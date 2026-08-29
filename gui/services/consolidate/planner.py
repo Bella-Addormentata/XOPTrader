@@ -34,8 +34,8 @@ converting at the edges avoids the inverted-rate class of bug entirely.
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
-from typing import Iterable, Optional, Sequence
 
 __all__ = [
     "Anchor",
@@ -185,6 +185,17 @@ class ConsolidationPlan:
     skipped_malformed: int = 0
     skipped_too_large: int = 0
     skipped_duplicate: int = 0
+    skipped_rolled_back: int = 0
+    """First-hop offers dropped so the second hop could complete.
+
+    Every other counter here says why an offer was REFUSED -- too dear, too
+    large, malformed, repeated.  These were none of those: they were inside
+    the cap and affordable, and taking them would have raised the blended
+    first-leg rate far enough to price the second hop out of the route.  They
+    are counted separately because "we chose not to take a perfectly good
+    offer" is a different sentence to show an operator than "nothing was
+    cheap enough", and without this they would be in no counter at all.
+    """
     unspent_source: int = 0
     hop_residual: int = 0
     """Hop-asset units the second leg could not spend.
@@ -295,6 +306,7 @@ def _plan_leg(
     max_slippage_frac: float,
     counters: dict[str, int],
     seen_ids: set[str],
+    max_takes: int | None = None,
 ) -> Leg:
     """Select offers for one hop, best price first, until the budget is spent.
 
@@ -305,22 +317,54 @@ def _plan_leg(
     which is the property that lets an operator who believes an asset is
     worthless set the cap accordingly without also accepting bad execution
     on the part of the position that could have gone out at a fair price.
+
+    ``max_takes`` stops after that many offers have been accepted.  Because
+    selection is best-first, capping the count is exactly "drop the worst
+    fills from the tail" -- which is what :func:`build_plan` needs to walk
+    back a first hop the second one cannot use.  It never reorders anything
+    and it is not a slippage control; the cap still decides what is
+    acceptable at all.
+
+    Note what this does to the counters: stopping early leaves the untested
+    tail in no counter, exactly as the existing ``remaining <= 0`` break
+    already does.  The counters describe the leg that was PLANNED rather
+    than the whole book, which is the convention this module already keeps,
+    and :attr:`ConsolidationPlan.skipped_rolled_back` is what tells the
+    operator the leg stopped by choice rather than for want of offers.
     """
-    usable: list[OfferCandidate] = []
+    # [review round 6] Keyed by id rather than appended in arrival order. A
+    # repeated id is the SAME on-chain offer arriving twice. Planning it
+    # twice means the first take consumes it and the second fails -- after
+    # the plan has already partially executed, which is the worst moment to
+    # discover it. Deduped across the whole plan, not just this leg, because
+    # the same offer can appear in both hops' books.
+    #
+    # Dropping every later arrival, as this did, let INPUT ORDER pick the
+    # price: two copies of one id at 200/100 and 210/100 under a 3% cap
+    # planned the 200 copy if it arrived first and planned nothing at all if
+    # it arrived second -- the same book, the same cap, two different
+    # answers, and one of them reads to the operator as "no offers within
+    # your cap". Two copies that disagree mean one payload is wrong, and we
+    # cannot tell which, so the WORST-priced copy is kept: planning a price
+    # better than the offer really carries is the direction that spends the
+    # operator's money on a fill they did not approve, while keeping the
+    # worse copy can only cost an opportunity.
+    grouped: dict[str, OfferCandidate] = {}
     for offer in offers:
         if not _usable(offer, give_asset, receive_asset):
             counters["malformed"] = counters.get("malformed", 0) + 1
             continue
-        # A repeated id is the SAME on-chain offer arriving twice. Planning
-        # it twice means the first take consumes it and the second fails --
-        # after the plan has already partially executed, which is the worst
-        # moment to discover it. Deduped across the whole plan, not just
-        # this leg, because the same offer can appear in both hops' books.
         if offer.offer_id in seen_ids:
             counters["duplicate"] = counters.get("duplicate", 0) + 1
             continue
-        seen_ids.add(offer.offer_id)
-        usable.append(offer)
+        previous = grouped.get(offer.offer_id)
+        if previous is not None:
+            counters["duplicate"] = counters.get("duplicate", 0) + 1
+            if _ExactRateKey(previous) < _ExactRateKey(offer):
+                grouped[offer.offer_id] = offer
+            continue
+        grouped[offer.offer_id] = offer
+    seen_ids.update(grouped)
 
     # [review] Exact, not float. `effective_rate` returns a float, and XCH
     # carries 10^12 raw units per display unit, so distinct prices collapse
@@ -329,7 +373,28 @@ def _plan_leg(
     # worse offer first; if only one fits, that is the best-price-first
     # guarantee quietly broken. Ordering on the exact ratio give/receive by
     # cross-multiplication keeps it in Python ints, which are unbounded.
-    usable.sort(key=_exact_rate_key)
+    #
+    # [review round 6] EXACT ties are still possible -- two different offers
+    # at genuinely the same price -- and Python's sort is stable, so with no
+    # tiebreak their order in the leg was the order they arrived in. That is
+    # the same defect as the duplicate-id case above wearing different
+    # clothes, and it is not cosmetic: given 400 of budget and two 2.0-priced
+    # offers of 400/200 and 200/100, the big one arriving first moves the
+    # whole 400, and arriving second it does not fit what the small one left
+    # and is skipped as too large -- half the position moved, on nothing but
+    # response order. Ties break on SIZE first, then on the id, so the order
+    # is total and nothing is left to arrival.
+    #
+    # Size-first is a preference, not an optimum, and the distinction is
+    # worth stating: takes are all-or-nothing, so which SET of equally priced
+    # offers fits a budget is a packing problem this planner does not attempt
+    # -- against 300 of budget, one 200 and two 150s at the same price, it
+    # takes the 200 and leaves 100 unspent where the two 150s would have
+    # filled it exactly. Smallest-first loses the mirror case just as badly.
+    # What this tiebreak buys is that the answer is the same every time,
+    # which arrival order was not; the packing question is untouched.
+    usable = sorted(grouped.values(), key=lambda o: (-o.give_amount, o.offer_id))
+    usable.sort(key=_ExactRateKey)
 
     chosen: list[OfferCandidate] = []
     give_total = 0
@@ -359,6 +424,8 @@ def _plan_leg(
         receive_total += offer.receive_amount
         remaining -= offer.give_amount
         if remaining <= 0:
+            break
+        if max_takes is not None and len(chosen) >= max_takes:
             break
 
     return Leg(
@@ -440,9 +507,9 @@ def remaining_route_cap(route_cap: float, first_leg_deviation: float) -> float:
 
 
 def _single_leg_plan(
-    source_asset: str, target_asset: str, leg: "Leg", budget: int,
+    source_asset: str, target_asset: str, leg: Leg, budget: int,
     counters: dict[str, int]
-) -> "ConsolidationPlan":
+) -> ConsolidationPlan:
     return ConsolidationPlan(
         source_asset=source_asset,
         target_asset=target_asset,
@@ -457,7 +524,7 @@ def _single_leg_plan(
 
 def _empty_plan(
     source_asset: str, target_asset: str, budget: int, counters: dict[str, int]
-) -> "ConsolidationPlan":
+) -> ConsolidationPlan:
     """A plan that does nothing, carrying EVERY diagnostic counter.
 
     Factored out because the three early returns each dropped a different
@@ -476,7 +543,29 @@ def _empty_plan(
     )
 
 
-#: How much more of the budget two hops must deliver to be worth taking.
+#: How many offers may be rolled off the end of a greedy first hop while
+#: looking for a first leg the second hop can actually use.
+#:
+#: The search replans both hops per attempt, so it is bounded rather than
+#: exhaustive. 16 is generous against the books this runs on -- the busiest
+#: pair in the log block quoted at the top of this module kept 29 offers in
+#: total, and a first leg is capped further by the budget -- so a first leg
+#: long enough to hit this bound is already outside anything observed. It is
+#: not a correctness limit: exceeding it leaves the SHORTEST prefixes
+#: unsearched, so a route only a very short first leg could reach would be
+#: missed -- the answer degrades towards the greedy one this search was added
+#: to improve on, and never below it.
+_MAX_FIRST_LEG_ROLLBACKS = 16
+
+#: How much more TARGET two hops must deliver to be worth taking.
+#:
+#: [review round 6] This said "of the budget", which was the round-4 rule.
+#: The comparison moved to target received and this line did not, so the one
+#: cross-reference build_plan's contract makes -- "'Materially' is
+#: :data:`MIN_TWO_HOP_ADVANTAGE`" -- landed a reader on the retired rule.
+#: The two genuinely disagree: a two-hop route spending half the budget for
+#: more than twice the target wins under the shipped comparison and loses
+#: under "of the budget".
 #:
 #: A second leg is a second fee and a second all-or-nothing failure window,
 #: and it strands anything the second hop cannot absorb in an intermediate
@@ -491,16 +580,16 @@ _ADVANTAGE_DEN = 10_000
 _ADVANTAGE_NUM = _ADVANTAGE_DEN + round(MIN_TWO_HOP_ADVANTAGE * _ADVANTAGE_DEN)
 
 
-class _exact_rate_key:
+class _ExactRateKey:
     """Total order on give/receive as an EXACT rational, no float involved."""
 
     __slots__ = ("give", "receive")
 
-    def __init__(self, offer: "OfferCandidate") -> None:
+    def __init__(self, offer: OfferCandidate) -> None:
         self.give = offer.give_amount
         self.receive = offer.receive_amount
 
-    def __lt__(self, other: "_exact_rate_key") -> bool:
+    def __lt__(self, other: _ExactRateKey) -> bool:
         # a/b < c/d  <=>  a*d < c*b, for positive b and d. Non-positive
         # receive sorts last: those offers are unusable and must not win.
         if self.receive <= 0:
@@ -517,12 +606,12 @@ def build_plan(
     budget: int,
     max_slippage_frac: float,
     direct_offers: Sequence[OfferCandidate],
-    direct_anchor: Optional[Anchor],
-    hop_asset: Optional[str] = None,
+    direct_anchor: Anchor | None,
+    hop_asset: str | None = None,
     first_hop_offers: Sequence[OfferCandidate] = (),
-    first_hop_anchor: Optional[Anchor] = None,
+    first_hop_anchor: Anchor | None = None,
     second_hop_offers: Sequence[OfferCandidate] = (),
-    second_hop_anchor: Optional[Anchor] = None,
+    second_hop_anchor: Anchor | None = None,
 ) -> ConsolidationPlan:
     """Build a one- or two-hop consolidation plan.
 
@@ -631,58 +720,126 @@ def build_plan(
         raise PlanError("hop asset is blank")
     if hop in (src, tgt):
         raise PlanError(
-            "hop asset %r is the source or the target; a hop must be a "
-            "third asset" % hop_asset)
+            f"hop asset {hop_asset!r} is the source or the target; a hop "
+            "must be a third asset")
 
-    # The first hop is priced blind -- nothing is known about the second when
-    # its offers are chosen. It is planned against the FULL route cap; the
-    # bound is enforced by the second hop, whose allowance is derived from
-    # what this one actually cost (see remaining_route_cap).
-    first = _plan_leg(
-        give_asset=source_asset,
-        receive_asset=hop_asset,
-        budget=budget,
-        offers=first_hop_offers,
-        anchor=first_hop_anchor,
-        # [review round 5] The FULL route cap, not the nth-root split. The
-        # split is sufficient for the route bound but not equivalent to it,
-        # and the gap costs availability: a +9% first hop followed by a -10%
-        # second is about -1.9% composite, comfortably inside a 10% route
-        # cap, yet the first hop was discarded at 4.88%. The route bound is
-        # still enforced -- remaining_route_cap() derives the second hop's
-        # allowance from what the first ACTUALLY cost, so a first hop that
-        # spends the whole cap leaves the second with nothing to spend.
-        max_slippage_frac=max_slippage_frac,
-        counters=counters,
-        seen_ids=seen_ids,
-    )
-    if not first.offers:
+    # Each attempt replans BOTH hops from scratch against its own counters
+    # and its own dedup set, so whatever is finally returned is described by
+    # diagnostics that belong to it rather than to a route that was
+    # abandoned.
+    base_counters = dict(counters)
+    base_seen = set(seen_ids)
+
+    def _route(max_takes: int | None) -> tuple[Leg, Leg | None, dict[str, int]]:
+        attempt_counters = dict(base_counters)
+        attempt_seen = set(base_seen)
+        # The first hop is priced blind -- nothing is known about the second
+        # when its offers are chosen. It is planned against the FULL route
+        # cap; the bound is enforced by the second hop, whose allowance is
+        # derived from what this one actually cost (see remaining_route_cap).
+        leg_one = _plan_leg(
+            give_asset=source_asset,
+            receive_asset=hop_asset,
+            budget=budget,
+            offers=first_hop_offers,
+            anchor=first_hop_anchor,
+            # [review round 5] The FULL route cap, not the nth-root split.
+            # The split is sufficient for the route bound but not equivalent
+            # to it, and the gap costs availability: a +9% first hop followed
+            # by a -10% second is about -1.9% composite, comfortably inside a
+            # 10% route cap, yet the first hop was discarded at 4.88%. The
+            # route bound is still enforced -- remaining_route_cap() derives
+            # the second hop's allowance from what the first ACTUALLY cost,
+            # so a first hop that spends the whole cap leaves the second with
+            # nothing to spend.
+            max_slippage_frac=max_slippage_frac,
+            counters=attempt_counters,
+            seen_ids=attempt_seen,
+            max_takes=max_takes,
+        )
+        if not leg_one.offers:
+            return leg_one, None, attempt_counters
+        # The second hop can only spend what the first actually yields.
+        # Budget it from receive_total rather than from any projection: if
+        # hop one underfills, hop two must shrink with it or the plan
+        # promises a quantity that will not exist when it runs.
+        #
+        # Its slippage allowance is likewise derived from what the first hop
+        # actually cost, not guessed in advance -- the route cap binds the
+        # COMPOSITE, so the blind split is the wrong yardstick once d1 is
+        # known.
+        leg_two = _plan_leg(
+            give_asset=hop_asset,
+            receive_asset=target_asset,
+            budget=leg_one.receive_total,
+            offers=second_hop_offers,
+            anchor=second_hop_anchor,
+            max_slippage_frac=remaining_route_cap(
+                max_slippage_frac,
+                rate_deviation_frac(leg_one.realised_rate, first_hop_anchor),
+            ),
+            counters=attempt_counters,
+            seen_ids=attempt_seen,
+        )
+        return leg_one, leg_two, attempt_counters
+
+    greedy_first, greedy_second, greedy_counters = _route(None)
+    if greedy_second is None:
+        # _route declines to plan a second hop exactly when the first one
+        # selected nothing, so this is "no first leg" -- and testing it this
+        # way is what lets everything below treat the second leg as present.
+        counters = greedy_counters
         if direct_leg is not None and direct_leg.offers:
             return _single_leg_plan(
                 source_asset, target_asset, direct_leg, budget, counters)
         return _empty_plan(source_asset, target_asset, budget, counters)
 
-    # The second hop can only spend what the first actually yields.  Budget
-    # it from first.receive_total rather than from any projection: if hop
-    # one underfills, hop two must shrink with it or the plan promises a
-    # quantity that will not exist when it runs.
+    # [review round 6] The greedy first hop used to be final, and that made
+    # the two rules above fight each other: the first leg takes everything
+    # inside the FULL route cap, then the second leg is allowed only what
+    # the first one left of that cap. A worse-priced tail on hop one is
+    # therefore paid for TWICE -- once in what it costs, and again in the
+    # allowance it removes from hop two -- and it can shut the route down
+    # entirely.
     #
-    # Its slippage allowance is likewise derived from what the first hop
-    # actually cost, not guessed in advance -- the route cap binds the
-    # COMPOSITE, so the blind split is the wrong yardstick once d1 is known.
-    second = _plan_leg(
-        give_asset=hop_asset,
-        receive_asset=target_asset,
-        budget=first.receive_total,
-        offers=second_hop_offers,
-        anchor=second_hop_anchor,
-        max_slippage_frac=remaining_route_cap(
-            max_slippage_frac,
-            rate_deviation_frac(first.realised_rate, first_hop_anchor),
-        ),
-        counters=counters,
-        seen_ids=seen_ids,
-    )
+    # Reproduced: route cap 10%, first-hop offers at +0% and +10%, one
+    # second-hop offer at +5%. Taking both first-hop offers blends to
+    # +4.878%, leaving hop two 4.884%, and the +5% offer is refused -- an
+    # empty plan. Dropping the +10% tail gives a complete route whose
+    # composite is 1.00 * 1.05 = +5%, half the cap the operator set. The
+    # operator would have read "no offers within your cap" for a route that
+    # was comfortably inside it.
+    #
+    # So the first leg is revisable. Selection is best-first, so capping the
+    # take count is exactly "roll the worst fills off the tail", and trying
+    # successively shorter prefixes is a search over first legs ordered
+    # worst-off-first. The winner is the one delivering the most TARGET --
+    # the same quantity the direct-versus-two-hop comparison below scores,
+    # and the only one the operator actually receives. Ties go to the
+    # SHORTER first leg: identical target for less source spent and less
+    # stranded in the hop asset.
+    best: tuple[Leg, Leg, dict[str, int]] | None = None
+    if greedy_second.offers:
+        best = (greedy_first, greedy_second, greedy_counters)
+    floor = max(1, len(greedy_first.offers) - _MAX_FIRST_LEG_ROLLBACKS)
+    for takes in range(len(greedy_first.offers) - 1, floor - 1, -1):
+        leg_one, leg_two, attempt_counters = _route(takes)
+        if leg_two is None or not leg_two.offers:
+            continue
+        if best is None or leg_two.receive_total >= best[1].receive_total:
+            best = (leg_one, leg_two, attempt_counters)
+
+    if best is None:
+        # No prefix completes. Report the greedy attempt, which is the route
+        # the operator would otherwise have been shown, so the counters
+        # explain why nothing worked.
+        first, second, counters = greedy_first, greedy_second, greedy_counters
+    else:
+        first, second, counters = best
+    # Offers the rollback declined that no other counter can explain: they
+    # were inside the cap and affordable, and dropping them is what let the
+    # second hop complete.
+    rolled_back = len(greedy_first.offers) - len(first.offers)
 
     # Direct wins ties and near-ties; the two-hop route has to be materially
     # better to justify a second all-or-nothing take.
@@ -730,6 +887,10 @@ def build_plan(
         skipped_malformed=counters.get("malformed", 0),
         skipped_too_large=counters.get("too_large", 0),
         skipped_duplicate=counters.get("duplicate", 0),
+        # Only the two-hop return carries this. The other exits from here
+        # hand back a direct plan or an empty one, neither of which has a
+        # first hop for anything to have been rolled off.
+        skipped_rolled_back=rolled_back,
         unspent_source=budget - first.give_total,
         hop_residual=first.receive_total - second.give_total,
     )

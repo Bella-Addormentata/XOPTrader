@@ -898,7 +898,7 @@ def test_the_sort_key_separates_rates_that_collide_as_floats():
     distinct prices then sort as a tie, input order decides, and if only one
     offer fits the planner takes the worse of them.
     """
-    from gui.services.consolidate.planner import _exact_rate_key
+    from gui.services.consolidate.planner import _ExactRateKey
 
     recv = 2 ** 52
     better = OfferCandidate(offer_id="better", give_asset=XCH,
@@ -911,19 +911,19 @@ def test_the_sort_key_separates_rates_that_collide_as_floats():
     # Indistinguishable in floating point...
     assert float(worse.give_amount) == float(better.give_amount)
     # ...and correctly ordered exactly.
-    assert _exact_rate_key(better) < _exact_rate_key(worse)
-    assert not _exact_rate_key(worse) < _exact_rate_key(better)
+    assert _ExactRateKey(better) < _ExactRateKey(worse)
+    assert not _ExactRateKey(worse) < _ExactRateKey(better)
 
 
 def test_the_sort_key_puts_unusable_offers_last():
-    from gui.services.consolidate.planner import _exact_rate_key
+    from gui.services.consolidate.planner import _ExactRateKey
 
     good = OfferCandidate(offer_id="g", give_asset=XCH, receive_asset=BYC,
                           give_amount=100, receive_amount=50)
     dud = OfferCandidate(offer_id="d", give_asset=XCH, receive_asset=BYC,
                          give_amount=100, receive_amount=0)
-    assert _exact_rate_key(good) < _exact_rate_key(dud)
-    assert not _exact_rate_key(dud) < _exact_rate_key(good)
+    assert _ExactRateKey(good) < _ExactRateKey(dud)
+    assert not _ExactRateKey(dud) < _ExactRateKey(good)
 
 
 def test_a_marginally_better_two_hop_route_loses_to_direct():
@@ -956,10 +956,10 @@ def test_a_marginally_better_two_hop_route_loses_to_direct():
 def test_the_materiality_bar_is_driven_by_its_named_constant():
     """[round 3] The comparison used a hand-written 102/100 beside a named
     MIN_TWO_HOP_ADVANTAGE, so changing the constant moved nothing."""
-    from gui.services.consolidate import planner as P
+    from gui.services.consolidate import planner
 
-    assert P._ADVANTAGE_NUM / P._ADVANTAGE_DEN == pytest.approx(
-        1.0 + P.MIN_TWO_HOP_ADVANTAGE
+    assert planner._ADVANTAGE_NUM / planner._ADVANTAGE_DEN == pytest.approx(
+        1.0 + planner.MIN_TWO_HOP_ADVANTAGE
     )
 
 
@@ -1067,4 +1067,142 @@ def test_the_composite_bound_still_holds_for_that_route():
         max_slippage_frac=0.10,
     )
     # 1.09 * 1.06 = 1.155, past the 10% route cap.
+    assert plan.is_empty
+
+
+# ---------------------------------------------------------------------------
+# [review round 6] Two ways the planner let something other than price decide:
+# the arrival order of a repeated id, and a first-hop tail that could not be
+# taken back.
+# ---------------------------------------------------------------------------
+
+def test_a_conflicting_repeated_id_does_not_let_arrival_order_pick_the_price():
+    """Dedup ran during ingest, in arrival order, before the sort.
+
+    Two payloads carrying one id disagree about its price, so one of them is
+    wrong and there is no way to tell which. Keeping whichever landed first
+    let the ORDER of the response decide both the price planned and whether
+    a plan existed at all: under a 3% cap the 200/100 copy plans a take and
+    the 210/100 copy plans nothing. Same book, same cap, two answers -- and
+    one of them reads to the operator as "no offers within your cap".
+    """
+    better = offer("same", 200, 100)   # 2.00 against the 2.0 anchor: +0%
+    worse = offer("same", 210, 100)    # 2.10: +5%, outside a 3% cap
+
+    outcomes = []
+    for feed in ([better, worse], [worse, better]):
+        plan = build_plan(
+            source_asset=BYC, target_asset=XCH,
+            budget=10_000 * denomination(BYC), max_slippage_frac=0.03,
+            direct_offers=feed, direct_anchor=ANCHOR,
+        )
+        outcomes.append(
+            (plan.is_empty, plan.take_count, plan.skipped_duplicate)
+        )
+
+    assert outcomes[0] == outcomes[1], "arrival order changed the plan"
+    # And the copy kept is the WORSE one. Planning a price better than the
+    # offer really carries is the direction that spends the operator's money
+    # on a fill they did not approve; keeping the worse copy can only cost an
+    # opportunity.
+    assert outcomes[0] == (True, 0, 1)
+
+
+def test_offers_at_the_same_exact_price_do_not_resolve_by_arrival_order():
+    """The repeated id above is one instance of this; here is the other.
+
+    Two DIFFERENT offers can carry genuinely the same price, and a stable
+    sort with no tiebreak left them in the order they arrived.  That is not
+    cosmetic once sizes differ: with 400 of budget and 2.0-priced offers of
+    400/200 and 200/100, the big one arriving first moves the whole 400,
+    while arriving second it no longer fits what the small one left and is
+    skipped as too large.  Half the position, decided by nothing but the
+    order the book happened to list them in.
+    """
+    big = offer("big", 400, 200)
+    small = offer("small", 200, 100)
+
+    outcomes = []
+    for feed in ([big, small], [small, big]):
+        plan = build_plan(
+            source_asset=BYC, target_asset=XCH,
+            budget=400 * denomination(BYC), max_slippage_frac=0.10,
+            direct_offers=feed, direct_anchor=ANCHOR,
+        )
+        outcomes.append((tuple(o.offer_id for o in plan.legs[0].offers),
+                         plan.receive_total, plan.unspent_source))
+
+    assert outcomes[0] == outcomes[1], "arrival order changed the plan"
+    # The tie goes to the LARGER offer. That is a preference and not an
+    # optimum -- all-or-nothing takes make "which set fits the budget" a
+    # packing problem this planner does not attempt -- but it is a fixed
+    # preference, which arrival order was not.
+    assert outcomes[0][0] == ("big",)
+    assert outcomes[0][2] == 0, "the whole budget moved"
+
+
+def test_a_dear_first_hop_tail_does_not_cancel_a_route_inside_the_cap():
+    """The greedy first leg used to be final, so its tail was paid for twice.
+
+    Hop one takes everything inside the FULL route cap; hop two then gets
+    only what hop one left of that cap. A worse-priced first-hop offer
+    therefore costs its own slippage AND the allowance it removes from hop
+    two, and here it removes enough to refuse the second hop outright.
+
+    Route cap 10%, first hop at +0% and +10%, second hop at +5%. Both first
+    takes blend to 215/205 = +4.878%, leaving hop two 4.884% -- and the +5%
+    offer is refused. Rolling the +10% tail off yields a composite
+    1.00 * 1.05 = +5%, half the cap the operator chose.
+    """
+    plan = build_plan(
+        source_asset=BYC, target_asset=DBX,
+        budget=10_000 * denomination(BYC), max_slippage_frac=0.10,
+        direct_offers=[], direct_anchor=None,
+        hop_asset=XCH,
+        first_hop_offers=[
+            offer("clean", 105, 105),                  # 1.00 vs 1.0 = +0%
+            offer("tail", 110, 100),                   # 1.10 = +10%
+        ],
+        first_hop_anchor=Anchor(rate=1.0, source="test"),
+        second_hop_offers=[
+            # 84/80 = 1.05, i.e. +5%, and small enough to fit inside the
+            # 105 XCH the clean first hop alone yields.
+            offer("s", 84, 80, give_asset=XCH, recv_asset=DBX),
+        ],
+        second_hop_anchor=Anchor(rate=1.0, source="test"),
+    )
+    assert not plan.is_empty
+    assert len(plan.legs) == 2
+    # The tail was dropped, not merely tolerated: the first leg is the clean
+    # offer alone.
+    assert [o.offer_id for o in plan.legs[0].offers] == ["clean"]
+    # And it is accounted for. The tail was inside the cap and affordable, so
+    # no other counter can explain where it went, and an offer in no counter
+    # at all is the silent gap every other counter here exists to close.
+    assert plan.skipped_rolled_back == 1
+    assert plan.skipped_worse_than_cap == 0
+    assert plan.skipped_too_large == 0
+
+
+def test_rolling_back_the_first_hop_cannot_smuggle_a_route_past_the_cap():
+    """The rollback widens hop two's allowance by shortening hop one, so it
+    has to be shown that it only ever restores allowance the route cap
+    already permits.  Same first hop as above; a second hop at +12% is
+    outside a 10% route cap for EVERY prefix, including the shortest, and
+    must still be refused rather than reached by trying harder."""
+    plan = build_plan(
+        source_asset=BYC, target_asset=DBX,
+        budget=10_000 * denomination(BYC), max_slippage_frac=0.10,
+        direct_offers=[], direct_anchor=None,
+        hop_asset=XCH,
+        first_hop_offers=[
+            offer("clean", 105, 105),
+            offer("tail", 110, 100),
+        ],
+        first_hop_anchor=Anchor(rate=1.0, source="test"),
+        second_hop_offers=[
+            offer("s", 84, 75, give_asset=XCH, recv_asset=DBX),   # 1.12
+        ],
+        second_hop_anchor=Anchor(rate=1.0, source="test"),
+    )
     assert plan.is_empty
