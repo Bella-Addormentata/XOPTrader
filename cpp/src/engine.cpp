@@ -804,6 +804,27 @@ void Engine::watchdog_loop()
         // cancel spends. This flag is restart-only, the same contract
         // breaker_pause_active_ already carries, because "the switch fired"
         // means the book state is unknown until someone looks.
+        // [review] Defer to a graceful cancel that is already in flight --
+        // for a bounded time only. Two secure bulk cancels racing over the
+        // same coins produce duplicate spends and contradictory outcomes,
+        // with the 60s per-rule cooldown suppressing whichever alert lands
+        // second. Past the grace the graceful path is presumed wedged and
+        // this fires anyway, which is the half that keeps a hung shutdown
+        // from silencing the switch entirely.
+        if (graceful_cancel_active_.load(std::memory_order_acquire)) {
+            const auto started =
+                graceful_cancel_started_ms_.load(std::memory_order_acquire);
+            if (now_ms() - started < static_cast<std::int64_t>(
+                    config_.risk.watchdog_stall_seconds) * 1000) {
+                spdlog::warn("[Engine] [S31] stall detected, but a graceful "
+                             "cancel is in flight -- deferring rather than "
+                             "spending the same coins twice");
+                continue;
+            }
+            spdlog::critical("[Engine] [S31] the graceful cancel has run past "
+                             "its grace; firing anyway");
+        }
+
         watchdog_fired_.store(true, std::memory_order_release);
         // [review] PUBLISH FROM HERE, not from Step 12. The gauge was
         // refreshed only by step_export_metrics() on the engine's event-loop
@@ -986,6 +1007,18 @@ void Engine::shutdown()
     spdlog::info("[Engine] Shutdown requested");
     state_->set_status(BotStatus::ShuttingDown);
 
+    // [review] A shutdown just requested is not a stall. The heartbeat is
+    // stamped only at the END of a completed cycle, so an operator stopping
+    // an engine most of the way through its threshold left the graceful
+    // cancel only the remainder of that budget before the watchdog fired
+    // over it. Give the cancel a full threshold instead. This delays the
+    // watchdog by at most one threshold if the shutdown itself wedges -- a
+    // delay, never a disarm, and the grace above bounds it either way.
+    last_beat_ms_.store(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count(),
+        std::memory_order_relaxed);
+
     // Cancel the polling timer so the loop exits.
     try {
         poll_timer_.cancel();
@@ -1011,6 +1044,22 @@ void Engine::shutdown()
     asio::co_spawn(ioc_, [this]() -> asio::awaitable<void> {
         // --- Cancel outstanding offers (skip in dry-run mode) ---
         if (!dry_run_) {
+            // [review] Claim the cancellation so the watchdog does not issue
+            // a second, concurrent secure spend against the same coins.
+            // Bounded: see graceful_cancel_active_ in the header for why the
+            // watchdog must still be able to fire if this never returns.
+            const auto claim_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count();
+            graceful_cancel_started_ms_.store(claim_ms,
+                                              std::memory_order_release);
+            graceful_cancel_active_.store(true, std::memory_order_release);
+            struct ClaimGuard {
+                std::atomic<bool>* flag;
+                ~ClaimGuard() { flag->store(false, std::memory_order_release); }
+            } claim_guard{&graceful_cancel_active_};
+
             try {
                 auto shutdown_cancelled = co_await offer_mgr_->cancel_all();
                 spdlog::info("[Engine] All outstanding offers cancelled");

@@ -446,6 +446,93 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
 
+    // ------------------------------------------------------------------
+    // 4a. [review] A DRY RUN GETS ITS OWN DATABASE.
+    //
+    //     Skipping kill_old_instances() above is right -- a dry run submits
+    //     nothing, so there is no double-posting to prevent -- but it also
+    //     removed the mutual exclusion that every DB write in the engine
+    //     silently depended on. Until this branch, exactly one process ever
+    //     held that file.
+    //
+    //     Dry run is NOT read-only there. It restores the live engine's
+    //     pending offers into State, so step_process_fills() then observes
+    //     the live engine's fills and writes them: offer status, trade log,
+    //     ledger entries, and persist_inventory_state() -- which rewrites
+    //     EVERY inventory row from a snapshot that stopped tracking reality
+    //     at startup. inventory_state.total_cost is the table whose loss
+    //     produced the P&L failure this project already spent a month on.
+    //     step_update_pnl() adds snapshot and strategy_quotes rows every
+    //     block, and the reward/bridge ingest branches on the ledger insert
+    //     COUNT -- so whichever process books a reward first makes the other
+    //     silently drop that income from its own running state.
+    //
+    //     Fixed at the persistence boundary rather than by guarding each
+    //     step. There are a dozen reachable write sites across six
+    //     functions, and this is the fourth round on dry-run isolation --
+    //     each previous one gated the sites it was shown and missed the
+    //     rest. A copy cannot be missed by a new step.
+    //
+    //     Copied rather than opened read-only, deliberately: writes would
+    //     then throw, and several callers convert a write failure into a
+    //     LATCHED degradation -- post_ledger_fill and the reward/bridge
+    //     ingest set ledger_incomplete_ and raise an ExposureBreach alert.
+    //     A read-only dry run would spend its life alarming about a database
+    //     that is fine. The copy also keeps every read the run needs
+    //     truthful: pending offers, inventory cost basis, and the snapshot
+    //     history the warm start replays.
+    //
+    //     PnLTracker opens its own second handle on this same path and
+    //     derives its trade_history CSV directory from it, so redirecting
+    //     the path covers all three. accounting.bridge_jobs_db_path needs
+    //     no change: it is already opened SQLITE_OPEN_READONLY.
+    // ------------------------------------------------------------------
+    if (cli.dry_run) {
+        namespace fs = std::filesystem;
+        try {
+            const fs::path live{app_config.database.path};
+            const auto stamp = std::to_string(static_cast<long long>(
+#ifdef _WIN32
+                GetCurrentProcessId()
+#else
+                getpid()
+#endif
+            ));
+            const fs::path scratch =
+                fs::temp_directory_path()
+                / ("xop_dryrun_" + stamp + ".sqlite");
+
+            std::error_code ec;
+            fs::remove(scratch, ec);
+            if (fs::exists(live)) {
+                fs::copy_file(live, scratch,
+                              fs::copy_options::overwrite_existing);
+                // The WAL may hold committed pages the main file does not.
+                for (const char* suffix : {"-wal", "-shm"}) {
+                    const fs::path from{live.string() + suffix};
+                    if (fs::exists(from)) {
+                        fs::copy_file(from,
+                                      fs::path{scratch.string() + suffix},
+                                      fs::copy_options::overwrite_existing,
+                                      ec);
+                    }
+                }
+            }
+            spdlog::warn("[S31] dry run -- database redirected to {} so this "
+                         "inspection cannot write to the live engine's "
+                         "accounting state", scratch.string());
+            app_config.database.path = scratch.string();
+        } catch (const std::exception& e) {
+            spdlog::critical("[S31] dry run -- could NOT isolate the database "
+                             "({}). Refusing to start: running against the "
+                             "live file would corrupt its accounting.",
+                             e.what());
+            spdlog::shutdown();
+            curl_global_cleanup();
+            return EXIT_FAILURE;
+        }
+    }
+
     // Count enabled trading pairs for the startup banner.
     std::size_t enabled_pairs = 0;
     for (const auto& pair : app_config.pairs) {

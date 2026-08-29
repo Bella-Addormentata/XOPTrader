@@ -455,6 +455,31 @@ private:
     /// cancel is exactly what should still be allowed to happen.
     std::mutex                watchdog_cancel_mtx_;
 
+    /// A graceful shutdown has claimed the cancellation, and when it started.
+    ///
+    /// [review] The watchdog stays ARMED through the graceful cancel, and it
+    /// must: stop_watchdog() runs after ioc_.run() returns, so a cancel_all()
+    /// that never comes back means ioc_.stop() is never reached and the
+    /// watchdog is the only thing left that can retract the book. Disarming
+    /// it at the top of shutdown() -- the obvious fix -- would convert the
+    /// wedged-shutdown case into total silence over a live book, which is the
+    /// incident the switch was built for.
+    ///
+    /// So the two paths hand off rather than exclude. While this claim is
+    /// held the watchdog SKIPS its duplicate RPC (no second secure spend
+    /// against coins the graceful path is already spending, and no
+    /// contradictory outcome with the cooldown suppressing whichever alert
+    /// arrives second) -- but only for a bounded grace. Past that the
+    /// graceful cancel is presumed failed and the watchdog fires anyway, so
+    /// a cancel that hangs forever cannot muzzle it.
+    ///
+    /// An atomic rather than holding watchdog_cancel_mtx_ across the
+    /// co_await: a lock_guard spanning a suspension point is legal here only
+    /// because ioc_ is single-threaded today, and becomes undefined the
+    /// moment it is not.
+    std::atomic<bool>         graceful_cancel_active_{false};
+    std::atomic<std::int64_t> graceful_cancel_started_ms_{0};
+
     void start_watchdog();
     void stop_watchdog();
     void watchdog_loop();
