@@ -1,0 +1,506 @@
+"""Identity tests. The derivation ones are the load-bearing part.
+
+If the mnemonic-to-key derivation is wrong in any way, the 24 words we tell an
+operator to engrave on metal will not restore the account -- and nothing will
+reveal that until the day they need it. So the canonical BIP-39 vectors are
+pinned here rather than assumed, and the round-trip is exercised end to end.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from gui.services.permuto.identity import (
+    PermutoIdentity,
+    PermutoIdentityError,
+    derive_bls_key,
+    generate_mnemonic,
+    mnemonic_is_valid,
+)
+
+
+# --------------------------------------------------------------------------- #
+# Fakes
+# --------------------------------------------------------------------------- #
+
+class FakeSecretsIO:
+    def __init__(self, data=None):
+        self._data = data or {}
+
+    def read(self):
+        import copy
+
+        return copy.deepcopy(self._data)
+
+    def write(self, data):
+        import copy
+
+        self._data = copy.deepcopy(data)
+
+
+class FakeProtector:
+    """Reversible, not secret. Proves the wiring without needing Windows."""
+
+    def protect(self, data: bytes, entropy: bytes = b"") -> bytes:
+        return b"P|" + entropy + b"|" + data
+
+    def unprotect(self, blob: bytes, entropy: bytes = b"") -> bytes:
+        prefix = b"P|" + entropy + b"|"
+        if not blob.startswith(prefix):
+            raise ValueError("wrong entropy or corrupt blob")
+        return blob[len(prefix):]
+
+
+@pytest.fixture()
+def ident():
+    return PermutoIdentity(FakeSecretsIO(), protector=FakeProtector())
+
+
+# --------------------------------------------------------------------------- #
+# BIP-39 correctness -- canonical vectors, not our own output
+# --------------------------------------------------------------------------- #
+
+def test_bip39_canonical_24_word_vector():
+    """256 bits of zero entropy is 'abandon' x23 + 'art'.
+
+    Pins wordlist content AND ordering. A shuffled or truncated list would
+    still produce 24 plausible words, and only this catches it.
+    """
+    from eth_account.hdaccount.mnemonic import Mnemonic
+
+    assert Mnemonic("english").to_mnemonic(bytes(32)) == \
+        "abandon " * 23 + "art"
+
+
+def test_bip39_canonical_seed_vector():
+    """The published TREZOR-passphrase seed vector.
+
+    Pins the PBKDF2 parameters -- 2048 rounds, HMAC-SHA512, salt
+    'mnemonic'+passphrase. Get any of those wrong and every derived key is
+    wrong while still looking perfectly well-formed.
+    """
+    from eth_account.hdaccount.mnemonic import Mnemonic
+
+    seed = Mnemonic.to_seed("abandon " * 11 + "about", "TREZOR")
+    assert seed.hex().startswith("c55257c360c07c72029aebc1b53c05ed")
+    assert len(seed) == 64
+
+
+def test_derivation_is_deterministic_and_chia_shaped():
+    phrase = "abandon " * 23 + "art"
+    a, b = derive_bls_key(phrase), derive_bls_key(phrase)
+    assert bytes(a) == bytes(b)
+    assert len(bytes(a.get_g1())) == 48        # G1 public key
+    assert len(bytes(a)) == 32                 # master secret
+
+
+def test_derivation_uses_an_empty_passphrase():
+    """Chia's convention. A non-empty passphrase silently yields a DIFFERENT
+    key from the same words -- exactly the surprise that loses an account."""
+    from eth_account.hdaccount.mnemonic import Mnemonic
+    import chia_rs
+
+    phrase = "abandon " * 23 + "art"
+    expected = chia_rs.AugSchemeMPL.key_gen(Mnemonic.to_seed(phrase, ""))
+    assert bytes(derive_bls_key(phrase)) == bytes(expected)
+
+
+def test_generated_mnemonics_are_24_words_and_valid():
+    phrase = generate_mnemonic()
+    assert len(phrase.split()) == 24
+    assert mnemonic_is_valid(phrase)
+
+
+def test_generated_mnemonics_are_unique():
+    """Cheap guard against a seeded or reused RNG."""
+    assert len({generate_mnemonic() for _ in range(5)}) == 5
+
+
+# --------------------------------------------------------------------------- #
+# The checksum is the reason we chose words
+# --------------------------------------------------------------------------- #
+
+def test_a_transposed_word_is_refused():
+    good = "abandon " * 23 + "art"
+    bad = " ".join((good.split()[:22] + ["art", "abandon"]))
+    assert not mnemonic_is_valid(bad)
+    with pytest.raises(PermutoIdentityError, match="checksum"):
+        derive_bls_key(bad)
+
+
+def test_a_misspelled_word_is_refused():
+    bad = ("abandon " * 23 + "artt")
+    assert not mnemonic_is_valid(bad)
+    with pytest.raises(PermutoIdentityError):
+        derive_bls_key(bad)
+
+
+def test_wrong_length_is_refused():
+    with pytest.raises(PermutoIdentityError):
+        derive_bls_key("abandon " * 11 + "about")  # valid 12-word, wrong size
+
+
+# --------------------------------------------------------------------------- #
+# Storage round-trip
+# --------------------------------------------------------------------------- #
+
+def test_create_then_restore_reproduces_the_same_key(ident):
+    """The whole promise of the mnemonic, exercised end to end."""
+    pubkey, phrase = ident.create()
+
+    fresh = PermutoIdentity(FakeSecretsIO(), protector=FakeProtector())
+    assert fresh.restore(phrase) == pubkey
+
+
+def test_create_refuses_to_overwrite_an_existing_identity(ident):
+    ident.create()
+    with pytest.raises(PermutoIdentityError, match="already exists"):
+        ident.create()
+
+
+def test_the_mnemonic_is_never_persisted(ident):
+    """It is shown once and dropped. Storing it would defeat wrapping the key."""
+    _, phrase = ident.create()
+    blob = repr(ident._io.read())
+    assert phrase not in blob
+    assert "mnemonic" not in blob.lower()
+    # Any 4 consecutive words would be enough to brute-force the rest.
+    words = phrase.split()
+    for i in range(len(words) - 3):
+        assert " ".join(words[i:i + 4]) not in blob
+
+
+def test_stored_key_is_wrapped_not_plaintext(ident):
+    ident.create()
+    section = ident._io.read()["permuto"]
+    raw = bytes(ident.private_key())
+    stored = repr(section)
+    assert raw.hex() not in stored
+    # base64 of the raw key must not appear either -- wrapping, not encoding.
+    import base64
+    assert base64.b64encode(raw).decode() not in stored
+
+
+def test_signing_matches_the_public_key(ident):
+    """A raw AugSchemeMPL signature over 32 bytes -- the shape wallet_auth
+    verifies. NOT CHIP-0002, which a WalletConnect wallet would produce."""
+    import chia_rs
+
+    pubkey, _ = ident.create()
+    nonce = bytes(range(32))
+    sig = ident.sign(nonce)
+
+    assert len(sig) == 96
+    assert chia_rs.AugSchemeMPL.verify(
+        chia_rs.G1Element.from_bytes(bytes.fromhex(pubkey)),
+        nonce,
+        chia_rs.G2Element.from_bytes(sig),
+    )
+
+
+def test_operations_without_an_identity_fail_loudly(ident):
+    with pytest.raises(PermutoIdentityError, match="no Permuto identity"):
+        ident.public_key()
+    with pytest.raises(PermutoIdentityError, match="no Permuto identity"):
+        ident.private_key()
+
+
+def test_restore_marks_backup_confirmed(ident):
+    """Restoring proves the words exist somewhere off this machine."""
+    _, phrase = ident.create()
+    assert ident.info().backup_confirmed is False
+    fresh = PermutoIdentity(FakeSecretsIO(), protector=FakeProtector())
+    fresh.restore(phrase)
+    assert fresh.info().backup_confirmed is True
+
+
+def test_restore_refuses_to_swap_the_key_of_a_registered_identity(ident):
+    """119-1. discard_unregistered() already refuses to delete a registered
+    key because the key IS the account -- but Restore destroyed it just as
+    completely, overwriting the wrapped blob and sweeping away the user_id
+    and address that were the only local record of the linked account. There
+    is no change-my-key flow on this venue, so the abandoned account is
+    unreachable forever."""
+    pubkey, _phrase = ident.create()
+    ident.mark_backup_confirmed()
+    ident.mark_registered(user_id="u" * 64, trading_address="xch1live")
+    before = ident._io.read()["permuto"]["bls_private_key_dpapi"]
+
+    stranger = generate_mnemonic()
+    with pytest.raises(PermutoIdentityError, match="REGISTERED"):
+        ident.restore(stranger)
+
+    section = ident._io.read()["permuto"]
+    assert section["bls_private_key_dpapi"] == before
+    assert section["bls_public_key"] == pubkey
+    assert section["user_id"] == "u" * 64
+    assert section["trading_address"] == "xch1live"
+    assert section["registered"] is True
+
+
+def test_restoring_the_same_phrase_over_a_registration_still_works(ident):
+    """The recovery path must survive the guard. Re-deriving the SAME key --
+    after a machine move, or to re-wrap it under a new DPAPI context -- is
+    not a key swap and must keep the registration intact."""
+    pubkey, phrase = ident.create()
+    ident.mark_backup_confirmed()
+    ident.mark_registered(user_id="u" * 64, trading_address="xch1live",
+                          listing_verified=True)
+
+    assert ident.restore(phrase) == pubkey
+    info = ident.info()
+    assert info.registered is True
+    assert info.user_id == "u" * 64
+    assert info.trading_address == "xch1live"
+    assert info.listing_verified is True
+
+
+def test_restore_still_replaces_an_unregistered_identity(ident):
+    """The guard is about the ACCOUNT, not about the key. An unregistered key
+    is worth nothing, so replacing it stays free."""
+    ident.create()
+    stranger = generate_mnemonic()
+    new_pubkey = ident.restore(stranger)
+    assert ident.info().pubkey == new_pubkey
+
+
+def test_identity_blob_is_bound_to_its_own_entropy(ident):
+    """A warp blob must not unwrap as a Permuto blob on the same machine."""
+    ident.create()
+    section = ident._io.read()["permuto"]
+    with pytest.raises(Exception):
+        FakeProtector().unprotect(
+            __import__("base64").b64decode(section["bls_private_key_dpapi"]),
+            b"XOPTrader/warp/keystore/v1",
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Platform reach -- the page must not vanish where DPAPI does not exist
+# --------------------------------------------------------------------------- #
+
+def test_inspection_needs_no_protector_at_all():
+    """default_protector() raises off Windows, and resolving it eagerly took
+    the whole Permuto page down on Linux and macOS -- for a project that is
+    open source and used worldwide. Reading PUBLIC state must not need one."""
+    io_ = FakeSecretsIO({
+        "permuto": {
+            "bls_public_key": "ab" * 48,
+            "bls_private_key_dpapi": "irrelevant",
+            "registered": True,
+            "user_id": "c" * 64,
+            "trading_address": "xch1x",
+            "listing_verified": True,
+        }
+    })
+    ident = PermutoIdentity(io_)          # no protector supplied
+    info = ident.info()                   # must not raise
+    assert info.pubkey == "ab" * 48
+    assert info.registered and info.listing_verified
+    assert ident.public_key() == "ab" * 48
+    assert ident.exists() is True
+
+
+def test_the_protector_is_resolved_only_when_key_material_is_touched():
+    """And when it IS needed, the platform error arrives attached to the
+    operation that requires it rather than to page construction."""
+    calls = []
+
+    class Boom:
+        def protect(self, data, entropy=b""):
+            calls.append("protect")
+            raise RuntimeError("no secure store on this platform")
+
+        def unprotect(self, blob, entropy=b""):
+            raise RuntimeError("no secure store on this platform")
+
+    ident = PermutoIdentity(FakeSecretsIO(), protector=Boom())
+    assert calls == []                    # construction touched nothing
+    with pytest.raises(RuntimeError, match="secure store"):
+        ident.create()
+    assert calls == ["protect"]
+
+
+# --------------------------------------------------------------------------- #
+# The identity must never reach git-tracked config.yaml
+# --------------------------------------------------------------------------- #
+
+def test_split_and_save_keeps_identity_out_of_public_config(tmp_path):
+    """Reproduces the leak before it was fixed.
+
+    Settings loads config.yaml and secrets.yaml MERGED, then writes every
+    section it does not recognise as public configuration -- and config.yaml
+    is tracked. With `permuto` absent from SECRET_KEYS, one Save wrote the
+    wrapped BLS key into the repository. The warp block carries the same
+    warning verbatim, which is why the rule is a list and not a convention.
+    """
+    from gui.services.config_split import (
+        SECRET_KEYS,
+        WALLET_MANAGED_KEYS,
+        split_and_save,
+    )
+
+    assert "permuto" in SECRET_KEYS
+    assert "permuto" in WALLET_MANAGED_KEYS
+
+    cfg = tmp_path / "config.yaml"
+    sec = tmp_path / "secrets.yaml"
+    cfg.write_text("pairs: []\n", encoding="utf-8")
+    sec.write_text(
+        "permuto:\n  bls_private_key_dpapi: ON_DISK_SECRET\n", encoding="utf-8"
+    )
+
+    split_and_save(cfg, {
+        "pairs": [],
+        "permuto": {
+            "bls_private_key_dpapi": "STALE_SNAPSHOT_BLOB",
+            "bls_public_key": "PUB",
+            "registered": True,
+            "user_id": "u" * 64,
+        },
+    })
+
+    public = cfg.read_text(encoding="utf-8")
+    for leaked in ("STALE_SNAPSHOT_BLOB", "ON_DISK_SECRET", "bls_private_key_dpapi"):
+        assert leaked not in public, "identity material reached tracked config"
+    assert "permuto" not in public
+
+    # WALLET_MANAGED: the on-disk secret is authoritative, so a stale cached
+    # snapshot must not round-trip over it. That is how a rotated key gets
+    # destroyed -- the warp block was given this rule after exactly that.
+    assert "ON_DISK_SECRET" in sec.read_text(encoding="utf-8")
+    assert "STALE_SNAPSHOT_BLOB" not in sec.read_text(encoding="utf-8")
+
+
+def test_every_field_the_identity_writes_is_listed_as_a_secret():
+    """Derived from behaviour, not from a copy of the list.
+
+    Both key sets are hand-maintained, and the section they describe grows:
+    `link_attempted_at` was added for the indeterminate-link marker. A field
+    missing from SECRET_KEYS is written straight into git-tracked config.yaml
+    on the next Settings save, and one missing from WALLET_MANAGED_KEYS is
+    round-tripped back from a stale in-memory snapshot over the live file.
+    Enumerating the section the identity actually produces catches the next
+    field too.
+    """
+    from gui.services.config_split import SECRET_KEYS, WALLET_MANAGED_KEYS
+
+    ident_ = PermutoIdentity(FakeSecretsIO(), protector=FakeProtector())
+    ident_.create()
+    ident_.mark_backup_confirmed()
+    ident_.mark_link_attempt()
+    ident_.mark_registered(user_id="u" * 64, trading_address="xch1x",
+                           listing_verified=True)
+    ident_.mark_link_attempt()          # the marker can outlive a registration
+
+    written = set(ident_._io.read()["permuto"])
+    assert written <= SECRET_KEYS["permuto"], (
+        "unlisted identity fields leak to config.yaml: %s"
+        % sorted(written - SECRET_KEYS["permuto"])
+    )
+    assert written <= WALLET_MANAGED_KEYS["permuto"], (
+        "unlisted identity fields can be clobbered by a stale snapshot: %s"
+        % sorted(written - WALLET_MANAGED_KEYS["permuto"])
+    )
+
+
+def test_an_unconfirmed_identity_can_be_discarded(ident):
+    """Escape and the title-bar close both reject the phrase dialog, and the
+    key is persisted BEFORE it opens.  Without rollback that strands an
+    account whose only recovery phrase was just discarded, with Create
+    disabled because a key exists."""
+    ident.create()
+    assert ident.exists()
+    ident.discard_unregistered()
+    assert not ident.exists()
+    ident.create()          # and Create works again
+
+
+def test_a_registered_identity_is_never_discarded(ident):
+    """After linking, the key IS the account."""
+    ident.create()
+    ident.mark_registered(user_id="a" * 64, trading_address="xch1x")
+    with pytest.raises(PermutoIdentityError, match="REGISTERED"):
+        ident.discard_unregistered()
+    assert ident.exists()
+
+
+def test_restore_also_refuses_over_an_unresolved_link_attempt():
+    """The other "this key may be the account" state.
+
+    An operator whose link timed out is the one most likely to reach for
+    Restore -- and restore sweeps link_attempted_at, so guarding only on
+    `registered` protected one of the pair while destroying the evidence for
+    its sibling.
+    """
+    ident = PermutoIdentity(FakeSecretsIO(), protector=FakeProtector())
+    ident.create()
+    ident.mark_backup_confirmed()
+    ident.mark_link_attempt()
+
+    other = generate_mnemonic()
+    with pytest.raises(PermutoIdentityError, match="UNRESOLVED link attempt"):
+        ident.restore(other)
+
+    # And the marker survives the refusal.
+    assert ident.info().link_attempted is True
+
+
+def test_restore_still_allows_the_same_key_over_an_attempt():
+    """The machine-move path must keep working."""
+    ident = PermutoIdentity(FakeSecretsIO(), protector=FakeProtector())
+    _pubkey, phrase = ident.create()
+    ident.mark_backup_confirmed()
+    before = ident.public_key()
+    ident.mark_link_attempt()
+
+    ident.restore(phrase)
+    assert ident.public_key() == before
+
+
+def test_a_restored_key_must_be_reconciled_before_registering():
+    """[review] The machine-move path is the COMMON case for restore.
+
+    A phrase registered on another machine arrives here with none of its
+    metadata, so refresh() saw registered=False plus backup_confirmed=True and
+    offered the permanent Register action for a key the venue may already own.
+    """
+    ident = PermutoIdentity(FakeSecretsIO(), protector=FakeProtector())
+    _pubkey, _phrase = ident.create()
+    other = generate_mnemonic()
+
+    ident.restore(other)
+    info = ident.info()
+    assert info.link_attempted is True, "restore did not gate registration"
+    assert info.backup_confirmed is True
+    assert info.registered is False
+
+
+def test_restoring_the_same_phrase_does_not_disturb_its_registration():
+    ident = PermutoIdentity(FakeSecretsIO(), protector=FakeProtector())
+    _pubkey, phrase = ident.create()
+    ident.mark_backup_confirmed()
+    ident.mark_registered(user_id="u" * 64, trading_address="xch1example")
+
+    ident.restore(phrase)
+    info = ident.info()
+    assert info.registered is True
+    assert info.link_attempted is False
+
+
+def test_restoring_onto_a_clean_machine_needs_reconciliation_too():
+    """[sweep] The guard did not fire in the case it was written for.
+
+    `different_key` compares against a STORED key, and a fresh install has
+    none -- so restoring a phrase onto a clean machine, which is the entire
+    advertised machine-move path, showed the identity as ready to Register
+    even though it may already own an account.
+    """
+    ident = PermutoIdentity(FakeSecretsIO(), protector=FakeProtector())
+    phrase = generate_mnemonic()
+
+    ident.restore(phrase)
+    info = ident.info()
+    assert info.link_attempted is True, "a clean-machine restore was not gated"
+    assert info.registered is False
+    assert info.backup_confirmed is True

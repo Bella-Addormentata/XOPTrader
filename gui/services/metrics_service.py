@@ -489,6 +489,33 @@ class MetricsService(QObject):
             "wallet_connected": _labelled(m, "xop_node", "metric", "wallet_connected"),
         }
 
+    def has_data(self) -> bool:
+        """Whether the gauges can be trusted RIGHT NOW.
+
+        Every getter here returns 0.0 for a metric it has not seen, which is
+        indistinguishable from a real zero -- so a consumer that treats zero
+        as authoritative reports a disconnected engine as an idle one. The
+        venue switch needs the difference: "no offers resting" and "we cannot
+        see whether offers are resting" are opposite answers to the only
+        question it asks.
+
+        [review] Both halves, and the second one is why this was wrong. The
+        previous version returned `bool(self._latest)` -- has a scrape EVER
+        landed -- while its own docstring claimed to answer the current
+        question. `_on_failure()` clears `_connected` but deliberately
+        RETAINS `_latest`, so after the first successful scrape this stayed
+        true through an entire outage, and `_gather_dexie()` read a stale
+        `pending == 0.0` as proof the book was empty. The switch would then
+        show DEXIE OFF over offers that were still takeable, which is the
+        precise failure the OFF-means-flat contract exists to prevent.
+
+        Retaining `_latest` is right -- the dashboard should keep showing the
+        last known figures rather than blanking -- so the fix belongs here,
+        in the predicate that says whether they are authoritative.
+        """
+        with QMutexLocker(self._mutex):
+            return bool(self._latest) and self._connected
+
     def get_offers_summary(self) -> dict[str, float]:
         """Return aggregated offer counters.
 

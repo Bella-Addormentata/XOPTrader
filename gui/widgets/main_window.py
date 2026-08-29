@@ -12,10 +12,10 @@ Compliant with:
 
 from __future__ import annotations
 
-from collections import deque
-from datetime import datetime
 import logging
 import time
+from collections import deque
+from datetime import datetime
 from typing import Any, Final, Optional
 
 from PySide6.QtCore import QSettings, QSize, Qt, QTimer
@@ -39,8 +39,10 @@ from PySide6.QtWidgets import (
 )
 
 # -- Local widgets ----------------------------------------------------------
+from gui.services.venue_control import SwitchInputs
 from gui.widgets.sidebar import Sidebar
 from gui.widgets.status_bar import StatusBar
+from gui.widgets.venue_switch import VenueSwitch
 
 # -- Placeholder imports for widgets that will be created later -------------
 # Each of these will live in gui/widgets/<name>.py once implemented.
@@ -109,6 +111,11 @@ try:
 except ImportError:
     BaseWalletWidget = None  # type: ignore[assignment,misc]
 
+try:
+    from gui.widgets.permuto import PermutoWidget
+except ImportError:
+    PermutoWidget = None  # type: ignore[assignment,misc]
+
 # ---------------------------------------------------------------------------
 # Theme constants -- sourced from the canonical CHIA palette singleton.
 # ---------------------------------------------------------------------------
@@ -167,7 +174,8 @@ _PAGE_WALLET: Final[int] = 5
 _PAGE_REPORTS: Final[int] = 6
 _PAGE_WARP: Final[int] = 7
 _PAGE_BASE_WALLET: Final[int] = 8
-_PAGE_SETTINGS: Final[int] = 9
+_PAGE_PERMUTO: Final[int] = 9
+_PAGE_SETTINGS: Final[int] = 10
 
 
 def _fmt_usd(value: float) -> str:
@@ -301,6 +309,24 @@ class MainWindow(QMainWindow):
         self._connected: bool = False
         self._bot_running: bool = False
         self._bot_paused: bool = False
+        # Per-venue INTENT, distinct from what is happening. The switch shows
+        # the difference: intent ON plus a gate is BLOCKED, not ON.
+        self._dexie_desired_on: bool = False
+        self._dexie_intent_synced: bool = False
+        self._permuto_desired_on: bool = False
+        # Set when a QuoteRunner is owned by this window. Until then the
+        # Permuto switch refuses to turn on -- see _gather_permuto.
+        self._permuto_runner = None
+        self._permuto_book_is_empty: bool = True
+        # [review] Whether anything has actually LOOKED at the venue's book
+        # this process. False until a session reports it, because Permuto
+        # orders rest remotely and survive a crash, a kill, a power loss or a
+        # failed cancel -- so "no runner" means unknown, not empty.
+        self._permuto_book_confirmed_empty: bool = False
+        # Latched from the last tick: True while the loop cannot trade.
+        self._permuto_last_blocked: bool = False
+        #: The last tick's action, for the gate's operator-facing reason.
+        self._permuto_last_action: str = ""
         # True when the current Paused status is owned by the GUI flag (the
         # pause Resume can clear), False when a risk breaker holds it.
         self._gui_pause_owns_it: bool = True
@@ -577,6 +603,10 @@ class MainWindow(QMainWindow):
         # Ownership of a pause can change without a status transition;
         # keep the Resume control truthful on every tick.
         self._refresh_pause_ownership()
+        # Same reasoning for the venue switches: a breaker can trip, the dead
+        # man's switch can fire, and the resting-offer count can fall to zero
+        # -- none of which is a status-string transition.
+        self._refresh_venue_switches()
         pnl = data.get("pnl", {})
         health = data.get("health", {})
 
@@ -1456,11 +1486,11 @@ class MainWindow(QMainWindow):
 
         file_menu.addSeparator()
 
-        self._act_start_trading = QAction("&Start Trading", self)
+        self._act_start_trading = QAction("&Start Engine", self)
         self._act_start_trading.triggered.connect(self._on_start_stop)
         file_menu.addAction(self._act_start_trading)
 
-        self._act_stop_trading = QAction("S&top Trading", self)
+        self._act_stop_trading = QAction("S&hut Down Engine", self)
         self._act_stop_trading.setEnabled(False)
         self._act_stop_trading.triggered.connect(self._on_start_stop)
         file_menu.addAction(self._act_stop_trading)
@@ -1600,14 +1630,27 @@ class MainWindow(QMainWindow):
 
         toolbar.addSeparator()
 
-        # Start / Stop button
-        self._start_stop_btn = QPushButton("Start Trading")
-        self._start_stop_btn.setFixedSize(130, 36)
-        self._start_stop_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._start_stop_btn.setToolTip("Start or stop live trading on the CHIA DEX")
-        self._start_stop_btn.clicked.connect(self._on_start_stop)
-        self._style_start_stop_button()
-        toolbar.addWidget(self._start_stop_btn)
+        # Per-venue trading switches.
+        #
+        # These replaced a single "Start Trading" button, which conflated two
+        # separate questions: is the engine process alive, and is each venue
+        # trading. They are genuinely independent -- dexie is 24/7 and
+        # currently idle with both stablecoin issuers compromised, while
+        # Permuto runs a fixed contest window -- so the operator needs both,
+        # either, or neither, and the old control could not express that.
+        #
+        # Process lifecycle moved to the File menu. Killing the engine is
+        # rare and destructive, and it does not belong under the same click
+        # as "stop quoting on one venue".
+        self._dexie_switch = VenueSwitch("dexie", self._gather_dexie)
+        self._dexie_switch.toggleRequested.connect(self._on_dexie_toggle)
+        self._dexie_switch.refused.connect(self._on_switch_refused)
+        toolbar.addWidget(self._dexie_switch)
+
+        self._permuto_switch = VenueSwitch("permuto", self._gather_permuto)
+        self._permuto_switch.toggleRequested.connect(self._on_permuto_toggle)
+        self._permuto_switch.refused.connect(self._on_switch_refused)
+        toolbar.addWidget(self._permuto_switch)
 
         # Pause / Resume button
         self._pause_resume_btn = QPushButton("Pause Trading")
@@ -1622,43 +1665,17 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self._pause_resume_btn)
 
     def _style_start_stop_button(self) -> None:
-        """Apply the correct colour to the start/stop button."""
-        if self._bot_running:
-            self._start_stop_btn.setText("Stop Trading")
-            self._start_stop_btn.setStyleSheet(
-                f"""
-                QPushButton {{
-                    background-color: {LOSS_RED};
-                    color: white;
-                    border: none;
-                    border-radius: 8px;
-                    font-weight: bold;
-                    font-size: 13px;
-                    padding: 8px 16px;
-                }}
-                QPushButton:hover {{ background-color: #F06060; }}
-                """
-            )
-        else:
-            self._start_stop_btn.setText("Start Trading")
-            self._start_stop_btn.setStyleSheet(
-                f"""
-                QPushButton {{
-                    background-color: {PRIMARY_GREEN};
-                    color: white;
-                    border: none;
-                    border-radius: 8px;
-                    font-weight: bold;
-                    font-size: 13px;
-                    padding: 8px 16px;
-                }}
-                QPushButton:hover {{ background-color: {LIGHT_GREEN}; }}
-                """
-            )
+        """Keep the File-menu process actions in step with engine state.
 
-        # Keep File menu items in sync with the toolbar button.
+        The toolbar button this used to paint is gone -- trading is now two
+        per-venue switches, and starting or killing the engine PROCESS is a
+        different question that lives in the File menu. The menu items still
+        need syncing, and the venue switches need repainting because
+        `engine_down` is one of their gates.
+        """
         self._act_start_trading.setEnabled(not self._bot_running)
         self._act_stop_trading.setEnabled(self._bot_running)
+        self._refresh_venue_switches()
 
     def _refresh_pause_ownership(self) -> None:
         """Recompute who owns the current pause, and re-arm the controls.
@@ -1828,8 +1845,12 @@ class MainWindow(QMainWindow):
             BaseWalletWidget, "Base Wallet"
         )
         self._stacked.addWidget(self._base_wallet_widget)
+        self._permuto_widget = self._create_page_widget(            # index 9
+            PermutoWidget, "Permuto"
+        )
+        self._stacked.addWidget(self._permuto_widget)
         self._settings_widget = self._create_page_widget(SettingsWidget, "Settings")
-        self._stacked.addWidget(self._settings_widget)              # index 9
+        self._stacked.addWidget(self._settings_widget)              # index 10
         self._splitter.addWidget(self._stacked)
 
         # Bottom area: tab widget (35 %)
@@ -2117,6 +2138,295 @@ class MainWindow(QMainWindow):
         self._conn_label.setText("Disconnected")
         self._act_connect.setEnabled(True)
         self._act_disconnect.setEnabled(False)
+
+    # ------------------------------------------------------------------
+    # Per-venue trading switches
+    # ------------------------------------------------------------------
+
+    def _sync_dexie_intent_from_engine(self) -> None:
+        """Adopt the engine's actual posting state as our initial intent.
+
+        [review] EngineBridge.initialise() auto-starts the C++ engine without
+        creating pause.flag, so a freshly opened GUI attaches to an engine
+        that is already trading -- while this intent defaulted to False and
+        the switch read DEXIE OFF. A control that says OFF over a live book
+        is the failure this design was chosen to avoid, arriving through its
+        own initial value.
+
+        Runs once, on the first tick that can see the engine.
+        """
+        if self._dexie_intent_synced or self._bridge is None:
+            return
+        try:
+            reasons = self._bridge.metrics_service.posting_gate_reasons()
+        except Exception:  # noqa: BLE001 - try again on the next tick
+            return
+        self._dexie_intent_synced = True
+        # Posting ungated means it IS trading, whatever we assumed.
+        self._dexie_desired_on = not (reasons - {"dry_run"})
+
+    def _gather_dexie(self) -> SwitchInputs:
+        """What the dexie switch is allowed to claim right now.
+
+        Gates come from the engine's OWN posting-gate family rather than
+        being recomputed here, so the switch reports the gate the engine is
+        actually applying. `gui` is excluded because that IS this switch --
+        treating our own pause as a protection gate would make the switch
+        permanently unable to turn itself back on. `dry_run` is excluded
+        because it is a mode, not a fault.
+        """
+        gates: set[str] = set()
+        if not self._bot_running:
+            gates.add("engine_down")
+        else:
+            try:
+                if self._bridge is not None:
+                    reasons = (self._bridge.metrics_service
+                               .posting_gate_reasons() - {"dry_run"})
+                    # [review] `gui` is only OUR pause while this switch is
+                    # OFF. With intent ON, a gui gate means something ELSE
+                    # paused posting -- the Pause/Resume button, which still
+                    # exists -- and dropping it unconditionally left the
+                    # switch showing DEXIE ON over a paused Step 8.
+                    if not self._dexie_desired_on:
+                        reasons -= {"gui"}
+                    gates |= reasons
+            except Exception:  # noqa: BLE001 - a stale read must not arm it
+                # Fail CLOSED: if the gate state cannot be read we do not
+                # know whether a breaker holds, and guessing "clear" is how
+                # a switch turns trading on over a tripped one.
+                gates.add("breaker")
+
+        return SwitchInputs(
+            desired_on=self._dexie_desired_on,
+            gates=frozenset(gates),
+            book_is_empty=self._dexie_book_is_empty(),
+        )
+
+    def _dexie_book_is_empty(self) -> bool:
+        """Whether anything of ours is still resting on dexie.
+
+        Unknown counts as NOT empty. A secure cancel settles on chain, so the
+        honest default while we cannot see the book is that an offer may
+        still be takeable -- which shows STOPPING rather than a false OFF.
+        """
+        if self._bridge is None:
+            # [review round 11] Unknown, NOT empty. Dexie offers rest on
+            # chain and survive this process, so "no bridge yet" is an
+            # absence of evidence -- exactly what the docstring above says
+            # must not read as an empty book. In production this is a
+            # startup transient (set_bridge() lands right after
+            # construction); while it lasts, STOPPING is the honest state.
+            return False
+        try:
+            svc = self._bridge.metrics_service
+            # [review] A DISCONNECTED metrics service does not raise: every
+            # gauge defaults to 0.0, so pending==0 rendered as DEXIE OFF over
+            # a book that may still be takeable -- contradicting the
+            # unknown-is-not-empty contract three lines below. Connectivity
+            # has to be established before zero means anything.
+            if not svc.has_data():
+                return False
+            pending = svc.get_offers_summary()
+            return float(pending.get("pending", 0.0)) <= 0.0
+        except Exception:  # noqa: BLE001
+            # Unknown counts as NOT empty. A secure cancel settles on chain,
+            # so while we cannot see the book the honest reading is that an
+            # offer may still be takeable -- which shows STOPPING rather than
+            # a false OFF.
+            return False
+
+    def _gather_permuto(self) -> SwitchInputs:
+        gates: set[str] = set()
+        try:
+            from gui.widgets.permuto import _default_identity_factory
+
+            info = _default_identity_factory().info()
+            if not info.registered:
+                gates.add("not_registered")
+        except Exception:  # noqa: BLE001 - no identity is a normal state
+            gates.add("not_registered")
+
+        # [review] A tick that cannot trade is a gate, not a green light.
+        #
+        # `not_wired` was removed on the premise that owning a QuoteRunner
+        # guarantees a usable session. Nothing enforced that premise, and it
+        # was false: the live session was built with an empty token and every
+        # tick came back "blocked" while this painted PERMUTO ON. The session
+        # bootstrap fixes the cause; this makes the switch stop asserting
+        # something it never checked.
+        if self._permuto_last_blocked:
+            if self._permuto_last_action == "starting":
+                gates.add("starting")
+            elif self._permuto_last_action in ("blocked", ""):
+                gates.add("blocked")
+            else:
+                gates.add("not_quoting")
+
+        # The runner is the authority on its own book: it reports empty only
+        # once a cancel has been acknowledged, so a stop in flight keeps the
+        # switch on STOPPING rather than claiming OFF.
+        #
+        # [review] With NO runner the book is UNVERIFIED, and unverified is
+        # reported as empty here on purpose.
+        #
+        # Permuto orders rest at a REMOTE venue and outlive this process -- a
+        # crash, a kill, a power loss or a failed cancel all leave them there
+        # -- so a fresh GUI has genuinely not checked. But feeding that
+        # uncertainty in as `book_is_empty=False` makes may_turn_on() refuse
+        # with `cancels_pending`, which would mean a fresh GUI could NEVER arm
+        # Permuto. That is worse than the claim it fixes, because arming is
+        # precisely what resolves the uncertainty: the first tick calls
+        # open_orders() and reconcile() adopts whatever is really there.
+        #
+        # So the switch stays armable and the PROMISE is what gets corrected
+        # -- see VenueSwitch._tooltip_for, which no longer tells a Permuto
+        # operator that nothing is resting when nothing has looked.
+        book_empty = (self._permuto_runner.book_is_empty()
+                      if self._permuto_runner is not None else True)
+        return SwitchInputs(
+            desired_on=self._permuto_desired_on,
+            gates=frozenset(gates),
+            book_is_empty=book_empty,
+            book_verified=(self._permuto_runner is not None
+                           or self._permuto_book_confirmed_empty),
+        )
+
+    def _on_switch_refused(self, reason: str) -> None:
+        """Say why, in the status bar and in the log.
+
+        A switch that snaps back without explanation teaches the operator
+        that the control is unreliable rather than that something is holding
+        it.
+        """
+        self.statusBar().showMessage("Refused: %s" % reason, 8000)
+        _log.warning("[GUI] venue switch refused: %s", reason)
+
+    def _on_dexie_toggle(self, want_on: bool) -> None:
+        if want_on:
+            if self._bridge is not None and not self._bot_running:
+                self._bridge.start_engine()
+            if self._bridge is not None:
+                self._bridge.resume_trading()
+            self._dexie_desired_on = True
+        else:
+            # OFF means flat, not "stopped posting". Pause first so nothing
+            # new is placed while the cancels go out, THEN cancel -- the
+            # other order races a fresh ladder against its own cancellation.
+            if self._bridge is not None:
+                self._bridge.pause_trading()
+                # Capability, not hasattr. cancel_all_offers() EXISTS on the
+                # Phase 1 bridge and does nothing but log -- so probing for
+                # the method would have this switch go quiet about a book it
+                # never retracted, which is the failure the OFF-means-flat
+                # rule was chosen to avoid.
+                if getattr(self._bridge, "SUPPORTS_DIRECT_CONTROL", False):
+                    self._bridge.cancel_all_offers()
+                else:
+                    self._on_switch_refused(
+                        "posting stopped, but this build cannot cancel from "
+                        "the GUI -- offers already resting stay takeable "
+                        "until they expire or the engine shuts down")
+            self._dexie_desired_on = False
+        self._refresh_venue_switches()
+
+    def _on_permuto_toggle(self, want_on: bool) -> None:
+        if want_on:
+            if self._permuto_runner is None:
+                try:
+                    self._permuto_runner = self._make_permuto_live()
+                except Exception as exc:  # noqa: BLE001
+                    self._on_switch_refused(
+                        "could not start Permuto quoting: %s" % exc)
+                    return
+                self._permuto_runner.ticked.connect(self._on_permuto_tick)
+                self._permuto_runner.stopped.connect(self._on_permuto_stopped)
+            # [review round 11] Seed the non-trading latch BEFORE starting.
+            # desired_on flips true here, and without the seed the very next
+            # refresh painted PERMUTO ON while the first authentication,
+            # account read and placement had not happened -- the same
+            # green-over-nothing this latch exists to prevent, arriving
+            # through its own initial value. The first quote/hold tick
+            # clears it, exactly like every later recovery.
+            self._permuto_last_blocked = True
+            self._permuto_last_action = "starting"
+            self._permuto_runner.start()
+            self._permuto_desired_on = True
+        else:
+            # Ask it to stop. The switch stays STOPPING until the worker's
+            # cancel is acknowledged -- off means flat, and the acknowledgement
+            # is what makes that true rather than merely intended.
+            self._permuto_desired_on = False
+            # [release review] Clear the blocked latch on an operator stop.
+            # It is written ONLY by the tick handler, so a stop during a
+            # blocked spell -- the Sunday pause being the guaranteed one --
+            # froze it True with no ticks left to clear it, and every later
+            # arm attempt was refused until the GUI restarted. The next
+            # session re-derives it from its own first tick.
+            self._permuto_last_blocked = False
+            self._permuto_last_action = ""
+            if self._permuto_runner is not None:
+                self._permuto_runner.stop()
+        self._refresh_venue_switches()
+
+    def _make_permuto_live(self):
+        """Build the live session. Separated so tests can inject a fake."""
+        from gui.services.permuto.live import PermutoLive
+        from gui.widgets.permuto import _default_identity_factory
+
+        identity = _default_identity_factory()
+        # [release review] The page's displayed parameters are the ones the
+        # session runs with. They used to agree only because both were the
+        # same hard-coded defaults -- a GUI that shows one sizing while the
+        # loop trades another is how an operator misreads their own risk.
+        page = self._unwrap(self._permuto_widget)
+        kwargs = {}
+        if page is not None:
+            kwargs = {
+                "target_depth_usd": page._target_depth_usd,
+                "max_position_usd": page._max_position_usd,
+            }
+        return PermutoLive(identity, **kwargs)
+
+    def _on_permuto_tick(self, result) -> None:
+        action = getattr(result, "action", "?")
+        # A tick that reached the venue is proof the session works, and its
+        # withdraw/quote outcome is the first real observation of the book.
+        # [review] Gate on ANY non-trading outcome, not just the literal
+        # "blocked". withdraw is what a venue pause, a missing oracle or an
+        # unreadable account produce -- all states in which the loop holds no
+        # quotes and cannot trade -- and treating those as healthy cleared
+        # the latch, so the toolbar resolved to ON over a loop doing nothing.
+        # error did the same. Cleared only by a pass that actually traded or
+        # confirmed a good book.
+        self._permuto_last_blocked = action not in ("quote", "hold")
+        self._permuto_last_action = action
+        if action in ("quote", "hold", "withdraw", "wait"):
+            self._permuto_book_confirmed_empty = True
+        if not getattr(result, "ok", True):
+            _log.warning("[Permuto] tick error: %s",
+                         getattr(result, "error", ""))
+        self.statusBar().showMessage("Permuto: %s" % action, 4000)
+        self._refresh_venue_switches()
+
+    def _on_permuto_stopped(self, reason: str) -> None:
+        _log.info("[Permuto] %s", reason)
+        self.statusBar().showMessage("Permuto: %s" % reason, 10000)
+        self._refresh_venue_switches()
+
+    def _refresh_venue_switches(self) -> None:
+        """Repaint both switches. Cheap, and called on every data tick.
+
+        Polling rather than reacting to transitions: the gate set can change
+        while the status STRING stays the same -- a breaker tripping under an
+        existing pause is the documented case -- so a transition-only refresh
+        goes stale in both directions.
+        """
+        self._sync_dexie_intent_from_engine()
+        for switch in (getattr(self, "_dexie_switch", None),
+                       getattr(self, "_permuto_switch", None)):
+            if switch is not None:
+                switch.refresh()
 
     def _on_start_stop(self) -> None:
         """Toggle bot running state after user confirmation.
@@ -2407,7 +2717,24 @@ class MainWindow(QMainWindow):
         # process (qFatal) if a QThread is destroyed while still running, and
         # nothing else knows about these: EngineBridge.shutdown() owns the
         # services, not the pages' own threads.
-        for page in (self._wallet_balances, self._settings_widget):
+        # [review] THE LIVE SESSION STOPS FIRST. It owns real orders at a
+        # remote venue; the page workers own polling. Joining the pages first
+        # meant the trading loop kept placing and managing orders for however
+        # long those joins took -- each can block ~10s -- AFTER the operator
+        # asked to leave. The thing that can spend money yields before the
+        # things that merely read.
+        #
+        # join() asks it to stop and WAITS for the cancel -- closing the
+        # window while orders rest is the dead-man's-switch incident in a
+        # different venue.
+        if self._permuto_runner is not None:
+            try:
+                self._permuto_runner.join()
+            except Exception:  # noqa: BLE001 - teardown must not block exit
+                _log.exception("[Permuto] live session did not stop cleanly")
+
+        for page in (self._wallet_balances, self._settings_widget,
+                     self._permuto_widget):
             widget = self._unwrap(page)
             if widget is not None and hasattr(widget, "stop_background_work"):
                 widget.stop_background_work()

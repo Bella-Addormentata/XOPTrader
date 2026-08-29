@@ -23,6 +23,7 @@
 #include <unordered_map>
 #include <vector>
 #include <stdexcept>
+#include <xop/peg_registry.hpp>
 
 namespace xop {
 
@@ -2089,6 +2090,13 @@ struct AppConfig {
     ChiaConfig       chia;
     DexieConfig      dexie;
     std::vector<PairConfig> pairs;
+
+    /// [PEG 2026-08-26] Assets declared pegged, and to WHAT.  Replaces the
+    /// fifteen scattered `quote == "wUSDC.b" || ...` comparisons that each
+    /// independently decided an asset was worth exactly one dollar.  Empty
+    /// is legal and means "no asset is pegged" -- every lookup then returns
+    /// no valuation, which is the correct answer, not a reason to guess.
+    PegRegistry pegged_assets;
     StrategyConfig   strategy;
     RiskConfig       risk;
     VolatilityConfig volatility;

@@ -405,6 +405,143 @@ DexieConfig parse_dexie(const YAML::Node& root)
     return cfg;
 }
 
+// ---------------------------------------------------------------------------
+// [PEG 2026-08-26] parse_pegged_assets
+//
+// Optional section.  Absent or empty means no asset is declared pegged, and
+// every valuation lookup then returns "no value" rather than falling back to
+// a dollar -- which is the whole point: par is something the operator
+// asserts, not something the code assumes from a ticker symbol.
+// ---------------------------------------------------------------------------
+PegRegistry parse_pegged_assets(const YAML::Node& root)
+{
+    PegRegistry reg;
+    if (!root["pegged_assets"]) {
+        return reg;   // absent is legal: nothing is declared pegged
+    }
+    // Present but not a sequence -- a mapping produced by an indentation
+    // slip, say.  Treating that like absence would silently disable EVERY
+    // peg and zero all USD valuation on a typo, which is the opposite of
+    // the fail-loud contract this parser is meant to honour.
+    if (!root["pegged_assets"].IsSequence()) {
+        throw ConfigError(
+            "pegged_assets: expected a sequence of asset declarations, got "
+            "something else -- check the indentation.  Remove the section "
+            "entirely if no asset is pegged.");
+    }
+    for (const auto& item : root["pegged_assets"]) {
+        // [review round 11] BOTH peg fields are mandatory. PeggedAsset
+        // defaults peg_currency to "USD" and peg_target to 1.0, and this
+        // parser only overwrote keys that were PRESENT -- so an entry
+        // carrying nothing but an asset id was accepted and silently
+        // recreated the implicit $1 par this registry exists to remove. A
+        // half-declaration is a question, and the answer must come from the
+        // operator, not from a struct initialiser.
+        if (!item["peg_currency"] || !item["peg_target"]) {
+            const std::string who =
+                item["symbol"] ? item["symbol"].as<std::string>()
+                : item["asset_id"] ? item["asset_id"].as<std::string>()
+                : std::string{"<unnamed>"};
+            throw ConfigError(
+                "pegged_assets: '" + who + "' must declare BOTH "
+                "peg_currency and peg_target explicitly.  Omitting them "
+                "would silently default to a $1 USD par -- the implicit "
+                "assumption this section exists to replace.");
+        }
+        PeggedAsset a;
+        a.asset_id = item["asset_id"] ? item["asset_id"].as<std::string>() : "";
+        a.symbol   = item["symbol"]   ? item["symbol"].as<std::string>()   : "";
+
+        // [PEG 2026-08-27] Canonicalize and validate exactly as parse_pairs
+        // does (T3-29).  Without this an uppercase tail -- which Chia tools
+        // emit -- could never match the lowercased pair asset ids, and a
+        // malformed id would be accepted silently.  Either one removes the
+        // peg valuation the operator believes they declared, with no error
+        // to tell them.
+        std::transform(a.asset_id.begin(), a.asset_id.end(), a.asset_id.begin(),
+                       [](unsigned char c) {
+                           return static_cast<char>(std::tolower(c));
+                       });
+        if (a.asset_id != "xch") {
+            const bool well_formed =
+                a.asset_id.size() == 64
+                && a.asset_id.find_first_not_of("0123456789abcdef")
+                       == std::string::npos;
+            if (!well_formed) {
+                throw ConfigError(
+                    "pegged_assets: asset_id for '"
+                    + (a.symbol.empty() ? std::string{"<no symbol>"} : a.symbol)
+                    + "' must be \"xch\" or a 64-character hex CAT tail -- got '"
+                    + a.asset_id + "'.  A malformed id can never match a pair, "
+                      "so the declared peg would silently do nothing.");
+            }
+        }
+        if (item["peg_currency"]) {
+            // Canonicalise to trimmed upper case.  usd_par_value() matches
+            // "USD" exactly, while the parser accepted any non-empty string --
+            // so `peg_currency: usd` was ACCEPTED and then behaved like an
+            // unsupported foreign currency, silently removing the par the
+            // operator believed they had declared.  Same class as the asset-id
+            // canonicalisation above: a declaration that looks like protection
+            // and does nothing.
+            std::string cur = item["peg_currency"].as<std::string>();
+            const std::string ws = " \t\r\n";
+            const auto first = cur.find_first_not_of(ws);
+            const auto last  = cur.find_last_not_of(ws);
+            cur = (first == std::string::npos)
+                ? std::string{}
+                : cur.substr(first, last - first + 1);
+            std::transform(cur.begin(), cur.end(), cur.begin(),
+                           [](unsigned char c) {
+                               return static_cast<char>(std::toupper(c));
+                           });
+            a.peg_currency = cur;
+        }
+        if (item["peg_target"])   a.peg_target   = item["peg_target"].as<double>();
+        if (item["warn_pct"])     a.warn_pct     = item["warn_pct"].as<double>();
+        if (item["bail_pct"])     a.bail_pct     = item["bail_pct"].as<double>();
+        if (item["sustained_observations"]) {
+            a.sustained_observations =
+                item["sustained_observations"].as<std::uint32_t>();
+        }
+        if (item["enforce"]) a.enforce = item["enforce"].as<bool>();
+        if (item["prefer_market_cross"]) {
+            a.prefer_market_cross = item["prefer_market_cross"].as<bool>();
+        }
+        // [review] These three are PARSED AND STORED, but nothing consumes
+        // them yet: PegRegistry::classify() has no production caller, and
+        // DepegDetector is still built and fed solely from
+        // PairConfig::is_stablecoin and the pair loop. An operator who sets
+        // them is configuring a monitor that does not run -- which is the
+        // exact shape of the S30 failure, where BYC's only peg watch lived
+        // on a pair that had been disabled. Say so rather than accept them
+        // silently; wiring an asset-level detector is what closes S29.
+        if (item["warn_pct"] || item["bail_pct"]
+                || item["sustained_observations"]) {
+            spdlog::warn(
+                "[Config] pegged_assets.{}: warn_pct / bail_pct / "
+                "sustained_observations are recorded but NOT YET WIRED to a "
+                "detector. Peg monitoring still comes only from pairs marked "
+                "`is_stablecoin`, so declaring thresholds here does not by "
+                "itself watch this asset.", a.asset_id);
+        }
+
+        if (!reg.add(std::move(a))) {
+            // Loud: a half-declared peg silently dropped is how an asset
+            // ends up unmonitored while everyone assumes it is watched.
+            throw ConfigError(
+                "pegged_assets: incoherent entry for '"
+                + (item["symbol"] ? item["symbol"].as<std::string>()
+                                  : std::string{"<no symbol>"})
+                + "' -- needs a non-empty asset_id and peg_currency, "
+                  "finite values, bail_pct > warn_pct, and an asset_id not "
+                  "already declared above (a duplicate would silently "
+                  "replace the first entry's safety policy)");
+        }
+    }
+    return reg;
+}
+
 std::vector<PairConfig> parse_pairs(const YAML::Node& root)
 {
     const std::string sec = "pairs";
@@ -3211,6 +3348,139 @@ static void deep_merge(YAML::Node dst, const YAML::Node& src)
 // Public API
 // ---------------------------------------------------------------------------
 
+// [S29 review round 2] AN EMPTY REGISTRY MUST NOT BOOT INTO A ZERO BOOK.
+//
+// Before the registry, "wUSDC.b is a dollar" was compiled into fifteen call
+// sites.  Retiring that is the point of this work -- but it also means a
+// config written before `pegged_assets` existed now declares NOTHING, and
+// all fifteen implicit anchors are simply gone.  usd_per_xch() then finds no
+// par wrapper among the enabled pairs and returns 0.0, every asset prices at
+// $0, and equity collapses: precisely the S27 incident, arriving through the
+// upgrade meant to make valuation safer.
+//
+// The tempting fix is to ship a default declaration so the registry is never
+// empty.  That is the wrong shape twice over.  It re-introduces exactly the
+// hardcoded "this symbol is worth a dollar" belief the registry exists to
+// delete, only centralised -- and the only plausible candidate is wUSDC.b,
+// whose issuer was compromised on 2026-08-25 and whose implied peg ran
+// $0.73-$0.75 for hours.  A built-in default would ship the specific belief
+// that caused the loss, and would still not rescue an operator whose enabled
+// pairs quote in something else.
+//
+// So: no default, and no silent zero either -- a loud, specific warning
+// naming the pairs and both ways to fix it.
+//
+// WHY A WARNING AND NOT A HARD FAILURE.  Refusing to start was the first
+// attempt and it rejected 35 existing configurations, including this
+// project's own kMinimalValidYaml -- which is anchorless by design, and
+// which PeggedAssets_AbsentSectionIsLegalAndEmpty deliberately asserts is
+// legal.  Parse time cannot tell a real deployment about to price a live
+// book from a fixture that will never hold anything, because it does not
+// know what is in the wallet.
+//
+// The runtime guard does know, and it ARRIVES WITH PR #117 (S27):
+// unvaluable_book_must_fail_closed() pauses the engine when the book cannot
+// be valued, with actual holdings in hand.  On THIS branch an unvalued book
+// does not pause automatically -- the warning below says so -- and the
+// enforcement lands when #117 merges on top.  This is the early, actionable
+// heads-up that names the fix before the operator hits it.
+void validate_usd_anchor(const AppConfig& cfg)
+{
+    // An external XCH/USD feed is an anchor in its own right and needs no
+    // declaration at all (S27).  With one configured, every XCH-based
+    // conversion has a route and there is nothing to complain about.
+    //
+    // But only if the RUNTIME will actually accept it. usd_per_xch() gates
+    // the cached CoinGecko price through coingecko_feed_fresh_for_revival(),
+    // which treats a non-positive or non-finite threshold as permanently
+    // stale -- deliberately, so a frozen feed cannot quote forever. A config
+    // with cex_freshness_threshold_sec: 0 is therefore legal, silent, and
+    // anchorless: this check passed on the declaration while every tick
+    // rejected the value. Requiring a usable threshold here keeps the
+    // startup verdict and the runtime behaviour in agreement.
+    if (cfg.coingecko.enabled
+            && std::isfinite(cfg.market_data.cex_freshness_threshold_sec)
+            && cfg.market_data.cex_freshness_threshold_sec > 0.0) {
+        const auto& ids = cfg.coingecko.coin_ids;
+        if (std::find(ids.begin(), ids.end(), "chia") != ids.end()) {
+            return;
+        }
+    }
+
+    // The only route is an enabled pair whose quote asset carries a
+    // declared, enforced USD par.
+    // [review] MIRROR BOTH RUNTIME PREDICATES, or this certifies an anchor
+    // usd_per_xch() will not use. That function accepts only an enabled
+    // pair whose BASE is XCH and whose quote is a par WRAPPER -- which
+    // excludes prefer_market_cross assets, since those are valued through
+    // their market rather than their par. Checking any base and ignoring
+    // prefer_market_cross meant a config of only BYC/wUSDC.b, or only
+    // XCH/BYC with BYC cross-preferring, suppressed the warning while
+    // usd_per_xch() returned 0 and every XCH-quoted conversion stayed
+    // unavailable.
+    for (const auto& pair : cfg.pairs) {
+        if (!pair.enabled) continue;
+        if (pair.base_asset_id != "xch") continue;
+        const auto* a = cfg.pegged_assets.find(pair.quote_asset_id);
+        if (a != nullptr && a->enforce && !a->prefer_market_cross
+                && a->peg_currency == "USD") {
+            return;
+        }
+    }
+
+    std::string enabled_names;
+    for (const auto& pair : cfg.pairs) {
+        if (!pair.enabled) continue;
+        if (!enabled_names.empty()) enabled_names += ", ";
+        enabled_names += pair.name;
+    }
+    // Nothing enabled means nothing to value and nothing to protect, so an
+    // anchorless config is a legitimate (if idle) state rather than a fault.
+    if (enabled_names.empty()) {
+        return;
+    }
+
+    // The wording is deliberately narrower than an earlier draft, which
+    // promised the engine "will pause fail-closed rather than trade blind".
+    // That behaviour is S27's (PR #117); on this branch a never-valued asset
+    // does not set `degraded`, so nothing pauses -- equity simply reads $0,
+    // and equity_drawdown_frac returns 0.0 against a non-positive peak, so
+    // both breakers sit INERT rather than tripping. Promising protection
+    // that does not exist is worse than the missing anchor: an operator who
+    // reads it has been told the fault is contained.
+    //
+    // [review] The reverse became true in this PR and the message did not
+    // follow. unvaluable_book_must_fail_closed() pauses after the grace, so
+    // "nothing pauses automatically" now UNDER-promises -- an operator with
+    // an anchorless config was told the build has no automatic protection
+    // and would then meet a "Manual intervention required" pause they had
+    // been told could not happen. The error direction is the safe one; the
+    // description is still wrong, and a diagnostic nobody can match to the
+    // behaviour is a diagnostic they stop reading.
+    spdlog::warn(
+        // [review] Scoped to what actually follows. The earlier wording
+        // said every asset values at $0 and both breakers sit inert, which
+        // is false for some configurations this matches: with only XCH/BYC
+        // and BYC cross-preferring, quote_usd_factor() falls back to the
+        // declared par and asset_usd_pseudo_price() can still value both, so
+        // equity need not be zero. Overstating a warning is how it gets
+        // dismissed the time it is right.
+        "[Config] NO usd_per_xch() ANCHOR IS REACHABLE. Nothing priced "
+        "THROUGH XCH can be valued -- usd_per_xch() returns 0, so every "
+        "XCH-quoted conversion is unavailable. Assets with their own "
+        "enforced par may still value. IF that leaves equity at or near zero, "
+        "both drawdown breakers sit inert, because they cannot fire against a "
+        "zero peak -- which is the 2026-08-25 incident. This build DOES "
+        "protect itself: after the drawdown grace expires with an unvaluable "
+        "book, the engine fails closed and pauses, requiring manual "
+        "intervention. Enabled pairs: {}. Fix by declaring an "
+        "enabled XCH pair's quote asset under `pegged_assets:` with "
+        "enforce: true and prefer_market_cross: false (see "
+        "config.example.yaml; a config written before that section existed "
+        "declares nothing, and the old built-in $1 assumptions are gone).",
+        enabled_names);
+}
+
 AppConfig load_config(const std::string& path,
                       const std::string& secrets_path)
 {
@@ -3248,6 +3518,7 @@ AppConfig load_config(const std::string& path,
     cfg.chia       = parse_chia(root);
     cfg.dexie      = parse_dexie(root);
     cfg.pairs      = parse_pairs(root);
+    cfg.pegged_assets = parse_pegged_assets(root);
     cfg.strategy   = parse_strategy(root);
     cfg.risk       = parse_risk(root);
     cfg.volatility = parse_volatility(root);
@@ -3261,6 +3532,45 @@ AppConfig load_config(const std::string& path,
     cfg.inventory_aging = parse_inventory_aging(root);
     cfg.accounting = parse_accounting(root);
     cfg.market_data = parse_market_data(root);
+    validate_usd_anchor(cfg);
+
+    // [S27 review round 3] Since usd_per_xch() now prefers the external
+    // CoinGecko price, a polling interval LONGER than the freshness window
+    // makes that anchor stale for part of every cycle by construction: the
+    // gate rejects the cached value, valuation silently falls through to the
+    // DEX mid, and if the DEX anchor sits higher it can ratchet the equity
+    // peak -- so the next successful CoinGecko refresh reads as a drawdown
+    // the market never produced. Nothing about that looks like a
+    // misconfiguration in the logs, which is why it is called out here.
+    // [review] The same "chia" membership test validate_usd_anchor() uses.
+    // Without it this warned about "the external XCH anchor" alternating
+    // with the DEX for any enabled CoinGecko config -- a Bitcoin-only feed
+    // with a long interval got a diagnostic about an XCH anchor that does
+    // not exist, which is how operators learn to ignore warnings.
+    const auto& cg_ids = cfg.coingecko.coin_ids;
+    const bool cg_quotes_chia =
+        std::find(cg_ids.begin(), cg_ids.end(), "chia") != cg_ids.end();
+    if (cfg.coingecko.enabled && cg_quotes_chia
+            && cfg.market_data.cex_freshness_threshold_sec > 0.0) {
+        const double poll_s = cfg.coingecko.polling_interval_ms / 1000.0;
+        // Strictly greater, not >=. The freshness check accepts
+        // age <= threshold, and a fetch is completed and timestamped BEFORE
+        // valuation reads it -- so poll_s == threshold never produces a
+        // stale cycle during healthy polling. Warning on equality would cry
+        // wolf on a perfectly good configuration, and a warning that fires
+        // when nothing is wrong is how operators learn to ignore warnings.
+        if (poll_s > cfg.market_data.cex_freshness_threshold_sec) {
+            spdlog::warn(
+                "[Config] coingecko.polling_interval_ms ({:.0f}s) is not "
+                "shorter than market_data.cex_freshness_threshold_sec "
+                "({:.0f}s), so the external XCH anchor is STALE for part of "
+                "every poll cycle and valuation alternates between CoinGecko "
+                "and the DEX mid. That can ratchet the equity peak and make "
+                "the next refresh look like a drawdown. Set the polling "
+                "interval well inside the freshness window.",
+                poll_s, cfg.market_data.cex_freshness_threshold_sec);
+        }
+    }
     cfg.adverse_selection = parse_adverse_selection(root);
     cfg.market_allocator = parse_market_allocator(root);
     cfg.recovery   = parse_recovery(root);

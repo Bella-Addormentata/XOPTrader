@@ -1465,3 +1465,273 @@ TEST(ConfigParserTest, S31_ZeroWatchdogThresholdStaysLegal) {
     auto cfg = xop::load_config(tmp.path());
     EXPECT_EQ(cfg.risk.watchdog_stall_seconds, 0u);
 }
+
+// ============================================================================
+// [PEG 2026-08-27] pegged_assets parser
+//
+// The registry's own tests build PeggedAsset directly, so none of them would
+// notice the PARSER ignoring `enforce: false`, dropping
+// `prefer_market_cross`, or accepting the wrong YAML shape.  These close
+// that gap -- a peg silently mis-parsed is an asset everyone believes is
+// monitored and valued correctly when it is neither.
+// ============================================================================
+
+namespace {
+
+std::string with_pegs(const std::string& pegs) {
+    return std::string(kMinimalValidYaml) + pegs;
+}
+
+}  // namespace
+
+TEST(ConfigParserTest, PeggedAssets_AbsentSectionIsLegalAndEmpty) {
+    TempYaml tmp(kMinimalValidYaml);
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_TRUE(cfg.pegged_assets.empty())
+        << "no declaration means nothing is pegged -- not a default of $1";
+}
+
+TEST(ConfigParserTest, PeggedAssets_AllFieldsRoundTrip) {
+    TempYaml tmp(with_pegs(R"(
+pegged_assets:
+- asset_id: aabb000000000000000000000000000000000000000000000000000000000000
+  symbol: wTEST
+  peg_currency: USD
+  peg_target: 1.0
+  warn_pct: 3.0
+  bail_pct: 12.0
+  sustained_observations: 7
+  prefer_market_cross: false
+  enforce: true
+)"));
+    auto cfg = xop::load_config(tmp.path());
+    const auto* a = cfg.pegged_assets.find("aabb000000000000000000000000000000000000000000000000000000000000");
+    ASSERT_NE(a, nullptr);
+    EXPECT_EQ(a->symbol, "wTEST");
+    EXPECT_EQ(a->peg_currency, "USD");
+    EXPECT_DOUBLE_EQ(a->peg_target, 1.0);
+    EXPECT_DOUBLE_EQ(a->warn_pct, 3.0);
+    EXPECT_DOUBLE_EQ(a->bail_pct, 12.0);
+    EXPECT_EQ(a->sustained_observations, 7u);
+    EXPECT_FALSE(a->prefer_market_cross);
+    EXPECT_TRUE(a->enforce);
+}
+
+TEST(ConfigParserTest, PeggedAssets_AHalfDeclarationIsRefused) {
+    // [review round 11] PeggedAsset defaults peg_currency to "USD" and
+    // peg_target to 1.0, and the parser only overwrote PRESENT keys -- so an
+    // entry carrying nothing but an asset id was accepted and silently
+    // recreated the implicit $1 par this registry exists to remove. One
+    // case per omitted key.
+    {
+        TempYaml tmp(with_pegs(R"(
+pegged_assets:
+- asset_id: aabb000000000000000000000000000000000000000000000000000000000000
+  symbol: HALF
+  peg_target: 1.0
+)"));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError)
+            << "omitted peg_currency defaulted to USD";
+    }
+    {
+        TempYaml tmp(with_pegs(R"(
+pegged_assets:
+- asset_id: aabb000000000000000000000000000000000000000000000000000000000000
+  symbol: HALF
+  peg_currency: USD
+)"));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError)
+            << "omitted peg_target defaulted to 1.0";
+    }
+    {
+        TempYaml tmp(with_pegs(R"(
+pegged_assets:
+- asset_id: aabb000000000000000000000000000000000000000000000000000000000000
+  symbol: BARE
+)"));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError)
+            << "a bare asset id recreated the full implicit par";
+    }
+}
+
+TEST(ConfigParserTest, PeggedAssets_EnforceFalseSurvivesTheParser) {
+    // The switch that did not exist when an issuer was compromised.  If the
+    // parser dropped it, an operator would set it and nothing would change.
+    TempYaml tmp(with_pegs(R"(
+pegged_assets:
+- asset_id: dead000000000000000000000000000000000000000000000000000000000000
+  symbol: GONE
+  peg_currency: USD
+  peg_target: 1.0
+  enforce: false
+)"));
+    auto cfg = xop::load_config(tmp.path());
+    ASSERT_NE(cfg.pegged_assets.find("dead000000000000000000000000000000000000000000000000000000000000"), nullptr) << "declaration retained";
+    EXPECT_FALSE(cfg.pegged_assets.is_pegged("dead000000000000000000000000000000000000000000000000000000000000"));
+    EXPECT_FALSE(cfg.pegged_assets.usd_par_value("dead000000000000000000000000000000000000000000000000000000000000").has_value())
+        << "an unenforced peg must not value anything";
+}
+
+TEST(ConfigParserTest, PeggedAssets_PreferMarketCrossSurvivesTheParser) {
+    TempYaml tmp(with_pegs(R"(
+pegged_assets:
+- asset_id: cd90000000000000000000000000000000000000000000000000000000000000
+  symbol: CDP
+  peg_currency: USD
+  peg_target: 1.0
+  prefer_market_cross: true
+)"));
+    auto cfg = xop::load_config(tmp.path());
+    const auto* a = cfg.pegged_assets.find("cd90000000000000000000000000000000000000000000000000000000000000");
+    ASSERT_NE(a, nullptr);
+    EXPECT_TRUE(a->prefer_market_cross)
+        << "wrapper-vs-CDP is what selects the valuation path";
+}
+
+TEST(ConfigParserTest, PeggedAssets_NonUsdDeclarationParsesAndYieldsNoUsdValue) {
+    TempYaml tmp(with_pegs(R"(
+pegged_assets:
+- asset_id: e040000000000000000000000000000000000000000000000000000000000000
+  symbol: wEURC
+  peg_currency: EUR
+  peg_target: 1.0
+)"));
+    auto cfg = xop::load_config(tmp.path());
+    const auto* a = cfg.pegged_assets.find("e040000000000000000000000000000000000000000000000000000000000000");
+    ASSERT_NE(a, nullptr);
+    EXPECT_EQ(a->peg_currency, "EUR");
+    EXPECT_FALSE(cfg.pegged_assets.usd_par_value("e040000000000000000000000000000000000000000000000000000000000000").has_value())
+        << "no FX rate supplied, so no USD value -- never a silent 1:1";
+    EXPECT_TRUE(cfg.pegged_assets.usd_par_value("e040000000000000000000000000000000000000000000000000000000000000", 1.09).has_value());
+}
+
+TEST(ConfigParserTest, PeggedAssets_IncoherentEntryThrows) {
+    // Dropped silently, this is an asset everyone assumes is watched.
+    TempYaml tmp(with_pegs(R"(
+pegged_assets:
+- asset_id: bad0000000000000000000000000000000000000000000000000000000000000
+  symbol: BAD
+  peg_currency: USD
+  peg_target: 1.0
+  warn_pct: 10.0
+  bail_pct: 2.0
+)"));
+    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError)
+        << "bail_pct must exceed warn_pct or the warning can never fire first";
+}
+
+TEST(ConfigParserTest, PeggedAssets_MissingAssetIdThrows) {
+    TempYaml tmp(with_pegs(R"(
+pegged_assets:
+- symbol: NOID
+  peg_currency: USD
+  peg_target: 1.0
+)"));
+    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+}
+
+TEST(ConfigParserTest, PeggedAssets_NonFiniteTargetThrows) {
+    TempYaml tmp(with_pegs(R"(
+pegged_assets:
+- asset_id: 1f00000000000000000000000000000000000000000000000000000000000000
+  symbol: INF
+  peg_currency: USD
+  peg_target: .inf
+)"));
+    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError)
+        << "+inf satisfies `> 0` and would reach llround as an infinite factor";
+}
+
+TEST(ConfigParserTest, PeggedAssets_MalformedSectionThrowsRatherThanDisablingEveryPeg) {
+    // A mapping instead of a sequence -- an indentation slip.  Treating it
+    // like absence would silently zero all USD valuation on a typo.
+    TempYaml tmp(with_pegs(R"(
+pegged_assets:
+  asset_id: oops
+  symbol: OOPS
+)"));
+    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+}
+
+TEST(ConfigParserTest, PeggedAssets_UppercaseAssetIdIsLowercased) {
+    // Chia tools emit uppercase hex.  Without canonicalization the
+    // declaration could never match a pair's lowercased asset id, so the
+    // peg would silently do nothing while looking configured.
+    TempYaml tmp(with_pegs(R"(
+pegged_assets:
+- asset_id: AABBCCDDEEFF00112233445566778899AABBCCDDEEFF00112233445566778899
+  symbol: UPPER
+  peg_currency: USD
+  peg_target: 1.0
+)"));
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_NE(cfg.pegged_assets.find(
+        "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"),
+        nullptr);
+}
+
+TEST(ConfigParserTest, PeggedAssets_MalformedAssetIdThrows) {
+    // A placeholder or typo must fail at startup, not key on a string no
+    // asset can ever match.
+    TempYaml tmp(with_pegs(R"(
+pegged_assets:
+- asset_id: REPLACE_WITH_REAL_TAIL
+  symbol: PLACEHOLDER
+  peg_currency: USD
+  peg_target: 1.0
+)"));
+    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+}
+
+TEST(ConfigParserTest, PeggedAssets_XchIsAValidAssetId) {
+    TempYaml tmp(with_pegs(R"(
+pegged_assets:
+- asset_id: xch
+  symbol: XCH
+  peg_currency: USD
+  peg_target: 1.0
+)"));
+    EXPECT_NO_THROW(xop::load_config(tmp.path()));
+}
+
+TEST(ConfigParserTest, PeggedAssets_DuplicateAssetIdThrows) {
+    TempYaml tmp(with_pegs(R"(
+pegged_assets:
+- asset_id: aa11000000000000000000000000000000000000000000000000000000000000
+  symbol: ONE
+  peg_currency: USD
+  peg_target: 1.0
+- asset_id: aa11000000000000000000000000000000000000000000000000000000000000
+  symbol: TWO
+  peg_currency: USD
+  peg_target: 1.0
+)"));
+    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+}
+
+TEST(ConfigParserTest, PeggedAssets_PegCurrencyIsCanonicalised) {
+    // usd_par_value() matches "USD" exactly. The parser accepted any
+    // non-empty string, so `peg_currency: usd` was accepted and then behaved
+    // like an unsupported foreign currency -- silently removing the par the
+    // operator believed they had declared.
+    for (const char* written : {"usd", " USD ", "Usd", "\tuSd\n"}) {
+        TempYaml tmp(with_pegs(std::string(R"(
+pegged_assets:
+- asset_id: "aa11bb22cc33dd44ee55ff6600112233445566778899aabbccddeeff00112233"
+  symbol: TEST
+  peg_currency: ")") + written + R"("
+  peg_target: 1.0
+  warn_pct: 2.0
+  bail_pct: 10.0
+)"));
+        auto cfg = xop::load_config(tmp.path());
+        const auto* a = cfg.pegged_assets.find(
+            "aa11bb22cc33dd44ee55ff6600112233445566778899aabbccddeeff00112233");
+        ASSERT_NE(a, nullptr) << "written as: " << written;
+        EXPECT_EQ(a->peg_currency, "USD") << "written as: " << written;
+        EXPECT_TRUE(cfg.pegged_assets.usd_par_value(
+            "aa11bb22cc33dd44ee55ff6600112233445566778899aabbccddeeff00112233")
+                        .has_value())
+            << "a canonicalised USD peg must still yield a par: " << written;
+    }
+}

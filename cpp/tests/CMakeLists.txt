@@ -70,7 +70,9 @@ add_executable(xop_tests
     test_orderbook_mid.cpp
     test_published_mid.cpp
     test_mid_gate.cpp
+    test_peg_registry.cpp
     test_valuation_authority.cpp
+    test_usd_route.cpp
     test_coin_lock_ledger.cpp
     test_exposure_gate.cpp
     test_reservation_offset.cpp
@@ -78,6 +80,7 @@ add_executable(xop_tests
     test_reward_ingest.cpp
     test_drawdown_breaker.cpp
     test_watchdog.cpp
+    test_height_source.cpp
     test_settled_fill.cpp
     test_wallet_poll_throttle.cpp
 )
