@@ -543,6 +543,25 @@ asio::awaitable<int> OfferManager::post_quotes(
                            "than publishing it", pair.name, tier.tier_index,
                            late_id.empty() ? "<unknown>" : late_id);
             if (!late_id.empty()) {
+                // [review round 11] Adopt BEFORE cancelling, as the
+                // merged path does: a secure cancel is an unconfirmed
+                // spend, and a counterparty can still win the race -- a
+                // fill on an unadopted trade is invisible to detection and
+                // to the next startup.
+                {
+                    PendingOffer pending;
+                    pending.offer_id         = late_id;
+                    pending.pair_name        = pair.name;
+                    pending.side             = tier.side;
+                    pending.price            = tier.price;
+                    pending.size             = tier.size;
+                    pending.tier             = tier.tier_index;
+                    pending.created_at_block = block_height;
+                    pending.created_at_ts    = std::chrono::system_clock::now();
+                    pending.fee_mojos        = current_fee_mojos_;
+                    pending.post_spread_bps  = tier.spread_bps;
+                    state_->upsert_offer(pending);
+                }
                 try {
                     co_await cancel_offer_charged(
                         late_id, xop::risk::watchdog_cancel().fee_mojos,
@@ -3218,6 +3237,25 @@ asio::awaitable<int> OfferManager::post_merged_side(
                                tier.tier_index,
                                late_id.empty() ? "<unknown>" : late_id);
                 if (!late_id.empty()) {
+                    // [review round 11] Adopt BEFORE cancelling, as the
+                    // merged path does: a secure cancel is an unconfirmed
+                    // spend, and a counterparty can still win the race -- a
+                    // fill on an unadopted trade is invisible to detection and
+                    // to the next startup.
+                    {
+                        PendingOffer pending;
+                        pending.offer_id         = late_id;
+                        pending.pair_name        = pair.name;
+                        pending.side             = tier.side;
+                        pending.price            = tier.price;
+                        pending.size             = tier.size;
+                        pending.tier             = tier.tier_index;
+                        pending.created_at_block = block_height;
+                        pending.created_at_ts    = std::chrono::system_clock::now();
+                        pending.fee_mojos        = current_fee_mojos_;
+                        pending.post_spread_bps  = tier.spread_bps;
+                        state_->upsert_offer(pending);
+                    }
                     try {
                         co_await cancel_offer_charged(
                             late_id, xop::risk::watchdog_cancel().fee_mojos,
