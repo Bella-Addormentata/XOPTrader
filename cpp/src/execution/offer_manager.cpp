@@ -3332,7 +3332,7 @@ asio::awaitable<int> OfferManager::post_merged_side(
                 pending.pair_name        = pair.name;
                 pending.side             = tiers.front().side;
                 pending.price            = tiers.front().price;
-                pending.size             = 0.0;
+                pending.size             = 0;
                 for (const auto& tier : tiers) {
                     pending.size += tier.size;
                     const bool worse = (tier.side == Side::Bid)
