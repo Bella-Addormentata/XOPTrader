@@ -11670,8 +11670,21 @@ Mojo Engine::asset_usd_pseudo_price(const AssetId& asset_id) const
         }
         const double f = quote_usd_factor(pair);
         if (snap.mid_price > 0 && snap.mid_valuation_grade && f > 0.0) {
-            return static_cast<Mojo>(std::llround(
-                static_cast<double>(snap.mid_price) * f));
+            // [sweep] Checked, like the quote branch below. This one was
+            // missed when the guard went in, and it is the branch the
+            // overflow actually reaches: mid_price is 1e12-scaled, so a
+            // 20-unit mid against the maximum declarable par is 2e19 -- the
+            // exact product test_peg_registry.cpp asserts to be out of range.
+            // `continue` rather than 0, because another enabled pair may
+            // still price this asset as base.
+            if (const auto m = to_mojo_checked(
+                    static_cast<double>(snap.mid_price) * f)) {
+                return *m;
+            }
+            spdlog::warn("[Engine] asset_usd_pseudo_price({}) overflowed via "
+                         "{} at factor {}; trying the next pair",
+                         asset_id.substr(0, 12), pair.name, f);
+            continue;
         }
     }
     // Otherwise price it as the QUOTE of an enabled pair (per-unit value).
