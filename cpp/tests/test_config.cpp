@@ -1502,6 +1502,43 @@ pegged_assets:
     EXPECT_TRUE(a->enforce);
 }
 
+TEST(ConfigParserTest, PeggedAssets_AHalfDeclarationIsRefused) {
+    // [review round 11] PeggedAsset defaults peg_currency to "USD" and
+    // peg_target to 1.0, and the parser only overwrote PRESENT keys -- so an
+    // entry carrying nothing but an asset id was accepted and silently
+    // recreated the implicit $1 par this registry exists to remove. One
+    // case per omitted key.
+    {
+        TempYaml tmp(with_pegs(R"(
+pegged_assets:
+- asset_id: aabb000000000000000000000000000000000000000000000000000000000000
+  symbol: HALF
+  peg_target: 1.0
+)"));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError)
+            << "omitted peg_currency defaulted to USD";
+    }
+    {
+        TempYaml tmp(with_pegs(R"(
+pegged_assets:
+- asset_id: aabb000000000000000000000000000000000000000000000000000000000000
+  symbol: HALF
+  peg_currency: USD
+)"));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError)
+            << "omitted peg_target defaulted to 1.0";
+    }
+    {
+        TempYaml tmp(with_pegs(R"(
+pegged_assets:
+- asset_id: aabb000000000000000000000000000000000000000000000000000000000000
+  symbol: BARE
+)"));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError)
+            << "a bare asset id recreated the full implicit par";
+    }
+}
+
 TEST(ConfigParserTest, PeggedAssets_EnforceFalseSurvivesTheParser) {
     // The switch that did not exist when an issuer was compromised.  If the
     // parser dropped it, an operator would set it and nothing would change.

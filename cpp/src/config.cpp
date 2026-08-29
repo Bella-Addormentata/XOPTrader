@@ -430,6 +430,24 @@ PegRegistry parse_pegged_assets(const YAML::Node& root)
             "entirely if no asset is pegged.");
     }
     for (const auto& item : root["pegged_assets"]) {
+        // [review round 11] BOTH peg fields are mandatory. PeggedAsset
+        // defaults peg_currency to "USD" and peg_target to 1.0, and this
+        // parser only overwrote keys that were PRESENT -- so an entry
+        // carrying nothing but an asset id was accepted and silently
+        // recreated the implicit $1 par this registry exists to remove. A
+        // half-declaration is a question, and the answer must come from the
+        // operator, not from a struct initialiser.
+        if (!item["peg_currency"] || !item["peg_target"]) {
+            const std::string who =
+                item["symbol"] ? item["symbol"].as<std::string>()
+                : item["asset_id"] ? item["asset_id"].as<std::string>()
+                : std::string{"<unnamed>"};
+            throw ConfigError(
+                "pegged_assets: '" + who + "' must declare BOTH "
+                "peg_currency and peg_target explicitly.  Omitting them "
+                "would silently default to a $1 USD par -- the implicit "
+                "assumption this section exists to replace.");
+        }
         PeggedAsset a;
         a.asset_id = item["asset_id"] ? item["asset_id"].as<std::string>() : "";
         a.symbol   = item["symbol"]   ? item["symbol"].as<std::string>()   : "";
@@ -3347,11 +3365,12 @@ static void deep_merge(YAML::Node dst, const YAML::Node& src)
 // book from a fixture that will never hold anything, because it does not
 // know what is in the wallet.
 //
-// The runtime guard does know, and it already exists: S27's
+// The runtime guard does know, and it ARRIVES WITH PR #117 (S27):
 // unvaluable_book_must_fail_closed() pauses the engine when the book cannot
-// be valued, with actual holdings in hand.  So the enforcement lives there
-// and this is the early, actionable heads-up that names the fix before the
-// operator hits it.
+// be valued, with actual holdings in hand.  On THIS branch an unvalued book
+// does not pause automatically -- the warning below says so -- and the
+// enforcement lands when #117 merges on top.  This is the early, actionable
+// heads-up that names the fix before the operator hits it.
 void validate_usd_anchor(const AppConfig& cfg)
 {
     // [review] NO CoinGecko EXEMPTION HERE, deliberately.

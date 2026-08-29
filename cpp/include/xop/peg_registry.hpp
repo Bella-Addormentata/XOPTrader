@@ -407,11 +407,16 @@ struct CrossSelection {
 /// worst-case location error is about half the spread, so a wide book is
 /// worse evidence than the declared par it would override. `spread_bps` of 0
 /// means one-sided or crossed and never qualifies.
+// [review round 11] NOT noexcept: the winning candidate's pair_name is
+// copied into the returned CrossSelection, and a std::string copy may
+// allocate. Declaring noexcept converts an ordinary bad_alloc into
+// std::terminate -- a crash promise this function has no business making
+// for a bookkeeping copy.
 [[nodiscard]] inline CrossSelection select_market_cross(
     const std::string& target,
     const std::vector<CrossCandidate>& candidates,
     const PegRegistry& registry,
-    double max_spread_bps) noexcept
+    double max_spread_bps)
 {
     const auto is_par_wrapper = [&registry](const std::string& id) {
         const auto* a = registry.find(id);
