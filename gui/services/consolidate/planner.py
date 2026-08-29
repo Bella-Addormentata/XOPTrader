@@ -1,0 +1,930 @@
+"""Pure planning logic for emergency consolidation.
+
+No network, no wallet, no Qt -- everything here is a function of its
+arguments, so the part where a mistake costs money is the part that can be
+tested exhaustively.
+
+THE ANCHOR PROBLEM
+------------------
+The obvious reference for "is this offer a fair price" is the median of the
+book being swept.  On these books that is fatal.  From one block of
+``logs/xop_trader.1.log`` on 2026-08-25 (05:18:24-27), counting offers the
+engine's own outlier filter rejected against those it kept:
+
+    wmilliETH.b/XCH   8 rejected vs   3 kept    (~73% junk)
+    BYC/wUSDC.b       6 rejected vs   7 kept    (~46% junk, and one-sided)
+    XCH/wUSDC.b       9 rejected vs  13 kept
+    XCH/BYC           6 rejected vs  29 kept
+
+A median tolerates contamination below 50%.  Two of those books are at or
+past it -- and they are exactly the books an operator escaping an impaired
+asset would be sweeping.  So the anchor MUST come from outside the book
+being swept.  ``Anchor`` carries its own provenance for that reason: the UI
+shows where the number came from, so a nonsense reference can be spotted
+before execution rather than after.
+
+DIRECTION CONVENTION
+--------------------
+Every rate in this module is expressed as **units of the asset we give per
+unit of the asset we receive** -- the price of what we are buying, in what
+we are spending.  Lower is better, always.  Fixing one convention here and
+converting at the edges avoids the inverted-rate class of bug entirely.
+"""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass, field
+
+__all__ = [
+    "Anchor",
+    "denomination",
+    "ConsolidationPlan",
+    "Leg",
+    "OfferCandidate",
+    "PlanError",
+    "build_plan",
+    "effective_rate",
+    "rate_deviation_frac",
+]
+
+
+#: Raw units per display unit.  XCH is 10^12 mojos; every CAT is 10^3.  The
+#: same split the engine applies (``rec.asset_id == "xch" ? 1e12 : 1e3`` in
+#: compute_portfolio_equity_usd) and the config parser enforces.
+XCH_UNITS = 10 ** 12
+CAT_UNITS = 10 ** 3
+
+
+def canonical_asset(asset_id: str) -> str:
+    """Fold an asset id for comparison.
+
+    Asset ids reach this module from two directions and do not agree on case:
+    the wallet lowercases them while settings can carry uppercase (see
+    gui/services/engine_bridge.py). Exact matching therefore classified a
+    perfectly good offer as malformed and returned an empty plan -- and
+    "nothing was cheap enough" is what the operator would have read.
+    """
+    return asset_id.strip().lower()
+
+
+def denomination(asset_id: str) -> int:
+    """Raw units per display unit of ``asset_id``.
+
+    [review round 4] This folded with a bare ``.lower()`` while every id
+    COMPARISON in the module folds with :func:`canonical_asset`, which also
+    strips. Settings ids arrive untrimmed, so ``" XCH "`` was accepted as XCH
+    by ``_usable`` and then scaled here as a CAT -- 10^3 instead of 10^12, the
+    same 10^9 error described in :class:`OfferCandidate`, reintroduced by the
+    one place left folding differently. Any id the module is willing to MATCH
+    as XCH must also be DENOMINATED as XCH, so both use one function.
+    """
+    return XCH_UNITS if canonical_asset(asset_id) == "xch" else CAT_UNITS
+
+
+class PlanError(ValueError):
+    """Raised when a plan cannot be built at all (as opposed to being empty)."""
+
+
+@dataclass(frozen=True)
+class Anchor:
+    """A reference rate that did NOT come from the book being swept.
+
+    Parameters
+    ----------
+    rate:
+        Give-per-receive, same convention as everything else here.
+    source:
+        Human-readable provenance, shown verbatim in the confirmation
+        dialog.  "dexie price_last", "engine snapshot mid", "implied via
+        XCH".  The operator is the last line of defence against a bad
+        anchor, and they can only exercise that if they can see it.
+    """
+
+    rate: float
+    source: str
+
+    def __post_init__(self) -> None:
+        if not (self.rate > 0.0) or self.rate != self.rate or self.rate == float("inf"):
+            raise PlanError(f"anchor rate must be finite and positive, got {self.rate!r}")
+        if not self.source.strip():
+            # The operator is the last line of defence against a bad
+            # reference and can only exercise that if the dialog shows them
+            # something. "   " passes `not self.source` and displays as
+            # nothing at all.
+            raise PlanError("anchor must carry its provenance")
+
+
+@dataclass(frozen=True)
+class OfferCandidate:
+    """One dexie offer, reduced to what the planner needs.
+
+    ``give_amount`` / ``receive_amount`` are in the raw integer units of
+    their respective assets (mojos for XCH, CAT mojos otherwise), exactly as
+    the wallet reports them.
+
+    An earlier version of this docstring claimed the planner could form
+    ratios directly because "unit scaling cancels".  **It does not cancel
+    across two different assets.**  XCH carries 10^12 raw units per display
+    unit and a CAT carries 10^3, so a 2 BYC-per-XCH offer expressed raw is
+    2000 / 10^12 = 2e-9 -- while a dexie or engine anchor for the same offer
+    is 2.0, a factor of 10^9 apart.  Depending on direction that makes every
+    offer pass the cap or every offer fail it, and neither failure looks
+    like a bug from the outside.  :func:`effective_rate` normalises both
+    sides by :func:`denomination` so rates are display-denominated and
+    directly comparable with the anchor.
+    """
+
+    offer_id: str
+    give_asset: str
+    receive_asset: str
+    give_amount: int
+    receive_amount: int
+    status: int = 0  # 0 == PENDING_ACCEPT, i.e. takeable
+
+
+@dataclass(frozen=True)
+class Leg:
+    """One hop of a plan: a set of offers taken to convert one asset to another."""
+
+    give_asset: str
+    receive_asset: str
+    anchor: Anchor
+    offers: tuple[OfferCandidate, ...]
+    give_total: int
+    receive_total: int
+
+    @property
+    def realised_rate(self) -> float:
+        """Blended give-per-receive for the whole leg, in DISPLAY units.
+
+        Same denomination trap as effective_rate, and it survived the fix
+        there: dividing the raw totals reports a 2-BYC-per-XCH leg as 2e-9.
+        This is the number a confirmation dialog shows next to the anchor the
+        operator chose, so the two must be in the same units or the comparison
+        it invites is meaningless.
+        """
+        if self.receive_total <= 0:
+            return float("inf")
+        give = self.give_total / denomination(self.give_asset)
+        receive = self.receive_total / denomination(self.receive_asset)
+        if receive <= 0.0:
+            return float("inf")
+        return give / receive
+
+
+@dataclass
+class ConsolidationPlan:
+    """What the button will do, in enough detail to be shown before it runs."""
+
+    source_asset: str
+    target_asset: str
+    legs: list[Leg] = field(default_factory=list)
+    skipped_worse_than_cap: int = 0
+    skipped_malformed: int = 0
+    skipped_too_large: int = 0
+    skipped_duplicate: int = 0
+    skipped_rolled_back: int = 0
+    """First-hop offers dropped so the second hop could complete.
+
+    Every other counter here says why an offer was REFUSED -- too dear, too
+    large, malformed, repeated.  These were none of those: they were inside
+    the cap and affordable, and taking them would have raised the blended
+    first-leg rate far enough to price the second hop out of the route.  They
+    are counted separately because "we chose not to take a perfectly good
+    offer" is a different sentence to show an operator than "nothing was
+    cheap enough", and without this they would be in no counter at all.
+    """
+    unspent_source: int = 0
+    hop_residual: int = 0
+    """Hop-asset units the second leg could not spend.
+
+    A two-hop plan buys the intermediate asset with the FIRST take and sells
+    it with the second.  When the second leg cannot absorb everything the
+    first yields -- its offers are too large, too expensive, or too few --
+    the difference is left sitting in an asset the operator did not want and
+    did not ask to hold.  Silently, previously.  It is surfaced so the
+    confirmation dialog can state it before anything executes.
+    """
+
+    @property
+    def is_empty(self) -> bool:
+        return not any(leg.offers for leg in self.legs)
+
+    @property
+    def take_count(self) -> int:
+        return sum(len(leg.offers) for leg in self.legs)
+
+    @property
+    def receive_total(self) -> int:
+        return self.legs[-1].receive_total if self.legs else 0
+
+    @property
+    def give_total(self) -> int:
+        return self.legs[0].give_total if self.legs else 0
+
+
+def effective_rate(offer: OfferCandidate) -> float:
+    """Give-per-receive for one offer.  Lower is better.
+
+    ``inf`` for a degenerate offer, so it sorts last and is filtered out by
+    any finite cap rather than needing a special case at every call site.
+    """
+    if offer.receive_amount <= 0 or offer.give_amount < 0:
+        return float("inf")
+    # Normalise to DISPLAY units on both sides.  Raw ratios do not cancel
+    # across assets with different denominations -- see OfferCandidate.
+    give = offer.give_amount / denomination(offer.give_asset)
+    receive = offer.receive_amount / denomination(offer.receive_asset)
+    if receive <= 0.0:
+        return float("inf")
+    return give / receive
+
+
+#: The cap is documented as inclusive, but binary floats do not honour that
+#: at the boundary: give/receive = 7/100 against an anchor of 0.05 computes a
+#: deviation of 0.4000000000000001, so an offer sitting exactly ON a 0.4 cap
+#: is rejected.  A relative tolerance restores the documented behaviour.  The
+#: direction is deliberate -- at the boundary we ACCEPT, because rejecting an
+#: at-cap offer is the surprising half and the operator chose that number.
+_CAP_EPSILON = 1e-9
+
+
+def within_cap(deviation: float, max_slippage_frac: float) -> bool:
+    """Is ``deviation`` inside an inclusive cap, tolerant of float error?"""
+    if deviation != deviation:                      # NaN deviation
+        return False
+    tolerance = _CAP_EPSILON * (1.0 + abs(max_slippage_frac))
+    return deviation <= max_slippage_frac + tolerance
+
+
+def rate_deviation_frac(rate: float, anchor: Anchor) -> float:
+    """How much worse than the anchor a rate is, as a fraction.
+
+    Positive means worse (we give more per unit received).  Negative means
+    better than the reference, which is not suspicious on its own -- a
+    genuinely good offer is why anyone runs this -- so callers must not
+    filter on the absolute value.
+    """
+    if rate == float("inf"):
+        return float("inf")
+    return (rate - anchor.rate) / anchor.rate
+
+
+def _usable(offer: OfferCandidate, give_asset: str, receive_asset: str) -> bool:
+    """Shape validation, applied before any pricing is considered.
+
+    A malformed offer is rejected on structure rather than on price so that
+    a junk entry cannot reach the ranking at all -- it never gets the chance
+    to look attractive.
+    """
+    if not offer.offer_id.strip():
+        # Compact dexie responses need this id to fetch the live offer
+        # payload before it can be taken, so an offer without one cannot be
+        # executed no matter how good its price.  Structural, not a price
+        # judgement -- it never reaches the ranking.
+        return False
+    if offer.status != 0:
+        return False
+    if (canonical_asset(offer.give_asset) != canonical_asset(give_asset)
+            or canonical_asset(offer.receive_asset)
+            != canonical_asset(receive_asset)):
+        return False
+    if offer.give_amount <= 0 or offer.receive_amount <= 0:
+        return False
+    return True
+
+
+def _plan_leg(
+    *,
+    give_asset: str,
+    receive_asset: str,
+    budget: int,
+    offers: Iterable[OfferCandidate],
+    anchor: Anchor,
+    max_slippage_frac: float,
+    counters: dict[str, int],
+    seen_ids: set[str],
+    max_takes: int | None = None,
+) -> Leg:
+    """Select offers for one hop, best price first, until the budget is spent.
+
+    Best-first ordering is what makes a wide cap safe.  The cap decides only
+    where to STOP, never what to take first, so widening it can add worse
+    fills at the tail but can never displace a better one.  A 99% cap and a
+    5% cap execute identically whenever the good offers cover the position --
+    which is the property that lets an operator who believes an asset is
+    worthless set the cap accordingly without also accepting bad execution
+    on the part of the position that could have gone out at a fair price.
+
+    ``max_takes`` stops after that many offers have been accepted.  Because
+    selection is best-first, capping the count is exactly "drop the worst
+    fills from the tail" -- which is what :func:`build_plan` needs to walk
+    back a first hop the second one cannot use.  It never reorders anything
+    and it is not a slippage control; the cap still decides what is
+    acceptable at all.
+
+    Note what this does to the counters: stopping early leaves the untested
+    tail in no counter, exactly as the existing ``remaining <= 0`` break
+    already does.  The counters describe the leg that was PLANNED rather
+    than the whole book, which is the convention this module already keeps,
+    and :attr:`ConsolidationPlan.skipped_rolled_back` is what tells the
+    operator the leg stopped by choice rather than for want of offers.
+    """
+    # [review round 6] Keyed by id rather than appended in arrival order. A
+    # repeated id is the SAME on-chain offer arriving twice. Planning it
+    # twice means the first take consumes it and the second fails -- after
+    # the plan has already partially executed, which is the worst moment to
+    # discover it. Deduped across the whole plan, not just this leg, because
+    # the same offer can appear in both hops' books.
+    #
+    # Dropping every later arrival, as this did, let INPUT ORDER pick the
+    # price: two copies of one id at 200/100 and 210/100 under a 3% cap
+    # planned the 200 copy if it arrived first and planned nothing at all if
+    # it arrived second -- the same book, the same cap, two different
+    # answers, and one of them reads to the operator as "no offers within
+    # your cap". Two copies that disagree mean one payload is wrong, and we
+    # cannot tell which, so the WORST-priced copy is kept: planning a price
+    # better than the offer really carries is the direction that spends the
+    # operator's money on a fill they did not approve, while keeping the
+    # worse copy can only cost an opportunity.
+    grouped: dict[str, OfferCandidate] = {}
+    for offer in offers:
+        if not _usable(offer, give_asset, receive_asset):
+            counters["malformed"] = counters.get("malformed", 0) + 1
+            continue
+        if offer.offer_id in seen_ids:
+            counters["duplicate"] = counters.get("duplicate", 0) + 1
+            continue
+        previous = grouped.get(offer.offer_id)
+        if previous is not None:
+            counters["duplicate"] = counters.get("duplicate", 0) + 1
+            # [review round 8] TOTAL, not just strictly-worse-wins. The rate
+            # comparison alone leaves EQUAL-rate copies to arrival order --
+            # and 400/200 against 200/100 is the same rate at twice the size,
+            # so under a 200 budget the first copy decides whether there is a
+            # plan at all. Size is the tiebreak, and the SMALLER copy wins:
+            # the plan's amounts are advisory and the executor takes whatever
+            # the live payload carries, so assuming the larger cannot bound
+            # an all-or-nothing take if the live offer is really the smaller.
+            # Same direction as keeping the worse price -- an assumption that
+            # can only cost opportunity, never overspend.
+            prev_key, this_key = _ExactRateKey(previous), _ExactRateKey(offer)
+            if prev_key < this_key:
+                grouped[offer.offer_id] = offer
+            elif not (this_key < prev_key):
+                # Equal rate, and the comparison is spelled out rather than
+                # done with a tuple: _ExactRateKey defines only __lt__, so a
+                # tuple falls back to identity for __eq__ and the tiebreak
+                # would never fire -- reintroducing the arrival-order bug it
+                # is here to remove.
+                if offer.give_amount < previous.give_amount:
+                    grouped[offer.offer_id] = offer
+            continue
+        grouped[offer.offer_id] = offer
+    seen_ids.update(grouped)
+
+    # [review] Exact, not float. `effective_rate` returns a float, and XCH
+    # carries 10^12 raw units per display unit, so distinct prices collapse
+    # to the same float once the integers pass 2^53 -- about 9,007 XCH, an
+    # ordinary position. Ties then fall back to input order and can put a
+    # worse offer first; if only one fits, that is the best-price-first
+    # guarantee quietly broken. Ordering on the exact ratio give/receive by
+    # cross-multiplication keeps it in Python ints, which are unbounded.
+    #
+    # [review round 6] EXACT ties are still possible -- two different offers
+    # at genuinely the same price -- and Python's sort is stable, so with no
+    # tiebreak their order in the leg was the order they arrived in. That is
+    # the same defect as the duplicate-id case above wearing different
+    # clothes, and it is not cosmetic: given 400 of budget and two 2.0-priced
+    # offers of 400/200 and 200/100, the big one arriving first moves the
+    # whole 400, and arriving second it does not fit what the small one left
+    # and is skipped as too large -- half the position moved, on nothing but
+    # response order. Ties break on SIZE first, then on the id, so the order
+    # is total and nothing is left to arrival.
+    #
+    # Size-first is a preference, not an optimum, and the distinction is
+    # worth stating: takes are all-or-nothing, so which SET of equally priced
+    # offers fits a budget is a packing problem this planner does not attempt
+    # -- against 300 of budget, one 200 and two 150s at the same price, it
+    # takes the 200 and leaves 100 unspent where the two 150s would have
+    # filled it exactly. Smallest-first loses the mirror case just as badly.
+    # What this tiebreak buys is that the answer is the same every time,
+    # which arrival order was not; the packing question is untouched.
+    usable = sorted(grouped.values(), key=lambda o: (-o.give_amount, o.offer_id))
+    usable.sort(key=_ExactRateKey)
+
+    chosen: list[OfferCandidate] = []
+    give_total = 0
+    receive_total = 0
+    remaining = budget
+
+    for index, offer in enumerate(usable):
+        rate = effective_rate(offer)
+        if not within_cap(rate_deviation_frac(rate, anchor), max_slippage_frac):
+            # The list is sorted best-first, so every remaining offer is at
+            # least this bad.  Count the whole tail from here and stop,
+            # rather than walking it to re-derive the same verdict.
+            counters["worse_than_cap"] = (
+                counters.get("worse_than_cap", 0) + (len(usable) - index)
+            )
+            break
+        if offer.give_amount > remaining:
+            # take_offer is ALL-OR-NOTHING (see the comment at
+            # cpp/src/engine.cpp:9921) -- there is no partial fill, so an
+            # offer larger than the remaining budget cannot be trimmed.
+            # Skip it and keep looking: a later, smaller offer may still
+            # fit, and stopping here would strand spendable balance.
+            counters["too_large"] = counters.get("too_large", 0) + 1
+            continue
+        chosen.append(offer)
+        give_total += offer.give_amount
+        receive_total += offer.receive_amount
+        remaining -= offer.give_amount
+        if remaining <= 0:
+            break
+        if max_takes is not None and len(chosen) >= max_takes:
+            break
+
+    return Leg(
+        give_asset=give_asset,
+        receive_asset=receive_asset,
+        anchor=anchor,
+        offers=tuple(chosen),
+        give_total=give_total,
+        receive_total=receive_total,
+    )
+
+
+def per_leg_cap(route_cap: float, hops: int) -> float:
+    """Split an operator's ROUTE slippage cap across ``hops`` legs.
+
+    [review round 2] The same cap used to be applied independently to each
+    hop, so a two-hop plan could accept 10% on the first leg and 10% on the
+    second and deliver a composite 21% worse than the product of the anchors
+    -- while telling the operator their limit was 10%. The bound on a route
+    of n equally-capped legs is (1+s)^n - 1, not s.
+
+    Inverting that gives each leg (1+s)^(1/n) - 1, so the COMPOSITE honours
+    the number the operator actually chose. A 10% route cap becomes ~4.88%
+    per leg over two hops -- far better than quietly spending 21%.
+
+    [review round 4] This is the bound for a leg priced BLIND. It is
+    sufficient for the route cap but not equivalent to it, so applying it to
+    every leg threw away routes that were comfortably inside the cap (see
+    :func:`remaining_route_cap`). Only the first hop is priced blind; by the
+    time the second is chosen the first is a known quantity.
+    """
+    if hops <= 1:
+        return route_cap
+    return (1.0 + route_cap) ** (1.0 / hops) - 1.0
+
+
+def remaining_route_cap(route_cap: float, first_leg_deviation: float) -> float:
+    """What the SECOND hop may deviate, given what the first one achieved.
+
+    [review round 4] ``per_leg_cap`` on both legs is sufficient but not
+    equivalent: a first hop 10% BETTER than its anchor and a second 10% worse
+    composite to -1%, which is inside a 10% route cap by any reading -- and
+    was refused anyway, because the second leg was judged against the static
+    4.88% split. Erring conservative never overspends, but "found nothing" is
+    the wrong answer in precisely the dust/thin-book situation this feature
+    exists for.
+
+    Once the first leg is priced its deviation d1 is a fact, so the second
+    leg's allowance follows from the route cap directly: (1+s)/(1+d1) - 1,
+    which multiplies back out to (1+d1)*(1+d2) <= 1+s.
+
+    [review] It is NOT "never tighter than the split it replaces" -- that
+    claim was true only while the first hop was itself capped at the split.
+    The first hop now gets the full route cap, so a +9% first leg against a
+    10% route cap leaves about 0.917% here, well inside the 4.88% equal
+    split. That is the point rather than a regression: the composite bound is
+    what matters, and a first hop that spends most of it must leave the rest.
+
+    The result is clamped at ``route_cap``. Strictly, a large enough bargain
+    on hop one buys more headroom than that, but the bargain is measured
+    against an anchor and anchors are the acknowledged weak link here (see the
+    module docstring). A stale first-hop reference would turn a phantom "-50%"
+    into a licence to pay +120% on the second take, on a book the operator is
+    watching in the dialog. No single hop goes further from its own reference
+    than the number the operator typed.
+    """
+    # [audit] The guard has to catch INFINITY, which is the one degenerate
+    # value that actually arrives. `Leg.realised_rate` never returns a
+    # non-positive number -- its sole degenerate result is float("inf"), when
+    # receive_total is zero -- and rate_deviation_frac then yields inf too.
+    # `1.0 + inf > 0.0` is True, so the old guard did not fire: control fell
+    # through to a division by infinity, producing -1.0, and the second leg
+    # was handed a NEGATIVE cap that refuses every offer. The fallback branch
+    # was dead for the exact case it was written for.
+    if not math.isfinite(first_leg_deviation) or not (
+            1.0 + first_leg_deviation > 0.0):
+        return per_leg_cap(route_cap, 2)
+    return min(route_cap, (1.0 + route_cap) / (1.0 + first_leg_deviation) - 1.0)
+
+
+def _single_leg_plan(
+    source_asset: str, target_asset: str, leg: Leg, budget: int,
+    counters: dict[str, int]
+) -> ConsolidationPlan:
+    return ConsolidationPlan(
+        source_asset=source_asset,
+        target_asset=target_asset,
+        legs=[leg],
+        skipped_worse_than_cap=counters.get("worse_than_cap", 0),
+        skipped_malformed=counters.get("malformed", 0),
+        skipped_too_large=counters.get("too_large", 0),
+        skipped_duplicate=counters.get("duplicate", 0),
+        unspent_source=budget - leg.give_total,
+    )
+
+
+def _empty_plan(
+    source_asset: str, target_asset: str, budget: int, counters: dict[str, int]
+) -> ConsolidationPlan:
+    """A plan that does nothing, carrying EVERY diagnostic counter.
+
+    Factored out because the three early returns each dropped a different
+    subset by hand, and the diagnostics are how an operator tells "nothing
+    was cheap enough" from "nothing was small enough".
+    """
+    return ConsolidationPlan(
+        source_asset=source_asset,
+        target_asset=target_asset,
+        legs=[],
+        skipped_worse_than_cap=counters.get("worse_than_cap", 0),
+        skipped_malformed=counters.get("malformed", 0),
+        skipped_too_large=counters.get("too_large", 0),
+        skipped_duplicate=counters.get("duplicate", 0),
+        unspent_source=budget,
+    )
+
+
+#: How many offers may be rolled off the end of a greedy first hop while
+#: looking for a first leg the second hop can actually use.
+#:
+#: The search replans both hops per attempt, so it is bounded rather than
+#: exhaustive. 16 is generous against the books this runs on -- the busiest
+#: pair in the log block quoted at the top of this module kept 29 offers in
+#: total, and a first leg is capped further by the budget -- so a first leg
+#: long enough to hit this bound is already outside anything observed. It is
+#: not a correctness limit: exceeding it leaves the SHORTEST prefixes
+#: unsearched, so a route only a very short first leg could reach would be
+#: missed -- the answer degrades towards the greedy one this search was added
+#: to improve on, and never below it.
+_MAX_FIRST_LEG_ROLLBACKS = 16
+
+#: How much more TARGET two hops must deliver to be worth taking.
+#:
+#: [review round 6] This said "of the budget", which was the round-4 rule.
+#: The comparison moved to target received and this line did not, so the one
+#: cross-reference build_plan's contract makes -- "'Materially' is
+#: :data:`MIN_TWO_HOP_ADVANTAGE`" -- landed a reader on the retired rule.
+#: The two genuinely disagree: a two-hop route spending half the budget for
+#: more than twice the target wins under the shipped comparison and loses
+#: under "of the budget".
+#:
+#: A second leg is a second fee and a second all-or-nothing failure window,
+#: and it strands anything the second hop cannot absorb in an intermediate
+#: asset the operator never asked to hold. 2% is small enough not to reject
+#: genuinely better routes and large enough that noise does not choose one.
+MIN_TWO_HOP_ADVANTAGE = 0.02
+
+#: The same figure as an exact rational, derived FROM the constant above so
+#: the two cannot drift. A hand-written 102/100 beside a named
+#: MIN_TWO_HOP_ADVANTAGE is a policy knob that does not move the policy.
+_ADVANTAGE_DEN = 10_000
+_ADVANTAGE_NUM = _ADVANTAGE_DEN + round(MIN_TWO_HOP_ADVANTAGE * _ADVANTAGE_DEN)
+
+
+class _ExactRateKey:
+    """Total order on give/receive as an EXACT rational, no float involved."""
+
+    __slots__ = ("give", "receive")
+
+    def __init__(self, offer: OfferCandidate) -> None:
+        self.give = offer.give_amount
+        self.receive = offer.receive_amount
+
+    def __lt__(self, other: _ExactRateKey) -> bool:
+        # a/b < c/d  <=>  a*d < c*b, for positive b and d. Non-positive
+        # receive sorts last: those offers are unusable and must not win.
+        if self.receive <= 0:
+            return False
+        if other.receive <= 0:
+            return True
+        return self.give * other.receive < other.give * self.receive
+
+
+def build_plan(
+    *,
+    source_asset: str,
+    target_asset: str,
+    budget: int,
+    max_slippage_frac: float,
+    direct_offers: Sequence[OfferCandidate],
+    direct_anchor: Anchor | None,
+    hop_asset: str | None = None,
+    first_hop_offers: Sequence[OfferCandidate] = (),
+    first_hop_anchor: Anchor | None = None,
+    second_hop_offers: Sequence[OfferCandidate] = (),
+    second_hop_anchor: Anchor | None = None,
+) -> ConsolidationPlan:
+    """Build a one- or two-hop consolidation plan.
+
+    A direct route is PREFERRED but no longer preferred at any coverage
+    whatsoever: each hop is a separate all-or-nothing take with its own fee,
+    its own slippage, and its own window in which the book can move, so two
+    hops are strictly more dangerous than one. Direct therefore wins ties and
+    near-ties -- but a two-hop route that delivers materially more TARGET
+    wins, because a dust direct fill silently stranding the position is the
+    failure this feature exists to avoid.
+
+    "Materially" is :data:`MIN_TWO_HOP_ADVANTAGE`, and the quantity compared
+    is target RECEIVED. Earlier revisions compared source spent on the first
+    hop, then source delivered through both, and both let a route win while
+    handing the operator less of the thing they asked for. The operator's
+    outcome is the target in their wallet, so that is what is measured.
+
+    The two-hop path exists because not every holding has a direct pair --
+    with XCH as the target every asset does, but consolidating into DBX
+    would leave BYC and wUSDC.b needing a hop through XCH.
+
+    Raises
+    ------
+    PlanError
+        If the request is incoherent (same source and target, non-positive
+        budget, negative cap, or a hop requested without its anchors).  An
+        empty plan -- nothing was cheap enough -- is NOT an error; it is a
+        valid answer that the dialog reports as "no offers within your cap".
+    """
+    # A blank endpoint folds to "" and is not equal to the other one, so it
+    # sailed past the sameness test. Planning then proceeded against an
+    # unnamed asset: `_usable` matched any offer whose own give_asset was
+    # blank, and `denomination("")` quietly called it a CAT. The hop already
+    # had this guard; the endpoints reach the same code and never did.
+    src = canonical_asset(source_asset)
+    tgt = canonical_asset(target_asset)
+    if not src or not tgt:
+        raise PlanError("source and target assets must be named")
+    if src == tgt:
+        raise PlanError("source and target are the same asset")
+    if budget <= 0:
+        raise PlanError(f"budget must be positive, got {budget}")
+    # NaN fails EVERY comparison, so `< 0.0` waves it through -- and then
+    # every `deviation > cap` test downstream is also false, silently
+    # disabling the cap entirely and selecting arbitrarily bad offers.
+    # Infinity removes the advertised finite bound the same way.  Both are
+    # rejected here rather than defended against at each comparison.
+    if max_slippage_frac != max_slippage_frac or max_slippage_frac in (
+        float("inf"), float("-inf")
+    ):
+        raise PlanError(
+            f"max slippage must be a finite number, got {max_slippage_frac!r}"
+        )
+    if max_slippage_frac < 0.0:
+        raise PlanError(f"max slippage must be non-negative, got {max_slippage_frac}")
+
+    counters: dict[str, int] = {}
+    seen_ids: set[str] = set()
+
+    direct_leg = None
+    if direct_anchor is not None:
+        direct_leg = _plan_leg(
+            give_asset=source_asset,
+            receive_asset=target_asset,
+            budget=budget,
+            offers=direct_offers,
+            anchor=direct_anchor,
+            max_slippage_frac=max_slippage_frac,
+            counters=counters,
+            seen_ids=seen_ids,
+        )
+        # [review round 2] This used to return the moment the direct route
+        # selected ANY offer. A reproduced case took a single 1-unit direct
+        # offer and left 999 of 1,000 source units untouched while a complete
+        # two-hop route sat unused -- dust liquidity making the only viable
+        # consolidation unreachable, in a tool whose whole promise is moving
+        # as much as possible. Direct is still PREFERRED, because each extra
+        # hop is another all-or-nothing take with its own fee and its own
+        # window for the book to move; it is just no longer preferred at any
+        # coverage whatsoever.
+        if direct_leg.offers and hop_asset is None:
+            return _single_leg_plan(
+                source_asset, target_asset, direct_leg, budget, counters)
+
+    if hop_asset is None and direct_leg is not None and direct_leg.offers:
+        return _single_leg_plan(
+            source_asset, target_asset, direct_leg, budget, counters)
+
+    if hop_asset is None:
+        # skipped_too_large was omitted here and below, so a direct route
+        # that failed ONLY because every offer was bigger than the budget
+        # reported zero oversized offers -- telling the operator "nothing
+        # within your cap" when the truth was "nothing small enough".  Those
+        # are different problems with different fixes.
+        return _empty_plan(source_asset, target_asset, budget, counters)
+
+    if first_hop_anchor is None or second_hop_anchor is None:
+        raise PlanError("a two-hop plan needs an anchor for each hop")
+    # A hop that IS one of the endpoints is a self-conversion leg, not a
+    # route. Only the anchors were checked, so this produced a degenerate
+    # plan instead of rejecting an incoherent request.
+    hop = canonical_asset(hop_asset)
+    if not hop:
+        # "   " folds to empty and would otherwise pass the endpoint test,
+        # letting the planner build legs through an unnamed asset.
+        raise PlanError("hop asset is blank")
+    if hop in (src, tgt):
+        raise PlanError(
+            f"hop asset {hop_asset!r} is the source or the target; a hop "
+            "must be a third asset")
+
+    # Each attempt replans BOTH hops from scratch against its own counters
+    # and its own dedup set, so whatever is finally returned is described by
+    # diagnostics that belong to it rather than to a route that was
+    # abandoned.
+    base_counters = dict(counters)
+    base_seen = set(seen_ids)
+
+    def _route(max_takes: int | None) -> tuple[Leg, Leg | None, dict[str, int]]:
+        attempt_counters = dict(base_counters)
+        attempt_seen = set(base_seen)
+        # The first hop is priced blind -- nothing is known about the second
+        # when its offers are chosen. It is planned against the FULL route
+        # cap; the bound is enforced by the second hop, whose allowance is
+        # derived from what this one actually cost (see remaining_route_cap).
+        leg_one = _plan_leg(
+            give_asset=source_asset,
+            receive_asset=hop_asset,
+            budget=budget,
+            offers=first_hop_offers,
+            anchor=first_hop_anchor,
+            # [review round 5] The FULL route cap, not the nth-root split.
+            # The split is sufficient for the route bound but not equivalent
+            # to it, and the gap costs availability: a +9% first hop followed
+            # by a -10% second is about -1.9% composite, comfortably inside a
+            # 10% route cap, yet the first hop was discarded at 4.88%. The
+            # route bound is still enforced -- remaining_route_cap() derives
+            # the second hop's allowance from what the first ACTUALLY cost,
+            # so a first hop that spends the whole cap leaves the second with
+            # nothing to spend.
+            max_slippage_frac=max_slippage_frac,
+            counters=attempt_counters,
+            seen_ids=attempt_seen,
+            max_takes=max_takes,
+        )
+        if not leg_one.offers:
+            return leg_one, None, attempt_counters
+        # The second hop can only spend what the first actually yields.
+        # Budget it from receive_total rather than from any projection: if
+        # hop one underfills, hop two must shrink with it or the plan
+        # promises a quantity that will not exist when it runs.
+        #
+        # Its slippage allowance is likewise derived from what the first hop
+        # actually cost, not guessed in advance -- the route cap binds the
+        # COMPOSITE, so the blind split is the wrong yardstick once d1 is
+        # known.
+        leg_two = _plan_leg(
+            give_asset=hop_asset,
+            receive_asset=target_asset,
+            budget=leg_one.receive_total,
+            offers=second_hop_offers,
+            anchor=second_hop_anchor,
+            max_slippage_frac=remaining_route_cap(
+                max_slippage_frac,
+                rate_deviation_frac(leg_one.realised_rate, first_hop_anchor),
+            ),
+            counters=attempt_counters,
+            seen_ids=attempt_seen,
+        )
+        return leg_one, leg_two, attempt_counters
+
+    greedy_first, greedy_second, greedy_counters = _route(None)
+    if greedy_second is None:
+        # _route declines to plan a second hop exactly when the first one
+        # selected nothing, so this is "no first leg" -- and testing it this
+        # way is what lets everything below treat the second leg as present.
+        counters = greedy_counters
+        if direct_leg is not None and direct_leg.offers:
+            return _single_leg_plan(
+                source_asset, target_asset, direct_leg, budget, counters)
+        return _empty_plan(source_asset, target_asset, budget, counters)
+
+    # [review round 6] The greedy first hop used to be final, and that made
+    # the two rules above fight each other: the first leg takes everything
+    # inside the FULL route cap, then the second leg is allowed only what
+    # the first one left of that cap. A worse-priced tail on hop one is
+    # therefore paid for TWICE -- once in what it costs, and again in the
+    # allowance it removes from hop two -- and it can shut the route down
+    # entirely.
+    #
+    # Reproduced: route cap 10%, first-hop offers at +0% and +10%, one
+    # second-hop offer at +5%. Taking both first-hop offers blends to
+    # +4.878%, leaving hop two 4.884%, and the +5% offer is refused -- an
+    # empty plan. Dropping the +10% tail gives a complete route whose
+    # composite is 1.00 * 1.05 = +5%, half the cap the operator set. The
+    # operator would have read "no offers within your cap" for a route that
+    # was comfortably inside it.
+    #
+    # So the first leg is revisable. Selection is best-first, so capping the
+    # take count is exactly "roll the worst fills off the tail", and trying
+    # successively shorter prefixes is a search over first legs ordered
+    # worst-off-first. The winner is the one delivering the most TARGET --
+    # the same quantity the direct-versus-two-hop comparison below scores,
+    # and the only one the operator actually receives. Ties go to the
+    # SHORTER first leg: identical target for less source spent and less
+    # stranded in the hop asset.
+    best: tuple[Leg, Leg, dict[str, int]] | None = None
+    if greedy_second.offers:
+        best = (greedy_first, greedy_second, greedy_counters)
+    floor = max(1, len(greedy_first.offers) - _MAX_FIRST_LEG_ROLLBACKS)
+    attempts = list(range(len(greedy_first.offers) - 1, floor - 1, -1))
+    # [review round 8] The SHORTEST prefix is always tried, whatever the
+    # bound leaves unsearched.
+    #
+    # The bound walks back from the greedy length, so on a long first leg the
+    # short prefixes are exactly the ones it drops -- and they are the ones
+    # most likely to leave hop two an allowance, which is the whole point of
+    # the search. Reviewer's case, reachable inside the 29-offer book this
+    # module cites: 18 first-hop takes makes floor 2, so the one-take prefix
+    # that completes the route is never attempted and the plan comes back
+    # empty. One extra replan removes that whole class; the bound still caps
+    # the middle of the range, which is where the search is genuinely
+    # speculative.
+    if 1 not in attempts and len(greedy_first.offers) > 1:
+        attempts.append(1)
+    for takes in attempts:
+        leg_one, leg_two, attempt_counters = _route(takes)
+        if leg_two is None or not leg_two.offers:
+            continue
+        if best is None or leg_two.receive_total >= best[1].receive_total:
+            best = (leg_one, leg_two, attempt_counters)
+
+    if best is None:
+        # No prefix completes. Report the greedy attempt, which is the route
+        # the operator would otherwise have been shown, so the counters
+        # explain why nothing worked.
+        first, second, counters = greedy_first, greedy_second, greedy_counters
+    else:
+        first, second, counters = best
+    # Offers the rollback declined that no other counter can explain: they
+    # were inside the cap and affordable, and dropping them is what let the
+    # second hop complete.
+    rolled_back = len(greedy_first.offers) - len(first.offers)
+
+    # Direct wins ties and near-ties; the two-hop route has to be materially
+    # better to justify a second all-or-nothing take.
+    #
+    # "Better" is TARGET RECEIVED, and getting to that took three attempts.
+    # Round 3 compared source SPENT on the first hop, so a hop spending 1,000
+    # units followed by a second absorbing 1 of them beat a 999-unit direct
+    # fill while delivering almost no target. Round 4 fixed that to source
+    # DELIVERED -- the pro-rata share whose output the second leg actually
+    # consumed -- which is closer but still the wrong quantity: an audit
+    # produced a counterexample where a permitted-but-expensive second hop
+    # wins on delivered source while handing the operator strictly LESS of
+    # the target than the direct fill would have.
+    #
+    # The operator's outcome is the target in their wallet. Compare that
+    # directly and the whole class disappears -- both routes draw on the same
+    # budget, and slippage is already bounded per leg, so more target for
+    # that budget is simply better. Integers throughout, no rate arithmetic,
+    # nothing to overflow.
+    if second.offers and direct_leg is not None and direct_leg.offers:
+        two_hop_target = second.receive_total
+        direct_target = direct_leg.receive_total
+        if (two_hop_target * _ADVANTAGE_DEN
+                <= direct_target * _ADVANTAGE_NUM):
+            return _single_leg_plan(
+                source_asset, target_asset, direct_leg, budget, counters)
+
+    if not second.offers:
+        # A partial direct fill beats a two-hop route that cannot complete.
+        if direct_leg is not None and direct_leg.offers:
+            return _single_leg_plan(
+                source_asset, target_asset, direct_leg, budget, counters)
+        # The first hop would spend source to buy an intermediate asset the
+        # second hop cannot sell -- so the plan receives NO target at all
+        # while still costing the whole first leg.  is_empty was false in
+        # this state (the first leg has offers), so it would have executed.
+        # A route that cannot deliver the target is not a route.
+        return _empty_plan(source_asset, target_asset, budget, counters)
+
+    return ConsolidationPlan(
+        source_asset=source_asset,
+        target_asset=target_asset,
+        legs=[first, second],
+        skipped_worse_than_cap=counters.get("worse_than_cap", 0),
+        skipped_malformed=counters.get("malformed", 0),
+        skipped_too_large=counters.get("too_large", 0),
+        skipped_duplicate=counters.get("duplicate", 0),
+        # Only the two-hop return carries this. The other exits from here
+        # hand back a direct plan or an empty one, neither of which has a
+        # first hop for anything to have been rolled off.
+        skipped_rolled_back=rolled_back,
+        unspent_source=budget - first.give_total,
+        hop_residual=first.receive_total - second.give_total,
+    )
