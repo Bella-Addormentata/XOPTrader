@@ -430,3 +430,30 @@ def test_a_keystore_failure_while_signing_becomes_an_auth_error(monkeypatch):
     with pytest.raises(PermutoAuthError):
         c.reauth(1.0)
 
+
+def test_a_timeout_during_the_body_read_is_still_an_auth_error(monkeypatch):
+    """[review] urlopen() returning does not end the I/O. resp.read() can
+    raise a bare TimeoutError, which is not a URLError -- so it escaped the
+    PermutoAuthError contract, bypassed the runner's withdraw path, and was
+    never charged to the renewal backoff."""
+    import urllib.request
+
+    from gui.services.permuto.auth import PermutoAuthError
+    from gui.services.permuto.client import PermutoClient
+
+    class _HangsOnRead:
+        def read(self):
+            raise TimeoutError("timed out mid-body")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        lambda *a, **k: _HangsOnRead())
+    c = PermutoClient(_Identity(), session_token="tok")
+    with pytest.raises(PermutoAuthError):
+        c.open_orders(1.0)
+

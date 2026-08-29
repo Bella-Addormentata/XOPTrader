@@ -422,7 +422,14 @@ class QuoteRunner:
                 # neither of the things the action names. Retract the book
                 # for this market at minimum; closing the position itself is
                 # a taker order and stays an operator decision.
-                results[market] = ("flatten", risk.reason)
+                results[market] = (
+                    "flatten",
+                    risk.reason + " -- quotes retracted; the POSITION is "
+                    "still open and needs closing by hand")
+                _log.critical(
+                    "permuto: %s margin past the flatten line -- resting "
+                    "quotes retracted, but the position remains OPEN and "
+                    "exposed. Close it manually.", market)
                 # Only if something is actually resting. _resting was
                 # reconciled from the venue at the top of this tick, so an
                 # empty entry means there is nothing to retract and a cancel

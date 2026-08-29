@@ -27,9 +27,10 @@ skew ceiling does.
 MARGIN. Liquidation is the one outcome that cannot be traded out of, and net
 PnL is the sole ranking criterion once the depth gate is passed, so the margin
 ceiling here is deliberately far tighter than the venue's. The venue liquidates
-at maintenance; we stop adding risk at `MAX_MARGIN_UTILISATION` and shed at
-`FLATTEN_MARGIN_UTILISATION`, both of which sit well above maintenance in
-equity terms. Being flat and eligible beats being liquidated and ranked.
+at maintenance; we stop adding risk at `MAX_MARGIN_UTILISATION` and stop
+QUOTING at `FLATTEN_MARGIN_UTILISATION`, both of which sit well above
+maintenance in equity terms. Past the second line the position itself is the
+operator's to close -- see RiskAction.FLATTEN for why that is not automated.
 """
 
 from __future__ import annotations
@@ -79,8 +80,18 @@ class RiskAction(str, Enum):
     """
 
     FLATTEN = "flatten"
-    """Cross the spread to get out. Pay the spread; it is cheaper than the
-    alternative."""
+    """Stop quoting and retract every resting order for this market.
+
+    [review] What this asks for and what the runner does are now the same
+    thing, and the earlier wording ("cross the spread to get out") promised
+    more than either. Nothing here submits a closing taker order: the
+    POSITION remains open, and at the 75% line it can keep moving toward
+    liquidation while this action is in force. Closing it is a spend with
+    slippage against a book this module cannot see, and it stays an operator
+    decision -- the runner surfaces the state loudly instead of trading on
+    its own. If an automated reduce-only close is ever added, it belongs in
+    the runner with its own review, not behind this label.
+    """
 
 
 @dataclass(frozen=True)

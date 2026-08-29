@@ -96,9 +96,14 @@ def _default_venue_state() -> dict:
     # paused" and the loop quoted straight through. The venue pause is the
     # one thing the sponsor said bots must handle, and every entrant meets it
     # at the Sunday reset. Absence of the key is not evidence of trading.
-    if not isinstance(flags, dict) or "trading_paused" not in flags:
+    # [review] Presence is not validity. `bool(flags.get(...))` after a
+    # presence check still coerces `0`, `None` or `"": ` to "not paused" --
+    # the fail-open direction on the one flag the sponsor said bots must
+    # handle. Require an actual JSON boolean, as signup_open() already does.
+    if not isinstance(flags, dict) or not isinstance(
+            flags.get("trading_paused"), bool):
         raise VenueStateUnreadable(
-            "/info/meta carried no recognisable trading_paused flag")
+            "/info/meta carried no boolean trading_paused flag")
 
     prices = oracle_doc.get("prices")
     if not isinstance(prices, dict):

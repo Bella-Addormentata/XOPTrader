@@ -293,3 +293,20 @@ def test_a_thread_that_will_not_stop_is_still_flattened(qapp):
     finally:
         release.set()
         qapp.processEvents()
+
+
+@pytest.mark.parametrize("bad", [0, 1, None, "", "false"])
+def test_a_non_boolean_pause_flag_is_unreadable_not_unpaused(bad):
+    """[review] Presence is not validity: bool(0) and bool(None) read as
+    "not paused", the fail-open direction on the one flag the sponsor said
+    bots must handle."""
+    from gui.services.permuto.live import VenueStateUnreadable
+    with pytest.raises(VenueStateUnreadable):
+        _venue_state({"flags": {"trading_paused": bad},
+                      "markets": _ACTIVE["markets"]})
+
+
+def test_a_real_boolean_pause_flag_is_read():
+    meta = dict(_ACTIVE); meta["flags"] = {"trading_paused": True}
+    assert _venue_state(meta)["flags"]["trading_paused"] is True
+

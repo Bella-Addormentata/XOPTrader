@@ -2680,20 +2680,26 @@ class MainWindow(QMainWindow):
         # process (qFatal) if a QThread is destroyed while still running, and
         # nothing else knows about these: EngineBridge.shutdown() owns the
         # services, not the pages' own threads.
-        for page in (self._wallet_balances, self._settings_widget,
-                     self._permuto_widget):
-            widget = self._unwrap(page)
-            if widget is not None and hasattr(widget, "stop_background_work"):
-                widget.stop_background_work()
-
-        # The live Permuto session owns its own thread and, more importantly,
-        # a live book. join() asks it to stop and WAITS for the cancel --
-        # closing the window while orders rest is the dead-man's-switch
-        # incident in a different venue.
+        # [review] THE LIVE SESSION STOPS FIRST. It owns real orders at a
+        # remote venue; the page workers own polling. Joining the pages first
+        # meant the trading loop kept placing and managing orders for however
+        # long those joins took -- each can block ~10s -- AFTER the operator
+        # asked to leave. The thing that can spend money yields before the
+        # things that merely read.
+        #
+        # join() asks it to stop and WAITS for the cancel -- closing the
+        # window while orders rest is the dead-man's-switch incident in a
+        # different venue.
         if self._permuto_runner is not None:
             try:
                 self._permuto_runner.join()
             except Exception:  # noqa: BLE001 - teardown must not block exit
                 _log.exception("[Permuto] live session did not stop cleanly")
+
+        for page in (self._wallet_balances, self._settings_widget,
+                     self._permuto_widget):
+            widget = self._unwrap(page)
+            if widget is not None and hasattr(widget, "stop_background_work"):
+                widget.stop_background_work()
         self._save_state()
         super().closeEvent(event)

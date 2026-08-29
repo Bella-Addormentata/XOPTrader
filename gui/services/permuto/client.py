@@ -146,6 +146,19 @@ class PermutoClient:
             raise PermutoAuthError(
                 "%s %s unreachable: %s" % (method, path, exc)
             ) from exc
+        except (TimeoutError, OSError, ValueError) as exc:
+            # [review] The READ boundary, not just the connect. urlopen()
+            # returning does not end the I/O: resp.read() can raise a bare
+            # TimeoutError or socket OSError, and a mangled body a ValueError
+            # -- none of which are URLError, so they escaped the
+            # PermutoAuthError contract entirely. An open_orders timeout then
+            # bypassed the runner's withdraw path (which catches
+            # PermutoAuthError) and the renewal backoff was never charged.
+            # The transport promises exactly two exception types; this makes
+            # the promise true at both ends of the request.
+            raise PermutoAuthError(
+                "%s %s failed mid-read: %s" % (method, path, exc)
+            ) from exc
 
     # ------------------------------------------------------------------ #
     # Session
