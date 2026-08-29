@@ -99,14 +99,29 @@ class VenueSwitch(QPushButton):
             _, reason = may_turn_on(inputs)
             return "%s cannot be turned on: %s" % (self._venue, reason)
         if state is VenueState.STOPPING:
+            # [review] Venue-NEUTRAL. This text is shown for both switches and
+            # described an on-chain coin spend, which is dexie's mechanism and
+            # not Permuto's -- a Permuto operator was told to wait for spends
+            # that do not exist. What is true of both is the only part that
+            # matters here: submitted is not confirmed, and until it is, the
+            # orders may still be takeable.
             return (
-                "%s is stopping. Cancels are SUBMITTED but a secure cancel "
-                "spends the offer coins on chain, so anything still resting "
-                "can be taken until those spends confirm." % self._venue
+                "%s is stopping. Cancels are SUBMITTED but NOT yet confirmed, "
+                "so anything still resting can be taken until they are."
+                % self._venue
             )
         if state is VenueState.ON:
             return "%s is trading. Click to stop and cancel the book." \
                 % self._venue
+        # [review] "nothing is resting" is a claim, and for a venue whose
+        # orders outlive this process it is one nothing has checked at
+        # startup. Say what is actually known -- and that arming is what
+        # reconciles it, since the first pass reads the venue's open orders.
+        if not inputs.book_verified:
+            return ("%s is off. The venue's book has NOT been checked this "
+                    "session -- orders there survive a restart. Click to "
+                    "start trading; the first pass reconciles whatever is "
+                    "really resting." % self._venue)
         return "%s is off and nothing is resting. Click to start trading." \
             % self._venue
 

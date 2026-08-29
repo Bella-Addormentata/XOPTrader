@@ -76,8 +76,10 @@ GATE_LABELS: dict[str, str] = {
     "engine_down": "the engine is not running",
     "not_registered": "this identity is not registered with the venue",
     "not_configured": "the venue is not configured",
-    "cancels_pending": "the previous stop is still confirming on chain",
+    "cancels_pending": "the previous stop is still confirming",
     "not_wired": "the quoting loop is not connected to this switch yet",
+    "blocked": ("the quoting loop cannot reach the venue -- every tick is "
+                "coming back blocked"),
 }
 
 
@@ -93,6 +95,17 @@ class SwitchInputs:
 
     book_is_empty: bool = True
     """Whether anything of ours is still resting at the venue."""
+
+    book_verified: bool = True
+    """Whether anything has actually LOOKED, this session.
+
+    Only meaningful when `book_is_empty` is True, and it deliberately does
+    not affect any decision -- `resolve_state` and `may_turn_on` ignore it.
+    It exists so the operator-facing text can stop promising "nothing is
+    resting" for a venue whose orders outlive the process and which nothing
+    has yet queried. Refusing to ARM on an unverified book would be worse
+    than the false promise, because arming is what reconciles it.
+    """
 
 
 def resolve_state(inputs: SwitchInputs) -> VenueState:
@@ -139,6 +152,7 @@ _GATE_ORDER = (
     "not_configured",
     "not_wired",
     "not_registered",
+    "blocked",
     "cancels_pending",
 )
 

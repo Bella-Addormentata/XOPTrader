@@ -379,3 +379,52 @@ def test_the_switch_adopts_an_already_trading_engine(window, monkeypatch):
     window._dexie_desired_on = False
     window._sync_dexie_intent_from_engine()
     assert window._dexie_desired_on is True
+
+
+# --------------------------------------------------------------------------- #
+# [review] The switch must not assert what it has not checked
+# --------------------------------------------------------------------------- #
+
+def test_a_blocked_tick_gates_the_switch(window):
+    """`not_wired` was removed on the premise that owning a QuoteRunner
+    guarantees a usable session. Nothing enforced that premise and it was
+    false -- the live session was built with an empty token, every tick came
+    back "blocked", and the toolbar painted PERMUTO ON over a loop that had
+    never placed an order. The session bootstrap fixes the cause; this stops
+    the switch claiming something it never checked."""
+    window._permuto_last_blocked = True
+    try:
+        assert "blocked" in window._gather_permuto().gates
+    finally:
+        window._permuto_last_blocked = False
+    assert "blocked" not in window._gather_permuto().gates
+
+
+def test_the_permuto_book_is_unverified_until_something_looks(window):
+    """Permuto orders rest at a REMOTE venue and survive this process, so a
+    fresh GUI has genuinely not checked. It still reports empty -- refusing
+    to arm would be worse, since arming is what reconciles -- but it must not
+    claim verification it does not have."""
+    assert window._gather_permuto().book_verified is False
+    assert window._gather_permuto().book_is_empty is True, (
+        "an unverified book must still be armable")
+
+
+def test_a_tick_that_reached_the_venue_verifies_the_book(window):
+    for action in ("quote", "hold", "withdraw", "wait"):
+        window._permuto_book_confirmed_empty = False
+        window._on_permuto_tick(
+            type("R", (), {"action": action, "ok": True, "error": ""})())
+        assert window._gather_permuto().book_verified, action
+
+
+def test_a_blocked_tick_does_not_verify_the_book(window):
+    """Blocked means we never reached the venue, so nothing was observed."""
+    window._permuto_book_confirmed_empty = False
+    window._on_permuto_tick(
+        type("R", (), {"action": "blocked", "ok": False, "error": "x"})())
+    try:
+        assert not window._gather_permuto().book_verified
+    finally:
+        window._permuto_last_blocked = False
+

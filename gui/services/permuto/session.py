@@ -99,20 +99,36 @@ def renew_action(state: SessionState, now_s: float) -> RenewAction:
     judgement left to exercise and the whole policy is testable without a
     socket.
     """
-    if state.forced:
-        # A 401 outranks the clock and outranks the backoff: the session is
-        # known dead, and waiting changes nothing except how long the book
-        # goes unmanaged.
-        return RenewAction.RENEW
-
-    if not state.token:
-        return RenewAction.NO_SESSION
-
+    # [review] BACKOFF FIRST, above both the 401 latch and the empty token.
+    #
+    # It used to sit below them, and both routes around it end in the same
+    # place: a renewal that keeps failing, retried on every 5s tick for the
+    # whole contest. `forced` is set by a 401 and cleared only by a
+    # SUCCESSFUL reauth, so a venue answering 401 forever pinned it to RENEW;
+    # and an empty token short-circuited to NO_SESSION before the failure
+    # count was ever consulted, so a failing bootstrap did the same.
+    #
+    # The "a 401 outranks the clock" intent survives, because on the first
+    # 401 `consecutive_failures` is still 0 and this block does not fire --
+    # the latch is honoured immediately and only earns a delay once an actual
+    # attempt has failed.
     if state.consecutive_failures > 0:
         due = state.last_attempt_s + next_backoff_s(state.consecutive_failures)
         if now_s < due:
             return RenewAction.WAIT
         return RenewAction.RENEW
+
+    if state.forced:
+        # A 401 outranks the clock: the session is known dead, and waiting
+        # changes nothing except how long the book goes unmanaged.
+        return RenewAction.RENEW
+
+    if not state.token:
+        # No token AND nothing has failed yet: this is a cold start. The
+        # caller decides whether it holds an identity that can mint one --
+        # see PermutoClient.ensure_session(), which treats this as "go and
+        # bootstrap" rather than as a dead end.
+        return RenewAction.NO_SESSION
 
     if state.expires_at_s <= 0.0:
         # Unknown expiry. Renew rather than assume: an unknown deadline that

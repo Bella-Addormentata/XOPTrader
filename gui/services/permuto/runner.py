@@ -175,9 +175,26 @@ class QuoteRunner:
 
         session_ok, session_waiting = True, False
         if not paused:
-            action = self._client.ensure_session(now_s)
-            session_waiting = action is RenewAction.WAIT
-            session_ok = action in (RenewAction.OK, RenewAction.RENEW)
+            # [review] A raise here used to abort the tick BEFORE the
+            # withdraw path, so the one branch written for a dead session --
+            # decide()'s `if not view.session_ok: WITHDRAW "no usable trading
+            # session"` -- was unreachable by exception. session_ok is only
+            # ever set from a RETURNED action, and an auth failure returns
+            # nothing. The book stayed resting for the whole outage while the
+            # code that exists to retract it sat one frame up the stack.
+            #
+            # Caught and folded into session_ok instead: a session we could
+            # not establish is a session we do not have, which is exactly
+            # what decide() already knows how to answer.
+            try:
+                action = self._client.ensure_session(now_s)
+                session_waiting = action is RenewAction.WAIT
+                session_ok = action in (RenewAction.OK, RenewAction.RENEW)
+            except PermutoNotLinked:
+                raise
+            except PermutoAuthError as exc:
+                _log.warning("permuto: session unavailable this tick: %s", exc)
+                session_ok, session_waiting = False, False
 
         # [review] Poll the venue BEFORE deciding, not after deciding to
         # quote. The first version reconciled only on the way to a batch, so
@@ -197,9 +214,21 @@ class QuoteRunner:
         state = MarginState(carried=carried)
         account_seen = False
         if session_ok and not paused:
-            self.reconcile(self._client.open_orders(now_s))
-            state = _margin_state(self._client.account(now_s), carried)
-            account_seen = True
+            # [review] Same reasoning as the session call above: these two
+            # were outside any handler, so a failure on either aborted the
+            # tick before the withdraw and left the book resting. A view of
+            # the venue we could not obtain is not a reason to stop managing
+            # what we already placed -- account_seen stays False, which the
+            # risk pass below already treats as "do not act on a default".
+            try:
+                self.reconcile(self._client.open_orders(now_s))
+                state = _margin_state(self._client.account(now_s), carried)
+                account_seen = True
+            except PermutoNotLinked:
+                raise
+            except (PermutoAuthError, BatchError) as exc:
+                _log.warning("permuto: venue view unavailable: %s", exc)
+                session_ok = False
 
         results: dict = {}
         any_quoted = False
@@ -241,13 +270,23 @@ class QuoteRunner:
             if len(withdrawing) == len(self._markets):
                 self._client.cancel_all(now_s)
                 self._forget_book()
+                # A full withdrawal discharges the reopen debt, because
+                # _forget_book() is what the debt was FOR: the latch exists
+                # to stop a stale two-sided belief surviving the venue's
+                # carried->live cancel, and there is no belief left to be
+                # stale about.
+                self._reopen_pending = False
             else:
                 self._client.cancel_all(now_s, withdrawing)
                 # Clear on withdrawal, not on next observation: between the
                 # two sits a belief in orders we just cancelled.
                 for market in withdrawing:
                     self._resting[market] = RestingQuote()
-            self._reopen_pending = False
+                # [review] The latch is NOT cleared here. It used to be
+                # cleared for both branches, so withdrawing ONE market
+                # discharged the rebuild owed to the others -- whose beliefs
+                # this branch deliberately leaves intact, and which are
+                # exactly the ones that can still be stale after a reopen.
             if not any_quoted:
                 return TickResult("withdraw", reason, results)
 

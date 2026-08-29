@@ -101,11 +101,59 @@ def test_the_reopen_debt_survives_a_failed_tick():
     c = _Client(fail_on="account")
     r = _runner(c)
     r.tick(1.0, _ORACLE, {"trading_paused": True})
-    assert not r.tick(2.0, _ORACLE, {"trading_paused": False}).ok
-    assert r._reopen_pending, "the rebuild we owe the book was dropped"
+
+    # The failing tick now WITHDRAWS rather than aborting -- which discharges
+    # the debt honestly rather than dropping it, because the full cancel also
+    # forgets the book, and a belief that no longer exists cannot be stale.
+    # The property that matters is the outcome, not the latch: the book is
+    # rebuilt once the venue is readable again.
+    assert r.tick(2.0, _ORACLE, {"trading_paused": False}).action == "withdraw"
+    assert all(q.empty for q in r._resting.values())
 
     c.fail_on = None
     assert r.tick(3.0, _ORACLE, {"trading_paused": False}).action == "quote"
+
+
+def test_a_partial_withdrawal_does_not_discharge_the_rebuild_debt():
+    """[review] Clearing the latch on ANY withdrawal was wrong.
+
+    The partial branch deliberately leaves the non-withdrawing markets'
+    beliefs intact -- and those are exactly the ones that can still be stale
+    after a carried->live cancel, because the venue cancelled orders we
+    still think are resting. Discharging the debt there dropped the rebuild
+    owed to markets that were never touched.
+
+    Reaching it needs a market that withdraws beside one that decides to
+    QUOTE but places nothing: `just_reopened` forces QUOTE, so with a healthy
+    account the rebuild really does happen and clearing the latch is right.
+    Exhausted margin is what separates the two -- risk leaves no legs, so
+    nothing was rebuilt and the debt must survive.
+    """
+    c = _Client(account={"equity_usd": 1000.0, "used_margin_usd": 995.0,
+                         "positions": {}})
+    r = _runner2(c)
+    r.tick(1.0, {_MKT: 0.07, _MKT2: 0.07}, {"trading_paused": True})
+
+    # _MKT loses its oracle -> 1 of 2 withdraws -> the PARTIAL branch.
+    result = r.tick(2.0, {_MKT2: 0.07}, {"trading_paused": False})
+
+    assert result.action == "hold"
+    assert "batch_upsert" not in c.calls, "nothing was rebuilt"
+    assert r._reopen_pending, (
+        "withdrawing one market discharged the rebuild owed to the other")
+
+
+def test_a_partial_withdrawal_beside_a_real_rebuild_does_discharge_it():
+    """The other half: when the surviving market actually re-quotes, the
+    debt IS paid and the latch must clear -- otherwise every later tick
+    force-quotes a book that is already correct."""
+    c = _Client()
+    r = _runner2(c)
+    r.tick(1.0, {_MKT: 0.07, _MKT2: 0.07}, {"trading_paused": True})
+    assert r.tick(2.0, {_MKT2: 0.07},
+                  {"trading_paused": False}).action == "quote"
+    assert not r._reopen_pending
+
 
 
 def test_a_second_pause_clears_a_pending_reopen():
@@ -275,7 +323,37 @@ def test_no_session_at_all_withdraws():
     "where", ["ensure_session", "open_orders", "account", "batch_upsert"]
 )
 def test_a_failure_anywhere_returns_rather_than_raises(where):
+    """The loop must outlive its own failures for ~102 unattended hours."""
+    result = _runner(_Client(fail_on=where)).tick(1.0, _ORACLE, {})
+    assert result is not None
+
+
+@pytest.mark.parametrize("where", ["ensure_session", "open_orders", "account"])
+def test_a_failure_reaching_the_venue_RETRACTS_the_book(where):
+    """[review] Not merely "returns" -- retracts.
+
+    These three calls sat outside any handler, so a failure aborted the tick
+    BEFORE the withdraw path. decide()'s branch for a dead session was
+    therefore unreachable by exception, and the previous version of this test
+    asserted only that nothing propagated -- testing around the hole rather
+    than covering it. Orders stayed resting, priced against a venue we could
+    no longer see, for the whole outage.
+
+    A view of the venue we cannot obtain is not a reason to stop managing
+    what we already placed.
+    """
     c = _Client(fail_on=where)
+    result = _runner(c).tick(1.0, _ORACLE, {})
+    assert result.action == "withdraw", (
+        "%s failed and the book was left resting" % where)
+    assert "cancel_all" in c.calls, "nothing was actually retracted"
+
+
+def test_a_batch_failure_is_still_an_error_not_a_false_all_clear():
+    """The batch runs AFTER the withdraw decision, so a failure there is a
+    genuine error rather than a degradation -- it must not be reported as a
+    successful pass."""
+    c = _Client(fail_on="batch_upsert")
     result = _runner(c).tick(1.0, _ORACLE, {})
     assert not result.ok
     assert "exploded" in result.error

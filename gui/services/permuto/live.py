@@ -28,6 +28,7 @@ here would make the loop confident and wrong.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from typing import Any, Callable, Optional
 
@@ -50,26 +51,82 @@ MARKETS = ["QQQ-VOL-PERP", "NVDA-VOL-PERP", "TSLA-VOL-PERP"]
 TICK_S = 5.0
 
 
+class VenueStateUnreadable(RuntimeError):
+    """The venue's public state could not be read well enough to quote on."""
+
+
 def _default_venue_state() -> dict:
-    """Oracle prices and pause flags, from the public routes."""
+    """Oracle prices and pause flags, from the public routes.
+
+    Raises VenueStateUnreadable rather than returning a cheerful default.
+    The caller turns that into a withdraw, which is the only safe reading:
+    everything downstream treats "not paused" and "oracle present" as
+    permission to rest orders.
+    """
     from gui.services.permuto.auth import _request
 
-    prices = (_request("GET", "/info/oracle") or {}).get("prices") or {}
-    flags = (_request("GET", "/info/meta") or {}).get("flags") or {}
+    try:
+        oracle_doc = _request("GET", "/info/oracle") or {}
+        meta = _request("GET", "/info/meta") or {}
+    except Exception as exc:  # noqa: BLE001
+        raise VenueStateUnreadable("public routes failed: %s" % exc) from exc
+
+    flags = meta.get("flags")
+    # [review] FAIL CLOSED on a flags payload we do not recognise. This used
+    # to be `bool(flags.get("trading_paused"))` over a `or {}` default, so a
+    # shape change, a partial response or an error object all read as "not
+    # paused" and the loop quoted straight through. The venue pause is the
+    # one thing the sponsor said bots must handle, and every entrant meets it
+    # at the Sunday reset. Absence of the key is not evidence of trading.
+    if not isinstance(flags, dict) or "trading_paused" not in flags:
+        raise VenueStateUnreadable(
+            "/info/meta carried no recognisable trading_paused flag")
+
+    prices = oracle_doc.get("prices")
+    if not isinstance(prices, dict):
+        raise VenueStateUnreadable("/info/oracle carried no prices object")
+
     # /info/oracle is keyed by TICKER (QQQ-VOL); the runner works in SYMBOLS.
     oracles = {}
     for symbol in MARKETS:
         value = prices.get(symbol.replace("-PERP", ""))
         if isinstance(value, (int, float, str)):
             try:
-                oracles[symbol] = float(value)
+                parsed = float(value)
             except (TypeError, ValueError):
                 continue
+            if math.isfinite(parsed) and parsed > 0.0:
+                oracles[symbol] = parsed
+
+    # [review] `carried` was read from flags["carried"], a key /info/meta does
+    # not have -- verified against the live venue, whose flags are banner,
+    # competition_mode, mm_prize_min_depth_seconds, pause_*, signup_*,
+    # trading_paused, untraded_purge_* and withdrawals_enabled. So it was
+    # always False, and a carried session would have sized every quote at 8x
+    # what the stressed initial margin allows (risk.py divides by
+    # CARRIED_IM_MULTIPLIER only when this is set), which the venue rejects --
+    # no fills, and no depth credit, for the whole overnight session.
+    #
+    # The observable signal is the per-market status in /info/meta["markets"],
+    # which reads "active" on a live market. Anything else is treated as not
+    # live, because the sizing consequence of guessing wrong in that direction
+    # is a rejected batch and in the other direction is a liquidation.
+    markets = meta.get("markets")
+    carried = False
+    if isinstance(markets, list) and markets:
+        wanted = {m.replace("-PERP", "") for m in MARKETS}
+        for entry in markets:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("symbol") in wanted or entry.get("base_asset") in wanted:
+                if entry.get("status") != "active":
+                    carried = True
+
     return {
         "oracles": oracles,
         "flags": {
             "trading_paused": bool(flags.get("trading_paused")),
-            "carried": bool(flags.get("carried")),
+            "carried": carried,
         },
     }
 
@@ -88,6 +145,9 @@ class _Worker(QObject):
         self._client = client
         self._venue_state = venue_state
         self._stop = False
+        # When we last held a venue reading we would be willing to quote on.
+        # Seeded at construction so the first tick is not born stale.
+        self._fresh_at = time.monotonic()
 
     def request_stop(self) -> None:
         self._stop = True
@@ -99,9 +159,46 @@ class _Worker(QObject):
             while not self._stop:
                 start = time.monotonic()
                 try:
-                    state = self._venue_state()
-                    result = self._runner.tick(
-                        time.time(), state["oracles"], state["flags"])
+                    # [review] The venue read gets its own try, and the tick
+                    # ALWAYS runs.
+                    #
+                    # These used to share one handler, so any failure of
+                    # /info/oracle or /info/meta -- a 5xx, a 429, a timeout,
+                    # a non-JSON body -- skipped tick() entirely. No
+                    # cancel_all, no reconcile, no account read, no risk
+                    # pass: every order from the last good tick stayed
+                    # resting, priced against an oracle the loop could no
+                    # longer read, for the whole outage. decide() has a
+                    # withdraw for exactly this and it was never reached.
+                    #
+                    # Degrading instead of skipping hands it an empty oracle
+                    # set and a paused flag, both of which decide() already
+                    # answers with WITHDRAW -- so an unreadable venue
+                    # retracts the book rather than abandoning it.
+                    try:
+                        state = self._venue_state()
+                        oracles = dict(state.get("oracles") or {})
+                        flags = dict(state.get("flags") or {})
+                        if oracles:
+                            self._fresh_at = time.monotonic()
+                    except Exception as exc:  # noqa: BLE001
+                        _log.warning("permuto: venue state unreadable: %s", exc)
+                        oracles, flags = {}, {"trading_paused": True,
+                                              "carried": False}
+
+                    # [review] A REAL oracle age. decide() withdraws above
+                    # MAX_ORACLE_AGE_S, and nothing in the process had ever
+                    # produced this key -- it defaulted to 0.0, so the check
+                    # evaluated 0.0 > 15.0 on every tick and the withdraw was
+                    # unreachable code. This module's own docstring cites
+                    # that protection as the reason the venue is polled every
+                    # tick. /info/oracle carries no timestamp (verified
+                    # against the live venue: it returns prices and nothing
+                    # else), so the honest measure is how long since WE last
+                    # held a usable reading.
+                    flags["oracle_age_s"] = time.monotonic() - self._fresh_at
+
+                    result = self._runner.tick(time.time(), oracles, flags)
                     self.ticked.emit(result)
                 except Exception as exc:  # noqa: BLE001 - never kill the loop
                     _log.exception("permuto: tick raised")

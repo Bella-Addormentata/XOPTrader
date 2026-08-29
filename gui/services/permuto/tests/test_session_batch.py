@@ -49,12 +49,42 @@ def test_a_401_outranks_our_own_clock():
     assert renew_action(s, now_s=0) is RenewAction.RENEW
 
 
-def test_a_401_also_outranks_the_backoff():
+def test_a_401_outranks_the_clock_on_its_first_occurrence():
     """The session is known dead; waiting changes nothing except how long the
-    book goes unmanaged."""
+    book goes unmanaged. Nothing has failed yet, so there is nothing to back
+    off from -- go and get a new session now."""
+    s = SessionState(token="t", expires_at_s=10_000, forced=True,
+                     consecutive_failures=0, last_attempt_s=1_000)
+    assert renew_action(s, now_s=1_001) is RenewAction.RENEW
+
+
+def test_a_401_stops_outranking_the_backoff_once_renewals_are_failing():
+    """[review] This case used to answer RENEW, and it was an auth-route
+    hammer.
+
+    `forced` is set by a 401 and cleared only by a SUCCESSFUL reauth, so a
+    venue answering 401 forever -- a deregistered account, a key mismatch --
+    pinned the policy to RENEW and the loop reauthenticated on every 5s tick
+    for the whole 102-hour contest.
+
+    The original reasoning ("waiting changes nothing except how long the book
+    goes unmanaged") holds for the FIRST 401, which the test above now
+    covers. It does not hold at the fifth consecutive failure: there, waiting
+    is the only thing standing between us and a rate-limit.
+    """
     s = SessionState(token="t", expires_at_s=10_000, forced=True,
                      consecutive_failures=5, last_attempt_s=1_000)
-    assert renew_action(s, now_s=1_001) is RenewAction.RENEW
+    assert renew_action(s, now_s=1_001) is RenewAction.WAIT
+    # And it still never gives up -- once the backoff is served, it retries.
+    assert renew_action(s, now_s=1_000 + 86_400) is RenewAction.RENEW
+
+
+def test_a_cold_start_backs_off_too_once_its_bootstrap_is_failing():
+    """The same hole through the other door. An empty token short-circuited
+    to NO_SESSION before the failure count was consulted, so a bootstrap that
+    kept failing was retried every tick as well."""
+    s = SessionState(token="", consecutive_failures=3, last_attempt_s=1_000)
+    assert renew_action(s, now_s=1_001) is RenewAction.WAIT
 
 
 def test_an_unknown_expiry_renews_rather_than_assumes():

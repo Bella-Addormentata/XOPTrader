@@ -230,6 +230,26 @@ class PermutoClient:
         function whose job is bookkeeping.
         """
         action = renew_action(self.session, now_s)
+        # [review] NO_SESSION means "cold start", not "give up".
+        #
+        # This client always holds a signing identity, and reauth() is the
+        # full challenge/sign/wallet_auth handshake -- it needs no previous
+        # token and passes no signup gate. So an empty token is something we
+        # can fix, and treating it as terminal is what left the live session
+        # dead: PermutoLive is constructed with session_token="", every
+        # ensure_session() returned NO_SESSION, session_ok was False on every
+        # tick, and the loop never placed an order while the switch showed
+        # PERMUTO ON. Nothing else in the process could mint that first
+        # token -- the 401 path that sets `forced` is unreachable, because a
+        # request with an empty token raises PermutoNotLinked before it is
+        # ever sent.
+        #
+        # Backoff is not bypassed by this: renew_action() now weighs
+        # consecutive_failures ABOVE the empty-token branch, so a bootstrap
+        # that keeps failing comes back as WAIT and this promotion never sees
+        # it.
+        if action is RenewAction.NO_SESSION and self._identity is not None:
+            action = RenewAction.RENEW
         if action is not RenewAction.RENEW:
             return action
         try:

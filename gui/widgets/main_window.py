@@ -318,6 +318,13 @@ class MainWindow(QMainWindow):
         # Permuto switch refuses to turn on -- see _gather_permuto.
         self._permuto_runner = None
         self._permuto_book_is_empty: bool = True
+        # [review] Whether anything has actually LOOKED at the venue's book
+        # this process. False until a session reports it, because Permuto
+        # orders rest remotely and survive a crash, a kill, a power loss or a
+        # failed cancel -- so "no runner" means unknown, not empty.
+        self._permuto_book_confirmed_empty: bool = False
+        # Latched from the last tick: True while the loop cannot trade.
+        self._permuto_last_blocked: bool = False
         # True when the current Paused status is owned by the GUI flag (the
         # pause Resume can clear), False when a risk breaker holds it.
         self._gui_pause_owns_it: bool = True
@@ -2233,15 +2240,44 @@ class MainWindow(QMainWindow):
         except Exception:  # noqa: BLE001 - no identity is a normal state
             gates.add("not_registered")
 
+        # [review] A tick that cannot trade is a gate, not a green light.
+        #
+        # `not_wired` was removed on the premise that owning a QuoteRunner
+        # guarantees a usable session. Nothing enforced that premise, and it
+        # was false: the live session was built with an empty token and every
+        # tick came back "blocked" while this painted PERMUTO ON. The session
+        # bootstrap fixes the cause; this makes the switch stop asserting
+        # something it never checked.
+        if self._permuto_last_blocked:
+            gates.add("blocked")
+
         # The runner is the authority on its own book: it reports empty only
         # once a cancel has been acknowledged, so a stop in flight keeps the
         # switch on STOPPING rather than claiming OFF.
+        #
+        # [review] With NO runner the book is UNVERIFIED, and unverified is
+        # reported as empty here on purpose.
+        #
+        # Permuto orders rest at a REMOTE venue and outlive this process -- a
+        # crash, a kill, a power loss or a failed cancel all leave them there
+        # -- so a fresh GUI has genuinely not checked. But feeding that
+        # uncertainty in as `book_is_empty=False` makes may_turn_on() refuse
+        # with `cancels_pending`, which would mean a fresh GUI could NEVER arm
+        # Permuto. That is worse than the claim it fixes, because arming is
+        # precisely what resolves the uncertainty: the first tick calls
+        # open_orders() and reconcile() adopts whatever is really there.
+        #
+        # So the switch stays armable and the PROMISE is what gets corrected
+        # -- see VenueSwitch._tooltip_for, which no longer tells a Permuto
+        # operator that nothing is resting when nothing has looked.
         book_empty = (self._permuto_runner.book_is_empty()
                       if self._permuto_runner is not None else True)
         return SwitchInputs(
             desired_on=self._permuto_desired_on,
             gates=frozenset(gates),
             book_is_empty=book_empty,
+            book_verified=(self._permuto_runner is not None
+                           or self._permuto_book_confirmed_empty),
         )
 
     def _on_switch_refused(self, reason: str) -> None:
@@ -2314,6 +2350,11 @@ class MainWindow(QMainWindow):
 
     def _on_permuto_tick(self, result) -> None:
         action = getattr(result, "action", "?")
+        # A tick that reached the venue is proof the session works, and its
+        # withdraw/quote outcome is the first real observation of the book.
+        self._permuto_last_blocked = (action == "blocked")
+        if action in ("quote", "hold", "withdraw", "wait"):
+            self._permuto_book_confirmed_empty = True
         if not getattr(result, "ok", True):
             _log.warning("[Permuto] tick error: %s",
                          getattr(result, "error", ""))
