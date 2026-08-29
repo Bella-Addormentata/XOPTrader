@@ -1813,14 +1813,25 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
     // discover an unvaluable book could post offers and execute takes before
     // the flag that is supposed to stop it existed.
     //
-    // The verdict this reads is the PREVIOUS cycle's, which is sufficient
-    // and is why it can run here at all: the predicate requires the drawdown
-    // grace to have elapsed, and the valuation flags have been recomputed
-    // every cycle throughout that grace. So by the cycle the condition first
-    // holds, the inputs are already true and the latch closes before this
-    // cycle trades rather than after.
-    // Idempotent -- Step 13 still evaluates it and owns the operator-facing
-    // logging and alert, which needs this cycle's equity figure.
+    // [review round 9] THIS cycle's verdict, not the previous one's.
+    //
+    // Three earlier rounds argued the previous cycle's flags were
+    // sufficient because they are recomputed throughout the grace. The
+    // reviewer's counterexamples break that: a carry exactly at its TTL last
+    // cycle expires at THIS block_height; Step 1 can stale the CoinGecko
+    // cache; Step 2 can change holdings. In each, the stored flags are still
+    // clean here and only Step 13 would discover the truth -- after offer
+    // management and arbitrage have traded on it. A zero-length grace makes
+    // the same window with no edge case at all.
+    //
+    // compute_portfolio_equity_usd() is synchronous, makes no RPC, and its
+    // only mutations -- refreshing an asset's carry price and live block --
+    // are idempotent within a block, so evaluating it twice per cycle (here
+    // and in Step 13, which still owns the operator-facing report with this
+    // cycle's equity figure) is two map walks, not two effects.
+    // The equity figure itself is Step 13's to report; only the flag side
+    // effects are wanted here.
+    static_cast<void>(compute_portfolio_equity_usd(block_height));
     if (risk::unvaluable_book_must_fail_closed(
             drawdown_grace_remaining_ == 0,
             valuation_degraded_,
