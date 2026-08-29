@@ -2224,17 +2224,6 @@ class MainWindow(QMainWindow):
 
     def _gather_permuto(self) -> SwitchInputs:
         gates: set[str] = set()
-        # [review] The switch could report PERMUTO ON with nothing behind it.
-        # QuoteRunner and PermutoClient are not instantiated outside tests,
-        # and the Permuto page deliberately keeps "Start quoting" disabled --
-        # so a registered operator could flip this and get a live-trading
-        # indication over no session, no loop and no orders. A control that
-        # claims to be trading when it is not is worse than one that refuses.
-        #
-        # This gate comes off in the change that owns a runner, and not
-        # before.
-        if self._permuto_runner is None:
-            gates.add("not_wired")
         try:
             from gui.widgets.permuto import _default_identity_factory
 
@@ -2244,10 +2233,15 @@ class MainWindow(QMainWindow):
         except Exception:  # noqa: BLE001 - no identity is a normal state
             gates.add("not_registered")
 
+        # The runner is the authority on its own book: it reports empty only
+        # once a cancel has been acknowledged, so a stop in flight keeps the
+        # switch on STOPPING rather than claiming OFF.
+        book_empty = (self._permuto_runner.book_is_empty()
+                      if self._permuto_runner is not None else True)
         return SwitchInputs(
             desired_on=self._permuto_desired_on,
             gates=frozenset(gates),
-            book_is_empty=self._permuto_book_is_empty,
+            book_is_empty=book_empty,
         )
 
     def _on_switch_refused(self, reason: str) -> None:
@@ -2289,9 +2283,46 @@ class MainWindow(QMainWindow):
         self._refresh_venue_switches()
 
     def _on_permuto_toggle(self, want_on: bool) -> None:
-        self._permuto_desired_on = bool(want_on)
-        if not want_on:
-            self._permuto_book_is_empty = True
+        if want_on:
+            if self._permuto_runner is None:
+                try:
+                    self._permuto_runner = self._make_permuto_live()
+                except Exception as exc:  # noqa: BLE001
+                    self._on_switch_refused(
+                        "could not start Permuto quoting: %s" % exc)
+                    return
+                self._permuto_runner.ticked.connect(self._on_permuto_tick)
+                self._permuto_runner.stopped.connect(self._on_permuto_stopped)
+            self._permuto_runner.start()
+            self._permuto_desired_on = True
+        else:
+            # Ask it to stop. The switch stays STOPPING until the worker's
+            # cancel is acknowledged -- off means flat, and the acknowledgement
+            # is what makes that true rather than merely intended.
+            self._permuto_desired_on = False
+            if self._permuto_runner is not None:
+                self._permuto_runner.stop()
+        self._refresh_venue_switches()
+
+    def _make_permuto_live(self):
+        """Build the live session. Separated so tests can inject a fake."""
+        from gui.services.permuto.live import PermutoLive
+        from gui.widgets.permuto import _default_identity_factory
+
+        identity = _default_identity_factory()
+        return PermutoLive(identity)
+
+    def _on_permuto_tick(self, result) -> None:
+        action = getattr(result, "action", "?")
+        if not getattr(result, "ok", True):
+            _log.warning("[Permuto] tick error: %s",
+                         getattr(result, "error", ""))
+        self.statusBar().showMessage("Permuto: %s" % action, 4000)
+        self._refresh_venue_switches()
+
+    def _on_permuto_stopped(self, reason: str) -> None:
+        _log.info("[Permuto] %s", reason)
+        self.statusBar().showMessage("Permuto: %s" % reason, 10000)
         self._refresh_venue_switches()
 
     def _refresh_venue_switches(self) -> None:
@@ -2602,5 +2633,15 @@ class MainWindow(QMainWindow):
             widget = self._unwrap(page)
             if widget is not None and hasattr(widget, "stop_background_work"):
                 widget.stop_background_work()
+
+        # The live Permuto session owns its own thread and, more importantly,
+        # a live book. join() asks it to stop and WAITS for the cancel --
+        # closing the window while orders rest is the dead-man's-switch
+        # incident in a different venue.
+        if self._permuto_runner is not None:
+            try:
+                self._permuto_runner.join()
+            except Exception:  # noqa: BLE001 - teardown must not block exit
+                _log.exception("[Permuto] live session did not stop cleanly")
         self._save_state()
         super().closeEvent(event)

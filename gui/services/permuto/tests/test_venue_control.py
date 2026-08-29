@@ -184,31 +184,37 @@ def test_dexie_refuses_while_the_engine_is_down(window):
     assert window._dexie_switch.text() == "DEXIE OFF"
 
 
-def test_permuto_refuses_while_no_runner_is_owned(window):
-    """[review] The switch could have reported PERMUTO ON with nothing behind
-    it -- no session, no loop, no orders.
+def test_permuto_refuses_until_registered(window):
+    """The runner is wired now, so registration is the only remaining gate.
 
-    `not_wired` outranks `not_registered` because it is the more fundamental
-    obstacle: registering would not make this switch do anything.
+    `not_wired` existed while nothing owned a QuoteRunner and the switch could
+    only ever have claimed ON over no session and no orders. PermutoLive owns
+    one, so that gate is gone and the operator's own decision -- built, but
+    disabled until registered -- is what holds.
     """
     seen = []
     window._permuto_switch.refused.connect(seen.append)
     window._permuto_switch.click()
-    assert seen == ["the quoting loop is not connected to this switch yet"]
+    assert seen == ["this identity is not registered with the venue"]
     assert window._permuto_switch.text() == "PERMUTO OFF"
 
 
-def test_permuto_still_refuses_on_registration_alone(window):
-    """With a runner present but no registration, the other gate applies."""
-    window._permuto_runner = object()
+def test_permuto_reports_its_own_book_rather_than_assuming(window):
+    """A stop in flight must read STOPPING, not OFF.
+
+    The live session reports empty only once its cancel is acknowledged, so
+    the switch cannot claim OFF over orders that may still be resting.
+    """
+    class _Live:
+        @staticmethod
+        def book_is_empty():
+            return False
+
+    window._permuto_runner = _Live()
     try:
-        seen = []
-        window._permuto_switch.refused.connect(seen.append)
-        window._permuto_switch.click()
-        assert seen == ["this identity is not registered with the venue"]
+        assert window._gather_permuto().book_is_empty is False
     finally:
         window._permuto_runner = None
-
 
 def test_an_unreadable_gate_state_fails_closed(window, monkeypatch):
     """Guessing "no gate" is how a switch turns trading on over a tripped
