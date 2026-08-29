@@ -7,6 +7,8 @@ that throws does not end a session meant to run for 102 unattended hours.
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 pytest.importorskip("PySide6")
@@ -150,6 +152,33 @@ def test_join_is_safe_when_nothing_is_running(qapp):
     live = _live(qapp)
     live.join()          # must not raise or hang
     assert not live.is_running()
+
+
+def test_join_returns_promptly_while_blocking_the_event_loop(qapp):
+    """The real closeEvent path: join() BLOCKS, it does not pump events.
+
+    Every other test here spins on processEvents(), which delivers the
+    queued worker.stopped -> thread.quit for free. closeEvent cannot: it
+    calls join(), which blocks the GUI thread inside wait(), so a quit that
+    depends on that event loop can never arrive and a healthy stop waits out
+    the whole timeout before terminating the thread.
+
+    So this one deliberately never pumps. A short timeout is the assertion:
+    if join() is relying on a queued quit it will spend all 3000 ms here.
+    """
+    live = _live(qapp)
+    live.start()
+    qapp.processEvents()          # let the worker actually start
+
+    started = time.monotonic()
+    live.join(timeout_ms=3000)    # no processEvents() anywhere in here
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 2.0, (
+        "join() took %.2fs -- it is waiting on a quit that needs the event "
+        "loop it is blocking" % elapsed)
+    assert not live.is_running()
+    assert live._client.cancels, "off must still mean flat on this path"
 
 
 def test_start_is_idempotent(qapp):

@@ -209,6 +209,20 @@ class PermutoLive(QObject):
         if thread is None:
             return
         self.stop()
+        # [review] quit() DIRECTLY, not through worker.stopped -> thread.quit.
+        #
+        # That connection is auto, and the QThread OBJECT lives in the GUI
+        # thread, so the slot invocation is queued to the GUI thread's event
+        # loop -- the loop this function is about to block by calling wait().
+        # The quit could therefore never be delivered, exec() never returned,
+        # and a perfectly healthy stop sat here for the full 30 s before
+        # reaching terminate(). QThread::quit is thread-safe and callable
+        # from anywhere; called here it takes effect as soon as run() returns.
+        #
+        # The tests did not catch this because they spin on processEvents()
+        # instead of blocking, which is exactly the delivery that closeEvent
+        # cannot do.
+        thread.quit()
         if not thread.wait(timeout_ms):
             _log.warning("permuto: live thread did not stop; terminating")
             thread.terminate()
