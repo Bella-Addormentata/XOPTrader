@@ -713,6 +713,19 @@ class MetricsService(QObject):
             return value >= 1.0
         return False
 
+    def posting_gates_published(self) -> bool:
+        """Whether the engine has published its posting-gate gauges at all.
+
+        The metrics endpoint answers before the first cycle writes the gate
+        family, and an empty scrape from that window is indistinguishable
+        from "no gates" to posting_gate_reasons(). Intent adoption must wait
+        for actual evidence; the legacy per-gauge fallback counts, since a
+        pre-family engine publishes xop_bot_paused from its first export.
+        """
+        with QMutexLocker(self._mutex):
+            m = self._latest
+        return bool(m.get("xop_posting_gate")) or "xop_bot_paused" in m
+
     def posting_gate_reasons(self) -> set[str]:
         """The STANDING gates currently disabling offer posting.
 

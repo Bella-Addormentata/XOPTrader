@@ -2158,7 +2158,19 @@ class MainWindow(QMainWindow):
         if self._dexie_intent_synced or self._bridge is None:
             return
         try:
-            reasons = self._bridge.metrics_service.posting_gate_reasons()
+            svc = self._bridge.metrics_service
+            # [v0.10.1 field report] Only sync from a scrape the engine has
+            # actually WRITTEN ITS GATES INTO. The metrics endpoint comes up
+            # before the first cycle publishes the gate family, and a scrape
+            # from that window returns an empty reason set -- which this
+            # read as "posting ungated, therefore trading" and adopted
+            # intent ON. The real gauges then arrived carrying the
+            # operator's own pause, and the switch opened showing DEXIE
+            # BLOCKED over an intent nobody had expressed. Absence of the
+            # family is absence of evidence; wait for the next tick.
+            if not svc.posting_gates_published():
+                return
+            reasons = svc.posting_gate_reasons()
         except Exception:  # noqa: BLE001 - try again on the next tick
             return
         self._dexie_intent_synced = True

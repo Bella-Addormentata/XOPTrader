@@ -379,6 +379,13 @@ def test_the_switch_adopts_an_already_trading_engine(window, monkeypatch):
         def posting_gate_reasons():
             return set()          # ungated: it IS posting
 
+        @staticmethod
+        def posting_gates_published():
+            # The gauges are genuinely present in this fake's world --
+            # required since the sync learned to wait for evidence rather
+            # than reading a pre-publication scrape as "trading".
+            return True
+
     class _Bridge:
         metrics_service = _Svc()
 
@@ -512,4 +519,35 @@ def test_arming_does_not_paint_ON_before_the_first_pass(window, monkeypatch):
         window._permuto_runner = None
         window._permuto_last_blocked = False
         window._permuto_last_action = ""
+
+
+def test_the_intent_sync_waits_for_the_gate_family(window, monkeypatch):
+    """[v0.10.1 field report] The metrics endpoint answers before the first
+    cycle publishes the gate family, and reading that empty scrape as
+    "ungated, therefore trading" adopted an ON intent nobody expressed --
+    the operator opened the GUI to DEXIE BLOCKED over their own pause."""
+    class _Svc:
+        @staticmethod
+        def posting_gate_reasons():
+            return set()          # empty -- but only because nothing is
+                                  # published yet
+
+        @staticmethod
+        def posting_gates_published():
+            return False
+
+    class _Bridge:
+        metrics_service = _Svc()
+
+    monkeypatch.setattr(window, "_bridge", _Bridge(), raising=False)
+    window._dexie_intent_synced = False
+    window._dexie_desired_on = False
+    try:
+        window._sync_dexie_intent_from_engine()
+        assert not window._dexie_intent_synced, "synced from no evidence"
+        assert not window._dexie_desired_on, (
+            "an unpublished scrape was read as an already-trading engine")
+    finally:
+        window._dexie_intent_synced = False
+        window._bridge = None
 

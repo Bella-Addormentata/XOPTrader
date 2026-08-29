@@ -78,6 +78,10 @@ GATE_LABELS: dict[str, str] = {
     "not_configured": "the venue is not configured",
     "cancels_pending": "the previous stop is still confirming",
     "not_wired": "the quoting loop is not connected to this switch yet",
+    "gui": ("posting is paused -- the Pause/Resume button (or a pause flag) "
+            "holds it; resume there rather than here"),
+    "xch_recovery": "XCH recovery mode is active -- posting resumes when the "
+                    "balance is restored",
     "blocked": ("the quoting loop cannot reach the venue -- every tick is "
                 "coming back blocked"),
     "not_quoting": ("the quoting loop is running but holding no quotes -- the "
@@ -161,6 +165,8 @@ _GATE_ORDER = (
     "flash_crash",
     "wallet_circuit",
     "engine_down",
+    "xch_recovery",
+    "gui",
     "not_configured",
     "not_wired",
     "not_registered",
