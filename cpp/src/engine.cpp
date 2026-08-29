@@ -1253,11 +1253,20 @@ asio::awaitable<void> Engine::poll_loop_coro()
             bool node_ok = false;
 
             // [review] Ask height_source_, not wallet_only_mode_. The
-            // latter is assigned only in open_connections() and never
+            // latter WAS assigned only in open_connections() and never
             // cleared, so an auto-mode startup fallback pinned this branch
             // forever: even after the probe walked the source back to the
             // node, every poll still took the wallet path and waited on both
-            // RPCs. wallet_only_CONFIGURED is the genuinely permanent one.
+            // RPCs.
+            //
+            // [review] That description is now historical. This PR made
+            // wallet_only_mode_ a RUNTIME latch -- set on fallback below,
+            // cleared on recovery -- so it no longer stays as it was, and
+            // keeping the old rationale obscured the separation this branch
+            // depends on. wallet_only_CONFIGURED is the permanent one and is
+            // what this condition asks; height_source_ drives the
+            // transitions; wallet_only_mode_ tells the REST of the engine
+            // not to await a dead node.
             if (wallet_only_configured_
                 || height_source_.current == risk::HeightSource::Wallet) {
                 // The wallet call gets its own guard. Unprotected, a wallet
@@ -1344,6 +1353,12 @@ asio::awaitable<void> Engine::poll_loop_coro()
                         // Clear the runtime fallback too, so the rest of the
                         // engine stops behaving as though there were no node.
                         wallet_only_mode_ = false;
+                        // [review] Clear the no-progress streak too. It is
+                        // what sent us to the wallet in the first place, and
+                        // leaving it above the threshold meant the FIRST
+                        // ordinary same-height poll on the recovered source
+                        // counted as a failure immediately.
+                        node_no_progress_polls_ = 0;
                         spdlog::warn("[Engine] [S28] full node is answering "
                                      "again -- block height back on the node");
                     }
@@ -14236,9 +14251,14 @@ asio::awaitable<void> Engine::open_connections()
 
 void Engine::close_connections()
 {
-    if (!wallet_only_mode_) {
-        full_node_->close();
-    }
+    // [review] Not gated on wallet_only_mode_ any more. That flag became a
+    // RUNTIME latch, and a runtime fallback deliberately leaves the
+    // full-node client OPEN so the recovery probe can use it -- so shutting
+    // down while fallback was active skipped the close and leaked its
+    // thread pool and sockets. close() is idempotent and safe on a client
+    // that was never opened, which is the only case the old guard was
+    // protecting against.
+    full_node_->close();
     wallet_->close();
     dexie_->close();
     if (coingecko_) {
