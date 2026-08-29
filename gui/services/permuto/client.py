@@ -196,13 +196,26 @@ class PermutoClient:
                 "unexpected message" % len(nonce)
             )
 
+        # [review] Signing failures are AUTH failures. identity.sign() reaches
+        # the OS keystore (DPAPI on Windows) and can raise something that is
+        # not a PermutoAuthError -- which escapes ensure_session()'s renewal
+        # accounting entirely, so a permanently broken keystore fetched a
+        # fresh challenge on every tick with no backoff at all.
+        try:
+            signature = self._identity.sign(nonce).hex()
+        except PermutoAuthError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise PermutoAuthError(
+                "could not sign the auth challenge: %s" % exc) from exc
+
         auth = self._request(
             "POST",
             "/exchange/wallet_auth",
             {
                 "challenge_token": token,
                 "wallet_pubkey": pubkey,
-                "signature": self._identity.sign(nonce).hex(),
+                "signature": signature,
             },
             authed=False,
         )
@@ -252,6 +265,19 @@ class PermutoClient:
             action = RenewAction.RENEW
         if action is not RenewAction.RENEW:
             return action
+        self._reauth_counted(now_s)
+        return RenewAction.RENEW
+
+    def _reauth_counted(self, now_s: float) -> None:
+        """reauth(), with the failure accounting the backoff policy needs.
+
+        [review] Every route to reauth() must come through here. The retry
+        path called reauth() DIRECTLY, so a failing renewal left
+        consecutive_failures at 0 with `forced` still set -- and
+        renew_action() answers that with RENEW immediately, on every 5s tick,
+        which is the auth-route hammer the backoff exists to prevent. The
+        accounting lived in the one caller that happened to have it.
+        """
         try:
             self.reauth(now_s)
         except PermutoAuthError as exc:
@@ -262,7 +288,6 @@ class PermutoClient:
                 self.session.consecutive_failures, exc,
             )
             raise
-        return RenewAction.RENEW
 
     # ------------------------------------------------------------------ #
     # Trading
@@ -319,8 +344,22 @@ class PermutoClient:
             _log.info(
                 "permuto: %s rejected the session, re-authing once", path
             )
-            self.reauth(now_s)
-            return self._request(method, path, payload)
+            # Counted, not direct -- see _reauth_counted().
+            prior = self.session.consecutive_failures
+            self._reauth_counted(now_s)
+            try:
+                return self._request(method, path, payload)
+            except PermutoSessionExpired:
+                # [review] A 401 that SURVIVES a fresh token is the case this
+                # method is named for, and it was the quietest failure here:
+                # reauth() zeroes consecutive_failures on success, so the
+                # second rejection re-set `forced` against a zero count and
+                # the next tick renewed again at once. Restoring the prior
+                # count and charging this attempt makes the backoff escalate
+                # across repeats instead of resetting every five seconds.
+                self.session.consecutive_failures = prior + 1
+                self.session.last_attempt_s = now_s
+                raise
 
 
 def _decode(raw: str, method: str, path: str) -> Any:

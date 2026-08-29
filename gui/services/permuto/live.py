@@ -111,16 +111,31 @@ def _default_venue_state() -> dict:
     # which reads "active" on a live market. Anything else is treated as not
     # live, because the sizing consequence of guessing wrong in that direction
     # is a rejected batch and in the other direction is a liquidation.
+    # [review] Built as an ACTIVE SET, so absence is not evidence of life.
+    #
+    # The previous version started from carried = False and only set it on
+    # finding a matching entry with a non-active status -- so a missing
+    # `markets` key, an empty list, malformed entries, or a response that
+    # simply did not mention our three markets all read as LIVE. That is the
+    # 8x oversizing this whole block exists to prevent, reachable through a
+    # partial payload rather than a wrong one, and it contradicted the
+    # comment directly above it.
+    #
+    # Carried unless EVERY configured market is explicitly "active".
     markets = meta.get("markets")
-    carried = False
-    if isinstance(markets, list) and markets:
-        wanted = {m.replace("-PERP", "") for m in MARKETS}
+    wanted = {m.replace("-PERP", "") for m in MARKETS}
+    active = set()
+    if isinstance(markets, list):
         for entry in markets:
             if not isinstance(entry, dict):
                 continue
-            if entry.get("symbol") in wanted or entry.get("base_asset") in wanted:
-                if entry.get("status") != "active":
-                    carried = True
+            if entry.get("status") != "active":
+                continue
+            for key in ("symbol", "base_asset"):
+                name = entry.get(key)
+                if name in wanted:
+                    active.add(name)
+    carried = active != wanted
 
     return {
         "oracles": oracles,

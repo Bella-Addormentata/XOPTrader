@@ -80,6 +80,9 @@ GATE_LABELS: dict[str, str] = {
     "not_wired": "the quoting loop is not connected to this switch yet",
     "blocked": ("the quoting loop cannot reach the venue -- every tick is "
                 "coming back blocked"),
+    "not_quoting": ("the quoting loop is running but holding no quotes -- the "
+                    "venue is paused, an oracle is missing, or the account "
+                    "could not be read"),
 }
 
 
@@ -153,6 +156,7 @@ _GATE_ORDER = (
     "not_wired",
     "not_registered",
     "blocked",
+    "not_quoting",
     "cancels_pending",
 )
 

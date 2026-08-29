@@ -727,3 +727,36 @@ def test_one_markets_risk_retraction_is_not_skipped_because_another_quotes():
     assert _MKT in (c.cancelled[0] or [])
     assert result.action in ("withdraw", "hold", "quote")
     assert r._resting[_MKT].empty
+
+
+# --------------------------------------------------------------------------- #
+# [review] Unknown inventory is not flat inventory
+# --------------------------------------------------------------------------- #
+
+def test_an_unreadable_position_is_not_read_as_flat():
+    """Dropping it removed the market from the dict, and assess() reads a
+    missing market as 0.0 -- so one unreadable position let that market take
+    normal risk-increasing quotes against inventory we could not see."""
+    import math
+    st = _margin_state({"equity_usd": 100_000.0, "used_margin_usd": 0.0,
+                        "positions": {_MKT: "not-a-number"}}, False)
+    assert math.isnan(st.positions[_MKT]), "the market was dropped, not flagged"
+
+
+def test_an_unreadable_position_in_a_list_payload_too():
+    import math
+    st = _margin_state({"equity_usd": 100_000.0, "used_margin_usd": 0.0,
+                        "positions": [{"market": _MKT, "size": "junk"}]}, False)
+    assert math.isnan(st.positions[_MKT])
+
+
+def test_an_unreadable_position_stops_the_market_adding_risk():
+    """The end-to-end property: assess() already refuses a non-finite
+    position; the sentinel is what lets it see one."""
+    from gui.services.permuto.risk import RiskAction, assess
+    st = _margin_state({"equity_usd": 100_000.0, "used_margin_usd": 0.0,
+                        "positions": {_MKT: "junk"}}, False)
+    d = assess(st, _MKT, base_size=100.0, max_position=100.0,
+               ring_pct=2.0, half_spread_pct=0.5)
+    assert d.action is not RiskAction.NORMAL
+

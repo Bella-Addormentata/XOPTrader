@@ -428,3 +428,26 @@ def test_a_blocked_tick_does_not_verify_the_book(window):
     finally:
         window._permuto_last_blocked = False
 
+
+def test_any_non_trading_tick_gates_the_switch(window):
+    """[review] Only the literal "blocked" used to gate it. withdraw is what a
+    venue pause, a missing oracle or an unreadable account produce -- all
+    states holding no quotes -- so those cleared the latch and the toolbar
+    resolved to ON over a loop doing nothing."""
+    for action in ("withdraw", "error", "wait", "blocked"):
+        window._on_permuto_tick(
+            type("R", (), {"action": action, "ok": True, "error": ""})())
+        gates = window._gather_permuto().gates
+        assert gates & {"blocked", "not_quoting"}, action
+
+
+def test_a_trading_tick_clears_the_gate(window):
+    for action in ("quote", "hold"):
+        window._on_permuto_tick(
+            type("R", (), {"action": "withdraw", "ok": True, "error": ""})())
+        assert window._gather_permuto().gates & {"blocked", "not_quoting"}
+        window._on_permuto_tick(
+            type("R", (), {"action": action, "ok": True, "error": ""})())
+        gates = window._gather_permuto().gates
+        assert not (gates & {"blocked", "not_quoting"}), action
+

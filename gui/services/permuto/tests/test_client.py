@@ -356,3 +356,77 @@ def test_a_bad_nonce_during_renewal_still_records_the_backoff(monkeypatch):
     with pytest.raises(PermutoAuthError):
         c.ensure_session(900.0)
     assert c.session.consecutive_failures == 1
+
+
+# --------------------------------------------------------------------------- #
+# [review] Every route to reauth must be counted, or the backoff is decorative
+# --------------------------------------------------------------------------- #
+
+def _client(monkeypatch, responder):
+    from gui.services.permuto.client import PermutoClient
+    c = PermutoClient(_Identity(), session_token="tok")
+    c.session.expires_at_s = 1e12
+    monkeypatch.setattr(c, "_request", responder)
+    return c
+
+
+def test_a_failing_retry_reauth_is_charged_to_the_backoff(monkeypatch):
+    """_retry_once_on_401 called reauth() DIRECTLY, so a failing renewal left
+    consecutive_failures at 0 with `forced` set -- which renew_action answers
+    with RENEW immediately, on every 5s tick, for the whole contest."""
+    from gui.services.permuto.auth import PermutoAuthError
+    from gui.services.permuto.client import PermutoSessionExpired
+
+    def responder(method, path, payload=None):
+        raise PermutoSessionExpired("401")
+
+    c = _client(monkeypatch, responder)
+    monkeypatch.setattr(
+        c, "reauth",
+        lambda now_s: (_ for _ in ()).throw(PermutoAuthError("auth down")))
+
+    before = c.session.consecutive_failures
+    with pytest.raises(PermutoAuthError):
+        c.cancel_all(1000.0)
+    assert c.session.consecutive_failures > before, (
+        "a failed renewal on the retry path was not charged")
+    assert c.session.last_attempt_s == 1000.0
+
+
+def test_a_401_that_survives_a_fresh_token_escalates_the_backoff(monkeypatch):
+    """reauth() zeroes the failure count on success, so a second rejection
+    re-set `forced` against a zero count and the next tick renewed at once."""
+    from gui.services.permuto.client import PermutoSessionExpired
+
+    def responder(method, path, payload=None):
+        raise PermutoSessionExpired("401 again")
+
+    c = _client(monkeypatch, responder)
+    c.session.consecutive_failures = 3
+    monkeypatch.setattr(c, "reauth", lambda now_s: None)   # succeeds
+
+    with pytest.raises(PermutoSessionExpired):
+        c.cancel_all(2000.0)
+    assert c.session.consecutive_failures == 4, (
+        "the prior count was reset, so the backoff restarts every 5s")
+
+
+def test_a_keystore_failure_while_signing_becomes_an_auth_error(monkeypatch):
+    """identity.sign() reaches DPAPI and can raise something that is not a
+    PermutoAuthError -- which escapes ensure_session's accounting entirely, so
+    a permanently broken keystore fetches a challenge every tick forever."""
+    from gui.services.permuto.auth import PermutoAuthError
+    from gui.services.permuto.client import PermutoClient
+
+    class _Broken(_Identity):
+        def sign(self, message):
+            raise OSError("DPAPI: keyset does not exist")
+
+    c = PermutoClient(_Broken(), session_token="")
+    monkeypatch.setattr(
+        c, "_request",
+        lambda m, p, payload=None, **kw: {"challenge_token": "t",
+                                          "nonce": "00" * 32})
+    with pytest.raises(PermutoAuthError):
+        c.reauth(1.0)
+

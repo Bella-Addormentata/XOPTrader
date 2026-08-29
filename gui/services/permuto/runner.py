@@ -546,6 +546,17 @@ def _margin_state(account: Any, carried: bool) -> MarginState:
                     continue
         return 0.0
 
+    # [review] An unreadable position is recorded as NaN, not dropped.
+    #
+    # Both loops used to `continue`, which removes the market from the dict --
+    # and assess() reads a missing market as 0.0, i.e. FLAT. So a valid
+    # equity/margin snapshot carrying one unreadable position let that market
+    # take normal, risk-increasing quotes against inventory we could not see.
+    # Unknown inventory became no inventory, which is the fail-open direction
+    # on the one number the position limit exists to bound.
+    #
+    # assess() already refuses on a non-finite position (risk.py) -- the
+    # sentinel simply never reached it.
     positions = {}
     raw = account.get("positions")
     if isinstance(raw, dict):
@@ -553,18 +564,20 @@ def _margin_state(account: Any, carried: bool) -> MarginState:
             try:
                 positions[market] = float(value)
             except (TypeError, ValueError):
-                continue
+                positions[market] = float("nan")
     elif isinstance(raw, list):
         for row in raw:
             if not isinstance(row, dict):
                 continue
             market = row.get("market") or row.get("symbol")
+            if market is None:
+                continue
             try:
                 positions[market] = float(
                     row.get("size", row.get("position", 0.0))
                 )
             except (TypeError, ValueError):
-                continue
+                positions[market] = float("nan")
 
     equity = _num("equity_usd", "equity", "account_value")
     used, used_present = _num_present(

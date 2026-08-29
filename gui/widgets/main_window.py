@@ -325,6 +325,8 @@ class MainWindow(QMainWindow):
         self._permuto_book_confirmed_empty: bool = False
         # Latched from the last tick: True while the loop cannot trade.
         self._permuto_last_blocked: bool = False
+        #: The last tick's action, for the gate's operator-facing reason.
+        self._permuto_last_action: str = ""
         # True when the current Paused status is owned by the GUI flag (the
         # pause Resume can clear), False when a risk breaker holds it.
         self._gui_pause_owns_it: bool = True
@@ -2249,7 +2251,8 @@ class MainWindow(QMainWindow):
         # bootstrap fixes the cause; this makes the switch stop asserting
         # something it never checked.
         if self._permuto_last_blocked:
-            gates.add("blocked")
+            gates.add("blocked" if self._permuto_last_action in ("blocked", "")
+                      else "not_quoting")
 
         # The runner is the authority on its own book: it reports empty only
         # once a cancel has been acknowledged, so a stop in flight keeps the
@@ -2352,7 +2355,15 @@ class MainWindow(QMainWindow):
         action = getattr(result, "action", "?")
         # A tick that reached the venue is proof the session works, and its
         # withdraw/quote outcome is the first real observation of the book.
-        self._permuto_last_blocked = (action == "blocked")
+        # [review] Gate on ANY non-trading outcome, not just the literal
+        # "blocked". withdraw is what a venue pause, a missing oracle or an
+        # unreadable account produce -- all states in which the loop holds no
+        # quotes and cannot trade -- and treating those as healthy cleared
+        # the latch, so the toolbar resolved to ON over a loop doing nothing.
+        # error did the same. Cleared only by a pass that actually traded or
+        # confirmed a good book.
+        self._permuto_last_blocked = action not in ("quote", "hold")
+        self._permuto_last_action = action
         if action in ("quote", "hold", "withdraw", "wait"):
             self._permuto_book_confirmed_empty = True
         if not getattr(result, "ok", True):

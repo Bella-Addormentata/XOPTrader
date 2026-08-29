@@ -199,3 +199,63 @@ def test_markets_are_symbols_not_oracle_tickers():
     """Order routes answer HTTP 400 on every leg for the ticker form."""
     assert all(m.endswith("-PERP") for m in MARKETS)
     assert "QQQ-VOL" not in MARKETS
+
+
+# --------------------------------------------------------------------------- #
+# [review] A partial /info/meta must not read as a live session
+# --------------------------------------------------------------------------- #
+
+def _venue_state(meta, oracle=None):
+    """Drive _default_venue_state with a fake transport."""
+    import gui.services.permuto.auth as auth_mod
+    from gui.services.permuto import live as live_mod
+
+    prices = oracle if oracle is not None else {
+        m.replace("-PERP", ""): 0.07 for m in MARKETS}
+    real = auth_mod._request
+
+    def fake(method, path, payload=None):
+        return {"prices": prices} if path == "/info/oracle" else meta
+
+    auth_mod._request = fake
+    try:
+        return live_mod._default_venue_state()
+    finally:
+        auth_mod._request = real
+
+
+_ACTIVE = {"flags": {"trading_paused": False},
+           "markets": [{"symbol": m.replace("-PERP", ""), "status": "active"}
+                       for m in MARKETS]}
+
+
+def test_every_market_active_is_a_live_session():
+    assert _venue_state(_ACTIVE)["flags"]["carried"] is False
+
+
+@pytest.mark.parametrize("meta", [
+    {"flags": {"trading_paused": False}},                        # no markets
+    {"flags": {"trading_paused": False}, "markets": []},         # empty
+    {"flags": {"trading_paused": False}, "markets": "nonsense"},  # wrong type
+    {"flags": {"trading_paused": False},
+     "markets": [{"symbol": "QQQ-VOL", "status": "active"}]},    # partial
+])
+def test_a_partial_markets_payload_is_treated_as_CARRIED(meta):
+    """Absence is not evidence of life.
+
+    The first version started from carried=False and only flipped on finding a
+    matching non-active entry, so a missing key, an empty list, a malformed
+    value or a response that simply omitted our markets all read as LIVE --
+    and live sizing during a carried session is 8x what the stressed initial
+    margin allows, which the venue rejects. No fills, no depth credit, all
+    night.
+    """
+    assert _venue_state(meta)["flags"]["carried"] is True
+
+
+def test_an_explicitly_non_active_market_is_carried():
+    meta = {"flags": {"trading_paused": False},
+            "markets": [dict(m, status="halted") if i == 0 else m
+                        for i, m in enumerate(_ACTIVE["markets"])]}
+    assert _venue_state(meta)["flags"]["carried"] is True
+
