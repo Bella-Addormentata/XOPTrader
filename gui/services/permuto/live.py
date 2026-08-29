@@ -331,9 +331,14 @@ class PermutoLive(QObject):
         super().__init__()
         self._identity = identity
         self._markets = list(markets or MARKETS)
+        user_id = ""
+        try:
+            user_id = getattr(identity.info(), "user_id", "") or ""
+        except Exception:  # noqa: BLE001 - an unregistered identity has none
+            pass
         self._client = client or PermutoClient(
             identity, session_token=session_token,
-            timeout=REQUEST_TIMEOUT_S)
+            timeout=REQUEST_TIMEOUT_S, user_id=user_id)
         self._runner = QuoteRunner(
             self._client, self._markets,
             target_depth_usd=target_depth_usd,

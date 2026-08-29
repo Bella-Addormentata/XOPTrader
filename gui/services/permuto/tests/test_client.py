@@ -544,3 +544,87 @@ def test_schedule_cancel_extends_and_clear_omits_time(monkeypatch):
     assert sent[0] == ("/exchange/schedule_cancel", {"time": 123_456_000})
     assert sent[1] == ("/exchange/schedule_cancel", {})
 
+
+def test_authed_bodies_carry_the_user_id(monkeypatch):
+    """[v0.10.4 field report] The first live test order was rejected with
+    422 "missing field user_id" on open_orders: the session token
+    authenticates the CALL, but the body still names the account. Injected
+    at the one door every authenticated request leaves through."""
+    from gui.services.permuto.client import PermutoClient
+
+    sent = []
+    c = PermutoClient(_Identity(), session_token="tok", user_id="u-123")
+    c.session.expires_at_s = 1e12
+    monkeypatch.setattr(
+        c, "_request",
+        lambda m, p, payload=None, **kw: sent.append((p, payload)) or {})
+
+    # _request is stubbed, so drive the injection through the real one by
+    # calling the routes and asserting what the stub received... the stub
+    # replaces the injector itself, so instead test the injector directly:
+    # restore the real _request and capture at the wire.
+    import urllib.request
+
+    wire = []
+
+    class _Resp:
+        def read(self):
+            import json
+            return json.dumps({}).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        import json
+        wire.append((req.full_url, json.loads(req.data or b"{}")))
+        return _Resp()
+
+    c2 = PermutoClient(_Identity(), session_token="tok", user_id="u-123")
+    c2.session.expires_at_s = 1e12
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    c2.open_orders(1.0)
+    c2.account(2.0)
+    c2.cancel_all(3.0)
+    c2.schedule_cancel(4.0, 999_000)
+
+    for url, body in wire:
+        assert body.get("user_id") == "u-123", (url, body)
+    # And the explicit field wins over the injection where one is set.
+    assert wire[-1][1]["time"] == 999_000
+
+
+def test_an_empty_user_id_injects_nothing(monkeypatch):
+    """An unregistered identity has no user id; sending an empty one would
+    turn a clear 422 into a mystery 4xx."""
+    import json
+    import urllib.request
+
+    from gui.services.permuto.client import PermutoClient
+
+    wire = []
+
+    class _Resp:
+        def read(self):
+            return json.dumps({}).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(
+        urllib.request, "urlopen",
+        lambda req, timeout=None: wire.append(
+            json.loads(req.data or b"{}")) or _Resp())
+
+    c = PermutoClient(_Identity(), session_token="tok")
+    c.session.expires_at_s = 1e12
+    c.open_orders(1.0)
+    assert "user_id" not in wire[0]
+

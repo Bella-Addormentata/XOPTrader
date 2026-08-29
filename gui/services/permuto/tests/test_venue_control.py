@@ -166,9 +166,40 @@ def window():
     from PySide6.QtWidgets import QApplication
 
     QApplication.instance() or QApplication([])
-    from gui.widgets.main_window import MainWindow
 
-    return MainWindow()
+    # [v0.10.4 field report] SEAL THE IDENTITY. _gather_permuto and the
+    # startup-state apply resolve _default_identity_factory(), which reads
+    # the machine's REAL secrets.yaml -- and the moment the operator
+    # actually registered, every "refuses until registered" assumption in
+    # this file inverted, and the startup-on test would have called
+    # _on_permuto_toggle(True) with a REGISTERED identity: a test suite one
+    # start() away from placing live orders. Tests get an unregistered
+    # fake, unconditionally.
+    import gui.widgets.permuto as permuto_mod
+
+    class _UnregisteredInfo:
+        registered = False
+        link_attempted = False
+        backup_confirmed = False
+        listing_verified = False
+        user_id = None
+        trading_address = None
+        pubkey = "ab" * 48
+        created_at = None
+
+    class _FakeIdentity:
+        @staticmethod
+        def info():
+            return _UnregisteredInfo()
+
+    real = permuto_mod._default_identity_factory
+    permuto_mod._default_identity_factory = lambda: _FakeIdentity()
+    try:
+        from gui.widgets.main_window import MainWindow
+
+        yield MainWindow()
+    finally:
+        permuto_mod._default_identity_factory = real
 
 
 def test_both_switches_start_honestly(window):

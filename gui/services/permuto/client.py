@@ -91,6 +91,7 @@ class PermutoClient:
         expires_at_s: float = 0.0,
         base_url: str = BASE_URL,
         timeout: float = _TIMEOUT,
+        user_id: str = "",
     ) -> None:
         self._identity = identity
         self._base_url = base_url.rstrip("/")
@@ -102,6 +103,14 @@ class PermutoClient:
         # orders left live at the venue while the process exits claiming an
         # empty book. Only placements are fenced; cancels must keep working
         # during shutdown, which is the whole point of shutting down.
+        # [v0.10.4 field report] The venue's registered user id, injected
+        # into every authenticated request body. The first live test order
+        # found the contract the reviews could only guess at: authenticated
+        # POSTs are rejected with 422 "missing field user_id" -- the session
+        # token authenticates the CALL, but the body still names the
+        # account. The API reference's schedule_cancel entry ({user_id,
+        # time}) said as much and we under-generalised it.
+        self._user_id = (user_id or "").strip()
         self._halt_placements = threading.Event()
         # [review round 11] Orders the last placement against the final
         # cancel. The fence alone cannot: a batch already past its is_set()
@@ -127,6 +136,11 @@ class PermutoClient:
         authed: bool = True,
     ) -> Any:
         headers = dict(_HEADERS)
+        if authed and isinstance(payload, dict) and self._user_id:
+            # Injected here, at the one door every authenticated request
+            # leaves through, rather than remembered at each call site --
+            # a missing field at one route cost the first test order.
+            payload.setdefault("user_id", self._user_id)
         if authed:
             if not self.session.token:
                 raise PermutoNotLinked(
