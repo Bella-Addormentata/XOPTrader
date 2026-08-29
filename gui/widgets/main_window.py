@@ -2198,8 +2198,7 @@ class MainWindow(QMainWindow):
                           "on" if want_on else "off")
             else:
                 inputs = self._gather_dexie()
-                from gui.services.venue_control import (may_turn_off,
-                                                        may_turn_on)
+                from gui.services.venue_control import may_turn_off, may_turn_on
                 allowed, reason = (may_turn_on(inputs) if want_on
                                    else may_turn_off(inputs))
                 if allowed:
