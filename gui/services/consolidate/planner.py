@@ -360,8 +360,27 @@ def _plan_leg(
         previous = grouped.get(offer.offer_id)
         if previous is not None:
             counters["duplicate"] = counters.get("duplicate", 0) + 1
-            if _ExactRateKey(previous) < _ExactRateKey(offer):
+            # [review round 8] TOTAL, not just strictly-worse-wins. The rate
+            # comparison alone leaves EQUAL-rate copies to arrival order --
+            # and 400/200 against 200/100 is the same rate at twice the size,
+            # so under a 200 budget the first copy decides whether there is a
+            # plan at all. Size is the tiebreak, and the SMALLER copy wins:
+            # the plan's amounts are advisory and the executor takes whatever
+            # the live payload carries, so assuming the larger cannot bound
+            # an all-or-nothing take if the live offer is really the smaller.
+            # Same direction as keeping the worse price -- an assumption that
+            # can only cost opportunity, never overspend.
+            prev_key, this_key = _ExactRateKey(previous), _ExactRateKey(offer)
+            if prev_key < this_key:
                 grouped[offer.offer_id] = offer
+            elif not (this_key < prev_key):
+                # Equal rate, and the comparison is spelled out rather than
+                # done with a tuple: _ExactRateKey defines only __lt__, so a
+                # tuple falls back to identity for __eq__ and the tiebreak
+                # would never fire -- reintroducing the arrival-order bug it
+                # is here to remove.
+                if offer.give_amount < previous.give_amount:
+                    grouped[offer.offer_id] = offer
             continue
         grouped[offer.offer_id] = offer
     seen_ids.update(grouped)
@@ -822,7 +841,22 @@ def build_plan(
     if greedy_second.offers:
         best = (greedy_first, greedy_second, greedy_counters)
     floor = max(1, len(greedy_first.offers) - _MAX_FIRST_LEG_ROLLBACKS)
-    for takes in range(len(greedy_first.offers) - 1, floor - 1, -1):
+    attempts = list(range(len(greedy_first.offers) - 1, floor - 1, -1))
+    # [review round 8] The SHORTEST prefix is always tried, whatever the
+    # bound leaves unsearched.
+    #
+    # The bound walks back from the greedy length, so on a long first leg the
+    # short prefixes are exactly the ones it drops -- and they are the ones
+    # most likely to leave hop two an allowance, which is the whole point of
+    # the search. Reviewer's case, reachable inside the 29-offer book this
+    # module cites: 18 first-hop takes makes floor 2, so the one-take prefix
+    # that completes the route is never attempted and the plan comes back
+    # empty. One extra replan removes that whole class; the bound still caps
+    # the middle of the range, which is where the search is genuinely
+    # speculative.
+    if 1 not in attempts and len(greedy_first.offers) > 1:
+        attempts.append(1)
+    for takes in attempts:
         leg_one, leg_two, attempt_counters = _route(takes)
         if leg_two is None or not leg_two.offers:
             continue

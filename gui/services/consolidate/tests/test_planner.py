@@ -1206,3 +1206,57 @@ def test_rolling_back_the_first_hop_cannot_smuggle_a_route_past_the_cap():
         second_hop_anchor=Anchor(rate=1.0, source="test"),
     )
     assert plan.is_empty
+
+
+def test_the_shortest_prefix_is_tried_even_past_the_rollback_bound():
+    """[review round 8] The bound walks back from the greedy length, so on a
+    long first leg the SHORT prefixes are exactly the ones it drops -- and
+    they are the ones most likely to leave hop two an allowance.
+
+    18 first-hop takes makes floor 2, so the one-take prefix that completes
+    the route was never attempted and the plan came back empty. Reachable
+    inside the 29-offer book this module cites.
+    """
+    a = Anchor(rate=1.0, source="t")
+    first_hop = [offer("cheap", 1_000, 1_000,
+                       give_asset=BYC, recv_asset="usds")]
+    first_hop += [offer("dear%d" % i, 1_100, 1_000,
+                        give_asset=BYC, recv_asset="usds")
+                  for i in range(17)]
+    second_hop = [offer("s%d" % i, 1_000, 952,
+                        give_asset="usds", recv_asset=XCH)
+                  for i in range(4)]
+
+    plan = build_plan(
+        source_asset=BYC, target_asset=XCH, hop_asset="usds",
+        budget=19_700 * denomination(BYC),
+        direct_offers=[], direct_anchor=None,
+        first_hop_offers=first_hop, first_hop_anchor=a,
+        second_hop_offers=second_hop, second_hop_anchor=a,
+        max_slippage_frac=0.10,
+    )
+    assert len(plan.legs) == 2, "a route only a short first leg reaches was missed"
+    assert len(plan.legs[0].offers) == 1
+
+
+@pytest.mark.parametrize("swap", [False, True])
+def test_equal_rate_duplicates_do_not_resolve_by_arrival_order(swap):
+    """[review round 8] The rate comparison alone left EQUAL-rate copies to
+    arrival order, and 400/200 is the same rate as 200/100 at twice the size
+    -- so under a 200 budget the first copy decided whether a plan existed.
+
+    The smaller copy wins: the plan's amounts are advisory and the executor
+    takes whatever the live payload carries, so assuming the larger cannot
+    bound an all-or-nothing take if the live offer is really the smaller.
+    """
+    big, small = offer("same", 400, 200), offer("same", 200, 100)
+    pair = [small, big] if swap else [big, small]
+    plan = build_plan(
+        source_asset=BYC, target_asset=XCH,
+        budget=200 * denomination(BYC), max_slippage_frac=10.0,
+        direct_offers=pair, direct_anchor=ANCHOR,
+    )
+    assert plan.take_count == 1
+    assert plan.legs[0].offers[0].give_amount == small.give_amount, (
+        "the larger copy was assumed, which cannot bound the real take")
+
