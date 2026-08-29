@@ -1400,13 +1400,24 @@ asio::awaitable<void> Engine::poll_loop_coro()
                            && node_no_progress_polls_
                                   < risk::kNodePollsWithoutProgress;
                     if (usable && !node_ok) {
+                        // [review] Mode-neutral. This promised "the wallet
+                        // fallback runs", and in an explicitly pinned
+                        // full_node mode next_height_source() cannot run one
+                        // -- so an operator reading it during a frozen-node
+                        // outage was given a recovery expectation the
+                        // configuration forbids.
                         spdlog::error("[Engine] [S28] the full node has "
                                       "answered {} times ({}s) without "
                                       "advancing past block {} -- treating it "
-                                      "as frozen so the wallet fallback runs",
+                                      "as frozen. {}",
                                       node_no_progress_polls_,
                                       risk::kNodePollsWithoutProgress * 5,
-                                      seen);
+                                      seen,
+                                      mode_is_auto
+                                          ? "The wallet fallback will run."
+                                          : "chia.mode is pinned, so NO "
+                                            "wallet fallback will run -- set "
+                                            "mode: auto to allow one.");
                     }
                 } catch (const std::exception& ex) {
                     node_ok = false;
@@ -1558,12 +1569,24 @@ asio::awaitable<void> Engine::run_startup_analysis()
         // Fetch current block height.
         std::int64_t height{0};
         std::string  height_error;
+        // [review] An explicit FLAG, not an empty string as a sentinel.
+        //
+        // std::exception::what() may be empty -- the RPC layer constructs
+        // ChiaRPCApplicationError straight from a server "error" field, which
+        // can be an empty string. The catch would then run while
+        // `!height_error.empty()` was false, so auto mode skipped the wallet
+        // rescue AND the failure warning, and the poll fell through to the
+        // `height <= 0` continue with no diagnosis at all. Silence during the
+        // exact outage this phase was taught to survive.
+        bool height_failed = false;
         try {
             height = wallet_only_mode_
                 ? co_await wallet_->get_height_info()
                 : co_await full_node_->get_block_height();
         } catch (const std::exception& ex) {
             height_error = ex.what();
+            if (height_error.empty()) height_error = "(no message)";
+            height_failed = true;
             height = -1;
         }
 
@@ -1574,7 +1597,7 @@ asio::awaitable<void> Engine::run_startup_analysis()
         // where the fallback lives. Try the wallet rather than spinning.
         //
         // Outside the catch, not inside it: co_await is illegal in a handler.
-        if (!height_error.empty()) {
+        if (height_failed) {
             bool recovered = false;
             // [review] The CONFIGURED PIN applies during analysis too.
             //
