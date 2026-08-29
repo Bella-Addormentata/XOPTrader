@@ -318,6 +318,7 @@ jobs:
           --windowed
           --paths ..
           --collect-submodules gui
+          --collect-data eth_account
           --exclude-module gui.services.warp.tests
           --exclude-module gui.services.permuto.tests
           --exclude-module gui.services.consolidate.tests
@@ -420,6 +421,12 @@ jobs:
             '--windowed',
             '--paths', '..',
             '--collect-submodules', 'gui',
+            # [v0.10.1] identity.py loads the BIP-39 wordlist from
+            # eth_account's package data through a LAZY import, so
+            # PyInstaller bundled the module and missed the data file --
+            # "Create identity" crashed in the frozen build with
+            # english.txt not found, working from source all along.
+            '--collect-data', 'eth_account',
             '--exclude-module', 'gui.services.warp.tests',
             '--exclude-module', 'gui.services.permuto.tests',
             '--exclude-module', 'gui.services.consolidate.tests',
