@@ -1251,7 +1251,20 @@ asio::awaitable<void> Engine::poll_loop_coro()
             // bundle).  These occur when the wallet daemon selects an
             // already-spent coin for a new offer, creating a local record
             // that can never confirm.  Clear them to free up pending balance.
-            {
+            //
+            // [review] NOT IN DRY RUN. prune_stuck_transactions() calls
+            // delete_unconfirmed_transactions(), which is WALLET-WIDE -- and
+            // since a dry run is now deliberately something you start BESIDE
+            // a live engine, it would delete that engine's in-flight spends:
+            // pending offer creations, unconfirmed secure cancels. Skipping
+            // startup reconciliation was not enough; this sat a few dozen
+            // lines below the guard, outside it.
+            if (dry_run_) {
+                spdlog::warn("[Engine] [S31] dry run -- SKIPPING the stuck "
+                             "transaction prune. It deletes unconfirmed "
+                             "transactions wallet-wide, which would take a "
+                             "live engine's pending spends with it.");
+            } else {
                 std::vector<std::int64_t> wallet_ids;
                 for (const auto& pair : config_.pairs) {
                     if (!pair.enabled) continue;
@@ -9969,9 +9982,14 @@ asio::awaitable<void> Engine::step_check_arbitrage(
         co_return;
     }
 
-    if (dry_run_) {
-        // In dry-run mode we still detect and log crossed-book opportunities.
-    }
+    // In dry-run mode we still detect and log crossed-book opportunities;
+    // each take path below carries its own dry-run guard (continue, co_return
+    // or a !dry_run_ gate) immediately before its take_offer().
+    //
+    // [review] This was written as an EMPTY `if (dry_run_) {}` block. It did
+    // nothing, but it read like the guard for this whole function -- exactly
+    // the shape someone adds a mutating call underneath. A comment cannot be
+    // mistaken for protection.
 
     if (wallet_circuit_open_) {
         spdlog::debug("[Engine] Step 9c: crossed-book SKIPPED -- wallet "
@@ -11311,6 +11329,23 @@ asio::awaitable<void> Engine::step_xch_recovery(BlockHeight block_height)
 {
     const auto& rcfg = config_.recovery;
     if (!rcfg.enabled) co_return;
+
+    // [review] A dry run does not recover. This had NO dry-run guard at all,
+    // and it is the larger of the two holes found in the same sweep: the
+    // path issues a WALLET-LEVEL cancel_offers(), which does not discriminate
+    // between our offers and the offers of a live engine sharing the wallet.
+    // An inspection run that trips the low-XCH threshold would invalidate
+    // that engine's entire book.
+    //
+    // Guarded at the top rather than at the call site, for the same reason
+    // step_maintain_coin_pool() is: a second call site is how the previous
+    // two dry-run fixes were each left incomplete.
+    if (dry_run_) {
+        spdlog::info("[Engine] [dry-run] skipping XCH recovery (it issues a "
+                     "wallet-level cancel that would take a live engine's "
+                     "book with it)");
+        co_return;
+    }
 
     // -- 1. Check XCH spendable balance ------------------------------------
     Mojo xch_spendable = 0;
