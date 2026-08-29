@@ -469,7 +469,16 @@ private:
 
     /// True when the pair's quote asset is declared pegged, enforced, and
     /// does NOT prefer a market cross -- a fiat-collateralised wrapper,
-    /// whose par is a claim on a dollar rather than an observation.
+    /// whose par is a claim on its CONFIGURED peg currency rather than an
+    /// observation.
+    ///
+    /// [review] Not "a claim on a dollar": peg_currency exists precisely so
+    /// a EUR or JPY wrapper can be declared, and this predicate classifies
+    /// those identically. What differs is what the claim is worth HERE --
+    /// declared_usd_par() supplies no FX rate, so a non-USD wrapper
+    /// classifies as a par wrapper and then values as nullopt until an FX
+    /// feed is wired. Callers deciding "can I price this in USD" must ask
+    /// declared_usd_par(), not this.
     [[nodiscard]] bool is_par_wrapper_quote(const PairConfig& pc) const;
 
     /// True when the pair's quote asset is declared pegged, enforced, and
