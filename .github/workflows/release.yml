@@ -816,6 +816,27 @@ jobs:
             esac
           done
 
+          # [release hygiene] ONE self-contained Windows engine zip instead
+          # of eleven loose DLLs beside a bare exe. The loose layout was a
+          # footgun -- the 2MB engine exe downloads without its runtime and
+          # will not start -- and the DLLs are already inside the installer
+          # for everyone else. The zip carries exe + DLLs + VC_redist +
+          # example config; the loose copies are removed from the release
+          # folder so the upload glob cannot resurrect them.
+          (
+            cd "${DEST}"
+            ENGINE_EXE=$(ls xop_trader-v*.exe 2>/dev/null | head -1)
+            if [[ -n "${ENGINE_EXE}" ]] && ls *.dll > /dev/null 2>&1; then
+              mkdir -p engine-win
+              mv *.dll engine-win/
+              mv "${ENGINE_EXE}" engine-win/
+              [[ -f VC_redist.x64.exe ]] && mv VC_redist.x64.exe engine-win/
+              cp config.example.yaml engine-win/
+              (cd engine-win && zip -q -r                 "../xop_trader-engine-windows-x64-${TAG}.zip" .)
+              rm -rf engine-win
+            fi
+          )
+
           # Bundle the entire RELEASE/ folder tree into a single zip archive
           zip -r "XOPTrader-${SLUG}.zip" "RELEASE/"
 
@@ -859,6 +880,7 @@ jobs:
             | `xop_trader-installer-windows-x64-${{ steps.tag.outputs.value }}.exe` | **Windows installer** — installs everything + creates desktop shortcut |
             | `xop_trader-linux-bundle-${{ steps.tag.outputs.value }}.tar.gz` | **Linux bundle** — GUI binary + icon + `.desktop` + `install.sh` |
             | `xop_trader-gui-linux-x64-${{ steps.tag.outputs.value }}` | Linux GUI standalone binary (no installer) |
+            | `xop_trader-engine-windows-x64-${{ steps.tag.outputs.value }}.zip` | C++ engine — Windows x64, self-contained (exe + runtime DLLs + VC_redist + example config) |
             | `xop_trader-linux-x64-${{ steps.tag.outputs.value }}` | C++ engine — Ubuntu 22.04 x86-64 |
             | `xop_trader-gui-macos-arm64-${{ steps.tag.outputs.value }}` | Python GUI — macOS (standalone) |
             | `xop_trader-macos-arm64-${{ steps.tag.outputs.value }}` | C++ engine — macOS 14 Apple-Silicon |
