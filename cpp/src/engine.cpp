@@ -1554,6 +1554,12 @@ asio::awaitable<void> Engine::run_startup_analysis()
     bool analysis_on_wallet = false;
     std::uint32_t analysis_no_progress = 0;
     int analysis_probe_skips = 0;
+    // [review round 10] Return needs the same hysteresis as the main loop.
+    // A single successful probe used to flip analysis straight back to the
+    // node, so an intermittently answering one made the NEXT poll pay the
+    // full failing retry budget before falling back again -- the flap the
+    // main loop's kNodeSuccessesBeforeReturn exists to damp.
+    std::uint32_t analysis_probe_successes = 0;
 
     while (!stop_requested_.load(std::memory_order_relaxed) &&
            !market_analyzer_->is_complete()) {
@@ -1616,14 +1622,26 @@ asio::awaitable<void> Engine::run_startup_analysis()
                         const auto probe =
                             co_await full_node_->get_block_height();
                         if (risk::height_in_range(probe) && probe >= height) {
-                            analysis_on_wallet = false;
-                            analysis_no_progress = 0;
-                            spdlog::info("[Engine] [S28] Analysis: the node "
-                                         "answered at height {} -- back to "
-                                         "it", probe);
+                            if (++analysis_probe_successes
+                                    >= risk::kNodeSuccessesBeforeReturn) {
+                                analysis_on_wallet = false;
+                                analysis_no_progress = 0;
+                                analysis_probe_successes = 0;
+                                spdlog::info("[Engine] [S28] Analysis: the "
+                                             "node answered {} consecutive "
+                                             "probes (height {}) -- back to "
+                                             "it",
+                                             risk::kNodeSuccessesBeforeReturn,
+                                             probe);
+                            }
+                        } else {
+                            analysis_probe_successes = 0;
                         }
                     } catch (const std::exception&) {
-                        // Still down; stay on the wallet.
+                        // Still down; stay on the wallet, and a failed probe
+                        // resets the streak -- one flap must not bank
+                        // progress toward a return.
+                        analysis_probe_successes = 0;
                     }
                 }
             } else {
