@@ -541,3 +541,42 @@ def test_nothing_resting_means_nothing_to_retract():
     r = _runner(c)
     r.tick(1.0, _ORACLE, {})
     assert "cancel_all" not in c.calls
+
+
+def test_a_session_backoff_does_not_cancel_a_resting_book():
+    """[review] WAIT exists to PRESERVE a legitimately resting book.
+
+    During a backoff no account is fetched, so `state` is the default
+    MarginState -- which utilisation() reports as fully used, by design,
+    because unreadable must mean no room. Feeding that to the risk pass
+    cancelled the book on every WAIT tick.
+    """
+    c = _Client(session=RenewAction.WAIT, open_orders={"orders": [
+        {"market": _MKT, "side": "buy", "price": 0.0698},
+        {"market": _MKT, "side": "sell", "price": 0.0702},
+    ]})
+    r = _runner(c)
+    r._resting[_MKT] = RestingQuote(0.0698, 0.0702)
+
+    result = r.tick(1.0, _ORACLE, {})
+    assert result.action == "wait"
+    assert "cancel_all" not in c.calls, "the resting book was cancelled"
+    assert not r._resting[_MKT].empty
+
+
+def test_an_unreadable_account_still_flattens():
+    """Not fetching is not the same as fetching and failing.
+
+    _margin_state() fails closed on a payload it cannot read, and that must
+    still reach the risk pass.
+    """
+    c = _Client(
+        open_orders={"orders": [
+            {"market": _MKT, "side": "buy", "price": 0.0698},
+            {"market": _MKT, "side": "sell", "price": 0.0702},
+        ]},
+        account={"equity_usd": 1_000.0},      # no used_margin: unreadable
+    )
+    r = _runner(c)
+    assert r.tick(1.0, _ORACLE, {}).action == "withdraw"
+    assert "cancel_all" in c.calls

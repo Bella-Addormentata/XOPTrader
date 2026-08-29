@@ -190,10 +190,16 @@ class QuoteRunner:
         #
         # Two requests per tick is the price of not being wrong about the
         # book. Skipped while paused or session-less, where both would fail.
+        # `account_seen` matters as much as `state`: without it, a tick that
+        # never fetched an account is indistinguishable from one that fetched
+        # an unreadable one, and the risk pass below would act on the
+        # fully-utilised default.
         state = MarginState(carried=carried)
+        account_seen = False
         if session_ok and not paused:
             self.reconcile(self._client.open_orders(now_s))
             state = _margin_state(self._client.account(now_s), carried)
+            account_seen = True
 
         results: dict = {}
         any_quoted = False
@@ -255,8 +261,19 @@ class QuoteRunner:
         # unreachable in exactly the situation they exist for: the loop was
         # content because the QUOTES were fine, and never asked whether the
         # POSITION was.
+        # [review] Only when an account was actually read. During a session
+        # backoff nothing is fetched, so `state` is the DEFAULT MarginState --
+        # which utilisation() reports as fully used, by design, because
+        # unreadable must mean no room. Feeding that to the risk pass would
+        # cancel a resting book on every WAIT tick, which is the precise
+        # opposite of WAIT's purpose: the book may be legitimately resting and
+        # the renewal is a transient.
+        #
+        # Not fetching is not the same as fetching and failing. The latter
+        # still flattens, because _margin_state() fails closed on a payload it
+        # cannot read.
         risk_by_market: dict = {}
-        for market in self._markets:
+        for market in (self._markets if account_seen else []):
             oracle = oracles.get(market)
             base_size = self._base_size(oracle)
             risk_by_market[market] = assess(
@@ -297,7 +314,11 @@ class QuoteRunner:
                 continue
             oracle = oracles.get(market)
             base_size = self._base_size(oracle)
-            risk = risk_by_market[market]
+            risk = risk_by_market.get(market)
+            if risk is None:
+                # No account this tick; quoting proceeds on decide() alone.
+                results[market] = ("skip", "no account snapshot this tick")
+                continue
             if risk.action is RiskAction.FLATTEN:
                 # [review] FLATTEN used to change the label and drop the
                 # legs, which left the existing two-sided quote live and sent
