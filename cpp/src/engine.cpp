@@ -1658,11 +1658,23 @@ asio::awaitable<void> Engine::run_startup_analysis()
         // refuses -- and it never throws, so it can never reach the rescue
         // below on its own. Same bound as the main loop, measured against
         // 2,418 real intervals (28% exceed a naive 30s guess).
+        //
+        // [review round 11] Two escapes closed. An OUT-OF-RANGE success is
+        // a failure outright, not a streak reset: it used to reset the
+        // counter and then be discarded by the later range gate, so a node
+        // answering garbage forever held analysis without ever triggering
+        // the rescue. And the `last_analysis_block > 0` condition let
+        // height zero escape the count entirely -- a node pinned at zero
+        // from the first poll never advanced and never counted. Every
+        // non-advancing representable height counts now, zero included.
         if (!height_failed && !ask_wallet_first) {
-            if (risk::height_in_range(height)
-                    && static_cast<BlockHeight>(height)
-                           <= last_analysis_block
-                    && last_analysis_block > 0) {
+            if (!risk::height_in_range(height)) {
+                height_error = "node answered " + std::to_string(height)
+                               + ", outside the representable range";
+                height_failed = true;
+                height = -1;
+            } else if (static_cast<BlockHeight>(height)
+                           <= last_analysis_block) {
                 if (++analysis_no_progress >= risk::kNodePollsWithoutProgress) {
                     height_error = "node answers but has not advanced past "
                                    "block " + std::to_string(
