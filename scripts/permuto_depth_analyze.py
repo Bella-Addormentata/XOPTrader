@@ -560,7 +560,12 @@ def main():
         print("         or a published lag bound; neither exists yet.")
         print("         Top corroborated rate: %.0f depth-seconds/hour, i.e. about"
               % rate)
-        print("         $%.0f of balanced depth resting inside the 2%% ring."
+        # [review] Do NOT name the width. vol_aggressive_ring_pct is a
+        # mutable venue parameter that the probe does not record, so if the
+        # sponsor retunes it the RATE stays meaningful while this provenance
+        # silently becomes false.
+        print("         $%.0f of balanced depth resting inside the venue's "
+              "depth-credit ring."
               % (rate / 3600))
         print()
         print("         At that rate 300,000,000 takes %.1f hours; the contest"
@@ -587,7 +592,8 @@ def main():
         print("INCONCLUSIVE: no account gained depth. This does NOT disprove accrual —")
         print("         zero accrual and accrual-cancelled-by-roll-off are")
         print("         indistinguishable here. It may also mean nobody was quoting")
-        print("         two-sided inside the 2%% ring. Re-run across an open instead.")
+        print("         two-sided inside the venue's depth-credit ring. "
+              "Re-run across an open instead.")
 
 
 if __name__ == "__main__":

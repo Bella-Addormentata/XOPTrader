@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -289,3 +290,40 @@ def test_an_unreadable_meta_says_so_rather_than_silently_assuming_two(
     assert header["ring_pct_src"] == "default"
     assert rows[0]["ring_pct_src"] == "default"
     assert rows[0]["l2"]["QQQ-VOL-PERP"]["ring"]["credit_usd"] == pytest.approx(990.0)
+
+
+# --------------------------------------------------------------------------- #
+# [review] Malformed levels must not poison the recorded aggregate
+# --------------------------------------------------------------------------- #
+
+def test_a_negative_size_is_not_liquidity(obs):
+    """It would SUBTRACT from the side total, so one bad level understates
+    the very quantity the recording exists to measure -- and the ladder it
+    came from is not kept, so it cannot be recomputed."""
+    good = [{"price": "0.070", "size": "100"}]
+    bad = good + [{"price": "0.070", "size": "-1000"}]
+    assert (obs._ring_depth(bad, good, 0.07)["credit_usd"]
+            == obs._ring_depth(good, good, 0.07)["credit_usd"])
+
+
+def test_non_finite_levels_are_skipped(obs):
+    """json.loads accepts bare NaN and Infinity, and NaN written back out
+    makes the whole JSONL line unparseable to a strict reader."""
+    good = [{"price": "0.070", "size": "100"}]
+    for junk in ("NaN", "Infinity", "-Infinity"):
+        out = obs._ring_depth(good + [{"price": "0.070", "size": junk}],
+                          good, 0.07)
+        assert math.isfinite(out["credit_usd"]), junk
+        assert out["credit_usd"] == obs._ring_depth(good, good, 0.07)["credit_usd"]
+
+    out = obs._ring_depth(good, good + [{"price": "NaN", "size": "10"}], 0.07)
+    assert math.isfinite(out["credit_usd"])
+
+
+def test_a_zero_priced_level_is_skipped(obs):
+    """Zero price contributes zero notional but counts as a level, which
+    overstates how deep the ring looked."""
+    good = [{"price": "0.070", "size": "100"}]
+    out = obs._ring_depth(good + [{"price": "0", "size": "100"}], good, 0.07)
+    assert out["bid_levels"] == 1
+

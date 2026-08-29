@@ -33,6 +33,7 @@ that is the interesting resolution and anything slower aliases it.
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import time
@@ -117,6 +118,20 @@ def _ring_depth(bids, asks, oracle, ring_pct=DEFAULT_RING_PCT):
                 price = float(lvl["price"])
                 size = float(lvl["size"])
             except (KeyError, TypeError, ValueError):
+                continue
+            # [review] Numeric is not the same as valid. The conversion
+            # rejected junk that would not parse and then admitted anything
+            # that would -- including a negative size, which subtracts from
+            # the aggregate, and NaN or Infinity, which json.loads accepts as
+            # bare literals and which propagate to a non-finite credit_usd.
+            # NaN additionally writes `NaN` into the JSONL, which strict
+            # parsers reject for the whole line.
+            #
+            # One malformed level poisons the recorder's central derived
+            # value, and it cannot be recovered afterwards: only eight levels
+            # of each ladder are kept and the ring can hold more.
+            if not (math.isfinite(price) and math.isfinite(size)
+                    and price > 0.0 and size > 0.0):
                 continue
             if abs(price - oracle) / oracle * 100.0 <= ring_pct:
                 total += price * size
@@ -286,6 +301,15 @@ def main():
                 funding[m] = {k: f.get(k) for k in
                               ("hourly_rate", "premium", "oracle_price",
                                "predicted_rate")}
+                # [review] Keep the FAILURE, not just its shape. safe()
+                # returns {"__error__": ...}, and projecting only the four
+                # known keys discarded it -- so a failed request recorded
+                # exactly the same all-null row as a successful one whose
+                # payload happened to lack those fields. Downstream cannot
+                # then exclude the missing observations, and reads them as
+                # funding data.
+                if "__error__" in f:
+                    funding[m]["__error__"] = f["__error__"]
             row["l2"] = books
             row["funding"] = funding
             # Per row, not only in the header: a run that spans a mid-session
@@ -294,9 +318,19 @@ def main():
             row["ring_pct_src"] = ring_pct_src
 
             if n % TRADES_EVERY == 0:
-                fresh = {}
+                fresh, trade_errs = {}, {}
                 for m in MARKETS:
                     t = safe("/info/trades/" + m)
+                    # [review] The same hole, and here it inverts a finding.
+                    # A failed request yields no "trades" key, the loop sees
+                    # an empty list, and the row records neither trades nor
+                    # an error -- indistinguishable from a successful poll
+                    # over a quiet market. Missing observations would read as
+                    # an apparent no-fill interval, which is precisely the
+                    # quantity this recording exists to measure.
+                    if "__error__" in t:
+                        trade_errs[m] = t["__error__"]
+                        continue
                     new = []
                     for tr in (t.get("trades") or []):
                         tid = tr.get("id")
@@ -307,6 +341,8 @@ def main():
                         fresh[m] = new
                 if fresh:
                     row["trades"] = fresh
+                if trade_errs:
+                    row["trades_err"] = trade_errs
 
             if n % META_EVERY == 0:
                 meta = safe("/info/meta")
