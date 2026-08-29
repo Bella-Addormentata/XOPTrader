@@ -1852,7 +1852,16 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
             std::max(peak_equity_hwm_usd_, pre_trade_equity);
     }
     if (risk::unvaluable_book_must_fail_closed(
-            drawdown_grace_remaining_ == 0,
+            // [review round 11] Step 13 DECREMENTS the counter before its
+            // own evaluation, so its boundary is one cycle earlier than a
+            // raw read here. Using == 0 pre-decrement let the cycle whose
+            // decrement reaches zero run drift correction, arbitrage and
+            // offer management first, with Step 13 declaring the book
+            // unvaluable only after they had traded -- the first-cycle gap
+            // again, one cycle wide, through counter phasing rather than
+            // stale flags. <= 1 is the same post-decrement boundary Step 13
+            // applies.
+            drawdown_grace_remaining_ <= 1,
             valuation_degraded_,
             valuation_all_unpriced_,
             peak_equity_hwm_usd_,
