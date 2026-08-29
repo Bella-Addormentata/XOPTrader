@@ -222,3 +222,32 @@ def test_a_bare_tab_is_left_to_qt_for_focus_movement(pages):
     pages.set_current(1)
     _key(pages, Qt.Key_Tab, Qt.NoModifier)
     assert pages.current_index() == 1
+
+
+def test_ctrl_tab_works_from_inside_a_page(pages, qapp):
+    """[sweep] keyPressEvent only fires while focus is ON the bar.
+
+    The moment an operator tabs into a field on the page -- the normal state
+    -- Ctrl+Tab never reached the handler. The shortcut is scoped to this
+    widget AND its children so it works from anywhere inside the page.
+    """
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QShortcut
+
+    scoped = [c for c in pages.findChildren(QShortcut)
+              if c.context() == Qt.WidgetWithChildrenShortcut]
+    assert scoped, "no page-scoped shortcut was installed"
+    seqs = {c.key().toString() for c in scoped}
+    assert any("Tab" in s for s in seqs)
+
+
+def test_the_shortcut_steps_and_wraps(pages):
+    pages.set_current(0)
+    pages._step(1)
+    assert pages.current_index() == 1
+    last = pages.bar.count() - 1
+    pages.set_current(last)
+    pages._step(1)
+    assert pages.current_index() == 0
+    pages._step(-1)
+    assert pages.current_index() == last

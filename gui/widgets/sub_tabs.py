@@ -30,6 +30,7 @@ from __future__ import annotations
 from typing import Optional
 
 from PySide6.QtCore import QPoint, QRect, QSize, Qt, Signal
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLayout,
@@ -277,6 +278,26 @@ class SubTabPages(QWidget):
         root.addWidget(self.stack, stretch=1)
 
         self.bar.currentChanged.connect(self._on_bar_changed)
+
+        # [sweep] Shortcuts, not just SubTabBar.keyPressEvent. That handler
+        # only fires while focus is ON the bar -- and the moment an operator
+        # tabs into a field on the page, which is the normal state, Ctrl+Tab
+        # never reaches it. WidgetWithChildrenShortcut scopes these to this
+        # page and its descendants, so they work from anywhere inside it
+        # without stealing the shortcut from the rest of the application.
+        for keys, step in ((("Ctrl+Tab",), 1),
+                           (("Ctrl+Shift+Tab", "Ctrl+Shift+Backtab"), -1)):
+            for key in keys:
+                sc = QShortcut(QKeySequence(key), self)
+                sc.setContext(Qt.WidgetWithChildrenShortcut)
+                sc.activated.connect(
+                    lambda s=step: self._step(s))
+
+    def _step(self, step: int) -> None:
+        """Move by `step`, wrapping, as QTabWidget's Ctrl+Tab does."""
+        count = self.bar.count()
+        if count:
+            self.set_current((self.bar.current_index() + step) % count)
 
     def _on_bar_changed(self, index: int) -> None:
         self.stack.setCurrentIndex(index)
