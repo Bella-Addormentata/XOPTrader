@@ -11869,8 +11869,27 @@ Mojo Engine::asset_usd_pseudo_price(const AssetId& asset_id) const
             auto it = coingecko_prices_.find("chia");
             if (it != coingecko_prices_.end() && std::isfinite(it->second)
                 && it->second > 0.0) {
-                return static_cast<Mojo>(std::llround(
-                    it->second * static_cast<double>(kMojosPerXch)));
+                // [review] to_mojo_checked(), like the two loops below.
+                //
+                // This fast path did the multiply and llround raw. The
+                // CoinGecko client accepts any JSON double with no upper
+                // bound, so a finite positive quote above ~9.22e6 makes
+                // price * 1e12 exceed int64_t -- and llround on an
+                // out-of-range double has an unspecified result with
+                // FE_INVALID raised, which on x86-64 is INT64_MIN. XCH would
+                // then have priced NEGATIVE, from a `return` that skips the
+                // graded DEX loops entirely.
+                //
+                // Falling THROUGH on a rejected value rather than returning
+                // 0 matters: a price we cannot represent is not a price we
+                // do not have, and the DEX path below can still answer.
+                if (const auto m = to_mojo_checked(
+                        it->second * static_cast<double>(kMojosPerXch))) {
+                    return *m;
+                }
+                spdlog::warn("[Engine] [S27] CoinGecko XCH price {} is "
+                             "outside the representable Mojo range; falling "
+                             "back to the DEX path", it->second);
             }
         }
     }

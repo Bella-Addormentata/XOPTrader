@@ -3416,6 +3416,15 @@ void validate_usd_anchor(const AppConfig& cfg)
     // both breakers sit INERT rather than tripping. Promising protection
     // that does not exist is worse than the missing anchor: an operator who
     // reads it has been told the fault is contained.
+    //
+    // [review] The reverse became true in this PR and the message did not
+    // follow. unvaluable_book_must_fail_closed() pauses after the grace, so
+    // "nothing pauses automatically" now UNDER-promises -- an operator with
+    // an anchorless config was told the build has no automatic protection
+    // and would then meet a "Manual intervention required" pause they had
+    // been told could not happen. The error direction is the safe one; the
+    // description is still wrong, and a diagnostic nobody can match to the
+    // behaviour is a diagnostic they stop reading.
     spdlog::warn(
         // [review] Scoped to what actually follows. The earlier wording
         // said every asset values at $0 and both breakers sit inert, which
@@ -3429,8 +3438,10 @@ void validate_usd_anchor(const AppConfig& cfg)
         "XCH-quoted conversion is unavailable. Assets with their own "
         "enforced par may still value. IF that leaves equity at or near zero, "
         "both drawdown breakers sit inert, because they cannot fire against a "
-        "zero peak -- which is the 2026-08-25 incident, and on this build "
-        "nothing pauses automatically. Enabled pairs: {}. Fix by declaring an "
+        "zero peak -- which is the 2026-08-25 incident. This build DOES "
+        "protect itself: after the drawdown grace expires with an unvaluable "
+        "book, the engine fails closed and pauses, requiring manual "
+        "intervention. Enabled pairs: {}. Fix by declaring an "
         "enabled XCH pair's quote asset under `pegged_assets:` with "
         "enforce: true and prefer_market_cross: false (see "
         "config.example.yaml; a config written before that section existed "
