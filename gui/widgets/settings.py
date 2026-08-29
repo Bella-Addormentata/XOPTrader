@@ -89,6 +89,26 @@ from gui.widgets.sub_tabs import SubTabPages
 
 log = logging.getLogger(__name__)
 
+
+def load_startup_states() -> tuple[str, str]:
+    """(dexie, permuto) startup requests from QSettings.
+
+    dexie: "adopt" | "on" | "off"; permuto: "off" | "on". Unknown or unset
+    values fall back to the safe defaults -- adopt for dexie (the switch
+    mirrors what the engine is really doing) and off for Permuto.
+    """
+    settings = QSettings("XOP", "XOPTrader")
+    settings.beginGroup("startup")
+    dexie = str(settings.value("dexie", "adopt")).lower()
+    permuto = str(settings.value("permuto", "off")).lower()
+    settings.endGroup()
+    if dexie not in ("adopt", "on", "off"):
+        dexie = "adopt"
+    if permuto not in ("off", "on"):
+        permuto = "off"
+    return dexie, permuto
+
+
 # ---------------------------------------------------------------------------
 # Theme colour shorthand
 # ---------------------------------------------------------------------------
@@ -414,7 +434,8 @@ class SettingsWidget(QWidget):
             ("Depeg & Aging", self._build_depeg_aging_tab),   # 7
             ("CoinGecko", self._build_coingecko_tab),         # 8
             ("Appearance", self._build_appearance_tab),       # 9
-            ("Advanced", self._build_advanced_tab),           # 10
+            ("Startup", self._build_startup_tab),             # 10
+            ("Advanced", self._build_advanced_tab),           # 11
         ]
         for idx, (title_text, builder) in enumerate(tab_builders):
             widget = builder()
@@ -1044,6 +1065,78 @@ class SettingsWidget(QWidget):
             widget.textChanged.connect(lambda _t, ti=4: self._mark_dirty(ti))
 
         return page
+
+    # -------------------------------------------------------------------
+    # Startup tab (QSettings-persisted, GUI-only)
+    # -------------------------------------------------------------------
+
+    def _build_startup_tab(self) -> QWidget:
+        """What each venue switch should ask for when the GUI opens.
+
+        These are REQUESTS, not overrides: a startup state is applied through
+        exactly the same gates as a click on the toolbar switch, so an
+        unregistered Permuto identity, a tripped breaker or a downed engine
+        refuses it the same way -- loudly, in the status bar. The point is a
+        machine that reboots mid-contest and comes back quoting on its own.
+        """
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setSpacing(12)
+
+        form = QFormLayout()
+        form.setSpacing(10)
+
+        self._startup_dexie = QComboBox()
+        # "Adopt" is today's behaviour and stays the default: the switch
+        # takes whatever the engine is actually doing, so a GUI attaching to
+        # an already-trading engine cannot show OFF over a live book.
+        self._startup_dexie.addItems([
+            "Adopt from engine (default)", "On", "Off"])
+        form.addRow("Dexie at startup:", self._startup_dexie)
+
+        self._startup_permuto = QComboBox()
+        self._startup_permuto.addItems(["Off (default)", "On"])
+        form.addRow("Permuto at startup:", self._startup_permuto)
+
+        layout.addLayout(form)
+
+        note = QLabel(
+            "WARNING: 'On' arms real trading the moment the GUI opens. It "
+            "passes through every protection gate a manual click does -- an "
+            "unregistered identity, a tripped breaker or a downed engine "
+            "refuses it, with the reason in the status bar. 'Dexie: On' "
+            "also resumes a paused engine, exactly like clicking the switch. "
+            "Use 'Permuto: On' during the contest week so a reboot does "
+            "not leave the book unmanaged."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet(f"color: {_C.WARNING_YELLOW};")
+        layout.addWidget(note)
+        layout.addStretch(1)
+
+        self._load_startup_settings()
+        self._startup_dexie.currentIndexChanged.connect(
+            self._save_startup_settings)
+        self._startup_permuto.currentIndexChanged.connect(
+            self._save_startup_settings)
+        return widget
+
+    def _load_startup_settings(self) -> None:
+        dexie, permuto = load_startup_states()
+        self._startup_dexie.setCurrentIndex(
+            {"adopt": 0, "on": 1, "off": 2}.get(dexie, 0))
+        self._startup_permuto.setCurrentIndex(1 if permuto == "on" else 0)
+
+    def _save_startup_settings(self) -> None:
+        settings = QSettings("XOP", "XOPTrader")
+        settings.beginGroup("startup")
+        settings.setValue(
+            "dexie", {0: "adopt", 1: "on", 2: "off"}[
+                self._startup_dexie.currentIndex()])
+        settings.setValue(
+            "permuto",
+            "on" if self._startup_permuto.currentIndex() == 1 else "off")
+        settings.endGroup()
 
     # -------------------------------------------------------------------
     # Appearance tab (QSettings-persisted, GUI-only)

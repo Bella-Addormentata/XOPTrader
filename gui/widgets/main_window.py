@@ -313,6 +313,11 @@ class MainWindow(QMainWindow):
         # the difference: intent ON plus a gate is BLOCKED, not ON.
         self._dexie_desired_on: bool = False
         self._dexie_intent_synced: bool = False
+        # Startup requests from the Settings > Startup tab, applied ONCE
+        # through the same gates as a click. dexie: adopt|on|off.
+        from gui.widgets.settings import load_startup_states
+        self._startup_dexie, self._startup_permuto = load_startup_states()
+        self._startup_permuto_applied: bool = False
         self._permuto_desired_on: bool = False
         # Set when a QuoteRunner is owned by this window. Until then the
         # Permuto switch refuses to turn on -- see _gather_permuto.
@@ -393,6 +398,11 @@ class MainWindow(QMainWindow):
         self._bridge = bridge
         self.config_service = bridge.config_service
         self.metrics_service = bridge.metrics_service
+        # [startup state] Permuto's request does not depend on the engine,
+        # only on the page and identity existing -- a short defer covers
+        # construction ordering. Dexie's request is applied in the intent
+        # sync instead, where the gates are real.
+        QTimer.singleShot(1500, self._apply_permuto_startup_state)
         self.db_service = bridge.database_service
 
         # -- Bridge-level signals ------------------------------------------
@@ -2177,6 +2187,29 @@ class MainWindow(QMainWindow):
         # Posting ungated means it IS trading, whatever we assumed.
         self._dexie_desired_on = not (reasons - {"dry_run"})
 
+        # [startup state] An explicit Settings request outranks the adopted
+        # intent -- but it is a REQUEST, applied through the same gates as a
+        # click, and refused the same way. Applied here because this is the
+        # first moment the gates are real rather than guessed.
+        if self._startup_dexie in ("on", "off"):
+            want_on = self._startup_dexie == "on"
+            if want_on == self._dexie_desired_on:
+                _log.info("[startup] dexie already %s; nothing to apply",
+                          "on" if want_on else "off")
+            else:
+                inputs = self._gather_dexie()
+                from gui.services.venue_control import (may_turn_off,
+                                                        may_turn_on)
+                allowed, reason = (may_turn_on(inputs) if want_on
+                                   else may_turn_off(inputs))
+                if allowed:
+                    _log.info("[startup] applying dexie startup state: %s",
+                              self._startup_dexie)
+                    self._on_dexie_toggle(want_on)
+                else:
+                    self._on_switch_refused(
+                        "startup state 'dexie: on' refused: %s" % reason)
+
     def _gather_dexie(self) -> SwitchInputs:
         """What the dexie switch is allowed to claim right now.
 
@@ -2341,6 +2374,33 @@ class MainWindow(QMainWindow):
                         "until they expire or the engine shuts down")
             self._dexie_desired_on = False
         self._refresh_venue_switches()
+
+    def _apply_permuto_startup_state(self) -> None:
+        """Apply 'Permuto: On at startup' -- once, through the click path.
+
+        Scheduled shortly after construction rather than run inline, so the
+        page and identity plumbing exist. A refusal (unregistered identity
+        being the common one) lands in the status bar exactly as a clicked
+        refusal would, and the switch stays honestly OFF. This is the reboot
+        story for the contest week: a machine that comes back mid-Tuesday
+        re-arms itself instead of resting a cancelled book until a human
+        notices.
+        """
+        if self._startup_permuto_applied:
+            return
+        self._startup_permuto_applied = True
+        if self._startup_permuto != "on" or self._permuto_desired_on:
+            return
+        from gui.services.venue_control import may_turn_on
+        inputs = self._gather_permuto()
+        allowed, reason = may_turn_on(inputs)
+        if allowed:
+            _log.info("[startup] applying permuto startup state: on")
+            self._on_permuto_toggle(True)
+            self._refresh_venue_switches()
+        else:
+            self._on_switch_refused(
+                "startup state 'permuto: on' refused: %s" % reason)
 
     def _on_permuto_toggle(self, want_on: bool) -> None:
         if want_on:

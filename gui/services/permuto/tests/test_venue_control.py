@@ -551,3 +551,122 @@ def test_the_intent_sync_waits_for_the_gate_family(window, monkeypatch):
         window._dexie_intent_synced = False
         window._bridge = None
 
+
+# --------------------------------------------------------------------------- #
+# [startup state] Settings > Startup: requests, never overrides
+# --------------------------------------------------------------------------- #
+
+def test_permuto_startup_on_is_refused_through_the_normal_gates(window):
+    """An unregistered identity refuses the startup request exactly as it
+    refuses a click -- the setting must never bypass a gate."""
+    seen = []
+    window._on_switch_refused = lambda r: seen.append(r)
+    window._startup_permuto = "on"
+    window._startup_permuto_applied = False
+    try:
+        window._apply_permuto_startup_state()
+        assert seen and "not registered" in seen[0]
+        assert not window._permuto_desired_on, "armed through a closed gate"
+        assert window._startup_permuto_applied
+    finally:
+        window._startup_permuto = "off"
+
+
+def test_permuto_startup_state_applies_exactly_once(window):
+    """The reboot story must not become a re-arm loop: a refusal consumes
+    the request rather than retrying it forever."""
+    seen = []
+    window._on_switch_refused = lambda r: seen.append(r)
+    window._startup_permuto = "on"
+    window._startup_permuto_applied = False
+    try:
+        window._apply_permuto_startup_state()
+        window._apply_permuto_startup_state()
+        assert len(seen) == 1
+    finally:
+        window._startup_permuto = "off"
+
+
+def test_permuto_startup_off_arms_nothing(window):
+    window._startup_permuto = "off"
+    window._startup_permuto_applied = False
+    window._apply_permuto_startup_state()
+    assert not window._permuto_desired_on
+
+
+def test_dexie_startup_request_outranks_adopt_but_not_the_gates(window,
+                                                               monkeypatch):
+    """With the engine visibly paused, 'dexie: on' resumes it through the
+    same path as a click -- and with gates real, a refusal is loud."""
+    calls = []
+
+    class _Svc:
+        @staticmethod
+        def posting_gates_published():
+            return True
+
+        @staticmethod
+        def posting_gate_reasons():
+            return {"gui"}          # paused by the operator's own flag
+
+        @staticmethod
+        def has_data():
+            return True
+
+        @staticmethod
+        def get_offers_summary():
+            return {"pending": 0.0}
+
+    class _Bridge:
+        metrics_service = _Svc()
+
+        def start_engine(self):
+            calls.append("start")
+
+        def resume_trading(self):
+            calls.append("resume")
+
+    monkeypatch.setattr(window, "_bridge", _Bridge(), raising=False)
+    monkeypatch.setattr(window, "_bot_running", True, raising=False)
+    window._dexie_intent_synced = False
+    window._dexie_desired_on = False
+    window._startup_dexie = "on"
+    try:
+        window._sync_dexie_intent_from_engine()
+        # Adopt would have said OFF (a gate holds); the explicit request
+        # resumes instead -- through _on_dexie_toggle, hence resume_trading.
+        assert "resume" in calls, "the startup request was not applied"
+        assert window._dexie_desired_on
+    finally:
+        window._startup_dexie = "adopt"
+        window._dexie_intent_synced = False
+        window._dexie_desired_on = False
+        window._bridge = None
+
+
+def test_startup_states_loader_defaults_are_safe(monkeypatch):
+    """Unset or garbage QSettings values must land on adopt/off -- the
+    states that arm nothing by themselves."""
+    from gui.widgets.settings import load_startup_states
+
+    from PySide6.QtCore import QSettings
+    settings = QSettings("XOP", "XOPTrader")
+    settings.beginGroup("startup")
+    old_d, old_p = settings.value("dexie"), settings.value("permuto")
+    settings.setValue("dexie", "sideways")
+    settings.setValue("permuto", 42)
+    settings.endGroup()
+    try:
+        assert load_startup_states() == ("adopt", "off")
+    finally:
+        settings.beginGroup("startup")
+        if old_d is None:
+            settings.remove("dexie")
+        else:
+            settings.setValue("dexie", old_d)
+        if old_p is None:
+            settings.remove("permuto")
+        else:
+            settings.setValue("permuto", old_p)
+        settings.endGroup()
+
