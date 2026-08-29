@@ -3317,18 +3317,34 @@ asio::awaitable<int> OfferManager::post_merged_side(
             // dexie id -- it was never published) so the ordinary fill and
             // status machinery carries it to a terminal state, whichever
             // way the race resolves.
-            for (const auto& tier : tiers) {
+            // [review round 11] ONE aggregate record, not a loop.
+            // State::upsert_offer is keyed by offer_id alone, so a per-tier
+            // loop under one trade id overwrote itself and retained only
+            // the LAST tier -- the "all constituents tracked" claim was
+            // false for every merged batch of more than one. The merged
+            // trade is one wallet trade; it is represented as one pending
+            // record carrying the total size, priced at the most
+            // conservative (worst-for-us) tier so fill accounting cannot
+            // overstate what the race can win.
+            {
                 PendingOffer pending;
                 pending.offer_id         = late_id;
                 pending.pair_name        = pair.name;
-                pending.side             = tier.side;
-                pending.price            = tier.price;
-                pending.size             = tier.size;
-                pending.tier             = tier.tier_index;
+                pending.side             = tiers.front().side;
+                pending.price            = tiers.front().price;
+                pending.size             = 0.0;
+                for (const auto& tier : tiers) {
+                    pending.size += tier.size;
+                    const bool worse = (tier.side == Side::Bid)
+                        ? tier.price > pending.price
+                        : tier.price < pending.price;
+                    if (worse) pending.price = tier.price;
+                }
+                pending.tier             = tiers.front().tier_index;
                 pending.created_at_block = block_height;
                 pending.created_at_ts    = std::chrono::system_clock::now();
                 pending.fee_mojos        = current_fee_mojos_;
-                pending.post_spread_bps  = tier.spread_bps;
+                pending.post_spread_bps  = tiers.front().spread_bps;
                 state_->upsert_offer(pending);
             }
             try {

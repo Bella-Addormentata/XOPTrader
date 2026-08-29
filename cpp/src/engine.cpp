@@ -1035,6 +1035,22 @@ void Engine::shutdown()
             std::chrono::steady_clock::now().time_since_epoch()).count(),
         std::memory_order_relaxed);
 
+    // [review round 11] The claim is published HERE, synchronously, not
+    // inside the posted coroutine. shutdown() runs on the caller's thread;
+    // the coroutine claim landed only when the io_context got around to it,
+    // so the watchdog could pass its pre-tick check, consume a genuine
+    // Fire, and start a second bulk cancel in the window before the claim
+    // appeared -- the exact duplicate-spend race the claim exists to
+    // prevent, reopened by its own delivery latency. The coroutine's
+    // ClaimGuard still clears it when the cancel completes.
+    if (!dry_run_) {
+        graceful_cancel_started_ms_.store(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count(),
+            std::memory_order_release);
+        graceful_cancel_active_.store(true, std::memory_order_release);
+    }
+
     // Cancel the polling timer so the loop exits.
     try {
         poll_timer_.cancel();
@@ -1060,17 +1076,10 @@ void Engine::shutdown()
     asio::co_spawn(ioc_, [this]() -> asio::awaitable<void> {
         // --- Cancel outstanding offers (skip in dry-run mode) ---
         if (!dry_run_) {
-            // [review] Claim the cancellation so the watchdog does not issue
-            // a second, concurrent secure spend against the same coins.
-            // Bounded: see graceful_cancel_active_ in the header for why the
-            // watchdog must still be able to fire if this never returns.
-            const auto claim_ms =
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now().time_since_epoch())
-                    .count();
-            graceful_cancel_started_ms_.store(claim_ms,
-                                              std::memory_order_release);
-            graceful_cancel_active_.store(true, std::memory_order_release);
+            // The claim was published synchronously in shutdown() -- see
+            // the note there. This guard is what CLEARS it once the cancel
+            // completes (or fails), so the watchdog resumes its own
+            // authority afterwards.
             struct ClaimGuard {
                 std::atomic<bool>* flag;
                 ~ClaimGuard() { flag->store(false, std::memory_order_release); }
