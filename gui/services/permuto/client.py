@@ -103,6 +103,14 @@ class PermutoClient:
         # empty book. Only placements are fenced; cancels must keep working
         # during shutdown, which is the whole point of shutting down.
         self._halt_placements = threading.Event()
+        # [review round 11] Orders the last placement against the final
+        # cancel. The fence alone cannot: a batch already past its is_set()
+        # check is an independent HTTP request, and the venue could process
+        # join()'s cancel FIRST and the placement second -- fresh orders
+        # resting after the "book is empty" claim. The placement holds this
+        # lock across its send; the teardown cancel acquires it first, so by
+        # the time the cancel is on the wire no placement is.
+        self._placement_lock = threading.Lock()
         self.session = SessionState(
             token=session_token, expires_at_s=expires_at_s
         )
@@ -361,9 +369,15 @@ class PermutoClient:
         # the shutdown began.
         if self._halt_placements.is_set():
             raise BatchError("placements halted for shutdown")
-        return self._retry_once_on_401(
-            "POST", "/exchange/batch_upsert", {"orders": list(legs)}, now_s
-        )
+        # Held across the send -- see _placement_lock. The fence is
+        # re-checked INSIDE the lock so the halt-then-cancel sequence in
+        # teardown cannot interleave between our check and our send.
+        with self._placement_lock:
+            if self._halt_placements.is_set():
+                raise BatchError("placements halted for shutdown")
+            return self._retry_once_on_401(
+                "POST", "/exchange/batch_upsert",
+                {"orders": list(legs)}, now_s)
 
     def account(self, now_s: float) -> Any:
         """Equity, used margin and positions, for :mod:`risk`."""

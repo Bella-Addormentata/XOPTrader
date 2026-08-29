@@ -2256,8 +2256,12 @@ class MainWindow(QMainWindow):
         # bootstrap fixes the cause; this makes the switch stop asserting
         # something it never checked.
         if self._permuto_last_blocked:
-            gates.add("blocked" if self._permuto_last_action in ("blocked", "")
-                      else "not_quoting")
+            if self._permuto_last_action == "starting":
+                gates.add("starting")
+            elif self._permuto_last_action in ("blocked", ""):
+                gates.add("blocked")
+            else:
+                gates.add("not_quoting")
 
         # The runner is the authority on its own book: it reports empty only
         # once a cancel has been acknowledged, so a stop in flight keeps the
@@ -2337,6 +2341,15 @@ class MainWindow(QMainWindow):
                     return
                 self._permuto_runner.ticked.connect(self._on_permuto_tick)
                 self._permuto_runner.stopped.connect(self._on_permuto_stopped)
+            # [review round 11] Seed the non-trading latch BEFORE starting.
+            # desired_on flips true here, and without the seed the very next
+            # refresh painted PERMUTO ON while the first authentication,
+            # account read and placement had not happened -- the same
+            # green-over-nothing this latch exists to prevent, arriving
+            # through its own initial value. The first quote/hold tick
+            # clears it, exactly like every later recovery.
+            self._permuto_last_blocked = True
+            self._permuto_last_action = "starting"
             self._permuto_runner.start()
             self._permuto_desired_on = True
         else:

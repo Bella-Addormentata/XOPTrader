@@ -403,6 +403,19 @@ class PermutoLive(QObject):
             self._client.halt_placements()
         except Exception:  # noqa: BLE001 - a fake client without the method
             pass
+        # [review round 11] And WAIT for any placement already on the wire.
+        # The fence stops new sends; this orders the final cancel after the
+        # one that got through. Bounded: a placement holds the lock only
+        # across a single REQUEST_TIMEOUT_S-bounded send, and a wedged one
+        # past twice that is abandoned to the cancel below -- a cancel
+        # racing a wedged placement is still strictly better than no cancel.
+        lock = getattr(self._client, "_placement_lock", None)
+        if lock is not None:
+            if lock.acquire(timeout=REQUEST_TIMEOUT_S * 2):
+                lock.release()
+            else:
+                _log.critical("permuto: a placement is still on the wire "
+                              "past its budget -- sending the cancel anyway")
         # [review] quit() DIRECTLY, not through worker.stopped -> thread.quit.
         #
         # That connection is auto, and the QThread OBJECT lives in the GUI

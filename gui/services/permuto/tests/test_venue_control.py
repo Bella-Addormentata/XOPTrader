@@ -477,3 +477,39 @@ def test_stopping_clears_the_blocked_latch_so_the_switch_can_rearm(window):
     assert not (gates & {"blocked", "not_quoting"}), (
         "a stale latch from the stopped session still gates the next one")
 
+
+def test_arming_does_not_paint_ON_before_the_first_pass(window, monkeypatch):
+    """[review round 11] desired_on flips true at the click, and nothing had
+    yet proven the loop can authenticate, read the account or place -- so the
+    very next refresh painted PERMUTO ON over an unstarted session. The
+    starting seed gates it until the first quote/hold tick clears it."""
+    class _FakeLive:
+        def __init__(self):
+            from PySide6.QtCore import QObject, Signal
+
+            class _Sig(QObject):
+                s = Signal(object)
+            self._t, self._s = _Sig(), _Sig()
+            self.ticked, self.stopped = self._t.s, self._s.s
+
+        def start(self):
+            pass
+
+        def book_is_empty(self):
+            return False
+
+    monkeypatch.setattr(window, "_make_permuto_live", lambda: _FakeLive())
+    window._on_permuto_toggle(True)
+    try:
+        gates = window._gather_permuto().gates
+        assert "starting" in gates, "armed with nothing proven reads as ON"
+        # The first healthy tick clears it, like every later recovery.
+        window._on_permuto_tick(
+            type("R", (), {"action": "quote", "ok": True, "error": ""})())
+        assert "starting" not in window._gather_permuto().gates
+    finally:
+        window._permuto_desired_on = False
+        window._permuto_runner = None
+        window._permuto_last_blocked = False
+        window._permuto_last_action = ""
+
