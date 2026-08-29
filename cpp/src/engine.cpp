@@ -11419,6 +11419,25 @@ std::string Engine::quote_usd_factor_source_pair(const PairConfig& pc) const
     if (quote_prefers_market_cross(pc)) {
         return byc_cross_source_pair(pc);
     }
+    // [review] The PAR case answers "no source", ahead of the XCH-base rule.
+    //
+    // This is what the contract above already promised -- "Empty when the
+    // factor needs no snapshot (par)" -- and the code did not do it, because
+    // an XCH/<par wrapper> pair matched the generic base_asset_id == "xch"
+    // rule first and named itself as its own market source. quote_usd_factor()
+    // answers such a pair from declared_usd_par(): a constant, read from no
+    // market at all.
+    //
+    // The consequence was a silent data loss rather than a wrong number.
+    // Disable such a pair -- an ordinary thing to do while triaging a market
+    // -- and step_update_pnl() sees the factor sourced from a pair that is
+    // itself disabled, marks it untrusted, and on a fresh process (where the
+    // in-memory carry map starts empty) registers 0 for it. That pair's
+    // historical USD P&L disappears, and the drawdown breaker reads the
+    // result.
+    if (is_par_wrapper_quote(pc)) {
+        return {};
+    }
     if (pc.base_asset_id == "xch") {
         return pc.name;   // DBX-style: derived from this pair's own mid
     }
@@ -11471,9 +11490,17 @@ double Engine::quote_usd_factor(const PairConfig& pc) const
     // Fiat-collateralised wrappers hold their peg tightly enough to treat
     // as exactly $1 for accounting (matches the GUI's pnl_usdc_expr).
     // [PEG 2026-08-26] The 1.0 is no longer written here.  It comes from
-    // whatever the operator declared for this asset, in the currency they
-    // declared it in -- so a EUR-pegged wrapper yields its EURUSD value and
-    // an asset whose peg is no longer enforced yields nothing at all.
+    // whatever the operator declared for this asset, and an asset whose peg
+    // is no longer enforced yields nothing at all.
+    //
+    // [review] A NON-USD peg also yields nothing, today. The earlier wording
+    // here said a EUR-pegged wrapper "yields its EURUSD value", which
+    // declared_usd_par() cannot do -- it supplies no FX rate, so such an
+    // asset returns nullopt and this branch returns 0.0. Wiring a live FX
+    // feed is the follow-up that makes EUR/JPY pegs usable; until then a
+    // declared non-USD peg produces "no valuation", exactly as a missing mid
+    // does. Documenting the intended behaviour as the current one is how a
+    // reader concludes the feature exists.
     if (is_par_wrapper_quote(pc)) {
         if (auto par = declared_usd_par(pc.quote_asset_id)) {
             return *par;

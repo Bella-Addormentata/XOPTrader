@@ -77,12 +77,19 @@ struct PeggedAsset {
 
     /// Largest declarable USD par per unit.
     ///
-    /// Not a taste judgement: the product of this and a Mojo has to survive
-    /// llround. XCH carries 1e12 mojos per unit, so a par of 1e6 leaves
-    /// eighteen orders of magnitude of headroom under the ~9.2e18 that
-    /// long long can represent, while still admitting anything an actual
-    /// pegged asset could be worth -- the most valuable currency unit in
-    /// circulation is under 4 USD.
+    /// A DECLARATION SANITY BOUND, not a representability guarantee.
+    ///
+    /// [review] The earlier wording claimed a par of 1e6 leaves "eighteen
+    /// orders of magnitude of headroom under the ~9.2e18 that long long can
+    /// represent". That is wrong by a wide margin and in the flattering
+    /// direction: 1e6 * 1e12 is 1e18, about 9x below the limit, not eighteen
+    /// orders of magnitude below it. The tests below make the same point --
+    /// a 20-unit pseudo-price at this par still overflows.
+    ///
+    /// So this bound does NOT make the conversion safe. to_mojo_checked() at
+    /// every double-to-Mojo boundary is what does that; this only rejects a
+    /// declaration no real pegged asset could justify -- the most valuable
+    /// currency unit in circulation is under 4 USD.
     static constexpr double kMaxPegTarget = 1e6;
 
     /// Deviation from peg_target at which to warn, as a percentage.
@@ -133,8 +140,18 @@ struct PeggedAsset {
         // [review] Finite is NOT enough for peg_target. 1e308 is finite and
         // positive, and the factor it produces is multiplied by a Mojo --
         // up to 1e12 for XCH -- and handed to std::llround at every
-        // double-to-Mojo boundary. That overflows long long, raises the
-        // invalid-operation condition, and yields an unusable Mojo rather
+        // double-to-Mojo boundary.
+        //
+        // But note what this check does NOT do, because an earlier version
+        // of this comment implied otherwise: kMaxPegTarget does not bound
+        // the PRODUCT. kMaxPegTarget * 20 * 1e12 is still far outside Mojo
+        // range, and division by a small factor overflows in the mirror
+        // direction, which no upper bound on the declaration can touch.
+        // Conversion safety rests entirely on to_mojo_checked() at each
+        // boundary; this rejects an absurd DECLARATION early, where the
+        // operator can still read the message. That overflows long long,
+        // raises the invalid-operation condition, and yields an unusable
+        // Mojo rather
         // than an error. Bounding the DECLARATION is the cheap place to stop
         // it: one check at startup instead of a range test at every
         // conversion, and it fails loudly where an operator can read it.
