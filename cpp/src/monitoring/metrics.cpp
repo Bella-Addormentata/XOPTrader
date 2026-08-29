@@ -758,6 +758,36 @@ void MetricsExporter::update_posting_gates(bool gui, bool breaker,
          || dry_run || wd) ? 1.0 : 0.0);
 }
 
+void MetricsExporter::update_peg_status(
+    const std::vector<std::tuple<std::string, int, double>>& rows)
+{
+    std::unique_lock lock(mtx_);
+    if (!running_ || !registry_) return;
+    if (peg_status_family_ == nullptr) {
+        peg_status_family_ = &prometheus::BuildGauge()
+            .Name("xop_peg_status")
+            .Help("Asset-level peg state: 0 holding, 1 warn, 2 SUSPENDED "
+                  "(par ignored, pairs disabled until operator re-enable)")
+            .Register(*registry_);
+        peg_deviation_family_ = &prometheus::BuildGauge()
+            .Name("xop_peg_deviation_pct")
+            .Help("Last observed deviation from the declared peg, percent")
+            .Register(*registry_);
+    }
+    for (const auto& [key, status, dev] : rows) {
+        const auto bar = key.find('|');
+        const std::string symbol = key.substr(0, bar);
+        const std::string asset = bar == std::string::npos
+            ? std::string{} : key.substr(bar + 1);
+        auto& g = peg_status_family_->Add(
+            {{"symbol", symbol}, {"asset", asset}});
+        g.Set(static_cast<double>(status));
+        auto& d = peg_deviation_family_->Add(
+            {{"symbol", symbol}, {"asset", asset}});
+        d.Set(dev);
+    }
+}
+
 void MetricsExporter::update_watchdog_gate(bool fired)
 {
     std::unique_lock lock(mtx_);

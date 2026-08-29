@@ -58,6 +58,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <functional>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -606,6 +607,10 @@ Engine::Engine(const AppConfig& config, bool dry_run)
         if (db_dir.empty()) db_dir = fs::current_path();
         pause_flag_path_ = db_dir / "pause.flag";
         spdlog::info("[Engine] Pause flag path: {}", pause_flag_path_.string());
+        // [PEGSUSPEND] Same channel, same directory: the GUI's re-enable
+        // button writes asset ids here, one per line, and the engine
+        // consumes the file on its next cycle.
+        peg_reenable_flag_path_ = db_dir / "peg_reenable.flag";
     }
 
     state_->set_status(BotStatus::Initializing);
@@ -1695,6 +1700,7 @@ asio::awaitable<void> Engine::poll_loop_coro()
             // operator who pauses during an outage gets a log line and a GUI
             // status instead of silence.
             check_pause_flag();
+    check_peg_reenable_flag();
 
             // [S28] Height source is decided EVERY poll, not once at startup.
             // wallet_only_mode_ used to be assigned only in
@@ -2569,7 +2575,16 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
     // does not abort the remaining steps.  The engine logs the error and
     // continues with degraded data.
 
-    try { co_await step_update_market_state(block_height); }
+    try { co_await step_update_market_state(block_height);
+
+    // [PEGSUSPEND] Asset-level peg observation, right after the mids it
+    // reads were ingested. Runs while paused too: a pause gates POSTING,
+    // and a depeg that develops during a pause must be latched before the
+    // resume, not discovered by it.
+    try { co_await step_observe_asset_pegs(block_height); }
+    catch (const std::exception& e) {
+        spdlog::error("[Engine] peg observation failed: {}", e.what());
+    } }
     catch (const std::exception& e) {
         spdlog::error("[Engine] Step 1 (market state) failed: {}", e.what());
     }
@@ -4529,6 +4544,19 @@ void Engine::step_compute_quotes(BlockHeight block_height)
         // where the depeg detector has triggered Bailed or SuspectedFailure.
         // This prevents us from market-making a coin that has lost its peg
         // (e.g. Stably) and accumulating worthless inventory.
+        // [PEGSUSPEND] The asset-level latch gates every pair TOUCHING a
+        // suspended asset -- including XCH/<asset>, which the pair-level
+        // detector cannot see because its mid moves with XCH.
+        {
+            const PairConfig* pc4 = find_pair_config(pair_name);
+            if (pc4 != nullptr && pair_peg_suspended(*pc4)) {
+                spdlog::debug("[Engine] Step 4: {} suspended (asset-level "
+                              "peg failure) -- suppressing all quotes",
+                              pair_name);
+                pcs.quote_valid = false;
+                continue;
+            }
+        }
         if (depeg_detector_ && depeg_detector_->should_bail(pair_name)) {
             // [S17] The Step 3 transition log is the alert; this per-cycle
             // suppression note stays at debug.
@@ -10593,7 +10621,7 @@ asio::awaitable<void> Engine::step_check_arbitrage(
 {
     // -- 9a: Legacy MarketDataFeed CEX-DEX signal check ----------------------
     for (const auto& pair : config_.pairs) {
-        if (!pair.enabled) continue;
+        if (!pair.enabled || pair_peg_suspended(pair)) continue;
 
         auto signal = market_data_->get_latest_arb_signal(pair.name);
         if (signal) {
@@ -10610,7 +10638,7 @@ asio::awaitable<void> Engine::step_check_arbitrage(
     if (config_.arbitrage.enabled && arb_detector_) {
         PairPriceMap pair_prices;
         for (const auto& pair : config_.pairs) {
-            if (!pair.enabled) continue;
+            if (!pair.enabled || pair_peg_suspended(pair)) continue;
             auto it = cycle_.find(pair.name);
             if (it == cycle_.end() || !it->second.market_data_valid) continue;
             const double mid = market_data_->get_mid_price(pair.name);
@@ -10679,7 +10707,7 @@ asio::awaitable<void> Engine::step_check_arbitrage(
     const double max_take_xch = config_.arbitrage.crossed_book_max_take_xch;
 
     for (const auto& pair : config_.pairs) {
-        if (!pair.enabled) continue;
+        if (!pair.enabled || pair_peg_suspended(pair)) continue;
 
         // Get the competing offers (already fetched in Step 1).
         auto comp_offers = market_data_->get_competing_offers(pair.name);
@@ -11224,7 +11252,8 @@ asio::awaitable<void> Engine::step_check_arbitrage(
         const double peg_max_units = config_.arbitrage.peg_arb_max_take_units;
 
         for (const auto& pair : config_.pairs) {
-            if (!pair.enabled || !pair.is_stablecoin) continue;
+            if (!pair.enabled || !pair.is_stablecoin
+                    || pair_peg_suspended(pair)) continue;
 
             // Only take when peg is trusted (Normal state).
             const auto* ds = depeg_detector_->get_state(pair.name);
@@ -12482,6 +12511,15 @@ bool Engine::quote_prefers_market_cross(const PairConfig& pc) const
 
 std::optional<double> Engine::declared_usd_par(const AssetId& asset_id) const
 {
+    // [PEGSUSPEND] A suspended peg values off the MARKET, exactly like an
+    // unpegged CAT: the operator declared the par, the market disproved it,
+    // and honouring a disproved par is how a depegged wrapper marks a book
+    // at money it cannot fetch. The declaration is not forgotten -- the
+    // latch clears through the GUI and the par returns with it.
+    if (asset_peg_suspended(asset_id)) {
+        return std::nullopt;
+    }
+
     // No FX rate is supplied here, so a non-USD peg yields nullopt rather
     // than a silent 1:1 substitution.  Wiring a live FX feed is the
     // follow-up that makes EUR/JPY pegs usable; until then, declaring one
@@ -15761,6 +15799,172 @@ void Engine::close_connections()
 // ---------------------------------------------------------------------------
 // check_pause_flag -- GUI-initiated pause via signal file.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// [PEGSUSPEND] Asset-level peg suspension
+// ---------------------------------------------------------------------------
+
+bool Engine::asset_peg_suspended(const std::string& asset_id) const
+{
+    auto it = asset_peg_rt_.find(asset_id);
+    return it != asset_peg_rt_.end() && it->second.suspended;
+}
+
+bool Engine::pair_peg_suspended(const PairConfig& pc) const
+{
+    return asset_peg_suspended(pc.base_asset_id)
+        || asset_peg_suspended(pc.quote_asset_id);
+}
+
+// Observe every declared, enforced pegged asset in USD, through a route
+// that does not consult the asset's own par -- a par-based observation of
+// the par would be circular and blind. The route is the XCH cross:
+// usd(asset) = usd_per_xch / mid(XCH/asset), or * mid(asset/XCH). Only
+// valuation-grade mids feed it (the S20 contract); a junk or missing print
+// reaches observe_peg() as a data gap and holds the streak.
+asio::awaitable<void> Engine::step_observe_asset_pegs(BlockHeight block_height)
+{
+    if (config_.pegged_assets.empty()) co_return;
+
+    const double usd_xch = usd_per_xch();
+
+    for (const PeggedAsset* a : config_.pegged_assets.all()) {
+        if (!a->enforce) continue;
+
+        double usd_obs = std::numeric_limits<double>::quiet_NaN();
+        if (usd_xch > 0.0 && std::isfinite(usd_xch)) {
+            for (const auto& pair : config_.pairs) {
+                if (!pair.enabled) continue;
+                const bool xch_base =
+                    pair.base_asset_id == "xch"
+                    && pair.quote_asset_id == a->asset_id;
+                const bool xch_quote =
+                    pair.quote_asset_id == "xch"
+                    && pair.base_asset_id == a->asset_id;
+                if (!xch_base && !xch_quote) continue;
+                auto snap = state_->get_market(pair.name);
+                if (!(snap.mid_price > 0) || !snap.mid_valuation_grade) {
+                    continue;
+                }
+                const double mid = static_cast<double>(snap.mid_price);
+                usd_obs = xch_base ? usd_xch / mid : usd_xch * mid;
+                break;
+            }
+        }
+
+        auto& rt = asset_peg_rt_[a->asset_id];
+        const auto what = risk::observe_peg(
+            rt, usd_obs, a->peg_target, a->bail_pct, a->warn_pct,
+            a->sustained_observations, block_height);
+
+        if (what != risk::PegObservation::JustSuspended) continue;
+
+        // The transition. Alert first -- the cancel below can fail, and
+        // the operator must hear about the depeg either way.
+        spdlog::error("[Engine] [PEGSUSPEND] {} has LOST ITS PEG "
+                      "(observed ${:.4f} vs target {:.4f}, {:.1f}% off, "
+                      "sustained {} observations) -- suspending the par and "
+                      "disabling every pair touching it. Re-enable from the "
+                      "GUI's Depeg tab when YOU trust the peg again.",
+                      a->symbol, usd_obs, a->peg_target,
+                      rt.last_deviation_pct, a->sustained_observations);
+        if (alerts_) {
+            alerts_->send_alert(
+                AlertRule::StablecoinDepeg,
+                a->symbol + " lost its peg ("
+                + std::to_string(rt.last_deviation_pct)
+                + "% off target). Its declared par is SUSPENDED, every pair "
+                  "touching it is disabled, and resting offers are being "
+                  "cancelled. Re-enable from the GUI when you trust the peg "
+                  "again.");
+        }
+
+        // OFF MEANS FLAT: cancel what is resting on the affected pairs.
+        std::vector<std::string> to_cancel;
+        for (const auto& po : state_->get_all_offers()) {
+            const auto* pc = find_pair_config(po.pair_name);
+            if (pc != nullptr && pair_peg_suspended(*pc)) {
+                to_cancel.push_back(po.offer_id);
+            }
+        }
+        if (!to_cancel.empty() && offer_mgr_ && !dry_run_) {
+            try {
+                auto done = co_await offer_mgr_->selective_cancel(to_cancel);
+                spdlog::warn("[Engine] [PEGSUSPEND] cancelled {}/{} resting "
+                             "offers on pairs touching {}",
+                             done.size(), to_cancel.size(), a->symbol);
+            } catch (const std::exception& e) {
+                spdlog::critical("[Engine] [PEGSUSPEND] could not cancel the "
+                                 "book on suspended pairs: {} -- offers may "
+                                 "still be resting in a depegged asset",
+                                 e.what());
+            }
+        }
+    }
+
+    publish_peg_status();
+    co_return;
+}
+
+void Engine::check_peg_reenable_flag()
+{
+    namespace fs = std::filesystem;
+    if (peg_reenable_flag_path_.empty()) return;
+    std::error_code ec;
+    if (!fs::exists(peg_reenable_flag_path_, ec)) return;
+
+    std::ifstream in(peg_reenable_flag_path_);
+    std::string asset_id;
+    while (std::getline(in, asset_id)) {
+        // Trim CR from Windows-written lines.
+        while (!asset_id.empty()
+               && (asset_id.back() == '\r' || asset_id.back() == ' ')) {
+            asset_id.pop_back();
+        }
+        if (asset_id.empty()) continue;
+        auto it = asset_peg_rt_.find(asset_id);
+        if (it == asset_peg_rt_.end() || !it->second.suspended) {
+            spdlog::warn("[Engine] [PEGSUSPEND] re-enable requested for {} "
+                         "but it is not suspended -- ignoring", asset_id);
+            continue;
+        }
+        risk::reenable_peg(it->second);
+        const auto* a = config_.pegged_assets.find(asset_id);
+        spdlog::warn("[Engine] [PEGSUSPEND] operator RE-ENABLED {} -- the "
+                     "par is honoured again and its pairs may quote. "
+                     "Detection is re-armed from zero: if the peg is still "
+                     "broken, the next sustained run re-suspends it.",
+                     a ? a->symbol : asset_id);
+        if (alerts_) {
+            alerts_->send_alert(
+                AlertRule::StablecoinDepeg,
+                (a ? a->symbol : asset_id)
+                + " re-enabled by the operator. Detection re-armed.");
+        }
+    }
+    in.close();
+    fs::remove(peg_reenable_flag_path_, ec);
+    publish_peg_status();
+}
+
+void Engine::publish_peg_status()
+{
+    if (!metrics_ || !metrics_->is_running()) return;
+    std::vector<std::tuple<std::string, int, double>> rows;
+    for (const PeggedAsset* a : config_.pegged_assets.all()) {
+        if (!a->enforce) continue;
+        auto it = asset_peg_rt_.find(a->asset_id);
+        int status = 0;
+        double dev = 0.0;
+        if (it != asset_peg_rt_.end()) {
+            const auto& rt = it->second;
+            dev = rt.last_deviation_pct;
+            status = rt.suspended ? 2 : (dev >= a->warn_pct ? 1 : 0);
+        }
+        rows.emplace_back(a->symbol + "|" + a->asset_id, status, dev);
+    }
+    metrics_->update_peg_status(rows);
+}
+
 void Engine::check_pause_flag()
 {
     namespace fs = std::filesystem;

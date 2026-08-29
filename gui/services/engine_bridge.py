@@ -29,11 +29,11 @@ from typing import Any, Final, Optional
 from PySide6.QtCore import QObject, Qt, QTimer, Signal, Slot
 
 from gui.services.config_service import ConfigService
+from gui.services.config_split import split_and_save
 from gui.services.database_service import DatabaseService
 from gui.services.metrics_service import MetricsService
 from gui.services.wallet_service import WalletService
 from gui.services.warp.service import WarpService
-from gui.services.config_split import split_and_save
 
 # ---------------------------------------------------------------------------
 # Module-level logger and constants
@@ -563,6 +563,24 @@ class EngineBridge(QObject):
         except OSError as exc:
             _log.error("Failed to create pause flag: %s", exc)
             self.error.emit(f"Could not pause trading: {exc}")
+
+    def reenable_peg(self, asset_id: str) -> None:
+        """[PEGSUSPEND] Ask the engine to re-enable a suspended peg.
+
+        Same channel as the pause: a flag file beside the database, one
+        asset id per line, consumed and deleted by the engine on its next
+        cycle. Appending rather than truncating lets two clicks in one
+        cycle both land.
+        """
+        flag_path = self._db_path.parent / "peg_reenable.flag"
+        try:
+            flag_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(flag_path, "a", encoding="utf-8") as fh:
+                fh.write(asset_id.strip() + "\n")
+            _log.warning("Peg re-enable requested for %s via %s",
+                         asset_id, flag_path)
+        except OSError as exc:
+            _log.error("Failed to write peg re-enable flag: %s", exc)
 
     def resume_trading(self) -> None:
         """Resume trading by removing the pause signal file."""

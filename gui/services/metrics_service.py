@@ -713,6 +713,35 @@ class MetricsService(QObject):
             return value >= 1.0
         return False
 
+    def peg_statuses(self) -> list[dict]:
+        """[PEGSUSPEND] Per-asset peg state from xop_peg_status.
+
+        Each row: {symbol, asset, status, deviation_pct} with status
+        0=holding, 1=warn, 2=SUSPENDED (par ignored, pairs disabled until
+        the operator re-enables). Empty when the engine predates the
+        family or declares no pegs.
+        """
+        with QMutexLocker(self._mutex):
+            m = self._latest
+
+        rows: list[dict] = []
+        status_fam = m.get("xop_peg_status") or {}
+        dev_fam = m.get("xop_peg_deviation_pct") or {}
+        for labels, value in status_fam.items():
+            entry = {"symbol": "", "asset": "",
+                     "status": int(value), "deviation_pct": 0.0}
+            for key, val in labels:
+                if key == "symbol":
+                    entry["symbol"] = val
+                elif key == "asset":
+                    entry["asset"] = val
+            dev = dev_fam.get(labels)
+            if dev is not None:
+                entry["deviation_pct"] = float(dev)
+            rows.append(entry)
+        rows.sort(key=lambda r: r["symbol"])
+        return rows
+
     def posting_gates_published(self) -> bool:
         """Whether the engine has published its posting-gate gauges at all.
 

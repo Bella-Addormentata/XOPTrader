@@ -41,6 +41,7 @@
 #include <memory>
 #include <shared_mutex>
 #include <string>
+#include <tuple>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
@@ -301,6 +302,13 @@ public:
     /// signal.  Thread-safe by the same mutex as every other updater.
     void update_watchdog_gate(bool fired);
 
+    /// [PEGSUSPEND] Per-asset peg status for the GUI's Depeg tab.
+    /// rows: ("symbol|asset_id", status 0=holding 1=warn 2=suspended,
+    /// deviation_pct). Rebuilt each publish so a re-enabled asset's gauge
+    /// drops back to 0 rather than sticking.
+    void update_peg_status(
+        const std::vector<std::tuple<std::string, int, double>>& rows);
+
     /// Update the rolling 24-hour blockchain fees gauge (mojos).
     void update_fees_paid_24h(std::uint64_t total_mojos);
 
@@ -429,6 +437,8 @@ private:
     /// before taking the lock, so without a sticky copy an older snapshot
     /// can clear a signal that is meant to survive until restart.
     bool               watchdog_sticky_{false};
+    prometheus::Family<prometheus::Gauge>* peg_status_family_{nullptr};
+    prometheus::Family<prometheus::Gauge>* peg_deviation_family_{nullptr};
     prometheus::Gauge* fees_paid_24h_gauge_{nullptr};
 
     // -- Trade decision-tree counters ---------------------------------------

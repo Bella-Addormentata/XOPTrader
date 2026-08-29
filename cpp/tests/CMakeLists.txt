@@ -71,6 +71,7 @@ add_executable(xop_tests
     test_published_mid.cpp
     test_mid_gate.cpp
     test_peg_registry.cpp
+    test_peg_suspension.cpp
     test_valuation_authority.cpp
     test_usd_route.cpp
     test_coin_lock_ledger.cpp

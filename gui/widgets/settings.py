@@ -51,7 +51,7 @@ from pathlib import Path
 from typing import Any, Final, Optional
 
 import yaml
-from PySide6.QtCore import QObject, QSettings, Qt, QThread, Signal, Slot
+from PySide6.QtCore import QObject, QSettings, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -1121,6 +1121,85 @@ class SettingsWidget(QWidget):
             self._save_startup_settings)
         return widget
 
+    def set_peg_services(self, metrics_getter, reenable_cb) -> None:
+        """Wire the live peg panel: a callable returning
+        MetricsService.peg_statuses() rows, and a callable(asset_id) that
+        asks the engine to re-enable. Called by MainWindow once the bridge
+        exists."""
+        self._peg_metrics_getter = metrics_getter
+        self._peg_reenable_cb = reenable_cb
+        self._peg_timer.start()
+        self._refresh_peg_panel()
+
+    def _refresh_peg_panel(self) -> None:
+        if self._peg_metrics_getter is None:
+            return
+        try:
+            rows = self._peg_metrics_getter() or []
+        except Exception:  # noqa: BLE001 - a scrape gap is not a UI error
+            rows = []
+
+        # Rebuild the rows. A handful of declared assets at 5s -- churn is
+        # irrelevant next to keeping the display truthful.
+        while self._peg_rows_layout.count():
+            item = self._peg_rows_layout.takeAt(0)
+            w = item.widget()
+            if w is not None and w is not self._peg_placeholder:
+                w.deleteLater()
+        if not rows:
+            self._peg_placeholder.setVisible(True)
+            self._peg_rows_layout.addWidget(self._peg_placeholder)
+            return
+        self._peg_placeholder.setVisible(False)
+
+        for row in rows:
+            line = QWidget()
+            h = QHBoxLayout(line)
+            h.setContentsMargins(0, 0, 0, 0)
+            status = int(row.get("status", 0))
+            dev = float(row.get("deviation_pct", 0.0))
+            symbol = row.get("symbol", "?")
+            asset = row.get("asset", "")
+            text = {0: "holding", 1: "WARN", 2: "SUSPENDED"}.get(
+                status, "?")
+            colour = {0: _C.PROFIT_GREEN, 1: _C.WARNING_YELLOW,
+                      2: _C.LOSS_RED}.get(status, _C.TEXT_SECONDARY)
+            lbl = QLabel(
+                "%s  --  %s (%.2f%% off peg)%s"
+                % (symbol, text, dev,
+                   "  |  par ignored, pairs disabled" if status == 2 else ""))
+            lbl.setStyleSheet(f"color: {colour};")
+            h.addWidget(lbl, stretch=1)
+            if status == 2 and self._peg_reenable_cb is not None:
+                btn = QPushButton("Re-enable %s" % symbol)
+                btn.setToolTip(
+                    "Restore the par and let its pairs quote again. "
+                    "Detection re-arms from zero: if the peg is still "
+                    "broken, it re-suspends on its own.")
+                btn.clicked.connect(
+                    lambda _=False, a=asset, sym=symbol:
+                    self._on_peg_reenable(a, sym))
+                h.addWidget(btn)
+            self._peg_rows_layout.addWidget(line)
+
+    def _on_peg_reenable(self, asset_id: str, symbol: str) -> None:
+        from PySide6.QtWidgets import QMessageBox
+        answer = QMessageBox.warning(
+            self, "Re-enable %s" % symbol,
+            "Re-enable the %s peg?" % symbol
+            + chr(10) + chr(10)
+            + "Its par will be honoured again and every pair touching it "
+              "may quote. This is YOUR judgement that the peg is "
+              "trustworthy -- the price recovering is not proof the bridge "
+              "behind it did. Detection re-arms from zero either way.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            self._peg_reenable_cb(asset_id)
+        except Exception as exc:  # noqa: BLE001
+            log.error("peg re-enable failed: %s", exc)
+
     def _load_startup_settings(self) -> None:
         dexie, permuto = load_startup_states()
         self._startup_dexie.setCurrentIndex(
@@ -1366,7 +1445,7 @@ class SettingsWidget(QWidget):
         validate_row.addWidget(self._yaml_load_btn)
 
         self._yaml_status_label = QLabel("")
-        self._yaml_status_label.setStyleSheet(f"font-size: 9pt;")
+        self._yaml_status_label.setStyleSheet("font-size: 9pt;")
         validate_row.addWidget(self._yaml_status_label)
         validate_row.addStretch(1)
         yaml_layout.addLayout(validate_row)
@@ -1833,11 +1912,45 @@ class SettingsWidget(QWidget):
     # -------------------------------------------------------------------
 
     def _build_depeg_aging_tab(self) -> QWidget:
-        """Build the Depeg & Aging tab: global depeg + inventory aging."""
+        """Build the Depeg & Aging tab: global depeg + inventory aging.
+
+        [PEGSUSPEND] Also hosts the live per-asset peg panel: each declared
+        peg's current state, and the re-enable button for a suspended one.
+        The panel polls the metrics service (set via set_peg_services) every
+        few seconds; with no engine connected it says so instead of
+        guessing.
+        """
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(10)
+
+        # -- [PEGSUSPEND] Live peg status + operator re-enable ---------------
+        peg_group = QGroupBox("Pegged Assets (live)")
+        peg_v = QVBoxLayout(peg_group)
+        self._peg_rows_host = QWidget()
+        self._peg_rows_layout = QVBoxLayout(self._peg_rows_host)
+        self._peg_rows_layout.setContentsMargins(0, 0, 0, 0)
+        self._peg_rows_layout.setSpacing(6)
+        self._peg_placeholder = QLabel(
+            "No engine connected -- live peg state appears here while the "
+            "engine runs. A SUSPENDED asset has lost its peg: its declared "
+            "par is ignored, every pair touching it is disabled, and its "
+            "resting offers were cancelled. Re-enabling is your judgement "
+            "call, not the chart's -- detection re-arms from zero, so a "
+            "still-broken peg re-suspends on its own."
+        )
+        self._peg_placeholder.setWordWrap(True)
+        self._peg_placeholder.setStyleSheet(f"color: {_C.TEXT_SECONDARY};")
+        self._peg_rows_layout.addWidget(self._peg_placeholder)
+        peg_v.addWidget(self._peg_rows_host)
+        layout.addWidget(peg_group)
+
+        self._peg_metrics_getter = None
+        self._peg_reenable_cb = None
+        self._peg_timer = QTimer(self)
+        self._peg_timer.setInterval(5000)
+        self._peg_timer.timeout.connect(self._refresh_peg_panel)
 
         # -- Depeg Monitoring --
         depeg_group = QGroupBox("Depeg Monitoring (Global Defaults)")

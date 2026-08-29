@@ -403,6 +403,15 @@ class MainWindow(QMainWindow):
         # construction ordering. Dexie's request is applied in the intent
         # sync instead, where the gates are real.
         QTimer.singleShot(1500, self._apply_permuto_startup_state)
+        # [PEGSUSPEND] Wire the Depeg tab's live peg panel to the metrics
+        # service and the re-enable channel.
+        settings_widget = self._unwrap(self._settings_widget)
+        if settings_widget is not None and hasattr(
+                settings_widget, "set_peg_services"):
+            settings_widget.set_peg_services(
+                bridge.metrics_service.peg_statuses,
+                bridge.reenable_peg,
+            )
         self.db_service = bridge.database_service
 
         # -- Bridge-level signals ------------------------------------------

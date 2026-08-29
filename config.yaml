@@ -449,3 +449,32 @@ warp:
   max_auto_bridge_usdc: 5      # blast radius for the $1 round-trip test
   max_unwrap_usdc: 2           # unwrap cap for the test; raise deliberately later
   min_base_eth: 0.005
+
+# [PEGSUSPEND 2026-08-29] Declared pegs. Par is DECLARED, never assumed --
+# and since v0.10.3, a declared par is also WATCHED: a sustained deviation
+# past bail_pct suspends the par, disables every pair touching the asset,
+# cancels its resting offers, and waits for the operator's re-enable in the
+# GUI's Depeg tab. warp.green was compromised 2026-08-25 and wUSDC.b
+# depegged; enforce:true is safe to declare BECAUSE the suspension exists.
+pegged_assets:
+- asset_id: fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d
+  symbol: wUSDC.b
+  peg_currency: USD
+  peg_target: 1.0
+  warn_pct: 2.0
+  bail_pct: 10.0
+  sustained_observations: 30
+  prefer_market_cross: false
+  enforce: true
+- asset_id: ae1536f56760e471ad85ead45f00d680ff9cca73b8cc3407be778f1c0c606eac
+  symbol: BYC
+  peg_currency: USD
+  peg_target: 1.0
+  warn_pct: 2.0
+  bail_pct: 10.0
+  sustained_observations: 30
+  # A CDP stablecoin: the market decides its dollar value when the book is
+  # tight; the par is the fallback. Measured basis in engine.cpp's BYC
+  # branch (7-day VWAP 1.001 vs p50 spread 1163bps).
+  prefer_market_cross: true
+  enforce: true

@@ -67,6 +67,7 @@
 #include "xop/risk/watchdog.hpp"
 #include "xop/risk/height_source.hpp"
 #include "xop/risk/valuation_authority.hpp"
+#include "xop/risk/peg_suspension.hpp"
 #include "xop/risk/usd_route.hpp"
 #include "xop/risk/inventory.hpp"
 #include "xop/risk/limits.hpp"
@@ -517,6 +518,27 @@ private:
     /// moment it is not.
     std::atomic<bool>         graceful_cancel_active_{false};
     std::atomic<std::int64_t> graceful_cancel_started_ms_{0};
+
+    // -- [PEGSUSPEND] Asset-level peg suspension ---------------------------
+    //
+    // Pair-level depeg detection watches a stable/stable pair's own mid;
+    // it is blind to the case that mattered on 2026-08-25, a WRAPPER
+    // losing its peg while every pair priced IN it looks healthy. Each
+    // declared enforced asset is observed in USD through a route that does
+    // not pass through its own par; a sustained bail latches a suspension
+    // that (a) stops declared_usd_par() honouring the par, (b) gates every
+    // pair touching the asset out of quoting AND the taker paths, and (c)
+    // cancels their resting offers at the transition. The latch clears
+    // only through the operator's re-enable flag file -- a healed chart is
+    // not a healed bridge.
+    std::unordered_map<std::string, risk::PegRuntime> asset_peg_rt_;
+    std::filesystem::path peg_reenable_flag_path_;
+
+    [[nodiscard]] bool asset_peg_suspended(const std::string& asset_id) const;
+    [[nodiscard]] bool pair_peg_suspended(const PairConfig& pc) const;
+    asio::awaitable<void> step_observe_asset_pegs(BlockHeight block_height);
+    void check_peg_reenable_flag();
+    void publish_peg_status();
 
     void start_watchdog();
     void stop_watchdog();
