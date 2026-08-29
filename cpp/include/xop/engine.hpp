@@ -64,7 +64,9 @@
 
 // Risk layer
 #include "xop/risk/drawdown_breaker.hpp"
+#include "xop/risk/height_source.hpp"
 #include "xop/risk/valuation_authority.hpp"
+#include "xop/risk/usd_route.hpp"
 #include "xop/risk/inventory.hpp"
 #include "xop/risk/limits.hpp"
 #include "xop/risk/hedging.hpp"
@@ -408,10 +410,58 @@ private:
     /// Dry-run mode flag.
     bool dry_run_;
 
-    /// True when running without the full node (wallet-only mode).
-    /// Set during open_connections() based on config_.chia.mode and
-    /// full-node reachability (auto-detect).
+    /// True only when the OPERATOR configured wallet-only.
+    ///
+    /// Distinct from `wallet_only_mode_`, which also becomes true when
+    /// `mode: auto` fails to reach the node AT STARTUP. Conflating the two
+    /// made the S28 recovery probe unreachable in exactly the case it was
+    /// written for: a startup node failure set wallet_only_mode_, and the
+    /// probe was guarded on that same flag, so a node that came back later
+    /// was never noticed and the engine stayed on the wallet forever.
+    bool wallet_only_configured_{false};
+
+    /// Polls between full-node recovery probes while on the wallet.
+    ///
+    /// The probe is awaited inline and get_block_height() retries four times
+    /// at up to 30s each, so probing every poll paid ~2 minutes of heartbeat
+    /// latency during an outage to detect a minutes-scale event sooner.
+    static constexpr int kNodeProbeEveryNPolls = 10;
+    ///
+    /// Starts at 0, not at the threshold. Seeding it full made the FIRST
+    /// wallet-sourced poll probe immediately -- so the very heartbeat that
+    /// the fallback exists to deliver, right after six failed node polls,
+    /// still waited through a four-attempt node probe. The node has just
+    /// failed six times; there is nothing to learn by asking again at once.
+    int                  node_probe_skips_{0};
+
+    /// Consecutive full-node polls that answered without advancing.
+    ///
+    /// height_is_usable() accepts height == last_block_, so a frozen node
+    /// resets the failure streak forever and the wallet fallback is never
+    /// reached. A node that says yes and never moves is a dead node.
+    std::uint32_t        node_no_progress_polls_{0};
+
+    /// The RUNTIME latch disabling full-node-dependent behaviour.
+    ///
+    /// [review] No longer only a startup decision. It is set by
+    /// open_connections() from config_.chia.mode and reachability, AND at
+    /// runtime when the height source falls back to the wallet -- and
+    /// cleared again when the node recovers. Anything that must not await a
+    /// dead node (the adaptive-fee path, for one) reads this;
+    /// height_source_ is what drives the source transitions themselves.
     bool wallet_only_mode_{false};
+
+    /// [S28] Which RPC answers "what block is it?", re-decided every poll.
+    ///
+    /// This is the TRANSITION STATE: the streak counters and the hysteresis
+    /// that decide when to fall back and when to return. wallet_only_mode_
+    /// above is its LATCH -- the flag that transition sets and clears, and
+    /// the one that other subsystems read. Neither is a startup decision;
+    /// the earlier wording here said so and was left over from before the
+    /// mid-flight source existed, which is what was missing when the node
+    /// died for 2.5h beside a healthy wallet. Code that relies on the
+    /// obsolete lifetime will be wrong in both directions.
+    risk::HeightSourceState height_source_{};
 
     // -- Pair config lookup ---------------------------------------------------
     // [M11] Declared after config_ so that C++ member initialization order
@@ -459,6 +509,40 @@ private:
     /// now that cost basis is persisted.
     [[nodiscard]] double usd_per_xch() const;
 
+    // -- [PEG 2026-08-26] Peg identity, asked of the registry ---------------
+    //
+    // These three replace fifteen scattered string comparisons against
+    // "wUSDC.b" / "wUSDC" / "USDS" / "BYC".  They key on ASSET ID, not on
+    // the ticker parsed out of a pair name: symbols collide and get reused
+    // (CoinMarketCap serves two coins called XCH, one dead since 2016),
+    // asset ids do not.
+
+    /// True when the pair's quote asset is declared pegged, enforced, and
+    /// does NOT prefer a market cross -- a fiat-collateralised wrapper,
+    /// whose par is a claim on its CONFIGURED peg currency rather than an
+    /// observation.
+    ///
+    /// [review] Not "a claim on a dollar": peg_currency exists precisely so
+    /// a EUR or JPY wrapper can be declared, and this predicate classifies
+    /// those identically. What differs is what the claim is worth HERE --
+    /// declared_usd_par() supplies no FX rate, so a non-USD wrapper
+    /// classifies as a par wrapper and then values as nullopt until an FX
+    /// feed is wired. Callers deciding "can I price this in USD" must ask
+    /// declared_usd_par(), not this.
+    [[nodiscard]] bool is_par_wrapper_quote(const PairConfig& pc) const;
+
+    /// True when the pair's quote asset is declared pegged, enforced, and
+    /// prefers a live cross over its declared par -- a CDP stablecoin,
+    /// whose dollar value the market decides.
+    [[nodiscard]] bool quote_prefers_market_cross(const PairConfig& pc) const;
+
+    /// Declared par of one unit of @p asset_id in USD, or nullopt when it
+    /// is undeclared, unenforced, or pegged to a currency whose USD rate we
+    /// do not have.  Callers must treat nullopt as "no valuation" and never
+    /// substitute 1.0.
+    [[nodiscard]] std::optional<double> declared_usd_par(
+        const AssetId& asset_id) const;
+
     /// USD value of one QUOTE display unit for the pair.  1.0 for
     /// USD-pegged stables (wUSDC/wUSDC.b/USDS) and BYC; cross-derived for
     /// DBX (usd_per_xch / dbx_per_xch); usd_per_xch for XCH-quoted pairs.
@@ -496,6 +580,21 @@ private:
     /// blip), otherwise it requires the supplying snapshot to be grade.
     /// Single classifier for all three consumers: both branches of
     /// asset_usd_pseudo_price and the P&L conversion refresh.
+    /// [PEG round 5] Asset-keyed form of is_par_wrapper_quote, so a cross
+    /// can be tested from EITHER side of a pair.
+    [[nodiscard]] bool is_par_wrapper_asset(const AssetId& asset_id) const;
+
+    /// One eligible market cross for a prefer_market_cross asset: which pair
+    /// supplies it and what a unit is worth in USD.  Both orientations are
+    /// accepted (<target>/<wrapper> and <wrapper>/<target>, the latter
+    /// inverted).  Empty pair_name means no eligible cross, and the caller
+    /// falls back to declared par.
+    struct CrossQuote {
+        std::string pair_name;
+        double      usd_per_unit{0.0};
+    };
+    [[nodiscard]] CrossQuote market_cross_for(const PairConfig& pc) const;
+
     [[nodiscard]] bool quote_usd_factor_trusted(const PairConfig& pc) const;
 
     /// Convert a pair-quote pseudo-price to a USD-normalized pseudo-price.
@@ -513,6 +612,45 @@ private:
     /// quote: factor * kMojosPerXch).  0 when no market data yet.
     /// [S20] The base-of-pair branch only accepts valuation-grade mids.
     [[nodiscard]] Mojo asset_usd_pseudo_price(const AssetId& asset_id) const;
+
+    /// [S32 2026-08-27] Whether the configuration provides ANY route to a
+    /// USD price for this asset -- meaning a route that reaches an ANCHOR,
+    /// not merely membership of an enabled pair.  Three qualify: the asset's
+    /// own declared and still-enforced par; an enabled pair against a quote
+    /// asset that has one; or an enabled pair against XCH while XCH is
+    /// itself anchored (CoinGecko "chia" with a usable freshness threshold,
+    /// or an enabled XCH pair against a par wrapper).  An enabled CAT/CAT
+    /// pair with no XCH leg and no enforced par is NOT a route -- it yields
+    /// 0.0 forever.  This is what distinguishes "we cannot price
+    /// this, ever, as configured" from "the price is unavailable right
+    /// now", and the two must not share a response: the first is written
+    /// off at $0, the second rides its carry.  Deliberately a pure function
+    /// of CONFIGURATION with no market state, so the answer is stable for the
+    /// life of the process and cannot flap with the feed.
+    ///
+    /// [review] NOT "an enabled pair naming the asset" -- that was the
+    /// rejected first implementation and this paragraph outlived its
+    /// deletion above. An enabled pair counts only when its other leg
+    /// reaches an enforced par or an anchored XCH; an enabled CAT/CAT pair
+    /// with neither is a dead end that yields 0.0 forever. Conversely an
+    /// asset's own enforced par is a route with no pair at all.
+    ///
+    /// Callers use this answer to choose between degrading and a permanent
+    /// $0 write-off, and both errors are expensive: a false route degrades
+    /// forever on a condition that cannot resolve, a missing one writes off
+    /// a holding a live feed is quoting.
+    [[nodiscard]] bool asset_has_pricing_path(const AssetId& asset_id) const;
+
+    /// Whether XCH can reach USD at all: the external CoinGecko quote, or an
+    /// enabled XCH pair against a wrapper with a declared, enforced par.
+    /// Asked twice -- for XCH itself, and for every asset whose only route to
+    /// USD runs through XCH, where an unanchored XCH makes the chain 0 * mid.
+    [[nodiscard]] bool xch_has_usd_anchor() const;
+
+    /// Config reduced to what the pure route logic in usd_route.hpp needs.
+    [[nodiscard]] std::vector<risk::RoutePair> enabled_route_pairs() const;
+    [[nodiscard]] risk::ExternalXchFeed        external_xch_feed() const;
+    [[nodiscard]] risk::ParLookups             par_lookups() const;
 
     /// [S20 2026-08-24] Median implied price of `pc` triangulated through
     /// every healthy pair of enabled sibling books (see the definition for
@@ -1048,6 +1186,50 @@ private:
     /// comparing against the frozen peak.  Disarming them would make a
     /// risk control fail open for a condition that can persist hours.
     bool valuation_degraded_{false};
+
+    /// [S27 2026-08-27, tightened by S33] TRUE only when something is held,
+    /// NOTHING was priced live this cycle, AND nothing is being bridged by a
+    /// still-valid carry.
+    ///
+    /// The third clause is not a detail. Without it a single quiet tick on a
+    /// healthy asset -- exactly the transient the carry mechanism exists to
+    /// bridge -- combined with some other asset's standing degradation gave
+    /// (grace, degraded, all_unpriced) = (true, true, true) and latched the
+    /// breaker permanently. The guard meant to tell a data gap from an
+    /// outage was being satisfied by a DIFFERENT asset than the one that had
+    /// gone quiet.
+    ///
+    /// Distinct from valuation_degraded_, which means "at least one", and
+    /// the distinction decides whether the drawdown comparison means
+    /// anything. With one asset still live or still bridged, equity moves
+    /// and the comparison works. With nothing live and nothing bridged,
+    /// equity is a mix of carried fiction and S32 write-offs sitting at the
+    /// value the peak was frozen at, so the drawdown reads 0 forever.
+    bool valuation_all_unpriced_{false};
+
+    /// Whether the last valuation saw ANY held asset.
+    ///
+    /// Distinguishes a zero peak that is honest -- an empty book has nothing
+    /// to protect -- from a zero peak while holding, which leaves the
+    /// drawdown breaker unable to fire at all.
+    bool valuation_holds_anything_{false};
+
+    /// Set when the pre-trading fail-closed latch fires, cleared when Step 13
+    /// has sent the detailed log and the operator alert.
+    ///
+    /// Needed because Step 13's branch is gated on !breaker_pause_active_,
+    /// so latching earlier would otherwise suppress the very report that
+    /// justified moving the latch forward -- and CircuitBreaker alerts are
+    /// event-driven, so a suppressed one is never re-sent.
+    bool unvaluable_report_pending_{false};
+
+    /// [S32 2026-08-27] One-shot log guards. Both conditions re-evaluate
+    /// every heartbeat and would otherwise emit a warn line per asset per
+    /// block; the operator needs to see each one ONCE, loudly. Not cleared
+    /// on recovery -- a written-off asset only becomes priceable again via
+    /// a config change, which means a restart.
+    std::set<AssetId> writeoff_logged_;
+    std::set<AssetId> never_valued_logged_;
 
     /// [S20] Peak-update authority: the clean-streak debounce and the
     /// transition signals that drive the warn-once logging.  Pure logic in

@@ -25,6 +25,7 @@
 #include "xop/execution/fair_value_solver.hpp"
 #include "xop/execution/mid_gate.hpp"
 #include "xop/risk/valuation_authority.hpp"
+#include "xop/risk/usd_route.hpp"
 
 #include "xop/accounting/bridge_ingest.hpp"
 #include "xop/accounting/reward_ingest.hpp"
@@ -1233,10 +1234,242 @@ asio::awaitable<void> Engine::poll_loop_coro()
                 }
             }
 
-            // co_await the block height -- use wallet RPC in wallet-only mode.
-            std::int64_t height = wallet_only_mode_
-                ? co_await wallet_->get_height_info()
-                : co_await full_node_->get_block_height();
+            // [S28] The pause flag is pure filesystem and state -- no RPC --
+            // so it is readable even while the node is unreachable. Read it
+            // HERE, before the height call that may be about to fail, so an
+            // operator who pauses during an outage gets a log line and a GUI
+            // status instead of silence.
+            check_pause_flag();
+
+            // [S28] Height source is decided EVERY poll, not once at startup.
+            // wallet_only_mode_ used to be assigned only in
+            // open_connections(), so `mode: auto` auto-detected once and then
+            // never again: on 2026-08-25 that meant 529 consecutive failures
+            // over ~2.5h against a dead node while the wallet RPC answered
+            // fine the whole time. No height means no heartbeat -- no quote
+            // refresh, no cancel, no breaker evaluation -- with offers resting
+            // on dexie throughout.
+            const bool mode_is_auto = (config_.chia.mode == ChiaMode::Auto);
+            std::int64_t height = -1;
+            bool node_ok = false;
+
+            // [review] Ask height_source_, not wallet_only_mode_. The
+            // latter WAS assigned only in open_connections() and never
+            // cleared, so an auto-mode startup fallback pinned this branch
+            // forever: even after the probe walked the source back to the
+            // node, every poll still took the wallet path and waited on both
+            // RPCs.
+            //
+            // [review] That description is now historical. This PR made
+            // wallet_only_mode_ a RUNTIME latch -- set on fallback below,
+            // cleared on recovery -- so it no longer stays as it was, and
+            // keeping the old rationale obscured the separation this branch
+            // depends on. wallet_only_CONFIGURED is the permanent one and is
+            // what this condition asks; height_source_ drives the
+            // transitions; wallet_only_mode_ tells the REST of the engine
+            // not to await a dead node.
+            if (wallet_only_configured_
+                || height_source_.current == risk::HeightSource::Wallet) {
+                // The wallet call gets its own guard. Unprotected, a wallet
+                // throw unwound the whole poll before the recovery probe
+                // below could run -- so the one failure that makes the
+                // wallet a bad height source was also the one that
+                // guaranteed we never looked for a way off it.
+                std::int64_t wallet_height = -1;
+                try {
+                    wallet_height = co_await wallet_->get_height_info();
+                    height = wallet_height;
+                } catch (const std::exception& ex) {
+                    spdlog::warn("[Engine] [S28] wallet height failed: {} -- "
+                                 "still probing the node for recovery",
+                                 ex.what());
+                }
+                // A wallet poll is evidence about the WALLET, not the node.
+                // Probe the node separately so a recovery can be noticed --
+                // otherwise the fallback would be permanent.
+                //
+                // Guarded on wallet_only_CONFIGURED, not wallet_only_mode_:
+                // an auto-mode startup failure sets the latter, and guarding
+                // on it disabled recovery precisely when recovery mattered.
+                // [review] THROTTLED. get_block_height() retries four
+                // times at up to 30s each plus backoff, and this is awaited
+                // inline -- so during an outage every poll paused roughly two
+                // minutes before the wallet height it had ALREADY fetched
+                // could reach the heartbeat. The probe exists to notice a
+                // recovery, which is a minutes-scale event; paying two
+                // minutes of heartbeat latency every poll to detect it sooner
+                // is the wrong trade, and it delays the cancels and breaker
+                // evaluations the heartbeat carries.
+                const bool probe_due =
+                    (++node_probe_skips_ >= kNodeProbeEveryNPolls);
+                if (!wallet_only_configured_ && mode_is_auto && probe_due) {
+                    node_probe_skips_ = 0;
+                    try {
+                        // A startup fallback closed the node client, so
+                        // re-open before probing. open() is idempotent but
+                        // tears down a live session, hence the is_open test.
+                        if (!full_node_->is_open()) {
+                            co_await full_node_->open();
+                        }
+                        const std::int64_t probe =
+                            co_await full_node_->get_block_height();
+                        // Answering is not the same as being usable. A node
+                        // resyncing from genesis answers every poll with a
+                        // height far BELOW the wallet's; counting those as
+                        // successes walked the source back onto it, after
+                        // which height_is_usable rejected every reading as
+                        // backwards and the engine stopped seeing blocks at
+                        // all. Require the node to be at least level with
+                        // both the wallet and the last height we acted on.
+                        // [review] Compare against the wallet only when
+                        // the wallet's own reading is usable. A wallet value
+                        // above UINT32_MAX makes every real node tip compare
+                        // lower, so a healthy node could never accumulate
+                        // recovery successes and would be locked out
+                        // permanently by a number that is itself rejected
+                        // downstream.
+                        const bool wallet_usable = risk::height_is_usable(
+                            wallet_height,
+                            last_block_.load(std::memory_order_relaxed));
+                        node_ok = (probe >= 0)
+                               && (!wallet_usable || probe >= wallet_height)
+                               && risk::height_is_usable(
+                                      probe,
+                                      last_block_.load(
+                                          std::memory_order_relaxed));
+                        // [review round 11] The probe's height, not a max
+                        // with a possibly-malformed wallet value. When the
+                        // wallet reading is unusable, node_ok can still be
+                        // true (that is what !wallet_usable exists for) --
+                        // and max() then kept the malformed wallet value,
+                        // which the usability gate below rejected, dropping
+                        // the heartbeat on every recovery probe despite a
+                        // perfectly good node answer in hand.
+                        if (node_ok) {
+                            height = wallet_usable ? std::max(height, probe)
+                                                   : probe;
+                        }
+                        else if (probe >= 0) {
+                            spdlog::debug("[Engine] [S28] node answered {} but "
+                                          "is behind wallet {} -- not counting "
+                                          "it as recovered", probe,
+                                          wallet_height);
+                        }
+                    } catch (const std::exception&) {
+                        node_ok = false;
+                    }
+                    const auto before = height_source_.current;
+                    if (next_height_source(height_source_, node_ok,
+                                           mode_is_auto)
+                            != before) {
+                        // Clear the runtime fallback too, so the rest of the
+                        // engine stops behaving as though there were no node.
+                        wallet_only_mode_ = false;
+                        // [review] Clear the no-progress streak too. It is
+                        // what sent us to the wallet in the first place, and
+                        // leaving it above the threshold meant the FIRST
+                        // ordinary same-height poll on the recovered source
+                        // counted as a failure immediately.
+                        node_no_progress_polls_ = 0;
+                        spdlog::warn("[Engine] [S28] full node is answering "
+                                     "again -- block height back on the node");
+                    }
+                }
+            } else {
+                try {
+                    height = co_await full_node_->get_block_height();
+                    // [review] USABLE, not merely non-negative. A stale or
+                    // malformed node answers every poll with a height that
+                    // is rejected below -- but counting it as a success
+                    // resets the failure counter, so the run of six that
+                    // triggers the wallet fallback can never accumulate.
+                    // The engine then stops seeing blocks indefinitely
+                    // beside a healthy wallet, which is the outage S28
+                    // exists to end.
+                    // [review] USABLE IS NOT THE SAME AS PROGRESSING.
+                    // height_is_usable() deliberately accepts
+                    // height == last_block_, so a node that keeps returning
+                    // the last processed height answers every poll, resets
+                    // the failure streak forever, and the fallback is never
+                    // reached -- while a healthy wallet advances beside it
+                    // and no new-block heartbeat runs. A frozen node is a
+                    // dead node that says yes.
+                    //
+                    // Counted as healthy only while it is not stuck: the
+                    // streak of no-progress polls is bounded the same way
+                    // outright failures are.
+                    const auto seen = last_block_.load(
+                        std::memory_order_relaxed);
+                    const bool usable = risk::height_is_usable(height, seen);
+                    const bool progressing =
+                        usable && static_cast<std::uint64_t>(height) > seen;
+                    if (progressing) {
+                        node_no_progress_polls_ = 0;
+                    } else if (usable) {
+                        ++node_no_progress_polls_;
+                    }
+                    node_ok = usable
+                           && node_no_progress_polls_
+                                  < risk::kNodePollsWithoutProgress;
+                    if (usable && !node_ok) {
+                        // [review] Mode-neutral. This promised "the wallet
+                        // fallback runs", and in an explicitly pinned
+                        // full_node mode next_height_source() cannot run one
+                        // -- so an operator reading it during a frozen-node
+                        // outage was given a recovery expectation the
+                        // configuration forbids.
+                        spdlog::error("[Engine] [S28] the full node has "
+                                      "answered {} times ({}s) without "
+                                      "advancing past block {} -- treating it "
+                                      "as frozen. {}",
+                                      node_no_progress_polls_,
+                                      risk::kNodePollsWithoutProgress * 5,
+                                      seen,
+                                      mode_is_auto
+                                          ? "The wallet fallback will run."
+                                          : "chia.mode is pinned, so NO "
+                                            "wallet fallback will run -- set "
+                                            "mode: auto to allow one.");
+                    }
+                } catch (const std::exception& ex) {
+                    node_ok = false;
+                    spdlog::warn("[Engine] [S28] full node height failed: {}",
+                                 ex.what());
+                }
+                const auto before = height_source_.current;
+                if (next_height_source(height_source_, node_ok, mode_is_auto)
+                        != before) {
+                    // [review] Set the runtime latch too. Without it every
+                    // wallet-driven heartbeat still enters the adaptive-fee
+                    // path and awaits get_fee_estimate() on the dead node,
+                    // retries and all -- stalling the very heartbeat this
+                    // fallback exists to preserve. The recovery path already
+                    // clears it.
+                    wallet_only_mode_ = true;
+                    spdlog::error(
+                        "[Engine] [S28] full node has failed {} consecutive "
+                        "height polls -- falling back to the WALLET RPC for "
+                        "block height so the heartbeat keeps running. The "
+                        "engine is not blind and its offers are still managed.",
+                        risk::kNodeFailuresBeforeWalletFallback);
+                }
+                if (!node_ok) {
+                    // Nothing usable this cycle; the switch (if any) takes
+                    // effect on the next poll.
+                    continue;
+                }
+            }
+
+            if (!risk::height_is_usable(
+                    height, last_block_.load(std::memory_order_relaxed))) {
+                // A wallet tip BEHIND the node's would read as a reorg to
+                // every downstream consumer, so it is skipped rather than
+                // applied. Negative heights are a malfunctioning RPC.
+                spdlog::debug("[Engine] [S28] height {} not usable against "
+                              "last seen {}; skipping this poll",
+                              height, last_block_.load());
+                continue;
+            }
 
             // [MEDIUM-4] Guard against negative block heights returned by a
             // malfunctioning or unreachable full node.  The RPC returns
@@ -1290,6 +1523,11 @@ asio::awaitable<void> Engine::run_startup_analysis()
     const uint32_t target = market_analyzer_->analysis_blocks();
     spdlog::info("[Engine] Starting market analysis phase ({} blocks)", target);
 
+    // The same mode the main poll loop uses. Hoisted once: only `auto` may
+    // move the height source off the node, during this phase as much as any
+    // other.
+    const bool analysis_mode_is_auto = (config_.chia.mode == ChiaMode::Auto);
+
     asio::steady_timer timer(ioc_);
     BlockHeight last_analysis_block{0};
 
@@ -1307,6 +1545,41 @@ asio::awaitable<void> Engine::run_startup_analysis()
     }
     const uint32_t max_total_polls = target * timeout_mult;
     uint32_t total_polls = 0;
+
+    // [review round 9] Analysis-local source state, mirroring the main
+    // loop's rules without sharing its machinery.
+    //
+    // Two holes, both from this loop deciding per-poll with no memory:
+    //  * a rescue used the wallet for ONE poll and forgot -- every later
+    //    poll retried the dead node through its full RPC retry budget
+    //    (~2 minutes each) before consulting the wallet again;
+    //  * a FROZEN node -- answering, never advancing -- never threw, so it
+    //    never reached the rescue at all. total_polls counts only ADVANCES,
+    //    so the timeout never fired either, and the loop spun until the
+    //    dead man's switch cancelled a perfectly healthy book at 600s.
+    //
+    // Local rather than folded into height_source_/wallet_only_mode_,
+    // deliberately: those are synchronised by the main loop's probe cycle,
+    // which does not exist yet, and a half-synchronised handoff is how the
+    // startup-fallback recovery bug happened. Same constants, same rules,
+    // scoped to this phase.
+    // [review round 11] Seeded from the STARTUP fallback. An auto-mode
+    // open_connections() failure sets wallet_only_mode_ and closes the node
+    // client; leaving this false meant that path never probed the node, and
+    // a later wallet failure looped forever because total_polls only counts
+    // successes. Seeding it routes the startup case through the same
+    // probe-and-return machinery as a mid-analysis fallback. Configured
+    // wallet-only stays out entirely -- there is no node to return to and
+    // full_node_ is null.
+    bool analysis_on_wallet = wallet_only_mode_ && !wallet_only_configured_;
+    std::uint32_t analysis_no_progress = 0;
+    int analysis_probe_skips = 0;
+    // [review round 10] Return needs the same hysteresis as the main loop.
+    // A single successful probe used to flip analysis straight back to the
+    // node, so an intermittently answering one made the NEXT poll pay the
+    // full failing retry budget before falling back again -- the flap the
+    // main loop's kNodeSuccessesBeforeReturn exists to damp.
+    std::uint32_t analysis_probe_successes = 0;
 
     while (!stop_requested_.load(std::memory_order_relaxed) &&
            !market_analyzer_->is_complete()) {
@@ -1342,16 +1615,201 @@ asio::awaitable<void> Engine::run_startup_analysis()
 
         // Fetch current block height.
         std::int64_t height{0};
+        std::string  height_error;
+        // [review] An explicit FLAG, not an empty string as a sentinel.
+        //
+        // std::exception::what() may be empty -- the RPC layer constructs
+        // ChiaRPCApplicationError straight from a server "error" field, which
+        // can be an empty string. The catch would then run while
+        // `!height_error.empty()` was false, so auto mode skipped the wallet
+        // rescue AND the failure warning, and the poll fell through to the
+        // `height <= 0` continue with no diagnosis at all. Silence during the
+        // exact outage this phase was taught to survive.
+        bool height_failed = false;
+        // The settled fallback: once a rescue succeeded, ask the wallet
+        // FIRST and probe the node only every kNodeProbeEveryNPolls polls,
+        // exactly as the main loop's recovery does -- rather than paying the
+        // dead node's full retry budget on every poll.
+        const bool ask_wallet_first =
+            wallet_only_configured_ || analysis_on_wallet;
         try {
-            height = wallet_only_mode_
-                ? co_await wallet_->get_height_info()
-                : co_await full_node_->get_block_height();
+            if (ask_wallet_first) {
+                height = co_await wallet_->get_height_info();
+                if (analysis_on_wallet
+                        && ++analysis_probe_skips
+                               >= kNodeProbeEveryNPolls) {
+                    analysis_probe_skips = 0;
+                    try {
+                        // A startup fallback CLOSED this client; reopen
+                        // before the first probe, as the main loop's
+                        // recovery does.
+                        if (full_node_ && !full_node_->is_open()) {
+                            co_await full_node_->open();
+                        }
+                        const auto probe =
+                            co_await full_node_->get_block_height();
+                        // [review round 11] The main loop's acceptance
+                        // rule, against the ANALYSIS-local last height.
+                        // `probe >= height` compared against the wallet
+                        // unconditionally: an out-of-range wallet value
+                        // blocked every real node tip forever, and a stale
+                        // wallet let a node still BEHIND the analysis
+                        // accumulate successes.
+                        const bool wallet_ok = risk::height_is_usable(
+                            height, last_analysis_block);
+                        const bool probe_ok =
+                            risk::height_in_range(probe)
+                            && (!wallet_ok || probe >= height)
+                            && risk::height_is_usable(
+                                   probe, last_analysis_block);
+                        if (probe_ok) {
+                            // This POLL's height comes from the accepted
+                            // probe when the wallet's reading is not
+                            // usable -- max() would keep the malformed
+                            // wallet value and the gate below would drop
+                            // the beat.
+                            height = wallet_ok
+                                ? std::max(height,
+                                           static_cast<std::int64_t>(probe))
+                                : probe;
+                            if (++analysis_probe_successes
+                                    >= risk::kNodeSuccessesBeforeReturn) {
+                                analysis_on_wallet = false;
+                                analysis_no_progress = 0;
+                                analysis_probe_successes = 0;
+                                spdlog::info("[Engine] [S28] Analysis: the "
+                                             "node answered {} consecutive "
+                                             "probes (height {}) -- back to "
+                                             "it",
+                                             risk::kNodeSuccessesBeforeReturn,
+                                             probe);
+                            }
+                        } else {
+                            analysis_probe_successes = 0;
+                        }
+                    } catch (const std::exception&) {
+                        // Still down; stay on the wallet, and a failed probe
+                        // resets the streak -- one flap must not bank
+                        // progress toward a return.
+                        analysis_probe_successes = 0;
+                    }
+                }
+            } else {
+                height = co_await full_node_->get_block_height();
+            }
         } catch (const std::exception& ex) {
-            spdlog::warn("[Engine] Analysis: block height poll failed: {}", ex.what());
-            continue;
+            height_error = ex.what();
+            if (height_error.empty()) height_error = "(no message)";
+            height_failed = true;
+            height = -1;
+        }
+
+        // A node that answers and never advances is as dead as one that
+        // refuses -- and it never throws, so it can never reach the rescue
+        // below on its own. Same bound as the main loop, measured against
+        // 2,418 real intervals (28% exceed a naive 30s guess).
+        //
+        // [review round 11] Two escapes closed. An OUT-OF-RANGE success is
+        // a failure outright, not a streak reset: it used to reset the
+        // counter and then be discarded by the later range gate, so a node
+        // answering garbage forever held analysis without ever triggering
+        // the rescue. And the `last_analysis_block > 0` condition let
+        // height zero escape the count entirely -- a node pinned at zero
+        // from the first poll never advanced and never counted. Every
+        // non-advancing representable height counts now, zero included.
+        if (!height_failed && !ask_wallet_first) {
+            if (!risk::height_in_range(height)) {
+                height_error = "node answered " + std::to_string(height)
+                               + ", outside the representable range";
+                height_failed = true;
+                height = -1;
+            } else if (static_cast<BlockHeight>(height)
+                           <= last_analysis_block) {
+                if (++analysis_no_progress >= risk::kNodePollsWithoutProgress) {
+                    height_error = "node answers but has not advanced past "
+                                   "block " + std::to_string(
+                                       last_analysis_block);
+                    height_failed = true;
+                    height = -1;
+                }
+            } else {
+                analysis_no_progress = 0;
+            }
+        }
+
+        // [S28] The main loop's fallback does not exist yet -- this phase runs
+        // before it. open_connections() covers a node that is already down at
+        // startup, but a node that dies DURING analysis left this loop failing
+        // and `continue`ing forever, so the engine never reached the loop
+        // where the fallback lives. Try the wallet rather than spinning.
+        //
+        // Outside the catch, not inside it: co_await is illegal in a handler.
+        if (height_failed) {
+            bool recovered = false;
+            // [review] The CONFIGURED PIN applies during analysis too.
+            //
+            // This branch gated on !wallet_only_mode_, which is false in
+            // explicit ChiaMode::FullNode -- so a single node error silently
+            // used the wallet in the one mode whose entire meaning is "do
+            // not". height_fallback_allowed() is the predicate the main
+            // poll loop consults for exactly this, and analysis was the only
+            // place that decided for itself.
+            //
+            // The per-poll rescue is kept rather than folded into
+            // height_source_'s hysteresis: analysis runs before the main
+            // loop exists, it is bounded, and a streak counter that has to
+            // reach six before it helps would spend the whole phase failing.
+            // What it must not do is override a pin the operator set.
+            if (!wallet_only_mode_
+                    && risk::height_fallback_allowed(analysis_mode_is_auto)) {
+                try {
+                    height = co_await wallet_->get_height_info();
+                    // Same bound the main poll applies. Accepting any
+                    // positive int64 here and narrowing to BlockHeight below
+                    // would fabricate an analysis height out of a malformed
+                    // value above UINT32_MAX -- the exact wrap the helper
+                    // was added to prevent, reintroduced one function away.
+                    // [review round 11] Against the ANALYSIS-local height.
+                    // last_block_ is stamped by the main cycle, which has
+                    // not run yet, so it is zero here -- validating against
+                    // it accepted a wallet height BEHIND the analysis and
+                    // latched onto a stale source that then never advanced.
+                    recovered = risk::height_is_usable(
+                        height,
+                        static_cast<std::uint32_t>(last_analysis_block));
+                } catch (const std::exception&) {
+                    recovered = false;
+                }
+            }
+            if (!recovered) {
+                spdlog::warn("[Engine] Analysis: block height poll failed: {}",
+                             height_error);
+                continue;
+            }
+
+            // Remember the rescue, so later polls ask the wallet first
+            // instead of re-paying the dead node's retry budget each time.
+            analysis_on_wallet = true;
+            analysis_probe_skips = 0;
+            spdlog::warn("[Engine] [S28] Analysis: node height failed ({}) -- "
+                         "switching to the WALLET; the node is re-probed "
+                         "every {} polls", height_error,
+                         kNodeProbeEveryNPolls);
         }
 
         if (height <= 0) continue;
+        // [S28] The bound applies to EVERY source, not only to the one that
+        // just failed. The fallback above runs the full usability check, but
+        // configured wallet-only mode and an ordinary successful node poll
+        // both arrive at this cast having had no bound applied at all -- and
+        // a value above UINT32_MAX wraps here into a phantom tip that every
+        // later real height then fails to beat, wedging analysis on a number
+        // no chain produced.
+        if (!risk::height_in_range(height)) {
+            spdlog::warn("[Engine] [S28] Analysis: height {} is outside the "
+                         "representable range; ignoring this poll", height);
+            continue;
+        }
         const BlockHeight current_block = static_cast<BlockHeight>(height);
         if (current_block <= last_analysis_block) continue;
         last_analysis_block = current_block;
@@ -1363,7 +1821,22 @@ asio::awaitable<void> Engine::run_startup_analysis()
         if (metrics_->is_running()) {
             SystemHealthSnapshot health;
             health.block_height     = current_block;
-            health.node_synced      = true;   // We just got a block -> node OK.
+            // [review] Not unconditionally true. This block is reached
+            // after the wallet fallback rescues a poll the NODE just failed,
+            // so publishing node_synced here reported the unavailable node
+            // as healthy -- to monitoring and to the GUI -- for as long as
+            // analysis ran. Derive it from which source actually answered.
+            // [review] The node is synced only if the NODE answered. In
+            // explicit wallet-only mode, and after an auto-mode startup
+            // fallback, height_error is empty because the WALLET succeeded --
+            // so this reported a node that is unavailable, or does not
+            // exist, as healthy.
+            // [review round 11] From THIS poll's source. height_error is
+            // empty on a settled wallet-first poll and wallet_only_mode_ is
+            // untouched by the analysis-local fallback, so the old test
+            // reported the node healthy for wallet-sourced blocks through
+            // the whole outage.
+            health.node_synced      = !ask_wallet_first && !height_failed;
             health.wallet_connected = wallet_->is_open();
             metrics_->update_system_health(health);
         }
@@ -1473,6 +1946,25 @@ asio::awaitable<void> Engine::run_startup_analysis()
     }
 
     if (stop_requested_.load(std::memory_order_relaxed)) co_return;
+
+    // [review round 11] HAND THE FALLBACK TO THE MAIN LOOP. The rescue
+    // state was analysis-local by design -- mid-phase, syncing it against a
+    // probe cycle that does not exist yet is how the startup-fallback bug
+    // happened -- but at the PHASE BOUNDARY the handoff is clean, and
+    // without it a node still down when analysis ends made the main loop
+    // start from FullNode with a zero failure streak: six full retrying
+    // node calls, up to ~12 minutes without a heartbeat, to rediscover what
+    // this phase already knew. The main loop's own probe cycle recovers the
+    // node from here exactly as it would from any settled fallback.
+    if (analysis_on_wallet && !wallet_only_configured_) {
+        height_source_.current = risk::HeightSource::Wallet;
+        height_source_.consecutive_node_failures = 0;
+        height_source_.consecutive_node_successes = 0;
+        wallet_only_mode_ = true;
+        spdlog::warn("[Engine] [S28] Analysis ended on the WALLET fallback "
+                     "-- handing that source to the main loop rather than "
+                     "making it rediscover the outage");
+    }
 
     // Log the completed analysis summaries.
     // [S23 2026-08-24] The phase is over however we reached here, so no
@@ -1793,6 +2285,91 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
         }
     }
 
+    // [review] HOISTED OUT of the recovery-mode branch.
+    //
+    // This latch used to sit inside the `else` of `if (xch_recovery_mode_)`,
+    // so it was skipped entirely whenever recovery was active -- while Step 9
+    // arbitrage, which TAKES offers, still runs in that mode. A book that
+    // cannot be valued could therefore be traded against for one cycle before
+    // Step 13 discovered it.
+    //
+    // Hoisting does not stop recovery from restoring XCH: step_xch_recovery
+    // runs above this point, and this only sets breaker_pause_active_, which
+    // gates Steps 7-8 and the taker paths -- not recovery itself.
+    // [S27 review] LATCH BEFORE TRADING, not in Step 13.
+    //
+    // unvaluable_book_must_fail_closed() was only evaluated in
+    // step_check_alerts(), which runs AFTER ladder generation, offer
+    // management, drift correction and arbitrage -- so the first cycle to
+    // discover an unvaluable book could post offers and execute takes before
+    // the flag that is supposed to stop it existed.
+    //
+    // [review round 9] THIS cycle's verdict, not the previous one's.
+    //
+    // Three earlier rounds argued the previous cycle's flags were
+    // sufficient because they are recomputed throughout the grace. The
+    // reviewer's counterexamples break that: a carry exactly at its TTL last
+    // cycle expires at THIS block_height; Step 1 can stale the CoinGecko
+    // cache; Step 2 can change holdings. In each, the stored flags are still
+    // clean here and only Step 13 would discover the truth -- after offer
+    // management and arbitrage have traded on it. A zero-length grace makes
+    // the same window with no edge case at all.
+    //
+    // compute_portfolio_equity_usd() is synchronous, makes no RPC, and its
+    // only mutations -- refreshing an asset's carry price and live block --
+    // are idempotent within a block, so evaluating it twice per cycle (here
+    // and in Step 13, which still owns the operator-facing report with this
+    // cycle's equity figure) is two map walks, not two effects.
+    // The equity figure feeds one thing here besides the flags: seeding the
+    // FIRST peak when the authority gate is fully armed.
+    //
+    // [review round 10] Without this, a legal `drawdown_grace_blocks: 0`
+    // paused every non-empty healthy startup: this latch runs BEFORE Step 13
+    // has ever seeded peak_equity_hwm_usd_, so a clean valuation reached the
+    // zero-peak branch of unvaluable_book_must_fail_closed() -- written for
+    // the post-degradation debounce window, not for a peak that has simply
+    // not been seeded yet -- and latched over nothing. Seeding mirrors Step
+    // 13's monotonic max, gated on the same authority (read-only: the gate
+    // is NOT stepped here, or each cycle would count its clean streak
+    // twice), so a degraded startup still cannot seed and the zero-peak
+    // protection still holds where it was aimed.
+    const double pre_trade_equity =
+        compute_portfolio_equity_usd(block_height);
+    if (pre_trade_equity > 0.0
+            && valuation_authority_.clean_streak()
+                   >= risk::ValuationAuthorityGate::kRearmCleanCycles
+            && !valuation_degraded_) {
+        peak_equity_hwm_usd_ =
+            std::max(peak_equity_hwm_usd_, pre_trade_equity);
+    }
+    if (risk::unvaluable_book_must_fail_closed(
+            // [review round 11] Step 13 DECREMENTS the counter before its
+            // own evaluation, so its boundary is one cycle earlier than a
+            // raw read here. Using == 0 pre-decrement let the cycle whose
+            // decrement reaches zero run drift correction, arbitrage and
+            // offer management first, with Step 13 declaring the book
+            // unvaluable only after they had traded -- the first-cycle gap
+            // again, one cycle wide, through counter phasing rather than
+            // stale flags. <= 1 is the same post-decrement boundary Step 13
+            // applies.
+            drawdown_grace_remaining_ <= 1,
+            valuation_degraded_,
+            valuation_all_unpriced_,
+            peak_equity_hwm_usd_,
+            valuation_holds_anything_)
+        && !breaker_pause_active_) {
+        breaker_pause_active_ = true;
+        // [review] Step 13's branch is gated on !breaker_pause_active_, so
+        // latching here silently SUPPRESSED the detailed log and the
+        // operator alert -- the exact report the comment promised. Record
+        // that the report is still owed; Step 13 clears it once sent.
+        unvaluable_report_pending_ = true;
+        state_->set_status(BotStatus::Paused);
+        spdlog::error("[Engine] [S27] the book cannot be valued and the "
+                      "grace has elapsed -- pausing BEFORE this cycle trades. "
+                      "Step 13 reports the detail.");
+    }
+
     // -- Dynamic market allocator: re-score pairs periodically. ------------
     // Must run before Step 7 (ladder generation) so that allocation fractions
     // are up-to-date when capital is distributed across pairs.
@@ -1831,6 +2408,7 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
             // Keep previous cached value; do not zero out.
         }
     }
+
 
     try { step_generate_ladder(block_height); }
     catch (const std::exception& e) {
@@ -11275,14 +11853,103 @@ void Engine::step_run_hedging([[maybe_unused]] BlockHeight block_height)
 // DBX cross-derived, XCH from a live stable-quoted mid.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// [PEG 2026-08-26] Peg identity helpers -- see engine.hpp for why these
+// exist and why they key on asset id rather than on a parsed ticker.
+// ---------------------------------------------------------------------------
+bool Engine::is_par_wrapper_asset(const AssetId& asset_id) const
+{
+    const auto* a = config_.pegged_assets.find(asset_id);
+    return a != nullptr && a->enforce && !a->prefer_market_cross;
+}
+
+bool Engine::is_par_wrapper_quote(const PairConfig& pc) const
+{
+    return is_par_wrapper_asset(pc.quote_asset_id);
+}
+
+bool Engine::quote_prefers_market_cross(const PairConfig& pc) const
+{
+    const auto* a = config_.pegged_assets.find(pc.quote_asset_id);
+    return a != nullptr && a->enforce && a->prefer_market_cross;
+}
+
+std::optional<double> Engine::declared_usd_par(const AssetId& asset_id) const
+{
+    // No FX rate is supplied here, so a non-USD peg yields nullopt rather
+    // than a silent 1:1 substitution.  Wiring a live FX feed is the
+    // follow-up that makes EUR/JPY pegs usable; until then, declaring one
+    // produces "no valuation" and the caller falls through exactly as it
+    // does for a missing mid.
+    return config_.pegged_assets.usd_par_value(asset_id);
+}
+
 double Engine::usd_per_xch() const
 {
+    // [S27 2026-08-27] EXTERNAL FEED FIRST.
+    //
+    // This used to derive XCH's dollar price solely from an enabled
+    // XCH/<par wrapper> pair.  That has the anchor backwards: XCH has a
+    // real, liquid, externally quoted USD price, and deriving it through a
+    // bridged stablecoin on a thin Chia book adds the wrapper issuer's risk
+    // to a number that never needed it.
+    //
+    // It also failed outright.  Only wUSDC.b / wUSDC / USDS qualified --
+    // BYC never did -- so when the wUSDC.b pairs were disabled on
+    // 2026-08-25 this returned 0, every asset priced at $0, equity became
+    // exactly $0, and equity_drawdown_frac returns 0.0 on a non-positive
+    // peak.  Both circuit breakers went INERT rather than tripping: the
+    // engine would have traded with no drawdown protection at all.
+    //
+    // The DEX-derived mid stays as the FALLBACK rather than being dropped.
+    // The note in the loop below is right that a CoinGecko outage must not
+    // zero every USD figure in the bot, so this prefers the external feed
+    // and falls back rather than failing.
+    // FRESHNESS IS NOT OPTIONAL HERE.  Step 1 deliberately RETAINS the old
+    // price map when a fetch fails and does not advance
+    // coingecko_last_fetch_, so reading the cache without an age check gives
+    // a stale value permanent priority and makes the DEX fallback below
+    // unreachable.  Worse: because the stale value is positive,
+    // asset_usd_pseudo_price keeps refreshing last_asset_live_block_ every
+    // heartbeat, so the carry never expires and a frozen feed reads as
+    // permanently healthy.  Reuse the existing revival gate, whose
+    // documentation already argues exactly this -- "a frozen feed would
+    // quote forever" -- and which treats a non-positive or non-finite
+    // threshold as stale rather than as "always fresh".
+    if (coingecko_feed_fresh_for_revival(
+            !coingecko_prices_.empty(),
+            coingecko_last_fetch_,
+            std::chrono::steady_clock::now(),
+            config_.market_data.cex_freshness_threshold_sec)) {
+        auto it = coingecko_prices_.find("chia");
+        if (it != coingecko_prices_.end() && std::isfinite(it->second)
+            && it->second > 0.0) {
+            return it->second;
+        }
+    }
+
     for (const auto& pair : config_.pairs) {
         if (!pair.enabled || pair.base_asset_id != "xch") continue;
-        const auto slash = pair.name.find('/');
-        if (slash == std::string::npos) continue;
-        const std::string quote = pair.name.substr(slash + 1);
-        if (quote == "wUSDC.b" || quote == "wUSDC" || quote == "USDS") {
+        // [review] No slash check. It is vestigial -- from when this matched
+        // on the display NAME -- and the lookup below is entirely by
+        // canonical asset id. parse_pairs() accepts names without a slash
+        // (only revive_market imposes one), so a legal XCH/<par>
+        // configuration whose name happens to lack one was skipped here as
+        // an anchor while validate_usd_anchor() -- which never looks at the
+        // name -- reported the config anchored, and the route predicate
+        // reported every XCH-routed holding priceable. Startup said fine and
+        // the runtime returned 0, which resolves as permanent degradation.
+        // The two must agree, and the asset-id lookup is the one that is
+        // right.
+        //
+        // Fixed independently on both branches, since neither contained the
+        // other; this is the merge of the two comments.
+        // [PEG 2026-08-26] Was a hardcoded symbol list.  Now asks the
+        // registry, keyed on ASSET ID rather than the ticker parsed out of
+        // the pair name -- symbols collide and get reused, asset ids do
+        // not.  A wrapper is one that does NOT prefer a market cross: its
+        // par is a claim on a dollar, not an observation.
+        if (is_par_wrapper_quote(pair)) {
             auto snap = state_->get_market(pair.name);
             // [S20 2026-08-24] NOT gated on mid_valuation_grade.  Grade
             // requires a fresh two-sided FILTERED book or a fresh CEX leg,
@@ -11294,9 +11961,20 @@ double Engine::usd_per_xch() const
             // breaker's own anchor.  The published mid is already gated
             // against an independent anchor before it reaches State, which
             // is where junk is meant to be stopped.
-            if (snap.mid_price > 0) {
-                return static_cast<double>(snap.mid_price)
-                     / static_cast<double>(kMojosPerXch);
+            // [PEG 2026-08-27] Multiply by the quote's DECLARED par rather
+            // than assuming one unit is one dollar.  The mid here is
+            // denominated in the quote asset, so for a EUR-pegged wrapper
+            // -- or any non-unit target -- returning it raw would silently
+            // report EUR as USD.  An unavailable par (no FX rate, or the
+            // peg no longer enforced) means this pair cannot anchor XCH;
+            // continue to the next candidate rather than guessing.
+            const auto par = declared_usd_par(pair.quote_asset_id);
+            if (par) {
+                if (auto usd = usd_per_base_from_mid(
+                        static_cast<double>(snap.mid_price),
+                        static_cast<double>(kMojosPerXch), *par)) {
+                    return *usd;
+                }
             }
         }
     }
@@ -11322,26 +12000,40 @@ double Engine::usd_per_xch() const
 // one snapshot's grade while consuming another snapshot's price -- passing
 // an ungraded factor or rejecting a graded one.  Both callers below derive
 // from this single answer so they cannot drift apart.
-std::string Engine::byc_cross_source_pair(const PairConfig& pc) const
+Engine::CrossQuote Engine::market_cross_for(const PairConfig& pc) const
 {
+    // [review round 2, 115-3] The DECISION lives in peg_registry.hpp so it
+    // can be tested without constructing an Engine -- which builds every
+    // subsystem, which is why nothing tested this and why the orientation
+    // and declared-par fixes could have regressed with the suite green.
+    // What is left here is the adapter: read config and snapshots, convert
+    // mids to display units, hand over.
     constexpr double kMaxCrossSpreadBps = 300.0;
+
+    std::vector<CrossCandidate> candidates;
+    candidates.reserve(config_.pairs.size());
     for (const auto& other : config_.pairs) {
         if (!other.enabled) continue;
-        if (other.base_asset_id != pc.quote_asset_id) continue;
-        const auto oslash = other.name.find('/');
-        if (oslash == std::string::npos) continue;
-        const std::string oquote = other.name.substr(oslash + 1);
-        if (oquote != "wUSDC.b" && oquote != "wUSDC" && oquote != "USDS") {
-            continue;
-        }
         auto snap = state_->get_market(other.name);
-        if (snap.mid_price > 0
-            && snap.spread_bps > 0.0
-            && snap.spread_bps <= kMaxCrossSpreadBps) {
-            return other.name;
-        }
+        candidates.push_back(CrossCandidate{
+            other.base_asset_id,
+            other.quote_asset_id,
+            other.name,
+            static_cast<double>(snap.mid_price)
+                / static_cast<double>(kMojosPerXch),
+            snap.spread_bps,
+        });
     }
-    return {};
+
+    const auto sel = select_market_cross(
+        pc.quote_asset_id, candidates, config_.pegged_assets,
+        kMaxCrossSpreadBps);
+    return CrossQuote{sel.pair_name, sel.usd_per_unit};
+}
+
+std::string Engine::byc_cross_source_pair(const PairConfig& pc) const
+{
+    return market_cross_for(pc).pair_name;
 }
 
 // [S20 2026-08-24] Which pair's published snapshot quote_usd_factor()
@@ -11350,13 +12042,27 @@ std::string Engine::byc_cross_source_pair(const PairConfig& pc) const
 // factor needs no snapshot (par) or none is available.
 std::string Engine::quote_usd_factor_source_pair(const PairConfig& pc) const
 {
-    const auto slash = pc.name.find('/');
-    const std::string quote = (slash == std::string::npos)
-        ? std::string{}
-        : pc.name.substr(slash + 1);
-
-    if (quote == "BYC") {
+    if (quote_prefers_market_cross(pc)) {
         return byc_cross_source_pair(pc);
+    }
+    // [review] The PAR case answers "no source", ahead of the XCH-base rule.
+    //
+    // This is what the contract above already promised -- "Empty when the
+    // factor needs no snapshot (par)" -- and the code did not do it, because
+    // an XCH/<par wrapper> pair matched the generic base_asset_id == "xch"
+    // rule first and named itself as its own market source. quote_usd_factor()
+    // answers such a pair from declared_usd_par(): a constant, read from no
+    // market at all.
+    //
+    // The consequence was a silent data loss rather than a wrong number.
+    // Disable such a pair -- an ordinary thing to do while triaging a market
+    // -- and step_update_pnl() sees the factor sourced from a pair that is
+    // itself disabled, marks it untrusted, and on a fresh process (where the
+    // in-memory carry map starts empty) registers 0 for it. That pair's
+    // historical USD P&L disappears, and the drawdown breaker reads the
+    // result.
+    if (is_par_wrapper_quote(pc)) {
+        return {};
     }
     if (pc.base_asset_id == "xch") {
         return pc.name;   // DBX-style: derived from this pair's own mid
@@ -11393,15 +12099,10 @@ bool Engine::quote_usd_factor_trusted(const PairConfig& pc) const
 
 bool Engine::quote_usd_factor_is_par(const PairConfig& pc) const
 {
-    const auto slash = pc.name.find('/');
-    const std::string quote = (slash == std::string::npos)
-        ? std::string{}
-        : pc.name.substr(slash + 1);
-
-    if (quote == "wUSDC.b" || quote == "wUSDC" || quote == "USDS") {
+    if (is_par_wrapper_quote(pc)) {
         return true;
     }
-    if (quote == "BYC") {
+    if (quote_prefers_market_cross(pc)) {
         // Par exactly when no eligible cross exists -- the same question
         // byc_cross_source_pair answers, so the two cannot disagree about
         // which snapshot (if any) supplies the factor.
@@ -11412,15 +12113,25 @@ bool Engine::quote_usd_factor_is_par(const PairConfig& pc) const
 
 double Engine::quote_usd_factor(const PairConfig& pc) const
 {
-    const auto slash = pc.name.find('/');
-    const std::string quote = (slash == std::string::npos)
-        ? std::string{}
-        : pc.name.substr(slash + 1);
-
     // Fiat-collateralised wrappers hold their peg tightly enough to treat
     // as exactly $1 for accounting (matches the GUI's pnl_usdc_expr).
-    if (quote == "wUSDC.b" || quote == "wUSDC" || quote == "USDS") {
-        return 1.0;
+    // [PEG 2026-08-26] The 1.0 is no longer written here.  It comes from
+    // whatever the operator declared for this asset, and an asset whose peg
+    // is no longer enforced yields nothing at all.
+    //
+    // [review] A NON-USD peg also yields nothing, today. The earlier wording
+    // here said a EUR-pegged wrapper "yields its EURUSD value", which
+    // declared_usd_par() cannot do -- it supplies no FX rate, so such an
+    // asset returns nullopt and this branch returns 0.0. Wiring a live FX
+    // feed is the follow-up that makes EUR/JPY pegs usable; until then a
+    // declared non-USD peg produces "no valuation", exactly as a missing mid
+    // does. Documenting the intended behaviour as the current one is how a
+    // reader concludes the feature exists.
+    if (is_par_wrapper_quote(pc)) {
+        if (auto par = declared_usd_par(pc.quote_asset_id)) {
+            return *par;
+        }
+        return 0.0;
     }
 
     // BYC is a Chia-native CDP stablecoin.  This branch used to prefer the
@@ -11440,30 +12151,24 @@ double Engine::quote_usd_factor(const PairConfig& pc) const
     // (midpoint worst-case error ~150 bps, comparable to the peg's), and
     // fall back to par otherwise.  spread_bps is 0 for one-sided or crossed
     // books, which also (correctly) selects par.
-    if (quote == "BYC") {
-        constexpr double kMaxCrossSpreadBps = 300.0;
-        for (const auto& other : config_.pairs) {
-            if (!other.enabled) continue;
-            if (other.base_asset_id != pc.quote_asset_id) continue;
-            const auto oslash = other.name.find('/');
-            if (oslash == std::string::npos) continue;
-            const std::string oquote = other.name.substr(oslash + 1);
-            if (oquote != "wUSDC.b" && oquote != "wUSDC" && oquote != "USDS") {
-                continue;
-            }
-            auto snap = state_->get_market(other.name);
-            // [S20] The S17 tight-spread test already establishes a live
-            // two-sided book here, which is the same evidence grade would
-            // ask for; adding grade would only fold in the CEX-availability
-            // dependency described at usd_per_xch.
-            if (snap.mid_price > 0
-                && snap.spread_bps > 0.0
-                && snap.spread_bps <= kMaxCrossSpreadBps) {
-                return static_cast<double>(snap.mid_price)
-                     / static_cast<double>(kMojosPerXch);
-            }
+    if (quote_prefers_market_cross(pc)) {
+        // Same resolver byc_cross_source_pair() projects, so the snapshot
+        // whose grade is checked is always the snapshot whose price is
+        // consumed -- the inconsistency class S20 was burned by.
+        const auto cross = market_cross_for(pc);
+        if (!cross.pair_name.empty()) {
+            return cross.usd_per_unit;
         }
-        return 1.0;
+        // [PEG 2026-08-26] No eligible cross, so fall back to the DECLARED
+        // par rather than a 1.0 written here.  This is the line that kept
+        // marking BYC at a dollar after its issuer announced the protocol
+        // would be sunset: with the value hardcoded there was nothing an
+        // operator could turn off.  Now clearing `enforce` in config stops
+        // it, and an undeclared asset yields no valuation at all.
+        if (auto par = declared_usd_par(pc.quote_asset_id)) {
+            return *par;
+        }
+        return 0.0;
     }
 
     if (pc.quote_asset_id == "xch") {
@@ -11496,8 +12201,16 @@ Mojo Engine::to_usd_pseudo(Mojo pair_price, const PairConfig& pc) const
     if (pair_price <= 0) return 0;
     const double f = quote_usd_factor(pc);
     if (f <= 0.0) return 0;
-    return static_cast<Mojo>(std::llround(
-        static_cast<double>(pair_price) * f));
+    // Checked, not cast. The product is a 1e12-scaled rate times a factor,
+    // and neither operand alone tells you whether it lands inside Mojo --
+    // bounding the declaration was not enough. 0 is the established "no USD
+    // valuation" answer here, and every caller already handles it.
+    if (const auto m = to_mojo_checked(static_cast<double>(pair_price) * f)) {
+        return *m;
+    }
+    spdlog::warn("[Engine] to_usd_pseudo({}) overflowed for {} at factor {}; "
+                 "reporting no valuation", pair_price, pc.name, f);
+    return 0;
 }
 
 Mojo Engine::from_usd_pseudo(Mojo usd_price, const PairConfig& pc) const
@@ -11505,8 +12218,14 @@ Mojo Engine::from_usd_pseudo(Mojo usd_price, const PairConfig& pc) const
     if (usd_price <= 0) return 0;
     const double f = quote_usd_factor(pc);
     if (f <= 0.0) return 0;
-    return static_cast<Mojo>(std::llround(
-        static_cast<double>(usd_price) / f));
+    // Division has the mirror problem: an arbitrarily SMALL positive factor
+    // passes coherence and produces an enormous quotient.
+    if (const auto m = to_mojo_checked(static_cast<double>(usd_price) / f)) {
+        return *m;
+    }
+    spdlog::warn("[Engine] from_usd_pseudo({}) overflowed for {} at factor "
+                 "{}; reporting no valuation", usd_price, pc.name, f);
+    return 0;
 }
 
 // [S20 2026-08-24] Triangulated implied cross for the published-mid gate.
@@ -11579,8 +12298,143 @@ double Engine::compute_implied_cross_anchor(const PairConfig& pc) const
     return midgate::median_of(candidates);
 }
 
+bool Engine::asset_has_pricing_path(const AssetId& asset_id) const
+{
+    // Mirrors exactly the two loops in asset_usd_pseudo_price below: an
+    // asset is priceable as the BASE of an enabled pair or as its QUOTE.
+    // If neither loop can even reach a candidate, no market event will ever
+    // produce a price and the asset is unpriceable BY CONFIGURATION.
+    //
+    // Deliberately ignores whether the pair currently HAS a usable mid, a
+    // trusted factor, or a valuation grade.  Those are transient and belong
+    // to the carry mechanism; folding them in here would let a junk book
+    // masquerade as "no path" and write a live asset off to zero.
+    // XCH is configured with an EXTERNAL route that no pair mediates, so
+    // judging it by pairs alone declares the one asset with an independent
+    // anchor unpriceable the moment its markets are switched off.  Whether
+    // the feed is fresh RIGHT NOW is a runtime availability question and
+    // belongs to the carry mechanism, exactly like a quiet book -- what
+    // matters here is that a route exists at all.
+    // [review] Pair membership is NOT proof of a USD route. An enabled
+    // CAT_A/CAT_B pair where neither leg is XCH and CAT_B has no enforced
+    // par gives quote_usd_factor() nothing to work with -- it returns 0.0
+    // for every tick, forever. Counting that as "has a path" is not a safe
+    // over-approximation: it withholds the write-off, so the asset degrades
+    // instead, and because the cause is CONFIGURATION rather than a feed
+    // outage the degradation never lifts. The engine would sit permanently
+    // paused on a state that will not resolve, which is precisely what the
+    // write-off exists to avoid. So follow the route to an anchor.
+    return risk::asset_is_routable_to_usd(
+        asset_id, external_xch_feed(), enabled_route_pairs(), par_lookups());
+}
+
+/// Does XCH have any USD anchor at all?
+///
+/// Split out because it is asked twice: once for XCH itself, and once for
+/// every asset that can only reach USD by going through XCH. Mirrors what
+/// usd_per_xch() will actually accept -- the external CoinGecko quote, or an
+/// enabled XCH pair against a wrapper with a declared, enforced par.
+bool Engine::xch_has_usd_anchor() const
+{
+    return risk::xch_is_anchored(external_xch_feed(), enabled_route_pairs(),
+                                 par_lookups());
+}
+
+/// The two config shapes the pure route logic needs, gathered in one place.
+std::vector<risk::RoutePair> Engine::enabled_route_pairs() const
+{
+    std::vector<risk::RoutePair> out;
+    out.reserve(config_.pairs.size());
+    for (const auto& pair : config_.pairs) {
+        if (!pair.enabled) continue;
+        out.push_back({pair.base_asset_id, pair.quote_asset_id});
+    }
+    return out;
+}
+
+risk::ParLookups Engine::par_lookups() const
+{
+    return risk::ParLookups{
+        [this](const std::string& id) {
+            return declared_usd_par(id).has_value();
+        },
+        // Narrower on purpose -- mirrors what usd_per_xch() will accept.
+        [this](const std::string& id) {
+            return is_par_wrapper_asset(id) && declared_usd_par(id).has_value();
+        },
+    };
+}
+
+risk::ExternalXchFeed Engine::external_xch_feed() const
+{
+    risk::ExternalXchFeed feed;
+    feed.enabled = config_.coingecko.enabled;
+    const auto& ids = config_.coingecko.coin_ids;
+    feed.quotes_chia =
+        std::find(ids.begin(), ids.end(), "chia") != ids.end();
+    feed.freshness_threshold_sec =
+        config_.market_data.cex_freshness_threshold_sec;
+    return feed;
+}
+
 Mojo Engine::asset_usd_pseudo_price(const AssetId& asset_id) const
 {
+    // [S27 follow-up] XCH HAS ITS OWN ANCHOR, INDEPENDENT OF EVERY PAIR.
+    //
+    // usd_per_xch() prefers a freshness-gated external CoinGecko price
+    // precisely so a disabled or compromised quote-asset market cannot zero
+    // the book -- but this function only ever reached that logic while
+    // ITERATING AN ENABLED PAIR.  So with every XCH pair disabled (exactly
+    // what an operator did on 2026-08-25) XCH priced at $0 despite a
+    // perfectly good external quote, and S32 then wrote it off as
+    // structurally unpriceable.  The S27 incident, arriving back through the
+    // fix for it.  Ask the anchor first.
+    if (asset_id == "xch") {
+        // THE EXTERNAL QUOTE ONLY -- not usd_per_xch().
+        //
+        // usd_per_xch() falls back to an ungraded DEX mid when the feed is
+        // stale, and returning that here would bypass the
+        // mid_valuation_grade check in the base-pair loop below: a
+        // last-trade-only wrapper book could then refresh XCH's live-price
+        // timestamp forever, so the carry TTL never fires and a junk print
+        // marks equity. That is the S20 contract (types.hpp), and the fast
+        // path added for S27 quietly stepped around it.
+        //
+        // The fast path exists only so a live EXTERNAL price is not hidden
+        // behind disabled pairs. The DEX fallback still happens -- through
+        // the graded loop below, where it belongs.
+        if (coingecko_feed_fresh_for_revival(
+                !coingecko_prices_.empty(), coingecko_last_fetch_,
+                std::chrono::steady_clock::now(),
+                config_.market_data.cex_freshness_threshold_sec)) {
+            auto it = coingecko_prices_.find("chia");
+            if (it != coingecko_prices_.end() && std::isfinite(it->second)
+                && it->second > 0.0) {
+                // [review] to_mojo_checked(), like the two loops below.
+                //
+                // This fast path did the multiply and llround raw. The
+                // CoinGecko client accepts any JSON double with no upper
+                // bound, so a finite positive quote above ~9.22e6 makes
+                // price * 1e12 exceed int64_t -- and llround on an
+                // out-of-range double has an unspecified result with
+                // FE_INVALID raised, which on x86-64 is INT64_MIN. XCH would
+                // then have priced NEGATIVE, from a `return` that skips the
+                // graded DEX loops entirely.
+                //
+                // Falling THROUGH on a rejected value rather than returning
+                // 0 matters: a price we cannot represent is not a price we
+                // do not have, and the DEX path below can still answer.
+                if (const auto m = to_mojo_checked(
+                        it->second * static_cast<double>(kMojosPerXch))) {
+                    return *m;
+                }
+                spdlog::warn("[Engine] [S27] CoinGecko XCH price {} is "
+                             "outside the representable Mojo range; falling "
+                             "back to the DEX path", it->second);
+            }
+        }
+    }
+
     // Prefer pricing the asset as the BASE of an enabled pair (live mid).
     //
     // [S20 2026-08-24] Valuation-grade mids only.  This branch was the main
@@ -11604,8 +12458,21 @@ Mojo Engine::asset_usd_pseudo_price(const AssetId& asset_id) const
         }
         const double f = quote_usd_factor(pair);
         if (snap.mid_price > 0 && snap.mid_valuation_grade && f > 0.0) {
-            return static_cast<Mojo>(std::llround(
-                static_cast<double>(snap.mid_price) * f));
+            // [sweep] Checked, like the quote branch below. This one was
+            // missed when the guard went in, and it is the branch the
+            // overflow actually reaches: mid_price is 1e12-scaled, so a
+            // 20-unit mid against the maximum declarable par is 2e19 -- the
+            // exact product test_peg_registry.cpp asserts to be out of range.
+            // `continue` rather than 0, because another enabled pair may
+            // still price this asset as base.
+            if (const auto m = to_mojo_checked(
+                    static_cast<double>(snap.mid_price) * f)) {
+                return *m;
+            }
+            spdlog::warn("[Engine] asset_usd_pseudo_price({}) overflowed via "
+                         "{} at factor {}; trying the next pair",
+                         asset_id.substr(0, 12), pair.name, f);
+            continue;
         }
     }
     // Otherwise price it as the QUOTE of an enabled pair (per-unit value).
@@ -11631,9 +12498,29 @@ Mojo Engine::asset_usd_pseudo_price(const AssetId& asset_id) const
         }
         const double f = quote_usd_factor(pair);
         if (f > 0.0) {
-            return static_cast<Mojo>(std::llround(
-                f * static_cast<double>(kMojosPerXch)));
+            if (const auto m = to_mojo_checked(
+                    f * static_cast<double>(kMojosPerXch))) {
+                return *m;
+            }
+            continue;
         }
+    }
+
+    // [review] OWN DECLARED PAR, last.
+    //
+    // usd_route.hpp advertises "the asset's own enforced par" as a route,
+    // and until now no runtime path delivered it: an asset holding an
+    // enforced par whose pairs were all disabled produced no pseudo-price,
+    // was classified as routable, and therefore degraded forever instead of
+    // taking the structural write-off -- pausing the engine on every start,
+    // which is the condition S32 exists to prevent.
+    //
+    // Placed AFTER both market loops on purpose. A prefer_market_cross asset
+    // must still be valued through its market when one is available; this is
+    // the fallback for when none is, not a shortcut past them.
+    if (const auto par = declared_usd_par(asset_id)) {
+        return static_cast<Mojo>(std::llround(
+            *par * static_cast<double>(kMojosPerXch)));
     }
     return 0;
 }
@@ -11663,8 +12550,18 @@ double Engine::compute_portfolio_equity_usd(BlockHeight current_block)
     bool degraded = false;
 
     std::vector<risk::AssetValuationInput> inputs;
+    std::size_t held_count = 0;
+    std::size_t live_count = 0;
+    // [S32] Held but structurally unpriceable: counted separately so it can
+    // never be mistaken for a live price when deciding all-unpriced below.
+    std::size_t writtenoff_count = 0;
+    // [S33] Is SOME held asset riding a carry that is still inside its TTL?
+    // That is the carry mechanism doing its job, and it is the difference
+    // between a gap the engine is bridging and an outage it cannot see past.
+    bool any_fresh_carry_bridging = false;
     for (const auto& rec : inventory_->get_all_records()) {
         if (rec.total_quantity <= 0) continue;
+        ++held_count;
 
         const double mojos_per_unit =
             (rec.asset_id == "xch") ? 1e12 : 1e3;
@@ -11675,6 +12572,7 @@ double Engine::compute_portfolio_equity_usd(BlockHeight current_block)
         // Live USD price per display unit (pseudo-price is USD * 1e12).
         const Mojo pseudo = asset_usd_pseudo_price(rec.asset_id);
         if (pseudo > 0) {
+            ++live_count;
             in.live_usd_per_unit = static_cast<double>(pseudo)
                                  / static_cast<double>(kMojosPerXch);
             last_asset_usd_price_[rec.asset_id] = in.live_usd_per_unit;
@@ -11682,17 +12580,88 @@ double Engine::compute_portfolio_equity_usd(BlockHeight current_block)
                 last_asset_live_block_[rec.asset_id] = current_block;
             }
         }
-        if (auto it = last_asset_usd_price_.find(rec.asset_id);
-            it != last_asset_usd_price_.end()) {
-            in.last_usd_per_unit = it->second;
+        const auto carry_it = last_asset_usd_price_.find(rec.asset_id);
+        const bool have_carry = (carry_it != last_asset_usd_price_.end());
+        if (have_carry) {
+            in.last_usd_per_unit = carry_it->second;
+        }
 
-            // [S20] Expired carry on a HELD asset degrades the cycle.
-            // The subtraction is guarded because BlockHeight is unsigned:
-            // a peer serving a lower height (reorg, node swap) would
-            // otherwise underflow to a huge age and instantly declare
-            // every asset degraded.  A regressed height means "no elapsed
-            // time", not "infinite elapsed time".
-            if (pseudo <= 0 && current_block > 0 && ttl > 0) {
+        // [S20] Expired carry on a HELD asset degrades the cycle.
+        // The subtraction is guarded because BlockHeight is unsigned: a
+        // peer serving a lower height (reorg, node swap) would otherwise
+        // underflow to a huge age and instantly declare every asset
+        // degraded.  A regressed height means "no elapsed time", not
+        // "infinite elapsed time".
+        //
+        // [S27 2026-08-27] This check used to sit INSIDE the "carry entry
+        // found" branch, so an asset that had NEVER been priced skipped it
+        // entirely: it contributed $0 to equity in silence and left
+        // `degraded` false, so ValuationAuthorityGate never fired and the
+        // peak re-anchored to a partial book.  On 2026-08-25 that produced
+        // an equity of $63.82 -- exactly the BYC balance -- while ~70 XCH
+        // and 519 DBX were invisible to it.  Never-valued is the WORST
+        // case, not an exempt one: there is not even a stale number to
+        // carry, so it degrades unconditionally.
+        //
+        // [S32 2026-08-27] ...but only when a price was ever POSSIBLE.  The
+        // paragraph above is right that never-valued is the worst case when
+        // the engine is trying and failing to price something.  It is not
+        // the right reading when the operator has removed every route to a
+        // price, which is what disabling the last pair for an asset does.
+        // wUSDC.b is held (78.6 units) with both its pairs disabled after
+        // the warp.green compromise, and wmilliETH.b likewise: under the
+        // unconditional rule every cycle degrades from cycle 0, the
+        // authority gate never sees the 10 clean cycles it needs to re-arm,
+        // the peak never seeds, and the fail-closed check below pauses the
+        // engine on EVERY start.  The release meant to make it safe to
+        // resume would have made it impossible.
+        //
+        // So an asset with no configured pricing path is written off at $0
+        // and does not degrade the cycle.  It stays out of live_count, so
+        // it cannot disguise a book with no live prices at all.
+        if (pseudo <= 0 && current_block > 0) {
+            if (risk::unpriced_asset_is_written_off(
+                    asset_has_pricing_path(rec.asset_id), have_carry)) {
+                ++writtenoff_count;
+                // in.live_usd_per_unit and in.last_usd_per_unit both stay
+                // 0.0, so the asset contributes exactly $0 to equity.
+                if (writeoff_logged_.insert(rec.asset_id).second) {
+                    // [review] Not "no enabled pair" -- the predicate now
+                    // follows the route, so this also fires for an asset
+                    // that IS in an enabled pair which cannot reach USD
+                    // (CAT_A/CAT_B with no XCH leg and no enforced par).
+                    // Telling that operator to re-enable a pair sends them
+                    // to check something already true.
+                    spdlog::warn("[Engine] [S32] held asset {} has NO "
+                                 "configured route to a USD anchor -- valuing "
+                                 "{} units at $0.  This is a configuration "
+                                 "state, not a feed outage: it persists until "
+                                 "the asset can reach USD, by enabling a pair "
+                                 "against a quote asset with an enforced par, "
+                                 "or against XCH while XCH itself is anchored "
+                                 "(CoinGecko \"chia\", or an XCH pair against "
+                                 "a declared par).  Equity EXCLUDES this "
+                                 "holding.",
+                                 rec.asset_id.substr(0, 12), in.units);
+                }
+            } else if (!have_carry) {
+                degraded = true;
+                // Warn, not debug: this is the signature of the 2026-08-25
+                // incident and it stayed invisible in the logs while the
+                // breakers sat inert.  Once per asset per process -- the
+                // condition repeats every heartbeat and would drown the log.
+                if (never_valued_logged_.insert(rec.asset_id).second) {
+                    spdlog::warn("[Engine] [S20] held asset {} has NEVER been "
+                                 "valued despite having an enabled pair -- "
+                                 "contributing $0; equity DEGRADED",
+                                 rec.asset_id.substr(0, 12));
+                }
+            } else if (ttl == 0) {
+                // TTL 0 means "never expire" (config.hpp). The operator has
+                // said a carry stays valid indefinitely, so this asset is
+                // bridged by definition and must not read as an outage.
+                any_fresh_carry_bridging = true;
+            } else {
                 auto lb = last_asset_live_block_.find(rec.asset_id);
                 if (lb == last_asset_live_block_.end()
                     || risk::carry_expired(current_block, lb->second, ttl)) {
@@ -11701,14 +12670,54 @@ double Engine::compute_portfolio_equity_usd(BlockHeight current_block)
                                   "{} blocks without a live print -- "
                                   "equity degraded this cycle",
                                   rec.asset_id, ttl);
+                } else {
+                    // [S33] Unpriced this tick but the carry is still inside
+                    // its TTL: this asset is being BRIDGED, not lost. That
+                    // distinction is what stops one quiet tick latching the
+                    // breaker -- see valuation_all_unpriced_ below.
+                    any_fresh_carry_bridging = true;
                 }
             }
         }
+
         inputs.push_back(in);
     }
 
     if (current_block > 0) {
+        // [S33 2026-08-27] A book made ENTIRELY of written-off assets has no
+        // valuation basis at all: equity is $0 by declaration, no peak can
+        // seed, and there is nothing for a breaker to measure.  Written-off
+        // assets deliberately do not degrade the cycle on their own (that is
+        // the point of S32), so without this the whole-book case would report
+        // a clean valuation of $0 and trade unprotected.
+        if (writtenoff_count > 0 && writtenoff_count == held_count) {
+            degraded = true;
+        }
         valuation_degraded_ = degraded;
+
+        // Nothing live at all, while holding something, AND nothing being
+        // bridged by a still-valid carry.  Equity is then entirely FROZEN
+        // fiction and no comparison against it is meaningful -- see
+        // unvaluable_book_must_fail_closed.
+        //
+        // [S33 2026-08-27] The bridging term is load-bearing and its absence
+        // was a real defect.  `degraded` is an aggregate over every held
+        // asset, so it can be raised by asset A's long-expired carry while
+        // asset B is riding a perfectly fresh one.  Without this term, a
+        // single quiet tick on B -- the exact transient the carry mechanism
+        // exists to bridge -- combined with A's standing degradation gave
+        // (grace, degraded, all_unpriced) = (true, true, true) and latched
+        // the breaker permanently.  The guard that was supposed to tell a
+        // gap from an outage was being satisfied by a DIFFERENT asset than
+        // the one that had gone quiet.  Requiring that nothing at all is
+        // being bridged restores the documented policy: "a data gap must not
+        // read as a crash".
+        valuation_all_unpriced_ =
+            (held_count > 0 && live_count == 0 && !any_fresh_carry_bridging);
+        // Needed by the fail-closed predicate to tell "no peak because the
+        // book is empty" -- honest and harmless -- from "no peak while
+        // holding", which is the unprotected state.
+        valuation_holds_anything_ = (held_count > 0);
     }
     return risk::portfolio_equity_usd(inputs);
 }
@@ -13178,11 +14187,39 @@ void Engine::step_update_pnl(BlockHeight block_height)
     // discontinuity this guard exists to avoid.  0 is used only before any
     // trusted factor has ever been seen, where there is no mark to
     // preserve.
+    // [review 2026-08-28] EVERY CONFIGURED PAIR, enabled or not.
+    //
+    // Skipping disabled pairs here kept them out of pair_conv_ entirely, and
+    // PnLTracker treats "not registered" as licence to fall back to a
+    // hardcoded symbol list worth exactly $1.00 per unit. So the documented
+    // response to the 2026-08-25 incident -- enforce:false on wUSDC.b AND
+    // disabling its pairs -- still marked every historical wUSDC.b and BYC
+    // position at par, which is the belief this whole change exists to
+    // remove. Registering a disabled pair costs one map write and turns it
+    // into "registered but unpriceable", which now contributes nothing.
+    //
+    // A pair that was enabled earlier keeps its last trusted factor through
+    // the carry below, so disabling a market does not discontinuously rewrite
+    // its history either.
     for (const auto& pair : config_.pairs) {
-        if (!pair.enabled) continue;
-
         double     factor  = quote_usd_factor(pair);
-        const bool trusted = quote_usd_factor_trusted(pair);
+
+        // [review] Suppress a fresh factor only when its SOURCE is the
+        // disabled pair itself. Gating on pair.enabled alone discarded
+        // factors that never came from this pair's market -- a declared par
+        // needs no market at all, and an XCH-quoted pair's factor is
+        // usd_per_xch(), which is independent of whether this market is
+        // switched on. After a restart the carry map is empty, so those
+        // pairs registered with factor 0 and their historical USD P&L
+        // vanished from the totals.
+        //
+        // quote_usd_factor_source_pair() returns empty when there is no
+        // market source, and this pair's own name when there is one.
+        const std::string factor_src = quote_usd_factor_source_pair(pair);
+        const bool source_is_this_disabled_pair =
+            !pair.enabled && factor_src == pair.name;
+        const bool trusted = !source_is_this_disabled_pair
+                          && quote_usd_factor_trusted(pair);
 
         if (trusted && factor > 0.0) {
             last_trusted_quote_usd_factor_[pair.name] = factor;
@@ -13509,7 +14546,13 @@ void Engine::step_export_metrics(BlockHeight block_height)
     // Dashboard 4: System health
     SystemHealthSnapshot health;
     health.block_height    = block_height;
-    health.node_synced     = true;  // Phase 2: check full node sync status.
+    // [review] Derived, not asserted. Every wallet-driven heartbeat reached
+    // here and published the FAILED node as synced, masking the outage in
+    // monitoring and in the GUI for its whole duration -- which is the one
+    // period anyone would be looking.
+    health.node_synced     = !wallet_only_configured_
+                          && !wallet_only_mode_
+                          && height_source_.current == risk::HeightSource::FullNode;
     health.wallet_connected = wallet_->is_open();
     metrics_->update_system_health(health);
 
@@ -13604,13 +14647,28 @@ void Engine::step_check_alerts(BlockHeight block_height)
     // alternating junk/honest cycles cannot ratchet the peak.
     const auto authority = valuation_authority_.step(valuation_degraded_);
     if (authority.entered_degraded) {
-        spdlog::warn("[Engine] Step 13: [S20] equity valuation DEGRADED "
-                     "(carry TTL exceeded on a held asset) -- peak frozen "
-                     "at ${:.2f} until {} consecutive clean cycles.  Both "
-                     "breakers REMAIN ARMED and keep comparing against "
-                     "that frozen peak",
-                     peak_equity_hwm_usd_,
-                     risk::ValuationAuthorityGate::kRearmCleanCycles);
+        // [S33] The cause matters, because the consequences differ. A carry
+        // that outlived its TTL leaves a real frozen peak and armed breakers.
+        // A book written off entirely (S32) has NO carry and NO peak, so
+        // saying "peak frozen at $0.00, both breakers remain armed" would be
+        // false on both counts -- and it is the FIRST thing an operator sees,
+        // ahead of the fail-closed latch that follows.
+        if (peak_equity_hwm_usd_ > 0.0) {
+            spdlog::warn("[Engine] Step 13: [S20] equity valuation DEGRADED "
+                         "(carry TTL exceeded on a held asset) -- peak frozen "
+                         "at ${:.2f} until {} consecutive clean cycles.  Both "
+                         "breakers REMAIN ARMED and keep comparing against "
+                         "that frozen peak",
+                         peak_equity_hwm_usd_,
+                         risk::ValuationAuthorityGate::kRearmCleanCycles);
+        } else {
+            spdlog::warn("[Engine] Step 13: [S20] equity valuation DEGRADED "
+                         "with NO equity peak ever established -- there is "
+                         "nothing to freeze and the drawdown breaker cannot "
+                         "fire against a zero peak.  This is the write-off / "
+                         "never-valued path, not an expired carry; the "
+                         "fail-closed check below decides whether to pause.");
+        }
     }
     if (authority.recovered) {
         spdlog::info("[Engine] Step 13: [S20] equity valuation clean for "
@@ -13628,6 +14686,7 @@ void Engine::step_check_alerts(BlockHeight block_height)
     if (valuation_authoritative) {
         peak_equity_hwm_usd_ = std::max(peak_equity_hwm_usd_, equity_usd);
     }
+
 
     bs.equity_usd      = equity_usd;
     bs.peak_equity_usd = peak_equity_hwm_usd_;
@@ -13660,6 +14719,65 @@ void Engine::step_check_alerts(BlockHeight block_height)
         --drawdown_grace_remaining_;
     }
 
+    // [S27 2026-08-27] FAIL CLOSED when the book cannot be valued.
+    //
+    // Placed AFTER the grace decrement so it uses the SAME boundary as the
+    // ordinary drawdown breaker below.  Checking before the decrement made
+    // this path wait one extra heartbeat when the counter entered Step 13
+    // at 1 -- allowing another trading round while the normal breaker
+    // already considered grace elapsed.
+    //
+    // Two states, both of which leave the breaker unable to fire: no peak
+    // was ever established (so it is frozen at zero), or nothing is live at
+    // all (so equity is carried fiction sitting at the value the peak was
+    // frozen at).  See the predicate for why the second one refutes the
+    // "a frozen peak still protects us" reasoning.
+    const bool unvaluable_now = risk::unvaluable_book_must_fail_closed(
+        drawdown_grace_remaining_ == 0,
+        valuation_degraded_,
+        valuation_all_unpriced_,
+        peak_equity_hwm_usd_,
+        valuation_holds_anything_);
+    // Either this cycle discovered it, or the pre-trading latch did and is
+    // still owed its report. AlertManager treats CircuitBreaker as
+    // event-driven, so a suppressed alert here is not re-sent later -- the
+    // operator simply never hears that the engine stopped.
+    if ((unvaluable_now && !breaker_pause_active_)
+        || unvaluable_report_pending_) {
+        unvaluable_report_pending_ = false;
+        breaker_pause_active_ = true;
+        state_->set_status(BotStatus::Paused);
+        if (valuation_all_unpriced_) {
+            spdlog::error("[Engine] Step 13: [S27] NO held asset has a "
+                          "usable live valuation -- equity ${:.2f} is either "
+                          "carried from stale values or written off to $0 "
+                          "(S32), so the drawdown breaker is comparing an "
+                          "unmoving equity against a frozen peak (${:.2f}) "
+                          "and cannot detect a loss.  Engine PAUSED "
+                          "(fail-closed).  Manual intervention required.",
+                          equity_usd, peak_equity_hwm_usd_);
+        } else {
+            spdlog::error("[Engine] Step 13: [S27] valuation is INCOMPLETE and "
+                          "no equity peak was ever established, so the drawdown "
+                          "breaker cannot fire against a zero peak (equity "
+                          "${:.2f}).  Engine PAUSED (fail-closed).  Manual "
+                          "intervention required.", equity_usd);
+        }
+        if (alerts_) {
+            alerts_->send_alert(
+                AlertRule::CircuitBreaker,
+                valuation_all_unpriced_
+                    ? "valuation unavailable: no held asset has a usable "
+                      "live valuation -- equity is carried from stale values "
+                      "or written off to $0, so it cannot move and the "
+                      "drawdown breaker cannot detect a loss. Engine paused "
+                      "fail-closed"
+                    : "valuation incomplete and no equity peak was ever "
+                      "established, so the drawdown breaker cannot fire -- "
+                      "engine paused fail-closed");
+        }
+    }
+
     // [S20 2026-08-24] The breaker COMPARISON is deliberately NOT gated on
     // valuation authority.  Degradation freezes the PEAK (above) because a
     // suspect number must not ratchet the high-water mark upward -- but
@@ -13669,7 +14787,24 @@ void Engine::step_check_alerts(BlockHeight block_height)
     // is one that can persist for hours.  A frozen peak compared against a
     // degraded equity still detects a real loss; it merely cannot invent a
     // new peak to measure it from.
-    if (equity_usd > 0.0 && drawdown_grace_remaining_ == 0) {
+    // [S27 2026-08-27] Gate on the PEAK, not on current equity.
+    //
+    // Gating on `equity_usd > 0.0` made a total pricing failure skip the
+    // drawdown evaluation entirely -- the exact 2026-08-25 shape, where
+    // equity computes to $0 and the breaker therefore never even looks.
+    // This PR added a test pinning that a collapse to zero against a real
+    // peak is a 100% drawdown, and that property was UNREACHABLE in
+    // production because of this line: the test pinned the maths while the
+    // call site defeated it.
+    //
+    // Safe against false trips for a structural reason: portfolio_equity_usd
+    // carries last-known prices, so mid-run equity can only reach $0 when
+    // every currently-held asset has NEVER been valued this run (any prior
+    // valuation leaves a carry entry).  With a peak already established that
+    // state means "everything held is unpriced", which is precisely what
+    // must not keep trading.  Warm-up is unchanged: equity_drawdown_frac
+    // already returns 0.0 for a non-positive peak.
+    if (peak_equity_hwm_usd_ > 0.0 && drawdown_grace_remaining_ == 0) {
         const double drawdown_frac = risk::equity_drawdown_frac(
             peak_equity_hwm_usd_, equity_usd);
 
@@ -13898,7 +15033,8 @@ asio::awaitable<void> Engine::open_connections()
 {
     // Determine operating mode: full_node, wallet_only, or auto-detect.
     if (config_.chia.mode == ChiaMode::WalletOnly) {
-        wallet_only_mode_ = true;
+        wallet_only_mode_       = true;
+        wallet_only_configured_ = true;
         spdlog::info("[Engine] Configured for wallet-only mode "
                      "(no full node required)");
     } else if (config_.chia.mode == ChiaMode::FullNode) {
@@ -13927,6 +15063,16 @@ asio::awaitable<void> Engine::open_connections()
                 spdlog::warn("[Engine] Full node unreachable ({}); "
                              "falling back to wallet-only mode", ex.what());
                 wallet_only_mode_ = true;
+                // [review] Move the height SOURCE too, not just the mode
+                // latch. height_source_ still said FullNode, and the poll
+                // loop selects its branch from that -- so a startup that had
+                // already given up on the node went on polling the closed
+                // client for the six failures it takes to fall back,
+                // recreating at startup the exact heartbeat gap S28 exists
+                // to close.
+                height_source_.current = risk::HeightSource::Wallet;
+                height_source_.consecutive_node_failures =
+                    risk::kNodeFailuresBeforeWalletFallback;
                 full_node_->close();
             } else {
                 // FullNode mode: failure is fatal.
@@ -13981,7 +15127,17 @@ asio::awaitable<void> Engine::open_connections()
 
 void Engine::close_connections()
 {
-    if (!wallet_only_mode_) {
+    // [review] Guarded on the POINTER, not on wallet_only_mode_. That flag
+    // became a RUNTIME latch, and a runtime fallback deliberately leaves the
+    // full-node client OPEN so the recovery probe can use it -- so gating on
+    // it skipped the close and leaked the thread pool and sockets of a
+    // client that was still open. But the pointer is genuinely null in
+    // CONFIGURED wallet-only mode, where the constructor never builds one
+    // (see the ChiaMode::WalletOnly branch), so dropping the guard entirely
+    // turned an ordinary wallet-only shutdown into a null dereference.
+    // close() is idempotent on a client that was never opened; it is not
+    // survivable on a client that was never created.
+    if (full_node_) {
         full_node_->close();
     }
     wallet_->close();
