@@ -64,6 +64,7 @@
 
 // Risk layer
 #include "xop/risk/drawdown_breaker.hpp"
+#include "xop/risk/height_source.hpp"
 #include "xop/risk/valuation_authority.hpp"
 #include "xop/risk/usd_route.hpp"
 #include "xop/risk/inventory.hpp"
@@ -409,10 +410,58 @@ private:
     /// Dry-run mode flag.
     bool dry_run_;
 
-    /// True when running without the full node (wallet-only mode).
-    /// Set during open_connections() based on config_.chia.mode and
-    /// full-node reachability (auto-detect).
+    /// True only when the OPERATOR configured wallet-only.
+    ///
+    /// Distinct from `wallet_only_mode_`, which also becomes true when
+    /// `mode: auto` fails to reach the node AT STARTUP. Conflating the two
+    /// made the S28 recovery probe unreachable in exactly the case it was
+    /// written for: a startup node failure set wallet_only_mode_, and the
+    /// probe was guarded on that same flag, so a node that came back later
+    /// was never noticed and the engine stayed on the wallet forever.
+    bool wallet_only_configured_{false};
+
+    /// Polls between full-node recovery probes while on the wallet.
+    ///
+    /// The probe is awaited inline and get_block_height() retries four times
+    /// at up to 30s each, so probing every poll paid ~2 minutes of heartbeat
+    /// latency during an outage to detect a minutes-scale event sooner.
+    static constexpr int kNodeProbeEveryNPolls = 10;
+    ///
+    /// Starts at 0, not at the threshold. Seeding it full made the FIRST
+    /// wallet-sourced poll probe immediately -- so the very heartbeat that
+    /// the fallback exists to deliver, right after six failed node polls,
+    /// still waited through a four-attempt node probe. The node has just
+    /// failed six times; there is nothing to learn by asking again at once.
+    int                  node_probe_skips_{0};
+
+    /// Consecutive full-node polls that answered without advancing.
+    ///
+    /// height_is_usable() accepts height == last_block_, so a frozen node
+    /// resets the failure streak forever and the wallet fallback is never
+    /// reached. A node that says yes and never moves is a dead node.
+    std::uint32_t        node_no_progress_polls_{0};
+
+    /// The RUNTIME latch disabling full-node-dependent behaviour.
+    ///
+    /// [review] No longer only a startup decision. It is set by
+    /// open_connections() from config_.chia.mode and reachability, AND at
+    /// runtime when the height source falls back to the wallet -- and
+    /// cleared again when the node recovers. Anything that must not await a
+    /// dead node (the adaptive-fee path, for one) reads this;
+    /// height_source_ is what drives the source transitions themselves.
     bool wallet_only_mode_{false};
+
+    /// [S28] Which RPC answers "what block is it?", re-decided every poll.
+    ///
+    /// This is the TRANSITION STATE: the streak counters and the hysteresis
+    /// that decide when to fall back and when to return. wallet_only_mode_
+    /// above is its LATCH -- the flag that transition sets and clears, and
+    /// the one that other subsystems read. Neither is a startup decision;
+    /// the earlier wording here said so and was left over from before the
+    /// mid-flight source existed, which is what was missing when the node
+    /// died for 2.5h beside a healthy wallet. Code that relies on the
+    /// obsolete lifetime will be wrong in both directions.
+    risk::HeightSourceState height_source_{};
 
     // -- Pair config lookup ---------------------------------------------------
     // [M11] Declared after config_ so that C++ member initialization order

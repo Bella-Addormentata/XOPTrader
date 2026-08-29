@@ -1234,10 +1234,242 @@ asio::awaitable<void> Engine::poll_loop_coro()
                 }
             }
 
-            // co_await the block height -- use wallet RPC in wallet-only mode.
-            std::int64_t height = wallet_only_mode_
-                ? co_await wallet_->get_height_info()
-                : co_await full_node_->get_block_height();
+            // [S28] The pause flag is pure filesystem and state -- no RPC --
+            // so it is readable even while the node is unreachable. Read it
+            // HERE, before the height call that may be about to fail, so an
+            // operator who pauses during an outage gets a log line and a GUI
+            // status instead of silence.
+            check_pause_flag();
+
+            // [S28] Height source is decided EVERY poll, not once at startup.
+            // wallet_only_mode_ used to be assigned only in
+            // open_connections(), so `mode: auto` auto-detected once and then
+            // never again: on 2026-08-25 that meant 529 consecutive failures
+            // over ~2.5h against a dead node while the wallet RPC answered
+            // fine the whole time. No height means no heartbeat -- no quote
+            // refresh, no cancel, no breaker evaluation -- with offers resting
+            // on dexie throughout.
+            const bool mode_is_auto = (config_.chia.mode == ChiaMode::Auto);
+            std::int64_t height = -1;
+            bool node_ok = false;
+
+            // [review] Ask height_source_, not wallet_only_mode_. The
+            // latter WAS assigned only in open_connections() and never
+            // cleared, so an auto-mode startup fallback pinned this branch
+            // forever: even after the probe walked the source back to the
+            // node, every poll still took the wallet path and waited on both
+            // RPCs.
+            //
+            // [review] That description is now historical. This PR made
+            // wallet_only_mode_ a RUNTIME latch -- set on fallback below,
+            // cleared on recovery -- so it no longer stays as it was, and
+            // keeping the old rationale obscured the separation this branch
+            // depends on. wallet_only_CONFIGURED is the permanent one and is
+            // what this condition asks; height_source_ drives the
+            // transitions; wallet_only_mode_ tells the REST of the engine
+            // not to await a dead node.
+            if (wallet_only_configured_
+                || height_source_.current == risk::HeightSource::Wallet) {
+                // The wallet call gets its own guard. Unprotected, a wallet
+                // throw unwound the whole poll before the recovery probe
+                // below could run -- so the one failure that makes the
+                // wallet a bad height source was also the one that
+                // guaranteed we never looked for a way off it.
+                std::int64_t wallet_height = -1;
+                try {
+                    wallet_height = co_await wallet_->get_height_info();
+                    height = wallet_height;
+                } catch (const std::exception& ex) {
+                    spdlog::warn("[Engine] [S28] wallet height failed: {} -- "
+                                 "still probing the node for recovery",
+                                 ex.what());
+                }
+                // A wallet poll is evidence about the WALLET, not the node.
+                // Probe the node separately so a recovery can be noticed --
+                // otherwise the fallback would be permanent.
+                //
+                // Guarded on wallet_only_CONFIGURED, not wallet_only_mode_:
+                // an auto-mode startup failure sets the latter, and guarding
+                // on it disabled recovery precisely when recovery mattered.
+                // [review] THROTTLED. get_block_height() retries four
+                // times at up to 30s each plus backoff, and this is awaited
+                // inline -- so during an outage every poll paused roughly two
+                // minutes before the wallet height it had ALREADY fetched
+                // could reach the heartbeat. The probe exists to notice a
+                // recovery, which is a minutes-scale event; paying two
+                // minutes of heartbeat latency every poll to detect it sooner
+                // is the wrong trade, and it delays the cancels and breaker
+                // evaluations the heartbeat carries.
+                const bool probe_due =
+                    (++node_probe_skips_ >= kNodeProbeEveryNPolls);
+                if (!wallet_only_configured_ && mode_is_auto && probe_due) {
+                    node_probe_skips_ = 0;
+                    try {
+                        // A startup fallback closed the node client, so
+                        // re-open before probing. open() is idempotent but
+                        // tears down a live session, hence the is_open test.
+                        if (!full_node_->is_open()) {
+                            co_await full_node_->open();
+                        }
+                        const std::int64_t probe =
+                            co_await full_node_->get_block_height();
+                        // Answering is not the same as being usable. A node
+                        // resyncing from genesis answers every poll with a
+                        // height far BELOW the wallet's; counting those as
+                        // successes walked the source back onto it, after
+                        // which height_is_usable rejected every reading as
+                        // backwards and the engine stopped seeing blocks at
+                        // all. Require the node to be at least level with
+                        // both the wallet and the last height we acted on.
+                        // [review] Compare against the wallet only when
+                        // the wallet's own reading is usable. A wallet value
+                        // above UINT32_MAX makes every real node tip compare
+                        // lower, so a healthy node could never accumulate
+                        // recovery successes and would be locked out
+                        // permanently by a number that is itself rejected
+                        // downstream.
+                        const bool wallet_usable = risk::height_is_usable(
+                            wallet_height,
+                            last_block_.load(std::memory_order_relaxed));
+                        node_ok = (probe >= 0)
+                               && (!wallet_usable || probe >= wallet_height)
+                               && risk::height_is_usable(
+                                      probe,
+                                      last_block_.load(
+                                          std::memory_order_relaxed));
+                        // [review round 11] The probe's height, not a max
+                        // with a possibly-malformed wallet value. When the
+                        // wallet reading is unusable, node_ok can still be
+                        // true (that is what !wallet_usable exists for) --
+                        // and max() then kept the malformed wallet value,
+                        // which the usability gate below rejected, dropping
+                        // the heartbeat on every recovery probe despite a
+                        // perfectly good node answer in hand.
+                        if (node_ok) {
+                            height = wallet_usable ? std::max(height, probe)
+                                                   : probe;
+                        }
+                        else if (probe >= 0) {
+                            spdlog::debug("[Engine] [S28] node answered {} but "
+                                          "is behind wallet {} -- not counting "
+                                          "it as recovered", probe,
+                                          wallet_height);
+                        }
+                    } catch (const std::exception&) {
+                        node_ok = false;
+                    }
+                    const auto before = height_source_.current;
+                    if (next_height_source(height_source_, node_ok,
+                                           mode_is_auto)
+                            != before) {
+                        // Clear the runtime fallback too, so the rest of the
+                        // engine stops behaving as though there were no node.
+                        wallet_only_mode_ = false;
+                        // [review] Clear the no-progress streak too. It is
+                        // what sent us to the wallet in the first place, and
+                        // leaving it above the threshold meant the FIRST
+                        // ordinary same-height poll on the recovered source
+                        // counted as a failure immediately.
+                        node_no_progress_polls_ = 0;
+                        spdlog::warn("[Engine] [S28] full node is answering "
+                                     "again -- block height back on the node");
+                    }
+                }
+            } else {
+                try {
+                    height = co_await full_node_->get_block_height();
+                    // [review] USABLE, not merely non-negative. A stale or
+                    // malformed node answers every poll with a height that
+                    // is rejected below -- but counting it as a success
+                    // resets the failure counter, so the run of six that
+                    // triggers the wallet fallback can never accumulate.
+                    // The engine then stops seeing blocks indefinitely
+                    // beside a healthy wallet, which is the outage S28
+                    // exists to end.
+                    // [review] USABLE IS NOT THE SAME AS PROGRESSING.
+                    // height_is_usable() deliberately accepts
+                    // height == last_block_, so a node that keeps returning
+                    // the last processed height answers every poll, resets
+                    // the failure streak forever, and the fallback is never
+                    // reached -- while a healthy wallet advances beside it
+                    // and no new-block heartbeat runs. A frozen node is a
+                    // dead node that says yes.
+                    //
+                    // Counted as healthy only while it is not stuck: the
+                    // streak of no-progress polls is bounded the same way
+                    // outright failures are.
+                    const auto seen = last_block_.load(
+                        std::memory_order_relaxed);
+                    const bool usable = risk::height_is_usable(height, seen);
+                    const bool progressing =
+                        usable && static_cast<std::uint64_t>(height) > seen;
+                    if (progressing) {
+                        node_no_progress_polls_ = 0;
+                    } else if (usable) {
+                        ++node_no_progress_polls_;
+                    }
+                    node_ok = usable
+                           && node_no_progress_polls_
+                                  < risk::kNodePollsWithoutProgress;
+                    if (usable && !node_ok) {
+                        // [review] Mode-neutral. This promised "the wallet
+                        // fallback runs", and in an explicitly pinned
+                        // full_node mode next_height_source() cannot run one
+                        // -- so an operator reading it during a frozen-node
+                        // outage was given a recovery expectation the
+                        // configuration forbids.
+                        spdlog::error("[Engine] [S28] the full node has "
+                                      "answered {} times ({}s) without "
+                                      "advancing past block {} -- treating it "
+                                      "as frozen. {}",
+                                      node_no_progress_polls_,
+                                      risk::kNodePollsWithoutProgress * 5,
+                                      seen,
+                                      mode_is_auto
+                                          ? "The wallet fallback will run."
+                                          : "chia.mode is pinned, so NO "
+                                            "wallet fallback will run -- set "
+                                            "mode: auto to allow one.");
+                    }
+                } catch (const std::exception& ex) {
+                    node_ok = false;
+                    spdlog::warn("[Engine] [S28] full node height failed: {}",
+                                 ex.what());
+                }
+                const auto before = height_source_.current;
+                if (next_height_source(height_source_, node_ok, mode_is_auto)
+                        != before) {
+                    // [review] Set the runtime latch too. Without it every
+                    // wallet-driven heartbeat still enters the adaptive-fee
+                    // path and awaits get_fee_estimate() on the dead node,
+                    // retries and all -- stalling the very heartbeat this
+                    // fallback exists to preserve. The recovery path already
+                    // clears it.
+                    wallet_only_mode_ = true;
+                    spdlog::error(
+                        "[Engine] [S28] full node has failed {} consecutive "
+                        "height polls -- falling back to the WALLET RPC for "
+                        "block height so the heartbeat keeps running. The "
+                        "engine is not blind and its offers are still managed.",
+                        risk::kNodeFailuresBeforeWalletFallback);
+                }
+                if (!node_ok) {
+                    // Nothing usable this cycle; the switch (if any) takes
+                    // effect on the next poll.
+                    continue;
+                }
+            }
+
+            if (!risk::height_is_usable(
+                    height, last_block_.load(std::memory_order_relaxed))) {
+                // A wallet tip BEHIND the node's would read as a reorg to
+                // every downstream consumer, so it is skipped rather than
+                // applied. Negative heights are a malfunctioning RPC.
+                spdlog::debug("[Engine] [S28] height {} not usable against "
+                              "last seen {}; skipping this poll",
+                              height, last_block_.load());
+                continue;
+            }
 
             // [MEDIUM-4] Guard against negative block heights returned by a
             // malfunctioning or unreachable full node.  The RPC returns
@@ -1291,6 +1523,11 @@ asio::awaitable<void> Engine::run_startup_analysis()
     const uint32_t target = market_analyzer_->analysis_blocks();
     spdlog::info("[Engine] Starting market analysis phase ({} blocks)", target);
 
+    // The same mode the main poll loop uses. Hoisted once: only `auto` may
+    // move the height source off the node, during this phase as much as any
+    // other.
+    const bool analysis_mode_is_auto = (config_.chia.mode == ChiaMode::Auto);
+
     asio::steady_timer timer(ioc_);
     BlockHeight last_analysis_block{0};
 
@@ -1308,6 +1545,41 @@ asio::awaitable<void> Engine::run_startup_analysis()
     }
     const uint32_t max_total_polls = target * timeout_mult;
     uint32_t total_polls = 0;
+
+    // [review round 9] Analysis-local source state, mirroring the main
+    // loop's rules without sharing its machinery.
+    //
+    // Two holes, both from this loop deciding per-poll with no memory:
+    //  * a rescue used the wallet for ONE poll and forgot -- every later
+    //    poll retried the dead node through its full RPC retry budget
+    //    (~2 minutes each) before consulting the wallet again;
+    //  * a FROZEN node -- answering, never advancing -- never threw, so it
+    //    never reached the rescue at all. total_polls counts only ADVANCES,
+    //    so the timeout never fired either, and the loop spun until the
+    //    dead man's switch cancelled a perfectly healthy book at 600s.
+    //
+    // Local rather than folded into height_source_/wallet_only_mode_,
+    // deliberately: those are synchronised by the main loop's probe cycle,
+    // which does not exist yet, and a half-synchronised handoff is how the
+    // startup-fallback recovery bug happened. Same constants, same rules,
+    // scoped to this phase.
+    // [review round 11] Seeded from the STARTUP fallback. An auto-mode
+    // open_connections() failure sets wallet_only_mode_ and closes the node
+    // client; leaving this false meant that path never probed the node, and
+    // a later wallet failure looped forever because total_polls only counts
+    // successes. Seeding it routes the startup case through the same
+    // probe-and-return machinery as a mid-analysis fallback. Configured
+    // wallet-only stays out entirely -- there is no node to return to and
+    // full_node_ is null.
+    bool analysis_on_wallet = wallet_only_mode_ && !wallet_only_configured_;
+    std::uint32_t analysis_no_progress = 0;
+    int analysis_probe_skips = 0;
+    // [review round 10] Return needs the same hysteresis as the main loop.
+    // A single successful probe used to flip analysis straight back to the
+    // node, so an intermittently answering one made the NEXT poll pay the
+    // full failing retry budget before falling back again -- the flap the
+    // main loop's kNodeSuccessesBeforeReturn exists to damp.
+    std::uint32_t analysis_probe_successes = 0;
 
     while (!stop_requested_.load(std::memory_order_relaxed) &&
            !market_analyzer_->is_complete()) {
@@ -1343,16 +1615,201 @@ asio::awaitable<void> Engine::run_startup_analysis()
 
         // Fetch current block height.
         std::int64_t height{0};
+        std::string  height_error;
+        // [review] An explicit FLAG, not an empty string as a sentinel.
+        //
+        // std::exception::what() may be empty -- the RPC layer constructs
+        // ChiaRPCApplicationError straight from a server "error" field, which
+        // can be an empty string. The catch would then run while
+        // `!height_error.empty()` was false, so auto mode skipped the wallet
+        // rescue AND the failure warning, and the poll fell through to the
+        // `height <= 0` continue with no diagnosis at all. Silence during the
+        // exact outage this phase was taught to survive.
+        bool height_failed = false;
+        // The settled fallback: once a rescue succeeded, ask the wallet
+        // FIRST and probe the node only every kNodeProbeEveryNPolls polls,
+        // exactly as the main loop's recovery does -- rather than paying the
+        // dead node's full retry budget on every poll.
+        const bool ask_wallet_first =
+            wallet_only_configured_ || analysis_on_wallet;
         try {
-            height = wallet_only_mode_
-                ? co_await wallet_->get_height_info()
-                : co_await full_node_->get_block_height();
+            if (ask_wallet_first) {
+                height = co_await wallet_->get_height_info();
+                if (analysis_on_wallet
+                        && ++analysis_probe_skips
+                               >= kNodeProbeEveryNPolls) {
+                    analysis_probe_skips = 0;
+                    try {
+                        // A startup fallback CLOSED this client; reopen
+                        // before the first probe, as the main loop's
+                        // recovery does.
+                        if (full_node_ && !full_node_->is_open()) {
+                            co_await full_node_->open();
+                        }
+                        const auto probe =
+                            co_await full_node_->get_block_height();
+                        // [review round 11] The main loop's acceptance
+                        // rule, against the ANALYSIS-local last height.
+                        // `probe >= height` compared against the wallet
+                        // unconditionally: an out-of-range wallet value
+                        // blocked every real node tip forever, and a stale
+                        // wallet let a node still BEHIND the analysis
+                        // accumulate successes.
+                        const bool wallet_ok = risk::height_is_usable(
+                            height, last_analysis_block);
+                        const bool probe_ok =
+                            risk::height_in_range(probe)
+                            && (!wallet_ok || probe >= height)
+                            && risk::height_is_usable(
+                                   probe, last_analysis_block);
+                        if (probe_ok) {
+                            // This POLL's height comes from the accepted
+                            // probe when the wallet's reading is not
+                            // usable -- max() would keep the malformed
+                            // wallet value and the gate below would drop
+                            // the beat.
+                            height = wallet_ok
+                                ? std::max(height,
+                                           static_cast<std::int64_t>(probe))
+                                : probe;
+                            if (++analysis_probe_successes
+                                    >= risk::kNodeSuccessesBeforeReturn) {
+                                analysis_on_wallet = false;
+                                analysis_no_progress = 0;
+                                analysis_probe_successes = 0;
+                                spdlog::info("[Engine] [S28] Analysis: the "
+                                             "node answered {} consecutive "
+                                             "probes (height {}) -- back to "
+                                             "it",
+                                             risk::kNodeSuccessesBeforeReturn,
+                                             probe);
+                            }
+                        } else {
+                            analysis_probe_successes = 0;
+                        }
+                    } catch (const std::exception&) {
+                        // Still down; stay on the wallet, and a failed probe
+                        // resets the streak -- one flap must not bank
+                        // progress toward a return.
+                        analysis_probe_successes = 0;
+                    }
+                }
+            } else {
+                height = co_await full_node_->get_block_height();
+            }
         } catch (const std::exception& ex) {
-            spdlog::warn("[Engine] Analysis: block height poll failed: {}", ex.what());
-            continue;
+            height_error = ex.what();
+            if (height_error.empty()) height_error = "(no message)";
+            height_failed = true;
+            height = -1;
+        }
+
+        // A node that answers and never advances is as dead as one that
+        // refuses -- and it never throws, so it can never reach the rescue
+        // below on its own. Same bound as the main loop, measured against
+        // 2,418 real intervals (28% exceed a naive 30s guess).
+        //
+        // [review round 11] Two escapes closed. An OUT-OF-RANGE success is
+        // a failure outright, not a streak reset: it used to reset the
+        // counter and then be discarded by the later range gate, so a node
+        // answering garbage forever held analysis without ever triggering
+        // the rescue. And the `last_analysis_block > 0` condition let
+        // height zero escape the count entirely -- a node pinned at zero
+        // from the first poll never advanced and never counted. Every
+        // non-advancing representable height counts now, zero included.
+        if (!height_failed && !ask_wallet_first) {
+            if (!risk::height_in_range(height)) {
+                height_error = "node answered " + std::to_string(height)
+                               + ", outside the representable range";
+                height_failed = true;
+                height = -1;
+            } else if (static_cast<BlockHeight>(height)
+                           <= last_analysis_block) {
+                if (++analysis_no_progress >= risk::kNodePollsWithoutProgress) {
+                    height_error = "node answers but has not advanced past "
+                                   "block " + std::to_string(
+                                       last_analysis_block);
+                    height_failed = true;
+                    height = -1;
+                }
+            } else {
+                analysis_no_progress = 0;
+            }
+        }
+
+        // [S28] The main loop's fallback does not exist yet -- this phase runs
+        // before it. open_connections() covers a node that is already down at
+        // startup, but a node that dies DURING analysis left this loop failing
+        // and `continue`ing forever, so the engine never reached the loop
+        // where the fallback lives. Try the wallet rather than spinning.
+        //
+        // Outside the catch, not inside it: co_await is illegal in a handler.
+        if (height_failed) {
+            bool recovered = false;
+            // [review] The CONFIGURED PIN applies during analysis too.
+            //
+            // This branch gated on !wallet_only_mode_, which is false in
+            // explicit ChiaMode::FullNode -- so a single node error silently
+            // used the wallet in the one mode whose entire meaning is "do
+            // not". height_fallback_allowed() is the predicate the main
+            // poll loop consults for exactly this, and analysis was the only
+            // place that decided for itself.
+            //
+            // The per-poll rescue is kept rather than folded into
+            // height_source_'s hysteresis: analysis runs before the main
+            // loop exists, it is bounded, and a streak counter that has to
+            // reach six before it helps would spend the whole phase failing.
+            // What it must not do is override a pin the operator set.
+            if (!wallet_only_mode_
+                    && risk::height_fallback_allowed(analysis_mode_is_auto)) {
+                try {
+                    height = co_await wallet_->get_height_info();
+                    // Same bound the main poll applies. Accepting any
+                    // positive int64 here and narrowing to BlockHeight below
+                    // would fabricate an analysis height out of a malformed
+                    // value above UINT32_MAX -- the exact wrap the helper
+                    // was added to prevent, reintroduced one function away.
+                    // [review round 11] Against the ANALYSIS-local height.
+                    // last_block_ is stamped by the main cycle, which has
+                    // not run yet, so it is zero here -- validating against
+                    // it accepted a wallet height BEHIND the analysis and
+                    // latched onto a stale source that then never advanced.
+                    recovered = risk::height_is_usable(
+                        height,
+                        static_cast<std::uint32_t>(last_analysis_block));
+                } catch (const std::exception&) {
+                    recovered = false;
+                }
+            }
+            if (!recovered) {
+                spdlog::warn("[Engine] Analysis: block height poll failed: {}",
+                             height_error);
+                continue;
+            }
+
+            // Remember the rescue, so later polls ask the wallet first
+            // instead of re-paying the dead node's retry budget each time.
+            analysis_on_wallet = true;
+            analysis_probe_skips = 0;
+            spdlog::warn("[Engine] [S28] Analysis: node height failed ({}) -- "
+                         "switching to the WALLET; the node is re-probed "
+                         "every {} polls", height_error,
+                         kNodeProbeEveryNPolls);
         }
 
         if (height <= 0) continue;
+        // [S28] The bound applies to EVERY source, not only to the one that
+        // just failed. The fallback above runs the full usability check, but
+        // configured wallet-only mode and an ordinary successful node poll
+        // both arrive at this cast having had no bound applied at all -- and
+        // a value above UINT32_MAX wraps here into a phantom tip that every
+        // later real height then fails to beat, wedging analysis on a number
+        // no chain produced.
+        if (!risk::height_in_range(height)) {
+            spdlog::warn("[Engine] [S28] Analysis: height {} is outside the "
+                         "representable range; ignoring this poll", height);
+            continue;
+        }
         const BlockHeight current_block = static_cast<BlockHeight>(height);
         if (current_block <= last_analysis_block) continue;
         last_analysis_block = current_block;
@@ -1364,7 +1821,22 @@ asio::awaitable<void> Engine::run_startup_analysis()
         if (metrics_->is_running()) {
             SystemHealthSnapshot health;
             health.block_height     = current_block;
-            health.node_synced      = true;   // We just got a block -> node OK.
+            // [review] Not unconditionally true. This block is reached
+            // after the wallet fallback rescues a poll the NODE just failed,
+            // so publishing node_synced here reported the unavailable node
+            // as healthy -- to monitoring and to the GUI -- for as long as
+            // analysis ran. Derive it from which source actually answered.
+            // [review] The node is synced only if the NODE answered. In
+            // explicit wallet-only mode, and after an auto-mode startup
+            // fallback, height_error is empty because the WALLET succeeded --
+            // so this reported a node that is unavailable, or does not
+            // exist, as healthy.
+            // [review round 11] From THIS poll's source. height_error is
+            // empty on a settled wallet-first poll and wallet_only_mode_ is
+            // untouched by the analysis-local fallback, so the old test
+            // reported the node healthy for wallet-sourced blocks through
+            // the whole outage.
+            health.node_synced      = !ask_wallet_first && !height_failed;
             health.wallet_connected = wallet_->is_open();
             metrics_->update_system_health(health);
         }
@@ -1474,6 +1946,25 @@ asio::awaitable<void> Engine::run_startup_analysis()
     }
 
     if (stop_requested_.load(std::memory_order_relaxed)) co_return;
+
+    // [review round 11] HAND THE FALLBACK TO THE MAIN LOOP. The rescue
+    // state was analysis-local by design -- mid-phase, syncing it against a
+    // probe cycle that does not exist yet is how the startup-fallback bug
+    // happened -- but at the PHASE BOUNDARY the handoff is clean, and
+    // without it a node still down when analysis ends made the main loop
+    // start from FullNode with a zero failure streak: six full retrying
+    // node calls, up to ~12 minutes without a heartbeat, to rediscover what
+    // this phase already knew. The main loop's own probe cycle recovers the
+    // node from here exactly as it would from any settled fallback.
+    if (analysis_on_wallet && !wallet_only_configured_) {
+        height_source_.current = risk::HeightSource::Wallet;
+        height_source_.consecutive_node_failures = 0;
+        height_source_.consecutive_node_successes = 0;
+        wallet_only_mode_ = true;
+        spdlog::warn("[Engine] [S28] Analysis ended on the WALLET fallback "
+                     "-- handing that source to the main loop rather than "
+                     "making it rediscover the outage");
+    }
 
     // Log the completed analysis summaries.
     // [S23 2026-08-24] The phase is over however we reached here, so no
@@ -14055,7 +14546,13 @@ void Engine::step_export_metrics(BlockHeight block_height)
     // Dashboard 4: System health
     SystemHealthSnapshot health;
     health.block_height    = block_height;
-    health.node_synced     = true;  // Phase 2: check full node sync status.
+    // [review] Derived, not asserted. Every wallet-driven heartbeat reached
+    // here and published the FAILED node as synced, masking the outage in
+    // monitoring and in the GUI for its whole duration -- which is the one
+    // period anyone would be looking.
+    health.node_synced     = !wallet_only_configured_
+                          && !wallet_only_mode_
+                          && height_source_.current == risk::HeightSource::FullNode;
     health.wallet_connected = wallet_->is_open();
     metrics_->update_system_health(health);
 
@@ -14536,7 +15033,8 @@ asio::awaitable<void> Engine::open_connections()
 {
     // Determine operating mode: full_node, wallet_only, or auto-detect.
     if (config_.chia.mode == ChiaMode::WalletOnly) {
-        wallet_only_mode_ = true;
+        wallet_only_mode_       = true;
+        wallet_only_configured_ = true;
         spdlog::info("[Engine] Configured for wallet-only mode "
                      "(no full node required)");
     } else if (config_.chia.mode == ChiaMode::FullNode) {
@@ -14565,6 +15063,16 @@ asio::awaitable<void> Engine::open_connections()
                 spdlog::warn("[Engine] Full node unreachable ({}); "
                              "falling back to wallet-only mode", ex.what());
                 wallet_only_mode_ = true;
+                // [review] Move the height SOURCE too, not just the mode
+                // latch. height_source_ still said FullNode, and the poll
+                // loop selects its branch from that -- so a startup that had
+                // already given up on the node went on polling the closed
+                // client for the six failures it takes to fall back,
+                // recreating at startup the exact heartbeat gap S28 exists
+                // to close.
+                height_source_.current = risk::HeightSource::Wallet;
+                height_source_.consecutive_node_failures =
+                    risk::kNodeFailuresBeforeWalletFallback;
                 full_node_->close();
             } else {
                 // FullNode mode: failure is fatal.
@@ -14619,7 +15127,17 @@ asio::awaitable<void> Engine::open_connections()
 
 void Engine::close_connections()
 {
-    if (!wallet_only_mode_) {
+    // [review] Guarded on the POINTER, not on wallet_only_mode_. That flag
+    // became a RUNTIME latch, and a runtime fallback deliberately leaves the
+    // full-node client OPEN so the recovery probe can use it -- so gating on
+    // it skipped the close and leaked the thread pool and sockets of a
+    // client that was still open. But the pointer is genuinely null in
+    // CONFIGURED wallet-only mode, where the constructor never builds one
+    // (see the ChiaMode::WalletOnly branch), so dropping the guard entirely
+    // turned an ordinary wallet-only shutdown into a null dereference.
+    // close() is idempotent on a client that was never opened; it is not
+    // survivable on a client that was never created.
+    if (full_node_) {
         full_node_->close();
     }
     wallet_->close();
