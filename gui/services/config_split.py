@@ -323,6 +323,25 @@ SECRET_KEYS: dict[str, set[str]] = {
         "retired_keys",
         "evm_key_backup_confirmed",
     },
+    # Permuto trading identity (gui/services/permuto/identity.py).  The
+    # wrapped BLS key IS the exchange account: same rule as the warp block
+    # above, and for the same reason -- without this a Settings save writes
+    # the blob straight into git-tracked config.yaml.  Reproduced before
+    # fixing.  The public key, address and registration flags ride with the
+    # key they describe so a stale public copy cannot resurrect retired
+    # identity state alongside a fresh secret.
+    "permuto": {
+        "bls_private_key_dpapi",
+        "bls_public_key",
+        "backup_confirmed",
+        "registered",
+        "registered_at",
+        "listing_verified",
+        "link_attempted_at",
+        "user_id",
+        "trading_address",
+        "created_at",
+    },
 }
 
 # The subset of SECRET_KEYS written EXCLUSIVELY by BaseWallet (create/rotate/
@@ -339,6 +358,23 @@ WALLET_MANAGED_KEYS: dict[str, set[str]] = {
         "relay_private_key_dpapi",
         "retired_keys",
         "evm_key_backup_confirmed",
+    },
+    # Written EXCLUSIVELY by PermutoIdentity (create / restore / mark_*),
+    # never by the Settings UI -- so Settings must strip them from the public
+    # file AND must not copy its cached snapshot back over secrets.yaml. A
+    # stale pre-restore blob round-tripping over a fresh one would destroy
+    # the only persisted copy of the account key.
+    "permuto": {
+        "bls_private_key_dpapi",
+        "bls_public_key",
+        "backup_confirmed",
+        "registered",
+        "registered_at",
+        "listing_verified",
+        "link_attempted_at",
+        "user_id",
+        "trading_address",
+        "created_at",
     },
 }
 

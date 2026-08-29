@@ -78,7 +78,6 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSpinBox,
-    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -86,6 +85,7 @@ from PySide6.QtWidgets import (
 )
 
 from gui.theme import COLORS, HitTargetCheckBox, fit_row_height
+from gui.widgets.sub_tabs import SubTabPages
 
 log = logging.getLogger(__name__)
 
@@ -391,9 +391,16 @@ class SettingsWidget(QWidget):
 
         root.addLayout(header)
 
-        # -- Tab widget --
-        self._tabs = QTabWidget()
-        self._tabs.setDocumentMode(True)
+        # -- Section switcher --
+        #
+        # A wrapping button bar, not QTabWidget. With eleven sections
+        # QTabWidget stops fitting at ordinary window widths and scrolls the
+        # overflow behind two small chevrons -- so Appearance and Advanced
+        # were simply not on screen, with nothing to say they existed. It
+        # also reflowed the whole bar every time a dirty marker appeared,
+        # which could slide a tab out from under the pointer mid-click.
+        # See gui/widgets/sub_tabs.py.
+        self._tabs = SubTabPages()
 
         # Build each tab and register its title.
         tab_builders: list[tuple[str, callable]] = [
@@ -418,7 +425,7 @@ class SettingsWidget(QWidget):
             scroll.setWidget(widget)
             scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
             
-            self._tabs.addTab(scroll, title_text)
+            self._tabs.add_page(title_text, scroll)
             self._tab_titles[idx] = title_text
             self._tab_dirty[idx] = False
 
@@ -2192,13 +2199,11 @@ class SettingsWidget(QWidget):
     def _mark_dirty(self, tab_index: int) -> None:
         """Flag *tab_index* as having unsaved changes.
 
-        Enables the Save/Reset/Apply buttons and appends ``*`` to
-        the tab title as a visual cue.
+        Enables the Save/Reset/Apply buttons and marks the section.
         """
         if not self._tab_dirty.get(tab_index, False):
             self._tab_dirty[tab_index] = True
-            base = self._tab_titles.get(tab_index, "")
-            self._tabs.setTabText(tab_index, f"{base} *")
+            self._tabs.set_dirty(tab_index, True)
 
         if not self._dirty:
             self._dirty = True
@@ -2215,9 +2220,9 @@ class SettingsWidget(QWidget):
         self._save_btn.setEnabled(False)
         self._reset_btn.setEnabled(False)
         self._apply_btn.setEnabled(False)
-        for idx, base_title in self._tab_titles.items():
+        for idx in self._tab_titles:
             self._tab_dirty[idx] = False
-            self._tabs.setTabText(idx, base_title)
+        self._tabs.clear_dirty()
 
     # ===================================================================
     # Config collection (widgets -> dict)

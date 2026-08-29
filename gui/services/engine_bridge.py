@@ -597,10 +597,20 @@ class EngineBridge(QObject):
             f"not yet available."
         )
 
+    #: Whether this bridge can actually command the running engine.
+    #:
+    #: False while start/stop/cancel are stubs. Callers MUST consult this
+    #: rather than checking that a method exists: every one of them does
+    #: exist, and calling them succeeds while doing nothing -- so a UI that
+    #: probes with hasattr concludes it retracted a book it never touched.
+    #: The dexie switch reads this to decide whether it may promise "off
+    #: means flat".
+    SUPPORTS_DIRECT_CONTROL: bool = False
+
     def cancel_all_offers(self) -> None:
         """Request cancellation of all outstanding offers.
 
-        Phase 1 stub -- logs a warning.
+        Phase 1 stub -- logs a warning. See SUPPORTS_DIRECT_CONTROL.
         """
         _log.warning(
             "cancel_all_offers() called but direct control is not yet "
