@@ -11,6 +11,7 @@
 using xop::risk::HeightSource;
 using xop::risk::HeightSourceState;
 using xop::risk::height_fallback_allowed;
+using xop::risk::height_in_range;
 using xop::risk::height_is_usable;
 using xop::risk::kNodeFailuresBeforeWalletFallback;
 using xop::risk::kNodePollsWithoutProgress;
@@ -204,4 +205,42 @@ TEST(NodeProgressBound, IsNotTheFailureThreshold) {
 TEST(NodeProgressBound, StillCatchesAGenuinelyFrozenNodeInMinutes) {
     // A node that never advances must not be tolerated indefinitely.
     EXPECT_LE(static_cast<int>(kNodePollsWithoutProgress) * 5, 600);
+}
+
+// ---------------------------------------------------------------------------
+// height_in_range -- the bound every source needs, not only the failed one
+// ---------------------------------------------------------------------------
+
+TEST(HeightSource, RangeBoundIsIndependentOfAnyOrdering)
+{
+    // The reason this predicate exists separately: configured wallet-only
+    // mode and a settled fallback both read a height with no error to send
+    // them through height_is_usable(), and had NOTHING bounding the value
+    // before the uint32_t cast. There is no "last seen" to compare a first
+    // reading against, so the ordering rule cannot be the thing that bounds.
+    EXPECT_TRUE(height_in_range(0));
+    EXPECT_TRUE(height_in_range(9'205'640));
+    EXPECT_TRUE(height_in_range(
+        static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max())));
+}
+
+TEST(HeightSource, RangeBoundRejectsWhatWouldWrapAtTheCast)
+{
+    // 2^32 arrives downstream as 0, and INT64_MAX as 4,294,967,295 -- a
+    // phantom tip millions of blocks ahead that no later real height beats.
+    EXPECT_FALSE(height_in_range(
+        static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max())
+        + 1));
+    EXPECT_FALSE(height_in_range(std::numeric_limits<std::int64_t>::max()));
+    EXPECT_FALSE(height_in_range(-1));
+}
+
+TEST(HeightSource, UsabilityStillImpliesTheBound)
+{
+    // height_is_usable() delegates its bound here now; the ordering rule
+    // must not have become the only check on the path that does use it.
+    EXPECT_FALSE(height_is_usable(
+        static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max())
+        + 1, 0));
+    EXPECT_FALSE(height_is_usable(std::numeric_limits<std::int64_t>::max(), 0));
 }

@@ -1595,6 +1595,18 @@ asio::awaitable<void> Engine::run_startup_analysis()
         }
 
         if (height <= 0) continue;
+        // [S28] The bound applies to EVERY source, not only to the one that
+        // just failed. The fallback above runs the full usability check, but
+        // configured wallet-only mode and an ordinary successful node poll
+        // both arrive at this cast having had no bound applied at all -- and
+        // a value above UINT32_MAX wraps here into a phantom tip that every
+        // later real height then fails to beat, wedging analysis on a number
+        // no chain produced.
+        if (!risk::height_in_range(height)) {
+            spdlog::warn("[Engine] [S28] Analysis: height {} is outside the "
+                         "representable range; ignoring this poll", height);
+            continue;
+        }
         const BlockHeight current_block = static_cast<BlockHeight>(height);
         if (current_block <= last_analysis_block) continue;
         last_analysis_block = current_block;
@@ -14253,14 +14265,19 @@ asio::awaitable<void> Engine::open_connections()
 
 void Engine::close_connections()
 {
-    // [review] Not gated on wallet_only_mode_ any more. That flag became a
-    // RUNTIME latch, and a runtime fallback deliberately leaves the
-    // full-node client OPEN so the recovery probe can use it -- so shutting
-    // down while fallback was active skipped the close and leaked its
-    // thread pool and sockets. close() is idempotent and safe on a client
-    // that was never opened, which is the only case the old guard was
-    // protecting against.
-    full_node_->close();
+    // [review] Guarded on the POINTER, not on wallet_only_mode_. That flag
+    // became a RUNTIME latch, and a runtime fallback deliberately leaves the
+    // full-node client OPEN so the recovery probe can use it -- so gating on
+    // it skipped the close and leaked the thread pool and sockets of a
+    // client that was still open. But the pointer is genuinely null in
+    // CONFIGURED wallet-only mode, where the constructor never builds one
+    // (see the ChiaMode::WalletOnly branch), so dropping the guard entirely
+    // turned an ordinary wallet-only shutdown into a null dereference.
+    // close() is idempotent on a client that was never opened; it is not
+    // survivable on a client that was never created.
+    if (full_node_) {
+        full_node_->close();
+    }
     wallet_->close();
     dexie_->close();
     if (coingecko_) {

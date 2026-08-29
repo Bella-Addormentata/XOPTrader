@@ -154,6 +154,25 @@ constexpr HeightSource next_height_source(HeightSourceState& state,
     return state.current;
 }
 
+/// The range bound on its own, with no ordering rule attached.
+///
+/// EVERY source narrows to BlockHeight (uint32_t), so every source needs
+/// this -- including the ones that never failed and therefore never reach
+/// height_is_usable(). Configured wallet-only mode and a settled fallback
+/// both read a height by the ordinary path, with no error to trigger the
+/// checked branch, and a value above UINT32_MAX wraps at the cast into a
+/// phantom tip millions of blocks ahead that no later real height can beat.
+///
+/// Separate from the ordering rule because the ordering rule is not always
+/// applicable: a first reading has nothing to be compared against, and the
+/// bound is applicable always.
+[[nodiscard]] constexpr bool height_in_range(std::int64_t height) noexcept
+{
+    return height >= 0
+        && height <= static_cast<std::int64_t>(
+               std::numeric_limits<std::uint32_t>::max());
+}
+
 /// A height from the wallet may LAG the node's tip, so it must never be
 /// allowed to move the engine backwards.
 ///
@@ -165,16 +184,9 @@ constexpr HeightSource next_height_source(HeightSourceState& state,
 [[nodiscard]] constexpr bool height_is_usable(std::int64_t height,
                                               std::uint32_t last_seen) noexcept
 {
-    if (height < 0) return false;                       // malfunctioning RPC
-    // The caller narrows to BlockHeight (uint32_t) immediately after this
-    // returns true, so anything above that range is not a large height, it
-    // is a wraparound. INT64_MAX would arrive downstream as 4,294,967,295 --
-    // a phantom tip millions of blocks ahead that every later real height
-    // then fails to beat, wedging the engine on a number no chain produced.
-    if (height > static_cast<std::int64_t>(
-            std::numeric_limits<std::uint32_t>::max())) {
-        return false;
-    }
+    // Negative (a malfunctioning RPC) and out-of-range are both the bound,
+    // which is shared with every caller that does not come through here.
+    if (!height_in_range(height)) return false;
     return static_cast<std::uint64_t>(height) >= last_seen;
 }
 

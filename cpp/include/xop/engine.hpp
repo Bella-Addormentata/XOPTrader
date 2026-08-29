@@ -451,9 +451,15 @@ private:
     bool wallet_only_mode_{false};
 
     /// [S28] Which RPC answers "what block is it?", re-decided every poll.
-    /// wallet_only_mode_ above is the STARTUP decision and stays as it was;
-    /// this is the mid-flight one, which is what was missing when the node
-    /// died for 2.5h beside a healthy wallet.
+    ///
+    /// This is the TRANSITION STATE: the streak counters and the hysteresis
+    /// that decide when to fall back and when to return. wallet_only_mode_
+    /// above is its LATCH -- the flag that transition sets and clears, and
+    /// the one that other subsystems read. Neither is a startup decision;
+    /// the earlier wording here said so and was left over from before the
+    /// mid-flight source existed, which is what was missing when the node
+    /// died for 2.5h beside a healthy wallet. Code that relies on the
+    /// obsolete lifetime will be wrong in both directions.
     risk::HeightSourceState height_source_{};
 
     // -- Pair config lookup ---------------------------------------------------
