@@ -25,6 +25,7 @@
 #include "xop/execution/fair_value_solver.hpp"
 #include "xop/execution/mid_gate.hpp"
 #include "xop/risk/valuation_authority.hpp"
+#include "xop/risk/usd_route.hpp"
 
 #include "xop/accounting/bridge_ingest.hpp"
 #include "xop/accounting/reward_ingest.hpp"
@@ -1793,6 +1794,91 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
         }
     }
 
+    // [review] HOISTED OUT of the recovery-mode branch.
+    //
+    // This latch used to sit inside the `else` of `if (xch_recovery_mode_)`,
+    // so it was skipped entirely whenever recovery was active -- while Step 9
+    // arbitrage, which TAKES offers, still runs in that mode. A book that
+    // cannot be valued could therefore be traded against for one cycle before
+    // Step 13 discovered it.
+    //
+    // Hoisting does not stop recovery from restoring XCH: step_xch_recovery
+    // runs above this point, and this only sets breaker_pause_active_, which
+    // gates Steps 7-8 and the taker paths -- not recovery itself.
+    // [S27 review] LATCH BEFORE TRADING, not in Step 13.
+    //
+    // unvaluable_book_must_fail_closed() was only evaluated in
+    // step_check_alerts(), which runs AFTER ladder generation, offer
+    // management, drift correction and arbitrage -- so the first cycle to
+    // discover an unvaluable book could post offers and execute takes before
+    // the flag that is supposed to stop it existed.
+    //
+    // [review round 9] THIS cycle's verdict, not the previous one's.
+    //
+    // Three earlier rounds argued the previous cycle's flags were
+    // sufficient because they are recomputed throughout the grace. The
+    // reviewer's counterexamples break that: a carry exactly at its TTL last
+    // cycle expires at THIS block_height; Step 1 can stale the CoinGecko
+    // cache; Step 2 can change holdings. In each, the stored flags are still
+    // clean here and only Step 13 would discover the truth -- after offer
+    // management and arbitrage have traded on it. A zero-length grace makes
+    // the same window with no edge case at all.
+    //
+    // compute_portfolio_equity_usd() is synchronous, makes no RPC, and its
+    // only mutations -- refreshing an asset's carry price and live block --
+    // are idempotent within a block, so evaluating it twice per cycle (here
+    // and in Step 13, which still owns the operator-facing report with this
+    // cycle's equity figure) is two map walks, not two effects.
+    // The equity figure feeds one thing here besides the flags: seeding the
+    // FIRST peak when the authority gate is fully armed.
+    //
+    // [review round 10] Without this, a legal `drawdown_grace_blocks: 0`
+    // paused every non-empty healthy startup: this latch runs BEFORE Step 13
+    // has ever seeded peak_equity_hwm_usd_, so a clean valuation reached the
+    // zero-peak branch of unvaluable_book_must_fail_closed() -- written for
+    // the post-degradation debounce window, not for a peak that has simply
+    // not been seeded yet -- and latched over nothing. Seeding mirrors Step
+    // 13's monotonic max, gated on the same authority (read-only: the gate
+    // is NOT stepped here, or each cycle would count its clean streak
+    // twice), so a degraded startup still cannot seed and the zero-peak
+    // protection still holds where it was aimed.
+    const double pre_trade_equity =
+        compute_portfolio_equity_usd(block_height);
+    if (pre_trade_equity > 0.0
+            && valuation_authority_.clean_streak()
+                   >= risk::ValuationAuthorityGate::kRearmCleanCycles
+            && !valuation_degraded_) {
+        peak_equity_hwm_usd_ =
+            std::max(peak_equity_hwm_usd_, pre_trade_equity);
+    }
+    if (risk::unvaluable_book_must_fail_closed(
+            // [review round 11] Step 13 DECREMENTS the counter before its
+            // own evaluation, so its boundary is one cycle earlier than a
+            // raw read here. Using == 0 pre-decrement let the cycle whose
+            // decrement reaches zero run drift correction, arbitrage and
+            // offer management first, with Step 13 declaring the book
+            // unvaluable only after they had traded -- the first-cycle gap
+            // again, one cycle wide, through counter phasing rather than
+            // stale flags. <= 1 is the same post-decrement boundary Step 13
+            // applies.
+            drawdown_grace_remaining_ <= 1,
+            valuation_degraded_,
+            valuation_all_unpriced_,
+            peak_equity_hwm_usd_,
+            valuation_holds_anything_)
+        && !breaker_pause_active_) {
+        breaker_pause_active_ = true;
+        // [review] Step 13's branch is gated on !breaker_pause_active_, so
+        // latching here silently SUPPRESSED the detailed log and the
+        // operator alert -- the exact report the comment promised. Record
+        // that the report is still owed; Step 13 clears it once sent.
+        unvaluable_report_pending_ = true;
+        state_->set_status(BotStatus::Paused);
+        spdlog::error("[Engine] [S27] the book cannot be valued and the "
+                      "grace has elapsed -- pausing BEFORE this cycle trades. "
+                      "Step 13 reports the detail.");
+    }
+
     // -- Dynamic market allocator: re-score pairs periodically. ------------
     // Must run before Step 7 (ladder generation) so that allocation fractions
     // are up-to-date when capital is distributed across pairs.
@@ -1831,6 +1917,7 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
             // Keep previous cached value; do not zero out.
         }
     }
+
 
     try { step_generate_ladder(block_height); }
     catch (const std::exception& e) {
@@ -11308,16 +11395,64 @@ std::optional<double> Engine::declared_usd_par(const AssetId& asset_id) const
 
 double Engine::usd_per_xch() const
 {
+    // [S27 2026-08-27] EXTERNAL FEED FIRST.
+    //
+    // This used to derive XCH's dollar price solely from an enabled
+    // XCH/<par wrapper> pair.  That has the anchor backwards: XCH has a
+    // real, liquid, externally quoted USD price, and deriving it through a
+    // bridged stablecoin on a thin Chia book adds the wrapper issuer's risk
+    // to a number that never needed it.
+    //
+    // It also failed outright.  Only wUSDC.b / wUSDC / USDS qualified --
+    // BYC never did -- so when the wUSDC.b pairs were disabled on
+    // 2026-08-25 this returned 0, every asset priced at $0, equity became
+    // exactly $0, and equity_drawdown_frac returns 0.0 on a non-positive
+    // peak.  Both circuit breakers went INERT rather than tripping: the
+    // engine would have traded with no drawdown protection at all.
+    //
+    // The DEX-derived mid stays as the FALLBACK rather than being dropped.
+    // The note in the loop below is right that a CoinGecko outage must not
+    // zero every USD figure in the bot, so this prefers the external feed
+    // and falls back rather than failing.
+    // FRESHNESS IS NOT OPTIONAL HERE.  Step 1 deliberately RETAINS the old
+    // price map when a fetch fails and does not advance
+    // coingecko_last_fetch_, so reading the cache without an age check gives
+    // a stale value permanent priority and makes the DEX fallback below
+    // unreachable.  Worse: because the stale value is positive,
+    // asset_usd_pseudo_price keeps refreshing last_asset_live_block_ every
+    // heartbeat, so the carry never expires and a frozen feed reads as
+    // permanently healthy.  Reuse the existing revival gate, whose
+    // documentation already argues exactly this -- "a frozen feed would
+    // quote forever" -- and which treats a non-positive or non-finite
+    // threshold as stale rather than as "always fresh".
+    if (coingecko_feed_fresh_for_revival(
+            !coingecko_prices_.empty(),
+            coingecko_last_fetch_,
+            std::chrono::steady_clock::now(),
+            config_.market_data.cex_freshness_threshold_sec)) {
+        auto it = coingecko_prices_.find("chia");
+        if (it != coingecko_prices_.end() && std::isfinite(it->second)
+            && it->second > 0.0) {
+            return it->second;
+        }
+    }
+
     for (const auto& pair : config_.pairs) {
         if (!pair.enabled || pair.base_asset_id != "xch") continue;
-        // [review] No slash check. It is left over from when this matched on
-        // the display NAME; the lookup below is entirely by canonical asset
-        // id, and parse_pairs() accepts names without a slash (only
-        // revive_market imposes one). So a legitimately-configured pair whose
-        // name happens to lack "/" was silently skipped as an anchor, while
-        // validate_usd_anchor() -- which never looks at the name -- reported
-        // the config as anchored. Startup said fine and the runtime returned
-        // 0.
+        // [review] No slash check. It is vestigial -- from when this matched
+        // on the display NAME -- and the lookup below is entirely by
+        // canonical asset id. parse_pairs() accepts names without a slash
+        // (only revive_market imposes one), so a legal XCH/<par>
+        // configuration whose name happens to lack one was skipped here as
+        // an anchor while validate_usd_anchor() -- which never looks at the
+        // name -- reported the config anchored, and the route predicate
+        // reported every XCH-routed holding priceable. Startup said fine and
+        // the runtime returned 0, which resolves as permanent degradation.
+        // The two must agree, and the asset-id lookup is the one that is
+        // right.
+        //
+        // Fixed independently on both branches, since neither contained the
+        // other; this is the merge of the two comments.
         // [PEG 2026-08-26] Was a hardcoded symbol list.  Now asks the
         // registry, keyed on ASSET ID rather than the ticker parsed out of
         // the pair name -- symbols collide and get reused, asset ids do
@@ -11672,8 +11807,143 @@ double Engine::compute_implied_cross_anchor(const PairConfig& pc) const
     return midgate::median_of(candidates);
 }
 
+bool Engine::asset_has_pricing_path(const AssetId& asset_id) const
+{
+    // Mirrors exactly the two loops in asset_usd_pseudo_price below: an
+    // asset is priceable as the BASE of an enabled pair or as its QUOTE.
+    // If neither loop can even reach a candidate, no market event will ever
+    // produce a price and the asset is unpriceable BY CONFIGURATION.
+    //
+    // Deliberately ignores whether the pair currently HAS a usable mid, a
+    // trusted factor, or a valuation grade.  Those are transient and belong
+    // to the carry mechanism; folding them in here would let a junk book
+    // masquerade as "no path" and write a live asset off to zero.
+    // XCH is configured with an EXTERNAL route that no pair mediates, so
+    // judging it by pairs alone declares the one asset with an independent
+    // anchor unpriceable the moment its markets are switched off.  Whether
+    // the feed is fresh RIGHT NOW is a runtime availability question and
+    // belongs to the carry mechanism, exactly like a quiet book -- what
+    // matters here is that a route exists at all.
+    // [review] Pair membership is NOT proof of a USD route. An enabled
+    // CAT_A/CAT_B pair where neither leg is XCH and CAT_B has no enforced
+    // par gives quote_usd_factor() nothing to work with -- it returns 0.0
+    // for every tick, forever. Counting that as "has a path" is not a safe
+    // over-approximation: it withholds the write-off, so the asset degrades
+    // instead, and because the cause is CONFIGURATION rather than a feed
+    // outage the degradation never lifts. The engine would sit permanently
+    // paused on a state that will not resolve, which is precisely what the
+    // write-off exists to avoid. So follow the route to an anchor.
+    return risk::asset_is_routable_to_usd(
+        asset_id, external_xch_feed(), enabled_route_pairs(), par_lookups());
+}
+
+/// Does XCH have any USD anchor at all?
+///
+/// Split out because it is asked twice: once for XCH itself, and once for
+/// every asset that can only reach USD by going through XCH. Mirrors what
+/// usd_per_xch() will actually accept -- the external CoinGecko quote, or an
+/// enabled XCH pair against a wrapper with a declared, enforced par.
+bool Engine::xch_has_usd_anchor() const
+{
+    return risk::xch_is_anchored(external_xch_feed(), enabled_route_pairs(),
+                                 par_lookups());
+}
+
+/// The two config shapes the pure route logic needs, gathered in one place.
+std::vector<risk::RoutePair> Engine::enabled_route_pairs() const
+{
+    std::vector<risk::RoutePair> out;
+    out.reserve(config_.pairs.size());
+    for (const auto& pair : config_.pairs) {
+        if (!pair.enabled) continue;
+        out.push_back({pair.base_asset_id, pair.quote_asset_id});
+    }
+    return out;
+}
+
+risk::ParLookups Engine::par_lookups() const
+{
+    return risk::ParLookups{
+        [this](const std::string& id) {
+            return declared_usd_par(id).has_value();
+        },
+        // Narrower on purpose -- mirrors what usd_per_xch() will accept.
+        [this](const std::string& id) {
+            return is_par_wrapper_asset(id) && declared_usd_par(id).has_value();
+        },
+    };
+}
+
+risk::ExternalXchFeed Engine::external_xch_feed() const
+{
+    risk::ExternalXchFeed feed;
+    feed.enabled = config_.coingecko.enabled;
+    const auto& ids = config_.coingecko.coin_ids;
+    feed.quotes_chia =
+        std::find(ids.begin(), ids.end(), "chia") != ids.end();
+    feed.freshness_threshold_sec =
+        config_.market_data.cex_freshness_threshold_sec;
+    return feed;
+}
+
 Mojo Engine::asset_usd_pseudo_price(const AssetId& asset_id) const
 {
+    // [S27 follow-up] XCH HAS ITS OWN ANCHOR, INDEPENDENT OF EVERY PAIR.
+    //
+    // usd_per_xch() prefers a freshness-gated external CoinGecko price
+    // precisely so a disabled or compromised quote-asset market cannot zero
+    // the book -- but this function only ever reached that logic while
+    // ITERATING AN ENABLED PAIR.  So with every XCH pair disabled (exactly
+    // what an operator did on 2026-08-25) XCH priced at $0 despite a
+    // perfectly good external quote, and S32 then wrote it off as
+    // structurally unpriceable.  The S27 incident, arriving back through the
+    // fix for it.  Ask the anchor first.
+    if (asset_id == "xch") {
+        // THE EXTERNAL QUOTE ONLY -- not usd_per_xch().
+        //
+        // usd_per_xch() falls back to an ungraded DEX mid when the feed is
+        // stale, and returning that here would bypass the
+        // mid_valuation_grade check in the base-pair loop below: a
+        // last-trade-only wrapper book could then refresh XCH's live-price
+        // timestamp forever, so the carry TTL never fires and a junk print
+        // marks equity. That is the S20 contract (types.hpp), and the fast
+        // path added for S27 quietly stepped around it.
+        //
+        // The fast path exists only so a live EXTERNAL price is not hidden
+        // behind disabled pairs. The DEX fallback still happens -- through
+        // the graded loop below, where it belongs.
+        if (coingecko_feed_fresh_for_revival(
+                !coingecko_prices_.empty(), coingecko_last_fetch_,
+                std::chrono::steady_clock::now(),
+                config_.market_data.cex_freshness_threshold_sec)) {
+            auto it = coingecko_prices_.find("chia");
+            if (it != coingecko_prices_.end() && std::isfinite(it->second)
+                && it->second > 0.0) {
+                // [review] to_mojo_checked(), like the two loops below.
+                //
+                // This fast path did the multiply and llround raw. The
+                // CoinGecko client accepts any JSON double with no upper
+                // bound, so a finite positive quote above ~9.22e6 makes
+                // price * 1e12 exceed int64_t -- and llround on an
+                // out-of-range double has an unspecified result with
+                // FE_INVALID raised, which on x86-64 is INT64_MIN. XCH would
+                // then have priced NEGATIVE, from a `return` that skips the
+                // graded DEX loops entirely.
+                //
+                // Falling THROUGH on a rejected value rather than returning
+                // 0 matters: a price we cannot represent is not a price we
+                // do not have, and the DEX path below can still answer.
+                if (const auto m = to_mojo_checked(
+                        it->second * static_cast<double>(kMojosPerXch))) {
+                    return *m;
+                }
+                spdlog::warn("[Engine] [S27] CoinGecko XCH price {} is "
+                             "outside the representable Mojo range; falling "
+                             "back to the DEX path", it->second);
+            }
+        }
+    }
+
     // Prefer pricing the asset as the BASE of an enabled pair (live mid).
     //
     // [S20 2026-08-24] Valuation-grade mids only.  This branch was the main
@@ -11744,6 +12014,23 @@ Mojo Engine::asset_usd_pseudo_price(const AssetId& asset_id) const
             continue;
         }
     }
+
+    // [review] OWN DECLARED PAR, last.
+    //
+    // usd_route.hpp advertises "the asset's own enforced par" as a route,
+    // and until now no runtime path delivered it: an asset holding an
+    // enforced par whose pairs were all disabled produced no pseudo-price,
+    // was classified as routable, and therefore degraded forever instead of
+    // taking the structural write-off -- pausing the engine on every start,
+    // which is the condition S32 exists to prevent.
+    //
+    // Placed AFTER both market loops on purpose. A prefer_market_cross asset
+    // must still be valued through its market when one is available; this is
+    // the fallback for when none is, not a shortcut past them.
+    if (const auto par = declared_usd_par(asset_id)) {
+        return static_cast<Mojo>(std::llround(
+            *par * static_cast<double>(kMojosPerXch)));
+    }
     return 0;
 }
 
@@ -11772,8 +12059,18 @@ double Engine::compute_portfolio_equity_usd(BlockHeight current_block)
     bool degraded = false;
 
     std::vector<risk::AssetValuationInput> inputs;
+    std::size_t held_count = 0;
+    std::size_t live_count = 0;
+    // [S32] Held but structurally unpriceable: counted separately so it can
+    // never be mistaken for a live price when deciding all-unpriced below.
+    std::size_t writtenoff_count = 0;
+    // [S33] Is SOME held asset riding a carry that is still inside its TTL?
+    // That is the carry mechanism doing its job, and it is the difference
+    // between a gap the engine is bridging and an outage it cannot see past.
+    bool any_fresh_carry_bridging = false;
     for (const auto& rec : inventory_->get_all_records()) {
         if (rec.total_quantity <= 0) continue;
+        ++held_count;
 
         const double mojos_per_unit =
             (rec.asset_id == "xch") ? 1e12 : 1e3;
@@ -11784,6 +12081,7 @@ double Engine::compute_portfolio_equity_usd(BlockHeight current_block)
         // Live USD price per display unit (pseudo-price is USD * 1e12).
         const Mojo pseudo = asset_usd_pseudo_price(rec.asset_id);
         if (pseudo > 0) {
+            ++live_count;
             in.live_usd_per_unit = static_cast<double>(pseudo)
                                  / static_cast<double>(kMojosPerXch);
             last_asset_usd_price_[rec.asset_id] = in.live_usd_per_unit;
@@ -11791,17 +12089,88 @@ double Engine::compute_portfolio_equity_usd(BlockHeight current_block)
                 last_asset_live_block_[rec.asset_id] = current_block;
             }
         }
-        if (auto it = last_asset_usd_price_.find(rec.asset_id);
-            it != last_asset_usd_price_.end()) {
-            in.last_usd_per_unit = it->second;
+        const auto carry_it = last_asset_usd_price_.find(rec.asset_id);
+        const bool have_carry = (carry_it != last_asset_usd_price_.end());
+        if (have_carry) {
+            in.last_usd_per_unit = carry_it->second;
+        }
 
-            // [S20] Expired carry on a HELD asset degrades the cycle.
-            // The subtraction is guarded because BlockHeight is unsigned:
-            // a peer serving a lower height (reorg, node swap) would
-            // otherwise underflow to a huge age and instantly declare
-            // every asset degraded.  A regressed height means "no elapsed
-            // time", not "infinite elapsed time".
-            if (pseudo <= 0 && current_block > 0 && ttl > 0) {
+        // [S20] Expired carry on a HELD asset degrades the cycle.
+        // The subtraction is guarded because BlockHeight is unsigned: a
+        // peer serving a lower height (reorg, node swap) would otherwise
+        // underflow to a huge age and instantly declare every asset
+        // degraded.  A regressed height means "no elapsed time", not
+        // "infinite elapsed time".
+        //
+        // [S27 2026-08-27] This check used to sit INSIDE the "carry entry
+        // found" branch, so an asset that had NEVER been priced skipped it
+        // entirely: it contributed $0 to equity in silence and left
+        // `degraded` false, so ValuationAuthorityGate never fired and the
+        // peak re-anchored to a partial book.  On 2026-08-25 that produced
+        // an equity of $63.82 -- exactly the BYC balance -- while ~70 XCH
+        // and 519 DBX were invisible to it.  Never-valued is the WORST
+        // case, not an exempt one: there is not even a stale number to
+        // carry, so it degrades unconditionally.
+        //
+        // [S32 2026-08-27] ...but only when a price was ever POSSIBLE.  The
+        // paragraph above is right that never-valued is the worst case when
+        // the engine is trying and failing to price something.  It is not
+        // the right reading when the operator has removed every route to a
+        // price, which is what disabling the last pair for an asset does.
+        // wUSDC.b is held (78.6 units) with both its pairs disabled after
+        // the warp.green compromise, and wmilliETH.b likewise: under the
+        // unconditional rule every cycle degrades from cycle 0, the
+        // authority gate never sees the 10 clean cycles it needs to re-arm,
+        // the peak never seeds, and the fail-closed check below pauses the
+        // engine on EVERY start.  The release meant to make it safe to
+        // resume would have made it impossible.
+        //
+        // So an asset with no configured pricing path is written off at $0
+        // and does not degrade the cycle.  It stays out of live_count, so
+        // it cannot disguise a book with no live prices at all.
+        if (pseudo <= 0 && current_block > 0) {
+            if (risk::unpriced_asset_is_written_off(
+                    asset_has_pricing_path(rec.asset_id), have_carry)) {
+                ++writtenoff_count;
+                // in.live_usd_per_unit and in.last_usd_per_unit both stay
+                // 0.0, so the asset contributes exactly $0 to equity.
+                if (writeoff_logged_.insert(rec.asset_id).second) {
+                    // [review] Not "no enabled pair" -- the predicate now
+                    // follows the route, so this also fires for an asset
+                    // that IS in an enabled pair which cannot reach USD
+                    // (CAT_A/CAT_B with no XCH leg and no enforced par).
+                    // Telling that operator to re-enable a pair sends them
+                    // to check something already true.
+                    spdlog::warn("[Engine] [S32] held asset {} has NO "
+                                 "configured route to a USD anchor -- valuing "
+                                 "{} units at $0.  This is a configuration "
+                                 "state, not a feed outage: it persists until "
+                                 "the asset can reach USD, by enabling a pair "
+                                 "against a quote asset with an enforced par, "
+                                 "or against XCH while XCH itself is anchored "
+                                 "(CoinGecko \"chia\", or an XCH pair against "
+                                 "a declared par).  Equity EXCLUDES this "
+                                 "holding.",
+                                 rec.asset_id.substr(0, 12), in.units);
+                }
+            } else if (!have_carry) {
+                degraded = true;
+                // Warn, not debug: this is the signature of the 2026-08-25
+                // incident and it stayed invisible in the logs while the
+                // breakers sat inert.  Once per asset per process -- the
+                // condition repeats every heartbeat and would drown the log.
+                if (never_valued_logged_.insert(rec.asset_id).second) {
+                    spdlog::warn("[Engine] [S20] held asset {} has NEVER been "
+                                 "valued despite having an enabled pair -- "
+                                 "contributing $0; equity DEGRADED",
+                                 rec.asset_id.substr(0, 12));
+                }
+            } else if (ttl == 0) {
+                // TTL 0 means "never expire" (config.hpp). The operator has
+                // said a carry stays valid indefinitely, so this asset is
+                // bridged by definition and must not read as an outage.
+                any_fresh_carry_bridging = true;
+            } else {
                 auto lb = last_asset_live_block_.find(rec.asset_id);
                 if (lb == last_asset_live_block_.end()
                     || risk::carry_expired(current_block, lb->second, ttl)) {
@@ -11810,14 +12179,54 @@ double Engine::compute_portfolio_equity_usd(BlockHeight current_block)
                                   "{} blocks without a live print -- "
                                   "equity degraded this cycle",
                                   rec.asset_id, ttl);
+                } else {
+                    // [S33] Unpriced this tick but the carry is still inside
+                    // its TTL: this asset is being BRIDGED, not lost. That
+                    // distinction is what stops one quiet tick latching the
+                    // breaker -- see valuation_all_unpriced_ below.
+                    any_fresh_carry_bridging = true;
                 }
             }
         }
+
         inputs.push_back(in);
     }
 
     if (current_block > 0) {
+        // [S33 2026-08-27] A book made ENTIRELY of written-off assets has no
+        // valuation basis at all: equity is $0 by declaration, no peak can
+        // seed, and there is nothing for a breaker to measure.  Written-off
+        // assets deliberately do not degrade the cycle on their own (that is
+        // the point of S32), so without this the whole-book case would report
+        // a clean valuation of $0 and trade unprotected.
+        if (writtenoff_count > 0 && writtenoff_count == held_count) {
+            degraded = true;
+        }
         valuation_degraded_ = degraded;
+
+        // Nothing live at all, while holding something, AND nothing being
+        // bridged by a still-valid carry.  Equity is then entirely FROZEN
+        // fiction and no comparison against it is meaningful -- see
+        // unvaluable_book_must_fail_closed.
+        //
+        // [S33 2026-08-27] The bridging term is load-bearing and its absence
+        // was a real defect.  `degraded` is an aggregate over every held
+        // asset, so it can be raised by asset A's long-expired carry while
+        // asset B is riding a perfectly fresh one.  Without this term, a
+        // single quiet tick on B -- the exact transient the carry mechanism
+        // exists to bridge -- combined with A's standing degradation gave
+        // (grace, degraded, all_unpriced) = (true, true, true) and latched
+        // the breaker permanently.  The guard that was supposed to tell a
+        // gap from an outage was being satisfied by a DIFFERENT asset than
+        // the one that had gone quiet.  Requiring that nothing at all is
+        // being bridged restores the documented policy: "a data gap must not
+        // read as a crash".
+        valuation_all_unpriced_ =
+            (held_count > 0 && live_count == 0 && !any_fresh_carry_bridging);
+        // Needed by the fail-closed predicate to tell "no peak because the
+        // book is empty" -- honest and harmless -- from "no peak while
+        // holding", which is the unprotected state.
+        valuation_holds_anything_ = (held_count > 0);
     }
     return risk::portfolio_equity_usd(inputs);
 }
@@ -13741,13 +14150,28 @@ void Engine::step_check_alerts(BlockHeight block_height)
     // alternating junk/honest cycles cannot ratchet the peak.
     const auto authority = valuation_authority_.step(valuation_degraded_);
     if (authority.entered_degraded) {
-        spdlog::warn("[Engine] Step 13: [S20] equity valuation DEGRADED "
-                     "(carry TTL exceeded on a held asset) -- peak frozen "
-                     "at ${:.2f} until {} consecutive clean cycles.  Both "
-                     "breakers REMAIN ARMED and keep comparing against "
-                     "that frozen peak",
-                     peak_equity_hwm_usd_,
-                     risk::ValuationAuthorityGate::kRearmCleanCycles);
+        // [S33] The cause matters, because the consequences differ. A carry
+        // that outlived its TTL leaves a real frozen peak and armed breakers.
+        // A book written off entirely (S32) has NO carry and NO peak, so
+        // saying "peak frozen at $0.00, both breakers remain armed" would be
+        // false on both counts -- and it is the FIRST thing an operator sees,
+        // ahead of the fail-closed latch that follows.
+        if (peak_equity_hwm_usd_ > 0.0) {
+            spdlog::warn("[Engine] Step 13: [S20] equity valuation DEGRADED "
+                         "(carry TTL exceeded on a held asset) -- peak frozen "
+                         "at ${:.2f} until {} consecutive clean cycles.  Both "
+                         "breakers REMAIN ARMED and keep comparing against "
+                         "that frozen peak",
+                         peak_equity_hwm_usd_,
+                         risk::ValuationAuthorityGate::kRearmCleanCycles);
+        } else {
+            spdlog::warn("[Engine] Step 13: [S20] equity valuation DEGRADED "
+                         "with NO equity peak ever established -- there is "
+                         "nothing to freeze and the drawdown breaker cannot "
+                         "fire against a zero peak.  This is the write-off / "
+                         "never-valued path, not an expired carry; the "
+                         "fail-closed check below decides whether to pause.");
+        }
     }
     if (authority.recovered) {
         spdlog::info("[Engine] Step 13: [S20] equity valuation clean for "
@@ -13765,6 +14189,7 @@ void Engine::step_check_alerts(BlockHeight block_height)
     if (valuation_authoritative) {
         peak_equity_hwm_usd_ = std::max(peak_equity_hwm_usd_, equity_usd);
     }
+
 
     bs.equity_usd      = equity_usd;
     bs.peak_equity_usd = peak_equity_hwm_usd_;
@@ -13797,6 +14222,65 @@ void Engine::step_check_alerts(BlockHeight block_height)
         --drawdown_grace_remaining_;
     }
 
+    // [S27 2026-08-27] FAIL CLOSED when the book cannot be valued.
+    //
+    // Placed AFTER the grace decrement so it uses the SAME boundary as the
+    // ordinary drawdown breaker below.  Checking before the decrement made
+    // this path wait one extra heartbeat when the counter entered Step 13
+    // at 1 -- allowing another trading round while the normal breaker
+    // already considered grace elapsed.
+    //
+    // Two states, both of which leave the breaker unable to fire: no peak
+    // was ever established (so it is frozen at zero), or nothing is live at
+    // all (so equity is carried fiction sitting at the value the peak was
+    // frozen at).  See the predicate for why the second one refutes the
+    // "a frozen peak still protects us" reasoning.
+    const bool unvaluable_now = risk::unvaluable_book_must_fail_closed(
+        drawdown_grace_remaining_ == 0,
+        valuation_degraded_,
+        valuation_all_unpriced_,
+        peak_equity_hwm_usd_,
+        valuation_holds_anything_);
+    // Either this cycle discovered it, or the pre-trading latch did and is
+    // still owed its report. AlertManager treats CircuitBreaker as
+    // event-driven, so a suppressed alert here is not re-sent later -- the
+    // operator simply never hears that the engine stopped.
+    if ((unvaluable_now && !breaker_pause_active_)
+        || unvaluable_report_pending_) {
+        unvaluable_report_pending_ = false;
+        breaker_pause_active_ = true;
+        state_->set_status(BotStatus::Paused);
+        if (valuation_all_unpriced_) {
+            spdlog::error("[Engine] Step 13: [S27] NO held asset has a "
+                          "usable live valuation -- equity ${:.2f} is either "
+                          "carried from stale values or written off to $0 "
+                          "(S32), so the drawdown breaker is comparing an "
+                          "unmoving equity against a frozen peak (${:.2f}) "
+                          "and cannot detect a loss.  Engine PAUSED "
+                          "(fail-closed).  Manual intervention required.",
+                          equity_usd, peak_equity_hwm_usd_);
+        } else {
+            spdlog::error("[Engine] Step 13: [S27] valuation is INCOMPLETE and "
+                          "no equity peak was ever established, so the drawdown "
+                          "breaker cannot fire against a zero peak (equity "
+                          "${:.2f}).  Engine PAUSED (fail-closed).  Manual "
+                          "intervention required.", equity_usd);
+        }
+        if (alerts_) {
+            alerts_->send_alert(
+                AlertRule::CircuitBreaker,
+                valuation_all_unpriced_
+                    ? "valuation unavailable: no held asset has a usable "
+                      "live valuation -- equity is carried from stale values "
+                      "or written off to $0, so it cannot move and the "
+                      "drawdown breaker cannot detect a loss. Engine paused "
+                      "fail-closed"
+                    : "valuation incomplete and no equity peak was ever "
+                      "established, so the drawdown breaker cannot fire -- "
+                      "engine paused fail-closed");
+        }
+    }
+
     // [S20 2026-08-24] The breaker COMPARISON is deliberately NOT gated on
     // valuation authority.  Degradation freezes the PEAK (above) because a
     // suspect number must not ratchet the high-water mark upward -- but
@@ -13806,7 +14290,24 @@ void Engine::step_check_alerts(BlockHeight block_height)
     // is one that can persist for hours.  A frozen peak compared against a
     // degraded equity still detects a real loss; it merely cannot invent a
     // new peak to measure it from.
-    if (equity_usd > 0.0 && drawdown_grace_remaining_ == 0) {
+    // [S27 2026-08-27] Gate on the PEAK, not on current equity.
+    //
+    // Gating on `equity_usd > 0.0` made a total pricing failure skip the
+    // drawdown evaluation entirely -- the exact 2026-08-25 shape, where
+    // equity computes to $0 and the breaker therefore never even looks.
+    // This PR added a test pinning that a collapse to zero against a real
+    // peak is a 100% drawdown, and that property was UNREACHABLE in
+    // production because of this line: the test pinned the maths while the
+    // call site defeated it.
+    //
+    // Safe against false trips for a structural reason: portfolio_equity_usd
+    // carries last-known prices, so mid-run equity can only reach $0 when
+    // every currently-held asset has NEVER been valued this run (any prior
+    // valuation leaves a carry entry).  With a peak already established that
+    // state means "everything held is unpriced", which is precisely what
+    // must not keep trading.  Warm-up is unchanged: equity_drawdown_frac
+    // already returns 0.0 for a non-positive peak.
+    if (peak_equity_hwm_usd_ > 0.0 && drawdown_grace_remaining_ == 0) {
         const double drawdown_frac = risk::equity_drawdown_frac(
             peak_equity_hwm_usd_, equity_usd);
 

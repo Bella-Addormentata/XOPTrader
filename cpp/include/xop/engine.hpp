@@ -65,6 +65,7 @@
 // Risk layer
 #include "xop/risk/drawdown_breaker.hpp"
 #include "xop/risk/valuation_authority.hpp"
+#include "xop/risk/usd_route.hpp"
 #include "xop/risk/inventory.hpp"
 #include "xop/risk/limits.hpp"
 #include "xop/risk/hedging.hpp"
@@ -562,6 +563,45 @@ private:
     /// quote: factor * kMojosPerXch).  0 when no market data yet.
     /// [S20] The base-of-pair branch only accepts valuation-grade mids.
     [[nodiscard]] Mojo asset_usd_pseudo_price(const AssetId& asset_id) const;
+
+    /// [S32 2026-08-27] Whether the configuration provides ANY route to a
+    /// USD price for this asset -- meaning a route that reaches an ANCHOR,
+    /// not merely membership of an enabled pair.  Three qualify: the asset's
+    /// own declared and still-enforced par; an enabled pair against a quote
+    /// asset that has one; or an enabled pair against XCH while XCH is
+    /// itself anchored (CoinGecko "chia" with a usable freshness threshold,
+    /// or an enabled XCH pair against a par wrapper).  An enabled CAT/CAT
+    /// pair with no XCH leg and no enforced par is NOT a route -- it yields
+    /// 0.0 forever.  This is what distinguishes "we cannot price
+    /// this, ever, as configured" from "the price is unavailable right
+    /// now", and the two must not share a response: the first is written
+    /// off at $0, the second rides its carry.  Deliberately a pure function
+    /// of CONFIGURATION with no market state, so the answer is stable for the
+    /// life of the process and cannot flap with the feed.
+    ///
+    /// [review] NOT "an enabled pair naming the asset" -- that was the
+    /// rejected first implementation and this paragraph outlived its
+    /// deletion above. An enabled pair counts only when its other leg
+    /// reaches an enforced par or an anchored XCH; an enabled CAT/CAT pair
+    /// with neither is a dead end that yields 0.0 forever. Conversely an
+    /// asset's own enforced par is a route with no pair at all.
+    ///
+    /// Callers use this answer to choose between degrading and a permanent
+    /// $0 write-off, and both errors are expensive: a false route degrades
+    /// forever on a condition that cannot resolve, a missing one writes off
+    /// a holding a live feed is quoting.
+    [[nodiscard]] bool asset_has_pricing_path(const AssetId& asset_id) const;
+
+    /// Whether XCH can reach USD at all: the external CoinGecko quote, or an
+    /// enabled XCH pair against a wrapper with a declared, enforced par.
+    /// Asked twice -- for XCH itself, and for every asset whose only route to
+    /// USD runs through XCH, where an unanchored XCH makes the chain 0 * mid.
+    [[nodiscard]] bool xch_has_usd_anchor() const;
+
+    /// Config reduced to what the pure route logic in usd_route.hpp needs.
+    [[nodiscard]] std::vector<risk::RoutePair> enabled_route_pairs() const;
+    [[nodiscard]] risk::ExternalXchFeed        external_xch_feed() const;
+    [[nodiscard]] risk::ParLookups             par_lookups() const;
 
     /// [S20 2026-08-24] Median implied price of `pc` triangulated through
     /// every healthy pair of enabled sibling books (see the definition for
@@ -1097,6 +1137,50 @@ private:
     /// comparing against the frozen peak.  Disarming them would make a
     /// risk control fail open for a condition that can persist hours.
     bool valuation_degraded_{false};
+
+    /// [S27 2026-08-27, tightened by S33] TRUE only when something is held,
+    /// NOTHING was priced live this cycle, AND nothing is being bridged by a
+    /// still-valid carry.
+    ///
+    /// The third clause is not a detail. Without it a single quiet tick on a
+    /// healthy asset -- exactly the transient the carry mechanism exists to
+    /// bridge -- combined with some other asset's standing degradation gave
+    /// (grace, degraded, all_unpriced) = (true, true, true) and latched the
+    /// breaker permanently. The guard meant to tell a data gap from an
+    /// outage was being satisfied by a DIFFERENT asset than the one that had
+    /// gone quiet.
+    ///
+    /// Distinct from valuation_degraded_, which means "at least one", and
+    /// the distinction decides whether the drawdown comparison means
+    /// anything. With one asset still live or still bridged, equity moves
+    /// and the comparison works. With nothing live and nothing bridged,
+    /// equity is a mix of carried fiction and S32 write-offs sitting at the
+    /// value the peak was frozen at, so the drawdown reads 0 forever.
+    bool valuation_all_unpriced_{false};
+
+    /// Whether the last valuation saw ANY held asset.
+    ///
+    /// Distinguishes a zero peak that is honest -- an empty book has nothing
+    /// to protect -- from a zero peak while holding, which leaves the
+    /// drawdown breaker unable to fire at all.
+    bool valuation_holds_anything_{false};
+
+    /// Set when the pre-trading fail-closed latch fires, cleared when Step 13
+    /// has sent the detailed log and the operator alert.
+    ///
+    /// Needed because Step 13's branch is gated on !breaker_pause_active_,
+    /// so latching earlier would otherwise suppress the very report that
+    /// justified moving the latch forward -- and CircuitBreaker alerts are
+    /// event-driven, so a suppressed one is never re-sent.
+    bool unvaluable_report_pending_{false};
+
+    /// [S32 2026-08-27] One-shot log guards. Both conditions re-evaluate
+    /// every heartbeat and would otherwise emit a warn line per asset per
+    /// block; the operator needs to see each one ONCE, loudly. Not cleared
+    /// on recovery -- a written-off asset only becomes priceable again via
+    /// a config change, which means a restart.
+    std::set<AssetId> writeoff_logged_;
+    std::set<AssetId> never_valued_logged_;
 
     /// [S20] Peak-update authority: the clean-streak debounce and the
     /// transition signals that drive the warn-once logging.  Pure logic in

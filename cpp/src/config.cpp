@@ -3373,22 +3373,26 @@ static void deep_merge(YAML::Node dst, const YAML::Node& src)
 // heads-up that names the fix before the operator hits it.
 void validate_usd_anchor(const AppConfig& cfg)
 {
-    // [review] NO CoinGecko EXEMPTION HERE, deliberately.
+    // An external XCH/USD feed is an anchor in its own right and needs no
+    // declaration at all (S27).  With one configured, every XCH-based
+    // conversion has a route and there is nothing to complain about.
     //
-    // An external XCH/USD feed WOULD be an anchor in its own right -- but on
-    // this branch Engine::usd_per_xch() never reads coingecko_prices_. It
-    // walks enabled pairs and asks declared_usd_par(), and returns 0.0 if no
-    // pair yields one. So exempting a CoinGecko-enabled config here silenced
-    // this warning in precisely the deployment it was added to catch: one
-    // upgrading into the registry with no `pegged_assets:` section, whose
-    // valuation is about to go to zero. The check must describe what the
-    // engine does, not what a sibling branch does.
-    //
-    // Teaching usd_per_xch() to prefer the external quote is S27's work
-    // (PR #117), which re-introduces this exemption together with the code
-    // that earns it -- and gated on cex_freshness_threshold_sec, since a
-    // non-positive threshold makes the runtime reject the cached price on
-    // every tick.
+    // But only if the RUNTIME will actually accept it. usd_per_xch() gates
+    // the cached CoinGecko price through coingecko_feed_fresh_for_revival(),
+    // which treats a non-positive or non-finite threshold as permanently
+    // stale -- deliberately, so a frozen feed cannot quote forever. A config
+    // with cex_freshness_threshold_sec: 0 is therefore legal, silent, and
+    // anchorless: this check passed on the declaration while every tick
+    // rejected the value. Requiring a usable threshold here keeps the
+    // startup verdict and the runtime behaviour in agreement.
+    if (cfg.coingecko.enabled
+            && std::isfinite(cfg.market_data.cex_freshness_threshold_sec)
+            && cfg.market_data.cex_freshness_threshold_sec > 0.0) {
+        const auto& ids = cfg.coingecko.coin_ids;
+        if (std::find(ids.begin(), ids.end(), "chia") != ids.end()) {
+            return;
+        }
+    }
 
     // The only route is an enabled pair whose quote asset carries a
     // declared, enforced USD par.
@@ -3431,6 +3435,15 @@ void validate_usd_anchor(const AppConfig& cfg)
     // both breakers sit INERT rather than tripping. Promising protection
     // that does not exist is worse than the missing anchor: an operator who
     // reads it has been told the fault is contained.
+    //
+    // [review] The reverse became true in this PR and the message did not
+    // follow. unvaluable_book_must_fail_closed() pauses after the grace, so
+    // "nothing pauses automatically" now UNDER-promises -- an operator with
+    // an anchorless config was told the build has no automatic protection
+    // and would then meet a "Manual intervention required" pause they had
+    // been told could not happen. The error direction is the safe one; the
+    // description is still wrong, and a diagnostic nobody can match to the
+    // behaviour is a diagnostic they stop reading.
     spdlog::warn(
         // [review] Scoped to what actually follows. The earlier wording
         // said every asset values at $0 and both breakers sit inert, which
@@ -3444,8 +3457,10 @@ void validate_usd_anchor(const AppConfig& cfg)
         "XCH-quoted conversion is unavailable. Assets with their own "
         "enforced par may still value. IF that leaves equity at or near zero, "
         "both drawdown breakers sit inert, because they cannot fire against a "
-        "zero peak -- which is the 2026-08-25 incident, and on this build "
-        "nothing pauses automatically. Enabled pairs: {}. Fix by declaring an "
+        "zero peak -- which is the 2026-08-25 incident. This build DOES "
+        "protect itself: after the drawdown grace expires with an unvaluable "
+        "book, the engine fails closed and pauses, requiring manual "
+        "intervention. Enabled pairs: {}. Fix by declaring an "
         "enabled XCH pair's quote asset under `pegged_assets:` with "
         "enforce: true and prefer_market_cross: false (see "
         "config.example.yaml; a config written before that section existed "
@@ -3505,6 +3520,44 @@ AppConfig load_config(const std::string& path,
     cfg.accounting = parse_accounting(root);
     cfg.market_data = parse_market_data(root);
     validate_usd_anchor(cfg);
+
+    // [S27 review round 3] Since usd_per_xch() now prefers the external
+    // CoinGecko price, a polling interval LONGER than the freshness window
+    // makes that anchor stale for part of every cycle by construction: the
+    // gate rejects the cached value, valuation silently falls through to the
+    // DEX mid, and if the DEX anchor sits higher it can ratchet the equity
+    // peak -- so the next successful CoinGecko refresh reads as a drawdown
+    // the market never produced. Nothing about that looks like a
+    // misconfiguration in the logs, which is why it is called out here.
+    // [review] The same "chia" membership test validate_usd_anchor() uses.
+    // Without it this warned about "the external XCH anchor" alternating
+    // with the DEX for any enabled CoinGecko config -- a Bitcoin-only feed
+    // with a long interval got a diagnostic about an XCH anchor that does
+    // not exist, which is how operators learn to ignore warnings.
+    const auto& cg_ids = cfg.coingecko.coin_ids;
+    const bool cg_quotes_chia =
+        std::find(cg_ids.begin(), cg_ids.end(), "chia") != cg_ids.end();
+    if (cfg.coingecko.enabled && cg_quotes_chia
+            && cfg.market_data.cex_freshness_threshold_sec > 0.0) {
+        const double poll_s = cfg.coingecko.polling_interval_ms / 1000.0;
+        // Strictly greater, not >=. The freshness check accepts
+        // age <= threshold, and a fetch is completed and timestamped BEFORE
+        // valuation reads it -- so poll_s == threshold never produces a
+        // stale cycle during healthy polling. Warning on equality would cry
+        // wolf on a perfectly good configuration, and a warning that fires
+        // when nothing is wrong is how operators learn to ignore warnings.
+        if (poll_s > cfg.market_data.cex_freshness_threshold_sec) {
+            spdlog::warn(
+                "[Config] coingecko.polling_interval_ms ({:.0f}s) is not "
+                "shorter than market_data.cex_freshness_threshold_sec "
+                "({:.0f}s), so the external XCH anchor is STALE for part of "
+                "every poll cycle and valuation alternates between CoinGecko "
+                "and the DEX mid. That can ratchet the equity peak and make "
+                "the next refresh look like a drawdown. Set the polling "
+                "interval well inside the freshness window.",
+                poll_s, cfg.market_data.cex_freshness_threshold_sec);
+        }
+    }
     cfg.adverse_selection = parse_adverse_selection(root);
     cfg.market_allocator = parse_market_allocator(root);
     cfg.recovery   = parse_recovery(root);

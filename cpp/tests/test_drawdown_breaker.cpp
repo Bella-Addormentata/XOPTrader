@@ -29,6 +29,8 @@ using xop::risk::window_loss_threshold_usd;
 using xop::risk::portfolio_equity_usd;
 using xop::risk::effective_usd_per_unit;
 using xop::risk::AssetValuationInput;
+using xop::risk::unvaluable_book_must_fail_closed;
+using xop::risk::unpriced_asset_is_written_off;
 using xop::risk::BreakerRealertGate;
 using xop::risk::kWindowAnchorFallbackUsd;
 
@@ -228,3 +230,241 @@ TEST(WindowLossThresholdUsdTest, DisabledAndDegenerateInputs) {
 }
 
 }  // namespace
+
+// ===========================================================================
+// [S27 2026-08-27] The inert-breaker hazard
+//
+// These do not test the engine-side fix (marking a never-valued asset as
+// degrading the cycle) -- that needs Engine plus an inventory tracker and is
+// blocked on the T4-07 harness.  They pin the PURE property that makes the
+// engine-side bug dangerous, so the hazard is documented where the maths
+// lives rather than only in a TODO.
+//
+// On 2026-08-25, disabling the wUSDC.b pairs left every held asset without
+// an enabled pricing pair.  Equity became exactly $0, the peak tracked to
+// $0 with it, and the breaker stopped being able to fire AT ALL -- not a
+// nuisance trip, silence.
+// ===========================================================================
+
+TEST(DrawdownBreakerTest, S27_ZeroPeakMakesTheBreakerInertNotTrigger) {
+    // The specific shape of the 2026-08-25 failure: nothing priced, so both
+    // equity and peak are 0.  A non-positive peak yields 0.0 drawdown, so
+    // no threshold can ever be crossed.
+    EXPECT_DOUBLE_EQ(equity_drawdown_frac(0.0, 0.0), 0.0);
+
+    // And it stays inert however bad things get, because the peak never
+    // rose above zero to measure against.
+    EXPECT_DOUBLE_EQ(equity_drawdown_frac(0.0, -5000.0), 0.0);
+}
+
+TEST(DrawdownBreakerTest, S27_APricedPeakStillProtectsAgainstACollapseToZero) {
+    // Contrast: once ANY real peak exists, a collapse to zero reads as a
+    // full 100% drawdown and trips everything.  The danger is not a wrong
+    // number -- it is having no number at all.
+    EXPECT_DOUBLE_EQ(equity_drawdown_frac(500.0, 0.0), 1.0);
+}
+
+TEST(DrawdownBreakerTest, S27_UnvaluedAssetsSumToZeroEquity) {
+    // Held units with neither a live nor a carried price contribute
+    // nothing, so a book full of them is indistinguishable from an empty
+    // one at this layer.  That is correct for the pure function -- which is
+    // exactly why the ENGINE must flag the condition instead of letting it
+    // pass as a healthy $0.
+    std::vector<AssetValuationInput> book;
+    AssetValuationInput xch;   xch.units = 70.0;    // no prices at all
+    AssetValuationInput dbx;   dbx.units = 519.0;
+    book.push_back(xch);
+    book.push_back(dbx);
+    EXPECT_DOUBLE_EQ(portfolio_equity_usd(book), 0.0);
+
+    // One priced asset is enough to make the total non-zero -- the $63.82
+    // equity observed live was exactly this: one asset counted, the rest
+    // silently absent.
+    AssetValuationInput byc;
+    byc.units = 63.818;
+    byc.live_usd_per_unit = 1.0;
+    book.push_back(byc);
+    EXPECT_NEAR(portfolio_equity_usd(book), 63.818, 1e-9);
+}
+
+// ===========================================================================
+// [S27 2026-08-27] Fail closed when the book cannot be valued
+//
+// Review finding 117-2: setting valuation_degraded_ makes the engine KNOW it
+// is blind, but freezing a peak that is already zero leaves the breakers
+// exactly as inert as before.  The first version of the S27 fix therefore
+// did not close its own stated hole.  These pin the decision that does.
+// ===========================================================================
+
+TEST(DrawdownBreakerTest, S27_FailsClosedWhenDegradedWithNoPeakEverEstablished) {
+    // The 2026-08-25 shape on a fresh process: nothing priced, so no peak
+    // was ever seeded and no drawdown can ever be measured.
+    EXPECT_TRUE(unvaluable_book_must_fail_closed(
+        /*grace_elapsed=*/true, /*valuation_degraded=*/true,
+        /*all_held_assets_unpriced=*/false, /*peak_equity_usd=*/0.0));
+}
+
+TEST(DrawdownBreakerTest, S27_DoesNotFailClosedWhileAValidPeakExists) {
+    // A frozen peak is still a real reference, and the ordinary comparison
+    // keeps protecting us.  Pausing here would be a false positive on a
+    // book that is measurably fine.
+    EXPECT_FALSE(unvaluable_book_must_fail_closed(true, true, false, 500.0));
+}
+
+TEST(DrawdownBreakerTest, S27_DoesNotFailClosedDuringStartupGrace) {
+    // Valuations warm up over the first cycles; pausing before grace
+    // expires would stop every start.
+    EXPECT_FALSE(unvaluable_book_must_fail_closed(false, true, false, 0.0));
+}
+
+TEST(DrawdownBreakerTest, S27_DoesNotFailClosedOnACleanValuationWithAPeak) {
+    EXPECT_FALSE(unvaluable_book_must_fail_closed(true, false, false, 500.0));
+}
+
+TEST(DrawdownBreakerTest, S27_ACleanValuationWithNoPeakStillFailsClosed) {
+    // [review] This asserted the opposite and was wrong.
+    //
+    // Start degraded, become clean near the end of grace: valuation_degraded
+    // is false, but ValuationAuthorityGate still refuses peak updates for its
+    // debounce run -- so the peak stays at zero and equity_drawdown_frac()
+    // returns 0.0 against it for up to nine post-grace cycles. The breaker is
+    // not blunted, it cannot fire at all, which is the inert state S27 exists
+    // to end.
+    EXPECT_TRUE(unvaluable_book_must_fail_closed(
+        true, false, false, 0.0, /*holding_anything=*/true));
+}
+
+TEST(DrawdownBreakerTest, S27_AnEmptyBookWithNoPeakIsNotAFault) {
+    // A zero peak is honest when there is nothing to protect, and pausing on
+    // it would make an idle engine unable to start.
+    EXPECT_FALSE(unvaluable_book_must_fail_closed(
+        true, false, false, 0.0, /*holding_anything=*/false));
+    // Degraded but empty is still not a fault: degradation can be raised by
+    // an asset that has since been sold. all_held_assets_unpriced is NOT
+    // tested here because it is defined as "something held and nothing
+    // live", so it cannot be true of an empty book -- asserting on that
+    // combination would be asserting on a state the engine cannot produce.
+    EXPECT_FALSE(unvaluable_book_must_fail_closed(
+        true, true, false, 0.0, /*holding_anything=*/false));
+}
+
+TEST(DrawdownBreakerTest, S27_ANegativeOrNanPeakCountsAsNoPeak) {
+    // `!(peak > 0)` rather than `peak <= 0` so NaN -- which fails every
+    // comparison -- also reads as "no usable peak" instead of slipping
+    // through as if it were valid.
+    EXPECT_TRUE(unvaluable_book_must_fail_closed(true, true, false, -1.0));
+    EXPECT_TRUE(unvaluable_book_must_fail_closed(
+        true, true, false, std::numeric_limits<double>::quiet_NaN()));
+}
+
+TEST(DrawdownBreakerTest, S27_AllHeldAssetsUnpricedFailsClosedEvenWithARealPeak) {
+    // Review finding: the first version of this helper assumed a frozen peak
+    // still protects us.  It does not.  effective_usd_per_unit carries the
+    // last known price with NO expiry check -- expiry only raises the
+    // degraded flag -- so when nothing is live, equity holds at the very
+    // value the peak was frozen at and the drawdown reads 0 forever.
+    // Comparing a frozen equity against a frozen peak detects nothing.
+    EXPECT_TRUE(unvaluable_book_must_fail_closed(
+        /*grace_elapsed=*/true, /*valuation_degraded=*/true,
+        /*all_held_assets_unpriced=*/true, /*peak_equity_usd=*/500.0));
+}
+
+TEST(DrawdownBreakerTest, S27_PartialDegradationWithARealPeakStillTrades) {
+    // At least one asset live means equity still moves, so the ordinary
+    // comparison genuinely works.  Pausing here would be a false positive.
+    EXPECT_FALSE(unvaluable_book_must_fail_closed(true, true, false, 500.0));
+}
+
+TEST(DrawdownBreakerTest, S27_AllUnpricedStillRespectsStartupGrace) {
+    EXPECT_FALSE(unvaluable_book_must_fail_closed(false, true, true, 500.0));
+}
+
+TEST(DrawdownBreakerTest, S27_ATransientAllUnpricedTickWithFreshCarriesDoesNotLatch) {
+    // Review: "all unpriced this heartbeat" is not "we cannot value the
+    // book".  A momentary feed gap with every carry still inside
+    // valuation_carry_ttl_blocks is exactly what the carry mechanism exists
+    // to bridge -- config.hpp: "a data gap must not read as a crash".
+    // Without requiring degradation, one bad tick would permanently latch
+    // the breaker, and a configured TTL of 0 ("never expire") would be
+    // ignored outright.
+    EXPECT_FALSE(unvaluable_book_must_fail_closed(
+        /*grace_elapsed=*/true, /*valuation_degraded=*/false,
+        /*all_held_assets_unpriced=*/true, /*peak_equity_usd=*/500.0));
+
+    // Same tick, but the carries have now expired -> genuinely unvaluable.
+    EXPECT_TRUE(unvaluable_book_must_fail_closed(true, true, true, 500.0));
+}
+
+// ---------------------------------------------------------------------------
+// S32: "no price" is two conditions, and they need opposite responses.
+// ---------------------------------------------------------------------------
+
+TEST(DrawdownBreakerTest, S32_NoConfiguredPathIsWrittenOff) {
+    // wUSDC.b after the warp.green compromise: held, both pairs disabled, so
+    // no market event can ever price it.  Writing it off at $0 is what keeps
+    // the rest of the book valuable and the breakers armed.
+    EXPECT_TRUE(unpriced_asset_is_written_off(
+        /*has_pricing_path=*/false, /*has_carry=*/false));
+}
+
+TEST(DrawdownBreakerTest, S32_AQuietFeedIsNeverWrittenOff) {
+    // THE dangerous case.  A configured pair that simply has no usable mid
+    // this heartbeat -- CoinGecko down, junk book, failed valuation grade --
+    // must ride its carry and degrade, never mark to zero.  On a fresh
+    // process this is also the pre-first-fetch state, so writing it off
+    // would seed the drawdown peak from a near-zero equity and leave the
+    // breaker under-protective for the rest of the run.
+    EXPECT_FALSE(unpriced_asset_is_written_off(
+        /*has_pricing_path=*/true, /*has_carry=*/false));
+    EXPECT_FALSE(unpriced_asset_is_written_off(true, true));
+}
+
+TEST(DrawdownBreakerTest, S32_ACarryOutranksTheWriteOff) {
+    // A carry can only exist if the asset was priced earlier this run, which
+    // contradicts "no path".  If the two ever disagree, the real number the
+    // engine once observed beats a synthetic zero.
+    EXPECT_FALSE(unpriced_asset_is_written_off(
+        /*has_pricing_path=*/false, /*has_carry=*/true));
+}
+
+TEST(DrawdownBreakerTest, S32_WriteOffsDoNotRescueATotallyUnpriceableBook) {
+    // Written-off assets stay out of live_count, so a book made up ENTIRELY
+    // of them still reports all-unpriced and still fails closed.  Equity is
+    // $0, no peak can seed, and the engine must not trade.  This is the
+    // guard against the write-off quietly becoming a way to disable the
+    // breaker for the whole portfolio.
+    EXPECT_TRUE(unvaluable_book_must_fail_closed(
+        /*grace_elapsed=*/true, /*valuation_degraded=*/true,
+        /*all_held_assets_unpriced=*/true, /*peak_equity_usd=*/0.0));
+    EXPECT_TRUE(unvaluable_book_must_fail_closed(true, true, false, 0.0));
+}
+
+TEST(DrawdownBreakerTest, S32_ThePartialBookThatUnblocksResume) {
+    // The live 2026-08-27 shape: XCH, BYC and DBX price fine; wUSDC.b and
+    // wmilliETH.b are written off.  Nothing degrades, so the authority gate
+    // stays armed, the peak seeds from real equity, and the ordinary
+    // drawdown comparison protects the run.
+    EXPECT_FALSE(unvaluable_book_must_fail_closed(
+        /*grace_elapsed=*/true, /*valuation_degraded=*/false,
+        /*all_held_assets_unpriced=*/false, /*peak_equity_usd=*/1234.56));
+}
+
+// ---------------------------------------------------------------------------
+// S33: the degradation guard must not be satisfied by a different asset than
+// the one that went quiet.
+// ---------------------------------------------------------------------------
+
+TEST(DrawdownBreakerTest, S33_AFreshCarryElsewhereStopsTheLatch) {
+    // The reported shape: asset A sits on a long-expired carry (so the
+    // aggregate degraded flag is permanently true) while asset B is live.
+    // B then misses ONE tick with its carry still fresh.  The caller must
+    // report all_held_assets_unpriced=false, because B is being bridged --
+    // otherwise these inputs latch the breaker on a transient.
+    EXPECT_FALSE(unvaluable_book_must_fail_closed(
+        /*grace_elapsed=*/true, /*valuation_degraded=*/true,
+        /*all_held_assets_unpriced=*/false, /*peak_equity_usd=*/500.0));
+
+    // Once B's carry expires too, nothing is bridged and the book really is
+    // unvaluable.
+    EXPECT_TRUE(unvaluable_book_must_fail_closed(true, true, true, 500.0));
+}
