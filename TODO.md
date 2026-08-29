@@ -1,7 +1,16 @@
 # XOPTrader Master TODO List
 
 **Created:** 2026-03-24
-**Last audited: 2026-08-27** -- S32 added while working the two Copilot reviews of PRs #115/#117: the S27 fix, on its own, would have paused the engine on every start with the live config. S27 and S29 moved to `[~]` (built, unmerged). Most other findings in those reviews were already fixed on-branch; both reviews ran against an older snapshot.
+**Last audited: 2026-08-29 (v0.10.0)** -- the seven-PR review cycle merged:
+#115 (peg registry, S29/S30), #117 (S27+S32), #120 (S28), #121 (S31), #118
+(emergency consolidation), #116 (Permuto research + probes), and #119 (the
+complete Permuto trading stack: identity, auth, quoting, risk, the live
+session and the venue switch). Eleven Copilot review rounds plus a
+release-review audit ran against these; every finding is fixed or
+explicitly declined on the PR. What remains below is what was NOT in that
+cycle.
+
+**Previously audited: 2026-08-27** -- S32 added while working the two Copilot reviews of PRs #115/#117: the S27 fix, on its own, would have paused the engine on every start with the live config. S27 and S29 moved to `[~]` (built, unmerged). Most other findings in those reviews were already fixed on-branch; both reviews ran against an older snapshot.
 **Previously audited: 2026-08-26 (v0.9.22)** -- S22/S24/S26-S30 added from the 2026-08-25/26 incident sessions: the warp.green and Circuit DAO compromises, the equity-blindness and dead-pause-flag defects found while responding to them, and the peg registry built in reply. S23 and S25 shipped in v0.9.22 (PRs #113, #114).
 **Previously audited: 2026-08-23 (v0.9.19)** -- statuses refreshed after the release train #96-#107: the spendable-XCH-zero incident fixes (coin-lock ledger PR #107, ensure_split half-split PR #106), the warp claim fix (PR #105, first live bridge completed 2026-08-23), the eth-account pin (PR #104), and the Warp tab split (PR #102).
 **Source:** Consolidated from all code reviews in `docs/CODE REVIEWS/` plus the 2026-08 live-operation sessions.
@@ -12,7 +21,20 @@
 
 ---
 
-## Target scope: v0.9.23 -- make it safe to resume
+## SHIPPED in v0.10.0 (2026-08-29) -- the resume gate is cleared
+
+S27/S32 (#117), S28 (#120), S31 (#121) and the peg registry (#115) are on
+main. The items that gated a defensible resume are done; S13 and S14 remain
+open below and are still marked "touches live order handling: NOT to be
+fixed casually" -- they did not gate the resume and were not rushed into it.
+
+v0.10.0 also ships the PERMUTO stack (#119): a second venue behind its own
+toolbar switch, disabled until the operator registers. Registration closes
+Mon 31 Aug 17:00 ET; the contest runs to Fri 4 Sep 16:00 ET. The operator
+sequence (register -> supervised test order -> arm before the Sunday pause)
+is in TODO-COMPETITION.md.
+
+## Superseded target scope: v0.9.23 -- make it safe to resume
 
 The engine has been paused since 2026-08-25 and every item here is about the
 same failure: **the bot continuing to stand behind quotes it can no longer
@@ -20,11 +42,11 @@ manage.** Ordered by whether resuming without it is defensible.
 
 | item | why it gates a resume |
 | --- | --- |
-| **PR #115** (S29/S30) | peg identity becomes an asset property; `enforce: false` lets an operator switch off a compromised peg without a release. **In flight** |
-| **S27** | with only XCH/DBX enabled, equity is exactly $0 and `equity_drawdown_frac` returns 0.0 on a non-positive peak — **both breakers go inert rather than trip**. Resuming with no drawdown protection is worse than staying paused. **Fix built on `fix/s27-equity-blindness` (PR #117); was the blocker** |
+| **PR #115** (S29/S30) | peg identity becomes an asset property; `enforce: false` lets an operator switch off a compromised peg without a release. **SHIPPED v0.10.0 (PR #115)** |
+| **S27** | with only XCH/DBX enabled, equity is exactly $0 and `equity_drawdown_frac` returns 0.0 on a non-positive peak — **both breakers go inert rather than trip**. Resuming with no drawdown protection is worse than staying paused. **SHIPPED v0.10.0 (PR #117)** |
 | **S32** | the S27 fix, on its own, would have made the engine **pause itself on every start** with the live config — wUSDC.b and wmilliETH.b are held with no enabled pair, so every cycle degrades from cycle 0 and the peak never seeds. Found 2026-08-27 while working the Copilot reviews. **Fixed in PR #117 (78b97f0)** |
-| **S28** | the engine cannot fall back to the wallet for block height, so it sat dead ~2.5h beside a healthy wallet RPC. (The pause-flag half was overstated; corrected in place — pause *is* applied before Step 8 on recovery) |
-| **S31** | nothing cancels the book when the engine stops. Cost $12.71 and a tripped breaker on 08-25, and was demonstrated again on 08-26 when a stray `--dry-run` killed the live process and left 10 offers unmanaged |
+| **S28** | the engine cannot fall back to the wallet for block height, so it sat dead ~2.5h beside a healthy wallet RPC. (The pause-flag half was overstated; corrected in place — pause *is* applied before Step 8 on recovery) **SHIPPED v0.10.0 (PR #120)** |
+| **S31** | nothing cancels the book when the engine stops. Cost $12.71 and a tripped breaker on 08-25, and was demonstrated again on 08-26 when a stray `--dry-run` killed the live process and left 10 offers unmanaged. **SHIPPED v0.10.0 (PR #121)** |
 | **S13** | "wallet needs to be fully synced" is **88% of all error lines** (~4,000 of 4,514). A silently failed cancel leaves a stale quote live — the same outcome as S31, by a different route |
 | **S14** (absorbs S26) | forced cancel retries with the same fee forever. Watched fail for 6+ hours on two offers this week; worst recorded case 158 warnings over 36h with coins locked throughout |
 
