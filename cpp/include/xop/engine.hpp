@@ -1156,6 +1156,15 @@ private:
     /// drawdown breaker unable to fire at all.
     bool valuation_holds_anything_{false};
 
+    /// Set when the pre-trading fail-closed latch fires, cleared when Step 13
+    /// has sent the detailed log and the operator alert.
+    ///
+    /// Needed because Step 13's branch is gated on !breaker_pause_active_,
+    /// so latching earlier would otherwise suppress the very report that
+    /// justified moving the latch forward -- and CircuitBreaker alerts are
+    /// event-driven, so a suppressed one is never re-sent.
+    bool unvaluable_report_pending_{false};
+
     /// [S32 2026-08-27] One-shot log guards. Both conditions re-evaluate
     /// every heartbeat and would otherwise emit a warn line per asset per
     /// block; the operator needs to see each one ONCE, loudly. Not cleared

@@ -1858,10 +1858,15 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
             valuation_holds_anything_)
         && !breaker_pause_active_) {
         breaker_pause_active_ = true;
+        // [review] Step 13's branch is gated on !breaker_pause_active_, so
+        // latching here silently SUPPRESSED the detailed log and the
+        // operator alert -- the exact report the comment promised. Record
+        // that the report is still owed; Step 13 clears it once sent.
+        unvaluable_report_pending_ = true;
         state_->set_status(BotStatus::Paused);
         spdlog::error("[Engine] [S27] the book cannot be valued and the "
                       "grace has elapsed -- pausing BEFORE this cycle trades. "
-                      "Step 13 will report the detail.");
+                      "Step 13 reports the detail.");
     }
 
     try { step_generate_ladder(block_height); }
@@ -14066,13 +14071,19 @@ void Engine::step_check_alerts(BlockHeight block_height)
     // all (so equity is carried fiction sitting at the value the peak was
     // frozen at).  See the predicate for why the second one refutes the
     // "a frozen peak still protects us" reasoning.
-    if (risk::unvaluable_book_must_fail_closed(
-            drawdown_grace_remaining_ == 0,
-            valuation_degraded_,
-            valuation_all_unpriced_,
-            peak_equity_hwm_usd_,
-            valuation_holds_anything_)
-        && !breaker_pause_active_) {
+    const bool unvaluable_now = risk::unvaluable_book_must_fail_closed(
+        drawdown_grace_remaining_ == 0,
+        valuation_degraded_,
+        valuation_all_unpriced_,
+        peak_equity_hwm_usd_,
+        valuation_holds_anything_);
+    // Either this cycle discovered it, or the pre-trading latch did and is
+    // still owed its report. AlertManager treats CircuitBreaker as
+    // event-driven, so a suppressed alert here is not re-sent later -- the
+    // operator simply never hears that the engine stopped.
+    if ((unvaluable_now && !breaker_pause_active_)
+        || unvaluable_report_pending_) {
+        unvaluable_report_pending_ = false;
         breaker_pause_active_ = true;
         state_->set_status(BotStatus::Paused);
         if (valuation_all_unpriced_) {
