@@ -459,6 +459,40 @@ private:
     /// now that cost basis is persisted.
     [[nodiscard]] double usd_per_xch() const;
 
+    // -- [PEG 2026-08-26] Peg identity, asked of the registry ---------------
+    //
+    // These three replace fifteen scattered string comparisons against
+    // "wUSDC.b" / "wUSDC" / "USDS" / "BYC".  They key on ASSET ID, not on
+    // the ticker parsed out of a pair name: symbols collide and get reused
+    // (CoinMarketCap serves two coins called XCH, one dead since 2016),
+    // asset ids do not.
+
+    /// True when the pair's quote asset is declared pegged, enforced, and
+    /// does NOT prefer a market cross -- a fiat-collateralised wrapper,
+    /// whose par is a claim on its CONFIGURED peg currency rather than an
+    /// observation.
+    ///
+    /// [review] Not "a claim on a dollar": peg_currency exists precisely so
+    /// a EUR or JPY wrapper can be declared, and this predicate classifies
+    /// those identically. What differs is what the claim is worth HERE --
+    /// declared_usd_par() supplies no FX rate, so a non-USD wrapper
+    /// classifies as a par wrapper and then values as nullopt until an FX
+    /// feed is wired. Callers deciding "can I price this in USD" must ask
+    /// declared_usd_par(), not this.
+    [[nodiscard]] bool is_par_wrapper_quote(const PairConfig& pc) const;
+
+    /// True when the pair's quote asset is declared pegged, enforced, and
+    /// prefers a live cross over its declared par -- a CDP stablecoin,
+    /// whose dollar value the market decides.
+    [[nodiscard]] bool quote_prefers_market_cross(const PairConfig& pc) const;
+
+    /// Declared par of one unit of @p asset_id in USD, or nullopt when it
+    /// is undeclared, unenforced, or pegged to a currency whose USD rate we
+    /// do not have.  Callers must treat nullopt as "no valuation" and never
+    /// substitute 1.0.
+    [[nodiscard]] std::optional<double> declared_usd_par(
+        const AssetId& asset_id) const;
+
     /// USD value of one QUOTE display unit for the pair.  1.0 for
     /// USD-pegged stables (wUSDC/wUSDC.b/USDS) and BYC; cross-derived for
     /// DBX (usd_per_xch / dbx_per_xch); usd_per_xch for XCH-quoted pairs.
@@ -496,6 +530,21 @@ private:
     /// blip), otherwise it requires the supplying snapshot to be grade.
     /// Single classifier for all three consumers: both branches of
     /// asset_usd_pseudo_price and the P&L conversion refresh.
+    /// [PEG round 5] Asset-keyed form of is_par_wrapper_quote, so a cross
+    /// can be tested from EITHER side of a pair.
+    [[nodiscard]] bool is_par_wrapper_asset(const AssetId& asset_id) const;
+
+    /// One eligible market cross for a prefer_market_cross asset: which pair
+    /// supplies it and what a unit is worth in USD.  Both orientations are
+    /// accepted (<target>/<wrapper> and <wrapper>/<target>, the latter
+    /// inverted).  Empty pair_name means no eligible cross, and the caller
+    /// falls back to declared par.
+    struct CrossQuote {
+        std::string pair_name;
+        double      usd_per_unit{0.0};
+    };
+    [[nodiscard]] CrossQuote market_cross_for(const PairConfig& pc) const;
+
     [[nodiscard]] bool quote_usd_factor_trusted(const PairConfig& pc) const;
 
     /// Convert a pair-quote pseudo-price to a USD-normalized pseudo-price.

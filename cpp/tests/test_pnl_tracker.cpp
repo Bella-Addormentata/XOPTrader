@@ -957,3 +957,59 @@ TEST_F(PnLTrackerTest, CarryPriceFollowsTheOwningPairNotMapOrder) {
     EXPECT_EQ(t.get_pair_pnl("XCH/wUSDC.b").inventory_pnl, 500);
     EXPECT_EQ(t.get_pair_pnl("XCH/BYC").inventory_pnl, 0);
 }
+
+// ---------------------------------------------------------------------------
+// [PEG 2026-08-28] A registered pair whose declared par is unavailable must
+// contribute NOTHING, not one dollar per unit.
+//
+// This is the failure that would have undone the whole peg registry. The
+// engine registers a conversion for every configured pair every cycle; when
+// the quote asset's par is unavailable -- enforce:false, or a non-USD peg
+// with no FX -- quote_usd_factor() yields 0.0, which peg_registry.hpp
+// documents as "no valuation available ... NOT substitute 1.0". The old
+// fallback read the pair NAME, matched wUSDC.b against a hardcoded list, and
+// returned exactly $1.00 per unit.
+//
+// So the operator action this PR exists to support -- disowning a
+// compromised wrapper with enforce:false -- silently restored the $1.00
+// belief it was meant to remove, in the P&L totals rather than in equity.
+// ---------------------------------------------------------------------------
+TEST_F(PnLTrackerTest, ARegisteredPairWithNoUsablePairIsNotWorthADollar) {
+    xop::PnLTracker t(db_path_);
+    t.init_database();
+
+    // Exactly what the engine does when declared_usd_par() returns nullopt.
+    t.set_pair_conversion("XCH/wUSDC.b", "xch", kBaseXchD, kCatDenomD,
+                          /*usd_per_quote_unit=*/0.0);
+
+    ASSERT_TRUE(t.record_fill(
+        make_fill("trade-unpegged", xop::Side::Ask,
+                  static_cast<xop::Mojo>(2.5e12),
+                  static_cast<xop::Mojo>(1e12)),
+        /*fee=*/0, /*cost_basis=*/0, /*realized_pnl=*/500'000));
+
+    const auto s = t.get_total_pnl();
+    // 500,000 quote mojos would have read as $500.00 through the hardcoded
+    // 1e3 mojos-per-unit symbol fallback.
+    EXPECT_DOUBLE_EQ(s.realized_pnl_usd, 0.0)
+        << "an unavailable par was valued at par anyway";
+}
+
+TEST_F(PnLTrackerTest, AnUnregisteredRetiredPairStillUsesTheSymbolFallback) {
+    // The fallback exists for a real case and must survive: rehydration
+    // resurrects pairs no longer in config, which are never registered, and
+    // dropping their history would make the engine and the GUI disagree.
+    xop::PnLTracker t(db_path_);
+    t.init_database();
+
+    xop::Fill f = make_fill("trade-retired", xop::Side::Ask,
+                            static_cast<xop::Mojo>(2.5e12),
+                            static_cast<xop::Mojo>(1e12));
+    f.pair_name = "XCH/wUSDC";          // pre-migration, never registered
+    ASSERT_TRUE(t.record_fill(f, /*fee=*/0, /*cost_basis=*/0,
+                              /*realized_pnl=*/500'000));
+
+    const auto s = t.get_total_pnl();
+    EXPECT_DOUBLE_EQ(s.realized_pnl_usd, 500.0)
+        << "the retired-pair fallback was lost";
+}

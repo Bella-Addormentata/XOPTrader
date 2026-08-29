@@ -1,12 +1,40 @@
 # XOPTrader Master TODO List
 
 **Created:** 2026-03-24
-**Last audited: 2026-08-23 (v0.9.19)** -- statuses refreshed after the release train #96-#107: the spendable-XCH-zero incident fixes (coin-lock ledger PR #107, ensure_split half-split PR #106), the warp claim fix (PR #105, first live bridge completed 2026-08-23), the eth-account pin (PR #104), and the Warp tab split (PR #102).
+**Last audited: 2026-08-26 (v0.9.22)** -- S22/S24/S26-S30 added from the 2026-08-25/26 incident sessions: the warp.green and Circuit DAO compromises, the equity-blindness and dead-pause-flag defects found while responding to them, and the peg registry built in reply. S23 and S25 shipped in v0.9.22 (PRs #113, #114).
+**Previously audited: 2026-08-23 (v0.9.19)** -- statuses refreshed after the release train #96-#107: the spendable-XCH-zero incident fixes (coin-lock ledger PR #107, ensure_split half-split PR #106), the warp claim fix (PR #105, first live bridge completed 2026-08-23), the eth-account pin (PR #104), and the Warp tab split (PR #102).
 **Source:** Consolidated from all code reviews in `docs/CODE REVIEWS/` plus the 2026-08 live-operation sessions.
 
 **Status Key:** `[ ]` = Not started | `[~]` = In progress | `[x]` = Complete
 
 > Items closed before this audit (Tiers 1–3, T5–T7, and all previously-`[x]` entries) are archived — see this file's pre-audit revision in git history (`git show d3fc381:TODO.md`).
+
+---
+
+## Target scope: v0.9.23 -- make it safe to resume
+
+The engine has been paused since 2026-08-25 and every item here is about the
+same failure: **the bot continuing to stand behind quotes it can no longer
+manage.** Ordered by whether resuming without it is defensible.
+
+| item | why it gates a resume |
+| --- | --- |
+| **PR #115** (S29/S30) | peg identity becomes an asset property; `enforce: false` lets an operator switch off a compromised peg without a release. **In flight** |
+| **S27** | with only XCH/DBX enabled, equity is exactly $0 and `equity_drawdown_frac` returns 0.0 on a non-positive peak — **both breakers go inert rather than trip**. Resuming with no drawdown protection is worse than staying paused. **The blocker** |
+| **S28** | the engine cannot fall back to the wallet for block height, so it sat dead ~2.5h beside a healthy wallet RPC. (The pause-flag half was overstated; corrected in place — pause *is* applied before Step 8 on recovery) |
+| **S31** | nothing cancels the book when the engine stops. Cost $12.71 and a tripped breaker on 08-25, and was demonstrated again on 08-26 when a stray `--dry-run` killed the live process and left 10 offers unmanaged |
+| **S13** | "wallet needs to be fully synced" is **88% of all error lines** (~4,000 of 4,514). A silently failed cancel leaves a stale quote live — the same outcome as S31, by a different route |
+| **S14** (absorbs S26) | forced cancel retries with the same fee forever. Watched fail for 6+ hours on two offers this week; worst recorded case 158 warnings over 36h with coins locked throughout |
+
+**Not in scope, deliberately.** S24 (reconciliation dominating the
+heartbeat) and S22 (pre-S20 DB junk, plus the S11 orphan backfill) are real
+but neither prevents a safe restart. S15 (11,798 spread warnings, 14% of all
+warnings, still firing while paused) is cheap noise reduction — include only
+if there is room.
+
+**Note on S13 and S14:** both are marked "touches live order handling: NOT
+to be fixed casually". They want care, not speed. But both directly caused
+exposure this week.
 
 ---
 
@@ -158,7 +186,15 @@
 - **Issue:** Rows stay `status='pending'` indefinitely when an offer ends without the resolution being written back. Measured 2026-08-21: 23 of 57 pending rows are over a day old, the oldest dated 2026-08-08, against a chain 38k blocks ahead. Taking the best price across all pending rows reported a SELF-CROSSED book (bid 1.4857 above ask 1.4534) on XCH/BYC. The engine separately logs `verify_pending_offer_coins: offer ... has terminal wallet status 3 but still in State` 1,614 times, which looks like the same class of bookkeeping gap — though five sampled ids from those warnings do NOT appear among the stale rows, so the link is unconfirmed.
 - **Also affected:** `fetch_deployed_capital()` aggregates every pending row the same way, so the Balances tab's "Deployed %" is likely overstated by the same ghosts. Not yet quantified.
 - **The heuristic is wrong in BOTH directions.** Too wide and eight-day ghosts return; too narrow and genuinely resting offers disappear. Observed 2026-08-22 while the engine was paused by the drawdown breaker: no new offers were posted for hours, so every side aged out of the 6.25h window and the panel showed em dashes — yet those offers were still resting on chain and takeable, because a pause stops new posting without cancelling what is live. An operator reading the panel would think we had no book at all.
-- **Status:** `[ ]` — OPEN. The dashboard's per-pair table works around this with a TTL-derived recency window (PR #94), which is a display heuristic only: age cannot distinguish a ghost from a legitimately resting offer. The real fix is for reconciliation to retire rows authoritatively, or for consumers to query live offer state.
+- **Status:** `[x]` — LARGELY RESOLVED by S25 (PR #114, shipped v0.9.22).
+  The root cause was exactly what S25 fixed: terminal outcomes were detected
+  every cycle and never written down. Measured 2026-08-26, two days after
+  the release: **pending+unresolved is 10, down from 48**, and **61 terminal
+  outcomes were written in 48 hours**. Remaining work is not this bug: the
+  10 survivors are the orphan class PR #114 identified (the wallet no longer
+  knows them, so they can never self-heal) and need the bounded backfill
+  SQL from that PR description, run once by the operator against the live
+  DB. Tracked with S22.
 
 ### S12: One spurious print latches a GLOBAL offer halt for ~1000 blocks
 - **Files:** `cpp/src/risk/limits.cpp` (`check_flash_crash`), `cpp/src/engine.cpp` (flash-crash state machine)
@@ -176,6 +212,24 @@
 - **Files:** `cpp/src/engine.cpp:7109-7121`, `cpp/src/execution/offer_manager.cpp:3206`
 - **Issue:** The forced-cancel loop retries with the SAME fee indefinitely: worst case one offer re-warned 158 times over ~36 h (age 851 → 7,782 blocks), fee frozen at 5,000 mojos on every attempt. While stuck, coins stay locked (170 "entering XCH-buy-only mode" warnings) and the quote stays live. Mostly downstream of S13.
 - **Status:** `[ ]` — OPEN. Escalation ladder: retry with escalated fee → delete_unconfirmed_transactions + re-cancel → mark unrecoverable and alert ONCE. Rate-limit the per-offer warning. Touches live order handling.
+- **[2026-08-26] S26 folded in here.** A separate item was filed after
+  watching two wmilliETH.b/XCH bids (`0xa49d5c9edd`, `0xca4eed3a27`) be
+  reported stuck and "attempting forced cancel" on every cycle for 6+ hours,
+  age climbing 895 -> 1173 blocks (~3x the 400-block TTL), with no error
+  logged after the attempt. Same signature later on XCH/DBX ("3 stuck
+  offers ... attempting forced cancel"). That is not a new bug -- it is this
+  one observed live, and S14 already names the mechanism (same fee, retried
+  forever). Filing it twice was a duplicate on my part.
+- **Second call site:** the escalation ladder must also cover
+  `engine.cpp:7435` (`cancel_stale` in Step 8), not only 7109-7121.
+- **⚠ Do NOT route `engine.cpp:7439` through the S25 re-verify buffer.**
+  That write looks like the ones S25 fixed, but `cancel_stale` is
+  *self-initiated*: the wallet reports PENDING_CANCEL for a while, which
+  `recheck_terminal` reads as non-terminal and would discard -- breaking a
+  path that currently works.
+- **Diagnose before fixing:** either `cancel_stale` is not returning these
+  ids, or the cancel is issued and does not take. Different fixes.
+
 
 ### S15: Spread-cap warning fires every block, including while paused
 - **Files:** `cpp/src/engine.cpp:3456`
@@ -281,6 +335,71 @@
   divergence control runs, so the movement is explained rather than
   adjusted. P&L tracker gains a net-deposits component excluded from
   performance; GUI P&L display gains a "Net deposits" line.
+
+### S22: pre-S20 junk persisted to the DB
+- **Files:** `data/xop_trader.db` (`inventory_state`, `snapshots`)
+- **Issue:** S20 stops junk prints reaching equity going forward, but rows written before it survive -- BYC/wUSDC.b `sigma_annual=143.30` from a warm-start, and cost basis stamped at junk prices.
+- **Status:** `[ ]` — Live DB, so any sweep needs an explicit operator go-ahead.
+
+### S24: run_full_reconciliation dominates the heartbeat
+- **Files:** `cpp/src/engine.cpp` (Step 8 reconciliation), `cpp/src/rpc/chia_rpc.cpp`
+- **Issue:** ~800s of every ~840s cycle spent in reconciliation, scanning blocks at ~12.5s each. Pre-existing but invisible while v0.9.20 was breaker-paused.
+- **Status:** `[ ]` — Suspected contributor to the 2026-08-25 full-node RPC wedge: sustained scan load against an I/O-strained node. Unproven, but the two facts sit close together.
+
+
+### S27: assets with no enabled pair price at $0 -- silently, and the S20 gate cannot see it
+- **Files:** `cpp/src/engine.cpp:11582` (`asset_usd_pseudo_price`), `:11277` (`usd_per_xch`), `cpp/include/xop/risk/drawdown_breaker.hpp`
+- **Issue:** `asset_usd_pseudo_price` prices an asset only through **enabled** pairs. Disabling the wUSDC.b pairs on 2026-08-25 therefore dropped XCH, DBX, wUSDC.b and wmilliETH.b to $0 each, leaving equity equal to the BYC balance alone (peak $63.82 == 63.818 BYC). Two compounding faults: (a) `usd_per_xch()` accepts **only** an enabled `XCH/⟨wUSDC.b|wUSDC|USDS⟩` pair as its anchor -- BYC never qualified -- so `snapshots.xch_usd_rate` went from 1.9165 (35% too high, priced through a depegged wrapper) to 0.0; (b) the S20 carry-expiry degradation check is nested **inside** the "carry entry found" branch, so an asset that was NEVER valued contributes $0 without setting `degraded`, the `ValuationAuthorityGate` never fires, and the peak re-anchors to a partial book.
+- **Consequence:** with only XCH/DBX enabled, equity is exactly $0. `equity_drawdown_frac` returns 0.0 when the peak is non-positive, so **both breakers go inert rather than trip** -- trading with no drawdown protection, and fills landing on `record_fill_unpriced`.
+- **Status:** `[ ]` — Fix has three parts: decouple price/peg **observation** from `pair.enabled` (a disabled pair should still be watched); make "never valued" set `degraded`; and let `usd_per_xch()` prefer the **external** CoinGecko XCH/USD already in `coingecko_prices_` (three call sites exist) with the DEX-derived mid as fallback. The last is the only anchor that survives both issuers being compromised.
+
+### S28: engine cannot fall back to the wallet for block height mid-outage
+- **Files:** `cpp/src/engine.cpp:1237` (height call), `:13901-13929` (`open_connections`), `:1597` (`check_pause_flag`)
+- **⚠ CORRECTED 2026-08-27.** Originally filed as "the GUI pause flag is unreachable during a node outage", claiming Pause and Resume are dead controls. **That was overstated.** `check_pause_flag()` runs at the TOP of `on_new_block_coro` (1597) while Step 8 posts at 1881, so on recovery the flag IS read before anything posts — and during the outage nothing is trading regardless. The flag genuinely is not read *while* the node is down, but the safety consequence asserted does not follow from that.
+- **What is actually wrong, in two parts of very different weight:**
+  1. **SUBSTANTIVE — no wallet fallback.** `wallet_only_mode_` is assigned only inside `open_connections()`, so the `mode: auto` decision is one-shot at startup. On 2026-08-25 the full node was unreachable for ~2.5h (529 consecutive `get_block_height` failures) **while the wallet RPC stayed healthy the whole time** — and `wallet_->get_height_info()` is already the height source in wallet-only mode. The engine sat dead beside a working alternative it could not switch to.
+  2. **MINOR — no pause feedback during an outage.** An operator who sets `pause.flag` while the node is down gets no log line and a stale GUI status, so cannot tell whether it registered. `check_pause_flag()` is pure filesystem and state with no RPC, so it can safely be called from the poll loop before the height call.
+- **Status:** `[ ]` — (2) is trivial and safe. (1) is the real item and needs care: switching height source mid-flight changes which RPC the heartbeat depends on, and `mode: auto` semantics need thought. Re-scoped, not descoped.
+
+
+### S29: peg identity is a repeated string comparison, not a property of the asset
+- **Files:** `cpp/include/xop/peg_registry.hpp` (new), `cpp/src/engine.cpp` (5 sites), `cpp/src/monitoring/pnl.cpp:1512`, `cpp/src/strategy/arbitrage.cpp:916`, `cpp/src/strategy/market_allocator.cpp:188`, `cpp/include/xop/feed_listings.hpp:47`
+- **Issue:** 15 sites each ask a variant of `quote == "wUSDC.b" || ... == "USDS"` and independently conclude "worth exactly $1". Two failures followed: BYC's depeg watch existed only because a *pair* carried `is_stablecoin`, so disabling BYC/wUSDC.b removed monitoring from the asset that had just become the book's dollar anchor; and `quote_usd_factor`'s BYC branch falls through to `return 1.0`, so BYC kept marking the portfolio at par after Circuit DAO announced the protocol would be sunset.
+- **Status:** `[~]` — Registry built and the VALUATION call sites converted
+  on `feat/peg-registry` (PR #115): `engine.cpp` now contains zero
+  comparisons against `"wUSDC.b"` / `"wUSDC"` / `"USDS"` / `"BYC"` and no
+  bare `return 1.0` in the USD-factor path. Asset-keyed, declares the peg
+  **currency** (so EUR/JPY pegs are expressible and a missing FX rate yields
+  *no valuation* rather than a silent 1:1), separates `Unobserved` from
+  `Holding`, and has an `enforce` flag. 22 registry tests plus 14 parser
+  tests, sabotage-verified.
+  **`pnl.cpp:1512` is now handled too, and it was the dangerous one.** Its
+  retired-pair fallback triggered whenever `usd_per_quote_unit <= 0`, which
+  is exactly what `quote_usd_factor` returns when a declared par is
+  UNAVAILABLE — so `enforce:false` on wUSDC.b, the whole point of this work,
+  silently routed back to a hardcoded $1.00 per unit in the P&L totals.
+  Registered-but-unpriceable now contributes 0.0; only never-registered
+  pairs keep the symbol fallback, which rehydration genuinely needs.
+  **Still carrying the $1 assumption:** `arbitrage.cpp:916`,
+  `market_allocator.cpp:188`, `feed_listings.hpp:47`.
+  **STILL OPEN — the observation half.** `PegRegistry::classify` has no
+  production caller; `DepegDetector` is registered and updated solely from
+  `PairConfig::is_stablecoin` and the pair loop, so disabling `BYC/wUSDC.b`
+  still removes BYC's only peg observation. Wiring an asset-level detector
+  independent of `pair.enabled` is the remaining work, and is what actually
+  closes S30.
+
+### S30: both issuers of our quote assets were compromised within a day
+- **Files:** `config.yaml` (pairs), `TODO-COMPETITION.md`, memory `warp-green-bridge-compromise`
+- **Issue:** warp.green (minter of every `.b` asset) reported compromised 2026-08-25 — wUSDC.b traded ~26% below par on the implied peg for hours while accounting valued it at $1.00. Then Circuit DAO reported its treasury drained and stated the protocol "will have to be sunset and relaunched", so BYC is being wound down rather than merely depegged. Four XCH→BYC asks filled 2–4 hours *after* that announcement, because BYC had no external feed and its only peg watch was on the pair we had already disabled.
+- **Status:** `[~]` — Contained: trading paused, all BYC/wUSDC.b-acquiring offers cancelled (0 takeable), XCH/wUSDC.b, BYC/wUSDC.b, wmilliETH.b/XCH and XCH/BYC all disabled, `recovery.pair_allowlist` emptied. **Open:** the ~58 BYC and ~79 wUSDC.b holdings, and whether to follow Circuit's relaunch. Both are operator calls. Blocks S27 — with every stablecoin pair disabled there is no USD anchor left, which is why the external-feed fix matters.
+
+### S31: no dead man's switch -- a wedged engine leaves live offers on the book
+- **Files:** `cpp/src/engine.cpp` (heartbeat), `cpp/src/execution/offer_manager.cpp`
+- **Issue:** On 2026-08-25 the engine spent ~4h unable to reach the full node while offers rested on dexie. When the node returned, six four-hour-old XCH/BYC bids filled in the same second and the rolling-window breaker tripped (-$12.71 over 3 blocks). Nothing cancels our book when the engine stops functioning -- the offers outlive the process that is supposed to be managing them. S28 compounds it differently from how this item first claimed: `pause.flag` is not read *during* the outage, but it IS applied before Step 8 on recovery (see the correction in S28), so the operator can still stop the engine — what they cannot do is retract the already-live book, which is exactly why this item is separate from S28.
+- **Prior art:** Permuto exposes exactly this as a first-class endpoint (`POST /exchange/schedule_cancel`, Hyperliquid-style): arm a future cancel-all, extend it on every healthy loop, and the venue cancels for you if you stop. Policy there is `min_delay_ms` 5000, `max_triggers_per_day` 10 fresh arms, with rescheduling-while-armed unlimited -- so the pattern is *extend*, never disarm-and-rearm. See `docs/permuto-api-reference.md` §2, which lands with PR #116 -- this path does not exist on `main` until that merges.
+- **Design note:** dexie has no server-side equivalent, so ours must be local and must NOT depend on the heartbeat it is protecting against -- a watchdog inside the loop that wedges is worthless. Wallet RPC stayed healthy throughout the 2026-08-25 outage while the full node was unreachable, so a wallet-only cancel path is viable.
+- **Status:** `[ ]` — Identified 2026-08-26 while scoping Permuto; the capability is a straight transfer back to the dexie bot.
 
 ### S21: Bridge chronology uses status time, not wallet-effect time (bounded, deferred)
 

@@ -11275,14 +11275,55 @@ void Engine::step_run_hedging([[maybe_unused]] BlockHeight block_height)
 // DBX cross-derived, XCH from a live stable-quoted mid.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// [PEG 2026-08-26] Peg identity helpers -- see engine.hpp for why these
+// exist and why they key on asset id rather than on a parsed ticker.
+// ---------------------------------------------------------------------------
+bool Engine::is_par_wrapper_asset(const AssetId& asset_id) const
+{
+    const auto* a = config_.pegged_assets.find(asset_id);
+    return a != nullptr && a->enforce && !a->prefer_market_cross;
+}
+
+bool Engine::is_par_wrapper_quote(const PairConfig& pc) const
+{
+    return is_par_wrapper_asset(pc.quote_asset_id);
+}
+
+bool Engine::quote_prefers_market_cross(const PairConfig& pc) const
+{
+    const auto* a = config_.pegged_assets.find(pc.quote_asset_id);
+    return a != nullptr && a->enforce && a->prefer_market_cross;
+}
+
+std::optional<double> Engine::declared_usd_par(const AssetId& asset_id) const
+{
+    // No FX rate is supplied here, so a non-USD peg yields nullopt rather
+    // than a silent 1:1 substitution.  Wiring a live FX feed is the
+    // follow-up that makes EUR/JPY pegs usable; until then, declaring one
+    // produces "no valuation" and the caller falls through exactly as it
+    // does for a missing mid.
+    return config_.pegged_assets.usd_par_value(asset_id);
+}
+
 double Engine::usd_per_xch() const
 {
     for (const auto& pair : config_.pairs) {
         if (!pair.enabled || pair.base_asset_id != "xch") continue;
-        const auto slash = pair.name.find('/');
-        if (slash == std::string::npos) continue;
-        const std::string quote = pair.name.substr(slash + 1);
-        if (quote == "wUSDC.b" || quote == "wUSDC" || quote == "USDS") {
+        // [review] No slash check. It is left over from when this matched on
+        // the display NAME; the lookup below is entirely by canonical asset
+        // id, and parse_pairs() accepts names without a slash (only
+        // revive_market imposes one). So a legitimately-configured pair whose
+        // name happens to lack "/" was silently skipped as an anchor, while
+        // validate_usd_anchor() -- which never looks at the name -- reported
+        // the config as anchored. Startup said fine and the runtime returned
+        // 0.
+        // [PEG 2026-08-26] Was a hardcoded symbol list.  Now asks the
+        // registry, keyed on ASSET ID rather than the ticker parsed out of
+        // the pair name -- symbols collide and get reused, asset ids do
+        // not.  A wrapper is one that does NOT prefer a market cross: its
+        // par is a claim on a dollar, not an observation.
+        if (is_par_wrapper_quote(pair)) {
             auto snap = state_->get_market(pair.name);
             // [S20 2026-08-24] NOT gated on mid_valuation_grade.  Grade
             // requires a fresh two-sided FILTERED book or a fresh CEX leg,
@@ -11294,9 +11335,20 @@ double Engine::usd_per_xch() const
             // breaker's own anchor.  The published mid is already gated
             // against an independent anchor before it reaches State, which
             // is where junk is meant to be stopped.
-            if (snap.mid_price > 0) {
-                return static_cast<double>(snap.mid_price)
-                     / static_cast<double>(kMojosPerXch);
+            // [PEG 2026-08-27] Multiply by the quote's DECLARED par rather
+            // than assuming one unit is one dollar.  The mid here is
+            // denominated in the quote asset, so for a EUR-pegged wrapper
+            // -- or any non-unit target -- returning it raw would silently
+            // report EUR as USD.  An unavailable par (no FX rate, or the
+            // peg no longer enforced) means this pair cannot anchor XCH;
+            // continue to the next candidate rather than guessing.
+            const auto par = declared_usd_par(pair.quote_asset_id);
+            if (par) {
+                if (auto usd = usd_per_base_from_mid(
+                        static_cast<double>(snap.mid_price),
+                        static_cast<double>(kMojosPerXch), *par)) {
+                    return *usd;
+                }
             }
         }
     }
@@ -11322,26 +11374,40 @@ double Engine::usd_per_xch() const
 // one snapshot's grade while consuming another snapshot's price -- passing
 // an ungraded factor or rejecting a graded one.  Both callers below derive
 // from this single answer so they cannot drift apart.
-std::string Engine::byc_cross_source_pair(const PairConfig& pc) const
+Engine::CrossQuote Engine::market_cross_for(const PairConfig& pc) const
 {
+    // [review round 2, 115-3] The DECISION lives in peg_registry.hpp so it
+    // can be tested without constructing an Engine -- which builds every
+    // subsystem, which is why nothing tested this and why the orientation
+    // and declared-par fixes could have regressed with the suite green.
+    // What is left here is the adapter: read config and snapshots, convert
+    // mids to display units, hand over.
     constexpr double kMaxCrossSpreadBps = 300.0;
+
+    std::vector<CrossCandidate> candidates;
+    candidates.reserve(config_.pairs.size());
     for (const auto& other : config_.pairs) {
         if (!other.enabled) continue;
-        if (other.base_asset_id != pc.quote_asset_id) continue;
-        const auto oslash = other.name.find('/');
-        if (oslash == std::string::npos) continue;
-        const std::string oquote = other.name.substr(oslash + 1);
-        if (oquote != "wUSDC.b" && oquote != "wUSDC" && oquote != "USDS") {
-            continue;
-        }
         auto snap = state_->get_market(other.name);
-        if (snap.mid_price > 0
-            && snap.spread_bps > 0.0
-            && snap.spread_bps <= kMaxCrossSpreadBps) {
-            return other.name;
-        }
+        candidates.push_back(CrossCandidate{
+            other.base_asset_id,
+            other.quote_asset_id,
+            other.name,
+            static_cast<double>(snap.mid_price)
+                / static_cast<double>(kMojosPerXch),
+            snap.spread_bps,
+        });
     }
-    return {};
+
+    const auto sel = select_market_cross(
+        pc.quote_asset_id, candidates, config_.pegged_assets,
+        kMaxCrossSpreadBps);
+    return CrossQuote{sel.pair_name, sel.usd_per_unit};
+}
+
+std::string Engine::byc_cross_source_pair(const PairConfig& pc) const
+{
+    return market_cross_for(pc).pair_name;
 }
 
 // [S20 2026-08-24] Which pair's published snapshot quote_usd_factor()
@@ -11350,13 +11416,27 @@ std::string Engine::byc_cross_source_pair(const PairConfig& pc) const
 // factor needs no snapshot (par) or none is available.
 std::string Engine::quote_usd_factor_source_pair(const PairConfig& pc) const
 {
-    const auto slash = pc.name.find('/');
-    const std::string quote = (slash == std::string::npos)
-        ? std::string{}
-        : pc.name.substr(slash + 1);
-
-    if (quote == "BYC") {
+    if (quote_prefers_market_cross(pc)) {
         return byc_cross_source_pair(pc);
+    }
+    // [review] The PAR case answers "no source", ahead of the XCH-base rule.
+    //
+    // This is what the contract above already promised -- "Empty when the
+    // factor needs no snapshot (par)" -- and the code did not do it, because
+    // an XCH/<par wrapper> pair matched the generic base_asset_id == "xch"
+    // rule first and named itself as its own market source. quote_usd_factor()
+    // answers such a pair from declared_usd_par(): a constant, read from no
+    // market at all.
+    //
+    // The consequence was a silent data loss rather than a wrong number.
+    // Disable such a pair -- an ordinary thing to do while triaging a market
+    // -- and step_update_pnl() sees the factor sourced from a pair that is
+    // itself disabled, marks it untrusted, and on a fresh process (where the
+    // in-memory carry map starts empty) registers 0 for it. That pair's
+    // historical USD P&L disappears, and the drawdown breaker reads the
+    // result.
+    if (is_par_wrapper_quote(pc)) {
+        return {};
     }
     if (pc.base_asset_id == "xch") {
         return pc.name;   // DBX-style: derived from this pair's own mid
@@ -11393,15 +11473,10 @@ bool Engine::quote_usd_factor_trusted(const PairConfig& pc) const
 
 bool Engine::quote_usd_factor_is_par(const PairConfig& pc) const
 {
-    const auto slash = pc.name.find('/');
-    const std::string quote = (slash == std::string::npos)
-        ? std::string{}
-        : pc.name.substr(slash + 1);
-
-    if (quote == "wUSDC.b" || quote == "wUSDC" || quote == "USDS") {
+    if (is_par_wrapper_quote(pc)) {
         return true;
     }
-    if (quote == "BYC") {
+    if (quote_prefers_market_cross(pc)) {
         // Par exactly when no eligible cross exists -- the same question
         // byc_cross_source_pair answers, so the two cannot disagree about
         // which snapshot (if any) supplies the factor.
@@ -11412,15 +11487,25 @@ bool Engine::quote_usd_factor_is_par(const PairConfig& pc) const
 
 double Engine::quote_usd_factor(const PairConfig& pc) const
 {
-    const auto slash = pc.name.find('/');
-    const std::string quote = (slash == std::string::npos)
-        ? std::string{}
-        : pc.name.substr(slash + 1);
-
     // Fiat-collateralised wrappers hold their peg tightly enough to treat
     // as exactly $1 for accounting (matches the GUI's pnl_usdc_expr).
-    if (quote == "wUSDC.b" || quote == "wUSDC" || quote == "USDS") {
-        return 1.0;
+    // [PEG 2026-08-26] The 1.0 is no longer written here.  It comes from
+    // whatever the operator declared for this asset, and an asset whose peg
+    // is no longer enforced yields nothing at all.
+    //
+    // [review] A NON-USD peg also yields nothing, today. The earlier wording
+    // here said a EUR-pegged wrapper "yields its EURUSD value", which
+    // declared_usd_par() cannot do -- it supplies no FX rate, so such an
+    // asset returns nullopt and this branch returns 0.0. Wiring a live FX
+    // feed is the follow-up that makes EUR/JPY pegs usable; until then a
+    // declared non-USD peg produces "no valuation", exactly as a missing mid
+    // does. Documenting the intended behaviour as the current one is how a
+    // reader concludes the feature exists.
+    if (is_par_wrapper_quote(pc)) {
+        if (auto par = declared_usd_par(pc.quote_asset_id)) {
+            return *par;
+        }
+        return 0.0;
     }
 
     // BYC is a Chia-native CDP stablecoin.  This branch used to prefer the
@@ -11440,30 +11525,24 @@ double Engine::quote_usd_factor(const PairConfig& pc) const
     // (midpoint worst-case error ~150 bps, comparable to the peg's), and
     // fall back to par otherwise.  spread_bps is 0 for one-sided or crossed
     // books, which also (correctly) selects par.
-    if (quote == "BYC") {
-        constexpr double kMaxCrossSpreadBps = 300.0;
-        for (const auto& other : config_.pairs) {
-            if (!other.enabled) continue;
-            if (other.base_asset_id != pc.quote_asset_id) continue;
-            const auto oslash = other.name.find('/');
-            if (oslash == std::string::npos) continue;
-            const std::string oquote = other.name.substr(oslash + 1);
-            if (oquote != "wUSDC.b" && oquote != "wUSDC" && oquote != "USDS") {
-                continue;
-            }
-            auto snap = state_->get_market(other.name);
-            // [S20] The S17 tight-spread test already establishes a live
-            // two-sided book here, which is the same evidence grade would
-            // ask for; adding grade would only fold in the CEX-availability
-            // dependency described at usd_per_xch.
-            if (snap.mid_price > 0
-                && snap.spread_bps > 0.0
-                && snap.spread_bps <= kMaxCrossSpreadBps) {
-                return static_cast<double>(snap.mid_price)
-                     / static_cast<double>(kMojosPerXch);
-            }
+    if (quote_prefers_market_cross(pc)) {
+        // Same resolver byc_cross_source_pair() projects, so the snapshot
+        // whose grade is checked is always the snapshot whose price is
+        // consumed -- the inconsistency class S20 was burned by.
+        const auto cross = market_cross_for(pc);
+        if (!cross.pair_name.empty()) {
+            return cross.usd_per_unit;
         }
-        return 1.0;
+        // [PEG 2026-08-26] No eligible cross, so fall back to the DECLARED
+        // par rather than a 1.0 written here.  This is the line that kept
+        // marking BYC at a dollar after its issuer announced the protocol
+        // would be sunset: with the value hardcoded there was nothing an
+        // operator could turn off.  Now clearing `enforce` in config stops
+        // it, and an undeclared asset yields no valuation at all.
+        if (auto par = declared_usd_par(pc.quote_asset_id)) {
+            return *par;
+        }
+        return 0.0;
     }
 
     if (pc.quote_asset_id == "xch") {
@@ -11496,8 +11575,16 @@ Mojo Engine::to_usd_pseudo(Mojo pair_price, const PairConfig& pc) const
     if (pair_price <= 0) return 0;
     const double f = quote_usd_factor(pc);
     if (f <= 0.0) return 0;
-    return static_cast<Mojo>(std::llround(
-        static_cast<double>(pair_price) * f));
+    // Checked, not cast. The product is a 1e12-scaled rate times a factor,
+    // and neither operand alone tells you whether it lands inside Mojo --
+    // bounding the declaration was not enough. 0 is the established "no USD
+    // valuation" answer here, and every caller already handles it.
+    if (const auto m = to_mojo_checked(static_cast<double>(pair_price) * f)) {
+        return *m;
+    }
+    spdlog::warn("[Engine] to_usd_pseudo({}) overflowed for {} at factor {}; "
+                 "reporting no valuation", pair_price, pc.name, f);
+    return 0;
 }
 
 Mojo Engine::from_usd_pseudo(Mojo usd_price, const PairConfig& pc) const
@@ -11505,8 +11592,14 @@ Mojo Engine::from_usd_pseudo(Mojo usd_price, const PairConfig& pc) const
     if (usd_price <= 0) return 0;
     const double f = quote_usd_factor(pc);
     if (f <= 0.0) return 0;
-    return static_cast<Mojo>(std::llround(
-        static_cast<double>(usd_price) / f));
+    // Division has the mirror problem: an arbitrarily SMALL positive factor
+    // passes coherence and produces an enormous quotient.
+    if (const auto m = to_mojo_checked(static_cast<double>(usd_price) / f)) {
+        return *m;
+    }
+    spdlog::warn("[Engine] from_usd_pseudo({}) overflowed for {} at factor "
+                 "{}; reporting no valuation", usd_price, pc.name, f);
+    return 0;
 }
 
 // [S20 2026-08-24] Triangulated implied cross for the published-mid gate.
@@ -11604,8 +11697,21 @@ Mojo Engine::asset_usd_pseudo_price(const AssetId& asset_id) const
         }
         const double f = quote_usd_factor(pair);
         if (snap.mid_price > 0 && snap.mid_valuation_grade && f > 0.0) {
-            return static_cast<Mojo>(std::llround(
-                static_cast<double>(snap.mid_price) * f));
+            // [sweep] Checked, like the quote branch below. This one was
+            // missed when the guard went in, and it is the branch the
+            // overflow actually reaches: mid_price is 1e12-scaled, so a
+            // 20-unit mid against the maximum declarable par is 2e19 -- the
+            // exact product test_peg_registry.cpp asserts to be out of range.
+            // `continue` rather than 0, because another enabled pair may
+            // still price this asset as base.
+            if (const auto m = to_mojo_checked(
+                    static_cast<double>(snap.mid_price) * f)) {
+                return *m;
+            }
+            spdlog::warn("[Engine] asset_usd_pseudo_price({}) overflowed via "
+                         "{} at factor {}; trying the next pair",
+                         asset_id.substr(0, 12), pair.name, f);
+            continue;
         }
     }
     // Otherwise price it as the QUOTE of an enabled pair (per-unit value).
@@ -11631,8 +11737,11 @@ Mojo Engine::asset_usd_pseudo_price(const AssetId& asset_id) const
         }
         const double f = quote_usd_factor(pair);
         if (f > 0.0) {
-            return static_cast<Mojo>(std::llround(
-                f * static_cast<double>(kMojosPerXch)));
+            if (const auto m = to_mojo_checked(
+                    f * static_cast<double>(kMojosPerXch))) {
+                return *m;
+            }
+            continue;
         }
     }
     return 0;
@@ -13178,11 +13287,39 @@ void Engine::step_update_pnl(BlockHeight block_height)
     // discontinuity this guard exists to avoid.  0 is used only before any
     // trusted factor has ever been seen, where there is no mark to
     // preserve.
+    // [review 2026-08-28] EVERY CONFIGURED PAIR, enabled or not.
+    //
+    // Skipping disabled pairs here kept them out of pair_conv_ entirely, and
+    // PnLTracker treats "not registered" as licence to fall back to a
+    // hardcoded symbol list worth exactly $1.00 per unit. So the documented
+    // response to the 2026-08-25 incident -- enforce:false on wUSDC.b AND
+    // disabling its pairs -- still marked every historical wUSDC.b and BYC
+    // position at par, which is the belief this whole change exists to
+    // remove. Registering a disabled pair costs one map write and turns it
+    // into "registered but unpriceable", which now contributes nothing.
+    //
+    // A pair that was enabled earlier keeps its last trusted factor through
+    // the carry below, so disabling a market does not discontinuously rewrite
+    // its history either.
     for (const auto& pair : config_.pairs) {
-        if (!pair.enabled) continue;
-
         double     factor  = quote_usd_factor(pair);
-        const bool trusted = quote_usd_factor_trusted(pair);
+
+        // [review] Suppress a fresh factor only when its SOURCE is the
+        // disabled pair itself. Gating on pair.enabled alone discarded
+        // factors that never came from this pair's market -- a declared par
+        // needs no market at all, and an XCH-quoted pair's factor is
+        // usd_per_xch(), which is independent of whether this market is
+        // switched on. After a restart the carry map is empty, so those
+        // pairs registered with factor 0 and their historical USD P&L
+        // vanished from the totals.
+        //
+        // quote_usd_factor_source_pair() returns empty when there is no
+        // market source, and this pair's own name when there is one.
+        const std::string factor_src = quote_usd_factor_source_pair(pair);
+        const bool source_is_this_disabled_pair =
+            !pair.enabled && factor_src == pair.name;
+        const bool trusted = !source_is_this_disabled_pair
+                          && quote_usd_factor_trusted(pair);
 
         if (trusted && factor > 0.0) {
             last_trusted_quote_usd_factor_[pair.name] = factor;
