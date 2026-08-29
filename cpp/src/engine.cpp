@@ -1534,6 +1534,27 @@ asio::awaitable<void> Engine::run_startup_analysis()
     const uint32_t max_total_polls = target * timeout_mult;
     uint32_t total_polls = 0;
 
+    // [review round 9] Analysis-local source state, mirroring the main
+    // loop's rules without sharing its machinery.
+    //
+    // Two holes, both from this loop deciding per-poll with no memory:
+    //  * a rescue used the wallet for ONE poll and forgot -- every later
+    //    poll retried the dead node through its full RPC retry budget
+    //    (~2 minutes each) before consulting the wallet again;
+    //  * a FROZEN node -- answering, never advancing -- never threw, so it
+    //    never reached the rescue at all. total_polls counts only ADVANCES,
+    //    so the timeout never fired either, and the loop spun until the
+    //    dead man's switch cancelled a perfectly healthy book at 600s.
+    //
+    // Local rather than folded into height_source_/wallet_only_mode_,
+    // deliberately: those are synchronised by the main loop's probe cycle,
+    // which does not exist yet, and a half-synchronised handoff is how the
+    // startup-fallback recovery bug happened. Same constants, same rules,
+    // scoped to this phase.
+    bool analysis_on_wallet = false;
+    std::uint32_t analysis_no_progress = 0;
+    int analysis_probe_skips = 0;
+
     while (!stop_requested_.load(std::memory_order_relaxed) &&
            !market_analyzer_->is_complete()) {
 
@@ -1579,15 +1600,61 @@ asio::awaitable<void> Engine::run_startup_analysis()
         // `height <= 0` continue with no diagnosis at all. Silence during the
         // exact outage this phase was taught to survive.
         bool height_failed = false;
+        // The settled fallback: once a rescue succeeded, ask the wallet
+        // FIRST and probe the node only every kNodeProbeEveryNPolls polls,
+        // exactly as the main loop's recovery does -- rather than paying the
+        // dead node's full retry budget on every poll.
+        const bool ask_wallet_first = wallet_only_mode_ || analysis_on_wallet;
         try {
-            height = wallet_only_mode_
-                ? co_await wallet_->get_height_info()
-                : co_await full_node_->get_block_height();
+            if (ask_wallet_first) {
+                height = co_await wallet_->get_height_info();
+                if (analysis_on_wallet
+                        && ++analysis_probe_skips
+                               >= kNodeProbeEveryNPolls) {
+                    analysis_probe_skips = 0;
+                    try {
+                        const auto probe =
+                            co_await full_node_->get_block_height();
+                        if (risk::height_in_range(probe) && probe >= height) {
+                            analysis_on_wallet = false;
+                            analysis_no_progress = 0;
+                            spdlog::info("[Engine] [S28] Analysis: the node "
+                                         "answered at height {} -- back to "
+                                         "it", probe);
+                        }
+                    } catch (const std::exception&) {
+                        // Still down; stay on the wallet.
+                    }
+                }
+            } else {
+                height = co_await full_node_->get_block_height();
+            }
         } catch (const std::exception& ex) {
             height_error = ex.what();
             if (height_error.empty()) height_error = "(no message)";
             height_failed = true;
             height = -1;
+        }
+
+        // A node that answers and never advances is as dead as one that
+        // refuses -- and it never throws, so it can never reach the rescue
+        // below on its own. Same bound as the main loop, measured against
+        // 2,418 real intervals (28% exceed a naive 30s guess).
+        if (!height_failed && !ask_wallet_first) {
+            if (risk::height_in_range(height)
+                    && static_cast<BlockHeight>(height)
+                           <= last_analysis_block
+                    && last_analysis_block > 0) {
+                if (++analysis_no_progress >= risk::kNodePollsWithoutProgress) {
+                    height_error = "node answers but has not advanced past "
+                                   "block " + std::to_string(
+                                       last_analysis_block);
+                    height_failed = true;
+                    height = -1;
+                }
+            } else {
+                analysis_no_progress = 0;
+            }
         }
 
         // [S28] The main loop's fallback does not exist yet -- this phase runs
@@ -1634,8 +1701,14 @@ asio::awaitable<void> Engine::run_startup_analysis()
                 continue;
             }
 
+            // Remember the rescue, so later polls ask the wallet first
+            // instead of re-paying the dead node's retry budget each time.
+            analysis_on_wallet = true;
+            analysis_probe_skips = 0;
             spdlog::warn("[Engine] [S28] Analysis: node height failed ({}) -- "
-                         "used the WALLET for this poll", height_error);
+                         "switching to the WALLET; the node is re-probed "
+                         "every {} polls", height_error,
+                         kNodeProbeEveryNPolls);
         }
 
         if (height <= 0) continue;
