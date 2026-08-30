@@ -382,11 +382,16 @@ class QuoteRunner:
                                       for rq in self._resting.values())
                         if rate <= 0.0 and quoting:
                             self._lb_stall_strikes += 1
-                            if self._lb_stall_strikes >= 2:
+                            # Warn on the TRANSITION only (== 2, not >= 2):
+                            # a stall lasting all day must not re-warn
+                            # every 5-minute sample. Recovery resets the
+                            # strikes, so the next episode warns again.
+                            if self._lb_stall_strikes == 2:
                                 _log.warning(
                                     "permuto: depth accrual STALLED for "
-                                    "%.0f min while quotes rest -- check "
-                                    "ring placement and venue state",
+                                    "%.0f min while quotes rest -- one-"
+                                    "sided books earn zero (min(bid,ask)); "
+                                    "check ring placement and venue state",
                                     self._lb_stall_strikes
                                     * LEADERBOARD_WATCH_S / 60.0)
                         else:
