@@ -292,7 +292,8 @@ public:
     /// aborts (e.g. wallet not yet synced) are outside this contract.
     void update_posting_gates(bool gui, bool breaker, bool wallet_circuit,
                               bool flash_crash, bool xch_recovery,
-                              bool dry_run, bool watchdog);
+                              bool dry_run, bool watchdog,
+                              bool cancels_pending);
 
     /// [S31] Set the watchdog gate alone, from the watchdog's own thread.
     ///
@@ -306,6 +307,9 @@ public:
     /// rows: ("symbol|asset_id", status 0=holding 1=warn 2=suspended,
     /// deviation_pct). Rebuilt each publish so a re-enabled asset's gauge
     /// drops back to 0 rather than sticking.
+    /// [STOPDRAIN review #0] 1 while the stopped-book drain is failing.
+    void update_stopdrain_failing(bool failing);
+
     void update_peg_status(
         const std::vector<std::tuple<std::string, int, double>>& rows);
 
@@ -416,6 +420,7 @@ private:
     prometheus::Counter* stuck_offers_total_counter_{nullptr};
     int stuck_offers_last_observed_{0};
     int stuck_offers_peak_observed_{0};
+    prometheus::Family<prometheus::Gauge>* paused_family_{nullptr};
     prometheus::Gauge* paused_gauge_{nullptr};
     prometheus::Gauge* posting_gated_gauge_{nullptr};
     prometheus::Family<prometheus::Gauge>* posting_gate_family_{nullptr};
@@ -437,6 +442,9 @@ private:
     /// before taking the lock, so without a sticky copy an older snapshot
     /// can clear a signal that is meant to survive until restart.
     bool               watchdog_sticky_{false};
+    prometheus::Gauge* gate_cancels_pending_{nullptr};
+    prometheus::Family<prometheus::Gauge>* stopdrain_failing_family_{nullptr};
+    prometheus::Gauge* stopdrain_failing_{nullptr};
     prometheus::Family<prometheus::Gauge>* peg_status_family_{nullptr};
     prometheus::Family<prometheus::Gauge>* peg_deviation_family_{nullptr};
     prometheus::Gauge* fees_paid_24h_gauge_{nullptr};

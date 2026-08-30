@@ -662,20 +662,72 @@ class EngineBridge(QObject):
     #: probes with hasattr concludes it retracted a book it never touched.
     #: The dexie switch reads this to decide whether it may promise "off
     #: means flat".
-    SUPPORTS_DIRECT_CONTROL: bool = False
+    SUPPORTS_DIRECT_CONTROL: bool = True
 
-    def cancel_all_offers(self) -> None:
-        """Request cancellation of all outstanding offers.
+    def cancel_all_offers(self) -> bool:
+        """[STOPDRAIN] Ask the engine to cancel every resting offer NOW.
 
-        Phase 1 stub -- logs a warning. See SUPPORTS_DIRECT_CONTROL.
+        Returns True only when the flag write succeeded.
+
+        Same channel as pause/reload: a flag file beside the database,
+        consumed on the engine's FAST poll path (not the slow heartbeat),
+        which co-spawns the cancel. Submission is not confirmation -- the
+        offers die when the cancel spends confirm on chain, and the TTL
+        sweep keeps draining anything a failed cancel leaves behind.
         """
-        _log.warning(
-            "cancel_all_offers() called but direct control is not yet "
-            "available."
-        )
-        self.error.emit(
-            "Cannot cancel offers: direct engine control not yet available."
-        )
+        flag_path = self._db_path.parent / "cancel_all.flag"
+        try:
+            flag_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(flag_path, "w", encoding="utf-8") as fh:
+                fh.write("cancel_all" + chr(10))
+            _log.warning("Cancel-all requested via %s", flag_path)
+            return True
+        except OSError as exc:
+            _log.error("Could not write cancel-all flag %s: %s",
+                       flag_path, exc)
+            self.error.emit(
+                "Could not signal the engine to cancel offers -- see "
+                "gui.log. Resting offers still drain by TTL.")
+            return False
+
+    # -- [review #8] the cancel-all-pending latch survives GUI restarts ---
+    def _cancel_all_pending_path(self):
+        return self._db_path.parent / "cancel_all_pending.marker"
+
+    def mark_cancel_all_pending(self) -> None:
+        try:
+            p = self._cancel_all_pending_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("pending", encoding="utf-8")
+        except OSError as exc:  # noqa: BLE001
+            _log.warning("could not persist cancel-all latch: %s", exc)
+
+    def clear_cancel_all_pending(self) -> None:
+        try:
+            self._cancel_all_pending_path().unlink(missing_ok=True)
+        except OSError as exc:  # noqa: BLE001
+            _log.warning("could not clear cancel-all latch: %s", exc)
+
+    #: [R2 review] Cancel spends confirm or fail within ~1-2 blocks; a
+    #: marker older than this outlived any possible confirm window and
+    #: must not re-latch a fresh GUI forever.
+    _CANCEL_ALL_MARKER_TTL_S = 15 * 60
+
+    def cancel_all_pending(self) -> bool:
+        try:
+            p = self._cancel_all_pending_path()
+            if not p.exists():
+                return False
+            import time
+            if (time.time() - p.stat().st_mtime
+                    > self._CANCEL_ALL_MARKER_TTL_S):
+                _log.info("cancel-all marker outlived its confirm window "
+                          "-- retiring it")
+                self.clear_cancel_all_pending()
+                return False
+            return True
+        except OSError:  # noqa: BLE001
+            return False
 
     def reload_config(self) -> None:
         """Re-read the YAML configuration and signal the engine.
@@ -1114,6 +1166,28 @@ class EngineBridge(QObject):
             return
 
         if self._engine_process.poll() is None:
+            # [review #7] Windows terminate() is a hard kill the engine
+            # never sees -- closing the GUI mid-drain left the book
+            # resting unmanaged. Ask for a GRACEFUL stop first via
+            # shutdown.flag (the engine's fast poll consumes it and runs
+            # the full shutdown path, cancelling the book); only escalate
+            # to terminate/kill if it does not exit in time.
+            try:
+                sf = self._db_path.parent / "shutdown.flag"
+                sf.parent.mkdir(parents=True, exist_ok=True)
+                sf.write_text("shutdown", encoding="utf-8")
+                _log.info("Wrote shutdown.flag; waiting for the engine to "
+                          "cancel its book and exit (PID %d).",
+                          self._engine_process.pid)
+                self._engine_process.wait(timeout=30)
+                _log.info("Engine exited gracefully.")
+                return
+            except subprocess.TimeoutExpired:
+                _log.warning("Engine ignored shutdown.flag for 30 s; "
+                             "terminating.")
+            except OSError as exc:  # noqa: BLE001
+                _log.warning("Could not write shutdown.flag (%s); "
+                             "terminating.", exc)
             _log.info(
                 "Terminating C++ engine (PID %d).",
                 self._engine_process.pid,
