@@ -51,7 +51,9 @@
 XOPTrader aims to become the dominant market maker on Chia's decentralized
 exchange ecosystem. The design is governed by three principles:
 
-1. **Never sell at a loss.** This is the overriding constraint. It invalidates
+> **[POLICY UPDATE 2026-08-30, v0.10.10]** "Never sell at a loss" is no longer an absolute. It is a three-mode operator dial, `strategy.no_loss_floor_mode`: `strict` (the old behaviour), `aging` (the floor decays with position age via `inventory_aging` -- `max_loss_relax_bps` now actually works), and `off` (market pricing governs; the side-aware BBO aggressive cap still bounds how far below the book an ask can execute). Rationale, recorded from the operator during the 2026-08-30 XCH repricing: the floor was "artificially trying to avoid unrealized losses becoming realized, even though this might be unavoidable" -- a market that has repriced has already marked the loss; refusing to sell below basis only left inventory exposed while quoting 20% off the book. Currently set to `off` in config.yaml. See `cpp/include/xop/strategy/no_loss_floor.hpp`.
+
+1. **Never sell at a loss** *(mode-dependent since v0.10.10 -- see the policy update above)*. Under `strict` this is the overriding constraint. It invalidates
    stop losses, timeout exits, and forced EOD closes. All algorithms, risk
    controls, and hedging layers are designed around this constraint.
 
@@ -438,7 +440,7 @@ offer model does not support market orders (all orders are limit offers).
 
 ### Core Rule
 
-**NEVER SELL AT A LOSS.** This is a hard constraint, not a guideline.
+**NEVER SELL AT A LOSS** -- a hard constraint under `no_loss_floor_mode: strict`; a decaying floor under `aging`; retired under `off` (the current setting).
 
 ### Architectural Enforcement
 
@@ -660,4 +662,4 @@ asymmetric) have fully implemented logic but no engine call sites.
 > additions (goals, Chia advantages, loss-taking policy, priority ranking,
 > trade-offs) and the current codebase state as of 2026-03-24.
 >
-> CONSTRAINT: All strategies enforce NEVER SELL AT A LOSS.
+> CONSTRAINT (v0.10.10): strategies enforce the operator's `no_loss_floor_mode`; NEVER-SELL-AT-A-LOSS holds only under `strict`.

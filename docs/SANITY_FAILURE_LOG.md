@@ -92,10 +92,23 @@ The [GUI database service](gui/services/database_service.py) has full read acces
 
 ## Constants
 
-Both sanity checks use the same threshold:
-- **kMaxBboDeviation = 0.15** (15% deviation tolerance)
+*(Updated 2026-08-30, v0.10.10 -- this section previously said a shared
+kMaxBboDeviation = 0.15, which was stale twice over: the code had used
+0.10 for some time, and the checks are now side-aware and configurable.)*
 
-This threshold can be adjusted in [engine.cpp](cpp/src/engine.cpp) around line 4680 if needed.
+The BBO sanity checks no longer share one constant. Three `strategy:`
+config keys (`cpp/include/xop/strategy/bbo_sanity.hpp` holds the
+routing and rationale):
+
+- **bbo_sanity_max_aggressive_dev** (default 0.10) -- a tier that would
+  EXECUTE at a dislocated price (ask below best ask / bid above the BBO
+  midpoint). The incident class this log exists for.
+- **bbo_sanity_max_passive_dev** (default 0.30) -- a tier that merely
+  RESTS far from a thin book (ask above the book; bid near best bid or
+  below the midpoint, whichever harbor is closer).
+- **bbo_sanity_max_mid_dev** (default 0.50) -- Check 1, model mid vs the
+  BBO midpoint, with its own threshold so a recovering one-sided book
+  does not suppress every tier.
 
 ## Related Files
 

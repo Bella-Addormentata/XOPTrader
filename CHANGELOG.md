@@ -5,6 +5,27 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.10] — 2026-08-30 — always-offer posture; the no-loss floor becomes an operator dial
+
+*(Entries 0.8.1–0.10.9 were not recorded here as they shipped; the git
+tags and release notes on GitHub are authoritative for that span.)*
+
+- **`strategy.no_loss_floor_mode: strict | aging | off`** replaces the
+  unconditional never-sell-below-basis ask floor. `aging` finally
+  threads `inventory_aging.max_loss_relax_bps` into the floor (it was
+  provably a no-op); `off` — the current setting, an explicit operator
+  decision during the 2026-08-30 XCH repricing — cedes ask pricing to
+  the market at both no-loss sites (Step 7 lift and Step 4
+  `set_cost_basis`).
+- **Side-aware, configurable BBO sanity**: aggressive deviation (would
+  execute dislocated) keeps 10%; passive deviation (merely rests far
+  from a thin book) allows 30% with a dual bid safe-harbor; the model-
+  mid check gets its own 50% threshold.
+- Two-sided quoting restored on XCH/BYC and XCH/DBX
+  (`ratio_band_enter_by_pair` 0.30), anchor engages across the full
+  dislocation (`competitive_anchor_max_distance_bps` 8000), post-restart
+  warmup cut to ~minutes (`comp_pid_warmup_blocks` 5).
+
 ## [0.8.0] — 2026-08-08 — P&L overhaul + warp bridge (requires an engine and GUI restart to take effect)
 
 Root-cause fix set for "P&L never worked".  A multi-agent audit against the

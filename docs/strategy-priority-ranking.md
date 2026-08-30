@@ -46,7 +46,7 @@ than 2-3 days to implement must justify itself by either (a) protecting existing
 (b) being required infrastructure for other strategies, or (c) preparing for volume
 growth (June 2026 hard fork catalyst).
 
-**Core constraint**: NEVER SELL AT A LOSS is hardcoded. All rankings respect this.
+**Core constraint**: NEVER SELL AT A LOSS was hardcoded when these rankings were made; since v0.10.10 it is the `no_loss_floor_mode` dial (currently `off`). Rankings that leaned on the absolute rule should be re-read with that in mind.
 Strategic loss-taking is evaluated separately in the [Loss-Taking Question](#the-loss-taking-question) section.
 
 ---
@@ -1210,8 +1210,11 @@ compound as volume grows.
 
 ---
 
-*CONSTRAINT: All strategies enforce NEVER SELL AT A LOSS unless the StrategicLossManager
+*CONSTRAINT (as of v0.10.10, mode-dependent): under `no_loss_floor_mode: strict`
+all strategies enforce NEVER SELL AT A LOSS unless the StrategicLossManager
 (disabled by default) explicitly approves a loss after passing all four conditions:
-enabled, within loss cap, within recovery horizon, and EV-positive.*
+enabled, within loss cap, within recovery horizon, and EV-positive. Under `aging`
+the floor decays on the inventory_aging schedule; under `off` (the current
+setting) asks price at the market.*
 
 *Generated for XOPTrader Issue #9*

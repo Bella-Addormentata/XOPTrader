@@ -300,14 +300,24 @@ new_basis = (old_total_cost + fill_price * fill_qty) / (old_qty + fill_qty)
 
 All cost basis math uses `int64_t` mojos with 128-bit intermediates to prevent overflow and eliminate floating-point drift.
 
-### No-Loss Constraint (Optional)
+### No-Loss Constraint (`no_loss_floor_mode`)
 
-When `enable_no_loss_constraint` is set in the strategy config:
+Since v0.10.10 the ask floor is a three-mode dial, `strategy.no_loss_floor_mode`:
+
+- **`strict`** (default) — every sell offer is floored above cost basis:
 ```
 ask = max(optimal_ask, cost_basis * (1 + min_profit_margin_bps / 10000))
 ```
+- **`aging`** — the floor decays with position age via the `inventory_aging`
+  dials (`max_loss_relax_bps` etc.), so losses on old inventory are realized
+  on a configured schedule rather than never.
+- **`off`** — market pricing governs; the side-aware BBO aggressive cap
+  (`bbo_sanity_max_aggressive_dev`, default 10%) remains the execution guard.
 
-This floors every sell offer above cost basis plus a configurable margin. Enforced in two independent places (PreTradeCheck and OfferManager) for defense in depth. **Disabled by default** — enable only if your strategy requires it.
+Under `strict`/`aging` the floor is enforced at both independent sites
+(the Step 7 lift and the strategy's `set_cost_basis`) for defense in depth;
+`off` silences both. See `cpp/include/xop/strategy/no_loss_floor.hpp` for
+the recorded rationale.
 
 ### Emergency Playbook
 

@@ -1,7 +1,7 @@
 # Auto-Balance Design And Implementation Plan
 
 ## Goal
-Maintain approximately equal portfolio value between base and quote per configured pair (default target ratio 0.50) while preserving existing fee/UTXO safety gates and no-loss constraints.
+Maintain approximately equal portfolio value between base and quote per configured pair (default target ratio 0.50) while preserving existing fee/UTXO safety gates and no-loss constraints (since v0.10.10 the no-loss floor is the `no_loss_floor_mode` dial; "preserving" means honouring whichever mode the operator set).
 
 ## Current State Summary
 - Existing behavior is threshold/depletion driven, not target-ratio balancing.
@@ -114,7 +114,7 @@ Add metrics (if available in exporter):
 
 ### Regression checks
 - No crossed-mid posts.
-- No violation of no-loss floor.
+- No violation of the no-loss floor (as configured by `no_loss_floor_mode`).
 - No unexpected offer churn due to mode flipping.
 
 ## Rollout Plan
