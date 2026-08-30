@@ -337,13 +337,16 @@ void MetricsExporter::register_metrics()
         .Register(*registry_)
         .Add({});
 
-    paused_gauge_ = &prometheus::BuildGauge()
+    // [R2 review #12] Lazy like the gate family: the GUI's
+    // posting_gates_published() falls back to this family's presence, so
+    // an eager zero kept that check vacuously true too.
+    paused_family_ = &prometheus::BuildGauge()
         .Name("xop_bot_paused")
         .Help("1 while the GUI pause flag is active -- the pause the GUI "
               "Resume button can clear.  Breaker and protection pauses are "
               "on xop_posting_gated instead")
-        .Register(*registry_)
-        .Add({});
+        .Register(*registry_);
+    paused_gauge_ = nullptr;
 
     posting_gate_family_ = &prometheus::BuildGauge()
         .Name("xop_posting_gate")
@@ -354,13 +357,19 @@ void MetricsExporter::register_metrics()
               "dead man's switch firing means the book was cancelled by a "
               "process that has stopped managing it.")
         .Register(*registry_);
-    gate_gui_            = &posting_gate_family_->Add({{"reason", "gui"}});
-    gate_breaker_        = &posting_gate_family_->Add({{"reason", "breaker"}});
-    gate_wallet_circuit_ = &posting_gate_family_->Add({{"reason", "wallet_circuit"}});
-    gate_flash_crash_    = &posting_gate_family_->Add({{"reason", "flash_crash"}});
-    gate_xch_recovery_   = &posting_gate_family_->Add({{"reason", "xch_recovery"}});
-    gate_dry_run_        = &posting_gate_family_->Add({{"reason", "dry_run"}});
-    gate_watchdog_       = &posting_gate_family_->Add({{"reason", "watchdog"}});
+    // [R2 review #12] Gate children are added LAZILY on the first
+    // update_posting_gates(): presence of any xop_posting_gate sample in
+    // a scrape is then genuine heartbeat evidence, which the GUI's
+    // posting_ungated check and intent adoption both rely on. Eager zeros
+    // made posting_gates_published() vacuously true.
+    gate_gui_ = nullptr;
+    gate_breaker_ = nullptr;
+    gate_wallet_circuit_ = nullptr;
+    gate_flash_crash_ = nullptr;
+    gate_xch_recovery_ = nullptr;
+    gate_dry_run_ = nullptr;
+    gate_watchdog_ = nullptr;
+    gate_cancels_pending_ = nullptr;
 
     posting_gated_gauge_ = &prometheus::BuildGauge()
         .Name("xop_posting_gated")
@@ -751,13 +760,37 @@ void MetricsExporter::update_posting_gates(bool gui, bool breaker,
                                            bool wallet_circuit,
                                            bool flash_crash,
                                            bool xch_recovery, bool dry_run,
-                                           bool watchdog)
+                                           bool watchdog,
+                                          bool cancels_pending)
 {
     // Same locked lifecycle check as every neighbouring updater: shutdown()
     // resets registry_ under this mutex, destroying the gauges, so an
     // unguarded update racing shutdown dereferences stale pointers.
     std::unique_lock lock(mtx_);
     if (!running_) return;
+
+    // [R2 review #12] Children added LAZILY on first use, under the lock:
+    // presence of any xop_posting_gate sample in a scrape is then genuine
+    // heartbeat evidence, which the GUI's posting_ungated check and the
+    // intent-adoption guard both rely on. Eager zeros made
+    // posting_gates_published() vacuously true.
+    if (!gate_gui_) {
+        gate_gui_ = &posting_gate_family_->Add({{"reason", "gui"}});
+        gate_breaker_ = &posting_gate_family_->Add({{"reason", "breaker"}});
+        gate_wallet_circuit_ =
+            &posting_gate_family_->Add({{"reason", "wallet_circuit"}});
+        gate_flash_crash_ =
+            &posting_gate_family_->Add({{"reason", "flash_crash"}});
+        gate_xch_recovery_ =
+            &posting_gate_family_->Add({{"reason", "xch_recovery"}});
+        gate_dry_run_ = &posting_gate_family_->Add({{"reason", "dry_run"}});
+        gate_watchdog_ =
+            &posting_gate_family_->Add({{"reason", "watchdog"}});
+        gate_cancels_pending_ =
+            &posting_gate_family_->Add({{"reason", "cancels_pending"}});
+    }
+    // [R2 #20] The durable cancel-all gate.
+    gate_cancels_pending_->Set(cancels_pending ? 1.0 : 0.0);
 
     gate_gui_->Set(gui ? 1.0 : 0.0);
     gate_breaker_->Set(breaker ? 1.0 : 0.0);
@@ -769,10 +802,10 @@ void MetricsExporter::update_posting_gates(bool gui, bool breaker,
     // own write must not clear it. Restart-only means restart-only.
     if (watchdog) watchdog_sticky_ = true;
     const bool wd = watchdog_sticky_;
-    gate_watchdog_->Set(wd ? 1.0 : 0.0);
+    if (gate_watchdog_) gate_watchdog_->Set(wd ? 1.0 : 0.0);
     posting_gated_gauge_->Set(
         (gui || breaker || wallet_circuit || flash_crash || xch_recovery
-         || dry_run || wd) ? 1.0 : 0.0);
+         || dry_run || wd || cancels_pending) ? 1.0 : 0.0);
 }
 
 void MetricsExporter::update_stopdrain_failing(bool failing)
@@ -824,7 +857,7 @@ void MetricsExporter::update_watchdog_gate(bool fired)
     // from a stale argument -- clearing a restart-only signal. Remembering it
     // here makes the later writer unable to lose it.
     if (fired) watchdog_sticky_ = true;
-    gate_watchdog_->Set(watchdog_sticky_ ? 1.0 : 0.0);
+    if (gate_watchdog_) gate_watchdog_->Set(watchdog_sticky_ ? 1.0 : 0.0);
     if (watchdog_sticky_) {
         // The aggregate has to move with it, or a consumer watching only
         // xop_posting_gated sees nothing while posting is gated.
@@ -837,6 +870,7 @@ void MetricsExporter::update_bot_paused(bool is_paused)
     std::unique_lock lock(mtx_);
     if (!running_) return;
 
+    if (!paused_gauge_) paused_gauge_ = &paused_family_->Add({});
     paused_gauge_->Set(is_paused ? 1.0 : 0.0);
 }
 

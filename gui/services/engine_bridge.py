@@ -708,9 +708,24 @@ class EngineBridge(QObject):
         except OSError as exc:  # noqa: BLE001
             _log.warning("could not clear cancel-all latch: %s", exc)
 
+    #: [R2 review] Cancel spends confirm or fail within ~1-2 blocks; a
+    #: marker older than this outlived any possible confirm window and
+    #: must not re-latch a fresh GUI forever.
+    _CANCEL_ALL_MARKER_TTL_S = 15 * 60
+
     def cancel_all_pending(self) -> bool:
         try:
-            return self._cancel_all_pending_path().exists()
+            p = self._cancel_all_pending_path()
+            if not p.exists():
+                return False
+            import time
+            if (time.time() - p.stat().st_mtime
+                    > self._CANCEL_ALL_MARKER_TTL_S):
+                _log.info("cancel-all marker outlived its confirm window "
+                          "-- retiring it")
+                self.clear_cancel_all_pending()
+                return False
+            return True
         except OSError:  # noqa: BLE001
             return False
 

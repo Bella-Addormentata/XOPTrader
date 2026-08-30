@@ -539,10 +539,15 @@ class MainWindow(QMainWindow):
         # -- Widget -> bridge command signals ------------------------------
         if self._order_panel is not None:
             self._order_panel.cancel_offer_requested.connect(bridge.cancel_offer)
-            self._order_panel.cancel_all_requested.connect(bridge.cancel_all_offers)
+            self._order_panel.cancel_all_requested.connect(
+                self._on_dexie_cancel_all)
         if self._tab_order_panel is not None:
             self._tab_order_panel.cancel_offer_requested.connect(bridge.cancel_offer)
-            self._tab_order_panel.cancel_all_requested.connect(bridge.cancel_all_offers)
+            # [R2 review] Through the latch owner, not straight to the
+            # bridge: _on_dexie_cancel_all persists the marker and arms
+            # the cancels_pending gate the engine now also enforces.
+            self._tab_order_panel.cancel_all_requested.connect(
+                self._on_dexie_cancel_all)
         if self._settings_widget is not None and hasattr(self._settings_widget, "config_saved"):
             self._settings_widget.config_saved.connect(bridge.update_config_path)
             # Connected AFTER update_config_path so it runs once the bridge
@@ -2367,6 +2372,16 @@ class MainWindow(QMainWindow):
             except Exception:  # noqa: BLE001
                 drain_failing = False
 
+        ttl_blocks = 0
+        if self._bridge is not None:
+            try:
+                cfg = self._bridge.config_service.get_full_config() or {}
+                ttl_blocks = int(
+                    (cfg.get("strategy") or {}).get("offer_ttl_blocks", 0)
+                    or 0)
+            except Exception:  # noqa: BLE001 - default phrasing applies
+                ttl_blocks = 0
+
         return SwitchInputs(
             desired_on=self._dexie_desired_on,
             gates=frozenset(gates),
@@ -2375,6 +2390,7 @@ class MainWindow(QMainWindow):
             drain_failing=drain_failing,
             cancel_all_pending=self._dexie_cancel_all_pending,
             posting_ungated=posting_ungated,
+            ttl_blocks=ttl_blocks,
         )
 
     def _dexie_pending_count(self) -> float:
@@ -2384,6 +2400,13 @@ class MainWindow(QMainWindow):
         try:
             svc = self._bridge.metrics_service
             if not svc.has_data():
+                return -1.0
+            # [review #14] Same guard as _dexie_book_is_empty: before the
+            # first heartbeat the xop_offers family carries no samples,
+            # and the 0.0 default would render "0 resting" over a
+            # reconciliation-adopted book. Unpublished means unknown.
+            if (hasattr(svc, "offers_published")
+                    and not svc.offers_published()):
                 return -1.0
             return float(svc.get_offers_summary().get("pending", -1.0))
         except Exception:  # noqa: BLE001
@@ -2521,9 +2544,16 @@ class MainWindow(QMainWindow):
                 # PAUSED: pause.flag keeps Step 8 off, the fast poll
                 # consumes cancel_all.flag, the TTL sweep drains, and the
                 # deferred resume applies once the book is provably flat.
-                if self._bridge is not None and not self._bot_running:
+                if self._bridge is not None:
+                    # [R2 review #11] Pause UNCONDITIONALLY, not only when
+                    # starting a downed engine: intent can be adopted OFF
+                    # via a non-gui gate with the engine running and no
+                    # pause.flag on disk -- without this, the deferred
+                    # resume holds nothing the moment that gate clears.
+                    # Idempotent when the flag already exists.
                     self._bridge.pause_trading()
-                    self._bridge.start_engine()
+                    if not self._bot_running:
+                        self._bridge.start_engine()
                 self._refresh_venue_switches()
                 return
             if self._bridge is not None and not self._bot_running:
@@ -2589,16 +2619,12 @@ class MainWindow(QMainWindow):
         self._startup_permuto_applied = True
         if self._startup_permuto != "on" or self._permuto_desired_on:
             return
-        from gui.services.venue_control import may_turn_on
-        inputs = self._gather_permuto()
-        allowed, reason = may_turn_on(inputs)
-        if allowed:
-            _log.info("[startup] applying permuto startup state: on")
-            self._on_permuto_toggle(True)
-            self._refresh_venue_switches()
-        else:
-            self._on_switch_refused(
-                "startup state 'permuto: on' refused: %s" % reason)
+        # [R2 review #17] Unconditional, like a click: a held gate RECORDS
+        # the intent and defers the start, with the chip naming the gate
+        # -- the startup wish is held, not dropped. (The toggle refreshes
+        # the switches itself.)
+        _log.info("[startup] applying permuto startup state: on")
+        self._on_permuto_toggle(True)
 
     def _on_permuto_toggle(self, want_on: bool) -> None:
         if want_on:

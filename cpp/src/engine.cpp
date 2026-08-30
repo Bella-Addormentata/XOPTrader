@@ -621,11 +621,24 @@ Engine::Engine(const AppConfig& config, bool dry_run)
         // previous run must not kill this boot.
         shutdown_flag_path_ = db_dir / "shutdown.flag";
         {
+            // [R2 review] Staleness is mtime-based, not delete-on-boot: a
+            // flag YOUNGER than this process is a live close request from
+            // the managing GUI (written during our own startup), and
+            // deleting it would silently ignore the operator.
             std::error_code sf_ec;
             if (std::filesystem::exists(shutdown_flag_path_, sf_ec)) {
-                std::filesystem::remove(shutdown_flag_path_, sf_ec);
-                spdlog::info("[Engine] removed stale shutdown.flag from a "
-                             "previous run");
+                const auto flag_time = std::filesystem::last_write_time(
+                    shutdown_flag_path_, sf_ec);
+                if (!sf_ec
+                    && flag_time < std::filesystem::file_time_type::clock::
+                           now() - std::chrono::seconds(60)) {
+                    std::filesystem::remove(shutdown_flag_path_, sf_ec);
+                    spdlog::info("[Engine] removed stale shutdown.flag "
+                                 "from a previous run");
+                } else {
+                    spdlog::warn("[Engine] shutdown.flag is FRESH -- "
+                                 "honouring it as a live close request");
+                }
             }
         }
     }
@@ -1111,6 +1124,19 @@ void Engine::shutdown()
             } claim_guard{&graceful_cancel_active_};
 
             try {
+                // [R2 review] An operator Cancel All may still be in
+                // flight (clicked, then the GUI closed writes
+                // shutdown.flag): its detached coroutine is mid bulk-RPC
+                // on the same offers. Stacking a second charged cancel
+                // double-spends the book and can escalate into the
+                // watchdog fallback via the shortfall check. Plain-bool
+                // wait is safe: single ioc_ thread.
+                while (cancel_all_inflight_) {
+                    asio::steady_timer wait_timer(ioc_);
+                    wait_timer.expires_after(
+                        std::chrono::milliseconds(250));
+                    co_await wait_timer.async_wait(asio::use_awaitable);
+                }
                 const auto pending_before =
                     state_->get_all_offers().size();
                 auto shutdown_cancelled = co_await offer_mgr_->cancel_all();
@@ -1739,6 +1765,12 @@ asio::awaitable<void> Engine::poll_loop_coro()
             check_cancel_all_flag();
             check_shutdown_flag();
     check_peg_reenable_flag();
+    // [R2 review: STOPDRAIN #7] shutdown() may have just latched via
+    // shutdown.flag (or a signal): this iteration must NOT fetch a height
+    // and dispatch a heartbeat interleaved with the detached shutdown
+    // cancel-all -- Step 8 would post a ladder the bulk cancel never saw.
+    // break, not continue: the detached continuation owns teardown.
+    if (stop_requested_.load(std::memory_order_acquire)) break;
 
             // [S28] Height source is decided EVERY poll, not once at startup.
             // wallet_only_mode_ used to be assigned only in
@@ -2119,6 +2151,12 @@ asio::awaitable<void> Engine::run_startup_analysis()
         // for the phase to end.
         check_pause_flag();
         check_cancel_all_flag();
+        // [R2 review] The graceful close must work mid-analysis too:
+        // shutdown() co_spawns its cancel-and-stop continuation on ioc_,
+        // which is live here; the early return unwinds this loop and
+        // lets that path own teardown.
+        check_shutdown_flag();
+        if (stop_requested_.load(std::memory_order_relaxed)) co_return;
 
         // Fetch current block height.
         std::int64_t height{0};
@@ -2613,6 +2651,11 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
         block_cadence_->update_block_arrival(block_height, now);
     }
 
+    // [R2 review: STOPDRAIN #7] A signal or shutdown.flag can latch stop
+    // between this heartbeat's dispatch and now: a shutting-down engine
+    // must not run steps (Step 8 would race the shutdown cancel-all).
+    if (stop_requested_.load(std::memory_order_acquire)) co_return;
+
     // Check GUI-initiated pause flag each heartbeat.
     check_pause_flag();
 
@@ -2998,6 +3041,22 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
     // [T1-03] Step 8 is a coroutine (co_awaits cancel_stale + post_quotes).
     // [T3-10] Gate Step 8 during Crash/Recovery states.
     // Also gated by the wallet circuit breaker and GUI pause flag.
+    // [R2 #20] Retire the durable cancel-all gate only on CONFIRMATION:
+    // submission done (inflight false) and no tracked offer still
+    // cancel_pending. Until then Step 8 stays gated engine-side, no
+    // matter what the GUI or pause.flag says.
+    if (cancel_all_draining_ && !cancel_all_inflight_) {
+        bool still_pending = false;
+        for (const auto& po : state_->get_all_offers()) {
+            if (po.cancel_pending) { still_pending = true; break; }
+        }
+        if (!still_pending) {
+            cancel_all_draining_ = false;
+            spdlog::info("[Engine] [CANCELALL] cancel-all confirmed -- "
+                         "posting gate released");
+        }
+    }
+
     if (watchdog_fired_.load(std::memory_order_acquire)) {
         // [S31] First, ahead of every other reason to skip. The switch
         // cancelled the book on a secure cancel, which settles on chain and
@@ -3024,13 +3083,24 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
                               "failed: {}", e.what());
             }
         }
-    } else if (cancel_all_inflight_) {
-        // [STOPDRAIN review #13] Engine-side invariant: while the
-        // operator's bulk cancel is in flight, nothing posts a fresh
-        // ladder over coins the cancel is spending -- regardless of what
-        // the pause flag says (a resume click can race the cancel).
-        spdlog::warn("[Engine] Step 8 SKIPPED: operator cancel-all in "
-                     "flight -- no new offers until it returns");
+    } else if (cancel_all_inflight_ || cancel_all_draining_) {
+        // [STOPDRAIN review #13 + R2 #20] Engine-side invariant: from the
+        // operator's cancel-all until its spends CONFIRM, nothing posts a
+        // fresh ladder over coins the cancel is spending -- regardless of
+        // what the pause flag says (a resume click can race the cancel,
+        // and the confirm window outlives the RPC).
+        spdlog::warn("[Engine] Step 8 SKIPPED: operator cancel-all still "
+                     "{} -- no new offers until the cancel spends confirm",
+                     cancel_all_inflight_ ? "in flight" : "confirming");
+        // Drain leftovers a failed bulk cancel missed (cancel_stale skips
+        // cancel_pending offers, so no double-spend).
+        if (!cancel_all_inflight_) {
+            try { co_await step_sweep_stale_offers(block_height); }
+            catch (const std::exception& e) {
+                spdlog::error("[Engine] [STOPDRAIN] draining-gate sweep "
+                              "failed: {}", e.what());
+            }
+        }
     } else if (wallet_circuit_open_) {
         spdlog::debug("[Engine] Step 8 SKIPPED: wallet circuit breaker open");
     } else if (gui_pause_active_) {
@@ -3087,6 +3157,13 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
             }
         }
     } else {
+        // [STOPDRAIN review #10] Deliberate: with intent ON, Crash/
+        // Recovery posts nothing and drains nothing. Cancelling into a
+        // crashing market spends fees, and a TTL sweep here would fight
+        // the recovery evaluation. Operator remedy: flip the switch OFF
+        // -- the gui_pause branch above then runs the sweep. If crash
+        // states should ever drain too, it is the same one-call
+        // step_sweep_stale_offers() extension as the breaker branch.
         spdlog::warn("[Engine] Step 8 GATED: flash_crash_state={} "
                      "-- no new offers posted",
                      to_string(flash_crash_state_));
@@ -10438,9 +10515,12 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         // fresh book on top of cancel spends that have not settled. The
         // outer gate stops the NEXT cycle; this stops the one already in
         // flight.
-        if (watchdog_fired_.load(std::memory_order_acquire)) {
-            spdlog::error("[Engine] [S31] abandoning an in-flight post for "
-                          "{}: the dead man's switch fired mid-cycle",
+        if (watchdog_fired_.load(std::memory_order_acquire)
+            || stop_requested_.load(std::memory_order_acquire)
+            || cancel_all_inflight_ || cancel_all_draining_) {
+            spdlog::error("[Engine] [S31/R2] abandoning an in-flight post "
+                          "for {}: a switch fired, shutdown latched, or a "
+                          "cancel-all is unconfirmed mid-cycle",
                           pair_cfg->name);
             co_return;
         }
@@ -15342,7 +15422,8 @@ void Engine::step_export_metrics(BlockHeight block_height)
         gui_pause_active_, breaker_pause_active_, wallet_circuit_open_,
         flash_crash_state_ != FlashCrashState::Normal,
         xch_recovery_mode_, dry_run_,
-        watchdog_fired_.load(std::memory_order_acquire));
+        watchdog_fired_.load(std::memory_order_acquire),
+            cancel_all_inflight_ || cancel_all_draining_);
 
     // Dashboard 8: Rolling 24-hour blockchain fees
     if (fee_tracker_ && fee_tracker_->enabled()) {
@@ -15980,6 +16061,53 @@ asio::awaitable<void> Engine::step_sweep_stale_offers(BlockHeight block_height)
         }
     }
 
+    // [R2 review] The eligible count above is pair-blind, so the cancel
+    // scope must be too: State can hold offers on pairs outside the
+    // enabled config set (adopted "UNKNOWN" orphans, pairs since
+    // removed). Without this leg they are eligible forever, never
+    // attempted, and every cycle counts as a false drain failure.
+    {
+        std::unordered_set<std::string> enabled_names;
+        for (const auto& pair : config_.pairs) {
+            if (pair.enabled) enabled_names.insert(pair.name);
+        }
+        std::unordered_set<std::string> extra_names;
+        for (const auto& po : state_->get_all_offers()) {
+            if (enabled_names.count(po.pair_name) == 0) {
+                extra_names.insert(po.pair_name);
+            }
+        }
+        for (const auto& name : extra_names) {
+            try {
+                auto cancelled = co_await offer_mgr_->cancel_stale(
+                    name, block_height,
+                    config_.strategy.offer_ttl_blocks);
+                total_cancelled += cancelled.size();
+                for (const auto& oid : cancelled) {
+                    try {
+                        db_->update_offer_status(oid, "cancelled",
+                                                 block_height,
+                                                 "ttl_while_stopped");
+                    } catch (const std::exception& e) {
+                        spdlog::debug("[Engine] [STOPDRAIN] "
+                                      "update_offer_status failed for "
+                                      "{}: {}", oid.substr(0, 12),
+                                      e.what());
+                    }
+                }
+                if (!cancelled.empty()) {
+                    spdlog::info("[Engine] [STOPDRAIN] {} (off-config): "
+                                 "{} offer(s) aged out", name,
+                                 cancelled.size());
+                }
+            } catch (const std::exception& e) {
+                any_threw = true;
+                spdlog::warn("[Engine] [STOPDRAIN] {} (off-config): "
+                             "aging sweep failed: {}", name, e.what());
+            }
+        }
+    }
+
     const bool cycle_failed =
         any_threw || (eligible > 0 && total_cancelled == 0);
     if (cycle_failed) {
@@ -16055,6 +16183,9 @@ void Engine::check_cancel_all_flag()
         return;
     }
     cancel_all_inflight_ = true;
+    // [R2 #20] The durable half: stays true until every marked cancel
+    // CONFIRMS (cleared by the convergence check before the Step 8 gate).
+    cancel_all_draining_ = true;
     spdlog::warn("[Engine] [CANCELALL] operator requested cancel-all -- "
                  "cancelling every resting offer");
     asio::co_spawn(
@@ -16373,7 +16504,11 @@ asio::awaitable<void> Engine::step_observe_asset_pegs(BlockHeight block_height)
     // quoting a dead par rested unmanaged. This scan runs every heartbeat
     // (including while GUI-paused): while any offer rests on a suspended
     // pair, cancel it; idempotent once flat.
-    if (offer_mgr_ && !dry_run_) {
+    // [review #15] An in-flight operator cancel-all supersedes this leg
+    // too -- cancelling now would double-spend the same coins and log a
+    // false "STILL LIVE" critical. If the bulk cancel fails, the flag
+    // clears and this leg resumes next heartbeat as the fallback drain.
+    if (offer_mgr_ && !dry_run_ && !cancel_all_inflight_) {
         std::vector<std::string> to_cancel;
         for (const auto& po : state_->get_all_offers()) {
             const auto* pc = find_pair_config(po.pair_name);

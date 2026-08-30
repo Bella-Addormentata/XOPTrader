@@ -609,34 +609,40 @@ def test_the_intent_sync_waits_for_the_gate_family(window, monkeypatch):
 # [startup state] Settings > Startup: requests, never overrides
 # --------------------------------------------------------------------------- #
 
-def test_permuto_startup_on_is_refused_through_the_normal_gates(window):
-    """An unregistered identity refuses the startup request exactly as it
-    refuses a click -- the setting must never bypass a gate."""
-    seen = []
-    window._on_switch_refused = lambda r: seen.append(r)
+def test_permuto_startup_on_records_intent_and_defers_behind_the_gate(window):
+    """[R2 #17] The startup wish is HELD, not dropped: with an
+    unregistered identity the intent is recorded, the start deferred, and
+    the chip names the gate -- exactly like a click. The setting still
+    never starts a session through a closed gate."""
     window._startup_permuto = "on"
     window._startup_permuto_applied = False
     try:
         window._apply_permuto_startup_state()
-        assert seen and "not registered" in seen[0]
-        assert not window._permuto_desired_on, "armed through a closed gate"
-        assert window._startup_permuto_applied
+        assert window._permuto_desired_on is True, "the wish was dropped"
+        assert window._permuto_runner is None, (
+            "a session must not start through a closed gate")
+        assert window._permuto_switch.status_text() == "blocked"
+        assert "not registered" in window._permuto_switch._chip.toolTip()
     finally:
         window._startup_permuto = "off"
+        window._permuto_desired_on = False
+        window._refresh_venue_switches()
 
 
 def test_permuto_startup_state_applies_exactly_once(window):
-    """The reboot story must not become a re-arm loop: a refusal consumes
-    the request rather than retrying it forever."""
-    seen = []
-    window._on_switch_refused = lambda r: seen.append(r)
+    """The reboot story must not become a re-apply loop: the request is
+    consumed on first application."""
+    calls = []
+    real = window._on_permuto_toggle
+    window._on_permuto_toggle = lambda want: calls.append(want)
     window._startup_permuto = "on"
     window._startup_permuto_applied = False
     try:
         window._apply_permuto_startup_state()
         window._apply_permuto_startup_state()
-        assert len(seen) == 1
+        assert calls == [True]
     finally:
+        window._on_permuto_toggle = real
         window._startup_permuto = "off"
 
 
@@ -815,3 +821,66 @@ def test_pause_button_resume_honours_the_latch(window, monkeypatch):
         "[review #18] the Resume button must not bypass the latch the "
         "switch honours")
     assert window._dexie_resume_deferred is True
+
+
+def test_cancel_all_with_no_bridge_refuses_and_leaves_the_latch(window):
+    seen = []
+    window._on_switch_refused = lambda r: seen.append(r)
+    window._bridge = None
+    window._dexie_cancel_all_pending = False
+    window._on_dexie_cancel_all()
+    assert seen, "a disconnected bridge must refuse loudly"
+    assert window._dexie_cancel_all_pending is False, (
+        "no latch without a delivered request")
+
+
+def test_cancels_pending_gates_the_gather_and_retires_on_flat(
+        window, monkeypatch):
+    b = _RecordingBridge()
+    monkeypatch.setattr(window, "_bridge", b)
+    window._dexie_cancel_all_pending = True
+    monkeypatch.setattr(window, "_dexie_book_is_empty", lambda: False)
+    assert "cancels_pending" in window._gather_dexie().gates
+
+    monkeypatch.setattr(window, "_dexie_book_is_empty", lambda: True)
+    window._gather_dexie()
+    assert window._dexie_cancel_all_pending is False, (
+        "a verifiably flat book retires the latch")
+    assert b.cancel_all_pending() is False, "and its persisted marker"
+
+
+def test_convergence_needs_the_deferred_flag_not_just_a_gui_gate(
+        window, monkeypatch):
+    b = _RecordingBridge()
+    monkeypatch.setattr(window, "_bridge", b)
+    window._dexie_desired_on = True
+    window._dexie_resume_deferred = False
+    window._bot_running = True
+    window._bot_paused = False
+    window._refresh_venue_switches()
+    assert "resume" not in b.calls, (
+        "[review #16] a bare gui gate must not auto-resume -- that would "
+        "override the Pause button")
+    window._bot_running = False
+    window._dexie_desired_on = False
+
+
+def test_deferred_permuto_on_shows_not_running_when_the_gate_clears(
+        window, monkeypatch):
+    """[R2 #17/#25] Intent ON, no runner, registration gate cleared: the
+    chip must say the loop is not running with re-flip guidance -- never
+    green 'quoting' over nothing."""
+    from gui.services.venue_control import SwitchInputs
+
+    window._permuto_desired_on = True
+    assert window._permuto_runner is None
+    # The switch captured its gather at construction -- patch that
+    # reference, simulating "registration gate cleared, still no runner".
+    monkeypatch.setattr(
+        window._permuto_switch, "_gather",
+        lambda: SwitchInputs(desired_on=True,
+                             gates=frozenset({"not_running"})))
+    window._permuto_switch.refresh()
+    assert window._permuto_switch.status_text() == "blocked"
+    assert "flip the switch OFF" in window._permuto_switch._chip.toolTip()
+    window._permuto_desired_on = False

@@ -142,6 +142,10 @@ class SwitchInputs:
     stop-in-flight read "stopping -- cancels in flight" instead of the
     dexie-flavoured unknown-book text."""
 
+    ttl_blocks: int = 0
+    """[review #29] strategy.offer_ttl_blocks, for phrasing the draining
+    tooltip. 0 = unknown: render no minutes figure."""
+
     posting_ungated: bool = False
     """[review #9] With intent OFF: the engine's PUBLISHED posting-gate
     family shows nothing holding Step 8 past a grace period -- our pause
@@ -191,8 +195,9 @@ def resolve_chip(inputs: SwitchInputs) -> StatusChip:
         return StatusChip(
             text=text, tone="ok",
             tooltip="Trading. Flip the switch to stop posting; resting "
-                    "offers then drain by TTL, or Cancel All retracts them "
-                    "now.")
+                    "offers then drain by TTL, or the Cancel all button "
+                    "that appears once the switch is off retracts them "
+                    "immediately.")
 
     # Intent OFF.
     if inputs.posting_ungated:
@@ -203,7 +208,10 @@ def resolve_chip(inputs: SwitchInputs) -> StatusChip:
             text="OFF requested -- engine still posting", tone="warn",
             tooltip="The pause flag did not take effect: the engine's "
                     "published posting gates show nothing holding Step 8. "
-                    "Check data/pause.flag and the engine log.")
+                    "Flip the switch again to retry, or Cancel All to "
+                    "retract the book now. Check data/pause.flag and the "
+                    "engine log.",
+            offer_cancel_visible=True)
     if not inputs.book_is_empty:
         if inputs.book_observed and n < 0:
             # [review #28] The venue runner itself says the book is not
@@ -253,11 +261,15 @@ def resolve_chip(inputs: SwitchInputs) -> StatusChip:
                         "wallet). The resting offers stay takeable -- use "
                         "Cancel All or restart the wallet.",
                 offer_cancel_visible=True)
+        ttl_phrase = (
+            "via their TTL (roughly %d minutes)"
+            % round(inputs.ttl_blocks * 18.75 / 60)
+            if inputs.ttl_blocks > 0 else "via their TTL")
         return StatusChip(
             text="stopped -- %d resting, draining" % n, tone="converging",
             tooltip="No new offers will be posted. Resting offers age out "
-                    "via their TTL (roughly 19 minutes), or Cancel All "
-                    "retracts them immediately.",
+                    + ttl_phrase + ", or Cancel All retracts them "
+                    "immediately.",
             offer_cancel_visible=True)
     if not inputs.book_verified:
         return StatusChip(

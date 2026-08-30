@@ -584,6 +584,12 @@ private:
     // via the same TTL sweep, which also runs in the breaker skip branch.
     std::filesystem::path cancel_all_flag_path_;
     bool cancel_all_inflight_ = false;
+    /// [R2 #20] Durable engine-side gate: true from the operator's
+    /// cancel-all until every marked cancel CONFIRMS (no tracked offer
+    /// still cancel_pending). Unlike cancel_all_inflight_ (submission),
+    /// this survives to confirmation, gates Step 8 regardless of GUI
+    /// state, and is published as the "cancels_pending" posting gate.
+    bool cancel_all_draining_ = false;
 
     // [STOPDRAIN review #0] Drain-failure escalation. The TTL sweep is the
     // ONLY manager of a stopped book; a sweep that fails silently is the
