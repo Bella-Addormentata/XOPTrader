@@ -5,6 +5,26 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.11] — 2026-08-30 — startup intent on the switch; declared pegs anchor fair value
+
+- **Dexie switch paints stored startup intent** [STARTINTENT]: with
+  Settings > Startup set to ON, the slider shows ON from the first tick
+  and a new "starting" chip narrates the boot (pre-launch, Analyzing,
+  gates-unpublished) instead of "the engine is not running". The claim is
+  honest: it expires after 90s without an engine, a failed launch retires
+  it, real gates outrank it, and a pre-sync click supersedes the stored
+  request.
+- **Declared pegs anchor fair value** [PARANCHOR]: pegged_assets now
+  feeds the fair-value graph as FALLBACK anchors — consulted only when a
+  pair's solve finds no path without them, so market evidence always
+  outranks a declaration. Universal over currencies: EUR/JPY pegs convert
+  through an FX cross fetched in the same CoinGecko request. Guards from
+  adversarial review: sibling consensus on conflated legs (wUSDC.b/wUSDC
+  are one node), suspension gating, CoinGecko freshness gate, escaped +
+  validated peg currencies, and a per-pairing sigma-ceiling warning
+  (`fair_value_par_sigma_bps` 100 / `fair_value_par_market_sigma_bps`
+  140). Retires the QUOTING BLIND widening on XCH/BYC.
+
 ## [0.10.10] — 2026-08-30 — always-offer posture; the no-loss floor becomes an operator dial
 
 *(Entries 0.8.1–0.10.9 were not recorded here as they shipped; the git
