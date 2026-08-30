@@ -122,13 +122,13 @@ def test_a_valid_two_sided_quote_serialises():
             OrderIntent(MKT, Side.SELL, 0.1005, 10_000)]
     out = build_upsert_batch(legs, ORACLE)
     assert [o["side"] for o in out] == ["buy", "sell"]
-    assert all(o["tif"] == "ALO" for o in out)
+    assert all(o["tif"] == "alo" for o in out)
     assert all(o["market"] == MKT for o in out)
 
 
 def test_alo_is_the_default_because_a_crossing_quote_pays_the_spread():
     out = build_upsert_batch([OrderIntent(MKT, Side.BUY, 0.0995, 100)], ORACLE)
-    assert out[0]["tif"] == "ALO"
+    assert out[0]["tif"] == "alo"
 
 
 def test_two_legs_on_one_market_side_are_refused():
@@ -232,3 +232,23 @@ def test_an_infinite_price_is_rejected():
             [OrderIntent("QQQ-VOL-PERP", Side.BUY, _math.inf, 10.0)],
             {"QQQ-VOL-PERP": 0.07},
         )
+
+
+# --------------------------------------------------------------------------- #
+# [live 2026-08-29] The venue's serde wants LOWERCASE tif variants
+# --------------------------------------------------------------------------- #
+
+def test_tif_reaches_the_wire_lowercase():
+    """The first real placement was rejected with "unknown variant `ALO`,
+    expected one of `gtc`, `ioc`, `alo`". Normalised at the wire boundary so
+    no caller's casing can regress it."""
+    from gui.services.permuto.batch import build_upsert_batch
+    from gui.services.permuto.orders import OrderIntent, Side
+
+    intents = [OrderIntent(market="QQQ-VOL-PERP", side=Side.BUY,
+                           price=0.15, size=100.0)]
+    legs = build_upsert_batch(intents, {"QQQ-VOL-PERP": 0.15})
+    assert legs[0]["tif"] == "alo"
+
+    legs = build_upsert_batch(intents, {"QQQ-VOL-PERP": 0.15}, tif="GTC")
+    assert legs[0]["tif"] == "gtc", "explicit caller casing must be fixed too"
