@@ -1016,3 +1016,72 @@ def test_batch_ok_with_clean_rows_records_resting():
     assert result.ok
     assert r._resting[_MKT].two_sided, (
         "an all-clean batch_ok is a full acceptance and records the legs")
+
+
+# --------------------------------------------------------------------------- #
+# [WATCH] Contest telemetry: depth accrual, fills, stall detection
+# --------------------------------------------------------------------------- #
+
+def _lb_runner(monkeypatch, rows):
+    """Runner whose client carries a user id and whose leaderboard reads
+    pop from `rows` (a list mutated by the test)."""
+    import gui.services.permuto.auth as auth_mod
+
+    c = _Client()
+    c._user_id = "u1"
+    monkeypatch.setattr(auth_mod, "leaderboard_entry",
+                        lambda uid: rows.pop(0) if rows else None)
+    return _runner(c)
+
+
+def test_a_fill_is_logged_loudly_and_not_on_the_baseline(monkeypatch, caplog):
+    rows = [
+        {"depth_seconds_5d": 100.0, "trade_count": 0, "total_pnl": "0"},
+        {"depth_seconds_5d": 200.0, "trade_count": 1, "total_pnl": "3"},
+    ]
+    r = _lb_runner(monkeypatch, rows)
+    import logging
+    with caplog.at_level(logging.INFO, logger="gui.services.permuto.runner"):
+        r.tick(1.0, _ORACLE, {})
+        assert not [m for m in caplog.messages if "FILL LANDED" in m], (
+            "the first observation is a baseline, not a fill")
+        r.tick(1.0 + 301.0, _ORACLE, {})
+    assert [m for m in caplog.messages if "FILL LANDED" in m], (
+        "a trade_count increase is the qualifying-fill signal and must "
+        "be loud")
+
+
+def test_stalled_depth_while_quoting_warns_after_two_samples(
+        monkeypatch, caplog):
+    from gui.services.permuto.quoting import RestingQuote
+
+    rows = [
+        {"depth_seconds_5d": 500.0, "trade_count": 0, "total_pnl": "0"},
+        {"depth_seconds_5d": 500.0, "trade_count": 0, "total_pnl": "0"},
+        {"depth_seconds_5d": 500.0, "trade_count": 0, "total_pnl": "0"},
+    ]
+    r = _lb_runner(monkeypatch, rows)
+    r._resting[_MKT] = RestingQuote(0.099, 0.101)
+    import logging
+    with caplog.at_level(logging.INFO, logger="gui.services.permuto.runner"):
+        r.tick(1.0, _ORACLE, {})
+        r.tick(302.0, _ORACLE, {})
+        assert not [m for m in caplog.messages if "STALLED" in m], (
+            "one flat sample is noise, not a stall")
+        r.tick(603.0, _ORACLE, {})
+    assert [m for m in caplog.messages if "STALLED" in m]
+
+
+def test_leaderboard_watch_is_throttled(monkeypatch):
+    calls = []
+    import gui.services.permuto.auth as auth_mod
+
+    c = _Client()
+    c._user_id = "u1"
+    monkeypatch.setattr(auth_mod, "leaderboard_entry",
+                        lambda uid: calls.append(uid) or None)
+    r = _runner(c)
+    r.tick(1.0, _ORACLE, {})
+    r.tick(2.0, _ORACLE, {})
+    r.tick(100.0, _ORACLE, {})
+    assert len(calls) == 1, "a full paged leaderboard read every tick "        "would hammer a public endpoint"

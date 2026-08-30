@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -55,6 +56,13 @@ RECANCEL_INTERVAL_S = 60.0
 #: 24 missed ticks of headroom -- generous against transients, small against
 #: the hours an unnoticed crash would otherwise leave quotes resting.
 DMS_EXTEND_S = 120.0
+
+# [WATCH 2026-08-29] Contest telemetry cadences. The tick-budget warning
+# threshold is half the 5s tick so drift is visible long before ticks
+# start overlapping; the leaderboard watch is throttled hard because it is
+# a full paged read of a public endpoint.
+TICK_BUDGET_WARN_S = 2.5
+LEADERBOARD_WATCH_S = 300.0
 
 _log = logging.getLogger(__name__)
 
@@ -114,6 +122,13 @@ class QuoteRunner:
         #: Whether the venue-side dead man's switch reported armed, for
         #: log-once state transitions rather than a message per tick.
         self._dms_ok: Optional[bool] = None
+        # [WATCH] Telemetry state: slow-tick latch, leaderboard throttle,
+        # last (time, depth) sample, last trade count, stall strikes.
+        self._tick_slow: bool = False
+        self._lb_next_s: float = 0.0
+        self._lb_prev: tuple = (0.0, 0.0)
+        self._lb_trades: int = -1
+        self._lb_stall_strikes: int = 0
         # [live 2026-08-29] Last leg-rejection note, so a persistent benign
         # rejection (ALO-cross) logs once per CHANGE rather than per tick.
         self._last_leg_rejections: str = ""
@@ -188,19 +203,39 @@ class QuoteRunner:
     # ------------------------------------------------------------------ #
     def tick(self, now_s: float, oracles: dict, flags: dict) -> TickResult:
         """Run one pass. Never raises; failures come back in the result."""
+        started = time.perf_counter()
         try:
-            return self._tick(now_s, oracles or {}, flags or {})
+            result = self._tick(now_s, oracles or {}, flags or {})
         except PermutoNotLinked as exc:
             # Not transient and not recoverable by retrying: nothing is
             # resting to withdraw and nothing can be placed.
-            return TickResult("blocked", str(exc), error=str(exc))
+            result = TickResult("blocked", str(exc), error=str(exc))
         except (PermutoAuthError, BatchError) as exc:
             _log.warning("permuto: tick failed: %s", exc)
-            return TickResult("error", str(exc), error=str(exc))
+            result = TickResult("error", str(exc), error=str(exc))
         except Exception as exc:  # noqa: BLE001
             # The loop must outlive its own bugs for ~102 unattended hours.
             _log.exception("permuto: unexpected tick failure")
-            return TickResult("error", repr(exc), error=repr(exc))
+            result = TickResult("error", repr(exc), error=repr(exc))
+        # [WATCH] Wall-clock per tick, so a slowing venue or a regressing
+        # loop is visible AS it degrades rather than inferred from missing
+        # depth two hours later. DEBUG when healthy; WARN past half the
+        # cadence, throttled to state CHANGES so a persistently slow venue
+        # does not write the same line forever.
+        elapsed = time.perf_counter() - started
+        if elapsed >= TICK_BUDGET_WARN_S:
+            if not self._tick_slow:
+                self._tick_slow = True
+                _log.warning("permuto: tick took %.2fs (budget warn at "
+                             "%.1fs; action=%s) -- watching for overlap",
+                             elapsed, TICK_BUDGET_WARN_S, result.action)
+        else:
+            if self._tick_slow:
+                self._tick_slow = False
+                _log.info("permuto: tick time recovered (%.2fs)", elapsed)
+            _log.debug("permuto: tick %.2fs action=%s",
+                       elapsed, result.action)
+        return result
 
     def _tick(self, now_s: float, oracles: dict, flags: dict) -> TickResult:
         paused = bool(flags.get("trading_paused"))
@@ -297,6 +332,54 @@ class QuoteRunner:
                                  "dead man's switch: %s -- a crash would "
                                  "leave the book resting", exc)
                     self._dms_ok = False
+
+        # [WATCH 2026-08-29] Depth-accrual and fill telemetry, every
+        # LEADERBOARD_WATCH_S. Net under the loop like the dead man's
+        # switch: a failure here must never affect the tick. This is the
+        # contest's outcome-side check -- quotes can rest while credit
+        # silently stops (venue pause, ring drift), and depth is the number
+        # being ranked, so watch the number itself. A trade_count increase
+        # is logged loudly: Monday morning it doubles as the qualifying
+        # fill confirmation (C-08).
+        if now_s >= self._lb_next_s:
+            self._lb_next_s = now_s + LEADERBOARD_WATCH_S
+            try:
+                from .auth import leaderboard_entry
+                uid = getattr(self._client, "_user_id", "") or ""
+                row = leaderboard_entry(uid) if uid else None
+                if row:
+                    depth = float(row.get("depth_seconds_5d") or 0.0)
+                    trades = int(row.get("trade_count") or 0)
+                    pnl = row.get("total_pnl")
+                    prev_t, prev_depth = self._lb_prev
+                    self._lb_prev = (now_s, depth)
+                    if self._lb_trades >= 0 and trades > self._lb_trades:
+                        _log.warning(
+                            "permuto: FILL LANDED -- trade_count %d -> %d, "
+                            "pnl %s", self._lb_trades, trades, pnl)
+                    self._lb_trades = trades
+                    if prev_t > 0.0:
+                        rate = (depth - prev_depth) / max(1.0, now_s - prev_t)
+                        _log.info("permuto: depth %.0f (+%.0f/s), trades "
+                                  "%d, pnl %s", depth, rate, trades, pnl)
+                        quoting = any(not rq.empty
+                                      for rq in self._resting.values())
+                        if rate <= 0.0 and quoting:
+                            self._lb_stall_strikes += 1
+                            if self._lb_stall_strikes >= 2:
+                                _log.warning(
+                                    "permuto: depth accrual STALLED for "
+                                    "%.0f min while quotes rest -- check "
+                                    "ring placement and venue state",
+                                    self._lb_stall_strikes
+                                    * LEADERBOARD_WATCH_S / 60.0)
+                        else:
+                            self._lb_stall_strikes = 0
+                    else:
+                        _log.info("permuto: depth %.0f, trades %d, pnl %s",
+                                  depth, trades, pnl)
+            except Exception as exc:  # noqa: BLE001
+                _log.debug("permuto: leaderboard watch failed: %s", exc)
 
         state = MarginState(carried=carried)
         account_seen = False
