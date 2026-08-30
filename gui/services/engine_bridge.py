@@ -664,8 +664,10 @@ class EngineBridge(QObject):
     #: means flat".
     SUPPORTS_DIRECT_CONTROL: bool = True
 
-    def cancel_all_offers(self) -> None:
+    def cancel_all_offers(self) -> bool:
         """[STOPDRAIN] Ask the engine to cancel every resting offer NOW.
+
+        Returns True only when the flag write succeeded.
 
         Same channel as pause/reload: a flag file beside the database,
         consumed on the engine's FAST poll path (not the slow heartbeat),
@@ -679,12 +681,38 @@ class EngineBridge(QObject):
             with open(flag_path, "w", encoding="utf-8") as fh:
                 fh.write("cancel_all" + chr(10))
             _log.warning("Cancel-all requested via %s", flag_path)
+            return True
         except OSError as exc:
             _log.error("Could not write cancel-all flag %s: %s",
                        flag_path, exc)
             self.error.emit(
                 "Could not signal the engine to cancel offers -- see "
                 "gui.log. Resting offers still drain by TTL.")
+            return False
+
+    # -- [review #8] the cancel-all-pending latch survives GUI restarts ---
+    def _cancel_all_pending_path(self):
+        return self._db_path.parent / "cancel_all_pending.marker"
+
+    def mark_cancel_all_pending(self) -> None:
+        try:
+            p = self._cancel_all_pending_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("pending", encoding="utf-8")
+        except OSError as exc:  # noqa: BLE001
+            _log.warning("could not persist cancel-all latch: %s", exc)
+
+    def clear_cancel_all_pending(self) -> None:
+        try:
+            self._cancel_all_pending_path().unlink(missing_ok=True)
+        except OSError as exc:  # noqa: BLE001
+            _log.warning("could not clear cancel-all latch: %s", exc)
+
+    def cancel_all_pending(self) -> bool:
+        try:
+            return self._cancel_all_pending_path().exists()
+        except OSError:  # noqa: BLE001
+            return False
 
     def reload_config(self) -> None:
         """Re-read the YAML configuration and signal the engine.
@@ -1123,6 +1151,28 @@ class EngineBridge(QObject):
             return
 
         if self._engine_process.poll() is None:
+            # [review #7] Windows terminate() is a hard kill the engine
+            # never sees -- closing the GUI mid-drain left the book
+            # resting unmanaged. Ask for a GRACEFUL stop first via
+            # shutdown.flag (the engine's fast poll consumes it and runs
+            # the full shutdown path, cancelling the book); only escalate
+            # to terminate/kill if it does not exit in time.
+            try:
+                sf = self._db_path.parent / "shutdown.flag"
+                sf.parent.mkdir(parents=True, exist_ok=True)
+                sf.write_text("shutdown", encoding="utf-8")
+                _log.info("Wrote shutdown.flag; waiting for the engine to "
+                          "cancel its book and exit (PID %d).",
+                          self._engine_process.pid)
+                self._engine_process.wait(timeout=30)
+                _log.info("Engine exited gracefully.")
+                return
+            except subprocess.TimeoutExpired:
+                _log.warning("Engine ignored shutdown.flag for 30 s; "
+                             "terminating.")
+            except OSError as exc:  # noqa: BLE001
+                _log.warning("Could not write shutdown.flag (%s); "
+                             "terminating.", exc)
             _log.info(
                 "Terminating C++ engine (PID %d).",
                 self._engine_process.pid,

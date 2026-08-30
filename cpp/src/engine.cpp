@@ -617,6 +617,17 @@ Engine::Engine(const AppConfig& config, bool dry_run)
         config_reload_flag_path_ = db_dir / "config_reload.flag";
         // [STOPDRAIN] The GUI's Cancel All button.
         cancel_all_flag_path_ = db_dir / "cancel_all.flag";
+        // [STOPDRAIN review #7] Graceful-close request; a leftover from a
+        // previous run must not kill this boot.
+        shutdown_flag_path_ = db_dir / "shutdown.flag";
+        {
+            std::error_code sf_ec;
+            if (std::filesystem::exists(shutdown_flag_path_, sf_ec)) {
+                std::filesystem::remove(shutdown_flag_path_, sf_ec);
+                spdlog::info("[Engine] removed stale shutdown.flag from a "
+                             "previous run");
+            }
+        }
     }
 
     state_->set_status(BotStatus::Initializing);
@@ -753,6 +764,7 @@ void Engine::watchdog_cancel_book(const std::string& why)
                     "is wedged and requires manual intervention.");
             }
         } else {
+            watchdog_cancel_failed_.store(true, std::memory_order_release);
             spdlog::critical("[Engine] [S31] cancel FAILED: {}. Offers are "
                              "STILL LIVE on a wedged engine -- cancel them "
                              "by hand NOW.", failure);
@@ -768,6 +780,7 @@ void Engine::watchdog_cancel_book(const std::string& why)
         // wioc.run() throwing leaves the offers exactly as live as an
         // RPC refusal does, and that path alerts -- staying silent here
         // made the worst failure the quietest one.
+        watchdog_cancel_failed_.store(true, std::memory_order_release);
         spdlog::critical("[Engine] [S31] watchdog cancel path threw: {} "
                          "-- offers are STILL LIVE on a wedged engine.",
                          ex.what());
@@ -1350,6 +1363,21 @@ asio::awaitable<void> Engine::poll_loop_coro()
                 po.created_at_block = rec.created_block;
                 po.fee_mojos       = rec.fee_mojos;
                 state_->upsert_offer(po);
+
+                // [STOPDRAIN review #2] An offer restored for a pair that
+                // is disabled or GONE from this config would be drained by
+                // nothing: the sweep and Step 8 iterate enabled pairs, and
+                // the reload retry set starts empty at boot. Seed that set
+                // here -- its heartbeat retry leg cancels these offers
+                // exactly like a live disable would have.
+                const auto* pc = find_pair_config(rec.pair_name);
+                if (pc == nullptr || !pc->enabled) {
+                    if (reload_pending_cancel_.insert(rec.pair_name).second) {
+                        spdlog::warn("[Engine] [STOPDRAIN] restored offers "
+                                     "on disabled/removed pair {} -- queued "
+                                     "for the reload drain", rec.pair_name);
+                    }
+                }
             }
 
             if (!db_pending.empty()) {
@@ -1709,6 +1737,7 @@ asio::awaitable<void> Engine::poll_loop_coro()
             // [STOPDRAIN] Same fast path: an operator's Cancel All must
             // not wait behind a slow heartbeat.
             check_cancel_all_flag();
+            check_shutdown_flag();
     check_peg_reenable_flag();
 
             // [S28] Height source is decided EVERY poll, not once at startup.
@@ -2082,6 +2111,14 @@ asio::awaitable<void> Engine::run_startup_analysis()
                          ec.message());
             break;
         }
+
+        // [STOPDRAIN review #12] Both flags are pure filesystem -- no RPC
+        // -- and the reconciliation-adopted book is already resting on
+        // dexie. Consume them during analysis too: an operator's Cancel
+        // All (or a flag written while the engine was down) must not wait
+        // for the phase to end.
+        check_pause_flag();
+        check_cancel_all_flag();
 
         // Fetch current block height.
         std::int64_t height{0};
@@ -2908,6 +2945,17 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
     // XCH balance is restored).
     if (xch_recovery_mode_) {
         spdlog::info("[Engine] Steps 7-8 SKIPPED: XCH recovery mode active");
+        // [STOPDRAIN review #3] Recovery skips Steps 7-8 wholesale, which
+        // also skipped the paused-book drain. Keep it alive: the sweep
+        // posts nothing and cancel_stale's emergency path tries fee=0
+        // secure cancels first, so it is safe with depleted XCH.
+        if (gui_pause_active_) {
+            try { co_await step_sweep_stale_offers(block_height); }
+            catch (const std::exception& e) {
+                spdlog::error("[Engine] [STOPDRAIN] recovery-mode sweep "
+                              "failed: {}", e.what());
+            }
+        }
     } else {
 
     // [v0.7.38] Query XCH confirmed balance once before Step 7 so the
@@ -2964,6 +3012,25 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
         } else {
             spdlog::debug("[Engine] Step 8 SKIPPED: dead man's switch fired");
         }
+        // [STOPDRAIN review #3] The one state where offers are live,
+        // unmanaged AND unowned: the watchdog FAILED to cancel. Run the
+        // TTL sweep as the fallback drain (still never posts). When the
+        // watchdog's cancel succeeded, the book is already pending-cancel
+        // on chain and the sweep finds nothing.
+        if (watchdog_cancel_failed_.load(std::memory_order_acquire)) {
+            try { co_await step_sweep_stale_offers(block_height); }
+            catch (const std::exception& e) {
+                spdlog::error("[Engine] [STOPDRAIN] watchdog-fallback sweep "
+                              "failed: {}", e.what());
+            }
+        }
+    } else if (cancel_all_inflight_) {
+        // [STOPDRAIN review #13] Engine-side invariant: while the
+        // operator's bulk cancel is in flight, nothing posts a fresh
+        // ladder over coins the cancel is spending -- regardless of what
+        // the pause flag says (a resume click can race the cancel).
+        spdlog::warn("[Engine] Step 8 SKIPPED: operator cancel-all in "
+                     "flight -- no new offers until it returns");
     } else if (wallet_circuit_open_) {
         spdlog::debug("[Engine] Step 8 SKIPPED: wallet circuit breaker open");
     } else if (gui_pause_active_) {
@@ -2992,6 +3059,15 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
             breaker_skip_warned_ = true;
         } else {
             spdlog::debug("[Engine] Step 8 SKIPPED: risk breaker pause");
+        }
+        // [STOPDRAIN review #19] A tripped breaker is not a reason to
+        // leave the book resting: prices are moving against it. Age out
+        // what rests (posts nothing; TTL is block-age-based, so it works
+        // even when the book is unvaluable).
+        try { co_await step_sweep_stale_offers(block_height); }
+        catch (const std::exception& e) {
+            spdlog::error("[Engine] [STOPDRAIN] breaker-pause sweep "
+                          "failed: {}", e.what());
         }
     } else if (flash_crash_state_ == FlashCrashState::Normal) {
         try {
@@ -12170,16 +12246,19 @@ asio::awaitable<void> Engine::step_xch_recovery(BlockHeight block_height)
 
         // Use wallet RPC directly (not offer_mgr_->cancel_all()) because
         // the engine state may not track offers from previous instances.
-        // Use fee=0 and secure=false so cancellation works even with 0 XCH
-        // spendable.  Non-secure cancel invalidates offers locally and
-        // releases the locked UTXOs immediately; offers may still appear
-        // on Dexie until they expire or are taken.
+        // [STOPDRAIN review #3] fee=0 SECURE -- the dead man's switch
+        // recipe: needs no spendable XCH and actually spends the offer
+        // coins on-chain, killing the Dexie files, instead of a local
+        // invalidation that leaves them takeable until expiry (the
+        // 2026-08-29 stuck-cancel lesson: non-secure "cancels" left 24
+        // offers takeable for hours). Coins free on confirmation
+        // (~1 block) rather than immediately.
         bool cancel_ok = false;
         try {
-            co_await wallet_->cancel_offers(/*fee=*/0, /*secure=*/false);
+            co_await wallet_->cancel_offers(/*fee=*/0, /*secure=*/true);
             spdlog::info("[Recovery] Wallet-level cancel_offers(fee=0, "
-                         "secure=false) succeeded -- all pending offers "
-                         "invalidated locally");
+                         "secure=true) succeeded -- cancel spends "
+                         "submitted for all pending offers");
             cancel_ok = true;
 
             // Also mark all tracked offers as cancel_pending.
@@ -15843,13 +15922,43 @@ void Engine::close_connections()
 asio::awaitable<void> Engine::step_sweep_stale_offers(BlockHeight block_height)
 {
     if (dry_run_ || !offer_mgr_) co_return;
+    // [review #15] An in-flight cancel-all supersedes TTL aging: its bulk
+    // RPC is already spending every resting offer, and sweeping now would
+    // double-cancel the same coins with a second charged spend. If the
+    // bulk cancel fails, the inflight flag clears and this sweep resumes
+    // as the documented fallback drain.
+    if (cancel_all_inflight_) {
+        spdlog::debug("[Engine] [STOPDRAIN] sweep skipped: cancel-all in "
+                      "flight");
+        co_return;
+    }
+
+    // [review #0] The sweep is the ONLY manager of a stopped book, so its
+    // outcome is measured, not assumed: eligible-but-uncancelled cycles
+    // count as failures (this catches cancel_stale's silent-shrink path),
+    // and consecutive failures alert and raise a gauge the GUI turns into
+    // DRAIN FAILING chip text.
+    std::size_t eligible = 0;
+    for (const auto& po : state_->get_all_offers()) {
+        if (!po.cancel_pending
+            && block_height > po.created_at_block
+            && block_height - po.created_at_block
+                   > config_.strategy.offer_ttl_blocks) {
+            ++eligible;
+        }
+    }
+
+    std::size_t total_cancelled = 0;
+    bool any_threw = false;
     for (const auto& pair : config_.pairs) {
         if (!pair.enabled) continue;
-        // A peg-suspended pair's book was already cancelled at suspension.
-        if (pair_peg_suspended(pair)) continue;
+        // [review #1] No peg-suspended skip: the suspension cancel now
+        // retries every heartbeat in step_observe_asset_pegs, and TTL-
+        // cancelling on a suspended pair is harmless belt-and-braces.
         try {
             auto cancelled = co_await offer_mgr_->cancel_stale(
                 pair.name, block_height, config_.strategy.offer_ttl_blocks);
+            total_cancelled += cancelled.size();
             for (const auto& oid : cancelled) {
                 try {
                     db_->update_offer_status(oid, "cancelled", block_height,
@@ -15865,11 +15974,60 @@ asio::awaitable<void> Engine::step_sweep_stale_offers(BlockHeight block_height)
                              "while stopped", pair.name, cancelled.size());
             }
         } catch (const std::exception& e) {
+            any_threw = true;
             spdlog::warn("[Engine] [STOPDRAIN] {}: aging sweep failed: {}",
                          pair.name, e.what());
         }
     }
+
+    const bool cycle_failed =
+        any_threw || (eligible > 0 && total_cancelled == 0);
+    if (cycle_failed) {
+        ++stopdrain_failed_cycles_;
+        if (stopdrain_failed_cycles_ >= 3 && !stopdrain_alerted_) {
+            stopdrain_alerted_ = true;
+            if (metrics_) metrics_->update_stopdrain_failing(true);
+            spdlog::critical("[Engine] [STOPDRAIN] the stopped book is NOT "
+                             "draining: TTL cancels failed {} consecutive "
+                             "cycles with {} offer(s) still eligible -- "
+                             "check the wallet",
+                             stopdrain_failed_cycles_, eligible);
+            if (alerts_) {
+                alerts_->send_alert(
+                    AlertRule::WalletUnreachable,
+                    "[STOPDRAIN] stopped book is NOT draining: TTL cancels "
+                    "failed " + std::to_string(stopdrain_failed_cycles_)
+                    + " consecutive cycles, "
+                    + std::to_string(eligible)
+                    + " offer(s) resting takeable -- check the wallet.");
+            }
+        }
+    } else {
+        if (stopdrain_alerted_) {
+            spdlog::info("[Engine] [STOPDRAIN] drain recovered after {} "
+                         "failed cycle(s)", stopdrain_failed_cycles_);
+            if (metrics_) metrics_->update_stopdrain_failing(false);
+        }
+        stopdrain_failed_cycles_ = 0;
+        stopdrain_alerted_ = false;
+    }
     co_return;
+}
+
+// [STOPDRAIN review #7] Consume data/shutdown.flag: the GUI asked for a
+// graceful stop. shutdown() is the existing full path -- cancel the book,
+// then stop -- the same thing SIGINT triggers on platforms where the GUI
+// could deliver it.
+void Engine::check_shutdown_flag()
+{
+    namespace fs = std::filesystem;
+    if (shutdown_flag_path_.empty()) return;
+    std::error_code ec;
+    if (!fs::exists(shutdown_flag_path_, ec)) return;
+    fs::remove(shutdown_flag_path_, ec);
+    spdlog::warn("[Engine] shutdown.flag consumed -- graceful shutdown "
+                 "(the book is cancelled on the way down)");
+    shutdown();
 }
 
 // Consume data/cancel_all.flag: the operator asked for the book to be gone
@@ -15882,13 +16040,15 @@ void Engine::check_cancel_all_flag()
     if (cancel_all_flag_path_.empty()) return;
     std::error_code ec;
     if (!fs::exists(cancel_all_flag_path_, ec)) return;
-    fs::remove(cancel_all_flag_path_, ec);
-
+    // [review #23] Inflight check BEFORE the remove: a second click during
+    // a running cancel leaves its flag in place, and the first poll after
+    // completion consumes it as a natural retry instead of dropping it.
     if (cancel_all_inflight_) {
-        spdlog::warn("[Engine] [CANCELALL] requested while a previous "
-                     "cancel-all is still running -- ignored");
+        spdlog::debug("[Engine] [CANCELALL] request pending behind an "
+                      "in-flight cancel-all");
         return;
     }
+    fs::remove(cancel_all_flag_path_, ec);
     if (!offer_mgr_ || dry_run_) {
         spdlog::info("[Engine] [CANCELALL] requested but nothing to do "
                      "(dry-run or no offer manager)");
@@ -16205,25 +16365,42 @@ asio::awaitable<void> Engine::step_observe_asset_pegs(BlockHeight block_height)
                   "again.");
         }
 
-        // OFF MEANS FLAT: cancel what is resting on the affected pairs.
+    }
+
+    // [PEGSUSPEND][review #1] CONVERGENT cancel, not one-shot: the old
+    // JustSuspended-only cancel could fail under exactly the depeg-era
+    // stress that triggers it, and nothing ever retried -- toxic offers
+    // quoting a dead par rested unmanaged. This scan runs every heartbeat
+    // (including while GUI-paused): while any offer rests on a suspended
+    // pair, cancel it; idempotent once flat.
+    if (offer_mgr_ && !dry_run_) {
         std::vector<std::string> to_cancel;
         for (const auto& po : state_->get_all_offers()) {
             const auto* pc = find_pair_config(po.pair_name);
-            if (pc != nullptr && pair_peg_suspended(*pc)) {
+            if (pc != nullptr && !po.cancel_pending
+                && pair_peg_suspended(*pc)) {
                 to_cancel.push_back(po.offer_id);
             }
         }
-        if (!to_cancel.empty() && offer_mgr_ && !dry_run_) {
+        if (!to_cancel.empty()) {
             try {
                 auto done = co_await offer_mgr_->selective_cancel(to_cancel);
-                spdlog::warn("[Engine] [PEGSUSPEND] cancelled {}/{} resting "
-                             "offers on pairs touching {}",
-                             done.size(), to_cancel.size(), a->symbol);
+                if (done.size() < to_cancel.size()) {
+                    spdlog::critical("[Engine] [PEGSUSPEND] only {}/{} "
+                                     "offers cancelled on suspended pairs "
+                                     "-- STILL LIVE; retrying next "
+                                     "heartbeat",
+                                     done.size(), to_cancel.size());
+                } else {
+                    spdlog::warn("[Engine] [PEGSUSPEND] cancelled {}/{} "
+                                 "resting offers on suspended pairs",
+                                 done.size(), to_cancel.size());
+                }
             } catch (const std::exception& e) {
-                spdlog::critical("[Engine] [PEGSUSPEND] could not cancel the "
-                                 "book on suspended pairs: {} -- offers may "
-                                 "still be resting in a depegged asset",
-                                 e.what());
+                spdlog::critical("[Engine] [PEGSUSPEND] could not cancel "
+                                 "the book on suspended pairs: {} -- "
+                                 "offers STILL LIVE in a depegged asset; "
+                                 "retrying next heartbeat", e.what());
             }
         }
     }

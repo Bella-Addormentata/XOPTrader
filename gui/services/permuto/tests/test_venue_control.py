@@ -82,11 +82,21 @@ def test_the_most_serious_gate_is_the_one_named():
 
 def test_turning_on_over_an_unconfirmed_stop_is_refused():
     """Posting a fresh book on top of cancel spends that have not settled
-    commits the same coins twice."""
+    commits the same coins twice.
+
+    [review #22] The gate is CALLER-SUPPLIED now, not inferred from book
+    shape: a routine TTL drain also leaves the book non-empty, and the
+    inference one-shot-refused the startup arm with a false reason. The
+    gathers add the gate exactly when a cancel is genuinely in flight."""
     allowed, reason = may_turn_on(
-        _in(desired_on=False, book_is_empty=False))
+        _in(desired_on=False, book_is_empty=False,
+            gates=["cancels_pending"]))
     assert not allowed
     assert reason == GATE_LABELS["cancels_pending"]
+
+    # Book shape ALONE no longer refuses -- that is the TTL-drain case.
+    allowed, _ = may_turn_on(_in(desired_on=False, book_is_empty=False))
+    assert allowed
 
 
 # --------------------------------------------------------------------------- #
@@ -713,3 +723,95 @@ def test_startup_states_loader_defaults_are_safe(monkeypatch):
             settings.setValue("permuto", old_p)
         settings.endGroup()
 
+
+# --------------------------------------------------------------------------- #
+# [review #26] The cancel-all latch, gate, and deferred-resume convergence
+# --------------------------------------------------------------------------- #
+
+class _RecordingBridge:
+    """Minimal bridge fake that records the calls the latch logic makes."""
+
+    def __init__(self):
+        self.calls = []
+        self._pending_marker = False
+
+    def pause_trading(self):
+        self.calls.append("pause")
+
+    def resume_trading(self):
+        self.calls.append("resume")
+
+    def cancel_all_offers(self):
+        self.calls.append("cancel_all")
+        return True
+
+    def mark_cancel_all_pending(self):
+        self._pending_marker = True
+
+    def clear_cancel_all_pending(self):
+        self._pending_marker = False
+
+    def cancel_all_pending(self):
+        return self._pending_marker
+
+
+def test_off_is_pause_only(window, monkeypatch):
+    b = _RecordingBridge()
+    monkeypatch.setattr(window, "_bridge", b)
+    window._on_dexie_toggle(False)
+    assert "pause" in b.calls
+    assert "cancel_all" not in b.calls, (
+        "[STOPDRAIN] the operator's routine OFF must not force-cancel -- "
+        "the TTL drain owns the book now")
+
+
+def test_cancel_all_sets_and_persists_the_latch(window, monkeypatch):
+    b = _RecordingBridge()
+    monkeypatch.setattr(window, "_bridge", b)
+    window._on_dexie_cancel_all()
+    assert "cancel_all" in b.calls
+    assert window._dexie_cancel_all_pending is True
+    assert b.cancel_all_pending() is True, (
+        "[review #8] the latch must survive a GUI restart via the marker")
+
+
+def test_on_over_unconfirmed_cancel_defers_the_resume(window, monkeypatch):
+    b = _RecordingBridge()
+    monkeypatch.setattr(window, "_bridge", b)
+    window._dexie_cancel_all_pending = True
+    monkeypatch.setattr(window, "_dexie_book_is_empty", lambda: False)
+    window._bot_running = True
+    window._on_dexie_toggle(True)
+    assert window._dexie_desired_on is True, "intent is the operator's"
+    assert "resume" not in b.calls, (
+        "[review #18-shape] resuming would post over unconfirmed cancels")
+    assert window._dexie_resume_deferred is True
+    window._bot_running = False
+
+
+def test_convergence_applies_exactly_one_deferred_resume(window, monkeypatch):
+    b = _RecordingBridge()
+    monkeypatch.setattr(window, "_bridge", b)
+    window._dexie_desired_on = True
+    window._dexie_resume_deferred = True
+    window._dexie_cancel_all_pending = False
+    window._bot_running = True
+    window._bot_paused = False
+    window._refresh_venue_switches()
+    window._refresh_venue_switches()
+    assert b.calls.count("resume") == 1, (
+        "the deferred resume is exactly-once, not per-tick")
+    window._bot_running = False
+
+
+def test_pause_button_resume_honours_the_latch(window, monkeypatch):
+    b = _RecordingBridge()
+    monkeypatch.setattr(window, "_bridge", b)
+    window._bot_paused = True
+    window._dexie_cancel_all_pending = True
+    monkeypatch.setattr(window, "_dexie_book_is_empty", lambda: False)
+    window._on_pause_resume()
+    assert "resume" not in b.calls, (
+        "[review #18] the Resume button must not bypass the latch the "
+        "switch honours")
+    assert window._dexie_resume_deferred is True

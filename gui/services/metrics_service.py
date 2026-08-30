@@ -713,6 +713,22 @@ class MetricsService(QObject):
             return value >= 1.0
         return False
 
+    def offers_published(self) -> bool:
+        """[review #14] Whether the xop_offers family carries samples.
+
+        The engine now adds its children lazily on the first heartbeat, so
+        presence is evidence a heartbeat ran; an eager zero used to read
+        as "0 pending" from an engine that had not yet looked.
+        """
+        with QMutexLocker(self._mutex):
+            return bool(self._latest.get("xop_offers"))
+
+    def drain_failing(self) -> bool:
+        """[review #0] The engine's stopped-book TTL drain is failing."""
+        with QMutexLocker(self._mutex):
+            fam = self._latest.get("xop_stopdrain_failing") or {}
+        return any(v >= 1.0 for v in fam.values())
+
     def peg_statuses(self) -> list[dict]:
         """[PEGSUSPEND] Per-asset peg state from xop_peg_status.
 

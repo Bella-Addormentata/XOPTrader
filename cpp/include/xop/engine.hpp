@@ -578,12 +578,38 @@ private:
     // Cancel All is the immediate version -- a flag file the GUI writes,
     // consumed on the fast poll path. Risk paths (peg suspension, live
     // pair-disable, dead man's switch) still cancel immediately; those
-    // fire when something is WRONG and a drain is exposure to it.
+    // fire when something is WRONG and a drain is exposure to it. The
+    // P&L breakers (drawdown, rolling-window, S27 unvaluable, ledger
+    // control) do NOT cancel -- they pause posting and the book drains
+    // via the same TTL sweep, which also runs in the breaker skip branch.
     std::filesystem::path cancel_all_flag_path_;
     bool cancel_all_inflight_ = false;
 
+    // [STOPDRAIN review #0] Drain-failure escalation. The TTL sweep is the
+    // ONLY manager of a stopped book; a sweep that fails silently is the
+    // 2026-08-25 unmanaged-book shape wearing a log line. Consecutive
+    // failed cycles alert and publish a gauge the GUI turns into chip
+    // text; any clean cycle resets.
+    int stopdrain_failed_cycles_ = 0;
+    bool stopdrain_alerted_ = false;
+
+    // [STOPDRAIN review #3] Set when the dead man's switch could not
+    // cancel the book: the one state where offers are live, unmanaged,
+    // AND unowned. The Step 8 skip branch then runs the TTL sweep as the
+    // fallback drain (still never posts).
+    std::atomic<bool> watchdog_cancel_failed_{false};
+
     asio::awaitable<void> step_sweep_stale_offers(BlockHeight block_height);
     void check_cancel_all_flag();
+
+    // [STOPDRAIN review #7] data/shutdown.flag: the GUI's graceful-close
+    // request. On Windows the bridge cannot deliver SIGINT, so terminate()
+    // used to hard-kill the engine past its shutdown cancel -- closing the
+    // GUI mid-drain left the book resting unmanaged. Consumed on the fast
+    // poll path; a stale flag is deleted at startup so a leftover cannot
+    // kill a fresh boot.
+    std::filesystem::path shutdown_flag_path_;
+    void check_shutdown_flag();
 
     [[nodiscard]] bool asset_peg_suspended(const std::string& asset_id) const;
     [[nodiscard]] bool pair_peg_suspended(const PairConfig& pc) const;

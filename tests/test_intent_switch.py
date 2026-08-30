@@ -2,7 +2,7 @@
 
 Policy-level tests for resolve_chip plus the Cancel All flag channel. The
 window-level behaviour (clicks never refused, deferred starts, the
-cancel-all convergence) is covered in
+cancel-all latch/gate/convergence) is covered in
 gui/services/permuto/tests/test_venue_control.py.
 """
 
@@ -106,3 +106,61 @@ def test_cancel_all_offers_writes_the_flag(tmp_path):
 def test_bridge_advertises_direct_control():
     from gui.services.engine_bridge import EngineBridge
     assert EngineBridge.SUPPORTS_DIRECT_CONTROL is True
+
+
+# --------------------------------------------------------------------------- #
+# [review] The chip's honesty states
+# --------------------------------------------------------------------------- #
+
+def test_no_drain_states_never_promise_draining():
+    # [review #4] watchdog / wallet_circuit / xch_recovery bypass the TTL
+    # sweep in the engine's gate chain -- the chip must say so.
+    for gate in ("watchdog", "wallet_circuit", "xch_recovery"):
+        chip = resolve_chip(_in(desired_on=False, book_is_empty=False,
+                                resting_count=5.0, gates={gate}))
+        assert "NOT draining" in chip.text, gate
+        assert chip.tone == "warn"
+
+    # A breaker pause DOES drain (its skip branch runs the sweep).
+    chip = resolve_chip(_in(desired_on=False, book_is_empty=False,
+                            resting_count=5.0, gates={"breaker"}))
+    assert "draining" in chip.text and "NOT" not in chip.text
+
+
+def test_drain_failing_overrides_the_draining_promise():
+    chip = resolve_chip(_in(desired_on=False, book_is_empty=False,
+                            resting_count=5.0, drain_failing=True))
+    assert "DRAIN FAILING" in chip.text
+    assert chip.tone == "warn"
+    assert chip.offer_cancel_visible
+
+
+def test_cancel_all_pending_reads_cancelling_and_hides_the_button():
+    chip = resolve_chip(_in(desired_on=False, book_is_empty=False,
+                            resting_count=5.0, cancel_all_pending=True))
+    assert chip.text == "cancelling -- 5 confirming"
+    assert not chip.offer_cancel_visible
+
+
+def test_runner_observed_stop_reads_stopping_not_unknown():
+    # [review #28] Permuto's own runner reporting a not-yet-clear book is
+    # a stop in flight, venue-neutral -- not the metrics-gap text.
+    chip = resolve_chip(_in(desired_on=False, book_is_empty=False,
+                            resting_count=-1.0, book_observed=True))
+    assert chip.text == "stopping -- cancels in flight"
+
+
+def test_posting_ungated_is_the_loudest_off_state():
+    chip = resolve_chip(_in(desired_on=False, book_is_empty=True,
+                            posting_ungated=True))
+    assert "still posting" in chip.text
+    assert chip.tone == "warn"
+
+
+def test_deferred_rearm_names_cancels_pending_not_gui():
+    # [review #24] Both gates hold during a deferred re-arm; naming gui
+    # sent the operator to the Pause/Resume button.
+    chip = resolve_chip(_in(desired_on=True,
+                            gates={"gui", "cancels_pending"}))
+    assert chip.text == "blocked"
+    assert "still confirming" in chip.tooltip

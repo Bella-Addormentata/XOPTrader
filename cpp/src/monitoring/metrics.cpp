@@ -250,8 +250,20 @@ void MetricsExporter::register_metrics()
         .Help("Offer lifecycle gauges")
         .Register(*registry_);
 
-    offers_pending_ = &offer_gauge_family_->Add({{"state", "pending"}});
-    fill_rate_gauge_ = &offer_gauge_family_->Add({{"state", "fill_rate_per_hour"}});
+    // [STOPDRAIN review #14] Children are added LAZILY on the first
+    // update_offers(): a childless family serialises no sample lines, so
+    // a scrape that carries xop_offers samples is evidence a heartbeat
+    // ran. Eager zeros let the GUI read "0 pending" from an engine that
+    // had not yet looked, which retired the cancel-all latch early.
+    offers_pending_ = nullptr;
+    fill_rate_gauge_ = nullptr;
+
+    stopdrain_failing_family_ = &prometheus::BuildGauge()
+        .Name("xop_stopdrain_failing")
+        .Help("1 while the stopped-book TTL drain is failing (see "
+              "[STOPDRAIN]); the GUI chip turns this into DRAIN FAILING")
+        .Register(*registry_);
+    stopdrain_failing_ = &stopdrain_failing_family_->Add({});
 
     offer_counter_family_ = &prometheus::BuildCounter()
         .Name("xop_offers_total")
@@ -524,6 +536,11 @@ void MetricsExporter::update_offers(
     double fill_rate_per_hour)
 {
     // T2-02: Exclusive lock -- update_offers mutates shadow counters
+    if (!offers_pending_) {
+        offers_pending_  = &offer_gauge_family_->Add({{"state", "pending"}});
+        fill_rate_gauge_ = &offer_gauge_family_->Add(
+            {{"state", "fill_rate_per_hour"}});
+    }
     // (last_fill_count_, last_cancel_count_, last_expired_count_) and writes
     // to prometheus gauge/counter objects.
     std::unique_lock lock(mtx_);
@@ -756,6 +773,14 @@ void MetricsExporter::update_posting_gates(bool gui, bool breaker,
     posting_gated_gauge_->Set(
         (gui || breaker || wallet_circuit || flash_crash || xch_recovery
          || dry_run || wd) ? 1.0 : 0.0);
+}
+
+void MetricsExporter::update_stopdrain_failing(bool failing)
+{
+    std::unique_lock lock(mtx_);
+    if (stopdrain_failing_) {
+        stopdrain_failing_->Set(failing ? 1.0 : 0.0);
+    }
 }
 
 void MetricsExporter::update_peg_status(
