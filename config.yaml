@@ -180,27 +180,19 @@ strategy:
   asset_target_allocations:
     BYC: 0.2
     DBX: 0.2
-    WMILLIETH.B: 0.1
-    WUSDC.B: 0.1
     XCH: 0.6
   ratio_target_by_pair:
-    BYC/wUSDC.b: 0.6666666666666666
     XCH/BYC: 0.75
     XCH/DBX: 0.75
-    XCH/wUSDC.b: 0.8571428571428571
-    wmilliETH.b/XCH: 0.14285714285714285
   asset_target_tolerances:
     BYC: 0.1
-    DBX: 0.1
+    DBX: 0.15
     WMILLIETH.B: 0.05
     WUSDC.B: 0.08
-    XCH: 0.2
+    XCH: 0.4
   ratio_band_enter_by_pair:
-    BYC/wUSDC.b: 0.3095238095238095
-    XCH/BYC: 0.30
-    XCH/DBX: 0.30
-    XCH/wUSDC.b: 0.16748768472906395
-    wmilliETH.b/XCH: 0.12987012987012986
+    XCH/BYC: 0.35
+    XCH/DBX: 0.38636363636363635
 risk:
   soft_limit_pct: 0.6
   hard_limit_pct: 0.8
