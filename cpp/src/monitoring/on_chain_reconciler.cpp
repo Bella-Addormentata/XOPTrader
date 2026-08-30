@@ -18,6 +18,9 @@
 
 #include "xop/monitoring/on_chain_reconciler.hpp"
 #include "xop/execution/wallet_poll_throttle.hpp"
+#include "xop/monitoring/reconcile_verdict.hpp"
+
+#include <string_view>
 
 #include <algorithm>
 #include <cctype>
@@ -384,8 +387,8 @@ OnChainReconciler::verify_pending_offer_coins()
             // offer (minus adoptee slack) mean the rest of the archive
             // holds nothing relevant.
             if (more && early_stop.observe_page(
-                    page_newest_created > 0
-                    && page_newest_created < cutoff_unix)) {
+                    execution::page_entirely_older(page_newest_created,
+                                                   cutoff_unix))) {
                 more = false;
             }
         } catch (const std::exception& e) {
@@ -455,25 +458,27 @@ OnChainReconciler::verify_pending_offer_coins()
             }
 
             // [S24][SETTLE-FIX pattern] Absence from a paged scan is not
-            // proof, especially with the early stop above -- verify THIS
-            // trade id individually before the one-way verdict. Removing
-            // a live offer loses its fill forever (the 2026-07-31 6-XCH
+            // proof, especially with the early stop above -- ask the wallet
+            // about THIS trade id before the one-way verdict. Removing a
+            // live offer loses its fill forever (the 2026-07-31 6-XCH
             // incident shape); one targeted RPC per candidate is cheap.
             //
-            // [Copilot review] The direct record carries a STATUS, and it
-            // must be mirrored against the in-scan path -- RELEVANCE sorts
-            // terminal records out of the front pages, so a tracked offer
-            // that went CANCELLED/FAILED will keep arriving HERE, and
-            // treating "found" as "live" would rescue it forever. And an
-            // RPC error keeps the offer tracked for the next pass; a blip
-            // at verdict time must never finalise a removal.
-            bool direct_lookup_ok = false;
+            // [review] Three answers, three meanings:
+            //  * a RECORD: route by its status through the unit-tested
+            //    classify_direct_lookup -- only explicit terminals reap,
+            //    an unknown code keeps the offer tracked (a newer wallet's
+            //    status extension must never trigger removals).
+            //  * "No trade" (ChiaRPCApplicationError): the wallet was
+            //    reachable and definitively has NO record -- get_offer
+            //    THROWS on absence, so this catch, not an empty record,
+            //    is the authoritative not-found verdict.
+            //  * any other error: a blip at verdict time never finalises
+            //    a removal -- keep tracked, retry next pass.
             int direct_status = -1;
             try {
                 auto rec = co_await wallet_->get_offer(po.offer_id,
                                                        /*file_contents=*/
                                                        false);
-                direct_lookup_ok = true;
                 if (rec.contains("status")) {
                     if (rec["status"].is_number()) {
                         direct_status = rec["status"].get<int>();
@@ -486,39 +491,58 @@ OnChainReconciler::verify_pending_offer_coins()
                         else if (ds == "CANCELLED")       direct_status = 3;
                         else if (ds == "CONFIRMED")       direct_status = 4;
                         else if (ds == "FAILED")          direct_status = 5;
+                        else {
+                            try {
+                                direct_status = std::stoi(ds);
+                            } catch (...) {
+                                direct_status = -1;
+                            }
+                        }
                     }
                 }
+            } catch (const rpc::ChiaRPCApplicationError& e) {
+                if (std::string_view(e.what()).find("No trade")
+                        != std::string_view::npos) {
+                    logger_->warn("verify_pending_offer_coins: offer {} NOT "
+                                  "FOUND in wallet (direct get_offer "
+                                  "confirms) -- marking as stale (pair={} "
+                                  "tier={})",
+                                  po.offer_id.substr(0, 12),
+                                  po.pair_name, po.tier);
+                    stale_offer_ids.push_back(po.offer_id);
+                    not_found_counts_.erase(po.offer_id);
+                    continue;
+                }
+                logger_->warn("verify_pending_offer_coins: direct get_offer "
+                              "failed for {} -- keeping tracked, will retry "
+                              "next pass: {}",
+                              po.offer_id.substr(0, 12), e.what());
+                continue;
             } catch (const std::exception& e) {
                 logger_->warn("verify_pending_offer_coins: direct get_offer "
-                              "failed for {} -- keeping tracked, will "
-                              "retry next pass: {}",
+                              "failed for {} -- keeping tracked, will retry "
+                              "next pass: {}",
                               po.offer_id.substr(0, 12), e.what());
                 continue;
             }
-            if (direct_lookup_ok && direct_status >= 0
-                && direct_status <= 2) {
+
+            switch (monitoring::classify_direct_lookup(direct_status)) {
+            case monitoring::DirectLookupVerdict::Live:
                 logger_->info("verify_pending_offer_coins: offer {} absent "
-                              "from the scan but direct lookup says "
-                              "status {} -- live, not stale (pair={} "
-                              "tier={})",
+                              "from the scan but direct lookup says status "
+                              "{} -- live, not stale (pair={} tier={})",
                               po.offer_id.substr(0, 12), direct_status,
                               po.pair_name, po.tier);
                 not_found_counts_.erase(po.offer_id);
                 continue;
-            }
-            if (direct_lookup_ok && direct_status == 4) {
-                // CONFIRMED: a fill, not a cancellation -- defer to the
-                // fill detector exactly like the in-scan path, or the DB
-                // mislabels a fill as cancelled.
+            case monitoring::DirectLookupVerdict::DeferToFillDetector:
                 logger_->info("verify_pending_offer_coins: offer {} direct "
                               "lookup says CONFIRMED -- deferring to fill "
                               "detector, not marking stale (pair={})",
                               po.offer_id.substr(0, 12), po.pair_name);
                 not_found_counts_.erase(po.offer_id);
                 continue;
-            }
-            if (direct_lookup_ok
-                && (direct_status == 3 || direct_status == 5)) {
+            case monitoring::DirectLookupVerdict::Stale:
                 logger_->warn("verify_pending_offer_coins: offer {} direct "
                               "lookup says terminal status {} -- stale "
                               "(pair={} tier={})",
@@ -527,24 +551,16 @@ OnChainReconciler::verify_pending_offer_coins()
                 stale_offer_ids.push_back(po.offer_id);
                 not_found_counts_.erase(po.offer_id);
                 continue;
-            }
-            if (direct_lookup_ok && direct_status < 0) {
-                // Present but unparseable: not ours to remove.
+            case monitoring::DirectLookupVerdict::KeepTracked:
+            default:
                 logger_->warn("verify_pending_offer_coins: offer {} direct "
-                              "lookup returned an unparseable status -- "
-                              "keeping tracked (pair={})",
-                              po.offer_id.substr(0, 12), po.pair_name);
+                              "lookup returned unrecognised status {} -- "
+                              "keeping tracked, not ours to remove "
+                              "(pair={} tier={})",
+                              po.offer_id.substr(0, 12), direct_status,
+                              po.pair_name, po.tier);
                 continue;
             }
-
-            // Offer not found in wallet at all -- wallet lost track of it.
-            // This is a strong signal that the offer was resolved externally
-            // or the wallet state was reset.
-            logger_->warn("verify_pending_offer_coins: offer {} NOT FOUND "
-                          "in wallet -- marking as stale (pair={} tier={})",
-                          po.offer_id.substr(0, 12), po.pair_name, po.tier);
-            stale_offer_ids.push_back(po.offer_id);
-            continue;
         }
 
         // Offer present in wallet: clear any prior NOT FOUND misses.
