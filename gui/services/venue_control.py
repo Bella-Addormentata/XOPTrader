@@ -184,6 +184,16 @@ def resolve_chip(inputs: SwitchInputs) -> StatusChip:
     n = int(inputs.resting_count) if inputs.resting_count >= 0 else -1
 
     if inputs.desired_on:
+        if inputs.gates == {"starting"}:
+            # [STARTINTENT v0.10.11] Intent ON while the engine boots is
+            # the NORMAL morning, not a fault: the slider holds the
+            # operator's stored request and this chip carries the boot
+            # story. Any real gate alongside outranks it below.
+            return StatusChip(
+                text="starting", tone="converging",
+                tooltip="Intent is ON and the engine is starting up -- "
+                        "quoting begins when its first pass completes and "
+                        "the posting gates publish.")
         if inputs.gates:
             _, reason = may_turn_on(inputs)
             return StatusChip(

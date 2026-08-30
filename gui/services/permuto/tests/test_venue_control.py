@@ -202,14 +202,22 @@ def window():
         def info():
             return _UnregisteredInfo()
 
+    # [STARTINTENT] Seal the startup states too: load_startup_states reads
+    # the machine's REAL QSettings, and a box with auto-arm stored would
+    # seed dexie intent ON and invert this file's baseline chips.
+    import gui.widgets.settings as settings_mod
+
     real = permuto_mod._default_identity_factory
+    real_loader = settings_mod.load_startup_states
     permuto_mod._default_identity_factory = lambda: _FakeIdentity()
+    settings_mod.load_startup_states = lambda: ("adopt", "off")
     try:
         from gui.widgets.main_window import MainWindow
 
         yield MainWindow()
     finally:
         permuto_mod._default_identity_factory = real
+        settings_mod.load_startup_states = real_loader
 
 
 def test_both_switches_start_honestly(window):
@@ -884,3 +892,129 @@ def test_deferred_permuto_on_shows_not_running_when_the_gate_clears(
     assert window._permuto_switch.status_text() == "blocked"
     assert "flip the switch OFF" in window._permuto_switch._chip.toolTip()
     window._permuto_desired_on = False
+
+
+# --------------------------------------------------------------------------- #
+# [STARTINTENT v0.10.11] A stored "start with dexie on" is the operator's
+# intent: the slider paints ON immediately and the chip carries the boot
+# story ("starting") instead of the false "the engine is not running".
+# --------------------------------------------------------------------------- #
+
+
+def _sealed_window(startup_dexie):
+    """A fresh MainWindow with the identity sealed and startup states forced."""
+    from PySide6.QtWidgets import QApplication
+
+    QApplication.instance() or QApplication([])
+
+    import gui.widgets.permuto as permuto_mod
+    import gui.widgets.settings as settings_mod
+
+    class _UnregisteredInfo:
+        registered = False
+        link_attempted = False
+        backup_confirmed = False
+        listing_verified = False
+        user_id = None
+        trading_address = None
+        pubkey = "ab" * 48
+        created_at = None
+
+    class _FakeIdentity:
+        @staticmethod
+        def info():
+            return _UnregisteredInfo()
+
+    real_identity = permuto_mod._default_identity_factory
+    real_loader = settings_mod.load_startup_states
+    permuto_mod._default_identity_factory = lambda: _FakeIdentity()
+    settings_mod.load_startup_states = lambda: (startup_dexie, "off")
+    try:
+        from gui.widgets.main_window import MainWindow
+
+        return MainWindow()
+    finally:
+        permuto_mod._default_identity_factory = real_identity
+        settings_mod.load_startup_states = real_loader
+
+
+def test_a_stored_on_request_paints_intent_before_the_engine():
+    w = _sealed_window("on")
+    assert w._dexie_desired_on is True
+    w._dexie_switch.refresh()
+    assert w._dexie_switch.status_text() == "starting"
+    assert w._dexie_switch._toggle.isChecked()
+
+
+def test_the_boot_window_expires_into_the_real_gate():
+    """An engine that never comes up must stop claiming boot progress."""
+    w = _sealed_window("on")
+    w._gui_started_at -= 1000.0
+    w._dexie_switch.refresh()
+    assert w._dexie_switch.status_text() == "blocked"
+
+
+def test_an_analyzing_engine_reads_starting_not_engine_down():
+    """"Analyzing" clears _bot_running, but the process is up and working --
+    any ON intent deserves the boot story, not "engine is not running"."""
+    w = _sealed_window("adopt")
+    w._dexie_desired_on = True
+    w._on_bot_status_changed("Analyzing")
+    w._dexie_switch.refresh()
+    assert w._dexie_switch.status_text() == "starting"
+
+
+def test_an_unpublished_gate_family_reads_starting_not_quoting():
+    """The metrics endpoint comes up before the first cycle publishes the
+    gate family; an empty scrape is evidence of starting, not of trading."""
+    w = _sealed_window("on")
+
+    class _Svc:
+        @staticmethod
+        def has_data():
+            return False
+
+        @staticmethod
+        def posting_gates_published():
+            return False
+
+        @staticmethod
+        def posting_gate_reasons():
+            return set()
+
+        @staticmethod
+        def offers_published():
+            return False
+
+        @staticmethod
+        def get_offers_summary():
+            return {}
+
+    class _Bridge:
+        metrics_service = _Svc()
+
+    w._bridge = _Bridge()
+    w._bot_running = True
+    w._dexie_switch.refresh()
+    assert w._dexie_switch.status_text() == "starting"
+
+
+def test_a_failed_launch_retires_the_starting_story(monkeypatch):
+    from gui.widgets import main_window as mw_mod
+
+    w = _sealed_window("on")
+    monkeypatch.setattr(mw_mod.QMessageBox, "critical",
+                        staticmethod(lambda *a, **k: None))
+    w._on_engine_start_failed("boom")
+    assert w._startup_dexie == ""
+    w._dexie_switch.refresh()
+    assert w._dexie_switch.status_text() == "blocked"
+
+
+def test_a_presync_click_outranks_the_stored_request():
+    """The operator's explicit toggle wins over the stored startup request:
+    the gate-publish application must find nothing left to apply."""
+    w = _sealed_window("on")
+    w._on_dexie_toggle(False)
+    assert w._startup_dexie == ""
+    assert w._dexie_desired_on is False

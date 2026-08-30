@@ -22,6 +22,22 @@ def _in(**kw) -> SwitchInputs:
 # Intent ON
 # --------------------------------------------------------------------------- #
 
+def test_on_while_starting_reads_starting_not_blocked():
+    """[STARTINTENT] A stored ON request during engine boot is the normal
+    morning; the chip narrates it instead of crying blocked."""
+    chip = resolve_chip(_in(desired_on=True, gates={"starting"}))
+    assert chip.text == "starting"
+    assert chip.tone == "converging"
+    assert not chip.offer_cancel_visible
+
+
+def test_a_real_gate_outranks_the_starting_story():
+    chip = resolve_chip(_in(desired_on=True,
+                            gates={"starting", "watchdog"}))
+    assert chip.text == "blocked"
+    assert "dead man's switch" in chip.tooltip
+
+
 def test_on_and_clear_reads_quoting_with_the_count():
     chip = resolve_chip(_in(desired_on=True, book_is_empty=False,
                             resting_count=14.0))

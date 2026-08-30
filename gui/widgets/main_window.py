@@ -329,6 +329,21 @@ class MainWindow(QMainWindow):
         # through the same gates as a click. dexie: adopt|on|off.
         from gui.widgets.settings import load_startup_states
         self._startup_dexie, self._startup_permuto = load_startup_states()
+        # [STARTINTENT v0.10.11] The slider claims INTENT, and a stored
+        # "start with dexie on" IS the operator's intent -- so it paints ON
+        # from the first tick while the chip explains the engine is still
+        # starting. The actual arming still happens at gate-publish time
+        # through may_turn_on, exactly as before; adoption overwrites this
+        # seed from reality immediately before that application runs.
+        if self._startup_dexie == "on":
+            self._dexie_desired_on = True
+        # The engine's "Analyzing" phase clears _bot_running, and a stored
+        # ON request has a launch in flight before the process even exists;
+        # _gather_dexie turns both into a "starting" gate instead of the
+        # false "the engine is not running". The window is BOUNDED so an
+        # engine that never comes up stops claiming boot progress.
+        self._engine_analyzing: bool = False
+        self._gui_started_at: float = _time.monotonic()
         self._startup_permuto_applied: bool = False
         self._permuto_desired_on: bool = False
         # Set when a QuoteRunner is owned by this window. Until then the
@@ -948,6 +963,7 @@ class MainWindow(QMainWindow):
             New status string (Running, Stopped, Disconnected, etc.).
         """
         self._bot_status_label.setText(status)
+        self._engine_analyzing = status in ("Analyzing",)
         if status in ("Running",):
             colour = LIGHT_GREEN
             self._bot_running = True
@@ -1000,6 +1016,12 @@ class MainWindow(QMainWindow):
     def _on_engine_start_failed(self, msg: str) -> None:
         """Show a detailed dialog when the managed engine exits on startup."""
         self._status_bar.showMessage("Engine startup failed.", 10_000)
+        # [STARTINTENT] The boot window's "starting" claim rests on a launch
+        # being in flight; a failed launch ends that story, and the chip
+        # falls back to naming the real gate (the engine is not running).
+        if not self._dexie_intent_synced:
+            self._startup_dexie = ""
+            self._refresh_venue_switches()
         if msg == self._last_engine_start_failure:
             return
 
@@ -2310,14 +2332,39 @@ class MainWindow(QMainWindow):
         permanently unable to turn itself back on. `dry_run` is excluded
         because it is a mode, not a fault.
         """
+        import time as _time
         gates: set[str] = set()
         if not self._bot_running:
-            gates.add("engine_down")
+            if self._engine_analyzing:
+                # The process is up and running its startup analysis --
+                # "Analyzing" clears _bot_running, but "the engine is not
+                # running" would be false. The chip says starting.
+                gates.add("starting")
+            elif (self._dexie_desired_on
+                    and not self._dexie_intent_synced
+                    and self._startup_dexie == "on"
+                    and _time.monotonic() - self._gui_started_at < 90.0):
+                # [STARTINTENT] Boot window of a stored ON request: the
+                # bridge auto-launch is imminent or in flight. Bounded so a
+                # launch that never lands stops reading "starting".
+                gates.add("starting")
+            else:
+                gates.add("engine_down")
         else:
             try:
                 if self._bridge is not None:
-                    reasons = (self._bridge.metrics_service
-                               .posting_gate_reasons() - {"dry_run"})
+                    svc = self._bridge.metrics_service
+                    if (hasattr(svc, "posting_gates_published")
+                            and not svc.posting_gates_published()):
+                        # [STARTINTENT] The metrics endpoint comes up before
+                        # the first cycle publishes the gate family, and an
+                        # empty scrape from that window is evidence of
+                        # STARTING, not of "nothing gates posting" -- the
+                        # same trap the intent sync learned in v0.10.1.
+                        gates.add("starting")
+                        reasons = set()
+                    else:
+                        reasons = (svc.posting_gate_reasons() - {"dry_run"})
                     # [review] `gui` is only OUR pause while this switch is
                     # OFF. With intent ON, a gui gate means something ELSE
                     # paused posting -- the Pause/Resume button, which still
@@ -2350,7 +2397,6 @@ class MainWindow(QMainWindow):
         # [review #9] Intent OFF but the engine's PUBLISHED gates show
         # nothing holding Step 8 past the grace period: our pause never
         # landed. Never claimed while the family is unpublished.
-        import time as _time
         posting_ungated = False
         if (not self._dexie_desired_on and self._bot_running
                 and self._bridge is not None
@@ -2531,6 +2577,11 @@ class MainWindow(QMainWindow):
         _log.warning("[GUI] venue switch refused: %s", reason)
 
     def _on_dexie_toggle(self, want_on: bool) -> None:
+        # [STARTINTENT] Any explicit toggle -- an operator click or the
+        # startup application itself -- supersedes the stored startup
+        # request: a pre-sync click must never be overridden when the gates
+        # publish, and a consumed request must not keep claiming "starting".
+        self._startup_dexie = ""
         if want_on:
             self._dexie_desired_on = True
             if (self._dexie_cancel_all_pending
