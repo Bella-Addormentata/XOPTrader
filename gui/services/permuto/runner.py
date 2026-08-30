@@ -122,6 +122,10 @@ class QuoteRunner:
         #: Whether the venue-side dead man's switch reported armed, for
         #: log-once state transitions rather than a message per tick.
         self._dms_ok: Optional[bool] = None
+        # [WATCH] Contest flags whose TRANSITIONS change the plan (C-09):
+        # untraded_purge_at flipping non-null starts the qualifying-fill
+        # clock; signup_closed flipping true ends re-registration forever.
+        self._watched_flags: dict = {}
         # [WATCH] Telemetry state: slow-tick latch, leaderboard throttle,
         # last (time, depth) sample, last trade count, stall strikes.
         self._tick_slow: bool = False
@@ -332,6 +336,18 @@ class QuoteRunner:
                                  "dead man's switch: %s -- a crash would "
                                  "leave the book resting", exc)
                     self._dms_ok = False
+
+        # [WATCH C-09] Contest-flag transitions, from the same flags dict
+        # the tick already receives -- no extra request. Logged only on
+        # CHANGE: these flip at most a handful of times all week, and each
+        # flip changes what the operator should be doing.
+        for key in ("untraded_purge_at", "signup_closed", "CONTEST_START",
+                    "contest_start"):
+            if key in flags and flags.get(key) != self._watched_flags.get(key):
+                _log.warning("permuto: contest flag %s changed: %r -> %r",
+                             key, self._watched_flags.get(key),
+                             flags.get(key))
+                self._watched_flags[key] = flags.get(key)
 
         # [WATCH 2026-08-29] Depth-accrual and fill telemetry, every
         # LEADERBOARD_WATCH_S. Net under the loop like the dead man's
