@@ -1257,3 +1257,31 @@ def test_a_failed_retraction_is_retried_rather_than_latched():
     r.tick(_OVERNIGHT + 5.0, _ORACLE, {})
     after = len([x for x in c.calls if x == "cancel_all"])
     assert after > c2_calls_before, "the retraction was not retried"
+
+
+def test_every_tick_reports_the_curfew_stage_it_ran_under():
+    """The GUI shows only the action, so without this an operator sees
+    bid-only quoting at 22:00 with no way to tell an intended curfew from a
+    half-broken loop."""
+    c = _Client(account=_account(0.0))
+    r = _runner(c, curfew_enabled=True)
+    assert r.tick(_OVERNIGHT, _ORACLE, {}).curfew == "closed"
+    assert r.tick(_MID_SESSION, _ORACLE, {}).curfew == "session"
+
+
+def test_the_stage_is_reported_on_a_tick_that_could_not_trade():
+    # The degraded paths are exactly where knowing the posture matters --
+    # and they are the ones most likely to forget it, since each builds its
+    # own TickResult. (An unreadable account degrades to withdraw rather
+    # than erroring, which is why this asserts the action rather than ok.)
+    c = _Client(account=_account(0.0), fail_on="account")
+    r = _runner(c, curfew_enabled=True)
+    result = r.tick(_OVERNIGHT, _ORACLE, {})
+    assert result.action == "withdraw"
+    assert result.curfew == "closed"
+
+
+def test_a_disabled_curfew_reports_nothing_rather_than_guessing():
+    c = _Client(account=_account(0.0))
+    r = _runner(c, curfew_enabled=False)
+    assert r.tick(_OVERNIGHT, _ORACLE, {}).curfew == ""

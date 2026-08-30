@@ -2775,7 +2775,15 @@ class MainWindow(QMainWindow):
         if not getattr(result, "ok", True):
             _log.warning("[Permuto] tick error: %s",
                          getattr(result, "error", ""))
-        self.statusBar().showMessage("Permuto: %s" % action, 4000)
+        # [CURFEW] Name the stage when one is in force. Overnight the book
+        # is deliberately bid-only and smaller; without this the window
+        # shows "quote" and gives the operator no way to tell an intended
+        # curfew from a half-broken loop.
+        curfew = getattr(result, "curfew", "") or ""
+        label = action
+        if curfew and curfew not in ("session", "unscheduled"):
+            label = "%s (curfew: %s)" % (action, curfew)
+        self.statusBar().showMessage("Permuto: %s" % label, 4000)
         self._refresh_venue_switches()
 
     def _on_permuto_stopped(self, reason: str) -> None:

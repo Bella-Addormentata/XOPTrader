@@ -79,6 +79,11 @@ class TickResult:
     reason: str = ""
     markets: dict = field(default_factory=dict)
     error: str = ""
+    #: [CURFEW] The inventory-curfew stage this tick ran under, or "" when
+    #: the curfew is off. Carried so the GUI can say WHY the book is
+    #: one-sided or small: without it an operator glancing at the window at
+    #: 22:00 sees bid-only quoting and no reason for it.
+    curfew: str = ""
 
     @property
     def ok(self) -> bool:
@@ -237,6 +242,12 @@ class QuoteRunner:
             # The loop must outlive its own bugs for ~102 unattended hours.
             _log.exception("permuto: unexpected tick failure")
             result = TickResult("error", repr(exc), error=repr(exc))
+        # [CURFEW] Stamped here rather than at each of the dozen
+        # TickResult sites, so no return path can forget it -- including
+        # the exception paths above, where knowing the curfew state is
+        # exactly as useful.
+        if self._curfew is not None:
+            result.curfew = self._curfew.stage.value
         # [WATCH] Wall-clock per tick, so a slowing venue or a regressing
         # loop is visible AS it degrades rather than inferred from missing
         # depth two hours later. DEBUG when healthy; WARN past half the
