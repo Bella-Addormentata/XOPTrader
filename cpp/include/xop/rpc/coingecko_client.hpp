@@ -24,6 +24,7 @@
 #define XOP_RPC_COINGECKO_CLIENT_HPP
 
 #include "xop/config.hpp"
+#include "xop/rpc/coingecko_parse.hpp"
 #include "xop/rpc/dexie_client.hpp"  // Reuse SlidingWindowRateLimiter, CurlEasyPtr, CurlSlistPtr
 
 #include <chrono>
@@ -93,8 +94,9 @@ public:
 ///   auto prices = co_await client.fetch_prices();
 ///   client.close();
 ///
-/// fetch_prices() returns a map from CoinGecko coin ID to USD price:
-///   { "chia": 2.71, "ethereum": 2450.0, "usd-coin": 1.0001 }
+/// fetch_prices() returns a ParsedPrices snapshot: coin-id -> USD price
+/// ({ "chia": 2.71, ... }) plus USD-per-unit FX rates for every non-USD
+/// currency the config requested ({ "EUR": 1.09 }).
 class CoinGeckoClient {
 public:
     /// Construct an unopened client.
@@ -125,13 +127,18 @@ public:
 
     // -- Price fetching ---------------------------------------------------
 
-    /// Fetch current USD prices for all configured coin_ids.
+    /// Fetch current prices for all configured coin_ids, in every
+    /// configured vs_currency.
     ///
-    /// Calls GET /simple/price?ids=chia,ethereum,...&vs_currencies=usd
+    /// Calls GET /simple/price?ids=chia,...&vs_currencies=usd[,eur,...]
     ///
-    /// @return Map from CoinGecko coin ID to USD price.
-    ///         e.g. { "chia": 2.71, "ethereum": 2450.0 }
-    [[nodiscard]] boost::asio::awaitable<std::map<std::string, double>>
+    /// [PARANCHOR 2026-08-30] Returns the digested snapshot: USD prices
+    /// per coin id, plus USD-per-unit FX rates for every requested
+    /// non-USD currency (derived as coin_usd / coin_cur from the first
+    /// coin quoting both).  Non-USD peg declarations put their currency
+    /// into cfg.vs_currencies at load, so the FX a par anchor needs
+    /// arrives with the same request that fetches feed prices.
+    [[nodiscard]] boost::asio::awaitable<ParsedPrices>
     fetch_prices();
 
     // -- Diagnostics ------------------------------------------------------

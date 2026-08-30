@@ -190,6 +190,24 @@ TEST(FairValueSolver, RecoversAnExactTriangle) {
     EXPECT_GT(s.sigma_bps, 0.0);
 }
 
+TEST(FairValueSolver, TwoAnchorsAloneSolveAnEdgelessPair) {
+    // [PARANCHOR] The BYC shape: no book edge survives own-book exclusion
+    // and the AMM is down, but BOTH legs carry an external anchor -- xch
+    // via CoinGecko (100bps) and byc via its declared par (150bps).  The
+    // solve must succeed as both_anchored at the anchor ratio, and the
+    // combined sigma must clear the 200bps usability ceiling -- this
+    // inequality is the entire reason the par sigma defaults are 100/140.
+    const std::vector<fv::Anchor> anchors = {
+        fv::Anchor{"xch", 1.43, 100.0}, fv::Anchor{"byc", 1.0, 140.0}};
+
+    const auto s = fv::solve_pair(anchors, {}, "xch", "byc", -1);
+    ASSERT_TRUE(s.ok);
+    EXPECT_TRUE(s.both_anchored);
+    EXPECT_NEAR(s.price, 1.43, 1e-9);
+    EXPECT_NEAR(s.sigma_bps, std::sqrt(100.0 * 100.0 + 140.0 * 140.0), 1.0);
+    EXPECT_LT(s.sigma_bps, 200.0);
+}
+
 TEST(FairValueSolver, IsSymmetricUnderPairInversion) {
     // Log space is not a convenience: the answer must not depend on which leg
     // a pair happens to be named after.

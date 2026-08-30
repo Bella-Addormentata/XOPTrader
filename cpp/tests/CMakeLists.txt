@@ -63,6 +63,8 @@ add_executable(xop_tests
     test_reconcile_verdict.cpp
     test_bbo_sanity.cpp
     test_no_loss_floor.cpp
+    test_par_anchor.cpp
+    test_coingecko_parse.cpp
     test_liquidity.cpp
     test_market_allocator.cpp
     test_fee_tracker.cpp

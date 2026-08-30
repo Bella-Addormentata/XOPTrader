@@ -283,7 +283,7 @@ asio::awaitable<nlohmann::json> CoinGeckoClient::execute_request_(
 // Public API: fetch_prices
 // =======================================================================
 
-asio::awaitable<std::map<std::string, double>>
+asio::awaitable<ParsedPrices>
 CoinGeckoClient::fetch_prices() {
 
     if (cfg_.coin_ids.empty()) {
@@ -312,37 +312,63 @@ CoinGeckoClient::fetch_prices() {
     } else {
         url += ids_raw;  // Fallback: use raw (safe for simple coin IDs).
     }
-    url += "&vs_currencies=usd";
+    // [PARANCHOR 2026-08-30] Every configured denomination in one
+    // request: the same call that fetches USD feed prices carries the
+    // fiat crosses that non-USD par anchors need.
+    const std::vector<std::string> currencies =
+        cfg_.vs_currencies.empty() ? std::vector<std::string>{"usd"}
+                                   : cfg_.vs_currencies;
+    // [review] Escaped like ids: these strings derive from operator
+    // config, and one malformed value spliced raw would poison the whole
+    // shared request (every coin, every cycle) rather than one FX rate.
+    url += "&vs_currencies=";
+    for (std::size_t i = 0; i < currencies.size(); ++i) {
+        if (i > 0) url += "%2C";
+        char* esc = curl_easy_escape(encoder.get(), currencies[i].c_str(),
+                                     static_cast<int>(currencies[i].size()));
+        if (esc) {
+            url += esc;
+            curl_free(esc);
+        } else {
+            url += currencies[i];
+        }
+    }
 
     // Execute the request.
     nlohmann::json result = co_await execute_request_(url);
 
-    // Parse the response.
-    // Expected format: { "chia": { "usd": 2.71 }, "ethereum": { "usd": 2450.0 }, ... }
-    std::map<std::string, double> prices;
+    // Parse the response (pure; see coingecko_parse.hpp).
+    // Expected format: { "chia": { "usd": 2.71, "eur": 2.48 }, ... }
+    ParsedPrices parsed = parse_simple_price(result, cfg_.coin_ids,
+                                             currencies);
 
     for (const auto& coin_id : cfg_.coin_ids) {
-        auto coin_it = result.find(coin_id);
-        if (coin_it == result.end() || !coin_it->is_object()) {
-            log_->warn("CoinGecko response missing coin: {}", coin_id);
-            continue;
-        }
-        auto usd_it = coin_it->find("usd");
-        if (usd_it == coin_it->end() || !usd_it->is_number()) {
-            log_->warn("CoinGecko response missing usd price for: {}",
+        if (parsed.usd.find(coin_id) == parsed.usd.end()) {
+            log_->warn("CoinGecko response missing usable usd price for: {}",
                        coin_id);
-            continue;
         }
-        prices[coin_id] = usd_it->get<double>();
+    }
+    for (const auto& cur : currencies) {
+        if (cur == "usd") continue;
+        if (parsed.fx_usd_per.find(ascii_upper(cur))
+            == parsed.fx_usd_per.end()) {
+            log_->warn("CoinGecko response carried no usable {} quote -- "
+                       "par anchors pegged in {} stay un-anchored this "
+                       "cycle", cur, ascii_upper(cur));
+        }
     }
 
-    log_->info("CoinGecko prices fetched: {} of {} coins",
-               prices.size(), cfg_.coin_ids.size());
-    for (const auto& [id, price] : prices) {
+    log_->info("CoinGecko prices fetched: {} of {} coins, {} fx rate(s)",
+               parsed.usd.size(), cfg_.coin_ids.size(),
+               parsed.fx_usd_per.size());
+    for (const auto& [id, price] : parsed.usd) {
         log_->debug("  {} = ${:.4f}", id, price);
     }
+    for (const auto& [cur, fx] : parsed.fx_usd_per) {
+        log_->debug("  1 {} = ${:.6f}", cur, fx);
+    }
 
-    co_return prices;
+    co_return parsed;
 }
 
 } // namespace xop::rpc

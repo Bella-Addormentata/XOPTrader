@@ -439,6 +439,28 @@ struct StrategyConfig {
     /// solve.  Default 100 bps, from that measured agreement.
     double   fair_value_feed_sigma_bps{100.0};
 
+    // [PARANCHOR 2026-08-30] Error bars for anchors derived from DECLARED
+    // pars (pegged_assets), by the declaration's own kind:
+    //
+    //   * par_sigma: prefer_market_cross == false -- a wrapper, par by
+    //     construction (one unit is a claim on one currency unit).
+    //   * par_market_sigma: prefer_market_cross == true -- a market-
+    //     determined peg (BYC): par is an aim the market usually honours
+    //     (7-day VWAP 1.001) but does not owe us, so the bar is wider.
+    //
+    // Par anchors are FALLBACK ONLY: a pair's solve consults them only
+    // when it fails without them, so these sigmas can never out-vote
+    // live market evidence (see par_anchor.hpp).
+    //
+    // BOTH interact with fair_value_max_sigma_bps: any two-anchor solve
+    // combines in quadrature, so EVERY pairing drawn from {feed, par,
+    // par_market} must stay under the ceiling or that combination is a
+    // silent no-op -- the loader warns per failing pairing.  Defaults
+    // chosen so all pairings clear 200: worst is par_market twice,
+    // sqrt(2)*140 = 198; the BYC case is sqrt(100^2+140^2) = 172.
+    double   fair_value_par_sigma_bps{100.0};
+    double   fair_value_par_market_sigma_bps{140.0};
+
     /// FLOOR (bps) on the 1-sigma of an AMM implied price: the uncertainty a
     /// pool deep enough to be genuinely arbitrage-pinned still carries, which
     /// is the swap fee plus the arbitrage band.  Default 50 bps (TibetSwap's
@@ -1535,6 +1557,13 @@ struct CoinGeckoConfig {
 
     /// CoinGecko coin IDs to fetch (e.g. "chia", "ethereum", "usd-coin").
     std::vector<std::string> coin_ids;
+
+    /// [PARANCHOR 2026-08-30] Fiat denominations the fetch requests:
+    /// always "usd", plus the lowercase peg currency of every declared
+    /// non-USD peg.  DERIVED at load from pegged_assets (see
+    /// rpc::vs_currencies_for), never operator-set: declaring a EUR peg
+    /// IS the request for a EURUSD rate.
+    std::vector<std::string> vs_currencies{"usd"};
 
     /// How often to poll CoinGecko (milliseconds).  Free tier: 30-60 s.
     uint32_t    polling_interval_ms{30'000};

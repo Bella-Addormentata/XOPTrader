@@ -992,6 +992,12 @@ private:
     /// Updated once per polling_interval_ms in step_update_market_state.
     std::map<std::string, double> coingecko_prices_;
 
+    /// [PARANCHOR 2026-08-30] USD per one unit of each non-USD peg
+    /// currency ("EUR" -> 1.09), from the same fetch.  Consulted when a
+    /// declared par needs converting into a USD anchor; an absent entry
+    /// means that par stays un-anchored (never a silent 1:1).
+    std::map<std::string, double> coingecko_fx_usd_;
+
     /// Timestamp of the last successful CoinGecko fetch.
     std::chrono::steady_clock::time_point coingecko_last_fetch_;
 

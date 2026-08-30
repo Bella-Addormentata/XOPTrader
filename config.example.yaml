@@ -274,6 +274,17 @@ strategy:
   # blind_quote_widen_pct: 50            # Extra width when no fair value exists
   # fair_value_clamp_tier_step_bps: 10   # Keep clamped tiers on distinct prices
   # fair_value_feed_sigma_bps: 100       # CoinGecko vs the on-chain market
+  # [PARANCHOR] Declared pegs (pegged_assets) can anchor their asset at
+  # par -- FALLBACK ONLY: a pair's solve consults them solely when it
+  # finds no path without them, so live market evidence always outranks
+  # a declaration.  Enforced + unsuspended assets only, every sibling
+  # sharing a graph node must agree, and a stale CoinGecko fetch
+  # disables the pass.  Non-USD pegs (EUR/JPY) convert through an FX
+  # cross fetched in the same CoinGecko request; a missing rate means no
+  # anchor, never 1:1.  Every sigma pairing must clear
+  # fair_value_max_sigma_bps (200) -- the loader warns per violation.
+  # fair_value_par_sigma_bps: 100        # wrappers (prefer_market_cross: false)
+  # fair_value_par_market_sigma_bps: 140 # market-determined pegs (e.g. BYC)
   # fair_value_amm_sigma_bps: 50         # TibetSwap pool implied price
   # fair_value_amm_max_age_sec: 300
   # fair_value_min_book_sigma_bps: 10    # Floor on a book mid's uncertainty

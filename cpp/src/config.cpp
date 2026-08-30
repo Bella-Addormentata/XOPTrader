@@ -15,6 +15,7 @@
 // ISO/IEC 25000 -- clear error messages citing the offending field.
 
 #include "xop/config.hpp"
+#include "xop/rpc/coingecko_parse.hpp"
 #include "xop/feed_listings.hpp"
 
 #include <spdlog/spdlog.h>
@@ -496,6 +497,21 @@ PegRegistry parse_pegged_assets(const YAML::Node& root)
                            [](unsigned char c) {
                                return static_cast<char>(std::toupper(c));
                            });
+            // [PARANCHOR review] This string is spliced into the shared
+            // CoinGecko request URL as a vs_currency; free text here could
+            // poison the whole feed (every coin, not just this peg).  An
+            // ISO-4217-shaped code is the only thing that can ever resolve
+            // anyway.
+            const bool cur_ok = cur.size() >= 2 && cur.size() <= 8
+                && std::all_of(cur.begin(), cur.end(),
+                               [](unsigned char c) {
+                                   return std::isalpha(c) != 0;
+                               });
+            if (!cur_ok) {
+                throw ConfigError(
+                    "pegged_assets: peg_currency '" + cur
+                    + "' must be 2-8 ASCII letters (ISO-4217-shaped)");
+            }
             a.peg_currency = cur;
         }
         if (item["peg_target"])   a.peg_target   = item["peg_target"].as<double>();
@@ -524,7 +540,10 @@ PegRegistry parse_pegged_assets(const YAML::Node& root)
                 "sustained_observations are recorded but NOT YET WIRED to a "
                 "detector. Peg monitoring still comes only from pairs marked "
                 "`is_stablecoin`, so declaring thresholds here does not by "
-                "itself watch this asset.", a.asset_id);
+                "itself watch this asset. (Since [PARANCHOR] the declared "
+                "par CAN feed fair value as a last-resort anchor when "
+                "nothing else prices a pair -- one more reason the watch "
+                "gap matters.)", a.asset_id);
         }
 
         if (!reg.add(std::move(a))) {
@@ -1443,6 +1462,23 @@ StrategyConfig parse_strategy(const YAML::Node& root)
             if (!(*dst > 0.0) || *dst > 2.0) {
                 throw ConfigError(sec + "." + key
                                   + " must be in (0, 2]");
+            }
+        }
+    }
+
+    // [PARANCHOR 2026-08-30] Declared-par anchor sigmas.  (0, 10000] --
+    // a zero or negative bar would give a declaration infinite weight.
+    for (const auto& [key, dst] : {
+             std::pair<const char*, double*>{
+                 "fair_value_par_sigma_bps",
+                 &cfg.fair_value_par_sigma_bps},
+             {"fair_value_par_market_sigma_bps",
+              &cfg.fair_value_par_market_sigma_bps}}) {
+        if (node[key] && node[key].IsDefined() && !node[key].IsNull()) {
+            *dst = node[key].as<double>();
+            if (!(*dst > 0.0) || *dst > 10'000.0) {
+                throw ConfigError(sec + "." + key
+                                  + " must be in (0, 10000]");
             }
         }
     }
@@ -3567,6 +3603,36 @@ AppConfig load_config(const std::string& path,
     cfg.depeg      = parse_depeg(root);
     cfg.arbitrage  = parse_arbitrage(root);
     cfg.coingecko  = parse_coingecko(root);
+    // [PARANCHOR 2026-08-30] Declaring a non-USD peg is the request for
+    // its FX rate; the fetch must carry that currency or usd_par_value()
+    // will (correctly) refuse to anchor the asset.
+    cfg.coingecko.vs_currencies = rpc::vs_currencies_for(cfg.pegged_assets);
+    // An anchor pairing whose quadrature clears the max ceiling can never
+    // make a pair usable by itself -- warn per failing pairing, because
+    // that configuration reads as "anchored" while behaving as "blind".
+    // ([review] the original check tested only worst-par + feed and missed
+    // the two-par pairing, which the earlier 150bps default itself failed.)
+    {
+        const double sig[] = {cfg.strategy.fair_value_feed_sigma_bps,
+                              cfg.strategy.fair_value_par_sigma_bps,
+                              cfg.strategy.fair_value_par_market_sigma_bps};
+        const char* nm[] = {"feed", "par", "par_market"};
+        for (int i = 0; i < 3; ++i) {
+            for (int j = i; j < 3; ++j) {
+                const double combined =
+                    std::sqrt(sig[i] * sig[i] + sig[j] * sig[j]);
+                if (combined > cfg.strategy.fair_value_max_sigma_bps) {
+                    spdlog::warn(
+                        "[Config] fair_value {}+{} sigmas combine to "
+                        "{:.0f}bps, above the max ceiling {:.0f}bps -- a "
+                        "pair anchored only by that combination can never "
+                        "be usable",
+                        nm[i], nm[j], combined,
+                        cfg.strategy.fair_value_max_sigma_bps);
+                }
+            }
+        }
+    }
     cfg.tibetswap  = parse_tibetswap(root);
     cfg.fees       = parse_fees(root);
     cfg.inventory_aging = parse_inventory_aging(root);

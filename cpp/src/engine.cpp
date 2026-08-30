@@ -23,6 +23,7 @@
 #include "xop/feed_listings.hpp"
 #include "xop/execution/exposure_gate.hpp"
 #include "xop/execution/fair_value_solver.hpp"
+#include "xop/execution/par_anchor.hpp"
 #include "xop/execution/mid_gate.hpp"
 #include "xop/risk/valuation_authority.hpp"
 #include "xop/risk/usd_route.hpp"
@@ -3274,7 +3275,9 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
             config_.coingecko.polling_interval_ms};
         if (now - coingecko_last_fetch_ >= interval) {
             try {
-                coingecko_prices_ = co_await coingecko_->fetch_prices();
+                auto cg_snapshot = co_await coingecko_->fetch_prices();
+                coingecko_prices_ = std::move(cg_snapshot.usd);
+                coingecko_fx_usd_ = std::move(cg_snapshot.fx_usd_per);
                 // Stamp COMPLETION, not the pre-await capture: a slow or
                 // retried request would otherwise age fresh prices by its
                 // own duration, and the revive freshness gate could read
@@ -5753,6 +5756,10 @@ void Engine::update_fair_values()
         std::string          name;
         std::string          base;
         std::string          quote;
+        // [PARANCHOR] Registry keys for the two legs -- pegs are declared
+        // by asset id, while the graph names legs by canonical symbol.
+        std::string          base_id;
+        std::string          quote_id;
         FairValueObservation obs{};
     };
     std::vector<GraphPair> graph;
@@ -5767,6 +5774,7 @@ void Engine::update_fair_values()
             continue;
         }
         graph.push_back(GraphPair{pair.name, legs->first, legs->second,
+                                  pair.base_asset_id, pair.quote_asset_id,
                                   market_data_->get_fair_value_inputs(
                                       pair.name)});
     }
@@ -5793,6 +5801,70 @@ void Engine::update_fair_values()
                 leg,
                 quoted->second / listing->second.units_per_coin,
                 sc.fair_value_feed_sigma_bps});
+        }
+    }
+
+    // [PARANCHOR 2026-08-30] Declared pars as FALLBACK anchors.  These
+    // are NOT added to the primary anchor set: Step D consults them only
+    // when a pair's solve fails without them, so a 100-140bps declaration
+    // can never out-vote live market evidence, and a broken-but-
+    // unobserved par can only anchor a pair that nothing else can price
+    // at all.  ([review] the always-on version inverted
+    // prefer_market_cross and let a stale par screen honest books.)
+    //
+    // Guards, per the adversarial review:
+    //  * consensus across conflated siblings -- ".b" stripping makes
+    //    wUSDC.b and wUSDC one graph node; every asset id sharing a leg
+    //    must independently justify the SAME par or the leg gets nothing
+    //    (a healthy sibling must not anchor a suspended one at par);
+    //  * CoinGecko freshness -- with the fetch stale, a par ratio against
+    //    an old feed anchor would CLAMP confidently where the pre-par
+    //    engine widened protectively.  No fresh fetch, no par anchors.
+    std::vector<fv::Anchor> par_fallback_anchors;
+    const auto cg_age_limit = std::chrono::milliseconds{
+        3 * config_.coingecko.polling_interval_ms};
+    const bool cg_fresh =
+        coingecko_last_success_at_ != std::chrono::system_clock::time_point{}
+        && std::chrono::system_clock::now() - coingecko_last_success_at_
+               <= cg_age_limit;
+    if (cg_fresh && !config_.pegged_assets.empty()) {
+        std::unordered_map<std::string, std::vector<ParLegInput>> leg_assets;
+        const auto note_leg = [&](const std::string& leg,
+                                  const std::string& asset_id) {
+            if (asset_id.empty() || anchored.count(leg)) return;
+            auto& ins = leg_assets[leg];
+            for (const auto& have : ins) {
+                if (have.asset_id == asset_id) return;
+            }
+            ParLegInput in;
+            in.asset_id = asset_id;
+            if (auto rt = asset_peg_rt_.find(asset_id);
+                rt != asset_peg_rt_.end()) {
+                in.suspended = rt->second.suspended;
+            }
+            if (const PeggedAsset* decl =
+                    config_.pegged_assets.find(asset_id);
+                decl != nullptr && decl->peg_currency != "USD") {
+                if (auto fit = coingecko_fx_usd_.find(decl->peg_currency);
+                    fit != coingecko_fx_usd_.end()) {
+                    in.fx_to_usd = fit->second;
+                }
+            }
+            ins.push_back(std::move(in));
+        };
+        for (const GraphPair& gp : graph) {
+            note_leg(gp.base, gp.base_id);
+            note_leg(gp.quote, gp.quote_id);
+        }
+        for (const auto& [leg, ins] : leg_assets) {
+            auto par = par_anchor_consensus(config_.pegged_assets, leg, ins,
+                                            sc.fair_value_par_sigma_bps,
+                                            sc.fair_value_par_market_sigma_bps);
+            if (!par) continue;
+            spdlog::debug("[Engine] fair value: leg {} holds a FALLBACK par "
+                          "anchor ${:.4f} (sigma={:.0f}bps, {} asset id(s))",
+                          leg, par->usd_price, par->sigma_bps, ins.size());
+            par_fallback_anchors.push_back(std::move(*par));
         }
     }
 
@@ -5878,8 +5950,24 @@ void Engine::update_fair_values()
     for (std::size_t i = 0; i < graph.size(); ++i) {
         const GraphPair& gp = graph[i];
 
-        const fv::Solution sol = fv::solve_pair(
+        fv::Solution sol = fv::solve_pair(
             anchors, edges, gp.base, gp.quote, static_cast<int>(i));
+
+        // [PARANCHOR] FALLBACK: only a solve that found NO path may
+        // consult the declared pars.  A solved pair -- however wide --
+        // never sees them, so market evidence always outranks a
+        // declaration.
+        if (!sol.ok && !par_fallback_anchors.empty()) {
+            std::vector<fv::Anchor> with_pars = anchors;
+            with_pars.insert(with_pars.end(), par_fallback_anchors.begin(),
+                             par_fallback_anchors.end());
+            sol = fv::solve_pair(with_pars, edges, gp.base, gp.quote,
+                                 static_cast<int>(i));
+            if (sol.ok) {
+                spdlog::debug("[Engine] fair value {}: solved via FALLBACK "
+                              "par anchor(s)", gp.name);
+            }
+        }
 
         FairValue out;
         out.residual_bps = std::numeric_limits<double>::quiet_NaN();
