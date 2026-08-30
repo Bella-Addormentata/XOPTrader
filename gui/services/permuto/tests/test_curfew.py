@@ -10,24 +10,24 @@ tell us the underlying is shut.
 from __future__ import annotations
 
 from gui.services.permuto.curfew import (
-    OVERNIGHT_LONG_FRACTION,
-    OVERNIGHT_SHORT_FRACTION,
-    leg_permitted,
     CLOSES_UTC,
     EXIT_START_S,
-    FLOOR_FRACTION,
     OPENS_UTC,
+    OVERNIGHT_LONG_FRACTION,
+    OVERNIGHT_SHORT_FRACTION,
     RAMP_START_S,
     SETTLE_AFTER_OPEN_S,
     OracleFreeze,
     Stage,
     assess_curfew,
+    permitted_leg_size,
 )
 
 MON_OPEN = OPENS_UTC[0]        # 2026-08-31 13:30Z = 09:30 EDT
 MON_CLOSE = CLOSES_UTC[0]      # 2026-08-31 20:00Z = 16:00 EDT
 FULL = 1_200.0
-FLOOR = FULL * FLOOR_FRACTION
+NIGHT_LONG = FULL * OVERNIGHT_LONG_FRACTION     # 300
+NIGHT_SHORT = FULL * OVERNIGHT_SHORT_FRACTION   # 0
 
 
 def _at(now_s, frozen=False, full=FULL):
@@ -35,14 +35,13 @@ def _at(now_s, frozen=False, full=FULL):
 
 
 # --------------------------------------------------------------------------- #
-# The table itself
+# The session table
 # --------------------------------------------------------------------------- #
 
 def test_the_table_is_five_sessions_of_six_and_a_half_hours():
     assert len(CLOSES_UTC) == len(OPENS_UTC) == 5
     for open_s, close_s in zip(OPENS_UTC, CLOSES_UTC):
         assert close_s - open_s == 6.5 * 3600.0
-    # Consecutive weekdays, one session per day.
     for i in range(1, 5):
         assert CLOSES_UTC[i] - CLOSES_UTC[i - 1] == 86_400.0
 
@@ -55,84 +54,164 @@ def test_before_the_first_open_the_market_is_closed_not_in_session():
     # Sunday evening: the venue is matching orders, the underlying is shut.
     state = _at(MON_OPEN - 3_600.0)
     assert state.stage is Stage.CLOSED
-    assert state.cap_usd == FLOOR
+    assert (state.long_cap_usd, state.short_cap_usd) == (NIGHT_LONG,
+                                                         NIGHT_SHORT)
 
 
-def test_just_after_the_open_is_settling_at_the_floor():
+def test_just_after_the_open_holds_the_overnight_posture():
     state = _at(MON_OPEN + 60.0)
     assert state.stage is Stage.SETTLING
-    assert state.cap_usd == FLOOR
+    assert (state.long_cap_usd, state.short_cap_usd) == (NIGHT_LONG,
+                                                         NIGHT_SHORT)
 
 
-def test_mid_session_restores_the_full_cap():
+def test_mid_session_restores_the_full_cap_on_both_sides():
     state = _at(MON_OPEN + SETTLE_AFTER_OPEN_S + 60.0)
     assert state.stage is Stage.SESSION
-    assert state.cap_usd == FULL
+    assert state.long_cap_usd == state.short_cap_usd == FULL
 
 
-def test_the_ramp_shrinks_the_cap_monotonically_toward_the_floor():
-    caps = []
-    t = MON_CLOSE - RAMP_START_S
-    # Stop strictly BEFORE the EXIT boundary: at exactly EXIT_START_S the
-    # stage is EXIT by design (the comparison there is inclusive).
-    while t < MON_CLOSE - EXIT_START_S:
-        state = _at(t)
-        assert state.stage is Stage.RAMP
-        caps.append(state.cap_usd)
-        t += 300.0
-    assert caps == sorted(caps, reverse=True)      # never increases
-    assert caps[0] <= FULL
-    assert caps[-1] >= FLOOR
-    # It actually travels most of the way, rather than nudging.
-    assert caps[0] - caps[-1] > (FULL - FLOOR) * 0.8
-
-
-def test_the_last_minutes_pin_the_floor():
+def test_the_last_minutes_hold_the_overnight_posture():
     state = _at(MON_CLOSE - 60.0)
     assert state.stage is Stage.EXIT
-    assert state.cap_usd == FLOOR
+    assert (state.long_cap_usd, state.short_cap_usd) == (NIGHT_LONG,
+                                                         NIGHT_SHORT)
 
 
 def test_after_the_close_the_curfew_holds_all_night():
     # The exploit executes DURING the closed window, so this is the case
-    # that matters most: hours after the bell, still floored.
+    # that matters most: hours after the bell, still capped.
     for hours in (0.5, 4.0, 12.0):
         state = _at(MON_CLOSE + hours * 3_600.0)
         assert state.stage is Stage.CLOSED
-        assert state.cap_usd == FLOOR
+        assert (state.long_cap_usd, state.short_cap_usd) == (NIGHT_LONG,
+                                                             NIGHT_SHORT)
 
 
 # --------------------------------------------------------------------------- #
-# The floor is never zero -- risk.assess() reads a non-positive limit as
-# "no limit", so a ramp to zero would restore UNLIMITED inventory.
+# [review] The constraint must never RELAX on the way into the close.
+# The first version ramped one symmetric number to a floor and then handed
+# EXIT a long cap of 25% of full, so the long allowance DOUBLED fifteen
+# minutes before the bell and restarted inventory accumulation.
 # --------------------------------------------------------------------------- #
 
-def test_the_cap_is_always_strictly_positive():
+def test_both_caps_fall_monotonically_from_the_ramp_into_the_night():
+    longs, shorts = [], []
+    t = MON_CLOSE - RAMP_START_S - 60.0        # a minute before the ramp
+    while t <= MON_CLOSE + 3_600.0:
+        state = _at(t)
+        longs.append(state.long_cap_usd)
+        shorts.append(state.short_cap_usd)
+        t += 60.0
+    assert longs == sorted(longs, reverse=True), "long cap increased"
+    assert shorts == sorted(shorts, reverse=True), "short cap increased"
+    assert longs[0] == FULL and longs[-1] == NIGHT_LONG
+    assert shorts[0] == FULL and shorts[-1] == NIGHT_SHORT
+
+
+def test_the_ramp_travels_most_of_the_way_rather_than_nudging():
+    early = _at(MON_CLOSE - RAMP_START_S + 60.0)
+    late = _at(MON_CLOSE - EXIT_START_S - 60.0)
+    assert early.stage is late.stage is Stage.RAMP
+    assert early.long_cap_usd - late.long_cap_usd > (FULL - NIGHT_LONG) * 0.8
+
+
+def test_there_is_no_jump_across_the_ramp_exit_boundary():
+    just_before = _at(MON_CLOSE - EXIT_START_S - 1.0)
+    just_after = _at(MON_CLOSE - EXIT_START_S + 1.0)
+    assert abs(just_before.long_cap_usd - just_after.long_cap_usd) < 1.0
+    assert abs(just_before.short_cap_usd - just_after.short_cap_usd) < 1.0
+
+
+# --------------------------------------------------------------------------- #
+# Caps and the position limit
+# --------------------------------------------------------------------------- #
+
+def test_the_long_cap_is_always_strictly_positive():
+    # risk.assess() reads a non-positive limit as "no limit"; the runner
+    # clamps, but the long side must never be the thing that needs it.
     probes = [MON_OPEN - 86_400.0, MON_OPEN, MON_OPEN + 1.0,
               MON_CLOSE - RAMP_START_S, MON_CLOSE - EXIT_START_S,
               MON_CLOSE - 1.0, MON_CLOSE, MON_CLOSE + 50_000.0]
     for t in probes:
         for frozen in (True, False):
-            assert _at(t, frozen=frozen).cap_usd > 0.0, (t, frozen)
+            assert _at(t, frozen=frozen).long_cap_usd > 0.0, (t, frozen)
 
 
-def test_an_explicit_zero_floor_is_refused():
-    state = assess_curfew(MON_CLOSE - 60.0, FULL, frozen_oracle=False,
-                          floor_usd=0.0)
-    assert state.cap_usd > 0.0
-
-
-def test_the_cap_never_exceeds_the_operators_limit():
-    for t in (MON_OPEN + 3_600.0, MON_CLOSE - RAMP_START_S + 1.0):
-        assert _at(t).cap_usd <= FULL
+def test_the_overnight_short_cap_is_exactly_zero():
+    state = _at(MON_CLOSE + 3_600.0)
+    assert state.short_cap_usd == 0.0
 
 
 def test_no_configured_limit_leaves_the_curfew_inactive():
-    # 0 means "no limit" downstream; inventing one would be the curfew
-    # imposing a constraint the operator never set.
     state = assess_curfew(MON_CLOSE - 60.0, 0.0, frozen_oracle=True)
-    assert state.cap_usd == 0.0
     assert "no position limit" in state.reason
+
+
+def test_cap_for_selects_by_the_position_we_actually_hold():
+    state = _at(MON_CLOSE + 3_600.0)
+    assert state.cap_for(10.0) == state.long_cap_usd
+    assert state.cap_for(-10.0) == state.short_cap_usd == 0.0
+    assert state.cap_for(0.0) == max(state.long_cap_usd,
+                                     state.short_cap_usd)
+    assert state.cap_for(float("nan")) == min(state.long_cap_usd,
+                                              state.short_cap_usd)
+
+
+# --------------------------------------------------------------------------- #
+# permitted_leg_size -- the blocker this replaced a boolean to fix
+# --------------------------------------------------------------------------- #
+
+def test_a_reducing_sell_is_clamped_to_the_long_it_closes():
+    # THE BLOCKER. One contract of long inventory used to wave through a
+    # full-size ask; filling it left us massively SHORT overnight, which is
+    # the exact position this module exists to forbid. The sell may now be
+    # exactly as large as the long, and not one contract more.
+    assert permitted_leg_size(False, 1.0, 17_094.0, 4_285.0, 0.0) == 1.0
+    assert permitted_leg_size(False, 250.0, 17_094.0, 4_285.0, 0.0) == 250.0
+
+
+def test_from_flat_overnight_the_ask_is_refused_outright():
+    assert permitted_leg_size(False, 0.0, 17_094.0, 4_285.0, 0.0) == 0.0
+
+
+def test_from_flat_overnight_the_bid_is_clamped_to_the_long_cap():
+    # And the clamp is what bounds it: the requested ladder leg is far
+    # larger than the cap allows.
+    assert permitted_leg_size(True, 0.0, 17_191.0, 4_285.0, 0.0) == 4_285.0
+
+
+def test_a_buy_may_close_a_short_and_rebuild_to_the_long_cap():
+    # Room is the distance from where we are to the cap, so reduction and
+    # growth fall out of one expression.
+    assert permitted_leg_size(True, -100.0, 99_999.0, 4_285.0, 0.0) == 4_385.0
+
+
+def test_a_leg_smaller_than_the_room_is_untouched():
+    assert permitted_leg_size(True, 0.0, 10.0, 4_285.0, 0.0) == 10.0
+    assert permitted_leg_size(False, 500.0, 10.0, 4_285.0, 0.0) == 10.0
+
+
+def test_no_room_means_no_leg():
+    assert permitted_leg_size(True, 4_285.0, 100.0, 4_285.0, 0.0) == 0.0
+    assert permitted_leg_size(True, 9_999.0, 100.0, 4_285.0, 0.0) == 0.0
+
+
+def test_unreadable_or_empty_inventory_permits_nothing():
+    nan = float("nan")
+    assert permitted_leg_size(True, nan, 100.0, 10.0, 10.0) == 0.0
+    assert permitted_leg_size(False, nan, 100.0, 10.0, 10.0) == 0.0
+    assert permitted_leg_size(True, 0.0, nan, 10.0, 10.0) == 0.0
+    assert permitted_leg_size(True, 0.0, 0.0, 10.0, 10.0) == 0.0
+    assert permitted_leg_size(True, 0.0, -5.0, 10.0, 10.0) == 0.0
+
+
+def test_mid_session_the_clamp_is_just_a_position_limit():
+    # With both caps equal the asymmetry vanishes and this degrades to the
+    # ordinary limit -- the lean belongs to the closed window, not to the
+    # strategy.
+    assert permitted_leg_size(False, 0.0, 100.0, 4_285.0, 4_285.0) == 100.0
+    assert permitted_leg_size(True, 0.0, 100.0, 4_285.0, 4_285.0) == 100.0
 
 
 # --------------------------------------------------------------------------- #
@@ -140,7 +219,6 @@ def test_no_configured_limit_leaves_the_curfew_inactive():
 # --------------------------------------------------------------------------- #
 
 def test_a_fresh_detector_does_not_claim_frozen():
-    # A process that has not looked yet must not declare the market shut.
     assert OracleFreeze().frozen(1_000.0) is False
 
 
@@ -170,14 +248,12 @@ def test_one_market_moving_is_enough_to_count_as_alive():
 
 
 def test_an_empty_reading_is_not_evidence_of_a_freeze():
-    # A venue we cannot read tells us nothing about the underlying; it must
-    # not reset the clock either way.
     f = OracleFreeze(confirm_s=100.0)
     f.observe(0.0, {"A": 1.0})
     f.observe(10.0, {})
     f.observe(20.0, {})
-    assert f.frozen(50.0) is False          # still inside the window
-    assert f.frozen(100.0) is True          # outage outlasting it tightens
+    assert f.frozen(50.0) is False
+    assert f.frozen(100.0) is True          # an outage outlasting it tightens
 
 
 def test_a_resumed_move_after_a_freeze_clears_it():
@@ -193,27 +269,25 @@ def test_a_resumed_move_after_a_freeze_clears_it():
 # --------------------------------------------------------------------------- #
 
 def test_a_frozen_oracle_overrides_an_in_session_schedule():
-    # The clock wrong in the direction that costs money: the table says
-    # mid-session, the price has stopped. Tighten.
     mid = MON_OPEN + 3 * 3_600.0
     assert _at(mid).stage is Stage.SESSION
     frozen = _at(mid, frozen=True)
     assert frozen.stage is Stage.CLOSED
-    assert frozen.cap_usd == FLOOR
+    assert frozen.short_cap_usd == 0.0
 
 
 def test_a_moving_oracle_does_not_lift_a_scheduled_close():
-    # Lifting needs BOTH conditions, so a stray overnight print cannot
-    # release the curfew.
     state = _at(MON_CLOSE + 3_600.0, frozen=False)
     assert state.stage is Stage.CLOSED
-    assert state.cap_usd == FLOOR
+    assert state.short_cap_usd == 0.0
 
 
-def test_a_frozen_oracle_cannot_raise_the_cap_anywhere():
+def test_a_frozen_oracle_never_raises_either_cap():
     for t in (MON_OPEN - 600.0, MON_OPEN + 60.0, MON_OPEN + 3 * 3_600.0,
               MON_CLOSE - 1_000.0, MON_CLOSE + 600.0):
-        assert _at(t, frozen=True).cap_usd <= _at(t, frozen=False).cap_usd
+        frozen, moving = _at(t, frozen=True), _at(t, frozen=False)
+        assert frozen.long_cap_usd <= moving.long_cap_usd
+        assert frozen.short_cap_usd <= moving.short_cap_usd
 
 
 # --------------------------------------------------------------------------- #
@@ -221,26 +295,19 @@ def test_a_frozen_oracle_cannot_raise_the_cap_anywhere():
 # --------------------------------------------------------------------------- #
 
 def test_past_the_table_a_moving_market_trades_normally():
-    # The table expires at the contest end; degrading to a permanent floor
-    # would quietly cripple the bot, and degrading to "no curfew" would
-    # quietly remove the protection. Fall back to the observable truth.
     after = CLOSES_UTC[-1] + 7 * 86_400.0
     state = _at(after, frozen=False)
     assert state.stage is Stage.UNSCHEDULED
-    assert state.cap_usd == FULL
+    assert state.long_cap_usd == state.short_cap_usd == FULL
 
 
 def test_past_the_table_a_frozen_market_is_still_a_curfew():
     after = CLOSES_UTC[-1] + 7 * 86_400.0
     state = _at(after, frozen=True)
     assert state.stage is Stage.CLOSED
-    assert state.cap_usd == FLOOR
+    assert (state.long_cap_usd, state.short_cap_usd) == (NIGHT_LONG,
+                                                         NIGHT_SHORT)
 
-
-# --------------------------------------------------------------------------- #
-# Every stage explains itself -- these strings go in front of an operator
-# at 16:00 on a contest day.
-# --------------------------------------------------------------------------- #
 
 def test_every_state_carries_a_reason():
     for t in (MON_OPEN - 600.0, MON_OPEN + 60.0, MON_OPEN + 3 * 3_600.0,
@@ -248,118 +315,3 @@ def test_every_state_carries_a_reason():
               CLOSES_UTC[-1] + 86_400.0):
         for frozen in (True, False):
             assert _at(t, frozen=frozen).reason.strip()
-
-
-# --------------------------------------------------------------------------- #
-# Side-aware caps. The oracle freezes on a calm end-of-day window and the
-# first print after the reopen comes from the most violent minute of the
-# day, so it is systematically HIGHER -- which makes a carried SHORT the
-# position that gets liquidated. The curfew is tighter on that side.
-# --------------------------------------------------------------------------- #
-
-def test_overnight_no_new_shorts_but_a_bounded_long():
-    state = _at(MON_CLOSE + 4 * 3_600.0)
-    assert state.short_cap_usd == 0.0 == FULL * OVERNIGHT_SHORT_FRACTION
-    assert state.long_cap_usd == FULL * OVERNIGHT_LONG_FRACTION
-    assert state.short_cap_usd < state.long_cap_usd
-
-
-def test_a_deliberate_zero_short_cap_survives_construction():
-    # Zero is a real value here, not "unset". If __post_init__ treated it
-    # as missing it would silently become the symmetric cap and the
-    # prohibition would vanish.
-    state = _at(MON_CLOSE + 4 * 3_600.0)
-    assert state.short_cap_usd == 0.0
-    assert state.cap_usd == FLOOR          # the named cap is unchanged
-
-
-def test_mid_session_the_sides_are_symmetric():
-    # The asymmetry is a property of the CLOSED window, not a permanent
-    # directional lean.
-    state = _at(MON_OPEN + 3 * 3_600.0)
-    assert state.long_cap_usd == state.short_cap_usd == FULL
-
-
-def test_the_symmetric_cap_still_reports_the_tightest_constraint():
-    # cap_usd is what the stage is named for, and existing callers read it.
-    state = _at(MON_CLOSE + 3_600.0)
-    assert state.cap_usd == FLOOR
-
-
-def test_cap_for_selects_by_the_position_we_actually_hold():
-    state = _at(MON_CLOSE + 3_600.0)
-    assert state.cap_for(10.0) == state.long_cap_usd
-    assert state.cap_for(-10.0) == state.short_cap_usd == 0.0
-    # Flat takes the looser side; the per-leg veto, not this number, is
-    # what stops the dangerous side being grown from zero.
-    assert state.cap_for(0.0) == max(state.long_cap_usd,
-                                     state.short_cap_usd)
-    assert state.cap_for(float("nan")) == min(state.long_cap_usd,
-                                              state.short_cap_usd)
-
-
-def test_overnight_from_flat_only_the_bid_may_open():
-    # THE POINT OF THE WHOLE FEATURE, in one assertion: at exactly zero
-    # neither side "shrinks" and no position limit is breached, so a
-    # symmetric cap would happily open a short into the frozen oracle.
-    state = _at(MON_CLOSE + 4 * 3_600.0)
-    oracle = 0.07
-    long_c = state.long_cap_usd / oracle
-    short_c = state.short_cap_usd / oracle
-    assert leg_permitted(True, 0.0, long_c, short_c) is True     # bid opens
-    assert leg_permitted(False, 0.0, long_c, short_c) is False   # ask does not
-
-
-def test_an_existing_short_can_always_be_worked_off():
-    # The prohibition is on GROWING the short, never on reducing one that
-    # was carried in from the session.
-    state = _at(MON_CLOSE + 4 * 3_600.0)
-    oracle = 0.07
-    long_c = state.long_cap_usd / oracle
-    short_c = state.short_cap_usd / oracle
-    assert leg_permitted(True, -25.0, long_c, short_c) is True   # buy reduces
-    assert leg_permitted(False, -25.0, long_c, short_c) is False
-
-
-def test_the_long_cap_is_never_below_the_floor():
-    # Otherwise the "safe" side would be tighter than the dangerous one.
-    for full in (10.0, 100.0, 1_200.0, 50_000.0):
-        state = assess_curfew(MON_CLOSE + 3_600.0, full, frozen_oracle=True)
-        assert state.long_cap_usd >= state.short_cap_usd
-
-
-# --------------------------------------------------------------------------- #
-# leg_permitted: the veto that a symmetric cap cannot express
-# --------------------------------------------------------------------------- #
-
-def test_a_reducing_leg_is_always_permitted():
-    # Nothing may stand between the loop and getting smaller -- even with
-    # both caps already breached.
-    assert leg_permitted(True, -50.0, 0.1, 0.1) is True     # buy cuts short
-    assert leg_permitted(False, 50.0, 0.1, 0.1) is True     # sell cuts long
-
-
-def test_growing_a_side_stops_at_that_sides_cap():
-    assert leg_permitted(True, 5.0, 10.0, 10.0) is True     # long 5 < 10
-    assert leg_permitted(True, 10.0, 10.0, 10.0) is False   # at the cap
-    assert leg_permitted(False, -5.0, 10.0, 10.0) is True
-    assert leg_permitted(False, -10.0, 10.0, 10.0) is False
-
-
-def test_from_flat_the_asymmetry_decides_which_side_may_open():
-    # THE CASE A SYMMETRIC CAP CANNOT EXPRESS: at exactly zero neither side
-    # "shrinks", so REDUCE_ONLY says nothing and the position limit is not
-    # breached -- yet the short side must stay small.
-    long_cap, short_cap = 100.0, 1.0
-    assert leg_permitted(True, 0.0, long_cap, short_cap) is True
-    assert leg_permitted(False, 0.0, long_cap, short_cap) is True   # 0 < 1
-    # Once the tiny short allowance is used up, selling stops while buying
-    # continues.
-    assert leg_permitted(False, -1.0, long_cap, short_cap) is False
-    assert leg_permitted(True, -1.0, long_cap, short_cap) is True
-
-
-def test_unreadable_inventory_permits_nothing():
-    nan = float("nan")
-    assert leg_permitted(True, nan, 10.0, 10.0) is False
-    assert leg_permitted(False, nan, 10.0, 10.0) is False

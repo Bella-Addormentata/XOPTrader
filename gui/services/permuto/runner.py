@@ -45,7 +45,7 @@ from .client import PermutoNotLinked
 from .orders import Side, quote_ladder
 from .quoting import LoopAction, RestingQuote, VenueView, decide
 from .risk import MarginState, RiskAction, assess, skewed_reference
-from .curfew import OracleFreeze, Stage, assess_curfew, leg_permitted
+from .curfew import OracleFreeze, assess_curfew, permitted_leg_size
 from .session import RenewAction
 
 #: How often a SUSTAINED full withdrawal re-asserts the cancel when we
@@ -269,11 +269,30 @@ class QuoteRunner:
                 frozen_oracle=self._freeze.frozen(now_s))
             if curfew.stage is not self._curfew_stage:
                 _log.warning("permuto: inventory curfew %s -> %s: %s "
-                             "(cap $%.0f of $%.0f)",
+                             "(long $%.0f / short $%.0f of $%.0f)",
                              getattr(self._curfew_stage, "value", "none"),
                              curfew.stage.value, curfew.reason,
-                             curfew.cap_usd, self._max_position_usd)
-                self._curfew_stage = curfew.stage
+                             curfew.long_cap_usd, curfew.short_cap_usd,
+                             self._max_position_usd)
+                # [review] RETRACT THE BOOK THE NEW STAGE NO LONGER ALLOWS.
+                # The size clamp below only shapes legs we are about to
+                # place; an ask resting from before the close stays live and
+                # takeable, and decide() answers HOLD for a quote that is
+                # still fresh and in-ring -- so without this the short
+                # prohibition never reached the order that mattered. Only
+                # latch the new stage once the retraction actually
+                # succeeded, so a failed cancel is retried next tick rather
+                # than silently skipped.
+                try:
+                    self._client.cancel_all(now_s, list(self._markets))
+                except Exception as exc:  # noqa: BLE001
+                    _log.error("permuto: curfew stage change could not "
+                               "retract the book (%s); retrying next tick",
+                               exc)
+                else:
+                    for market in self._markets:
+                        self._resting[market] = RestingQuote()
+                    self._curfew_stage = curfew.stage
             self._curfew = curfew
 
         paused = bool(flags.get("trading_paused"))
@@ -740,18 +759,28 @@ class QuoteRunner:
                         continue
                     leg = type(leg)(leg.market, leg.side, leg.price,
                                     leg.size, True)
-                # [CURFEW] The per-side veto. REDUCE_ONLY above already
-                # keeps only shrinking legs, so this composes with it and
-                # bites in the case that one cannot express: FLAT, where
-                # neither side "shrinks" and a symmetric cap therefore
-                # permits growing the dangerous side from zero.
+                # [CURFEW] Clamp the leg to the room left under its side's
+                # cap. A yes/no veto was not enough: the ladder is sized to
+                # target_depth_usd, so a leg permitted merely because it
+                # "reduces" could still overshoot flat and open the very
+                # short the curfew forbids -- and at the EXIT cap one leg
+                # was eight times the position it was trying to hold, so
+                # the ramp could never converge.
                 if self._curfew is not None and oracle and oracle > 0.0:
-                    if not leg_permitted(
-                            leg.side is Side.BUY,
-                            float(state.positions.get(market, 0.0) or 0.0),
-                            self._curfew.long_cap_usd / oracle,
-                            self._curfew.short_cap_usd / oracle):
+                    allowed = permitted_leg_size(
+                        leg.side is Side.BUY,
+                        float(state.positions.get(market, 0.0) or 0.0),
+                        leg.size,
+                        self._curfew.long_cap_usd / oracle,
+                        self._curfew.short_cap_usd / oracle)
+                    # Whole contracts: lot_size is 1 on every market, and a
+                    # fractional remainder is a rejected batch.
+                    allowed = math.floor(allowed)
+                    if allowed < 1.0:
                         continue
+                    if allowed < leg.size:
+                        leg = type(leg)(leg.market, leg.side, leg.price,
+                                        allowed, leg.reduce_only)
                 legs.append(leg)
 
         if to_cancel:

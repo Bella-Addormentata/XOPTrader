@@ -116,6 +116,11 @@ def load_curfew_enabled() -> bool:
     touched yet must not silently leave the book exposed through a close.
     """
     settings = QSettings("XOP", "XOPTrader")
+    # [review] Read from the store, not from whatever this process cached
+    # when it first touched QSettings: the session is armed long after the
+    # settings page wrote, and a stale read would arm the opposite of what
+    # the operator just chose.
+    settings.sync()
     settings.beginGroup("permuto")
     raw = settings.value("curfew_enabled", True)
     settings.endGroup()

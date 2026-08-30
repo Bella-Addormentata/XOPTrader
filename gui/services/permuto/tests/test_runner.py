@@ -1190,3 +1190,70 @@ def test_mid_session_from_flat_both_sides_still_go_out():
     r = _runner(c, curfew_enabled=True)
     r.tick(_MID_SESSION, _ORACLE, {})
     assert sorted({leg["side"] for leg in c.last_batch}) == ["buy", "sell"]
+
+
+# --------------------------------------------------------------------------- #
+# [review] Regressions for the two blockers the adversarial pass found in the
+# first curfew implementation. Both were verified by execution before the fix.
+# --------------------------------------------------------------------------- #
+
+def _legs(client):
+    return [(l["side"], l["size"], round(l["size"] * float(l["price"]), 2))
+            for l in (client.last_batch or [])]
+
+
+def test_overnight_a_long_permits_an_ask_of_exactly_that_long():
+    """BLOCKER 1. The veto used to be size-blind: it waved through any ask
+    once position > 0 because "selling reduces a long". True only up to the
+    SIZE of the long -- and the ladder leg is sized to target_depth_usd, so
+    ONE contract of inventory bought a $1,199.99 ask. Filling it left us
+    ~$1,196 SHORT overnight: four times the long cap, and precisely the
+    position the curfew exists to forbid."""
+    c = _Client(account=_account(1.0))
+    _runner(c, curfew_enabled=True).tick(_OVERNIGHT, _ORACLE, {})
+    sells = [leg for leg in _legs(c) if leg[0] == "sell"]
+    assert len(sells) == 1
+    assert sells[0][1] == 1.0, "the ask must close the long, never exceed it"
+
+
+def test_overnight_a_larger_long_scales_the_ask_with_it():
+    c = _Client(account=_account(2_000.0))
+    _runner(c, curfew_enabled=True).tick(_OVERNIGHT, _ORACLE, {})
+    sells = [leg for leg in _legs(c) if leg[0] == "sell"]
+    assert sells and sells[0][1] == 2_000.0
+
+
+def test_overnight_the_bid_is_sized_to_the_cap_not_to_target_depth():
+    """BLOCKER 2. The curfew capped the POSITION but never the LEG, so a
+    $1,200 bid rested against a $300 overnight cap -- one fill blew 4x
+    through it in a single trade and the ramp could never converge."""
+    c = _Client(account=_account(0.0))
+    r = _runner(c, curfew_enabled=True, max_position_usd=1_200.0)
+    r.tick(_OVERNIGHT, _ORACLE, {})
+    buys = [leg for leg in _legs(c) if leg[0] == "buy"]
+    assert len(buys) == 1
+    assert buys[0][2] <= 300.0 + 1.0, "bid notional exceeds the long cap"
+    assert buys[0][2] > 250.0, "bid collapsed to nothing"
+
+
+def test_a_curfew_stage_change_retracts_the_resting_book():
+    """BLOCKER 3. The clamp only shapes legs about to be placed. An ask
+    resting from before the close stayed live and takeable, because
+    decide() answers HOLD for a quote that is still fresh and in-ring."""
+    c = _Client(account=_account(0.0))
+    r = _runner(c, curfew_enabled=True)
+    r.tick(_OVERNIGHT, _ORACLE, {})
+    assert "cancel_all" in c.calls, "the stage change must retract the book"
+
+
+def test_a_failed_retraction_is_retried_rather_than_latched():
+    # Latching the new stage over a failed cancel would leave the old book
+    # resting under the new caps for the rest of the night.
+    c = _Client(account=_account(0.0), fail_on="cancel_all")
+    r = _runner(c, curfew_enabled=True)
+    r.tick(_OVERNIGHT, _ORACLE, {})
+    assert r._curfew_stage is None, "stage latched despite a failed cancel"
+    c2_calls_before = len([x for x in c.calls if x == "cancel_all"])
+    r.tick(_OVERNIGHT + 5.0, _ORACLE, {})
+    after = len([x for x in c.calls if x == "cancel_all"])
+    assert after > c2_calls_before, "the retraction was not retried"

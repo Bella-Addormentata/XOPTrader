@@ -91,7 +91,7 @@ __all__ = [
     "CLOSES_UTC",
     "OVERNIGHT_LONG_FRACTION",
     "OVERNIGHT_SHORT_FRACTION",
-    "leg_permitted",
+    "permitted_leg_size",
     "OPENS_UTC",
     "CurfewState",
     "OracleFreeze",
@@ -304,29 +304,41 @@ class CurfewState:
         return max(self.long_cap_usd, self.short_cap_usd)
 
 
-def leg_permitted(
+def permitted_leg_size(
     is_buy: bool,
     position: float,
+    requested_size: float,
     long_cap_contracts: float,
     short_cap_contracts: float,
-) -> bool:
-    """Whether one ladder leg may rest under the side-aware caps.
+) -> float:
+    """How much of this leg may rest.  0.0 means "do not place it".
 
-    A leg that REDUCES is always permitted -- nothing here may stand
-    between the loop and getting smaller.  A leg that GROWS a side is
-    permitted only while that side is inside its own cap, which is what
-    makes the asymmetry real: with the caps equal this is just a position
-    limit, and overnight the short cap is the tight one.
+    [review] THIS RETURNS A SIZE, NOT A BOOLEAN, AND THAT IS THE WHOLE
+    POINT.  The first version voted yes/no on a leg whose size it never
+    read, reasoning "selling reduces a long, so permit it".  True only up
+    to the SIZE of the long: the ladder leg is sized to target_depth_usd,
+    so one contract of long inventory waved through a full $1,200 ask, and
+    filling it left us $1,196 SHORT overnight -- four times the long cap
+    and precisely the position this module exists to forbid.  A size-blind
+    veto cannot express "reduces"; it can only express "reduces by at most
+    this much".
+
+    The room on each side is the distance from where we are to where that
+    side's cap sits, which handles reduction and growth in one expression:
+    a buy may travel from `position` up to `+long_cap`, a sell from
+    `position` down to `-short_cap`.  With the overnight short cap at zero
+    a sell is therefore permitted at exactly the size of the long it
+    closes -- never one contract more.
     """
-    if position != position:            # NaN: unreadable inventory
-        return False                    # risk.assess() already FLATTENs
-    if is_buy:
-        if position < 0.0:
-            return True                 # buying reduces a short
-        return position < long_cap_contracts
-    if position > 0.0:
-        return True                     # selling reduces a long
-    return abs(position) < short_cap_contracts
+    if position != position or requested_size != requested_size:
+        return 0.0                      # NaN: unreadable
+    if not (requested_size > 0.0):
+        return 0.0
+    room = ((long_cap_contracts - position) if is_buy
+            else (position + short_cap_contracts))
+    if not (room > 0.0):
+        return 0.0
+    return min(requested_size, room)
 
 
 def _schedule_stage(
@@ -367,14 +379,31 @@ def _schedule_stage(
     return Stage.SESSION, to_close, since_open
 
 
-def _ramp_cap(full_usd: float, floor_usd: float, to_close: float) -> float:
-    """Linear cap between RAMP_START_S and EXIT_START_S."""
-    span = RAMP_START_S - EXIT_START_S
-    if span <= 0.0:
-        return floor_usd
-    progress = (RAMP_START_S - to_close) / span
-    progress = min(1.0, max(0.0, progress))
-    return full_usd - (full_usd - floor_usd) * progress
+def _side_caps(
+    stage: "Stage",
+    full_usd: float,
+    to_close: float,
+    long_target: float,
+    short_target: float,
+) -> tuple:
+    """``(long_cap, short_cap)`` for a stage.  Monotone into the close.
+
+    [review] Each side interpolates to ITS OWN overnight target.  The
+    earlier version ramped one symmetric number down to a floor and then
+    handed EXIT a long cap of 25% of full -- so the long allowance DOUBLED
+    fifteen minutes before the bell, lifting REDUCE_ONLY and restarting
+    inventory accumulation at the worst possible moment.
+    """
+    if stage is Stage.SESSION:
+        return full_usd, full_usd
+    if stage is Stage.RAMP:
+        span = RAMP_START_S - EXIT_START_S
+        progress = 1.0 if span <= 0.0 else (RAMP_START_S - to_close) / span
+        progress = min(1.0, max(0.0, progress))
+        return (full_usd - (full_usd - long_target) * progress,
+                full_usd - (full_usd - short_target) * progress)
+    # EXIT / CLOSED / SETTLING: the overnight posture, held.
+    return long_target, short_target
 
 
 def assess_curfew(
@@ -386,85 +415,68 @@ def assess_curfew(
     closes: Sequence[float] = CLOSES_UTC,
     opens: Sequence[float] = OPENS_UTC,
 ) -> CurfewState:
-    """The inventory cap for right now.  Total and side-effect free.
-
-    `full_cap_usd` is the operator's configured limit; the result never
-    exceeds it and never reaches zero (see FLOOR_FRACTION).
-    """
+    """The inventory caps for right now.  Total and side-effect free."""
     if not (full_cap_usd > 0.0):
         # No configured limit means "unlimited" downstream; a curfew cannot
         # be expressed as a fraction of it, so say so rather than inventing
         # a number the operator never set.
         return CurfewState(Stage.UNSCHEDULED, full_cap_usd,
-                           "no position limit configured; curfew inactive")
+                           "no position limit configured; curfew inactive",
+                           long_cap_usd=full_cap_usd,
+                           short_cap_usd=full_cap_usd)
 
-    floor = floor_usd if floor_usd is not None else full_cap_usd * FLOOR_FRACTION
-    floor = max(floor, full_cap_usd * 0.01)   # never zero: see FLOOR_FRACTION
-    floor = min(floor, full_cap_usd)
-
-    # The tolerated overnight LONG. Never below the floor (that would make
-    # the "safe" side tighter than the dangerous one) and never above the
-    # operator's own limit.
-    long_cap = max(floor, min(full_cap_usd,
-                              full_cap_usd * OVERNIGHT_LONG_FRACTION))
-    # May be exactly zero -- see OVERNIGHT_SHORT_FRACTION. Only the per-leg
-    # veto reads it; the number handed to risk.assess() is clamped positive
-    # by the runner so that zero can never read as "no limit".
-    short_cap = max(0.0, full_cap_usd * OVERNIGHT_SHORT_FRACTION)
+    long_target = (floor_usd if floor_usd is not None
+                   else full_cap_usd * OVERNIGHT_LONG_FRACTION)
+    long_target = max(0.0, min(full_cap_usd, long_target))
+    # May be exactly zero -- see OVERNIGHT_SHORT_FRACTION.  Only the
+    # size-aware permission reads it; the number handed to risk.assess() is
+    # clamped positive by the runner so zero can never read as "no limit".
+    short_target = max(0.0, min(full_cap_usd,
+                                full_cap_usd * OVERNIGHT_SHORT_FRACTION))
 
     stage, to_close, since_open = _schedule_stage(now_s, closes, opens)
+
+    def _state(effective: "Stage", reason: str) -> CurfewState:
+        long_cap, short_cap = _side_caps(
+            effective, full_cap_usd, to_close, long_target, short_target)
+        return CurfewState(effective, long_cap, reason, to_close,
+                           long_cap_usd=long_cap, short_cap_usd=short_cap)
 
     # Past the table the schedule abstains and the observable truth governs.
     if stage is Stage.UNSCHEDULED:
         if frozen_oracle:
-            return CurfewState(
-                Stage.CLOSED, floor,
-                "no session scheduled and the oracle is frozen -- the "
-                "underlying is shut", to_close,
-                long_cap_usd=long_cap, short_cap_usd=short_cap)
+            return _state(Stage.CLOSED,
+                          "no session scheduled and the oracle is frozen -- "
+                          "the underlying is shut")
         return CurfewState(
             Stage.UNSCHEDULED, full_cap_usd,
             "no session scheduled; the oracle is moving, so trading "
-            "normally", to_close)
+            "normally", to_close,
+            long_cap_usd=full_cap_usd, short_cap_usd=full_cap_usd)
 
-    # ASYMMETRIC COMBINATION. A frozen oracle can only ever tighten, and it
+    # ASYMMETRIC COMBINATION.  A frozen oracle can only ever tighten, and it
     # overrides any in-session claim the table makes -- that is the case
     # where the table is wrong in the direction that costs money.
-    if frozen_oracle and stage in (Stage.SESSION, Stage.RAMP, Stage.EXIT,
-                                   Stage.SETTLING):
-        return CurfewState(
-            Stage.CLOSED, floor,
-            "the oracle has stopped moving -- treating the underlying as "
-            "shut regardless of the schedule", to_close,
-            long_cap_usd=long_cap, short_cap_usd=short_cap)
+    if frozen_oracle:
+        return _state(Stage.CLOSED,
+                      "the oracle has stopped moving -- treating the "
+                      "underlying as shut regardless of the schedule")
 
     if stage is Stage.CLOSED:
-        return CurfewState(
-            stage, floor,
-            "the underlying is closed; the venue still matches orders "
-            "against a stale price", to_close,
-            long_cap_usd=long_cap, short_cap_usd=short_cap)
-
+        return _state(stage,
+                      "the underlying is closed; the venue still matches "
+                      "orders against a stale price")
     if stage is Stage.SETTLING:
-        return CurfewState(
-            stage, floor,
-            "the session has just opened; holding the floor until the "
-            "opening move has printed", to_close,
-            long_cap_usd=long_cap, short_cap_usd=short_cap)
-
+        return _state(stage,
+                      "the session has just opened; holding the overnight "
+                      "posture until the opening move has printed")
     if stage is Stage.EXIT:
-        return CurfewState(
-            stage, floor,
-            "%.0f minutes to the close; no new shorts, a bounded long "
-            "tolerated" % (to_close / 60.0), to_close,
-            long_cap_usd=long_cap, short_cap_usd=short_cap)
-
+        return _state(stage,
+                      "%.0f minutes to the close; no new shorts, a bounded "
+                      "long tolerated" % (to_close / 60.0))
     if stage is Stage.RAMP:
-        cap = _ramp_cap(full_cap_usd, floor, to_close)
-        return CurfewState(
-            stage, cap,
-            "%.0f minutes to the close; cap ramping %.0f -> %.0f USD so "
-            "inventory is worked off as a maker"
-            % (to_close / 60.0, full_cap_usd, floor), to_close)
-
-    return CurfewState(stage, full_cap_usd, "mid-session", to_close)
+        return _state(stage,
+                      "%.0f minutes to the close; caps ramping toward the "
+                      "overnight posture so inventory is worked off as a "
+                      "maker" % (to_close / 60.0))
+    return _state(stage, "mid-session")
