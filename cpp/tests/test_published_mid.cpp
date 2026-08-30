@@ -180,13 +180,16 @@ TEST(PublishedMidBandTest, OneSidedBook_UnagedPrint_CexGoverns) {
 // ---------------------------------------------------------------------------
 // Stale book: no clamp.  A stale book is history, not "now"; pinning fresh
 // CEX data to it would preserve exactly the frozen-price failure the
-// staleness machinery exists to expose.  stale_threshold = 0 makes any
-// positive age stale.
+// staleness machinery exists to expose.  The staleness comparison is
+// strict (age > threshold), so a zero threshold is a RACE: a fast runner
+// can ingest and refresh inside one clock tick, age reads exactly 0, and
+// the book counts as fresh (this flaked the v0.10.10 macOS release job).
+// A negative threshold makes any age, including 0, stale -- deterministic.
 // ---------------------------------------------------------------------------
 TEST(PublishedMidBandTest, StaleBook_NoClamp) {
     State state;
     MarketDataConfig cfg = band_cfg();
-    cfg.stale_threshold = std::chrono::minutes{0};
+    cfg.stale_threshold = std::chrono::minutes{-1};
     MarketDataFeed feed(cfg, state);
 
     feed.ingest_dexie("XCH/wUSDC.b", 1.00, 1.01, 1.005, 100.0);
