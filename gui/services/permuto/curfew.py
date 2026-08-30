@@ -89,6 +89,9 @@ from typing import Mapping, Optional, Sequence
 
 __all__ = [
     "CLOSES_UTC",
+    "OVERNIGHT_LONG_FRACTION",
+    "OVERNIGHT_SHORT_FRACTION",
+    "leg_permitted",
     "OPENS_UTC",
     "CurfewState",
     "OracleFreeze",
@@ -134,6 +137,43 @@ SETTLE_AFTER_OPEN_S = 900.0    # 15 minutes
 #: is shut.  These are realised-vol estimates resampled every few seconds
 #: and carried to sixteen digits: during a live session they never repeat.
 FREEZE_CONFIRM_S = 180.0
+
+#: How much LONG inventory the curfew tolerates overnight, as a fraction
+#: of the full cap.  Deliberately larger than the short side.
+#:
+#: WHY THE SIDES ARE NOT SYMMETRIC.  The oracle is a 60-second trailing
+#: realised-vol estimate.  Overnight it is frozen on a calm end-of-day
+#: window, while the first print after the reopen is computed from the
+#: most violent minute of the trading day -- the opening auction absorbing
+#: everything that happened overnight.  So the reopening print is
+#: systematically ABOVE the frozen one, and a SHORT vol position carried
+#: through it is the side that gets liquidated.  That is not a forecast,
+#: it is the shape of the estimator, and it is exactly what "MMs that were
+#: short went bust" describes.
+#:
+#: This is a DEFENSIVE asymmetry, not a carry bet: we simply decline to
+#: keep selling the side that is structurally mispriced by a stale oracle,
+#: while still accepting fills from someone selling vol to us cheaply.
+#: Whether ACCUMULATING long overnight is profitable depends on funding,
+#: which settles every 60s here and has not been measured across a real
+#: close -> open cycle.  Until it has, keep this modest.
+OVERNIGHT_LONG_FRACTION = 0.25
+
+#: How much NEW SHORT exposure the curfew tolerates overnight.  Zero: we
+#: decline the side that a stale oracle structurally misprices.
+#:
+#: Zero is expressible here and NOT through the position limit, which is
+#: the whole reason `leg_permitted` exists as a separate mechanism.
+#: risk.assess() reads `if max_position > 0.0`, so handing it zero means
+#: "no limit" -- the exact inversion.  The per-leg veto has no such
+#: overload: it simply refuses a leg that would grow the short side, while
+#: any leg that REDUCES an existing short stays permitted, so a position
+#: carried in from the session can always be worked off.
+#:
+#: This forbids OPENING shorts overnight; it is not a directional bet.  We
+#: still quote the bid, so anyone selling volatility to us cheaply is
+#: filled, and the long side remains capped by OVERNIGHT_LONG_FRACTION.
+OVERNIGHT_SHORT_FRACTION = 0.0
 
 #: Floor as a fraction of the operator's full cap.  NOT zero, and not
 #: negotiable: risk.assess() reads `if max_position > 0.0 and ...`, so a
@@ -223,12 +263,70 @@ class OracleFreeze:
 
 @dataclass(frozen=True)
 class CurfewState:
-    """How much inventory is allowed, and why."""
+    """How much inventory is allowed, and why.
+
+    `cap_usd` is the symmetric baseline -- the tightest cap in force, and
+    what the stage is named for.  The per-side caps differ only while the
+    curfew is tightening: see OVERNIGHT_LONG_FRACTION for why the short
+    side is the dangerous one.
+    """
 
     stage: Stage
     cap_usd: float
     reason: str
     seconds_to_close: float = -1.0
+    long_cap_usd: Optional[float] = None
+    short_cap_usd: Optional[float] = None
+
+    def __post_init__(self):
+        # None means "unset" and mirrors the symmetric cap, so a state built
+        # without per-side values behaves exactly as it did before they
+        # existed.  ZERO is a real value and must survive: it is how the
+        # overnight short prohibition is expressed.
+        if self.long_cap_usd is None:
+            object.__setattr__(self, "long_cap_usd", self.cap_usd)
+        if self.short_cap_usd is None:
+            object.__setattr__(self, "short_cap_usd", self.cap_usd)
+
+    def cap_for(self, position: float) -> float:
+        """The cap that binds given the position we actually hold.
+
+        Flat takes the looser of the two: no side is at its limit yet, and
+        the per-leg veto -- not this number -- is what stops the forbidden
+        side being GROWN from zero.
+        """
+        if position != position:                      # NaN
+            return min(self.long_cap_usd, self.short_cap_usd)
+        if position > 0.0:
+            return self.long_cap_usd
+        if position < 0.0:
+            return self.short_cap_usd
+        return max(self.long_cap_usd, self.short_cap_usd)
+
+
+def leg_permitted(
+    is_buy: bool,
+    position: float,
+    long_cap_contracts: float,
+    short_cap_contracts: float,
+) -> bool:
+    """Whether one ladder leg may rest under the side-aware caps.
+
+    A leg that REDUCES is always permitted -- nothing here may stand
+    between the loop and getting smaller.  A leg that GROWS a side is
+    permitted only while that side is inside its own cap, which is what
+    makes the asymmetry real: with the caps equal this is just a position
+    limit, and overnight the short cap is the tight one.
+    """
+    if position != position:            # NaN: unreadable inventory
+        return False                    # risk.assess() already FLATTENs
+    if is_buy:
+        if position < 0.0:
+            return True                 # buying reduces a short
+        return position < long_cap_contracts
+    if position > 0.0:
+        return True                     # selling reduces a long
+    return abs(position) < short_cap_contracts
 
 
 def _schedule_stage(
@@ -304,6 +402,16 @@ def assess_curfew(
     floor = max(floor, full_cap_usd * 0.01)   # never zero: see FLOOR_FRACTION
     floor = min(floor, full_cap_usd)
 
+    # The tolerated overnight LONG. Never below the floor (that would make
+    # the "safe" side tighter than the dangerous one) and never above the
+    # operator's own limit.
+    long_cap = max(floor, min(full_cap_usd,
+                              full_cap_usd * OVERNIGHT_LONG_FRACTION))
+    # May be exactly zero -- see OVERNIGHT_SHORT_FRACTION. Only the per-leg
+    # veto reads it; the number handed to risk.assess() is clamped positive
+    # by the runner so that zero can never read as "no limit".
+    short_cap = max(0.0, full_cap_usd * OVERNIGHT_SHORT_FRACTION)
+
     stage, to_close, since_open = _schedule_stage(now_s, closes, opens)
 
     # Past the table the schedule abstains and the observable truth governs.
@@ -312,7 +420,8 @@ def assess_curfew(
             return CurfewState(
                 Stage.CLOSED, floor,
                 "no session scheduled and the oracle is frozen -- the "
-                "underlying is shut", to_close)
+                "underlying is shut", to_close,
+                long_cap_usd=long_cap, short_cap_usd=short_cap)
         return CurfewState(
             Stage.UNSCHEDULED, full_cap_usd,
             "no session scheduled; the oracle is moving, so trading "
@@ -326,25 +435,29 @@ def assess_curfew(
         return CurfewState(
             Stage.CLOSED, floor,
             "the oracle has stopped moving -- treating the underlying as "
-            "shut regardless of the schedule", to_close)
+            "shut regardless of the schedule", to_close,
+            long_cap_usd=long_cap, short_cap_usd=short_cap)
 
     if stage is Stage.CLOSED:
         return CurfewState(
             stage, floor,
             "the underlying is closed; the venue still matches orders "
-            "against a stale price", to_close)
+            "against a stale price", to_close,
+            long_cap_usd=long_cap, short_cap_usd=short_cap)
 
     if stage is Stage.SETTLING:
         return CurfewState(
             stage, floor,
             "the session has just opened; holding the floor until the "
-            "opening move has printed", to_close)
+            "opening move has printed", to_close,
+            long_cap_usd=long_cap, short_cap_usd=short_cap)
 
     if stage is Stage.EXIT:
         return CurfewState(
             stage, floor,
-            "%.0f minutes to the close; cap at the floor so nothing new "
-            "is carried" % (to_close / 60.0), to_close)
+            "%.0f minutes to the close; no new shorts, a bounded long "
+            "tolerated" % (to_close / 60.0), to_close,
+            long_cap_usd=long_cap, short_cap_usd=short_cap)
 
     if stage is Stage.RAMP:
         cap = _ramp_cap(full_cap_usd, floor, to_close)

@@ -325,6 +325,7 @@ class PermutoLive(QObject):
         markets: Optional[list] = None,
         target_depth_usd: float = 1_200.0,
         max_position_usd: float = 1_200.0,
+        curfew_enabled: bool = True,
         venue_state: Optional[Callable[[], dict]] = None,
         client: Any = None,
     ) -> None:
@@ -343,6 +344,7 @@ class PermutoLive(QObject):
             self._client, self._markets,
             target_depth_usd=target_depth_usd,
             max_position_usd=max_position_usd,
+            curfew_enabled=curfew_enabled,
         )
         self._venue_state = venue_state or _default_venue_state
         self._thread: Optional[QThread] = None

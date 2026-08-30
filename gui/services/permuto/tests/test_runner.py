@@ -1158,3 +1158,35 @@ def test_curfew_disabled_ignores_the_clock_entirely():
     r = _runner(c, curfew_enabled=False, max_position_usd=12_000.0)
     r.tick(_OVERNIGHT, _ORACLE, {})
     assert sorted(leg["side"] for leg in c.last_batch) == ["buy", "sell"]
+
+
+def test_overnight_from_flat_the_runner_places_only_the_bid():
+    """End to end: the frozen-oracle window opens no new shorts.
+
+    Flat inventory breaches no position limit and neither side shrinks, so
+    every symmetric control in the stack says "quote both". Only the
+    per-leg curfew veto stops the ask going out against a stale oracle.
+    """
+    c = _Client(account=_account(0.0))
+    r = _runner(c, curfew_enabled=True)
+    r.tick(_OVERNIGHT, _ORACLE, {})
+    assert c.last_batch, "expected a bid, got nothing"
+    assert {leg["side"] for leg in c.last_batch} == {"buy"}
+
+
+def test_overnight_an_existing_short_is_still_worked_off():
+    # The prohibition is on GROWING a short, never on reducing one carried
+    # in from the session.
+    c = _Client(account=_account(-100.0))
+    r = _runner(c, curfew_enabled=True)
+    r.tick(_OVERNIGHT, _ORACLE, {})
+    assert {leg["side"] for leg in c.last_batch} == {"buy"}
+    assert all(leg["reduce_only"] for leg in c.last_batch)
+
+
+def test_mid_session_from_flat_both_sides_still_go_out():
+    # The asymmetry belongs to the closed window, not to the strategy.
+    c = _Client(account=_account(0.0))
+    r = _runner(c, curfew_enabled=True)
+    r.tick(_MID_SESSION, _ORACLE, {})
+    assert sorted({leg["side"] for leg in c.last_batch}) == ["buy", "sell"]

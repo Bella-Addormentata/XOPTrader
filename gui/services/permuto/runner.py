@@ -45,7 +45,7 @@ from .client import PermutoNotLinked
 from .orders import Side, quote_ladder
 from .quoting import LoopAction, RestingQuote, VenueView, decide
 from .risk import MarginState, RiskAction, assess, skewed_reference
-from .curfew import OracleFreeze, Stage, assess_curfew
+from .curfew import OracleFreeze, Stage, assess_curfew, leg_permitted
 from .session import RenewAction
 
 #: How often a SUSTAINED full withdrawal re-asserts the cancel when we
@@ -579,9 +579,19 @@ class QuoteRunner:
             # non-positive max_position as "no limit", so ramping to zero
             # would restore UNLIMITED inventory at the exact moment the
             # curfew meant to forbid it.
-            cap_usd = (self._curfew.cap_usd if self._curfew is not None
-                       else self._max_position_usd)
-            max_position = (cap_usd / oracle
+            # Side-aware: overnight the SHORT cap is the tight one, because
+            # a short carried through the reopen is the position that gets
+            # liquidated (see curfew.OVERNIGHT_LONG_FRACTION).
+            cap_usd = self._max_position_usd
+            if self._curfew is not None:
+                cap_usd = self._curfew.cap_for(
+                    float(state.positions.get(market, 0.0) or 0.0))
+            # Clamped strictly positive: the overnight SHORT cap is zero,
+            # and assess() reads a non-positive max_position as "no limit".
+            # The prohibition is enforced by the per-leg veto below; what
+            # assess() needs here is a number that keeps an existing short
+            # in REDUCE_ONLY rather than switching the limit off.
+            max_position = (max(cap_usd, 1e-9) / oracle
                             if oracle and oracle > 0.0 else 0.0)
             risk_by_market[market] = assess(
                 state, market,
@@ -730,6 +740,18 @@ class QuoteRunner:
                         continue
                     leg = type(leg)(leg.market, leg.side, leg.price,
                                     leg.size, True)
+                # [CURFEW] The per-side veto. REDUCE_ONLY above already
+                # keeps only shrinking legs, so this composes with it and
+                # bites in the case that one cannot express: FLAT, where
+                # neither side "shrinks" and a symmetric cap therefore
+                # permits growing the dangerous side from zero.
+                if self._curfew is not None and oracle and oracle > 0.0:
+                    if not leg_permitted(
+                            leg.side is Side.BUY,
+                            float(state.positions.get(market, 0.0) or 0.0),
+                            self._curfew.long_cap_usd / oracle,
+                            self._curfew.short_cap_usd / oracle):
+                        continue
                 legs.append(leg)
 
         if to_cancel:

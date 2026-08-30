@@ -10,6 +10,9 @@ tell us the underlying is shut.
 from __future__ import annotations
 
 from gui.services.permuto.curfew import (
+    OVERNIGHT_LONG_FRACTION,
+    OVERNIGHT_SHORT_FRACTION,
+    leg_permitted,
     CLOSES_UTC,
     EXIT_START_S,
     FLOOR_FRACTION,
@@ -245,3 +248,118 @@ def test_every_state_carries_a_reason():
               CLOSES_UTC[-1] + 86_400.0):
         for frozen in (True, False):
             assert _at(t, frozen=frozen).reason.strip()
+
+
+# --------------------------------------------------------------------------- #
+# Side-aware caps. The oracle freezes on a calm end-of-day window and the
+# first print after the reopen comes from the most violent minute of the
+# day, so it is systematically HIGHER -- which makes a carried SHORT the
+# position that gets liquidated. The curfew is tighter on that side.
+# --------------------------------------------------------------------------- #
+
+def test_overnight_no_new_shorts_but_a_bounded_long():
+    state = _at(MON_CLOSE + 4 * 3_600.0)
+    assert state.short_cap_usd == 0.0 == FULL * OVERNIGHT_SHORT_FRACTION
+    assert state.long_cap_usd == FULL * OVERNIGHT_LONG_FRACTION
+    assert state.short_cap_usd < state.long_cap_usd
+
+
+def test_a_deliberate_zero_short_cap_survives_construction():
+    # Zero is a real value here, not "unset". If __post_init__ treated it
+    # as missing it would silently become the symmetric cap and the
+    # prohibition would vanish.
+    state = _at(MON_CLOSE + 4 * 3_600.0)
+    assert state.short_cap_usd == 0.0
+    assert state.cap_usd == FLOOR          # the named cap is unchanged
+
+
+def test_mid_session_the_sides_are_symmetric():
+    # The asymmetry is a property of the CLOSED window, not a permanent
+    # directional lean.
+    state = _at(MON_OPEN + 3 * 3_600.0)
+    assert state.long_cap_usd == state.short_cap_usd == FULL
+
+
+def test_the_symmetric_cap_still_reports_the_tightest_constraint():
+    # cap_usd is what the stage is named for, and existing callers read it.
+    state = _at(MON_CLOSE + 3_600.0)
+    assert state.cap_usd == FLOOR
+
+
+def test_cap_for_selects_by_the_position_we_actually_hold():
+    state = _at(MON_CLOSE + 3_600.0)
+    assert state.cap_for(10.0) == state.long_cap_usd
+    assert state.cap_for(-10.0) == state.short_cap_usd == 0.0
+    # Flat takes the looser side; the per-leg veto, not this number, is
+    # what stops the dangerous side being grown from zero.
+    assert state.cap_for(0.0) == max(state.long_cap_usd,
+                                     state.short_cap_usd)
+    assert state.cap_for(float("nan")) == min(state.long_cap_usd,
+                                              state.short_cap_usd)
+
+
+def test_overnight_from_flat_only_the_bid_may_open():
+    # THE POINT OF THE WHOLE FEATURE, in one assertion: at exactly zero
+    # neither side "shrinks" and no position limit is breached, so a
+    # symmetric cap would happily open a short into the frozen oracle.
+    state = _at(MON_CLOSE + 4 * 3_600.0)
+    oracle = 0.07
+    long_c = state.long_cap_usd / oracle
+    short_c = state.short_cap_usd / oracle
+    assert leg_permitted(True, 0.0, long_c, short_c) is True     # bid opens
+    assert leg_permitted(False, 0.0, long_c, short_c) is False   # ask does not
+
+
+def test_an_existing_short_can_always_be_worked_off():
+    # The prohibition is on GROWING the short, never on reducing one that
+    # was carried in from the session.
+    state = _at(MON_CLOSE + 4 * 3_600.0)
+    oracle = 0.07
+    long_c = state.long_cap_usd / oracle
+    short_c = state.short_cap_usd / oracle
+    assert leg_permitted(True, -25.0, long_c, short_c) is True   # buy reduces
+    assert leg_permitted(False, -25.0, long_c, short_c) is False
+
+
+def test_the_long_cap_is_never_below_the_floor():
+    # Otherwise the "safe" side would be tighter than the dangerous one.
+    for full in (10.0, 100.0, 1_200.0, 50_000.0):
+        state = assess_curfew(MON_CLOSE + 3_600.0, full, frozen_oracle=True)
+        assert state.long_cap_usd >= state.short_cap_usd
+
+
+# --------------------------------------------------------------------------- #
+# leg_permitted: the veto that a symmetric cap cannot express
+# --------------------------------------------------------------------------- #
+
+def test_a_reducing_leg_is_always_permitted():
+    # Nothing may stand between the loop and getting smaller -- even with
+    # both caps already breached.
+    assert leg_permitted(True, -50.0, 0.1, 0.1) is True     # buy cuts short
+    assert leg_permitted(False, 50.0, 0.1, 0.1) is True     # sell cuts long
+
+
+def test_growing_a_side_stops_at_that_sides_cap():
+    assert leg_permitted(True, 5.0, 10.0, 10.0) is True     # long 5 < 10
+    assert leg_permitted(True, 10.0, 10.0, 10.0) is False   # at the cap
+    assert leg_permitted(False, -5.0, 10.0, 10.0) is True
+    assert leg_permitted(False, -10.0, 10.0, 10.0) is False
+
+
+def test_from_flat_the_asymmetry_decides_which_side_may_open():
+    # THE CASE A SYMMETRIC CAP CANNOT EXPRESS: at exactly zero neither side
+    # "shrinks", so REDUCE_ONLY says nothing and the position limit is not
+    # breached -- yet the short side must stay small.
+    long_cap, short_cap = 100.0, 1.0
+    assert leg_permitted(True, 0.0, long_cap, short_cap) is True
+    assert leg_permitted(False, 0.0, long_cap, short_cap) is True   # 0 < 1
+    # Once the tiny short allowance is used up, selling stops while buying
+    # continues.
+    assert leg_permitted(False, -1.0, long_cap, short_cap) is False
+    assert leg_permitted(True, -1.0, long_cap, short_cap) is True
+
+
+def test_unreadable_inventory_permits_nothing():
+    nan = float("nan")
+    assert leg_permitted(True, nan, 10.0, 10.0) is False
+    assert leg_permitted(False, nan, 10.0, 10.0) is False

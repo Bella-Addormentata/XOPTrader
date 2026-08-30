@@ -109,6 +109,21 @@ def load_startup_states() -> tuple[str, str]:
     return dexie, permuto
 
 
+def load_curfew_enabled() -> bool:
+    """Whether the Permuto overnight inventory curfew is armed.
+
+    Defaults to TRUE: the curfew is a protection, and a setting nobody has
+    touched yet must not silently leave the book exposed through a close.
+    """
+    settings = QSettings("XOP", "XOPTrader")
+    settings.beginGroup("permuto")
+    raw = settings.value("curfew_enabled", True)
+    settings.endGroup()
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() not in ("false", "0", "off", "no")
+
+
 # ---------------------------------------------------------------------------
 # Theme colour shorthand
 # ---------------------------------------------------------------------------
@@ -1098,6 +1113,10 @@ class SettingsWidget(QWidget):
         self._startup_permuto.addItems(["Off (default)", "On"])
         form.addRow("Permuto at startup:", self._startup_permuto)
 
+        self._permuto_curfew = QComboBox()
+        self._permuto_curfew.addItems(["On (default)", "Off"])
+        form.addRow("Permuto overnight curfew:", self._permuto_curfew)
+
         layout.addLayout(form)
 
         note = QLabel(
@@ -1112,9 +1131,28 @@ class SettingsWidget(QWidget):
         note.setWordWrap(True)
         note.setStyleSheet(f"color: {_C.WARNING_YELLOW};")
         layout.addWidget(note)
+
+        curfew_note = QLabel(
+            "The overnight curfew caps how much inventory Permuto may "
+            "hold once the underlying market shuts. The venue does NOT "
+            "pause overnight -- it keeps matching orders against a frozen "
+            "oracle -- and the first price after the reopen is "
+            "systematically higher, so a SHORT volatility position "
+            "carried through it is the one that gets liquidated. The "
+            "curfew ramps the cap down before each close and holds the "
+            "short side tight until the price is moving again. It never "
+            "crosses the spread: positions are worked off by resting "
+            "orders. Turn it Off only if you intend to carry inventory "
+            "across a close deliberately."
+        )
+        curfew_note.setWordWrap(True)
+        curfew_note.setStyleSheet(f"color: {_C.TEXT_SECONDARY};")
+        layout.addWidget(curfew_note)
         layout.addStretch(1)
 
         self._load_startup_settings()
+        self._permuto_curfew.currentIndexChanged.connect(
+            self._save_startup_settings)
         self._startup_dexie.currentIndexChanged.connect(
             self._save_startup_settings)
         self._startup_permuto.currentIndexChanged.connect(
@@ -1205,6 +1243,8 @@ class SettingsWidget(QWidget):
         self._startup_dexie.setCurrentIndex(
             {"adopt": 0, "on": 1, "off": 2}.get(dexie, 0))
         self._startup_permuto.setCurrentIndex(1 if permuto == "on" else 0)
+        self._permuto_curfew.setCurrentIndex(
+            0 if load_curfew_enabled() else 1)
 
     def _save_startup_settings(self) -> None:
         settings = QSettings("XOP", "XOPTrader")
@@ -1215,6 +1255,12 @@ class SettingsWidget(QWidget):
         settings.setValue(
             "permuto",
             "on" if self._startup_permuto.currentIndex() == 1 else "off")
+        settings.endGroup()
+        # Not a startup state: it governs the running loop, so it lives in
+        # its own group and is read fresh each time a session is built.
+        settings.beginGroup("permuto")
+        settings.setValue("curfew_enabled",
+                          self._permuto_curfew.currentIndex() == 0)
         settings.endGroup()
 
     # -------------------------------------------------------------------

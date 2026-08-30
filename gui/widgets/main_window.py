@@ -2748,6 +2748,13 @@ class MainWindow(QMainWindow):
                 "target_depth_usd": page._target_depth_usd,
                 "max_position_usd": page._max_position_usd,
             }
+        # [CURFEW] Read fresh per session, so toggling the setting takes
+        # effect on the next arm rather than only on a GUI restart.
+        try:
+            from gui.widgets.settings import load_curfew_enabled
+            kwargs["curfew_enabled"] = load_curfew_enabled()
+        except Exception:  # noqa: BLE001 - the protection is the default
+            kwargs["curfew_enabled"] = True
         return PermutoLive(identity, **kwargs)
 
     def _on_permuto_tick(self, result) -> None:
