@@ -578,6 +578,59 @@ def test_a_readable_zero_margin_is_still_zero():
     assert st.utilisation() == 0.0
 
 
+# --------------------------------------------------------------------------- #
+# [live 2026-08-29] The venue's REAL account payload
+# --------------------------------------------------------------------------- #
+_LIVE_ACCOUNT_PAYLOAD = {
+    # Verbatim from POST /exchange/account on the first authenticated tick
+    # ever. None of the field names we guessed exist; every number is a
+    # STRING. Guessing wrong read as equity 0 -> utilisation 1.0 -> the
+    # runner flattened all three markets on a $500k, zero-position account
+    # and the supervised test order never quoted.
+    "balance": "500000",
+    "locked_margin": "0",
+    "locked_order_margin": "0",
+    "open_order_count": 0,
+    "pending_trigger_count": 0,
+    "positions": [],
+    "pricing_incomplete": False,
+    "total_realized_pnl": "0",
+    "total_unrealized_pnl": "0",
+    "user_id": "b3edfaa83da8cdbfe9258d54776409f1deec0bdb537086617294e6bad1929001",
+}
+
+
+def test_the_live_account_payload_reads_as_healthy():
+    st = _margin_state(dict(_LIVE_ACCOUNT_PAYLOAD), False)
+    assert st.equity_usd == 500_000.0
+    assert st.used_margin_usd == 0.0
+    assert st.utilisation() == 0.0
+    assert st.positions_readable
+    assert st.positions == {}
+
+
+def test_live_payload_locked_margins_sum_into_used():
+    payload = dict(_LIVE_ACCOUNT_PAYLOAD,
+                   locked_margin="1200.5", locked_order_margin="300")
+    st = _margin_state(payload, False)
+    assert st.used_margin_usd == 1500.5
+
+
+def test_live_payload_unrealized_pnl_moves_equity():
+    payload = dict(_LIVE_ACCOUNT_PAYLOAD, total_unrealized_pnl="-2500")
+    st = _margin_state(payload, False)
+    assert st.equity_usd == 497_500.0
+
+
+def test_half_a_locked_margin_pair_still_fails_closed():
+    """locked_margin without locked_order_margin is a partly-readable
+    account -- unknown margin must mean no room, never lots of room."""
+    payload = dict(_LIVE_ACCOUNT_PAYLOAD)
+    del payload["locked_order_margin"]
+    st = _margin_state(payload, False)
+    assert st.utilisation() == 1.0
+
+
 @pytest.mark.parametrize("bad", ["nan", "inf", "-inf"])
 def test_a_non_finite_resting_price_is_not_a_present_side(bad):
     """float("nan") converts happily and would count as a live quote.

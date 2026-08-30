@@ -499,14 +499,30 @@ class QuoteRunner:
                 # neither of the things the action names. Retract the book
                 # for this market at minimum; closing the position itself is
                 # a taker order and stays an operator decision.
-                results[market] = (
-                    "flatten",
-                    risk.reason + " -- quotes retracted; the POSITION is "
-                    "still open and needs closing by hand")
-                _log.critical(
-                    "permuto: %s margin past the flatten line -- resting "
-                    "quotes retracted, but the position remains OPEN and "
-                    "exposed. Close it manually.", market)
+                pos = state.positions.get(market, 0.0)
+                has_pos = pos != 0.0  # NaN compares unequal: unreadable
+                                      # inventory is treated as a position.
+                if has_pos:
+                    results[market] = (
+                        "flatten",
+                        risk.reason + " -- quotes retracted; the POSITION "
+                        "is still open and needs closing by hand")
+                    _log.critical(
+                        "permuto: %s margin past the flatten line -- "
+                        "resting quotes retracted, but the position "
+                        "remains OPEN and exposed. Close it manually.",
+                        market)
+                else:
+                    results[market] = (
+                        "flatten",
+                        risk.reason + " -- refusing to quote (no open "
+                        "position)")
+                    _log.critical(
+                        "permuto: %s margin past the flatten line "
+                        "(utilisation %.0f%%, equity $%.0f) -- refusing "
+                        "to quote. No open position.",
+                        market, state.utilisation() * 100.0,
+                        state.equity_usd)
                 # Only if something is actually resting. _resting was
                 # reconciled from the venue at the top of this tick, so an
                 # empty entry means there is nothing to retract and a cancel
@@ -711,9 +727,32 @@ def _margin_state(account: Any, carried: bool) -> MarginState:
             except (TypeError, ValueError):
                 positions[market] = float("nan")
 
-    equity = _num("equity_usd", "equity", "account_value")
+    # [live 2026-08-29] The venue's /exchange/account payload, observed on
+    # the first authenticated tick ever (every earlier attempt 422'd on
+    # user_id), carries NONE of the names we guessed:
+    #   {"balance": "500000", "locked_margin": "0",
+    #    "locked_order_margin": "0", "positions": [],
+    #    "total_realized_pnl": "0", "total_unrealized_pnl": "0", ...}
+    # equity = balance + unrealized PnL; used = locked_margin +
+    # locked_order_margin. The guessed names stay first for forward compat.
+    equity, equity_present = _num_present(
+        account, "equity_usd", "equity", "account_value")
+    if not equity_present:
+        bal, bal_present = _num_present(account, "balance")
+        if bal_present:
+            upnl, _ = _num_present(account, "total_unrealized_pnl")
+            equity = bal + upnl
+            equity_present = True
     used, used_present = _num_present(
         account, "used_margin_usd", "used_margin", "margin_used")
+    if not used_present:
+        lm, lm_present = _num_present(account, "locked_margin")
+        lom, lom_present = _num_present(account, "locked_order_margin")
+        if lm_present and lom_present:
+            # Both halves or neither: a partly-readable pair falls through
+            # to the fail-closed branch below.
+            used = lm + lom
+            used_present = True
     if equity > 0.0 and not used_present:
         # [review] Fail CLOSED on a partly-readable payload. Defaulting the
         # missing field to 0.0 made utilisation() report 0% -- maximum
