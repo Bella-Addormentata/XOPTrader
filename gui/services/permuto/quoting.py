@@ -124,6 +124,7 @@ def decide(
     *,
     ring_pct: float = 2.0,
     quote_when_carried: bool = True,
+    one_sided_ok: bool = False,
 ) -> QuoteDecision:
     """One action for the current state. Total and side-effect free."""
 
@@ -184,7 +185,7 @@ def decide(
     if resting.empty:
         return QuoteDecision(LoopAction.QUOTE, "no quote resting")
 
-    if not resting.two_sided:
+    if not resting.two_sided and not one_sided_ok:
         # The expensive state. min(bid, ask) is zero, so this market is
         # earning nothing at all until both sides are back.
         side = "ask" if resting.bid_price is not None else "bid"
@@ -193,9 +194,17 @@ def decide(
             "%s side is gone -- depth credit is min(bid, ask), so this market "
             "earns ZERO until both sides rest again" % side,
         )
+    # [CURFEW review] `one_sided_ok` says the caller FORBIDS one side right
+    # now -- the overnight curfew closes the ask entirely -- so a one-sided
+    # book is the intended state rather than a gap to repair. Without this
+    # the branch above fires on every tick forever: measured at ~12,600
+    # authenticated re-upserts across a single overnight session, all of
+    # them replacing a quote with an identical copy of itself.
 
     trigger = ring_pct * REQUOTE_AT_RING_FRACTION
     for price in (resting.bid_price, resting.ask_price):
+        if price is None:
+            continue        # the forbidden side; nothing to drift-check
         drift = abs(price - view.oracle) / view.oracle * 100.0
         if drift >= trigger:
             return QuoteDecision(
@@ -204,4 +213,8 @@ def decide(
                 "%.2f%%, ring %.2f%%)" % (drift, trigger, ring_pct),
             )
 
-    return QuoteDecision(LoopAction.HOLD, "two-sided and inside the ring")
+    if resting.two_sided:
+        return QuoteDecision(LoopAction.HOLD, "two-sided and inside the ring")
+    return QuoteDecision(
+        LoopAction.HOLD,
+        "one-sided by design (the other side is closed) and inside the ring")

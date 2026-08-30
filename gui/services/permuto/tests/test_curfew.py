@@ -58,11 +58,20 @@ def test_before_the_first_open_the_market_is_closed_not_in_session():
                                                          NIGHT_SHORT)
 
 
-def test_just_after_the_open_holds_the_overnight_posture():
+def test_just_after_the_open_holds_the_reduced_size():
     state = _at(MON_OPEN + 60.0)
     assert state.stage is Stage.SETTLING
-    assert (state.long_cap_usd, state.short_cap_usd) == (NIGHT_LONG,
-                                                         NIGHT_SHORT)
+    assert state.long_cap_usd == NIGHT_LONG
+
+
+def test_settling_is_two_sided_at_the_reduced_size():
+    # [review] The curfew exists to stop us quoting against a STALE price.
+    # By SETTLING the oracle is moving again, so that rationale is spent --
+    # and holding the ask closed would forfeit depth credit (min(bid, ask))
+    # through the busiest quarter-hour of the session.
+    state = _at(MON_OPEN + 60.0)
+    assert state.stage is Stage.SETTLING
+    assert state.long_cap_usd == state.short_cap_usd == NIGHT_LONG
 
 
 def test_mid_session_restores_the_full_cap_on_both_sides():
@@ -97,6 +106,8 @@ def test_after_the_close_the_curfew_holds_all_night():
 
 def test_both_caps_fall_monotonically_from_the_ramp_into_the_night():
     longs, shorts = [], []
+    # Ramp -> exit -> night only; SETTLING belongs to the NEXT session and
+    # deliberately reopens the ask once the oracle is live again.
     t = MON_CLOSE - RAMP_START_S - 60.0        # a minute before the ramp
     while t <= MON_CLOSE + 3_600.0:
         state = _at(t)

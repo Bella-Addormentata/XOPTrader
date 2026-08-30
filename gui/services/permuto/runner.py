@@ -487,10 +487,18 @@ class QuoteRunner:
                 carried=carried,
                 just_reopened=self._reopen_pending,
             )
+            # [CURFEW] A side the curfew has closed cannot be restored, so
+            # its absence must not read as a book to repair -- otherwise the
+            # loop re-upserts an identical quote on every tick, all night.
+            one_sided_ok = bool(
+                self._curfew is not None
+                and (self._curfew.short_cap_usd <= 0.0
+                     or self._curfew.long_cap_usd <= 0.0))
             call = decide(
                 view, self._resting.get(market, RestingQuote()),
                 ring_pct=self._ring_pct,
                 quote_when_carried=self._quote_when_carried,
+                one_sided_ok=one_sided_ok,
             )
             results[market] = (call.action.value, call.reason)
             if call.action is LoopAction.QUOTE:
@@ -654,7 +662,11 @@ class QuoteRunner:
             waiting = [m for m, (a, _) in results.items() if a == wait]
             if waiting:
                 return TickResult("wait", results[waiting[0]][1], results)
-            return TickResult("hold", "all markets two-sided and in ring",
+            # [CURFEW] Not necessarily two-sided any more: overnight the
+            # ask is closed by design, and claiming otherwise would tell an
+            # operator the book is whole when half of it is deliberately
+            # absent.
+            return TickResult("hold", "all markets resting and in ring",
                               results)
 
         legs = []

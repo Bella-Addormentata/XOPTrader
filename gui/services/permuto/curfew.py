@@ -402,7 +402,17 @@ def _side_caps(
         progress = min(1.0, max(0.0, progress))
         return (full_usd - (full_usd - long_target) * progress,
                 full_usd - (full_usd - short_target) * progress)
-    # EXIT / CLOSED / SETTLING: the overnight posture, held.
+    if stage is Stage.SETTLING:
+        # [review] TWO-SIDED, at the reduced size. The curfew exists to
+        # stop us quoting against a STALE price; by SETTLING the oracle is
+        # moving again, so that rationale is spent and the only remaining
+        # concern is the size of the opening move -- which the reduced cap
+        # already answers. Holding the ask closed here would forfeit depth
+        # credit (min(bid, ask), so a one-sided book earns zero) through
+        # the busiest quarter-hour of the session, for a danger that has
+        # already passed.
+        return long_target, long_target
+    # EXIT / CLOSED: the overnight posture, held.
     return long_target, short_target
 
 

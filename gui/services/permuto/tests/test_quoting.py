@@ -174,3 +174,46 @@ def test_an_infinite_oracle_withdraws_rather_than_holding():
 def test_a_nan_oracle_withdraws():
     assert decide(VenueView(oracle=float("nan")),
                   RestingQuote(0.069, 0.071)).action is LoopAction.WITHDRAW
+
+
+# --------------------------------------------------------------------------- #
+# [CURFEW] A side the caller has CLOSED is not a gap to repair.
+#
+# The overnight curfew forbids the ask outright, so `not resting.two_sided`
+# is true for the whole session. Without one_sided_ok that branch re-quotes
+# on every tick forever -- replacing a resting bid with an identical copy of
+# itself, all night, against a venue that rate-limits.
+# --------------------------------------------------------------------------- #
+
+BID_ONLY = RestingQuote(bid_price=ORACLE)
+
+
+def test_a_one_sided_book_is_repaired_by_default():
+    d = decide(view(), BID_ONLY)
+    assert d.action is LoopAction.QUOTE
+    assert "ask side is gone" in d.reason
+
+
+def test_a_deliberately_one_sided_book_holds():
+    d = decide(view(), BID_ONLY, one_sided_ok=True)
+    assert d.action is LoopAction.HOLD
+    assert "by design" in d.reason
+
+
+def test_a_deliberately_one_sided_book_still_re_quotes_on_drift():
+    # Permission to be one-sided is not permission to rest at a stale price.
+    trigger = 2.0 * REQUOTE_AT_RING_FRACTION
+    drifted = RestingQuote(bid_price=ORACLE * (1 - (trigger + 0.5) / 100))
+    d = decide(view(), drifted, one_sided_ok=True)
+    assert d.action is LoopAction.QUOTE
+    assert "drifted" in d.reason
+
+
+def test_an_empty_book_still_quotes_even_when_one_sided_is_allowed():
+    d = decide(view(), RestingQuote(), one_sided_ok=True)
+    assert d.action is LoopAction.QUOTE
+
+
+def test_one_sided_permission_does_not_bypass_the_pause():
+    d = decide(view(trading_paused=True), BID_ONLY, one_sided_ok=True)
+    assert d.action is LoopAction.WITHDRAW
