@@ -67,7 +67,7 @@ def build_upsert_batch(
     intents: Sequence[OrderIntent],
     oracles: dict[str, float],
     *,
-    tif: str = "ALO",
+    tif: str = "alo",
     band_pct: float = 5.0,
     ring_pct: float = 2.0,
 ) -> list[dict]:
@@ -158,7 +158,12 @@ def build_upsert_batch(
             "side": leg.side.value,
             "price": leg.price,
             "size": leg.size,
-            "tif": tif,
+            # [live 2026-08-29] The venue's serde wants LOWERCASE variants
+            # ("unknown variant `ALO`, expected one of `gtc`, `ioc`,
+            # `alo`") -- our API notes recorded the uppercase forms and the
+            # first real placement found out. Normalised here, at the wire
+            # boundary, so no caller's casing can regress it.
+            "tif": tif.lower(),
             "reduce_only": leg.reduce_only,
         })
 

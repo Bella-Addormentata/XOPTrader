@@ -10573,8 +10573,17 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     if (qwid > 0) wallet_ids[pair.name + "/quote"] = qwid;
                 }
 
-                // Collect puzzle hashes from spendable coins for fee tracking.
+                // Collect puzzle hashes from spendable coins for fee
+                // tracking. [S24] Deduplicated by wallet id: labels are
+                // per pair-side, so the XCH wallet behind every XCH pair
+                // used to be re-queried once per enabled pair for zero
+                // extra information.
+                std::unordered_set<std::int64_t> seen_wids;
                 for (const auto& [label, wid] : wallet_ids) {
+                    if (!seen_wids.insert(
+                            static_cast<std::int64_t>(wid)).second) {
+                        continue;
+                    }
                     try {
                         auto coins = co_await wallet_->get_spendable_coins(wid);
                         for (const auto& cr : coins) {

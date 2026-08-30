@@ -143,7 +143,7 @@ without an account.
 
 | endpoint | use |
 | -------- | --- |
-| `POST /exchange/order` | single order. `market` (the **`symbol`**, e.g. `QQQ-VOL-PERP`, not the oracle ticker `QQQ-VOL`), `side` (`buy`/`sell`), `size` required; `order_type` (`market`/`limit`), `price`, `tif` (`GTC`/`ALO`/`IOC`), `reduce_only` |
+| `POST /exchange/order` | single order. `market` (the **`symbol`**, e.g. `QQQ-VOL-PERP`, not the oracle ticker `QQQ-VOL`), `side` (`buy`/`sell`), `size` required; `order_type` (`market`/`limit`), `price`, `tif` (`gtc`/`alo`/`ioc` -- LOWERCASE; the serde rejects uppercase, verified live 2026-08-29), `reduce_only` |
 | `POST /exchange/batch_place` | up to 12 limit legs, one **place** token. Insert-only semantics |
 | `POST /exchange/batch_upsert` | up to 12 GTC/ALO quotes, one **mutate** token. Modify-or-place per `(market, side)`, at most one leg each |
 | `POST /exchange/batch_modify` | up to 12 resting orders by `order_id`, one mutate token |

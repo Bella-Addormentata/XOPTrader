@@ -930,3 +930,158 @@ def test_a_non_clean_batch_status_is_a_failed_tick_not_a_quote():
     assert r._resting[_MKT].empty, (
         "legs were recorded as resting off a non-clean status")
 
+
+# --------------------------------------------------------------------------- #
+# [live 2026-08-29] The venue's real batch vocabulary
+# --------------------------------------------------------------------------- #
+
+_LIVE_PARTIAL = {
+    "status": "batch_partial",
+    "note": ("Batch upsert is best-effort; each leg is modify-or-place "
+             "independently after the shared mutate token is consumed."),
+    "order_count": 2,
+    "results": [
+        {"action": "modified", "market": _MKT, "order_id": 4512562,
+         "price": "0.0995", "remaining_size": "5253", "size": "5253",
+         "status": "modified"},
+        {"action": "placed", "fills": [], "order_id": 4512662,
+         "position": None, "market": _MKT,
+         "rejection_reason": "post-only order would cross"},
+    ],
+}
+
+
+def test_a_live_batch_partial_is_a_quoting_tick_not_an_error():
+    """Captured live: an ALO ask rejected because a bid rests above it is
+    the add-liquidity-only guard working -- the tick quotes, the leg
+    retries, and nothing is recorded as resting off the response."""
+    import copy
+
+    class _Partial(_Client):
+        def batch_upsert(self, legs, now_s):
+            self.calls.append("batch_upsert")
+            return copy.deepcopy(_LIVE_PARTIAL)
+
+    r = _runner(_Partial())
+    result = r.tick(1.0, _ORACLE, {})
+    assert result.ok, "a benign per-leg rejection must not fail the tick"
+    assert "post-only" in result.reason
+    assert r._resting[_MKT].empty, (
+        "legs must still not be recorded as resting off a partial -- "
+        "reconcile() from open_orders owns that belief")
+
+
+def test_every_leg_rejected_is_still_an_error():
+    class _AllRejected(_Client):
+        def batch_upsert(self, legs, now_s):
+            self.calls.append("batch_upsert")
+            return {"status": "batch_partial", "results": [
+                {"action": "placed", "market": _MKT,
+                 "rejection_reason": "margin"},
+                {"action": "placed", "market": _MKT,
+                 "rejection_reason": "margin"},
+            ]}
+
+    r = _runner(_AllRejected())
+    result = r.tick(1.0, _ORACLE, {})
+    assert not result.ok
+    assert "rejected" in (result.error or "")
+
+
+def test_batch_partial_without_detail_stays_conservative():
+    """The round-11 rule survives the new vocabulary: 'partial' with no
+    per-leg rows is unverifiable and must not record legs as resting."""
+    class _Empty(_Client):
+        def batch_upsert(self, legs, now_s):
+            self.calls.append("batch_upsert")
+            return {"status": "batch_partial", "results": []}
+
+    r = _runner(_Empty())
+    result = r.tick(1.0, _ORACLE, {})
+    assert not result.ok
+    assert r._resting[_MKT].empty
+
+
+def test_batch_ok_with_clean_rows_records_resting():
+    class _Ok(_Client):
+        def batch_upsert(self, legs, now_s):
+            self.calls.append("batch_upsert")
+            return {"status": "batch_ok", "results": [
+                {"action": "placed", "market": _MKT, "order_id": 1},
+                {"action": "placed", "market": _MKT, "order_id": 2},
+            ]}
+
+    r = _runner(_Ok())
+    result = r.tick(1.0, _ORACLE, {})
+    assert result.ok
+    assert r._resting[_MKT].two_sided, (
+        "an all-clean batch_ok is a full acceptance and records the legs")
+
+
+# --------------------------------------------------------------------------- #
+# [WATCH] Contest telemetry: depth accrual, fills, stall detection
+# --------------------------------------------------------------------------- #
+
+def _lb_runner(monkeypatch, rows):
+    """Runner whose client carries a user id and whose leaderboard reads
+    pop from `rows` (a list mutated by the test)."""
+    import gui.services.permuto.auth as auth_mod
+
+    c = _Client()
+    c._user_id = "u1"
+    monkeypatch.setattr(auth_mod, "leaderboard_entry",
+                        lambda uid: rows.pop(0) if rows else None)
+    return _runner(c)
+
+
+def test_a_fill_is_logged_loudly_and_not_on_the_baseline(monkeypatch, caplog):
+    rows = [
+        {"depth_seconds_5d": 100.0, "trade_count": 0, "total_pnl": "0"},
+        {"depth_seconds_5d": 200.0, "trade_count": 1, "total_pnl": "3"},
+    ]
+    r = _lb_runner(monkeypatch, rows)
+    import logging
+    with caplog.at_level(logging.INFO, logger="gui.services.permuto.runner"):
+        r.tick(1.0, _ORACLE, {})
+        assert not [m for m in caplog.messages if "FILL LANDED" in m], (
+            "the first observation is a baseline, not a fill")
+        r.tick(1.0 + 301.0, _ORACLE, {})
+    assert [m for m in caplog.messages if "FILL LANDED" in m], (
+        "a trade_count increase is the qualifying-fill signal and must "
+        "be loud")
+
+
+def test_stalled_depth_while_quoting_warns_after_two_samples(
+        monkeypatch, caplog):
+    from gui.services.permuto.quoting import RestingQuote
+
+    rows = [
+        {"depth_seconds_5d": 500.0, "trade_count": 0, "total_pnl": "0"},
+        {"depth_seconds_5d": 500.0, "trade_count": 0, "total_pnl": "0"},
+        {"depth_seconds_5d": 500.0, "trade_count": 0, "total_pnl": "0"},
+    ]
+    r = _lb_runner(monkeypatch, rows)
+    r._resting[_MKT] = RestingQuote(0.099, 0.101)
+    import logging
+    with caplog.at_level(logging.INFO, logger="gui.services.permuto.runner"):
+        r.tick(1.0, _ORACLE, {})
+        r.tick(302.0, _ORACLE, {})
+        assert not [m for m in caplog.messages if "STALLED" in m], (
+            "one flat sample is noise, not a stall")
+        r.tick(603.0, _ORACLE, {})
+    assert [m for m in caplog.messages if "STALLED" in m]
+
+
+def test_leaderboard_watch_is_throttled(monkeypatch):
+    calls = []
+    import gui.services.permuto.auth as auth_mod
+
+    c = _Client()
+    c._user_id = "u1"
+    monkeypatch.setattr(auth_mod, "leaderboard_entry",
+                        lambda uid: calls.append(uid) or None)
+    r = _runner(c)
+    r.tick(1.0, _ORACLE, {})
+    r.tick(2.0, _ORACLE, {})
+    r.tick(100.0, _ORACLE, {})
+    assert len(calls) == 1, "a full paged leaderboard read every tick "        "would hammer a public endpoint"

@@ -122,13 +122,13 @@ def test_a_valid_two_sided_quote_serialises():
             OrderIntent(MKT, Side.SELL, 0.1005, 10_000)]
     out = build_upsert_batch(legs, ORACLE)
     assert [o["side"] for o in out] == ["buy", "sell"]
-    assert all(o["tif"] == "ALO" for o in out)
+    assert all(o["tif"] == "alo" for o in out)
     assert all(o["market"] == MKT for o in out)
 
 
 def test_alo_is_the_default_because_a_crossing_quote_pays_the_spread():
     out = build_upsert_batch([OrderIntent(MKT, Side.BUY, 0.0995, 100)], ORACLE)
-    assert out[0]["tif"] == "ALO"
+    assert out[0]["tif"] == "alo"
 
 
 def test_two_legs_on_one_market_side_are_refused():
@@ -232,3 +232,48 @@ def test_an_infinite_price_is_rejected():
             [OrderIntent("QQQ-VOL-PERP", Side.BUY, _math.inf, 10.0)],
             {"QQQ-VOL-PERP": 0.07},
         )
+
+
+# --------------------------------------------------------------------------- #
+# [live 2026-08-29] The venue's serde wants LOWERCASE tif variants
+# --------------------------------------------------------------------------- #
+
+def test_tif_reaches_the_wire_lowercase():
+    """The first real placement was rejected with "unknown variant `ALO`,
+    expected one of `gtc`, `ioc`, `alo`". Normalised at the wire boundary so
+    no caller's casing can regress it."""
+    from gui.services.permuto.batch import build_upsert_batch
+    from gui.services.permuto.orders import OrderIntent, Side
+
+    intents = [OrderIntent(market="QQQ-VOL-PERP", side=Side.BUY,
+                           price=0.15, size=100.0)]
+    legs = build_upsert_batch(intents, {"QQQ-VOL-PERP": 0.15})
+    assert legs[0]["tif"] == "alo"
+
+    legs = build_upsert_batch(intents, {"QQQ-VOL-PERP": 0.15}, tif="GTC")
+    assert legs[0]["tif"] == "gtc", "explicit caller casing must be fixed too"
+
+
+# --------------------------------------------------------------------------- #
+# [live 2026-08-29] batch_partial is the venue's NORMAL vocabulary
+# --------------------------------------------------------------------------- #
+
+def _live_partial_body():
+    """Shaped from the first live accepted batch: TSLA bid modified, TSLA
+    ask rejected (an ALO ask that would cross a bid resting 2% above the
+    oracle -- the add-liquidity-only guard doing its job)."""
+    return {
+        "status": "batch_partial",
+        "note": ("Batch upsert is best-effort; each leg is modify-or-place "
+                 "independently after the shared mutate token is consumed."),
+        "order_count": 2,
+        "results": [
+            {"action": "modified", "market": "TSLA-VOL-PERP",
+             "order_id": 4512562, "price": "0.2284",
+             "remaining_size": "5253", "size": "5253",
+             "status": "modified"},
+            {"action": "placed", "fills": [], "order_id": 4512662,
+             "position": None, "market": "TSLA-VOL-PERP",
+             "rejection_reason": "post-only order would cross"},
+        ],
+    }
