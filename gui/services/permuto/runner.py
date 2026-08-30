@@ -45,6 +45,7 @@ from .client import PermutoNotLinked
 from .orders import Side, quote_ladder
 from .quoting import LoopAction, RestingQuote, VenueView, decide
 from .risk import MarginState, RiskAction, assess, skewed_reference
+from .curfew import OracleFreeze, Stage, assess_curfew
 from .session import RenewAction
 
 #: How often a SUSTAINED full withdrawal re-asserts the cancel when we
@@ -94,6 +95,7 @@ class QuoteRunner:
         *,
         target_depth_usd: float = 1_200.0,
         max_position_usd: float = 1_200.0,
+        curfew_enabled: bool = True,
         ring_pct: float = 2.0,
         half_spread_pct: float = 0.25,
         quote_when_carried: bool = True,
@@ -109,6 +111,20 @@ class QuoteRunner:
         # dollar limit survives an oracle that moves 10-13% in seconds; a
         # contract limit does not.
         self._max_position_usd = max_position_usd
+        # [CURFEW 2026-08-30] The venue does NOT pause when the underlying
+        # shuts -- measured: trading_paused False and every market active
+        # while all three oracles sat frozen to sixteen digits. It keeps
+        # matching orders against a stale price, which is exactly the
+        # window the competing long-carry trade exploits against MMs. So
+        # inventory is capped on a clock instead: the cap ramps down before
+        # each close and stays at the floor all night, which turns an
+        # oversized position into maker-side REDUCE_ONLY quotes through the
+        # machinery risk.assess() already has. Nothing here crosses the
+        # spread.
+        self._curfew_enabled = curfew_enabled
+        self._freeze = OracleFreeze()
+        self._curfew_stage = None
+        self._curfew = None
         self._ring_pct = ring_pct
         self._half_spread_pct = half_spread_pct
         self._quote_when_carried = quote_when_carried
@@ -242,6 +258,24 @@ class QuoteRunner:
         return result
 
     def _tick(self, now_s: float, oracles: dict, flags: dict) -> TickResult:
+        # [CURFEW] Ground truth for "the underlying is shut" before anything
+        # else reads the clock: a frozen oracle can only ever TIGHTEN the
+        # cap, so observing early costs nothing and a missed observation
+        # would loosen it.
+        if self._curfew_enabled:
+            self._freeze.observe(now_s, oracles)
+            curfew = assess_curfew(
+                now_s, self._max_position_usd,
+                frozen_oracle=self._freeze.frozen(now_s))
+            if curfew.stage is not self._curfew_stage:
+                _log.warning("permuto: inventory curfew %s -> %s: %s "
+                             "(cap $%.0f of $%.0f)",
+                             getattr(self._curfew_stage, "value", "none"),
+                             curfew.stage.value, curfew.reason,
+                             curfew.cap_usd, self._max_position_usd)
+                self._curfew_stage = curfew.stage
+            self._curfew = curfew
+
         paused = bool(flags.get("trading_paused"))
         carried = bool(flags.get("carried") or flags.get("carried_session"))
 
@@ -540,7 +574,14 @@ class QuoteRunner:
             # oracle means zero base_size too, and assess() treats a
             # non-positive limit as "no limit" -- but base_size 0 places
             # nothing, so nothing is sized off the degenerate value.
-            max_position = (self._max_position_usd / oracle
+            # [CURFEW] The curfew cap, not the raw configured limit. Its
+            # floor is deliberately non-zero: assess() reads a
+            # non-positive max_position as "no limit", so ramping to zero
+            # would restore UNLIMITED inventory at the exact moment the
+            # curfew meant to forbid it.
+            cap_usd = (self._curfew.cap_usd if self._curfew is not None
+                       else self._max_position_usd)
+            max_position = (cap_usd / oracle
                             if oracle and oracle > 0.0 else 0.0)
             risk_by_market[market] = assess(
                 state, market,

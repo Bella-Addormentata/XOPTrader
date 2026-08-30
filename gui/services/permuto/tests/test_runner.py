@@ -59,6 +59,11 @@ class _Client:
 
 
 def _runner(client, **kw):
+    # [CURFEW] These tests tick at epoch 1.0, which the real session table
+    # reads as CLOSED -- correctly, but it would floor the position cap and
+    # quietly turn quoting tests into curfew tests. The curfew has its own
+    # suite (test_curfew.py) and its own runner-integration tests below.
+    kw.setdefault("curfew_enabled", False)
     return QuoteRunner(client, [_MKT], **kw)
 
 
@@ -458,6 +463,7 @@ _BOTH = {_MKT: 0.07, _MKT2: 0.09}
 
 
 def _runner2(client, **kw):
+    kw.setdefault("curfew_enabled", False)   # see _runner above
     return QuoteRunner(client, [_MKT, _MKT2], **kw)
 
 
@@ -1085,3 +1091,70 @@ def test_leaderboard_watch_is_throttled(monkeypatch):
     r.tick(2.0, _ORACLE, {})
     r.tick(100.0, _ORACLE, {})
     assert len(calls) == 1, "a full paged leaderboard read every tick "        "would hammer a public endpoint"
+
+
+# --------------------------------------------------------------------------- #
+# [CURFEW] Runner integration. The helpers above opt OUT of the curfew so the
+# quoting tests keep testing quoting; these construct it explicitly and prove
+# the cap actually reaches risk.assess() through the runner.
+# --------------------------------------------------------------------------- #
+
+from gui.services.permuto.curfew import (            # noqa: E402
+    CLOSES_UTC, OPENS_UTC, SETTLE_AFTER_OPEN_S,
+)
+
+_MID_SESSION = OPENS_UTC[0] + SETTLE_AFTER_OPEN_S + 3_600.0
+_OVERNIGHT = CLOSES_UTC[0] + 4 * 3_600.0
+
+
+def _account(position):
+    return {"equity_usd": 100_000.0, "used_margin_usd": 0.0,
+            "positions": {_MKT: position}}
+
+
+def test_curfew_mid_session_quotes_both_sides_at_the_full_cap():
+    # 100 contracts * 0.07 = $7 notional, far inside the $1200 cap.
+    c = _Client(account=_account(100.0))
+    r = _runner(c, curfew_enabled=True)
+    assert r.tick(_MID_SESSION, _ORACLE, {}).action == "quote"
+    assert sorted(leg["side"] for leg in c.last_batch) == ["buy", "sell"]
+
+
+def test_curfew_overnight_floors_the_cap_into_reduce_only():
+    # Same position, same oracle -- only the clock differs. Overnight the
+    # cap is the floor ($150), and $7 of inventory is still inside it, so
+    # push the position past the FLOOR to show the curfew biting.
+    c = _Client(account=_account(100_000.0))   # $7,000 notional
+    r = _runner(c, curfew_enabled=True)
+    r.tick(_OVERNIGHT, _ORACLE, {})
+    assert [leg["side"] for leg in c.last_batch] == ["sell"]
+    assert all(leg["reduce_only"] for leg in c.last_batch)
+
+
+def test_the_same_position_is_unrestricted_mid_session():
+    # The mirror of the test above: $7,000 exceeds the $150 overnight floor
+    # but sits inside the $12,000 configured limit, so mid-session it is
+    # quoted two-sided. The ONLY difference is the time of day.
+    c = _Client(account=_account(100_000.0))
+    r = _runner(c, curfew_enabled=True, max_position_usd=12_000.0)
+    r.tick(_MID_SESSION, _ORACLE, {})
+    assert sorted(leg["side"] for leg in c.last_batch) == ["buy", "sell"]
+
+
+def test_a_frozen_oracle_floors_the_cap_even_mid_session():
+    # The clock wrong in the direction that costs money: the table says
+    # mid-session, the oracle has stopped moving. The freeze wins.
+    c = _Client(account=_account(100_000.0))
+    r = _runner(c, curfew_enabled=True, max_position_usd=12_000.0)
+    t = _MID_SESSION
+    for _ in range(6):                     # hold the oracle still
+        r.tick(t, _ORACLE, {})
+        t += 60.0
+    assert [leg["side"] for leg in c.last_batch] == ["sell"]
+
+
+def test_curfew_disabled_ignores_the_clock_entirely():
+    c = _Client(account=_account(100_000.0))
+    r = _runner(c, curfew_enabled=False, max_position_usd=12_000.0)
+    r.tick(_OVERNIGHT, _ORACLE, {})
+    assert sorted(leg["side"] for leg in c.last_batch) == ["buy", "sell"]
