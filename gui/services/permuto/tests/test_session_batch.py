@@ -252,3 +252,28 @@ def test_tif_reaches_the_wire_lowercase():
 
     legs = build_upsert_batch(intents, {"QQQ-VOL-PERP": 0.15}, tif="GTC")
     assert legs[0]["tif"] == "gtc", "explicit caller casing must be fixed too"
+
+
+# --------------------------------------------------------------------------- #
+# [live 2026-08-29] batch_partial is the venue's NORMAL vocabulary
+# --------------------------------------------------------------------------- #
+
+def _live_partial_body():
+    """Shaped from the first live accepted batch: TSLA bid modified, TSLA
+    ask rejected (an ALO ask that would cross a bid resting 2% above the
+    oracle -- the add-liquidity-only guard doing its job)."""
+    return {
+        "status": "batch_partial",
+        "note": ("Batch upsert is best-effort; each leg is modify-or-place "
+                 "independently after the shared mutate token is consumed."),
+        "order_count": 2,
+        "results": [
+            {"action": "modified", "market": "TSLA-VOL-PERP",
+             "order_id": 4512562, "price": "0.2284",
+             "remaining_size": "5253", "size": "5253",
+             "status": "modified"},
+            {"action": "placed", "fills": [], "order_id": 4512662,
+             "position": None, "market": "TSLA-VOL-PERP",
+             "rejection_reason": "post-only order would cross"},
+        ],
+    }

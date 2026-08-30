@@ -114,6 +114,9 @@ class QuoteRunner:
         #: Whether the venue-side dead man's switch reported armed, for
         #: log-once state transitions rather than a message per tick.
         self._dms_ok: Optional[bool] = None
+        # [live 2026-08-29] Last leg-rejection note, so a persistent benign
+        # rejection (ALO-cross) logs once per CHANGE rather than per tick.
+        self._last_leg_rejections: str = ""
 
     # ------------------------------------------------------------------ #
     # Belief
@@ -616,7 +619,62 @@ class QuoteRunner:
         # and reconcile() heals the belief from open_orders next tick.
         if isinstance(response, dict):
             status = str(response.get("status", "")).lower()
-            if status and status not in ("ok", "success", "accepted"):
+            # [live 2026-08-29] The venue's REAL vocabulary, captured on the
+            # first accepted batch: 'batch_partial' (and by symmetry
+            # 'batch_ok') with a per-leg results list, plus the note "Batch
+            # upsert is best-effort; each leg is modify-or-place
+            # independently". A partial is NORMAL -- tonight's live case is
+            # an ALO ask rejected because a bid rests 2% above the oracle,
+            # which is the add-liquidity-only guard doing its job and worth
+            # a retry every tick, not a failed tick. Accepted legs are NOT
+            # recorded from the response (rows do not echo the side);
+            # reconcile() heals _resting from open_orders next tick, which
+            # also keeps re-sending the rejected leg until it rests.
+            leg_rows = response.get("results")
+            if (status in ("batch_ok", "batch_partial")
+                    and isinstance(leg_rows, list)):
+                if status == "batch_partial" and not leg_rows:
+                    # "partial" with no per-leg detail is unverifiable --
+                    # the round-11 rule stands: never record legs as
+                    # resting off a status that admits some failed.
+                    _log.warning(
+                        "permuto: batch_partial with no results detail; "
+                        "believing open_orders over our own send")
+                    return TickResult(
+                        "error",
+                        "batch_partial with no per-leg results",
+                        results,
+                        error="batch status 'batch_partial'")
+                rejected = []
+                for row in leg_rows:
+                    if not isinstance(row, dict):
+                        continue
+                    reason = row.get("rejection_reason")
+                    if reason or str(row.get("action", "")).lower() == "rejected":
+                        # [live] Rejected rows do not echo the market.
+                        rejected.append("%s: %s"
+                                        % (row.get("market") or "leg",
+                                           reason))
+                if rejected and len(rejected) >= len(leg_rows):
+                    return TickResult(
+                        "error",
+                        "every batch leg rejected: " + "; ".join(rejected),
+                        results,
+                        error="all legs rejected")
+                if rejected:
+                    note = "; ".join(rejected)
+                    if note != self._last_leg_rejections:
+                        self._last_leg_rejections = note
+                        _log.info(
+                            "permuto: batch accepted with rejected leg(s) "
+                            "-- %s -- retrying each tick", note)
+                    return TickResult(
+                        "quote",
+                        "quoting (leg(s) pending: %s)" % note,
+                        results)
+                self._last_leg_rejections = ""
+                # All legs clean: fall through to record them as resting.
+            elif status and status not in ("ok", "success", "accepted"):
                 # [review round 11] A non-clean status is a FAILED tick, not
                 # an annotated success. Recording every requested leg as
                 # resting and returning ok meant a venue answering "partial"
