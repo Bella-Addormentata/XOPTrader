@@ -17,6 +17,7 @@
 //     spikes on large ranges.
 
 #include "xop/monitoring/on_chain_reconciler.hpp"
+#include "xop/execution/wallet_poll_throttle.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -267,23 +268,74 @@ OnChainReconciler::verify_pending_offer_coins()
     // Offers the wallet reports as PENDING_ACCEPT are assumed live.
     // Offers not found in the wallet at all have been lost -- flag them.
 
+    // ------------------------------------------------------------------
+    // [S24 2026-08-29] Early-stopped RELEVANCE pagination.
+    //
+    // This loop was a pre-fix fork of OfferManager::reconcile_offers and
+    // still walked the ENTIRE trade archive (20-25k records, 400-500
+    // get_all_offers round-trips at ~1.6-2s each) every pass, because the
+    // wallet's default ordering sorts pending offers LAST. Live logs put
+    // this loop at ~795-845s of every ~818-845s pass -- 97% of S24's
+    // "reconciliation dominates the heartbeat", misattributed in TODO.md
+    // to block scanning. The [WALLET-LOAD 2026-08-04] fix in
+    // offer_manager.cpp (sort_key="RELEVANCE" so the live set is on page
+    // one, plus a consecutive-old-pages early stop) collapses it to ~2-4
+    // pages; this ports that fix. Absence from the scan is STILL not
+    // trusted on its own: the not-found path below individually verifies
+    // with get_offer before any stale verdict.
+    // ------------------------------------------------------------------
+    std::int64_t oldest_tracked_unix = 0;
+    for (const auto& po : pending) {
+        const auto unix_s =
+            std::chrono::duration_cast<std::chrono::seconds>(
+                po.created_at_ts.time_since_epoch()).count();
+        if (unix_s > 0
+            && (oldest_tracked_unix == 0 || unix_s < oldest_tracked_unix)) {
+            oldest_tracked_unix = unix_s;
+        }
+    }
+    // [S24] The scan snapshot instant. Ages below are measured against
+    // THIS, not against verdict time: on a slow pass an offer created
+    // seconds after the snapshot aged past the grace period DURING the
+    // scan and took a not-found miss for being absent from pages read
+    // before it existed (observed live: "miss 1/3 ... age=842s" for an
+    // offer 12s younger than the pass).
+    const auto scan_started = std::chrono::system_clock::now();
+    const std::int64_t now_unix =
+        std::chrono::duration_cast<std::chrono::seconds>(
+            scan_started.time_since_epoch()).count();
+    const std::int64_t cutoff_unix =
+        execution::reconcile_scan_cutoff(oldest_tracked_unix, now_unix);
+    execution::ReconcileEarlyStop early_stop;
+
     // Paginate wallet offers to build a map of known trade IDs.
     std::unordered_map<std::string, int> wallet_offer_status;
     constexpr std::int64_t kPageSize = 50;
     std::int64_t offset = 0;
+    std::int64_t pages_scanned = 0;
     bool more = true;
     bool wallet_query_succeeded = false;
 
     while (more) {
         try {
             auto records = co_await wallet_->get_all_offers(
-                offset, offset + kPageSize, /*file_contents=*/false);
+                offset, offset + kPageSize, /*file_contents=*/false,
+                /*include_completed=*/true,
+                /*sort_key=*/"RELEVANCE", /*reverse=*/false);
 
             wallet_query_succeeded = true;
+            ++pages_scanned;
 
             if (records.empty() ||
                 static_cast<std::int64_t>(records.size()) < kPageSize) {
                 more = false;
+            }
+
+            std::int64_t page_newest_created = 0;
+            for (const auto& rec : records) {
+                page_newest_created = std::max(
+                    page_newest_created,
+                    rec.value("created_at_time", std::int64_t{0}));
             }
 
             for (const auto& rec : records) {
@@ -326,12 +378,25 @@ OnChainReconciler::verify_pending_offer_coins()
             }
 
             offset += kPageSize;
+
+            // [S24] With RELEVANCE ordering the live set is at the front;
+            // consecutive pages entirely older than the oldest tracked
+            // offer (minus adoptee slack) mean the rest of the archive
+            // holds nothing relevant.
+            if (more && early_stop.observe_page(
+                    page_newest_created > 0
+                    && page_newest_created < cutoff_unix)) {
+                more = false;
+            }
         } catch (const std::exception& e) {
             logger_->warn("verify_pending_offer_coins: wallet query failed "
                           "at offset {}: {}", offset, e.what());
             more = false;
         }
     }
+    logger_->info("verify_pending_offer_coins: scanned {} page(s) for {} "
+                  "pending offers ({} wallet records mapped)",
+                  pages_scanned, pending.size(), wallet_offer_status.size());
 
     // If we couldn't retrieve any wallet offers at all, do not proceed
     // with cross-referencing -- we'd falsely mark everything as stale.
@@ -344,7 +409,6 @@ OnChainReconciler::verify_pending_offer_coins()
     }
 
     // Cross-reference pending offers against wallet state and on-chain data.
-    const auto now = std::chrono::system_clock::now();
     for (const auto& po : pending) {
         auto it = wallet_offer_status.find(po.offer_id);
 
@@ -357,9 +421,10 @@ OnChainReconciler::verify_pending_offer_coins()
             // and re-create duplicates that drain XCH to zero.
             constexpr auto kCreationGracePeriod = std::chrono::seconds{600};
             constexpr std::uint32_t kRequiredConsecutiveMisses = 3;
-            const auto age = now - po.created_at_ts;
-            auto& miss_count = not_found_counts_[po.offer_id];
-            ++miss_count;
+            // [S24] Age at the SCAN SNAPSHOT, not at verdict time -- and
+            // no miss accrual during grace: an in-grace absence is the
+            // expected wallet propagation delay, not evidence.
+            const auto age = scan_started - po.created_at_ts;
 
             if (age < kCreationGracePeriod) {
                 logger_->info("verify_pending_offer_coins: offer {} NOT FOUND "
@@ -372,6 +437,9 @@ OnChainReconciler::verify_pending_offer_coins()
                 continue;
             }
 
+            auto& miss_count = not_found_counts_[po.offer_id];
+            ++miss_count;
+
             // Require multiple consecutive misses before declaring stale.
             // Wallet get_all_offers can transiently omit entries during
             // sync/refresh windows; a single miss is not authoritative.
@@ -383,6 +451,30 @@ OnChainReconciler::verify_pending_offer_coins()
                               miss_count, kRequiredConsecutiveMisses,
                               po.pair_name, po.tier,
                               std::chrono::duration<double>(age).count());
+                continue;
+            }
+
+            // [S24][SETTLE-FIX pattern] Absence from a paged scan is not
+            // proof, especially with the early stop above -- verify THIS
+            // trade id individually before the one-way verdict. Removing
+            // a live offer loses its fill forever (the 2026-07-31 6-XCH
+            // incident shape); one targeted RPC per candidate is cheap.
+            bool found_individually = false;
+            try {
+                auto rec = co_await wallet_->get_offer(po.offer_id,
+                                                       /*file_contents=*/
+                                                       false);
+                found_individually = !rec.empty();
+            } catch (const std::exception&) {
+                found_individually = false;
+            }
+            if (found_individually) {
+                logger_->info("verify_pending_offer_coins: offer {} absent "
+                              "from the scan but found by direct lookup -- "
+                              "not stale (pair={} tier={})",
+                              po.offer_id.substr(0, 12),
+                              po.pair_name, po.tier);
+                not_found_counts_.erase(po.offer_id);
                 continue;
             }
 
@@ -579,9 +671,11 @@ asio::awaitable<std::pair<
     logger_->info("run_full_reconciliation: starting at block {} "
                   "(last reconciled: {})",
                   current_block, last_reconciled_block_);
+    const auto t0 = std::chrono::steady_clock::now();
 
     // Phase 1: Verify pending offer coins.
     auto stale_ids = co_await verify_pending_offer_coins();
+    const auto t1 = std::chrono::steady_clock::now();
 
     // Remove stale offers from State.
     for (const auto& oid : stale_ids) {
@@ -590,6 +684,7 @@ asio::awaitable<std::pair<
 
     // Phase 2: Reconcile balances.
     auto discrepancies = co_await reconcile_balances(wallet_ids);
+    const auto t2 = std::chrono::steady_clock::now();
 
     // Phase 3: Extract block fees since last reconciliation.
     if (last_reconciled_block_ > 0 && current_block > last_reconciled_block_) {
@@ -619,9 +714,18 @@ asio::awaitable<std::pair<
 
     last_reconciled_block_ = current_block;
 
+    // [S24] Per-phase wall clock, so the next regression is a log line
+    // instead of a two-day investigation. Pre-fix live shape for
+    // reference: verify ~795-845s, balances+fees ~23-27s.
+    const auto t3 = std::chrono::steady_clock::now();
+    const auto secs = [](auto a, auto b) {
+        return std::chrono::duration<double>(b - a).count();
+    };
     logger_->info("run_full_reconciliation: complete -- {} stale offers, "
-                  "{} balance discrepancies",
-                  stale_ids.size(), discrepancies.size());
+                  "{} balance discrepancies (verify {:.1f}s, balances "
+                  "{:.1f}s, fees {:.1f}s, total {:.1f}s)",
+                  stale_ids.size(), discrepancies.size(),
+                  secs(t0, t1), secs(t1, t2), secs(t2, t3), secs(t0, t3));
 
     co_return std::make_pair(std::move(stale_ids), std::move(discrepancies));
 }
