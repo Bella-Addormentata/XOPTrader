@@ -60,6 +60,7 @@ add_executable(xop_tests
     test_limits.cpp
     test_config.cpp
     test_config_reload.cpp
+    test_reconcile_verdict.cpp
     test_liquidity.cpp
     test_market_allocator.cpp
     test_fee_tracker.cpp
