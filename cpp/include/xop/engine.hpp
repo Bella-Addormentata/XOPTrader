@@ -570,6 +570,21 @@ private:
     asio::awaitable<void> check_config_reload_flag();
     asio::awaitable<bool> sweep_reload_disabled_offers();
 
+    // -- [STOPDRAIN v0.10.7] Stopped means draining, never unmanaged -------
+    //
+    // The operator's OFF stops NEW offers immediately (pause flag) but no
+    // longer force-cancels the book: resting offers drain through the TTL
+    // sweep below, which runs precisely while Step 8 is pause-skipped.
+    // Cancel All is the immediate version -- a flag file the GUI writes,
+    // consumed on the fast poll path. Risk paths (peg suspension, live
+    // pair-disable, dead man's switch) still cancel immediately; those
+    // fire when something is WRONG and a drain is exposure to it.
+    std::filesystem::path cancel_all_flag_path_;
+    bool cancel_all_inflight_ = false;
+
+    asio::awaitable<void> step_sweep_stale_offers(BlockHeight block_height);
+    void check_cancel_all_flag();
+
     [[nodiscard]] bool asset_peg_suspended(const std::string& asset_id) const;
     [[nodiscard]] bool pair_peg_suspended(const PairConfig& pc) const;
     asio::awaitable<void> step_observe_asset_pegs(BlockHeight block_height);

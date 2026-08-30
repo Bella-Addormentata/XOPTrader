@@ -203,24 +203,26 @@ def window():
 
 
 def test_both_switches_start_honestly(window):
-    """[review round 11] Dexie starts STOPPING, not OFF: with no bridge the
-    book is UNKNOWN, and dexie offers rest on chain and survive this
-    process -- "off and nothing is resting" is a claim nothing has checked.
-    Permuto starts OFF because its unverified book is deliberately reported
-    empty (arming is what reconciles it; see _gather_permuto)."""
-    assert window._dexie_switch.text() == "DEXIE STOPPING"
-    assert window._permuto_switch.text() == "PERMUTO OFF"
+    """[INTENT v0.10.7] With no bridge the dexie book is UNKNOWN, and dexie
+    offers rest on chain and survive this process -- so the chip must not
+    claim flatness, and must not invent resting offers either. Permuto's
+    unverified book is deliberately reported empty (arming is what
+    reconciles it), so its chip says unverified rather than flat."""
+    assert window._dexie_switch.status_text() == "stopped -- book unknown"
+    assert window._permuto_switch.status_text()         == "stopped -- book unverified"
 
 
-def test_dexie_refuses_while_the_engine_is_down(window):
+def test_dexie_click_records_intent_and_the_chip_names_the_gate(window):
+    """[INTENT v0.10.7] Clicks are never refused: the slider records what
+    the operator wants, and the chip explains why reality is not following
+    yet -- gates-first, so "the engine is not running" is what shows."""
     seen = []
     window._dexie_switch.refused.connect(seen.append)
     window._dexie_switch.click()
-    # Gates-first ordering: with the engine down AND an unknown book, "the
-    # engine is not running" is the refusal the operator can act on --
-    # "previous stop still confirming" would be neither true nor fixable.
-    assert seen == ["the engine is not running"]
-    assert window._dexie_switch.text() == "DEXIE STOPPING"
+    assert seen == [], "the intent slider must never refuse a click"
+    assert window._dexie_desired_on is True
+    assert window._dexie_switch.status_text() == "blocked"
+    assert "engine is not running" in window._dexie_switch._chip.toolTip()
 
 
 def test_permuto_refuses_until_registered(window):
@@ -234,8 +236,13 @@ def test_permuto_refuses_until_registered(window):
     seen = []
     window._permuto_switch.refused.connect(seen.append)
     window._permuto_switch.click()
-    assert seen == ["this identity is not registered with the venue"]
-    assert window._permuto_switch.text() == "PERMUTO OFF"
+    assert seen == [], "the intent slider must never refuse a click"
+    assert window._permuto_desired_on is True
+    assert window._permuto_runner is None, (
+        "the START must be deferred while the gate holds -- constructing "
+        "the runner here would authenticate against the real venue")
+    assert window._permuto_switch.status_text() == "blocked"
+    assert "not registered" in window._permuto_switch._chip.toolTip()
 
 
 def test_permuto_reports_its_own_book_rather_than_assuming(window):
@@ -304,12 +311,12 @@ def test_a_resting_book_shows_stopping_rather_than_off(window, monkeypatch):
     window._dexie_intent_synced = True      # do not adopt engine state here
     window._dexie_desired_on = False
     window._dexie_switch.refresh()
-    assert window._dexie_switch.text() == "DEXIE STOPPING"
+    assert "resting, draining" in window._dexie_switch.status_text()
 
-    # And it becomes OFF only once the count actually reaches zero.
+    # And it reads flat only once the count actually reaches zero.
     _Svc.get_offers_summary = staticmethod(lambda: {"pending": 0.0})
     window._dexie_switch.refresh()
-    assert window._dexie_switch.text() == "DEXIE OFF"
+    assert window._dexie_switch.status_text() == "stopped -- flat"
 
 
 def test_the_gui_pause_is_not_treated_as_a_protection_gate(window, monkeypatch):
@@ -389,7 +396,8 @@ def test_a_pause_button_pause_is_not_hidden_by_the_switch(window, monkeypatch):
     window._dexie_desired_on = True
     assert "gui" in window._gather_dexie().gates
     window._dexie_switch.refresh()
-    assert window._dexie_switch.text() == "DEXIE BLOCKED"
+    assert window._dexie_switch.status_text() == "blocked"
+    assert "Pause/Resume" in window._dexie_switch._chip.toolTip()
     window._bot_running = False
 
 
@@ -537,6 +545,10 @@ def test_arming_does_not_paint_ON_before_the_first_pass(window, monkeypatch):
             return False
 
     monkeypatch.setattr(window, "_make_permuto_live", lambda: _FakeLive())
+    # This test is about the STARTING latch, not the registration gate:
+    # let the deferred-start check pass so the fake actually arms.
+    monkeypatch.setattr("gui.services.venue_control.may_turn_on",
+                        lambda inputs: (True, ""))
     window._on_permuto_toggle(True)
     try:
         gates = window._gather_permuto().gates

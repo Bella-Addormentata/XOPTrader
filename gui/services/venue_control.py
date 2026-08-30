@@ -37,9 +37,11 @@ from enum import Enum
 
 __all__ = [
     "GATE_LABELS",
+    "StatusChip",
     "SwitchInputs",
     "VenueState",
     "may_turn_on",
+    "resolve_chip",
     "resolve_state",
 ]
 
@@ -105,6 +107,14 @@ class SwitchInputs:
     book_is_empty: bool = True
     """Whether anything of ours is still resting at the venue."""
 
+    resting_count: float = -1.0
+    """How many of our offers rest at the venue. Negative means unknown.
+
+    Display-only: decisions use `book_is_empty`, which callers derive from
+    the same source. Kept separate so an unknown COUNT (metrics gap) does
+    not force the decision fields into their fail-closed shapes.
+    """
+
     book_verified: bool = True
     """Whether anything has actually LOOKED, this session.
 
@@ -126,6 +136,70 @@ def resolve_state(inputs: SwitchInputs) -> VenueState:
     # about the book, not about the request -- the operator's intent cannot
     # retire an offer that is still takeable.
     return VenueState.OFF if inputs.book_is_empty else VenueState.STOPPING
+
+
+@dataclass(frozen=True)
+class StatusChip:
+    """What the status label next to the intent slider should say.
+
+    [INTENT v0.10.7] The slider claims only the operator's intent; this
+    chip claims only observed reality. Split so neither can lie: a slider
+    that waits for reality looks stuck, a label that reports intent
+    overpromises -- both have happened here.
+    """
+
+    text: str
+    tone: str          # "ok" | "converging" | "warn" | "idle"
+    tooltip: str = ""
+    offer_cancel_visible: bool = False
+
+
+def resolve_chip(inputs: SwitchInputs) -> StatusChip:
+    """Reality, phrased for the operator. Total and side-effect free."""
+    n = int(inputs.resting_count) if inputs.resting_count >= 0 else -1
+
+    if inputs.desired_on:
+        if inputs.gates:
+            _, reason = may_turn_on(inputs)
+            return StatusChip(
+                text="blocked",
+                tone="warn",
+                tooltip="Intent is ON but the venue cannot trade: " + reason,
+            )
+        text = "quoting" if n < 0 else "quoting -- %d resting" % n
+        return StatusChip(
+            text=text, tone="ok",
+            tooltip="Trading. Flip the switch to stop posting; resting "
+                    "offers then drain by TTL, or Cancel All retracts them "
+                    "now.")
+
+    # Intent OFF.
+    if not inputs.book_is_empty:
+        if n < 0:
+            # Not-empty here means UNKNOWN (metrics gap, engine down):
+            # claiming "offers resting" would be a guess, and offering a
+            # cancel of a book nothing can see is noise.
+            return StatusChip(
+                text="stopped -- book unknown", tone="converging",
+                tooltip="No new offers will be posted, but nothing can "
+                        "currently see whether offers are still resting "
+                        "(engine down or metrics unavailable).")
+        return StatusChip(
+            text="stopped -- %d resting, draining" % n, tone="converging",
+            tooltip="No new offers will be posted. Resting offers age out "
+                    "via their TTL (roughly 19 minutes), or Cancel All "
+                    "retracts them immediately.",
+            offer_cancel_visible=True)
+    if not inputs.book_verified:
+        return StatusChip(
+            text="stopped -- book unverified", tone="idle",
+            tooltip="No new offers will be posted. Nothing has queried the "
+                    "venue's book this session, so whether anything is "
+                    "still resting is unknown.")
+    return StatusChip(
+        text="stopped -- flat", tone="idle",
+        tooltip="No new offers will be posted and nothing of ours rests at "
+                "the venue.")
 
 
 def may_turn_on(inputs: SwitchInputs) -> tuple[bool, str]:

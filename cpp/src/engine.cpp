@@ -615,6 +615,8 @@ Engine::Engine(const AppConfig& config, bool dry_run)
         peg_reenable_flag_path_ = db_dir / "peg_reenable.flag";
         // [RELOAD] Touched by the GUI after every successful Save.
         config_reload_flag_path_ = db_dir / "config_reload.flag";
+        // [STOPDRAIN] The GUI's Cancel All button.
+        cancel_all_flag_path_ = db_dir / "cancel_all.flag";
     }
 
     state_->set_status(BotStatus::Initializing);
@@ -1704,6 +1706,9 @@ asio::awaitable<void> Engine::poll_loop_coro()
             // operator who pauses during an outage gets a log line and a GUI
             // status instead of silence.
             check_pause_flag();
+            // [STOPDRAIN] Same fast path: an operator's Cancel All must
+            // not wait behind a slow heartbeat.
+            check_cancel_all_flag();
     check_peg_reenable_flag();
 
             // [S28] Height source is decided EVERY poll, not once at startup.
@@ -2962,7 +2967,13 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
     } else if (wallet_circuit_open_) {
         spdlog::debug("[Engine] Step 8 SKIPPED: wallet circuit breaker open");
     } else if (gui_pause_active_) {
-        spdlog::debug("[Engine] Step 8 SKIPPED: trading paused by GUI");
+        spdlog::debug("[Engine] Step 8 SKIPPED: trading paused by GUI "
+                      "-- running the TTL sweep only");
+        // [STOPDRAIN] Stopped is not unmanaged: age out what is resting.
+        try { co_await step_sweep_stale_offers(block_height); }
+        catch (const std::exception& e) {
+            spdlog::error("[Engine] [STOPDRAIN] sweep failed: {}", e.what());
+        }
     } else if (breaker_pause_active_) {
         // A dedicated flag, not BotStatus.  Two reasons, both observed on
         // 2026-08-22.  First, nothing in this path ever read BotStatus, so
@@ -15811,6 +15822,90 @@ void Engine::close_connections()
 // ---------------------------------------------------------------------------
 // check_pause_flag -- GUI-initiated pause via signal file.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// [STOPDRAIN] Stopped means draining, never unmanaged
+// ---------------------------------------------------------------------------
+
+// The TTL sweep alone, for cycles where Step 8 is pause-skipped. Without
+// this, a stopped book neither requotes nor expires -- the exact shape of
+// 2026-08-25's four-hour-old bids being picked off. Deliberately NOT the
+// whole of Step 8: while stopped the engine must also not spend fees on
+// UTXO liberation, splits, or liveness reposts.
+asio::awaitable<void> Engine::step_sweep_stale_offers(BlockHeight block_height)
+{
+    if (dry_run_ || !offer_mgr_) co_return;
+    for (const auto& pair : config_.pairs) {
+        if (!pair.enabled) continue;
+        // A peg-suspended pair's book was already cancelled at suspension.
+        if (pair_peg_suspended(pair)) continue;
+        try {
+            auto cancelled = co_await offer_mgr_->cancel_stale(
+                pair.name, block_height, config_.strategy.offer_ttl_blocks);
+            for (const auto& oid : cancelled) {
+                try {
+                    db_->update_offer_status(oid, "cancelled", block_height,
+                                             "ttl_while_stopped");
+                } catch (const std::exception& e) {
+                    spdlog::debug("[Engine] [STOPDRAIN] update_offer_status "
+                                  "failed for {}: {}", oid.substr(0, 12),
+                                  e.what());
+                }
+            }
+            if (!cancelled.empty()) {
+                spdlog::info("[Engine] [STOPDRAIN] {}: {} offer(s) aged out "
+                             "while stopped", pair.name, cancelled.size());
+            }
+        } catch (const std::exception& e) {
+            spdlog::warn("[Engine] [STOPDRAIN] {}: aging sweep failed: {}",
+                         pair.name, e.what());
+        }
+    }
+    co_return;
+}
+
+// Consume data/cancel_all.flag: the operator asked for the book to be gone
+// NOW rather than by TTL. Spawned detached so the fast poll path never
+// blocks on wallet RPC; the in-flight guard stops a second click from
+// stacking a duplicate cancel run.
+void Engine::check_cancel_all_flag()
+{
+    namespace fs = std::filesystem;
+    if (cancel_all_flag_path_.empty()) return;
+    std::error_code ec;
+    if (!fs::exists(cancel_all_flag_path_, ec)) return;
+    fs::remove(cancel_all_flag_path_, ec);
+
+    if (cancel_all_inflight_) {
+        spdlog::warn("[Engine] [CANCELALL] requested while a previous "
+                     "cancel-all is still running -- ignored");
+        return;
+    }
+    if (!offer_mgr_ || dry_run_) {
+        spdlog::info("[Engine] [CANCELALL] requested but nothing to do "
+                     "(dry-run or no offer manager)");
+        return;
+    }
+    cancel_all_inflight_ = true;
+    spdlog::warn("[Engine] [CANCELALL] operator requested cancel-all -- "
+                 "cancelling every resting offer");
+    asio::co_spawn(
+        ioc_,
+        [this]() -> asio::awaitable<void> {
+            try {
+                auto done = co_await offer_mgr_->cancel_all();
+                spdlog::warn("[Engine] [CANCELALL] {} offer(s) submitted "
+                             "for cancel", done.size());
+            } catch (const std::exception& e) {
+                spdlog::critical("[Engine] [CANCELALL] FAILED: {} -- offers "
+                                 "may still be resting; the TTL sweep keeps "
+                                 "draining them", e.what());
+            }
+            cancel_all_inflight_ = false;
+            co_return;
+        },
+        asio::detached);
+}
+
 // ---------------------------------------------------------------------------
 // [RELOAD] Config hot-reload: live pair disable
 // ---------------------------------------------------------------------------

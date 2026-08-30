@@ -662,20 +662,29 @@ class EngineBridge(QObject):
     #: probes with hasattr concludes it retracted a book it never touched.
     #: The dexie switch reads this to decide whether it may promise "off
     #: means flat".
-    SUPPORTS_DIRECT_CONTROL: bool = False
+    SUPPORTS_DIRECT_CONTROL: bool = True
 
     def cancel_all_offers(self) -> None:
-        """Request cancellation of all outstanding offers.
+        """[STOPDRAIN] Ask the engine to cancel every resting offer NOW.
 
-        Phase 1 stub -- logs a warning. See SUPPORTS_DIRECT_CONTROL.
+        Same channel as pause/reload: a flag file beside the database,
+        consumed on the engine's FAST poll path (not the slow heartbeat),
+        which co-spawns the cancel. Submission is not confirmation -- the
+        offers die when the cancel spends confirm on chain, and the TTL
+        sweep keeps draining anything a failed cancel leaves behind.
         """
-        _log.warning(
-            "cancel_all_offers() called but direct control is not yet "
-            "available."
-        )
-        self.error.emit(
-            "Cannot cancel offers: direct engine control not yet available."
-        )
+        flag_path = self._db_path.parent / "cancel_all.flag"
+        try:
+            flag_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(flag_path, "w", encoding="utf-8") as fh:
+                fh.write("cancel_all" + chr(10))
+            _log.warning("Cancel-all requested via %s", flag_path)
+        except OSError as exc:
+            _log.error("Could not write cancel-all flag %s: %s",
+                       flag_path, exc)
+            self.error.emit(
+                "Could not signal the engine to cancel offers -- see "
+                "gui.log. Resting offers still drain by TTL.")
 
     def reload_config(self) -> None:
         """Re-read the YAML configuration and signal the engine.

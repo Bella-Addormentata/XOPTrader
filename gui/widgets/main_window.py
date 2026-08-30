@@ -295,6 +295,13 @@ class MainWindow(QMainWindow):
         self.metrics_service = metrics_service
         self.db_service = db_service
         self._bridge: Optional[Any] = None  # Set via set_bridge()
+        # [STOPDRAIN] True from a Cancel All click until the book is
+        # verifiably flat; gates a re-arm from posting over unconfirmed
+        # cancel spends.
+        self._dexie_cancel_all_pending: bool = False
+        # True only while an ON click was held behind that latch; the
+        # convergence pass applies exactly one resume when it clears.
+        self._dexie_resume_deferred: bool = False
         # Dashboard per-pair table inputs: our own book/fills from the DB,
         # plus the latest live snapshot to pair them with.
         self._pair_summary: dict = {}
@@ -1672,6 +1679,8 @@ class MainWindow(QMainWindow):
         self._dexie_switch = VenueSwitch("dexie", self._gather_dexie)
         self._dexie_switch.toggleRequested.connect(self._on_dexie_toggle)
         self._dexie_switch.refused.connect(self._on_switch_refused)
+        self._dexie_switch.cancelAllRequested.connect(
+            self._on_dexie_cancel_all)
         toolbar.addWidget(self._dexie_switch)
 
         self._permuto_switch = VenueSwitch("permuto", self._gather_permuto)
@@ -2304,11 +2313,35 @@ class MainWindow(QMainWindow):
                 # a switch turns trading on over a tripped one.
                 gates.add("breaker")
 
+        book_empty = self._dexie_book_is_empty()
+        if book_empty:
+            # A confirmed-flat book retires the cancel-all latch.
+            self._dexie_cancel_all_pending = False
+        elif self._dexie_desired_on and self._dexie_cancel_all_pending:
+            # Turning ON over an unconfirmed cancel-all would post a fresh
+            # ladder on top of cancel spends that have not settled -- the
+            # same coins committed twice. Intent stays ON; the chip names
+            # this gate until the book is verifiably flat.
+            gates.add("cancels_pending")
+
         return SwitchInputs(
             desired_on=self._dexie_desired_on,
             gates=frozenset(gates),
-            book_is_empty=self._dexie_book_is_empty(),
+            book_is_empty=book_empty,
+            resting_count=self._dexie_pending_count(),
         )
+
+    def _dexie_pending_count(self) -> float:
+        """Our resting-offer count, or -1.0 when nothing can say."""
+        if self._bridge is None:
+            return -1.0
+        try:
+            svc = self._bridge.metrics_service
+            if not svc.has_data():
+                return -1.0
+            return float(svc.get_offers_summary().get("pending", -1.0))
+        except Exception:  # noqa: BLE001
+            return -1.0
 
     def _dexie_book_is_empty(self) -> bool:
         """Whether anything of ours is still resting on dexie.
@@ -2411,31 +2444,44 @@ class MainWindow(QMainWindow):
 
     def _on_dexie_toggle(self, want_on: bool) -> None:
         if want_on:
+            self._dexie_desired_on = True
+            if (self._dexie_cancel_all_pending
+                    and not self._dexie_book_is_empty()):
+                # Intent recorded; plumbing deferred. The chip shows
+                # "blocked: previous stop still confirming" and
+                # _refresh_venue_switches() resumes once the book is flat.
+                self._dexie_resume_deferred = True
+                self._refresh_venue_switches()
+                return
             if self._bridge is not None and not self._bot_running:
                 self._bridge.start_engine()
             if self._bridge is not None:
                 self._bridge.resume_trading()
-            self._dexie_desired_on = True
         else:
-            # OFF means flat, not "stopped posting". Pause first so nothing
-            # new is placed while the cancels go out, THEN cancel -- the
-            # other order races a fresh ladder against its own cancellation.
+            # [STOPDRAIN v0.10.7] OFF means "no new offers", immediately --
+            # and ONLY that. The resting book is not force-cancelled: the
+            # engine's TTL sweep (which now runs while paused) drains it
+            # within ~19 minutes, and the chip shows the countdown. Cancel
+            # All is the explicit immediate version. Risk paths (peg
+            # suspension, pair disable, dead man's switch) still cancel
+            # instantly -- this is the OPERATOR's routine stop, not an
+            # emergency.
             if self._bridge is not None:
                 self._bridge.pause_trading()
-                # Capability, not hasattr. cancel_all_offers() EXISTS on the
-                # Phase 1 bridge and does nothing but log -- so probing for
-                # the method would have this switch go quiet about a book it
-                # never retracted, which is the failure the OFF-means-flat
-                # rule was chosen to avoid.
-                if getattr(self._bridge, "SUPPORTS_DIRECT_CONTROL", False):
-                    self._bridge.cancel_all_offers()
-                else:
-                    self._on_switch_refused(
-                        "posting stopped, but this build cannot cancel from "
-                        "the GUI -- offers already resting stay takeable "
-                        "until they expire or the engine shuts down")
             self._dexie_desired_on = False
         self._refresh_venue_switches()
+
+    def _on_dexie_cancel_all(self) -> None:
+        """[STOPDRAIN] The operator wants the book gone now, not by TTL."""
+        if self._bridge is None:
+            self._on_switch_refused(
+                "cannot cancel: the engine bridge is not connected")
+            return
+        self._bridge.cancel_all_offers()
+        self._dexie_cancel_all_pending = True
+        self.statusBar().showMessage(
+            "Cancel-all sent to the engine -- offers die when the cancel "
+            "spends confirm on chain.", 8000)
 
     def _apply_permuto_startup_state(self) -> None:
         """Apply 'Permuto: On at startup' -- once, through the click path.
@@ -2466,6 +2512,21 @@ class MainWindow(QMainWindow):
 
     def _on_permuto_toggle(self, want_on: bool) -> None:
         if want_on:
+            # [INTENT v0.10.7] The slider records intent unconditionally;
+            # the START is what gates. With the widget no longer refusing
+            # clicks, starting here despite a held gate would authenticate
+            # and place against a venue the operator was just told is
+            # blocked (and, in tests, would reach the real network -- the
+            # sealed-identity lesson). The chip names the gate; flipping
+            # OFF/ON after fixing it starts cleanly.
+            from gui.services.venue_control import may_turn_on
+            allowed, reason = may_turn_on(self._gather_permuto())
+            self._permuto_desired_on = True
+            if not allowed:
+                _log.info("permuto intent ON recorded; start deferred: %s",
+                          reason)
+                self._refresh_venue_switches()
+                return
             if self._permuto_runner is None:
                 try:
                     self._permuto_runner = self._make_permuto_live()
@@ -2557,6 +2618,20 @@ class MainWindow(QMainWindow):
         goes stale in both directions.
         """
         self._sync_dexie_intent_from_engine()
+        # [INTENT] Converge deferred plumbing toward recorded intent: an ON
+        # that was HELD back by an unconfirmed cancel-all resumes the moment
+        # the book is verifiably flat. Only explicitly deferred resumes are
+        # applied -- the Pause/Resume button's pause also reads as the "gui"
+        # gate, and resuming on that signal alone would override it.
+        if (self._dexie_resume_deferred
+                and self._dexie_desired_on
+                and not self._dexie_cancel_all_pending
+                and self._bridge is not None
+                and self._bot_running):
+            self._dexie_resume_deferred = False
+            _log.info("[INTENT] deferred dexie resume applying -- the "
+                      "cancel-all confirmed and the book is flat")
+            self._bridge.resume_trading()
         for switch in (getattr(self, "_dexie_switch", None),
                        getattr(self, "_permuto_switch", None)):
             if switch is not None:
