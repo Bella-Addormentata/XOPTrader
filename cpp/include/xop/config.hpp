@@ -273,6 +273,24 @@ struct StrategyConfig {
     double   q_max{1000.0};
     double   min_profit_margin_bps{35.0};   // Never ask below cost + this.
     uint32_t offer_ttl_blocks{60};          // Cancel stale offers after N blocks.
+
+    // [ALWAYSOFFER 2026-08-30] Side-aware BBO sanity (see bbo_sanity.hpp).
+    // Aggressive deviation (would EXECUTE dislocated) keeps the tight
+    // 10%; passive deviation (merely RESTS far from a thin book, e.g. a
+    // cost-floored ask above a crashed book) is allowed much wider.
+    // Check 1 (model mid vs BBO midpoint) gets its own threshold so a
+    // recovering one-sided book cannot re-suppress every tier.
+    double bbo_sanity_max_aggressive_dev{0.10};
+    double bbo_sanity_max_passive_dev{0.30};
+    double bbo_sanity_max_mid_dev{0.50};
+
+    // [FLOOR 2026-08-30] The Step 7 ask floor mode: "strict" (never quote
+    // below basis+margin -- the old unconditional behaviour), "aging"
+    // (floor decays with position age via inventory_aging, finally making
+    // max_loss_relax_bps real), or "off" (market pricing governs; the BBO
+    // aggressive cap still bounds how far below the book an ask can go).
+    // See strategy/no_loss_floor.hpp for the rationale.
+    std::string no_loss_floor_mode{"strict"};
     uint32_t num_tiers{4};                  // Tier count per side.
     std::vector<double> tier_spacing_bps;   // Length == num_tiers.
     std::vector<double> tier_size_pct;      // Length == num_tiers, sum ~= 1.0.

@@ -4816,7 +4816,15 @@ void Engine::step_compute_quotes(BlockHeight block_height)
               / static_cast<double>(kMojosPerXch);
         double margin_bps = pair_cfg->min_profit_margin_bps_override.value_or(
             config_.strategy.min_profit_margin_bps);
-        strategy.set_cost_basis(cost_basis, margin_bps);
+        // [FLOOR 2026-08-30] Mode "off" must silence BOTH no-loss sites:
+        // this one seeds the strategy's internal ask floor, and leaving
+        // it armed would re-impose basis pricing that Step 7 no longer
+        // enforces. Basis 0 = "unknown" = no internal floor.
+        if (config_.strategy.no_loss_floor_mode == "off") {
+            strategy.set_cost_basis(0.0, margin_bps);
+        } else {
+            strategy.set_cost_basis(cost_basis, margin_bps);
+        }
 
         // Invoke the per-pair strategy to produce raw quotes.
         pcs.raw_quote = strategy.compute_quotes(mid, sigma, q, block_height);
@@ -7978,7 +7986,22 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                     ? 0
                     : from_usd_pseudo(rec.weighted_avg_cost_basis, *pair_cfg);
 
-            if (cost_basis > 0) {
+            // [FLOOR 2026-08-30] Mode-aware: "off" skips the lift
+            // entirely (market pricing governs, BBO aggressive cap still
+            // bounds sales below the book); "aging" finally threads the
+            // inventory-aging discount into THIS floor -- the review
+            // proved max_loss_relax_bps was a no-op here because the lift
+            // read the undiscounted basis.
+            const auto& floor_mode_str = config_.strategy.no_loss_floor_mode;
+            const auto floor_mode =
+                floor_mode_str == "off"
+                    ? strategy::FloorMode::Off
+                    : (floor_mode_str == "aging"
+                           ? strategy::FloorMode::Aging
+                           : strategy::FloorMode::Strict);
+
+            if (cost_basis > 0
+                && floor_mode != strategy::FloorMode::Off) {
                 // Honour the pair's own margin override; the other no-loss
                 // site (step 4, strategy.set_cost_basis) already does, so
                 // using the global here made BYC/wUSDC.b quote against 30 bps
@@ -7986,9 +8009,14 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                 const double margin_bps =
                     pair_cfg->min_profit_margin_bps_override.value_or(
                         config_.strategy.min_profit_margin_bps);
-                const auto min_ask = static_cast<Mojo>(std::llround(
-                    static_cast<double>(cost_basis)
-                    * (1.0 + margin_bps / 10'000.0)));
+                const int floor_pos_age = inventory_->position_age_blocks(
+                    AssetId{pair_cfg->base_asset_id}, block_height);
+                const auto min_ask = static_cast<Mojo>(
+                    strategy::compute_ask_floor(
+                        floor_mode, cost_basis, margin_bps, floor_pos_age,
+                        config_.inventory_aging.aging_start_blocks,
+                        config_.inventory_aging.relax_rate_bps_per_block,
+                        config_.inventory_aging.max_loss_relax_bps));
 
                 // Walk ask tiers in ladder order, holding a running minimum
                 // that steps up after each lift.  Without the step every
@@ -9984,14 +10012,26 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
 
             if (has_bbo && !fee_filtered_tiers.empty()) {
                 const Mojo bbo_mid_m = (best_bid + best_ask) / 2;
-                constexpr double kMaxBboDeviation = 0.10;  // 10% -- matches microprice clamp
+                // [ALWAYSOFFER 2026-08-30] Side-aware and configurable --
+                // see bbo_sanity.hpp for the two-risk rationale. Check 1
+                // has its OWN (wider) threshold: it shares no risk with
+                // the per-tier aggressive cap, and at the shared 10% a
+                // recovering one-sided book (real bid appearing under a
+                // lagging model mid) re-suppressed every tier of the very
+                // pair the recovery was reviving.
+                const double kMaxAggressiveDev =
+                    config_.strategy.bbo_sanity_max_aggressive_dev;
+                const double kMaxPassiveDev =
+                    config_.strategy.bbo_sanity_max_passive_dev;
+                const double kMaxMidDev =
+                    config_.strategy.bbo_sanity_max_mid_dev;
 
                 // Check 1: Model mid vs BBO sanity
                 if (mid > 0) {
                     const double mid_dev = std::abs(
                         static_cast<double>(mid) - static_cast<double>(bbo_mid_m))
                         / static_cast<double>(bbo_mid_m);
-                    if (mid_dev > kMaxBboDeviation) {
+                    if (mid_dev > kMaxMidDev) {
                         spdlog::warn("[Engine] Step 8: {} model mid {} deviates "
                                      "{:.1f}% from BBO mid {} -- suppressing ALL "
                                      "offers this block",
@@ -10009,19 +10049,27 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     for (const auto& tier : fee_filtered_tiers) {
                         const Mojo ref = (tier.side == Side::Bid)
                             ? best_bid : best_ask;
-                        const double dev = std::abs(
-                            static_cast<double>(tier.price)
-                            - static_cast<double>(ref))
-                            / static_cast<double>(ref);
-
-                        if (dev > kMaxBboDeviation) {
+                        const auto verdict = strategy::classify_tier(
+                            tier.side != Side::Bid,
+                            static_cast<double>(tier.price),
+                            static_cast<double>(ref),
+                            static_cast<double>(bbo_mid_m),
+                            kMaxAggressiveDev, kMaxPassiveDev);
+                        if (verdict != strategy::BboVerdict::Pass) {
+                            const double dev = std::abs(
+                                static_cast<double>(tier.price)
+                                - static_cast<double>(ref))
+                                / static_cast<double>(ref);
                             spdlog::warn("[Engine] Step 8: {} {} tier {} price {} "
-                                         "deviates {:.1f}% from BBO {} -- "
+                                         "deviates {:.1f}% from BBO {} ({}) -- "
                                          "suppressed",
                                          pair_name,
                                          (tier.side == Side::Bid) ? "bid" : "ask",
                                          tier.tier_index, tier.price,
-                                         dev * 100.0, ref);
+                                         dev * 100.0, ref,
+                                         verdict == strategy::BboVerdict::
+                                             SuppressAggressive
+                                             ? "aggressive" : "passive");
                             ++bbo_suppressed;
                             continue;
                         }

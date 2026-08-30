@@ -1418,6 +1418,35 @@ StrategyConfig parse_strategy(const YAML::Node& root)
         }
     }
 
+    if (node["no_loss_floor_mode"] && node["no_loss_floor_mode"].IsDefined()
+        && !node["no_loss_floor_mode"].IsNull()) {
+        cfg.no_loss_floor_mode =
+            node["no_loss_floor_mode"].as<std::string>();
+        if (cfg.no_loss_floor_mode != "strict"
+            && cfg.no_loss_floor_mode != "aging"
+            && cfg.no_loss_floor_mode != "off") {
+            throw ConfigError(sec + ".no_loss_floor_mode must be one of "
+                              "strict | aging | off");
+        }
+    }
+
+    // [ALWAYSOFFER 2026-08-30] Side-aware BBO sanity thresholds.
+    for (const auto& [key, dst] : {
+             std::pair<const char*, double*>{
+                 "bbo_sanity_max_aggressive_dev",
+                 &cfg.bbo_sanity_max_aggressive_dev},
+             {"bbo_sanity_max_passive_dev",
+              &cfg.bbo_sanity_max_passive_dev},
+             {"bbo_sanity_max_mid_dev", &cfg.bbo_sanity_max_mid_dev}}) {
+        if (node[key] && node[key].IsDefined() && !node[key].IsNull()) {
+            *dst = node[key].as<double>();
+            if (!(*dst > 0.0) || *dst > 2.0) {
+                throw ConfigError(sec + "." + key
+                                  + " must be in (0, 2]");
+            }
+        }
+    }
+
     // -- Untrustworthy-reference quoting gate (optional, default in StrategyConfig) --
     if (node["dex_print_stale_heartbeats"] && node["dex_print_stale_heartbeats"].IsDefined()
         && !node["dex_print_stale_heartbeats"].IsNull()) {

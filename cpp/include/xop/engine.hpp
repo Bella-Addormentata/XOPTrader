@@ -69,6 +69,8 @@
 #include "xop/risk/valuation_authority.hpp"
 #include "xop/risk/peg_suspension.hpp"
 #include "xop/config_reload.hpp"
+#include "xop/strategy/bbo_sanity.hpp"
+#include "xop/strategy/no_loss_floor.hpp"
 #include "xop/risk/usd_route.hpp"
 #include "xop/risk/inventory.hpp"
 #include "xop/risk/limits.hpp"

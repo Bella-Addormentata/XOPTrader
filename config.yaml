@@ -81,6 +81,11 @@ strategy:
   # Asks below cost+margin are now LIFTED to this floor rather than dropped,
   # so raising it widens the ask side instead of withdrawing it.
   min_profit_margin_bps: 50
+  # [FLOOR 2026-08-30] Operator decision: market pricing governs asks;
+  # realized losses on repriced inventory are accepted ("this might be
+  # unavoidable"). The BBO aggressive cap (10%) still bounds how far
+  # below the book an ask can execute. Alternatives: strict | aging.
+  no_loss_floor_mode: "off"
   max_half_spread_bps: 150
   high_vol_multiplier: 1.3
   offer_ttl_blocks: 400
@@ -145,7 +150,7 @@ strategy:
   wall_size_threshold_xch: 50.0
   wall_niche_premium_pct: 0.05
   competitive_anchor_enabled: true
-  competitive_anchor_max_distance_bps: 350.0
+  competitive_anchor_max_distance_bps: 8000.0
   competitive_anchor_stride_bps: 45.0
   orphan_adopt_enabled: true
   orphan_adverse_threshold: 0.02
@@ -169,7 +174,7 @@ strategy:
   comp_pid_kd: 2.0
   comp_pid_ema_alpha: 0.02
   comp_pid_integral_max: 4.0
-  comp_pid_warmup_blocks: 30
+  comp_pid_warmup_blocks: 5
   comp_pid_min_offset: -3
   comp_pid_max_offset: 3
   asset_target_allocations:
@@ -192,8 +197,8 @@ strategy:
     XCH: 0.2
   ratio_band_enter_by_pair:
     BYC/wUSDC.b: 0.3095238095238095
-    XCH/BYC: 0.1785714285714286
-    XCH/DBX: 0.1785714285714286
+    XCH/BYC: 0.30
+    XCH/DBX: 0.30
     XCH/wUSDC.b: 0.16748768472906395
     wmilliETH.b/XCH: 0.12987012987012986
 risk:
