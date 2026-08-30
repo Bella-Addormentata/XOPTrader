@@ -16029,6 +16029,46 @@ asio::awaitable<void> Engine::step_sweep_stale_offers(BlockHeight block_height)
         }
     }
 
+    // [Copilot review] Step 8's wallet-sync preflight documents that an
+    // unsynced wallet makes cancel_offer "fail outright" -- and its
+    // per-offer failures are swallowed inside cancel_stale, so an
+    // unsynced-wallet sweep would look like success by omission. Count
+    // it as an immediately-failed cycle: that feeds the drain-failure
+    // escalation (alert + DRAIN FAILING chip) instead of attempting
+    // doomed RPCs.
+    if (eligible > 0) {
+        try {
+            auto sync_status = co_await wallet_->get_sync_status();
+            const bool synced =
+                sync_status.value("synced", false)
+                && !sync_status.value("syncing", false);
+            if (!synced) {
+                spdlog::warn("[Engine] [STOPDRAIN] wallet not synced -- "
+                             "sweep cannot cancel this cycle ({} offer(s) "
+                             "eligible)", eligible);
+                ++stopdrain_failed_cycles_;
+                if (stopdrain_failed_cycles_ >= 3 && !stopdrain_alerted_) {
+                    stopdrain_alerted_ = true;
+                    if (metrics_) metrics_->update_stopdrain_failing(true);
+                    if (alerts_) {
+                        alerts_->send_alert(
+                            AlertRule::WalletUnreachable,
+                            "[STOPDRAIN] stopped book is NOT draining: "
+                            "the wallet is unsynced and "
+                            + std::to_string(eligible)
+                            + " offer(s) rest takeable.");
+                    }
+                }
+                co_return;
+            }
+        } catch (const std::exception& e) {
+            spdlog::warn("[Engine] [STOPDRAIN] sync pre-check failed: {}",
+                         e.what());
+            // Fall through: the cancel attempts below surface the
+            // failure through the normal accounting.
+        }
+    }
+
     std::size_t total_cancelled = 0;
     bool any_threw = false;
     for (const auto& pair : config_.pairs) {
@@ -16176,7 +16216,26 @@ void Engine::check_cancel_all_flag()
                       "in-flight cancel-all");
         return;
     }
+    // [Copilot review] Deletion failure must not re-fire a fee-bearing
+    // cancel-all after every completed run (an undeletable flag stays
+    // visible forever). Mirror the reload flag's stuck-mtime latch: run
+    // this request once, then skip the stuck file until it CHANGES.
+    std::error_code mt_ec;
+    const auto flag_mtime =
+        fs::last_write_time(cancel_all_flag_path_, mt_ec);
+    if (!mt_ec && cancel_all_stuck_mtime_
+        && flag_mtime == *cancel_all_stuck_mtime_) {
+        return;
+    }
+    cancel_all_stuck_mtime_.reset();
     fs::remove(cancel_all_flag_path_, ec);
+    if (ec) {
+        spdlog::warn("[Engine] [CANCELALL] could not delete {} ({}) -- "
+                     "running this request once; the stuck file is "
+                     "skipped until it changes",
+                     cancel_all_flag_path_.string(), ec.message());
+        if (!mt_ec) cancel_all_stuck_mtime_ = flag_mtime;
+    }
     if (!offer_mgr_ || dry_run_) {
         spdlog::info("[Engine] [CANCELALL] requested but nothing to do "
                      "(dry-run or no offer manager)");

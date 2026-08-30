@@ -590,6 +590,9 @@ private:
     /// this survives to confirmation, gates Step 8 regardless of GUI
     /// state, and is published as the "cancels_pending" posting gate.
     bool cancel_all_draining_ = false;
+    /// [Copilot review] mtime of a cancel_all.flag that could not be
+    /// deleted: its request ran once; skip until the file changes.
+    std::optional<std::filesystem::file_time_type> cancel_all_stuck_mtime_;
 
     // [STOPDRAIN review #0] Drain-failure escalation. The TTL sweep is the
     // ONLY manager of a stopped book; a sweep that fails silently is the

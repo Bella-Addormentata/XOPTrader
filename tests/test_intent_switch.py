@@ -8,13 +8,7 @@ gui/services/permuto/tests/test_venue_control.py.
 
 from __future__ import annotations
 
-import pytest
-
-from gui.services.venue_control import (
-    StatusChip,
-    SwitchInputs,
-    resolve_chip,
-)
+from gui.services.venue_control import SwitchInputs, resolve_chip
 
 
 def _in(**kw) -> SwitchInputs:
