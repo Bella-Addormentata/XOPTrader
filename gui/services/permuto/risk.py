@@ -167,10 +167,25 @@ def max_price_skew_frac(ring_pct: float, half_spread_pct: float) -> float:
     budget and never rested long enough to earn depth. The skew ceiling now
     stops at 80% of the trigger, so even a fully skewed pair rests until the
     ORACLE moves, which is what the trigger is for.
+
+    [review 2026-08-31] AND THE HALF-SPREAD COMES OUT OF THE SAME BUDGET.
+    The cap above reserved 80% of the trigger for the SKEW alone, but
+    quoting.decide() measures ``abs(leg_price - oracle)`` -- the LEG, not
+    the skewed midpoint -- and the leg sits a further half-spread beyond
+    it. So the real distance is placement + skew, and at the shipped
+    defaults that was 0.25 + 0.96 = 1.21% against a 1.20% trigger: a fully
+    skewed pair was born past its own trigger and churned, which is the
+    exact failure the previous review thought it had closed.
+
+    Subtracting the half-spread makes the total self-balancing at 80% of
+    the trigger whatever the spread is -- 0.25 + 0.71 and 0.75 + 0.21 both
+    land on 0.96% -- so a wider quoting posture tightens the skew instead
+    of silently breaking the invariant.
     """
     ring_edge = (ring_pct - half_spread_pct) / 100.0
     trigger = ring_pct * _REQUOTE_AT_RING_FRACTION / 100.0
-    return max(0.0, min(ring_edge, trigger * 0.8))
+    budget = trigger * 0.8 - half_spread_pct / 100.0
+    return max(0.0, min(ring_edge, budget))
 
 
 def skew_frac(

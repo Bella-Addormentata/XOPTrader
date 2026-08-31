@@ -209,6 +209,10 @@ class QuoteRunner:
         #: minute, and silence then means something is actually wrong
         #: rather than merely un-logged.
         self._depth_logged_at_s = 0.0
+        #: [MODES] The half-spread actually in force this tick, after the
+        #: stage profile. Read by the crossing-backoff headroom, which must
+        #: budget the spread we USED and not the one we configured.
+        self._eff_half_spread = half_spread_pct
         #: [ANTICROSS] Learned per-market retreat from the book. The venue
         #: refused 51 legs for crossing on 2026-08-31 and publishes no L2, so
         #: its own refusals are the only signal available. Depth credit is
@@ -730,6 +734,38 @@ class QuoteRunner:
                 if self._curfew is not None:
                     self._curfew_stage = self._curfew.stage
 
+        # [MODES] Computed ONCE, above the risk loop, because the stage is a
+        # property of the tick and not of a market.
+        #
+        # [review] The effective half-spread has to be the SAME number
+        # everywhere. The first version widened only the ladder while
+        # risk.assess() and the crossing headroom still budgeted the
+        # configured 0.25%. At defaults that is a real failure and not a
+        # tidiness point: a session position near half its cap produces
+        # ~0.48% skew, and 0.48 + 0.75 puts a leg past the 1.2% re-quote
+        # trigger the moment it is born -- so every tick would cancel and
+        # replace a quote that was never wrong, and the backoff would budget
+        # ring headroom against a spread nobody was using.
+        # [review] POSTURE reads the SCHEDULE stage, not the effective one.
+        # The effective stage is deliberately lossy -- a frozen oracle maps a
+        # scheduled SETTLING back to PREOPEN so the short cap stays shut --
+        # and that made the (SETTLING, stale) branch unreachable: after the
+        # bell, a still-frozen oracle arrived as PREOPEN, which quotes. So
+        # the guard against quoting a stale post-open price was dead code,
+        # killed by the other fix I made hours earlier.
+        posture_stage = Stage.UNSCHEDULED
+        if self._curfew is not None:
+            posture_stage = (self._curfew.schedule_stage
+                             or self._curfew.stage)
+        profile = profile_for(
+            posture_stage,
+            # frozen() is a METHOD taking now_s, not a property: passing the
+            # bound method reads as permanently truthy, which would pin
+            # oracle_fresh to False and stop SETTLING ever quoting.
+            oracle_fresh=not self._freeze.frozen(now_s))
+        eff_half_spread = self._half_spread_pct * profile.spread_mult
+        self._eff_half_spread = eff_half_spread
+
         risk_by_market: dict = {}
         for market in (self._markets if account_seen else []):
             oracle = oracles.get(market)
@@ -762,7 +798,7 @@ class QuoteRunner:
                 base_size=base_size,
                 max_position=max_position,
                 ring_pct=self._ring_pct,
-                half_spread_pct=self._half_spread_pct,
+                half_spread_pct=eff_half_spread,
             )
 
         # A market holding a live quote that risk wants shrunk or gone must
@@ -885,16 +921,8 @@ class QuoteRunner:
             # footprint -- a leg outside the ring earns nothing.
             self._last_skew[market] = risk.skew
             # [MODES] The stage decides the POSTURE, the curfew and risk
-            # decide the LIMITS. Applied here so both can still only reduce
-            # what the profile asks for -- never the other way round.
-            profile = profile_for(
-                self._curfew.stage if self._curfew is not None
-                else Stage.UNSCHEDULED,
-                # frozen() is a METHOD taking now_s, not a property: passing
-                # the bound method reads as permanently truthy, which would
-                # have pinned oracle_fresh to False and stopped SETTLING from
-                # ever quoting.
-                oracle_fresh=not self._freeze.frozen(now_s))
+            # decide the LIMITS -- the profile is applied first precisely so
+            # both can still only reduce it, never the other way round.
             if not profile.quote:
                 results[market] = ("skip", profile.reason)
                 continue
@@ -905,7 +933,7 @@ class QuoteRunner:
             ladder = quote_ladder(
                 market, reference, depth_usd,
                 levels=1,
-                first_offset_pct=(self._half_spread_pct * profile.spread_mult
+                first_offset_pct=(eff_half_spread
                                   + self._cross_backoff.offset_pct(market)),
                 ring_pct=self._ring_pct,
                 tick_size=spec.get("tick_size", 0.0001),
@@ -1302,8 +1330,13 @@ class QuoteRunner:
                     if mkt in crossed:
                         self._cross_backoff.observe_cross(
                             mkt,
+                            # [review] The spread we USED this tick, not the
+                            # configured one: budgeting ring headroom against
+                            # a narrower spread than the ladder actually
+                            # placed lets the backoff hand back room the
+                            # widened quote has already spent.
                             headroom_pct(self._ring_pct,
-                                         self._half_spread_pct,
+                                         self._eff_half_spread,
                                          self._last_skew.get(mkt, 0.0)))
                     else:
                         self._cross_backoff.observe_clean(mkt)

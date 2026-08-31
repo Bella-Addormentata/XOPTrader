@@ -337,6 +337,17 @@ class CurfewState:
     seconds_to_close: float = -1.0
     long_cap_usd: Optional[float] = None
     short_cap_usd: Optional[float] = None
+    #: What the CLOCK said, before a frozen oracle overrode it.
+    #:
+    #: [review] The effective stage is deliberately lossy: a frozen oracle
+    #: maps a scheduled SETTLING back to PREOPEN so the short side stays
+    #: shut. That is right for CAPS and wrong for POSTURE -- a consumer
+    #: asking "has the bell rung?" cannot tell a genuine pre-open PREOPEN
+    #: (oracle frozen because the market is shut, quoting is fine) from a
+    #: post-open one (oracle frozen because it has not printed yet, quoting
+    #: is the stale-price trap). Both need to be answerable, so both are
+    #: reported.
+    schedule_stage: Optional[Stage] = None
 
     def __post_init__(self):
         # None means "unset" and mirrors the symmetric cap, so a state built
@@ -524,7 +535,8 @@ def assess_curfew(
         long_cap, short_cap = _side_caps(
             effective, full_cap_usd, to_close, long_target, short_target)
         return CurfewState(effective, long_cap, reason, to_close,
-                           long_cap_usd=long_cap, short_cap_usd=short_cap)
+                           long_cap_usd=long_cap, short_cap_usd=short_cap,
+                           schedule_stage=stage)
 
     # Past the table the schedule abstains and the observable truth governs.
     if stage is Stage.UNSCHEDULED:

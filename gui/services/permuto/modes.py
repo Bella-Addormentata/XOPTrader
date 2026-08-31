@@ -20,13 +20,21 @@ regime. They are different games:
 So the same cap wants opposite behaviour on either side of the bell, and a
 mode has to carry a quoting PROFILE, not just a limit.
 
-THE BALANCE SHEET IS PART OF THE MODE. The most expensive mistake of
-contest night one was not a bad quote, it was arriving at the close with
-inventory: 870k contracts short, which pinned every market to reduce-only
-and earned exactly zero through the most valuable hours of the week.
-Inventory held into the close is not neutral, it is a claim on the
-overnight window. RAMP and EXIT therefore aim at FLAT rather than merely
-at a smaller number.
+THE BALANCE SHEET IS PART OF THE MODE -- PARTLY. The most expensive
+mistake of contest night one was not a bad quote, it was arriving at the
+close with inventory: 870k contracts short, which pinned every market to
+reduce-only and earned exactly zero through the most valuable hours of the
+week. Inventory held into the close is not neutral, it is a claim on the
+overnight window.
+
+What this module does about that is bounded, and worth stating precisely
+rather than overselling: RAMP shrinks size and EXIT places nothing, so the
+run-in to the close STOPS ADDING inventory. It does NOT actively skew to
+shed what is already on -- that would mean directional sizing, which
+belongs with risk.skew_frac and deserves its own change and its own tests.
+An earlier draft carried a `flatten_bias` flag that nothing read, which
+described behaviour the code did not have; the flag is gone rather than
+left to imply it.
 
 WHAT THIS MODULE IS NOT. It does not decide direction, size in dollars, or
 whether risk permits a leg -- risk.assess() and the curfew caps still own
@@ -46,9 +54,17 @@ __all__ = ["Profile", "profile_for", "SESSION_SPREAD_MULT",
 #: Open hours: quote WIDER than the configured spread. Depth credit is flat
 #: anywhere inside the +/-2% ring, so width costs nothing in eligibility --
 #: and against a tape moving 20%+ a minute, a tight quote is not tighter
-#: pricing, it is a donation. 3x the configured half-spread puts a 0.25%
-#: default at 0.75%, still well inside the ring after skew.
-SESSION_SPREAD_MULT = 3.0
+#: pricing, it is a donation.
+#:
+#: [review 2026-08-31] 1.6x, NOT the 3x first shipped. The placement and the
+#: inventory skew share ONE budget -- quoting.decide() re-quotes on
+#: abs(leg_price - oracle), so both count -- and at 3x the skew ceiling
+#: collapsed to 0.21%, which at ordinary inventory rounds away entirely on
+#: the 0.0001 tick grid. Widening that hard does not trade skew for width,
+#: it DELETES inventory leaning. 1.6x puts the 0.25% default at 0.40% and
+#: leaves 0.56% of skew, and the adaptive crossing backoff covers the rest
+#: of the distance from the book on the markets that actually need it.
+SESSION_SPREAD_MULT = 1.6
 
 #: After hours: the oracle is frozen, so the ring does not move and there is
 #: no drift to defend against. Quote at the configured spread.
@@ -82,7 +98,6 @@ class Profile:
     quote: bool
     spread_mult: float
     depth_mult: float
-    flatten_bias: bool
     reason: str
 
 
@@ -100,7 +115,6 @@ def profile_for(stage: Stage, *, oracle_fresh: bool = True) -> Profile:
     if stage is Stage.EXIT:
         return Profile(
             quote=False, spread_mult=SESSION_SPREAD_MULT, depth_mult=0.0,
-            flatten_bias=True,
             reason="last minutes before the close: no new quotes, and "
                    "inventory carried past the bell costs the overnight "
                    "window, which is where depth is actually earned")
@@ -108,7 +122,6 @@ def profile_for(stage: Stage, *, oracle_fresh: bool = True) -> Profile:
     if stage is Stage.SETTLING and not oracle_fresh:
         return Profile(
             quote=False, spread_mult=SESSION_SPREAD_MULT, depth_mult=0.0,
-            flatten_bias=False,
             reason="the bell has rung but the oracle has not printed; "
                    "quoting against a frozen price after the open is the "
                    "stale-price trap, not the start of a session")
@@ -116,7 +129,7 @@ def profile_for(stage: Stage, *, oracle_fresh: bool = True) -> Profile:
     if stage is Stage.CLOSED:
         return Profile(
             quote=True, spread_mult=CLOSED_SPREAD_MULT,
-            depth_mult=_DEPTH[Stage.CLOSED], flatten_bias=False,
+            depth_mult=_DEPTH[Stage.CLOSED],
             reason="frozen oracle: the ring does not move, so a resting "
                    "two-sided book earns without drift risk. This is the "
                    "cheapest depth of the week")
@@ -124,12 +137,12 @@ def profile_for(stage: Stage, *, oracle_fresh: bool = True) -> Profile:
     if stage is Stage.RAMP:
         return Profile(
             quote=True, spread_mult=SESSION_SPREAD_MULT,
-            depth_mult=_DEPTH[Stage.RAMP], flatten_bias=True,
+            depth_mult=_DEPTH[Stage.RAMP],
             reason="winding inventory down so we reach the close flat and "
                    "can quote both sides overnight")
 
     return Profile(
         quote=True, spread_mult=SESSION_SPREAD_MULT,
-        depth_mult=_DEPTH.get(stage, 0.5), flatten_bias=False,
+        depth_mult=_DEPTH.get(stage, 0.5),
         reason="open hours: the tape moves further than the band in most "
                "minutes, so quote wide and small rather than fighting it")

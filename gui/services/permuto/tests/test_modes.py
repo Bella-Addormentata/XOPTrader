@@ -13,7 +13,7 @@ from gui.services.permuto.modes import (
 
 
 def test_every_stage_has_a_profile():
-    for stage in Stage:
+    for stage in list(Stage):
         p = profile_for(stage)
         assert isinstance(p, Profile)
         assert p.reason, "%s has no stated reason" % stage
@@ -50,17 +50,20 @@ def test_the_last_minutes_place_nothing_new():
     assert p.depth_mult == 0.0
 
 
-def test_the_close_run_in_biases_toward_flat():
+def test_the_close_run_in_stops_adding_inventory():
     """Inventory carried past the bell is a claim on the overnight window.
 
     870k contracts short at the close pinned every market to reduce-only
-    and earned zero through the most valuable hours of the week, so RAMP
-    and EXIT aim at flat rather than merely smaller.
+    and earned zero through the most valuable hours of the week. What this
+    module does about it is bounded: RAMP shrinks and EXIT stops. It does
+    NOT actively skew to shed what is already on -- an earlier draft had a
+    `flatten_bias` flag that nothing read, describing behaviour the code
+    did not have.
     """
-    assert profile_for(Stage.RAMP).flatten_bias is True
-    assert profile_for(Stage.EXIT).flatten_bias is True
-    assert profile_for(Stage.CLOSED).flatten_bias is False
-    assert profile_for(Stage.SESSION).flatten_bias is False
+    assert (profile_for(Stage.RAMP).depth_mult
+            < profile_for(Stage.SESSION).depth_mult)
+    assert profile_for(Stage.EXIT).depth_mult == 0.0
+    assert profile_for(Stage.EXIT).quote is False
 
 
 def test_size_shrinks_monotonically_into_the_close():
@@ -101,7 +104,7 @@ def test_no_profile_can_widen_past_the_credit_ring_at_defaults():
     """A profile that quotes outside the ring earns nothing, so the
     multipliers have to stay usable at the shipped spread."""
     half_spread, ring = 0.25, 2.0
-    for stage in Stage:
+    for stage in list(Stage):
         p = profile_for(stage)
         assert half_spread * p.spread_mult < ring, (
             "%s widens 0.25%% to %.2f%%, at or past the %.1f%% ring"

@@ -1982,3 +1982,81 @@ def test_the_last_minutes_before_the_close_place_nothing():
     assert not getattr(c, "last_batch", None), (
         "placed a new quote inside the exit window")
     assert res.markets.get(_MKT, ("", ""))[0] == "skip", res.markets
+
+def test_a_frozen_oracle_after_the_bell_stops_the_runner_quoting():
+    """[review] This guard was DEAD CODE, killed by my own earlier fix.
+
+    assess_curfew maps a scheduled SETTLING with a frozen oracle back to
+    PREOPEN so the short cap stays shut -- right for caps, wrong for
+    posture. profile_for therefore never saw (SETTLING, stale); it saw
+    PREOPEN, which quotes. So after the bell a still-frozen oracle would
+    have been quoted against, which is the exact stale-price trap the
+    branch was written to prevent. Posture now reads the SCHEDULE stage.
+    """
+    c = _Client(account=_account(0.0), batch_response=_venue_ok())
+    r = _runner(c, curfew_enabled=True)
+    t0 = OPENS_UTC[0] + 60.0
+    for k in range(6):                      # let the freeze detector confirm
+        r.tick(t0 - 300.0 + k * 60.0, _ORACLE, {})
+    res = r.tick(t0, _ORACLE, {})
+    assert res.markets.get(_MKT, ("", ""))[0] == "skip", res.markets
+    assert "not printed" in res.markets[_MKT][1], res.markets[_MKT]
+
+
+def test_the_widened_spread_is_budgeted_by_risk_too():
+    """[review] The spread must be ONE number everywhere.
+
+    Widening only the ladder while risk.assess() budgets the configured
+    0.25% puts a skewed leg past the 1.2% re-quote trigger the moment it
+    is born -- ~0.48% skew at half the cap plus 0.75% placement -- so the
+    loop would cancel and replace a quote that was never wrong, every
+    tick, forever.
+    """
+    from gui.services.permuto.modes import SESSION_SPREAD_MULT
+
+    c = _Client(account=_account(0.0), batch_response=_venue_ok())
+    r = _runner(c, curfew_enabled=True, max_position_usd=250_000.0)
+    r.tick(_MID_SESSION, _ORACLE, {})
+    assert abs(r._eff_half_spread
+               - r._half_spread_pct * SESSION_SPREAD_MULT) < 1e-9,         "the effective spread is not the profile-widened one"
+
+
+def test_a_widened_quote_is_not_born_past_its_own_requote_trigger():
+    """The consequence the reviewer named, asserted as arithmetic.
+
+    A first attempt tried to observe this end to end, but the fake client
+    reports no open orders, so reconcile clears the belief and the loop
+    re-quotes every tick regardless -- the harness, not the behaviour. The
+    property that actually matters is that the widened placement plus the
+    largest skew it permits still rests inside the trigger.
+    """
+    from gui.services.permuto.modes import SESSION_SPREAD_MULT
+    from gui.services.permuto.quoting import REQUOTE_AT_RING_FRACTION
+    from gui.services.permuto.risk import max_price_skew_frac
+
+    ring, configured = 2.0, 0.25
+    placement = configured * SESSION_SPREAD_MULT
+    worst = placement + max_price_skew_frac(ring, placement) * 100.0
+    assert worst <= ring * REQUOTE_AT_RING_FRACTION + 1e-9, (
+        "a fully skewed session leg is born %.4f%% out, past the %.2f%% "
+        "trigger -- it would be cancelled and replaced every tick"
+        % (worst, ring * REQUOTE_AT_RING_FRACTION))
+
+
+def test_widening_leaves_enough_skew_to_move_a_real_price():
+    """And the widening must not silently DELETE inventory leaning.
+
+    At the 3x first shipped, the skew ceiling collapsed to 0.21% and
+    rounded away entirely on the 0.0001 tick grid at ordinary inventory --
+    a quote that leans on inventory in the arithmetic and not in the
+    prices actually sent.
+    """
+    from gui.services.permuto.modes import SESSION_SPREAD_MULT
+    from gui.services.permuto.risk import max_price_skew_frac
+
+    placement = 0.25 * SESSION_SPREAD_MULT
+    ceiling = max_price_skew_frac(2.0, placement)
+    oracle, tick = 0.07, 0.0001
+    assert ceiling * oracle > 2 * tick, (
+        "a full skew moves the price %.6f, under two ticks -- inventory "
+        "leaning would round away" % (ceiling * oracle))
