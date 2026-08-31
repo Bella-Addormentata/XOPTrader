@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import pytest
 
 from gui.services.permuto.auth import PermutoAuthError
@@ -1703,3 +1704,43 @@ def test_survivors_are_re_priced_after_a_cancel_round_trip():
 
     assert "cancel_all" in c.calls, "the unsafe market was never retracted"
     assert len(reads) >= 2, "survivors were not re-read after the cancel"
+
+# --------------------------------------------------------------------------- #
+# [DEPTHSIGNAL] A one-sided book banks nothing, and must say so.
+# --------------------------------------------------------------------------- #
+
+def test_a_two_sided_batch_reports_a_positive_depth_credit(caplog):
+    c = _Client(account=_account(100.0))
+    r = _runner(c, curfew_enabled=True)
+    with caplog.at_level(logging.DEBUG, logger="gui.services.permuto.runner"):
+        assert r.tick(_MID_SESSION, _ORACLE, {}).action == "quote"
+    assert sorted(leg["side"] for leg in c.last_batch) == ["buy", "sell"]
+    assert not [rec for rec in caplog.records
+                if "ZERO depth credit" in rec.getMessage()],         "a healthy two-sided book was reported as earning nothing"
+    assert [rec for rec in caplog.records
+            if "batch depth credit" in rec.getMessage()],         "the per-tick depth credit was never reported at all"
+
+
+def test_a_reduce_only_batch_warns_that_it_banks_nothing(caplog):
+    """The failure that was silent: a one-sided book earns zero.
+
+    Overnight the curfew floors the SHORT cap to zero, which puts a short
+    into REDUCE_ONLY -- one side only. `depth_credit_usd` scores that at
+    min(bid, ask) = 0, so the tick banks nothing towards the 300,000,000
+    eligibility gate no matter how large the leg is. Before this warning
+    existed the loop sent it, logged an ordinary success, and the operator
+    had no way to tell an earning tick from a free one.
+    """
+    c = _Client(account=_account(-100.0))
+    r = _runner(c, curfew_enabled=True)
+    with caplog.at_level(logging.DEBUG, logger="gui.services.permuto.runner"):
+        r.tick(_OVERNIGHT, _ORACLE, {})
+    # Unconditional: measured, this tick DOES send one reduce-only buy leg,
+    # so an `if c.last_batch:` guard here would be the same do-nothing test
+    # this suite just finished removing three of.
+    assert c.last_batch, "no batch was sent; the assertions never ran"
+    sides = {leg["side"] for leg in c.last_batch}
+    assert len(sides) == 1, "expected a one-sided book, got %r" % (sides,)
+    assert all(leg["reduce_only"] for leg in c.last_batch), c.last_batch
+    assert [rec for rec in caplog.records
+            if "ZERO depth credit" in rec.getMessage()],         "a one-sided book was sent without warning that it earns nothing"

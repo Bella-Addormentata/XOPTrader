@@ -42,7 +42,7 @@ from typing import Any, Optional
 from .auth import PermutoAuthError
 from .batch import BatchError, build_upsert_batch
 from .client import PermutoNotLinked
-from .orders import Side, quote_ladder
+from .orders import Side, depth_credit_usd, quote_ladder
 from .quoting import LoopAction, RestingQuote, VenueView, decide
 from .risk import MarginState, RiskAction, assess, skewed_reference
 from .band_guard import VENUE_BAND_PCT, BandGuard
@@ -1125,6 +1125,47 @@ class QuoteRunner:
             send_oracles.update(send_refs)
         except NameError:                       # no legs -> no preflight pass
             pass
+        # [DEPTHSIGNAL] What this batch is worth in eligibility terms,
+        # computed locally, BEFORE it is sent.
+        #
+        # The venue's own depth_seconds counter cannot serve as the feedback
+        # signal: sampled every 60s on 2026-08-31 during the cash session it
+        # was byte-identical for ALL 39 market makers across three minutes,
+        # while total_pnl moved on every sample. It is published on a
+        # coarse, batched cadence, so "did that tick earn anything?" is
+        # unanswerable from the leaderboard at tick resolution.
+        #
+        # depth_credit_usd() is the same min(bid, ask)-inside-the-ring rule
+        # the venue credits, so a zero here means this tick banks nothing --
+        # which is precisely the one-sided-book failure the note below
+        # describes and which was, until now, completely silent.
+        credit_usd = 0.0
+        for mkt in {leg.market for leg in legs}:
+            ref = send_oracles.get(mkt) or 0.0
+            if ref <= 0.0:
+                continue
+            try:
+                credit_usd += depth_credit_usd(
+                    [l for l in legs if l.market == mkt
+                     and l.side is Side.BUY],
+                    [l for l in legs if l.market == mkt
+                     and l.side is Side.SELL],
+                    ref, ring_pct=self._ring_pct)
+            except ValueError:
+                # A leg whose side disagrees with its book is a builder bug,
+                # not a reason to lose the whole tick's send.
+                _log.debug("permuto: depth credit skipped for %s", mkt)
+        if legs and credit_usd <= 0.0:
+            _log.warning(
+                "permuto: this batch earns ZERO depth credit -- %d leg(s) "
+                "across %d market(s), no market two-sided inside the "
+                "%.1f%% ring. Eligibility accrues on min(bid, ask), so a "
+                "one-sided book banks nothing however large it is.",
+                len(legs), len({l.market for l in legs}), self._ring_pct)
+        else:
+            _log.debug("permuto: batch depth credit $%.0f/s (%d legs)",
+                       credit_usd, len(legs))
+
         payload = build_upsert_batch(legs, send_oracles,
                                      ring_pct=self._ring_pct)
         response = self._client.batch_upsert(payload, now_s)
