@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 from datetime import datetime
 from typing import Any, Optional
 
@@ -507,6 +508,54 @@ class _MarketWorker(QObject):
             self.failed.emit(str(exc))
 
 
+class _CloseWorker(QObject):
+    """Read-and-plan, or send, an operator close. Off the GUI thread.
+
+    Two modes rather than one, because the operator must SEE the plan --
+    contracts and notional, per market -- before anything is sent. A
+    one-shot button that reports what it did afterwards is not a decision,
+    it is a surprise.
+    """
+
+    planned = Signal(object)      # (legs, summary)
+    sent = Signal(object)         # result dict
+    failed = Signal(str)
+
+    def __init__(self, identity: Any, fraction: float, mode: str,
+                 tif: str = "ioc") -> None:
+        super().__init__()
+        self._identity = identity
+        self._fraction = fraction
+        self._mode = mode
+        self._tif = tif
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            from gui.services.permuto import close_out
+            from gui.services.permuto.client import PermutoClient
+
+            client = PermutoClient(self._identity)
+            client.ensure_session(time.time())
+            now = time.time()
+            try:
+                prices = _default_market_reader().get("prices") or {}
+            except Exception:  # noqa: BLE001 - notional is a nicety
+                prices = {}
+
+            if self._mode == "plan":
+                positions = close_out.read_positions(client, now)
+                legs = (close_out.plan_close(positions, self._fraction)
+                        if positions else [])
+                self.planned.emit((legs, close_out.describe(legs, prices)))
+                return
+
+            self.sent.emit(close_out.close_positions(
+                client, now, self._fraction, tif=self._tif, prices=prices))
+        except Exception as exc:  # noqa: BLE001 - shown, never raised
+            self.failed.emit(str(exc))
+
+
 class PermutoWidget(QWidget):
     """Identity + registration surface for the Permuto perps venue."""
 
@@ -536,6 +585,9 @@ class PermutoWidget(QWidget):
         self._market_reader = market_reader or _default_market_reader
         self._markets_timer: Optional[QTimer] = None
         self._markets_thread: Optional[QThread] = None
+        self._close_thread: Optional[QThread] = None
+        self._close_worker: Optional[QObject] = None
+        self._close_fraction: float = 1.0
         self._markets_worker: Optional[Any] = None
         # [2026-08-31] Target stays SMALL, cap goes wide, and the two are
         # deliberately no longer equal.
@@ -754,8 +806,137 @@ class PermutoWidget(QWidget):
         self._arm_note.setStyleSheet(f"color: {_C.WARNING_YELLOW};")
         layout.addWidget(self._arm_note)
 
+        # -- operator close ------------------------------------------------ #
+        #
+        # The quoting loop sheds inventory as a MAKER only, and risk.py
+        # deliberately reserves crossing the spread to close as an operator
+        # decision. Until this button there was no way to make that decision:
+        # the page offered Create/Restore/Register/Check/Recover/Discard/
+        # Start polling/Start quoting and nothing else. A doctrine that
+        # reserves a choice for a human, in software that gives the human no
+        # control, is not a safeguard -- it is a dead end.
+        close_frame = QFrame()
+        close_frame.setFrameShape(QFrame.HLine)
+        close_frame.setStyleSheet(f"color: {_C.BORDER};")
+        layout.addWidget(close_frame)
+
+        close_title = QLabel("Close position")
+        close_title.setStyleSheet(
+            f"color: {_C.TEXT_PRIMARY}; font-weight: bold;")
+        layout.addWidget(close_title)
+
+        close_blurb = QLabel(
+            "Buys back a short or sells down a long, crossing the spread. "
+            "Every leg is reduce-only, so this can only ever shrink a "
+            "position -- never open or flip one. You will see exactly what "
+            "it intends to send before anything is placed."
+        )
+        close_blurb.setWordWrap(True)
+        close_blurb.setStyleSheet(f"color: {_C.TEXT_SECONDARY};")
+        layout.addWidget(close_blurb)
+
+        close_row = QHBoxLayout()
+        self._close_btns = {}
+        for frac, label in ((0.25, "Close 25%"), (0.50, "Close 50%"),
+                            (1.00, "Close all")):
+            btn = QPushButton(label)
+            btn.clicked.connect(
+                lambda _checked=False, f=frac: self._on_close_clicked(f))
+            close_row.addWidget(btn)
+            self._close_btns[frac] = btn
+        close_row.addStretch(1)
+        layout.addLayout(close_row)
+
+        self._close_note = QLabel("")
+        self._close_note.setWordWrap(True)
+        self._close_note.setStyleSheet(f"color: {_C.TEXT_SECONDARY};")
+        layout.addWidget(self._close_note)
+
         layout.addStretch(1)
         return page
+
+    # -- operator close ---------------------------------------------------- #
+
+    def _set_close_enabled(self, on: bool) -> None:
+        for btn in getattr(self, "_close_btns", {}).values():
+            btn.setEnabled(on)
+
+    def _on_close_clicked(self, fraction: float) -> None:
+        """Phase one: read the venue and show the plan. Sends nothing."""
+        if self._close_thread is not None:
+            return
+        self._set_close_enabled(False)
+        self._close_note.setText("Reading positions from the venue...")
+        self._start_close_worker(fraction, "plan")
+
+    def _start_close_worker(self, fraction: float, mode: str) -> None:
+        thread = QThread(self)
+        worker = _CloseWorker(self._identity_factory(), fraction, mode)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.planned.connect(self._on_close_planned)
+        worker.sent.connect(self._on_close_sent)
+        worker.failed.connect(self._on_close_failed)
+        for sig in (worker.planned, worker.sent, worker.failed):
+            sig.connect(thread.quit)
+        thread.finished.connect(self._on_close_thread_finished)
+        self._close_thread = thread
+        self._close_worker = worker
+        self._close_fraction = fraction
+        thread.start()
+
+    def _on_close_thread_finished(self) -> None:
+        thread, self._close_thread = self._close_thread, None
+        self._close_worker = None
+        if thread is not None:
+            thread.deleteLater()
+
+    @Slot(object)
+    def _on_close_planned(self, payload: Any) -> None:
+        legs, summary = payload
+        self._set_close_enabled(True)
+        if not legs:
+            self._close_note.setText(summary)
+            self._log_activity("Close: nothing to do -- no open positions.")
+            return
+        # The operator confirms against the ACTUAL numbers, not a percentage.
+        box = QMessageBox(self)
+        box.setWindowTitle("Confirm close")
+        box.setIcon(QMessageBox.Warning)
+        box.setText("Send these reduce-only orders to Permuto?")
+        box.setInformativeText(
+            "%s\n\nThey cross the spread (IOC), so they are intended to "
+            "fill immediately at whatever the book offers." % summary)
+        box.setStandardButtons(QMessageBox.Cancel | QMessageBox.Ok)
+        box.setDefaultButton(QMessageBox.Cancel)
+        if box.exec() != QMessageBox.Ok:
+            self._close_note.setText("Cancelled -- nothing was sent.")
+            self._log_activity("Close: cancelled by operator.")
+            return
+        self._set_close_enabled(False)
+        self._close_note.setText("Sending...")
+        self._log_activity("Close: operator confirmed %d leg(s)." % len(legs))
+        self._start_close_worker(self._close_fraction, "send")
+
+    @Slot(object)
+    def _on_close_sent(self, result: Any) -> None:
+        self._set_close_enabled(True)
+        if not result.get("ok"):
+            self._close_note.setText("Failed: %s" % result.get("note", ""))
+            self._log_activity("Close FAILED: %s" % result.get("note", ""))
+            return
+        sent = result.get("sent", 0)
+        note = result.get("note") or ("%d leg(s) sent" % sent)
+        self._close_note.setText(
+            "%s. Check the position on the venue -- a reduce-only IOC can "
+            "part-fill, and this button does not retry." % note)
+        self._log_activity("Close: %s" % note)
+
+    @Slot(str)
+    def _on_close_failed(self, message: str) -> None:
+        self._set_close_enabled(True)
+        self._close_note.setText("Failed: %s" % message)
+        self._log_activity("Close FAILED: %s" % message)
 
     def _build_activity_page(self) -> QWidget:
         page = QWidget()
