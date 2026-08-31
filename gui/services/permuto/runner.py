@@ -69,6 +69,16 @@ _log = logging.getLogger(__name__)
 
 __all__ = ["QuoteRunner", "TickResult"]
 
+#: [BATCHBREAKER] Consecutive unrecognised batch statuses before the loop
+#: stops re-sending every tick. Five is ~25s at a 5s tick: long enough that
+#: a genuine transient heals itself, short enough that a systematic
+#: rejection cannot place hundreds of unacknowledged orders overnight.
+BATCH_FAIL_STREAK_LIMIT = 5
+
+#: How often to probe once the breaker is open. Still self-heals, at 1/min
+#: instead of 12/min.
+BATCH_PROBE_INTERVAL_S = 60.0
+
 
 @dataclass
 class TickResult:
@@ -126,6 +136,14 @@ class QuoteRunner:
         # oversized position into maker-side REDUCE_ONLY quotes through the
         # machinery risk.assess() already has. Nothing here crosses the
         # spread.
+        # [BATCHBREAKER 2026-08-30] Consecutive batch statuses we do not
+        # recognise as acceptance. A repeating rejection used to re-send
+        # the same batch every tick forever -- measured live at ~12 sends
+        # a minute for 5+ minutes, each one placing orders at the venue
+        # that the failure path then declined to record.
+        self._batch_fail_streak = 0
+        self._batch_muted_until_s = 0.0
+        self._curfew_retract_pending = False
         self._curfew_enabled = curfew_enabled
         self._freeze = OracleFreeze()
         self._curfew_stage = None
@@ -294,16 +312,12 @@ class QuoteRunner:
                 # latch the new stage once the retraction actually
                 # succeeded, so a failed cancel is retried next tick rather
                 # than silently skipped.
-                try:
-                    self._client.cancel_all(now_s, list(self._markets))
-                except Exception as exc:  # noqa: BLE001
-                    _log.error("permuto: curfew stage change could not "
-                               "retract the book (%s); retrying next tick",
-                               exc)
-                else:
-                    for market in self._markets:
-                        self._resting[market] = RestingQuote()
-                    self._curfew_stage = curfew.stage
+                # [live 2026-08-30] DEFERRED, not done here: this runs
+                # before ensure_session(), so on the first tick after a
+                # restart the cancel always failed with "needs a session
+                # and none is held". It self-healed a tick later, but the
+                # retraction belongs after the session exists.
+                self._curfew_retract_pending = True
             self._curfew = curfew
 
         paused = bool(flags.get("trading_paused"))
@@ -604,6 +618,23 @@ class QuoteRunner:
         # Not fetching is not the same as fetching and failing. The latter
         # still flattens, because _margin_state() fails closed on a payload it
         # cannot read.
+        # [CURFEW] The deferred stage-change retraction, now that a
+        # session exists. Latched only on success, so a failed cancel is
+        # retried next tick rather than leaving the old book resting under
+        # caps that no longer permit it.
+        if getattr(self, "_curfew_retract_pending", False) and session_ok:
+            try:
+                self._client.cancel_all(now_s, list(self._markets))
+            except Exception as exc:  # noqa: BLE001
+                _log.error("permuto: curfew stage change could not retract "
+                           "the book (%s); retrying next tick", exc)
+            else:
+                for market in self._markets:
+                    self._resting[market] = RestingQuote()
+                self._curfew_retract_pending = False
+                if self._curfew is not None:
+                    self._curfew_stage = self._curfew.stage
+
         risk_by_market: dict = {}
         for market in (self._markets if account_seen else []):
             oracle = oracles.get(market)
@@ -824,6 +855,29 @@ class QuoteRunner:
             return TickResult("risk_blocked",
                               "risk left nothing to place", results)
 
+        # [BATCHBREAKER] A batch that keeps coming back rejected is not a
+        # transient. Re-sending it every 5s does not fix it, and on this
+        # venue each attempt still PLACES legs best-effort -- so the loop
+        # accumulates orders it has decided not to believe in. Past the
+        # streak limit, probe at a bounded rate instead and say so loudly.
+        if self._batch_fail_streak >= BATCH_FAIL_STREAK_LIMIT:
+            if now_s < self._batch_muted_until_s:
+                return TickResult(
+                    "error",
+                    "batch rejected %d times running; probing once per %.0fs "
+                    "instead of re-sending every tick"
+                    % (self._batch_fail_streak, BATCH_PROBE_INTERVAL_S),
+                    results,
+                    error="batch breaker open")
+            self._batch_muted_until_s = now_s + BATCH_PROBE_INTERVAL_S
+            _log.critical(
+                "permuto: batch has been rejected %d times running -- "
+                "probing once now. The venue may be refusing the SHAPE of "
+                "this batch (it accepts legs best-effort even when the "
+                "batch status is a failure), so every attempt can leave "
+                "orders behind. Check open orders at the venue.",
+                self._batch_fail_streak)
+
         payload = build_upsert_batch(legs, oracles, ring_pct=self._ring_pct)
         response = self._client.batch_upsert(payload, now_s)
 
@@ -838,6 +892,14 @@ class QuoteRunner:
         # and reconcile() heals the belief from open_orders next tick.
         if isinstance(response, dict):
             status = str(response.get("status", "")).lower()
+            if status in ("batch_ok", "batch_partial"):
+                if self._batch_fail_streak:
+                    _log.info("permuto: batch accepted again after %d "
+                              "rejection(s)", self._batch_fail_streak)
+                self._batch_fail_streak = 0
+                self._batch_muted_until_s = 0.0
+            else:
+                self._batch_fail_streak += 1
             # [live 2026-08-29] The venue's REAL vocabulary, captured on the
             # first accepted batch: 'batch_partial' (and by symmetry
             # 'batch_ok') with a per-leg results list, plus the note "Batch

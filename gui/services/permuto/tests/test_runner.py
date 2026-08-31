@@ -1285,3 +1285,92 @@ def test_a_disabled_curfew_reports_nothing_rather_than_guessing():
     c = _Client(account=_account(0.0))
     r = _runner(c, curfew_enabled=False)
     assert r.tick(_OVERNIGHT, _ORACLE, {}).curfew == ""
+
+
+# --------------------------------------------------------------------------- #
+# [BATCHBREAKER] A repeating rejection must not re-send forever.
+#
+# Live 2026-08-30: the venue began answering 'batch_failed' while still
+# reporting every leg 'placed' -- it accepts legs best-effort even when the
+# batch status is a failure. The loop treated that as an error, declined to
+# record the orders, and re-sent every 5s: ~12 sends a minute, each leaving
+# orders behind at the venue.
+# --------------------------------------------------------------------------- #
+
+class _RejectingClient(_Client):
+    """Answers with an unrecognised batch status, as the venue really did."""
+
+    def batch_upsert(self, legs, now_s):
+        self.calls.append("batch_upsert")
+        self.last_batch = legs
+        return {"status": "batch_failed",
+                "results": [{"action": "placed", "order_id": 1}]}
+
+
+def _sends(client):
+    return len([x for x in client.calls if x == "batch_upsert"])
+
+
+def test_a_repeating_batch_rejection_stops_re_sending_every_tick():
+    from gui.services.permuto.runner import BATCH_FAIL_STREAK_LIMIT
+    c = _RejectingClient(account=_account(0.0))
+    r = _runner(c, curfew_enabled=False)
+    t = 1.0
+    for _ in range(20):
+        r.tick(t, _ORACLE, {})
+        t += 5.0
+    # Without the breaker this is 20. With it, the streak limit plus at most
+    # one probe per interval across the 100s walked here.
+    assert _sends(c) <= BATCH_FAIL_STREAK_LIMIT + 3, _sends(c)
+    assert _sends(c) >= BATCH_FAIL_STREAK_LIMIT
+
+
+def test_the_breaker_still_probes_so_it_can_heal():
+    from gui.services.permuto.runner import BATCH_PROBE_INTERVAL_S
+    c = _RejectingClient(account=_account(0.0))
+    r = _runner(c, curfew_enabled=False)
+    t = 1.0
+    for _ in range(10):
+        r.tick(t, _ORACLE, {})
+        t += 5.0
+    before = _sends(c)
+    t += BATCH_PROBE_INTERVAL_S + 5.0
+    r.tick(t, _ORACLE, {})
+    assert _sends(c) == before + 1, "the breaker never probes again"
+
+
+def test_an_accepted_batch_clears_the_streak():
+    c = _RejectingClient(account=_account(0.0))
+    r = _runner(c, curfew_enabled=False)
+    t = 1.0
+    for _ in range(3):
+        r.tick(t, _ORACLE, {})
+        t += 5.0
+    assert r._batch_fail_streak == 3
+    c.batch_upsert = lambda legs, now_s: {"status": "batch_ok", "results": []}
+    r.tick(t, _ORACLE, {})
+    assert r._batch_fail_streak == 0
+
+
+def test_the_curfew_retraction_waits_for_a_session():
+    """Live: it ran before ensure_session() and failed every restart with
+    'cancel_all needs a session and none is held'."""
+    c = _Client(account=_account(0.0), session=RenewAction.NO_SESSION)
+    r = _runner(c, curfew_enabled=True)
+    r.tick(_OVERNIGHT, _ORACLE, {})
+    # A cancel may still happen on the withdraw path -- what must never
+    # happen again is one being attempted BEFORE the session exists.
+    if "cancel_all" in c.calls:
+        assert c.calls.index("ensure_session") < c.calls.index("cancel_all")
+    # And the retraction is deferred rather than dropped, so it still runs
+    # once a session is held.
+    assert r._curfew_retract_pending is True, "the retraction was dropped"
+
+
+def test_the_deferred_retraction_runs_once_a_session_exists():
+    c = _Client(account=_account(0.0))
+    r = _runner(c, curfew_enabled=True)
+    r.tick(_OVERNIGHT, _ORACLE, {})
+    assert r._curfew_retract_pending is False, "the retraction never ran"
+    assert "cancel_all" in c.calls
+    assert c.calls.index("ensure_session") < c.calls.index("cancel_all")
