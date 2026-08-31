@@ -446,11 +446,22 @@ def test_a_malformed_account_reads_as_fully_utilised_not_empty():
 
 
 def test_positions_parse_from_a_dict_or_a_list():
+    # [2026-08-31] This test used a list row carrying `size` and NO `side`,
+    # and asserted it equalled the signed dict form. That is precisely the
+    # assumption that hid the phantom-long bug for a whole session: the
+    # dict form is SIGNED, while the venue's list form is an unsigned
+    # magnitude plus a direction. The two agree only when the direction is
+    # actually given.
     as_dict = _margin_state({"positions": {_MKT: 5.0}}, False)
     as_list = _margin_state(
-        {"positions": [{"market": _MKT, "size": 5.0}]}, False
+        {"positions": [{"market": _MKT, "side": "buy", "size": 5.0}]}, False
     )
     assert as_dict.positions[_MKT] == as_list.positions[_MKT] == 5.0
+
+    short = _margin_state(
+        {"positions": [{"market": _MKT, "side": "sell", "size": 5.0}]}, False
+    )
+    assert short.positions[_MKT] == -5.0
 
 
 def test_numeric_strings_are_accepted_and_booleans_are_not():
@@ -1570,11 +1581,21 @@ def test_a_buy_position_parses_as_a_long():
     assert st.positions[_MKT] == 500.0
 
 
-def test_an_absent_side_keeps_the_magnitude_rather_than_guessing():
+def test_an_unorientable_position_fails_closed():
+    # "Keep the magnitude" is "default to long" wearing a modest hat --
+    # the exact assumption that created the phantom long. Unreadable.
+    import math
     from gui.services.permuto.runner import _margin_state
     st = _margin_state(
         _account_rows([{"market": _MKT, "size": "42"}]), False)
-    assert st.positions[_MKT] == 42.0
+    assert math.isnan(st.positions[_MKT])
+
+
+def test_a_flat_row_without_a_side_is_still_flat():
+    from gui.services.permuto.runner import _margin_state
+    st = _margin_state(
+        _account_rows([{"market": _MKT, "size": "0"}]), False)
+    assert st.positions[_MKT] == 0.0
 
 
 def test_a_short_is_reduced_by_BUYING_not_selling():

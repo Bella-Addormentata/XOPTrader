@@ -1359,6 +1359,14 @@ def _margin_state(account: Any, carried: bool) -> MarginState:
                 size = -abs(size)
             elif side in ("buy", "long", "b", "bid"):
                 size = abs(size)
+            elif size != 0.0:
+                # [review] FAIL CLOSED on an unrecognised direction. An
+                # earlier version kept the raw magnitude, which is
+                # "default to long" wearing a modest hat -- the exact
+                # assumption that turned an 812,520 short into a phantom
+                # long. A non-zero size we cannot orient is unreadable
+                # inventory, and assess() already treats that as FLATTEN.
+                size = float("nan")
             positions[market] = size
 
     # [live 2026-08-29] The venue's /exchange/account payload, observed on
