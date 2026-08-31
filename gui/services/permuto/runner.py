@@ -45,7 +45,8 @@ from .client import PermutoNotLinked
 from .orders import Side, quote_ladder
 from .quoting import LoopAction, RestingQuote, VenueView, decide
 from .risk import MarginState, RiskAction, assess, skewed_reference
-from .band_guard import BandGuard
+from .band_guard import VENUE_BAND_PCT, BandGuard
+from .preflight import latest_oracle, preflight_leg_price, stand_down
 from .curfew import OracleFreeze, assess_curfew, permitted_leg_size
 from .session import RenewAction
 
@@ -161,6 +162,7 @@ class QuoteRunner:
         ring_pct: float = 2.0,
         half_spread_pct: float = 0.25,
         quote_when_carried: bool = True,
+        oracle_fetch: Any = None,
     ) -> None:
         self._client = client
         self._markets = list(markets)
@@ -198,6 +200,17 @@ class QuoteRunner:
         # open, whole minutes of batches 400'd because grace-aged reads
         # plus the 2% ring overshot the band while the oracle collapsed.
         self._band_guard = BandGuard()
+        # [PREFLIGHT] Optional callable returning {market: price}, invoked
+        # immediately BEFORE the batch is sent. band_guard anchors to the
+        # tick's read and measures staleness as fetch age -- but age is not
+        # divergence: a 2s-old read is 5% behind when vol collapses 20% a
+        # minute, which is how "Price 0.047 outside band (+/-5% of 0.04423)"
+        # happened with a fresh fetch. Re-reading here shrinks the exposure
+        # to one request's flight time, measured rather than assumed.
+        self._oracle_fetch = oracle_fetch
+        #: Measured duration of the last pre-send fetch: the best estimate
+        #: of how long the NEXT request will take.
+        self._send_latency_s = 0.25
         self._curfew_retract_pending = False
         self._curfew_enabled = curfew_enabled
         self._freeze = OracleFreeze()
@@ -959,7 +972,73 @@ class QuoteRunner:
                 "orders behind. Check open orders at the venue.",
                 self._batch_fail_streak)
 
-        payload = build_upsert_batch(legs, oracles, ring_pct=self._ring_pct)
+        # [PREFLIGHT] Re-anchor to the oracle as it is RIGHT NOW, not as it
+        # was when this tick started pricing. Legs that cannot fit the band
+        # are dropped rather than sent: one out-of-band leg 400s the whole
+        # batch, so dropping is strictly cheaper than the rejection it would
+        # have caused, and its siblings survive.
+        fresh_oracles = None
+        if self._oracle_fetch is not None and legs:
+            t0 = time.perf_counter()
+            try:
+                fetched = self._oracle_fetch()
+                if isinstance(fetched, dict) and fetched:
+                    fresh_oracles = fetched
+            except Exception as exc:  # noqa: BLE001 - the tick read still works
+                _log.debug("permuto: pre-send oracle fetch failed (%s); "
+                           "falling back to the tick's read", exc)
+            else:
+                # EWMA over round trips, so one slow request does not
+                # permanently widen the drift projection.
+                measured = time.perf_counter() - t0
+                self._send_latency_s = (0.7 * self._send_latency_s
+                                        + 0.3 * measured)
+
+        if legs:
+            kept = []
+            for leg in legs:
+                oracle_now = latest_oracle(fresh_oracles, oracles, leg.market)
+                if oracle_now <= 0.0:
+                    kept.append(leg)
+                    continue
+                out = preflight_leg_price(
+                    leg.price, oracle_now,
+                    band_pct=VENUE_BAND_PCT,
+                    latency_s=self._send_latency_s,
+                    velocity_pct_per_s=self._band_guard.velocity(leg.market),
+                    is_buy=leg.side is Side.BUY,
+                    ring_pct=self._ring_pct)
+                if out.dropped:
+                    if leg.market not in results or results[leg.market][0] in (
+                            "quote", "hold"):
+                        results[leg.market] = ("skip", out.reason)
+                    continue
+                if out.changed:
+                    leg = type(leg)(leg.market, leg.side, out.price,
+                                    leg.size, leg.reduce_only)
+                kept.append(leg)
+            dropped = len(legs) - len(kept)
+            if dropped:
+                _log.info("permuto: preflight dropped %d/%d leg(s) the venue "
+                          "band would have refused (latency %.0fms)",
+                          dropped, len(legs), self._send_latency_s * 1000.0)
+            legs = kept
+            if not legs:
+                return TickResult(
+                    "skip",
+                    "every leg would have been refused by the oracle band",
+                    results)
+
+        # [PREFLIGHT] Validate against the SAME reference the venue will
+        # use. Passing the tick's read here rejected our own re-anchored
+        # prices locally -- "0.092925 is outside the band around 0.100000"
+        # -- because the leg had been correctly moved to fit an oracle the
+        # validator had not been told about.
+        send_oracles = dict(oracles or {})
+        if fresh_oracles:
+            send_oracles.update(fresh_oracles)
+        payload = build_upsert_batch(legs, send_oracles,
+                                     ring_pct=self._ring_pct)
         response = self._client.batch_upsert(payload, now_s)
 
         # [release review] "partial" IS HTTP success on this venue, and the

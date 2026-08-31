@@ -1461,3 +1461,53 @@ def test_a_calm_oracle_is_untouched_by_the_guard():
     for leg in c.last_batch:
         dev = abs(float(leg["price"]) / _ORACLE[_MKT] - 1.0) * 100.0
         assert dev <= 2.1
+
+
+# --------------------------------------------------------------------------- #
+# [PREFLIGHT] The runner re-reads the oracle immediately before sending.
+# --------------------------------------------------------------------------- #
+
+def test_a_moved_oracle_re_anchors_legs_before_they_are_sent():
+    """The live case: the tick prices off 0.10, the oracle is 0.09 by send
+    time. Every leg must land inside +/-5% of the FRESH value, not the
+    stale one it was priced against."""
+    c = _Client(account=_account(0.0))
+    fresh = {_MKT: 0.09}
+    r = _runner(c, curfew_enabled=False, oracle_fetch=lambda: fresh)
+    r.tick(_MID_SESSION, {_MKT: 0.10}, {})
+    assert c.last_batch, "expected a batch"
+    for leg in c.last_batch:
+        dev = abs(float(leg["price"]) / 0.09 - 1.0) * 100.0
+        assert dev <= 5.0, "leg %r outside the band of the fresh oracle" % (leg,)
+
+
+def test_a_failed_pre_send_fetch_still_quotes_off_the_tick_read():
+    # A hiccup on the extra request must not cost a quoting cycle.
+    def boom():
+        raise RuntimeError("oracle fetch exploded")
+
+    c = _Client(account=_account(0.0))
+    r = _runner(c, curfew_enabled=False, oracle_fetch=boom)
+    result = r.tick(_MID_SESSION, _ORACLE, {})
+    assert result.action != "error", result.reason
+    assert c.last_batch, "a failed pre-send fetch silenced the loop"
+
+
+def test_no_fetcher_configured_behaves_exactly_as_before():
+    c = _Client(account=_account(0.0))
+    r = _runner(c, curfew_enabled=False)
+    r.tick(_MID_SESSION, _ORACLE, {})
+    assert c.last_batch
+
+
+def test_a_violently_moving_oracle_sends_nothing_rather_than_a_400():
+    # Velocity high enough that projected flight-time drift exceeds the
+    # band: no price is safe, so the batch is skipped with a reason.
+    c = _Client(account=_account(0.0))
+    fresh = {_MKT: 0.070}
+    r = _runner(c, curfew_enabled=False, oracle_fetch=lambda: fresh)
+    r.tick(_MID_SESSION, {_MKT: 0.100}, {})          # -30% in one step
+    r._send_latency_s = 20.0                          # slow link
+    c.last_batch = None
+    r.tick(_MID_SESSION + 5.0, {_MKT: 0.070}, {})
+    assert c.last_batch is None, "sent into a market it cannot price"

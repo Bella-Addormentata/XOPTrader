@@ -72,6 +72,32 @@ class VenueStateUnreadable(RuntimeError):
     """The venue's public state could not be read well enough to quote on."""
 
 
+def _fetch_oracle_prices() -> dict:
+    """{symbol: price} from /info/oracle, or {} on any failure.
+
+    Public and unauthenticated, like the tick's own read. Returns {} rather
+    than raising: the caller treats absence as "use the tick's read", and a
+    hiccup on this extra request must never cost a quoting cycle.
+    """
+    from gui.services.permuto.auth import _request
+
+    doc = _request("GET", "/info/oracle", timeout=REQUEST_TIMEOUT_S) or {}
+    prices = doc.get("prices")
+    if not isinstance(prices, dict):
+        return {}
+    out = {}
+    for symbol in MARKETS:
+        value = prices.get(symbol.replace("-PERP", ""))
+        if isinstance(value, (int, float, str)):
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(parsed) and parsed > 0.0:
+                out[symbol] = parsed
+    return out
+
+
 def _default_venue_state() -> dict:
     """Oracle prices and pause flags, from the public routes.
 
@@ -345,6 +371,10 @@ class PermutoLive(QObject):
             target_depth_usd=target_depth_usd,
             max_position_usd=max_position_usd,
             curfew_enabled=curfew_enabled,
+            # [PREFLIGHT] The runner re-reads the oracle immediately before
+            # sending, so leg prices are judged against the value the venue
+            # will actually compare them to rather than one a tick older.
+            oracle_fetch=_fetch_oracle_prices,
         )
         self._venue_state = venue_state or _default_venue_state
         self._thread: Optional[QThread] = None
