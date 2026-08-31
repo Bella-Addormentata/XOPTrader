@@ -985,7 +985,6 @@ class QuoteRunner:
         # size after re-pricing. Two passes that must agree should not be
         # two pieces of code.
         send_refs = {}
-        preflight_cancel = set()
 
         def _fetch_refs():
             # (prices, elapsed). {} on failure -- and the elapsed time is
