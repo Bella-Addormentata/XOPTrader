@@ -222,3 +222,18 @@ def test_headroom_tick_reservation_holds_across_representative_domain():
         assert pct_from_oracle <= ring + 1e-9, (
             "skew %.4f%%: quantised ask %.4f%% from oracle, outside ring"
             % (skew * 100.0, pct_from_oracle))
+
+def test_reserving_the_tick_only_ever_tightens():
+    """Monotonicity. A reserve that could LOOSEN the bound would be worse
+    than none: it would hand back room the rounding is about to consume."""
+    plain = headroom_pct(2.0, 0.25, 0.0096)
+    reserved = headroom_pct(2.0, 0.25, 0.0096, tick_size_frac=0.0001 / 0.15)
+    assert reserved < plain
+
+
+def test_a_tick_coarser_than_the_ring_leaves_no_room_at_all():
+    """The degenerate market. If one tick is wider than the credit ring,
+    there is no on-grid price inside it and the honest answer is zero --
+    not a negative that would invert the retreat into an advance."""
+    assert headroom_pct(2.0, 0.25, 0.0, tick_size_frac=0.5) == 0.0
+    assert headroom_pct(2.0, 0.25, 0.0, tick_size_frac=0.02) == 0.0
