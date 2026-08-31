@@ -1447,19 +1447,53 @@ def test_an_explicit_rejection_is_believed_over_its_legs():
 # --------------------------------------------------------------------------- #
 
 def test_a_collapsing_oracle_still_produces_an_in_band_batch():
+    """A fast oracle must not push our legs out of the venue band.
+
+    [review round 3] This test used to guard its assertion behind
+    `if c.last_batch:`. Removing the guard exposed that no batch was
+    being sent at all -- the third tick HELD, because the quote placed
+    on the second tick was still fresh and in-ring, so decide() rightly
+    declined to touch it and the assertion loop iterated over nothing.
+    The fix is to clear the resting book so a re-quote genuinely happens.
+    """
     c = _Client(account=_account(0.0))
     r = _runner(c, curfew_enabled=False)
     # Establish a fast decay: ~0.5%/s across two ticks.
     r.tick(_MID_SESSION, {_MKT: 0.100}, {})
     r.tick(_MID_SESSION + 5.0, {_MKT: 0.0975}, {})
+    assert r._band_guard.velocity(_MKT) > 0.0, "no velocity: test is inert"
     c.last_batch = None
-    # A grace-aged read: same oracle value, but flagged 10s old.
-    r.tick(_MID_SESSION + 10.0, {_MKT: 0.0975},
-           {"oracle_age_s": 10.0})
-    if c.last_batch:
-        for leg in c.last_batch:
-            dev = abs(float(leg["price"]) / 0.0975 - 1.0) * 100.0
-            assert dev <= 5.0, "leg %r is outside the venue band" % (leg,)
+    r._resting = {}
+    r.tick(_MID_SESSION + 10.0, {_MKT: 0.0975}, {"oracle_age_s": 2.0})
+    assert c.last_batch, "no batch was sent; the assertion never ran"
+    for leg in c.last_batch:
+        dev = abs(float(leg["price"]) / 0.0975 - 1.0) * 100.0
+        assert dev <= 5.0, "leg %r is outside the venue band" % (leg,)
+
+
+def test_a_collapse_faster_than_the_band_stands_the_market_down():
+    """When drift exceeds the band there is no safe price -- send nothing.
+
+    [review round 3] The sibling test above was written as though a fast
+    oracle is always survivable by clamping. It is not. At 0.5%/s a read
+    10s stale has already drifted 5%, which is the WHOLE venue band, so
+    the clamp window closes and the only correct action is to stand the
+    market down. Asserting that explicitly stops a future change from
+    turning a stand-down into a silently-empty batch and calling it a
+    pass.
+    """
+    c = _Client(account=_account(0.0))
+    r = _runner(c, curfew_enabled=False)
+    r.tick(_MID_SESSION, {_MKT: 0.100}, {})
+    r.tick(_MID_SESSION + 5.0, {_MKT: 0.0975}, {})
+    c.last_batch = None
+    r._resting = {}
+    res = r.tick(_MID_SESSION + 10.0, {_MKT: 0.0975},
+                 {"oracle_age_s": 10.0})
+    assert not c.last_batch, "sent a batch the band cannot accommodate"
+    action, reason = res.markets[_MKT]
+    assert action == "skip", res.markets
+    assert "too fast" in reason, reason
 
 
 def test_a_calm_oracle_is_untouched_by_the_guard():
@@ -1626,10 +1660,15 @@ def test_a_market_spec_tick_is_used_when_repricing():
     r = _runner(c, curfew_enabled=False, oracle_fetch=lambda: {_MKT: 0.09})
     r.tick(_MID_SESSION, {_MKT: 0.10},
            {"specs": {_MKT: {"tick_size": 0.01, "lot_size": 1.0}}})
-    if c.last_batch:
-        for leg in c.last_batch:
-            ticks = float(leg["price"]) / 0.01
-            assert abs(round(ticks) - ticks) < 1e-6,                 "leg %r ignores the market's 0.01 tick" % (leg,)
+    # [review round 3] Unconditional. A `if c.last_batch:` guard
+    # lets this pass on an EMPTY batch -- one of the very failures
+    # it exists to catch. A test that cannot fail reports coverage
+    # that is not there.
+    assert c.last_batch, "no batch was sent; the assertion never ran"
+    for leg in c.last_batch:
+        ticks = float(leg["price"]) / 0.01
+        assert abs(round(ticks) - ticks) < 1e-6, (
+            "leg %r ignores the market's 0.01 tick" % (leg,))
 
 
 def test_survivors_are_re_priced_after_a_cancel_round_trip():
@@ -1645,8 +1684,22 @@ def test_survivors_are_re_priced_after_a_cancel_round_trip():
 
     c = _Client(account=_account(0.0))
     r = _runner2(c, curfew_enabled=False, oracle_fetch=fetch)
-    r._send_latency_s = 30.0          # force a drop on one market
-    r.tick(_MID_SESSION, {_MKT: 0.10, _MKT2: 0.20}, {})
-    # A drop happened -> cancel -> a SECOND oracle read for the survivors.
-    if "cancel_all" in c.calls:
-        assert len(reads) >= 2, "survivors were not re-read after the cancel"
+    # [review round 3] This test used to guard its assertions behind
+    # `if "cancel_all" in c.calls:`. With a fresh runner the band guard
+    # has ZERO velocity, so no leg was ever dropped, no cancel happened,
+    # and the test passed without exercising the path it is named for. A
+    # test that cannot fail reports coverage that does not exist.
+    #
+    # Establish a real velocity first -- two samples, -50% over 5s -- so
+    # the stand-down actually triggers, then assert unconditionally.
+    r._band_guard.observe(_MID_SESSION, {_MKT: 0.100, _MKT2: 0.200})
+    r._band_guard.observe(_MID_SESSION + 5.0, {_MKT: 0.050, _MKT2: 0.200})
+    assert r._band_guard.velocity(_MKT) > 0.0, "no velocity: test is inert"
+    r._send_latency_s = 30.0          # guarantees stand-down on _MKT
+
+    c.calls.clear()
+    reads.clear()
+    r.tick(_MID_SESSION + 10.0, {_MKT: 0.050, _MKT2: 0.200}, {})
+
+    assert "cancel_all" in c.calls, "the unsafe market was never retracted"
+    assert len(reads) >= 2, "survivors were not re-read after the cancel"

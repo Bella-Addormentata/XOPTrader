@@ -973,158 +973,151 @@ class QuoteRunner:
                 "orders behind. Check open orders at the venue.",
                 self._batch_fail_streak)
 
-        # [PREFLIGHT] Re-anchor to the oracle as it is RIGHT NOW, not as it
-        # was when this tick started pricing. Legs that cannot fit the band
-        # are dropped rather than sent: one out-of-band leg 400s the whole
-        # batch, so dropping is strictly cheaper than the rejection it would
-        # have caused, and its siblings survive.
-        fresh_oracles = None
-        if self._oracle_fetch is not None and legs:
+        # [PREFLIGHT] Re-anchor to the oracle as it is RIGHT NOW, not as
+        # it was when this tick started pricing. One out-of-band leg 400s
+        # the WHOLE batch, so a leg we decline to send is strictly cheaper
+        # than the rejection it would have caused.
+        #
+        # [review round 3] The first pass and the post-cancel second pass
+        # now share ONE helper. They were separate code and the copy
+        # drifted immediately: the second pass quantised at the default
+        # tick instead of the market published one, and kept the original
+        # size after re-pricing. Two passes that must agree should not be
+        # two pieces of code.
+        send_refs = {}
+        preflight_cancel = set()
+
+        def _fetch_refs():
+            # (prices, elapsed). {} on failure -- and the elapsed time is
+            # folded into the latency estimate either way.
+            #
+            # [review] A failed fetch can burn the whole request timeout.
+            # The earlier version left _send_latency_s untouched on that
+            # path and then priced off the OLDER tick oracle, so preflight
+            # ignored a delay it had just incurred -- exactly when the
+            # market is moving fast enough to make the fetch slow.
             t0 = time.perf_counter()
             try:
-                fetched = self._oracle_fetch()
-                if isinstance(fetched, dict) and fetched:
-                    fresh_oracles = fetched
-            except Exception as exc:  # noqa: BLE001 - the tick read still works
-                _log.debug("permuto: pre-send oracle fetch failed (%s); "
-                           "falling back to the tick's read", exc)
-            else:
-                # EWMA over round trips, so one slow request does not
-                # permanently widen the drift projection.
-                measured = time.perf_counter() - t0
-                self._send_latency_s = (0.7 * self._send_latency_s
-                                        + 0.3 * measured)
+                got = self._oracle_fetch()
+            except Exception as exc:  # noqa: BLE001
+                _log.debug("permuto: pre-send oracle fetch failed (%s)", exc)
+                got = None
+            elapsed = time.perf_counter() - t0
+            self._send_latency_s = (0.7 * self._send_latency_s
+                                    + 0.3 * elapsed)
+            return (got if isinstance(got, dict) and got else {}), elapsed
 
-        if legs:
-            kept = []
-            send_refs: dict = {}
-            preflight_cancel: set = set()
-            for leg in legs:
-                oracle_now = latest_oracle(fresh_oracles, oracles, leg.market)
-                if oracle_now <= 0.0:
-                    kept.append(leg)
+        def _prepare(pending, sources):
+            # Re-anchor legs against `sources`, newest reference first.
+            # Returns (kept, dropped_markets).
+            #
+            # EVERY retained leg is quantised on its own market grid, not
+            # only the ones this pass re-priced: an earlier band-guard
+            # clamp can already have left an off-grid boundary, and
+            # build_upsert_batch does not validate tick alignment.
+            kept_legs, dropped = [], set()
+            for leg in pending:
+                ref = 0.0
+                for src in sources:
+                    ref = latest_oracle(src, None, leg.market)
+                    if ref > 0.0:
+                        break
+                if ref <= 0.0:
+                    kept_legs.append(leg)
                     continue
+
+                raw_specs = flags.get("specs")
+                mspec = (raw_specs.get(leg.market, {})
+                         if isinstance(raw_specs, dict) else {})
+                m_tick = float(mspec.get("tick_size", 0.0001) or 0.0001)
+                m_lot = float(mspec.get("lot_size", 1.0) or 1.0)
+
                 out = preflight_leg_price(
-                    leg.price, oracle_now,
+                    leg.price, ref,
                     band_pct=VENUE_BAND_PCT,
                     latency_s=self._send_latency_s,
                     velocity_pct_per_s=self._band_guard.velocity(leg.market),
                     is_buy=leg.side is Side.BUY,
                     ring_pct=self._ring_pct)
                 if out.dropped:
-                    if leg.market not in results or results[leg.market][0] in (
-                            "quote", "hold"):
-                        results[leg.market] = ("skip", out.reason)
-                    # [review] Omitting a leg from an upsert does NOT retract
-                    # the quote already resting for that (market, side) --
-                    # the venue keeps it. So a stand-down would leave the old
-                    # book live at prices preflight has just judged unsafe,
-                    # which is the opposite of standing down. Retract it.
-                    preflight_cancel.add(leg.market)
+                    results[leg.market] = ("skip", out.reason)
+                    dropped.add(leg.market)
                     continue
-                if out.changed:
-                    # ON the venue grid, and re-sized so re-pricing does not
-                    # quietly change the notional (see rescaled_size).
-                    #
-                    # [review round 2] Use THIS market's published spec, the
-                    # same one quote_ladder was built with. Hardcoding
-                    # 0.0001/1.0 would silently turn a valid ladder leg into
-                    # an off-grid price or a fractional lot on any market
-                    # whose metadata differs.
-                    raw_specs = flags.get("specs")
-                    mspec = (raw_specs.get(leg.market, {})
-                             if isinstance(raw_specs, dict) else {})
-                    m_tick = float(mspec.get("tick_size", 0.0001) or 0.0001)
-                    m_lot = float(mspec.get("lot_size", 1.0) or 1.0)
-                    new_price = quantise_toward(out.price, oracle_now, m_tick)
-                    if new_price <= 0.0:
-                        # No legal grid point between our price and the
-                        # anchor: there is nothing safe to send here.
-                        results[leg.market] = (
-                            "skip", "no on-grid price inside the band")
-                        preflight_cancel.add(leg.market)
-                        continue
-                    new_size = rescaled_size(leg.size, leg.price, new_price,
-                                             m_lot)
-                    if new_size <= 0.0:
-                        preflight_cancel.add(leg.market)
-                        continue
-                    leg = type(leg)(leg.market, leg.side, new_price,
-                                    new_size, leg.reduce_only)
-                # [review] The validator must see the SAME per-leg reference
-                # preflight used -- not a raw merge of a fetch that may carry
-                # junk for some market. latest_oracle already vetted this one.
-                send_refs[leg.market] = oracle_now
-                kept.append(leg)
-            dropped = len(legs) - len(kept)
-            if dropped:
-                _log.info("permuto: preflight dropped %d/%d leg(s) the venue "
-                          "band would have refused (latency %.0fms)",
-                          dropped, len(legs), self._send_latency_s * 1000.0)
-            legs = kept
-            # Retract anything preflight refused to replace.
-            #
-            # [review round 2] The cancel is an authenticated round trip
-            # sitting between the "fresh" read and the send, so every
-            # SURVIVING leg ages through it while its drift budget models
-            # only one request -- reintroducing exactly the band rejection
-            # this preflight exists to prevent. So: cancel first, then take
-            # a NEW reading and re-price the survivors against it. The
-            # extra fetch only happens on the tick where something was
-            # actually dropped, which is rare.
+
+                price = quantise_toward(
+                    out.price if out.changed else leg.price, ref, m_tick)
+                if price <= 0.0:
+                    results[leg.market] = (
+                        "skip", "no on-grid price inside the band")
+                    dropped.add(leg.market)
+                    continue
+                size = (rescaled_size(leg.size, leg.price, price, m_lot)
+                        if price != leg.price else leg.size)
+                if size <= 0.0:
+                    results[leg.market] = ("skip", "size rounds to nothing")
+                    dropped.add(leg.market)
+                    continue
+                if price != leg.price or size != leg.size:
+                    leg = type(leg)(leg.market, leg.side, price, size,
+                                    leg.reduce_only)
+                send_refs[leg.market] = ref
+                kept_legs.append(leg)
+            return kept_legs, dropped
+
+        def _retract(markets, note):
+            # True when the book is safe to build on. A failed retraction
+            # leaves an unsafe quote resting, and sending siblings beside
+            # it is the state stand-down exists to prevent.
+            try:
+                self._client.cancel_all(now_s, sorted(markets))
+            except Exception as exc:  # noqa: BLE001
+                _log.warning("permuto: could not retract %s (%s): %s",
+                             sorted(markets), note, exc)
+                return False
+            for market in markets:
+                self._resting[market] = RestingQuote()
+            return True
+
+        fresh_oracles = {}
+        if self._oracle_fetch is not None and legs:
+            fresh_oracles, _ = _fetch_refs()
+            legs, preflight_cancel = _prepare(legs, (fresh_oracles, oracles))
+
             if preflight_cancel:
-                try:
-                    self._client.cancel_all(now_s, sorted(preflight_cancel))
-                except Exception as exc:  # noqa: BLE001
-                    _log.warning("permuto: could not retract %s after a "
-                                 "preflight drop (%s)",
-                                 sorted(preflight_cancel), exc)
-                else:
-                    for market in preflight_cancel:
-                        self._resting[market] = RestingQuote()
-                if legs and self._oracle_fetch is not None:
-                    try:
-                        again = self._oracle_fetch()
-                    except Exception:  # noqa: BLE001
-                        again = None
-                    if isinstance(again, dict) and again:
-                        refreshed = []
-                        for leg in legs:
-                            ref = latest_oracle(again, oracles, leg.market)
-                            if ref <= 0.0:
-                                refreshed.append(leg)
-                                continue
-                            out2 = preflight_leg_price(
-                                leg.price, ref,
-                                band_pct=VENUE_BAND_PCT,
-                                latency_s=self._send_latency_s,
-                                velocity_pct_per_s=(
-                                    self._band_guard.velocity(leg.market)),
-                                is_buy=leg.side is Side.BUY,
-                                ring_pct=self._ring_pct)
-                            if out2.dropped:
-                                continue
-                            price2 = out2.price if out2.changed else leg.price
-                            if out2.changed:
-                                price2 = quantise_toward(price2, ref)
-                                if price2 <= 0.0:
-                                    continue
-                                leg = type(leg)(leg.market, leg.side, price2,
-                                                leg.size, leg.reduce_only)
-                            send_refs[leg.market] = ref
-                            refreshed.append(leg)
-                        legs = refreshed
+                if not _retract(preflight_cancel, "first pass"):
+                    return TickResult(
+                        "skip",
+                        "unsafe quote still resting; retraction failed",
+                        results)
+
+                # That cancel was an authenticated round trip, so the
+                # survivors have aged. Re-read and re-price them. If the
+                # read is unavailable we do NOT fall back to pre-cancel
+                # references -- that is the very ageing this exists to
+                # avoid.
+                if legs:
+                    again, _ = _fetch_refs()
+                    if not again:
+                        return TickResult(
+                            "skip",
+                            "post-cancel oracle read unavailable; not "
+                            "sending on pre-cancel prices",
+                            results)
+                    # Newest first: second read, first pre-send read, tick.
+                    legs, dropped2 = _prepare(
+                        legs, (again, fresh_oracles, oracles))
+                    if dropped2 and not _retract(dropped2, "second pass"):
+                        return TickResult(
+                            "skip",
+                            "unsafe quote still resting after the second "
+                            "pass", results)
+
             if not legs:
                 return TickResult(
                     "skip",
                     "every leg would have been refused by the oracle band",
                     results)
 
-        # [PREFLIGHT] Validate against the SAME reference the venue will
-        # use. Passing the tick's read here rejected our own re-anchored
-        # prices locally -- "0.092925 is outside the band around 0.100000"
-        # -- because the leg had been correctly moved to fit an oracle the
-        # validator had not been told about.
         send_oracles = dict(oracles or {})
         # Only the per-leg references preflight actually validated, never a
         # raw merge: a fetch carrying a junk value for one market would
