@@ -133,14 +133,106 @@ def describe(legs: list, prices: Optional[dict] = None) -> str:
     return "\n".join(lines)
 
 
+def send_close(client: Any, now_s: float, approved_legs: list, *,
+               tif: str = "ioc") -> dict:
+    """Send ``approved_legs`` via :meth:`~PermutoClient.place_order`, clamped
+    against a fresh venue read so the actual order never exceeds what the
+    operator approved.
+
+    Each leg is sent as a separate ``/exchange/order`` with ``reduce_only``
+    and the requested ``tif``.  ``batch_upsert`` is for GTC/ALO resting
+    quotes; IOC and market orders must use the single-order route.
+
+    Clamping rules (per market):
+    * If the fresh venue position has the opposite sign from the approved
+      leg, the position already flipped -- skip it rather than send a
+      new-direction order.
+    * If the fresh venue position is smaller than the approved size, use
+      the fresh size (never send more than what the venue says is there).
+    * If the fresh venue position is zero, skip (already flat).
+
+    Never raises for a venue-side refusal: a refusal is information the
+    operator needs on screen, not a traceback in a log they are not
+    reading.
+    """
+    if not approved_legs:
+        return {"ok": True, "sent": 0, "note": "no legs to send", "legs": []}
+
+    fresh = read_positions(client, now_s)
+
+    to_send: list = []
+    skipped: list = []
+    for leg in approved_legs:
+        market = leg["market"]
+        approved_side = leg["side"]
+        approved_size = float(leg["size"])
+
+        fresh_signed = fresh.get(market, 0.0)
+        if fresh_signed == 0.0:
+            skipped.append(market + "(already flat)")
+            continue
+        # Check the approved side still matches the fresh sign.
+        # A short (negative) needs a BUY; a long (positive) needs a SELL.
+        expected_side = "buy" if fresh_signed < 0 else "sell"
+        if approved_side != expected_side:
+            # The position flipped between plan and send. Sending the
+            # original direction would OPEN a new position. Skip it.
+            skipped.append(market + "(position flipped)")
+            continue
+        size = min(approved_size, abs(fresh_signed))
+        if size <= 0.0:
+            skipped.append(market + "(zero after clamp)")
+            continue
+        to_send.append({
+            "market": market,
+            "side": approved_side,
+            "size": size,
+            "tif": tif,
+            "reduce_only": True,
+        })
+
+    if skipped:
+        _log.warning("permuto: operator close -- skipped legs: %s",
+                     ", ".join(skipped))
+    if not to_send:
+        return {"ok": True, "sent": 0,
+                "note": "no legs remain after clamping to fresh positions",
+                "legs": approved_legs}
+
+    _log.warning(
+        "permuto: OPERATOR CLOSE -- %d leg(s), tif=%s:\n%s",
+        len(to_send), tif, describe(to_send))
+
+    responses: list = []
+    failed: list = []
+    for leg in to_send:
+        try:
+            resp = client.place_order(leg, now_s)
+            responses.append(resp)
+        except Exception as exc:  # noqa: BLE001 - shown, not raised
+            _log.error("permuto: operator close leg %s failed: %s",
+                       leg["market"], exc)
+            failed.append("%s: %s" % (leg["market"], exc))
+
+    sent = len(to_send) - len(failed)
+    if failed:
+        return {"ok": False, "sent": sent,
+                "note": "partial: %s" % "; ".join(failed),
+                "legs": to_send, "responses": responses}
+    return {"ok": True, "sent": sent, "note": "",
+            "legs": to_send, "responses": responses}
+
+
 def close_positions(client: Any, now_s: float, fraction: float, *,
                     tif: str = "ioc", lot_sizes: Optional[dict] = None,
                     prices: Optional[dict] = None) -> dict:
     """Read, plan, send. Returns a result dict for the UI to display.
 
-    Never raises for a venue-side refusal: a refusal is information the
-    operator needs on screen, not a traceback in a log they are not
-    reading.
+    .. deprecated::
+        Prefer :func:`plan_close` (to build and show the plan) followed by
+        :func:`send_close` (to execute it against a fresh position read),
+        so the operator approves the concrete plan before anything is sent.
+        This combined form is retained for backward compatibility only.
     """
     positions = read_positions(client, now_s)
     if not positions:
@@ -152,16 +244,4 @@ def close_positions(client: Any, now_s: float, fraction: float, *,
         return {"ok": True, "sent": 0,
                 "note": "every close rounded below one lot", "legs": []}
 
-    payload = [{"market": leg["market"], "side": leg["side"],
-                "size": leg["size"], "tif": tif, "reduce_only": True}
-               for leg in legs]
-    _log.warning(
-        "permuto: OPERATOR CLOSE -- %d leg(s), fraction %.0f%%, tif=%s:\n%s",
-        len(payload), fraction * 100.0, tif, describe(legs, prices))
-    try:
-        response = client.batch_upsert(payload, now_s)
-    except Exception as exc:  # noqa: BLE001 - shown, not raised
-        _log.error("permuto: operator close failed: %s", exc)
-        return {"ok": False, "sent": 0, "note": str(exc), "legs": legs}
-    return {"ok": True, "sent": len(payload), "note": "",
-            "legs": legs, "response": response}
+    return send_close(client, now_s, legs, tif=tif)

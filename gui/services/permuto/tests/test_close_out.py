@@ -3,24 +3,24 @@
 import pytest
 
 from gui.services.permuto.close_out import (
-    close_positions, describe, plan_close, read_positions,
+    close_positions, describe, plan_close, read_positions, send_close,
 )
 
 
 class _Client:
     def __init__(self, payload, fail=False):
         self.payload = payload
-        self.sent = None
+        self.sent = []
         self.fail = fail
 
     def account(self, now_s):
         return self.payload
 
-    def batch_upsert(self, legs, now_s):
+    def place_order(self, leg, now_s):
         if self.fail:
             raise RuntimeError("venue said no")
-        self.sent = legs
-        return {"status": "batch_ok"}
+        self.sent.append(leg)
+        return {"status": "ok"}
 
 
 def _pos(market, side, size):
@@ -100,12 +100,13 @@ def test_a_flat_market_produces_no_leg():
 
 
 # --------------------------------------------------------------------------- #
-# sending
+# sending via send_close -- each leg goes through place_order not batch_upsert
 # --------------------------------------------------------------------------- #
 
 def test_it_sends_reduce_only_ioc_legs():
     c = _Client({"positions": [_pos("QQQ-VOL-PERP", "sell", 100)]})
-    res = close_positions(c, 0.0, 1.0)
+    legs = plan_close({"QQQ-VOL-PERP": -100.0}, 1.0)
+    res = send_close(c, 0.0, legs)
     assert res["ok"] and res["sent"] == 1
     leg = c.sent[0]
     assert leg["side"] == "buy" and leg["reduce_only"] is True
@@ -114,14 +115,42 @@ def test_it_sends_reduce_only_ioc_legs():
 
 def test_a_patient_close_can_ask_for_alo():
     c = _Client({"positions": [_pos("QQQ-VOL-PERP", "sell", 100)]})
-    close_positions(c, 0.0, 1.0, tif="alo")
+    legs = plan_close({"QQQ-VOL-PERP": -100.0}, 1.0)
+    send_close(c, 0.0, legs, tif="alo")
     assert c.sent[0]["tif"] == "alo"
+
+
+def test_send_clamps_to_fresh_position_if_smaller():
+    """If the position shrank between plan and send, send the fresh size."""
+    c = _Client({"positions": [_pos("QQQ-VOL-PERP", "sell", 40)]})
+    legs = plan_close({"QQQ-VOL-PERP": -100.0}, 1.0)  # planned for 100
+    res = send_close(c, 0.0, legs)
+    assert res["ok"] and res["sent"] == 1
+    assert c.sent[0]["size"] == 40.0  # clamped to fresh 40, not planned 100
+
+
+def test_send_skips_a_leg_when_position_flipped():
+    """If the position went from short to long between plan and send, the
+    original BUY direction would grow the long -- skip it entirely."""
+    c = _Client({"positions": [_pos("QQQ-VOL-PERP", "buy", 50)]})
+    legs = [{"market": "QQQ-VOL-PERP", "side": "buy",
+             "size": 100.0, "reduce_only": True}]  # planned to close short
+    res = send_close(c, 0.0, legs)
+    assert res["sent"] == 0 and not c.sent
+
+
+def test_send_skips_a_leg_when_already_flat():
+    """A position that closed before the operator confirmed: skip cleanly."""
+    c = _Client({"positions": []})
+    legs = plan_close({"QQQ-VOL-PERP": -100.0}, 1.0)
+    res = send_close(c, 0.0, legs)
+    assert res["ok"] and res["sent"] == 0 and not c.sent
 
 
 def test_no_positions_sends_nothing():
     c = _Client({"positions": []})
     res = close_positions(c, 0.0, 1.0)
-    assert res["ok"] and res["sent"] == 0 and c.sent is None
+    assert res["ok"] and res["sent"] == 0 and not c.sent
 
 
 def test_a_venue_refusal_is_reported_not_raised():

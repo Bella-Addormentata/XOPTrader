@@ -68,12 +68,16 @@ def test_confirming_the_dialog_sends(widget, monkeypatch):
     started = {}
     monkeypatch.setattr(
         widget, "_start_close_worker",
-        lambda frac, mode: started.update(frac=frac, mode=mode))
+        lambda frac, mode, **kw: started.update(
+            frac=frac, mode=mode, legs=kw.get("approved_legs")))
     widget._close_fraction = 0.5
     legs = [{"market": "QQQ-VOL-PERP", "side": "buy", "size": 100.0,
              "reduce_only": True}]
     widget._on_close_planned((legs, "  QQQ-VOL-PERP BUY 100"))
-    assert started == {"frac": 0.5, "mode": "send"}
+    assert started["frac"] == 0.5
+    assert started["mode"] == "send"
+    assert started["legs"] == legs, \
+        "the confirmed legs must be forwarded so send cannot exceed the plan"
 
 
 def test_a_venue_refusal_is_shown_not_swallowed(widget):

@@ -393,6 +393,19 @@ class PermutoClient:
                 "POST", "/exchange/batch_upsert",
                 {"orders": list(legs)}, now_s)
 
+    def place_order(self, leg: dict, now_s: float) -> Any:
+        """POST a single order to ``/exchange/order``.
+
+        Used for reduce-only IOC and ALO close legs -- ``batch_upsert`` is
+        GTC/ALO quotes only; IOC and market orders must go through this
+        route per the API reference.
+
+        The caller is responsible for building the payload (market, side,
+        size, tif, reduce_only, and optionally order_type / price).
+        """
+        return self._retry_once_on_401(
+            "POST", "/exchange/order", dict(leg), now_s)
+
     def account(self, now_s: float) -> Any:
         """Equity, used margin and positions, for :mod:`risk`."""
         return self._retry_once_on_401("POST", "/exchange/account", {}, now_s)

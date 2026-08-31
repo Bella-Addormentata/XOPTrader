@@ -515,6 +515,11 @@ class _CloseWorker(QObject):
     contracts and notional, per market -- before anything is sent. A
     one-shot button that reports what it did afterwards is not a decision,
     it is a surprise.
+
+    In send mode the worker receives the legs that were already approved by
+    the operator.  It re-reads the fresh venue position and clamps each leg
+    to it before sending, so the actual order can never exceed or differ
+    from what was confirmed on screen.
     """
 
     planned = Signal(object)      # (legs, summary)
@@ -522,12 +527,14 @@ class _CloseWorker(QObject):
     failed = Signal(str)
 
     def __init__(self, identity: Any, fraction: float, mode: str,
-                 tif: str = "ioc") -> None:
+                 tif: str = "ioc",
+                 approved_legs: Optional[list] = None) -> None:
         super().__init__()
         self._identity = identity
         self._fraction = fraction
         self._mode = mode
         self._tif = tif
+        self._approved_legs: list = approved_legs or []
 
     @Slot()
     def run(self) -> None:
@@ -535,23 +542,30 @@ class _CloseWorker(QObject):
             from gui.services.permuto import close_out
             from gui.services.permuto.client import PermutoClient
 
-            client = PermutoClient(self._identity)
+            user_id = ""
+            try:
+                user_id = getattr(self._identity.info(), "user_id", "") or ""
+            except Exception:  # noqa: BLE001 - unregistered identity has none
+                pass
+            client = PermutoClient(self._identity, user_id=user_id)
             client.ensure_session(time.time())
             now = time.time()
-            try:
-                prices = _default_market_reader().get("prices") or {}
-            except Exception:  # noqa: BLE001 - notional is a nicety
-                prices = {}
 
             if self._mode == "plan":
+                try:
+                    prices = _default_market_reader().get("prices") or {}
+                except Exception:  # noqa: BLE001 - notional is a nicety
+                    prices = {}
                 positions = close_out.read_positions(client, now)
                 legs = (close_out.plan_close(positions, self._fraction)
                         if positions else [])
                 self.planned.emit((legs, close_out.describe(legs, prices)))
                 return
 
-            self.sent.emit(close_out.close_positions(
-                client, now, self._fraction, tif=self._tif, prices=prices))
+            # send mode: use the operator-approved legs, clamped against a
+            # fresh read -- not a new plan computed from scratch.
+            self.sent.emit(close_out.send_close(
+                client, now, self._approved_legs, tif=self._tif))
         except Exception as exc:  # noqa: BLE001 - shown, never raised
             self.failed.emit(str(exc))
 
@@ -869,9 +883,11 @@ class PermutoWidget(QWidget):
         self._close_note.setText("Reading positions from the venue...")
         self._start_close_worker(fraction, "plan")
 
-    def _start_close_worker(self, fraction: float, mode: str) -> None:
+    def _start_close_worker(self, fraction: float, mode: str,
+                            approved_legs: Optional[list] = None) -> None:
         thread = QThread(self)
-        worker = _CloseWorker(self._identity_factory(), fraction, mode)
+        worker = _CloseWorker(self._identity_factory(), fraction, mode,
+                              approved_legs=approved_legs)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.planned.connect(self._on_close_planned)
@@ -916,7 +932,8 @@ class PermutoWidget(QWidget):
         self._set_close_enabled(False)
         self._close_note.setText("Sending...")
         self._log_activity("Close: operator confirmed %d leg(s)." % len(legs))
-        self._start_close_worker(self._close_fraction, "send")
+        self._start_close_worker(self._close_fraction, "send",
+                                 approved_legs=legs)
 
     @Slot(object)
     def _on_close_sent(self, result: Any) -> None:
@@ -1244,6 +1261,10 @@ class PermutoWidget(QWidget):
         self._join(self._markets_thread, "market poll")
         self._markets_thread = None
         self._markets_worker = None
+
+        self._join(self._close_thread, "operator close")
+        self._close_thread = None
+        self._close_worker = None
 
     @staticmethod
     def _join(thread: Optional[QThread], what: str) -> None:
