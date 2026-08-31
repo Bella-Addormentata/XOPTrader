@@ -49,7 +49,9 @@ from .band_guard import VENUE_BAND_PCT, BandGuard
 from .cross_backoff import CrossBackoff, headroom_pct
 from .preflight import (latest_oracle, preflight_leg_price,
                         quantise_toward, rescaled_size)
-from .curfew import OracleFreeze, assess_curfew, permitted_leg_size
+from .curfew import (OracleFreeze, Stage, assess_curfew,
+                     permitted_leg_size)
+from .modes import profile_for
 from .session import RenewAction
 
 #: How often a SUSTAINED full withdrawal re-asserts the cancel when we
@@ -882,10 +884,28 @@ class QuoteRunner:
             # ring, so this can widen the placement but never the credit
             # footprint -- a leg outside the ring earns nothing.
             self._last_skew[market] = risk.skew
+            # [MODES] The stage decides the POSTURE, the curfew and risk
+            # decide the LIMITS. Applied here so both can still only reduce
+            # what the profile asks for -- never the other way round.
+            profile = profile_for(
+                self._curfew.stage if self._curfew is not None
+                else Stage.UNSCHEDULED,
+                # frozen() is a METHOD taking now_s, not a property: passing
+                # the bound method reads as permanently truthy, which would
+                # have pinned oracle_fresh to False and stopped SETTLING from
+                # ever quoting.
+                oracle_fresh=not self._freeze.frozen(now_s))
+            if not profile.quote:
+                results[market] = ("skip", profile.reason)
+                continue
+            depth_usd *= profile.depth_mult
+            if depth_usd <= 0.0:
+                results[market] = ("skip", profile.reason)
+                continue
             ladder = quote_ladder(
                 market, reference, depth_usd,
                 levels=1,
-                first_offset_pct=(self._half_spread_pct
+                first_offset_pct=(self._half_spread_pct * profile.spread_mult
                                   + self._cross_backoff.offset_pct(market)),
                 ring_pct=self._ring_pct,
                 tick_size=spec.get("tick_size", 0.0001),

@@ -1,0 +1,135 @@
+"""What to quote in each trading mode, as opposed to how much to hold.
+
+THE GAP THIS FILLS. ``curfew.py`` already models the session as stages --
+SESSION, RAMP, EXIT, CLOSED, PREOPEN, SETTLING -- but every one of them
+modulates only the POSITION CAP. The quoting itself is identical at 09:31
+and at 03:00, and the measurements say those are not variations of one
+regime. They are different games:
+
+* **Open hours are close to unquotable.** Sampled 2026-08-31, the median
+  ONE-MINUTE oracle move was 20-24% and 56 of 65 moves exceeded the whole
+  +/-5% venue band. A tight two-sided ladder against that tape does not
+  earn depth -- it collects refusals and adverse fills. 53 legs were
+  refused in one afternoon with prices landing +/-22% from the band mid.
+* **After hours the oracle FREEZES.** 1,290 consecutive identical samples
+  on the Sunday night before the contest. A frozen oracle is a fixed ring:
+  quotes rest inside it indefinitely, no drift, no band rejections, nothing
+  to be picked off by. That is where the field banks its eligibility --
+  the leader went 4.2M to 216M depth-seconds overnight.
+
+So the same cap wants opposite behaviour on either side of the bell, and a
+mode has to carry a quoting PROFILE, not just a limit.
+
+THE BALANCE SHEET IS PART OF THE MODE. The most expensive mistake of
+contest night one was not a bad quote, it was arriving at the close with
+inventory: 870k contracts short, which pinned every market to reduce-only
+and earned exactly zero through the most valuable hours of the week.
+Inventory held into the close is not neutral, it is a claim on the
+overnight window. RAMP and EXIT therefore aim at FLAT rather than merely
+at a smaller number.
+
+WHAT THIS MODULE IS NOT. It does not decide direction, size in dollars, or
+whether risk permits a leg -- risk.assess() and the curfew caps still own
+all of that, and they can only ever tighten what is returned here. This is
+the strategy dial, applied before those limits, never instead of them.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from .curfew import Stage
+
+__all__ = ["Profile", "profile_for", "SESSION_SPREAD_MULT",
+           "CLOSED_SPREAD_MULT"]
+
+#: Open hours: quote WIDER than the configured spread. Depth credit is flat
+#: anywhere inside the +/-2% ring, so width costs nothing in eligibility --
+#: and against a tape moving 20%+ a minute, a tight quote is not tighter
+#: pricing, it is a donation. 3x the configured half-spread puts a 0.25%
+#: default at 0.75%, still well inside the ring after skew.
+SESSION_SPREAD_MULT = 3.0
+
+#: After hours: the oracle is frozen, so the ring does not move and there is
+#: no drift to defend against. Quote at the configured spread.
+CLOSED_SPREAD_MULT = 1.0
+
+#: Depth multipliers per stage, applied to target_depth_usd BEFORE the
+#: curfew cap and risk sizing, both of which can only reduce the result.
+_DEPTH = {
+    # Present, but not fighting the tape. Refusals and adverse fills are
+    # the cost of size here, and the depth earned is small either way.
+    Stage.SESSION: 0.5,
+    # Winding inventory down into the close. Size shrinks so fills shrink.
+    Stage.RAMP: 0.35,
+    # Last minutes: place nothing new. Whatever is on is what we carry.
+    Stage.EXIT: 0.0,
+    # The earning window. Full size.
+    Stage.CLOSED: 1.0,
+    # Short side is already shut by the caps; the bid may stay out.
+    Stage.PREOPEN: 0.5,
+    # The oracle may not have printed yet -- see profile_for.
+    Stage.SETTLING: 0.25,
+    # Off the table entirely: behave as an ordinary session.
+    Stage.UNSCHEDULED: 0.5,
+}
+
+
+@dataclass(frozen=True)
+class Profile:
+    """The quoting dial for one tick."""
+
+    quote: bool
+    spread_mult: float
+    depth_mult: float
+    flatten_bias: bool
+    reason: str
+
+
+def profile_for(stage: Stage, *, oracle_fresh: bool = True) -> Profile:
+    """The quoting posture for ``stage``.
+
+    ``oracle_fresh`` is False when the venue is still publishing a frozen
+    price after the bell. That case is the stale-price trap in its purest
+    form: the schedule says the session has begun, the price says it has
+    not, and quoting against it hands a free option to anyone who can see
+    the real underlying. Measured on 2026-08-31, the oracle stayed frozen
+    across the 20:00 close and only repointed at the NEXT open -- and at
+    that open it gapped +73% to +229% in one print before mean-reverting.
+    """
+    if stage is Stage.EXIT:
+        return Profile(
+            quote=False, spread_mult=SESSION_SPREAD_MULT, depth_mult=0.0,
+            flatten_bias=True,
+            reason="last minutes before the close: no new quotes, and "
+                   "inventory carried past the bell costs the overnight "
+                   "window, which is where depth is actually earned")
+
+    if stage is Stage.SETTLING and not oracle_fresh:
+        return Profile(
+            quote=False, spread_mult=SESSION_SPREAD_MULT, depth_mult=0.0,
+            flatten_bias=False,
+            reason="the bell has rung but the oracle has not printed; "
+                   "quoting against a frozen price after the open is the "
+                   "stale-price trap, not the start of a session")
+
+    if stage is Stage.CLOSED:
+        return Profile(
+            quote=True, spread_mult=CLOSED_SPREAD_MULT,
+            depth_mult=_DEPTH[Stage.CLOSED], flatten_bias=False,
+            reason="frozen oracle: the ring does not move, so a resting "
+                   "two-sided book earns without drift risk. This is the "
+                   "cheapest depth of the week")
+
+    if stage is Stage.RAMP:
+        return Profile(
+            quote=True, spread_mult=SESSION_SPREAD_MULT,
+            depth_mult=_DEPTH[Stage.RAMP], flatten_bias=True,
+            reason="winding inventory down so we reach the close flat and "
+                   "can quote both sides overnight")
+
+    return Profile(
+        quote=True, spread_mult=SESSION_SPREAD_MULT,
+        depth_mult=_DEPTH.get(stage, 0.5), flatten_bias=False,
+        reason="open hours: the tape moves further than the band in most "
+               "minutes, so quote wide and small rather than fighting it")

@@ -1907,3 +1907,78 @@ def test_a_clean_market_relaxes_back_toward_its_spread():
         r._resting = {}
         r.tick(_MID_SESSION + i * 5.0, _ORACLE, {})
     assert r._cross_backoff.offset_pct(_MKT) < widened,         "the backoff never relaxed once the venue stopped refusing us"
+
+# --------------------------------------------------------------------------- #
+# [MODES] The stage must change what actually goes out, not just a dataclass.
+# --------------------------------------------------------------------------- #
+
+def test_the_session_quotes_wider_than_the_overnight_window():
+    """Open hours: 20-24% median one-minute oracle moves, 56 of 65 past the
+    whole band. Depth credit is flat inside the ring, so width is free and
+    a tight quote is just a donation. Overnight the oracle is frozen and
+    the ring does not move, so the configured spread is right."""
+    oracle = _ORACLE[_MKT]
+
+    c1 = _Client(account=_account(0.0), batch_response=_venue_ok())
+    _runner(c1, curfew_enabled=True).tick(_MID_SESSION, _ORACLE, {})
+    sess = [abs(float(l["price"]) / oracle - 1.0) * 100.0 for l in c1.last_batch]
+
+    c2 = _Client(account=_account(0.0), batch_response=_venue_ok())
+    _runner(c2, curfew_enabled=True).tick(_OVERNIGHT, _ORACLE, {})
+    night = [abs(float(l["price"]) / oracle - 1.0) * 100.0 for l in c2.last_batch]
+
+    assert min(sess) > min(night), (
+        "session legs %.3f%% are not wider than overnight %.3f%%"
+        % (min(sess), min(night)))
+
+
+def test_the_overnight_window_quotes_more_size_than_the_session():
+    """CLOSED is the earning window and must be the biggest book.
+
+    Sized like PRODUCTION (cap $250k against $1,200 target depth), because
+    at the default test cap of $1,200 the CURFEW cap binds first -- $300
+    long / $120 short overnight -- and the profile multiplier never gets to
+    express itself. That is correct behaviour (limits beat posture), but it
+    tests the cap rather than the mode.
+    """
+    kw = dict(curfew_enabled=True, max_position_usd=250_000.0)
+    c1 = _Client(account=_account(0.0), batch_response=_venue_ok())
+    _runner(c1, **kw).tick(_MID_SESSION, _ORACLE, {})
+    sess = sum(float(l["size"]) for l in c1.last_batch)
+
+    c2 = _Client(account=_account(0.0), batch_response=_venue_ok())
+    _runner(c2, **kw).tick(_OVERNIGHT, _ORACLE, {})
+    night = sum(float(l["size"]) for l in c2.last_batch)
+
+    assert night > sess, ("overnight %.0f is not larger than session %.0f"
+                          % (night, sess))
+
+
+def test_a_curfew_cap_still_beats_the_profile():
+    """Posture proposes, limits dispose. At the tight default cap the
+    overnight book must be SMALLER than the session one, because the
+    curfew floor binds below what the profile asks for -- if a mode could
+    talk its way past a cap, the mode would be a risk control, and it is
+    not."""
+    c1 = _Client(account=_account(0.0), batch_response=_venue_ok())
+    _runner(c1, curfew_enabled=True).tick(_MID_SESSION, _ORACLE, {})
+    sess = sum(float(l["size"]) for l in c1.last_batch)
+
+    c2 = _Client(account=_account(0.0), batch_response=_venue_ok())
+    _runner(c2, curfew_enabled=True).tick(_OVERNIGHT, _ORACLE, {})
+    night = sum(float(l["size"]) for l in c2.last_batch)
+
+    assert night < sess, "the profile overrode the overnight curfew cap"
+
+
+def test_the_last_minutes_before_the_close_place_nothing():
+    """EXIT: whatever is on is what we carry. Adding inventory here buys a
+    fill we then hold through the frozen window, which is where the 870k
+    short came from."""
+    exit_t = CLOSES_UTC[0] - 300.0          # 5 minutes to the bell
+    c = _Client(account=_account(0.0), batch_response=_venue_ok())
+    r = _runner(c, curfew_enabled=True)
+    res = r.tick(exit_t, _ORACLE, {})
+    assert not getattr(c, "last_batch", None), (
+        "placed a new quote inside the exit window")
+    assert res.markets.get(_MKT, ("", ""))[0] == "skip", res.markets
