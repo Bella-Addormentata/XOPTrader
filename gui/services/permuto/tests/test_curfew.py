@@ -390,3 +390,29 @@ def test_a_frozen_oracle_cannot_reopen_the_short_before_the_bell():
     frozen = _at(MON_OPEN - 600.0, frozen=True)
     assert frozen.short_cap_usd == 0.0
     assert frozen.short_cap_usd <= _at(MON_OPEN - 600.0, frozen=False).short_cap_usd
+
+
+def test_a_frozen_oracle_just_after_the_open_keeps_the_short_shut():
+    """[review 2026-08-31] The second version of the same hole.
+
+    The first tick at/after the bell leaves PREOPEN for SETTLING. If the
+    oracle has not printed yet, mapping that to CLOSED restores the
+    overnight short cap and lets a fresh ask rest against a price that is
+    still stale -- re-opening the exposure PREOPEN spent the previous half
+    hour preventing, at the exact moment the gap is most likely to land.
+    A frozen oracle after the open means the session has NOT started.
+    """
+    just_after = MON_OPEN + 60.0
+    assert _at(just_after, frozen=False).stage is Stage.SETTLING
+    frozen = _at(just_after, frozen=True)
+    assert frozen.short_cap_usd == 0.0,         "a frozen oracle after the bell reopened the short side"
+    assert frozen.short_cap_usd <= _at(just_after, frozen=False).short_cap_usd
+
+
+def test_the_frozen_posture_lifts_once_the_oracle_prints():
+    """And it must not be a one-way latch: a moving oracle after the open
+    is a real session, and holding zero-short there would forfeit the
+    busiest quarter hour for a danger that has passed."""
+    moving = _at(MON_OPEN + 60.0, frozen=False)
+    assert moving.stage is Stage.SETTLING
+    assert moving.short_cap_usd > 0.0

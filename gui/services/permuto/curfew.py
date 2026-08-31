@@ -207,10 +207,14 @@ OVERNIGHT_LONG_FRACTION = 0.25
 #: is not just "0.0 but braver":
 #:
 #:   * The danger is inventory carried INTO the reopen, where the measured
-#:     gap runs +73% to +229%.  The EXIT and SETTLING stages still retract
-#:     the book before the open, so in the normal path nothing is RESTING
-#:     when the gap lands.  What this fraction bounds is what an overnight
-#:     FILL can leave us holding, which retraction cannot undo.
+#:     gap runs +73% to +229%.  Stage.PREOPEN -- NOT EXIT and NOT SETTLING,
+#:     both of which were claimed here before and neither of which does
+#:     this -- shuts the SHORT SIDE for the last PREOPEN_EXIT_S before each
+#:     open.  Say what that actually protects: no ASK is resting for the
+#:     gap to sweep.  The bid is deliberately left open, so the book is not
+#:     "retracted" and describing it that way was wrong twice over.  What
+#:     this fraction bounds is what an overnight FILL can leave us holding,
+#:     which no retraction can undo.
 #:   * At a $250k full cap that is $25k of overnight short notional per
 #:     market.  At the worst gap ever measured here (+229%) that leg marks
 #:     against us by ~$57k -- survivable on a healthy book, and bounded
@@ -544,8 +548,24 @@ def assess_curfew(
         # RAISE the short cap in the last half hour before the bell -- a
         # frozen oracle re-opening the short side in precisely the window
         # the stage exists to shut. Keep whichever is tighter.
-        return _state(Stage.PREOPEN if stage is Stage.PREOPEN
-                      else Stage.CLOSED,
+        # PREOPEN is STRICTLY TIGHTER than CLOSED (short cap 0), and a
+        # frozen oracle may only ever tighten -- so it must not be collapsed
+        # away.
+        #
+        # [review] SETTLING maps here too, and that one is not obvious. The
+        # first tick at or after the bell leaves PREOPEN for SETTLING; if
+        # the oracle has NOT yet printed, mapping that to CLOSED restores
+        # the overnight short cap and lets a fresh ask rest against a price
+        # that is still stale -- re-opening the exact exposure PREOPEN
+        # spent the previous half hour preventing, at the one moment the
+        # gap is most likely to arrive. A frozen oracle after the open is
+        # not "the session has started", it is "the session has not
+        # started yet"; hold the zero-short posture until it moves.
+        if stage in (Stage.PREOPEN, Stage.SETTLING):
+            return _state(Stage.PREOPEN,
+                          "the oracle has stopped moving -- holding the "
+                          "pre-open posture until it prints again")
+        return _state(Stage.CLOSED,
                       "the oracle has stopped moving -- treating the "
                       "underlying as shut regardless of the schedule")
 
