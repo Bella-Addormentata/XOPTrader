@@ -51,7 +51,7 @@ from .preflight import (latest_oracle, preflight_leg_price,
                         quantise_toward, rescaled_size)
 from .curfew import (OracleFreeze, Stage, assess_curfew,
                      permitted_leg_size)
-from .modes import profile_for
+from .modes import Profile, profile_for
 from .session import RenewAction
 
 #: How often a SUSTAINED full withdrawal re-asserts the cancel when we
@@ -213,6 +213,7 @@ class QuoteRunner:
         #: stage profile. Read by the crossing-backoff headroom, which must
         #: budget the spread we USED and not the one we configured.
         self._eff_half_spread = half_spread_pct
+        self._eff_half_spread_by_market: dict = {}
         #: [ANTICROSS] Learned per-market retreat from the book. The venue
         #: refused 51 legs for crossing on 2026-08-31 and publishes no L2, so
         #: its own refusals are the only signal available. Depth credit is
@@ -757,13 +758,25 @@ class QuoteRunner:
         if self._curfew is not None:
             posture_stage = (self._curfew.schedule_stage
                              or self._curfew.stage)
-        profile = profile_for(
+        # Stage-level default; market-specific posture can tighten from here.
+        default_profile = profile_for(
             posture_stage,
-            # Stage-level width/depth posture only; stale-open gating is
-            # MARKET-local and applied inside the loop below.
-            oracle_fresh=True)
-        eff_half_spread = self._half_spread_pct * profile.spread_mult
-        self._eff_half_spread = eff_half_spread
+            oracle_fresh=not self._freeze.frozen(now_s),
+        )
+        self._eff_half_spread = (self._half_spread_pct
+                                 * default_profile.spread_mult)
+        profile_by_market: dict[str, Profile] = {}
+        eff_half_spread_by_market: dict[str, float] = {}
+        for market in self._markets:
+            market_profile = profile_for(
+                posture_stage,
+                oracle_fresh=not self._freeze.market_frozen(market, now_s),
+            )
+            profile_by_market[market] = market_profile
+            eff_half_spread_by_market[market] = (
+                self._half_spread_pct * market_profile.spread_mult
+            )
+        self._eff_half_spread_by_market = eff_half_spread_by_market
 
         risk_by_market: dict = {}
         for market in (self._markets if account_seen else []):
@@ -797,7 +810,7 @@ class QuoteRunner:
                 base_size=base_size,
                 max_position=max_position,
                 ring_pct=self._ring_pct,
-                half_spread_pct=eff_half_spread,
+                half_spread_pct=eff_half_spread_by_market[market],
             )
 
         # A market holding a live quote that risk wants shrunk or gone must
@@ -922,10 +935,8 @@ class QuoteRunner:
             # [MODES] The stage decides the POSTURE, the curfew and risk
             # decide the LIMITS -- the profile is applied first precisely so
             # both can still only reduce it, never the other way round.
-            market_profile = profile_for(
-                posture_stage,
-                oracle_fresh=not self._freeze.market_frozen(market, now_s),
-            )
+            market_profile = profile_by_market[market]
+            eff_half_spread = eff_half_spread_by_market[market]
             if not market_profile.quote:
                 results[market] = ("skip", market_profile.reason)
                 continue
@@ -1339,7 +1350,8 @@ class QuoteRunner:
                             # placed lets the backoff hand back room the
                             # widened quote has already spent.
                             headroom_pct(self._ring_pct,
-                                         self._eff_half_spread,
+                                         self._eff_half_spread_by_market.get(
+                                             mkt, self._eff_half_spread),
                                          self._last_skew.get(mkt, 0.0)))
                     else:
                         self._cross_backoff.observe_clean(mkt)
