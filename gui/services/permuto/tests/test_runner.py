@@ -1989,3 +1989,36 @@ def test_a_market_with_fewer_rows_than_legs_does_not_decay_the_backoff():
     r.tick(_MID_SESSION + 5.0, _ORACLE, {})
     assert r._cross_backoff.offset_pct(_MKT) == widened, \
         "a truncated row list decayed the crossing backoff"
+
+
+def test_widened_quote_with_max_skew_still_stays_inside_the_ring():
+    """'Retreating is free' must hold even when the pair is at max inventory skew.
+
+    [review] ``test_the_widened_quote_still_earns_full_depth_credit`` runs with
+    position=100 out of max_position≈17143, giving a skew of ~0.006% --
+    effectively zero. That test cannot detect a bound that forgets the skew
+    term. This one reproduces the exact condition where the bug lived:
+    max-skew + max-backoff, quantised.
+
+    With max_position_usd=7.0 and oracle=0.07, max_position=100 contracts, so
+    position=100 is the fully-skewed case (|skew|=0.96%). The backoff is driven
+    to its cap by repeated crossing refusals, then the final ask price is checked
+    against the 2% credit ring measured from the TRUE oracle (not the skewed
+    reference). Before the multiplicative fix the ask landed at 2.0100%;
+    before the tick-reservation fix it landed at 2.0467%.
+    """
+    oracle = _ORACLE[_MKT]
+    # max_position = max_position_usd / oracle = 7.0 / 0.07 = 100 contracts.
+    # position = 100 => fraction = 1.0 => |skew| = max_price_skew_frac ≈ 0.96%.
+    c = _Client(account=_account(100.0), batch_response=_venue_cross((0, 1)))
+    r = _runner(c, curfew_enabled=True, max_position_usd=7.0)
+    for i in range(20):                       # drive the backoff to its cap
+        r._resting = {}
+        r.tick(_MID_SESSION + i * 5.0, _ORACLE, {})
+    assert r._cross_backoff.offset_pct(_MKT) > 0.0, \
+        "backoff never fired -- test is not exercising the combined case"
+    for leg in c.last_batch:
+        dev = abs(float(leg["price"]) / oracle - 1.0) * 100.0
+        assert dev <= 2.0 + 1e-9, (
+            "leg %r sits %.4f%% out at max skew+backoff -- outside the 2%% "
+            "credit ring, it rests and earns nothing" % (leg, dev))

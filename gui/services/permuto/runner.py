@@ -895,9 +895,12 @@ class QuoteRunner:
             spec = (raw_specs.get(market, {})
                     if isinstance(raw_specs, dict) else {})
             # [ANTICROSS] Sit as far from the book as the venue's refusals
-            # say we must. quote_ladder still clamps every level inside the
-            # ring, so this can widen the placement but never the credit
-            # footprint -- a leg outside the ring earns nothing.
+            # say we must. headroom_pct bounds the backoff so that the
+            # quantised trailing leg stays inside the credit ring against the
+            # TRUE oracle (skew and tick rounding both accounted for).
+            # quote_ladder's own ring_pct*0.9 clamp is relative to the SKEWED
+            # reference, not the true oracle, so it is NOT the true ceiling --
+            # that is headroom_pct's job.
             self._last_skew[market] = risk.skew
             # [review] Reserve the worst-case ask-ceil rounding margin so
             # headroom_pct accounts for the one tick quote_ladder adds.
