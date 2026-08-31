@@ -1118,8 +1118,8 @@ def test_leaderboard_watch_is_throttled(monkeypatch):
 # the cap actually reaches risk.assess() through the runner.
 # --------------------------------------------------------------------------- #
 
-from gui.services.permuto.curfew import (            # noqa: E402
-    CLOSES_UTC, OPENS_UTC, SETTLE_AFTER_OPEN_S,
+from gui.services.permuto.curfew import (                          # noqa: E402
+    CLOSES_UTC, OPENS_UTC, OVERNIGHT_SHORT_FRACTION, SETTLE_AFTER_OPEN_S,
 )
 
 _MID_SESSION = OPENS_UTC[0] + SETTLE_AFTER_OPEN_S + 3_600.0
@@ -1179,28 +1179,47 @@ def test_curfew_disabled_ignores_the_clock_entirely():
     assert sorted(leg["side"] for leg in c.last_batch) == ["buy", "sell"]
 
 
-def test_overnight_from_flat_the_runner_places_only_the_bid():
-    """End to end: the frozen-oracle window opens no new shorts.
+def test_overnight_from_flat_the_runner_quotes_BOTH_sides():
+    """End to end: the overnight window must actually earn.
 
-    Flat inventory breaches no position limit and neither side shrinks, so
-    every symmetric control in the stack says "quote both". Only the
-    per-leg curfew veto stops the ask going out against a stale oracle.
+    [2026-08-31] This asserted bid-only, and bid-only is worth exactly
+    nothing: depth credit is min(bid, ask), so a one-sided book banks 0/s
+    however large it is. On contest night one that cost us the entire
+    after-hours session while five rivals compounded -- the leader ran
+    $19,728/s past 86,000,000 depth-seconds while we held at 4,093.892.
+
+    The protection now lives in the SIZE of the ask, not its absence:
+    see the bound asserted in the tests below.
     """
     c = _Client(account=_account(0.0))
     r = _runner(c, curfew_enabled=True)
     r.tick(_OVERNIGHT, _ORACLE, {})
-    assert c.last_batch, "expected a bid, got nothing"
-    assert {leg["side"] for leg in c.last_batch} == {"buy"}
+    assert c.last_batch, "expected a two-sided book, got nothing"
+    assert {leg["side"] for leg in c.last_batch} == {"buy", "sell"},         "a one-sided overnight book earns zero depth credit"
 
 
-def test_overnight_an_existing_short_is_still_worked_off():
-    # The prohibition is on GROWING a short, never on reducing one carried
-    # in from the session.
+def test_overnight_a_short_at_the_cap_cannot_grow_any_further():
+    """The bound that replaced the ban. A short AT the overnight cap must
+    go reduce-only -- otherwise "small non-zero" becomes "unbounded by
+    instalments", one tick at a time, which is how the -$523k short was
+    built in the first place.
+    """
+    cap_contracts = (1_200.0 * OVERNIGHT_SHORT_FRACTION) / _ORACLE[_MKT]
+    c = _Client(account=_account(-(cap_contracts * 5)))    # far past the cap
+    r = _runner(c, curfew_enabled=True)
+    r.tick(_OVERNIGHT, _ORACLE, {})
+    assert c.last_batch, "no batch at all"
+    assert {leg["side"] for leg in c.last_batch} == {"buy"},         "a short past its overnight cap was allowed to grow"
+    assert all(leg["reduce_only"] for leg in c.last_batch)
+
+
+def test_overnight_a_small_short_is_still_worked_off_not_abandoned():
+    """Reducing a carried short stays permitted -- that never changed."""
     c = _Client(account=_account(-100.0))
     r = _runner(c, curfew_enabled=True)
     r.tick(_OVERNIGHT, _ORACLE, {})
-    assert {leg["side"] for leg in c.last_batch} == {"buy"}
-    assert all(leg["reduce_only"] for leg in c.last_batch)
+    buys = [leg for leg in _legs(c) if leg[0] == "buy"]
+    assert buys, "the reducing side disappeared"
 
 
 def test_mid_session_from_flat_both_sides_still_go_out():
@@ -1229,17 +1248,31 @@ def test_overnight_a_long_permits_an_ask_of_exactly_that_long():
     ~$1,196 SHORT overnight: four times the long cap, and precisely the
     position the curfew exists to forbid."""
     c = _Client(account=_account(1.0))
-    _runner(c, curfew_enabled=True).tick(_OVERNIGHT, _ORACLE, {})
+    r = _runner(c, curfew_enabled=True)
+    r.tick(_OVERNIGHT, _ORACLE, {})
     sells = [leg for leg in _legs(c) if leg[0] == "sell"]
     assert len(sells) == 1
-    assert sells[0][1] == 1.0, "the ask must close the long, never exceed it"
+    # [2026-08-31] The bound is no longer "exactly the long". A small NEW
+    # short is now legal overnight so the book can be two-sided and earn
+    # depth at all. But BLOCKER 1 is still forbidden: the ask must be
+    # bounded by (the long we are closing) + (the overnight short cap),
+    # NOT by target_depth_usd. The original bug let one contract of
+    # inventory unlock a $1,199.99 ask -- unbounded by any cap. Bounded is
+    # the property that mattered; zero was only one way to get it.
+    cap_usd = 1_200.0 * OVERNIGHT_SHORT_FRACTION
+    ceiling = 1.0 + cap_usd / _ORACLE[_MKT]
+    assert sells[0][1] <= ceiling + 1e-6, (
+        "ask %.1f exceeds long + overnight short cap (%.1f) -- BLOCKER 1 is "
+        "back" % (sells[0][1], ceiling))
+    assert sells[0][1] < 1_200.0 / _ORACLE[_MKT],         "the ask is sized to target depth, ignoring the curfew cap entirely"
 
 
 def test_overnight_a_larger_long_scales_the_ask_with_it():
     c = _Client(account=_account(2_000.0))
     _runner(c, curfew_enabled=True).tick(_OVERNIGHT, _ORACLE, {})
     sells = [leg for leg in _legs(c) if leg[0] == "sell"]
-    assert sells and sells[0][1] == 2_000.0
+    cap_usd = 1_200.0 * OVERNIGHT_SHORT_FRACTION
+    assert sells and 2_000.0 <= sells[0][1] <= 2_000.0 + cap_usd / _ORACLE[_MKT] + 1e-6,         "the ask must scale with the long and stop at the overnight cap"
 
 
 def test_overnight_the_bid_is_sized_to_the_cap_not_to_target_depth():
@@ -1781,7 +1814,11 @@ def test_a_reduce_only_batch_warns_that_it_banks_nothing(caplog):
     `depth_credit_usd` scores that at min(bid, ask) = 0, so the tick banks
     nothing towards the 300,000,000 gate however large the leg is.
     """
-    c = _Client(account=_account(-100.0), batch_response=_venue_ok())
+    # A short PAST the overnight cap: still reduce-only, so still
+    # one-sided, which is the state this warning exists to surface.
+    cap_contracts = (1_200.0 * OVERNIGHT_SHORT_FRACTION) / _ORACLE[_MKT]
+    c = _Client(account=_account(-(cap_contracts * 5)),
+                batch_response=_venue_ok())
     r = _runner(c, curfew_enabled=True)
     with caplog.at_level(logging.DEBUG, logger="gui.services.permuto.runner"):
         r.tick(_OVERNIGHT, _ORACLE, {})

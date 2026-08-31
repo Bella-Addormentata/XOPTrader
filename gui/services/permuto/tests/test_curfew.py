@@ -10,6 +10,7 @@ tell us the underlying is shut.
 from __future__ import annotations
 
 from gui.services.permuto.curfew import (
+    OVERNIGHT_SHORT_FRACTION,
     CLOSES_UTC,
     EXIT_START_S,
     OPENS_UTC,
@@ -149,9 +150,18 @@ def test_the_long_cap_is_always_strictly_positive():
             assert _at(t, frozen=frozen).long_cap_usd > 0.0, (t, frozen)
 
 
-def test_the_overnight_short_cap_is_exactly_zero():
+def test_the_overnight_short_cap_is_small_but_not_zero():
+    """[2026-08-31] It WAS exactly zero, and zero cost the whole night.
+
+    Depth credit is min(bid, ask): an ask permitted at size zero makes
+    min(bid, 0) = 0, so even a flat, fully funded account banked nothing
+    overnight while five rivals compounded after hours. Small and
+    non-zero makes a BALANCED book legal; the asymmetry with the long
+    side is what still forbids a directional short.
+    """
     state = _at(MON_CLOSE + 3_600.0)
-    assert state.short_cap_usd == 0.0
+    assert state.short_cap_usd == FULL * OVERNIGHT_SHORT_FRACTION
+    assert 0.0 < state.short_cap_usd < state.long_cap_usd,         "the short side must stay strictly tighter than the long side"
 
 
 def test_no_configured_limit_leaves_the_curfew_inactive():
@@ -162,7 +172,7 @@ def test_no_configured_limit_leaves_the_curfew_inactive():
 def test_cap_for_selects_by_the_position_we_actually_hold():
     state = _at(MON_CLOSE + 3_600.0)
     assert state.cap_for(10.0) == state.long_cap_usd
-    assert state.cap_for(-10.0) == state.short_cap_usd == 0.0
+    assert state.cap_for(-10.0) == state.short_cap_usd
     assert state.cap_for(0.0) == max(state.long_cap_usd,
                                      state.short_cap_usd)
     assert state.cap_for(float("nan")) == min(state.long_cap_usd,
@@ -182,11 +192,14 @@ def test_a_reducing_sell_is_clamped_to_the_long_it_closes():
     assert permitted_leg_size(False, 250.0, 17_094.0, 4_285.0, 0.0) == 250.0
 
 
-def test_from_flat_overnight_the_ask_is_refused_outright():
+def test_a_zero_short_cap_refuses_the_ask_outright():
+    # Contract of the FUNCTION given a zero cap -- no longer the overnight
+    # configuration, which is now OVERNIGHT_SHORT_FRACTION > 0. Renamed so
+    # the name stops implying a policy that changed underneath it.
     assert permitted_leg_size(False, 0.0, 17_094.0, 4_285.0, 0.0) == 0.0
 
 
-def test_from_flat_overnight_the_bid_is_clamped_to_the_long_cap():
+def test_a_bid_is_clamped_to_the_long_cap():
     # And the clamp is what bounds it: the requested ladder leg is far
     # larger than the cap allows.
     assert permitted_leg_size(True, 0.0, 17_191.0, 4_285.0, 0.0) == 4_285.0
@@ -284,13 +297,13 @@ def test_a_frozen_oracle_overrides_an_in_session_schedule():
     assert _at(mid).stage is Stage.SESSION
     frozen = _at(mid, frozen=True)
     assert frozen.stage is Stage.CLOSED
-    assert frozen.short_cap_usd == 0.0
+    assert frozen.short_cap_usd == FULL * OVERNIGHT_SHORT_FRACTION
 
 
 def test_a_moving_oracle_does_not_lift_a_scheduled_close():
     state = _at(MON_CLOSE + 3_600.0, frozen=False)
     assert state.stage is Stage.CLOSED
-    assert state.short_cap_usd == 0.0
+    assert state.short_cap_usd == FULL * OVERNIGHT_SHORT_FRACTION
 
 
 def test_a_frozen_oracle_never_raises_either_cap():

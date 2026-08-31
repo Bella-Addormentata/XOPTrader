@@ -173,7 +173,40 @@ OVERNIGHT_LONG_FRACTION = 0.25
 #: This forbids OPENING shorts overnight; it is not a directional bet.  We
 #: still quote the bid, so anyone selling volatility to us cheaply is
 #: filled, and the long side remains capped by OVERNIGHT_LONG_FRACTION.
-OVERNIGHT_SHORT_FRACTION = 0.0
+#:
+#: [2026-08-31, MEASURED] It was 0.0, and 0.0 costs the entire overnight
+#: session's eligibility, because depth credit is min(bid, ask): with the
+#: ask side permitted at exactly zero size, min(bid, 0) = 0 and a FLAT,
+#: fully-funded account still banks nothing overnight.  That is not a
+#: theoretical loss.  On contest night one, five entrants compounded
+#: after hours -- the leader ran $19,728/s and passed 86,000,000
+#: depth-seconds while we sat at 4,093.892 -- and with a frozen oracle
+#: overnight is structurally the CHEAPEST depth of the week: no drift, no
+#: band risk, quotes simply rest.  Our own curfew was the thing closing
+#: that window, not the venue and not the position.
+#:
+#: So: small and non-zero.  A BALANCED two-sided book becomes legal; a
+#: directional short still does not.  Why 0.10 specifically, and why this
+#: is not just "0.0 but braver":
+#:
+#:   * The danger is inventory carried INTO the reopen, where the measured
+#:     gap runs +73% to +229%.  The EXIT and SETTLING stages still retract
+#:     the book before the open, so in the normal path nothing is RESTING
+#:     when the gap lands.  What this fraction bounds is what an overnight
+#:     FILL can leave us holding, which retraction cannot undo.
+#:   * At a $250k full cap that is $25k of overnight short notional per
+#:     market.  At the worst gap ever measured here (+229%) that leg marks
+#:     against us by ~$57k -- survivable on a healthy book, and bounded
+#:     rather than open-ended.
+#:   * It is a SECOND limit, not the only one.  risk.assess() independently
+#:     refuses to add risk above 50% margin utilisation, so this fraction
+#:     can never be the sole thing standing between us and a reopen.
+#:
+#: Raising this further is not free and should not be done without
+#: re-measuring the reopen gap: the asymmetry with the long side is
+#: deliberate, because a short is the side a stale oracle misprices and
+#: the side that gets liquidated at the open.
+OVERNIGHT_SHORT_FRACTION = 0.10
 
 #: Floor as a fraction of the operator's full cap.  NOT zero, and not
 #: negotiable: risk.assess() reads `if max_position > 0.0 and ...`, so a
