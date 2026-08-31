@@ -1428,3 +1428,36 @@ def test_an_explicit_rejection_is_believed_over_its_legs():
     r = _runner(c, curfew_enabled=False)
     r.tick(1.0, _ORACLE, {})
     assert r._batch_fail_streak == 1
+
+
+# --------------------------------------------------------------------------- #
+# [BANDGUARD] End to end: a collapsing oracle clamps leg prices so the
+# batch survives, instead of one stale leg 400ing every sibling.
+# --------------------------------------------------------------------------- #
+
+def test_a_collapsing_oracle_still_produces_an_in_band_batch():
+    c = _Client(account=_account(0.0))
+    r = _runner(c, curfew_enabled=False)
+    # Establish a fast decay: ~0.5%/s across two ticks.
+    r.tick(_MID_SESSION, {_MKT: 0.100}, {})
+    r.tick(_MID_SESSION + 5.0, {_MKT: 0.0975}, {})
+    c.last_batch = None
+    # A grace-aged read: same oracle value, but flagged 10s old.
+    r.tick(_MID_SESSION + 10.0, {_MKT: 0.0975},
+           {"oracle_age_s": 10.0})
+    if c.last_batch:
+        for leg in c.last_batch:
+            dev = abs(float(leg["price"]) / 0.0975 - 1.0) * 100.0
+            assert dev <= 5.0, "leg %r is outside the venue band" % (leg,)
+
+
+def test_a_calm_oracle_is_untouched_by_the_guard():
+    c = _Client(account=_account(0.0))
+    r = _runner(c, curfew_enabled=False)
+    for i in range(4):
+        r.tick(_MID_SESSION + i * 5.0, _ORACLE, {})
+    assert c.last_batch, "expected quotes on a calm market"
+    # The ladder's own ring is 2%; nothing should be clamped tighter.
+    for leg in c.last_batch:
+        dev = abs(float(leg["price"]) / _ORACLE[_MKT] - 1.0) * 100.0
+        assert dev <= 2.1

@@ -45,6 +45,7 @@ from .client import PermutoNotLinked
 from .orders import Side, quote_ladder
 from .quoting import LoopAction, RestingQuote, VenueView, decide
 from .risk import MarginState, RiskAction, assess, skewed_reference
+from .band_guard import BandGuard
 from .curfew import OracleFreeze, assess_curfew, permitted_leg_size
 from .session import RenewAction
 
@@ -192,6 +193,11 @@ class QuoteRunner:
         #: Unknown-but-accepted statuses already reported, so the "add it
         #: to BATCH_ACCEPTED" nudge is logged once rather than every tick.
         self._unknown_ok_statuses: set = set()
+        # [BANDGUARD] Oracle velocity per market, so leg prices are clamped
+        # inside the venue's +/-5% oracle band ON ARRIVAL. At the contest
+        # open, whole minutes of batches 400'd because grace-aged reads
+        # plus the 2% ring overshot the band while the oracle collapsed.
+        self._band_guard = BandGuard()
         self._curfew_retract_pending = False
         self._curfew_enabled = curfew_enabled
         self._freeze = OracleFreeze()
@@ -340,6 +346,7 @@ class QuoteRunner:
         # else reads the clock: a frozen oracle can only ever TIGHTEN the
         # cap, so observing early costs nothing and a missed observation
         # would loosen it.
+        self._band_guard.observe(now_s, oracles)
         if self._curfew_enabled:
             self._freeze.observe(now_s, oracles)
             curfew = assess_curfew(
@@ -869,6 +876,31 @@ class QuoteRunner:
                 # short the curfew forbids -- and at the EXIT cap one leg
                 # was eight times the position it was trying to hold, so
                 # the ramp could never converge.
+                # [BANDGUARD] Pull the price inside the venue band as it
+                # will be judged on ARRIVAL, or drop the leg when the
+                # projected in-flight drift leaves no window. One out-of-
+                # band leg 400s the whole batch -- every sibling dies with
+                # it -- so a dropped leg here is strictly better than the
+                # rejection it would have caused.
+                if oracle and oracle > 0.0:
+                    oracle_age = 0.0
+                    try:
+                        oracle_age = float(flags.get("oracle_age_s") or 0.0)
+                    except (TypeError, ValueError):
+                        oracle_age = 0.0
+                    clamped = self._band_guard.clamp_price(
+                        market, oracle, leg.price, oracle_age)
+                    if clamped <= 0.0:
+                        results[market] = (
+                            "skip",
+                            "oracle moving too fast for the venue band "
+                            "(%.2f%%/s, read %.1fs old)"
+                            % (self._band_guard.velocity(market),
+                               oracle_age))
+                        continue
+                    if clamped != leg.price:
+                        leg = type(leg)(leg.market, leg.side, clamped,
+                                        leg.size, leg.reduce_only)
                 if self._curfew is not None and oracle and oracle > 0.0:
                     allowed = permitted_leg_size(
                         leg.side is Side.BUY,
