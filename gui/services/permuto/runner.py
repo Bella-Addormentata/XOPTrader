@@ -124,6 +124,11 @@ def _legs_all_accepted(leg_rows) -> bool:
 #: rejection cannot place hundreds of unacknowledged orders overnight.
 BATCH_FAIL_STREAK_LIMIT = 5
 
+#: [DEPTHSIGNAL] Seconds between positive depth-credit INFO lines. Zero
+#: credit is never throttled -- that one is the failure, and it should be
+#: as loud as it is often.
+DEPTH_LOG_INTERVAL_S = 60.0
+
 #: How often to probe once the breaker is open. Still self-heals, at 1/min
 #: instead of 12/min.
 BATCH_PROBE_INTERVAL_S = 60.0
@@ -193,6 +198,14 @@ class QuoteRunner:
         # that the failure path then declined to record.
         self._batch_fail_streak = 0
         self._batch_muted_until_s = 0.0
+        #: [DEPTHSIGNAL] When the positive depth credit was last logged.
+        #: The figure goes to gui.log, which is configured INFO-only, so a
+        #: DEBUG line would be invisible exactly when it is being relied on.
+        #: But a tick is ~5s and an unthrottled INFO would be 720 lines an
+        #: hour, so it is rate limited: a healthy book still says so once a
+        #: minute, and silence then means something is actually wrong
+        #: rather than merely un-logged.
+        self._depth_logged_at_s = 0.0
         #: Unknown-but-accepted statuses already reported, so the "add it
         #: to BATCH_ACCEPTED" nudge is logged once rather than every tick.
         self._unknown_ok_statuses: set = set()
@@ -1162,9 +1175,11 @@ class QuoteRunner:
                 "%.1f%% ring. Eligibility accrues on min(bid, ask), so a "
                 "one-sided book banks nothing however large it is.",
                 len(legs), len({l.market for l in legs}), self._ring_pct)
-        else:
-            _log.debug("permuto: batch depth credit $%.0f/s (%d legs)",
-                       credit_usd, len(legs))
+        elif now_s - self._depth_logged_at_s >= DEPTH_LOG_INTERVAL_S:
+            self._depth_logged_at_s = now_s
+            _log.info("permuto: batch depth credit $%.0f/s across %d "
+                      "market(s) (%d legs)", credit_usd,
+                      len({l.market for l in legs}), len(legs))
 
         payload = build_upsert_batch(legs, send_oracles,
                                      ring_pct=self._ring_pct)
