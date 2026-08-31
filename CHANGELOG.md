@@ -5,6 +5,51 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.12] — 2026-08-31 — the Permuto inventory curfew
+
+Stops us carrying inventory across a market close, which is the trade that
+beat market makers in the previous competition: buy long while the
+underlying is shut, collect at the reopen when short MMs are liquidated and
+ADL hands the longs their exit.
+
+- **The venue does not pause overnight.** Measured live with US equities
+  closed: `trading_paused` is `false` and every market reads `active` while
+  all three oracles sit frozen to sixteen digits. It keeps matching orders
+  against a stale price, and `/info/meta` has no next-close field at all —
+  `paused_at` / `pause_resume_at` populate only once already paused. So the
+  curfew runs on a written-down UTC session table (no tzdata on Windows,
+  and the bundle is lock-pinned), checked against an oracle-freeze detector
+  that is ground truth and cannot expire. They combine asymmetrically:
+  tighten if either says so, relax only if both agree.
+- **Inventory is capped on a clock**, feeding the `max_position` argument
+  `risk.assess()` already takes, so an oversized position becomes
+  maker-side REDUCE_ONLY quotes through existing, tested machinery. The cap
+  ramps down over the 90 minutes before each close, so inventory is worked
+  off by resting orders that **earn** the spread rather than dumped through
+  it at the bell. Nothing crosses the spread.
+- **Overnight the sides are not symmetric**: no new short exposure at all,
+  a bounded long (25% of the configured cap) still permitted. The oracle is
+  a 60-second trailing realized-vol estimate, so it freezes on a calm
+  end-of-day window while the first print after the reopen comes from the
+  most violent minute of the day — the reopening print is systematically
+  higher, which is why a carried short is the position that gets
+  liquidated. Defensive, not a carry bet: the bid keeps quoting.
+- **Settling reopens the ask.** The 15 minutes after an open hold the
+  reduced size but quote both sides — the oracle is live by then, so the
+  stale-price rationale is spent and closing a side would forfeit depth
+  credit (`min(bid, ask)`) through the busiest quarter-hour.
+- **An on/off switch** in Settings → Startup, defaulting **on**, read fresh
+  each time a session is armed. Ticks now report the curfew stage, and the
+  status bar names it, so bid-only overnight quoting is legible as intended
+  rather than broken.
+
+Hardened by a 22-agent adversarial review that confirmed 15 findings, four
+of them blockers reproduced by execution — the leg-permission check was
+size-blind (one contract of long inventory waved through a full-size ask,
+which if filled left us massively short), leg sizes were never clamped to
+the cap at all, the veto never touched a book already resting, and the long
+cap doubled at the ramp/exit boundary. All fixed and regression-tested.
+
 ## [0.10.11] — 2026-08-30 — startup intent on the switch; declared pegs anchor fair value
 
 - **Dexie switch paints stored startup intent** [STARTINTENT]: with
