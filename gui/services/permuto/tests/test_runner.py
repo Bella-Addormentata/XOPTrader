@@ -1792,3 +1792,81 @@ def test_a_reduce_only_batch_warns_that_it_banks_nothing(caplog):
     assert all(leg["reduce_only"] for leg in c.last_batch), c.last_batch
     assert [rec for rec in caplog.records
             if "banked ZERO depth" in rec.getMessage()],         "a one-sided book was sent without warning that it earns nothing"
+
+# --------------------------------------------------------------------------- #
+# [ANTICROSS] The venue's refusals must actually move our prices.
+# --------------------------------------------------------------------------- #
+
+def _venue_cross(reject_idx):
+    """A response refusing the given leg indices for crossing the book."""
+    def build(legs):
+        return {
+            "status": "batch_ok",
+            "results": [
+                {"action": "placed",
+                 "rejection_reason": (
+                     "Post-only order would cross the book. Switch to GTC "
+                     "or adjust price." if i in reject_idx else None)}
+                for i, _ in enumerate(legs)
+            ],
+        }
+    return build
+
+
+def test_a_crossing_refusal_widens_the_next_quote(caplog):
+    """The whole point: refused legs must come back further from the book.
+
+    [live 2026-08-31] 51 legs were refused for crossing in one afternoon.
+    Each refusal rested nothing and therefore banked zero depth-seconds,
+    and the loop re-sent the same crossing price on the next tick forever
+    because nothing consumed the venue's answer.
+    """
+    c = _Client(account=_account(100.0), batch_response=_venue_cross((0, 1)))
+    r = _runner(c, curfew_enabled=True)
+    with caplog.at_level(logging.INFO, logger="gui.services.permuto"):
+        r.tick(_MID_SESSION, _ORACLE, {})
+    first = sorted(float(l["price"]) for l in c.last_batch)
+    assert r._cross_backoff.offset_pct(_MKT) > 0.0,         "the venue said we crossed and the placement did not move"
+
+    # Second tick: same oracle, but the book must be quoted wider.
+    r._resting = {}
+    r.tick(_MID_SESSION + 5.0, _ORACLE, {})
+    second = sorted(float(l["price"]) for l in c.last_batch)
+    assert second[0] < first[0], "the bid did not retreat after crossing"
+    assert second[-1] > first[-1], "the ask did not retreat after crossing"
+
+
+def test_the_widened_quote_still_earns_full_depth_credit():
+    """Retreating must not cost eligibility -- that would defeat the point.
+
+    depth_credit_usd counts a leg's whole notional anywhere inside the
+    ring, so a wider quote scores exactly the same as a tight one. If a
+    backoff ever pushed a leg out of the ring it would rest and score
+    nothing, which is the failure this feature exists to remove.
+    """
+    oracle = _ORACLE[_MKT]
+    c = _Client(account=_account(100.0), batch_response=_venue_cross((0, 1)))
+    r = _runner(c, curfew_enabled=True)
+    for i in range(12):                       # drive the backoff to its cap
+        r._resting = {}
+        r.tick(_MID_SESSION + i * 5.0, _ORACLE, {})
+    assert r._cross_backoff.offset_pct(_MKT) > 0.0
+    for leg in c.last_batch:
+        dev = abs(float(leg["price"]) / oracle - 1.0) * 100.0
+        assert dev <= 2.0 + 1e-9, (
+            "leg %r sits %.3f%% out, outside the 2%% credit ring -- it would "
+            "rest and earn nothing" % (leg, dev))
+
+
+def test_a_clean_market_relaxes_back_toward_its_spread():
+    c = _Client(account=_account(100.0), batch_response=_venue_cross((0, 1)))
+    r = _runner(c, curfew_enabled=True)
+    r.tick(_MID_SESSION, _ORACLE, {})
+    widened = r._cross_backoff.offset_pct(_MKT)
+    assert widened > 0.0
+
+    c.batch_response = _venue_ok()            # venue stops refusing
+    for i in range(1, 4):
+        r._resting = {}
+        r.tick(_MID_SESSION + i * 5.0, _ORACLE, {})
+    assert r._cross_backoff.offset_pct(_MKT) < widened,         "the backoff never relaxed once the venue stopped refusing us"
