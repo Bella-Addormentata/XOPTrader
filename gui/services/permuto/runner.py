@@ -46,6 +46,7 @@ from .orders import Side, depth_credit_usd, quote_ladder
 from .quoting import LoopAction, RestingQuote, VenueView, decide
 from .risk import MarginState, RiskAction, assess, skewed_reference
 from .band_guard import VENUE_BAND_PCT, BandGuard
+from .cross_backoff import CrossBackoff, headroom_pct
 from .preflight import (latest_oracle, preflight_leg_price,
                         quantise_toward, rescaled_size)
 from .curfew import OracleFreeze, assess_curfew, permitted_leg_size
@@ -206,6 +207,15 @@ class QuoteRunner:
         #: minute, and silence then means something is actually wrong
         #: rather than merely un-logged.
         self._depth_logged_at_s = 0.0
+        #: [ANTICROSS] Learned per-market retreat from the book. The venue
+        #: refused 51 legs for crossing on 2026-08-31 and publishes no L2, so
+        #: its own refusals are the only signal available. Depth credit is
+        #: flat inside the ring, so retreating costs no eligibility.
+        self._cross_backoff = CrossBackoff()
+        #: Skew last applied per market, so the backoff's ring headroom can
+        #: account for it at response time (skew and backoff push the
+        #: trailing leg the same way, and the ring does not care which).
+        self._last_skew: dict = {}
         #: Unknown-but-accepted statuses already reported, so the "add it
         #: to BATCH_ACCEPTED" nudge is logged once rather than every tick.
         self._unknown_ok_statuses: set = set()
@@ -867,9 +877,16 @@ class QuoteRunner:
             raw_specs = flags.get("specs")
             spec = (raw_specs.get(market, {})
                     if isinstance(raw_specs, dict) else {})
+            # [ANTICROSS] Sit as far from the book as the venue's refusals
+            # say we must. quote_ladder still clamps every level inside the
+            # ring, so this can widen the placement but never the credit
+            # footprint -- a leg outside the ring earns nothing.
+            self._last_skew[market] = risk.skew
             ladder = quote_ladder(
                 market, reference, depth_usd,
-                levels=1, first_offset_pct=self._half_spread_pct,
+                levels=1,
+                first_offset_pct=(self._half_spread_pct
+                                  + self._cross_backoff.offset_pct(market)),
                 ring_pct=self._ring_pct,
                 tick_size=spec.get("tick_size", 0.0001),
                 lot_size=spec.get("lot_size", 1.0),
@@ -1249,6 +1266,28 @@ class QuoteRunner:
                           in ("placed", "modified", "unchanged")]
             else:
                 rested = list(legs)
+            # [ANTICROSS] Feed the venue's own refusals back into the
+            # placement. Rows do not echo the side, so this is per-market:
+            # if ANY leg here crossed, the market retreats; if none did, it
+            # relaxes back toward the configured spread.
+            if isinstance(leg_rows, list) and leg_rows:
+                crossed = set()
+                for leg, row in zip(legs, leg_rows):
+                    if not isinstance(row, dict):
+                        continue
+                    if "cross the book" in str(
+                            row.get("rejection_reason") or "").lower():
+                        crossed.add(leg.market)
+                for mkt in {l.market for l in legs}:
+                    if mkt in crossed:
+                        self._cross_backoff.observe_cross(
+                            mkt,
+                            headroom_pct(self._ring_pct,
+                                         self._half_spread_pct,
+                                         self._last_skew.get(mkt, 0.0)))
+                    else:
+                        self._cross_backoff.observe_clean(mkt)
+
             credit_usd = _credit_for(rested)
             if legs and credit_usd <= 0.0:
                 _log.warning(
