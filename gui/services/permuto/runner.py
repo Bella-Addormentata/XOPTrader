@@ -1025,8 +1025,27 @@ class QuoteRunner:
                 if out.changed:
                     # ON the venue grid, and re-sized so re-pricing does not
                     # quietly change the notional (see rescaled_size).
-                    new_price = quantise_toward(out.price, oracle_now)
-                    new_size = rescaled_size(leg.size, leg.price, new_price)
+                    #
+                    # [review round 2] Use THIS market's published spec, the
+                    # same one quote_ladder was built with. Hardcoding
+                    # 0.0001/1.0 would silently turn a valid ladder leg into
+                    # an off-grid price or a fractional lot on any market
+                    # whose metadata differs.
+                    raw_specs = flags.get("specs")
+                    mspec = (raw_specs.get(leg.market, {})
+                             if isinstance(raw_specs, dict) else {})
+                    m_tick = float(mspec.get("tick_size", 0.0001) or 0.0001)
+                    m_lot = float(mspec.get("lot_size", 1.0) or 1.0)
+                    new_price = quantise_toward(out.price, oracle_now, m_tick)
+                    if new_price <= 0.0:
+                        # No legal grid point between our price and the
+                        # anchor: there is nothing safe to send here.
+                        results[leg.market] = (
+                            "skip", "no on-grid price inside the band")
+                        preflight_cancel.add(leg.market)
+                        continue
+                    new_size = rescaled_size(leg.size, leg.price, new_price,
+                                             m_lot)
                     if new_size <= 0.0:
                         preflight_cancel.add(leg.market)
                         continue
@@ -1043,8 +1062,16 @@ class QuoteRunner:
                           "band would have refused (latency %.0fms)",
                           dropped, len(legs), self._send_latency_s * 1000.0)
             legs = kept
-            # Retract anything preflight refused to replace, before the
-            # surviving siblings go out.
+            # Retract anything preflight refused to replace.
+            #
+            # [review round 2] The cancel is an authenticated round trip
+            # sitting between the "fresh" read and the send, so every
+            # SURVIVING leg ages through it while its drift budget models
+            # only one request -- reintroducing exactly the band rejection
+            # this preflight exists to prevent. So: cancel first, then take
+            # a NEW reading and re-price the survivors against it. The
+            # extra fetch only happens on the tick where something was
+            # actually dropped, which is rare.
             if preflight_cancel:
                 try:
                     self._client.cancel_all(now_s, sorted(preflight_cancel))
@@ -1055,6 +1082,38 @@ class QuoteRunner:
                 else:
                     for market in preflight_cancel:
                         self._resting[market] = RestingQuote()
+                if legs and self._oracle_fetch is not None:
+                    try:
+                        again = self._oracle_fetch()
+                    except Exception:  # noqa: BLE001
+                        again = None
+                    if isinstance(again, dict) and again:
+                        refreshed = []
+                        for leg in legs:
+                            ref = latest_oracle(again, oracles, leg.market)
+                            if ref <= 0.0:
+                                refreshed.append(leg)
+                                continue
+                            out2 = preflight_leg_price(
+                                leg.price, ref,
+                                band_pct=VENUE_BAND_PCT,
+                                latency_s=self._send_latency_s,
+                                velocity_pct_per_s=(
+                                    self._band_guard.velocity(leg.market)),
+                                is_buy=leg.side is Side.BUY,
+                                ring_pct=self._ring_pct)
+                            if out2.dropped:
+                                continue
+                            price2 = out2.price if out2.changed else leg.price
+                            if out2.changed:
+                                price2 = quantise_toward(price2, ref)
+                                if price2 <= 0.0:
+                                    continue
+                                leg = type(leg)(leg.market, leg.side, price2,
+                                                leg.size, leg.reduce_only)
+                            send_refs[leg.market] = ref
+                            refreshed.append(leg)
+                        legs = refreshed
             if not legs:
                 return TickResult(
                     "skip",

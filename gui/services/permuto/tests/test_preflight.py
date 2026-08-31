@@ -217,3 +217,47 @@ def test_rescale_is_lot_quantised_and_never_negative():
 def test_rescale_leaves_junk_inputs_untouched():
     assert rescaled_size(50.0, 0.0, 0.1) == 50.0
     assert rescaled_size(50.0, 0.1, 0.0) == 50.0
+
+
+# --------------------------------------------------------------------------- #
+# [Copilot round 2] The anchor is a BOUND, not a legal price. Clamping the
+# snapped value to an off-grid oracle re-introduced the very off-grid price
+# quantisation exists to remove.
+# --------------------------------------------------------------------------- #
+
+def test_an_off_grid_anchor_never_leaks_into_the_result():
+    # The reported case: 0.05005 toward an anchor of 0.05003 (itself 500.3
+    # ticks). There is no grid point in between, so there is no legal
+    # answer -- say so rather than returning the anchor.
+    assert quantise_toward(0.05005, 0.05003, 0.0001) == 0.0
+
+
+def test_a_grid_point_inside_the_interval_is_still_found():
+    # 0.05021 -> anchor 0.05003: 0.0502 lies between them and is on-grid.
+    out = quantise_toward(0.05021, 0.05003, 0.0001)
+    assert out > 0.0
+    assert abs(round(out / 0.0001) - out / 0.0001) < 1e-6
+    assert 0.05003 <= out <= 0.05021
+
+
+def test_every_returned_price_is_on_grid_or_zero():
+    import random
+    random.seed(7)
+    for _ in range(400):
+        tick = random.choice([0.0001, 0.001, 0.01])
+        anchor = random.uniform(0.01, 0.5)
+        price = anchor * random.uniform(0.9, 1.1)
+        out = quantise_toward(price, anchor, tick)
+        if out == 0.0:
+            continue
+        ticks = out / tick
+        assert abs(round(ticks) - ticks) < 1e-6, (price, anchor, tick, out)
+
+
+def test_a_coarser_market_tick_is_honoured():
+    # A market whose published tick is 0.01 must not be quantised at
+    # 0.0001 -- that is the per-market spec Copilot flagged as discarded.
+    out = quantise_toward(0.2345, 0.23, 0.01)
+    assert out in (0.23, 0.24) or out == 0.0
+    if out:
+        assert abs(round(out / 0.01) - out / 0.01) < 1e-6

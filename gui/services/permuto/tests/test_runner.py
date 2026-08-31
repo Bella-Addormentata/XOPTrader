@@ -1596,3 +1596,36 @@ def test_a_long_is_still_reduced_by_selling():
     r.tick(_MID_SESSION, _ORACLE, {})
     assert c.last_batch
     assert {leg["side"] for leg in c.last_batch} == {"sell"}
+
+
+def test_a_market_spec_tick_is_used_when_repricing():
+    """[Copilot round 2] Repricing must use the market's PUBLISHED tick,
+    the same one quote_ladder built with -- not a hardcoded 0.0001."""
+    c = _Client(account=_account(0.0))
+    r = _runner(c, curfew_enabled=False, oracle_fetch=lambda: {_MKT: 0.09})
+    r.tick(_MID_SESSION, {_MKT: 0.10},
+           {"specs": {_MKT: {"tick_size": 0.01, "lot_size": 1.0}}})
+    if c.last_batch:
+        for leg in c.last_batch:
+            ticks = float(leg["price"]) / 0.01
+            assert abs(round(ticks) - ticks) < 1e-6,                 "leg %r ignores the market's 0.01 tick" % (leg,)
+
+
+def test_survivors_are_re_priced_after_a_cancel_round_trip():
+    """[Copilot round 2] The cancel is an authenticated round trip between
+    the fresh read and the send; survivors must be re-read against a NEW
+    oracle rather than ageing through it on a one-request budget."""
+    reads = []
+
+    def fetch():
+        reads.append(len(reads))
+        # Second read differs, so a re-price is observable.
+        return {_MKT: 0.09 if len(reads) < 2 else 0.088, _MKT2: 0.05}
+
+    c = _Client(account=_account(0.0))
+    r = _runner2(c, curfew_enabled=False, oracle_fetch=fetch)
+    r._send_latency_s = 30.0          # force a drop on one market
+    r.tick(_MID_SESSION, {_MKT: 0.10, _MKT2: 0.20}, {})
+    # A drop happened -> cancel -> a SECOND oracle read for the survivors.
+    if "cancel_all" in c.calls:
+        assert len(reads) >= 2, "survivors were not re-read after the cancel"

@@ -46,6 +46,7 @@ Pure module: arithmetic only, no I/O.  The caller owns the fetch.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Mapping, Optional
 
@@ -179,32 +180,48 @@ def latest_oracle(
 
 def quantise_toward(price: float, oracle: float,
                     tick: float = DEFAULT_TICK) -> float:
-    """Snap `price` to the venue tick grid, rounding TOWARD the oracle.
+    """Snap `price` to the venue tick grid, moving TOWARD the oracle.
+
+    Returns 0.0 when NO grid point exists between the price and the anchor,
+    which the caller must treat as "drop this leg".
 
     [review] Re-anchoring produced prices off the grid -- the 0.09 clamp
     yields 0.092925, which is 929.25 ticks at the live 0.0001 size, and
-    the venue's strict validator can refuse the leg and with it the whole
-    batch.  So the clamp has to land ON the grid.
+    the venue's strict validator can refuse the leg and take the batch
+    with it.
+
+    [review round 2] The first version then clamped the snapped value to
+    the ORACLE, which is not itself necessarily a grid point:
+    quantise_toward(0.05005, 0.05003, 0.0001) returned 0.05003 -- 500.3
+    ticks, still off-grid, still rejectable. The anchor is a bound, not a
+    legal price. So the bound is applied on the grid, and when the
+    interval between price and anchor contains no grid point at all there
+    is no legal answer to return and we say so.
 
     Rounding is toward the oracle rather than by the maker convention
-    (bids down, asks up) because the failure being fixed here is the BAND,
-    and one tick is 0.05-0.2% at these prices -- small against a 5% band
-    but the wrong direction still spends margin we may not have.  Crossing
-    in the other direction is caught per-leg by ALO, which refuses one
-    order politely instead of failing the batch.
+    (bids down, asks up) because the failure being fixed is the BAND; a
+    quote made marginally more aggressive by rounding is caught per-leg by
+    ALO, which refuses one order politely instead of failing the batch.
     """
-    if not (tick > 0.0) or not (price > 0.0):
-        return price
-    steps = price / tick
-    snapped = (int(steps) * tick if price > oracle
-               else (int(steps) + (1 if steps % 1 else 0)) * tick)
-    # Never cross the oracle through rounding: a tick-sized overshoot past
-    # the anchor flips the side of the quote.
+    if not (tick > 0.0) or not (price > 0.0) or not (oracle > 0.0):
+        return price if price > 0.0 else 0.0
+
+    eps = tick * 1e-9
     if price > oracle:
-        snapped = max(snapped, oracle)
+        # Largest grid point <= price, but not below the anchor.
+        snapped = math.floor(price / tick + eps) * tick
+        if snapped < oracle - eps:
+            snapped = math.ceil(oracle / tick - eps) * tick
+            if snapped > price + eps:
+                return 0.0          # no grid point in [oracle, price]
     else:
-        snapped = min(snapped, oracle)
-    return snapped if snapped > 0.0 else price
+        # Smallest grid point >= price, but not above the anchor.
+        snapped = math.ceil(price / tick - eps) * tick
+        if snapped > oracle + eps:
+            snapped = math.floor(oracle / tick + eps) * tick
+            if snapped < price - eps:
+                return 0.0          # no grid point in [price, oracle]
+    return snapped if snapped > 0.0 else 0.0
 
 
 def rescaled_size(size: float, old_price: float, new_price: float,
