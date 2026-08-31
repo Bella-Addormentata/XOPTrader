@@ -69,6 +69,52 @@ _log = logging.getLogger(__name__)
 
 __all__ = ["QuoteRunner", "TickResult"]
 
+#: Batch statuses that mean "the venue took it".
+#:
+#: [live 2026-08-31, contest open] 'batch_upserted' was the venue's ACTUAL
+#: success status and we had never seen it. The set was
+#: ("batch_ok", "batch_partial") -- and the comment beside it admitted
+#: batch_ok was inferred "by symmetry" from the one status a capture had
+#: caught. So every successful batch at the contest open was logged as an
+#: error, and the breaker added below would have throttled a perfectly
+#: healthy loop after five of them.
+BATCH_ACCEPTED = ("batch_ok", "batch_partial", "batch_upserted")
+
+#: Statuses where the venue is explicitly telling us it did NOT take the
+#: batch. These are believed over the legs.
+#:
+#: [review] The leg-trusting fallback below must NOT extend to these. On
+#: 2026-08-30 the venue answered 'batch_failed' during its pre-competition
+#: reset while STILL reporting legs 'placed' -- best-effort placement
+#: inside a failing envelope. Trusting legs there would silently
+#: reclassify a genuine refusal as success and record orders the venue may
+#: have rolled back. Legs are evidence only when the envelope is UNKNOWN.
+BATCH_REJECTED = ("batch_failed", "batch_rejected", "error")
+
+
+def _legs_all_accepted(leg_rows) -> bool:
+    """True when every leg reports the venue acted on it.
+
+    THE STATUS STRING IS NOT THE EVIDENCE, the legs are. Guessing at a
+    closed vocabulary has now failed twice in two days -- once by treating
+    a real success as an error, once by treating a venue outage as our
+    bug. A leg that says 'placed' or 'modified' was accepted whatever the
+    envelope around it is called, so an unknown status with clean legs is
+    trusted, logged once, and does not trip the breaker.
+    """
+    if not isinstance(leg_rows, list) or not leg_rows:
+        return False
+    for row in leg_rows:
+        if not isinstance(row, dict):
+            return False
+        if row.get("rejection_reason"):
+            return False
+        if str(row.get("action", "")).lower() not in ("placed", "modified",
+                                                      "cancelled", "unchanged"):
+            return False
+    return True
+
+
 #: [BATCHBREAKER] Consecutive unrecognised batch statuses before the loop
 #: stops re-sending every tick. Five is ~25s at a 5s tick: long enough that
 #: a genuine transient heals itself, short enough that a systematic
@@ -143,6 +189,9 @@ class QuoteRunner:
         # that the failure path then declined to record.
         self._batch_fail_streak = 0
         self._batch_muted_until_s = 0.0
+        #: Unknown-but-accepted statuses already reported, so the "add it
+        #: to BATCH_ACCEPTED" nudge is logged once rather than every tick.
+        self._unknown_ok_statuses: set = set()
         self._curfew_retract_pending = False
         self._curfew_enabled = curfew_enabled
         self._freeze = OracleFreeze()
@@ -892,7 +941,9 @@ class QuoteRunner:
         # and reconcile() heals the belief from open_orders next tick.
         if isinstance(response, dict):
             status = str(response.get("status", "")).lower()
-            if status in ("batch_ok", "batch_partial"):
+            if (status in BATCH_ACCEPTED
+                    or (status not in BATCH_REJECTED
+                        and _legs_all_accepted(response.get("results")))):
                 if self._batch_fail_streak:
                     _log.info("permuto: batch accepted again after %d "
                               "rejection(s)", self._batch_fail_streak)
@@ -912,8 +963,19 @@ class QuoteRunner:
             # reconcile() heals _resting from open_orders next tick, which
             # also keeps re-sending the rejected leg until it rests.
             leg_rows = response.get("results")
-            if (status in ("batch_ok", "batch_partial")
-                    and isinstance(leg_rows, list)):
+            accepted = status in BATCH_ACCEPTED
+            if (not accepted and status not in BATCH_REJECTED
+                    and _legs_all_accepted(leg_rows)):
+                # Unknown envelope, clean legs: believe the legs.
+                if status not in self._unknown_ok_statuses:
+                    self._unknown_ok_statuses.add(status)
+                    _log.warning(
+                        "permuto: batch status %r is not in the known "
+                        "accepted set %r, but every leg reports the venue "
+                        "acted on it -- treating as success. Add it to "
+                        "BATCH_ACCEPTED.", status, BATCH_ACCEPTED)
+                accepted = True
+            if accepted and isinstance(leg_rows, list):
                 if status == "batch_partial" and not leg_rows:
                     # "partial" with no per-leg detail is unverifiable --
                     # the round-11 rule stands: never record legs as

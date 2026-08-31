@@ -1374,3 +1374,57 @@ def test_the_deferred_retraction_runs_once_a_session_exists():
     assert r._curfew_retract_pending is False, "the retraction never ran"
     assert "cancel_all" in c.calls
     assert c.calls.index("ensure_session") < c.calls.index("cancel_all")
+
+
+# --------------------------------------------------------------------------- #
+# [live 2026-08-31, contest open] The venue's ACTUAL success status is
+# 'batch_upserted', which this code had never seen -- the accepted set was
+# ("batch_ok", "batch_partial") and the comment beside it admitted batch_ok
+# was inferred "by symmetry". Every successful batch at the open was logged
+# as an error, and the breaker would have throttled a healthy loop.
+# --------------------------------------------------------------------------- #
+
+class _UpsertedClient(_Client):
+    def batch_upsert(self, legs, now_s):
+        self.calls.append("batch_upsert")
+        self.last_batch = legs
+        return {"status": "batch_upserted",
+                "results": [{"action": "placed", "order_id": 7},
+                            {"action": "modified", "order_id": 8}]}
+
+
+class _UnknownStatusClient(_Client):
+    def batch_upsert(self, legs, now_s):
+        self.calls.append("batch_upsert")
+        self.last_batch = legs
+        return {"status": "batch_teleported",       # never seen before
+                "results": [{"action": "placed", "order_id": 9}]}
+
+
+def test_batch_upserted_is_a_success_not_an_error():
+    c = _UpsertedClient(account=_account(0.0))
+    r = _runner(c, curfew_enabled=False)
+    result = r.tick(1.0, _ORACLE, {})
+    assert result.action != "error", result.reason
+    assert r._batch_fail_streak == 0
+
+
+def test_an_unknown_status_with_clean_legs_is_believed():
+    # Guessing at a closed vocabulary has failed twice; the legs are the
+    # evidence when the envelope is unfamiliar.
+    c = _UnknownStatusClient(account=_account(0.0))
+    r = _runner(c, curfew_enabled=False)
+    for _ in range(8):
+        r.tick(1.0, _ORACLE, {})
+    assert r._batch_fail_streak == 0
+    assert len([x for x in c.calls if x == "batch_upsert"]) == 8,         "the breaker throttled a working venue"
+
+
+def test_an_explicit_rejection_is_believed_over_its_legs():
+    # The 2026-08-30 case: 'batch_failed' WITH legs reporting 'placed'.
+    # Best-effort placement inside a failing envelope must not read as
+    # success, or a genuine refusal is silently reclassified.
+    c = _RejectingClient(account=_account(0.0))
+    r = _runner(c, curfew_enabled=False)
+    r.tick(1.0, _ORACLE, {})
+    assert r._batch_fail_streak == 1
