@@ -10,7 +10,7 @@ tell us the underlying is shut.
 from __future__ import annotations
 
 from gui.services.permuto.curfew import (
-    OVERNIGHT_SHORT_FRACTION,
+    PREOPEN_EXIT_S,
     CLOSES_UTC,
     EXIT_START_S,
     OPENS_UTC,
@@ -339,3 +339,54 @@ def test_every_state_carries_a_reason():
               CLOSES_UTC[-1] + 86_400.0):
         for frozen in (True, False):
             assert _at(t, frozen=frozen).reason.strip()
+
+
+# --------------------------------------------------------------------------- #
+# PREOPEN -- the retraction PR #130 claimed but did not have
+# --------------------------------------------------------------------------- #
+
+def test_the_short_side_is_shut_before_the_bell():
+    """The gap arrives AT the open, and it fills whatever is resting.
+
+    [review 2026-08-31] PR #130's comment claimed EXIT/SETTLING retract
+    before the open. They do not: SETTLING is gated on since_open >= 0, so
+    it begins AFTER the bell and the whole night is CLOSED. With a non-zero
+    overnight short cap the ask rested straight through the opening jump
+    and was swept BY it -- filled short at pre-gap prices into a +73% to
+    +229% move, which is exactly how this account lost $523k of unrealised
+    P&L on night one.
+    """
+    state = _at(MON_OPEN - 600.0)
+    assert state.stage is Stage.PREOPEN
+    assert state.short_cap_usd == 0.0, "an ask can still rest into the gap"
+
+
+def test_the_long_side_survives_the_pre_open_window():
+    # Long into an upward vol gap is the harmless side, and shutting it too
+    # would forfeit the tail of the cheapest depth window for no gain.
+    assert _at(MON_OPEN - 600.0).long_cap_usd > 0.0
+
+
+def test_the_window_starts_exactly_where_it_says():
+    assert _at(MON_OPEN - PREOPEN_EXIT_S + 1.0).stage is Stage.PREOPEN
+    assert _at(MON_OPEN - PREOPEN_EXIT_S - 60.0).stage is Stage.CLOSED
+
+
+def test_earlier_in_the_night_the_short_side_is_open_for_depth():
+    """The whole point of the change: most of the night still earns."""
+    mid = MON_CLOSE + 3_600.0
+    state = _at(mid)
+    assert state.stage is Stage.CLOSED
+    assert state.short_cap_usd == FULL * OVERNIGHT_SHORT_FRACTION > 0.0
+
+
+def test_a_frozen_oracle_cannot_reopen_the_short_before_the_bell():
+    """A frozen oracle may only ever TIGHTEN.
+
+    Collapsing PREOPEN to CLOSED raised the short cap from 0 to the
+    overnight fraction in the last half hour -- a freeze re-opening the
+    exact side the window exists to shut.
+    """
+    frozen = _at(MON_OPEN - 600.0, frozen=True)
+    assert frozen.short_cap_usd == 0.0
+    assert frozen.short_cap_usd <= _at(MON_OPEN - 600.0, frozen=False).short_cap_usd

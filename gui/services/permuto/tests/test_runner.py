@@ -1198,8 +1198,8 @@ def test_overnight_from_flat_the_runner_quotes_BOTH_sides():
     assert {leg["side"] for leg in c.last_batch} == {"buy", "sell"},         "a one-sided overnight book earns zero depth credit"
 
 
-def test_overnight_a_short_at_the_cap_cannot_grow_any_further():
-    """The bound that replaced the ban. A short AT the overnight cap must
+def test_overnight_a_short_PAST_the_cap_cannot_grow_any_further():
+    """The bound that replaced the ban. A short PAST the overnight cap must
     go reduce-only -- otherwise "small non-zero" becomes "unbounded by
     instalments", one tick at a time, which is how the -$523k short was
     built in the first place.

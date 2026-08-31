@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 from datetime import datetime
 from typing import Any, Optional
 
@@ -504,6 +505,51 @@ class _MarketWorker(QObject):
         try:
             self.done.emit(self._reader())
         except Exception as exc:  # noqa: BLE001 - reported, never raised
+            self.failed.emit(str(exc))
+
+
+class _CloseWorker(QObject):
+    """Read-and-plan, or send, an operator close. Off the GUI thread.
+
+    Two modes rather than one, because the operator must SEE the plan --
+    contracts and notional, per market -- before anything is sent. A
+    single-shot "close everything" button that reports what it did after
+    the fact is not a decision, it is a surprise.
+    """
+
+    planned = Signal(object)      # (legs, summary)
+    sent = Signal(object)         # result dict
+    failed = Signal(str)
+
+    def __init__(self, identity: Any, fraction: float, mode: str,
+                 tif: str = "ioc") -> None:
+        super().__init__()
+        self._identity = identity
+        self._fraction = fraction
+        self._mode = mode
+        self._tif = tif
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            from gui.services.permuto import close_out
+            from gui.services.permuto.client import PermutoClient
+
+            client = PermutoClient(self._identity)
+            client.ensure_session(time.time())
+            now = time.time()
+            prices = _default_market_reader().get("prices") or {}
+
+            if self._mode == "plan":
+                positions = close_out.read_positions(client, now)
+                legs = (close_out.plan_close(positions, self._fraction)
+                        if positions else [])
+                self.planned.emit((legs, close_out.describe(legs, prices)))
+                return
+
+            self.sent.emit(close_out.close_positions(
+                client, now, self._fraction, tif=self._tif, prices=prices))
+        except Exception as exc:  # noqa: BLE001 - shown, never raised
             self.failed.emit(str(exc))
 
 
