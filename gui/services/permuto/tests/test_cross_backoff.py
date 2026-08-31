@@ -1,7 +1,8 @@
 """The anti-cross controller must widen, relax, and never leave the ring."""
 
+from gui.services.permuto.risk import max_price_skew_frac
 from gui.services.permuto.cross_backoff import (
-    BACKOFF_DECAY, BACKOFF_FLOOR_PCT, BACKOFF_STEP_PCT, CrossBackoff,
+    BACKOFF_DECAY, BACKOFF_STEP_PCT, CrossBackoff,
     headroom_pct,
 )
 
@@ -85,12 +86,58 @@ def test_forget_drops_the_learned_offset():
 # --------------------------------------------------------------------------- #
 
 def test_headroom_is_the_ring_less_the_spread():
-    assert headroom_pct(2.0, 0.25) == 1.75
+    # Tolerance, not equality: the bound is computed as a ratio now, and
+    # (1.02 - 1.0) * 100 is 2.0000000000000018 in binary floating point.
+    assert abs(headroom_pct(2.0, 0.25) - 1.75) < 1e-9
 
 
-def test_headroom_subtracts_the_skew_already_applied():
-    # skew_frac is a FRACTION (0.0096 == 0.96%), the units risk.skew_frac uses.
-    assert abs(headroom_pct(2.0, 0.25, 0.0096) - 0.79) < 1e-9
+def test_headroom_composes_the_skew_multiplicatively():
+    """[review] The offsets compose as products, not sums.
+
+    The ladder prices against an already-skewed reference, so the trailing
+    leg is at oracle * (1 + skew) * (1 + offset). Subtracting additively
+    (2.0 - 0.25 - 0.96 = 0.79) let the ask land at
+    (1.0096 * 1.0104 - 1) = 2.0100% -- outside the 2% credit ring, earning
+    nothing, which is exactly what this bound exists to prevent.
+    """
+    room = headroom_pct(2.0, 0.25, 0.0096)
+    assert room < 0.79, "additive arithmetic overstates the room"
+    # And the composed result must genuinely land inside the ring.
+    landed = (1.0096 * (1.0 + (0.25 + room) / 100.0) - 1.0) * 100.0
+    assert landed <= 2.0 + 1e-9, "leg lands at %.4f%%, outside the ring" % landed
+
+
+def test_the_composed_bound_holds_across_every_skew_that_can_occur():
+    """The property, over the domain the system can actually produce.
+
+    The ceiling is risk.max_price_skew_frac, which is itself capped below
+    the ring edge AND below the re-quote trigger -- 0.96% at defaults. Past
+    about 1.75% the configured SPREAD alone already leaves the ring with
+    zero backoff, which is not this function's doing and not something it
+    can fix; testing there would assert an impossibility and fail for the
+    wrong reason.
+    """
+    ring, spread = 2.0, 0.25
+    ceiling = max_price_skew_frac(ring, spread)
+    steps = 200
+    for i in range(steps + 1):
+        skew = ceiling * i / steps
+        room = headroom_pct(ring, spread, skew)
+        landed = ((1.0 + skew) * (1.0 + (spread + room) / 100.0) - 1.0) * 100.0
+        assert landed <= ring + 1e-9, (
+            "skew %.4f + spread %.2f + room %.4f lands at %.4f%%, outside "
+            "the %.1f%% ring" % (skew, spread, room, landed, ring))
+
+
+def test_where_there_is_no_room_the_backoff_contributes_nothing():
+    """Past the point where spread+skew fills the ring, room is zero.
+
+    The leg may still sit outside the ring on spread and skew alone -- that
+    is a quoting-config problem, not a backoff one -- but the controller
+    must not ADD to it.
+    """
+    assert headroom_pct(2.0, 0.25, 0.0175) == 0.0
+    assert headroom_pct(2.0, 3.0) == 0.0
 
 
 def test_headroom_never_goes_negative():
@@ -108,13 +155,15 @@ def test_a_backoff_plus_spread_plus_skew_stays_inside_the_ring():
     module itself.
     """
     ring, spread = 2.0, 0.25
-    for skew in (0.0, 0.005, 0.0096, 0.0175):
+    for skew in (0.0, 0.005, max_price_skew_frac(ring, spread)):
         room = headroom_pct(ring, spread, skew)
         b = CrossBackoff()
         for _ in range(50):
             b.observe_cross(_MKT, headroom_pct=room)
-        total = spread + abs(skew) * 100.0 + b.offset_pct(_MKT)
-        assert total <= ring + 1e-9, (
-            "spread %.2f + skew %.2f%% + backoff %.2f = %.4f, outside the "
-            "%.2f%% ring" % (spread, skew * 100.0, b.offset_pct(_MKT),
-                             total, ring))
+        landed = ((1.0 + abs(skew))
+                  * (1.0 + (spread + b.offset_pct(_MKT)) / 100.0)
+                  - 1.0) * 100.0
+        assert landed <= ring + 1e-9, (
+            "spread %.2f + skew %.2f%% + backoff %.2f composes to %.4f%%, "
+            "outside the %.2f%% ring" % (spread, skew * 100.0,
+                                         b.offset_pct(_MKT), landed, ring))

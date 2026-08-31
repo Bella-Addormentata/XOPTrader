@@ -1870,3 +1870,64 @@ def test_a_clean_market_relaxes_back_toward_its_spread():
         r._resting = {}
         r.tick(_MID_SESSION + i * 5.0, _ORACLE, {})
     assert r._cross_backoff.offset_pct(_MKT) < widened,         "the backoff never relaxed once the venue stopped refusing us"
+
+# --------------------------------------------------------------------------- #
+# [ANTICROSS review] Refusal matching, and what counts as a clean tick.
+# --------------------------------------------------------------------------- #
+
+def _venue_reason(reason, idx=(0, 1)):
+    def build(legs):
+        return {"status": "batch_ok",
+                "results": [{"action": "placed",
+                             "rejection_reason": reason if i in idx else None}
+                            for i, _ in enumerate(legs)]}
+    return build
+
+
+def test_the_short_refusal_spelling_also_widens_the_backoff():
+    """The venue's wording is not one fixed sentence.
+
+    Live it sends "Post-only order would cross the book. Switch to GTC or
+    adjust price."; this repo's own fixtures carry the shorter "post-only
+    order would cross". An exact match on "cross the book" skipped the
+    short form, so a refusal took the CLEAN path and DECAYED the backoff
+    instead of widening it -- precisely backwards, and invisible because
+    both spellings look alike at a glance.
+    """
+    c = _Client(account=_account(100.0),
+                batch_response=_venue_reason("post-only order would cross"))
+    r = _runner(c, curfew_enabled=True)
+    r.tick(_MID_SESSION, _ORACLE, {})
+    assert r._cross_backoff.offset_pct(_MKT) > 0.0,         "the short refusal spelling was treated as a clean tick"
+
+
+def test_a_capitalised_full_sentence_refusal_still_matches():
+    c = _Client(account=_account(100.0),
+                batch_response=_venue_reason(
+                    "Post-only order would cross the book. Switch to GTC "
+                    "or adjust price."))
+    r = _runner(c, curfew_enabled=True)
+    r.tick(_MID_SESSION, _ORACLE, {})
+    assert r._cross_backoff.offset_pct(_MKT) > 0.0
+
+
+def test_a_non_crossing_refusal_does_not_decay_the_backoff():
+    """A margin or band rejection is not evidence we stopped crossing.
+
+    Those never reach the venue's post-only check at all, so treating them
+    as a clean tick walks the learned offset back while the book is exactly
+    where it was -- undoing convergence during the other refusal classes.
+    """
+    c = _Client(account=_account(100.0),
+                batch_response=_venue_reason(
+                    "Post-only order would cross the book."))
+    r = _runner(c, curfew_enabled=True)
+    r.tick(_MID_SESSION, _ORACLE, {})
+    widened = r._cross_backoff.offset_pct(_MKT)
+    assert widened > 0.0
+
+    c.batch_response = _venue_reason(
+        "Price 0.0999 is outside the allowed oracle band")
+    r._resting = {}
+    r.tick(_MID_SESSION + 5.0, _ORACLE, {})
+    assert r._cross_backoff.offset_pct(_MKT) == widened,         "a band rejection decayed the crossing backoff"

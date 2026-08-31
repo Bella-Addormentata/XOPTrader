@@ -96,6 +96,20 @@ BATCH_ACCEPTED = ("batch_ok", "batch_partial", "batch_upserted")
 BATCH_REJECTED = ("batch_failed", "batch_rejected", "error")
 
 
+def _is_cross_refusal(reason: str) -> bool:
+    """True when the venue refused this leg for crossing the book.
+
+    [review] Matched on the STABLE markers, not the full sentence. The live
+    venue sends "Post-only order would cross the book. Switch to GTC or
+    adjust price." but this repo's own fixtures carry the shorter
+    "post-only order would cross", and an exact-phrase match on "cross the
+    book" silently skipped those -- so a refusal took the CLEAN path and
+    decayed the backoff instead of widening it, which is precisely
+    backwards.
+    """
+    return "post-only" in reason and "cross" in reason
+
+
 def _legs_all_accepted(leg_rows) -> bool:
     """True when every leg reports the venue acted on it.
 
@@ -1271,13 +1285,24 @@ class QuoteRunner:
             # if ANY leg here crossed, the market retreats; if none did, it
             # relaxes back toward the configured spread.
             if isinstance(leg_rows, list) and leg_rows:
-                crossed = set()
+                crossed, seen, dirty = set(), set(), set()
                 for leg, row in zip(legs, leg_rows):
                     if not isinstance(row, dict):
+                        # A row we cannot parse tells us nothing about this
+                        # market, so it must not count as a clean tick.
+                        dirty.add(leg.market)
                         continue
-                    if "cross the book" in str(
-                            row.get("rejection_reason") or "").lower():
+                    seen.add(leg.market)
+                    reason = str(row.get("rejection_reason") or "").lower()
+                    if _is_cross_refusal(reason):
                         crossed.add(leg.market)
+                    elif reason:
+                        # [review] A NON-crossing refusal is not evidence
+                        # that our price stopped crossing. Margin and band
+                        # rejections never reach the post-only check at all,
+                        # so decaying on them walks the learned offset back
+                        # while the book is still exactly where it was.
+                        dirty.add(leg.market)
                 for mkt in {l.market for l in legs}:
                     if mkt in crossed:
                         self._cross_backoff.observe_cross(
@@ -1285,7 +1310,9 @@ class QuoteRunner:
                             headroom_pct(self._ring_pct,
                                          self._half_spread_pct,
                                          self._last_skew.get(mkt, 0.0)))
-                    else:
+                    elif mkt in seen and mkt not in dirty:
+                        # Only a market whose every row came back present and
+                        # ACCEPTED has actually demonstrated it rests.
                         self._cross_backoff.observe_clean(mkt)
 
             credit_usd = _credit_for(rested)
