@@ -1536,3 +1536,63 @@ def test_re_anchored_legs_are_sent_on_the_venue_tick_grid():
     for leg in c.last_batch:
         ticks = float(leg["price"]) / 0.0001
         assert abs(round(ticks) - ticks) < 1e-6, "off-grid price %r" % leg
+
+
+# --------------------------------------------------------------------------- #
+# [live 2026-08-31] POSITION SIGN. The venue reports a position as
+# {"side": "sell", "size": "812520"} -- an unsigned magnitude plus a
+# direction. Reading `size` alone recorded a short as a LONG, and every
+# risk control downstream ran inverted: the loop "reduced" its phantom
+# long by SELLING, which grew the real short all session.
+#
+# Every pre-existing test used the DICT form of `positions`, which carries
+# a signed number, so the list form the venue actually sends was untested.
+# --------------------------------------------------------------------------- #
+
+def _account_rows(rows):
+    return {"equity_usd": 100_000.0, "used_margin_usd": 0.0,
+            "positions": rows}
+
+
+def _pos(market, side, size):
+    return {"market": market, "side": side, "size": str(size)}
+
+
+def test_a_sell_position_parses_as_a_short():
+    from gui.services.permuto.runner import _margin_state
+    st = _margin_state(_account_rows([_pos(_MKT, "sell", 812520)]), False)
+    assert st.positions[_MKT] == -812520.0
+
+
+def test_a_buy_position_parses_as_a_long():
+    from gui.services.permuto.runner import _margin_state
+    st = _margin_state(_account_rows([_pos(_MKT, "buy", 500)]), False)
+    assert st.positions[_MKT] == 500.0
+
+
+def test_an_absent_side_keeps_the_magnitude_rather_than_guessing():
+    from gui.services.permuto.runner import _margin_state
+    st = _margin_state(
+        _account_rows([{"market": _MKT, "size": "42"}]), False)
+    assert st.positions[_MKT] == 42.0
+
+
+def test_a_short_is_reduced_by_BUYING_not_selling():
+    """THE BUG, end to end. A short past the cap must quote the side that
+    shrinks it. Before the sign fix this emitted asks, and every ask that
+    filled made the short larger."""
+    c = _Client(account=_account_rows([_pos(_MKT, "sell", 812520)]))
+    r = _runner(c, curfew_enabled=False, max_position_usd=7.0)
+    r.tick(_MID_SESSION, _ORACLE, {})
+    assert c.last_batch, "expected a reducing quote"
+    sides = {leg["side"] for leg in c.last_batch}
+    assert sides == {"buy"}, "a short must be reduced by buying, got %s" % sides
+    assert all(leg["reduce_only"] for leg in c.last_batch)
+
+
+def test_a_long_is_still_reduced_by_selling():
+    c = _Client(account=_account_rows([_pos(_MKT, "buy", 812520)]))
+    r = _runner(c, curfew_enabled=False, max_position_usd=7.0)
+    r.tick(_MID_SESSION, _ORACLE, {})
+    assert c.last_batch
+    assert {leg["side"] for leg in c.last_batch} == {"sell"}

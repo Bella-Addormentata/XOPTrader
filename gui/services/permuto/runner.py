@@ -1275,11 +1275,32 @@ def _margin_state(account: Any, carried: bool) -> MarginState:
             if market is None:
                 continue
             try:
-                positions[market] = float(
-                    row.get("size", row.get("position", 0.0))
-                )
+                size = float(row.get("size", row.get("position", 0.0)))
             except (TypeError, ValueError):
                 positions[market] = float("nan")
+                continue
+            # [live 2026-08-31] SIGN THE SIZE. The venue reports a position
+            # as {"side": "sell", "size": "812520"} -- an UNSIGNED magnitude
+            # plus a direction. Reading `size` alone recorded an 812,520
+            # contract SHORT as a +812,520 LONG, and every risk control
+            # downstream then ran inverted:
+            #
+            #   * assess() saw a huge long and returned REDUCE_ONLY;
+            #   * REDUCE_ONLY keeps the leg that shrinks a LONG -- the ASK;
+            #   * each of those asks GREW the real short, and the skew for a
+            #     phantom long priced them aggressively below the oracle,
+            #     which is why 156 consecutive rejections were "Aggressive
+            #     ask" and not one was a bid.
+            #
+            # The loop spent the session enlarging the position it believed
+            # it was unwinding. Absent or unrecognised side keeps the raw
+            # magnitude rather than guessing a direction.
+            side = str(row.get("side", "")).strip().lower()
+            if side in ("sell", "short", "s", "ask"):
+                size = -abs(size)
+            elif side in ("buy", "long", "b", "bid"):
+                size = abs(size)
+            positions[market] = size
 
     # [live 2026-08-29] The venue's /exchange/account payload, observed on
     # the first authenticated tick ever (every earlier attempt 422'd on
