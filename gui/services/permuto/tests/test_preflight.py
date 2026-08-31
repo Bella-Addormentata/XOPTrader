@@ -159,3 +159,61 @@ def test_an_ask_far_below_the_oracle_is_pulled_back_to_the_ring():
     out = _pf(0.05, 0.10, latency=0.0, vel=0.0, is_buy=False)
     assert out.changed
     assert out.price >= 0.10 * 0.98 - 1e-12
+
+
+# --------------------------------------------------------------------------- #
+# [Copilot review] Re-anchored prices must land on the venue grid, and
+# re-pricing must not silently re-size the leg.
+# --------------------------------------------------------------------------- #
+
+from gui.services.permuto.preflight import (          # noqa: E402
+    DEFAULT_TICK, quantise_toward, rescaled_size,
+)
+
+
+def _on_grid(p, tick=DEFAULT_TICK):
+    return abs(round(p / tick) - p / tick) < 1e-6
+
+
+def test_the_reported_off_grid_price_is_snapped():
+    # 0.092925 is 929.25 ticks at 0.0001 -- the venue's strict validator
+    # can refuse the leg and take the batch with it.
+    assert not _on_grid(0.092925)
+    assert _on_grid(quantise_toward(0.092925, 0.09))
+
+
+def test_rounding_moves_toward_the_oracle_never_past_it():
+    below = quantise_toward(0.0929251, 0.09)      # above oracle -> round down
+    assert below <= 0.0929251 and below >= 0.09
+    above = quantise_toward(0.0870749, 0.09)      # below oracle -> round up
+    assert above >= 0.0870749 and above <= 0.09
+
+
+def test_quantise_never_crosses_the_anchor():
+    # A tick-sized overshoot past the oracle would flip the quote's side.
+    assert quantise_toward(0.099999, 0.10) <= 0.10
+    assert quantise_toward(0.100001, 0.10) >= 0.10
+
+
+def test_degenerate_tick_or_price_is_left_alone():
+    assert quantise_toward(0.05, 0.06, tick=0.0) == 0.05
+    assert quantise_toward(0.0, 0.06) == 0.0
+
+
+def test_re_anchoring_holds_notional_constant():
+    # Sizing at 0.09 and sending near 0.10 was ~11% more USD than the cap
+    # allowed. Rescaling keeps the leg worth what it was sized to be.
+    size = rescaled_size(1000.0, 0.09, 0.10)
+    assert abs(size * 0.10 - 1000.0 * 0.09) <= 0.10   # within one lot
+    assert size == int(size)                          # whole contracts
+
+
+def test_rescale_is_lot_quantised_and_never_negative():
+    assert rescaled_size(3.0, 0.10, 0.09) == 3.0      # 3.33 -> 3 lots
+    assert rescaled_size(0.4, 0.10, 0.90) == 0.0      # rounds away entirely
+    assert rescaled_size(0.0, 0.1, 0.1) == 0.0
+
+
+def test_rescale_leaves_junk_inputs_untouched():
+    assert rescaled_size(50.0, 0.0, 0.1) == 50.0
+    assert rescaled_size(50.0, 0.1, 0.0) == 50.0

@@ -46,7 +46,8 @@ from .orders import Side, quote_ladder
 from .quoting import LoopAction, RestingQuote, VenueView, decide
 from .risk import MarginState, RiskAction, assess, skewed_reference
 from .band_guard import VENUE_BAND_PCT, BandGuard
-from .preflight import latest_oracle, preflight_leg_price, stand_down
+from .preflight import (latest_oracle, preflight_leg_price,
+                        quantise_toward, rescaled_size)
 from .curfew import OracleFreeze, assess_curfew, permitted_leg_size
 from .session import RenewAction
 
@@ -996,6 +997,8 @@ class QuoteRunner:
 
         if legs:
             kept = []
+            send_refs: dict = {}
+            preflight_cancel: set = set()
             for leg in legs:
                 oracle_now = latest_oracle(fresh_oracles, oracles, leg.market)
                 if oracle_now <= 0.0:
@@ -1012,10 +1015,27 @@ class QuoteRunner:
                     if leg.market not in results or results[leg.market][0] in (
                             "quote", "hold"):
                         results[leg.market] = ("skip", out.reason)
+                    # [review] Omitting a leg from an upsert does NOT retract
+                    # the quote already resting for that (market, side) --
+                    # the venue keeps it. So a stand-down would leave the old
+                    # book live at prices preflight has just judged unsafe,
+                    # which is the opposite of standing down. Retract it.
+                    preflight_cancel.add(leg.market)
                     continue
                 if out.changed:
-                    leg = type(leg)(leg.market, leg.side, out.price,
-                                    leg.size, leg.reduce_only)
+                    # ON the venue grid, and re-sized so re-pricing does not
+                    # quietly change the notional (see rescaled_size).
+                    new_price = quantise_toward(out.price, oracle_now)
+                    new_size = rescaled_size(leg.size, leg.price, new_price)
+                    if new_size <= 0.0:
+                        preflight_cancel.add(leg.market)
+                        continue
+                    leg = type(leg)(leg.market, leg.side, new_price,
+                                    new_size, leg.reduce_only)
+                # [review] The validator must see the SAME per-leg reference
+                # preflight used -- not a raw merge of a fetch that may carry
+                # junk for some market. latest_oracle already vetted this one.
+                send_refs[leg.market] = oracle_now
                 kept.append(leg)
             dropped = len(legs) - len(kept)
             if dropped:
@@ -1023,6 +1043,18 @@ class QuoteRunner:
                           "band would have refused (latency %.0fms)",
                           dropped, len(legs), self._send_latency_s * 1000.0)
             legs = kept
+            # Retract anything preflight refused to replace, before the
+            # surviving siblings go out.
+            if preflight_cancel:
+                try:
+                    self._client.cancel_all(now_s, sorted(preflight_cancel))
+                except Exception as exc:  # noqa: BLE001
+                    _log.warning("permuto: could not retract %s after a "
+                                 "preflight drop (%s)",
+                                 sorted(preflight_cancel), exc)
+                else:
+                    for market in preflight_cancel:
+                        self._resting[market] = RestingQuote()
             if not legs:
                 return TickResult(
                     "skip",
@@ -1035,8 +1067,13 @@ class QuoteRunner:
         # -- because the leg had been correctly moved to fit an oracle the
         # validator had not been told about.
         send_oracles = dict(oracles or {})
-        if fresh_oracles:
-            send_oracles.update(fresh_oracles)
+        # Only the per-leg references preflight actually validated, never a
+        # raw merge: a fetch carrying a junk value for one market would
+        # otherwise poison the validator for that market.
+        try:
+            send_oracles.update(send_refs)
+        except NameError:                       # no legs -> no preflight pass
+            pass
         payload = build_upsert_batch(legs, send_oracles,
                                      ring_pct=self._ring_pct)
         response = self._client.batch_upsert(payload, now_s)
@@ -1138,7 +1175,12 @@ class QuoteRunner:
                 _log.warning(
                     "permuto: batch_upsert returned status %r (body %r); "
                     "believing open_orders over our own send",
-                    status, str(response)[:400])
+                    # [diagnostic 2026-08-31] 400 chars truncated the body
+                    # before the per-leg rejection_reason fields, which is
+                    # exactly where the explanation for a repeating
+                    # 'batch_failed' lives. Widened to capture one whole
+                    # response; narrow again once the cause is known.
+                    status, str(response)[:4000])
                 return TickResult(
                     "error",
                     "batch status %r -- legs not recorded as resting; "

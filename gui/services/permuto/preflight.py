@@ -47,13 +47,24 @@ Pure module: arithmetic only, no I/O.  The caller owns the fetch.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping, Optional, Sequence
+from typing import Mapping, Optional
 
 __all__ = [
     "PreflightOutcome",
     "preflight_leg_price",
+    "quantise_toward",
+    "rescaled_size",
     "stand_down",
 ]
+
+#: The venue's price grid (/info/meta tick_size, 0.0001 on every market
+#: today).  Not yet threaded from meta -- a follow-up; the value is stable
+#: and a wrong-but-finer grid would only round more often, never produce
+#: an illegal price.
+DEFAULT_TICK = 0.0001
+
+#: Whole contracts (/info/meta lot_size = 1).
+DEFAULT_LOT = 1.0
 
 #: Fraction of the band kept in reserve for what cannot be measured: the
 #: venue's own resample cadence, clock skew, and the fact that the next
@@ -164,3 +175,50 @@ def latest_oracle(
         if isinstance(value, (int, float)) and value > 0.0:
             return float(value)
     return 0.0
+
+
+def quantise_toward(price: float, oracle: float,
+                    tick: float = DEFAULT_TICK) -> float:
+    """Snap `price` to the venue tick grid, rounding TOWARD the oracle.
+
+    [review] Re-anchoring produced prices off the grid -- the 0.09 clamp
+    yields 0.092925, which is 929.25 ticks at the live 0.0001 size, and
+    the venue's strict validator can refuse the leg and with it the whole
+    batch.  So the clamp has to land ON the grid.
+
+    Rounding is toward the oracle rather than by the maker convention
+    (bids down, asks up) because the failure being fixed here is the BAND,
+    and one tick is 0.05-0.2% at these prices -- small against a 5% band
+    but the wrong direction still spends margin we may not have.  Crossing
+    in the other direction is caught per-leg by ALO, which refuses one
+    order politely instead of failing the batch.
+    """
+    if not (tick > 0.0) or not (price > 0.0):
+        return price
+    steps = price / tick
+    snapped = (int(steps) * tick if price > oracle
+               else (int(steps) + (1 if steps % 1 else 0)) * tick)
+    # Never cross the oracle through rounding: a tick-sized overshoot past
+    # the anchor flips the side of the quote.
+    if price > oracle:
+        snapped = max(snapped, oracle)
+    else:
+        snapped = min(snapped, oracle)
+    return snapped if snapped > 0.0 else price
+
+
+def rescaled_size(size: float, old_price: float, new_price: float,
+                  lot: float = DEFAULT_LOT) -> float:
+    """Hold NOTIONAL constant when a leg is re-anchored, floored to a lot.
+
+    [review] The re-anchored price kept the size computed against the
+    stale oracle, so an upward move inflated the leg's notional -- sizing
+    at 0.09 and sending near 0.10 is ~11% more USD than target_depth_usd
+    or the curfew cap allowed.  Re-pricing must not quietly re-size.
+    """
+    if not (size > 0.0) or not (old_price > 0.0) or not (new_price > 0.0):
+        return size
+    scaled = size * old_price / new_price
+    if lot > 0.0:
+        scaled = int(scaled / lot) * lot
+    return scaled if scaled > 0.0 else 0.0

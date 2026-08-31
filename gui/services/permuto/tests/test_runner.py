@@ -1511,3 +1511,28 @@ def test_a_violently_moving_oracle_sends_nothing_rather_than_a_400():
     c.last_batch = None
     r.tick(_MID_SESSION + 5.0, {_MKT: 0.070}, {})
     assert c.last_batch is None, "sent into a market it cannot price"
+
+
+def test_a_preflight_drop_retracts_the_quote_it_cannot_replace():
+    """[Copilot review] Omitting a leg from an upsert does NOT retract the
+    quote already resting for that (market, side) -- the venue keeps it. A
+    stand-down that leaves the old book live is the opposite of standing
+    down."""
+    c = _Client(account=_account(0.0))
+    # Violent move: velocity high enough that no price survives the flight.
+    r = _runner(c, curfew_enabled=False, oracle_fetch=lambda: {_MKT: 0.05})
+    r.tick(_MID_SESSION, {_MKT: 0.100}, {})
+    r._send_latency_s = 30.0
+    c.calls.clear()
+    r.tick(_MID_SESSION + 5.0, {_MKT: 0.050}, {})
+    assert "cancel_all" in c.calls, "left an unsafe quote resting"
+
+
+def test_re_anchored_legs_are_sent_on_the_venue_tick_grid():
+    c = _Client(account=_account(0.0))
+    r = _runner(c, curfew_enabled=False, oracle_fetch=lambda: {_MKT: 0.09})
+    r.tick(_MID_SESSION, {_MKT: 0.10}, {})
+    assert c.last_batch
+    for leg in c.last_batch:
+        ticks = float(leg["price"]) / 0.0001
+        assert abs(round(ticks) - ticks) < 1e-6, "off-grid price %r" % leg
