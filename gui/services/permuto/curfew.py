@@ -281,6 +281,7 @@ class OracleFreeze:
     confirm_s: float = FREEZE_CONFIRM_S
     _last: dict = field(default_factory=dict)
     _changed_at_s: float = 0.0
+    _changed_at_by_market_s: dict = field(default_factory=dict)
     _seeded: bool = False
 
     def observe(self, now_s: float, oracles: Mapping[str, float]) -> None:
@@ -298,6 +299,9 @@ class OracleFreeze:
         for market, value in oracles.items():
             if self._last.get(market) != value:
                 changed = True
+                self._changed_at_by_market_s[market] = now_s
+            elif market not in self._changed_at_by_market_s:
+                self._changed_at_by_market_s[market] = now_s
             self._last[market] = value
         if changed or not self._seeded:
             self._changed_at_s = now_s
@@ -319,6 +323,13 @@ class OracleFreeze:
         if not self._seeded:
             return -1.0
         return max(0.0, now_s - self._changed_at_s)
+
+    def market_frozen(self, market: str, now_s: float) -> bool:
+        """True once this market has not changed for `confirm_s`."""
+        changed_at = self._changed_at_by_market_s.get(market)
+        if changed_at is None:
+            return False
+        return (now_s - changed_at) >= self.confirm_s
 
 
 @dataclass(frozen=True)

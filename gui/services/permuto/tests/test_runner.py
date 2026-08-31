@@ -2003,6 +2003,24 @@ def test_a_frozen_oracle_after_the_bell_stops_the_runner_quoting():
     assert "not printed" in res.markets[_MKT][1], res.markets[_MKT]
 
 
+def test_a_single_opening_print_does_not_mark_every_market_fresh():
+    """One market printing at the bell must not re-enable stale neighbours."""
+    c = _Client(account=_account(0.0), batch_response=_venue_ok())
+    r = _runner2(c, curfew_enabled=True)
+    t0 = OPENS_UTC[0] + 60.0
+    for k in range(6):                      # confirm both as frozen first
+        r.tick(t0 - 300.0 + k * 60.0, _BOTH, {})
+
+    # NVDA prints; QQQ is still frozen at the opening price.
+    res = r.tick(t0, {_MKT: _BOTH[_MKT], _MKT2: _BOTH[_MKT2] + 0.0001}, {})
+
+    assert res.markets.get(_MKT, ("", ""))[0] == "skip", res.markets
+    assert "not printed" in res.markets[_MKT][1], res.markets[_MKT]
+    assert res.markets.get(_MKT2, ("", ""))[0] == "quote", res.markets
+    assert getattr(c, "last_batch", None), "no quote sent for the fresh market"
+    assert {leg["market"] for leg in c.last_batch} == {_MKT2}, c.last_batch
+
+
 def test_the_widened_spread_is_budgeted_by_risk_too():
     """[review] The spread must be ONE number everywhere.
 

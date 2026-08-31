@@ -759,10 +759,9 @@ class QuoteRunner:
                              or self._curfew.stage)
         profile = profile_for(
             posture_stage,
-            # frozen() is a METHOD taking now_s, not a property: passing the
-            # bound method reads as permanently truthy, which would pin
-            # oracle_fresh to False and stop SETTLING ever quoting.
-            oracle_fresh=not self._freeze.frozen(now_s))
+            # Stage-level width/depth posture only; stale-open gating is
+            # MARKET-local and applied inside the loop below.
+            oracle_fresh=True)
         eff_half_spread = self._half_spread_pct * profile.spread_mult
         self._eff_half_spread = eff_half_spread
 
@@ -923,12 +922,16 @@ class QuoteRunner:
             # [MODES] The stage decides the POSTURE, the curfew and risk
             # decide the LIMITS -- the profile is applied first precisely so
             # both can still only reduce it, never the other way round.
-            if not profile.quote:
-                results[market] = ("skip", profile.reason)
+            market_profile = profile_for(
+                posture_stage,
+                oracle_fresh=not self._freeze.market_frozen(market, now_s),
+            )
+            if not market_profile.quote:
+                results[market] = ("skip", market_profile.reason)
                 continue
-            depth_usd *= profile.depth_mult
+            depth_usd *= market_profile.depth_mult
             if depth_usd <= 0.0:
-                results[market] = ("skip", profile.reason)
+                results[market] = ("skip", market_profile.reason)
                 continue
             ladder = quote_ladder(
                 market, reference, depth_usd,
