@@ -42,10 +42,12 @@ from typing import Any, Optional
 from .auth import PermutoAuthError
 from .batch import BatchError, build_upsert_batch
 from .client import PermutoNotLinked
-from .orders import Side, quote_ladder
+from .orders import Side, depth_credit_usd, quote_ladder
 from .quoting import LoopAction, RestingQuote, VenueView, decide
 from .risk import MarginState, RiskAction, assess, skewed_reference
-from .band_guard import BandGuard
+from .band_guard import VENUE_BAND_PCT, BandGuard
+from .preflight import (latest_oracle, preflight_leg_price,
+                        quantise_toward, rescaled_size)
 from .curfew import OracleFreeze, assess_curfew, permitted_leg_size
 from .session import RenewAction
 
@@ -161,6 +163,7 @@ class QuoteRunner:
         ring_pct: float = 2.0,
         half_spread_pct: float = 0.25,
         quote_when_carried: bool = True,
+        oracle_fetch: Any = None,
     ) -> None:
         self._client = client
         self._markets = list(markets)
@@ -198,6 +201,17 @@ class QuoteRunner:
         # open, whole minutes of batches 400'd because grace-aged reads
         # plus the 2% ring overshot the band while the oracle collapsed.
         self._band_guard = BandGuard()
+        # [PREFLIGHT] Optional callable returning {market: price}, invoked
+        # immediately BEFORE the batch is sent. band_guard anchors to the
+        # tick's read and measures staleness as fetch age -- but age is not
+        # divergence: a 2s-old read is 5% behind when vol collapses 20% a
+        # minute, which is how "Price 0.047 outside band (+/-5% of 0.04423)"
+        # happened with a fresh fetch. Re-reading here shrinks the exposure
+        # to one request's flight time, measured rather than assumed.
+        self._oracle_fetch = oracle_fetch
+        #: Measured duration of the last pre-send fetch: the best estimate
+        #: of how long the NEXT request will take.
+        self._send_latency_s = 0.25
         self._curfew_retract_pending = False
         self._curfew_enabled = curfew_enabled
         self._freeze = OracleFreeze()
@@ -959,7 +973,201 @@ class QuoteRunner:
                 "orders behind. Check open orders at the venue.",
                 self._batch_fail_streak)
 
-        payload = build_upsert_batch(legs, oracles, ring_pct=self._ring_pct)
+        # [PREFLIGHT] Re-anchor to the oracle as it is RIGHT NOW, not as
+        # it was when this tick started pricing. One out-of-band leg 400s
+        # the WHOLE batch, so a leg we decline to send is strictly cheaper
+        # than the rejection it would have caused.
+        #
+        # [review round 3] The first pass and the post-cancel second pass
+        # now share ONE helper. They were separate code and the copy
+        # drifted immediately: the second pass quantised at the default
+        # tick instead of the market published one, and kept the original
+        # size after re-pricing. Two passes that must agree should not be
+        # two pieces of code.
+        send_refs = {}
+
+        def _fetch_refs():
+            # (prices, elapsed). {} on failure -- and the elapsed time is
+            # folded into the latency estimate either way.
+            #
+            # [review] A failed fetch can burn the whole request timeout.
+            # The earlier version left _send_latency_s untouched on that
+            # path and then priced off the OLDER tick oracle, so preflight
+            # ignored a delay it had just incurred -- exactly when the
+            # market is moving fast enough to make the fetch slow.
+            t0 = time.perf_counter()
+            try:
+                got = self._oracle_fetch()
+            except Exception as exc:  # noqa: BLE001
+                _log.debug("permuto: pre-send oracle fetch failed (%s)", exc)
+                got = None
+            elapsed = time.perf_counter() - t0
+            self._send_latency_s = (0.7 * self._send_latency_s
+                                    + 0.3 * elapsed)
+            return (got if isinstance(got, dict) and got else {}), elapsed
+
+        def _prepare(pending, sources):
+            # Re-anchor legs against `sources`, newest reference first.
+            # Returns (kept, dropped_markets).
+            #
+            # EVERY retained leg is quantised on its own market grid, not
+            # only the ones this pass re-priced: an earlier band-guard
+            # clamp can already have left an off-grid boundary, and
+            # build_upsert_batch does not validate tick alignment.
+            kept_legs, dropped = [], set()
+            for leg in pending:
+                ref = 0.0
+                for src in sources:
+                    ref = latest_oracle(src, None, leg.market)
+                    if ref > 0.0:
+                        break
+                if ref <= 0.0:
+                    kept_legs.append(leg)
+                    continue
+
+                raw_specs = flags.get("specs")
+                mspec = (raw_specs.get(leg.market, {})
+                         if isinstance(raw_specs, dict) else {})
+                m_tick = float(mspec.get("tick_size", 0.0001) or 0.0001)
+                m_lot = float(mspec.get("lot_size", 1.0) or 1.0)
+
+                out = preflight_leg_price(
+                    leg.price, ref,
+                    band_pct=VENUE_BAND_PCT,
+                    latency_s=self._send_latency_s,
+                    velocity_pct_per_s=self._band_guard.velocity(leg.market),
+                    is_buy=leg.side is Side.BUY,
+                    ring_pct=self._ring_pct)
+                if out.dropped:
+                    results[leg.market] = ("skip", out.reason)
+                    dropped.add(leg.market)
+                    continue
+
+                price = quantise_toward(
+                    out.price if out.changed else leg.price, ref, m_tick)
+                if price <= 0.0:
+                    results[leg.market] = (
+                        "skip", "no on-grid price inside the band")
+                    dropped.add(leg.market)
+                    continue
+                size = (rescaled_size(leg.size, leg.price, price, m_lot)
+                        if price != leg.price else leg.size)
+                if size <= 0.0:
+                    results[leg.market] = ("skip", "size rounds to nothing")
+                    dropped.add(leg.market)
+                    continue
+                if price != leg.price or size != leg.size:
+                    leg = type(leg)(leg.market, leg.side, price, size,
+                                    leg.reduce_only)
+                send_refs[leg.market] = ref
+                kept_legs.append(leg)
+            return kept_legs, dropped
+
+        def _retract(markets, note):
+            # True when the book is safe to build on. A failed retraction
+            # leaves an unsafe quote resting, and sending siblings beside
+            # it is the state stand-down exists to prevent.
+            try:
+                self._client.cancel_all(now_s, sorted(markets))
+            except Exception as exc:  # noqa: BLE001
+                _log.warning("permuto: could not retract %s (%s): %s",
+                             sorted(markets), note, exc)
+                return False
+            for market in markets:
+                self._resting[market] = RestingQuote()
+            return True
+
+        fresh_oracles = {}
+        if self._oracle_fetch is not None and legs:
+            fresh_oracles, _ = _fetch_refs()
+            legs, preflight_cancel = _prepare(legs, (fresh_oracles, oracles))
+
+            if preflight_cancel:
+                if not _retract(preflight_cancel, "first pass"):
+                    return TickResult(
+                        "skip",
+                        "unsafe quote still resting; retraction failed",
+                        results)
+
+                # That cancel was an authenticated round trip, so the
+                # survivors have aged. Re-read and re-price them. If the
+                # read is unavailable we do NOT fall back to pre-cancel
+                # references -- that is the very ageing this exists to
+                # avoid.
+                if legs:
+                    again, _ = _fetch_refs()
+                    if not again:
+                        return TickResult(
+                            "skip",
+                            "post-cancel oracle read unavailable; not "
+                            "sending on pre-cancel prices",
+                            results)
+                    # Newest first: second read, first pre-send read, tick.
+                    legs, dropped2 = _prepare(
+                        legs, (again, fresh_oracles, oracles))
+                    if dropped2 and not _retract(dropped2, "second pass"):
+                        return TickResult(
+                            "skip",
+                            "unsafe quote still resting after the second "
+                            "pass", results)
+
+            if not legs:
+                return TickResult(
+                    "skip",
+                    "every leg would have been refused by the oracle band",
+                    results)
+
+        send_oracles = dict(oracles or {})
+        # Only the per-leg references preflight actually validated, never a
+        # raw merge: a fetch carrying a junk value for one market would
+        # otherwise poison the validator for that market.
+        try:
+            send_oracles.update(send_refs)
+        except NameError:                       # no legs -> no preflight pass
+            pass
+        # [DEPTHSIGNAL] What this batch is worth in eligibility terms,
+        # computed locally, BEFORE it is sent.
+        #
+        # The venue's own depth_seconds counter cannot serve as the feedback
+        # signal: sampled every 60s on 2026-08-31 during the cash session it
+        # was byte-identical for ALL 39 market makers across three minutes,
+        # while total_pnl moved on every sample. It is published on a
+        # coarse, batched cadence, so "did that tick earn anything?" is
+        # unanswerable from the leaderboard at tick resolution.
+        #
+        # depth_credit_usd() is the same min(bid, ask)-inside-the-ring rule
+        # the venue credits, so a zero here means this tick banks nothing --
+        # which is precisely the one-sided-book failure the note below
+        # describes and which was, until now, completely silent.
+        credit_usd = 0.0
+        for mkt in {leg.market for leg in legs}:
+            ref = send_oracles.get(mkt) or 0.0
+            if ref <= 0.0:
+                continue
+            try:
+                credit_usd += depth_credit_usd(
+                    [l for l in legs if l.market == mkt
+                     and l.side is Side.BUY],
+                    [l for l in legs if l.market == mkt
+                     and l.side is Side.SELL],
+                    ref, ring_pct=self._ring_pct)
+            except ValueError:
+                # A leg whose side disagrees with its book is a builder bug,
+                # not a reason to lose the whole tick's send.
+                _log.debug("permuto: depth credit skipped for %s", mkt)
+        if legs and credit_usd <= 0.0:
+            _log.warning(
+                "permuto: this batch earns ZERO depth credit -- %d leg(s) "
+                "across %d market(s), no market two-sided inside the "
+                "%.1f%% ring. Eligibility accrues on min(bid, ask), so a "
+                "one-sided book banks nothing however large it is.",
+                len(legs), len({l.market for l in legs}), self._ring_pct)
+        else:
+            _log.debug("permuto: batch depth credit $%.0f/s (%d legs)",
+                       credit_usd, len(legs))
+
+        payload = build_upsert_batch(legs, send_oracles,
+                                     ring_pct=self._ring_pct)
         response = self._client.batch_upsert(payload, now_s)
 
         # [release review] "partial" IS HTTP success on this venue, and the
@@ -1059,7 +1267,12 @@ class QuoteRunner:
                 _log.warning(
                     "permuto: batch_upsert returned status %r (body %r); "
                     "believing open_orders over our own send",
-                    status, str(response)[:400])
+                    # [diagnostic 2026-08-31] 400 chars truncated the body
+                    # before the per-leg rejection_reason fields, which is
+                    # exactly where the explanation for a repeating
+                    # 'batch_failed' lives. Widened to capture one whole
+                    # response; narrow again once the cause is known.
+                    status, str(response)[:4000])
                 return TickResult(
                     "error",
                     "batch status %r -- legs not recorded as resting; "
@@ -1154,11 +1367,40 @@ def _margin_state(account: Any, carried: bool) -> MarginState:
             if market is None:
                 continue
             try:
-                positions[market] = float(
-                    row.get("size", row.get("position", 0.0))
-                )
+                size = float(row.get("size", row.get("position", 0.0)))
             except (TypeError, ValueError):
                 positions[market] = float("nan")
+                continue
+            # [live 2026-08-31] SIGN THE SIZE. The venue reports a position
+            # as {"side": "sell", "size": "812520"} -- an UNSIGNED magnitude
+            # plus a direction. Reading `size` alone recorded an 812,520
+            # contract SHORT as a +812,520 LONG, and every risk control
+            # downstream then ran inverted:
+            #
+            #   * assess() saw a huge long and returned REDUCE_ONLY;
+            #   * REDUCE_ONLY keeps the leg that shrinks a LONG -- the ASK;
+            #   * each of those asks GREW the real short, and the skew for a
+            #     phantom long priced them aggressively below the oracle,
+            #     which is why 156 consecutive rejections were "Aggressive
+            #     ask" and not one was a bid.
+            #
+            # The loop spent the session enlarging the position it believed
+            # it was unwinding. Absent or unrecognised side keeps the raw
+            # magnitude rather than guessing a direction.
+            side = str(row.get("side", "")).strip().lower()
+            if side in ("sell", "short", "s", "ask"):
+                size = -abs(size)
+            elif side in ("buy", "long", "b", "bid"):
+                size = abs(size)
+            elif size != 0.0:
+                # [review] FAIL CLOSED on an unrecognised direction. An
+                # earlier version kept the raw magnitude, which is
+                # "default to long" wearing a modest hat -- the exact
+                # assumption that turned an 812,520 short into a phantom
+                # long. A non-zero size we cannot orient is unreadable
+                # inventory, and assess() already treats that as FLATTEN.
+                size = float("nan")
+            positions[market] = size
 
     # [live 2026-08-29] The venue's /exchange/account payload, observed on
     # the first authenticated tick ever (every earlier attempt 422'd on

@@ -537,8 +537,26 @@ class PermutoWidget(QWidget):
         self._markets_timer: Optional[QTimer] = None
         self._markets_thread: Optional[QThread] = None
         self._markets_worker: Optional[Any] = None
+        # [2026-08-31] Target stays SMALL, cap goes wide, and the two are
+        # deliberately no longer equal.
+        #
+        # They were both $1,200, which meant one nearly-complete quote fill
+        # took a flat market straight to its position limit -- and at the
+        # limit the runner drops to a single reduce-only leg, which earns
+        # exactly zero depth (depth_credit_usd skips reduce-only legs). The
+        # loop therefore spent ~95% of the contest's first session unable
+        # to score at all. A cap has to sit several fills away from the
+        # quote size, not one.
+        #
+        # The cap is sized to TOLERATE the ~$188k position already on the
+        # book so the loop can quote two-sided again; it is not an
+        # invitation to build one. The target stays at $1,200 on purpose:
+        # the 2026-08-31 recovery review is explicit that "quote
+        # correctness and uptime dominate size" and that $25k/market on the
+        # current code path would only multiply rejected orders. Ramp the
+        # target only against a measured leaderboard slope.
         self._target_depth_usd = 1_200.0
-        self._max_position_usd = 1_200.0
+        self._max_position_usd = 250_000.0
         self._build()
         self.refresh()
 

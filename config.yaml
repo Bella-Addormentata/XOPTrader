@@ -17,7 +17,16 @@ pairs:
   quote_asset_id: fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d
   ratio_target_override: 0.6429
 - base_asset_id: xch
-  enabled: true
+  # [2026-08-31] DISABLED by the operator so XCH/DBX could resume quoting.
+  #
+  # CORRECTION: an earlier version of this comment said BYC had depegged to
+  # ~$0.15. That was wrong. It read only the ASK side of a book dislocated
+  # roughly 7x; the wallet's own valuation had BYC at 1.002, i.e. at par.
+  # The drawdown-breaker pause that followed was therefore a valuation
+  # artifact, not a real loss. The pair stays disabled because the OPERATOR
+  # asked for it, not because BYC is broken -- re-enabling is a decision
+  # about the book's liquidity, not about the peg.
+  enabled: false
   min_offer_size_units_override: 1.0
   name: XCH/BYC
   quote_asset_id: ae1536f56760e471ad85ead45f00d680ff9cca73b8cc3407be778f1c0c606eac

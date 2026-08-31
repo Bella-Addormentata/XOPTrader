@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import pytest
 
 from gui.services.permuto.auth import PermutoAuthError
@@ -446,11 +447,22 @@ def test_a_malformed_account_reads_as_fully_utilised_not_empty():
 
 
 def test_positions_parse_from_a_dict_or_a_list():
+    # [2026-08-31] This test used a list row carrying `size` and NO `side`,
+    # and asserted it equalled the signed dict form. That is precisely the
+    # assumption that hid the phantom-long bug for a whole session: the
+    # dict form is SIGNED, while the venue's list form is an unsigned
+    # magnitude plus a direction. The two agree only when the direction is
+    # actually given.
     as_dict = _margin_state({"positions": {_MKT: 5.0}}, False)
     as_list = _margin_state(
-        {"positions": [{"market": _MKT, "size": 5.0}]}, False
+        {"positions": [{"market": _MKT, "side": "buy", "size": 5.0}]}, False
     )
     assert as_dict.positions[_MKT] == as_list.positions[_MKT] == 5.0
+
+    short = _margin_state(
+        {"positions": [{"market": _MKT, "side": "sell", "size": 5.0}]}, False
+    )
+    assert short.positions[_MKT] == -5.0
 
 
 def test_numeric_strings_are_accepted_and_booleans_are_not():
@@ -1436,19 +1448,53 @@ def test_an_explicit_rejection_is_believed_over_its_legs():
 # --------------------------------------------------------------------------- #
 
 def test_a_collapsing_oracle_still_produces_an_in_band_batch():
+    """A fast oracle must not push our legs out of the venue band.
+
+    [review round 3] This test used to guard its assertion behind
+    `if c.last_batch:`. Removing the guard exposed that no batch was
+    being sent at all -- the third tick HELD, because the quote placed
+    on the second tick was still fresh and in-ring, so decide() rightly
+    declined to touch it and the assertion loop iterated over nothing.
+    The fix is to clear the resting book so a re-quote genuinely happens.
+    """
     c = _Client(account=_account(0.0))
     r = _runner(c, curfew_enabled=False)
     # Establish a fast decay: ~0.5%/s across two ticks.
     r.tick(_MID_SESSION, {_MKT: 0.100}, {})
     r.tick(_MID_SESSION + 5.0, {_MKT: 0.0975}, {})
+    assert r._band_guard.velocity(_MKT) > 0.0, "no velocity: test is inert"
     c.last_batch = None
-    # A grace-aged read: same oracle value, but flagged 10s old.
-    r.tick(_MID_SESSION + 10.0, {_MKT: 0.0975},
-           {"oracle_age_s": 10.0})
-    if c.last_batch:
-        for leg in c.last_batch:
-            dev = abs(float(leg["price"]) / 0.0975 - 1.0) * 100.0
-            assert dev <= 5.0, "leg %r is outside the venue band" % (leg,)
+    r._resting = {}
+    r.tick(_MID_SESSION + 10.0, {_MKT: 0.0975}, {"oracle_age_s": 2.0})
+    assert c.last_batch, "no batch was sent; the assertion never ran"
+    for leg in c.last_batch:
+        dev = abs(float(leg["price"]) / 0.0975 - 1.0) * 100.0
+        assert dev <= 5.0, "leg %r is outside the venue band" % (leg,)
+
+
+def test_a_collapse_faster_than_the_band_stands_the_market_down():
+    """When drift exceeds the band there is no safe price -- send nothing.
+
+    [review round 3] The sibling test above was written as though a fast
+    oracle is always survivable by clamping. It is not. At 0.5%/s a read
+    10s stale has already drifted 5%, which is the WHOLE venue band, so
+    the clamp window closes and the only correct action is to stand the
+    market down. Asserting that explicitly stops a future change from
+    turning a stand-down into a silently-empty batch and calling it a
+    pass.
+    """
+    c = _Client(account=_account(0.0))
+    r = _runner(c, curfew_enabled=False)
+    r.tick(_MID_SESSION, {_MKT: 0.100}, {})
+    r.tick(_MID_SESSION + 5.0, {_MKT: 0.0975}, {})
+    c.last_batch = None
+    r._resting = {}
+    res = r.tick(_MID_SESSION + 10.0, {_MKT: 0.0975},
+                 {"oracle_age_s": 10.0})
+    assert not c.last_batch, "sent a batch the band cannot accommodate"
+    action, reason = res.markets[_MKT]
+    assert action == "skip", res.markets
+    assert "too fast" in reason, reason
 
 
 def test_a_calm_oracle_is_untouched_by_the_guard():
@@ -1461,3 +1507,240 @@ def test_a_calm_oracle_is_untouched_by_the_guard():
     for leg in c.last_batch:
         dev = abs(float(leg["price"]) / _ORACLE[_MKT] - 1.0) * 100.0
         assert dev <= 2.1
+
+
+# --------------------------------------------------------------------------- #
+# [PREFLIGHT] The runner re-reads the oracle immediately before sending.
+# --------------------------------------------------------------------------- #
+
+def test_a_moved_oracle_re_anchors_legs_before_they_are_sent():
+    """The live case: the tick prices off 0.10, the oracle is 0.09 by send
+    time. Every leg must land inside +/-5% of the FRESH value, not the
+    stale one it was priced against."""
+    c = _Client(account=_account(0.0))
+    fresh = {_MKT: 0.09}
+    r = _runner(c, curfew_enabled=False, oracle_fetch=lambda: fresh)
+    r.tick(_MID_SESSION, {_MKT: 0.10}, {})
+    assert c.last_batch, "expected a batch"
+    for leg in c.last_batch:
+        dev = abs(float(leg["price"]) / 0.09 - 1.0) * 100.0
+        assert dev <= 5.0, "leg %r outside the band of the fresh oracle" % (leg,)
+
+
+def test_a_failed_pre_send_fetch_still_quotes_off_the_tick_read():
+    # A hiccup on the extra request must not cost a quoting cycle.
+    def boom():
+        raise RuntimeError("oracle fetch exploded")
+
+    c = _Client(account=_account(0.0))
+    r = _runner(c, curfew_enabled=False, oracle_fetch=boom)
+    result = r.tick(_MID_SESSION, _ORACLE, {})
+    assert result.action != "error", result.reason
+    assert c.last_batch, "a failed pre-send fetch silenced the loop"
+
+
+def test_no_fetcher_configured_behaves_exactly_as_before():
+    c = _Client(account=_account(0.0))
+    r = _runner(c, curfew_enabled=False)
+    r.tick(_MID_SESSION, _ORACLE, {})
+    assert c.last_batch
+
+
+def test_a_violently_moving_oracle_sends_nothing_rather_than_a_400():
+    # Velocity high enough that projected flight-time drift exceeds the
+    # band: no price is safe, so the batch is skipped with a reason.
+    c = _Client(account=_account(0.0))
+    fresh = {_MKT: 0.070}
+    r = _runner(c, curfew_enabled=False, oracle_fetch=lambda: fresh)
+    r.tick(_MID_SESSION, {_MKT: 0.100}, {})          # -30% in one step
+    r._send_latency_s = 20.0                          # slow link
+    c.last_batch = None
+    r.tick(_MID_SESSION + 5.0, {_MKT: 0.070}, {})
+    assert c.last_batch is None, "sent into a market it cannot price"
+
+
+def test_a_preflight_drop_retracts_the_quote_it_cannot_replace():
+    """[Copilot review] Omitting a leg from an upsert does NOT retract the
+    quote already resting for that (market, side) -- the venue keeps it. A
+    stand-down that leaves the old book live is the opposite of standing
+    down."""
+    c = _Client(account=_account(0.0))
+    # Violent move: velocity high enough that no price survives the flight.
+    r = _runner(c, curfew_enabled=False, oracle_fetch=lambda: {_MKT: 0.05})
+    r.tick(_MID_SESSION, {_MKT: 0.100}, {})
+    r._send_latency_s = 30.0
+    c.calls.clear()
+    r.tick(_MID_SESSION + 5.0, {_MKT: 0.050}, {})
+    assert "cancel_all" in c.calls, "left an unsafe quote resting"
+
+
+def test_re_anchored_legs_are_sent_on_the_venue_tick_grid():
+    c = _Client(account=_account(0.0))
+    r = _runner(c, curfew_enabled=False, oracle_fetch=lambda: {_MKT: 0.09})
+    r.tick(_MID_SESSION, {_MKT: 0.10}, {})
+    assert c.last_batch
+    for leg in c.last_batch:
+        ticks = float(leg["price"]) / 0.0001
+        assert abs(round(ticks) - ticks) < 1e-6, "off-grid price %r" % leg
+
+
+# --------------------------------------------------------------------------- #
+# [live 2026-08-31] POSITION SIGN. The venue reports a position as
+# {"side": "sell", "size": "812520"} -- an unsigned magnitude plus a
+# direction. Reading `size` alone recorded a short as a LONG, and every
+# risk control downstream ran inverted: the loop "reduced" its phantom
+# long by SELLING, which grew the real short all session.
+#
+# Every pre-existing test used the DICT form of `positions`, which carries
+# a signed number, so the list form the venue actually sends was untested.
+# --------------------------------------------------------------------------- #
+
+def _account_rows(rows):
+    return {"equity_usd": 100_000.0, "used_margin_usd": 0.0,
+            "positions": rows}
+
+
+def _pos(market, side, size):
+    return {"market": market, "side": side, "size": str(size)}
+
+
+def test_a_sell_position_parses_as_a_short():
+    from gui.services.permuto.runner import _margin_state
+    st = _margin_state(_account_rows([_pos(_MKT, "sell", 812520)]), False)
+    assert st.positions[_MKT] == -812520.0
+
+
+def test_a_buy_position_parses_as_a_long():
+    from gui.services.permuto.runner import _margin_state
+    st = _margin_state(_account_rows([_pos(_MKT, "buy", 500)]), False)
+    assert st.positions[_MKT] == 500.0
+
+
+def test_an_unorientable_position_fails_closed():
+    # "Keep the magnitude" is "default to long" wearing a modest hat --
+    # the exact assumption that created the phantom long. Unreadable.
+    import math
+    from gui.services.permuto.runner import _margin_state
+    st = _margin_state(
+        _account_rows([{"market": _MKT, "size": "42"}]), False)
+    assert math.isnan(st.positions[_MKT])
+
+
+def test_a_flat_row_without_a_side_is_still_flat():
+    from gui.services.permuto.runner import _margin_state
+    st = _margin_state(
+        _account_rows([{"market": _MKT, "size": "0"}]), False)
+    assert st.positions[_MKT] == 0.0
+
+
+def test_a_short_is_reduced_by_BUYING_not_selling():
+    """THE BUG, end to end. A short past the cap must quote the side that
+    shrinks it. Before the sign fix this emitted asks, and every ask that
+    filled made the short larger."""
+    c = _Client(account=_account_rows([_pos(_MKT, "sell", 812520)]))
+    r = _runner(c, curfew_enabled=False, max_position_usd=7.0)
+    r.tick(_MID_SESSION, _ORACLE, {})
+    assert c.last_batch, "expected a reducing quote"
+    sides = {leg["side"] for leg in c.last_batch}
+    assert sides == {"buy"}, "a short must be reduced by buying, got %s" % sides
+    assert all(leg["reduce_only"] for leg in c.last_batch)
+
+
+def test_a_long_is_still_reduced_by_selling():
+    c = _Client(account=_account_rows([_pos(_MKT, "buy", 812520)]))
+    r = _runner(c, curfew_enabled=False, max_position_usd=7.0)
+    r.tick(_MID_SESSION, _ORACLE, {})
+    assert c.last_batch
+    assert {leg["side"] for leg in c.last_batch} == {"sell"}
+
+
+def test_a_market_spec_tick_is_used_when_repricing():
+    """[Copilot round 2] Repricing must use the market's PUBLISHED tick,
+    the same one quote_ladder built with -- not a hardcoded 0.0001."""
+    c = _Client(account=_account(0.0))
+    r = _runner(c, curfew_enabled=False, oracle_fetch=lambda: {_MKT: 0.09})
+    r.tick(_MID_SESSION, {_MKT: 0.10},
+           {"specs": {_MKT: {"tick_size": 0.01, "lot_size": 1.0}}})
+    # [review round 3] Unconditional. A `if c.last_batch:` guard
+    # lets this pass on an EMPTY batch -- one of the very failures
+    # it exists to catch. A test that cannot fail reports coverage
+    # that is not there.
+    assert c.last_batch, "no batch was sent; the assertion never ran"
+    for leg in c.last_batch:
+        ticks = float(leg["price"]) / 0.01
+        assert abs(round(ticks) - ticks) < 1e-6, (
+            "leg %r ignores the market's 0.01 tick" % (leg,))
+
+
+def test_survivors_are_re_priced_after_a_cancel_round_trip():
+    """[Copilot round 2] The cancel is an authenticated round trip between
+    the fresh read and the send; survivors must be re-read against a NEW
+    oracle rather than ageing through it on a one-request budget."""
+    reads = []
+
+    def fetch():
+        reads.append(len(reads))
+        # Second read differs, so a re-price is observable.
+        return {_MKT: 0.09 if len(reads) < 2 else 0.088, _MKT2: 0.05}
+
+    c = _Client(account=_account(0.0))
+    r = _runner2(c, curfew_enabled=False, oracle_fetch=fetch)
+    # [review round 3] This test used to guard its assertions behind
+    # `if "cancel_all" in c.calls:`. With a fresh runner the band guard
+    # has ZERO velocity, so no leg was ever dropped, no cancel happened,
+    # and the test passed without exercising the path it is named for. A
+    # test that cannot fail reports coverage that does not exist.
+    #
+    # Establish a real velocity first -- two samples, -50% over 5s -- so
+    # the stand-down actually triggers, then assert unconditionally.
+    r._band_guard.observe(_MID_SESSION, {_MKT: 0.100, _MKT2: 0.200})
+    r._band_guard.observe(_MID_SESSION + 5.0, {_MKT: 0.050, _MKT2: 0.200})
+    assert r._band_guard.velocity(_MKT) > 0.0, "no velocity: test is inert"
+    r._send_latency_s = 30.0          # guarantees stand-down on _MKT
+
+    c.calls.clear()
+    reads.clear()
+    r.tick(_MID_SESSION + 10.0, {_MKT: 0.050, _MKT2: 0.200}, {})
+
+    assert "cancel_all" in c.calls, "the unsafe market was never retracted"
+    assert len(reads) >= 2, "survivors were not re-read after the cancel"
+
+# --------------------------------------------------------------------------- #
+# [DEPTHSIGNAL] A one-sided book banks nothing, and must say so.
+# --------------------------------------------------------------------------- #
+
+def test_a_two_sided_batch_reports_a_positive_depth_credit(caplog):
+    c = _Client(account=_account(100.0))
+    r = _runner(c, curfew_enabled=True)
+    with caplog.at_level(logging.DEBUG, logger="gui.services.permuto.runner"):
+        assert r.tick(_MID_SESSION, _ORACLE, {}).action == "quote"
+    assert sorted(leg["side"] for leg in c.last_batch) == ["buy", "sell"]
+    assert not [rec for rec in caplog.records
+                if "ZERO depth credit" in rec.getMessage()],         "a healthy two-sided book was reported as earning nothing"
+    assert [rec for rec in caplog.records
+            if "batch depth credit" in rec.getMessage()],         "the per-tick depth credit was never reported at all"
+
+
+def test_a_reduce_only_batch_warns_that_it_banks_nothing(caplog):
+    """The failure that was silent: a one-sided book earns zero.
+
+    Overnight the curfew floors the SHORT cap to zero, which puts a short
+    into REDUCE_ONLY -- one side only. `depth_credit_usd` scores that at
+    min(bid, ask) = 0, so the tick banks nothing towards the 300,000,000
+    eligibility gate no matter how large the leg is. Before this warning
+    existed the loop sent it, logged an ordinary success, and the operator
+    had no way to tell an earning tick from a free one.
+    """
+    c = _Client(account=_account(-100.0))
+    r = _runner(c, curfew_enabled=True)
+    with caplog.at_level(logging.DEBUG, logger="gui.services.permuto.runner"):
+        r.tick(_OVERNIGHT, _ORACLE, {})
+    # Unconditional: measured, this tick DOES send one reduce-only buy leg,
+    # so an `if c.last_batch:` guard here would be the same do-nothing test
+    # this suite just finished removing three of.
+    assert c.last_batch, "no batch was sent; the assertions never ran"
+    sides = {leg["side"] for leg in c.last_batch}
+    assert len(sides) == 1, "expected a one-sided book, got %r" % (sides,)
+    assert all(leg["reduce_only"] for leg in c.last_batch), c.last_batch
+    assert [rec for rec in caplog.records
+            if "ZERO depth credit" in rec.getMessage()],         "a one-sided book was sent without warning that it earns nothing"
