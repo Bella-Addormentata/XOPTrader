@@ -1930,4 +1930,62 @@ def test_a_non_crossing_refusal_does_not_decay_the_backoff():
         "Price 0.0999 is outside the allowed oracle band")
     r._resting = {}
     r.tick(_MID_SESSION + 5.0, _ORACLE, {})
-    assert r._cross_backoff.offset_pct(_MKT) == widened,         "a band rejection decayed the crossing backoff"
+    assert r._cross_backoff.offset_pct(_MKT) == widened, \
+        "a band rejection decayed the crossing backoff"
+
+
+def test_a_rejected_action_with_no_reason_does_not_decay_the_backoff():
+    """action=rejected with no rejection_reason must not count as clean.
+
+    [review] The previous check only tested ``rejection_reason``; a row
+    that carries ``action='rejected'`` and an empty reason passed the
+    guard and decayed the learned offset even though the order did not
+    rest -- exactly backwards.
+    """
+    c = _Client(account=_account(100.0),
+                batch_response=_venue_cross((0, 1)))
+    r = _runner(c, curfew_enabled=True)
+    r.tick(_MID_SESSION, _ORACLE, {})
+    widened = r._cross_backoff.offset_pct(_MKT)
+    assert widened > 0.0
+
+    # Venue sends action=rejected with no reason -- the batch succeeded
+    # overall but the individual legs did not rest.
+    def _rejected_no_reason(legs):
+        return {"status": "batch_ok",
+                "results": [{"action": "rejected", "rejection_reason": None}
+                            for _ in legs]}
+
+    c.batch_response = _rejected_no_reason
+    r._resting = {}
+    r.tick(_MID_SESSION + 5.0, _ORACLE, {})
+    assert r._cross_backoff.offset_pct(_MKT) == widened, \
+        "action=rejected with no reason decayed the crossing backoff"
+
+
+def test_a_market_with_fewer_rows_than_legs_does_not_decay_the_backoff():
+    """zip truncation must not hide an unverifiable leg.
+
+    [review] When leg_rows is shorter than legs, zip silently drops the
+    trailing legs.  The previous code called observe_clean because the
+    market appeared in ``seen`` and not in ``dirty``, even though half
+    the legs had no row at all.  Now the unpaired suffix is marked dirty
+    so the clean path is blocked.
+    """
+    c = _Client(account=_account(100.0),
+                batch_response=_venue_cross((0, 1)))
+    r = _runner(c, curfew_enabled=True)
+    r.tick(_MID_SESSION, _ORACLE, {})
+    widened = r._cross_backoff.offset_pct(_MKT)
+    assert widened > 0.0
+
+    # Return only one row for a two-leg batch -- the other leg is missing.
+    def _one_row(legs):
+        return {"status": "batch_ok",
+                "results": [{"action": "placed", "rejection_reason": None}]}
+
+    c.batch_response = _one_row
+    r._resting = {}
+    r.tick(_MID_SESSION + 5.0, _ORACLE, {})
+    assert r._cross_backoff.offset_pct(_MKT) == widened, \
+        "a truncated row list decayed the crossing backoff"

@@ -167,3 +167,58 @@ def test_a_backoff_plus_spread_plus_skew_stays_inside_the_ring():
             "spread %.2f + skew %.2f%% + backoff %.2f composes to %.4f%%, "
             "outside the %.2f%% ring" % (spread, skew * 100.0,
                                          b.offset_pct(_MKT), landed, ring))
+
+
+def test_headroom_reserves_a_tick_for_ask_ceil_rounding():
+    """[review] quote_ladder rounds asks UP; the bound must absorb that tick.
+
+    For oracle=0.1544391445921985, tick=0.0001, skew=0.0096 the raw ask
+    before rounding lands exactly on the ring boundary when headroom_pct
+    is called without tick reservation.  math.ceil then pushes it one tick
+    further out -- 2.0467% from the oracle -- outside the 2% credit ring.
+
+    With tick reservation the bound is tightened by tick/oracle so the
+    ceil'd price always lands inside the ring.
+    """
+    import math
+    oracle = 0.1544391445921985
+    tick = 0.0001
+    ring = 2.0
+    spread = 0.25
+    skew = 0.0096
+
+    tick_frac = tick / oracle
+    room = headroom_pct(ring, spread, skew, tick_frac)
+
+    # Simulate quote_ladder: place at oracle*(1+skew)*(1+offset/100)
+    raw_ask = oracle * (1.0 + skew) * (1.0 + (spread + room) / 100.0)
+    quantised_ask = math.ceil(raw_ask / tick) * tick
+
+    pct_from_oracle = (quantised_ask / oracle - 1.0) * 100.0
+    assert pct_from_oracle <= ring + 1e-9, (
+        "quantised ask is %.4f%% from oracle, outside the %.1f%% ring "
+        "(oracle=%.16f tick=%.4f skew=%.2f%% room=%.4f%%)"
+        % (pct_from_oracle, ring, oracle, tick, skew * 100.0, room))
+
+
+def test_headroom_tick_reservation_holds_across_representative_domain():
+    """The quantised price stays inside the ring for every skew that occurs."""
+    import math
+    oracle = 0.1544391445921985
+    tick = 0.0001
+    ring = 2.0
+    spread = 0.25
+    tick_frac = tick / oracle
+    ceiling = max_price_skew_frac(ring, spread)
+    steps = 200
+    for i in range(steps + 1):
+        skew = ceiling * i / steps
+        room = headroom_pct(ring, spread, skew, tick_frac)
+        if room <= 0.0:
+            continue
+        raw_ask = oracle * (1.0 + skew) * (1.0 + (spread + room) / 100.0)
+        quantised_ask = math.ceil(raw_ask / tick) * tick
+        pct_from_oracle = (quantised_ask / oracle - 1.0) * 100.0
+        assert pct_from_oracle <= ring + 1e-9, (
+            "skew %.4f%%: quantised ask %.4f%% from oracle, outside ring"
+            % (skew * 100.0, pct_from_oracle))

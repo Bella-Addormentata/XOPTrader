@@ -230,6 +230,9 @@ class QuoteRunner:
         #: account for it at response time (skew and backoff push the
         #: trailing leg the same way, and the ring does not care which).
         self._last_skew: dict = {}
+        #: Tick size as a fraction of the oracle, per market, so headroom_pct
+        #: can reserve the one-tick rounding margin ask/ceil adds.
+        self._last_tick_frac: dict = {}
         #: Unknown-but-accepted statuses already reported, so the "add it
         #: to BATCH_ACCEPTED" nudge is logged once rather than every tick.
         self._unknown_ok_statuses: set = set()
@@ -896,6 +899,11 @@ class QuoteRunner:
             # ring, so this can widen the placement but never the credit
             # footprint -- a leg outside the ring earns nothing.
             self._last_skew[market] = risk.skew
+            # [review] Reserve the worst-case ask-ceil rounding margin so
+            # headroom_pct accounts for the one tick quote_ladder adds.
+            _tick = float(spec.get("tick_size", 0.0001) or 0.0001)
+            self._last_tick_frac[market] = (
+                _tick / max(float(oracle or 1e-12), 1e-12))
             ladder = quote_ladder(
                 market, reference, depth_usd,
                 levels=1,
@@ -1294,22 +1302,29 @@ class QuoteRunner:
                         continue
                     seen.add(leg.market)
                     reason = str(row.get("rejection_reason") or "").lower()
+                    action = str(row.get("action") or "").lower()
                     if _is_cross_refusal(reason):
                         crossed.add(leg.market)
-                    elif reason:
-                        # [review] A NON-crossing refusal is not evidence
-                        # that our price stopped crossing. Margin and band
-                        # rejections never reach the post-only check at all,
-                        # so decaying on them walks the learned offset back
-                        # while the book is still exactly where it was.
+                    elif reason or action not in ("placed", "modified",
+                                                  "unchanged"):
+                        # [review] A NON-crossing refusal (margin/band) or an
+                        # action that does not prove the order is resting is
+                        # not evidence we stopped crossing. "rejected",
+                        # "cancelled", an empty action, or any unknown value
+                        # all count as dirty.
                         dirty.add(leg.market)
+                # [review] zip truncates when leg_rows is shorter than legs;
+                # any unmatched leg has no row and cannot be verified clean.
+                for leg in legs[len(leg_rows):]:
+                    dirty.add(leg.market)
                 for mkt in {l.market for l in legs}:
                     if mkt in crossed:
                         self._cross_backoff.observe_cross(
                             mkt,
                             headroom_pct(self._ring_pct,
                                          self._half_spread_pct,
-                                         self._last_skew.get(mkt, 0.0)))
+                                         self._last_skew.get(mkt, 0.0),
+                                         self._last_tick_frac.get(mkt, 0.0)))
                     elif mkt in seen and mkt not in dirty:
                         # Only a market whose every row came back present and
                         # ACCEPTED has actually demonstrated it rests.
