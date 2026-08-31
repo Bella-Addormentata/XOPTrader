@@ -26,6 +26,9 @@ class _Client:
         self.open_payload = kw.get("open_orders", {"orders": []})
         self.fail_on = kw.get("fail_on")
         self.cancelled = []
+        #: Callable(legs) -> dict, or a dict. Default {} means "the venue
+        #: confirmed nothing", which the runner now scores as zero depth.
+        self.batch_response = kw.get("batch_response")
 
     def _maybe_fail(self, name):
         if self.fail_on == name:
@@ -50,7 +53,11 @@ class _Client:
         self.calls.append("batch_upsert")
         self.last_batch = legs
         self._maybe_fail("batch_upsert")
-        return {}
+        if self.batch_response is None:
+            return {}
+        if callable(self.batch_response):
+            return self.batch_response(legs)
+        return self.batch_response
 
     def cancel_all(self, now_s, markets=None):
         self.calls.append("cancel_all")
@@ -1709,38 +1716,79 @@ def test_survivors_are_re_priced_after_a_cancel_round_trip():
 # [DEPTHSIGNAL] A one-sided book banks nothing, and must say so.
 # --------------------------------------------------------------------------- #
 
-def test_a_two_sided_batch_reports_a_positive_depth_credit(caplog):
-    c = _Client(account=_account(100.0))
+def _venue_ok(reject_idx=()):
+    """A realistic accepted batch response, one result row per leg.
+
+    Rows are positional against the legs, which is how the venue has
+    replied on every live capture. `reject_idx` marks legs the venue
+    refused -- an ALO cross, typically.
+    """
+    def build(legs):
+        return {
+            "status": "batch_ok",
+            "results": [
+                {"action": "placed",
+                 "rejection_reason": (
+                     "Post-only order would cross the book."
+                     if i in reject_idx else None)}
+                for i, _ in enumerate(legs)
+            ],
+        }
+    return build
+
+
+def test_an_accepted_two_sided_batch_reports_the_rested_credit(caplog):
+    c = _Client(account=_account(100.0), batch_response=_venue_ok())
     r = _runner(c, curfew_enabled=True)
     with caplog.at_level(logging.DEBUG, logger="gui.services.permuto.runner"):
         assert r.tick(_MID_SESSION, _ORACLE, {}).action == "quote"
     assert sorted(leg["side"] for leg in c.last_batch) == ["buy", "sell"]
     assert not [rec for rec in caplog.records
-                if "ZERO depth credit" in rec.getMessage()],         "a healthy two-sided book was reported as earning nothing"
+                if "banked ZERO depth" in rec.getMessage()],         "a healthy accepted two-sided book was reported as earning nothing"
     assert [rec for rec in caplog.records
-            if "batch depth credit" in rec.getMessage()],         "the per-tick depth credit was never reported at all"
+            if "RESTED depth credit" in rec.getMessage()],         "the rested depth credit was never reported at all"
+
+
+def test_a_batch_the_venue_refuses_banks_nothing(caplog):
+    """The instrument must not report intent as achievement.
+
+    [live 2026-08-31] The first version of this signal was computed from
+    the OUTGOING batch, before the send. It logged "$1200/s" on ticks
+    whose batch then 400'd in its entirety, so it claimed we were earning
+    while the venue's own counter sat flat at 4,093.892 for 46 minutes --
+    38 whole-batch rejections in ~14 minutes, every one banking zero. A
+    measurement taken before the thing it measures is not a measurement.
+
+    Here the legs are a perfectly good two-sided book and the venue
+    refuses BOTH. The credit must be zero.
+    """
+    c = _Client(account=_account(100.0),
+                batch_response=_venue_ok(reject_idx=(0, 1)))
+    r = _runner(c, curfew_enabled=True)
+    with caplog.at_level(logging.DEBUG, logger="gui.services.permuto.runner"):
+        r.tick(_MID_SESSION, _ORACLE, {})
+    assert c.last_batch, "no batch was sent; the assertions never ran"
+    assert sorted(leg["side"] for leg in c.last_batch) == ["buy", "sell"],         "the OUTGOING book was two-sided -- that is the point of this test"
+    assert not [rec for rec in caplog.records
+                if "RESTED depth credit" in rec.getMessage()],         "reported credit for a batch the venue refused outright"
+    assert [rec for rec in caplog.records
+            if "banked ZERO depth" in rec.getMessage()],         "a fully-refused batch did not warn that it banked nothing"
 
 
 def test_a_reduce_only_batch_warns_that_it_banks_nothing(caplog):
-    """The failure that was silent: a one-sided book earns zero.
+    """Overnight the curfew floors the short cap, leaving one side only.
 
-    Overnight the curfew floors the SHORT cap to zero, which puts a short
-    into REDUCE_ONLY -- one side only. `depth_credit_usd` scores that at
-    min(bid, ask) = 0, so the tick banks nothing towards the 300,000,000
-    eligibility gate no matter how large the leg is. Before this warning
-    existed the loop sent it, logged an ordinary success, and the operator
-    had no way to tell an earning tick from a free one.
+    `depth_credit_usd` scores that at min(bid, ask) = 0, so the tick banks
+    nothing towards the 300,000,000 gate however large the leg is.
     """
-    c = _Client(account=_account(-100.0))
+    c = _Client(account=_account(-100.0), batch_response=_venue_ok())
     r = _runner(c, curfew_enabled=True)
     with caplog.at_level(logging.DEBUG, logger="gui.services.permuto.runner"):
         r.tick(_OVERNIGHT, _ORACLE, {})
-    # Unconditional: measured, this tick DOES send one reduce-only buy leg,
-    # so an `if c.last_batch:` guard here would be the same do-nothing test
-    # this suite just finished removing three of.
+    # Unconditional: measured, this tick DOES send one reduce-only buy leg.
     assert c.last_batch, "no batch was sent; the assertions never ran"
     sides = {leg["side"] for leg in c.last_batch}
     assert len(sides) == 1, "expected a one-sided book, got %r" % (sides,)
     assert all(leg["reduce_only"] for leg in c.last_batch), c.last_batch
     assert [rec for rec in caplog.records
-            if "ZERO depth credit" in rec.getMessage()],         "a one-sided book was sent without warning that it earns nothing"
+            if "banked ZERO depth" in rec.getMessage()],         "a one-sided book was sent without warning that it earns nothing"

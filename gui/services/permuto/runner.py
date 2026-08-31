@@ -1152,34 +1152,36 @@ class QuoteRunner:
         # the venue credits, so a zero here means this tick banks nothing --
         # which is precisely the one-sided-book failure the note below
         # describes and which was, until now, completely silent.
-        credit_usd = 0.0
-        for mkt in {leg.market for leg in legs}:
-            ref = send_oracles.get(mkt) or 0.0
-            if ref <= 0.0:
-                continue
-            try:
-                credit_usd += depth_credit_usd(
-                    [l for l in legs if l.market == mkt
-                     and l.side is Side.BUY],
-                    [l for l in legs if l.market == mkt
-                     and l.side is Side.SELL],
-                    ref, ring_pct=self._ring_pct)
-            except ValueError:
-                # A leg whose side disagrees with its book is a builder bug,
-                # not a reason to lose the whole tick's send.
-                _log.debug("permuto: depth credit skipped for %s", mkt)
-        if legs and credit_usd <= 0.0:
-            _log.warning(
-                "permuto: this batch earns ZERO depth credit -- %d leg(s) "
-                "across %d market(s), no market two-sided inside the "
-                "%.1f%% ring. Eligibility accrues on min(bid, ask), so a "
-                "one-sided book banks nothing however large it is.",
-                len(legs), len({l.market for l in legs}), self._ring_pct)
-        elif now_s - self._depth_logged_at_s >= DEPTH_LOG_INTERVAL_S:
-            self._depth_logged_at_s = now_s
-            _log.info("permuto: batch depth credit $%.0f/s across %d "
-                      "market(s) (%d legs)", credit_usd,
-                      len({l.market for l in legs}), len(legs))
+        # [review 2026-08-31, live] The FIRST version of this measured the
+        # outgoing batch, before the send. That was worse than no signal at
+        # all: it logged "$1200/s" on ticks whose batch then 400'd in its
+        # entirety and rested nothing, so the instrument reported intent as
+        # achievement and disagreed with the venue for 46 minutes straight
+        # while the leaderboard sat flat at 4,093.892. Measured after the
+        # fact: 38 whole-batch 400s in ~14 minutes, every one of them
+        # banking exactly zero while the log claimed otherwise.
+        #
+        # So credit is computed from what the venue ACCEPTED, below, and a
+        # leg the venue refused contributes nothing here -- because it
+        # contributes nothing there.
+        def _credit_for(kept):
+            total = 0.0
+            for mkt in {leg.market for leg in kept}:
+                ref = send_oracles.get(mkt) or 0.0
+                if ref <= 0.0:
+                    continue
+                try:
+                    total += depth_credit_usd(
+                        [l for l in kept if l.market == mkt
+                         and l.side is Side.BUY],
+                        [l for l in kept if l.market == mkt
+                         and l.side is Side.SELL],
+                        ref, ring_pct=self._ring_pct)
+                except ValueError:
+                    # A leg whose side disagrees with its book is a builder
+                    # bug, not a reason to lose the whole tick's send.
+                    _log.debug("permuto: depth credit skipped for %s", mkt)
+            return total
 
         payload = build_upsert_batch(legs, send_oracles,
                                      ring_pct=self._ring_pct)
@@ -1230,6 +1232,38 @@ class QuoteRunner:
                         "acted on it -- treating as success. Add it to "
                         "BATCH_ACCEPTED.", status, BATCH_ACCEPTED)
                 accepted = True
+
+            # [DEPTHSIGNAL] Only the legs the venue did not refuse. Rows are
+            # positional against `legs` (order_count matches the results
+            # length on every capture so far); if that ever stops holding,
+            # the zip truncates rather than mispairing, which understates
+            # the credit -- the safe direction for a number whose whole job
+            # is to stop us believing we are earning when we are not.
+            if not accepted:
+                rested = []
+            elif isinstance(leg_rows, list) and leg_rows:
+                rested = [leg for leg, row in zip(legs, leg_rows)
+                          if isinstance(row, dict)
+                          and not row.get("rejection_reason")
+                          and str(row.get("action", "")).lower()
+                          in ("placed", "modified", "unchanged")]
+            else:
+                rested = list(legs)
+            credit_usd = _credit_for(rested)
+            if legs and credit_usd <= 0.0:
+                _log.warning(
+                    "permuto: this tick banked ZERO depth -- %d leg(s) sent, "
+                    "%d accepted, no market two-sided inside the %.1f%% "
+                    "ring. Eligibility accrues on min(bid, ask), so a "
+                    "one-sided or rejected book banks nothing however large.",
+                    len(legs), len(rested), self._ring_pct)
+            elif now_s - self._depth_logged_at_s >= DEPTH_LOG_INTERVAL_S:
+                self._depth_logged_at_s = now_s
+                _log.info("permuto: RESTED depth credit $%.0f/s across %d "
+                          "market(s) (%d of %d legs accepted)", credit_usd,
+                          len({l.market for l in rested}), len(rested),
+                          len(legs))
+
             if accepted and isinstance(leg_rows, list):
                 if status == "batch_partial" and not leg_rows:
                     # "partial" with no per-leg detail is unverifiable --
