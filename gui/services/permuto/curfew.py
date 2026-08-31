@@ -91,6 +91,7 @@ __all__ = [
     "CLOSES_UTC",
     "OVERNIGHT_LONG_FRACTION",
     "OVERNIGHT_SHORT_FRACTION",
+    "PREOPEN_EXIT_S",
     "permitted_leg_size",
     "OPENS_UTC",
     "CurfewState",
@@ -133,6 +134,24 @@ EXIT_START_S = 900.0           # 15 minutes
 #: cap staying low through them is the point, not an oversight.
 SETTLE_AFTER_OPEN_S = 900.0    # 15 minutes
 
+#: How long BEFORE the open the overnight short side is shut again.
+#:
+#: [review 2026-08-31] PR #130 claimed "EXIT/SETTLING retract the book
+#: before the open".  They do not.  SETTLING is gated on
+#: `since_open >= 0`, so it begins AFTER the bell; the whole night is
+#: Stage.CLOSED, and with a non-zero overnight short cap a two-sided book
+#: rests straight through the opening jump.  The resting ASK is then swept
+#: BY the gap -- filled short at pre-gap prices into a +73% to +229% move,
+#: which is the mechanism that cost this account $523k of unrealised P&L
+#: on contest night one.
+#:
+#: 30 minutes because the gap is an instant event at a known clock time,
+#: so this only has to cover clock skew and the cancel round trip, not a
+#: forecast.  The BID stays open: being long into an upward vol gap is the
+#: harmless side, and closing both would forfeit the tail of the cheapest
+#: depth window of the week for no risk reduction.
+PREOPEN_EXIT_S = 1800.0        # 30 minutes
+
 #: An oracle whose value has not moved for this long means the underlying
 #: is shut.  These are realised-vol estimates resampled every few seconds
 #: and carried to sixteen digits: during a live session they never repeat.
@@ -159,21 +178,56 @@ FREEZE_CONFIRM_S = 180.0
 #: close -> open cycle.  Until it has, keep this modest.
 OVERNIGHT_LONG_FRACTION = 0.25
 
-#: How much NEW SHORT exposure the curfew tolerates overnight.  Zero: we
-#: decline the side that a stale oracle structurally misprices.
+#: How much NEW SHORT exposure the curfew tolerates overnight.  Small, and
+#: strictly tighter than the long side: a stale oracle structurally
+#: misprices the short, and the short is the side an opening gap
+#: liquidates.
 #:
-#: Zero is expressible here and NOT through the position limit, which is
-#: the whole reason `leg_permitted` exists as a separate mechanism.
-#: risk.assess() reads `if max_position > 0.0`, so handing it zero means
-#: "no limit" -- the exact inversion.  The per-leg veto has no such
-#: overload: it simply refuses a leg that would grow the short side, while
-#: any leg that REDUCES an existing short stays permitted, so a position
-#: carried in from the session can always be worked off.
+#: Expressed HERE and not through the position limit, which is the whole
+#: reason the per-leg veto exists as a separate mechanism.  risk.assess()
+#: reads `if max_position > 0.0`, so handing it zero would mean "no limit"
+#: -- the exact inversion.  The per-leg veto has no such overload: it
+#: bounds a leg that would grow the short side, while any leg that REDUCES
+#: an existing short stays permitted, so a position carried in from the
+#: session can always be worked off.
 #:
-#: This forbids OPENING shorts overnight; it is not a directional bet.  We
-#: still quote the bid, so anyone selling volatility to us cheaply is
-#: filled, and the long side remains capped by OVERNIGHT_LONG_FRACTION.
-OVERNIGHT_SHORT_FRACTION = 0.0
+#: [2026-08-31, MEASURED] It was 0.0, and 0.0 costs the entire overnight
+#: session's eligibility, because depth credit is min(bid, ask): with the
+#: ask side permitted at exactly zero size, min(bid, 0) = 0 and a FLAT,
+#: fully-funded account still banks nothing overnight.  That is not a
+#: theoretical loss.  On contest night one, five entrants compounded
+#: after hours -- the leader ran $19,728/s and passed 86,000,000
+#: depth-seconds while we sat at 4,093.892 -- and with a frozen oracle
+#: overnight is structurally the CHEAPEST depth of the week: no drift, no
+#: band risk, quotes simply rest.  Our own curfew was the thing closing
+#: that window, not the venue and not the position.
+#:
+#: So: small and non-zero.  A BALANCED two-sided book becomes legal; a
+#: directional short still does not.  Why 0.10 specifically, and why this
+#: is not just "0.0 but braver":
+#:
+#:   * The danger is inventory carried INTO the reopen, where the measured
+#:     gap runs +73% to +229%.  Stage.PREOPEN -- NOT EXIT and NOT SETTLING,
+#:     both of which were claimed here before and neither of which does
+#:     this -- shuts the SHORT SIDE for the last PREOPEN_EXIT_S before each
+#:     open.  Say what that actually protects: no ASK is resting for the
+#:     gap to sweep.  The bid is deliberately left open, so the book is not
+#:     "retracted" and describing it that way was wrong twice over.  What
+#:     this fraction bounds is what an overnight FILL can leave us holding,
+#:     which no retraction can undo.
+#:   * At a $250k full cap that is $25k of overnight short notional per
+#:     market.  At the worst gap ever measured here (+229%) that leg marks
+#:     against us by ~$57k -- survivable on a healthy book, and bounded
+#:     rather than open-ended.
+#:   * It is a SECOND limit, not the only one.  risk.assess() independently
+#:     refuses to add risk above 50% margin utilisation, so this fraction
+#:     can never be the sole thing standing between us and a reopen.
+#:
+#: Raising this further is not free and should not be done without
+#: re-measuring the reopen gap: the asymmetry with the long side is
+#: deliberate, because a short is the side a stale oracle misprices and
+#: the side that gets liquidated at the open.
+OVERNIGHT_SHORT_FRACTION = 0.10
 
 #: Floor as a fraction of the operator's full cap.  NOT zero, and not
 #: negotiable: risk.assess() reads `if max_position > 0.0 and ...`, so a
@@ -194,6 +248,12 @@ class Stage(str, Enum):
 
     EXIT = "exit"
     """The last minutes before the close: cap pinned at the floor."""
+
+    PREOPEN = "preopen"
+    """The last half hour before the bell.  The overnight short side is
+    shut again so no ask is resting when the opening gap lands: SETTLING
+    starts only AFTER the open, so without this stage there is no
+    pre-open retraction at all, whatever the comments used to say."""
 
     CLOSED = "closed"
     """The underlying is shut -- by the table, by a frozen oracle, or
@@ -367,6 +427,13 @@ def _schedule_stage(
     in_session = bool(past_opens) and max(past_opens) > last_close
 
     if not in_session:
+        # Shut the short side before the bell.  next_open is the first open
+        # still ahead of us; inside PREOPEN_EXIT_S of it the overnight ask
+        # must already be gone, because the gap arrives at the open and a
+        # resting ask is what it fills.
+        future_opens = [o for o in opens if o > now_s]
+        if future_opens and (min(future_opens) - now_s) <= PREOPEN_EXIT_S:
+            return Stage.PREOPEN, close - now_s, since_open
         return Stage.CLOSED, close - now_s, since_open
 
     to_close = close - now_s
@@ -412,6 +479,13 @@ def _side_caps(
         # the busiest quarter-hour of the session, for a danger that has
         # already passed.
         return long_target, long_target
+    if stage is Stage.PREOPEN:
+        # Short shut, long held.  Zero here is safe in a way it is NOT safe
+        # as an overnight default: the per-leg veto reads this cap, and
+        # risk.assess() never sees a zero because cap_for() on a flat or
+        # long book returns the long side.  A short carried in still works
+        # off, because permitted_leg_size allows a REDUCING buy regardless.
+        return long_target, 0.0
     # EXIT / CLOSED: the overnight posture, held.
     return long_target, short_target
 
@@ -468,6 +542,29 @@ def assess_curfew(
     # overrides any in-session claim the table makes -- that is the case
     # where the table is wrong in the direction that costs money.
     if frozen_oracle:
+        # PREOPEN is STRICTLY TIGHTER than CLOSED (short cap 0 against the
+        # overnight fraction), and this function's own rule is that a frozen
+        # oracle may only ever tighten. Collapsing it to CLOSED here would
+        # RAISE the short cap in the last half hour before the bell -- a
+        # frozen oracle re-opening the short side in precisely the window
+        # the stage exists to shut. Keep whichever is tighter.
+        # PREOPEN is STRICTLY TIGHTER than CLOSED (short cap 0), and a
+        # frozen oracle may only ever tighten -- so it must not be collapsed
+        # away.
+        #
+        # [review] SETTLING maps here too, and that one is not obvious. The
+        # first tick at or after the bell leaves PREOPEN for SETTLING; if
+        # the oracle has NOT yet printed, mapping that to CLOSED restores
+        # the overnight short cap and lets a fresh ask rest against a price
+        # that is still stale -- re-opening the exact exposure PREOPEN
+        # spent the previous half hour preventing, at the one moment the
+        # gap is most likely to arrive. A frozen oracle after the open is
+        # not "the session has started", it is "the session has not
+        # started yet"; hold the zero-short posture until it moves.
+        if stage in (Stage.PREOPEN, Stage.SETTLING):
+            return _state(Stage.PREOPEN,
+                          "the oracle has stopped moving -- holding the "
+                          "pre-open posture until it prints again")
         return _state(Stage.CLOSED,
                       "the oracle has stopped moving -- treating the "
                       "underlying as shut regardless of the schedule")

@@ -10,6 +10,7 @@ tell us the underlying is shut.
 from __future__ import annotations
 
 from gui.services.permuto.curfew import (
+    PREOPEN_EXIT_S,
     CLOSES_UTC,
     EXIT_START_S,
     OPENS_UTC,
@@ -27,7 +28,7 @@ MON_OPEN = OPENS_UTC[0]        # 2026-08-31 13:30Z = 09:30 EDT
 MON_CLOSE = CLOSES_UTC[0]      # 2026-08-31 20:00Z = 16:00 EDT
 FULL = 1_200.0
 NIGHT_LONG = FULL * OVERNIGHT_LONG_FRACTION     # 300
-NIGHT_SHORT = FULL * OVERNIGHT_SHORT_FRACTION   # 0
+NIGHT_SHORT = FULL * OVERNIGHT_SHORT_FRACTION   # 120
 
 
 def _at(now_s, frozen=False, full=FULL):
@@ -149,9 +150,18 @@ def test_the_long_cap_is_always_strictly_positive():
             assert _at(t, frozen=frozen).long_cap_usd > 0.0, (t, frozen)
 
 
-def test_the_overnight_short_cap_is_exactly_zero():
+def test_the_overnight_short_cap_is_small_but_not_zero():
+    """[2026-08-31] It WAS exactly zero, and zero cost the whole night.
+
+    Depth credit is min(bid, ask): an ask permitted at size zero makes
+    min(bid, 0) = 0, so even a flat, fully funded account banked nothing
+    overnight while five rivals compounded after hours. Small and
+    non-zero makes a BALANCED book legal; the asymmetry with the long
+    side is what still forbids a directional short.
+    """
     state = _at(MON_CLOSE + 3_600.0)
-    assert state.short_cap_usd == 0.0
+    assert state.short_cap_usd == FULL * OVERNIGHT_SHORT_FRACTION
+    assert 0.0 < state.short_cap_usd < state.long_cap_usd,         "the short side must stay strictly tighter than the long side"
 
 
 def test_no_configured_limit_leaves_the_curfew_inactive():
@@ -162,7 +172,7 @@ def test_no_configured_limit_leaves_the_curfew_inactive():
 def test_cap_for_selects_by_the_position_we_actually_hold():
     state = _at(MON_CLOSE + 3_600.0)
     assert state.cap_for(10.0) == state.long_cap_usd
-    assert state.cap_for(-10.0) == state.short_cap_usd == 0.0
+    assert state.cap_for(-10.0) == state.short_cap_usd
     assert state.cap_for(0.0) == max(state.long_cap_usd,
                                      state.short_cap_usd)
     assert state.cap_for(float("nan")) == min(state.long_cap_usd,
@@ -182,11 +192,14 @@ def test_a_reducing_sell_is_clamped_to_the_long_it_closes():
     assert permitted_leg_size(False, 250.0, 17_094.0, 4_285.0, 0.0) == 250.0
 
 
-def test_from_flat_overnight_the_ask_is_refused_outright():
+def test_a_zero_short_cap_refuses_the_ask_outright():
+    # Contract of the FUNCTION given a zero cap -- no longer the overnight
+    # configuration, which is now OVERNIGHT_SHORT_FRACTION > 0. Renamed so
+    # the name stops implying a policy that changed underneath it.
     assert permitted_leg_size(False, 0.0, 17_094.0, 4_285.0, 0.0) == 0.0
 
 
-def test_from_flat_overnight_the_bid_is_clamped_to_the_long_cap():
+def test_a_bid_is_clamped_to_the_long_cap():
     # And the clamp is what bounds it: the requested ladder leg is far
     # larger than the cap allows.
     assert permitted_leg_size(True, 0.0, 17_191.0, 4_285.0, 0.0) == 4_285.0
@@ -284,13 +297,13 @@ def test_a_frozen_oracle_overrides_an_in_session_schedule():
     assert _at(mid).stage is Stage.SESSION
     frozen = _at(mid, frozen=True)
     assert frozen.stage is Stage.CLOSED
-    assert frozen.short_cap_usd == 0.0
+    assert frozen.short_cap_usd == FULL * OVERNIGHT_SHORT_FRACTION
 
 
 def test_a_moving_oracle_does_not_lift_a_scheduled_close():
     state = _at(MON_CLOSE + 3_600.0, frozen=False)
     assert state.stage is Stage.CLOSED
-    assert state.short_cap_usd == 0.0
+    assert state.short_cap_usd == FULL * OVERNIGHT_SHORT_FRACTION
 
 
 def test_a_frozen_oracle_never_raises_either_cap():
@@ -326,3 +339,80 @@ def test_every_state_carries_a_reason():
               CLOSES_UTC[-1] + 86_400.0):
         for frozen in (True, False):
             assert _at(t, frozen=frozen).reason.strip()
+
+
+# --------------------------------------------------------------------------- #
+# PREOPEN -- the retraction PR #130 claimed but did not have
+# --------------------------------------------------------------------------- #
+
+def test_the_short_side_is_shut_before_the_bell():
+    """The gap arrives AT the open, and it fills whatever is resting.
+
+    [review 2026-08-31] PR #130's comment claimed EXIT/SETTLING retract
+    before the open. They do not: SETTLING is gated on since_open >= 0, so
+    it begins AFTER the bell and the whole night is CLOSED. With a non-zero
+    overnight short cap the ask rested straight through the opening jump
+    and was swept BY it -- filled short at pre-gap prices into a +73% to
+    +229% move, which is exactly how this account lost $523k of unrealised
+    P&L on night one.
+    """
+    state = _at(MON_OPEN - 600.0)
+    assert state.stage is Stage.PREOPEN
+    assert state.short_cap_usd == 0.0, "an ask can still rest into the gap"
+
+
+def test_the_long_side_survives_the_pre_open_window():
+    # Long into an upward vol gap is the harmless side, and shutting it too
+    # would forfeit the tail of the cheapest depth window for no gain.
+    assert _at(MON_OPEN - 600.0).long_cap_usd > 0.0
+
+
+def test_the_window_starts_exactly_where_it_says():
+    assert _at(MON_OPEN - PREOPEN_EXIT_S + 1.0).stage is Stage.PREOPEN
+    assert _at(MON_OPEN - PREOPEN_EXIT_S - 60.0).stage is Stage.CLOSED
+
+
+def test_earlier_in_the_night_the_short_side_is_open_for_depth():
+    """The whole point of the change: most of the night still earns."""
+    mid = MON_CLOSE + 3_600.0
+    state = _at(mid)
+    assert state.stage is Stage.CLOSED
+    assert state.short_cap_usd == FULL * OVERNIGHT_SHORT_FRACTION > 0.0
+
+
+def test_a_frozen_oracle_cannot_reopen_the_short_before_the_bell():
+    """A frozen oracle may only ever TIGHTEN.
+
+    Collapsing PREOPEN to CLOSED raised the short cap from 0 to the
+    overnight fraction in the last half hour -- a freeze re-opening the
+    exact side the window exists to shut.
+    """
+    frozen = _at(MON_OPEN - 600.0, frozen=True)
+    assert frozen.short_cap_usd == 0.0
+    assert frozen.short_cap_usd <= _at(MON_OPEN - 600.0, frozen=False).short_cap_usd
+
+
+def test_a_frozen_oracle_just_after_the_open_keeps_the_short_shut():
+    """[review 2026-08-31] The second version of the same hole.
+
+    The first tick at/after the bell leaves PREOPEN for SETTLING. If the
+    oracle has not printed yet, mapping that to CLOSED restores the
+    overnight short cap and lets a fresh ask rest against a price that is
+    still stale -- re-opening the exposure PREOPEN spent the previous half
+    hour preventing, at the exact moment the gap is most likely to land.
+    A frozen oracle after the open means the session has NOT started.
+    """
+    just_after = MON_OPEN + 60.0
+    assert _at(just_after, frozen=False).stage is Stage.SETTLING
+    frozen = _at(just_after, frozen=True)
+    assert frozen.short_cap_usd == 0.0,         "a frozen oracle after the bell reopened the short side"
+    assert frozen.short_cap_usd <= _at(just_after, frozen=False).short_cap_usd
+
+
+def test_the_frozen_posture_lifts_once_the_oracle_prints():
+    """And it must not be a one-way latch: a moving oracle after the open
+    is a real session, and holding zero-short there would forfeit the
+    busiest quarter hour for a danger that has passed."""
+    moving = _at(MON_OPEN + 60.0, frozen=False)
+    assert moving.stage is Stage.SETTLING
+    assert moving.short_cap_usd > 0.0
