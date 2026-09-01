@@ -1928,7 +1928,7 @@ class QuoteRunner:
         resting = self._resting.get(market, RestingQuote())
         if resting.empty or resting.two_sided:
             return False
-        if position != position:            # NaN: unreadable, force it
+        if math.isnan(position):            # unreadable: force it
             return False
         if position < 0.0:
             return (resting.bid_price is not None
