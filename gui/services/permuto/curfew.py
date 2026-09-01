@@ -354,7 +354,12 @@ class OracleFreeze:
         changed_at = self._changed_at_by_market_s.get(market)
         if changed_at is None:
             return False
-        return changed_at > boundary_s
+        # [review] INCLUSIVE. A print landing exactly on the bell IS the
+        # opening print -- the one the gate is waiting for -- and a strict
+        # `>` rejected it, holding SETTLING in the stale-withdraw posture
+        # until some later change happened to arrive. The boundaries here
+        # are exact round timestamps, so equality is not a rare edge.
+        return changed_at >= boundary_s
 
     def market_gone_quiet(self, market: str, now_s: float) -> bool:
         """Did this market print and then STOP?

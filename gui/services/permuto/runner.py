@@ -416,6 +416,28 @@ class QuoteRunner:
         # cap, so observing early costs nothing and a missed observation
         # would loosen it.
         self._band_guard.observe(now_s, oracles)
+        # [audit] DELIBERATELY gated on the curfew, and it must stay that
+        # way. An audit flagged the obvious reading -- observation is about
+        # the ORACLE, the curfew is about inventory caps, so why couple
+        # them -- and ungating it looks like a strict improvement, because
+        # with the curfew off _changed_at_by_market_s stays empty and the
+        # stale-oracle gate never fires.
+        #
+        # It is not an improvement, it is a regression, and the reason is
+        # two lines below at posture_stage: with the curfew off,
+        # self._curfew is None, so posture_stage pins to UNSCHEDULED --
+        # which modes.profile_for() lists among the stages where a frozen
+        # oracle means WITHDRAW. Feeding the detector in that
+        # configuration therefore withdraws the book every night, because
+        # the overnight oracle is frozen BY DESIGN and there is no stage
+        # left to say so. That window is where the depth is actually
+        # earned. Measured and reproduced, not theorised.
+        #
+        # The honest semantics: the stale-price gate is part of the
+        # schedule-aware machinery, and curfew_enabled=False turns that
+        # machinery off wholesale. Distinguishing "the underlying is shut"
+        # from "our feed died" REQUIRES the schedule; without it the two
+        # are the same observation.
         if self._curfew_enabled:
             self._freeze.observe(now_s, oracles)
             curfew = assess_curfew(
@@ -768,6 +790,7 @@ class QuoteRunner:
         # session exists. Latched only on success, so a failed cancel is
         # retried next tick rather than leaving the old book resting under
         # caps that no longer permit it.
+        retracted = False
         if getattr(self, "_curfew_retract_pending", False) and session_ok:
             try:
                 self._client.cancel_all(now_s, list(self._markets))
@@ -778,6 +801,7 @@ class QuoteRunner:
                 for market in self._markets:
                     self._resting[market] = RestingQuote()
                 self._curfew_retract_pending = False
+                retracted = True
                 if self._curfew is not None:
                     self._curfew_stage = self._curfew.stage
 
@@ -838,9 +862,16 @@ class QuoteRunner:
             # Outside SETTLING there is no boundary to be after, so the
             # ordinary freshness test governs.
             if posture_stage is Stage.SETTLING:
+                # [audit] BOTH questions, not just the first. "Printed
+                # since the bell" alone is satisfied forever by a single
+                # print: a market that ticks once at 09:31 and then
+                # freezes stayed quotable for the whole settle window,
+                # which is the same stale-price trap the gate exists to
+                # close, just arriving fifteen minutes later.
                 opened = [o for o in OPENS_UTC if o <= now_s]
-                fresh = bool(opened) and self._freeze.changed_since(
-                    market, max(opened))
+                fresh = (bool(opened)
+                         and self._freeze.changed_since(market, max(opened))
+                         and not self._freeze.market_gone_quiet(market, now_s))
             else:
                 # [review] gone_quiet, not market_frozen. The gate must
                 # outlive SETTLING -- the aggregate detector keeps the
@@ -961,8 +992,8 @@ class QuoteRunner:
             except Exception as exc:  # noqa: BLE001 - reported, not raised
                 _log.error("permuto: could not withdraw %s: %s", pull, exc)
                 return TickResult(
-                    "error", "stale quote still resting; withdrawal "
-                    "failed: %s" % exc, results)
+                    "error", "quote still resting; withdrawal failed: %s"
+                    % exc, results)
             if not any_quoted:
                 return TickResult("withdraw", reason, results)
 
@@ -980,6 +1011,31 @@ class QuoteRunner:
             if shut:
                 return TickResult(
                     "withdraw", profile_by_market[shut[0]].reason, results)
+            if retracted:
+                # [audit] The sibling of the `shut` case above, and the one
+                # it does NOT cover. The stage-change retraction cancels
+                # every order AFTER decide() has answered and after
+                # any_quoted was frozen, so on a frozen oracle -- where
+                # decide() says HOLD because the resting quote has not
+                # drifted -- results still reads "hold" for markets whose
+                # orders were cancelled seconds earlier in this same tick.
+                # `shut` misses it because the posture that follows the
+                # change need not be a withdrawing one: CLOSED -> PREOPEN
+                # 30 minutes before each open is quote=True, so nothing
+                # else rewrote the row.
+                #
+                # Reachable roughly once a trading day at that boundary,
+                # and on the first tick after a GUI restart while a book
+                # is still resting at the venue. One tick, then the next
+                # sees an empty _resting and re-quotes -- but for that tick
+                # the GUI is told a two-sided book is live over zero
+                # orders, which is the direction this status line must
+                # never be wrong in.
+                reason = ("the book was retracted for a curfew stage "
+                          "change; re-quoting next tick")
+                for market in self._markets:
+                    results[market] = ("withdraw", reason)
+                return TickResult("withdraw", reason, results)
             if withdrawing:
                 return TickResult("withdraw", withdraw_reason, results)
             wait = LoopAction.WAIT.value

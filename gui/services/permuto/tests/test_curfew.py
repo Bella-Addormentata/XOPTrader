@@ -505,3 +505,23 @@ def test_a_late_print_refreshes_a_market_that_had_gone_quiet():
     assert f.market_gone_quiet("QQQ-VOL-PERP", 1210.0) is False
     # ...and goes quiet again on its own schedule, not the startup one.
     assert f.market_gone_quiet("QQQ-VOL-PERP", 1310.0) is True
+
+
+def test_a_print_landing_exactly_on_the_bell_counts_as_after_it():
+    """[review] A strict `>` rejected the opening print itself.
+
+    The boundaries here are exact round timestamps and the loop ticks on a
+    timer, so a print stamped at precisely the open is not an exotic edge
+    -- and it is the very print SETTLING is waiting for. Rejecting it held
+    the stage in the stale-withdraw posture until some later change
+    happened along.
+    """
+    f = OracleFreeze()
+    f.observe(999.0, {"QQQ-VOL-PERP": 0.07})     # first sighting: no stamp
+    f.observe(1000.0, {"QQQ-VOL-PERP": 0.08})    # the opening print, at the bell
+    assert f.changed_since("QQQ-VOL-PERP", 1000.0) is True,         "the opening print was not accepted as having happened at the open"
+    # A print BEFORE the bell still does not count.
+    g = OracleFreeze()
+    g.observe(900.0, {"QQQ-VOL-PERP": 0.07})
+    g.observe(999.0, {"QQQ-VOL-PERP": 0.08})
+    assert g.changed_since("QQQ-VOL-PERP", 1000.0) is False

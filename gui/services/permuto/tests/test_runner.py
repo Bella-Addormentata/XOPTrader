@@ -1120,7 +1120,8 @@ def test_leaderboard_watch_is_throttled(monkeypatch):
 # --------------------------------------------------------------------------- #
 
 from gui.services.permuto.curfew import (                          # noqa: E402
-    CLOSES_UTC, OPENS_UTC, OVERNIGHT_SHORT_FRACTION, SETTLE_AFTER_OPEN_S,
+    CLOSES_UTC, FREEZE_CONFIRM_S, OPENS_UTC, OVERNIGHT_SHORT_FRACTION,
+    SETTLE_AFTER_OPEN_S,
 )
 
 _MID_SESSION = OPENS_UTC[0] + SETTLE_AFTER_OPEN_S + 3_600.0
@@ -2402,3 +2403,75 @@ def test_a_withdrawn_book_never_reports_itself_as_holding(monkeypatch):
     assert res.action == "withdraw", (
         "reported %r over an empty book" % (res.action,))
     assert res.reason
+
+
+def test_the_stage_change_retraction_does_not_report_a_live_book(monkeypatch):
+    """[audit] The sibling the posture fix above does NOT catch.
+
+    At the CLOSED -> PREOPEN boundary, 30 minutes before each open, the
+    oracle is still frozen: decide() therefore says HOLD, because the
+    resting quote has not drifted anywhere. `results` and `any_quoted` are
+    frozen from that answer. THEN the deferred stage-change retraction
+    cancels every order and empties _resting -- and rewrites neither.
+
+    `shut` does not save it, because PREOPEN's profile is quote=True: the
+    book is gone for a reason that has nothing to do with posture. So the
+    tick returned "hold -- all markets resting and in ring" on a tick that
+    had just cancelled the entire book, and the GUI paints that as a live
+    two-sided market.
+
+    Reachable once a trading day at that boundary, and on the first tick
+    after a GUI restart (_curfew_stage starts None, so any stage differs)
+    while a book is still resting at the venue.
+    """
+    c = _Client(account=_account(100_000.0))
+    r = _runner(c, curfew_enabled=True, max_position_usd=12_000.0)
+
+    # A book resting overnight, with the curfew latched at CLOSED.
+    r.tick(_OVERNIGHT, _ORACLE, {})
+    assert not r._resting[_MKT].empty
+
+    monkeypatch.setattr(
+        "gui.services.permuto.runner.decide",
+        lambda *a, **k: QuoteDecision(LoopAction.HOLD, "two-sided, in ring"))
+    r._curfew_retract_pending = True
+
+    res = r.tick(OPENS_UTC[1] - 1_800.0, _ORACLE, {})
+
+    assert r._resting[_MKT].empty, "the retraction did not empty the book"
+    assert res.action != "hold", (
+        "reported a resting book on the tick that cancelled it")
+    assert res.action == "withdraw", res.action
+    assert all(a == "withdraw" for a, _ in res.markets.values()), res.markets
+
+
+def test_one_print_after_the_bell_does_not_buy_the_whole_settle_window():
+    """[audit] "Printed since the open" is satisfied forever by one print.
+
+    changed_since() answers a question with no expiry date: once a market
+    has ticked after the bell, it has ticked after the bell for the rest
+    of the day. So a market that printed at 09:31 and then froze stayed
+    quotable for the remaining fourteen minutes of SETTLING -- the same
+    stale-price trap the gate exists to close, arriving a quarter of an
+    hour later than the case that motivated it.
+
+    The gate needs BOTH halves: printed since the bell, AND not since gone
+    quiet.
+    """
+    open_s = OPENS_UTC[0]
+    c = _Client(account=_account(100_000.0))
+    r = _runner(c, curfew_enabled=True, max_position_usd=12_000.0)
+
+    r.tick(open_s + 10.0, {_MKT: 0.07}, {})          # first sighting only
+    live = r.tick(open_s + 60.0, {_MKT: 0.08}, {})   # a real opening print
+    assert live.action == "quote", (
+        "a market printing after the bell should be quotable: %s"
+        % live.reason)
+
+    # Now it stops, while the clock is still inside the settle window.
+    stale_at = open_s + 60.0 + FREEZE_CONFIRM_S + 5.0
+    assert stale_at < open_s + SETTLE_AFTER_OPEN_S, "left SETTLING too early"
+    gone = r.tick(stale_at, {_MKT: 0.08}, {})
+    assert gone.action == "withdraw", (
+        "a market that went quiet mid-settle stayed quotable: %s"
+        % gone.action)
