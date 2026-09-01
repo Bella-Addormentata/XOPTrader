@@ -474,15 +474,34 @@ def _default_market_reader() -> dict:
     return {"prices": prices, "trading_paused": bool(flags.get("trading_paused"))}
 
 
+from gui.services.permuto.live import MARKETS as _MARKETS_FOR_BUDGET
+
 #: Per-request ceiling for the operator-close worker. Below the venue
 #: default so no single call can outlive the join budget on its own.
 CLOSE_REQUEST_TIMEOUT_S = 8.0
 
-#: How long shutdown waits for that worker. Sized for its worst-case
-#: sequence -- session, account, a fresh account read, then one order
-#: per market -- at CLOSE_REQUEST_TIMEOUT_S each, so a slow venue does
-#: not end with a live order thread being terminated.
-CLOSE_JOIN_MS = 60000
+#: A cold ensure_session() is two calls: challenge, then auth.
+CLOSE_SESSION_CALLS = 2
+
+#: [review] And every authenticated call can expand to FOUR on the
+#: supported 401 path -- the request, the challenge, the re-auth, and
+#: the retry. Budgeting one call per request, as the first version of
+#: this did, understates the worst case by roughly 2.4x and leaves
+#: terminate() reachable with an order retry in flight.
+CLOSE_CALLS_PER_REQUEST = 4
+
+#: Requests send mode makes beyond the session: the fresh position read
+#: send_close() performs, plus one order per market.
+CLOSE_MAX_LEGS = len(_MARKETS_FOR_BUDGET)
+
+#: How long shutdown waits for that worker. DERIVED, not chosen: a
+#: hand-picked number drifts the moment a market is added or the retry
+#: path changes, and the failure it guards is an order acknowledged by
+#: the venue and never seen by the operator.
+CLOSE_JOIN_MS = int(
+    (CLOSE_SESSION_CALLS
+     + CLOSE_CALLS_PER_REQUEST * (1 + CLOSE_MAX_LEGS))
+    * CLOSE_REQUEST_TIMEOUT_S * 1000)
 
 
 def _default_venue_snapshot() -> tuple:
@@ -607,6 +626,17 @@ class _CloseWorker(QObject):
 
     @Slot()
     def run(self) -> None:
+        # [review] BEFORE the session, not after. The join budget is
+        # derived from CLOSE_MAX_LEGS, so exceeding it silently
+        # invalidates the arithmetic that keeps terminate() away from a
+        # live order -- and there is no reason to open a venue session
+        # for a close we have already decided to refuse.
+        if self._mode == "send" and len(self._approved_legs) > CLOSE_MAX_LEGS:
+            self.failed.emit(
+                "refusing %d legs: the shutdown budget covers %d, and "
+                "exceeding it risks a live order being killed mid-flight"
+                % (len(self._approved_legs), CLOSE_MAX_LEGS))
+            return
         try:
             from gui.services.permuto import close_out
             from gui.services.permuto.client import PermutoClient
@@ -1443,13 +1473,13 @@ class PermutoWidget(QWidget):
         # per-request timeout, so terminate() stays a real last resort
         # rather than the ordinary outcome of a slow venue.
         self._join(self._close_thread, "operator close",
-                   wait_ms=CLOSE_JOIN_MS)
+                   wait_ms=CLOSE_JOIN_MS, live_orders=True)
         self._close_thread = None
         self._close_worker = None
 
     @staticmethod
     def _join(thread: Optional[QThread], what: str,
-              wait_ms: int = 10000) -> None:
+              wait_ms: int = 10000, live_orders: bool = False) -> None:
         """Stop one worker, terminating it if it will not go quietly."""
         if thread is None:
             return
@@ -1462,7 +1492,20 @@ class PermutoWidget(QWidget):
         # page-owned workers use (settings.py, wallet_balances.py).
         thread.quit()
         if not thread.wait(wait_ms):
-            _log.warning("permuto: %s thread did not stop; terminating", what)
+            # [review] There is no compensating action available here.
+            # PermutoLive.join() can cancel the book from the GUI thread
+            # before terminating, so its last resort still leaves a safe
+            # state; an order already on the wire cannot be un-sent. If
+            # this is ever reached for the close worker the operator has
+            # to be told to go and look at the venue themselves.
+            if live_orders:
+                _log.critical(
+                    "permuto: the %s thread did not stop in %dms and is "
+                    "being TERMINATED -- an order may have reached the "
+                    "venue without its acknowledgement being recorded. "
+                    "CHECK THE POSITION ON THE VENUE.", what, wait_ms)
+            else:
+                _log.warning("permuto: %s thread did not stop; terminating", what)
             thread.terminate()
             thread.wait(1000)
 

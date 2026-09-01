@@ -348,12 +348,25 @@ def test_the_close_worker_cannot_outlive_its_join_budget():
     from gui.widgets import permuto as permuto_mod
     from gui.services.permuto.live import MARKETS
 
-    worst_case_requests = 3 + len(MARKETS)
-    worst_case_ms = worst_case_requests * permuto_mod.CLOSE_REQUEST_TIMEOUT_S * 1000
+    # [review] STATED HERE, not imported. The first version of this test
+    # computed the worst case from the very constants that produce
+    # CLOSE_JOIN_MS, so the two moved together and the assertion could
+    # never fail -- reverting CLOSE_CALLS_PER_REQUEST to 1 left it green.
+    # The protocol facts belong in the test, independently:
+    #
+    #   a cold ensure_session() is 2 calls (challenge, auth)
+    #   every authenticated request can become 4 on the 401 path
+    #     (request, challenge, re-auth, retry)
+    #   send mode makes 1 fresh position read + one order per market
+    session_calls = 2
+    calls_per_request = 4
+    worst_case_calls = session_calls + calls_per_request * (1 + len(MARKETS))
+    worst_case_ms = (worst_case_calls
+                     * permuto_mod.CLOSE_REQUEST_TIMEOUT_S * 1000)
     assert permuto_mod.CLOSE_JOIN_MS >= worst_case_ms, (
-        "join budget %dms is under the %.0fms worst case (%d requests at "
-        "%.1fs) -- a live order thread can still be terminated"
-        % (permuto_mod.CLOSE_JOIN_MS, worst_case_ms, worst_case_requests,
+        "join budget %dms is under the %.0fms worst case (%d HTTP calls "
+        "at %.1fs) -- a live order thread can still be terminated"
+        % (permuto_mod.CLOSE_JOIN_MS, worst_case_ms, worst_case_calls,
            permuto_mod.CLOSE_REQUEST_TIMEOUT_S))
 
 
@@ -380,3 +393,35 @@ def test_the_close_client_is_built_with_the_bounded_timeout(monkeypatch):
     assert seen.get("timeout") == permuto_mod.CLOSE_REQUEST_TIMEOUT_S, (
         "the close worker used the venue default, not the bounded timeout")
     assert failures, "the fake should have surfaced its error"
+
+
+def test_more_legs_than_the_budget_covers_are_refused(monkeypatch):
+    """[review] The join budget is DERIVED from CLOSE_MAX_LEGS, so sending
+    more than that silently invalidates the arithmetic that keeps
+    terminate() away from a live order. Refuse instead."""
+    from gui.widgets import permuto as permuto_mod
+
+    legs = [{"market": "M%d" % i, "side": "buy", "size": 1.0,
+             "reduce_only": True}
+            for i in range(permuto_mod.CLOSE_MAX_LEGS + 1)]
+    worker = permuto_mod._CloseWorker(object(), 1.0, mode="send",
+                                      approved_legs=legs)
+    refusals, sent = [], []
+    worker.failed.connect(lambda m: refusals.append(m))
+    worker.sent.connect(lambda r: sent.append(r))
+
+    class _NeverCalled:
+        def __init__(self, *a, **k):
+            raise AssertionError("a client was built for a refused close")
+
+    monkeypatch.setattr("gui.services.permuto.client.PermutoClient",
+                        _NeverCalled)
+    worker.run()
+
+    assert not sent, "an over-budget close was sent anyway"
+    assert refusals, "no refusal was surfaced at all"
+    # Specific: the refusal must name BOTH counts, so a generic
+    # exception message cannot satisfy it by containing a word.
+    assert str(len(legs)) in refusals[0], refusals
+    assert str(permuto_mod.CLOSE_MAX_LEGS) in refusals[0], refusals
+    assert "refusing" in refusals[0].lower(), refusals
