@@ -46,10 +46,18 @@ class _Fake:
         self.routes = routes
         self.errors = errors or {}
         self.calls = []
+        #: Decoded request bodies, keyed by path. Kept separate from
+        #: `calls` so the existing 3-tuple unpacking keeps working.
+        self.bodies = []
 
     def __call__(self, req, timeout=None):
         path = req.full_url.split("permuto.capital", 1)[-1]
         self.calls.append((req.method, path, dict(req.headers)))
+        try:
+            self.bodies.append((path, json.loads(req.data.decode())
+                                if req.data else None))
+        except Exception:       # noqa: BLE001 - a body we cannot decode
+            self.bodies.append((path, req.data))
         queue = self.errors.get(path)
         if queue:
             code = queue.pop(0)
@@ -628,3 +636,43 @@ def test_an_empty_user_id_injects_nothing(monkeypatch):
     c.open_orders(1.0)
     assert "user_id" not in wire[0]
 
+
+
+def test_place_order_posts_the_payload_unchanged(monkeypatch):
+    """[review] The close-control tests fake place_order, so nothing
+    covered the transport itself -- an endpoint or payload regression
+    would have passed the entire new suite."""
+    fake = _wire(monkeypatch, {"/exchange/order": {"action": "placed"}})
+    c = PermutoClient(_Identity(), session_token="tok", expires_at_s=1e12)
+    leg = {"market": "QQQ-VOL-PERP", "side": "buy", "size": 100.0,
+           "tif": "ioc", "reduce_only": True}
+    assert c.place_order(leg, 3.0) == {"action": "placed"}
+
+    posted = [b for p, b in fake.bodies if p == "/exchange/order"]
+    assert len(posted) == 1, "the order did not go to /exchange/order"
+    # Every field the caller built must survive, unaltered.
+    for key, value in leg.items():
+        assert posted[0].get(key) == value, key
+    # ...and the caller's dict must not be mutated underneath it.
+    assert leg["reduce_only"] is True and "user_id" not in leg
+
+
+def test_place_order_inherits_the_one_401_retry(monkeypatch):
+    """The same auth contract every other trading route is held to."""
+    fake = _wire(monkeypatch, {"/exchange/order": {"action": "placed"}},
+                 errors={"/exchange/order": [401]})
+    c = PermutoClient(_Identity(), session_token="stale", expires_at_s=1e12)
+    assert c.place_order({"market": "A"}, 7.0) == {"action": "placed"}
+
+    paths = [p for _, p, _ in fake.calls]
+    assert paths.count("/exchange/order") == 2
+    assert paths.count("/exchange/wallet_auth") == 1
+    assert fake.calls[-1][2]["Authorization"] == "Bearer fresh"
+
+
+def test_place_order_does_not_retry_a_401_forever(monkeypatch):
+    fake = _wire(monkeypatch, errors={"/exchange/order": [401, 401, 401]})
+    c = PermutoClient(_Identity(), session_token="tok", expires_at_s=1e12)
+    with pytest.raises(PermutoSessionExpired):
+        c.place_order({"market": "A"}, 0.0)
+    assert [p for _, p, _ in fake.calls].count("/exchange/order") == 2

@@ -111,6 +111,20 @@ def read_positions(client: Any, now_s: float) -> dict:
         for market, raw in rows.items():
             name = str(market or "").strip()
             if not name:
+                # [review] The seventh variant of the same fail-open, and
+                # the only survivor of the audit that added the rule: a row
+                # may be skipped only when it carries NO EXPOSURE. A blank
+                # key with a live size is a malformed but exposed account,
+                # and dropping it turned that into "Nothing to close" on
+                # the one control an operator uses to escape. The LIST
+                # branch already records exactly this as unreadable.
+                try:
+                    blank = float(raw)
+                except (TypeError, ValueError):
+                    blank = float("nan")
+                if blank == 0.0:
+                    continue        # genuinely flat: nothing to misreport
+                unreadable.append("(no market) %r" % (raw,))
                 continue
             try:
                 signed = float(raw)
@@ -165,14 +179,24 @@ def read_positions(client: Any, now_s: float) -> dict:
         if not market:
             unreadable.append("row %d (no market)" % index)
             continue
+        # [review] `or 0.0` made a MISSING or null size indistinguishable
+        # from an explicit zero, so {"market": "A", "side": "sell"} -- a
+        # truncated row that may well carry the whole position -- vanished
+        # from the confirmation as "flat". An absent size is unreadable,
+        # not empty; only a size the venue actually stated as zero is flat.
+        raw_size = row.get("size")
+        if raw_size is None:
+            raw_size = row.get("position")
+        if raw_size is None:
+            unreadable.append("%s (no size field)" % market)
+            continue
         try:
-            size = abs(float(row.get("size", row.get("position", 0.0)) or 0.0))
+            size = abs(float(raw_size))
         except (TypeError, ValueError):
-            unreadable.append("%s (size %r)"
-                              % (market, row.get("size")))
+            unreadable.append("%s (size %r)" % (market, raw_size))
             continue
         if not math.isfinite(size):
-            unreadable.append("%s (size %r)" % (market, row.get("size")))
+            unreadable.append("%s (size %r)" % (market, raw_size))
             continue
         if size <= 0.0:
             continue        # genuinely flat: no exposure to misreport
@@ -191,6 +215,16 @@ def read_positions(client: Any, now_s: float) -> dict:
     return out
 
 
+#: Words the venue uses to refuse, on either key.
+_REFUSED = ("rejected", "failed", "error", "cancelled")
+
+#: ...and to acknowledge. `action` is the one actually observed in
+#: captured responses; the status words are accepted too so a differently
+#: shaped envelope is not read as a refusal.
+_ACCEPTED = ("placed", "modified", "filled", "unchanged", "ok", "success",
+             "accepted", "partially_filled")
+
+
 def order_was_accepted(resp: Any) -> tuple:
     """``(accepted, detail)`` for one single-order response.
 
@@ -201,15 +235,42 @@ def order_was_accepted(resp: Any) -> tuple:
     the venue had refused, which on an emergency control is worse than
     reporting the failure.
     """
-    if not isinstance(resp, dict):
-        return True, ""            # nothing to contradict; trust the 200
+    if not isinstance(resp, dict) or not resp:
+        # [review] NO BODY IS NOT AN ACKNOWLEDGEMENT. This used to return
+        # True here -- "nothing to contradict, trust the 200" -- but the
+        # transport manufactures {} for an empty 200 (client._decode), and
+        # a null, a list or a bare number all arrive here as-is. Zero bytes
+        # of venue evidence was being counted into `sent` and shown to the
+        # operator as "N leg(s) sent".
+        return False, ("no order acknowledgement in the venue response "
+                       "(%s)" % type(resp).__name__)
     reason = str(resp.get("rejection_reason") or "").strip()
-    status = str(resp.get("status", "")).strip().lower()
     if reason:
         return False, reason
-    if status in ("rejected", "failed", "error", "cancelled"):
-        return False, status
-    return True, ""
+    status = str(resp.get("status", "")).strip().lower()
+    action = str(resp.get("action", "")).strip().lower()
+    if status in _REFUSED or action in _REFUSED:
+        return False, status or action
+    # [review] `action` was never read at all, and it is the vocabulary the
+    # venue actually speaks: every acknowledgement this repo has captured
+    # is shaped {"action": "placed", "fills": [...], "order_id": N} with
+    # "rejection_reason" on refusal. A body saying {"action": "rejected"}
+    # and nothing else was therefore reported as a successful close.
+    #
+    # An id or a fill is acceptance on its own, so an order that fills
+    # without a recognised status word is not misreported as refused.
+    if (resp.get("order_id") or resp.get("id") or resp.get("fills")
+            or action in _ACCEPTED or status in _ACCEPTED):
+        return True, ""
+    # Deliberately NOT the runner's rule. runner._legs_all_accepted trusts
+    # an unknown envelope on purpose, because a false refusal there trips
+    # the batch breaker and drains the book. Here the asymmetry runs the
+    # other way: a false refusal costs one re-press, and the re-press
+    # re-reads the venue and clamps every leg reduce-only against it, so a
+    # second attempt on an already-closed position skips as "already
+    # flat". Fail-closed is self-correcting; fail-open ends with an
+    # operator walking away from a position they think is gone.
+    return False, "unrecognised order response: %.200r" % (resp,)
 
 
 def plan_close(positions: dict, fraction: float,
@@ -255,6 +316,7 @@ def describe(legs: list, prices: Optional[dict] = None) -> str:
         return "Nothing to close -- the venue reports no open positions."
     px = prices or {}
     lines, total = [], 0.0
+    unpriced = 0
     for leg in legs:
         key = leg["market"].replace("-PERP", "")
         # [review] The notional is a NICETY; the plan is the point. A junk
@@ -270,6 +332,13 @@ def describe(legs: list, prices: Optional[dict] = None) -> str:
             price = 0.0
         if not math.isfinite(price) or price < 0.0:
             price = 0.0
+        if price <= 0.0:
+            # [review] A leg we could not price must not silently
+            # shrink the total. Two legs with one missing price
+            # produced a plausible number that UNDERSTATED what the
+            # operator was approving -- on a confirmation dialog,
+            # which exists so the number can be checked first.
+            unpriced += 1
         notional = leg["size"] * price
         total += notional
         lines.append("  %-15s %-4s %12.0f contracts%s"
@@ -277,8 +346,14 @@ def describe(legs: list, prices: Optional[dict] = None) -> str:
                         ("  ~$%,.0f".replace(",", "") % notional)
                         if price > 0 else ""))
     if total > 0.0:
-        lines.append("  %-15s %-4s %12s   ~$%.0f total"
-                     % ("", "", "", total))
+        lines.append("  %-15s %-4s %12s   ~$%.0f%s"
+                     % ("", "", "", total,
+                        " total" if not unpriced else
+                        " PARTIAL total -- %d leg(s) unpriced"
+                        % unpriced))
+    elif unpriced:
+        lines.append("  (no notional available -- %d leg(s) "
+                     "unpriced)" % unpriced)
     return "\n".join(lines)
 
 
@@ -304,6 +379,22 @@ def send_close(client: Any, now_s: float, approved_legs: list, *,
     operator needs on screen, not a traceback in a log they are not
     reading.
     """
+    # [review] IOC ONLY. The advertised tif="alo" built exactly the same
+    # payload as IOC -- with no limit price in it. ALO is post-only limit,
+    # so the venue can only reject a price-less one, and the option read
+    # as a supported "patient close" that silently could not work.
+    #
+    # Not fixed by adding a price: that would need the limit chosen, band
+    # checked against a fresh oracle, and SHOWN in the confirmation before
+    # approval. That is a feature, and the wrong one for a control whose
+    # purpose is crossing the spread to get out now.
+    tif = str(tif or "").strip().lower()
+    if tif != "ioc":
+        raise ValueError(
+            "close legs carry no limit price, so only tif='ioc' is valid "
+            "here; %r is a resting/post-only variant the venue would "
+            "reject" % (tif,))
+
     if not approved_legs:
         return {"ok": True, "sent": 0, "note": "no legs to send", "legs": []}
 

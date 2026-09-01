@@ -473,6 +473,35 @@ def _default_market_reader() -> dict:
     return {"prices": prices, "trading_paused": bool(flags.get("trading_paused"))}
 
 
+def _default_lot_sizes() -> dict:
+    """``{market: lot_size}`` from the public /info/meta specs.
+
+    [review] The close planner quantises to whole lots, but nothing was
+    passing it any, so every operator close fell back to the hardcoded 1.0
+    -- and a market whose lot is not 1 then produces a size the venue
+    rejects. The quantisation was tested and simply never wired up.
+
+    Reuses live._default_venue_state() rather than re-parsing /info/meta
+    here: that function already handles the symbol/base_asset aliasing and
+    the malformed-entry cases, and duplicating it is how the two copies
+    drift. Unauthenticated, like the price read beside it.
+    """
+    from gui.services.permuto.live import _default_venue_state
+
+    specs = ((_default_venue_state().get("flags") or {}).get("specs") or {})
+    lots = {}
+    for market, spec in specs.items():
+        if not isinstance(spec, dict):
+            continue
+        try:
+            lot = float(spec.get("lot_size"))
+        except (TypeError, ValueError):
+            continue
+        if lot > 0.0 and lot == lot:
+            lots[market] = lot
+    return lots
+
+
 def _scrolled(inner: QWidget) -> QScrollArea:
     """Wrap a section so a narrow window scrolls it instead of clipping it."""
     area = QScrollArea()
@@ -561,8 +590,12 @@ class _CloseWorker(QObject):
                     prices = _default_market_reader().get("prices") or {}
                 except Exception:  # noqa: BLE001 - notional is a nicety
                     prices = {}
+                try:
+                    lots = _default_lot_sizes()
+                except Exception:  # noqa: BLE001 - degrades to the 1.0 grid
+                    lots = {}
                 positions = close_out.read_positions(client, now)
-                legs = (close_out.plan_close(positions, self._fraction)
+                legs = (close_out.plan_close(positions, self._fraction, lots)
                         if positions else [])
                 self.planned.emit((legs, close_out.describe(legs, prices)))
                 return
@@ -1026,7 +1059,15 @@ class PermutoWidget(QWidget):
             self._log_activity("Close FAILED (%d sent): %s" % (sent, note))
             return
         sent = result.get("sent", 0)
-        note = result.get("note") or ("%d leg(s) sent" % sent)
+        # [review] The count is never optional. `note` is non-empty
+        # whenever any leg was SKIPPED, and `or` then replaced the count
+        # entirely -- so a partial success displayed "skipped X(already
+        # flat)" with no indication that three other legs had gone out.
+        # The operator needs both halves to know what state they are in.
+        note = ("%d leg(s) sent" % sent)
+        detail = result.get("note")
+        if detail:
+            note = "%s -- %s" % (note, detail)
         self._close_note.setText(
             "%s. Check the position on the venue -- a reduce-only IOC can "
             "part-fill, and this button does not retry." % note)

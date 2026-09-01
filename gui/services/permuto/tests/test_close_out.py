@@ -56,9 +56,46 @@ def test_an_unreadable_side_RAISES_rather_than_vanishing():
 
 
 def test_a_genuinely_flat_row_is_ignored():
-    """A zero size carries no exposure, so there is nothing to misreport."""
-    c = _Client({"positions": [_pos("A", "sell", 0), {"market": "B"}]})
+    """A zero size carries no exposure, so there is nothing to misreport.
+
+    [review] This used to assert the same for {"market": "B"} -- a row with
+    no size FIELD -- which is the opposite case: an explicit zero is the
+    venue telling us the market is flat, while an absent size is the venue
+    telling us nothing at all. See the test below.
+    """
+    c = _Client({"positions": [_pos("A", "sell", 0), _pos("B", "buy", 0)]})
     assert read_positions(c, 0.0) == {}
+
+
+def test_a_row_with_no_size_field_FAILS_the_plan():
+    """[review] `or 0.0` collapsed "absent" into "zero".
+
+    A truncated row may carry the entire position -- there is nothing in
+    {"market": "B", "side": "sell"} that says the exposure is small. It
+    used to be dropped as flat, so an account with real exposure could
+    render as "Nothing to close" on the one control an operator uses to
+    get out.
+    """
+    c = _Client({"positions": [_pos("A", "sell", 100), {"market": "B",
+                                                        "side": "sell"}]})
+    with pytest.raises(ClosePayloadError) as excinfo:
+        read_positions(c, 0.0)
+    assert "B" in str(excinfo.value)
+
+
+def test_a_blank_market_key_with_live_size_FAILS_the_plan():
+    """The dict-shape twin of the row above: a nameless key we cannot act
+    on, carrying exposure we must not pretend is absent."""
+    c = _Client({"positions": {"": -250.0, "A": -100.0}})
+    with pytest.raises(ClosePayloadError):
+        read_positions(c, 0.0)
+
+
+def test_a_blank_market_key_that_is_flat_is_still_ignored():
+    """...but a nameless key at zero carries nothing, so it must not
+    block a close that is otherwise perfectly readable."""
+    c = _Client({"positions": {"": 0.0, "A": -100.0}})
+    assert read_positions(c, 0.0) == {"A": -100.0}
 
 
 def test_a_structurally_broken_row_FAILS_the_plan():
@@ -148,11 +185,20 @@ def test_it_sends_reduce_only_ioc_legs():
     assert leg["tif"] == "ioc"
 
 
-def test_a_patient_close_can_ask_for_alo():
+def test_a_post_only_close_is_refused_rather_than_sent_priceless():
+    """[review] The "patient close" could never have worked.
+
+    tif="alo" built the identical price-less payload as IOC, and ALO is a
+    post-only LIMIT instruction -- the venue has nothing to rest. Better
+    to refuse the call than to advertise an option that can only come back
+    rejected.
+    """
     c = _Client({"positions": [_pos("QQQ-VOL-PERP", "sell", 100)]})
     legs = plan_close({"QQQ-VOL-PERP": -100.0}, 1.0)
-    send_close(c, 0.0, legs, tif="alo")
-    assert c.sent[0]["tif"] == "alo"
+    with pytest.raises(ValueError) as excinfo:
+        send_close(c, 0.0, legs, tif="alo")
+    assert "limit price" in str(excinfo.value)
+    assert not c.sent, "a leg went out despite the refusal"
 
 
 def test_send_clamps_to_fresh_position_if_smaller():
@@ -340,3 +386,52 @@ def test_a_flipped_market_is_named_in_the_note():
     res = send_close(c, 0.0, approved)
     assert res["sent"] == 0
     assert "flipped" in res["note"], res
+
+
+def test_an_empty_or_absent_body_is_not_an_acknowledgement():
+    """[review] "Nothing to contradict, trust the 200" counted zero bytes
+    of venue evidence as a completed close.
+
+    The transport manufactures {} for an empty 200, so this is not a
+    hypothetical shape -- and the operator was shown "N leg(s) sent" on
+    the strength of it.
+    """
+    for junk in (None, {}, [], "ok", 7):
+        accepted, detail = order_was_accepted(junk)
+        assert accepted is False, "%r was read as a successful close" % (junk,)
+        assert detail
+
+
+def test_the_action_key_is_read_on_both_sides():
+    """`action` is the vocabulary the venue actually speaks -- every
+    acknowledgement captured from it is shaped {"action": ..., "fills":
+    ..., "order_id": ...}. It was not consulted at all, so a plain
+    {"action": "rejected"} was reported as sent."""
+    refused, detail = order_was_accepted({"action": "rejected"})
+    assert refused is False
+    # ...and the operator is told it was REFUSED, not that we could not
+    # parse the answer. Both are False, but only one is actionable.
+    assert "rejected" in detail and "unrecognised" not in detail
+    assert order_was_accepted({"action": "placed"})[0] is True
+    assert order_was_accepted({"action": "placed", "order_id": 4512662,
+                               "fills": []})[0] is True
+
+
+def test_a_fill_or_an_id_is_acceptance_on_its_own():
+    """So an order the venue clearly acted on is never misreported as
+    refused just because its envelope used an unfamiliar word."""
+    assert order_was_accepted({"order_id": 4512662})[0] is True
+    assert order_was_accepted({"fills": [{"size": 10}]})[0] is True
+
+
+def test_an_unrecognised_body_is_refused_not_assumed():
+    accepted, detail = order_was_accepted({"weather": "fine"})
+    assert accepted is False
+    assert "unrecognised" in detail
+
+
+def test_a_stated_rejection_still_wins_over_an_id():
+    """A body carrying both an id and a refusal is a refusal."""
+    assert order_was_accepted(
+        {"order_id": 1, "rejection_reason": "reduce-only would increase"}
+    )[0] is False

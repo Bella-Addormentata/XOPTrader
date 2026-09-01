@@ -205,6 +205,23 @@ def test_a_partial_failure_still_reports_what_went_out(widget):
     assert "margin" in text, text
 
 
+def test_a_success_with_skipped_legs_still_reports_the_sent_count(widget):
+    """[review] `note or "%d leg(s) sent"` dropped the count.
+
+    `note` is non-empty whenever ANY leg was skipped, so a partial success
+    showed only the skip detail: the operator saw "skipped B(already
+    flat)" with no indication that a leg had in fact gone out. On a close
+    control the count is the whole message -- it is what tells them
+    whether they still have exposure.
+    """
+    widget._on_close_sent({"ok": True, "sent": 2,
+                           "note": "skipped B(already flat)",
+                           "skipped": ["B(already flat)"]})
+    text = widget._close_note.text()
+    assert "2 leg(s) sent" in text, text
+    assert "already flat" in text, text
+
+
 def test_a_total_failure_does_not_claim_legs_went_out(widget):
     widget._on_close_sent({"ok": False, "sent": 0, "note": "session expired"})
     text = widget._close_note.text()
