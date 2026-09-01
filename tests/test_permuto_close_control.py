@@ -172,7 +172,9 @@ def test_a_late_finish_does_not_clear_the_running_thread(widget, monkeypatch):
 
     assert widget._close_thread is running,         "a late finish from a superseded thread disowned the running one"
     assert widget.close_in_flight() is True, "lost in-flight protection"
-    assert stale.deleted is True, "the superseded thread was never cleaned up"
+    # Deletion is wired to each thread's own finished signal now, so the
+    # callback must not delete anything itself -- doing so would schedule a
+    # second deletion of the same object.
     assert running.deleted is False, "deleted a thread that is still running"
 
 
@@ -186,4 +188,25 @@ def test_the_current_thread_finishing_does_clear_state(widget, monkeypatch):
 
     assert widget._close_thread is None
     assert widget.close_in_flight() is False
-    assert running.deleted is True
+
+
+def test_a_partial_failure_still_reports_what_went_out(widget):
+    """[review] Legs that already filled moved the position.
+
+    Reporting only "Failed: ..." let an operator believe nothing happened
+    while some legs were already live -- on a control whose whole purpose
+    is knowing your exposure.
+    """
+    widget._on_close_sent({"ok": False, "sent": 2,
+                           "note": "partial: TSLA-VOL-PERP: margin"})
+    text = widget._close_note.text()
+    assert "2 leg(s)" in text, text
+    assert "does not retry" in text, text
+    assert "margin" in text, text
+
+
+def test_a_total_failure_does_not_claim_legs_went_out(widget):
+    widget._on_close_sent({"ok": False, "sent": 0, "note": "session expired"})
+    text = widget._close_note.text()
+    assert text.startswith("Failed:"), text
+    assert "leg(s) went out" not in text

@@ -936,7 +936,15 @@ class PermutoWidget(QWidget):
         worker.failed.connect(self._on_close_failed)
         for sig in (worker.planned, worker.sent, worker.failed):
             sig.connect(thread.quit)
+            # [review] The worker has no parent -- moveToThread removes it
+            # from this page's children -- so clearing _close_worker is not
+            # Qt cleanup, it just drops our reference and leaks the object.
+            # Same wiring the registration and market workers already use,
+            # and it matters more here because a send worker can supersede
+            # a plan worker before its thread has finished.
+            sig.connect(worker.deleteLater)
         thread.finished.connect(self._on_close_thread_finished)
+        thread.finished.connect(thread.deleteLater)
         self._close_thread = thread
         self._close_worker = worker
         self._close_fraction = fraction
@@ -955,13 +963,14 @@ class PermutoWidget(QWidget):
         """
         done = self.sender()
         if done is not None and done is not self._close_thread:
-            # A superseded thread finishing late. It owns nothing now.
-            done.deleteLater()
+            # A superseded thread finishing late. It owns nothing now, and
+            # its own finished->deleteLater has already been scheduled.
             return
-        thread, self._close_thread = self._close_thread, None
+        # deleteLater is wired on the thread's own finished signal above,
+        # so this only drops our references -- deleting here as well would
+        # be a second scheduled deletion of the same object.
+        self._close_thread = None
         self._close_worker = None
-        if thread is not None:
-            thread.deleteLater()
 
     @Slot(object)
     def _on_close_planned(self, payload: Any) -> None:
@@ -995,8 +1004,21 @@ class PermutoWidget(QWidget):
     def _on_close_sent(self, result: Any) -> None:
         self._set_close_enabled(True)
         if not result.get("ok"):
-            self._close_note.setText("Failed: %s" % result.get("note", ""))
-            self._log_activity("Close FAILED: %s" % result.get("note", ""))
+            note = result.get("note", "")
+            sent = result.get("sent", 0)
+            # [review] A partial failure still moved the position. Reporting
+            # only "Failed: ..." let an operator believe nothing happened
+            # while some legs had already filled -- so say what went out,
+            # and repeat the no-retry warning, exactly as the success path
+            # does.
+            if sent:
+                self._close_note.setText(
+                    "Partly sent: %d leg(s) went out before this failed -- "
+                    "%s. Check the position on the venue; this button does "
+                    "not retry." % (sent, note))
+            else:
+                self._close_note.setText("Failed: %s" % note)
+            self._log_activity("Close FAILED (%d sent): %s" % (sent, note))
             return
         sent = result.get("sent", 0)
         note = result.get("note") or ("%d leg(s) sent" % sent)

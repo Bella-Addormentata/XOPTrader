@@ -69,9 +69,19 @@ def read_positions(client: Any, now_s: float) -> dict:
     if not isinstance(payload, dict):
         raise ClosePayloadError(
             "account payload was %s, not an object" % type(payload).__name__)
-    rows = payload.get("positions")
+    # [review] A MISSING field is not an empty account. A partial payload
+    # -- one that simply did not carry `positions` -- was reading as "the
+    # venue reports no open positions", which is the same fail-open this
+    # function closes everywhere else. Only an explicitly EMPTY list or
+    # object means flat; absence means we could not read it.
+    if "positions" not in payload:
+        raise ClosePayloadError(
+            "account payload carried no `positions` field; refusing to "
+            "report a flat account we cannot actually see")
+    rows = payload["positions"]
     out: dict = {}
-    if rows is None or rows == [] or rows == {}:
+    unreadable: list = []
+    if rows == [] or rows == {}:
         return out
 
     # Dict form: {market: signed_size}. Already signed -- that is the whole
@@ -88,6 +98,7 @@ def read_positions(client: Any, now_s: float) -> dict:
                 _log.warning(
                     "permuto: position for %s is %r, which is not a number "
                     "-- skipping it rather than guessing", name, raw)
+                unreadable.append(name)
                 continue
             if signed == 0.0 or math.isnan(signed):
                 continue
@@ -121,6 +132,17 @@ def read_positions(client: Any, now_s: float) -> dict:
                 "permuto: position row for %s has side %r, which we cannot "
                 "read -- skipping it rather than guessing its direction",
                 market, row.get("side"))
+            unreadable.append(market)
+    if unreadable:
+        # [review] Dropping the rows silently also drops the FACT that the
+        # account was incomplete. If every row is unreadable the operator
+        # is told "no open positions"; if one is, that exposure simply
+        # vanishes from the confirmation plan. Neither is survivable on a
+        # control someone reaches for to get out.
+        raise ClosePayloadError(
+            "could not read the direction of: %s -- refusing to plan a "
+            "close against a partial view of the account"
+            % ", ".join(sorted(unreadable)))
     return out
 
 

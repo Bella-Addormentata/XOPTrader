@@ -39,15 +39,26 @@ def test_a_short_reads_negative_and_a_long_positive():
                                       "NVDA-VOL-PERP": 50.0}
 
 
-def test_an_unreadable_side_is_dropped_not_guessed():
+def test_an_unreadable_side_RAISES_rather_than_vanishing():
     """An unsigned size makes a short look like a long, and then "reduce"
     means "sell more" -- the exact inversion that grew the contest short
-    from 5,253 to 825,541 contracts in one session."""
+    from 5,253 to 825,541 contracts in one session.
+
+    [review] Dropping the row silently also dropped the FACT that the
+    account was incomplete: with every row unreadable the operator was
+    told "no open positions", and with one unreadable that exposure just
+    vanished from the confirmation plan. Neither is survivable on the
+    control someone reaches for to get out, so it fails closed.
+    """
     c = _Client({"positions": [_pos("QQQ-VOL-PERP", "sideways", 100)]})
-    assert read_positions(c, 0.0) == {}
+    with pytest.raises(ClosePayloadError):
+        read_positions(c, 0.0)
 
 
-def test_zero_and_malformed_rows_are_ignored():
+def test_zero_and_structurally_empty_rows_are_ignored():
+    """Rows with no direction to misread -- a zero size, a market with no
+    size, a row with no market -- carry no exposure and are not the
+    unreadable-DIRECTION case that must fail closed."""
     c = _Client({"positions": [_pos("A", "sell", 0), {"market": "B"},
                                {"side": "sell", "size": "5"}, "junk"]})
     assert read_positions(c, 0.0) == {}
@@ -198,9 +209,23 @@ def test_the_dict_shape_is_already_signed():
     assert read_positions(c, 0.0)["A"] == -5.0
 
 
-def test_a_genuinely_empty_account_is_still_empty():
-    for payload in ({"positions": []}, {"positions": {}}, {}):
+def test_an_explicitly_empty_account_is_flat():
+    for payload in ({"positions": []}, {"positions": {}}):
         assert read_positions(_Client(payload), 0.0) == {}
+
+
+def test_a_MISSING_positions_field_is_unreadable_not_flat():
+    """[review] Absence is not emptiness.
+
+    A partial payload that simply did not carry `positions` read as "the
+    venue reports no open positions" -- the same fail-open this function
+    closes everywhere else, and the risk parser already treats a
+    missing/wrong-typed field as unreadable.
+    """
+    with pytest.raises(ClosePayloadError):
+        read_positions(_Client({}), 0.0)
+    with pytest.raises(ClosePayloadError):
+        read_positions(_Client({"balance": "500000"}), 0.0)
 
 
 def test_an_unreadable_shape_raises_rather_than_reading_as_empty():
