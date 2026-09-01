@@ -579,6 +579,26 @@ def test_an_unresolved_close_is_not_shown_as_failed(widget):
     assert "UNRESOLVED" in logged and "FAILED" not in logged, logged
 
 
+def test_a_mixed_unresolved_close_reports_both_counts(widget):
+    """[review] The dropped-count bug, rebuilt next door.
+
+    Earlier in this PR the success path was fixed for exactly this --
+    `note or "%d leg(s) sent"` swallowed the count whenever a leg was
+    skipped. Adding the UNRESOLVED branch reintroduced it: with one
+    leg acknowledged and another timed out, the operator saw the
+    unverified count and was never told one leg had definitely gone
+    out -- half the state they need to decide what to do next."""
+    widget._on_close_sent({
+        "ok": False, "sent": 1,
+        "note": "UNRESOLVED -- no verdict for NVDA-VOL-PERP: timeout",
+        "unknown": ["NVDA-VOL-PERP: timeout"],
+        "partial": [], "skipped": []})
+    text = widget._close_note.text()
+    assert "1 leg(s) sent" in text, text
+    assert "1 got no verdict" in text, text
+    assert "MAY HAVE EXECUTED" in text, text
+
+
 def test_a_plain_refusal_is_still_shown_as_failed(widget):
     """The other side of it: a refusal leaves the position exactly where
     it was, and must not be dressed up as uncertainty."""

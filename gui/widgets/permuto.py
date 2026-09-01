@@ -1202,11 +1202,19 @@ class PermutoWidget(QWidget):
             # screen collapses it again.
             unresolved = result.get("unknown") or []
             if unresolved:
+                # [review] BOTH COUNTS. Dropping `sent` here is the
+                # very defect fixed earlier in this PR for the success
+                # path -- and I rebuilt it next door while adding this
+                # branch. On a mixed outcome the operator was told how
+                # many legs were unverified and never that one had
+                # definitely gone out, which is half the state they
+                # need to decide what to do.
                 self._close_note.setText(
-                    "UNRESOLVED: %d leg(s) got no verdict and MAY HAVE "
-                    "EXECUTED -- %s. Check the position on the venue "
-                    "before closing again; this button does not retry."
-                    % (len(unresolved), note))
+                    "UNRESOLVED: %d leg(s) sent and acknowledged, "
+                    "%d got no verdict and MAY HAVE EXECUTED -- %s. "
+                    "Check the position on the venue before closing "
+                    "again; this button does not retry."
+                    % (sent, len(unresolved), note))
                 self._log_activity(
                     "Close UNRESOLVED (%d sent, %d unverified): %s"
                     % (sent, len(unresolved), note))
