@@ -248,7 +248,6 @@ def _wire(monkeypatch, in_flight):
     # the wrong reason -- refused by the ordinary gate rather than by the
     # in-flight guard under test.
     mw._gather_permuto = lambda: {}
-    import gui.widgets.main_window as mwmod
     monkeypatch.setattr("gui.services.venue_control.may_turn_on",
                         lambda _s: (True, ""))
     return mw, page, refusals, built
