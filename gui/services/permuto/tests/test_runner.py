@@ -2166,8 +2166,14 @@ def test_entering_EXIT_retracts_because_its_caps_are_tighter():
 
 
 def test_entering_the_overnight_close_DOES_retract():
-    """The exemption is EXIT-only. Every other tightening transition still
-    retracts, because those genuinely forbid what is resting."""
+    """Every tightening transition retracts, EXIT included.
+
+    [review] This used to say "the exemption is EXIT-only", describing a
+    policy that no longer exists -- the runner sets
+    _curfew_retract_pending on every effective stage change, and the test
+    above asserts RAMP -> EXIT retracts too. A test that documents the
+    opposite of what it verifies is worse than none.
+    """
     orders = [{"market": _MKT, "side": "sell", "price": 0.0702, "size": 100}]
     c = _BookClient(account=_account(-100.0), batch_response=_venue_ok(),
                     orders=orders)

@@ -99,11 +99,24 @@ class Profile:
     spread_mult: float
     depth_mult: float
     #: True when a quote already RESTING must be pulled, not merely not
-    #: replaced. [review] These are different needs and conflating them
-    #: gets one of them wrong: EXIT wants to stop ADDING inventory while
-    #: the existing book keeps earning into a close that is not dangerous,
-    #: whereas a stale oracle after the bell means the resting order is
-    #: itself the exposure and has to come off.
+    #: replaced. Distinct from ``quote`` because "place nothing new" and
+    #: "take down what is there" are different needs.
+    #:
+    #: BOTH current non-quoting stages set it, for different reasons:
+    #:
+    #:   * EXIT -- its caps are tighter than RAMP's and RestingQuote holds
+    #:     prices without quantities, so nothing can prove a retained
+    #:     order still fits. A fill against an oversized leg would breach
+    #:     the cap and carry into the overnight window.
+    #:   * stale SETTLING -- the resting order IS the exposure, sitting
+    #:     against a price the bell has already invalidated.
+    #:
+    #: [review] An earlier draft described EXIT as keeping its book to
+    #: earn to the bell. That was tried, did not survive the cap
+    #: invariant, and was reverted -- but the prose stayed behind, which
+    #: is exactly how the safety behaviour would get removed again by
+    #: someone trusting the comment. It is corrected here rather than
+    #: left as a trap.
     withdraw: bool
     reason: str
 

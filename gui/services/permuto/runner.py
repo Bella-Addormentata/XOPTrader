@@ -929,9 +929,11 @@ class QuoteRunner:
         # separate pass over EVERY market rather than a branch inside the
         # quoting loop.
         #
-        # Only `withdraw` profiles do this. EXIT also declines to quote but
-        # wants its book left alone: the danger is the OPEN, not the close,
-        # and a resting pair keeps earning credit until the bell.
+        # Only `withdraw` profiles do this -- which is currently BOTH
+        # non-quoting stages, EXIT and stale SETTLING. (An earlier draft
+        # exempted EXIT so it could earn to the bell; that did not survive
+        # the cap invariant and was reverted. This comment used to still
+        # describe the exemption, which is how it would come back.)
         pull = [m for m in self._markets
                 if (profile_by_market.get(m) is not None
                     and profile_by_market[m].withdraw
