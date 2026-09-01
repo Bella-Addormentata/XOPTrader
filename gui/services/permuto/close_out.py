@@ -284,12 +284,14 @@ def order_verdict(resp: Any) -> tuple:
         return "refused", status or action
     # An id or a fill is acceptance on its own, so an order that filled
     # without a recognised status word is not misreported as refused.
-    # [review] A FILL COLLECTION, not any truthy "fills". {"fills":
-    # "lots"} is a shape filled_size() already refuses to read, and
-    # counting it as acceptance let an unrecognised body through as a
-    # sent leg -- the two functions disagreeing about the same field.
-    fills = resp.get("fills")
-    has_fills = isinstance(fills, list) and bool(fills)
+    # [review] ONE PARSER, so the two cannot disagree. Checking only
+    # "non-empty list" here let {"fills": [null]} and {"fills": [{}]}
+    # count as acceptance -- a leg reported as sent on evidence
+    # filled_size() refuses to read. Asking filled_size() directly
+    # makes the two agree by construction rather than by two
+    # implementations of the same rule, which is how they drifted
+    # apart twice already.
+    has_fills = filled_size(resp) > 0.0
     if (resp.get("order_id") or resp.get("id") or has_fills
             or action in _ACCEPTED or status in _ACCEPTED):
         return "accepted", ""
@@ -326,6 +328,13 @@ def filled_size(resp) -> float:
         return -1.0
     direct = resp.get("filled_size", resp.get("filled"))
     if direct is not None:
+        # [review] A BOOL IS NOT A QUANTITY. bool subclasses int, so
+        # float(True) == 1.0 and {"filled_size": true} invented a
+        # one-contract execution to show the operator. Same defect
+        # read_positions() was already fixed for; the fill parser was
+        # simply never audited against it.
+        if isinstance(direct, bool):
+            return -1.0
         try:
             value = abs(float(direct))
         except (TypeError, ValueError):
@@ -338,8 +347,11 @@ def filled_size(resp) -> float:
     for fill in fills:
         if not isinstance(fill, dict):
             return -1.0
+        raw = fill.get("size", fill.get("qty"))
+        if isinstance(raw, bool):        # see above
+            return -1.0
         try:
-            total += abs(float(fill.get("size", fill.get("qty"))))
+            total += abs(float(raw))
         except (TypeError, ValueError):
             return -1.0
     return total if math.isfinite(total) else -1.0

@@ -673,3 +673,40 @@ def test_a_list_row_keyed_by_symbol_is_read_like_one_keyed_by_market():
         {"market": "QQQ-VOL-PERP", "side": "sell", "size": "100"}]})
     assert read_positions(by_symbol, 0.0) == read_positions(by_market, 0.0)
     assert read_positions(by_symbol, 0.0) == {"QQQ-VOL-PERP": -100.0}
+
+
+def test_a_boolean_is_never_a_fill_quantity():
+    """[review] bool subclasses int, so float(True) == 1.0.
+
+    {"filled_size": true} invented a one-contract execution to show the
+    operator -- a fabricated partial fill. read_positions() was already
+    fixed for exactly this; the fill parser had simply never been audited
+    against it, which is the twelfth instance of this family in one
+    module.
+    """
+    assert filled_size({"filled_size": True}) == -1.0
+    assert filled_size({"filled": True}) == -1.0
+    assert filled_size({"fills": [{"size": True}]}) == -1.0
+    assert filled_size({"fills": [{"qty": False}]}) == -1.0
+    # ...and real numbers still read.
+    assert filled_size({"filled_size": 12}) == 12.0
+    assert filled_size({"fills": [{"size": 4}, {"size": 6}]}) == 10.0
+
+
+def test_a_list_of_junk_is_not_evidence_of_a_fill():
+    """[review] "Non-empty list" was the wrong test.
+
+    {"fills": [null]} and {"fills": [{}]} became `accepted`, so a leg was
+    reported as sent on evidence filled_size() refuses to read. The two
+    now share one parser, so they cannot disagree: whatever filled_size()
+    will not count, order_verdict() will not accept.
+    """
+    for junk in ({"fills": [None]}, {"fills": [{}]},
+                 {"fills": [{"size": True}]}, {"fills": "lots"}):
+        assert filled_size(junk) == -1.0, junk
+        assert order_verdict(junk)[0] == "unknown", junk
+
+    # A genuine fill is still acceptance...
+    assert order_verdict({"fills": [{"size": 10}]})[0] == "accepted"
+    # ...and an acknowledgement without fills is unaffected.
+    assert order_verdict({"action": "placed"})[0] == "accepted"
