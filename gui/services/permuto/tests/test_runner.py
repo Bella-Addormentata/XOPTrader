@@ -1907,3 +1907,326 @@ def test_a_clean_market_relaxes_back_toward_its_spread():
         r._resting = {}
         r.tick(_MID_SESSION + i * 5.0, _ORACLE, {})
     assert r._cross_backoff.offset_pct(_MKT) < widened,         "the backoff never relaxed once the venue stopped refusing us"
+
+# --------------------------------------------------------------------------- #
+# [ANTICROSS review] Refusal matching, and what counts as a clean tick.
+# --------------------------------------------------------------------------- #
+
+def _venue_reason(reason, idx=(0, 1)):
+    def build(legs):
+        return {"status": "batch_ok",
+                "results": [{"action": "placed",
+                             "rejection_reason": reason if i in idx else None}
+                            for i, _ in enumerate(legs)]}
+    return build
+
+
+def test_the_short_refusal_spelling_also_widens_the_backoff():
+    """The venue's wording is not one fixed sentence.
+
+    Live it sends "Post-only order would cross the book. Switch to GTC or
+    adjust price."; this repo's own fixtures carry the shorter "post-only
+    order would cross". An exact match on "cross the book" skipped the
+    short form, so a refusal took the CLEAN path and DECAYED the backoff
+    instead of widening it -- precisely backwards, and invisible because
+    both spellings look alike at a glance.
+    """
+    c = _Client(account=_account(100.0),
+                batch_response=_venue_reason("post-only order would cross"))
+    r = _runner(c, curfew_enabled=True)
+    r.tick(_MID_SESSION, _ORACLE, {})
+    assert r._cross_backoff.offset_pct(_MKT) > 0.0,         "the short refusal spelling was treated as a clean tick"
+
+
+def test_a_capitalised_full_sentence_refusal_still_matches():
+    c = _Client(account=_account(100.0),
+                batch_response=_venue_reason(
+                    "Post-only order would cross the book. Switch to GTC "
+                    "or adjust price."))
+    r = _runner(c, curfew_enabled=True)
+    r.tick(_MID_SESSION, _ORACLE, {})
+    assert r._cross_backoff.offset_pct(_MKT) > 0.0
+
+
+def test_a_non_crossing_refusal_does_not_decay_the_backoff():
+    """A margin or band rejection is not evidence we stopped crossing.
+
+    Those never reach the venue's post-only check at all, so treating them
+    as a clean tick walks the learned offset back while the book is exactly
+    where it was -- undoing convergence during the other refusal classes.
+    """
+    c = _Client(account=_account(100.0),
+                batch_response=_venue_reason(
+                    "Post-only order would cross the book."))
+    r = _runner(c, curfew_enabled=True)
+    r.tick(_MID_SESSION, _ORACLE, {})
+    widened = r._cross_backoff.offset_pct(_MKT)
+    assert widened > 0.0
+
+    c.batch_response = _venue_reason(
+        "Price 0.0999 is outside the allowed oracle band")
+    r._resting = {}
+    r.tick(_MID_SESSION + 5.0, _ORACLE, {})
+    assert r._cross_backoff.offset_pct(_MKT) == widened, \
+        "a band rejection decayed the crossing backoff"
+
+
+def test_a_rejected_action_with_no_reason_does_not_decay_the_backoff():
+    """action=rejected with no rejection_reason must not count as clean.
+
+    [review] The previous check only tested ``rejection_reason``; a row
+    that carries ``action='rejected'`` and an empty reason passed the
+    guard and decayed the learned offset even though the order did not
+    rest -- exactly backwards.
+    """
+    c = _Client(account=_account(100.0),
+                batch_response=_venue_cross((0, 1)))
+    r = _runner(c, curfew_enabled=True)
+    r.tick(_MID_SESSION, _ORACLE, {})
+    widened = r._cross_backoff.offset_pct(_MKT)
+    assert widened > 0.0
+
+    # Venue sends action=rejected with no reason -- the batch succeeded
+    # overall but the individual legs did not rest.
+    def _rejected_no_reason(legs):
+        return {"status": "batch_ok",
+                "results": [{"action": "rejected", "rejection_reason": None}
+                            for _ in legs]}
+
+    c.batch_response = _rejected_no_reason
+    r._resting = {}
+    r.tick(_MID_SESSION + 5.0, _ORACLE, {})
+    assert r._cross_backoff.offset_pct(_MKT) == widened, \
+        "action=rejected with no reason decayed the crossing backoff"
+
+
+def test_a_market_with_fewer_rows_than_legs_does_not_decay_the_backoff():
+    """zip truncation must not hide an unverifiable leg.
+
+    [review] When leg_rows is shorter than legs, zip silently drops the
+    trailing legs.  The previous code called observe_clean because the
+    market appeared in ``seen`` and not in ``dirty``, even though half
+    the legs had no row at all.  Now the unpaired suffix is marked dirty
+    so the clean path is blocked.
+    """
+    c = _Client(account=_account(100.0),
+                batch_response=_venue_cross((0, 1)))
+    r = _runner(c, curfew_enabled=True)
+    r.tick(_MID_SESSION, _ORACLE, {})
+    widened = r._cross_backoff.offset_pct(_MKT)
+    assert widened > 0.0
+
+    # Return only one row for a two-leg batch -- the other leg is missing.
+    def _one_row(legs):
+        return {"status": "batch_ok",
+                "results": [{"action": "placed", "rejection_reason": None}]}
+
+    c.batch_response = _one_row
+    r._resting = {}
+    r.tick(_MID_SESSION + 5.0, _ORACLE, {})
+    assert r._cross_backoff.offset_pct(_MKT) == widened, \
+        "a truncated row list decayed the crossing backoff"
+
+
+def test_widened_quote_with_max_skew_still_stays_inside_the_ring():
+    """'Retreating is free' must hold even when the pair is at max inventory skew.
+
+    [review] ``test_the_widened_quote_still_earns_full_depth_credit`` runs with
+    position=100 out of max_position≈17143, giving a skew of ~0.006% --
+    effectively zero. That test cannot detect a bound that forgets the skew
+    term. This one reproduces the exact condition where the bug lived:
+    max-skew + max-backoff, quantised.
+
+    With max_position_usd=7.0 and oracle=0.07, max_position=100 contracts, so
+    position=100 is the fully-skewed case (|skew|=0.96%). The backoff is driven
+    to its cap by repeated crossing refusals, then the final ask price is checked
+    against the 2% credit ring measured from the TRUE oracle (not the skewed
+    reference). Before the multiplicative fix the ask landed at 2.0100%;
+    before the tick-reservation fix it landed at 2.0467%.
+    """
+    oracle = _ORACLE[_MKT]
+    # [review] A SHORT just BELOW the cap, not a long AT it.
+    #
+    # The first version used +100 against a 100-contract cap, which hits
+    # the limit exactly -> REDUCE_ONLY -> the sell leg alone. And for a
+    # LONG the skew is negative, so that lone sell is the LEADING leg,
+    # moving toward the oracle. The TRAILING leg -- the one whose skew and
+    # offset compound outward, which is the entire failure mode -- was
+    # never emitted, so the assertion held even under the old additive
+    # bound. It could not have caught what it was written for.
+    #
+    # A short at 95 of 100 keeps both sides quoting and gives the ASK
+    # near-maximum POSITIVE skew, which is the leg that leaves the ring.
+    # [review] A position where the cap is ACTIVE and its effect is
+    # VISIBLE IN THE PRICE.
+    #
+    # The previous version asserted only r._cross_backoff.offset_pct(),
+    # the private stored value -- which is what the controller LEARNED,
+    # not what the ladder APPLIED. At a 95% short the applied cap is only
+    # 0.17%, so the emitted legs were essentially spread+skew and the test
+    # would have passed even if the runner ignored the cap entirely.
+    #
+    # At a 30% short the budget splits 0.25 spread + 0.17 skew + 0.54
+    # backoff, so a learned offset far above the cap must show up in the
+    # price as a clearly non-zero retreat that still lands inside the
+    # trigger. Both halves are checked below.
+    from gui.services.permuto.quoting import REQUOTE_AT_RING_FRACTION
+
+    c = _Client(account=_account(-30.0), batch_response=_venue_cross((0, 1)))
+    r = _runner(c, curfew_enabled=True, max_position_usd=7.0)
+    r._cross_backoff._pct[_MKT] = 5.0        # far past ring and trigger
+    r.tick(_MID_SESSION, _ORACLE, {})
+    assert c.last_batch, "no batch to inspect"
+
+    sides = {leg["side"] for leg in c.last_batch}
+    assert sides == {"buy", "sell"}, (
+        "expected a two-sided book so the TRAILING leg is exercised, got "
+        "%r" % (sides,))
+
+    ask = max(float(leg["price"]) for leg in c.last_batch)
+    out = (ask / oracle - 1.0) * 100.0
+    trigger = 2.0 * REQUOTE_AT_RING_FRACTION
+
+    # APPLIED, not merely computed: without the backoff the ask would sit
+    # at roughly spread + skew (~0.42%), so a materially larger offset is
+    # the only evidence the ladder used the cap at all.
+    assert out > 0.60, (
+        "ask only %.4f%% out -- the capped backoff was never applied to "
+        "the ladder" % out)
+    # And BOUNDED: inside the re-quote trigger, so it is not replaced on
+    # the next tick, and inside the credit ring, so it earns.
+    assert out <= trigger + 1e-6, (
+        "ask %.4f%% is past the %.2f%% re-quote trigger" % (out, trigger))
+    assert out <= 2.0 + 1e-9, (
+        "ask %.4f%% is outside the 2%% credit ring" % out)
+
+
+
+def test_junk_tick_metadata_cannot_disable_the_backoff():
+    """[review] `float(raw or default)` is not a fallback: NaN is TRUTHY.
+
+    A non-finite tick_size therefore sailed through, made the reservation
+    NaN, and headroom_pct returned zero -- which makes observe_cross CLEAR
+    the learned offset. Meanwhile quote_ladder validated and quietly used
+    0.0001, so bad venue metadata disabled the crossing defence while the
+    quote itself carried on as if nothing were wrong.
+    """
+    def crossed(legs):
+        return {"status": "batch_ok",
+                "results": [{"action": "placed", "rejection_reason":
+                             "Post-only order would cross the book."}
+                            for _ in legs]}
+
+    c = _Client(account=_account(100.0), batch_response=crossed)
+    r = _runner(c, curfew_enabled=True)
+    flags = {"specs": {_MKT: {"tick_size": float("nan"), "lot_size": 1.0}}}
+    r.tick(_MID_SESSION, _ORACLE, flags)
+    assert r._cross_backoff.offset_pct(_MKT) > 0.0,         "junk tick metadata cleared the backoff instead of falling back"
+
+
+def test_the_runner_APPLIES_the_backoff_cap_not_just_computes_it():
+    """[review] The helper being correct proves nothing on its own.
+
+    Capping at the LADDER is the part that matters. Coverage that only
+    exercises _requote_safe_backoff leaves the call site free to apply the
+    raw learned offset -- and removing the cap there kept all 625 tests
+    green, which is exactly how this class of gap keeps surviving.
+    """
+    from gui.services.permuto.quoting import REQUOTE_AT_RING_FRACTION
+
+    oracle = _ORACLE[_MKT]
+    c = _Client(account=_account(0.0), batch_response=_venue_ok())
+    r = _runner(c, curfew_enabled=False, max_position_usd=250_000.0)
+    r._cross_backoff._pct[_MKT] = 5.0        # far past ring and trigger
+    r.tick(_MID_SESSION, _ORACLE, {})
+    assert c.last_batch, "no batch to inspect"
+
+    trigger = 2.0 * REQUOTE_AT_RING_FRACTION
+    for leg in c.last_batch:
+        out = abs(float(leg["price"]) / oracle - 1.0) * 100.0
+        assert out <= trigger + 1e-6, (
+            "leg %r sits %.3f%% from the oracle, past the %.2f%% re-quote "
+            "trigger -- the learned backoff was applied uncapped"
+            % (leg, out, trigger))
+
+
+def test_preflight_repricing_snaps_to_the_grid_under_junk_tick_metadata():
+    """[review] "Decided once" was not true of the PRE-SEND path.
+
+    _prepare parsed mspec["tick_size"] raw, so with NaN metadata and a
+    fresh-oracle reprice quantise_toward received NaN and handed back the
+    changed price UNSNAPPED -- an off-grid order going out despite the
+    fallback that had been added for the ladder.
+    """
+    def fetch():
+        # A COLLAPSE, not a nudge. preflight only re-prices a leg that has
+        # fallen outside the band, so a 0.6% move leaves the ladder's own
+        # on-grid prices untouched and the test proves nothing -- which is
+        # how the first version of it passed with the raw tick restored.
+        return {_MKT: 0.0700, _MKT2: 0.200}
+
+    c = _Client(account=_account(0.0))
+    r = _runner2(c, curfew_enabled=False, oracle_fetch=fetch)
+    flags = {"specs": {_MKT: {"tick_size": float("nan"), "lot_size": 1.0}}}
+    r.tick(_MID_SESSION, {_MKT: 0.0800, _MKT2: 0.200}, flags)
+    assert c.last_batch, "no batch was sent"
+    # [review] The generator below is empty if _MKT was dropped, and an
+    # empty loop passes. The batch-level assertion above can be satisfied
+    # by _MKT2 alone, so without this the whole grid check is vacuous
+    # exactly when the preflight path under test failed to send anything.
+    mkt_legs = [l for l in c.last_batch if l["market"] == _MKT]
+    assert mkt_legs, ("no %s leg in the batch -- the preflight path under "
+                      "test never sent one" % _MKT)
+    for leg in mkt_legs:
+        ticks = float(leg["price"]) / 0.0001
+        assert abs(round(ticks) - ticks) < 1e-6, (
+            "leg %r is off the 0.0001 grid -- junk metadata bypassed the "
+            "normalised tick on the preflight path" % (leg,))
+
+
+def test_a_MISSING_MIDDLE_row_poisons_the_whole_mapping():
+    """[review] Not just the unpaired tail.
+
+    Rows are paired with legs by POSITION, so a row missing from the
+    MIDDLE shifts every later pairing by one: a market reads another
+    market's result and can come back "seen" and clean while its own leg
+    was refused. The previous fix marked only the suffix dirty, which
+    covers the one case where the shift happens to be at the end.
+    """
+    c = _Client(account=_account(100.0),
+                batch_response=lambda legs: {
+                    "status": "batch_ok",
+                    "results": [{"action": "placed", "rejection_reason":
+                                 "Post-only order would cross the book."}
+                                for _ in legs]})
+    r = _runner(c, curfew_enabled=True)
+    r.tick(_MID_SESSION, _ORACLE, {})
+    widened = r._cross_backoff.offset_pct(_MKT)
+    assert widened > 0.0
+
+    # Two legs go out; ONE row comes back, and it looks clean.
+    c.batch_response = lambda legs: {
+        "status": "batch_ok", "results": [{"action": "placed"}]}
+    r._resting = {}
+    r.tick(_MID_SESSION + 5.0, _ORACLE, {})
+    assert r._cross_backoff.offset_pct(_MKT) == widened,         "an ambiguous row count decayed the backoff anyway"
+
+
+def test_a_SURPLUS_row_is_equally_unusable():
+    """More rows than legs is the same ambiguity from the other side."""
+    c = _Client(account=_account(100.0),
+                batch_response=lambda legs: {
+                    "status": "batch_ok",
+                    "results": [{"action": "placed", "rejection_reason":
+                                 "Post-only order would cross the book."}
+                                for _ in legs]})
+    r = _runner(c, curfew_enabled=True)
+    r.tick(_MID_SESSION, _ORACLE, {})
+    widened = r._cross_backoff.offset_pct(_MKT)
+
+    c.batch_response = lambda legs: {
+        "status": "batch_ok",
+        "results": [{"action": "placed"} for _ in range(len(legs) + 2)]}
+    r._resting = {}
+    r.tick(_MID_SESSION + 5.0, _ORACLE, {})
+    assert r._cross_backoff.offset_pct(_MKT) == widened,         "a surplus row count decayed the backoff anyway"

@@ -110,8 +110,45 @@ def test_the_ceiling_stays_below_the_requote_trigger():
     ceiling = max_price_skew_frac(ring, half_spread)
     trigger = ring * REQUOTE_AT_RING_FRACTION / 100.0
     assert ceiling < trigger, "a full skew is instantly past its own trigger"
-    # And a spread so wide the ring edge is the binding cap still wins.
-    assert max_price_skew_frac(2.0, 1.9) == pytest.approx(0.1 / 100.0)
+
+    # [review 2026-09-01] PLACEMENT AND ROUNDING COUNT TOO. decide()
+    # re-quotes on abs(leg_price - oracle), and the leg sits a half-spread
+    # beyond the skewed midpoint before being CEILED onto the grid. At the
+    # defaults with oracle 0.07 and a 95% short that was 1.2857% against a
+    # 1.20% trigger -- born past it, replaced every tick.
+    import math as _math
+    for half_spread in (0.05, 0.25, 0.40, 0.75):
+        # [review] The tick values matter. With the tick term DROPPED the
+        # ceiling becomes (0.96 - spread), so the total collapses to
+        # 0.96 + tick% -- which only breaches 1.20% once the tick exceeds
+        # 0.24% of the oracle. At 0.0001/0.07 that is 0.143% and the
+        # broken version still passes; my first version of this loop
+        # stopped there and the mutation survived it.
+        #
+        # QQQ-VOL traded as low as 0.01615 in the session sampled on
+        # 2026-08-31, where one tick is 0.62% -- so the small-oracle case
+        # is the real one, not a contrived edge.
+        for tick_frac in (0.0, 0.0001 / 0.15, 0.0001 / 0.07,
+                          0.0001 / 0.0416, 0.0001 / 0.01615):
+            ceil_ = max_price_skew_frac(ring, half_spread, tick_frac)
+            total = (half_spread + ceil_ * 100.0 + tick_frac * 100.0)
+            trigger_pct = ring * REQUOTE_AT_RING_FRACTION
+            # The honest property: the CEILING must never contribute to a
+            # breach. Where spread + tick alone already exceed the trigger
+            # -- 0.75% placement against a 0.62% tick at oracle 0.01615 --
+            # no skew allowance can rescue it, and the function's only
+            # correct answer is zero. Asserting the total unconditionally
+            # would demand the impossible and fail on the fixed code, the
+            # same over-strong shape as the ring-bound property earlier.
+            assert total <= trigger_pct + 1e-9 or ceil_ == 0.0, (
+                "spread %.2f + skew %.4f + tick %.4f = %.4f%%, past the "
+                "%.2f%% trigger with a NON-zero ceiling"
+                % (half_spread, ceil_ * 100.0, tick_frac * 100.0,
+                   total, trigger_pct))
+
+    # A spread so wide the placement ALONE clears the trigger leaves no
+    # room for any skew at all -- zero, not a sliver off the ring edge.
+    assert max_price_skew_frac(2.0, 1.9) == 0.0
 
 
 def test_a_spread_wider_than_the_ring_allows_no_skew_rather_than_a_negative():
