@@ -193,6 +193,52 @@ TEST(BookSideQuality, a_collapsed_side_is_disqualified_the_same_way_as_a_spiked_
     EXPECT_FALSE(q.bid_ok);
 }
 
+// -- The derived bypass threshold -------------------------------------------
+
+TEST(BookSideQuality, bypass_threshold_can_never_be_stricter_than_the_gate)
+{
+    using xop::bookside::effective_agree_max_spread_bps;
+
+    // [review] The reviewer's exact case: gate confirming at 5000, this knob
+    // lowered to 750. A 4000 bps book is accepted by book_confirms() as "the
+    // whole market repriced" -- so disqualifying both its sides here would
+    // strip the confirmation the gate is waiting for, and Step 8 would take
+    // its both-sides-disqualified path instead of honouring it.
+    EXPECT_DOUBLE_EQ(effective_agree_max_spread_bps(750.0, 5000.0), 5000.0);
+
+    // And the consequence that actually matters: with the derived value, a
+    // 4000 bps book far from the anchor is still trusted whole.
+    const double derived = effective_agree_max_spread_bps(750.0, 5000.0);
+    const auto q = classify_sides(5.60, 5.60 * 1.4918, kAnchor, kBand,
+                                  derived);   // ~4000 bps apart, ~4x anchor
+    EXPECT_TRUE(q.bypassed)
+        << "a book the mid gate would accept as confirmation must not have "
+           "its sides disqualified underneath it";
+}
+
+TEST(BookSideQuality, raising_the_bypass_above_the_gate_does_take_effect)
+{
+    using xop::bookside::effective_agree_max_spread_bps;
+    // More permissive than the gate is harmless -- it only ever adds trust --
+    // so the operator's larger value stands.
+    EXPECT_DOUBLE_EQ(effective_agree_max_spread_bps(8000.0, 5000.0), 8000.0);
+}
+
+TEST(BookSideQuality, derived_bypass_ignores_unusable_inputs)
+{
+    using xop::bookside::effective_agree_max_spread_bps;
+    // A disabled/absent side of the pair contributes nothing rather than
+    // poisoning the result; both unusable means the bypass is simply off,
+    // which is the safe direction because it only ever ADDS trust.
+    EXPECT_DOUBLE_EQ(effective_agree_max_spread_bps(0.0, 5000.0), 5000.0);
+    EXPECT_DOUBLE_EQ(effective_agree_max_spread_bps(5000.0, 0.0), 5000.0);
+    EXPECT_DOUBLE_EQ(effective_agree_max_spread_bps(kNaN, 5000.0), 5000.0);
+    EXPECT_DOUBLE_EQ(effective_agree_max_spread_bps(kInf, 5000.0), 5000.0);
+    EXPECT_DOUBLE_EQ(effective_agree_max_spread_bps(-1.0, 5000.0), 5000.0);
+    EXPECT_DOUBLE_EQ(effective_agree_max_spread_bps(0.0, 0.0), 0.0);
+    EXPECT_DOUBLE_EQ(effective_agree_max_spread_bps(kNaN, kNaN), 0.0);
+}
+
 // -- The band's relationship to the filters around it -----------------------
 
 TEST(BookSideQuality, disqualification_sits_well_inside_the_offer_absurdity_bound)

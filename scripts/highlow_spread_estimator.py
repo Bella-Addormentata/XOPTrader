@@ -49,6 +49,26 @@ output because the choice changes the answer:
       bounce that both estimators exist to extract, so it is biased hard
       toward zero.  Useful only as a lower bracket.
 
+Two raw-spread figures, and they are NOT interchangeable
+--------------------------------------------------------
+The report prints two raw book spread columns because there are two
+different questions and one number cannot answer both:
+
+  obs med   the median, across the window, of each day's own median raw book
+            spread.  A robust WINDOW-LEVEL summary.  It is not the book now.
+
+  obs last  the SINGLE most recent quote sample's raw book spread.  One
+            observation, no averaging.  This is the CURRENT posted book.
+
+Only "obs last" can answer "is this book dislocated RIGHT NOW", so the
+dislocation flag and the FALSIFICATION verdict both read it.  A median does
+not move until the new state dominates half the day's samples, so it lags a
+fresh dislocation in exactly the direction that hides one.  An earlier
+version of this tool computed the latest bar's MEDIAN, labelled it "obs now"
+and quoted it to the operator as the current posted book spread; that is the
+bug this split exists to prevent, and the reason the column headers and the
+legend below spell out which is which.
+
 Method
 ------
   * Per pair, daily bars over --days, from --source (offer_log or snapshots).
@@ -211,14 +231,35 @@ def _median(values: list[float]) -> float | None:
 
 @dataclass
 class Bar:
-    """One daily bar built from sampled quotes."""
+    """One daily bar built from sampled quotes.
+
+    TWO RAW-SPREAD FIGURES LIVE HERE and conflating them is the bug this
+    docstring exists to prevent.
+
+      spread_bps        the MEDIAN over every quote sample in the day.  A
+                        summary of the day.  Robust, and by construction
+                        blind to anything that has not yet dominated half
+                        the day's samples.
+      last_spread_bps   the SINGLE newest quote sample of the day, stamped
+                        with last_sample_at.  Noisy, and the only one of the
+                        two that describes the book as it currently stands.
+
+    A dislocation that arrives late in the day does not move the median
+    until it owns half the day's samples, so the median lags in exactly the
+    direction that hides a fresh dislocation.  Anything presenting CURRENT
+    state -- the dislocation flag, the "obs last" column, the falsification
+    verdict -- must read last_spread_bps.  Anything summarising the WINDOW
+    reads spread_bps, which is what a median is right for.
+    """
 
     day: str
     high: float
     low: float
     close: float
     samples: int
-    spread_bps: float          # median raw book spread across the day
+    spread_bps: float          # MEDIAN raw book spread across the day
+    last_spread_bps: float     # raw book spread of the day's LAST sample
+    last_sample_at: str        # timestamp of that last sample
     bid_span_bps: float        # dispersion of the bid side within the day
     ask_span_bps: float        # dispersion of the ask side within the day
 
@@ -236,6 +277,22 @@ class Bar:
 
     @property
     def dislocated(self) -> bool:
+        """Is the book dislocated AS OF THE LAST SAMPLE?
+
+        Reads last_spread_bps, never the daily median.  The flag is a claim
+        about the book NOW, and a median cannot make one: it has to wait for
+        half the day's samples to agree before it moves at all.
+        """
+        return self.last_spread_bps >= DISLOCATION_SPREAD_BPS
+
+    @property
+    def median_dislocated(self) -> bool:
+        """The same threshold against the day's MEDIAN.
+
+        Not the flag.  Carried only so the report can say when the two
+        disagree, which is precisely the case the flag above exists to
+        catch and the old median-driven flag could not.
+        """
         return self.spread_bps >= DISLOCATION_SPREAD_BPS
 
 
@@ -413,22 +470,36 @@ class DbReader:
 # ==========================================================================
 
 def build_bars(quotes: list[tuple[str, float, float]], mode: str) -> list[Bar]:
-    """Daily bars from a sampled quote series, newest last."""
-    by_day: dict[str, list[tuple[float, float]]] = defaultdict(list)
+    """Daily bars from a sampled quote series, newest last.
+
+    Every bar carries BOTH the day's MEDIAN raw spread and the day's LAST
+    sample's raw spread, with the timestamp of that last sample.  See Bar
+    for which figure answers which question; they are not interchangeable
+    and the report must never print one under the other's label.
+    """
+    by_day: dict[str, list[tuple[str, float, float]]] = defaultdict(list)
     for ts, bid, ask in quotes:
-        by_day[ts[:10]].append((bid, ask))
+        by_day[ts[:10]].append((ts, bid, ask))
 
     bars: list[Bar] = []
     for day in sorted(by_day):
-        samples = by_day[day]
-        bids = [b for b, _ in samples]
-        asks = [a for _, a in samples]
-        mids = [(b + a) / 2.0 for b, a in samples]
+        # Sorted here rather than trusted from the caller.  Three fields --
+        # close, last_spread_bps and last_sample_at -- all mean "the newest
+        # sample of the day", and all three would silently degrade into
+        # "whichever row the query happened to hand back last" if the
+        # ORDER BY in DbReader.quotes were ever dropped or the caller ever
+        # concatenated two sources.  The sort is cheap; a wrong "current
+        # book spread" quoted to an operator is not.
+        samples = sorted(by_day[day], key=lambda s: s[0])
+        bids = [b for _, b, _ in samples]
+        asks = [a for _, _, a in samples]
+        mids = [(b + a) / 2.0 for _, b, a in samples]
+        # Per-sample raw book spread, in day order, so [-1] is the newest.
+        spreads = [(a - b) / ((a + b) / 2.0) * BPS for _, b, a in samples]
         if mode == "quote-touch":
             high, low = max(asks), min(bids)
         else:
             high, low = max(mids), min(mids)
-        spread = _median([(a - b) / ((a + b) / 2.0) * BPS for b, a in samples])
         bid_ref = _median(bids) or 1.0
         ask_ref = _median(asks) or 1.0
         bars.append(Bar(
@@ -437,7 +508,9 @@ def build_bars(quotes: list[tuple[str, float, float]], mode: str) -> list[Bar]:
             low=low,
             close=mids[-1],
             samples=len(samples),
-            spread_bps=float(spread or 0.0),
+            spread_bps=float(_median(spreads) or 0.0),
+            last_spread_bps=spreads[-1],
+            last_sample_at=samples[-1][0],
             bid_span_bps=(max(bids) - min(bids)) / bid_ref * BPS,
             ask_span_bps=(max(asks) - min(asks)) / ask_ref * BPS,
         ))
@@ -474,11 +547,20 @@ def estimate_pair(pair: str, bars: list[Bar], crossed_dropped: int,
         "cs_bps": None,
         "ar_bps": None,
         "ar_twoday_bps": None,
-        "observed_spread_bps": None,
-        "observed_spread_latest_bps": None,
+        # Three DISTINCT raw-spread figures, deliberately not collapsed into
+        # one field.  See the block below where they are filled in.
+        "observed_spread_window_median_bps": None,
+        "latest_bar_median_bps": None,
+        "observed_spread_last_sample_bps": None,
+        "observed_spread_last_sample_at": None,
         "latest_bar": bars[-1].day if bars else None,
+        "latest_bar_samples": bars[-1].samples if bars else None,
         "latest_bar_age_days": None,
+        # "dislocated" is THE flag and is driven by the last sample.
+        # "dislocated_by_median" is reported only so a disagreement between
+        # the two can be stated out loud; nothing branches on it.
         "dislocated": False,
+        "dislocated_by_median": False,
         "refused": None,
         "notes": [],
     }
@@ -487,13 +569,34 @@ def estimate_pair(pair: str, bars: list[Bar], crossed_dropped: int,
         return result
 
     latest = bars[-1]
-    result["observed_spread_bps"] = _median([b.spread_bps for b in bars])
-    result["observed_spread_latest_bps"] = latest.spread_bps
+    # THREE DIFFERENT RAW-SPREAD FIGURES, kept apart on purpose:
+    #
+    #   window median   median across the window of each day's own median.
+    #                   A window-level summary.  NOT the current book.
+    #   latest bar med  the newest day's median.  Also NOT the current book:
+    #                   a dislocation arriving late in the day does not move
+    #                   it until it dominates half that day's samples.
+    #   last sample     the single newest quote sample, with its timestamp.
+    #                   THIS is the current posted book, and it is the only
+    #                   one of the three permitted to drive the dislocation
+    #                   flag or the falsification verdict.
+    #
+    # The tool used to publish the latest bar's MEDIAN under the heading
+    # "obs now" and it was quoted to an operator as the current posted book
+    # spread in an argument about whether a book was dislocated right then.
+    # A daily median cannot answer that question.
+    result["observed_spread_window_median_bps"] = _median(
+        [b.spread_bps for b in bars])
+    result["latest_bar_median_bps"] = latest.spread_bps
+    result["observed_spread_last_sample_bps"] = latest.last_spread_bps
+    result["observed_spread_last_sample_at"] = latest.last_sample_at
     result["dislocated"] = latest.dislocated
+    result["dislocated_by_median"] = latest.median_dislocated
     if latest.dislocated:
         result["notes"].append(
-            f"DISLOCATION FLAG: latest bar {latest.day} shows a raw book "
-            f"spread of {latest.spread_bps:,.0f} bps, at or above the "
+            f"DISLOCATION FLAG: the most recent quote sample, taken at "
+            f"{latest.last_sample_at}, shows a raw book spread of "
+            f"{latest.last_spread_bps:,.0f} bps, at or above the "
             f"{DISLOCATION_SPREAD_BPS:,.0f} bps threshold. Read every "
             f"estimate below as a ceiling argument."
         )
@@ -544,6 +647,27 @@ def estimate_pair(pair: str, bars: list[Bar], crossed_dropped: int,
             f"test, cpp/include/xop/execution/book_side_quality.hpp, which "
             f"scores each side against an independent anchor instead of "
             f"against its own dispersion."
+        )
+
+    if latest.dislocated != latest.median_dislocated:
+        # The two straddle the threshold.  Say so out loud, in both
+        # directions: a last sample above a median below is a dislocation
+        # the median has not caught up with yet, and the reverse is one the
+        # book has already come out of.  Either way the operator is looking
+        # at a flag that appears to contradict the "obs med" column beside
+        # it, and is owed the reason rather than left to guess.
+        lagging = "has not yet caught up with" if latest.dislocated \
+            else "has not yet let go of"
+        result["notes"].append(
+            f"MEDIAN AND LAST SAMPLE STRADDLE THE FLAG THRESHOLD: bar "
+            f"{latest.day} has a median raw spread of "
+            f"{latest.spread_bps:,.0f} bps over {latest.samples} samples, "
+            f"while its last sample ({latest.last_sample_at}) shows "
+            f"{latest.last_spread_bps:,.0f} bps -- opposite sides of the "
+            f"{DISLOCATION_SPREAD_BPS:,.0f} bps threshold. The flag follows "
+            f"the LAST SAMPLE, because the question it answers is about the "
+            f"book NOW; the median {lagging} it, since a median cannot move "
+            f"until half the day's samples agree."
         )
 
     # --- FRESHNESS GATE ---------------------------------------------------
@@ -814,9 +938,13 @@ def print_report(results: list[dict], dexie_rows: list[dict],
         print(line)
     print()
 
+    # 'obs med' and 'obs last' are two different quantities and the headers
+    # say so.  The previous pair of headers was 'obs bps' / 'obs now', which
+    # named neither: 'obs now' was in fact the latest bar's MEDIAN, and it
+    # was read off this table and quoted as the current posted book spread.
     header = (f"{'pair':<16}{'bars':>5}{'n pairs':>8}{'degen':>6}{'thin':>5}"
               f"{'CS-':>5}{'AR-':>5}{'CS bps':>10}{'AR bps':>10}"
-              f"{'obs bps':>10}{'obs now':>11}")
+              f"{'obs med':>10}{'obs last':>11}")
     print(header)
     print("-" * len(header))
     for r in results:
@@ -831,15 +959,15 @@ def print_report(results: list[dict], dexie_rows: list[dict],
             print(f"{r['pair']:<16}{r['bars_seen']:>5}{'-':>8}"
                   f"{r['bars_degenerate']:>6}{r['bars_thin']:>5}"
                   f"{'-':>5}{'-':>5}{'REFUSED':>10}{'REFUSED':>10}"
-                  f"{_fmt_bps(r['observed_spread_bps']):>10}"
-                  f"{_fmt_bps(r['observed_spread_latest_bps']):>11}")
+                  f"{_fmt_bps(r['observed_spread_window_median_bps']):>10}"
+                  f"{_fmt_bps(r['observed_spread_last_sample_bps']):>11}")
             continue
         print(f"{r['pair']:<16}{r['bars_used']:>5}{r['day_pairs_used']:>8}"
               f"{r['bars_degenerate']:>6}{r['bars_thin']:>5}"
               f"{r['cs_negative']:>5}{r['ar_negative']:>5}"
               f"{_fmt_bps(r['cs_bps']):>10}{_fmt_bps(r['ar_bps']):>10}"
-              f"{_fmt_bps(r['observed_spread_bps']):>10}"
-              f"{_fmt_bps(r['observed_spread_latest_bps']):>11}")
+              f"{_fmt_bps(r['observed_spread_window_median_bps']):>10}"
+              f"{_fmt_bps(r['observed_spread_last_sample_bps']):>11}")
     print()
     print("bars  = non-degenerate daily bars used (bars SEEN when REFUSED)")
     print("n pairs = ADJACENT DAY PAIRS = THE SAMPLE SIZE. Both estimators "
@@ -851,8 +979,33 @@ def print_report(results: list[dict], dexie_rows: list[dict],
           f"{MIN_SAMPLES_PER_BAR} samples (Ardia et al. 2024)")
     print("CS-/AR- = RAW negative estimates before zero-flooring "
           "(Corwin 2014)")
-    print("obs bps = median RAW book spread across the window; "
-          "obs now = latest bar")
+    # The two raw-spread columns are a WINDOW MEDIAN and a SINGLE MOST
+    # RECENT OBSERVATION.  The legend they replace read "obs bps = median
+    # RAW book spread across the window; obs now = latest bar", which left
+    # a reader to guess whether "latest bar" meant the newest observation
+    # or an average over the newest day -- it meant the latter, and it was
+    # quoted to an operator as the former.  Spell both out.
+    print("obs med  = RAW book spread, WINDOW MEDIAN: the median across the "
+          "window of each")
+    print("           day's own median sample. A summary of the window. "
+          "NOT the book now,")
+    print("           and it cannot move until half a day's samples agree.")
+    print("obs last = RAW book spread, SINGLE MOST RECENT QUOTE SAMPLE: "
+          "one observation,")
+    print("           no averaging -- the book as it currently stands. "
+          "The dislocation")
+    print("           flag and the FALSIFICATION verdict read THIS column, "
+          "never obs med.")
+    # One line per pair rather than a wrapped run-on: a wrapped list splits
+    # timestamps across lines and separates a stamp from its pair, which is
+    # the wrong failure mode for the one column whose whole point is being
+    # pinned to an instant.
+    stamps = [(r["pair"], r["observed_spread_last_sample_at"])
+              for r in results if r.get("observed_spread_last_sample_at")]
+    if stamps:
+        print("           obs last was sampled at (UTC):")
+        for pair, taken_at in stamps:
+            print(f"             {pair:<16} {taken_at}")
     print()
     print("Corwin-Schultz is BOUNDED: S = 2(e^a - 1)/(1 + e^a) -> 2.0 as "
           "a -> +inf, i.e. it")
@@ -882,13 +1035,28 @@ def print_report(results: list[dict], dexie_rows: list[dict],
                   f"(n={n} pairs; {r['ar_negative']}/{n} negative S^2 terms)")
             print(f"    two-day variant {r['ar_twoday_bps']:>8,.1f} bps   "
                   f"(n={n} pairs; each term floored before averaging)")
-            obs_now = r["observed_spread_latest_bps"] or 0.0
-            print(f"  raw book spread {obs_now:>10,.1f} bps   "
-                  f"(latest bar {r['latest_bar']})")
+            # The current book, the window summary, and the newest day's
+            # median -- printed as three separate lines under three separate
+            # labels, because they are three separate numbers and only the
+            # first is an answer to "what is the book doing now".
+            obs_last = r["observed_spread_last_sample_bps"] or 0.0
+            obs_med = r["observed_spread_window_median_bps"] or 0.0
+            print(f"  raw book spread NOW    {obs_last:>10,.1f} bps   "
+                  f"(LAST SAMPLE, taken "
+                  f"{r['observed_spread_last_sample_at']})")
+            print(f"  raw book spread MEDIAN {obs_med:>10,.1f} bps   "
+                  f"(WINDOW MEDIAN of {r['bars_seen']} daily medians; "
+                  f"NOT now)")
+            print(f"    latest bar {r['latest_bar']}: median "
+                  f"{r['latest_bar_median_bps']:,.1f} bps over "
+                  f"{r['latest_bar_samples']} samples (also NOT now)")
             best = max(r["cs_bps"] or 0.0, r["ar_bps"] or 0.0,
                        r["ar_twoday_bps"] or 0.0)
-            if best > 0.0 and obs_now > 0.0:
-                ratio = obs_now / best
+            if best > 0.0 and obs_last > 0.0:
+                # The verdict compares the CURRENT posted book against the
+                # estimators, so the numerator is the last sample.  Using
+                # the median here would answer a question nobody asked.
+                ratio = obs_last / best
                 if ratio <= 1.0:
                     verdict = (
                         f"the posted book spread is within the widest "
@@ -919,8 +1087,15 @@ def print_report(results: list[dict], dexie_rows: list[dict],
                 # behind it, and that number is n day pairs, never the bar
                 # count printed above it.
                 for line in _wrap(
-                        f"FALSIFICATION (n = {n} adjacent day pairs): "
-                        + verdict, 74):
+                        f"FALSIFICATION (estimator n = {n} adjacent day "
+                        f"pairs; \"posted book spread\" is the SINGLE LAST "
+                        f"QUOTE SAMPLE, {obs_last:,.1f} bps at "
+                        f"{r['observed_spread_last_sample_at']} -- window "
+                        f"median for comparison "
+                        f"{_fmt_bps(r['observed_spread_window_median_bps'])} "
+                        f"bps. The two can straddle the estimate, so a "
+                        f"verdict resting on the last sample alone moves "
+                        f"between runs; read both): " + verdict, 74):
                     print(f"  {line}")
         for note in r["notes"]:
             for line in _wrap("NOTE: " + note, 74):
@@ -1071,6 +1246,16 @@ def main(argv: list[str] | None = None) -> int:
             # estimators.  min_day_pairs is the gate below which a pair is
             # refused outright.
             "sample_size_field": "day_pairs_used",
+            # Which raw-spread field means what, so a JSON consumer cannot
+            # repeat the mistake the text report used to invite.
+            # observed_spread_last_sample_bps is a SINGLE observation and is
+            # the only field describing the book NOW; it is what "dislocated"
+            # is computed from.  observed_spread_window_median_bps and
+            # latest_bar_median_bps are medians and are window/day summaries
+            # -- neither is current state.
+            "current_spread_field": "observed_spread_last_sample_bps",
+            "current_spread_timestamp_field": "observed_spread_last_sample_at",
+            "window_spread_field": "observed_spread_window_median_bps",
             "min_day_pairs": MIN_USABLE_DAY_PAIRS,
             "min_usable_bars": MIN_USABLE_BARS,
             "generated_at": datetime.now(timezone.utc)

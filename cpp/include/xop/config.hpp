@@ -2006,10 +2006,17 @@ struct MarketDataSettings {
 
     /// Two-sides-agree bypass: a two-sided book whose own spread is at
     /// most this wide is trusted WHOLE, however far it sits from the
-    /// anchor.  Shares mid_gate_book_confirm_max_spread_bps's default
-    /// deliberately -- it is the same "the whole market repriced"
-    /// evidence, and splitting them lets one half of the feature strip
-    /// the confirmation the other half is waiting for.
+    /// anchor.  It is the same "the whole market repriced" evidence
+    /// mid_gate::book_confirms() accepts.
+    ///
+    /// RAISING this above mid_gate_book_confirm_max_spread_bps takes
+    /// effect.  LOWERING it below has NO effect: the value actually used
+    /// is max(this, mid_gate_book_confirm_max_spread_bps), derived in
+    /// bookside::effective_agree_max_spread_bps so the two mechanisms
+    /// cannot be configured into contradiction.  A bypass stricter than
+    /// the gate would disqualify both sides of a book the gate had just
+    /// accepted as confirmation, and Step 8 would then take its
+    /// both-sides-disqualified path instead of honouring it.
     double book_side_agree_max_spread_bps{5000.0};
 
     /// Max spread (bps) for a sibling pair's book to serve as a leg of the

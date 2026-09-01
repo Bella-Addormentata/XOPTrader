@@ -449,36 +449,75 @@ def test_a_tracked_copy_is_still_cleared_when_the_dialog_closes(qapp):
 
 
 def test_public_key_is_shown_and_private_key_is_not(page):
+    # [flake 2026-08-31, closed 2026-09-01] Do not reintroduce substring
+    # sampling here. Two generations of this test searched `shown` for
+    # fragments of the generated mnemonic, and both were probabilistic
+    # because BIP39 is ordinary English and the label's own chrome is
+    # ordinary English too.
+    #
+    #   * Per-WORD: the check was `" %s " % word not in shown`, and exactly
+    #     ONE BIP39 word survives that space-delimited form against this
+    #     label -- "public", from "BLS public key:". A 24-word phrase hits
+    #     it with probability 1 - (2047/2048)^24 = 1.17%, about one CI run
+    #     in 86, failing with "' public ' is contained here: BLS public
+    #     key: ..." -- the widget's chrome rather than the secret.
+    #
+    #     [corrected 2026-09-01] An earlier version of this comment, and
+    #     the commit message it came from, said EIGHT words collided
+    #     (public, key, address, this, machine, session, order, market) for
+    #     8.97%, one run in eleven. Measured against the real label: "key:"
+    #     and "address:" carry colons so they never match " key " or
+    #     " address ", and the other five do not appear in the label at
+    #     all. The flake was real and the fix was right; the arithmetic
+    #     justifying it was not, and a number nobody rechecks is how a
+    #     wrong one survives into three documents.
+    #
+    #   * Per-ADJACENT-PAIR: replaced NOT because it was flaky -- against
+    #     this label it is deterministic, since " public key " cannot match
+    #     "BLS public key:" (the colon). A review flagged it as 23/2048^2 =
+    #     5.5e-6; that is the rate for a label containing the bare pair,
+    #     which this one does not.
+    #
+    #     It was replaced because its safety rested ENTIRELY on that colon.
+    #     Deleting one character of chrome would have silently reintroduced
+    #     a probabilistic security test, with nothing to catch it. A test
+    #     whose correctness depends on punctuation in unrelated UI text is
+    #     not a test you can reason about.
+    #
+    # A security test that cries wolf -- however rarely -- trains people to
+    # re-run CI until it goes green. So the label is asserted WHOLE instead,
+    # rebuilt from the public fields the widget is allowed to show. That is
+    # both deterministic and strictly stronger than sampling: it rejects any
+    # unexpected content at all, every mnemonic word, the private key, or
+    # anything else, rather than only the leaks we thought to look for.
+    #
+    # Exact equality is available because the label is a pure function of
+    # two public fields -- no timestamps, truncation or conditional chrome.
+    # If that ever stops being true, tighten the expected value; do not
+    # loosen this back into a substring search.
     widget, ident = page
     pubkey, phrase = ident.create()
     widget.refresh()
 
+    info = ident.info()
+    # Percent format is DELIBERATE: this mirrors the widget's own format
+    # string in gui/widgets/permuto.py character for character, so the two
+    # can be checked against each other by eye. Rewriting it as an f-string
+    # would break the correspondence that makes this assertion auditable.
+    expected = (
+        "BLS public key:  %s\nTrading address: %s"  # noqa: UP031
+        % (info.pubkey, info.trading_address or "(resolved on registration)")
+    )
+
     shown = widget._identity_lbl.text()
+    assert shown == expected, "the identity label shows something unexpected"
+
+    # Stated separately so the security intent survives any future edit to
+    # the expected string above: the public key is disclosed, the private
+    # key and the recovery phrase are not.
     assert pubkey in shown
     assert bytes(ident.private_key()).hex() not in shown
-
-    # [flake 2026-08-31] The per-WORD check that used to live here fails
-    # about 9% of the time -- roughly one CI run in eleven -- and it is not
-    # finding a leak when it does.
-    #
-    # BIP39 is ordinary English, and eight of its 2,048 words also appear
-    # in this label's own chrome: public, key, address, this, machine,
-    # session, order, market. A 24-word phrase hits at least one of them
-    # with probability 1 - (2040/2048)^24 = 8.97%, and the failure reads
-    # "' public ' is contained here: BLS public key: ..." -- the widget's
-    # static text, not the secret.
-    #
-    # What actually constitutes a leak is the PHRASE, so that is what is
-    # checked: the whole thing, and any two ADJACENT words. A real
-    # disclosure carries neighbours with it; a lone common word is
-    # coincidence, and a test that cannot tell the two apart trains people
-    # to re-run CI until it goes green, which is the opposite of a
-    # security check.
-    words = phrase.split()
     assert phrase not in shown
-    for first, second in zip(words, words[1:]):
-        assert "%s %s" % (first, second) not in shown, (
-            "two consecutive phrase words leaked into the label")
 
 
 def test_page_constants_match_the_sidebar_order(qapp):

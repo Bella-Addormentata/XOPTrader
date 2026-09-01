@@ -2159,10 +2159,18 @@ void MarketDataFeed::ingest_competing_offers(
             // and both sides remain trusted -- unexamined, and recorded as
             // such.
             {
+                // [review] DERIVED, not read straight from config: the
+                // bypass must never be stricter than the published-mid
+                // gate's own confirmation threshold, or it strips the
+                // evidence that gate is waiting for.  See
+                // effective_agree_max_spread_bps.
+                const double agree_max =
+                    bookside::effective_agree_max_spread_bps(
+                        cfg.book_side_agree_max_spread_bps,
+                        cfg.mid_gate_book_confirm_max_spread_bps);
                 const auto sq = bookside::classify_sides(
                     filtered_best_bid, filtered_best_ask, ref_price,
-                    cfg.book_side_anchor_band_ratio,
-                    cfg.book_side_agree_max_spread_bps);
+                    cfg.book_side_anchor_band_ratio, agree_max);
                 ps.bid_side_anchor_ok = sq.bid_ok;
                 ps.ask_side_anchor_ok = sq.ask_ok;
                 ps.book_side_ref      = sq.ref;

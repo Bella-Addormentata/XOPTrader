@@ -54,6 +54,13 @@
 // from the anchor.  Dislocation is one side moving ALONE, and that always
 // leaves a wide spread behind.
 //
+// "Tight" is DERIVED from the gate's own confirmation threshold rather
+// than merely defaulted to it -- see effective_agree_max_spread_bps.  An
+// earlier revision of this comment claimed the two were "pinned to the
+// same default", which was true and insufficient: a default they share is
+// still a default an operator can move, and moving this one below the
+// gate's threshold recreates exactly the contradiction described above.
+//
 // Pure header, no feed or engine types, so the branches are driven
 // directly by cpp/tests/test_book_side_quality.cpp rather than through a
 // MarketDataFeed.
@@ -62,6 +69,44 @@
 #include <cmath>
 
 namespace xop::bookside {
+
+// The bypass threshold this classifier must ACTUALLY use, DERIVED from the
+// published-mid gate's own confirmation threshold so the two can never be
+// configured into conflict.  Same shape, and for the same reason, as
+// mid_gate::offer_absurdity_ratio.
+//
+// [review, PR #134] The header above says the bypass and
+// mid_gate::book_confirms() are "pinned to the same default".  Sharing a
+// DEFAULT is not the same as being unable to disagree, and an operator can
+// set them apart.  The reviewer's case: leave the gate confirming at
+// 5000 bps and set this to 750.  A far-from-anchor book at 4000 bps is then
+// accepted by book_confirms() as "the whole market repriced" -- while this
+// classifier disqualifies BOTH its sides, because 4000 > 750.  Step 8 then
+// takes its both-sides-disqualified path instead of honouring the
+// confirmation, which is precisely the contradiction the header promises
+// cannot happen.
+//
+// The constraint is one-directional.  A bypass MORE permissive than the
+// gate is harmless: it trusts a book whole that the gate would also have
+// accepted.  A bypass LESS permissive strips the evidence the gate is
+// waiting for.  So the effective value is the larger of the two, and an
+// operator who lowers this knob below the gate's threshold gets the gate's
+// threshold rather than a silent contradiction.
+//
+// Non-finite or negative inputs contribute nothing rather than poisoning
+// the result; if both are unusable the bypass is simply off, which is the
+// safe direction (it only ever ADDS trust).
+[[nodiscard]] inline double effective_agree_max_spread_bps(
+    double configured,
+    double gate_confirm_max_spread_bps) noexcept
+{
+    const double a = (std::isfinite(configured) && configured > 0.0)
+                         ? configured : 0.0;
+    const double b = (std::isfinite(gate_confirm_max_spread_bps)
+                      && gate_confirm_max_spread_bps > 0.0)
+                         ? gate_confirm_max_spread_bps : 0.0;
+    return a > b ? a : b;
+}
 
 /// Verdict for one dust-filtered book.  Both sides default to trusted:
 /// absence of evidence against a side is not evidence against it, and the
