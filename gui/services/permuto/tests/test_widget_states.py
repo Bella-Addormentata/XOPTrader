@@ -460,10 +460,21 @@ def test_public_key_is_shown_and_private_key_is_not(page):
     # [review] EXACT MATCH, which is both non-flaky and STRONGER than
     # either previous attempt.
     #
-    # The original per-word check failed ~9% of runs -- BIP39 is ordinary
-    # English and eight of its 2,048 words appear in this label's own
-    # chrome (public, key, address, this, machine, session, order, market),
-    # so a 24-word phrase collides with probability 1 - (2040/2048)^24.
+    # The original per-word check was probabilistic: BIP39 is ordinary
+    # English and the label's own chrome is too.
+    #
+    # [corrected 2026-09-01] This comment previously said EIGHT words
+    # collided (public, key, address, this, machine, session, order,
+    # market) for ~9%. Measured against the real label -- "BLS public
+    # key:  %s
+Trading address: %s" -- exactly ONE does: "public".
+    # "key:" and "address:" carry colons so they never match " key ",
+    # "Trading" and "BLS" are capitalised and BIP39 is lowercase, and
+    # the rest do not appear at all. Against the 2,048-word list that
+    # is 1 - (2047/2048)^24 = 1.1653%, about one run in 86 -- which
+    # matches the observed rate. The flake was real and the fix is
+    # right; the arithmetic justifying it was not, and a number nobody
+    # rechecks is how a wrong one propagates.
     #
     # My first fix swapped it for adjacent-word pairs, which cured the
     # flake by WEAKENING the check: a single leaked word passes, and so
