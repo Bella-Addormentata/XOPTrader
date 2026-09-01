@@ -122,9 +122,13 @@ def profile_for(stage: Stage, *, oracle_fresh: bool = True) -> Profile:
     if stage is Stage.EXIT:
         return Profile(
             quote=False, spread_mult=SESSION_SPREAD_MULT, depth_mult=0.0,
-            # Hold what is on: the danger is the OPEN, not the close, and
-            # a resting book keeps earning credit until the bell.
-            withdraw=False,
+            # [review] WITHDRAW. An earlier version held the book here so
+            # it could earn to the bell, but EXIT's caps are tighter than
+            # RAMP's and RestingQuote tracks prices without quantities --
+            # so nothing can show a retained order still fits. A fill
+            # against an oversized resting leg would breach the cap and
+            # carry into the overnight window.
+            withdraw=True,
             reason="last minutes before the close: no new quotes, and "
                    "inventory carried past the bell costs the overnight "
                    "window, which is where depth is actually earned")

@@ -452,12 +452,18 @@ class QuoteRunner:
                 # consulted, so `withdraw=False` could never take effect.
                 # The caps still bind; nothing that would GROW inventory
                 # gets placed. This only spares what is already there.
-                if curfew.stage is not Stage.EXIT:
-                    self._curfew_retract_pending = True
-                else:
-                    _log.info(
-                        "permuto: entering EXIT -- holding the resting "
-                        "book (caps still bind; nothing new is placed)")
+                # [review] AND THAT INCLUDES EXIT. An exemption was tried
+                # here so EXIT could keep earning credit to the bell, and
+                # it does not survive the cap invariant: a pair placed
+                # early in RAMP can be ~$420 a side, while EXIT permits
+                # ~$300 long / $120 short, and RestingQuote records PRICES
+                # but not quantities -- so nothing here can prove a
+                # retained order fits the tightened caps. A fill during
+                # EXIT would then breach the cap and carry the excess into
+                # the overnight window, which is the exact failure the
+                # curfew exists to prevent. Fifteen minutes of forgone
+                # credit is the cheaper side of that trade.
+                self._curfew_retract_pending = True
             self._curfew = curfew
 
         paused = bool(flags.get("trading_paused"))

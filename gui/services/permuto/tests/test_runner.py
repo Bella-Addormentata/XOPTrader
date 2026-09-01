@@ -1981,7 +1981,7 @@ def test_the_last_minutes_before_the_close_place_nothing():
     res = r.tick(exit_t, _ORACLE, {})
     assert not getattr(c, "last_batch", None), (
         "placed a new quote inside the exit window")
-    assert res.markets.get(_MKT, ("", ""))[0] == "skip", res.markets
+    assert res.markets.get(_MKT, ("", ""))[0] == "withdraw", res.markets
 
 def test_a_frozen_oracle_after_the_bell_stops_the_runner_quoting():
     """[review] This guard was DEAD CODE, killed by my own earlier fix.
@@ -2132,16 +2132,17 @@ class _BookClient(_Client):
         return out
 
 
-def test_entering_EXIT_does_not_retract_the_resting_book():
-    """[review] Across the REAL boundary, with a book that stays cancelled.
+def test_entering_EXIT_retracts_because_its_caps_are_tighter():
+    """[review] The exemption tried here did not survive the cap invariant.
 
-    The curfew's stage-change path retracts on every effective transition,
-    which cancelled the book EXIT is meant to leave alone -- and did it
-    before the profile was consulted, so `withdraw=False` could never take
-    effect. The previous version of this test primed at 6 minutes to the
-    close and asserted at 5, both already INSIDE the EXIT window, so no
-    RAMP -> EXIT transition ever occurred and the fake resurrected the
-    orders anyway. It could not have failed.
+    EXIT was briefly exempted from the stage-change retraction so it could
+    keep earning credit to the bell. But a pair placed early in RAMP can
+    be ~$420 a side while EXIT permits ~$300 long / $120 short, and
+    RestingQuote records PRICES and not quantities -- so nothing can prove
+    a retained order still fits. A fill against an oversized resting leg
+    would breach the cap and carry the excess into the overnight window,
+    the exact failure the curfew exists to prevent. Fifteen minutes of
+    forgone credit is the cheaper side of that trade.
     """
     orders = [{"market": _MKT, "side": "buy", "price": 0.0698, "size": 100},
               {"market": _MKT, "side": "sell", "price": 0.0702, "size": 100}]
@@ -2150,18 +2151,18 @@ def test_entering_EXIT_does_not_retract_the_resting_book():
     r = _runner(c, curfew_enabled=True)
     close = CLOSES_UTC[0]
     # A MOVING oracle, or the freeze detector overrides the schedule and
-    # the transition under test becomes RAMP -> CLOSED instead of EXIT.
+    # the transition under test becomes RAMP -> CLOSED instead.
+    # EXIT_START_S is 900s, so close-900 IS the boundary -- an assertion
+    # tick at close-600 is already inside EXIT and sees no transition,
+    # which is the same mistake the previous version of this test made.
     r.tick(close - 1800.0, {_MKT: 0.0700}, {})   # RAMP, 30 minutes out
-    r.tick(close - 1200.0, {_MKT: 0.0705}, {})
-    # Entering RAMP legitimately retracts (its caps tighten), so re-seed a
-    # resting book: the property under test is what crossing into EXIT does
-    # to a book that IS there, not whether one survived an earlier stage.
-    c._orders = list(orders)
-    r.tick(close - 900.0, {_MKT: 0.0707}, {})    # reconcile picks it up
+    r.tick(close - 1200.0, {_MKT: 0.0705}, {})   # RAMP
+    c._orders = list(orders)                     # re-seed: RAMP retracts on
+    r.tick(close - 1100.0, {_MKT: 0.0707}, {})   # its own caps, legitimately
     c.calls.clear()
-    r.tick(close - 600.0, {_MKT: 0.0710}, {})    # crosses into EXIT
-    assert "cancel_all" not in c.calls,         "the RAMP -> EXIT transition retracted the book EXIT should hold"
-    assert c._orders, "the resting book was cancelled entering EXIT"
+    r.tick(close - 890.0, {_MKT: 0.0710}, {})    # crosses RAMP -> EXIT
+    assert "cancel_all" in c.calls,         "entering EXIT kept a book whose size it cannot verify"
+
 
 
 def test_entering_the_overnight_close_DOES_retract():
