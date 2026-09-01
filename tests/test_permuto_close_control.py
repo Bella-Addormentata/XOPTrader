@@ -507,3 +507,51 @@ def test_an_empty_plan_is_not_logged_as_a_flat_account(widget):
     logged = widget._activity.toPlainText()
     assert "no open positions" not in logged, logged
     assert "one lot" in logged, logged
+
+
+def test_the_session_stays_reserved_while_the_operator_decides(widget,
+                                                               monkeypatch):
+    """[review] QMessageBox.exec() runs a NESTED EVENT LOOP.
+
+    The plan worker finishes before the operator answers, so
+    _close_thread goes None while the dialog is still on screen. The
+    deferred startup timer could read that as permission, open a quoting
+    session, and pressing OK would then start the send worker beside it
+    -- two clients renewing the same identity, which is the exact failure
+    close_in_flight() exists to prevent.
+    """
+    seen = {}
+
+    def _fake_confirm(summary):
+        # Exactly the moment the old guard went false: the worker is gone
+        # and the operator has not answered yet.
+        widget._close_thread = None
+        seen["in_flight_during_dialog"] = widget.close_in_flight()
+        return False            # cancel, so nothing is sent
+
+    monkeypatch.setattr(widget, "_confirm_close", _fake_confirm)
+    widget._on_close_planned(([{"market": "A", "side": "buy", "size": 1.0,
+                                "reduce_only": True}], "one leg"))
+
+    assert seen.get("in_flight_during_dialog") is True, (
+        "the session was unreserved while the confirmation dialog was open")
+    # ...and released afterwards, or the control locks itself out forever.
+    assert widget.close_in_flight() is False
+
+
+def test_quoting_going_live_during_confirmation_cancels_the_send(widget,
+                                                                 monkeypatch):
+    """The reservation stops a session being opened while we hold it; one
+    that was ALREADY live when the dialog opened is still live now, so the
+    send has to re-check rather than assume."""
+    started = []
+    monkeypatch.setattr(widget, "_confirm_close", lambda s: True)
+    monkeypatch.setattr(widget, "_start_close_worker",
+                        lambda *a, **k: started.append(a))
+    widget._quoting_live = True
+
+    widget._on_close_planned(([{"market": "A", "side": "buy", "size": 1.0,
+                                "reduce_only": True}], "one leg"))
+
+    assert not started, "a send was started while quoting was live"
+    assert "Quoting started" in widget._close_note.text()

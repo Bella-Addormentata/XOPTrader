@@ -262,7 +262,13 @@ def order_verdict(resp: Any) -> tuple:
         return "refused", status or action
     # An id or a fill is acceptance on its own, so an order that filled
     # without a recognised status word is not misreported as refused.
-    if (resp.get("order_id") or resp.get("id") or resp.get("fills")
+    # [review] A FILL COLLECTION, not any truthy "fills". {"fills":
+    # "lots"} is a shape filled_size() already refuses to read, and
+    # counting it as acceptance let an unrecognised body through as a
+    # sent leg -- the two functions disagreeing about the same field.
+    fills = resp.get("fills")
+    has_fills = isinstance(fills, list) and bool(fills)
+    if (resp.get("order_id") or resp.get("id") or has_fills
             or action in _ACCEPTED or status in _ACCEPTED):
         return "accepted", ""
     # Deliberately NOT "refused": not recognising a body is a statement

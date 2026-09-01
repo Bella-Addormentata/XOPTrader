@@ -1023,7 +1023,16 @@ class PermutoWidget(QWidget):
         would sit in alternating 401/reauth, which is the failure the guard
         exists to prevent, arriving from the other side.
         """
-        return getattr(self, "_close_thread", None) is not None
+        # [review] ...AND WHILE THE OPERATOR IS DECIDING. The plan
+        # thread finishes before the confirmation dialog is answered --
+        # QMessageBox.exec() runs a NESTED EVENT LOOP, so the worker
+        # completes and _close_thread goes None while the box is still
+        # on screen. The deferred startup timer could then take that as
+        # permission and open a quoting session, and pressing OK would
+        # start the send worker beside it: two clients renewing the same
+        # identity, which is exactly what this guard exists to stop.
+        return (getattr(self, "_close_thread", None) is not None
+                or getattr(self, "_close_confirming", False))
 
     def set_quoting_live(self, live: bool) -> None:
         """Told by MainWindow when the quoting loop owns a venue session.
@@ -1124,7 +1133,39 @@ class PermutoWidget(QWidget):
             # permanent record. Log what was actually shown.
             self._log_activity("Close: %s" % summary.replace(chr(10), " "))
             return
-        # The operator confirms against the ACTUAL numbers, not a percentage.
+        # Reserve the session across the DECISION, not merely across the
+        # worker -- see close_in_flight(). Cleared on every exit from
+        # here, including the exception path, or the control locks
+        # itself out permanently.
+        self._close_confirming = True
+        try:
+            confirmed = self._confirm_close(summary)
+        finally:
+            self._close_confirming = False
+        if not confirmed:
+            self._close_note.setText("Cancelled -- nothing was sent.")
+            self._log_activity("Close: cancelled by operator.")
+            return
+        # [review] And re-check, because the reservation only stops a
+        # session being opened WHILE we hold it -- one that was already
+        # live when the dialog opened is still live now.
+        if getattr(self, "_quoting_live", False):
+            self._close_note.setText(
+                "Quoting started while you were deciding -- nothing "
+                "was sent. Stop quoting and try again.")
+            self._log_activity("Close: refused -- quoting went live "
+                               "during confirmation.")
+            return
+        self._set_close_enabled(False)
+        self._close_note.setText("Sending...")
+        self._log_activity("Close: operator confirmed %d leg(s)."
+                           % len(legs))
+        self._start_close_worker(self._close_fraction, "send",
+                                 approved_legs=legs)
+
+    def _confirm_close(self, summary: str) -> bool:
+        """The confirmation dialog, split out so the reservation above
+        wraps it and a test can drive it without a live event loop."""
         box = QMessageBox(self)
         box.setWindowTitle("Confirm close")
         box.setIcon(QMessageBox.Warning)
@@ -1134,15 +1175,7 @@ class PermutoWidget(QWidget):
             "fill immediately at whatever the book offers." % summary)
         box.setStandardButtons(QMessageBox.Cancel | QMessageBox.Ok)
         box.setDefaultButton(QMessageBox.Cancel)
-        if box.exec() != QMessageBox.Ok:
-            self._close_note.setText("Cancelled -- nothing was sent.")
-            self._log_activity("Close: cancelled by operator.")
-            return
-        self._set_close_enabled(False)
-        self._close_note.setText("Sending...")
-        self._log_activity("Close: operator confirmed %d leg(s)." % len(legs))
-        self._start_close_worker(self._close_fraction, "send",
-                                 approved_legs=legs)
+        return box.exec() == QMessageBox.Ok
 
     @Slot(object)
     def _on_close_sent(self, result: Any) -> None:

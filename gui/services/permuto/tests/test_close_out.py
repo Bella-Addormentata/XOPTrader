@@ -570,3 +570,18 @@ def test_every_leg_refused_is_not_called_partial():
     assert res["sent"] == 0
     assert not res["note"].startswith("partial"), res["note"]
     assert "refused" in res["note"], res["note"]
+
+
+def test_a_malformed_fills_field_is_not_acceptance():
+    """[review] order_verdict() and filled_size() disagreed about the same
+    field. filled_size({"fills": "lots"}) already refuses to read it, but
+    order_verdict() counted any truthy `fills` as acceptance -- so an
+    unrecognised body was reported as a sent leg instead of an unresolved
+    one."""
+    assert order_verdict({"fills": "lots"})[0] == "unknown"
+    assert order_verdict({"fills": {}})[0] == "unknown"
+    assert order_verdict({"fills": []})[0] == "unknown"
+    # A real collection still is.
+    assert order_verdict({"fills": [{"size": 10}]})[0] == "accepted"
+    # ...and the two functions now agree about the malformed case.
+    assert filled_size({"fills": "lots"}) == -1.0
