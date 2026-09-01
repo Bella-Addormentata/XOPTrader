@@ -45,7 +45,7 @@
 #include <boost/asio/steady_timer.hpp>
 #include <boost/asio/this_coro.hpp>
 #include <boost/asio/use_awaitable.hpp>
-#include <spdlog/sinks/stdout_color_sinks.h>
+#include "xop/util/client_logger.hpp"
 
 namespace xop::rpc {
 
@@ -209,13 +209,12 @@ ChiaRPCBase::ChiaRPCBase(asio::io_context& ioc,
     : ioc_(ioc)
     , config_(std::move(cfg))
 {
-    // Obtain or create a named logger.  spdlog::get() returns nullptr if
-    // the logger does not yet exist; create a colour-stdout sink in that
-    // case.
-    logger_ = spdlog::get(std::string(logger_name));
-    if (!logger_) {
-        logger_ = spdlog::stdout_color_mt(std::string(logger_name));
-    }
+    // Obtain or create the named logger.  This adopts the PROCESS logger's
+    // sinks, so RPC-layer faults reach the rotating file log and not just
+    // stdout -- see xop/util/client_logger.hpp for why the old
+    // get()-then-stdout_color_mt() pattern was stdout-only.  Never throws,
+    // never returns a logger that discards silently.
+    logger_ = xop::util::get_or_create_client_logger(logger_name);
 }
 
 ChiaRPCBase::~ChiaRPCBase()
@@ -229,7 +228,14 @@ ChiaRPCBase::ChiaRPCBase(ChiaRPCBase&& other) noexcept
     , logger_(std::move(other.logger_))
     , thread_pool_(std::move(other.thread_pool_))
     , open_(std::exchange(other.open_, false))
-{}
+{
+    // Moving a shared_ptr leaves the SOURCE null, and open() dereferences
+    // logger_ with no guard (:274, :278) -- reopening a moved-from client
+    // would be a null deref.  ~ChiaRPCBase -> close() only survives it by
+    // accident, because open_ was exchanged to false first.  Share the logger
+    // instead of leaving a hole; loggers are designed to be shared.
+    other.logger_ = logger_;
+}
 
 ChiaRPCBase& ChiaRPCBase::operator=(ChiaRPCBase&& other) noexcept
 {
@@ -241,6 +247,8 @@ ChiaRPCBase& ChiaRPCBase::operator=(ChiaRPCBase&& other) noexcept
         logger_      = std::move(other.logger_);
         thread_pool_ = std::move(other.thread_pool_);
         open_        = std::exchange(other.open_, false);
+        // See the move ctor: do not leave the source with a null logger_.
+        other.logger_ = logger_;
     }
     return *this;
 }

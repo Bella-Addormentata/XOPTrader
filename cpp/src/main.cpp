@@ -329,9 +329,18 @@ static void init_logging(bool verbose) {
     auto console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
     console_sink->set_level(verbose ? spdlog::level::debug : spdlog::level::info);
 
-    // Rotating file: 10 MB per file, 5 rotated files kept.
+    // Rotating file: 10 MB per file, 9 rotated files kept (100 MB total).
+    //
+    // [CLIENTLOG 2026-09-01] Raised 5 -> 9 in the same commit that routed the
+    // four RPC clients onto these sinks (xop/util/client_logger.hpp).  Those
+    // clients were stdout-only and their DEBUG tier emitted nowhere at all, so
+    // making them visible adds a measured +13 to +25 MB/day (central ~19) on
+    // top of the measured 35.8 MB/day baseline.  At the old 60 MB the operator's
+    // post-mortem window would have fallen from ~40 h to ~26 h -- below the
+    // overnight line that the frozen-oracle and batch_failed incidents both
+    // needed.  100 MB / ~55 MB/day restores ~44 h.  Cost: +40 MB of disk.
     constexpr std::size_t kMaxFileSize = 10 * 1024 * 1024;
-    constexpr std::size_t kMaxFiles    = 5;
+    constexpr std::size_t kMaxFiles    = 9;
     auto file_sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
         "logs/xop_trader.log", kMaxFileSize, kMaxFiles);
     file_sink->set_level(spdlog::level::debug);
@@ -340,7 +349,15 @@ static void init_logging(bool verbose) {
         "xop", spdlog::sinks_init_list{console_sink, file_sink});
 
     logger->set_level(spdlog::level::debug);
-    logger->set_pattern("[%Y-%m-%dT%H:%M:%S.%e%z] [%^%l%$] [tid:%t] %v");
+    // [CLIENTLOG 2026-09-01] %n (logger name) added.  Every logger that clones
+    // or shares these sinks -- CoinMgr, OfferMgr, OnChainReconciler, and now
+    // chia.fullnode / chia.wallet / dexie / coingecko / tibetswap -- was
+    // indistinguishable from the engine in this file, because the shared sink
+    // owns the formatter and the pattern had no %n.  It also keeps the [dexie]
+    // tag operators grep in engine.log, which adopting this pattern would
+    // otherwise have dropped.  Engine lines now carry [xop]; message text is
+    // unchanged, so greps on content still match.  Cost ~1.4 MB/day.
+    logger->set_pattern("[%Y-%m-%dT%H:%M:%S.%e%z] [%n] [%^%l%$] [tid:%t] %v");
     logger->flush_on(spdlog::level::warn);  // Auto-flush on warn and above.
 
     spdlog::set_default_logger(std::move(logger));

@@ -93,6 +93,9 @@ add_executable(xop_tests
     test_height_source.cpp
     test_settled_fill.cpp
     test_wallet_poll_throttle.cpp
+    test_client_logger.cpp
+    test_pid_reachability.cpp
+    test_pid_rail_latch.cpp
 )
 
 target_link_libraries(xop_tests
