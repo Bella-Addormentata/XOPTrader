@@ -1008,8 +1008,13 @@ class QuoteRunner:
             # unreadable equity or a neighbour's unreadable position
             # yields zero, because authorising exposure against a
             # number nobody can see is how the last account died.
-            cap_usd = min(cap_usd, portfolio_cap_usd(
-                state.equity_usd, market, cap_usd, positions_usd))
+            # min() only when there IS a per-market cap: with the
+            # "no limit" sentinel (<= 0) min() would keep the zero and
+            # cap the market at nothing. The budget replaces it there.
+            _budgeted = portfolio_cap_usd(
+                state.equity_usd, market, cap_usd, positions_usd)
+            cap_usd = (min(cap_usd, _budgeted) if cap_usd > 0.0
+                       else _budgeted)
             # Clamped strictly positive: the overnight SHORT cap is zero,
             # and assess() reads a non-positive max_position as "no limit".
             # The prohibition is enforced by the per-leg veto below; what
@@ -1052,11 +1057,21 @@ class QuoteRunner:
         # place the shrinking side -- and pre-empting it here would cancel
         # the book and then skip the replacement, leaving the market flat
         # when it should have been reduced.
+        # [review] ...EXCEPT one that is already exactly what reduce-only
+        # wants. Making one_sided_ok cover a room-pinned market stopped
+        # decide() re-quoting it, but HOLD is not QUOTE, so the market
+        # fell into risk_forced instead and was cancelled -- then the
+        # next tick saw an empty book and upserted the same leg again.
+        # Alternating cancel/upsert is the same churn wearing a
+        # different hat, and it took a review to notice the fix had
+        # moved the problem rather than removed it.
         risk_forced = [
             m for m, r in risk_by_market.items()
             if r.action is not RiskAction.NORMAL
             and not self._resting.get(m, RestingQuote()).empty
             and results.get(m, ("", ""))[0] != LoopAction.QUOTE.value
+            and not self._already_reducing(
+                m, float(state.positions.get(m, 0.0) or 0.0))
         ]
         # [sweep] Unconditional, NOT `and not any_quoted`. This is the same
         # mistake as the withdraw path two commits ago: a market past its
@@ -1896,6 +1911,32 @@ class QuoteRunner:
 
         self._reopen_pending = False
         return TickResult("quote", "%d legs" % len(legs), results)
+
+    def _already_reducing(self, market: str, position: float) -> bool:
+        """True when the resting book is ALREADY the reduce-only shape.
+
+        Cancelling such a market achieves nothing: the only leg resting is
+        the one that shrinks the position, at a size risk has already
+        permitted. Cancel it and the next tick simply places it again --
+        which is how a pinned market alternates cancel and upsert all
+        night instead of resting.
+
+        A short is reduced by BUYING, a long by SELLING. Anything
+        two-sided, empty, or resting on the wrong side is not this state
+        and must still be forced.
+        """
+        resting = self._resting.get(market, RestingQuote())
+        if resting.empty or resting.two_sided:
+            return False
+        if position != position:            # NaN: unreadable, force it
+            return False
+        if position < 0.0:
+            return (resting.bid_price is not None
+                    and resting.ask_price is None)
+        if position > 0.0:
+            return (resting.ask_price is not None
+                    and resting.bid_price is None)
+        return False
 
     def _base_size(self, oracle: Optional[float]) -> float:
         """Contracts that carry ``target_depth_usd`` of notional per side."""

@@ -102,8 +102,16 @@ def portfolio_cap_usd(
     cannot parse yields zero room, because the alternative is authorising
     exposure against a number nobody can see.
     """
-    if not math.isfinite(per_market_cap_usd) or per_market_cap_usd <= 0.0:
+    # [review] A NON-POSITIVE per-market cap is the documented "no
+    # limit" SENTINEL, not a limit of zero. Returning 0.0 here turned
+    # it into an almost-zero cap once the runner clamped it to 1e-9,
+    # which pins every market to REDUCE_ONLY -- silently inverting the
+    # one setting an operator uses to say "do not cap me per market".
+    # The PORTFOLIO budget still binds; that is the whole point of it,
+    # and it is the only limit left in that configuration.
+    if not math.isfinite(per_market_cap_usd):
         return 0.0
+    unlimited_per_market = per_market_cap_usd <= 0.0
     if not math.isfinite(equity_usd) or equity_usd <= 0.0:
         return 0.0
     budget = equity_usd * PORTFOLIO_MAX_EXPOSURE_FRACTION
@@ -118,7 +126,10 @@ def portfolio_cap_usd(
         if not math.isfinite(value):
             return 0.0
         others += value
-    return max(0.0, min(per_market_cap_usd, budget - others))
+    room = budget - others
+    if unlimited_per_market:
+        return max(0.0, room)
+    return max(0.0, min(per_market_cap_usd, room))
 
 
 class RiskAction(str, Enum):

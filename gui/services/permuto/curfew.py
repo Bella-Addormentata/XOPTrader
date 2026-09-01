@@ -341,7 +341,7 @@ class OracleFreeze:
         return max(0.0, now_s - self._changed_at_s)
 
     def changed_since(self, market: str, boundary_s: float) -> bool:
-        """Has this market printed AFTER ``boundary_s``?
+        """Has this market printed AT OR AFTER ``boundary_s``?
 
         [review] "Fresh" and "printed since the bell" are not the same
         question, and the freshness gate needs the second one. An oracle

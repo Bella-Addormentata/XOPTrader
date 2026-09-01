@@ -349,8 +349,28 @@ def test_the_portfolio_budget_fails_closed_on_anything_unreadable():
     for junk in ("lots", None, float("nan"), float("inf")):
         assert portfolio_cap_usd(500_000.0, "A", 250_000.0,
                                  {"B": junk}) == 0.0
-    for cap in (0.0, -1.0, float("nan")):
-        assert portfolio_cap_usd(500_000.0, "A", cap, {}) == 0.0
+    # A NaN per-market cap is unreadable and yields nothing...
+    assert portfolio_cap_usd(500_000.0, "A", float("nan"), {}) == 0.0
+
+
+def test_the_no_limit_sentinel_is_not_read_as_a_zero_cap():
+    """[review] <= 0 means "do not cap me per market", and turning it
+    into a literal zero pinned every market to REDUCE_ONLY -- silently
+    inverting the one setting an operator uses to remove the cap.
+
+    The PORTFOLIO budget still binds there; in that configuration it is
+    the only limit left, which is exactly why it must not be zero."""
+    from gui.services.permuto.risk import (PORTFOLIO_MAX_EXPOSURE_FRACTION,
+                                           portfolio_cap_usd)
+    equity = 500_000.0
+    budget = equity * PORTFOLIO_MAX_EXPOSURE_FRACTION
+    for sentinel in (0.0, -1.0):
+        assert portfolio_cap_usd(equity, "A", sentinel, {}) == budget, (
+            "the no-limit sentinel %r was read as a zero cap"
+            % (sentinel,))
+        # ...and the budget is still shared with the rest of the book.
+        assert portfolio_cap_usd(equity, "A", sentinel,
+                                 {"B": 100_000.0}) == budget - 100_000.0
 
 
 def test_the_market_being_sized_is_not_counted_against_itself():

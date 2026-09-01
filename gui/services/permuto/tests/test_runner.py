@@ -2837,8 +2837,16 @@ def test_a_posture_change_retracts_even_with_no_position_cap():
             "a posture-only transition left the old book resting")
 
 
-def test_a_market_pinned_by_exhausted_room_says_so_and_stops_rechurning(caplog):
-    """[audit] The failure that cost ~40% of a simulated night in silence.
+def test_a_market_pinned_reduce_only_says_so_once(caplog):
+    """[audit] The failure that cost ~40% of a simulated night.
+
+    [review] NAMED FOR WHAT IT ACTUALLY EXERCISES. An earlier version
+    claimed the exhausted-ROOM path, but -100,000 contracts at 0.07 is
+    $7,000 against a $1,200 cap, so assess() returns REDUCE_ONLY long
+    before permitted_leg_size() floors anything. The room-floor branch is
+    a one-contract-wide window between |position| > short_cap - 1 and
+    |position| >= short_cap; REDUCE_ONLY is the path that actually runs,
+    and it is the one worth pinning.
 
     Overnight flow is one-directional -- buyers lift our ask, and nothing
     sells back against a frozen oracle -- so the short room drains. When
@@ -2853,7 +2861,6 @@ def test_a_market_pinned_by_exhausted_room_says_so_and_stops_rechurning(caplog):
     cancel+upsert pairs across one night, each replacing a quote with a
     copy of itself, on a rate-limited route.
     """
-    import logging
     # A short already at the overnight cap: room for the ask is gone.
     # -100,000 contracts at oracle 0.07 = $7,000 short, against an
     # overnight short cap of $12,000 x 0.10 = $1,200. Room is gone.
@@ -2915,3 +2922,37 @@ def test_a_pinned_market_tells_decide_its_missing_side_is_intended(monkeypatch):
     assert seen.get("one_sided_ok") is True, (
         "a market pinned by exhausted room still reported its missing side "
         "as a gap to repair -- decide() will re-upsert it every tick")
+
+
+def test_an_already_reducing_book_is_not_cancelled_and_replaced():
+    """[review] The one_sided_ok fix moved the churn instead of ending it.
+
+    Once decide() stops re-quoting a pinned market it returns HOLD -- and
+    HOLD is not QUOTE, so the market dropped straight into risk_forced
+    and was cancelled. The next tick then saw an empty book and placed
+    the same leg again: alternating cancel/upsert, the same ~12,600
+    requests a night wearing a different hat.
+
+    Cancelling a book that is ALREADY exactly what reduce-only wants
+    achieves nothing, so it is exempt. Anything two-sided, empty, or
+    resting on the wrong side is still forced.
+    """
+    from gui.services.permuto.quoting import RestingQuote as RQ
+    c = _Client(account=_account(-100_000.0))
+    r = _runner(c, curfew_enabled=True, max_position_usd=12_000.0)
+
+    # A short reduces by BUYING, so a lone bid is the correct shape.
+    r._resting[_MKT] = RQ(0.0695, None)
+    assert r._already_reducing(_MKT, -100_000.0) is True
+
+    # ...and everything else still gets forced.
+    assert r._already_reducing(_MKT, 100_000.0) is False   # long: wrong side
+    r._resting[_MKT] = RQ(None, 0.0705)
+    assert r._already_reducing(_MKT, 100_000.0) is True    # long: lone ask
+    assert r._already_reducing(_MKT, -100_000.0) is False
+    r._resting[_MKT] = RQ(0.0695, 0.0705)
+    assert r._already_reducing(_MKT, -100_000.0) is False  # two-sided
+    r._resting[_MKT] = RQ()
+    assert r._already_reducing(_MKT, -100_000.0) is False  # empty
+    r._resting[_MKT] = RQ(0.0695, None)
+    assert r._already_reducing(_MKT, float("nan")) is False  # unreadable
