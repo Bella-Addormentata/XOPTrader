@@ -26,6 +26,7 @@
 #include "xop/execution/par_anchor.hpp"
 #include "xop/execution/book_side_quality.hpp"
 #include "xop/execution/cross_guard.hpp"
+#include "xop/strategy/tier_gain.hpp"
 #include "xop/execution/mid_gate.hpp"
 #include "xop/risk/valuation_authority.hpp"
 #include "xop/risk/usd_route.hpp"
@@ -6329,6 +6330,16 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
         // strategy/reservation_offset.hpp.  Every downstream guard (sigma
         // width floor, fair-value clamp, no-loss floor, peg guards,
         // competitive caps) is untouched and acts on the shifted centre.
+        // [FEEGAIN 2026-09-01] Capture the fair-value centre BEFORE the A-S
+        // shift. This is the frame the ladder's EDGE lives in: the shift
+        // that follows moves quotes for inventory reasons, not because our
+        // view of value changed. Captured here rather than at blend.center
+        // so the peg anchor's correction is included.
+        pcs.quote_fair_centre_mojos = market_mid > 0.0
+            ? static_cast<Mojo>(std::llround(
+                  market_mid * static_cast<double>(kMojosPerXch)))
+            : Mojo{0};
+
         if (config_.strategy.as_reservation_enabled && pair_cfg
             && market_mid > 0.0)
         {
@@ -9845,7 +9856,32 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         // -- T4-03: Fee-vs-gain gating per tier ------------------------------
         // Estimate expected gain for each tier and filter out tiers where
         // the fee exceeds the configured ratio of expected gain.
-        // Use market mid for the gain calculation (avoids A-S skew bias).
+        // [FEEGAIN 2026-09-01] The reference below is the PUBLISHED MID,
+        // and that is now known to be the wrong frame -- kept unchanged
+        // while the shadow above measures it.
+        //
+        // The original rationale was "avoids A-S skew bias". That names a
+        // real effect: tier price is centre*(1 +/- spacing), so scoring
+        // from the POST-A-S centre reports the nominal spacing identically
+        // on both sides and erases the inventory-skew cost exactly where
+        // A-S places it. But the published mid is not a neutral third
+        // option, it is a different frame again, and measured on XCH/DBX
+        // the error it introduces (mean 143.2 bps, max 959) is about
+        // twelve times the skew it avoids (mean 11.8 bps, max 29.9).
+        //
+        // Direction matters most: this gate only ever DROPS tiers, so a
+        // reference farther from the ladder is more PERMISSIVE, not more
+        // conservative. The right reference is the fair-value centre
+        // BEFORE the A-S shift -- pcs.quote_fair_centre_mojos.
+        //
+        // Not changed yet, deliberately: the gate has NEVER fired (zero
+        // "skipped (round-trip fee" lines in any retained log), so there
+        // is nothing to recover, and two sibling guards in this same Step 8
+        // family were mis-diagnosed from control-flow reading alone. See
+        // cpp/include/xop/strategy/tier_gain.hpp, including the SIGN TRAP:
+        // the std::abs below and the frame must be fixed together, because
+        // a signed edge measured from the published mid drops nearly every
+        // bid.
         const Mojo mid = static_cast<Mojo>(std::llround(
             market_data_->get_mid_price(pair_name)
             * static_cast<double>(kMojosPerXch)));
@@ -9871,6 +9907,49 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
 
                 const auto expected_gain = static_cast<std::uint64_t>(
                     std::max(0.0, gain_mojos));
+
+                // [FEEGAIN 2026-09-01] SHADOW. The decision below is
+                // UNCHANGED -- still expected_gain from the published mid.
+                // These score the same tier in the two other frames Step 7
+                // produces, and only a DISAGREEMENT is logged.
+                //
+                // The published mid is not the frame the ladder lives in:
+                // tier price is centre*(1 +/- spacing), and measured on
+                // XCH/DBX the frame error is mean 143.2 bps against an A-S
+                // skew of mean 11.8 bps -- the gate's comment names the
+                // small term and admits one twelve times larger. But the
+                // gate has NEVER fired (zero "skipped (round-trip fee"
+                // lines across every retained log, engine.log included),
+                // so there is nothing to recover and a behaviour change
+                // here would be unmeasured. See tier_gain.hpp, and note
+                // the sign trap documented there before touching the abs.
+                if (pcs.quote_fair_centre_mojos > 0) {
+                    const bool is_ask_cg = (tier.side != Side::Bid);
+                    const auto g_fair = strategy::tier_expected_gain(
+                        static_cast<double>(tier.price),
+                        static_cast<double>(tier.size), is_ask_cg,
+                        static_cast<double>(pcs.quote_fair_centre_mojos),
+                        static_cast<double>(pair_cfg->base_mojos_per_unit));
+                    const bool live_keep = fee_tracker_->should_post_offer(
+                        expected_gain, recommended_fee, block_height);
+                    const bool fair_keep = g_fair.usable
+                        && fee_tracker_->should_post_offer(
+                               g_fair.expected_gain_mojos, recommended_fee,
+                               block_height);
+                    if (live_keep != fair_keep || g_fair.edge_fraction <= 0.0) {
+                        spdlog::warn(
+                            "[Engine] Step 8: {} [FEEGAIN-SHADOW] {} tier {} "
+                            "-- published-mid gain {} (keep={}), fair-centre "
+                            "gain {} edge {:+.1f}bps (keep={}); mid={} "
+                            "fair_centre={} -- decision unchanged, "
+                            "measurement only",
+                            pair_name, is_ask_cg ? "ask" : "bid",
+                            tier.tier_index, expected_gain, live_keep,
+                            g_fair.expected_gain_mojos,
+                            g_fair.edge_fraction * 10'000.0, fair_keep,
+                            mid, pcs.quote_fair_centre_mojos);
+                    }
+                }
 
                 if (fee_tracker_->should_post_offer(
                         expected_gain, recommended_fee, block_height)) {

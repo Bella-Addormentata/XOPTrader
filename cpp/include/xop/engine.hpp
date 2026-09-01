@@ -1305,6 +1305,22 @@ private:
         // cycle; Step 8 treats 0 as "no floor available" and skips the
         // recovery repricing rather than running it unfloored.
         Mojo          quote_mid_mojos{0};
+        // [FEEGAIN 2026-09-01] The centre BEFORE the Avellaneda-Stoikov
+        // reservation shift -- our fair-value estimate, undisplaced.
+        //
+        // quote_mid_mojos above is that same centre AFTER the shift, which
+        // deliberately moves quotes to manage inventory. That is not a
+        // revision of what the asset is worth, so it is the wrong reference
+        // for anything asking "how much edge does this tier carry": tier
+        // price is centre*(1 +/- spacing), so measuring from the shifted
+        // centre reports the nominal spacing identically on both sides and
+        // erases the inventory-skew cost exactly where A-S places it.
+        //
+        // Captured after the peg anchor and the fair-value blend, before
+        // the A-S block -- not blend.center, which is earlier and misses
+        // the peg correction on stablecoin pairs. 0 when Step 7 never
+        // reached the capture point.
+        Mojo          quote_fair_centre_mojos{0};
         double        quote_min_half_spread_bps{0.0};
     };
 
