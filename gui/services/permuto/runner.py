@@ -1067,8 +1067,19 @@ class QuoteRunner:
             # The prohibition is enforced by the per-leg veto below; what
             # assess() needs here is a number that keeps an existing short
             # in REDUCE_ONLY rather than switching the limit off.
-            max_position = (max(cap_usd, 1e-9) / oracle
-                            if oracle and oracle > 0.0 else 0.0)
+            # [review] ...but NOT when there is no configured limit at
+            # all. assess() reads a non-positive max_position as "no
+            # limit", which is precisely what the sentinel means, and
+            # the 1e-9 clamp turned it into a limit of almost zero --
+            # so every nonzero position became REDUCE_ONLY. The clamp
+            # exists for a curfew-FLOORED cap, where zero would read as
+            # "unlimited" and undo the curfew; an unset cap is the
+            # opposite case and wants exactly that reading.
+            if self._max_position_usd > 0.0:
+                max_position = (max(cap_usd, 1e-9) / oracle
+                                if oracle and oracle > 0.0 else 0.0)
+            else:
+                max_position = 0.0          # the sentinel: no limit
             # [audit] REDUCE_ONLY IS A PIN. It quotes one side only, and
             # depth credit is min(bid, ask) -- so the market earns
             # EXACTLY ZERO while it lasts. Overnight that is not a
