@@ -1,7 +1,16 @@
 # XOPTrader Master TODO List
 
 **Created:** 2026-03-24
-**Last audited: 2026-08-29 (v0.10.5)** -- post-release operator-experience round: config hot-reload (a Settings save now applies pair DISABLES to the running engine live, cancelling their resting offers; enables and every other field are honestly reported as restart-required -- the 2026-08-25 "disable landed on disk but the engine kept quoting" hole), and allocation zeroing (a disabled pair's asset is applied as a 0% target while hidden from Target Portfolio Allocation; its saved percent returns when the pair does).
+**Last audited: 2026-09-01 (PRs #132/#133/#135)** -- the Permuto contest
+session. The account was LIQUIDATED to zero equity that morning, so depth
+ended at 4,093.892 against a 300,000,000 gate and no code change can
+restart it without re-funding. Findings **P1-P5** at the end of this file
+are what has to be true before the second account runs: P1 and part of P2
+ship in #135, while P3, P4 and P5 are open and each needs its own PR.
+(#134 audits the same day from the dexie side and numbers its findings
+S38/S39; the two series do not overlap.)
+
+**Previously audited: 2026-08-29 (v0.10.5)** -- post-release operator-experience round: config hot-reload (a Settings save now applies pair DISABLES to the running engine live, cancelling their resting offers; enables and every other field are honestly reported as restart-required -- the 2026-08-25 "disable landed on disk but the engine kept quoting" hole), and allocation zeroing (a disabled pair's asset is applied as a 0% target while hidden from Target Portfolio Allocation; its saved percent returns when the pair does).
 
 **Previously audited: 2026-08-29 (v0.10.0)** -- the seven-PR review cycle merged:
 #115 (peg registry, S29/S30), #117 (S27+S32), #120 (S28), #121 (S31), #118
