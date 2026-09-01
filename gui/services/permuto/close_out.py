@@ -22,8 +22,10 @@ WHAT IT WILL NOT DO, BY CONSTRUCTION.
 TIME IN FORCE. ``ioc`` crosses the spread and is the point: a maker-side
 close is what the loop already attempts and what leaves inventory sitting
 through a reopen gap. The operator pressing this button has decided the
-spread is cheaper than the exposure. ``alo`` is offered for a patient close
-when there is time.
+spread is cheaper than the exposure. ``alo`` is NOT offered: these legs carry no
+limit price, so a post-only instruction has nothing to rest and the venue
+can only reject it. send_close() refuses any tif but ``ioc`` rather than
+advertising a patient close that cannot work.
 """
 
 from __future__ import annotations
@@ -273,6 +275,62 @@ def order_was_accepted(resp: Any) -> tuple:
     return False, "unrecognised order response: %.200r" % (resp,)
 
 
+def filled_size(resp) -> float:
+    """How much of a leg the venue says actually filled, or -1.0.
+
+    [review] An IOC that fills 40 of 100 is not a completed close, but
+    "partially_filled" was accepted as a plain success and no quantity
+    was ever compared -- so a 40/100 fill produced the same result and
+    the same UI text as a full one. The generic "IOC can part-fill"
+    warning is not a substitute for the number: it tells the operator
+    the outcome is possible, not that it happened.
+
+    Returns -1.0 when the venue did not say, which is different from 0.0
+    (it said nothing filled) and must not be rendered as a quantity.
+    """
+    if not isinstance(resp, dict):
+        return -1.0
+    direct = resp.get("filled_size", resp.get("filled"))
+    if direct is not None:
+        try:
+            value = abs(float(direct))
+        except (TypeError, ValueError):
+            return -1.0
+        return value if math.isfinite(value) else -1.0
+    fills = resp.get("fills")
+    if not isinstance(fills, list):
+        return -1.0
+    total = 0.0
+    for fill in fills:
+        if not isinstance(fill, dict):
+            return -1.0
+        try:
+            total += abs(float(fill.get("size", fill.get("qty"))))
+        except (TypeError, ValueError):
+            return -1.0
+    return total if math.isfinite(total) else -1.0
+
+
+class _Legs(list):
+    """The planned legs, plus what rounded away building them.
+
+    A list SUBCLASS rather than a tuple or a dict: every caller already
+    treats the return value as the legs themselves -- they index it, pass
+    it to describe(), hand it to send_close() and JSON it into the worker
+    -- and changing that shape to carry one extra field would touch all of
+    them for no gain. The attribute is additive and invisible to code that
+    does not ask for it.
+    """
+
+    def __new__(cls, legs, rounded_out=()):
+        self = super().__new__(cls, legs)
+        return self
+
+    def __init__(self, legs, rounded_out=()):
+        super().__init__(legs)
+        self.rounded_out = list(rounded_out)
+
+
 def plan_close(positions: dict, fraction: float,
                lot_sizes: Optional[dict] = None) -> list:
     """Legs that would close ``fraction`` of each position.
@@ -286,6 +344,9 @@ def plan_close(positions: dict, fraction: float,
         raise ValueError("fraction must be in (0, 1], got %r" % (fraction,))
     lots = lot_sizes or {}
     legs = []
+    #: Markets whose share rounds below one lot. Attached to the returned
+    #: list so callers can surface them without changing the leg shape.
+    rounded_out: list = []
     for market, signed in sorted(positions.items()):
         if not signed:
             continue
@@ -294,6 +355,15 @@ def plan_close(positions: dict, fraction: float,
         if lot > 0.0:
             size = int(size / lot) * lot
         if size <= 0.0:
+            # [review] An unannotated `continue` here removed a live market
+            # from the confirmation entirely -- {A: 100, B: 1} at 0.25 lists
+            # only A, and the operator is never told B is still open. Worse,
+            # if EVERY market rounds out the plan is empty and describe()
+            # then reports "the venue reports no open positions", which is
+            # the opposite of the truth. Carry the casualties out with the
+            # legs so the dialog can say so.
+            rounded_out.append("%s (%.4g below one lot of %.4g)"
+                               % (market, abs(signed) * fraction, lot))
             continue
         legs.append({
             "market": market,
@@ -302,7 +372,7 @@ def plan_close(positions: dict, fraction: float,
             "size": size,
             "reduce_only": True,
         })
-    return legs
+    return _Legs(legs, rounded_out)
 
 
 def describe(legs: list, prices: Optional[dict] = None) -> str:
@@ -312,7 +382,18 @@ def describe(legs: list, prices: Optional[dict] = None) -> str:
     contract count alone is meaningless when one market trades at 0.15 and
     another at 0.46.
     """
+    rounded = list(getattr(legs, "rounded_out", ()) or ())
     if not legs:
+        # [review] "No open positions" is a claim about the ACCOUNT.
+        # When every market merely rounded below one lot the account
+        # is NOT flat, and saying so on the control an operator uses
+        # to escape is the worst available wording.
+        if rounded:
+            return ("Nothing can be closed at this size -- every "
+                    "position rounds below one lot: "
+                    + "; ".join(rounded)
+                    + ". The exposure is still open; try a larger "
+                      "fraction.")
         return "Nothing to close -- the venue reports no open positions."
     px = prices or {}
     lines, total = [], 0.0
@@ -354,6 +435,10 @@ def describe(legs: list, prices: Optional[dict] = None) -> str:
     elif unpriced:
         lines.append("  (no notional available -- %d leg(s) "
                      "unpriced)" % unpriced)
+    if rounded:
+        lines.append("  NOT included -- below one lot at this size:")
+        for entry in rounded:
+            lines.append("    %s" % entry)
     return "\n".join(lines)
 
 
@@ -450,6 +535,7 @@ def send_close(client: Any, now_s: float, approved_legs: list, *,
 
     responses: list = []
     failed: list = []
+    partial: list = []
     for leg in to_send:
         try:
             resp = client.place_order(leg, now_s)
@@ -463,6 +549,12 @@ def send_close(client: Any, now_s: float, approved_legs: list, *,
                 _log.error("permuto: operator close leg %s refused: %s",
                            leg["market"], detail)
                 failed.append("%s: %s" % (leg["market"], detail))
+            else:
+                got = filled_size(resp)
+                if 0.0 <= got < leg["size"] - 1e-9:
+                    partial.append("%s filled %.4g of %.4g"
+                                   % (leg["market"], got,
+                                      leg["size"]))
         except Exception as exc:  # noqa: BLE001 - shown, not raised
             _log.error("permuto: operator close leg %s failed: %s",
                        leg["market"], exc)
@@ -475,15 +567,23 @@ def send_close(client: Any, now_s: float, approved_legs: list, *,
     # to nothing -- is precisely the report that gets someone to walk away
     # from a position they believe they closed.
     skipped_note = ("skipped %s" % "; ".join(skipped)) if skipped else ""
+    # [review] A part-fill is not a completed close, and the operator
+    # cannot see it anywhere else -- the leg was accepted, so it is
+    # counted in `sent`. Name the quantities.
+    if partial:
+        part_note = "PARTIAL -- %s" % "; ".join(partial)
+        skipped_note = ("%s (%s)" % (part_note, skipped_note)
+                        if skipped_note else part_note)
     if failed:
         note = "partial: %s" % "; ".join(failed)
         if skipped_note:
             note = "%s (%s)" % (note, skipped_note)
         return {"ok": False, "sent": sent, "note": note,
                 "legs": to_send, "responses": responses,
-                "skipped": skipped}
+                "skipped": skipped, "partial": partial}
     return {"ok": True, "sent": sent, "note": skipped_note,
-            "legs": to_send, "responses": responses, "skipped": skipped}
+            "legs": to_send, "responses": responses, "skipped": skipped,
+            "partial": partial}
 
 
 def close_positions(client: Any, now_s: float, fraction: float, *,

@@ -301,3 +301,29 @@ def test_quoting_starts_normally_when_no_close_is_running(monkeypatch):
         # is that the guard did NOT refuse before getting there.
         pass
     assert not [r for r in refusals if "close is in flight" in r], refusals
+
+
+def test_lot_sizes_reject_anything_not_finite_and_positive(monkeypatch):
+    """[review] `lot == lot` rejects NaN and lets +inf through.
+
+    An infinite lot is not a harmless oddity here: plan_close divides by
+    it, so every size floors to zero, every market rounds out, and a fully
+    loaded account renders as nothing to close -- on the control an
+    operator reaches for to get out. Junk venue metadata must fall back to
+    the published grid, not silently empty the plan.
+    """
+    from gui.widgets.permuto import _default_lot_sizes
+
+    monkeypatch.setattr(
+        "gui.services.permuto.live._default_venue_state",
+        lambda: {"flags": {"specs": {
+            "GOOD-PERP": {"lot_size": 5.0},
+            "INF-PERP": {"lot_size": float("inf")},
+            "NAN-PERP": {"lot_size": float("nan")},
+            "ZERO-PERP": {"lot_size": 0.0},
+            "NEG-PERP": {"lot_size": -1.0},
+            "TEXT-PERP": {"lot_size": "big"},
+            "NULL-PERP": {"lot_size": None},
+            "JUNK-PERP": "not a dict",
+        }}})
+    assert _default_lot_sizes() == {"GOOD-PERP": 5.0}

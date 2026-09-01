@@ -29,6 +29,7 @@ public result.
 
 from __future__ import annotations
 
+import math
 import hashlib
 import logging
 import time
@@ -497,7 +498,11 @@ def _default_lot_sizes() -> dict:
             lot = float(spec.get("lot_size"))
         except (TypeError, ValueError):
             continue
-        if lot > 0.0 and lot == lot:
+        # [review] `lot == lot` rejects NaN and lets +inf straight through
+        # -- and an infinite lot floors EVERY size to zero in plan_close,
+        # so a live account renders as nothing to close. Exactly the
+        # fail-open this module keeps producing; finiteness is the test.
+        if math.isfinite(lot) and lot > 0.0:
             lots[market] = lot
     return lots
 

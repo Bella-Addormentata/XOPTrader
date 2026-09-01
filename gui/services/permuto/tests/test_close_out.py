@@ -3,7 +3,7 @@
 import pytest
 
 from gui.services.permuto.close_out import (
-    ClosePayloadError, order_was_accepted,
+    ClosePayloadError, filled_size, order_was_accepted,
     close_positions, describe, plan_close, read_positions, send_close,
 )
 
@@ -13,6 +13,9 @@ class _Client:
         self.payload = payload
         self.sent = []
         self.fail = fail
+        #: Overridable so a test can hand back a real venue body
+        #: (a part-fill, a refusal) instead of a bare success.
+        self.order_response = {"status": "ok"}
 
     def account(self, now_s):
         return self.payload
@@ -21,7 +24,7 @@ class _Client:
         if self.fail:
             raise RuntimeError("venue said no")
         self.sent.append(leg)
-        return {"status": "ok"}
+        return self.order_response
 
 
 def _pos(market, side, size):
@@ -435,3 +438,60 @@ def test_a_stated_rejection_still_wins_over_an_id():
     assert order_was_accepted(
         {"order_id": 1, "rejection_reason": "reduce-only would increase"}
     )[0] is False
+
+
+def test_a_market_rounded_below_one_lot_is_named_not_dropped():
+    """[review] An unannotated `continue` removed a live market from the
+    confirmation. The operator approves what the dialog lists, so a
+    position that never appears is a position they believe is closing."""
+    legs = plan_close({"A": 100.0, "B": 1.0}, 0.25, {"A": 1.0, "B": 1.0})
+    assert [leg["market"] for leg in legs] == ["A"]
+    assert legs.rounded_out and "B" in legs.rounded_out[0]
+    text = describe(legs, {"A": 0.07})
+    assert "NOT included" in text and "B" in text, text
+
+
+def test_everything_rounding_out_is_not_reported_as_a_flat_account():
+    """The worst wording available: "the venue reports no open positions"
+    is a claim about the ACCOUNT, and the account is not flat -- the
+    fraction was just too small to reach one lot."""
+    legs = plan_close({"B": 1.0}, 0.25, {"B": 1.0})
+    assert list(legs) == []
+    text = describe(legs)
+    assert "no open positions" not in text, text
+    assert "still open" in text and "one lot" in text, text
+
+
+def test_a_partial_fill_is_reported_as_partial():
+    """[review] partially_filled was accepted as a plain success and no
+    quantity was ever compared, so 40 of 100 read exactly like 100."""
+    c = _Client({"positions": [_pos("QQQ-VOL-PERP", "sell", 100)]})
+    c.order_response = {"action": "partially_filled", "order_id": 7,
+                        "fills": [{"size": 40}]}
+    legs = plan_close({"QQQ-VOL-PERP": -100.0}, 1.0)
+    res = send_close(c, 0.0, legs)
+    assert res["ok"] is True                      # the leg WAS accepted
+    assert res["partial"], "a 40/100 fill was reported as a full close"
+    assert "40" in res["note"] and "100" in res["note"], res["note"]
+
+
+def test_a_full_fill_is_not_flagged_partial():
+    c = _Client({"positions": [_pos("QQQ-VOL-PERP", "sell", 100)]})
+    c.order_response = {"action": "filled", "order_id": 7,
+                        "fills": [{"size": 100}]}
+    legs = plan_close({"QQQ-VOL-PERP": -100.0}, 1.0)
+    assert not send_close(c, 0.0, legs)["partial"]
+
+
+def test_a_venue_that_does_not_state_fills_is_not_guessed_at():
+    """-1.0, not 0.0: "it did not say" and "nothing filled" are different
+    facts, and rendering the first as a quantity would invent one."""
+    assert filled_size({"action": "placed"}) == -1.0
+    assert filled_size({"fills": "lots"}) == -1.0
+    assert filled_size(None) == -1.0
+    assert filled_size({"fills": [{"size": 10}, {"size": 5}]}) == 15.0
+    assert filled_size({"filled_size": 12}) == 12.0
+    c = _Client({"positions": [_pos("QQQ-VOL-PERP", "sell", 100)]})
+    c.order_response = {"action": "placed", "order_id": 7}
+    legs = plan_close({"QQQ-VOL-PERP": -100.0}, 1.0)
+    assert not send_close(c, 0.0, legs)["partial"]
