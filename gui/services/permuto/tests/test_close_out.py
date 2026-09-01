@@ -585,3 +585,25 @@ def test_a_malformed_fills_field_is_not_acceptance():
     assert order_verdict({"fills": [{"size": 10}]})[0] == "accepted"
     # ...and the two functions now agree about the malformed case.
     assert filled_size({"fills": "lots"}) == -1.0
+
+
+def test_a_boolean_size_is_malformed_not_one_contract():
+    """[review] bool subclasses int, so float(True) == 1.0.
+
+    A malformed {market: true} therefore became a real one-contract
+    exposure and could generate a close order from junk -- the eleventh
+    variant of the same fail-open in this module, and the exact inverse
+    of what the parser promises. Both payload shapes must refuse it, or
+    the operator cannot tell which one they got.
+    """
+    # dict shape
+    with pytest.raises(ClosePayloadError):
+        read_positions(_Client({"positions": {"A": True}}), 0.0)
+    with pytest.raises(ClosePayloadError):
+        read_positions(_Client({"positions": {"A": False}}), 0.0)
+    # list shape
+    with pytest.raises(ClosePayloadError):
+        read_positions(_Client({"positions": [
+            {"market": "A", "side": "sell", "size": True}]}), 0.0)
+    # ...and a genuine numeric size is still read normally.
+    assert read_positions(_Client({"positions": {"A": -5.0}}), 0.0) == {"A": -5.0}

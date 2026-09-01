@@ -130,6 +130,14 @@ def read_positions(client: Any, now_s: float) -> dict:
                     continue        # genuinely flat: nothing to misreport
                 unreadable.append("(no market) %r" % (raw,))
                 continue
+            # [review] A BOOL IS NOT A SIZE. bool subclasses int, so
+            # float(True) == 1.0 and {market: true} became a real
+            # one-contract exposure -- a malformed payload generating
+            # a close order, which is the exact opposite of this
+            # parser's contract. The eleventh member of this family.
+            if isinstance(raw, bool):
+                unreadable.append("%s (size %r)" % (name, raw))
+                continue
             try:
                 signed = float(raw)
             except (TypeError, ValueError):
@@ -193,6 +201,12 @@ def read_positions(client: Any, now_s: float) -> dict:
             raw_size = row.get("position")
         if raw_size is None:
             unreadable.append("%s (no size field)" % market)
+            continue
+        if isinstance(raw_size, bool):
+            # Same reasoning as the dict branch above; the two shapes
+            # have to fail closed identically or the operator cannot
+            # tell which one they got.
+            unreadable.append("%s (size %r)" % (market, raw_size))
             continue
         try:
             size = abs(float(raw_size))

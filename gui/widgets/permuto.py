@@ -700,8 +700,12 @@ class _CloseWorker(QObject):
             # it was protecting. send_close() records the pre-send plan;
             # this records what came back.
             _log.warning(
-                "permuto: OPERATOR CLOSE RESULT -- ok=%s sent=%s unresolved=%s refused=%s note=%s",
+                "permuto: OPERATOR CLOSE RESULT -- ok=%s sent=%s unresolved=%s partial=%s note=%s",
                 result.get("ok"), result.get("sent"),
+                # [review] These are PART-FILLS, not refusals -- the
+                # field was mislabelled, so the audit record showed
+                # partial fills as refusals and refusals as nothing at
+                # all. Refusal detail lives in `note`.
                 result.get("unknown"), result.get("partial"),
                 result.get("note"))
             self.sent.emit(result)
