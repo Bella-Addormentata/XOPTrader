@@ -2022,3 +2022,53 @@ def test_widened_quote_with_max_skew_still_stays_inside_the_ring():
         assert dev <= 2.0 + 1e-9, (
             "leg %r sits %.4f%% out at max skew+backoff -- outside the 2%% "
             "credit ring, it rests and earns nothing" % (leg, dev))
+
+def test_a_failed_batch_envelope_does_not_decay_the_backoff():
+    """[review] The ROWS describe legs; the ENVELOPE says whether the venue
+    took them, and only the envelope can answer that.
+
+    A known batch_failed response can still report every row as "placed",
+    so without gating on `accepted` an explicit venue refusal decayed the
+    learned offset exactly as though the batch had rested.
+    """
+    def crossed(legs):
+        return {"status": "batch_ok",
+                "results": [{"action": "placed", "rejection_reason":
+                             "Post-only order would cross the book."}
+                            for _ in legs]}
+
+    c = _Client(account=_account(100.0), batch_response=crossed)
+    r = _runner(c, curfew_enabled=True)
+    r.tick(_MID_SESSION, _ORACLE, {})
+    widened = r._cross_backoff.offset_pct(_MKT)
+    assert widened > 0.0
+
+    # Rows all look clean, but the ENVELOPE is an explicit failure.
+    c.batch_response = lambda legs: {
+        "status": "batch_failed",
+        "results": [{"action": "placed"} for _ in legs]}
+    r._resting = {}
+    r.tick(_MID_SESSION + 5.0, _ORACLE, {})
+    assert r._cross_backoff.offset_pct(_MKT) == widened,         "a batch_failed envelope with clean-looking rows decayed the backoff"
+
+
+def test_junk_tick_metadata_cannot_disable_the_backoff():
+    """[review] `float(raw or default)` is not a fallback: NaN is TRUTHY.
+
+    A non-finite tick_size therefore sailed through, made the reservation
+    NaN, and headroom_pct returned zero -- which makes observe_cross CLEAR
+    the learned offset. Meanwhile quote_ladder validated and quietly used
+    0.0001, so bad venue metadata disabled the crossing defence while the
+    quote itself carried on as if nothing were wrong.
+    """
+    def crossed(legs):
+        return {"status": "batch_ok",
+                "results": [{"action": "placed", "rejection_reason":
+                             "Post-only order would cross the book."}
+                            for _ in legs]}
+
+    c = _Client(account=_account(100.0), batch_response=crossed)
+    r = _runner(c, curfew_enabled=True)
+    flags = {"specs": {_MKT: {"tick_size": float("nan"), "lot_size": 1.0}}}
+    r.tick(_MID_SESSION, _ORACLE, flags)
+    assert r._cross_backoff.offset_pct(_MKT) > 0.0,         "junk tick metadata cleared the backoff instead of falling back"

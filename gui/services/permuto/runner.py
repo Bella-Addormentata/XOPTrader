@@ -96,6 +96,25 @@ BATCH_ACCEPTED = ("batch_ok", "batch_partial", "batch_upserted")
 BATCH_REJECTED = ("batch_failed", "batch_rejected", "error")
 
 
+def _effective_tick(raw, default: float = 0.0001) -> float:
+    """The tick quote_ladder will actually use, decided once.
+
+    [review] Two callers derived this independently and disagreed on junk:
+    `float(raw or default)` passes NaN straight through, because NaN is
+    truthy, while quote_ladder validates and falls back. So a non-finite
+    tick_size disabled the crossing backoff -- headroom of zero clears the
+    learned offset -- while the ladder priced on 0.0001 as if nothing were
+    wrong. Same value to both, or they will drift again.
+    """
+    try:
+        tick = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(tick) or tick <= 0.0:
+        return default
+    return tick
+
+
 def _is_cross_refusal(reason: str) -> bool:
     """True when the venue refused this leg for crossing the book.
 
@@ -903,8 +922,17 @@ class QuoteRunner:
             # that is headroom_pct's job.
             self._last_skew[market] = risk.skew
             # [review] Reserve the worst-case ask-ceil rounding margin so
-            # headroom_pct accounts for the one tick quote_ladder adds.
-            _tick = float(spec.get("tick_size", 0.0001) or 0.0001)
+            # headroom_pct accounts for the one tick quote_ladder adds --
+            # from the EFFECTIVE tick, the same one the ladder will use.
+            #
+            # `float(spec.get(...) or 0.0001)` looked like a fallback and is
+            # not one: NaN is truthy, so a non-finite tick_size sailed
+            # through as NaN, made _last_tick_frac NaN, and headroom_pct
+            # then returned zero -- which makes observe_cross CLEAR the
+            # learned backoff. Meanwhile quote_ladder validates and quietly
+            # uses 0.0001, so bad venue metadata disabled the crossing
+            # defence while the quote itself carried on regardless.
+            _tick = _effective_tick(spec.get("tick_size"))
             self._last_tick_frac[market] = (
                 _tick / max(float(oracle or 1e-12), 1e-12))
             ladder = quote_ladder(
@@ -913,7 +941,7 @@ class QuoteRunner:
                 first_offset_pct=(self._half_spread_pct
                                   + self._cross_backoff.offset_pct(market)),
                 ring_pct=self._ring_pct,
-                tick_size=spec.get("tick_size", 0.0001),
+                tick_size=_tick,
                 lot_size=spec.get("lot_size", 1.0),
             )
             if risk.action is RiskAction.REDUCE_ONLY:
@@ -1328,9 +1356,17 @@ class QuoteRunner:
                                          self._half_spread_pct,
                                          self._last_skew.get(mkt, 0.0),
                                          self._last_tick_frac.get(mkt, 0.0)))
-                    elif mkt in seen and mkt not in dirty:
+                    elif accepted and mkt in seen and mkt not in dirty:
                         # Only a market whose every row came back present and
                         # ACCEPTED has actually demonstrated it rests.
+                        #
+                        # [review] `accepted` gates this, and it has to: a
+                        # known batch_failed envelope can still report every
+                        # row as "placed", so without the gate an explicit
+                        # venue refusal decayed the learned offset as though
+                        # the batch had rested. The rows describe legs; the
+                        # envelope describes whether the venue took them,
+                        # and only the envelope can answer that.
                         self._cross_backoff.observe_clean(mkt)
 
             credit_usd = _credit_for(rested)
