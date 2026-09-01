@@ -350,6 +350,25 @@ class OracleFreeze:
             return False
         return changed_at > boundary_s
 
+    def market_gone_quiet(self, market: str, now_s: float) -> bool:
+        """Did this market print and then STOP?
+
+        [review] Distinct from market_frozen(), which reports an UNSEEN
+        market as frozen -- correct for the post-bell gate, where the
+        question is "has it printed since the open?", and wrong as a
+        general in-session gate, where it would refuse to quote anything
+        until a second distinct value had been observed. A market we have
+        never seen move is absence of evidence, not evidence of staleness.
+
+        This is the one to use when asking "has a live market gone quiet
+        while its neighbours carry on?" -- the case the aggregate freeze
+        detector cannot see, because it resets whenever ANY market moves.
+        """
+        changed_at = self._changed_at_by_market_s.get(market)
+        if changed_at is None:
+            return False
+        return (now_s - changed_at) >= self.confirm_s
+
     def market_frozen(self, market: str, now_s: float) -> bool:
         """True once this market has not changed for `confirm_s`.
 

@@ -842,7 +842,14 @@ class QuoteRunner:
                 fresh = bool(opened) and self._freeze.changed_since(
                     market, max(opened))
             else:
-                fresh = not self._freeze.market_frozen(market, now_s)
+                # [review] gone_quiet, not market_frozen. The gate must
+                # outlive SETTLING -- the aggregate detector keeps the
+                # curfew in SESSION while ANY market prints, so a
+                # neighbour that stops is quoted against its own stale
+                # price indefinitely -- but an UNSEEN market must not be
+                # treated as stale, or the loop refuses to quote anything
+                # until it has watched a second distinct value arrive.
+                fresh = not self._freeze.market_gone_quiet(market, now_s)
             market_profile = profile_for(
                 posture_stage,
                 oracle_fresh=fresh,

@@ -146,6 +146,31 @@ def profile_for(stage: Stage, *, oracle_fresh: bool = True) -> Profile:
                    "inventory carried past the bell costs the overnight "
                    "window, which is where depth is actually earned")
 
+    # [review] THE GATE MUST NOT EXPIRE WITH SETTLING. It was checked only
+    # in that stage, so fifteen minutes after the bell it stopped applying
+    # -- and the aggregate freeze detector keeps the curfew in SESSION as
+    # long as ANY market prints, so a neighbour that has gone quiet was
+    # quoted against its own stale price indefinitely. The narrow version
+    # of this bug (a market that never printed since the open) is just its
+    # first fifteen minutes.
+    #
+    # The rule generalises: a frozen oracle is EXPECTED in the stages built
+    # around one -- CLOSED is the overnight earning window and PREOPEN is
+    # the run-up to the bell -- and is a stale-price trap in every stage
+    # that implies a live session.
+    # SETTLING is handled by the stricter branch below -- it has an actual
+    # boundary to be after, so "printed since the bell" beats "has not gone
+    # quiet". Listing it here too would shadow that with the weaker test
+    # and the more general message.
+    if not oracle_fresh and stage in (Stage.SESSION, Stage.RAMP,
+                                      Stage.UNSCHEDULED):
+        return Profile(
+            quote=False, spread_mult=SESSION_SPREAD_MULT, depth_mult=0.0,
+            withdraw=True,
+            reason="this market's own oracle has stopped printing while "
+                   "the session is live; quoting against it is the "
+                   "stale-price trap, whatever the neighbours are doing")
+
     if stage is Stage.SETTLING and not oracle_fresh:
         return Profile(
             quote=False, spread_mult=SESSION_SPREAD_MULT, depth_mult=0.0,

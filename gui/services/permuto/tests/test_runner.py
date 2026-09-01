@@ -2286,3 +2286,40 @@ def test_a_post_bell_print_does_satisfy_it():
     r.tick(open_s + 10.0, {_MKT: 0.085}, {})        # a genuine post-bell move
     res = r.tick(open_s + 30.0, {_MKT: 0.085}, {})
     assert res.markets.get(_MKT, ("", ""))[0] != "withdraw", res.markets
+
+
+def test_a_market_that_goes_quiet_MID_SESSION_stops_being_quoted():
+    """[review] The gate must outlive SETTLING.
+
+    The aggregate freeze detector resets whenever ANY market prints, so
+    the curfew stays in SESSION while one symbol carries the venue -- and
+    a neighbour that stopped printing was quoted against its own stale
+    price indefinitely. The narrow bug (never printed since the open) is
+    just the first fifteen minutes of this one.
+    """
+    c = _Client(account=_account(0.0), batch_response=_venue_ok())
+    r = _runner(c, curfew_enabled=True)
+    base = _MID_SESSION
+    # Both markets alive, then _MKT goes silent while _MKT2 keeps printing.
+    r.tick(base, {_MKT: 0.070, _MKT2: 0.200}, {})
+    r.tick(base + 10.0, {_MKT: 0.071, _MKT2: 0.201}, {})
+    for i in range(1, 8):                       # well past FREEZE_CONFIRM_S
+        r.tick(base + 10.0 + i * 40.0,
+               {_MKT: 0.071, _MKT2: 0.201 + i * 0.001}, {})
+    res = r.tick(base + 400.0, {_MKT: 0.071, _MKT2: 0.210}, {})
+    assert res.markets.get(_MKT, ("", ""))[0] == "withdraw", res.markets
+    assert "stopped printing" in res.markets[_MKT][1], res.markets[_MKT]
+
+
+def test_a_market_never_yet_observed_is_not_treated_as_stale():
+    """Absence of evidence is not evidence of staleness.
+
+    market_frozen() reports an unseen market as frozen, which is right for
+    the post-bell gate and wrong here: using it as the general in-session
+    test refused to quote anything until a second distinct value had been
+    seen, and broke 59 tests saying so.
+    """
+    c = _Client(account=_account(0.0), batch_response=_venue_ok())
+    r = _runner(c, curfew_enabled=True)
+    res = r.tick(_MID_SESSION, _ORACLE, {})     # the very first tick
+    assert res.markets.get(_MKT, ("", ""))[0] == "quote", res.markets
