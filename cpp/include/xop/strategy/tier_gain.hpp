@@ -117,9 +117,22 @@ struct TierGain {
     }
     // Clamp rather than wrap: the product is a fraction times a mojo size
     // times a scale factor, and neither operand alone bounds it.
-    constexpr double kMaxU64 = 18'446'744'073'709'551'000.0;
+    //
+    // 2^63, NOT a value near UINT64_MAX. [caught by CI on GCC, 2026-09-01]
+    // An earlier revision clamped at 18'446'744'073'709'551'000.0, reasoning
+    // that it sits below UINT64_MAX. It does as an integer; it does not as a
+    // DOUBLE. Doubles are spaced 2048 apart up there, so that literal rounds
+    // to exactly 2^64 = 18'446'744'073'709'551'616 -- one greater than
+    // UINT64_MAX -- and the cast is undefined. MSVC happened to yield a
+    // large value and the test passed locally; GCC yielded 0, which is the
+    // precise failure the clamp exists to prevent, introduced by the clamp.
+    //
+    // 2^63 is exactly representable, comfortably below UINT64_MAX, and far
+    // beyond any real gain (a fill worth 9.2 billion XCH). Saturating there
+    // is indistinguishable from saturating higher for every caller.
+    constexpr double kMaxSafeGain = 9'223'372'036'854'775'808.0;  // 2^63
     g.expected_gain_mojos = static_cast<std::uint64_t>(
-        std::min(mojos, kMaxU64));
+        std::min(mojos, kMaxSafeGain));
     return g;
 }
 

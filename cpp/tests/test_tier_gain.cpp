@@ -189,7 +189,28 @@ TEST(TierGain, AnAbsurdProductClampsRatherThanWrapping)
     // The product is a fraction times a size times a scale factor and no
     // operand alone bounds it. Wrapping a uint64 here would turn an enormous
     // gain into a tiny one and drop the tier.
+    //
+    // [CI, GCC, 2026-09-01] This test PASSED on MSVC and FAILED on GCC while
+    // the clamp constant was a literal near UINT64_MAX: doubles are spaced
+    // 2048 apart at that magnitude, so it rounded to exactly 2^64 -- one
+    // above UINT64_MAX -- making the cast undefined. The clamp introduced
+    // the wrap it was written to prevent, and only a second toolchain
+    // exposed it. Pinned with a platform-independent bound.
     const auto g = tier_expected_gain(1e18, 1e18, kAsk, 1.0, 1e-6);
     EXPECT_TRUE(g.usable);
     EXPECT_GT(g.expected_gain_mojos, 0u) << "must not wrap to a small value";
+    // Saturates at 2^63 rather than at some UB-dependent value.
+    EXPECT_EQ(g.expected_gain_mojos, 9'223'372'036'854'775'808ULL);
+}
+
+TEST(TierGain, TheSaturationBoundIsExactlyRepresentableAndBelowTheMax)
+{
+    // Guard the constant itself, since the defect was in the constant and
+    // not in the logic around it. A double that rounds above UINT64_MAX
+    // makes the cast undefined no matter how careful the surrounding code.
+    constexpr double kBound = 9'223'372'036'854'775'808.0;   // 2^63
+    EXPECT_EQ(static_cast<std::uint64_t>(kBound), 9'223'372'036'854'775'808ULL)
+        << "the bound must survive the round trip exactly";
+    EXPECT_LT(kBound, static_cast<double>(
+                          std::numeric_limits<std::uint64_t>::max()));
 }
