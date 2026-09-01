@@ -873,6 +873,25 @@ class QuoteRunner:
                     self._resting[market] = RestingQuote()
                 self._curfew_retract_pending = False
                 retracted = True
+                # [review] AND EVERY HOLD IS NOW STALE. `results` was
+                # decided against the book that existed a moment ago,
+                # and HOLD means "what is resting is fine" -- but
+                # nothing is resting any more. The earlier fix only
+                # covered the case where EVERY market held, because it
+                # hung off `not any_quoted`; with one market QUOTE and
+                # another HOLD the loop rebuilt the first, left the
+                # second empty for a tick, and still reported "quote".
+                #
+                # Rebuilding immediately beats waiting a tick: the
+                # book is empty either way, and a tick of it is a tick
+                # of no depth on every market at once.
+                for market, (action, _reason) in list(results.items()):
+                    if action == LoopAction.HOLD.value:
+                        results[market] = (
+                            LoopAction.QUOTE.value,
+                            "book retracted for a curfew stage change; "
+                            "rebuilding under the new posture")
+                        any_quoted = True
                 if self._curfew is not None:
                     self._curfew_stage = self._curfew.stage
                     self._curfew_stage_key = (

@@ -2661,11 +2661,21 @@ def test_the_stage_change_retraction_does_not_report_a_live_book(monkeypatch):
 
     res = r.tick(OPENS_UTC[1] - 1_800.0, _ORACLE, {})
 
-    assert r._resting[_MKT].empty, "the retraction did not empty the book"
+    # [review] The tick now REBUILDS rather than reporting a bare
+    # withdrawal: `results` was decided against the pre-cancel book, so
+    # every stale HOLD becomes QUOTE and the book goes back out in the
+    # same tick. Waiting a tick would mean a tick of no depth on every
+    # market at once, and the earlier version of this fix only covered
+    # the all-HOLD case anyway -- a mixed QUOTE/HOLD transition left
+    # the holding market empty while still reporting "quote".
+    #
+    # What must never happen is the ORIGINAL bug: claiming a resting
+    # book that is not there.
     assert res.action != "hold", (
         "reported a resting book on the tick that cancelled it")
-    assert res.action == "withdraw", res.action
-    assert all(a == "withdraw" for a, _ in res.markets.values()), res.markets
+    assert not r._resting[_MKT].empty, (
+        "the book was cancelled and not rebuilt: %s" % res.action)
+    assert res.action == "quote", res.action
 
 
 def test_one_print_after_the_bell_does_not_buy_the_whole_settle_window():
@@ -3102,3 +3112,42 @@ def test_an_unset_cap_does_not_force_reduce_only_on_a_held_position():
     assert sides == ["buy", "sell"], (
         "a held position under the no-limit sentinel was forced "
         "reduce-only: %s" % sides)
+
+
+def test_a_mixed_quote_hold_transition_rebuilds_every_market(monkeypatch):
+    """[review] The earlier fix only covered the all-HOLD case.
+
+    It hung off `not any_quoted`, so with ONE market deciding QUOTE and
+    another HOLD, the quoting loop rebuilt the first and left the second
+    empty for a tick -- while the tick reported top-level "quote", which
+    is the same lie the all-HOLD case was fixed for, just harder to see.
+
+    `results` is decided against the book that existed before the
+    stage-change retraction cancelled everything, and HOLD means "what is
+    resting is fine". After the cancel nothing is resting, so every HOLD
+    is stale by construction.
+    """
+    from gui.services.permuto.quoting import LoopAction, QuoteDecision
+
+    c = _Client(account=_account(100.0))
+    r = _runner2(c, curfew_enabled=True, max_position_usd=12_000.0)
+
+    # _MKT holds, _MKT2 quotes -- the mixed case.
+    def _mixed(view, resting, **kw):
+        if getattr(view, "market", None) == _MKT2:
+            return QuoteDecision(LoopAction.QUOTE, "no quote resting")
+        return QuoteDecision(LoopAction.HOLD, "two-sided and in ring")
+
+    r.tick(_OVERNIGHT, {_MKT: 0.07, _MKT2: 0.07}, {})
+    monkeypatch.setattr("gui.services.permuto.runner.decide", _mixed)
+    r._curfew_retract_pending = True
+
+    res = r.tick(OPENS_UTC[1] - 1_500.0, {_MKT: 0.07, _MKT2: 0.07}, {})
+
+    holding = [m for m, (a, _) in res.markets.items() if a == "hold"]
+    assert not holding, (
+        "a market still says HOLD after its book was cancelled: %s" % holding)
+    for market in (_MKT, _MKT2):
+        assert not r._resting[market].empty, (
+            "%s was cancelled and left empty while the tick reported %r"
+            % (market, res.action))
