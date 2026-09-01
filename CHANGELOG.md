@@ -127,24 +127,105 @@ microstructure literature behind it.
   assumption rather than an observation, and ~19% of the August tape is
   our own fills.
 - **`scripts/byc_price_diagnostic.py`** — read-only. Re-derives the
-  "7-day traded VWAP 1.001" figure that three places cite as ground truth
-  and no code path produces, and reports the executable depth near par
-  that a VWAP cannot. Sample size printed beside every statistic.
+  "7-day traded VWAP 1.001" figure that **five** sites cite as ground truth
+  and no code path produces (`par_anchor.hpp`, `config.hpp`, `engine.cpp`'s
+  `quote_usd_factor`, `test_fair_value.cpp`, `config.yaml`), and reports the
+  executable depth near par that a VWAP cannot. Sample size printed beside
+  every statistic.
 - **`scripts/highlow_spread_estimator.py`** — read-only Corwin-Schultz and
-  Abdi-Ranaldo estimators over `price_high`/`price_low`, which the engine
-  already fetches and then discards unread. Diagnostic only: their value
-  is falsification, since they structurally cannot return 10,769 bps.
+  Abdi-Ranaldo estimators. Their inputs are **not** `price_high`/`price_low`:
+  those are fetched and discarded unread by the engine, but a dexie 24h
+  high/low is a single bar and both estimators need two consecutive ones, so
+  the optional `--dexie` flag is a separate range check that cannot drive
+  either estimator. The multi-day bars come from the third-party BBO series
+  we already store — `offer_log.book_best_bid`/`book_best_ask`, or
+  `snapshots.mid_price_mojos` + `spread_bps`, which invert to the same two
+  sides exactly. So these are **quote samples standing in for trade prices**,
+  outside the regime either estimator was derived for; the script says so in
+  its own output and the caveat stays in front, not buried. Diagnostic only,
+  and the value is falsification rather than measurement — the gap is what
+  argues, not the level. Measured on XCH/BYC 2026-09-01 over 20 adjacent day
+  pairs: a posted 14,977 bps against a widest estimate of 1,820 bps, 8.2×.
+  Under the default `quote-touch` bars that estimate is an *upper* bound on
+  the range, so the gap holds a fortiori.
 - **`get_trades()` sort fix.** It passed `date_completed_desc`, which the
   dexie API does not recognise and silently ignores, so it returned an
   arbitrary page rather than recent trades. The valid value is
   `date_completed`, already descending. The function still has no callers,
   and now says why.
 
-Not changed, on purpose: no `enabled:` flag was flipped. BYC's pairs are
-off because the operator turned them off on 2026-08-31, which is a
-liquidity decision and not a code problem. Nothing here argues for
-re-enabling them — the ask side of that book is at par while nothing is
-bid above $0.30, and we hold 52.58 BYC.
+### The `enabled:` flags, and the one deployment order that matters
+
+Nothing in this entry argues for or against quoting BYC — that is a
+liquidity decision and not a code problem. The operator made it separately:
+**XCH/BYC was re-enabled on 2026-09-01**, and BYC/wUSDC.b stays off.
+
+**The re-enable is inert until the engine restarts, and that restart must
+come after this PR is merged, built and deployed.** `[RELOAD]` disables a
+pair live but refuses to enable one — it logs "restart the engine to start
+quoting it" and carries on. On the pre-PR binary a restart with the flag set
+reproduces 2026-08-30 exactly: the ladder self-crosses and drops every tier,
+then the mojo-scale bug latches a **false** depeg about ten minutes in and
+cancels every offer on every pair touching BYC, and that bogus valuation
+feeds the 10% drawdown breaker — which pauses the **whole engine** and takes
+XCH/DBX, the only earning pair, down with it. Every link in that chain is
+addressed above. Merge, build, deploy, *then* restart.
+
+The two sides are not symmetric, and there is no per-pair one-sided switch,
+so enabling turns on both. In the pair's own orientation (price = BYC per
+XCH) a **bid** pays BYC to buy XCH, which sells our 52.58 BYC at about $1.01
+into the honest side of the book — an exit at par, and the reason to be
+here. An **ask** accumulates more BYC, and there is no exit for that:
+nothing bids for BYC above about $0.29. Rising BYC inventory is the signal
+to turn it back off.
+
+BYC/wUSDC.b remains disabled for an unrelated reason: the 2026-08-25
+warp.green bridge compromise depegged wUSDC.b (~$0.80 on 2026-09-01) and the
+pair has had no print since 2026-08-24, so it would be quoting into a dead
+book through a broken denominator.
+
+### Retention would have deleted half the history it was asked to keep
+
+Retention had not run since 2026-05-16, so raw history reached back to
+2026-04-03 while the default window was 120 days. The next run — no flag
+typed differently, nothing to review — would have deleted **91,244 of
+207,787** `snapshots` rows (43.9%) and **363,374** `strategy_quotes` rows
+(29.0%), including all of April: the densest month of the very BYC book
+history the new diagnostics read.
+
+- **The hazard was never the retention number.** A long gap between runs
+  silently converts a routine window into a bulk deletion, and the loss grows
+  exactly while nobody is watching. So the guard is proportional rather than
+  a bigger constant: a run that would delete more than 25% of a raw table
+  refuses, prints per-breached-table counts, percentages and each table's own
+  oldest surviving row, and exits 3 without touching the database. A steady
+  daily run removes a day at a time and never approaches the bound.
+- Rows are **counted before deleting**. `cur.rowcount` reports the damage
+  after it is done, which is no use to a guard, and the refusal has to happen
+  before any `DELETE` so the rollback is empty rather than merely correct.
+  The refusal rolls back explicitly — the rollup UPSERTs already ran in the
+  same transaction and are the half that could otherwise survive.
+- Two deliberate escapes: widen `--raw-retention-days` to keep the history,
+  or `--confirm-large-prune` to delete it on purpose.
+- **`--backup` was unsafe in exactly the situation it exists for.** It used
+  `shutil.copy2` on a database running in WAL mode against a live engine,
+  copying only `xop_trader.db` and leaving the `-wal` file behind — 15 MB of
+  committed-but-uncheckpointed pages at the time of the change. The backup
+  taken before a destructive operation would have been missing the most
+  recent writes and torn besides. Now uses SQLite's own `conn.backup()`,
+  which holds a read transaction and sees one consistent snapshot including
+  the WAL. Verified: `integrity_check ok`, full row counts.
+- **The prune reached up to a day past its own window.** The cutoff was
+  formatted `...THH:MM:SS.ffffffZ` while both tables store
+  `YYYY-MM-DD HH:MM:SS`, and both comparisons are text: `" "` (0x20) sorts
+  below `"T"` (0x54), so every row sharing the cutoff's date compared
+  less-than whatever its time. A row stored `2026-05-04 23:59:59` was deleted
+  by a cutoff of `2026-05-04T11:56:08Z`. The count and the DELETE shared the
+  format, so the guard's percentages were honest — this was over-deletion,
+  not mis-reporting — but it always erred toward data loss, so it is fixed
+  here rather than left standing next to a guard about data loss.
+
+Exercised against a **copy** of the live database, never the original.
 
 ## [0.10.12] — 2026-08-31 — the Permuto inventory curfew
 

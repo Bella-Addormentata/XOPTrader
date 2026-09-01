@@ -1401,6 +1401,124 @@ TEST(ConfigParserTest, S20GateKnobs_NegativeAndZeroLegCapRejected) {
     }
 }
 
+// ============================================================================
+// [SIDEQUALITY 2026-09-01] Per-side anchor-agreement knob validation through
+// the REAL YAML parser.
+//
+// Same hazard as the S20 knobs above: the side-quality tests build
+// MarketDataConfig directly, so nothing exercised these two validators, and
+// yaml-cpp happily hands back `.nan` / `.inf`.  A `.nan` side band would make
+// every band comparison false -- the per-side test silently skipped while the
+// config read as though it were armed -- and an `.inf` agreement cap would
+// trust ANY two-sided book whole, which is exactly the absent-ask-side book
+// this feature exists to distrust.
+//
+// The disabled-value case below is the one that matters most: <= 1.0 is
+// DOCUMENTED as "disables the per-side test", not as an error.  A validator
+// that rejected it would take the escape hatch away from the operator.
+// ============================================================================
+
+TEST(ConfigParserTest, SideQualityKnobs_ExplicitValuesParse) {
+    TempYaml tmp(with_market_data(
+        "  book_side_anchor_band_ratio: 2.5\n"
+        "  book_side_agree_max_spread_bps: 750.0\n"));
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_DOUBLE_EQ(cfg.market_data.book_side_anchor_band_ratio, 2.5);
+    EXPECT_DOUBLE_EQ(cfg.market_data.book_side_agree_max_spread_bps, 750.0);
+}
+
+TEST(ConfigParserTest, SideQualityKnobs_DefaultsWhenAbsent) {
+    {
+        // No market_data section at all.
+        TempYaml tmp(kMinimalValidYaml);
+        auto cfg = xop::load_config(tmp.path());
+        EXPECT_DOUBLE_EQ(cfg.market_data.book_side_anchor_band_ratio, 3.0);
+        EXPECT_DOUBLE_EQ(cfg.market_data.book_side_agree_max_spread_bps,
+                         5000.0);
+    }
+    {
+        // Section present, both keys absent: the neighbouring key must not
+        // drag either default off its documented value.
+        TempYaml tmp(with_market_data(
+            "  cex_freshness_threshold_sec: 600\n"));
+        auto cfg = xop::load_config(tmp.path());
+        EXPECT_DOUBLE_EQ(cfg.market_data.book_side_anchor_band_ratio, 3.0);
+        EXPECT_DOUBLE_EQ(cfg.market_data.book_side_agree_max_spread_bps,
+                         5000.0);
+    }
+}
+
+TEST(ConfigParserTest, SideQualityKnobs_NonFiniteRejected) {
+    for (const char* bad : {".nan", ".inf", "-.inf"}) {
+        {
+            TempYaml tmp(with_market_data(
+                std::string("  book_side_anchor_band_ratio: ") + bad));
+            EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError)
+                << "book_side_anchor_band_ratio accepted " << bad;
+        }
+        {
+            TempYaml tmp(with_market_data(
+                std::string("  book_side_agree_max_spread_bps: ") + bad));
+            EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError)
+                << "book_side_agree_max_spread_bps accepted " << bad;
+        }
+    }
+}
+
+TEST(ConfigParserTest, SideQualityKnobs_NegativeRejected) {
+    {
+        TempYaml tmp(with_market_data(
+            "  book_side_anchor_band_ratio: -1.0\n"));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+    }
+    {
+        TempYaml tmp(with_market_data(
+            "  book_side_agree_max_spread_bps: -0.5\n"));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+    }
+}
+
+TEST(ConfigParserTest, SideQualityKnobs_DisabledBandAccepted) {
+    // <= 1.0 DISABLES the per-side anchor test; it is a legal setting, not a
+    // malformed one.  Rejecting it here is the regression this case exists to
+    // catch -- assert acceptance AND that the value survives to the config.
+    const struct { const char* written; double expected; } kDisabling[] = {
+        {"0.0", 0.0}, {"0.5", 0.5}, {"1.0", 1.0},
+    };
+    for (const auto& d : kDisabling) {
+        TempYaml tmp(with_market_data(
+            std::string("  book_side_anchor_band_ratio: ") + d.written + "\n"));
+        ASSERT_NO_THROW(xop::load_config(tmp.path()))
+            << "disabling value rejected: " << d.written;
+        auto cfg = xop::load_config(tmp.path());
+        EXPECT_DOUBLE_EQ(cfg.market_data.book_side_anchor_band_ratio,
+                         d.expected)
+            << "disabling value not carried through: " << d.written;
+    }
+    {
+        // 0 on the agreement cap is likewise legal: it means no two-sided
+        // book is ever narrow enough to be trusted whole.
+        TempYaml tmp(with_market_data(
+            "  book_side_agree_max_spread_bps: 0.0\n"));
+        auto cfg = xop::load_config(tmp.path());
+        EXPECT_DOUBLE_EQ(cfg.market_data.book_side_agree_max_spread_bps, 0.0);
+    }
+}
+
+TEST(ConfigParserTest, SideQualityKnobs_WiderThanMidBandWarnsButLoads) {
+    // A side band wider than mid_anchor_band_ratio lets a side stay a trusted
+    // reference while the mid it implies is refused.  config.cpp treats that
+    // as a coherence smell and emits a spdlog WARNING -- it must NOT throw,
+    // and both values must survive exactly as written.
+    TempYaml tmp(with_market_data(
+        "  mid_anchor_band_ratio: 2.0\n"
+        "  book_side_anchor_band_ratio: 6.0\n"));
+    ASSERT_NO_THROW(xop::load_config(tmp.path()));
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_DOUBLE_EQ(cfg.market_data.mid_anchor_band_ratio, 2.0);
+    EXPECT_DOUBLE_EQ(cfg.market_data.book_side_anchor_band_ratio, 6.0);
+}
+
 TEST(ConfigParserTest, S20CarryTtl_ParsesAndRejectsNegative) {
     {
         TempYaml tmp(with_risk_extra("valuation_carry_ttl_blocks: 720"));

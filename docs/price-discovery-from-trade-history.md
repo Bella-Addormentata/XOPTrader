@@ -69,8 +69,10 @@ is a claim whose age we cannot bound from below.
 
 **The denominator is broken.** The only market route from BYC to a dollar
 runs through wUSDC.b. The newest BYC/wUSDC.b print is 2026-08-24 -- eight
-days stale -- and wUSDC.b is itself trading around 0.70 USD after the
-2026-08-25 warp.green bridge compromise. A cross through a depegged
+days stale -- and wUSDC.b is itself depegged after the 2026-08-25
+warp.green bridge compromise, measured at ~0.80 USD on 2026-09-01 through
+the XCH/wUSDC.b cross, which is itself a 2026-08-29 mid and therefore stale
+too. A cross through a depegged
 stablecoin with an eight-day-old print is not a weak measurement of BYC/USD;
 it is a measurement of something else. Nothing in `docs/` carries the depeg
 history -- `docs/warp-bridge.md` is a USDC(Base) -> wUSDC.b bridging runbook
@@ -413,34 +415,75 @@ marginally sensitive to trades-per-day above roughly five. Ardia, Guidotti
 and Kroencke (2024) supersede all three by combining the moment conditions
 available from open, high, low and close efficiently.
 
-**We already have the inputs, and we throw them away.**
+**There is a free high/low input, and it is not enough on its own.**
 `TickerData::price_high` / `price_low`
 (`cpp/include/xop/rpc/dexie_client.hpp:168-169`) are parsed at
 `cpp/src/rpc/dexie_client.cpp:647-650`, correctly orientation-swapped for
 inverted pairs at 821-828 (high and low exchange roles under inversion, and
 the code gets this right), and then **discarded** -- a repo-wide grep finds
-no other reader. This is free input.
+no other reader. But it is a single 24h bar, and both estimators are
+**two-day** estimators, so it can be a range check and never a series.
+
+### What was actually built, and on what inputs
+
+`scripts/highlow_spread_estimator.py` exists as of 2026-09-01. Because one
+bar is not a series, its inputs are **not** the free high/low above. Read
+them before reading its output.
+
+* The multi-day bars come from the **sampled third-party BBO series** we
+  already store: `offer_log.book_best_bid` / `book_best_ask`, or the denser
+  `snapshots.mid_price_mojos` + `spread_bps`, which invert back to the same
+  two sides exactly (mid 3.24975 at 10,768.52 bps returns 1.5000 / 4.9995).
+* `--dexie` fetches the `price_high` / `price_low` bar above. It is reported
+  as an independent range check and gate test. It cannot drive either
+  estimator, because one bar is not two.
+
+So every number the tool prints comes from **quote samples standing in for
+trade prices**. That is outside the regime Corwin-Schultz and Abdi-Ranaldo
+were derived for -- neither paper's input is a quote series -- and it is the
+first caveat on the output, not a footnote to it. The script prints it on
+every run and its module docstring forbids importing the file. A spread
+number for the engine comes from the book or from realized fills; it does
+not come from here.
+
+Two bar constructions are offered and the choice changes the answer, so the
+tool declares which one produced a figure. `quote-touch` (the default) takes
+the daily high from the ask side and the low from the bid side, which is an
+**upper bound** on the range and therefore on the estimated spread; `mid`
+takes both from the mid, which strips the bid-ask bounce the estimators
+exist to extract and brackets from below. The falsification argument below
+holds a fortiori under the upper bound: if even that lands far under the
+posted book spread, the posted figure is not a spread.
 
 ### The falsification argument -- this is the actual value
 
-These estimators are bounded by construction. They recover a spread from
-the ratio of an observed high to an observed low, both of which are prices
-that occurred inside the bar. On a market whose prints all cluster within a
-few percent of 1.40, the family **structurally cannot return 10,769 bps**.
+These estimators recover a spread from the ratio of an observed high to an
+observed low, and on a trade-price series both are prices that occurred
+inside the bar. On a market whose prints all cluster within a few percent
+of 1.40, the family **structurally cannot return 10,769 bps**. The tool we
+have runs on quote samples rather than prints, so it does not get that
+structural guarantee for free -- it earns the same conclusion empirically,
+and under the `quote-touch` upper bound at that. Nor is the analytic bound
+the argument: Corwin-Schultz saturates at 2.0, i.e. 20,000 bps, so a large
+CS output means the estimator has saturated and is not confirmation of a
+large spread.
 
-So when the book reports 10,769 bps and the high-low family reports a few
-hundred, we hold an independent, model-based proof that **the book's
-"spread" is not a spread** -- it is the distance to an absent quote. That
-is a falsification test we can run on every day BYC traded, and it is worth
-considerably more to an operator than a price estimate we had already
-decided not to use.
+**The measured gap is the argument.** XCH/BYC on 2026-09-01, over 20
+adjacent day pairs: a posted book spread of 14,977 bps against a widest
+estimate of 1,820 bps -- 8.2x, on bars whose high is taken from the junk
+ask side and is therefore already generous to the posted figure. That is an
+independent, model-based indication that **the book's "spread" is not a
+spread** -- it is the distance to an absent quote. It is a test we can run
+on every day the pair was sampled, and it is worth considerably more to an
+operator than a price estimate we had already decided not to use.
 
 Ardia et al. (2024) states explicitly that Roll, Corwin-Schultz and
 Abdi-Ranaldo are all **downward biased** when trading is infrequent. That
-bias points the *same* direction as the one-sided-book bias below. Both
-errors say "the true spread is at least this much", which is the safe
+bias says "the true spread is at least this much", which is the safe
 direction for an estimator whose entire job is to prove that a stated
-number is too big.
+number is too big. The one-sided-book bias below points the same way on a
+trade-price series; on the shipped tool's default `quote-touch` bars it
+points the other way, and the argument survives either sign -- see limit 2.
 
 ### Three honest limits
 
@@ -451,22 +494,33 @@ number is too big.
    monthly cross-sectional work; that is a smoothing convention for
    research panels, **not** a licence to show an operator "0 bps". Report
    *undefined*, and report why.
-2. **On a one-sided book it UNDERSTATES.** Both the high and the low come
-   from the surviving side. The estimator sees the honest bid ladder's
-   range (1.3514 .. 1.5000, ~1,000 bps) and never sees the junk asks at all.
-   That is acceptable -- conservative, even -- for falsification, and
-   useless as a spread *level*. Do not put the number in a fee model.
-3. **The two-trades-per-bar rule fails on daily bars for BYC.** Ardia et
-   al. require a bar frequency giving at least two trades per bar;
-   Abdi-Ranaldo document only marginal sensitivity above ~5 trades/day.
-   BYC has **zero** trades in the last 24 hours on every pair. Daily bars
-   fail the rule outright. The choices are to aggregate to weekly bars --
-   where the answer is stale by construction and Merton (1980) says the
-   level precision does not improve anyway -- or to accept that the
-   diagnostic is available only on days BYC actually traded. Do not emit a
-   number on a zero-trade day.
+2. **On a one-sided book the level is unusable, and which way it errs
+   depends on the bars.** Fed a *trade*-price series it UNDERSTATES: both
+   the high and the low come from the surviving side, so it sees the honest
+   bid ladder's range (1.3514 .. 1.5000, ~1,000 bps) and never sees the junk
+   asks at all. Fed the shipped tool's default `quote-touch` bars it errs
+   the other way: the high is taken from the ask side, so a junk ask at
+   10.0000 enters the range and the estimate becomes an upper bound on what
+   that range could justify. Either way the number is a **ceiling or floor
+   argument, not a transaction cost** -- no counterparty ever crossed the
+   width being measured. Acceptable, and in the `quote-touch` case a
+   fortiori, for falsification. Do not put it in a fee model.
+3. **The two-trades-per-bar rule fails on daily bars for BYC, and the
+   shipped tool cannot enforce it.** Ardia et al. require a bar frequency
+   giving at least two trades per bar; Abdi-Ranaldo document only marginal
+   sensitivity above ~5 trades/day. BYC has **zero** trades in the last 24
+   hours on every pair, so daily trade bars fail the rule outright. The
+   quote-sample bars the tool actually builds do not fail it, because they
+   are not the quantity the rule is about: `MIN_SAMPLES_PER_BAR` applies the
+   two-per-bar threshold to BBO *samples*, which is a strictly **weaker**
+   test than the paper's -- a bar that clears it has not been shown to clear
+   theirs. That substitution is the price of having a series at all, and it
+   is why the day-pair count travels beside every figure and why the whole
+   tool is a falsification argument rather than a measurement. Aggregating
+   to weekly bars is no escape: the answer is stale by construction and
+   Merton (1980) says the level precision does not improve anyway.
 
-### Plumbing notes for whoever builds it
+### Plumbing notes
 
 * `DexieClient::get_trades()` used to pass `sort="date_completed_desc"`,
   which the dexie API does not recognise and *silently ignores* -- so it
@@ -491,15 +545,15 @@ form "and the tape agrees with par" is one input agreeing with itself. If
 BYC's peg breaks, the ~1.40 tape cluster and the 1.41 model output break
 together, in the same direction, by the same amount, and neither warns us.
 The only thing that would is a genuinely independent BYC/USD measurement,
-and we do not have one -- the sole market cross runs through wUSDC.b at
-~0.70 USD.
+and we do not have one -- the sole market cross runs through wUSDC.b, itself
+depegged to ~0.80 USD and last crossed on 2026-08-29.
 
 This is also why the peg-suspension observation route cannot be repaired by
-fixing arithmetic alone. `cpp/src/engine.cpp:16661` does
+fixing arithmetic alone. `Engine::step_observe_asset_pegs` (cpp/src/engine.cpp) did
 `static_cast<double>(snap.mid_price)` with no division by `kMojosPerXch`,
 yielding `usd_obs ~ 3.4e-13` and a false
 `[PEGSUSPEND] ... observed 0.0000 ... 100.0% off`. The correct pattern is
-`usd_per_base_from_mid` at `cpp/src/engine.cpp:12944-12947`. But scale is
+`usd_per_base_from_mid`, used correctly by `Engine::usd_per_xch` in the same file. But scale is
 only half the defect: the *correctly scaled* observation on this book is
 1.43 / 3.25 = **0.44 USD**, still 56% off par and still past `bail_pct`
 10.0. The observation **source** has to change as well, and the source
@@ -604,9 +658,36 @@ the input they are fed is.
   stamped 567-569). Advances only on a price change, by design, for the
   polling reason in section 2. Documented limitation, not a bug,
   unfixable without a true per-trade timestamp.
-* **`enabled: false` on every BYC pair.** That is an operator decision from
-  2026-08-31. Nothing in this note changes it, and nothing in this note is
-  an argument to reverse it.
+* **The BYC pairs' `enabled:` flags -- not by this work, but the operator
+  has since changed one.** Nothing in this note is an argument either way;
+  the flags are an operator decision and stay one. On 2026-09-01 **XCH/BYC
+  was re-enabled** at the operator's request, and BYC/wUSDC.b was left
+  disabled. Recorded here because the deployment order is not obvious and
+  getting it wrong is expensive:
+
+  - An enable takes effect **only on an engine restart**. A live config
+    reload disables a pair in place but refuses to enable one, logging
+    "restart the engine to start quoting it".
+  - **That restart must come after this branch is merged, built and
+    deployed.** On the pre-branch binary a restart with the flag set
+    reproduces the 2026-08-30 incident: the ladder self-crosses and drops
+    every tier, the mojo-scale bug in section 7 latches a false depeg about
+    ten minutes in and cancels every offer on every pair touching BYC, and
+    that bogus valuation feeds the 10% drawdown breaker -- which pauses the
+    **whole engine** and takes XCH/DBX, the only earning pair, down with it.
+    Section 8 addresses every link in that chain.
+  - The two sides are **not** symmetric, and there is no per-pair one-sided
+    switch, so both go on together. In this pair's own orientation (price =
+    BYC per XCH) a **bid** pays BYC to buy XCH, selling our 52.58 BYC at
+    about 1.01 USD into the honest side of the book -- an exit at par, and
+    the reason to be there. An **ask** accumulates more BYC, for which there
+    is no exit: nothing bids for BYC above about 0.29 USD. Rising BYC
+    inventory is the signal to turn the pair back off.
+  - **BYC/wUSDC.b stays disabled for an unrelated reason.** The 2026-08-25
+    warp.green bridge compromise depegged wUSDC.b (~0.80 USD) and the pair
+    has had no print since 2026-08-24, so it would be quoting into a dead
+    book through a broken denominator -- the section 2 problem, not a
+    liquidity judgement about BYC.
 
 If this proposal comes back, the short answer is **section 3**: the engine
 already reaches 1.41 without the tape, the tape's agreement is downstream of

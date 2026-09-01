@@ -303,7 +303,23 @@ def _prune_raw_tables(
     confirm_large_prune: bool = False,
 ) -> dict[str, int]:
     cutoff = datetime.now(tz=timezone.utc) - timedelta(days=raw_retention_days)
-    cutoff_iso = _iso_utc(cutoff)
+    # [review 2026-09-01] Format the cutoff the way these two tables actually
+    # STORE their timestamps -- "YYYY-MM-DD HH:MM:SS", space-separated -- not
+    # as _iso_utc()'s "...THH:MM:SS.ffffffZ".
+    #
+    # Both comparisons here are TEXT comparisons, and " " (0x20) sorts below
+    # "T" (0x54). So against a "T"-form cutoff, every row sharing the cutoff's
+    # DATE compares less-than regardless of its time: a row stored
+    # "2026-05-04 23:59:59" was deleted by a cutoff of
+    # "2026-05-04T11:56:08.326330Z". The prune therefore reached up to a full
+    # extra day past the window the operator asked for, silently and always in
+    # the deleting direction.
+    #
+    # The count and the DELETE shared the format, so the guard's percentages
+    # were honest about what would be removed -- this was over-deletion, not
+    # mis-reporting. Fixed here rather than left as pre-existing because it
+    # lives in the function this change hardened, and it errs toward data loss.
+    cutoff_iso = cutoff.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
     targets = ["snapshots"]
     if prune_strategy_quotes:
@@ -313,7 +329,7 @@ def _prune_raw_tables(
     # done, which is no use to a guard, and inside the caller's transaction
     # a refusal has to happen before any DELETE runs so the rollback is
     # empty rather than merely correct.
-    planned: dict[str, tuple[int, int]] = {}
+    planned: dict[str, tuple[int, int, str | None]] = {}
     for table in targets:
         total = int(
             conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
@@ -324,26 +340,41 @@ def _prune_raw_tables(
                 [cutoff_iso],
             ).fetchone()[0]
         )
-        planned[table] = (doomed, total)
+        # The oldest row is captured PER TABLE, in the same pass as the
+        # counts.  The refusal exists so the operator can choose a retention
+        # window, and the window has to clear whichever table's history
+        # actually reaches furthest back.  Reporting the snapshots row while
+        # strategy_quotes is the table in breach points at unrelated history
+        # and misleads exactly the decision this message is for.  These
+        # tables are not pruned independently, but they do not start at the
+        # same date, and either one can breach alone.
+        oldest = conn.execute(
+            f"SELECT MIN(created_at) FROM {table}"
+        ).fetchone()[0]
+        planned[table] = (doomed, total, oldest)
 
     if not confirm_large_prune:
         breaches = [
-            f"{t}: {d:,} of {n:,} rows ({d / n:.1%})"
-            for t, (d, n) in planned.items()
+            (t, d, n, oldest)
+            for t, (d, n, oldest) in planned.items()
             if n > 0 and (d / n) > MAX_UNCONFIRMED_PRUNE_FRACTION
         ]
         if breaches:
-            oldest = conn.execute(
-                "SELECT MIN(created_at) FROM snapshots"
-            ).fetchone()[0]
+            width = max(len(t) for t, _, _, _ in breaches)
             msg = [
                 "this run would delete more than "
                 f"{MAX_UNCONFIRMED_PRUNE_FRACTION:.0%} of a raw table:",
             ]
-            msg += [f"    {b}" for b in breaches]
+            for t, d, n, oldest in breaches:
+                msg.append(f"    {t:<{width}} : {d:,} of {n:,} rows ({d / n:.1%})")
+                # Printed verbatim.  snapshots.created_at stores a SPACE
+                # between date and time while other tables may store a "T",
+                # and the operator has to be able to see which form the
+                # rows in front of them use.  Nothing here compares the two
+                # forms; MIN() is over the stored text of one table only.
+                msg.append(f"    {'':<{width}}   oldest row {oldest}")
             msg += [
                 f"  cutoff        : {cutoff_iso}",
-                f"  oldest row    : {oldest}",
                 f"  retention set : {raw_retention_days} days",
                 "  A jump this large means retention has not run in a "
                 "long time, not that this much data is stale.",

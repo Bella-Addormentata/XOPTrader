@@ -14,9 +14,14 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <cstdlib>
 #include <limits>
+#include <string>
+#include <vector>
 
 #include "xop/execution/book_side_quality.hpp"
+#include "xop/execution/market_data.hpp"
+#include "xop/state.hpp"
 
 using xop::bookside::classify_sides;
 
@@ -201,4 +206,155 @@ TEST(BookSideQuality, disqualification_sits_well_inside_the_offer_absurdity_boun
     const auto q = classify_sides(1.5, 4.9995, kAnchor, kBand, kAgree);
     EXPECT_FALSE(q.ask_ok);
     EXPECT_LT(4.9995 / kAnchor, 10.0);  // survives the absurdity filter
+}
+
+// ===========================================================================
+// FEED-LEVEL: the verdict must never outlive the book it was measured on.
+//
+// [review, PR #134] ingest_dexie() replaces dex_best_bid/ask with the RAW
+// ticker and clears the three S20 provenance flags, because raw values are
+// self-inclusive and unfiltered. The per-side verdicts were originally NOT
+// cleared alongside them, so when the full-offer fetch throws -- the exact
+// scenario those flags exist for -- Step 8 would pair a CURRENT raw BBO with
+// the PREVIOUS cycle's disqualification and anchor, and re-reference a tier
+// against a book_side_ref measured on prices that no longer exist. Fresh
+// numbers, stale evidence: the S20 shape, reintroduced by the feature meant
+// to close it.
+// ===========================================================================
+
+namespace {
+
+using namespace xop;
+
+MarketDataConfig sq_cfg() {
+    MarketDataConfig cfg;
+    cfg.cex_freshness_threshold_sec = 0.0;
+    cfg.amm_blend_weight            = 0.0;
+    cfg.mid_gate_enabled            = true;
+    // Dust filter off: these fixtures are about the side verdict, not sizing.
+    cfg.min_competitor_offer_size   = 0;
+    return cfg;
+}
+
+CompetingOffer sq_offer(const std::string& id, Side side, double price,
+                        Mojo size) {
+    CompetingOffer o;
+    o.offer_id = id;
+    o.side     = side;
+    o.price    = static_cast<Mojo>(
+        std::llround(price * static_cast<double>(kMojosPerXch)));
+    o.size     = size;
+    return o;
+}
+
+// The live XCH/BYC shape: honest bids at the anchor, a junk ask stack 3.5x
+// above it.
+std::vector<CompetingOffer> dislocated_book() {
+    return {
+        sq_offer("b1", Side::Bid, 1.5000, 5'000'000'000'000LL),
+        sq_offer("a1", Side::Ask, 4.9995, 5'000'000'000'000LL),
+    };
+}
+
+}  // namespace
+
+TEST(BookSideQualityFeed, DislocatedAskSideIsPublishedAsDisqualified)
+{
+    State state;
+    MarketDataFeed feed(sq_cfg(), state);
+    const std::string pair = "XCH/BYC";
+
+    feed.ingest_block_height(100);
+    // Independent anchor. A CEX reference is the simplest injection
+    // point: select_anchor ranks it first, and it is what the sibling
+    // gate tests use for the same purpose.
+    feed.ingest_cex_reference(pair, kAnchor);
+    feed.ingest_competing_offers(pair, dislocated_book(), {},
+                                 kMojosPerXch, 1'000);
+    feed.refresh({pair});
+
+    const auto snap = state.get_market(pair);
+    EXPECT_TRUE(snap.bid_side_anchor_ok)  << "1.5000 is 1.06x the anchor";
+    EXPECT_FALSE(snap.ask_side_anchor_ok) << "4.9995 is 3.55x the anchor";
+    EXPECT_GT(snap.book_side_ref, 0)
+        << "a disqualification requires an anchor, so ref must be published";
+}
+
+TEST(BookSideQualityFeed, RawTickerIngestClearsAStaleDisqualification)
+{
+    // THE REGRESSION. Disqualify a side, then let a raw ticker poll land
+    // without a successful offers fetch behind it -- which is what happens
+    // when the offers request throws.
+    State state;
+    MarketDataFeed feed(sq_cfg(), state);
+    const std::string pair = "XCH/BYC";
+
+    feed.ingest_block_height(100);
+    feed.ingest_cex_reference(pair, kAnchor);
+    feed.ingest_competing_offers(pair, dislocated_book(), {},
+                                 kMojosPerXch, 1'000);
+    feed.refresh({pair});
+    ASSERT_FALSE(state.get_market(pair).ask_side_anchor_ok)
+        << "precondition: the ask side must start out disqualified";
+
+    // A raw ticker poll lands with COMPLETELY DIFFERENT prices and no
+    // filtered book behind it.
+    feed.ingest_dexie(pair, 1.38, 1.44, 0.0, 0.0);
+    feed.refresh({pair});
+
+    const auto snap = state.get_market(pair);
+    EXPECT_TRUE(snap.bid_side_anchor_ok);
+    EXPECT_TRUE(snap.ask_side_anchor_ok)
+        << "the previous cycle's verdict describes a book that no longer "
+           "exists; carrying it forward is the S20 defect shape";
+    EXPECT_EQ(snap.book_side_ref, 0)
+        << "ref must return to 0 -- nothing screened this raw book, and a "
+           "stale ref would re-reference a tier against vanished prices";
+}
+
+TEST(BookSideQualityFeed, AFreshFilteredIngestReinstatesTheVerdict)
+{
+    // The reset must not be sticky: once the offers fetch succeeds again the
+    // verdict has to come back, or one failed poll would disarm the feature
+    // until process restart.
+    State state;
+    MarketDataFeed feed(sq_cfg(), state);
+    const std::string pair = "XCH/BYC";
+
+    feed.ingest_block_height(100);
+    feed.ingest_cex_reference(pair, kAnchor);
+    feed.ingest_competing_offers(pair, dislocated_book(), {},
+                                 kMojosPerXch, 1'000);
+    feed.ingest_dexie(pair, 1.38, 1.44, 0.0, 0.0);
+    feed.refresh({pair});
+    ASSERT_TRUE(state.get_market(pair).ask_side_anchor_ok);
+
+    feed.ingest_competing_offers(pair, dislocated_book(), {},
+                                 kMojosPerXch, 1'000);
+    feed.refresh({pair});
+
+    const auto snap = state.get_market(pair);
+    EXPECT_FALSE(snap.ask_side_anchor_ok)
+        << "a successful filtered ingest must re-disqualify the junk side";
+    EXPECT_GT(snap.book_side_ref, 0);
+}
+
+TEST(BookSideQualityFeed, AHealthyBookPublishesBothSidesTrusted)
+{
+    State state;
+    MarketDataFeed feed(sq_cfg(), state);
+    const std::string pair = "XCH/DBX";
+
+    feed.ingest_block_height(100);
+    feed.ingest_cex_reference(pair, kAnchor);
+    feed.ingest_competing_offers(
+        pair,
+        {sq_offer("b1", Side::Bid, 1.40, 5'000'000'000'000LL),
+         sq_offer("a1", Side::Ask, 1.42, 5'000'000'000'000LL)},
+        {}, kMojosPerXch, 1'000);
+    feed.refresh({pair});
+
+    const auto snap = state.get_market(pair);
+    EXPECT_TRUE(snap.bid_side_anchor_ok);
+    EXPECT_TRUE(snap.ask_side_anchor_ok);
 }

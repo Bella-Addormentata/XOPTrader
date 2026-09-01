@@ -417,9 +417,10 @@ is in [docs/price-discovery-from-trade-history.md](docs/price-discovery-from-tra
 python scripts/byc_price_diagnostic.py --days 7
 ```
 
-Re-derives the "BYC 7-day traded VWAP 1.001" figure that `par_anchor.hpp`,
-`config.yaml` and `test_fair_value.cpp` all cite as ground truth and that no
-code path produces — it was a manual measurement taken in July. Reports maker
+Re-derives the "BYC 7-day traded VWAP 1.001" figure that **five** sites cite
+as ground truth and that no code path produces — `par_anchor.hpp`,
+`config.hpp`, `Engine::quote_usd_factor()`, `test_fair_value.cpp` and
+`config.yaml`. It was a manual measurement taken in July. Reports maker
 and taker fills separately (the taker rows are the ones the *counterparty*
 priced), prints the sample size beside every statistic, marks anything with
 n < 30 as an anecdote, and gives a median and trimmed mean next to the VWAP,
@@ -430,14 +431,33 @@ the question a VWAP cannot answer. Add `--no-network` for local-only.
 python scripts/highlow_spread_estimator.py --days 30
 ```
 
-Corwin-Schultz (2012) and Abdi-Ranaldo (2017) spread estimators over daily
-high/low bars, with the Ardia et al. (2024) degeneracy and freshness gates.
-Their value here is *falsification*, not measurement: they estimate the range
-the price actually travelled, so when the posted book spread is many times
-their widest output, the posted figure is an absent side rather than a
+Corwin-Schultz (2012) and Abdi-Ranaldo (2017) spread estimators, behind
+degeneracy, freshness and sample-adequacy gates — the last of these grounded
+in Ardia et al. (2024), which is the authority on how these estimators
+misbehave when there is too little usable data.
+
+Read the inputs before quoting the output. Both papers want daily bars off a
+*trade*-price series, and we have none. The daily bars here are built from
+the third-party BBO series we already store — `offer_log.book_best_bid` /
+`book_best_ask`, or the denser `snapshots.mid_price_mojos` + `spread_bps`,
+which invert back to the same two sides — so these are **quote samples
+standing in for trade prices**, which is outside the regime the estimators
+were derived for. That caveat is real and the script prints it on every run.
+(`--dexie` adds a live 24h high/low from `TickerData::price_high` /
+`price_low`, the one field the engine fetches and discards unread. It is a
+single bar, both estimators need two consecutive ones, so it is an
+independent range check and gate test — never an estimator input.)
+
+Their value here is *falsification*, not measurement: the estimators recover
+a spread from an observed daily range, so when the posted book spread is many
+times their widest output, the posted figure is an absent side rather than a
 spread. Measured on XCH/BYC 2026-09-01: posted 14,977 bps against a widest
-estimate of 1,817 bps, an 8.2× gap. The script refuses outright on stale or
-degenerate books rather than returning a plausible-looking number.
+estimate of 1,820 bps over 20 adjacent day pairs, an 8.2× gap. The default
+`quote-touch` bars take the high from the ask side and the low from the bid,
+making that estimate an *upper* bound on the range, so the gap holds a
+fortiori. The script refuses outright on stale, degenerate or under-sampled
+books rather than returning a plausible-looking number, and a spread number
+for the engine comes from the book or from realized fills — never from here.
 
 ---
 
@@ -643,6 +663,30 @@ Key sections to configure before first run:
 ---
 
 ## Running
+
+> **A pair enable takes effect only on restart, so the restart order matters.**
+> A config reload disables a pair live but *refuses* to enable one — it logs
+> "restart the engine to start quoting it" and carries on. `XCH/BYC` was
+> re-enabled by the operator on 2026-09-01 and is therefore inert on the
+> running engine.
+>
+> **Do not restart onto a binary older than PR #134** with that flag set. On
+> the pre-#134 binary the restart reproduces the 2026-08-30 incident: the
+> ladder self-crosses and drops every tier, the mojo-scale bug in the
+> peg-observation route latches a false depeg about ten minutes in and
+> cancels every offer on every pair touching BYC, and the bogus valuation
+> feeds the 10% drawdown breaker — which pauses the **whole engine**, taking
+> `XCH/DBX` down with it. Merge, build, deploy, then restart.
+>
+> Enabling turns on both sides; there is no per-pair one-sided switch. In the
+> pair's own orientation (price = BYC per XCH) the bid pays BYC to buy XCH,
+> selling our BYC at about $1.01 into the honest side of the book — that exit
+> at par is the reason to be there. The ask accumulates BYC, for which there
+> is no exit: nothing bids for BYC above about $0.29. Watch the BYC balance;
+> if it rises rather than falls, turn the pair back off. `BYC/wUSDC.b` stays
+> disabled for an unrelated reason — the 2026-08-25 warp.green bridge
+> compromise depegged wUSDC.b (~$0.80) and the pair has had no print since
+> 2026-08-24.
 
 ```bash
 # Dry run (compute quotes, never submit offers)

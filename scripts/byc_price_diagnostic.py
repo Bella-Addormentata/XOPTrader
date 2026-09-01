@@ -9,7 +9,7 @@ with ``grep -rn "1\\.001" cpp/ config.yaml | grep -i vwap`` --
   * cpp/include/xop/config.hpp:449               "(7-day VWAP 1.001)"
   * cpp/src/engine.cpp, Engine::quote_usd_factor() "traded VWAP 1.001"
   * cpp/tests/test_fair_value.cpp:83             "dexie 7-day traded VWAP 1.001"
-  * config.yaml:485                              "(7-day VWAP 1.001 vs p50 spread 1163bps)"
+  * config.yaml, the BYC pegged_assets block    "(7-day VWAP 1.001 vs p50 spread 1163bps)"
 
 All five are the same July measurement, and it is produced by NO code path --
 it was taken by hand and copied forward.  The two that were missing from the
@@ -678,7 +678,9 @@ def _book_side(
     exists to inform the decision to re-enable exactly these pairs.
 
     This is NOT hypothetical and NOT contingent on re-enabling.  Measured
-    2026-09-01, with both BYC pairs disabled and nothing being quoted: FOUR of
+    2026-09-01, when both BYC pairs were still disabled and nothing was being
+    quoted (XCH/BYC has since been re-enabled, effective on the next engine
+    restart): FOUR of
     our offers were still resting on the live XCH/BYC book (all four recorded
     as 'cancelled' locally -- see ``DbReader.our_offer_ids``).  Unfiltered,
     this side reported 50 counterparty offers where there were 46.  The filter
@@ -1083,10 +1085,11 @@ def gather(opts: Options) -> dict:
                 'cpp/include/xop/execution/par_anchor.hpp:59  -- "BYC 7-day VWAP 1.001"',
                 'cpp/include/xop/config.hpp:449               -- "(7-day VWAP 1.001)"',
                 'cpp/src/engine.cpp Engine::quote_usd_factor() -- "traded VWAP 1.001"',
-                "cpp/tests/test_fair_value.cpp:83             -- "
-                '"dexie 7-day traded VWAP 1.001"',
-                "config.yaml:485                              -- "
-                '"(7-day VWAP 1.001 vs p50 spread 1163bps)"',
+                'cpp/tests/test_fair_value.cpp:83             -- "dexie 7-day traded VWAP 1.001"',
+                (
+                    "config.yaml BYC pegged_assets block          -- "
+                    + '"(7-day VWAP 1.001 vs p50 spread 1163bps)"'
+                ),
             ],
             "cited_at_note": (
                 "FIVE sites, re-measured 2026-09-01. This report previously "
@@ -1105,44 +1108,61 @@ def gather(opts: Options) -> dict:
 
 
 CAVEATS = [
-    "EVERY VWAP HERE STATES ITS WEIGHT UNIT, and the label is generated from "
-    "the weights, never hard-coded. Native quote-per-base prices are weighted "
-    "in BASE units; USD-per-BYC prices are weighted in BYC. Those coincide on "
-    "BYC/wUSDC.b (base IS BYC) and differ on XCH/BYC (base is XCH). Compare a "
-    "native VWAP only with another native VWAP: local maker, local taker and "
-    "the settled tape now share one weighting, so those three ARE "
-    "like-for-like. A native and a USD VWAP are different averages.",
-    "VWAP IS NOT ROBUST TO OUTLIERS. It is reported because it is the cited "
-    "figure, always beside a median and a trimmed mean. One 1.093 print moved "
-    "the BYC last-trade 9.3% off a 30-day median of 1.0010; the median moved "
-    "by nothing.",
-    "Maker fills are OUR OWN quotes. A VWAP over them measures where we chose "
-    "to stand, not where the market is. Taker fills are the counterparty's "
-    "prices and are the more independent local sample -- which is why the two "
-    "are never pooled here.",
-    "Measured over the whole of August, ~19% of the XCH/BYC tape is our own "
-    "fills (270 of ~1,402). The OWN-FILL SHARE printed above is this window's "
-    "own figure, measured independently. Either way, a market statistic that "
-    "silently pools our fills with everyone else's is part self-portrait.",
-    "BYC's par is an ASSUMPTION, not an observation. The engine's fair-value "
-    "blend feeds BYC's declared par IN, so agreement between a ~1.40 BYC/XCH "
-    "tape cluster and a 1.41 model output is corroboration, not independent "
-    "confirmation.",
-    "wUSDC.b is itself depegged since the 2026-08-25 warp.green bridge "
-    "compromise. Every BYC/wUSDC.b price is quoted in a broken numeraire; the "
-    "USD column here crosses it through the market, never through par.",
-    "A traded VWAP says where trades HAPPENED, not what is EXECUTABLE now. "
-    "The depth ladder is the part that answers the question actually being "
-    "asked when this number gets cited.",
-    "The depth ladder counts COUNTERPARTY offers only. Our own resting offers "
-    "are matched out by trade id (dexie trade_id == offer_log.offer_id). This "
-    "is not a precaution for when the pairs are re-enabled: on 2026-09-01, "
-    "with both BYC pairs disabled and nothing being quoted, FOUR of our "
-    "XCH/BYC offers were still live on dexie -- every one of them recorded "
-    "locally as 'cancelled', with a resolved_at and a cancel_reason. A "
-    "recorded cancel is not a broadcast cancel, so the exclusion matches on "
-    "id regardless of status. What the match cannot cover is stated on each "
-    "book side, beside the depth itself.",
+    (
+        "EVERY VWAP HERE STATES ITS WEIGHT UNIT, and the label is generated from "
+        + "the weights, never hard-coded. Native quote-per-base prices are weighted "
+        + "in BASE units; USD-per-BYC prices are weighted in BYC. Those coincide on "
+        + "BYC/wUSDC.b (base IS BYC) and differ on XCH/BYC (base is XCH). Compare a "
+        + "native VWAP only with another native VWAP: local maker, local taker and "
+        + "the settled tape now share one weighting, so those three ARE "
+        + "like-for-like. A native and a USD VWAP are different averages."
+    ),
+    (
+        "VWAP IS NOT ROBUST TO OUTLIERS. It is reported because it is the cited "
+        + "figure, always beside a median and a trimmed mean. One 1.093 print moved "
+        + "the BYC last-trade 9.3% off a 30-day median of 1.0010; the median moved "
+        + "by nothing."
+    ),
+    (
+        "Maker fills are OUR OWN quotes. A VWAP over them measures where we chose "
+        + "to stand, not where the market is. Taker fills are the counterparty's "
+        + "prices and are the more independent local sample -- which is why the two "
+        + "are never pooled here."
+    ),
+    (
+        "Measured over the whole of August, ~19% of the XCH/BYC tape is our own "
+        + "fills (270 of ~1,402). The OWN-FILL SHARE printed above is this window's "
+        + "own figure, measured independently. Either way, a market statistic that "
+        + "silently pools our fills with everyone else's is part self-portrait."
+    ),
+    (
+        "BYC's par is an ASSUMPTION, not an observation. The engine's fair-value "
+        + "blend feeds BYC's declared par IN, so agreement between a ~1.40 BYC/XCH "
+        + "tape cluster and a 1.41 model output is corroboration, not independent "
+        + "confirmation."
+    ),
+    (
+        "wUSDC.b is itself depegged since the 2026-08-25 warp.green bridge "
+        + "compromise. Every BYC/wUSDC.b price is quoted in a broken numeraire; the "
+        + "USD column here crosses it through the market, never through par."
+    ),
+    (
+        "A traded VWAP says where trades HAPPENED, not what is EXECUTABLE now. "
+        + "The depth ladder is the part that answers the question actually being "
+        + "asked when this number gets cited."
+    ),
+    (
+        "The depth ladder counts COUNTERPARTY offers only. Our own resting offers "
+        + "are matched out by trade id (dexie trade_id == offer_log.offer_id). This "
+        + "is not a precaution for when the pairs are re-enabled: on 2026-09-01, "
+        + "when both BYC pairs were still disabled and nothing was being quoted "
+        + "(XCH/BYC has since been re-enabled), FOUR of our "
+        + "XCH/BYC offers were still live on dexie -- every one of them recorded "
+        + "locally as 'cancelled', with a resolved_at and a cancel_reason. A "
+        + "recorded cancel is not a broadcast cancel, so the exclusion matches on "
+        + "id regardless of status. What the match cannot cover is stated on each "
+        + "book side, beside the depth itself."
+    ),
 ]
 
 

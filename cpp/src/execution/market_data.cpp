@@ -548,6 +548,30 @@ void MarketDataFeed::ingest_dexie(const std::string& pair_name,
     ps.bbo_from_filtered_book = false;
     ps.bbo_filter_had_anchor  = false;
     ps.bbo_filter_had_independent_anchor = false;
+    // [SIDEQUALITY 2026-09-01] ...and the per-side verdicts with them, for
+    // exactly the same reason and with the same failure mode if omitted.
+    //
+    // [review] These three fields were originally left untouched here,
+    // which meant a raw ticker ingest replaced dex_best_bid/ask with NEW
+    // prices while the PREVIOUS cycle's disqualification and anchor
+    // survived beside them.  When the full-offer fetch then throws --
+    // the exact scenario the flags above exist for -- Step 8 pairs a
+    // current raw BBO with a stale verdict about a book that no longer
+    // exists, and re-references a tier against a book_side_ref that was
+    // measured against different prices.  That is the S20 defect shape
+    // (fresh numbers, stale evidence) reintroduced by the very feature
+    // meant to close it.
+    //
+    // Reset is to TRUSTED, not to disqualified: an unexamined book has
+    // not failed anything, and book_side_ref returning to 0 records that
+    // nothing screened it.  Every consumer already falls back correctly
+    // on ref == 0 -- Step 8's effective midpoint reverts to bbo_mid_m,
+    // its per-tier reference reverts to the tier's own side, and the
+    // liquidity bid cap reverts to bbo_ref -- so a raw book behaves
+    // exactly as it did before this feature existed.
+    ps.bid_side_anchor_ok = true;
+    ps.ask_side_anchor_ok = true;
+    ps.book_side_ref      = 0.0;
     // Age the print by its VALUE, not by when we polled: dex_updated_at is
     // re-stamped every heartbeat, so it cannot answer "how old is this
     // trade?".  A first sighting deliberately leaves last_trade_changed_at
