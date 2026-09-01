@@ -1011,8 +1011,16 @@ def fetch_dexie_markets() -> dict:
         return json.load(resp)
 
 
-def dexie_high_low(payload: dict, pair: str) -> dict:
+def dexie_high_low(payload: dict, pair: str,
+                   max_age_days: float = MAX_BAR_AGE_DAYS) -> dict:
     """TickerData-style daily high/low for *pair*, in OUR orientation.
+
+    *max_age_days* is the operator's --max-age-days, threaded in rather than
+    read off the module constant.  It used to be the constant: the header
+    printed the operator's value while this gate silently applied 2.0, so
+    --max-age-days 5 produced a report claiming a 5-day limit and refusing
+    at 2.  The value actually applied is returned in the row so the report
+    can print the limit that fired rather than one it assumed.
 
     These are the same price_high / price_low that dexie_client.cpp:647-650
     parses into TickerData and dexie_client.cpp:821-828 orientation-swaps --
@@ -1078,13 +1086,21 @@ def dexie_high_low(payload: dict, pair: str) -> dict:
     # Freshness applies here too, and from a better clock than the database
     # has: dexie stamps the last trade, so this is real trade staleness
     # rather than sampling staleness.
+    #
+    # FRACTIONAL, not timedelta.days.  This is a datetime subtraction, so
+    # .days FLOORS to whole days: a 2.96-day-old print reported as 2 and
+    # PASSED a limit documented as 2.0 days.  The bar ages elsewhere in this
+    # file are date-minus-date, where .days is exact and no such rounding
+    # exists -- this was the only datetime subtraction, and the only place
+    # the floor could bite.
     last_date = last.get("date")
     stale_days = None
     if last_date:
         try:
             stamped = datetime.fromisoformat(
                 str(last_date).replace("Z", "+00:00"))
-            stale_days = (datetime.now(timezone.utc) - stamped).days
+            stale_days = ((datetime.now(timezone.utc) - stamped)
+                          .total_seconds() / 86400.0)
         except ValueError:
             stale_days = None
 
@@ -1098,7 +1114,10 @@ def dexie_high_low(payload: dict, pair: str) -> dict:
         "inverted": not inverted,
         "range_bps": math.log(our_high / our_low) * BPS,
         "degenerate": not (our_high > our_low > 0.0),
-        "stale": stale_days is not None and stale_days > MAX_BAR_AGE_DAYS,
+        "stale": stale_days is not None and stale_days > max_age_days,
+        # The limit this row was actually judged against, carried so the
+        # report prints the number that fired instead of assuming one.
+        "max_age_days": max_age_days,
     })
     return out
 
@@ -1318,11 +1337,81 @@ def print_report(results: list[dict], dexie_rows: list[dict],
                 )
                 if recent > 0.0:
                     ratio = obs_last / recent
-                    if ratio <= 1.0:
+                    if ratio <= 1.0 and r["dislocated"]:
+                        # A RATIO AT OR BELOW 1.0 IS AGREEMENT, NOT AN
+                        # ALL-CLEAR.
+                        #
+                        # This branch used to print "No discrepancy to look
+                        # into." for XCH/BYC while the DISLOCATION FLAG note
+                        # three lines below reported the same book at 14,667
+                        # bps.  Both were emitted, adjacent, in the same run,
+                        # and the output contradicted itself.
+                        #
+                        # The cause is that the ratio compares two
+                        # quantities and carries no information about the
+                        # MAGNITUDE of either.  The divisor is the LARGER of
+                        # the two comparators (max of CS and AR, chosen so
+                        # the tool understates rather than overstates a
+                        # discrepancy), which minimises the ratio -- so a
+                        # dislocated book whose estimator agrees it is
+                        # dislocated lands here, at 0.99x, and got read out
+                        # as though the book were fine.
+                        #
+                        # So this branch now consults the same two facts the
+                        # elif below does: the posted magnitude and
+                        # r["dislocated"].  When the flag is set the
+                        # all-clear is never emitted; what is said instead is
+                        # that the ESTIMATOR AGREES THE BOOK IS WIDE.  That
+                        # is a materially different statement and the
+                        # operator needs it.
                         body = (
-                            f"The posted book spread is at or below the "
-                            f"most recent two-day estimate ({ratio:.2f}x). "
-                            f"No discrepancy to look into."
+                            f"NOT AN ALL-CLEAR. The posted book spread is "
+                            f"{obs_last:,.1f} bps, at or above the "
+                            f"{DISLOCATION_SPREAD_BPS:,.0f} bps dislocation "
+                            f"threshold, so this book carries the "
+                            f"dislocation flag; and the like-for-like "
+                            f"comparator, {recent:,.1f} bps, is of the SAME "
+                            f"MAGNITUDE, which is the only reason the ratio "
+                            f"is {ratio:.2f}x. A ratio at or below 1.0 says "
+                            f"the two quantities AGREE. It says nothing "
+                            f"about how large either of them is, and here "
+                            f"they agree at a dislocated width: what this "
+                            f"line reports is that THE ESTIMATOR AGREES THE "
+                            f"BOOK IS WIDE, not that the book is fine. The "
+                            f"agreement closes the DISCREPANCY, not the "
+                            f"dislocation -- the finding is the DISLOCATION "
+                            f"FLAG note below, and it stands. It remains "
+                            f"NOT a finding that a side of the book is "
+                            f"absent, and this tool does not draw one: "
+                            f"neither estimator identifies SIDES -- both "
+                            f"consume a high, a low and a close, with no "
+                            f"step at which a bid is told from an ask -- "
+                            f"and a high/low range cannot distinguish a "
+                            f"genuinely widened spread from a quote that "
+                            f"went missing. The per-side question belongs "
+                            f"to the engine's per-side anchor test, "
+                            f"cpp/include/xop/execution/book_side_quality"
+                            f".hpp, which scores each side against an "
+                            f"INDEPENDENT anchor. Take the verdict from "
+                            f"there, not from here."
+                        )
+                    elif ratio <= 1.0:
+                        # Reached only with the dislocation flag CLEAR, so
+                        # the magnitude is known to be below the threshold
+                        # and the all-clear is about a book that is
+                        # genuinely narrow.  Said with the figure attached,
+                        # and scoped to the direction this tool exists to
+                        # watch (posted wider than estimated), because a
+                        # bare all-clear is what went wrong above.
+                        body = (
+                            f"The posted book spread, {obs_last:,.1f} bps, "
+                            f"is at or below the most recent two-day "
+                            f"estimate ({ratio:.2f}x) and below the "
+                            f"{DISLOCATION_SPREAD_BPS:,.0f} bps dislocation "
+                            f"threshold, so the book carries no dislocation "
+                            f"flag. No discrepancy to look into in the "
+                            f"direction this block watches -- a posted "
+                            f"spread far WIDER than the estimate."
                         )
                     elif r["dislocated"]:
                         body = (
@@ -1409,20 +1498,25 @@ def print_report(results: list[dict], dexie_rows: list[dict],
             print(f"  24h high {d['high']:.6f}  low {d['low']:.6f}{swap}")
             print(f"  log range {d['range_bps']:,.1f} bps")
             last_price = d.get("last_price")
+            # Two decimals, because the age is FRACTIONAL and the whole
+            # point of making it so is that a reader can tell 2.96 from 2.
+            # Printing the floor here would put the gate's real input back
+            # out of sight even after the gate itself was fixed.
             print(f"  last trade "
                   f"{'n/a' if last_price is None else f'{last_price:.6f}'} "
                   f"at {d.get('last_date')}"
                   + ("" if d.get("last_trade_age_days") is None
-                     else f" ({d['last_trade_age_days']} day"
-                          f"{'' if d['last_trade_age_days'] == 1 else 's'}"
-                          f" ago)"))
+                     else f" ({d['last_trade_age_days']:.2f} days ago)"))
             if d["degenerate"]:
                 print("  DEGENERACY GATE: high == low. One print, no range. "
                       "Refused.")
             if d.get("stale"):
+                # The limit that actually fired, read off the row, not the
+                # module constant: this gate takes the operator's
+                # --max-age-days and the two used to disagree.
                 print(f"  FRESHNESS GATE: last trade is "
-                      f"{d['last_trade_age_days']} days old, limit "
-                      f"{MAX_BAR_AGE_DAYS:g}. Refused.")
+                      f"{d['last_trade_age_days']:.2f} days old, limit "
+                      f"{d.get('max_age_days', max_age_days):g}. Refused.")
             print()
 
 
@@ -1475,7 +1569,9 @@ def main(argv: list[str] | None = None) -> int:
                         help=f"freshness gate: refuse a pair whose newest "
                              f"USABLE bar -- the newest one that actually "
                              f"contributes to an estimate, not merely the "
-                             f"newest one seen -- is older than this "
+                             f"newest one seen -- is older than this. Also "
+                             f"gates the --dexie last-trade age, which is "
+                             f"measured in FRACTIONAL days "
                              f"(default {MAX_BAR_AGE_DAYS:g})")
     parser.add_argument("--dexie", action="store_true",
                         help="also GET api.dexie.space/v1/markets for live "
@@ -1523,7 +1619,8 @@ def main(argv: list[str] | None = None) -> int:
         except (urllib.error.URLError, TimeoutError, ValueError) as exc:
             print(f"error: dexie unreachable: {exc}", file=sys.stderr)
             return 2
-        dexie_rows = [dexie_high_low(payload, p) for p in selected]
+        dexie_rows = [dexie_high_low(payload, p, args.max_age_days)
+                      for p in selected]
 
     if args.json:
         print(json.dumps({

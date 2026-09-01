@@ -1505,11 +1505,23 @@ TEST(ConfigParserTest, SideQualityKnobs_DisabledBandAccepted) {
     }
 }
 
-TEST(ConfigParserTest, SideQualityKnobs_WiderThanMidBandWarnsButLoads) {
+TEST(ConfigParserTest, SideQualityKnobs_WiderThanMidBandIsAcceptedNotRejected) {
     // A side band wider than mid_anchor_band_ratio lets a side stay a trusted
     // reference while the mid it implies is refused.  config.cpp treats that
-    // as a coherence smell and emits a spdlog WARNING -- it must NOT throw,
-    // and both values must survive exactly as written.
+    // as a coherence smell: it emits an advisory spdlog WARNING and loads the
+    // values anyway.  THIS TEST CHECKS THE LOAD, NOT THE WARNING -- the
+    // combination must not throw, and both values must survive exactly as
+    // written.
+    //
+    // The warning itself is unobserved BY DESIGN.  Nothing in this suite
+    // installs an spdlog sink -- this comment is the only mention of spdlog
+    // anywhere under cpp/tests -- and standing up sink-capture machinery for
+    // one advisory line would cost more than it protects: the line changes no
+    // behaviour, and a regression in its wording is not a defect worth a
+    // fixture.  Hence the name: "accepted, not rejected" is the whole of the
+    // contract verified here.  The previous name, WarnsButLoads, promised a
+    // check on the warning that does not exist, which is how a later reader
+    // concludes there is coverage where there is none.
     TempYaml tmp(with_market_data(
         "  mid_anchor_band_ratio: 2.0\n"
         "  book_side_anchor_band_ratio: 6.0\n"));

@@ -500,11 +500,24 @@ def main() -> int:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
 
+    deleted: dict[str, int] = {}
+
     try:
-        if args.dry_run:
-            conn.execute("BEGIN")
-        else:
-            conn.execute("BEGIN IMMEDIATE")
+        # TWO TRANSACTIONS, not one.
+        #
+        # [review 2026-09-01] The rollups and the prune used to share a
+        # single transaction, so the refusal's rollback -- which must
+        # discard the DELETEs -- also discarded four tables' worth of
+        # rollup UPSERTs, and returned before the summary was printed. The
+        # operator who hit the guard saw no sign the rollups had run, and
+        # they had not persisted.
+        #
+        # The two halves do not need shared atomicity. The rollup UPSERTs
+        # are idempotent and non-destructive: they derive from `snapshots`
+        # rows that are still there, and re-running reproduces them. The
+        # DELETEs are neither, so they keep a transaction of their own and
+        # a refusal still leaves the raw tables exactly as it found them.
+        conn.execute("BEGIN" if args.dry_run else "BEGIN IMMEDIATE")
 
         print("Building rollups...")
         rollup_stats: list[tuple[str, int, int]] = []
@@ -512,7 +525,22 @@ def main() -> int:
             source_rows, upserts = _build_rollup(conn, spec)
             rollup_stats.append((spec.table, source_rows, upserts))
 
-        print("Pruning raw tables...")
+        if args.dry_run:
+            conn.rollback()
+        else:
+            conn.commit()
+
+        # Reported here, between the phases, so the refusal path shows it
+        # too -- and so it only ever describes work that is already
+        # durable.
+        suffix = "  (dry-run; rolled back)" if args.dry_run else ""
+        print(f"\nRollup summary:{suffix}")
+        for table, source_rows, upserts in rollup_stats:
+            print(f"  {table:<14} source_rows={source_rows:>8}  upserts={upserts:>8}")
+
+        conn.execute("BEGIN" if args.dry_run else "BEGIN IMMEDIATE")
+
+        print("\nPruning raw tables...")
         deleted = _prune_raw_tables(
             conn,
             raw_retention_days=args.raw_retention_days,
@@ -532,11 +560,10 @@ def main() -> int:
             conn.commit()
 
     except LargePruneRefused as exc:
-        # Roll back explicitly rather than relying on close(): the rollup
-        # UPSERTs already ran inside this transaction, and they are the
-        # half that would otherwise survive a bare close on some driver
-        # versions. Refusing has to leave the database untouched, not
-        # partly updated.
+        # Roll back explicitly rather than relying on close(). Nothing has
+        # been deleted -- the guard raises before the first DELETE -- but
+        # the prune transaction is still open, and refusing has to leave
+        # the raw tables exactly as they were, not merely usually.
         conn.rollback()
         conn.close()
         print()
@@ -546,10 +573,6 @@ def main() -> int:
         conn.close()
 
     after_size = _db_size_bytes(db_path)
-
-    print("\nRollup summary:")
-    for table, source_rows, upserts in rollup_stats:
-        print(f"  {table:<14} source_rows={source_rows:>8}  upserts={upserts:>8}")
 
     print("\nPrune summary:")
     for table, rows in deleted.items():

@@ -7101,7 +7101,15 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
         pcs.quote_min_half_spread_bps = quote_min_half_spread_bps;
 
         // Fetch competing offers for gap-aware dynamic tier spacing.
-        auto comp_offers = market_data_->get_competing_offers(pair_name);
+        // [review round 5] Book AND verdict from ONE lock. Reading the
+        // offers here and the verdict from the snapshot let the two
+        // desync: ingest_dexie resets the snapshot verdict to trusted on
+        // every raw ticker poll, while nothing clears this offer store, so
+        // after a failed offers fetch the ladder would anchor against a
+        // stale junk book that the live verdict called healthy -- re-arming
+        // the self-cross this work exists to stop.
+        const auto comp_book = market_data_->get_competing_book(pair_name);
+        const auto& comp_offers = comp_book.offers;
 
         // Query per-tier fill rates from the offer log for adaptive sizing.
         LiquidityConfig ladder_cfg = liq.config();
@@ -7137,11 +7145,8 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
         // is not a reference at all.  Read from the same snapshot the Step 8
         // sanity checks read, so the ladder and the checks that police it
         // cannot disagree about which side is trustworthy.
-        {
-            const auto side_snap = state_->get_market(pair_name);
-            ladder_cfg.book_bid_side_anchor_ok = side_snap.bid_side_anchor_ok;
-            ladder_cfg.book_ask_side_anchor_ok = side_snap.ask_side_anchor_ok;
-        }
+        ladder_cfg.book_bid_side_anchor_ok = comp_book.bid_side_anchor_ok;
+        ladder_cfg.book_ask_side_anchor_ok = comp_book.ask_side_anchor_ok;
 
         // Generate the tier ladder.
         // When competing offers are available, uses the gap-aware overload

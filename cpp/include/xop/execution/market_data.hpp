@@ -970,6 +970,31 @@ public:
     std::vector<CompetingOffer> get_competing_offers(
         const std::string& pair_name) const;
 
+    /// A competing book together with the per-side verdict that measured
+    /// THAT book, read under one lock.
+    ///
+    /// [review round 5] ingest_dexie resets PairState's per-side verdict to
+    /// trusted on every raw ticker poll, because those raw prices were
+    /// screened by nothing.  But the OFFERS live in a different store that
+    /// nothing clears, so after a failed offers fetch the two desync: the
+    /// PairState verdict says "trusted" while competing_offers_ still holds
+    /// the previous cycle's junk book.  A consumer reading the offers from
+    /// one place and the verdict from the other then anchors against a book
+    /// no live verdict describes -- re-arming precisely the self-cross this
+    /// work exists to stop.
+    ///
+    /// So the verdict is stored BESIDE the offers and handed out with them.
+    /// A consumer that uses both must use this, not the snapshot.
+    struct CompetingBook {
+        std::vector<CompetingOffer> offers;
+        bool   bid_side_anchor_ok{true};
+        bool   ask_side_anchor_ok{true};
+        double book_side_ref{0.0};
+    };
+
+    [[nodiscard]] CompetingBook get_competing_book(
+        const std::string& pair_name) const;
+
     // -- Arbitrage signal access --------------------------------------------
 
     /// Retrieve the most recent arbitrage signal for a pair, if any.
@@ -1257,6 +1282,10 @@ private:
     /// Per-pair competing offers tracked from order book.  Guarded by mtx_competitors_.
     mutable std::shared_mutex                          mtx_competitors_;
     std::unordered_map<std::string, std::vector<CompetingOffer>> competing_offers_;
+    /// [review round 5] Per-side verdict for the book in competing_offers_,
+    /// written in the SAME critical section so the two cannot desync.
+    struct BookQuality { bool bid_ok{true}; bool ask_ok{true}; double ref{0.0}; };
+    std::unordered_map<std::string, BookQuality> competing_book_quality_;
 
     /// Per-pair latest competitor metrics.  Guarded by mtx_competitor_metrics_.
     mutable std::shared_mutex                          mtx_competitor_metrics_;

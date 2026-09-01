@@ -2086,8 +2086,32 @@ void MarketDataFeed::ingest_competing_offers(
             : OrderbookMid{};
         const double ob_mid = ob.mid;
 
+        // [review round 5] Compute the per-side verdict HERE, before the
+        // competitors lock, so the book and the verdict that measured it
+        // are written in ONE critical section and cannot desync.  See
+        // get_competing_book().
+        //
+        // DERIVED, not read straight from config: the bypass must never be
+        // stricter than the published-mid gate's own confirmation
+        // threshold, or it strips the evidence that gate is waiting for.
+        //
+        // ref_price, NOT offer_ref_used.  offer_ref_used falls back to this
+        // pair's own last accepted mid, and letting a pair's own history
+        // disqualify a side of its own book is the self-referential lock-in
+        // that made the 187.461980 mid unkillable.  Only an INDEPENDENT
+        // anchor may disqualify.
+        const double agree_max =
+            bookside::effective_agree_max_spread_bps(
+                cfg.book_side_agree_max_spread_bps,
+                cfg.mid_gate_book_confirm_max_spread_bps);
+        const auto sq = bookside::classify_sides(
+            filtered_best_bid, filtered_best_ask, ref_price,
+            cfg.book_side_anchor_band_ratio, agree_max);
+
         std::unique_lock lock(mtx_competitors_);
         competing_offers_[pair_name] = std::move(filtered);
+        competing_book_quality_[pair_name] =
+            BookQuality{sq.bid_ok, sq.ask_ok, sq.ref};
 
         // Override dex BBO when the filtered book has meaningful offers.
         // This requires mtx_pairs_ -- we can't nest it under mtx_competitors_
@@ -2159,18 +2183,11 @@ void MarketDataFeed::ingest_competing_offers(
             // and both sides remain trusted -- unexamined, and recorded as
             // such.
             {
-                // [review] DERIVED, not read straight from config: the
-                // bypass must never be stricter than the published-mid
-                // gate's own confirmation threshold, or it strips the
-                // evidence that gate is waiting for.  See
-                // effective_agree_max_spread_bps.
-                const double agree_max =
-                    bookside::effective_agree_max_spread_bps(
-                        cfg.book_side_agree_max_spread_bps,
-                        cfg.mid_gate_book_confirm_max_spread_bps);
-                const auto sq = bookside::classify_sides(
-                    filtered_best_bid, filtered_best_ask, ref_price,
-                    cfg.book_side_anchor_band_ratio, agree_max);
+                // The verdict was computed above, beside the offers it
+                // measured; this only mirrors it onto PairState for the
+                // snapshot consumers (Step 8).  Consumers that read the
+                // OFFERS must use get_competing_book() instead, or they
+                // reintroduce the desync this arrangement exists to close.
                 ps.bid_side_anchor_ok = sq.bid_ok;
                 ps.ask_side_anchor_ok = sq.ask_ok;
                 ps.book_side_ref      = sq.ref;
@@ -2457,6 +2474,27 @@ std::vector<CompetingOffer> MarketDataFeed::get_competing_offers(
         return {};
     }
     return it->second;
+}
+
+MarketDataFeed::CompetingBook MarketDataFeed::get_competing_book(
+    const std::string& pair_name) const
+{
+    // ONE lock covers both maps, which is the entire point: a caller must
+    // not be able to observe a book from one cycle beside a verdict from
+    // another.
+    std::shared_lock lock(mtx_competitors_);
+    CompetingBook out;
+    if (auto it = competing_offers_.find(pair_name);
+        it != competing_offers_.end()) {
+        out.offers = it->second;
+    }
+    if (auto q = competing_book_quality_.find(pair_name);
+        q != competing_book_quality_.end()) {
+        out.bid_side_anchor_ok = q->second.bid_ok;
+        out.ask_side_anchor_ok = q->second.ask_ok;
+        out.book_side_ref      = q->second.ref;
+    }
+    return out;
 }
 
 // =========================================================================
