@@ -109,3 +109,53 @@ def test_no_profile_can_widen_past_the_credit_ring_at_defaults():
         assert half_spread * p.spread_mult < ring, (
             "%s widens 0.25%% to %.2f%%, at or past the %.1f%% ring"
             % (stage, half_spread * p.spread_mult, ring))
+
+
+def test_no_stage_can_widen_the_spread_past_the_requote_trigger():
+    """[merge] The invariant that spans both changes, and neither tested.
+
+    #131 derived the ring guarantee against the FIXED 0.25% half-spread:
+    placement + skew + rounding tick must stay inside the re-quote
+    trigger, or a fully skewed leg is born past it and churns every tick.
+    This branch then made the half-spread PER-STAGE -- SESSION widens it
+    1.6x -- so the guarantee is now a claim about every profile, not one
+    number, and nothing checked the combination.
+
+    It holds because max_price_skew_frac subtracts the half-spread from
+    the same budget: widening the quote shrinks the skew allowance rather
+    than pushing the total out. This test exists so that stays true when
+    someone retunes a multiplier -- the failure it prevents is silent and
+    costs the whole depth-earning window to churn.
+
+    Swept over real oracle levels because the tick term is a FRACTION of
+    price: QQQ-VOL traded at 0.01615 on 2026-08-31, where one 0.0001 tick
+    is 0.62% -- eight times its cost at 0.15.
+    """
+    from gui.services.permuto.quoting import REQUOTE_AT_RING_FRACTION
+    from gui.services.permuto.risk import max_price_skew_frac
+
+    ring, base_half_spread = 2.0, 0.25
+    trigger = ring * REQUOTE_AT_RING_FRACTION
+
+    for stage in Stage:
+        for fresh in (True, False):
+            profile = profile_for(stage, oracle_fresh=fresh)
+            if not profile.quote:
+                continue        # nothing is placed, nothing can drift
+            half_spread = base_half_spread * profile.spread_mult
+            for oracle in (0.15, 0.07, 0.0416, 0.01615):
+                tick_frac = 0.0001 / oracle
+                skew = max_price_skew_frac(ring, half_spread, tick_frac)
+                total = half_spread + skew * 100.0 + tick_frac * 100.0
+                assert total <= trigger + 1e-9, (
+                    "%s (fresh=%s) at oracle %.5g: placement %.4f%% + skew "
+                    "%.4f%% + tick %.4f%% = %.4f%%, past the %.3f%% trigger "
+                    "-- a fully skewed leg is born already stale"
+                    % (stage.name, fresh, oracle, half_spread,
+                       skew * 100.0, tick_frac * 100.0, total, trigger))
+                # And still inside the ring once composed multiplicatively.
+                landed = ((1.0 + skew) * (1.0 + half_spread / 100.0)
+                          - 1.0) * 100.0
+                assert landed <= ring + 1e-9, (
+                    "%s: composed leg at %.4f%% is outside the %.1f%% ring"
+                    % (stage.name, landed, ring))
