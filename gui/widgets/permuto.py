@@ -602,6 +602,8 @@ class PermutoWidget(QWidget):
         self._close_thread: Optional[QThread] = None
         self._close_worker: Optional[QObject] = None
         self._close_fraction: float = 1.0
+        #: True while the quoting loop owns a venue session.
+        self._quoting_live: bool = False
         self._markets_worker: Optional[Any] = None
         # [2026-08-31] Target stays SMALL, cap goes wide, and the two are
         # deliberately no longer equal.
@@ -871,7 +873,33 @@ class PermutoWidget(QWidget):
 
     # -- operator close ---------------------------------------------------- #
 
+    def set_quoting_live(self, live: bool) -> None:
+        """Told by MainWindow when the quoting loop owns a venue session.
+
+        [review] The close worker builds its OWN PermutoClient and calls
+        ensure_session(). PermutoClient documents that concurrent renewals
+        install different tokens which invalidate each other, so pressing
+        Close while the loop is running can put both into alternating
+        401/reauth -- at the exact moment the operator is trying to get
+        out of a position, which is the worst possible time for the
+        session to be contended.
+
+        Rather than race it, the control says why it is unavailable. Stop
+        quoting, close, then start again.
+        """
+        self._quoting_live = bool(live)
+        self._set_close_enabled(not self._quoting_live)
+        if self._quoting_live:
+            self._close_note.setText(
+                "Stop quoting first. The close needs its own venue session, "
+                "and two sessions for one identity invalidate each other's "
+                "tokens.")
+        elif self._close_note.text().startswith("Stop quoting first"):
+            self._close_note.setText("")
+
     def _set_close_enabled(self, on: bool) -> None:
+        if on and getattr(self, "_quoting_live", False):
+            on = False          # the guard above always wins
         for btn in getattr(self, "_close_btns", {}).values():
             btn.setEnabled(on)
 

@@ -2677,6 +2677,21 @@ class MainWindow(QMainWindow):
         _log.info("[startup] applying permuto startup state: on")
         self._on_permuto_toggle(True)
 
+    def _tell_permuto_page_quoting(self, live: bool) -> None:
+        """Keep the page's close control in step with the loop.
+
+        Wrapped because the page is created lazily and an older build may
+        not have the setter; a missing close control must never break the
+        toggle path that starts and stops trading.
+        """
+        page = getattr(self, "_permuto_widget", None)
+        setter = getattr(page, "set_quoting_live", None)
+        if callable(setter):
+            try:
+                setter(live)
+            except Exception:  # noqa: BLE001 - cosmetic, never fatal
+                _log.debug("permuto: could not update the close control")
+
     def _on_permuto_toggle(self, want_on: bool) -> None:
         if want_on:
             # [INTENT v0.10.7] The slider records intent unconditionally;
@@ -2714,6 +2729,9 @@ class MainWindow(QMainWindow):
             self._permuto_last_action = "starting"
             self._permuto_runner.start()
             self._permuto_desired_on = True
+            # The loop now owns a venue session; the page's close control
+            # must not open a second one for the same identity.
+            self._tell_permuto_page_quoting(True)
         else:
             # Ask it to stop. The switch stays STOPPING until the worker's
             # cancel is acknowledged -- off means flat, and the acknowledgement
@@ -2788,6 +2806,9 @@ class MainWindow(QMainWindow):
 
     def _on_permuto_stopped(self, reason: str) -> None:
         _log.info("[Permuto] %s", reason)
+        # Released here rather than on the stop REQUEST: off means flat, and
+        # the acknowledgement is what makes the session actually gone.
+        self._tell_permuto_page_quoting(False)
         self.statusBar().showMessage("Permuto: %s" % reason, 10000)
         self._refresh_venue_switches()
 

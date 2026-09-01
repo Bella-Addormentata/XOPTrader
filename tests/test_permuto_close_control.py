@@ -104,3 +104,35 @@ def test_a_partial_fill_is_reported_as_such(widget):
     text = widget._close_note.text()
     assert "part-fill" in text and "does not retry" in text, \
         "the operator must know this is one shot, not a managed close"
+
+
+# --------------------------------------------------------------------------- #
+# Session contention -- two clients for one identity fight over the token
+# --------------------------------------------------------------------------- #
+
+def test_the_close_is_refused_while_quoting_is_live(widget):
+    """[review] The close worker opens its OWN venue session.
+
+    PermutoClient documents that concurrent renewals install different
+    tokens which invalidate each other, so pressing Close while the loop
+    runs can put both into alternating 401/reauth -- at exactly the moment
+    the operator is trying to get out of a position.
+    """
+    widget.set_quoting_live(True)
+    assert not any(b.isEnabled() for b in widget._close_btns.values())
+    assert "Stop quoting first" in widget._close_note.text()
+
+
+def test_stopping_quoting_returns_the_close_control(widget):
+    widget.set_quoting_live(True)
+    widget.set_quoting_live(False)
+    assert all(b.isEnabled() for b in widget._close_btns.values())
+    assert "Stop quoting first" not in widget._close_note.text()
+
+
+def test_the_guard_outranks_a_plain_re_enable(widget):
+    """A failure handler calling _set_close_enabled(True) must not hand the
+    buttons back while the loop still owns the session."""
+    widget.set_quoting_live(True)
+    widget._on_close_failed("boom")          # re-enables on the normal path
+    assert not any(b.isEnabled() for b in widget._close_btns.values()),         "a failure re-enabled the close control during live quoting"
