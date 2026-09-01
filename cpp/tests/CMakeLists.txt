@@ -63,6 +63,7 @@ add_executable(xop_tests
     test_reconcile_verdict.cpp
     test_bbo_sanity.cpp
     test_book_side_quality.cpp
+    test_cross_guard.cpp
     test_no_loss_floor.cpp
     test_par_anchor.cpp
     test_coingecko_parse.cpp

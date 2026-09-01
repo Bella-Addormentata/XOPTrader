@@ -25,6 +25,7 @@
 #include "xop/execution/fair_value_solver.hpp"
 #include "xop/execution/par_anchor.hpp"
 #include "xop/execution/book_side_quality.hpp"
+#include "xop/execution/cross_guard.hpp"
 #include "xop/execution/mid_gate.hpp"
 #include "xop/risk/valuation_authority.hpp"
 #include "xop/risk/usd_route.hpp"
@@ -10088,23 +10089,63 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         // ~10M mojos and exposed us to adverse selection for one block
         // per offer before cancellation.
         if (mid > 0) {
+            // [CROSSGUARD 2026-09-01] SHADOW MEASUREMENT. Suppression is
+            // UNCHANGED -- still the published-mid verdict, exactly as since
+            // 4d3f30d. The BBO verdict is computed beside it and only the
+            // DISAGREEMENT is logged.
+            //
+            // Why: this guard was written to pre-empt classify_tier_staleness
+            // and was a bit-exact predictor of it, until a932a5d moved the
+            // canceller onto the BBO one day later and left the guard behind.
+            // It has never been modified since. See cross_guard.hpp for the
+            // full account. But it is INERT on the only enabled pair (zero
+            // firings in six live rotations, one in the whole retained
+            // corpus), every "would suppress" figure available is a
+            // reconstruction rather than an observation, and a change in this
+            // family already shipped a regression through four review rounds.
+            // So: count first, decide from data.
+            const auto book_snap_cg = state_->get_market(pair_name);
+            const double cg_bid = static_cast<double>(book_snap_cg.best_bid);
+            const double cg_ask = static_cast<double>(book_snap_cg.best_ask);
+            const double cg_mid = static_cast<double>(mid);
+
             std::vector<TierQuote> mid_safe;
             mid_safe.reserve(fee_filtered_tiers.size());
             std::size_t suppressed_count = 0;
+            std::size_t shadow_would_keep = 0;   // we drop, canceller would not
+            std::size_t shadow_would_drop = 0;   // we keep, canceller would drop
+            std::size_t shadow_indeterminate = 0;
+            bool        shadow_inverted = false;
+            bool        shadow_mid_fallback = false;
+
             for (const auto& tier : fee_filtered_tiers) {
-                if (tier.side == Side::Bid && tier.price > mid) {
-                    spdlog::info("[Engine] Step 8: {} bid tier {} suppressed "
-                                 "-- price {} > mid {} (crossed)",
-                                 pair_name, tier.tier_index,
-                                 tier.price, mid);
-                    ++suppressed_count;
-                    continue;
+                const bool is_ask = (tier.side != Side::Bid);
+                const double px   = static_cast<double>(tier.price);
+
+                const auto live = execution::classify_cross_published_mid(
+                    is_ask, px, cg_mid);
+                const auto shadow = execution::classify_cross_bbo(
+                    is_ask, px, cg_bid, cg_ask, cg_mid);
+                shadow_inverted     |= shadow.book_inverted;
+                shadow_mid_fallback |= shadow.used_mid_fallback;
+
+                const bool live_crossed =
+                    (live == execution::CrossVerdict::Crossed);
+                if (shadow.verdict == execution::CrossVerdict::Indeterminate) {
+                    ++shadow_indeterminate;
+                } else {
+                    const bool shadow_crossed =
+                        (shadow.verdict == execution::CrossVerdict::Crossed);
+                    if (live_crossed && !shadow_crossed) ++shadow_would_keep;
+                    if (!live_crossed && shadow_crossed) ++shadow_would_drop;
                 }
-                if (tier.side == Side::Ask && tier.price < mid) {
-                    spdlog::info("[Engine] Step 8: {} ask tier {} suppressed "
-                                 "-- price {} < mid {} (crossed)",
-                                 pair_name, tier.tier_index,
-                                 tier.price, mid);
+
+                // SUPPRESSION IS THE LIVE VERDICT, UNCHANGED.
+                if (live_crossed) {
+                    spdlog::info("[Engine] Step 8: {} {} tier {} suppressed "
+                                 "-- price {} vs mid {} (crossed)",
+                                 pair_name, is_ask ? "ask" : "bid",
+                                 tier.tier_index, tier.price, mid);
                     ++suppressed_count;
                     continue;
                 }
@@ -10115,6 +10156,26 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                              "{}/{} tiers",
                              pair_name, suppressed_count,
                              fee_filtered_tiers.size());
+            }
+            if (shadow_would_keep > 0 || shadow_would_drop > 0) {
+                // The number this shadow exists to produce. If it stays at
+                // zero the question answers itself and the guard can be left
+                // alone; if it does not, this line is the evidence a fix
+                // would be built on.
+                spdlog::warn("[Engine] Step 8: {} [CROSSGUARD-SHADOW] "
+                             "published-mid and BBO verdicts disagree on "
+                             "{} tier(s) we dropped and {} we kept "
+                             "(mid={}, bbo={}/{}{}{}) -- suppression "
+                             "unchanged, this is measurement only",
+                             pair_name, shadow_would_keep, shadow_would_drop,
+                             mid, book_snap_cg.best_bid, book_snap_cg.best_ask,
+                             shadow_inverted ? ", BOOK INVERTED" : "",
+                             shadow_mid_fallback ? ", mid-fallback" : "");
+            }
+            if (shadow_indeterminate > 0) {
+                spdlog::debug("[Engine] Step 8: {} [CROSSGUARD-SHADOW] "
+                              "{} tier(s) had no usable reference",
+                              pair_name, shadow_indeterminate);
             }
             fee_filtered_tiers = std::move(mid_safe);
         }
