@@ -555,3 +555,36 @@ def test_quoting_going_live_during_confirmation_cancels_the_send(widget,
 
     assert not started, "a send was started while quoting was live"
     assert "Quoting started" in widget._close_note.text()
+
+
+def test_an_unresolved_close_is_not_shown_as_failed(widget):
+    """[review] The widget was the half of the tri-state I left undone.
+
+    send_close() separates a refusal -- the position is untouched -- from
+    an answer that never arrived, where the order MAY HAVE EXECUTED. The
+    screen collapsed both into "Failed", which reads as "nothing
+    happened" and invites the second press that doubles the close. The
+    service-layer distinction is worth nothing if the UI erases it.
+    """
+    widget._on_close_sent({
+        "ok": False, "sent": 0,
+        "note": "UNRESOLVED -- no verdict for QQQ-VOL-PERP: timeout",
+        "unknown": ["QQQ-VOL-PERP: timeout"], "partial": [], "skipped": []})
+    text = widget._close_note.text()
+    assert not text.startswith("Failed"), text
+    assert "UNRESOLVED" in text, text
+    assert "MAY HAVE EXECUTED" in text, text
+    assert "Check the position" in text, text
+    logged = widget._activity.toPlainText()
+    assert "UNRESOLVED" in logged and "FAILED" not in logged, logged
+
+
+def test_a_plain_refusal_is_still_shown_as_failed(widget):
+    """The other side of it: a refusal leaves the position exactly where
+    it was, and must not be dressed up as uncertainty."""
+    widget._on_close_sent({"ok": False, "sent": 0,
+                           "note": "all 1 leg(s) refused: margin",
+                           "unknown": [], "partial": [], "skipped": []})
+    text = widget._close_note.text()
+    assert text.startswith("Failed"), text
+    assert "MAY HAVE EXECUTED" not in text, text

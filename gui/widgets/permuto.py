@@ -1192,6 +1192,25 @@ class PermutoWidget(QWidget):
             # while some legs had already filled -- so say what went out,
             # and repeat the no-retry warning, exactly as the success path
             # does.
+            # [review] UNRESOLVED IS NOT FAILED, and the widget was the
+            # half of that fix I left undone. send_close() separates a
+            # refusal (the position is untouched) from an answer that
+            # never arrived (the order MAY HAVE EXECUTED) -- and then
+            # this rendered both as "Failed", which reads as "nothing
+            # happened" and invites the second press that doubles the
+            # close. The whole point of the tri-state is lost if the
+            # screen collapses it again.
+            unresolved = result.get("unknown") or []
+            if unresolved:
+                self._close_note.setText(
+                    "UNRESOLVED: %d leg(s) got no verdict and MAY HAVE "
+                    "EXECUTED -- %s. Check the position on the venue "
+                    "before closing again; this button does not retry."
+                    % (len(unresolved), note))
+                self._log_activity(
+                    "Close UNRESOLVED (%d sent, %d unverified): %s"
+                    % (sent, len(unresolved), note))
+                return
             if sent:
                 self._close_note.setText(
                     "Partly sent: %d leg(s) went out before this failed -- "
