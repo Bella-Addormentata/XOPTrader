@@ -973,7 +973,13 @@ class QuoteRunner:
         # exposure on a 500,000 account. No single market has to breach
         # its own limit for the book to breach the account.
         positions_usd: dict = {}
-        for market in self._markets:
+        # [review] EVERY position the account reports, not just the
+        # markets we quote. MarginState.positions comes from
+        # /exchange/account and QuoteRunner can be built with a SUBSET,
+        # so exposure in an unconfigured market -- or one held manually
+        # -- was invisible to the budget and it authorised that much
+        # again. A budget that only sees its own book is not a budget.
+        for market in set(self._markets) | set(state.positions or {}):
             oracle = oracles.get(market)
             try:
                 contracts = abs(float(
@@ -1050,6 +1056,34 @@ class QuoteRunner:
             if _verdict.action is RiskAction.REDUCE_ONLY:
                 newly_pinned.add(market)
 
+        # [review] RECONCILED HERE, above the not-any_quoted early
+        # returns. A pinned market makes decide() answer HOLD, so the
+        # tick returns before the tail -- and the pin could never be
+        # CLEARED. An operator who reduced the position would find the
+        # market still latched and its missing side never rebuilt, which
+        # is a worse stuck state than the one this was added to report.
+        #
+        # [audit] Announce a market that has just run out of room, and
+        # forget one that has recovered. This is the state that cost
+        # ~40%% of a simulated night in silence: the book goes
+        # one-sided, depth credit is min(bid, ask) so the market earns
+        # exactly zero, and nothing else says so -- assess() reports
+        # NORMAL because the floor leaves |position| a hair under the
+        # cap. Overnight the recovery needs a BID fill, which
+        # one-directional flow will not provide, so an operator who is
+        # not told will find out in the morning.
+        for market in sorted(newly_pinned - self._pinned_markets):
+            _log.critical(
+                "permuto: %s IS PINNED ONE-SIDED -- inventory has "
+                "consumed the whole side cap, so this market now earns "
+                "ZERO depth (credit is min(bid, ask)). It cannot "
+                "recover without a fill on the other side. Reduce the "
+                "position to resume earning.", market)
+        for market in sorted(self._pinned_markets - newly_pinned):
+            _log.warning("permuto: %s is two-sided again -- depth "
+                         "resumes", market)
+        self._pinned_markets = newly_pinned
+
         # A market holding a live quote that risk wants shrunk or gone must
         # act now, whatever decide() thought of the quote itself.
         # Only markets the quoting loop below will NOT reach. One that is
@@ -1057,21 +1091,26 @@ class QuoteRunner:
         # place the shrinking side -- and pre-empting it here would cancel
         # the book and then skip the replacement, leaving the market flat
         # when it should have been reduced.
-        # [review] ...EXCEPT one that is already exactly what reduce-only
-        # wants. Making one_sided_ok cover a room-pinned market stopped
-        # decide() re-quoting it, but HOLD is not QUOTE, so the market
-        # fell into risk_forced instead and was cancelled -- then the
-        # next tick saw an empty book and upserted the same leg again.
-        # Alternating cancel/upsert is the same churn wearing a
-        # different hat, and it took a review to notice the fix had
-        # moved the problem rather than removed it.
+        # [review] NO EXEMPTION HERE, and the attempt is instructive.
+        # A pinned market whose lone resting leg is already the
+        # reduce-only shape gets cancelled and re-placed every other
+        # tick, and exempting it looked free. It is not: reconcile()
+        # records bid/ask PRICES and discards each order's
+        # reduce_only flag and size, so nothing here can tell that
+        # lone quote from an ordinary one -- and if risk later turns
+        # REDUCE_ONLY, the un-replaced order can fill THROUGH flat
+        # into opposite exposure. The exemption also caught FLATTEN,
+        # which must retract everything by definition.
+        #
+        # The churn is a rate-limit problem; those two are position
+        # and margin problems. Correct needs RestingQuote to carry
+        # reduce_only and size -- the same rework the RAMP cap
+        # revalidation needs, and it belongs with it.
         risk_forced = [
             m for m, r in risk_by_market.items()
             if r.action is not RiskAction.NORMAL
             and not self._resting.get(m, RestingQuote()).empty
             and results.get(m, ("", ""))[0] != LoopAction.QUOTE.value
-            and not self._already_reducing(
-                m, float(state.positions.get(m, 0.0) or 0.0))
         ]
         # [sweep] Unconditional, NOT `and not any_quoted`. This is the same
         # mistake as the withdraw path two commits ago: a market past its
@@ -1365,7 +1404,17 @@ class QuoteRunner:
                     if clamped != leg.price:
                         leg = type(leg)(leg.market, leg.side, clamped,
                                         leg.size, leg.reduce_only)
-                if self._curfew is not None and oracle and oracle > 0.0:
+                # [review] ...and only when a per-market cap EXISTS. With
+                # the no-limit sentinel assess_curfew() leaves both side
+                # caps at zero -- correctly, a curfew cannot be a
+                # fraction of a number nobody set -- so this clamp
+                # dropped BOTH legs and the tick reported risk_blocked.
+                # Fixing the sentinel for assess() alone was half a fix:
+                # a flat account with the cap disabled quoted nothing at
+                # all. The portfolio budget is the limit in that
+                # configuration, and it is applied above.
+                if (self._curfew is not None and oracle and oracle > 0.0
+                        and self._max_position_usd > 0.0):
                     allowed = permitted_leg_size(
                         leg.side is Side.BUY,
                         float(state.positions.get(market, 0.0) or 0.0),
@@ -1376,42 +1425,16 @@ class QuoteRunner:
                     # fractional remainder is a rejected batch.
                     allowed = math.floor(allowed)
                     if allowed < 1.0:
-                        # [audit] NOT SILENT. Dropping this leg makes
-                        # the book one-sided, and depth credit is
-                        # min(bid, ask) -- so this market now earns
-                        # EXACTLY ZERO, for the rest of the night if
-                        # the room does not come back. assess() still
-                        # says NORMAL here, because the floor leaves
-                        # |position| a fraction BELOW the cap, so
-                        # nothing else in the tick names the state.
-                        # It cost ~40%% of a simulated night unnoticed.
-                        newly_pinned.add(market)
+                        # The room-floor branch is a one-contract-wide
+                        # window (short_cap - 1 < |pos| < short_cap);
+                        # REDUCE_ONLY fires first in every reachable
+                        # case and is where the pin is recorded.
                         continue
                     if allowed < leg.size:
                         leg = type(leg)(leg.market, leg.side, leg.price,
                                         allowed, leg.reduce_only)
                 legs.append(leg)
 
-        # [audit] Announce a market that has just run out of room, and
-        # forget one that has recovered. This is the state that cost
-        # ~40%% of a simulated night in silence: the book goes
-        # one-sided, depth credit is min(bid, ask) so the market earns
-        # exactly zero, and nothing else says so -- assess() reports
-        # NORMAL because the floor leaves |position| a hair under the
-        # cap. Overnight the recovery needs a BID fill, which
-        # one-directional flow will not provide, so an operator who is
-        # not told will find out in the morning.
-        for market in sorted(newly_pinned - self._pinned_markets):
-            _log.critical(
-                "permuto: %s IS PINNED ONE-SIDED -- inventory has "
-                "consumed the whole side cap, so this market now earns "
-                "ZERO depth (credit is min(bid, ask)). It cannot "
-                "recover without a fill on the other side. Reduce the "
-                "position to resume earning.", market)
-        for market in sorted(self._pinned_markets - newly_pinned):
-            _log.warning("permuto: %s is two-sided again -- depth "
-                         "resumes", market)
-        self._pinned_markets = newly_pinned
 
         if to_cancel:
             # Before the upsert, so the reduce-only leg is not racing the
@@ -1911,32 +1934,6 @@ class QuoteRunner:
 
         self._reopen_pending = False
         return TickResult("quote", "%d legs" % len(legs), results)
-
-    def _already_reducing(self, market: str, position: float) -> bool:
-        """True when the resting book is ALREADY the reduce-only shape.
-
-        Cancelling such a market achieves nothing: the only leg resting is
-        the one that shrinks the position, at a size risk has already
-        permitted. Cancel it and the next tick simply places it again --
-        which is how a pinned market alternates cancel and upsert all
-        night instead of resting.
-
-        A short is reduced by BUYING, a long by SELLING. Anything
-        two-sided, empty, or resting on the wrong side is not this state
-        and must still be forced.
-        """
-        resting = self._resting.get(market, RestingQuote())
-        if resting.empty or resting.two_sided:
-            return False
-        if math.isnan(position):            # unreadable: force it
-            return False
-        if position < 0.0:
-            return (resting.bid_price is not None
-                    and resting.ask_price is None)
-        if position > 0.0:
-            return (resting.ask_price is not None
-                    and resting.bid_price is None)
-        return False
 
     def _base_size(self, oracle: Optional[float]) -> float:
         """Contracts that carry ``target_depth_usd`` of notional per side."""

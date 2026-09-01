@@ -2924,35 +2924,75 @@ def test_a_pinned_market_tells_decide_its_missing_side_is_intended(monkeypatch):
         "as a gap to repair -- decide() will re-upsert it every tick")
 
 
-def test_an_already_reducing_book_is_not_cancelled_and_replaced():
-    """[review] The one_sided_ok fix moved the churn instead of ending it.
+def test_a_pin_clears_once_the_position_is_reduced():
+    """[review] The pin could be set but never cleared.
 
-    Once decide() stops re-quoting a pinned market it returns HOLD -- and
-    HOLD is not QUOTE, so the market dropped straight into risk_forced
-    and was cancelled. The next tick then saw an empty book and placed
-    the same leg again: alternating cancel/upsert, the same ~12,600
-    requests a night wearing a different hat.
-
-    Cancelling a book that is ALREADY exactly what reduce-only wants
-    achieves nothing, so it is exempt. Anything two-sided, empty, or
-    resting on the wrong side is still forced.
+    A pinned market makes decide() answer HOLD, so any_quoted is false
+    and the tick returns at the no-quote branch -- which sat ABOVE the
+    line that updates _pinned_markets. An operator who reduced the
+    position would find the market still latched and its missing side
+    never rebuilt: a worse stuck state than the one the pin was added to
+    report.
     """
-    from gui.services.permuto.quoting import RestingQuote as RQ
     c = _Client(account=_account(-100_000.0))
     r = _runner(c, curfew_enabled=True, max_position_usd=12_000.0)
+    r.tick(_OVERNIGHT, _ORACLE, {})
+    assert _MKT in r._pinned_markets, "the pin was never set"
 
-    # A short reduces by BUYING, so a lone bid is the correct shape.
-    r._resting[_MKT] = RQ(0.0695, None)
-    assert r._already_reducing(_MKT, -100_000.0) is True
+    # The operator closes the position. Nothing else changes.
+    c.account_payload = _account(0.0)
+    r.tick(_OVERNIGHT + 60.0, _ORACLE, {})
+    assert _MKT not in r._pinned_markets, (
+        "the pin survived the position being reduced -- the missing side "
+        "will never be rebuilt")
 
-    # ...and everything else still gets forced.
-    assert r._already_reducing(_MKT, 100_000.0) is False   # long: wrong side
-    r._resting[_MKT] = RQ(None, 0.0705)
-    assert r._already_reducing(_MKT, 100_000.0) is True    # long: lone ask
-    assert r._already_reducing(_MKT, -100_000.0) is False
-    r._resting[_MKT] = RQ(0.0695, 0.0705)
-    assert r._already_reducing(_MKT, -100_000.0) is False  # two-sided
-    r._resting[_MKT] = RQ()
-    assert r._already_reducing(_MKT, -100_000.0) is False  # empty
-    r._resting[_MKT] = RQ(0.0695, None)
-    assert r._already_reducing(_MKT, float("nan")) is False  # unreadable
+
+def test_the_no_limit_sentinel_still_quotes_both_sides():
+    """[review] Fixing the sentinel for assess() alone was half a fix.
+
+    assess_curfew() leaves both side caps at zero when no per-market cap
+    is configured -- correctly, a curfew cannot be a fraction of a number
+    nobody set. But permitted_leg_size() was still handed those zero
+    caps, so BOTH legs were dropped and a flat account with the cap
+    disabled reported risk_blocked and quoted nothing at all.
+    """
+    c = _Client(account=_account(0.0))
+    r = _runner(c, curfew_enabled=True, max_position_usd=0.0)
+    res = r.tick(_OVERNIGHT, _ORACLE, {})
+
+    assert res.action == "quote", (
+        "a flat account with the cap disabled quoted nothing: %s"
+        % res.reason)
+    sides = sorted(leg["side"] for leg in (c.last_batch or []))
+    assert sides == ["buy", "sell"], (
+        "depth credit is min(bid, ask); one side earns nothing: %s" % sides)
+
+
+def test_the_budget_counts_positions_in_markets_we_do_not_quote():
+    """[review] A budget that only sees its own book is not a budget.
+
+    MarginState.positions comes from /exchange/account, and QuoteRunner
+    can be built with a SUBSET of markets -- so exposure held in an
+    unconfigured market, or opened by hand, was invisible to the
+    portfolio budget and it authorised that much again on top.
+
+    Asserted as a DIFFERENCE against a control, because the absolute
+    outcome depends on sizing that is not the point here: the same
+    account, plus one holding the runner does not quote, must stop being
+    two-sided. (It cannot be valued without an oracle, and an unvaluable
+    neighbour has to fail closed rather than be skipped.)
+    """
+    def _sides(extra):
+        positions = {_MKT: -50_000.0}
+        positions.update(extra)
+        c = _Client(account={"equity_usd": 500_000.0,
+                             "used_margin_usd": 0.0,
+                             "positions": positions})
+        r = _runner(c, curfew_enabled=False, max_position_usd=250_000.0)
+        r.tick(1.0, {_MKT: 0.07}, {})
+        return sorted(leg["side"] for leg in (c.last_batch or []))
+
+    assert _sides({}) == ["buy", "sell"], "the control was not two-sided"
+    assert _sides({"OTHER-VOL-PERP": 9_000_000.0}) == ["buy"], (
+        "a holding in an unquoted market did not reach the portfolio "
+        "budget -- exposure outside the configured set is invisible to it")
