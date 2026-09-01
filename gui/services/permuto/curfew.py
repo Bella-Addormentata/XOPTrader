@@ -598,10 +598,20 @@ def assess_curfew(
         # No configured limit means "unlimited" downstream; a curfew cannot
         # be expressed as a fraction of it, so say so rather than inventing
         # a number the operator never set.
+        # [review] The CAPS are inactive here; the CLOCK is not, and
+        # dropping schedule_stage conflated the two. posture_stage then
+        # pinned to UNSCHEDULED on every tick, and profile_for() reads a
+        # frozen oracle in UNSCHEDULED as the stale-price trap -- so an
+        # account with no configured position limit WITHDREW its book
+        # 180s into every overnight freeze, losing precisely the window
+        # the CLOSED profile exists to earn in. Whether a cap is set says
+        # nothing about whether the cash market is open.
         return CurfewState(Stage.UNSCHEDULED, full_cap_usd,
                            "no position limit configured; curfew inactive",
                            long_cap_usd=full_cap_usd,
-                           short_cap_usd=full_cap_usd)
+                           short_cap_usd=full_cap_usd,
+                           schedule_stage=_schedule_stage(
+                               now_s, closes, opens)[0])
 
     long_target = (floor_usd if floor_usd is not None
                    else full_cap_usd * OVERNIGHT_LONG_FRACTION)

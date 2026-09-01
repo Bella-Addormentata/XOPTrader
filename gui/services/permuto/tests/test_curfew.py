@@ -525,3 +525,31 @@ def test_a_print_landing_exactly_on_the_bell_counts_as_after_it():
     g.observe(900.0, {"QQQ-VOL-PERP": 0.07})
     g.observe(999.0, {"QQQ-VOL-PERP": 0.08})
     assert g.changed_since("QQQ-VOL-PERP", 1000.0) is False
+
+
+def test_an_unset_position_cap_still_knows_what_time_it_is():
+    """[review] The caps being inactive is not the clock being unknown.
+
+    assess_curfew() returns early when no position limit is configured --
+    a curfew cannot be a fraction of a number nobody set. But it dropped
+    schedule_stage on the way out, so posture_stage pinned to UNSCHEDULED
+    on every tick; profile_for() reads a frozen oracle in UNSCHEDULED as
+    the stale-price trap, and the book was therefore WITHDRAWN 180
+    seconds into every overnight freeze.
+
+    Overnight is the cheapest depth of the week and the frozen oracle
+    there is expected, not a fault. An operator who left max_position_usd
+    unset lost that window entirely, with nothing in the logs naming the
+    cap as the cause.
+    """
+    overnight = CLOSES_UTC[0] + 4 * 3_600.0
+    state = assess_curfew(overnight, 0.0, frozen_oracle=True)
+    assert state.stage is Stage.UNSCHEDULED       # caps really are off
+    assert state.schedule_stage is Stage.CLOSED, (
+        "the clock stage was thrown away with the cap: %s"
+        % (state.schedule_stage,))
+
+    # And mid-session it reports the session, not a blanket UNSCHEDULED.
+    mid = OPENS_UTC[0] + SETTLE_AFTER_OPEN_S + 3_600.0
+    assert assess_curfew(mid, 0.0, frozen_oracle=False).schedule_stage \
+        is Stage.SESSION

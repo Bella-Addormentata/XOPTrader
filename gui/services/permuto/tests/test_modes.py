@@ -137,7 +137,7 @@ def test_no_stage_can_widen_the_spread_past_the_requote_trigger():
     ring, base_half_spread = 2.0, 0.25
     trigger = ring * REQUOTE_AT_RING_FRACTION
 
-    for stage in Stage:
+    for stage in list(Stage):
         for fresh in (True, False):
             profile = profile_for(stage, oracle_fresh=fresh)
             if not profile.quote:

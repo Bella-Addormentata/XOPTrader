@@ -2773,3 +2773,33 @@ def test_a_SURPLUS_row_is_equally_unusable():
     r._resting = {}
     r.tick(_MID_SESSION + 5.0, _ORACLE, {})
     assert r._cross_backoff.offset_pct(_MKT) == widened,         "a surplus row count decayed the backoff anyway"
+
+
+def test_a_mixed_failure_is_not_blamed_on_the_trading_mode(monkeypatch):
+    """[review] The posture took the blame for someone else's failure.
+
+    The mode-withdrawal label was awarded when every SKIPPED market was a
+    mode skip -- but a market left marked "quote" that produced no legs
+    (an invalid ladder, a clamp to zero size) appears in neither list, so
+    the equality held anyway. The tick then reported a clean mode
+    withdrawal and the real cause never surfaced anywhere.
+
+    Blaming the posture is only honest when the posture is the whole
+    story, so the denominator has to be EVERY market.
+    """
+    c = _Client(account=_account(100_000.0))
+    r = _runner2(c, curfew_enabled=True, max_position_usd=12_000.0)
+
+    # _MKT goes quiet and is withdrawn by posture; _MKT2 keeps printing so
+    # it stays a quoting market -- but its ladder yields nothing.
+    monkeypatch.setattr("gui.services.permuto.runner.quote_ladder",
+                        lambda *a, **k: [])
+    t = _MID_SESSION
+    res = None
+    for i in range(6):
+        res = r.tick(t, {_MKT: 0.07, _MKT2: 0.07 + (i % 5) * 0.0004}, {})
+        t += 60.0
+
+    assert res.action != "withdraw", (
+        "a ladder that produced nothing was reported as a mode withdrawal, "
+        "hiding the real cause: %s" % res.reason)

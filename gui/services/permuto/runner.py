@@ -1320,9 +1320,15 @@ class QuoteRunner:
                           if a in ("skip", "withdraw")
                           and profile_by_market.get(m) is not None
                           and not profile_by_market[m].quote]
-            if mode_skips and len(mode_skips) == len(
-                    [m for m, (a, _) in results.items()
-                     if a in ("skip", "withdraw")]):
+            # [review] EVERY market, not every skipped one. Comparing
+            # against the skip/withdraw rows alone ignored markets left
+            # marked "quote" that produced no legs -- an invalid ladder,
+            # a curfew clamp to zero size -- because those sit in neither
+            # list. The equality held anyway, so a MIXED failure was
+            # reported as a clean mode withdrawal and the real cause
+            # never surfaced. Blaming the posture is only honest when
+            # the posture is the whole story.
+            if mode_skips and len(mode_skips) == len(results):
                 return TickResult("withdraw",
                                   results[mode_skips[0]][1], results)
             return TickResult("risk_blocked",
