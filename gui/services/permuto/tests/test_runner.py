@@ -2803,3 +2803,34 @@ def test_a_mixed_failure_is_not_blamed_on_the_trading_mode(monkeypatch):
     assert res.action != "withdraw", (
         "a ladder that produced nothing was reported as a mode withdrawal, "
         "hiding the real cause: %s" % res.reason)
+
+
+def test_a_posture_change_retracts_even_with_no_position_cap():
+    """[review] The latch and the posture drifted apart.
+
+    With max_position_usd unset, assess_curfew() pins curfew.stage at
+    UNSCHEDULED forever -- but posture_stage now follows schedule_stage,
+    so CLOSED -> PREOPEN moves the PROFILE (full size to half, 1.0x
+    spread to 1.6x) while a latch keyed only on curfew.stage sees nothing
+    happen. decide() answers HOLD for a quote that is still fresh and
+    in-ring, so a full-size overnight book rode straight through the
+    run-up to the bell at a size the new posture forbids.
+
+    Caused by the fix that gave posture its own stage: the transition key
+    has to cover both, or every posture-only change is invisible.
+    """
+    c = _Client(account=_account(100_000.0))
+    r = _runner(c, curfew_enabled=True, max_position_usd=0.0)   # no cap
+
+    # Overnight: CLOSED posture, a book resting.
+    r.tick(_OVERNIGHT, _ORACLE, {})
+    assert not r._resting[_MKT].empty, "no overnight book to carry"
+    cancels_before = len(getattr(c, "cancelled", []) or [])
+
+    # Cross into PREOPEN. The cap stage has not moved -- it cannot -- but
+    # the profile has, so the resting book must be retracted and rebuilt.
+    r.tick(OPENS_UTC[1] - 1_500.0, _ORACLE, {})
+
+    assert getattr(r, "_curfew_retract_pending", False) or \
+        len(getattr(c, "cancelled", []) or []) > cancels_before, (
+            "a posture-only transition left the old book resting")

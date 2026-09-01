@@ -309,6 +309,10 @@ class QuoteRunner:
         self._curfew_enabled = curfew_enabled
         self._freeze = OracleFreeze()
         self._curfew_stage = None
+        #: (cap stage, schedule stage). Both, because with no cap
+        #: configured the first never changes while the second drives
+        #: the quoting profile.
+        self._curfew_stage_key = None
         self._curfew = None
         self._ring_pct = ring_pct
         self._half_spread_pct = half_spread_pct
@@ -481,7 +485,19 @@ class QuoteRunner:
             curfew = assess_curfew(
                 now_s, self._max_position_usd,
                 frozen_oracle=self._freeze.frozen(now_s))
-            if curfew.stage is not self._curfew_stage:
+            # [review] THE POSTURE STAGE COUNTS TOO, not just the cap
+            # stage. With no position limit configured, curfew.stage is
+            # pinned at UNSCHEDULED forever while posture now follows
+            # schedule_stage -- so CLOSED -> PREOPEN moved the PROFILE
+            # (full size to half, 1.0x spread to 1.6x) and this latch
+            # never noticed. decide() answers HOLD for a quote that is
+            # still fresh and in-ring, so a full-size overnight book sat
+            # live straight through the run-up to the bell at a size the
+            # new posture does not allow. Introduced by the fix that
+            # gave posture its own stage; the transition key has to
+            # cover both or they drift apart.
+            stage_key = (curfew.stage, curfew.schedule_stage)
+            if stage_key != self._curfew_stage_key:
                 _log.warning("permuto: inventory curfew %s -> %s: %s "
                              "(long $%.0f / short $%.0f of $%.0f)",
                              getattr(self._curfew_stage, "value", "none"),
@@ -842,6 +858,8 @@ class QuoteRunner:
                 retracted = True
                 if self._curfew is not None:
                     self._curfew_stage = self._curfew.stage
+                    self._curfew_stage_key = (
+                        self._curfew.stage, self._curfew.schedule_stage)
 
         # [MODES] Computed ONCE, above the risk loop, because the stage is a
         # property of the tick and not of a market.
