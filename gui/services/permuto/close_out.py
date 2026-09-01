@@ -70,7 +70,9 @@ def read_positions(client: Any, now_s: float) -> dict:
     Signed the same way ``runner._margin_state`` signs it, and for the same
     reason: a row whose side we cannot read is worse than useless, because
     an unsigned size makes a short look like a long and "reduce" then means
-    "sell more". Unreadable rows are dropped rather than guessed.
+    "sell more". An unreadable row REFUSES THE WHOLE PLAN --
+    ClosePayloadError, not a quiet omission. Dropping one reports less
+    exposure than exists, on the control an operator uses to escape it.
 
     BOTH DOCUMENTED SHAPES. [review] This accepted only the LIST form, so a
     perfectly valid dict payload -- the signed form `_margin_state` handles

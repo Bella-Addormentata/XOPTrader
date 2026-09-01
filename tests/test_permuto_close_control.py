@@ -312,11 +312,11 @@ def test_lot_sizes_reject_anything_not_finite_and_positive(monkeypatch):
     operator reaches for to get out. Junk venue metadata must fall back to
     the published grid, not silently empty the plan.
     """
-    from gui.widgets.permuto import _default_lot_sizes
+    from gui.widgets.permuto import _default_venue_snapshot
 
     monkeypatch.setattr(
         "gui.services.permuto.live._default_venue_state",
-        lambda: {"flags": {"specs": {
+        lambda: {"oracles": {"QQQ-VOL-PERP": 0.07}, "flags": {"specs": {
             "GOOD-PERP": {"lot_size": 5.0},
             "INF-PERP": {"lot_size": float("inf")},
             "NAN-PERP": {"lot_size": float("nan")},
@@ -326,4 +326,57 @@ def test_lot_sizes_reject_anything_not_finite_and_positive(monkeypatch):
             "NULL-PERP": {"lot_size": None},
             "JUNK-PERP": "not a dict",
         }}})
-    assert _default_lot_sizes() == {"GOOD-PERP": 5.0}
+    prices, lots = _default_venue_snapshot()
+    assert lots == {"GOOD-PERP": 5.0}
+    # ...and the same single read supplies the prices.
+    assert prices == {"QQQ-VOL-PERP": 0.07}
+
+
+def test_the_close_worker_cannot_outlive_its_join_budget():
+    """[review] A live-order thread was terminable mid-flight.
+
+    The client's default request timeout is 30s and _join() waited 10s
+    before terminate(), so shutdown could kill the worker AFTER the venue
+    had received an order and BEFORE the answer arrived -- leaving the
+    operator with no record of whether their close went out. That is the
+    one failure this control exists to prevent.
+
+    The arithmetic, not just the constants: worst case is session +
+    account + the fresh re-read + one order per market, each bounded by
+    CLOSE_REQUEST_TIMEOUT_S, and the join must cover all of it.
+    """
+    from gui.widgets import permuto as permuto_mod
+    from gui.services.permuto.live import MARKETS
+
+    worst_case_requests = 3 + len(MARKETS)
+    worst_case_ms = worst_case_requests * permuto_mod.CLOSE_REQUEST_TIMEOUT_S * 1000
+    assert permuto_mod.CLOSE_JOIN_MS >= worst_case_ms, (
+        "join budget %dms is under the %.0fms worst case (%d requests at "
+        "%.1fs) -- a live order thread can still be terminated"
+        % (permuto_mod.CLOSE_JOIN_MS, worst_case_ms, worst_case_requests,
+           permuto_mod.CLOSE_REQUEST_TIMEOUT_S))
+
+
+def test_the_close_client_is_built_with_the_bounded_timeout(monkeypatch):
+    """The constant is worthless if the worker does not pass it."""
+    from gui.widgets import permuto as permuto_mod
+
+    seen = {}
+
+    class _FakeClient:
+        def __init__(self, identity, user_id="", timeout=None, **kw):
+            seen["timeout"] = timeout
+
+        def ensure_session(self, now_s):
+            raise RuntimeError("stop here -- construction is the assertion")
+
+    monkeypatch.setattr("gui.services.permuto.client.PermutoClient",
+                        _FakeClient)
+    worker = permuto_mod._CloseWorker(object(), 1.0, mode="plan")
+    failures = []
+    worker.failed.connect(lambda msg: failures.append(msg))
+    worker.run()
+
+    assert seen.get("timeout") == permuto_mod.CLOSE_REQUEST_TIMEOUT_S, (
+        "the close worker used the venue default, not the bounded timeout")
+    assert failures, "the fake should have surfaced its error"

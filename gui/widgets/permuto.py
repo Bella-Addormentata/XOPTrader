@@ -474,7 +474,39 @@ def _default_market_reader() -> dict:
     return {"prices": prices, "trading_paused": bool(flags.get("trading_paused"))}
 
 
-def _default_lot_sizes() -> dict:
+#: Per-request ceiling for the operator-close worker. Below the venue
+#: default so no single call can outlive the join budget on its own.
+CLOSE_REQUEST_TIMEOUT_S = 8.0
+
+#: How long shutdown waits for that worker. Sized for its worst-case
+#: sequence -- session, account, a fresh account read, then one order
+#: per market -- at CLOSE_REQUEST_TIMEOUT_S each, so a slow venue does
+#: not end with a live order thread being terminated.
+CLOSE_JOIN_MS = 60000
+
+
+def _default_venue_snapshot() -> tuple:
+    """``(prices, lot_sizes)`` from ONE read of the public routes.
+
+    [review] Both are display/quantisation inputs derived from the same
+    two documents, and fetching them separately doubled the public I/O on
+    the path to an emergency close -- serially, and ahead of the account
+    read that actually matters. One snapshot, both values.
+
+    Never raises for a partial answer: a missing price only costs a
+    notional in the confirmation, and a missing lot falls back to the
+    published grid.
+    """
+    from gui.services.permuto.live import _default_venue_state
+
+    state = _default_venue_state()
+    prices = state.get("oracles")
+    if not isinstance(prices, dict):
+        prices = {}
+    return prices, _lot_sizes_from(state)
+
+
+def _lot_sizes_from(state: dict) -> dict:
     """``{market: lot_size}`` from the public /info/meta specs.
 
     [review] The close planner quantises to whole lots, but nothing was
@@ -487,9 +519,7 @@ def _default_lot_sizes() -> dict:
     the malformed-entry cases, and duplicating it is how the two copies
     drift. Unauthenticated, like the price read beside it.
     """
-    from gui.services.permuto.live import _default_venue_state
-
-    specs = ((_default_venue_state().get("flags") or {}).get("specs") or {})
+    specs = ((state.get("flags") or {}).get("specs") or {})
     lots = {}
     for market, spec in specs.items():
         if not isinstance(spec, dict):
@@ -586,19 +616,34 @@ class _CloseWorker(QObject):
                 user_id = getattr(self._identity.info(), "user_id", "") or ""
             except Exception:  # noqa: BLE001 - unregistered identity has none
                 pass
-            client = PermutoClient(self._identity, user_id=user_id)
+            # [review] A BOUNDED timeout, because the join budget is
+            # finite and this worker sends LIVE ORDERS. At the 30s
+            # default a single request outlives _join()'s wait, so
+            # shutdown could terminate the thread after the venue had
+            # received an order and before the answer came back --
+            # leaving the operator with no record of whether their
+            # close went out. Paired with a close-specific join budget
+            # below that covers the whole worst-case sequence.
+            client = PermutoClient(self._identity, user_id=user_id,
+                                   timeout=CLOSE_REQUEST_TIMEOUT_S)
             client.ensure_session(time.time())
             now = time.time()
 
             if self._mode == "plan":
+                # [review] ONE public snapshot, not two. Wiring lot
+                # sizes in added a second /info/oracle + /info/meta
+                # round trip, run serially AHEAD of the account read
+                # -- so an emergency close waited through two sets of
+                # request timeouts before it even learned the
+                # positions. Both display inputs come from the same
+                # document; read it once.
+                prices, lots = {}, {}
                 try:
-                    prices = _default_market_reader().get("prices") or {}
-                except Exception:  # noqa: BLE001 - notional is a nicety
-                    prices = {}
-                try:
-                    lots = _default_lot_sizes()
-                except Exception:  # noqa: BLE001 - degrades to the 1.0 grid
-                    lots = {}
+                    snapshot = _default_venue_snapshot()
+                except Exception:  # noqa: BLE001 - both are niceties
+                    pass
+                else:
+                    prices, lots = snapshot
                 positions = close_out.read_positions(client, now)
                 legs = (close_out.plan_close(positions, self._fraction, lots)
                         if positions else [])
@@ -1391,12 +1436,20 @@ class PermutoWidget(QWidget):
         self._markets_thread = None
         self._markets_worker = None
 
-        self._join(self._close_thread, "operator close")
+        # [review] A LONGER budget for this one. Terminating a worker
+        # mid-flight is survivable for a market poll and is not for a
+        # live order: the request may already have reached the venue.
+        # CLOSE_JOIN_MS covers the worst-case sequence at the bounded
+        # per-request timeout, so terminate() stays a real last resort
+        # rather than the ordinary outcome of a slow venue.
+        self._join(self._close_thread, "operator close",
+                   wait_ms=CLOSE_JOIN_MS)
         self._close_thread = None
         self._close_worker = None
 
     @staticmethod
-    def _join(thread: Optional[QThread], what: str) -> None:
+    def _join(thread: Optional[QThread], what: str,
+              wait_ms: int = 10000) -> None:
         """Stop one worker, terminating it if it will not go quietly."""
         if thread is None:
             return
@@ -1408,7 +1461,7 @@ class PermutoWidget(QWidget):
         # this exists to prevent. Same terminate-and-wait fallback the other
         # page-owned workers use (settings.py, wallet_balances.py).
         thread.quit()
-        if not thread.wait(10000):
+        if not thread.wait(wait_ms):
             _log.warning("permuto: %s thread did not stop; terminating", what)
             thread.terminate()
             thread.wait(1000)

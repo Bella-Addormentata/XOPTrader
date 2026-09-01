@@ -396,9 +396,10 @@ class PermutoClient:
     def place_order(self, leg: dict, now_s: float) -> Any:
         """POST a single order to ``/exchange/order``.
 
-        Used for reduce-only IOC and ALO close legs -- ``batch_upsert`` is
-        GTC/ALO quotes only; IOC and market orders must go through this
-        route per the API reference.
+        Used for reduce-only IOC close legs -- ``batch_upsert`` is GTC/ALO
+        quotes only; IOC and market orders must go through this route per
+        the API reference. (close_out refuses ALO because its legs carry
+        no limit price; a caller that supplies one may still use it here.)
 
         The caller is responsible for building the payload (market, side,
         size, tif, reduce_only, and optionally order_type / price).
