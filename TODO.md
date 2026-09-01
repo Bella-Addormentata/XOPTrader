@@ -1,7 +1,16 @@
 # XOPTrader Master TODO List
 
 **Created:** 2026-03-24
-**Last audited: 2026-08-29 (v0.10.5)** -- post-release operator-experience round: config hot-reload (a Settings save now applies pair DISABLES to the running engine live, cancelling their resting offers; enables and every other field are honestly reported as restart-required -- the 2026-08-25 "disable landed on disk but the engine kept quoting" hole), and allocation zeroing (a disabled pair's asset is applied as a 0% target while hidden from Target Portfolio Allocation; its saved percent returns when the pair does).
+**Last audited: 2026-09-01 (v0.10.13, PR #134)** -- the BYC price-discovery
+session. Started as "can dexie trade history price BYC" and became an audit of
+Step 8's reference frames. Findings S33-S37 below. Three items shipped as
+MEASUREMENT rather than as fixes, because in each case the defect was real,
+the observed cost was zero, and the pair exhibiting it is disabled (S33/S34).
+The structural item is S36: nothing in `cpp/tests` constructs an `Engine`,
+which is how a regression in this family survived four review rounds and a
+thousand green tests.
+
+**Previously audited: 2026-08-29 (v0.10.5)** -- post-release operator-experience round: config hot-reload (a Settings save now applies pair DISABLES to the running engine live, cancelling their resting offers; enables and every other field are honestly reported as restart-required -- the 2026-08-25 "disable landed on disk but the engine kept quoting" hole), and allocation zeroing (a disabled pair's asset is applied as a 0% target while hidden from Target Portfolio Allocation; its saved percent returns when the pair does).
 
 **Previously audited: 2026-08-29 (v0.10.0)** -- the seven-PR review cycle merged:
 #115 (peg registry, S29/S30), #117 (S27+S32), #120 (S28), #121 (S31), #118
@@ -538,3 +547,35 @@ catch-up -- the same persisted wallet-effect event closes both windows.
   deployment runs ~17-21 s/block, so the real TTL is ~3.5-4 h not 10.4 h;
   the carry TTL cannot fire for BYC itself because quote_usd_factor's par
   fallback always reports a live price.
+
+### S33: Step 8's crossed-mid guard has been mis-referenced since 2026-04-13
+- **Files:** `cpp/src/engine.cpp` (Step 8, "Crossed-mid pre-post guard"), `cpp/include/xop/execution/cross_guard.hpp`
+- **Issue:** The guard drops a bid above the PUBLISHED MID and an ask below it, to pre-empt `classify_tier_staleness` cancelling the offer next cycle. It was a bit-exact predictor of that canceller when written in `4d3f30d` (2026-04-12). **One day later `a932a5d` moved the canceller onto the BBO and did not touch the guard**, recording why in `offer_manager.cpp`: "Using model mid as the threshold is too conservative -- a bid between mid and best_ask is a valid competitive bid, not a crossed offer." `git log -L` over the guard returns `4d3f30d` alone. So for ~4.5 months it has been strictly stricter than the thing it pre-empts, removing every ask in `(best_bid, mid]` and every bid in `[mid, best_ask)` -- the profitable half-spread on each side. The divergence widened when `fv::blend_quote_center` landed 2026-08-01.
+- **Status:** `[~]` -- SHADOW SHIPPED, decision deferred. `cross_guard.hpp` computes both verdicts; Step 8 suppresses on the live one unchanged and logs `[CROSSGUARD-SHADOW]` only on disagreement. **Deliberately not fixed:** the guard is inert on the only enabled pair (zero firings across six live rotations, one in the entire retained corpus), every "would suppress" figure is a reconstruction rather than an observation, and the obvious fix -- re-pointing at `pcs.quote_mid_mojos` -- is wrong: at centre 1.41 against best_bid 1.50 an ask at 1.41 genuinely IS crossed, and only the BBO separates that from an ask at 2.00.
+- **Next step:** read the counter after a deploy. Silence closes the question.
+
+### S34: The fee-to-gain gate scores edge in the wrong price frame
+- **Files:** `cpp/src/engine.cpp` (Step 8 fee gate), `cpp/include/xop/strategy/tier_gain.hpp`
+- **Issue:** The gate measures expected gain as distance from the PUBLISHED MID, justified in-comment as avoiding A-S skew bias. That effect is real -- tier price is `centre*(1 +/- spacing)`, so scoring from the post-A-S centre reports the nominal spacing identically on both sides and erases the inventory-skew cost exactly where A-S places it. But the published mid is a third frame again, and measured on XCH/DBX over 5,080 cycles the error it introduces is **mean 143.2 bps (max 959)** against an A-S skew of **mean 11.8 bps (max 29.9)** -- twelve times larger. Direction is what the comment misses: the gate only DROPS tiers, so a farther reference is more PERMISSIVE, not more conservative. The correct reference is the fair-value centre BEFORE the A-S shift, now persisted as `pcs.quote_fair_centre_mojos`.
+- **Status:** `[~]` -- SHADOW SHIPPED, decision deferred. The gate has **never fired**: zero `skipped (round-trip fee` lines across every retained log including `engine.log`. At the live fee it would need a tier within 0.00134 bps of its reference; measured closest approach is 6.97 bps, and the width floor holds tiers at 70 bps in the fair-value frame.
+- **Next step:** read `[FEEGAIN-SHADOW]` after a deploy.
+- **COUPLED WITH THE SIGN TRAP -- do not fix half of it.** The gate takes `std::abs`, which makes its own `std::max(0.0, ...)` dead code and credits a wrong-side tier in full. The obvious cleanup is a signed edge. **Alone that is a disaster:** under the published-mid frame, bid tiers sit ABOVE the mid whenever the centre shift exceeds the spacing -- 81.4% of cycles -- so a signed edge from the published mid clamps to zero and drops nearly every bid. Frame and sign move together or not at all.
+
+### S35: A per-pair price band was asked for; most of it already existed
+- **Files:** `cpp/include/xop/strategy/bbo_sanity.hpp`, `cpp/include/xop/config.hpp` (`bbo_sanity_*_override`)
+- **Outcome:** `[x]` -- CLOSED. `strategy::classify_tier` already was the requested control: a per-side percentage max-distance bound measured against the SAME-SIDE BBO that SUPPRESSES rather than clamps. Only its two thresholds were global, and the pairs are not alike -- XCH/DBX's sigma width floor never exceeded 141 bps in 48,402 evaluations while XCH/BYC's exceeded 200 bps on 87.7%. Per-pair overrides shipped in PR #134, bounded `(0, 1]` and rejected at load otherwise, because `10` and `1000` are both plausible operator entries and either yields a cap that can never bind.
+- **Recorded so it is not re-proposed, each with evidence:**
+  - **Do not reference the mid.** It breaks exactly when a bound would bind: a mid-referenced 2% band would have forced correct 1.33 bids to 5.4635 on 2026-08-30, and forfeits 78.4% of realized P&L against 5.6% for the same band measured same-side. No production band in the verified literature (LULD, Nasdaq 4702(b)(7), CME, Binance, Kraken, Hyperliquid, Xetra) references an instantaneous mid.
+  - **Do not depth-qualify the reference.** Depth walking is monotone away from the book's interior, so it repairs only too-aggressive touches -- while on a venue with no matching engine aggressive offers are consumed and passive ones fossilize (Spearman rho between dislocation and resting age +0.615; median resting age 0.41 d within 10% of fair vs 125 d at 10-100% off). Its helpful direction covers the small errors; its harmful direction covers the catastrophic ones.
+  - **Tight is not conservative.** When the sigma floor exceeds the bound the innermost tier is already outside it, so every tier is. A 2% passive bound withdraws XCH/BYC on 87.7% of blocks; on XCH/DBX anything >= 10% never binds. Inert or fatal, little in between.
+
+### S36: No test in `cpp/tests` constructs an `Engine`
+- **Files:** all of `cpp/tests/`
+- **Issue:** `xop_core` compiles `engine.cpp` into the test binary, so Step 8's guards LINK but are never EXECUTED. Not theoretical: a change to Step 8 Check 1 in PR #134 converted a check that never fired (0% deviation) into one that cleared every tier on every block (116.7%), and passed **four review rounds and 1000 green tests** before an independent adversarial pass caught it.
+- **Status:** `[~]` -- PARTIALLY MITIGATED. The response so far is to extract decisions into pure headers that tests CAN drive: `book_side_quality.hpp` (`step8_references`), `cross_guard.hpp`, `strategy/tier_gain.hpp`, `risk::peg_usd_observation`. That covers the branch tables but not the wiring between them. A real fix is an Engine-level harness, or a seam letting Step 8 run end to end.
+- **Interim rule:** any change to a Step 8 guard must be accompanied by a pure-function extraction, or it ships unverified.
+
+### S37: `is_own_fill` is never persisted, so no venue-tape statistic is reproducible
+- **Files:** `cpp/src/execution/market_data.cpp` (`ingest_trade`, `ingest_trade_for_vpin`), `db/schema.md`
+- **Issue:** `is_own_fill` is an in-memory VPIN filter parameter. `PRAGMA table_info` confirms neither `trade_log` nor `taker_fills` carries an own-fill column, and both hold only our own fills by construction. ~19% of the August XCH/BYC venue tape was ours (270 of ~1,402 trades), and every estimator in the microstructure literature assumes flow is exogenous -- quoting from a tape we partly wrote closes a feedback loop.
+- **Status:** `[ ]` -- OPEN, and a prerequisite rather than a task on its own. Excluding own fills means matching settled dexie offers against our own ids (`offer_log.offer_id` posted, `trade_log.offer_hash` filled, plus `taker_fills` for offers we crossed) and then PERSISTING the verdict. Until that exists no venue-tape statistic is reproducible. See `docs/price-discovery-from-trade-history.md`.

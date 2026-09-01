@@ -763,6 +763,122 @@ already reaches 1.41 without the tape, the tape's agreement is downstream of
 the same par assumption, and adding it would displace a governed
 fallback anchor with a market edge carrying borrowed error bars.
 
+## 9. What the question turned into: Step 8's reference frames
+
+This note began as "can dexie trade history price BYC". Answering it required
+establishing which price the engine already believes, and that turned into an
+audit of every reference Step 8 consumes. Three of them were measuring against
+the wrong price. None of the three has been changed, and the reasons are worth
+recording as carefully as the findings.
+
+### The pattern
+
+Step 7 produces THREE centres in sequence, and downstream consumers pick
+between them inconsistently:
+
+  1. the PUBLISHED MID -- the book midpoint, band-clamped into the third-party
+     BBO;
+  2. the FAIR-VALUE CENTRE -- after the peg anchor and the fair-value blend,
+     deliberately NOT clamped to the book. Persisted as
+     `pcs.quote_fair_centre_mojos`;
+  3. the POST-A-S CENTRE -- (2) displaced by the Avellaneda-Stoikov
+     reservation offset to manage inventory. Persisted as
+     `pcs.quote_mid_mojos`.
+
+The ladder is built around (3). A guard asking "is our quote sane relative to
+where WE think value is" wants (2) or (3); one asking "will the market pick
+this off" wants the BBO. Nothing wants (1), and yet two guards use it.
+
+### The crossed-mid guard: right rule, obsolete reference
+
+It drops a bid above the published mid and an ask below it, to pre-empt
+`classify_tier_staleness`. It was a bit-exact predictor of that canceller when
+written in `4d3f30d` (2026-04-12). ONE DAY LATER `a932a5d` moved the canceller
+onto the BBO and left the guard alone, recording the reason in
+`offer_manager.cpp`:
+
+> "Using model mid as the threshold is too conservative -- a bid between mid
+> and best_ask is a valid competitive bid, not a crossed offer."
+
+`git log -L` over the guard returns `4d3f30d` alone. For about four and a half
+months it has been strictly STRICTER than the thing it exists to pre-empt: on
+an uncrossed book `best_bid <= mid <= best_ask`, so it removes every ask in
+`(best_bid, mid]` and every bid in `[mid, best_ask)` that the canceller would
+call Fresh -- precisely the profitable half-spread on each side.
+
+The justification in its own comment is an artifact. The "267 crossed_mid
+cancellations ... ~10M mojos" reproduces exactly from `offer_log`, but
+re-tested against the rule that replaced it the next day only 40 of 265 (15%)
+would still be crossed -- and the divergence mechanism did not exist then, so
+the centre WAS the published mid in April.
+
+NOT FIXED, and the reason matters more than the finding. The guard is inert on
+the only enabled pair: zero firings across six live rotations, one in the
+entire retained corpus. Every "would suppress" figure available is a
+reconstruction from persisted ladders, not an observation. And the obvious fix
+-- re-pointing it at the ladder centre -- is wrong: at centre 1.41 against
+best_bid 1.5000 an ask at 1.41 genuinely IS crossed and the canceller kills it
+correctly, while an ask at 2.00 is not. Only the BBO separates those. Shadow
+counter shipped instead (`cross_guard.hpp`, `[CROSSGUARD-SHADOW]`).
+
+### The fee-to-gain gate: the comment names the small term
+
+It scores expected gain as distance from the published mid, justified as
+avoiding A-S skew bias. That effect is real -- tier price is
+`centre*(1 +/- spacing)`, so scoring from (3) reports the nominal spacing
+identically on both sides and erases the inventory-skew cost exactly where A-S
+places it. But (1) is not a neutral alternative, and measured on XCH/DBX over
+5,080 cycles:
+
+| term | mean | max |
+|---|---|---|
+| frame error, (1) vs (2) | 143.2 bps | 959 bps |
+| A-S skew, (2) vs (3) -- what the comment avoids | 11.8 bps | 29.9 bps |
+
+The comment names the small term correctly and then admits one twelve times
+larger. Direction is the part it misses: the gate only DROPS tiers, so a
+reference farther from the ladder is more PERMISSIVE, not more conservative.
+
+NOT FIXED: the gate has never fired. Zero `skipped (round-trip fee` lines
+across every retained log, `engine.log` included. At the live fee it would need
+a tier within 0.00134 bps of its reference; the measured closest approach is
+6.97 bps, and the width floor holds tiers at 70 bps in the fair-value frame.
+Shadow counter shipped (`strategy/tier_gain.hpp`, `[FEEGAIN-SHADOW]`).
+
+### The sign trap, which is why that fix is one change and not two
+
+The fee gate takes `std::abs` of the price difference, making its own
+`std::max(0.0, ...)` dead code and crediting a wrong-side tier -- an ask priced
+BELOW fair value -- in full. The obvious cleanup is a signed edge.
+
+Doing that alone would be a disaster. Under the published-mid frame, bid tiers
+sit ABOVE the mid whenever the centre shift exceeds the tier spacing -- 81.4%
+of cycles -- so a signed edge measured from the published mid clamps to zero
+and drops very nearly every bid. The frame fix and the sign fix are correct
+only together.
+
+### Why measurement rather than repair, three times running
+
+Each of these is a real defect with a verified mechanism. In each case the
+observed cost is zero, the pair exhibiting it is disabled, and the code is
+shared with the only pair that earns. Against that, the counter-evidence is
+that a change to a FOURTH member of this same family -- Step 8 Check 1 -- was
+made in this very PR on a misread mechanism, converted a check that had never
+fired into one that would have cleared every tier on every block, and survived
+four review rounds and a thousand green tests before an independent pass caught
+it.
+
+The structural cause is that nothing in `cpp/tests` constructs an `Engine`:
+`xop_core` compiles `engine.cpp` into the test binary, so these guards link but
+never execute. Extracting each decision into a pure header --
+`book_side_quality.hpp`, `cross_guard.hpp`, `strategy/tier_gain.hpp`,
+`risk::peg_usd_observation` -- is the partial answer, and it is why the shadow
+counters are cheap to add and safe to trust.
+
+Read `[CROSSGUARD-SHADOW]` and `[FEEGAIN-SHADOW]` after a deploy. If both stay
+silent, both questions close themselves on observation rather than argument.
+Tracked as S33, S34 and S36 in `TODO.md`.
+
 ## Appendix: reproducing the measurements
 
 The live bot owns `data/xop_trader.db`. Any script written against it must
