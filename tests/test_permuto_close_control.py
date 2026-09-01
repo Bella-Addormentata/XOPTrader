@@ -425,3 +425,55 @@ def test_more_legs_than_the_budget_covers_are_refused(monkeypatch):
     assert str(len(legs)) in refusals[0], refusals
     assert str(permuto_mod.CLOSE_MAX_LEGS) in refusals[0], refusals
     assert "refusing" in refusals[0].lower(), refusals
+
+
+def test_a_live_order_thread_is_parked_never_terminated():
+    """[review] The join budget cannot be a guarantee, so safety must not
+    rest on it.
+
+    urlopen(timeout=) bounds each socket OPERATION, not the request, so a
+    response that keeps trickling outlasts any budget derived from it.
+    terminate() is TerminateThread on Windows -- the frame dies without
+    unwinding, mid-request -- and whatever the venue then does with that
+    order is never recorded anywhere.
+
+    So the live-order path must never reach terminate(), however long the
+    wait was. Parking costs a leaked thread on a pathological shutdown,
+    which is cheaper than losing the record of a live order.
+    """
+    from gui.widgets import permuto as permuto_mod
+
+    class _StuckThread:
+        def __init__(self):
+            self.quit_called = False
+            self.terminated = False
+
+        def quit(self):
+            self.quit_called = True
+
+        def wait(self, ms):
+            return False            # never stops
+
+        def terminate(self):
+            self.terminated = True
+
+    before = len(permuto_mod._ORPHANED_LIVE_THREADS)
+    stuck = _StuckThread()
+    permuto_mod.PermutoWidget._join(stuck, "operator close", wait_ms=1,
+                                    live_orders=True)
+    assert stuck.quit_called
+    assert not stuck.terminated, (
+        "a thread that may hold a live order was terminated")
+    assert len(permuto_mod._ORPHANED_LIVE_THREADS) == before + 1, (
+        "the thread was neither terminated nor kept referenced -- Qt will "
+        "abort when it is destroyed while running")
+
+    # A worker with no orders in flight is still terminated: leaking those
+    # would be a slow resource leak for no safety gain.
+    ordinary = _StuckThread()
+    permuto_mod.PermutoWidget._join(ordinary, "market poll", wait_ms=1)
+    assert ordinary.terminated, "an ordinary worker was leaked instead"
+    assert len(permuto_mod._ORPHANED_LIVE_THREADS) == before + 1
+
+    permuto_mod._ORPHANED_LIVE_THREADS[:] = \
+        permuto_mod._ORPHANED_LIVE_THREADS[:before]

@@ -476,6 +476,12 @@ def _default_market_reader() -> dict:
 
 from gui.services.permuto.live import MARKETS as _MARKETS_FOR_BUDGET
 
+#: Threads holding live orders that outlived their advisory wait. Kept
+#: referenced ON PURPOSE: destroying a running QThread aborts the
+#: process, and terminating one mid-order loses the acknowledgement.
+#: They finish on their own or die with the process.
+_ORPHANED_LIVE_THREADS: list = []
+
 #: Per-request ceiling for the operator-close worker. Below the venue
 #: default so no single call can outlive the join budget on its own.
 CLOSE_REQUEST_TIMEOUT_S = 8.0
@@ -494,10 +500,12 @@ CLOSE_CALLS_PER_REQUEST = 4
 #: send_close() performs, plus one order per market.
 CLOSE_MAX_LEGS = len(_MARKETS_FOR_BUDGET)
 
-#: How long shutdown waits for that worker. DERIVED, not chosen: a
-#: hand-picked number drifts the moment a market is added or the retry
-#: path changes, and the failure it guards is an order acknowledged by
-#: the venue and never seen by the operator.
+#: How long shutdown waits for that worker before giving up on a tidy
+#: exit. DERIVED, not chosen, so it tracks the retry path -- but
+#: ADVISORY, not a guarantee: urlopen's timeout bounds each socket
+#: operation rather than the whole request, so a trickling response can
+#: outlast it. Nothing unsafe hangs off the number being right; passing
+#: it parks the thread rather than killing it.
 CLOSE_JOIN_MS = int(
     (CLOSE_SESSION_CALLS
      + CLOSE_CALLS_PER_REQUEST * (1 + CLOSE_MAX_LEGS))
@@ -1499,13 +1507,30 @@ class PermutoWidget(QWidget):
             # this is ever reached for the close worker the operator has
             # to be told to go and look at the venue themselves.
             if live_orders:
+                # [review] DO NOT TERMINATE THIS ONE. The wait above is
+                # advisory, not a ceiling: urlopen(timeout=) bounds each
+                # socket operation, not the request, so a response that
+                # keeps trickling can outlast any budget derived from
+                # it. Since the bound cannot be guaranteed, the
+                # behaviour must not depend on it.
+                #
+                # terminate() is TerminateThread on Windows -- the frame
+                # dies without unwinding, mid-request, and whatever the
+                # venue does with that order is never recorded. Parking
+                # the thread instead keeps the QThread OBJECT alive, so
+                # Qt never hits the destroyed-while-running abort, and
+                # the worker gets to finish and log its result. It costs
+                # a leaked thread on a pathological shutdown, which is a
+                # cheaper thing to lose than the record of a live order.
                 _log.critical(
-                    "permuto: the %s thread did not stop in %dms and is "
-                    "being TERMINATED -- an order may have reached the "
-                    "venue without its acknowledgement being recorded. "
-                    "CHECK THE POSITION ON THE VENUE.", what, wait_ms)
-            else:
-                _log.warning("permuto: %s thread did not stop; terminating", what)
+                    "permuto: the %s thread has not stopped after %dms "
+                    "and is being left to finish rather than killed -- "
+                    "an order may be on the wire. CHECK THE POSITION ON "
+                    "THE VENUE.", what, wait_ms)
+                _ORPHANED_LIVE_THREADS.append(thread)
+                return
+            _log.warning("permuto: %s thread did not stop; terminating",
+                         what)
             thread.terminate()
             thread.wait(1000)
 

@@ -521,3 +521,27 @@ def test_no_price_at_all_says_so_rather_than_showing_nothing():
     legs = plan_close({"A": 100.0}, 1.0, {"A": 1.0})
     text = describe(legs, {})
     assert "no notional available" in text, text
+
+
+def test_a_transport_error_is_unresolved_not_a_refusal():
+    """[review] "Failed" reads as "nothing happened", and invites a second
+    press that doubles the close.
+
+    _request() can raise AFTER urlopen() succeeded, while reading the
+    response, so the venue may well have taken the order. A refusal
+    leaves the position untouched; this does not, and the two must not
+    render alike.
+    """
+    c = _Client({"positions": [_pos("QQQ-VOL-PERP", "sell", 100)]}, fail=True)
+    legs = plan_close({"QQQ-VOL-PERP": -100.0}, 1.0)
+    res = send_close(c, 0.0, legs)
+
+    assert res["ok"] is False
+    assert res["unknown"], "a transport error was not recorded as unresolved"
+    assert res["sent"] == 0, "an unresolved leg was counted as sent"
+    note = res["note"]
+    assert "UNRESOLVED" in note, note
+    assert "EXECUTED" in note, note
+    assert "Check the position" in note, note
+    # ...and it must NOT be described as a plain refusal.
+    assert not note.startswith("partial:"), note

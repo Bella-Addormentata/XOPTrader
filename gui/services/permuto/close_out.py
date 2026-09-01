@@ -558,6 +558,9 @@ def send_close(client: Any, now_s: float, approved_legs: list, *,
     responses: list = []
     failed: list = []
     partial: list = []
+    #: Legs whose outcome the venue never told us. Distinct from
+    #: `failed`, which is the venue saying no.
+    unknown: list = []
     for leg in to_send:
         try:
             resp = client.place_order(leg, now_s)
@@ -578,11 +581,20 @@ def send_close(client: Any, now_s: float, approved_legs: list, *,
                                    % (leg["market"], got,
                                       leg["size"]))
         except Exception as exc:  # noqa: BLE001 - shown, not raised
-            _log.error("permuto: operator close leg %s failed: %s",
-                       leg["market"], exc)
-            failed.append("%s: %s" % (leg["market"], exc))
+            # [review] A TRANSPORT ERROR IS NOT A REFUSAL. _request()
+            # can raise after urlopen() has already succeeded -- while
+            # reading the response -- so the venue may well have taken
+            # this order. Counting it with the refusals told the
+            # operator "Failed", which reads as "nothing happened", and
+            # the natural next move is to press Close again and double
+            # the size. Unknown is its own answer and the only honest
+            # one; the remedy is to go and look.
+            _log.error("permuto: operator close leg %s did not return a verdict: %s", leg["market"], exc)
+            unknown.append("%s: %s" % (leg["market"], exc))
 
-    sent = len(to_send) - len(failed)
+    # Neither refused nor unresolved: only these are known to have gone
+    # out and been acknowledged.
+    sent = len(to_send) - len(failed) - len(unknown)
     # [review] Skipped markets belong in the OPERATOR's note, not only in a
     # log they are not reading. "2 leg(s) sent" while an approved exposure
     # was quietly dropped -- because it flipped, or went flat, or rounded
@@ -596,16 +608,33 @@ def send_close(client: Any, now_s: float, approved_legs: list, *,
         part_note = "PARTIAL -- %s" % "; ".join(partial)
         skipped_note = ("%s (%s)" % (part_note, skipped_note)
                         if skipped_note else part_note)
+    # [review] UNKNOWN OUTCOMES LEAD. A leg the venue refused leaves the
+    # position untouched; a leg whose answer never arrived may have
+    # executed, and the two must not read alike -- the wrong reading
+    # invites a second press that doubles the close.
+    if unknown:
+        note = ("UNRESOLVED -- no verdict for %s. These may have "
+                "EXECUTED. Check the position on the venue before "
+                "closing again." % "; ".join(unknown))
+        if failed:
+            note = "%s Refused: %s." % (note, "; ".join(failed))
+        if skipped_note:
+            note = "%s (%s)" % (note, skipped_note)
+        return {"ok": False, "sent": sent, "note": note,
+                "legs": to_send, "responses": responses,
+                "skipped": skipped, "partial": partial,
+                "unknown": unknown}
     if failed:
         note = "partial: %s" % "; ".join(failed)
         if skipped_note:
             note = "%s (%s)" % (note, skipped_note)
         return {"ok": False, "sent": sent, "note": note,
                 "legs": to_send, "responses": responses,
-                "skipped": skipped, "partial": partial}
+                "skipped": skipped, "partial": partial,
+                "unknown": unknown}
     return {"ok": True, "sent": sent, "note": skipped_note,
             "legs": to_send, "responses": responses, "skipped": skipped,
-            "partial": partial}
+            "partial": partial, "unknown": unknown}
 
 
 def close_positions(client: Any, now_s: float, fraction: float, *,
