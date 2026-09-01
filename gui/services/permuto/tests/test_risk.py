@@ -110,8 +110,26 @@ def test_the_ceiling_stays_below_the_requote_trigger():
     ceiling = max_price_skew_frac(ring, half_spread)
     trigger = ring * REQUOTE_AT_RING_FRACTION / 100.0
     assert ceiling < trigger, "a full skew is instantly past its own trigger"
-    # And a spread so wide the ring edge is the binding cap still wins.
-    assert max_price_skew_frac(2.0, 1.9) == pytest.approx(0.1 / 100.0)
+
+    # [review 2026-09-01] PLACEMENT AND ROUNDING COUNT TOO. decide()
+    # re-quotes on abs(leg_price - oracle), and the leg sits a half-spread
+    # beyond the skewed midpoint before being CEILED onto the grid. At the
+    # defaults with oracle 0.07 and a 95% short that was 1.2857% against a
+    # 1.20% trigger -- born past it, replaced every tick.
+    import math as _math
+    for half_spread in (0.05, 0.25, 0.40, 0.75):
+        for tick_frac in (0.0, 0.0001 / 0.07, 0.0001 / 0.15):
+            ceil_ = max_price_skew_frac(ring, half_spread, tick_frac)
+            total = (half_spread + ceil_ * 100.0 + tick_frac * 100.0)
+            assert total <= ring * REQUOTE_AT_RING_FRACTION + 1e-9, (
+                "spread %.2f + skew %.4f + tick %.4f = %.4f%%, past the "
+                "%.2f%% trigger" % (half_spread, ceil_ * 100.0,
+                                    tick_frac * 100.0, total,
+                                    ring * REQUOTE_AT_RING_FRACTION))
+
+    # A spread so wide the placement ALONE clears the trigger leaves no
+    # room for any skew at all -- zero, not a sliver off the ring edge.
+    assert max_price_skew_frac(2.0, 1.9) == 0.0
 
 
 def test_a_spread_wider_than_the_ring_allows_no_skew_rather_than_a_negative():

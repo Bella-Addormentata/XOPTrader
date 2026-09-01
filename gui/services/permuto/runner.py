@@ -824,6 +824,14 @@ class QuoteRunner:
                 max_position=max_position,
                 ring_pct=self._ring_pct,
                 half_spread_pct=self._half_spread_pct,
+                # [review] The skew budget must reserve the rounding tick
+                # as well, or spread + skew + ceil() lands past the
+                # re-quote trigger before any backoff is even considered.
+                tick_frac=(_effective_tick(
+                    (flags.get("specs") or {}).get(market, {}).get(
+                        "tick_size") if isinstance(flags.get("specs"), dict)
+                    else None)
+                    / max(float(oracle or 1e-12), 1e-12)),
             )
 
         # A market holding a live quote that risk wants shrunk or gone must
