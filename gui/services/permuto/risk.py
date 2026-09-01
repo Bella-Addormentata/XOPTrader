@@ -95,8 +95,17 @@ def portfolio_cap_usd(
 
     Returns the smaller of ``per_market_cap_usd`` and whatever portfolio
     room is left once every OTHER market's exposure is subtracted. Never
-    negative, and never larger than what was passed in -- this can only
-    tighten, exactly like the curfew.
+    negative, and -- for a POSITIVE ``per_market_cap_usd`` -- never
+    larger than what was passed in: it can only tighten, like the
+    curfew.
+
+    [review] THE SENTINEL IS THE EXCEPTION, and callers must not read
+    this as monotonically tightening every numeric input. A
+    non-positive cap is the documented "no per-market limit" marker,
+    not a limit of zero, so it RETURNS THE BUDGET -- a larger number
+    than it was given. Treating it as a tightening would reinstate the
+    bug this exception exists to avoid: an operator who removes the
+    per-market cap having every market pinned to zero instead.
 
     Fails CLOSED on anything unreadable: an equity or a position we
     cannot parse yields zero room, because the alternative is authorising

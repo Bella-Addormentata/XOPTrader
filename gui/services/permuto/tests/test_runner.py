@@ -1999,9 +1999,15 @@ def test_a_curfew_cap_still_beats_the_profile():
 
 
 def test_the_last_minutes_before_the_close_place_nothing():
-    """EXIT: whatever is on is what we carry. Adding inventory here buys a
-    fill we then hold through the frozen window, which is where the 870k
-    short came from."""
+    """EXIT: place nothing new, and RETRACT what is on.
+
+    [review] This said "whatever is on is what we carry" -- the
+    retain-through-EXIT behaviour that did not survive review, while
+    the test below already expects a withdrawal. The fifth such
+    comment found; each one is an invitation to put it back.
+
+    Adding inventory here buys a fill we then hold through the frozen
+    window, which is where the 870k short came from."""
     exit_t = CLOSES_UTC[0] - 300.0          # 5 minutes to the bell
     c = _Client(account=_account(0.0), batch_response=_venue_ok())
     r = _runner(c, curfew_enabled=True)
@@ -2996,3 +3002,72 @@ def test_the_budget_counts_positions_in_markets_we_do_not_quote():
     assert _sides({"OTHER-VOL-PERP": 9_000_000.0}) == ["buy"], (
         "a holding in an unquoted market did not reach the portfolio "
         "budget -- exposure outside the configured set is invisible to it")
+
+
+def test_the_portfolio_budget_stops_new_exposure_but_never_a_reduction():
+    """[review] A budget that only binds once you hold something is not a
+    budget.
+
+    Handing it to assess() as max_position bounds the POSITION limit, not
+    new exposure: with the budget spent by neighbours and this market
+    FLAT, abs(0) >= 1e-9 is false, so assess() answers NORMAL and both
+    risk-increasing legs go out at full size.
+
+    A REDUCING leg must still be allowed. Blocking it would trap the book
+    at the exact moment it is trying to get back inside the budget.
+    """
+    def _run(positions):
+        c = _Client(account={"equity_usd": 500_000.0,
+                             "used_margin_usd": 0.0,
+                             "positions": positions})
+        r = _runner(c, curfew_enabled=False, max_position_usd=250_000.0)
+        res = r.tick(1.0, {_MKT: 0.07, "NVDA-VOL-PERP": 0.07}, {})
+        return res.action, sorted(leg["side"]
+                                  for leg in (getattr(c, "last_batch", None)
+                                              or []))
+
+    # Room available: an ordinary two-sided book.
+    assert _run({_MKT: 0.0}) == ("quote", ["buy", "sell"])
+
+    # A neighbour has spent the whole budget and we are FLAT -- the case
+    # every per-market check calls harmless.
+    action, sides = _run({_MKT: 0.0, "NVDA-VOL-PERP": 4_400_000.0})
+    assert sides == [], (
+        "risk-increasing legs went out after the portfolio budget was "
+        "exhausted: %s" % sides)
+    assert action == "risk_blocked", action
+
+    # Over budget and SHORT: the buy reduces us, and must survive.
+    action, sides = _run({_MKT: -50_000.0, "NVDA-VOL-PERP": 4_400_000.0})
+    assert sides == ["buy"], (
+        "the reducing leg was blocked, trapping the book over budget: %s"
+        % sides)
+
+
+def test_recovery_is_announced_only_when_a_book_is_actually_resting(caplog):
+    """[review] "depth resumes" is a claim about the BOOK.
+
+    Leaving the pin only means risk stopped forbidding a side. _resting
+    can still be empty, and the batch that rebuilds it can still be
+    rejected -- so announcing recovery there tells an operator depth is
+    back while the market earns exactly zero. Same mistake as measuring
+    depth credit before the venue answered: report the achievement, not
+    the intention.
+    """
+    c = _Client(account=_account(-100_000.0))
+    r = _runner(c, curfew_enabled=True, max_position_usd=12_000.0)
+    r.tick(_OVERNIGHT, _ORACLE, {})
+    assert _MKT in r._pinned_markets
+
+    # The position is reduced, so the pin lifts -- but nothing is resting.
+    c.account_payload = _account(0.0)
+    r._resting[_MKT] = RestingQuote()
+    with caplog.at_level(logging.WARNING,
+                         logger="gui.services.permuto.runner"):
+        r.tick(_OVERNIGHT + 60.0, _ORACLE, {})
+
+    resumed = [m for m in caplog.messages if "depth resumes" in m]
+    assert not resumed, (
+        "recovery was announced over an empty book: %s" % resumed)
+    honest = [m for m in caplog.messages if "no longer pinned" in m]
+    assert honest, "the un-pinning was not reported at all"

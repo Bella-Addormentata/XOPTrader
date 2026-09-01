@@ -45,7 +45,8 @@ from .client import PermutoNotLinked
 from .orders import Side, depth_credit_usd, quote_ladder
 from .quoting import (REQUOTE_AT_RING_FRACTION, LoopAction,
                       RestingQuote, VenueView, decide)
-from .risk import (MarginState, RiskAction, assess, portfolio_cap_usd,
+from .risk import (PORTFOLIO_MAX_EXPOSURE_FRACTION, MarginState,
+                   RiskAction, assess, portfolio_cap_usd,
                    skewed_reference)
 from .band_guard import VENUE_BAND_PCT, BandGuard
 from .cross_backoff import CrossBackoff, headroom_pct
@@ -964,6 +965,21 @@ class QuoteRunner:
         self._eff_half_spread_by_market = eff_half_spread_by_market
 
         risk_by_market: dict = {}
+        #: What a risk-INCREASING leg may still add, book-wide.
+        #:
+        #: [review] Handing the budget to assess() as max_position bounds
+        #: the POSITION limit, not new exposure: with the budget spent by
+        #: neighbours and this market FLAT, abs(0) >= 1e-9 is false, so
+        #: assess() answers NORMAL and both risk-increasing legs go out at
+        #: full size. A budget that only binds once you already hold
+        #: something is not a budget.
+        #:
+        #: Headroom is a property of the BOOK, so it is the total against
+        #: the budget -- NOT the per-market cap. Clamping a leg to the
+        #: per-market cap instead would re-apply the position limit as an
+        #: order-size limit and break the equal-notional pairing that
+        #: min(bid, ask) depends on.
+        portfolio_headroom_usd = None
         #: Markets that cannot be two-sided this tick -- reduce-only, or
         #: a side whose room ran out. Either way the market earns zero.
         newly_pinned: set = set()
@@ -986,9 +1002,34 @@ class QuoteRunner:
                     state.positions.get(market, 0.0) or 0.0))
             except (TypeError, ValueError):
                 contracts = float('nan')
-            positions_usd[market] = (
-                contracts * float(oracle)
-                if oracle and oracle > 0.0 else float('nan'))
+            # [review] A FLAT market is worth zero at ANY price, so it
+            # must not need an oracle to be valued. Marking it NaN made
+            # every unpriced market -- including the ones we simply are
+            # not quoting this tick -- fail the whole budget closed and
+            # drop every risk-increasing leg in the book. Only a
+            # NON-ZERO position we cannot price is genuinely unreadable.
+            if contracts == 0.0:
+                positions_usd[market] = 0.0
+            else:
+                positions_usd[market] = (
+                    contracts * float(oracle)
+                    if oracle and oracle > 0.0 else float('nan'))
+
+        _total = 0.0
+        for _value in positions_usd.values():
+            if _value != _value:            # NaN: cannot value the book
+                _total = float('nan')
+                break
+            _total += abs(_value)
+        if (_total == _total and math.isfinite(state.equity_usd)
+                and state.equity_usd > 0.0):
+            portfolio_headroom_usd = max(
+                0.0, state.equity_usd * PORTFOLIO_MAX_EXPOSURE_FRACTION
+                - _total)
+        else:
+            # Unreadable book or equity: no room at all, which is the
+            # same direction every other guard here fails in.
+            portfolio_headroom_usd = 0.0
         for market in (self._markets if account_seen else []):
             oracle = oracles.get(market)
             base_size = self._base_size(oracle)
@@ -1080,8 +1121,23 @@ class QuoteRunner:
                 "recover without a fill on the other side. Reduce the "
                 "position to resume earning.", market)
         for market in sorted(self._pinned_markets - newly_pinned):
-            _log.warning("permuto: %s is two-sided again -- depth "
-                         "resumes", market)
+            # [review] "depth resumes" is a claim about the BOOK, and
+            # leaving the pin only means risk stopped forbidding a side.
+            # _resting can still be empty here, and the batch that
+            # rebuilds it can still be rejected -- so announcing
+            # recovery now can tell an operator depth is back while the
+            # market earns zero. Same mistake as measuring depth credit
+            # before the venue answered: report the ACHIEVEMENT, not the
+            # intention. Two-sidedness is confirmed by reconcile() or by
+            # an accepted upsert, both of which land before the next
+            # tick reads this.
+            if self._resting.get(market, RestingQuote()).two_sided:
+                _log.warning("permuto: %s is two-sided again -- depth "
+                             "resumes", market)
+            else:
+                _log.warning("permuto: %s is no longer pinned, but no "
+                             "two-sided book is resting yet -- it earns "
+                             "nothing until both sides are back", market)
         self._pinned_markets = newly_pinned
 
         # A market holding a live quote that risk wants shrunk or gone must
@@ -1433,6 +1489,22 @@ class QuoteRunner:
                     if allowed < leg.size:
                         leg = type(leg)(leg.market, leg.side, leg.price,
                                         allowed, leg.reduce_only)
+                # [review] A risk-increasing leg may not exceed the
+                # portfolio room. A REDUCING leg always may: shrinking
+                # exposure is what the budget wants, and blocking it
+                # would trap the book at the very moment it is trying
+                # to get back inside.
+                room_usd = portfolio_headroom_usd
+                if (room_usd is not None and oracle and oracle > 0.0
+                        and self._increases_exposure(leg, float(
+                            state.positions.get(market, 0.0) or 0.0))):
+                    room_contracts = math.floor(
+                        max(0.0, room_usd) / oracle)
+                    if room_contracts < 1.0:
+                        continue
+                    if room_contracts < leg.size:
+                        leg = type(leg)(leg.market, leg.side, leg.price,
+                                        room_contracts, leg.reduce_only)
                 legs.append(leg)
 
 
@@ -1934,6 +2006,21 @@ class QuoteRunner:
 
         self._reopen_pending = False
         return TickResult("quote", "%d legs" % len(legs), results)
+
+    @staticmethod
+    def _increases_exposure(leg, position: float) -> bool:
+        """True when filling this leg would make |position| larger.
+
+        A buy grows a long and shrinks a short; a sell does the reverse.
+        From FLAT either side grows exposure, which is the case the
+        portfolio budget most needs to catch -- a market with nothing on
+        it looks harmless to every per-market check.
+        """
+        if position != position:            # NaN: assume the worse case
+            return True
+        if leg.side is Side.BUY:
+            return position >= 0.0
+        return position <= 0.0
 
     def _base_size(self, oracle: Optional[float]) -> float:
         """Contracts that carry ``target_depth_usd`` of notional per side."""
