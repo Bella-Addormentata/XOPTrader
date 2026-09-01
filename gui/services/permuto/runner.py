@@ -972,8 +972,19 @@ class QuoteRunner:
             # The prohibition is enforced by the per-leg veto below; what
             # assess() needs here is a number that keeps an existing short
             # in REDUCE_ONLY rather than switching the limit off.
-            max_position = (max(cap_usd, 1e-9) / oracle
-                            if oracle and oracle > 0.0 else 0.0)
+            # [review] ...but NOT when there is no configured limit at
+            # all. assess() reads a non-positive max_position as "no
+            # limit", which is precisely what the sentinel means, and
+            # the 1e-9 clamp turned it into a limit of almost zero --
+            # so every nonzero position became REDUCE_ONLY. The clamp
+            # exists for a curfew-FLOORED cap, where zero would read as
+            # "unlimited" and undo the curfew; an unset cap is the
+            # opposite case and wants exactly that reading.
+            if self._max_position_usd > 0.0:
+                max_position = (max(cap_usd, 1e-9) / oracle
+                                if oracle and oracle > 0.0 else 0.0)
+            else:
+                max_position = 0.0          # the sentinel: no limit
             risk_by_market[market] = assess(
                 state, market,
                 base_size=base_size,
@@ -1295,7 +1306,16 @@ class QuoteRunner:
                     if clamped != leg.price:
                         leg = type(leg)(leg.market, leg.side, clamped,
                                         leg.size, leg.reduce_only)
-                if self._curfew is not None and oracle and oracle > 0.0:
+                # [review] ...and only when a per-market cap EXISTS.
+                # assess_curfew() publishes ZERO side caps for the
+                # sentinel -- correctly, a curfew cannot be a fraction
+                # of a number nobody set -- and permitted_leg_size()
+                # then allowed zero contracts, so a flat account with
+                # the cap unset quoted NOTHING. This branch claims to
+                # protect the overnight window for that configuration,
+                # which it cannot do if the book never goes out.
+                if (self._curfew is not None and oracle and oracle > 0.0
+                        and self._max_position_usd > 0.0):
                     allowed = permitted_leg_size(
                         leg.side is Side.BUY,
                         float(state.positions.get(market, 0.0) or 0.0),

@@ -2819,7 +2819,11 @@ def test_a_posture_change_retracts_even_with_no_position_cap():
     Caused by the fix that gave posture its own stage: the transition key
     has to cover both, or every posture-only change is invisible.
     """
-    c = _Client(account=_account(100_000.0))
+    # [review] FLAT, not long. Starting 100,000 contracts long masked
+    # the sentinel bug entirely: a long permits a reducing sell, so a
+    # book went out and the test passed while a FLAT account with the
+    # same config could not quote at all.
+    c = _Client(account=_account(0.0))
     r = _runner(c, curfew_enabled=True, max_position_usd=0.0)   # no cap
 
     # Overnight: CLOSED posture, a book resting.
@@ -2834,3 +2838,55 @@ def test_a_posture_change_retracts_even_with_no_position_cap():
     assert getattr(r, "_curfew_retract_pending", False) or \
         len(getattr(c, "cancelled", []) or []) > cancels_before, (
             "a posture-only transition left the old book resting")
+
+
+def test_an_unset_cap_quotes_both_sides_from_flat():
+    """[review] The sentinel meant "no limit" and delivered "no quoting".
+
+    assess_curfew() publishes ZERO side caps when no per-market cap is
+    configured -- correctly, a curfew cannot be a fraction of a number
+    nobody set. But the runner fed that through cap_for() into a 1e-9
+    position limit AND through permitted_leg_size(), so a flat account
+    with max_position_usd=0 was allowed zero contracts on both sides.
+
+    This branch adds a fix for that configuration's overnight window,
+    which is worth nothing if the book never goes out at all.
+    """
+    c = _Client(account=_account(0.0))
+    r = _runner(c, curfew_enabled=True, max_position_usd=0.0)
+    res = r.tick(_OVERNIGHT, _ORACLE, {})
+
+    assert res.action == "quote", (
+        "a flat account with no configured cap quoted nothing: %s"
+        % res.reason)
+    sides = sorted(leg["side"] for leg in (getattr(c, "last_batch", None)
+                                           or []))
+    assert sides == ["buy", "sell"], (
+        "depth credit is min(bid, ask); one side earns nothing: %s" % sides)
+
+
+def test_an_unset_cap_does_not_force_reduce_only_on_a_held_position():
+    """[review] The other half of the sentinel, and the half a flat
+    account cannot show.
+
+    assess() reads a non-positive max_position as "no limit" -- exactly
+    what the sentinel means. The runner clamped it to 1e-9 instead, so
+    ANY nonzero position satisfied `abs(position) >= max_position` and
+    became REDUCE_ONLY: one-sided, and earning nothing, on the setting an
+    operator chose to remove limits with.
+
+    A FLAT account cannot distinguish the two, because 0 >= 1e-9 is false
+    either way -- which is why this needs a held position and why the
+    original test, starting long, still managed to hide the leg-clamp
+    half of the same bug.
+    """
+    c = _Client(account=_account(100_000.0))    # a real long
+    r = _runner(c, curfew_enabled=True, max_position_usd=0.0)
+    res = r.tick(_OVERNIGHT, _ORACLE, {})
+
+    assert res.action == "quote", res.reason
+    sides = sorted(leg["side"] for leg in (getattr(c, "last_batch", None)
+                                           or []))
+    assert sides == ["buy", "sell"], (
+        "a held position under the no-limit sentinel was forced "
+        "reduce-only: %s" % sides)
