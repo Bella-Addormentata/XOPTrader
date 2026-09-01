@@ -447,6 +447,7 @@ def test_a_live_order_thread_is_parked_never_terminated():
         def __init__(self):
             self.quit_called = False
             self.terminated = False
+            self.parent_set_to = "never called"
 
         def quit(self):
             self.quit_called = True
@@ -456,6 +457,9 @@ def test_a_live_order_thread_is_parked_never_terminated():
 
         def terminate(self):
             self.terminated = True
+
+        def setParent(self, parent):
+            self.parent_set_to = parent
 
     before = len(permuto_mod._ORPHANED_LIVE_THREADS)
     stuck = _StuckThread()
@@ -467,6 +471,14 @@ def test_a_live_order_thread_is_parked_never_terminated():
     assert len(permuto_mod._ORPHANED_LIVE_THREADS) == before + 1, (
         "the thread was neither terminated nor kept referenced -- Qt will "
         "abort when it is destroyed while running")
+    # [review] AND DETACHED. The thread is a QObject child of the
+    # widget (QThread(self)), so the parent destructor deletes it
+    # whatever Python holds -- keeping a reference alone left the
+    # destroyed-while-running abort exactly where it was.
+    assert stuck.parent_set_to is None, (
+        "the parked thread is still parented to the widget, so its "
+        "parent will delete it mid-run: setParent -> %r"
+        % (stuck.parent_set_to,))
 
     # A worker with no orders in flight is still terminated: leaking those
     # would be a slow resource leak for no safety gain.

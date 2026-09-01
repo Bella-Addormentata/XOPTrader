@@ -229,52 +229,56 @@ _ACCEPTED = ("placed", "modified", "filled", "unchanged", "ok", "success",
              "accepted", "partially_filled")
 
 
-def order_was_accepted(resp: Any) -> tuple:
-    """``(accepted, detail)`` for one single-order response.
+def order_verdict(resp: Any) -> tuple:
+    """``(verdict, detail)`` for one single-order response.
 
-    [review] HTTP 200 is not acceptance. The client raises only for HTTP
-    errors, and this venue's vocabulary includes application-level refusal
-    -- a body carrying ``status: "rejected"`` or a rejection_reason comes
-    back 200. Counting those as sent let the UI report a successful close
-    the venue had refused, which on an emergency control is worse than
-    reporting the failure.
+    ``verdict`` is ``"accepted"``, ``"refused"`` or ``"unknown"``, and the
+    third is not a hedge -- it is the honest answer in most of the ways
+    this can go wrong.
+
+    [review] A BOOLEAN CANNOT EXPRESS THIS. The previous version returned
+    accepted/not, so an empty body and an explicit ``rejected`` collapsed
+    into the same False and both rendered as "Failed". They are opposite
+    facts: a refusal leaves the position exactly where it was, while an
+    answer we could not read may describe an order that EXECUTED. Told
+    "Failed", the operator's natural next move is to press Close again --
+    doubling a close that already happened.
+
+    Only positive refusal evidence earns ``refused``; absence of
+    acknowledgement earns ``unknown``, and the caller must say so.
     """
     if not isinstance(resp, dict) or not resp:
-        # [review] NO BODY IS NOT AN ACKNOWLEDGEMENT. This used to return
-        # True here -- "nothing to contradict, trust the 200" -- but the
-        # transport manufactures {} for an empty 200 (client._decode), and
-        # a null, a list or a bare number all arrive here as-is. Zero bytes
-        # of venue evidence was being counted into `sent` and shown to the
-        # operator as "N leg(s) sent".
-        return False, ("no order acknowledgement in the venue response "
-                       "(%s)" % type(resp).__name__)
+        # The transport manufactures {} for an empty 200, and a null, a
+        # list or a bare number arrive here as-is. None of it says what
+        # the venue did with the order.
+        return "unknown", ("no order acknowledgement in the venue response "
+                           "(%s)" % type(resp).__name__)
     reason = str(resp.get("rejection_reason") or "").strip()
     if reason:
-        return False, reason
+        return "refused", reason
     status = str(resp.get("status", "")).strip().lower()
     action = str(resp.get("action", "")).strip().lower()
     if status in _REFUSED or action in _REFUSED:
-        return False, status or action
-    # [review] `action` was never read at all, and it is the vocabulary the
-    # venue actually speaks: every acknowledgement this repo has captured
-    # is shaped {"action": "placed", "fills": [...], "order_id": N} with
-    # "rejection_reason" on refusal. A body saying {"action": "rejected"}
-    # and nothing else was therefore reported as a successful close.
-    #
-    # An id or a fill is acceptance on its own, so an order that fills
+        return "refused", status or action
+    # An id or a fill is acceptance on its own, so an order that filled
     # without a recognised status word is not misreported as refused.
     if (resp.get("order_id") or resp.get("id") or resp.get("fills")
             or action in _ACCEPTED or status in _ACCEPTED):
-        return True, ""
-    # Deliberately NOT the runner's rule. runner._legs_all_accepted trusts
-    # an unknown envelope on purpose, because a false refusal there trips
-    # the batch breaker and drains the book. Here the asymmetry runs the
-    # other way: a false refusal costs one re-press, and the re-press
-    # re-reads the venue and clamps every leg reduce-only against it, so a
-    # second attempt on an already-closed position skips as "already
-    # flat". Fail-closed is self-correcting; fail-open ends with an
-    # operator walking away from a position they think is gone.
-    return False, "unrecognised order response: %.200r" % (resp,)
+        return "accepted", ""
+    # Deliberately NOT "refused": not recognising a body is a statement
+    # about us, not about what the venue did with the order.
+    return "unknown", "unrecognised order response: %.200r" % (resp,)
+
+
+def order_was_accepted(resp: Any) -> tuple:
+    """``(accepted, detail)`` -- the two-valued view.
+
+    Anything short of positive acceptance is False, so this must NOT drive
+    what the operator is TOLD: it cannot tell a refusal from an unread
+    answer. order_verdict() is the one for that.
+    """
+    verdict, detail = order_verdict(resp)
+    return verdict == "accepted", detail
 
 
 def filled_size(resp) -> float:
@@ -569,11 +573,18 @@ def send_close(client: Any, now_s: float, approved_legs: list, *,
             # for HTTP errors, and this venue refuses at the application
             # level with a 200 body -- so counting every non-raising call
             # as sent let the UI report a close the venue had declined.
-            ok, detail = order_was_accepted(resp)
-            if not ok:
+            verdict, detail = order_verdict(resp)
+            if verdict == "refused":
                 _log.error("permuto: operator close leg %s refused: %s",
                            leg["market"], detail)
                 failed.append("%s: %s" % (leg["market"], detail))
+            elif verdict == "unknown":
+                # [review] The venue answered, but not readably -- which
+                # is not evidence it declined. Same bucket as a transport
+                # error, and for the same reason: the order may be live.
+                _log.error("permuto: operator close leg %s gave no "
+                           "readable verdict: %s", leg["market"], detail)
+                unknown.append("%s: %s" % (leg["market"], detail))
             else:
                 got = filled_size(resp)
                 if 0.0 <= got < leg["size"] - 1e-9:

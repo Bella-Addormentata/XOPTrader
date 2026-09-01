@@ -3,7 +3,7 @@
 import pytest
 
 from gui.services.permuto.close_out import (
-    ClosePayloadError, filled_size, order_was_accepted,
+    ClosePayloadError, filled_size, order_verdict, order_was_accepted,
     close_positions, describe, plan_close, read_positions, send_close,
 )
 
@@ -400,9 +400,13 @@ def test_an_empty_or_absent_body_is_not_an_acknowledgement():
     the strength of it.
     """
     for junk in (None, {}, [], "ok", 7):
-        accepted, detail = order_was_accepted(junk)
-        assert accepted is False, "%r was read as a successful close" % (junk,)
+        verdict, detail = order_verdict(junk)
+        assert verdict == "unknown", (
+            "%r was classified %r -- it is neither an acceptance nor "
+            "evidence of refusal" % (junk, verdict))
         assert detail
+        # ...and the two-valued view still refuses to count it as sent.
+        assert order_was_accepted(junk)[0] is False
 
 
 def test_the_action_key_is_read_on_both_sides():
@@ -410,8 +414,8 @@ def test_the_action_key_is_read_on_both_sides():
     acknowledgement captured from it is shaped {"action": ..., "fills":
     ..., "order_id": ...}. It was not consulted at all, so a plain
     {"action": "rejected"} was reported as sent."""
-    refused, detail = order_was_accepted({"action": "rejected"})
-    assert refused is False
+    verdict, detail = order_verdict({"action": "rejected"})
+    assert verdict == "refused", verdict
     # ...and the operator is told it was REFUSED, not that we could not
     # parse the answer. Both are False, but only one is actionable.
     assert "rejected" in detail and "unrecognised" not in detail
@@ -428,8 +432,10 @@ def test_a_fill_or_an_id_is_acceptance_on_its_own():
 
 
 def test_an_unrecognised_body_is_refused_not_assumed():
-    accepted, detail = order_was_accepted({"weather": "fine"})
-    assert accepted is False
+    verdict, detail = order_verdict({"weather": "fine"})
+    assert verdict == "unknown", (
+        "an unfamiliar body was reported as a refusal; not recognising it "
+        "is a fact about us, not about what the venue did")
     assert "unrecognised" in detail
 
 

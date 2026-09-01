@@ -1527,6 +1527,18 @@ class PermutoWidget(QWidget):
                     "and is being left to finish rather than killed -- "
                     "an order may be on the wire. CHECK THE POSITION ON "
                     "THE VENUE.", what, wait_ms)
+                # [review] DETACH FIRST. The thread was built as
+                # QThread(self), so it is a QObject CHILD of the widget:
+                # the parent's destructor deletes its children whatever
+                # Python references exist, and the previous version of
+                # this -- keeping a reference and nothing else -- did not
+                # prevent the destroyed-while-running abort at all. Only
+                # breaking the parent link does; the Python reference
+                # then keeps it alive afterwards.
+                try:
+                    thread.setParent(None)
+                except Exception:  # noqa: BLE001 - a fake in tests
+                    pass
                 _ORPHANED_LIVE_THREADS.append(thread)
                 return
             _log.warning("permuto: %s thread did not stop; terminating",
