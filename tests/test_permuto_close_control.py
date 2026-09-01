@@ -136,3 +136,54 @@ def test_the_guard_outranks_a_plain_re_enable(widget):
     widget.set_quoting_live(True)
     widget._on_close_failed("boom")          # re-enables on the normal path
     assert not any(b.isEnabled() for b in widget._close_btns.values()),         "a failure re-enabled the close control during live quoting"
+
+
+# --------------------------------------------------------------------------- #
+# Thread supersession -- a late `finished` must not disown a running thread
+# --------------------------------------------------------------------------- #
+
+class _FakeThread:
+    """Stands in for a QThread; records whether it was told to delete."""
+
+    def __init__(self, name):
+        self.name = name
+        self.deleted = False
+
+    def deleteLater(self):
+        self.deleted = True
+
+
+def test_a_late_finish_does_not_clear_the_running_thread(widget, monkeypatch):
+    """[review] A fast confirmation starts the SEND thread before the PLAN
+    thread's queued `finished` arrives.
+
+    The callback used to clear whatever thread was current, so that late
+    signal disowned the running send thread -- losing close_in_flight()
+    protection, so quoting could start beside a live close, and risking
+    Qt's fatal "QThread: Destroyed while thread is still running" on the
+    one control an operator reaches for in an emergency.
+    """
+    stale, running = _FakeThread("plan"), _FakeThread("send")
+    widget._close_thread = running
+    widget._close_worker = object()
+    monkeypatch.setattr(widget, "sender", lambda: stale)
+
+    widget._on_close_thread_finished()
+
+    assert widget._close_thread is running,         "a late finish from a superseded thread disowned the running one"
+    assert widget.close_in_flight() is True, "lost in-flight protection"
+    assert stale.deleted is True, "the superseded thread was never cleaned up"
+    assert running.deleted is False, "deleted a thread that is still running"
+
+
+def test_the_current_thread_finishing_does_clear_state(widget, monkeypatch):
+    running = _FakeThread("send")
+    widget._close_thread = running
+    widget._close_worker = object()
+    monkeypatch.setattr(widget, "sender", lambda: running)
+
+    widget._on_close_thread_finished()
+
+    assert widget._close_thread is None
+    assert widget.close_in_flight() is False
+    assert running.deleted is True

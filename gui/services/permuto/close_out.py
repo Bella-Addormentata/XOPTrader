@@ -61,7 +61,11 @@ def read_positions(client: Any, now_s: float) -> dict:
     the same reason. "I could not understand the account" and "you have no
     positions" must never look alike here.
     """
-    payload = client.account(now_s) or {}
+    # [review] NOT `or {}`. A JSON null coerced to an empty object made an
+    # unreadable venue response report "no open positions" -- the same
+    # conflation this function fails closed on everywhere else, arriving
+    # through the one line that looked like harmless defensiveness.
+    payload = client.account(now_s)
     if not isinstance(payload, dict):
         raise ClosePayloadError(
             "account payload was %s, not an object" % type(payload).__name__)
@@ -261,9 +265,14 @@ def send_close(client: Any, now_s: float, approved_legs: list, *,
         _log.warning("permuto: operator close -- skipped legs: %s",
                      ", ".join(skipped))
     if not to_send:
-        return {"ok": True, "sent": 0,
-                "note": "no legs remain after clamping to fresh positions",
-                "legs": approved_legs}
+        # Say WHICH markets fell away and why. "No legs remain" alone tells
+        # an operator nothing about whether their exposure is gone or their
+        # close silently did nothing.
+        detail = ("no legs remain after clamping to fresh positions: %s"
+                  % "; ".join(skipped)) if skipped else (
+                      "no legs remain after clamping to fresh positions")
+        return {"ok": True, "sent": 0, "note": detail,
+                "legs": approved_legs, "skipped": skipped}
 
     _log.warning(
         "permuto: OPERATOR CLOSE -- %d leg(s), tif=%s:\n%s",
@@ -290,12 +299,21 @@ def send_close(client: Any, now_s: float, approved_legs: list, *,
             failed.append("%s: %s" % (leg["market"], exc))
 
     sent = len(to_send) - len(failed)
+    # [review] Skipped markets belong in the OPERATOR's note, not only in a
+    # log they are not reading. "2 leg(s) sent" while an approved exposure
+    # was quietly dropped -- because it flipped, or went flat, or rounded
+    # to nothing -- is precisely the report that gets someone to walk away
+    # from a position they believe they closed.
+    skipped_note = ("skipped %s" % "; ".join(skipped)) if skipped else ""
     if failed:
-        return {"ok": False, "sent": sent,
-                "note": "partial: %s" % "; ".join(failed),
-                "legs": to_send, "responses": responses}
-    return {"ok": True, "sent": sent, "note": "",
-            "legs": to_send, "responses": responses}
+        note = "partial: %s" % "; ".join(failed)
+        if skipped_note:
+            note = "%s (%s)" % (note, skipped_note)
+        return {"ok": False, "sent": sent, "note": note,
+                "legs": to_send, "responses": responses,
+                "skipped": skipped}
+    return {"ok": True, "sent": sent, "note": skipped_note,
+            "legs": to_send, "responses": responses, "skipped": skipped}
 
 
 def close_positions(client: Any, now_s: float, fraction: float, *,

@@ -240,3 +240,36 @@ def test_a_refused_leg_is_reported_as_failed_not_sent():
     assert res["ok"] is False, "a venue refusal was reported as a close"
     assert res["sent"] == 0
     assert "reduce_only" in res["note"]
+
+
+def test_a_null_account_response_raises_rather_than_reading_as_empty():
+    """[review] `or {}` turned a JSON null into an empty account.
+
+    The emergency control then reported "no open positions" for a venue
+    response it could not read at all -- the same conflation this function
+    fails closed on everywhere else, arriving through the one line that
+    looked like harmless defensiveness.
+    """
+    with pytest.raises(ClosePayloadError):
+        read_positions(_Client(None), 0.0)
+
+
+def test_skipped_markets_reach_the_operator_not_just_the_log():
+    """"2 leg(s) sent" while an approved exposure was quietly dropped is
+    the report that gets someone to walk away from a position they believe
+    they closed."""
+    c = _Client({"positions": [_pos("QQQ-VOL-PERP", "sell", 100)]})
+    approved = plan_close({"QQQ-VOL-PERP": -100.0,
+                           "TSLA-VOL-PERP": -500.0}, 1.0)
+    res = send_close(c, 0.0, approved)          # TSLA is gone from the venue
+    assert res["sent"] == 1
+    assert "TSLA-VOL-PERP" in res["note"], res
+    assert "TSLA-VOL-PERP" in " ".join(res.get("skipped", []))
+
+
+def test_a_flipped_market_is_named_in_the_note():
+    c = _Client({"positions": [_pos("QQQ-VOL-PERP", "buy", 100)]})
+    approved = plan_close({"QQQ-VOL-PERP": -100.0}, 1.0)   # approved a BUY
+    res = send_close(c, 0.0, approved)
+    assert res["sent"] == 0
+    assert "flipped" in res["note"], res

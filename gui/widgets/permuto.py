@@ -943,6 +943,21 @@ class PermutoWidget(QWidget):
         thread.start()
 
     def _on_close_thread_finished(self) -> None:
+        """Clear state for the thread that FINISHED, not whatever is current.
+
+        [review] A fast confirmation starts the send thread before the plan
+        thread's queued `finished` has been delivered. The old body then
+        cleared and deleted the RUNNING send thread -- losing
+        close_in_flight() protection, so quoting could start beside a live
+        close, and risking Qt's fatal "QThread: Destroyed while thread is
+        still running" on the very control an operator reaches for in an
+        emergency.
+        """
+        done = self.sender()
+        if done is not None and done is not self._close_thread:
+            # A superseded thread finishing late. It owns nothing now.
+            done.deleteLater()
+            return
         thread, self._close_thread = self._close_thread, None
         self._close_worker = None
         if thread is not None:
