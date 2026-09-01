@@ -29,6 +29,7 @@ when there is time.
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any, Optional
 
 _log = logging.getLogger(__name__)
@@ -84,7 +85,7 @@ def read_positions(client: Any, now_s: float) -> dict:
                     "permuto: position for %s is %r, which is not a number "
                     "-- skipping it rather than guessing", name, raw)
                 continue
-            if signed == 0.0 or signed != signed:      # zero or NaN
+            if signed == 0.0 or math.isnan(signed):
                 continue
             out[name] = signed
         return out
