@@ -636,7 +636,14 @@ def send_close(client: Any, now_s: float, approved_legs: list, *,
                 "skipped": skipped, "partial": partial,
                 "unknown": unknown}
     if failed:
-        note = "partial: %s" % "; ".join(failed)
+        # [review] "partial" claims something got through. When every
+        # leg was refused nothing did, and the position is exactly where
+        # it was -- which is a different instruction to the operator
+        # than "some of your close landed".
+        note = ("all %d leg(s) refused: %s" % (len(failed),
+                                               "; ".join(failed))
+                if sent == 0 else
+                "partial: %s" % "; ".join(failed))
         if skipped_note:
             note = "%s (%s)" % (note, skipped_note)
         return {"ok": False, "sent": sent, "note": note,

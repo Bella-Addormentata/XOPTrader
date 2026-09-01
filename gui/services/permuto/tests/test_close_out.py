@@ -551,3 +551,22 @@ def test_a_transport_error_is_unresolved_not_a_refusal():
     assert "Check the position" in note, note
     # ...and it must NOT be described as a plain refusal.
     assert not note.startswith("partial:"), note
+
+
+def test_every_leg_refused_is_not_called_partial():
+    """[review] "partial" claims something got through.
+
+    When every leg was refused, nothing did -- the position is exactly
+    where it was. That is a different instruction to the operator than
+    "some of your close landed", and on this control the difference
+    decides whether they press it again.
+    """
+    c = _Client({"positions": [_pos("QQQ-VOL-PERP", "sell", 100)]})
+    c.order_response = {"status": "rejected"}
+    legs = plan_close({"QQQ-VOL-PERP": -100.0}, 1.0)
+    res = send_close(c, 0.0, legs)
+
+    assert res["ok"] is False
+    assert res["sent"] == 0
+    assert not res["note"].startswith("partial"), res["note"]
+    assert "refused" in res["note"], res["note"]

@@ -690,8 +690,21 @@ class _CloseWorker(QObject):
 
             # send mode: use the operator-approved legs, clamped against a
             # fresh read -- not a new plan computed from scratch.
-            self.sent.emit(close_out.send_close(
-                client, now, self._approved_legs, tif=self._tif))
+            result = close_out.send_close(
+                client, now, self._approved_legs, tif=self._tif)
+            # [review] LOG BEFORE EMITTING. The signal is the only way
+            # this reaches the operator, and the parked-thread path
+            # exists precisely for the case where the widget is gone by
+            # the time the answer arrives -- so without a log line the
+            # safety path preserves the THREAD and loses the very thing
+            # it was protecting. send_close() records the pre-send plan;
+            # this records what came back.
+            _log.warning(
+                "permuto: OPERATOR CLOSE RESULT -- ok=%s sent=%s unresolved=%s refused=%s note=%s",
+                result.get("ok"), result.get("sent"),
+                result.get("unknown"), result.get("partial"),
+                result.get("note"))
+            self.sent.emit(result)
         except Exception as exc:  # noqa: BLE001 - shown, never raised
             self.failed.emit(str(exc))
 
@@ -1104,7 +1117,12 @@ class PermutoWidget(QWidget):
         self._set_close_enabled(True)
         if not legs:
             self._close_note.setText(summary)
-            self._log_activity("Close: nothing to do -- no open positions.")
+            # [review] An empty plan does NOT mean a flat account.
+            # plan_close() also returns nothing when every position
+            # rounds below one lot, and the summary says so explicitly
+            # -- while this line asserted the opposite into the
+            # permanent record. Log what was actually shown.
+            self._log_activity("Close: %s" % summary.replace(chr(10), " "))
             return
         # The operator confirms against the ACTUAL numbers, not a percentage.
         box = QMessageBox(self)

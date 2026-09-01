@@ -489,3 +489,21 @@ def test_a_live_order_thread_is_parked_never_terminated():
 
     permuto_mod._ORPHANED_LIVE_THREADS[:] = \
         permuto_mod._ORPHANED_LIVE_THREADS[:before]
+
+
+def test_an_empty_plan_is_not_logged_as_a_flat_account(widget):
+    """[review] plan_close() also returns nothing when every position
+    rounds below one lot -- and the summary says the exposure is still
+    open. Asserting "no open positions" into the permanent record is the
+    opposite of what happened."""
+    summary = ("Nothing can be closed at this size -- every position rounds "
+               "below one lot: B (0.25 below one lot of 1). The exposure is "
+               "still open; try a larger fraction.")
+    widget._on_close_planned(([], summary))
+    # The ACTIVITY LOG, not the note. An earlier version of this test
+    # fell back to _close_note when it could not find the log, and the
+    # note is set to the summary either way -- so it passed against the
+    # bug it was written for.
+    logged = widget._activity.toPlainText()
+    assert "no open positions" not in logged, logged
+    assert "one lot" in logged, logged
