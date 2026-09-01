@@ -5,6 +5,147 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.13] — 2026-09-01 — one side of a book can be junk
+
+XCH/BYC stopped quoting on 2026-08-30 and the reason was not price
+discovery. The engine had already solved the pair correctly: CoinGecko
+XCH/USD combined with BYC's declared par gave `XCH/BYC = 1.41022765` at
+sigma 171 bps, and Step 7 replaced the raw book mid of 3.2498 with
+1.41141912 at full external weight. Three consumers downstream then
+preferred the book to the number, and the pair went silent *because* the
+solver was right.
+
+The book, in the pair's own orientation (BYC per XCH), with XCH at $1.43:
+
+| side | levels | implies BYC |
+|---|---|---|
+| ask | 4.9995, 5.0000, 9.7500, 10.0000 × 3 | $0.286 … $0.143 |
+| bid | 1.5000, 1.4283, 1.4066, 1.3793, 1.3699, 1.3514 | $0.953 … $1.058 |
+
+Every bid is within 6.4% of the anchor. Every ask is 3.5×–7.1× it. The
+"10,769 bps spread" was never a spread — it was an **absent ask side**
+wearing the costume of one. Nothing in the tree could say that, because
+every consumer read `best_bid`/`best_ask` as an atomic pair.
+
+- **Per-side anchor agreement**, in the new pure header
+  `execution/book_side_quality.hpp` and carried on `MarketSnapshot` as
+  `bid_side_anchor_ok` / `ask_side_anchor_ok` / `book_side_ref`. A side
+  whose best dust-filtered price sits outside 3× of the *independent*
+  anchor is no longer treated as a reference. Computed from `ref_price`,
+  never `offer_ref_used` — letting a pair's own last accepted mid
+  disqualify a side of its own book is the self-referential lock-in that
+  made the 187.461980 mid unkillable.
+- **The offers are flagged, not removed.** Stripping the ask side takes
+  `dex_best_ask` to 0, `compute_mid` Case 2 refuses to publish a lone bid
+  as a mid, Case 3 wants a fresh print a silent pair does not have — so
+  the pair publishes no mid, Step 4 invalidates the quote, and the correct
+  1.41 never reaches the ladder. Silence instead of a mispriced quote is
+  not an improvement when the alternative is quoting correctly.
+- **The two-sides-agree bypass** is the part that must not regress. A
+  genuine market-wide repricing moves both sides together and leaves the
+  book coherent — the same evidence `mid_gate::book_confirms()` accepts to
+  override an anchor breach. A two-sided book whose own spread is at most
+  5000 bps is therefore trusted whole, however far it sits from the
+  anchor. Dislocation is one side moving *alone*, and that always leaves a
+  wide spread behind. Pinned to the same default as the gate's own
+  confirmation threshold so the two halves cannot be configured into
+  contradiction.
+- **Step 8 Check 1** measured a correct model mid against `bbo_mid`, the
+  mean of an honest bid and a junk ask: 56.6% > the 50% cap, so it cleared
+  every tier. It now measures against the surviving side (5.9%, passes),
+  and when *both* sides are disqualified it skips — the model mid is then
+  the only location estimate there is, and suppressing it in favour of a
+  book we just called junk buys zero protection for guaranteed zero
+  participation.
+- **Step 8 Check 2** measured our correctly-priced 1.41 ask against the
+  4.9995 junk ask and called it 71.8% "aggressive", killing it, while a
+  1.41 bid passed at 6.0%. It now references the independent anchor when
+  the tier's own side is disqualified. The effective midpoint moves too:
+  `classify_tier`'s bid passive rule would otherwise read any bid up to
+  3.24975 as a safe passive rest.
+- **The bid cap, which was live money.** `bbo_ref` is the midpoint of the
+  two sides, so one dislocated side moved the reference meant to police
+  it: `bid_cap = 3.24975` never bound, and the competitive anchor parked a
+  bid at 1.5001 against a 1.4102 fair value — a ~6.3% overpay on every XCH
+  bought, every cycle. A disqualified side no longer contributes to
+  `bbo_ref`, and `bid_cap` tightens to `min(bbo_ref, mid)` **only** in
+  that state. Healthy books are byte-identical, deliberately: this is
+  shared hot-path code for the pairs that actually earn, and the
+  pre-existing `bid_cap == bbo_ref` rule for healthy books is a separate
+  decision that is not revisited here.
+- **A unit test reproduces the incident exactly.** On the unexamined path
+  the three bids anchor above the ask tiers and the cross check drops
+  **6/6 tiers** — the 2026-08-30 log line in shape. The outcome was never
+  "a slightly expensive bid"; it was no quotes at all.
+
+### The false depeg, which would have re-fired ten minutes after any restart
+
+- **`step_observe_asset_pegs` read a mojo-scaled mid as a USD price.**
+  `snap.mid_price` is 1e12-scaled; dividing XCH's USD price by it gave
+  `usd_obs ≈ 3.4e-13` on every heartbeat and produced
+  `[PEGSUSPEND] observed $0.0000 vs target 1.0000, 100.0% off` — for
+  wUSDC.b on 2026-08-29 and BYC on 2026-08-30, both false, both cancelling
+  every resting offer on every pair touching the asset. `asset_peg_rt_` is
+  in-memory only, so a restart cleared the latch and re-armed it 30
+  heartbeats (~10 min) later.
+- **Fixing the scale alone was not enough**, and this is the part that
+  needed deciding rather than patching. Correctly scaled, the observation
+  on that book is $1.43 / 3.25 = **$0.44** — still 56% off par, still past
+  `bail_pct`. The route reads the *published book mid*, so it inherits the
+  junk side. It now refuses to observe at all when a side is disqualified,
+  which routes into `observe_peg`'s data-gap branch and **holds** the
+  streak rather than advancing or resetting it.
+- **Deliberately not re-sourced to the fair-value estimate**, which is the
+  obvious-looking alternative and is circular: `par_anchor.hpp` feeds the
+  *declared par* into the fair-value solve precisely when nothing else can
+  price the asset, so a peg watcher reading that estimate would read its
+  own input back, sit permanently at par, and never detect the depeg it
+  exists to detect. A peg must be observed from a market or not at all.
+- **The Step 4 suspension gate now logs at warn.** It silently suppressed
+  every XCH/BYC quote for a day at debug level. A safety latch that halts
+  trading has to announce itself in the normal log.
+
+### Trade history: asked, answered, and written down
+
+The prompting question was whether dexie's trade history could supply a
+price target for BYC when the book is unusable. It can — the tape says
+~1.40 BYC/XCH, i.e. BYC at $1.02 — and that turns out to be the wrong
+thing to want. `1.41 = XCH/USD ÷ BYC par`, so the engine already had the
+number; the tape's agreement adds no information, its content is already
+spent as `fair_value_par_market_sigma_bps = 140`, and wiring it in as a
+live edge would *displace* the operator-governed par rather than confirm
+it, because the par fallback is fallback-only. See
+`docs/price-discovery-from-trade-history.md` for the full argument and the
+microstructure literature behind it.
+
+- **`docs/price-discovery-from-trade-history.md`** — why the tape is
+  corroboration here and not an oracle, which estimators degenerate at
+  this trade count and why (Roll is undefined when sample autocovariance
+  is positive; information-share metrics cannot fit a VECM across 8-day
+  gaps; Stoikov's micro-price symmetrises the two sides, the exact
+  assumption this book violates), and the two standing caveats — par is an
+  assumption rather than an observation, and ~19% of the August tape is
+  our own fills.
+- **`scripts/byc_price_diagnostic.py`** — read-only. Re-derives the
+  "7-day traded VWAP 1.001" figure that three places cite as ground truth
+  and no code path produces, and reports the executable depth near par
+  that a VWAP cannot. Sample size printed beside every statistic.
+- **`scripts/highlow_spread_estimator.py`** — read-only Corwin-Schultz and
+  Abdi-Ranaldo estimators over `price_high`/`price_low`, which the engine
+  already fetches and then discards unread. Diagnostic only: their value
+  is falsification, since they structurally cannot return 10,769 bps.
+- **`get_trades()` sort fix.** It passed `date_completed_desc`, which the
+  dexie API does not recognise and silently ignores, so it returned an
+  arbitrary page rather than recent trades. The valid value is
+  `date_completed`, already descending. The function still has no callers,
+  and now says why.
+
+Not changed, on purpose: no `enabled:` flag was flipped. BYC's pairs are
+off because the operator turned them off on 2026-08-31, which is a
+liquidity decision and not a code problem. Nothing here argues for
+re-enabling them — the ask side of that book is at par while nothing is
+bid above $0.30, and we hold 52.58 BYC.
+
 ## [0.10.12] — 2026-08-31 — the Permuto inventory curfew
 
 Stops us carrying inventory across a market close, which is the trade that

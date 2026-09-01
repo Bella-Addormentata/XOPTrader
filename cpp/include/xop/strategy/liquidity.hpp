@@ -377,6 +377,32 @@ struct LiquidityConfig {
     /// Tier 0 lands at the anchor; Tier i lands at anchor ± i*stride.
     /// Default: 65 bps.
     double competitive_anchor_stride_bps{65.0};
+
+    // -- Per-side book quality (runtime data, not YAML config) --------------
+    //
+    // [SIDEQUALITY 2026-09-01] Copied from MarketSnapshot by the engine
+    // before each compute_ladder call, the same way tier_fill_rates is.
+    // They exist because the competitive anchor's safety reference,
+    // bbo_ref, is the MIDPOINT of the two sides -- so one dislocated side
+    // moves the reference that is supposed to police it.
+    //
+    // Live XCH/BYC 2026-09-01 (BYC per XCH): honest bids at 1.5000 and a
+    // junk ask stack from 4.9995 gave bbo_ref = 3.24975, 2.3x the solved
+    // fair value of 1.41022765.  bid_cap = bbo_ref therefore did not bind
+    // at all, and the anchor parked a bid at best_comp_bid + tick =
+    // 1.5001 -- a ~6.3% overpay on every XCH bought, every cycle.
+    //
+    // Both default TRUE so every existing caller, test and backtest keeps
+    // byte-identical behaviour: the tightened cap engages ONLY in the new
+    // disqualified state, which no healthy book can enter.  That is
+    // deliberate -- this is shared hot-path code for the pairs that are
+    // actually earning, and the pre-existing bid_cap == bbo_ref rule for
+    // healthy books is a separate decision that is NOT revisited here.
+    // (Its history matters: an earlier min(bbo_ref, mid) was reverted
+    // because it anchored zero bids whenever the blended mid sat below
+    // best_comp_bid.  That revert is left standing for healthy books.)
+    bool book_bid_side_anchor_ok{true};
+    bool book_ask_side_anchor_ok{true};
 };
 
 // ---------------------------------------------------------------------------

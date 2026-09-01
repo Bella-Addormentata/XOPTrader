@@ -35,6 +35,7 @@
 
 #include "xop/execution/market_data.hpp"
 
+#include "xop/execution/book_side_quality.hpp"
 #include "xop/execution/mid_gate.hpp"
 #include "xop/execution/orderbook_mid.hpp"
 
@@ -1779,6 +1780,15 @@ void MarketDataFeed::publish_snapshot(const PairState& ps) {
     snap.dex_print_age       = ps.dex_print_age;
     snap.is_stale            = ps.is_stale;
 
+    // [SIDEQUALITY 2026-09-01] Per-side anchor agreement, carried through
+    // on every publish for the same reason as the flags above: the struct
+    // defaults are permissive so hand-built snapshots keep their previous
+    // behaviour, which makes an unset field indistinguishable from a
+    // deliberately trusted one unless the publisher always writes it.
+    snap.bid_side_anchor_ok = ps.bid_side_anchor_ok;
+    snap.ask_side_anchor_ok = ps.ask_side_anchor_ok;
+    snap.book_side_ref      = to_mojos(ps.book_side_ref);
+
     // Write to shared State (thread-safe; State::update_market acquires
     // its own internal mutex).
     state_.update_market(snap);
@@ -2113,6 +2123,46 @@ void MarketDataFeed::ingest_competing_offers(
             // into evidence on cycle 2.
             ps.bbo_filter_had_independent_anchor =
                 !cfg.mid_gate_enabled || ref_price > 0.0;
+            // [SIDEQUALITY 2026-09-01] Per-side agreement with the anchor.
+            //
+            // ref_price, NOT offer_ref_used.  offer_ref_used falls back to
+            // this pair's own last accepted mid, and letting a pair's own
+            // history disqualify a side of its own book is precisely the
+            // self-referential lock-in that made the 187.461980 mid
+            // unkillable: once the history is junk, the honest side looks
+            // wrong and gets demoted, which preserves the junk.  Only an
+            // INDEPENDENT anchor may disqualify.  Absent one, ref stays 0
+            // and both sides remain trusted -- unexamined, and recorded as
+            // such.
+            {
+                const auto sq = bookside::classify_sides(
+                    filtered_best_bid, filtered_best_ask, ref_price,
+                    cfg.book_side_anchor_band_ratio,
+                    cfg.book_side_agree_max_spread_bps);
+                ps.bid_side_anchor_ok = sq.bid_ok;
+                ps.ask_side_anchor_ok = sq.ask_ok;
+                ps.book_side_ref      = sq.ref;
+                if (!sq.bid_ok || !sq.ask_ok) {
+                    // Warn, not debug.  A disqualified side changes which
+                    // reference three downstream gates use, and the whole
+                    // reason this exists is that the previous behaviour
+                    // (silently suppressing every tier) was invisible at
+                    // info level.
+                    spdlog::warn("[MarketData] {}: book side disqualified vs "
+                                 "anchor {:.8f} (band {:.1f}x) -- bid {:.8f} "
+                                 "{}, ask {:.8f} {}",
+                                 pair_name, sq.ref,
+                                 cfg.book_side_anchor_band_ratio,
+                                 filtered_best_bid,
+                                 sq.bid_ok ? "ok" : "DISQUALIFIED",
+                                 filtered_best_ask,
+                                 sq.ask_ok ? "ok" : "DISQUALIFIED");
+                } else if (sq.bypassed) {
+                    spdlog::debug("[MarketData] {}: book is internally "
+                                  "coherent -- both sides trusted whole",
+                                  pair_name);
+                }
+            }
             // Publish unconditionally, INCLUDING the "no usable mid" zero.
             // The old `if (ob_mid > 0.0)` made this field sticky: once a book
             // went one-sided or empty the last good mid stayed in place and

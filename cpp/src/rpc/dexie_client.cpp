@@ -874,6 +874,15 @@ asio::awaitable<nlohmann::json> DexieClient::get_prices() {
 // -----------------------------------------------------------------------
 // GET /v1/offers?status=4  (recent trades)
 // -----------------------------------------------------------------------
+//
+// NO CALLERS TODAY -- and that is deliberate, not an oversight.  The
+// obvious use for a traded-price series is price discovery; that was
+// considered and REJECTED.  Routing this tape into the fair-value chain
+// would displace the governed par anchor (which is fallback-only), and it
+// would violate the commitment ``mid_gate.hpp`` states as "never the
+// pair's own history" -- trades on this pair ARE the pair's own history,
+// and a material share of them are our own fills.  Read
+// docs/price-discovery-from-trade-history.md before adding a caller.
 asio::awaitable<OffersPage> DexieClient::get_trades(
     std::string_view pair_id,
     uint32_t         page,
@@ -882,14 +891,36 @@ asio::awaitable<OffersPage> DexieClient::get_trades(
     log_->info("get_trades(pair_id={}, page={}, page_size={})",
                pair_id, page, page_size);
 
-    // Settled offers have status=4.  Sort newest first.
+    // Settled offers have status=4.
+    //
+    // VERIFIED against the live API, and only this much: "date_completed"
+    // is accepted and ALREADY returns newest-first on its own, while
+    // "date_completed_desc" -- what this call used to pass -- is NOT
+    // recognised.  An unrecognised sort value is SILENTLY IGNORED: the
+    // response still comes back success:true with a full page, merely in
+    // an arbitrary order.  That silence is exactly why the old key failed
+    // quietly: it never sorted, so this returned an arbitrary page
+    // instead of recent trades, and nothing in the response said so.
+    //
+    // Since tested (2026-09-01, live probe against /v1/offers, each result
+    // compared against the unsorted default): "price_desc",
+    // "date_completed" and "date_found" are HONOURED; "date_completed_desc",
+    // "date_found_desc", "date_found_asc", "price" and a deliberately bogus
+    // key are all SILENTLY IGNORED.  "price_asc" is indeterminate -- it
+    // returns the default order, but the default IS ascending price.
+    //
+    // Note "price_desc" works while "date_found_desc" does not, so the
+    // suffix belongs to some key names and not others; do not derive one
+    // key's spelling from another's.  See the @param sort doc on
+    // get_offers() for the full table.  This is what was tested, not an
+    // exhaustive list of what the API accepts.
     co_return co_await get_offers(
         pair_id,
         /*offered=*/   {},
         /*requested=*/ {},
         page,
         page_size,
-        /*sort=*/      "date_completed_desc",
+        /*sort=*/      "date_completed",
         /*compact=*/   true,
         /*status=*/    4);
 }

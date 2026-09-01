@@ -1,0 +1,1088 @@
+#!/usr/bin/env python3
+"""Low-frequency high/low bid-ask spread estimators, run as a falsification test.
+
+OPERATOR DIAGNOSTIC ONLY.  Nothing in this module may ever become a live
+engine input -- not a fair-value term, not a spread floor, not a gate
+threshold, not a sanity bound.  The numbers it prints are produced from
+QUOTE samples standing in for trade prices (see "Bar construction" below),
+which is outside the regime every estimator here was derived for.  They are
+evidence in an argument, not measurements of a transaction cost.  If a
+future reader wants a spread number for the engine, take it from the book or
+from realized fills; do not import this file.
+
+WHY IT EXISTS
+-------------
+The XCH/BYC book currently reports a spread of ~10,769 bps (best bid 1.5000
+BYC/XCH, best ask 4.9995, mid 3.24975).  The claim under test is that this is
+not a spread at all: the ask side is absent, and 10,769 bps is arithmetic on
+a quote nobody has ever hit.  Corwin-Schultz and Abdi-Ranaldo estimate an
+EFFECTIVE spread from daily high/low (and close) alone -- from the range the
+price actually travelled, not from the quotes standing on the book.  Feeding
+them the same market and getting back a number one to two orders of magnitude
+smaller is a falsification of the 10,769 bps figure, obtained without any
+appeal to our own fair-value model, our own fills, or BYC's declared par.
+
+The estimators are used here for what they CANNOT return, which is the only
+use that survives their misuse as described above.
+
+Bar construction
+----------------
+Neither paper's input exists in this database: there is no continuous
+trade-price series with daily highs and lows.  What exists is a sampled
+third-party BBO series (offer_log.book_best_bid / book_best_ask, and
+snapshots.mid_price_mojos + spread_bps, which reconstruct the same bid and
+ask exactly -- mid 3.24975 with spread 10768.52 bps gives back 1.5000 /
+4.9995).  Two bar constructions are offered, and BOTH are declared in the
+output because the choice changes the answer:
+
+  quote-touch (default)
+      H_t = max(best_ask) over the day, L_t = min(best_bid) over the day,
+      C_t = last mid.  Assumes a trade occurred at every quote that was ever
+      touched, so the daily range is the widest the quotes can justify.  This
+      is an UPPER BOUND on the range and therefore an UPPER BOUND on the
+      estimated spread.  The falsification argument holds a fortiori under
+      it: if even the upper bound lands far below the posted book spread,
+      the posted book spread is not a spread.
+
+  mid
+      H_t = max(mid), L_t = min(mid), C_t = last mid.  Strips the bid-ask
+      bounce that both estimators exist to extract, so it is biased hard
+      toward zero.  Useful only as a lower bracket.
+
+Method
+------
+  * Per pair, daily bars over --days, from --source (offer_log or snapshots).
+  * Corwin-Schultz over every pair of ADJACENT calendar days (the estimator
+    is defined on consecutive days; day pairs straddling a gap in our
+    sampling are counted and skipped, never silently joined).
+  * Abdi-Ranaldo over the same adjacent day pairs.
+  * A freshness gate, a degeneracy gate and a SAMPLE gate, any of which
+    REFUSES a pair outright rather than printing a plausible-looking number.
+
+SAMPLE SIZE
+-----------
+Both estimators are TWO-DAY estimators.  Every figure they return is an
+average over ADJACENT DAY PAIRS, so the day-pair count -- not the bar count
+-- is the sample size, and it is the number quoted beside every estimate in
+the output.  Usable bars and usable day pairs are not the same quantity:
+bars survive the gap-skipping step that day pairs do not, so a handful of
+bars scattered around a sampling gap can leave one or two adjacent pairs
+behind.  MIN_USABLE_DAY_PAIRS gates that directly.
+
+Usage:
+    .venv/Scripts/python.exe scripts/highlow_spread_estimator.py
+    .venv/Scripts/python.exe scripts/highlow_spread_estimator.py \
+        --pair XCH/BYC --days 30 --source offer_log
+    .venv/Scripts/python.exe scripts/highlow_spread_estimator.py --dexie
+    .venv/Scripts/python.exe scripts/highlow_spread_estimator.py --json
+
+Exit codes: 0 = report printed (a REFUSED pair is a printed result, not an
+error), 2 = operational error (database missing, dexie unreachable, no such
+pair).  Read-only throughout: the database is opened mode=ro and dexie is
+only GETted.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import sqlite3
+import sys
+import urllib.error
+import urllib.request
+from collections import defaultdict
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DB_PATH = REPO_ROOT / "data" / "xop_trader.db"
+
+DEXIE_MARKETS_URL = "https://api.dexie.space/v1/markets"
+
+# offer_log.book_best_bid / book_best_ask and snapshots.mid_price_mojos are
+# fixed-point PRICES (quote per base), not asset quantities, so the scale is
+# a single constant independent of the assets' own decimals.  Verified
+# against the live book: book_best_bid 1500000000000 -> 1.5000 BYC/XCH.
+PRICE_SCALE = 1_000_000_000_000
+
+DEFAULT_LOOKBACK_DAYS = 30.0
+
+# --- Gate constants -------------------------------------------------------
+# Ardia, Guidotti and Kroencke (2024), "Efficient estimation of bid-ask
+# spreads from open, high, low, and close prices", JFE 161, 103916, show
+# that Roll (1984), Corwin-Schultz (2012) and Abdi-Ranaldo (2017) are all
+# DOWNWARD BIASED when trading is infrequent, and require a bar frequency
+# that delivers at least two trades per bar.  We have no trade series here,
+# only quote samples, so the requirement is applied to samples -- a strictly
+# WEAKER test than the paper's, since a quote sample is not a trade.  A bar
+# that clears this gate has still not been shown to clear theirs.
+MIN_SAMPLES_PER_BAR = 2
+
+# Minimum non-degenerate bars before either estimator is reported at all.
+#
+# DERIVED, not chosen: MIN_USABLE_DAY_PAIRS + 1 (see below).  N usable bars
+# yield at most N-1 adjacent day pairs, so any value above that would be
+# dominated -- the day-pair gate would refuse everything this one admitted,
+# and the operator would read a "need 4 bars" message while the tool was
+# really enforcing five consecutive ones.  Defined after MIN_USABLE_DAY_PAIRS
+# so the two cannot drift apart; it is a cheap early-out, and the day-pair
+# gate is the real sample-adequacy test.
+
+# Minimum ADJACENT DAY PAIRS before either estimator is reported at all.
+#
+# MIN_USABLE_BARS above gates BARS, which is NOT the sample size here.  Both
+# estimators are two-day estimators: Corwin-Schultz consumes a pair of
+# consecutive days and Abdi-Ranaldo's moment condition spans the same two,
+# so every reported figure is an average over adjacent day pairs.  Bars and
+# day pairs come apart because the estimation loop skips any pair straddling
+# a gap in our sampling: four usable bars sitting either side of a gap can
+# yield as few as one adjacent pair, and before this gate existed the tool
+# would print headline Corwin-Schultz and Abdi-Ranaldo figures AND a full
+# FALSIFICATION verdict off that single observation.  The only guard was
+# "cs_values is non-empty", which refuses zero pairs and accepts one.
+#
+# Ardia, Guidotti and Kroencke (2024), "Efficient estimation of bid-ask
+# spreads from open, high, low, and close prices", JFE 161, 103916, is the
+# authority for gating on sample adequacy: their result is that these
+# estimators' bias and dispersion are governed by how much usable data each
+# estimate averages over, which is exactly the quantity a bar count
+# misreports here.
+#
+# Held at the same 4 as MIN_USABLE_BARS.  Note this is the STRICTER of the
+# two: four adjacent day pairs require five CONSECUTIVE usable bars, not
+# merely five usable bars.  It is a floor and not a sufficiency claim --
+# four day pairs remains a tiny sample, which is why the count is printed
+# beside every estimate rather than only checked.
+MIN_USABLE_DAY_PAIRS = 4
+
+# See the derivation note above.
+MIN_USABLE_BARS = MIN_USABLE_DAY_PAIRS + 1
+
+# Newest bar must be no older than this or the whole pair is refused.  BYC
+# pairs went enabled:false on 2026-08-31 and BYC/wUSDC.b last printed on
+# 2026-08-24, so this gate genuinely fires in production.
+MAX_BAR_AGE_DAYS = 2.0
+
+# A raw book spread at or above this is treated as a DISLOCATION flag, not a
+# spread: no two-sided market quotes 20% and expects a fill.  Used only to
+# label the output, never to filter data.
+DISLOCATION_SPREAD_BPS = 2000.0
+
+# Corwin-Schultz constant 3 - 2*sqrt(2) ~ 0.171573.
+CS_K = 3.0 - 2.0 * math.sqrt(2.0)
+
+BPS = 10_000.0
+
+SOURCES = ("offer_log", "snapshots")
+BAR_MODES = ("quote-touch", "mid")
+
+# Mirrors scripts/offer_sizing.py ASSET_NAMES, inverted: dexie keys markets
+# by CAT asset id, our pair names are symbols.
+ASSET_IDS: dict[str, str] = {
+    "XCH": "xch",
+    "WUSDC.B": "fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d",
+    "BYC": "ae1536f56760e471ad85ead45f00d680ff9cca73b8cc3407be778f1c0c606eac",
+    "DBX": "db1a9020d48d9d4ad22631b66ab4b9ebd3637ef7758ad38881348c5d24c38f20",
+}
+
+ONE_SIDED_NOTE = (
+    "ONE-SIDED BOOK: when one side of the book is absent, the surviving side "
+    "supplies BOTH the daily high and the daily low. A high/low estimator "
+    "cannot see a spread that no counterparty ever crossed, so any number it "
+    "returns for such a market is a CEILING ARGUMENT -- an upper bound on "
+    "what the traded range could justify -- and NOT a usable transaction "
+    "cost. Do not quote it as one."
+)
+
+
+def _median(values: list[float]) -> float | None:
+    """Median of *values*, or None when empty.
+
+    Same convention as scripts/offer_sizing.py: sort, take the middle
+    element (upper median on even counts), no interpolation.
+    """
+    if not values:
+        return None
+    ordered = sorted(values)
+    return float(ordered[len(ordered) // 2])
+
+
+@dataclass
+class Bar:
+    """One daily bar built from sampled quotes."""
+
+    day: str
+    high: float
+    low: float
+    close: float
+    samples: int
+    spread_bps: float          # median raw book spread across the day
+    bid_span_bps: float        # dispersion of the bid side within the day
+    ask_span_bps: float        # dispersion of the ask side within the day
+
+    @property
+    def degenerate(self) -> bool:
+        """H == L (a zero-print day) collapses both estimators.
+
+        Corwin-Schultz reads ln(H/L) = 0 into beta AND gamma, so alpha = 0
+        and S = 0 exactly; Abdi-Ranaldo reads eta_t = c_t and returns 0 the
+        same way.  Both then look like a measured zero spread rather than an
+        absence of information, which is precisely the failure this gate
+        exists to prevent.  Non-positive prices are folded in here too.
+        """
+        return not (self.high > self.low > 0.0)
+
+    @property
+    def dislocated(self) -> bool:
+        return self.spread_bps >= DISLOCATION_SPREAD_BPS
+
+
+# ==========================================================================
+# Estimators
+# ==========================================================================
+
+def corwin_schultz(bar_t: Bar, bar_t1: Bar) -> float:
+    """Corwin and Schultz (2012), JF 67(2), 719-760, "A Simple Way to
+    Estimate Bid-Ask Spreads from Daily High and Low Prices".
+
+    Two consecutive single days t and t+1, and the two-day high and low
+    formed over both:
+
+        beta  = [ln(H_t / L_t)]^2 + [ln(H_t1 / L_t1)]^2
+        gamma = [ln(H_2day / L_2day)]^2
+        alpha = (sqrt(2*beta) - sqrt(beta)) / (3 - 2*sqrt(2))
+                - sqrt(gamma / (3 - 2*sqrt(2)))
+        S     = 2 * (exp(alpha) - 1) / (1 + exp(alpha))
+
+    where H_2day = max(H_t, H_t1) and L_2day = min(L_t, L_t1).
+
+    The intuition the paper trades on: the two-day range contains one
+    spread, the sum of two single-day ranges contains two, and volatility
+    scales with the square root of time while the spread does not.  The
+    difference isolates the spread.
+
+    S is a PROPORTIONAL spread (a fraction of price), so bps = S * 10_000.
+    Bounded above by 2.0 as alpha -> +inf, i.e. 20,000 bps -- worth knowing
+    before treating a large output as informative.
+
+    The paper's overnight-return adjustment (its eq. 15, which shifts the
+    day-t+1 high and low when the two days do not overlap) is deliberately
+    NOT applied: it corrects for a closed session, and a Chia DEX book runs
+    continuously with no session boundary for prices to jump across.
+
+    Callers must pre-screen both bars with Bar.degenerate; this function
+    assumes H > L > 0 on both.
+    """
+    beta = math.log(bar_t.high / bar_t.low) ** 2 \
+        + math.log(bar_t1.high / bar_t1.low) ** 2
+    two_day_high = max(bar_t.high, bar_t1.high)
+    two_day_low = min(bar_t.low, bar_t1.low)
+    gamma = math.log(two_day_high / two_day_low) ** 2
+
+    alpha = (math.sqrt(2.0 * beta) - math.sqrt(beta)) / CS_K \
+        - math.sqrt(gamma / CS_K)
+    exp_alpha = math.exp(alpha)
+    return 2.0 * (exp_alpha - 1.0) / (1.0 + exp_alpha)
+
+
+def abdi_ranaldo_sq(bar_t: Bar, bar_t1: Bar) -> float:
+    """Abdi and Ranaldo (2017), RFS 30(12), 4437-4480, "A Simple Estimation
+    of Bid-Ask Spreads from Daily Close, High, and Low Prices".
+
+    With lower-case letters for logs, c_t = ln(C_t), h_t = ln(H_t),
+    l_t = ln(L_t), and the mid-range
+
+        eta_t = (h_t + l_t) / 2
+
+    the estimator's moment condition is
+
+        E[ 4 * (c_t - eta_t) * (c_t - eta_t1) ] = S^2
+
+    so this returns the per-day-pair S^2 term
+
+        S^2_t = 4 * (c_t - eta_t) * (c_t - eta_t1)
+
+    which the caller aggregates.  Unlike Corwin-Schultz, the close is used,
+    which is what lets a single close sit between two mid-range estimates of
+    the same efficient price; the spread falls out of the covariance.
+
+    The paper documents this estimator as MOST ACCURATE FOR LESS LIQUID
+    STOCKS, and reports that it is only MARGINALLY SENSITIVE to the number
+    of trades per day once that number is above roughly five -- which is why
+    it is the more appropriate of the two for a market as thin as this one,
+    and why its disagreement with the posted book spread carries weight.
+    That insensitivity has a floor, however: see MIN_SAMPLES_PER_BAR and
+    Ardia, Guidotti and Kroencke (2024) above.
+
+    S^2_t is frequently NEGATIVE in small samples.  That is expected -- it is
+    a sample covariance, not a variance -- and the sign is reported, never
+    hidden.
+    """
+    eta_t = (math.log(bar_t.high) + math.log(bar_t.low)) / 2.0
+    eta_t1 = (math.log(bar_t1.high) + math.log(bar_t1.low)) / 2.0
+    c_t = math.log(bar_t.close)
+    return 4.0 * (c_t - eta_t) * (c_t - eta_t1)
+
+
+# ==========================================================================
+# Database (read-only)
+# ==========================================================================
+
+class DbReader:
+    """Read-only reader.  Opened with a mode=ro URI: the live bot owns this
+    file and this script must never write, VACUUM or migrate it."""
+
+    def __init__(self, db_path: Path) -> None:
+        uri = f"file:{db_path.as_posix()}?mode=ro"
+        self._con = sqlite3.connect(uri, uri=True, timeout=10)
+        self._con.execute("PRAGMA busy_timeout = 10000")
+
+    def close(self) -> None:
+        self._con.close()
+
+    @staticmethod
+    def _cutoff(days: float) -> str:
+        """Lexical ISO cutoff.
+
+        TIMESTAMP FORMAT TRAP (see scripts/offer_sizing.py:181-186, 207-212):
+        trade_log.timestamp separates date and time with 'T', while
+        snapshots.created_at and offer_log.created_at use a SPACE.  Both
+        tables read here are the space-separated kind, so one cutoff format
+        serves both -- but do not copy this cutoff into a trade_log query.
+        """
+        return (datetime.now(timezone.utc) - timedelta(days=days)) \
+            .strftime("%Y-%m-%d %H:%M:%S")
+
+    def pairs(self, source: str, days: float) -> list[str]:
+        cutoff = self._cutoff(days)
+        if source == "offer_log":
+            sql = ("SELECT DISTINCT pair_name FROM offer_log "
+                   "WHERE created_at >= ? AND book_best_bid > 0 "
+                   "AND book_best_ask > 0")
+        else:
+            sql = ("SELECT DISTINCT pair_name FROM snapshots "
+                   "WHERE created_at >= ? AND mid_price_mojos > 0 "
+                   "AND spread_bps IS NOT NULL")
+        return sorted(r[0] for r in self._con.execute(sql, (cutoff,)))
+
+    def quotes(self, pair: str, source: str,
+               days: float) -> tuple[list[tuple[str, float, float]], int]:
+        """[(created_at, bid, ask)] in quote-per-base units, plus the count
+        of CROSSED/LOCKED samples dropped (ask <= bid).
+
+        A crossed sample is not a spread observation -- it is two stale
+        halves of the book sampled at different instants -- and admitting it
+        would put a negative range into a log.  XCH/DBX carries a few.
+        """
+        cutoff = self._cutoff(days)
+        if source == "offer_log":
+            rows = self._con.execute(
+                "SELECT created_at, book_best_bid, book_best_ask "
+                "FROM offer_log WHERE pair_name = ? AND created_at >= ? "
+                "AND book_best_bid > 0 AND book_best_ask > 0 "
+                "ORDER BY created_at",
+                (pair, cutoff),
+            ).fetchall()
+            raw = [(ts, b / PRICE_SCALE, a / PRICE_SCALE) for ts, b, a in rows]
+        else:
+            # snapshots stores mid and spread rather than the two sides;
+            # inverting is exact.  half = mid * spread_bps / 2 / 10_000, so
+            # mid 3.24975 with spread 10768.52 bps returns bid 1.50000 and
+            # ask 4.99950 -- the live XCH/BYC book, to five decimals.
+            rows = self._con.execute(
+                "SELECT created_at, mid_price_mojos, spread_bps "
+                "FROM snapshots WHERE pair_name = ? AND created_at >= ? "
+                "AND mid_price_mojos > 0 AND spread_bps IS NOT NULL "
+                "ORDER BY created_at",
+                (pair, cutoff),
+            ).fetchall()
+            raw = []
+            for ts, mid_mojos, spread_bps in rows:
+                mid = mid_mojos / PRICE_SCALE
+                half = mid * float(spread_bps) / BPS / 2.0
+                raw.append((ts, mid - half, mid + half))
+
+        clean = [(ts, b, a) for ts, b, a in raw if a > b > 0.0]
+        return clean, len(raw) - len(clean)
+
+
+# ==========================================================================
+# Bar building
+# ==========================================================================
+
+def build_bars(quotes: list[tuple[str, float, float]], mode: str) -> list[Bar]:
+    """Daily bars from a sampled quote series, newest last."""
+    by_day: dict[str, list[tuple[float, float]]] = defaultdict(list)
+    for ts, bid, ask in quotes:
+        by_day[ts[:10]].append((bid, ask))
+
+    bars: list[Bar] = []
+    for day in sorted(by_day):
+        samples = by_day[day]
+        bids = [b for b, _ in samples]
+        asks = [a for _, a in samples]
+        mids = [(b + a) / 2.0 for b, a in samples]
+        if mode == "quote-touch":
+            high, low = max(asks), min(bids)
+        else:
+            high, low = max(mids), min(mids)
+        spread = _median([(a - b) / ((a + b) / 2.0) * BPS for b, a in samples])
+        bid_ref = _median(bids) or 1.0
+        ask_ref = _median(asks) or 1.0
+        bars.append(Bar(
+            day=day,
+            high=high,
+            low=low,
+            close=mids[-1],
+            samples=len(samples),
+            spread_bps=float(spread or 0.0),
+            bid_span_bps=(max(bids) - min(bids)) / bid_ref * BPS,
+            ask_span_bps=(max(asks) - min(asks)) / ask_ref * BPS,
+        ))
+    return bars
+
+
+# ==========================================================================
+# Per-pair estimation, with the gates
+# ==========================================================================
+
+def estimate_pair(pair: str, bars: list[Bar], crossed_dropped: int,
+                  max_age_days: float, source: str, days: float) -> dict:
+    """Run both estimators over *bars* subject to the freshness, degeneracy
+    and sample gates.  Returns a result dict; "refused" carries the reason
+    when no estimate is reported.
+
+    *source* and *days* are carried only so the output can state which quote
+    series and which window every descriptive figure was read off; they do
+    not affect the estimates.
+    """
+    result: dict = {
+        "pair": pair,
+        "source": source,
+        "window_days": days,
+        "bars_seen": len(bars),
+        "bars_used": 0,
+        "bars_degenerate": 0,
+        "bars_thin": 0,
+        "crossed_dropped": crossed_dropped,
+        "day_pairs_used": 0,
+        "day_pairs_nonadjacent": 0,
+        "cs_negative": 0,
+        "ar_negative": 0,
+        "cs_bps": None,
+        "ar_bps": None,
+        "ar_twoday_bps": None,
+        "observed_spread_bps": None,
+        "observed_spread_latest_bps": None,
+        "latest_bar": bars[-1].day if bars else None,
+        "latest_bar_age_days": None,
+        "dislocated": False,
+        "refused": None,
+        "notes": [],
+    }
+    if not bars:
+        result["refused"] = "no quote samples in window"
+        return result
+
+    latest = bars[-1]
+    result["observed_spread_bps"] = _median([b.spread_bps for b in bars])
+    result["observed_spread_latest_bps"] = latest.spread_bps
+    result["dislocated"] = latest.dislocated
+    if latest.dislocated:
+        result["notes"].append(
+            f"DISLOCATION FLAG: latest bar {latest.day} shows a raw book "
+            f"spread of {latest.spread_bps:,.0f} bps, at or above the "
+            f"{DISLOCATION_SPREAD_BPS:,.0f} bps threshold. Read every "
+            f"estimate below as a ceiling argument."
+        )
+        # SIDE DISPERSION IS DESCRIPTIVE ONLY.
+        #
+        # This block used to convert the two span figures into a claim about
+        # WHICH SIDE was absent -- "the ask side never moved all day while
+        # the bid did", and so on.  That inference is withdrawn.  It failed
+        # on both counts a claim like it has to survive:
+        #
+        #   * It is not the measurement it was being read as.  bid_span_bps
+        #     and ask_span_bps are the dispersion of OUR QUOTE SAMPLES within
+        #     a day.  Zero dispersion means a side did not move BETWEEN THE
+        #     INSTANTS WE SAMPLED; it is not evidence about whether any
+        #     counterparty would cross that side.  Dislocation and sample
+        #     dispersion are different quantities and the tool was equating
+        #     them.
+        #   * It is sample-dependent, and this tool's own two sources
+        #     disagree on the same book on the same day.  XCH/BYC on
+        #     2026-08-31: --source offer_log gives ask dispersion 0 bps, and
+        #     the denser --source snapshots gives 9,502 bps.  The sparser
+        #     series therefore pointed the opposite way to the denser one,
+        #     with no caveat attached to say so.
+        #
+        # The per-side verdict is not this tool's to give.  It belongs to
+        # cpp/include/xop/execution/book_side_quality.hpp, which scores each
+        # side against an INDEPENDENT anchor carrying no book input, rather
+        # than against the side's own dispersion.  A diagnostic built on
+        # quote samples must not pre-empt a test built on an anchor.
+        #
+        # The numbers are still printed, because the raw spans are a real
+        # observation about the sample and a reader may want them.  What is
+        # printed with them is the source, the window, the date, and the
+        # statement that they do not rank the sides.
+        result["notes"].append(
+            f"SIDE DISPERSION (descriptive, NOT a per-side verdict): on bar "
+            f"{latest.day}, read from source '{source}' over a {days:g}-day "
+            f"window, sampled bid quotes spanned "
+            f"{latest.bid_span_bps:,.0f} bps and sampled ask quotes spanned "
+            f"{latest.ask_span_bps:,.0f} bps. Quote-sample dispersion is NOT "
+            f"a measurement of book dislocation: it reports how far each "
+            f"side moved between the instants THIS source happened to "
+            f"sample, not whether a counterparty would cross either side, "
+            f"and it changes with the source and the window -- the two "
+            f"sources available here can and do disagree about the same "
+            f"book on the same day. This tool does not say which side is "
+            f"junk. That verdict belongs to the engine's per-side anchor "
+            f"test, cpp/include/xop/execution/book_side_quality.hpp, which "
+            f"scores each side against an independent anchor instead of "
+            f"against its own dispersion."
+        )
+
+    # --- FRESHNESS GATE ---------------------------------------------------
+    age_days = (datetime.now(timezone.utc).date()
+                - date.fromisoformat(latest.day)).days
+    result["latest_bar_age_days"] = age_days
+    if age_days > max_age_days:
+        result["refused"] = (
+            f"FRESHNESS GATE: newest bar is {latest.day} "
+            f"({age_days} days old, limit {max_age_days:g}). A high/low "
+            f"estimator run on a stale book reports the spread of a market "
+            f"that has stopped existing."
+        )
+        return result
+
+    # --- DEGENERACY GATE (per bar) ----------------------------------------
+    # H == L means the day produced a single price: no range, no information.
+    # Refuse the bar rather than let it return a plausible-looking zero.
+    usable: list[Bar] = []
+    for bar in bars:
+        if bar.degenerate:
+            result["bars_degenerate"] += 1
+            continue
+        if bar.samples < MIN_SAMPLES_PER_BAR:
+            # Ardia, Guidotti and Kroencke (2024), JFE 161, 103916.
+            result["bars_thin"] += 1
+            continue
+        usable.append(bar)
+    result["bars_used"] = len(usable)
+
+    if len(usable) < MIN_USABLE_BARS:
+        result["refused"] = (
+            f"DEGENERACY GATE: only {len(usable)} usable bars "
+            f"({result['bars_degenerate']} degenerate H==L, "
+            f"{result['bars_thin']} below {MIN_SAMPLES_PER_BAR} samples); "
+            f"need {MIN_USABLE_BARS} (and {MIN_USABLE_DAY_PAIRS} adjacent "
+            f"day pairs, i.e. {MIN_USABLE_DAY_PAIRS + 1} CONSECUTIVE usable "
+            f"bars, to produce an estimate)."
+        )
+        return result
+
+    # --- Estimation over ADJACENT calendar-day pairs ----------------------
+    cs_values: list[float] = []
+    ar_sq_values: list[float] = []
+    for bar_t, bar_t1 in zip(usable, usable[1:], strict=False):
+        if (date.fromisoformat(bar_t1.day) - date.fromisoformat(bar_t.day)).days != 1:
+            # Both estimators are defined on CONSECUTIVE days.  Our sampling
+            # has gaps (the bot is not always quoting every pair), and
+            # joining across a gap would silently price a multi-day range as
+            # a two-day one.
+            result["day_pairs_nonadjacent"] += 1
+            continue
+        result["day_pairs_used"] += 1
+
+        spread = corwin_schultz(bar_t, bar_t1)
+        if spread < 0.0:
+            result["cs_negative"] += 1
+        # Corwin (2014) / the paper's own practice: negative two-day
+        # estimates are set to zero before averaging into a monthly-style
+        # figure.  The RAW negative count is reported alongside because a
+        # high negative rate is not noise to be cleaned -- it is the
+        # estimator telling us it is out of its regime on this data.
+        cs_values.append(max(spread, 0.0))
+
+        sq = abdi_ranaldo_sq(bar_t, bar_t1)
+        if sq < 0.0:
+            result["ar_negative"] += 1
+        ar_sq_values.append(sq)
+
+    # --- SAMPLE GATE (adjacent day pairs) ---------------------------------
+    # The real sample size.  MIN_USABLE_BARS above counted BARS, which
+    # survive the gap-skipping just above while day pairs do not, so passing
+    # it is no evidence at all about how many two-day terms were actually
+    # averaged.  The `not cs_values` half is redundant while
+    # MIN_USABLE_DAY_PAIRS >= 1 and is kept so the guard cannot be voided by
+    # lowering the constant.
+    if result["day_pairs_used"] < MIN_USABLE_DAY_PAIRS or not cs_values:
+        nonadj = result["day_pairs_nonadjacent"]
+        result["refused"] = (
+            f"SAMPLE GATE: only {result['day_pairs_used']} adjacent day "
+            f"pairs from {len(usable)} usable bars "
+            f"({nonadj} candidate pair{'' if nonadj == 1 else 's'} straddled "
+            f"a sampling gap); need {MIN_USABLE_DAY_PAIRS}. Both estimators "
+            f"are TWO-DAY estimators and neither is defined on "
+            f"non-consecutive days, so the ADJACENT DAY PAIR count is the "
+            f"sample size -- {len(usable)} usable bars is not {len(usable)} "
+            f"observations. Averaging this few two-day terms reports "
+            f"sampling noise as a spread (Ardia, Guidotti & Kroencke 2024, "
+            f"JFE 161, 103916)."
+        )
+        return result
+
+    result["cs_bps"] = sum(cs_values) / len(cs_values) * BPS
+
+    # Abdi-Ranaldo aggregates in VARIANCE space -- average the S^2 terms,
+    # then floor at zero and take the root.  A negative mean is not a small
+    # spread; it is no estimate at all, and is labelled as such below.
+    ar_mean_sq = sum(ar_sq_values) / len(ar_sq_values)
+    result["ar_mean_sq"] = ar_mean_sq
+    result["ar_bps"] = (math.sqrt(ar_mean_sq) * BPS) if ar_mean_sq > 0.0 else 0.0
+    if ar_mean_sq <= 0.0:
+        result["notes"].append(
+            "Abdi-Ranaldo mean S^2 is negative -- the estimator returns no "
+            "estimate here, not a zero spread."
+        )
+    # The paper's "two-day corrected" variant floors each daily term before
+    # averaging instead of after.  It cannot go negative, so it is reported
+    # as a bracket rather than as the headline.
+    two_day = [math.sqrt(v) for v in ar_sq_values if v > 0.0]
+    result["ar_twoday_bps"] = (sum(two_day) / len(ar_sq_values) * BPS
+                               if two_day else 0.0)
+
+    neg_rate = result["cs_negative"] / result["day_pairs_used"]
+    if neg_rate > 0.5:
+        result["notes"].append(
+            f"Corwin-Schultz returned a negative estimate on "
+            f"{result['cs_negative']} of {result['day_pairs_used']} day pairs "
+            f"({neg_rate:.0%}) -- above 50% the zero-flooring dominates the "
+            f"average and the reported figure is an artefact of the flooring, "
+            f"not a measurement."
+        )
+    return result
+
+
+# ==========================================================================
+# dexie (optional, read-only GET)
+# ==========================================================================
+
+def fetch_dexie_markets() -> dict:
+    """GET the dexie markets document.
+
+    Standard library only: pyproject.toml lists requests under the OPTIONAL
+    [gui] extra, so a diagnostic that reaches for it stops working on a
+    checkout without the GUI installed.  The URL is the module constant
+    above -- a literal https endpoint, not caller-supplied.
+    """
+    req = urllib.request.Request(  # noqa: S310 - literal https constant
+        DEXIE_MARKETS_URL,
+        headers={"User-Agent": "xop-trader-highlow-diagnostic/1.0"},
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310
+        return json.load(resp)
+
+
+def dexie_high_low(payload: dict, pair: str) -> dict:
+    """TickerData-style daily high/low for *pair*, in OUR orientation.
+
+    These are the same price_high / price_low that dexie_client.cpp:647-650
+    parses into TickerData and dexie_client.cpp:821-828 orientation-swaps --
+    and that nothing in the engine then reads.  They are free input.
+
+    ORIENTATION: dexie keys markets by pair_id and quotes CAT_XCH, i.e.
+    price is XCH per CAT.  Our XCH/BYC is BYC per XCH, so the swap is a
+    RECIPROCAL AND A SIDE FLIP: our high is 1/their low and our low is
+    1/their high.  Getting only the reciprocal right silently inverts the
+    bar.
+
+    A single 24h high/low is ONE bar.  Corwin-Schultz and Abdi-Ranaldo both
+    need two consecutive bars, so this cannot drive either estimator on its
+    own; it is reported as an independent range check and gate test.
+    """
+    base, _, quote = pair.partition("/")
+    base_id = ASSET_IDS.get(base.upper())
+    quote_id = ASSET_IDS.get(quote.upper())
+    out: dict = {"pair": pair, "available": False, "reason": ""}
+    if base_id is None or quote_id is None:
+        out["reason"] = f"no dexie asset id known for {pair}"
+        return out
+
+    markets = payload.get("markets") or {}
+    entry = None
+    inverted = False
+    for pair_id, listings in markets.items():
+        for market in listings:
+            market_id = market.get("id")
+            if pair_id == base_id and market_id == quote_id:
+                entry, inverted = market, False
+                break
+            if pair_id == quote_id and market_id == base_id:
+                # dexie quotes it the other way round from us.
+                entry, inverted = market, True
+                break
+        if entry is not None:
+            break
+    if entry is None:
+        out["reason"] = f"dexie lists no market for {pair}"
+        return out
+
+    prices = entry.get("prices") or {}
+    high = (prices.get("high") or {}).get("daily")
+    low = (prices.get("low") or {}).get("daily")
+    last = prices.get("last") or {}
+    if not high or not low or high <= 0 or low <= 0:
+        out["reason"] = "dexie reports no daily high/low"
+        return out
+
+    last_price = last.get("price")
+    if inverted:
+        our_high, our_low = high, low
+    else:
+        # dexie price is XCH-per-CAT while our pair is CAT-per-XCH.
+        our_high, our_low = 1.0 / low, 1.0 / high
+        # The last price needs the SAME reciprocal, or the report mixes two
+        # orientations in one block and reads as a 2x discrepancy that is
+        # not there.
+        if last_price:
+            last_price = 1.0 / float(last_price)
+
+    # Freshness applies here too, and from a better clock than the database
+    # has: dexie stamps the last trade, so this is real trade staleness
+    # rather than sampling staleness.
+    last_date = last.get("date")
+    stale_days = None
+    if last_date:
+        try:
+            stamped = datetime.fromisoformat(
+                str(last_date).replace("Z", "+00:00"))
+            stale_days = (datetime.now(timezone.utc) - stamped).days
+        except ValueError:
+            stale_days = None
+
+    out.update({
+        "available": True,
+        "high": our_high,
+        "low": our_low,
+        "last_price": last_price,
+        "last_date": last_date,
+        "last_trade_age_days": stale_days,
+        "inverted": not inverted,
+        "range_bps": math.log(our_high / our_low) * BPS,
+        "degenerate": not (our_high > our_low > 0.0),
+        "stale": stale_days is not None and stale_days > MAX_BAR_AGE_DAYS,
+    })
+    return out
+
+
+# ==========================================================================
+# Presentation
+# ==========================================================================
+
+def _fmt_bps(value: float | None) -> str:
+    return "     n/a" if value is None else f"{value:>8,.1f}"
+
+
+def print_report(results: list[dict], dexie_rows: list[dict],
+                 source: str, mode: str, days: float,
+                 max_age_days: float) -> None:
+    print("Low-frequency high/low spread estimators -- OPERATOR DIAGNOSTIC")
+    print("=" * 78)
+    print("Corwin & Schultz (2012) JF 67(2) 719-760; "
+          "Abdi & Ranaldo (2017) RFS 30(12) 4437-4480.")
+    print("Gates per Ardia, Guidotti & Kroencke (2024) JFE 161 103916.")
+    print()
+    print(f"source: {source}   bars: {mode}   window: {days:g} days   "
+          f"freshness limit: {max_age_days:g} days")
+    print(f"sample gate: at least {MIN_USABLE_DAY_PAIRS} adjacent day pairs "
+          f"-- the sample size, because both")
+    print("             estimators are two-day estimators "
+          "(Ardia et al. 2024)")
+    print(f"generated: {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%SZ}")
+    print()
+    print("NOT A LIVE ENGINE INPUT. These estimates come from quote samples "
+          "standing in for")
+    print("trade prices, which is outside the regime all three estimators "
+          "were derived for.")
+    print()
+    for line in _wrap(ONE_SIDED_NOTE, 78):
+        print(line)
+    print()
+
+    header = (f"{'pair':<16}{'bars':>5}{'n pairs':>8}{'degen':>6}{'thin':>5}"
+              f"{'CS-':>5}{'AR-':>5}{'CS bps':>10}{'AR bps':>10}"
+              f"{'obs bps':>10}{'obs now':>11}")
+    print(header)
+    print("-" * len(header))
+    for r in results:
+        if r["refused"]:
+            # No estimate is shown, so no sample size is shown.  '-' rather
+            # than 0 means "not reported here", NOT "zero pairs": freshness
+            # and degeneracy refusals genuinely never reach the pairing loop,
+            # but a SAMPLE GATE refusal does reach it and holds a real count
+            # (2 or 3).  Printing 0 for both would assert something false
+            # about the second.  The per-pair refusal text below states the
+            # actual count for every gate that has one.
+            print(f"{r['pair']:<16}{r['bars_seen']:>5}{'-':>8}"
+                  f"{r['bars_degenerate']:>6}{r['bars_thin']:>5}"
+                  f"{'-':>5}{'-':>5}{'REFUSED':>10}{'REFUSED':>10}"
+                  f"{_fmt_bps(r['observed_spread_bps']):>10}"
+                  f"{_fmt_bps(r['observed_spread_latest_bps']):>11}")
+            continue
+        print(f"{r['pair']:<16}{r['bars_used']:>5}{r['day_pairs_used']:>8}"
+              f"{r['bars_degenerate']:>6}{r['bars_thin']:>5}"
+              f"{r['cs_negative']:>5}{r['ar_negative']:>5}"
+              f"{_fmt_bps(r['cs_bps']):>10}{_fmt_bps(r['ar_bps']):>10}"
+              f"{_fmt_bps(r['observed_spread_bps']):>10}"
+              f"{_fmt_bps(r['observed_spread_latest_bps']):>11}")
+    print()
+    print("bars  = non-degenerate daily bars used (bars SEEN when REFUSED)")
+    print("n pairs = ADJACENT DAY PAIRS = THE SAMPLE SIZE. Both estimators "
+          "are two-day")
+    print("        estimators, so bars are not observations; "
+          f"below {MIN_USABLE_DAY_PAIRS} the pair is REFUSED.")
+    print("degen = bars skipped, high == low (zero-print day)")
+    print("thin  = bars skipped, fewer than "
+          f"{MIN_SAMPLES_PER_BAR} samples (Ardia et al. 2024)")
+    print("CS-/AR- = RAW negative estimates before zero-flooring "
+          "(Corwin 2014)")
+    print("obs bps = median RAW book spread across the window; "
+          "obs now = latest bar")
+    print()
+    print("Corwin-Schultz is BOUNDED: S = 2(e^a - 1)/(1 + e^a) -> 2.0 as "
+          "a -> +inf, i.e. it")
+    print("cannot exceed 20,000 bps. Do not read a large CS output as "
+          "confirmation of a")
+    print("large spread -- read it as the estimator saturating.")
+    print()
+
+    for r in results:
+        print(f"{r['pair']}")
+        if r["refused"]:
+            for line in _wrap(r["refused"], 74):
+                print(f"  {line}")
+        else:
+            n = r["day_pairs_used"]
+            for line in _wrap(
+                    f"SAMPLE SIZE n = {n} adjacent day pairs, from "
+                    f"{r['bars_used']} usable bars. Both estimators are "
+                    f"two-day estimators, so bars are not observations. "
+                    f"Skipped non-adjacent {r['day_pairs_nonadjacent']}, "
+                    f"crossed samples dropped {r['crossed_dropped']}.", 74):
+                print(f"  {line}")
+            print(f"  Corwin-Schultz  {r['cs_bps']:>10,.1f} bps   "
+                  f"(n={n} pairs; {r['cs_negative']}/{n} raw negatives "
+                  f"floored to zero)")
+            print(f"  Abdi-Ranaldo    {r['ar_bps']:>10,.1f} bps   "
+                  f"(n={n} pairs; {r['ar_negative']}/{n} negative S^2 terms)")
+            print(f"    two-day variant {r['ar_twoday_bps']:>8,.1f} bps   "
+                  f"(n={n} pairs; each term floored before averaging)")
+            obs_now = r["observed_spread_latest_bps"] or 0.0
+            print(f"  raw book spread {obs_now:>10,.1f} bps   "
+                  f"(latest bar {r['latest_bar']})")
+            best = max(r["cs_bps"] or 0.0, r["ar_bps"] or 0.0,
+                       r["ar_twoday_bps"] or 0.0)
+            if best > 0.0 and obs_now > 0.0:
+                ratio = obs_now / best
+                if ratio <= 1.0:
+                    verdict = (
+                        f"the posted book spread is within the widest "
+                        f"high/low estimate ({ratio:.2f}x). No contradiction: "
+                        f"the range the price travelled is consistent with "
+                        f"the quoted width."
+                    )
+                elif r["dislocated"]:
+                    verdict = (
+                        f"the posted book spread is {ratio:,.1f}x the widest "
+                        f"high/low estimate, on a book already carrying the "
+                        f"dislocation flag. The estimators work on the range "
+                        f"the price TRAVELLED; they cannot see a width no "
+                        f"counterparty ever crossed. That gap is the evidence "
+                        f"that the posted figure is an absent side, not a "
+                        f"spread."
+                    )
+                else:
+                    verdict = (
+                        f"the posted book spread is {ratio:,.1f}x the widest "
+                        f"high/low estimate, but this book is NOT flagged "
+                        f"dislocated, so the gap is the ordinary quoted-vs-"
+                        f"effective spread wedge plus estimator bias -- not "
+                        f"evidence of a missing side."
+                    )
+                # The sample size travels with the verdict.  A falsification
+                # claim is only as strong as the number of two-day terms
+                # behind it, and that number is n day pairs, never the bar
+                # count printed above it.
+                for line in _wrap(
+                        f"FALSIFICATION (n = {n} adjacent day pairs): "
+                        + verdict, 74):
+                    print(f"  {line}")
+        for note in r["notes"]:
+            for line in _wrap("NOTE: " + note, 74):
+                print(f"  {line}")
+        print()
+
+    if dexie_rows:
+        print("dexie GET /v1/markets -- TickerData price_high / price_low")
+        print("-" * 78)
+        print("A single 24h high/low is ONE bar. Both estimators need two "
+              "consecutive bars,")
+        print("so this is a range check and a gate test, not an estimate.")
+        print()
+        for d in dexie_rows:
+            print(f"{d['pair']}")
+            if not d.get("available"):
+                print(f"  unavailable: {d['reason']}")
+                print()
+                continue
+            swap = " (orientation-swapped from dexie's CAT_XCH quoting)" \
+                if d["inverted"] else ""
+            print(f"  24h high {d['high']:.6f}  low {d['low']:.6f}{swap}")
+            print(f"  log range {d['range_bps']:,.1f} bps")
+            last_price = d.get("last_price")
+            print(f"  last trade "
+                  f"{'n/a' if last_price is None else f'{last_price:.6f}'} "
+                  f"at {d.get('last_date')}"
+                  + ("" if d.get("last_trade_age_days") is None
+                     else f" ({d['last_trade_age_days']} day"
+                          f"{'' if d['last_trade_age_days'] == 1 else 's'}"
+                          f" ago)"))
+            if d["degenerate"]:
+                print("  DEGENERACY GATE: high == low. One print, no range. "
+                      "Refused.")
+            if d.get("stale"):
+                print(f"  FRESHNESS GATE: last trade is "
+                      f"{d['last_trade_age_days']} days old, limit "
+                      f"{MAX_BAR_AGE_DAYS:g}. Refused.")
+            print()
+
+
+def _wrap(text: str, width: int) -> list[str]:
+    words = text.split()
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if len(candidate) > width and current:
+            lines.append(current)
+            current = word
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return lines
+
+
+# ==========================================================================
+# CLI
+# ==========================================================================
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Corwin-Schultz and Abdi-Ranaldo low-frequency spread "
+                    "estimators, as an operator diagnostic. Read-only.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="OPERATOR DIAGNOSTIC ONLY -- never a live engine input.",
+    )
+    parser.add_argument("--db", default=str(DB_PATH),
+                        help=f"engine database (default {DB_PATH})")
+    parser.add_argument("--days", type=float, default=DEFAULT_LOOKBACK_DAYS,
+                        help=f"lookback window in days "
+                             f"(default {DEFAULT_LOOKBACK_DAYS:g})")
+    parser.add_argument("--pair", action="append", metavar="BASE/QUOTE",
+                        help="restrict to this pair (repeatable; "
+                             "default all pairs with data in the window)")
+    parser.add_argument("--source", choices=SOURCES, default="offer_log",
+                        help="quote series: offer_log book_best_bid/ask "
+                             "(third-party BBO samples) or snapshots "
+                             "mid+spread (denser; default offer_log)")
+    parser.add_argument("--bars", choices=BAR_MODES, default="quote-touch",
+                        help="bar construction (default quote-touch, an "
+                             "upper bound on the daily range)")
+    parser.add_argument("--max-age-days", type=float, default=MAX_BAR_AGE_DAYS,
+                        help=f"freshness gate: refuse a pair whose newest "
+                             f"bar is older than this "
+                             f"(default {MAX_BAR_AGE_DAYS:g})")
+    parser.add_argument("--dexie", action="store_true",
+                        help="also GET api.dexie.space/v1/markets for live "
+                             "TickerData-style 24h high/low")
+    parser.add_argument("--json", action="store_true",
+                        help="emit JSON instead of the text report")
+    args = parser.parse_args(argv)
+
+    db_path = Path(args.db)
+    if not db_path.exists():
+        print(f"error: database not found at {db_path}", file=sys.stderr)
+        return 2
+
+    db = DbReader(db_path)
+    try:
+        available = db.pairs(args.source, args.days)
+        if args.pair:
+            wanted = list(dict.fromkeys(args.pair))
+            missing = [p for p in wanted if p not in available]
+            if missing:
+                print(f"error: no {args.source} data in the last "
+                      f"{args.days:g} days for: {', '.join(missing)}",
+                      file=sys.stderr)
+                print(f"       available: {', '.join(available) or '(none)'}",
+                      file=sys.stderr)
+                return 2
+            selected = wanted
+        else:
+            selected = available
+
+        results = []
+        for pair in selected:
+            quotes, crossed = db.quotes(pair, args.source, args.days)
+            bars = build_bars(quotes, args.bars)
+            results.append(
+                estimate_pair(pair, bars, crossed, args.max_age_days,
+                              args.source, args.days))
+    finally:
+        db.close()
+
+    dexie_rows: list[dict] = []
+    if args.dexie:
+        try:
+            payload = fetch_dexie_markets()
+        except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+            print(f"error: dexie unreachable: {exc}", file=sys.stderr)
+            return 2
+        dexie_rows = [dexie_high_low(payload, p) for p in selected]
+
+    if args.json:
+        print(json.dumps({
+            "diagnostic": "highlow_spread_estimator",
+            "operator_diagnostic_only": True,
+            "not_a_live_engine_input": True,
+            "one_sided_book_note": ONE_SIDED_NOTE,
+            "source": args.source,
+            "bars": args.bars,
+            "days": args.days,
+            "max_age_days": args.max_age_days,
+            # The sample size for every estimate in "pairs" is that pair's
+            # day_pairs_used, NOT bars_used: both estimators are two-day
+            # estimators.  min_day_pairs is the gate below which a pair is
+            # refused outright.
+            "sample_size_field": "day_pairs_used",
+            "min_day_pairs": MIN_USABLE_DAY_PAIRS,
+            "min_usable_bars": MIN_USABLE_BARS,
+            "generated_at": datetime.now(timezone.utc)
+            .strftime("%Y-%m-%d %H:%M:%SZ"),
+            "pairs": results,
+            "dexie": dexie_rows,
+        }, indent=2))
+    else:
+        print_report(results, dexie_rows, args.source, args.bars,
+                     args.days, args.max_age_days)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

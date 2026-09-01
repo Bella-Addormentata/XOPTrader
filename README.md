@@ -406,6 +406,39 @@ Every offer lifecycle event and trade settlement is recorded in an append-only S
 
 `offer_log` stores the current state of each offer, while `offer_closure_events` preserves the append-only closure history used for cancel-cause analytics. After the updated trader binary has run migrations against the target database, use `python scripts/report_offer_closure_events.py --top 15` for a compact breakdown of primary close causes, reconcile follow-ups, and recent closure observations.
 
+### Price-Discovery Diagnostics (read-only)
+
+Both scripts open the database `mode=ro` and are safe to run against a live
+engine. Neither is wired into the engine, and neither should be: their output
+is for an operator making a decision, not an input to quoting. The reasoning
+is in [docs/price-discovery-from-trade-history.md](docs/price-discovery-from-trade-history.md).
+
+```bash
+python scripts/byc_price_diagnostic.py --days 7
+```
+
+Re-derives the "BYC 7-day traded VWAP 1.001" figure that `par_anchor.hpp`,
+`config.yaml` and `test_fair_value.cpp` all cite as ground truth and that no
+code path produces — it was a manual measurement taken in July. Reports maker
+and taker fills separately (the taker rows are the ones the *counterparty*
+priced), prints the sample size beside every statistic, marks anything with
+n < 30 as an anecdote, and gives a median and trimmed mean next to the VWAP,
+which is not robust to outliers. Also reports executable depth near par —
+the question a VWAP cannot answer. Add `--no-network` for local-only.
+
+```bash
+python scripts/highlow_spread_estimator.py --days 30
+```
+
+Corwin-Schultz (2012) and Abdi-Ranaldo (2017) spread estimators over daily
+high/low bars, with the Ardia et al. (2024) degeneracy and freshness gates.
+Their value here is *falsification*, not measurement: they estimate the range
+the price actually travelled, so when the posted book spread is many times
+their widest output, the posted figure is an absent side rather than a
+spread. Measured on XCH/BYC 2026-09-01: posted 14,977 bps against a widest
+estimate of 1,817 bps, an 8.2× gap. The script refuses outright on stale or
+degenerate books rather than returning a plausible-looking number.
+
 ---
 
 ## Backtesting
@@ -818,6 +851,17 @@ Useful flags:
 - `--vacuum`: reclaim on-disk space after pruning.
 
 Note: run maintenance when the engine is idle when possible.
+
+> **⚠ Retention has not run since 2026-05-16.** Raw history now reaches back
+> to 2026-04-03, so the `--raw-retention-days 120` default would hard-DELETE
+> roughly **90,968 of 206,694** `snapshots` rows and **363,374**
+> `strategy_quotes` rows on the first cycle — including all of April, the
+> densest month of the BYC book history that
+> [docs/price-discovery-from-trade-history.md](docs/price-discovery-from-trade-history.md)
+> and `scripts/byc_price_diagnostic.py` depend on. Measured 2026-09-01.
+> Run `--dry-run` first, take a `--backup`, and widen `--raw-retention-days`
+> before the next scheduled run. This is a landmine, not an emergency: the
+> job is not currently registered with any OS scheduler.
 
 ### Cross-Platform Scheduled Backups (No OS Scheduler Required)
 

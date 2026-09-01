@@ -427,6 +427,43 @@ struct MarketDataConfig {
     /// one heartbeat.  Chia blocks at ~52 s; nothing honest moves 50% in
     /// one, but a book-confirmed move still passes.  <= 0 disables.
     double mid_gate_max_step_frac{0.5};
+
+    /// [SIDEQUALITY 2026-09-01] Multiplicative band for the PER-SIDE
+    /// anchor-agreement test (MarketSnapshot::bid_side_anchor_ok /
+    /// ask_side_anchor_ok).  A side whose best dust-filtered price sits
+    /// outside [1/ratio, ratio] of the independent anchor is not evidence
+    /// about location, and consumers may re-reference away from it.
+    ///
+    /// Defaulted to the SAME 3.0 as mid_anchor_band_ratio, deliberately.
+    /// The published-mid gate already treats 3x from the anchor as the
+    /// boundary of the plausible; a side that is individually past that
+    /// boundary fails the same test the whole mid would fail, so one
+    /// number governs both and they cannot be configured into
+    /// disagreement.  It sits WELL INSIDE the per-offer absurdity bound
+    /// (offer_absurdity_ratio -> 10.0 at these settings), which is
+    /// intentional: the absurdity filter removes offers no honest market
+    /// could produce, while this flags a side no honest market would
+    /// price.  A side can therefore be disqualified as a REFERENCE while
+    /// its offers remain in the book, which is exactly the state XCH/BYC
+    /// is in.
+    ///
+    /// <= 1.0 disables the test (both flags stay true).
+    double book_side_anchor_band_ratio{3.0};
+
+    /// Two-sides-agree bypass: when the dust-filtered book is two-sided
+    /// and its OWN spread is at most this many bps, neither side is
+    /// disqualified however far both sit from the anchor.
+    ///
+    /// This is the escape that keeps a genuine repricing alive.  If the
+    /// whole market moved, both sides move together and the book stays
+    /// internally coherent -- exactly the evidence
+    /// mid_gate::book_confirms() accepts to override an anchor breach.
+    /// Disqualifying sides in that state would strip the confirmation
+    /// before the gate could read it, so the two mechanisms are pinned to
+    /// the same default (mid_gate_book_confirm_max_spread_bps, 5000).
+    /// Dislocation is one side moving ALONE, which leaves a wide spread
+    /// and fails this test.
+    double book_side_agree_max_spread_bps{5000.0};
 };
 
 // ---------------------------------------------------------------------------
@@ -535,6 +572,17 @@ struct PairState {
     // override the anchor that arrives moments later, publish once, and
     // move the peak.  A book nothing screened is not evidence.
     bool        bbo_filter_had_anchor{false};
+
+    // [SIDEQUALITY 2026-09-01] Per-side agreement with the anchor that
+    // screened this book.  Written by ingest_competing_offers alongside
+    // the filtered BBO, copied verbatim into MarketSnapshot by
+    // publish_snapshot; see the long note on MarketSnapshot for why the
+    // offers are FLAGGED rather than removed.  Both default true, and
+    // both are forced true whenever no independent reference existed --
+    // an unscreened book cannot disqualify anything.
+    bool        bid_side_anchor_ok{true};
+    bool        ask_side_anchor_ok{true};
+    double      book_side_ref{0.0};   // anchor used; 0 = nothing screened
 
     // [S20 2026-08-24] ...and whether that reference was an INDEPENDENT
     // anchor rather than this pair's own last accepted mid.

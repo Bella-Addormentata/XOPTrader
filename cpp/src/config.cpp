@@ -3045,6 +3045,12 @@ MarketDataSettings parse_market_data(const YAML::Node& root)
     read_dbl ("implied_cross_max_leg_spread_bps",
               cfg.implied_cross_max_leg_spread_bps);
 
+    // [SIDEQUALITY 2026-09-01] Per-side anchor agreement.
+    read_dbl ("book_side_anchor_band_ratio",
+              cfg.book_side_anchor_band_ratio);
+    read_dbl ("book_side_agree_max_spread_bps",
+              cfg.book_side_agree_max_spread_bps);
+
     // Validate ranges.
     if (cfg.whale_volume_fraction < 0.0 || cfg.whale_volume_fraction > 1.0) {
         throw ConfigError(sec + ".whale_volume_fraction must be in [0, 1]");
@@ -3091,6 +3097,35 @@ MarketDataSettings parse_market_data(const YAML::Node& root)
         || cfg.implied_cross_max_leg_spread_bps <= 0.0) {
         throw ConfigError(sec + ".implied_cross_max_leg_spread_bps must be "
                                 "a finite value > 0");
+    }
+    // [SIDEQUALITY 2026-09-01] Non-negative and finite; <= 1.0 is the
+    // documented "disabled" setting rather than an error, matching
+    // mid_anchor_band_ratio's convention.
+    if (!std::isfinite(cfg.book_side_anchor_band_ratio)
+        || cfg.book_side_anchor_band_ratio < 0.0) {
+        throw ConfigError(sec + ".book_side_anchor_band_ratio must be a "
+                                "finite value >= 0");
+    }
+    if (!std::isfinite(cfg.book_side_agree_max_spread_bps)
+        || cfg.book_side_agree_max_spread_bps < 0.0) {
+        throw ConfigError(sec + ".book_side_agree_max_spread_bps must be a "
+                                "finite value >= 0");
+    }
+    // A side band WIDER than the published-mid gate's own band would let a
+    // side stay a trusted reference while the mid it implies is refused as
+    // implausible -- the two would be adjudicating the same question and
+    // disagreeing.  Warn rather than throw: it is a coherence smell, not an
+    // unsafe value, and the operator may be deliberately loosening the side
+    // test while leaving the gate alone.
+    if (cfg.book_side_anchor_band_ratio > 1.0
+        && cfg.mid_anchor_band_ratio > 1.0
+        && cfg.book_side_anchor_band_ratio > cfg.mid_anchor_band_ratio) {
+        spdlog::warn("[Config] {}.book_side_anchor_band_ratio ({:.2f}) is "
+                     "wider than mid_anchor_band_ratio ({:.2f}): a book side "
+                     "can stay a trusted reference while the published mid "
+                     "it implies is rejected", sec,
+                     cfg.book_side_anchor_band_ratio,
+                     cfg.mid_anchor_band_ratio);
     }
 
     return cfg;

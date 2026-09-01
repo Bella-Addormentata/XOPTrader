@@ -1995,6 +1995,23 @@ struct MarketDataSettings {
     /// mid in one heartbeat (~52 s).  <= 0 disables.
     double mid_gate_max_step_frac{0.5};
 
+    /// [SIDEQUALITY 2026-09-01] Multiplicative band for the PER-SIDE
+    /// anchor-agreement test.  A side whose best dust-filtered price sits
+    /// outside [1/ratio, ratio] of the independent anchor stops being used
+    /// as a reference; its offers stay in the book.  Keep at or below
+    /// mid_anchor_band_ratio -- config load warns otherwise, because a
+    /// side wider than the gate's own band could remain trusted while the
+    /// mid it implies is refused.  <= 1.0 disables.
+    double book_side_anchor_band_ratio{3.0};
+
+    /// Two-sides-agree bypass: a two-sided book whose own spread is at
+    /// most this wide is trusted WHOLE, however far it sits from the
+    /// anchor.  Shares mid_gate_book_confirm_max_spread_bps's default
+    /// deliberately -- it is the same "the whole market repriced"
+    /// evidence, and splitting them lets one half of the feature strip
+    /// the confirmation the other half is waiting for.
+    double book_side_agree_max_spread_bps{5000.0};
+
     /// Max spread (bps) for a sibling pair's book to serve as a leg of the
     /// triangulated implied cross.
     ///

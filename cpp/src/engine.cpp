@@ -320,6 +320,11 @@ Engine::Engine(const AppConfig& config, bool dry_run)
         config_.market_data.mid_gate_book_confirm_max_spread_bps;
     md_cfg.mid_gate_max_step_frac =
         config_.market_data.mid_gate_max_step_frac;
+    // [SIDEQUALITY 2026-09-01] Per-side anchor agreement.
+    md_cfg.book_side_anchor_band_ratio =
+        config_.market_data.book_side_anchor_band_ratio;
+    md_cfg.book_side_agree_max_spread_bps =
+        config_.market_data.book_side_agree_max_spread_bps;
     market_data_ = std::make_unique<MarketDataFeed>(md_cfg, *state_);
 
     // -- Data / analytics (per-pair estimators) --------------------------------
@@ -4729,9 +4734,17 @@ void Engine::step_compute_quotes(BlockHeight block_height)
         {
             const PairConfig* pc4 = find_pair_config(pair_name);
             if (pc4 != nullptr && pair_peg_suspended(*pc4)) {
-                spdlog::debug("[Engine] Step 4: {} suspended (asset-level "
-                              "peg failure) -- suppressing all quotes",
-                              pair_name);
+                // [SIDEQUALITY 2026-09-01] warn, not debug.  This gate
+                // silently suppressed every XCH/BYC quote for a full day
+                // after a FALSE suspension, and nothing said so at info
+                // level -- the pair simply stopped quoting.  A safety
+                // latch that halts trading has to announce itself in the
+                // normal log, or the next false positive costs another
+                // day of diagnosis.
+                spdlog::warn("[Engine] Step 4: {} suspended (asset-level "
+                             "peg failure) -- suppressing all quotes; "
+                             "re-enable from the GUI's Depeg tab",
+                             pair_name);
                 pcs.quote_valid = false;
                 continue;
             }
@@ -7114,6 +7127,19 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
             std::string cutoff_ts = PnLTracker::timestamp_to_iso(cutoff);
             ladder_cfg.tier_fill_rates = db_->query_tier_fill_rates(
                 pair_name, cutoff_ts, ladder_cfg.num_tiers);
+        }
+
+        // [SIDEQUALITY 2026-09-01] Thread the per-side book verdict into the
+        // ladder config, the same channel tier_fill_rates already uses for
+        // runtime data.  The competitive anchor's safety reference is the
+        // midpoint of the two sides, so it needs to know when one of them
+        // is not a reference at all.  Read from the same snapshot the Step 8
+        // sanity checks read, so the ladder and the checks that police it
+        // cannot disagree about which side is trustworthy.
+        {
+            const auto side_snap = state_->get_market(pair_name);
+            ladder_cfg.book_bid_side_anchor_ok = side_snap.bid_side_anchor_ok;
+            ladder_cfg.book_ask_side_anchor_ok = side_snap.ask_side_anchor_ok;
         }
 
         // Generate the tier ladder.
@@ -10114,17 +10140,83 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 const double kMaxMidDev =
                     config_.strategy.bbo_sanity_max_mid_dev;
 
+                // [SIDEQUALITY 2026-09-01] Pick the reference ONCE, here,
+                // so Check 1 and Check 2 cannot disagree about which half
+                // of the book is trustworthy.
+                //
+                // bbo_mid_m is the arithmetic mean of the two sides.  When
+                // one side is dislocated that mean is half-poisoned, and
+                // measuring a CORRECT model mid against it produces a
+                // large deviation whose cause is the book, not the model.
+                // Live XCH/BYC 2026-08-30: model 1.41141912 vs bbo_mid
+                // 3.24975 = 56.6% > 50%, so every tier was cleared -- the
+                // pair went silent BECAUSE the solver was right.  Against
+                // the surviving (honest) bid alone the same comparison is
+                // 5.9%, which passes.
+                const bool bid_ok = book_snap.bid_side_anchor_ok;
+                const bool ask_ok = book_snap.ask_side_anchor_ok;
+                const Mojo side_ref = book_snap.book_side_ref;
+
+                // The anchor replaces the midpoint wherever a midpoint
+                // would be built from a disqualified side.  side_ref is
+                // guaranteed > 0 whenever a side was disqualified (only an
+                // independent anchor can disqualify), but the fallback is
+                // written out rather than assumed: a silent 0 here would
+                // divide by zero below.
+                const Mojo eff_bbo_mid =
+                    (bid_ok && ask_ok) || side_ref <= 0 ? bbo_mid_m : side_ref;
+
                 // Check 1: Model mid vs BBO sanity
                 if (mid > 0) {
-                    const double mid_dev = std::abs(
-                        static_cast<double>(mid) - static_cast<double>(bbo_mid_m))
-                        / static_cast<double>(bbo_mid_m);
-                    if (mid_dev > kMaxMidDev) {
-                        spdlog::warn("[Engine] Step 8: {} model mid {} deviates "
-                                     "{:.1f}% from BBO mid {} -- suppressing ALL "
-                                     "offers this block",
-                                     pair_name, mid, mid_dev * 100.0, bbo_mid_m);
-                        fee_filtered_tiers.clear();
+                    Mojo        c1_ref  = eff_bbo_mid;
+                    const char* c1_what = "BBO mid";
+                    bool        c1_run  = true;
+                    if (!bid_ok && !ask_ok) {
+                        // Nothing in the book is a reference.  Skipping is
+                        // the honest outcome: the model mid is then the
+                        // ONLY location estimate available, and suppressing
+                        // it in favour of a book we just declared junk
+                        // would guarantee zero participation for zero
+                        // protection.  The mid still passed the published-
+                        // mid gate to get here.
+                        //
+                        // The obvious worry is "what if the ANCHOR is the
+                        // wrong one?", since a bad anchor disqualifies an
+                        // honest book and this branch then trusts the bad
+                        // anchor.  The two-sides-agree bypass makes that
+                        // unreachable: a coherent two-sided book is never
+                        // disqualified however far it sits from the anchor
+                        // (book_side_quality.hpp, pinned by
+                        // BookSideQuality.a_coherent_book_is_trusted_whole_
+                        // however_far_it_sits).  So arriving here requires
+                        // BOTH a suspect anchor and an incoherent book, and
+                        // in that state there is no good reference to
+                        // prefer -- which is why it warns.
+                        c1_run = false;
+                    } else if (!ask_ok && best_bid > 0) {
+                        c1_ref  = best_bid;
+                        c1_what = "best bid (ask side disqualified)";
+                    } else if (!bid_ok && best_ask > 0) {
+                        c1_ref  = best_ask;
+                        c1_what = "best ask (bid side disqualified)";
+                    }
+                    if (c1_run && c1_ref > 0) {
+                        const double mid_dev = std::abs(
+                            static_cast<double>(mid) - static_cast<double>(c1_ref))
+                            / static_cast<double>(c1_ref);
+                        if (mid_dev > kMaxMidDev) {
+                            spdlog::warn("[Engine] Step 8: {} model mid {} deviates "
+                                         "{:.1f}% from {} {} -- suppressing ALL "
+                                         "offers this block",
+                                         pair_name, mid, mid_dev * 100.0,
+                                         c1_what, c1_ref);
+                            fee_filtered_tiers.clear();
+                        }
+                    } else if (!c1_run) {
+                        spdlog::warn("[Engine] Step 8: {} both book sides "
+                                     "disqualified vs anchor {} -- skipping the "
+                                     "model-mid check and quoting on the model",
+                                     pair_name, side_ref);
                     }
                 }
 
@@ -10135,13 +10227,32 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     std::size_t bbo_suppressed = 0;
 
                     for (const auto& tier : fee_filtered_tiers) {
-                        const Mojo ref = (tier.side == Side::Bid)
-                            ? best_bid : best_ask;
+                        // [SIDEQUALITY 2026-09-01] Reference the tier's OWN
+                        // side, unless that side has been disqualified --
+                        // then reference the independent anchor instead.
+                        //
+                        // The old unconditional best_ask measured our
+                        // correctly-priced 1.41 ask against a 4.9995 junk
+                        // ask and called it 71.8% "aggressive", killing it,
+                        // while a 1.41 bid passed at 6.0% against an honest
+                        // best_bid.  Suppressing the right quote and
+                        // admitting the questionable one, from one line.
+                        //
+                        // eff_bbo_mid matters as much as ref: classify_tier
+                        // uses the midpoint for the bid passive rule, so a
+                        // poisoned 3.24975 would read any bid up to 3.24975
+                        // as a safe passive rest.
+                        const bool side_ok =
+                            (tier.side == Side::Bid) ? bid_ok : ask_ok;
+                        const Mojo own_side =
+                            (tier.side == Side::Bid) ? best_bid : best_ask;
+                        const Mojo ref =
+                            (!side_ok && side_ref > 0) ? side_ref : own_side;
                         const auto verdict = strategy::classify_tier(
                             tier.side != Side::Bid,
                             static_cast<double>(tier.price),
                             static_cast<double>(ref),
-                            static_cast<double>(bbo_mid_m),
+                            static_cast<double>(eff_bbo_mid),
                             kMaxAggressiveDev, kMaxPassiveDev);
                         if (verdict != strategy::BboVerdict::Pass) {
                             const double dev = std::abs(
@@ -16658,8 +16769,47 @@ asio::awaitable<void> Engine::step_observe_asset_pegs(BlockHeight block_height)
                 if (!(snap.mid_price > 0) || !snap.mid_valuation_grade) {
                     continue;
                 }
-                const double mid = static_cast<double>(snap.mid_price);
-                usd_obs = xch_base ? usd_xch / mid : usd_xch * mid;
+                // [SIDEQUALITY 2026-09-01] A book with a disqualified side
+                // is not an observation about this asset's peg.
+                //
+                // XCH/BYC on 2026-08-30 had honest bids at par and a junk
+                // ask stack 3.5x-7.1x above the anchor.  Its midpoint said
+                // BYC was worth $0.44 -- an artifact of the dead side, not
+                // a depeg -- and the latch that fired on it cancelled every
+                // resting offer on every pair touching BYC.  Leaving
+                // usd_obs NaN routes into observe_peg's data-gap branch,
+                // which HOLDS the streak rather than resetting or
+                // advancing it: absence of evidence neither confirms nor
+                // clears a depeg, which is the correct treatment.
+                //
+                // Deliberately NOT re-sourced to the fair-value estimate,
+                // which is the obvious-looking alternative and is
+                // circular here: par_anchor.hpp feeds a DECLARED par into
+                // the fair-value solve precisely when nothing else can
+                // price the asset, so a peg watcher reading that estimate
+                // would read its own input back, sit permanently at par,
+                // and never detect the depeg it exists to detect.  The
+                // peg must be observed from a market or not at all.
+                if (!snap.bid_side_anchor_ok || !snap.ask_side_anchor_ok) {
+                    spdlog::debug("[Engine] peg observe: {} skipped -- book "
+                                  "side disqualified vs anchor {}",
+                                  pair.name, snap.book_side_ref);
+                    continue;
+                }
+                // [SIDEQUALITY 2026-09-01] mid_price is MOJO-SCALED (1e12).
+                // Reading it as a bare price gave usd_obs ~ 3.4e-13 on
+                // every heartbeat and produced "[PEGSUSPEND] observed
+                // $0.0000 ... 100.0% off" for wUSDC.b on 2026-08-29 and
+                // BYC on 2026-08-30 -- both false, both cancelling live
+                // offers.  The correct pattern is the one usd_per_xch()
+                // already uses via peg_registry's usd_per_base_from_mid.
+                const double mid_units = static_cast<double>(snap.mid_price)
+                                       / static_cast<double>(kMojosPerXch);
+                if (!(mid_units > 0.0) || !std::isfinite(mid_units)) {
+                    continue;
+                }
+                usd_obs = xch_base ? usd_xch / mid_units
+                                   : usd_xch * mid_units;
                 break;
             }
         }
