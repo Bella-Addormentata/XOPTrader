@@ -847,21 +847,34 @@ Useful flags:
 
 - `--dry-run`: show expected changes without writing.
 - `--raw-retention-days N`: change high-frequency retention window.
+- `--confirm-large-prune`: permit deleting more than 25% of a raw table in
+  one run. **Without it the run refuses and changes nothing** (exit 3).
 - `--no-prune-strategy-quotes`: keep all `strategy_quotes` rows.
 - `--vacuum`: reclaim on-disk space after pruning.
 
 Note: run maintenance when the engine is idle when possible.
 
-> **⚠ Retention has not run since 2026-05-16.** Raw history now reaches back
-> to 2026-04-03, so the `--raw-retention-days 120` default would hard-DELETE
-> roughly **90,968 of 206,694** `snapshots` rows and **363,374**
-> `strategy_quotes` rows on the first cycle — including all of April, the
-> densest month of the BYC book history that
-> [docs/price-discovery-from-trade-history.md](docs/price-discovery-from-trade-history.md)
+> **Retention had not run since 2026-05-16, and the first run would have been
+> destructive.** Raw history reaches back to 2026-04-03, so the
+> `--raw-retention-days 120` default would have deleted **91,244 of 207,787**
+> `snapshots` rows (43.9%) and **363,374** `strategy_quotes` rows (29.0%) on
+> the first cycle — including all of April, the densest month of the BYC book
+> history that [docs/price-discovery-from-trade-history.md](docs/price-discovery-from-trade-history.md)
 > and `scripts/byc_price_diagnostic.py` depend on. Measured 2026-09-01.
-> Run `--dry-run` first, take a `--backup`, and widen `--raw-retention-days`
-> before the next scheduled run. This is a landmine, not an emergency: the
-> job is not currently registered with any OS scheduler.
+>
+> **This is now guarded.** A run that would delete more than 25% of a raw
+> table refuses, prints what it would have removed, and exits 3 without
+> touching the database. The hazard was never the retention number — it is
+> that a long gap between runs silently converts a routine window into a bulk
+> deletion, and the loss grows exactly while nobody is watching. A steady
+> daily run removes a day at a time and never approaches the bound.
+>
+> To proceed deliberately, either widen `--raw-retention-days` to keep the
+> history, or pass `--confirm-large-prune` to delete it on purpose. Take a
+> `--backup` either way — it now uses SQLite's own backup API rather than a
+> file copy, which matters here because the database runs in WAL mode against
+> a live engine and a plain copy omitted the (15 MB, at time of writing)
+> uncheckpointed WAL.
 
 ### Cross-Platform Scheduled Backups (No OS Scheduler Required)
 

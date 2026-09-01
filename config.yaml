@@ -26,7 +26,33 @@ pairs:
   # artifact, not a real loss. The pair stays disabled because the OPERATOR
   # asked for it, not because BYC is broken -- re-enabling is a decision
   # about the book's liquidity, not about the peg.
-  enabled: false
+  #
+  # [2026-09-01] RE-ENABLED by the operator.
+  #
+  # *** DO NOT RESTART THE ENGINE ON A PRE-#134 BINARY WITH THIS SET TRUE. ***
+  # An enable takes effect only on restart (engine.cpp refuses live enables),
+  # and on the old binary a restart here reproduces the 2026-08-30 incident
+  # exactly: the competitive anchor caps bids against a book midpoint built
+  # half from the junk ask stack, the ladder self-crosses and drops 12/12
+  # tiers, then the mojo-scale bug in step_observe_asset_pegs latches a FALSE
+  # depeg ~10 min in and cancels every offer on every pair touching BYC. The
+  # bogus valuation then feeds the 10% drawdown breaker, which PAUSES THE
+  # WHOLE ENGINE and takes XCH/DBX -- the only earning pair -- down with it.
+  # PR #134 fixes all three. Merge, build, deploy, THEN restart.
+  #
+  # What re-enabling actually buys, and what it costs, in this pair's own
+  # orientation (base XCH, quote BYC, so price is BYC per XCH):
+  #   BID  = we buy XCH and PAY BYC. At ~1.41 BYC/XCH that SELLS BYC at
+  #          ~$1.01. This is an EXIT for the 52.58 BYC we hold, at par, into
+  #          the one side of the book that is honest.
+  #   ASK  = we sell XCH and RECEIVE BYC. This ACCUMULATES more BYC, and
+  #          there is no exit for it: nothing on the book bids for BYC above
+  #          ~$0.29.
+  # There is no per-pair one-sided switch, so enabling turns on both. Watch
+  # the BYC balance: the bid side is the reason to be here, the ask side is
+  # the risk. If BYC inventory rises rather than falls, that is the signal to
+  # turn this back off.
+  enabled: true
   min_offer_size_units_override: 1.0
   name: XCH/BYC
   quote_asset_id: ae1536f56760e471ad85ead45f00d680ff9cca73b8cc3407be778f1c0c606eac

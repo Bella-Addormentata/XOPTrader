@@ -18,7 +18,6 @@ By default, the script also prunes old rows from ``snapshots`` and
 from __future__ import annotations
 
 import argparse
-import shutil
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -274,14 +273,85 @@ def _build_rollup(conn: sqlite3.Connection, spec: RollupSpec) -> tuple[int, int]
     return (len(rows), len(upserts))
 
 
+class LargePruneRefused(RuntimeError):
+    """A prune would remove more history than an unattended run should."""
+
+
+# Fraction of a table a single unattended run may delete before it refuses.
+#
+# [2026-09-01] Retention had not run since 2026-05-16, so raw history reached
+# back to 2026-04-03 while the default window was 120 days.  The next run --
+# with no flag typed differently, no warning, and nothing to review -- would
+# have deleted 90,968 of 206,694 snapshots rows (44%) and 363,374
+# strategy_quotes rows, including all of April: the densest month of the BYC
+# book history that docs/price-discovery-from-trade-history.md and
+# scripts/byc_price_diagnostic.py both depend on.
+#
+# The hazard is not the retention number.  It is that a LONG GAP between runs
+# silently converts a routine window into a bulk deletion, and the longer the
+# gap the bigger the loss -- the failure mode gets worse exactly when nobody
+# is watching.  A steady-state daily run deletes a day at a time and never
+# comes near this bound; only the dangerous case trips it.
+MAX_UNCONFIRMED_PRUNE_FRACTION = 0.25
+
+
 def _prune_raw_tables(
     conn: sqlite3.Connection,
     *,
     raw_retention_days: int,
     prune_strategy_quotes: bool,
+    confirm_large_prune: bool = False,
 ) -> dict[str, int]:
     cutoff = datetime.now(tz=timezone.utc) - timedelta(days=raw_retention_days)
     cutoff_iso = _iso_utc(cutoff)
+
+    targets = ["snapshots"]
+    if prune_strategy_quotes:
+        targets.append("strategy_quotes")
+
+    # COUNT BEFORE DELETING.  cur.rowcount reports the damage after it is
+    # done, which is no use to a guard, and inside the caller's transaction
+    # a refusal has to happen before any DELETE runs so the rollback is
+    # empty rather than merely correct.
+    planned: dict[str, tuple[int, int]] = {}
+    for table in targets:
+        total = int(
+            conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        )
+        doomed = int(
+            conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE created_at < ?",
+                [cutoff_iso],
+            ).fetchone()[0]
+        )
+        planned[table] = (doomed, total)
+
+    if not confirm_large_prune:
+        breaches = [
+            f"{t}: {d:,} of {n:,} rows ({d / n:.1%})"
+            for t, (d, n) in planned.items()
+            if n > 0 and (d / n) > MAX_UNCONFIRMED_PRUNE_FRACTION
+        ]
+        if breaches:
+            oldest = conn.execute(
+                "SELECT MIN(created_at) FROM snapshots"
+            ).fetchone()[0]
+            msg = [
+                "this run would delete more than "
+                f"{MAX_UNCONFIRMED_PRUNE_FRACTION:.0%} of a raw table:",
+            ]
+            msg += [f"    {b}" for b in breaches]
+            msg += [
+                f"  cutoff        : {cutoff_iso}",
+                f"  oldest row    : {oldest}",
+                f"  retention set : {raw_retention_days} days",
+                "  A jump this large means retention has not run in a "
+                "long time, not that this much data is stale.",
+                "  Widen --raw-retention-days to keep the history, or "
+                "pass --confirm-large-prune to delete it on purpose.",
+                "  Take a --backup either way, and --dry-run first.",
+            ]
+            raise LargePruneRefused(chr(10).join(msg))
 
     deleted: dict[str, int] = {}
 
@@ -330,6 +400,15 @@ def main() -> int:
         help="Do not delete old rows from strategy_quotes.",
     )
     parser.add_argument(
+        "--confirm-large-prune",
+        action="store_true",
+        help=(
+            "Permit deleting more than "
+            f"{MAX_UNCONFIRMED_PRUNE_FRACTION:.0%} of a raw table in one run. "
+            "Without this the run REFUSES and changes nothing."
+        ),
+    )
+    parser.add_argument(
         "--vacuum",
         action="store_true",
         help="Run VACUUM after pruning to reclaim disk space.",
@@ -358,8 +437,30 @@ def main() -> int:
     if args.backup and not args.dry_run:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         backup = db_path.with_suffix(db_path.suffix + f".rollup.{stamp}.bak")
-        shutil.copy2(db_path, backup)
-        print(f"Backup created: {backup}")
+        # sqlite3's own backup API, NOT shutil.copy2.
+        #
+        # [2026-09-01] This database runs in WAL mode against a live engine,
+        # and a plain file copy takes only xop_trader.db -- leaving the
+        # -wal file behind. Measured at the time of this change the WAL held
+        # 15 MB of committed pages that had not yet been checkpointed into
+        # the main file, so the "backup" would silently have been missing
+        # the most recent writes AND been a torn read of a file being
+        # written underneath it. A backup you take before a destructive
+        # operation is the one thing that must not be quietly wrong.
+        #
+        # conn.backup() holds a read transaction for the copy, so it sees a
+        # single consistent snapshot including the WAL, and it is safe
+        # against a concurrent writer.
+        src = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            dst = sqlite3.connect(str(backup))
+            try:
+                src.backup(dst)
+            finally:
+                dst.close()
+        finally:
+            src.close()
+        print(f"Backup created: {backup} ({_human_mb(_db_size_bytes(backup)):.1f} MB)")
 
     before_size = _db_size_bytes(db_path)
 
@@ -385,6 +486,7 @@ def main() -> int:
             conn,
             raw_retention_days=args.raw_retention_days,
             prune_strategy_quotes=not args.no_prune_strategy_quotes,
+            confirm_large_prune=args.confirm_large_prune,
         )
 
         if args.vacuum and not args.dry_run:
@@ -398,6 +500,17 @@ def main() -> int:
         else:
             conn.commit()
 
+    except LargePruneRefused as exc:
+        # Roll back explicitly rather than relying on close(): the rollup
+        # UPSERTs already ran inside this transaction, and they are the
+        # half that would otherwise survive a bare close on some driver
+        # versions. Refusing has to leave the database untouched, not
+        # partly updated.
+        conn.rollback()
+        conn.close()
+        print()
+        print("REFUSED: " + str(exc))
+        return 3
     finally:
         conn.close()
 
