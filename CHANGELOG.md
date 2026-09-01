@@ -176,10 +176,9 @@ microstructure literature behind it.
 
 Nothing in this entry argues for or against quoting BYC — that is a
 liquidity decision and not a code problem. The operator made it separately:
-**XCH/BYC was re-enabled on 2026-09-01**, and BYC/wUSDC.b stays off.
+**XCH/BYC was re-enabled on 2026-09-01 and then **backed out the same day, pending deployment**. The decision stands; only its timing changed. An enable is inert until the engine restarts, but the GUI relaunches the engine whenever the GUI restarts -- so the flag was a latent trigger that any unrelated restart could arm without anyone choosing to. Leaving a loaded trigger in a config file and relying on nobody touching it is not a safety argument. Re-set it AFTER this PR is merged, built and deployed.** BYC/wUSDC.b stays off throughout.
 
-**The re-enable is inert until the engine restarts, and that restart must
-come after this PR is merged, built and deployed.** `[RELOAD]` disables a
+**Why the timing matters, and why the flag ships `false`.** `[RELOAD]` disables a
 pair live but refuses to enable one — it logs "restart the engine to start
 quoting it" and carries on. On the pre-PR binary a restart with the flag set
 reproduces 2026-08-30 exactly: the ladder self-crosses and drops every tier,

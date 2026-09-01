@@ -691,8 +691,10 @@ Key sections to configure before first run:
 > **A pair enable takes effect only on restart, so the restart order matters.**
 > A config reload disables a pair live but *refuses* to enable one — it logs
 > "restart the engine to start quoting it" and carries on. `XCH/BYC` was
-> re-enabled by the operator on 2026-09-01 and is therefore inert on the
-> running engine.
+> re-enabled by the operator on 2026-09-01 and then backed out the same day
+> pending deployment — an enable that only a restart can arm is still a
+> latent trigger, because the GUI relaunches the engine whenever the GUI
+> restarts.
 >
 > **Do not restart onto a binary older than PR #134** with that flag set. On
 > the pre-#134 binary the restart reproduces the 2026-08-30 incident: the

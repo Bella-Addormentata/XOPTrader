@@ -27,9 +27,23 @@ pairs:
   # asked for it, not because BYC is broken -- re-enabling is a decision
   # about the book's liquidity, not about the peg.
   #
-  # [2026-09-01] RE-ENABLED by the operator.
+  # [2026-09-01] RE-ENABLED by the operator, then DISABLED AGAIN the same day
+  # pending deployment of PR #134. The re-enable decision stands; only its
+  # TIMING changed.
   #
-  # *** DO NOT RESTART THE ENGINE ON A PRE-#134 BINARY WITH THIS SET TRUE. ***
+  # Why it was backed out rather than left set: an enable is inert until the
+  # engine restarts, but the running engine is still the PRE-#134 binary, and
+  # the GUI relaunches the engine whenever the GUI itself restarts. So the
+  # flag was a latent trigger -- any GUI restart, for any reason, would have
+  # armed the failure below without anyone choosing to. Leaving a loaded
+  # trigger in a config file and relying on nobody touching it is not a
+  # safety argument.
+  #
+  # TO RE-ENABLE: merge #134, build, stop the engine, restart the GUI (it
+  # launches the engine), THEN set this true and restart once more. In that
+  # order the failure below cannot occur, because every link in it is fixed.
+  #
+  # *** DO NOT SET THIS TRUE ON A PRE-#134 BINARY. ***
   # An enable takes effect only on restart (engine.cpp refuses live enables),
   # and on the old binary a restart here reproduces the 2026-08-30 incident
   # exactly: the competitive anchor caps bids against a book midpoint built
@@ -52,7 +66,7 @@ pairs:
   # the BYC balance: the bid side is the reason to be here, the ask side is
   # the risk. If BYC inventory rises rather than falls, that is the signal to
   # turn this back off.
-  enabled: true
+  enabled: false
   min_offer_size_units_override: 1.0
   name: XCH/BYC
   quote_asset_id: ae1536f56760e471ad85ead45f00d680ff9cca73b8cc3407be778f1c0c606eac

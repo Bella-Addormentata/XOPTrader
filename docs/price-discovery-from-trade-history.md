@@ -725,10 +725,14 @@ the input they are fed is.
   unfixable without a true per-trade timestamp.
 * **The BYC pairs' `enabled:` flags -- not by this work, but the operator
   has since changed one.** Nothing in this note is an argument either way;
-  the flags are an operator decision and stay one. On 2026-09-01 **XCH/BYC
-  was re-enabled** at the operator's request, and BYC/wUSDC.b was left
-  disabled. Recorded here because the deployment order is not obvious and
-  getting it wrong is expensive:
+  the flags are an operator decision and stay one. On 2026-09-01 XCH/BYC was
+  re-enabled at the operator's request and then BACKED OUT the same day,
+  pending deployment; BYC/wUSDC.b was left disabled throughout. The decision
+  stands, only its timing changed: an enable is inert until the engine
+  restarts, but the GUI relaunches the engine whenever the GUI restarts, so
+  the flag was a latent trigger any unrelated restart could arm. Recorded
+  here because the deployment order is not obvious and getting it wrong is
+  expensive:
 
   - An enable takes effect **only on an engine restart**. A live config
     reload disables a pair in place but refuses to enable one, logging
