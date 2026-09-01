@@ -1378,6 +1378,28 @@ class QuoteRunner:
             # relaxes back toward the configured spread.
             if isinstance(leg_rows, list) and leg_rows:
                 crossed, seen, dirty = set(), set(), set()
+                # [review] A COUNT MISMATCH POISONS THE WHOLE MAPPING, not
+                # just the tail. These rows are paired with legs by
+                # POSITION, so a missing row in the MIDDLE shifts every
+                # later pairing by one -- a market then reads another
+                # market's result, and can come back "seen" and clean while
+                # its own leg was refused. Marking only the unpaired suffix
+                # dirty, as the previous fix did, addresses the one case
+                # where the shift happens to be at the end.
+                #
+                # There is no way to re-align without an identifier the
+                # rows do not carry, so the honest response is to trust
+                # none of it: no crossings inferred, every market dirty, and
+                # the backoff left exactly where it was until a response
+                # arrives that can be read.
+                if len(leg_rows) != len(legs):
+                    _log.warning(
+                        "permuto: batch response had %d row(s) for %d leg(s)"
+                        " -- positional mapping is ambiguous, so no backoff "
+                        "is inferred this tick", len(leg_rows), len(legs))
+                    for leg in legs:
+                        dirty.add(leg.market)
+                    leg_rows = []
                 for leg, row in zip(legs, leg_rows):
                     if not isinstance(row, dict):
                         # A row we cannot parse tells us nothing about this
@@ -1397,10 +1419,6 @@ class QuoteRunner:
                         # "cancelled", an empty action, or any unknown value
                         # all count as dirty.
                         dirty.add(leg.market)
-                # [review] zip truncates when leg_rows is shorter than legs;
-                # any unmatched leg has no row and cannot be verified clean.
-                for leg in legs[len(leg_rows):]:
-                    dirty.add(leg.market)
                 for mkt in {l.market for l in legs}:
                     if mkt in crossed:
                         self._cross_backoff.observe_cross(

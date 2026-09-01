@@ -2140,3 +2140,51 @@ def test_preflight_repricing_snaps_to_the_grid_under_junk_tick_metadata():
         assert abs(round(ticks) - ticks) < 1e-6, (
             "leg %r is off the 0.0001 grid -- junk metadata bypassed the "
             "normalised tick on the preflight path" % (leg,))
+
+
+def test_a_MISSING_MIDDLE_row_poisons_the_whole_mapping():
+    """[review] Not just the unpaired tail.
+
+    Rows are paired with legs by POSITION, so a row missing from the
+    MIDDLE shifts every later pairing by one: a market reads another
+    market's result and can come back "seen" and clean while its own leg
+    was refused. The previous fix marked only the suffix dirty, which
+    covers the one case where the shift happens to be at the end.
+    """
+    c = _Client(account=_account(100.0),
+                batch_response=lambda legs: {
+                    "status": "batch_ok",
+                    "results": [{"action": "placed", "rejection_reason":
+                                 "Post-only order would cross the book."}
+                                for _ in legs]})
+    r = _runner(c, curfew_enabled=True)
+    r.tick(_MID_SESSION, _ORACLE, {})
+    widened = r._cross_backoff.offset_pct(_MKT)
+    assert widened > 0.0
+
+    # Two legs go out; ONE row comes back, and it looks clean.
+    c.batch_response = lambda legs: {
+        "status": "batch_ok", "results": [{"action": "placed"}]}
+    r._resting = {}
+    r.tick(_MID_SESSION + 5.0, _ORACLE, {})
+    assert r._cross_backoff.offset_pct(_MKT) == widened,         "an ambiguous row count decayed the backoff anyway"
+
+
+def test_a_SURPLUS_row_is_equally_unusable():
+    """More rows than legs is the same ambiguity from the other side."""
+    c = _Client(account=_account(100.0),
+                batch_response=lambda legs: {
+                    "status": "batch_ok",
+                    "results": [{"action": "placed", "rejection_reason":
+                                 "Post-only order would cross the book."}
+                                for _ in legs]})
+    r = _runner(c, curfew_enabled=True)
+    r.tick(_MID_SESSION, _ORACLE, {})
+    widened = r._cross_backoff.offset_pct(_MKT)
+
+    c.batch_response = lambda legs: {
+        "status": "batch_ok",
+        "results": [{"action": "placed"} for _ in range(len(legs) + 2)]}
+    r._resting = {}
+    r.tick(_MID_SESSION + 5.0, _ORACLE, {})
+    assert r._cross_backoff.offset_pct(_MKT) == widened,         "a surplus row count decayed the backoff anyway"
