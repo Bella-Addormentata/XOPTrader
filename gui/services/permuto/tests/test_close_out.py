@@ -495,3 +495,29 @@ def test_a_venue_that_does_not_state_fills_is_not_guessed_at():
     c.order_response = {"action": "placed", "order_id": 7}
     legs = plan_close({"QQQ-VOL-PERP": -100.0}, 1.0)
     assert not send_close(c, 0.0, legs)["partial"]
+
+
+def test_a_total_missing_a_price_is_labelled_partial():
+    """[review] The total summed only the priced legs and still called
+    itself the total, understating what the operator was approving -- on
+    the confirmation dialog, which exists so the number can be checked
+    before anything is sent."""
+    legs = plan_close({"A": 100.0, "B": 100.0}, 1.0, {"A": 1.0, "B": 1.0})
+    text = describe(legs, {"A": 0.07})            # B has no price
+    assert "PARTIAL total" in text, text
+    assert "1 leg(s) unpriced" in text, text
+    # Both legs are still LISTED -- an unpriced leg is being closed too.
+    assert "A" in text and "B" in text
+
+
+def test_a_fully_priced_total_is_not_labelled_partial():
+    legs = plan_close({"A": 100.0, "B": 100.0}, 1.0, {"A": 1.0, "B": 1.0})
+    text = describe(legs, {"A": 0.07, "B": 0.07})
+    assert "PARTIAL" not in text, text
+    assert "total" in text
+
+
+def test_no_price_at_all_says_so_rather_than_showing_nothing():
+    legs = plan_close({"A": 100.0}, 1.0, {"A": 1.0})
+    text = describe(legs, {})
+    assert "no notional available" in text, text
