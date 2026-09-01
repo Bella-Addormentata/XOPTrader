@@ -33,6 +33,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <optional>
 #include <string>
 
 namespace xop::risk {
@@ -152,6 +153,87 @@ inline void reenable_peg(PegRuntime& rt) noexcept
     rt.suspended = false;
     rt.suspended_at_block = 0;
     rt.above_bail = 0;
+}
+
+// ---------------------------------------------------------------------------
+// peg_usd_observation -- what one pair's published book says an asset is
+// worth in USD, or nothing at all.
+//
+// [SIDEQUALITY 2026-09-01] Extracted from Engine::step_observe_asset_pegs so
+// the two ways this route has already gone wrong are drivable by a test
+// rather than only by a live engine. Both failures cancelled real offers:
+//
+//   * SCALE. MarketSnapshot::mid_price is MOJO-SCALED (1e12). Reading it as
+//     a bare price yielded usd ~ 3.4e-13 every heartbeat and produced
+//     "[PEGSUSPEND] observed $0.0000 vs target 1.0000, 100.0% off" -- for
+//     wUSDC.b on 2026-08-29 and BYC on 2026-08-30, both false, both
+//     suspending the par and cancelling every offer on every pair touching
+//     the asset.
+//
+//   * SOURCE. Fixing the scale alone was NOT sufficient. On the dislocated
+//     XCH/BYC book the correctly scaled observation was 1.43 / 3.25 = $0.44
+//     -- still 56% off par, still past bail_pct -- because the published mid
+//     inherits a junk side. A book with a disqualified side is not an
+//     observation about this asset's peg, so it yields nothing.
+//
+// Returning nullopt routes the caller into observe_peg's data-gap branch,
+// which HOLDS the streak rather than advancing or resetting it: absence of
+// evidence neither confirms nor clears a depeg.
+//
+// DELIBERATELY NOT re-sourced to a fair-value estimate, which is the
+// obvious-looking alternative and is circular: par_anchor.hpp feeds a
+// DECLARED par into the fair-value solve precisely when nothing else can
+// price the asset, so a peg watcher reading that estimate would read its own
+// input back, sit permanently at par, and never detect the depeg it exists
+// to detect. A peg is observed from a market or not at all.
+//
+// @param scaled_mid   MarketSnapshot::mid_price, mojo-scaled.
+// @param scale        Mojos per unit (kMojosPerXch at every call site today).
+// @param xch_base     True when the pair is XCH/<asset>, so the price is
+//                     ASSET per XCH and the asset's USD value is
+//                     usd_per_xch / mid. False for <asset>/XCH, where the
+//                     price is XCH per asset and the value is the product.
+// @param mid_valuation_grade  MarketSnapshot::mid_valuation_grade.
+// @param bid_side_ok / ask_side_ok  Per-side anchor agreement.
+// @param usd_per_xch  USD per XCH; must be finite and positive.
+// ---------------------------------------------------------------------------
+[[nodiscard]] inline std::optional<double> peg_usd_observation(
+    double scaled_mid,
+    double scale,
+    bool   xch_base,
+    bool   mid_valuation_grade,
+    bool   bid_side_ok,
+    bool   ask_side_ok,
+    double usd_per_xch) noexcept
+{
+    if (!(usd_per_xch > 0.0) || !std::isfinite(usd_per_xch)) {
+        return std::nullopt;
+    }
+    if (!(scaled_mid > 0.0) || !std::isfinite(scaled_mid)) {
+        return std::nullopt;
+    }
+    if (!(scale > 0.0) || !std::isfinite(scale)) {
+        return std::nullopt;
+    }
+    if (!mid_valuation_grade) {
+        return std::nullopt;
+    }
+    // Either side disqualified poisons the midpoint, whichever side it is:
+    // the mid is the mean of the two, so one junk side moves it regardless
+    // of which one.
+    if (!bid_side_ok || !ask_side_ok) {
+        return std::nullopt;
+    }
+    const double mid_units = scaled_mid / scale;
+    if (!(mid_units > 0.0) || !std::isfinite(mid_units)) {
+        return std::nullopt;
+    }
+    const double usd = xch_base ? usd_per_xch / mid_units
+                                : usd_per_xch * mid_units;
+    if (!std::isfinite(usd) || !(usd > 0.0)) {
+        return std::nullopt;
+    }
+    return usd;
 }
 
 }  // namespace xop::risk

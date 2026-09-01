@@ -376,10 +376,10 @@ def _prune_raw_tables(
             msg += [
                 f"  cutoff        : {cutoff_iso}",
                 f"  retention set : {raw_retention_days} days",
-                "  A jump this large means retention has not run in a "
-                "long time, not that this much data is stale.",
-                "  Widen --raw-retention-days to keep the history, or "
-                "pass --confirm-large-prune to delete it on purpose.",
+                ("  A jump this large means retention has not run in a "
+                 + "long time, not that this much data is stale."),
+                ("  Widen --raw-retention-days to keep the history, or "
+                 + "pass --confirm-large-prune to delete it on purpose."),
                 "  Take a --backup either way, and --dry-run first.",
             ]
             raise LargePruneRefused(chr(10).join(msg))

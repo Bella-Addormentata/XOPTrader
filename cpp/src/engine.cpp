@@ -16766,50 +16766,35 @@ asio::awaitable<void> Engine::step_observe_asset_pegs(BlockHeight block_height)
                     && pair.base_asset_id == a->asset_id;
                 if (!xch_base && !xch_quote) continue;
                 auto snap = state_->get_market(pair.name);
-                if (!(snap.mid_price > 0) || !snap.mid_valuation_grade) {
-                    continue;
-                }
-                // [SIDEQUALITY 2026-09-01] A book with a disqualified side
-                // is not an observation about this asset's peg.
+                // [SIDEQUALITY 2026-09-01] Both the SCALE and the SOURCE
+                // of this observation were wrong, and both cancelled real
+                // offers. The logic now lives in risk::peg_usd_observation
+                // so a test can drive it -- see its header comment for the
+                // two incidents and for why a fair-value estimate is
+                // deliberately NOT an acceptable substitute source here.
                 //
-                // XCH/BYC on 2026-08-30 had honest bids at par and a junk
-                // ask stack 3.5x-7.1x above the anchor.  Its midpoint said
-                // BYC was worth $0.44 -- an artifact of the dead side, not
-                // a depeg -- and the latch that fired on it cancelled every
-                // resting offer on every pair touching BYC.  Leaving
-                // usd_obs NaN routes into observe_peg's data-gap branch,
-                // which HOLDS the streak rather than resetting or
-                // advancing it: absence of evidence neither confirms nor
-                // clears a depeg, which is the correct treatment.
-                //
-                // Deliberately NOT re-sourced to the fair-value estimate,
-                // which is the obvious-looking alternative and is
-                // circular here: par_anchor.hpp feeds a DECLARED par into
-                // the fair-value solve precisely when nothing else can
-                // price the asset, so a peg watcher reading that estimate
-                // would read its own input back, sit permanently at par,
-                // and never detect the depeg it exists to detect.  The
-                // peg must be observed from a market or not at all.
-                if (!snap.bid_side_anchor_ok || !snap.ask_side_anchor_ok) {
-                    spdlog::debug("[Engine] peg observe: {} skipped -- book "
-                                  "side disqualified vs anchor {}",
-                                  pair.name, snap.book_side_ref);
+                // nullopt leaves usd_obs NaN, which routes into
+                // observe_peg's data-gap branch and HOLDS the streak:
+                // absence of evidence neither confirms nor clears a depeg.
+                const auto obs = risk::peg_usd_observation(
+                    static_cast<double>(snap.mid_price),
+                    static_cast<double>(kMojosPerXch),
+                    xch_base,
+                    snap.mid_valuation_grade,
+                    snap.bid_side_anchor_ok,
+                    snap.ask_side_anchor_ok,
+                    usd_xch);
+                if (!obs) {
+                    spdlog::debug("[Engine] peg observe: {} yields no "
+                                  "observation (grade={}, bid_ok={}, "
+                                  "ask_ok={}, anchor={})",
+                                  pair.name, snap.mid_valuation_grade,
+                                  snap.bid_side_anchor_ok,
+                                  snap.ask_side_anchor_ok,
+                                  snap.book_side_ref);
                     continue;
                 }
-                // [SIDEQUALITY 2026-09-01] mid_price is MOJO-SCALED (1e12).
-                // Reading it as a bare price gave usd_obs ~ 3.4e-13 on
-                // every heartbeat and produced "[PEGSUSPEND] observed
-                // $0.0000 ... 100.0% off" for wUSDC.b on 2026-08-29 and
-                // BYC on 2026-08-30 -- both false, both cancelling live
-                // offers.  The correct pattern is the one usd_per_xch()
-                // already uses via peg_registry's usd_per_base_from_mid.
-                const double mid_units = static_cast<double>(snap.mid_price)
-                                       / static_cast<double>(kMojosPerXch);
-                if (!(mid_units > 0.0) || !std::isfinite(mid_units)) {
-                    continue;
-                }
-                usd_obs = xch_base ? usd_xch / mid_units
-                                   : usd_xch * mid_units;
+                usd_obs = *obs;
                 break;
             }
         }
