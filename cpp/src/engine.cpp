@@ -10167,55 +10167,57 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     (bid_ok && ask_ok) || side_ref <= 0 ? bbo_mid_m : side_ref;
 
                 // Check 1: Model mid vs BBO sanity
+                //
+                // [review round 5] AN EARLIER REVISION OF THIS BLOCK
+                // RE-REFERENCED THIS CHECK TO THE SURVIVING SIDE WHEN THE
+                // OTHER WAS DISQUALIFIED. That was WRONG, and worse than
+                // the behaviour it replaced. The premise was that `mid`
+                // here is Step 7's fair-value centre; it is not. `mid` is
+                // the PUBLISHED mid (engine.cpp, `market_data_->
+                // get_mid_price(pair_name)`), and for a pair with no CEX
+                // or AMM leg the published mid IS the BBO midpoint --
+                // bit-for-bit the same number as bbo_mid_m.
+                //
+                // So on the live XCH/BYC book (bid 1.5000, ask 4.9995,
+                // both mid and bbo_mid_m 3.24975) this check's deviation
+                // is identically ZERO and it has never fired. Substituting
+                // best_bid turned that 0% into |3.24975-1.5|/1.5 = 116.7%,
+                // clearing EVERY tier on EVERY block -- silencing the pair
+                // this work exists to un-silence, by a different route.
+                //
+                // Check 2 does not have this problem and its
+                // re-referencing is correct: it compares TIER PRICES,
+                // which are built around Step 7's centre, so substituting
+                // that centre compares like with like. Check 1 compares
+                // the PUBLISHED MID, which is derived from the very book
+                // being judged -- there is no substitution that makes it
+                // meaningful, because both operands move together.
+                //
+                // Hence: when a side is disqualified this check is SKIPPED,
+                // not re-pointed. That restores its pre-existing behaviour
+                // exactly (it could not fire on such a book anyway) and
+                // refuses to invent a comparison the numbers cannot
+                // support.
                 if (mid > 0) {
-                    Mojo        c1_ref  = eff_bbo_mid;
-                    const char* c1_what = "BBO mid";
-                    bool        c1_run  = true;
-                    if (!bid_ok && !ask_ok) {
-                        // Nothing in the book is a reference.  Skipping is
-                        // the honest outcome: the model mid is then the
-                        // ONLY location estimate available, and suppressing
-                        // it in favour of a book we just declared junk
-                        // would guarantee zero participation for zero
-                        // protection.  The mid still passed the published-
-                        // mid gate to get here.
-                        //
-                        // The obvious worry is "what if the ANCHOR is the
-                        // wrong one?", since a bad anchor disqualifies an
-                        // honest book and this branch then trusts the bad
-                        // anchor.  The two-sides-agree bypass makes that
-                        // unreachable: a coherent two-sided book is never
-                        // disqualified however far it sits from the anchor
-                        // (book_side_quality.hpp, pinned by
-                        // BookSideQuality.a_coherent_book_is_trusted_whole_
-                        // however_far_it_sits).  So arriving here requires
-                        // BOTH a suspect anchor and an incoherent book, and
-                        // in that state there is no good reference to
-                        // prefer -- which is why it warns.
-                        c1_run = false;
-                    } else if (!ask_ok && best_bid > 0) {
-                        c1_ref  = best_bid;
-                        c1_what = "best bid (ask side disqualified)";
-                    } else if (!bid_ok && best_ask > 0) {
-                        c1_ref  = best_ask;
-                        c1_what = "best ask (bid side disqualified)";
-                    }
-                    if (c1_run && c1_ref > 0) {
+                    const bool c1_run = bid_ok && ask_ok;
+                    if (c1_run) {
                         const double mid_dev = std::abs(
-                            static_cast<double>(mid) - static_cast<double>(c1_ref))
-                            / static_cast<double>(c1_ref);
+                            static_cast<double>(mid)
+                            - static_cast<double>(bbo_mid_m))
+                            / static_cast<double>(bbo_mid_m);
                         if (mid_dev > kMaxMidDev) {
                             spdlog::warn("[Engine] Step 8: {} model mid {} deviates "
-                                         "{:.1f}% from {} {} -- suppressing ALL "
+                                         "{:.1f}% from BBO mid {} -- suppressing ALL "
                                          "offers this block",
-                                         pair_name, mid, mid_dev * 100.0,
-                                         c1_what, c1_ref);
+                                         pair_name, mid, mid_dev * 100.0, bbo_mid_m);
                             fee_filtered_tiers.clear();
                         }
-                    } else if (!c1_run) {
-                        spdlog::warn("[Engine] Step 8: {} both book sides "
-                                     "disqualified vs anchor {} -- skipping the "
-                                     "model-mid check and quoting on the model",
+                    } else {
+                        spdlog::warn("[Engine] Step 8: {} skipping the model-mid "
+                                     "check -- a book side is disqualified vs "
+                                     "anchor {}, and the published mid is derived "
+                                     "from that same book, so no reference makes "
+                                     "the comparison meaningful",
                                      pair_name, side_ref);
                     }
                 }

@@ -189,7 +189,7 @@ participants demanding a 250% premium to sell XCH; it is **nobody offering
 XCH**, plus residue. Consequently `(best_bid + best_ask) / 2` is a category
 error on this book: it averages a conditional expectation with a
 non-existent one. Every threshold measured against that midpoint --
-`bbo_sanity` Check 1 at `cpp/src/engine.cpp:10117-10128`, the `bid_cap` at
+`bbo_sanity` Check 1 in Step 8 of `cpp/src/engine.cpp`, the `bid_cap` in
 `cpp/src/strategy/liquidity.cpp:1044-1056` -- is comparing a real number to
 a number with no referent.
 
@@ -682,7 +682,7 @@ reads it directly, per-side, and is wrong anyway. Pooling is the more
 visible symptom, not the root -- the root is trusting a side that has no
 quote in it.
 
-* **`cpp/src/engine.cpp:10117-10128`, `bbo_sanity` Check 1.**
+* **`bbo_sanity` Check 1, Step 8 of `cpp/src/engine.cpp`.**
   `mid_dev = |1.41141912 - 3.24975| / 3.24975 = 0.5657` against
   `bbo_sanity_max_mid_dev` 0.50, so `fee_filtered_tiers.clear()` and
   "suppressing ALL offers this block". Measured against `best_bid` alone

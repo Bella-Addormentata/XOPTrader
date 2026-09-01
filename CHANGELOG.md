@@ -50,13 +50,23 @@ every consumer read `best_bid`/`best_ask` as an atomic pair.
   wide spread behind. Pinned to the same default as the gate's own
   confirmation threshold so the two halves cannot be configured into
   contradiction.
-- **Step 8 Check 1** measured a correct model mid against `bbo_mid`, the
-  mean of an honest bid and a junk ask: 56.6% > the 50% cap, so it cleared
-  every tier. It now measures against the surviving side (5.9%, passes),
-  and when *both* sides are disqualified it skips — the model mid is then
-  the only location estimate there is, and suppressing it in favour of a
-  book we just called junk buys zero protection for guaranteed zero
-  participation.
+- **Step 8 Check 1 is SKIPPED when a side is disqualified, not
+  re-referenced — and an earlier revision of this entry got the mechanism
+  wrong.** It claimed Check 1 compared Step 7's centre (1.41141912) against
+  `bbo_mid` (3.24975) for 56.6% and cleared every tier. Step 8 performs no
+  such comparison. `mid` there is the **published** mid, and for a pair
+  with no CEX or AMM leg the published mid *is* the BBO midpoint —
+  bit-for-bit `bbo_mid_m`. On the live book the deviation is identically
+  **zero**, and this check has never fired for XCH/BYC.
+  Re-pointing it at the surviving side, as an earlier commit on this branch
+  did, turned that 0% into `|3.24975 − 1.5| / 1.5` = **116.7%**, clearing
+  every tier on every block — silencing the pair this work exists to
+  un-silence, by a different route. It now skips instead, which restores
+  the pre-existing behaviour exactly. Both operands of this check are
+  derived from the book being judged, so no substitution makes it
+  meaningful. Check 2 is unaffected: it compares **tier prices**, which are
+  built around Step 7's centre, so substituting that centre compares like
+  with like.
 - **Step 8 Check 2** measured our correctly-priced 1.41 ask against the
   4.9995 junk ask and called it 71.8% "aggressive", killing it, while a
   1.41 bid passed at 6.0%. It now references the independent anchor when
@@ -68,8 +78,11 @@ every consumer read `best_bid`/`best_ask` as an atomic pair.
   it: `bid_cap = 3.24975` never bound, and the competitive anchor parked a
   bid at 1.5001 against a 1.4102 fair value — a ~6.3% overpay on every XCH
   bought, every cycle. A disqualified side no longer contributes to
-  `bbo_ref`, and `bid_cap` tightens to `min(bbo_ref, mid)` **only** in
-  that state. Healthy books are byte-identical, deliberately: this is
+  `bbo_ref` — which is the whole of the fix, and is what the two ladder
+  regression tests pin. (The accompanying `min(bbo_ref, mid)` is
+  decoration: in the disqualified state `bbo_ref` has already fallen back
+  to the model mid, so the `min` cannot bind. It is retained only as an
+  explicit statement of intent.) Healthy books are byte-identical: this is
   shared hot-path code for the pairs that actually earn, and the
   pre-existing `bid_cap == bbo_ref` rule for healthy books is a separate
   decision that is not revisited here.

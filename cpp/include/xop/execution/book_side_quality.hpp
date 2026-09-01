@@ -19,10 +19,15 @@
 // ask side wearing the costume of one.  Three consumers then did the wrong
 // thing with it, all correctly, all from the same bad premise:
 //
-//   * the model-mid sanity check measured a correct 1.41141912 against
-//     bbo_mid 3.24975 (the mean of an honest bid and a junk ask), got
-//     56.6% deviation, and suppressed EVERY tier -- the pair went silent
-//     precisely BECAUSE the solver was right;
+//   * [CORRECTED in review round 5] the model-mid sanity check was
+//     originally described here as measuring 1.41141912 against bbo_mid
+//     3.24975 for 56.6%. It does not: its `mid` is the PUBLISHED mid,
+//     which for a pair with no CEX or AMM leg IS the BBO midpoint, so its
+//     deviation is identically zero and it never fired. That check is now
+//     SKIPPED on a disqualified side rather than re-pointed -- re-pointing
+//     it at the surviving side produced 116.7% and cleared every tier.
+//     Both its operands come from the book being judged, so no
+//     substitution makes it meaningful;
 //   * the per-tier check measured our correctly-priced ask against
 //     best_ask 4.9995 and called it 71.8% "aggressive";
 //   * the competitive anchor capped bids at that same poisoned midpoint,
