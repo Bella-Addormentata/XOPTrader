@@ -456,8 +456,29 @@ def test_public_key_is_shown_and_private_key_is_not(page):
     shown = widget._identity_lbl.text()
     assert pubkey in shown
     assert bytes(ident.private_key()).hex() not in shown
-    for word in phrase.split():
-        assert " %s " % word not in shown
+
+    # [flake 2026-08-31] The per-WORD check that used to live here fails
+    # about 9% of the time -- roughly one CI run in eleven -- and it is not
+    # finding a leak when it does.
+    #
+    # BIP39 is ordinary English, and eight of its 2,048 words also appear
+    # in this label's own chrome: public, key, address, this, machine,
+    # session, order, market. A 24-word phrase hits at least one of them
+    # with probability 1 - (2040/2048)^24 = 8.97%, and the failure reads
+    # "' public ' is contained here: BLS public key: ..." -- the widget's
+    # static text, not the secret.
+    #
+    # What actually constitutes a leak is the PHRASE, so that is what is
+    # checked: the whole thing, and any two ADJACENT words. A real
+    # disclosure carries neighbours with it; a lone common word is
+    # coincidence, and a test that cannot tell the two apart trains people
+    # to re-run CI until it goes green, which is the opposite of a
+    # security check.
+    words = phrase.split()
+    assert phrase not in shown
+    for first, second in zip(words, words[1:]):
+        assert "%s %s" % (first, second) not in shown, (
+            "two consecutive phrase words leaked into the label")
 
 
 def test_page_constants_match_the_sidebar_order(qapp):
