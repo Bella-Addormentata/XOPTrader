@@ -2106,26 +2106,78 @@ def test_a_stale_open_RETRACTS_a_resting_quote_not_just_declines_to_place():
     assert "cancel_all" in c.calls,         "a stale resting quote was left live into the opening gap"
 
 
-def test_the_exit_window_holds_its_book_rather_than_retracting():
-    """EXIT declines to place but must NOT pull what is resting.
+class _BookClient(_Client):
+    """A client whose open_orders REFLECTS cancellation.
 
-    The danger is the OPEN, not the close, and a resting pair keeps
-    earning depth credit right up to the bell. Retracting here would
-    forfeit that for no safety gain -- which is why `withdraw` is a
-    separate flag from `quote` rather than the same one.
+    The plain fake returns a fixed payload, so a cancelled book reappears
+    on the next reconcile -- which is why the first version of the EXIT
+    test could not fail: the orders it checked for had been resurrected
+    between the cancel and the assertion.
     """
-    c = _Client(account=_account(0.0), batch_response=_venue_ok(),
-                open_orders={"orders": [
-                    {"market": _MKT, "side": "buy", "price": 0.0698,
-                     "size": 100},
-                    {"market": _MKT, "side": "sell", "price": 0.0702,
-                     "size": 100}]})
+
+    def __init__(self, **kw):
+        orders = kw.pop("orders", [])
+        super().__init__(**kw)
+        self._orders = list(orders)
+
+    def open_orders(self, now_s):
+        self.calls.append("open_orders")
+        return {"orders": list(self._orders)}
+
+    def cancel_all(self, now_s, markets=None):
+        out = super().cancel_all(now_s, markets)
+        keep = set(markets or [])
+        self._orders = [o for o in self._orders
+                        if keep and o.get("market") not in keep]
+        return out
+
+
+def test_entering_EXIT_does_not_retract_the_resting_book():
+    """[review] Across the REAL boundary, with a book that stays cancelled.
+
+    The curfew's stage-change path retracts on every effective transition,
+    which cancelled the book EXIT is meant to leave alone -- and did it
+    before the profile was consulted, so `withdraw=False` could never take
+    effect. The previous version of this test primed at 6 minutes to the
+    close and asserted at 5, both already INSIDE the EXIT window, so no
+    RAMP -> EXIT transition ever occurred and the fake resurrected the
+    orders anyway. It could not have failed.
+    """
+    orders = [{"market": _MKT, "side": "buy", "price": 0.0698, "size": 100},
+              {"market": _MKT, "side": "sell", "price": 0.0702, "size": 100}]
+    c = _BookClient(account=_account(0.0), batch_response=_venue_ok(),
+                    orders=orders)
     r = _runner(c, curfew_enabled=True)
-    exit_t = CLOSES_UTC[0] - 300.0
-    r.tick(exit_t - 60.0, _ORACLE, {})
+    close = CLOSES_UTC[0]
+    # A MOVING oracle, or the freeze detector overrides the schedule and
+    # the transition under test becomes RAMP -> CLOSED instead of EXIT.
+    r.tick(close - 1800.0, {_MKT: 0.0700}, {})   # RAMP, 30 minutes out
+    r.tick(close - 1200.0, {_MKT: 0.0705}, {})
+    # Entering RAMP legitimately retracts (its caps tighten), so re-seed a
+    # resting book: the property under test is what crossing into EXIT does
+    # to a book that IS there, not whether one survived an earlier stage.
+    c._orders = list(orders)
+    r.tick(close - 900.0, {_MKT: 0.0707}, {})    # reconcile picks it up
     c.calls.clear()
-    r.tick(exit_t, _ORACLE, {})
-    assert "cancel_all" not in c.calls,         "EXIT retracted a resting book it should have left earning"
+    r.tick(close - 600.0, {_MKT: 0.0710}, {})    # crosses into EXIT
+    assert "cancel_all" not in c.calls,         "the RAMP -> EXIT transition retracted the book EXIT should hold"
+    assert c._orders, "the resting book was cancelled entering EXIT"
+
+
+def test_entering_the_overnight_close_DOES_retract():
+    """The exemption is EXIT-only. Every other tightening transition still
+    retracts, because those genuinely forbid what is resting."""
+    orders = [{"market": _MKT, "side": "sell", "price": 0.0702, "size": 100}]
+    c = _BookClient(account=_account(-100.0), batch_response=_venue_ok(),
+                    orders=orders)
+    r = _runner(c, curfew_enabled=True)
+    close = CLOSES_UTC[0]
+    r.tick(close - 900.0, {_MKT: 0.0700}, {})    # EXIT, oracle alive
+    r.tick(close - 600.0, {_MKT: 0.0705}, {})
+    c.calls.clear()
+    r.tick(close + 600.0, {_MKT: 0.0710}, {})    # crosses into CLOSED
+    assert "cancel_all" in c.calls,         "the EXIT -> CLOSED transition failed to retract"
+
 
 
 def test_the_learned_backoff_is_capped_by_CURRENT_headroom():
@@ -2195,3 +2247,35 @@ def test_the_runner_APPLIES_the_backoff_cap_not_just_computes_it():
             "leg %r sits %.3f%% from the oracle, past the %.2f%% re-quote "
             "trigger -- the learned backoff was applied uncapped"
             % (leg, out, trigger))
+
+
+def test_a_pre_bell_print_does_not_satisfy_the_post_open_gate():
+    """[review] "Moved in the last 180s" is not "printed since the bell".
+
+    An oracle that ticks at 13:29 and then stops is still inside the
+    confirmation window at the 13:30 open, so market_frozen() reports it
+    live -- and the runner quoted against a price that predates the
+    session, walking straight through the gate meant to stop exactly that.
+    """
+    c = _Client(account=_account(0.0), batch_response=_venue_ok())
+    r = _runner(c, curfew_enabled=True)
+    open_s = OPENS_UTC[0]
+    # A real print a minute BEFORE the bell, then silence.
+    r.tick(open_s - 120.0, {_MKT: 0.070}, {})
+    r.tick(open_s - 60.0, {_MKT: 0.071}, {})       # moved: genuinely fresh
+    c.calls.clear()
+    res = r.tick(open_s + 30.0, {_MKT: 0.071}, {})  # same value after open
+    assert res.markets.get(_MKT, ("", ""))[0] == "withdraw", res.markets
+    assert "not printed" in res.markets[_MKT][1], res.markets[_MKT]
+
+
+def test_a_post_bell_print_does_satisfy_it():
+    """And the gate must open once the session really starts, or it would
+    forfeit the busiest quarter hour for a danger that has passed."""
+    c = _Client(account=_account(0.0), batch_response=_venue_ok())
+    r = _runner(c, curfew_enabled=True)
+    open_s = OPENS_UTC[0]
+    r.tick(open_s - 120.0, {_MKT: 0.070}, {})
+    r.tick(open_s + 10.0, {_MKT: 0.085}, {})        # a genuine post-bell move
+    res = r.tick(open_s + 30.0, {_MKT: 0.085}, {})
+    assert res.markets.get(_MKT, ("", ""))[0] != "withdraw", res.markets

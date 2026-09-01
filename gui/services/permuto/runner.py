@@ -50,7 +50,7 @@ from .band_guard import VENUE_BAND_PCT, BandGuard
 from .cross_backoff import CrossBackoff, headroom_pct
 from .preflight import (latest_oracle, preflight_leg_price,
                         quantise_toward, rescaled_size)
-from .curfew import (OracleFreeze, Stage, assess_curfew,
+from .curfew import (OPENS_UTC, OracleFreeze, Stage, assess_curfew,
                      permitted_leg_size)
 from .modes import Profile, profile_for
 from .session import RenewAction
@@ -442,7 +442,22 @@ class QuoteRunner:
                 # restart the cancel always failed with "needs a session
                 # and none is held". It self-healed a tick later, but the
                 # retraction belongs after the session exists.
-                self._curfew_retract_pending = True
+                #
+                # [review] EXCEPT INTO EXIT. That transition tightens the
+                # CAPS but does not forbid anything already resting: the
+                # danger is the OPEN, not the close, and a two-sided pair
+                # keeps earning credit right up to the bell. Blanket
+                # retraction here cancelled the book EXIT is supposed to
+                # leave alone -- and did it before the profile was ever
+                # consulted, so `withdraw=False` could never take effect.
+                # The caps still bind; nothing that would GROW inventory
+                # gets placed. This only spares what is already there.
+                if curfew.stage is not Stage.EXIT:
+                    self._curfew_retract_pending = True
+                else:
+                    _log.info(
+                        "permuto: entering EXIT -- holding the resting "
+                        "book (caps still bind; nothing new is placed)")
             self._curfew = curfew
 
         paused = bool(flags.get("trading_paused"))
@@ -806,9 +821,25 @@ class QuoteRunner:
         profile_by_market: dict[str, Profile] = {}
         eff_half_spread_by_market: dict[str, float] = {}
         for market in self._markets:
+            # [review] After the bell, "fresh" has to mean PRINTED SINCE
+            # THE BELL, not merely "moved in the last 180 seconds". An
+            # oracle that ticks at 13:29 and then stops is still inside the
+            # confirmation window at the 13:30 open, so market_frozen()
+            # reports it live and the runner quotes against a price that
+            # predates the session -- the exact stale-price case this gate
+            # exists to close, walking straight through it.
+            #
+            # Outside SETTLING there is no boundary to be after, so the
+            # ordinary freshness test governs.
+            if posture_stage is Stage.SETTLING:
+                opened = [o for o in OPENS_UTC if o <= now_s]
+                fresh = bool(opened) and self._freeze.changed_since(
+                    market, max(opened))
+            else:
+                fresh = not self._freeze.market_frozen(market, now_s)
             market_profile = profile_for(
                 posture_stage,
-                oracle_fresh=not self._freeze.market_frozen(market, now_s),
+                oracle_fresh=fresh,
             )
             profile_by_market[market] = market_profile
             eff_half_spread_by_market[market] = (

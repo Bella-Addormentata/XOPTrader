@@ -334,6 +334,22 @@ class OracleFreeze:
             return -1.0
         return max(0.0, now_s - self._changed_at_s)
 
+    def changed_since(self, market: str, boundary_s: float) -> bool:
+        """Has this market printed AFTER ``boundary_s``?
+
+        [review] "Fresh" and "printed since the bell" are not the same
+        question, and the freshness gate needs the second one. An oracle
+        that moves at 13:29 and then stops is still inside the 180s
+        confirmation window at the 13:30 open, so market_frozen() says
+        "not frozen" and the runner quotes -- against a price that
+        predates the open, which is the exact stale-price case the gate
+        exists to close.
+        """
+        changed_at = self._changed_at_by_market_s.get(market)
+        if changed_at is None:
+            return False
+        return changed_at > boundary_s
+
     def market_frozen(self, market: str, now_s: float) -> bool:
         """True once this market has not changed for `confirm_s`.
 
