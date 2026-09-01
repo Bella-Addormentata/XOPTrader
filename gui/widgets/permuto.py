@@ -873,6 +873,19 @@ class PermutoWidget(QWidget):
 
     # -- operator close ---------------------------------------------------- #
 
+    def close_in_flight(self) -> bool:
+        """True while a close worker owns (or is about to own) a session.
+
+        [review] The guard was one-directional. It stopped a close starting
+        during live quoting, but not the INVERSE: starting the runner while
+        a close plan or send is already in flight opens the quoting
+        client's session anyway, and set_quoting_live(True) then merely
+        greys out buttons whose worker is already running. Both clients
+        would sit in alternating 401/reauth, which is the failure the guard
+        exists to prevent, arriving from the other side.
+        """
+        return getattr(self, "_close_thread", None) is not None
+
     def set_quoting_live(self, live: bool) -> None:
         """Told by MainWindow when the quoting loop owns a venue session.
 

@@ -37,6 +37,10 @@ _log = logging.getLogger(__name__)
 CLOSE_FRACTIONS = (0.25, 0.50, 1.00)
 
 
+class ClosePayloadError(RuntimeError):
+    """The account payload was a shape we do not understand."""
+
+
 def read_positions(client: Any, now_s: float) -> dict:
     """``{market: signed_contracts}`` from the venue, right now.
 
@@ -44,12 +48,52 @@ def read_positions(client: Any, now_s: float) -> dict:
     reason: a row whose side we cannot read is worse than useless, because
     an unsigned size makes a short look like a long and "reduce" then means
     "sell more". Unreadable rows are dropped rather than guessed.
+
+    BOTH DOCUMENTED SHAPES. [review] This accepted only the LIST form, so a
+    perfectly valid dict payload -- the signed form `_margin_state` handles
+    and `test_positions_parse_from_a_dict_or_a_list` pins -- returned an
+    empty mapping. For an emergency control that is the worst failure
+    available: it tells the operator "Nothing to close" while the position
+    is fully open, at the one moment they are trying to get out.
+
+    An unreadable TOP-LEVEL shape raises rather than reading as empty, for
+    the same reason. "I could not understand the account" and "you have no
+    positions" must never look alike here.
     """
     payload = client.account(now_s) or {}
+    if not isinstance(payload, dict):
+        raise ClosePayloadError(
+            "account payload was %s, not an object" % type(payload).__name__)
     rows = payload.get("positions")
     out: dict = {}
-    if not isinstance(rows, list):
+    if rows is None or rows == [] or rows == {}:
         return out
+
+    # Dict form: {market: signed_size}. Already signed -- that is the whole
+    # difference between the two shapes, and conflating them is what hid the
+    # phantom-long bug for a session.
+    if isinstance(rows, dict):
+        for market, raw in rows.items():
+            name = str(market or "").strip()
+            if not name:
+                continue
+            try:
+                signed = float(raw)
+            except (TypeError, ValueError):
+                _log.warning(
+                    "permuto: position for %s is %r, which is not a number "
+                    "-- skipping it rather than guessing", name, raw)
+                continue
+            if signed == 0.0 or signed != signed:      # zero or NaN
+                continue
+            out[name] = signed
+        return out
+
+    if not isinstance(rows, list):
+        raise ClosePayloadError(
+            "account positions were %s, not a list or an object"
+            % type(rows).__name__)
+
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -73,6 +117,27 @@ def read_positions(client: Any, now_s: float) -> dict:
                 "read -- skipping it rather than guessing its direction",
                 market, row.get("side"))
     return out
+
+
+def order_was_accepted(resp: Any) -> tuple:
+    """``(accepted, detail)`` for one single-order response.
+
+    [review] HTTP 200 is not acceptance. The client raises only for HTTP
+    errors, and this venue's vocabulary includes application-level refusal
+    -- a body carrying ``status: "rejected"`` or a rejection_reason comes
+    back 200. Counting those as sent let the UI report a successful close
+    the venue had refused, which on an emergency control is worse than
+    reporting the failure.
+    """
+    if not isinstance(resp, dict):
+        return True, ""            # nothing to contradict; trust the 200
+    reason = str(resp.get("rejection_reason") or "").strip()
+    status = str(resp.get("status", "")).strip().lower()
+    if reason:
+        return False, reason
+    if status in ("rejected", "failed", "error", "cancelled"):
+        return False, status
+    return True, ""
 
 
 def plan_close(positions: dict, fraction: float,
@@ -209,6 +274,15 @@ def send_close(client: Any, now_s: float, approved_legs: list, *,
         try:
             resp = client.place_order(leg, now_s)
             responses.append(resp)
+            # [review] HTTP 200 is not acceptance. The client raises only
+            # for HTTP errors, and this venue refuses at the application
+            # level with a 200 body -- so counting every non-raising call
+            # as sent let the UI report a close the venue had declined.
+            ok, detail = order_was_accepted(resp)
+            if not ok:
+                _log.error("permuto: operator close leg %s refused: %s",
+                           leg["market"], detail)
+                failed.append("%s: %s" % (leg["market"], detail))
         except Exception as exc:  # noqa: BLE001 - shown, not raised
             _log.error("permuto: operator close leg %s failed: %s",
                        leg["market"], exc)

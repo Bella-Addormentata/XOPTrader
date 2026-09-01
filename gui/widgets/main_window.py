@@ -2709,6 +2709,19 @@ class MainWindow(QMainWindow):
                           reason)
                 self._refresh_venue_switches()
                 return
+            # [review] The inverse of the close guard. Starting here while
+            # a close worker is in flight opens a second session for the
+            # same identity, and the two invalidate each other's tokens --
+            # the close being the one that must not lose that fight.
+            page = self._unwrap(getattr(self, "_permuto_widget", None))
+            in_flight = getattr(page, "close_in_flight", None)
+            if callable(in_flight) and in_flight():
+                self._permuto_desired_on = False
+                self._on_switch_refused(
+                    "a position close is in flight; quoting would open a "
+                    "second venue session and invalidate its token")
+                self._refresh_venue_switches()
+                return
             if self._permuto_runner is None:
                 try:
                     self._permuto_runner = self._make_permuto_live()
