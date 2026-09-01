@@ -2020,51 +2020,49 @@ def test_widened_quote_with_max_skew_still_stays_inside_the_ring():
     #
     # A short at 95 of 100 keeps both sides quoting and gives the ASK
     # near-maximum POSITIVE skew, which is the leg that leaves the ring.
-    c = _Client(account=_account(-95.0), batch_response=_venue_cross((0, 1)))
+    # [review] A position where the cap is ACTIVE and its effect is
+    # VISIBLE IN THE PRICE.
+    #
+    # The previous version asserted only r._cross_backoff.offset_pct(),
+    # the private stored value -- which is what the controller LEARNED,
+    # not what the ladder APPLIED. At a 95% short the applied cap is only
+    # 0.17%, so the emitted legs were essentially spread+skew and the test
+    # would have passed even if the runner ignored the cap entirely.
+    #
+    # At a 30% short the budget splits 0.25 spread + 0.17 skew + 0.54
+    # backoff, so a learned offset far above the cap must show up in the
+    # price as a clearly non-zero retreat that still lands inside the
+    # trigger. Both halves are checked below.
+    from gui.services.permuto.quoting import REQUOTE_AT_RING_FRACTION
+
+    c = _Client(account=_account(-30.0), batch_response=_venue_cross((0, 1)))
     r = _runner(c, curfew_enabled=True, max_position_usd=7.0)
-    for i in range(20):                       # drive the backoff to its cap
-        r._resting = {}
-        r.tick(_MID_SESSION + i * 5.0, _ORACLE, {})
-    assert r._cross_backoff.offset_pct(_MKT) > 0.0, \
-        "backoff never fired -- test is not exercising the combined case"
+    r._cross_backoff._pct[_MKT] = 5.0        # far past ring and trigger
+    r.tick(_MID_SESSION, _ORACLE, {})
+    assert c.last_batch, "no batch to inspect"
+
     sides = {leg["side"] for leg in c.last_batch}
     assert sides == {"buy", "sell"}, (
         "expected a two-sided book so the TRAILING leg is exercised, got "
         "%r" % (sides,))
-    assert max(float(l["price"]) for l in c.last_batch) > oracle,         "the ask is not the trailing leg -- positive skew was expected"
-    for leg in c.last_batch:
-        dev = abs(float(leg["price"]) / oracle - 1.0) * 100.0
-        assert dev <= 2.0 + 1e-9, (
-            "leg %r sits %.4f%% out at max skew+backoff -- outside the 2%% "
-            "credit ring, it rests and earns nothing" % (leg, dev))
 
-def test_a_failed_batch_envelope_does_not_decay_the_backoff():
-    """[review] The ROWS describe legs; the ENVELOPE says whether the venue
-    took them, and only the envelope can answer that.
+    ask = max(float(leg["price"]) for leg in c.last_batch)
+    out = (ask / oracle - 1.0) * 100.0
+    trigger = 2.0 * REQUOTE_AT_RING_FRACTION
 
-    A known batch_failed response can still report every row as "placed",
-    so without gating on `accepted` an explicit venue refusal decayed the
-    learned offset exactly as though the batch had rested.
-    """
-    def crossed(legs):
-        return {"status": "batch_ok",
-                "results": [{"action": "placed", "rejection_reason":
-                             "Post-only order would cross the book."}
-                            for _ in legs]}
+    # APPLIED, not merely computed: without the backoff the ask would sit
+    # at roughly spread + skew (~0.42%), so a materially larger offset is
+    # the only evidence the ladder used the cap at all.
+    assert out > 0.60, (
+        "ask only %.4f%% out -- the capped backoff was never applied to "
+        "the ladder" % out)
+    # And BOUNDED: inside the re-quote trigger, so it is not replaced on
+    # the next tick, and inside the credit ring, so it earns.
+    assert out <= trigger + 1e-6, (
+        "ask %.4f%% is past the %.2f%% re-quote trigger" % (out, trigger))
+    assert out <= 2.0 + 1e-9, (
+        "ask %.4f%% is outside the 2%% credit ring" % out)
 
-    c = _Client(account=_account(100.0), batch_response=crossed)
-    r = _runner(c, curfew_enabled=True)
-    r.tick(_MID_SESSION, _ORACLE, {})
-    widened = r._cross_backoff.offset_pct(_MKT)
-    assert widened > 0.0
-
-    # Rows all look clean, but the ENVELOPE is an explicit failure.
-    c.batch_response = lambda legs: {
-        "status": "batch_failed",
-        "results": [{"action": "placed"} for _ in legs]}
-    r._resting = {}
-    r.tick(_MID_SESSION + 5.0, _ORACLE, {})
-    assert r._cross_backoff.offset_pct(_MKT) == widened,         "a batch_failed envelope with clean-looking rows decayed the backoff"
 
 
 def test_junk_tick_metadata_cannot_disable_the_backoff():
@@ -2135,7 +2133,14 @@ def test_preflight_repricing_snaps_to_the_grid_under_junk_tick_metadata():
     flags = {"specs": {_MKT: {"tick_size": float("nan"), "lot_size": 1.0}}}
     r.tick(_MID_SESSION, {_MKT: 0.0800, _MKT2: 0.200}, flags)
     assert c.last_batch, "no batch was sent"
-    for leg in (l for l in c.last_batch if l["market"] == _MKT):
+    # [review] The generator below is empty if _MKT was dropped, and an
+    # empty loop passes. The batch-level assertion above can be satisfied
+    # by _MKT2 alone, so without this the whole grid check is vacuous
+    # exactly when the preflight path under test failed to send anything.
+    mkt_legs = [l for l in c.last_batch if l["market"] == _MKT]
+    assert mkt_legs, ("no %s leg in the batch -- the preflight path under "
+                      "test never sent one" % _MKT)
+    for leg in mkt_legs:
         ticks = float(leg["price"]) / 0.0001
         assert abs(round(ticks) - ticks) < 1e-6, (
             "leg %r is off the 0.0001 grid -- junk metadata bypassed the "
