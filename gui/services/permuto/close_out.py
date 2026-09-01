@@ -42,6 +42,26 @@ class ClosePayloadError(RuntimeError):
     """The account payload was a shape we do not understand."""
 
 
+def _raise_if_unreadable(unreadable: list) -> None:
+    """One check both position shapes go through.
+
+    [review] Dropping a row silently also drops the FACT that the account
+    was incomplete: with every row unreadable the operator is told "no
+    open positions", and with one unreadable that exposure vanishes from
+    the confirmation plan. Neither is survivable on a control someone
+    reaches for to get out of a position.
+
+    Factored out because the dict branch recorded the list and then
+    returned without consulting it -- the list branch had the check, the
+    dict branch had the bug, and a shared helper is the only version of
+    this that cannot drift apart again.
+    """
+    if unreadable:
+        raise ClosePayloadError(
+            "could not read: %s -- refusing to plan a close against a "
+            "partial view of the account" % ", ".join(sorted(unreadable)))
+
+
 def read_positions(client: Any, now_s: float) -> dict:
     """``{market: signed_contracts}`` from the venue, right now.
 
@@ -100,9 +120,27 @@ def read_positions(client: Any, now_s: float) -> dict:
                     "-- skipping it rather than guessing", name, raw)
                 unreadable.append(name)
                 continue
-            if signed == 0.0 or math.isnan(signed):
+            if not math.isfinite(signed):
+                # [review] NaN and infinity were dropped silently here
+                # while the LIST branch raised on the same class of junk.
+                # One shape failing closed and the other failing open is
+                # worse than either rule applied consistently: the
+                # operator cannot tell which they got.
+                _log.warning(
+                    "permuto: position for %s is %r, which is not finite",
+                    name, raw)
+                unreadable.append(name)
+                continue
+            if signed == 0.0:
                 continue
             out[name] = signed
+        # [review] And CHECK it. This branch recorded `unreadable` and then
+        # returned without looking, so {"A": "lots", "B": -5} produced a
+        # confirmation showing only B -- a partial view of the account on
+        # an emergency close path, which is the fifth variant of the same
+        # fail-open in this one function. Both shapes now go through the
+        # single check below.
+        _raise_if_unreadable(unreadable)
         return out
 
     if not isinstance(rows, list):
@@ -133,16 +171,7 @@ def read_positions(client: Any, now_s: float) -> dict:
                 "read -- skipping it rather than guessing its direction",
                 market, row.get("side"))
             unreadable.append(market)
-    if unreadable:
-        # [review] Dropping the rows silently also drops the FACT that the
-        # account was incomplete. If every row is unreadable the operator
-        # is told "no open positions"; if one is, that exposure simply
-        # vanishes from the confirmation plan. Neither is survivable on a
-        # control someone reaches for to get out.
-        raise ClosePayloadError(
-            "could not read the direction of: %s -- refusing to plan a "
-            "close against a partial view of the account"
-            % ", ".join(sorted(unreadable)))
+    _raise_if_unreadable(unreadable)
     return out
 
 

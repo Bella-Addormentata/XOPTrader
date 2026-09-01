@@ -237,9 +237,28 @@ def test_an_unreadable_shape_raises_rather_than_reading_as_empty():
         read_positions(_Client("nonsense"), 0.0)
 
 
-def test_a_non_numeric_dict_value_is_skipped_not_guessed():
+def test_a_non_numeric_dict_value_FAILS_the_plan():
+    """[review] Skipping it produced a partial view of the account.
+
+    {"A": "lots", "B": -5} yielded a confirmation showing only B -- and if
+    A were the only row, "no open positions". The LIST branch already
+    raised on the same class of junk; the dict branch recorded the row as
+    unreadable and then returned without ever consulting the list. Both
+    shapes now go through one shared check, because two copies of this
+    rule is how they drifted apart in the first place.
+    """
     c = _Client({"positions": {"A": "lots", "B": -5.0}})
-    assert read_positions(c, 0.0) == {"B": -5.0}
+    with pytest.raises(ClosePayloadError):
+        read_positions(c, 0.0)
+
+
+def test_a_non_finite_dict_value_FAILS_the_plan():
+    """NaN and infinity were dropped silently while the list branch
+    raised. One shape failing closed and the other failing open is worse
+    than either rule applied consistently."""
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ClosePayloadError):
+            read_positions(_Client({"positions": {"A": bad}}), 0.0)
 
 
 def test_http_200_with_a_rejection_is_not_a_successful_close():

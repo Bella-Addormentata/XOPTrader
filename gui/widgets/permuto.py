@@ -516,10 +516,15 @@ class _CloseWorker(QObject):
     one-shot button that reports what it did afterwards is not a decision,
     it is a surprise.
 
-    In send mode the worker receives the legs that were already approved by
-    the operator.  It re-reads the fresh venue position and clamps each leg
-    to it before sending, so the actual order can never exceed or differ
-    from what was confirmed on screen.
+    In send mode the worker receives the legs the operator approved, then
+    re-reads the fresh venue position and clamps each leg to it.
+
+    [review] The invariant is NO LARGER and NO DIFFERENT SIDE -- not "never
+    differs". Clamping can legitimately send LESS than was confirmed, or
+    skip a market entirely, when the position shrank, went flat or flipped
+    while the dialog was open. Stating it as "never differ" promised
+    something send_close() does not do, and on a safety contract the
+    wording is the contract.
     """
 
     planned = Signal(object)      # (legs, summary)
