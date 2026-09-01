@@ -43,7 +43,8 @@ from .auth import PermutoAuthError
 from .batch import BatchError, build_upsert_batch
 from .client import PermutoNotLinked
 from .orders import Side, depth_credit_usd, quote_ladder
-from .quoting import LoopAction, RestingQuote, VenueView, decide
+from .quoting import (REQUOTE_AT_RING_FRACTION, LoopAction,
+                      RestingQuote, VenueView, decide)
 from .risk import MarginState, RiskAction, assess, skewed_reference
 from .band_guard import VENUE_BAND_PCT, BandGuard
 from .cross_backoff import CrossBackoff, headroom_pct
@@ -94,6 +95,32 @@ BATCH_ACCEPTED = ("batch_ok", "batch_partial", "batch_upserted")
 #: reclassify a genuine refusal as success and record orders the venue may
 #: have rolled back. Legs are evidence only when the envelope is UNKNOWN.
 BATCH_REJECTED = ("batch_failed", "batch_rejected", "error")
+
+
+def _requote_safe_backoff(ring_pct: float, half_spread_pct: float,
+                          skew_frac_abs: float, tick_frac: float) -> float:
+    """The most backoff this leg can carry and still rest.
+
+    [review] Bounded by BOTH constraints, because satisfying one and
+    failing the other still costs the quote:
+
+      * the credit RING -- outside it the leg earns nothing, so retreating
+        past it turns a rejected leg into a resting worthless one;
+      * the RE-QUOTE TRIGGER -- decide() replaces any leg further than
+        ring * REQUOTE_AT_RING_FRACTION from the oracle, so a leg born
+        past it is cancelled and replaced every tick, forever.
+
+    Computed from the CURRENT skew rather than whatever held when the
+    offset was learned. An offset learned while flat is not legal after a
+    fill: 1.607% at oracle 0.07 becomes a 2.857% ask once skew reaches
+    0.95%, outside the ring entirely.
+    """
+    ring_room = headroom_pct(ring_pct, half_spread_pct, skew_frac_abs,
+                             tick_frac)
+    trigger_budget = ring_pct * REQUOTE_AT_RING_FRACTION * 0.8
+    trigger_room = (trigger_budget - abs(half_spread_pct)
+                    - abs(skew_frac_abs) * 100.0)
+    return max(0.0, min(ring_room, trigger_room))
 
 
 def _effective_tick(raw, default: float = 0.0001) -> float:
@@ -938,8 +965,19 @@ class QuoteRunner:
             ladder = quote_ladder(
                 market, reference, depth_usd,
                 levels=1,
-                first_offset_pct=(self._half_spread_pct
-                                  + self._cross_backoff.offset_pct(market)),
+                # [review] Capped against CURRENT headroom and the
+                # re-quote trigger, not applied raw. See
+                # _requote_safe_backoff: an offset learned under wider
+                # headroom is illegal after a fill raises skew, and one
+                # inside the ring but past the trigger is replaced on the
+                # next tick -- the churn the budget exists to stop.
+                first_offset_pct=(
+                    self._half_spread_pct
+                    + min(self._cross_backoff.offset_pct(market),
+                          _requote_safe_backoff(
+                              self._ring_pct, self._half_spread_pct,
+                              self._last_skew.get(market, 0.0),
+                              self._last_tick_frac.get(market, 0.0)))),
                 ring_pct=self._ring_pct,
                 tick_size=_tick,
                 lot_size=spec.get("lot_size", 1.0),

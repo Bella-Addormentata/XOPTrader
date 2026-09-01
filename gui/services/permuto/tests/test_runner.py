@@ -2008,15 +2008,30 @@ def test_widened_quote_with_max_skew_still_stays_inside_the_ring():
     before the tick-reservation fix it landed at 2.0467%.
     """
     oracle = _ORACLE[_MKT]
-    # max_position = max_position_usd / oracle = 7.0 / 0.07 = 100 contracts.
-    # position = 100 => fraction = 1.0 => |skew| = max_price_skew_frac ≈ 0.96%.
-    c = _Client(account=_account(100.0), batch_response=_venue_cross((0, 1)))
+    # [review] A SHORT just BELOW the cap, not a long AT it.
+    #
+    # The first version used +100 against a 100-contract cap, which hits
+    # the limit exactly -> REDUCE_ONLY -> the sell leg alone. And for a
+    # LONG the skew is negative, so that lone sell is the LEADING leg,
+    # moving toward the oracle. The TRAILING leg -- the one whose skew and
+    # offset compound outward, which is the entire failure mode -- was
+    # never emitted, so the assertion held even under the old additive
+    # bound. It could not have caught what it was written for.
+    #
+    # A short at 95 of 100 keeps both sides quoting and gives the ASK
+    # near-maximum POSITIVE skew, which is the leg that leaves the ring.
+    c = _Client(account=_account(-95.0), batch_response=_venue_cross((0, 1)))
     r = _runner(c, curfew_enabled=True, max_position_usd=7.0)
     for i in range(20):                       # drive the backoff to its cap
         r._resting = {}
         r.tick(_MID_SESSION + i * 5.0, _ORACLE, {})
     assert r._cross_backoff.offset_pct(_MKT) > 0.0, \
         "backoff never fired -- test is not exercising the combined case"
+    sides = {leg["side"] for leg in c.last_batch}
+    assert sides == {"buy", "sell"}, (
+        "expected a two-sided book so the TRAILING leg is exercised, got "
+        "%r" % (sides,))
+    assert max(float(l["price"]) for l in c.last_batch) > oracle,         "the ask is not the trailing leg -- positive skew was expected"
     for leg in c.last_batch:
         dev = abs(float(leg["price"]) / oracle - 1.0) * 100.0
         assert dev <= 2.0 + 1e-9, (
@@ -2072,3 +2087,29 @@ def test_junk_tick_metadata_cannot_disable_the_backoff():
     flags = {"specs": {_MKT: {"tick_size": float("nan"), "lot_size": 1.0}}}
     r.tick(_MID_SESSION, _ORACLE, flags)
     assert r._cross_backoff.offset_pct(_MKT) > 0.0,         "junk tick metadata cleared the backoff instead of falling back"
+
+
+def test_the_runner_APPLIES_the_backoff_cap_not_just_computes_it():
+    """[review] The helper being correct proves nothing on its own.
+
+    Capping at the LADDER is the part that matters. Coverage that only
+    exercises _requote_safe_backoff leaves the call site free to apply the
+    raw learned offset -- and removing the cap there kept all 625 tests
+    green, which is exactly how this class of gap keeps surviving.
+    """
+    from gui.services.permuto.quoting import REQUOTE_AT_RING_FRACTION
+
+    oracle = _ORACLE[_MKT]
+    c = _Client(account=_account(0.0), batch_response=_venue_ok())
+    r = _runner(c, curfew_enabled=False, max_position_usd=250_000.0)
+    r._cross_backoff._pct[_MKT] = 5.0        # far past ring and trigger
+    r.tick(_MID_SESSION, _ORACLE, {})
+    assert c.last_batch, "no batch to inspect"
+
+    trigger = 2.0 * REQUOTE_AT_RING_FRACTION
+    for leg in c.last_batch:
+        out = abs(float(leg["price"]) / oracle - 1.0) * 100.0
+        assert out <= trigger + 1e-6, (
+            "leg %r sits %.3f%% from the oracle, past the %.2f%% re-quote "
+            "trigger -- the learned backoff was applied uncapped"
+            % (leg, out, trigger))
