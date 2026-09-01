@@ -113,6 +113,72 @@ namespace xop::bookside {
     return a > b ? a : b;
 }
 
+/// What Step 8's two BBO sanity guards may reference, given a per-side
+/// verdict.  Pure, so the branch table can be driven by a test instead of
+/// by an Engine -- which nothing in cpp/tests constructs.
+///
+/// [review round 5] THIS EXISTS BECAUSE A REGRESSION SHIPPED HERE THROUGH
+/// FOUR REVIEW ROUNDS AND 1000 GREEN TESTS.
+///
+/// Check 1 compares the PUBLISHED mid against the BBO midpoint.  For a
+/// pair with no CEX or AMM leg those are the SAME NUMBER, so its deviation
+/// is identically zero and it never fires.  An earlier revision re-pointed
+/// it at the surviving side when the other was disqualified, on the false
+/// premise that its input was Step 7's fair-value centre.  On the live
+/// XCH/BYC book that turned 0% into |3.24975 - 1.5|/1.5 = 116.7% and
+/// cleared every tier on every block.
+///
+/// The distinction that matters, and the reason these two guards must be
+/// treated differently:
+///
+///   * CHECK 1 reads a BOOK-DERIVED AGGREGATE on both sides of the
+///     comparison.  Both operands move together with the book, so no
+///     substitution makes the deviation meaningful.  It can only be RUN
+///     or SKIPPED.
+///   * CHECK 2 reads OUR OWN TIER PRICE against a book reference.  The
+///     tier price comes from Step 7's centre, so re-anchoring the
+///     reference to that same centre compares like with like.  It CAN be
+///     re-referenced, and should be.
+struct Step8References {
+    bool run_mid_check{true};   ///< Check 1: run it, or skip entirely.
+    double bid_tier_ref{0.0};   ///< Check 2 reference for bid tiers.
+    double ask_tier_ref{0.0};   ///< Check 2 reference for ask tiers.
+    double effective_mid{0.0};  ///< midpoint classify_tier should use.
+};
+
+/// @param bid_ok/ask_ok  Per-side verdicts from classify_sides.
+/// @param side_ref       book_side_ref -- the anchor the verdict used.
+///                       0 when nothing screened the book.
+/// @param bbo_mid        The BBO midpoint (Check 1's only valid reference).
+/// @param best_bid/best_ask  Same-side touches, > 0.
+[[nodiscard]] inline Step8References step8_references(
+    bool   bid_ok,
+    bool   ask_ok,
+    double side_ref,
+    double bbo_mid,
+    double best_bid,
+    double best_ask) noexcept
+{
+    Step8References r{};
+    const bool healthy   = bid_ok && ask_ok;
+    const bool has_anchor = side_ref > 0.0 && std::isfinite(side_ref);
+
+    // Check 1 runs ONLY on a book whose sides both stand. Never re-pointed:
+    // see the note above -- re-pointing is what produced the 116.7%.
+    r.run_mid_check = healthy;
+
+    // The midpoint classify_tier uses for its bid passive rule. A midpoint
+    // built from a disqualified side would read any bid up to that poisoned
+    // value as a safe passive rest.
+    r.effective_mid = (healthy || !has_anchor) ? bbo_mid : side_ref;
+
+    // Per-tier references: a tier whose OWN side is disqualified is judged
+    // against the independent anchor instead.
+    r.bid_tier_ref = (!bid_ok && has_anchor) ? side_ref : best_bid;
+    r.ask_tier_ref = (!ask_ok && has_anchor) ? side_ref : best_ask;
+    return r;
+}
+
 /// Verdict for one dust-filtered book.  Both sides default to trusted:
 /// absence of evidence against a side is not evidence against it, and the
 /// no-anchor case must leave every consumer exactly where it was.

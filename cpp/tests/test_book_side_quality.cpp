@@ -193,6 +193,99 @@ TEST(BookSideQuality, a_collapsed_side_is_disqualified_the_same_way_as_a_spiked_
     EXPECT_FALSE(q.bid_ok);
 }
 
+// -- Step 8 reference selection: the regression that shipped ----------------
+//
+// [review round 5] Four review rounds and 1000 green tests missed a change
+// here that turned a check which never fired into one that cleared every
+// tier on every block. Nothing in cpp/tests constructs an Engine, so Step 8
+// had no coverage at all. These pin the branch table directly.
+
+namespace {
+// The live XCH/BYC book, 2026-08-30/09-01.
+constexpr double kS8Bid  = 1.5000;
+constexpr double kS8Ask  = 4.9995;
+constexpr double kS8Mid  = (kS8Bid + kS8Ask) / 2.0;   // 3.24975
+}  // namespace
+
+TEST(Step8References, CheckOneIsSkippedNotRepointedWhenASideIsDisqualified)
+{
+    // THE REGRESSION, pinned. Re-pointing Check 1 at the surviving bid gave
+    // |3.24975 - 1.5| / 1.5 = 116.7% against a 50% cap -- clearing every
+    // tier on every block, on the very pair this feature exists for.
+    const auto r = xop::bookside::step8_references(
+        /*bid_ok=*/true, /*ask_ok=*/false, kAnchor, kS8Mid, kS8Bid, kS8Ask);
+
+    EXPECT_FALSE(r.run_mid_check)
+        << "Check 1 must be SKIPPED on a disqualified side, never re-pointed: "
+           "both its operands are book-derived and move together";
+
+    // Demonstrate the arithmetic the skip avoids, so the reason survives
+    // even if someone later doubts the comment.
+    const double repointed_dev = std::abs(kS8Mid - kS8Bid) / kS8Bid;
+    EXPECT_GT(repointed_dev, 1.0)
+        << "sanity: re-pointing really would produce >100% deviation";
+}
+
+TEST(Step8References, CheckOneRunsNormallyOnAHealthyBook)
+{
+    const auto r = xop::bookside::step8_references(
+        true, true, kAnchor, kS8Mid, kS8Bid, kS8Ask);
+    EXPECT_TRUE(r.run_mid_check);
+    EXPECT_DOUBLE_EQ(r.effective_mid, kS8Mid) << "healthy: untouched";
+    EXPECT_DOUBLE_EQ(r.bid_tier_ref, kS8Bid);
+    EXPECT_DOUBLE_EQ(r.ask_tier_ref, kS8Ask);
+}
+
+TEST(Step8References, CheckTwoReReferencesOnlyTheDisqualifiedSide)
+{
+    // Check 2 CAN be re-referenced -- it compares our own tier price, which
+    // is built around the same centre the anchor represents, so this is
+    // like-for-like. The healthy side keeps its own touch.
+    const auto ask_bad = xop::bookside::step8_references(
+        true, false, kAnchor, kS8Mid, kS8Bid, kS8Ask);
+    EXPECT_DOUBLE_EQ(ask_bad.bid_tier_ref, kS8Bid) << "honest side untouched";
+    EXPECT_DOUBLE_EQ(ask_bad.ask_tier_ref, kAnchor) << "junk side re-anchored";
+
+    const auto bid_bad = xop::bookside::step8_references(
+        false, true, kAnchor, kS8Mid, kS8Bid, kS8Ask);
+    EXPECT_DOUBLE_EQ(bid_bad.bid_tier_ref, kAnchor);
+    EXPECT_DOUBLE_EQ(bid_bad.ask_tier_ref, kS8Ask);
+}
+
+TEST(Step8References, TheEffectiveMidpointMovesOffAPoisonedBook)
+{
+    // classify_tier's bid passive rule reads the midpoint. Left at 3.24975
+    // it would read any bid up to 3.24975 as a safe passive rest -- against
+    // a fair value of ~1.41.
+    const auto r = xop::bookside::step8_references(
+        true, false, kAnchor, kS8Mid, kS8Bid, kS8Ask);
+    EXPECT_DOUBLE_EQ(r.effective_mid, kAnchor);
+    EXPECT_LT(r.effective_mid, kS8Mid);
+}
+
+TEST(Step8References, WithoutAnAnchorNothingIsSubstituted)
+{
+    // A disqualification cannot occur without an anchor, but the fallback is
+    // written out rather than assumed: substituting a zero would be worse
+    // than any book.
+    for (const double ref : {0.0, -1.0, kNaN}) {
+        const auto r = xop::bookside::step8_references(
+            true, false, ref, kS8Mid, kS8Bid, kS8Ask);
+        EXPECT_DOUBLE_EQ(r.effective_mid, kS8Mid);
+        EXPECT_DOUBLE_EQ(r.ask_tier_ref, kS8Ask);
+        EXPECT_DOUBLE_EQ(r.bid_tier_ref, kS8Bid);
+    }
+}
+
+TEST(Step8References, BothSidesDisqualifiedStillSkipsCheckOne)
+{
+    const auto r = xop::bookside::step8_references(
+        false, false, kAnchor, kS8Mid, kS8Bid, kS8Ask);
+    EXPECT_FALSE(r.run_mid_check);
+    EXPECT_DOUBLE_EQ(r.bid_tier_ref, kAnchor);
+    EXPECT_DOUBLE_EQ(r.ask_tier_ref, kAnchor);
+}
+
 // -- The derived bypass threshold -------------------------------------------
 
 TEST(BookSideQuality, bypass_threshold_can_never_be_stricter_than_the_gate)

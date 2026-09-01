@@ -24,6 +24,7 @@
 #include "xop/execution/exposure_gate.hpp"
 #include "xop/execution/fair_value_solver.hpp"
 #include "xop/execution/par_anchor.hpp"
+#include "xop/execution/book_side_quality.hpp"
 #include "xop/execution/mid_gate.hpp"
 #include "xop/risk/valuation_authority.hpp"
 #include "xop/risk/usd_route.hpp"
@@ -10163,8 +10164,19 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 // independent anchor can disqualify), but the fallback is
                 // written out rather than assumed: a silent 0 here would
                 // divide by zero below.
+                // [review round 5] The branch table now lives in
+                // bookside::step8_references, so it is driven by tests
+                // rather than by an Engine -- nothing in cpp/tests
+                // constructs one, which is exactly how the re-pointing
+                // regression reached production through four review rounds.
+                const auto s8 = bookside::step8_references(
+                    bid_ok, ask_ok,
+                    static_cast<double>(side_ref),
+                    static_cast<double>(bbo_mid_m),
+                    static_cast<double>(best_bid),
+                    static_cast<double>(best_ask));
                 const Mojo eff_bbo_mid =
-                    (bid_ok && ask_ok) || side_ref <= 0 ? bbo_mid_m : side_ref;
+                    static_cast<Mojo>(std::llround(s8.effective_mid));
 
                 // Check 1: Model mid vs BBO sanity
                 //
@@ -10199,8 +10211,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 // refuses to invent a comparison the numbers cannot
                 // support.
                 if (mid > 0) {
-                    const bool c1_run = bid_ok && ask_ok;
-                    if (c1_run) {
+                    if (s8.run_mid_check) {
                         const double mid_dev = std::abs(
                             static_cast<double>(mid)
                             - static_cast<double>(bbo_mid_m))
@@ -10244,12 +10255,9 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                         // uses the midpoint for the bid passive rule, so a
                         // poisoned 3.24975 would read any bid up to 3.24975
                         // as a safe passive rest.
-                        const bool side_ok =
-                            (tier.side == Side::Bid) ? bid_ok : ask_ok;
-                        const Mojo own_side =
-                            (tier.side == Side::Bid) ? best_bid : best_ask;
-                        const Mojo ref =
-                            (!side_ok && side_ref > 0) ? side_ref : own_side;
+                        const Mojo ref = static_cast<Mojo>(std::llround(
+                            tier.side == Side::Bid ? s8.bid_tier_ref
+                                                   : s8.ask_tier_ref));
                         const auto verdict = strategy::classify_tier(
                             tier.side != Side::Bid,
                             static_cast<double>(tier.price),
