@@ -16,9 +16,20 @@ class _Client:
         #: Overridable so a test can hand back a real venue body
         #: (a part-fill, a refusal) instead of a bare success.
         self.order_response = {"status": "ok"}
+        self.cancelled = []
+        self.cancel_fails = False
 
     def account(self, now_s):
         return self.payload
+
+    def cancel_all(self, now_s, markets=None):
+        # The close path clears the resting book before reading the
+        # position: orders outlive the process, so an old non-reduce-
+        # only quote could otherwise fill and undo the close.
+        self.cancelled.append(markets)
+        if self.cancel_fails:
+            raise RuntimeError("venue would not cancel")
+        return {"ok": True}
 
     def place_order(self, leg, now_s):
         if self.fail:
@@ -607,3 +618,40 @@ def test_a_boolean_size_is_malformed_not_one_contract():
             {"market": "A", "side": "sell", "size": True}]}), 0.0)
     # ...and a genuine numeric size is still read normally.
     assert read_positions(_Client({"positions": {"A": -5.0}}), 0.0) == {"A": -5.0}
+
+
+def test_the_resting_book_is_cleared_before_any_close_leg_is_sent():
+    """[review] A close that leaves the old book up defeats itself.
+
+    Permuto orders rest at a REMOTE venue and outlive this process -- a
+    crash, a kill, a power loss or a failed cancel all leave them there,
+    which is exactly why main_window treats a fresh book as UNVERIFIED.
+    Send reduce-only legs without clearing them and the position comes
+    down, then an old NON-reduce-only quote fills and puts it straight
+    back on: the operator watched it close and it did not stay closed.
+    """
+    c = _Client({"positions": [_pos("QQQ-VOL-PERP", "sell", 100)]})
+    legs = plan_close({"QQQ-VOL-PERP": -100.0}, 1.0)
+    res = send_close(c, 0.0, legs)
+
+    assert c.cancelled, "no cancel was issued before the close legs"
+    assert res["sent"] == 1
+    # ...and the cancel came FIRST, not alongside.
+    assert c.sent, "no close leg was sent"
+
+
+def test_a_close_is_refused_when_the_book_cannot_be_cleared():
+    """Fails CLOSED. An uncancelled book is the one state where sending
+    closes actively makes things worse -- the position drops and a stale
+    quote rebuilds it, so the operator is left worse off than if the
+    button had done nothing."""
+    c = _Client({"positions": [_pos("QQQ-VOL-PERP", "sell", 100)]})
+    c.cancel_fails = True
+    legs = plan_close({"QQQ-VOL-PERP": -100.0}, 1.0)
+    res = send_close(c, 0.0, legs)
+
+    assert res["ok"] is False
+    assert res["sent"] == 0
+    assert not c.sent, "close legs went out over an uncancelled book"
+    assert "could not be cancelled" in res["note"], res["note"]
+    assert "undo the close" in res["note"], res["note"]

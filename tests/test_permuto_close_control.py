@@ -300,6 +300,15 @@ def test_quoting_starts_normally_when_no_close_is_running(monkeypatch):
         # Construction goes further than this fake supports; what matters
         # is that the guard did NOT refuse before getting there.
         pass
+
+    # [review] ASSERT IT GOT THERE. The absence of a refusal proves
+    # nothing on its own -- the blanket except above swallows any
+    # earlier regression, and a startup that died before reaching the
+    # guard also records no refusal. Only `built` distinguishes "the
+    # guard let it through" from "the guard was never consulted".
+    assert built, (
+        "startup never attempted runner construction, so this proves "
+        "nothing about the close guard: refusals=%r" % (refusals,))
     assert not [r for r in refusals if "close is in flight" in r], refusals
 
 

@@ -529,6 +529,32 @@ def send_close(client: Any, now_s: float, approved_legs: list, *,
     if not approved_legs:
         return {"ok": True, "sent": 0, "note": "no legs to send", "legs": []}
 
+    # [review] CANCEL THE BOOK FIRST, and refuse to proceed if that
+    # fails. Permuto orders rest at a REMOTE venue and outlive this
+    # process -- a crash, a kill, a power loss or a failed cancel all
+    # leave them there, which is exactly why main_window treats a fresh
+    # book as UNVERIFIED. Closing without clearing them is a control
+    # that defeats itself: the reduce-only legs go out, the position
+    # comes down, and then an old NON-reduce-only quote fills and puts
+    # it straight back on. The operator watched it close and it did not
+    # stay closed.
+    #
+    # Ordered before the fresh read as well as before the send, so the
+    # position we clamp against cannot move underneath us between the
+    # two. Fails CLOSED: an uncancelled book is the one state where
+    # sending closes actively makes things worse.
+    try:
+        client.cancel_all(now_s)
+    except Exception as exc:  # noqa: BLE001 - reported, not raised
+        _log.error("permuto: operator close could not clear the resting "
+                   "book: %s", exc)
+        return {"ok": False, "sent": 0,
+                "note": ("refusing to close: the resting book could not "
+                         "be cancelled (%s), and an old quote filling "
+                         "afterwards would undo the close" % exc),
+                "legs": approved_legs, "responses": [], "skipped": [],
+                "partial": [], "unknown": []}
+
     fresh = read_positions(client, now_s)
 
     to_send: list = []
