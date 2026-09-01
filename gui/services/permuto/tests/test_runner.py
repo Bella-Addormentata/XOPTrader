@@ -1999,7 +1999,7 @@ def test_a_frozen_oracle_after_the_bell_stops_the_runner_quoting():
     for k in range(6):                      # let the freeze detector confirm
         r.tick(t0 - 300.0 + k * 60.0, _ORACLE, {})
     res = r.tick(t0, _ORACLE, {})
-    assert res.markets.get(_MKT, ("", ""))[0] == "skip", res.markets
+    assert res.markets.get(_MKT, ("", ""))[0] == "withdraw", res.markets
     assert "not printed" in res.markets[_MKT][1], res.markets[_MKT]
 
 
@@ -2014,7 +2014,7 @@ def test_a_single_opening_print_does_not_mark_every_market_fresh():
     # NVDA prints; QQQ is still frozen at the opening price.
     res = r.tick(t0, {_MKT: _BOTH[_MKT], _MKT2: _BOTH[_MKT2] + 0.0001}, {})
 
-    assert res.markets.get(_MKT, ("", ""))[0] == "skip", res.markets
+    assert res.markets.get(_MKT, ("", ""))[0] == "withdraw", res.markets
     assert "not printed" in res.markets[_MKT][1], res.markets[_MKT]
     assert res.markets.get(_MKT2, ("", ""))[0] == "quote", res.markets
     assert getattr(c, "last_batch", None), "no quote sent for the fresh market"
@@ -2078,3 +2078,51 @@ def test_widening_leaves_enough_skew_to_move_a_real_price():
     assert ceiling * oracle > 2 * tick, (
         "a full skew moves the price %.6f, under two ticks -- inventory "
         "leaning would round away" % (ceiling * oracle))
+
+
+def test_a_stale_open_RETRACTS_a_resting_quote_not_just_declines_to_place():
+    """[review] Declining to place is not enough when one is already there.
+
+    The quoting loop only visits markets decide() marked QUOTE, and a
+    healthy resting book reconciles as HOLD. So when the clock enters
+    SETTLING with the oracle still frozen, the effective curfew stage stays
+    PREOPEN, no stage-change cancellation fires, and the stale order simply
+    stays live into the opening gap -- waiting to be filled by the very
+    move the posture exists to avoid.
+    """
+    c = _Client(account=_account(0.0), batch_response=_venue_ok(),
+                open_orders={"orders": [
+                    {"market": _MKT, "side": "buy", "price": 0.0698,
+                     "size": 100},
+                    {"market": _MKT, "side": "sell", "price": 0.0702,
+                     "size": 100}]})
+    r = _runner(c, curfew_enabled=True)
+    t0 = OPENS_UTC[0] + 60.0
+    for k in range(6):                      # let the freeze detector confirm
+        r.tick(t0 - 300.0 + k * 60.0, _ORACLE, {})
+    c.calls.clear()
+    res = r.tick(t0, _ORACLE, {})
+    assert res.markets.get(_MKT, ("", ""))[0] == "withdraw", res.markets
+    assert "cancel_all" in c.calls,         "a stale resting quote was left live into the opening gap"
+
+
+def test_the_exit_window_holds_its_book_rather_than_retracting():
+    """EXIT declines to place but must NOT pull what is resting.
+
+    The danger is the OPEN, not the close, and a resting pair keeps
+    earning depth credit right up to the bell. Retracting here would
+    forfeit that for no safety gain -- which is why `withdraw` is a
+    separate flag from `quote` rather than the same one.
+    """
+    c = _Client(account=_account(0.0), batch_response=_venue_ok(),
+                open_orders={"orders": [
+                    {"market": _MKT, "side": "buy", "price": 0.0698,
+                     "size": 100},
+                    {"market": _MKT, "side": "sell", "price": 0.0702,
+                     "size": 100}]})
+    r = _runner(c, curfew_enabled=True)
+    exit_t = CLOSES_UTC[0] - 300.0
+    r.tick(exit_t - 60.0, _ORACLE, {})
+    c.calls.clear()
+    r.tick(exit_t, _ORACLE, {})
+    assert "cancel_all" not in c.calls,         "EXIT retracted a resting book it should have left earning"

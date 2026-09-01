@@ -15,6 +15,7 @@ from gui.services.permuto.curfew import (
     EXIT_START_S,
     OPENS_UTC,
     OVERNIGHT_LONG_FRACTION,
+    FREEZE_CONFIRM_S,
     OVERNIGHT_SHORT_FRACTION,
     RAMP_START_S,
     SETTLE_AFTER_OPEN_S,
@@ -416,3 +417,34 @@ def test_the_frozen_posture_lifts_once_the_oracle_prints():
     moving = _at(MON_OPEN + 60.0, frozen=False)
     assert moving.stage is Stage.SETTLING
     assert moving.short_cap_usd > 0.0
+
+
+def test_a_first_sighting_is_not_a_print():
+    """[review] Cold start during SETTLING.
+
+    Seeding used to go through the inequality -- None != value -- and so
+    stamped the market as having just moved. A runner started after the
+    bell then read a frozen pre-open oracle as FRESH for the whole
+    confirm_s window and quoted against it, which is exactly the
+    stale-price case the freshness gate exists to catch.
+    """
+    f = OracleFreeze()
+    f.observe(1000.0, {"QQQ-VOL-PERP": 0.07})
+    assert f.market_frozen("QQQ-VOL-PERP", 1000.0) is True,         "a first sighting was treated as evidence the market is printing"
+    # Still frozen a moment later: nothing has moved.
+    assert f.market_frozen("QQQ-VOL-PERP", 1060.0) is True
+
+
+def test_an_actual_change_is_what_marks_a_market_fresh():
+    f = OracleFreeze()
+    f.observe(1000.0, {"QQQ-VOL-PERP": 0.07})
+    f.observe(1010.0, {"QQQ-VOL-PERP": 0.08})        # a real print
+    assert f.market_frozen("QQQ-VOL-PERP", 1010.0) is False
+    # And it goes stale again once confirm_s passes with no further move.
+    assert f.market_frozen("QQQ-VOL-PERP", 1010.0 + FREEZE_CONFIRM_S) is True
+
+
+def test_an_unseen_market_is_frozen_not_fresh():
+    """Unknown freshness must tighten: never having seen a market move is
+    not evidence that it does."""
+    assert OracleFreeze().market_frozen("NEVER-SEEN", 1000.0) is True

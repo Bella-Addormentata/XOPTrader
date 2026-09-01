@@ -98,6 +98,13 @@ class Profile:
     quote: bool
     spread_mult: float
     depth_mult: float
+    #: True when a quote already RESTING must be pulled, not merely not
+    #: replaced. [review] These are different needs and conflating them
+    #: gets one of them wrong: EXIT wants to stop ADDING inventory while
+    #: the existing book keeps earning into a close that is not dangerous,
+    #: whereas a stale oracle after the bell means the resting order is
+    #: itself the exposure and has to come off.
+    withdraw: bool
     reason: str
 
 
@@ -115,6 +122,9 @@ def profile_for(stage: Stage, *, oracle_fresh: bool = True) -> Profile:
     if stage is Stage.EXIT:
         return Profile(
             quote=False, spread_mult=SESSION_SPREAD_MULT, depth_mult=0.0,
+            # Hold what is on: the danger is the OPEN, not the close, and
+            # a resting book keeps earning credit until the bell.
+            withdraw=False,
             reason="last minutes before the close: no new quotes, and "
                    "inventory carried past the bell costs the overnight "
                    "window, which is where depth is actually earned")
@@ -122,6 +132,10 @@ def profile_for(stage: Stage, *, oracle_fresh: bool = True) -> Profile:
     if stage is Stage.SETTLING and not oracle_fresh:
         return Profile(
             quote=False, spread_mult=SESSION_SPREAD_MULT, depth_mult=0.0,
+            # PULL IT. The resting order is the exposure here -- it sits
+            # against a price the bell has already invalidated, waiting for
+            # the gap to fill it.
+            withdraw=True,
             reason="the bell has rung but the oracle has not printed; "
                    "quoting against a frozen price after the open is the "
                    "stale-price trap, not the start of a session")
@@ -130,6 +144,7 @@ def profile_for(stage: Stage, *, oracle_fresh: bool = True) -> Profile:
         return Profile(
             quote=True, spread_mult=CLOSED_SPREAD_MULT,
             depth_mult=_DEPTH[Stage.CLOSED],
+            withdraw=False,
             reason="frozen oracle: the ring does not move, so a resting "
                    "two-sided book earns without drift risk. This is the "
                    "cheapest depth of the week")
@@ -138,11 +153,13 @@ def profile_for(stage: Stage, *, oracle_fresh: bool = True) -> Profile:
         return Profile(
             quote=True, spread_mult=SESSION_SPREAD_MULT,
             depth_mult=_DEPTH[Stage.RAMP],
+            withdraw=False,
             reason="winding inventory down so we reach the close flat and "
                    "can quote both sides overnight")
 
     return Profile(
         quote=True, spread_mult=SESSION_SPREAD_MULT,
         depth_mult=_DEPTH.get(stage, 0.5),
+        withdraw=False,
         reason="open hours: the tape moves further than the band in most "
                "minutes, so quote wide and small rather than fighting it")

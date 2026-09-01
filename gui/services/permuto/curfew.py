@@ -297,7 +297,19 @@ class OracleFreeze:
             return
         changed = False
         for market, value in oracles.items():
-            if self._last.get(market) != value:
+            if market not in self._last:
+                # [review] A FIRST SIGHTING IS NOT A PRINT. Seeding used to
+                # go through the inequality below -- None != value -- and so
+                # stamped the market as having just moved. A runner started
+                # during SETTLING then read a frozen pre-open oracle as
+                # fresh for the whole confirm_s window and quoted against
+                # it, which is the exact cold-start case the freshness gate
+                # exists to catch. Seed the comparison state only;
+                # market_frozen() treats an unseen market as FROZEN, which
+                # is the safe direction to be wrong in.
+                self._last[market] = value
+                continue
+            if self._last[market] != value:
                 changed = True
                 self._changed_at_by_market_s[market] = now_s
             self._last[market] = value

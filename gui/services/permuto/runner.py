@@ -840,6 +840,47 @@ class QuoteRunner:
             if not any_quoted:
                 return TickResult("withdraw", worst.reason, results)
 
+        # [MODES review] A withdrawing posture must RETRACT, not merely
+        # decline to place -- and it has to happen HERE, above the
+        # not-any_quoted early returns.
+        #
+        # The case that exposed it: the clock enters SETTLING while the
+        # oracle is still frozen. The effective curfew stage stays PREOPEN,
+        # so no stage-change cancellation fires; decide() says HOLD because
+        # the resting quote is fine on its own terms; the tick returns
+        # "all markets resting and in ring" -- and the stale order sits
+        # there waiting for the opening gap to fill it. A guard further
+        # down was never reached, which is the whole reason this is a
+        # separate pass over EVERY market rather than a branch inside the
+        # quoting loop.
+        #
+        # Only `withdraw` profiles do this. EXIT also declines to quote but
+        # wants its book left alone: the danger is the OPEN, not the close,
+        # and a resting pair keeps earning credit until the bell.
+        pull = [m for m in self._markets
+                if (profile_by_market.get(m) is not None
+                    and profile_by_market[m].withdraw
+                    and not self._resting.get(m, RestingQuote()).empty)]
+        for market in self._markets:
+            wprofile = profile_by_market.get(market)
+            if wprofile is not None and wprofile.withdraw:
+                results[market] = ("withdraw", wprofile.reason)
+        if pull:
+            reason = profile_by_market[pull[0]].reason
+            _log.warning("permuto: withdrawing %s -- %s",
+                         ", ".join(sorted(pull)), reason)
+            try:
+                self._client.cancel_all(now_s, sorted(pull))
+                for market in pull:
+                    self._resting[market] = RestingQuote()
+            except Exception as exc:  # noqa: BLE001 - reported, not raised
+                _log.error("permuto: could not withdraw %s: %s", pull, exc)
+                return TickResult(
+                    "error", "stale quote still resting; withdrawal "
+                    "failed: %s" % exc, results)
+            if not any_quoted:
+                return TickResult("withdraw", reason, results)
+
         if not any_quoted:
             if withdrawing:
                 return TickResult("withdraw", withdraw_reason, results)
@@ -856,6 +897,7 @@ class QuoteRunner:
 
         legs = []
         to_cancel: list = []
+
         for market, (action, _) in results.items():
             if action != LoopAction.QUOTE.value:
                 continue
