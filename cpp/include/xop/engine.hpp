@@ -91,6 +91,8 @@
 #include "xop/strategy/kappa_calibrator.hpp"
 #include "xop/strategy/market_allocator.hpp"
 #include "xop/strategy/competitiveness_pid.hpp"
+#include "xop/strategy/pid_rail_latch.hpp"
+#include "xop/strategy/pid_reachability.hpp"
 
 // New risk modules
 #include "xop/risk/loss_manager.hpp"
@@ -1672,6 +1674,13 @@ private:
         double   current_mult{1.0};      ///< Current output spread multiplier.
         uint32_t blocks_active{0};       ///< Blocks since first offer was posted.
         int      fills_this_cycle{0};    ///< Fills counted this heartbeat.
+        /// [S39] Edge detector for "the anti-windup clamp is firing and this
+        /// controller has lost authority".  The predicate is on the
+        /// INTEGRATOR rather than on current_mult, because pid_min_mult is
+        /// unreachable on the shipped config and an output-clamp predicate
+        /// would fire never on the one controller that has been railed for
+        /// 40 hours.  See cpp/include/xop/strategy/pid_rail_latch.hpp.
+        xop::strategy::PidRailLatch rail;
     };
     std::unordered_map<std::string, SpreadPidState> spread_pid_state_;
 

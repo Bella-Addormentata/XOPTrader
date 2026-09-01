@@ -17,6 +17,7 @@
 #include "xop/config.hpp"
 #include "xop/rpc/coingecko_parse.hpp"
 #include "xop/feed_listings.hpp"
+#include "xop/strategy/pid_reachability.hpp"
 
 #include <spdlog/spdlog.h>
 #include <yaml-cpp/yaml.h>
@@ -1779,6 +1780,56 @@ StrategyConfig parse_strategy(const YAML::Node& root)
     }
     if (cfg.comp_pid_min_offset > cfg.comp_pid_max_offset) {
         throw ConfigError(sec + ".comp_pid_min_offset must be <= comp_pid_max_offset");
+    }
+
+    // -- [S39] Unreachable PID clamps ------------------------------------
+    // A clamp the gains can never reach is not a safety bound, it is
+    // decoration that reads as a tuned value. config.yaml:216 ships
+    // pid_min_mult: 0.7 while the gain budget (kp*target + ki*integral_max
+    // = 0.18) floors the multiplier at 0.820 -- measured across 5,287 live
+    // ticks in which 0.820 is the minimum ever observed.
+    //
+    // WARN, NEVER THROW. The check above is a contradiction that cannot be
+    // resolved, so it refuses. This one resolves deterministically, and the
+    // config.hpp DEFAULTS carry the same problem (pid_target_fill_rate{0.10}
+    // with pid_integral_max{2.0} against pid_min_mult{0.70}), so a throw
+    // would reject a bare config, a fresh deployment, config.example.yaml --
+    // which has no pid_* keys at all -- and every load_config case in
+    // cpp/tests/test_config.cpp, whose kMinimalValidYaml has none either.
+    // Refusing to boot over a value that has never once bound would be a
+    // self-inflicted outage. The engine derives the effective clamp anyway
+    // (strategy::effective_pid_min_mult); this only tells the operator.
+    {
+        const strategy::PidGains spread_gains{
+            cfg.pid_kp, cfg.pid_ki, cfg.pid_kd, cfg.pid_target_fill_rate,
+            cfg.pid_ema_alpha, cfg.pid_integral_max, cfg.pid_warmup_blocks};
+        strategy::PidReachabilityFinding f{};
+        if (strategy::spread_pid_min_mult_is_unreachable(
+                cfg.pid_min_mult, spread_gains, f)) {
+            spdlog::warn("[Config] {}.pid_min_mult ({:.3f}) is UNREACHABLE: "
+                         "the gain budget kp*target + ki*integral_max = "
+                         "{:.4f} floors the multiplier at {:.3f}, so this "
+                         "clamp can never bind. Set it to {:.3f} or widen the "
+                         "gains -- as written it reads as a tuned safety "
+                         "bound and is not one.",
+                         sec, f.configured, f.authority, f.reachable,
+                         f.reachable);
+        }
+
+        const strategy::PidGains comp_gains{
+            cfg.comp_pid_kp, cfg.comp_pid_ki, cfg.comp_pid_kd,
+            cfg.comp_pid_target_fill_rate, cfg.comp_pid_ema_alpha,
+            cfg.comp_pid_integral_max, cfg.comp_pid_warmup_blocks};
+        strategy::PidReachabilityFinding g{};
+        if (strategy::comp_pid_min_offset_is_unreachable(
+                cfg.comp_pid_min_offset, comp_gains, g)) {
+            spdlog::warn("[Config] {}.comp_pid_min_offset ({:.0f}) is "
+                         "UNREACHABLE: the gain budget {:.4f} bottoms the "
+                         "offset at {:.0f}. Widening this clamp changes "
+                         "nothing -- the floor is the gain budget, not the "
+                         "clamp.",
+                         sec, g.configured, g.authority, g.reachable);
+        }
     }
 
     return cfg;

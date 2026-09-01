@@ -673,7 +673,24 @@ Engine::Engine(const AppConfig& config, bool dry_run)
 // it exists to detect -- the 08-25 log contains a cycle recorded as "processed
 // in 14241482 ms", 3.96 hours during which nothing else on that thread ran.
 // A watchdog that can be blocked by what it watches is not a watchdog, so this
-// one shares nothing with the engine except two atomics.
+// one shares no io_context, no thread and no RPC client with the engine.
+//
+// WHAT IT DOES SHARE: LOG SINKS.  [CLIENTLOG 2026-09-01] This comment used to
+// say "shares nothing with the engine except two atomics".  That was never
+// quite true -- the second ChiaWalletRPC built below has always resolved to
+// the SAME spdlog logger object the engine's own wallet_ registered under
+// "chia.wallet", hence the same console sink and the same base_sink mutex.
+// What changed in the client_logger commit is that the shared sink list now
+// also contains main.cpp's rotating_file_sink_mt.  ChiaRPCBase::open() emits
+// three records before cancel_offers() runs, so a rotation in progress on the
+// engine thread can block this thread on that sink's mutex: bounded at roughly
+// 900 ms (9 renames x one 100 ms retry each, kMaxFiles = 9), and unbounded if
+// the volume itself stalls.  Against watchdog_stall_seconds (default 600) the
+// bounded case is 0.15% of a stall this switch already tolerates, and the
+// alternative -- a stdout-only logger for the watchdog -- would make the one
+// component whose diagnosis matters most during an incident invisible in the
+// only log that survives the restart.  The coupling is accepted deliberately;
+// see the S31 section of cpp/include/xop/util/client_logger.hpp.
 //
 // WHY THE WALLET RPC.  Cancellation needs only the wallet, and the wallet
 // stayed healthy throughout the 08-25 outage while the full node was
@@ -5114,9 +5131,26 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
                 const double output = p_term + i_term + d_term;
 
                 // Convert to multiplier: positive output -> tighten (< 1.0)
+                //
+                // [S39] The tightening clamp is DERIVED from the gain budget
+                // rather than taken raw, so the knob and the controller
+                // cannot disagree.  config.yaml ships pid_min_mult: 0.7,
+                // which these gains can never reach -- the floor is
+                // 1 - (kp*target + ki*integral_max) = 0.820.  A behavioural
+                // no-op today (the clamp is inert at 0.7 and at 0.820 alike);
+                // it starts mattering the moment the gains are retuned.
+                const xop::strategy::PidGains spread_gains{
+                    config_.strategy.pid_kp,
+                    config_.strategy.pid_ki,
+                    config_.strategy.pid_kd,
+                    config_.strategy.pid_target_fill_rate,
+                    config_.strategy.pid_ema_alpha,
+                    config_.strategy.pid_integral_max,
+                    config_.strategy.pid_warmup_blocks};
                 pid.current_mult = std::clamp(
                     1.0 - output,
-                    config_.strategy.pid_min_mult,
+                    xop::strategy::effective_pid_min_mult(
+                        config_.strategy.pid_min_mult, spread_gains),
                     config_.strategy.pid_max_mult);
 
                 // Update integral with anti-windup clamp.
@@ -5126,6 +5160,50 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
                     config_.strategy.pid_integral_max);
 
                 pid.prev_error = error;
+
+                // [S39] Report the rail as an EDGE, plus an hourly heartbeat.
+                // Both PIDs have sat at their most aggressive value for the
+                // whole retained log window and nothing said so.  A
+                // level-triggered warning is useless here: the live log
+                // already carries 3,129 warnings in 5.4h from 18 distinct
+                // messages.  The heartbeat is not optional either -- the one
+                // existing edge-triggered warn in this file (:3135) has no
+                // off-edge and compressed a 4h10m outage into a single unread
+                // line on 2026-08-31.
+                const auto rail_ev = pid.rail.update(
+                    pid.integral_error,
+                    config_.strategy.pid_integral_max,
+                    error,
+                    pid.blocks_active);
+                if (rail_ev == xop::strategy::RailEvent::Enter) {
+                    spdlog::warn("[Engine] Step 5: {} spread PID SATURATED -- "
+                                 "integral pinned at {:.2f}/{:.2f} for {} "
+                                 "blocks; it is asking for mult {:.3f} and "
+                                 "delivering {:.3f}. It is no longer "
+                                 "controlling; the fill rate ({:.4f}) is not "
+                                 "responding to it.",
+                                 pair_name, pid.integral_error,
+                                 config_.strategy.pid_integral_max,
+                                 config_.strategy.pid_warmup_blocks,
+                                 1.0 - output, pid.current_mult,
+                                 pid.ema_fill_rate);
+                } else if (rail_ev == xop::strategy::RailEvent::Exit) {
+                    spdlog::warn("[Engine] Step 5: {} spread PID recovered "
+                                 "authority after {} blocks (integral {:.2f}, "
+                                 "mult {:.3f}, ema_fill {:.4f})",
+                                 pair_name,
+                                 pid.rail.latched_blocks(pid.blocks_active),
+                                 pid.integral_error, pid.current_mult,
+                                 pid.ema_fill_rate);
+                } else if (pid.rail.heartbeat_due(pid.blocks_active)) {
+                    spdlog::warn("[Engine] Step 5: {} spread PID STILL "
+                                 "saturated -- {} blocks at the rail, mult "
+                                 "{:.3f}, ema_fill {:.4f} vs target {:.4f}",
+                                 pair_name,
+                                 pid.rail.latched_blocks(pid.blocks_active),
+                                 pid.current_mult, pid.ema_fill_rate,
+                                 config_.strategy.pid_target_fill_rate);
+                }
             }
 
             // Reset per-cycle fill counter (consumed).
@@ -5159,7 +5237,21 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
                 cpc.ema_alpha         = config_.strategy.comp_pid_ema_alpha;
                 cpc.integral_max      = config_.strategy.comp_pid_integral_max;
                 cpc.warmup_blocks     = config_.strategy.comp_pid_warmup_blocks;
-                cpc.min_offset        = config_.strategy.comp_pid_min_offset;
+                // [S39] Derived, same reason as the spread clamp above.
+                // A no-op on the shipped config (raw -3.20 rounds to -3,
+                // which equals the configured floor), and note that -3 comes
+                // out of the ROUNDING step, not the clamp: widening
+                // comp_pid_min_offset would change nothing at all.
+                cpc.min_offset        = xop::strategy::effective_comp_pid_min_offset(
+                    config_.strategy.comp_pid_min_offset,
+                    xop::strategy::PidGains{
+                        config_.strategy.comp_pid_kp,
+                        config_.strategy.comp_pid_ki,
+                        config_.strategy.comp_pid_kd,
+                        config_.strategy.comp_pid_target_fill_rate,
+                        config_.strategy.comp_pid_ema_alpha,
+                        config_.strategy.comp_pid_integral_max,
+                        config_.strategy.comp_pid_warmup_blocks});
                 cpc.max_offset        = config_.strategy.comp_pid_max_offset;
                 pid_it = comp_pid_state_.emplace(
                     pair_name,
