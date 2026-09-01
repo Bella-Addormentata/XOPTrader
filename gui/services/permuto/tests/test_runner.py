@@ -2378,8 +2378,6 @@ def test_a_withdrawn_book_never_reports_itself_as_holding(monkeypatch):
     black-box test here would pass against the bug, so the HOLD is forced
     directly rather than pretended into existence.
     """
-    import gui.services.permuto.runner as runner_mod
-
     c = _Client(account=_account(100_000.0))
     r = _runner(c, curfew_enabled=True, max_position_usd=12_000.0)
 
@@ -2390,7 +2388,7 @@ def test_a_withdrawn_book_never_reports_itself_as_holding(monkeypatch):
     assert not r._resting[_MKT].empty, "no resting book to withdraw"
 
     monkeypatch.setattr(
-        runner_mod, "decide",
+        "gui.services.permuto.runner.decide",
         lambda *a, **k: QuoteDecision(LoopAction.HOLD, "resting and in ring"))
     # The stage change whose retraction empties _resting mid-tick, after
     # decide() has already answered.
