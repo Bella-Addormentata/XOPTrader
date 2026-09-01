@@ -7,6 +7,7 @@ import pytest
 
 from gui.services.permuto.auth import PermutoAuthError
 from gui.services.permuto.client import PermutoNotLinked
+from gui.services.permuto.runner import decide as runner_decide
 from gui.services.permuto.quoting import (LoopAction, QuoteDecision,
                                           RestingQuote)
 from gui.services.permuto.risk import FLATTEN_MARGIN_UTILISATION
@@ -2834,3 +2835,83 @@ def test_a_posture_change_retracts_even_with_no_position_cap():
     assert getattr(r, "_curfew_retract_pending", False) or \
         len(getattr(c, "cancelled", []) or []) > cancels_before, (
             "a posture-only transition left the old book resting")
+
+
+def test_a_market_pinned_by_exhausted_room_says_so_and_stops_rechurning(caplog):
+    """[audit] The failure that cost ~40% of a simulated night in silence.
+
+    Overnight flow is one-directional -- buyers lift our ask, and nothing
+    sells back against a frozen oracle -- so the short room drains. When
+    it runs out the ask leg is dropped, the book goes one-sided, and
+    depth credit is min(bid, ask), so the market earns EXACTLY ZERO for
+    the rest of the night.
+
+    Two things made it invisible. assess() still reports NORMAL, because
+    the floor leaves |position| a hair BELOW the cap; and one_sided_ok
+    only recognised a ZERO cap, so decide() read the missing ask as a
+    repairable gap and returned QUOTE every tick -- ~12,600 authenticated
+    cancel+upsert pairs across one night, each replacing a quote with a
+    copy of itself, on a rate-limited route.
+    """
+    import logging
+    # A short already at the overnight cap: room for the ask is gone.
+    # -100,000 contracts at oracle 0.07 = $7,000 short, against an
+    # overnight short cap of $12,000 x 0.10 = $1,200. Room is gone.
+    c = _Client(account=_account(-100_000.0))
+    r = _runner(c, curfew_enabled=True, max_position_usd=12_000.0)
+
+    with caplog.at_level(logging.CRITICAL,
+                         logger="gui.services.permuto.runner"):
+        r.tick(_OVERNIGHT, _ORACLE, {})
+
+    assert _MKT in r._pinned_markets, "the pin was not recorded"
+    pinned = [m for m in caplog.messages if "PINNED ONE-SIDED" in m]
+    assert pinned, "a market stopped earning and nothing said so"
+    assert "ZERO depth" in pinned[0], pinned[0]
+
+    # ...and it is not re-announced on every subsequent tick.
+    caplog.clear()
+    with caplog.at_level(logging.CRITICAL,
+                         logger="gui.services.permuto.runner"):
+        r.tick(_OVERNIGHT + 60.0, _ORACLE, {})
+    assert not [m for m in caplog.messages if "PINNED ONE-SIDED" in m], (
+        "the pin is announced every tick instead of on entry")
+
+
+def test_a_pinned_market_tells_decide_its_missing_side_is_intended(monkeypatch):
+    """[audit] ~12,600 authenticated re-upserts across one overnight.
+
+    one_sided_ok told decide() "this side is closed on purpose" only when
+    the CAP was zero. A side pinned by exhausted ROOM leaves the cap
+    positive, so decide() read the missing leg as a repairable gap and
+    returned QUOTE every tick -- cancelling and re-placing an identical
+    quote every 5 seconds until morning, on a route the venue documents
+    as rate-limited. A 429 there takes down the markets still earning.
+
+    Asserted at the mechanism rather than by counting requests: _Client
+    does not round-trip resting orders, so decide() always sees an empty
+    book in this harness and re-quotes whatever the flag says. Counting
+    upserts here would measure the double, not the fix.
+    """
+    seen = {}
+    real = runner_decide
+
+    def _spy(view, resting, **kw):
+        seen["one_sided_ok"] = kw.get("one_sided_ok")
+        return real(view, resting, **kw)
+
+    monkeypatch.setattr("gui.services.permuto.runner.decide", _spy)
+
+    c = _Client(account=_account(-100_000.0))
+    r = _runner(c, curfew_enabled=True, max_position_usd=12_000.0)
+
+    r.tick(_OVERNIGHT, _ORACLE, {})
+    assert _MKT in r._pinned_markets, "the pin was not detected"
+    # The cap is POSITIVE -- this is room exhaustion, not a closed side,
+    # which is exactly the case the old test missed.
+    assert r._curfew.short_cap_usd > 0.0
+
+    r.tick(_OVERNIGHT + 60.0, _ORACLE, {})
+    assert seen.get("one_sided_ok") is True, (
+        "a market pinned by exhausted room still reported its missing side "
+        "as a gap to repair -- decide() will re-upsert it every tick")

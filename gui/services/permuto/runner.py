@@ -45,7 +45,8 @@ from .client import PermutoNotLinked
 from .orders import Side, depth_credit_usd, quote_ladder
 from .quoting import (REQUOTE_AT_RING_FRACTION, LoopAction,
                       RestingQuote, VenueView, decide)
-from .risk import MarginState, RiskAction, assess, skewed_reference
+from .risk import (MarginState, RiskAction, assess, portfolio_cap_usd,
+                   skewed_reference)
 from .band_guard import VENUE_BAND_PCT, BandGuard
 from .cross_backoff import CrossBackoff, headroom_pct
 from .preflight import (latest_oracle, preflight_leg_price,
@@ -286,6 +287,10 @@ class QuoteRunner:
         #: Tick size as a fraction of the oracle, per market, so headroom_pct
         #: can reserve the one-tick rounding margin ask/ceil adds.
         self._last_tick_frac: dict = {}
+        #: Markets currently one-sided because a side's room ran out.
+        #: Distinct from a curfew-closed side: the cap is positive,
+        #: the inventory has simply consumed all of it.
+        self._pinned_markets: set = set()
         #: Unknown-but-accepted statuses already reported, so the "add it
         #: to BATCH_ACCEPTED" nudge is logged once rather than every tick.
         self._unknown_ok_statuses: set = set()
@@ -737,10 +742,21 @@ class QuoteRunner:
             # [CURFEW] A side the curfew has closed cannot be restored, so
             # its absence must not read as a book to repair -- otherwise the
             # loop re-upserts an identical quote on every tick, all night.
+            # [audit] ...and a side pinned by EXHAUSTED ROOM is just as
+            # closed as one pinned by a zero cap. Overnight flow is
+            # one-directional -- buyers lift the ask, nothing sells back
+            # against a frozen oracle -- so the short room drains and
+            # the ask is dropped while short_cap_usd is still POSITIVE.
+            # This test only saw the zero-cap case, so decide() read the
+            # missing ask as a repairable gap and returned QUOTE every
+            # tick: measured at ~12,600 authenticated cancel+upsert
+            # pairs across one overnight session, each replacing a quote
+            # with an identical copy of itself, on a rate-limited route.
             one_sided_ok = bool(
                 self._curfew is not None
                 and (self._curfew.short_cap_usd <= 0.0
-                     or self._curfew.long_cap_usd <= 0.0))
+                     or self._curfew.long_cap_usd <= 0.0
+                     or market in self._pinned_markets))
             call = decide(
                 view, self._resting.get(market, RestingQuote()),
                 ring_pct=self._ring_pct,
@@ -948,6 +964,25 @@ class QuoteRunner:
         self._eff_half_spread_by_market = eff_half_spread_by_market
 
         risk_by_market: dict = {}
+        #: Markets that cannot be two-sided this tick -- reduce-only, or
+        #: a side whose room ran out. Either way the market earns zero.
+        newly_pinned: set = set()
+        # [audit] Notional per market, for the PORTFOLIO cap below.
+        # max_position_usd is per-market and nothing aggregated it, so
+        # three markets at the shipped 250,000 authorised 750,000 of
+        # exposure on a 500,000 account. No single market has to breach
+        # its own limit for the book to breach the account.
+        positions_usd: dict = {}
+        for market in self._markets:
+            oracle = oracles.get(market)
+            try:
+                contracts = abs(float(
+                    state.positions.get(market, 0.0) or 0.0))
+            except (TypeError, ValueError):
+                contracts = float('nan')
+            positions_usd[market] = (
+                contracts * float(oracle)
+                if oracle and oracle > 0.0 else float('nan'))
         for market in (self._markets if account_seen else []):
             oracle = oracles.get(market)
             base_size = self._base_size(oracle)
@@ -967,6 +1002,14 @@ class QuoteRunner:
             if self._curfew is not None:
                 cap_usd = self._curfew.cap_for(
                     float(state.positions.get(market, 0.0) or 0.0))
+            # [audit] ...and then by the PORTFOLIO budget, which can only
+            # tighten it further. A market is allowed its own cap only
+            # to the extent the rest of the book has left room; an
+            # unreadable equity or a neighbour's unreadable position
+            # yields zero, because authorising exposure against a
+            # number nobody can see is how the last account died.
+            cap_usd = min(cap_usd, portfolio_cap_usd(
+                state.equity_usd, market, cap_usd, positions_usd))
             # Clamped strictly positive: the overnight SHORT cap is zero,
             # and assess() reads a non-positive max_position as "no limit".
             # The prohibition is enforced by the per-leg veto below; what
@@ -974,7 +1017,16 @@ class QuoteRunner:
             # in REDUCE_ONLY rather than switching the limit off.
             max_position = (max(cap_usd, 1e-9) / oracle
                             if oracle and oracle > 0.0 else 0.0)
-            risk_by_market[market] = assess(
+            # [audit] REDUCE_ONLY IS A PIN. It quotes one side only, and
+            # depth credit is min(bid, ask) -- so the market earns
+            # EXACTLY ZERO while it lasts. Overnight that is not a
+            # passing state: recovery needs a fill on the other side,
+            # and the flow that put us here is one-directional against
+            # a frozen oracle. The per-tick 'banked ZERO depth' line
+            # does fire, but it repeats every 5s all night and the
+            # tick still reports action='quote', so the GUI shows a
+            # live book. Announce the TRANSITION instead.
+            _verdict = assess(
                 state, market,
                 base_size=base_size,
                 max_position=max_position,
@@ -989,6 +1041,9 @@ class QuoteRunner:
                     else None)
                     / max(float(oracle or 1e-12), 1e-12)),
             )
+            risk_by_market[market] = _verdict
+            if _verdict.action is RiskAction.REDUCE_ONLY:
+                newly_pinned.add(market)
 
         # A market holding a live quote that risk wants shrunk or gone must
         # act now, whatever decide() thought of the quote itself.
@@ -1306,11 +1361,42 @@ class QuoteRunner:
                     # fractional remainder is a rejected batch.
                     allowed = math.floor(allowed)
                     if allowed < 1.0:
+                        # [audit] NOT SILENT. Dropping this leg makes
+                        # the book one-sided, and depth credit is
+                        # min(bid, ask) -- so this market now earns
+                        # EXACTLY ZERO, for the rest of the night if
+                        # the room does not come back. assess() still
+                        # says NORMAL here, because the floor leaves
+                        # |position| a fraction BELOW the cap, so
+                        # nothing else in the tick names the state.
+                        # It cost ~40%% of a simulated night unnoticed.
+                        newly_pinned.add(market)
                         continue
                     if allowed < leg.size:
                         leg = type(leg)(leg.market, leg.side, leg.price,
                                         allowed, leg.reduce_only)
                 legs.append(leg)
+
+        # [audit] Announce a market that has just run out of room, and
+        # forget one that has recovered. This is the state that cost
+        # ~40%% of a simulated night in silence: the book goes
+        # one-sided, depth credit is min(bid, ask) so the market earns
+        # exactly zero, and nothing else says so -- assess() reports
+        # NORMAL because the floor leaves |position| a hair under the
+        # cap. Overnight the recovery needs a BID fill, which
+        # one-directional flow will not provide, so an operator who is
+        # not told will find out in the morning.
+        for market in sorted(newly_pinned - self._pinned_markets):
+            _log.critical(
+                "permuto: %s IS PINNED ONE-SIDED -- inventory has "
+                "consumed the whole side cap, so this market now earns "
+                "ZERO depth (credit is min(bid, ask)). It cannot "
+                "recover without a fill on the other side. Reduce the "
+                "position to resume earning.", market)
+        for market in sorted(self._pinned_markets - newly_pinned):
+            _log.warning("permuto: %s is two-sided again -- depth "
+                         "resumes", market)
+        self._pinned_markets = newly_pinned
 
         if to_cancel:
             # Before the upsert, so the reduce-only leg is not racing the

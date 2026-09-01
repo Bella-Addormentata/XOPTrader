@@ -45,10 +45,12 @@ from .quoting import REQUOTE_AT_RING_FRACTION as _REQUOTE_AT_RING_FRACTION
 __all__ = [
     "FLATTEN_MARGIN_UTILISATION",
     "MAX_MARGIN_UTILISATION",
+    "PORTFOLIO_MAX_EXPOSURE_FRACTION",
     "MarginState",
     "RiskAction",
     "RiskDecision",
     "assess",
+    "portfolio_cap_usd",
     "max_price_skew_frac",
     "skew_frac",
     "skewed_reference",
@@ -67,6 +69,56 @@ FLATTEN_MARGIN_UTILISATION = 0.75
 #: risk-increasing orders. The venue's own number: the same target depth costs
 #: eight times the collateral out of hours.
 CARRIED_IM_MULTIPLIER = 8.0
+
+
+#: Fraction of equity the WHOLE BOOK may carry, across every market.
+#:
+#: [audit] max_position_usd is PER MARKET and nothing aggregated it, so
+#: three markets at the shipped 250,000 authorised 750,000 of exposure on
+#: a 500,000 account -- 1.5x the equity, before the venue's 8x carried
+#: multiplier touches it. That is the shape of the liquidation this bot
+#: has already suffered once: no single market breached its own limit.
+#:
+#: Denominated in EQUITY rather than as a multiple of the per-market cap,
+#: because equity is what the venue liquidates against and it is the one
+#: number that shrinks when things go wrong.
+PORTFOLIO_MAX_EXPOSURE_FRACTION = 0.60
+
+
+def portfolio_cap_usd(
+    equity_usd: float,
+    market: str,
+    per_market_cap_usd: float,
+    positions_usd: dict,
+) -> float:
+    """The per-market cap, reduced so the WHOLE book stays inside budget.
+
+    Returns the smaller of ``per_market_cap_usd`` and whatever portfolio
+    room is left once every OTHER market's exposure is subtracted. Never
+    negative, and never larger than what was passed in -- this can only
+    tighten, exactly like the curfew.
+
+    Fails CLOSED on anything unreadable: an equity or a position we
+    cannot parse yields zero room, because the alternative is authorising
+    exposure against a number nobody can see.
+    """
+    if not math.isfinite(per_market_cap_usd) or per_market_cap_usd <= 0.0:
+        return 0.0
+    if not math.isfinite(equity_usd) or equity_usd <= 0.0:
+        return 0.0
+    budget = equity_usd * PORTFOLIO_MAX_EXPOSURE_FRACTION
+    others = 0.0
+    for name, notional in (positions_usd or {}).items():
+        if name == market:
+            continue
+        try:
+            value = abs(float(notional))
+        except (TypeError, ValueError):
+            return 0.0
+        if not math.isfinite(value):
+            return 0.0
+        others += value
+    return max(0.0, min(per_market_cap_usd, budget - others))
 
 
 class RiskAction(str, Enum):
