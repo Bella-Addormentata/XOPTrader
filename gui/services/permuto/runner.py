@@ -1149,7 +1149,14 @@ class QuoteRunner:
                 raw_specs = flags.get("specs")
                 mspec = (raw_specs.get(leg.market, {})
                          if isinstance(raw_specs, dict) else {})
-                m_tick = float(mspec.get("tick_size", 0.0001) or 0.0001)
+                # [review] The SAME normalisation as the ladder. This
+                # parsed the raw value, so "decided once" was not true of
+                # the pre-send path: with NaN metadata and a fresh-oracle
+                # reprice, quantise_toward received NaN and handed back the
+                # changed price UNSNAPPED, so an off-grid order still went
+                # out despite the fallback added for the ladder. Two places
+                # deriving one number is how it drifted the first time.
+                m_tick = _effective_tick(mspec.get("tick_size"))
                 m_lot = float(mspec.get("lot_size", 1.0) or 1.0)
 
                 out = preflight_leg_price(

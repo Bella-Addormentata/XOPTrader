@@ -2113,3 +2113,30 @@ def test_the_runner_APPLIES_the_backoff_cap_not_just_computes_it():
             "leg %r sits %.3f%% from the oracle, past the %.2f%% re-quote "
             "trigger -- the learned backoff was applied uncapped"
             % (leg, out, trigger))
+
+
+def test_preflight_repricing_snaps_to_the_grid_under_junk_tick_metadata():
+    """[review] "Decided once" was not true of the PRE-SEND path.
+
+    _prepare parsed mspec["tick_size"] raw, so with NaN metadata and a
+    fresh-oracle reprice quantise_toward received NaN and handed back the
+    changed price UNSNAPPED -- an off-grid order going out despite the
+    fallback that had been added for the ladder.
+    """
+    def fetch():
+        # A COLLAPSE, not a nudge. preflight only re-prices a leg that has
+        # fallen outside the band, so a 0.6% move leaves the ladder's own
+        # on-grid prices untouched and the test proves nothing -- which is
+        # how the first version of it passed with the raw tick restored.
+        return {_MKT: 0.0700, _MKT2: 0.200}
+
+    c = _Client(account=_account(0.0))
+    r = _runner2(c, curfew_enabled=False, oracle_fetch=fetch)
+    flags = {"specs": {_MKT: {"tick_size": float("nan"), "lot_size": 1.0}}}
+    r.tick(_MID_SESSION, {_MKT: 0.0800, _MKT2: 0.200}, flags)
+    assert c.last_batch, "no batch was sent"
+    for leg in (l for l in c.last_batch if l["market"] == _MKT):
+        ticks = float(leg["price"]) / 0.0001
+        assert abs(round(ticks) - ticks) < 1e-6, (
+            "leg %r is off the 0.0001 grid -- junk metadata bypassed the "
+            "normalised tick on the preflight path" % (leg,))
