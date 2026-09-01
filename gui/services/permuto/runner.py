@@ -100,7 +100,7 @@ BATCH_REJECTED = ("batch_failed", "batch_rejected", "error")
 
 
 def _requote_safe_backoff(ring_pct: float, half_spread_pct: float,
-                          skew_frac_abs: float) -> float:
+                          skew_frac_abs: float, tick_frac: float) -> float:
     """The most backoff this leg can carry and still rest.
 
     [review] Bounded by BOTH constraints, because satisfying one and
@@ -112,15 +112,50 @@ def _requote_safe_backoff(ring_pct: float, half_spread_pct: float,
         ring * REQUOTE_AT_RING_FRACTION from the oracle, so a leg born
         past it is cancelled and replaced every tick, forever.
 
-    Computed from the CURRENT skew rather than whatever applied when the
-    offset was learned, so an offset earned under wider headroom is
-    clamped instead of reapplied blind.
+    Computed from the CURRENT skew rather than whatever held when the
+    offset was learned. An offset learned while flat is not legal after a
+    fill: 1.607% at oracle 0.07 becomes a 2.857% ask once skew reaches
+    0.95%, outside the ring entirely.
     """
-    ring_room = headroom_pct(ring_pct, half_spread_pct, skew_frac_abs)
+    ring_room = headroom_pct(ring_pct, half_spread_pct, skew_frac_abs,
+                             tick_frac)
     trigger_budget = ring_pct * REQUOTE_AT_RING_FRACTION * 0.8
     trigger_room = (trigger_budget - abs(half_spread_pct)
                     - abs(skew_frac_abs) * 100.0)
     return max(0.0, min(ring_room, trigger_room))
+
+
+def _effective_tick(raw, default: float = 0.0001) -> float:
+    """The tick quote_ladder will actually use, decided once.
+
+    [review] Two callers derived this independently and disagreed on junk:
+    `float(raw or default)` passes NaN straight through, because NaN is
+    truthy, while quote_ladder validates and falls back. So a non-finite
+    tick_size disabled the crossing backoff -- headroom of zero clears the
+    learned offset -- while the ladder priced on 0.0001 as if nothing were
+    wrong. Same value to both, or they will drift again.
+    """
+    try:
+        tick = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(tick) or tick <= 0.0:
+        return default
+    return tick
+
+
+def _is_cross_refusal(reason: str) -> bool:
+    """True when the venue refused this leg for crossing the book.
+
+    [review] Matched on the STABLE markers, not the full sentence. The live
+    venue sends "Post-only order would cross the book. Switch to GTC or
+    adjust price." but this repo's own fixtures carry the shorter
+    "post-only order would cross", and an exact-phrase match on "cross the
+    book" silently skipped those -- so a refusal took the CLEAN path and
+    decayed the backoff instead of widening it, which is precisely
+    backwards.
+    """
+    return "post-only" in reason and "cross" in reason
 
 
 def _legs_all_accepted(leg_rows) -> bool:
@@ -248,6 +283,9 @@ class QuoteRunner:
         #: account for it at response time (skew and backoff push the
         #: trailing leg the same way, and the ring does not care which).
         self._last_skew: dict = {}
+        #: Tick size as a fraction of the oracle, per market, so headroom_pct
+        #: can reserve the one-tick rounding margin ask/ceil adds.
+        self._last_tick_frac: dict = {}
         #: Unknown-but-accepted statuses already reported, so the "add it
         #: to BATCH_ACCEPTED" nudge is logged once rather than every tick.
         self._unknown_ok_statuses: set = set()
@@ -924,6 +962,14 @@ class QuoteRunner:
                 max_position=max_position,
                 ring_pct=self._ring_pct,
                 half_spread_pct=eff_half_spread_by_market[market],
+                # [review] The skew budget must reserve the rounding tick
+                # as well, or spread + skew + ceil() lands past the
+                # re-quote trigger before any backoff is even considered.
+                tick_frac=(_effective_tick(
+                    (flags.get("specs") or {}).get(market, {}).get(
+                        "tick_size") if isinstance(flags.get("specs"), dict)
+                    else None)
+                    / max(float(oracle or 1e-12), 1e-12)),
             )
 
         # A market holding a live quote that risk wants shrunk or gone must
@@ -1124,9 +1170,12 @@ class QuoteRunner:
             spec = (raw_specs.get(market, {})
                     if isinstance(raw_specs, dict) else {})
             # [ANTICROSS] Sit as far from the book as the venue's refusals
-            # say we must. quote_ladder still clamps every level inside the
-            # ring, so this can widen the placement but never the credit
-            # footprint -- a leg outside the ring earns nothing.
+            # say we must. headroom_pct bounds the backoff so that the
+            # quantised trailing leg stays inside the credit ring against the
+            # TRUE oracle (skew and tick rounding both accounted for).
+            # quote_ladder's own ring_pct*0.9 clamp is relative to the SKEWED
+            # reference, not the true oracle, so it is NOT the true ceiling --
+            # that is headroom_pct's job.
             self._last_skew[market] = risk.skew
             # [MODES] The stage decides the POSTURE, the curfew and risk
             # decide the LIMITS -- the profile is applied first precisely so
@@ -1140,28 +1189,38 @@ class QuoteRunner:
             if depth_usd <= 0.0:
                 results[market] = ("skip", market_profile.reason)
                 continue
+            # [review] Reserve the worst-case ask-ceil rounding margin so
+            # headroom_pct accounts for the one tick quote_ladder adds --
+            # from the EFFECTIVE tick, the same one the ladder will use.
+            #
+            # `float(spec.get(...) or 0.0001)` looked like a fallback and is
+            # not one: NaN is truthy, so a non-finite tick_size sailed
+            # through as NaN, made _last_tick_frac NaN, and headroom_pct
+            # then returned zero -- which makes observe_cross CLEAR the
+            # learned backoff. Meanwhile quote_ladder validates and quietly
+            # uses 0.0001, so bad venue metadata disabled the crossing
+            # defence while the quote itself carried on regardless.
+            _tick = _effective_tick(spec.get("tick_size"))
+            self._last_tick_frac[market] = (
+                _tick / max(float(oracle or 1e-12), 1e-12))
             ladder = quote_ladder(
                 market, reference, depth_usd,
                 levels=1,
-                # [review] CAP THE LEARNED OFFSET AGAINST CURRENT HEADROOM,
-                # and against the RE-QUOTE TRIGGER, not merely the ring.
-                #
-                # Two ways the raw learned value goes wrong. It was learned
-                # under whatever skew and oracle applied then, so a fill
-                # that raises skew leaves an offset legal at the time and
-                # not now -- 1.607% learned while flat becomes a 2.857% ask
-                # once skew reaches 0.95%, outside the 2% ring entirely.
-                # And even inside the ring, spread + skew + backoff past
-                # the 1.2% trigger means decide() replaces the quote on the
-                # very next tick: the churn this budget exists to stop.
+                # [review] Capped against CURRENT headroom and the
+                # re-quote trigger, not applied raw. See
+                # _requote_safe_backoff: an offset learned under wider
+                # headroom is illegal after a fill raises skew, and one
+                # inside the ring but past the trigger is replaced on the
+                # next tick -- the churn the budget exists to stop.
                 first_offset_pct=(
                     eff_half_spread
                     + min(self._cross_backoff.offset_pct(market),
                           _requote_safe_backoff(
                               self._ring_pct, eff_half_spread,
-                              self._last_skew.get(market, 0.0)))),
+                              self._last_skew.get(market, 0.0),
+                              self._last_tick_frac.get(market, 0.0)))),
                 ring_pct=self._ring_pct,
-                tick_size=spec.get("tick_size", 0.0001),
+                tick_size=_tick,
                 lot_size=spec.get("lot_size", 1.0),
             )
             if risk.action is RiskAction.REDUCE_ONLY:
@@ -1347,7 +1406,14 @@ class QuoteRunner:
                 raw_specs = flags.get("specs")
                 mspec = (raw_specs.get(leg.market, {})
                          if isinstance(raw_specs, dict) else {})
-                m_tick = float(mspec.get("tick_size", 0.0001) or 0.0001)
+                # [review] The SAME normalisation as the ladder. This
+                # parsed the raw value, so "decided once" was not true of
+                # the pre-send path: with NaN metadata and a fresh-oracle
+                # reprice, quantise_toward received NaN and handed back the
+                # changed price UNSNAPPED, so an off-grid order still went
+                # out despite the fallback added for the ladder. Two places
+                # deriving one number is how it drifted the first time.
+                m_tick = _effective_tick(mspec.get("tick_size"))
                 m_lot = float(mspec.get("lot_size", 1.0) or 1.0)
 
                 out = preflight_leg_price(
@@ -1560,13 +1626,48 @@ class QuoteRunner:
             # if ANY leg here crossed, the market retreats; if none did, it
             # relaxes back toward the configured spread.
             if isinstance(leg_rows, list) and leg_rows:
-                crossed = set()
+                crossed, seen, dirty = set(), set(), set()
+                # [review] A COUNT MISMATCH POISONS THE WHOLE MAPPING, not
+                # just the tail. These rows are paired with legs by
+                # POSITION, so a missing row in the MIDDLE shifts every
+                # later pairing by one -- a market then reads another
+                # market's result, and can come back "seen" and clean while
+                # its own leg was refused. Marking only the unpaired suffix
+                # dirty, as the previous fix did, addresses the one case
+                # where the shift happens to be at the end.
+                #
+                # There is no way to re-align without an identifier the
+                # rows do not carry, so the honest response is to trust
+                # none of it: no crossings inferred, every market dirty, and
+                # the backoff left exactly where it was until a response
+                # arrives that can be read.
+                if len(leg_rows) != len(legs):
+                    _log.warning(
+                        "permuto: batch response had %d row(s) for %d leg(s)"
+                        " -- positional mapping is ambiguous, so no backoff "
+                        "is inferred this tick", len(leg_rows), len(legs))
+                    for leg in legs:
+                        dirty.add(leg.market)
+                    leg_rows = []
                 for leg, row in zip(legs, leg_rows):
                     if not isinstance(row, dict):
+                        # A row we cannot parse tells us nothing about this
+                        # market, so it must not count as a clean tick.
+                        dirty.add(leg.market)
                         continue
-                    if "cross the book" in str(
-                            row.get("rejection_reason") or "").lower():
+                    seen.add(leg.market)
+                    reason = str(row.get("rejection_reason") or "").lower()
+                    action = str(row.get("action") or "").lower()
+                    if _is_cross_refusal(reason):
                         crossed.add(leg.market)
+                    elif reason or action not in ("placed", "modified",
+                                                  "unchanged"):
+                        # [review] A NON-crossing refusal (margin/band) or an
+                        # action that does not prove the order is resting is
+                        # not evidence we stopped crossing. "rejected",
+                        # "cancelled", an empty action, or any unknown value
+                        # all count as dirty.
+                        dirty.add(leg.market)
                 for mkt in {l.market for l in legs}:
                     if mkt in crossed:
                         self._cross_backoff.observe_cross(
@@ -1579,8 +1680,19 @@ class QuoteRunner:
                             headroom_pct(self._ring_pct,
                                          self._eff_half_spread_by_market.get(
                                              mkt, self._eff_half_spread),
-                                         self._last_skew.get(mkt, 0.0)))
-                    else:
+                                         self._last_skew.get(mkt, 0.0),
+                                         self._last_tick_frac.get(mkt, 0.0)))
+                    elif accepted and mkt in seen and mkt not in dirty:
+                        # Only a market whose every row came back present and
+                        # ACCEPTED has actually demonstrated it rests.
+                        #
+                        # [review] `accepted` gates this, and it has to: a
+                        # known batch_failed envelope can still report every
+                        # row as "placed", so without the gate an explicit
+                        # venue refusal decayed the learned offset as though
+                        # the batch had rested. The rows describe legs; the
+                        # envelope describes whether the venue took them,
+                        # and only the envelope can answer that.
                         self._cross_backoff.observe_clean(mkt)
 
             credit_usd = _credit_for(rested)

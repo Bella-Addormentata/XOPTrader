@@ -152,7 +152,8 @@ class RiskDecision:
     reason: str = ""
 
 
-def max_price_skew_frac(ring_pct: float, half_spread_pct: float) -> float:
+def max_price_skew_frac(ring_pct: float, half_spread_pct: float,
+                        tick_frac: float = 0.0) -> float:
     """How far the pair can slide before the trailing leg leaves the ring.
 
     Never negative: a spread wider than the ring has no legal two-sided
@@ -168,23 +169,23 @@ def max_price_skew_frac(ring_pct: float, half_spread_pct: float) -> float:
     stops at 80% of the trigger, so even a fully skewed pair rests until the
     ORACLE moves, which is what the trigger is for.
 
-    [review 2026-08-31] AND THE HALF-SPREAD COMES OUT OF THE SAME BUDGET.
-    The cap above reserved 80% of the trigger for the SKEW alone, but
-    quoting.decide() measures ``abs(leg_price - oracle)`` -- the LEG, not
-    the skewed midpoint -- and the leg sits a further half-spread beyond
-    it. So the real distance is placement + skew, and at the shipped
-    defaults that was 0.25 + 0.96 = 1.21% against a 1.20% trigger: a fully
-    skewed pair was born past its own trigger and churned, which is the
-    exact failure the previous review thought it had closed.
+    [review 2026-09-01] THE PLACEMENT AND THE ROUNDING TICK COME OUT OF
+    THIS BUDGET TOO. It reserved 80% of the trigger for the SKEW alone,
+    but decide() re-quotes on abs(leg_price - oracle) -- the LEG, which
+    sits a half-spread beyond the skewed midpoint and is then CEILED onto
+    the venue grid. Measured at the defaults with oracle 0.07 and a 95%
+    short: skew 0.9120%, raw ask 0.070815, rounded to 0.0709, which is
+    1.2857% from the oracle against a 1.20% trigger. Born past it and
+    replaced every tick, with the crossing backoff already clamped to
+    zero and unable to help -- the churn this cap was added to prevent,
+    surviving underneath it.
 
-    Subtracting the half-spread makes the total self-balancing at 80% of
-    the trigger whatever the spread is -- 0.25 + 0.71 and 0.75 + 0.21 both
-    land on 0.96% -- so a wider quoting posture tightens the skew instead
-    of silently breaking the invariant.
+    Subtracting both makes the total self-balancing whatever the spread
+    and tick are.
     """
     ring_edge = (ring_pct - half_spread_pct) / 100.0
     trigger = ring_pct * _REQUOTE_AT_RING_FRACTION / 100.0
-    budget = trigger * 0.8 - half_spread_pct / 100.0
+    budget = (trigger * 0.8 - half_spread_pct / 100.0 - abs(tick_frac))
     return max(0.0, min(ring_edge, budget))
 
 
@@ -194,6 +195,7 @@ def skew_frac(
     *,
     ring_pct: float = 2.0,
     half_spread_pct: float = 0.25,
+    tick_frac: float = 0.0,
 ) -> float:
     """Price offset for the current inventory, as a signed fraction.
 
@@ -202,7 +204,8 @@ def skew_frac(
     a step function that arrives after the inventory is already a problem, and
     each step is a re-quote that empties the book between states.
     """
-    ceiling = max_price_skew_frac(ring_pct, half_spread_pct)
+    ceiling = max_price_skew_frac(ring_pct, half_spread_pct,
+                                  tick_frac)
     if not (max_position > 0.0) or ceiling <= 0.0:
         return 0.0
     fraction = max(-1.0, min(1.0, position / max_position))
@@ -219,6 +222,7 @@ def assess(
     max_position: float,
     ring_pct: float = 2.0,
     half_spread_pct: float = 0.25,
+    tick_frac: float = 0.0,
 ) -> RiskDecision:
     """One decision for one market. Total and side-effect free.
 
@@ -261,6 +265,7 @@ def assess(
     skew = skew_frac(
         position, max_position,
         ring_pct=ring_pct, half_spread_pct=half_spread_pct,
+        tick_frac=tick_frac,
     )
 
     if max_position > 0.0 and abs(position) >= max_position:
