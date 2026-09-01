@@ -187,7 +187,15 @@ def read_positions(client: Any, now_s: float) -> dict:
         if not isinstance(row, dict):
             unreadable.append("row %d (%s)" % (index, type(row).__name__))
             continue
-        market = str(row.get("market") or "").strip()
+        # [review] `symbol` IS THE SAME FIELD. runner._margin_state and
+        # the reconcile parser both accept market-or-symbol; only this
+        # one did not, so a payload the rest of the app reads fine made
+        # the whole EMERGENCY CLOSE plan fail as "no market". Two
+        # parsers of one payload disagreeing is the same fault as the
+        # dict and list branches failing differently, which this
+        # function has already been fixed for once.
+        market = str(row.get("market") or row.get("symbol")
+                     or "").strip()
         if not market:
             unreadable.append("row %d (no market)" % index)
             continue

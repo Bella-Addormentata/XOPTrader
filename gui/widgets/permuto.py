@@ -496,8 +496,17 @@ CLOSE_SESSION_CALLS = 2
 #: terminate() reachable with an order retry in flight.
 CLOSE_CALLS_PER_REQUEST = 4
 
-#: Requests send mode makes beyond the session: the fresh position read
-#: send_close() performs, plus one order per market.
+#: Requests send mode makes beyond the session BEFORE the orders: the
+#: cancel_all() that clears the resting book, and the fresh position
+#: read that follows it.
+#:
+#: [review] The cancel used to be missing from this count -- it was
+#: added to send_close() in the same batch that fixed the close
+#: undoing itself, and the budget derived from these terms was not
+#: updated with it, leaving the ceiling four retry-path calls short.
+CLOSE_FIXED_REQUESTS = 2
+
+#: ...plus one order per market.
 CLOSE_MAX_LEGS = len(_MARKETS_FOR_BUDGET)
 
 #: How long shutdown waits for that worker before giving up on a tidy
@@ -508,7 +517,7 @@ CLOSE_MAX_LEGS = len(_MARKETS_FOR_BUDGET)
 #: it parks the thread rather than killing it.
 CLOSE_JOIN_MS = int(
     (CLOSE_SESSION_CALLS
-     + CLOSE_CALLS_PER_REQUEST * (1 + CLOSE_MAX_LEGS))
+     + CLOSE_CALLS_PER_REQUEST * (CLOSE_FIXED_REQUESTS + CLOSE_MAX_LEGS))
     * CLOSE_REQUEST_TIMEOUT_S * 1000)
 
 

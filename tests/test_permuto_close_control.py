@@ -369,7 +369,16 @@ def test_the_close_worker_cannot_outlive_its_join_budget():
     #   send mode makes 1 fresh position read + one order per market
     session_calls = 2
     calls_per_request = 4
-    worst_case_calls = session_calls + calls_per_request * (1 + len(MARKETS))
+    # [review] TWO fixed requests before the orders, not one. send mode
+    # cancels the resting book AND reads the position; this test
+    # counted only the read, so it stayed green for a budget four
+    # retry-path calls too short -- it repeated the production
+    # omission because I derived it from the same mental model rather
+    # than from the code path.
+    fixed_requests = 2                  # cancel_all, then account
+    worst_case_calls = (session_calls
+                        + calls_per_request
+                        * (fixed_requests + len(MARKETS)))
     worst_case_ms = (worst_case_calls
                      * permuto_mod.CLOSE_REQUEST_TIMEOUT_S * 1000)
     assert permuto_mod.CLOSE_JOIN_MS >= worst_case_ms, (

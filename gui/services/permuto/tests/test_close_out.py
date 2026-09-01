@@ -655,3 +655,21 @@ def test_a_close_is_refused_when_the_book_cannot_be_cleared():
     assert not c.sent, "close legs went out over an uncancelled book"
     assert "could not be cancelled" in res["note"], res["note"]
     assert "undo the close" in res["note"], res["note"]
+
+
+def test_a_list_row_keyed_by_symbol_is_read_like_one_keyed_by_market():
+    """[review] Two parsers of one payload must not disagree.
+
+    runner._margin_state and the reconcile parser both accept
+    `market` or `symbol`; this one took only `market`, so a payload the
+    rest of the app reads fine made the whole EMERGENCY CLOSE plan fail
+    as "no market" -- the same class of fault as the dict and list
+    branches failing differently, which this function has been fixed for
+    once already.
+    """
+    by_symbol = _Client({"positions": [
+        {"symbol": "QQQ-VOL-PERP", "side": "sell", "size": "100"}]})
+    by_market = _Client({"positions": [
+        {"market": "QQQ-VOL-PERP", "side": "sell", "size": "100"}]})
+    assert read_positions(by_symbol, 0.0) == read_positions(by_market, 0.0)
+    assert read_positions(by_symbol, 0.0) == {"QQQ-VOL-PERP": -100.0}
