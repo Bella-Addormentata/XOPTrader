@@ -465,9 +465,9 @@ def test_public_key_is_shown_and_private_key_is_not(page):
     #
     # [corrected 2026-09-01] This comment previously said EIGHT words
     # collided (public, key, address, this, machine, session, order,
-    # market) for ~9%. Measured against the real label -- "BLS public
-    # key:  %s
-Trading address: %s" -- exactly ONE does: "public".
+    # market) for ~9%. Measured against the real label, which renders
+    # as "BLS public key:" then a newline then "Trading address:",
+    # exactly ONE does: "public".
     # "key:" and "address:" carry colons so they never match " key ",
     # "Trading" and "BLS" are capitalised and BIP39 is lowercase, and
     # the rest do not appear at all. Against the 2,048-word list that
