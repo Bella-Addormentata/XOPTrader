@@ -210,3 +210,78 @@ def test_a_total_failure_does_not_claim_legs_went_out(widget):
     text = widget._close_note.text()
     assert text.startswith("Failed:"), text
     assert "leg(s) went out" not in text
+
+
+# --------------------------------------------------------------------------- #
+# [review] The INVERSE guard, pinned at the MainWindow wiring
+# --------------------------------------------------------------------------- #
+
+class _FakePage:
+    """Minimal stand-in for the Permuto page."""
+
+    def __init__(self, in_flight):
+        self._in_flight = in_flight
+        self.told = []
+
+    def close_in_flight(self):
+        return self._in_flight
+
+    def set_quoting_live(self, live):
+        self.told.append(live)
+
+
+def _wire(monkeypatch, in_flight):
+    """A MainWindow-shaped object carrying only what the guard touches."""
+    from gui.widgets.main_window import MainWindow
+
+    page = _FakePage(in_flight)
+    mw = MainWindow.__new__(MainWindow)          # no Qt construction
+    mw._permuto_widget = page
+    mw._permuto_runner = None
+    mw._permuto_desired_on = False
+    mw._unwrap = staticmethod(lambda w: w)
+    refusals, built = [], []
+    mw._on_switch_refused = lambda msg: refusals.append(msg)
+    mw._refresh_venue_switches = lambda: None
+    mw._make_permuto_live = lambda: built.append(True)
+    # may_turn_on() runs first and must ALLOW, or the test would pass for
+    # the wrong reason -- refused by the ordinary gate rather than by the
+    # in-flight guard under test.
+    mw._gather_permuto = lambda: {}
+    import gui.widgets.main_window as mwmod
+    monkeypatch.setattr("gui.services.venue_control.may_turn_on",
+                        lambda _s: (True, ""))
+    return mw, page, refusals, built
+
+
+def test_quoting_is_refused_while_a_close_is_in_flight(monkeypatch):
+    """[review] The guard existed but nothing exercised it.
+
+    Starting the runner while a close worker is live opens a SECOND venue
+    session for the same identity, and the two invalidate each other's
+    tokens -- with the close being the one that must not lose that fight.
+    The widget tests only covered the other direction.
+    """
+    from gui.widgets.main_window import MainWindow
+
+    mw, page, refusals, built = _wire(monkeypatch, in_flight=True)
+    MainWindow._on_permuto_toggle(mw, True)
+
+    assert not built, "a runner was constructed during an in-flight close"
+    assert mw._permuto_runner is None
+    assert mw._permuto_desired_on is False
+    assert refusals and "close is in flight" in refusals[0], refusals
+
+
+def test_quoting_starts_normally_when_no_close_is_running(monkeypatch):
+    """And the guard must not be a permanent block."""
+    from gui.widgets.main_window import MainWindow
+
+    mw, page, refusals, built = _wire(monkeypatch, in_flight=False)
+    try:
+        MainWindow._on_permuto_toggle(mw, True)
+    except Exception:
+        # Construction goes further than this fake supports; what matters
+        # is that the guard did NOT refuse before getting there.
+        pass
+    assert not [r for r in refusals if "close is in flight" in r], refusals

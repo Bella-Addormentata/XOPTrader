@@ -148,18 +148,34 @@ def read_positions(client: Any, now_s: float) -> dict:
             "account positions were %s, not a list or an object"
             % type(rows).__name__)
 
-    for row in rows:
+    # [review] THE WHOLE BRANCH, not one more variant of it.
+    #
+    # This is the sixth fail-open found in this function, and every one was
+    # a `continue` that looked harmless in isolation. The rule that should
+    # have been applied at the first: a row may be SKIPPED only when it
+    # structurally carries no exposure -- a zero size, nothing to act on.
+    # Anything we merely could not PARSE might be a live position, and
+    # dropping it silently reports less exposure than exists on the one
+    # control an operator uses to escape it.
+    for index, row in enumerate(rows):
         if not isinstance(row, dict):
+            unreadable.append("row %d (%s)" % (index, type(row).__name__))
             continue
         market = str(row.get("market") or "").strip()
         if not market:
+            unreadable.append("row %d (no market)" % index)
             continue
         try:
             size = abs(float(row.get("size", row.get("position", 0.0)) or 0.0))
         except (TypeError, ValueError):
+            unreadable.append("%s (size %r)"
+                              % (market, row.get("size")))
+            continue
+        if not math.isfinite(size):
+            unreadable.append("%s (size %r)" % (market, row.get("size")))
             continue
         if size <= 0.0:
-            continue
+            continue        # genuinely flat: no exposure to misreport
         side = str(row.get("side", "")).strip().lower()
         if side in ("sell", "short", "s", "ask"):
             out[market] = -size
@@ -241,7 +257,19 @@ def describe(legs: list, prices: Optional[dict] = None) -> str:
     lines, total = [], 0.0
     for leg in legs:
         key = leg["market"].replace("-PERP", "")
-        price = float(px.get(key, px.get(leg["market"], 0.0)) or 0.0)
+        # [review] The notional is a NICETY; the plan is the point. A junk
+        # public oracle value -- "unavailable", NaN, infinity -- used to
+        # raise straight out of here and stop the operator ever reaching
+        # the confirmation dialog. That is the opposite failure to the
+        # account parsing above and needs the opposite rule: the ACCOUNT
+        # must fail closed because it is the truth about exposure, while
+        # the ORACLE is display data and must degrade quietly.
+        try:
+            price = float(px.get(key, px.get(leg["market"], 0.0)) or 0.0)
+        except (TypeError, ValueError):
+            price = 0.0
+        if not math.isfinite(price) or price < 0.0:
+            price = 0.0
         notional = leg["size"] * price
         total += notional
         lines.append("  %-15s %-4s %12.0f contracts%s"

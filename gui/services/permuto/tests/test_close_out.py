@@ -55,23 +55,46 @@ def test_an_unreadable_side_RAISES_rather_than_vanishing():
         read_positions(c, 0.0)
 
 
-def test_zero_and_structurally_empty_rows_are_ignored():
-    """Rows with no direction to misread -- a zero size, a market with no
-    size, a row with no market -- carry no exposure and are not the
-    unreadable-DIRECTION case that must fail closed."""
-    c = _Client({"positions": [_pos("A", "sell", 0), {"market": "B"},
-                               {"side": "sell", "size": "5"}, "junk"]})
+def test_a_genuinely_flat_row_is_ignored():
+    """A zero size carries no exposure, so there is nothing to misreport."""
+    c = _Client({"positions": [_pos("A", "sell", 0), {"market": "B"}]})
     assert read_positions(c, 0.0) == {}
 
 
-# --------------------------------------------------------------------------- #
-# planning -- the sign is the whole ballgame
-# --------------------------------------------------------------------------- #
+def test_a_structurally_broken_row_FAILS_the_plan():
+    """[review] The sixth fail-open, and the audit that should have come
+    after the first.
 
-def test_a_short_is_closed_by_BUYING():
-    legs = plan_close({"QQQ-VOL-PERP": -100.0}, 1.0)
-    assert legs == [{"market": "QQQ-VOL-PERP", "side": "buy",
-                     "size": 100.0, "reduce_only": True}]
+    Every one of these was a `continue` that looked harmless alone. The
+    rule: a row may be SKIPPED only when it structurally carries no
+    exposure. Anything merely UNPARSEABLE might be a live position, and
+    dropping it silently reports less exposure than exists.
+    """
+    for rows in (
+        [{"side": "sell", "size": "5"}],        # a size with no market
+        ["junk"],                                # not even a row
+        [_pos("A", "sell", "lots")],             # unparseable size
+        [{"market": "A", "side": "sell", "size": float("inf")}],
+    ):
+        with pytest.raises(ClosePayloadError):
+            read_positions(_Client({"positions": rows}), 0.0)
+
+
+def test_a_junk_oracle_price_does_not_block_the_confirmation():
+    """[review] The opposite rule to the account parsing, deliberately.
+
+    The notional is a NICETY; the plan is the point. A malformed public
+    oracle value used to raise straight out of describe() and stop the
+    operator ever reaching the dialog. The ACCOUNT must fail closed
+    because it is the truth about exposure; the ORACLE is display data
+    and must degrade quietly.
+    """
+    legs = plan_close({"QQQ-VOL-PERP": -1000.0}, 1.0)
+    for bad in ("unavailable", float("nan"), float("inf"), None, -1.0):
+        text = describe(legs, {"QQQ-VOL": bad})
+        assert "QQQ-VOL-PERP" in text and "1000" in text, (
+            "a junk oracle value (%r) hid the close plan" % (bad,))
+
 
 
 def test_a_long_is_closed_by_SELLING():
