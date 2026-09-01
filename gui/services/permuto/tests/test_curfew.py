@@ -553,3 +553,37 @@ def test_an_unset_position_cap_still_knows_what_time_it_is():
     mid = OPENS_UTC[0] + SETTLE_AFTER_OPEN_S + 3_600.0
     assert assess_curfew(mid, 0.0, frozen_oracle=False).schedule_stage \
         is Stage.SESSION
+
+
+def test_an_uncapped_runner_still_reads_a_frozen_oracle_as_closed():
+    """[review] The table is a convenience; the frozen oracle is the truth.
+
+    Past the last entry in the hardcoded session table the schedule
+    abstains. A CAPPED runner then reads a frozen oracle as CLOSED -- "no
+    session scheduled and the oracle is frozen, the underlying is shut" --
+    and keeps earning. An uncapped one published a bare UNSCHEDULED,
+    which puts profile_for() into its stale-price branch and WITHDRAWS,
+    so it lost every overnight book once the table ran out while an
+    identically-placed capped runner carried on.
+
+    The two configurations must derive the same posture from the same
+    observable.
+    """
+    past = CLOSES_UTC[-1] + 5 * 86_400.0
+
+    capped = assess_curfew(past, 250_000.0, frozen_oracle=True)
+    uncapped = assess_curfew(past, 0.0, frozen_oracle=True)
+    # The capped path expresses it as the effective stage, the uncapped
+    # one as the posture stage -- both must reach CLOSED.
+    assert capped.stage is Stage.CLOSED
+    assert uncapped.schedule_stage is Stage.CLOSED, (
+        "an uncapped runner reported %s past the table with a frozen "
+        "oracle, which withdraws the book" % (uncapped.schedule_stage,))
+
+    # A MOVING oracle past the table is genuinely unscheduled in both.
+    assert assess_curfew(past, 0.0, frozen_oracle=False).schedule_stage \
+        is Stage.UNSCHEDULED
+    # ...and inside the table the real stage still wins over the freeze.
+    mid = OPENS_UTC[0] + SETTLE_AFTER_OPEN_S + 3_600.0
+    assert assess_curfew(mid, 0.0, frozen_oracle=False).schedule_stage \
+        is Stage.SESSION

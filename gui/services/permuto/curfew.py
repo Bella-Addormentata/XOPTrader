@@ -584,6 +584,33 @@ def _side_caps(
     return long_target, short_target
 
 
+def _uncapped_posture(
+    now_s: float,
+    closes: Sequence[float],
+    opens: Sequence[float],
+    frozen_oracle: bool,
+) -> Stage:
+    """The posture stage to publish when no per-market cap is set.
+
+    [review] The caps are inactive here, but the POSTURE still has to be
+    right, and it has to agree with what the capped path decides from the
+    same facts. Past the last entry in the hardcoded session table the
+    schedule abstains, and the capped path then reads a frozen oracle as
+    CLOSED -- "no session scheduled and the oracle is frozen, the
+    underlying is shut". Publishing a bare UNSCHEDULED instead put
+    profile_for() into its stale-price branch, which WITHDRAWS, so an
+    uncapped runner lost every overnight book once the table ran out --
+    while an identically-placed capped runner kept earning.
+
+    The table is a convenience, not the truth. A frozen oracle is the
+    observable, and it must mean the same thing in both configurations.
+    """
+    stage = _schedule_stage(now_s, closes, opens)[0]
+    if stage is Stage.UNSCHEDULED and frozen_oracle:
+        return Stage.CLOSED
+    return stage
+
+
 def assess_curfew(
     now_s: float,
     full_cap_usd: float,
@@ -610,8 +637,8 @@ def assess_curfew(
                            "no position limit configured; curfew inactive",
                            long_cap_usd=full_cap_usd,
                            short_cap_usd=full_cap_usd,
-                           schedule_stage=_schedule_stage(
-                               now_s, closes, opens)[0])
+                           schedule_stage=_uncapped_posture(
+                               now_s, closes, opens, frozen_oracle))
 
     long_target = (floor_usd if floor_usd is not None
                    else full_cap_usd * OVERNIGHT_LONG_FRACTION)

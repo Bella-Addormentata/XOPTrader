@@ -3132,11 +3132,20 @@ def test_a_mixed_quote_hold_transition_rebuilds_every_market(monkeypatch):
     c = _Client(account=_account(100.0))
     r = _runner2(c, curfew_enabled=True, max_position_usd=12_000.0)
 
-    # _MKT holds, _MKT2 quotes -- the mixed case.
+    # [review] BY CALL ORDER, not by a market attribute. VenueView has
+    # no `market` field, so the original getattr() was always None and
+    # BOTH calls returned HOLD -- the test exercised the all-HOLD path
+    # while claiming the mixed one, and would have passed with the
+    # mixed handling removed. (The mutation check did fail it, but for
+    # the all-HOLD reason, which is exactly how a mislabelled test
+    # survives one.) The runner iterates _MKT then _MKT2.
+    calls = []
+
     def _mixed(view, resting, **kw):
-        if getattr(view, "market", None) == _MKT2:
-            return QuoteDecision(LoopAction.QUOTE, "no quote resting")
-        return QuoteDecision(LoopAction.HOLD, "two-sided and in ring")
+        calls.append(1)
+        if len(calls) == 1:                 # _MKT: holds
+            return QuoteDecision(LoopAction.HOLD, "two-sided and in ring")
+        return QuoteDecision(LoopAction.QUOTE, "no quote resting")
 
     r.tick(_OVERNIGHT, {_MKT: 0.07, _MKT2: 0.07}, {})
     monkeypatch.setattr("gui.services.permuto.runner.decide", _mixed)
@@ -3144,6 +3153,9 @@ def test_a_mixed_quote_hold_transition_rebuilds_every_market(monkeypatch):
 
     res = r.tick(OPENS_UTC[1] - 1_500.0, {_MKT: 0.07, _MKT2: 0.07}, {})
 
+    assert len(calls) >= 2, (
+        "decide() was called %d time(s); the mixed case needs both "
+        "markets to answer" % len(calls))
     holding = [m for m, (a, _) in res.markets.items() if a == "hold"]
     assert not holding, (
         "a market still says HOLD after its book was cancelled: %s" % holding)
