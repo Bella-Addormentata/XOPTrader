@@ -330,6 +330,26 @@ class _Legs(list):
         super().__init__(legs)
         self.rounded_out = list(rounded_out)
 
+    # [review] Equality is the LEGS, stated explicitly rather than
+    # inherited by accident. rounded_out is diagnostic -- it records
+    # what the plan could not include, not what it will do -- so two
+    # plans sending the same orders are the same plan.
+    #
+    # The alternative the linter suggests, comparing rounded_out when
+    # both sides are _Legs and delegating to list otherwise, buys
+    # nothing and costs transitivity: _Legs(x, a) != _Legs(x, b)
+    # while both still equal list(x).
+    def __eq__(self, other):
+        return list.__eq__(self, other)
+
+    def __ne__(self, other):
+        result = self.__eq__(other)
+        return result if result is NotImplemented else not result
+
+    #: Mutable and equality-defining, so unhashable -- the data model's
+    #: own rule, and list is unhashable for the same reason.
+    __hash__ = None
+
 
 def plan_close(positions: dict, fraction: float,
                lot_sizes: Optional[dict] = None) -> list:
