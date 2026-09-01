@@ -122,10 +122,18 @@ def read_positions(client: Any, now_s: float) -> dict:
                 # and dropping it turned that into "Nothing to close" on
                 # the one control an operator uses to escape. The LIST
                 # branch already records exactly this as unreadable.
-                try:
-                    blank = float(raw)
-                except (TypeError, ValueError):
+                # [review] ...INCLUDING the boolean check. float(False)
+                # is 0.0, so {"": false} read as a genuine flat row
+                # while every other path in this parser rejects bools.
+                # A guard added to two branches and not the third is
+                # how this module keeps producing the same defect.
+                if isinstance(raw, bool):
                     blank = float("nan")
+                else:
+                    try:
+                        blank = float(raw)
+                    except (TypeError, ValueError):
+                        blank = float("nan")
                 if blank == 0.0:
                     continue        # genuinely flat: nothing to misreport
                 unreadable.append("(no market) %r" % (raw,))
@@ -249,6 +257,15 @@ _REFUSED = ("rejected", "failed", "error", "cancelled")
 #: shaped envelope is not read as a refusal.
 _ACCEPTED = ("placed", "modified", "filled", "unchanged", "ok", "success",
              "accepted", "partially_filled")
+
+
+def _states_partial(resp: Any) -> bool:
+    """True when the venue itself called this a partial fill."""
+    if not isinstance(resp, dict):
+        return False
+    return "partially_filled" in (
+        str(resp.get("action", "")).strip().lower(),
+        str(resp.get("status", "")).strip().lower())
 
 
 def order_verdict(resp: Any) -> tuple:
@@ -657,7 +674,32 @@ def send_close(client: Any, now_s: float, approved_legs: list, *,
                     partial.append("%s filled %.4g of %.4g"
                                    % (leg["market"], got,
                                       leg["size"]))
+                elif _states_partial(resp):
+                    # [review] The venue SAID partially_filled and gave
+                    # no number. Reporting only "sent" plus the generic
+                    # may-part-fill warning drops a fact the venue
+                    # stated outright -- the operator should not have to
+                    # infer it from a caveat that applies to every IOC.
+                    partial.append("%s partially filled (quantity not "
+                                   "stated)" % leg["market"])
         except Exception as exc:  # noqa: BLE001 - shown, not raised
+            # [review] ...BUT A 4xx IS. The transport wraps definite
+            # server rejections (400/401/403/422) in the same
+            # exception family as timeouts and mid-read failures, so
+            # routing every exception to `unknown` was the mirror of
+            # the bug it fixed: the venue said NO and the operator was
+            # warned the order MAY HAVE EXECUTED, which invites them to
+            # hunt a position that does not exist. The status now rides
+            # on the exception, so a stated 4xx is a refusal and
+            # everything else -- 5xx, unreachable, mid-read -- stays
+            # unresolved, because those genuinely might have landed.
+            status = getattr(exc, "http_status", None)
+            if isinstance(status, int) and 400 <= status < 500:
+                _log.error("permuto: operator close leg %s refused by "
+                           "the venue (HTTP %s): %s",
+                           leg["market"], status, exc)
+                failed.append("%s: HTTP %s" % (leg["market"], status))
+                continue
             # [review] A TRANSPORT ERROR IS NOT A REFUSAL. _request()
             # can raise after urlopen() has already succeeded -- while
             # reading the response -- so the venue may well have taken

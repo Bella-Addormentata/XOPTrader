@@ -710,3 +710,78 @@ def test_a_list_of_junk_is_not_evidence_of_a_fill():
     assert order_verdict({"fills": [{"size": 10}]})[0] == "accepted"
     # ...and an acknowledgement without fills is unaffected.
     assert order_verdict({"action": "placed"})[0] == "accepted"
+
+
+class _CodeClient(_Client):
+    """A client whose place_order fails with a stated HTTP status."""
+
+    def __init__(self, payload, code=None, **kw):
+        super().__init__(payload, **kw)
+        self.code = code
+
+    def place_order(self, leg, now_s):
+        exc = RuntimeError("POST /exchange/order -> HTTP %s" % self.code)
+        if self.code is not None:
+            exc.http_status = self.code
+        raise exc
+
+
+def test_a_stated_4xx_is_a_refusal_not_an_unresolved_outcome():
+    """[review] The mirror of the bug it fixed.
+
+    The transport wraps definite server rejections (400/401/403/422) in
+    the same exception family as timeouts and mid-read failures, so
+    routing every exception to `unknown` told the operator an order MAY
+    HAVE EXECUTED when the venue had plainly said no -- sending them to
+    hunt a position that does not exist.
+    """
+    legs = plan_close({"QQQ-VOL-PERP": -100.0}, 1.0)
+    for code in (400, 401, 403, 422):
+        c = _CodeClient({"positions": [_pos("QQQ-VOL-PERP", "sell", 100)]},
+                        code=code)
+        res = send_close(c, 0.0, legs)
+        assert not res["unknown"], "HTTP %s was reported unresolved" % code
+        assert "refused" in res["note"], (code, res["note"])
+        assert "MAY HAVE EXECUTED" not in res["note"], code
+
+
+def test_anything_that_might_have_landed_stays_unresolved():
+    """5xx, unreachable and mid-read failures genuinely might have been
+    accepted, so they must keep the warning."""
+    legs = plan_close({"QQQ-VOL-PERP": -100.0}, 1.0)
+    for code in (500, 502, None):
+        c = _CodeClient({"positions": [_pos("QQQ-VOL-PERP", "sell", 100)]},
+                        code=code)
+        res = send_close(c, 0.0, legs)
+        assert res["unknown"], "HTTP %s lost its unresolved warning" % code
+        # The SERVICE wording; the uppercase "MAY HAVE EXECUTED" lives
+        # in the widget, and asserting UI text here would pass or fail
+        # for reasons that have nothing to do with this layer.
+        assert "UNRESOLVED" in res["note"], code
+        assert "EXECUTED" in res["note"], code
+        assert "refused" not in res["note"], code
+
+
+def test_a_blank_market_key_holding_a_boolean_is_malformed():
+    """[review] float(False) is 0.0, so {"": false} read as a genuine flat
+    row while every other path in this parser rejects booleans. A guard
+    added to two branches and not the third is how this module keeps
+    producing the same defect."""
+    for value in (True, False):
+        with pytest.raises(ClosePayloadError):
+            read_positions(_Client({"positions": {"": value, "A": -5.0}}), 0.0)
+    # A real zero under a blank key is still harmless.
+    assert read_positions(_Client({"positions": {"": 0.0, "A": -5.0}}),
+                          0.0) == {"A": -5.0}
+
+
+def test_a_stated_partial_without_a_quantity_is_still_reported():
+    """[review] The venue said partially_filled and gave no number.
+    Reporting only "sent" plus the generic may-part-fill caveat drops a
+    fact the venue stated outright."""
+    c = _Client({"positions": [_pos("QQQ-VOL-PERP", "sell", 100)]})
+    c.order_response = {"action": "partially_filled", "order_id": 7}
+    legs = plan_close({"QQQ-VOL-PERP": -100.0}, 1.0)
+    res = send_close(c, 0.0, legs)
+    assert res["partial"], "a stated partial fill was not reported"
+    assert "quantity not stated" in res["partial"][0], res["partial"]

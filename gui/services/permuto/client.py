@@ -162,18 +162,29 @@ class PermutoClient:
                 detail = exc.read().decode()[:400]
             except Exception:  # noqa: BLE001
                 pass
+            # [review] CARRY THE STATUS. A definite server rejection and
+            # an indeterminate timeout both arrive as PermutoAuthError,
+            # so a caller cannot tell "the venue said no" from "we never
+            # heard" -- and on the close path that is the difference
+            # between reporting a refusal and warning that an order MAY
+            # HAVE EXECUTED. An attribute keeps the exception types and
+            # every existing handler unchanged.
             if exc.code in (401, 403) and authed:
                 # Believe the server over our own clock. Leaving `forced`
                 # unset here would let renew_action() keep answering OK from
                 # a stale expiry while every request is rejected.
                 self.session.forced = True
-                raise PermutoSessionExpired(
+                expired = PermutoSessionExpired(
                     "%s %s -> HTTP %s (session rejected) %s"
                     % (method, path, exc.code, detail)
-                ) from exc
-            raise PermutoAuthError(
+                )
+                expired.http_status = exc.code
+                raise expired from exc
+            refused = PermutoAuthError(
                 "%s %s -> HTTP %s %s" % (method, path, exc.code, detail)
-            ) from exc
+            )
+            refused.http_status = exc.code
+            raise refused from exc
         except urllib.error.URLError as exc:
             raise PermutoAuthError(
                 "%s %s unreachable: %s" % (method, path, exc)
