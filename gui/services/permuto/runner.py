@@ -945,10 +945,11 @@ class QuoteRunner:
                 if (profile_by_market.get(m) is not None
                     and profile_by_market[m].withdraw
                     and not self._resting.get(m, RestingQuote()).empty)]
-        for market in self._markets:
-            wprofile = profile_by_market.get(market)
-            if wprofile is not None and wprofile.withdraw:
-                results[market] = ("withdraw", wprofile.reason)
+        shut = [m for m in self._markets
+                if (profile_by_market.get(m) is not None
+                    and profile_by_market[m].withdraw)]
+        for market in shut:
+            results[market] = ("withdraw", profile_by_market[market].reason)
         if pull:
             reason = profile_by_market[pull[0]].reason
             _log.warning("permuto: withdrawing %s -- %s",
@@ -966,6 +967,19 @@ class QuoteRunner:
                 return TickResult("withdraw", reason, results)
 
         if not any_quoted:
+            # [review] `shut`, not `pull`. `pull` is only the markets that
+            # still had something resting to cancel, and `withdrawing` is a
+            # snapshot of `results` taken far above -- BEFORE the loop just
+            # now rewrote those entries. Enter EXIT with a stage change that
+            # already cancelled the book and all three of those are empty
+            # while every per-market result says "withdraw", so this fell
+            # through to the "hold" below and told the GUI the book was live
+            # over nothing at all. The posture is what makes this a
+            # withdrawal; whether there happened to be an order left to pull
+            # is incidental.
+            if shut:
+                return TickResult(
+                    "withdraw", profile_by_market[shut[0]].reason, results)
             if withdrawing:
                 return TickResult("withdraw", withdraw_reason, results)
             wait = LoopAction.WAIT.value

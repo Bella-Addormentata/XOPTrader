@@ -282,6 +282,7 @@ class OracleFreeze:
     _last: dict = field(default_factory=dict)
     _changed_at_s: float = 0.0
     _changed_at_by_market_s: dict = field(default_factory=dict)
+    _first_seen_at_market_s: dict = field(default_factory=dict)
     _seeded: bool = False
 
     def observe(self, now_s: float, oracles: Mapping[str, float]) -> None:
@@ -308,6 +309,11 @@ class OracleFreeze:
                 # market_frozen() treats an unseen market as FROZEN, which
                 # is the safe direction to be wrong in.
                 self._last[market] = value
+                # ...but DO record when we started watching. Without this,
+                # a market that never changes has no entry anywhere and
+                # market_gone_quiet() below cannot tell "we have not looked
+                # long enough" from "we have watched it sit still all day".
+                self._first_seen_at_market_s[market] = now_s
                 continue
             if self._last[market] != value:
                 changed = True
@@ -363,10 +369,23 @@ class OracleFreeze:
         This is the one to use when asking "has a live market gone quiet
         while its neighbours carry on?" -- the case the aggregate freeze
         detector cannot see, because it resets whenever ANY market moves.
+
+        [review] "Never seen it move" is only absence of evidence for as
+        long as we have not been watching. A market that is ALREADY frozen
+        when the runner starts never takes the != branch in observe(), so
+        it never lands in _changed_at_by_market_s -- and returning False on
+        a missing entry meant it stayed quotable FOREVER, which is exactly
+        the market this gate exists to catch. Once confirm_s has elapsed
+        since we first saw it, sitting still IS the evidence. The
+        never-observed case still answers False: that one really is a
+        market we have not looked at.
         """
         changed_at = self._changed_at_by_market_s.get(market)
         if changed_at is None:
-            return False
+            first_seen = self._first_seen_at_market_s.get(market)
+            if first_seen is None:
+                return False
+            return (now_s - first_seen) >= self.confirm_s
         return (now_s - changed_at) >= self.confirm_s
 
     def market_frozen(self, market: str, now_s: float) -> bool:

@@ -448,3 +448,60 @@ def test_an_unseen_market_is_frozen_not_fresh():
     """Unknown freshness must tighten: never having seen a market move is
     not evidence that it does."""
     assert OracleFreeze().market_frozen("NEVER-SEEN", 1000.0) is True
+
+
+def test_a_market_frozen_since_startup_eventually_goes_quiet():
+    """[review] The fail-open that kept a dead feed quotable forever.
+
+    _changed_at_by_market_s is only written on an actual change, and a
+    first sighting deliberately does not count as one. So a market that
+    was ALREADY frozen when the runner started never landed in that dict
+    at all -- and market_gone_quiet() answered False on the missing key,
+    which meant "still fresh", which meant quotable. Not just during the
+    confirmation window: forever.
+
+    That is precisely the market this gate exists to catch. The aggregate
+    detector cannot see it, because it resets whenever ANY market moves,
+    so a neighbour ticking along keeps the whole curfew in SESSION while
+    this one sits on a price from before the process started.
+    """
+    f = OracleFreeze(confirm_s=100.0)
+    f.observe(1000.0, {"QQQ-VOL-PERP": 0.07})
+    # Inside the window it is still absence of evidence -- we have not
+    # been watching long enough to call it.
+    assert f.market_gone_quiet("QQQ-VOL-PERP", 1050.0) is False
+    # Keep reading the same value. At confirm_s, sitting still IS the
+    # evidence.
+    f.observe(1050.0, {"QQQ-VOL-PERP": 0.07})
+    f.observe(1100.0, {"QQQ-VOL-PERP": 0.07})
+    assert f.market_gone_quiet("QQQ-VOL-PERP", 1100.0) is True,         "a market that has not moved since startup stayed quotable forever"
+
+
+def test_a_market_we_have_never_observed_is_not_reported_quiet():
+    """The other half of the same call, and the reason it cannot simply
+    return True on a missing key: never having looked is not the same as
+    having watched it sit still. market_frozen() is the one that tightens
+    on an unseen market; this one must not, or the runner refuses to quote
+    anything until a second distinct value arrives.
+    """
+    f = OracleFreeze(confirm_s=100.0)
+    assert f.market_gone_quiet("NEVER-SEEN", 10_000.0) is False
+    # Even long after a different market has been seen and gone quiet.
+    f.observe(1000.0, {"QQQ-VOL-PERP": 0.07})
+    f.observe(1200.0, {"QQQ-VOL-PERP": 0.07})
+    assert f.market_gone_quiet("QQQ-VOL-PERP", 1200.0) is True
+    assert f.market_gone_quiet("NEVER-SEEN", 1200.0) is False
+
+
+def test_a_late_print_refreshes_a_market_that_had_gone_quiet():
+    """The first-seen fallback must not outrank a real print -- otherwise
+    a market that woke up would stay branded quiet on the strength of when
+    we happened to start watching it."""
+    f = OracleFreeze(confirm_s=100.0)
+    f.observe(1000.0, {"QQQ-VOL-PERP": 0.07})
+    f.observe(1200.0, {"QQQ-VOL-PERP": 0.07})
+    assert f.market_gone_quiet("QQQ-VOL-PERP", 1200.0) is True
+    f.observe(1210.0, {"QQQ-VOL-PERP": 0.09})        # it wakes up
+    assert f.market_gone_quiet("QQQ-VOL-PERP", 1210.0) is False
+    # ...and goes quiet again on its own schedule, not the startup one.
+    assert f.market_gone_quiet("QQQ-VOL-PERP", 1310.0) is True

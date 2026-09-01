@@ -7,7 +7,8 @@ import pytest
 
 from gui.services.permuto.auth import PermutoAuthError
 from gui.services.permuto.client import PermutoNotLinked
-from gui.services.permuto.quoting import RestingQuote
+from gui.services.permuto.quoting import (LoopAction, QuoteDecision,
+                                          RestingQuote)
 from gui.services.permuto.risk import FLATTEN_MARGIN_UTILISATION
 from gui.services.permuto.runner import RECANCEL_INTERVAL_S, QuoteRunner, _margin_state
 from gui.services.permuto.session import RenewAction
@@ -1163,13 +1164,37 @@ def test_the_same_position_is_unrestricted_mid_session():
 def test_a_frozen_oracle_floors_the_cap_even_mid_session():
     # The clock wrong in the direction that costs money: the table says
     # mid-session, the oracle has stopped moving. The freeze wins.
+    #
+    # [review] This used to assert a one-sided ["sell"] batch, which was
+    # only reachable because market_gone_quiet() fail-opened on a market
+    # that had never been seen to move: the runner kept quoting under the
+    # floored cap, and the floored cap shut the buy side. With the gate
+    # fixed the market is WITHDRAWN before that -- profile_for() calls a
+    # frozen oracle during a scheduled session the stale-price trap -- so
+    # no batch is sent at all after it goes quiet, and c.last_batch still
+    # holds the two-sided one from before the confirmation window closed.
+    # Asserting on last_batch therefore measures a STALE artefact; assert
+    # the two things the test actually meant instead.
     c = _Client(account=_account(100_000.0))
     r = _runner(c, curfew_enabled=True, max_position_usd=12_000.0)
     t = _MID_SESSION
+    seen = []
     for _ in range(6):                     # hold the oracle still
-        r.tick(t, _ORACLE, {})
+        seen.append(r.tick(t, _ORACLE, {}))
         t += 60.0
-    assert [leg["side"] for leg in c.last_batch] == ["sell"]
+
+    # The freeze beats the table: the cap is floored to the overnight
+    # stage even though the schedule says mid-session. That is the
+    # original point of this test and it still holds.
+    assert seen[-1].curfew == "closed", seen[-1].curfew
+
+    # And the market is not quoted against the price that stopped moving.
+    assert seen[-1].action == "withdraw", seen[-1].action
+    assert all(a == "withdraw" for a, _ in seen[-1].markets.values())
+
+    # It quoted BEFORE the confirmation window closed -- otherwise this
+    # would pass on a runner that never quotes at all.
+    assert seen[0].action == "quote", seen[0].action
 
 
 def test_curfew_disabled_ignores_the_clock_entirely():
@@ -2323,3 +2348,59 @@ def test_a_market_never_yet_observed_is_not_treated_as_stale():
     r = _runner(c, curfew_enabled=True)
     res = r.tick(_MID_SESSION, _ORACLE, {})     # the very first tick
     assert res.markets.get(_MKT, ("", ""))[0] == "quote", res.markets
+
+
+def test_a_withdrawn_book_never_reports_itself_as_holding(monkeypatch):
+    """[review] The GUI read "hold" over a book the runner had emptied.
+
+    Three things must all be empty for the old code to miss a withdrawal,
+    and in this state they are:
+
+      * `pull` lists only markets that still had an order to cancel, and
+        the deferred stage-change retraction (runner.py ~771) has already
+        emptied _resting by the time the posture pass runs at ~948;
+      * `withdrawing` is a snapshot of `results` taken at ~679, BEFORE the
+        posture pass rewrites those entries, so a withdrawal caused by the
+        POSTURE is invisible to it;
+      * decide() said HOLD, so `waiting` is empty too.
+
+    Control then reached `TickResult("hold", "all markets resting and in
+    ring")` while every per-market entry said "withdraw" and nothing was
+    resting at all. The GUI shows the top-level action, so the operator
+    saw a live two-sided book over a market that had been deliberately
+    emptied.
+
+    WHY THIS IS WHITE-BOX. decide() returns HOLD constantly in production
+    -- it is the steady state of a resting book that is still good -- but
+    it is unreachable through _Client, which does not round-trip resting
+    orders: instrumenting the whole existing sweep of stages and oracle
+    regimes produced QUOTE 720 times out of 720 and HOLD never. A
+    black-box test here would pass against the bug, so the HOLD is forced
+    directly rather than pretended into existence.
+    """
+    import gui.services.permuto.runner as runner_mod
+
+    c = _Client(account=_account(100_000.0))
+    r = _runner(c, curfew_enabled=True, max_position_usd=12_000.0)
+
+    # A normal tick first, so a real book is resting and the curfew has a
+    # stage to move away from.
+    t = _MID_SESSION
+    r.tick(t, _ORACLE, {})
+    assert not r._resting[_MKT].empty, "no resting book to withdraw"
+
+    monkeypatch.setattr(
+        runner_mod, "decide",
+        lambda *a, **k: QuoteDecision(LoopAction.HOLD, "resting and in ring"))
+    # The stage change whose retraction empties _resting mid-tick, after
+    # decide() has already answered.
+    r._curfew_retract_pending = True
+
+    # EXIT: the posture withdraws regardless of what decide() thought.
+    res = r.tick(CLOSES_UTC[0] - 600.0, _ORACLE, {})
+
+    assert r._resting[_MKT].empty, "the retraction did not empty the book"
+    assert all(a == "withdraw" for a, _ in res.markets.values()), res.markets
+    assert res.action == "withdraw", (
+        "reported %r over an empty book" % (res.action,))
+    assert res.reason
