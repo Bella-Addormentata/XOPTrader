@@ -143,11 +143,29 @@ microstructure literature behind it.
   sides exactly. So these are **quote samples standing in for trade prices**,
   outside the regime either estimator was derived for; the script says so in
   its own output and the caveat stays in front, not buried. Diagnostic only,
-  and the value is falsification rather than measurement — the gap is what
-  argues, not the level. Measured on XCH/BYC 2026-09-01 over 20 adjacent day
-  pairs: a posted 14,977 bps against a widest estimate of 1,820 bps, 8.2×.
-  Under the default `quote-touch` bars that estimate is an *upper* bound on
-  the range, so the gap holds a fortiori.
+  and what it offers is a descriptive discrepancy rather than a measurement.
+  Measured like-for-like on XCH/BYC 2026-09-01 against the most recent day
+  pair, the posted 14,666.7 bps is **0.99×** the 14,863.9 bps comparator —
+  no gap at all — and even that is soft, the comparator being 74% of the
+  20,000 bps ceiling Corwin-Schultz saturates toward.
+- **Retraction — the "a fortiori" claim about `quote-touch` bars.** This
+  entry previously said the default `quote-touch` bars give an *upper* bound
+  on the estimate, so the gap held a fortiori. Withdrawn, not hedged:
+  Corwin-Schultz **subtracts** the two-day range term `gamma`, so the
+  estimate is not monotonic in the sampled range — a wider range can lower
+  it, to zero. Abdi-Ranaldo has no monotonicity guarantee either. A bar
+  construction is a sensitivity choice, not a bound. Worked counterexample
+  in `docs/price-discovery-from-trade-history.md` § 6, recorded there rather
+  than silently edited.
+- **Second retraction — the 8.0× gap itself.** An earlier revision of this
+  entry said the 8.0× figure "is measured and stands". It does not. It came
+  from dividing ONE instantaneous quote sample by estimators averaged over a
+  month of day pairs — the window mismatch the same release fixes. Compared
+  like-for-like the ratio is 0.99×. Both retractions point the same way:
+  these estimators do not
+  identify sides — the absent-side finding for XCH/BYC rests on the direct
+  book observation (bids within 6.4% of the 1.41022765 anchor, asks at
+  3.5×–7.1× it) and never depended on them.
 - **`get_trades()` sort fix.** It passed `date_completed_desc`, which the
   dexie API does not recognise and silently ignores, so it returned an
   arbitrary page rather than recent trades. The valid value is

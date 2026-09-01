@@ -1,29 +1,42 @@
 #!/usr/bin/env python3
-"""Low-frequency high/low bid-ask spread estimators, run as a falsification test.
+"""Low-frequency high/low bid-ask spread estimators, run as a cross-check.
 
 OPERATOR DIAGNOSTIC ONLY.  Nothing in this module may ever become a live
 engine input -- not a fair-value term, not a spread floor, not a gate
 threshold, not a sanity bound.  The numbers it prints are produced from
 QUOTE samples standing in for trade prices (see "Bar construction" below),
 which is outside the regime every estimator here was derived for.  They are
-evidence in an argument, not measurements of a transaction cost.  If a
-future reader wants a spread number for the engine, take it from the book or
-from realized fills; do not import this file.
+one more description of a market, not measurements of a transaction cost.
+If a future reader wants a spread number for the engine, take it from the
+book or from realized fills; do not import this file.
 
 WHY IT EXISTS
 -------------
 The XCH/BYC book currently reports a spread of ~10,769 bps (best bid 1.5000
-BYC/XCH, best ask 4.9995, mid 3.24975).  The claim under test is that this is
-not a spread at all: the ask side is absent, and 10,769 bps is arithmetic on
-a quote nobody has ever hit.  Corwin-Schultz and Abdi-Ranaldo estimate an
-EFFECTIVE spread from daily high/low (and close) alone -- from the range the
-price actually travelled, not from the quotes standing on the book.  Feeding
-them the same market and getting back a number one to two orders of magnitude
-smaller is a falsification of the 10,769 bps figure, obtained without any
-appeal to our own fair-value model, our own fills, or BYC's declared par.
+BYC/XCH, best ask 4.9995, mid 3.24975).  Corwin-Schultz and Abdi-Ranaldo
+estimate an EFFECTIVE spread from daily high/low (and close) alone -- from
+the range the price actually travelled, not from the quotes standing on the
+book.  Feeding them the same market returns a number one to two orders of
+magnitude smaller.
 
-The estimators are used here for what they CANNOT return, which is the only
-use that survives their misuse as described above.
+WHAT THAT IS, AND WHAT IT IS NOT.  It is a DESCRIPTIVE DISCREPANCY: the
+posted book spread and the estimator output are different quantities
+computed different ways, and a large gap between them is worth an operator's
+attention.  It is NOT proof that a side of the book is absent, and this tool
+no longer says that it is.  Neither estimator identifies SIDES at all --
+both consume a daily high, a daily low and a close, and there is no step in
+either derivation at which a bid can be told from an ask.  Nor can an
+average over a month of day pairs distinguish a genuine spread that widened
+yesterday from a quote that went missing yesterday.
+
+The absent-side conclusion for XCH/BYC is separately and far better
+supported by direct observation of the book -- bids at 1.5000, within 6.4%
+of the 1.41022765 anchor, against asks at 4.9995-10.0, which is 3.5x-7.1x
+it -- and by the engine's per-side anchor test,
+cpp/include/xop/execution/book_side_quality.hpp, which scores each side
+against an INDEPENDENT anchor carrying no book input.  That test owns the
+per-side verdict.  It needs no help from the estimators here, and a
+diagnostic built on quote samples must not pre-empt it.
 
 Bar construction
 ----------------
@@ -38,16 +51,53 @@ output because the choice changes the answer:
   quote-touch (default)
       H_t = max(best_ask) over the day, L_t = min(best_bid) over the day,
       C_t = last mid.  Assumes a trade occurred at every quote that was ever
-      touched, so the daily range is the widest the quotes can justify.  This
-      is an UPPER BOUND on the range and therefore an UPPER BOUND on the
-      estimated spread.  The falsification argument holds a fortiori under
-      it: if even the upper bound lands far below the posted book spread,
-      the posted book spread is not a spread.
+      touched.  This is a SENSITIVITY CONSTRUCTION -- one choice of bar
+      inputs among several.  It does give the widest daily RANGE these
+      quotes can justify, but a wider range does NOT give a larger estimate:
+      see "Not monotonic in the sampled range" below.
 
   mid
       H_t = max(mid), L_t = min(mid), C_t = last mid.  Strips the bid-ask
       bounce that both estimators exist to extract, so it is biased hard
-      toward zero.  Useful only as a lower bracket.
+      toward zero.  A second sensitivity choice, not a bracket endpoint.
+
+Not monotonic in the sampled range
+----------------------------------
+AN EARLIER VERSION OF THIS FILE CLAIMED THAT quote-touch, BEING THE WIDEST
+RANGE, WAS AN UPPER BOUND ON THE ESTIMATE, AND THAT THE ARGUMENT THEREFORE
+HELD "A FORTIORI".  THAT CLAIM IS FALSE.  IT IS RETRACTED, NOT HEDGED.  The
+worked numbers are written out here so nobody reintroduces it.
+
+Corwin-Schultz SUBTRACTS the two-day-range term:
+
+    beta  = [ln(H1/L1)]^2 + [ln(H2/L2)]^2         (the two single days)
+    gamma = [ln(max(H1,H2)/min(L1,L2))]^2         (the TWO-DAY range)
+    alpha = (sqrt(2*beta) - sqrt(beta))/(3-2*sqrt2)
+            - sqrt(gamma/(3-2*sqrt2))
+    S     = 2(e^alpha - 1)/(1 + e^alpha)
+
+Widening a high or a low raises beta -- and it raises gamma too, and gamma
+enters with a MINUS sign.  Widening can therefore LOWER the estimate, or
+push it negative so it floors to zero.  Baseline H1=1.010 L1=0.990
+H2=1.012 L2=0.988, moving only day 1's high UPWARD and changing nothing
+else:
+
+    baseline (H1 = 1.010)      174.8 bps
+    H1 = 1.020 (wider)         155.2 bps   LOWER
+    H1 = 1.050 (wider)          64.8 bps   LOWER
+    H1 = 1.100 (wider)          16.3 bps   LOWER
+    H1 = 1.300 (wider)         -23.3 bps   LOWER (floors to zero)
+
+Abdi-Ranaldo is likewise nonlinear in the shifted log mid-ranges it
+multiplies, (c_t - eta_t)(c_t - eta_t1), and carries no monotonicity
+guarantee either.
+
+CONSEQUENCE, and it binds every line of output this file prints: the
+estimate one bar construction yields can be either HIGHER or LOWER than the
+estimate another yields, and no run of this tool bounds the estimate from
+above.  Wording of the form "upper bound", "ceiling argument", "a fortiori",
+"conservative direction", "at most" or "understates" is invalid here.  Do
+not reintroduce it.
 
 Two raw-spread figures, and they are NOT interchangeable
 --------------------------------------------------------
@@ -61,7 +111,7 @@ different questions and one number cannot answer both:
             observation, no averaging.  This is the CURRENT posted book.
 
 Only "obs last" can answer "is this book dislocated RIGHT NOW", so the
-dislocation flag and the FALSIFICATION verdict both read it.  A median does
+dislocation flag and the DISCREPANCY block both read it.  A median does
 not move until the new state dominates half the day's samples, so it lags a
 fresh dislocation in exactly the direction that hides one.  An earlier
 version of this tool computed the latest bar's MEDIAN, labelled it "obs now"
@@ -76,8 +126,32 @@ Method
     is defined on consecutive days; day pairs straddling a gap in our
     sampling are counted and skipped, never silently joined).
   * Abdi-Ranaldo over the same adjacent day pairs.
+  * The MOST RECENT adjacent day pair is also reported on its own, because
+    the headline figures average the whole lookback while the posted book
+    spread is a single instant, and a ratio between those two is not
+    like-for-like.  See "Comparing windows" below.
   * A freshness gate, a degeneracy gate and a SAMPLE gate, any of which
     REFUSES a pair outright rather than printing a plausible-looking number.
+    The freshness gate ages the newest bar that actually CONTRIBUTES to an
+    estimate, not the newest bar seen -- a fresh but degenerate or too-thin
+    bar must not vouch for a month-old estimate.  Both ages are carried, in
+    separately named fields, so they cannot be read for one another.
+
+Comparing windows
+-----------------
+The report prints a DISCREPANCY block, not a verdict.  Its two operands used
+to cover wildly different windows: "obs last" is ONE quote sample at ONE
+instant, while cs_bps / ar_bps average every adjacent day pair in the
+lookback -- up to a month of them.  A month-long average cannot tell a
+newly widened genuine spread from a side that went missing this morning, so
+a ratio between the two supports no conclusion about the current book.
+
+The block therefore compares the instant against the estimate over the
+SINGLE MOST RECENT day pair, which is the closest to like-for-like this data
+allows, and prints the residual mismatch explicitly: the instant's
+timestamp, the two days the comparator spans, and the span the headline
+figures average over.  Two days against one instant is still not a match.
+It is stated rather than hidden.
 
 SAMPLE SIZE
 -----------
@@ -160,7 +234,7 @@ MIN_SAMPLES_PER_BAR = 2
 # a gap in our sampling: four usable bars sitting either side of a gap can
 # yield as few as one adjacent pair, and before this gate existed the tool
 # would print headline Corwin-Schultz and Abdi-Ranaldo figures AND a full
-# FALSIFICATION verdict off that single observation.  The only guard was
+# DISCREPANCY block off that single observation.  The only guard was
 # "cs_values is non-empty", which refuses zero pairs and accepts one.
 #
 # Ardia, Guidotti and Kroencke (2024), "Efficient estimation of bid-ask
@@ -180,9 +254,12 @@ MIN_USABLE_DAY_PAIRS = 4
 # See the derivation note above.
 MIN_USABLE_BARS = MIN_USABLE_DAY_PAIRS + 1
 
-# Newest bar must be no older than this or the whole pair is refused.  BYC
-# pairs went enabled:false on 2026-08-31 and BYC/wUSDC.b last printed on
-# 2026-08-24, so this gate genuinely fires in production.
+# The newest USABLE bar must be no older than this or the whole pair is
+# refused.  USABLE, not merely newest seen: the bar this ages has to be one
+# that actually feeds an estimator, or a fresh degenerate/thin bar certifies
+# a month-old estimate as current.  BYC pairs went enabled:false on
+# 2026-08-31 and BYC/wUSDC.b last printed on 2026-08-24, so this gate
+# genuinely fires in production.
 MAX_BAR_AGE_DAYS = 2.0
 
 # A raw book spread at or above this is treated as a DISLOCATION flag, not a
@@ -194,6 +271,13 @@ DISLOCATION_SPREAD_BPS = 2000.0
 CS_K = 3.0 - 2.0 * math.sqrt(2.0)
 
 BPS = 10_000.0
+
+# S = 2(e^a - 1)/(1 + e^a) -> 2.0 as alpha -> +inf, so Corwin-Schultz cannot
+# print above 20,000 bps whatever the inputs.  A CS figure well up this range
+# is the estimator saturating, not a measured width -- and the discrepancy
+# block divides by it, so it says so when the comparator gets there.
+CS_SATURATION_BPS = 2.0 * BPS
+CS_SATURATION_WARN_FRACTION = 0.5
 
 SOURCES = ("offer_log", "snapshots")
 BAR_MODES = ("quote-touch", "mid")
@@ -211,9 +295,32 @@ ONE_SIDED_NOTE = (
     "ONE-SIDED BOOK: when one side of the book is absent, the surviving side "
     "supplies BOTH the daily high and the daily low. A high/low estimator "
     "cannot see a spread that no counterparty ever crossed, so any number it "
-    "returns for such a market is a CEILING ARGUMENT -- an upper bound on "
-    "what the traded range could justify -- and NOT a usable transaction "
-    "cost. Do not quote it as one."
+    "returns for such a market is NOT a usable transaction cost -- do not "
+    "quote it as one. It is also NOT a bound in either direction on what the "
+    "traded range could justify: Corwin-Schultz SUBTRACTS the two-day range "
+    "term, so widening the sampled highs and lows can LOWER the estimate or "
+    "floor it to zero (worked numbers in the module docstring), and "
+    "Abdi-Ranaldo carries no monotonicity guarantee either. The bar "
+    "construction is a SENSITIVITY choice, not a ceiling. And neither "
+    "estimator identifies SIDES, so nothing printed below can tell you which "
+    "side is missing; that question belongs to the engine's per-side anchor "
+    "test, cpp/include/xop/execution/book_side_quality.hpp."
+)
+
+
+NOT_MONOTONIC_NOTE = (
+    "NOT AN UPPER BOUND, IN ANY BAR MODE. The bar construction chosen with "
+    "--bars is a SENSITIVITY CHOICE, not a ceiling: these estimators are NOT "
+    "monotonic in the sampled range. Corwin-Schultz SUBTRACTS the two-day "
+    "range term gamma, so widening a high or a low raises gamma as well as "
+    "beta and can LOWER the output or drive it negative -- from a baseline "
+    "H1=1.010 L1=0.990 H2=1.012 L2=0.988 at 174.8 bps, raising ONLY H1 gives "
+    "155.2 bps at 1.020, 64.8 at 1.050, 16.3 at 1.100 and -23.3 at 1.300, "
+    "which floors to zero. Abdi-Ranaldo carries no monotonicity guarantee "
+    "either. An earlier version of this tool claimed quote-touch bars gave "
+    "an upper bound and that its argument therefore held a fortiori; that "
+    "claim is RETRACTED. Another bar choice can give a HIGHER number than "
+    "the one printed below, or a lower one."
 )
 
 
@@ -247,8 +354,8 @@ class Bar:
     A dislocation that arrives late in the day does not move the median
     until it owns half the day's samples, so the median lags in exactly the
     direction that hides a fresh dislocation.  Anything presenting CURRENT
-    state -- the dislocation flag, the "obs last" column, the falsification
-    verdict -- must read last_spread_bps.  Anything summarising the WINDOW
+    state -- the dislocation flag, the "obs last" column, the DISCREPANCY
+    block -- must read last_spread_bps.  Anything summarising the WINDOW
     reads spread_bps, which is what a median is right for.
     """
 
@@ -547,15 +654,38 @@ def estimate_pair(pair: str, bars: list[Bar], crossed_dropped: int,
         "cs_bps": None,
         "ar_bps": None,
         "ar_twoday_bps": None,
+        # The MOST RECENT adjacent day pair, reported apart from the
+        # lookback-wide averages above so the discrepancy block has a
+        # comparator whose window is close to the instant it is compared
+        # against.  See the "Comparing windows" note in the module docstring.
+        "latest_day_pair": None,
+        "latest_pair_cs_bps": None,
+        "latest_pair_ar_bps": None,
+        "latest_pair_ar_negative": None,
+        "day_pair_span": None,
         # Three DISTINCT raw-spread figures, deliberately not collapsed into
         # one field.  See the block below where they are filled in.
         "observed_spread_window_median_bps": None,
-        "latest_bar_median_bps": None,
+        "latest_raw_bar_median_bps": None,
         "observed_spread_last_sample_bps": None,
         "observed_spread_last_sample_at": None,
-        "latest_bar": bars[-1].day if bars else None,
-        "latest_bar_samples": bars[-1].samples if bars else None,
-        "latest_bar_age_days": None,
+        # TWO DISTINCT BARS AND TWO DISTINCT AGES, named apart on purpose.
+        #
+        #   latest_raw_bar*      bars[-1]: the newest bar SEEN. It may be
+        #                        degenerate or too thin to feed either
+        #                        estimator. Descriptive only.
+        #   newest_usable_bar*   the newest bar that survives the degeneracy
+        #                        and thinness filter, i.e. the newest bar
+        #                        that actually CONTRIBUTES. This is the one
+        #                        the freshness gate ages.
+        #
+        # They were one field once, and the gate read the raw one: a single
+        # fresh unusable bar could certify a month-old estimate as fresh.
+        "latest_raw_bar": bars[-1].day if bars else None,
+        "latest_raw_bar_samples": bars[-1].samples if bars else None,
+        "latest_raw_bar_age_days": None,
+        "newest_usable_bar": None,
+        "newest_usable_bar_age_days": None,
         # "dislocated" is THE flag and is driven by the last sample.
         # "dislocated_by_median" is reported only so a disagreement between
         # the two can be stated out loud; nothing branches on it.
@@ -579,7 +709,7 @@ def estimate_pair(pair: str, bars: list[Bar], crossed_dropped: int,
     #   last sample     the single newest quote sample, with its timestamp.
     #                   THIS is the current posted book, and it is the only
     #                   one of the three permitted to drive the dislocation
-    #                   flag or the falsification verdict.
+    #                   flag or the DISCREPANCY block.
     #
     # The tool used to publish the latest bar's MEDIAN under the heading
     # "obs now" and it was quoted to an operator as the current posted book
@@ -587,7 +717,7 @@ def estimate_pair(pair: str, bars: list[Bar], crossed_dropped: int,
     # A daily median cannot answer that question.
     result["observed_spread_window_median_bps"] = _median(
         [b.spread_bps for b in bars])
-    result["latest_bar_median_bps"] = latest.spread_bps
+    result["latest_raw_bar_median_bps"] = latest.spread_bps
     result["observed_spread_last_sample_bps"] = latest.last_spread_bps
     result["observed_spread_last_sample_at"] = latest.last_sample_at
     result["dislocated"] = latest.dislocated
@@ -597,8 +727,11 @@ def estimate_pair(pair: str, bars: list[Bar], crossed_dropped: int,
             f"DISLOCATION FLAG: the most recent quote sample, taken at "
             f"{latest.last_sample_at}, shows a raw book spread of "
             f"{latest.last_spread_bps:,.0f} bps, at or above the "
-            f"{DISLOCATION_SPREAD_BPS:,.0f} bps threshold. Read every "
-            f"estimate below as a ceiling argument."
+            f"{DISLOCATION_SPREAD_BPS:,.0f} bps threshold. The estimates "
+            f"above do not bound that figure in either direction -- they "
+            f"are a different quantity computed a different way, and the "
+            f"estimator is not monotonic in the sampled range. Read the gap "
+            f"as a discrepancy to look into, not as a measurement of it."
         )
         # SIDE DISPERSION IS DESCRIPTIVE ONLY.
         #
@@ -670,22 +803,21 @@ def estimate_pair(pair: str, bars: list[Bar], crossed_dropped: int,
             f"until half the day's samples agree."
         )
 
-    # --- FRESHNESS GATE ---------------------------------------------------
-    age_days = (datetime.now(timezone.utc).date()
-                - date.fromisoformat(latest.day)).days
-    result["latest_bar_age_days"] = age_days
-    if age_days > max_age_days:
-        result["refused"] = (
-            f"FRESHNESS GATE: newest bar is {latest.day} "
-            f"({age_days} days old, limit {max_age_days:g}). A high/low "
-            f"estimator run on a stale book reports the spread of a market "
-            f"that has stopped existing."
-        )
-        return result
+    # RAW newest-bar age.  DESCRIPTIVE ONLY -- this is the age of bars[-1],
+    # the newest bar SEEN, which may be degenerate or too thin to feed
+    # either estimator.  It stamps the "obs last" figure and nothing else.
+    # The freshness gate below does not read it.
+    today = datetime.now(timezone.utc).date()
+    raw_age_days = (today - date.fromisoformat(latest.day)).days
+    result["latest_raw_bar_age_days"] = raw_age_days
 
     # --- DEGENERACY GATE (per bar) ----------------------------------------
     # H == L means the day produced a single price: no range, no information.
     # Refuse the bar rather than let it return a plausible-looking zero.
+    #
+    # THIS RUNS BEFORE THE FRESHNESS GATE, and the order is the point: the
+    # freshness gate has to age a bar that actually contributes, and which
+    # bars contribute is not known until this filter has run.
     usable: list[Bar] = []
     for bar in bars:
         if bar.degenerate:
@@ -698,6 +830,40 @@ def estimate_pair(pair: str, bars: list[Bar], crossed_dropped: int,
         usable.append(bar)
     result["bars_used"] = len(usable)
 
+    # --- FRESHNESS GATE (newest USABLE bar) -------------------------------
+    # THE AGE THAT MATTERS IS THE AGE OF THE NEWEST BAR THAT CONTRIBUTES.
+    #
+    # This gate used to test bars[-1] -- and it did so BEFORE the filter
+    # above ran, so the bar it aged was the newest bar seen, usable or not.
+    # One fresh but unusable bar (a degenerate H==L day, or a day with a
+    # single quote sample) was therefore enough to pass the gate while every
+    # bar feeding the estimators was weeks old: five older usable bars and
+    # today's junk bar would publish a month-stale estimate under a
+    # freshness stamp saying zero days. The two ages live in separately
+    # named fields for the same reason, and the refusal below says which one
+    # it tested.
+    if usable:
+        newest_usable = usable[-1]
+        usable_age_days = (today
+                           - date.fromisoformat(newest_usable.day)).days
+        result["newest_usable_bar"] = newest_usable.day
+        result["newest_usable_bar_age_days"] = usable_age_days
+        if usable_age_days > max_age_days:
+            same = newest_usable.day == latest.day
+            result["refused"] = (
+                f"FRESHNESS GATE: the newest USABLE bar -- the newest one "
+                f"that would actually contribute to an estimate -- is "
+                f"{newest_usable.day}, {usable_age_days} days old, limit "
+                f"{max_age_days:g}. THIS IS THE AGE THE GATE TESTED. The "
+                f"newest bar SEEN is {latest.day} ({raw_age_days} days old)"
+                + (", the same bar. " if same else
+                   ", which is degenerate or too thin to contribute and so "
+                   "cannot vouch for the estimate's freshness. ")
+                + "A high/low estimator run on a stale book reports the "
+                  "spread of a market that has stopped existing."
+            )
+            return result
+
     if len(usable) < MIN_USABLE_BARS:
         result["refused"] = (
             f"DEGENERACY GATE: only {len(usable)} usable bars "
@@ -705,13 +871,22 @@ def estimate_pair(pair: str, bars: list[Bar], crossed_dropped: int,
             f"{result['bars_thin']} below {MIN_SAMPLES_PER_BAR} samples); "
             f"need {MIN_USABLE_BARS} (and {MIN_USABLE_DAY_PAIRS} adjacent "
             f"day pairs, i.e. {MIN_USABLE_DAY_PAIRS + 1} CONSECUTIVE usable "
-            f"bars, to produce an estimate)."
+            f"bars, to produce an estimate). Newest usable bar "
+            f"{result['newest_usable_bar'] or 'n/a'}; newest bar seen "
+            f"{latest.day} ({raw_age_days} days old)."
         )
         return result
 
     # --- Estimation over ADJACENT calendar-day pairs ----------------------
     cs_values: list[float] = []
     ar_sq_values: list[float] = []
+    # (day_t, day_t1, floored CS, raw AR S^2) per ADJACENT pair, in day
+    # order, so [-1] is the most recent two-day window.  Kept because the
+    # headline figures average the whole lookback while the posted book
+    # spread is one instant; comparing those two directly is not
+    # like-for-like, and the newest pair is the nearest comparator this data
+    # affords.  See "Comparing windows" in the module docstring.
+    pair_records: list[tuple[str, str, float, float]] = []
     for bar_t, bar_t1 in zip(usable, usable[1:], strict=False):
         if (date.fromisoformat(bar_t1.day) - date.fromisoformat(bar_t.day)).days != 1:
             # Both estimators are defined on CONSECUTIVE days.  Our sampling
@@ -736,6 +911,8 @@ def estimate_pair(pair: str, bars: list[Bar], crossed_dropped: int,
         if sq < 0.0:
             result["ar_negative"] += 1
         ar_sq_values.append(sq)
+
+        pair_records.append((bar_t.day, bar_t1.day, max(spread, 0.0), sq))
 
     # --- SAMPLE GATE (adjacent day pairs) ---------------------------------
     # The real sample size.  MIN_USABLE_BARS above counted BARS, which
@@ -779,6 +956,28 @@ def estimate_pair(pair: str, bars: list[Bar], crossed_dropped: int,
     two_day = [math.sqrt(v) for v in ar_sq_values if v > 0.0]
     result["ar_twoday_bps"] = (sum(two_day) / len(ar_sq_values) * BPS
                                if two_day else 0.0)
+
+    # --- The MOST RECENT two-day estimate ---------------------------------
+    # Everything above averages over the whole lookback.  The posted book
+    # spread the report compares against is a SINGLE quote sample at a
+    # single instant.  Those cover different windows, and the ratio between
+    # them cannot support a claim about the current book: a lookback-wide
+    # average cannot distinguish a genuine spread that widened yesterday
+    # from a quote that vanished yesterday.  So the newest adjacent day pair
+    # is carried separately and the discrepancy block is computed against
+    # IT, with the residual mismatch -- two days against one instant --
+    # printed rather than hidden.  n = 1 day pair, which is why it is a
+    # comparator and never a headline figure.
+    #
+    # pair_records is non-empty here: the sample gate above returns unless
+    # day_pairs_used >= MIN_USABLE_DAY_PAIRS, and every counted pair appends.
+    last_t, last_t1, last_cs, last_ar_sq = pair_records[-1]
+    result["latest_day_pair"] = f"{last_t}..{last_t1}"
+    result["day_pair_span"] = f"{pair_records[0][0]}..{pair_records[-1][1]}"
+    result["latest_pair_cs_bps"] = last_cs * BPS
+    result["latest_pair_ar_bps"] = (math.sqrt(last_ar_sq) * BPS
+                                    if last_ar_sq > 0.0 else 0.0)
+    result["latest_pair_ar_negative"] = last_ar_sq <= 0.0
 
     neg_rate = result["cs_negative"] / result["day_pairs_used"]
     if neg_rate > 0.5:
@@ -934,6 +1133,9 @@ def print_report(results: list[dict], dexie_rows: list[dict],
     print("trade prices, which is outside the regime all three estimators "
           "were derived for.")
     print()
+    for line in _wrap(NOT_MONOTONIC_NOTE, 78):
+        print(line)
+    print()
     for line in _wrap(ONE_SIDED_NOTE, 78):
         print(line)
     print()
@@ -994,7 +1196,7 @@ def print_report(results: list[dict], dexie_rows: list[dict],
           "one observation,")
     print("           no averaging -- the book as it currently stands. "
           "The dislocation")
-    print("           flag and the FALSIFICATION verdict read THIS column, "
+    print("           flag and the DISCREPANCY block read THIS column, "
           "never obs med.")
     # One line per pair rather than a wrapped run-on: a wrapped list splits
     # timestamps across lines and separates a stamp from its pair, which is
@@ -1047,55 +1249,142 @@ def print_report(results: list[dict], dexie_rows: list[dict],
             print(f"  raw book spread MEDIAN {obs_med:>10,.1f} bps   "
                   f"(WINDOW MEDIAN of {r['bars_seen']} daily medians; "
                   f"NOT now)")
-            print(f"    latest bar {r['latest_bar']}: median "
-                  f"{r['latest_bar_median_bps']:,.1f} bps over "
-                  f"{r['latest_bar_samples']} samples (also NOT now)")
-            best = max(r["cs_bps"] or 0.0, r["ar_bps"] or 0.0,
-                       r["ar_twoday_bps"] or 0.0)
-            if best > 0.0 and obs_last > 0.0:
-                # The verdict compares the CURRENT posted book against the
-                # estimators, so the numerator is the last sample.  Using
-                # the median here would answer a question nobody asked.
-                ratio = obs_last / best
-                if ratio <= 1.0:
-                    verdict = (
-                        f"the posted book spread is within the widest "
-                        f"high/low estimate ({ratio:.2f}x). No contradiction: "
-                        f"the range the price travelled is consistent with "
-                        f"the quoted width."
-                    )
-                elif r["dislocated"]:
-                    verdict = (
-                        f"the posted book spread is {ratio:,.1f}x the widest "
-                        f"high/low estimate, on a book already carrying the "
-                        f"dislocation flag. The estimators work on the range "
-                        f"the price TRAVELLED; they cannot see a width no "
-                        f"counterparty ever crossed. That gap is the evidence "
-                        f"that the posted figure is an absent side, not a "
-                        f"spread."
-                    )
+            print(f"    newest bar SEEN {r['latest_raw_bar']}: median "
+                  f"{r['latest_raw_bar_median_bps']:,.1f} bps over "
+                  f"{r['latest_raw_bar_samples']} samples (also NOT now)")
+            # TWO BARS, TWO AGES, SPELLED OUT SEPARATELY. The freshness gate
+            # ages the newest bar that CONTRIBUTES; the newest bar seen may
+            # be degenerate or too thin, and then it vouches for nothing.
+            print(f"    bar ages: newest SEEN {r['latest_raw_bar']} "
+                  f"({r['latest_raw_bar_age_days']}d), newest USABLE "
+                  f"{r['newest_usable_bar']} "
+                  f"({r['newest_usable_bar_age_days']}d)")
+            print("              the freshness gate tested the USABLE age; "
+                  "the seen bar may")
+            print("              be degenerate or thin and vouches for "
+                  "nothing")
+
+            # --- DISCREPANCY, made as like-for-like as the data allows -----
+            # obs_last is ONE sample at ONE instant. cs_bps / ar_bps average
+            # every adjacent day pair in the lookback -- up to a month. A
+            # ratio between those compares an instant against a month, and a
+            # month-long average cannot tell a genuine spread that widened
+            # yesterday from a quote that vanished yesterday, so no claim
+            # about the CURRENT book survives the mismatch. The ratio below
+            # therefore uses the MOST RECENT day pair, and the mismatch that
+            # remains -- two days against one instant -- is printed.
+            recent_cs = r["latest_pair_cs_bps"] or 0.0
+            recent_ar = r["latest_pair_ar_bps"] or 0.0
+            recent = max(recent_cs, recent_ar)
+            window_max = max(r["cs_bps"] or 0.0, r["ar_bps"] or 0.0,
+                             r["ar_twoday_bps"] or 0.0)
+            print(f"  most recent day pair {r['latest_day_pair']}: "
+                  f"CS {recent_cs:,.1f} bps, AR {recent_ar:,.1f} bps")
+            print("    n=1 pair -- the like-for-like comparator for "
+                  "'raw book spread NOW',")
+            print("    never a headline figure")
+            if obs_last > 0.0:
+                obs_day = (r["observed_spread_last_sample_at"] or "")[:10]
+                try:
+                    lag_days = (
+                        date.fromisoformat(obs_day)
+                        - date.fromisoformat(
+                            r["latest_day_pair"].split("..")[1])).days
+                except ValueError:
+                    lag_days = None
+                obs_med_str = _fmt_bps(
+                    r["observed_spread_window_median_bps"]).strip()
+                preamble = (
+                    f"DISCREPANCY (descriptive -- NOT a verdict about "
+                    f"either side of the book). THE TWO OPERANDS COVER "
+                    f"DIFFERENT WINDOWS, and here is by how much: the "
+                    f"posted figure is ONE quote sample at ONE instant, "
+                    f"{obs_last:,.1f} bps at "
+                    f"{r['observed_spread_last_sample_at']}; the comparator "
+                    f"is the estimate over the single most recent day pair "
+                    f"{r['latest_day_pair']} (n=1"
+                    + ("" if lag_days is None else
+                       ", ending on that sample's own calendar day"
+                       if lag_days == 0 else
+                       f", ending {lag_days} day"
+                       f"{'' if lag_days == 1 else 's'} before that sample")
+                    + f"). Two days against one instant is still not a "
+                    f"match; it is the closest this data allows. The "
+                    f"headline CS/AR figures above average n={n} day pairs "
+                    f"spanning {r['day_pair_span']} -- a different window "
+                    f"again, and NOT what this ratio uses (their largest is "
+                    f"{window_max:,.1f} bps). Window median raw spread for "
+                    f"reference {obs_med_str} bps. "
+                )
+                if recent > 0.0:
+                    ratio = obs_last / recent
+                    if ratio <= 1.0:
+                        body = (
+                            f"The posted book spread is at or below the "
+                            f"most recent two-day estimate ({ratio:.2f}x). "
+                            f"No discrepancy to look into."
+                        )
+                    elif r["dislocated"]:
+                        body = (
+                            f"The posted book spread is {ratio:,.1f}x the "
+                            f"most recent two-day estimate, on a book "
+                            f"already carrying the dislocation flag. THAT "
+                            f"IS A LARGE DISCREPANCY BETWEEN TWO QUANTITIES "
+                            f"COMPUTED DIFFERENT WAYS AND AN OPERATOR "
+                            f"SHOULD LOOK AT IT. It is NOT a finding that a "
+                            f"side of the book is absent, and this tool "
+                            f"does not draw one: neither estimator "
+                            f"identifies SIDES -- both consume a high, a "
+                            f"low and a close, with no step at which a bid "
+                            f"is told from an ask -- and a high/low range "
+                            f"cannot distinguish a genuinely widened spread "
+                            f"from a quote that went missing. The per-side "
+                            f"question belongs to the engine's per-side "
+                            f"anchor test, "
+                            f"cpp/include/xop/execution/book_side_quality"
+                            f".hpp, which scores each side against an "
+                            f"INDEPENDENT anchor. Take the verdict from "
+                            f"there, not from here."
+                        )
+                    else:
+                        body = (
+                            f"The posted book spread is {ratio:,.1f}x the "
+                            f"most recent two-day estimate, on a book NOT "
+                            f"carrying the dislocation flag. Consistent "
+                            f"with the ordinary quoted-versus-effective "
+                            f"spread wedge plus estimator bias. Nothing "
+                            f"here identifies a missing side either way -- "
+                            f"that is book_side_quality.hpp's question."
+                        )
                 else:
-                    verdict = (
-                        f"the posted book spread is {ratio:,.1f}x the widest "
-                        f"high/low estimate, but this book is NOT flagged "
-                        f"dislocated, so the gap is the ordinary quoted-vs-"
-                        f"effective spread wedge plus estimator bias -- not "
-                        f"evidence of a missing side."
+                    body = (
+                        f"NO RATIO IS REPORTED: the most recent day pair "
+                        f"{r['latest_day_pair']} produced no positive "
+                        f"estimate (Corwin-Schultz floored to zero and "
+                        f"Abdi-Ranaldo's S^2 term was non-positive), so "
+                        f"there is nothing like-for-like to divide the "
+                        f"{obs_last:,.1f} bps posted spread by. The "
+                        f"lookback-wide figures above cover a different "
+                        f"window and are not a substitute for one."
                     )
-                # The sample size travels with the verdict.  A falsification
-                # claim is only as strong as the number of two-day terms
-                # behind it, and that number is n day pairs, never the bar
-                # count printed above it.
-                for line in _wrap(
-                        f"FALSIFICATION (estimator n = {n} adjacent day "
-                        f"pairs; \"posted book spread\" is the SINGLE LAST "
-                        f"QUOTE SAMPLE, {obs_last:,.1f} bps at "
-                        f"{r['observed_spread_last_sample_at']} -- window "
-                        f"median for comparison "
-                        f"{_fmt_bps(r['observed_spread_window_median_bps'])} "
-                        f"bps. The two can straddle the estimate, so a "
-                        f"verdict resting on the last sample alone moves "
-                        f"between runs; read both): " + verdict, 74):
+                # The comparator is now a DIVISOR, so a saturating
+                # Corwin-Schultz term silently shrinks the ratio and can
+                # turn a real gap into "nothing to look into". The bounded-
+                # ness note in the header covers the headline figures; this
+                # covers the one number the ratio actually rests on.
+                if recent_cs >= (CS_SATURATION_WARN_FRACTION
+                                 * CS_SATURATION_BPS):
+                    body += (
+                        f" CAVEAT ON THE DIVISOR: the comparator's "
+                        f"Corwin-Schultz term, {recent_cs:,.1f} bps, is "
+                        f"{recent_cs / CS_SATURATION_BPS:.0%} of the "
+                        f"{CS_SATURATION_BPS:,.0f} bps ceiling that "
+                        f"S = 2(e^a - 1)/(1 + e^a) imposes as alpha -> "
+                        f"+inf. Read it as the estimator saturating rather "
+                        f"than as a measured width, and the ratio above as "
+                        f"correspondingly soft."
+                    )
+                for line in _wrap(preamble + body, 74):
                     print(f"  {line}")
         for note in r["notes"]:
             for line in _wrap("NOTE: " + note, 74):
@@ -1177,11 +1466,16 @@ def main(argv: list[str] | None = None) -> int:
                              "(third-party BBO samples) or snapshots "
                              "mid+spread (denser; default offer_log)")
     parser.add_argument("--bars", choices=BAR_MODES, default="quote-touch",
-                        help="bar construction (default quote-touch, an "
-                             "upper bound on the daily range)")
+                        help="bar construction: a SENSITIVITY choice, NOT a "
+                             "bound -- these estimators are not monotonic in "
+                             "the sampled range, so another mode can return "
+                             "a higher number as easily as a lower one "
+                             "(default quote-touch, the widest daily range)")
     parser.add_argument("--max-age-days", type=float, default=MAX_BAR_AGE_DAYS,
                         help=f"freshness gate: refuse a pair whose newest "
-                             f"bar is older than this "
+                             f"USABLE bar -- the newest one that actually "
+                             f"contributes to an estimate, not merely the "
+                             f"newest one seen -- is older than this "
                              f"(default {MAX_BAR_AGE_DAYS:g})")
     parser.add_argument("--dexie", action="store_true",
                         help="also GET api.dexie.space/v1/markets for live "
@@ -1237,6 +1531,11 @@ def main(argv: list[str] | None = None) -> int:
             "operator_diagnostic_only": True,
             "not_a_live_engine_input": True,
             "one_sided_book_note": ONE_SIDED_NOTE,
+            # The bar mode is a sensitivity choice, not a ceiling: these
+            # estimators are not monotonic in the sampled range.  A JSON
+            # consumer must not treat any figure below as an upper bound.
+            "not_an_upper_bound_note": NOT_MONOTONIC_NOTE,
+            "estimate_is_monotonic_in_sampled_range": False,
             "source": args.source,
             "bars": args.bars,
             "days": args.days,
@@ -1251,11 +1550,30 @@ def main(argv: list[str] | None = None) -> int:
             # observed_spread_last_sample_bps is a SINGLE observation and is
             # the only field describing the book NOW; it is what "dislocated"
             # is computed from.  observed_spread_window_median_bps and
-            # latest_bar_median_bps are medians and are window/day summaries
-            # -- neither is current state.
+            # latest_raw_bar_median_bps are medians and are window/day
+            # summaries -- neither is current state.
             "current_spread_field": "observed_spread_last_sample_bps",
             "current_spread_timestamp_field": "observed_spread_last_sample_at",
             "window_spread_field": "observed_spread_window_median_bps",
+            # The like-for-like comparator for current_spread_field.  cs_bps
+            # and ar_bps average day_pairs_used pairs across the whole
+            # lookback; comparing an instant against that is not
+            # like-for-like, so a consumer wanting a ratio must use these.
+            "recent_estimate_fields": ["latest_pair_cs_bps",
+                                       "latest_pair_ar_bps"],
+            "recent_estimate_window_field": "latest_day_pair",
+            "window_estimate_span_field": "day_pair_span",
+            # Neither estimator identifies SIDES.  A discrepancy between
+            # current_spread_field and the recent estimate is descriptive; a
+            # per-side verdict comes from the engine's anchor test.
+            "per_side_verdict_source":
+                "cpp/include/xop/execution/book_side_quality.hpp",
+            # TWO bar ages, deliberately distinct.  The freshness gate reads
+            # newest_usable_bar_age_days -- the newest bar that contributes
+            # to an estimate.  latest_raw_bar_age_days is the newest bar
+            # SEEN and is descriptive only; it may be degenerate or thin.
+            "freshness_gate_field": "newest_usable_bar_age_days",
+            "raw_newest_bar_age_field": "latest_raw_bar_age_days",
             "min_day_pairs": MIN_USABLE_DAY_PAIRS,
             "min_usable_bars": MIN_USABLE_BARS,
             "generated_at": datetime.now(timezone.utc)

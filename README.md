@@ -448,16 +448,40 @@ were derived for. That caveat is real and the script prints it on every run.
 single bar, both estimators need two consecutive ones, so it is an
 independent range check and gate test — never an estimator input.)
 
-Their value here is *falsification*, not measurement: the estimators recover
-a spread from an observed daily range, so when the posted book spread is many
-times their widest output, the posted figure is an absent side rather than a
-spread. Measured on XCH/BYC 2026-09-01: posted 14,977 bps against a widest
-estimate of 1,820 bps over 20 adjacent day pairs, an 8.2× gap. The default
-`quote-touch` bars take the high from the ask side and the low from the bid,
-making that estimate an *upper* bound on the range, so the gap holds a
-fortiori. The script refuses outright on stale, degenerate or under-sampled
-books rather than returning a plausible-looking number, and a spread number
-for the engine comes from the book or from realized fills — never from here.
+Their value here is a *descriptive discrepancy*, not measurement: the posted
+book spread and the estimator output are different quantities computed
+different ways, and a large gap between them is worth an operator's attention.
+
+The honest answer, measured 2026-09-01, is that the estimators contribute
+nothing to this argument in either direction. Compared LIKE FOR LIKE against
+the most recent day pair (2026-08-30..2026-08-31), the posted 14,666.7 bps
+sits at 0.99× the comparator's 14,863.9 bps: no gap at all, and the tool
+prints "No discrepancy to look into." Even that is soft, because the
+comparator is 74% of the 20,000 bps ceiling Corwin-Schultz saturates toward,
+so it is the estimator running out of range rather than a measured width.
+
+The 8.0× gap an earlier revision of this section quoted was an ARTIFACT of a
+window mismatch -- one instant divided by a month-long average -- and the
+tool was changed to stop producing it. The absent-side finding for XCH/BYC
+is unaffected, because it never rested on these estimators: it rests on the
+direct book observation, bids within 6.4% of the 1.41022765 anchor against
+asks at 3.5×–7.1× it. Run the tool for current numbers rather than quoting
+any of these.
+
+**Retracted 2026-09-01:** this section previously claimed the default
+`quote-touch` bars give an *upper* bound on the estimate, so the gap held "a
+fortiori". That is wrong and is withdrawn, not softened — Corwin-Schultz
+*subtracts* the two-day range term, so the estimate is not monotonic in the
+sampled range and a wider range can lower it. See the worked counterexample in
+`docs/price-discovery-from-trade-history.md` § 6. A bar construction is a
+sensitivity choice, not a bound. The estimators also do not identify sides at
+all: the absent-side conclusion for XCH/BYC stands on the direct book
+observation (bids within 6.4% of the 1.41022765 anchor, asks at 3.5×–7.1× it)
+and never needed them.
+
+The script refuses outright on stale, degenerate or under-sampled books rather
+than returning a plausible-looking number, and a spread number for the engine
+comes from the book or from realized fills — never from here.
 
 ---
 

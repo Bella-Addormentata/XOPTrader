@@ -448,42 +448,107 @@ not come from here.
 
 Two bar constructions are offered and the choice changes the answer, so the
 tool declares which one produced a figure. `quote-touch` (the default) takes
-the daily high from the ask side and the low from the bid side, which is an
-**upper bound** on the range and therefore on the estimated spread; `mid`
-takes both from the mid, which strips the bid-ask bounce the estimators
-exist to extract and brackets from below. The falsification argument below
-holds a fortiori under the upper bound: if even that lands far under the
-posted book spread, the posted figure is not a spread.
+the daily high from the ask side and the low from the bid side; `mid` takes
+both from the mid, which strips the bid-ask bounce the estimators exist to
+extract. Neither one bounds the other. A bar construction is a
+**sensitivity choice**: one set of inputs among several, and the estimate it
+yields can come out higher *or* lower than the estimate from another choice.
+Report which bars produced a figure and read two constructions as two
+readings, never as brackets.
 
-### The falsification argument -- this is the actual value
+> **RETRACTED 2026-09-01.** Earlier versions of this section, of the README
+> and of the changelog argued that `quote-touch` bars widen the sampled
+> range and therefore yield an **upper bound** on the estimated spread, so
+> the discrepancy below held "a fortiori". That is mathematically wrong and
+> is withdrawn outright -- not narrowed, not hedged to "usually". In
+> Corwin-Schultz the two-day range term
+> `gamma = [ln(max(H1,H2)/min(L1,L2))]^2` enters `alpha` with a **minus**
+> sign, so the estimate is not monotonic in the sampled range: widening a
+> high or a low can *lower* the output, or drive it negative. Worked
+> counterexample, baseline `H1=1.010 L1=0.990 H2=1.012 L2=0.988`, raising
+> only day one's high and changing nothing else:
+>
+> | day-1 high | estimate  |
+> |------------|-----------|
+> | 1.010 (baseline) | 174.8 bps |
+> | 1.020      | 155.2 bps |
+> | 1.050      |  64.8 bps |
+> | 1.100      |  16.3 bps |
+> | 1.300      | -23.3 bps (floors to zero) |
+>
+> A strictly wider range, a monotonically *falling* estimate. Abdi-Ranaldo
+> is likewise nonlinear in the shifted log mid-ranges and carries no
+> monotonicity guarantee either. Every claim that rested on this -- "upper
+> bound", "ceiling argument", "a fortiori", "the conservative direction" --
+> goes with it. This is recorded rather than quietly edited because the job
+> of this document is to stop settled questions being re-litigated, and a
+> claim that silently changes teaches the opposite lesson.
+>
+> `scripts/highlow_spread_estimator.py` carries the same retraction in its
+> module docstring and in the one-sided-book banner it prints on every run.
+> If any output of that tool still reads as a ceiling or bound argument, the
+> tool is wrong and this section is right.
+
+### The measured discrepancy -- descriptive, and not proof of anything
 
 These estimators recover a spread from the ratio of an observed high to an
 observed low, and on a trade-price series both are prices that occurred
 inside the bar. On a market whose prints all cluster within a few percent
-of 1.40, the family **structurally cannot return 10,769 bps**. The tool we
-have runs on quote samples rather than prints, so it does not get that
-structural guarantee for free -- it earns the same conclusion empirically,
-and under the `quote-touch` upper bound at that. Nor is the analytic bound
-the argument: Corwin-Schultz saturates at 2.0, i.e. 20,000 bps, so a large
-CS output means the estimator has saturated and is not confirmation of a
-large spread.
+of 1.40, the family cannot return 10,769 bps -- that one is a bound on the
+*inputs*, not on the bar construction: bounded log ranges bound `beta`, and
+`gamma` only ever subtracts. The tool we have runs on quote samples rather
+than prints, so it does not even get that for free. Nor is the analytic
+bound the argument: Corwin-Schultz saturates at 2.0, i.e. 20,000 bps, so a
+large CS output means the estimator has saturated and is not confirmation of
+a large spread.
 
-**The measured gap is the argument.** XCH/BYC on 2026-09-01, over 20
-adjacent day pairs: a posted book spread of 14,977 bps against a widest
-estimate of 1,820 bps -- 8.2x, on bars whose high is taken from the junk
-ask side and is therefore already generous to the posted figure. That is an
-independent, model-based indication that **the book's "spread" is not a
-spread** -- it is the distance to an absent quote. It is a test we can run
-on every day the pair was sampled, and it is worth considerably more to an
-operator than a price estimate we had already decided not to use.
+**And the discrepancy does not survive a like-for-like comparison either.**
+This is the second retraction in this section, and it is the more important
+one. An earlier revision reported XCH/BYC on 2026-09-01 as "the widest
+estimate 1,824.8 bps against 14,666.7 bps posted -- 8.0x", and read that gap
+as the surviving evidence. It was an artifact of a WINDOW MISMATCH: the
+numerator is one quote sample at one instant, while the denominator averaged
+20 adjacent day pairs spanning a month. Dividing an instant by a month-long
+average measures the window, not the book.
+
+Compared like-for-like against the single most recent day pair
+(2026-08-30..2026-08-31), the same posted 14,666.7 bps sits at **0.99x** the
+comparator's 14,863.9 bps. No gap. The tool now prints "No discrepancy to
+look into" for this pair, and carries the window mismatch and its size in
+the output so the comparison cannot be made carelessly again.
+
+Even the 0.99x is soft: that comparator is 74% of the 20,000 bps ceiling
+Corwin-Schultz saturates toward as alpha grows, so it is the estimator
+running out of range rather than a measured width. A saturating divisor
+flatters any ratio built on it.
+
+The window median of the daily medians, 341.7 bps, sits *below* the
+estimate, so the two posted figures straddle it and the sign of any "gap"
+depends on which is read. Every one of these numbers moves between runs.
+Quote the run, not this paragraph.
+
+That divergence is **descriptive**. The posted spread and the estimator
+output are different quantities computed different ways, and a large gap
+between them is a flag worth an operator chasing. It is not proof of an
+absent side. These estimators do not identify sides at all -- they consume a
+high and a low and return a scalar.
+
+**The absent-side conclusion for XCH/BYC does not rest on this section and
+never needed to.** It rests on the direct book reading in section 1: bids at
+1.5000, within 6.4% of the independent 1.41022765 anchor, against asks at
+4.9995 to 10.0000, which is 3.5x to 7.1x that anchor. One side prices the
+pair and the other does not. That is an observation of the book, it invokes
+no estimator, and nothing retracted above touches it. The estimators were
+being cited in support of a conclusion that already stood without them.
+Keep the two apart.
 
 Ardia et al. (2024) states explicitly that Roll, Corwin-Schultz and
-Abdi-Ranaldo are all **downward biased** when trading is infrequent. That
-bias says "the true spread is at least this much", which is the safe
-direction for an estimator whose entire job is to prove that a stated
-number is too big. The one-sided-book bias below points the same way on a
-trade-price series; on the shipped tool's default `quote-touch` bars it
-points the other way, and the argument survives either sign -- see limit 2.
+Abdi-Ranaldo are all **downward biased** when trading is infrequent. Record
+that as a documented property of those estimators on the trade-price bars
+their paper studies. It is not a safety margin here: our bars are quote
+samples, outside that regime, and after the retraction above there is no
+surviving argument that any bar choice errs in a knowable direction -- see
+limit 2.
 
 ### Three honest limits
 
@@ -494,17 +559,17 @@ points the other way, and the argument survives either sign -- see limit 2.
    monthly cross-sectional work; that is a smoothing convention for
    research panels, **not** a licence to show an operator "0 bps". Report
    *undefined*, and report why.
-2. **On a one-sided book the level is unusable, and which way it errs
-   depends on the bars.** Fed a *trade*-price series it UNDERSTATES: both
-   the high and the low come from the surviving side, so it sees the honest
-   bid ladder's range (1.3514 .. 1.5000, ~1,000 bps) and never sees the junk
-   asks at all. Fed the shipped tool's default `quote-touch` bars it errs
-   the other way: the high is taken from the ask side, so a junk ask at
-   10.0000 enters the range and the estimate becomes an upper bound on what
-   that range could justify. Either way the number is a **ceiling or floor
-   argument, not a transaction cost** -- no counterparty ever crossed the
-   width being measured. Acceptable, and in the `quote-touch` case a
-   fortiori, for falsification. Do not put it in a fee model.
+2. **On a one-sided book the level is unusable, and no direction of error
+   is knowable.** Fed a *trade*-price series the estimator sees only the
+   surviving side: the honest bid ladder's range (1.3514 .. 1.5000, ~1,000
+   bps), and never the junk asks. Fed the shipped tool's default
+   `quote-touch` bars, a junk ask at 10.0000 enters the range instead.
+   Those are two different inputs giving two different numbers, and neither
+   brackets the other -- see the retraction above; do not read the wider
+   input as the higher estimate. What holds for both is that **no
+   counterparty ever crossed the width being measured**, so the output is
+   not a transaction cost either way. Report the discrepancy; do not put
+   the number in a fee model.
 3. **The two-trades-per-bar rule fails on daily bars for BYC, and the
    shipped tool cannot enforce it.** Ardia et al. require a bar frequency
    giving at least two trades per bar; Abdi-Ranaldo document only marginal
@@ -516,7 +581,7 @@ points the other way, and the argument survives either sign -- see limit 2.
    test than the paper's -- a bar that clears it has not been shown to clear
    theirs. That substitution is the price of having a series at all, and it
    is why the day-pair count travels beside every figure and why the whole
-   tool is a falsification argument rather than a measurement. Aggregating
+   tool is a descriptive diagnostic rather than a measurement. Aggregating
    to weekly bars is no escape: the answer is stale by construction and
    Merton (1980) says the level precision does not improve anyway.
 
