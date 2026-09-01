@@ -214,6 +214,58 @@ warp.green bridge compromise depegged wUSDC.b (~$0.80 on 2026-09-01) and the
 pair has had no print since 2026-08-24, so it would be quoting into a dead
 book through a broken denominator.
 
+### Per-pair BBO proximity caps, and the research that shrank the feature
+
+The operator asked for a per-pair percentage band on how far offers may sit
+from the market. The research answered a narrower question than the one asked,
+and this is the narrow answer.
+
+**The band already existed.** `strategy::classify_tier`
+(`bbo_sanity.hpp`) is a per-side percentage max-distance bound, measured
+against the **same-side BBO**, that **suppresses rather than clamps**, with an
+ordered fallback chain. That is the proposal, shipped. What was missing is
+that its two thresholds were **global**, and the pairs are not alike: XCH/DBX's
+sigma width floor never exceeded 141 bps in 48,402 logged evaluations while
+XCH/BYC's exceeded 200 bps on 87.7% of them. One number cannot serve both — a
+bound tight enough to mean anything on the first silences the second.
+
+- `bbo_sanity_max_aggressive_dev_override` and
+  `bbo_sanity_max_passive_dev_override` on `PairConfig`, resolved at the Step 8
+  call site with the same idiom `max_half_spread_bps_override` already uses.
+  Absent → the strategy-level value, so every existing pair is unchanged.
+- **Fractions, bounded (0, 1], rejected at load otherwise.** `10` ("10%") and
+  `1000` ("1000 bps") are both plausible operator entries and both would yield
+  a cap that can never bind — a suppression control silently switched off. Zero
+  is rejected too: it would suppress every tier on that side, and a config
+  value that quietly stops a pair quoting is worse than one that fails to load.
+
+**Three things the research killed, recorded so they are not re-proposed:**
+
+- **Do not reference the mid.** On 2026-08-30 XCH/BYC's mid read 5.575 against
+  a fair value of ~1.40; a mid-referenced 2% band would have forced correct
+  1.33 bids up to 5.4635 — paying ~5.46 BYC for an XCH worth ~1.40, filling
+  instantly. Same-side 2% forfeits **5.6%** of realized P&L; mid-referenced 2%
+  forfeits **78.4%**. No production band in the verified literature — LULD,
+  Nasdaq Rule 4702(b)(7), CME, Binance, Kraken, Hyperliquid, Xetra — references
+  an instantaneous mid.
+- **Depth-qualifying the reference is worse than useless here.** Depth walking
+  is monotone *away* from the book's interior, so it can only repair a touch
+  that is too *aggressive* — but on a venue with no matching engine, aggressive
+  offers get consumed and passive ones fossilize (Spearman ρ between
+  dislocation and resting age = **+0.615**; median age 0.41 d within 10% of
+  fair versus **125 d** at 10–100% off). Its helpful direction covers only the
+  small errors; its harmful direction covers all the catastrophic ones. The
+  motivating shape does not occur either: 100% of XCH/BYC's 377 XCH of ask
+  depth is >50% off the anchor, and the "junk top" is 2 XCH — 20× the dust
+  threshold, not dust.
+- **Tight is not conservative.** When the sigma floor exceeds the bound the
+  innermost tier is already outside it, so every tier is: a 2% passive bound
+  withdraws XCH/BYC on 87.7% of blocks, while on XCH/DBX anything ≥10% never
+  binds. The feature is inert or fatal with little in between, which is why the
+  caps are documented with the SEC's own comparators (8% for a blue-chip,
+  20% near the open and close, 28–30% for less liquid names) rather than left
+  to intuition.
+
 ### Retention would have deleted half the history it was asked to keep
 
 Retention had not run since 2026-05-16, so raw history reached back to

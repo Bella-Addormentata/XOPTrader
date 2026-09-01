@@ -581,6 +581,18 @@ std::string with_strategy_keys(const std::string& extra) {
     return y;
 }
 
+std::string with_pair_extra(const std::string& line) {
+    // Insert a key into the single pair in kMinimalValidYaml. The pair block
+    // is indented four spaces, so the inserted line must match or YAML
+    // silently reads it as a sibling of `pairs:` rather than a pair field --
+    // which would make an override test pass while overriding nothing.
+    std::string s(kMinimalValidYaml);
+    const std::string anchor = "    enabled: true";
+    const auto pos = s.find(anchor);
+    s.insert(pos + anchor.size(), "\n    " + line);
+    return s;
+}
+
 }  // namespace
 
 TEST(ConfigParserTest, MicropriceBandDefaultsWithoutAnyConfig) {
@@ -1417,6 +1429,84 @@ TEST(ConfigParserTest, S20GateKnobs_NegativeAndZeroLegCapRejected) {
 // DOCUMENTED as "disables the per-side test", not as an error.  A validator
 // that rejected it would take the escape hatch away from the operator.
 // ============================================================================
+
+// [BBOPERPAIR 2026-09-01] Per-pair BBO proximity caps.
+//
+// FRACTIONS (0.10 == 10%), bounded (0, 1]. The bound is the point: the
+// strategy-level fields these override are fractions too, and an operator
+// reaching for a "percentage from the market" knob is one keystroke from
+// entering 10 (meaning 10%) or 1000 (meaning bps). Either sails through an
+// unbounded parse and yields a cap that can never bind -- a suppression
+// control silently switched off. Rejecting at load is the whole value.
+
+TEST(ConfigParserTest, BboSanityPerPairOverrides_ParseAndReachTheConfig) {
+    TempYaml tmp(with_pair_extra(
+        "bbo_sanity_max_aggressive_dev_override: 0.05\n"
+        "    bbo_sanity_max_passive_dev_override: 0.45"));
+    auto cfg = xop::load_config(tmp.path());
+    ASSERT_FALSE(cfg.pairs.empty());
+    ASSERT_TRUE(cfg.pairs[0].bbo_sanity_max_aggressive_dev_override.has_value());
+    ASSERT_TRUE(cfg.pairs[0].bbo_sanity_max_passive_dev_override.has_value());
+    EXPECT_DOUBLE_EQ(*cfg.pairs[0].bbo_sanity_max_aggressive_dev_override, 0.05);
+    EXPECT_DOUBLE_EQ(*cfg.pairs[0].bbo_sanity_max_passive_dev_override, 0.45);
+}
+
+TEST(ConfigParserTest, BboSanityPerPairOverrides_AbsentMeansUnset) {
+    // Absent must be nullopt, NOT a defaulted number: the engine tests
+    // has_value() to decide whether to fall back to the strategy-level
+    // value, so a silently defaulted override would pin every pair to it and
+    // make the strategy-level setting unreachable.
+    TempYaml tmp(kMinimalValidYaml);
+    auto cfg = xop::load_config(tmp.path());
+    ASSERT_FALSE(cfg.pairs.empty());
+    EXPECT_FALSE(cfg.pairs[0].bbo_sanity_max_aggressive_dev_override.has_value());
+    EXPECT_FALSE(cfg.pairs[0].bbo_sanity_max_passive_dev_override.has_value());
+}
+
+TEST(ConfigParserTest, BboSanityPerPairOverrides_RejectBpsEnteredByMistake) {
+    // THE REGRESSION THE BOUND EXISTS FOR. 10 ("10%") and 1000 ("1000 bps")
+    // are both plausible operator entries and both would produce a cap that
+    // can never bind.
+    for (const char* v : {"10", "100", "1000", "1.5"}) {
+        TempYaml tmp(with_pair_extra(
+            std::string("bbo_sanity_max_aggressive_dev_override: ") + v));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError)
+            << "aggressive override " << v << " must be rejected";
+    }
+    for (const char* v : {"10", "1000"}) {
+        TempYaml tmp(with_pair_extra(
+            std::string("bbo_sanity_max_passive_dev_override: ") + v));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError)
+            << "passive override " << v << " must be rejected";
+    }
+}
+
+TEST(ConfigParserTest, BboSanityPerPairOverrides_RejectZeroNegativeNonFinite) {
+    // Zero would suppress EVERY tier on that side. A config value that
+    // silently stops a pair quoting is worse than one that fails to load.
+    for (const char* v : {"0", "0.0", "-0.1", ".nan", ".inf", "-.inf"}) {
+        TempYaml a(with_pair_extra(
+            std::string("bbo_sanity_max_aggressive_dev_override: ") + v));
+        EXPECT_THROW(xop::load_config(a.path()), xop::ConfigError)
+            << "aggressive override " << v;
+        TempYaml b(with_pair_extra(
+            std::string("bbo_sanity_max_passive_dev_override: ") + v));
+        EXPECT_THROW(xop::load_config(b.path()), xop::ConfigError)
+            << "passive override " << v;
+    }
+}
+
+TEST(ConfigParserTest, BboSanityPerPairOverrides_BoundaryOneIsAccepted) {
+    // 1.0 == "100% from the touch" is the documented upper edge and must
+    // LOAD. Pinning the boundary in the ACCEPTING direction matters: a
+    // stricter-than-documented parser is what an operator discovers at 3am.
+    TempYaml tmp(with_pair_extra(
+        "bbo_sanity_max_aggressive_dev_override: 1.0\n"
+        "    bbo_sanity_max_passive_dev_override: 1.0"));
+    ASSERT_NO_THROW(xop::load_config(tmp.path()));
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_DOUBLE_EQ(*cfg.pairs[0].bbo_sanity_max_aggressive_dev_override, 1.0);
+}
 
 TEST(ConfigParserTest, SideQualityKnobs_ExplicitValuesParse) {
     TempYaml tmp(with_market_data(

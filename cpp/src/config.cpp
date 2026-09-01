@@ -781,6 +781,32 @@ std::vector<PairConfig> parse_pairs(const YAML::Node& root)
             }
             p.max_half_spread_bps_override = v;
         }
+        // [BBOPERPAIR 2026-09-01] Per-pair BBO proximity caps. Both are
+        // FRACTIONS, not bps -- 0.10 means 10% -- matching the
+        // strategy-level fields they override. Bounded (0, 1] deliberately:
+        // 0 would suppress every tier on that side, and > 1 means "further
+        // than 100% from the touch", which is not a proximity cap in any
+        // useful sense and is almost certainly a bps value entered by
+        // mistake. Rejecting at load beats discovering it as a silent
+        // ladder.
+        auto read_dev_override = [&](const char* key,
+                                     std::optional<double>& dst) {
+            if (item[key] && item[key].IsDefined() && !item[key].IsNull()) {
+                const double v = item[key].as<double>();
+                if (!std::isfinite(v) || !(v > 0.0) || v > 1.0) {
+                    throw ConfigError(
+                        idx + "." + key + " must be a finite fraction in "
+                        "(0, 1] -- 0.10 means 10%, not 10 or 1000; got "
+                        + std::to_string(v));
+                }
+                dst = v;
+            }
+        };
+        read_dev_override("bbo_sanity_max_aggressive_dev_override",
+                          p.bbo_sanity_max_aggressive_dev_override);
+        read_dev_override("bbo_sanity_max_passive_dev_override",
+                          p.bbo_sanity_max_passive_dev_override);
+
         if (item["min_offer_size_units_override"]
             && item["min_offer_size_units_override"].IsDefined()
             && !item["min_offer_size_units_override"].IsNull()) {

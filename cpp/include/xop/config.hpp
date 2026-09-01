@@ -140,6 +140,38 @@ struct PairConfig {
     std::optional<double>   max_half_spread_bps_override;
     std::optional<double>   min_offer_size_units_override;
 
+    // [BBOPERPAIR 2026-09-01] Per-pair BBO proximity caps.
+    //
+    // strategy.bbo_sanity_max_aggressive_dev / max_passive_dev already are
+    // exactly the control an operator reaches for when they want "do not
+    // quote further than X% from the market on this pair": a per-SIDE
+    // percentage bound, measured against the SAME-SIDE BBO (never the mid,
+    // which breaks precisely when a bound would bind), that SUPPRESSES
+    // rather than clamps -- the disposition RTS 7 Art. 20(2)(c) requires
+    // and CME, Binance, Kraken and Nasdaq all implement.
+    //
+    // What was missing is that they were GLOBAL. The pairs this bot trades
+    // are not alike: XCH/DBX's sigma width floor never exceeded 141 bps in
+    // 48,402 logged evaluations, while XCH/BYC's exceeded 200 bps on 87.7%
+    // of them. One number cannot serve both -- a bound tight enough to mean
+    // anything on the first silences the second, and a bound loose enough
+    // for the second never binds on the first.
+    //
+    // Absent -> the strategy-level value, so every existing pair is
+    // unchanged.
+    //
+    // NOTE the asymmetry these inherit, and do not undo: the AGGRESSIVE cap
+    // is tight (a tier that would execute at a dislocated price) while the
+    // PASSIVE cap is wide (a tier that merely rests far from a thin book).
+    // ALWAYSOFFER widened the passive side deliberately, because a
+    // cost-floored ask suppressed for resting far from a crashed book buys
+    // zero protection for guaranteed zero participation. Tightening the
+    // passive override is therefore the one that can silence a pair;
+    // measured, a 2% passive bound withdraws XCH/BYC entirely on 87.7% of
+    // blocks. See cpp/include/xop/strategy/bbo_sanity.hpp.
+    std::optional<double>   bbo_sanity_max_aggressive_dev_override;
+    std::optional<double>   bbo_sanity_max_passive_dev_override;
+
     // -- Market revival -----------------------------------------------------
     // Opt-in for a pair whose third-party book is expected to be empty or
     // stale (every offer outside the 20% outlier band).  Normally Step 7

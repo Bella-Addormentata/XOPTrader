@@ -200,6 +200,40 @@ pairs:
     tier_spacing_bps_override: [3, 5, 8, 15, 25, 40]  # Much tighter ladder
     tier_size_pct_override: [0.30, 0.25, 0.20, 0.12, 0.08, 0.05]
     min_offer_size_units_override: 1    # Drop tiers below 1 unit — prevents dust offers
+
+    # [BBOPERPAIR 2026-09-01] Per-pair BBO proximity caps: "do not quote
+    # further than X from the market on THIS pair".
+    #
+    # FRACTIONS, not bps — 0.10 means 10%. Bounded (0, 1]; 10 or 1000 are
+    # REJECTED at load, because either would produce a cap that can never
+    # bind, i.e. a suppression control silently switched off.
+    #
+    # Measured against the SAME-SIDE BBO, never the mid. That is not a
+    # detail: the mid breaks precisely when a bound would bind. On 2026-08-30
+    # XCH/BYC's mid read 5.575 while fair value was ~1.40, and a mid-
+    # referenced 2% band would have forced correct 1.33 bids up to 5.4635 —
+    # paying ~5.46 BYC for an XCH worth ~1.40, filling instantly. A 2% band
+    # measured from the same side forfeits 5.6% of realized P&L; the same
+    # band measured from the mid forfeits 78.4%.
+    #
+    # A breach SUPPRESSES the tier. It never reprices it — the disposition
+    # RTS 7 Art. 20(2)(c) requires and CME, Binance, Kraken and Nasdaq all
+    # implement. Absent → the strategy-level value.
+    #
+    # ⚠ THE PASSIVE ONE IS THE DANGEROUS ONE. Aggressive bounds a tier that
+    # would EXECUTE at a dislocated price; passive bounds one that merely
+    # RESTS far from a thin book, which ALWAYSOFFER widened deliberately so a
+    # cost-floored ask could still participate. Tighten it and you can
+    # silence a pair outright: whenever the sigma width floor exceeds the
+    # bound, the innermost tier is already outside it, so every tier is.
+    # Measured, a 2% passive bound withdraws XCH/BYC on 87.7% of blocks,
+    # while on XCH/DBX (floor never above 141 bps) anything ≥10% never binds
+    # at all. For scale: the tightest such bound the SEC imposes on a
+    # blue-chip market maker is 8% from the same-side NBBO, widening to 20%
+    # near the open and close and 28–30% for less liquid names.
+    bbo_sanity_max_aggressive_dev_override: 0.10   # [OPTIONAL] default 0.10
+    bbo_sanity_max_passive_dev_override: 0.30      # [OPTIONAL] default 0.30
+
     # Stablecoin peg monitoring — both sides are USD-pegged
     is_stablecoin: true
     peg_target: 1.0                # Both BYC and wUSDC.b should be $1

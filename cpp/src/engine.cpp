@@ -10200,10 +10200,24 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 // recovering one-sided book (real bid appearing under a
                 // lagging model mid) re-suppressed every tier of the very
                 // pair the recovery was reviving.
+                // [BBOPERPAIR 2026-09-01] Per-pair first, strategy-level
+                // otherwise -- the same idiom max_half_spread_bps_override
+                // already uses. These are the bound an operator means by
+                // "do not quote further than X% from the market on THIS
+                // pair": measured against the same-side BBO, suppressing
+                // rather than clamping. Global values could not serve pairs
+                // whose volatility differs by an order of magnitude.
+                const PairConfig* bpc = find_pair_config(pair_name);
                 const double kMaxAggressiveDev =
-                    config_.strategy.bbo_sanity_max_aggressive_dev;
+                    (bpc && bpc->bbo_sanity_max_aggressive_dev_override
+                                .has_value())
+                        ? bpc->bbo_sanity_max_aggressive_dev_override.value()
+                        : config_.strategy.bbo_sanity_max_aggressive_dev;
                 const double kMaxPassiveDev =
-                    config_.strategy.bbo_sanity_max_passive_dev;
+                    (bpc && bpc->bbo_sanity_max_passive_dev_override
+                                .has_value())
+                        ? bpc->bbo_sanity_max_passive_dev_override.value()
+                        : config_.strategy.bbo_sanity_max_passive_dev;
                 const double kMaxMidDev =
                     config_.strategy.bbo_sanity_max_mid_dev;
 
