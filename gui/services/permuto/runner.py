@@ -43,7 +43,8 @@ from .auth import PermutoAuthError
 from .batch import BatchError, build_upsert_batch
 from .client import PermutoNotLinked
 from .orders import Side, depth_credit_usd, quote_ladder
-from .quoting import LoopAction, RestingQuote, VenueView, decide
+from .quoting import (REQUOTE_AT_RING_FRACTION, LoopAction,
+                      RestingQuote, VenueView, decide)
 from .risk import MarginState, RiskAction, assess, skewed_reference
 from .band_guard import VENUE_BAND_PCT, BandGuard
 from .cross_backoff import CrossBackoff, headroom_pct
@@ -96,6 +97,30 @@ BATCH_ACCEPTED = ("batch_ok", "batch_partial", "batch_upserted")
 #: reclassify a genuine refusal as success and record orders the venue may
 #: have rolled back. Legs are evidence only when the envelope is UNKNOWN.
 BATCH_REJECTED = ("batch_failed", "batch_rejected", "error")
+
+
+def _requote_safe_backoff(ring_pct: float, half_spread_pct: float,
+                          skew_frac_abs: float) -> float:
+    """The most backoff this leg can carry and still rest.
+
+    [review] Bounded by BOTH constraints, because satisfying one and
+    failing the other still costs the quote:
+
+      * the credit RING -- outside it the leg earns nothing, so retreating
+        past it turns a rejected leg into a resting worthless one;
+      * the RE-QUOTE TRIGGER -- decide() replaces any leg further than
+        ring * REQUOTE_AT_RING_FRACTION from the oracle, so a leg born
+        past it is cancelled and replaced every tick, forever.
+
+    Computed from the CURRENT skew rather than whatever applied when the
+    offset was learned, so an offset earned under wider headroom is
+    clamped instead of reapplied blind.
+    """
+    ring_room = headroom_pct(ring_pct, half_spread_pct, skew_frac_abs)
+    trigger_budget = ring_pct * REQUOTE_AT_RING_FRACTION * 0.8
+    trigger_room = (trigger_budget - abs(half_spread_pct)
+                    - abs(skew_frac_abs) * 100.0)
+    return max(0.0, min(ring_room, trigger_room))
 
 
 def _legs_all_accepted(leg_rows) -> bool:
@@ -754,10 +779,23 @@ class QuoteRunner:
         # bell, a still-frozen oracle arrived as PREOPEN, which quotes. So
         # the guard against quoting a stale post-open price was dead code,
         # killed by the other fix I made hours earlier.
+        # [review] `schedule_stage or stage` masks the effective stage,
+        # because Stage.UNSCHEDULED is TRUTHY. Past the end of the session
+        # table assess_curfew returns effective CLOSED for a frozen oracle
+        # while recording schedule_stage=UNSCHEDULED -- so the `or` picked
+        # UNSCHEDULED and applied the wide, half-size SESSION profile
+        # instead of the full-size CLOSED earning profile, throwing away
+        # the overnight window precisely when the schedule has run out and
+        # the freeze detector is the only thing that knows the truth.
+        #
+        # UNSCHEDULED means "the clock abstains", which is the same as
+        # having no schedule at all: fall through to the effective stage.
         posture_stage = Stage.UNSCHEDULED
         if self._curfew is not None:
-            posture_stage = (self._curfew.schedule_stage
-                             or self._curfew.stage)
+            scheduled = self._curfew.schedule_stage
+            posture_stage = (scheduled
+                             if scheduled not in (None, Stage.UNSCHEDULED)
+                             else self._curfew.stage)
         # Stage-level default; market-specific posture can tighten from here.
         default_profile = profile_for(
             posture_stage,
@@ -989,8 +1027,23 @@ class QuoteRunner:
             ladder = quote_ladder(
                 market, reference, depth_usd,
                 levels=1,
-                first_offset_pct=(eff_half_spread
-                                  + self._cross_backoff.offset_pct(market)),
+                # [review] CAP THE LEARNED OFFSET AGAINST CURRENT HEADROOM,
+                # and against the RE-QUOTE TRIGGER, not merely the ring.
+                #
+                # Two ways the raw learned value goes wrong. It was learned
+                # under whatever skew and oracle applied then, so a fill
+                # that raises skew leaves an offset legal at the time and
+                # not now -- 1.607% learned while flat becomes a 2.857% ask
+                # once skew reaches 0.95%, outside the 2% ring entirely.
+                # And even inside the ring, spread + skew + backoff past
+                # the 1.2% trigger means decide() replaces the quote on the
+                # very next tick: the churn this budget exists to stop.
+                first_offset_pct=(
+                    eff_half_spread
+                    + min(self._cross_backoff.offset_pct(market),
+                          _requote_safe_backoff(
+                              self._ring_pct, eff_half_spread,
+                              self._last_skew.get(market, 0.0)))),
                 ring_pct=self._ring_pct,
                 tick_size=spec.get("tick_size", 0.0001),
                 lot_size=spec.get("lot_size", 1.0),
@@ -1081,6 +1134,22 @@ class QuoteRunner:
             # the not_quoting gate and painted PERMUTO ON over nothing
             # resting. risk_blocked gates the switch like any other
             # non-trading outcome.
+            # [review] But say WHICH refusal it was. `any_quoted` is set
+            # before the profile filter runs, so a market that decide()
+            # marked QUOTE and the MODE then skipped still arrives here --
+            # and reporting "risk left nothing to place" for a deliberate
+            # EXIT or stale-oracle decision blames risk for a posture
+            # choice, which is the wrong thing to go looking at when the
+            # book is empty and nobody knows why.
+            mode_skips = [m for m, (a, r) in results.items()
+                          if a in ("skip", "withdraw")
+                          and profile_by_market.get(m) is not None
+                          and not profile_by_market[m].quote]
+            if mode_skips and len(mode_skips) == len(
+                    [m for m, (a, _) in results.items()
+                     if a in ("skip", "withdraw")]):
+                return TickResult("withdraw",
+                                  results[mode_skips[0]][1], results)
             return TickResult("risk_blocked",
                               "risk left nothing to place", results)
 

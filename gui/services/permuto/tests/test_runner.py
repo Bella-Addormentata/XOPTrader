@@ -2126,3 +2126,72 @@ def test_the_exit_window_holds_its_book_rather_than_retracting():
     c.calls.clear()
     r.tick(exit_t, _ORACLE, {})
     assert "cancel_all" not in c.calls,         "EXIT retracted a resting book it should have left earning"
+
+
+def test_the_learned_backoff_is_capped_by_CURRENT_headroom():
+    """[review] An offset legal when learned is not legal forever.
+
+    It is learned under whatever skew applied at the time, so a fill that
+    raises skew leaves it oversized: 1.607% learned while flat becomes a
+    2.857% ask once skew reaches 0.95%, outside the 2% ring entirely. And
+    even inside the ring, spread + skew + backoff past the 1.2% trigger
+    means decide() replaces the quote on the very next tick.
+    """
+    from gui.services.permuto.runner import _requote_safe_backoff
+    from gui.services.permuto.quoting import REQUOTE_AT_RING_FRACTION
+    from gui.services.permuto.risk import max_price_skew_frac
+
+    ring, spread = 2.0, 0.40
+    trigger = ring * REQUOTE_AT_RING_FRACTION
+    for skew in (0.0, 0.002, max_price_skew_frac(ring, spread)):
+        cap = _requote_safe_backoff(ring, spread, skew)
+        total = spread + abs(skew) * 100.0 + cap
+        assert total <= trigger + 1e-9, (
+            "spread %.2f + skew %.3f%% + backoff %.3f = %.4f%%, past the "
+            "%.2f%% re-quote trigger" % (spread, skew * 100.0, cap,
+                                         total, trigger))
+        landed = ((1.0 + abs(skew)) * (1.0 + (spread + cap) / 100.0)
+                  - 1.0) * 100.0
+        assert landed <= ring + 1e-9, (
+            "composed leg at %.4f%% is outside the %.1f%% ring" % (landed,
+                                                                   ring))
+
+
+def test_a_rising_skew_shrinks_the_permitted_backoff():
+    from gui.services.permuto.runner import _requote_safe_backoff
+    wide = _requote_safe_backoff(2.0, 0.40, 0.0)
+    tight = _requote_safe_backoff(2.0, 0.40, 0.0056)
+    assert tight < wide, "skew rose and the backoff budget did not shrink"
+
+
+def test_no_room_left_yields_zero_not_a_negative():
+    from gui.services.permuto.runner import _requote_safe_backoff
+    assert _requote_safe_backoff(2.0, 1.5, 0.01) == 0.0
+
+
+def test_the_runner_APPLIES_the_backoff_cap_not_just_computes_it():
+    """[review] The helper being correct proves nothing on its own.
+
+    Capping the learned offset at the LADDER is the part that matters, and
+    a first version of this coverage tested only _requote_safe_backoff --
+    so removing the cap from the call site left every test green. This
+    drives a large learned offset through an actual tick and checks the
+    price that comes out.
+    """
+    from gui.services.permuto.quoting import REQUOTE_AT_RING_FRACTION
+
+    oracle = _ORACLE[_MKT]
+    c = _Client(account=_account(0.0), batch_response=_venue_ok())
+    r = _runner(c, curfew_enabled=False, max_position_usd=250_000.0)
+    # An offset far past anything the ring or the trigger would allow.
+    r._cross_backoff._pct[_MKT] = 5.0
+    r.tick(_MID_SESSION, _ORACLE, {})
+    assert c.last_batch, "no batch to inspect"
+
+    trigger = 2.0 * REQUOTE_AT_RING_FRACTION
+    for leg in c.last_batch:
+        out = abs(float(leg["price"]) / oracle - 1.0) * 100.0
+        assert out <= trigger + 1e-6, (
+            "leg %r sits %.3f%% from the oracle, past the %.2f%% re-quote "
+            "trigger -- the learned backoff was applied uncapped"
+            % (leg, out, trigger))
