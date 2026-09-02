@@ -304,3 +304,80 @@ def test_an_unreadable_position_flattens_rather_than_skewing(bad):
     d = assess(_state(positions={_MKT: bad}), _MKT,
                base_size=10.0, max_position=100.0)
     assert d.action is RiskAction.FLATTEN
+
+
+# --------------------------------------------------------------------------- #
+# The portfolio budget: no single market has to breach its own limit for the
+# book to breach the account.
+# --------------------------------------------------------------------------- #
+def test_the_portfolio_budget_binds_before_any_market_does():
+    """[audit] max_position_usd is PER MARKET and nothing aggregated it.
+
+    Three markets at the shipped 250,000 authorised 750,000 of exposure on
+    a 500,000 account -- 1.5x the equity before the venue's 8x carried
+    multiplier touches it, and with every individual market perfectly
+    inside its own limit. That is the shape of a liquidation nothing in
+    the per-market checks can see.
+    """
+    from gui.services.permuto.risk import (PORTFOLIO_MAX_EXPOSURE_FRACTION,
+                                           portfolio_cap_usd)
+    equity, per_market = 500_000.0, 250_000.0
+    budget = equity * PORTFOLIO_MAX_EXPOSURE_FRACTION
+
+    # Flat: a market may use its own limit, capped by the budget.
+    assert portfolio_cap_usd(equity, "A", per_market, {}) == min(per_market,
+                                                                 budget)
+    # Neighbours holding exposure take it away, one for one.
+    assert portfolio_cap_usd(equity, "C", per_market,
+                             {"A": 100_000.0, "B": 50_000.0}) == budget - 150_000.0
+    # Once the budget is spent there is no room at all, however far this
+    # market is from its own limit.
+    assert portfolio_cap_usd(equity, "C", per_market,
+                             {"A": budget}) == 0.0
+    # Never negative, and never LARGER than what was asked for.
+    assert portfolio_cap_usd(equity, "C", per_market,
+                             {"A": 10 * budget}) == 0.0
+    assert portfolio_cap_usd(equity, "A", 1_000.0, {}) == 1_000.0
+
+
+def test_the_portfolio_budget_fails_closed_on_anything_unreadable():
+    """Authorising exposure against a number nobody can see is how the
+    previous account died."""
+    from gui.services.permuto.risk import portfolio_cap_usd
+    for equity in (0.0, -1.0, float("nan"), float("inf")):
+        assert portfolio_cap_usd(equity, "A", 250_000.0, {}) == 0.0
+    for junk in ("lots", None, float("nan"), float("inf")):
+        assert portfolio_cap_usd(500_000.0, "A", 250_000.0,
+                                 {"B": junk}) == 0.0
+    # A NaN per-market cap is unreadable and yields nothing...
+    assert portfolio_cap_usd(500_000.0, "A", float("nan"), {}) == 0.0
+
+
+def test_the_no_limit_sentinel_is_not_read_as_a_zero_cap():
+    """[review] <= 0 means "do not cap me per market", and turning it
+    into a literal zero pinned every market to REDUCE_ONLY -- silently
+    inverting the one setting an operator uses to remove the cap.
+
+    The PORTFOLIO budget still binds there; in that configuration it is
+    the only limit left, which is exactly why it must not be zero."""
+    from gui.services.permuto.risk import (PORTFOLIO_MAX_EXPOSURE_FRACTION,
+                                           portfolio_cap_usd)
+    equity = 500_000.0
+    budget = equity * PORTFOLIO_MAX_EXPOSURE_FRACTION
+    for sentinel in (0.0, -1.0):
+        assert portfolio_cap_usd(equity, "A", sentinel, {}) == budget, (
+            "the no-limit sentinel %r was read as a zero cap"
+            % (sentinel,))
+        # ...and the budget is still shared with the rest of the book.
+        assert portfolio_cap_usd(equity, "A", sentinel,
+                                 {"B": 100_000.0}) == budget - 100_000.0
+
+
+def test_the_market_being_sized_is_not_counted_against_itself():
+    """Its own position is what the per-market cap already governs; adding
+    it here would double-charge and shrink the book for no reason."""
+    from gui.services.permuto.risk import portfolio_cap_usd
+    with_self = portfolio_cap_usd(500_000.0, "A", 250_000.0,
+                                  {"A": 200_000.0})
+    without = portfolio_cap_usd(500_000.0, "A", 250_000.0, {})
+    assert with_self == without

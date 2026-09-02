@@ -78,7 +78,14 @@ _DEPTH = {
     Stage.SESSION: 0.5,
     # Winding inventory down into the close. Size shrinks so fills shrink.
     Stage.RAMP: 0.35,
-    # Last minutes: place nothing new. Whatever is on is what we carry.
+    # Last minutes: place nothing new -- and RETRACT what is on.
+    # [review] This used to read "whatever is on is what we carry",
+    # which describes the retain-through-EXIT behaviour that did NOT
+    # survive review: profile_for(EXIT) sets withdraw=True, because
+    # EXIT's caps are tighter than RAMP's and RestingQuote has no
+    # quantities, so nothing can show a retained order still fits.
+    # The fourth stale comment left describing that exemption; each
+    # one is an invitation to put it back.
     Stage.EXIT: 0.0,
     # The earning window. Full size.
     Stage.CLOSED: 1.0,

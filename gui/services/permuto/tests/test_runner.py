@@ -7,6 +7,7 @@ import pytest
 
 from gui.services.permuto.auth import PermutoAuthError
 from gui.services.permuto.client import PermutoNotLinked
+from gui.services.permuto.runner import decide as runner_decide
 from gui.services.permuto.quoting import (LoopAction, QuoteDecision,
                                           RestingQuote)
 from gui.services.permuto.risk import FLATTEN_MARGIN_UTILISATION
@@ -1998,9 +1999,15 @@ def test_a_curfew_cap_still_beats_the_profile():
 
 
 def test_the_last_minutes_before_the_close_place_nothing():
-    """EXIT: whatever is on is what we carry. Adding inventory here buys a
-    fill we then hold through the frozen window, which is where the 870k
-    short came from."""
+    """EXIT: place nothing new, and RETRACT what is on.
+
+    [review] This said "whatever is on is what we carry" -- the
+    retain-through-EXIT behaviour that did not survive review, while
+    the test below already expects a withdrawal. The fifth such
+    comment found; each one is an invitation to put it back.
+
+    Adding inventory here buys a fill we then hold through the frozen
+    window, which is where the 870k short came from."""
     exit_t = CLOSES_UTC[0] - 300.0          # 5 minutes to the bell
     c = _Client(account=_account(0.0), batch_response=_venue_ok())
     r = _runner(c, curfew_enabled=True)
@@ -2850,29 +2857,234 @@ def test_a_posture_change_retracts_even_with_no_position_cap():
             "a posture-only transition left the old book resting")
 
 
-def test_an_unset_cap_quotes_both_sides_from_flat():
-    """[review] The sentinel meant "no limit" and delivered "no quoting".
+def test_a_market_pinned_reduce_only_says_so_once(caplog):
+    """[audit] The failure that cost ~40% of a simulated night.
 
-    assess_curfew() publishes ZERO side caps when no per-market cap is
-    configured -- correctly, a curfew cannot be a fraction of a number
-    nobody set. But the runner fed that through cap_for() into a 1e-9
-    position limit AND through permitted_leg_size(), so a flat account
-    with max_position_usd=0 was allowed zero contracts on both sides.
+    [review] NAMED FOR WHAT IT ACTUALLY EXERCISES. An earlier version
+    claimed the exhausted-ROOM path, but -100,000 contracts at 0.07 is
+    $7,000 against a $1,200 cap, so assess() returns REDUCE_ONLY long
+    before permitted_leg_size() floors anything. The room-floor branch is
+    a one-contract-wide window between |position| > short_cap - 1 and
+    |position| >= short_cap; REDUCE_ONLY is the path that actually runs,
+    and it is the one worth pinning.
 
-    This branch adds a fix for that configuration's overnight window,
-    which is worth nothing if the book never goes out at all.
+    Overnight flow is one-directional -- buyers lift our ask, and nothing
+    sells back against a frozen oracle -- so the short room drains. When
+    it runs out the ask leg is dropped, the book goes one-sided, and
+    depth credit is min(bid, ask), so the market earns EXACTLY ZERO for
+    the rest of the night.
+
+    Two things made it invisible. assess() still reports NORMAL, because
+    the floor leaves |position| a hair BELOW the cap; and one_sided_ok
+    only recognised a ZERO cap, so decide() read the missing ask as a
+    repairable gap and returned QUOTE every tick -- ~12,600 authenticated
+    cancel+upsert pairs across one night, each replacing a quote with a
+    copy of itself, on a rate-limited route.
+    """
+    # A short already at the overnight cap: room for the ask is gone.
+    # -100,000 contracts at oracle 0.07 = $7,000 short, against an
+    # overnight short cap of $12,000 x 0.10 = $1,200. Room is gone.
+    c = _Client(account=_account(-100_000.0))
+    r = _runner(c, curfew_enabled=True, max_position_usd=12_000.0)
+
+    with caplog.at_level(logging.CRITICAL,
+                         logger="gui.services.permuto.runner"):
+        r.tick(_OVERNIGHT, _ORACLE, {})
+
+    assert _MKT in r._pinned_markets, "the pin was not recorded"
+    pinned = [m for m in caplog.messages if "PINNED ONE-SIDED" in m]
+    assert pinned, "a market stopped earning and nothing said so"
+    assert "ZERO depth" in pinned[0], pinned[0]
+
+    # ...and it is not re-announced on every subsequent tick.
+    caplog.clear()
+    with caplog.at_level(logging.CRITICAL,
+                         logger="gui.services.permuto.runner"):
+        r.tick(_OVERNIGHT + 60.0, _ORACLE, {})
+    assert not [m for m in caplog.messages if "PINNED ONE-SIDED" in m], (
+        "the pin is announced every tick instead of on entry")
+
+
+def test_a_pinned_market_tells_decide_its_missing_side_is_intended(monkeypatch):
+    """[audit] ~12,600 authenticated re-upserts across one overnight.
+
+    one_sided_ok told decide() "this side is closed on purpose" only when
+    the CAP was zero. A side pinned by exhausted ROOM leaves the cap
+    positive, so decide() read the missing leg as a repairable gap and
+    returned QUOTE every tick -- cancelling and re-placing an identical
+    quote every 5 seconds until morning, on a route the venue documents
+    as rate-limited. A 429 there takes down the markets still earning.
+
+    Asserted at the mechanism rather than by counting requests: _Client
+    does not round-trip resting orders, so decide() always sees an empty
+    book in this harness and re-quotes whatever the flag says. Counting
+    upserts here would measure the double, not the fix.
+    """
+    seen = {}
+    real = runner_decide
+
+    def _spy(view, resting, **kw):
+        seen["one_sided_ok"] = kw.get("one_sided_ok")
+        return real(view, resting, **kw)
+
+    monkeypatch.setattr("gui.services.permuto.runner.decide", _spy)
+
+    c = _Client(account=_account(-100_000.0))
+    r = _runner(c, curfew_enabled=True, max_position_usd=12_000.0)
+
+    r.tick(_OVERNIGHT, _ORACLE, {})
+    assert _MKT in r._pinned_markets, "the pin was not detected"
+    # The cap is POSITIVE -- this is room exhaustion, not a closed side,
+    # which is exactly the case the old test missed.
+    assert r._curfew.short_cap_usd > 0.0
+
+    r.tick(_OVERNIGHT + 60.0, _ORACLE, {})
+    assert seen.get("one_sided_ok") is True, (
+        "a market pinned by exhausted room still reported its missing side "
+        "as a gap to repair -- decide() will re-upsert it every tick")
+
+
+def test_a_pin_clears_once_the_position_is_reduced():
+    """[review] The pin could be set but never cleared.
+
+    A pinned market makes decide() answer HOLD, so any_quoted is false
+    and the tick returns at the no-quote branch -- which sat ABOVE the
+    line that updates _pinned_markets. An operator who reduced the
+    position would find the market still latched and its missing side
+    never rebuilt: a worse stuck state than the one the pin was added to
+    report.
+    """
+    c = _Client(account=_account(-100_000.0))
+    r = _runner(c, curfew_enabled=True, max_position_usd=12_000.0)
+    r.tick(_OVERNIGHT, _ORACLE, {})
+    assert _MKT in r._pinned_markets, "the pin was never set"
+
+    # The operator closes the position. Nothing else changes.
+    c.account_payload = _account(0.0)
+    r.tick(_OVERNIGHT + 60.0, _ORACLE, {})
+    assert _MKT not in r._pinned_markets, (
+        "the pin survived the position being reduced -- the missing side "
+        "will never be rebuilt")
+
+
+def test_the_no_limit_sentinel_still_quotes_both_sides():
+    """[review] Fixing the sentinel for assess() alone was half a fix.
+
+    assess_curfew() leaves both side caps at zero when no per-market cap
+    is configured -- correctly, a curfew cannot be a fraction of a number
+    nobody set. But permitted_leg_size() was still handed those zero
+    caps, so BOTH legs were dropped and a flat account with the cap
+    disabled reported risk_blocked and quoted nothing at all.
     """
     c = _Client(account=_account(0.0))
     r = _runner(c, curfew_enabled=True, max_position_usd=0.0)
     res = r.tick(_OVERNIGHT, _ORACLE, {})
 
     assert res.action == "quote", (
-        "a flat account with no configured cap quoted nothing: %s"
+        "a flat account with the cap disabled quoted nothing: %s"
         % res.reason)
-    sides = sorted(leg["side"] for leg in (getattr(c, "last_batch", None)
-                                           or []))
+    sides = sorted(leg["side"] for leg in (c.last_batch or []))
     assert sides == ["buy", "sell"], (
         "depth credit is min(bid, ask); one side earns nothing: %s" % sides)
+
+
+def test_the_budget_counts_positions_in_markets_we_do_not_quote():
+    """[review] A budget that only sees its own book is not a budget.
+
+    MarginState.positions comes from /exchange/account, and QuoteRunner
+    can be built with a SUBSET of markets -- so exposure held in an
+    unconfigured market, or opened by hand, was invisible to the
+    portfolio budget and it authorised that much again on top.
+
+    Asserted as a DIFFERENCE against a control, because the absolute
+    outcome depends on sizing that is not the point here: the same
+    account, plus one holding the runner does not quote, must stop being
+    two-sided. (It cannot be valued without an oracle, and an unvaluable
+    neighbour has to fail closed rather than be skipped.)
+    """
+    def _sides(extra):
+        positions = {_MKT: -50_000.0}
+        positions.update(extra)
+        c = _Client(account={"equity_usd": 500_000.0,
+                             "used_margin_usd": 0.0,
+                             "positions": positions})
+        r = _runner(c, curfew_enabled=False, max_position_usd=250_000.0)
+        r.tick(1.0, {_MKT: 0.07}, {})
+        return sorted(leg["side"] for leg in (c.last_batch or []))
+
+    assert _sides({}) == ["buy", "sell"], "the control was not two-sided"
+    assert _sides({"OTHER-VOL-PERP": 9_000_000.0}) == ["buy"], (
+        "a holding in an unquoted market did not reach the portfolio "
+        "budget -- exposure outside the configured set is invisible to it")
+
+
+def test_the_portfolio_budget_stops_new_exposure_but_never_a_reduction():
+    """[review] A budget that only binds once you hold something is not a
+    budget.
+
+    Handing it to assess() as max_position bounds the POSITION limit, not
+    new exposure: with the budget spent by neighbours and this market
+    FLAT, abs(0) >= 1e-9 is false, so assess() answers NORMAL and both
+    risk-increasing legs go out at full size.
+
+    A REDUCING leg must still be allowed. Blocking it would trap the book
+    at the exact moment it is trying to get back inside the budget.
+    """
+    def _run(positions):
+        c = _Client(account={"equity_usd": 500_000.0,
+                             "used_margin_usd": 0.0,
+                             "positions": positions})
+        r = _runner(c, curfew_enabled=False, max_position_usd=250_000.0)
+        res = r.tick(1.0, {_MKT: 0.07, "NVDA-VOL-PERP": 0.07}, {})
+        return res.action, sorted(leg["side"]
+                                  for leg in (getattr(c, "last_batch", None)
+                                              or []))
+
+    # Room available: an ordinary two-sided book.
+    assert _run({_MKT: 0.0}) == ("quote", ["buy", "sell"])
+
+    # A neighbour has spent the whole budget and we are FLAT -- the case
+    # every per-market check calls harmless.
+    action, sides = _run({_MKT: 0.0, "NVDA-VOL-PERP": 4_400_000.0})
+    assert sides == [], (
+        "risk-increasing legs went out after the portfolio budget was "
+        "exhausted: %s" % sides)
+    assert action == "risk_blocked", action
+
+    # Over budget and SHORT: the buy reduces us, and must survive.
+    action, sides = _run({_MKT: -50_000.0, "NVDA-VOL-PERP": 4_400_000.0})
+    assert sides == ["buy"], (
+        "the reducing leg was blocked, trapping the book over budget: %s"
+        % sides)
+
+
+def test_recovery_is_announced_only_when_a_book_is_actually_resting(caplog):
+    """[review] "depth resumes" is a claim about the BOOK.
+
+    Leaving the pin only means risk stopped forbidding a side. _resting
+    can still be empty, and the batch that rebuilds it can still be
+    rejected -- so announcing recovery there tells an operator depth is
+    back while the market earns exactly zero. Same mistake as measuring
+    depth credit before the venue answered: report the achievement, not
+    the intention.
+    """
+    c = _Client(account=_account(-100_000.0))
+    r = _runner(c, curfew_enabled=True, max_position_usd=12_000.0)
+    r.tick(_OVERNIGHT, _ORACLE, {})
+    assert _MKT in r._pinned_markets
+
+    # The position is reduced, so the pin lifts -- but nothing is resting.
+    c.account_payload = _account(0.0)
+    r._resting[_MKT] = RestingQuote()
+    with caplog.at_level(logging.WARNING,
+                         logger="gui.services.permuto.runner"):
+        r.tick(_OVERNIGHT + 60.0, _ORACLE, {})
+
+    resumed = [m for m in caplog.messages if "depth resumes" in m]
+    assert not resumed, (
+        "recovery was announced over an empty book: %s" % resumed)
+    honest = [m for m in caplog.messages if "no longer pinned" in m]
+    assert honest, "the un-pinning was not reported at all"
 
 
 def test_an_unset_cap_does_not_force_reduce_only_on_a_held_position():
