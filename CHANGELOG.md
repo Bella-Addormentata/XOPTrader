@@ -5,6 +5,39 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.14] — 2026-09-02 — place against the book that is actually there
+
+The Permuto runner banked zero depth through a full session while three legs
+per batch appeared accepted. The rejected legs were asks crossing bids parked
+near the +2% credit-ring ceiling. The fallback controller could only learn a
+retreat from repeated refusals, and its unrelated re-quote budget declared
+valid QQQ and TSLA earning windows shut.
+
+- Read `GET /info/l2/{market}` and compute exact, tick-aligned bid and ask
+  prices that rest post-only inside the true-oracle depth ring. Each side is
+  clamped independently, so inventory skew cannot move a clearing ask back
+  through the bid.
+- Detect a one-sided order blocking its own missing side, cancel it once, and
+  rebuild against the external book. External walls stay untouched, and one
+  shut market no longer marks healthy resting siblings globally blocked.
+- Revalidate placement after the send-time oracle refresh. If either side is
+  invalid, drop the whole pair: a lone sibling earns zero under
+  `min(bid, ask)` and is only unbalanced exposure.
+- Preserve deliberately wide BBO quotes without weakening the tighter churn
+  guard for blind backoff. Apply the documented 8x carried sizing from the
+  schedule because the REST venue state does not expose a reliable carried
+  flag.
+- Keep genuinely unscheduled moving markets at the reduced session profile;
+  only an explicitly disabled curfew selects full target depth. The field
+  monitor now reads and labels the venue-published ring instead of assuming 2%.
+- Set the contest posture to $6,000 target depth per market and a $30,000
+  position cap. Two currently placeable markets project 413.6M depth-seconds
+  over the measured remaining stage schedule from a freshly funded account.
+
+The competition account is liquidated at zero equity and still requires a
+sponsor reset. No software version can place orders or increase its depth
+counter until that simulated balance is restored.
+
 ## [0.10.13] — 2026-09-01 — one side of a book can be junk
 
 XCH/BYC stopped quoting on 2026-08-30 and the reason was not price
