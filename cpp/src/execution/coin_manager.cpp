@@ -99,64 +99,35 @@ CoinManager::CoinManager(asio::io_context&                    /*ioc*/,
 // became 34 phantom "Have 0 mojos total" claims about a wallet that held ~59
 // XCH, and each one reached ensure_split(). See coin_pool_verdict.hpp.
 //
-// `coins` is built INSIDE the try so there is no partially-filled vector in
-// scope that a later edit could return by accident on the failure path.
+// EVERYTHING THAT CAN GO WRONG HERE LIVES IN collect_spendable_coins(), a
+// static template in coin_manager.hpp taking the wallet call as a parameter.
+// That is not decoration: the first version of this fix put the two catches
+// in this file, where no test could reach them, and a review demonstrated the
+// consequence by restoring the fail-open inside the ChiaRPCError catch and
+// watching all 1109 tests stay green. The seam exists so that
+// cpp/tests/test_coin_pool_verdict.cpp can drive a throwing fetch and a
+// malformed record and observe the RETURNED VALUE, which is where the bug
+// was. This function is now only the wiring: which wallet, which dust
+// threshold, which locked set.
 asio::awaitable<std::optional<std::vector<CoinInfo>>>
 CoinManager::get_spendable_coins(std::int64_t wallet_id)
 {
-    try {
-        std::vector<CoinInfo> coins;
-
-        auto raw_coins = co_await wallet_->get_spendable_coins(wallet_id);
-
-        for (const auto& rc : raw_coins) {
-            CoinInfo ci = parse_coin(rc);
-
-            // Filter dust coins.
-            if (ci.amount < dust_threshold_) {
-                continue;
-            }
-
-            // Filter coins that are locked by pending offers.
-            {
-                std::lock_guard<std::mutex> lock(mtx_locked_);
-                if (locked_coins_.count(ci.coin_name) > 0) {
-                    continue;
-                }
-            }
-
-            coins.push_back(std::move(ci));
-        }
-
-        // Sort by amount descending -- largest coins first for efficient
-        // selection and splitting.
-        std::sort(coins.begin(), coins.end(),
-                  [](const CoinInfo& a, const CoinInfo& b) {
-                      return a.amount > b.amount;
-                  });
-
-        co_return coins;
-
-    } catch (const rpc::ChiaRPCError& e) {
-        // The observed failure, 68 times: "Wallet needs to be fully synced
-        // before getting all coins" -- an application error, not a transport
-        // fault.
-        logger_->error("get_spendable_coins failed for wallet_id {}: {}",
-                       wallet_id, e.what());
-        co_return std::nullopt;
-
-    } catch (const std::exception& e) {
-        // parse_coin() and compute_coin_name() throw json::type_error,
-        // std::invalid_argument and std::runtime_error on a malformed coin
-        // record. These used to escape this function and, at the two live
-        // call sites, an ancestry of DETACHED coroutines whose completion
-        // handler discards the exception_ptr -- so an escape here would end
-        // the poll loop silently rather than terminate. One non-throwing
-        // boundary, and nothing silent: it is logged at critical.
-        logger_->critical("get_spendable_coins: malformed coin record for "
-                          "wallet_id {}: {}", wallet_id, e.what());
-        co_return std::nullopt;
-    }
+    // The locked set is consulted through a predicate rather than copied, so
+    // the mutex is still taken per coin AFTER the RPC returns -- a snapshot
+    // taken before the await would miss a coin locked while it was in flight
+    // and could hand out a coin an offer had claimed.
+    co_return co_await collect_spendable_coins(
+        [wallet = wallet_](std::int64_t wid)
+            -> asio::awaitable<std::vector<json>> {
+            return wallet->get_spendable_coins(wid);
+        },
+        wallet_id,
+        dust_threshold_,
+        [this](const std::string& coin_name) {
+            std::lock_guard<std::mutex> lock(mtx_locked_);
+            return locked_coins_.count(coin_name) > 0;
+        },
+        logger_);
 }
 
 // ---------------------------------------------------------------------------

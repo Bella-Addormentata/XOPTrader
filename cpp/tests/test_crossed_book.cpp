@@ -22,8 +22,14 @@
 //     the only thing that has ever bounded this path. Funding the wallet
 //     without this fix unmasks the bug, which is why the two must land in
 //     this order.
-//   * All 23 crossed_book rows in taker_fills settled below the cap, so no
-//     historical remediation is owed. The defect is entirely forward-looking.
+//   * Of the 23 crossed_book rows in taker_fills, nineteen settled strictly
+//     below their pair's cap and FOUR sit exactly on it -- the BYC/wUSDC.b
+//     rows of 2026-08-06 21:38 to 22:45, base_delta 5000 against a
+//     cap_mojos_for(5.0, 1000) of exactly 5000. Exactly-on-cap is the clamp
+//     signature, so those four are indistinguishable from clamped records and
+//     their remediation is OPEN, not closed. See crossed_book.hpp. An earlier
+//     version of this comment claimed all 23 were clean; it had not queried
+//     the database.
 //
 // The clamp also reached the books: record_taker_fill() derives the quote leg
 // as quote_mojos_for(base_mojos, ...), so a clamped base size would have
@@ -135,13 +141,49 @@ TEST(CrossedBook, EmptyBookIsNoBook)
 
 TEST(CrossedBook, OneSidedBookIsNoBook)
 {
+    // The asks-only case is the one that used to leak: selection populates
+    // best_ask_offer_id and best_ask_size before the NoBook exit, while
+    // best_ask_price is assigned only after it. A declined decision carrying
+    // a real size beside a price of 0 is a trap for the detection log, which
+    // prints best_ask_size. All three ask fields must be returned as a unit.
     const std::vector<CompetingOffer> asks_only{mk(Side::Ask, kAsk, 10)};
-    EXPECT_EQ(evaluate_crossed_book(asks_only, 1.0, kXchCap).verdict,
-              CrossedBookVerdict::NoBook);
+    const auto a = evaluate_crossed_book(asks_only, 1.0, kXchCap);
+    EXPECT_EQ(a.verdict, CrossedBookVerdict::NoBook);
+    EXPECT_EQ(a.take_size, 0);
+    EXPECT_EQ(a.best_ask_price, 0);
+    EXPECT_EQ(a.best_ask_size, 0);
+    EXPECT_TRUE(a.best_ask_offer_id.empty());
 
     const std::vector<CompetingOffer> bids_only{mk(Side::Bid, kBid, 10)};
-    EXPECT_EQ(evaluate_crossed_book(bids_only, 1.0, kXchCap).verdict,
-              CrossedBookVerdict::NoBook);
+    const auto b = evaluate_crossed_book(bids_only, 1.0, kXchCap);
+    EXPECT_EQ(b.verdict, CrossedBookVerdict::NoBook);
+    EXPECT_EQ(b.take_size, 0);
+    EXPECT_EQ(b.best_ask_size, 0);
+    EXPECT_TRUE(b.best_ask_offer_id.empty());
+}
+
+// A NoBook decision must never describe an offer. Stated as its own test
+// because the biconditional at the top of crossed_book.hpp constrains
+// take_size only, and the property test's field assertion accepts either the
+// counterparty size or 0 -- so neither of them can see this.
+TEST(CrossedBook, ADeclinedDecisionWithNoUsableCrossDescribesNoOffer)
+{
+    // Several asks, no bid at all: selection runs to completion and picks a
+    // cheapest ask, then the book shape rejects it.
+    const std::vector<CompetingOffer> asks_only{
+        mk(Side::Ask, kAsk + 5, 7),
+        mk(Side::Ask, kAsk, 9),
+        mk(Side::Ask, kAsk + 1, 11),
+    };
+    const auto d = evaluate_crossed_book(asks_only, 1.0, kXchCap);
+    EXPECT_EQ(d.verdict, CrossedBookVerdict::NoBook);
+    EXPECT_EQ(d.best_ask_price, 0);
+    EXPECT_EQ(d.best_ask_size, 0)
+        << "a NoBook decision reported a counterparty size next to a zero "
+           "price -- the three ask fields must be written as a unit";
+    EXPECT_TRUE(d.best_ask_offer_id.empty());
+    EXPECT_EQ(d.take_size, 0);
+    EXPECT_EQ(d.cap_mojos, 0);
 }
 
 TEST(CrossedBook, UncrossedBookIsNotCrossed)

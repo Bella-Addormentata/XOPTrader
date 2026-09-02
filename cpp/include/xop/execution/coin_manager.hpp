@@ -41,12 +41,14 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace xop::execution {
@@ -98,7 +100,6 @@ struct SplitResult {
  * active pairs, without double-spending.
  *
  * Key operations:
- *   - get_balance_xch()     : confirmed + spendable balance.
  *   - get_spendable_coins() : unspent coins minus those locked by offers.
  *   - count_free_coins()    : how many unlocked coins are available.
  *   - ensure_split()        : split large coins into target denominations.
@@ -168,6 +169,125 @@ public:
      */
     asio::awaitable<std::optional<std::vector<CoinInfo>>> get_spendable_coins(
         std::int64_t wallet_id);
+
+    /**
+     * @brief [S41] The whole of get_spendable_coins(), minus the wallet.
+     *
+     * WHY THIS EXISTS: THE GUARD HAD NO GUARD.
+     *
+     * The first attempt at S41 changed the return type to std::optional and
+     * pinned that with static_asserts in test_coin_pool_verdict.cpp. A review
+     * then reinstated the defect -- `co_return std::vector<CoinInfo>{};` in
+     * place of `co_return std::nullopt;` inside the ChiaRPCError catch -- and
+     * the entire 1109-test suite stayed GREEN. The type was never the bug.
+     * The bug is a VALUE: an error path returning the same value as a valid
+     * negative answer. static_asserts cannot see into a function body, and
+     * ChiaWalletRPC is `final` with non-virtual methods and there is no gmock
+     * in this repo, so no test could reach the catch at either end.
+     *
+     * So the RPC is now a parameter rather than a member read. `fetch` is any
+     * callable taking a wallet id and returning an awaitable vector of coin
+     * records; production passes one that calls the wallet, and a test passes
+     * one that throws. Everything else -- the dust filter, the locked filter,
+     * the sort, and BOTH catches -- is here, where a test can drive it.
+     *
+     * THE CONTRACT, which is the thing under test:
+     *   - `fetch` throws                       -> std::nullopt
+     *   - any record fails to parse            -> std::nullopt
+     *   - `fetch` yields no records            -> ENGAGED, empty vector
+     *   - every coin filtered out as dust or
+     *     locked                               -> ENGAGED, empty vector
+     *
+     * The last two are why nullopt exists. "The wallet has nothing usable" is
+     * a real answer and must stay expressible; it is not the same fact as
+     * "the question was never answered", and treating them alike is what made
+     * 68 failed reads into 34 phantom "Have 0 mojos total" claims about a
+     * wallet holding ~59 XCH.
+     *
+     * All parameters are BY VALUE: this is a coroutine, and a reference
+     * parameter would dangle across the first suspension.
+     *
+     * @param fetch           wallet_id -> awaitable<std::vector<json>>; may throw.
+     * @param wallet_id       Wallet identifier, forwarded to `fetch` and logged.
+     * @param dust_threshold  Coins strictly below this are dropped.
+     * @param is_locked       coin_name -> bool; true drops the coin.
+     * @param logger          May be null; used only for the two failure paths.
+     * @return Unlocked spendable coins, or nullopt if the read did not happen.
+     */
+    template <class Fetch, class IsLocked>
+    static asio::awaitable<std::optional<std::vector<CoinInfo>>>
+    collect_spendable_coins(Fetch                           fetch,
+                            std::int64_t                    wallet_id,
+                            Mojo                            dust_threshold,
+                            IsLocked                        is_locked,
+                            std::shared_ptr<spdlog::logger> logger)
+    {
+        // `coins` is built INSIDE the try so there is no partially-filled
+        // vector in scope that a later edit could return by accident on the
+        // failure path.
+        try {
+            std::vector<CoinInfo> coins;
+
+            auto raw_coins = co_await fetch(wallet_id);
+
+            for (const auto& rc : raw_coins) {
+                CoinInfo ci = parse_coin(rc);
+
+                // Filter dust coins.
+                if (ci.amount < dust_threshold) {
+                    continue;
+                }
+
+                // Filter coins that are locked by pending offers.
+                if (is_locked(ci.coin_name)) {
+                    continue;
+                }
+
+                coins.push_back(std::move(ci));
+            }
+
+            // Sort by amount descending -- largest coins first for efficient
+            // selection and splitting.
+            std::sort(coins.begin(), coins.end(),
+                      [](const CoinInfo& a, const CoinInfo& b) {
+                          return a.amount > b.amount;
+                      });
+
+            co_return coins;
+
+        } catch (const rpc::ChiaRPCError& e) {
+            // The observed failure, 68 times: "Wallet needs to be fully
+            // synced before getting all coins" -- an application error, not a
+            // transport fault. NOT an empty wallet. Do not "simplify" this to
+            // an empty vector; CoinPoolVerdict.AnRpcFailureIsNotAnEmptyWallet
+            // exists to stop exactly that edit.
+            if (logger) {
+                logger->error("get_spendable_coins failed for wallet_id {}: {}",
+                              wallet_id, e.what());
+            }
+            co_return std::nullopt;
+
+        } catch (const std::exception& e) {
+            // parse_coin() and compute_coin_name() throw json::type_error,
+            // std::invalid_argument and std::runtime_error on a malformed
+            // coin record. These used to escape this function and, at the two
+            // live call sites, an ancestry of DETACHED coroutines whose
+            // completion handler discards the exception_ptr -- so an escape
+            // here would end the poll loop silently rather than terminate.
+            // One non-throwing boundary, and nothing silent: it is logged at
+            // critical.
+            //
+            // NOTE FOR THE ENGINE: because this catch is here, a malformed
+            // record arrives at engine.cpp as a nullopt, NOT as an exception.
+            // The engine's try/catch around count_free_coins() is a backstop
+            // for a non-std::exception escape and is not the live path.
+            if (logger) {
+                logger->critical("get_spendable_coins: malformed coin record "
+                                 "for wallet_id {}: {}", wallet_id, e.what());
+            }
+            co_return std::nullopt;
+        }
+    }
 
     /**
      * @brief Count of unlocked spendable coins for a wallet.

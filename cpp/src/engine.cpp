@@ -27,6 +27,7 @@
 #include "xop/execution/book_side_quality.hpp"
 #include "xop/execution/cross_guard.hpp"
 #include "xop/execution/crossed_book.hpp"
+#include "xop/execution/take_sizing.hpp"
 #include "xop/execution/coin_pool_verdict.hpp"
 #include "xop/strategy/tier_gain.hpp"
 #include "xop/execution/mid_gate.hpp"
@@ -11493,8 +11494,19 @@ asio::awaitable<void> Engine::step_check_arbitrage(
         }
 
         // The whole offer is consumed -- already validated against the cap by
-        // the size filter above.  This is the size that actually settles, and
-        // therefore the only size allowed to reach record_taker_fill().
+        // the size filter above, so it is the only size allowed to reach
+        // record_taker_fill().
+        //
+        // What it is NOT: a confirmation. This is the counterparty's
+        // ADVERTISED size, as observed in Step 1's Dexie snapshot. Nothing
+        // below re-derives it -- get_offer_status() is read only for the
+        // bech32 text and the status, and take_offer()'s trade_record is read
+        // only for the trade id -- so if the maker reposts between detection
+        // and the take, the ledger legs are still synthesised from an
+        // unconfirmed number. That is far smaller than the clamp (an
+        // unvalidated observation, not a fabricated cap) but it is a residual,
+        // not a closed gap. FOLLOW-UP: re-derive the settled amounts from
+        // take_offer()'s trade_record before recording.
         const Mojo take_size = decision.take_size;
 
         if (dry_run_) {
@@ -12062,17 +12074,87 @@ asio::awaitable<void> Engine::step_check_arbitrage(
             // Lambda to take a single peg-crossing offer.
             auto take_peg = [&](const PegCandidate& c)
                 -> asio::awaitable<void> {
-                const Mojo max_mojos = static_cast<Mojo>(
-                    peg_max_units
-                    * static_cast<double>(pair.base_mojos_per_unit));
-                const Mojo take_sz = std::min(c.size, max_mojos);
+                // [S40 follow-up 2026-09-01] This lambda carried the SAME
+                // defect as Step 9c, and worse. It read
+                //
+                //     const Mojo take_sz = std::min(c.size, max_mojos);
+                //
+                // take_offer() has no size parameter and a Chia offer cannot
+                // be partially filled, so the clamp bounded nothing. Here the
+                // clamped value did not merely mislead a log: it fed the
+                // PRE-BALANCE GUARD below, so for any offer larger than
+                // peg_arb_max_take_units the guard priced a fraction of the
+                // take, passed, and let take_offer() lift the whole offer we
+                // could not fund. A fail-open inside a guard whose only job is
+                // to stop unfundable takes. It then fed record_taker_fill(),
+                // synthesising both double-entry ledger legs from a size the
+                // RPC never saw.
+                //
+                // The cap is now a FILTER, exactly as Steps 9c/9d/9f do it.
+                //
+                // The units were wrong too, independently of the clamp.
+                // Ingest denominates a BID's size in the QUOTE asset and an
+                // ASK's in the BASE asset (market_data.cpp:1933-1937), and
+                // this lambda applied one base-denominated formula to both.
+                // On BYC/wUSDC.b the error is masked because base and quote
+                // mojos-per-unit are coincidentally equal (1000 each); on any
+                // pair where they differ, the cap, the funding estimate and
+                // the ledger were all in the wrong unit. take_sizing.hpp does
+                // the conversion and is tested.
+                const Mojo max_mojos = execution::cap_mojos_for(
+                    peg_max_units, pair.base_mojos_per_unit);
+
+                // base_sz: what we actually acquire or deliver, in BASE mojos
+                //          -- the number the cap bounds and the number
+                //          record_taker_fill() books.
+                // spend_cost: what leaves our wallet, in the asset we spend.
+                const Mojo base_sz = (c.side == Side::Ask)
+                    ? c.size
+                    : execution::base_size_for_bid(
+                          c.size, c.price,
+                          pair.base_mojos_per_unit,
+                          pair.quote_mojos_per_unit);
+                const Mojo spend_cost = (c.side == Side::Ask)
+                    ? execution::quote_cost_for_ask(
+                          c.size, c.price,
+                          pair.base_mojos_per_unit,
+                          pair.quote_mojos_per_unit)
+                    : base_sz;
 
                 spdlog::info("[Engine] Step 9e: {} PEG-CROSS {} "
                              "price={} peg={} edge={:.1f}bps "
-                             "offer={} size={}",
+                             "offer={} size={} base_size={} cap={}",
                              pair.name, to_string(c.side),
                              c.price, peg_mojos, c.edge_bps,
-                             c.id.substr(0, 12), take_sz);
+                             c.id.substr(0, 12), c.size, base_sz, max_mojos);
+
+                if (max_mojos <= 0) {
+                    spdlog::warn("[Engine] Step 9e: {} take cap is unusable "
+                                 "(peg_arb_max_take_units={} "
+                                 "base_mojos_per_unit={}) -- taking nothing",
+                                 pair.name, peg_max_units,
+                                 pair.base_mojos_per_unit);
+                    co_return;
+                }
+                if (base_sz <= 0 || spend_cost <= 0) {
+                    spdlog::info("[Engine] Step 9e: {} offer {} carries no "
+                                 "usable size (size={} base_size={} price={}) "
+                                 "-- skipping",
+                                 pair.name, c.id.substr(0, 12), c.size,
+                                 base_sz, c.price);
+                    co_return;
+                }
+                if (base_sz > max_mojos) {
+                    spdlog::info("[Engine] Step 9e: {} offer base size {} "
+                                 "exceeds cap {} -- skipping (takes are "
+                                 "all-or-nothing, cannot partially fill)",
+                                 pair.name, base_sz, max_mojos);
+                    co_return;
+                }
+
+                // The whole offer settles, and it has been checked against
+                // the cap. No clamp: see take_sizing.hpp.
+                const Mojo take_sz = base_sz;
 
                 if (dry_run_) {
                     spdlog::info("[Engine] Step 9e: {} DRY RUN -- "
@@ -12120,18 +12202,13 @@ asio::awaitable<void> Engine::step_check_arbitrage(
                                 "spendable_balance",
                                 static_cast<Mojo>(0));
 
-                            // Estimate cost: for ASK take we pay
-                            // take_sz * price / kMojosPerXch in quote
-                            // mojos; for BID take we deliver take_sz
-                            // base mojos.
-                            const Mojo cost =
-                                (c.side == Side::Ask)
-                                    ? static_cast<Mojo>(
-                                          static_cast<double>(take_sz)
-                                          * static_cast<double>(c.price)
-                                          / static_cast<double>(
-                                                kMojosPerXch))
-                                    : take_sz;
+                            // The cost of the WHOLE offer, in the asset we
+                            // spend, derived by take_sizing.hpp from the size
+                            // that actually settles. The previous formula
+                            // priced the CLAMPED size and ignored the
+                            // quote/base denomination ratio, so it could
+                            // clear this guard on a take it could not fund.
+                            const Mojo cost = spend_cost;
 
                             if (spendable < cost) {
                                 spdlog::warn(
@@ -12143,10 +12220,23 @@ asio::awaitable<void> Engine::step_check_arbitrage(
                                 co_return;
                             }
                         } catch (const std::exception& be) {
-                            spdlog::debug(
-                                "[Engine] Step 9e: {} balance check "
-                                "failed: {} -- proceeding cautiously",
-                                pair.name, be.what());
+                            // [S41 family] An UNREAD balance is not a PASSED
+                            // balance check. This used to log at debug and
+                            // fall through to take_offer(), so a thrown
+                            // ChiaRPCError -- the same "wallet not synced"
+                            // condition behind 68 swallowed
+                            // get_spendable_coins failures -- produced
+                            // exactly the observable outcome of "we checked
+                            // and had the funds", invisibly, under the
+                            // default sink. An error path must not be
+                            // indistinguishable from a passing one. Decline,
+                            // at warn.
+                            spdlog::warn(
+                                "[Engine] Step 9e: {} SKIP {} take -- balance "
+                                "check FAILED: {} (an unread balance is not a "
+                                "passed check)",
+                                pair.name, to_string(c.side), be.what());
+                            co_return;
                         }
                     }
                 }
@@ -12511,34 +12601,23 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
         // fall within max_premium_bps of mid.
         const Mojo max_mojos = static_cast<Mojo>(
             max_units * static_cast<double>(pair.base_mojos_per_unit));
-        auto ceil_to_mojo = [](long double value) -> Mojo {
-            if (!std::isfinite(static_cast<double>(value)) || value <= 0.0L) {
-                return 0;
-            }
-            const long double cap = static_cast<long double>(
-                std::numeric_limits<Mojo>::max());
-            if (value >= cap) {
-                return std::numeric_limits<Mojo>::max();
-            }
-            return static_cast<Mojo>(std::ceil(value));
-        };
-        const long double base_mpu = static_cast<long double>(
-            pair.base_mojos_per_unit > 0 ? pair.base_mojos_per_unit : 1);
-        const long double quote_mpu = static_cast<long double>(
-            pair.quote_mojos_per_unit > 0 ? pair.quote_mojos_per_unit : 1);
-        const long double price_scale = static_cast<long double>(kMojosPerXch);
+        // [S40 follow-up 2026-09-01] These four lambdas used to be spelled
+        // out here. They were correct -- 9f is the step that got both the
+        // all-or-nothing filter and the bid/ask denomination right -- but they
+        // were the ONLY correct copy, unreachable from any test, while Step 9e
+        // twenty lines away had its own wrong copy of the same arithmetic.
+        // The maths now lives in take_sizing.hpp, used by both steps and
+        // pinned by cpp/tests/test_take_sizing.cpp. Same formulas, same
+        // round-up direction, same zero-means-decline convention.
         auto quote_cost_for_ask = [&](Mojo base_size, Mojo price) -> Mojo {
-            return ceil_to_mojo(
-                static_cast<long double>(base_size)
-                * static_cast<long double>(price)
-                * quote_mpu / (base_mpu * price_scale));
+            return execution::quote_cost_for_ask(
+                base_size, price,
+                pair.base_mojos_per_unit, pair.quote_mojos_per_unit);
         };
         auto base_cost_for_bid = [&](Mojo quote_size, Mojo price) -> Mojo {
-            if (price <= 0) return static_cast<Mojo>(0);
-            return ceil_to_mojo(
-                static_cast<long double>(quote_size)
-                * price_scale * base_mpu
-                / (static_cast<long double>(price) * quote_mpu));
+            return execution::base_size_for_bid(
+                quote_size, price,
+                pair.base_mojos_per_unit, pair.quote_mojos_per_unit);
         };
 
         struct Cand {
@@ -12679,8 +12758,16 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
                         continue;
                     }
                 } catch (const std::exception& be) {
-                    spdlog::debug("[Engine] Step 9f: {} balance check "
-                                  "failed: {}", pair.name, be.what());
+                    // [S41 family] Same fix as Step 9e: an unread balance is
+                    // not a passed balance check. The `spendable < cost`
+                    // branch above declines; this one used to log at debug
+                    // and fall through into the take, so a failed read was
+                    // indistinguishable from a successful one.
+                    spdlog::warn("[Engine] Step 9f: {} SKIP -- balance check "
+                                 "FAILED: {} (an unread balance is not a "
+                                 "passed check)",
+                                 pair.name, be.what());
+                    continue;
                 }
             }
         }
@@ -12935,9 +13022,31 @@ asio::awaitable<void> Engine::step_xch_recovery(BlockHeight block_height)
     // -- 5. Scan XCH-base pairs for cheap asks to take ---------------------
     //    An "ask" on an XCH-base pair means someone is selling XCH.
     //    Taking it gives us XCH in exchange for the quote asset.
-    const double max_take_mojos_total =
-        rcfg.max_take_per_block_xch * static_cast<double>(kMojosPerXch);
-    double taken_mojos_this_block = 0.0;
+    // [S40 third site 2026-09-01] recovery.max_take_per_block_xch NEVER
+    // BOUNDED A TAKE. This was a running total, in double, that was compared
+    // against the budget at the TOP of the candidate loop -- where it is
+    // structurally zero, because the only increment happens AFTER
+    // take_offer() has already settled and is immediately followed by an
+    // unconditional break out of the loop. `cand.size` was never compared to
+    // the budget anywhere, and the candidate filter screened side, own-ids
+    // and price but not size. So a single 20 XCH ask was lifted whole against
+    // a 0.5 XCH per-block budget, and the budget was charged only after the
+    // overrun it existed to prevent.
+    //
+    // Worse than S40's clamp in one respect: crossed_book_max_take_xch at
+    // least clamped a log field, so the number appeared somewhere. This one
+    // was not consulted against the candidate at all.
+    //
+    // Dormant today only because the sole pair that can supply a cex_ref is
+    // disabled -- which is exactly the kind of accident that was holding the
+    // 9c path together, and the config comments say the operator intends to
+    // re-enable it.
+    //
+    // Now an integer budget, filtered per candidate (9d's semantics: an
+    // oversized candidate is SKIPPED, not clamped and not partially taken),
+    // and the cap is scaled by the PAIR's denomination via cap_mojos_for so
+    // an unrepresentable cap declines rather than reading as unbounded.
+    Mojo taken_mojos_this_block = 0;
 
     for (const auto& pair : config_.pairs) {
         if (!pair.enabled) continue;
@@ -12981,6 +13090,30 @@ asio::awaitable<void> Engine::step_xch_recovery(BlockHeight block_height)
             if (!po.dexie_id.empty()) own_ids.insert(po.dexie_id);
         }
 
+        // The per-block take budget, in this pair's base mojos. Zero means
+        // the configured budget is unusable, which means TAKE NOTHING -- an
+        // unrepresentable budget is an unbounded budget, and unbounded is the
+        // defect being closed here.
+        const Mojo max_take_mojos_total = execution::cap_mojos_for(
+            rcfg.max_take_per_block_xch, pair.base_mojos_per_unit);
+        if (max_take_mojos_total <= 0) {
+            spdlog::warn("[Recovery] {} take budget is unusable "
+                         "(max_take_per_block_xch={} base_mojos_per_unit={}) "
+                         "-- taking nothing",
+                         pair.name, rcfg.max_take_per_block_xch,
+                         pair.base_mojos_per_unit);
+            continue;
+        }
+        if (taken_mojos_this_block >= max_take_mojos_total) {
+            spdlog::info("[Recovery] {} per-block take budget already spent "
+                         "({} of {} mojos) -- skipping",
+                         pair.name, taken_mojos_this_block,
+                         max_take_mojos_total);
+            continue;
+        }
+        const Mojo remaining_budget_mojos =
+            max_take_mojos_total - taken_mojos_this_block;
+
         // Find the cheapest asks (someone selling XCH) within our budget.
         struct CandidateAsk {
             std::string offer_id;
@@ -12995,6 +13128,21 @@ asio::awaitable<void> Engine::step_xch_recovery(BlockHeight block_height)
             if (co.price > max_price_mojos) continue;
             if (co.price == 0) continue;
 
+            // THE BUDGET, APPLIED. An ask on an XCH-base pair is denominated
+            // in the base asset, so co.size is directly comparable with the
+            // budget. Takes are all-or-nothing, so an oversized candidate is
+            // dropped here rather than clamped -- there is no way to lift
+            // part of it, and a clamp would only mis-state the log and the
+            // ledger, which is S40 verbatim.
+            if (co.size <= 0 || co.size > remaining_budget_mojos) {
+                spdlog::debug("[Recovery] {} ask {} size {} outside remaining "
+                              "budget {} -- skipping (takes are "
+                              "all-or-nothing, cannot partially fill)",
+                              pair.name, co.offer_id.substr(0, 12), co.size,
+                              remaining_budget_mojos);
+                continue;
+            }
+
             candidates.push_back({co.offer_id, co.price, co.size});
         }
 
@@ -13003,6 +13151,9 @@ asio::awaitable<void> Engine::step_xch_recovery(BlockHeight block_height)
             [](const auto& a, const auto& b) { return a.price < b.price; });
 
         for (const auto& cand : candidates) {
+            // Every candidate already fits the remaining budget (filtered
+            // above). This stays as a second line of defence for the day
+            // someone takes more than one offer per block.
             if (taken_mojos_this_block >= max_take_mojos_total) break;
 
             const double price_d =
@@ -13080,8 +13231,7 @@ asio::awaitable<void> Engine::step_xch_recovery(BlockHeight block_height)
                                  pair.name, trade_id.substr(0, 12),
                                  price_d, premium_bps);
 
-                    taken_mojos_this_block +=
-                        static_cast<double>(cand.size);
+                    taken_mojos_this_block += cand.size;
 
                     // [TAKER-RECORDING] Recovery lifts asks, so we bought
                     // base and paid quote.
@@ -17370,8 +17520,20 @@ asio::awaitable<void> Engine::step_maintain_coin_pool(BlockHeight block_height)
                                  "(this is NOT an empty wallet)");
                 }
             } catch (const std::exception& e) {
-                // Reachable now: CoinManager no longer swallows, and a
-                // malformed coin record still arrives here as an exception.
+                // NOT the live path, and an earlier comment here said the
+                // opposite. CoinManager::collect_spendable_coins() catches
+                // rpc::ChiaRPCError and then std::exception, and converts
+                // both to nullopt; count_free_coins() adds no throwing work
+                // of its own. So an RPC failure AND a malformed coin record
+                // both arrive at the `else` branch above, as nullopt -- that
+                // is the branch that observes the failure, and the one to
+                // keep if anyone ever simplifies this block.
+                //
+                // This catch is a backstop for something that is not a
+                // std::exception escaping the call. It is retained rather
+                // than deleted only because deleting it would let such an
+                // escape unwind a DETACHED coroutine whose completion handler
+                // discards the exception_ptr. Its silence is expected.
                 spdlog::warn("[Engine] Coin pool: XCH count_free_coins failed: {}",
                              e.what());
             }
@@ -17521,6 +17683,9 @@ asio::awaitable<void> Engine::step_maintain_coin_pool(BlockHeight block_height)
                                      info.display_name, info.wallet_id);
                     }
                 } catch (const std::exception& e) {
+                    // Backstop only -- see the XCH branch above. Both real
+                    // failure modes arrive as nullopt at the `else` branch,
+                    // not here.
                     spdlog::warn("[Engine] Coin pool: {} count_free_coins failed: {}",
                                  info.display_name, e.what());
                 }

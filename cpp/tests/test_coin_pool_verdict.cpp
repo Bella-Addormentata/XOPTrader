@@ -33,10 +33,31 @@
 // would still have split, because free_count keeps its zero. A mechanical
 // port to maybe.value_or(0) preserves the defect verbatim. So the policy was
 // moved into a pure header where a test can hold it: nothing in cpp/tests
-// constructs an Engine (TODO S36), ChiaWalletRPC is final with non-virtual
-// methods, and there is no gmock in this repo -- meaning the RPC failure path
-// cannot be driven from a unit test at either end. These tests plus the
-// signature assertions below are the entire regression surface.
+// constructs an Engine (TODO S36).
+//
+// AND THAT WAS NOT ENOUGH. The first version of this file pinned the POLICY
+// (decide_coin_pool_action) and the SIGNATURE (the static_asserts below), and
+// stopped there, on the argument that ChiaWalletRPC is `final` with
+// non-virtual methods and there is no gmock, so the RPC failure path could
+// not be driven from a unit test. A review then reinstated the original
+// defect at the boundary --
+//
+//     catch (const rpc::ChiaRPCError&) { co_return std::vector<CoinInfo>{}; }
+//
+// -- and ALL 1109 TESTS PASSED. The type was never the bug. The bug is a
+// VALUE: an error path returning the same value as a valid negative answer.
+// A static_assert cannot see into a function body.
+//
+// "The RPC cannot be faked" was a statement about the SHAPE OF THE CODE, not
+// a law. CoinManager::collect_spendable_coins() now takes the wallet call as
+// a parameter, so the failure is drivable without faking anything: pass a
+// fetch that throws. The four tests under "The S41 boundary itself" below are
+// the ones that go red when the fail-open is restored.
+//
+// STILL UNGUARDED, stated plainly rather than left for the next reader to
+// discover: nothing here pins the ENGINE's wiring -- that it sets read_ok
+// from has_value() rather than from a value_or, at engine.cpp's two coin-pool
+// branches. That needs an Engine, and TODO S36 is why there isn't one.
 //
 // THE RULE: a number may never be substituted for a failed read. Unknown is
 // its own state, it is the DEFAULT state, and it authorises nothing.
@@ -44,10 +65,17 @@
 
 #include <gtest/gtest.h>
 
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/io_context.hpp>
+
 #include <climits>
 #include <cstdint>
+#include <exception>
 #include <optional>
+#include <stdexcept>
+#include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "xop/execution/coin_manager.hpp"
@@ -85,6 +113,155 @@ static_assert(
                        std::int64_t)>,
     "count_free_coins must propagate 'I could not count'. The number 0 is not "
     "an answer to a question that was never asked.");
+
+// ---------------------------------------------------------------------------
+// The S41 boundary itself -- the four tests that a reinstated fail-open fails.
+//
+// These drive CoinManager::collect_spendable_coins() directly. It is the
+// entire body of get_spendable_coins() with the wallet call passed in, so
+// what is under test here is exactly the production code path, both catches
+// included.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+using RawCoins = std::vector<xop::execution::json>;
+using MaybeCoins = std::optional<std::vector<CoinInfo>>;
+
+// Run one awaitable to completion on a private io_context and return its
+// value. Rethrows anything that escapes, so a test that expects nullopt would
+// fail loudly rather than quietly if the boundary started throwing again.
+template <class T>
+T run_awaitable(asio::awaitable<T> a)
+{
+    asio::io_context ioc;
+    std::optional<T>   out;
+    std::exception_ptr err;
+
+    asio::co_spawn(ioc, std::move(a),
+                   [&](std::exception_ptr ep, T value) {
+                       err = ep;
+                       if (!ep) out = std::move(value);
+                   });
+    ioc.run();
+
+    if (err) std::rethrow_exception(err);
+    return std::move(*out);
+}
+
+// A well-formed coin record. coin_name is supplied explicitly so parse_coin
+// does not have to derive it through OpenSSL.
+xop::execution::json coin_record(const std::string& name, xop::Mojo amount)
+{
+    return xop::execution::json{
+        {"coin", {{"parent_coin_info", std::string(64, 'a')},
+                  {"puzzle_hash",      std::string(64, 'b')},
+                  {"amount",           amount}}},
+        {"confirmed_block_index", 100},
+        {"coin_name", name},
+    };
+}
+
+MaybeCoins collect(RawCoins records)
+{
+    return run_awaitable(CoinManager::collect_spendable_coins(
+        [records](std::int64_t) -> asio::awaitable<RawCoins> {
+            co_return records;
+        },
+        /*wallet_id=*/1,
+        /*dust_threshold=*/1'000'000LL,
+        [](const std::string&) { return false; },
+        /*logger=*/nullptr));
+}
+
+}  // namespace
+
+// The mutation this test exists for: replace `co_return std::nullopt` in the
+// ChiaRPCError catch with `co_return std::vector<CoinInfo>{}` -- the literal
+// pre-S41 behaviour -- and this is what turns red.
+TEST(CoinPoolVerdict, AnRpcFailureIsNotAnEmptyWallet)
+{
+    const auto read = run_awaitable(CoinManager::collect_spendable_coins(
+        [](std::int64_t) -> asio::awaitable<RawCoins> {
+            // The observed failure, 68 times.
+            throw xop::rpc::ChiaRPCError(
+                "Wallet needs to be fully synced before getting all coins");
+            co_return RawCoins{};  // unreachable; keeps this a coroutine
+        },
+        /*wallet_id=*/1,
+        /*dust_threshold=*/1'000'000LL,
+        [](const std::string&) { return false; },
+        /*logger=*/nullptr));
+
+    ASSERT_FALSE(read.has_value())
+        << "an RPC failure came back as a value. That is S41: a failed read "
+           "that is indistinguishable from an empty wallet authorises a "
+           "split and prints 'Have 0 mojos total' about a funded wallet.";
+}
+
+// The other throw site: parse_coin() on a malformed record. Same rule.
+TEST(CoinPoolVerdict, AMalformedCoinRecordIsNotAnEmptyWallet)
+{
+    // parent_coin_info as a number, not a string -> json::type_error, which
+    // is a std::exception and NOT a ChiaRPCError, so this exercises the
+    // second catch.
+    const xop::execution::json bad{
+        {"coin", {{"parent_coin_info", 12345},
+                  {"puzzle_hash",      std::string(64, 'b')},
+                  {"amount",           5'000'000'000LL}}},
+    };
+
+    const auto read = collect(RawCoins{bad});
+
+    ASSERT_FALSE(read.has_value())
+        << "a record we could not parse came back as a value";
+}
+
+// The direction that keeps nullopt meaningful. If a genuinely empty wallet
+// also returned nullopt, the engine would simply never split, and the
+// distinction the whole fix rests on would carry no information.
+TEST(CoinPoolVerdict, AGenuinelyEmptyWalletIsAnEngagedEmptyVector)
+{
+    const auto read = collect(RawCoins{});
+
+    ASSERT_TRUE(read.has_value())
+        << "an empty wallet is a real answer, not a failed read";
+    EXPECT_TRUE(read->empty());
+
+    // ... and every coin being filtered out is also a real answer.
+    const auto all_dust = collect(RawCoins{coin_record("aa", 10),
+                                           coin_record("bb", 99)});
+    ASSERT_TRUE(all_dust.has_value());
+    EXPECT_TRUE(all_dust->empty());
+}
+
+// Guards against a vacuous pass of the three above: a boundary that returned
+// nullopt for everything, or an empty vector for everything, would satisfy
+// some of them. This pins the success path -- dust dropped, locked dropped,
+// survivors sorted by amount descending.
+TEST(CoinPoolVerdict, ASuccessfulReadFiltersDustAndLockedCoinsAndSortsBySize)
+{
+    const RawCoins records{
+        coin_record("small",  2'000'000LL),
+        coin_record("dust",         999LL),   // below the 1e6 threshold
+        coin_record("locked", 9'000'000LL),
+        coin_record("big",   50'000'000LL),
+    };
+
+    const auto read = run_awaitable(CoinManager::collect_spendable_coins(
+        [records](std::int64_t) -> asio::awaitable<RawCoins> {
+            co_return records;
+        },
+        /*wallet_id=*/1,
+        /*dust_threshold=*/1'000'000LL,
+        [](const std::string& name) { return name == "locked"; },
+        /*logger=*/nullptr));
+
+    ASSERT_TRUE(read.has_value());
+    ASSERT_EQ(read->size(), 2U);
+    EXPECT_EQ((*read)[0].coin_name, "big");
+    EXPECT_EQ((*read)[1].coin_name, "small");
+}
 
 // ---------------------------------------------------------------------------
 // std::nullopt and an empty vector are different values.

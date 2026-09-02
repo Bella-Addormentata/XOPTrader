@@ -32,25 +32,63 @@
 // clamped base size synthesises BOTH double-entry ledger legs and the
 // taker_fills row from a number the RPC never saw -- coherently, so the
 // books stay internally consistent while being wrong about reality, and
-// nothing downstream can detect it. (Checked 2026-09-01: all 23 crossed_book
-// rows settled below the cap, so no remediation is owed. That is a
-// consequence of never having had the funds, not of the code being right.)
+// nothing downstream can detect it.
+//
+// HISTORICAL ROWS: 19 CLEAN, 4 UNDECIDED. An earlier draft of this header
+// said "all 23 crossed_book rows settled below the cap, so no remediation is
+// owed". That was asserted without querying the database and it is wrong.
+// Re-read read-only on 2026-09-01, taker_fills WHERE strategy='crossed_book'
+// has 23 rows; nineteen are strictly below their pair's cap, and four are
+// EXACTLY ON IT:
+//
+//     2026-08-06T21:38:01.800Z  BYC/wUSDC.b  base_delta=5000  quote_delta=-5005
+//     2026-08-06T22:00:26.487Z  BYC/wUSDC.b  base_delta=5000  quote_delta=-5005
+//     2026-08-06T22:23:07.326Z  BYC/wUSDC.b  base_delta=5000  quote_delta=-5005
+//     2026-08-06T22:45:05.796Z  BYC/wUSDC.b  base_delta=5000  quote_delta=-5005
+//
+// BYC is a CAT, so base_mojos_per_unit is 1000 and cap_mojos_for(5.0, 1000)
+// is exactly 5000. Landing exactly on the cap is the CLAMP SIGNATURE -- it is
+// what std::min(size, 5000) returns for every counterparty offer of 5000 or
+// more -- so those four rows are indistinguishable from clamped records. The
+// quote leg is derived, not observed, so if the base was clamped both
+// double-entry legs are wrong by the same construction. Logs older than
+// 2026-08-31 have rotated away, so this cannot now be settled from logs; it
+// needs the four counterparty offer ids adjudicated on chain or on Dexie.
+// REMEDIATION FOR THOSE FOUR ROWS IS OPEN. Do not restate it as closed
+// without the adjudication.
 //
 // THE FIX IS A FILTER, NOT A CLAMP. If the whole offer does not fit under
 // the cap, we do not take it. Step 9d has done this correctly since it was
-// written (engine.cpp:11771-11801) and Step 9f likewise; this header is 9d's
-// rule made testable, because nothing in cpp/tests can construct an Engine
-// (TODO S36) and the call site is otherwise unpinnable.
+// written -- see Step 9d's `size_ok` filter and its "takes are all-or-nothing"
+// skip log -- and Step 9f likewise; this header is 9d's rule made testable,
+// because nothing in cpp/tests can construct an Engine (TODO S36) and the
+// call site is otherwise unpinnable. (Line numbers are deliberately not cited:
+// this step moved ~40 lines in the commit that added this header, and the
+// citations it shipped with were already stale.)
 //
 // WE SKIP; WE DO NOT RE-SELECT. When the cheapest ask is oversized we
 // decline the pair for this cycle rather than looking for a smaller ask
 // inside the cross. That is 9d's semantics and it is deliberately the
-// conservative direction: it makes the set of offers we take a strict
-// SUBSET of what the old code took, so this change cannot cause a take that
-// would not have happened before. Selecting the best ask WITHIN the cap
-// would capture more edge, but it would make us lift offers we do not lift
-// today, which is the one thing that breaks the subset property. That is a
-// follow-up, deliberately not done here.
+// conservative direction. Selecting the best ask WITHIN the cap would
+// capture more edge, but it would make us lift offers we do not lift today.
+// That is a follow-up, deliberately not done here.
+//
+// THE SUBSET PROPERTY, STATED ACCURATELY. For every book whose cheapest ask
+// carries a positive price, the set of offers this header takes is a subset
+// of what the old code took. There is exactly ONE exception and it is worth
+// naming rather than hiding: a zero- or negative-priced cheapest ask. The old
+// selection loop had no price guard, so such an ask won selection, produced
+// edge = (bid - 0) / 0 = +inf, cleared any minimum, and WAS TAKEN. This
+// header excludes it, which promotes the next-cheapest ask -- a real,
+// finite-priced, edge-checked, cap-checked offer the old code never reached.
+// So in that one case we take a DIFFERENT offer, not a superset of them:
+// one phantom take is replaced by one ordinary take. A price of 0 is
+// reachable, not theoretical -- ingest computes price by llround()ing a
+// market ratio scaled by kMojosPerXch, which rounds to 0 below 5e-13. The
+// redirection is the safer behaviour; the blanket claim that no take can
+// happen that would not have happened before is simply not true, and
+// CrossedBook.ZeroPricedAskCannotManufactureInfiniteEdge encodes the
+// exception.
 //
 // THE INVARIANT, stated as a biconditional because one direction is not
 // enough:
@@ -208,7 +246,17 @@ struct CrossedBookDecision {
     }
 
     if (best_bid == 0 || !have_ask) {
-        return d;  // NoBook -- take_size stays 0
+        // NoBook. Return the ask fields to their defaults as well, so a
+        // declined decision never carries a populated offer id and size
+        // beside a best_ask_price of 0 -- the three are written and returned
+        // as a unit or not at all. The biconditional below constrains only
+        // take_size; this closes the gap it leaves, because the detection log
+        // prints best_ask_size and a future edit that moves that log above
+        // the quiet-verdict filter must not be able to print a real size
+        // against a zero price.
+        d.best_ask_offer_id.clear();
+        d.best_ask_size = 0;
+        return d;  // take_size stays 0
     }
 
     d.best_bid_price = best_bid;
@@ -239,9 +287,9 @@ struct CrossedBookDecision {
     d.cap_mojos = cap_mojos;
 
     // 9d guards this (best_ask_a_size > 0). Without it a zero-size offer is
-    // taken on chain and record_taker_fill() returns early at engine.cpp:14301
-    // (base_mojos <= 0), leaving a settled take with NO taker_fills row and NO
-    // ledger legs at all.
+    // taken on chain and record_taker_fill() returns early on its
+    // `base_mojos <= 0` guard, leaving a settled take with NO taker_fills row
+    // and NO ledger legs at all.
     if (d.best_ask_size <= 0) {
         d.verdict = CrossedBookVerdict::ZeroSizeOffer;
         return d;
