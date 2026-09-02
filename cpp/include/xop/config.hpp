@@ -2061,6 +2061,22 @@ struct MarketDataSettings {
     /// mid_anchor_band_ratio -- config load warns otherwise, because a
     /// side wider than the gate's own band could remain trusted while the
     /// mid it implies is refused.  <= 1.0 disables.
+    ///
+    /// [review round 9] DISABLING THIS IS COUPLED TO
+    /// book_side_agree_max_spread_bps -- READ BOTH BEFORE CHANGING EITHER.
+    /// With the band off, nothing can disqualify a side, so the ONLY
+    /// remaining screen on whether a book's mid may MARK EQUITY is the
+    /// coherence test below.  That test has two stand-downs of its own: it is
+    /// switched off at 0, and it cannot measure a CROSSED book at all
+    /// (crossed books are normal on Dexie).  In either state, turning this
+    /// band off would leave a two-sided book with no screen whatsoever.
+    ///
+    /// The bot refuses that combination rather than trusting it: valuation
+    /// grade is WITHHELD when the band is off AND the coherence test cannot
+    /// bite, so the pair falls to the S20 carry and then to a DEGRADED cycle.
+    /// Fail-closed, and visible.  If you disable this band, keep
+    /// book_side_agree_max_spread_bps positive or expect crossed cycles to go
+    /// ungraded.
     double book_side_anchor_band_ratio{3.0};
 
     /// Two-sides-agree bypass: a two-sided book whose own spread is at
@@ -2103,6 +2119,23 @@ struct MarketDataSettings {
     /// 0 remains safe against that: at 0 the coherence requirement stands
     /// down entirely and the per-side band governs valuation alone, so
     /// switching the bypass off can never black out valuation bot-wide.
+    ///
+    /// [review round 9] "THE PER-SIDE BAND GOVERNS ALONE" IS A PROMISE ABOUT
+    /// THE OTHER KNOB, AND IT IS ONLY TRUE WHILE THAT KNOB IS ON.  The
+    /// sentence above was written -- correctly -- on the assumption that
+    /// book_side_anchor_band_ratio is live.  If the band is ALSO disabled,
+    /// nothing governs: every conjunct of the valuation book check stands
+    /// down at once and a dislocated or crossed book marks equity off a mid
+    /// arbitrarily far from the anchor.  That combination shipped briefly and
+    /// graded the 3.24975 XCH/BYC incident mid.
+    ///
+    /// It is now refused rather than trusted: with the band off, valuation
+    /// grade additionally requires that THIS test can still refuse the book
+    /// (positive here, and a measurable -- i.e. uncrossed -- spread).  Both
+    /// knobs remain individually safe, and the two of them together are
+    /// fail-closed rather than fail-open.  Note the same state is reachable
+    /// by lowering mid_gate_book_confirm_max_spread_bps to 0, since the
+    /// effective value is the min() of the two.
     double book_side_agree_max_spread_bps{5000.0};
 
     /// Max spread (bps) for a sibling pair's book to serve as a leg of the

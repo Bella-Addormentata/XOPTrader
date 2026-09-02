@@ -47,6 +47,7 @@
 #include "xop/types.hpp"
 #include "xop/config.hpp"
 #include "xop/state.hpp"
+#include "xop/execution/book_side_quality.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -599,6 +600,17 @@ struct PairState {
     bool        bid_side_anchor_ok{true};
     bool        ask_side_anchor_ok{true};
     double      book_side_ref{0.0};   // anchor used; 0 = nothing screened
+    // ...and WHY it is 0 when it is 0.  `book_side_ref > 0.0` was the
+    // valuation gate's `sides_examined` witness until 2026-09-02, and it
+    // could not tell a genuine data gap (NoAnchor) from the operator's
+    // documented band off-switch (BandDisabled), so turning the band off
+    // withheld valuation grade on every two-sided book.  See the
+    // ScreenOutcome note in book_side_quality.hpp.
+    //
+    // Default is NoAnchor, matching book_side_ref's 0: before the first
+    // ingest nothing has screened this pair, and that must WITHHOLD.
+    bookside::ScreenOutcome book_side_screen{
+        bookside::ScreenOutcome::NoAnchor};
 
     // [S20 2026-08-24] ...and whether that reference was an INDEPENDENT
     // anchor rather than this pair's own last accepted mid.

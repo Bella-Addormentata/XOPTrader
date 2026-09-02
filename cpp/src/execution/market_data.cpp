@@ -584,6 +584,12 @@ void MarketDataFeed::ingest_dexie(const std::string& pair_name,
     ps.bid_side_anchor_ok = true;
     ps.ask_side_anchor_ok = true;
     ps.book_side_ref      = 0.0;
+    // Reset to NoAnchor, NOT BandDisabled.  A raw ticker poll is the
+    // data-gap case by definition -- classify_sides did not run at all this
+    // cycle, whatever the band is configured to.  Resetting to BandDisabled
+    // would hand valuation grade to exactly the unexamined book the round-7
+    // witness exists to refuse.
+    ps.book_side_screen   = bookside::ScreenOutcome::NoAnchor;
     // Age the print by its VALUE, not by when we polled: dex_updated_at is
     // re-stamped every heartbeat, so it cannot answer "how old is this
     // trade?".  A first sighting deliberately leaves last_trade_changed_at
@@ -1738,12 +1744,63 @@ void MarketDataFeed::apply_mid_gate(PairState& ps, const MarketDataConfig& cfg)
     // invents a price the book does not contain.
     const bool book_sides_ok =
         ps.bid_side_anchor_ok && ps.ask_side_anchor_ok;
-    // Witness that classify_sides actually ran against an independent
-    // anchor this cycle.  NOT bbo_filter_had_independent_anchor -- see (2).
-    const bool sides_examined = ps.book_side_ref > 0.0;
+    // Witness that classify_sides actually had the chance to run against an
+    // independent anchor this cycle.  NOT bbo_filter_had_independent_anchor
+    // -- see (2).
+    //
+    // [REGRESSION FIXED 2026-09-02] This read `ps.book_side_ref > 0.0`,
+    // which was the right idea reading the wrong field.  ref is 0 from a
+    // single early exit in classify_sides that has TWO causes, and only one
+    // is a reason to withhold:
+    //
+    //   NoAnchor      genuine data gap -- WITHHOLD, this is what b45c30f
+    //                 closed and it stays closed;
+    //   BandDisabled  band_ratio <= 1.0, the operator's DOCUMENTED
+    //                 off-switch (config.hpp:2063) -- an opt-out, not a
+    //                 gap, and withholding on it silently broke the switch.
+    //
+    // Measured on a clean 142-bps book with an anchor present, band 3.0
+    // granted grade while bands 1.0 and 0.0 withheld it, dropping valuation
+    // to the S20 carry and then to a DEGRADED cycle for no visible reason.
+    //
+    // [review round 9] AN EARLIER REVISION OF THIS COMMENT ENDED "The
+    // off-switch costs the per-side band and nothing else", on the argument
+    // that book_agrees_with_itself is independent of the band and fails the
+    // 10,769-bps incident book at every band setting.  Both halves are true
+    // and the conclusion is false, because that measurement holds agree_max
+    // at 5,000 and uses an UNCROSSED book.  The coherence conjunct has TWO
+    // documented stand-downs (see the note directly below it), and in either
+    // one it passes every book:
+    //
+    //   band off + CROSSED book        -> book_spread_bps is 0, 0 <= 5,000
+    //   band off + agree_max 0         -> the conjunct stands down outright
+    //
+    // In both, all three conjuncts of book_side_safe are vacuous at once and
+    // the 3.24975 incident mid marks equity -- measured on this feed, not
+    // argued.  Each stand-down is justified by "the per-side band governs
+    // alone" and the band's off-switch was justified by the coherence test
+    // being independent; each guard licensed by the other, with nothing
+    // checking that both were live.  That is the close_out fail-open shape.
+    //
+    // So the witness needs to know whether a screen is still standing.  Both
+    // inputs to that question are already locals here, and the DECISION is
+    // made in the pure header (bookside::book_was_examined /
+    // coherence_can_bite) rather than by re-deriving band_ratio here, because
+    // nothing in cpp/tests constructs an Engine (TODO S36) -- a decision made
+    // in this file is untestable, which is how b45c30f shipped through a
+    // green suite in the first place.
+    //
+    // Note the ORDER: agree_max_bps must be computed before the witness that
+    // now consumes it.
     const double agree_max_bps = bookside::effective_agree_max_spread_bps(
         cfg.book_side_agree_max_spread_bps,
         cfg.mid_gate_book_confirm_max_spread_bps);
+    // Screened is unaffected by this argument, so the two documented escapes
+    // keep working exactly as their tests pin them while the band is on. It
+    // binds only when the band is off, which is when it is the last guard.
+    const bool sides_examined = bookside::book_was_examined(
+        ps.book_side_screen,
+        bookside::coherence_can_bite(agree_max_bps, book_spread_bps));
     // NOTE THE ABSENT `book_spread_bps > 0.0` CONJUNCT, which
     // mid_gate::book_confirms does carry and which does NOT belong here.
     // compute_spread_bps returns 0 for a CROSSED book, and 0 satisfies the
@@ -1754,6 +1811,16 @@ void MarketDataFeed::apply_mid_gate(PairState& ps, const MarketDataConfig& cfg)
     // book_confirms needs that conjunct because it is deciding whether the
     // book may OVERRIDE the gate; here we are only asking whether the book
     // contradicts itself, and an unmeasurable spread is not a contradiction.
+    //
+    // [review round 9] BOTH STAND-DOWNS BELOW ARE RETAINED AND BOTH ARE STILL
+    // CORRECT -- they are what keep a crossed book, and the documented
+    // agree_max 0 setting, from blacking out valuation bot-wide.  What
+    // changed is that neither is any longer a SILENT one: each makes this
+    // conjunct incapable of refusing anything, and `sides_examined` above now
+    // knows that (bookside::coherence_can_bite) and refuses to treat the
+    // band's off-switch as sufficient when it happens.  While the band is on,
+    // nothing here is affected -- ACrossedBookIsStillJudgedByTheBandAlone and
+    // DisablingTheBypassDoesNotBlackOutValuation both still pass unchanged.
     const bool book_agrees_with_itself =
         agree_max_bps <= 0.0         // coherence test switched off
         || book_spread_bps <= agree_max_bps;
@@ -2350,6 +2417,12 @@ void MarketDataFeed::ingest_competing_offers(
                 ps.bid_side_anchor_ok = sq.bid_ok;
                 ps.ask_side_anchor_ok = sq.ask_ok;
                 ps.book_side_ref      = sq.ref;
+                // Carried verbatim: only classify_sides knows whether ref
+                // is 0 because nothing could screen the book or because the
+                // operator switched the band off.  Re-deriving this from
+                // cfg.book_side_anchor_band_ratio here would put the
+                // decision back in a file no test can construct.
+                ps.book_side_screen   = sq.outcome;
                 if (!sq.bid_ok || !sq.ask_ok) {
                     // Warn, not debug.  A disqualified side changes which
                     // reference three downstream gates use, and the whole

@@ -1605,3 +1605,661 @@ TEST(BookSideQualityMixedGeneration, MoveAssigningTheFeedCarriesTheVerdictToo)
     EXPECT_GT(book.book_side_ref, 0.0)
         << "the anchor that produced the verdict must travel with it";
 }
+
+// ===========================================================================
+// [REGRESSION, b45c30f ON THIS BRANCH -- FIXED 2026-09-02]
+// THE DOCUMENTED BAND OFF-SWITCH SILENTLY WITHHELD VALUATION GRADE.
+//
+// b45c30f made the per-side verdicts gate valuation trust. That was correct
+// and stays: a poisoned 3.24975 mid was reaching compute_portfolio_equity_usd,
+// the mark-to-market callback and the drawdown breaker. Its witness that a
+// classification had actually happened was `ps.book_side_ref > 0.0`.
+//
+// classify_sides returned ref = 0 from ONE early exit reached for TWO
+// unrelated reasons, and the witness could not tell them apart:
+//
+//   (i)  NO ANCHOR      -- a genuine data gap. Withholding is CORRECT.
+//   (ii) band_ratio <= 1.0 -- the operator threw the DOCUMENTED off-switch.
+//        config.hpp:2063 says "<= 1.0 disables", config.cpp accepts it and
+//        explicitly exempts it from the coherence warning.
+//
+// MEASURED BEFORE THE FIX, driving classify_sides plus the exact gate
+// expression at market_data.cpp:1743 over a CLEAN book -- bid 1.4000 /
+// ask 1.4200 (141.8 bps), both ratios far inside any band, anchor
+// 1.41022765 present:
+//
+//   band 3.0 -> ref=1.410228 examined=1 -> grade GRANTED
+//   band 1.0 -> ref=0.000000 examined=0 -> grade WITHHELD   <- the bug
+//   band 0.0 -> ref=0.000000 examined=0 -> grade WITHHELD   <- the bug
+//
+// So setting a documented switch withheld grade on EVERY two-sided book,
+// including a perfect one. Valuation fell to the S20 carry and, past
+// valuation_carry_ttl_blocks, to a DEGRADED cycle -- an operator who turned
+// the band off watched the bot degrade for no visible reason. Fail-CLOSED,
+// so nothing unsafe happened; it just meant the switch did not do what it
+// documents.
+//
+// THE DANGER IN FIXING IT IS OVER-RESTORING. This change RESTORES grade in
+// one case, so the direction of risk is inverted from the usual: a genuine
+// missing anchor MUST still withhold, or b45c30f re-opens. The fix is a
+// separate channel (bookside::ScreenOutcome) rather than a loosened
+// predicate, and NoAnchor is the zero enumerator and the default, so every
+// zero-initialised path lands on WITHHOLD.
+//
+// WHEN THE OFF-SWITCH CANNOT RE-ADMIT THE INCIDENT BOOK, AND WHEN IT CAN.
+// Disabling the band makes bid_ok/ask_ok trivially true, so `book_sides_ok`
+// stops carrying information -- but it is not the only conjunct.
+// `book_agrees_with_itself` is independent of the band. Measured on the
+// incident book itself, AT THE DEFAULT agree_max OF 5,000 BPS:
+//
+//   band 3.0 -> 10,769 bps, sides_ok=0, agrees=0 -> WITHHELD
+//   band 1.0 -> 10,769 bps, sides_ok=1, agrees=0 -> WITHHELD
+//   band 0.0 -> 10,769 bps, sides_ok=1, agrees=0 -> WITHHELD
+//
+// [review round 9] THAT TABLE USED TO CARRY THE HEADING "WHY THE OFF-SWITCH
+// CANNOT RE-ADMIT THE INCIDENT BOOK", FULL STOP, AND THAT WAS WRONG. Every
+// row varies band_ratio ALONE, holding agree_max at its default and using the
+// uncrossed book -- the single cell in which the coherence conjunct actually
+// bites. It has two documented stand-downs of its own, each pinned by its own
+// test above (ACrossedBookIsStillJudgedByTheBandAlone,
+// DisablingTheBypassDoesNotBlackOutValuation) and each justified in prose by
+// the sentence "the per-side band governs alone". With the band ALSO off,
+// nothing governs, and the incident mid was graded. See the round-9 block at
+// the bottom of this file for the two cells and their measurements.
+//
+// The lesson is about the SHAPE, not the arithmetic: three guards, each one's
+// stand-down justified by the continued existence of another, and a test
+// suite that pinned each in isolation and never once at the intersection.
+// That is the documented close_out fail-open family, and it is why the truth
+// table below is now driven over a cross product rather than written out for
+// whichever cell was on someone's mind.
+//
+// The pair -- restore on the clean book, still refuse on the incident book --
+// is what BandDisabledStillRefusesTheIncidentBook holds down. Without it this
+// file would pin the restore alone, which is the half that can be satisfied
+// by simply deleting the witness.
+// ===========================================================================
+
+// -- The header half: the two causes are distinguishable, and the default --
+//    is the withholding one. -----------------------------------------------
+
+TEST(BookSideScreenOutcome, ADefaultConstructedSideQualityIsNoAnchor)
+{
+    // SideQuality{} is used throughout as "nothing screened". If it ever
+    // reads as BandDisabled, every unexamined book in the bot starts marking
+    // equity -- the exact fail-open b45c30f closed. Pinned at runtime here
+    // and at compile time by the static_asserts in the header; both, because
+    // a static_assert cannot fail a test run that never compiles it.
+    const xop::bookside::SideQuality d{};
+    EXPECT_EQ(d.outcome, xop::bookside::ScreenOutcome::NoAnchor);
+    // Asked with the PERMISSIVE second argument, so this pins that the
+    // default withholds on its own and is not merely being rescued by a
+    // coherence test that happened to be standing down.
+    EXPECT_FALSE(xop::bookside::book_was_examined(d.outcome,
+                                                  /*coherence_live=*/true))
+        << "a default-constructed verdict must WITHHOLD valuation grade";
+    EXPECT_DOUBLE_EQ(d.ref, 0.0);
+    EXPECT_TRUE(d.bid_ok);
+    EXPECT_TRUE(d.ask_ok);
+}
+
+TEST(BookSideScreenOutcome, ZeroInitialisationLandsOnTheFailClosedOutcome)
+{
+    // NoAnchor must be the ZERO enumerator, not merely the default member
+    // initialiser: a value-initialised aggregate, or any future struct that
+    // holds a ScreenOutcome without repeating the initialiser, must still
+    // land on WITHHOLD.
+    EXPECT_EQ(xop::bookside::ScreenOutcome{},
+              xop::bookside::ScreenOutcome::NoAnchor);
+    EXPECT_FALSE(xop::bookside::book_was_examined(
+        xop::bookside::ScreenOutcome{}, /*coherence_live=*/true));
+}
+
+TEST(BookSideScreenOutcome, TheTwoCausesOfAZeroRefAreToldApart)
+{
+    // Same book, same clean geometry, same missing ref -- different cause.
+    const auto no_anchor =
+        classify_sides(1.40, 1.42, /*anchor=*/0.0, kBand, kAgree);
+    const auto band_off =
+        classify_sides(1.40, 1.42, kAnchor, /*band_ratio=*/1.0, kAgree);
+
+    ASSERT_DOUBLE_EQ(no_anchor.ref, 0.0);
+    ASSERT_DOUBLE_EQ(band_off.ref, 0.0)
+        << "precondition: BOTH produce ref == 0 -- that is the whole "
+           "reason the sentinel could not carry this distinction";
+
+    EXPECT_EQ(no_anchor.outcome, xop::bookside::ScreenOutcome::NoAnchor);
+    EXPECT_EQ(band_off.outcome, xop::bookside::ScreenOutcome::BandDisabled);
+    // Both asked with the coherence test LIVE, which is the configuration in
+    // which the two answers are genuinely allowed to differ.
+    EXPECT_FALSE(xop::bookside::book_was_examined(no_anchor.outcome,
+                                                  /*coherence_live=*/true))
+        << "a data gap must still withhold -- this is what b45c30f closed";
+    EXPECT_TRUE(xop::bookside::book_was_examined(band_off.outcome,
+                                                 /*coherence_live=*/true))
+        << "an operator opt-out is not a data gap";
+    // ...but the opt-out is conditional and the data gap is not.
+    EXPECT_FALSE(xop::bookside::book_was_examined(band_off.outcome,
+                                                  /*coherence_live=*/false))
+        << "with the band off AND the coherence test unable to refuse this "
+           "book, no screen is left standing and the opt-out buys nothing";
+}
+
+TEST(BookSideScreenOutcome, AScreenedBookReportsScreened)
+{
+    const auto q = classify_sides(1.40, 1.42, kAnchor, kBand, kAgree);
+    EXPECT_EQ(q.outcome, xop::bookside::ScreenOutcome::Screened);
+    EXPECT_DOUBLE_EQ(q.ref, kAnchor);
+    // Asked with the RESTRICTIVE second argument: a book the band actually
+    // screened is examined whatever the coherence test is doing. This is what
+    // keeps crossed books and the documented agree_max 0 setting from
+    // blacking out valuation bot-wide.
+    EXPECT_TRUE(xop::bookside::book_was_examined(q.outcome,
+                                                 /*coherence_live=*/false));
+
+    // The bypass returns early, but AFTER the anchor was accepted -- a
+    // coherent book is screened, not unexamined.
+    const auto byp = classify_sides(5.60, 5.70, kAnchor, kBand, kAgree);
+    ASSERT_TRUE(byp.bypassed) << "precondition: the coherence bypass fired";
+    EXPECT_EQ(byp.outcome, xop::bookside::ScreenOutcome::Screened);
+}
+
+TEST(BookSideScreenOutcome, NoAnchorWinsWhenBothCausesHoldAtOnce)
+{
+    // THE FAIL-CLOSED ORDERING. With no anchor AND the band off, the honest
+    // answer is NoAnchor: a missing anchor is a data gap whatever the band
+    // says. Reporting BandDisabled here would let the off-switch grant
+    // valuation grade to a book nothing screened -- the fail-open direction,
+    // and precisely what b45c30f closed. If classify_sides ever tests the
+    // band before the anchor, this is the test that catches it.
+    for (const double anchor : {0.0, -1.0, kNaN, kInf}) {
+        for (const double band : {0.0, 1.0}) {
+            const auto q = classify_sides(1.40, 1.42, anchor, band, kAgree);
+            EXPECT_EQ(q.outcome, xop::bookside::ScreenOutcome::NoAnchor)
+                << "anchor=" << anchor << " band=" << band;
+            EXPECT_FALSE(xop::bookside::book_was_examined(
+                q.outcome, /*coherence_live=*/true))
+                << "anchor=" << anchor << " band=" << band;
+        }
+    }
+}
+
+TEST(BookSideScreenOutcome, AGarbageBandIsNotAnOperatorOptOut)
+{
+    // BandDisabled means the range config.cpp ACCEPTS and documents as off:
+    // finite, in [0, 1]. config.cpp:3181 throws on non-finite or negative,
+    // so anything outside that is garbage, and garbage must not inherit the
+    // operator's opt-out -- it degrades to NoAnchor and withholds. Defence
+    // in depth: the parser makes these unreachable today, which is how each
+    // of the twelve close_out fail-open bugs started.
+    //
+    // [review round 9] +inf IS IN THIS LIST NOW, AND IT USED TO BE THE HOLE.
+    // The finiteness test lived INSIDE the `!(band_ratio > 1.0)` branch, so
+    // it only ever saw garbage that compared <= 1.0. NaN and -inf land there
+    // and were handled; +inf does not -- `!(inf > 1.0)` is false, so it fell
+    // straight through to the band, reported Screened WITH ref SET, and then
+    // screened nothing at all: in_band's `ratio <= inf` and
+    // `ratio >= 1.0/inf == 0.0` both hold for every price on earth. The
+    // maximally permissive outcome, wearing the label of the verified one.
+    // The test is now hoisted above the comparison so a non-finite band lands
+    // on NoAnchor whichever side of 1.0 it falls.
+    for (const double band : {kNaN, kInf, -kInf, -3.0, -0.5}) {
+        const auto q = classify_sides(1.40, 1.42, kAnchor, band, kAgree);
+        EXPECT_EQ(q.outcome, xop::bookside::ScreenOutcome::NoAnchor)
+            << "band=" << band << " is not a setting, it is garbage";
+        EXPECT_DOUBLE_EQ(q.ref, 0.0)
+            << "band=" << band << ": garbage must not publish a ref either -- "
+               "a ref > 0 is the signature of a book that WAS screened";
+        EXPECT_FALSE(xop::bookside::book_was_examined(
+            q.outcome, /*coherence_live=*/true))
+            << "band=" << band;
+    }
+    // ...while the two documented off values ARE opt-outs.
+    for (const double band : {0.0, 1.0}) {
+        EXPECT_EQ(classify_sides(1.40, 1.42, kAnchor, band, kAgree).outcome,
+                  xop::bookside::ScreenOutcome::BandDisabled)
+            << "band=" << band << " is documented as 'disables'";
+    }
+}
+
+// -- The feed half: what the operator actually observes. --------------------
+
+// THE REGRESSION ITSELF. A perfect 142-bps book on the anchor, with the
+// documented off-switch thrown. Before the fix this was WITHHELD.
+TEST(BookSideQualityFeed, ADisabledBandStillEarnsValuationGradeOnACleanBook)
+{
+    MarketDataConfig cfg = sq_cfg();
+    cfg.book_side_anchor_band_ratio = 1.0;   // documented "disables"
+
+    State state;
+    MarketDataFeed feed(cfg, state);
+    const std::string pair = "XCH/DBX";
+
+    feed.ingest_block_height(100);
+    feed.ingest_reference_anchor(pair, kAnchor, 0.0);
+    feed.ingest_competing_offers(
+        pair,
+        {sq_offer("b1", Side::Bid, 1.40, 5'000'000'000'000LL),
+         sq_offer("a1", Side::Ask, 1.42, 5'000'000'000'000LL)},
+        {}, kMojosPerXch, 1'000);
+    feed.refresh({pair});
+
+    const auto snap = state.get_market(pair);
+    // The precondition that made this bug invisible: ref is 0 even though an
+    // anchor was present and the book is flawless. If ref ever becomes > 0
+    // here, this fixture has stopped modelling the regression.
+    ASSERT_EQ(snap.book_side_ref, 0)
+        << "precondition: a disabled band screens nothing, so ref stays 0 -- "
+           "that is the sentinel the old witness misread";
+    ASSERT_GT(snap.spread_bps, 0) << "precondition: spread IS measurable";
+    ASSERT_TRUE(snap.bid_side_anchor_ok);
+    ASSERT_TRUE(snap.ask_side_anchor_ok);
+
+    EXPECT_TRUE(snap.mid_valuation_grade)
+        << "turning the DOCUMENTED band off-switch off must not withhold "
+           "valuation grade on a flawless book: b45c30f made this WITHHELD, "
+           "dropping the pair to the S20 carry and then to a DEGRADED cycle";
+}
+
+// THE OTHER HALF, AND THE ONE THAT MATTERS MORE. Disabling the band must not
+// become a way to buy grade for a dislocated book. The per-side band cannot
+// disqualify anything here, so this is the coherence conjunct working alone.
+TEST(BookSideQualityFeed, BandDisabledStillRefusesTheIncidentBook)
+{
+    MarketDataConfig cfg = sq_cfg();
+    cfg.book_side_anchor_band_ratio = 1.0;   // documented "disables"
+
+    State state;
+    MarketDataFeed feed(cfg, state);
+    const std::string pair = "XCH/BYC";
+
+    feed.ingest_block_height(100);
+    feed.ingest_reference_anchor(pair, kAnchor, 0.0);
+    feed.ingest_competing_offers(pair, dislocated_book(), {},
+                                 kMojosPerXch, 1'000);
+    feed.refresh({pair});
+
+    const auto snap = state.get_market(pair);
+    // With the band off NEITHER side can be disqualified, so book_sides_ok
+    // is trivially true and carries no information. Asserting that here is
+    // what makes the EXPECT below meaningful: it proves the refusal comes
+    // from the coherence test and not from a side verdict.
+    ASSERT_TRUE(snap.bid_side_anchor_ok)
+        << "precondition: a disabled band disqualifies nothing";
+    ASSERT_TRUE(snap.ask_side_anchor_ok)
+        << "precondition: a disabled band disqualifies nothing -- even for "
+           "the 3.55x junk ask";
+    ASSERT_GT(snap.spread_bps, 8000.0)
+        << "precondition: the incident book's own spread is ~10,769 bps";
+
+    EXPECT_FALSE(snap.mid_valuation_grade)
+        << "the band off-switch must not hand valuation grade to the 3.24975 "
+           "mid: this is the poisoned value that reached the P&L callback "
+           "and the drawdown breaker, and b45c30f must stay closed";
+}
+
+// THE DIRECTION THAT MATTERS, AND THE FAIL-OPEN THIS CHANGE COULD HAVE
+// INTRODUCED. The band off-switch must not leak into the UNEXAMINED case.
+//
+// This is the shape to worry about, because two plausible implementations of
+// the fix both produce it:
+//
+//   * resetting ps.book_side_screen to BandDisabled (rather than NoAnchor)
+//     in ingest_dexie, on the reasoning that "the band is off, so record
+//     that";
+//   * re-deriving the outcome at the valuation gate from
+//     cfg.book_side_anchor_band_ratio instead of carrying what
+//     classify_sides actually concluded -- which is what "just check the
+//     config there" looks like, and is untestable in market_data.cpp
+//     because nothing in cpp/tests constructs an Engine.
+//
+// Either one grades a raw, self-inclusive, NEVER-SCREENED BBO off the CEX
+// leg alone, for every pair, permanently, whenever the operator has the band
+// off. That is strictly worse than the regression being fixed.
+//
+// NON-VACUITY, WHICH THIS TEST DID NOT HAVE AT FIRST. The obvious fixture --
+// no anchor at all plus a clean FILTERED book -- is vacuous: with no
+// independent anchor, bbo_filter_had_independent_anchor is false, so
+// dex_fresh_grade is false and `(book_two_sided && dex_fresh_grade) ||
+// cex_fresh` refuses on its own no matter what the witness says. That
+// version passed with `sides_examined` hard-coded to true and proved
+// nothing. So this fixture instead follows
+// AnUnexaminedRawBookIsNotRescuedByAFreshCexLeg: a FRESH CEX leg keeps the
+// `|| cex_fresh` branch live, and the raw book is deliberately TIGHT (99
+// bps) so the coherence conjunct cannot be what refuses it. The witness is
+// then the only thing left standing between this book and equity.
+TEST(BookSideQualityFeed, ADisabledBandDoesNotRescueAnUnexaminedRawBook)
+{
+    MarketDataConfig cfg = sq_cfg();
+    cfg.book_side_anchor_band_ratio = 1.0;   // documented "disables"
+
+    State state;
+    MarketDataFeed feed(cfg, state);
+    const std::string pair = "XCH/BYC";
+
+    feed.ingest_block_height(100);
+    feed.ingest_cex_reference(pair, kAnchor);   // expiry disabled -> fresh
+    // Coherent, self-inclusive, 2.1x the anchor -- and NEVER screened.
+    // No ingest_competing_offers call. That absence IS the test.
+    feed.ingest_dexie(pair, 3.0000, 3.0300, 0.0, 0.0);
+    feed.refresh({pair});
+
+    const auto snap = state.get_market(pair);
+    ASSERT_TRUE(snap.bid_side_anchor_ok);
+    ASSERT_TRUE(snap.ask_side_anchor_ok)
+        << "precondition: the verdicts are TRIVIALLY true -- nothing ran";
+    ASSERT_EQ(snap.book_side_ref, 0)
+        << "precondition: classify_sides never examined this book";
+    ASSERT_GT(snap.spread_bps, 0);
+    ASSERT_LT(snap.spread_bps, 5000.0)
+        << "precondition: this book IS coherent, so the spread conjunct "
+           "cannot be what refuses it -- otherwise this test is vacuous";
+    ASSERT_GT(snap.mid_price, 0);
+
+    EXPECT_FALSE(snap.mid_valuation_grade)
+        << "the band off-switch must not promote an UNEXAMINED book to "
+           "valuation grade: nothing screened this 2.1x self-inclusive BBO, "
+           "and 'the operator disabled the band' is not evidence that "
+           "something did";
+}
+
+// Band ACTIVE + dislocated book: the b45c30f behaviour, unchanged. Restated
+// here beside the three above so the whole truth table sits in one place --
+// ADislocatedBookIsRefusedValuationGrade pins the same thing via the
+// implied-cross anchor, and if these two ever disagree the fix is wrong.
+TEST(BookSideQualityFeed, BandActiveAndDislocatedStillWithholds)
+{
+    State state;
+    MarketDataFeed feed(sq_cfg(), state);   // band 3.0
+    const std::string pair = "XCH/BYC";
+
+    feed.ingest_block_height(100);
+    feed.ingest_reference_anchor(pair, kAnchor, 0.0);
+    feed.ingest_competing_offers(pair, dislocated_book(), {},
+                                 kMojosPerXch, 1'000);
+    feed.refresh({pair});
+
+    const auto snap = state.get_market(pair);
+    ASSERT_GT(snap.book_side_ref, 0)
+        << "precondition: the book WAS examined -- ScreenOutcome::Screened";
+    ASSERT_FALSE(snap.ask_side_anchor_ok)
+        << "precondition: the 3.55x ask is disqualified";
+    EXPECT_FALSE(snap.mid_valuation_grade);
+}
+
+// ===========================================================================
+// [review round 9] THE TWO OFF-SWITCHES WERE ONLY EVER REASONED ABOUT ONE AT
+// A TIME, AND EACH ONE'S JUSTIFICATION ASSUMES THE OTHER IS ON.
+//
+// `book_side_safe` has three conjuncts, and once the band is off exactly one
+// of them can still carry information:
+//
+//   sides_examined            BandDisabled -> true by construction
+//   book_sides_ok             a disabled band disqualifies nothing -> true
+//   book_agrees_with_itself   the ONLY remaining screen
+//
+// But the coherence conjunct has TWO documented stand-downs of its own, each
+// pinned by a test above and each justified in prose by the sentence "the
+// per-side band governs alone":
+//
+//   ACrossedBookIsStillJudgedByTheBandAlone   crossed -> spread 0 -> passes
+//   DisablingTheBypassDoesNotBlackOutValuation  agree_max 0 -> stands down
+//
+// With the band ALSO off, nothing governs alone -- nothing governs at all,
+// and `book_side_safe` is unconditionally true on every two-sided book. Each
+// escape is individually correct and jointly fatal. That is the exact shape
+// of the documented close_out fail-open family: every guard justified by the
+// existence of another guard, and no test at the intersection.
+//
+// The suite could not catch this because the two escapes are each pinned in
+// isolation and BandDisabledStillRefusesTheIncidentBook -- the only test
+// guarding the restore direction -- sits in the one cell where the coherence
+// conjunct genuinely bites (uncrossed, agree_max 5000). It passes no matter
+// what the witness does.
+//
+// Both tests below FAIL against the round-8 code and pass after the fix.
+// ===========================================================================
+
+// -- The header half: the witness now needs a second input, and the two --
+//    documented stand-downs are exactly what makes it necessary. -----------
+
+TEST(BookSideScreenOutcome, CoherenceCanBiteNamesBothStandDowns)
+{
+    using xop::bookside::coherence_can_bite;
+
+    // Live: a real ceiling and a measurable spread.
+    EXPECT_TRUE(coherence_can_bite(kAgree, 141.8));
+    EXPECT_TRUE(coherence_can_bite(kAgree, 10768.5))
+        << "'can bite' is about CAPABILITY, not about the verdict -- a book "
+           "that fails the ceiling is still one the ceiling could judge";
+
+    // Stand-down 1: the documented "bypass off" setting, from either knob --
+    // effective_agree_max_spread_bps returns 0 for an unusable gate value too.
+    EXPECT_FALSE(coherence_can_bite(0.0, 141.8));
+    EXPECT_FALSE(coherence_can_bite(-1.0, 141.8));
+
+    // Stand-down 2: compute_spread_bps's crossed/one-sided sentinel. 0
+    // satisfies every positive ceiling, so the conjunct passes every such
+    // book and cannot refuse one.
+    EXPECT_FALSE(coherence_can_bite(kAgree, 0.0));
+
+    // Both at once, and garbage. NaN > 0.0 is false, so NaN withholds.
+    EXPECT_FALSE(coherence_can_bite(0.0, 0.0));
+    EXPECT_FALSE(coherence_can_bite(kNaN, 141.8));
+    EXPECT_FALSE(coherence_can_bite(kAgree, kNaN));
+}
+
+TEST(BookSideScreenOutcome, TheWitnessTruthTableOverBothInputs)
+{
+    using xop::bookside::book_was_examined;
+    using O = xop::bookside::ScreenOutcome;
+
+    // The whole 3x2 table in one place, so no future reader has to infer a
+    // cell from prose. The previous round's argument went wrong precisely by
+    // measuring three cells of a larger table and generalising.
+    //
+    //                        coherence_live=true   coherence_live=false
+    //   NoAnchor                   WITHHOLD               WITHHOLD
+    //   BandDisabled               examined               WITHHOLD
+    //   Screened                   examined               examined
+    EXPECT_FALSE(book_was_examined(O::NoAnchor,     true));
+    EXPECT_FALSE(book_was_examined(O::NoAnchor,     false));
+    EXPECT_TRUE (book_was_examined(O::BandDisabled, true));
+    EXPECT_FALSE(book_was_examined(O::BandDisabled, false));
+    EXPECT_TRUE (book_was_examined(O::Screened,     true));
+    EXPECT_TRUE (book_was_examined(O::Screened,     false));
+
+    // The two rows that carry the safety argument, stated as properties
+    // rather than as cells:
+    for (const bool live : {true, false}) {
+        EXPECT_FALSE(book_was_examined(O::NoAnchor, live))
+            << "a genuine data gap withholds under EVERY coherence state -- "
+               "no second input may ever rescue it. coherence_live=" << live;
+        EXPECT_TRUE(book_was_examined(O::Screened, live))
+            << "a screened book is examined under EVERY coherence state, or "
+               "crossed books and agree_max 0 black out valuation bot-wide. "
+               "coherence_live=" << live;
+    }
+}
+
+// -- The feed half: the two cells the old suite never constructed. ----------
+
+// CELL 1: band off + CROSSED book. The coherence conjunct cannot judge a
+// crossed book at all -- compute_spread_bps returns 0 by design -- so with the
+// band off this book has no screen left. The junk touch is the incident's own
+// 4.9995, moved to the bid so the book crosses, and the published mid is the
+// incident mid 3.24975 verbatim.
+TEST(BookSideQualityFeed, BandOffPlusACrossedBookIsNotEvidenceOfAnything)
+{
+    MarketDataConfig cfg = sq_cfg();
+    cfg.book_side_anchor_band_ratio = 1.0;   // documented "disables"
+
+    State state;
+    MarketDataFeed feed(cfg, state);
+    const std::string pair = "XCH/BYC";
+
+    feed.ingest_block_height(100);
+    feed.ingest_reference_anchor(pair, kAnchor, 0.0);
+    // Crossed, and the BID is the 3.55x junk touch.
+    feed.ingest_competing_offers(
+        pair,
+        {sq_offer("b1", Side::Bid, 4.9995, 5'000'000'000'000LL),
+         sq_offer("a1", Side::Ask, 1.5000, 5'000'000'000'000LL)},
+        {}, kMojosPerXch, 1'000);
+    feed.refresh({pair});
+
+    const auto snap = state.get_market(pair);
+    // Preconditions: every conjunct except the witness is vacuous here. Stated
+    // explicitly so this test cannot quietly become a test of something else.
+    ASSERT_GT(snap.best_bid, snap.best_ask)
+        << "precondition: the book must actually be crossed";
+    ASSERT_DOUBLE_EQ(snap.spread_bps, 0.0)
+        << "precondition: a crossed book has no measurable spread, so the "
+           "coherence conjunct stands down";
+    ASSERT_TRUE(snap.bid_side_anchor_ok)
+        << "precondition: a disabled band disqualifies nothing -- not even a "
+           "bid 3.55x the anchor";
+    ASSERT_TRUE(snap.ask_side_anchor_ok)
+        << "precondition: a disabled band disqualifies nothing";
+    ASSERT_GT(snap.mid_price, 0)
+        << "precondition: the crossed midpoint IS published -- 3.24975";
+
+    EXPECT_FALSE(snap.mid_valuation_grade)
+        << "with the band off AND the book crossed, NOTHING screened this "
+           "book: the per-side band was switched off and the coherence test "
+           "cannot measure a crossed spread. Granting grade here marks equity "
+           "off the 3.24975 incident mid -- exactly what b45c30f closed";
+}
+
+// CELL 2: band off + coherence off, on the literal incident book. Uncrossed,
+// 10,769 bps, so the spread is perfectly measurable -- the coherence conjunct
+// simply is not asked. Reachable from either knob: book_side_agree_max_spread_bps
+// directly, or mid_gate_book_confirm_max_spread_bps through the min() in
+// effective_agree_max_spread_bps.
+TEST(BookSideQualityFeed, BandOffPlusCoherenceOffStillRefusesTheIncidentBook)
+{
+    for (const bool via_gate_knob : {false, true}) {
+        MarketDataConfig cfg = sq_cfg();
+        cfg.book_side_anchor_band_ratio = 1.0;   // documented "disables"
+        if (via_gate_knob) {
+            cfg.mid_gate_book_confirm_max_spread_bps = 0.0;
+        } else {
+            cfg.book_side_agree_max_spread_bps = 0.0;
+        }
+        ASSERT_DOUBLE_EQ(
+            xop::bookside::effective_agree_max_spread_bps(
+                cfg.book_side_agree_max_spread_bps,
+                cfg.mid_gate_book_confirm_max_spread_bps),
+            0.0) << "precondition: the coherence test is off, via_gate_knob="
+                 << via_gate_knob;
+
+        State state;
+        MarketDataFeed feed(cfg, state);
+        const std::string pair = "XCH/BYC";
+
+        feed.ingest_block_height(100);
+        feed.ingest_reference_anchor(pair, kAnchor, 0.0);
+        feed.ingest_competing_offers(pair, dislocated_book(), {},
+                                     kMojosPerXch, 1'000);
+        feed.refresh({pair});
+
+        const auto snap = state.get_market(pair);
+        ASSERT_TRUE(snap.bid_side_anchor_ok)
+            << "precondition: a disabled band disqualifies nothing";
+        ASSERT_TRUE(snap.ask_side_anchor_ok)
+            << "precondition: not even the 3.55x junk ask";
+        ASSERT_GT(snap.spread_bps, 8000.0)
+            << "precondition: the spread is MEASURABLE and enormous -- the "
+               "coherence test is not blind here, it is switched off";
+
+        EXPECT_FALSE(snap.mid_valuation_grade)
+            << "both documented off-switches thrown, via_gate_knob="
+            << via_gate_knob << ": every conjunct of book_side_safe is "
+               "vacuous and the 3.24975 incident mid marks equity. Each knob "
+               "is individually documented as safe because 'the other one "
+               "still governs'; together they govern nothing";
+    }
+}
+
+// THE CROSS PRODUCT, so the two off-switches can never again be reasoned
+// about one at a time.
+//
+// {band on, band off} x {coherence on, coherence off} x {clean, incident,
+// crossed-junk}. Nine cells, and the rule that decides every one of them is a
+// single sentence: A BOOK MAY MARK EQUITY ONLY IF SOMETHING ACTUALLY SCREENED
+// IT. The expectation below is therefore computed from that rule rather than
+// written out cell by cell -- a hand-written expectation list is how the
+// previous round's three-row table came to omit the free variable that broke
+// its conclusion.
+//
+// This is deliberately NOT a restatement of the implementation. The rule is
+// expressed in terms of the BOOK's geometry and the operator's two knobs;
+// the implementation is expressed in terms of ScreenOutcome and three
+// conjuncts. If those two ever disagree, one of them is wrong and this fails.
+TEST(BookSideQualityFeed, TheTwoOffSwitchesAcrossEveryBookShape)
+{
+    struct Book {
+        const char* name;
+        double bid;
+        double ask;
+        bool   junk;      ///< does a touch sit far outside the band?
+        bool   crossed;   ///< bid above ask -> no measurable spread
+    };
+    // 1.5000 is 1.06x the anchor (honest); 4.9995 is 3.55x it (junk).
+    const Book books[] = {
+        {"clean",         1.4000, 1.4200, false, false},
+        {"incident",      1.5000, 4.9995, true,  false},
+        {"crossed-junk",  4.9995, 1.5000, true,  true },
+    };
+
+    for (const Book& b : books) {
+        for (const bool band_off : {false, true}) {
+            for (const bool coherence_off : {false, true}) {
+                MarketDataConfig cfg = sq_cfg();
+                if (band_off)      cfg.book_side_anchor_band_ratio    = 1.0;
+                if (coherence_off) cfg.book_side_agree_max_spread_bps = 0.0;
+
+                State state;
+                MarketDataFeed feed(cfg, state);
+                const std::string pair = "XCH/BYC";
+
+                feed.ingest_block_height(100);
+                feed.ingest_reference_anchor(pair, kAnchor, 0.0);
+                feed.ingest_competing_offers(
+                    pair,
+                    {sq_offer("b1", Side::Bid, b.bid, 5'000'000'000'000LL),
+                     sq_offer("a1", Side::Ask, b.ask, 5'000'000'000'000LL)},
+                    {}, kMojosPerXch, 1'000);
+                feed.refresh({pair});
+
+                // WHAT IS STILL CAPABLE OF SCREENING THIS BOOK?
+                //   the per-side band  -- unless the operator switched it off
+                //   the coherence test -- unless switched off, and it cannot
+                //                         measure a crossed book at all
+                const bool band_screens      = !band_off;
+                const bool coherence_screens = !coherence_off && !b.crossed;
+                const bool anything_screens  = band_screens || coherence_screens;
+
+                // A junk touch is caught by the band; a junk touch on an
+                // UNCROSSED book also blows the spread wide enough for the
+                // coherence test to catch it.
+                const bool caught =
+                    (b.junk && band_screens)
+                    || (b.junk && !b.crossed && coherence_screens);
+
+                const bool expect_grade = anything_screens && !caught;
+
+                const auto snap = state.get_market(pair);
+                EXPECT_EQ(snap.mid_valuation_grade, expect_grade)
+                    << "book=" << b.name
+                    << " band_off=" << band_off
+                    << " coherence_off=" << coherence_off
+                    << " -> spread=" << snap.spread_bps
+                    << " bid_ok=" << snap.bid_side_anchor_ok
+                    << " ask_ok=" << snap.ask_side_anchor_ok
+                    << " ref=" << snap.book_side_ref
+                    << "; a book may mark equity only if SOMETHING screened it";
+            }
+        }
+    }
+}

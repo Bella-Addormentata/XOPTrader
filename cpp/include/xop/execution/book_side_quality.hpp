@@ -262,15 +262,235 @@ struct Step8References {
     return r;
 }
 
+/// WHY `ref` IS ZERO -- A SENTINEL THAT USED TO MEAN TWO THINGS.
+///
+/// [REGRESSION, INTRODUCED ON THIS BRANCH BY b45c30f, FIXED 2026-09-02]
+///
+/// b45c30f made the per-side verdicts gate valuation trust, which was
+/// correct: a poisoned 3.24975 mid was reaching the P&L callback and the
+/// drawdown breaker.  Its witness that a classification had actually
+/// happened was `ref > 0.0` (market_data.cpp, `sides_examined`).  But
+/// classify_sides returns ref = 0 from ONE early exit reached for TWO
+/// unrelated reasons, and only one of them is evidence of anything:
+///
+///   NoAnchor      No usable independent anchor this cycle.  A genuine
+///                 DATA GAP.  The book is unscreened and unscreenable, so
+///                 withholding valuation grade is CORRECT and is the whole
+///                 point of b45c30f.
+///   BandDisabled  band_ratio <= 1.0 -- the operator threw the DOCUMENTED
+///                 off-switch (config.hpp:2063, "<= 1.0 disables"; the
+///                 parser accepts it and config.cpp exempts it from the
+///                 coherence warning).  Evidence was not gathered because
+///                 it was not ASKED for.  That is not a data gap.
+///
+/// Conflating them meant setting the documented off-switch withheld
+/// valuation grade on EVERY two-sided book, including a perfect one.
+/// Measured on a clean book -- bid 1.4000 / ask 1.4200, 142 bps, both
+/// ratios far inside any band, anchor 1.41022765 present:
+///
+///   band 3.0 -> ref=1.410228 examined=1 -> grade GRANTED
+///   band 1.0 -> ref=0.000000 examined=0 -> grade WITHHELD  <- regression
+///   band 0.0 -> ref=0.000000 examined=0 -> grade WITHHELD  <- regression
+///
+/// Valuation then fell to the S20 carry and, past
+/// valuation_carry_ttl_blocks, to a DEGRADED cycle: an operator who turned
+/// the band off watched the bot degrade for no visible reason.  Fail-CLOSED,
+/// so nothing unsafe happened -- but a documented switch silently did
+/// something other than what it documents.
+///
+/// WHY RESTORING GRADE HERE DOES NOT RE-OPEN b45c30f -- AND THE CONDITION IT
+/// DEPENDS ON, WHICH AN EARLIER REVISION OF THIS COMMENT ASSERTED WAS FREE.
+///
+/// Turning the band off makes bid_ok/ask_ok trivially true, so `book_sides_ok`
+/// stops carrying information.  The coherence test (`book_agrees_with_itself`)
+/// is independent of the band and is then the ONLY screen left.  Measured on
+/// the incident book itself, bid 1.5000 / ask 4.9995, at the default
+/// agree_max of 5,000 bps:
+///
+///   band 3.0 -> spread 10,769 bps, sides_ok=0, agrees=0 -> WITHHELD
+///   band 1.0 -> spread 10,769 bps, sides_ok=1, agrees=0 -> WITHHELD
+///   band 0.0 -> spread 10,769 bps, sides_ok=1, agrees=0 -> WITHHELD
+///
+/// [review round 9] THAT TABLE IS TRUE AND ITS CONCLUSION WAS NOT.  This
+/// comment used to end "So the off-switch costs the per-side band and nothing
+/// else.  It cannot hand valuation grade to the dislocated book that started
+/// all this."  Every row above holds agree_max at 5,000 and uses an UNCROSSED
+/// book -- the one cell where the coherence conjunct actually bites.  It has
+/// two documented stand-downs of its own, and in either of them the sentence
+/// is false.  Both were measured on the real feed:
+///
+///   band 1.0, CROSSED bid 4.9995 / ask 1.5000, agree 5,000
+///       -> compute_spread_bps returns 0 for a crossed book, 0 <= 5,000,
+///          agrees=1 -> GRANTED, marking equity off mid 3.24975
+///   band 1.0, uncrossed incident book, agree_max 0 ("bypass off")
+///       -> the conjunct stands down, agrees=1 -> GRANTED, same 3.24975
+///
+/// Each stand-down is individually correct and justified, in prose, by the
+/// sentence "the per-side band governs alone" (market_data.cpp, and the two
+/// tests that pin them).  The band's own off-switch was justified by the
+/// coherence test being independent.  Each guard was licensed by the other,
+/// nothing checked that both were live, and that is the exact shape of the
+/// documented close_out fail-open family.
+///
+/// So BandDisabled is NOT sufficient on its own.  `book_was_examined` takes a
+/// second input -- whether the coherence test can still bite THIS book -- and
+/// the off-switch restores grade only while some screen remains standing.
+///
+/// `ref` KEEPS ITS OLD MEANING and is deliberately NOT set in the
+/// BandDisabled case: it is a PRICE consumers substitute for a junk side,
+/// and nothing was screened, so there is no price to substitute.  This enum
+/// is a separate channel precisely so that no consumer of `ref` changes
+/// behaviour -- see step8_references, which reads `ref` only under
+/// `!bid_ok`/`!ask_ok`, both unreachable when the band is off.
+enum class ScreenOutcome {
+    /// MUST BE THE ZERO ENUMERATOR AND MUST STAY FIRST.  This is the
+    /// withholding value, so zero-initialisation -- `ScreenOutcome{}`, a
+    /// value-initialised aggregate, a memset struct -- lands fail-CLOSED.
+    /// Reordering these makes silence mean "the operator opted out", which
+    /// is the fail-open direction and re-opens b45c30f.
+    NoAnchor = 0,
+    /// The operator disabled the per-side band.  Not a data gap.
+    BandDisabled,
+    /// classify_sides ran the band against a real anchor; `ref` holds it.
+    Screened,
+};
+
+/// Can the valuation gate's coherence conjunct still REFUSE a book, or is it
+/// standing down?  `book_agrees_with_itself` is
+///
+///     agree_max_bps <= 0.0 || book_spread_bps <= agree_max_bps
+///
+/// which is capable of returning false only when BOTH inputs are positive:
+///
+///   * agree_max_bps <= 0  is the documented "bypass off" setting (and the
+///     value effective_agree_max_spread_bps returns for an unusable gate
+///     knob).  The conjunct is switched off and passes every book.
+///   * book_spread_bps == 0 is compute_spread_bps's convention for a CROSSED
+///     or one-sided book.  0 satisfies any positive ceiling, so the conjunct
+///     passes every crossed book.  It is not blind by accident: crossed books
+///     are normal on Dexie and an unmeasurable spread is deliberately not
+///     treated as a contradiction.
+///
+/// Neither is a bug on its own -- each is a documented, tested escape, and
+/// while the per-side band is live each is safe.  This predicate exists so a
+/// caller can ask whether the OTHER guard is still standing before leaning on
+/// it, which is the check whose absence made both escapes fatal together.
+///
+/// NaN lands on false (NaN > 0.0 is false), i.e. it withholds.
+[[nodiscard]] constexpr bool coherence_can_bite(
+    double agree_max_bps,
+    double book_spread_bps) noexcept
+{
+    return agree_max_bps > 0.0 && book_spread_bps > 0.0;
+}
+
+/// Did a classification actually have the chance to run, and is this book
+/// still screened by SOMETHING?  The valuation gate's `sides_examined`
+/// witness, decided HERE rather than by re-deriving band_ratio at the call
+/// site -- nothing in cpp/tests constructs an Engine (TODO S36), so a
+/// decision made in this header is testable and one made in market_data.cpp
+/// is not.  That is exactly how b45c30f shipped.
+///
+/// @param coherence_live  Whether `book_agrees_with_itself` can still refuse
+///                        THIS book -- see coherence_can_bite.  Only consulted
+///                        for BandDisabled, where it is the last guard left.
+///
+/// WHITELIST, NOT `!= NoAnchor`.  A future enumerator must default to
+/// WITHHOLDING.  `!= NoAnchor` would silently grant grade to any state added
+/// later; this refuses it until someone names it here on purpose.
+///
+/// NO DEFAULT ARGUMENT ON `coherence_live`, DELIBERATELY.  A default would
+/// have to be `true` to be ergonomic, and `true` is the fail-OPEN value; a
+/// future call site that forgot the argument would silently reinstate exactly
+/// the two fail-opens round 9 closed.  Every caller states it.
+[[nodiscard]] constexpr bool book_was_examined(ScreenOutcome o,
+                                               bool coherence_live) noexcept {
+    // Screened: the band actually ran against a real anchor. That IS the
+    // screen, so it stands whatever the coherence test is doing -- this is
+    // what keeps the two documented escapes working while the band is on.
+    return o == ScreenOutcome::Screened
+        // BandDisabled: the operator withdrew the band. An opt-out is not a
+        // data gap, so grade is restored -- but only while a screen remains.
+        || (o == ScreenOutcome::BandDisabled && coherence_live);
+}
+
+static_assert(ScreenOutcome{} == ScreenOutcome::NoAnchor,
+              "zero-initialisation must mean NoAnchor");
+static_assert(!book_was_examined(ScreenOutcome{}, true),
+              "the default outcome must WITHHOLD valuation grade");
+static_assert(!book_was_examined(ScreenOutcome::NoAnchor, true),
+              "a genuine data gap must still withhold EVEN WITH the coherence "
+              "test live -- this is what b45c30f closed and what must not "
+              "re-open. The second argument must never rescue NoAnchor");
+static_assert(book_was_examined(ScreenOutcome::BandDisabled, true),
+              "the documented off-switch must not withhold while the "
+              "coherence test can still refuse the book");
+static_assert(!book_was_examined(ScreenOutcome::BandDisabled, false),
+              "band off AND coherence standing down leaves NO screen at all; "
+              "granting grade there re-opens b45c30f on a crossed book or at "
+              "agree_max 0");
+static_assert(book_was_examined(ScreenOutcome::Screened, false),
+              "a book the band actually screened is examined regardless of "
+              "the coherence test -- otherwise crossed books and the "
+              "documented agree_max 0 setting black out valuation bot-wide");
+static_assert(book_was_examined(ScreenOutcome::Screened, true), "");
+
+static_assert(coherence_can_bite(5000.0, 141.8),
+              "a live ceiling and a measurable spread: the conjunct bites");
+static_assert(!coherence_can_bite(0.0, 141.8),
+              "agree_max 0 is the documented bypass-off: it stands down");
+static_assert(!coherence_can_bite(5000.0, 0.0),
+              "spread 0 is compute_spread_bps's crossed/one-sided sentinel: "
+              "0 satisfies every ceiling, so the conjunct cannot refuse");
+
 /// Verdict for one dust-filtered book.  Both sides default to trusted:
 /// absence of evidence against a side is not evidence against it, and the
 /// no-anchor case must leave every consumer exactly where it was.
+///
+/// The "trusted" states are distinguishable, and so are the two reasons a
+/// book went unexamined.  There are THREE ways to be trusted, not two:
+///
+///   trusted because VERIFIED    outcome == Screened, ref > 0,
+///                               bypassed == false -- both sides were
+///                               individually compared to the anchor.
+///   trusted because COHERENT    outcome == Screened, ref > 0,
+///                               bypassed == true -- the two-sides-agree
+///                               escape fired and returned BEFORE in_band
+///                               ever ran.  The anchor was accepted, so this
+///                               is a screened book, but the trust came from
+///                               the book agreeing with ITSELF, not from any
+///                               comparison against the anchor.
+///   trusted because UNEXAMINED  ref == 0, and `outcome` says WHY --
+///                               NoAnchor (no evidence available) or
+///                               BandDisabled (no evidence requested).
+///
+/// An earlier revision of this comment claimed only the first distinction
+/// and asserted consumers could tell what they needed to.  They could not:
+/// the "why" is what the valuation gate turns on, and it was not recorded.
+/// A later revision listed two trusted states where there are three, reading
+/// `Screened` as "both sides were checked against the anchor" -- which is not
+/// what a bypassed book got.  The information was always recoverable from
+/// `bypassed`; the comment just did not say so.
 struct SideQuality {
     bool   bid_ok{true};
     bool   ask_ok{true};
     double ref{0.0};        ///< anchor actually used; 0 = nothing screened
     bool   bypassed{false}; ///< the two-sides-agree escape fired
+    /// Why `ref` is what it is.  DEFAULT IS THE FAIL-CLOSED ONE: a
+    /// default-constructed SideQuality is "nothing screened", and nothing
+    /// screened must never read as "the operator opted out".
+    ScreenOutcome outcome{ScreenOutcome::NoAnchor};
 };
+
+static_assert(SideQuality{}.outcome == ScreenOutcome::NoAnchor,
+              "SideQuality{} is used as 'nothing screened' -- it must "
+              "behave as NoAnchor, never as BandDisabled");
+// Asserted with coherence_live TRUE -- the permissive argument -- so this
+// pins that the DEFAULT withholds on its own merits and is not merely being
+// rescued by a coincidentally standing-down coherence test.
+static_assert(!book_was_examined(SideQuality{}.outcome, true),
+              "a default-constructed SideQuality must WITHHOLD");
+static_assert(SideQuality{}.ref == 0.0, "");
 
 /// Classify a filtered book against an independent anchor.
 ///
@@ -279,8 +499,20 @@ struct SideQuality {
 /// @param best_ask  Best dust-filtered third-party ask, same units.
 /// @param anchor    Independent reference (NEVER this pair's own book).
 ///                  <= 0 or non-finite means nothing screened this cycle.
-/// @param band_ratio            Multiplicative band; <= 1.0 disables.
+/// @param band_ratio            Multiplicative band; finite and <= 1.0
+///                  disables.  A disabled band yields outcome BandDisabled,
+///                  NOT NoAnchor: it is an opt-out, not a data gap.  A
+///                  NON-FINITE or negative band is garbage rather than a
+///                  setting and degrades to NoAnchor -- on EITHER side of 1.0,
+///                  which is why that test is hoisted above the comparison.
 /// @param agree_max_spread_bps  Two-sides-agree bypass threshold.
+///
+/// On return, `outcome` always says why `ref` holds what it does, and it is
+/// the ONLY field that distinguishes an operator opt-out from a data gap.
+///
+/// BandDisabled is NOT by itself a licence to grade: see book_was_examined,
+/// which additionally requires that the coherence test can still refuse the
+/// book.  This function reports WHAT HAPPENED; it does not decide trust.
 [[nodiscard]] inline SideQuality classify_sides(
     double best_bid,
     double best_ask,
@@ -291,13 +523,52 @@ struct SideQuality {
     SideQuality q{};
 
     // No usable anchor, or the test is switched off: nothing may be
-    // disqualified.  ref stays 0 so consumers can tell "trusted because
-    // verified" from "trusted because unexamined" -- they are not the
-    // same claim, and a consumer that re-references on a junk side must
-    // not silently re-reference onto a zero.
-    if (!(anchor > 0.0) || !std::isfinite(anchor) || !(band_ratio > 1.0)) {
+    // disqualified.  ref stays 0 in BOTH cases so consumers can tell
+    // "trusted because verified" from "trusted because unexamined" -- they
+    // are not the same claim, and a consumer that re-references on a junk
+    // side must not silently re-reference onto a zero.
+    //
+    // These were ONE early exit until 2026-09-02.  They are now two,
+    // because `q.outcome` has to say WHICH -- see the ScreenOutcome note.
+    //
+    // ORDER IS LOAD-BEARING AND MUST STAY THIS WAY.  When BOTH hold (no
+    // anchor AND the band disabled) the answer must be NoAnchor: a missing
+    // anchor is a data gap whatever the band says, and reporting
+    // BandDisabled there would let an operator's off-switch grant valuation
+    // grade to a book nothing screened.  That is the fail-open direction and
+    // it is precisely what b45c30f closed.  Anchor first, therefore.
+    if (!(anchor > 0.0) || !std::isfinite(anchor)) {
+        q.outcome = ScreenOutcome::NoAnchor;
         return q;
     }
+    // A NON-FINITE BAND IS GARBAGE WHICHEVER SIDE OF 1.0 IT FALLS, and this
+    // test is hoisted ABOVE the `> 1.0` comparison for that reason.
+    //
+    // [review round 9] It used to sit inside the disabled branch below, so it
+    // only caught garbage that compared <= 1.0.  NaN and -inf land there and
+    // were handled; +inf does NOT -- `!(inf > 1.0)` is false, so it fell
+    // through to the band as though it were a setting, reported Screened with
+    // `ref` set, and then screened NOTHING: in_band's `ratio <= inf` and
+    // `ratio >= 1.0/inf == 0.0` both hold for every price.  That is the
+    // maximally permissive outcome wearing the label of the verified one --
+    // a book arbitrarily far from the anchor reported as positively screened.
+    //
+    // config.cpp:3181 throws on non-finite or negative, so no config can
+    // reach this today.  It is written anyway, and written to fail CLOSED,
+    // because "unreachable today" is how each of the twelve close_out
+    // fail-opens started.
+    if (!std::isfinite(band_ratio) || band_ratio < 0.0) {
+        q.outcome = ScreenOutcome::NoAnchor;
+        return q;
+    }
+    if (!(band_ratio > 1.0)) {
+        // Everything reaching here is finite and >= 0, so this IS the range
+        // config.cpp accepts and documents as "off": [0.0, 1.0].  A genuine
+        // operator opt-out, not garbage.
+        q.outcome = ScreenOutcome::BandDisabled;
+        return q;
+    }
+    q.outcome = ScreenOutcome::Screened;
     q.ref = anchor;
 
     // The bypass, tested BEFORE the per-side band so a coherent book can

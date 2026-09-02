@@ -18065,10 +18065,18 @@ asio::awaitable<void> Engine::step_observe_asset_pegs(BlockHeight block_height)
                     // its own. The warn that explains it is throttled to
                     // once per asset per five minutes, so during a flap this
                     // debug line is all there is.
+                    // [review round 9] The last field is LABELLED
+                    // book_side_ref, not "anchor", because that is what it
+                    // is. classify_sides deliberately leaves ref at 0 when
+                    // the per-side band is disabled, so an operator with the
+                    // band off and a perfectly good anchor present used to
+                    // read "anchor=0" here and diagnose a missing anchor --
+                    // the same self-contradicting log the round-8 note above
+                    // was written to prevent, one field to the right.
                     spdlog::debug("[Engine] peg observe: {} yields no "
                                   "observation (circular_anchor={}, "
                                   "grade={}, bid_ok={}, ask_ok={}, "
-                                  "anchor_kind={}, anchor={})",
+                                  "anchor_kind={}, book_side_ref={})",
                                   pair.name,
                                   risk::xch_anchor_is_circular_for(
                                       usd_anchor, a->asset_id),
