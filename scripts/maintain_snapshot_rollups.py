@@ -362,8 +362,12 @@ def _prune_raw_tables(
         if breaches:
             width = max(len(t) for t, _, _, _ in breaches)
             msg = [
+                # Explicit '+', not adjacent literals: CodeQL flags implicit
+                # concatenation inside a list because a missing comma between
+                # two intended elements is indistinguishable from it, and this
+                # list is the operator's only warning before a bulk delete.
                 "this run would delete more than "
-                f"{MAX_UNCONFIRMED_PRUNE_FRACTION:.0%} of a raw table:",
+                + f"{MAX_UNCONFIRMED_PRUNE_FRACTION:.0%} of a raw table:",
             ]
             for t, d, n, oldest in breaches:
                 msg.append(f"    {t:<{width}} : {d:,} of {n:,} rows ({d / n:.1%})")
