@@ -28,6 +28,7 @@
 #include "xop/execution/cross_guard.hpp"
 #include "xop/execution/crossed_book.hpp"
 #include "xop/execution/take_sizing.hpp"
+#include "xop/execution/take_retry.hpp"
 #include "xop/execution/coin_pool_verdict.hpp"
 #include "xop/strategy/tier_gain.hpp"
 #include "xop/execution/mid_gate.hpp"
@@ -3063,7 +3064,14 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
             && !watchdog_fired_.load(std::memory_order_acquire)) {
         try { co_await step_run_drift_corrector(block_height); }
         catch (const std::exception& e) {
-            spdlog::error("[Engine] Step 9f (drift corrector) failed: {}", e.what());
+            // [S40 remainder] Finding C, recorded not fixed: 9f has no
+            // per-iteration try, so a throw from take_offer lands here naming
+            // NO pair and NO offer id and abandoning the remaining pairs for
+            // this cycle. At minimum say which CLASS of failure it was.
+            spdlog::error("[Engine] Step 9f (drift corrector) failed [{}]: {}",
+                          execution::to_string(
+                              execution::classify_take_failure(e.what())),
+                          e.what());
         }
     }
 
@@ -11405,12 +11413,48 @@ asio::awaitable<void> Engine::step_check_arbitrage(
     const double min_edge_bps = config_.arbitrage.crossed_book_min_edge_bps;
     const double max_take_xch = config_.arbitrage.crossed_book_max_take_xch;
 
+    // [S40 remainder 2026-09-01] Age-out plus the hard cap on the retry map.
+    // Safe on every cycle, including cycles whose book read empty -- unlike
+    // retain_live() below, which must NOT run on an empty read.
+    //
+    // [review] The return value used to be discarded. The two counts are not
+    // interchangeable: an age-out is routine, but a CAP eviction throws away a
+    // suppression that may still be live -- still crossed, still unfundable --
+    // and the storm it was holding resumes on the next cycle with no record
+    // anywhere that it happened. That is an edge, so it is warned once per
+    // cycle it occurs and never levelled.
+    {
+        const auto swept = crossed_book_retry_.sweep(
+            static_cast<std::uint64_t>(block_height),
+            crossed_book_retry_cfg_);
+        if (swept.capped > 0) {
+            spdlog::warn("[Engine] Step 9c: retry map hit its {}-entry cap -- "
+                         "evicted {} least-recently-seen entries. Any that "
+                         "were still suppressed resume attempting now.",
+                         crossed_book_retry_cfg_.max_entries, swept.capped);
+        }
+    }
+
     for (const auto& pair : config_.pairs) {
         if (!pair.enabled || pair_peg_suspended(pair)) continue;
 
         // Get the competing offers (already fetched in Step 1).
         auto comp_offers = market_data_->get_competing_offers(pair.name);
         if (comp_offers.empty()) continue;
+
+        // [S40 remainder] The book read non-empty, so every retry entry for
+        // THIS pair whose offer is no longer on the book is garbage by
+        // construction: evaluate_crossed_book() cannot re-select it. Pruning
+        // here and nowhere else is deliberate -- offer_manager.cpp clear()s
+        // its equivalent counters when its input list is empty, and copying
+        // that would let one transient empty Dexie snapshot wipe every
+        // suppression and resume the storm on the next non-empty cycle.
+        {
+            std::unordered_set<std::string> live_ids;
+            live_ids.reserve(comp_offers.size());
+            for (const auto& co : comp_offers) live_ids.insert(co.offer_id);
+            crossed_book_retry_.retain_live(pair.name, live_ids);
+        }
 
         // [S40 2026-09-01] Selection, the cross test, the edge test and the
         // size cap now live in evaluate_crossed_book(). The cap used to be
@@ -11455,11 +11499,25 @@ asio::awaitable<void> Engine::step_check_arbitrage(
         // size can be read for months without anyone seeing the defect.
         // Rule for this whole step: no log line may print a size that is not
         // best_ask_size or cap_mojos verbatim.
-        spdlog::info("[Engine] Step 9c: {} CROSSED BOOK detected -- "
-                     "bid={} ask={} edge={:.1f}bps offer_id={} size={} cap={}",
-                     pair.name, best_bid_price, best_ask_price,
-                     edge_bps, best_ask_offer_id.substr(0, 12),
-                     decision.best_ask_size, decision.cap_mojos);
+        //
+        // [review 2026-09-01] IT IS DEBUG, NOT INFO, AND THAT IS THE POINT.
+        // This line sits 140+ lines ABOVE the retry gate and fires on every
+        // cycle the book is crossed above min edge, so during the Cgp9 storm
+        // it emitted 50 of the window's 150 Step-9c lines -- and the gate,
+        // which lives below it, cannot suppress a line that was already
+        // printed. Leaving it at info made the claim "the 50-attempt storm
+        // collapses to one line" false by 50x and violated this repo's own
+        // rule (log edges plus a heartbeat, never a level every cycle) with
+        // the single most frequent line on the path. Every downstream branch
+        // -- CapUnusable, ZeroSize, SizeExceedsCap, each gate decline, TAKING
+        // and TOOK -- carries the offer id and the numbers it needs, so
+        // nothing that happens is now unreported; only the per-cycle
+        // restatement that nothing has changed is gone.
+        spdlog::debug("[Engine] Step 9c: {} CROSSED BOOK detected -- "
+                      "bid={} ask={} edge={:.1f}bps offer_id={} size={} cap={}",
+                      pair.name, best_bid_price, best_ask_price,
+                      edge_bps, best_ask_offer_id.substr(0, 12),
+                      decision.best_ask_size, decision.cap_mojos);
 
         if (decision.verdict == CrossedBookVerdict::CapUnusable) {
             spdlog::warn("[Engine] Step 9c: {} take cap is unusable "
@@ -11517,17 +11575,224 @@ asio::awaitable<void> Engine::step_check_arbitrage(
             continue;
         }
 
+        // ------------------------------------------------------------------
+        // [S40 remainder 2026-09-01] PRE-TRADE FUNDING CHECK + RETRY GATE.
+        //
+        // This sits BEFORE get_offer_status() on purpose. Step 9e checks the
+        // balance AFTER its Dexie fetch; 9c's decline is deterministic and
+        // repeats, so checking first saves BOTH round trips rather than one.
+        // Measured: 105 attempts x (1 Dexie GET + 1 take_offer) = 208 wasted
+        // RPCs on 104 failures, 96 of them insufficient funds and not one of
+        // them ever fundable -- offer Cgp9GrtmnmPf alone was re-selected 50
+        // times in 46 minutes against a DBX wallet that never came within
+        // 30% of the 485,908 mojos it needed. See take_retry.hpp.
+        //
+        // The fee is computed here rather than after the fetch because it is
+        // part of the requirement whenever it leaves the SAME wallet as the
+        // spend.
+        // ------------------------------------------------------------------
+        const std::uint64_t fee = fee_tracker_
+            ? fee_tracker_->get_recommended_fee(
+                  config_.fees.min_fee_mojos, block_height)
+            : config_.fees.min_fee_mojos;
+
+        // 9c lifts an ASK and only an ASK -- evaluate_crossed_book() has no
+        // bid path -- so the spend asset is unconditionally the QUOTE. There
+        // is deliberately no side ternary here: a ternary on a side that is
+        // always Ask is a copy-paste hazard, and the cost MUST be quote
+        // mojos. Writing `cost = take_size` (base mojos) would compare
+        // 5,000,000,000,000 against a 338,276-mojo DBX wallet and decline
+        // every crossed-book take on every pair, forever, while looking
+        // exactly like a working guard.
+        const bool spend_is_xch = (pair.quote_asset_id == "xch");
+        const Mojo spend_cost = execution::ask_take_cost(
+            decision.best_ask_size, best_ask_price,
+            pair.base_mojos_per_unit, pair.quote_mojos_per_unit,
+            spend_is_xch ? static_cast<Mojo>(fee) : Mojo{0});
+
+        // read_ok{false} is UNKNOWN and it is the DEFAULT. A number is never
+        // substituted for a failed read (coin_pool_verdict.hpp), which is why
+        // this is not `bal.value("spendable_balance", 0)` -- that defaulted
+        // zero reads as "broke", which happens to decline but for the wrong
+        // reason, with the wrong log line and the wrong accrual class.
+        execution::SpendableReading reading{};
+        std::string balance_err;
+        const std::int64_t spend_wid =
+            offer_mgr_ ? offer_mgr_->resolve_wallet_id(pair.quote_asset_id)
+                       : -1;
+        if (spend_wid > 0) {
+            try {
+                auto bal = co_await wallet_->get_wallet_balance(spend_wid);
+                if (bal.contains("spendable_balance")) {
+                    const auto& jb = bal["spendable_balance"];
+                    if (jb.is_number_unsigned()) {
+                        const auto u = jb.get<std::uint64_t>();
+                        reading.spendable =
+                            (u > static_cast<std::uint64_t>(
+                                     std::numeric_limits<Mojo>::max()))
+                                ? std::numeric_limits<Mojo>::max()
+                                : static_cast<Mojo>(u);
+                        reading.read_ok = true;
+                    } else if (jb.is_number_integer()) {
+                        reading.spendable = jb.get<Mojo>();
+                        reading.read_ok   = true;
+                    }
+                }
+                if (!reading.read_ok) {
+                    balance_err = "response carried no usable "
+                                  "spendable_balance field";
+                }
+            } catch (const std::exception& be) {
+                balance_err = be.what();
+            }
+        } else {
+            // resolve_wallet_id() returns -1 only when no wallet is mapped
+            // for the asset -- i.e. we have nothing to spend it from, so the
+            // take could not settle anyway. This declines rather than
+            // skipping the check the way Step 9e does, and it is logged, so
+            // it cannot become a silent kill switch.
+            balance_err = "no wallet is mapped for the spend asset";
+        }
+
+        const execution::OfferFingerprint fp{best_ask_price,
+                                             decision.best_ask_size};
+        const auto tg = crossed_book_retry_.gate(
+            pair.name, best_ask_offer_id, fp, reading, spend_cost,
+            static_cast<std::uint64_t>(block_height),
+            crossed_book_retry_cfg_);
+
+        if (tg.gate != execution::TakeGate::Attempt) {
+            // Edges and a heartbeat, never a level. 150 of the 153 Step-9c
+            // info/error lines in the Cgp9 window were one doomed offer;
+            // with the detection line demoted above, this path is the whole
+            // of the step's recurring output: one line per state change plus
+            // an hourly reminder. The heartbeat is not optional: engine.cpp's
+            // breaker_skip_warned_ is an edge with no off-edge and it
+            // compressed a 4h10m total-quoting outage into a single line
+            // nobody saw.
+            //
+            // [review] ONE MESSAGE PER ENUMERATOR, and no message may be
+            // reachable from two different states. The first cut rendered the
+            // coin-lock funding hold as DeclineInsufficient, which printed
+            // "insufficient balance: need 485908 spendable 485913 short 0 ...
+            // Clears the cycle the balance covers it" -- self-contradicting,
+            // and identical to the benign case that fires 96 times in 104.
+            const bool edge = (tg.log == execution::TakeLogEvent::Edge);
+            if (edge || tg.log == execution::TakeLogEvent::Heartbeat) {
+                const char* verb = edge ? "DECLINING" : "still declining";
+                const std::string id12 = best_ask_offer_id.substr(0, 12);
+                switch (tg.gate) {
+                case execution::TakeGate::DeclineUnknown:
+                    spdlog::warn(
+                        "[Engine] Step 9c: {} {} take of {} (edge={:.1f}bps) "
+                        "-- spendable balance UNKNOWN (wallet {}): {}. An "
+                        "unread balance is not a passed check. "
+                        "cycles={} blocks={}",
+                        pair.name, verb, id12, edge_bps, spend_wid,
+                        balance_err.empty() ? "cost could not be priced"
+                                            : balance_err,
+                        tg.suppressed_cycles, tg.suppressed_blocks);
+                    break;
+                case execution::TakeGate::DeclineInsufficient:
+                    spdlog::info(
+                        "[Engine] Step 9c: {} {} take of {} (edge={:.1f}bps) "
+                        "-- insufficient balance: need {} spendable {} "
+                        "short {} (wallet {}). Clears the cycle the balance "
+                        "covers it. cycles={} blocks={}",
+                        pair.name, verb, id12, edge_bps, spend_cost,
+                        tg.spendable, tg.shortfall, spend_wid,
+                        tg.suppressed_cycles, tg.suppressed_blocks);
+                    break;
+                case execution::TakeGate::DeclineFundingHold:
+                    // The one state the old wording could not express: the
+                    // read says we can pay and the WALLET disagreed. Name the
+                    // rejected reading and both release conditions, because
+                    // neither is "the balance covers it" -- it already does.
+                    spdlog::warn(
+                        "[Engine] Step 9c: {} {} take of {} (edge={:.1f}bps) "
+                        "-- our read says AFFORDABLE (need {} spendable {}) "
+                        "but the wallet rejected this on funding at "
+                        "spendable={} (wallet {}); most likely our own "
+                        "just-posted offers still hold the coins. Held until "
+                        "the read rises above that or block {} (now {}). "
+                        "cycles={} blocks={}",
+                        pair.name, verb, id12, edge_bps, spend_cost,
+                        tg.spendable, tg.rejected_at, spend_wid,
+                        tg.ready_block, block_height,
+                        tg.suppressed_cycles, tg.suppressed_blocks);
+                    break;
+                case execution::TakeGate::DeclineSyncBackoff:
+                    spdlog::info(
+                        "[Engine] Step 9c: {} {} take of {} (edge={:.1f}bps) "
+                        "-- the wallet rejected this while syncing; short "
+                        "hold until block {} (now {}). The balance is fine "
+                        "(need {} spendable {}). cycles={} blocks={}",
+                        pair.name, verb, id12, edge_bps, tg.ready_block,
+                        block_height, spend_cost, tg.spendable,
+                        tg.suppressed_cycles, tg.suppressed_blocks);
+                    break;
+                case execution::TakeGate::DeclineBackoff:
+                    spdlog::info(
+                        "[Engine] Step 9c: {} {} take of {} (edge={:.1f}bps) "
+                        "-- backing off after an unclassified take failure "
+                        "until block {} (now {}). cycles={} blocks={}",
+                        pair.name, verb, id12, edge_bps, tg.ready_block,
+                        block_height,
+                        tg.suppressed_cycles, tg.suppressed_blocks);
+                    break;
+                case execution::TakeGate::Attempt:
+                    // Unreachable: this whole branch is the != Attempt case.
+                    // Enumerated rather than defaulted so a new decline
+                    // enumerator is a COMPILE error here (/W4 /WX) and not a
+                    // silently mislabelled log line.
+                    break;
+                }
+            }
+            continue;
+        }
+
+        if (tg.log == execution::TakeLogEvent::Resume) {
+            spdlog::info("[Engine] Step 9c: {} offer {} is fundable again "
+                         "after {} suppressed cycles ({} blocks) -- "
+                         "need {} spendable {}",
+                         pair.name, best_ask_offer_id.substr(0, 12),
+                         tg.suppressed_cycles, tg.suppressed_blocks,
+                         spend_cost, tg.spendable);
+        }
+
         // Fetch the full offer text (bech32m) from Dexie.
         // The competing-offers fetch uses compact=true which omits the text.
+        //
+        // [review 2026-09-01] `took_ok` exists because the bookkeeping below
+        // (record_taker_fill / record_fee / send_alert) sits inside this try.
+        // A SQLite "database is locked" -- routine on Windows here -- thrown
+        // AFTER the swap settled used to land in the catch, which logged a
+        // settled take as a failure and then re-created the retry entry with
+        // other_failures=1. A take that reached the chain is not a take
+        // failure, whatever throws afterwards.
+        bool took_ok = false;
         try {
             auto offer_status =
                 co_await dexie_->get_offer_status(best_ask_offer_id);
 
             if (!offer_status.success ||
                 offer_status.offer.offer_bech32.empty()) {
+                // [review] This used to `continue` with no accrual, while the
+                // THROWING form of the identical Dexie fault was classified
+                // Other and backed off 4 -> 64 blocks. Same fault, opposite
+                // treatment, decided by whether the client models the failure
+                // as an exception -- and the non-accruing branch reproduces
+                // S40's "re-attempted every cycle, no backoff" one RPC
+                // earlier. Latent (all 104 measured failures were take_offer
+                // throws), so this closes it before it is observed.
                 spdlog::warn("[Engine] Step 9c: {} failed to fetch offer "
                              "text for {} -- skipping",
                              pair.name, best_ask_offer_id.substr(0, 12));
+                crossed_book_retry_.note_failure(
+                    pair.name, best_ask_offer_id, fp,
+                    execution::TakeFailureClass::Other, reading,
+                    static_cast<std::uint64_t>(block_height),
+                    crossed_book_retry_cfg_);
                 continue;
             }
 
@@ -11539,12 +11804,6 @@ asio::awaitable<void> Engine::step_check_arbitrage(
                              offer_status.offer.status);
                 continue;
             }
-
-            // Determine fee from the FeeTracker.
-            const std::uint64_t fee = fee_tracker_
-                ? fee_tracker_->get_recommended_fee(
-                      config_.fees.min_fee_mojos, block_height)
-                : config_.fees.min_fee_mojos;
 
             spdlog::info("[Engine] Step 9c: {} TAKING crossed-book offer "
                          "{} (edge={:.1f}bps, size={}, fee={})",
@@ -11580,6 +11839,12 @@ asio::awaitable<void> Engine::step_check_arbitrage(
                              pair.name, trade_id.substr(0, 12),
                              edge_bps, take_size);
 
+                // Everything we knew about this offer is spent. Set BEFORE
+                // the bookkeeping below, which is what can still throw.
+                took_ok = true;
+                crossed_book_retry_.note_success(pair.name,
+                                                 best_ask_offer_id);
+
                 // [TAKER-RECORDING 2026-07-30] We lifted an ASK, so we
                 // bought base and paid quote.
                 if (const PairConfig* tpc = find_pair_config(pair.name)) {
@@ -11604,16 +11869,53 @@ asio::awaitable<void> Engine::step_check_arbitrage(
                         std::to_string(take_size) + " mojos");
                 }
             } else {
+                // Structurally near-dead: rpc_post() THROWS
+                // ChiaRPCApplicationError on success:false and only returns
+                // on success, so this fires solely on a malformed response
+                // with no `success` key -- 0 occurrences in the 39h window
+                // against 104 from the catch below. It still burned two
+                // RPCs, so it accrues as the unmodelled class.
                 const std::string err = result.contains("error")
                     ? result["error"].get<std::string>()
                     : "unknown error";
                 spdlog::warn("[Engine] Step 9c: {} take_offer failed: {}",
                              pair.name, err);
+                crossed_book_retry_.note_failure(
+                    pair.name, best_ask_offer_id, fp,
+                    execution::TakeFailureClass::Other, reading,
+                    static_cast<std::uint64_t>(block_height),
+                    crossed_book_retry_cfg_);
             }
 
         } catch (const std::exception& e) {
-            spdlog::error("[Engine] Step 9c: {} crossed-book take failed: {}",
-                          pair.name, e.what());
+            // [S40 remainder] The catch-all used to erase the taxonomy: a
+            // Dexie transport throw, a wallet sync rejection and a funding
+            // rejection all emitted the identical message shape with the
+            // identical control flow, so the log could not distinguish a
+            // DETERMINISTIC failure from a TRANSIENT one except by
+            // substring-matching the exception text. Classify HERE, at the
+            // throw site, and say which class it was -- a policy reading the
+            // log stream cannot do it.
+            if (took_ok) {
+                // The swap SETTLED. Whatever threw came from the ledger /
+                // fee / alert bookkeeping after it, and calling note_failure
+                // here would both misreport a filled take as a failure and
+                // feed a backoff counter with an event that has nothing to do
+                // with taking offers.
+                spdlog::error("[Engine] Step 9c: {} the take SETTLED but the "
+                              "bookkeeping after it failed -- the fill may be "
+                              "missing from the ledger: {}",
+                              pair.name, e.what());
+                continue;
+            }
+            const auto cls = execution::classify_take_failure(e.what());
+            spdlog::error("[Engine] Step 9c: {} crossed-book take failed "
+                          "[{}]: {}",
+                          pair.name, execution::to_string(cls), e.what());
+            crossed_book_retry_.note_failure(
+                pair.name, best_ask_offer_id, fp, cls, reading,
+                static_cast<std::uint64_t>(block_height),
+                crossed_book_retry_cfg_);
         }
     }
 
@@ -12198,9 +12500,34 @@ asio::awaitable<void> Engine::step_check_arbitrage(
                         try {
                             auto bal = co_await
                                 wallet_->get_wallet_balance(spend_wid);
-                            Mojo spendable = bal.value(
-                                "spendable_balance",
-                                static_cast<Mojo>(0));
+
+                            // [S40 remainder 2026-09-01] read_ok{false} is
+                            // UNKNOWN and it is the DEFAULT. This used to be
+                            // bal.value("spendable_balance", 0), which
+                            // silently substitutes a NUMBER for a missing
+                            // field -- coin_pool_verdict.hpp's rule forbids
+                            // exactly that. The defaulted zero happened to
+                            // decline (it reads as "broke"), so it was a
+                            // latent bug pointing the safe way, but it
+                            // declined for the wrong reason and said the
+                            // wrong thing in the log.
+                            execution::SpendableReading reading{};
+                            if (bal.contains("spendable_balance")) {
+                                const auto& jb = bal["spendable_balance"];
+                                if (jb.is_number_unsigned()) {
+                                    const auto u = jb.get<std::uint64_t>();
+                                    reading.spendable =
+                                        (u > static_cast<std::uint64_t>(
+                                                 std::numeric_limits<
+                                                     Mojo>::max()))
+                                            ? std::numeric_limits<Mojo>::max()
+                                            : static_cast<Mojo>(u);
+                                    reading.read_ok = true;
+                                } else if (jb.is_number_integer()) {
+                                    reading.spendable = jb.get<Mojo>();
+                                    reading.read_ok   = true;
+                                }
+                            }
 
                             // The cost of the WHOLE offer, in the asset we
                             // spend, derived by take_sizing.hpp from the size
@@ -12208,15 +12535,39 @@ asio::awaitable<void> Engine::step_check_arbitrage(
                             // priced the CLAMPED size and ignored the
                             // quote/base denomination ratio, so it could
                             // clear this guard on a take it could not fund.
-                            const Mojo cost = spend_cost;
+                            //
+                            // The fee is XCH from wallet 1. Add it ONLY when
+                            // the asset we are spending IS xch, i.e. when the
+                            // fee and the spend leave the SAME wallet -- a
+                            // single-wallet check structurally cannot see it
+                            // otherwise. Inert on XCH/DBX and XCH/BYC ask
+                            // takes; live on a bid take of an xch base and on
+                            // the wmilliETH.b/XCH family.
+                            const Mojo cost = execution::add_same_wallet_fee(
+                                spend_cost,
+                                spend_asset == "xch"
+                                    ? static_cast<Mojo>(fee) : Mojo{0});
 
-                            if (spendable < cost) {
+                            const auto fv =
+                                execution::decide_funding(reading, cost);
+                            if (fv == execution::FundingVerdict::Unknown) {
+                                spdlog::warn(
+                                    "[Engine] Step 9e: {} SKIP {} take -- "
+                                    "spendable balance UNKNOWN (wallet {}, "
+                                    "cost {}): an unread balance is not a "
+                                    "passed check",
+                                    pair.name, to_string(c.side),
+                                    spend_wid, cost);
+                                co_return;
+                            }
+                            if (fv ==
+                                execution::FundingVerdict::Insufficient) {
                                 spdlog::warn(
                                     "[Engine] Step 9e: {} SKIP {} "
                                     "take -- insufficient balance: "
                                     "need {} spendable {} (wallet {})",
                                     pair.name, to_string(c.side),
-                                    cost, spendable, spend_wid);
+                                    cost, reading.spendable, spend_wid);
                                 co_return;
                             }
                         } catch (const std::exception& be) {
@@ -12323,8 +12674,11 @@ asio::awaitable<void> Engine::step_check_arbitrage(
                                  pair.name, inv_ratio_9e, peg_max_ratio);
                 }
             } catch (const std::exception& e) {
-                spdlog::error("[Engine] Step 9e: {} peg-arb failed: {}",
-                              pair.name, e.what());
+                spdlog::error("[Engine] Step 9e: {} peg-arb failed [{}]: {}",
+                              pair.name,
+                              execution::to_string(
+                                  execution::classify_take_failure(e.what())),
+                              e.what());
             }
         }
     }
@@ -12736,6 +13090,13 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
             continue;
         }
 
+        // The fee is part of the funding requirement whenever it leaves the
+        // SAME wallet as the spend, so it is computed before the check.
+        const std::uint64_t fee = fee_tracker_
+            ? fee_tracker_->get_recommended_fee(
+                  config_.fees.min_fee_mojos, block_height)
+            : config_.fees.min_fee_mojos;
+
         // Pre-balance check (mirrors Step 9e).
         if (offer_mgr_) {
             const std::string& spend_asset =
@@ -12746,14 +13107,45 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
                 try {
                     auto bal = co_await
                         wallet_->get_wallet_balance(spend_wid);
-                    Mojo spendable = bal.value(
-                        "spendable_balance", static_cast<Mojo>(0));
-                      const Mojo cost = chosen->spend_cost;
-                    if (spendable < cost) {
+
+                    // [S40 remainder 2026-09-01] See Step 9e: read_ok{false}
+                    // is UNKNOWN and it is the DEFAULT. A number is never
+                    // substituted for a failed read.
+                    execution::SpendableReading reading{};
+                    if (bal.contains("spendable_balance")) {
+                        const auto& jb = bal["spendable_balance"];
+                        if (jb.is_number_unsigned()) {
+                            const auto u = jb.get<std::uint64_t>();
+                            reading.spendable =
+                                (u > static_cast<std::uint64_t>(
+                                         std::numeric_limits<Mojo>::max()))
+                                    ? std::numeric_limits<Mojo>::max()
+                                    : static_cast<Mojo>(u);
+                            reading.read_ok = true;
+                        } else if (jb.is_number_integer()) {
+                            reading.spendable = jb.get<Mojo>();
+                            reading.read_ok   = true;
+                        }
+                    }
+                    const Mojo cost = execution::add_same_wallet_fee(
+                        chosen->spend_cost,
+                        spend_asset == "xch" ? static_cast<Mojo>(fee)
+                                             : Mojo{0});
+                    const auto fv =
+                        execution::decide_funding(reading, cost);
+                    if (fv == execution::FundingVerdict::Unknown) {
+                        spdlog::warn("[Engine] Step 9f: {} SKIP -- spendable "
+                                     "balance UNKNOWN (wallet {}, cost {}): "
+                                     "an unread balance is not a passed "
+                                     "check",
+                                     pair.name, spend_wid, cost);
+                        continue;
+                    }
+                    if (fv == execution::FundingVerdict::Insufficient) {
                         spdlog::warn("[Engine] Step 9f: {} SKIP -- "
                                      "insufficient balance: need {} "
                                      "spendable {} (wallet {})",
-                                     pair.name, cost, spendable,
+                                     pair.name, cost, reading.spendable,
                                      spend_wid);
                         continue;
                     }
@@ -12771,11 +13163,6 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
                 }
             }
         }
-
-        const std::uint64_t fee = fee_tracker_
-            ? fee_tracker_->get_recommended_fee(
-                  config_.fees.min_fee_mojos, block_height)
-            : config_.fees.min_fee_mojos;
 
         spdlog::info("[Engine] Step 9f: {} TAKING drift-corr {} offer {} "
                      "(prem={:.1f}bps size={} fee={})",

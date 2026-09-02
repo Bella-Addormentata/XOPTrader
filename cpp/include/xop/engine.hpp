@@ -50,6 +50,7 @@
 #include "xop/execution/coin_manager.hpp"
 #include "xop/execution/market_data.hpp"
 #include "xop/execution/offer_manager.hpp"
+#include "xop/execution/take_retry.hpp"
 
 // Data / analytics
 #include "xop/data/volatility.hpp"
@@ -1511,6 +1512,28 @@ private:
 
     // True when Step 9c successfully took at least one offer on this block.
     bool crossed_book_take_this_block_{false};
+
+    // -- [S40 remainder 2026-09-01] Step 9c take-retry state ----------------
+    // SEVEN members above declare Step-9 cooldowns and per-block caps that a
+    // repo-wide grep over cpp/src and cpp/include finds NO read and NO write
+    // of -- buyer_last_take_block_, buyer_epoch_taken_,
+    // buyer_takes_this_block_, midpoint_last_take_block_,
+    // midpoint_epoch_taken_xch_, midpoint_takes_this_block_ and
+    // crossed_book_take_this_block_ each occur exactly once, at their own
+    // declaration. The "no backoff" half of S40 is therefore not an oversight
+    // in one path; it is seven declared-and-forgotten members whose comments
+    // describe enforcement that was never written. Step 9f's
+    // last_drift_correction_block_ is the one that IS wired.
+    // This one is wired, and its policy lives in a pure header so a test can
+    // hold it -- nothing in cpp/tests constructs an Engine (TODO S36).
+    //
+    // Bounded by three rules, each covering the other's failure mode:
+    // retain_live() prunes to the pair's live book (only on a cycle whose
+    // book read non-empty -- clearing on an empty read would wipe every
+    // suppression and resume the storm), sweep() ages entries out and
+    // enforces the hard cap.
+    execution::TakeRetryBook crossed_book_retry_;
+    execution::TakeRetryConfig crossed_book_retry_cfg_{};
 
     // [T3-09] Max-drawdown global circuit breaker threshold.
     // Drawdown fraction = risk::equity_drawdown_frac(peak_equity_hwm_usd_,
