@@ -140,11 +140,12 @@ namespace xop::execution {
     if (base_mojos_per_unit <= 0) return 0;
     if (!(max_take_units > 0.0) || !std::isfinite(max_take_units)) return 0;
 
-    // 9.0e18 is exactly representable as a double (and long double is double
-    // under MSVC), and is strictly below 2^63, so both the comparison and the
-    // subsequent narrowing are exact and well-defined on every ABI we build.
-    // A previous saturation clamp in this repo rounded to 2^63 and passed
-    // MSVC while failing GCC; do not replace this with (long double)INT64_MAX.
+    // 9.0e18 is exactly representable as a double (9e18 = 2^18 * 34332275390625,
+    // a 46-bit odd part) and is strictly below 2^63, so both the comparison
+    // and the subsequent narrowing are exact and well-defined on every ABI we
+    // build. A previous saturation clamp in this repo rounded to 2^63 and
+    // passed MSVC while failing GCC; do not replace this with
+    // (long double)INT64_MAX.
     //
     // NO TEST GUARDS THIS LINE, and that was checked rather than assumed:
     // deleting it leaves the whole suite green on MSVC. Narrowing an
@@ -154,10 +155,44 @@ namespace xop::execution {
     // it is ABI-specific. THIS BOUND is what makes the conversion defined;
     // the `cap > 0` below is a second line of defence, not the first. Do not
     // delete it on the grounds that the tests still pass.
-    constexpr long double kMaxSafe = 9.0e18L;
+    //
+    // [2026-09-01] THE TYPE HERE IS `double`, DELIBERATELY, AND IT USED TO BE
+    // `long double`. The comment above was true of the NARROWING and false of
+    // the VALUE, which is a distinction worth spelling out because this
+    // function is cited elsewhere as the exemplar of getting this right.
+    //
+    // `long double` is 53-bit on MSVC and 64-bit x87 on GCC/x86-64, so
+    // `units * base_mojos_per_unit` was computed to different precisions and
+    // then TRUNCATED -- the cap VALUE was ABI-divergent, in the same file
+    // that warns about ABI divergence. For max_take_units = 0.15 and
+    // base_mojos_per_unit = 1e12 the exact product is 149999999999.999994...,
+    // which the 53-bit rounding lifts to exactly 150000000000 while the
+    // 64-bit rounding leaves below it: MSVC 150000000000, GCC 149999999999.
+    // Same for 0.03 and 0.3. This is the cap that `base_sz > max_mojos` is
+    // tested against at Step 9e and Step 9f -- the same guard the exact
+    // base_size_for_bid result feeds.
+    //
+    // It was latent, not live: every current config value
+    // (crossed_book_max_take_xch 5.0, midpoint_recycling_max_take_xch 0.25,
+    // peg_arb_max_take_units 50, drift_corrector_max_take_units 2.0) is
+    // dyadic-exact and agrees on both ABIs. Any operator writing 0.15, 0.03
+    // or 0.3 would have made CI and production disagree by one mojo again.
+    //
+    // `double` fixes it because binary64 arithmetic is correctly rounded and
+    // identical on both toolchains here: GCC targets x86-64 with SSE2, where
+    // FLT_EVAL_METHOD is 0, so there is no x87 excess precision to leak in.
+    // MSVC is bit-identical to before (its long double IS double), so the
+    // DEPLOYED build's cap values do not move at all.
+    //
+    // Note this is portable rounding, NOT exact-rational evaluation, and that
+    // is the intended reading: 0.15 * 1e12 in exact rational over the double
+    // 0.15 is 149999999999, whereas round-to-nearest recovers the 150000000000
+    // the operator meant when they typed 0.15. Truncation afterwards stays --
+    // it only ever narrows the cap, which is the conservative direction.
+    constexpr double kMaxSafe = 9.0e18;
 
-    const long double cap_ld = static_cast<long double>(max_take_units)
-                             * static_cast<long double>(base_mojos_per_unit);
+    const double cap_ld = static_cast<double>(max_take_units)
+                        * static_cast<double>(base_mojos_per_unit);
     if (cap_ld > kMaxSafe) return 0;
 
     const Mojo cap = static_cast<Mojo>(cap_ld);  // truncates down -- conservative

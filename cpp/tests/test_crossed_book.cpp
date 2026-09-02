@@ -105,6 +105,45 @@ TEST(CrossedBook, CapIsPairDenominatedNotAlwaysXch)
     EXPECT_EQ(cap_mojos_for(kMaxTake, kCatDenom), kCatCap);
 }
 
+TEST(CrossedBook, CapIsTheSameNumberOnEveryAbi)
+{
+    // [2026-09-01] cap_mojos_for used to compute this product in
+    // `long double`, which is 53-bit on MSVC and 64-bit x87 on GCC/x86-64,
+    // and then TRUNCATE it. So the cap VALUE was ABI-divergent even though
+    // the narrowing was well-defined -- in the very file whose comment is
+    // cited elsewhere as the exemplar of getting ABI divergence right.
+    //
+    // Every case below is a non-dyadic unit count, which is what makes the
+    // two precisions land on different integers. Exact products, and what
+    // each ABI produced BEFORE the fix:
+    //
+    //   0.15 * 1e12 = 149999999999.999994...   MSVC 150000000000 / GCC 149999999999
+    //   0.03 * 1e12 =  29999999999.999999...   MSVC  30000000000 / GCC  29999999999
+    //   0.3  * 1e12 = 299999999999.999989...   MSVC 300000000000 / GCC 299999999999
+    //
+    // THIS TEST WOULD HAVE BEEN RED ON CI AND GREEN LOCALLY, which is the
+    // exact failure shape the whole exercise exists to close: it is not
+    // reproducible on the developer machine, so it has to be argued from the
+    // type rather than observed. In `double` both toolchains are IEEE
+    // binary64 under SSE2 (FLT_EVAL_METHOD 0 on x86-64, no x87 excess
+    // precision), so these are now identical by construction.
+    //
+    // Latent rather than live: no current config value is non-dyadic
+    // (5.0, 0.25, 50, 2.0 all agreed on both ABIs), so nothing in production
+    // moved. The point is that the next operator to type 0.15 does not
+    // reopen this.
+    EXPECT_EQ(cap_mojos_for(0.15, kXchDenom), 150'000'000'000LL);
+    EXPECT_EQ(cap_mojos_for(0.03, kXchDenom), 30'000'000'000LL);
+    EXPECT_EQ(cap_mojos_for(0.3, kXchDenom), 300'000'000'000LL);
+
+    // The dyadic config values in use today, pinned so the change is visibly
+    // a no-op for them.
+    EXPECT_EQ(cap_mojos_for(5.0, kXchDenom), 5'000'000'000'000LL);
+    EXPECT_EQ(cap_mojos_for(0.25, kXchDenom), 250'000'000'000LL);
+    EXPECT_EQ(cap_mojos_for(2.0, kXchDenom), 2'000'000'000'000LL);
+    EXPECT_EQ(cap_mojos_for(50.0, kXchDenom), 50'000'000'000'000LL);
+}
+
 TEST(CrossedBook, UnusableCapMeansTakeNothingNotTakeAnything)
 {
     // An unrepresentable cap is an UNBOUNDED cap, and unbounded is the bug.

@@ -876,16 +876,22 @@ TEST(TakeRetryCost, CostIsQuoteDenominatedNotBase)
     // XCH/DBX: base_mojos_per_unit 1e12 (XCH), quote_mojos_per_unit 1000
     // (DBX is a CAT). Lifting an ask spends QUOTE.
     //
-    // The exact rational value is 485908. The multiplication runs in
-    // long double, which is 64-bit on MSVC and 80-bit on x86 GCC -- neither
-    // holds the 68-bit intermediate exactly -- so this is asserted as a
-    // one-mojo band rather than an equality. A recent bug in this area (a
-    // clamp that rounded to 2^64) passed MSVC and failed GCC in CI; pretending
-    // the arithmetic is exact is how that happens again.
+    // The exact rational value is 485908, and 5e12 * 97181600000000 * 1000
+    // divides 1e24 EXACTLY -- there is no remainder to round.
+    //
+    // [2026-09-01] This used to be asserted as a one-mojo band, because the
+    // multiplication ran in long double (64-bit on MSVC, 80-bit x87 on GCC)
+    // and neither format holds the intermediate exactly. take_sizing.hpp now
+    // does this in exact integer arithmetic, so the band is not merely
+    // unnecessary, it is a hole: it would silently accept a re-introduced
+    // off-by-one. Asserted as an equality.
+    //
+    // Both ABIs happened to agree on 485908 here even in long double, which
+    // is why this test was never red in CI -- the band was hiding nothing
+    // today, but it was standing ready to hide the next one.
     const Mojo cost = ask_take_cost(kStormSize, kStormAsk,
                                     kXchDenom, kCatDenom, /*fee=*/0);
-    EXPECT_GE(cost, kStormCost);
-    EXPECT_LE(cost, kStormCost + 1);
+    EXPECT_EQ(cost, kStormCost);
 
     // THE MUTATION. `cost = take_size` -- the base size -- is one token at the
     // call site. Against the same wallet it declines by a factor of ~15

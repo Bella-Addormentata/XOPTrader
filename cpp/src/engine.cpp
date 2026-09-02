@@ -84,6 +84,32 @@ namespace asio = boost::asio;
 
 namespace {
 
+// [2026-09-01] Saturating accumulation for Step 8's exposure projection.
+//
+// The tier-cost and pending-spend loops sum values that can each saturate at
+// Mojo max -- execution::quote_cost_for_ask returns exactly that on a product
+// too large to represent, as the long double version it replaced also did.
+// Two saturated summands overflow a signed int64, which is UNDEFINED
+// BEHAVIOUR, not a wrap: the compiler is entitled to assume it cannot happen
+// and optimise on that basis, and the number it corrupts feeds
+// exposure_breaches_reserve() and therefore can_bid/can_ask -- a quoting kill
+// switch.
+//
+// Unreachable today: these loops iterate only over OUR OWN offers and
+// candidate tiers, whose sizes are bounded by config (max_offer_size_units
+// 5.0). It predates this change; the old lambda saturated identically. It is
+// hardened rather than left because a saturated value DECLINES safely while
+// an overflowed one is arbitrary, and because clamping is provably identical
+// to `+` on every input that does not overflow -- so nothing reachable moves.
+//
+// Same discipline as take_retry.hpp's ask_take_cost (:383-386).
+[[nodiscard]] Mojo saturating_add_mojo(Mojo acc, Mojo add) noexcept
+{
+    if (add <= 0) return acc;
+    const Mojo headroom = std::numeric_limits<Mojo>::max() - acc;
+    return (add > headroom) ? std::numeric_limits<Mojo>::max() : acc + add;
+}
+
 int score_offer_competitiveness(Side side,
                                 Mojo price,
                                 Mojo best_bid,
@@ -8519,20 +8545,44 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                         if (is_ask) {
                             costs.push_back(tq.size);
                         } else {
-                            // Conservative ceil: never under-count a cost.
-                            const double q = quote_mojos_for(
-                                static_cast<double>(tq.size),
-                                static_cast<double>(tq.price),
-                                static_cast<double>(
-                                    pair_cfg->base_mojos_per_unit),
-                                static_cast<double>(
-                                    pair_cfg->quote_mojos_per_unit));
-                            costs.push_back(
-                                (std::isfinite(q) && q >= 0.0
-                                 && q < static_cast<double>(
-                                        std::numeric_limits<Mojo>::max()))
-                                    ? static_cast<Mojo>(std::ceil(q))
-                                    : std::numeric_limits<Mojo>::max());
+                            // [2026-09-01] The FIFTH copy of this conversion,
+                            // and the one that made Step 8 compute the same
+                            // tier's quote cost two different ways within a
+                            // single step: exactly at :10907 for the exposure
+                            // projection, and in double here for the wallet
+                            // budget filter that ERASES tiers from
+                            // pcs.ladder. Two answers for one number.
+                            //
+                            // The double form was the same defect shape that
+                            // produced the GCC 1501, minus the platform
+                            // dependency: quote_mojos_for(1e11, 1e11, 1e12,
+                            // 1000) evaluates to 10.000000000000002, so
+                            // std::ceil returned 11 where the exact cost is
+                            // 10. On a CAT-base geometry it errs in BOTH
+                            // directions, including under-counting a tier's
+                            // cost against the budget so a tier that does not
+                            // fit is kept -- fail-open.
+                            //
+                            // Replacing it does NOT move live behaviour, and
+                            // that was measured rather than assumed: over
+                            // 20,000 samples at the only enabled pair's
+                            // geometry (XCH/DBX, base 1e12 / quote 1e3) and
+                            // our own configured tier sizes (1.0-5.0 XCH),
+                            // the double path and the exact path agree on
+                            // every case. The divergence lives off the live
+                            // band; the duplicated formula was the defect.
+                            //
+                            // quote_cost_for_ask is named for the taker path,
+                            // but its arithmetic is "quote cost of a base
+                            // size at a price" -- and OUR OWN bid tier's
+                            // `size` is already base mojos, unlike an
+                            // ingested bid's. Saturation is handled inside
+                            // it, so the isfinite/range branch this replaces
+                            // is no longer needed.
+                            costs.push_back(execution::quote_cost_for_ask(
+                                tq.size, tq.price,
+                                pair_cfg->base_mojos_per_unit,
+                                pair_cfg->quote_mojos_per_unit));
                         }
                     }
                     const std::size_t keep = tiers_within_budget(
@@ -9526,27 +9576,25 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                         int staleness_rank{2};
                         Mojo price{0};
                     };
-                    auto ceil_to_mojo = [](long double value) -> Mojo {
-                        if (!std::isfinite(static_cast<double>(value)) || value <= 0.0L) {
-                            return 0;
-                        }
-                        const long double cap = static_cast<long double>(
-                            std::numeric_limits<Mojo>::max());
-                        if (value >= cap) {
-                            return std::numeric_limits<Mojo>::max();
-                        }
-                        return static_cast<Mojo>(std::ceil(value));
-                    };
+                    // [2026-09-01] This was a verbatim third copy of
+                    // take_sizing.hpp's old long double arithmetic -- a local
+                    // ceil_to_mojo lambda plus this one -- carrying the same
+                    // MSVC/GCC divergence (see the banner in take_sizing.hpp)
+                    // with no test able to reach it. It is Step 8's
+                    // auto-rebalance proactive-cancel decision, so the value
+                    // chooses which of our own live offers get cancelled.
+                    // Replaced with the shared exact-integer implementation.
+                    //
+                    // quote_cost_for_ask is named for the taker path, but the
+                    // arithmetic it performs is exactly "quote cost of a base
+                    // size at a price", which is what this needs: unlike an
+                    // ingested bid, OUR OWN pending bid's `size` is already
+                    // base mojos.
                     auto quote_cost_for_base_size = [&](Mojo base_size, Mojo price) -> Mojo {
-                        const long double base_mpu = static_cast<long double>(
-                            gate_pc->base_mojos_per_unit > 0 ? gate_pc->base_mojos_per_unit : 1);
-                        const long double quote_mpu = static_cast<long double>(
-                            gate_pc->quote_mojos_per_unit > 0 ? gate_pc->quote_mojos_per_unit : 1);
-                        const long double price_scale = static_cast<long double>(kMojosPerXch);
-                        return ceil_to_mojo(
-                            static_cast<long double>(base_size)
-                            * static_cast<long double>(price)
-                            * quote_mpu / (base_mpu * price_scale));
+                        return execution::quote_cost_for_ask(
+                            base_size, price,
+                            gate_pc->base_mojos_per_unit,
+                            gate_pc->quote_mojos_per_unit);
                     };
 
                     std::unordered_map<std::string, execution::TierClassification> tc_by_id;
@@ -9584,14 +9632,16 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                         if (po.side == Side::Ask) {
                             const Mojo spend = po.size;
                             if (spend > 0) {
-                                pair_base_pending_spend += spend;
+                                pair_base_pending_spend = saturating_add_mojo(
+                                    pair_base_pending_spend, spend);
                                 ask_candidates.push_back(
                                     {po.offer_id, spend, po.tier, staleness_rank, class_price});
                             }
                         } else {
                             const Mojo spend = quote_cost_for_base_size(po.size, po.price);
                             if (spend > 0) {
-                                pair_quote_pending_spend += spend;
+                                pair_quote_pending_spend = saturating_add_mojo(
+                                    pair_quote_pending_spend, spend);
                                 bid_candidates.push_back(
                                     {po.offer_id, spend, po.tier, staleness_rank, class_price});
                             }
@@ -10881,36 +10931,54 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         // pending offers plus candidate new tiers and suppress any side that
         // would breach reserve if all accepted.
         {
-            auto ceil_to_mojo = [](long double value) -> Mojo {
-                if (!std::isfinite(static_cast<double>(value)) || value <= 0.0L) {
-                    return 0;
-                }
-                const long double cap = static_cast<long double>(
-                    std::numeric_limits<Mojo>::max());
-                if (value >= cap) {
-                    return std::numeric_limits<Mojo>::max();
-                }
-                return static_cast<Mojo>(std::ceil(value));
-            };
+            // [2026-09-01] The fourth copy of the same long double formula,
+            // and the most dangerous of them: this one feeds
+            // exposure_breaches_reserve() and therefore can_bid/can_ask --
+            // a quoting kill switch driven by platform-dependent arithmetic,
+            // on every enabled pair. No test reaches it. Replaced with the
+            // shared exact-integer implementation; see the banner in
+            // take_sizing.hpp.
+            //
+            // BE ACCURATE ABOUT THE MOTIVE. An earlier draft of this comment
+            // said this site ran "at exactly the magnitudes where the float
+            // version diverged most (~0.24% on the live pair)". That is
+            // false, and it would send a future auditor of this kill switch
+            // hunting for corrupted historical suppression decisions that do
+            // not exist. This site computes the ASK-shaped conversion
+            // (base_size * price * quote_mpu / (base_mpu * kMojosPerXch));
+            // the ~0.24-0.33% figure belongs to the BID-shaped inverse, a
+            // formula this site never calls. Measured at this site's own
+            // geometry -- XCH/DBX, our own pending offer sizes -- the float
+            // version diverged on 0.000% of 20,000 samples, on BOTH ABIs.
+            //
+            // The real reason to change it is sufficient without the number:
+            // the ask path is fragile precisely on exact-integer results,
+            // which is the 1500/750 case CI was red on, and keeping a fourth
+            // private copy of the formula IS the defect.
+            //
+            // As above: our own pending offer's `size` is already base mojos,
+            // so quote_cost_for_ask is the right arithmetic despite the
+            // taker-flavoured name.
             auto quote_cost_for_base_size = [&](Mojo base_size, Mojo price) -> Mojo {
-                const long double base_mpu = static_cast<long double>(
-                    pair_cfg->base_mojos_per_unit > 0 ? pair_cfg->base_mojos_per_unit : 1);
-                const long double quote_mpu = static_cast<long double>(
-                    pair_cfg->quote_mojos_per_unit > 0 ? pair_cfg->quote_mojos_per_unit : 1);
-                const long double price_scale = static_cast<long double>(kMojosPerXch);
-                return ceil_to_mojo(
-                    static_cast<long double>(base_size)
-                    * static_cast<long double>(price)
-                    * quote_mpu / (base_mpu * price_scale));
+                return execution::quote_cost_for_ask(
+                    base_size, price,
+                    pair_cfg->base_mojos_per_unit,
+                    pair_cfg->quote_mojos_per_unit);
             };
 
             Mojo pending_plus_new_ask = pair_base_pending_spend;
             Mojo pending_plus_new_bid = pair_quote_pending_spend;
             for (const auto& tq : fee_filtered_tiers) {
                 if (tq.side == Side::Ask) {
-                    pending_plus_new_ask += tq.size;
+                    pending_plus_new_ask =
+                        saturating_add_mojo(pending_plus_new_ask, tq.size);
                 } else {
-                    pending_plus_new_bid += quote_cost_for_base_size(tq.size, tq.price);
+                    // Saturating: quote_cost_for_base_size can return Mojo max,
+                    // and two such summands would overflow signed int64 (UB) in
+                    // a value that drives can_bid/can_ask.
+                    pending_plus_new_bid = saturating_add_mojo(
+                        pending_plus_new_bid,
+                        quote_cost_for_base_size(tq.size, tq.price));
                 }
             }
 
