@@ -29,8 +29,10 @@ public result.
 
 from __future__ import annotations
 
+import math
 import hashlib
 import logging
+import time
 from datetime import datetime
 from typing import Any, Optional
 
@@ -472,6 +474,105 @@ def _default_market_reader() -> dict:
     return {"prices": prices, "trading_paused": bool(flags.get("trading_paused"))}
 
 
+from gui.services.permuto.live import MARKETS as _MARKETS_FOR_BUDGET
+
+#: Threads holding live orders that outlived their advisory wait. Kept
+#: referenced ON PURPOSE: destroying a running QThread aborts the
+#: process, and terminating one mid-order loses the acknowledgement.
+#: They finish on their own or die with the process.
+_ORPHANED_LIVE_THREADS: list = []
+
+#: Per-request ceiling for the operator-close worker. Below the venue
+#: default so no single call can outlive the join budget on its own.
+CLOSE_REQUEST_TIMEOUT_S = 8.0
+
+#: A cold ensure_session() is two calls: challenge, then auth.
+CLOSE_SESSION_CALLS = 2
+
+#: [review] And every authenticated call can expand to FOUR on the
+#: supported 401 path -- the request, the challenge, the re-auth, and
+#: the retry. Budgeting one call per request, as the first version of
+#: this did, understates the worst case by roughly 2.4x and leaves
+#: terminate() reachable with an order retry in flight.
+CLOSE_CALLS_PER_REQUEST = 4
+
+#: Requests send mode makes beyond the session BEFORE the orders: the
+#: cancel_all() that clears the resting book, and the fresh position
+#: read that follows it.
+#:
+#: [review] The cancel used to be missing from this count -- it was
+#: added to send_close() in the same batch that fixed the close
+#: undoing itself, and the budget derived from these terms was not
+#: updated with it, leaving the ceiling four retry-path calls short.
+CLOSE_FIXED_REQUESTS = 2
+
+#: ...plus one order per market.
+CLOSE_MAX_LEGS = len(_MARKETS_FOR_BUDGET)
+
+#: How long shutdown waits for that worker before giving up on a tidy
+#: exit. DERIVED, not chosen, so it tracks the retry path -- but
+#: ADVISORY, not a guarantee: urlopen's timeout bounds each socket
+#: operation rather than the whole request, so a trickling response can
+#: outlast it. Nothing unsafe hangs off the number being right; passing
+#: it parks the thread rather than killing it.
+CLOSE_JOIN_MS = int(
+    (CLOSE_SESSION_CALLS
+     + CLOSE_CALLS_PER_REQUEST * (CLOSE_FIXED_REQUESTS + CLOSE_MAX_LEGS))
+    * CLOSE_REQUEST_TIMEOUT_S * 1000)
+
+
+def _default_venue_snapshot() -> tuple:
+    """``(prices, lot_sizes)`` from ONE read of the public routes.
+
+    [review] Both are display/quantisation inputs derived from the same
+    two documents, and fetching them separately doubled the public I/O on
+    the path to an emergency close -- serially, and ahead of the account
+    read that actually matters. One snapshot, both values.
+
+    Never raises for a partial answer: a missing price only costs a
+    notional in the confirmation, and a missing lot falls back to the
+    published grid.
+    """
+    from gui.services.permuto.live import _default_venue_state
+
+    state = _default_venue_state()
+    prices = state.get("oracles")
+    if not isinstance(prices, dict):
+        prices = {}
+    return prices, _lot_sizes_from(state)
+
+
+def _lot_sizes_from(state: dict) -> dict:
+    """``{market: lot_size}`` from the public /info/meta specs.
+
+    [review] The close planner quantises to whole lots, but nothing was
+    passing it any, so every operator close fell back to the hardcoded 1.0
+    -- and a market whose lot is not 1 then produces a size the venue
+    rejects. The quantisation was tested and simply never wired up.
+
+    Reuses live._default_venue_state() rather than re-parsing /info/meta
+    here: that function already handles the symbol/base_asset aliasing and
+    the malformed-entry cases, and duplicating it is how the two copies
+    drift. Unauthenticated, like the price read beside it.
+    """
+    specs = ((state.get("flags") or {}).get("specs") or {})
+    lots = {}
+    for market, spec in specs.items():
+        if not isinstance(spec, dict):
+            continue
+        try:
+            lot = float(spec.get("lot_size"))
+        except (TypeError, ValueError):
+            continue
+        # [review] `lot == lot` rejects NaN and lets +inf straight through
+        # -- and an infinite lot floors EVERY size to zero in plan_close,
+        # so a live account renders as nothing to close. Exactly the
+        # fail-open this module keeps producing; finiteness is the test.
+        if math.isfinite(lot) and lot > 0.0:
+            lots[market] = lot
+    return lots
+
+
 def _scrolled(inner: QWidget) -> QScrollArea:
     """Wrap a section so a narrow window scrolls it instead of clipping it."""
     area = QScrollArea()
@@ -507,6 +608,120 @@ class _MarketWorker(QObject):
             self.failed.emit(str(exc))
 
 
+class _CloseWorker(QObject):
+    """Read-and-plan, or send, an operator close. Off the GUI thread.
+
+    Two modes rather than one, because the operator must SEE the plan --
+    contracts and notional, per market -- before anything is sent. A
+    one-shot button that reports what it did afterwards is not a decision,
+    it is a surprise.
+
+    In send mode the worker receives the legs the operator approved, then
+    re-reads the fresh venue position and clamps each leg to it.
+
+    [review] The invariant is NO LARGER and NO DIFFERENT SIDE -- not "never
+    differs". Clamping can legitimately send LESS than was confirmed, or
+    skip a market entirely, when the position shrank, went flat or flipped
+    while the dialog was open. Stating it as "never differ" promised
+    something send_close() does not do, and on a safety contract the
+    wording is the contract.
+    """
+
+    planned = Signal(object)      # (legs, summary)
+    sent = Signal(object)         # result dict
+    failed = Signal(str)
+
+    def __init__(self, identity: Any, fraction: float, mode: str,
+                 tif: str = "ioc",
+                 approved_legs: Optional[list] = None) -> None:
+        super().__init__()
+        self._identity = identity
+        self._fraction = fraction
+        self._mode = mode
+        self._tif = tif
+        self._approved_legs: list = approved_legs or []
+
+    @Slot()
+    def run(self) -> None:
+        # [review] BEFORE the session, not after. The join budget is
+        # derived from CLOSE_MAX_LEGS, so exceeding it silently
+        # invalidates the arithmetic that keeps terminate() away from a
+        # live order -- and there is no reason to open a venue session
+        # for a close we have already decided to refuse.
+        if self._mode == "send" and len(self._approved_legs) > CLOSE_MAX_LEGS:
+            self.failed.emit(
+                "refusing %d legs: the shutdown budget covers %d, and "
+                "exceeding it risks a live order being killed mid-flight"
+                % (len(self._approved_legs), CLOSE_MAX_LEGS))
+            return
+        try:
+            from gui.services.permuto import close_out
+            from gui.services.permuto.client import PermutoClient
+
+            user_id = ""
+            try:
+                user_id = getattr(self._identity.info(), "user_id", "") or ""
+            except Exception:  # noqa: BLE001 - unregistered identity has none
+                pass
+            # [review] A BOUNDED timeout, because the join budget is
+            # finite and this worker sends LIVE ORDERS. At the 30s
+            # default a single request outlives _join()'s wait, so
+            # shutdown could terminate the thread after the venue had
+            # received an order and before the answer came back --
+            # leaving the operator with no record of whether their
+            # close went out. Paired with a close-specific join budget
+            # below that covers the whole worst-case sequence.
+            client = PermutoClient(self._identity, user_id=user_id,
+                                   timeout=CLOSE_REQUEST_TIMEOUT_S)
+            client.ensure_session(time.time())
+            now = time.time()
+
+            if self._mode == "plan":
+                # [review] ONE public snapshot, not two. Wiring lot
+                # sizes in added a second /info/oracle + /info/meta
+                # round trip, run serially AHEAD of the account read
+                # -- so an emergency close waited through two sets of
+                # request timeouts before it even learned the
+                # positions. Both display inputs come from the same
+                # document; read it once.
+                prices, lots = {}, {}
+                try:
+                    snapshot = _default_venue_snapshot()
+                except Exception:  # noqa: BLE001 - both are niceties
+                    pass
+                else:
+                    prices, lots = snapshot
+                positions = close_out.read_positions(client, now)
+                legs = (close_out.plan_close(positions, self._fraction, lots)
+                        if positions else [])
+                self.planned.emit((legs, close_out.describe(legs, prices)))
+                return
+
+            # send mode: use the operator-approved legs, clamped against a
+            # fresh read -- not a new plan computed from scratch.
+            result = close_out.send_close(
+                client, now, self._approved_legs, tif=self._tif)
+            # [review] LOG BEFORE EMITTING. The signal is the only way
+            # this reaches the operator, and the parked-thread path
+            # exists precisely for the case where the widget is gone by
+            # the time the answer arrives -- so without a log line the
+            # safety path preserves the THREAD and loses the very thing
+            # it was protecting. send_close() records the pre-send plan;
+            # this records what came back.
+            _log.warning(
+                "permuto: OPERATOR CLOSE RESULT -- ok=%s sent=%s unresolved=%s partial=%s note=%s",
+                result.get("ok"), result.get("sent"),
+                # [review] These are PART-FILLS, not refusals -- the
+                # field was mislabelled, so the audit record showed
+                # partial fills as refusals and refusals as nothing at
+                # all. Refusal detail lives in `note`.
+                result.get("unknown"), result.get("partial"),
+                result.get("note"))
+            self.sent.emit(result)
+        except Exception as exc:  # noqa: BLE001 - shown, never raised
+            self.failed.emit(str(exc))
+
+
 class PermutoWidget(QWidget):
     """Identity + registration surface for the Permuto perps venue."""
 
@@ -536,6 +751,11 @@ class PermutoWidget(QWidget):
         self._market_reader = market_reader or _default_market_reader
         self._markets_timer: Optional[QTimer] = None
         self._markets_thread: Optional[QThread] = None
+        self._close_thread: Optional[QThread] = None
+        self._close_worker: Optional[QObject] = None
+        self._close_fraction: float = 1.0
+        #: True while the quoting loop owns a venue session.
+        self._quoting_live: bool = False
         self._markets_worker: Optional[Any] = None
         # [2026-08-31] Target stays SMALL, cap goes wide, and the two are
         # deliberately no longer equal.
@@ -754,8 +974,289 @@ class PermutoWidget(QWidget):
         self._arm_note.setStyleSheet(f"color: {_C.WARNING_YELLOW};")
         layout.addWidget(self._arm_note)
 
+        # -- operator close ------------------------------------------------ #
+        #
+        # The quoting loop sheds inventory as a MAKER only, and risk.py
+        # deliberately reserves crossing the spread to close as an operator
+        # decision. Until this button there was no way to make that decision:
+        # the page offered Create/Restore/Register/Check/Recover/Discard/
+        # Start polling/Start quoting and nothing else. A doctrine that
+        # reserves a choice for a human, in software that gives the human no
+        # control, is not a safeguard -- it is a dead end.
+        close_frame = QFrame()
+        close_frame.setFrameShape(QFrame.HLine)
+        close_frame.setStyleSheet(f"color: {_C.BORDER};")
+        layout.addWidget(close_frame)
+
+        close_title = QLabel("Close position")
+        close_title.setStyleSheet(
+            f"color: {_C.TEXT_PRIMARY}; font-weight: bold;")
+        layout.addWidget(close_title)
+
+        close_blurb = QLabel(
+            "Buys back a short or sells down a long, crossing the spread. "
+            "Every leg is reduce-only, so this can only ever shrink a "
+            "position -- never open or flip one. You will see exactly what "
+            "it intends to send before anything is placed."
+        )
+        close_blurb.setWordWrap(True)
+        close_blurb.setStyleSheet(f"color: {_C.TEXT_SECONDARY};")
+        layout.addWidget(close_blurb)
+
+        close_row = QHBoxLayout()
+        self._close_btns = {}
+        for frac, label in ((0.25, "Close 25%"), (0.50, "Close 50%"),
+                            (1.00, "Close all")):
+            btn = QPushButton(label)
+            btn.clicked.connect(
+                lambda _checked=False, f=frac: self._on_close_clicked(f))
+            close_row.addWidget(btn)
+            self._close_btns[frac] = btn
+        close_row.addStretch(1)
+        layout.addLayout(close_row)
+
+        self._close_note = QLabel("")
+        self._close_note.setWordWrap(True)
+        self._close_note.setStyleSheet(f"color: {_C.TEXT_SECONDARY};")
+        layout.addWidget(self._close_note)
+
         layout.addStretch(1)
         return page
+
+    # -- operator close ---------------------------------------------------- #
+
+    def close_in_flight(self) -> bool:
+        """True while a close worker owns (or is about to own) a session.
+
+        [review] The guard was one-directional. It stopped a close starting
+        during live quoting, but not the INVERSE: starting the runner while
+        a close plan or send is already in flight opens the quoting
+        client's session anyway, and set_quoting_live(True) then merely
+        greys out buttons whose worker is already running. Both clients
+        would sit in alternating 401/reauth, which is the failure the guard
+        exists to prevent, arriving from the other side.
+        """
+        # [review] ...AND WHILE THE OPERATOR IS DECIDING. The plan
+        # thread finishes before the confirmation dialog is answered --
+        # QMessageBox.exec() runs a NESTED EVENT LOOP, so the worker
+        # completes and _close_thread goes None while the box is still
+        # on screen. The deferred startup timer could then take that as
+        # permission and open a quoting session, and pressing OK would
+        # start the send worker beside it: two clients renewing the same
+        # identity, which is exactly what this guard exists to stop.
+        return (getattr(self, "_close_thread", None) is not None
+                or getattr(self, "_close_confirming", False))
+
+    def set_quoting_live(self, live: bool) -> None:
+        """Told by MainWindow when the quoting loop owns a venue session.
+
+        [review] The close worker builds its OWN PermutoClient and calls
+        ensure_session(). PermutoClient documents that concurrent renewals
+        install different tokens which invalidate each other, so pressing
+        Close while the loop is running can put both into alternating
+        401/reauth -- at the exact moment the operator is trying to get
+        out of a position, which is the worst possible time for the
+        session to be contended.
+
+        Rather than race it, the control says why it is unavailable. Stop
+        quoting, close, then start again.
+        """
+        self._quoting_live = bool(live)
+        self._set_close_enabled(not self._quoting_live)
+        if self._quoting_live:
+            self._close_note.setText(
+                "Stop quoting first. The close needs its own venue session, "
+                "and two sessions for one identity invalidate each other's "
+                "tokens.")
+        elif self._close_note.text().startswith("Stop quoting first"):
+            self._close_note.setText("")
+
+    def _set_close_enabled(self, on: bool) -> None:
+        if on and getattr(self, "_quoting_live", False):
+            on = False          # the guard above always wins
+        for btn in getattr(self, "_close_btns", {}).values():
+            btn.setEnabled(on)
+
+    def _on_close_clicked(self, fraction: float) -> None:
+        """Phase one: read the venue and show the plan. Sends nothing."""
+        if self._close_thread is not None:
+            return
+        self._set_close_enabled(False)
+        self._close_note.setText("Reading positions from the venue...")
+        self._start_close_worker(fraction, "plan")
+
+    def _start_close_worker(self, fraction: float, mode: str,
+                            approved_legs: Optional[list] = None) -> None:
+        thread = QThread(self)
+        worker = _CloseWorker(self._identity_factory(), fraction, mode,
+                              approved_legs=approved_legs)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.planned.connect(self._on_close_planned)
+        worker.sent.connect(self._on_close_sent)
+        worker.failed.connect(self._on_close_failed)
+        for sig in (worker.planned, worker.sent, worker.failed):
+            sig.connect(thread.quit)
+            # [review] The worker has no parent -- moveToThread removes it
+            # from this page's children -- so clearing _close_worker is not
+            # Qt cleanup, it just drops our reference and leaks the object.
+            # Same wiring the registration and market workers already use,
+            # and it matters more here because a send worker can supersede
+            # a plan worker before its thread has finished.
+            sig.connect(worker.deleteLater)
+        thread.finished.connect(self._on_close_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+        self._close_thread = thread
+        self._close_worker = worker
+        self._close_fraction = fraction
+        thread.start()
+
+    def _on_close_thread_finished(self) -> None:
+        """Clear state for the thread that FINISHED, not whatever is current.
+
+        [review] A fast confirmation starts the send thread before the plan
+        thread's queued `finished` has been delivered. The old body then
+        cleared and deleted the RUNNING send thread -- losing
+        close_in_flight() protection, so quoting could start beside a live
+        close, and risking Qt's fatal "QThread: Destroyed while thread is
+        still running" on the very control an operator reaches for in an
+        emergency.
+        """
+        done = self.sender()
+        if done is not None and done is not self._close_thread:
+            # A superseded thread finishing late. It owns nothing now, and
+            # its own finished->deleteLater has already been scheduled.
+            return
+        # deleteLater is wired on the thread's own finished signal above,
+        # so this only drops our references -- deleting here as well would
+        # be a second scheduled deletion of the same object.
+        self._close_thread = None
+        self._close_worker = None
+
+    @Slot(object)
+    def _on_close_planned(self, payload: Any) -> None:
+        legs, summary = payload
+        self._set_close_enabled(True)
+        if not legs:
+            self._close_note.setText(summary)
+            # [review] An empty plan does NOT mean a flat account.
+            # plan_close() also returns nothing when every position
+            # rounds below one lot, and the summary says so explicitly
+            # -- while this line asserted the opposite into the
+            # permanent record. Log what was actually shown.
+            self._log_activity("Close: %s" % summary.replace(chr(10), " "))
+            return
+        # Reserve the session across the DECISION, not merely across the
+        # worker -- see close_in_flight(). Cleared on every exit from
+        # here, including the exception path, or the control locks
+        # itself out permanently.
+        self._close_confirming = True
+        try:
+            confirmed = self._confirm_close(summary)
+        finally:
+            self._close_confirming = False
+        if not confirmed:
+            self._close_note.setText("Cancelled -- nothing was sent.")
+            self._log_activity("Close: cancelled by operator.")
+            return
+        # [review] And re-check, because the reservation only stops a
+        # session being opened WHILE we hold it -- one that was already
+        # live when the dialog opened is still live now.
+        if getattr(self, "_quoting_live", False):
+            self._close_note.setText(
+                "Quoting started while you were deciding -- nothing "
+                "was sent. Stop quoting and try again.")
+            self._log_activity("Close: refused -- quoting went live "
+                               "during confirmation.")
+            return
+        self._set_close_enabled(False)
+        self._close_note.setText("Sending...")
+        self._log_activity("Close: operator confirmed %d leg(s)."
+                           % len(legs))
+        self._start_close_worker(self._close_fraction, "send",
+                                 approved_legs=legs)
+
+    def _confirm_close(self, summary: str) -> bool:
+        """The confirmation dialog, split out so the reservation above
+        wraps it and a test can drive it without a live event loop."""
+        box = QMessageBox(self)
+        box.setWindowTitle("Confirm close")
+        box.setIcon(QMessageBox.Warning)
+        box.setText("Send these reduce-only orders to Permuto?")
+        box.setInformativeText(
+            "%s\n\nThey cross the spread (IOC), so they are intended to "
+            "fill immediately at whatever the book offers." % summary)
+        box.setStandardButtons(QMessageBox.Cancel | QMessageBox.Ok)
+        box.setDefaultButton(QMessageBox.Cancel)
+        return box.exec() == QMessageBox.Ok
+
+    @Slot(object)
+    def _on_close_sent(self, result: Any) -> None:
+        self._set_close_enabled(True)
+        if not result.get("ok"):
+            note = result.get("note", "")
+            sent = result.get("sent", 0)
+            # [review] A partial failure still moved the position. Reporting
+            # only "Failed: ..." let an operator believe nothing happened
+            # while some legs had already filled -- so say what went out,
+            # and repeat the no-retry warning, exactly as the success path
+            # does.
+            # [review] UNRESOLVED IS NOT FAILED, and the widget was the
+            # half of that fix I left undone. send_close() separates a
+            # refusal (the position is untouched) from an answer that
+            # never arrived (the order MAY HAVE EXECUTED) -- and then
+            # this rendered both as "Failed", which reads as "nothing
+            # happened" and invites the second press that doubles the
+            # close. The whole point of the tri-state is lost if the
+            # screen collapses it again.
+            unresolved = result.get("unknown") or []
+            if unresolved:
+                # [review] BOTH COUNTS. Dropping `sent` here is the
+                # very defect fixed earlier in this PR for the success
+                # path -- and I rebuilt it next door while adding this
+                # branch. On a mixed outcome the operator was told how
+                # many legs were unverified and never that one had
+                # definitely gone out, which is half the state they
+                # need to decide what to do.
+                self._close_note.setText(
+                    "UNRESOLVED: %d leg(s) sent and acknowledged, "
+                    "%d got no verdict and MAY HAVE EXECUTED -- %s. "
+                    "Check the position on the venue before closing "
+                    "again; this button does not retry."
+                    % (sent, len(unresolved), note))
+                self._log_activity(
+                    "Close UNRESOLVED (%d sent, %d unverified): %s"
+                    % (sent, len(unresolved), note))
+                return
+            if sent:
+                self._close_note.setText(
+                    "Partly sent: %d leg(s) went out before this failed -- "
+                    "%s. Check the position on the venue; this button does "
+                    "not retry." % (sent, note))
+            else:
+                self._close_note.setText("Failed: %s" % note)
+            self._log_activity("Close FAILED (%d sent): %s" % (sent, note))
+            return
+        sent = result.get("sent", 0)
+        # [review] The count is never optional. `note` is non-empty
+        # whenever any leg was SKIPPED, and `or` then replaced the count
+        # entirely -- so a partial success displayed "skipped X(already
+        # flat)" with no indication that three other legs had gone out.
+        # The operator needs both halves to know what state they are in.
+        note = ("%d leg(s) sent" % sent)
+        detail = result.get("note")
+        if detail:
+            note = "%s -- %s" % (note, detail)
+        self._close_note.setText(
+            "%s. Check the position on the venue -- a reduce-only IOC can "
+            "part-fill, and this button does not retry." % note)
+        self._log_activity("Close: %s" % note)
+
+    @Slot(str)
+    def _on_close_failed(self, message: str) -> None:
+        self._set_close_enabled(True)
+        self._close_note.setText("Failed: %s" % message)
+        self._log_activity("Close FAILED: %s" % message)
 
     def _build_activity_page(self) -> QWidget:
         page = QWidget()
@@ -1064,8 +1565,20 @@ class PermutoWidget(QWidget):
         self._markets_thread = None
         self._markets_worker = None
 
+        # [review] A LONGER budget for this one. Terminating a worker
+        # mid-flight is survivable for a market poll and is not for a
+        # live order: the request may already have reached the venue.
+        # CLOSE_JOIN_MS covers the worst-case sequence at the bounded
+        # per-request timeout, so terminate() stays a real last resort
+        # rather than the ordinary outcome of a slow venue.
+        self._join(self._close_thread, "operator close",
+                   wait_ms=CLOSE_JOIN_MS, live_orders=True)
+        self._close_thread = None
+        self._close_worker = None
+
     @staticmethod
-    def _join(thread: Optional[QThread], what: str) -> None:
+    def _join(thread: Optional[QThread], what: str,
+              wait_ms: int = 10000, live_orders: bool = False) -> None:
         """Stop one worker, terminating it if it will not go quietly."""
         if thread is None:
             return
@@ -1077,8 +1590,50 @@ class PermutoWidget(QWidget):
         # this exists to prevent. Same terminate-and-wait fallback the other
         # page-owned workers use (settings.py, wallet_balances.py).
         thread.quit()
-        if not thread.wait(10000):
-            _log.warning("permuto: %s thread did not stop; terminating", what)
+        if not thread.wait(wait_ms):
+            # [review] There is no compensating action available here.
+            # PermutoLive.join() can cancel the book from the GUI thread
+            # before terminating, so its last resort still leaves a safe
+            # state; an order already on the wire cannot be un-sent. If
+            # this is ever reached for the close worker the operator has
+            # to be told to go and look at the venue themselves.
+            if live_orders:
+                # [review] DO NOT TERMINATE THIS ONE. The wait above is
+                # advisory, not a ceiling: urlopen(timeout=) bounds each
+                # socket operation, not the request, so a response that
+                # keeps trickling can outlast any budget derived from
+                # it. Since the bound cannot be guaranteed, the
+                # behaviour must not depend on it.
+                #
+                # terminate() is TerminateThread on Windows -- the frame
+                # dies without unwinding, mid-request, and whatever the
+                # venue does with that order is never recorded. Parking
+                # the thread instead keeps the QThread OBJECT alive, so
+                # Qt never hits the destroyed-while-running abort, and
+                # the worker gets to finish and log its result. It costs
+                # a leaked thread on a pathological shutdown, which is a
+                # cheaper thing to lose than the record of a live order.
+                _log.critical(
+                    "permuto: the %s thread has not stopped after %dms "
+                    "and is being left to finish rather than killed -- "
+                    "an order may be on the wire. CHECK THE POSITION ON "
+                    "THE VENUE.", what, wait_ms)
+                # [review] DETACH FIRST. The thread was built as
+                # QThread(self), so it is a QObject CHILD of the widget:
+                # the parent's destructor deletes its children whatever
+                # Python references exist, and the previous version of
+                # this -- keeping a reference and nothing else -- did not
+                # prevent the destroyed-while-running abort at all. Only
+                # breaking the parent link does; the Python reference
+                # then keeps it alive afterwards.
+                try:
+                    thread.setParent(None)
+                except Exception:  # noqa: BLE001 - a fake in tests
+                    pass
+                _ORPHANED_LIVE_THREADS.append(thread)
+                return
+            _log.warning("permuto: %s thread did not stop; terminating",
+                         what)
             thread.terminate()
             thread.wait(1000)
 
