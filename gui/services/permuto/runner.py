@@ -49,6 +49,7 @@ from .risk import (PORTFOLIO_MAX_EXPOSURE_FRACTION, MarginState,
                    RiskAction, assess, portfolio_cap_usd,
                    skewed_reference)
 from .band_guard import VENUE_BAND_PCT, BandGuard
+from .bbo import required_offset_pct as bbo_required_offset_pct
 from .cross_backoff import CrossBackoff, headroom_pct
 from .preflight import (latest_oracle, preflight_leg_price,
                         quantise_toward, rescaled_size)
@@ -231,9 +232,24 @@ class QuoteRunner:
         max_position_usd: float = 1_200.0,
         curfew_enabled: bool = True,
         ring_pct: float = 2.0,
+        # [DEPTH 2026-09-02] TRIED 0.05 AND REVERTED -- recorded so it is not
+        # retried. Cutting this does buy ring headroom (1.700% -> 1.900% at
+        # zero skew), but one tick is 0.14-0.28% of oracle on these markets,
+        # which is COARSER than the spread itself: at 0.05 the session and
+        # overnight placements both quantise to the same single tick and
+        # test_the_session_quotes_wider_than_the_overnight_window fails --
+        # correctly, because the 1.6x session widening stops existing. The
+        # 0.2% of headroom it buys does not close a ~1.5% gap anyway; skew is
+        # the term that matters. Width now comes from the ring-edge rule in
+        # _bbo_offset_pct instead, which is quantisation-proof.
         half_spread_pct: float = 0.25,
         quote_when_carried: bool = True,
         oracle_fetch: Any = None,
+        #: [BBO] Optional ``market -> bbo.Book | None``. When absent the
+        #: runner behaves exactly as before, learning the resting price from
+        #: refusals alone. When supplied, the book is CONSULTED instead of
+        #: guessed: see the note at the placement site for why that matters.
+        bbo_fetch: Any = None,
     ) -> None:
         self._client = client
         self._markets = list(markets)
@@ -308,6 +324,7 @@ class QuoteRunner:
         # happened with a fresh fetch. Re-reading here shrinks the exposure
         # to one request's flight time, measured rather than assumed.
         self._oracle_fetch = oracle_fetch
+        self._bbo_fetch = bbo_fetch
         #: Measured duration of the last pre-send fetch: the best estimate
         #: of how long the NEXT request will take.
         self._send_latency_s = 0.25
@@ -351,6 +368,79 @@ class QuoteRunner:
     # ------------------------------------------------------------------ #
     # Belief
     # ------------------------------------------------------------------ #
+    def _bbo_offset_pct(self, market: str, oracle: Any, tick_size: float,
+                        eff_half_spread: float, safe_backoff: float):
+        """``(status, extra_offset_pct)`` from the live book.
+
+        ``status`` is one of:
+
+        * ``"ok"``      -- a two-sided placement exists; the value is the
+                           EXTRA offset to add on top of ``eff_half_spread``.
+        * ``"shut"``    -- no tick-aligned price rests and earns on at least
+                           one side. Depth credit is ``min(bid, ask)``, so a
+                           market that cannot quote both sides earns nothing
+                           whatever we send: skip it rather than spend a
+                           rate-limit token on a refusal.
+        * ``"unknown"`` -- the book could not be read. Fall back to the
+                           learned backoff; a monitoring failure must never
+                           be the reason a quote stops going out.
+
+        A required offset beyond ``safe_backoff`` is ``"shut"`` as well: the
+        price that would rest is outside the ring, and a resting leg that
+        earns nothing is failure wearing success's clothes.
+        """
+        try:
+            oracle_f = float(oracle or 0.0)
+        except (TypeError, ValueError):
+            return "unknown", 0.0
+        if not (oracle_f > 0.0 and tick_size > 0.0):
+            return "unknown", 0.0
+        try:
+            book = self._bbo_fetch(market)
+        except Exception as exc:  # noqa: BLE001 - never fail the tick on this
+            _log.debug("permuto: %s BBO fetch raised: %s", market, exc)
+            return "unknown", 0.0
+        if book is None:
+            return "unknown", 0.0
+
+        needed = 0.0
+        for side in ("ask", "bid"):
+            off = bbo_required_offset_pct(
+                side, oracle_f, book,
+                ring_pct=self._ring_pct, tick_size=tick_size)
+            if off is None:
+                _log.info(
+                    "permuto: %s %s side has no placeable price -- best bid "
+                    "%s / best ask %s against a %.1f%% ring. Skipping: depth "
+                    "is min(bid, ask), so one side alone banks nothing.",
+                    market, side, book.best_bid, book.best_ask,
+                    self._ring_pct)
+                return "shut", 0.0
+            needed = max(needed, off)
+
+        extra = needed - eff_half_spread
+        if extra <= 0.0:
+            # The configured spread already clears the book -- so go WIDE
+            # rather than resting where we happen to be.
+            #
+            # [DEPTH 2026-09-02] depth_credit_usd counts a leg's full notional
+            # anywhere inside the ring and gives nothing extra for being tight,
+            # so a leg at the ring edge earns exactly what a leg at 0.05%
+            # earns. What differs is the fill rate, and a fill is not neutral:
+            # it flattens one side, and credit is min(bid, ask), so the market
+            # banks ZERO until the restore lands. Width is therefore free
+            # eligibility bought with fewer holes in the book -- and less of
+            # the inventory that consumed the ring headroom to begin with.
+            return "ok", max(safe_backoff, 0.0)
+        if extra > safe_backoff:
+            _log.info(
+                "permuto: %s needs +%.3f%% to clear the book but only "
+                "%.3f%% of ring headroom remains -- any resting price is "
+                "outside the credit ring. Skipping rather than banking zero.",
+                market, needed, eff_half_spread + safe_backoff)
+            return "shut", 0.0
+        return "ok", extra
+
     def _forget_book(self) -> None:
         self._resting = {m: RestingQuote() for m in self._markets}
 
@@ -1416,22 +1506,72 @@ class QuoteRunner:
             _tick = _effective_tick(spec.get("tick_size"))
             self._last_tick_frac[market] = (
                 _tick / max(float(oracle or 1e-12), 1e-12))
+            # [review] Capped against CURRENT headroom and the re-quote
+            # trigger, not applied raw. See _requote_safe_backoff: an offset
+            # learned under wider headroom is illegal after a fill raises
+            # skew, and one inside the ring but past the trigger is replaced
+            # on the next tick -- the churn the budget exists to stop.
+            _safe_backoff = _requote_safe_backoff(
+                self._ring_pct, eff_half_spread,
+                self._last_skew.get(market, 0.0),
+                self._last_tick_frac.get(market, 0.0))
+            _extra_offset = min(self._cross_backoff.offset_pct(market),
+                                _safe_backoff)
+            # [BBO 2026-09-02] Ask the book rather than guessing at it.
+            #
+            # cross_backoff.py states the venue "publishes no L2/orderbook/
+            # ticker route". It does -- GET /info/l2/{market} -- and the
+            # consequence of assuming otherwise was total: with bids parked
+            # at exactly +2.00% (the ring ceiling), the 0.25%-per-refusal
+            # controller saturated at its headroom and every ask was refused
+            # post-only, tick after tick, for the whole session. Zero
+            # depth-seconds banked on 2026-09-02 against a 300M gate.
+            #
+            # One observation answers what the controller could only
+            # approach, and -- more importantly -- distinguishes "retreat
+            # further" from "no placeable price exists", which a blind
+            # controller cannot do and so retries forever.
+            if self._bbo_fetch is not None:
+                _status, _observed = self._bbo_offset_pct(
+                    market, oracle, _tick, eff_half_spread, _safe_backoff)
+                if _status == "shut":
+                    # [review] SKIP ONLY WHEN THERE IS NOTHING ELSE TO DO.
+                    #
+                    # The first version of this returned unconditionally,
+                    # which deadlocked the account it was written to help.
+                    # A market that cannot earn depth can still need its
+                    # inventory worked off, and the reduce-only branch below
+                    # rests exactly one leg for that. Reducing a SHORT means
+                    # resting a BID -- the side the ring wall does not touch
+                    # -- so the leg that unpins us is placeable precisely
+                    # when the earning leg is not.
+                    #
+                    # Skipping both meant no fills, so inventory never fell,
+                    # so the skew never released the ring headroom, so the
+                    # ask stayed unreachable: a loop that could not exit
+                    # itself. Depth is min(bid, ask) and stays zero here
+                    # either way; the difference is whether we are getting
+                    # closer to earning again or standing still.
+                    if risk.action is not RiskAction.REDUCE_ONLY:
+                        results[market] = (
+                            "skip",
+                            "no tick-aligned price rests inside the %.1f%% "
+                            "ring on both sides, and no inventory to work "
+                            "off -- a leg here would be refused or earn "
+                            "nothing" % (self._ring_pct,))
+                        continue
+                    _log.info(
+                        "permuto: %s cannot earn depth (ring shut) but is "
+                        "REDUCE_ONLY -- resting the reducing leg anyway so "
+                        "inventory falls and the skew stops eating ring "
+                        "headroom.", market)
+                elif _status == "ok":
+                    # Never TIGHTER than refusals have already taught us.
+                    _extra_offset = max(_extra_offset, _observed)
             ladder = quote_ladder(
                 market, reference, depth_usd,
                 levels=1,
-                # [review] Capped against CURRENT headroom and the
-                # re-quote trigger, not applied raw. See
-                # _requote_safe_backoff: an offset learned under wider
-                # headroom is illegal after a fill raises skew, and one
-                # inside the ring but past the trigger is replaced on the
-                # next tick -- the churn the budget exists to stop.
-                first_offset_pct=(
-                    eff_half_spread
-                    + min(self._cross_backoff.offset_pct(market),
-                          _requote_safe_backoff(
-                              self._ring_pct, eff_half_spread,
-                              self._last_skew.get(market, 0.0),
-                              self._last_tick_frac.get(market, 0.0)))),
+                first_offset_pct=eff_half_spread + _extra_offset,
                 ring_pct=self._ring_pct,
                 tick_size=_tick,
                 lot_size=spec.get("lot_size", 1.0),

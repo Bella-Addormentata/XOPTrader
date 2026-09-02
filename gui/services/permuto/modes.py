@@ -93,8 +93,15 @@ _DEPTH = {
     Stage.PREOPEN: 0.5,
     # The oracle may not have printed yet -- see profile_for.
     Stage.SETTLING: 0.25,
-    # Off the table entirely: behave as an ordinary session.
-    Stage.UNSCHEDULED: 0.5,
+    # [DEPTH 2026-09-02] 1.0, not 0.5. This used to mean "no schedule, so
+    # behave like an ordinary session" -- a safe default when UNSCHEDULED was
+    # reached only past the end of the table. It is now also the stage the
+    # runner sits in whenever the curfew is DISABLED, because assess_curfew
+    # never runs and self._curfew stays None. Disabling the curfew to free the
+    # overnight book therefore halved the target depth as a side effect, which
+    # is the opposite of the intent. The freeze detector still governs: a
+    # frozen oracle in a live-session stage withdraws regardless.
+    Stage.UNSCHEDULED: 1.0,
 }
 
 

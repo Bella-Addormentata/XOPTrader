@@ -72,6 +72,20 @@ class VenueStateUnreadable(RuntimeError):
     """The venue's public state could not be read well enough to quote on."""
 
 
+def _fetch_bbo(market: str):
+    """Top of book for ``market`` from /info/l2, or None on any failure.
+
+    Public and unauthenticated, like the oracle read beside it. Returning
+    None rather than raising is deliberate: the runner treats an unreadable
+    book as "no opinion" and falls back to the learned backoff, so a hiccup
+    on this request degrades placement quality but never stops a quote.
+    """
+    from gui.services.permuto.auth import BASE_URL
+    from gui.services.permuto.bbo import fetch_book
+
+    return fetch_book(market, base_url=BASE_URL, timeout=REQUEST_TIMEOUT_S)
+
+
 def _fetch_oracle_prices() -> dict:
     """{symbol: price} from /info/oracle, or {} on any failure.
 
@@ -375,6 +389,11 @@ class PermutoLive(QObject):
             # sending, so leg prices are judged against the value the venue
             # will actually compare them to rather than one a tick older.
             oracle_fetch=_fetch_oracle_prices,
+            # [BBO 2026-09-02] Consult the real book before placing. Without
+            # this the runner learns the resting price only from refusals,
+            # which saturates against bids parked on the ring ceiling and
+            # banked zero depth-seconds for an entire session.
+            bbo_fetch=_fetch_bbo,
         )
         self._venue_state = venue_state or _default_venue_state
         self._thread: Optional[QThread] = None
