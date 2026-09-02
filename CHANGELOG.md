@@ -309,6 +309,58 @@ history the new diagnostics read.
 
 Exercised against a **copy** of the live database, never the original.
 
+### Permuto: the contest account was liquidated, and four PRs answering why
+
+The contest account reached **equity 0** on 2026-09-01 — realized PnL
+-1,218,420, total PnL floored at the full -500,000 starting allocation,
+depth frozen at 4,093.892 against a 300,000,000 eligibility gate. Three of
+41 market makers were in that state while median MM equity was still
+exactly 500,000, so this was not a venue-wide reset. `risk.assess()`
+returns FLATTEN on zero equity, so no configuration change can restart
+quoting without the account being re-funded.
+
+The last observable state before the log stopped was the venue refusing
+every batch: *"Carried-session stress margin: need 5,394,844 USDC to
+survive 8x index move (available 591,782)"* — the carried short needed
+~9x the cash on hand. The oracle then gapped +73% to +229% at the open.
+
+**#135 — a portfolio exposure budget.** `max_position_usd` was PER MARKET
+with nothing aggregating it, so three markets at the shipped 250,000
+authorised 750,000 of exposure on a 500,000 account — 1.5x equity before
+the venue's 8x carried multiplier, with every individual market perfectly
+inside its own limit. `portfolio_cap_usd()` reduces each market's cap by
+what the rest of the book already holds, denominated in equity because
+that is what the venue liquidates against. Risk-increasing legs are
+clamped to remaining headroom; reducing legs never are, or the book is
+trapped at the moment it is trying to get back inside. A market pinned
+one-sided — which earns exactly zero, since credit is `min(bid, ask)` —
+now announces itself once on entry and once on recovery, instead of
+hiding in a per-tick line that repeats all night while the tick still
+reports `quote`.
+
+**#133 — stage-aware quoting profiles.** A mode now carries a posture,
+not just a position cap: CLOSED quotes full size against the frozen
+overnight oracle (the cheapest depth of the week), SESSION quotes wide
+and small because the measured median 1-minute move is 20-24%, and RAMP
+and EXIT aim at **flat** rather than merely smaller — inventory carried
+into the close is a claim on the overnight window. Adds per-market
+stale-oracle withdrawal, so a neighbour that stops printing is no longer
+quoted against its own stale price while the aggregate detector stays
+happy.
+
+**#132 — an operator control that can actually close a position.** Three
+buttons (25/50/100%) behind a confirmation showing market, side,
+contracts and notional per leg. Every order `reduce_only` and IOC, sized
+against a fresh venue read, with the resting book cancelled first — an
+old non-reduce-only quote filling afterwards would otherwise undo the
+close. Reports refusals, partial fills and **unresolved** outcomes
+distinctly, because an order whose answer never arrived may have executed
+and must not read as "nothing happened".
+
+**#131 — anti-cross backoff.** The learned retreat is now capped against
+current headroom *and* the re-quote trigger, so a fully skewed leg is not
+born past its own trigger and replaced every tick.
+
 ## [0.10.12] — 2026-08-31 — the Permuto inventory curfew
 
 Stops us carrying inventory across a market close, which is the trade that
