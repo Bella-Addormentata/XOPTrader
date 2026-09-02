@@ -18,6 +18,7 @@
 #include <cmath>
 #include <limits>
 #include <numeric>
+#include <string>
 #include <vector>
 
 namespace {
@@ -1213,6 +1214,268 @@ TEST(WidthFloorCompetitivenessTest, DegenerateInputsNeverExempt) {
         price, 150.0, 150.0, centre, nan));
     EXPECT_FALSE(width_floor_exempts_competitiveness(
         price, nan, 150.0, centre, 150.0));
+}
+
+// ============================================================================
+// [SIDEQUALITY 2026-09-01] Per-side book quality and the bid cap.
+//
+// The live XCH/BYC book of 2026-09-01, in the pair's own orientation
+// (BYC per XCH), against the Step-7 fair-value centre:
+//
+//     model mid      1.41141912   (solved from CoinGecko XCH/USD and BYC par)
+//     best comp bid  1.50000000   honest side, 6.3% above the centre
+//     best comp ask  4.99950000   junk side, 3.5x the centre
+//     bbo midpoint   3.24975000   half honest, half junk
+//
+// bid_cap == bbo_ref therefore did not bind, and the anchor parked a bid at
+// best_comp_bid + tick against a fair value 6.3% below it -- an overpay on
+// every XCH bought, every cycle.
+// ============================================================================
+
+namespace {
+
+// Production uses 8000 bps (config.yaml), not the 500 default, and the gate
+// matters here: |1.50 - 1.41141912| / 1.41141912 = 628 bps, which the 500
+// default would reject outright and mask the behaviour under test.
+LiquidityConfig make_sidequality_config() {
+    auto cfg = make_anchor_config(3);
+    cfg.competitive_anchor_max_distance_bps = 8000.0;
+    return cfg;
+}
+
+constexpr Mojo kSqMid     = 1'411'419'120LL * 1000LL;  // 1.41141912
+constexpr Mojo kSqCompBid = 1'500'000'000'000LL;       // 1.50
+constexpr Mojo kSqCompAsk = 4'999'500'000'000LL;       // 4.9995
+
+std::vector<CompetingOffer> sidequality_offers() {
+    std::vector<CompetingOffer> offers;
+    offers.push_back(make_offer(Side::Bid, kSqCompBid, 1'000'000'000'000LL));
+    offers.push_back(make_offer(Side::Ask, kSqCompAsk, 1'000'000'000'000LL));
+    return offers;
+}
+
+}  // namespace
+
+TEST(BookSideQualityLadder, UnexaminedBookSelfCrossesAndLosesTheWholeLadder) {
+    // THE BUG, reproduced. With both sides unexamined (the flags' defaults,
+    // i.e. exactly the pre-change code path) bbo_ref is the poisoned 3.24975
+    // midpoint, so bid_cap does not bind and all three bids anchor at
+    // best_comp_bid + tick = 1.500141141912 -- above the ask tiers, which
+    // sit around the model mid of 1.41141912. The post-adjustment cross
+    // check then deletes EVERYTHING:
+    //
+    //   [Liquidity] XCH/BYC competitive anchor: anchored 3 bids
+    //       (comp_best=1500000000000) 0 asks bbo_ref=3249750000000
+    //       bid_cap=3249750000000
+    //   [Liquidity] XCH/BYC post-adjustment cross: max_bid=1500141141912
+    //       >= min_ask=1418476215600 -- dropped 6/6 tiers
+    //
+    // which is the 2026-08-30 production log line, verbatim in shape. The
+    // outcome is not "a slightly expensive bid" -- it is NO QUOTES AT ALL,
+    // on a pair whose fair value the engine had already solved correctly.
+    auto cfg = make_sidequality_config();
+    LiquidityEngine engine("XCH/BYC", cfg);
+
+    auto ladder = engine.compute_ladder(
+        kSqMid, 0.03, 0.5,
+        100'000'000'000'000LL, 100'000'000'000'000LL,
+        sidequality_offers(), cfg);
+
+    EXPECT_TRUE(ladder.empty())
+        << "the legacy path is expected to self-cross and drop every tier; "
+           "if this now survives, the healthy-book cap has been changed and "
+           "that decision needs its own review";
+}
+
+TEST(BookSideQualityLadder, DisqualifiedAskSideStopsTheOverpay) {
+    // The fix. Once the ask side is disqualified it may no longer help build
+    // bbo_ref, which falls back to the model mid; bid_cap then tightens to
+    // min(bbo_ref, mid) and no bid may be priced above fair value.
+    auto cfg = make_sidequality_config();
+    cfg.book_ask_side_anchor_ok = false;
+    LiquidityEngine engine("XCH/BYC", cfg);
+
+    auto ladder = engine.compute_ladder(
+        kSqMid, 0.03, 0.5,
+        100'000'000'000'000LL, 100'000'000'000'000LL,
+        sidequality_offers(), cfg);
+
+    ASSERT_FALSE(ladder.empty());
+    for (const auto& tq : ladder) {
+        if (tq.side != Side::Bid) continue;
+        EXPECT_LE(tq.price, kSqMid)
+            << "tier " << tq.tier_index << " bids " << tq.price
+            << " above the model mid " << kSqMid
+            << " -- this is the ~6.3% overpay the cap exists to stop";
+    }
+}
+
+TEST(BookSideQualityLadder, DisqualifiedAskSideLeavesTheAskLadderIntact) {
+    // Disqualifying a side must not empty the ladder. The ask tiers keep
+    // their raw prices around the model mid rather than being anchored to
+    // the junk 4.9995 stack, which is the whole point: quote correctly
+    // rather than not at all.
+    auto cfg = make_sidequality_config();
+    cfg.book_ask_side_anchor_ok = false;
+    LiquidityEngine engine("XCH/BYC", cfg);
+
+    auto ladder = engine.compute_ladder(
+        kSqMid, 0.03, 0.5,
+        100'000'000'000'000LL, 100'000'000'000'000LL,
+        sidequality_offers(), cfg);
+
+    const bool has_ask = std::any_of(
+        ladder.begin(), ladder.end(),
+        [](const TierQuote& tq) { return tq.side == Side::Ask; });
+    EXPECT_TRUE(has_ask) << "the ask side must still be quoted";
+
+    for (const auto& tq : ladder) {
+        if (tq.side != Side::Ask) continue;
+        EXPECT_LT(tq.price, kSqCompAsk)
+            << "no ask tier should be dragged out to the junk stack";
+    }
+}
+
+namespace {
+
+// ---------------------------------------------------------------------------
+// Healthy-book fixture.
+//
+// Deliberately NOT symmetric about the mid, and that asymmetry is the whole
+// point.  The first version of the guard below used comp_bid 1.99 / comp_ask
+// 2.01 against mid 2.00, where the BBO midpoint IS the model mid.  On that
+// book the expression under test -- bbo_ref falling back to mid_f, and
+// bid_cap tightening to min(bbo_ref, mid) -- is a no-op, so the flags cannot
+// move the ladder and the guard compared the new code against itself.
+//
+// Here the book leans hard to the buy side:
+//
+//     model mid       2.00
+//     best comp bid   2.02        ABOVE the mid
+//     best comp ask   2.10
+//     bbo midpoint    2.06        300 bps above the mid
+//     bid anchor      2.0202      comp_bid + 1 tick, BETWEEN the two
+//     stride           65 bps     0.013 per tier at this mid
+//
+// so the bid cap is what decides the bid ladder:
+//
+//   both flags true    bid_cap = bbo_ref = 2.06.  Bid tiers 0 and 1
+//                      (2.0202 and 2.0072) clear it and anchor above the mid.
+//   either flag false  bbo_ref falls back to 2.00 and bid_cap tightens to
+//                      min(2.00, 2.00) = 2.00.  Those two tiers fail the cap
+//                      and keep their raw prices; only tier 2 (1.9942) fits.
+//
+// HealthyBookFixtureIsSensitiveToTheFlags asserts that second bullet.  It has
+// to exist: the flags DEFAULT to true, so "explicitly true" and "default" are
+// the same config by construction and the equality assertion in the guard
+// underneath is worth nothing unless the fixture is one where the flags are
+// known to be load-bearing.
+// ---------------------------------------------------------------------------
+constexpr Mojo kHbMid     = 2'000'000'000'000LL;  // 2.00
+constexpr Mojo kHbCompBid = 2'020'000'000'000LL;  // 2.02
+constexpr Mojo kHbCompAsk = 2'100'000'000'000LL;  // 2.10
+
+std::vector<CompetingOffer> healthy_book_offers() {
+    std::vector<CompetingOffer> offers;
+    offers.push_back(make_offer(Side::Bid, kHbCompBid, 1'000'000'000'000LL));
+    offers.push_back(make_offer(Side::Ask, kHbCompAsk, 1'000'000'000'000LL));
+    return offers;
+}
+
+std::vector<TierQuote> healthy_book_ladder(const LiquidityConfig& cfg) {
+    LiquidityEngine engine("T/Q", cfg);
+    return engine.compute_ladder(
+        kHbMid, 0.03, 0.5, 10'000'000'000'000LL, 10'000'000'000'000LL,
+        healthy_book_offers(), cfg);
+}
+
+// Everything the flags are able to move: side, tier and price, in order.
+std::string ladder_shape(const std::vector<TierQuote>& ladder) {
+    std::string out;
+    for (const auto& tq : ladder) {
+        out += to_string(tq.side);
+        out += std::to_string(static_cast<int>(tq.tier_index));
+        out += '@';
+        out += std::to_string(tq.price);
+        out += ' ';
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST(BookSideQualityLadder, HealthyBookFixtureIsSensitiveToTheFlags) {
+    // The teeth behind HealthyTwoSidedBookIsUnaffectedByTheNewFlags.  On THIS
+    // fixture the flags must be observable, otherwise the "unaffected" guard
+    // is measuring nothing.  Flip either side and the bid cap drops from the
+    // 2.06 BBO midpoint to the 2.00 model mid, which unanchors the tiers that
+    // sit between them.
+    const auto cfg = make_sidequality_config();
+    const auto healthy = healthy_book_ladder(cfg);
+    ASSERT_FALSE(healthy.empty());
+
+    // The fixture only bites if the healthy path actually anchors bids above
+    // the model mid -- that is the region the tightened cap removes.
+    const bool anchored_above_mid = std::any_of(
+        healthy.begin(), healthy.end(), [](const TierQuote& tq) {
+            return tq.side == Side::Bid && tq.price > kHbMid;
+        });
+    ASSERT_TRUE(anchored_above_mid)
+        << "degenerate fixture: the healthy path put no bid above the model "
+           "mid, so tightening bid_cap to the mid cannot change anything. "
+        << ladder_shape(healthy);
+
+    auto bid_flipped = cfg;
+    bid_flipped.book_bid_side_anchor_ok = false;
+    auto ask_flipped = cfg;
+    ask_flipped.book_ask_side_anchor_ok = false;
+
+    EXPECT_NE(ladder_shape(healthy), ladder_shape(healthy_book_ladder(bid_flipped)))
+        << "disqualifying the bid side left the ladder untouched -- the "
+           "fixture is degenerate and the healthy-book guard is vacuous";
+    EXPECT_NE(ladder_shape(healthy), ladder_shape(healthy_book_ladder(ask_flipped)))
+        << "disqualifying the ask side left the ladder untouched -- the "
+           "fixture is degenerate and the healthy-book guard is vacuous";
+}
+
+TEST(BookSideQualityLadder, HealthyTwoSidedBookIsUnaffectedByTheNewFlags) {
+    // Regression guard for the pairs that are actually earning.  On a book
+    // where the flags demonstrably CAN move the ladder (see
+    // HealthyBookFixtureIsSensitiveToTheFlags, same fixture), leaving them at
+    // their defaults must reproduce the healthy path exactly -- same tier
+    // count, same sides, same prices.
+    const auto cfg = make_sidequality_config();
+    const auto by_default = healthy_book_ladder(cfg);
+
+    auto explicit_cfg = cfg;
+    explicit_cfg.book_bid_side_anchor_ok = true;
+    explicit_cfg.book_ask_side_anchor_ok = true;
+    const auto healthy = healthy_book_ladder(explicit_cfg);
+
+    ASSERT_FALSE(by_default.empty());
+    ASSERT_EQ(by_default.size(), healthy.size());
+    for (std::size_t i = 0; i < by_default.size(); ++i) {
+        EXPECT_EQ(by_default[i].price, healthy[i].price)
+            << "tier " << i << " moved on a healthy book";
+        EXPECT_EQ(by_default[i].side, healthy[i].side);
+    }
+
+    // ...and the healthy path is the pre-change path: the BBO midpoint cap
+    // does not bind, so every bid tier still anchors off best_comp_bid + 1
+    // tick, stepping outward by one stride.  Asserting the values rather than
+    // just self-consistency is what stops this from drifting into another
+    // comparison of the new code with itself.
+    constexpr Mojo kTick   = kHbMid / 10'000;                    // 0.0002
+    constexpr Mojo kAnchor = kHbCompBid + kTick;                 // 2.0202
+    constexpr Mojo kStride = 65LL * kHbMid / 10'000;             // 65 bps
+    for (const auto& tq : healthy) {
+        if (tq.side != Side::Bid) continue;
+        EXPECT_EQ(tq.price,
+                  kAnchor - static_cast<Mojo>(tq.tier_index) * kStride)
+            << "bid tier " << static_cast<int>(tq.tier_index)
+            << " is no longer anchored off the competing best bid on a "
+               "healthy book";
+    }
 }
 
 }  // namespace

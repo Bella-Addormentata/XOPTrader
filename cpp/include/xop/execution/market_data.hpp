@@ -47,6 +47,7 @@
 #include "xop/types.hpp"
 #include "xop/config.hpp"
 #include "xop/state.hpp"
+#include "xop/execution/book_side_quality.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -345,18 +346,30 @@ struct MarketDataConfig {
     /// empty, which is exactly the state a thin or bid-only pair sits in.
     double dex_last_trade_max_age_sec{1800.0};
 
-    // -- Order-book-derived mid-price (depth-weighted VWAP micro-price) -----
+    // -- Order-book-derived mid-price (Stoikov micro-price) ----------------
+    //
+    // [2026-09-02] NOT a VWAP micro-price, whatever the surrounding prose
+    // used to say.  The estimator weights each side's TOUCH PRICE by the
+    // OPPOSITE side's top-N cumulative depth, which is a convex combination
+    // of best_bid and best_ask and is therefore interior to the book by
+    // construction.  The VWAP form these comments described was the defect
+    // (1,849 invariant-clamp firings over ~39h of live XCH/DBX); see
+    // xop/execution/orderbook_mid.hpp.  Do not re-derive it from here.
 
     /// When true, compute_mid() prefers an order-book-derived mid-price
-    /// (depth-weighted VWAP micro-price) over the simple Dexie BBO midpoint.
-    /// The order-book mid is computed from the top `orderbook_mid_depth` levels
-    /// per side of the dust-filtered competing offers.
+    /// (Stoikov micro-price: touch prices weighted by opposite-side top-N
+    /// depth) over the simple Dexie BBO midpoint.  Computed from the top
+    /// `orderbook_mid_depth` levels per side of the dust-filtered competing
+    /// offers.
     /// Default: true.
     bool orderbook_mid_enabled{true};
 
-    /// Number of order book levels per side to include in the VWAP
-    /// micro-price computation.  Higher values give a more robust estimate
-    /// at the cost of including offers further from fair value.
+    /// Number of order book levels per side over which each side's
+    /// CUMULATIVE DEPTH is summed for the micro-price weighting.  (The
+    /// per-side VWAP is still computed from these levels, but only for the
+    /// clamp diagnostic -- it is not the price the estimator weights.)
+    /// Higher values give a more robust depth measure at the cost of
+    /// including offers further from fair value.
     /// Default: 5 levels per side.
     std::size_t orderbook_mid_depth{5};
 
@@ -427,6 +440,43 @@ struct MarketDataConfig {
     /// one heartbeat.  Chia blocks at ~52 s; nothing honest moves 50% in
     /// one, but a book-confirmed move still passes.  <= 0 disables.
     double mid_gate_max_step_frac{0.5};
+
+    /// [SIDEQUALITY 2026-09-01] Multiplicative band for the PER-SIDE
+    /// anchor-agreement test (MarketSnapshot::bid_side_anchor_ok /
+    /// ask_side_anchor_ok).  A side whose best dust-filtered price sits
+    /// outside [1/ratio, ratio] of the independent anchor is not evidence
+    /// about location, and consumers may re-reference away from it.
+    ///
+    /// Defaulted to the SAME 3.0 as mid_anchor_band_ratio, deliberately.
+    /// The published-mid gate already treats 3x from the anchor as the
+    /// boundary of the plausible; a side that is individually past that
+    /// boundary fails the same test the whole mid would fail, so one
+    /// number governs both and they cannot be configured into
+    /// disagreement.  It sits WELL INSIDE the per-offer absurdity bound
+    /// (offer_absurdity_ratio -> 10.0 at these settings), which is
+    /// intentional: the absurdity filter removes offers no honest market
+    /// could produce, while this flags a side no honest market would
+    /// price.  A side can therefore be disqualified as a REFERENCE while
+    /// its offers remain in the book, which is exactly the state XCH/BYC
+    /// is in.
+    ///
+    /// <= 1.0 disables the test (both flags stay true).
+    double book_side_anchor_band_ratio{3.0};
+
+    /// Two-sides-agree bypass: when the dust-filtered book is two-sided
+    /// and its OWN spread is at most this many bps, neither side is
+    /// disqualified however far both sit from the anchor.
+    ///
+    /// This is the escape that keeps a genuine repricing alive.  If the
+    /// whole market moved, both sides move together and the book stays
+    /// internally coherent -- exactly the evidence
+    /// mid_gate::book_confirms() accepts to override an anchor breach.
+    /// Disqualifying sides in that state would strip the confirmation
+    /// before the gate could read it, so the two mechanisms are pinned to
+    /// the same default (mid_gate_book_confirm_max_spread_bps, 5000).
+    /// Dislocation is one side moving ALONE, which leaves a wide spread
+    /// and fails this test.
+    double book_side_agree_max_spread_bps{5000.0};
 };
 
 // ---------------------------------------------------------------------------
@@ -473,8 +523,12 @@ struct PairState {
                                     // time -- see ingest_amm_mid).
     double      amm_pool_usd{0.0};  // USD value of both pool sides, 0=unknown
 
-    // --- Order-book-derived mid (depth-weighted VWAP micro-price) ---
-    double      orderbook_mid{0.0}; // VWAP micro-price from competing offers
+    // --- Order-book-derived mid (Stoikov micro-price) ---
+    // Touch prices weighted by opposite-side top-N depth, blended toward the
+    // plain BBO midpoint as the spread widens.  NOT a VWAP micro-price --
+    // that form was unbounded and was corrected 2026-09-02; see
+    // xop/execution/orderbook_mid.hpp before changing anything here.
+    double      orderbook_mid{0.0}; // Stoikov micro-price from competing offers
 
     // --- CEX reference ---
     double      cex_mid{0.0};       // CEX mid-price (0 if unavailable)
@@ -535,6 +589,28 @@ struct PairState {
     // override the anchor that arrives moments later, publish once, and
     // move the peak.  A book nothing screened is not evidence.
     bool        bbo_filter_had_anchor{false};
+
+    // [SIDEQUALITY 2026-09-01] Per-side agreement with the anchor that
+    // screened this book.  Written by ingest_competing_offers alongside
+    // the filtered BBO, copied verbatim into MarketSnapshot by
+    // publish_snapshot; see the long note on MarketSnapshot for why the
+    // offers are FLAGGED rather than removed.  Both default true, and
+    // both are forced true whenever no independent reference existed --
+    // an unscreened book cannot disqualify anything.
+    bool        bid_side_anchor_ok{true};
+    bool        ask_side_anchor_ok{true};
+    double      book_side_ref{0.0};   // anchor used; 0 = nothing screened
+    // ...and WHY it is 0 when it is 0.  `book_side_ref > 0.0` was the
+    // valuation gate's `sides_examined` witness until 2026-09-02, and it
+    // could not tell a genuine data gap (NoAnchor) from the operator's
+    // documented band off-switch (BandDisabled), so turning the band off
+    // withheld valuation grade on every two-sided book.  See the
+    // ScreenOutcome note in book_side_quality.hpp.
+    //
+    // Default is NoAnchor, matching book_side_ref's 0: before the first
+    // ingest nothing has screened this pair, and that must WITHHOLD.
+    bookside::ScreenOutcome book_side_screen{
+        bookside::ScreenOutcome::NoAnchor};
 
     // [S20 2026-08-24] ...and whether that reference was an INDEPENDENT
     // anchor rather than this pair's own last accepted mid.
@@ -922,6 +998,31 @@ public:
     std::vector<CompetingOffer> get_competing_offers(
         const std::string& pair_name) const;
 
+    /// A competing book together with the per-side verdict that measured
+    /// THAT book, read under one lock.
+    ///
+    /// [review round 5] ingest_dexie resets PairState's per-side verdict to
+    /// trusted on every raw ticker poll, because those raw prices were
+    /// screened by nothing.  But the OFFERS live in a different store that
+    /// nothing clears, so after a failed offers fetch the two desync: the
+    /// PairState verdict says "trusted" while competing_offers_ still holds
+    /// the previous cycle's junk book.  A consumer reading the offers from
+    /// one place and the verdict from the other then anchors against a book
+    /// no live verdict describes -- re-arming precisely the self-cross this
+    /// work exists to stop.
+    ///
+    /// So the verdict is stored BESIDE the offers and handed out with them.
+    /// A consumer that uses both must use this, not the snapshot.
+    struct CompetingBook {
+        std::vector<CompetingOffer> offers;
+        bool   bid_side_anchor_ok{true};
+        bool   ask_side_anchor_ok{true};
+        double book_side_ref{0.0};
+    };
+
+    [[nodiscard]] CompetingBook get_competing_book(
+        const std::string& pair_name) const;
+
     // -- Arbitrage signal access --------------------------------------------
 
     /// Retrieve the most recent arbitrage signal for a pair, if any.
@@ -1209,6 +1310,10 @@ private:
     /// Per-pair competing offers tracked from order book.  Guarded by mtx_competitors_.
     mutable std::shared_mutex                          mtx_competitors_;
     std::unordered_map<std::string, std::vector<CompetingOffer>> competing_offers_;
+    /// [review round 5] Per-side verdict for the book in competing_offers_,
+    /// written in the SAME critical section so the two cannot desync.
+    struct BookQuality { bool bid_ok{true}; bool ask_ok{true}; double ref{0.0}; };
+    std::unordered_map<std::string, BookQuality> competing_book_quality_;
 
     /// Per-pair latest competitor metrics.  Guarded by mtx_competitor_metrics_.
     mutable std::shared_mutex                          mtx_competitor_metrics_;

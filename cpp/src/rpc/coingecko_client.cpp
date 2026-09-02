@@ -20,7 +20,7 @@
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include <boost/asio/use_awaitable.hpp>
-#include <spdlog/sinks/stdout_color_sinks.h>
+#include "xop/util/client_logger.hpp"
 
 namespace xop::rpc {
 
@@ -58,10 +58,9 @@ CoinGeckoClient::CoinGeckoClient(asio::io_context&      ioc,
       limiter_(cfg_.rate_limit_max_requests,
                std::chrono::milliseconds{cfg_.rate_limit_window_ms}) {
 
-    log_ = spdlog::get("coingecko");
-    if (!log_) {
-        log_ = spdlog::stdout_color_mt("coingecko");
-    }
+    // Adopts the process logger's sinks so this client's diagnoses reach the
+    // rotating file log, not just stdout.  See xop/util/client_logger.hpp.
+    log_ = xop::util::get_or_create_client_logger("coingecko");
 }
 
 CoinGeckoClient::~CoinGeckoClient() {

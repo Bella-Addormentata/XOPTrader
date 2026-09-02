@@ -50,6 +50,7 @@
 #include "xop/execution/coin_manager.hpp"
 #include "xop/execution/market_data.hpp"
 #include "xop/execution/offer_manager.hpp"
+#include "xop/execution/take_retry.hpp"
 
 // Data / analytics
 #include "xop/data/volatility.hpp"
@@ -91,6 +92,8 @@
 #include "xop/strategy/kappa_calibrator.hpp"
 #include "xop/strategy/market_allocator.hpp"
 #include "xop/strategy/competitiveness_pid.hpp"
+#include "xop/strategy/pid_rail_latch.hpp"
+#include "xop/strategy/pid_reachability.hpp"
 
 // New risk modules
 #include "xop/risk/loss_manager.hpp"
@@ -544,6 +547,20 @@ private:
     std::unordered_map<std::string, risk::PegRuntime> asset_peg_rt_;
     std::filesystem::path peg_reenable_flag_path_;
 
+    /// [CIRCANCHOR 2026-09-02] Last time we told the operator that an
+    /// asset's peg detector is inoperative because the only USD anchor
+    /// available is that asset's own declared par.
+    ///
+    /// This is an operator-facing condition, not a debug detail -- the
+    /// detector is blind for as long as it lasts -- so it logs at warn
+    /// rather than joining the debug line that covers a transient junk
+    /// book. It also repeats every heartbeat of the outage, hence the
+    /// throttle. Deliberately NOT a new AlertRule: the warn line plus the
+    /// existing StablecoinDepeg channel is the right scope, and expanding
+    /// alert plumbing here would bury the fix.
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point>
+        peg_circular_anchor_warned_at_;
+
     // -- [RELOAD] Config hot-reload: live pair disable ---------------------
     //
     // A GUI Save writes config.yaml and touches data/config_reload.flag;
@@ -691,6 +708,28 @@ private:
     /// [PNL-BASIS-USD] note in usd_per_xch for why a fixed rate is unsafe
     /// now that cost basis is persisted.
     [[nodiscard]] double usd_per_xch() const;
+
+    /// The same number, plus WHERE IT CAME FROM.
+    ///
+    /// [CIRCANCHOR 2026-09-02] usd_per_xch()'s DEX fallback prices XCH off an
+    /// XCH/<par wrapper> mid times that wrapper's DECLARED par. Used to judge
+    /// that same wrapper's peg, the mids cancel and the observation is the
+    /// declared par read back to itself -- a permanent, silent all-clear on
+    /// the one asset whose bridge was actually compromised. The asset-level
+    /// peg watcher needs to be able to tell that case apart from a legitimate
+    /// cross against a DIFFERENT wrapper, and only the code that picked the
+    /// anchor knows which it was. See risk::XchUsdAnchor.
+    ///
+    /// THIS IS THE SINGLE IMPLEMENTATION; usd_per_xch() is a thin accessor
+    /// over it, so the price and its provenance cannot disagree. The other
+    /// four call sites (quote_usd_factor x2, step_update_pnl, the Step 13
+    /// breaker anchor) keep the bare double -- provenance is irrelevant to
+    /// them, and dragging a circuit-breaker anchor into a peg fix is not a
+    /// trade worth making.
+    ///
+    /// The returned par_asset_id BORROWS from config_; it is valid for the
+    /// engine's lifetime but is meant to be consumed within the cycle.
+    [[nodiscard]] risk::XchUsdAnchor usd_per_xch_anchor() const;
 
     // -- [PEG 2026-08-26] Peg identity, asked of the registry ---------------
     //
@@ -1305,7 +1344,40 @@ private:
         // cycle; Step 8 treats 0 as "no floor available" and skips the
         // recovery repricing rather than running it unfloored.
         Mojo          quote_mid_mojos{0};
+        // [FEEGAIN 2026-09-01] The centre BEFORE the Avellaneda-Stoikov
+        // reservation shift -- our fair-value estimate, undisplaced.
+        //
+        // quote_mid_mojos above is that same centre AFTER the shift, which
+        // deliberately moves quotes to manage inventory. That is not a
+        // revision of what the asset is worth, so it is the wrong reference
+        // for anything asking "how much edge does this tier carry": tier
+        // price is centre*(1 +/- spacing), so measuring from the shifted
+        // centre reports the nominal spacing identically on both sides and
+        // erases the inventory-skew cost exactly where A-S places it.
+        //
+        // Captured after the peg anchor and the fair-value blend, before
+        // the A-S block -- not blend.center, which is earlier and misses
+        // the peg correction on stablecoin pairs. 0 when Step 7 never
+        // reached the capture point.
+        Mojo          quote_fair_centre_mojos{0};
         double        quote_min_half_spread_bps{0.0};
+
+        // [2026-09-02, review] The spread SpreadOptimizer::compute_spread()
+        // produced, captured before Step 5's first adjustment site.
+        //
+        // Step 5 mutates spread_result.total_spread_bps at ten sites -- eight
+        // multiplications and TWO ASSIGNMENTS (the order-book tactician and
+        // the global half-spread cap) that discard everything before them.
+        // A telemetry gauge built from the multipliers therefore cannot
+        // describe what was posted, and one was: it multiplied two of the ten
+        // and was labelled "Effective Multiplier".  Keeping the base here lets
+        // the applied multiplier be MEASURED as end/start, which follows any
+        // future site -- multiplication, assignment or clamp -- without
+        // anyone remembering to update a product.
+        //
+        // 0 until Step 5 runs compute_spread() for this pair this cycle;
+        // consumers treat 0 as "no reading" rather than as 1.0x.
+        double        spread_base_bps{0.0};
     };
 
     /// Per-pair cycle state for the current block.
@@ -1494,6 +1566,28 @@ private:
     // True when Step 9c successfully took at least one offer on this block.
     bool crossed_book_take_this_block_{false};
 
+    // -- [S40 remainder 2026-09-01] Step 9c take-retry state ----------------
+    // SEVEN members above declare Step-9 cooldowns and per-block caps that a
+    // repo-wide grep over cpp/src and cpp/include finds NO read and NO write
+    // of -- buyer_last_take_block_, buyer_epoch_taken_,
+    // buyer_takes_this_block_, midpoint_last_take_block_,
+    // midpoint_epoch_taken_xch_, midpoint_takes_this_block_ and
+    // crossed_book_take_this_block_ each occur exactly once, at their own
+    // declaration. The "no backoff" half of S40 is therefore not an oversight
+    // in one path; it is seven declared-and-forgotten members whose comments
+    // describe enforcement that was never written. Step 9f's
+    // last_drift_correction_block_ is the one that IS wired.
+    // This one is wired, and its policy lives in a pure header so a test can
+    // hold it -- nothing in cpp/tests constructs an Engine (TODO S36).
+    //
+    // Bounded by three rules, each covering the other's failure mode:
+    // retain_live() prunes to the pair's live book (only on a cycle whose
+    // book read non-empty -- clearing on an empty read would wipe every
+    // suppression and resume the storm), sweep() ages entries out and
+    // enforces the hard cap.
+    execution::TakeRetryBook crossed_book_retry_;
+    execution::TakeRetryConfig crossed_book_retry_cfg_{};
+
     // [T3-09] Max-drawdown global circuit breaker threshold.
     // Drawdown fraction = risk::equity_drawdown_frac(peak_equity_hwm_usd_,
     // equity_usd) -- portfolio equity on both sides ([DRAWDOWN-EQUITY
@@ -1656,6 +1750,13 @@ private:
         double   current_mult{1.0};      ///< Current output spread multiplier.
         uint32_t blocks_active{0};       ///< Blocks since first offer was posted.
         int      fills_this_cycle{0};    ///< Fills counted this heartbeat.
+        /// [S39] Edge detector for "the anti-windup clamp is firing and this
+        /// controller has lost authority".  The predicate is on the
+        /// INTEGRATOR rather than on current_mult, because pid_min_mult is
+        /// unreachable on the shipped config and an output-clamp predicate
+        /// would fire never on the one controller that has been railed for
+        /// 40 hours.  See cpp/include/xop/strategy/pid_rail_latch.hpp.
+        xop::strategy::PidRailLatch rail;
     };
     std::unordered_map<std::string, SpreadPidState> spread_pid_state_;
 

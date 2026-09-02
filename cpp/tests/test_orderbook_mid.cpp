@@ -12,6 +12,79 @@
 //  same-block observations in the week to 2026-08-01.
 //
 // =============================================================================
+//  2026-09-02 -- FOUR ASSERTIONS IN THIS FILE WERE INVERTED ON PURPOSE.
+// =============================================================================
+//
+//  The estimator was corrected to weight the TOUCH PRICES rather than each
+//  side's top-N VWAP (see orderbook_mid.hpp).  The micro-price is now a convex
+//  combination of best_bid and best_ask and is therefore INTERIOR TO THE BOOK
+//  BY CONSTRUCTION.  Assertions that pinned the old, unbounded behaviour were
+//  asserting the defect, and have been flipped:
+//
+//    1. ThousandToOneBidHeavyStaysInsideTheBook
+//         was  EXPECT_GT(r.microprice, r.best_ask)
+//         now  strictly interior, and provably so
+//    2. ThousandToOneAskHeavyStaysInsideTheBook
+//         was  EXPECT_LT(r.microprice, r.best_bid)
+//         now  strictly interior, and provably so
+//    3. TheBycCaseCannotProduceAMidAboveTheAsk
+//         was  EXPECT_TRUE(r.clamped) and EXPECT_DOUBLE_EQ(r.mid, r.best_ask)
+//         now  !clamped, mid ~= 1.06257
+//    4. OrderbookMidLayer2.WeightIsOneAtOrBelowNarrow
+//         was  EXPECT_NEAR(r.mid, std::min(r.microprice, r.best_ask), 1e-12)
+//         now  EXPECT_NEAR(r.mid, r.microprice, 1e-12) + EXPECT_FALSE(clamped)
+//         The std::min was written for the clamping regime and is BLIND: on
+//         any mutation that pushes the micro-price above the ask, mid clamps
+//         to best_ask and std::min(micro, best_ask) evaluates to best_ask
+//         too, so the assertion passes on the broken estimator.  It was
+//         missed in the first pass over this file.
+//
+//  (3) is the one that matters, and it is an IMPROVEMENT, not a regression.
+//  That book's truth was ~$1.01.  The old code clamped to the best ask,
+//  1.07500; the corrected estimator returns ~1.06257, which is ~115 bps
+//  CLOSER to the truth.  The clamp no longer binds there because nothing is
+//  out of bounds to clamp.
+//
+//  A note on the vacuity that let the original defect survive: the sweep test
+//  HoldsAcrossEveryDepthRatioAndSpread asserted only best_bid <= mid <=
+//  best_ask, which the Layer-1 clamp guarantees UNCONDITIONALLY -- it could
+//  never fail, whatever the estimator did.  It now also asserts the clamp did
+//  not fire, AND that the micro-price itself is interior.  MEASURED AGAINST
+//  THE UNFIXED ESTIMATOR, the clamp assertion failed at 26 of the 56 grid
+//  points:
+//
+//      spread   10 bps -- all 7 depth ratios clamped
+//      spread   50 bps -- all 7 depth ratios clamped
+//      spread  200 bps -- 6 of 7 clamped (only ratio 1.0, balanced, survived)
+//      spread  500 bps -- 6 of 7 clamped (only ratio 1.0, balanced, survived)
+//      spread  800/1259/2114/5000 bps -- 0 of 7 clamped
+//
+//  The four wide spreads are all at or beyond microprice_wide_bps, where
+//  w_micro is 0 and the micro-price is discarded entirely -- so the CLAMP
+//  assertion cannot test the estimator at those 28 points at all.  Of the 28
+//  points where it can, 26 escaped the book.  Note the direction: the escapes
+//  are worst at the TIGHTEST spreads, which is the opposite of what the
+//  spread taper was built to defend against.
+//
+//  THE MICRO-PRICE INTERIORITY ASSERTIONS IN THAT SWEEP ARE THE STRICTLY
+//  STRONGER GUARD, NOT DECORATION.  Measured against the same unfixed
+//  estimator they failed at 50 of the 56 grid points -- 26 below the bid and
+//  24 above the ask -- versus 26 for the clamp assertion, and the two sets
+//  are disjoint per point.  24 of those 50 are at the four WIDE spreads,
+//  where w_micro is 0, the micro-price is discarded by the blend, and a
+//  broken estimator therefore cannot trip the clamp at all: 28 grid points
+//  that the clamp assertion cannot test and these assertions catch 24 of.
+//  They are the only coverage the estimator has at spreads >=
+//  microprice_wide_bps.  Do not delete them as redundant over the clamp
+//  assertion; the clamp assertion is the subset.
+//
+//  A NOTE ON THE ACCEPTANCE METRIC.  The centre shift this fix produces is
+//  S/(1+R), not spread/2 -- see the header of orderbook_mid.hpp and
+//  OrderbookMidAcceptance below, which pins the formula against the
+//  estimator so the wrong number cannot be re-derived from a memory of the
+//  original write-up.
+//
+// =============================================================================
 
 #include <gtest/gtest.h>
 
@@ -67,9 +140,18 @@ TEST(OrderbookMidInvariant, ThousandToOneBidHeavyStaysInsideTheBook) {
     EXPECT_GE(r.mid, r.best_bid);
     EXPECT_LE(r.mid, r.best_ask);
 
-    // The unweighted micro-price really does escape the book here -- that is
-    // the whole defect, and the fixture is worthless if it does not reproduce it.
-    EXPECT_GT(r.microprice, r.best_ask);
+    // INVERTED 2026-09-02.  This used to read EXPECT_GT(r.microprice,
+    // r.best_ask) -- it asserted that the estimator escaped the book, which
+    // was the defect, not a requirement.  Weighting the touch prices makes the
+    // micro-price a convex combination of best_bid and best_ask, so on this
+    // 1000:1 bid-heavy book it is dragged hard toward the ask but cannot pass
+    // it:  bid_depth = 3000 quote units, ask_depth = 1.10+1.30+1.60 = 4.00,
+    //      micro = (4.00*1.00 + 3000*1.10) / 3004 = 1.099867
+    // i.e. within 13 bps of the ask, and still strictly inside.
+    EXPECT_LT(r.microprice, r.best_ask);
+    EXPECT_GT(r.microprice, r.best_bid);
+    EXPECT_NEAR(r.microprice, 1.099867, 1e-5);
+    EXPECT_FALSE(r.clamped);
 }
 
 // The mirror image: 1000:1 with asks dominating drags the estimate toward
@@ -89,12 +171,36 @@ TEST(OrderbookMidInvariant, ThousandToOneAskHeavyStaysInsideTheBook) {
     EXPECT_DOUBLE_EQ(r.best_ask, 1.10);
     EXPECT_GE(r.mid, r.best_bid);
     EXPECT_LE(r.mid, r.best_ask);
-    EXPECT_LT(r.microprice, r.best_bid);
+
+    // INVERTED 2026-09-02, mirror of the above.  Was EXPECT_LT(r.microprice,
+    // r.best_bid).  bid_depth = 3.00 quote units, ask_depth = 1000*(1.10 +
+    // 1.12 + 1.14) = 3360, so
+    //      micro = (3360*1.00 + 3.00*1.10) / 3363 = 1.000089
+    // pinned just above the bid, and strictly inside.
+    EXPECT_GT(r.microprice, r.best_bid);
+    EXPECT_LT(r.microprice, r.best_ask);
+    EXPECT_NEAR(r.microprice, 1.000089, 1e-5);
+    EXPECT_FALSE(r.clamped);
 }
 
 // Sweep the depth ratio across six orders of magnitude in both directions and
 // across spreads from 10 bps to 5000 bps.  The invariant is unconditional, so
 // this asserts it unconditionally rather than at hand-picked points.
+//
+// THE CLAMP ASSERTION IS THE POINT OF THIS TEST.  Asserting only
+// best_bid <= mid <= best_ask here is VACUOUS: Layer 1 clamps to exactly that
+// interval as its last action, so those two bounds hold no matter how wrong
+// the estimator is, and for months they did exactly that.  ASSERT_FALSE(
+// r.clamped) is what actually tests the estimator, because it asserts the
+// clamp had NOTHING TO DO.
+//
+// Verified non-vacuous by construction and by measurement: against the
+// pre-2026-09-02 estimator this assertion failed at 26 of the 56 grid points
+// (and at 26 of the 28 where w_micro > 0 -- see the file header for the
+// per-spread breakdown).  The grid carries a real d_b: each side's five levels
+// step 5% away from the touch, so bid_vwap sits 10% below best_bid.  If this
+// test ever passes with the touch prices swapped back to the VWAPs, the grid
+// has lost its depth ladder and must be rebuilt before it is trusted again.
 TEST(OrderbookMidInvariant, HoldsAcrossEveryDepthRatioAndSpread) {
     const double ratios[] = {1e-3, 1e-2, 0.1, 1.0, 10.0, 100.0, 1000.0};
     const double spreads_bps[] = {10.0, 50.0, 200.0, 500.0, 800.0,
@@ -123,6 +229,36 @@ TEST(OrderbookMidInvariant, HoldsAcrossEveryDepthRatioAndSpread) {
                 << "ratio=" << ratio << " spread=" << sp;
             ASSERT_TRUE(std::isfinite(r.mid))
                 << "ratio=" << ratio << " spread=" << sp;
+            // EXPECT, not ASSERT.  A regression here needs its full
+            // SIGNATURE to be diagnosable -- escapes at every ratio across
+            // the four narrow spreads and none at the four wide ones is what
+            // identifies the defect as unboundedness rather than a broken
+            // fixture.  ASSERT aborts the whole test at the first point and
+            // reports 1 of up to 26 (measured).  Nothing below dereferences
+            // anything a failure would invalidate, so there is no
+            // abort-safety reason to ASSERT here.
+            EXPECT_FALSE(r.clamped)
+                << "the estimator left the book and Layer 1 had to drag it "
+                   "back: ratio=" << ratio << " spread=" << sp
+                << " micro=" << r.microprice << " bid=" << r.best_bid
+                << " ask=" << r.best_ask << " w_micro=" << r.w_micro;
+
+            // NOT belt and braces -- this is the STRONGER assertion of the
+            // two, and the only one with any force at the four wide spreads.
+            // There w_micro is 0, the blend discards the micro-price, and the
+            // clamp above therefore cannot fire however wrong the estimator
+            // is: 28 of the 56 grid points are untested by the clamp check
+            // and tested only here.  Measured against the pre-2026-09-02
+            // estimator this pair failed at 50 of 56 points versus 26 for the
+            // clamp check (disjoint per point), 24 of the 50 being at those
+            // wide spreads.  Deleting these as redundant would silently drop
+            // half the grid.
+            EXPECT_GE(r.microprice, r.best_bid)
+                << "ratio=" << ratio << " spread=" << sp
+                << " micro=" << r.microprice << " w_micro=" << r.w_micro;
+            EXPECT_LE(r.microprice, r.best_ask)
+                << "ratio=" << ratio << " spread=" << sp
+                << " micro=" << r.microprice << " w_micro=" << r.w_micro;
         }
     }
 }
@@ -155,20 +291,247 @@ TEST(OrderbookMidInvariant, TheBycCaseCannotProduceAMidAboveTheAsk) {
     EXPECT_LT(r.mid, kBadMid) << "the published 1.144407 must be unreachable";
 
     // 490 bps of spread sits in the middle of the 200..800 blend band, so
-    // roughly half the micro-price survives -- and at a 1000:1 depth ratio
-    // even half of it is enough to leave the book.  That is precisely the
-    // case Layer 1 exists for: the clamp binds, and it must be visible.
+    // roughly half the micro-price survives.
     EXPECT_NEAR(r.midpoint, (kBid + kAsk) / 2.0, 1e-9);
     EXPECT_NEAR(r.w_micro, 1.0 - (490.0 - 200.0) / 600.0, 0.02);  // ~0.517
-    EXPECT_TRUE(r.clamped) << "a binding clamp here is the expected outcome, "
-                              "and it is logged at warning level";
-    EXPECT_DOUBLE_EQ(r.mid, r.best_ask);
 
-    // Layer 2 alone already removed most of the damage: the raw micro-price
-    // wanted 1.1179, the blend brought it to 1.0848, the clamp finished the
-    // job at 1.0750.  All three are far below the 1.1444 that was published.
-    EXPECT_GT(r.microprice, r.best_ask);
+    // ===================================================================
+    //  INVERTED 2026-09-02.  THIS IS AN IMPROVEMENT, NOT A REGRESSION.
+    // ===================================================================
+    //  These two lines used to read
+    //
+    //      EXPECT_TRUE(r.clamped);
+    //      EXPECT_DOUBLE_EQ(r.mid, r.best_ask);
+    //
+    //  and were described as "a binding clamp here is the expected
+    //  outcome".  It was not an expected outcome, it was the defect
+    //  announcing itself.  With the touch-price micro-price:
+    //
+    //      bid_depth = 5 x 500                       = 2500     quote units
+    //      ask_depth = 0.5 x (1.0750 + 1.0965 + 1.1180
+    //                         + 1.1395 + 1.1610)     =    2.795 quote units
+    //      micro     = (2.795*1.023622 + 2500*1.075)
+    //                  / 2502.795                    = 1.074946
+    //      mid       = 0.5173*1.074946 + 0.4827*1.049311
+    //                                                = 1.062572
+    //
+    //  Nothing leaves the book, so the clamp has nothing to do.  The book's
+    //  true value was ~$1.01: the old clamped answer was 1.07500, the new
+    //  one is 1.06257, which is ~115 bps CLOSER to the truth.
+    EXPECT_FALSE(r.clamped) << "the corrected estimator is interior by "
+                               "construction; a clamp here means it regressed";
+    EXPECT_LT(r.mid, r.best_ask);
+    EXPECT_GT(r.mid, r.best_bid);
+    EXPECT_NEAR(r.mid, 1.062572, 1e-5);
+
+    // Third inversion in this test: the micro-price no longer escapes above
+    // the ask.  Extreme bid dominance still pins it hard against the ask
+    // (within ~0.5 bps), which is the correct lean -- just not past it.
+    EXPECT_LT(r.microprice, r.best_ask);
+    EXPECT_NEAR(r.microprice, 1.074946, 1e-5);
+
     EXPECT_GT((kBadMid / r.mid - 1.0) * 10000.0, 600.0);  // >600 bps better
+}
+
+namespace {
+
+// Build a level whose NORMALIZED depth (quote units, as the estimator sees it
+// after unit normalization) is exactly `quote_units`.  Bid sizes are already
+// quote-denominated; ask sizes are base-denominated and get valued at px.
+CompetingOffer mk_quote(Side side, double price, double quote_units) {
+    return mk(side, price,
+              side == Side::Bid ? quote_units : quote_units / price);
+}
+
+}  // namespace
+
+// =============================================================================
+//  THE LIVE MODAL STATE -- XCH/DBX, the only enabled pair.
+// =============================================================================
+//
+//  Reconstructed from the modal live book over the ~39h to 2026-09-02:
+//  bid 84.502400, ask 84.570143 (8.01 bps -- the modal spread), normalized
+//  quote depths 2048 (bid) and 5844 (ask).  Over that window the Layer-1 clamp
+//  fired 1,849 times, 98.38% of them BELOW THE BID, binding on 46.9% of
+//  ingests.  This fixture reproduces that exactly, so it is a real regression
+//  test and not a restatement of the fix.
+//
+//  Five levels a side, stepping 4 bps, so bid_vwap really does sit below
+//  best_bid (d_b = 0.0676, against a spread of only 0.0677 -- which is the
+//  whole reason a NARROW book escaped so easily).  Under the OLD VWAP form
+//  this book produced
+//
+//      micro_old = (5844*84.43480 + 2048*84.63779) / 7892 = 84.48748
+//
+//  which is 84.48748 < best_bid 84.50240: outside the book, clamped, exactly
+//  the production symptom.  Under the corrected touch-price form it produces
+//  84.519979, strictly interior.
+TEST(OrderbookMidRegression, LiveXchDbxModalBookIsInteriorAndBelowTheMidpoint) {
+    constexpr double kBid = 84.502400;
+    constexpr double kAsk = 84.570143;
+
+    std::vector<CompetingOffer> book;
+    for (int i = 0; i < 5; ++i) {
+        book.push_back(mk_quote(Side::Bid, kBid * (1.0 - 0.0004 * i),
+                                2048.0 / 5.0));
+        book.push_back(mk_quote(Side::Ask, kAsk * (1.0 + 0.0004 * i),
+                                5844.0 / 5.0));
+    }
+
+    const OrderbookMid r = compute_orderbook_mid(book, defaults(), "XCH/DBX");
+
+    EXPECT_NEAR(r.best_bid, kBid, 1e-6);
+    EXPECT_NEAR(r.best_ask, kAsk, 1e-6);
+    EXPECT_NEAR(r.spread_bps, 8.01, 0.05);   // the modal 8 bps
+    EXPECT_DOUBLE_EQ(r.w_micro, 1.0);        // far inside the narrow band
+
+    // 1. The clamp must not fire.  It fired on 46.9% of live ingests.
+    EXPECT_FALSE(r.clamped);
+
+    // 2. Strictly interior -- not merely within, but off both touches.
+    EXPECT_GT(r.mid, r.best_bid);
+    EXPECT_LT(r.mid, r.best_ask);
+
+    // 3. AND STRICTLY BELOW THE PLAIN MIDPOINT.  This is the assertion that
+    //    stops anyone "fixing" the estimator by returning the midpoint and
+    //    calling the invariant satisfied.  Ask depth is 2.85x bid depth, so
+    //    the thin side is the BID and a correct micro-price must lean down.
+    //    A midpoint return would sit at 84.5362715 and fail here.
+    EXPECT_LT(r.mid, r.midpoint);
+    EXPECT_NEAR(r.midpoint, (kBid + kAsk) / 2.0, 1e-9);
+
+    //  micro = (5844*84.502400 + 2048*84.570143) / 7892 = 84.519979
+    EXPECT_NEAR(r.mid, 84.519979, 1e-4);
+    EXPECT_NEAR(r.microprice, 84.519979, 1e-4);
+
+    // And the ladder really is a ladder: if these VWAPs ever collapse onto the
+    // touches, the fixture has stopped discriminating between the two formulas
+    // and the test above is vacuous.  d_b here is ~0.0676, ~1x the spread.
+    EXPECT_LT(84.43480, r.best_bid);
+    EXPECT_GT(84.63779, r.best_ask);
+}
+
+// =============================================================================
+//  ACCEPTANCE -- what the corrected estimator is expected to MOVE.
+// =============================================================================
+//
+//  The original write-up of this fix predicted "ladder-centre bias is
+//  spread/2: p50 4.0 bps".  THAT NUMBER IS WRONG and this test exists so it
+//  cannot be re-derived from memory.  spread/2 assumes the corrected centre
+//  lands on the MIDPOINT.  It lands on the MICRO-PRICE, which leans to the
+//  thin side.  With R = ask_depth / bid_depth and w_micro = 1,
+//
+//      micro = (R*B + A) / (1 + R) = B + S/(1 + R)
+//
+//  so the shift off a centre that the old code clamped to the bid is
+//  S/(1+R) -- and it DECAYS TOWARD ZERO exactly in the deep-asymmetry cases
+//  where the old clamp bound hardest.  An operator who measures against
+//  4.0 bps will see roughly half that and wrongly conclude the fix did not
+//  deploy.
+//
+//  The sound acceptance number is the OTHER one: clamp firings go to zero.
+//  That is asserted throughout this file.
+TEST(OrderbookMidAcceptance, CentreShiftIsSpreadOverOnePlusRatioNotHalfTheSpread) {
+    // The live modal XCH/DBX book.  Bid depth held at the observed 2048 quote
+    // units; ask depth swept to move R.
+    constexpr double kBid = 84.502400;
+    constexpr double kAsk = 84.570143;
+    constexpr double kBidDepth = 2048.0;
+
+    const double S = kAsk - kBid;
+
+    // p50 of the live below-bid population, the clamp threshold itself, and
+    // three points into the deep tail.  R = 0.46 is the observed minimum on
+    // the above-ask population, where the shift REVERSES SIGN.
+    const double ratios[] = {0.46, 1.0, 2.00, 2.85, 10.0, 1000.0};
+
+    for (double R : ratios) {
+        std::vector<CompetingOffer> book;
+        for (int i = 0; i < 5; ++i) {
+            book.push_back(mk_quote(Side::Bid, kBid * (1.0 - 0.0004 * i),
+                                    kBidDepth / 5.0));
+            book.push_back(mk_quote(Side::Ask, kAsk * (1.0 + 0.0004 * i),
+                                    kBidDepth * R / 5.0));
+        }
+
+        const OrderbookMid r =
+            compute_orderbook_mid(book, defaults(), "XCH/DBX");
+
+        ASSERT_DOUBLE_EQ(r.w_micro, 1.0) << "R=" << R;   // 8 bps: micro used whole
+        EXPECT_FALSE(r.clamped) << "R=" << R;
+
+        // THE FORMULA.  mid - best_bid == S / (1 + R), to within the rounding
+        // the mojo-quantised fixture introduces (~1e-4 relative).
+        const double predicted = S / (1.0 + R);
+        EXPECT_NEAR(r.mid - r.best_bid, predicted, std::abs(predicted) * 2e-3)
+            << "R=" << R << " mid=" << r.mid << " bid=" << r.best_bid;
+
+        // And it is NOT spread/2 anywhere except R == 1 exactly.  At the p50
+        // R = 2.85 the two differ by more than a factor of 1.9, which is the
+        // whole point: 2.08 bps realized against 4.0 bps predicted.
+        if (std::abs(R - 1.0) > 1e-9) {
+            EXPECT_GT(std::abs((r.mid - r.best_bid) - S / 2.0),
+                      S * 1e-3)
+                << "R=" << R << ": the shift coincided with spread/2, which "
+                   "means the fixture stopped discriminating";
+        }
+    }
+}
+
+// The two directional claims that follow from the formula, pinned separately
+// so a regression names which one broke.
+TEST(OrderbookMidAcceptance, ShiftIsCappedAtSpreadOverThreeOnTheBelowBidPopulation) {
+    constexpr double kBid = 84.502400;
+    constexpr double kAsk = 84.570143;
+    constexpr double kBidDepth = 2048.0;
+    const double S = kAsk - kBid;
+
+    // A below-bid escape under the OLD estimator required R > 2.00 on this
+    // ladder, so S/(1+R) < S/3 bounds the entire below-bid population --
+    // 98.38% of the 1,849 live firings.  ~2.7 bps against the modal 8 bps
+    // spread, not the 4.0 bps that was predicted.
+    for (double R : {2.0001, 2.85, 10.0, 100.0, 1000.0}) {
+        std::vector<CompetingOffer> book;
+        for (int i = 0; i < 5; ++i) {
+            book.push_back(mk_quote(Side::Bid, kBid * (1.0 - 0.0004 * i),
+                                    kBidDepth / 5.0));
+            book.push_back(mk_quote(Side::Ask, kAsk * (1.0 + 0.0004 * i),
+                                    kBidDepth * R / 5.0));
+        }
+        const OrderbookMid r =
+            compute_orderbook_mid(book, defaults(), "XCH/DBX");
+
+        const double shift = r.mid - r.best_bid;
+        EXPECT_GT(shift, 0.0) << "R=" << R;              // centre RISES
+        EXPECT_LT(shift, S / 3.0) << "R=" << R;          // and is capped
+        EXPECT_LT(shift, S / 2.0) << "R=" << R;          // never spread/2
+    }
+}
+
+TEST(OrderbookMidAcceptance, ShiftReversesOnTheAboveAskPopulation) {
+    constexpr double kBid = 84.502400;
+    constexpr double kAsk = 84.570143;
+    constexpr double kBidDepth = 2048.0;
+
+    // The ~1.62% of firings that clamped ABOVE the ask needed R < ~0.4995.
+    // There the old centre sat ON the ask and the corrected centre FALLS.
+    // Direction, not just magnitude, differs -- an acceptance check that
+    // assumes a one-way move will misread these.
+    for (double R : {0.46, 0.30, 0.10}) {
+        std::vector<CompetingOffer> book;
+        for (int i = 0; i < 5; ++i) {
+            book.push_back(mk_quote(Side::Bid, kBid * (1.0 - 0.0004 * i),
+                                    kBidDepth / 5.0));
+            book.push_back(mk_quote(Side::Ask, kAsk * (1.0 + 0.0004 * i),
+                                    kBidDepth * R / 5.0));
+        }
+        const OrderbookMid r =
+            compute_orderbook_mid(book, defaults(), "XCH/DBX");
+
+        EXPECT_FALSE(r.clamped) << "R=" << R;
+        EXPECT_LT(r.mid, r.best_ask) << "R=" << R;   // strictly below the ask
+        EXPECT_GT(r.mid, r.midpoint) << "R=" << R;   // thin side is the ASK
+    }
 }
 
 // The exact book at the sweep block, reconstructed from
@@ -215,8 +578,19 @@ TEST(OrderbookMidLayer2, WeightIsOneAtOrBelowNarrow) {
     const OrderbookMid r = compute_orderbook_mid(book, p, "TIGHT/PAIR");
     EXPECT_NEAR(r.spread_bps, 100.0, 0.01);
     EXPECT_DOUBLE_EQ(r.w_micro, 1.0);
-    // With w = 1 the estimate IS the micro-price (modulo the invariant).
-    EXPECT_NEAR(r.mid, std::min(r.microprice, r.best_ask), 1e-12);
+
+    // INVERTED 2026-09-02 (fourth site, missed in the first pass).  This read
+    //     EXPECT_NEAR(r.mid, std::min(r.microprice, r.best_ask), 1e-12);
+    // which was written for the clamping regime and is BLIND to the very
+    // failure this file exists to catch: if the micro-price escapes above the
+    // ask, mid is clamped to best_ask and std::min(micro, best_ask) is ALSO
+    // best_ask, so the assertion passes on a broken estimator.  With w = 1
+    // the estimate simply IS the micro-price, and the micro-price is interior
+    // by construction -- assert exactly that, with no clamp in the way.
+    EXPECT_NEAR(r.mid, r.microprice, 1e-12);
+    EXPECT_FALSE(r.clamped);
+    EXPECT_GT(r.microprice, r.best_bid);
+    EXPECT_LT(r.microprice, r.best_ask);
 }
 
 TEST(OrderbookMidLayer2, WeightIsZeroAtOrAboveWide) {
@@ -510,14 +884,17 @@ TEST(OrderbookMidUnits, XchCatTightBookDoesNotCollapseToBidVwapOrClamp) {
     EXPECT_GT(r.mid, r.best_bid);
     EXPECT_LT(r.mid, r.best_ask);
 
-    // Hand-computed micro-price in quote units:
+    // Hand-computed micro-price in quote units (touch-price form, 2026-09-02):
     //   bid_depth = 500 + 300                       = 800     quote units
     //   ask_depth = 200*2.250 + 100*2.255           = 675.5   quote units
-    //   bid_vwap  = (2.230*500 + 2.225*300) / 800   = 2.228125
-    //   ask_vwap  = (2.250*450 + 2.255*225.5)/675.5 = 2.2516691...
-    //   micro     = (675.5*bid_vwap + 800*ask_vwap) / 1475.5
-    //             = 2.2408937...
-    EXPECT_NEAR(r.mid, 2.24089, 5e-4);
+    //   micro     = (675.5*best_bid + 800*best_ask) / 1475.5
+    //             = (675.5*2.230 + 800*2.250) / 1475.5
+    //             = 2.2408438...
+    // The old VWAP form gave 2.2408937 on this book -- the two agree to 2 bps
+    // here precisely because the book is tight and near-balanced, which is the
+    // regime where the defect was invisible.  This test was never the one that
+    // could have caught it; the sweep and the XCH/DBX modal fixture are.
+    EXPECT_NEAR(r.mid, 2.2408438, 1e-6);
 }
 
 // Same shape at a two-orders-of-magnitude pseudo-price (XCH/DBX-like) --

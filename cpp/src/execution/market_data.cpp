@@ -35,6 +35,7 @@
 
 #include "xop/execution/market_data.hpp"
 
+#include "xop/execution/book_side_quality.hpp"
 #include "xop/execution/mid_gate.hpp"
 #include "xop/execution/orderbook_mid.hpp"
 
@@ -89,7 +90,8 @@ bool last_trade_is_fresh(const PairState& ps,
 }
 
 // -------------------------------------------------------------------------
-// The depth-weighted VWAP micro-price now lives in orderbook_mid.cpp as
+// The order-book mid (a Stoikov micro-price: touch prices weighted by the
+// opposite side's top-N cumulative depth) now lives in orderbook_mid.cpp as
 // xop::compute_orderbook_mid().  It moved out of this anonymous namespace so
 // that the invariant (best_bid <= mid <= best_ask), the spread-dependent
 // blend toward the plain midpoint, and the degenerate/one-sided handling can
@@ -231,7 +233,16 @@ MarketDataFeed::MarketDataFeed(MarketDataFeed&& other) noexcept
     }
     {
         std::unique_lock lock(other.mtx_competitors_);
-        competing_offers_ = std::move(other.competing_offers_);
+        // [review round 8] BOTH maps, or neither.  mtx_competitors_ guards a
+        // PAIR of stores and get_competing_book() hands them out together;
+        // moving the offers without the verdict that condemned them leaves
+        // the destination holding a junk book whose quality entry is absent,
+        // so get_competing_book() returns the struct defaults -- both sides
+        // TRUSTED -- beside it.  That is the round-5 desync reached without
+        // any fetch failure at all, and it is fail-open: the evidence is
+        // dropped and the thing it condemned survives.
+        competing_offers_       = std::move(other.competing_offers_);
+        competing_book_quality_ = std::move(other.competing_book_quality_);
     }
     {
         std::unique_lock lock(other.mtx_competitor_metrics_);
@@ -324,7 +335,9 @@ MarketDataFeed& MarketDataFeed::operator=(MarketDataFeed&& other) noexcept {
     }
     {
         std::scoped_lock lock(mtx_competitors_, other.mtx_competitors_);
-        competing_offers_ = std::move(other.competing_offers_);
+        // [review round 8] BOTH maps, or neither -- see the move constructor.
+        competing_offers_       = std::move(other.competing_offers_);
+        competing_book_quality_ = std::move(other.competing_book_quality_);
     }
     {
         std::scoped_lock lock(mtx_competitor_metrics_, other.mtx_competitor_metrics_);
@@ -547,6 +560,36 @@ void MarketDataFeed::ingest_dexie(const std::string& pair_name,
     ps.bbo_from_filtered_book = false;
     ps.bbo_filter_had_anchor  = false;
     ps.bbo_filter_had_independent_anchor = false;
+    // [SIDEQUALITY 2026-09-01] ...and the per-side verdicts with them, for
+    // exactly the same reason and with the same failure mode if omitted.
+    //
+    // [review] These three fields were originally left untouched here,
+    // which meant a raw ticker ingest replaced dex_best_bid/ask with NEW
+    // prices while the PREVIOUS cycle's disqualification and anchor
+    // survived beside them.  When the full-offer fetch then throws --
+    // the exact scenario the flags above exist for -- Step 8 pairs a
+    // current raw BBO with a stale verdict about a book that no longer
+    // exists, and re-references a tier against a book_side_ref that was
+    // measured against different prices.  That is the S20 defect shape
+    // (fresh numbers, stale evidence) reintroduced by the very feature
+    // meant to close it.
+    //
+    // Reset is to TRUSTED, not to disqualified: an unexamined book has
+    // not failed anything, and book_side_ref returning to 0 records that
+    // nothing screened it.  Every consumer already falls back correctly
+    // on ref == 0 -- Step 8's effective midpoint reverts to bbo_mid_m,
+    // its per-tier reference reverts to the tier's own side, and the
+    // liquidity bid cap reverts to bbo_ref -- so a raw book behaves
+    // exactly as it did before this feature existed.
+    ps.bid_side_anchor_ok = true;
+    ps.ask_side_anchor_ok = true;
+    ps.book_side_ref      = 0.0;
+    // Reset to NoAnchor, NOT BandDisabled.  A raw ticker poll is the
+    // data-gap case by definition -- classify_sides did not run at all this
+    // cycle, whatever the band is configured to.  Resetting to BandDisabled
+    // would hand valuation grade to exactly the unexamined book the round-7
+    // witness exists to refuse.
+    ps.book_side_screen   = bookside::ScreenOutcome::NoAnchor;
     // Age the print by its VALUE, not by when we polled: dex_updated_at is
     // re-stamped every heartbeat, so it cannot answer "how old is this
     // trade?".  A first sighting deliberately leaves last_trade_changed_at
@@ -1169,7 +1212,8 @@ void MarketDataFeed::set_whale_max_spread_multiplier(double multiplier) {
 // compute_mid -- multi-source price aggregation
 //
 // Priority cascade:
-//   0. Order-book VWAP micro-price (depth-weighted, when enabled)
+//   0. Order-book Stoikov micro-price (depth-weighted touch prices, when
+//      enabled)
 //   1. Dexie two-sided quotes -> dex_mid = (bid + ask) / 2
 //   2. Dexie one-sided (bid-only or ask-only) -> NO dex mid; falls to 3.
 //      (This used to publish the surviving side as the mid.)
@@ -1218,9 +1262,12 @@ double MarketDataFeed::compute_mid(const PairState& ps) const {
 
     double dex_mid = 0.0;
 
-    // Case 0: Prefer order-book-derived VWAP micro-price when available.
-    // This is computed from the top N levels of dust-filtered competing
-    // offers and weights by depth -- more robust than simple BBO midpoint.
+    // Case 0: Prefer the order-book-derived Stoikov micro-price when
+    // available.  Each side's TOUCH PRICE is weighted by the opposite side's
+    // top-N cumulative depth over the dust-filtered competing offers -- more
+    // robust than the simple BBO midpoint, and interior to the book by
+    // construction.  (It weighted each side's top-N VWAP until 2026-09-02,
+    // which is NOT interior; see xop/execution/orderbook_mid.hpp.)
     //
     // [S20 2026-08-24] ...and only while it is FRESH.  orderbook_mid is
     // written solely by ingest_competing_offers; when the offers fetch
@@ -1581,7 +1628,207 @@ void MarketDataFeed::apply_mid_gate(PairState& ps, const MarketDataConfig& cfg)
         && (cfg.cex_freshness_threshold_sec <= 0.0
             || age_seconds(ps.cex_updated_at, now)
                    < cfg.cex_freshness_threshold_sec);
+
+    // [SIDEQUALITY review round 6, PR #134] A HALF-DISLOCATED BOOK MUST NOT
+    // MARK EQUITY, and until now it did.
+    //
+    // The grade above tested only that the book was two-sided and screened.
+    // "Two-sided" is a presence test -- dex_best_bid > 0 && dex_best_ask > 0
+    // -- with no price sanity in it at all, and the per-side verdicts
+    // computed in ingest_competing_offers were read by Step 8 and the ladder
+    // but never by this predicate.  So the live XCH/BYC book
+    //
+    //     bid 1.5000   ask 4.9995   bbo_mid 3.24975   anchor 1.41022765
+    //
+    // graded.  Its mid is 2.3044x the anchor, which is INSIDE
+    // mid_anchor_band_ratio (3.0), so gate_mid returns Accept at its early
+    // exit and never calls book_confirms -- the 10,769 bps spread is never
+    // examined by anything.  The mid then reaches
+    // asset_usd_pseudo_price/compute_portfolio_equity_usd (the max-drawdown
+    // breaker) and the mark-to-market price callback (the rolling-window
+    // loss breaker).  A 2.3x valuation error on one leg is a breaker trip.
+    //
+    // Gating the WHOLE expression, not just the book branch, is deliberate:
+    // the published mid is the 70/30 blend, so a fresh CEX leg does not make
+    // a 70%-junk-book mid side-safe.  Leaving `|| cex_fresh` ungated would
+    // keep exactly this hole open for any pair that has a CoinGecko mapping.
+    //
+    // NOT re-referencing to the surviving side instead: that invents a price
+    // the book does not contain, which is what types.hpp already refused to
+    // do for the BBO.  Withholding the grade is the fail-closed answer.
+    //
+    // The mid itself still publishes -- quoting logic needs it, and Step 8
+    // now re-references off the junk side.  Only VALUATION is withheld.  The
+    // consequence on a persistently dislocated pair is that valuation falls
+    // through to the S20 carry and, past valuation_carry_ttl_blocks, to a
+    // DEGRADED cycle.  That is a real behaviour change on a dislocated
+    // market and it is the correct direction.
+    //
+    // [review round 7, PR #134] THREE CORRECTIONS TO THE ROUND-6 PREDICATE,
+    // which read `mid > 0 && book_sides_ok && ((two_sided && grade) || cex)`.
+    //
+    // (1) IT GATED MIDS THE BOOK NEVER TOUCHED.  book_sides_ok gated the
+    //     WHOLE expression, including the `|| cex_fresh` branch reached when
+    //     the book is ONE-SIDED.  compute_mid Case 2 refuses to derive any
+    //     DEX mid from a one-sided book, so w_dex is 0 and the published mid
+    //     is EXACTLY the CEX/anchor value -- yet a disqualified side that
+    //     never entered that number withheld its grade.  Measured: a
+    //     third-party-ask-only book at 4.0x the anchor published
+    //     mid == anchor bit-for-bit and graded FALSE.  On the thin pairs we
+    //     are routinely the only offer on a side (see ~line 2187), and
+    //     engine.cpp records a prior incident of exactly this shape --
+    //     requiring grade on a habitually one-sided pair "zeroed every USD
+    //     figure in the bot on a single feed blip ... and did".  So the side
+    //     verdicts now gate only when the book actually feeds the mid, and
+    //     book_two_sided is the right discriminator: every compute_mid path
+    //     that puts book prices into dex_mid needs both sides present.
+    //
+    // (2) IT WAS VACUOUS EXACTLY WHERE IT MATTERED.  The round-6 vacuity
+    //     note argued: dex_fresh_grade implies bbo_filter_had_independent_
+    //     anchor, hence ref_price > 0, hence the verdicts were genuinely
+    //     computed.  That chain holds ONLY on the book branch, and the note
+    //     said so -- while the expression relied on the flags for BOTH.  On
+    //     the `|| cex_fresh` branch dex_fresh_grade is false, so nothing
+    //     forces the verdicts to have been computed at all.  ingest_dexie
+    //     resets them to TRUE and book_side_ref to 0 every heartbeat (~line
+    //     573).  When the competing-offer fetch then throws -- the exact
+    //     failure the S20 provenance flags exist for -- classify_sides never
+    //     runs, book_sides_ok is trivially true, and a fresh CEX leg graded
+    //     a 70%-raw, self-inclusive, unscreened BBO.  Permanently so with
+    //     competitor tracking off.  book_side_ref is the witness that a real
+    //     classification happened: it is zeroed by ingest_dexie and set only
+    //     by classify_sides past its no-anchor early exit.
+    //
+    //     (The chain also breaks under mid_gate_enabled: false, where
+    //     ref_price is never assigned -- it is computed inside
+    //     `if (cfg.mid_gate_enabled)` -- while
+    //     bbo_filter_had_independent_anchor is true from its
+    //     `!cfg.mid_gate_enabled ||` short-circuit.  sides_examined is false
+    //     there too, so that configuration now withholds grade on two-sided
+    //     books rather than granting it on unexamined ones.)
+    //
+    // (3) THE PER-SIDE BAND ALONE DOES NOT MEAN "NOT DISLOCATED".  The
+    //     round-6 comment promised "A HALF-DISLOCATED BOOK MUST NOT MARK
+    //     EQUITY"; a 3.0x per-side band does not deliver that.  Anchor
+    //     1.41022765, bid 1.5000, ask 4.2000: bid/anchor 1.064 and
+    //     ask/anchor 2.978 are BOTH inside the band, so both sides stand,
+    //     while the book's own spread is 9,474 bps and its mid 2.85 is
+    //     2.02x the anchor -- a 102% valuation error, graded.  The incident
+    //     ask was 3.545x; an ask only 16% lower defeated the whole fix.
+    //     The header's own diagnostic ("one side moving ALONE always leaves
+    //     a wide spread behind") was computed and never consulted here.
+    //
+    //     So the book must also agree with ITSELF, tested with the same
+    //     scalar and the same shape mid_gate::book_confirms uses to decide
+    //     whether a book may serve as evidence -- including its treatment of
+    //     the unmeasurable cases, so the two cannot be configured or
+    //     reasoned into conflict:
+    //       * a CROSSED book has no measurable spread (compute_spread_bps
+    //         returns 0), and classify_sides deliberately falls such a book
+    //         through to the per-side band rather than judging it.  Crossed
+    //         books are normal on Dexie (no matching engine), so this must
+    //         NOT become a valuation blackout: the per-side band governs
+    //         alone, exactly as it does in classify_sides.
+    //       * agree_max 0 is the documented "bypass off" setting, i.e. the
+    //         operator has withdrawn coherence as a reason to trust a book.
+    //         It must not silently become a reason to DISTRUST every book:
+    //         at 0 this conjunct stands down and the per-side band governs
+    //         alone -- the round-6 behaviour, so the knob can never black
+    //         out valuation bot-wide.
+    //
+    // Everything else about round 6 stands and is deliberate.  The mid still
+    // PUBLISHES on a disqualified book -- quoting needs a price and Step 8
+    // re-references off the junk side; only VALUATION is withheld, falling
+    // to the S20 carry and, past valuation_carry_ttl_blocks, to a DEGRADED
+    // cycle.  And it is still not re-referenced to the surviving side: that
+    // invents a price the book does not contain.
+    const bool book_sides_ok =
+        ps.bid_side_anchor_ok && ps.ask_side_anchor_ok;
+    // Witness that classify_sides actually had the chance to run against an
+    // independent anchor this cycle.  NOT bbo_filter_had_independent_anchor
+    // -- see (2).
+    //
+    // [REGRESSION FIXED 2026-09-02] This read `ps.book_side_ref > 0.0`,
+    // which was the right idea reading the wrong field.  ref is 0 from a
+    // single early exit in classify_sides that has TWO causes, and only one
+    // is a reason to withhold:
+    //
+    //   NoAnchor      genuine data gap -- WITHHOLD, this is what b45c30f
+    //                 closed and it stays closed;
+    //   BandDisabled  band_ratio <= 1.0, the operator's DOCUMENTED
+    //                 off-switch (config.hpp:2063) -- an opt-out, not a
+    //                 gap, and withholding on it silently broke the switch.
+    //
+    // Measured on a clean 142-bps book with an anchor present, band 3.0
+    // granted grade while bands 1.0 and 0.0 withheld it, dropping valuation
+    // to the S20 carry and then to a DEGRADED cycle for no visible reason.
+    //
+    // [review round 9] AN EARLIER REVISION OF THIS COMMENT ENDED "The
+    // off-switch costs the per-side band and nothing else", on the argument
+    // that book_agrees_with_itself is independent of the band and fails the
+    // 10,769-bps incident book at every band setting.  Both halves are true
+    // and the conclusion is false, because that measurement holds agree_max
+    // at 5,000 and uses an UNCROSSED book.  The coherence conjunct has TWO
+    // documented stand-downs (see the note directly below it), and in either
+    // one it passes every book:
+    //
+    //   band off + CROSSED book        -> book_spread_bps is 0, 0 <= 5,000
+    //   band off + agree_max 0         -> the conjunct stands down outright
+    //
+    // In both, all three conjuncts of book_side_safe are vacuous at once and
+    // the 3.24975 incident mid marks equity -- measured on this feed, not
+    // argued.  Each stand-down is justified by "the per-side band governs
+    // alone" and the band's off-switch was justified by the coherence test
+    // being independent; each guard licensed by the other, with nothing
+    // checking that both were live.  That is the close_out fail-open shape.
+    //
+    // So the witness needs to know whether a screen is still standing.  Both
+    // inputs to that question are already locals here, and the DECISION is
+    // made in the pure header (bookside::book_was_examined /
+    // coherence_can_bite) rather than by re-deriving band_ratio here, because
+    // nothing in cpp/tests constructs an Engine (TODO S36) -- a decision made
+    // in this file is untestable, which is how b45c30f shipped through a
+    // green suite in the first place.
+    //
+    // Note the ORDER: agree_max_bps must be computed before the witness that
+    // now consumes it.
+    const double agree_max_bps = bookside::effective_agree_max_spread_bps(
+        cfg.book_side_agree_max_spread_bps,
+        cfg.mid_gate_book_confirm_max_spread_bps);
+    // Screened is unaffected by this argument, so the two documented escapes
+    // keep working exactly as their tests pin them while the band is on. It
+    // binds only when the band is off, which is when it is the last guard.
+    const bool sides_examined = bookside::book_was_examined(
+        ps.book_side_screen,
+        bookside::coherence_can_bite(agree_max_bps, book_spread_bps));
+    // NOTE THE ABSENT `book_spread_bps > 0.0` CONJUNCT, which
+    // mid_gate::book_confirms does carry and which does NOT belong here.
+    // compute_spread_bps returns 0 for a CROSSED book, and 0 satisfies the
+    // ceiling below, so a crossed book passes this test and is judged by the
+    // per-side band alone -- exactly as classify_sides judges it. Adding
+    // `> 0.0` to mirror book_confirms would make every crossed cycle
+    // ungraded, and crossed books are normal on Dexie (no matching engine).
+    // book_confirms needs that conjunct because it is deciding whether the
+    // book may OVERRIDE the gate; here we are only asking whether the book
+    // contradicts itself, and an unmeasurable spread is not a contradiction.
+    //
+    // [review round 9] BOTH STAND-DOWNS BELOW ARE RETAINED AND BOTH ARE STILL
+    // CORRECT -- they are what keep a crossed book, and the documented
+    // agree_max 0 setting, from blacking out valuation bot-wide.  What
+    // changed is that neither is any longer a SILENT one: each makes this
+    // conjunct incapable of refusing anything, and `sides_examined` above now
+    // knows that (bookside::coherence_can_bite) and refuses to treat the
+    // band's off-switch as sufficient when it happens.  While the band is on,
+    // nothing here is affected -- ACrossedBookIsStillJudgedByTheBandAlone and
+    // DisablingTheBypassDoesNotBlackOutValuation both still pass unchanged.
+    const bool book_agrees_with_itself =
+        agree_max_bps <= 0.0         // coherence test switched off
+        || book_spread_bps <= agree_max_bps;
+    const bool book_side_safe =
+        !book_two_sided
+        || (sides_examined && book_sides_ok && book_agrees_with_itself);
     ps.mid_valuation_grade = ps.mid_price > 0.0
+        && book_side_safe
         && ((book_two_sided && dex_fresh_grade) || cex_fresh);
 }
 
@@ -1778,6 +2025,15 @@ void MarketDataFeed::publish_snapshot(const PairState& ps) {
     snap.mid_valuation_grade = ps.mid_valuation_grade;
     snap.dex_print_age       = ps.dex_print_age;
     snap.is_stale            = ps.is_stale;
+
+    // [SIDEQUALITY 2026-09-01] Per-side anchor agreement, carried through
+    // on every publish for the same reason as the flags above: the struct
+    // defaults are permissive so hand-built snapshots keep their previous
+    // behaviour, which makes an unset field indistinguishable from a
+    // deliberately trusted one unless the publisher always writes it.
+    snap.bid_side_anchor_ok = ps.bid_side_anchor_ok;
+    snap.ask_side_anchor_ok = ps.ask_side_anchor_ok;
+    snap.book_side_ref      = to_mojos(ps.book_side_ref);
 
     // Write to shared State (thread-safe; State::update_market acquires
     // its own internal mutex).
@@ -2052,8 +2308,36 @@ void MarketDataFeed::ingest_competing_offers(
             : OrderbookMid{};
         const double ob_mid = ob.mid;
 
+        // [review round 5] Compute the per-side verdict HERE, before the
+        // competitors lock, so the book and the verdict that measured it
+        // are written in ONE critical section and cannot desync.  See
+        // get_competing_book().
+        //
+        // DERIVED, not read straight from config: the bypass must never be
+        // WIDER than the published-mid gate's own confirmation threshold.
+        // Both are ceilings on an accept condition over the same spread, so
+        // a wider bypass trusts whole a book the gate would not confirm --
+        // see the direction argument on effective_agree_max_spread_bps.
+        // (This read max() until review round 6, which is the fail-open
+        // direction; the fail-closed cost of min() is documented there.)
+        //
+        // ref_price, NOT offer_ref_used.  offer_ref_used falls back to this
+        // pair's own last accepted mid, and letting a pair's own history
+        // disqualify a side of its own book is the self-referential lock-in
+        // that made the 187.461980 mid unkillable.  Only an INDEPENDENT
+        // anchor may disqualify.
+        const double agree_max =
+            bookside::effective_agree_max_spread_bps(
+                cfg.book_side_agree_max_spread_bps,
+                cfg.mid_gate_book_confirm_max_spread_bps);
+        const auto sq = bookside::classify_sides(
+            filtered_best_bid, filtered_best_ask, ref_price,
+            cfg.book_side_anchor_band_ratio, agree_max);
+
         std::unique_lock lock(mtx_competitors_);
         competing_offers_[pair_name] = std::move(filtered);
+        competing_book_quality_[pair_name] =
+            BookQuality{sq.bid_ok, sq.ask_ok, sq.ref};
 
         // Override dex BBO when the filtered book has meaningful offers.
         // This requires mtx_pairs_ -- we can't nest it under mtx_competitors_
@@ -2113,6 +2397,53 @@ void MarketDataFeed::ingest_competing_offers(
             // into evidence on cycle 2.
             ps.bbo_filter_had_independent_anchor =
                 !cfg.mid_gate_enabled || ref_price > 0.0;
+            // [SIDEQUALITY 2026-09-01] Per-side agreement with the anchor.
+            //
+            // ref_price, NOT offer_ref_used.  offer_ref_used falls back to
+            // this pair's own last accepted mid, and letting a pair's own
+            // history disqualify a side of its own book is precisely the
+            // self-referential lock-in that made the 187.461980 mid
+            // unkillable: once the history is junk, the honest side looks
+            // wrong and gets demoted, which preserves the junk.  Only an
+            // INDEPENDENT anchor may disqualify.  Absent one, ref stays 0
+            // and both sides remain trusted -- unexamined, and recorded as
+            // such.
+            {
+                // The verdict was computed above, beside the offers it
+                // measured; this only mirrors it onto PairState for the
+                // snapshot consumers (Step 8).  Consumers that read the
+                // OFFERS must use get_competing_book() instead, or they
+                // reintroduce the desync this arrangement exists to close.
+                ps.bid_side_anchor_ok = sq.bid_ok;
+                ps.ask_side_anchor_ok = sq.ask_ok;
+                ps.book_side_ref      = sq.ref;
+                // Carried verbatim: only classify_sides knows whether ref
+                // is 0 because nothing could screen the book or because the
+                // operator switched the band off.  Re-deriving this from
+                // cfg.book_side_anchor_band_ratio here would put the
+                // decision back in a file no test can construct.
+                ps.book_side_screen   = sq.outcome;
+                if (!sq.bid_ok || !sq.ask_ok) {
+                    // Warn, not debug.  A disqualified side changes which
+                    // reference three downstream gates use, and the whole
+                    // reason this exists is that the previous behaviour
+                    // (silently suppressing every tier) was invisible at
+                    // info level.
+                    spdlog::warn("[MarketData] {}: book side disqualified vs "
+                                 "anchor {:.8f} (band {:.1f}x) -- bid {:.8f} "
+                                 "{}, ask {:.8f} {}",
+                                 pair_name, sq.ref,
+                                 cfg.book_side_anchor_band_ratio,
+                                 filtered_best_bid,
+                                 sq.bid_ok ? "ok" : "DISQUALIFIED",
+                                 filtered_best_ask,
+                                 sq.ask_ok ? "ok" : "DISQUALIFIED");
+                } else if (sq.bypassed) {
+                    spdlog::debug("[MarketData] {}: book is internally "
+                                  "coherent -- both sides trusted whole",
+                                  pair_name);
+                }
+            }
             // Publish unconditionally, INCLUDING the "no usable mid" zero.
             // The old `if (ob_mid > 0.0)` made this field sticky: once a book
             // went one-sided or empty the last good mid stayed in place and
@@ -2375,6 +2706,27 @@ std::vector<CompetingOffer> MarketDataFeed::get_competing_offers(
         return {};
     }
     return it->second;
+}
+
+MarketDataFeed::CompetingBook MarketDataFeed::get_competing_book(
+    const std::string& pair_name) const
+{
+    // ONE lock covers both maps, which is the entire point: a caller must
+    // not be able to observe a book from one cycle beside a verdict from
+    // another.
+    std::shared_lock lock(mtx_competitors_);
+    CompetingBook out;
+    if (auto it = competing_offers_.find(pair_name);
+        it != competing_offers_.end()) {
+        out.offers = it->second;
+    }
+    if (auto q = competing_book_quality_.find(pair_name);
+        q != competing_book_quality_.end()) {
+        out.bid_side_anchor_ok = q->second.bid_ok;
+        out.ask_side_anchor_ok = q->second.ask_ok;
+        out.book_side_ref      = q->second.ref;
+    }
+    return out;
 }
 
 // =========================================================================

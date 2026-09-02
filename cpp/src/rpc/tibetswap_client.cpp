@@ -22,7 +22,7 @@
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include <boost/asio/use_awaitable.hpp>
-#include <spdlog/sinks/stdout_color_sinks.h>
+#include "xop/util/client_logger.hpp"
 
 namespace xop::rpc {
 
@@ -56,12 +56,15 @@ std::string to_lower_hex(std::string s) {
 }
 
 /// Shared logger for the free parsing helpers (which have no client state).
+///
+/// Returns the SAME logger the client constructor registers, so a parse
+/// warning and the request that produced it land in one place.  That sharing
+/// used to depend on an undocumented ordering (the ctor had to run first, or
+/// this became the site that registered the name); it no longer does -- either
+/// caller may be first.  Called only on the malformed-payload branches at :187
+/// and :206, so the registry lookup is not on any hot path.
 std::shared_ptr<spdlog::logger> parse_log() {
-    auto log = spdlog::get("tibetswap");
-    if (!log) {
-        log = spdlog::stdout_color_mt("tibetswap");
-    }
-    return log;
+    return xop::util::get_or_create_client_logger("tibetswap");
 }
 
 /// Extract a JSON field as int64, accepting integer, unsigned, float, or
@@ -284,10 +287,9 @@ TibetSwapClient::TibetSwapClient(asio::io_context&      ioc,
       limiter_(cfg_.rate_limit_max_requests,
                std::chrono::milliseconds{cfg_.rate_limit_window_ms}) {
 
-    log_ = spdlog::get("tibetswap");
-    if (!log_) {
-        log_ = spdlog::stdout_color_mt("tibetswap");
-    }
+    // Adopts the process logger's sinks so this client's diagnoses reach the
+    // rotating file log, not just stdout.  See xop/util/client_logger.hpp.
+    log_ = xop::util::get_or_create_client_logger("tibetswap");
 }
 
 TibetSwapClient::~TibetSwapClient() {

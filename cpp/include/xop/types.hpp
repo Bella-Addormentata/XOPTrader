@@ -327,6 +327,46 @@ struct MarketSnapshot {
     // [S20] Poll-age staleness verdict at publish time (PairState::is_stale;
     // previously computed and then dropped on the floor).
     bool         is_stale{false};
+
+    // [SIDEQUALITY 2026-09-01] Per-SIDE agreement with the independent
+    // anchor.  A book can be dislocated on ONE side only, and every
+    // consumer here used to treat best_bid/best_ask as an atomic pair --
+    // so nothing in the tree could express "the bid stack is honest and
+    // the ask stack is junk".
+    //
+    // Live case that forced this (XCH/BYC, 2026-09-01, price is BYC per
+    // XCH): the bid stack ran 1.5000 / 1.4283 / 1.4066 / 1.3793 -- every
+    // level within 6.4% of the independently-solved 1.41022765 -- while
+    // the ask stack sat at 4.9995 / 5.0000 / 9.7500 / 10.0000, i.e. 3.5x
+    // to 7.1x the same anchor.  The "10,769 bps spread" that produced was
+    // never a spread; it was an ABSENT ask side wearing one.  Consumers
+    // that averaged the two (bbo_mid) or referenced the junk side
+    // directly then suppressed the correctly-priced quote and anchored
+    // the bid to a poisoned midpoint.
+    //
+    // These flags do NOT remove the offers.  Stripping a side here takes
+    // dex_best_ask to 0, which walks compute_mid into Case 2 (a lone bid
+    // is refused as a mid) and Case 3 (needs a fresh last trade, which a
+    // silent pair does not have), publishing no mid at all -- Step 4 then
+    // marks the quote invalid and the pair goes SILENT rather than
+    // mispriced.  Flagging keeps the book intact and lets each consumer
+    // choose its own reference, which is the reversible half of the same
+    // idea.
+    //
+    // Default TRUE, matching mid_valuation_grade's convention: a side is
+    // trusted unless something actively disqualified it, so hand-built
+    // snapshots in tests and tools keep their previous behaviour.
+    bool         bid_side_anchor_ok{true};
+    bool         ask_side_anchor_ok{true};
+
+    // The anchor the two flags above were measured against (quote per
+    // base, same units as mid_price).  0 means no independent reference
+    // was available this cycle, in which case BOTH flags stay true --
+    // nothing was screened, so nothing may be disqualified.  Consumers
+    // that re-reference away from a junk side need this value, and taking
+    // it from the same struct guarantees they use the SAME number the
+    // disqualification was computed from.
+    Mojo         book_side_ref{0};
 };
 
 // ---------------------------------------------------------------------------

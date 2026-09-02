@@ -406,6 +406,92 @@ Every offer lifecycle event and trade settlement is recorded in an append-only S
 
 `offer_log` stores the current state of each offer, while `offer_closure_events` preserves the append-only closure history used for cancel-cause analytics. After the updated trader binary has run migrations against the target database, use `python scripts/report_offer_closure_events.py --top 15` for a compact breakdown of primary close causes, reconcile follow-ups, and recent closure observations.
 
+### Price-Discovery Diagnostics (read-only)
+
+Both scripts open the database `mode=ro` and are safe to run against a live
+engine. Neither is wired into the engine, and neither should be: their output
+is for an operator making a decision, not an input to quoting. The reasoning
+is in [docs/price-discovery-from-trade-history.md](docs/price-discovery-from-trade-history.md).
+
+```bash
+python scripts/byc_price_diagnostic.py --days 7
+```
+
+Re-derives the "BYC 7-day traded VWAP 1.001" figure that **five** sites cite
+as ground truth and that no code path produces — `par_anchor.hpp`,
+`config.hpp`, `Engine::quote_usd_factor()`, `test_fair_value.cpp` and
+`config.yaml`. It was a manual measurement taken in July. Reports maker
+and taker fills separately (the taker rows are the ones the *counterparty*
+priced), prints the sample size beside every statistic, marks anything with
+n < 30 as an anecdote, and gives a median and trimmed mean next to the VWAP,
+which is not robust to outliers. Also reports executable depth near par —
+the question a VWAP cannot answer. Add `--no-network` for local-only.
+
+```bash
+python scripts/highlow_spread_estimator.py --days 30
+```
+
+Corwin-Schultz (2012) and Abdi-Ranaldo (2017) spread estimators, behind
+degeneracy, freshness and sample-adequacy gates — the last of these grounded
+in Ardia et al. (2024), which is the authority on how these estimators
+misbehave when there is too little usable data.
+
+Read the inputs before quoting the output. Both papers want daily bars off a
+*trade*-price series, and we have none. The daily bars here are built from
+the one table that actually persists a third-party BBO —
+`offer_log.book_best_bid` / `book_best_ask` — so these are **quote samples
+standing in for trade prices**, which is outside the regime the estimators
+were derived for. That caveat is real and the script prints it on every run.
+
+An earlier revision offered `snapshots.mid_price_mojos` + `spread_bps` as a
+denser second source, claiming the two invert back to the same sides.
+**They do not, and that source is now refused.** `snapshots` has no bid or
+ask column; `mid_price_mojos` is a depth-weighted orderbook micro-price
+blended across DEX, CEX and AMM legs, while `spread_bps` is computed
+separately from `dex_best_bid`/`ask`. Centring one on the other fabricates
+two shifted sides. Measured on the only enabled pair, the micro-price left
+the book on 46.9% of ingests and was clamped onto `best_bid`, putting both
+reconstructed sides a full half-spread below the truth.
+(`--dexie` adds a live 24h high/low from `TickerData::price_high` /
+`price_low`, the one field the engine fetches and discards unread. It is a
+single bar, both estimators need two consecutive ones, so it is an
+independent range check and gate test — never an estimator input.)
+
+Their value here is a *descriptive discrepancy*, not measurement: the posted
+book spread and the estimator output are different quantities computed
+different ways, and a large gap between them is worth an operator's attention.
+
+The honest answer, measured 2026-09-01, is that the estimators contribute
+nothing to this argument in either direction. Compared LIKE FOR LIKE against
+the most recent day pair (2026-08-30..2026-08-31), the posted 14,666.7 bps
+sits at 0.99× the comparator's 14,863.9 bps: no gap at all, and the tool
+prints "No discrepancy to look into." Even that is soft, because the
+comparator is 74% of the 20,000 bps ceiling Corwin-Schultz saturates toward,
+so it is the estimator running out of range rather than a measured width.
+
+The 8.0× gap an earlier revision of this section quoted was an ARTIFACT of a
+window mismatch -- one instant divided by a month-long average -- and the
+tool was changed to stop producing it. The absent-side finding for XCH/BYC
+is unaffected, because it never rested on these estimators: it rests on the
+direct book observation, bids within 6.4% of the 1.41022765 anchor against
+asks at 3.5×–7.1× it. Run the tool for current numbers rather than quoting
+any of these.
+
+**Retracted 2026-09-01:** this section previously claimed the default
+`quote-touch` bars give an *upper* bound on the estimate, so the gap held "a
+fortiori". That is wrong and is withdrawn, not softened — Corwin-Schultz
+*subtracts* the two-day range term, so the estimate is not monotonic in the
+sampled range and a wider range can lower it. See the worked counterexample in
+`docs/price-discovery-from-trade-history.md` § 6. A bar construction is a
+sensitivity choice, not a bound. The estimators also do not identify sides at
+all: the absent-side conclusion for XCH/BYC stands on the direct book
+observation (bids within 6.4% of the 1.41022765 anchor, asks at 3.5×–7.1× it)
+and never needed them.
+
+The script refuses outright on stale, degenerate or under-sampled books rather
+than returning a plausible-looking number, and a spread number for the engine
+comes from the book or from realized fills — never from here.
+
 ---
 
 ## Backtesting
@@ -611,6 +697,32 @@ Key sections to configure before first run:
 
 ## Running
 
+> **A pair enable takes effect only on restart, so the restart order matters.**
+> A config reload disables a pair live but *refuses* to enable one — it logs
+> "restart the engine to start quoting it" and carries on. `XCH/BYC` was
+> re-enabled by the operator on 2026-09-01 and then backed out the same day
+> pending deployment — an enable that only a restart can arm is still a
+> latent trigger, because the GUI relaunches the engine whenever the GUI
+> restarts.
+>
+> **Do not restart onto a binary older than PR #134** with that flag set. On
+> the pre-#134 binary the restart reproduces the 2026-08-30 incident: the
+> ladder self-crosses and drops every tier, the mojo-scale bug in the
+> peg-observation route latches a false depeg about ten minutes in and
+> cancels every offer on every pair touching BYC, and the bogus valuation
+> feeds the 10% drawdown breaker — which pauses the **whole engine**, taking
+> `XCH/DBX` down with it. Merge, build, deploy, then restart.
+>
+> Enabling turns on both sides; there is no per-pair one-sided switch. In the
+> pair's own orientation (price = BYC per XCH) the bid pays BYC to buy XCH,
+> selling our BYC at about $1.01 into the honest side of the book — that exit
+> at par is the reason to be there. The ask accumulates BYC, for which there
+> is no exit: nothing bids for BYC above about $0.29. Watch the BYC balance;
+> if it rises rather than falls, turn the pair back off. `BYC/wUSDC.b` stays
+> disabled for an unrelated reason — the 2026-08-25 warp.green bridge
+> compromise depegged wUSDC.b (~$0.80) and the pair has had no print since
+> 2026-08-24.
+
 ```bash
 # Dry run (compute quotes, never submit offers)
 ./build/xop_trader --config config.yaml --dry-run --verbose
@@ -814,10 +926,34 @@ Useful flags:
 
 - `--dry-run`: show expected changes without writing.
 - `--raw-retention-days N`: change high-frequency retention window.
+- `--confirm-large-prune`: permit deleting more than 25% of a raw table in
+  one run. **Without it the run refuses and changes nothing** (exit 3).
 - `--no-prune-strategy-quotes`: keep all `strategy_quotes` rows.
 - `--vacuum`: reclaim on-disk space after pruning.
 
 Note: run maintenance when the engine is idle when possible.
+
+> **Retention had not run since 2026-05-16, and the first run would have been
+> destructive.** Raw history reaches back to 2026-04-03, so the
+> `--raw-retention-days 120` default would have deleted **91,244 of 207,787**
+> `snapshots` rows (43.9%) and **363,374** `strategy_quotes` rows (29.0%) on
+> the first cycle — including all of April, the densest month of the BYC book
+> history that [docs/price-discovery-from-trade-history.md](docs/price-discovery-from-trade-history.md)
+> and `scripts/byc_price_diagnostic.py` depend on. Measured 2026-09-01.
+>
+> **This is now guarded.** A run that would delete more than 25% of a raw
+> table refuses, prints what it would have removed, and exits 3 without
+> touching the database. The hazard was never the retention number — it is
+> that a long gap between runs silently converts a routine window into a bulk
+> deletion, and the loss grows exactly while nobody is watching. A steady
+> daily run removes a day at a time and never approaches the bound.
+>
+> To proceed deliberately, either widen `--raw-retention-days` to keep the
+> history, or pass `--confirm-large-prune` to delete it on purpose. Take a
+> `--backup` either way — it now uses SQLite's own backup API rather than a
+> file copy, which matters here because the database runs in WAL mode against
+> a live engine and a plain copy omitted the (15 MB, at time of writing)
+> uncheckpointed WAL.
 
 ### Cross-Platform Scheduled Backups (No OS Scheduler Required)
 

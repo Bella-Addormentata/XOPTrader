@@ -18,6 +18,9 @@
 
 #include "xop/config.hpp"
 
+// std::isfinite / std::abs are named directly below; both arrived only
+// transitively via config.hpp before.
+#include <cmath>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -105,6 +108,27 @@ public:
         // Already manually flagged — stay in SuspectedFailure.
         if (s.manually_flagged) {
             s.status = DepegStatus::SuspectedFailure;
+            return s.status;
+        }
+
+        // [review round 8] AN UNREADABLE PRICE HOLDS THE STREAK; it does not
+        // clear it. Without this guard a non-finite mid falls through both
+        // comparisons below -- NaN >= bail_pct and NaN >= warn_pct are both
+        // false -- and lands in the final `else`, which zeroes
+        // blocks_above_bail AND block_entered_warn and reports Normal. That
+        // is a blind read published as a clean bill of health, which is the
+        // fail-open shape the documented close_out family is about, and the
+        // exact INVERSE of what this detector's asset-level sibling does:
+        // observe_peg guards finiteness first and returns WITHOUT writing.
+        // The two now agree.
+        //
+        // Defence in depth rather than a demonstrated live bug: every leg of
+        // compute_mid is admitted through a `> 0.0` test that NaN fails, so
+        // the published mid cannot be NaN today. But the caller's own guard
+        // is `if (mid <= 0.0) continue;`, which does NOT reject NaN, so the
+        // only thing standing between a NaN and this reset branch is an
+        // upstream invariant in another file. Cheap to close the shape here.
+        if (!std::isfinite(mid_price) || mid_price <= 0.0) {
             return s.status;
         }
 

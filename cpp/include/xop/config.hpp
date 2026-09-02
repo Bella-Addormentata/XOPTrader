@@ -140,6 +140,38 @@ struct PairConfig {
     std::optional<double>   max_half_spread_bps_override;
     std::optional<double>   min_offer_size_units_override;
 
+    // [BBOPERPAIR 2026-09-01] Per-pair BBO proximity caps.
+    //
+    // strategy.bbo_sanity_max_aggressive_dev / max_passive_dev already are
+    // exactly the control an operator reaches for when they want "do not
+    // quote further than X% from the market on this pair": a per-SIDE
+    // percentage bound, measured against the SAME-SIDE BBO (never the mid,
+    // which breaks precisely when a bound would bind), that SUPPRESSES
+    // rather than clamps -- the disposition RTS 7 Art. 20(2)(c) requires
+    // and CME, Binance, Kraken and Nasdaq all implement.
+    //
+    // What was missing is that they were GLOBAL. The pairs this bot trades
+    // are not alike: XCH/DBX's sigma width floor never exceeded 141 bps in
+    // 48,402 logged evaluations, while XCH/BYC's exceeded 200 bps on 87.7%
+    // of them. One number cannot serve both -- a bound tight enough to mean
+    // anything on the first silences the second, and a bound loose enough
+    // for the second never binds on the first.
+    //
+    // Absent -> the strategy-level value, so every existing pair is
+    // unchanged.
+    //
+    // NOTE the asymmetry these inherit, and do not undo: the AGGRESSIVE cap
+    // is tight (a tier that would execute at a dislocated price) while the
+    // PASSIVE cap is wide (a tier that merely rests far from a thin book).
+    // ALWAYSOFFER widened the passive side deliberately, because a
+    // cost-floored ask suppressed for resting far from a crashed book buys
+    // zero protection for guaranteed zero participation. Tightening the
+    // passive override is therefore the one that can silence a pair;
+    // measured, a 2% passive bound withdraws XCH/BYC entirely on 87.7% of
+    // blocks. See cpp/include/xop/strategy/bbo_sanity.hpp.
+    std::optional<double>   bbo_sanity_max_aggressive_dev_override;
+    std::optional<double>   bbo_sanity_max_passive_dev_override;
+
     // -- Market revival -----------------------------------------------------
     // Opt-in for a pair whose third-party book is expected to be empty or
     // stale (every offer outside the 20% outlier band).  Normally Step 7
@@ -559,22 +591,44 @@ struct StrategyConfig {
     double   fair_value_residual_widen_floor_bps{150.0};
 
     // -- Order-book micro-price blend schedule -------------------------------
-    // The order-book mid is a Stoikov micro-price: each side's top-N VWAP is
-    // weighted by the OPPOSITE side's depth, so the estimate leans toward the
-    // thin side -- the side that moves next.  That is genuinely the right
-    // estimator on a tight two-sided book and it is why it is still here.
+    // The order-book mid is a Stoikov micro-price: each side's TOUCH PRICE is
+    // weighted by the OPPOSITE side's top-N depth, so the estimate leans
+    // toward the thin side -- the side that moves next.  That is genuinely the
+    // right estimator on a tight two-sided book and it is why it is here.
     //
-    // Its information content collapses as the book widens.  "Which side is
+    // WHAT THIS SCHEDULE IS FOR -- AND WHAT IT IS NOT.  The micro-price's
+    // information content collapses as the book widens.  "Which side is
     // thinner" is a statement about the next tick; on a 1259 bps book there is
     // no next tick to speak of, and the answer says essentially nothing about
-    // fair value.  Worse, each side's VWAP lies OUTSIDE the BBO by
-    // construction (bid_vwap <= best_bid, ask_vwap >= best_ask), so once one
-    // side's depth dominates the estimate is dragged out of the book entirely:
+    // fair value.  THAT is what the schedule below addresses, and it is the
+    // only thing it addresses.
+    //
+    // It is NOT a boundedness mechanism, and must never be re-purposed as one.
+    // Until 2026-09-02 the estimator substituted each side's top-N VWAP for
+    // its touch price.  The premise usually cited for the taper is correct --
+    // each side's VWAP does lie OUTSIDE the BBO by construction (bid_vwap <=
+    // best_bid, ask_vwap >= best_ask) -- but the conclusion drawn from it, to
+    // add a clamp and taper the weight off with width, was wrong twice over:
+    //
+    //   * The right remedy was to fix the estimator.  Weighting the TOUCH
+    //     PRICES makes the result a convex combination of best_bid and
+    //     best_ask, hence bounded inside the book for every depth ratio and
+    //     every spread, with no clamp and no taper required.
+    //   * The taper cannot bound anything, because it disengages exactly where
+    //     the unbounded form was worst.  Writing d_b = best_bid - bid_vwap,
+    //     d_a = ask_vwap - best_ask and S = the spread, the old form escaped
+    //     below the bid whenever ask_depth/bid_depth > (S + d_a)/d_b -- S is
+    //     ADDITIVE IN THE NUMERATOR, so a NARROWER spread made escape EASIER.
+    //     Live XCH/DBX confirmed it: 1,849 clamp firings over ~39h, binding on
+    //     46.9% of ingests, and the taper fully disengaged at 95.3% of them.
+    //
     // BYC/wUSDC.b (~65 deep bids vs ~9 thin asks) published a "mid" of
     // 1.144728 sitting EXACTLY on its own best ask at block 9087661, against a
-    // true BYC value of ~$1.01 corroborated five independent ways.
+    // true BYC value of ~$1.01 corroborated five independent ways.  That was
+    // the unbounded estimator, not the schedule.
     //
-    // So the micro-price weight is degraded continuously with relative spread:
+    // With the estimator corrected, the weight is still degraded continuously
+    // with relative spread, purely on the information-content argument:
     //
     //     w_micro = clamp(1 - (spread_bps - narrow) / (wide - narrow), 0, 1)
     //     mid     = w_micro * microprice + (1 - w_micro) * BBO midpoint
@@ -1959,14 +2013,19 @@ struct MarketDataSettings {
     /// the pair last traded.
     double dex_last_trade_max_age_sec{1800.0};
 
-    // -- Order-book-derived mid-price (depth-weighted VWAP micro-price) -----
+    // -- Order-book-derived mid-price (Stoikov micro-price) ----------------
+    //
+    // [2026-09-02] Touch prices weighted by opposite-side top-N depth, NOT a
+    // VWAP micro-price.  The VWAP form was the defect; see
+    // xop/execution/orderbook_mid.hpp.
 
-    /// When true, the aggregator prefers a depth-weighted VWAP micro-price
+    /// When true, the aggregator prefers the order-book Stoikov micro-price
     /// from competing offers over the simple Dexie BBO midpoint.
     bool orderbook_mid_enabled{true};
 
-    /// Number of order book levels per side to include in the VWAP
-    /// micro-price computation.  Default: 5.
+    /// Number of order book levels per side over which each side's
+    /// cumulative DEPTH is summed for the micro-price weighting.
+    /// Default: 5.
     uint32_t orderbook_mid_depth{5};
 
     // -- [S20 2026-08-24] Published-mid plausibility gate --------------------
@@ -1994,6 +2053,90 @@ struct MarketDataSettings {
     /// Anchorless fallback: max fractional mid move vs the last accepted
     /// mid in one heartbeat (~52 s).  <= 0 disables.
     double mid_gate_max_step_frac{0.5};
+
+    /// [SIDEQUALITY 2026-09-01] Multiplicative band for the PER-SIDE
+    /// anchor-agreement test.  A side whose best dust-filtered price sits
+    /// outside [1/ratio, ratio] of the independent anchor stops being used
+    /// as a reference; its offers stay in the book.  Keep at or below
+    /// mid_anchor_band_ratio -- config load warns otherwise, because a
+    /// side wider than the gate's own band could remain trusted while the
+    /// mid it implies is refused.  <= 1.0 disables.
+    ///
+    /// [review round 9] DISABLING THIS IS COUPLED TO
+    /// book_side_agree_max_spread_bps -- READ BOTH BEFORE CHANGING EITHER.
+    /// With the band off, nothing can disqualify a side, so the ONLY
+    /// remaining screen on whether a book's mid may MARK EQUITY is the
+    /// coherence test below.  That test has two stand-downs of its own: it is
+    /// switched off at 0, and it cannot measure a CROSSED book at all
+    /// (crossed books are normal on Dexie).  In either state, turning this
+    /// band off would leave a two-sided book with no screen whatsoever.
+    ///
+    /// The bot refuses that combination rather than trusting it: valuation
+    /// grade is WITHHELD when the band is off AND the coherence test cannot
+    /// bite, so the pair falls to the S20 carry and then to a DEGRADED cycle.
+    /// Fail-closed, and visible.  If you disable this band, keep
+    /// book_side_agree_max_spread_bps positive or expect crossed cycles to go
+    /// ungraded.
+    double book_side_anchor_band_ratio{3.0};
+
+    /// Two-sides-agree bypass: a two-sided book whose own spread is at
+    /// most this wide is trusted WHOLE, however far it sits from the
+    /// anchor.  It is the same "the whole market repriced" evidence
+    /// mid_gate::book_confirms() accepts.
+    ///
+    /// LOWERING this takes effect.  RAISING it above
+    /// mid_gate_book_confirm_max_spread_bps has NO effect: the value
+    /// actually used is min(this, mid_gate_book_confirm_max_spread_bps),
+    /// derived in bookside::effective_agree_max_spread_bps.  0 disables
+    /// the bypass outright and BINDS -- 0 on EITHER knob switches it off.
+    ///
+    /// [review round 6] This was max() and the doc promised the opposite.
+    /// A bypass wider than the gate trusts WHOLE a book the gate would
+    /// refuse to confirm, which re-enables the poisoned-BBO behaviour the
+    /// side classifier exists to stop.  It also meant HARDENING the gate
+    /// (lowering mid_gate_book_confirm_max_spread_bps on its own) silently
+    /// widened the bypass past it; that edit now tightens both.
+    ///
+    /// KNOWN COST of the safe direction, stated so nobody "fixes" it back:
+    /// setting this BELOW the gate's threshold can disqualify both sides of
+    /// a genuinely coherent far-from-anchor book that the gate accepted as
+    /// confirmation, and Step 8 then takes its both-sides-disqualified path
+    /// -- the bot quotes conservatively through a real market-wide
+    /// repricing.  That is fail-closed, and it is the trade this repo makes
+    /// on purpose.  If you do not want it, leave this at the default and
+    /// tune mid_gate_book_confirm_max_spread_bps instead.
+    ///
+    /// [review round 7] THE COST IS NOT ONLY A QUOTING COST.  Since the
+    /// valuation-grade fix landed, this same scalar also decides whether a
+    /// two-sided book's mid may MARK EQUITY: apply_mid_gate requires the
+    /// book's own spread to be within the effective value here before
+    /// granting mid_valuation_grade.  So lowering this knob can additionally
+    /// cost a pair its valuation, which falls to the S20 carry and, past
+    /// valuation_carry_ttl_blocks, degrades the cycle and freezes the
+    /// max-drawdown peak.  Both effects are fail-closed and both are
+    /// intended; budget for the risk-machinery one too, not just the spread.
+    ///
+    /// 0 remains safe against that: at 0 the coherence requirement stands
+    /// down entirely and the per-side band governs valuation alone, so
+    /// switching the bypass off can never black out valuation bot-wide.
+    ///
+    /// [review round 9] "THE PER-SIDE BAND GOVERNS ALONE" IS A PROMISE ABOUT
+    /// THE OTHER KNOB, AND IT IS ONLY TRUE WHILE THAT KNOB IS ON.  The
+    /// sentence above was written -- correctly -- on the assumption that
+    /// book_side_anchor_band_ratio is live.  If the band is ALSO disabled,
+    /// nothing governs: every conjunct of the valuation book check stands
+    /// down at once and a dislocated or crossed book marks equity off a mid
+    /// arbitrarily far from the anchor.  That combination shipped briefly and
+    /// graded the 3.24975 XCH/BYC incident mid.
+    ///
+    /// It is now refused rather than trusted: with the band off, valuation
+    /// grade additionally requires that THIS test can still refuse the book
+    /// (positive here, and a measurable -- i.e. uncrossed -- spread).  Both
+    /// knobs remain individually safe, and the two of them together are
+    /// fail-closed rather than fail-open.  Note the same state is reachable
+    /// by lowering mid_gate_book_confirm_max_spread_bps to 0, since the
+    /// effective value is the min() of the two.
+    double book_side_agree_max_spread_bps{5000.0};
 
     /// Max spread (bps) for a sibling pair's book to serve as a leg of the
     /// triangulated implied cross.

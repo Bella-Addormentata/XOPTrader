@@ -17,6 +17,7 @@
 #include "xop/config.hpp"
 #include "xop/rpc/coingecko_parse.hpp"
 #include "xop/feed_listings.hpp"
+#include "xop/strategy/pid_reachability.hpp"
 
 #include <spdlog/spdlog.h>
 #include <yaml-cpp/yaml.h>
@@ -781,6 +782,32 @@ std::vector<PairConfig> parse_pairs(const YAML::Node& root)
             }
             p.max_half_spread_bps_override = v;
         }
+        // [BBOPERPAIR 2026-09-01] Per-pair BBO proximity caps. Both are
+        // FRACTIONS, not bps -- 0.10 means 10% -- matching the
+        // strategy-level fields they override. Bounded (0, 1] deliberately:
+        // 0 would suppress every tier on that side, and > 1 means "further
+        // than 100% from the touch", which is not a proximity cap in any
+        // useful sense and is almost certainly a bps value entered by
+        // mistake. Rejecting at load beats discovering it as a silent
+        // ladder.
+        auto read_dev_override = [&](const char* key,
+                                     std::optional<double>& dst) {
+            if (item[key] && item[key].IsDefined() && !item[key].IsNull()) {
+                const double v = item[key].as<double>();
+                if (!std::isfinite(v) || !(v > 0.0) || v > 1.0) {
+                    throw ConfigError(
+                        idx + "." + key + " must be a finite fraction in "
+                        "(0, 1] -- 0.10 means 10%, not 10 or 1000; got "
+                        + std::to_string(v));
+                }
+                dst = v;
+            }
+        };
+        read_dev_override("bbo_sanity_max_aggressive_dev_override",
+                          p.bbo_sanity_max_aggressive_dev_override);
+        read_dev_override("bbo_sanity_max_passive_dev_override",
+                          p.bbo_sanity_max_passive_dev_override);
+
         if (item["min_offer_size_units_override"]
             && item["min_offer_size_units_override"].IsDefined()
             && !item["min_offer_size_units_override"].IsNull()) {
@@ -1753,6 +1780,56 @@ StrategyConfig parse_strategy(const YAML::Node& root)
     }
     if (cfg.comp_pid_min_offset > cfg.comp_pid_max_offset) {
         throw ConfigError(sec + ".comp_pid_min_offset must be <= comp_pid_max_offset");
+    }
+
+    // -- [S39] Unreachable PID clamps ------------------------------------
+    // A clamp the gains can never reach is not a safety bound, it is
+    // decoration that reads as a tuned value. config.yaml:216 ships
+    // pid_min_mult: 0.7 while the gain budget (kp*target + ki*integral_max
+    // = 0.18) floors the multiplier at 0.820 -- measured across 5,287 live
+    // ticks in which 0.820 is the minimum ever observed.
+    //
+    // WARN, NEVER THROW. The check above is a contradiction that cannot be
+    // resolved, so it refuses. This one resolves deterministically, and the
+    // config.hpp DEFAULTS carry the same problem (pid_target_fill_rate{0.10}
+    // with pid_integral_max{2.0} against pid_min_mult{0.70}), so a throw
+    // would reject a bare config, a fresh deployment, config.example.yaml --
+    // which has no pid_* keys at all -- and every load_config case in
+    // cpp/tests/test_config.cpp, whose kMinimalValidYaml has none either.
+    // Refusing to boot over a value that has never once bound would be a
+    // self-inflicted outage. The engine derives the effective clamp anyway
+    // (strategy::effective_pid_min_mult); this only tells the operator.
+    {
+        const strategy::PidGains spread_gains{
+            cfg.pid_kp, cfg.pid_ki, cfg.pid_kd, cfg.pid_target_fill_rate,
+            cfg.pid_ema_alpha, cfg.pid_integral_max, cfg.pid_warmup_blocks};
+        strategy::PidReachabilityFinding f{};
+        if (strategy::spread_pid_min_mult_is_unreachable(
+                cfg.pid_min_mult, spread_gains, f)) {
+            spdlog::warn("[Config] {}.pid_min_mult ({:.3f}) is UNREACHABLE: "
+                         "the gain budget kp*target + ki*integral_max = "
+                         "{:.4f} floors the multiplier at {:.3f}, so this "
+                         "clamp can never bind. Set it to {:.3f} or widen the "
+                         "gains -- as written it reads as a tuned safety "
+                         "bound and is not one.",
+                         sec, f.configured, f.authority, f.reachable,
+                         f.reachable);
+        }
+
+        const strategy::PidGains comp_gains{
+            cfg.comp_pid_kp, cfg.comp_pid_ki, cfg.comp_pid_kd,
+            cfg.comp_pid_target_fill_rate, cfg.comp_pid_ema_alpha,
+            cfg.comp_pid_integral_max, cfg.comp_pid_warmup_blocks};
+        strategy::PidReachabilityFinding g{};
+        if (strategy::comp_pid_min_offset_is_unreachable(
+                cfg.comp_pid_min_offset, comp_gains, g)) {
+            spdlog::warn("[Config] {}.comp_pid_min_offset ({:.0f}) is "
+                         "UNREACHABLE: the gain budget {:.4f} bottoms the "
+                         "offset at {:.0f}. Widening this clamp changes "
+                         "nothing -- the floor is the gain budget, not the "
+                         "clamp.",
+                         sec, g.configured, g.authority, g.reachable);
+        }
     }
 
     return cfg;
@@ -3045,6 +3122,12 @@ MarketDataSettings parse_market_data(const YAML::Node& root)
     read_dbl ("implied_cross_max_leg_spread_bps",
               cfg.implied_cross_max_leg_spread_bps);
 
+    // [SIDEQUALITY 2026-09-01] Per-side anchor agreement.
+    read_dbl ("book_side_anchor_band_ratio",
+              cfg.book_side_anchor_band_ratio);
+    read_dbl ("book_side_agree_max_spread_bps",
+              cfg.book_side_agree_max_spread_bps);
+
     // Validate ranges.
     if (cfg.whale_volume_fraction < 0.0 || cfg.whale_volume_fraction > 1.0) {
         throw ConfigError(sec + ".whale_volume_fraction must be in [0, 1]");
@@ -3091,6 +3174,35 @@ MarketDataSettings parse_market_data(const YAML::Node& root)
         || cfg.implied_cross_max_leg_spread_bps <= 0.0) {
         throw ConfigError(sec + ".implied_cross_max_leg_spread_bps must be "
                                 "a finite value > 0");
+    }
+    // [SIDEQUALITY 2026-09-01] Non-negative and finite; <= 1.0 is the
+    // documented "disabled" setting rather than an error, matching
+    // mid_anchor_band_ratio's convention.
+    if (!std::isfinite(cfg.book_side_anchor_band_ratio)
+        || cfg.book_side_anchor_band_ratio < 0.0) {
+        throw ConfigError(sec + ".book_side_anchor_band_ratio must be a "
+                                "finite value >= 0");
+    }
+    if (!std::isfinite(cfg.book_side_agree_max_spread_bps)
+        || cfg.book_side_agree_max_spread_bps < 0.0) {
+        throw ConfigError(sec + ".book_side_agree_max_spread_bps must be a "
+                                "finite value >= 0");
+    }
+    // A side band WIDER than the published-mid gate's own band would let a
+    // side stay a trusted reference while the mid it implies is refused as
+    // implausible -- the two would be adjudicating the same question and
+    // disagreeing.  Warn rather than throw: it is a coherence smell, not an
+    // unsafe value, and the operator may be deliberately loosening the side
+    // test while leaving the gate alone.
+    if (cfg.book_side_anchor_band_ratio > 1.0
+        && cfg.mid_anchor_band_ratio > 1.0
+        && cfg.book_side_anchor_band_ratio > cfg.mid_anchor_band_ratio) {
+        spdlog::warn("[Config] {}.book_side_anchor_band_ratio ({:.2f}) is "
+                     "wider than mid_anchor_band_ratio ({:.2f}): a book side "
+                     "can stay a trusted reference while the published mid "
+                     "it implies is rejected", sec,
+                     cfg.book_side_anchor_band_ratio,
+                     cfg.mid_anchor_band_ratio);
     }
 
     return cfg;

@@ -1033,15 +1033,27 @@ std::vector<TierQuote> LiquidityEngine::compute_ladder(
         //
         // Safety rules become:
         //   BID: never bid above min(bbo_ref, mid) — prevents crossing
-        //        both the BBO spread AND the model mid (depth-weighted
-        //        VWAP micro-price / CEX blend).  The model mid can sit
-        //        well below the BBO midpoint when order-book depth is
-        //        asymmetric, causing offers that pass the BBO check to
-        //        be immediately cancelled by classify_tier_staleness.
+        //        both the BBO spread AND the model mid (order-book
+        //        Stoikov micro-price / CEX blend).  The model mid can sit
+        //        away from the BBO midpoint when order-book depth is
+        //        asymmetric -- it leans toward the THIN side -- causing
+        //        offers that pass the BBO check to be immediately
+        //        cancelled by classify_tier_staleness.  (Before the
+        //        2026-09-02 correction it could sit OUTSIDE the BBO
+        //        entirely; it is now interior by construction.)
         //   ASK: never ask below bbo_ref — when model mid sits ABOVE
         //        the best ask (CEX > DEX), we trust the DEX BBO for
         //        competitive ask placement.
-        const double bbo_ref_f = (best_comp_bid > 0 && best_comp_ask > 0)
+        // [SIDEQUALITY 2026-09-01] A midpoint is only a reference when both
+        // sides are.  When one side has been disqualified against the
+        // independent anchor, including it here builds the safety reference
+        // out of the very prices it is meant to police, so the disqualified
+        // side is dropped and the model mid stands in for it.
+        const bool bid_side_ok = adj_cfg.book_bid_side_anchor_ok;
+        const bool ask_side_ok = adj_cfg.book_ask_side_anchor_ok;
+        const bool both_sides_ok = bid_side_ok && ask_side_ok;
+        const double bbo_ref_f =
+            (best_comp_bid > 0 && best_comp_ask > 0 && both_sides_ok)
             ? (static_cast<double>(best_comp_bid)
                + static_cast<double>(best_comp_ask)) / 2.0
             : mid_f;
@@ -1053,7 +1065,32 @@ std::vector<TierQuote> LiquidityEngine::compute_ladder(
         // making bid_cap < comp_best and anchoring 0 bids every cycle.
         // The BBO midpoint alone is the correct spread-crossing guard;
         // classify_tier_staleness guards against truly crossed offers.
-        const std::int64_t bid_cap  = bbo_ref;
+        //
+        // [SIDEQUALITY 2026-09-01] ...for a HEALTHY book, which is why the
+        // paragraph above still stands and the revert it describes is left
+        // in place.  Once a side is disqualified the argument no longer
+        // applies: the objection to min(bbo_ref, mid) was that it declines
+        // to anchor when the model mid sits below the best competing bid,
+        // and in the disqualified state DECLINING IS THE POINT.  Anchoring
+        // at 1.5001 against a 1.4102 fair value is not competitiveness, it
+        // is buying above fair value on purpose.  Zero anchored bids is the
+        // correct output there, and the log line below says so rather than
+        // leaving it a mystery.
+        const std::int64_t bid_cap = both_sides_ok
+            ? bbo_ref
+            : std::min<std::int64_t>(bbo_ref,
+                                     static_cast<std::int64_t>(
+                                         std::llround(mid_f)));
+        if (!both_sides_ok) {
+            spdlog::warn("[Liquidity] {} book side disqualified (bid {}, "
+                         "ask {}) -- bbo_ref falls back to model mid {} and "
+                         "bid_cap tightens to {}; zero anchored bids here "
+                         "means the book's best bid is above fair value",
+                         pair_name_, bid_side_ok ? "ok" : "DISQUALIFIED",
+                         ask_side_ok ? "ok" : "DISQUALIFIED",
+                         static_cast<std::int64_t>(std::llround(mid_f)),
+                         bid_cap);
+        }
 
         int anchored_bids = 0;
         int anchored_asks = 0;

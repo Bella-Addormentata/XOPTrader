@@ -14,11 +14,17 @@
 #include <gtest/gtest.h>
 
 #include <xop/config.hpp>
+#include <xop/execution/book_side_quality.hpp>
 
+#include <spdlog/sinks/ringbuffer_sink.h>
+#include <spdlog/spdlog.h>
+
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <limits>
+#include <memory>
 #include <string>
 
 namespace {
@@ -579,6 +585,18 @@ std::string with_strategy_keys(const std::string& extra) {
     if (pos == std::string::npos) return y;
     y.insert(pos + anchor.size(), extra);
     return y;
+}
+
+std::string with_pair_extra(const std::string& line) {
+    // Insert a key into the single pair in kMinimalValidYaml. The pair block
+    // is indented four spaces, so the inserted line must match or YAML
+    // silently reads it as a sibling of `pairs:` rather than a pair field --
+    // which would make an override test pass while overriding nothing.
+    std::string s(kMinimalValidYaml);
+    const std::string anchor = "    enabled: true";
+    const auto pos = s.find(anchor);
+    s.insert(pos + anchor.size(), "\n    " + line);
+    return s;
 }
 
 }  // namespace
@@ -1399,6 +1417,339 @@ TEST(ConfigParserTest, S20GateKnobs_NegativeAndZeroLegCapRejected) {
         TempYaml tmp(with_market_data("  implied_cross_max_leg_spread_bps: 0.0\n"));
         EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
     }
+}
+
+// ============================================================================
+// [SIDEQUALITY 2026-09-01] Per-side anchor-agreement knob validation through
+// the REAL YAML parser.
+//
+// Same hazard as the S20 knobs above: the side-quality tests build
+// MarketDataConfig directly, so nothing exercised these two validators, and
+// yaml-cpp happily hands back `.nan` / `.inf`.  A `.nan` side band would make
+// every band comparison false -- the per-side test silently skipped while the
+// config read as though it were armed -- and an `.inf` agreement cap would
+// trust ANY two-sided book whole, which is exactly the absent-ask-side book
+// this feature exists to distrust.
+//
+// The disabled-value case below is the one that matters most: <= 1.0 is
+// DOCUMENTED as "disables the per-side test", not as an error.  A validator
+// that rejected it would take the escape hatch away from the operator.
+// ============================================================================
+
+// [BBOPERPAIR 2026-09-01] Per-pair BBO proximity caps.
+//
+// FRACTIONS (0.10 == 10%), bounded (0, 1]. The bound is the point: the
+// strategy-level fields these override are fractions too, and an operator
+// reaching for a "percentage from the market" knob is one keystroke from
+// entering 10 (meaning 10%) or 1000 (meaning bps). Either sails through an
+// unbounded parse and yields a cap that can never bind -- a suppression
+// control silently switched off. Rejecting at load is the whole value.
+
+TEST(ConfigParserTest, BboSanityPerPairOverrides_ParseAndReachTheConfig) {
+    TempYaml tmp(with_pair_extra(
+        "bbo_sanity_max_aggressive_dev_override: 0.05\n"
+        "    bbo_sanity_max_passive_dev_override: 0.45"));
+    auto cfg = xop::load_config(tmp.path());
+    ASSERT_FALSE(cfg.pairs.empty());
+    ASSERT_TRUE(cfg.pairs[0].bbo_sanity_max_aggressive_dev_override.has_value());
+    ASSERT_TRUE(cfg.pairs[0].bbo_sanity_max_passive_dev_override.has_value());
+    EXPECT_DOUBLE_EQ(*cfg.pairs[0].bbo_sanity_max_aggressive_dev_override, 0.05);
+    EXPECT_DOUBLE_EQ(*cfg.pairs[0].bbo_sanity_max_passive_dev_override, 0.45);
+}
+
+TEST(ConfigParserTest, BboSanityPerPairOverrides_AbsentMeansUnset) {
+    // Absent must be nullopt, NOT a defaulted number: the engine tests
+    // has_value() to decide whether to fall back to the strategy-level
+    // value, so a silently defaulted override would pin every pair to it and
+    // make the strategy-level setting unreachable.
+    TempYaml tmp(kMinimalValidYaml);
+    auto cfg = xop::load_config(tmp.path());
+    ASSERT_FALSE(cfg.pairs.empty());
+    EXPECT_FALSE(cfg.pairs[0].bbo_sanity_max_aggressive_dev_override.has_value());
+    EXPECT_FALSE(cfg.pairs[0].bbo_sanity_max_passive_dev_override.has_value());
+}
+
+TEST(ConfigParserTest, BboSanityPerPairOverrides_RejectBpsEnteredByMistake) {
+    // THE REGRESSION THE BOUND EXISTS FOR. 10 ("10%") and 1000 ("1000 bps")
+    // are both plausible operator entries and both would produce a cap that
+    // can never bind.
+    for (const char* v : {"10", "100", "1000", "1.5"}) {
+        TempYaml tmp(with_pair_extra(
+            std::string("bbo_sanity_max_aggressive_dev_override: ") + v));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError)
+            << "aggressive override " << v << " must be rejected";
+    }
+    for (const char* v : {"10", "1000"}) {
+        TempYaml tmp(with_pair_extra(
+            std::string("bbo_sanity_max_passive_dev_override: ") + v));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError)
+            << "passive override " << v << " must be rejected";
+    }
+}
+
+TEST(ConfigParserTest, BboSanityPerPairOverrides_RejectZeroNegativeNonFinite) {
+    // Zero would suppress EVERY tier on that side. A config value that
+    // silently stops a pair quoting is worse than one that fails to load.
+    for (const char* v : {"0", "0.0", "-0.1", ".nan", ".inf", "-.inf"}) {
+        TempYaml a(with_pair_extra(
+            std::string("bbo_sanity_max_aggressive_dev_override: ") + v));
+        EXPECT_THROW(xop::load_config(a.path()), xop::ConfigError)
+            << "aggressive override " << v;
+        TempYaml b(with_pair_extra(
+            std::string("bbo_sanity_max_passive_dev_override: ") + v));
+        EXPECT_THROW(xop::load_config(b.path()), xop::ConfigError)
+            << "passive override " << v;
+    }
+}
+
+TEST(ConfigParserTest, BboSanityPerPairOverrides_BoundaryOneIsAccepted) {
+    // 1.0 == "100% from the touch" is the documented upper edge and must
+    // LOAD. Pinning the boundary in the ACCEPTING direction matters: a
+    // stricter-than-documented parser is what an operator discovers at 3am.
+    TempYaml tmp(with_pair_extra(
+        "bbo_sanity_max_aggressive_dev_override: 1.0\n"
+        "    bbo_sanity_max_passive_dev_override: 1.0"));
+    ASSERT_NO_THROW(xop::load_config(tmp.path()));
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_DOUBLE_EQ(*cfg.pairs[0].bbo_sanity_max_aggressive_dev_override, 1.0);
+}
+
+TEST(ConfigParserTest, SideQualityKnobs_ExplicitValuesParse) {
+    TempYaml tmp(with_market_data(
+        "  book_side_anchor_band_ratio: 2.5\n"
+        "  book_side_agree_max_spread_bps: 750.0\n"));
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_DOUBLE_EQ(cfg.market_data.book_side_anchor_band_ratio, 2.5);
+    EXPECT_DOUBLE_EQ(cfg.market_data.book_side_agree_max_spread_bps, 750.0);
+}
+
+TEST(ConfigParserTest, SideQualityKnobs_DefaultsWhenAbsent) {
+    {
+        // No market_data section at all.
+        TempYaml tmp(kMinimalValidYaml);
+        auto cfg = xop::load_config(tmp.path());
+        EXPECT_DOUBLE_EQ(cfg.market_data.book_side_anchor_band_ratio, 3.0);
+        EXPECT_DOUBLE_EQ(cfg.market_data.book_side_agree_max_spread_bps,
+                         5000.0);
+    }
+    {
+        // Section present, both keys absent: the neighbouring key must not
+        // drag either default off its documented value.
+        TempYaml tmp(with_market_data(
+            "  cex_freshness_threshold_sec: 600\n"));
+        auto cfg = xop::load_config(tmp.path());
+        EXPECT_DOUBLE_EQ(cfg.market_data.book_side_anchor_band_ratio, 3.0);
+        EXPECT_DOUBLE_EQ(cfg.market_data.book_side_agree_max_spread_bps,
+                         5000.0);
+    }
+}
+
+TEST(ConfigParserTest, SideQualityKnobs_NonFiniteRejected) {
+    for (const char* bad : {".nan", ".inf", "-.inf"}) {
+        {
+            TempYaml tmp(with_market_data(
+                std::string("  book_side_anchor_band_ratio: ") + bad));
+            EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError)
+                << "book_side_anchor_band_ratio accepted " << bad;
+        }
+        {
+            TempYaml tmp(with_market_data(
+                std::string("  book_side_agree_max_spread_bps: ") + bad));
+            EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError)
+                << "book_side_agree_max_spread_bps accepted " << bad;
+        }
+    }
+}
+
+TEST(ConfigParserTest, SideQualityKnobs_NegativeRejected) {
+    {
+        TempYaml tmp(with_market_data(
+            "  book_side_anchor_band_ratio: -1.0\n"));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+    }
+    {
+        TempYaml tmp(with_market_data(
+            "  book_side_agree_max_spread_bps: -0.5\n"));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+    }
+}
+
+TEST(ConfigParserTest, SideQualityKnobs_DisabledBandAccepted) {
+    // <= 1.0 DISABLES the per-side anchor test; it is a legal setting, not a
+    // malformed one.  Rejecting it here is the regression this case exists to
+    // catch -- assert acceptance AND that the value survives to the config.
+    const struct { const char* written; double expected; } kDisabling[] = {
+        {"0.0", 0.0}, {"0.5", 0.5}, {"1.0", 1.0},
+    };
+    for (const auto& d : kDisabling) {
+        TempYaml tmp(with_market_data(
+            std::string("  book_side_anchor_band_ratio: ") + d.written + "\n"));
+        ASSERT_NO_THROW(xop::load_config(tmp.path()))
+            << "disabling value rejected: " << d.written;
+        auto cfg = xop::load_config(tmp.path());
+        EXPECT_DOUBLE_EQ(cfg.market_data.book_side_anchor_band_ratio,
+                         d.expected)
+            << "disabling value not carried through: " << d.written;
+    }
+    {
+        // 0 on the agreement cap is likewise legal: it means no two-sided
+        // book is ever narrow enough to be trusted whole.
+        //
+        // [review round 6, PR #134] THAT SENTENCE USED TO BE FALSE.  The
+        // effective threshold was max(configured, mid-gate confirm), so 0
+        // here returned the gate's 5000 and the bypass carried on firing.
+        // The comment promised operators an escape hatch that did not
+        // exist, and the test asserted only that the number survived the
+        // parser -- which it did, on its way to being discarded.
+        //
+        // The helper now returns min(), so the sentence is true, and the
+        // load-level assertion is followed by the RUNTIME assertion that
+        // makes it a contract instead of a claim.
+        TempYaml tmp(with_market_data(
+            "  book_side_agree_max_spread_bps: 0.0\n"));
+        auto cfg = xop::load_config(tmp.path());
+        EXPECT_DOUBLE_EQ(cfg.market_data.book_side_agree_max_spread_bps, 0.0);
+
+        // The value the classifier ACTUALLY uses, against the gate's
+        // shipped default rather than a hand-written constant.
+        const double effective =
+            xop::bookside::effective_agree_max_spread_bps(
+                cfg.market_data.book_side_agree_max_spread_bps,
+                cfg.market_data.mid_gate_book_confirm_max_spread_bps);
+        ASSERT_GT(cfg.market_data.mid_gate_book_confirm_max_spread_bps, 0.0)
+            << "sanity: the gate's own threshold must be non-zero, or this "
+               "case cannot distinguish min() from max()";
+        EXPECT_DOUBLE_EQ(effective, 0.0)
+            << "0 must BIND, not be treated as 'unset' and replaced by the "
+               "mid gate's threshold";
+
+        // And the behaviour the operator was promised: a book so tight it
+        // would otherwise be trusted whole (10 bps) gets no bypass, and the
+        // per-side band is what decides.
+        const auto q = xop::bookside::classify_sides(
+            /*best_bid=*/5.60, /*best_ask=*/5.6056,
+            /*anchor=*/1.41022765,
+            cfg.market_data.book_side_anchor_band_ratio, effective);
+        EXPECT_FALSE(q.bypassed)
+            << "with the cap at 0 no two-sided book may be trusted whole";
+        EXPECT_FALSE(q.ask_ok)
+            << "3.97x the anchor, and nothing bypassed the band";
+    }
+}
+
+namespace {
+
+/// Capturing sink for the advisory warnings config.cpp emits through the
+/// DEFAULT logger.  Same technique as cpp/tests/test_client_logger.cpp: a
+/// ringbuffer sink installed as the default logger for the duration of one
+/// test, then removed.
+using LogProbe = spdlog::sinks::ringbuffer_sink_mt;
+
+/// Installs a capturing default logger and restores the previous one.
+/// spdlog's default logger and registry are PROCESS state, so this must be
+/// exception-safe and must not leave the probe installed for later tests.
+class CapturedLog {
+public:
+    /// Capacity is generous on purpose: a ringbuffer keeps only the LAST N
+    /// records, and load_config emits other advisories.  A tight buffer would
+    /// silently evict the line under test and fail for the wrong reason.
+    explicit CapturedLog(std::size_t capacity = 256)
+        : probe_(std::make_shared<LogProbe>(capacity)),
+          saved_(spdlog::default_logger())
+    {
+        auto logger = std::make_shared<spdlog::logger>("config_test_probe",
+                                                       probe_);
+        // Level set on THIS logger only.  spdlog::set_level() would stamp
+        // every registered logger in the process, which test_client_logger.cpp
+        // asserts on -- a global side effect is not worth one advisory line.
+        logger->set_level(spdlog::level::trace);
+        spdlog::set_default_logger(logger);
+    }
+
+    ~CapturedLog() {
+        spdlog::set_default_logger(saved_);
+        spdlog::drop("config_test_probe");
+    }
+
+    CapturedLog(const CapturedLog&)            = delete;
+    CapturedLog& operator=(const CapturedLog&) = delete;
+
+    /// Every captured payload joined by newlines, for substring matching.
+    [[nodiscard]] std::string text() const {
+        std::string out;
+        for (const auto& rec : probe_->last_raw()) {
+            out.append(rec.payload.data(), rec.payload.size());
+            out.push_back('\n');
+        }
+        return out;
+    }
+
+    /// True if any captured record at >= warn level contains `needle`.
+    [[nodiscard]] bool warned_containing(const std::string& needle) const {
+        for (const auto& rec : probe_->last_raw()) {
+            if (rec.level < spdlog::level::warn) continue;
+            const std::string payload(rec.payload.data(), rec.payload.size());
+            if (payload.find(needle) != std::string::npos) return true;
+        }
+        return false;
+    }
+
+private:
+    std::shared_ptr<LogProbe>       probe_;
+    std::shared_ptr<spdlog::logger> saved_;
+};
+
+}  // namespace
+
+TEST(ConfigParserTest, SideQualityKnobs_WiderThanMidBandWarnsAndLoads) {
+    // A side band wider than mid_anchor_band_ratio lets a side stay a trusted
+    // reference while the mid it implies is refused.  config.cpp treats that
+    // as a coherence smell: it emits an advisory spdlog WARNING and loads the
+    // values anyway.  BOTH halves are checked here.
+    //
+    // [review round 6, PR #134] The previous version of this test asserted
+    // only the load and said so in a comment that argued sink capture was not
+    // worth the trouble.  The consequence was that deleting the warning
+    // outright left the case green -- the exact vacuity this repo's
+    // mutation-check rule exists to catch.  test_client_logger.cpp already
+    // owned the capture technique, so the cost was a fixture, not machinery.
+    CapturedLog log;
+
+    TempYaml tmp(with_market_data(
+        "  mid_anchor_band_ratio: 2.0\n"
+        "  book_side_anchor_band_ratio: 6.0\n"));
+    ASSERT_NO_THROW(xop::load_config(tmp.path()));
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_DOUBLE_EQ(cfg.market_data.mid_anchor_band_ratio, 2.0);
+    EXPECT_DOUBLE_EQ(cfg.market_data.book_side_anchor_band_ratio, 6.0);
+
+    // Matched on the KEY NAMES and the numbers, not on the prose: the
+    // advisory's wording may legitimately be reworded, but a warning that no
+    // longer names which two knobs disagree is not the same warning.
+    EXPECT_TRUE(log.warned_containing("book_side_anchor_band_ratio"))
+        << "captured log was:\n" << log.text();
+    EXPECT_TRUE(log.warned_containing("mid_anchor_band_ratio"))
+        << "captured log was:\n" << log.text();
+    EXPECT_TRUE(log.warned_containing("6.00"))
+        << "the advisory must report the offending value; captured log was:\n"
+        << log.text();
+    EXPECT_TRUE(log.warned_containing("2.00"))
+        << "captured log was:\n" << log.text();
+}
+
+TEST(ConfigParserTest, SideQualityKnobs_CoherentBandsDoNotWarn) {
+    // The negative half, without which the assertions above would also pass
+    // against a warning emitted unconditionally on every load.
+    CapturedLog log;
+
+    TempYaml tmp(with_market_data(
+        "  mid_anchor_band_ratio: 6.0\n"
+        "  book_side_anchor_band_ratio: 2.0\n"));
+    ASSERT_NO_THROW(xop::load_config(tmp.path()));
+
+    EXPECT_FALSE(log.warned_containing("book_side_anchor_band_ratio"))
+        << "a side band NARROWER than the mid band is coherent and must be "
+           "silent; captured log was:\n" << log.text();
 }
 
 TEST(ConfigParserTest, S20CarryTtl_ParsesAndRejectsNegative) {

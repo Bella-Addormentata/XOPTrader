@@ -370,8 +370,47 @@ public:
     /// @param requested  Filter by requested asset id.
     /// @param page       1-based page index.
     /// @param page_size  Results per page (max typically 100).
-    /// @param sort       Sorting key: "price_asc", "price_desc",
-    ///                   "date_found_asc", "date_found_desc", etc.
+    /// @param sort       Sorting key, forwarded verbatim as the API's
+    ///                   ``sort`` query parameter.  Empty = API default,
+    ///                   which is ascending price.
+    ///
+    ///                   AN UNKNOWN SORT VALUE IS SILENTLY IGNORED, not
+    ///                   rejected: the response still carries
+    ///                   ``success: true`` and 200, just in default order.
+    ///                   That silence is why a wrong key here survived
+    ///                   unnoticed -- there is nothing to catch.
+    ///
+    ///                   The ``_asc``/``_desc`` suffix convention is NOT
+    ///                   uniform across keys, so do not derive one key's
+    ///                   spelling from another's.  Probed live against
+    ///                   /v1/offers on 2026-09-01, comparing each result
+    ///                   against the unsorted default:
+    ///
+    ///                     HONOURED (order changes):
+    ///                       "price_desc", "date_completed", "date_found"
+    ///                     IGNORED (identical to default, as was a
+    ///                     deliberately bogus key):
+    ///                       "date_completed_desc", "date_found_desc",
+    ///                       "date_found_asc", "price"
+    ///                     INDETERMINATE:
+    ///                       "price_asc" -- returns the default order, but
+    ///                       the default IS ascending price, so honoured
+    ///                       and ignored are indistinguishable.  It is in
+    ///                       live use (engine.cpp's book fetch) and works
+    ///                       either way.
+    ///
+    ///                   So "price_desc" is honoured while
+    ///                   "date_found_desc" is not: the suffix is part of
+    ///                   some key names and not others.  This list is what
+    ///                   was tested, not an exhaustive enumeration of what
+    ///                   the API accepts -- do not treat it as one.
+    ///                   CRITICAL: an unrecognised sort value is SILENTLY
+    ///                   ACCEPTED AND IGNORED, not rejected.  The response
+    ///                   is still success:true with a full page of offers,
+    ///                   merely in an arbitrary order, so a wrong key
+    ///                   cannot be caught by error handling and will look
+    ///                   exactly like a working one.  Check any new key
+    ///                   against the live API before trusting its order.
     /// @param compact    If true the response omits bech32 offer strings.
     /// @param status     Offer status filter (0=active, 4=completed, ...).
     [[nodiscard]] boost::asio::awaitable<OffersPage> get_offers(
@@ -401,6 +440,19 @@ public:
 
     /// GET /v1/offers?status=4  (settled trades, most recent first)
     /// Convenience wrapper around get_offers with status=4 (completed).
+    ///
+    /// Sorts with sort="date_completed".  Verified against the live API:
+    /// that key is accepted and already returns newest-first on its own,
+    /// and "date_completed_desc" is NOT recognised.  An unrecognised sort
+    /// value is SILENTLY IGNORED (still success:true, just an arbitrary
+    /// page), so a wrong sort key never fails loudly.  The API's full set
+    /// of accepted keys has NOT been established -- see the note above
+    /// the definition in ``dexie_client.cpp``.
+    ///
+    /// NO CALLERS TODAY -- deliberately.  Routing a traded-price series
+    /// into price discovery was considered and REJECTED; see the note
+    /// above the definition in ``dexie_client.cpp`` and
+    /// docs/price-discovery-from-trade-history.md.
     [[nodiscard]] boost::asio::awaitable<OffersPage> get_trades(
         std::string_view pair_id   = {},
         uint32_t         page      = 1,

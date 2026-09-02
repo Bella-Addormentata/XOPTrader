@@ -617,14 +617,78 @@ class MetricsService(QObject):
             }
 
         # Attach the global recommended_spread_multiplier to every pair entry.
+        #
+        # THIS IS THE STARTUP RECOMMENDATION AND IT IS FROZEN AT STARTUP.
+        # [S42 2026-09-02] Both of the engine's update_analysis() call sites
+        # are inside Engine::run_startup_analysis(), so this gauge is written
+        # during the observation phase and never again.  The live spread PID
+        # multiplier moves every block and is applied to the SAME spread
+        # field.  Displaying this one alone showed the operator 1.50x
+        # ("defensively wide") while the engine sat at 0.820 (maximum
+        # tightening) -- not a stale reading but an inverted one.  The live
+        # values are attached alongside below; do not drop them, and do not
+        # let a caller render this key on its own.
         spread_mult = _labelled(
             m, "xop_analysis", "metric", "recommended_spread_multiplier",
             default=1.0,
         )
         for pair in result:
             result[pair]["spread_multiplier"] = spread_mult
+            result[pair].update(self._strategy_for(m, pair))
 
         return result
+
+    @staticmethod
+    def _strategy_for(m: dict, pair: str) -> dict[str, Any]:
+        """Read the live ``xop_strategy`` gauges for one pair.
+
+        Emitted every block by ``Engine::step_export_metrics()``.  Absent
+        keys fall back to neutral values so an older engine binary -- which
+        does not publish this family at all -- degrades to "no live data"
+        rather than to a wrong number.
+        """
+        def _g(metric_name: str, default: float = 0.0) -> float:
+            inner = m.get("xop_strategy", {})
+            for labels, value in inner.items():
+                label_dict = dict(labels)
+                if (label_dict.get("pair_name") == pair and
+                        label_dict.get("metric") == metric_name):
+                    return value
+            return default
+
+        # Sentinel: the family is missing entirely on an engine that predates
+        # it.  `spread_pid_active` is the discriminator because it is always
+        # published (0 or 1) when the family exists.
+        has_live = any(
+            dict(labels).get("pair_name") == pair
+            for labels in m.get("xop_strategy", {})
+        )
+
+        return {
+            "live_available":        has_live,
+            "spread_pid_active":     _g("spread_pid_active") >= 1.0,
+            "spread_pid_mult":       _g("spread_pid_mult", default=1.0),
+            "spread_pid_ema_fill":   _g("spread_pid_ema_fill"),
+            # NOT the applied multiplier -- the product of two of Step 5's
+            # ten mutation sites (startup analysis x spread PID).  Named for
+            # what it is since 2026-09-02; the gauge that claimed to be
+            # "effective" ignored two assignment sites that discard the whole
+            # chain.  Defaults to 0.0 = no reading, never 1.0.
+            "analysis_x_pid_mult":   _g("analysis_x_pid_mult"),
+            # What Step 5 ACTUALLY did, measured end/start.  0 = no reading
+            # (Step 5 never reached the pair this block).
+            "spread_base_bps":       _g("spread_base_bps"),
+            "spread_applied_bps":    _g("spread_applied_bps"),
+            "spread_applied_mult":   _g("spread_applied_mult"),
+            "rail_latched":          _g("rail_latched") >= 1.0,
+            "rail_latched_blocks":   _g("rail_latched_blocks"),
+            "comp_pid_active":       _g("comp_pid_active") >= 1.0,
+            "comp_pid_offset":       _g("comp_pid_offset"),
+            "comp_gate_base":        _g("comp_gate_base"),
+            "comp_gate_effective":   _g("comp_gate_effective"),
+            "take_suppressed":       _g("take_suppressed"),
+            "take_tracked":          _g("take_tracked"),
+        }
 
     def is_analysis_active(self) -> bool:
         """True when startup analysis metrics indicate an in-progress analysis.

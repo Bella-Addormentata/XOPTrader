@@ -5,6 +5,310 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.13] — 2026-09-01 — one side of a book can be junk
+
+XCH/BYC stopped quoting on 2026-08-30 and the reason was not price
+discovery. The engine had already solved the pair correctly: CoinGecko
+XCH/USD combined with BYC's declared par gave `XCH/BYC = 1.41022765` at
+sigma 171 bps, and Step 7 replaced the raw book mid of 3.2498 with
+1.41141912 at full external weight. Three consumers downstream then
+preferred the book to the number, and the pair went silent *because* the
+solver was right.
+
+The book, in the pair's own orientation (BYC per XCH), with XCH at $1.43:
+
+| side | levels | implies BYC |
+|---|---|---|
+| ask | 4.9995, 5.0000, 9.7500, 10.0000 × 3 | $0.286 … $0.143 |
+| bid | 1.5000, 1.4283, 1.4066, 1.3793, 1.3699, 1.3514 | $0.953 … $1.058 |
+
+Every bid is within 6.4% of the anchor. Every ask is 3.5×–7.1× it. The
+"10,769 bps spread" was never a spread — it was an **absent ask side**
+wearing the costume of one. Nothing in the tree could say that, because
+every consumer read `best_bid`/`best_ask` as an atomic pair.
+
+- **Per-side anchor agreement**, in the new pure header
+  `execution/book_side_quality.hpp` and carried on `MarketSnapshot` as
+  `bid_side_anchor_ok` / `ask_side_anchor_ok` / `book_side_ref`. A side
+  whose best dust-filtered price sits outside 3× of the *independent*
+  anchor is no longer treated as a reference. Computed from `ref_price`,
+  never `offer_ref_used` — letting a pair's own last accepted mid
+  disqualify a side of its own book is the self-referential lock-in that
+  made the 187.461980 mid unkillable.
+- **The offers are flagged, not removed.** Stripping the ask side takes
+  `dex_best_ask` to 0, `compute_mid` Case 2 refuses to publish a lone bid
+  as a mid, Case 3 wants a fresh print a silent pair does not have — so
+  the pair publishes no mid, Step 4 invalidates the quote, and the correct
+  1.41 never reaches the ladder. Silence instead of a mispriced quote is
+  not an improvement when the alternative is quoting correctly.
+- **The two-sides-agree bypass** is the part that must not regress. A
+  genuine market-wide repricing moves both sides together and leaves the
+  book coherent — the same evidence `mid_gate::book_confirms()` accepts to
+  override an anchor breach. A two-sided book whose own spread is at most
+  5000 bps is therefore trusted whole, however far it sits from the
+  anchor. Dislocation is one side moving *alone*, and that always leaves a
+  wide spread behind. Pinned to the same default as the gate's own
+  confirmation threshold so the two halves cannot be configured into
+  contradiction.
+- **Step 8 Check 1 is SKIPPED when a side is disqualified, not
+  re-referenced — and an earlier revision of this entry got the mechanism
+  wrong.** It claimed Check 1 compared Step 7's centre (1.41141912) against
+  `bbo_mid` (3.24975) for 56.6% and cleared every tier. Step 8 performs no
+  such comparison. `mid` there is the **published** mid, and for a pair
+  with no CEX or AMM leg the published mid *is* the BBO midpoint —
+  bit-for-bit `bbo_mid_m`. On the live book the deviation is identically
+  **zero**, and this check has never fired for XCH/BYC.
+  Re-pointing it at the surviving side, as an earlier commit on this branch
+  did, turned that 0% into `|3.24975 − 1.5| / 1.5` = **116.7%**, clearing
+  every tier on every block — silencing the pair this work exists to
+  un-silence, by a different route. It now skips instead, which restores
+  the pre-existing behaviour exactly. Both operands of this check are
+  derived from the book being judged, so no substitution makes it
+  meaningful. Check 2 is unaffected: it compares **tier prices**, which are
+  built around Step 7's centre, so substituting that centre compares like
+  with like.
+- **Step 8 Check 2** measured our correctly-priced 1.41 ask against the
+  4.9995 junk ask and called it 71.8% "aggressive", killing it, while a
+  1.41 bid passed at 6.0%. It now references the independent anchor when
+  the tier's own side is disqualified. The effective midpoint moves too:
+  `classify_tier`'s bid passive rule would otherwise read any bid up to
+  3.24975 as a safe passive rest.
+- **The bid cap, which was live money.** `bbo_ref` is the midpoint of the
+  two sides, so one dislocated side moved the reference meant to police
+  it: `bid_cap = 3.24975` never bound, and the competitive anchor parked a
+  bid at 1.5001 against a 1.4102 fair value — a ~6.3% overpay on every XCH
+  bought, every cycle. A disqualified side no longer contributes to
+  `bbo_ref` — which is the whole of the fix, and is what the two ladder
+  regression tests pin. (The accompanying `min(bbo_ref, mid)` is
+  decoration: in the disqualified state `bbo_ref` has already fallen back
+  to the model mid, so the `min` cannot bind. It is retained only as an
+  explicit statement of intent.) Healthy books are byte-identical: this is
+  shared hot-path code for the pairs that actually earn, and the
+  pre-existing `bid_cap == bbo_ref` rule for healthy books is a separate
+  decision that is not revisited here.
+- **A unit test reproduces the incident exactly.** On the unexamined path
+  the three bids anchor above the ask tiers and the cross check drops
+  **6/6 tiers** — the 2026-08-30 log line in shape. The outcome was never
+  "a slightly expensive bid"; it was no quotes at all.
+
+### The false depeg, which would have re-fired ten minutes after any restart
+
+- **`step_observe_asset_pegs` read a mojo-scaled mid as a USD price.**
+  `snap.mid_price` is 1e12-scaled; dividing XCH's USD price by it gave
+  `usd_obs ≈ 3.4e-13` on every heartbeat and produced
+  `[PEGSUSPEND] observed $0.0000 vs target 1.0000, 100.0% off` — for
+  wUSDC.b on 2026-08-29 and BYC on 2026-08-30, both false, both cancelling
+  every resting offer on every pair touching the asset. `asset_peg_rt_` is
+  in-memory only, so a restart cleared the latch and re-armed it 30
+  heartbeats (~10 min) later.
+- **Fixing the scale alone was not enough**, and this is the part that
+  needed deciding rather than patching. Correctly scaled, the observation
+  on that book is $1.43 / 3.25 = **$0.44** — still 56% off par, still past
+  `bail_pct`. The route reads the *published book mid*, so it inherits the
+  junk side. It now refuses to observe at all when a side is disqualified,
+  which routes into `observe_peg`'s data-gap branch and **holds** the
+  streak rather than advancing or resetting it.
+- **Deliberately not re-sourced to the fair-value estimate**, which is the
+  obvious-looking alternative and is circular: `par_anchor.hpp` feeds the
+  *declared par* into the fair-value solve precisely when nothing else can
+  price the asset, so a peg watcher reading that estimate would read its
+  own input back, sit permanently at par, and never detect the depeg it
+  exists to detect. A peg must be observed from a market or not at all.
+- **The Step 4 suspension gate now logs at warn.** It silently suppressed
+  every XCH/BYC quote for a day at debug level. A safety latch that halts
+  trading has to announce itself in the normal log.
+
+### Trade history: asked, answered, and written down
+
+The prompting question was whether dexie's trade history could supply a
+price target for BYC when the book is unusable. It can — the tape says
+~1.40 BYC/XCH, i.e. BYC at $1.02 — and that turns out to be the wrong
+thing to want. `1.41 = XCH/USD ÷ BYC par`, so the engine already had the
+number; the tape's agreement adds no information, its content is already
+spent as `fair_value_par_market_sigma_bps = 140`, and wiring it in as a
+live edge would *displace* the operator-governed par rather than confirm
+it, because the par fallback is fallback-only. See
+`docs/price-discovery-from-trade-history.md` for the full argument and the
+microstructure literature behind it.
+
+- **`docs/price-discovery-from-trade-history.md`** — why the tape is
+  corroboration here and not an oracle, which estimators degenerate at
+  this trade count and why (Roll is undefined when sample autocovariance
+  is positive; information-share metrics cannot fit a VECM across 8-day
+  gaps; Stoikov's micro-price symmetrises the two sides, the exact
+  assumption this book violates), and the two standing caveats — par is an
+  assumption rather than an observation, and ~19% of the August tape is
+  our own fills.
+- **`scripts/byc_price_diagnostic.py`** — read-only. Re-derives the
+  "7-day traded VWAP 1.001" figure that **five** sites cite as ground truth
+  and no code path produces (`par_anchor.hpp`, `config.hpp`, `engine.cpp`'s
+  `quote_usd_factor`, `test_fair_value.cpp`, `config.yaml`), and reports the
+  executable depth near par that a VWAP cannot. Sample size printed beside
+  every statistic.
+- **`scripts/highlow_spread_estimator.py`** — read-only Corwin-Schultz and
+  Abdi-Ranaldo estimators. Their inputs are **not** `price_high`/`price_low`:
+  those are fetched and discarded unread by the engine, but a dexie 24h
+  high/low is a single bar and both estimators need two consecutive ones, so
+  the optional `--dexie` flag is a separate range check that cannot drive
+  either estimator. The multi-day bars come from the third-party BBO series
+  we already store — `offer_log.book_best_bid`/`book_best_ask`, or
+  `snapshots.mid_price_mojos` + `spread_bps`, which invert to the same two
+  sides exactly. So these are **quote samples standing in for trade prices**,
+  outside the regime either estimator was derived for; the script says so in
+  its own output and the caveat stays in front, not buried. Diagnostic only,
+  and what it offers is a descriptive discrepancy rather than a measurement.
+  Measured like-for-like on XCH/BYC 2026-09-01 against the most recent day
+  pair, the posted 14,666.7 bps is **0.99×** the 14,863.9 bps comparator —
+  no gap at all — and even that is soft, the comparator being 74% of the
+  20,000 bps ceiling Corwin-Schultz saturates toward.
+- **Retraction — the "a fortiori" claim about `quote-touch` bars.** This
+  entry previously said the default `quote-touch` bars give an *upper* bound
+  on the estimate, so the gap held a fortiori. Withdrawn, not hedged:
+  Corwin-Schultz **subtracts** the two-day range term `gamma`, so the
+  estimate is not monotonic in the sampled range — a wider range can lower
+  it, to zero. Abdi-Ranaldo has no monotonicity guarantee either. A bar
+  construction is a sensitivity choice, not a bound. Worked counterexample
+  in `docs/price-discovery-from-trade-history.md` § 6, recorded there rather
+  than silently edited.
+- **Second retraction — the 8.0× gap itself.** An earlier revision of this
+  entry said the 8.0× figure "is measured and stands". It does not. It came
+  from dividing ONE instantaneous quote sample by estimators averaged over a
+  month of day pairs — the window mismatch the same release fixes. Compared
+  like-for-like the ratio is 0.99×. Both retractions point the same way:
+  these estimators do not
+  identify sides — the absent-side finding for XCH/BYC rests on the direct
+  book observation (bids within 6.4% of the 1.41022765 anchor, asks at
+  3.5×–7.1× it) and never depended on them.
+- **`get_trades()` sort fix.** It passed `date_completed_desc`, which the
+  dexie API does not recognise and silently ignores, so it returned an
+  arbitrary page rather than recent trades. The valid value is
+  `date_completed`, already descending. The function still has no callers,
+  and now says why.
+
+### The `enabled:` flags, and the one deployment order that matters
+
+Nothing in this entry argues for or against quoting BYC — that is a
+liquidity decision and not a code problem. The operator made it separately:
+**XCH/BYC was re-enabled on 2026-09-01 and then **backed out the same day, pending deployment**. The decision stands; only its timing changed. An enable is inert until the engine restarts, but the GUI relaunches the engine whenever the GUI restarts -- so the flag was a latent trigger that any unrelated restart could arm without anyone choosing to. Leaving a loaded trigger in a config file and relying on nobody touching it is not a safety argument. Re-set it AFTER this PR is merged, built and deployed.** BYC/wUSDC.b stays off throughout.
+
+**Why the timing matters, and why the flag ships `false`.** `[RELOAD]` disables a
+pair live but refuses to enable one — it logs "restart the engine to start
+quoting it" and carries on. On the pre-PR binary a restart with the flag set
+reproduces 2026-08-30 exactly: the ladder self-crosses and drops every tier,
+then the mojo-scale bug latches a **false** depeg about ten minutes in and
+cancels every offer on every pair touching BYC, and that bogus valuation
+feeds the 10% drawdown breaker — which pauses the **whole engine** and takes
+XCH/DBX, the only earning pair, down with it. Every link in that chain is
+addressed above. Merge, build, deploy, *then* restart.
+
+The two sides are not symmetric, and there is no per-pair one-sided switch,
+so enabling turns on both. In the pair's own orientation (price = BYC per
+XCH) a **bid** pays BYC to buy XCH, which sells our 52.58 BYC at about $1.01
+into the honest side of the book — an exit at par, and the reason to be
+here. An **ask** accumulates more BYC, and there is no exit for that:
+nothing bids for BYC above about $0.29. Rising BYC inventory is the signal
+to turn it back off.
+
+BYC/wUSDC.b remains disabled for an unrelated reason: the 2026-08-25
+warp.green bridge compromise depegged wUSDC.b (~$0.80 on 2026-09-01) and the
+pair has had no print since 2026-08-24, so it would be quoting into a dead
+book through a broken denominator.
+
+### Per-pair BBO proximity caps, and the research that shrank the feature
+
+The operator asked for a per-pair percentage band on how far offers may sit
+from the market. The research answered a narrower question than the one asked,
+and this is the narrow answer.
+
+**The band already existed.** `strategy::classify_tier`
+(`bbo_sanity.hpp`) is a per-side percentage max-distance bound, measured
+against the **same-side BBO**, that **suppresses rather than clamps**, with an
+ordered fallback chain. That is the proposal, shipped. What was missing is
+that its two thresholds were **global**, and the pairs are not alike: XCH/DBX's
+sigma width floor never exceeded 141 bps in 48,402 logged evaluations while
+XCH/BYC's exceeded 200 bps on 87.7% of them. One number cannot serve both — a
+bound tight enough to mean anything on the first silences the second.
+
+- `bbo_sanity_max_aggressive_dev_override` and
+  `bbo_sanity_max_passive_dev_override` on `PairConfig`, resolved at the Step 8
+  call site with the same idiom `max_half_spread_bps_override` already uses.
+  Absent → the strategy-level value, so every existing pair is unchanged.
+- **Fractions, bounded (0, 1], rejected at load otherwise.** `10` ("10%") and
+  `1000` ("1000 bps") are both plausible operator entries and both would yield
+  a cap that can never bind — a suppression control silently switched off. Zero
+  is rejected too: it would suppress every tier on that side, and a config
+  value that quietly stops a pair quoting is worse than one that fails to load.
+
+**Three things the research killed, recorded so they are not re-proposed:**
+
+- **Do not reference the mid.** On 2026-08-30 XCH/BYC's mid read 5.575 against
+  a fair value of ~1.40; a mid-referenced 2% band would have forced correct
+  1.33 bids up to 5.4635 — paying ~5.46 BYC for an XCH worth ~1.40, filling
+  instantly. Same-side 2% forfeits **5.6%** of realized P&L; mid-referenced 2%
+  forfeits **78.4%**. No production band in the verified literature — LULD,
+  Nasdaq Rule 4702(b)(7), CME, Binance, Kraken, Hyperliquid, Xetra — references
+  an instantaneous mid.
+- **Depth-qualifying the reference is worse than useless here.** Depth walking
+  is monotone *away* from the book's interior, so it can only repair a touch
+  that is too *aggressive* — but on a venue with no matching engine, aggressive
+  offers get consumed and passive ones fossilize (Spearman ρ between
+  dislocation and resting age = **+0.615**; median age 0.41 d within 10% of
+  fair versus **125 d** at 10–100% off). Its helpful direction covers only the
+  small errors; its harmful direction covers all the catastrophic ones. The
+  motivating shape does not occur either: 100% of XCH/BYC's 377 XCH of ask
+  depth is >50% off the anchor, and the "junk top" is 2 XCH — 20× the dust
+  threshold, not dust.
+- **Tight is not conservative.** When the sigma floor exceeds the bound the
+  innermost tier is already outside it, so every tier is: a 2% passive bound
+  withdraws XCH/BYC on 87.7% of blocks, while on XCH/DBX anything ≥10% never
+  binds. The feature is inert or fatal with little in between, which is why the
+  caps are documented with the SEC's own comparators (8% for a blue-chip,
+  20% near the open and close, 28–30% for less liquid names) rather than left
+  to intuition.
+
+### Retention would have deleted half the history it was asked to keep
+
+Retention had not run since 2026-05-16, so raw history reached back to
+2026-04-03 while the default window was 120 days. The next run — no flag
+typed differently, nothing to review — would have deleted **91,244 of
+207,787** `snapshots` rows (43.9%) and **363,374** `strategy_quotes` rows
+(29.0%), including all of April: the densest month of the very BYC book
+history the new diagnostics read.
+
+- **The hazard was never the retention number.** A long gap between runs
+  silently converts a routine window into a bulk deletion, and the loss grows
+  exactly while nobody is watching. So the guard is proportional rather than
+  a bigger constant: a run that would delete more than 25% of a raw table
+  refuses, prints per-breached-table counts, percentages and each table's own
+  oldest surviving row, and exits 3 without touching the database. A steady
+  daily run removes a day at a time and never approaches the bound.
+- Rows are **counted before deleting**. `cur.rowcount` reports the damage
+  after it is done, which is no use to a guard, and the refusal has to happen
+  before any `DELETE` so the rollback is empty rather than merely correct.
+  The refusal rolls back explicitly — the rollup UPSERTs already ran in the
+  same transaction and are the half that could otherwise survive.
+- Two deliberate escapes: widen `--raw-retention-days` to keep the history,
+  or `--confirm-large-prune` to delete it on purpose.
+- **`--backup` was unsafe in exactly the situation it exists for.** It used
+  `shutil.copy2` on a database running in WAL mode against a live engine,
+  copying only `xop_trader.db` and leaving the `-wal` file behind — 15 MB of
+  committed-but-uncheckpointed pages at the time of the change. The backup
+  taken before a destructive operation would have been missing the most
+  recent writes and torn besides. Now uses SQLite's own `conn.backup()`,
+  which holds a read transaction and sees one consistent snapshot including
+  the WAL. Verified: `integrity_check ok`, full row counts.
+- **The prune reached up to a day past its own window.** The cutoff was
+  formatted `...THH:MM:SS.ffffffZ` while both tables store
+  `YYYY-MM-DD HH:MM:SS`, and both comparisons are text: `" "` (0x20) sorts
+  below `"T"` (0x54), so every row sharing the cutoff's date compared
+  less-than whatever its time. A row stored `2026-05-04 23:59:59` was deleted
+  by a cutoff of `2026-05-04T11:56:08Z`. The count and the DELETE shared the
+  format, so the guard's percentages were honest — this was over-deletion,
+  not mis-reporting — but it always erred toward data loss, so it is fixed
+  here rather than left standing next to a guard about data loss.
+
+Exercised against a **copy** of the live database, never the original.
+
 ## [0.10.12] — 2026-08-31 — the Permuto inventory curfew
 
 Stops us carrying inventory across a market close, which is the trade that

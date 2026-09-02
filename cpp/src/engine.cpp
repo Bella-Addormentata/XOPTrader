@@ -24,6 +24,14 @@
 #include "xop/execution/exposure_gate.hpp"
 #include "xop/execution/fair_value_solver.hpp"
 #include "xop/execution/par_anchor.hpp"
+#include "xop/execution/book_side_quality.hpp"
+#include "xop/execution/cross_guard.hpp"
+#include "xop/execution/crossed_book.hpp"
+#include "xop/execution/take_sizing.hpp"
+#include "xop/execution/take_retry.hpp"
+#include "xop/execution/coin_pool_verdict.hpp"
+#include "xop/strategy/tier_gain.hpp"
+#include "xop/strategy/competitiveness_gate.hpp"
 #include "xop/execution/mid_gate.hpp"
 #include "xop/risk/valuation_authority.hpp"
 #include "xop/risk/usd_route.hpp"
@@ -66,6 +74,12 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+// [review round 8] Named directly at the anchor-candidate construction
+// below. It arrived only transitively, via engine.hpp -> peg_suspension.hpp,
+// so a future edit that stopped peg_suspension.hpp needing it would break
+// this file for an unrelated reason -- and this branch has a documented
+// history of MSVC-pass/GCC-fail include differences.
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -76,6 +90,32 @@ namespace xop {
 namespace asio = boost::asio;
 
 namespace {
+
+// [2026-09-01] Saturating accumulation for Step 8's exposure projection.
+//
+// The tier-cost and pending-spend loops sum values that can each saturate at
+// Mojo max -- execution::quote_cost_for_ask returns exactly that on a product
+// too large to represent, as the long double version it replaced also did.
+// Two saturated summands overflow a signed int64, which is UNDEFINED
+// BEHAVIOUR, not a wrap: the compiler is entitled to assume it cannot happen
+// and optimise on that basis, and the number it corrupts feeds
+// exposure_breaches_reserve() and therefore can_bid/can_ask -- a quoting kill
+// switch.
+//
+// Unreachable today: these loops iterate only over OUR OWN offers and
+// candidate tiers, whose sizes are bounded by config (max_offer_size_units
+// 5.0). It predates this change; the old lambda saturated identically. It is
+// hardened rather than left because a saturated value DECLINES safely while
+// an overflowed one is arbitrary, and because clamping is provably identical
+// to `+` on every input that does not overflow -- so nothing reachable moves.
+//
+// Same discipline as take_retry.hpp's ask_take_cost (:383-386).
+[[nodiscard]] Mojo saturating_add_mojo(Mojo acc, Mojo add) noexcept
+{
+    if (add <= 0) return acc;
+    const Mojo headroom = std::numeric_limits<Mojo>::max() - acc;
+    return (add > headroom) ? std::numeric_limits<Mojo>::max() : acc + add;
+}
 
 int score_offer_competitiveness(Side side,
                                 Mojo price,
@@ -320,6 +360,11 @@ Engine::Engine(const AppConfig& config, bool dry_run)
         config_.market_data.mid_gate_book_confirm_max_spread_bps;
     md_cfg.mid_gate_max_step_frac =
         config_.market_data.mid_gate_max_step_frac;
+    // [SIDEQUALITY 2026-09-01] Per-side anchor agreement.
+    md_cfg.book_side_anchor_band_ratio =
+        config_.market_data.book_side_anchor_band_ratio;
+    md_cfg.book_side_agree_max_spread_bps =
+        config_.market_data.book_side_agree_max_spread_bps;
     market_data_ = std::make_unique<MarketDataFeed>(md_cfg, *state_);
 
     // -- Data / analytics (per-pair estimators) --------------------------------
@@ -665,7 +710,24 @@ Engine::Engine(const AppConfig& config, bool dry_run)
 // it exists to detect -- the 08-25 log contains a cycle recorded as "processed
 // in 14241482 ms", 3.96 hours during which nothing else on that thread ran.
 // A watchdog that can be blocked by what it watches is not a watchdog, so this
-// one shares nothing with the engine except two atomics.
+// one shares no io_context, no thread and no RPC client with the engine.
+//
+// WHAT IT DOES SHARE: LOG SINKS.  [CLIENTLOG 2026-09-01] This comment used to
+// say "shares nothing with the engine except two atomics".  That was never
+// quite true -- the second ChiaWalletRPC built below has always resolved to
+// the SAME spdlog logger object the engine's own wallet_ registered under
+// "chia.wallet", hence the same console sink and the same base_sink mutex.
+// What changed in the client_logger commit is that the shared sink list now
+// also contains main.cpp's rotating_file_sink_mt.  ChiaRPCBase::open() emits
+// three records before cancel_offers() runs, so a rotation in progress on the
+// engine thread can block this thread on that sink's mutex: bounded at roughly
+// 900 ms (9 renames x one 100 ms retry each, kMaxFiles = 9), and unbounded if
+// the volume itself stalls.  Against watchdog_stall_seconds (default 600) the
+// bounded case is 0.15% of a stall this switch already tolerates, and the
+// alternative -- a stdout-only logger for the watchdog -- would make the one
+// component whose diagnosis matters most during an incident invisible in the
+// only log that survives the restart.  The coupling is accepted deliberately;
+// see the S31 section of cpp/include/xop/util/client_logger.hpp.
 //
 // WHY THE WALLET RPC.  Cancellation needs only the wallet, and the wallet
 // stayed healthy throughout the 08-25 outage while the full node was
@@ -3035,7 +3097,14 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
             && !watchdog_fired_.load(std::memory_order_acquire)) {
         try { co_await step_run_drift_corrector(block_height); }
         catch (const std::exception& e) {
-            spdlog::error("[Engine] Step 9f (drift corrector) failed: {}", e.what());
+            // [S40 remainder] Finding C, recorded not fixed: 9f has no
+            // per-iteration try, so a throw from take_offer lands here naming
+            // NO pair and NO offer id and abandoning the remaining pairs for
+            // this cycle. At minimum say which CLASS of failure it was.
+            spdlog::error("[Engine] Step 9f (drift corrector) failed [{}]: {}",
+                          execution::to_string(
+                              execution::classify_take_failure(e.what())),
+                          e.what());
         }
     }
 
@@ -4729,9 +4798,17 @@ void Engine::step_compute_quotes(BlockHeight block_height)
         {
             const PairConfig* pc4 = find_pair_config(pair_name);
             if (pc4 != nullptr && pair_peg_suspended(*pc4)) {
-                spdlog::debug("[Engine] Step 4: {} suspended (asset-level "
-                              "peg failure) -- suppressing all quotes",
-                              pair_name);
+                // [SIDEQUALITY 2026-09-01] warn, not debug.  This gate
+                // silently suppressed every XCH/BYC quote for a full day
+                // after a FALSE suspension, and nothing said so at info
+                // level -- the pair simply stopped quoting.  A safety
+                // latch that halts trading has to announce itself in the
+                // normal log, or the next false positive costs another
+                // day of diagnosis.
+                spdlog::warn("[Engine] Step 4: {} suspended (asset-level "
+                             "peg failure) -- suppressing all quotes; "
+                             "re-enable from the GUI's Depeg tab",
+                             pair_name);
                 pcs.quote_valid = false;
                 continue;
             }
@@ -4901,6 +4978,14 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
             mid, sigma, q, q_max, pin,
             Venue::Dexie, best_competing_bps,
             hour_utc, day_of_week);
+
+        // [2026-09-02, review] Capture the pre-adjustment spread HERE, before
+        // the first of Step 5's ten mutation sites.  Step 12 divides the
+        // finished spread by this to publish the multiplier that was ACTUALLY
+        // applied.  Two of those ten sites are assignments that discard the
+        // whole chain, so a multiplier derived from the chain is wrong by
+        // construction -- see xop/strategy/spread_mult.hpp.
+        pcs.spread_base_bps = pcs.spread_result.total_spread_bps;
 
         // ---------------------------------------------------------------
         // [Wall-aware retail niche premium]
@@ -5098,9 +5183,26 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
                 const double output = p_term + i_term + d_term;
 
                 // Convert to multiplier: positive output -> tighten (< 1.0)
+                //
+                // [S39] The tightening clamp is DERIVED from the gain budget
+                // rather than taken raw, so the knob and the controller
+                // cannot disagree.  config.yaml ships pid_min_mult: 0.7,
+                // which these gains can never reach -- the floor is
+                // 1 - (kp*target + ki*integral_max) = 0.820.  A behavioural
+                // no-op today (the clamp is inert at 0.7 and at 0.820 alike);
+                // it starts mattering the moment the gains are retuned.
+                const xop::strategy::PidGains spread_gains{
+                    config_.strategy.pid_kp,
+                    config_.strategy.pid_ki,
+                    config_.strategy.pid_kd,
+                    config_.strategy.pid_target_fill_rate,
+                    config_.strategy.pid_ema_alpha,
+                    config_.strategy.pid_integral_max,
+                    config_.strategy.pid_warmup_blocks};
                 pid.current_mult = std::clamp(
                     1.0 - output,
-                    config_.strategy.pid_min_mult,
+                    xop::strategy::effective_pid_min_mult(
+                        config_.strategy.pid_min_mult, spread_gains),
                     config_.strategy.pid_max_mult);
 
                 // Update integral with anti-windup clamp.
@@ -5110,6 +5212,50 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
                     config_.strategy.pid_integral_max);
 
                 pid.prev_error = error;
+
+                // [S39] Report the rail as an EDGE, plus an hourly heartbeat.
+                // Both PIDs have sat at their most aggressive value for the
+                // whole retained log window and nothing said so.  A
+                // level-triggered warning is useless here: the live log
+                // already carries 3,129 warnings in 5.4h from 18 distinct
+                // messages.  The heartbeat is not optional either -- the one
+                // existing edge-triggered warn in this file (:3135) has no
+                // off-edge and compressed a 4h10m outage into a single unread
+                // line on 2026-08-31.
+                const auto rail_ev = pid.rail.update(
+                    pid.integral_error,
+                    config_.strategy.pid_integral_max,
+                    error,
+                    pid.blocks_active);
+                if (rail_ev == xop::strategy::RailEvent::Enter) {
+                    spdlog::warn("[Engine] Step 5: {} spread PID SATURATED -- "
+                                 "integral pinned at {:.2f}/{:.2f} for {} "
+                                 "blocks; it is asking for mult {:.3f} and "
+                                 "delivering {:.3f}. It is no longer "
+                                 "controlling; the fill rate ({:.4f}) is not "
+                                 "responding to it.",
+                                 pair_name, pid.integral_error,
+                                 config_.strategy.pid_integral_max,
+                                 config_.strategy.pid_warmup_blocks,
+                                 1.0 - output, pid.current_mult,
+                                 pid.ema_fill_rate);
+                } else if (rail_ev == xop::strategy::RailEvent::Exit) {
+                    spdlog::warn("[Engine] Step 5: {} spread PID recovered "
+                                 "authority after {} blocks (integral {:.2f}, "
+                                 "mult {:.3f}, ema_fill {:.4f})",
+                                 pair_name,
+                                 pid.rail.latched_blocks(pid.blocks_active),
+                                 pid.integral_error, pid.current_mult,
+                                 pid.ema_fill_rate);
+                } else if (pid.rail.heartbeat_due(pid.blocks_active)) {
+                    spdlog::warn("[Engine] Step 5: {} spread PID STILL "
+                                 "saturated -- {} blocks at the rail, mult "
+                                 "{:.3f}, ema_fill {:.4f} vs target {:.4f}",
+                                 pair_name,
+                                 pid.rail.latched_blocks(pid.blocks_active),
+                                 pid.current_mult, pid.ema_fill_rate,
+                                 config_.strategy.pid_target_fill_rate);
+                }
             }
 
             // Reset per-cycle fill counter (consumed).
@@ -5143,7 +5289,21 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
                 cpc.ema_alpha         = config_.strategy.comp_pid_ema_alpha;
                 cpc.integral_max      = config_.strategy.comp_pid_integral_max;
                 cpc.warmup_blocks     = config_.strategy.comp_pid_warmup_blocks;
-                cpc.min_offset        = config_.strategy.comp_pid_min_offset;
+                // [S39] Derived, same reason as the spread clamp above.
+                // A no-op on the shipped config (raw -3.20 rounds to -3,
+                // which equals the configured floor), and note that -3 comes
+                // out of the ROUNDING step, not the clamp: widening
+                // comp_pid_min_offset would change nothing at all.
+                cpc.min_offset        = xop::strategy::effective_comp_pid_min_offset(
+                    config_.strategy.comp_pid_min_offset,
+                    xop::strategy::PidGains{
+                        config_.strategy.comp_pid_kp,
+                        config_.strategy.comp_pid_ki,
+                        config_.strategy.comp_pid_kd,
+                        config_.strategy.comp_pid_target_fill_rate,
+                        config_.strategy.comp_pid_ema_alpha,
+                        config_.strategy.comp_pid_integral_max,
+                        config_.strategy.comp_pid_warmup_blocks});
                 cpc.max_offset        = config_.strategy.comp_pid_max_offset;
                 pid_it = comp_pid_state_.emplace(
                     pair_name,
@@ -6314,6 +6474,16 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
         // strategy/reservation_offset.hpp.  Every downstream guard (sigma
         // width floor, fair-value clamp, no-loss floor, peg guards,
         // competitive caps) is untouched and acts on the shifted centre.
+        // [FEEGAIN 2026-09-01] Capture the fair-value centre BEFORE the A-S
+        // shift. This is the frame the ladder's EDGE lives in: the shift
+        // that follows moves quotes for inventory reasons, not because our
+        // view of value changed. Captured here rather than at blend.center
+        // so the peg anchor's correction is included.
+        pcs.quote_fair_centre_mojos = market_mid > 0.0
+            ? static_cast<Mojo>(std::llround(
+                  market_mid * static_cast<double>(kMojosPerXch)))
+            : Mojo{0};
+
         if (config_.strategy.as_reservation_enabled && pair_cfg
             && market_mid > 0.0)
         {
@@ -7087,7 +7257,15 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
         pcs.quote_min_half_spread_bps = quote_min_half_spread_bps;
 
         // Fetch competing offers for gap-aware dynamic tier spacing.
-        auto comp_offers = market_data_->get_competing_offers(pair_name);
+        // [review round 5] Book AND verdict from ONE lock. Reading the
+        // offers here and the verdict from the snapshot let the two
+        // desync: ingest_dexie resets the snapshot verdict to trusted on
+        // every raw ticker poll, while nothing clears this offer store, so
+        // after a failed offers fetch the ladder would anchor against a
+        // stale junk book that the live verdict called healthy -- re-arming
+        // the self-cross this work exists to stop.
+        const auto comp_book = market_data_->get_competing_book(pair_name);
+        const auto& comp_offers = comp_book.offers;
 
         // Query per-tier fill rates from the offer log for adaptive sizing.
         LiquidityConfig ladder_cfg = liq.config();
@@ -7115,6 +7293,93 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
             ladder_cfg.tier_fill_rates = db_->query_tier_fill_rates(
                 pair_name, cutoff_ts, ladder_cfg.num_tiers);
         }
+
+        // [SIDEQUALITY 2026-09-01] Thread the per-side book verdict into the
+        // ladder config, the same channel tier_fill_rates already uses for
+        // runtime data.  The competitive anchor's safety reference is the
+        // midpoint of the two sides, so it needs to know when one of them
+        // is not a reference at all.
+        //
+        // [review round 8, PR #134] THE VERDICT HERE IS NOT THE VERDICT STEP 8
+        // READS, AND THAT IS DELIBERATE.  READ THIS BEFORE "UNIFYING" THEM.
+        //
+        // An earlier revision of this comment claimed the ladder read "the
+        // same snapshot the Step 8 sanity checks read, so the ladder and the
+        // checks that police it cannot disagree".  That is FALSE, and it is
+        // false by construction, not by accident:
+        //
+        //   * Step 7 (here) reads get_competing_book() -- the cached filtered
+        //     offers AND the verdict measured on THOSE offers, under
+        //     mtx_competitors_, last written by ingest_competing_offers().
+        //   * Step 8 (engine.cpp, the BBO proximity block) reads
+        //     state_->get_market() -- a MarketSnapshot published from
+        //     PairState under mtx_pairs_, whose verdict ingest_dexie() resets
+        //     to (true, true, ref=0) on EVERY raw ticker poll.
+        //
+        // Two stores, two last-write times.  Step 1 calls ingest_dexie() and
+        // ingest_competing_offers() in one try block; when the offers fetch
+        // throws, the catch warns and the cycle CONTINUES.  So after
+        // [successful filtered ingest -> raw ticker -> offers fetch failure]
+        // Step 7 builds from the previous cycle's book and verdict while
+        // Step 8 polices it against this cycle's raw BBO with the reset
+        // verdict.  That state is reachable, deterministic, and not a race.
+        //
+        // WHY THE MIX IS ACCEPTED.  NOT because the two policies nest --
+        // THEY DO NOT.  [review round 9] An earlier revision of THIS comment
+        // claimed the mix "produces a SUBSET of the quotes the stale verdict
+        // alone would admit -- fewer, never a quote either policy alone would
+        // refuse".  That is false, and believing it is the dangerous part:
+        // the verdict does not merely veto, it also SELECTS THE REFERENCE the
+        // veto measures against, and different references admit sets that are
+        // not nested in either direction.  On this very book (side_ref
+        // 1.41022765, raw 1.5000 / 4.9995, shipped 0.10 / 0.30 caps):
+        //
+        //     BID   fresh(reset) admits [1.0500, 3.2498]
+        //           stale        admits [0.9872, 1.6500]   <- neither
+        //                                                     contains the
+        //                                                     other
+        //     ASK   fresh(reset) admits [4.4996, 6.4994]
+        //           stale        admits [1.2692, 1.8333]   <- DISJOINT
+        //
+        // The mechanism is bookside::step8_references: the reset verdict
+        // restores effective_mid to the BBO midpoint, and classify_tier's bid
+        // passive rule keys on that midpoint (bbo_sanity.hpp), so a midpoint
+        // poisoned HIGH by the junk ask routes bids up to 3.2498 through the
+        // WIDE 0.30 passive cap instead of the tight 0.10 aggressive one.
+        // That is a LOOSENING on the bid side, in exchange for a tightening
+        // on the ask side (ask_tier_ref returns to the raw 4.9995 touch).
+        // Same fact stated 3300 lines below at the Step 8 site itself.
+        //
+        // So the real argument for (c) is a BOUND, not a nesting: the reset
+        // triple (true, true, ref=0) is exactly the pre-SIDEQUALITY verdict,
+        // so Step 8 falls back to LEGACY behaviour bit for bit -- never worse
+        // than what shipped before this work existed -- and Step 7 still caps
+        // every bid at the fair-value centre, so the loosened band can only
+        // admit tiers already priced at or under fair value.  A competing-
+        // offer fetch failure occurred 0 times in 15,834 anchor cycles.
+        // Bounded, rare, and no worse than legacy is the whole claim.  Do not
+        // upgrade it back into an invariant.
+        // Pinned by BookSideQualityMixedGeneration.* in
+        // cpp/tests/test_book_side_quality.cpp -- including
+        // TheTwoPoliciesAdmitNonNestedSets, which fails if anyone restates
+        // the subset claim by making it true.
+        //
+        // DO NOT re-point Step 7 at the snapshot: the snapshot verdict is
+        // reset to trusted on every raw ticker poll while this offer store is
+        // not, so Step 7 would anchor a ladder to a junk book the live
+        // verdict calls healthy -- the round-5 desync, re-armed.
+        // DO NOT re-point Step 8 at this cached verdict either: the fresh raw
+        // BBO is the only current price evidence in the cycle, and adopting
+        // the stale verdict there makes THREE changes, not the two an earlier
+        // revision listed -- (1) ask_tier_ref becomes side_ref, (2) Check 1 is
+        // skipped, both of which disarm that evidence against a ladder that
+        // may be anchored to prices which have since vanished; and (3)
+        // effective_mid becomes side_ref, which TIGHTENS bids.  (3) pulls the
+        // other way from (1) and (2), which is exactly why the two policies do
+        // not nest and why "adopt the stale verdict" is not the strictly safer
+        // option it looks like.
+        ladder_cfg.book_bid_side_anchor_ok = comp_book.bid_side_anchor_ok;
+        ladder_cfg.book_ask_side_anchor_ok = comp_book.ask_side_anchor_ok;
 
         // Generate the tier ladder.
         // When competing offers are available, uses the gap-aware overload
@@ -8372,20 +8637,44 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                         if (is_ask) {
                             costs.push_back(tq.size);
                         } else {
-                            // Conservative ceil: never under-count a cost.
-                            const double q = quote_mojos_for(
-                                static_cast<double>(tq.size),
-                                static_cast<double>(tq.price),
-                                static_cast<double>(
-                                    pair_cfg->base_mojos_per_unit),
-                                static_cast<double>(
-                                    pair_cfg->quote_mojos_per_unit));
-                            costs.push_back(
-                                (std::isfinite(q) && q >= 0.0
-                                 && q < static_cast<double>(
-                                        std::numeric_limits<Mojo>::max()))
-                                    ? static_cast<Mojo>(std::ceil(q))
-                                    : std::numeric_limits<Mojo>::max());
+                            // [2026-09-01] The FIFTH copy of this conversion,
+                            // and the one that made Step 8 compute the same
+                            // tier's quote cost two different ways within a
+                            // single step: exactly at :10907 for the exposure
+                            // projection, and in double here for the wallet
+                            // budget filter that ERASES tiers from
+                            // pcs.ladder. Two answers for one number.
+                            //
+                            // The double form was the same defect shape that
+                            // produced the GCC 1501, minus the platform
+                            // dependency: quote_mojos_for(1e11, 1e11, 1e12,
+                            // 1000) evaluates to 10.000000000000002, so
+                            // std::ceil returned 11 where the exact cost is
+                            // 10. On a CAT-base geometry it errs in BOTH
+                            // directions, including under-counting a tier's
+                            // cost against the budget so a tier that does not
+                            // fit is kept -- fail-open.
+                            //
+                            // Replacing it does NOT move live behaviour, and
+                            // that was measured rather than assumed: over
+                            // 20,000 samples at the only enabled pair's
+                            // geometry (XCH/DBX, base 1e12 / quote 1e3) and
+                            // our own configured tier sizes (1.0-5.0 XCH),
+                            // the double path and the exact path agree on
+                            // every case. The divergence lives off the live
+                            // band; the duplicated formula was the defect.
+                            //
+                            // quote_cost_for_ask is named for the taker path,
+                            // but its arithmetic is "quote cost of a base
+                            // size at a price" -- and OUR OWN bid tier's
+                            // `size` is already base mojos, unlike an
+                            // ingested bid's. Saturation is handled inside
+                            // it, so the isfinite/range branch this replaces
+                            // is no longer needed.
+                            costs.push_back(execution::quote_cost_for_ask(
+                                tq.size, tq.price,
+                                pair_cfg->base_mojos_per_unit,
+                                pair_cfg->quote_mojos_per_unit));
                         }
                     }
                     const std::size_t keep = tiers_within_budget(
@@ -9379,27 +9668,25 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                         int staleness_rank{2};
                         Mojo price{0};
                     };
-                    auto ceil_to_mojo = [](long double value) -> Mojo {
-                        if (!std::isfinite(static_cast<double>(value)) || value <= 0.0L) {
-                            return 0;
-                        }
-                        const long double cap = static_cast<long double>(
-                            std::numeric_limits<Mojo>::max());
-                        if (value >= cap) {
-                            return std::numeric_limits<Mojo>::max();
-                        }
-                        return static_cast<Mojo>(std::ceil(value));
-                    };
+                    // [2026-09-01] This was a verbatim third copy of
+                    // take_sizing.hpp's old long double arithmetic -- a local
+                    // ceil_to_mojo lambda plus this one -- carrying the same
+                    // MSVC/GCC divergence (see the banner in take_sizing.hpp)
+                    // with no test able to reach it. It is Step 8's
+                    // auto-rebalance proactive-cancel decision, so the value
+                    // chooses which of our own live offers get cancelled.
+                    // Replaced with the shared exact-integer implementation.
+                    //
+                    // quote_cost_for_ask is named for the taker path, but the
+                    // arithmetic it performs is exactly "quote cost of a base
+                    // size at a price", which is what this needs: unlike an
+                    // ingested bid, OUR OWN pending bid's `size` is already
+                    // base mojos.
                     auto quote_cost_for_base_size = [&](Mojo base_size, Mojo price) -> Mojo {
-                        const long double base_mpu = static_cast<long double>(
-                            gate_pc->base_mojos_per_unit > 0 ? gate_pc->base_mojos_per_unit : 1);
-                        const long double quote_mpu = static_cast<long double>(
-                            gate_pc->quote_mojos_per_unit > 0 ? gate_pc->quote_mojos_per_unit : 1);
-                        const long double price_scale = static_cast<long double>(kMojosPerXch);
-                        return ceil_to_mojo(
-                            static_cast<long double>(base_size)
-                            * static_cast<long double>(price)
-                            * quote_mpu / (base_mpu * price_scale));
+                        return execution::quote_cost_for_ask(
+                            base_size, price,
+                            gate_pc->base_mojos_per_unit,
+                            gate_pc->quote_mojos_per_unit);
                     };
 
                     std::unordered_map<std::string, execution::TierClassification> tc_by_id;
@@ -9437,14 +9724,16 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                         if (po.side == Side::Ask) {
                             const Mojo spend = po.size;
                             if (spend > 0) {
-                                pair_base_pending_spend += spend;
+                                pair_base_pending_spend = saturating_add_mojo(
+                                    pair_base_pending_spend, spend);
                                 ask_candidates.push_back(
                                     {po.offer_id, spend, po.tier, staleness_rank, class_price});
                             }
                         } else {
                             const Mojo spend = quote_cost_for_base_size(po.size, po.price);
                             if (spend > 0) {
-                                pair_quote_pending_spend += spend;
+                                pair_quote_pending_spend = saturating_add_mojo(
+                                    pair_quote_pending_spend, spend);
                                 bid_candidates.push_back(
                                     {po.offer_id, spend, po.tier, staleness_rank, class_price});
                             }
@@ -9812,7 +10101,32 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         // -- T4-03: Fee-vs-gain gating per tier ------------------------------
         // Estimate expected gain for each tier and filter out tiers where
         // the fee exceeds the configured ratio of expected gain.
-        // Use market mid for the gain calculation (avoids A-S skew bias).
+        // [FEEGAIN 2026-09-01] The reference below is the PUBLISHED MID,
+        // and that is now known to be the wrong frame -- kept unchanged
+        // while the shadow above measures it.
+        //
+        // The original rationale was "avoids A-S skew bias". That names a
+        // real effect: tier price is centre*(1 +/- spacing), so scoring
+        // from the POST-A-S centre reports the nominal spacing identically
+        // on both sides and erases the inventory-skew cost exactly where
+        // A-S places it. But the published mid is not a neutral third
+        // option, it is a different frame again, and measured on XCH/DBX
+        // the error it introduces (mean 143.2 bps, max 959) is about
+        // twelve times the skew it avoids (mean 11.8 bps, max 29.9).
+        //
+        // Direction matters most: this gate only ever DROPS tiers, so a
+        // reference farther from the ladder is more PERMISSIVE, not more
+        // conservative. The right reference is the fair-value centre
+        // BEFORE the A-S shift -- pcs.quote_fair_centre_mojos.
+        //
+        // Not changed yet, deliberately: the gate has NEVER fired (zero
+        // "skipped (round-trip fee" lines in any retained log), so there
+        // is nothing to recover, and two sibling guards in this same Step 8
+        // family were mis-diagnosed from control-flow reading alone. See
+        // cpp/include/xop/strategy/tier_gain.hpp, including the SIGN TRAP:
+        // the std::abs below and the frame must be fixed together, because
+        // a signed edge measured from the published mid drops nearly every
+        // bid.
         const Mojo mid = static_cast<Mojo>(std::llround(
             market_data_->get_mid_price(pair_name)
             * static_cast<double>(kMojosPerXch)));
@@ -9838,6 +10152,49 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
 
                 const auto expected_gain = static_cast<std::uint64_t>(
                     std::max(0.0, gain_mojos));
+
+                // [FEEGAIN 2026-09-01] SHADOW. The decision below is
+                // UNCHANGED -- still expected_gain from the published mid.
+                // These score the same tier in the two other frames Step 7
+                // produces, and only a DISAGREEMENT is logged.
+                //
+                // The published mid is not the frame the ladder lives in:
+                // tier price is centre*(1 +/- spacing), and measured on
+                // XCH/DBX the frame error is mean 143.2 bps against an A-S
+                // skew of mean 11.8 bps -- the gate's comment names the
+                // small term and admits one twelve times larger. But the
+                // gate has NEVER fired (zero "skipped (round-trip fee"
+                // lines across every retained log, engine.log included),
+                // so there is nothing to recover and a behaviour change
+                // here would be unmeasured. See tier_gain.hpp, and note
+                // the sign trap documented there before touching the abs.
+                if (pcs.quote_fair_centre_mojos > 0) {
+                    const bool is_ask_cg = (tier.side != Side::Bid);
+                    const auto g_fair = strategy::tier_expected_gain(
+                        static_cast<double>(tier.price),
+                        static_cast<double>(tier.size), is_ask_cg,
+                        static_cast<double>(pcs.quote_fair_centre_mojos),
+                        static_cast<double>(pair_cfg->base_mojos_per_unit));
+                    const bool live_keep = fee_tracker_->should_post_offer(
+                        expected_gain, recommended_fee, block_height);
+                    const bool fair_keep = g_fair.usable
+                        && fee_tracker_->should_post_offer(
+                               g_fair.expected_gain_mojos, recommended_fee,
+                               block_height);
+                    if (live_keep != fair_keep || g_fair.edge_fraction <= 0.0) {
+                        spdlog::warn(
+                            "[Engine] Step 8: {} [FEEGAIN-SHADOW] {} tier {} "
+                            "-- published-mid gain {} (keep={}), fair-centre "
+                            "gain {} edge {:+.1f}bps (keep={}); mid={} "
+                            "fair_centre={} -- decision unchanged, "
+                            "measurement only",
+                            pair_name, is_ask_cg ? "ask" : "bid",
+                            tier.tier_index, expected_gain, live_keep,
+                            g_fair.expected_gain_mojos,
+                            g_fair.edge_fraction * 10'000.0, fair_keep,
+                            mid, pcs.quote_fair_centre_mojos);
+                    }
+                }
 
                 if (fee_tracker_->should_post_offer(
                         expected_gain, recommended_fee, block_height)) {
@@ -10056,23 +10413,63 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         // ~10M mojos and exposed us to adverse selection for one block
         // per offer before cancellation.
         if (mid > 0) {
+            // [CROSSGUARD 2026-09-01] SHADOW MEASUREMENT. Suppression is
+            // UNCHANGED -- still the published-mid verdict, exactly as since
+            // 4d3f30d. The BBO verdict is computed beside it and only the
+            // DISAGREEMENT is logged.
+            //
+            // Why: this guard was written to pre-empt classify_tier_staleness
+            // and was a bit-exact predictor of it, until a932a5d moved the
+            // canceller onto the BBO one day later and left the guard behind.
+            // It has never been modified since. See cross_guard.hpp for the
+            // full account. But it is INERT on the only enabled pair (zero
+            // firings in six live rotations, one in the whole retained
+            // corpus), every "would suppress" figure available is a
+            // reconstruction rather than an observation, and a change in this
+            // family already shipped a regression through four review rounds.
+            // So: count first, decide from data.
+            const auto book_snap_cg = state_->get_market(pair_name);
+            const double cg_bid = static_cast<double>(book_snap_cg.best_bid);
+            const double cg_ask = static_cast<double>(book_snap_cg.best_ask);
+            const double cg_mid = static_cast<double>(mid);
+
             std::vector<TierQuote> mid_safe;
             mid_safe.reserve(fee_filtered_tiers.size());
             std::size_t suppressed_count = 0;
+            std::size_t shadow_would_keep = 0;   // we drop, canceller would not
+            std::size_t shadow_would_drop = 0;   // we keep, canceller would drop
+            std::size_t shadow_indeterminate = 0;
+            bool        shadow_inverted = false;
+            bool        shadow_mid_fallback = false;
+
             for (const auto& tier : fee_filtered_tiers) {
-                if (tier.side == Side::Bid && tier.price > mid) {
-                    spdlog::info("[Engine] Step 8: {} bid tier {} suppressed "
-                                 "-- price {} > mid {} (crossed)",
-                                 pair_name, tier.tier_index,
-                                 tier.price, mid);
-                    ++suppressed_count;
-                    continue;
+                const bool is_ask = (tier.side != Side::Bid);
+                const double px   = static_cast<double>(tier.price);
+
+                const auto live = execution::classify_cross_published_mid(
+                    is_ask, px, cg_mid);
+                const auto shadow = execution::classify_cross_bbo(
+                    is_ask, px, cg_bid, cg_ask, cg_mid);
+                shadow_inverted     |= shadow.book_inverted;
+                shadow_mid_fallback |= shadow.used_mid_fallback;
+
+                const bool live_crossed =
+                    (live == execution::CrossVerdict::Crossed);
+                if (shadow.verdict == execution::CrossVerdict::Indeterminate) {
+                    ++shadow_indeterminate;
+                } else {
+                    const bool shadow_crossed =
+                        (shadow.verdict == execution::CrossVerdict::Crossed);
+                    if (live_crossed && !shadow_crossed) ++shadow_would_keep;
+                    if (!live_crossed && shadow_crossed) ++shadow_would_drop;
                 }
-                if (tier.side == Side::Ask && tier.price < mid) {
-                    spdlog::info("[Engine] Step 8: {} ask tier {} suppressed "
-                                 "-- price {} < mid {} (crossed)",
-                                 pair_name, tier.tier_index,
-                                 tier.price, mid);
+
+                // SUPPRESSION IS THE LIVE VERDICT, UNCHANGED.
+                if (live_crossed) {
+                    spdlog::info("[Engine] Step 8: {} {} tier {} suppressed "
+                                 "-- price {} vs mid {} (crossed)",
+                                 pair_name, is_ask ? "ask" : "bid",
+                                 tier.tier_index, tier.price, mid);
                     ++suppressed_count;
                     continue;
                 }
@@ -10083,6 +10480,26 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                              "{}/{} tiers",
                              pair_name, suppressed_count,
                              fee_filtered_tiers.size());
+            }
+            if (shadow_would_keep > 0 || shadow_would_drop > 0) {
+                // The number this shadow exists to produce. If it stays at
+                // zero the question answers itself and the guard can be left
+                // alone; if it does not, this line is the evidence a fix
+                // would be built on.
+                spdlog::warn("[Engine] Step 8: {} [CROSSGUARD-SHADOW] "
+                             "published-mid and BBO verdicts disagree on "
+                             "{} tier(s) we dropped and {} we kept "
+                             "(mid={}, bbo={}/{}{}{}) -- suppression "
+                             "unchanged, this is measurement only",
+                             pair_name, shadow_would_keep, shadow_would_drop,
+                             mid, book_snap_cg.best_bid, book_snap_cg.best_ask,
+                             shadow_inverted ? ", BOOK INVERTED" : "",
+                             shadow_mid_fallback ? ", mid-fallback" : "");
+            }
+            if (shadow_indeterminate > 0) {
+                spdlog::debug("[Engine] Step 8: {} [CROSSGUARD-SHADOW] "
+                              "{} tier(s) had no usable reference",
+                              pair_name, shadow_indeterminate);
             }
             fee_filtered_tiers = std::move(mid_safe);
         }
@@ -10107,24 +10524,116 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 // recovering one-sided book (real bid appearing under a
                 // lagging model mid) re-suppressed every tier of the very
                 // pair the recovery was reviving.
+                // [BBOPERPAIR 2026-09-01] Per-pair first, strategy-level
+                // otherwise -- the same idiom max_half_spread_bps_override
+                // already uses. These are the bound an operator means by
+                // "do not quote further than X% from the market on THIS
+                // pair": measured against the same-side BBO, suppressing
+                // rather than clamping. Global values could not serve pairs
+                // whose volatility differs by an order of magnitude.
+                const PairConfig* bpc = find_pair_config(pair_name);
                 const double kMaxAggressiveDev =
-                    config_.strategy.bbo_sanity_max_aggressive_dev;
+                    (bpc && bpc->bbo_sanity_max_aggressive_dev_override
+                                .has_value())
+                        ? bpc->bbo_sanity_max_aggressive_dev_override.value()
+                        : config_.strategy.bbo_sanity_max_aggressive_dev;
                 const double kMaxPassiveDev =
-                    config_.strategy.bbo_sanity_max_passive_dev;
+                    (bpc && bpc->bbo_sanity_max_passive_dev_override
+                                .has_value())
+                        ? bpc->bbo_sanity_max_passive_dev_override.value()
+                        : config_.strategy.bbo_sanity_max_passive_dev;
                 const double kMaxMidDev =
                     config_.strategy.bbo_sanity_max_mid_dev;
 
+                // [SIDEQUALITY 2026-09-01] Pick the reference ONCE, here,
+                // so Check 1 and Check 2 cannot disagree about which half
+                // of the book is trustworthy.
+                //
+                // bbo_mid_m is the arithmetic mean of the two sides.  When
+                // one side is dislocated that mean is half-poisoned, and
+                // measuring a CORRECT model mid against it produces a
+                // large deviation whose cause is the book, not the model.
+                // Live XCH/BYC 2026-08-30: model 1.41141912 vs bbo_mid
+                // 3.24975 = 56.6% > 50%, so every tier was cleared -- the
+                // pair went silent BECAUSE the solver was right.  Against
+                // the surviving (honest) bid alone the same comparison is
+                // 5.9%, which passes.
+                const bool bid_ok = book_snap.bid_side_anchor_ok;
+                const bool ask_ok = book_snap.ask_side_anchor_ok;
+                const Mojo side_ref = book_snap.book_side_ref;
+
+                // The anchor replaces the midpoint wherever a midpoint
+                // would be built from a disqualified side.  side_ref is
+                // guaranteed > 0 whenever a side was disqualified (only an
+                // independent anchor can disqualify), but the fallback is
+                // written out rather than assumed: a silent 0 here would
+                // divide by zero below.
+                // [review round 5] The branch table now lives in
+                // bookside::step8_references, so it is driven by tests
+                // rather than by an Engine -- nothing in cpp/tests
+                // constructs one, which is exactly how the re-pointing
+                // regression reached production through four review rounds.
+                const auto s8 = bookside::step8_references(
+                    bid_ok, ask_ok,
+                    static_cast<double>(side_ref),
+                    static_cast<double>(bbo_mid_m),
+                    static_cast<double>(best_bid),
+                    static_cast<double>(best_ask));
+                const Mojo eff_bbo_mid =
+                    static_cast<Mojo>(std::llround(s8.effective_mid));
+
                 // Check 1: Model mid vs BBO sanity
+                //
+                // [review round 5] AN EARLIER REVISION OF THIS BLOCK
+                // RE-REFERENCED THIS CHECK TO THE SURVIVING SIDE WHEN THE
+                // OTHER WAS DISQUALIFIED. That was WRONG, and worse than
+                // the behaviour it replaced. The premise was that `mid`
+                // here is Step 7's fair-value centre; it is not. `mid` is
+                // the PUBLISHED mid (engine.cpp, `market_data_->
+                // get_mid_price(pair_name)`), and for a pair with no CEX
+                // or AMM leg the published mid IS the BBO midpoint --
+                // bit-for-bit the same number as bbo_mid_m.
+                //
+                // So on the live XCH/BYC book (bid 1.5000, ask 4.9995,
+                // both mid and bbo_mid_m 3.24975) this check's deviation
+                // is identically ZERO and it has never fired. Substituting
+                // best_bid turned that 0% into |3.24975-1.5|/1.5 = 116.7%,
+                // clearing EVERY tier on EVERY block -- silencing the pair
+                // this work exists to un-silence, by a different route.
+                //
+                // Check 2 does not have this problem and its
+                // re-referencing is correct: it compares TIER PRICES,
+                // which are built around Step 7's centre, so substituting
+                // that centre compares like with like. Check 1 compares
+                // the PUBLISHED MID, which is derived from the very book
+                // being judged -- there is no substitution that makes it
+                // meaningful, because both operands move together.
+                //
+                // Hence: when a side is disqualified this check is SKIPPED,
+                // not re-pointed. That restores its pre-existing behaviour
+                // exactly (it could not fire on such a book anyway) and
+                // refuses to invent a comparison the numbers cannot
+                // support.
                 if (mid > 0) {
-                    const double mid_dev = std::abs(
-                        static_cast<double>(mid) - static_cast<double>(bbo_mid_m))
-                        / static_cast<double>(bbo_mid_m);
-                    if (mid_dev > kMaxMidDev) {
-                        spdlog::warn("[Engine] Step 8: {} model mid {} deviates "
-                                     "{:.1f}% from BBO mid {} -- suppressing ALL "
-                                     "offers this block",
-                                     pair_name, mid, mid_dev * 100.0, bbo_mid_m);
-                        fee_filtered_tiers.clear();
+                    if (s8.run_mid_check) {
+                        const double mid_dev = std::abs(
+                            static_cast<double>(mid)
+                            - static_cast<double>(bbo_mid_m))
+                            / static_cast<double>(bbo_mid_m);
+                        if (mid_dev > kMaxMidDev) {
+                            spdlog::warn("[Engine] Step 8: {} model mid {} deviates "
+                                         "{:.1f}% from BBO mid {} -- suppressing ALL "
+                                         "offers this block",
+                                         pair_name, mid, mid_dev * 100.0, bbo_mid_m);
+                            fee_filtered_tiers.clear();
+                        }
+                    } else {
+                        spdlog::warn("[Engine] Step 8: {} skipping the model-mid "
+                                     "check -- a book side is disqualified vs "
+                                     "anchor {}, and the published mid is derived "
+                                     "from that same book, so no reference makes "
+                                     "the comparison meaningful",
+                                     pair_name, side_ref);
                     }
                 }
 
@@ -10135,13 +10644,29 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     std::size_t bbo_suppressed = 0;
 
                     for (const auto& tier : fee_filtered_tiers) {
-                        const Mojo ref = (tier.side == Side::Bid)
-                            ? best_bid : best_ask;
+                        // [SIDEQUALITY 2026-09-01] Reference the tier's OWN
+                        // side, unless that side has been disqualified --
+                        // then reference the independent anchor instead.
+                        //
+                        // The old unconditional best_ask measured our
+                        // correctly-priced 1.41 ask against a 4.9995 junk
+                        // ask and called it 71.8% "aggressive", killing it,
+                        // while a 1.41 bid passed at 6.0% against an honest
+                        // best_bid.  Suppressing the right quote and
+                        // admitting the questionable one, from one line.
+                        //
+                        // eff_bbo_mid matters as much as ref: classify_tier
+                        // uses the midpoint for the bid passive rule, so a
+                        // poisoned 3.24975 would read any bid up to 3.24975
+                        // as a safe passive rest.
+                        const Mojo ref = static_cast<Mojo>(std::llround(
+                            tier.side == Side::Bid ? s8.bid_tier_ref
+                                                   : s8.ask_tier_ref));
                         const auto verdict = strategy::classify_tier(
                             tier.side != Side::Bid,
                             static_cast<double>(tier.price),
                             static_cast<double>(ref),
-                            static_cast<double>(bbo_mid_m),
+                            static_cast<double>(eff_bbo_mid),
                             kMaxAggressiveDev, kMaxPassiveDev);
                         if (verdict != strategy::BboVerdict::Pass) {
                             const double dev = std::abs(
@@ -10293,9 +10818,15 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             // competitiveness scale, which historically caused 100% of
             // BYC tiers to be suppressed (151 sanity rejections in
             // 0.7.45 audit).  Use a lower threshold for stablecoin pairs.
+            // [2026-09-02, review] The literal used to be written out here
+            // AND again in the Step 12 metrics export, with a comment there
+            // claiming a test kept the two in sync.  There was no such test.
+            // One definition now, in a pure header, pinned by static_assert
+            // and by test_competitiveness_gate.cpp.  Do not re-inline it.
             const PairConfig* pair_cfg_comp = find_pair_config(pair_name);
             const int kBaseCompetitivenessScore =
-                (pair_cfg_comp && pair_cfg_comp->is_stablecoin) ? 1 : 3;
+                xop::strategy::base_competitiveness_score(
+                    pair_cfg_comp && pair_cfg_comp->is_stablecoin);
 
             // [v0.7.48] Apply PID offset to the base threshold.  Negative
             // offset (underfilling) lowers the gate so more tiers post;
@@ -10498,36 +11029,54 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         // pending offers plus candidate new tiers and suppress any side that
         // would breach reserve if all accepted.
         {
-            auto ceil_to_mojo = [](long double value) -> Mojo {
-                if (!std::isfinite(static_cast<double>(value)) || value <= 0.0L) {
-                    return 0;
-                }
-                const long double cap = static_cast<long double>(
-                    std::numeric_limits<Mojo>::max());
-                if (value >= cap) {
-                    return std::numeric_limits<Mojo>::max();
-                }
-                return static_cast<Mojo>(std::ceil(value));
-            };
+            // [2026-09-01] The fourth copy of the same long double formula,
+            // and the most dangerous of them: this one feeds
+            // exposure_breaches_reserve() and therefore can_bid/can_ask --
+            // a quoting kill switch driven by platform-dependent arithmetic,
+            // on every enabled pair. No test reaches it. Replaced with the
+            // shared exact-integer implementation; see the banner in
+            // take_sizing.hpp.
+            //
+            // BE ACCURATE ABOUT THE MOTIVE. An earlier draft of this comment
+            // said this site ran "at exactly the magnitudes where the float
+            // version diverged most (~0.24% on the live pair)". That is
+            // false, and it would send a future auditor of this kill switch
+            // hunting for corrupted historical suppression decisions that do
+            // not exist. This site computes the ASK-shaped conversion
+            // (base_size * price * quote_mpu / (base_mpu * kMojosPerXch));
+            // the ~0.24-0.33% figure belongs to the BID-shaped inverse, a
+            // formula this site never calls. Measured at this site's own
+            // geometry -- XCH/DBX, our own pending offer sizes -- the float
+            // version diverged on 0.000% of 20,000 samples, on BOTH ABIs.
+            //
+            // The real reason to change it is sufficient without the number:
+            // the ask path is fragile precisely on exact-integer results,
+            // which is the 1500/750 case CI was red on, and keeping a fourth
+            // private copy of the formula IS the defect.
+            //
+            // As above: our own pending offer's `size` is already base mojos,
+            // so quote_cost_for_ask is the right arithmetic despite the
+            // taker-flavoured name.
             auto quote_cost_for_base_size = [&](Mojo base_size, Mojo price) -> Mojo {
-                const long double base_mpu = static_cast<long double>(
-                    pair_cfg->base_mojos_per_unit > 0 ? pair_cfg->base_mojos_per_unit : 1);
-                const long double quote_mpu = static_cast<long double>(
-                    pair_cfg->quote_mojos_per_unit > 0 ? pair_cfg->quote_mojos_per_unit : 1);
-                const long double price_scale = static_cast<long double>(kMojosPerXch);
-                return ceil_to_mojo(
-                    static_cast<long double>(base_size)
-                    * static_cast<long double>(price)
-                    * quote_mpu / (base_mpu * price_scale));
+                return execution::quote_cost_for_ask(
+                    base_size, price,
+                    pair_cfg->base_mojos_per_unit,
+                    pair_cfg->quote_mojos_per_unit);
             };
 
             Mojo pending_plus_new_ask = pair_base_pending_spend;
             Mojo pending_plus_new_bid = pair_quote_pending_spend;
             for (const auto& tq : fee_filtered_tiers) {
                 if (tq.side == Side::Ask) {
-                    pending_plus_new_ask += tq.size;
+                    pending_plus_new_ask =
+                        saturating_add_mojo(pending_plus_new_ask, tq.size);
                 } else {
-                    pending_plus_new_bid += quote_cost_for_base_size(tq.size, tq.price);
+                    // Saturating: quote_cost_for_base_size can return Mojo max,
+                    // and two such summands would overflow signed int64 (UB) in
+                    // a value that drives can_bid/can_ask.
+                    pending_plus_new_bid = saturating_add_mojo(
+                        pending_plus_new_bid,
+                        quote_cost_for_base_size(tq.size, tq.price));
                 }
             }
 
@@ -11030,6 +11579,28 @@ asio::awaitable<void> Engine::step_check_arbitrage(
     const double min_edge_bps = config_.arbitrage.crossed_book_min_edge_bps;
     const double max_take_xch = config_.arbitrage.crossed_book_max_take_xch;
 
+    // [S40 remainder 2026-09-01] Age-out plus the hard cap on the retry map.
+    // Safe on every cycle, including cycles whose book read empty -- unlike
+    // retain_live() below, which must NOT run on an empty read.
+    //
+    // [review] The return value used to be discarded. The two counts are not
+    // interchangeable: an age-out is routine, but a CAP eviction throws away a
+    // suppression that may still be live -- still crossed, still unfundable --
+    // and the storm it was holding resumes on the next cycle with no record
+    // anywhere that it happened. That is an edge, so it is warned once per
+    // cycle it occurs and never levelled.
+    {
+        const auto swept = crossed_book_retry_.sweep(
+            static_cast<std::uint64_t>(block_height),
+            crossed_book_retry_cfg_);
+        if (swept.capped > 0) {
+            spdlog::warn("[Engine] Step 9c: retry map hit its {}-entry cap -- "
+                         "evicted {} least-recently-seen entries. Any that "
+                         "were still suppressed resume attempting now.",
+                         crossed_book_retry_cfg_.max_entries, swept.capped);
+        }
+    }
+
     for (const auto& pair : config_.pairs) {
         if (!pair.enabled || pair_peg_suspended(pair)) continue;
 
@@ -11037,53 +11608,130 @@ asio::awaitable<void> Engine::step_check_arbitrage(
         auto comp_offers = market_data_->get_competing_offers(pair.name);
         if (comp_offers.empty()) continue;
 
-        // Find best (highest) bid and best (lowest) ask from competing offers.
-        Mojo best_bid_price = 0;
-        Mojo best_ask_price = std::numeric_limits<Mojo>::max();
-        std::string best_ask_offer_id;
-        Mojo best_ask_size = 0;
-
-        for (const auto& co : comp_offers) {
-            if (co.side == Side::Bid && co.price > best_bid_price) {
-                best_bid_price = co.price;
-            }
-            if (co.side == Side::Ask && co.price < best_ask_price) {
-                best_ask_price = co.price;
-                best_ask_offer_id = co.offer_id;
-                best_ask_size = co.size;
-            }
+        // [S40 remainder] The book read non-empty, so every retry entry for
+        // THIS pair whose offer is no longer on the book is garbage by
+        // construction: evaluate_crossed_book() cannot re-select it. Pruning
+        // here and nowhere else is deliberate -- offer_manager.cpp clear()s
+        // its equivalent counters when its input list is empty, and copying
+        // that would let one transient empty Dexie snapshot wipe every
+        // suppression and resume the storm on the next non-empty cycle.
+        {
+            std::unordered_set<std::string> live_ids;
+            live_ids.reserve(comp_offers.size());
+            for (const auto& co : comp_offers) live_ids.insert(co.offer_id);
+            crossed_book_retry_.retain_live(pair.name, live_ids);
         }
 
-        // No two-sided market -> nothing to cross.
-        if (best_bid_price == 0 ||
-            best_ask_price == std::numeric_limits<Mojo>::max()) {
+        // [S40 2026-09-01] Selection, the cross test, the edge test and the
+        // size cap now live in evaluate_crossed_book(). The cap used to be
+        // computed here and then thrown away: std::min() clamped a LOG FIELD
+        // while take_offer() -- which has no size parameter, because Chia
+        // offers are atomic and cannot be partially filled -- consumed the
+        // counterparty's entire offer. The cap is honoured by FILTERING, as
+        // Step 9d has always done. See crossed_book.hpp for the full argument.
+        //
+        // The pair denomination is preserved here on purpose: 9c caps in
+        // pair.base_mojos_per_unit, NOT kMojosPerXch, so 5.0 means 5e12 mojos
+        // on XCH/DBX and 5000 mojos on BYC/wUSDC.b.
+        const Mojo max_take_mojos = execution::cap_mojos_for(
+            max_take_xch, pair.base_mojos_per_unit);
+
+        const auto decision = execution::evaluate_crossed_book(
+            comp_offers, min_edge_bps, max_take_mojos);
+
+        using execution::CrossedBookVerdict;
+
+        // The quiet verdicts first: these fire on most pairs on most blocks
+        // and must not reach info.
+        if (decision.verdict == CrossedBookVerdict::NoBook ||
+            decision.verdict == CrossedBookVerdict::NotCrossed) {
             continue;
         }
-
-        // Not crossed -> no opportunity.
-        if (best_bid_price < best_ask_price) continue;
-
-        // Compute edge in basis points.
-        const double ask_d = static_cast<double>(best_ask_price);
-        const double bid_d = static_cast<double>(best_bid_price);
-        const double edge_bps = (bid_d - ask_d) / ask_d * 10000.0;
-
-        if (edge_bps < min_edge_bps) {
+        if (decision.verdict == CrossedBookVerdict::EdgeTooThin) {
             spdlog::debug("[Engine] Step 9c: {} crossed book edge={:.1f}bps "
                           "< min={:.1f}bps -- skipping",
-                          pair.name, edge_bps, min_edge_bps);
+                          pair.name, decision.edge_bps, min_edge_bps);
             continue;
         }
 
-        // Cap the take size (use pair denomination, not kMojosPerXch).
-        const Mojo max_take_mojos = static_cast<Mojo>(
-            max_take_xch * static_cast<double>(pair.base_mojos_per_unit));
-        const Mojo take_size = std::min(best_ask_size, max_take_mojos);
+        const Mojo         best_bid_price    = decision.best_bid_price;
+        const Mojo         best_ask_price    = decision.best_ask_price;
+        const std::string& best_ask_offer_id = decision.best_ask_offer_id;
+        const double       edge_bps          = decision.edge_bps;
 
-        spdlog::info("[Engine] Step 9c: {} CROSSED BOOK detected -- "
-                     "bid={} ask={} edge={:.1f}bps offer_id={} size={}",
-                     pair.name, best_bid_price, best_ask_price,
-                     edge_bps, best_ask_offer_id.substr(0, 12), take_size);
+        // Detection is logged BEFORE the size gate, and prints the TRUE
+        // counterparty size alongside the cap. This line is the instrument
+        // that measured 208 clamped attempts; a log that prints a DERIVED
+        // size can be read for months without anyone seeing the defect.
+        // Rule for this whole step: no log line may print a size that is not
+        // best_ask_size or cap_mojos verbatim.
+        //
+        // [review 2026-09-01] IT IS DEBUG, NOT INFO, AND THAT IS THE POINT.
+        // This line sits 140+ lines ABOVE the retry gate and fires on every
+        // cycle the book is crossed above min edge, so during the Cgp9 storm
+        // it emitted 50 of the window's 150 Step-9c lines -- and the gate,
+        // which lives below it, cannot suppress a line that was already
+        // printed. Leaving it at info made the claim "the 50-attempt storm
+        // collapses to one line" false by 50x and violated this repo's own
+        // rule (log edges plus a heartbeat, never a level every cycle) with
+        // the single most frequent line on the path. Every downstream branch
+        // -- CapUnusable, ZeroSize, SizeExceedsCap, each gate decline, TAKING
+        // and TOOK -- carries the offer id and the numbers it needs, so
+        // nothing that happens is now unreported; only the per-cycle
+        // restatement that nothing has changed is gone.
+        spdlog::debug("[Engine] Step 9c: {} CROSSED BOOK detected -- "
+                      "bid={} ask={} edge={:.1f}bps offer_id={} size={} cap={}",
+                      pair.name, best_bid_price, best_ask_price,
+                      edge_bps, best_ask_offer_id.substr(0, 12),
+                      decision.best_ask_size, decision.cap_mojos);
+
+        if (decision.verdict == CrossedBookVerdict::CapUnusable) {
+            spdlog::warn("[Engine] Step 9c: {} take cap is unusable "
+                         "(crossed_book_max_take_xch={} base_mojos_per_unit={}) "
+                         "-- taking nothing",
+                         pair.name, max_take_xch, pair.base_mojos_per_unit);
+            continue;
+        }
+
+        if (decision.verdict == CrossedBookVerdict::ZeroSizeOffer) {
+            spdlog::info("[Engine] Step 9c: {} offer {} carries zero size -- "
+                         "skipping (the take would settle on chain with no "
+                         "fill record and no ledger legs)",
+                         pair.name, best_ask_offer_id.substr(0, 12));
+            continue;
+        }
+
+        if (decision.verdict == CrossedBookVerdict::SizeExceedsCap) {
+            // 9d's words, deliberately (engine.cpp Step 9d size filter).
+            spdlog::info("[Engine] Step 9c: {} offer size {} exceeds cap {} "
+                         "-- skipping (takes are all-or-nothing, cannot "
+                         "partially fill)",
+                         pair.name, decision.best_ask_size,
+                         decision.cap_mojos);
+            continue;
+        }
+
+        // Any verdict this step does not know about declines. A new enumerator
+        // must not fall through into a take.
+        if (decision.verdict != CrossedBookVerdict::Take) {
+            continue;
+        }
+
+        // The whole offer is consumed -- already validated against the cap by
+        // the size filter above, so it is the only size allowed to reach
+        // record_taker_fill().
+        //
+        // What it is NOT: a confirmation. This is the counterparty's
+        // ADVERTISED size, as observed in Step 1's Dexie snapshot. Nothing
+        // below re-derives it -- get_offer_status() is read only for the
+        // bech32 text and the status, and take_offer()'s trade_record is read
+        // only for the trade id -- so if the maker reposts between detection
+        // and the take, the ledger legs are still synthesised from an
+        // unconfirmed number. That is far smaller than the clamp (an
+        // unvalidated observation, not a fabricated cap) but it is a residual,
+        // not a closed gap. FOLLOW-UP: re-derive the settled amounts from
+        // take_offer()'s trade_record before recording.
+        const Mojo take_size = decision.take_size;
 
         if (dry_run_) {
             spdlog::info("[Engine] Step 9c: {} DRY RUN -- would take offer "
@@ -11093,17 +11741,224 @@ asio::awaitable<void> Engine::step_check_arbitrage(
             continue;
         }
 
+        // ------------------------------------------------------------------
+        // [S40 remainder 2026-09-01] PRE-TRADE FUNDING CHECK + RETRY GATE.
+        //
+        // This sits BEFORE get_offer_status() on purpose. Step 9e checks the
+        // balance AFTER its Dexie fetch; 9c's decline is deterministic and
+        // repeats, so checking first saves BOTH round trips rather than one.
+        // Measured: 105 attempts x (1 Dexie GET + 1 take_offer) = 208 wasted
+        // RPCs on 104 failures, 96 of them insufficient funds and not one of
+        // them ever fundable -- offer Cgp9GrtmnmPf alone was re-selected 50
+        // times in 46 minutes against a DBX wallet that never came within
+        // 30% of the 485,908 mojos it needed. See take_retry.hpp.
+        //
+        // The fee is computed here rather than after the fetch because it is
+        // part of the requirement whenever it leaves the SAME wallet as the
+        // spend.
+        // ------------------------------------------------------------------
+        const std::uint64_t fee = fee_tracker_
+            ? fee_tracker_->get_recommended_fee(
+                  config_.fees.min_fee_mojos, block_height)
+            : config_.fees.min_fee_mojos;
+
+        // 9c lifts an ASK and only an ASK -- evaluate_crossed_book() has no
+        // bid path -- so the spend asset is unconditionally the QUOTE. There
+        // is deliberately no side ternary here: a ternary on a side that is
+        // always Ask is a copy-paste hazard, and the cost MUST be quote
+        // mojos. Writing `cost = take_size` (base mojos) would compare
+        // 5,000,000,000,000 against a 338,276-mojo DBX wallet and decline
+        // every crossed-book take on every pair, forever, while looking
+        // exactly like a working guard.
+        const bool spend_is_xch = (pair.quote_asset_id == "xch");
+        const Mojo spend_cost = execution::ask_take_cost(
+            decision.best_ask_size, best_ask_price,
+            pair.base_mojos_per_unit, pair.quote_mojos_per_unit,
+            spend_is_xch ? static_cast<Mojo>(fee) : Mojo{0});
+
+        // read_ok{false} is UNKNOWN and it is the DEFAULT. A number is never
+        // substituted for a failed read (coin_pool_verdict.hpp), which is why
+        // this is not `bal.value("spendable_balance", 0)` -- that defaulted
+        // zero reads as "broke", which happens to decline but for the wrong
+        // reason, with the wrong log line and the wrong accrual class.
+        execution::SpendableReading reading{};
+        std::string balance_err;
+        const std::int64_t spend_wid =
+            offer_mgr_ ? offer_mgr_->resolve_wallet_id(pair.quote_asset_id)
+                       : -1;
+        if (spend_wid > 0) {
+            try {
+                auto bal = co_await wallet_->get_wallet_balance(spend_wid);
+                if (bal.contains("spendable_balance")) {
+                    const auto& jb = bal["spendable_balance"];
+                    if (jb.is_number_unsigned()) {
+                        const auto u = jb.get<std::uint64_t>();
+                        reading.spendable =
+                            (u > static_cast<std::uint64_t>(
+                                     std::numeric_limits<Mojo>::max()))
+                                ? std::numeric_limits<Mojo>::max()
+                                : static_cast<Mojo>(u);
+                        reading.read_ok = true;
+                    } else if (jb.is_number_integer()) {
+                        reading.spendable = jb.get<Mojo>();
+                        reading.read_ok   = true;
+                    }
+                }
+                if (!reading.read_ok) {
+                    balance_err = "response carried no usable "
+                                  "spendable_balance field";
+                }
+            } catch (const std::exception& be) {
+                balance_err = be.what();
+            }
+        } else {
+            // resolve_wallet_id() returns -1 only when no wallet is mapped
+            // for the asset -- i.e. we have nothing to spend it from, so the
+            // take could not settle anyway. This declines rather than
+            // skipping the check the way Step 9e does, and it is logged, so
+            // it cannot become a silent kill switch.
+            balance_err = "no wallet is mapped for the spend asset";
+        }
+
+        const execution::OfferFingerprint fp{best_ask_price,
+                                             decision.best_ask_size};
+        const auto tg = crossed_book_retry_.gate(
+            pair.name, best_ask_offer_id, fp, reading, spend_cost,
+            static_cast<std::uint64_t>(block_height),
+            crossed_book_retry_cfg_);
+
+        if (tg.gate != execution::TakeGate::Attempt) {
+            // Edges and a heartbeat, never a level. 150 of the 153 Step-9c
+            // info/error lines in the Cgp9 window were one doomed offer;
+            // with the detection line demoted above, this path is the whole
+            // of the step's recurring output: one line per state change plus
+            // an hourly reminder. The heartbeat is not optional: engine.cpp's
+            // breaker_skip_warned_ is an edge with no off-edge and it
+            // compressed a 4h10m total-quoting outage into a single line
+            // nobody saw.
+            //
+            // [review] ONE MESSAGE PER ENUMERATOR, and no message may be
+            // reachable from two different states. The first cut rendered the
+            // coin-lock funding hold as DeclineInsufficient, which printed
+            // "insufficient balance: need 485908 spendable 485913 short 0 ...
+            // Clears the cycle the balance covers it" -- self-contradicting,
+            // and identical to the benign case that fires 96 times in 104.
+            const bool edge = (tg.log == execution::TakeLogEvent::Edge);
+            if (edge || tg.log == execution::TakeLogEvent::Heartbeat) {
+                const char* verb = edge ? "DECLINING" : "still declining";
+                const std::string id12 = best_ask_offer_id.substr(0, 12);
+                switch (tg.gate) {
+                case execution::TakeGate::DeclineUnknown:
+                    spdlog::warn(
+                        "[Engine] Step 9c: {} {} take of {} (edge={:.1f}bps) "
+                        "-- spendable balance UNKNOWN (wallet {}): {}. An "
+                        "unread balance is not a passed check. "
+                        "cycles={} blocks={}",
+                        pair.name, verb, id12, edge_bps, spend_wid,
+                        balance_err.empty() ? "cost could not be priced"
+                                            : balance_err,
+                        tg.suppressed_cycles, tg.suppressed_blocks);
+                    break;
+                case execution::TakeGate::DeclineInsufficient:
+                    spdlog::info(
+                        "[Engine] Step 9c: {} {} take of {} (edge={:.1f}bps) "
+                        "-- insufficient balance: need {} spendable {} "
+                        "short {} (wallet {}). Clears the cycle the balance "
+                        "covers it. cycles={} blocks={}",
+                        pair.name, verb, id12, edge_bps, spend_cost,
+                        tg.spendable, tg.shortfall, spend_wid,
+                        tg.suppressed_cycles, tg.suppressed_blocks);
+                    break;
+                case execution::TakeGate::DeclineFundingHold:
+                    // The one state the old wording could not express: the
+                    // read says we can pay and the WALLET disagreed. Name the
+                    // rejected reading and both release conditions, because
+                    // neither is "the balance covers it" -- it already does.
+                    spdlog::warn(
+                        "[Engine] Step 9c: {} {} take of {} (edge={:.1f}bps) "
+                        "-- our read says AFFORDABLE (need {} spendable {}) "
+                        "but the wallet rejected this on funding at "
+                        "spendable={} (wallet {}); most likely our own "
+                        "just-posted offers still hold the coins. Held until "
+                        "the read rises above that or block {} (now {}). "
+                        "cycles={} blocks={}",
+                        pair.name, verb, id12, edge_bps, spend_cost,
+                        tg.spendable, tg.rejected_at, spend_wid,
+                        tg.ready_block, block_height,
+                        tg.suppressed_cycles, tg.suppressed_blocks);
+                    break;
+                case execution::TakeGate::DeclineSyncBackoff:
+                    spdlog::info(
+                        "[Engine] Step 9c: {} {} take of {} (edge={:.1f}bps) "
+                        "-- the wallet rejected this while syncing; short "
+                        "hold until block {} (now {}). The balance is fine "
+                        "(need {} spendable {}). cycles={} blocks={}",
+                        pair.name, verb, id12, edge_bps, tg.ready_block,
+                        block_height, spend_cost, tg.spendable,
+                        tg.suppressed_cycles, tg.suppressed_blocks);
+                    break;
+                case execution::TakeGate::DeclineBackoff:
+                    spdlog::info(
+                        "[Engine] Step 9c: {} {} take of {} (edge={:.1f}bps) "
+                        "-- backing off after an unclassified take failure "
+                        "until block {} (now {}). cycles={} blocks={}",
+                        pair.name, verb, id12, edge_bps, tg.ready_block,
+                        block_height,
+                        tg.suppressed_cycles, tg.suppressed_blocks);
+                    break;
+                case execution::TakeGate::Attempt:
+                    // Unreachable: this whole branch is the != Attempt case.
+                    // Enumerated rather than defaulted so a new decline
+                    // enumerator is a COMPILE error here (/W4 /WX) and not a
+                    // silently mislabelled log line.
+                    break;
+                }
+            }
+            continue;
+        }
+
+        if (tg.log == execution::TakeLogEvent::Resume) {
+            spdlog::info("[Engine] Step 9c: {} offer {} is fundable again "
+                         "after {} suppressed cycles ({} blocks) -- "
+                         "need {} spendable {}",
+                         pair.name, best_ask_offer_id.substr(0, 12),
+                         tg.suppressed_cycles, tg.suppressed_blocks,
+                         spend_cost, tg.spendable);
+        }
+
         // Fetch the full offer text (bech32m) from Dexie.
         // The competing-offers fetch uses compact=true which omits the text.
+        //
+        // [review 2026-09-01] `took_ok` exists because the bookkeeping below
+        // (record_taker_fill / record_fee / send_alert) sits inside this try.
+        // A SQLite "database is locked" -- routine on Windows here -- thrown
+        // AFTER the swap settled used to land in the catch, which logged a
+        // settled take as a failure and then re-created the retry entry with
+        // other_failures=1. A take that reached the chain is not a take
+        // failure, whatever throws afterwards.
+        bool took_ok = false;
         try {
             auto offer_status =
                 co_await dexie_->get_offer_status(best_ask_offer_id);
 
             if (!offer_status.success ||
                 offer_status.offer.offer_bech32.empty()) {
+                // [review] This used to `continue` with no accrual, while the
+                // THROWING form of the identical Dexie fault was classified
+                // Other and backed off 4 -> 64 blocks. Same fault, opposite
+                // treatment, decided by whether the client models the failure
+                // as an exception -- and the non-accruing branch reproduces
+                // S40's "re-attempted every cycle, no backoff" one RPC
+                // earlier. Latent (all 104 measured failures were take_offer
+                // throws), so this closes it before it is observed.
                 spdlog::warn("[Engine] Step 9c: {} failed to fetch offer "
                              "text for {} -- skipping",
                              pair.name, best_ask_offer_id.substr(0, 12));
+                crossed_book_retry_.note_failure(
+                    pair.name, best_ask_offer_id, fp,
+                    execution::TakeFailureClass::Other, reading,
+                    static_cast<std::uint64_t>(block_height),
+                    crossed_book_retry_cfg_);
                 continue;
             }
 
@@ -11115,12 +11970,6 @@ asio::awaitable<void> Engine::step_check_arbitrage(
                              offer_status.offer.status);
                 continue;
             }
-
-            // Determine fee from the FeeTracker.
-            const std::uint64_t fee = fee_tracker_
-                ? fee_tracker_->get_recommended_fee(
-                      config_.fees.min_fee_mojos, block_height)
-                : config_.fees.min_fee_mojos;
 
             spdlog::info("[Engine] Step 9c: {} TAKING crossed-book offer "
                          "{} (edge={:.1f}bps, size={}, fee={})",
@@ -11156,6 +12005,12 @@ asio::awaitable<void> Engine::step_check_arbitrage(
                              pair.name, trade_id.substr(0, 12),
                              edge_bps, take_size);
 
+                // Everything we knew about this offer is spent. Set BEFORE
+                // the bookkeeping below, which is what can still throw.
+                took_ok = true;
+                crossed_book_retry_.note_success(pair.name,
+                                                 best_ask_offer_id);
+
                 // [TAKER-RECORDING 2026-07-30] We lifted an ASK, so we
                 // bought base and paid quote.
                 if (const PairConfig* tpc = find_pair_config(pair.name)) {
@@ -11180,16 +12035,53 @@ asio::awaitable<void> Engine::step_check_arbitrage(
                         std::to_string(take_size) + " mojos");
                 }
             } else {
+                // Structurally near-dead: rpc_post() THROWS
+                // ChiaRPCApplicationError on success:false and only returns
+                // on success, so this fires solely on a malformed response
+                // with no `success` key -- 0 occurrences in the 39h window
+                // against 104 from the catch below. It still burned two
+                // RPCs, so it accrues as the unmodelled class.
                 const std::string err = result.contains("error")
                     ? result["error"].get<std::string>()
                     : "unknown error";
                 spdlog::warn("[Engine] Step 9c: {} take_offer failed: {}",
                              pair.name, err);
+                crossed_book_retry_.note_failure(
+                    pair.name, best_ask_offer_id, fp,
+                    execution::TakeFailureClass::Other, reading,
+                    static_cast<std::uint64_t>(block_height),
+                    crossed_book_retry_cfg_);
             }
 
         } catch (const std::exception& e) {
-            spdlog::error("[Engine] Step 9c: {} crossed-book take failed: {}",
-                          pair.name, e.what());
+            // [S40 remainder] The catch-all used to erase the taxonomy: a
+            // Dexie transport throw, a wallet sync rejection and a funding
+            // rejection all emitted the identical message shape with the
+            // identical control flow, so the log could not distinguish a
+            // DETERMINISTIC failure from a TRANSIENT one except by
+            // substring-matching the exception text. Classify HERE, at the
+            // throw site, and say which class it was -- a policy reading the
+            // log stream cannot do it.
+            if (took_ok) {
+                // The swap SETTLED. Whatever threw came from the ledger /
+                // fee / alert bookkeeping after it, and calling note_failure
+                // here would both misreport a filled take as a failure and
+                // feed a backoff counter with an event that has nothing to do
+                // with taking offers.
+                spdlog::error("[Engine] Step 9c: {} the take SETTLED but the "
+                              "bookkeeping after it failed -- the fill may be "
+                              "missing from the ledger: {}",
+                              pair.name, e.what());
+                continue;
+            }
+            const auto cls = execution::classify_take_failure(e.what());
+            spdlog::error("[Engine] Step 9c: {} crossed-book take failed "
+                          "[{}]: {}",
+                          pair.name, execution::to_string(cls), e.what());
+            crossed_book_retry_.note_failure(
+                pair.name, best_ask_offer_id, fp, cls, reading,
+                static_cast<std::uint64_t>(block_height),
+                crossed_book_retry_cfg_);
         }
     }
 
@@ -11650,17 +12542,87 @@ asio::awaitable<void> Engine::step_check_arbitrage(
             // Lambda to take a single peg-crossing offer.
             auto take_peg = [&](const PegCandidate& c)
                 -> asio::awaitable<void> {
-                const Mojo max_mojos = static_cast<Mojo>(
-                    peg_max_units
-                    * static_cast<double>(pair.base_mojos_per_unit));
-                const Mojo take_sz = std::min(c.size, max_mojos);
+                // [S40 follow-up 2026-09-01] This lambda carried the SAME
+                // defect as Step 9c, and worse. It read
+                //
+                //     const Mojo take_sz = std::min(c.size, max_mojos);
+                //
+                // take_offer() has no size parameter and a Chia offer cannot
+                // be partially filled, so the clamp bounded nothing. Here the
+                // clamped value did not merely mislead a log: it fed the
+                // PRE-BALANCE GUARD below, so for any offer larger than
+                // peg_arb_max_take_units the guard priced a fraction of the
+                // take, passed, and let take_offer() lift the whole offer we
+                // could not fund. A fail-open inside a guard whose only job is
+                // to stop unfundable takes. It then fed record_taker_fill(),
+                // synthesising both double-entry ledger legs from a size the
+                // RPC never saw.
+                //
+                // The cap is now a FILTER, exactly as Steps 9c/9d/9f do it.
+                //
+                // The units were wrong too, independently of the clamp.
+                // Ingest denominates a BID's size in the QUOTE asset and an
+                // ASK's in the BASE asset (market_data.cpp:1933-1937), and
+                // this lambda applied one base-denominated formula to both.
+                // On BYC/wUSDC.b the error is masked because base and quote
+                // mojos-per-unit are coincidentally equal (1000 each); on any
+                // pair where they differ, the cap, the funding estimate and
+                // the ledger were all in the wrong unit. take_sizing.hpp does
+                // the conversion and is tested.
+                const Mojo max_mojos = execution::cap_mojos_for(
+                    peg_max_units, pair.base_mojos_per_unit);
+
+                // base_sz: what we actually acquire or deliver, in BASE mojos
+                //          -- the number the cap bounds and the number
+                //          record_taker_fill() books.
+                // spend_cost: what leaves our wallet, in the asset we spend.
+                const Mojo base_sz = (c.side == Side::Ask)
+                    ? c.size
+                    : execution::base_size_for_bid(
+                          c.size, c.price,
+                          pair.base_mojos_per_unit,
+                          pair.quote_mojos_per_unit);
+                const Mojo spend_cost = (c.side == Side::Ask)
+                    ? execution::quote_cost_for_ask(
+                          c.size, c.price,
+                          pair.base_mojos_per_unit,
+                          pair.quote_mojos_per_unit)
+                    : base_sz;
 
                 spdlog::info("[Engine] Step 9e: {} PEG-CROSS {} "
                              "price={} peg={} edge={:.1f}bps "
-                             "offer={} size={}",
+                             "offer={} size={} base_size={} cap={}",
                              pair.name, to_string(c.side),
                              c.price, peg_mojos, c.edge_bps,
-                             c.id.substr(0, 12), take_sz);
+                             c.id.substr(0, 12), c.size, base_sz, max_mojos);
+
+                if (max_mojos <= 0) {
+                    spdlog::warn("[Engine] Step 9e: {} take cap is unusable "
+                                 "(peg_arb_max_take_units={} "
+                                 "base_mojos_per_unit={}) -- taking nothing",
+                                 pair.name, peg_max_units,
+                                 pair.base_mojos_per_unit);
+                    co_return;
+                }
+                if (base_sz <= 0 || spend_cost <= 0) {
+                    spdlog::info("[Engine] Step 9e: {} offer {} carries no "
+                                 "usable size (size={} base_size={} price={}) "
+                                 "-- skipping",
+                                 pair.name, c.id.substr(0, 12), c.size,
+                                 base_sz, c.price);
+                    co_return;
+                }
+                if (base_sz > max_mojos) {
+                    spdlog::info("[Engine] Step 9e: {} offer base size {} "
+                                 "exceeds cap {} -- skipping (takes are "
+                                 "all-or-nothing, cannot partially fill)",
+                                 pair.name, base_sz, max_mojos);
+                    co_return;
+                }
+
+                // The whole offer settles, and it has been checked against
+                // the cap. No clamp: see take_sizing.hpp.
+                const Mojo take_sz = base_sz;
 
                 if (dry_run_) {
                     spdlog::info("[Engine] Step 9e: {} DRY RUN -- "
@@ -11704,37 +12666,94 @@ asio::awaitable<void> Engine::step_check_arbitrage(
                         try {
                             auto bal = co_await
                                 wallet_->get_wallet_balance(spend_wid);
-                            Mojo spendable = bal.value(
-                                "spendable_balance",
-                                static_cast<Mojo>(0));
 
-                            // Estimate cost: for ASK take we pay
-                            // take_sz * price / kMojosPerXch in quote
-                            // mojos; for BID take we deliver take_sz
-                            // base mojos.
-                            const Mojo cost =
-                                (c.side == Side::Ask)
-                                    ? static_cast<Mojo>(
-                                          static_cast<double>(take_sz)
-                                          * static_cast<double>(c.price)
-                                          / static_cast<double>(
-                                                kMojosPerXch))
-                                    : take_sz;
+                            // [S40 remainder 2026-09-01] read_ok{false} is
+                            // UNKNOWN and it is the DEFAULT. This used to be
+                            // bal.value("spendable_balance", 0), which
+                            // silently substitutes a NUMBER for a missing
+                            // field -- coin_pool_verdict.hpp's rule forbids
+                            // exactly that. The defaulted zero happened to
+                            // decline (it reads as "broke"), so it was a
+                            // latent bug pointing the safe way, but it
+                            // declined for the wrong reason and said the
+                            // wrong thing in the log.
+                            execution::SpendableReading reading{};
+                            if (bal.contains("spendable_balance")) {
+                                const auto& jb = bal["spendable_balance"];
+                                if (jb.is_number_unsigned()) {
+                                    const auto u = jb.get<std::uint64_t>();
+                                    reading.spendable =
+                                        (u > static_cast<std::uint64_t>(
+                                                 std::numeric_limits<
+                                                     Mojo>::max()))
+                                            ? std::numeric_limits<Mojo>::max()
+                                            : static_cast<Mojo>(u);
+                                    reading.read_ok = true;
+                                } else if (jb.is_number_integer()) {
+                                    reading.spendable = jb.get<Mojo>();
+                                    reading.read_ok   = true;
+                                }
+                            }
 
-                            if (spendable < cost) {
+                            // The cost of the WHOLE offer, in the asset we
+                            // spend, derived by take_sizing.hpp from the size
+                            // that actually settles. The previous formula
+                            // priced the CLAMPED size and ignored the
+                            // quote/base denomination ratio, so it could
+                            // clear this guard on a take it could not fund.
+                            //
+                            // The fee is XCH from wallet 1. Add it ONLY when
+                            // the asset we are spending IS xch, i.e. when the
+                            // fee and the spend leave the SAME wallet -- a
+                            // single-wallet check structurally cannot see it
+                            // otherwise. Inert on XCH/DBX and XCH/BYC ask
+                            // takes; live on a bid take of an xch base and on
+                            // the wmilliETH.b/XCH family.
+                            const Mojo cost = execution::add_same_wallet_fee(
+                                spend_cost,
+                                spend_asset == "xch"
+                                    ? static_cast<Mojo>(fee) : Mojo{0});
+
+                            const auto fv =
+                                execution::decide_funding(reading, cost);
+                            if (fv == execution::FundingVerdict::Unknown) {
+                                spdlog::warn(
+                                    "[Engine] Step 9e: {} SKIP {} take -- "
+                                    "spendable balance UNKNOWN (wallet {}, "
+                                    "cost {}): an unread balance is not a "
+                                    "passed check",
+                                    pair.name, to_string(c.side),
+                                    spend_wid, cost);
+                                co_return;
+                            }
+                            if (fv ==
+                                execution::FundingVerdict::Insufficient) {
                                 spdlog::warn(
                                     "[Engine] Step 9e: {} SKIP {} "
                                     "take -- insufficient balance: "
                                     "need {} spendable {} (wallet {})",
                                     pair.name, to_string(c.side),
-                                    cost, spendable, spend_wid);
+                                    cost, reading.spendable, spend_wid);
                                 co_return;
                             }
                         } catch (const std::exception& be) {
-                            spdlog::debug(
-                                "[Engine] Step 9e: {} balance check "
-                                "failed: {} -- proceeding cautiously",
-                                pair.name, be.what());
+                            // [S41 family] An UNREAD balance is not a PASSED
+                            // balance check. This used to log at debug and
+                            // fall through to take_offer(), so a thrown
+                            // ChiaRPCError -- the same "wallet not synced"
+                            // condition behind 68 swallowed
+                            // get_spendable_coins failures -- produced
+                            // exactly the observable outcome of "we checked
+                            // and had the funds", invisibly, under the
+                            // default sink. An error path must not be
+                            // indistinguishable from a passing one. Decline,
+                            // at warn.
+                            spdlog::warn(
+                                "[Engine] Step 9e: {} SKIP {} take -- balance "
+                                "check FAILED: {} (an unread balance is not a "
+                                "passed check)",
+                                pair.name, to_string(c.side), be.what());
+                            co_return;
                         }
                     }
                 }
@@ -11821,8 +12840,11 @@ asio::awaitable<void> Engine::step_check_arbitrage(
                                  pair.name, inv_ratio_9e, peg_max_ratio);
                 }
             } catch (const std::exception& e) {
-                spdlog::error("[Engine] Step 9e: {} peg-arb failed: {}",
-                              pair.name, e.what());
+                spdlog::error("[Engine] Step 9e: {} peg-arb failed [{}]: {}",
+                              pair.name,
+                              execution::to_string(
+                                  execution::classify_take_failure(e.what())),
+                              e.what());
             }
         }
     }
@@ -12099,34 +13121,23 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
         // fall within max_premium_bps of mid.
         const Mojo max_mojos = static_cast<Mojo>(
             max_units * static_cast<double>(pair.base_mojos_per_unit));
-        auto ceil_to_mojo = [](long double value) -> Mojo {
-            if (!std::isfinite(static_cast<double>(value)) || value <= 0.0L) {
-                return 0;
-            }
-            const long double cap = static_cast<long double>(
-                std::numeric_limits<Mojo>::max());
-            if (value >= cap) {
-                return std::numeric_limits<Mojo>::max();
-            }
-            return static_cast<Mojo>(std::ceil(value));
-        };
-        const long double base_mpu = static_cast<long double>(
-            pair.base_mojos_per_unit > 0 ? pair.base_mojos_per_unit : 1);
-        const long double quote_mpu = static_cast<long double>(
-            pair.quote_mojos_per_unit > 0 ? pair.quote_mojos_per_unit : 1);
-        const long double price_scale = static_cast<long double>(kMojosPerXch);
+        // [S40 follow-up 2026-09-01] These four lambdas used to be spelled
+        // out here. They were correct -- 9f is the step that got both the
+        // all-or-nothing filter and the bid/ask denomination right -- but they
+        // were the ONLY correct copy, unreachable from any test, while Step 9e
+        // twenty lines away had its own wrong copy of the same arithmetic.
+        // The maths now lives in take_sizing.hpp, used by both steps and
+        // pinned by cpp/tests/test_take_sizing.cpp. Same formulas, same
+        // round-up direction, same zero-means-decline convention.
         auto quote_cost_for_ask = [&](Mojo base_size, Mojo price) -> Mojo {
-            return ceil_to_mojo(
-                static_cast<long double>(base_size)
-                * static_cast<long double>(price)
-                * quote_mpu / (base_mpu * price_scale));
+            return execution::quote_cost_for_ask(
+                base_size, price,
+                pair.base_mojos_per_unit, pair.quote_mojos_per_unit);
         };
         auto base_cost_for_bid = [&](Mojo quote_size, Mojo price) -> Mojo {
-            if (price <= 0) return static_cast<Mojo>(0);
-            return ceil_to_mojo(
-                static_cast<long double>(quote_size)
-                * price_scale * base_mpu
-                / (static_cast<long double>(price) * quote_mpu));
+            return execution::base_size_for_bid(
+                quote_size, price,
+                pair.base_mojos_per_unit, pair.quote_mojos_per_unit);
         };
 
         struct Cand {
@@ -12245,6 +13256,13 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
             continue;
         }
 
+        // The fee is part of the funding requirement whenever it leaves the
+        // SAME wallet as the spend, so it is computed before the check.
+        const std::uint64_t fee = fee_tracker_
+            ? fee_tracker_->get_recommended_fee(
+                  config_.fees.min_fee_mojos, block_height)
+            : config_.fees.min_fee_mojos;
+
         // Pre-balance check (mirrors Step 9e).
         if (offer_mgr_) {
             const std::string& spend_asset =
@@ -12255,28 +13273,62 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
                 try {
                     auto bal = co_await
                         wallet_->get_wallet_balance(spend_wid);
-                    Mojo spendable = bal.value(
-                        "spendable_balance", static_cast<Mojo>(0));
-                      const Mojo cost = chosen->spend_cost;
-                    if (spendable < cost) {
+
+                    // [S40 remainder 2026-09-01] See Step 9e: read_ok{false}
+                    // is UNKNOWN and it is the DEFAULT. A number is never
+                    // substituted for a failed read.
+                    execution::SpendableReading reading{};
+                    if (bal.contains("spendable_balance")) {
+                        const auto& jb = bal["spendable_balance"];
+                        if (jb.is_number_unsigned()) {
+                            const auto u = jb.get<std::uint64_t>();
+                            reading.spendable =
+                                (u > static_cast<std::uint64_t>(
+                                         std::numeric_limits<Mojo>::max()))
+                                    ? std::numeric_limits<Mojo>::max()
+                                    : static_cast<Mojo>(u);
+                            reading.read_ok = true;
+                        } else if (jb.is_number_integer()) {
+                            reading.spendable = jb.get<Mojo>();
+                            reading.read_ok   = true;
+                        }
+                    }
+                    const Mojo cost = execution::add_same_wallet_fee(
+                        chosen->spend_cost,
+                        spend_asset == "xch" ? static_cast<Mojo>(fee)
+                                             : Mojo{0});
+                    const auto fv =
+                        execution::decide_funding(reading, cost);
+                    if (fv == execution::FundingVerdict::Unknown) {
+                        spdlog::warn("[Engine] Step 9f: {} SKIP -- spendable "
+                                     "balance UNKNOWN (wallet {}, cost {}): "
+                                     "an unread balance is not a passed "
+                                     "check",
+                                     pair.name, spend_wid, cost);
+                        continue;
+                    }
+                    if (fv == execution::FundingVerdict::Insufficient) {
                         spdlog::warn("[Engine] Step 9f: {} SKIP -- "
                                      "insufficient balance: need {} "
                                      "spendable {} (wallet {})",
-                                     pair.name, cost, spendable,
+                                     pair.name, cost, reading.spendable,
                                      spend_wid);
                         continue;
                     }
                 } catch (const std::exception& be) {
-                    spdlog::debug("[Engine] Step 9f: {} balance check "
-                                  "failed: {}", pair.name, be.what());
+                    // [S41 family] Same fix as Step 9e: an unread balance is
+                    // not a passed balance check. The `spendable < cost`
+                    // branch above declines; this one used to log at debug
+                    // and fall through into the take, so a failed read was
+                    // indistinguishable from a successful one.
+                    spdlog::warn("[Engine] Step 9f: {} SKIP -- balance check "
+                                 "FAILED: {} (an unread balance is not a "
+                                 "passed check)",
+                                 pair.name, be.what());
+                    continue;
                 }
             }
         }
-
-        const std::uint64_t fee = fee_tracker_
-            ? fee_tracker_->get_recommended_fee(
-                  config_.fees.min_fee_mojos, block_height)
-            : config_.fees.min_fee_mojos;
 
         spdlog::info("[Engine] Step 9f: {} TAKING drift-corr {} offer {} "
                      "(prem={:.1f}bps size={} fee={})",
@@ -12523,9 +13575,31 @@ asio::awaitable<void> Engine::step_xch_recovery(BlockHeight block_height)
     // -- 5. Scan XCH-base pairs for cheap asks to take ---------------------
     //    An "ask" on an XCH-base pair means someone is selling XCH.
     //    Taking it gives us XCH in exchange for the quote asset.
-    const double max_take_mojos_total =
-        rcfg.max_take_per_block_xch * static_cast<double>(kMojosPerXch);
-    double taken_mojos_this_block = 0.0;
+    // [S40 third site 2026-09-01] recovery.max_take_per_block_xch NEVER
+    // BOUNDED A TAKE. This was a running total, in double, that was compared
+    // against the budget at the TOP of the candidate loop -- where it is
+    // structurally zero, because the only increment happens AFTER
+    // take_offer() has already settled and is immediately followed by an
+    // unconditional break out of the loop. `cand.size` was never compared to
+    // the budget anywhere, and the candidate filter screened side, own-ids
+    // and price but not size. So a single 20 XCH ask was lifted whole against
+    // a 0.5 XCH per-block budget, and the budget was charged only after the
+    // overrun it existed to prevent.
+    //
+    // Worse than S40's clamp in one respect: crossed_book_max_take_xch at
+    // least clamped a log field, so the number appeared somewhere. This one
+    // was not consulted against the candidate at all.
+    //
+    // Dormant today only because the sole pair that can supply a cex_ref is
+    // disabled -- which is exactly the kind of accident that was holding the
+    // 9c path together, and the config comments say the operator intends to
+    // re-enable it.
+    //
+    // Now an integer budget, filtered per candidate (9d's semantics: an
+    // oversized candidate is SKIPPED, not clamped and not partially taken),
+    // and the cap is scaled by the PAIR's denomination via cap_mojos_for so
+    // an unrepresentable cap declines rather than reading as unbounded.
+    Mojo taken_mojos_this_block = 0;
 
     for (const auto& pair : config_.pairs) {
         if (!pair.enabled) continue;
@@ -12569,6 +13643,30 @@ asio::awaitable<void> Engine::step_xch_recovery(BlockHeight block_height)
             if (!po.dexie_id.empty()) own_ids.insert(po.dexie_id);
         }
 
+        // The per-block take budget, in this pair's base mojos. Zero means
+        // the configured budget is unusable, which means TAKE NOTHING -- an
+        // unrepresentable budget is an unbounded budget, and unbounded is the
+        // defect being closed here.
+        const Mojo max_take_mojos_total = execution::cap_mojos_for(
+            rcfg.max_take_per_block_xch, pair.base_mojos_per_unit);
+        if (max_take_mojos_total <= 0) {
+            spdlog::warn("[Recovery] {} take budget is unusable "
+                         "(max_take_per_block_xch={} base_mojos_per_unit={}) "
+                         "-- taking nothing",
+                         pair.name, rcfg.max_take_per_block_xch,
+                         pair.base_mojos_per_unit);
+            continue;
+        }
+        if (taken_mojos_this_block >= max_take_mojos_total) {
+            spdlog::info("[Recovery] {} per-block take budget already spent "
+                         "({} of {} mojos) -- skipping",
+                         pair.name, taken_mojos_this_block,
+                         max_take_mojos_total);
+            continue;
+        }
+        const Mojo remaining_budget_mojos =
+            max_take_mojos_total - taken_mojos_this_block;
+
         // Find the cheapest asks (someone selling XCH) within our budget.
         struct CandidateAsk {
             std::string offer_id;
@@ -12583,6 +13681,21 @@ asio::awaitable<void> Engine::step_xch_recovery(BlockHeight block_height)
             if (co.price > max_price_mojos) continue;
             if (co.price == 0) continue;
 
+            // THE BUDGET, APPLIED. An ask on an XCH-base pair is denominated
+            // in the base asset, so co.size is directly comparable with the
+            // budget. Takes are all-or-nothing, so an oversized candidate is
+            // dropped here rather than clamped -- there is no way to lift
+            // part of it, and a clamp would only mis-state the log and the
+            // ledger, which is S40 verbatim.
+            if (co.size <= 0 || co.size > remaining_budget_mojos) {
+                spdlog::debug("[Recovery] {} ask {} size {} outside remaining "
+                              "budget {} -- skipping (takes are "
+                              "all-or-nothing, cannot partially fill)",
+                              pair.name, co.offer_id.substr(0, 12), co.size,
+                              remaining_budget_mojos);
+                continue;
+            }
+
             candidates.push_back({co.offer_id, co.price, co.size});
         }
 
@@ -12591,6 +13704,9 @@ asio::awaitable<void> Engine::step_xch_recovery(BlockHeight block_height)
             [](const auto& a, const auto& b) { return a.price < b.price; });
 
         for (const auto& cand : candidates) {
+            // Every candidate already fits the remaining budget (filtered
+            // above). This stays as a second line of defence for the day
+            // someone takes more than one offer per block.
             if (taken_mojos_this_block >= max_take_mojos_total) break;
 
             const double price_d =
@@ -12668,8 +13784,7 @@ asio::awaitable<void> Engine::step_xch_recovery(BlockHeight block_height)
                                  pair.name, trade_id.substr(0, 12),
                                  price_d, premium_bps);
 
-                    taken_mojos_this_block +=
-                        static_cast<double>(cand.size);
+                    taken_mojos_this_block += cand.size;
 
                     // [TAKER-RECORDING] Recovery lifts asks, so we bought
                     // base and paid quote.
@@ -12855,7 +13970,18 @@ std::optional<double> Engine::declared_usd_par(const AssetId& asset_id) const
     return config_.pegged_assets.usd_par_value(asset_id);
 }
 
+// [CIRCANCHOR 2026-09-02] usd_per_xch() is now a thin accessor over the
+// anchored form so that the price and the record of where it came from are
+// produced by ONE piece of code and cannot drift apart. Every existing
+// caller is byte-identical; only the asset-level peg watcher asks for the
+// provenance, and only because the fallback below is circular when the
+// wrapper it picks is the wrapper being judged. See risk::XchUsdAnchor.
 double Engine::usd_per_xch() const
+{
+    return usd_per_xch_anchor().usd;
+}
+
+risk::XchUsdAnchor Engine::usd_per_xch_anchor() const
 {
     // [S27 2026-08-27] EXTERNAL FEED FIRST.
     //
@@ -12887,20 +14013,42 @@ double Engine::usd_per_xch() const
     // documentation already argues exactly this -- "a frozen feed would
     // quote forever" -- and which treats a non-positive or non-finite
     // threshold as stale rather than as "always fresh".
-    if (coingecko_feed_fresh_for_revival(
-            !coingecko_prices_.empty(),
-            coingecko_last_fetch_,
-            std::chrono::steady_clock::now(),
-            config_.market_data.cex_freshness_threshold_sec)) {
+    const bool feed_fresh = coingecko_feed_fresh_for_revival(
+        !coingecko_prices_.empty(),
+        coingecko_last_fetch_,
+        std::chrono::steady_clock::now(),
+        config_.market_data.cex_freshness_threshold_sec);
+
+    // Left at 0 when the feed is stale OR when it is fresh but carries no
+    // usable XCH price. select_xch_usd_anchor treats both the same way --
+    // fall through to the fallback -- which is the behaviour this has always
+    // had, and is why the operator warn must NOT assert "the feed is stale".
+    double external_xch_usd = 0.0;
+    if (feed_fresh) {
         auto it = coingecko_prices_.find("chia");
-        if (it != coingecko_prices_.end() && std::isfinite(it->second)
-            && it->second > 0.0) {
-            return it->second;
+        if (it != coingecko_prices_.end()) {
+            external_xch_usd = it->second;
         }
     }
 
+    // [CIRCANCHOR review round 8] THE SELECTION ITSELF NOW LIVES IN
+    // risk::select_xch_usd_anchor, and what is left here is the adapter:
+    // read config and snapshots, hand over the decision, return the answer.
+    //
+    // Extracted because the PROVENANCE recorded below is load-bearing for
+    // the asset-level peg watcher and was the one part of that fix no test
+    // could reach -- dropping it here while keeping the VALUE identical
+    // reinstates the original defect with the whole suite green. Same split,
+    // and same reason, as usd_route.hpp.
+    //
+    // The views borrow config_.pairs' strings, which outlive the returned
+    // anchor and every consumer of it; `candidates` itself is free to die
+    // here.
+    std::vector<risk::XchAnchorCandidate> candidates;
+    candidates.reserve(config_.pairs.size());
     for (const auto& pair : config_.pairs) {
-        if (!pair.enabled || pair.base_asset_id != "xch") continue;
+        // Filtered to ENABLED here, per select_xch_usd_anchor's contract.
+        if (!pair.enabled) continue;
         // [review] No slash check. It is vestigial -- from when this matched
         // on the display NAME -- and the lookup below is entirely by
         // canonical asset id. parse_pairs() accepts names without a slash
@@ -12920,8 +14068,25 @@ double Engine::usd_per_xch() const
         // the pair name -- symbols collide and get reused, asset ids do
         // not.  A wrapper is one that does NOT prefer a market cross: its
         // par is a claim on a dollar, not an observation.
-        if (is_par_wrapper_quote(pair)) {
-            auto snap = state_->get_market(pair.name);
+        candidates.push_back(risk::XchAnchorCandidate{
+            std::string_view{pair.name},
+            std::string_view{pair.base_asset_id},
+            std::string_view{pair.quote_asset_id},
+            is_par_wrapper_quote(pair)});
+    }
+
+    // [PNL-BASIS-USD 2026-07-30] A no-anchor answer is 0 ("unknown"), NOT
+    // the historical hard-coded fallback rate.  That rate was 2.70 while XCH
+    // has traded near $1.35, so using it would silently value fills at ~2x
+    // and -- now that cost basis is PERSISTED -- bake that error in
+    // permanently instead of it evaporating at the next restart.  Callers
+    // treat 0 as "no USD valuation": quote_usd_factor returns 0, the fill
+    // takes the unpriced path that leaves the basis intact, and the pair is
+    // excluded from USD totals until real market data arrives.
+    return risk::select_xch_usd_anchor(
+        feed_fresh, external_xch_usd, candidates,
+        [this](const risk::XchAnchorCandidate& c)
+            -> std::optional<double> {
             // [S20 2026-08-24] NOT gated on mid_valuation_grade.  Grade
             // requires a fresh two-sided FILTERED book or a fresh CEX leg,
             // and XCH/wUSDC.b's dust-filtered book is one-sided on most
@@ -12932,33 +14097,21 @@ double Engine::usd_per_xch() const
             // breaker's own anchor.  The published mid is already gated
             // against an independent anchor before it reaches State, which
             // is where junk is meant to be stopped.
+            const auto snap = state_->get_market(std::string{c.pair_name});
             // [PEG 2026-08-27] Multiply by the quote's DECLARED par rather
             // than assuming one unit is one dollar.  The mid here is
             // denominated in the quote asset, so for a EUR-pegged wrapper
             // -- or any non-unit target -- returning it raw would silently
             // report EUR as USD.  An unavailable par (no FX rate, or the
             // peg no longer enforced) means this pair cannot anchor XCH;
-            // continue to the next candidate rather than guessing.
-            const auto par = declared_usd_par(pair.quote_asset_id);
-            if (par) {
-                if (auto usd = usd_per_base_from_mid(
-                        static_cast<double>(snap.mid_price),
-                        static_cast<double>(kMojosPerXch), *par)) {
-                    return *usd;
-                }
-            }
-        }
-    }
-
-    // [PNL-BASIS-USD 2026-07-30] Return 0 ("unknown"), NOT the historical
-    // hard-coded fallback rate.  That rate was 2.70 while XCH has
-    // traded near $1.35, so using it would silently value fills at ~2x and
-    // -- now that cost basis is PERSISTED -- bake that error in permanently
-    // instead of it evaporating at the next restart.  Callers treat 0 as
-    // "no USD valuation": quote_usd_factor returns 0, the fill takes the
-    // unpriced path that leaves the basis intact, and the pair is excluded
-    // from USD totals until real market data arrives.
-    return 0.0;
+            // nullopt sends the selector to the next candidate rather than
+            // guessing.
+            const auto par = declared_usd_par(AssetId{c.quote_asset_id});
+            if (!par) return std::nullopt;
+            return usd_per_base_from_mid(
+                static_cast<double>(snap.mid_price),
+                static_cast<double>(kMojosPerXch), *par);
+        });
 }
 
 // [S20 2026-08-24] The BYC cross that quote_usd_factor() would ACTUALLY
@@ -13810,6 +14963,19 @@ void Engine::post_ledger_genesis(
         all_assets.insert(pair.base_asset_id);
         all_assets.insert(pair.quote_asset_id);
     }
+    // [2026-09-02, review] XCH UNCONDITIONALLY, whatever the pairs are.
+    // Both fill recorders book their fee leg against a HARDCODED
+    // AssetId{"xch"} (record_maker_fill and record_taker_fill), so xch is a
+    // ledger asset on every deployment regardless of which pairs are
+    // enabled.  Seeded only from enabled pairs, a CAT/CAT-only config would
+    // leave xch out of this set while it still had a persistent DB opening
+    // from an earlier config -- and EVERY fee leg would then be silently
+    // dropped for the life of that config while the wallet's xch drained.
+    // Today's XCH/DBX config puts xch here anyway, so this changes nothing
+    // now; it stops the fee leg's asset and this set from ever diverging.
+    // Note this only RECOGNISES an existing opening (the has_ledger_opening
+    // gate below still applies) -- it cannot manufacture one.
+    all_assets.insert("xch");
     for (const auto& asset : all_assets) {
         if (db_->has_ledger_opening(AssetId{asset})) {
             ledger_opened_assets_.insert(asset);
@@ -13894,6 +15060,13 @@ void Engine::post_ledger_fill(const Fill& fill, const PairConfig& pc,
         add("fee", AssetId{"xch"}, -fill.fee_mojos);
     }
 
+    // [S44 2026-09-02] Empty here means every leg was skipped for want of an
+    // opening balance, and each skip has ALREADY warned individually above.
+    // Deliberately not escalated to ledger_incomplete_: the assets whose legs
+    // were dropped are the same assets check_ledger_invariant() excludes via
+    // has_ledger_opening(), so nothing is being hidden from a control that is
+    // watching.  See the extended note in record_taker_fill() for the full
+    // argument and for why latching here would be the worse outcome.
     if (legs.empty()) return;
 
     // A dropped fill leg is UNRECOVERABLE: the fill is not re-processed, so
@@ -13959,10 +15132,30 @@ void Engine::record_taker_fill(const std::string& strategy,
         db_->insert_taker_fill(f);
 
         // Ledger legs, keyed on the trade id so a retry cannot double-post.
+        //
+        // [S44 2026-09-02] The skip below used to be COMPLETELY SILENT --
+        // no log, no counter, no flag -- while the maker-fill twin above
+        // warns on the identical condition.  A take could write a
+        // taker_fills row backed by zero ledger legs and nothing said so.
+        // It has never fired (all 26 engine-written takes carry exactly 3
+        // legs) but it was unobservable, which is the part that had to go.
+        //
+        // WHY THIS DOES **NOT** SET ledger_incomplete_ -- see the long note
+        // after the write, and do not "finish the job" by adding it.
         std::vector<DbLedgerEntry> legs;
+        int skipped_legs = 0;
         auto add = [&](const char* leg_name, const AssetId& asset, Mojo delta) {
-            if (delta == 0) return;
-            if (!ledger_opened_assets_.count(asset)) return;
+            if (delta == 0) return;   // nothing moved: not a leg at all
+            if (!ledger_opened_assets_.count(asset)) {
+                ++skipped_legs;
+                spdlog::warn("[Engine] Ledger: skipping {} leg for {} take {} "
+                             "-- asset {} has no opening balance this session",
+                             leg_name, strategy,
+                             trade_id.substr(0,
+                                 std::min<std::size_t>(12, trade_id.size())),
+                             asset.substr(0, 12));
+                return;
+            }
             DbLedgerEntry e;
             e.entry_time   = ts;
             e.event_type   = "take";
@@ -13981,10 +15174,90 @@ void Engine::record_taker_fill(const std::string& strategy,
             add("fee", AssetId{"xch"}, -static_cast<Mojo>(fee_mojos));
         }
 
+        // A real write failure IS a ledger-incompleteness event: legs that
+        // should exist do not, for an asset that IS being reconciled.
         if (!legs.empty() && !db_->append_ledger_entries(legs)) {
             ledger_incomplete_ = true;
             spdlog::error("[Engine] Ledger: failed to post legs for {} take {} "
                           "-- ledger now INCOMPLETE", strategy, trade_id);
+        } else if (skipped_legs > 0) {
+            // ================================================================
+            //  A SKIPPED LEG IS NOT AN INCOMPLETE LEDGER.  DO NOT LATCH HERE.
+            // ================================================================
+            //  It is tempting to treat "some legs were dropped" as the same
+            //  fail-open shape as an empty collection reported as success.
+            //  It is not, and latching ledger_incomplete_ here would be
+            //  strictly worse than the silence it replaces.  Three reasons,
+            //  each independently sufficient:
+            //
+            //  1. THE SKIP IS PER-ASSET CONSISTENT.  The ledger is not a
+            //     balanced double-entry journal across assets -- legs are
+            //     independent per-asset deltas (base mojos, quote mojos, an
+            //     XCH fee) that do not sum to zero.  Each asset's ledger is
+            //     reconciled against ITS OWN wallet balance, separately.
+            //  2. THE INVARIANT DOES NOT MEASURE THE ASSETS THAT GET
+            //     SKIPPED HERE.  Stated carefully, because an earlier draft
+            //     of this comment claimed a SET EQUALITY that the code does
+            //     not provide and a future reader would have leant on it:
+            //
+            //       - the write-skip set is the complement of
+            //         ledger_opened_assets_, which is rebuilt EACH SESSION
+            //         over enabled pairs' base/quote assets plus xch;
+            //       - the control's skip set is the complement of the
+            //         PERSISTENT db_->has_ledger_opening(asset), evaluated
+            //         over cached_wallet_balances_.
+            //
+            //     Those are not the same predicate: openings are written
+            //     "once, ever", so an asset carrying a historic opening from
+            //     an earlier config is CHECKED by the control while being
+            //     SKIPPED by the leg writer -- the reverse of the claimed
+            //     equality.  What actually makes the skip safe is narrower
+            //     and is worth naming: cached_wallet_balances_ is itself
+            //     written only for enabled-pair assets and the bridge asset
+            //     (three writers -- the ladder refresh, the Step 8 pair-gate
+            //     writer, and the bridge writer), so an asset this function
+            //     refuses to write legs for is also absent from the loop the
+            //     control iterates.  It is not measured, so a dropped leg
+            //     creates no divergence and hides none.  The maker-fill twin
+            //     says the same thing: skipping "keeps the two consistent",
+            //     and the eventual opening captures the resulting balance.
+            //
+            //     THE ONE ASSET THAT COULD HAVE BROKEN THAT is the fee leg's
+            //     hardcoded xch, which is not necessarily a pair asset.  It
+            //     is now seeded into ledger_opened_assets_ unconditionally at
+            //     genesis (see the note there), so the fee leg's asset can no
+            //     longer fall out of the writer's set while the wallet
+            //     drains.
+            //  3. LATCHING WOULD DISABLE HEALTHY ACCOUNTING WHOLESALE.
+            //     ledger_incomplete_ is process-latching (nothing clears it;
+            //     the log lines say "restart to re-baseline") and it gates
+            //     FOUR things, none of them scoped to the offending asset:
+            //     reward ingest, bridge_accounting_operational(), bridge
+            //     flow ingest, and the invariant control for EVERY asset.
+            //     It also fires an ExposureBreach alert.
+            //     The failure mode is concrete, not hypothetical: a startup
+            //     wallet RPC timeout leaves an asset unopened, and that is
+            //     DOCUMENTED as having happened on this deployment
+            //     (2026-07-26T08:46, both balance queries timed out).  In
+            //     that state the first take carrying a fee leg would latch
+            //     the flag and take down the invariant control for the
+            //     healthy assets too -- turning a benign, self-correcting
+            //     per-asset gap into a session-wide accounting blackout.
+            //
+            //  What was actually wrong here was SILENCE, and silence is what
+            //  is fixed: each skip warns above, and the shape of the event is
+            //  summarised here so an all-skipped take is greppable.
+            spdlog::warn("[Engine] Ledger: {} take {} posted {} of {} legs -- "
+                         "{} skipped for want of an opening balance. The "
+                         "skipped assets are excluded from the invariant "
+                         "control too, so the books stay per-asset consistent; "
+                         "a restart opens them cleanly.",
+                         strategy,
+                         trade_id.substr(0,
+                             std::min<std::size_t>(12, trade_id.size())),
+                         legs.size(),
+                         legs.size() + static_cast<std::size_t>(skipped_legs),
+                         skipped_legs);
         }
 
         spdlog::info("[Engine] Recorded {} take: {} {} base={} quote={} "
@@ -15567,6 +16840,95 @@ void Engine::step_export_metrics(BlockHeight block_height)
             fee_tracker_->get_rolling_total(block_height));
     }
 
+    // ------------------------------------------------------------------
+    // Dashboard 9: LIVE strategy controllers  [S42 2026-09-02]
+    //
+    // Until now the only strategy number in telemetry was the startup
+    // analysis recommendation, published by update_analysis() from inside
+    // run_startup_analysis() and never refreshed.  On 2026-09-02 that gauge
+    // read 1.5 -- "quoting defensively wide" -- while the spread PID was
+    // railed at 0.820, the most aggressive TIGHTENING it can command, and
+    // had been for the entire retained log.  Both multiply the same field
+    // in Step 5, so the operator was shown a value that pointed the wrong
+    // way, not merely a stale one.
+    //
+    // Read-only over state this function already runs on the engine's own
+    // event-loop thread, so no additional synchronisation is introduced.
+    {
+        std::vector<MetricsStrategySnapshot> strat;
+        strat.reserve(config_.pairs.size());
+
+        for (const auto& pair : config_.pairs) {
+            if (!pair.enabled) continue;
+
+            MetricsStrategySnapshot ss;
+            ss.pair_name            = pair.name;
+            ss.analysis_spread_mult = analysis_spread_mult_;
+
+            // [2026-09-02, review] The two numbers that bracket Step 5's
+            // whole adjustment chain.  Step 12 runs after Step 5 in the same
+            // block and cycle_ is not cleared in between, so these are this
+            // block's values.  Both stay 0 when Step 5 never reached the pair
+            // (invalid quote, no mid, no pair config), and 0 is published as
+            // "no reading" -- NOT as 1.0x, which would report a healthy
+            // neutral for a block that never quoted.
+            if (const auto cit = cycle_.find(pair.name);
+                cit != cycle_.end() && cit->second.spread_base_bps > 0.0) {
+                ss.spread_base_bps    = cit->second.spread_base_bps;
+                ss.spread_applied_bps =
+                    cit->second.spread_result.total_spread_bps;
+            }
+
+            if (const auto it = spread_pid_state_.find(pair.name);
+                it != spread_pid_state_.end()) {
+                const SpreadPidState& pid = it->second;
+                ss.spread_pid_active   = config_.strategy.pid_spread_enabled;
+                ss.spread_pid_mult     = pid.current_mult;
+                ss.spread_pid_ema_fill = pid.ema_fill_rate;
+                ss.spread_pid_integral = pid.integral_error;
+                ss.spread_pid_blocks   = pid.blocks_active;
+
+                ss.rail_latched        = pid.rail.latched;
+                ss.rail_side           = static_cast<int>(pid.rail.side);
+                ss.rail_latched_blocks =
+                    pid.rail.latched_blocks(pid.blocks_active);
+                ss.rail_suppressed     = pid.rail.suppressed;
+                ss.rail_peak_abs_integral = pid.rail.peak_abs_integral;
+            }
+
+            // The Step 8 gate's base score.  NOT a mirror -- this calls the
+            // same function Step 8 calls (see
+            // xop/strategy/competitiveness_gate.hpp).  It previously WAS a
+            // mirror, guarded by a comment citing test_strategy_metrics.cpp,
+            // a file that did not exist.  If you retune the gate, retune it
+            // in the header and both sites follow.
+            ss.comp_gate_base =
+                xop::strategy::base_competitiveness_score(pair.is_stablecoin);
+            ss.comp_gate_effective = ss.comp_gate_base;
+
+            if (config_.strategy.comp_pid_enabled) {
+                if (const auto it = comp_pid_state_.find(pair.name);
+                    it != comp_pid_state_.end()) {
+                    ss.comp_pid_active   = true;
+                    ss.comp_pid_offset   = it->second.current_offset();
+                    ss.comp_pid_ema_fill = it->second.ema_fill_rate();
+                    ss.comp_gate_effective =
+                        xop::strategy::effective_competitiveness_gate(
+                            pair.is_stablecoin, ss.comp_pid_offset);
+                }
+            }
+
+            ss.take_suppressed = static_cast<std::uint32_t>(
+                crossed_book_retry_.suppressed_count(pair.name));
+            ss.take_tracked = static_cast<std::uint32_t>(
+                crossed_book_retry_.size(pair.name));
+
+            strat.push_back(std::move(ss));
+        }
+
+        metrics_->update_strategy(strat);
+    }
+
     spdlog::debug("[Engine] Step 12: metrics exported");
 }
 
@@ -16634,11 +17996,26 @@ bool Engine::pair_peg_suspended(const PairConfig& pc) const
 // usd(asset) = usd_per_xch / mid(XCH/asset), or * mid(asset/XCH). Only
 // valuation-grade mids feed it (the S20 contract); a junk or missing print
 // reaches observe_peg() as a data gap and holds the streak.
+//
+// [CIRCANCHOR 2026-09-02] "does not consult the asset's own par" was an
+// ASSERTION, not an enforced property. usd_per_xch()'s DEX fallback -- live
+// whenever CoinGecko has been stale for cex_freshness_threshold_sec, four
+// missed 30s polls -- prices XCH as mid(XCH/W) * declared_par(W). Judging W
+// through that anchor divides the same mid straight back out, so the
+// observation IS declared_par(W), lands at 0.0% off, and takes observe_peg's
+// below-bail branch, which executes rt.above_bail = 0. Not a stall: an
+// active wipe of the streak, on every graded cycle of the outage.
+//
+// The anchor now reports its provenance and peg_usd_observation refuses the
+// self-anchored case. A fallback anchored on a DIFFERENT wrapper still
+// observes -- that is a real market cross and it is what produced the
+// honest $0.44 reading on 2026-08-30.
 asio::awaitable<void> Engine::step_observe_asset_pegs(BlockHeight block_height)
 {
     if (config_.pegged_assets.empty()) co_return;
 
-    const double usd_xch = usd_per_xch();
+    const auto   usd_anchor = usd_per_xch_anchor();
+    const double usd_xch    = usd_anchor.usd;
 
     for (const PeggedAsset* a : config_.pegged_assets.all()) {
         if (!a->enforce) continue;
@@ -16655,13 +18032,147 @@ asio::awaitable<void> Engine::step_observe_asset_pegs(BlockHeight block_height)
                     && pair.base_asset_id == a->asset_id;
                 if (!xch_base && !xch_quote) continue;
                 auto snap = state_->get_market(pair.name);
-                if (!(snap.mid_price > 0) || !snap.mid_valuation_grade) {
+                // [SIDEQUALITY 2026-09-01] Both the SCALE and the SOURCE
+                // of this observation were wrong, and both cancelled real
+                // offers. The logic now lives in risk::peg_usd_observation
+                // so a test can drive it -- see its header comment for the
+                // two incidents and for why a fair-value estimate is
+                // deliberately NOT an acceptable substitute source here.
+                //
+                // nullopt leaves usd_obs NaN, which routes into
+                // observe_peg's data-gap branch and HOLDS the streak:
+                // absence of evidence neither confirms nor clears a depeg.
+                // That is why refusing is the SAFE direction here and
+                // returning a number is the risky one -- the inverse of the
+                // usual rule, and stated at length in that header.
+                const auto obs = risk::peg_usd_observation(
+                    static_cast<double>(snap.mid_price),
+                    static_cast<double>(kMojosPerXch),
+                    xch_base,
+                    snap.mid_valuation_grade,
+                    snap.bid_side_anchor_ok,
+                    snap.ask_side_anchor_ok,
+                    usd_anchor,
+                    a->asset_id);
+                if (!obs) {
+                    // [review round 8] THE CIRCULAR REASON BELONGS IN THIS
+                    // LINE. peg_usd_observation checks circularity FIRST, so
+                    // on that refusal every other field here reads true and
+                    // the message contradicted itself: "yields no
+                    // observation (grade=true, bid_ok=true, ask_ok=true)".
+                    // An operator debugging a short feed flap concluded the
+                    // peg code was broken rather than that the anchor was
+                    // its own. The warn that explains it is throttled to
+                    // once per asset per five minutes, so during a flap this
+                    // debug line is all there is.
+                    // [review round 9] The last field is LABELLED
+                    // book_side_ref, not "anchor", because that is what it
+                    // is. classify_sides deliberately leaves ref at 0 when
+                    // the per-side band is disabled, so an operator with the
+                    // band off and a perfectly good anchor present used to
+                    // read "anchor=0" here and diagnose a missing anchor --
+                    // the same self-contradicting log the round-8 note above
+                    // was written to prevent, one field to the right.
+                    spdlog::debug("[Engine] peg observe: {} yields no "
+                                  "observation (circular_anchor={}, "
+                                  "grade={}, bid_ok={}, ask_ok={}, "
+                                  "anchor_kind={}, book_side_ref={})",
+                                  pair.name,
+                                  risk::xch_anchor_is_circular_for(
+                                      usd_anchor, a->asset_id),
+                                  snap.mid_valuation_grade,
+                                  snap.bid_side_anchor_ok,
+                                  snap.ask_side_anchor_ok,
+                                  risk::to_string(usd_anchor.kind),
+                                  snap.book_side_ref);
                     continue;
                 }
-                const double mid = static_cast<double>(snap.mid_price);
-                usd_obs = xch_base ? usd_xch / mid : usd_xch * mid;
+                usd_obs = *obs;
                 break;
             }
+        }
+
+        // [CIRCANCHOR 2026-09-02] GO BLIND LOUDLY.
+        //
+        // The refusal is correct and is strictly better than what it
+        // replaces -- blind-and-silent beats blind-while-announcing a
+        // fabricated all-clear -- but blind is still blind, and "this
+        // asset's peg detector is inoperative for the duration of the
+        // CoinGecko outage" is an operator decision input, not a debug
+        // detail. So it does not join the per-pair debug line above.
+        //
+        // Placed after the loop, so it fires once per asset per heartbeat
+        // rather than once per matching pair, and only when NO pair
+        // produced an observation: if some other market prices the asset
+        // non-circularly, the loop already used it and there is nothing to
+        // report. (Circularity is a property of the anchor and the judged
+        // asset, not of the pair, so it is invariant across this loop --
+        // the pair loop keeps looking after a refusal, which is free and
+        // correct.)
+        //
+        // Throttled: the condition repeats every heartbeat of the outage.
+        //
+        // [review round 8] The `!std::isfinite(usd_obs)` term is REDUNDANT
+        // today and is kept as defence in depth, not as a live condition.
+        // Circularity depends only on the anchor and the judged asset, so
+        // once it holds every peg_usd_observation call in the loop above
+        // returns nullopt and usd_obs is necessarily NaN here. The earlier
+        // comment claiming this term selects the "no pair produced an
+        // observation" case described a state that cannot arise -- kept so
+        // that a future route which CAN price the asset non-circularly
+        // silences the warn instead of shouting over a working detector.
+        if (!std::isfinite(usd_obs)
+                && risk::xch_anchor_is_circular_for(usd_anchor, a->asset_id)) {
+            // [review round 8] STATE THE RECOVERY CONDITION THAT ACTUALLY
+            // EXISTS. The old text promised "or another market can price
+            // it", which in the shipped configuration is unreachable:
+            // is_par_wrapper_quote requires !prefer_market_cross, and
+            // wUSDC.b is the only declared asset that qualifies (BYC sets
+            // prefer_market_cross). So for wUSDC.b the blind window is
+            // TOTAL, and an operator waiting for a cross-market recovery
+            // would wait for something this config cannot produce. Computed
+            // rather than asserted, so it stays true if a second wrapper is
+            // ever declared.
+            bool other_anchor_possible = false;
+            for (const auto& pair : config_.pairs) {
+                if (!pair.enabled || pair.base_asset_id != "xch") continue;
+                if (pair.quote_asset_id == a->asset_id) continue;
+                if (is_par_wrapper_quote(pair)) {
+                    other_anchor_possible = true;
+                    break;
+                }
+            }
+
+            const auto now = std::chrono::steady_clock::now();
+            auto& last = peg_circular_anchor_warned_at_[a->asset_id];
+            if (last == std::chrono::steady_clock::time_point{}
+                    || now - last >= std::chrono::minutes(5)) {
+                last = now;
+                spdlog::warn(
+                    "[Engine] [PEGSUSPEND] {} peg detection is INOPERATIVE: "
+                    "the only USD-per-XCH anchor available is {}'s OWN "
+                    "declared par (no usable external XCH price, so XCH is "
+                    "priced off an XCH/{} mid; anchor kind={}). Observing "
+                    "through it would divide that mid straight back out and "
+                    "report exactly par, so the observation is REFUSED -- "
+                    "which HOLDS the streak rather than clearing it. {}",
+                    a->symbol, a->symbol, a->symbol,
+                    risk::to_string(usd_anchor.kind),
+                    other_anchor_possible
+                        ? "This asset is not being watched until the "
+                          "external price feed returns, or until another "
+                          "declared par wrapper can anchor XCH."
+                        : "This asset is not being watched until the "
+                          "external price feed returns -- this config "
+                          "declares no OTHER par wrapper, so no other "
+                          "market can anchor XCH in the meantime.");
+            }
+        } else if (std::isfinite(usd_obs)) {
+            // [review round 8] The detector is working for this asset, so
+            // ARM the warn again. Without this the throttle timestamp was
+            // never cleared, and a second outage beginning within five
+            // minutes of the first warn announced nothing at all.
+            peg_circular_anchor_warned_at_.erase(a->asset_id);
         }
 
         auto& rt = asset_peg_rt_[a->asset_id];
@@ -16673,13 +18184,31 @@ asio::awaitable<void> Engine::step_observe_asset_pegs(BlockHeight block_height)
 
         // The transition. Alert first -- the cancel below can fail, and
         // the operator must hear about the depeg either way.
+        //
+        // [review round 8] NAME THE ANCHOR THE MEASUREMENT WAS MADE
+        // AGAINST. The observation is usd_per_xch / mid, so it is only as
+        // trustworthy as usd_per_xch, and a DeclaredParCross anchor borrows
+        // trust from ANOTHER asset's declared par. Concretely: with the
+        // external feed out and XCH priced off a depegged wUSDC.b, a
+        // perfectly healthy BYC reads at the reciprocal of wUSDC.b's depeg
+        // and can be suspended for it -- the alert names the healthy asset
+        // while the compromised pair keeps quoting. That mis-attribution is
+        // NOT fixed here (see peg_suspension.hpp's KNOWN LIMIT); printing
+        // the anchor is what lets an operator recognise it in the log
+        // rather than trusting the headline.
         spdlog::error("[Engine] [PEGSUSPEND] {} has LOST ITS PEG "
                       "(observed ${:.4f} vs target {:.4f}, {:.1f}% off, "
-                      "sustained {} observations) -- suspending the par and "
-                      "disabling every pair touching it. Re-enable from the "
-                      "GUI's Depeg tab when YOU trust the peg again.",
+                      "sustained {} observations, measured against a "
+                      "usd-per-xch anchor of ${:.4f} from {}{}) -- "
+                      "suspending the par and disabling every pair touching "
+                      "it. Re-enable from the GUI's Depeg tab when YOU trust "
+                      "the peg again.",
                       a->symbol, usd_obs, a->peg_target,
-                      rt.last_deviation_pct, a->sustained_observations);
+                      rt.last_deviation_pct, a->sustained_observations,
+                      usd_anchor.usd, risk::to_string(usd_anchor.kind),
+                      usd_anchor.par_asset_id.empty()
+                          ? std::string{}
+                          : " on " + std::string{usd_anchor.par_asset_id});
         if (alerts_) {
             alerts_->send_alert(
                 AlertRule::StablecoinDepeg,
@@ -16904,41 +18433,95 @@ asio::awaitable<void> Engine::step_maintain_coin_pool(BlockHeight block_height)
             xch_pending = true;
         }
 
+        // [S41 2026-09-01] Read, then judge, then spend -- in that order, and
+        // only the verdict authorises the spend.
+        //
+        // What used to be here was `int free_count = 0;` followed by a try
+        // whose catch logged and FELL THROUGH, leaving the zero in place. A
+        // zero is below any positive target, so a FAILED READ AUTHORISED A
+        // SPLIT. The handler was also unreachable, because CoinManager
+        // swallowed the RPC error upstream and returned an empty coin vector
+        // that was indistinguishable from an empty wallet -- 68 swallowed
+        // failures, 34 phantom "Have 0 mojos total" lines, 0 handler hits.
+        // Un-swallowing alone would have made the handler reachable and still
+        // wrong; the policy therefore lives in coin_pool_verdict.hpp, where a
+        // test can hold it, since nothing in cpp/tests constructs an Engine.
+        //
+        // read_ok defaults to false: unknown is the default state, and unknown
+        // authorises nothing. A pending split short-circuits the read (it
+        // would only be stale anyway) and leaves the reading unknown, which
+        // the verdict maps to Skip via its split_pending clause.
+        execution::CoinPoolReading xch_reading;
         if (!xch_pending) {
-            int free_count = 0;
             try {
-                free_count = co_await coin_mgr_->count_free_coins(1);
+                if (auto n = co_await coin_mgr_->count_free_coins(1)) {
+                    xch_reading.read_ok          = true;
+                    xch_reading.pool_ready_count = *n;
+                } else {
+                    spdlog::warn("[Engine] Coin pool: XCH free-coin read FAILED "
+                                 "-- pool state unknown, no split this cycle "
+                                 "(this is NOT an empty wallet)");
+                }
             } catch (const std::exception& e) {
+                // NOT the live path, and an earlier comment here said the
+                // opposite. CoinManager::collect_spendable_coins() catches
+                // rpc::ChiaRPCError and then std::exception, and converts
+                // both to nullopt; count_free_coins() adds no throwing work
+                // of its own. So an RPC failure AND a malformed coin record
+                // both arrive at the `else` branch above, as nullopt -- that
+                // is the branch that observes the failure, and the one to
+                // keep if anyone ever simplifies this block.
+                //
+                // This catch is a backstop for something that is not a
+                // std::exception escaping the call. It is retained rather
+                // than deleted only because deleting it would let such an
+                // escape unwind a DETACHED coroutine whose completion handler
+                // discards the exception_ptr. Its silence is expected.
                 spdlog::warn("[Engine] Coin pool: XCH count_free_coins failed: {}",
                              e.what());
             }
+        }
 
-            if (free_count >= xch_target_count) {
-                spdlog::debug("[Engine] Coin pool: XCH {} free coins >= target {} -- OK",
-                              free_count, xch_target_count);
-            } else {
-                spdlog::info("[Engine] Coin pool: XCH {} free coins < target {} -- "
-                             "splitting to create {} more coins of {:.2f} XCH each",
-                             free_count, xch_target_count,
-                             xch_target_count - free_count, target_xch);
+        switch (execution::decide_coin_pool_action(
+                    xch_reading, xch_target_count, xch_pending)) {
+        case execution::CoinPoolAction::Skip:
+            // Pending split, or the pool state is unknown. Spend nothing.
+            break;
 
-                constexpr Mojo split_fee = 0;
-                try {
-                    auto result = co_await coin_mgr_->ensure_split(
-                        1, xch_target_count, target_mojos, split_fee);
+        case execution::CoinPoolAction::Satisfied:
+            spdlog::debug("[Engine] Coin pool: XCH {} free coins >= target {} -- OK",
+                          xch_reading.pool_ready_count, xch_target_count);
+            break;
 
-                    if (result.success && result.coins_created > 0) {
-                        spdlog::info("[Engine] Coin pool: XCH created {} new coins",
-                                     result.coins_created);
-                    } else if (!result.success) {
-                        spdlog::warn("[Engine] Coin pool: XCH split failed "
-                                     "(insufficient balance or RPC error)");
-                    }
-                } catch (const std::exception& e) {
-                    spdlog::error("[Engine] Coin pool: XCH ensure_split failed: {}",
-                                  e.what());
+        case execution::CoinPoolAction::Split: {
+            spdlog::info("[Engine] Coin pool: XCH {} free coins < target {} -- "
+                         "splitting to create {} more coins of {:.2f} XCH each",
+                         xch_reading.pool_ready_count, xch_target_count,
+                         xch_target_count - xch_reading.pool_ready_count,
+                         target_xch);
+
+            constexpr Mojo split_fee = 0;
+            try {
+                auto result = co_await coin_mgr_->ensure_split(
+                    1, xch_target_count, target_mojos, split_fee);
+
+                if (result.success && result.coins_created > 0) {
+                    spdlog::info("[Engine] Coin pool: XCH created {} new coins",
+                                 result.coins_created);
+                } else if (result.read_failed) {
+                    spdlog::warn("[Engine] Coin pool: XCH split abandoned -- "
+                                 "coin enumeration failed, pool state unknown "
+                                 "(NOT an insufficient balance)");
+                } else if (!result.success) {
+                    spdlog::warn("[Engine] Coin pool: XCH split failed "
+                                 "(insufficient balance or no improving split)");
                 }
+            } catch (const std::exception& e) {
+                spdlog::error("[Engine] Coin pool: XCH ensure_split failed: {}",
+                              e.what());
             }
+            break;
+        }
         }
     }
 
@@ -17023,29 +18606,52 @@ asio::awaitable<void> Engine::step_maintain_coin_pool(BlockHeight block_height)
                 cat_pending = true;
             }
 
-            if (cat_pending) continue;
-
-            // Count free coins for this wallet.
-            int free_count = 0;
-            try {
-                free_count = co_await coin_mgr_->count_free_coins(info.wallet_id);
-            } catch (const std::exception& e) {
-                spdlog::warn("[Engine] Coin pool: {} count_free_coins failed: {}",
-                             info.display_name, e.what());
-                continue;
+            // [S41] Same shape as the XCH branch above, deliberately, so the
+            // two cannot drift again. This branch already skipped correctly on
+            // an exception; it is routed through the same verdict anyway
+            // because "already correct" is not a property that survives edits.
+            // (It is also dead in production: cat_coin_pool_target_count is 0,
+            // so only the broken XCH branch has been running live.)
+            execution::CoinPoolReading cat_reading;
+            if (!cat_pending) {
+                try {
+                    if (auto n = co_await coin_mgr_->count_free_coins(
+                                     info.wallet_id)) {
+                        cat_reading.read_ok          = true;
+                        cat_reading.pool_ready_count = *n;
+                    } else {
+                        spdlog::warn("[Engine] Coin pool: {} free-coin read "
+                                     "FAILED (wid={}) -- pool state unknown, "
+                                     "no split (this is NOT an empty wallet)",
+                                     info.display_name, info.wallet_id);
+                    }
+                } catch (const std::exception& e) {
+                    // Backstop only -- see the XCH branch above. Both real
+                    // failure modes arrive as nullopt at the `else` branch,
+                    // not here.
+                    spdlog::warn("[Engine] Coin pool: {} count_free_coins failed: {}",
+                                 info.display_name, e.what());
+                }
             }
 
-            if (free_count >= cat_target_count) {
+            const auto cat_action = execution::decide_coin_pool_action(
+                cat_reading, cat_target_count, cat_pending);
+
+            if (cat_action == execution::CoinPoolAction::Skip) continue;
+
+            if (cat_action == execution::CoinPoolAction::Satisfied) {
                 spdlog::debug("[Engine] Coin pool: {} {} free coins >= target {} -- OK",
-                              info.display_name, free_count, cat_target_count);
+                              info.display_name, cat_reading.pool_ready_count,
+                              cat_target_count);
                 continue;
             }
 
             spdlog::info("[Engine] Coin pool: {} {} free coins < target {} -- "
                          "splitting to create {} more coins of {:.1f} units "
                          "({} mojos) each",
-                         info.display_name, free_count, cat_target_count,
-                         cat_target_count - free_count,
+                         info.display_name, cat_reading.pool_ready_count,
+                         cat_target_count,
+                         cat_target_count - cat_reading.pool_ready_count,
                          cat_target_units, target_mojos);
 
             // Execute the split.
@@ -17059,9 +18665,14 @@ asio::awaitable<void> Engine::step_maintain_coin_pool(BlockHeight block_height)
                                  "of {} mojos each (wid={})",
                                  info.display_name, result.coins_created,
                                  target_mojos, info.wallet_id);
+                } else if (result.read_failed) {
+                    spdlog::warn("[Engine] Coin pool: {} split abandoned -- "
+                                 "coin enumeration failed, pool state unknown "
+                                 "(NOT an insufficient balance)",
+                                 info.display_name);
                 } else if (!result.success) {
                     spdlog::warn("[Engine] Coin pool: {} split failed "
-                                 "(insufficient balance or RPC error)",
+                                 "(insufficient balance or no improving split)",
                                  info.display_name);
                 }
             } catch (const std::exception& e) {

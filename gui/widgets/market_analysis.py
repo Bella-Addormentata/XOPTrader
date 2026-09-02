@@ -54,6 +54,11 @@ PROFIT_GREEN   = _C.PROFIT_GREEN
 LOSS_RED       = _C.LOSS_RED
 WARNING        = _C.WARNING_YELLOW
 INFO           = _C.INFO_BLUE
+# [S42] Used for values that are CONTEXT rather than live state (the frozen
+# startup recommendation) and for "no data" placeholders.  Rendering either of
+# those in a live status colour is what made a stale, inverted reading look
+# authoritative.
+TEXT_MUTED     = _C.TEXT_DISABLED
 
 # Regime display names and colours.
 _REGIME_LABELS = {0: "Mean-Reverting", 1: "Random Walk", 2: "Momentum"}
@@ -65,6 +70,26 @@ _AGG_COLORS = {0: WARNING, 1: INFO, 2: PROFIT_GREEN}
 
 # Monospaced font for numeric readouts.
 _MONO = "Consolas, 'Courier New', monospace"
+
+
+def format_comp_gate(base: int, offset: int, effective: int) -> str:
+    """Render the competitiveness gate as ``base(+/-)offset -> effective``.
+
+    Module-level and pure so it can be tested without a QApplication.
+
+    THE SEPARATOR MUST NEVER VANISH.  This was written inline as
+    ``sign = "+" if offset > 0 else ""`` followed by ``f"{base}{sign}{offset}"``
+    which, at the NEUTRAL offset of 0, concatenated the two numbers: base 3 /
+    offset 0 rendered as ``"30 -> 3"`` and the operator read the gate base as
+    thirty on a 0-10 scale.  Offset 0 is the most common state -- the
+    post-creation warm-up window sits there, as does any block where
+    ema_fill_rate is at target -- and it was the one case the display could
+    not express.  It went unnoticed because the live controller happened to be
+    railed at -3 throughout, which renders correctly.
+    """
+    sign = "+" if offset >= 0 else "-"
+    tail = " (open)" if effective == 0 else ""
+    return f"{base}{sign}{abs(offset)} -> {effective}{tail}"
 
 
 # ---------------------------------------------------------------------------
@@ -181,11 +206,38 @@ class PairAnalysisPanel(QFrame):
         self._imb_row     = _StatRow("Book Imbalance", self)
         self._mom_row     = _StatRow("Price Momentum", self)
         self._rec_row     = _StatRow("Recommendation", self)
-        self._mult_row    = _StatRow("Spread Multiplier", self)
+
+        # [S42 2026-09-02] RELABELLED.  This row used to read "Spread
+        # Multiplier", which the operator reasonably took to mean "the
+        # multiplier currently applied to my spreads".  It is not: it is the
+        # startup-analysis recommendation, frozen for the process lifetime,
+        # and on 2026-09-02 it showed 1.50x ("defensively wide") while the
+        # live spread PID was railed at 0.820 -- the maximum TIGHTENING.
+        # Both multiply the same field, so the display was inverted, not
+        # merely stale.  The label now says which one it is, and the live
+        # rows below carry the values that actually govern quoting.
+        self._mult_row    = _StatRow("Startup Recommendation (x)", self)
+
+        # -- live controller state ------------------------------------------
+        self._live_mult_row = _StatRow("Live Spread PID (x)", self)
+        # NOT "Effective Multiplier".  This is the product of two of the ten
+        # sites that mutate the spread in Step 5, and two of the other eight
+        # are assignments that discard the chain outright.  Labelling it
+        # "effective" re-created the very confusion these rows were added to
+        # end.  The row below it carries the measured, applied value.
+        self._eff_mult_row  = _StatRow("Analysis x PID (x)", self)
+        self._applied_row   = _StatRow("Applied Spread (bps)", self)
+        self._applied_mult_row = _StatRow("Applied Multiplier (x)", self)
+        self._rail_row      = _StatRow("PID Rail Status", self)
+        self._comp_row      = _StatRow("Competitiveness Gate", self)
+        self._take_row      = _StatRow("Crosses Suppressed", self)
 
         for row in (self._vol_row, self._spread_row, self._cv_row,
                     self._vr_row, self._regime_row, self._imb_row,
-                    self._mom_row, self._rec_row, self._mult_row):
+                    self._mom_row, self._rec_row, self._mult_row,
+                    self._live_mult_row, self._eff_mult_row,
+                    self._applied_row, self._applied_mult_row,
+                    self._rail_row, self._comp_row, self._take_row):
             root.addWidget(row)
 
         root.addStretch(1)
@@ -206,6 +258,7 @@ class PairAnalysisPanel(QFrame):
         agg_code: int,
         complete: bool,
         spread_multiplier: float = 1.0,
+        live: dict | None = None,
     ) -> None:
         """Refresh all displayed statistics.
 
@@ -234,8 +287,14 @@ class PairAnalysisPanel(QFrame):
         complete:
             True when the analysis window is complete.
         spread_multiplier:
-            Recommended spread multiplier (1.5=Conservative, 1.0=Normal,
-            0.8=Aggressive).
+            STARTUP RECOMMENDATION only (1.5=Conservative, 1.0=Normal,
+            0.8=Aggressive).  Frozen once the analysis phase ends -- both
+            engine call sites are inside run_startup_analysis().  This is
+            NOT the multiplier currently applied to quotes; see `live`.
+        live:
+            Per-pair live controller state from the ``xop_strategy`` gauge
+            family, as assembled by ``MetricsService._strategy_for``.  None
+            or ``live_available = False`` renders the live rows as "--".
         """
         pct = int(blocks_collected * 100 / blocks_target) if blocks_target > 0 else 0
         self._progress.setValue(pct)
@@ -290,13 +349,110 @@ class PairAnalysisPanel(QFrame):
         agg_col   = _AGG_COLORS.get(agg_code, TEXT_PRIMARY)
         self._rec_row.set_value(agg_label, agg_col)
 
-        # Spread multiplier (derived from recommendation)
-        mult_col = (
-            WARNING      if spread_multiplier > 1.0 else
-            PROFIT_GREEN if spread_multiplier < 1.0 else
-            TEXT_PRIMARY
+        # Startup recommendation (derived from the analysis phase, frozen).
+        # Deliberately rendered in the muted colour: it is context, not state.
+        # Colouring it WARNING/GREEN as if it were live is what made an
+        # inverted reading look authoritative.
+        self._mult_row.set_value(f"{spread_multiplier:.2f}x", TEXT_MUTED)
+
+        self._update_live(live)
+
+    # -- live controller rows -------------------------------------------------
+
+    def _update_live(self, live: dict | None = None) -> None:
+        """Render the live controller rows from an ``xop_strategy`` dict.
+
+        `live` is the per-pair dict produced by
+        ``MetricsService._strategy_for``.  When it is None or reports
+        ``live_available = False`` -- an engine binary that predates the
+        family -- every row shows an explicit em dash.  It must never fall
+        back to 1.00x, because "no data" and "neutral multiplier" are
+        different facts and conflating them is the original defect.
+        """
+        if not live or not live.get("live_available", False):
+            for row in (self._live_mult_row, self._eff_mult_row,
+                        self._rail_row, self._comp_row, self._take_row):
+                row.set_value("--", TEXT_MUTED)
+            return
+
+        # Live spread PID multiplier.  < 1.0 is TIGHTENING (more aggressive,
+        # thinner margin) and is the direction that warrants attention here;
+        # > 1.0 is defensive widening.
+        if live.get("spread_pid_active", False):
+            pid_mult = float(live.get("spread_pid_mult", 1.0))
+            pid_col  = (
+                WARNING      if pid_mult < 1.0 else
+                PROFIT_GREEN if pid_mult > 1.0 else
+                TEXT_PRIMARY
+            )
+            self._live_mult_row.set_value(f"{pid_mult:.3f}x", pid_col)
+        else:
+            self._live_mult_row.set_value("disabled", TEXT_MUTED)
+
+        # The two controller factors, multiplied.  Explicitly NOT the applied
+        # multiplier: Step 5 mutates the spread at ten sites and two of them
+        # are assignments that discard everything before them.  0.0 is the
+        # engine's "no reading" sentinel and must not render as 1.000x.
+        eff = float(live.get("analysis_x_pid_mult", 0.0))
+        if eff > 0.0:
+            eff_col = (
+                WARNING      if eff < 1.0 else
+                PROFIT_GREEN if eff > 1.0 else
+                TEXT_PRIMARY
+            )
+            self._eff_mult_row.set_value(f"{eff:.3f}x", eff_col)
+        else:
+            self._eff_mult_row.set_value("--", TEXT_MUTED)
+
+        # What was ACTUALLY posted, and the multiplier that measures it.
+        # base -> applied, so the operator can see the chain's endpoints
+        # rather than a subset of its factors.
+        base_bps    = float(live.get("spread_base_bps", 0.0))
+        applied_bps = float(live.get("spread_applied_bps", 0.0))
+        applied_x   = float(live.get("spread_applied_mult", 0.0))
+        if base_bps > 0.0 and applied_bps > 0.0:
+            self._applied_row.set_value(
+                f"{base_bps:.1f} -> {applied_bps:.1f}", TEXT_PRIMARY)
+        else:
+            self._applied_row.set_value("--", TEXT_MUTED)
+        if applied_x > 0.0:
+            ax_col = (
+                WARNING      if applied_x < 1.0 else
+                PROFIT_GREEN if applied_x > 1.0 else
+                TEXT_PRIMARY
+            )
+            self._applied_mult_row.set_value(f"{applied_x:.3f}x", ax_col)
+        else:
+            self._applied_mult_row.set_value("--", TEXT_MUTED)
+
+        # Rail latch.  A railed controller is not controlling: it is emitting
+        # a constant that happens to be recomputed every heartbeat.
+        if live.get("rail_latched", False):
+            blocks = int(live.get("rail_latched_blocks", 0))
+            self._rail_row.set_value(f"RAILED ({blocks} blocks)", WARNING)
+        else:
+            self._rail_row.set_value("controlling", PROFIT_GREEN)
+
+        # Competitiveness gate: base score, PID offset, effective score.
+        # An effective score of 0 means the gate is fully open.
+        if live.get("comp_pid_active", False):
+            base   = int(live.get("comp_gate_base", 0))
+            offset = int(live.get("comp_pid_offset", 0))
+            effe   = int(live.get("comp_gate_effective", 0))
+            comp_col = WARNING if effe == 0 else TEXT_PRIMARY
+            self._comp_row.set_value(
+                format_comp_gate(base, offset, effe), comp_col)
+        else:
+            self._comp_row.set_value("disabled", TEXT_MUTED)
+
+        # Crossed-book takes currently being skipped.  Not derivable from the
+        # log: a suppression announces itself once and then heartbeats.
+        supp    = int(live.get("take_suppressed", 0))
+        tracked = int(live.get("take_tracked", 0))
+        self._take_row.set_value(
+            f"{supp} of {tracked}",
+            WARNING if supp > 0 else TEXT_PRIMARY,
         )
-        self._mult_row.set_value(f"{spread_multiplier:.2f}x", mult_col)
 
 
 # ---------------------------------------------------------------------------
@@ -483,6 +639,9 @@ class MarketAnalysisWidget(QWidget):
                 agg_code         = data.get("agg_code", 1),
                 complete         = complete,
                 spread_multiplier = data.get("spread_multiplier", 1.0),
+                # The whole per-pair dict doubles as the live-state carrier;
+                # MetricsService merges the xop_strategy gauges into it.
+                live             = data,
             )
 
         # Update overall progress bar.

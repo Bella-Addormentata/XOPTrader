@@ -62,6 +62,13 @@ add_executable(xop_tests
     test_config_reload.cpp
     test_reconcile_verdict.cpp
     test_bbo_sanity.cpp
+    test_book_side_quality.cpp
+    test_cross_guard.cpp
+    test_crossed_book.cpp
+    test_take_sizing.cpp
+    test_take_retry.cpp
+    test_coin_pool_verdict.cpp
+    test_tier_gain.cpp
     test_no_loss_floor.cpp
     test_par_anchor.cpp
     test_coingecko_parse.cpp
@@ -71,6 +78,8 @@ add_executable(xop_tests
     test_pnl_units.cpp
     test_pnl_tracker.cpp
     test_competitiveness_pid.cpp
+    test_competitiveness_gate.cpp
+    test_spread_mult.cpp
     test_fair_value.cpp
     test_tibetswap.cpp
     test_orderbook_mid.cpp
@@ -78,6 +87,7 @@ add_executable(xop_tests
     test_mid_gate.cpp
     test_peg_registry.cpp
     test_peg_suspension.cpp
+    test_depeg_detector.cpp
     test_valuation_authority.cpp
     test_usd_route.cpp
     test_coin_lock_ledger.cpp
@@ -90,6 +100,9 @@ add_executable(xop_tests
     test_height_source.cpp
     test_settled_fill.cpp
     test_wallet_poll_throttle.cpp
+    test_client_logger.cpp
+    test_pid_reachability.cpp
+    test_pid_rail_latch.cpp
 )
 
 target_link_libraries(xop_tests
