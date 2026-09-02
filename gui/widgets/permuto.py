@@ -757,8 +757,7 @@ class PermutoWidget(QWidget):
         #: True while the quoting loop owns a venue session.
         self._quoting_live: bool = False
         self._markets_worker: Optional[Any] = None
-        # [2026-08-31] Target stays SMALL, cap goes wide, and the two are
-        # deliberately no longer equal.
+        # [2026-09-02] Target and cap are deliberately no longer equal.
         #
         # They were both $1,200, which meant one nearly-complete quote fill
         # took a flat market straight to its position limit -- and at the
@@ -768,15 +767,19 @@ class PermutoWidget(QWidget):
         # to score at all. A cap has to sit several fills away from the
         # quote size, not one.
         #
-        # The cap is sized to TOLERATE the ~$188k position already on the
-        # book so the loop can quote two-sided again; it is not an
-        # invitation to build one. The target stays at $1,200 on purpose:
-        # the 2026-08-31 recovery review is explicit that "quote
-        # correctness and uptime dominate size" and that $25k/market on the
-        # current code path would only multiply rejected orders. Ramp the
-        # target only against a measured leaderboard slope.
-        self._target_depth_usd = 1_200.0
-        self._max_position_usd = 250_000.0
+        # The old $250k cap existed only to tolerate the account's already
+        # accumulated ~$188k short. That account is now flat and liquidated;
+        # carrying the emergency cap into a reset would authorize the same
+        # loss again. Ten full quote fills is enough room for skew and repair
+        # without turning a depth target into a directional position budget.
+        #
+        # Integrating the actual CLOSED/PREOPEN/SETTLING/SESSION/RAMP/EXIT
+        # profiles over the 44.6 hours left gives 9.575 target-equivalent
+        # hours per market. With two currently placeable markets, $3k projects
+        # only 206.8M depth-seconds and $5k leaves just 14.9% outage headroom.
+        # $6k projects 413.6M while the SESSION profile sends only $3k/side.
+        self._target_depth_usd = 6_000.0
+        self._max_position_usd = 30_000.0
         self._build()
         self.refresh()
 

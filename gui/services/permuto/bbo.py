@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import urllib.request
 from dataclasses import dataclass
 from typing import Optional
@@ -115,6 +116,19 @@ def _quantise(price: float, tick_size: float, *, up: bool) -> float:
     return ticks * tick_size
 
 
+def _grid_bounds(side: str, low: float, high: float,
+                 tick_size: float) -> tuple[float, float]:
+    """First and last legal grid prices for a side-specific open interval."""
+    epsilon = _EPS * tick_size
+    first = _quantise(low, tick_size, up=True)
+    last = _quantise(high, tick_size, up=False)
+    if side == "ask" and first <= low + epsilon:
+        first += tick_size
+    if side == "bid" and last >= high - epsilon:
+        last -= tick_size
+    return first, last
+
+
 def _get(url: str, timeout: float) -> dict:
     req = urllib.request.Request(url, headers=_HEADERS, method="GET")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -161,7 +175,9 @@ def earning_window(side: str, oracle: float, book: Book, *,
     """
     if side not in ("bid", "ask"):
         raise ValueError("side must be 'bid' or 'ask', got %r" % (side,))
-    if not (oracle > 0.0 and ring_pct > 0.0 and tick_size > 0.0):
+    if not (math.isfinite(oracle) and oracle > 0.0
+            and math.isfinite(ring_pct) and ring_pct > 0.0
+            and math.isfinite(tick_size) and tick_size > 0.0):
         return Window(side=side, low=0.0, high=0.0, ticks=0)
 
     # The ring is a band AROUND the oracle and bounds BOTH sides. An earlier
@@ -186,9 +202,9 @@ def earning_window(side: str, oracle: float, book: Book, *,
 
     if not (high > low):
         return Window(side=side, low=low, high=high, ticks=0)
-    # Count tick-aligned prices strictly inside the open bound. Computed on
-    # the width rather than by enumerating, so a wide window is not a loop.
-    ticks = int((high - low) / tick_size)
+    first, last = _grid_bounds(side, low, high, tick_size)
+    ticks = (int(round((last - first) / tick_size)) + 1
+             if last >= first - _EPS * tick_size else 0)
     return Window(side=side, low=low, high=high, ticks=max(ticks, 0))
 
 
@@ -203,18 +219,103 @@ def required_offset_pct(side: str, oracle: float, book: Book, *,
     ticks to approach, and approaches only when the answer is inside its
     headroom at all.
     """
+    return required_ladder_offset_pct(
+        side, oracle, oracle, book,
+        ring_pct=ring_pct, tick_size=tick_size)
+
+
+def required_ladder_offset_pct(
+    side: str,
+    oracle: float,
+    reference: float,
+    book: Book,
+    *,
+    ring_pct: float,
+    tick_size: float,
+) -> Optional[float]:
+    """Symmetric ladder offset that clears the book inside the oracle ring.
+
+    ``earning_window`` is anchored to the true oracle because that is what
+    the venue scores. The returned offset is anchored to ``reference`` because
+    that is where ``quote_ladder`` applies it after inventory skew.
+    """
+    if not (math.isfinite(reference) and reference > 0.0):
+        return None
     window = earning_window(side, oracle, book,
                             ring_pct=ring_pct, tick_size=tick_size)
     if not window.open:
         return None
+    if side == "ask" and book.best_bid is None:
+        return 0.0
+    if side == "bid" and book.best_ask is None:
+        return 0.0
+    first, last = _grid_bounds(side, window.low, window.high, tick_size)
+    target = first if side == "ask" else last
     if side == "ask":
-        # One tick clear of the bid, then quantised UP the way the ladder
-        # rounds asks, so the price we compute is the price that is sent.
-        target = _quantise(window.low + tick_size, tick_size, up=True)
-        if target > window.high + _EPS * tick_size:
-            return None
-    else:
-        target = _quantise(window.high - tick_size, tick_size, up=False)
-        if target < window.low - _EPS * tick_size:
-            return None
-    return abs(target / oracle - 1.0) * 100.0
+        return max(0.0, (target / reference - 1.0) * 100.0)
+    return max(0.0, (1.0 - target / reference) * 100.0)
+
+
+def placement_prices(
+    oracle: float,
+    reference: float,
+    book: Book,
+    *,
+    preferred_offset_pct: float,
+    ring_pct: float,
+    tick_size: float,
+) -> Optional[tuple[float, float]]:
+    """Exact ``(bid, ask)`` prices that rest and earn around a skewed center.
+
+    Each side is clamped independently. A symmetric spread can be impossible
+    around an inventory-skewed reference even though both earning windows are
+    open; forcing one shared offset would either cross the book or leave the
+    true-oracle ring.
+    """
+    if not (math.isfinite(reference) and reference > 0.0
+            and math.isfinite(preferred_offset_pct)
+            and preferred_offset_pct >= 0.0):
+        return None
+    bid_window = earning_window(
+        "bid", oracle, book, ring_pct=ring_pct, tick_size=tick_size)
+    ask_window = earning_window(
+        "ask", oracle, book, ring_pct=ring_pct, tick_size=tick_size)
+    if not (bid_window.open and ask_window.open):
+        return None
+
+    bid_low, bid_high = _grid_bounds(
+        "bid", bid_window.low, bid_window.high, tick_size)
+    ask_low, ask_high = _grid_bounds(
+        "ask", ask_window.low, ask_window.high, tick_size)
+    desired_bid = _quantise(
+        reference * (1.0 - preferred_offset_pct / 100.0),
+        tick_size, up=False)
+    desired_ask = _quantise(
+        reference * (1.0 + preferred_offset_pct / 100.0),
+        tick_size, up=True)
+    bid = min(max(desired_bid, bid_low), bid_high)
+    ask = min(max(desired_ask, ask_low), ask_high)
+    if not (bid > 0.0 and ask > bid):
+        return None
+    return bid, ask
+
+
+def rests_and_earns(side: str, price: float, oracle: float, book: Book, *,
+                    ring_pct: float, tick_size: float) -> bool:
+    """Whether one final on-grid leg is post-only and inside the score ring."""
+    if side not in ("bid", "ask"):
+        raise ValueError("side must be 'bid' or 'ask', got %r" % (side,))
+    if not (math.isfinite(price) and price > 0.0
+            and math.isfinite(oracle) and oracle > 0.0
+            and math.isfinite(ring_pct) and ring_pct > 0.0
+            and math.isfinite(tick_size) and tick_size > 0.0):
+        return False
+    deviation = abs(price / oracle - 1.0) * 100.0
+    if deviation > ring_pct + 1e-9:
+        return False
+    epsilon = tick_size * _EPS
+    if side == "ask":
+        return (book.best_bid is None
+                or price > book.best_bid + epsilon)
+    return (book.best_ask is None
+            or price < book.best_ask - epsilon)

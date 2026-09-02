@@ -65,6 +65,16 @@ def test_an_empty_opposing_side_does_not_produce_an_infinite_window():
     assert window.ticks >= 0
 
 
+def test_an_empty_opposing_side_requires_no_crossing_offset():
+    oracle = 0.100
+    assert required_offset_pct(
+        "ask", oracle, _book(bid=None, ask=0.1010),
+        ring_pct=RING, tick_size=TICK) == 0.0
+    assert required_offset_pct(
+        "bid", oracle, _book(bid=0.0990, ask=None),
+        ring_pct=RING, tick_size=TICK) == 0.0
+
+
 # --------------------------------------------------------------------------- #
 # Quantisation.
 # --------------------------------------------------------------------------- #
@@ -147,6 +157,9 @@ def test_a_missing_oracle_or_tick_closes_the_window_without_raising():
         assert window.ticks == 0
         assert required_offset_pct("ask", oracle, book,
                                    ring_pct=RING, tick_size=tick) is None
+    assert required_offset_pct(
+        "ask", 0.0, _book(bid=None),
+        ring_pct=RING, tick_size=TICK) is None
 
 
 def test_an_unknown_side_is_a_programming_error_not_a_silent_zero():

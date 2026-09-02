@@ -48,7 +48,7 @@ from dataclasses import dataclass
 
 from .curfew import Stage
 
-__all__ = ["Profile", "profile_for", "SESSION_SPREAD_MULT",
+__all__ = ["Profile", "profile_for", "uncurfewed_profile", "SESSION_SPREAD_MULT",
            "CLOSED_SPREAD_MULT"]
 
 #: Open hours: quote WIDER than the configured spread. Depth credit is flat
@@ -93,15 +93,10 @@ _DEPTH = {
     Stage.PREOPEN: 0.5,
     # The oracle may not have printed yet -- see profile_for.
     Stage.SETTLING: 0.25,
-    # [DEPTH 2026-09-02] 1.0, not 0.5. This used to mean "no schedule, so
-    # behave like an ordinary session" -- a safe default when UNSCHEDULED was
-    # reached only past the end of the table. It is now also the stage the
-    # runner sits in whenever the curfew is DISABLED, because assess_curfew
-    # never runs and self._curfew stays None. Disabling the curfew to free the
-    # overnight book therefore halved the target depth as a side effect, which
-    # is the opposite of the intent. The freeze detector still governs: a
-    # frozen oracle in a live-session stage withdraws regardless.
-    Stage.UNSCHEDULED: 1.0,
+    # The finite schedule abstains, but a moving oracle still means an ordinary
+    # live session. Curfew-disabled full-depth quoting is a separate posture;
+    # sharing this value doubled risk after the schedule table ended.
+    Stage.UNSCHEDULED: 0.5,
 }
 
 
@@ -133,6 +128,17 @@ class Profile:
     #: left as a trap.
     withdraw: bool
     reason: str
+
+
+def uncurfewed_profile() -> Profile:
+    """Full-depth posture explicitly requested by disabling the curfew."""
+    return Profile(
+        quote=True,
+        spread_mult=SESSION_SPREAD_MULT,
+        depth_mult=1.0,
+        withdraw=False,
+        reason="inventory curfew disabled: quote the configured full depth",
+    )
 
 
 def profile_for(stage: Stage, *, oracle_fresh: bool = True) -> Profile:

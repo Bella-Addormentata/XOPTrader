@@ -227,6 +227,7 @@ def quote_ladder(
     ring_pct: float = 2.0,
     tick_size: float = 0.0001,
     lot_size: float = 1.0,
+    max_offset_pct: Optional[float] = None,
 ) -> list[OrderIntent]:
     """A balanced ladder sized to earn ``target_depth_usd`` of depth credit.
 
@@ -235,11 +236,11 @@ def quote_ladder(
     earning nothing. Symmetry is not a stylistic choice here, it is what the
     scoring function rewards.
 
-    Every level is placed strictly INSIDE the ring, because a level outside it
-    earns no depth AND risks being purged on an oracle move. The last level is
-    clamped rather than allowed to drift out, so asking for more levels than
-    the ring can hold degrades into a tighter ladder instead of a book with
-    invisible legs.
+    By default every level reserves 10% of the ring for drift, because a level
+    outside it earns no depth AND risks being purged on an oracle move. A
+    caller with a directly observed resting window may supply
+    ``max_offset_pct`` to use more of the ring; the cap is still bounded by
+    ``ring_pct``.
 
     EVERY tuning input is checked, and an out-of-domain one quotes NOTHING
     rather than raising. ``first_offset_pct`` and ``ring_pct`` arrive from
@@ -274,6 +275,16 @@ def quote_ladder(
             market, first_offset_pct, level_step_pct, ring_pct,
         )
         return []
+    if max_offset_pct is None:
+        offset_cap = ring_pct * 0.9
+    elif (_finite(max_offset_pct)
+          and 0.0 < max_offset_pct <= ring_pct):
+        offset_cap = max_offset_pct
+    else:
+        _log.warning(
+            "permuto: refusing to quote %s -- max_offset_pct=%r is outside "
+            "(0, ring_pct]", market, max_offset_pct)
+        return []
 
     # [release review] Quantise to the venue's published grid. The live
     # /info/meta declares tick_size 0.0001 and lot_size 1 per market, and
@@ -289,13 +300,22 @@ def quote_ladder(
     if not (_finite(lot_size) and lot_size > 0.0):
         lot_size = 1.0
 
+    # Away-from-oracle rounding can add almost one full tick. The ordinary
+    # 90% cap already has ample room; an observed BBO override may use nearly
+    # the whole ring, so reserve that tick explicitly before building prices.
+    grid_safe_cap = ring_pct - tick_size / oracle * 100.0
+    offset_cap = min(offset_cap, grid_safe_cap)
+    if offset_cap <= 0.0:
+        _log.warning(
+            "quote_ladder: %s has no in-ring grid point (oracle=%r, tick=%r)",
+            market, oracle, tick_size)
+        return []
+
     per_level = target_depth_usd / levels
     out: list[OrderIntent] = []
     for i in range(levels):
         offset = first_offset_pct + i * level_step_pct
-        # Strictly inside: a leg exactly ON the ring boundary earns credit but
-        # leaves no room for the oracle to move before it falls out.
-        offset = min(offset, ring_pct * 0.9)
+        offset = min(offset, offset_cap)
         bid_price = oracle * (1.0 - offset / 100.0)
         ask_price = oracle * (1.0 + offset / 100.0)
         # floor/ceil on the tick grid, then guard the degenerate results: a

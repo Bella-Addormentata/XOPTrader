@@ -9,6 +9,7 @@ not be mistaken for a session starting.
 from gui.services.permuto.curfew import Stage
 from gui.services.permuto.modes import (
     CLOSED_SPREAD_MULT, SESSION_SPREAD_MULT, Profile, profile_for,
+    uncurfewed_profile,
 )
 
 
@@ -42,6 +43,11 @@ def test_open_hours_quote_wider_than_overnight():
         profile_for(Stage.CLOSED).spread_mult
     assert profile_for(Stage.CLOSED).spread_mult == CLOSED_SPREAD_MULT
     assert profile_for(Stage.SESSION).spread_mult == SESSION_SPREAD_MULT
+
+
+def test_unscheduled_is_session_sized_but_disabling_curfew_is_full_depth():
+    assert profile_for(Stage.UNSCHEDULED).depth_mult == 0.5
+    assert uncurfewed_profile().depth_mult == 1.0
 
 
 def test_the_last_minutes_place_nothing_new():

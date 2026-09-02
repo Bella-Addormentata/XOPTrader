@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import time
 import urllib.request
@@ -33,6 +34,7 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (XOPTrader)", "Accept": "application/json"
 OUT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                    "data", "field_monitor.jsonl")
 MARKETS = ("NVDA-VOL-PERP", "QQQ-VOL-PERP", "TSLA-VOL-PERP")
+DEFAULT_RING_PCT = 2.0
 
 
 def get(path, timeout=25):
@@ -54,11 +56,23 @@ def fetch_field():
             return rows, page
 
 
+def active_ring_pct(meta):
+    """``(percent, source)`` from venue metadata, with a labeled fallback."""
+    try:
+        value = float((meta or {}).get("vol_aggressive_ring_pct"))
+    except (TypeError, ValueError):
+        value = 0.0
+    if math.isfinite(value) and value > 0.0:
+        return value, "venue"
+    return DEFAULT_RING_PCT, "default"
+
+
 def ring_state():
     """Is an ask placeable at all, per market? The reason we bank nothing."""
     out = {}
     try:
         prices = (get("/info/oracle") or {}).get("prices") or {}
+        ring_pct, ring_source = active_ring_pct(get("/info/meta"))
     except Exception as exc:  # noqa: BLE001
         return {"error": str(exc)[:120]}
     for market in MARKETS:
@@ -67,11 +81,13 @@ def ring_state():
             book = get("/info/l2/%s?levels=1" % market)
             bids = book.get("bids") or []
             best_bid = float(bids[0]["price"]) if bids else None
-            ring_hi = oracle * 1.02
+            ring_hi = oracle * (1.0 + ring_pct / 100.0)
             out[market] = {
                 "oracle": oracle,
                 "best_bid": best_bid,
                 "ring_hi": ring_hi,
+                "ring_pct": ring_pct,
+                "ring_source": ring_source,
                 # Ticks of room for an ask that rests AND earns.
                 "ask_ticks": (int((ring_hi - best_bid) / 0.0001)
                               if best_bid is not None and ring_hi > best_bid
