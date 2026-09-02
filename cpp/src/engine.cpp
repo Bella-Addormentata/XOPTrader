@@ -74,6 +74,12 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+// [review round 8] Named directly at the anchor-candidate construction
+// below. It arrived only transitively, via engine.hpp -> peg_suspension.hpp,
+// so a future edit that stopped peg_suspension.hpp needing it would break
+// this file for an unrelated reason -- and this branch has a documented
+// history of MSVC-pass/GCC-fail include differences.
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -13887,7 +13893,18 @@ std::optional<double> Engine::declared_usd_par(const AssetId& asset_id) const
     return config_.pegged_assets.usd_par_value(asset_id);
 }
 
+// [CIRCANCHOR 2026-09-02] usd_per_xch() is now a thin accessor over the
+// anchored form so that the price and the record of where it came from are
+// produced by ONE piece of code and cannot drift apart. Every existing
+// caller is byte-identical; only the asset-level peg watcher asks for the
+// provenance, and only because the fallback below is circular when the
+// wrapper it picks is the wrapper being judged. See risk::XchUsdAnchor.
 double Engine::usd_per_xch() const
+{
+    return usd_per_xch_anchor().usd;
+}
+
+risk::XchUsdAnchor Engine::usd_per_xch_anchor() const
 {
     // [S27 2026-08-27] EXTERNAL FEED FIRST.
     //
@@ -13919,20 +13936,42 @@ double Engine::usd_per_xch() const
     // documentation already argues exactly this -- "a frozen feed would
     // quote forever" -- and which treats a non-positive or non-finite
     // threshold as stale rather than as "always fresh".
-    if (coingecko_feed_fresh_for_revival(
-            !coingecko_prices_.empty(),
-            coingecko_last_fetch_,
-            std::chrono::steady_clock::now(),
-            config_.market_data.cex_freshness_threshold_sec)) {
+    const bool feed_fresh = coingecko_feed_fresh_for_revival(
+        !coingecko_prices_.empty(),
+        coingecko_last_fetch_,
+        std::chrono::steady_clock::now(),
+        config_.market_data.cex_freshness_threshold_sec);
+
+    // Left at 0 when the feed is stale OR when it is fresh but carries no
+    // usable XCH price. select_xch_usd_anchor treats both the same way --
+    // fall through to the fallback -- which is the behaviour this has always
+    // had, and is why the operator warn must NOT assert "the feed is stale".
+    double external_xch_usd = 0.0;
+    if (feed_fresh) {
         auto it = coingecko_prices_.find("chia");
-        if (it != coingecko_prices_.end() && std::isfinite(it->second)
-            && it->second > 0.0) {
-            return it->second;
+        if (it != coingecko_prices_.end()) {
+            external_xch_usd = it->second;
         }
     }
 
+    // [CIRCANCHOR review round 8] THE SELECTION ITSELF NOW LIVES IN
+    // risk::select_xch_usd_anchor, and what is left here is the adapter:
+    // read config and snapshots, hand over the decision, return the answer.
+    //
+    // Extracted because the PROVENANCE recorded below is load-bearing for
+    // the asset-level peg watcher and was the one part of that fix no test
+    // could reach -- dropping it here while keeping the VALUE identical
+    // reinstates the original defect with the whole suite green. Same split,
+    // and same reason, as usd_route.hpp.
+    //
+    // The views borrow config_.pairs' strings, which outlive the returned
+    // anchor and every consumer of it; `candidates` itself is free to die
+    // here.
+    std::vector<risk::XchAnchorCandidate> candidates;
+    candidates.reserve(config_.pairs.size());
     for (const auto& pair : config_.pairs) {
-        if (!pair.enabled || pair.base_asset_id != "xch") continue;
+        // Filtered to ENABLED here, per select_xch_usd_anchor's contract.
+        if (!pair.enabled) continue;
         // [review] No slash check. It is vestigial -- from when this matched
         // on the display NAME -- and the lookup below is entirely by
         // canonical asset id. parse_pairs() accepts names without a slash
@@ -13952,8 +13991,25 @@ double Engine::usd_per_xch() const
         // the pair name -- symbols collide and get reused, asset ids do
         // not.  A wrapper is one that does NOT prefer a market cross: its
         // par is a claim on a dollar, not an observation.
-        if (is_par_wrapper_quote(pair)) {
-            auto snap = state_->get_market(pair.name);
+        candidates.push_back(risk::XchAnchorCandidate{
+            std::string_view{pair.name},
+            std::string_view{pair.base_asset_id},
+            std::string_view{pair.quote_asset_id},
+            is_par_wrapper_quote(pair)});
+    }
+
+    // [PNL-BASIS-USD 2026-07-30] A no-anchor answer is 0 ("unknown"), NOT
+    // the historical hard-coded fallback rate.  That rate was 2.70 while XCH
+    // has traded near $1.35, so using it would silently value fills at ~2x
+    // and -- now that cost basis is PERSISTED -- bake that error in
+    // permanently instead of it evaporating at the next restart.  Callers
+    // treat 0 as "no USD valuation": quote_usd_factor returns 0, the fill
+    // takes the unpriced path that leaves the basis intact, and the pair is
+    // excluded from USD totals until real market data arrives.
+    return risk::select_xch_usd_anchor(
+        feed_fresh, external_xch_usd, candidates,
+        [this](const risk::XchAnchorCandidate& c)
+            -> std::optional<double> {
             // [S20 2026-08-24] NOT gated on mid_valuation_grade.  Grade
             // requires a fresh two-sided FILTERED book or a fresh CEX leg,
             // and XCH/wUSDC.b's dust-filtered book is one-sided on most
@@ -13964,33 +14020,21 @@ double Engine::usd_per_xch() const
             // breaker's own anchor.  The published mid is already gated
             // against an independent anchor before it reaches State, which
             // is where junk is meant to be stopped.
+            const auto snap = state_->get_market(std::string{c.pair_name});
             // [PEG 2026-08-27] Multiply by the quote's DECLARED par rather
             // than assuming one unit is one dollar.  The mid here is
             // denominated in the quote asset, so for a EUR-pegged wrapper
             // -- or any non-unit target -- returning it raw would silently
             // report EUR as USD.  An unavailable par (no FX rate, or the
             // peg no longer enforced) means this pair cannot anchor XCH;
-            // continue to the next candidate rather than guessing.
-            const auto par = declared_usd_par(pair.quote_asset_id);
-            if (par) {
-                if (auto usd = usd_per_base_from_mid(
-                        static_cast<double>(snap.mid_price),
-                        static_cast<double>(kMojosPerXch), *par)) {
-                    return *usd;
-                }
-            }
-        }
-    }
-
-    // [PNL-BASIS-USD 2026-07-30] Return 0 ("unknown"), NOT the historical
-    // hard-coded fallback rate.  That rate was 2.70 while XCH has
-    // traded near $1.35, so using it would silently value fills at ~2x and
-    // -- now that cost basis is PERSISTED -- bake that error in permanently
-    // instead of it evaporating at the next restart.  Callers treat 0 as
-    // "no USD valuation": quote_usd_factor returns 0, the fill takes the
-    // unpriced path that leaves the basis intact, and the pair is excluded
-    // from USD totals until real market data arrives.
-    return 0.0;
+            // nullopt sends the selector to the next candidate rather than
+            // guessing.
+            const auto par = declared_usd_par(AssetId{c.quote_asset_id});
+            if (!par) return std::nullopt;
+            return usd_per_base_from_mid(
+                static_cast<double>(snap.mid_price),
+                static_cast<double>(kMojosPerXch), *par);
+        });
 }
 
 // [S20 2026-08-24] The BYC cross that quote_usd_factor() would ACTUALLY
@@ -17875,11 +17919,26 @@ bool Engine::pair_peg_suspended(const PairConfig& pc) const
 // usd(asset) = usd_per_xch / mid(XCH/asset), or * mid(asset/XCH). Only
 // valuation-grade mids feed it (the S20 contract); a junk or missing print
 // reaches observe_peg() as a data gap and holds the streak.
+//
+// [CIRCANCHOR 2026-09-02] "does not consult the asset's own par" was an
+// ASSERTION, not an enforced property. usd_per_xch()'s DEX fallback -- live
+// whenever CoinGecko has been stale for cex_freshness_threshold_sec, four
+// missed 30s polls -- prices XCH as mid(XCH/W) * declared_par(W). Judging W
+// through that anchor divides the same mid straight back out, so the
+// observation IS declared_par(W), lands at 0.0% off, and takes observe_peg's
+// below-bail branch, which executes rt.above_bail = 0. Not a stall: an
+// active wipe of the streak, on every graded cycle of the outage.
+//
+// The anchor now reports its provenance and peg_usd_observation refuses the
+// self-anchored case. A fallback anchored on a DIFFERENT wrapper still
+// observes -- that is a real market cross and it is what produced the
+// honest $0.44 reading on 2026-08-30.
 asio::awaitable<void> Engine::step_observe_asset_pegs(BlockHeight block_height)
 {
     if (config_.pegged_assets.empty()) co_return;
 
-    const double usd_xch = usd_per_xch();
+    const auto   usd_anchor = usd_per_xch_anchor();
+    const double usd_xch    = usd_anchor.usd;
 
     for (const PeggedAsset* a : config_.pegged_assets.all()) {
         if (!a->enforce) continue;
@@ -17906,6 +17965,9 @@ asio::awaitable<void> Engine::step_observe_asset_pegs(BlockHeight block_height)
                 // nullopt leaves usd_obs NaN, which routes into
                 // observe_peg's data-gap branch and HOLDS the streak:
                 // absence of evidence neither confirms nor clears a depeg.
+                // That is why refusing is the SAFE direction here and
+                // returning a number is the risky one -- the inverse of the
+                // usual rule, and stated at length in that header.
                 const auto obs = risk::peg_usd_observation(
                     static_cast<double>(snap.mid_price),
                     static_cast<double>(kMojosPerXch),
@@ -17913,20 +17975,119 @@ asio::awaitable<void> Engine::step_observe_asset_pegs(BlockHeight block_height)
                     snap.mid_valuation_grade,
                     snap.bid_side_anchor_ok,
                     snap.ask_side_anchor_ok,
-                    usd_xch);
+                    usd_anchor,
+                    a->asset_id);
                 if (!obs) {
+                    // [review round 8] THE CIRCULAR REASON BELONGS IN THIS
+                    // LINE. peg_usd_observation checks circularity FIRST, so
+                    // on that refusal every other field here reads true and
+                    // the message contradicted itself: "yields no
+                    // observation (grade=true, bid_ok=true, ask_ok=true)".
+                    // An operator debugging a short feed flap concluded the
+                    // peg code was broken rather than that the anchor was
+                    // its own. The warn that explains it is throttled to
+                    // once per asset per five minutes, so during a flap this
+                    // debug line is all there is.
                     spdlog::debug("[Engine] peg observe: {} yields no "
-                                  "observation (grade={}, bid_ok={}, "
-                                  "ask_ok={}, anchor={})",
-                                  pair.name, snap.mid_valuation_grade,
+                                  "observation (circular_anchor={}, "
+                                  "grade={}, bid_ok={}, ask_ok={}, "
+                                  "anchor_kind={}, anchor={})",
+                                  pair.name,
+                                  risk::xch_anchor_is_circular_for(
+                                      usd_anchor, a->asset_id),
+                                  snap.mid_valuation_grade,
                                   snap.bid_side_anchor_ok,
                                   snap.ask_side_anchor_ok,
+                                  risk::to_string(usd_anchor.kind),
                                   snap.book_side_ref);
                     continue;
                 }
                 usd_obs = *obs;
                 break;
             }
+        }
+
+        // [CIRCANCHOR 2026-09-02] GO BLIND LOUDLY.
+        //
+        // The refusal is correct and is strictly better than what it
+        // replaces -- blind-and-silent beats blind-while-announcing a
+        // fabricated all-clear -- but blind is still blind, and "this
+        // asset's peg detector is inoperative for the duration of the
+        // CoinGecko outage" is an operator decision input, not a debug
+        // detail. So it does not join the per-pair debug line above.
+        //
+        // Placed after the loop, so it fires once per asset per heartbeat
+        // rather than once per matching pair, and only when NO pair
+        // produced an observation: if some other market prices the asset
+        // non-circularly, the loop already used it and there is nothing to
+        // report. (Circularity is a property of the anchor and the judged
+        // asset, not of the pair, so it is invariant across this loop --
+        // the pair loop keeps looking after a refusal, which is free and
+        // correct.)
+        //
+        // Throttled: the condition repeats every heartbeat of the outage.
+        //
+        // [review round 8] The `!std::isfinite(usd_obs)` term is REDUNDANT
+        // today and is kept as defence in depth, not as a live condition.
+        // Circularity depends only on the anchor and the judged asset, so
+        // once it holds every peg_usd_observation call in the loop above
+        // returns nullopt and usd_obs is necessarily NaN here. The earlier
+        // comment claiming this term selects the "no pair produced an
+        // observation" case described a state that cannot arise -- kept so
+        // that a future route which CAN price the asset non-circularly
+        // silences the warn instead of shouting over a working detector.
+        if (!std::isfinite(usd_obs)
+                && risk::xch_anchor_is_circular_for(usd_anchor, a->asset_id)) {
+            // [review round 8] STATE THE RECOVERY CONDITION THAT ACTUALLY
+            // EXISTS. The old text promised "or another market can price
+            // it", which in the shipped configuration is unreachable:
+            // is_par_wrapper_quote requires !prefer_market_cross, and
+            // wUSDC.b is the only declared asset that qualifies (BYC sets
+            // prefer_market_cross). So for wUSDC.b the blind window is
+            // TOTAL, and an operator waiting for a cross-market recovery
+            // would wait for something this config cannot produce. Computed
+            // rather than asserted, so it stays true if a second wrapper is
+            // ever declared.
+            bool other_anchor_possible = false;
+            for (const auto& pair : config_.pairs) {
+                if (!pair.enabled || pair.base_asset_id != "xch") continue;
+                if (pair.quote_asset_id == a->asset_id) continue;
+                if (is_par_wrapper_quote(pair)) {
+                    other_anchor_possible = true;
+                    break;
+                }
+            }
+
+            const auto now = std::chrono::steady_clock::now();
+            auto& last = peg_circular_anchor_warned_at_[a->asset_id];
+            if (last == std::chrono::steady_clock::time_point{}
+                    || now - last >= std::chrono::minutes(5)) {
+                last = now;
+                spdlog::warn(
+                    "[Engine] [PEGSUSPEND] {} peg detection is INOPERATIVE: "
+                    "the only USD-per-XCH anchor available is {}'s OWN "
+                    "declared par (no usable external XCH price, so XCH is "
+                    "priced off an XCH/{} mid; anchor kind={}). Observing "
+                    "through it would divide that mid straight back out and "
+                    "report exactly par, so the observation is REFUSED -- "
+                    "which HOLDS the streak rather than clearing it. {}",
+                    a->symbol, a->symbol, a->symbol,
+                    risk::to_string(usd_anchor.kind),
+                    other_anchor_possible
+                        ? "This asset is not being watched until the "
+                          "external price feed returns, or until another "
+                          "declared par wrapper can anchor XCH."
+                        : "This asset is not being watched until the "
+                          "external price feed returns -- this config "
+                          "declares no OTHER par wrapper, so no other "
+                          "market can anchor XCH in the meantime.");
+            }
+        } else if (std::isfinite(usd_obs)) {
+            // [review round 8] The detector is working for this asset, so
+            // ARM the warn again. Without this the throttle timestamp was
+            // never cleared, and a second outage beginning within five
+            // minutes of the first warn announced nothing at all.
+            peg_circular_anchor_warned_at_.erase(a->asset_id);
         }
 
         auto& rt = asset_peg_rt_[a->asset_id];
@@ -17938,13 +18099,31 @@ asio::awaitable<void> Engine::step_observe_asset_pegs(BlockHeight block_height)
 
         // The transition. Alert first -- the cancel below can fail, and
         // the operator must hear about the depeg either way.
+        //
+        // [review round 8] NAME THE ANCHOR THE MEASUREMENT WAS MADE
+        // AGAINST. The observation is usd_per_xch / mid, so it is only as
+        // trustworthy as usd_per_xch, and a DeclaredParCross anchor borrows
+        // trust from ANOTHER asset's declared par. Concretely: with the
+        // external feed out and XCH priced off a depegged wUSDC.b, a
+        // perfectly healthy BYC reads at the reciprocal of wUSDC.b's depeg
+        // and can be suspended for it -- the alert names the healthy asset
+        // while the compromised pair keeps quoting. That mis-attribution is
+        // NOT fixed here (see peg_suspension.hpp's KNOWN LIMIT); printing
+        // the anchor is what lets an operator recognise it in the log
+        // rather than trusting the headline.
         spdlog::error("[Engine] [PEGSUSPEND] {} has LOST ITS PEG "
                       "(observed ${:.4f} vs target {:.4f}, {:.1f}% off, "
-                      "sustained {} observations) -- suspending the par and "
-                      "disabling every pair touching it. Re-enable from the "
-                      "GUI's Depeg tab when YOU trust the peg again.",
+                      "sustained {} observations, measured against a "
+                      "usd-per-xch anchor of ${:.4f} from {}{}) -- "
+                      "suspending the par and disabling every pair touching "
+                      "it. Re-enable from the GUI's Depeg tab when YOU trust "
+                      "the peg again.",
                       a->symbol, usd_obs, a->peg_target,
-                      rt.last_deviation_pct, a->sustained_observations);
+                      rt.last_deviation_pct, a->sustained_observations,
+                      usd_anchor.usd, risk::to_string(usd_anchor.kind),
+                      usd_anchor.par_asset_id.empty()
+                          ? std::string{}
+                          : " on " + std::string{usd_anchor.par_asset_id});
         if (alerts_) {
             alerts_->send_alert(
                 AlertRule::StablecoinDepeg,

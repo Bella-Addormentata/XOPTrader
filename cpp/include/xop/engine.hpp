@@ -547,6 +547,20 @@ private:
     std::unordered_map<std::string, risk::PegRuntime> asset_peg_rt_;
     std::filesystem::path peg_reenable_flag_path_;
 
+    /// [CIRCANCHOR 2026-09-02] Last time we told the operator that an
+    /// asset's peg detector is inoperative because the only USD anchor
+    /// available is that asset's own declared par.
+    ///
+    /// This is an operator-facing condition, not a debug detail -- the
+    /// detector is blind for as long as it lasts -- so it logs at warn
+    /// rather than joining the debug line that covers a transient junk
+    /// book. It also repeats every heartbeat of the outage, hence the
+    /// throttle. Deliberately NOT a new AlertRule: the warn line plus the
+    /// existing StablecoinDepeg channel is the right scope, and expanding
+    /// alert plumbing here would bury the fix.
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point>
+        peg_circular_anchor_warned_at_;
+
     // -- [RELOAD] Config hot-reload: live pair disable ---------------------
     //
     // A GUI Save writes config.yaml and touches data/config_reload.flag;
@@ -694,6 +708,28 @@ private:
     /// [PNL-BASIS-USD] note in usd_per_xch for why a fixed rate is unsafe
     /// now that cost basis is persisted.
     [[nodiscard]] double usd_per_xch() const;
+
+    /// The same number, plus WHERE IT CAME FROM.
+    ///
+    /// [CIRCANCHOR 2026-09-02] usd_per_xch()'s DEX fallback prices XCH off an
+    /// XCH/<par wrapper> mid times that wrapper's DECLARED par. Used to judge
+    /// that same wrapper's peg, the mids cancel and the observation is the
+    /// declared par read back to itself -- a permanent, silent all-clear on
+    /// the one asset whose bridge was actually compromised. The asset-level
+    /// peg watcher needs to be able to tell that case apart from a legitimate
+    /// cross against a DIFFERENT wrapper, and only the code that picked the
+    /// anchor knows which it was. See risk::XchUsdAnchor.
+    ///
+    /// THIS IS THE SINGLE IMPLEMENTATION; usd_per_xch() is a thin accessor
+    /// over it, so the price and its provenance cannot disagree. The other
+    /// four call sites (quote_usd_factor x2, step_update_pnl, the Step 13
+    /// breaker anchor) keep the bare double -- provenance is irrelevant to
+    /// them, and dragging a circuit-breaker anchor into a peg fix is not a
+    /// trade worth making.
+    ///
+    /// The returned par_asset_id BORROWS from config_; it is valid for the
+    /// engine's lifetime but is meant to be consumed within the cycle.
+    [[nodiscard]] risk::XchUsdAnchor usd_per_xch_anchor() const;
 
     // -- [PEG 2026-08-26] Peg identity, asked of the registry ---------------
     //
