@@ -81,57 +81,32 @@ CoinManager::CoinManager(asio::io_context&                    /*ioc*/,
 }
 
 // ---------------------------------------------------------------------------
-// get_balance_xch -- confirmed spendable balance in whole XCH (display)
+// [S41 2026-09-01] get_balance_xch() and get_balance_mojos() were DELETED
+// here. Both had zero callers repo-wide. get_balance_mojos() returned 0 on an
+// unexpected response shape and 0 again on ChiaRPCError -- reporting an empty
+// wallet when the read had failed, which is the exact defect this commit
+// fixes in get_spendable_coins(). Leaving it in place while fixing its twin
+// would have shipped the next instance of the family in the same commit.
 // ---------------------------------------------------------------------------
-
-asio::awaitable<double> CoinManager::get_balance_xch(std::int64_t wallet_id)
-{
-    Mojo balance_mojos = co_await get_balance_mojos(wallet_id);
-    double balance_xch = static_cast<double>(balance_mojos)
-                         / static_cast<double>(kMojosPerXch);
-    co_return balance_xch;
-}
-
-// ---------------------------------------------------------------------------
-// get_balance_mojos -- confirmed spendable balance in raw mojos
-// ---------------------------------------------------------------------------
-
-asio::awaitable<Mojo> CoinManager::get_balance_mojos(std::int64_t wallet_id)
-{
-    try {
-        json result = co_await wallet_->get_wallet_balance(wallet_id);
-
-        // MEDIUM-5 FIX: The wallet RPC already unwraps the "wallet_balance"
-        // envelope, so `result` IS the balance object.  Access the balance
-        // fields directly from the unwrapped object; the nested
-        // "wallet_balance" path was dead code (always false).
-        // ISO/IEC 25000 -- remove unreachable branch to improve maintainability.
-        // ISO/IEC 5055 -- CWE-561 (dead code) elimination.
-        if (result.contains("spendable_balance")) {
-            co_return result["spendable_balance"].get<Mojo>();
-        }
-
-        logger_->warn("get_balance_mojos: unexpected response structure "
-                      "for wallet_id {}", wallet_id);
-        co_return 0;
-
-    } catch (const rpc::ChiaRPCError& e) {
-        logger_->error("get_balance_mojos failed for wallet_id {}: {}",
-                       wallet_id, e.what());
-        co_return 0;
-    }
-}
 
 // ---------------------------------------------------------------------------
 // get_spendable_coins -- enumerate unlocked spendable coins
 // ---------------------------------------------------------------------------
 
-asio::awaitable<std::vector<CoinInfo>> CoinManager::get_spendable_coins(
-    std::int64_t wallet_id)
+// [S41 2026-09-01] nullopt means THE READ DID NOT HAPPEN. An engaged optional
+// holding an empty vector means the wallet genuinely has nothing usable. This
+// function used to return the same empty vector for both, so 68 failed reads
+// became 34 phantom "Have 0 mojos total" claims about a wallet that held ~59
+// XCH, and each one reached ensure_split(). See coin_pool_verdict.hpp.
+//
+// `coins` is built INSIDE the try so there is no partially-filled vector in
+// scope that a later edit could return by accident on the failure path.
+asio::awaitable<std::optional<std::vector<CoinInfo>>>
+CoinManager::get_spendable_coins(std::int64_t wallet_id)
 {
-    std::vector<CoinInfo> coins;
-
     try {
+        std::vector<CoinInfo> coins;
+
         auto raw_coins = co_await wallet_->get_spendable_coins(wallet_id);
 
         for (const auto& rc : raw_coins) {
@@ -160,26 +135,50 @@ asio::awaitable<std::vector<CoinInfo>> CoinManager::get_spendable_coins(
                       return a.amount > b.amount;
                   });
 
+        co_return coins;
+
     } catch (const rpc::ChiaRPCError& e) {
+        // The observed failure, 68 times: "Wallet needs to be fully synced
+        // before getting all coins" -- an application error, not a transport
+        // fault.
         logger_->error("get_spendable_coins failed for wallet_id {}: {}",
                        wallet_id, e.what());
-    }
+        co_return std::nullopt;
 
-    co_return coins;
+    } catch (const std::exception& e) {
+        // parse_coin() and compute_coin_name() throw json::type_error,
+        // std::invalid_argument and std::runtime_error on a malformed coin
+        // record. These used to escape this function and, at the two live
+        // call sites, an ancestry of DETACHED coroutines whose completion
+        // handler discards the exception_ptr -- so an escape here would end
+        // the poll loop silently rather than terminate. One non-throwing
+        // boundary, and nothing silent: it is logged at critical.
+        logger_->critical("get_spendable_coins: malformed coin record for "
+                          "wallet_id {}: {}", wallet_id, e.what());
+        co_return std::nullopt;
+    }
 }
 
 // ---------------------------------------------------------------------------
 // count_free_coins -- number of unlocked spendable coins
 // ---------------------------------------------------------------------------
 
-asio::awaitable<int> CoinManager::count_free_coins(std::int64_t wallet_id)
+asio::awaitable<std::optional<int>> CoinManager::count_free_coins(
+    std::int64_t wallet_id)
 {
+    // [S41] Propagate "I could not count". Note there is deliberately no
+    // .value_or(0) here and there must never be one -- that single token is
+    // the whole bug, relocated.
     auto coins = co_await get_spendable_coins(wallet_id);
+    if (!coins.has_value()) {
+        co_return std::nullopt;
+    }
+
     if (wallet_id == 1 && xch_pool_target_mojos_ > 0) {
         co_return static_cast<int>(count_pool_ready_coins(
-            coins, xch_pool_target_mojos_));
+            *coins, xch_pool_target_mojos_));
     }
-    co_return static_cast<int>(coins.size());
+    co_return static_cast<int>(coins->size());
 }
 
 bool CoinManager::is_pool_ready_coin(Mojo coin_amount_mojos,
@@ -300,14 +299,9 @@ bool CoinManager::split_improves_pool_ready_count(Mojo source_amount_mojos,
     return future_ready > current_ready;
 }
 
-asio::awaitable<int> CoinManager::count_pool_ready_coins(
-    std::int64_t wallet_id,
-    Mojo         target_amount_mojos)
-{
-    auto coins = co_await get_spendable_coins(wallet_id);
-    co_return static_cast<int>(count_pool_ready_coins(coins,
-                                                      target_amount_mojos));
-}
+// [S41 2026-09-01] The awaitable count_pool_ready_coins(wallet_id, target)
+// overload was DELETED here: zero callers repo-wide, and it returned 0 on a
+// failed read. The static (coins, target) overload above is the live one.
 
 // ---------------------------------------------------------------------------
 // ensure_split -- pre-split large coins into target denominations
@@ -322,7 +316,24 @@ asio::awaitable<SplitResult> CoinManager::ensure_split(
     SplitResult result;
 
     // Step 1: Count current pool-ready coins.
-    auto free_coins = co_await get_spendable_coins(wallet_id);
+    //
+    // [S41 2026-09-01] The read is checked BEFORE anything derived from it is
+    // computed. This function is a SPEND, and every downstream step -- the
+    // needed count, the balance sum, the candidate search -- is meaningless if
+    // the enumeration never happened. It used to proceed on an empty vector
+    // and reach the insufficient-balance branch, which logged "Have 0 mojos
+    // total" about a wallet the function had never successfully read. That it
+    // did not also spend was arithmetic luck (0 < target + fee), not a guard.
+    auto maybe_free_coins = co_await get_spendable_coins(wallet_id);
+    if (!maybe_free_coins.has_value()) {
+        logger_->error("ensure_split: coin enumeration FAILED for wallet_id "
+                       "{} -- the pool state is unknown, so no split is "
+                       "authorised. This is NOT an insufficient balance.",
+                       wallet_id);
+        co_return SplitResult{.success = false, .read_failed = true};
+    }
+    auto free_coins = std::move(*maybe_free_coins);
+
     const int current_count = static_cast<int>(count_pool_ready_coins(
         free_coins, target_amount_mojos));
 

@@ -26,6 +26,8 @@
 #include "xop/execution/par_anchor.hpp"
 #include "xop/execution/book_side_quality.hpp"
 #include "xop/execution/cross_guard.hpp"
+#include "xop/execution/crossed_book.hpp"
+#include "xop/execution/coin_pool_verdict.hpp"
 #include "xop/strategy/tier_gain.hpp"
 #include "xop/execution/mid_gate.hpp"
 #include "xop/risk/valuation_authority.hpp"
@@ -11409,53 +11411,91 @@ asio::awaitable<void> Engine::step_check_arbitrage(
         auto comp_offers = market_data_->get_competing_offers(pair.name);
         if (comp_offers.empty()) continue;
 
-        // Find best (highest) bid and best (lowest) ask from competing offers.
-        Mojo best_bid_price = 0;
-        Mojo best_ask_price = std::numeric_limits<Mojo>::max();
-        std::string best_ask_offer_id;
-        Mojo best_ask_size = 0;
+        // [S40 2026-09-01] Selection, the cross test, the edge test and the
+        // size cap now live in evaluate_crossed_book(). The cap used to be
+        // computed here and then thrown away: std::min() clamped a LOG FIELD
+        // while take_offer() -- which has no size parameter, because Chia
+        // offers are atomic and cannot be partially filled -- consumed the
+        // counterparty's entire offer. The cap is honoured by FILTERING, as
+        // Step 9d has always done. See crossed_book.hpp for the full argument.
+        //
+        // The pair denomination is preserved here on purpose: 9c caps in
+        // pair.base_mojos_per_unit, NOT kMojosPerXch, so 5.0 means 5e12 mojos
+        // on XCH/DBX and 5000 mojos on BYC/wUSDC.b.
+        const Mojo max_take_mojos = execution::cap_mojos_for(
+            max_take_xch, pair.base_mojos_per_unit);
 
-        for (const auto& co : comp_offers) {
-            if (co.side == Side::Bid && co.price > best_bid_price) {
-                best_bid_price = co.price;
-            }
-            if (co.side == Side::Ask && co.price < best_ask_price) {
-                best_ask_price = co.price;
-                best_ask_offer_id = co.offer_id;
-                best_ask_size = co.size;
-            }
-        }
+        const auto decision = execution::evaluate_crossed_book(
+            comp_offers, min_edge_bps, max_take_mojos);
 
-        // No two-sided market -> nothing to cross.
-        if (best_bid_price == 0 ||
-            best_ask_price == std::numeric_limits<Mojo>::max()) {
+        using execution::CrossedBookVerdict;
+
+        // The quiet verdicts first: these fire on most pairs on most blocks
+        // and must not reach info.
+        if (decision.verdict == CrossedBookVerdict::NoBook ||
+            decision.verdict == CrossedBookVerdict::NotCrossed) {
             continue;
         }
-
-        // Not crossed -> no opportunity.
-        if (best_bid_price < best_ask_price) continue;
-
-        // Compute edge in basis points.
-        const double ask_d = static_cast<double>(best_ask_price);
-        const double bid_d = static_cast<double>(best_bid_price);
-        const double edge_bps = (bid_d - ask_d) / ask_d * 10000.0;
-
-        if (edge_bps < min_edge_bps) {
+        if (decision.verdict == CrossedBookVerdict::EdgeTooThin) {
             spdlog::debug("[Engine] Step 9c: {} crossed book edge={:.1f}bps "
                           "< min={:.1f}bps -- skipping",
-                          pair.name, edge_bps, min_edge_bps);
+                          pair.name, decision.edge_bps, min_edge_bps);
             continue;
         }
 
-        // Cap the take size (use pair denomination, not kMojosPerXch).
-        const Mojo max_take_mojos = static_cast<Mojo>(
-            max_take_xch * static_cast<double>(pair.base_mojos_per_unit));
-        const Mojo take_size = std::min(best_ask_size, max_take_mojos);
+        const Mojo         best_bid_price    = decision.best_bid_price;
+        const Mojo         best_ask_price    = decision.best_ask_price;
+        const std::string& best_ask_offer_id = decision.best_ask_offer_id;
+        const double       edge_bps          = decision.edge_bps;
 
+        // Detection is logged BEFORE the size gate, and prints the TRUE
+        // counterparty size alongside the cap. This line is the instrument
+        // that measured 208 clamped attempts; a log that prints a DERIVED
+        // size can be read for months without anyone seeing the defect.
+        // Rule for this whole step: no log line may print a size that is not
+        // best_ask_size or cap_mojos verbatim.
         spdlog::info("[Engine] Step 9c: {} CROSSED BOOK detected -- "
-                     "bid={} ask={} edge={:.1f}bps offer_id={} size={}",
+                     "bid={} ask={} edge={:.1f}bps offer_id={} size={} cap={}",
                      pair.name, best_bid_price, best_ask_price,
-                     edge_bps, best_ask_offer_id.substr(0, 12), take_size);
+                     edge_bps, best_ask_offer_id.substr(0, 12),
+                     decision.best_ask_size, decision.cap_mojos);
+
+        if (decision.verdict == CrossedBookVerdict::CapUnusable) {
+            spdlog::warn("[Engine] Step 9c: {} take cap is unusable "
+                         "(crossed_book_max_take_xch={} base_mojos_per_unit={}) "
+                         "-- taking nothing",
+                         pair.name, max_take_xch, pair.base_mojos_per_unit);
+            continue;
+        }
+
+        if (decision.verdict == CrossedBookVerdict::ZeroSizeOffer) {
+            spdlog::info("[Engine] Step 9c: {} offer {} carries zero size -- "
+                         "skipping (the take would settle on chain with no "
+                         "fill record and no ledger legs)",
+                         pair.name, best_ask_offer_id.substr(0, 12));
+            continue;
+        }
+
+        if (decision.verdict == CrossedBookVerdict::SizeExceedsCap) {
+            // 9d's words, deliberately (engine.cpp Step 9d size filter).
+            spdlog::info("[Engine] Step 9c: {} offer size {} exceeds cap {} "
+                         "-- skipping (takes are all-or-nothing, cannot "
+                         "partially fill)",
+                         pair.name, decision.best_ask_size,
+                         decision.cap_mojos);
+            continue;
+        }
+
+        // Any verdict this step does not know about declines. A new enumerator
+        // must not fall through into a take.
+        if (decision.verdict != CrossedBookVerdict::Take) {
+            continue;
+        }
+
+        // The whole offer is consumed -- already validated against the cap by
+        // the size filter above.  This is the size that actually settles, and
+        // therefore the only size allowed to reach record_taker_fill().
+        const Mojo take_size = decision.take_size;
 
         if (dry_run_) {
             spdlog::info("[Engine] Step 9c: {} DRY RUN -- would take offer "
@@ -17300,41 +17340,83 @@ asio::awaitable<void> Engine::step_maintain_coin_pool(BlockHeight block_height)
             xch_pending = true;
         }
 
+        // [S41 2026-09-01] Read, then judge, then spend -- in that order, and
+        // only the verdict authorises the spend.
+        //
+        // What used to be here was `int free_count = 0;` followed by a try
+        // whose catch logged and FELL THROUGH, leaving the zero in place. A
+        // zero is below any positive target, so a FAILED READ AUTHORISED A
+        // SPLIT. The handler was also unreachable, because CoinManager
+        // swallowed the RPC error upstream and returned an empty coin vector
+        // that was indistinguishable from an empty wallet -- 68 swallowed
+        // failures, 34 phantom "Have 0 mojos total" lines, 0 handler hits.
+        // Un-swallowing alone would have made the handler reachable and still
+        // wrong; the policy therefore lives in coin_pool_verdict.hpp, where a
+        // test can hold it, since nothing in cpp/tests constructs an Engine.
+        //
+        // read_ok defaults to false: unknown is the default state, and unknown
+        // authorises nothing. A pending split short-circuits the read (it
+        // would only be stale anyway) and leaves the reading unknown, which
+        // the verdict maps to Skip via its split_pending clause.
+        execution::CoinPoolReading xch_reading;
         if (!xch_pending) {
-            int free_count = 0;
             try {
-                free_count = co_await coin_mgr_->count_free_coins(1);
+                if (auto n = co_await coin_mgr_->count_free_coins(1)) {
+                    xch_reading.read_ok          = true;
+                    xch_reading.pool_ready_count = *n;
+                } else {
+                    spdlog::warn("[Engine] Coin pool: XCH free-coin read FAILED "
+                                 "-- pool state unknown, no split this cycle "
+                                 "(this is NOT an empty wallet)");
+                }
             } catch (const std::exception& e) {
+                // Reachable now: CoinManager no longer swallows, and a
+                // malformed coin record still arrives here as an exception.
                 spdlog::warn("[Engine] Coin pool: XCH count_free_coins failed: {}",
                              e.what());
             }
+        }
 
-            if (free_count >= xch_target_count) {
-                spdlog::debug("[Engine] Coin pool: XCH {} free coins >= target {} -- OK",
-                              free_count, xch_target_count);
-            } else {
-                spdlog::info("[Engine] Coin pool: XCH {} free coins < target {} -- "
-                             "splitting to create {} more coins of {:.2f} XCH each",
-                             free_count, xch_target_count,
-                             xch_target_count - free_count, target_xch);
+        switch (execution::decide_coin_pool_action(
+                    xch_reading, xch_target_count, xch_pending)) {
+        case execution::CoinPoolAction::Skip:
+            // Pending split, or the pool state is unknown. Spend nothing.
+            break;
 
-                constexpr Mojo split_fee = 0;
-                try {
-                    auto result = co_await coin_mgr_->ensure_split(
-                        1, xch_target_count, target_mojos, split_fee);
+        case execution::CoinPoolAction::Satisfied:
+            spdlog::debug("[Engine] Coin pool: XCH {} free coins >= target {} -- OK",
+                          xch_reading.pool_ready_count, xch_target_count);
+            break;
 
-                    if (result.success && result.coins_created > 0) {
-                        spdlog::info("[Engine] Coin pool: XCH created {} new coins",
-                                     result.coins_created);
-                    } else if (!result.success) {
-                        spdlog::warn("[Engine] Coin pool: XCH split failed "
-                                     "(insufficient balance or RPC error)");
-                    }
-                } catch (const std::exception& e) {
-                    spdlog::error("[Engine] Coin pool: XCH ensure_split failed: {}",
-                                  e.what());
+        case execution::CoinPoolAction::Split: {
+            spdlog::info("[Engine] Coin pool: XCH {} free coins < target {} -- "
+                         "splitting to create {} more coins of {:.2f} XCH each",
+                         xch_reading.pool_ready_count, xch_target_count,
+                         xch_target_count - xch_reading.pool_ready_count,
+                         target_xch);
+
+            constexpr Mojo split_fee = 0;
+            try {
+                auto result = co_await coin_mgr_->ensure_split(
+                    1, xch_target_count, target_mojos, split_fee);
+
+                if (result.success && result.coins_created > 0) {
+                    spdlog::info("[Engine] Coin pool: XCH created {} new coins",
+                                 result.coins_created);
+                } else if (result.read_failed) {
+                    spdlog::warn("[Engine] Coin pool: XCH split abandoned -- "
+                                 "coin enumeration failed, pool state unknown "
+                                 "(NOT an insufficient balance)");
+                } else if (!result.success) {
+                    spdlog::warn("[Engine] Coin pool: XCH split failed "
+                                 "(insufficient balance or no improving split)");
                 }
+            } catch (const std::exception& e) {
+                spdlog::error("[Engine] Coin pool: XCH ensure_split failed: {}",
+                              e.what());
             }
+            break;
+        }
         }
     }
 
@@ -17419,29 +17501,49 @@ asio::awaitable<void> Engine::step_maintain_coin_pool(BlockHeight block_height)
                 cat_pending = true;
             }
 
-            if (cat_pending) continue;
-
-            // Count free coins for this wallet.
-            int free_count = 0;
-            try {
-                free_count = co_await coin_mgr_->count_free_coins(info.wallet_id);
-            } catch (const std::exception& e) {
-                spdlog::warn("[Engine] Coin pool: {} count_free_coins failed: {}",
-                             info.display_name, e.what());
-                continue;
+            // [S41] Same shape as the XCH branch above, deliberately, so the
+            // two cannot drift again. This branch already skipped correctly on
+            // an exception; it is routed through the same verdict anyway
+            // because "already correct" is not a property that survives edits.
+            // (It is also dead in production: cat_coin_pool_target_count is 0,
+            // so only the broken XCH branch has been running live.)
+            execution::CoinPoolReading cat_reading;
+            if (!cat_pending) {
+                try {
+                    if (auto n = co_await coin_mgr_->count_free_coins(
+                                     info.wallet_id)) {
+                        cat_reading.read_ok          = true;
+                        cat_reading.pool_ready_count = *n;
+                    } else {
+                        spdlog::warn("[Engine] Coin pool: {} free-coin read "
+                                     "FAILED (wid={}) -- pool state unknown, "
+                                     "no split (this is NOT an empty wallet)",
+                                     info.display_name, info.wallet_id);
+                    }
+                } catch (const std::exception& e) {
+                    spdlog::warn("[Engine] Coin pool: {} count_free_coins failed: {}",
+                                 info.display_name, e.what());
+                }
             }
 
-            if (free_count >= cat_target_count) {
+            const auto cat_action = execution::decide_coin_pool_action(
+                cat_reading, cat_target_count, cat_pending);
+
+            if (cat_action == execution::CoinPoolAction::Skip) continue;
+
+            if (cat_action == execution::CoinPoolAction::Satisfied) {
                 spdlog::debug("[Engine] Coin pool: {} {} free coins >= target {} -- OK",
-                              info.display_name, free_count, cat_target_count);
+                              info.display_name, cat_reading.pool_ready_count,
+                              cat_target_count);
                 continue;
             }
 
             spdlog::info("[Engine] Coin pool: {} {} free coins < target {} -- "
                          "splitting to create {} more coins of {:.1f} units "
                          "({} mojos) each",
-                         info.display_name, free_count, cat_target_count,
-                         cat_target_count - free_count,
+                         info.display_name, cat_reading.pool_ready_count,
+                         cat_target_count,
+                         cat_target_count - cat_reading.pool_ready_count,
                          cat_target_units, target_mojos);
 
             // Execute the split.
@@ -17455,9 +17557,14 @@ asio::awaitable<void> Engine::step_maintain_coin_pool(BlockHeight block_height)
                                  "of {} mojos each (wid={})",
                                  info.display_name, result.coins_created,
                                  target_mojos, info.wallet_id);
+                } else if (result.read_failed) {
+                    spdlog::warn("[Engine] Coin pool: {} split abandoned -- "
+                                 "coin enumeration failed, pool state unknown "
+                                 "(NOT an insufficient balance)",
+                                 info.display_name);
                 } else if (!result.success) {
                     spdlog::warn("[Engine] Coin pool: {} split failed "
-                                 "(insufficient balance or RPC error)",
+                                 "(insufficient balance or no improving split)",
                                  info.display_name);
                 }
             } catch (const std::exception& e) {
