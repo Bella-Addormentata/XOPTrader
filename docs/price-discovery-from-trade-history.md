@@ -431,9 +431,20 @@ bar is not a series, its inputs are **not** the free high/low above. Read
 them before reading its output.
 
 * The multi-day bars come from the **sampled third-party BBO series** we
-  already store: `offer_log.book_best_bid` / `book_best_ask`, or the denser
-  `snapshots.mid_price_mojos` + `spread_bps`, which invert back to the same
-  two sides exactly (mid 3.24975 at 10,768.52 bps returns 1.5000 / 4.9995).
+  already store: `offer_log.book_best_bid` / `book_best_ask`. That is the
+  only table that persists the two sides.
+* **`snapshots` cannot substitute, and the claim that it could is retracted.**
+  An earlier revision said `mid_price_mojos` + `spread_bps` "invert back to
+  the same two sides exactly", citing mid 3.24975 at 10,768.52 bps returning
+  1.5000 / 4.9995. That single example works only because that book's
+  published mid happened to be the arithmetic midpoint. In general
+  `mid_price_mojos` is `compute_mid()` — a depth-weighted micro-price blended
+  across DEX, CEX and AMM legs — while `spread_bps` is computed separately
+  from the raw BBO, so the two do not describe the same centre. On the only
+  enabled pair the micro-price left the book on 46.9% of ingests and was
+  clamped onto `best_bid`. The `--source snapshots` path now refuses rather
+  than fabricating sides, and any conclusion previously drawn from it should
+  be re-derived from `offer_log`.
 * `--dexie` fetches the `price_high` / `price_low` bar above. It is reported
   as an independent range check and gate test. It cannot drive either
   estimator, because one bar is not two.

@@ -509,20 +509,43 @@ class DbReader:
         return (float(row[0]), row[1]) if row else (None, None)
 
     def latest_usdc_usd(self) -> tuple[float | None, str | None]:
-        """wUSDC.b in USD from the newest local XCH/wUSDC.b snapshot.
+        """wUSDC.b in USD from the newest RAW DEX BBO on XCH/wUSDC.b.
 
-        mid_price_mojos on that pair is wUSDC.b per XCH; dividing the SAME
-        row's xch_usd_rate by it keeps the cross internally consistent.
+        [PR #134 review] This used to read snapshots.mid_price_mojos and
+        report the result as "market, NOT par".  It was neither.
+        mid_price_mojos is MarketDataFeed::compute_mid() -- a blended
+        micro-price across DEX, CEX and AMM legs -- and on XCH/wUSDC.b the CEX
+        leg is CoinGecko's NATIVE USDC price, i.e. a number pinned near $1.
+        Dividing xch_usd_rate by that aggregate therefore drags the inferred
+        wrapper price back toward $1 by construction, and then labels the
+        circularity a market observation. That is worse than no answer: the
+        whole point of this figure is to detect wUSDC.b trading OFF par.
+
+        offer_log persists the real third-party book (book_best_bid /
+        book_best_ask), so the arithmetic BBO midpoint from there is an actual
+        DEX cross with no CEX leg in it. If the book is absent the honest
+        answer is None -- the caller already renders that as unavailable.
         """
         row = self._con.execute(
-            "SELECT mid_price_mojos, xch_usd_rate, created_at FROM snapshots "
-            "WHERE pair_name = 'XCH/wUSDC.b' AND mid_price_mojos > 0 "
-            "AND xch_usd_rate > 0 ORDER BY id DESC LIMIT 1"
+            "SELECT book_best_bid, book_best_ask, created_at FROM offer_log "
+            "WHERE pair_name = 'XCH/wUSDC.b' AND book_best_bid > 0 "
+            "AND book_best_ask > 0 ORDER BY id DESC LIMIT 1"
         ).fetchone()
         if not row:
             return None, None
-        mid = row[0] / PRICE_SCALE
-        return (float(row[1]) / mid, row[2]) if mid > 0 else (None, None)
+        mid = (row[0] + row[1]) / 2.0 / PRICE_SCALE
+        if not mid > 0:
+            return None, None
+        # xch_usd_rate rides on snapshots, so take the newest one at or before
+        # this book sample rather than silently crossing two different instants.
+        rate_row = self._con.execute(
+            "SELECT xch_usd_rate FROM snapshots WHERE xch_usd_rate > 0 "
+            "AND created_at <= ? ORDER BY id DESC LIMIT 1",
+            (row[2],),
+        ).fetchone()
+        if not rate_row:
+            return None, None
+        return float(rate_row[0]) / mid, row[2]
 
     def our_offer_ids(self, pair: str) -> set[str]:
         """Every offer id this engine has ever recorded for the pair, normalised.
@@ -618,6 +641,19 @@ def _dexie_offers(
         if sort:
             params["sort"] = sort
         payload = _http_json(f"{DEXIE_OFFERS_URL}?{urllib.parse.urlencode(params)}")
+        # [PR #134 review] Dexie wraps every response in an explicit success
+        # envelope.  Reading `offers` straight off a 200 turns a `success:
+        # false` payload -- a rate limit, a bad filter, a partial outage --
+        # into "the book is empty", which for an operator diagnostic is the
+        # worst possible failure: it reports a real, actionable market state
+        # that never happened.  A failed call must reach the warning path in
+        # gather(), not be laundered into data.
+        if not payload.get("success", False):
+            raise RuntimeError(
+                f"dexie /v1/offers returned success=false for "
+                f"offered={offered} requested={requested} status={status} "
+                f"page={page} (keys: {sorted(payload)[:6]})"
+            )
         offers = payload.get("offers") or []
         collected.extend(offers)
         if len(offers) < DEXIE_PAGE_SIZE:

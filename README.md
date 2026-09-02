@@ -438,11 +438,20 @@ misbehave when there is too little usable data.
 
 Read the inputs before quoting the output. Both papers want daily bars off a
 *trade*-price series, and we have none. The daily bars here are built from
-the third-party BBO series we already store — `offer_log.book_best_bid` /
-`book_best_ask`, or the denser `snapshots.mid_price_mojos` + `spread_bps`,
-which invert back to the same two sides — so these are **quote samples
+the one table that actually persists a third-party BBO —
+`offer_log.book_best_bid` / `book_best_ask` — so these are **quote samples
 standing in for trade prices**, which is outside the regime the estimators
 were derived for. That caveat is real and the script prints it on every run.
+
+An earlier revision offered `snapshots.mid_price_mojos` + `spread_bps` as a
+denser second source, claiming the two invert back to the same sides.
+**They do not, and that source is now refused.** `snapshots` has no bid or
+ask column; `mid_price_mojos` is a depth-weighted orderbook micro-price
+blended across DEX, CEX and AMM legs, while `spread_bps` is computed
+separately from `dex_best_bid`/`ask`. Centring one on the other fabricates
+two shifted sides. Measured on the only enabled pair, the micro-price left
+the book on 46.9% of ingests and was clamped onto `best_bid`, putting both
+reconstructed sides a full half-spread below the truth.
 (`--dexie` adds a live 24h high/low from `TickerData::price_high` /
 `price_low`, the one field the engine fetches and discards unread. It is a
 single bar, both estimators need two consecutive ones, so it is an

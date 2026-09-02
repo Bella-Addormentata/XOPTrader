@@ -42,11 +42,23 @@ Bar construction
 ----------------
 Neither paper's input exists in this database: there is no continuous
 trade-price series with daily highs and lows.  What exists is a sampled
-third-party BBO series (offer_log.book_best_bid / book_best_ask, and
-snapshots.mid_price_mojos + spread_bps, which reconstruct the same bid and
-ask exactly -- mid 3.24975 with spread 10768.52 bps gives back 1.5000 /
-4.9995).  Two bar constructions are offered, and BOTH are declared in the
-output because the choice changes the answer:
+third-party BBO series, and only ONE table actually persists it:
+offer_log.book_best_bid / book_best_ask.
+
+`snapshots` does NOT.  An earlier revision of this file claimed that
+snapshots.mid_price_mojos + spread_bps "reconstruct the same bid and ask
+exactly", citing mid 3.24975 with spread 10768.52 bps giving back 1.5000 /
+4.9995.  That holds only because that particular book's published mid
+happened to be the arithmetic midpoint.  mid_price_mojos is a depth-weighted
+orderbook micro-price blended across DEX, CEX and AMM legs, while spread_bps
+is computed separately from dex_best_bid/ask -- so centring the one on the
+other fabricates two shifted sides rather than recovering the real ones.  On
+the only enabled pair the micro-price left the book on 46.9% of ingests, which
+put both reconstructed sides a full half-spread below the truth.  That source
+is now refused rather than silently wrong.
+
+Two bar constructions are offered, and BOTH are declared in the output because
+the choice changes the answer:
 
   quote-touch (default)
       H_t = max(best_ask) over the day, L_t = min(best_bid) over the day,
@@ -551,22 +563,39 @@ class DbReader:
             ).fetchall()
             raw = [(ts, b / PRICE_SCALE, a / PRICE_SCALE) for ts, b, a in rows]
         else:
-            # snapshots stores mid and spread rather than the two sides;
-            # inverting is exact.  half = mid * spread_bps / 2 / 10_000, so
-            # mid 3.24975 with spread 10768.52 bps returns bid 1.50000 and
-            # ask 4.99950 -- the live XCH/BYC book, to five decimals.
-            rows = self._con.execute(
-                "SELECT created_at, mid_price_mojos, spread_bps "
-                "FROM snapshots WHERE pair_name = ? AND created_at >= ? "
-                "AND mid_price_mojos > 0 AND spread_bps IS NOT NULL "
-                "ORDER BY created_at",
-                (pair, cutoff),
-            ).fetchall()
-            raw = []
-            for ts, mid_mojos, spread_bps in rows:
-                mid = mid_mojos / PRICE_SCALE
-                half = mid * float(spread_bps) / BPS / 2.0
-                raw.append((ts, mid - half, mid + half))
+            # REFUSED.  [PR #134 review] This branch used to reconstruct the
+            # two sides as mid +/- mid*spread_bps/2e4 and called the inversion
+            # "exact", on the strength of one worked example (mid 3.24975 with
+            # spread 10768.52 bps giving back 1.50000 / 4.99950).  That example
+            # only works because that book's published mid HAPPENED to be the
+            # arithmetic midpoint.  In general it is not:
+            #
+            #   * `snapshots` has NO bid or ask column.  Verified against the
+            #     live schema -- the only price fields are mid_price_mojos and
+            #     spread_bps.
+            #   * mid_price_mojos is MarketDataFeed::compute_mid() (persisted at
+            #     engine.cpp:16530), which is a depth-weighted orderbook
+            #     micro-price blended across DEX, CEX and AMM legs.
+            #   * spread_bps is computed separately, from dex_best_bid/ask.
+            #
+            # Centring a BBO-derived spread on a blended micro-price mid does
+            # not recover the sides, it fabricates two shifted ones.  Measured
+            # on the only enabled pair: the micro-price left the book on 46.9%
+            # of XCH/DBX ingests and was clamped onto best_bid, so on nearly
+            # half the samples this reconstruction put BOTH sides a full
+            # half-spread below the truth -- correct width, wrong level, and
+            # the error varies sample to sample rather than cancelling.
+            #
+            # offer_log persists the real thing (book_best_bid/book_best_ask)
+            # and is the default source.  Re-enable this branch only if the
+            # BBO is actually persisted into snapshots.
+            raise SystemExit(
+                "--source snapshots is disabled: the snapshots table stores a "
+                "blended micro-price mid and a separately-computed BBO spread, "
+                "with no bid or ask column, so the two sides cannot be "
+                "recovered from it. Use --source offer_log, which persists "
+                "book_best_bid/book_best_ask directly."
+            )
 
         clean = [(ts, b, a) for ts, b, a in raw if a > b > 0.0]
         return clean, len(raw) - len(clean)
