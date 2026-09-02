@@ -90,7 +90,8 @@ bool last_trade_is_fresh(const PairState& ps,
 }
 
 // -------------------------------------------------------------------------
-// The depth-weighted VWAP micro-price now lives in orderbook_mid.cpp as
+// The order-book mid (a Stoikov micro-price: touch prices weighted by the
+// opposite side's top-N cumulative depth) now lives in orderbook_mid.cpp as
 // xop::compute_orderbook_mid().  It moved out of this anonymous namespace so
 // that the invariant (best_bid <= mid <= best_ask), the spread-dependent
 // blend toward the plain midpoint, and the degenerate/one-sided handling can
@@ -1194,7 +1195,8 @@ void MarketDataFeed::set_whale_max_spread_multiplier(double multiplier) {
 // compute_mid -- multi-source price aggregation
 //
 // Priority cascade:
-//   0. Order-book VWAP micro-price (depth-weighted, when enabled)
+//   0. Order-book Stoikov micro-price (depth-weighted touch prices, when
+//      enabled)
 //   1. Dexie two-sided quotes -> dex_mid = (bid + ask) / 2
 //   2. Dexie one-sided (bid-only or ask-only) -> NO dex mid; falls to 3.
 //      (This used to publish the surviving side as the mid.)
@@ -1243,9 +1245,12 @@ double MarketDataFeed::compute_mid(const PairState& ps) const {
 
     double dex_mid = 0.0;
 
-    // Case 0: Prefer order-book-derived VWAP micro-price when available.
-    // This is computed from the top N levels of dust-filtered competing
-    // offers and weights by depth -- more robust than simple BBO midpoint.
+    // Case 0: Prefer the order-book-derived Stoikov micro-price when
+    // available.  Each side's TOUCH PRICE is weighted by the opposite side's
+    // top-N cumulative depth over the dust-filtered competing offers -- more
+    // robust than the simple BBO midpoint, and interior to the book by
+    // construction.  (It weighted each side's top-N VWAP until 2026-09-02,
+    // which is NOT interior; see xop/execution/orderbook_mid.hpp.)
     //
     // [S20 2026-08-24] ...and only while it is FRESH.  orderbook_mid is
     // written solely by ingest_competing_offers; when the offers fetch

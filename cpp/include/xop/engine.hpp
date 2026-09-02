@@ -1325,6 +1325,23 @@ private:
         // reached the capture point.
         Mojo          quote_fair_centre_mojos{0};
         double        quote_min_half_spread_bps{0.0};
+
+        // [2026-09-02, review] The spread SpreadOptimizer::compute_spread()
+        // produced, captured before Step 5's first adjustment site.
+        //
+        // Step 5 mutates spread_result.total_spread_bps at ten sites -- eight
+        // multiplications and TWO ASSIGNMENTS (the order-book tactician and
+        // the global half-spread cap) that discard everything before them.
+        // A telemetry gauge built from the multipliers therefore cannot
+        // describe what was posted, and one was: it multiplied two of the ten
+        // and was labelled "Effective Multiplier".  Keeping the base here lets
+        // the applied multiplier be MEASURED as end/start, which follows any
+        // future site -- multiplication, assignment or clamp -- without
+        // anyone remembering to update a product.
+        //
+        // 0 until Step 5 runs compute_spread() for this pair this cycle;
+        // consumers treat 0 as "no reading" rather than as 1.0x.
+        double        spread_base_bps{0.0};
     };
 
     /// Per-pair cycle state for the current block.

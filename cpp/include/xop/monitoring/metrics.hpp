@@ -132,6 +132,84 @@ struct ConcentrationEntry {
 };
 
 // ---------------------------------------------------------------------------
+// MetricsStrategySnapshot -- LIVE per-pair controller state, for update_strategy().
+//
+// [S42 2026-09-02] WHY THIS EXISTS
+// --------------------------------
+// Monitoring published the STARTUP ANALYSIS recommendation and nothing else,
+// so the operator read a number that was not merely stale but pointed the
+// WRONG WAY.  Measured on the running process, 2026-09-02:
+//
+//     xop_analysis{metric="recommended_spread_multiplier"}  1.5
+//     live spread PID  Engine::SpreadPidState::current_mult 0.820
+//
+// The GUI rendered "1.50x", coloured WARNING, meaning "quoting defensively
+// wide".  The engine was in fact at 0.820 -- the most AGGRESSIVE tightening
+// the controller can command -- and had been for every one of the 410 PID
+// lines in the retained log.  Both multipliers are applied to the same field
+// (engine.cpp Step 5: `*= analysis_spread_mult_` then `*= pid.current_mult`),
+// so this was not a missing metric; it was a published contradiction.
+//
+// The same blind spot covered the competitiveness PID (railed at offset -3
+// across all 410 lines, which drives the Step 8 gate to an effective score of
+// 0 -- i.e. fully open, every tier posts) and the take-retry suppression
+// count, which by construction cannot be read off the log at all.
+//
+// Every member carries a default initializer: this struct is populated by
+// designated initialisation at the call site, and GCC treats a skipped member
+// there as a -Werror diagnostic.
+// ---------------------------------------------------------------------------
+
+struct MetricsStrategySnapshot {
+    std::string   pair_name{};
+
+    /// Startup-analysis recommendation, republished per pair so a consumer
+    /// can show it NEXT TO the live value instead of INSTEAD OF it.
+    double        analysis_spread_mult{1.0};
+
+    // -- the spread that was actually posted, bracketing Step 5 ------------
+    //
+    // [2026-09-02, review] Step 5 mutates total_spread_bps at TEN sites, and
+    // two of them are ASSIGNMENTS -- the order-book tactician and the global
+    // half-spread cap -- which discard every multiplier that ran before them.
+    // Any "effective multiplier" derived by multiplying controller outputs is
+    // therefore wrong whenever either binds, and one was published that way.
+    // These two fields let the applied multiplier be MEASURED instead of
+    // derived: applied/base, which follows the chain wherever it goes.
+    //
+    // Both 0 when Step 5 did not reach the pair this block.  0 is "no
+    // reading"; it is deliberately NOT 1.0, which is a legal and reassuring
+    // value that would hide the gap.
+    double        spread_base_bps{0.0};     ///< compute_spread(), pre-adjust
+    double        spread_applied_bps{0.0};  ///< end of Step 5, post-everything
+
+    // -- spread PID (Engine::SpreadPidState) -------------------------------
+    bool          spread_pid_active{false};   ///< false => mult is not applied
+    double        spread_pid_mult{1.0};       ///< THE LIVE MULTIPLIER
+    double        spread_pid_ema_fill{0.0};
+    double        spread_pid_integral{0.0};
+    std::uint32_t spread_pid_blocks{0};
+
+    // -- rail latch (xop::strategy::PidRailLatch) on the spread PID --------
+    bool          rail_latched{false};        ///< controller has lost authority
+    int           rail_side{0};               ///< -1 low, 0 none, +1 high
+    std::uint32_t rail_latched_blocks{0};
+    std::uint32_t rail_suppressed{0};         ///< Enter events rate-limited away
+    double        rail_peak_abs_integral{0.0};
+
+    // -- competitiveness PID (xop::strategy::CompetitivenessPid) -----------
+    bool          comp_pid_active{false};
+    int           comp_pid_offset{0};
+    double        comp_pid_ema_fill{0.0};
+    int           comp_gate_base{0};          ///< 1 stablecoin, else 3
+    int           comp_gate_effective{0};     ///< clamp(base + offset, 0, 10)
+
+    // -- crossed-book take retry (execution::TakeRetryBook) ----------------
+    std::uint32_t take_suppressed{0};         ///< crosses being skipped NOW
+    std::uint32_t take_tracked{0};            ///< entries held for this pair
+};
+
+// ---------------------------------------------------------------------------
 // MetricsExporter -- Prometheus HTTP endpoint and metric families.
 //
 // Lifecycle:
@@ -268,7 +346,21 @@ public:
 
     /// Export the analysis-derived spread multiplier as a global metric.
     /// Called once after analysis completes; persists for the engine lifetime.
+    ///
+    /// THIS IS A STARTUP RECOMMENDATION, NOT THE LIVE MULTIPLIER.  It is
+    /// frozen for the process lifetime while the spread PID moves every
+    /// block, and the two are applied to the same spread field.  Consumers
+    /// that show a single "spread multiplier" MUST NOT use this one alone;
+    /// see MetricsStrategySnapshot::spread_pid_mult and update_strategy() below.
     void set_analysis_spread_multiplier(double mult);
+
+    /// Publish LIVE per-pair strategy-controller state.  Called every block
+    /// from Engine::step_export_metrics(), unlike update_analysis() which
+    /// fires only during startup analysis and then never again.
+    ///
+    /// Emits xop_strategy{pair_name=..., metric=...}.  See MetricsStrategySnapshot
+    /// for why each field is here and what went wrong without it.
+    void update_strategy(const std::vector<MetricsStrategySnapshot>& snaps);
 
     /// Update per-wallet spendable reserve ratio (0–1).
     void update_spendable_reserve(const std::string& wallet_label, double ratio);
@@ -406,6 +498,14 @@ private:
 
     prometheus::Family<prometheus::Gauge>* analysis_family_{nullptr};
     prometheus::Family<prometheus::Gauge>* analysis_pair_family_{nullptr};
+
+    // [S42] LIVE per-pair strategy controllers.  Deliberately a SEPARATE
+    // family from xop_analysis_pair: that one is startup observation and
+    // stops updating when trading begins, this one is current state and
+    // updates every block.  Merging them would let a consumer read a
+    // startup number as if it were live, which is the defect that motivated
+    // this family in the first place.
+    prometheus::Family<prometheus::Gauge>* strategy_family_{nullptr};
 
     // -- Wallet reserve & stuck offer gauges ---------------------------------
 

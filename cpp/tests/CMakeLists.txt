@@ -78,6 +78,8 @@ add_executable(xop_tests
     test_pnl_units.cpp
     test_pnl_tracker.cpp
     test_competitiveness_pid.cpp
+    test_competitiveness_gate.cpp
+    test_spread_mult.cpp
     test_fair_value.cpp
     test_tibetswap.cpp
     test_orderbook_mid.cpp

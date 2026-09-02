@@ -980,3 +980,89 @@ TEST(TakeRetryStorm, Cgp9WasNeverFundableAndIsAttemptedZeroTimes)
                         block, cfg).gate,
               TakeGate::Attempt);
 }
+
+// ===========================================================================
+// 11. suppressed_count -- the telemetry accessor.
+//
+// [S41 2026-09-02] The book's whole value is that it stops talking; the
+// consequence is that "how many crosses are we sitting out?" has no answer in
+// the log at any instant. These tests pin the accessor that answers it, and
+// in particular that it FALLS as well as rises -- a suppression gauge that
+// only ever climbs would misreport a healthy book as a stuck one.
+// ===========================================================================
+
+TEST(TakeRetrySuppressedCount, RisesWithSuppressionAndIsPerPair)
+{
+    TakeRetryBook book;
+    const auto cfg = live_cfg();
+
+    EXPECT_EQ(book.suppressed_count(), 0u);
+    EXPECT_EQ(book.suppressed_count(kPair), 0u);
+
+    // One unfundable cross on XCH/DBX: gate once to open the entry, and the
+    // decline suppresses it.
+    const auto d = book.gate(kPair, kStorm, kStormFp, known(kBestBal),
+                             kStormCost, 100, cfg);
+    ASSERT_NE(d.gate, TakeGate::Attempt);
+    EXPECT_EQ(book.suppressed_count(), 1u);
+    EXPECT_EQ(book.suppressed_count(kPair), 1u);
+    EXPECT_EQ(book.size(kPair), 1u);
+
+    // A second unfundable offer on the SAME pair.
+    const OfferFingerprint fp2{kStormAsk + 1, kStormSize};
+    book.gate(kPair, kFrozen, fp2, known(kBestBal), kStormCost, 101, cfg);
+    EXPECT_EQ(book.suppressed_count(), 2u);
+    EXPECT_EQ(book.suppressed_count(kPair), 2u);
+
+    // A suppressed offer on a DIFFERENT pair must not inflate this pair's
+    // gauge -- the per-pair overload is the one wired to a per-pair metric.
+    book.gate("XCH/BYC", kStorm, kStormFp, known(kBestBal), kStormCost,
+              102, cfg);
+    EXPECT_EQ(book.suppressed_count(), 3u);
+    EXPECT_EQ(book.suppressed_count(kPair), 2u);
+    EXPECT_EQ(book.suppressed_count("XCH/BYC"), 1u);
+    EXPECT_EQ(book.size(kPair), 2u);
+    EXPECT_EQ(book.size("XCH/BYC"), 1u);
+    EXPECT_EQ(book.size(), 3u);
+}
+
+TEST(TakeRetrySuppressedCount, FallsWhenTheSuppressionClears)
+{
+    TakeRetryBook book;
+    const auto cfg = live_cfg();
+
+    book.gate(kPair, kStorm, kStormFp, known(kBestBal), kStormCost, 100, cfg);
+    ASSERT_EQ(book.suppressed_count(), 1u);
+
+    // The balance arrives: the gate attempts, and the suppression lifts.  A
+    // gauge that stuck at 1 here would report a permanently blocked taker.
+    const auto ok = book.gate(kPair, kStorm, kStormFp, known(kStormCost),
+                              kStormCost, 101, cfg);
+    ASSERT_EQ(ok.gate, TakeGate::Attempt);
+    EXPECT_EQ(book.suppressed_count(), 0u);
+    EXPECT_EQ(book.suppressed_count(kPair), 0u);
+
+    // Still tracked, just not suppressed -- the two counts are distinct and
+    // only the suppressed one means "we are skipping a cross".
+    EXPECT_EQ(book.size(kPair), 1u);
+}
+
+TEST(TakeRetrySuppressedCount, DropsToZeroWhenTheOfferLeavesTheBook)
+{
+    TakeRetryBook book;
+    const auto cfg = live_cfg();
+
+    book.gate(kPair, kStorm, kStormFp, known(kBestBal), kStormCost, 100, cfg);
+    book.gate(kPair, kFrozen, kStormFp, known(kBestBal), kStormCost, 100, cfg);
+    ASSERT_EQ(book.suppressed_count(), 2u);
+
+    // The storm offer is gone from the book; the frozen one is still resting.
+    book.retain_live(kPair, {std::string(kFrozen)});
+    EXPECT_EQ(book.suppressed_count(), 1u);
+    EXPECT_EQ(book.suppressed_count(kPair), 1u);
+
+    // And a sweep that ages everything out empties the gauge.
+    book.sweep(100 + cfg.stale_after_blocks + 1, cfg);
+    EXPECT_EQ(book.suppressed_count(), 0u);
+    EXPECT_EQ(book.size(), 0u);
+}

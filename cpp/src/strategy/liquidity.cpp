@@ -1033,11 +1033,14 @@ std::vector<TierQuote> LiquidityEngine::compute_ladder(
         //
         // Safety rules become:
         //   BID: never bid above min(bbo_ref, mid) — prevents crossing
-        //        both the BBO spread AND the model mid (depth-weighted
-        //        VWAP micro-price / CEX blend).  The model mid can sit
-        //        well below the BBO midpoint when order-book depth is
-        //        asymmetric, causing offers that pass the BBO check to
-        //        be immediately cancelled by classify_tier_staleness.
+        //        both the BBO spread AND the model mid (order-book
+        //        Stoikov micro-price / CEX blend).  The model mid can sit
+        //        away from the BBO midpoint when order-book depth is
+        //        asymmetric -- it leans toward the THIN side -- causing
+        //        offers that pass the BBO check to be immediately
+        //        cancelled by classify_tier_staleness.  (Before the
+        //        2026-09-02 correction it could sit OUTSIDE the BBO
+        //        entirely; it is now interior by construction.)
         //   ASK: never ask below bbo_ref — when model mid sits ABOVE
         //        the best ask (CEX > DEX), we trust the DEX BBO for
         //        competitive ask placement.

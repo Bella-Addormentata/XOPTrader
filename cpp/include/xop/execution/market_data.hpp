@@ -345,18 +345,30 @@ struct MarketDataConfig {
     /// empty, which is exactly the state a thin or bid-only pair sits in.
     double dex_last_trade_max_age_sec{1800.0};
 
-    // -- Order-book-derived mid-price (depth-weighted VWAP micro-price) -----
+    // -- Order-book-derived mid-price (Stoikov micro-price) ----------------
+    //
+    // [2026-09-02] NOT a VWAP micro-price, whatever the surrounding prose
+    // used to say.  The estimator weights each side's TOUCH PRICE by the
+    // OPPOSITE side's top-N cumulative depth, which is a convex combination
+    // of best_bid and best_ask and is therefore interior to the book by
+    // construction.  The VWAP form these comments described was the defect
+    // (1,849 invariant-clamp firings over ~39h of live XCH/DBX); see
+    // xop/execution/orderbook_mid.hpp.  Do not re-derive it from here.
 
     /// When true, compute_mid() prefers an order-book-derived mid-price
-    /// (depth-weighted VWAP micro-price) over the simple Dexie BBO midpoint.
-    /// The order-book mid is computed from the top `orderbook_mid_depth` levels
-    /// per side of the dust-filtered competing offers.
+    /// (Stoikov micro-price: touch prices weighted by opposite-side top-N
+    /// depth) over the simple Dexie BBO midpoint.  Computed from the top
+    /// `orderbook_mid_depth` levels per side of the dust-filtered competing
+    /// offers.
     /// Default: true.
     bool orderbook_mid_enabled{true};
 
-    /// Number of order book levels per side to include in the VWAP
-    /// micro-price computation.  Higher values give a more robust estimate
-    /// at the cost of including offers further from fair value.
+    /// Number of order book levels per side over which each side's
+    /// CUMULATIVE DEPTH is summed for the micro-price weighting.  (The
+    /// per-side VWAP is still computed from these levels, but only for the
+    /// clamp diagnostic -- it is not the price the estimator weights.)
+    /// Higher values give a more robust depth measure at the cost of
+    /// including offers further from fair value.
     /// Default: 5 levels per side.
     std::size_t orderbook_mid_depth{5};
 
@@ -510,8 +522,12 @@ struct PairState {
                                     // time -- see ingest_amm_mid).
     double      amm_pool_usd{0.0};  // USD value of both pool sides, 0=unknown
 
-    // --- Order-book-derived mid (depth-weighted VWAP micro-price) ---
-    double      orderbook_mid{0.0}; // VWAP micro-price from competing offers
+    // --- Order-book-derived mid (Stoikov micro-price) ---
+    // Touch prices weighted by opposite-side top-N depth, blended toward the
+    // plain BBO midpoint as the spread widens.  NOT a VWAP micro-price --
+    // that form was unbounded and was corrected 2026-09-02; see
+    // xop/execution/orderbook_mid.hpp before changing anything here.
+    double      orderbook_mid{0.0}; // Stoikov micro-price from competing offers
 
     // --- CEX reference ---
     double      cex_mid{0.0};       // CEX mid-price (0 if unavailable)

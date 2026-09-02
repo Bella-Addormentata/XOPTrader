@@ -935,6 +935,62 @@ public:
 
     [[nodiscard]] std::size_t size() const noexcept { return entries_.size(); }
 
+    // -----------------------------------------------------------------------
+    // suppressed_count -- how many tracked offers Step 9c is CURRENTLY
+    // declining to attempt.
+    //
+    // [S41 2026-09-02] This number cannot be recovered from the log, by
+    // design.  A suppression announces itself ONCE on its edge and then only
+    // every `suppress_heartbeat_blocks`; that silence is the entire point of
+    // this book -- it is what turned 150 log lines about one doomed offer into
+    // two.  The cost is that "how many crosses are we sitting out right now?"
+    // became unanswerable at any instant, for an operator or for telemetry.
+    // Exporting it is what makes the suppression observable rather than merely
+    // quiet, and quiet-but-unobservable is how the 39h/104-failure storm went
+    // unnoticed in the first place.
+    //
+    // Deliberately recomputed by scan rather than maintained as a counter.
+    // The suppressed flag is cleared on four separate paths (resume,
+    // fingerprint change, retain_live prune, sweep eviction) and an
+    // incrementally maintained tally would have to be correct on all of them;
+    // a stale telemetry counter that says "3 suppressed" when the book is
+    // empty is worse than no counter.  The book is capped at cfg.max_entries,
+    // so this is a bounded scan on a container that is already iterated every
+    // cycle by sweep().
+    // -----------------------------------------------------------------------
+    [[nodiscard]] std::size_t suppressed_count() const noexcept
+    {
+        std::size_t n = 0;
+        for (const auto& kv : entries_) {
+            if (kv.second.suppressed) ++n;
+        }
+        return n;
+    }
+
+    /// The same count restricted to one pair.  Entries belonging to other
+    /// pairs are not this pair's business and must not inflate its gauge.
+    [[nodiscard]] std::size_t suppressed_count(std::string_view pair) const
+    {
+        std::size_t n = 0;
+        for (const auto& kv : entries_) {
+            if (kv.second.suppressed && is_pair_(kv.second, pair)) ++n;
+        }
+        return n;
+    }
+
+    /// Tracked entries for one pair, suppressed or not.  Published alongside
+    /// the suppressed count so a rising suppressed/tracked ratio is visible:
+    /// tracked-but-not-suppressed is a book being watched, suppressed is a
+    /// cross being skipped, and only the second is lost revenue.
+    [[nodiscard]] std::size_t size(std::string_view pair) const
+    {
+        std::size_t n = 0;
+        for (const auto& kv : entries_) {
+            if (is_pair_(kv.second, pair)) ++n;
+        }
+        return n;
+    }
+
     [[nodiscard]] const TakeRetryEntry* find(std::string_view pair,
                                              std::string_view offer_id) const
     {
@@ -945,6 +1001,15 @@ public:
     void clear() noexcept { entries_.clear(); }
 
 private:
+    /// Entry-belongs-to-pair test, shared by the three per-pair accessors and
+    /// matching retain_live()'s comparison exactly.
+    [[nodiscard]] static bool is_pair_(const TakeRetryEntry& e,
+                                       std::string_view      pair)
+    {
+        return e.pair.size() == pair.size()
+            && std::equal(pair.begin(), pair.end(), e.pair.begin());
+    }
+
     static std::uint32_t span_(std::uint64_t from, std::uint64_t to) noexcept
     {
         if (to <= from) return 0;

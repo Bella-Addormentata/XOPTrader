@@ -20,6 +20,7 @@
 //   ISO/IEC 25000      -- documented, single-responsibility methods
 
 #include "xop/monitoring/metrics.hpp"
+#include "xop/strategy/spread_mult.hpp"
 
 #include <spdlog/spdlog.h>
 
@@ -306,6 +307,14 @@ void MetricsExporter::register_metrics()
     analysis_pair_family_ = &prometheus::BuildGauge()
         .Name("xop_analysis_pair")
         .Help("Startup market analysis per-pair observations")
+        .Register(*registry_);
+
+    // [S42] LIVE strategy-controller state, refreshed every block.  The
+    // Help string says "live" because the adjacent xop_analysis family is
+    // NOT, and a consumer picked the wrong one for months.
+    strategy_family_ = &prometheus::BuildGauge()
+        .Name("xop_strategy")
+        .Help("Live per-pair strategy controller state (updated every block)")
         .Register(*registry_);
 
     // ---------------------------------------------------------------
@@ -718,6 +727,95 @@ void MetricsExporter::set_analysis_spread_multiplier(double mult)
     analysis_family_
         ->Add({{"metric", "recommended_spread_multiplier"}})
         .Set(mult);
+}
+
+// ===================================================================
+//  Live strategy controllers  [S42 2026-09-02]
+//
+//  Called every block from Engine::step_export_metrics().  Contrast with
+//  update_analysis() above, whose only two call sites are both inside
+//  Engine::run_startup_analysis() -- those gauges are written during the
+//  observation phase and then never again for the life of the process.
+// ===================================================================
+
+void MetricsExporter::update_strategy(
+    const std::vector<MetricsStrategySnapshot>& snaps)
+{
+    std::unique_lock lock(mtx_);
+    if (!running_) return;
+
+    for (const auto& s : snaps) {
+        const auto g = [&](const char* metric, double v) {
+            strategy_family_
+                ->Add({{"pair_name", s.pair_name}, {"metric", metric}})
+                .Set(v);
+        };
+
+        // -- the multiplier the operator actually needs ------------------
+        // Published next to the startup recommendation, never instead of
+        // it, so the two can be compared rather than confused.
+        g("analysis_spread_mult",   s.analysis_spread_mult);
+        g("spread_pid_active",      s.spread_pid_active ? 1.0 : 0.0);
+        g("spread_pid_mult",        s.spread_pid_mult);
+        g("spread_pid_ema_fill",    s.spread_pid_ema_fill);
+        g("spread_pid_integral",    s.spread_pid_integral);
+        g("spread_pid_blocks",
+          static_cast<double>(s.spread_pid_blocks));
+
+        // [2026-09-02, review] THIS IS NOT THE MULTIPLIER APPLIED TO THE
+        // SPREAD, and it is no longer named or labelled as though it were.
+        // It is the product of exactly two of Step 5's ten mutation sites --
+        // the startup analysis and the spread PID -- published because those
+        // two are the controllers an operator reasons about, and because the
+        // GUI previously showed ONE of them alone and got the direction of
+        // the adjustment wrong.
+        //
+        // Two of the eight sites it does not capture are ASSIGNMENTS (the
+        // order-book tactician, the global half-spread cap) which discard the
+        // entire chain including both of these factors.  Calling this the
+        // effective multiplier re-created the very defect the live gauges
+        // exist to remove.  For what was actually applied, use
+        // spread_applied_mult below.
+        g("analysis_x_pid_mult",
+          s.analysis_spread_mult
+          * (s.spread_pid_active ? s.spread_pid_mult : 1.0));
+
+        // What Step 5 ACTUALLY did to the spread, measured across the whole
+        // step rather than derived from any subset of its sites: the spread
+        // the optimizer produced, the spread that was posted, and the ratio.
+        // A future adjustment site -- multiplicative, assignment, clamp, or
+        // something not yet written -- is captured automatically, because
+        // this never looks at the chain.
+        //
+        // 0 means NO READING (Step 5 did not reach this pair this block), not
+        // 1.0x.  See xop/strategy/spread_mult.hpp for why the sentinel is 0.
+        g("spread_base_bps",     s.spread_base_bps);
+        g("spread_applied_bps",  s.spread_applied_bps);
+        g("spread_applied_mult",
+          strategy::applied_spread_mult(s.spread_base_bps,
+                                        s.spread_applied_bps));
+
+        // -- rail latch --------------------------------------------------
+        g("rail_latched",           s.rail_latched ? 1.0 : 0.0);
+        g("rail_side",              static_cast<double>(s.rail_side));
+        g("rail_latched_blocks",
+          static_cast<double>(s.rail_latched_blocks));
+        g("rail_suppressed",
+          static_cast<double>(s.rail_suppressed));
+        g("rail_peak_abs_integral", s.rail_peak_abs_integral);
+
+        // -- competitiveness PID ----------------------------------------
+        g("comp_pid_active",        s.comp_pid_active ? 1.0 : 0.0);
+        g("comp_pid_offset",        static_cast<double>(s.comp_pid_offset));
+        g("comp_pid_ema_fill",      s.comp_pid_ema_fill);
+        g("comp_gate_base",         static_cast<double>(s.comp_gate_base));
+        g("comp_gate_effective",
+          static_cast<double>(s.comp_gate_effective));
+
+        // -- crossed-book take retry -------------------------------------
+        g("take_suppressed",   static_cast<double>(s.take_suppressed));
+        g("take_tracked",      static_cast<double>(s.take_tracked));
+    }
 }
 
 // ===================================================================

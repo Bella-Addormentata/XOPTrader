@@ -591,22 +591,44 @@ struct StrategyConfig {
     double   fair_value_residual_widen_floor_bps{150.0};
 
     // -- Order-book micro-price blend schedule -------------------------------
-    // The order-book mid is a Stoikov micro-price: each side's top-N VWAP is
-    // weighted by the OPPOSITE side's depth, so the estimate leans toward the
-    // thin side -- the side that moves next.  That is genuinely the right
-    // estimator on a tight two-sided book and it is why it is still here.
+    // The order-book mid is a Stoikov micro-price: each side's TOUCH PRICE is
+    // weighted by the OPPOSITE side's top-N depth, so the estimate leans
+    // toward the thin side -- the side that moves next.  That is genuinely the
+    // right estimator on a tight two-sided book and it is why it is here.
     //
-    // Its information content collapses as the book widens.  "Which side is
+    // WHAT THIS SCHEDULE IS FOR -- AND WHAT IT IS NOT.  The micro-price's
+    // information content collapses as the book widens.  "Which side is
     // thinner" is a statement about the next tick; on a 1259 bps book there is
     // no next tick to speak of, and the answer says essentially nothing about
-    // fair value.  Worse, each side's VWAP lies OUTSIDE the BBO by
-    // construction (bid_vwap <= best_bid, ask_vwap >= best_ask), so once one
-    // side's depth dominates the estimate is dragged out of the book entirely:
+    // fair value.  THAT is what the schedule below addresses, and it is the
+    // only thing it addresses.
+    //
+    // It is NOT a boundedness mechanism, and must never be re-purposed as one.
+    // Until 2026-09-02 the estimator substituted each side's top-N VWAP for
+    // its touch price.  The premise usually cited for the taper is correct --
+    // each side's VWAP does lie OUTSIDE the BBO by construction (bid_vwap <=
+    // best_bid, ask_vwap >= best_ask) -- but the conclusion drawn from it, to
+    // add a clamp and taper the weight off with width, was wrong twice over:
+    //
+    //   * The right remedy was to fix the estimator.  Weighting the TOUCH
+    //     PRICES makes the result a convex combination of best_bid and
+    //     best_ask, hence bounded inside the book for every depth ratio and
+    //     every spread, with no clamp and no taper required.
+    //   * The taper cannot bound anything, because it disengages exactly where
+    //     the unbounded form was worst.  Writing d_b = best_bid - bid_vwap,
+    //     d_a = ask_vwap - best_ask and S = the spread, the old form escaped
+    //     below the bid whenever ask_depth/bid_depth > (S + d_a)/d_b -- S is
+    //     ADDITIVE IN THE NUMERATOR, so a NARROWER spread made escape EASIER.
+    //     Live XCH/DBX confirmed it: 1,849 clamp firings over ~39h, binding on
+    //     46.9% of ingests, and the taper fully disengaged at 95.3% of them.
+    //
     // BYC/wUSDC.b (~65 deep bids vs ~9 thin asks) published a "mid" of
     // 1.144728 sitting EXACTLY on its own best ask at block 9087661, against a
-    // true BYC value of ~$1.01 corroborated five independent ways.
+    // true BYC value of ~$1.01 corroborated five independent ways.  That was
+    // the unbounded estimator, not the schedule.
     //
-    // So the micro-price weight is degraded continuously with relative spread:
+    // With the estimator corrected, the weight is still degraded continuously
+    // with relative spread, purely on the information-content argument:
     //
     //     w_micro = clamp(1 - (spread_bps - narrow) / (wide - narrow), 0, 1)
     //     mid     = w_micro * microprice + (1 - w_micro) * BBO midpoint
@@ -1991,14 +2013,19 @@ struct MarketDataSettings {
     /// the pair last traded.
     double dex_last_trade_max_age_sec{1800.0};
 
-    // -- Order-book-derived mid-price (depth-weighted VWAP micro-price) -----
+    // -- Order-book-derived mid-price (Stoikov micro-price) ----------------
+    //
+    // [2026-09-02] Touch prices weighted by opposite-side top-N depth, NOT a
+    // VWAP micro-price.  The VWAP form was the defect; see
+    // xop/execution/orderbook_mid.hpp.
 
-    /// When true, the aggregator prefers a depth-weighted VWAP micro-price
+    /// When true, the aggregator prefers the order-book Stoikov micro-price
     /// from competing offers over the simple Dexie BBO midpoint.
     bool orderbook_mid_enabled{true};
 
-    /// Number of order book levels per side to include in the VWAP
-    /// micro-price computation.  Default: 5.
+    /// Number of order book levels per side over which each side's
+    /// cumulative DEPTH is summed for the micro-price weighting.
+    /// Default: 5.
     uint32_t orderbook_mid_depth{5};
 
     // -- [S20 2026-08-24] Published-mid plausibility gate --------------------

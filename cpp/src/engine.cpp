@@ -31,6 +31,7 @@
 #include "xop/execution/take_retry.hpp"
 #include "xop/execution/coin_pool_verdict.hpp"
 #include "xop/strategy/tier_gain.hpp"
+#include "xop/strategy/competitiveness_gate.hpp"
 #include "xop/execution/mid_gate.hpp"
 #include "xop/risk/valuation_authority.hpp"
 #include "xop/risk/usd_route.hpp"
@@ -4971,6 +4972,14 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
             mid, sigma, q, q_max, pin,
             Venue::Dexie, best_competing_bps,
             hour_utc, day_of_week);
+
+        // [2026-09-02, review] Capture the pre-adjustment spread HERE, before
+        // the first of Step 5's ten mutation sites.  Step 12 divides the
+        // finished spread by this to publish the multiplier that was ACTUALLY
+        // applied.  Two of those ten sites are assignments that discard the
+        // whole chain, so a multiplier derived from the chain is wrong by
+        // construction -- see xop/strategy/spread_mult.hpp.
+        pcs.spread_base_bps = pcs.spread_result.total_spread_bps;
 
         // ---------------------------------------------------------------
         // [Wall-aware retail niche premium]
@@ -10726,9 +10735,15 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             // competitiveness scale, which historically caused 100% of
             // BYC tiers to be suppressed (151 sanity rejections in
             // 0.7.45 audit).  Use a lower threshold for stablecoin pairs.
+            // [2026-09-02, review] The literal used to be written out here
+            // AND again in the Step 12 metrics export, with a comment there
+            // claiming a test kept the two in sync.  There was no such test.
+            // One definition now, in a pure header, pinned by static_assert
+            // and by test_competitiveness_gate.cpp.  Do not re-inline it.
             const PairConfig* pair_cfg_comp = find_pair_config(pair_name);
             const int kBaseCompetitivenessScore =
-                (pair_cfg_comp && pair_cfg_comp->is_stablecoin) ? 1 : 3;
+                xop::strategy::base_competitiveness_score(
+                    pair_cfg_comp && pair_cfg_comp->is_stablecoin);
 
             // [v0.7.48] Apply PID offset to the base threshold.  Negative
             // offset (underfilling) lowers the gate so more tiers post;
@@ -14827,6 +14842,19 @@ void Engine::post_ledger_genesis(
         all_assets.insert(pair.base_asset_id);
         all_assets.insert(pair.quote_asset_id);
     }
+    // [2026-09-02, review] XCH UNCONDITIONALLY, whatever the pairs are.
+    // Both fill recorders book their fee leg against a HARDCODED
+    // AssetId{"xch"} (record_maker_fill and record_taker_fill), so xch is a
+    // ledger asset on every deployment regardless of which pairs are
+    // enabled.  Seeded only from enabled pairs, a CAT/CAT-only config would
+    // leave xch out of this set while it still had a persistent DB opening
+    // from an earlier config -- and EVERY fee leg would then be silently
+    // dropped for the life of that config while the wallet's xch drained.
+    // Today's XCH/DBX config puts xch here anyway, so this changes nothing
+    // now; it stops the fee leg's asset and this set from ever diverging.
+    // Note this only RECOGNISES an existing opening (the has_ledger_opening
+    // gate below still applies) -- it cannot manufacture one.
+    all_assets.insert("xch");
     for (const auto& asset : all_assets) {
         if (db_->has_ledger_opening(AssetId{asset})) {
             ledger_opened_assets_.insert(asset);
@@ -14911,6 +14939,13 @@ void Engine::post_ledger_fill(const Fill& fill, const PairConfig& pc,
         add("fee", AssetId{"xch"}, -fill.fee_mojos);
     }
 
+    // [S44 2026-09-02] Empty here means every leg was skipped for want of an
+    // opening balance, and each skip has ALREADY warned individually above.
+    // Deliberately not escalated to ledger_incomplete_: the assets whose legs
+    // were dropped are the same assets check_ledger_invariant() excludes via
+    // has_ledger_opening(), so nothing is being hidden from a control that is
+    // watching.  See the extended note in record_taker_fill() for the full
+    // argument and for why latching here would be the worse outcome.
     if (legs.empty()) return;
 
     // A dropped fill leg is UNRECOVERABLE: the fill is not re-processed, so
@@ -14976,10 +15011,30 @@ void Engine::record_taker_fill(const std::string& strategy,
         db_->insert_taker_fill(f);
 
         // Ledger legs, keyed on the trade id so a retry cannot double-post.
+        //
+        // [S44 2026-09-02] The skip below used to be COMPLETELY SILENT --
+        // no log, no counter, no flag -- while the maker-fill twin above
+        // warns on the identical condition.  A take could write a
+        // taker_fills row backed by zero ledger legs and nothing said so.
+        // It has never fired (all 26 engine-written takes carry exactly 3
+        // legs) but it was unobservable, which is the part that had to go.
+        //
+        // WHY THIS DOES **NOT** SET ledger_incomplete_ -- see the long note
+        // after the write, and do not "finish the job" by adding it.
         std::vector<DbLedgerEntry> legs;
+        int skipped_legs = 0;
         auto add = [&](const char* leg_name, const AssetId& asset, Mojo delta) {
-            if (delta == 0) return;
-            if (!ledger_opened_assets_.count(asset)) return;
+            if (delta == 0) return;   // nothing moved: not a leg at all
+            if (!ledger_opened_assets_.count(asset)) {
+                ++skipped_legs;
+                spdlog::warn("[Engine] Ledger: skipping {} leg for {} take {} "
+                             "-- asset {} has no opening balance this session",
+                             leg_name, strategy,
+                             trade_id.substr(0,
+                                 std::min<std::size_t>(12, trade_id.size())),
+                             asset.substr(0, 12));
+                return;
+            }
             DbLedgerEntry e;
             e.entry_time   = ts;
             e.event_type   = "take";
@@ -14998,10 +15053,90 @@ void Engine::record_taker_fill(const std::string& strategy,
             add("fee", AssetId{"xch"}, -static_cast<Mojo>(fee_mojos));
         }
 
+        // A real write failure IS a ledger-incompleteness event: legs that
+        // should exist do not, for an asset that IS being reconciled.
         if (!legs.empty() && !db_->append_ledger_entries(legs)) {
             ledger_incomplete_ = true;
             spdlog::error("[Engine] Ledger: failed to post legs for {} take {} "
                           "-- ledger now INCOMPLETE", strategy, trade_id);
+        } else if (skipped_legs > 0) {
+            // ================================================================
+            //  A SKIPPED LEG IS NOT AN INCOMPLETE LEDGER.  DO NOT LATCH HERE.
+            // ================================================================
+            //  It is tempting to treat "some legs were dropped" as the same
+            //  fail-open shape as an empty collection reported as success.
+            //  It is not, and latching ledger_incomplete_ here would be
+            //  strictly worse than the silence it replaces.  Three reasons,
+            //  each independently sufficient:
+            //
+            //  1. THE SKIP IS PER-ASSET CONSISTENT.  The ledger is not a
+            //     balanced double-entry journal across assets -- legs are
+            //     independent per-asset deltas (base mojos, quote mojos, an
+            //     XCH fee) that do not sum to zero.  Each asset's ledger is
+            //     reconciled against ITS OWN wallet balance, separately.
+            //  2. THE INVARIANT DOES NOT MEASURE THE ASSETS THAT GET
+            //     SKIPPED HERE.  Stated carefully, because an earlier draft
+            //     of this comment claimed a SET EQUALITY that the code does
+            //     not provide and a future reader would have leant on it:
+            //
+            //       - the write-skip set is the complement of
+            //         ledger_opened_assets_, which is rebuilt EACH SESSION
+            //         over enabled pairs' base/quote assets plus xch;
+            //       - the control's skip set is the complement of the
+            //         PERSISTENT db_->has_ledger_opening(asset), evaluated
+            //         over cached_wallet_balances_.
+            //
+            //     Those are not the same predicate: openings are written
+            //     "once, ever", so an asset carrying a historic opening from
+            //     an earlier config is CHECKED by the control while being
+            //     SKIPPED by the leg writer -- the reverse of the claimed
+            //     equality.  What actually makes the skip safe is narrower
+            //     and is worth naming: cached_wallet_balances_ is itself
+            //     written only for enabled-pair assets and the bridge asset
+            //     (three writers -- the ladder refresh, the Step 8 pair-gate
+            //     writer, and the bridge writer), so an asset this function
+            //     refuses to write legs for is also absent from the loop the
+            //     control iterates.  It is not measured, so a dropped leg
+            //     creates no divergence and hides none.  The maker-fill twin
+            //     says the same thing: skipping "keeps the two consistent",
+            //     and the eventual opening captures the resulting balance.
+            //
+            //     THE ONE ASSET THAT COULD HAVE BROKEN THAT is the fee leg's
+            //     hardcoded xch, which is not necessarily a pair asset.  It
+            //     is now seeded into ledger_opened_assets_ unconditionally at
+            //     genesis (see the note there), so the fee leg's asset can no
+            //     longer fall out of the writer's set while the wallet
+            //     drains.
+            //  3. LATCHING WOULD DISABLE HEALTHY ACCOUNTING WHOLESALE.
+            //     ledger_incomplete_ is process-latching (nothing clears it;
+            //     the log lines say "restart to re-baseline") and it gates
+            //     FOUR things, none of them scoped to the offending asset:
+            //     reward ingest, bridge_accounting_operational(), bridge
+            //     flow ingest, and the invariant control for EVERY asset.
+            //     It also fires an ExposureBreach alert.
+            //     The failure mode is concrete, not hypothetical: a startup
+            //     wallet RPC timeout leaves an asset unopened, and that is
+            //     DOCUMENTED as having happened on this deployment
+            //     (2026-07-26T08:46, both balance queries timed out).  In
+            //     that state the first take carrying a fee leg would latch
+            //     the flag and take down the invariant control for the
+            //     healthy assets too -- turning a benign, self-correcting
+            //     per-asset gap into a session-wide accounting blackout.
+            //
+            //  What was actually wrong here was SILENCE, and silence is what
+            //  is fixed: each skip warns above, and the shape of the event is
+            //  summarised here so an all-skipped take is greppable.
+            spdlog::warn("[Engine] Ledger: {} take {} posted {} of {} legs -- "
+                         "{} skipped for want of an opening balance. The "
+                         "skipped assets are excluded from the invariant "
+                         "control too, so the books stay per-asset consistent; "
+                         "a restart opens them cleanly.",
+                         strategy,
+                         trade_id.substr(0,
+                             std::min<std::size_t>(12, trade_id.size())),
+                         legs.size(),
+                         legs.size() + static_cast<std::size_t>(skipped_legs),
+                         skipped_legs);
         }
 
         spdlog::info("[Engine] Recorded {} take: {} {} base={} quote={} "
@@ -16582,6 +16717,95 @@ void Engine::step_export_metrics(BlockHeight block_height)
     if (fee_tracker_ && fee_tracker_->enabled()) {
         metrics_->update_fees_paid_24h(
             fee_tracker_->get_rolling_total(block_height));
+    }
+
+    // ------------------------------------------------------------------
+    // Dashboard 9: LIVE strategy controllers  [S42 2026-09-02]
+    //
+    // Until now the only strategy number in telemetry was the startup
+    // analysis recommendation, published by update_analysis() from inside
+    // run_startup_analysis() and never refreshed.  On 2026-09-02 that gauge
+    // read 1.5 -- "quoting defensively wide" -- while the spread PID was
+    // railed at 0.820, the most aggressive TIGHTENING it can command, and
+    // had been for the entire retained log.  Both multiply the same field
+    // in Step 5, so the operator was shown a value that pointed the wrong
+    // way, not merely a stale one.
+    //
+    // Read-only over state this function already runs on the engine's own
+    // event-loop thread, so no additional synchronisation is introduced.
+    {
+        std::vector<MetricsStrategySnapshot> strat;
+        strat.reserve(config_.pairs.size());
+
+        for (const auto& pair : config_.pairs) {
+            if (!pair.enabled) continue;
+
+            MetricsStrategySnapshot ss;
+            ss.pair_name            = pair.name;
+            ss.analysis_spread_mult = analysis_spread_mult_;
+
+            // [2026-09-02, review] The two numbers that bracket Step 5's
+            // whole adjustment chain.  Step 12 runs after Step 5 in the same
+            // block and cycle_ is not cleared in between, so these are this
+            // block's values.  Both stay 0 when Step 5 never reached the pair
+            // (invalid quote, no mid, no pair config), and 0 is published as
+            // "no reading" -- NOT as 1.0x, which would report a healthy
+            // neutral for a block that never quoted.
+            if (const auto cit = cycle_.find(pair.name);
+                cit != cycle_.end() && cit->second.spread_base_bps > 0.0) {
+                ss.spread_base_bps    = cit->second.spread_base_bps;
+                ss.spread_applied_bps =
+                    cit->second.spread_result.total_spread_bps;
+            }
+
+            if (const auto it = spread_pid_state_.find(pair.name);
+                it != spread_pid_state_.end()) {
+                const SpreadPidState& pid = it->second;
+                ss.spread_pid_active   = config_.strategy.pid_spread_enabled;
+                ss.spread_pid_mult     = pid.current_mult;
+                ss.spread_pid_ema_fill = pid.ema_fill_rate;
+                ss.spread_pid_integral = pid.integral_error;
+                ss.spread_pid_blocks   = pid.blocks_active;
+
+                ss.rail_latched        = pid.rail.latched;
+                ss.rail_side           = static_cast<int>(pid.rail.side);
+                ss.rail_latched_blocks =
+                    pid.rail.latched_blocks(pid.blocks_active);
+                ss.rail_suppressed     = pid.rail.suppressed;
+                ss.rail_peak_abs_integral = pid.rail.peak_abs_integral;
+            }
+
+            // The Step 8 gate's base score.  NOT a mirror -- this calls the
+            // same function Step 8 calls (see
+            // xop/strategy/competitiveness_gate.hpp).  It previously WAS a
+            // mirror, guarded by a comment citing test_strategy_metrics.cpp,
+            // a file that did not exist.  If you retune the gate, retune it
+            // in the header and both sites follow.
+            ss.comp_gate_base =
+                xop::strategy::base_competitiveness_score(pair.is_stablecoin);
+            ss.comp_gate_effective = ss.comp_gate_base;
+
+            if (config_.strategy.comp_pid_enabled) {
+                if (const auto it = comp_pid_state_.find(pair.name);
+                    it != comp_pid_state_.end()) {
+                    ss.comp_pid_active   = true;
+                    ss.comp_pid_offset   = it->second.current_offset();
+                    ss.comp_pid_ema_fill = it->second.ema_fill_rate();
+                    ss.comp_gate_effective =
+                        xop::strategy::effective_competitiveness_gate(
+                            pair.is_stablecoin, ss.comp_pid_offset);
+                }
+            }
+
+            ss.take_suppressed = static_cast<std::uint32_t>(
+                crossed_book_retry_.suppressed_count(pair.name));
+            ss.take_tracked = static_cast<std::uint32_t>(
+                crossed_book_retry_.size(pair.name));
+
+            strat.push_back(std::move(ss));
+        }
+
+        metrics_->update_strategy(strat);
     }
 
     spdlog::debug("[Engine] Step 12: metrics exported");
