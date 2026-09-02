@@ -2117,6 +2117,21 @@ def test_a_pre_send_oracle_move_revalidates_the_bbo_quote():
     assert books == [], "the BBO was not refreshed after the oracle moved"
 
 
+def test_an_oracle_move_drops_the_pair_when_final_bbo_is_unreadable():
+    books = [Book(_MKT, best_bid=0.1015, best_ask=None), None]
+    c = _Client(account=_account(0.0), batch_response=_venue_ok())
+    r = _runner(
+        c,
+        oracle_fetch=lambda: {_MKT: 0.0980},
+        bbo_fetch=lambda _market: books.pop(0),
+    )
+
+    result = r.tick(1.0, {_MKT: 0.1000}, {})
+
+    assert result.action == "skip"
+    assert "batch_upsert" not in c.calls
+
+
 def test_an_accepted_two_sided_batch_reports_the_rested_credit(caplog):
     c = _Client(account=_account(100.0), batch_response=_venue_ok())
     r = _runner(c, curfew_enabled=True)

@@ -1450,6 +1450,9 @@ class QuoteRunner:
         to_cancel: list = []
         bbo_resets: list = []
         bbo_placements: set = set()
+        start_bbo_tick = getattr(self._bbo_fetch, "start_tick", None)
+        if callable(start_bbo_tick):
+            start_bbo_tick()
 
         for market, (action, _) in results.items():
             if action != LoopAction.QUOTE.value:
@@ -1963,8 +1966,13 @@ class QuoteRunner:
                 except Exception as exc:  # noqa: BLE001
                     _log.debug("permuto: final BBO fetch failed for %s: %s",
                                market, exc)
-                    continue
+                    book = None
                 if book is None:
+                    dropped.add(market)
+                    results[market] = (
+                        "skip",
+                        "oracle moved after the BBO read and the final book "
+                        "could not be read inside the tick budget")
                     continue
                 raw_specs = flags.get("specs")
                 spec = (raw_specs.get(market, {})

@@ -17,7 +17,11 @@ pytest.importorskip("PySide6")
 from PySide6.QtCore import QDeadlineTimer  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from gui.services.permuto.live import MARKETS, PermutoLive  # noqa: E402
+from gui.services.permuto.live import (  # noqa: E402
+    MARKETS,
+    PermutoLive,
+    _BudgetedBboFetcher,
+)
 
 
 @pytest.fixture(scope="module")
@@ -200,6 +204,29 @@ def test_markets_are_symbols_not_oracle_tickers():
     """Order routes answer HTTP 400 on every leg for the ticker form."""
     assert all(m.endswith("-PERP") for m in MARKETS)
     assert "QQQ-VOL" not in MARKETS
+
+
+def test_bbo_reads_share_one_sub_tick_deadline():
+    now = [0.0]
+    timeouts = []
+
+    def fetch(market, timeout):
+        timeouts.append((market, timeout))
+        now[0] += timeout
+        return market
+
+    reader = _BudgetedBboFetcher(
+        fetch=fetch,
+        clock=lambda: now[0],
+        tick_budget_s=1.0,
+        request_timeout_s=0.6,
+    )
+    reader.start_tick()
+
+    assert reader("QQQ-VOL-PERP") == "QQQ-VOL-PERP"
+    assert reader("NVDA-VOL-PERP") == "NVDA-VOL-PERP"
+    assert reader("TSLA-VOL-PERP") is None
+    assert [round(timeout, 3) for _market, timeout in timeouts] == [0.6, 0.4]
 
 
 # --------------------------------------------------------------------------- #

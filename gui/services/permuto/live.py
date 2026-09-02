@@ -67,23 +67,50 @@ REQUEST_TIMEOUT_S = 4.0
 #: already replaced.
 TICK_S = 5.0
 
+#: All BBO reads in one tick share this budget. Three independent 4-second
+#: timeouts delayed risk and oracle handling by roughly 12 seconds when the
+#: public book route degraded, despite the loop's 5-second cadence.
+BBO_TICK_BUDGET_S = 1.0
+BBO_REQUEST_TIMEOUT_S = 0.5
+
 
 class VenueStateUnreadable(RuntimeError):
     """The venue's public state could not be read well enough to quote on."""
 
 
-def _fetch_bbo(market: str):
-    """Top of book for ``market`` from /info/l2, or None on any failure.
+class _BudgetedBboFetcher:
+    """Top-of-book reads sharing one sub-tick deadline."""
 
-    Public and unauthenticated, like the oracle read beside it. Returning
-    None rather than raising is deliberate: the runner treats an unreadable
-    book as "no opinion" and falls back to the learned backoff, so a hiccup
-    on this request degrades placement quality but never stops a quote.
-    """
-    from gui.services.permuto.auth import BASE_URL
-    from gui.services.permuto.bbo import fetch_book
+    def __init__(self, *, fetch=None, clock=time.monotonic,
+                 tick_budget_s: float = BBO_TICK_BUDGET_S,
+                 request_timeout_s: float = BBO_REQUEST_TIMEOUT_S) -> None:
+        self._fetch = fetch
+        self._clock = clock
+        self._tick_budget_s = tick_budget_s
+        self._request_timeout_s = request_timeout_s
+        self._deadline = 0.0
 
-    return fetch_book(market, base_url=BASE_URL, timeout=REQUEST_TIMEOUT_S)
+    def start_tick(self) -> None:
+        self._deadline = self._clock() + self._tick_budget_s
+
+    def __call__(self, market: str):
+        if self._deadline <= 0.0:
+            self.start_tick()
+        remaining = self._deadline - self._clock()
+        if remaining <= 0.0:
+            _log.debug("permuto: BBO budget exhausted before %s", market)
+            return None
+
+        fetch = self._fetch
+        if fetch is None:
+            from gui.services.permuto.auth import BASE_URL
+            from gui.services.permuto.bbo import fetch_book
+
+            fetch = lambda symbol, timeout: fetch_book(
+                symbol, base_url=BASE_URL, timeout=timeout)
+
+        timeout = min(self._request_timeout_s, remaining)
+        return fetch(market, timeout)
 
 
 def _fetch_oracle_prices() -> dict:
@@ -393,7 +420,7 @@ class PermutoLive(QObject):
             # this the runner learns the resting price only from refusals,
             # which saturates against bids parked on the ring ceiling and
             # banked zero depth-seconds for an entire session.
-            bbo_fetch=_fetch_bbo,
+            bbo_fetch=_BudgetedBboFetcher(),
         )
         self._venue_state = venue_state or _default_venue_state
         self._thread: Optional[QThread] = None
