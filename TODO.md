@@ -1,7 +1,16 @@
 # XOPTrader Master TODO List
 
 **Created:** 2026-03-24
-**Last audited: 2026-08-29 (v0.10.5)** -- post-release operator-experience round: config hot-reload (a Settings save now applies pair DISABLES to the running engine live, cancelling their resting offers; enables and every other field are honestly reported as restart-required -- the 2026-08-25 "disable landed on disk but the engine kept quoting" hole), and allocation zeroing (a disabled pair's asset is applied as a 0% target while hidden from Target Portfolio Allocation; its saved percent returns when the pair does).
+**Last audited: 2026-09-01 (PRs #132/#133/#135)** -- the Permuto contest
+session. The account was LIQUIDATED to zero equity that morning, so depth
+ended at 4,093.892 against a 300,000,000 gate and no code change can
+restart it without re-funding. Findings **P1-P5** at the end of this file
+are what has to be true before the second account runs: P1 and part of P2
+ship in #135, while P3, P4 and P5 are open and each needs its own PR.
+(#134 audits the same day from the dexie side and numbers its findings
+S38/S39; the two series do not overlap.)
+
+**Previously audited: 2026-08-29 (v0.10.5)** -- post-release operator-experience round: config hot-reload (a Settings save now applies pair DISABLES to the running engine live, cancelling their resting offers; enables and every other field are honestly reported as restart-required -- the 2026-08-25 "disable landed on disk but the engine kept quoting" hole), and allocation zeroing (a disabled pair's asset is applied as a 0% target while hidden from Target Portfolio Allocation; its saved percent returns when the pair does).
 
 **Previously audited: 2026-08-29 (v0.10.0)** -- the seven-PR review cycle merged:
 #115 (peg registry, S29/S30), #117 (S27+S32), #120 (S28), #121 (S31), #118
@@ -538,3 +547,104 @@ catch-up -- the same persisted wallet-effect event closes both windows.
   deployment runs ~17-21 s/block, so the real TTL is ~3.5-4 h not 10.4 h;
   the carry TTL cannot fire for BYC itself because quote_usd_factor's par
   fallback always reports a live price.
+
+
+## Permuto contest, 2026-09-01 -- the account was liquidated, and what that taught
+
+**The headline is not a code finding.** The contest account
+(`b3edfaa8...9001`) reached **equity 0, balance 0, position 0** on
+2026-09-01, with `realized_pnl -1,218,420` and `total_pnl` floored at
+**-500,000** -- the entire starting allocation. Depth froze permanently at
+**4,093.892** against a 300,000,000 gate. Only 3 of 41 market makers were
+in that state and median MM equity was still exactly 500,000, so this was
+NOT a venue-wide reset like the 2026-08-30 `batch_failed` incident.
+
+Last observable state before the log died (2026-08-31 19:55, GUI still
+running): the venue refusing every batch with *"Carried-session stress
+margin: need 5,394,844 USDC to survive 8x index move (available
+591,782)"* -- the carried short needed ~9x the cash on hand. The oracle
+then gapped **+73% to +229%** at the open, which is the direction that
+destroys a short.
+
+`risk.assess()` returns FLATTEN on `not (equity_usd > 0.0)`, so with
+equity at zero no config, mode or PR produces a single quote. Depth
+cannot restart without the account being re-funded.
+
+**A second account exists on another machine.** The work below is what
+has to be true before it runs.
+
+### P1: max_position_usd is PER MARKET and nothing aggregated it
+Three markets at the shipped 250,000 authorise **750,000 of exposure on a
+500,000 account** -- 1.5x equity before the venue's 8x carried multiplier,
+with every individual market perfectly inside its own limit. That is a
+liquidation no per-market check can see, and it is the likeliest shape of
+the one already suffered.
+- **Status:** `[x]` PR #135 -- `portfolio_cap_usd()` reduces each market's
+  cap by what the rest of the book holds, denominated in EQUITY because
+  that is what the venue liquidates against. Risk-INCREASING legs are
+  clamped to remaining headroom; reducing legs never are, or the book is
+  trapped at the moment it is trying to get back inside.
+
+### P2: the overnight cap is a one-way ratchet, denominated in ~21 legs
+Overnight flow is one-directional -- buyers lift our ask, nothing sells
+back against a frozen oracle -- so the short room drains. Each leg is
+`target_depth_usd` = $1,200 against a `0.10 x 250,000` = $25,000 overnight
+short cap: **~21 lifted asks** and the market pins one-sided, earning
+EXACTLY ZERO because credit is `min(bid, ask)`. Simulated at a
+conservative 2 lifts/market/hour: **135M depth-seconds against 227M**, the
+last ~5 hours at zero.
+- **Cutting the position cap makes this WORSE, not safer.** At 25,000 the
+  overnight short cap is $2,500 -- about **two** legs.
+- **Status:** `[~]` PR #135 makes the pin announce itself once (entry and
+  recovery) instead of hiding in a per-tick line that repeats all night
+  while the tick still reports `action="quote"`. The RATCHET itself is
+  unfixed: see P3.
+
+### P3: decide() re-quotes on absolute distance, not on drift
+`drift = abs(price - view.oracle) / view.oracle` cannot tell a leg
+DELIBERATELY placed wide from one the oracle moved away from -- and
+overnight the oracle is frozen, so there is no drift at all. That single
+check is also currently the only thing keeping a leg inside the ring.
+Splitting it into an absolute ring bound plus a true
+drift-since-placement measure would let the ask retreat toward the ring
+edge, where **credit is flat and fills are rarer** -- the actual
+anti-ratchet, and the same root cause as the anti-cross retreat being
+capped at 0.96% of a 2% ring.
+- **Status:** `[ ]` Core quoting-loop change; own PR, own review round.
+
+### P4: RestingQuote records prices only, and two fixes are blocked on it
+No `reduce_only` flag, no size. Consequently nothing can prove a resting
+leg still fits a cap that has shrunk under it (RAMP's caps shrink
+CONTINUOUSLY while the stage stays RAMP -- measured 6000 -> 3200 between
+T-2400s and T-1000s), and nothing can distinguish a lone reduce-only
+quote from an ordinary one (so exempting it from `risk_forced` risks an
+order filling THROUGH flat into opposite exposure).
+- Both were attempted on 2026-09-01 and **reverted** rather than shipped
+  on state that does not exist.
+- **Status:** `[ ]` Populate from the venue in `reconcile()`; then both
+  revalidations become straightforward.
+
+### P5: close_out.py accumulates guards where it should validate once
+**Thirteen** defects of one shape -- a value that could not be read
+treated as a value meaning something. Six in `read_positions`
+(2026-08-31), then on 2026-09-01: blank market key dropped with live
+size; absent size collapsed by `or 0.0`; empty/non-dict acknowledgement
+counted as sent; `+inf` lot passing a `lot == lot` guard; boolean
+position; boolean fill quantity; a non-empty-but-junk fills list counted
+as acceptance. Two parsers of one field drifted apart twice
+(`order_verdict` vs `filled_size`; close vs runner on `market`/`symbol`).
+- Every one was real and every one is fixed. The COUNT is the argument.
+- **Status:** `[ ]` Rewrite as validated conversions, one rule stated
+  once. Not a patch, and not inside an active review cycle -- PR #132
+  took 34 findings across 16 rounds, several of them defects introduced
+  by the previous round's fix.
+
+### Verification note, recorded because it changes what "tested" means here
+Six tests written on 2026-09-01 passed with their bug reinstated, four of
+them written specifically to prove a fix. The cause was mutating by
+DELETING a mechanism, which proves a test touches code but not that it
+catches the defect; the check that works is reinstating the PREVIOUS
+BUGGY VERSION. Also: two consecutive "0 new comments" review rounds on
+#132 were read as convergence and reported as such, and the next round
+found a design-level hole in the same code -- a stale resting order could
+fill after "Close all" and recreate the exposure.

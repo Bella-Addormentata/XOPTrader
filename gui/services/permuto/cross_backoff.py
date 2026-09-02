@@ -112,16 +112,34 @@ class CrossBackoff:
 
 
 def headroom_pct(ring_pct: float, half_spread_pct: float,
-                 skew_frac_abs: float = 0.0) -> float:
+                 skew_frac_abs: float = 0.0,
+                 tick_size_frac: float = 0.0) -> float:
     """How far out we may push before the leg leaves the credit ring.
 
     The skew already applied to this pair is subtracted, because backoff and
     skew both push in the same direction for the trailing leg and the ring
     does not care which of them was responsible for the leg landing outside
-    it. Never negative -- a spread wider than the ring has no room at all,
-    and returning a negative would invert the retreat into an advance.
+    it. A tick margin is also reserved: ``quote_ladder`` rounds asks UP and
+    bids DOWN, so the quantised price can be up to one tick further out than
+    the unrounded price -- a bound that does not account for that rounding
+    still lets the leg land outside the ring after quantisation.  Never
+    negative -- a spread wider than the ring has no room at all, and
+    returning a negative would invert the retreat into an advance.
     """
     if not (ring_pct > 0.0):
         return 0.0
-    room = ring_pct - abs(half_spread_pct) - abs(skew_frac_abs) * 100.0
+    # [review] MULTIPLICATIVE, because the offsets compose that way. The
+    # ladder prices against an ALREADY SKEWED reference, so the trailing leg
+    # sits at oracle * (1 + skew) * (1 + offset), not oracle * (1 + skew +
+    # offset). Subtracting them additively overstated the room: at the
+    # 0.96% max skew and the 0.79% additive "headroom" the ask landed
+    # (1.0096 * 1.0104 - 1) = 2.0100% from the true oracle -- OUTSIDE the
+    # 2% credit ring, earning nothing. A bound that lets the leg out of the
+    # ring is the exact failure this function exists to prevent.
+    skew = abs(skew_frac_abs)
+    allowed = (1.0 + ring_pct / 100.0) / (1.0 + skew)
+    # [review] Reserve one tick so the ask-ceil in quote_ladder cannot push
+    # the quantised price past the ring boundary.
+    tick_pct = abs(tick_size_frac) * 100.0
+    room = (allowed - 1.0) * 100.0 - abs(half_spread_pct) - tick_pct
     return room if room > 0.0 else 0.0
