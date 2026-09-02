@@ -759,6 +759,21 @@ cannot restart without the account being re-funded.
 **A second account exists on another machine.** The work below is what
 has to be true before it runs.
 
+### S45: every crossed-book TAKE is invisible in the GUI, because the offers view is maker-only
+- **Files:** `gui/widgets/order_panel.py:112` and `:930` (the `status == "filled"` filter), `gui/services/database_service.py:330` and `:1089` (the same aggregate), `cpp/src/engine.cpp` `record_taker_fill` (writes `taker_fills`, never `offer_log`)
+- **Reported by the operator 2026-09-02:** an offer was accepted at 06:19 CDT and did not appear in the list of filled offers. **The data is fine; the view is maker-only.** Traced end to end:
+  - `taker_fills` id=608, `taken_at 2026-09-02T11:19:36.062Z` (= 06:19:36 CDT), pair XCH/DBX, counterparty offer `79Yxe3DK4PaMKcvziiMgjGVtbjasW4ucVQTgB7DeYjP5`.
+  - Reconciles EXACTLY against the Dexie API: that offer is `status: 4` (taken), `offered XCH 1`, `requested DBX 84.175`; we recorded `base_delta +1,000,000,000,000` (1 XCH), `quote_delta -84,175` (84.175 DBX), `price 84.175`, `fee 874,627`. All three `ledger_entries` legs are present (base, quote, fee).
+  - **We were the TAKER.** We accepted someone else's offer; nobody accepted ours. `offer_log` holds only offers WE post, so a take correctly has no row there -- and the GUI's list filters exactly that table on `status == "filled"`. **`taker_fills` is read NOWHERE in `gui/`** (verified by grep across the whole package).
+- **Scope: all 23 `crossed_book` takes ever executed are invisible in that view**, as are the `cross_stable`, `peg_arb` and recovery takes. For contrast, the last genuine MAKER fill was **2026-08-26 09:40:19** -- a week before the report -- so an operator watching that list has seen nothing for a week while the bot was trading.
+- **Not a data-loss defect and not caused by anything in PR #134.** Nothing in this branch touches the GUI's offer list. Recording is complete; only the presentation is maker-shaped.
+- **Third instance of the same theme.** S42 records that `append_log()` has zero callers and that the analysis gauges publish once at startup, so the GUI shows a frozen startup recommendation where an operator expects live state. The pattern is that the GUI reports the *maker quoting loop* and is silent about everything else the engine does.
+- **Status:** `[ ]` -- OPEN, deferred to the next release by the operator on 2026-09-02.
+  - **Preferred fix:** union `taker_fills` into the fills view with an explicit MAKER/TAKER column, so one list answers "what did we trade". A separate "takes" section is the cheaper alternative but leaves the operator correlating two lists by timestamp.
+  - Carry the `strategy` column through (`crossed_book`, `cross_stable`, `peg_arb`, recovery) -- it is the only thing that says WHY a take happened, and the four paths have different risk profiles.
+  - **Do not** synthesise `offer_log` rows for takes to make them appear. `offer_log` means "an offer we posted" and its `status`/`cancel_reason`/`competitiveness_score` columns are meaningless for a take; faking rows there would corrupt every fill-rate and competitiveness statistic that reads the table, including the 0.39% figure S39(b) rests on.
+- **Related and NOT deferred:** the take path itself had an inert size cap (S40). Fixed on this branch but **not deployed** -- the running binary predates it. Today's take was 1 XCH against a 5 XCH cap so it was recorded truthfully; a larger one would not have been. That is a deployment argument, not a GUI one.
+
 ### P1: max_position_usd is PER MARKET and nothing aggregated it
 Three markets at the shipped 250,000 authorise **750,000 of exposure on a
 500,000 account** -- 1.5x equity before the venue's 8x carried multiplier,
