@@ -26,6 +26,11 @@
 #ifndef XOP_STRATEGY_BBO_SANITY_HPP
 #define XOP_STRATEGY_BBO_SANITY_HPP
 
+#include <algorithm>   // std::min, in the passive safe-harbor branch below.
+                       // Was missing: the header compiled only because every
+                       // existing includer happened to pull <algorithm> in
+                       // first, which is the include-order-dependent break
+                       // that shows up on one toolchain and not the other.
 #include <cmath>
 
 namespace xop::strategy {

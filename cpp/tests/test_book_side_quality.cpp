@@ -13,15 +13,20 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <limits>
 #include <string>
 #include <vector>
 
+#include "xop/config.hpp"
 #include "xop/execution/book_side_quality.hpp"
 #include "xop/execution/market_data.hpp"
 #include "xop/state.hpp"
+#include "xop/strategy/bbo_sanity.hpp"
+#include "xop/strategy/liquidity.hpp"
 
 using xop::bookside::classify_sides;
 
@@ -911,4 +916,692 @@ TEST(BookSideQualityFeed, DisablingTheBypassDoesNotBlackOutValuation)
 
     EXPECT_TRUE(snap.mid_valuation_grade)
         << "turning the bypass off must not zero every USD figure in the bot";
+}
+
+// ===========================================================================
+// [review round 8, PR #134] THE MIXED-GENERATION READ, PINNED END TO END.
+//
+// Step 7 and Step 8 read the per-side verdict from TWO DIFFERENT STORES:
+//
+//   Step 7  engine.cpp -> market_data_->get_competing_book(pair)
+//             cached filtered offers + the verdict measured on THOSE offers,
+//             under mtx_competitors_, written only by ingest_competing_offers.
+//   Step 8  engine.cpp -> state_->get_market(pair)
+//             a MarketSnapshot published from PairState under mtx_pairs_,
+//             whose verdict ingest_dexie() resets to (true, true, ref=0) on
+//             EVERY raw ticker poll.
+//
+// Step 1 calls both ingests inside one try block and its catch only WARNS, so
+// after [successful filtered ingest -> raw ticker -> offers fetch failure] the
+// two stores hold different generations and the cycle proceeds anyway. That is
+// deterministic, not a race.
+//
+// RawTickerIngestClearsAStaleDisqualification above pins only the snapshot
+// half. It says nothing about what get_competing_book() returns in that state,
+// what ladder Step 7 then builds, or what Step 8 does to it. This fixture pins
+// all of that TOGETHER, because the safety argument is a property of the PAIR
+// and cannot be stated about either half alone:
+//
+//   Step 7's verdict re-references the ladder: a disqualified side replaces
+//   the BBO midpoint with the model mid for BOTH the bid cap and the ask
+//   floor (liquidity.cpp, the competitive anchor block). That is USUALLY a
+//   tightening, but it is a re-reference, not a direction -- on a crossed
+//   competing book the BBO midpoint falls BELOW the model mid and the
+//   disqualified branch raises the bid cap instead. Nothing in compute_ladder
+//   enforces the uncrossed precondition; the `mid` parameter is whatever the
+//   caller passes.
+//   Step 8's verdict likewise re-references: it decides which price each tier
+//   is measured against, and only then vetoes (classify_tier returns Pass or
+//   Suppress; Check 1 only ever clears). It never prices a tier.
+//
+// [review round 9] BOTH halves RE-REFERENCE BEFORE THEY JUDGE, so the two
+// policies DO NOT NEST. An earlier revision of this comment, and of the one
+// at the Step 7 site in engine.cpp, claimed the mix "yields a SUBSET of what
+// adopting the stale verdict in Step 8 would admit. Fail-closed." That is
+// false on this fixture's OWN book -- see TheTwoPoliciesAdmitNonNestedSets
+// below, which measures the admitted intervals directly:
+//
+//     BID  fresh [1.0500, 3.2498]  vs  stale [0.9872, 1.6500]  -- neither
+//                                                                 contains
+//                                                                 the other
+//     ASK  fresh [4.4996, 6.4994]  vs  stale [1.2692, 1.8333]  -- DISJOINT
+//
+// The subset relation observed in Step8VetoesAsksTheStaleVerdictWouldAdmit is
+// a property of WHERE THIS FIXTURE'S SIX TIERS LAND, not of the policies. The
+// mix is still kept deliberately, on a bound rather than a nesting: the reset
+// triple is the legacy pre-SIDEQUALITY verdict, so Step 8 is never worse than
+// what shipped before this work. See the round-9 comment in engine.cpp.
+//
+// The book does NOT move in this fixture, and that is the point: the offers
+// ENDPOINT threw, the market did not reprice. So the raw ticker reports the
+// same 1.50 / 4.9995 the filtered fetch saw last cycle -- self-inclusive and
+// unscreened, hence the reset.
+// ===========================================================================
+
+namespace {
+
+// Mirrors make_anchor_config(3) + make_sidequality_config() in
+// test_liquidity.cpp, where the ladder-side behaviour asserted below is
+// independently pinned (BookSideQualityLadder.*). Production runs 8000 bps,
+// not the 500 default, and the gate matters: |1.50 - 1.41141912| / 1.41141912
+// = 628 bps, which 500 would reject outright and mask the behaviour.
+LiquidityConfig mg_ladder_config() {
+    LiquidityConfig cfg;
+    cfg.num_tiers        = 3;
+    cfg.tier_spacing_bps = {50.0, 100.0, 150.0};
+    cfg.tier_size_pct    = {1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0};
+    cfg.competitive_anchor_enabled          = true;
+    cfg.competitive_anchor_stride_bps       = 65.0;
+    cfg.competitive_anchor_max_distance_bps = 8000.0;
+    cfg.gap_aware_spacing        = false;
+    cfg.adverse_selection_sizing = false;
+    cfg.fill_rate_sizing         = false;
+    return cfg;
+}
+
+// The Step-7 fair-value centre: 1.41141912, solved WITHOUT book input. Not
+// the published mid -- on this book those are wildly different numbers, which
+// is the round-5 correction recorded in book_side_quality.hpp.
+//
+// [review round 9] WHY THIS IS THE REACHABLE VALUE AND get_mid_price() IS NOT.
+// Two reviews have now read engine.cpp:6295 --
+//
+//     double market_mid = market_data_->get_mid_price(pair_name);
+//
+// -- concluded that Step 7 centres on the published mid (3.24975 here), and
+// filed this fixture as pinning a state the code cannot reach. It does not
+// stop there. engine.cpp REASSIGNS market_mid before the ladder ever sees it:
+//
+//     market_mid = blend.center;      // fv::blend_quote_center
+//
+// and only then converts it to mid_mojos for compute_ladder. The blend is an
+// inverse-variance weighted mean in log space of (book mid, book sigma) and
+// (external solve, solve sigma), and quote_center_blend_enabled defaults true.
+// On THIS book the 1.5000/4.9995 spread is 10,768 bps, so book_sigma is
+// ~5,384 bps and the book's own opinion is worth almost nothing. Running the
+// real blend_quote_center against it:
+//
+//     ext_sigma  100bps -> w_external 0.9997 -> centre 1.41063
+//     ext_sigma  200bps -> w_external 0.9986 -> centre 1.41185
+//     ext_sigma  467bps -> w_external 0.9925 -> centre 1.41905
+//
+// 1.41141912 sits inside that range (ext_sigma ~180 bps). A centre near the
+// anchor is not merely reachable on a book this dislocated, it is the ONLY
+// thing the blend can produce. The published mid is what the blend takes as
+// its low-confidence input, not what Step 7 quotes around.
+constexpr Mojo kMgCentre = 1'411'419'120'000LL;
+
+Mojo mg_to_mojos(double price) {
+    return static_cast<Mojo>(
+        std::llround(price * static_cast<double>(kMojosPerXch)));
+}
+
+std::vector<TierQuote> mg_ladder(bool bid_side_ok, bool ask_side_ok,
+                                 const std::vector<CompetingOffer>& offers) {
+    auto cfg = mg_ladder_config();
+    cfg.book_bid_side_anchor_ok = bid_side_ok;
+    cfg.book_ask_side_anchor_ok = ask_side_ok;
+    LiquidityEngine engine("XCH/BYC", cfg);
+    return engine.compute_ladder(
+        kMgCentre, 0.03, 0.5,
+        100'000'000'000'000LL, 100'000'000'000'000LL,
+        offers, cfg);
+}
+
+// A faithful replica of engine.cpp's Step 8 BBO-proximity block: pick the
+// references ONCE via bookside::step8_references, run Check 1 (all-or-nothing
+// on the PUBLISHED mid), then Check 2 (per tier, per side). The Engine cannot
+// be constructed from a test (TODO S36), so the policy is reproduced from the
+// same two pure functions the Engine calls, in the same order.
+struct Step8Outcome {
+    std::vector<TierQuote> survivors{};
+    bool   mid_check_ran{false};
+    bool   mid_check_fired{false};
+    double mid_dev{0.0};
+};
+
+Step8Outcome mg_step8(const std::vector<TierQuote>& tiers,
+                      bool bid_ok, bool ask_ok, Mojo side_ref,
+                      Mojo published_mid, Mojo best_bid, Mojo best_ask) {
+    // The shipped thresholds, not invented ones.
+    //
+    // [review round 9] MODELLING LIMIT, stated so it is not mistaken for
+    // coverage: engine.cpp prefers the PER-PAIR overrides
+    // (bbo_sanity_max_aggressive_dev_override / _max_passive_dev_override on
+    // PairConfig) and falls back to these strategy-level values only when the
+    // pair sets none. This replica models the fallback path only. Since every
+    // relation pinned in this section turns on whether a tier routes to the
+    // aggressive cap or the passive one, a pair carrying overrides can sit on
+    // the other side of that boundary with these tests still green. The
+    // mid-dev threshold is correctly global-only in both.
+    const StrategyConfig sc{};
+    const double kMaxAggressiveDev = sc.bbo_sanity_max_aggressive_dev;
+    const double kMaxPassiveDev    = sc.bbo_sanity_max_passive_dev;
+    const double kMaxMidDev        = sc.bbo_sanity_max_mid_dev;
+
+    const Mojo bbo_mid_m = (best_bid + best_ask) / 2;
+    const auto s8 = xop::bookside::step8_references(
+        bid_ok, ask_ok,
+        static_cast<double>(side_ref),
+        static_cast<double>(bbo_mid_m),
+        static_cast<double>(best_bid),
+        static_cast<double>(best_ask));
+    const Mojo eff_bbo_mid =
+        static_cast<Mojo>(std::llround(s8.effective_mid));
+
+    Step8Outcome out;
+    out.mid_check_ran = s8.run_mid_check;
+    std::vector<TierQuote> working = tiers;
+
+    // Check 1: model mid vs BBO mid. Clears EVERYTHING when it fires.
+    if (published_mid > 0) {
+        out.mid_dev = std::abs(static_cast<double>(published_mid)
+                               - static_cast<double>(bbo_mid_m))
+                    / static_cast<double>(bbo_mid_m);
+        if (s8.run_mid_check && out.mid_dev > kMaxMidDev) {
+            out.mid_check_fired = true;
+            working.clear();
+        }
+    }
+
+    // Check 2: per-tier BBO proximity, referenced per side.
+    for (const auto& tier : working) {
+        const Mojo ref = static_cast<Mojo>(std::llround(
+            tier.side == Side::Bid ? s8.bid_tier_ref : s8.ask_tier_ref));
+        const auto verdict = xop::strategy::classify_tier(
+            tier.side != Side::Bid,
+            static_cast<double>(tier.price),
+            static_cast<double>(ref),
+            static_cast<double>(eff_bbo_mid),
+            kMaxAggressiveDev, kMaxPassiveDev);
+        if (verdict == xop::strategy::BboVerdict::Pass) {
+            out.survivors.push_back(tier);
+        }
+    }
+    return out;
+}
+
+std::string mg_key(const TierQuote& tq) {
+    return std::string(tq.side == Side::Bid ? "B" : "A")
+         + std::to_string(static_cast<int>(tq.tier_index))
+         + "@" + std::to_string(tq.price);
+}
+
+std::vector<std::string> mg_keys(const std::vector<TierQuote>& tiers) {
+    std::vector<std::string> out;
+    out.reserve(tiers.size());
+    for (const auto& tq : tiers) out.push_back(mg_key(tq));
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+bool mg_is_subset(const std::vector<TierQuote>& sub,
+                  const std::vector<TierQuote>& super) {
+    const auto a = mg_keys(sub);
+    const auto b = mg_keys(super);
+    return std::includes(b.begin(), b.end(), a.begin(), a.end());
+}
+
+// The exact sequence: filtered ingest SUCCEEDS, then a raw ticker lands, then
+// the offers fetch THROWS (modelled as the absence of a second
+// ingest_competing_offers -- a throw is the only way to skip that write; an
+// EMPTY result still writes, and would clear the verdict honestly).
+//
+// ingest_reference_anchor, not ingest_cex_reference: with no CEX leg the
+// published mid IS the BBO midpoint, so Check 1's deviation is identically
+// zero and it cannot fire. That isolates the Check 2 asymmetry below instead
+// of letting an all-or-nothing Check 1 mask it -- and it models XCH/DBX, the
+// shipped pair, which has no CoinGecko mapping.
+
+}  // namespace
+
+TEST(BookSideQualityMixedGeneration, Step7AndStep8SeeDifferentVerdicts)
+{
+    State state;
+    MarketDataFeed feed(sq_cfg(), state);
+    const std::string pair = "XCH/BYC";
+
+    feed.ingest_block_height(100);
+    feed.ingest_reference_anchor(pair, /*implied_cross=*/kAnchor,
+                                 /*peg_target=*/0.0);
+    feed.ingest_competing_offers(pair, dislocated_book(), {},
+                                 kMojosPerXch, 1'000);
+    feed.refresh({pair});
+    ASSERT_FALSE(state.get_market(pair).ask_side_anchor_ok)
+        << "precondition: the filtered ingest must disqualify the junk ask";
+
+    // The offers fetch throws; only the raw ticker lands, reporting the same
+    // book (self-inclusive, unscreened).
+    feed.ingest_dexie(pair, 1.5000, 4.9995, 0.0, 0.0);
+    feed.refresh({pair});
+
+    const auto comp_book = feed.get_competing_book(pair);  // Step 7's read
+    const auto snap      = state.get_market(pair);         // Step 8's read
+
+    // -- Step 7's half: the cached book AND the verdict that measured it.
+    ASSERT_FALSE(comp_book.offers.empty())
+        << "nothing clears competing_offers_, so the stale book must survive";
+    ASSERT_TRUE(comp_book.bid_side_anchor_ok);
+    ASSERT_FALSE(comp_book.ask_side_anchor_ok)
+        << "PRECONDITION, not an expectation: if the two-sides-agree bypass "
+           "ever fires on this book both sides come back trusted, the two "
+           "arms below collapse onto each other, and this whole fixture "
+           "becomes vacuous";
+    ASSERT_GT(comp_book.book_side_ref, 0.0)
+        << "the verdict must carry the anchor that produced it";
+
+    // -- Step 8's half: reset to the legacy triple by the raw ticker.
+    EXPECT_TRUE(snap.bid_side_anchor_ok);
+    EXPECT_TRUE(snap.ask_side_anchor_ok);
+    EXPECT_EQ(snap.book_side_ref, 0);
+
+    // -- The divergence itself, stated as the fact the engine consumes.
+    EXPECT_NE(comp_book.ask_side_anchor_ok, snap.ask_side_anchor_ok)
+        << "the two stores must be observably out of step here -- if they "
+           "agree, either ingest_dexie now clears the offer store (option b, "
+           "which re-opens the round-5 desync) or Step 7 has been re-pointed "
+           "at the snapshot (the tertiary mutation)";
+}
+
+TEST(BookSideQualityMixedGeneration, Step7BuildsTheConservativeLadderFromTheCachedPairing)
+{
+    State state;
+    MarketDataFeed feed(sq_cfg(), state);
+    const std::string pair = "XCH/BYC";
+
+    feed.ingest_block_height(100);
+    feed.ingest_reference_anchor(pair, kAnchor, 0.0);
+    feed.ingest_competing_offers(pair, dislocated_book(), {},
+                                 kMojosPerXch, 1'000);
+    feed.refresh({pair});
+    feed.ingest_dexie(pair, 1.5000, 4.9995, 0.0, 0.0);
+    feed.refresh({pair});
+
+    const auto comp_book = feed.get_competing_book(pair);
+    const auto snap      = state.get_market(pair);
+    ASSERT_FALSE(comp_book.ask_side_anchor_ok);
+
+    // ARM 2 -- what ships. Step 7 pairs the cached offers with the verdict
+    // that measured them, so the disqualified ask side may not build bbo_ref;
+    // it falls back to the model mid and bid_cap tightens to it.
+    const auto shipped = mg_ladder(comp_book.bid_side_anchor_ok,
+                                   comp_book.ask_side_anchor_ok,
+                                   comp_book.offers);
+    ASSERT_FALSE(shipped.empty())
+        << "a disqualified side must not empty the ladder -- quoting "
+           "correctly beats not quoting";
+    for (const auto& tq : shipped) {
+        if (tq.side != Side::Bid) continue;
+        EXPECT_LE(tq.price, kMgCentre)
+            << "bid tier " << static_cast<int>(tq.tier_index) << " at "
+            << tq.price << " sits above the fair-value centre " << kMgCentre
+            << " -- the ~6.3% overpay the cap exists to stop";
+    }
+    const bool shipped_has_ask = std::any_of(
+        shipped.begin(), shipped.end(),
+        [](const TierQuote& tq) { return tq.side == Side::Ask; });
+    EXPECT_TRUE(shipped_has_ask) << "the ask side must still be quoted";
+
+    // ARM 3 -- the "fix it back onto one snapshot" edit: same stale offers,
+    // but the verdict taken from the snapshot (true/true). This is the legacy
+    // path, and on this book it SELF-CROSSES: every bid anchors at
+    // best_comp_bid + 1 tick = 1.5001, above the ask tiers around 1.4185, and
+    // the post-adjustment cross check drops all six tiers.
+    const auto collapsed = mg_ladder(snap.bid_side_anchor_ok,
+                                     snap.ask_side_anchor_ok,
+                                     comp_book.offers);
+    EXPECT_TRUE(collapsed.empty())
+        << "re-pointing Step 7 at the snapshot must reproduce the legacy "
+           "self-cross (see BookSideQualityLadder."
+           "UnexaminedBookSelfCrossesAndLosesTheWholeLadder); if this now "
+           "quotes, the stale book is no longer poisonous and the arm above "
+           "proves nothing";
+
+    // [review round 9] DELIBERATELY NOTHING FURTHER HERE. This test used to
+    // close with
+    //
+    //     ASSERT_NE(shipped.size(), collapsed.size());
+    //
+    // described as "the price relation, not merely as inequality" while in
+    // fact comparing cardinalities. It could not fail for any reason the
+    // ASSERT_FALSE(shipped.empty()) and EXPECT_TRUE(collapsed.empty()) above
+    // had not already reported -- the "asserted what an earlier check
+    // guaranteed" shape this project mutation-hunts for.
+    //
+    // It was briefly replaced with a max-bid-vs-kMgCentre check, which is no
+    // better: the disqualified branch sets bid_cap = min(bbo_ref, mid) = the
+    // centre, so every bid is BELOW the centre by clamp, unconditionally, and
+    // the per-bid EXPECT_LE loop in ARM 2 already states it. Verified by
+    // mutation: reverting the SIDEQUALITY bbo_ref/bid_cap fallback in
+    // liquidity.cpp is caught at ASSERT_FALSE(shipped.empty()) instead --
+    // the ladder self-crosses and empties before any price relation is
+    // reachable. The difference in KIND between the two arms (one quotes,
+    // the other quotes nothing) IS the assertion, and it is already made.
+}
+
+// Named for what it measures. It was called
+// Step8VetoesAStrictSubsetOfWhatTheStaleVerdictWouldAdmit and labelled "THE
+// INVARIANT"; it is neither an invariant nor primarily about subsetting --
+// see TheTwoPoliciesAdmitNonNestedSets below.
+TEST(BookSideQualityMixedGeneration, Step8VetoesAsksTheStaleVerdictWouldAdmit)
+{
+    State state;
+    MarketDataFeed feed(sq_cfg(), state);
+    const std::string pair = "XCH/BYC";
+
+    feed.ingest_block_height(100);
+    feed.ingest_reference_anchor(pair, kAnchor, 0.0);
+    feed.ingest_competing_offers(pair, dislocated_book(), {},
+                                 kMojosPerXch, 1'000);
+    feed.refresh({pair});
+    feed.ingest_dexie(pair, 1.5000, 4.9995, 0.0, 0.0);
+    feed.refresh({pair});
+
+    const auto comp_book = feed.get_competing_book(pair);
+    const auto snap      = state.get_market(pair);
+    ASSERT_FALSE(comp_book.ask_side_anchor_ok);
+    ASSERT_TRUE(snap.ask_side_anchor_ok);
+
+    // The ladder Step 7 actually hands to Step 8 in this state.
+    const auto ladder = mg_ladder(comp_book.bid_side_anchor_ok,
+                                  comp_book.ask_side_anchor_ok,
+                                  comp_book.offers);
+    ASSERT_FALSE(ladder.empty());
+
+    // WHAT SHIPS: Step 8 polices that ladder against the CURRENT snapshot.
+    const auto fresh = mg_step8(
+        ladder, snap.bid_side_anchor_ok, snap.ask_side_anchor_ok,
+        snap.book_side_ref, snap.mid_price, snap.best_bid, snap.best_ask);
+
+    // THE PRIMARY MUTATION: Step 8 sourcing the verdict from comp_book --
+    // i.e. a generation stamp that detects the mismatch and "adapts" by
+    // adopting the stale verdict. This is the fail-OPEN direction.
+    const auto stale = mg_step8(
+        ladder, comp_book.bid_side_anchor_ok, comp_book.ask_side_anchor_ok,
+        mg_to_mojos(comp_book.book_side_ref),
+        snap.mid_price, snap.best_bid, snap.best_ask);
+
+    // Check 1 is inert on this fixture BY CONSTRUCTION (no CEX leg, so the
+    // published mid IS the BBO midpoint). Asserted, not assumed: if it ever
+    // fires, `fresh` empties and the subset relation below becomes trivially
+    // true while measuring nothing.
+    ASSERT_TRUE(fresh.mid_check_ran)
+        << "the reset verdict is the LEGACY verdict: Check 1 must RUN";
+    ASSERT_FALSE(stale.mid_check_ran)
+        << "the stale verdict skips Check 1 -- one of the THREE changes "
+           "adopting it would make (ask_tier_ref -> side_ref, Check 1 "
+           "skipped, and effective_mid -> side_ref, which pulls the other "
+           "way; see the round-9 note at the top of this section)";
+    ASSERT_FALSE(fresh.mid_check_fired)
+        << "degenerate fixture: Check 1 cleared every tier (mid_dev="
+        << fresh.mid_dev << "), so the Check 2 comparison below is vacuous";
+
+    // [review round 9] THE LOAD-BEARING PRECONDITION, ASSERTED FIRST.
+    // The subset relation below is NOT an invariant of the two policies --
+    // TheTwoPoliciesAdmitNonNestedSets proves they admit non-nested sets on
+    // this exact book. It holds HERE only because every bid tier this ladder
+    // produces lands inside the region where the two policies happen to
+    // agree: at or below best_bid * (1 + max_aggressive_dev), which is the
+    // point above which the reset's poisoned-high effective_mid starts
+    // routing bids through the WIDE passive cap that the stale verdict's
+    // effective_mid would route through the tight aggressive one.
+    //
+    // Assert it, so that a future fixture change which breaks the premise
+    // fails ON THE PREMISE instead of misreporting a code regression.
+    {
+        const StrategyConfig sc{};
+        const auto bid_divergence_floor = static_cast<Mojo>(std::llround(
+            static_cast<double>(snap.best_bid)
+            * (1.0 + sc.bbo_sanity_max_aggressive_dev)));
+        for (const auto& tq : ladder) {
+            if (tq.side != Side::Bid) continue;
+            ASSERT_LE(tq.price, bid_divergence_floor)
+                << "PRECONDITION BROKEN, NOT A CODE REGRESSION: bid tier "
+                << static_cast<int>(tq.tier_index) << " at " << tq.price
+                << " sits above best_bid*(1+max_aggressive_dev) = "
+                << bid_divergence_floor << ", which is where the two Step 8 "
+                   "policies stop agreeing on bids. Above that line the mix "
+                   "is the MORE permissive of the two and the relation below "
+                   "inverts -- correctly. Re-read the round-9 comment at the "
+                   "top of this section before 'fixing' anything.";
+        }
+    }
+
+    // Given that precondition, the delta is entirely on the ask side and the
+    // mix is the tighter policy. This is a statement about THIS ladder on
+    // THIS book, not a general property.
+    EXPECT_TRUE(mg_is_subset(fresh.survivors, stale.survivors))
+        << "on this ladder the mixed-source policy admitted a tier the stale "
+           "verdict would have vetoed -- given the precondition above holds, "
+           "that means the ask-side references moved";
+    EXPECT_LT(fresh.survivors.size(), stale.survivors.size())
+        << "the two policies agree on this fixture, so the subset assertion "
+           "above is vacuous -- the fixture must be repaired before it can "
+           "be trusted";
+
+    // And the direction, named concretely rather than left as a cardinality.
+    // The fresh raw best_ask is the junk 4.9995 touch, so every honest ask
+    // tier around 1.42 reads as ~72% "aggressive" and dies. Under the stale
+    // verdict those same tiers reference the 1.41022765 anchor, read as
+    // passive, and live. Asks are the whole delta; bids survive both ways.
+    const auto ask_count = [](const std::vector<TierQuote>& v) {
+        return std::count_if(v.begin(), v.end(), [](const TierQuote& tq) {
+            return tq.side == Side::Ask;
+        });
+    };
+    EXPECT_EQ(ask_count(fresh.survivors), 0)
+        << "measured against the junk 4.9995 touch, no ask tier may survive";
+    EXPECT_GT(ask_count(stale.survivors), 0)
+        << "referenced to the stale anchor those same asks pass -- which is "
+           "exactly the extra permission adopting the stale verdict grants";
+}
+
+// ---------------------------------------------------------------------------
+// [review round 9] THE CLAIM THAT WAS WRONG, PINNED SO IT CANNOT COME BACK.
+//
+// Round 8 shipped a comment at the Step 7 site in engine.cpp, duplicated at
+// the top of this section, asserting that the mixed-generation read "produces
+// a SUBSET of the quotes the stale verdict alone would admit -- fewer, never a
+// quote either policy alone would refuse". It was offered as THE safety
+// argument for keeping the two stores split.
+//
+// It is false. The derivation ("Step 7 can only tighten, Step 8 can only
+// veto") does not compose, because BOTH halves RE-REFERENCE BEFORE THEY JUDGE.
+// bookside::step8_references does not just decide whether to veto -- it picks
+// effective_mid and the per-side tier reference, and classify_tier's verdict
+// is a function of those. Different references admit sets that are not nested
+// in either direction.
+//
+// This test measures the admitted sets directly off the two pure functions the
+// Engine calls, on the fixture's own live XCH/BYC state, and asserts that BOTH
+// exclusive directions are non-empty. If anyone restates the subset claim --
+// in a comment, or by "fixing" step8_references to make it true -- this goes
+// red and names the price that breaks it.
+//
+// The ladder is deliberately NOT involved. The previous test is bounded by
+// where its six tiers happen to land; this one is about the policies.
+// ---------------------------------------------------------------------------
+TEST(BookSideQualityMixedGeneration, TheTwoPoliciesAdmitNonNestedSets)
+{
+    const StrategyConfig sc{};
+    const double kAgg = sc.bbo_sanity_max_aggressive_dev;
+    const double kPas = sc.bbo_sanity_max_passive_dev;
+
+    // The state the fetch failure leaves behind: raw self-inclusive touches
+    // from the ticker, and the anchor the (now stale) verdict was measured on.
+    const double best_bid = 1.5000;
+    const double best_ask = 4.9995;
+    const double bbo_mid  = (best_bid + best_ask) / 2.0;
+
+    // WHAT SHIPS: ingest_dexie reset the snapshot verdict to the legacy
+    // triple, so Step 8 reads (true, true, ref=0).
+    const auto fresh = xop::bookside::step8_references(
+        true, true, 0.0, bbo_mid, best_bid, best_ask);
+    // THE REJECTED OPTION: Step 8 adopting Step 7's cached verdict.
+    const auto stale = xop::bookside::step8_references(
+        true, false, kAnchor, bbo_mid, best_bid, best_ask);
+
+    // Non-vacuity: the two policies must actually be different policies.
+    ASSERT_NE(fresh.effective_mid, stale.effective_mid)
+        << "the two reference sets are identical, so every count below is "
+           "zero and this test measures nothing";
+    ASSERT_NE(fresh.ask_tier_ref, stale.ask_tier_ref);
+
+    const auto admits = [&](const xop::bookside::Step8References& r,
+                            bool is_ask, double price) {
+        return xop::strategy::classify_tier(
+                   is_ask, price,
+                   is_ask ? r.ask_tier_ref : r.bid_tier_ref,
+                   r.effective_mid, kAgg, kPas)
+               == xop::strategy::BboVerdict::Pass;
+    };
+
+    // ---- Sweep both sides and collect the two exclusive directions. -------
+    struct Excl {
+        int    count{0};
+        double lo{0.0};
+        double hi{0.0};
+    };
+    const auto sweep = [&](bool is_ask, bool fresh_only) {
+        Excl e{};
+        for (int i = 0; i <= 80'000; ++i) {
+            const double p = 0.20 + (7.0 * static_cast<double>(i)) / 80'000.0;
+            const bool f = admits(fresh, is_ask, p);
+            const bool s = admits(stale, is_ask, p);
+            const bool hit = fresh_only ? (f && !s) : (s && !f);
+            if (!hit) continue;
+            if (e.count == 0) e.lo = p;
+            e.hi = p;
+            ++e.count;
+        }
+        return e;
+    };
+
+    // ---- BIDS: neither policy's admitted set contains the other's. --------
+    const Excl bid_fresh_only = sweep(/*is_ask=*/false, /*fresh_only=*/true);
+    const Excl bid_stale_only = sweep(/*is_ask=*/false, /*fresh_only=*/false);
+
+    EXPECT_GT(bid_fresh_only.count, 0)
+        << "THE SUBSET CLAIM WOULD BE TRUE IF THIS WERE ZERO. The reset "
+           "verdict restores effective_mid to the BBO midpoint " << bbo_mid
+        << ", poisoned high by the junk ask; classify_tier's bid passive "
+           "rule keys on that midpoint, so bids above best_bid*(1+"
+        << kAgg << ") = " << best_bid * (1.0 + kAgg)
+        << " get the WIDE passive cap instead of the tight aggressive one. "
+           "If this is zero, either step8_references changed or the caps did "
+           "-- do NOT restore the subset language without re-deriving it.";
+    EXPECT_GT(bid_stale_only.count, 0)
+        << "the stale verdict admits low bids the reset refuses (its "
+           "effective_mid is the anchor, which supplies a second passive "
+           "safe harbor down at anchor*(1-" << kPas << "))";
+
+    // The mix is the MORE permissive policy for bids in this band -- the
+    // fail-open direction the round-8 comment claimed could not exist.
+    EXPECT_GT(bid_fresh_only.hi, bid_stale_only.hi)
+        << "the shipped mix must be the one that reaches higher on bids";
+
+    // ---- ASKS: the two sets are not merely non-nested, they are DISJOINT. -
+    const Excl ask_fresh_only = sweep(/*is_ask=*/true, /*fresh_only=*/true);
+    const Excl ask_stale_only = sweep(/*is_ask=*/true, /*fresh_only=*/false);
+
+    ASSERT_GT(ask_fresh_only.count, 0);
+    ASSERT_GT(ask_stale_only.count, 0);
+    EXPECT_GT(ask_fresh_only.lo, ask_stale_only.hi)
+        << "the ask sets should not overlap at all: fresh references the raw "
+           "4.9995 touch, stale references the " << kAnchor << " anchor, and "
+           "the two windows sit either side of each other. fresh=["
+        << ask_fresh_only.lo << "," << ask_fresh_only.hi << "] stale=["
+        << ask_stale_only.lo << "," << ask_stale_only.hi << "]";
+
+    // One named price, so a failure report carries a reproducible case
+    // rather than only a count.
+    const double kWitness = 1.66;  // inside (best_bid*1.10, bbo_mid]
+    EXPECT_TRUE(admits(fresh, /*is_ask=*/false, kWitness))
+        << "the shipped mix admits a " << kWitness << " bid";
+    EXPECT_FALSE(admits(stale, /*is_ask=*/false, kWitness))
+        << "and the stale verdict refuses it -- which is precisely the "
+           "'never a quote either policy alone would refuse' guarantee that "
+           "round 8 claimed and round 9 removed";
+}
+
+// ---------------------------------------------------------------------------
+// [review round 8] The same invariant, reached WITHOUT any fetch failure.
+//
+// mtx_competitors_ guards a PAIR of stores. The move operations moved
+// competing_offers_ and left competing_book_quality_ behind, so a moved-to
+// feed held the junk book with NO quality entry -- and get_competing_book()
+// falls back to the struct defaults, both sides TRUSTED. Offers survive, the
+// evidence that condemned them does not: a pure fail-open, and the round-5
+// desync without needing a throw.
+// ---------------------------------------------------------------------------
+TEST(BookSideQualityMixedGeneration, MovingTheFeedCarriesTheVerdictWithTheBook)
+{
+    State state;
+    const std::string pair = "XCH/BYC";
+
+    MarketDataFeed source(sq_cfg(), state);
+    source.ingest_block_height(100);
+    source.ingest_reference_anchor(pair, kAnchor, 0.0);
+    source.ingest_competing_offers(pair, dislocated_book(), {},
+                                   kMojosPerXch, 1'000);
+    source.refresh({pair});
+    ASSERT_FALSE(source.get_competing_book(pair).ask_side_anchor_ok)
+        << "precondition: the verdict exists before the move";
+
+    MarketDataFeed moved(std::move(source));
+    const auto book = moved.get_competing_book(pair);
+
+    ASSERT_FALSE(book.offers.empty())
+        << "the offers moved across; if they did not, the assertion below "
+           "passes for the wrong reason";
+    EXPECT_FALSE(book.ask_side_anchor_ok)
+        << "the junk book moved but its verdict did not -- get_competing_book "
+           "fell back to the both-sides-trusted defaults beside a book it has "
+           "no evidence for";
+    EXPECT_GT(book.book_side_ref, 0.0)
+        << "the anchor that produced the verdict must travel with it";
+}
+
+// [review round 9] THE MOVE-ASSIGNMENT ARM. The test above exercises only the
+// move CONSTRUCTOR. MarketDataFeed has two move operations and the fix touched
+// both, but reverting ONLY
+//
+//     competing_book_quality_ = std::move(other.competing_book_quality_);
+//
+// in operator=(MarketDataFeed&&) left the whole suite green -- a surviving
+// mutant of exactly the fail-open shape the fix exists to close. Verified by
+// mutation, both arms, before and after this test was added.
+TEST(BookSideQualityMixedGeneration, MoveAssigningTheFeedCarriesTheVerdictToo)
+{
+    State state;
+    const std::string pair = "XCH/BYC";
+
+    MarketDataFeed source(sq_cfg(), state);
+    source.ingest_block_height(100);
+    source.ingest_reference_anchor(pair, kAnchor, 0.0);
+    source.ingest_competing_offers(pair, dislocated_book(), {},
+                                   kMojosPerXch, 1'000);
+    source.refresh({pair});
+    ASSERT_FALSE(source.get_competing_book(pair).ask_side_anchor_ok)
+        << "precondition: the verdict exists before the move-assign";
+
+    // A destination that has never seen this pair, so nothing it already
+    // holds can mask a verdict that fails to arrive.
+    MarketDataFeed dest(sq_cfg(), state);
+    ASSERT_TRUE(dest.get_competing_book(pair).offers.empty())
+        << "precondition: the destination starts empty for this pair";
+
+    dest = std::move(source);
+    const auto book = dest.get_competing_book(pair);
+
+    ASSERT_FALSE(book.offers.empty())
+        << "the offers move-assigned across; if they did not, the assertions "
+           "below pass for the wrong reason";
+    EXPECT_FALSE(book.ask_side_anchor_ok)
+        << "operator=(MarketDataFeed&&) moved the junk book without the "
+           "verdict that condemned it -- get_competing_book fell back to the "
+           "both-sides-trusted defaults, the round-5 desync with no fetch "
+           "failure required";
+    EXPECT_GT(book.book_side_ref, 0.0)
+        << "the anchor that produced the verdict must travel with it";
 }

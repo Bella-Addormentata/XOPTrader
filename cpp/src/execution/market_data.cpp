@@ -233,7 +233,16 @@ MarketDataFeed::MarketDataFeed(MarketDataFeed&& other) noexcept
     }
     {
         std::unique_lock lock(other.mtx_competitors_);
-        competing_offers_ = std::move(other.competing_offers_);
+        // [review round 8] BOTH maps, or neither.  mtx_competitors_ guards a
+        // PAIR of stores and get_competing_book() hands them out together;
+        // moving the offers without the verdict that condemned them leaves
+        // the destination holding a junk book whose quality entry is absent,
+        // so get_competing_book() returns the struct defaults -- both sides
+        // TRUSTED -- beside it.  That is the round-5 desync reached without
+        // any fetch failure at all, and it is fail-open: the evidence is
+        // dropped and the thing it condemned survives.
+        competing_offers_       = std::move(other.competing_offers_);
+        competing_book_quality_ = std::move(other.competing_book_quality_);
     }
     {
         std::unique_lock lock(other.mtx_competitor_metrics_);
@@ -326,7 +335,9 @@ MarketDataFeed& MarketDataFeed::operator=(MarketDataFeed&& other) noexcept {
     }
     {
         std::scoped_lock lock(mtx_competitors_, other.mtx_competitors_);
-        competing_offers_ = std::move(other.competing_offers_);
+        // [review round 8] BOTH maps, or neither -- see the move constructor.
+        competing_offers_       = std::move(other.competing_offers_);
+        competing_book_quality_ = std::move(other.competing_book_quality_);
     }
     {
         std::scoped_lock lock(mtx_competitor_metrics_, other.mtx_competitor_metrics_);

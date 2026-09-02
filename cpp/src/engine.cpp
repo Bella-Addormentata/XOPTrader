@@ -7298,9 +7298,86 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
         // ladder config, the same channel tier_fill_rates already uses for
         // runtime data.  The competitive anchor's safety reference is the
         // midpoint of the two sides, so it needs to know when one of them
-        // is not a reference at all.  Read from the same snapshot the Step 8
-        // sanity checks read, so the ladder and the checks that police it
-        // cannot disagree about which side is trustworthy.
+        // is not a reference at all.
+        //
+        // [review round 8, PR #134] THE VERDICT HERE IS NOT THE VERDICT STEP 8
+        // READS, AND THAT IS DELIBERATE.  READ THIS BEFORE "UNIFYING" THEM.
+        //
+        // An earlier revision of this comment claimed the ladder read "the
+        // same snapshot the Step 8 sanity checks read, so the ladder and the
+        // checks that police it cannot disagree".  That is FALSE, and it is
+        // false by construction, not by accident:
+        //
+        //   * Step 7 (here) reads get_competing_book() -- the cached filtered
+        //     offers AND the verdict measured on THOSE offers, under
+        //     mtx_competitors_, last written by ingest_competing_offers().
+        //   * Step 8 (engine.cpp, the BBO proximity block) reads
+        //     state_->get_market() -- a MarketSnapshot published from
+        //     PairState under mtx_pairs_, whose verdict ingest_dexie() resets
+        //     to (true, true, ref=0) on EVERY raw ticker poll.
+        //
+        // Two stores, two last-write times.  Step 1 calls ingest_dexie() and
+        // ingest_competing_offers() in one try block; when the offers fetch
+        // throws, the catch warns and the cycle CONTINUES.  So after
+        // [successful filtered ingest -> raw ticker -> offers fetch failure]
+        // Step 7 builds from the previous cycle's book and verdict while
+        // Step 8 polices it against this cycle's raw BBO with the reset
+        // verdict.  That state is reachable, deterministic, and not a race.
+        //
+        // WHY THE MIX IS ACCEPTED.  NOT because the two policies nest --
+        // THEY DO NOT.  [review round 9] An earlier revision of THIS comment
+        // claimed the mix "produces a SUBSET of the quotes the stale verdict
+        // alone would admit -- fewer, never a quote either policy alone would
+        // refuse".  That is false, and believing it is the dangerous part:
+        // the verdict does not merely veto, it also SELECTS THE REFERENCE the
+        // veto measures against, and different references admit sets that are
+        // not nested in either direction.  On this very book (side_ref
+        // 1.41022765, raw 1.5000 / 4.9995, shipped 0.10 / 0.30 caps):
+        //
+        //     BID   fresh(reset) admits [1.0500, 3.2498]
+        //           stale        admits [0.9872, 1.6500]   <- neither
+        //                                                     contains the
+        //                                                     other
+        //     ASK   fresh(reset) admits [4.4996, 6.4994]
+        //           stale        admits [1.2692, 1.8333]   <- DISJOINT
+        //
+        // The mechanism is bookside::step8_references: the reset verdict
+        // restores effective_mid to the BBO midpoint, and classify_tier's bid
+        // passive rule keys on that midpoint (bbo_sanity.hpp), so a midpoint
+        // poisoned HIGH by the junk ask routes bids up to 3.2498 through the
+        // WIDE 0.30 passive cap instead of the tight 0.10 aggressive one.
+        // That is a LOOSENING on the bid side, in exchange for a tightening
+        // on the ask side (ask_tier_ref returns to the raw 4.9995 touch).
+        // Same fact stated 3300 lines below at the Step 8 site itself.
+        //
+        // So the real argument for (c) is a BOUND, not a nesting: the reset
+        // triple (true, true, ref=0) is exactly the pre-SIDEQUALITY verdict,
+        // so Step 8 falls back to LEGACY behaviour bit for bit -- never worse
+        // than what shipped before this work existed -- and Step 7 still caps
+        // every bid at the fair-value centre, so the loosened band can only
+        // admit tiers already priced at or under fair value.  A competing-
+        // offer fetch failure occurred 0 times in 15,834 anchor cycles.
+        // Bounded, rare, and no worse than legacy is the whole claim.  Do not
+        // upgrade it back into an invariant.
+        // Pinned by BookSideQualityMixedGeneration.* in
+        // cpp/tests/test_book_side_quality.cpp -- including
+        // TheTwoPoliciesAdmitNonNestedSets, which fails if anyone restates
+        // the subset claim by making it true.
+        //
+        // DO NOT re-point Step 7 at the snapshot: the snapshot verdict is
+        // reset to trusted on every raw ticker poll while this offer store is
+        // not, so Step 7 would anchor a ladder to a junk book the live
+        // verdict calls healthy -- the round-5 desync, re-armed.
+        // DO NOT re-point Step 8 at this cached verdict either: the fresh raw
+        // BBO is the only current price evidence in the cycle, and adopting
+        // the stale verdict there makes THREE changes, not the two an earlier
+        // revision listed -- (1) ask_tier_ref becomes side_ref, (2) Check 1 is
+        // skipped, both of which disarm that evidence against a ladder that
+        // may be anchored to prices which have since vanished; and (3)
+        // effective_mid becomes side_ref, which TIGHTENS bids.  (3) pulls the
+        // other way from (1) and (2), which is exactly why the two policies do
+        // not nest and why "adopt the stale verdict" is not the strictly safer
+        // option it looks like.
         ladder_cfg.book_bid_side_anchor_ok = comp_book.bid_side_anchor_ok;
         ladder_cfg.book_ask_side_anchor_ok = comp_book.ask_side_anchor_ok;
 
