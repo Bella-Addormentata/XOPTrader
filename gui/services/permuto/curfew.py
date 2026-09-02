@@ -281,6 +281,8 @@ class OracleFreeze:
     confirm_s: float = FREEZE_CONFIRM_S
     _last: dict = field(default_factory=dict)
     _changed_at_s: float = 0.0
+    _changed_at_by_market_s: dict = field(default_factory=dict)
+    _first_seen_at_market_s: dict = field(default_factory=dict)
     _seeded: bool = False
 
     def observe(self, now_s: float, oracles: Mapping[str, float]) -> None:
@@ -296,8 +298,26 @@ class OracleFreeze:
             return
         changed = False
         for market, value in oracles.items():
-            if self._last.get(market) != value:
+            if market not in self._last:
+                # [review] A FIRST SIGHTING IS NOT A PRINT. Seeding used to
+                # go through the inequality below -- None != value -- and so
+                # stamped the market as having just moved. A runner started
+                # during SETTLING then read a frozen pre-open oracle as
+                # fresh for the whole confirm_s window and quoted against
+                # it, which is the exact cold-start case the freshness gate
+                # exists to catch. Seed the comparison state only;
+                # market_frozen() treats an unseen market as FROZEN, which
+                # is the safe direction to be wrong in.
+                self._last[market] = value
+                # ...but DO record when we started watching. Without this,
+                # a market that never changes has no entry anywhere and
+                # market_gone_quiet() below cannot tell "we have not looked
+                # long enough" from "we have watched it sit still all day".
+                self._first_seen_at_market_s[market] = now_s
+                continue
+            if self._last[market] != value:
                 changed = True
+                self._changed_at_by_market_s[market] = now_s
             self._last[market] = value
         if changed or not self._seeded:
             self._changed_at_s = now_s
@@ -320,6 +340,69 @@ class OracleFreeze:
             return -1.0
         return max(0.0, now_s - self._changed_at_s)
 
+    def changed_since(self, market: str, boundary_s: float) -> bool:
+        """Has this market printed AT OR AFTER ``boundary_s``?
+
+        [review] "Fresh" and "printed since the bell" are not the same
+        question, and the freshness gate needs the second one. An oracle
+        that moves at 13:29 and then stops is still inside the 180s
+        confirmation window at the 13:30 open, so market_frozen() says
+        "not frozen" and the runner quotes -- against a price that
+        predates the open, which is the exact stale-price case the gate
+        exists to close.
+        """
+        changed_at = self._changed_at_by_market_s.get(market)
+        if changed_at is None:
+            return False
+        # [review] INCLUSIVE. A print landing exactly on the bell IS the
+        # opening print -- the one the gate is waiting for -- and a strict
+        # `>` rejected it, holding SETTLING in the stale-withdraw posture
+        # until some later change happened to arrive. The boundaries here
+        # are exact round timestamps, so equality is not a rare edge.
+        return changed_at >= boundary_s
+
+    def market_gone_quiet(self, market: str, now_s: float) -> bool:
+        """Did this market print and then STOP?
+
+        [review] Distinct from market_frozen(), which reports an UNSEEN
+        market as frozen -- correct for the post-bell gate, where the
+        question is "has it printed since the open?", and wrong as a
+        general in-session gate, where it would refuse to quote anything
+        until a second distinct value had been observed. A market we have
+        never seen move is absence of evidence, not evidence of staleness.
+
+        This is the one to use when asking "has a live market gone quiet
+        while its neighbours carry on?" -- the case the aggregate freeze
+        detector cannot see, because it resets whenever ANY market moves.
+
+        [review] "Never seen it move" is only absence of evidence for as
+        long as we have not been watching. A market that is ALREADY frozen
+        when the runner starts never takes the != branch in observe(), so
+        it never lands in _changed_at_by_market_s -- and returning False on
+        a missing entry meant it stayed quotable FOREVER, which is exactly
+        the market this gate exists to catch. Once confirm_s has elapsed
+        since we first saw it, sitting still IS the evidence. The
+        never-observed case still answers False: that one really is a
+        market we have not looked at.
+        """
+        changed_at = self._changed_at_by_market_s.get(market)
+        if changed_at is None:
+            first_seen = self._first_seen_at_market_s.get(market)
+            if first_seen is None:
+                return False
+            return (now_s - first_seen) >= self.confirm_s
+        return (now_s - changed_at) >= self.confirm_s
+
+    def market_frozen(self, market: str, now_s: float) -> bool:
+        """True once this market has not changed for `confirm_s`.
+
+        Unseen markets are treated as frozen: unknown freshness must tighten.
+        """
+        changed_at = self._changed_at_by_market_s.get(market)
+        if changed_at is None:
+            return True
+        return (now_s - changed_at) >= self.confirm_s
+
 
 @dataclass(frozen=True)
 class CurfewState:
@@ -337,6 +420,17 @@ class CurfewState:
     seconds_to_close: float = -1.0
     long_cap_usd: Optional[float] = None
     short_cap_usd: Optional[float] = None
+    #: What the CLOCK said, before a frozen oracle overrode it.
+    #:
+    #: [review] The effective stage is deliberately lossy: a frozen oracle
+    #: maps a scheduled SETTLING back to PREOPEN so the short side stays
+    #: shut. That is right for CAPS and wrong for POSTURE -- a consumer
+    #: asking "has the bell rung?" cannot tell a genuine pre-open PREOPEN
+    #: (oracle frozen because the market is shut, quoting is fine) from a
+    #: post-open one (oracle frozen because it has not printed yet, quoting
+    #: is the stale-price trap). Both need to be answerable, so both are
+    #: reported.
+    schedule_stage: Optional[Stage] = None
 
     def __post_init__(self):
         # None means "unset" and mirrors the symmetric cap, so a state built
@@ -490,6 +584,33 @@ def _side_caps(
     return long_target, short_target
 
 
+def _uncapped_posture(
+    now_s: float,
+    closes: Sequence[float],
+    opens: Sequence[float],
+    frozen_oracle: bool,
+) -> Stage:
+    """The posture stage to publish when no per-market cap is set.
+
+    [review] The caps are inactive here, but the POSTURE still has to be
+    right, and it has to agree with what the capped path decides from the
+    same facts. Past the last entry in the hardcoded session table the
+    schedule abstains, and the capped path then reads a frozen oracle as
+    CLOSED -- "no session scheduled and the oracle is frozen, the
+    underlying is shut". Publishing a bare UNSCHEDULED instead put
+    profile_for() into its stale-price branch, which WITHDRAWS, so an
+    uncapped runner lost every overnight book once the table ran out --
+    while an identically-placed capped runner kept earning.
+
+    The table is a convenience, not the truth. A frozen oracle is the
+    observable, and it must mean the same thing in both configurations.
+    """
+    stage = _schedule_stage(now_s, closes, opens)[0]
+    if stage is Stage.UNSCHEDULED and frozen_oracle:
+        return Stage.CLOSED
+    return stage
+
+
 def assess_curfew(
     now_s: float,
     full_cap_usd: float,
@@ -504,10 +625,20 @@ def assess_curfew(
         # No configured limit means "unlimited" downstream; a curfew cannot
         # be expressed as a fraction of it, so say so rather than inventing
         # a number the operator never set.
+        # [review] The CAPS are inactive here; the CLOCK is not, and
+        # dropping schedule_stage conflated the two. posture_stage then
+        # pinned to UNSCHEDULED on every tick, and profile_for() reads a
+        # frozen oracle in UNSCHEDULED as the stale-price trap -- so an
+        # account with no configured position limit WITHDREW its book
+        # 180s into every overnight freeze, losing precisely the window
+        # the CLOSED profile exists to earn in. Whether a cap is set says
+        # nothing about whether the cash market is open.
         return CurfewState(Stage.UNSCHEDULED, full_cap_usd,
                            "no position limit configured; curfew inactive",
                            long_cap_usd=full_cap_usd,
-                           short_cap_usd=full_cap_usd)
+                           short_cap_usd=full_cap_usd,
+                           schedule_stage=_uncapped_posture(
+                               now_s, closes, opens, frozen_oracle))
 
     long_target = (floor_usd if floor_usd is not None
                    else full_cap_usd * OVERNIGHT_LONG_FRACTION)
@@ -524,7 +655,8 @@ def assess_curfew(
         long_cap, short_cap = _side_caps(
             effective, full_cap_usd, to_close, long_target, short_target)
         return CurfewState(effective, long_cap, reason, to_close,
-                           long_cap_usd=long_cap, short_cap_usd=short_cap)
+                           long_cap_usd=long_cap, short_cap_usd=short_cap,
+                           schedule_stage=stage)
 
     # Past the table the schedule abstains and the observable truth governs.
     if stage is Stage.UNSCHEDULED:

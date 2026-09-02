@@ -15,6 +15,7 @@ from gui.services.permuto.curfew import (
     EXIT_START_S,
     OPENS_UTC,
     OVERNIGHT_LONG_FRACTION,
+    FREEZE_CONFIRM_S,
     OVERNIGHT_SHORT_FRACTION,
     RAMP_START_S,
     SETTLE_AFTER_OPEN_S,
@@ -416,3 +417,173 @@ def test_the_frozen_posture_lifts_once_the_oracle_prints():
     moving = _at(MON_OPEN + 60.0, frozen=False)
     assert moving.stage is Stage.SETTLING
     assert moving.short_cap_usd > 0.0
+
+
+def test_a_first_sighting_is_not_a_print():
+    """[review] Cold start during SETTLING.
+
+    Seeding used to go through the inequality -- None != value -- and so
+    stamped the market as having just moved. A runner started after the
+    bell then read a frozen pre-open oracle as FRESH for the whole
+    confirm_s window and quoted against it, which is exactly the
+    stale-price case the freshness gate exists to catch.
+    """
+    f = OracleFreeze()
+    f.observe(1000.0, {"QQQ-VOL-PERP": 0.07})
+    assert f.market_frozen("QQQ-VOL-PERP", 1000.0) is True,         "a first sighting was treated as evidence the market is printing"
+    # Still frozen a moment later: nothing has moved.
+    assert f.market_frozen("QQQ-VOL-PERP", 1060.0) is True
+
+
+def test_an_actual_change_is_what_marks_a_market_fresh():
+    f = OracleFreeze()
+    f.observe(1000.0, {"QQQ-VOL-PERP": 0.07})
+    f.observe(1010.0, {"QQQ-VOL-PERP": 0.08})        # a real print
+    assert f.market_frozen("QQQ-VOL-PERP", 1010.0) is False
+    # And it goes stale again once confirm_s passes with no further move.
+    assert f.market_frozen("QQQ-VOL-PERP", 1010.0 + FREEZE_CONFIRM_S) is True
+
+
+def test_an_unseen_market_is_frozen_not_fresh():
+    """Unknown freshness must tighten: never having seen a market move is
+    not evidence that it does."""
+    assert OracleFreeze().market_frozen("NEVER-SEEN", 1000.0) is True
+
+
+def test_a_market_frozen_since_startup_eventually_goes_quiet():
+    """[review] The fail-open that kept a dead feed quotable forever.
+
+    _changed_at_by_market_s is only written on an actual change, and a
+    first sighting deliberately does not count as one. So a market that
+    was ALREADY frozen when the runner started never landed in that dict
+    at all -- and market_gone_quiet() answered False on the missing key,
+    which meant "still fresh", which meant quotable. Not just during the
+    confirmation window: forever.
+
+    That is precisely the market this gate exists to catch. The aggregate
+    detector cannot see it, because it resets whenever ANY market moves,
+    so a neighbour ticking along keeps the whole curfew in SESSION while
+    this one sits on a price from before the process started.
+    """
+    f = OracleFreeze(confirm_s=100.0)
+    f.observe(1000.0, {"QQQ-VOL-PERP": 0.07})
+    # Inside the window it is still absence of evidence -- we have not
+    # been watching long enough to call it.
+    assert f.market_gone_quiet("QQQ-VOL-PERP", 1050.0) is False
+    # Keep reading the same value. At confirm_s, sitting still IS the
+    # evidence.
+    f.observe(1050.0, {"QQQ-VOL-PERP": 0.07})
+    f.observe(1100.0, {"QQQ-VOL-PERP": 0.07})
+    assert f.market_gone_quiet("QQQ-VOL-PERP", 1100.0) is True,         "a market that has not moved since startup stayed quotable forever"
+
+
+def test_a_market_we_have_never_observed_is_not_reported_quiet():
+    """The other half of the same call, and the reason it cannot simply
+    return True on a missing key: never having looked is not the same as
+    having watched it sit still. market_frozen() is the one that tightens
+    on an unseen market; this one must not, or the runner refuses to quote
+    anything until a second distinct value arrives.
+    """
+    f = OracleFreeze(confirm_s=100.0)
+    assert f.market_gone_quiet("NEVER-SEEN", 10_000.0) is False
+    # Even long after a different market has been seen and gone quiet.
+    f.observe(1000.0, {"QQQ-VOL-PERP": 0.07})
+    f.observe(1200.0, {"QQQ-VOL-PERP": 0.07})
+    assert f.market_gone_quiet("QQQ-VOL-PERP", 1200.0) is True
+    assert f.market_gone_quiet("NEVER-SEEN", 1200.0) is False
+
+
+def test_a_late_print_refreshes_a_market_that_had_gone_quiet():
+    """The first-seen fallback must not outrank a real print -- otherwise
+    a market that woke up would stay branded quiet on the strength of when
+    we happened to start watching it."""
+    f = OracleFreeze(confirm_s=100.0)
+    f.observe(1000.0, {"QQQ-VOL-PERP": 0.07})
+    f.observe(1200.0, {"QQQ-VOL-PERP": 0.07})
+    assert f.market_gone_quiet("QQQ-VOL-PERP", 1200.0) is True
+    f.observe(1210.0, {"QQQ-VOL-PERP": 0.09})        # it wakes up
+    assert f.market_gone_quiet("QQQ-VOL-PERP", 1210.0) is False
+    # ...and goes quiet again on its own schedule, not the startup one.
+    assert f.market_gone_quiet("QQQ-VOL-PERP", 1310.0) is True
+
+
+def test_a_print_landing_exactly_on_the_bell_counts_as_after_it():
+    """[review] A strict `>` rejected the opening print itself.
+
+    The boundaries here are exact round timestamps and the loop ticks on a
+    timer, so a print stamped at precisely the open is not an exotic edge
+    -- and it is the very print SETTLING is waiting for. Rejecting it held
+    the stage in the stale-withdraw posture until some later change
+    happened along.
+    """
+    f = OracleFreeze()
+    f.observe(999.0, {"QQQ-VOL-PERP": 0.07})     # first sighting: no stamp
+    f.observe(1000.0, {"QQQ-VOL-PERP": 0.08})    # the opening print, at the bell
+    assert f.changed_since("QQQ-VOL-PERP", 1000.0) is True,         "the opening print was not accepted as having happened at the open"
+    # A print BEFORE the bell still does not count.
+    g = OracleFreeze()
+    g.observe(900.0, {"QQQ-VOL-PERP": 0.07})
+    g.observe(999.0, {"QQQ-VOL-PERP": 0.08})
+    assert g.changed_since("QQQ-VOL-PERP", 1000.0) is False
+
+
+def test_an_unset_position_cap_still_knows_what_time_it_is():
+    """[review] The caps being inactive is not the clock being unknown.
+
+    assess_curfew() returns early when no position limit is configured --
+    a curfew cannot be a fraction of a number nobody set. But it dropped
+    schedule_stage on the way out, so posture_stage pinned to UNSCHEDULED
+    on every tick; profile_for() reads a frozen oracle in UNSCHEDULED as
+    the stale-price trap, and the book was therefore WITHDRAWN 180
+    seconds into every overnight freeze.
+
+    Overnight is the cheapest depth of the week and the frozen oracle
+    there is expected, not a fault. An operator who left max_position_usd
+    unset lost that window entirely, with nothing in the logs naming the
+    cap as the cause.
+    """
+    overnight = CLOSES_UTC[0] + 4 * 3_600.0
+    state = assess_curfew(overnight, 0.0, frozen_oracle=True)
+    assert state.stage is Stage.UNSCHEDULED       # caps really are off
+    assert state.schedule_stage is Stage.CLOSED, (
+        "the clock stage was thrown away with the cap: %s"
+        % (state.schedule_stage,))
+
+    # And mid-session it reports the session, not a blanket UNSCHEDULED.
+    mid = OPENS_UTC[0] + SETTLE_AFTER_OPEN_S + 3_600.0
+    assert assess_curfew(mid, 0.0, frozen_oracle=False).schedule_stage \
+        is Stage.SESSION
+
+
+def test_an_uncapped_runner_still_reads_a_frozen_oracle_as_closed():
+    """[review] The table is a convenience; the frozen oracle is the truth.
+
+    Past the last entry in the hardcoded session table the schedule
+    abstains. A CAPPED runner then reads a frozen oracle as CLOSED -- "no
+    session scheduled and the oracle is frozen, the underlying is shut" --
+    and keeps earning. An uncapped one published a bare UNSCHEDULED,
+    which puts profile_for() into its stale-price branch and WITHDRAWS,
+    so it lost every overnight book once the table ran out while an
+    identically-placed capped runner carried on.
+
+    The two configurations must derive the same posture from the same
+    observable.
+    """
+    past = CLOSES_UTC[-1] + 5 * 86_400.0
+
+    capped = assess_curfew(past, 250_000.0, frozen_oracle=True)
+    uncapped = assess_curfew(past, 0.0, frozen_oracle=True)
+    # The capped path expresses it as the effective stage, the uncapped
+    # one as the posture stage -- both must reach CLOSED.
+    assert capped.stage is Stage.CLOSED
+    assert uncapped.schedule_stage is Stage.CLOSED, (
+        "an uncapped runner reported %s past the table with a frozen "
+        "oracle, which withdraws the book" % (uncapped.schedule_stage,))
+
+    # A MOVING oracle past the table is genuinely unscheduled in both.
+    assert assess_curfew(past, 0.0, frozen_oracle=False).schedule_stage \
+        is Stage.UNSCHEDULED
+    # ...and inside the table the real stage still wins over the freeze.
+    mid = OPENS_UTC[0] + SETTLE_AFTER_OPEN_S + 3_600.0
+    assert assess_curfew(mid, 0.0, frozen_oracle=False).schedule_stage \
+        is Stage.SESSION
