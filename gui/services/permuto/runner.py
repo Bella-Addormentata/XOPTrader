@@ -43,13 +43,18 @@ from .auth import PermutoAuthError
 from .batch import BatchError, build_upsert_batch
 from .client import PermutoNotLinked
 from .orders import Side, depth_credit_usd, quote_ladder
-from .quoting import LoopAction, RestingQuote, VenueView, decide
-from .risk import MarginState, RiskAction, assess, skewed_reference
+from .quoting import (REQUOTE_AT_RING_FRACTION, LoopAction,
+                      RestingQuote, VenueView, decide)
+from .risk import (PORTFOLIO_MAX_EXPOSURE_FRACTION, MarginState,
+                   RiskAction, assess, portfolio_cap_usd,
+                   skewed_reference)
 from .band_guard import VENUE_BAND_PCT, BandGuard
 from .cross_backoff import CrossBackoff, headroom_pct
 from .preflight import (latest_oracle, preflight_leg_price,
                         quantise_toward, rescaled_size)
-from .curfew import OracleFreeze, assess_curfew, permitted_leg_size
+from .curfew import (OPENS_UTC, OracleFreeze, Stage, assess_curfew,
+                     permitted_leg_size)
+from .modes import Profile, profile_for
 from .session import RenewAction
 
 #: How often a SUSTAINED full withdrawal re-asserts the cancel when we
@@ -94,6 +99,65 @@ BATCH_ACCEPTED = ("batch_ok", "batch_partial", "batch_upserted")
 #: reclassify a genuine refusal as success and record orders the venue may
 #: have rolled back. Legs are evidence only when the envelope is UNKNOWN.
 BATCH_REJECTED = ("batch_failed", "batch_rejected", "error")
+
+
+def _requote_safe_backoff(ring_pct: float, half_spread_pct: float,
+                          skew_frac_abs: float, tick_frac: float) -> float:
+    """The most backoff this leg can carry and still rest.
+
+    [review] Bounded by BOTH constraints, because satisfying one and
+    failing the other still costs the quote:
+
+      * the credit RING -- outside it the leg earns nothing, so retreating
+        past it turns a rejected leg into a resting worthless one;
+      * the RE-QUOTE TRIGGER -- decide() replaces any leg further than
+        ring * REQUOTE_AT_RING_FRACTION from the oracle, so a leg born
+        past it is cancelled and replaced every tick, forever.
+
+    Computed from the CURRENT skew rather than whatever held when the
+    offset was learned. An offset learned while flat is not legal after a
+    fill: 1.607% at oracle 0.07 becomes a 2.857% ask once skew reaches
+    0.95%, outside the ring entirely.
+    """
+    ring_room = headroom_pct(ring_pct, half_spread_pct, skew_frac_abs,
+                             tick_frac)
+    trigger_budget = ring_pct * REQUOTE_AT_RING_FRACTION * 0.8
+    trigger_room = (trigger_budget - abs(half_spread_pct)
+                    - abs(skew_frac_abs) * 100.0)
+    return max(0.0, min(ring_room, trigger_room))
+
+
+def _effective_tick(raw, default: float = 0.0001) -> float:
+    """The tick quote_ladder will actually use, decided once.
+
+    [review] Two callers derived this independently and disagreed on junk:
+    `float(raw or default)` passes NaN straight through, because NaN is
+    truthy, while quote_ladder validates and falls back. So a non-finite
+    tick_size disabled the crossing backoff -- headroom of zero clears the
+    learned offset -- while the ladder priced on 0.0001 as if nothing were
+    wrong. Same value to both, or they will drift again.
+    """
+    try:
+        tick = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(tick) or tick <= 0.0:
+        return default
+    return tick
+
+
+def _is_cross_refusal(reason: str) -> bool:
+    """True when the venue refused this leg for crossing the book.
+
+    [review] Matched on the STABLE markers, not the full sentence. The live
+    venue sends "Post-only order would cross the book. Switch to GTC or
+    adjust price." but this repo's own fixtures carry the shorter
+    "post-only order would cross", and an exact-phrase match on "cross the
+    book" silently skipped those -- so a refusal took the CLEAN path and
+    decayed the backoff instead of widening it, which is precisely
+    backwards.
+    """
+    return "post-only" in reason and "cross" in reason
 
 
 def _legs_all_accepted(leg_rows) -> bool:
@@ -207,6 +271,11 @@ class QuoteRunner:
         #: minute, and silence then means something is actually wrong
         #: rather than merely un-logged.
         self._depth_logged_at_s = 0.0
+        #: [MODES] The half-spread actually in force this tick, after the
+        #: stage profile. Read by the crossing-backoff headroom, which must
+        #: budget the spread we USED and not the one we configured.
+        self._eff_half_spread = half_spread_pct
+        self._eff_half_spread_by_market: dict = {}
         #: [ANTICROSS] Learned per-market retreat from the book. The venue
         #: refused 51 legs for crossing on 2026-08-31 and publishes no L2, so
         #: its own refusals are the only signal available. Depth credit is
@@ -216,6 +285,13 @@ class QuoteRunner:
         #: account for it at response time (skew and backoff push the
         #: trailing leg the same way, and the ring does not care which).
         self._last_skew: dict = {}
+        #: Tick size as a fraction of the oracle, per market, so headroom_pct
+        #: can reserve the one-tick rounding margin ask/ceil adds.
+        self._last_tick_frac: dict = {}
+        #: Markets currently one-sided because a side's room ran out.
+        #: Distinct from a curfew-closed side: the cap is positive,
+        #: the inventory has simply consumed all of it.
+        self._pinned_markets: set = set()
         #: Unknown-but-accepted statuses already reported, so the "add it
         #: to BATCH_ACCEPTED" nudge is logged once rather than every tick.
         self._unknown_ok_statuses: set = set()
@@ -239,6 +315,10 @@ class QuoteRunner:
         self._curfew_enabled = curfew_enabled
         self._freeze = OracleFreeze()
         self._curfew_stage = None
+        #: (cap stage, schedule stage). Both, because with no cap
+        #: configured the first never changes while the second drives
+        #: the quoting profile.
+        self._curfew_stage_key = None
         self._curfew = None
         self._ring_pct = ring_pct
         self._half_spread_pct = half_spread_pct
@@ -384,12 +464,46 @@ class QuoteRunner:
         # cap, so observing early costs nothing and a missed observation
         # would loosen it.
         self._band_guard.observe(now_s, oracles)
+        # [audit] DELIBERATELY gated on the curfew, and it must stay that
+        # way. An audit flagged the obvious reading -- observation is about
+        # the ORACLE, the curfew is about inventory caps, so why couple
+        # them -- and ungating it looks like a strict improvement, because
+        # with the curfew off _changed_at_by_market_s stays empty and the
+        # stale-oracle gate never fires.
+        #
+        # It is not an improvement, it is a regression, and the reason is
+        # two lines below at posture_stage: with the curfew off,
+        # self._curfew is None, so posture_stage pins to UNSCHEDULED --
+        # which modes.profile_for() lists among the stages where a frozen
+        # oracle means WITHDRAW. Feeding the detector in that
+        # configuration therefore withdraws the book every night, because
+        # the overnight oracle is frozen BY DESIGN and there is no stage
+        # left to say so. That window is where the depth is actually
+        # earned. Measured and reproduced, not theorised.
+        #
+        # The honest semantics: the stale-price gate is part of the
+        # schedule-aware machinery, and curfew_enabled=False turns that
+        # machinery off wholesale. Distinguishing "the underlying is shut"
+        # from "our feed died" REQUIRES the schedule; without it the two
+        # are the same observation.
         if self._curfew_enabled:
             self._freeze.observe(now_s, oracles)
             curfew = assess_curfew(
                 now_s, self._max_position_usd,
                 frozen_oracle=self._freeze.frozen(now_s))
-            if curfew.stage is not self._curfew_stage:
+            # [review] THE POSTURE STAGE COUNTS TOO, not just the cap
+            # stage. With no position limit configured, curfew.stage is
+            # pinned at UNSCHEDULED forever while posture now follows
+            # schedule_stage -- so CLOSED -> PREOPEN moved the PROFILE
+            # (full size to half, 1.0x spread to 1.6x) and this latch
+            # never noticed. decide() answers HOLD for a quote that is
+            # still fresh and in-ring, so a full-size overnight book sat
+            # live straight through the run-up to the bell at a size the
+            # new posture does not allow. Introduced by the fix that
+            # gave posture its own stage; the transition key has to
+            # cover both or they drift apart.
+            stage_key = (curfew.stage, curfew.schedule_stage)
+            if stage_key != self._curfew_stage_key:
                 _log.warning("permuto: inventory curfew %s -> %s: %s "
                              "(long $%.0f / short $%.0f of $%.0f)",
                              getattr(self._curfew_stage, "value", "none"),
@@ -410,6 +524,27 @@ class QuoteRunner:
                 # restart the cancel always failed with "needs a session
                 # and none is held". It self-healed a tick later, but the
                 # retraction belongs after the session exists.
+                #
+                # [review] EXCEPT INTO EXIT. That transition tightens the
+                # CAPS but does not forbid anything already resting: the
+                # danger is the OPEN, not the close, and a two-sided pair
+                # keeps earning credit right up to the bell. Blanket
+                # retraction here cancelled the book EXIT is supposed to
+                # leave alone -- and did it before the profile was ever
+                # consulted, so `withdraw=False` could never take effect.
+                # The caps still bind; nothing that would GROW inventory
+                # gets placed. This only spares what is already there.
+                # [review] AND THAT INCLUDES EXIT. An exemption was tried
+                # here so EXIT could keep earning credit to the bell, and
+                # it does not survive the cap invariant: a pair placed
+                # early in RAMP can be ~$420 a side, while EXIT permits
+                # ~$300 long / $120 short, and RestingQuote records PRICES
+                # but not quantities -- so nothing here can prove a
+                # retained order fits the tightened caps. A fill during
+                # EXIT would then breach the cap and carry the excess into
+                # the overnight window, which is the exact failure the
+                # curfew exists to prevent. Fifteen minutes of forgone
+                # credit is the cheaper side of that trade.
                 self._curfew_retract_pending = True
             self._curfew = curfew
 
@@ -608,10 +743,21 @@ class QuoteRunner:
             # [CURFEW] A side the curfew has closed cannot be restored, so
             # its absence must not read as a book to repair -- otherwise the
             # loop re-upserts an identical quote on every tick, all night.
+            # [audit] ...and a side pinned by EXHAUSTED ROOM is just as
+            # closed as one pinned by a zero cap. Overnight flow is
+            # one-directional -- buyers lift the ask, nothing sells back
+            # against a frozen oracle -- so the short room drains and
+            # the ask is dropped while short_cap_usd is still POSITIVE.
+            # This test only saw the zero-cap case, so decide() read the
+            # missing ask as a repairable gap and returned QUOTE every
+            # tick: measured at ~12,600 authenticated cancel+upsert
+            # pairs across one overnight session, each replacing a quote
+            # with an identical copy of itself, on a rate-limited route.
             one_sided_ok = bool(
                 self._curfew is not None
                 and (self._curfew.short_cap_usd <= 0.0
-                     or self._curfew.long_cap_usd <= 0.0))
+                     or self._curfew.long_cap_usd <= 0.0
+                     or market in self._pinned_markets))
             call = decide(
                 view, self._resting.get(market, RestingQuote()),
                 ring_pct=self._ring_pct,
@@ -715,6 +861,7 @@ class QuoteRunner:
         # session exists. Latched only on success, so a failed cancel is
         # retried next tick rather than leaving the old book resting under
         # caps that no longer permit it.
+        retracted = False
         if getattr(self, "_curfew_retract_pending", False) and session_ok:
             try:
                 self._client.cancel_all(now_s, list(self._markets))
@@ -725,10 +872,183 @@ class QuoteRunner:
                 for market in self._markets:
                     self._resting[market] = RestingQuote()
                 self._curfew_retract_pending = False
+                retracted = True
+                # [review] AND EVERY HOLD IS NOW STALE. `results` was
+                # decided against the book that existed a moment ago,
+                # and HOLD means "what is resting is fine" -- but
+                # nothing is resting any more. The earlier fix only
+                # covered the case where EVERY market held, because it
+                # hung off `not any_quoted`; with one market QUOTE and
+                # another HOLD the loop rebuilt the first, left the
+                # second empty for a tick, and still reported "quote".
+                #
+                # Rebuilding immediately beats waiting a tick: the
+                # book is empty either way, and a tick of it is a tick
+                # of no depth on every market at once.
+                for market, (action, _reason) in list(results.items()):
+                    if action == LoopAction.HOLD.value:
+                        results[market] = (
+                            LoopAction.QUOTE.value,
+                            "book retracted for a curfew stage change; "
+                            "rebuilding under the new posture")
+                        any_quoted = True
                 if self._curfew is not None:
                     self._curfew_stage = self._curfew.stage
+                    self._curfew_stage_key = (
+                        self._curfew.stage, self._curfew.schedule_stage)
+
+        # [MODES] Computed ONCE, above the risk loop, because the stage is a
+        # property of the tick and not of a market.
+        #
+        # [review] The effective half-spread has to be the SAME number
+        # everywhere. The first version widened only the ladder while
+        # risk.assess() and the crossing headroom still budgeted the
+        # configured 0.25%. At defaults that is a real failure and not a
+        # tidiness point: a session position near half its cap produces
+        # ~0.48% skew, and 0.48 + 0.75 puts a leg past the 1.2% re-quote
+        # trigger the moment it is born -- so every tick would cancel and
+        # replace a quote that was never wrong, and the backoff would budget
+        # ring headroom against a spread nobody was using.
+        # [review] POSTURE reads the SCHEDULE stage, not the effective one.
+        # The effective stage is deliberately lossy -- a frozen oracle maps a
+        # scheduled SETTLING back to PREOPEN so the short cap stays shut --
+        # and that made the (SETTLING, stale) branch unreachable: after the
+        # bell, a still-frozen oracle arrived as PREOPEN, which quotes. So
+        # the guard against quoting a stale post-open price was dead code,
+        # killed by the other fix I made hours earlier.
+        # [review] `schedule_stage or stage` masks the effective stage,
+        # because Stage.UNSCHEDULED is TRUTHY. Past the end of the session
+        # table assess_curfew returns effective CLOSED for a frozen oracle
+        # while recording schedule_stage=UNSCHEDULED -- so the `or` picked
+        # UNSCHEDULED and applied the wide, half-size SESSION profile
+        # instead of the full-size CLOSED earning profile, throwing away
+        # the overnight window precisely when the schedule has run out and
+        # the freeze detector is the only thing that knows the truth.
+        #
+        # UNSCHEDULED means "the clock abstains", which is the same as
+        # having no schedule at all: fall through to the effective stage.
+        posture_stage = Stage.UNSCHEDULED
+        if self._curfew is not None:
+            scheduled = self._curfew.schedule_stage
+            posture_stage = (scheduled
+                             if scheduled not in (None, Stage.UNSCHEDULED)
+                             else self._curfew.stage)
+        # Stage-level default; market-specific posture can tighten from here.
+        default_profile = profile_for(
+            posture_stage,
+            oracle_fresh=not self._freeze.frozen(now_s),
+        )
+        self._eff_half_spread = (self._half_spread_pct
+                                 * default_profile.spread_mult)
+        profile_by_market: dict[str, Profile] = {}
+        eff_half_spread_by_market: dict[str, float] = {}
+        for market in self._markets:
+            # [review] After the bell, "fresh" has to mean PRINTED SINCE
+            # THE BELL, not merely "moved in the last 180 seconds". An
+            # oracle that ticks at 13:29 and then stops is still inside the
+            # confirmation window at the 13:30 open, so market_frozen()
+            # reports it live and the runner quotes against a price that
+            # predates the session -- the exact stale-price case this gate
+            # exists to close, walking straight through it.
+            #
+            # Outside SETTLING there is no boundary to be after, so the
+            # ordinary freshness test governs.
+            if posture_stage is Stage.SETTLING:
+                # [audit] BOTH questions, not just the first. "Printed
+                # since the bell" alone is satisfied forever by a single
+                # print: a market that ticks once at 09:31 and then
+                # freezes stayed quotable for the whole settle window,
+                # which is the same stale-price trap the gate exists to
+                # close, just arriving fifteen minutes later.
+                opened = [o for o in OPENS_UTC if o <= now_s]
+                fresh = (bool(opened)
+                         and self._freeze.changed_since(market, max(opened))
+                         and not self._freeze.market_gone_quiet(market, now_s))
+            else:
+                # [review] gone_quiet, not market_frozen. The gate must
+                # outlive SETTLING -- the aggregate detector keeps the
+                # curfew in SESSION while ANY market prints, so a
+                # neighbour that stops is quoted against its own stale
+                # price indefinitely -- but an UNSEEN market must not be
+                # treated as stale, or the loop refuses to quote anything
+                # until it has watched a second distinct value arrive.
+                fresh = not self._freeze.market_gone_quiet(market, now_s)
+            market_profile = profile_for(
+                posture_stage,
+                oracle_fresh=fresh,
+            )
+            profile_by_market[market] = market_profile
+            eff_half_spread_by_market[market] = (
+                self._half_spread_pct * market_profile.spread_mult
+            )
+        self._eff_half_spread_by_market = eff_half_spread_by_market
 
         risk_by_market: dict = {}
+        #: What a risk-INCREASING leg may still add, book-wide.
+        #:
+        #: [review] Handing the budget to assess() as max_position bounds
+        #: the POSITION limit, not new exposure: with the budget spent by
+        #: neighbours and this market FLAT, abs(0) >= 1e-9 is false, so
+        #: assess() answers NORMAL and both risk-increasing legs go out at
+        #: full size. A budget that only binds once you already hold
+        #: something is not a budget.
+        #:
+        #: Headroom is a property of the BOOK, so it is the total against
+        #: the budget -- NOT the per-market cap. Clamping a leg to the
+        #: per-market cap instead would re-apply the position limit as an
+        #: order-size limit and break the equal-notional pairing that
+        #: min(bid, ask) depends on.
+        portfolio_headroom_usd = None
+        #: Markets that cannot be two-sided this tick -- reduce-only, or
+        #: a side whose room ran out. Either way the market earns zero.
+        newly_pinned: set = set()
+        # [audit] Notional per market, for the PORTFOLIO cap below.
+        # max_position_usd is per-market and nothing aggregated it, so
+        # three markets at the shipped 250,000 authorised 750,000 of
+        # exposure on a 500,000 account. No single market has to breach
+        # its own limit for the book to breach the account.
+        positions_usd: dict = {}
+        # [review] EVERY position the account reports, not just the
+        # markets we quote. MarginState.positions comes from
+        # /exchange/account and QuoteRunner can be built with a SUBSET,
+        # so exposure in an unconfigured market -- or one held manually
+        # -- was invisible to the budget and it authorised that much
+        # again. A budget that only sees its own book is not a budget.
+        for market in set(self._markets) | set(state.positions or {}):
+            oracle = oracles.get(market)
+            try:
+                contracts = abs(float(
+                    state.positions.get(market, 0.0) or 0.0))
+            except (TypeError, ValueError):
+                contracts = float('nan')
+            # [review] A FLAT market is worth zero at ANY price, so it
+            # must not need an oracle to be valued. Marking it NaN made
+            # every unpriced market -- including the ones we simply are
+            # not quoting this tick -- fail the whole budget closed and
+            # drop every risk-increasing leg in the book. Only a
+            # NON-ZERO position we cannot price is genuinely unreadable.
+            if contracts == 0.0:
+                positions_usd[market] = 0.0
+            else:
+                positions_usd[market] = (
+                    contracts * float(oracle)
+                    if oracle and oracle > 0.0 else float('nan'))
+
+        _total = 0.0
+        for _value in positions_usd.values():
+            if _value != _value:            # NaN: cannot value the book
+                _total = float('nan')
+                break
+            _total += abs(_value)
+        if (_total == _total and math.isfinite(state.equity_usd)
+                and state.equity_usd > 0.0):
+            portfolio_headroom_usd = max(
+                0.0, state.equity_usd * PORTFOLIO_MAX_EXPOSURE_FRACTION
+                - _total)
+        else:
+            # Unreadable book or equity: no room at all, which is the
+            # same direction every other guard here fails in.
+            portfolio_headroom_usd = 0.0
         for market in (self._markets if account_seen else []):
             oracle = oracles.get(market)
             base_size = self._base_size(oracle)
@@ -748,20 +1068,107 @@ class QuoteRunner:
             if self._curfew is not None:
                 cap_usd = self._curfew.cap_for(
                     float(state.positions.get(market, 0.0) or 0.0))
+            # [audit] ...and then by the PORTFOLIO budget, which can only
+            # tighten it further. A market is allowed its own cap only
+            # to the extent the rest of the book has left room; an
+            # unreadable equity or a neighbour's unreadable position
+            # yields zero, because authorising exposure against a
+            # number nobody can see is how the last account died.
+            # min() only when there IS a per-market cap: with the
+            # "no limit" sentinel (<= 0) min() would keep the zero and
+            # cap the market at nothing. The budget replaces it there.
+            _budgeted = portfolio_cap_usd(
+                state.equity_usd, market, cap_usd, positions_usd)
+            cap_usd = (min(cap_usd, _budgeted) if cap_usd > 0.0
+                       else _budgeted)
             # Clamped strictly positive: the overnight SHORT cap is zero,
             # and assess() reads a non-positive max_position as "no limit".
             # The prohibition is enforced by the per-leg veto below; what
             # assess() needs here is a number that keeps an existing short
             # in REDUCE_ONLY rather than switching the limit off.
-            max_position = (max(cap_usd, 1e-9) / oracle
-                            if oracle and oracle > 0.0 else 0.0)
-            risk_by_market[market] = assess(
+            # [review] ...but NOT when there is no configured limit at
+            # all. assess() reads a non-positive max_position as "no
+            # limit", which is precisely what the sentinel means, and
+            # the 1e-9 clamp turned it into a limit of almost zero --
+            # so every nonzero position became REDUCE_ONLY. The clamp
+            # exists for a curfew-FLOORED cap, where zero would read as
+            # "unlimited" and undo the curfew; an unset cap is the
+            # opposite case and wants exactly that reading.
+            if self._max_position_usd > 0.0:
+                max_position = (max(cap_usd, 1e-9) / oracle
+                                if oracle and oracle > 0.0 else 0.0)
+            else:
+                max_position = 0.0          # the sentinel: no limit
+            # [audit] REDUCE_ONLY IS A PIN. It quotes one side only, and
+            # depth credit is min(bid, ask) -- so the market earns
+            # EXACTLY ZERO while it lasts. Overnight that is not a
+            # passing state: recovery needs a fill on the other side,
+            # and the flow that put us here is one-directional against
+            # a frozen oracle. The per-tick 'banked ZERO depth' line
+            # does fire, but it repeats every 5s all night and the
+            # tick still reports action='quote', so the GUI shows a
+            # live book. Announce the TRANSITION instead.
+            _verdict = assess(
                 state, market,
                 base_size=base_size,
                 max_position=max_position,
                 ring_pct=self._ring_pct,
-                half_spread_pct=self._half_spread_pct,
+                half_spread_pct=eff_half_spread_by_market[market],
+                # [review] The skew budget must reserve the rounding tick
+                # as well, or spread + skew + ceil() lands past the
+                # re-quote trigger before any backoff is even considered.
+                tick_frac=(_effective_tick(
+                    (flags.get("specs") or {}).get(market, {}).get(
+                        "tick_size") if isinstance(flags.get("specs"), dict)
+                    else None)
+                    / max(float(oracle or 1e-12), 1e-12)),
             )
+            risk_by_market[market] = _verdict
+            if _verdict.action is RiskAction.REDUCE_ONLY:
+                newly_pinned.add(market)
+
+        # [review] RECONCILED HERE, above the not-any_quoted early
+        # returns. A pinned market makes decide() answer HOLD, so the
+        # tick returns before the tail -- and the pin could never be
+        # CLEARED. An operator who reduced the position would find the
+        # market still latched and its missing side never rebuilt, which
+        # is a worse stuck state than the one this was added to report.
+        #
+        # [audit] Announce a market that has just run out of room, and
+        # forget one that has recovered. This is the state that cost
+        # ~40%% of a simulated night in silence: the book goes
+        # one-sided, depth credit is min(bid, ask) so the market earns
+        # exactly zero, and nothing else says so -- assess() reports
+        # NORMAL because the floor leaves |position| a hair under the
+        # cap. Overnight the recovery needs a BID fill, which
+        # one-directional flow will not provide, so an operator who is
+        # not told will find out in the morning.
+        for market in sorted(newly_pinned - self._pinned_markets):
+            _log.critical(
+                "permuto: %s IS PINNED ONE-SIDED -- inventory has "
+                "consumed the whole side cap, so this market now earns "
+                "ZERO depth (credit is min(bid, ask)). It cannot "
+                "recover without a fill on the other side. Reduce the "
+                "position to resume earning.", market)
+        for market in sorted(self._pinned_markets - newly_pinned):
+            # [review] "depth resumes" is a claim about the BOOK, and
+            # leaving the pin only means risk stopped forbidding a side.
+            # _resting can still be empty here, and the batch that
+            # rebuilds it can still be rejected -- so announcing
+            # recovery now can tell an operator depth is back while the
+            # market earns zero. Same mistake as measuring depth credit
+            # before the venue answered: report the ACHIEVEMENT, not the
+            # intention. Two-sidedness is confirmed by reconcile() or by
+            # an accepted upsert, both of which land before the next
+            # tick reads this.
+            if self._resting.get(market, RestingQuote()).two_sided:
+                _log.warning("permuto: %s is two-sided again -- depth "
+                             "resumes", market)
+            else:
+                _log.warning("permuto: %s is no longer pinned, but no "
+                             "two-sided book is resting yet -- it earns "
+                             "nothing until both sides are back", market)
+        self._pinned_markets = newly_pinned
 
         # A market holding a live quote that risk wants shrunk or gone must
         # act now, whatever decide() thought of the quote itself.
@@ -770,6 +1177,21 @@ class QuoteRunner:
         # place the shrinking side -- and pre-empting it here would cancel
         # the book and then skip the replacement, leaving the market flat
         # when it should have been reduced.
+        # [review] NO EXEMPTION HERE, and the attempt is instructive.
+        # A pinned market whose lone resting leg is already the
+        # reduce-only shape gets cancelled and re-placed every other
+        # tick, and exempting it looked free. It is not: reconcile()
+        # records bid/ask PRICES and discards each order's
+        # reduce_only flag and size, so nothing here can tell that
+        # lone quote from an ordinary one -- and if risk later turns
+        # REDUCE_ONLY, the un-replaced order can fill THROUGH flat
+        # into opposite exposure. The exemption also caught FLATTEN,
+        # which must retract everything by definition.
+        #
+        # The churn is a rate-limit problem; those two are position
+        # and margin problems. Correct needs RestingQuote to carry
+        # reduce_only and size -- the same rework the RAMP cap
+        # revalidation needs, and it belongs with it.
         risk_forced = [
             m for m, r in risk_by_market.items()
             if r.action is not RiskAction.NORMAL
@@ -790,7 +1212,89 @@ class QuoteRunner:
             if not any_quoted:
                 return TickResult("withdraw", worst.reason, results)
 
+        # [MODES review] A withdrawing posture must RETRACT, not merely
+        # decline to place -- and it has to happen HERE, above the
+        # not-any_quoted early returns.
+        #
+        # The case that exposed it: the clock enters SETTLING while the
+        # oracle is still frozen. The effective curfew stage stays PREOPEN,
+        # so no stage-change cancellation fires; decide() says HOLD because
+        # the resting quote is fine on its own terms; the tick returns
+        # "all markets resting and in ring" -- and the stale order sits
+        # there waiting for the opening gap to fill it. A guard further
+        # down was never reached, which is the whole reason this is a
+        # separate pass over EVERY market rather than a branch inside the
+        # quoting loop.
+        #
+        # Only `withdraw` profiles do this -- which is currently BOTH
+        # non-quoting stages, EXIT and stale SETTLING. (An earlier draft
+        # exempted EXIT so it could earn to the bell; that did not survive
+        # the cap invariant and was reverted. This comment used to still
+        # describe the exemption, which is how it would come back.)
+        pull = [m for m in self._markets
+                if (profile_by_market.get(m) is not None
+                    and profile_by_market[m].withdraw
+                    and not self._resting.get(m, RestingQuote()).empty)]
+        shut = [m for m in self._markets
+                if (profile_by_market.get(m) is not None
+                    and profile_by_market[m].withdraw)]
+        for market in shut:
+            results[market] = ("withdraw", profile_by_market[market].reason)
+        if pull:
+            reason = profile_by_market[pull[0]].reason
+            _log.warning("permuto: withdrawing %s -- %s",
+                         ", ".join(sorted(pull)), reason)
+            try:
+                self._client.cancel_all(now_s, sorted(pull))
+                for market in pull:
+                    self._resting[market] = RestingQuote()
+            except Exception as exc:  # noqa: BLE001 - reported, not raised
+                _log.error("permuto: could not withdraw %s: %s", pull, exc)
+                return TickResult(
+                    "error", "quote still resting; withdrawal failed: %s"
+                    % exc, results)
+            if not any_quoted:
+                return TickResult("withdraw", reason, results)
+
         if not any_quoted:
+            # [review] `shut`, not `pull`. `pull` is only the markets that
+            # still had something resting to cancel, and `withdrawing` is a
+            # snapshot of `results` taken far above -- BEFORE the loop just
+            # now rewrote those entries. Enter EXIT with a stage change that
+            # already cancelled the book and all three of those are empty
+            # while every per-market result says "withdraw", so this fell
+            # through to the "hold" below and told the GUI the book was live
+            # over nothing at all. The posture is what makes this a
+            # withdrawal; whether there happened to be an order left to pull
+            # is incidental.
+            if shut:
+                return TickResult(
+                    "withdraw", profile_by_market[shut[0]].reason, results)
+            if retracted:
+                # [audit] The sibling of the `shut` case above, and the one
+                # it does NOT cover. The stage-change retraction cancels
+                # every order AFTER decide() has answered and after
+                # any_quoted was frozen, so on a frozen oracle -- where
+                # decide() says HOLD because the resting quote has not
+                # drifted -- results still reads "hold" for markets whose
+                # orders were cancelled seconds earlier in this same tick.
+                # `shut` misses it because the posture that follows the
+                # change need not be a withdrawing one: CLOSED -> PREOPEN
+                # 30 minutes before each open is quote=True, so nothing
+                # else rewrote the row.
+                #
+                # Reachable roughly once a trading day at that boundary,
+                # and on the first tick after a GUI restart while a book
+                # is still resting at the venue. One tick, then the next
+                # sees an empty _resting and re-quotes -- but for that tick
+                # the GUI is told a two-sided book is live over zero
+                # orders, which is the direction this status line must
+                # never be wrong in.
+                reason = ("the book was retracted for a curfew stage "
+                          "change; re-quoting next tick")
+                for market in self._markets:
+                    results[market] = ("withdraw", reason)
+                return TickResult("withdraw", reason, results)
             if withdrawing:
                 return TickResult("withdraw", withdraw_reason, results)
             wait = LoopAction.WAIT.value
@@ -806,6 +1310,7 @@ class QuoteRunner:
 
         legs = []
         to_cancel: list = []
+
         for market, (action, _) in results.items():
             if action != LoopAction.QUOTE.value:
                 continue
@@ -878,17 +1383,57 @@ class QuoteRunner:
             spec = (raw_specs.get(market, {})
                     if isinstance(raw_specs, dict) else {})
             # [ANTICROSS] Sit as far from the book as the venue's refusals
-            # say we must. quote_ladder still clamps every level inside the
-            # ring, so this can widen the placement but never the credit
-            # footprint -- a leg outside the ring earns nothing.
+            # say we must. headroom_pct bounds the backoff so that the
+            # quantised trailing leg stays inside the credit ring against the
+            # TRUE oracle (skew and tick rounding both accounted for).
+            # quote_ladder's own ring_pct*0.9 clamp is relative to the SKEWED
+            # reference, not the true oracle, so it is NOT the true ceiling --
+            # that is headroom_pct's job.
             self._last_skew[market] = risk.skew
+            # [MODES] The stage decides the POSTURE, the curfew and risk
+            # decide the LIMITS -- the profile is applied first precisely so
+            # both can still only reduce it, never the other way round.
+            market_profile = profile_by_market[market]
+            eff_half_spread = eff_half_spread_by_market[market]
+            if not market_profile.quote:
+                results[market] = ("skip", market_profile.reason)
+                continue
+            depth_usd *= market_profile.depth_mult
+            if depth_usd <= 0.0:
+                results[market] = ("skip", market_profile.reason)
+                continue
+            # [review] Reserve the worst-case ask-ceil rounding margin so
+            # headroom_pct accounts for the one tick quote_ladder adds --
+            # from the EFFECTIVE tick, the same one the ladder will use.
+            #
+            # `float(spec.get(...) or 0.0001)` looked like a fallback and is
+            # not one: NaN is truthy, so a non-finite tick_size sailed
+            # through as NaN, made _last_tick_frac NaN, and headroom_pct
+            # then returned zero -- which makes observe_cross CLEAR the
+            # learned backoff. Meanwhile quote_ladder validates and quietly
+            # uses 0.0001, so bad venue metadata disabled the crossing
+            # defence while the quote itself carried on regardless.
+            _tick = _effective_tick(spec.get("tick_size"))
+            self._last_tick_frac[market] = (
+                _tick / max(float(oracle or 1e-12), 1e-12))
             ladder = quote_ladder(
                 market, reference, depth_usd,
                 levels=1,
-                first_offset_pct=(self._half_spread_pct
-                                  + self._cross_backoff.offset_pct(market)),
+                # [review] Capped against CURRENT headroom and the
+                # re-quote trigger, not applied raw. See
+                # _requote_safe_backoff: an offset learned under wider
+                # headroom is illegal after a fill raises skew, and one
+                # inside the ring but past the trigger is replaced on the
+                # next tick -- the churn the budget exists to stop.
+                first_offset_pct=(
+                    eff_half_spread
+                    + min(self._cross_backoff.offset_pct(market),
+                          _requote_safe_backoff(
+                              self._ring_pct, eff_half_spread,
+                              self._last_skew.get(market, 0.0),
+                              self._last_tick_frac.get(market, 0.0)))),
                 ring_pct=self._ring_pct,
-                tick_size=spec.get("tick_size", 0.0001),
+                tick_size=_tick,
                 lot_size=spec.get("lot_size", 1.0),
             )
             if risk.action is RiskAction.REDUCE_ONLY:
@@ -945,7 +1490,17 @@ class QuoteRunner:
                     if clamped != leg.price:
                         leg = type(leg)(leg.market, leg.side, clamped,
                                         leg.size, leg.reduce_only)
-                if self._curfew is not None and oracle and oracle > 0.0:
+                # [review] ...and only when a per-market cap EXISTS. With
+                # the no-limit sentinel assess_curfew() leaves both side
+                # caps at zero -- correctly, a curfew cannot be a
+                # fraction of a number nobody set -- so this clamp
+                # dropped BOTH legs and the tick reported risk_blocked.
+                # Fixing the sentinel for assess() alone was half a fix:
+                # a flat account with the cap disabled quoted nothing at
+                # all. The portfolio budget is the limit in that
+                # configuration, and it is applied above.
+                if (self._curfew is not None and oracle and oracle > 0.0
+                        and self._max_position_usd > 0.0):
                     allowed = permitted_leg_size(
                         leg.side is Side.BUY,
                         float(state.positions.get(market, 0.0) or 0.0),
@@ -956,11 +1511,32 @@ class QuoteRunner:
                     # fractional remainder is a rejected batch.
                     allowed = math.floor(allowed)
                     if allowed < 1.0:
+                        # The room-floor branch is a one-contract-wide
+                        # window (short_cap - 1 < |pos| < short_cap);
+                        # REDUCE_ONLY fires first in every reachable
+                        # case and is where the pin is recorded.
                         continue
                     if allowed < leg.size:
                         leg = type(leg)(leg.market, leg.side, leg.price,
                                         allowed, leg.reduce_only)
+                # [review] A risk-increasing leg may not exceed the
+                # portfolio room. A REDUCING leg always may: shrinking
+                # exposure is what the budget wants, and blocking it
+                # would trap the book at the very moment it is trying
+                # to get back inside.
+                room_usd = portfolio_headroom_usd
+                if (room_usd is not None and oracle and oracle > 0.0
+                        and self._increases_exposure(leg, float(
+                            state.positions.get(market, 0.0) or 0.0))):
+                    room_contracts = math.floor(
+                        max(0.0, room_usd) / oracle)
+                    if room_contracts < 1.0:
+                        continue
+                    if room_contracts < leg.size:
+                        leg = type(leg)(leg.market, leg.side, leg.price,
+                                        room_contracts, leg.reduce_only)
                 legs.append(leg)
+
 
         if to_cancel:
             # Before the upsert, so the reduce-only leg is not racing the
@@ -977,6 +1553,28 @@ class QuoteRunner:
             # the not_quoting gate and painted PERMUTO ON over nothing
             # resting. risk_blocked gates the switch like any other
             # non-trading outcome.
+            # [review] But say WHICH refusal it was. `any_quoted` is set
+            # before the profile filter runs, so a market that decide()
+            # marked QUOTE and the MODE then skipped still arrives here --
+            # and reporting "risk left nothing to place" for a deliberate
+            # EXIT or stale-oracle decision blames risk for a posture
+            # choice, which is the wrong thing to go looking at when the
+            # book is empty and nobody knows why.
+            mode_skips = [m for m, (a, r) in results.items()
+                          if a in ("skip", "withdraw")
+                          and profile_by_market.get(m) is not None
+                          and not profile_by_market[m].quote]
+            # [review] EVERY market, not every skipped one. Comparing
+            # against the skip/withdraw rows alone ignored markets left
+            # marked "quote" that produced no legs -- an invalid ladder,
+            # a curfew clamp to zero size -- because those sit in neither
+            # list. The equality held anyway, so a MIXED failure was
+            # reported as a clean mode withdrawal and the real cause
+            # never surfaced. Blaming the posture is only honest when
+            # the posture is the whole story.
+            if mode_skips and len(mode_skips) == len(results):
+                return TickResult("withdraw",
+                                  results[mode_skips[0]][1], results)
             return TickResult("risk_blocked",
                               "risk left nothing to place", results)
 
@@ -1058,7 +1656,14 @@ class QuoteRunner:
                 raw_specs = flags.get("specs")
                 mspec = (raw_specs.get(leg.market, {})
                          if isinstance(raw_specs, dict) else {})
-                m_tick = float(mspec.get("tick_size", 0.0001) or 0.0001)
+                # [review] The SAME normalisation as the ladder. This
+                # parsed the raw value, so "decided once" was not true of
+                # the pre-send path: with NaN metadata and a fresh-oracle
+                # reprice, quantise_toward received NaN and handed back the
+                # changed price UNSNAPPED, so an off-grid order still went
+                # out despite the fallback added for the ladder. Two places
+                # deriving one number is how it drifted the first time.
+                m_tick = _effective_tick(mspec.get("tick_size"))
                 m_lot = float(mspec.get("lot_size", 1.0) or 1.0)
 
                 out = preflight_leg_price(
@@ -1271,21 +1876,73 @@ class QuoteRunner:
             # if ANY leg here crossed, the market retreats; if none did, it
             # relaxes back toward the configured spread.
             if isinstance(leg_rows, list) and leg_rows:
-                crossed = set()
+                crossed, seen, dirty = set(), set(), set()
+                # [review] A COUNT MISMATCH POISONS THE WHOLE MAPPING, not
+                # just the tail. These rows are paired with legs by
+                # POSITION, so a missing row in the MIDDLE shifts every
+                # later pairing by one -- a market then reads another
+                # market's result, and can come back "seen" and clean while
+                # its own leg was refused. Marking only the unpaired suffix
+                # dirty, as the previous fix did, addresses the one case
+                # where the shift happens to be at the end.
+                #
+                # There is no way to re-align without an identifier the
+                # rows do not carry, so the honest response is to trust
+                # none of it: no crossings inferred, every market dirty, and
+                # the backoff left exactly where it was until a response
+                # arrives that can be read.
+                if len(leg_rows) != len(legs):
+                    _log.warning(
+                        "permuto: batch response had %d row(s) for %d leg(s)"
+                        " -- positional mapping is ambiguous, so no backoff "
+                        "is inferred this tick", len(leg_rows), len(legs))
+                    for leg in legs:
+                        dirty.add(leg.market)
+                    leg_rows = []
                 for leg, row in zip(legs, leg_rows):
                     if not isinstance(row, dict):
+                        # A row we cannot parse tells us nothing about this
+                        # market, so it must not count as a clean tick.
+                        dirty.add(leg.market)
                         continue
-                    if "cross the book" in str(
-                            row.get("rejection_reason") or "").lower():
+                    seen.add(leg.market)
+                    reason = str(row.get("rejection_reason") or "").lower()
+                    action = str(row.get("action") or "").lower()
+                    if _is_cross_refusal(reason):
                         crossed.add(leg.market)
+                    elif reason or action not in ("placed", "modified",
+                                                  "unchanged"):
+                        # [review] A NON-crossing refusal (margin/band) or an
+                        # action that does not prove the order is resting is
+                        # not evidence we stopped crossing. "rejected",
+                        # "cancelled", an empty action, or any unknown value
+                        # all count as dirty.
+                        dirty.add(leg.market)
                 for mkt in {l.market for l in legs}:
                     if mkt in crossed:
                         self._cross_backoff.observe_cross(
                             mkt,
+                            # [review] The spread we USED this tick, not the
+                            # configured one: budgeting ring headroom against
+                            # a narrower spread than the ladder actually
+                            # placed lets the backoff hand back room the
+                            # widened quote has already spent.
                             headroom_pct(self._ring_pct,
-                                         self._half_spread_pct,
-                                         self._last_skew.get(mkt, 0.0)))
-                    else:
+                                         self._eff_half_spread_by_market.get(
+                                             mkt, self._eff_half_spread),
+                                         self._last_skew.get(mkt, 0.0),
+                                         self._last_tick_frac.get(mkt, 0.0)))
+                    elif accepted and mkt in seen and mkt not in dirty:
+                        # Only a market whose every row came back present and
+                        # ACCEPTED has actually demonstrated it rests.
+                        #
+                        # [review] `accepted` gates this, and it has to: a
+                        # known batch_failed envelope can still report every
+                        # row as "placed", so without the gate an explicit
+                        # venue refusal decayed the learned offset as though
+                        # the batch had rested. The rows describe legs; the
+                        # envelope describes whether the venue took them,
+                        # and only the envelope can answer that.
                         self._cross_backoff.observe_clean(mkt)
 
             credit_usd = _credit_for(rested)
@@ -1379,6 +2036,21 @@ class QuoteRunner:
 
         self._reopen_pending = False
         return TickResult("quote", "%d legs" % len(legs), results)
+
+    @staticmethod
+    def _increases_exposure(leg, position: float) -> bool:
+        """True when filling this leg would make |position| larger.
+
+        A buy grows a long and shrinks a short; a sell does the reverse.
+        From FLAT either side grows exposure, which is the case the
+        portfolio budget most needs to catch -- a market with nothing on
+        it looks harmless to every per-market check.
+        """
+        if position != position:            # NaN: assume the worse case
+            return True
+        if leg.side is Side.BUY:
+            return position >= 0.0
+        return position <= 0.0
 
     def _base_size(self, oracle: Optional[float]) -> float:
         """Contracts that carry ``target_depth_usd`` of notional per side."""

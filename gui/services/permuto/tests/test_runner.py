@@ -7,7 +7,9 @@ import pytest
 
 from gui.services.permuto.auth import PermutoAuthError
 from gui.services.permuto.client import PermutoNotLinked
-from gui.services.permuto.quoting import RestingQuote
+from gui.services.permuto.runner import decide as runner_decide
+from gui.services.permuto.quoting import (LoopAction, QuoteDecision,
+                                          RestingQuote)
 from gui.services.permuto.risk import FLATTEN_MARGIN_UTILISATION
 from gui.services.permuto.runner import RECANCEL_INTERVAL_S, QuoteRunner, _margin_state
 from gui.services.permuto.session import RenewAction
@@ -1119,7 +1121,8 @@ def test_leaderboard_watch_is_throttled(monkeypatch):
 # --------------------------------------------------------------------------- #
 
 from gui.services.permuto.curfew import (                          # noqa: E402
-    CLOSES_UTC, OPENS_UTC, OVERNIGHT_SHORT_FRACTION, SETTLE_AFTER_OPEN_S,
+    CLOSES_UTC, FREEZE_CONFIRM_S, OPENS_UTC, OVERNIGHT_SHORT_FRACTION,
+    SETTLE_AFTER_OPEN_S,
 )
 
 _MID_SESSION = OPENS_UTC[0] + SETTLE_AFTER_OPEN_S + 3_600.0
@@ -1163,13 +1166,37 @@ def test_the_same_position_is_unrestricted_mid_session():
 def test_a_frozen_oracle_floors_the_cap_even_mid_session():
     # The clock wrong in the direction that costs money: the table says
     # mid-session, the oracle has stopped moving. The freeze wins.
+    #
+    # [review] This used to assert a one-sided ["sell"] batch, which was
+    # only reachable because market_gone_quiet() fail-opened on a market
+    # that had never been seen to move: the runner kept quoting under the
+    # floored cap, and the floored cap shut the buy side. With the gate
+    # fixed the market is WITHDRAWN before that -- profile_for() calls a
+    # frozen oracle during a scheduled session the stale-price trap -- so
+    # no batch is sent at all after it goes quiet, and c.last_batch still
+    # holds the two-sided one from before the confirmation window closed.
+    # Asserting on last_batch therefore measures a STALE artefact; assert
+    # the two things the test actually meant instead.
     c = _Client(account=_account(100_000.0))
     r = _runner(c, curfew_enabled=True, max_position_usd=12_000.0)
     t = _MID_SESSION
+    seen = []
     for _ in range(6):                     # hold the oracle still
-        r.tick(t, _ORACLE, {})
+        seen.append(r.tick(t, _ORACLE, {}))
         t += 60.0
-    assert [leg["side"] for leg in c.last_batch] == ["sell"]
+
+    # The freeze beats the table: the cap is floored to the overnight
+    # stage even though the schedule says mid-session. That is the
+    # original point of this test and it still holds.
+    assert seen[-1].curfew == "closed", seen[-1].curfew
+
+    # And the market is not quoted against the price that stopped moving.
+    assert seen[-1].action == "withdraw", seen[-1].action
+    assert all(a == "withdraw" for a, _ in seen[-1].markets.values())
+
+    # It quoted BEFORE the confirmation window closed -- otherwise this
+    # would pass on a runner that never quotes at all.
+    assert seen[0].action == "quote", seen[0].action
 
 
 def test_curfew_disabled_ignores_the_clock_entirely():
@@ -1907,3 +1934,1232 @@ def test_a_clean_market_relaxes_back_toward_its_spread():
         r._resting = {}
         r.tick(_MID_SESSION + i * 5.0, _ORACLE, {})
     assert r._cross_backoff.offset_pct(_MKT) < widened,         "the backoff never relaxed once the venue stopped refusing us"
+
+# --------------------------------------------------------------------------- #
+# [MODES] The stage must change what actually goes out, not just a dataclass.
+# --------------------------------------------------------------------------- #
+
+def test_the_session_quotes_wider_than_the_overnight_window():
+    """Open hours: 20-24% median one-minute oracle moves, 56 of 65 past the
+    whole band. Depth credit is flat inside the ring, so width is free and
+    a tight quote is just a donation. Overnight the oracle is frozen and
+    the ring does not move, so the configured spread is right."""
+    oracle = _ORACLE[_MKT]
+
+    c1 = _Client(account=_account(0.0), batch_response=_venue_ok())
+    _runner(c1, curfew_enabled=True).tick(_MID_SESSION, _ORACLE, {})
+    sess = [abs(float(l["price"]) / oracle - 1.0) * 100.0 for l in c1.last_batch]
+
+    c2 = _Client(account=_account(0.0), batch_response=_venue_ok())
+    _runner(c2, curfew_enabled=True).tick(_OVERNIGHT, _ORACLE, {})
+    night = [abs(float(l["price"]) / oracle - 1.0) * 100.0 for l in c2.last_batch]
+
+    assert min(sess) > min(night), (
+        "session legs %.3f%% are not wider than overnight %.3f%%"
+        % (min(sess), min(night)))
+
+
+def test_the_overnight_window_quotes_more_size_than_the_session():
+    """CLOSED is the earning window and must be the biggest book.
+
+    Sized like PRODUCTION (cap $250k against $1,200 target depth), because
+    at the default test cap of $1,200 the CURFEW cap binds first -- $300
+    long / $120 short overnight -- and the profile multiplier never gets to
+    express itself. That is correct behaviour (limits beat posture), but it
+    tests the cap rather than the mode.
+    """
+    kw = dict(curfew_enabled=True, max_position_usd=250_000.0)
+    c1 = _Client(account=_account(0.0), batch_response=_venue_ok())
+    _runner(c1, **kw).tick(_MID_SESSION, _ORACLE, {})
+    sess = sum(float(l["size"]) for l in c1.last_batch)
+
+    c2 = _Client(account=_account(0.0), batch_response=_venue_ok())
+    _runner(c2, **kw).tick(_OVERNIGHT, _ORACLE, {})
+    night = sum(float(l["size"]) for l in c2.last_batch)
+
+    assert night > sess, ("overnight %.0f is not larger than session %.0f"
+                          % (night, sess))
+
+
+def test_a_curfew_cap_still_beats_the_profile():
+    """Posture proposes, limits dispose. At the tight default cap the
+    overnight book must be SMALLER than the session one, because the
+    curfew floor binds below what the profile asks for -- if a mode could
+    talk its way past a cap, the mode would be a risk control, and it is
+    not."""
+    c1 = _Client(account=_account(0.0), batch_response=_venue_ok())
+    _runner(c1, curfew_enabled=True).tick(_MID_SESSION, _ORACLE, {})
+    sess = sum(float(l["size"]) for l in c1.last_batch)
+
+    c2 = _Client(account=_account(0.0), batch_response=_venue_ok())
+    _runner(c2, curfew_enabled=True).tick(_OVERNIGHT, _ORACLE, {})
+    night = sum(float(l["size"]) for l in c2.last_batch)
+
+    assert night < sess, "the profile overrode the overnight curfew cap"
+
+
+def test_the_last_minutes_before_the_close_place_nothing():
+    """EXIT: place nothing new, and RETRACT what is on.
+
+    [review] This said "whatever is on is what we carry" -- the
+    retain-through-EXIT behaviour that did not survive review, while
+    the test below already expects a withdrawal. The fifth such
+    comment found; each one is an invitation to put it back.
+
+    Adding inventory here buys a fill we then hold through the frozen
+    window, which is where the 870k short came from."""
+    exit_t = CLOSES_UTC[0] - 300.0          # 5 minutes to the bell
+    c = _Client(account=_account(0.0), batch_response=_venue_ok())
+    r = _runner(c, curfew_enabled=True)
+    res = r.tick(exit_t, _ORACLE, {})
+    assert not getattr(c, "last_batch", None), (
+        "placed a new quote inside the exit window")
+    assert res.markets.get(_MKT, ("", ""))[0] == "withdraw", res.markets
+
+def test_a_frozen_oracle_after_the_bell_stops_the_runner_quoting():
+    """[review] This guard was DEAD CODE, killed by my own earlier fix.
+
+    assess_curfew maps a scheduled SETTLING with a frozen oracle back to
+    PREOPEN so the short cap stays shut -- right for caps, wrong for
+    posture. profile_for therefore never saw (SETTLING, stale); it saw
+    PREOPEN, which quotes. So after the bell a still-frozen oracle would
+    have been quoted against, which is the exact stale-price trap the
+    branch was written to prevent. Posture now reads the SCHEDULE stage.
+    """
+    c = _Client(account=_account(0.0), batch_response=_venue_ok())
+    r = _runner(c, curfew_enabled=True)
+    t0 = OPENS_UTC[0] + 60.0
+    for k in range(6):                      # let the freeze detector confirm
+        r.tick(t0 - 300.0 + k * 60.0, _ORACLE, {})
+    res = r.tick(t0, _ORACLE, {})
+    assert res.markets.get(_MKT, ("", ""))[0] == "withdraw", res.markets
+    assert "not printed" in res.markets[_MKT][1], res.markets[_MKT]
+
+
+def test_a_single_opening_print_does_not_mark_every_market_fresh():
+    """One market printing at the bell must not re-enable stale neighbours."""
+    c = _Client(account=_account(0.0), batch_response=_venue_ok())
+    r = _runner2(c, curfew_enabled=True)
+    t0 = OPENS_UTC[0] + 60.0
+    for k in range(6):                      # confirm both as frozen first
+        r.tick(t0 - 300.0 + k * 60.0, _BOTH, {})
+
+    # NVDA prints; QQQ is still frozen at the opening price.
+    res = r.tick(t0, {_MKT: _BOTH[_MKT], _MKT2: _BOTH[_MKT2] + 0.0001}, {})
+
+    assert res.markets.get(_MKT, ("", ""))[0] == "withdraw", res.markets
+    assert "not printed" in res.markets[_MKT][1], res.markets[_MKT]
+    assert res.markets.get(_MKT2, ("", ""))[0] == "quote", res.markets
+    assert getattr(c, "last_batch", None), "no quote sent for the fresh market"
+    assert {leg["market"] for leg in c.last_batch} == {_MKT2}, c.last_batch
+
+
+def test_the_widened_spread_is_budgeted_by_risk_too():
+    """[review] The spread must be ONE number everywhere.
+
+    Widening only the ladder while risk.assess() budgets the configured
+    0.25% puts a skewed leg past the 1.2% re-quote trigger the moment it
+    is born -- ~0.48% skew at half the cap plus 0.75% placement -- so the
+    loop would cancel and replace a quote that was never wrong, every
+    tick, forever.
+    """
+    from gui.services.permuto.modes import SESSION_SPREAD_MULT
+
+    c = _Client(account=_account(0.0), batch_response=_venue_ok())
+    r = _runner(c, curfew_enabled=True, max_position_usd=250_000.0)
+    r.tick(_MID_SESSION, _ORACLE, {})
+    assert abs(r._eff_half_spread
+               - r._half_spread_pct * SESSION_SPREAD_MULT) < 1e-9,         "the effective spread is not the profile-widened one"
+
+
+def test_a_widened_quote_is_not_born_past_its_own_requote_trigger():
+    """The consequence the reviewer named, asserted as arithmetic.
+
+    A first attempt tried to observe this end to end, but the fake client
+    reports no open orders, so reconcile clears the belief and the loop
+    re-quotes every tick regardless -- the harness, not the behaviour. The
+    property that actually matters is that the widened placement plus the
+    largest skew it permits still rests inside the trigger.
+    """
+    from gui.services.permuto.modes import SESSION_SPREAD_MULT
+    from gui.services.permuto.quoting import REQUOTE_AT_RING_FRACTION
+    from gui.services.permuto.risk import max_price_skew_frac
+
+    ring, configured = 2.0, 0.25
+    placement = configured * SESSION_SPREAD_MULT
+    worst = placement + max_price_skew_frac(ring, placement) * 100.0
+    assert worst <= ring * REQUOTE_AT_RING_FRACTION + 1e-9, (
+        "a fully skewed session leg is born %.4f%% out, past the %.2f%% "
+        "trigger -- it would be cancelled and replaced every tick"
+        % (worst, ring * REQUOTE_AT_RING_FRACTION))
+
+
+def test_widening_leaves_enough_skew_to_move_a_real_price():
+    """And the widening must not silently DELETE inventory leaning.
+
+    At the 3x first shipped, the skew ceiling collapsed to 0.21% and
+    rounded away entirely on the 0.0001 tick grid at ordinary inventory --
+    a quote that leans on inventory in the arithmetic and not in the
+    prices actually sent.
+    """
+    from gui.services.permuto.modes import SESSION_SPREAD_MULT
+    from gui.services.permuto.risk import max_price_skew_frac
+
+    placement = 0.25 * SESSION_SPREAD_MULT
+    ceiling = max_price_skew_frac(2.0, placement)
+    oracle, tick = 0.07, 0.0001
+    assert ceiling * oracle > 2 * tick, (
+        "a full skew moves the price %.6f, under two ticks -- inventory "
+        "leaning would round away" % (ceiling * oracle))
+
+
+def test_a_stale_open_RETRACTS_a_resting_quote_not_just_declines_to_place():
+    """[review] Declining to place is not enough when one is already there.
+
+    The quoting loop only visits markets decide() marked QUOTE, and a
+    healthy resting book reconciles as HOLD. So when the clock enters
+    SETTLING with the oracle still frozen, the effective curfew stage stays
+    PREOPEN, no stage-change cancellation fires, and the stale order simply
+    stays live into the opening gap -- waiting to be filled by the very
+    move the posture exists to avoid.
+    """
+    c = _Client(account=_account(0.0), batch_response=_venue_ok(),
+                open_orders={"orders": [
+                    {"market": _MKT, "side": "buy", "price": 0.0698,
+                     "size": 100},
+                    {"market": _MKT, "side": "sell", "price": 0.0702,
+                     "size": 100}]})
+    r = _runner(c, curfew_enabled=True)
+    t0 = OPENS_UTC[0] + 60.0
+    for k in range(6):                      # let the freeze detector confirm
+        r.tick(t0 - 300.0 + k * 60.0, _ORACLE, {})
+    c.calls.clear()
+    res = r.tick(t0, _ORACLE, {})
+    assert res.markets.get(_MKT, ("", ""))[0] == "withdraw", res.markets
+    assert "cancel_all" in c.calls,         "a stale resting quote was left live into the opening gap"
+
+
+class _BookClient(_Client):
+    """A client whose open_orders REFLECTS cancellation.
+
+    The plain fake returns a fixed payload, so a cancelled book reappears
+    on the next reconcile -- which is why the first version of the EXIT
+    test could not fail: the orders it checked for had been resurrected
+    between the cancel and the assertion.
+    """
+
+    def __init__(self, **kw):
+        orders = kw.pop("orders", [])
+        super().__init__(**kw)
+        self._orders = list(orders)
+
+    def open_orders(self, now_s):
+        self.calls.append("open_orders")
+        return {"orders": list(self._orders)}
+
+    def cancel_all(self, now_s, markets=None):
+        out = super().cancel_all(now_s, markets)
+        keep = set(markets or [])
+        self._orders = [o for o in self._orders
+                        if keep and o.get("market") not in keep]
+        return out
+
+
+def test_entering_EXIT_retracts_because_its_caps_are_tighter():
+    """[review] The exemption tried here did not survive the cap invariant.
+
+    EXIT was briefly exempted from the stage-change retraction so it could
+    keep earning credit to the bell. But a pair placed early in RAMP can
+    be ~$420 a side while EXIT permits ~$300 long / $120 short, and
+    RestingQuote records PRICES and not quantities -- so nothing can prove
+    a retained order still fits. A fill against an oversized resting leg
+    would breach the cap and carry the excess into the overnight window,
+    the exact failure the curfew exists to prevent. Fifteen minutes of
+    forgone credit is the cheaper side of that trade.
+    """
+    orders = [{"market": _MKT, "side": "buy", "price": 0.0698, "size": 100},
+              {"market": _MKT, "side": "sell", "price": 0.0702, "size": 100}]
+    c = _BookClient(account=_account(0.0), batch_response=_venue_ok(),
+                    orders=orders)
+    r = _runner(c, curfew_enabled=True)
+    close = CLOSES_UTC[0]
+    # A MOVING oracle, or the freeze detector overrides the schedule and
+    # the transition under test becomes RAMP -> CLOSED instead.
+    # EXIT_START_S is 900s, so close-900 IS the boundary -- an assertion
+    # tick at close-600 is already inside EXIT and sees no transition,
+    # which is the same mistake the previous version of this test made.
+    r.tick(close - 1800.0, {_MKT: 0.0700}, {})   # RAMP, 30 minutes out
+    r.tick(close - 1200.0, {_MKT: 0.0705}, {})   # RAMP
+    c._orders = list(orders)                     # re-seed: RAMP retracts on
+    r.tick(close - 1100.0, {_MKT: 0.0707}, {})   # its own caps, legitimately
+    c.calls.clear()
+    r.tick(close - 890.0, {_MKT: 0.0710}, {})    # crosses RAMP -> EXIT
+    assert "cancel_all" in c.calls,         "entering EXIT kept a book whose size it cannot verify"
+
+
+
+def test_entering_the_overnight_close_DOES_retract():
+    """Every tightening transition retracts, EXIT included.
+
+    [review] This used to say "the exemption is EXIT-only", describing a
+    policy that no longer exists -- the runner sets
+    _curfew_retract_pending on every effective stage change, and the test
+    above asserts RAMP -> EXIT retracts too. A test that documents the
+    opposite of what it verifies is worse than none.
+    """
+    orders = [{"market": _MKT, "side": "sell", "price": 0.0702, "size": 100}]
+    c = _BookClient(account=_account(-100.0), batch_response=_venue_ok(),
+                    orders=orders)
+    r = _runner(c, curfew_enabled=True)
+    close = CLOSES_UTC[0]
+    r.tick(close - 900.0, {_MKT: 0.0700}, {})    # EXIT, oracle alive
+    r.tick(close - 600.0, {_MKT: 0.0705}, {})
+    c.calls.clear()
+    r.tick(close + 600.0, {_MKT: 0.0710}, {})    # crosses into CLOSED
+    assert "cancel_all" in c.calls,         "the EXIT -> CLOSED transition failed to retract"
+
+
+
+def test_the_learned_backoff_is_capped_by_CURRENT_headroom():
+    """[review] An offset legal when learned is not legal forever.
+
+    It is learned under whatever skew applied at the time, so a fill that
+    raises skew leaves it oversized: 1.607% learned while flat becomes a
+    2.857% ask once skew reaches 0.95%, outside the 2% ring entirely. And
+    even inside the ring, spread + skew + backoff past the 1.2% trigger
+    means decide() replaces the quote on the very next tick.
+    """
+    from gui.services.permuto.runner import _requote_safe_backoff
+    from gui.services.permuto.quoting import REQUOTE_AT_RING_FRACTION
+    from gui.services.permuto.risk import max_price_skew_frac
+
+    ring, spread = 2.0, 0.40
+    trigger = ring * REQUOTE_AT_RING_FRACTION
+    for skew in (0.0, 0.002, max_price_skew_frac(ring, spread)):
+        # [merge] tick_frac=0.0 keeps this the pure spread+skew
+        # property it was written to be; the tick term is covered by
+        # the parameterised tests that arrived with the anti-cross fix.
+        cap = _requote_safe_backoff(ring, spread, skew, 0.0)
+        total = spread + abs(skew) * 100.0 + cap
+        assert total <= trigger + 1e-9, (
+            "spread %.2f + skew %.3f%% + backoff %.3f = %.4f%%, past the "
+            "%.2f%% re-quote trigger" % (spread, skew * 100.0, cap,
+                                         total, trigger))
+        landed = ((1.0 + abs(skew)) * (1.0 + (spread + cap) / 100.0)
+                  - 1.0) * 100.0
+        assert landed <= ring + 1e-9, (
+            "composed leg at %.4f%% is outside the %.1f%% ring" % (landed,
+                                                                   ring))
+
+
+def test_a_rising_skew_shrinks_the_permitted_backoff():
+    from gui.services.permuto.runner import _requote_safe_backoff
+    wide = _requote_safe_backoff(2.0, 0.40, 0.0, 0.0)
+    tight = _requote_safe_backoff(2.0, 0.40, 0.0056, 0.0)
+    assert tight < wide, "skew rose and the backoff budget did not shrink"
+
+
+def test_no_room_left_yields_zero_not_a_negative():
+    from gui.services.permuto.runner import _requote_safe_backoff
+    assert _requote_safe_backoff(2.0, 1.5, 0.01, 0.0) == 0.0
+
+
+# [ANTICROSS review] Refusal matching, and what counts as a clean tick.
+# --------------------------------------------------------------------------- #
+
+def _venue_reason(reason, idx=(0, 1)):
+    def build(legs):
+        return {"status": "batch_ok",
+                "results": [{"action": "placed",
+                             "rejection_reason": reason if i in idx else None}
+                            for i, _ in enumerate(legs)]}
+    return build
+
+
+def test_the_short_refusal_spelling_also_widens_the_backoff():
+    """The venue's wording is not one fixed sentence.
+
+    Live it sends "Post-only order would cross the book. Switch to GTC or
+    adjust price."; this repo's own fixtures carry the shorter "post-only
+    order would cross". An exact match on "cross the book" skipped the
+    short form, so a refusal took the CLEAN path and DECAYED the backoff
+    instead of widening it -- precisely backwards, and invisible because
+    both spellings look alike at a glance.
+    """
+    c = _Client(account=_account(100.0),
+                batch_response=_venue_reason("post-only order would cross"))
+    r = _runner(c, curfew_enabled=True)
+    r.tick(_MID_SESSION, _ORACLE, {})
+    assert r._cross_backoff.offset_pct(_MKT) > 0.0,         "the short refusal spelling was treated as a clean tick"
+
+
+def test_a_capitalised_full_sentence_refusal_still_matches():
+    c = _Client(account=_account(100.0),
+                batch_response=_venue_reason(
+                    "Post-only order would cross the book. Switch to GTC "
+                    "or adjust price."))
+    r = _runner(c, curfew_enabled=True)
+    r.tick(_MID_SESSION, _ORACLE, {})
+    assert r._cross_backoff.offset_pct(_MKT) > 0.0
+
+
+def test_a_non_crossing_refusal_does_not_decay_the_backoff():
+    """A margin or band rejection is not evidence we stopped crossing.
+
+    Those never reach the venue's post-only check at all, so treating them
+    as a clean tick walks the learned offset back while the book is exactly
+    where it was -- undoing convergence during the other refusal classes.
+    """
+    c = _Client(account=_account(100.0),
+                batch_response=_venue_reason(
+                    "Post-only order would cross the book."))
+    r = _runner(c, curfew_enabled=True)
+    r.tick(_MID_SESSION, _ORACLE, {})
+    widened = r._cross_backoff.offset_pct(_MKT)
+    assert widened > 0.0
+
+    c.batch_response = _venue_reason(
+        "Price 0.0999 is outside the allowed oracle band")
+    r._resting = {}
+    r.tick(_MID_SESSION + 5.0, _ORACLE, {})
+    assert r._cross_backoff.offset_pct(_MKT) == widened, \
+        "a band rejection decayed the crossing backoff"
+
+
+def test_a_rejected_action_with_no_reason_does_not_decay_the_backoff():
+    """action=rejected with no rejection_reason must not count as clean.
+
+    [review] The previous check only tested ``rejection_reason``; a row
+    that carries ``action='rejected'`` and an empty reason passed the
+    guard and decayed the learned offset even though the order did not
+    rest -- exactly backwards.
+    """
+    c = _Client(account=_account(100.0),
+                batch_response=_venue_cross((0, 1)))
+    r = _runner(c, curfew_enabled=True)
+    r.tick(_MID_SESSION, _ORACLE, {})
+    widened = r._cross_backoff.offset_pct(_MKT)
+    assert widened > 0.0
+
+    # Venue sends action=rejected with no reason -- the batch succeeded
+    # overall but the individual legs did not rest.
+    def _rejected_no_reason(legs):
+        return {"status": "batch_ok",
+                "results": [{"action": "rejected", "rejection_reason": None}
+                            for _ in legs]}
+
+    c.batch_response = _rejected_no_reason
+    r._resting = {}
+    r.tick(_MID_SESSION + 5.0, _ORACLE, {})
+    assert r._cross_backoff.offset_pct(_MKT) == widened, \
+        "action=rejected with no reason decayed the crossing backoff"
+
+
+def test_a_market_with_fewer_rows_than_legs_does_not_decay_the_backoff():
+    """zip truncation must not hide an unverifiable leg.
+
+    [review] When leg_rows is shorter than legs, zip silently drops the
+    trailing legs.  The previous code called observe_clean because the
+    market appeared in ``seen`` and not in ``dirty``, even though half
+    the legs had no row at all.  Now the unpaired suffix is marked dirty
+    so the clean path is blocked.
+    """
+    c = _Client(account=_account(100.0),
+                batch_response=_venue_cross((0, 1)))
+    r = _runner(c, curfew_enabled=True)
+    r.tick(_MID_SESSION, _ORACLE, {})
+    widened = r._cross_backoff.offset_pct(_MKT)
+    assert widened > 0.0
+
+    # Return only one row for a two-leg batch -- the other leg is missing.
+    def _one_row(legs):
+        return {"status": "batch_ok",
+                "results": [{"action": "placed", "rejection_reason": None}]}
+
+    c.batch_response = _one_row
+    r._resting = {}
+    r.tick(_MID_SESSION + 5.0, _ORACLE, {})
+    assert r._cross_backoff.offset_pct(_MKT) == widened, \
+        "a truncated row list decayed the crossing backoff"
+
+
+def test_widened_quote_with_max_skew_still_stays_inside_the_ring():
+    """'Retreating is free' must hold even when the pair is at max inventory skew.
+
+    [review] ``test_the_widened_quote_still_earns_full_depth_credit`` runs with
+    position=100 out of max_position≈17143, giving a skew of ~0.006% --
+    effectively zero. That test cannot detect a bound that forgets the skew
+    term. This one reproduces the exact condition where the bug lived:
+    max-skew + max-backoff, quantised.
+
+    With max_position_usd=7.0 and oracle=0.07, max_position=100 contracts, so
+    position=100 is the fully-skewed case (|skew|=0.96%). The backoff is driven
+    to its cap by repeated crossing refusals, then the final ask price is checked
+    against the 2% credit ring measured from the TRUE oracle (not the skewed
+    reference). Before the multiplicative fix the ask landed at 2.0100%;
+    before the tick-reservation fix it landed at 2.0467%.
+    """
+    oracle = _ORACLE[_MKT]
+    # [review] A SHORT just BELOW the cap, not a long AT it.
+    #
+    # The first version used +100 against a 100-contract cap, which hits
+    # the limit exactly -> REDUCE_ONLY -> the sell leg alone. And for a
+    # LONG the skew is negative, so that lone sell is the LEADING leg,
+    # moving toward the oracle. The TRAILING leg -- the one whose skew and
+    # offset compound outward, which is the entire failure mode -- was
+    # never emitted, so the assertion held even under the old additive
+    # bound. It could not have caught what it was written for.
+    #
+    # A short at 95 of 100 keeps both sides quoting and gives the ASK
+    # near-maximum POSITIVE skew, which is the leg that leaves the ring.
+    # [review] A position where the cap is ACTIVE and its effect is
+    # VISIBLE IN THE PRICE.
+    #
+    # The previous version asserted only r._cross_backoff.offset_pct(),
+    # the private stored value -- which is what the controller LEARNED,
+    # not what the ladder APPLIED. At a 95% short the applied cap is only
+    # 0.17%, so the emitted legs were essentially spread+skew and the test
+    # would have passed even if the runner ignored the cap entirely.
+    #
+    # At a 30% short the budget splits 0.25 spread + 0.17 skew + 0.54
+    # backoff, so a learned offset far above the cap must show up in the
+    # price as a clearly non-zero retreat that still lands inside the
+    # trigger. Both halves are checked below.
+    from gui.services.permuto.quoting import REQUOTE_AT_RING_FRACTION
+
+    c = _Client(account=_account(-30.0), batch_response=_venue_cross((0, 1)))
+    r = _runner(c, curfew_enabled=True, max_position_usd=7.0)
+    r._cross_backoff._pct[_MKT] = 5.0        # far past ring and trigger
+    r.tick(_MID_SESSION, _ORACLE, {})
+    assert c.last_batch, "no batch to inspect"
+
+    sides = {leg["side"] for leg in c.last_batch}
+    assert sides == {"buy", "sell"}, (
+        "expected a two-sided book so the TRAILING leg is exercised, got "
+        "%r" % (sides,))
+
+    ask = max(float(leg["price"]) for leg in c.last_batch)
+    out = (ask / oracle - 1.0) * 100.0
+    trigger = 2.0 * REQUOTE_AT_RING_FRACTION
+
+    # APPLIED, not merely computed: without the backoff the ask would sit
+    # at roughly spread + skew (~0.42%), so a materially larger offset is
+    # the only evidence the ladder used the cap at all.
+    assert out > 0.60, (
+        "ask only %.4f%% out -- the capped backoff was never applied to "
+        "the ladder" % out)
+    # And BOUNDED: inside the re-quote trigger, so it is not replaced on
+    # the next tick, and inside the credit ring, so it earns.
+    assert out <= trigger + 1e-6, (
+        "ask %.4f%% is past the %.2f%% re-quote trigger" % (out, trigger))
+    assert out <= 2.0 + 1e-9, (
+        "ask %.4f%% is outside the 2%% credit ring" % out)
+
+
+
+def test_junk_tick_metadata_cannot_disable_the_backoff():
+    """[review] `float(raw or default)` is not a fallback: NaN is TRUTHY.
+
+    A non-finite tick_size therefore sailed through, made the reservation
+    NaN, and headroom_pct returned zero -- which makes observe_cross CLEAR
+    the learned offset. Meanwhile quote_ladder validated and quietly used
+    0.0001, so bad venue metadata disabled the crossing defence while the
+    quote itself carried on as if nothing were wrong.
+    """
+    def crossed(legs):
+        return {"status": "batch_ok",
+                "results": [{"action": "placed", "rejection_reason":
+                             "Post-only order would cross the book."}
+                            for _ in legs]}
+
+    c = _Client(account=_account(100.0), batch_response=crossed)
+    r = _runner(c, curfew_enabled=True)
+    flags = {"specs": {_MKT: {"tick_size": float("nan"), "lot_size": 1.0}}}
+    r.tick(_MID_SESSION, _ORACLE, flags)
+    assert r._cross_backoff.offset_pct(_MKT) > 0.0,         "junk tick metadata cleared the backoff instead of falling back"
+
+
+def test_the_runner_APPLIES_the_backoff_cap_not_just_computes_it():
+    """[review] The helper being correct proves nothing on its own.
+
+    Capping at the LADDER is the part that matters. Coverage that only
+    exercises _requote_safe_backoff leaves the call site free to apply the
+    raw learned offset -- and removing the cap there kept all 625 tests
+    green, which is exactly how this class of gap keeps surviving.
+    """
+    from gui.services.permuto.quoting import REQUOTE_AT_RING_FRACTION
+
+    oracle = _ORACLE[_MKT]
+    c = _Client(account=_account(0.0), batch_response=_venue_ok())
+    r = _runner(c, curfew_enabled=False, max_position_usd=250_000.0)
+    r._cross_backoff._pct[_MKT] = 5.0        # far past ring and trigger
+    r.tick(_MID_SESSION, _ORACLE, {})
+    assert c.last_batch, "no batch to inspect"
+
+    trigger = 2.0 * REQUOTE_AT_RING_FRACTION
+    for leg in c.last_batch:
+        out = abs(float(leg["price"]) / oracle - 1.0) * 100.0
+        assert out <= trigger + 1e-6, (
+            "leg %r sits %.3f%% from the oracle, past the %.2f%% re-quote "
+            "trigger -- the learned backoff was applied uncapped"
+            % (leg, out, trigger))
+
+
+def test_a_pre_bell_print_does_not_satisfy_the_post_open_gate():
+    """[review] "Moved in the last 180s" is not "printed since the bell".
+
+    An oracle that ticks at 13:29 and then stops is still inside the
+    confirmation window at the 13:30 open, so market_frozen() reports it
+    live -- and the runner quoted against a price that predates the
+    session, walking straight through the gate meant to stop exactly that.
+    """
+    c = _Client(account=_account(0.0), batch_response=_venue_ok())
+    r = _runner(c, curfew_enabled=True)
+    open_s = OPENS_UTC[0]
+    # A real print a minute BEFORE the bell, then silence.
+    r.tick(open_s - 120.0, {_MKT: 0.070}, {})
+    r.tick(open_s - 60.0, {_MKT: 0.071}, {})       # moved: genuinely fresh
+    c.calls.clear()
+    res = r.tick(open_s + 30.0, {_MKT: 0.071}, {})  # same value after open
+    assert res.markets.get(_MKT, ("", ""))[0] == "withdraw", res.markets
+    assert "not printed" in res.markets[_MKT][1], res.markets[_MKT]
+
+
+def test_a_post_bell_print_does_satisfy_it():
+    """And the gate must open once the session really starts, or it would
+    forfeit the busiest quarter hour for a danger that has passed."""
+    c = _Client(account=_account(0.0), batch_response=_venue_ok())
+    r = _runner(c, curfew_enabled=True)
+    open_s = OPENS_UTC[0]
+    r.tick(open_s - 120.0, {_MKT: 0.070}, {})
+    r.tick(open_s + 10.0, {_MKT: 0.085}, {})        # a genuine post-bell move
+    res = r.tick(open_s + 30.0, {_MKT: 0.085}, {})
+    assert res.markets.get(_MKT, ("", ""))[0] != "withdraw", res.markets
+
+
+def test_a_market_that_goes_quiet_MID_SESSION_stops_being_quoted():
+    """[review] The gate must outlive SETTLING.
+
+    The aggregate freeze detector resets whenever ANY market prints, so
+    the curfew stays in SESSION while one symbol carries the venue -- and
+    a neighbour that stopped printing was quoted against its own stale
+    price indefinitely. The narrow bug (never printed since the open) is
+    just the first fifteen minutes of this one.
+    """
+    c = _Client(account=_account(0.0), batch_response=_venue_ok())
+    r = _runner(c, curfew_enabled=True)
+    base = _MID_SESSION
+    # Both markets alive, then _MKT goes silent while _MKT2 keeps printing.
+    r.tick(base, {_MKT: 0.070, _MKT2: 0.200}, {})
+    r.tick(base + 10.0, {_MKT: 0.071, _MKT2: 0.201}, {})
+    for i in range(1, 8):                       # well past FREEZE_CONFIRM_S
+        r.tick(base + 10.0 + i * 40.0,
+               {_MKT: 0.071, _MKT2: 0.201 + i * 0.001}, {})
+    res = r.tick(base + 400.0, {_MKT: 0.071, _MKT2: 0.210}, {})
+    assert res.markets.get(_MKT, ("", ""))[0] == "withdraw", res.markets
+    assert "stopped printing" in res.markets[_MKT][1], res.markets[_MKT]
+
+
+def test_a_market_never_yet_observed_is_not_treated_as_stale():
+    """Absence of evidence is not evidence of staleness.
+
+    market_frozen() reports an unseen market as frozen, which is right for
+    the post-bell gate and wrong here: using it as the general in-session
+    test refused to quote anything until a second distinct value had been
+    seen, and broke 59 tests saying so.
+    """
+    c = _Client(account=_account(0.0), batch_response=_venue_ok())
+    r = _runner(c, curfew_enabled=True)
+    res = r.tick(_MID_SESSION, _ORACLE, {})     # the very first tick
+    assert res.markets.get(_MKT, ("", ""))[0] == "quote", res.markets
+
+
+def test_a_withdrawn_book_never_reports_itself_as_holding(monkeypatch):
+    """[review] The GUI read "hold" over a book the runner had emptied.
+
+    Three things must all be empty for the old code to miss a withdrawal,
+    and in this state they are:
+
+      * `pull` lists only markets that still had an order to cancel, and
+        the deferred stage-change retraction (runner.py ~771) has already
+        emptied _resting by the time the posture pass runs at ~948;
+      * `withdrawing` is a snapshot of `results` taken at ~679, BEFORE the
+        posture pass rewrites those entries, so a withdrawal caused by the
+        POSTURE is invisible to it;
+      * decide() said HOLD, so `waiting` is empty too.
+
+    Control then reached `TickResult("hold", "all markets resting and in
+    ring")` while every per-market entry said "withdraw" and nothing was
+    resting at all. The GUI shows the top-level action, so the operator
+    saw a live two-sided book over a market that had been deliberately
+    emptied.
+
+    WHY THIS IS WHITE-BOX. decide() returns HOLD constantly in production
+    -- it is the steady state of a resting book that is still good -- but
+    it is unreachable through _Client, which does not round-trip resting
+    orders: instrumenting the whole existing sweep of stages and oracle
+    regimes produced QUOTE 720 times out of 720 and HOLD never. A
+    black-box test here would pass against the bug, so the HOLD is forced
+    directly rather than pretended into existence.
+    """
+    c = _Client(account=_account(100_000.0))
+    r = _runner(c, curfew_enabled=True, max_position_usd=12_000.0)
+
+    # A normal tick first, so a real book is resting and the curfew has a
+    # stage to move away from.
+    t = _MID_SESSION
+    r.tick(t, _ORACLE, {})
+    assert not r._resting[_MKT].empty, "no resting book to withdraw"
+
+    monkeypatch.setattr(
+        "gui.services.permuto.runner.decide",
+        lambda *a, **k: QuoteDecision(LoopAction.HOLD, "resting and in ring"))
+    # The stage change whose retraction empties _resting mid-tick, after
+    # decide() has already answered.
+    r._curfew_retract_pending = True
+
+    # EXIT: the posture withdraws regardless of what decide() thought.
+    res = r.tick(CLOSES_UTC[0] - 600.0, _ORACLE, {})
+
+    assert r._resting[_MKT].empty, "the retraction did not empty the book"
+    assert all(a == "withdraw" for a, _ in res.markets.values()), res.markets
+    assert res.action == "withdraw", (
+        "reported %r over an empty book" % (res.action,))
+    assert res.reason
+
+
+def test_the_stage_change_retraction_does_not_report_a_live_book(monkeypatch):
+    """[audit] The sibling the posture fix above does NOT catch.
+
+    At the CLOSED -> PREOPEN boundary, 30 minutes before each open, the
+    oracle is still frozen: decide() therefore says HOLD, because the
+    resting quote has not drifted anywhere. `results` and `any_quoted` are
+    frozen from that answer. THEN the deferred stage-change retraction
+    cancels every order and empties _resting -- and rewrites neither.
+
+    `shut` does not save it, because PREOPEN's profile is quote=True: the
+    book is gone for a reason that has nothing to do with posture. So the
+    tick returned "hold -- all markets resting and in ring" on a tick that
+    had just cancelled the entire book, and the GUI paints that as a live
+    two-sided market.
+
+    Reachable once a trading day at that boundary, and on the first tick
+    after a GUI restart (_curfew_stage starts None, so any stage differs)
+    while a book is still resting at the venue.
+    """
+    c = _Client(account=_account(100_000.0))
+    r = _runner(c, curfew_enabled=True, max_position_usd=12_000.0)
+
+    # A book resting overnight, with the curfew latched at CLOSED.
+    r.tick(_OVERNIGHT, _ORACLE, {})
+    assert not r._resting[_MKT].empty
+
+    monkeypatch.setattr(
+        "gui.services.permuto.runner.decide",
+        lambda *a, **k: QuoteDecision(LoopAction.HOLD, "two-sided, in ring"))
+    r._curfew_retract_pending = True
+
+    res = r.tick(OPENS_UTC[1] - 1_800.0, _ORACLE, {})
+
+    # [review] The tick now REBUILDS rather than reporting a bare
+    # withdrawal: `results` was decided against the pre-cancel book, so
+    # every stale HOLD becomes QUOTE and the book goes back out in the
+    # same tick. Waiting a tick would mean a tick of no depth on every
+    # market at once, and the earlier version of this fix only covered
+    # the all-HOLD case anyway -- a mixed QUOTE/HOLD transition left
+    # the holding market empty while still reporting "quote".
+    #
+    # What must never happen is the ORIGINAL bug: claiming a resting
+    # book that is not there.
+    assert res.action != "hold", (
+        "reported a resting book on the tick that cancelled it")
+    assert not r._resting[_MKT].empty, (
+        "the book was cancelled and not rebuilt: %s" % res.action)
+    assert res.action == "quote", res.action
+
+
+def test_one_print_after_the_bell_does_not_buy_the_whole_settle_window():
+    """[audit] "Printed since the open" is satisfied forever by one print.
+
+    changed_since() answers a question with no expiry date: once a market
+    has ticked after the bell, it has ticked after the bell for the rest
+    of the day. So a market that printed at 09:31 and then froze stayed
+    quotable for the remaining fourteen minutes of SETTLING -- the same
+    stale-price trap the gate exists to close, arriving a quarter of an
+    hour later than the case that motivated it.
+
+    The gate needs BOTH halves: printed since the bell, AND not since gone
+    quiet.
+    """
+    open_s = OPENS_UTC[0]
+    c = _Client(account=_account(100_000.0))
+    r = _runner(c, curfew_enabled=True, max_position_usd=12_000.0)
+
+    r.tick(open_s + 10.0, {_MKT: 0.07}, {})          # first sighting only
+    live = r.tick(open_s + 60.0, {_MKT: 0.08}, {})   # a real opening print
+    assert live.action == "quote", (
+        "a market printing after the bell should be quotable: %s"
+        % live.reason)
+
+    # Now it stops, while the clock is still inside the settle window.
+    stale_at = open_s + 60.0 + FREEZE_CONFIRM_S + 5.0
+    assert stale_at < open_s + SETTLE_AFTER_OPEN_S, "left SETTLING too early"
+    gone = r.tick(stale_at, {_MKT: 0.08}, {})
+    assert gone.action == "withdraw", (
+        "a market that went quiet mid-settle stayed quotable: %s"
+        % gone.action)
+
+
+def test_preflight_repricing_snaps_to_the_grid_under_junk_tick_metadata():
+    """[review] "Decided once" was not true of the PRE-SEND path.
+
+    _prepare parsed mspec["tick_size"] raw, so with NaN metadata and a
+    fresh-oracle reprice quantise_toward received NaN and handed back the
+    changed price UNSNAPPED -- an off-grid order going out despite the
+    fallback that had been added for the ladder.
+    """
+    def fetch():
+        # A COLLAPSE, not a nudge. preflight only re-prices a leg that has
+        # fallen outside the band, so a 0.6% move leaves the ladder's own
+        # on-grid prices untouched and the test proves nothing -- which is
+        # how the first version of it passed with the raw tick restored.
+        return {_MKT: 0.0700, _MKT2: 0.200}
+
+    c = _Client(account=_account(0.0))
+    r = _runner2(c, curfew_enabled=False, oracle_fetch=fetch)
+    flags = {"specs": {_MKT: {"tick_size": float("nan"), "lot_size": 1.0}}}
+    r.tick(_MID_SESSION, {_MKT: 0.0800, _MKT2: 0.200}, flags)
+    assert c.last_batch, "no batch was sent"
+    # [review] The generator below is empty if _MKT was dropped, and an
+    # empty loop passes. The batch-level assertion above can be satisfied
+    # by _MKT2 alone, so without this the whole grid check is vacuous
+    # exactly when the preflight path under test failed to send anything.
+    mkt_legs = [l for l in c.last_batch if l["market"] == _MKT]
+    assert mkt_legs, ("no %s leg in the batch -- the preflight path under "
+                      "test never sent one" % _MKT)
+    for leg in mkt_legs:
+        ticks = float(leg["price"]) / 0.0001
+        assert abs(round(ticks) - ticks) < 1e-6, (
+            "leg %r is off the 0.0001 grid -- junk metadata bypassed the "
+            "normalised tick on the preflight path" % (leg,))
+
+
+def test_a_MISSING_MIDDLE_row_poisons_the_whole_mapping():
+    """[review] Not just the unpaired tail.
+
+    Rows are paired with legs by POSITION, so a row missing from the
+    MIDDLE shifts every later pairing by one: a market reads another
+    market's result and can come back "seen" and clean while its own leg
+    was refused. The previous fix marked only the suffix dirty, which
+    covers the one case where the shift happens to be at the end.
+    """
+    c = _Client(account=_account(100.0),
+                batch_response=lambda legs: {
+                    "status": "batch_ok",
+                    "results": [{"action": "placed", "rejection_reason":
+                                 "Post-only order would cross the book."}
+                                for _ in legs]})
+    r = _runner(c, curfew_enabled=True)
+    r.tick(_MID_SESSION, _ORACLE, {})
+    widened = r._cross_backoff.offset_pct(_MKT)
+    assert widened > 0.0
+
+    # Two legs go out; ONE row comes back, and it looks clean.
+    c.batch_response = lambda legs: {
+        "status": "batch_ok", "results": [{"action": "placed"}]}
+    r._resting = {}
+    r.tick(_MID_SESSION + 5.0, _ORACLE, {})
+    assert r._cross_backoff.offset_pct(_MKT) == widened,         "an ambiguous row count decayed the backoff anyway"
+
+
+def test_a_SURPLUS_row_is_equally_unusable():
+    """More rows than legs is the same ambiguity from the other side."""
+    c = _Client(account=_account(100.0),
+                batch_response=lambda legs: {
+                    "status": "batch_ok",
+                    "results": [{"action": "placed", "rejection_reason":
+                                 "Post-only order would cross the book."}
+                                for _ in legs]})
+    r = _runner(c, curfew_enabled=True)
+    r.tick(_MID_SESSION, _ORACLE, {})
+    widened = r._cross_backoff.offset_pct(_MKT)
+
+    c.batch_response = lambda legs: {
+        "status": "batch_ok",
+        "results": [{"action": "placed"} for _ in range(len(legs) + 2)]}
+    r._resting = {}
+    r.tick(_MID_SESSION + 5.0, _ORACLE, {})
+    assert r._cross_backoff.offset_pct(_MKT) == widened,         "a surplus row count decayed the backoff anyway"
+
+
+def test_a_mixed_failure_is_not_blamed_on_the_trading_mode(monkeypatch):
+    """[review] The posture took the blame for someone else's failure.
+
+    The mode-withdrawal label was awarded when every SKIPPED market was a
+    mode skip -- but a market left marked "quote" that produced no legs
+    (an invalid ladder, a clamp to zero size) appears in neither list, so
+    the equality held anyway. The tick then reported a clean mode
+    withdrawal and the real cause never surfaced anywhere.
+
+    Blaming the posture is only honest when the posture is the whole
+    story, so the denominator has to be EVERY market.
+    """
+    c = _Client(account=_account(100_000.0))
+    r = _runner2(c, curfew_enabled=True, max_position_usd=12_000.0)
+
+    # _MKT goes quiet and is withdrawn by posture; _MKT2 keeps printing so
+    # it stays a quoting market -- but its ladder yields nothing.
+    monkeypatch.setattr("gui.services.permuto.runner.quote_ladder",
+                        lambda *a, **k: [])
+    t = _MID_SESSION
+    res = None
+    for i in range(6):
+        res = r.tick(t, {_MKT: 0.07, _MKT2: 0.07 + (i % 5) * 0.0004}, {})
+        t += 60.0
+
+    assert res.action != "withdraw", (
+        "a ladder that produced nothing was reported as a mode withdrawal, "
+        "hiding the real cause: %s" % res.reason)
+
+
+def test_a_posture_change_retracts_even_with_no_position_cap():
+    """[review] The latch and the posture drifted apart.
+
+    With max_position_usd unset, assess_curfew() pins curfew.stage at
+    UNSCHEDULED forever -- but posture_stage now follows schedule_stage,
+    so CLOSED -> PREOPEN moves the PROFILE (full size to half, 1.0x
+    spread to 1.6x) while a latch keyed only on curfew.stage sees nothing
+    happen. decide() answers HOLD for a quote that is still fresh and
+    in-ring, so a full-size overnight book rode straight through the
+    run-up to the bell at a size the new posture forbids.
+
+    Caused by the fix that gave posture its own stage: the transition key
+    has to cover both, or every posture-only change is invisible.
+    """
+    # [review] FLAT, not long. Starting 100,000 contracts long masked
+    # the sentinel bug entirely: a long permits a reducing sell, so a
+    # book went out and the test passed while a FLAT account with the
+    # same config could not quote at all.
+    c = _Client(account=_account(0.0))
+    r = _runner(c, curfew_enabled=True, max_position_usd=0.0)   # no cap
+
+    # Overnight: CLOSED posture, a book resting.
+    r.tick(_OVERNIGHT, _ORACLE, {})
+    assert not r._resting[_MKT].empty, "no overnight book to carry"
+    cancels_before = len(getattr(c, "cancelled", []) or [])
+
+    # Cross into PREOPEN. The cap stage has not moved -- it cannot -- but
+    # the profile has, so the resting book must be retracted and rebuilt.
+    r.tick(OPENS_UTC[1] - 1_500.0, _ORACLE, {})
+
+    assert getattr(r, "_curfew_retract_pending", False) or \
+        len(getattr(c, "cancelled", []) or []) > cancels_before, (
+            "a posture-only transition left the old book resting")
+
+
+def test_a_market_pinned_reduce_only_says_so_once(caplog):
+    """[audit] The failure that cost ~40% of a simulated night.
+
+    [review] NAMED FOR WHAT IT ACTUALLY EXERCISES. An earlier version
+    claimed the exhausted-ROOM path, but -100,000 contracts at 0.07 is
+    $7,000 against a $1,200 cap, so assess() returns REDUCE_ONLY long
+    before permitted_leg_size() floors anything. The room-floor branch is
+    a one-contract-wide window between |position| > short_cap - 1 and
+    |position| >= short_cap; REDUCE_ONLY is the path that actually runs,
+    and it is the one worth pinning.
+
+    Overnight flow is one-directional -- buyers lift our ask, and nothing
+    sells back against a frozen oracle -- so the short room drains. When
+    it runs out the ask leg is dropped, the book goes one-sided, and
+    depth credit is min(bid, ask), so the market earns EXACTLY ZERO for
+    the rest of the night.
+
+    Two things made it invisible. assess() still reports NORMAL, because
+    the floor leaves |position| a hair BELOW the cap; and one_sided_ok
+    only recognised a ZERO cap, so decide() read the missing ask as a
+    repairable gap and returned QUOTE every tick -- ~12,600 authenticated
+    cancel+upsert pairs across one night, each replacing a quote with a
+    copy of itself, on a rate-limited route.
+    """
+    # A short already at the overnight cap: room for the ask is gone.
+    # -100,000 contracts at oracle 0.07 = $7,000 short, against an
+    # overnight short cap of $12,000 x 0.10 = $1,200. Room is gone.
+    c = _Client(account=_account(-100_000.0))
+    r = _runner(c, curfew_enabled=True, max_position_usd=12_000.0)
+
+    with caplog.at_level(logging.CRITICAL,
+                         logger="gui.services.permuto.runner"):
+        r.tick(_OVERNIGHT, _ORACLE, {})
+
+    assert _MKT in r._pinned_markets, "the pin was not recorded"
+    pinned = [m for m in caplog.messages if "PINNED ONE-SIDED" in m]
+    assert pinned, "a market stopped earning and nothing said so"
+    assert "ZERO depth" in pinned[0], pinned[0]
+
+    # ...and it is not re-announced on every subsequent tick.
+    caplog.clear()
+    with caplog.at_level(logging.CRITICAL,
+                         logger="gui.services.permuto.runner"):
+        r.tick(_OVERNIGHT + 60.0, _ORACLE, {})
+    assert not [m for m in caplog.messages if "PINNED ONE-SIDED" in m], (
+        "the pin is announced every tick instead of on entry")
+
+
+def test_a_pinned_market_tells_decide_its_missing_side_is_intended(monkeypatch):
+    """[audit] ~12,600 authenticated re-upserts across one overnight.
+
+    one_sided_ok told decide() "this side is closed on purpose" only when
+    the CAP was zero. A side pinned by exhausted ROOM leaves the cap
+    positive, so decide() read the missing leg as a repairable gap and
+    returned QUOTE every tick -- cancelling and re-placing an identical
+    quote every 5 seconds until morning, on a route the venue documents
+    as rate-limited. A 429 there takes down the markets still earning.
+
+    Asserted at the mechanism rather than by counting requests: _Client
+    does not round-trip resting orders, so decide() always sees an empty
+    book in this harness and re-quotes whatever the flag says. Counting
+    upserts here would measure the double, not the fix.
+    """
+    seen = {}
+    real = runner_decide
+
+    def _spy(view, resting, **kw):
+        seen["one_sided_ok"] = kw.get("one_sided_ok")
+        return real(view, resting, **kw)
+
+    monkeypatch.setattr("gui.services.permuto.runner.decide", _spy)
+
+    c = _Client(account=_account(-100_000.0))
+    r = _runner(c, curfew_enabled=True, max_position_usd=12_000.0)
+
+    r.tick(_OVERNIGHT, _ORACLE, {})
+    assert _MKT in r._pinned_markets, "the pin was not detected"
+    # The cap is POSITIVE -- this is room exhaustion, not a closed side,
+    # which is exactly the case the old test missed.
+    assert r._curfew.short_cap_usd > 0.0
+
+    r.tick(_OVERNIGHT + 60.0, _ORACLE, {})
+    assert seen.get("one_sided_ok") is True, (
+        "a market pinned by exhausted room still reported its missing side "
+        "as a gap to repair -- decide() will re-upsert it every tick")
+
+
+def test_a_pin_clears_once_the_position_is_reduced():
+    """[review] The pin could be set but never cleared.
+
+    A pinned market makes decide() answer HOLD, so any_quoted is false
+    and the tick returns at the no-quote branch -- which sat ABOVE the
+    line that updates _pinned_markets. An operator who reduced the
+    position would find the market still latched and its missing side
+    never rebuilt: a worse stuck state than the one the pin was added to
+    report.
+    """
+    c = _Client(account=_account(-100_000.0))
+    r = _runner(c, curfew_enabled=True, max_position_usd=12_000.0)
+    r.tick(_OVERNIGHT, _ORACLE, {})
+    assert _MKT in r._pinned_markets, "the pin was never set"
+
+    # The operator closes the position. Nothing else changes.
+    c.account_payload = _account(0.0)
+    r.tick(_OVERNIGHT + 60.0, _ORACLE, {})
+    assert _MKT not in r._pinned_markets, (
+        "the pin survived the position being reduced -- the missing side "
+        "will never be rebuilt")
+
+
+def test_the_no_limit_sentinel_still_quotes_both_sides():
+    """[review] Fixing the sentinel for assess() alone was half a fix.
+
+    assess_curfew() leaves both side caps at zero when no per-market cap
+    is configured -- correctly, a curfew cannot be a fraction of a number
+    nobody set. But permitted_leg_size() was still handed those zero
+    caps, so BOTH legs were dropped and a flat account with the cap
+    disabled reported risk_blocked and quoted nothing at all.
+    """
+    c = _Client(account=_account(0.0))
+    r = _runner(c, curfew_enabled=True, max_position_usd=0.0)
+    res = r.tick(_OVERNIGHT, _ORACLE, {})
+
+    assert res.action == "quote", (
+        "a flat account with the cap disabled quoted nothing: %s"
+        % res.reason)
+    sides = sorted(leg["side"] for leg in (c.last_batch or []))
+    assert sides == ["buy", "sell"], (
+        "depth credit is min(bid, ask); one side earns nothing: %s" % sides)
+
+
+def test_the_budget_counts_positions_in_markets_we_do_not_quote():
+    """[review] A budget that only sees its own book is not a budget.
+
+    MarginState.positions comes from /exchange/account, and QuoteRunner
+    can be built with a SUBSET of markets -- so exposure held in an
+    unconfigured market, or opened by hand, was invisible to the
+    portfolio budget and it authorised that much again on top.
+
+    Asserted as a DIFFERENCE against a control, because the absolute
+    outcome depends on sizing that is not the point here: the same
+    account, plus one holding the runner does not quote, must stop being
+    two-sided. (It cannot be valued without an oracle, and an unvaluable
+    neighbour has to fail closed rather than be skipped.)
+    """
+    def _sides(extra):
+        positions = {_MKT: -50_000.0}
+        positions.update(extra)
+        c = _Client(account={"equity_usd": 500_000.0,
+                             "used_margin_usd": 0.0,
+                             "positions": positions})
+        r = _runner(c, curfew_enabled=False, max_position_usd=250_000.0)
+        r.tick(1.0, {_MKT: 0.07}, {})
+        return sorted(leg["side"] for leg in (c.last_batch or []))
+
+    assert _sides({}) == ["buy", "sell"], "the control was not two-sided"
+    assert _sides({"OTHER-VOL-PERP": 9_000_000.0}) == ["buy"], (
+        "a holding in an unquoted market did not reach the portfolio "
+        "budget -- exposure outside the configured set is invisible to it")
+
+
+def test_the_portfolio_budget_stops_new_exposure_but_never_a_reduction():
+    """[review] A budget that only binds once you hold something is not a
+    budget.
+
+    Handing it to assess() as max_position bounds the POSITION limit, not
+    new exposure: with the budget spent by neighbours and this market
+    FLAT, abs(0) >= 1e-9 is false, so assess() answers NORMAL and both
+    risk-increasing legs go out at full size.
+
+    A REDUCING leg must still be allowed. Blocking it would trap the book
+    at the exact moment it is trying to get back inside the budget.
+    """
+    def _run(positions):
+        c = _Client(account={"equity_usd": 500_000.0,
+                             "used_margin_usd": 0.0,
+                             "positions": positions})
+        r = _runner(c, curfew_enabled=False, max_position_usd=250_000.0)
+        res = r.tick(1.0, {_MKT: 0.07, "NVDA-VOL-PERP": 0.07}, {})
+        return res.action, sorted(leg["side"]
+                                  for leg in (getattr(c, "last_batch", None)
+                                              or []))
+
+    # Room available: an ordinary two-sided book.
+    assert _run({_MKT: 0.0}) == ("quote", ["buy", "sell"])
+
+    # A neighbour has spent the whole budget and we are FLAT -- the case
+    # every per-market check calls harmless.
+    action, sides = _run({_MKT: 0.0, "NVDA-VOL-PERP": 4_400_000.0})
+    assert sides == [], (
+        "risk-increasing legs went out after the portfolio budget was "
+        "exhausted: %s" % sides)
+    assert action == "risk_blocked", action
+
+    # Over budget and SHORT: the buy reduces us, and must survive.
+    action, sides = _run({_MKT: -50_000.0, "NVDA-VOL-PERP": 4_400_000.0})
+    assert sides == ["buy"], (
+        "the reducing leg was blocked, trapping the book over budget: %s"
+        % sides)
+
+
+def test_recovery_is_announced_only_when_a_book_is_actually_resting(caplog):
+    """[review] "depth resumes" is a claim about the BOOK.
+
+    Leaving the pin only means risk stopped forbidding a side. _resting
+    can still be empty, and the batch that rebuilds it can still be
+    rejected -- so announcing recovery there tells an operator depth is
+    back while the market earns exactly zero. Same mistake as measuring
+    depth credit before the venue answered: report the achievement, not
+    the intention.
+    """
+    c = _Client(account=_account(-100_000.0))
+    r = _runner(c, curfew_enabled=True, max_position_usd=12_000.0)
+    r.tick(_OVERNIGHT, _ORACLE, {})
+    assert _MKT in r._pinned_markets
+
+    # The position is reduced, so the pin lifts -- but nothing is resting.
+    c.account_payload = _account(0.0)
+    r._resting[_MKT] = RestingQuote()
+    with caplog.at_level(logging.WARNING,
+                         logger="gui.services.permuto.runner"):
+        r.tick(_OVERNIGHT + 60.0, _ORACLE, {})
+
+    resumed = [m for m in caplog.messages if "depth resumes" in m]
+    assert not resumed, (
+        "recovery was announced over an empty book: %s" % resumed)
+    honest = [m for m in caplog.messages if "no longer pinned" in m]
+    assert honest, "the un-pinning was not reported at all"
+
+
+def test_an_unset_cap_does_not_force_reduce_only_on_a_held_position():
+    """[review] The other half of the sentinel, and the half a flat
+    account cannot show.
+
+    assess() reads a non-positive max_position as "no limit" -- exactly
+    what the sentinel means. The runner clamped it to 1e-9 instead, so
+    ANY nonzero position satisfied `abs(position) >= max_position` and
+    became REDUCE_ONLY: one-sided, and earning nothing, on the setting an
+    operator chose to remove limits with.
+
+    A FLAT account cannot distinguish the two, because 0 >= 1e-9 is false
+    either way -- which is why this needs a held position and why the
+    original test, starting long, still managed to hide the leg-clamp
+    half of the same bug.
+    """
+    c = _Client(account=_account(100_000.0))    # a real long
+    r = _runner(c, curfew_enabled=True, max_position_usd=0.0)
+    res = r.tick(_OVERNIGHT, _ORACLE, {})
+
+    assert res.action == "quote", res.reason
+    sides = sorted(leg["side"] for leg in (getattr(c, "last_batch", None)
+                                           or []))
+    assert sides == ["buy", "sell"], (
+        "a held position under the no-limit sentinel was forced "
+        "reduce-only: %s" % sides)
+
+
+def test_a_mixed_quote_hold_transition_rebuilds_every_market(monkeypatch):
+    """[review] The earlier fix only covered the all-HOLD case.
+
+    It hung off `not any_quoted`, so with ONE market deciding QUOTE and
+    another HOLD, the quoting loop rebuilt the first and left the second
+    empty for a tick -- while the tick reported top-level "quote", which
+    is the same lie the all-HOLD case was fixed for, just harder to see.
+
+    `results` is decided against the book that existed before the
+    stage-change retraction cancelled everything, and HOLD means "what is
+    resting is fine". After the cancel nothing is resting, so every HOLD
+    is stale by construction.
+    """
+    from gui.services.permuto.quoting import LoopAction, QuoteDecision
+
+    c = _Client(account=_account(100.0))
+    r = _runner2(c, curfew_enabled=True, max_position_usd=12_000.0)
+
+    # [review] BY CALL ORDER, not by a market attribute. VenueView has
+    # no `market` field, so the original getattr() was always None and
+    # BOTH calls returned HOLD -- the test exercised the all-HOLD path
+    # while claiming the mixed one, and would have passed with the
+    # mixed handling removed. (The mutation check did fail it, but for
+    # the all-HOLD reason, which is exactly how a mislabelled test
+    # survives one.) The runner iterates _MKT then _MKT2.
+    calls = []
+
+    def _mixed(view, resting, **kw):
+        calls.append(1)
+        if len(calls) == 1:                 # _MKT: holds
+            return QuoteDecision(LoopAction.HOLD, "two-sided and in ring")
+        return QuoteDecision(LoopAction.QUOTE, "no quote resting")
+
+    r.tick(_OVERNIGHT, {_MKT: 0.07, _MKT2: 0.07}, {})
+    monkeypatch.setattr("gui.services.permuto.runner.decide", _mixed)
+    r._curfew_retract_pending = True
+
+    res = r.tick(OPENS_UTC[1] - 1_500.0, {_MKT: 0.07, _MKT2: 0.07}, {})
+
+    assert len(calls) >= 2, (
+        "decide() was called %d time(s); the mixed case needs both "
+        "markets to answer" % len(calls))
+    holding = [m for m, (a, _) in res.markets.items() if a == "hold"]
+    assert not holding, (
+        "a market still says HOLD after its book was cancelled: %s" % holding)
+    for market in (_MKT, _MKT2):
+        assert not r._resting[market].empty, (
+            "%s was cancelled and left empty while the tick reported %r"
+            % (market, res.action))
