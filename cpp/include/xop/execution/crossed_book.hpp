@@ -186,7 +186,7 @@ struct CrossedBookDecision {
 
     Mojo        best_bid_price{0};   ///< highest competing bid, 0 if none
     Mojo        best_ask_price{0};   ///< lowest competing ask, 0 if none
-    std::string best_ask_offer_id;   ///< id of that ask, empty if none
+    std::string best_ask_offer_id{}; ///< id of that ask, empty if none
     Mojo        best_ask_size{0};    ///< the counterparty's size, VERBATIM
     double      edge_bps{0.0};       ///< (bid - ask) / ask * 10000, 0 if not crossed
 

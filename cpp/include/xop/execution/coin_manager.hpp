@@ -76,7 +76,12 @@ struct SplitResult {
     int  coins_created{0};     ///< Number of new coins produced by the split.
     Mojo fee_paid{0};          ///< Transaction fee paid in mojos.
     bool success{false};       ///< True if the split transaction was accepted.
-    std::string tx_id;         ///< Transaction (spend bundle) ID, if available.
+    std::string tx_id{};       ///< Transaction (spend bundle) ID, if available.
+                               ///  [CI, GCC] The {} is load-bearing: every
+                               ///  designated-initializer site that skips this
+                               ///  member trips -Wmissing-field-initializers,
+                               ///  which -Wextra enables and MSVC has no
+                               ///  equivalent for. Its siblings all carry one.
 
     /// [S41] True when the split was abandoned because the coin enumeration
     /// FAILED -- not because the wallet lacked funds. The two were previously

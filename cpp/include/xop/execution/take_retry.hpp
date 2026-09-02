@@ -571,7 +571,7 @@ struct TakeDecision {
 // someone forgot to wire. They are deleted rather than "surfaced": the cost is
 // already on TakeDecision, which is what the call site logs.
 struct TakeRetryEntry {
-    std::string      pair;
+    std::string      pair{};
     OfferFingerprint fp{};
 
     // -- deterministic class, post-RPC only ------------------------------
