@@ -110,9 +110,11 @@
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "xop/types.hpp"
+#include "xop/util/denom.hpp"
 
 namespace xop::execution {
 
@@ -134,11 +136,30 @@ namespace xop::execution {
 // unrepresentable cap is an unbounded cap, and unbounded is the bug -- so it
 // declines rather than falling back to "no limit".
 // ---------------------------------------------------------------------------
-[[nodiscard]] inline Mojo cap_mojos_for(double       max_take_units,
-                                        std::int64_t base_mojos_per_unit) noexcept
+// [2026-09-02] THE RETURN TYPE IS NOW BaseMojos, AND THAT IS THE POINT.
+// This cap is what Step 9e's `base_sz > max_mojos` is tested against. While it
+// returned a bare Mojo, the comparison accepted a bid's raw quote-denominated
+// size on the left -- which is the defect, verbatim. With BaseMojos on the
+// right, only a base-denominated left operand compiles. See the ACCEPTANCE block
+// in take_sizing.hpp.
+//
+// NOT MADE constexpr, deliberately, and this contradicts a survey note that said
+// it must be. The value-level static_asserts that would have needed constant
+// evaluation were replaced by CONCEPT-level ones (callability and return type),
+// which need no such thing. Going constexpr would mean removing std::isfinite --
+// not constexpr in C++20 on either toolchain -- and hand-rolling the
+// non-finiteness check on a live money path. That is a behaviour change smuggled
+// into a type change, and the whole premise of this increment is that the
+// arithmetic does not move. Left inline on purpose.
+//
+// The `double` -> Mojo narrowing, the 9.0e18 bound and the truncate-down
+// conservatism below are all UNCHANGED. Only the wrapper on the way out is new.
+// ---------------------------------------------------------------------------
+[[nodiscard]] inline BaseMojos cap_mojos_for(double  max_take_units,
+                                             BaseMpu base_mojos_per_unit) noexcept
 {
-    if (base_mojos_per_unit <= 0) return 0;
-    if (!(max_take_units > 0.0) || !std::isfinite(max_take_units)) return 0;
+    if (base_mojos_per_unit.v <= 0) return BaseMojos{0};
+    if (!(max_take_units > 0.0) || !std::isfinite(max_take_units)) return BaseMojos{0};
 
     // 9.0e18 is exactly representable as a double (9e18 = 2^18 * 34332275390625,
     // a 46-bit odd part) and is strictly below 2^63, so both the comparison
@@ -192,12 +213,26 @@ namespace xop::execution {
     constexpr double kMaxSafe = 9.0e18;
 
     const double cap_ld = static_cast<double>(max_take_units)
-                        * static_cast<double>(base_mojos_per_unit);
-    if (cap_ld > kMaxSafe) return 0;
+                        * static_cast<double>(base_mojos_per_unit.v);
+    if (cap_ld > kMaxSafe) return BaseMojos{0};
 
     const Mojo cap = static_cast<Mojo>(cap_ld);  // truncates down -- conservative
-    return cap > 0 ? cap : 0;
+    return BaseMojos{cap > 0 ? cap : 0};
 }
+
+// The cap's denomination, pinned at compile time. No constant evaluation is
+// needed for this, which is why cap_mojos_for did not have to become constexpr.
+static_assert(std::is_same_v<decltype(cap_mojos_for(1.0, BaseMpu{1})), BaseMojos>);
+
+// And the transposition: an mpu is not a unit count and a unit count is not an
+// mpu. Templated so the substitution is dependent -- a bare requires-expression
+// in this position is a HARD ERROR on MSVC, not a false constraint. See the long
+// note on this in take_sizing.hpp's ACCEPTANCE block.
+template <class U, class M>
+concept CapCallable = requires(U u, M m) { cap_mojos_for(u, m); };
+static_assert( CapCallable<double, BaseMpu>);
+static_assert(!CapCallable<double, QuoteMpu>);      // wrong denomination
+static_assert(!CapCallable<double, std::int64_t>);  // unwrapped mpu
 
 // ---------------------------------------------------------------------------
 // The verdict. Exactly one of these describes any book.
@@ -222,15 +257,24 @@ struct CrossedBookDecision {
     Mojo        best_bid_price{0};   ///< highest competing bid, 0 if none
     Mojo        best_ask_price{0};   ///< lowest competing ask, 0 if none
     std::string best_ask_offer_id{}; ///< id of that ask, empty if none
-    Mojo        best_ask_size{0};    ///< the counterparty's size, VERBATIM
     double      edge_bps{0.0};       ///< (bid - ask) / ask * 10000, 0 if not crossed
+
+    /// The counterparty's size, VERBATIM.
+    ///
+    /// [2026-09-02] BaseMojos, not Mojo. This decision is ASK-ONLY BY
+    /// CONSTRUCTION -- the selection loop below only ever writes this field
+    /// inside `if (co.side == Side::Ask)`, and an ask's advertised size IS base
+    /// mojos -- so the denomination is statically known here even though
+    /// CompetingOffer::size is runtime-denominated in general. Typing it is what
+    /// makes the cap comparison below a BaseMojos-vs-BaseMojos check.
+    BaseMojos   best_ask_size{};
 
     /// Non-zero IFF verdict == Take, and then exactly best_ask_size.
     /// Never a clamped value. See the biconditional at the top of this file.
-    Mojo take_size{0};
+    BaseMojos take_size{};
 
     /// The cap this decision was judged against, for the log. 0 when unusable.
-    Mojo cap_mojos{0};
+    BaseMojos cap_mojos{};
 };
 
 // ---------------------------------------------------------------------------
@@ -250,7 +294,7 @@ struct CrossedBookDecision {
 [[nodiscard]] inline CrossedBookDecision evaluate_crossed_book(
     const std::vector<CompetingOffer>& offers,
     double                             min_edge_bps,
-    Mojo                               cap_mojos)
+    BaseMojos                          cap_mojos)
 {
     CrossedBookDecision d;
 
@@ -275,7 +319,13 @@ struct CrossedBookDecision {
         if (co.side == Side::Ask && co.price < best_ask) {
             best_ask            = co.price;
             d.best_ask_offer_id = co.offer_id;
-            d.best_ask_size     = co.size;
+            // The one hand-wrap in this file, and it is sound BECAUSE it sits
+            // inside the `co.side == Side::Ask` test two lines above: an ask's
+            // advertised size is base mojos by the ingest invariant. Any future
+            // edit that moves this assignment out of the ask branch must
+            // re-derive the denomination -- see denom.hpp LIMIT 1, a wrap is a
+            // human judgement the type system cannot check.
+            d.best_ask_size     = BaseMojos{co.size};
             have_ask            = true;
         }
     }
@@ -290,7 +340,7 @@ struct CrossedBookDecision {
         // the quiet-verdict filter must not be able to print a real size
         // against a zero price.
         d.best_ask_offer_id.clear();
-        d.best_ask_size = 0;
+        d.best_ask_size = BaseMojos{0};
         return d;  // take_size stays 0
     }
 
@@ -315,7 +365,7 @@ struct CrossedBookDecision {
         return d;
     }
 
-    if (cap_mojos <= 0) {
+    if (cap_mojos <= BaseMojos{0}) {
         d.verdict = CrossedBookVerdict::CapUnusable;
         return d;
     }
@@ -325,7 +375,7 @@ struct CrossedBookDecision {
     // taken on chain and record_taker_fill() returns early on its
     // `base_mojos <= 0` guard, leaving a settled take with NO taker_fills row
     // and NO ledger legs at all.
-    if (d.best_ask_size <= 0) {
+    if (d.best_ask_size <= BaseMojos{0}) {
         d.verdict = CrossedBookVerdict::ZeroSizeOffer;
         return d;
     }

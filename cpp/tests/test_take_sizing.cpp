@@ -72,10 +72,69 @@
 
 using xop::kMojosPerXch;
 using xop::Mojo;
-using xop::execution::base_size_for_bid;
-using xop::execution::quote_cost_for_ask;
 
+// ===========================================================================
+// [2026-09-02] TEST-LOCAL UNTYPED ADAPTERS, AND WHY THEY ARE THE RIGHT CHOICE
+// HERE RATHER THAN A DODGE.
+//
+// quote_cost_for_ask and base_size_for_bid now take BaseMojos/QuoteMojos and
+// BaseMpu/QuoteMpu (see cpp/include/xop/util/denom.hpp). Roughly 60 assertions
+// in this file pass bare integer literals and compare against bare integer
+// literals. There were two ways to absorb that:
+//
+//   (a) wrap all ~60 call sites and all ~60 expected values by hand, or
+//   (b) adapt at ONE point and leave every assertion byte-identical.
+//
+// (b) IS CHOSEN, for three reasons, and the third is the decisive one:
+//
+//   1. THE ACCEPTANCE CRITERION FOR THE RETYPE IS "NO VALUE MOVED". The strong
+//      typedefs are constexpr wrappers that compile away, so the arithmetic must
+//      be bit-identical; if it is not, the type change broke the maths. Leaving
+//      the assertions untouched makes that property auditable by `git diff` --
+//      the diff for this file shows ZERO changed numbers. Hand-wrapping 60 sites
+//      would bury that signal in 120 lines of mechanical churn and give a typo
+//      the chance to mask a real change.
+//
+//   2. THIS FILE'S JOB IS ARITHMETIC, NOT DENOMINATION. It is the exact-integer
+//      kernel's differential test against an independent decimal long-division
+//      reference. The denomination guarantee is proven where it belongs: by the
+//      concept-based static_asserts in take_sizing.hpp's ACCEPTANCE block
+//      (which fail the BUILD, on both toolchains, not a test run) and by
+//      cpp/tests/test_denom.cpp.
+//
+//   3. IT PRESERVES THE MIDDLE-LIMB CARRY WITNESS. The differential and seeded
+//      sweeps below feed ONE loop variable to BOTH functions, which cannot be
+//      done with strong types -- a single value cannot be BaseMojos and
+//      QuoteMojos at once. Splitting those loops into two typed variables is
+//      exactly the "harmless test edit" that take_sizing.hpp:596-621 warns
+//      silently drops the only runtime coverage of the mul3_u64 carry. Adapting
+//      instead of splitting keeps that coverage intact.
+//
+// These adapters take bare integers ON PURPOSE. They are the boundary; nothing
+// below them is denomination-aware, and nothing below them needs to be.
+// ===========================================================================
 namespace {
+
+[[nodiscard]] constexpr Mojo quote_cost_for_ask(Mojo         base_size,
+                                                Mojo         price,
+                                                std::int64_t base_mpu,
+                                                std::int64_t quote_mpu) noexcept
+{
+    return xop::execution::quote_cost_for_ask(xop::BaseMojos{base_size}, price,
+                                              xop::BaseMpu{base_mpu},
+                                              xop::QuoteMpu{quote_mpu}).v;
+}
+
+[[nodiscard]] constexpr Mojo base_size_for_bid(Mojo         quote_size,
+                                               Mojo         price,
+                                               std::int64_t base_mpu,
+                                               std::int64_t quote_mpu) noexcept
+{
+    return xop::execution::base_size_for_bid(xop::QuoteMojos{quote_size}, price,
+                                             xop::BaseMpu{base_mpu},
+                                             xop::QuoteMpu{quote_mpu}).v;
+}
+
 
 // The live denominations (config.cpp:638): XCH bases are 1e12 mojos/unit,
 // CATs are 1000.

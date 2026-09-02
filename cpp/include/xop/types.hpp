@@ -572,18 +572,45 @@ struct TierQuote {
     Side         side;         // Bid (buy) or Ask (sell).
     Mojo         price;        // Offer price in mojos.
 
-    // Offer quantity in mojos of the *side-relevant* asset:
-    //   - Bid (buy):  quote-asset mojos — the capital we are willing to spend.
-    //   - Ask (sell): base-asset mojos  — the inventory we are willing to sell.
+    // Offer quantity in BASE-ASSET MOJOS, on BOTH SIDES.
     //
-    // The execution layer (OfferManager::build_offer_dict) uses this convention
-    // to compute the counter-leg amount:
+    // [2026-09-02] THIS COMMENT USED TO SAY THE OPPOSITE FOR A BID, AND IT WAS
+    // WRONG. It read:
+    //
+    //     - Bid (buy):  quote-asset mojos -- the capital we are willing to spend
+    //     ...
+    //     LiquidityEngine::build_ladder() sets bid size from available quote
+    //     capital (`cap * size_frac`) ...
+    //
+    // Two things are wrong with that. First, `LiquidityEngine::build_ladder()`
+    // DOES NOT EXIST -- the only occurrence of that name in the tree was the
+    // citation itself. Second, the live producer is liquidity.cpp's tier loop,
+    // where `bid_size = tier_size_for_pool(bid_pool)` and `bid_pool` derives
+    // from `cap` == `avail_capital`, which engine.cpp states outright in its own
+    // comment: "avail_capital is BASE-asset mojos (see the caps below)". So a
+    // bid tier's size is BASE mojos, exactly like an ask's.
+    //
+    // WHY THIS MATTERED ENOUGH TO FIX. Three Step 7/Step 8 call sites in
+    // engine.cpp pass this field to execution::quote_cost_for_ask, which now
+    // takes a BaseMojos and therefore requires an explicit `BaseMojos{tq.size}`
+    // wrap. A reader who trusted this comment would conclude those three wraps
+    // were bugs and "correct" them into a REAL denomination error on the
+    // exposure kill switch. The strong typedefs force the question at every such
+    // site, which is how the stale comment surfaced; a wrap is a human judgement
+    // the type system cannot check (see xop/util/denom.hpp, LIMIT 1), so the
+    // documentation it rests on has to be right.
+    //
+    // NOTE, so the contradiction is not rediscovered as a "bug": OfferManager::
+    // build_tier_ladder (offer_manager.cpp:1404) DOES implement the
+    // quote-denominated convention this comment used to describe. It has no
+    // callers anywhere in cpp/src, cpp/include or cpp/tests -- it is dead code.
+    // The tree therefore contains both conventions, one live and one dead. Its
+    // removal is deliberately NOT bundled into this type change.
+    //
+    // The execution layer (OfferManager::build_offer_dict) computes the
+    // counter-leg amount as:
     //   Bid: quote_amount = size * price / quote_denom   (we spend quote, receive base)
     //   Ask: quote_amount = size * price / quote_denom   (we spend base, receive quote)
-    //
-    // LiquidityEngine::build_ladder() sets bid size from available quote
-    // capital (`cap * size_frac`) and ask size from available base inventory
-    // (`inv * size_frac`), both already in mojos.
     Mojo         size;
 
     double       spread_bps;   // Distance from mid-price in basis points
