@@ -2068,14 +2068,41 @@ struct MarketDataSettings {
     /// anchor.  It is the same "the whole market repriced" evidence
     /// mid_gate::book_confirms() accepts.
     ///
-    /// RAISING this above mid_gate_book_confirm_max_spread_bps takes
-    /// effect.  LOWERING it below has NO effect: the value actually used
-    /// is max(this, mid_gate_book_confirm_max_spread_bps), derived in
-    /// bookside::effective_agree_max_spread_bps so the two mechanisms
-    /// cannot be configured into contradiction.  A bypass stricter than
-    /// the gate would disqualify both sides of a book the gate had just
-    /// accepted as confirmation, and Step 8 would then take its
-    /// both-sides-disqualified path instead of honouring it.
+    /// LOWERING this takes effect.  RAISING it above
+    /// mid_gate_book_confirm_max_spread_bps has NO effect: the value
+    /// actually used is min(this, mid_gate_book_confirm_max_spread_bps),
+    /// derived in bookside::effective_agree_max_spread_bps.  0 disables
+    /// the bypass outright and BINDS -- 0 on EITHER knob switches it off.
+    ///
+    /// [review round 6] This was max() and the doc promised the opposite.
+    /// A bypass wider than the gate trusts WHOLE a book the gate would
+    /// refuse to confirm, which re-enables the poisoned-BBO behaviour the
+    /// side classifier exists to stop.  It also meant HARDENING the gate
+    /// (lowering mid_gate_book_confirm_max_spread_bps on its own) silently
+    /// widened the bypass past it; that edit now tightens both.
+    ///
+    /// KNOWN COST of the safe direction, stated so nobody "fixes" it back:
+    /// setting this BELOW the gate's threshold can disqualify both sides of
+    /// a genuinely coherent far-from-anchor book that the gate accepted as
+    /// confirmation, and Step 8 then takes its both-sides-disqualified path
+    /// -- the bot quotes conservatively through a real market-wide
+    /// repricing.  That is fail-closed, and it is the trade this repo makes
+    /// on purpose.  If you do not want it, leave this at the default and
+    /// tune mid_gate_book_confirm_max_spread_bps instead.
+    ///
+    /// [review round 7] THE COST IS NOT ONLY A QUOTING COST.  Since the
+    /// valuation-grade fix landed, this same scalar also decides whether a
+    /// two-sided book's mid may MARK EQUITY: apply_mid_gate requires the
+    /// book's own spread to be within the effective value here before
+    /// granting mid_valuation_grade.  So lowering this knob can additionally
+    /// cost a pair its valuation, which falls to the S20 carry and, past
+    /// valuation_carry_ttl_blocks, degrades the cycle and freezes the
+    /// max-drawdown peak.  Both effects are fail-closed and both are
+    /// intended; budget for the risk-machinery one too, not just the spread.
+    ///
+    /// 0 remains safe against that: at 0 the coherence requirement stands
+    /// down entirely and the per-side band governs valuation alone, so
+    /// switching the bypass off can never black out valuation bot-wide.
     double book_side_agree_max_spread_bps{5000.0};
 
     /// Max spread (bps) for a sibling pair's book to serve as a leg of the

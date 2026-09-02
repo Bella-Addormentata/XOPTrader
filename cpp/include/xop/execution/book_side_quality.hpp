@@ -63,8 +63,19 @@
 // than merely defaulted to it -- see effective_agree_max_spread_bps.  An
 // earlier revision of this comment claimed the two were "pinned to the
 // same default", which was true and insufficient: a default they share is
-// still a default an operator can move, and moving this one below the
-// gate's threshold recreates exactly the contradiction described above.
+// still a default an operator can move.
+//
+// [review round 6] The derivation used to take the LARGER of the two, to
+// guarantee the bypass could never be stricter than the gate.  That was
+// backwards and is now max()-> min().  A bypass WIDER than the gate does
+// not "trust a book the gate would also have accepted" -- above the gate's
+// threshold the gate accepts nothing, so the extra width is trust the gate
+// never granted.  The cost of the safe direction is stated honestly at
+// effective_agree_max_spread_bps: a bypass stricter than the gate CAN
+// disqualify both sides of a book the gate confirmed, and Step 8 then
+// takes its both-sides-disqualified path.  That is quoting conservatively
+// through a genuine repricing -- a fail-CLOSED cost -- and this repo trades
+// that for a fail-open risk in exactly this direction, never the reverse.
 //
 // Pure header, no feed or engine types, so the branches are driven
 // directly by cpp/tests/test_book_side_quality.cpp rather than through a
@@ -80,37 +91,109 @@ namespace xop::bookside {
 // configured into conflict.  Same shape, and for the same reason, as
 // mid_gate::offer_absurdity_ratio.
 //
-// [review, PR #134] The header above says the bypass and
-// mid_gate::book_confirms() are "pinned to the same default".  Sharing a
-// DEFAULT is not the same as being unable to disagree, and an operator can
-// set them apart.  The reviewer's case: leave the gate confirming at
-// 5000 bps and set this to 750.  A far-from-anchor book at 4000 bps is then
-// accepted by book_confirms() as "the whole market repriced" -- while this
-// classifier disqualifies BOTH its sides, because 4000 > 750.  Step 8 then
-// takes its both-sides-disqualified path instead of honouring the
-// confirmation, which is precisely the contradiction the header promises
-// cannot happen.
+// WHICH DIRECTION IS PERMISSIVE.  READ THIS BEFORE CHANGING THE OPERATOR.
+// ----------------------------------------------------------------------
+// Both knobs are CEILINGS ON AN ACCEPT CONDITION, applied to the SAME
+// scalar computed by the SAME formula on the SAME two prices:
 //
-// The constraint is one-directional.  A bypass MORE permissive than the
-// gate is harmless: it trusts a book whole that the gate would also have
-// accepted.  A bypass LESS permissive strips the evidence the gate is
-// waiting for.  So the effective value is the larger of the two, and an
-// operator who lowers this knob below the gate's threshold gets the gate's
-// threshold rather than a silent contradiction.
+//   here                    spread_bps <= agree_max_spread_bps
+//                             -> bypassed, book trusted WHOLE
+//   mid_gate::book_confirms  book_spread_bps <= book_confirm_max_spread_bps
+//                             -> book accepted as confirmation
 //
-// Non-finite or negative inputs contribute nothing rather than poisoning
-// the result; if both are unusable the bypass is simply off, which is the
-// safe direction (it only ever ADDS trust).
+// Raising EITHER admits strictly more books.  So the more permissive of
+// the two is the LARGER, and the effective value must be the SMALLER.
+//
+// [review round 6, PR #134] This returned max() through five review
+// rounds, justified by: "A bypass MORE permissive than the gate is
+// harmless: it trusts a book whole that the gate would also have
+// accepted."  There is no "also".  Above the gate's threshold the gate
+// accepts NOTHING, so every basis point of extra width is trust nothing
+// granted.  Worked case, configured 8000 / gate 5000, anchor 1.41022765,
+// both bands 3.0:
+//
+//   bid 2.764048  ask 5.133232  bbo_mid 3.948640   spread 6000.0 bps
+//     mid/anchor 2.80  -> INSIDE the 3x band, so gate_mid returns Accept
+//                         at its early exit and never calls book_confirms
+//     ask/anchor 3.64  -> OUT of band, and must be disqualified
+//   max(): 6000 <= 8000 -> bypass fires -> ask_ok = true.  Step 8 runs
+//     Check 1, measures ask tiers against the junk 5.133232 touch, and the
+//     liquidity bid cap is pinned to the poisoned 3.948640 midpoint.
+//   min(): 6000 > 5000 -> no bypass -> ask_ok = false, tiers re-anchored.
+//
+// That is the poisoned-BBO behaviour this whole header exists to stop,
+// re-enabled by a knob.  Note the second route in as well: LOWERING
+// mid_gate_book_confirm_max_spread_bps and touching nothing else used to
+// leave max(5000, gate) = 5000 -- the operator hardened the gate and
+// silently widened the bypass past it.  Under min() that edit now tightens
+// both, which is what "hardening the gate" is supposed to mean.
+//
+// WHAT min() COSTS, STATED RATHER THAN DENIED
+// -------------------------------------------
+// It re-opens the case max() was introduced to close: gate confirming at
+// 5000, this knob at 750, and a far-from-anchor 4000 bps book.  The gate
+// accepts it as "the whole market repriced" while this classifier
+// disqualifies both sides, so Step 8 takes its both-sides-disqualified
+// path on a book the gate just blessed.  Traced through: Check 1 is
+// skipped (it never fires anyway -- both its operands are book-derived),
+// both tier sides re-reference to the anchor, and the liquidity bid cap
+// tightens.  The bot quotes conservatively, or not at all, through a
+// genuine market-wide repricing.
+//
+// That is a FAIL-CLOSED cost.  max() bought it off with a FAIL-OPEN risk.
+// This repo's documented rule (the close_out fail-open family, twelve of
+// one shape) makes that trade backwards, so the cost is accepted here and
+// the operator is told about it in config.hpp instead of being promised it
+// cannot arise.
+//
+// SANITISING CONTRACT -- THE TWO OPERANDS ARE NOT INTERCHANGEABLE
+// ---------------------------------------------------------------
+// A non-finite or NEGATIVE input is not a setting -- it is garbage the
+// parser already refuses at startup (config.cpp:3163 and :3186 both throw
+// ConfigError), so every branch below is defence in depth.  It is still
+// written to fail CLOSED, because "unreachable today" is how the twelve
+// close_out fail-open bugs each started.
+//
+// [review round 7] An earlier revision returned "the other value governs
+// alone" for BOTH single-garbage cases, describing each as contributing
+// "no constraint".  That is true for only one of them, and under min() the
+// other is the maximally fail-open branch there is:
+//
+//   * GATE side garbage (a_ok && !b_ok).  The gate's threshold is what
+//     mid_gate::book_confirms compares against, and `spread <= NaN` is
+//     false for EVERY book, as is `spread <= -1`.  So an unusable gate
+//     confirms NOTHING -- and returning `configured` (say 8000) would make
+//     the bypass infinitely wider than a gate that grants nothing, which
+//     is exactly the "trust the gate never granted" shape the direction
+//     argument above exists to close.  Under min() the neutral element is
+//     +infinity, NOT zero, so the other operand is not neutral here.
+//     A gate you cannot trust must not license trust: return 0 (bypass
+//     off), matching the both-garbage branch.
+//   * OPERATOR side garbage (b_ok && !a_ok).  Falling back to the gate's
+//     own ceiling is genuinely neutral -- it makes the bypass exactly as
+//     wide as the gate, never wider -- so the gate value governs alone.
+//
+// An explicit 0 is different from garbage: it is the documented "off"
+// setting, and under min() it BINDS -- 0 on either knob disables the
+// bypass entirely.  That asymmetry, plus the operand asymmetry above, is
+// the whole reason the branches are written out instead of a bare
+// std::min: no single std:: call implements this table.
 [[nodiscard]] inline double effective_agree_max_spread_bps(
     double configured,
     double gate_confirm_max_spread_bps) noexcept
 {
-    const double a = (std::isfinite(configured) && configured > 0.0)
-                         ? configured : 0.0;
-    const double b = (std::isfinite(gate_confirm_max_spread_bps)
-                      && gate_confirm_max_spread_bps > 0.0)
-                         ? gate_confirm_max_spread_bps : 0.0;
-    return a > b ? a : b;
+    const bool a_ok = std::isfinite(configured) && configured >= 0.0;
+    const bool b_ok = std::isfinite(gate_confirm_max_spread_bps)
+                   && gate_confirm_max_spread_bps >= 0.0;
+    if (a_ok && b_ok) {
+        return configured < gate_confirm_max_spread_bps
+                   ? configured : gate_confirm_max_spread_bps;
+    }
+    // An unusable GATE confirms nothing, so the bypass may grant nothing.
+    if (a_ok) return 0.0;
+    // An unusable OPERATOR knob defers to the gate's own ceiling.
+    if (b_ok) return gate_confirm_max_spread_bps;
+    return 0.0;
 }
 
 /// What Step 8's two BBO sanity guards may reference, given a per-side

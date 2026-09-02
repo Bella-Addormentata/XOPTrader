@@ -782,10 +782,28 @@ market_data:
   # evidence mid_gate_book_confirm_max_spread_bps accepts.  Dislocation is
   # one side moving alone, which always leaves a wide spread behind.
   #
-  # RAISING this takes effect; LOWERING it below
+  # LOWERING this takes effect; RAISING it above
   # mid_gate_book_confirm_max_spread_bps does NOT.  The effective value is
-  # max(this, mid_gate_book_confirm_max_spread_bps), so a bypass can never
-  # be stricter than the gate whose confirmation it is meant to preserve.
+  # min(this, mid_gate_book_confirm_max_spread_bps), so the bypass can never
+  # trust WHOLE a book the gate itself would refuse to confirm.  0 disables
+  # the bypass, and 0 on either knob disables it.
+  #
+  # Cost of that direction, on purpose: set below the gate's threshold, this
+  # can disqualify both sides of a genuinely coherent far-from-anchor book,
+  # and the bot then quotes conservatively through a real repricing.  That
+  # is fail-closed.  Tune mid_gate_book_confirm_max_spread_bps instead if
+  # you want the bypass wider.
+  #
+  # THAT COST IS NOT ONLY A QUOTING COST.  This same value also decides
+  # whether a two-sided book's mid may MARK EQUITY: a book whose own spread
+  # exceeds it does not earn mid_valuation_grade, so valuation falls to the
+  # carry and, past valuation_carry_ttl_blocks, degrades the cycle and
+  # freezes the max-drawdown peak.  Lowering this knob buys quoting safety
+  # and spends valuation coverage; budget for both.
+  #
+  # Setting it to 0 is safe against that: the coherence requirement stands
+  # down entirely and the per-side band governs valuation alone, so turning
+  # the bypass off can never black out valuation bot-wide.
   book_side_agree_max_spread_bps: 5000.0    # [OPTIONAL, default: 5000]
 
   implied_cross_max_leg_spread_bps: 1500.0  # [OPTIONAL, default: 1500]

@@ -14,11 +14,17 @@
 #include <gtest/gtest.h>
 
 #include <xop/config.hpp>
+#include <xop/execution/book_side_quality.hpp>
 
+#include <spdlog/sinks/ringbuffer_sink.h>
+#include <spdlog/spdlog.h>
+
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <limits>
+#include <memory>
 #include <string>
 
 namespace {
@@ -1588,30 +1594,127 @@ TEST(ConfigParserTest, SideQualityKnobs_DisabledBandAccepted) {
     {
         // 0 on the agreement cap is likewise legal: it means no two-sided
         // book is ever narrow enough to be trusted whole.
+        //
+        // [review round 6, PR #134] THAT SENTENCE USED TO BE FALSE.  The
+        // effective threshold was max(configured, mid-gate confirm), so 0
+        // here returned the gate's 5000 and the bypass carried on firing.
+        // The comment promised operators an escape hatch that did not
+        // exist, and the test asserted only that the number survived the
+        // parser -- which it did, on its way to being discarded.
+        //
+        // The helper now returns min(), so the sentence is true, and the
+        // load-level assertion is followed by the RUNTIME assertion that
+        // makes it a contract instead of a claim.
         TempYaml tmp(with_market_data(
             "  book_side_agree_max_spread_bps: 0.0\n"));
         auto cfg = xop::load_config(tmp.path());
         EXPECT_DOUBLE_EQ(cfg.market_data.book_side_agree_max_spread_bps, 0.0);
+
+        // The value the classifier ACTUALLY uses, against the gate's
+        // shipped default rather than a hand-written constant.
+        const double effective =
+            xop::bookside::effective_agree_max_spread_bps(
+                cfg.market_data.book_side_agree_max_spread_bps,
+                cfg.market_data.mid_gate_book_confirm_max_spread_bps);
+        ASSERT_GT(cfg.market_data.mid_gate_book_confirm_max_spread_bps, 0.0)
+            << "sanity: the gate's own threshold must be non-zero, or this "
+               "case cannot distinguish min() from max()";
+        EXPECT_DOUBLE_EQ(effective, 0.0)
+            << "0 must BIND, not be treated as 'unset' and replaced by the "
+               "mid gate's threshold";
+
+        // And the behaviour the operator was promised: a book so tight it
+        // would otherwise be trusted whole (10 bps) gets no bypass, and the
+        // per-side band is what decides.
+        const auto q = xop::bookside::classify_sides(
+            /*best_bid=*/5.60, /*best_ask=*/5.6056,
+            /*anchor=*/1.41022765,
+            cfg.market_data.book_side_anchor_band_ratio, effective);
+        EXPECT_FALSE(q.bypassed)
+            << "with the cap at 0 no two-sided book may be trusted whole";
+        EXPECT_FALSE(q.ask_ok)
+            << "3.97x the anchor, and nothing bypassed the band";
     }
 }
 
-TEST(ConfigParserTest, SideQualityKnobs_WiderThanMidBandIsAcceptedNotRejected) {
+namespace {
+
+/// Capturing sink for the advisory warnings config.cpp emits through the
+/// DEFAULT logger.  Same technique as cpp/tests/test_client_logger.cpp: a
+/// ringbuffer sink installed as the default logger for the duration of one
+/// test, then removed.
+using LogProbe = spdlog::sinks::ringbuffer_sink_mt;
+
+/// Installs a capturing default logger and restores the previous one.
+/// spdlog's default logger and registry are PROCESS state, so this must be
+/// exception-safe and must not leave the probe installed for later tests.
+class CapturedLog {
+public:
+    /// Capacity is generous on purpose: a ringbuffer keeps only the LAST N
+    /// records, and load_config emits other advisories.  A tight buffer would
+    /// silently evict the line under test and fail for the wrong reason.
+    explicit CapturedLog(std::size_t capacity = 256)
+        : probe_(std::make_shared<LogProbe>(capacity)),
+          saved_(spdlog::default_logger())
+    {
+        auto logger = std::make_shared<spdlog::logger>("config_test_probe",
+                                                       probe_);
+        // Level set on THIS logger only.  spdlog::set_level() would stamp
+        // every registered logger in the process, which test_client_logger.cpp
+        // asserts on -- a global side effect is not worth one advisory line.
+        logger->set_level(spdlog::level::trace);
+        spdlog::set_default_logger(logger);
+    }
+
+    ~CapturedLog() {
+        spdlog::set_default_logger(saved_);
+        spdlog::drop("config_test_probe");
+    }
+
+    CapturedLog(const CapturedLog&)            = delete;
+    CapturedLog& operator=(const CapturedLog&) = delete;
+
+    /// Every captured payload joined by newlines, for substring matching.
+    [[nodiscard]] std::string text() const {
+        std::string out;
+        for (const auto& rec : probe_->last_raw()) {
+            out.append(rec.payload.data(), rec.payload.size());
+            out.push_back('\n');
+        }
+        return out;
+    }
+
+    /// True if any captured record at >= warn level contains `needle`.
+    [[nodiscard]] bool warned_containing(const std::string& needle) const {
+        for (const auto& rec : probe_->last_raw()) {
+            if (rec.level < spdlog::level::warn) continue;
+            const std::string payload(rec.payload.data(), rec.payload.size());
+            if (payload.find(needle) != std::string::npos) return true;
+        }
+        return false;
+    }
+
+private:
+    std::shared_ptr<LogProbe>       probe_;
+    std::shared_ptr<spdlog::logger> saved_;
+};
+
+}  // namespace
+
+TEST(ConfigParserTest, SideQualityKnobs_WiderThanMidBandWarnsAndLoads) {
     // A side band wider than mid_anchor_band_ratio lets a side stay a trusted
     // reference while the mid it implies is refused.  config.cpp treats that
     // as a coherence smell: it emits an advisory spdlog WARNING and loads the
-    // values anyway.  THIS TEST CHECKS THE LOAD, NOT THE WARNING -- the
-    // combination must not throw, and both values must survive exactly as
-    // written.
+    // values anyway.  BOTH halves are checked here.
     //
-    // The warning itself is unobserved BY DESIGN.  Nothing in this suite
-    // installs an spdlog sink -- this comment is the only mention of spdlog
-    // anywhere under cpp/tests -- and standing up sink-capture machinery for
-    // one advisory line would cost more than it protects: the line changes no
-    // behaviour, and a regression in its wording is not a defect worth a
-    // fixture.  Hence the name: "accepted, not rejected" is the whole of the
-    // contract verified here.  The previous name, WarnsButLoads, promised a
-    // check on the warning that does not exist, which is how a later reader
-    // concludes there is coverage where there is none.
+    // [review round 6, PR #134] The previous version of this test asserted
+    // only the load and said so in a comment that argued sink capture was not
+    // worth the trouble.  The consequence was that deleting the warning
+    // outright left the case green -- the exact vacuity this repo's
+    // mutation-check rule exists to catch.  test_client_logger.cpp already
+    // owned the capture technique, so the cost was a fixture, not machinery.
+    CapturedLog log;
+
     TempYaml tmp(with_market_data(
         "  mid_anchor_band_ratio: 2.0\n"
         "  book_side_anchor_band_ratio: 6.0\n"));
@@ -1619,6 +1722,34 @@ TEST(ConfigParserTest, SideQualityKnobs_WiderThanMidBandIsAcceptedNotRejected) {
     auto cfg = xop::load_config(tmp.path());
     EXPECT_DOUBLE_EQ(cfg.market_data.mid_anchor_band_ratio, 2.0);
     EXPECT_DOUBLE_EQ(cfg.market_data.book_side_anchor_band_ratio, 6.0);
+
+    // Matched on the KEY NAMES and the numbers, not on the prose: the
+    // advisory's wording may legitimately be reworded, but a warning that no
+    // longer names which two knobs disagree is not the same warning.
+    EXPECT_TRUE(log.warned_containing("book_side_anchor_band_ratio"))
+        << "captured log was:\n" << log.text();
+    EXPECT_TRUE(log.warned_containing("mid_anchor_band_ratio"))
+        << "captured log was:\n" << log.text();
+    EXPECT_TRUE(log.warned_containing("6.00"))
+        << "the advisory must report the offending value; captured log was:\n"
+        << log.text();
+    EXPECT_TRUE(log.warned_containing("2.00"))
+        << "captured log was:\n" << log.text();
+}
+
+TEST(ConfigParserTest, SideQualityKnobs_CoherentBandsDoNotWarn) {
+    // The negative half, without which the assertions above would also pass
+    // against a warning emitted unconditionally on every load.
+    CapturedLog log;
+
+    TempYaml tmp(with_market_data(
+        "  mid_anchor_band_ratio: 6.0\n"
+        "  book_side_anchor_band_ratio: 2.0\n"));
+    ASSERT_NO_THROW(xop::load_config(tmp.path()));
+
+    EXPECT_FALSE(log.warned_containing("book_side_anchor_band_ratio"))
+        << "a side band NARROWER than the mid band is coherent and must be "
+           "silent; captured log was:\n" << log.text();
 }
 
 TEST(ConfigParserTest, S20CarryTtl_ParsesAndRejectsNegative) {

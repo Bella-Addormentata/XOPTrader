@@ -20,6 +20,41 @@
 // (cpp/include/xop/execution/book_side_quality.hpp) -- so the engine asks for
 // the EFFECTIVE clamp and the knob can never disagree with the controller.
 //
+// COPY THE PATTERN, NEVER THE OPERATOR. The citation above is to
+// DERIVE-don't-validate and to NOTHING ELSE. book_side_quality's helper
+// returns the SMALLER of the two when both are usable; both helpers here
+// return max(); they are all correct. The question is never "is max
+// conservative" -- it is WHICH SIDE OF THE DECISION THE NUMBER BOUNDS:
+//
+//   * agree_max_spread_bps is a CEILING ON AN ACCEPT CONDITION
+//     (spread <= X -> trust the book whole), so RAISING it admits more
+//     -> the safe operator there is min();
+//   * both knobs here are FLOORS ON AN OUTPUT WHOSE AGGRESSION DECREASES IN
+//     THE VALUE (a higher min_mult truncates the controller sooner; a higher,
+//     i.e. less negative, min_offset raises the suppression gate), so RAISING
+//     them restricts more -> the safe operator here is max().
+//
+// Opposite monotonicity, opposite safe operator, NEARLY identical expression
+// -- and the "nearly" is load-bearing in both directions, so do not read
+// either helper as a bare std::min/std::max over its two inputs:
+//
+//   * book_side_quality's helper SANITISES. A non-finite or negative input
+//     there is garbage the parser already refuses, and it must contribute NO
+//     constraint rather than winning the comparison -- `std::min(-1.0, 5000)`
+//     would return -1 and silently disable the bypass. An explicit 0, by
+//     contrast, must BIND. That four-branch asymmetry is why it is written
+//     out longhand, and it is not reproducible with one std:: call.
+//   * the two helpers HERE do not sanitise their configured input the same
+//     way: effective_pid_min_mult returns configured_min_mult UNCHANGED when
+//     it is non-finite, rather than letting the reachable value govern alone.
+//
+// So the operator differs, and so does the contract around it. The
+// max() below was once justified by pasting book_side_quality's sentence,
+// which reached the right answer for the wrong reason; that sentence has since
+// been found to be wrong even where it was written. Each helper below now
+// argues its OWN direction from its OWN clamp site. Do not collapse them back
+// into "same rule as".
+//
 // THE DERIVATIVE TERM DOES NOT BUY AUTHORITY. READ THIS BEFORE "IMPROVING" IT
 // ---------------------------------------------------------------------------
 // The obvious closed form for the tightening bound is
@@ -203,10 +238,34 @@ namespace detail {
 /// The tightening clamp the engine should ACTUALLY apply, derived from the
 /// gain budget so the knob and the controller cannot disagree.
 ///
-/// ONE-DIRECTIONAL, and the direction matters. A configured floor ABOVE the
-/// reachable floor genuinely truncates the controller and must be honoured --
-/// that is a real safety bound. A configured floor BELOW it is a promise the
-/// arithmetic cannot keep. So the effective value is the LARGER of the two.
+/// WHY max() IS THE CONSERVATIVE DIRECTION HERE -- argued from the clamp site,
+/// not borrowed from anywhere else:
+///
+///   engine.cpp: pid.current_mult = clamp(1 - output, effective_pid_min_mult,
+///                                        pid_max_mult)
+///
+/// mult < 1.0 means TIGHTER spreads (config.hpp), so this is a FLOOR under a
+/// quantity that is at its most AGGRESSIVE at its LOW end. A HIGHER min_mult
+/// therefore truncates the controller sooner = LESS TIGHTENING = MORE
+/// RESTRICTIVE. Raising this number can only ever make the bot quote wider,
+/// never narrower, so taking the LARGER of the two inputs is the safe choice
+/// and neither input's value is ever exceeded in the aggressive direction.
+///
+/// Read as an operator contract that makes the same point: a configured floor
+/// ABOVE the reachable floor genuinely truncates the controller and must be
+/// honoured -- it is a real safety bound. A configured floor BELOW it is a
+/// promise the arithmetic cannot keep, so the reachable value replaces it and
+/// the operator sees the truth rather than decoration.
+///
+/// This is the OPPOSITE operator to
+/// bookside::effective_agree_max_spread_bps, which takes the SMALLER of its
+/// two inputs when both are usable. That helper bounds a ceiling on an accept
+/// condition, where larger = more permissive; this one bounds a floor on an
+/// aggressive output, where larger = more restrictive. Only the
+/// derive-don't-validate SHAPE is shared -- not the operator, and not the
+/// sanitising contract either (see the header note: that helper drops garbage
+/// inputs so the other governs alone, while this one passes a non-finite
+/// configured_min_mult straight back to the caller).
 ///
 /// Behaviourally a no-op on the shipped config: max(0.70, 0.820) = 0.820, and
 /// the controller never produces a multiplier below 0.820 anyway, so the clamp
@@ -257,7 +316,21 @@ namespace detail {
     return pid_round_half_away_from_zero(-pid_output_bounds(g).min_output);
 }
 
-/// Same one-directional rule as effective_pid_min_mult.
+/// WHY max() IS THE CONSERVATIVE DIRECTION HERE. Stated in full rather than
+/// cross-referenced to effective_pid_min_mult: this one is an INTEGER OFFSET
+/// and it is NEGATIVE in every live tick, so "larger" means "LESS NEGATIVE" --
+/// the single easiest value in this file to reason backwards about.
+///
+///   competitiveness_pid.hpp: clamp(round(-output), min_offset, max_offset)
+///
+/// The offset is ADDED to the competitiveness gate BELOW which a tier is
+/// suppressed (config.hpp). A MORE negative offset lowers that gate = fewer
+/// suppressions = MORE PERMISSIVE. So a HIGHER (less negative) min_offset
+/// raises the gate = MORE RESTRICTIVE, and max() -- which picks the less
+/// negative of the two -- is the direction that can only ever suppress more
+/// tiers, never fewer. Same conclusion as effective_pid_min_mult, reached from
+/// a different clamp; NOT the same argument, because this quantity is an
+/// integer whose sign inverts the intuition.
 ///
 /// A no-op on the shipped config -- max(-3, -3) = -3 -- and note WHY -3 is the
 /// live value: it comes out of the ROUNDING step, not out of the clamp.

@@ -288,48 +288,131 @@ TEST(Step8References, BothSidesDisqualifiedStillSkipsCheckOne)
 
 // -- The derived bypass threshold -------------------------------------------
 
-TEST(BookSideQuality, bypass_threshold_can_never_be_stricter_than_the_gate)
+// [review round 6, PR #134] These three tests pinned max(). max() is the
+// FAIL-OPEN direction: both knobs are ceilings on an accept condition over the
+// same spread scalar, so the larger is the more permissive and the effective
+// value must be the SMALLER. They are rewritten, not re-baselined -- the old
+// contract was the defect.
+
+TEST(BookSideQuality, bypass_threshold_can_never_be_wider_than_the_gate)
 {
     using xop::bookside::effective_agree_max_spread_bps;
 
-    // [review] The reviewer's exact case: gate confirming at 5000, this knob
-    // lowered to 750. A 4000 bps book is accepted by book_confirms() as "the
-    // whole market repriced" -- so disqualifying both its sides here would
-    // strip the confirmation the gate is waiting for, and Step 8 would take
-    // its both-sides-disqualified path instead of honouring it.
-    EXPECT_DOUBLE_EQ(effective_agree_max_spread_bps(750.0, 5000.0), 5000.0);
+    // The knob raised above the gate must NOT take effect. Above 5000 the
+    // gate confirms nothing, so any extra width is trust nothing granted.
+    EXPECT_DOUBLE_EQ(effective_agree_max_spread_bps(8000.0, 5000.0), 5000.0);
 
-    // And the consequence that actually matters: with the derived value, a
-    // 4000 bps book far from the anchor is still trusted whole.
+    // Hardening the gate on its own must tighten the bypass with it. Under
+    // max() this returned 5000 -- the operator lowered the gate to 750 and
+    // silently left the bypass eight times wider than what they had just
+    // asked the gate to confirm.
+    EXPECT_DOUBLE_EQ(effective_agree_max_spread_bps(5000.0, 750.0), 750.0);
+}
+
+// THE MUTATION CHECK. Arithmetic on the helper alone would still pass with
+// max() reinstated "in spirit" (the numbers merely swap), so this drives
+// classify_sides on a book with the incident's own geometry and asserts the
+// DECISION, not the threshold.
+TEST(BookSideQuality, a_wider_configured_bypass_cannot_re_enable_a_junk_ask)
+{
+    using xop::bookside::effective_agree_max_spread_bps;
+
+    // Constructed so that:
+    //   spread            = 6000.0 bps   (between the gate's 5000 and 8000)
+    //   bbo_mid / anchor  = 2.80         -> INSIDE mid_anchor_band_ratio 3.0,
+    //                                       so gate_mid Accepts at its early
+    //                                       exit and never calls
+    //                                       book_confirms at all
+    //   ask / anchor      = 3.64         -> OUT of band, must be disqualified
+    //   bid / anchor      = 1.96         -> in band
+    const double bid = 2.764048;
+    const double ask = 5.133232;
+    const double mid = (bid + ask) / 2.0;
+    ASSERT_NEAR((ask - bid) / mid * 10000.0, 6000.0, 1e-6);
+    ASSERT_LT(mid / kAnchor, 3.0) << "the mid gate must not be what saves us";
+    ASSERT_GT(ask / kAnchor, 3.0);
+
+    const double derived = effective_agree_max_spread_bps(8000.0, kAgree);
+    const auto q = classify_sides(bid, ask, kAnchor, kBand, derived);
+
+    EXPECT_FALSE(q.bypassed)
+        << "6000 bps is wider than the gate confirms; the bypass must not "
+           "fire on an operator's larger number";
+    EXPECT_FALSE(q.ask_ok)
+        << "THE POISONED BBO. With max() this side came back trusted, Step 8 "
+           "measured ask tiers against 5.133232, and the liquidity bid cap "
+           "was pinned to the 3.948640 midpoint";
+    EXPECT_TRUE(q.bid_ok) << "the honest side is untouched";
+}
+
+TEST(BookSideQuality, a_stricter_bypass_takes_effect_and_this_costs_something)
+{
+    using xop::bookside::effective_agree_max_spread_bps;
+
+    // The operator's stricter value now stands.
+    EXPECT_DOUBLE_EQ(effective_agree_max_spread_bps(750.0, 5000.0), 750.0);
+
+    // ...and here is the price, pinned rather than denied. A coherent
+    // 4000 bps book far from the anchor IS accepted by book_confirms() as
+    // "the whole market repriced", yet both its sides are now disqualified,
+    // so Step 8 takes its both-sides-disqualified path and the bot quotes
+    // conservatively through a genuine repricing. That is FAIL-CLOSED, which
+    // is the trade this repo makes on purpose. Anyone who reverts to max()
+    // to recover this case is re-opening the poisoned-BBO path above.
     const double derived = effective_agree_max_spread_bps(750.0, 5000.0);
     const auto q = classify_sides(5.60, 5.60 * 1.4918, kAnchor, kBand,
                                   derived);   // ~4000 bps apart, ~4x anchor
-    EXPECT_TRUE(q.bypassed)
-        << "a book the mid gate would accept as confirmation must not have "
-           "its sides disqualified underneath it";
-}
-
-TEST(BookSideQuality, raising_the_bypass_above_the_gate_does_take_effect)
-{
-    using xop::bookside::effective_agree_max_spread_bps;
-    // More permissive than the gate is harmless -- it only ever adds trust --
-    // so the operator's larger value stands.
-    EXPECT_DOUBLE_EQ(effective_agree_max_spread_bps(8000.0, 5000.0), 8000.0);
+    EXPECT_FALSE(q.bypassed);
+    EXPECT_FALSE(q.bid_ok);
+    EXPECT_FALSE(q.ask_ok);
 }
 
 TEST(BookSideQuality, derived_bypass_ignores_unusable_inputs)
 {
     using xop::bookside::effective_agree_max_spread_bps;
-    // A disabled/absent side of the pair contributes nothing rather than
-    // poisoning the result; both unusable means the bypass is simply off,
-    // which is the safe direction because it only ever ADDS trust.
-    EXPECT_DOUBLE_EQ(effective_agree_max_spread_bps(0.0, 5000.0), 5000.0);
-    EXPECT_DOUBLE_EQ(effective_agree_max_spread_bps(5000.0, 0.0), 5000.0);
+
+    // The asymmetry IS the contract, and it is the whole reason this helper
+    // is not a bare std::min. THE TWO OPERANDS ARE NOT INTERCHANGEABLE:
+    //
+    //   garbage on the OPERATOR knob -- which the config parser already
+    //   refuses, so this is defence in depth -- contributes no constraint
+    //   and the GATE's own ceiling governs alone;
+    //
+    //   garbage on the GATE side is NOT neutral. mid_gate::book_confirms
+    //   evaluates `spread <= threshold`, and that is false for every book
+    //   when the threshold is NaN or negative -- so an unusable gate
+    //   confirms NOTHING, and a bypass that still returned `configured`
+    //   would be infinitely wider than it. Under min() the neutral element
+    //   is +infinity, not the other operand. Fail closed: 0.
+    //
+    //   an explicit 0 is a SETTING ("bypass off") and BINDS, on either knob.
     EXPECT_DOUBLE_EQ(effective_agree_max_spread_bps(kNaN, 5000.0), 5000.0);
     EXPECT_DOUBLE_EQ(effective_agree_max_spread_bps(kInf, 5000.0), 5000.0);
     EXPECT_DOUBLE_EQ(effective_agree_max_spread_bps(-1.0, 5000.0), 5000.0);
-    EXPECT_DOUBLE_EQ(effective_agree_max_spread_bps(0.0, 0.0), 0.0);
+
+    // [review round 7] These two returned 5000.0 until the direction
+    // argument that retired max() was applied to the sanitising branches as
+    // well. A knob you cannot trust must not license trust.
+    EXPECT_DOUBLE_EQ(effective_agree_max_spread_bps(5000.0, kNaN), 0.0)
+        << "an unusable gate confirms nothing, so the bypass grants nothing";
+    EXPECT_DOUBLE_EQ(effective_agree_max_spread_bps(5000.0, -1.0), 0.0);
     EXPECT_DOUBLE_EQ(effective_agree_max_spread_bps(kNaN, kNaN), 0.0);
+
+    EXPECT_DOUBLE_EQ(effective_agree_max_spread_bps(0.0, 5000.0), 0.0)
+        << "0 is the documented off switch, not an absent value";
+    EXPECT_DOUBLE_EQ(effective_agree_max_spread_bps(5000.0, 0.0), 0.0);
+    EXPECT_DOUBLE_EQ(effective_agree_max_spread_bps(0.0, 0.0), 0.0);
+
+    // And 0 must actually disable the bypass at the classifier, not merely
+    // arrive there as a number. This is the assertion test_config.cpp's
+    // SideQualityKnobs_DisabledBandAccepted comment promised and could not
+    // make while the helper returned max().
+    const auto q = classify_sides(5.60, 5.70, kAnchor, kBand,
+                                  effective_agree_max_spread_bps(0.0, kAgree));
+    EXPECT_FALSE(q.bypassed)
+        << "0 on the agreement cap must mean NO two-sided book is ever "
+           "narrow enough to be trusted whole";
+    EXPECT_FALSE(q.ask_ok) << "and the per-side band then decides: 4.04x";
 }
 
 // -- The band's relationship to the filters around it -----------------------
@@ -419,6 +502,116 @@ TEST(BookSideQualityFeed, DislocatedAskSideIsPublishedAsDisqualified)
         << "a disqualification requires an anchor, so ref must be published";
 }
 
+// ---------------------------------------------------------------------------
+// [review round 6, PR #134] VALUATION GRADE MUST RESPECT THE SIDE VERDICTS.
+//
+// apply_mid_gate granted mid_valuation_grade on `book_two_sided &&
+// dex_fresh_grade` alone.  "Two-sided" is a PRESENCE test with no price sanity
+// in it, and the per-side verdicts were read by Step 8 and the ladder but by
+// nothing on the valuation path.  So the dislocated book below graded, its
+// 3.24975 mid reached compute_portfolio_equity_usd and the mark-to-market
+// callback, and both breakers could be fed a 2.3x valuation error.
+//
+// The mid gate does not save this: 3.24975 / 1.41022765 = 2.3044 is INSIDE
+// mid_anchor_band_ratio (3.0), so gate_mid returns Accept at its early exit
+// and never calls book_confirms -- the 10,769 bps spread is never examined.
+//
+// The anchor here is injected with ingest_reference_anchor, NOT
+// ingest_cex_reference.  sq_cfg() sets cex_freshness_threshold_sec = 0.0
+// ("expiry disabled"), so a CEX leg would make cex_fresh true and an
+// EXPECT_FALSE below would pass through the `|| cex_fresh` branch regardless
+// of whether the book branch was fixed -- green by accident, in the wrong
+// direction.  An implied-cross anchor models the shipped XCH/DBX pair, which
+// has no CoinGecko mapping and anchors off the AMM/fair-value chain.
+// ---------------------------------------------------------------------------
+
+TEST(BookSideQualityFeed, ADislocatedBookIsRefusedValuationGrade)
+{
+    State state;
+    MarketDataFeed feed(sq_cfg(), state);
+    const std::string pair = "XCH/BYC";
+
+    feed.ingest_block_height(100);
+    feed.ingest_reference_anchor(pair, /*implied_cross=*/kAnchor,
+                                 /*peg_target=*/0.0);
+    feed.ingest_competing_offers(pair, dislocated_book(), {},
+                                 kMojosPerXch, 1'000);
+    feed.refresh({pair});
+
+    const auto snap = state.get_market(pair);
+    ASSERT_FALSE(snap.ask_side_anchor_ok)
+        << "precondition: the junk ask side must be disqualified";
+
+    // The mid STILL PUBLISHES. Withholding valuation is not the same as
+    // going no-mid: quoting logic needs a price, and Step 8 re-references
+    // off the junk side rather than losing the pair. If this ever flips to
+    // 0 the test below stops meaning anything.
+    ASSERT_GT(snap.mid_price, 0)
+        << "the fix must withhold VALUATION, not suppress the mid";
+
+    const double mid =
+        static_cast<double>(snap.mid_price) / static_cast<double>(kMojosPerXch);
+    EXPECT_LT(mid / kAnchor, 3.0)
+        << "the poisoned mid is INSIDE the gate's band -- the mid gate is "
+           "not what stops this, which is the whole point";
+
+    EXPECT_FALSE(snap.mid_valuation_grade)
+        << "a book with one disqualified side must not mark equity or P&L: "
+           "this mid reaches the drawdown breaker and the rolling-window "
+           "loss breaker";
+}
+
+// Non-vacuity control. If dex_fresh_grade were false in this fixture for some
+// unrelated reason, the assertion above would pass no matter what the grade
+// predicate did. Same feed, same anchor, same ingest path -- only the book is
+// coherent -- and the grade must be GRANTED.
+TEST(BookSideQualityFeed, ACoherentBookStillEarnsValuationGrade)
+{
+    State state;
+    MarketDataFeed feed(sq_cfg(), state);
+    const std::string pair = "XCH/BYC";
+
+    feed.ingest_block_height(100);
+    feed.ingest_reference_anchor(pair, kAnchor, 0.0);
+    feed.ingest_competing_offers(
+        pair,
+        {sq_offer("b1", Side::Bid, 1.40, 5'000'000'000'000LL),
+         sq_offer("a1", Side::Ask, 1.42, 5'000'000'000'000LL)},
+        {}, kMojosPerXch, 1'000);
+    feed.refresh({pair});
+
+    const auto snap = state.get_market(pair);
+    ASSERT_TRUE(snap.bid_side_anchor_ok);
+    ASSERT_TRUE(snap.ask_side_anchor_ok);
+    EXPECT_TRUE(snap.mid_valuation_grade)
+        << "the side gate must not deny grade to a healthy book -- if this "
+           "fails, the assertion in the sibling test proves nothing";
+}
+
+// The `|| cex_fresh` branch must be gated too, not just the book branch.
+// mid_price is the 70/30 blend, so a fresh CEX leg does not make a
+// 70%-junk-book mid side-safe. A fix applied only to the book branch leaves
+// this green in the wrong direction.
+TEST(BookSideQualityFeed, AFreshCexLegDoesNotRescueADislocatedBook)
+{
+    State state;
+    MarketDataFeed feed(sq_cfg(), state);
+    const std::string pair = "XCH/BYC";
+
+    feed.ingest_block_height(100);
+    feed.ingest_cex_reference(pair, kAnchor);   // expiry disabled -> always fresh
+    feed.ingest_competing_offers(pair, dislocated_book(), {},
+                                 kMojosPerXch, 1'000);
+    feed.refresh({pair});
+
+    const auto snap = state.get_market(pair);
+    ASSERT_FALSE(snap.ask_side_anchor_ok);
+    ASSERT_GT(snap.mid_price, 0);
+    EXPECT_FALSE(snap.mid_valuation_grade)
+        << "the CEX leg is only 30% of this mid; it cannot bless the 70% of "
+           "it that came from a disqualified book side";
+}
+
 TEST(BookSideQualityFeed, RawTickerIngestClearsAStaleDisqualification)
 {
     // THE REGRESSION. Disqualify a side, then let a raw ticker poll land
@@ -496,4 +689,226 @@ TEST(BookSideQualityFeed, AHealthyBookPublishesBothSidesTrusted)
     const auto snap = state.get_market(pair);
     EXPECT_TRUE(snap.bid_side_anchor_ok);
     EXPECT_TRUE(snap.ask_side_anchor_ok);
+}
+
+// ===========================================================================
+// [review round 7, PR #134] THE THREE DEFECTS IN THE ROUND-6 GRADE PREDICATE.
+//
+// Round 6 shipped `mid > 0 && book_sides_ok && ((two_sided && grade) || cex)`.
+// The five tests below pin the corrections. Each was RED before the fix; the
+// last two pin the two deliberate escapes, so neither can be deleted as dead
+// weight.
+// ===========================================================================
+
+// (1) OVER-STRICT: the side verdicts gated mids the book never entered.
+//
+// A one-sided book publishes NO dex mid at all (compute_mid Case 2 refuses
+// to derive one), so the published mid here is EXACTLY the CEX anchor -- and
+// round 6 withheld its grade because of a book side that contributed zero to
+// it. On the thin pairs being the only offer on a side is the normal state,
+// and engine.cpp records a prior incident where requiring grade on such a
+// pair zeroed every USD figure in the bot.
+TEST(BookSideQualityFeed, AOneSidedBookDoesNotForfeitAPureCexValuation)
+{
+    State state;
+    MarketDataFeed feed(sq_cfg(), state);
+    const std::string pair = "XCH/BYC";
+
+    feed.ingest_block_height(100);
+    feed.ingest_cex_reference(pair, kAnchor);   // expiry disabled -> fresh
+    // Third-party ASK only, far outside the 3.0x band. No third-party bid,
+    // so dex_best_bid is the authoritative 0 and the book is NOT two-sided.
+    feed.ingest_competing_offers(
+        pair,
+        {sq_offer("a1", Side::Ask, kAnchor * 4.0, 5'000'000'000'000LL)},
+        {}, kMojosPerXch, 1'000);
+    feed.refresh({pair});
+
+    const auto snap = state.get_market(pair);
+    ASSERT_FALSE(snap.ask_side_anchor_ok)
+        << "precondition: the lone ask is 4x the anchor and must be junk";
+    ASSERT_EQ(snap.best_bid, 0)
+        << "precondition: no third-party bid, so the book is one-sided";
+
+    // The published mid must be the anchor itself -- proof that the
+    // disqualified ask contributed nothing to the number being graded.
+    const double mid =
+        static_cast<double>(snap.mid_price) / static_cast<double>(kMojosPerXch);
+    ASSERT_NEAR(mid, kAnchor, kAnchor * 1e-9)
+        << "w_dex must be 0 here: a one-sided book yields no dex mid";
+
+    EXPECT_TRUE(snap.mid_valuation_grade)
+        << "this mid is bit-for-bit the CEX anchor; withholding its grade "
+           "over a book side that never entered it starves the drawdown "
+           "breaker on the pair's NORMAL state";
+}
+
+// (2) VACUOUS: on the `|| cex_fresh` branch the verdicts were never computed.
+//
+// ingest_dexie writes the RAW self-inclusive ticker BBO and resets both side
+// verdicts to TRUE with book_side_ref to 0. If the competing-offer fetch then
+// throws -- the exact failure the S20 provenance flags exist for --
+// classify_sides never runs, so `book_sides_ok` is trivially true and round 6
+// graded a 70%-raw, unscreened, half-dislocated BBO off the CEX leg alone.
+//
+// No ingest_competing_offers call in this fixture. That absence IS the test.
+//
+// The raw book here is deliberately TIGHT (99 bps) and therefore internally
+// coherent, so the round-7 coherence conjunct does NOT fire and this fixture
+// isolates the witness. A dislocated raw book would be refused by coherence
+// alone and would prove nothing about `sides_examined` -- the first version
+// of this test made exactly that mistake and survived the mutation.
+//
+// A tight raw book is not a safe book: ingest_dexie's BBO includes OUR OWN
+// resting offers, so on a thin pair "tight" can mean nothing more than that
+// we are the only two offers and are quoting 2.1x the anchor to ourselves.
+TEST(BookSideQualityFeed, AnUnexaminedRawBookIsNotRescuedByAFreshCexLeg)
+{
+    State state;
+    MarketDataFeed feed(sq_cfg(), state);
+    const std::string pair = "XCH/BYC";
+
+    feed.ingest_block_height(100);
+    feed.ingest_cex_reference(pair, kAnchor);   // expiry disabled -> fresh
+    // Coherent, self-inclusive, and 2.1x the anchor. Never screened.
+    feed.ingest_dexie(pair, 3.0000, 3.0300, 0.0, 0.0);
+    feed.refresh({pair});
+
+    const auto snap = state.get_market(pair);
+    ASSERT_TRUE(snap.bid_side_anchor_ok);
+    ASSERT_TRUE(snap.ask_side_anchor_ok)
+        << "precondition: the verdicts are TRIVIALLY true -- nothing ran";
+    ASSERT_EQ(snap.book_side_ref, 0)
+        << "precondition: book_side_ref is the witness, and it is 0 because "
+           "classify_sides never examined this book";
+    ASSERT_GT(snap.spread_bps, 0);
+    ASSERT_LT(snap.spread_bps, 5000.0)
+        << "precondition: this book IS coherent, so the spread conjunct "
+           "cannot be what refuses it -- otherwise this test is vacuous";
+    ASSERT_GT(snap.mid_price, 0);
+
+    EXPECT_FALSE(snap.mid_valuation_grade)
+        << "70% of this mid is a raw, self-inclusive, never-screened BBO "
+           "sitting at 2.1x the anchor; two default-true flags are not "
+           "evidence that anything checked it";
+}
+
+// (3) TOO LOOSE: the 3.0x per-side band alone does not mean "not dislocated".
+//
+// Round 6's comment promised "A HALF-DISLOCATED BOOK MUST NOT MARK EQUITY".
+// With an ask at 2.978x the anchor BOTH sides sit inside the band, so both
+// stand -- while the book's own spread is 9,474 bps and its mid is 2.02x the
+// anchor. The incident ask was 3.545x; an ask only 16% lower defeated the
+// entire fix. The header's own diagnostic (one side moving alone leaves a
+// wide spread behind) was computed and never consulted on this path.
+TEST(BookSideQualityFeed, AWideBookWithBothSidesInsideTheBandIsStillRefused)
+{
+    State state;
+    MarketDataFeed feed(sq_cfg(), state);
+    const std::string pair = "XCH/BYC";
+
+    feed.ingest_block_height(100);
+    feed.ingest_reference_anchor(pair, /*implied_cross=*/kAnchor,
+                                 /*peg_target=*/0.0);
+    feed.ingest_competing_offers(
+        pair,
+        {sq_offer("b1", Side::Bid, 1.5000, 5'000'000'000'000LL),
+         sq_offer("a1", Side::Ask, 4.2000, 5'000'000'000'000LL)},
+        {}, kMojosPerXch, 1'000);
+    feed.refresh({pair});
+
+    const auto snap = state.get_market(pair);
+    // The per-side band is NOT what catches this -- both sides survive it.
+    ASSERT_TRUE(snap.bid_side_anchor_ok) << "1.5000 / anchor = 1.064";
+    ASSERT_TRUE(snap.ask_side_anchor_ok) << "4.2000 / anchor = 2.978 < 3.0";
+    ASSERT_GT(snap.book_side_ref, 0) << "precondition: the book WAS examined";
+
+    // Nor is the mid gate: 2.02x is inside mid_anchor_band_ratio, so gate_mid
+    // returns Accept at its early exit and never calls book_confirms.
+    const double mid =
+        static_cast<double>(snap.mid_price) / static_cast<double>(kMojosPerXch);
+    ASSERT_GT(mid, 0);
+    ASSERT_LT(mid / kAnchor, 3.0);
+    ASSERT_GT(mid / kAnchor, 2.0) << "a 102% valuation error, and it grades";
+
+    EXPECT_FALSE(snap.mid_valuation_grade)
+        << "a 9,474-bps book is one side standing alone; the book must agree "
+           "with ITSELF before its mid may mark equity";
+}
+
+// ESCAPE 1, PINNED: a crossed book must not become a valuation blackout.
+//
+// compute_spread_bps returns 0 for a crossed book, and classify_sides
+// deliberately falls such a book through to the per-side band rather than
+// judging its coherence. Crossed books are normal on Dexie (no matching
+// engine), so the round-7 coherence conjunct must stand down here and let the
+// per-side band govern alone -- exactly as classify_sides does. Without this
+// escape every crossed cycle would lose its grade.
+TEST(BookSideQualityFeed, ACrossedBookIsStillJudgedByTheBandAlone)
+{
+    State state;
+    MarketDataFeed feed(sq_cfg(), state);
+    const std::string pair = "XCH/DBX";
+
+    feed.ingest_block_height(100);
+    feed.ingest_reference_anchor(pair, kAnchor, 0.0);
+    // Crossed: bid ABOVE ask. Both touches sit on the anchor.
+    feed.ingest_competing_offers(
+        pair,
+        {sq_offer("b1", Side::Bid, 1.42, 5'000'000'000'000LL),
+         sq_offer("a1", Side::Ask, 1.40, 5'000'000'000'000LL)},
+        {}, kMojosPerXch, 1'000);
+    feed.refresh({pair});
+
+    const auto snap = state.get_market(pair);
+    ASSERT_GT(snap.best_bid, snap.best_ask)
+        << "precondition: the book must actually be crossed";
+    ASSERT_DOUBLE_EQ(snap.spread_bps, 0.0)
+        << "precondition: a crossed book has no measurable spread";
+    ASSERT_TRUE(snap.bid_side_anchor_ok);
+    ASSERT_TRUE(snap.ask_side_anchor_ok);
+
+    EXPECT_TRUE(snap.mid_valuation_grade)
+        << "an unmeasurable spread is not evidence of dislocation; both "
+           "touches are on the anchor and the band is what governs";
+}
+
+// ESCAPE 2, PINNED: agree_max 0 is "bypass off", not "distrust every book".
+//
+// 0 is the documented setting for withdrawing coherence as a reason to TRUST
+// a book. It must not silently become a reason to DISTRUST one: at 0 the
+// coherence conjunct stands down and the per-side band governs alone, which
+// is the round-6 behaviour. Without this escape the knob would black out
+// valuation bot-wide -- every two-sided book on every pair.
+TEST(BookSideQualityFeed, DisablingTheBypassDoesNotBlackOutValuation)
+{
+    MarketDataConfig cfg = sq_cfg();
+    cfg.book_side_agree_max_spread_bps = 0.0;   // documented "off"
+    ASSERT_DOUBLE_EQ(
+        xop::bookside::effective_agree_max_spread_bps(
+            cfg.book_side_agree_max_spread_bps,
+            cfg.mid_gate_book_confirm_max_spread_bps),
+        0.0) << "precondition: min() carries the 0 through";
+
+    State state;
+    MarketDataFeed feed(cfg, state);
+    const std::string pair = "XCH/DBX";
+
+    feed.ingest_block_height(100);
+    feed.ingest_reference_anchor(pair, kAnchor, 0.0);
+    // A perfectly healthy 142-bps book sitting on the anchor.
+    feed.ingest_competing_offers(
+        pair,
+        {sq_offer("b1", Side::Bid, 1.40, 5'000'000'000'000LL),
+         sq_offer("a1", Side::Ask, 1.42, 5'000'000'000'000LL)},
+        {}, kMojosPerXch, 1'000);
+    feed.refresh({pair});
+
+    const auto snap = state.get_market(pair);
+    ASSERT_GT(snap.spread_bps, 0) << "precondition: spread IS measurable here";
+    ASSERT_TRUE(snap.bid_side_anchor_ok);
+    ASSERT_TRUE(snap.ask_side_anchor_ok);
+
+    EXPECT_TRUE(snap.mid_valuation_grade)
+        << "turning the bypass off must not zero every USD figure in the bot";
 }
