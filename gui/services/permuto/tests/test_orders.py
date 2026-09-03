@@ -286,9 +286,15 @@ def test_an_observed_full_ring_cap_reserves_the_quantisation_tick():
         lot_size=1.0,
     )
     assert legs
+    bid = next(o for o in legs if o.side is Side.BUY)
+    ask = next(o for o in legs if o.side is Side.SELL)
+    # Both legs override the default 1.8% cap and place at the full-ring grid boundary
+    assert bid.price == 0.1514
+    assert ask.price == 0.1575
     for leg in legs:
         deviation = abs(leg.price / oracle - 1.0) * 100.0
-        assert deviation <= 2.0 + 1e-9, leg
+        # Exceeds the default 90% cap (1.8%) while remaining inside the 2.0% ring
+        assert 1.8 < deviation <= 2.0 + 1e-9, leg
 
 
 def test_a_degenerate_quantised_pair_is_skipped_not_sent():

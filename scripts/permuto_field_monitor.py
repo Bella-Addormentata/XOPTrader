@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -77,7 +78,9 @@ def ring_state():
         for entry in (meta.get("markets") or []):
             if isinstance(entry, dict) and entry.get("symbol"):
                 try:
-                    specs[entry["symbol"]] = float(entry.get("tick_size") or 0.0001)
+                    val = float(entry.get("tick_size") or 0.0001)
+                    if math.isfinite(val) and val > 0.0:
+                        specs[entry["symbol"]] = val
                 except (TypeError, ValueError):
                     # Malformed or missing tick_size; downstream specs.get() falls back to 0.0001
                     pass

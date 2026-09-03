@@ -64,3 +64,29 @@ def test_ring_state_computes_ask_ticks_on_empty_bid(monkeypatch):
     st = mod.ring_state()
     assert st["QQQ-VOL-PERP"]["ask_ticks"] > 0
     assert st["QQQ-VOL-PERP"]["best_bid"] is None
+
+
+def test_ring_state_falls_back_on_malformed_or_nonpositive_tick_size(monkeypatch):
+    import scripts.permuto_field_monitor as mod
+
+    def mock_get(path, timeout=25):
+        if path == "/info/oracle":
+            return {"prices": {"NVDA-VOL": 0.20, "QQQ-VOL": 0.10, "TSLA-VOL": 0.28}}
+        if path == "/info/meta":
+            return {
+                "vol_aggressive_ring_pct": 2.0,
+                "markets": [
+                    {"symbol": "QQQ-VOL-PERP", "tick_size": float("nan")},
+                    {"symbol": "NVDA-VOL-PERP", "tick_size": -0.01},
+                    {"symbol": "TSLA-VOL-PERP", "tick_size": 0.0},
+                ],
+            }
+        if "/info/l2/" in path:
+            return {"bids": [], "asks": []}
+        return {}
+
+    monkeypatch.setattr(mod, "get", mock_get)
+    st = mod.ring_state()
+    for m in ("QQQ-VOL-PERP", "NVDA-VOL-PERP", "TSLA-VOL-PERP"):
+        assert st[m]["tick_size"] == 0.0001
+        assert st[m]["ask_ticks"] > 0
