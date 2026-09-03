@@ -3556,6 +3556,43 @@ def test_shut_bbo_prices_reducing_leg_passively_within_band():
         "reducing ask exceeds 5% legal venue band")
 
 
+def test_reduce_only_passive_bound_preserved_when_blocker_outside_preflight_safety_window():
+    """A blocker at +3.57% (above preflight 3.25% reserve) is not clamped below the blocker."""
+    from gui.services.permuto.bbo import Book
+
+    # Oracle = 0.0700. Preflight safety window is 3.25% (0.072275).
+    # Competitor best bid is at 0.0725 (+3.57%), inside 5% band (0.0735).
+    c = _Client(account=_account(100.0), batch_response=_venue_ok())
+    book = Book(market=_MKT, best_bid=0.0725, best_ask=None)
+    r = _runner(c, curfew_enabled=False, oracle_fetch=lambda: _ORACLE, bbo_fetch=lambda m: book, max_position_usd=5.0)
+
+    res = r.tick(_MID_SESSION, _ORACLE, {})
+    assert res.action == "quote"
+    assert c.last_batch, "no reduce-only batch was sent"
+    sell_legs = [l for l in c.last_batch if l["side"] == "sell"]
+    assert sell_legs, "no reducing sell leg sent"
+    ask_price = float(sell_legs[0]["price"])
+    assert ask_price > 0.0725, (
+        "reducing ask %.6f was clamped below best bid 0.0725 and crosses the book" % ask_price)
+    assert ask_price <= 0.07 * 1.05 + 1e-9, (
+        "reducing ask %.6f exceeds 5%% legal venue band" % ask_price)
+
+
+def test_reduce_only_skipped_when_blocker_exceeds_venue_band():
+    """A blocker at +5.14% cannot be cleared inside the 5.0% legal venue band."""
+    from gui.services.permuto.bbo import Book
+
+    # Oracle = 0.0700. Competitor best bid is at 0.0736 (+5.14% > 5.0% band).
+    c = _Client(account=_account(100.0), batch_response=_venue_ok())
+    book = Book(market=_MKT, best_bid=0.0736, best_ask=None)
+    r = _runner(c, curfew_enabled=False, oracle_fetch=lambda: _ORACLE, bbo_fetch=lambda m: book, max_position_usd=5.0)
+
+    res = r.tick(_MID_SESSION, _ORACLE, {})
+    assert res.action == "risk_blocked" or res.markets[_MKT][0] == "skip"
+    assert not getattr(c, "last_batch", None), (
+        "an out-of-band reduce-only leg was erroneously sent")
+
+
 def test_uncapped_overnight_schedule_sets_carried_flag():
     """max_position_usd=0 leaves curfew.stage=UNSCHEDULED but schedule_stage=CLOSED."""
     c = _Client(account=_account(0.0), batch_response=_venue_ok())

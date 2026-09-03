@@ -1435,6 +1435,7 @@ class QuoteRunner:
         bbo_placements: set = set()
         bbo_initial_prices: dict = {}
         observed_books: dict = {}
+        bbo_reduce_placements: set = set()
         start_bbo_tick = getattr(self._bbo_fetch, "start_tick", None)
         if callable(start_bbo_tick):
             start_bbo_tick()
@@ -1676,6 +1677,8 @@ class QuoteRunner:
                     if not shrinking:
                         continue
                     leg_price = leg.price
+                    min_passive = None
+                    max_passive = None
                     if _bbo_prices is None:
                         book = _observed_book
                         if book is None and self._bbo_fetch is not None:
@@ -1685,6 +1688,7 @@ class QuoteRunner:
                                 _log.debug("permuto: BBO fetch for reduce-only leg failed for %s: %s", market, exc)
                                 book = None
                         if book is not None:
+                            observed_books[market] = book
                             if leg.side is Side.SELL and book.best_bid is not None:
                                 min_passive = bbo_quantise(book.best_bid + _tick, _tick, up=True)
                                 if leg_price < min_passive:
@@ -1707,6 +1711,7 @@ class QuoteRunner:
                         continue
                     leg = type(leg)(leg.market, leg.side, leg_price,
                                     leg_size, True)
+                    bbo_reduce_placements.add(market)
                 # [CURFEW] Clamp the leg to the room left under its side's
                 # cap. A yes/no veto was not enough: the ladder is sized to
                 # target_depth_usd, so a leg permitted merely because it
@@ -1736,6 +1741,23 @@ class QuoteRunner:
                             % (self._band_guard.velocity(market),
                                oracle_age))
                         continue
+                    if leg.reduce_only:
+                        if leg.side is Side.SELL and min_passive is not None and clamped < min_passive:
+                            if min_passive <= oracle * (1.0 + VENUE_BAND_PCT / 100.0) + 1e-9:
+                                clamped = min_passive
+                            else:
+                                results[market] = (
+                                    "skip",
+                                    "reduce-only ask cannot clear book within venue band")
+                                continue
+                        elif leg.side is Side.BUY and max_passive is not None and clamped > max_passive:
+                            if max_passive >= oracle * (1.0 - VENUE_BAND_PCT / 100.0) - 1e-9:
+                                clamped = max_passive
+                            else:
+                                results[market] = (
+                                    "skip",
+                                    "reduce-only bid cannot clear book within venue band")
+                                continue
                     if clamped != leg.price:
                         leg = type(leg)(leg.market, leg.side, clamped,
                                         leg.size, leg.reduce_only)
@@ -1947,6 +1969,31 @@ class QuoteRunner:
 
                 price = quantise_toward(
                     out.price if out.changed else leg.price, ref, m_tick)
+                if leg.reduce_only and leg.market in observed_books:
+                    book = observed_books[leg.market]
+                    if leg.side is Side.SELL and book.best_bid is not None:
+                        min_p = bbo_quantise(book.best_bid + m_tick, m_tick, up=True)
+                        if price < min_p:
+                            if min_p <= ref * (1.0 + VENUE_BAND_PCT / 100.0) + 1e-9:
+                                price = min_p
+                            else:
+                                results[leg.market] = (
+                                    "skip",
+                                    "reduce-only ask cannot clear book within venue band")
+                                dropped.add(leg.market)
+                                continue
+                    elif leg.side is Side.BUY and book.best_ask is not None:
+                        max_p = bbo_quantise(book.best_ask - m_tick, m_tick, up=False)
+                        if price > max_p:
+                            if max_p >= ref * (1.0 - VENUE_BAND_PCT / 100.0) - 1e-9:
+                                price = max_p
+                            else:
+                                results[leg.market] = (
+                                    "skip",
+                                    "reduce-only bid cannot clear book within venue band")
+                                dropped.add(leg.market)
+                                continue
+
                 if price <= 0.0:
                     results[leg.market] = (
                         "skip", "no on-grid price inside the band")
@@ -2040,6 +2087,73 @@ class QuoteRunner:
                     "permuto: %s BBO placement invalidated (oracle %.6f -> %.6f); "
                     "dropping stale pair and rebuilding next tick",
                     market, original, current)
+
+            for market in bbo_reduce_placements:
+                if market in dropped:
+                    continue
+                original = latest_oracle(oracles, None, market)
+                current = 0.0
+                for source in sources:
+                    current = latest_oracle(source, None, market)
+                    if current > 0.0:
+                        break
+                if current <= 0.0:
+                    current = original
+
+                market_legs = [leg for leg in pending
+                               if leg.market == market]
+                if not market_legs:
+                    continue
+
+                book = None
+                if current == original and market in observed_books:
+                    book = observed_books[market]
+                elif self._bbo_fetch is not None:
+                    try:
+                        book = self._bbo_fetch(market)
+                    except Exception as exc:  # noqa: BLE001
+                        _log.debug("permuto: final BBO fetch failed for reduce-only %s: %s",
+                                   market, exc)
+                        book = None
+
+                if book is None:
+                    dropped.add(market)
+                    results[market] = (
+                        "skip",
+                        "final book could not be read for reduce-only leg revalidation")
+                    continue
+
+                raw_specs = flags.get("specs")
+                spec = (raw_specs.get(market, {})
+                        if isinstance(raw_specs, dict) else {})
+                tick_size = _effective_tick(spec.get("tick_size"))
+                eps = tick_size * 1e-4
+                valid = True
+                for leg in market_legs:
+                    if leg.side is Side.SELL:
+                        if book.best_bid is not None and leg.price <= book.best_bid + eps:
+                            valid = False
+                            break
+                        if leg.price > current * (1.0 + VENUE_BAND_PCT / 100.0) + 1e-9:
+                            valid = False
+                            break
+                    elif leg.side is Side.BUY:
+                        if book.best_ask is not None and leg.price >= book.best_ask - eps:
+                            valid = False
+                            break
+                        if leg.price < current * (1.0 - VENUE_BAND_PCT / 100.0) - 1e-9:
+                            valid = False
+                            break
+
+                if not valid:
+                    dropped.add(market)
+                    results[market] = (
+                        "skip",
+                        "reduce-only leg would cross the refreshed book or exceed venue band")
+                    _log.info(
+                        "permuto: %s reduce-only leg invalidated against refreshed book or oracle; dropping leg",
+                        market)
+
             if not dropped:
                 return list(pending), dropped
             return ([leg for leg in pending if leg.market not in dropped],
