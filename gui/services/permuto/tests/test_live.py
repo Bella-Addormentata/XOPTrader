@@ -186,6 +186,58 @@ def test_join_returns_promptly_while_blocking_the_event_loop(qapp):
     assert live._client.cancels, "off must still mean flat on this path"
 
 
+def test_join_reports_the_cancel_outcome_without_the_event_loop(qapp):
+    """A blocking caller cannot learn the outcome from the signal.
+
+    book_state is emitted on the worker's thread, so its slot is QUEUED to
+    the GUI thread's event loop -- the loop join() stops pumping the moment
+    it calls wait(). Reading book_is_empty() straight after a blocking join
+    therefore returned the value start() left behind (False), and a clean
+    cancel read as a book still resting.
+
+    The Settings master switch gates on exactly that reading before it
+    hides the Permuto surfaces, so a stale False meant it refused every
+    honest stop -- and a stale True on the other path would have been worse.
+    join() now returns the worker's own record of the final cancel.
+    """
+    live = _live(qapp)
+    live.start()
+    qapp.processEvents()          # let the worker actually start
+
+    flat = live.join(timeout_ms=3000)     # no processEvents() in here
+
+    assert live._client.cancels, "off must still mean flat"
+    assert flat is True, "join() did not report the successful cancel"
+    assert live.book_is_empty() is True, (
+        "book_is_empty() still reads the pre-stop value after a join")
+
+
+def test_join_reports_a_failed_cancel_without_the_event_loop(qapp):
+    """The direction that must never be optimistic.
+
+    A cancel that raised leaves orders resting at a remote venue. If join()
+    reported flat here, the master switch would hide the page -- and the
+    close control -- over a live book.
+    """
+    live = _live(qapp, cancel_raises=True)
+    live.start()
+    qapp.processEvents()
+
+    flat = live.join(timeout_ms=3000)
+
+    assert flat is False, "a failed cancel was reported as a flat book"
+    assert live.book_is_empty() is False
+
+
+def test_join_on_an_idle_session_reports_the_current_book(qapp):
+    """Nothing running is not an error, and it is not a claim either."""
+    live = _live(qapp)
+    assert live.join() is True
+
+    live._book_empty = False
+    assert live.join() is False
+
+
 def test_start_is_idempotent(qapp):
     live = _live(qapp)
     live.start()

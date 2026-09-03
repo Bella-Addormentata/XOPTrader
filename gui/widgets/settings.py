@@ -1476,44 +1476,52 @@ class SettingsWidget(QWidget):
         that the venue is finished: it governs the machine that has
         expressed no preference, not the one that has.
 
-        ASYMMETRIC ON PURPOSE. Off applies immediately, because a control
-        that promises a subsystem is gone has to be honest the moment it is
-        clicked, and because it may have to stop a live session first. On
-        cannot: the toolbar switch and the page are built during window
-        construction and the sidebar/page indices are positional, so there is
-        nowhere to insert them afterwards. Since the default is off, turning
-        it ON is now the ordinary path rather than the rare one, so the
-        restart is said three times -- in the label, in the note, and in a
-        dialog when it is actually clicked. A tick box that silently appears
-        to do nothing is the failure mode this is guarding against.
+        ASYMMETRIC, BUT ONLY IN ONE CASE. Off applies immediately, because a
+        control that promises a subsystem is gone has to be honest the
+        moment it is clicked, and because it may have to stop a live session
+        first. On applies immediately TOO whenever this session actually
+        built the surfaces -- switching off and back on again just unhides
+        them. It is only a session that STARTED with Permuto off that has
+        nothing to unhide: the toolbar switch and the page are built during
+        window construction and the sidebar/page indices are positional, so
+        there is nowhere to insert them afterwards.
+
+        The wording has to carry that distinction rather than flatten it to
+        "restart required", which is wrong half the time and trains
+        operators to ignore it. MainWindow knows which case it is in and
+        raises a dialog only for the one that genuinely waits.
         """
         group = QGroupBox("Subsystems")
         box = QVBoxLayout(group)
         box.setSpacing(6)
 
         self._permuto_enabled_box = QCheckBox(
-            "Enable the Permuto market maker (restart required)")
+            "Enable the Permuto market maker")
         self._permuto_enabled_box.setChecked(load_permuto_enabled())
         self._permuto_enabled_box.setToolTip(
             "Off by default. Off hides the Permuto toolbar switch, its "
             "sidebar entry and its page, and stops every background read and "
-            "venue request the subsystem makes. Turning it on takes effect "
-            "the next time XOPTrader starts."
+            "venue request the subsystem makes. Switching it back on in the "
+            "same session brings them straight back; if this session STARTED "
+            "with Permuto off, they appear the next time XOPTrader starts."
         )
         box.addWidget(self._permuto_enabled_box)
 
         note = QLabel(
             "Off by default -- leaving it on costs a read of the trading "
-            "identity on every tick whether or not you ever quote. Turning "
-            "it ON takes effect the next time XOPTrader starts, because the "
-            "toolbar switch and the page are built at startup. Switching it "
-            "off also sets 'Permuto at startup' to Off; the overnight "
-            "curfew stays armed, because its off position disarms a "
-            "protection rather than stopping activity. Turning it OFF "
-            "takes effect "
-            "immediately -- if a session is quoting it is stopped and its "
-            "book cancelled first, and the switch refuses to hide anything "
-            "until that cancel is confirmed."
+            "identity on every tick whether or not you ever quote.\n\n"
+            "Turning it OFF takes effect immediately: if a session is "
+            "quoting it is stopped and its book cancelled first, and the "
+            "switch refuses to hide anything until that cancel is "
+            "confirmed. It also sets 'Permuto at startup' to Off. The "
+            "overnight curfew is left armed on purpose -- its off position "
+            "disarms a protection rather than stopping activity.\n\n"
+            "Turning it back ON is immediate too IF this session built the "
+            "Permuto surfaces -- that is, if you switched it off here a "
+            "moment ago. If XOPTrader STARTED with Permuto off, there is "
+            "nothing to unhide: the toolbar switch and the page are built "
+            "at startup, so they appear on the next launch and you will be "
+            "told so."
         )
         note.setWordWrap(True)
         note.setStyleSheet(f"color: {_C.TEXT_SECONDARY}; font-size: 9pt;")

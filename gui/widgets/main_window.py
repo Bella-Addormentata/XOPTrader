@@ -2904,7 +2904,32 @@ class MainWindow(QMainWindow):
             return
 
         # -- OFF -----------------------------------------------------------
-        if self._permuto_runner is not None:
+        # [review] A close worker owns the venue session and CANNOT be
+        # joined away: stop_background_work gives it CLOSE_JOIN_MS and then
+        # deliberately abandons the thread rather than terminate it mid
+        # order. Hiding the page over that would take away the operator's
+        # close control while their close is still on the wire, and a later
+        # re-enable could open a second session for the same identity --
+        # the alternating-401 failure _on_permuto_toggle already refuses
+        # arming for, arriving from the other side.
+        page = self._unwrap(self._permuto_widget)
+        in_flight = getattr(page, "close_in_flight", None)
+        if callable(in_flight) and in_flight():
+            self._revert_permuto_enabled(True)
+            self._on_switch_refused(
+                "a position close is in flight; wait for it to finish "
+                "before switching the Permuto subsystem off")
+            return
+
+        # [review] is_running(), not "a runner object exists". An ordinary
+        # toolbar stop leaves the object assigned after its thread has
+        # finished, so testing for existence alone showed a "session is
+        # live" confirmation -- and ran the whole live-stop path -- over a
+        # venue that had been flat for hours.
+        runner = self._permuto_runner
+        running = runner is not None and bool(
+            getattr(runner, "is_running", lambda: True)())
+        if running:
             reply = QMessageBox.question(
                 self,
                 "Stop Permuto?",
@@ -2922,15 +2947,20 @@ class MainWindow(QMainWindow):
             # may_turn_off is unconditional by design; this is the same stop
             # an operator click performs.
             self._on_permuto_toggle(False)
+            # [review] Take the verdict from join() itself. stop() only sets
+            # a flag; the cancel runs on the worker thread and its result
+            # comes back through a QUEUED signal -- queued to the very event
+            # loop join() blocks. Reading book_is_empty() straight after a
+            # blocking join therefore saw the pre-stop value, and a clean
+            # cancel was reported as a book still resting. join() now
+            # records the worker's own final outcome before returning it.
+            flat = False
             try:
-                # stop() only sets a flag -- the cancel runs on the worker
-                # thread and lands seconds later. join() is what waits for
-                # it, and waiting is the entire safety argument here.
-                self._permuto_runner.join()
+                flat = bool(runner.join())
             except Exception:  # noqa: BLE001
                 _log.exception("[Permuto] session did not stop cleanly")
 
-            if not self._permuto_runner.book_is_empty():
+            if not flat:
                 _log.warning("[Permuto] refusing to hide the subsystem: the "
                              "book is not confirmed empty")
                 self._revert_permuto_enabled(True)
@@ -2946,6 +2976,15 @@ class MainWindow(QMainWindow):
                 return
 
         self._permuto_enabled = False
+        # [review] DISCARD THE SESSION. join() fences the client with
+        # halt_placements(), and that fence is permanent -- it exists so a
+        # tick already on the wire cannot resurrect the book after the final
+        # cancel. Keeping the object meant the next arm found
+        # `_permuto_runner is not None`, skipped building a fresh one, and
+        # started the halted client, so every batch_upsert came back
+        # "placements halted for shutdown". Dropping it costs nothing: the
+        # next arm builds a session, which is what arming means.
+        self._permuto_runner = None
         # A pending startup arm must not fire into a subsystem being torn
         # down; _apply_permuto_startup_state also checks the flag.
         self._startup_permuto = "off"
@@ -2954,7 +2993,6 @@ class MainWindow(QMainWindow):
         # off too, or the page claims to be polling a venue it has stopped
         # talking to. suspend_for_disabled_subsystem does both; the
         # fallback covers a placeholder or an older page object.
-        page = self._unwrap(self._permuto_widget)
         for method in ("suspend_for_disabled_subsystem",
                        "stop_background_work"):
             fn = getattr(page, method, None)

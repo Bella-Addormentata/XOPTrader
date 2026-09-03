@@ -58,19 +58,46 @@ the venue -- including the ones that never will.
   and which does nothing at all while the subsystem is off, and the
   **backup-confirmation checkbox**, which is a record that the operator
   wrote down their recovery phrase, not a switch.
-- **Off applies immediately; on waits for a restart.** The toolbar switch
-  and the page are built during window construction and the indices are
-  positional, so a session that started without them has nowhere to put
-  them. Since the default is off, turning it ON is the ordinary path rather
-  than the rare one, so the restart is stated three times — in the checkbox
-  label, in the note beneath it, and in a dialog raised when it is actually
-  clicked. A tick box that appears to do nothing is the failure mode that
-  guards against. (Off→on *within* one session restores live; the surfaces
-  were only hidden.)
+- **Off applies immediately. On applies immediately too — unless the
+  session started with Permuto off.** Switching off and back on again just
+  unhides surfaces this session already built. Only a session that *started*
+  disabled has nothing to unhide: the toolbar switch and the page are built
+  during window construction and the indices are positional, so there is
+  nowhere to insert them afterwards. That case — and only that case — raises
+  a dialog saying so, because with the default now off it is the ordinary
+  path, and a tick box that appears to do nothing reads as broken.
 - `disabled` is a first-class gate in `venue_control`, ordered **above**
   `watchdog` and `breaker`. Those say why a venue will not trade; this says
   why the venue is not here, and an operator who switched Permuto off must
   not be told the dead man's switch fired.
+
+Review round (PR #147) turned up three more, all in the disable path itself:
+
+- **The flatness verdict was read from a queued signal.** `PermutoLive`
+  emits `book_state` from the worker thread, so the slot that updates
+  `_book_empty` is queued to the GUI thread's event loop — the loop
+  `join()` stops pumping the moment it calls `wait()`. Reading
+  `book_is_empty()` straight after a blocking join returned the value
+  `start()` left behind, so an honest clean stop was refused as "the book is
+  not confirmed empty". `join()` now returns the worker's own record of the
+  final cancel, written on the worker thread before the emit, and the master
+  switch gates on that.
+- **The halted runner was kept.** `join()` fences the client with
+  `halt_placements()`, permanently and by design. Keeping the object meant
+  the next arm found `_permuto_runner is not None`, skipped building a fresh
+  session, and started the halted client — every `batch_upsert` back as
+  "placements halted for shutdown". It is discarded now.
+- **Any runner object counted as a live session.** An ordinary toolbar stop
+  leaves the object assigned after its thread finishes, so disabling later
+  raised a "a Permuto session is live" confirmation over a venue that had
+  been flat for hours, and ran the whole live-stop path. It asks
+  `is_running()`.
+
+Also: disabling now refuses while an operator close is in flight. That
+worker owns the venue session and cannot be joined away —
+`stop_background_work` gives it `CLOSE_JOIN_MS` and then abandons the thread
+rather than terminate it mid order — so hiding the page over it would take
+away the close control while the close was still on the wire.
 
 Three pre-existing faults surfaced while gating this and are fixed here:
 

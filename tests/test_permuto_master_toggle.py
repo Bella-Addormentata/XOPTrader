@@ -103,8 +103,8 @@ def _window(monkeypatch, *, enabled: bool):
     silently answers is indistinguishable from a real one that reads the
     file. The counter is what tells them apart.
     """
-    import gui.widgets.permuto as permuto_mod
-    import gui.widgets.settings as settings_mod
+    from gui.widgets import permuto as permuto_mod
+    from gui.widgets import settings as settings_mod
 
     reads: list[int] = []
 
@@ -390,7 +390,7 @@ def test_disabled_refuses_to_arm_but_never_refuses_to_stop(app, monkeypatch):
 
 
 def test_disabled_ignores_a_stored_startup_arm(app, monkeypatch):
-    """"Permuto: On at startup" must not outrank the master switch.
+    """A stored 'Permuto: On at startup' must not outrank the master switch.
 
     Two independent guards, because the arm is a QTimer scheduled from
     set_bridge: the schedule is skipped, and the method refuses even if a
@@ -422,7 +422,7 @@ def test_a_placeholder_page_does_not_break_the_session_builder(
     "could not start Permuto quoting: '_placeholder' object has no attribute
     '_target_depth_usd'", which is not something an operator can act on.
     """
-    import gui.services.permuto.live as live_mod
+    from gui.services.permuto import live as live_mod
 
     window, _reads = _window(monkeypatch, enabled=False)
     seen: dict = {}
@@ -484,7 +484,7 @@ def test_enabled_still_builds_the_whole_subsystem(app, monkeypatch):
 
 def _settings_page(monkeypatch, *, enabled: bool):
     """A SettingsWidget with the master switch forced."""
-    import gui.widgets.settings as settings_mod
+    from gui.widgets import settings as settings_mod
 
     monkeypatch.setattr(settings_mod, "load_permuto_enabled",
                         lambda: enabled)
@@ -682,11 +682,19 @@ def test_a_live_session_is_stopped_and_joined_before_anything_hides(
     order: list[str] = []
 
     class _Runner:
+        @staticmethod
+        def is_running():
+            return True
+
         def stop(self):
             order.append("stop")
 
         def join(self, timeout_ms=30_000):
+            # join() REPORTS the outcome. book_is_empty() cannot be trusted
+            # straight after a blocking join -- see
+            # test_the_verdict_comes_from_join_not_a_queued_signal.
             order.append("join")
+            return True
 
         @staticmethod
         def book_is_empty():
@@ -709,8 +717,6 @@ def test_a_live_session_is_stopped_and_joined_before_anything_hides(
         # the switch repaint the stop itself triggers.)
         assert order[0] == "stop", order
         assert "join" in order, order
-        assert order[-1] == "check", order
-        assert order.index("join") < len(order) - 1, order
         assert not window._sidebar.is_page_visible(mw._PAGE_PERMUTO)
     finally:
         window._permuto_runner = None
@@ -735,11 +741,15 @@ def test_an_unconfirmed_cancel_refuses_to_hide_anything(app, monkeypatch):
     reverted: list[bool] = []
 
     class _StuckRunner:
+        @staticmethod
+        def is_running():
+            return True
+
         def stop(self):
             pass
 
         def join(self, timeout_ms=30_000):
-            pass
+            return False        # the cancel was not confirmed
 
         @staticmethod
         def book_is_empty():
@@ -761,6 +771,217 @@ def test_an_unconfirmed_cancel_refuses_to_hide_anything(app, monkeypatch):
         assert window._permuto_switch_action.isVisible()
     finally:
         window._permuto_runner = None
+        window.close()
+        window.deleteLater()
+        app.processEvents()
+
+
+def test_the_verdict_comes_from_join_not_a_queued_signal(app, monkeypatch):
+    """[review] The two readings DISAGREE, and only one of them is current.
+
+    PermutoLive emits book_state from the worker thread, so the slot that
+    updates _book_empty is queued to the GUI thread's event loop -- the loop
+    join() stops pumping. Immediately after a blocking join, book_is_empty()
+    still holds what start() left there (False), while join() itself carries
+    the worker's real outcome.
+
+    A fake whose two readings agree cannot tell the fixed code from the
+    broken code; this one is built so it can.
+    """
+    from PySide6.QtWidgets import QMessageBox
+
+    from gui.widgets import main_window as mw
+
+    window, _reads = _window(monkeypatch, enabled=True)
+
+    class _CleanStopStaleRead:
+        """Cancelled successfully; book_is_empty() has not caught up."""
+
+        @staticmethod
+        def is_running():
+            return True
+
+        def stop(self):
+            pass
+
+        def join(self, timeout_ms=30_000):
+            return True           # the worker's real, final outcome
+
+        @staticmethod
+        def book_is_empty():
+            return False          # the stale pre-stop value
+
+    window._permuto_runner = _CleanStopStaleRead()
+    monkeypatch.setattr(QMessageBox, "question",
+                        staticmethod(lambda *a, **k:
+                                     QMessageBox.StandardButton.Yes))
+    monkeypatch.setattr(QMessageBox, "warning",
+                        staticmethod(lambda *a, **k: None))
+    try:
+        window._on_permuto_enabled_changed(False)
+
+        assert window._permuto_enabled is False, (
+            "an honest clean stop was refused on a stale book reading")
+        assert not window._sidebar.is_page_visible(mw._PAGE_PERMUTO)
+    finally:
+        window._permuto_runner = None
+        window.close()
+        window.deleteLater()
+        app.processEvents()
+
+
+def test_a_stale_optimistic_read_does_not_get_the_subsystem_hidden(
+        app, monkeypatch):
+    """The same disagreement, pointing the dangerous way.
+
+    If the verdict were taken from book_is_empty() it would be possible for
+    a FAILED cancel to read flat and get the page hidden over a live book.
+    join() is the authority in both directions.
+    """
+    from PySide6.QtWidgets import QMessageBox
+
+    from gui.widgets import main_window as mw
+
+    window, _reads = _window(monkeypatch, enabled=True)
+
+    class _FailedCancelStaleRead:
+        @staticmethod
+        def is_running():
+            return True
+
+        def stop(self):
+            pass
+
+        def join(self, timeout_ms=30_000):
+            return False          # the cancel FAILED
+
+        @staticmethod
+        def book_is_empty():
+            return True           # stale, and optimistic
+
+    window._permuto_runner = _FailedCancelStaleRead()
+    monkeypatch.setattr(QMessageBox, "question",
+                        staticmethod(lambda *a, **k:
+                                     QMessageBox.StandardButton.Yes))
+    monkeypatch.setattr(QMessageBox, "warning",
+                        staticmethod(lambda *a, **k: None))
+    window._revert_permuto_enabled = lambda _v: None
+    try:
+        window._on_permuto_enabled_changed(False)
+
+        assert window._permuto_enabled is True, (
+            "the subsystem was hidden over an unconfirmed cancel")
+        assert window._sidebar.is_page_visible(mw._PAGE_PERMUTO)
+    finally:
+        window._permuto_runner = None
+        window.close()
+        window.deleteLater()
+        app.processEvents()
+
+
+def test_a_stopped_runner_is_not_treated_as_a_live_session(app, monkeypatch):
+    """[review] is_running(), not "a runner object exists".
+
+    An ordinary toolbar stop leaves the object assigned after its thread has
+    finished. Testing for existence alone put a "a Permuto session is live"
+    confirmation in front of an operator whose venue had been flat for
+    hours, and ran the whole live-stop path over it.
+    """
+    from PySide6.QtWidgets import QMessageBox
+
+    window, _reads = _window(monkeypatch, enabled=True)
+    asked, joined = [], []
+
+    class _StoppedRunner:
+        @staticmethod
+        def is_running():
+            return False
+
+        def join(self, timeout_ms=30_000):
+            joined.append(1)
+            return True
+
+    window._permuto_runner = _StoppedRunner()
+    monkeypatch.setattr(QMessageBox, "question",
+                        staticmethod(lambda *a, **k: asked.append(a)))
+    try:
+        window._on_permuto_enabled_changed(False)
+        assert asked == [], "a flat venue raised a live-session confirmation"
+        assert joined == [], "a finished session was joined again"
+        assert window._permuto_enabled is False
+    finally:
+        window._permuto_runner = None
+        window.close()
+        window.deleteLater()
+        app.processEvents()
+
+
+def test_the_runner_is_discarded_so_the_next_arm_is_a_fresh_session(
+        app, monkeypatch):
+    """[review] join() fences the client with halt_placements(), for good.
+
+    Keeping the object meant the next arm found `_permuto_runner is not
+    None`, skipped building a fresh one, and start()ed the halted client --
+    so every batch_upsert came back "placements halted for shutdown".
+    """
+    from PySide6.QtWidgets import QMessageBox
+
+    window, _reads = _window(monkeypatch, enabled=True)
+
+    class _Runner:
+        @staticmethod
+        def is_running():
+            return True
+
+        def stop(self):
+            pass
+
+        def join(self, timeout_ms=30_000):
+            return True
+
+        @staticmethod
+        def book_is_empty():
+            return True
+
+    window._permuto_runner = _Runner()
+    monkeypatch.setattr(QMessageBox, "question",
+                        staticmethod(lambda *a, **k:
+                                     QMessageBox.StandardButton.Yes))
+    try:
+        window._on_permuto_enabled_changed(False)
+        assert window._permuto_runner is None, (
+            "the halted session was kept and would be re-armed")
+    finally:
+        window._permuto_runner = None
+        window.close()
+        window.deleteLater()
+        app.processEvents()
+
+
+def test_a_close_in_flight_refuses_the_disable(app, monkeypatch):
+    """[review] A close worker owns the session and cannot be joined away.
+
+    stop_background_work gives it CLOSE_JOIN_MS and then deliberately
+    abandons the thread rather than terminate it mid order. Hiding the page
+    over that takes away the operator's close control while their close is
+    still on the wire.
+    """
+    from gui.widgets import main_window as mw
+
+    window, _reads = _window(monkeypatch, enabled=True)
+    page = window._unwrap(window._permuto_widget)
+    refusals, reverted = [], []
+    window._on_switch_refused = refusals.append
+    window._revert_permuto_enabled = reverted.append
+    page.close_in_flight = lambda: True
+    try:
+        window._on_permuto_enabled_changed(False)
+
+        assert window._permuto_enabled is True, "hidden over a live close"
+        assert reverted == [True]
+        assert refusals and "close is in flight" in refusals[0]
+        assert window._sidebar.is_page_visible(mw._PAGE_PERMUTO)
+    finally:
         window.close()
         window.deleteLater()
         app.processEvents()
