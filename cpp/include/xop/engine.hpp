@@ -650,7 +650,20 @@ private:
     void watchdog_loop();
     /// Cancel every resting offer through a private wallet RPC.
     /// `why` is the operator-facing reason, already formatted.
-    void watchdog_cancel_book(const std::string& why);
+    /// [S46 2026-09-02] `live_ids` are the offers we still believe are
+    /// RESTING, and they are not optional decoration.
+    ///
+    /// The 2026-09-02 alert said "Offers are still live and unmanaged" and
+    /// "cancel them by hand NOW" without naming a single one. The seven ids
+    /// were recoverable only by querying offer_log afterwards, which is not
+    /// something an operator can do at 13:10 with a live book. They are in
+    /// scope at every call site (state_->get_all_offers(), or the failed
+    /// list from the cancel), so passing them costs nothing.
+    ///
+    /// Named IN FULL, never truncated: a 12-character prefix is not something
+    /// an operator can paste into a cancel command.
+    void watchdog_cancel_book(const std::string&              why,
+                              const std::vector<std::string>& live_ids = {});
     /// [S28] Which RPC answers "what block is it?", re-decided every poll.
     ///
     /// This is the TRANSITION STATE: the streak counters and the hysteresis

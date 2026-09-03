@@ -29,6 +29,7 @@
 #include "xop/execution/crossed_book.hpp"
 #include "xop/execution/take_sizing.hpp"
 #include "xop/execution/take_retry.hpp"
+#include "xop/execution/cancel_retry.hpp"
 #include "xop/execution/coin_pool_verdict.hpp"
 #include "xop/strategy/tier_gain.hpp"
 #include "xop/strategy/competitiveness_gate.hpp"
@@ -779,11 +780,40 @@ void Engine::stop_watchdog()
 // returning without a shutdown request means the engine DIED rather than
 // stopped, and stop_watchdog() is about to remove the only other route to a
 // cancel. `why` is the operator-facing reason, already formatted.
-void Engine::watchdog_cancel_book(const std::string& why)
+void Engine::watchdog_cancel_book(const std::string&              why,
+                                  const std::vector<std::string>& live_ids)
 {
     // One cancel at a time, so one authoritative outcome. See the mutex's
     // declaration for why concurrent entry is worse than a slow one.
     const std::lock_guard<std::mutex> cancel_lock(watchdog_cancel_mtx_);
+
+    // [S46 2026-09-02] NAME THE OFFERS. The alert this function sends is the
+    // last thing anyone reads before an operator has to act, and on
+    // 2026-09-02 it told them to "cancel them by hand NOW" without saying
+    // which -- the seven ids existed only in offer_log, which is not
+    // reachable from a phone at 13:10 with a live book.
+    //
+    // IDs are printed IN FULL. Everywhere else in this file logs
+    // `substr(0, 12)` for readability; here the whole point is that the
+    // string can be pasted into a cancel command, and a prefix cannot.
+    //
+    // An empty list is stated as an absence rather than omitted, so the
+    // operator can tell "no offers were live" from "this build forgot to
+    // pass them".
+    std::string id_clause;
+    if (live_ids.empty()) {
+        id_clause = " NO offer ids were supplied to this alert.";
+    } else {
+        id_clause = " STILL-LIVE OFFER IDS (" +
+                    std::to_string(live_ids.size()) + "): ";
+        bool first = true;
+        for (const auto& oid : live_ids) {
+            if (!first) id_clause += ", ";
+            id_clause += oid;
+            first = false;
+        }
+    }
+
     try {
         asio::io_context wioc;
         rpc::ChiaRPCConfig wal_cfg;
@@ -825,7 +855,7 @@ void Engine::watchdog_cancel_book(const std::string& why)
                           "so the book is not empty until those spends "
                           "CONFIRM -- do not read this as proof the "
                           "offers are gone. The engine is still wedged "
-                          "and needs manual attention.");
+                          "and needs manual attention.{}", id_clause);
             if (alerts_) {
                 alerts_->send_alert(
                     AlertRule::DeadMansSwitch,
@@ -837,18 +867,18 @@ void Engine::watchdog_cancel_book(const std::string& why)
                     "of every resting offer has been SUBMITTED -- the "
                     "spends must still confirm on-chain, so verify the "
                     "book is empty rather than assuming it. The engine "
-                    "is wedged and requires manual intervention.");
+                    "is wedged and requires manual intervention." + id_clause);
             }
         } else {
             watchdog_cancel_failed_.store(true, std::memory_order_release);
             spdlog::critical("[Engine] [S31] cancel FAILED: {}. Offers are "
                              "STILL LIVE on a wedged engine -- cancel them "
-                             "by hand NOW.", failure);
+                             "by hand NOW.{}", failure, id_clause);
             if (alerts_) {
                 alerts_->send_alert(
                     AlertRule::DeadMansSwitch,
                     "DEAD MAN'S SWITCH COULD NOT CANCEL: " + failure +
-                    ". Offers are still live and unmanaged.");
+                    ". Offers are still live and unmanaged." + id_clause);
             }
         }
     } catch (const std::exception& ex) {
@@ -858,14 +888,14 @@ void Engine::watchdog_cancel_book(const std::string& why)
         // made the worst failure the quietest one.
         watchdog_cancel_failed_.store(true, std::memory_order_release);
         spdlog::critical("[Engine] [S31] watchdog cancel path threw: {} "
-                         "-- offers are STILL LIVE on a wedged engine.",
-                         ex.what());
+                         "-- offers are STILL LIVE on a wedged engine.{}",
+                         ex.what(), id_clause);
         if (alerts_) {
             alerts_->send_alert(
                 AlertRule::DeadMansSwitch,
                 std::string("DEAD MAN'S SWITCH FAILED BEFORE IT COULD "
                             "CANCEL: ") + ex.what() +
-                ". Offers are still live and unmanaged.");
+                ". Offers are still live and unmanaged." + id_clause);
         }
     }
 }
@@ -982,7 +1012,15 @@ void Engine::watchdog_loop()
                 ? ("no heartbeat for " + std::to_string(stale_ms / 1000) + "s")
                 : ("no heartbeat EVER, " + std::to_string(stale_ms / 1000) +
                    "s after startup");
-        watchdog_cancel_book(reason);
+        // [S46] The ids are available here too -- State is what the watchdog
+        // is firing over. This runs on the watchdog thread while the engine
+        // is wedged, and get_all_offers() takes only a shared lock, so it
+        // cannot be blocked by the wedge it is reporting.
+        std::vector<std::string> live_ids;
+        for (const auto& po : state_->get_all_offers()) {
+            live_ids.push_back(po.offer_id);
+        }
+        watchdog_cancel_book(reason, live_ids);
     }
 }
 
@@ -1098,8 +1136,13 @@ void Engine::run()
             spdlog::critical("[Engine] [S31] the switch had already fired; "
                              "its cancel stands and no second one is sent");
         } else if (!dry_run_) {
+            std::vector<std::string> live_ids;
+            for (const auto& po : state_->get_all_offers()) {
+                live_ids.push_back(po.offer_id);
+            }
             watchdog_cancel_book("the engine exited without a shutdown "
-                                 "request -- the event loop ran out of work");
+                                 "request -- the event loop ran out of work",
+                                 live_ids);
         } else if (alerts_) {
             // Dry run cancels nothing, so there is no outcome alert to
             // preserve and this is the only chance to say anything.
@@ -1200,33 +1243,216 @@ void Engine::shutdown()
                         std::chrono::milliseconds(250));
                     co_await wait_timer.async_wait(asio::use_awaitable);
                 }
-                const auto pending_before =
-                    state_->get_all_offers().size();
-                auto shutdown_cancelled = co_await offer_mgr_->cancel_all();
-                // [review round 11] VERIFIED, not assumed. cancel_all()
-                // swallows per-offer RPC failures and returns only the ids
-                // it succeeded on -- and this coroutine then stops the
-                // io_context, after which run() joins the watchdog before
-                // its fresh shutdown heartbeat can age out. A partial
-                // cancellation therefore exited the process with live
-                // offers and NO fallback and NO outcome alert: the graceful
-                // path swallowed exactly the failure the switch exists to
-                // announce. When the count comes up short, the independent
-                // zero-fee secure fallback runs from here -- same mutex,
-                // same alert machinery, one authoritative outcome -- while
-                // the claim is still held so the watchdog cannot race it.
-                if (shutdown_cancelled.size() < pending_before) {
+                // ---------------------------------------------------------
+                // [S46 2026-09-02] THE RETRY LEG.
+                //
+                // What shipped before this block was a SINGLE attempt whose
+                // only escalation was a "fallback" that goes through the
+                // same wallet RPC. On 2026-09-02 both failed on "Wallet
+                // needs to be fully synced" inside the same second, and the
+                // process exited cleanly leaving seven offers live. That
+                // condition cleared on its own; the replacement engine was
+                // transacting again minutes later.
+                //
+                // The retry POLICY is a pure function in
+                // execution/cancel_retry.hpp with its own gtest, because
+                // nothing in cpp/tests can construct an Engine (S36) and a
+                // policy verified only by reading this file is not verified.
+                // The loop's STATE is execution::CancelLadder, for the same
+                // reason and a measured one: reinstating the original
+                // fail-open at this call site -- `outstanding = oc.failed`
+                // replaced by `outstanding.clear()` -- left the whole suite
+                // green, because the four lines that decide WHAT IS STILL
+                // LIVE were the untested part and they are the entire bug.
+                //
+                // [UNGUARDED -- HAND-REASONED] What remains below is the
+                // plumbing: the timer, the co_awaits, and the dispatch
+                // between cancel_all and cancel_ids. None of it is reachable
+                // from cpp/tests. A mutation here can only fail to call
+                // record() (which cannot terminate the loop) or skip the
+                // timer (which changes timing, not correctness) -- but that
+                // is an argument, not coverage, and it must not be reported
+                // as coverage.
+                // ---------------------------------------------------------
+                std::vector<std::string> outstanding;
+                for (const auto& po : state_->get_all_offers()) {
+                    outstanding.push_back(po.offer_id);
+                }
+                const std::size_t pending_before = outstanding.size();
+
+                // The clock starts HERE, above the sync probe, not below it.
+                // The probe is a wallet RPC like any other and can burn its
+                // full retry ladder against a wallet that hangs rather than
+                // refuses -- so the old placement could consume the whole
+                // exit window and be killed with ZERO cancel RPCs ever
+                // issued, strictly worse than the pre-S46 code that at least
+                // got one attempt away. Charging it against the budget means
+                // a slow probe costs RETRIES, never the first attempt: the
+                // ladder is only consulted after attempt 1 has gone out.
+                const auto cancel_t0 = std::chrono::steady_clock::now();
+                const auto elapsed_ms = [cancel_t0]() -> std::uint32_t {
+                    const auto d = std::chrono::duration_cast<
+                        std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - cancel_t0)
+                                .count();
+                    if (d <= 0) return 0;
+                    return static_cast<std::uint32_t>(
+                        std::min<std::int64_t>(d, 0xFFFF'FFFF));
+                };
+
+                const execution::CancelRetryConfig retry_cfg{};
+                // The wall-clock stop, handed INTO cancel_ids so the budget
+                // bounds when RPCs may START and not merely the sleeps
+                // between attempts. It is an ADMISSION gate: it cannot
+                // interrupt an RPC already in flight, so it does not bound
+                // this function's duration and no such bound is claimed. How
+                // long shutdown can take is NOT ESTABLISHED -- see TODO.md
+                // S46, and note that close_connections() below joins the
+                // curl thread pools with no accounting at all.
+                const auto cancel_deadline =
+                    cancel_t0 + std::chrono::milliseconds(retry_cfg.budget_ms);
+
+                // Look at sync BEFORE cancelling and say so, but NEVER refuse
+                // the stop. check_shutdown_flag() deletes the flag before
+                // calling shutdown(), so a refusal would strand the
+                // operator's request with nothing to retry from, and an
+                // operator who wants out must get out.
+                if (!outstanding.empty()) {
+                    try {
+                        auto sync = co_await wallet_->get_sync_status();
+                        const bool synced =
+                            sync.contains("synced")
+                            && sync["synced"].get<bool>();
+                        const bool syncing =
+                            sync.contains("syncing")
+                            && sync["syncing"].get<bool>();
+                        if (!synced || syncing) {
+                            spdlog::critical(
+                                "[Engine] [S46] the wallet is NOT ready "
+                                "(synced={}, syncing={}) and we are about to "
+                                "cancel {} offer(s). Proceeding anyway -- the "
+                                "shutdown request is already consumed -- but "
+                                "expect refusals and a retry ladder.",
+                                synced, syncing, outstanding.size());
+                        }
+                    } catch (const std::exception& e) {
+                        spdlog::warn("[Engine] [S46] pre-cancel sync check "
+                                     "failed: {} -- proceeding", e.what());
+                    }
+                }
+
+                execution::CancelLadder ladder(outstanding, retry_cfg);
+
+                for (;;) {
+                    const auto act = ladder.next(elapsed_ms());
+                    if (act.step == execution::CancelLadderStep::Finish) break;
+
+                    if (act.step == execution::CancelLadderStep::Sleep) {
+                        spdlog::warn(
+                            "[Engine] [S46] {} offer(s) still live after "
+                            "attempt {} ({}: {}) -- retrying in {} ms "
+                            "(attempt {}/{}, {} ms of budget left after the "
+                            "wait)",
+                            ladder.outstanding().size(), ladder.attempts(),
+                            execution::to_string(ladder.worst_class()),
+                            ladder.last_error(), act.delay_ms,
+                            act.attempt_index, retry_cfg.max_attempts,
+                            act.budget_left_ms);
+
+                        asio::steady_timer retry_timer(ioc_);
+                        retry_timer.expires_after(
+                            std::chrono::milliseconds(act.delay_ms));
+                        co_await retry_timer.async_wait(asio::use_awaitable);
+                        continue;
+                    }
+
+                    // The first attempt keeps the bulk endpoint (one RPC for
+                    // the whole book, the cheap path). Every retry goes
+                    // per-id, because the bulk endpoint takes no offer id at
+                    // all and re-running it would re-charge a fee against
+                    // the offers that already went through.
+                    execution::OfferManager::CancelOutcome oc =
+                        (act.attempt_index == 1)
+                            ? co_await offer_mgr_->cancel_all(cancel_deadline)
+                            : co_await offer_mgr_->cancel_ids(
+                                  ladder.outstanding(), cancel_deadline);
+
+                    execution::CancelAttemptOutcome res;
+                    res.cancelled       = std::move(oc.cancelled);
+                    res.failed          = std::move(oc.failed);
+                    res.already_pending = std::move(oc.already_pending);
+                    res.last_error      = std::move(oc.last_error);
+                    // ONE classifier, folded across the WHOLE batch by
+                    // cancel_ids. Classifying only the last failure string
+                    // let a single trailing funding refusal strip the retry
+                    // ladder from every offer that merely hit the sync flap.
+                    res.worst_class     = oc.worst_class;
+                    res.bulk_submitted  = oc.bulk_submitted;
+                    // The gate's own report that it ran out of time. Without
+                    // it the ladder infers a stop reason from a failure class
+                    // that a zero-RPC attempt never set, and tells the
+                    // operator "attempts-exhausted" for a budget expiry.
+                    res.deadline_hit    = oc.deadline_hit;
+                    ladder.record(std::move(res));
+                }
+
+                outstanding = ladder.outstanding();
+                const auto& shutdown_cancelled = ladder.submitted();
+                const std::uint32_t attempts    = ladder.attempts();
+                const bool bulk_submitted       = ladder.bulk_submitted();
+                const auto stop_reason          = ladder.stop_reason();
+                const std::string& last_error   = ladder.last_error();
+
+                if (!ladder.already_pending().empty()) {
+                    spdlog::warn(
+                        "[Engine] [S46] {} offer(s) already had a cancel "
+                        "spend in flight and were not re-charged; their "
+                        "spends must still confirm",
+                        ladder.already_pending().size());
+                }
+
+                // [review round 11] VERIFIED, not assumed. The cancel path
+                // reports per-offer RPC failures rather than swallowing them
+                // -- and this coroutine then stops the io_context, after
+                // which run() joins the watchdog before its fresh shutdown
+                // heartbeat can age out. A partial cancellation therefore
+                // exited the process with live offers and NO fallback and NO
+                // outcome alert: the graceful path swallowed exactly the
+                // failure the switch exists to announce. When offers remain,
+                // the independent zero-fee secure fallback runs from here --
+                // same mutex, same alert machinery, one authoritative
+                // outcome -- while the claim is still held so the watchdog
+                // cannot race it.
+                //
+                // [S46] The shortfall test is now on the OUTSTANDING set, not
+                // on a count comparison. `cancelled.size() < pending_before`
+                // was never the question; "is anything still resting" is.
+                if (!outstanding.empty()) {
                     spdlog::critical(
-                        "[Engine] [S31] graceful cancellation got {}/{} -- "
-                        "invoking the independent fallback for the rest",
-                        shutdown_cancelled.size(), pending_before);
+                        "[Engine] [S31] graceful cancellation got {}/{} after "
+                        "{} attempt(s) in {} ms, stopped because {} (last "
+                        "error: {}) -- invoking the independent fallback for "
+                        "the rest",
+                        shutdown_cancelled.size(), pending_before, attempts,
+                        elapsed_ms(), execution::to_string(stop_reason),
+                        last_error.empty() ? "none" : last_error);
                     watchdog_cancel_book(
                         "graceful shutdown cancelled "
                         + std::to_string(shutdown_cancelled.size()) + "/"
                         + std::to_string(pending_before)
-                        + " offers; the fallback covers the remainder");
+                        + " offers after " + std::to_string(attempts)
+                        + " attempt(s), stopped because "
+                        + execution::to_string(stop_reason)
+                        + "; the fallback covers the remainder",
+                        outstanding);
+                } else if (bulk_submitted) {
+                    spdlog::info("[Engine] All outstanding offers SUBMITTED "
+                                 "for cancel via the bulk endpoint -- the "
+                                 "spends must still confirm on-chain");
                 } else {
-                    spdlog::info("[Engine] All outstanding offers cancelled");
+                    spdlog::info("[Engine] All outstanding offers cancelled "
+                                 "({} attempt(s), {} ms)",
+                                 attempts, elapsed_ms());
                 }
                 // [T5-02] Persist cancellation status to database with retry.
                 // Shutdown is our last chance to update the audit trail; stale
@@ -1394,6 +1620,114 @@ asio::awaitable<void> Engine::poll_loop_coro()
             } else {
                 orphans = co_await offer_mgr_->startup_reconcile(
                     known_ids, startup_block);
+
+                // ---------------------------------------------------------
+                // [S46 2026-09-02] Act on the DB -> wallet leg.
+                //
+                // startup_reconcile used to look only for wallet records we
+                // did not know about (orphans). A DB row the WALLET no longer
+                // mentioned was never examined, so on 2026-09-02 seven rows
+                // that a failed shutdown had left pending were restored into
+                // State below and quoted on as if healthy, while the routine
+                // logged "0 wallet offers scanned, 0 known/restored, 0
+                // orphans" and looked like a success.
+                //
+                // [UNGUARDED -- HAND-REASONED] The bucketing that produces
+                // `leg` is pinned by test_startup_probe.cpp. What this block
+                // DOES with each bucket is not: nothing in cpp/tests
+                // constructs an Engine (S36), so deleting any arm below
+                // leaves the suite green.
+                // ---------------------------------------------------------
+                const auto& leg = offer_mgr_->last_db_leg();
+
+                for (const auto& oid : leg.terminal) {
+                    // The wallet says CANCELLED/FAILED. Stamp the row so it
+                    // stops being restored on every boot. These are the rows
+                    // that accumulated to 48 by 2026-08-24 and to a 17-day-old
+                    // cluster of 40 on 2026-08-25.
+                    known_ids.erase(oid);
+                    try {
+                        db_->update_offer_status(oid, "cancelled", 0,
+                                                 "s46_startup_db_leg");
+                    } catch (const std::exception& e) {
+                        spdlog::warn("[Engine] [S46] could not stamp stale "
+                                     "DB-pending offer {}: {}",
+                                     oid.substr(0, 12), e.what());
+                    }
+                }
+
+                // `confirmed` rows FILLED while we were away. They must NOT be
+                // stamped cancelled -- that is the 2026-07-31 defect that put
+                // six XCH/BYC fills off the books. recheck/detect_fills owns
+                // them; leave the row alone and let them restore into State.
+                if (!leg.confirmed.empty()) {
+                    spdlog::warn("[Engine] [S46] {} DB-pending offer(s) the "
+                                 "wallet reports CONFIRMED -- left for the "
+                                 "fill path, NOT stamped cancelled",
+                                 leg.confirmed.size());
+                }
+
+                // A cancel spend is ALREADY IN FLIGHT for these. Nothing is
+                // stamped -- the spend has not landed and "submitted" is not
+                // "confirmed" -- so they restore into State below exactly
+                // like any other pending row, and the operator is told which
+                // they are.
+                //
+                // WHAT THIS DELIBERATELY DOES NOT DO: it does not latch
+                // State::cancel_pending on them. That was tried and
+                // withdrawn. cancel_pending is one-way -- state.cpp is its
+                // only mutator, and a repo-wide grep finds no clearer and no
+                // timeout -- and every per-offer drain path skips a
+                // cancel_pending offer. Latching it here bought one saved
+                // duplicate cancel fee and cost an offer that no sweep would
+                // touch again for the process lifetime, while removing the
+                // one thing that ever unstuck a submitted-but-unlanded
+                // cancel: a restart.
+                //
+                // So the duplicate-fee exposure is ACCEPTED AND NAMED: if one
+                // of these is still resting past offer_ttl_blocks, the TTL
+                // sweep may charge a second secure cancel for a spend already
+                // in flight. That is bounded and cents-scale. See TODO.md
+                // S47 -- cancel_pending needs a clearer and a timeout before
+                // anything may latch it from a probe.
+                if (!leg.pending_cancel.empty()) {
+                    std::string ids;
+                    for (const auto& oid : leg.pending_cancel) {
+                        if (!ids.empty()) ids += ", ";
+                        ids += oid;
+                    }
+                    spdlog::warn(
+                        "[Engine] [S46] {} DB-pending offer(s) already have a "
+                        "cancel spend IN FLIGHT (wallet says PENDING_CANCEL). "
+                        "They are NOT resolved until that spend confirms, and "
+                        "this engine does not latch them skip-forever. If one "
+                        "is still resting after its TTL the sweep may pay a "
+                        "second cancel fee for the same spend. IDS: {}",
+                        leg.pending_cancel.size(), ids);
+                }
+
+                if (!leg.unverifiable.empty()) {
+                    // The wallet could not tell us. This is the case the
+                    // incident note warned about: a one-shot recovery at boot
+                    // just moves the shutdown's single failed attempt to a
+                    // different single failed attempt against the same
+                    // unsynced wallet. So NOTHING is concluded here. The rows
+                    // keep status="pending", they restore into State below,
+                    // and the ordinary machinery -- periodic reconcile, the
+                    // TTL sweep -- manages them exactly as it manages any
+                    // resting offer.
+                    std::string ids;
+                    for (const auto& oid : leg.unverifiable) {
+                        if (!ids.empty()) ids += ", ";
+                        ids += oid;
+                    }
+                    spdlog::error(
+                        "[Engine] [S46] {} DB-pending offer(s) could NOT be "
+                        "verified against the wallet at boot -- nothing is "
+                        "assumed about them; they stay pending and are "
+                        "managed as ordinary resting offers. IDS: {}",
+                        leg.unverifiable.size(), ids);
+                }
             }
 
             // Mark cancelled orphans in the DB.  Adopted orphans were
@@ -17749,9 +18083,29 @@ void Engine::check_cancel_all_flag()
         ioc_,
         [this]() -> asio::awaitable<void> {
             try {
+                // [S46] cancel_all now REPORTS failures instead of returning
+                // only its successes. The operator path deliberately keeps
+                // its default (unbounded) deadline -- it is not racing a
+                // shutdown -- but it must no longer report submissions
+                // without also reporting what did not go.
                 auto done = co_await offer_mgr_->cancel_all();
-                spdlog::warn("[Engine] [CANCELALL] {} offer(s) submitted "
-                             "for cancel", done.size());
+                if (done.failed.empty()) {
+                    spdlog::warn("[Engine] [CANCELALL] {} offer(s) submitted "
+                                 "for cancel", done.cancelled.size());
+                } else {
+                    std::string ids;
+                    for (const auto& oid : done.failed) {
+                        if (!ids.empty()) ids += ", ";
+                        ids += oid;
+                    }
+                    spdlog::critical(
+                        "[Engine] [CANCELALL] {} offer(s) submitted for "
+                        "cancel but {} STILL LIVE (last error: {}). The TTL "
+                        "sweep keeps draining them. STILL-LIVE IDS: {}",
+                        done.cancelled.size(), done.failed.size(),
+                        done.last_error.empty() ? "none" : done.last_error,
+                        ids);
+                }
             } catch (const std::exception& e) {
                 spdlog::critical("[Engine] [CANCELALL] FAILED: {} -- offers "
                                  "may still be resting; the TTL sweep keeps "

@@ -5,6 +5,40 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — the shutdown cancel gets a second chance, and the alert says which offers
+
+A planned graceful stop on 2026-09-02 hit a transient "Wallet needs to be fully
+synced", gave up after one attempt, and exited cleanly leaving seven offers live
+and unmanaged. The independent fallback went through the same wallet RPC and
+failed in the same millisecond. The condition cleared on its own minutes later.
+
+- Retry the shutdown cancel against the **failed subset**, on a bounded
+  wall-clock ladder. The policy is a pure function
+  (`cpp/include/xop/execution/cancel_retry.hpp`) with its own tests; the wallet
+  failure classifier is reused from the take path rather than written twice, and
+  is folded across the whole batch so one funding refusal cannot strip the retry
+  ladder from offers that only hit the sync flap.
+- Name the still-live offer ids, in full, in every dead-man's-switch log line
+  and alert. The previous wording said "cancel them by hand NOW" without saying
+  which, and the ids were recoverable only by querying the database afterwards.
+- Walk the **DB → wallet** direction at startup. Reconciliation was
+  wallet → DB only, so a database row the wallet never mentioned was invisible,
+  and a failed wallet read returned early reporting "0 orphans" — which is what
+  ran during the incident, and it read as success. A failed or empty read now
+  marks every pending row *unverifiable* instead of resolved.
+
+**Shutdown duration is not established.** Three figures were published during
+this change's review and all three were wrong; `close_connections()` joins the
+curl thread pools and was never accounted for. The retry states its own budget
+and nothing else. See `TODO.md` S46.
+
+**Deferred, not fixed (`TODO.md` S47):** routes that terminate the process
+without running shutdown still leave a live book with no record of the intent to
+cancel it, and `cancel_pending` still has no clearer and no timeout. A durable
+intent file and a startup `cancel_pending` latch were both attempted and
+**withdrawn** — the latch traded a cents-scale duplicate fee for unbounded live
+exposure. That work is preserved on branch `wip/s46-full-scope`.
+
 ## [0.10.14] — 2026-09-02 — place against the book that is actually there
 
 The Permuto runner banked zero depth through a full session while three legs
