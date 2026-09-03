@@ -25,9 +25,11 @@ running subsystem with nothing to do.
 - **A master switch**, in Settings → Advanced → Subsystems, persisted to
   `QSettings` under `permuto/enabled` beside the existing `permuto/curfew_enabled`.
   Off removes the toolbar switch, the sidebar entry and the page, refuses the
-  startup arm, and stops both identity reads. It **defaults to on**: the
-  default has to be the software the operator had yesterday, and a silent
-  default of off would make an upgrade look like a venue that vanished.
+  startup arm, and stops both identity reads. It **defaults to off** — opt
+  in, matching `load_startup_states`, which has always defaulted Permuto to
+  `"off"` for the same reason. Nothing is lost by it: the Startup tab's
+  "Permuto at startup" and curfew preferences are kept untouched and apply
+  again from the first launch after the switch goes on.
 - **Hidden, never renumbered.** `_NAV_ITEMS` keeps all eleven entries and
   index 9 keeps a page — a placeholder rather than a `PermutoWidget`. The
   page indices are positional, and the last time that slipped, `_PAGE_SETTINGS`
@@ -44,7 +46,12 @@ running subsystem with nothing to do.
 - **Off applies immediately; on waits for a restart.** The toolbar switch
   and the page are built during window construction and the indices are
   positional, so a session that started without them has nowhere to put
-  them. The control says so rather than pretending.
+  them. Since the default is off, turning it ON is the ordinary path rather
+  than the rare one, so the restart is stated three times — in the checkbox
+  label, in the note beneath it, and in a dialog raised when it is actually
+  clicked. A tick box that appears to do nothing is the failure mode that
+  guards against. (Off→on *within* one session restores live; the surfaces
+  were only hidden.)
 - `disabled` is a first-class gate in `venue_control`, ordered **above**
   `watchdog` and `breaker`. Those say why a venue will not trade; this says
   why the venue is not here, and an operator who switched Permuto off must

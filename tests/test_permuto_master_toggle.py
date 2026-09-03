@@ -85,12 +85,14 @@ def _window(monkeypatch, *, enabled: bool):
 # The loader
 # --------------------------------------------------------------------------- #
 
-def test_the_loader_defaults_to_enabled(monkeypatch):
-    """The default has to be the software the operator had yesterday.
+def test_the_loader_defaults_to_disabled(monkeypatch):
+    """Opt in, matching load_startup_states' own "off" for Permuto.
 
-    A default of False would make an upgrade look like a venue that vanished
-    -- and would do it to the one venue whose orders rest at a remote machine
-    and outlive the GUI.
+    The venue is dormant -- the account was liquidated on 2026-09-01 -- so a
+    machine that has never been told otherwise must not read a BLS key off
+    disk on a tick for it. Nothing is lost by the default: the operator's
+    startup and curfew preferences are kept and apply again the moment they
+    switch it on.
     """
     from PySide6.QtCore import QSettings
 
@@ -102,7 +104,7 @@ def test_the_loader_defaults_to_enabled(monkeypatch):
     settings.remove("enabled")
     settings.endGroup()
     try:
-        assert load_permuto_enabled() is True
+        assert load_permuto_enabled() is False
     finally:
         settings.beginGroup("permuto")
         if previous is None:
@@ -117,9 +119,11 @@ def test_the_loader_defaults_to_enabled(monkeypatch):
     [
         (False, False), ("false", False), ("0", False), ("off", False),
         ("no", False), (True, True), ("true", True), ("1", True),
-        # Garbage reads as ON, matching the default: an unreadable
-        # preference must not silently remove a venue.
-        ("sideways", True),
+        ("on", True), ("yes", True),
+        # Garbage reads as OFF, matching the default. Unparseable must fall
+        # to the same side as unset, or the fail-safe direction depends on
+        # which kind of corruption happened.
+        ("sideways", False), ("", False),
     ],
 )
 def test_the_loader_reads_every_shape_qsettings_stores(stored, expected):
@@ -585,19 +589,30 @@ def test_re_enabling_a_session_that_never_built_it_asks_for_a_restart(
     nowhere to insert them. Saying "restart" is the honest answer; silently
     doing nothing is not.
     """
+    from PySide6.QtWidgets import QMessageBox
+
     from gui.widgets import main_window as mw
 
     window, _reads = _window(monkeypatch, enabled=False)
     messages: list[str] = []
     window.statusBar().showMessage = lambda text, _t=0: messages.append(text)
+    # A real modal blocks the offscreen run forever. Capturing it is also
+    # the assertion: this is the ordinary path now that the subsystem is
+    # off by default, so the dialog has to actually be raised.
+    shown: list[tuple] = []
+    monkeypatch.setattr(
+        QMessageBox, "information",
+        staticmethod(lambda *a, **k: shown.append(a)))
     try:
         assert window._permuto_built is False
         window._on_permuto_enabled_changed(True)
 
-        # Still absent -- and the operator was told why.
+        # Still absent -- and the operator was told why, twice.
         assert window._permuto_switch is None
         assert not window._sidebar.is_page_visible(mw._PAGE_PERMUTO)
         assert messages and "next time" in messages[-1]
+        assert shown, "the restart requirement was never shown"
+        assert "next time you launch" in shown[0][2]
     finally:
         window.close()
         window.deleteLater()

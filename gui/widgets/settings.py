@@ -118,9 +118,19 @@ def load_permuto_enabled() -> bool:
     part that matters -- no identity read and no venue traffic. Every one of
     those runs today whether or not the operator ever arms Permuto.
 
-    Defaults to TRUE, because the default has to be "the software you had
-    yesterday". A silent default of False would make an upgrade look like a
-    venue that vanished.
+    Defaults to FALSE -- opt in, like ``load_startup_states`` defaults
+    Permuto to "off". The venue is dormant: the account was liquidated on
+    2026-09-01 and the contest is over, so the machine that has never been
+    told otherwise should not be reading a BLS key off disk on a timer for
+    it. An operator who wants Permuto ticks one box and restarts, and the
+    Startup tab's own "Permuto at startup" preference is waiting for them
+    exactly as they left it.
+
+    This is the one default in the file that is deliberately NOT "the
+    software you had yesterday". Everything it turns off is either inert
+    (a page nobody opens) or invisible (a secrets read on a tick), and the
+    one thing that is neither -- a live quoting session -- cannot exist at
+    the moment this is read, because it is read before anything is built.
 
     Read from the store rather than a cached value, for the same reason
     ``load_curfew_enabled`` does: the GUI is armed long after the settings
@@ -129,11 +139,11 @@ def load_permuto_enabled() -> bool:
     settings = QSettings("XOP", "XOPTrader")
     settings.sync()
     settings.beginGroup("permuto")
-    raw = settings.value("enabled", True)
+    raw = settings.value("enabled", False)
     settings.endGroup()
     if isinstance(raw, bool):
         return raw
-    return str(raw).strip().lower() not in ("false", "0", "off", "no")
+    return str(raw).strip().lower() in ("true", "1", "on", "yes")
 
 
 def load_curfew_enabled() -> bool:
@@ -1457,35 +1467,46 @@ class SettingsWidget(QWidget):
         and -- the reason it exists -- stops the identity read and the venue
         traffic that run today regardless of whether anyone ever arms it.
 
+        OFF BY DEFAULT. The venue is dormant and everything it does when
+        idle is either invisible or useless, so a machine that has never
+        been told otherwise does not run it.
+
         ASYMMETRIC ON PURPOSE. Off applies immediately, because a control
         that promises a subsystem is gone has to be honest the moment it is
         clicked, and because it may have to stop a live session first. On
         cannot: the toolbar switch and the page are built during window
         construction and the sidebar/page indices are positional, so there is
-        nowhere to insert them afterwards. The label says so rather than
-        pretending otherwise.
+        nowhere to insert them afterwards. Since the default is off, turning
+        it ON is now the ordinary path rather than the rare one, so the
+        restart is said three times -- in the label, in the note, and in a
+        dialog when it is actually clicked. A tick box that silently appears
+        to do nothing is the failure mode this is guarding against.
         """
         group = QGroupBox("Subsystems")
         box = QVBoxLayout(group)
         box.setSpacing(6)
 
         self._permuto_enabled_box = QCheckBox(
-            "Enable the Permuto market maker")
+            "Enable the Permuto market maker (restart required)")
         self._permuto_enabled_box.setChecked(load_permuto_enabled())
         self._permuto_enabled_box.setToolTip(
-            "Off hides the Permuto toolbar switch, its sidebar entry and its "
-            "page, and stops every background read and venue request the "
-            "subsystem makes. Turning it back on takes effect the next time "
-            "XOPTrader starts."
+            "Off by default. Off hides the Permuto toolbar switch, its "
+            "sidebar entry and its page, and stops every background read and "
+            "venue request the subsystem makes. Turning it on takes effect "
+            "the next time XOPTrader starts."
         )
         box.addWidget(self._permuto_enabled_box)
 
         note = QLabel(
-            "Off takes effect immediately -- if a Permuto session is quoting "
-            "it is stopped and its book cancelled first, and the switch will "
-            "refuse to hide anything until that cancel is confirmed. Turning "
-            "it back ON takes effect the next time XOPTrader starts, because "
-            "the toolbar switch and the page are built at startup."
+            "Off by default -- the Permuto venue is dormant, and leaving it "
+            "on costs a read of the trading identity on every tick. Turning "
+            "it ON takes effect the next time XOPTrader starts, because the "
+            "toolbar switch and the page are built at startup; your "
+            "'Permuto at startup' and curfew preferences are kept and apply "
+            "again from that launch. Turning it OFF takes effect "
+            "immediately -- if a session is quoting it is stopped and its "
+            "book cancelled first, and the switch refuses to hide anything "
+            "until that cancel is confirmed."
         )
         note.setWordWrap(True)
         note.setStyleSheet(f"color: {_C.TEXT_SECONDARY}; font-size: 9pt;")

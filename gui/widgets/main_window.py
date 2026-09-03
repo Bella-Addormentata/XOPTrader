@@ -2886,10 +2886,21 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage(
                     "Permuto market maker enabled.", 6000)
             else:
+                # The ORDINARY path now that the subsystem is off by
+                # default, so a transient status-bar line is not enough:
+                # the operator ticks a box, nothing appears, and the
+                # reasonable conclusion is that the setting is broken.
                 _log.info("[Permuto] enable stored; applies at next start")
                 self.statusBar().showMessage(
                     "Permuto will be enabled the next time XOPTrader "
                     "starts.", 10000)
+                QMessageBox.information(
+                    self,
+                    "Restart to enable Permuto",
+                    "Permuto is enabled and the setting is saved, but its "
+                    "toolbar switch and page are built when XOPTrader "
+                    "starts -- so they appear the next time you launch it.",
+                )
             return
 
         # -- OFF -----------------------------------------------------------
