@@ -1506,9 +1506,11 @@ class SettingsWidget(QWidget):
             "Off by default -- leaving it on costs a read of the trading "
             "identity on every tick whether or not you ever quote. Turning "
             "it ON takes effect the next time XOPTrader starts, because the "
-            "toolbar switch and the page are built at startup; your "
-            "'Permuto at startup' and curfew preferences are kept and apply "
-            "again from that launch. Turning it OFF takes effect "
+            "toolbar switch and the page are built at startup. Switching it "
+            "off also sets 'Permuto at startup' to Off; the overnight "
+            "curfew stays armed, because its off position disarms a "
+            "protection rather than stopping activity. Turning it OFF "
+            "takes effect "
             "immediately -- if a session is quoting it is stopped and its "
             "book cancelled first, and the switch refuses to hide anything "
             "until that cancel is confirmed."
@@ -1560,18 +1562,43 @@ class SettingsWidget(QWidget):
         self._sync_permuto_dependent_rows(enabled)
 
     def _sync_permuto_dependent_rows(self, enabled: bool) -> None:
-        """Grey out the Startup tab's Permuto rows when the venue is off.
+        """Master switch off means every Permuto switch reads off.
 
-        Disabled, never reset. Both combos auto-save on currentIndexChanged,
-        so "tidying" them to a default would silently overwrite a preference
-        the operator set for when they switch Permuto back on.
+        An INVARIANT, not a transition effect -- it is applied on every
+        build as well as on every click, so a store carrying an older
+        "Permuto: On at startup" is corrected the first time Settings opens
+        rather than lying in wait until the subsystem is switched back on.
+
+        "Permuto at startup" follows to Off. That is the whole point: with
+        the subsystem off it could not arm anyway, and a switch that still
+        reads On is describing something that cannot happen.
+
+        THE CURFEW IS DELIBERATELY NOT FOLLOWED, and it is the one control
+        here whose "off position" means LESS safety rather than less
+        activity. It is not an enabler -- it caps how much inventory
+        Permuto may carry once the underlying market shuts, and the venue
+        keeps matching against a frozen oracle through that close. Forcing
+        it Off would disarm a liquidation protection that has no effect
+        whatsoever while the subsystem is disabled, and would then persist
+        silently into the next session that DOES quote. So it greys out
+        armed. See _build_startup_tab's explainer for why it exists.
         """
+        enabled = bool(enabled)
+        if not enabled:
+            combo = getattr(self, "_startup_permuto", None)
+            # Index 0 is "Off (default)". Setting it fires
+            # currentIndexChanged -> _save_startup_settings, which is how
+            # the corrected value reaches QSettings; already-off is a no-op
+            # because Qt does not emit for an unchanged index.
+            if combo is not None and combo.currentIndex() != 0:
+                combo.setCurrentIndex(0)
+
         for name in ("_startup_permuto", "_permuto_curfew",
                      "_startup_permuto_label", "_permuto_curfew_label",
                      "_permuto_curfew_note"):
             row = getattr(self, name, None)
             if row is not None:
-                row.setEnabled(bool(enabled))
+                row.setEnabled(enabled)
 
     def _build_advanced_tab(self) -> QWidget:
         """Build the Advanced tab: subsystems, volatility, DB path, YAML."""

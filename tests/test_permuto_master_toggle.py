@@ -32,6 +32,51 @@ import pytest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QWidget  # noqa: E402
 
 
+#: The QSettings keys this module writes. Snapshotted and restored around
+#: every test by the autouse fixture below.
+_TOUCHED_KEYS = (
+    ("permuto", "enabled"),
+    ("permuto", "curfew_enabled"),
+    ("startup", "permuto"),
+    ("startup", "dexie"),
+)
+
+
+@pytest.fixture(autouse=True)
+def preserve_operator_settings():
+    """Put the operator's store back, whatever the test did to it.
+
+    This module's whole subject is code that WRITES startup preferences, and
+    it runs against the real store because that is what the loaders read.
+    QSettings.setPath would be tidier isolation but it is process-global:
+    one call silently redirects every later test module in the same pytest
+    process, including the ones asserting on real appearance and startup
+    values. So snapshot, run, restore -- the same shape as
+    test_startup_states_loader_defaults_are_safe.
+    """
+    from PySide6.QtCore import QSettings
+
+    settings = QSettings("XOP", "XOPTrader")
+    settings.sync()
+    saved = {}
+    for group, key in _TOUCHED_KEYS:
+        settings.beginGroup(group)
+        saved[(group, key)] = settings.value(key)
+        settings.endGroup()
+    try:
+        yield
+    finally:
+        restore = QSettings("XOP", "XOPTrader")
+        for (group, key), value in saved.items():
+            restore.beginGroup(group)
+            if value is None:
+                restore.remove(key)
+            else:
+                restore.setValue(key, value)
+            restore.endGroup()
+        restore.sync()
+
+
 @pytest.fixture(scope="module")
 def app():
     instance = QApplication.instance() or QApplication(sys.argv)
@@ -427,6 +472,147 @@ def test_enabled_still_builds_the_whole_subsystem(app, monkeypatch):
 
         inputs = window._gather_permuto()
         assert "disabled" not in inputs.gates
+    finally:
+        window.close()
+        window.deleteLater()
+        app.processEvents()
+
+
+# --------------------------------------------------------------------------- #
+# Master off means every other Permuto switch reads off
+# --------------------------------------------------------------------------- #
+
+def _settings_page(monkeypatch, *, enabled: bool):
+    """A SettingsWidget with the master switch forced."""
+    import gui.widgets.settings as settings_mod
+
+    monkeypatch.setattr(settings_mod, "load_permuto_enabled",
+                        lambda: enabled)
+    return settings_mod.SettingsWidget()
+
+
+def test_master_off_forces_permuto_at_startup_to_off(app, monkeypatch):
+    """The invariant, applied on BUILD and not only on a click.
+
+    A store carrying an older "Permuto: On at startup" -- which is exactly
+    what a machine that ran the contest has -- would otherwise sit there
+    reading On under a subsystem that cannot arm, and spring the moment the
+    subsystem came back.
+    """
+    from PySide6.QtCore import QSettings
+
+    page = _settings_page(monkeypatch, enabled=True)
+    page._startup_permuto.setCurrentIndex(1)          # "On", as stored
+    assert page._startup_permuto.currentIndex() == 1
+
+    # Now the operator switches the whole subsystem off.
+    page._permuto_enabled_box.setChecked(False)
+    app.processEvents()
+
+    assert page._startup_permuto.currentIndex() == 0, (
+        "'Permuto at startup' did not follow the master switch")
+    assert not page._startup_permuto.isEnabled()
+
+    # ...and it reached the store, not just the widget.
+    settings = QSettings("XOP", "XOPTrader")
+    settings.sync()
+    settings.beginGroup("startup")
+    stored = str(settings.value("permuto", "off")).lower()
+    settings.endGroup()
+    assert stored == "off", "the corrected value never reached QSettings"
+
+
+def test_a_store_that_says_on_is_corrected_when_settings_opens(
+        app, monkeypatch):
+    """Built disabled, with "on" already in the store: still corrected."""
+    from PySide6.QtCore import QSettings
+
+    seed = QSettings("XOP", "XOPTrader")
+    seed.beginGroup("startup")
+    seed.setValue("permuto", "on")
+    seed.endGroup()
+    seed.sync()
+
+    page = _settings_page(monkeypatch, enabled=False)
+    assert page._startup_permuto.currentIndex() == 0
+
+    from gui.widgets.settings import load_startup_states
+    assert load_startup_states()[1] == "off"
+
+
+def test_the_curfew_is_greyed_but_stays_armed(app, monkeypatch):
+    """The one control whose "off position" means LESS safety.
+
+    The curfew is not an enabler -- it caps inventory carried through the
+    underlying market's close, which the venue keeps matching against with a
+    frozen oracle. It does nothing at all while the subsystem is off, so
+    forcing it Off would buy nothing now and disarm a liquidation
+    protection in the next session that actually quotes.
+    """
+    page = _settings_page(monkeypatch, enabled=True)
+    assert page._permuto_curfew.currentIndex() == 0, "armed is index 0"
+
+    page._permuto_enabled_box.setChecked(False)
+    app.processEvents()
+
+    assert page._permuto_curfew.currentIndex() == 0, (
+        "the curfew was disarmed by the master switch")
+    assert not page._permuto_curfew.isEnabled(), "it should still grey out"
+
+
+def test_the_dexie_startup_row_is_untouched(app, monkeypatch):
+    """A Permuto switch is not every switch."""
+    page = _settings_page(monkeypatch, enabled=True)
+    page._startup_dexie.setCurrentIndex(1)
+
+    page._permuto_enabled_box.setChecked(False)
+    app.processEvents()
+
+    assert page._startup_dexie.currentIndex() == 1
+    assert page._startup_dexie.isEnabled()
+
+
+def test_disabling_turns_the_pages_polling_switch_off(app, monkeypatch):
+    """stop_background_work stops the TIMER and leaves the button checked.
+
+    A page reading "Stop polling" over a stopped timer is claiming to poll
+    a venue it no longer talks to, and a later re-enable finds a checked
+    button with nothing behind it.
+    """
+    window, _reads = _window(monkeypatch, enabled=True)
+    page = window._unwrap(window._permuto_widget)
+    try:
+        page._markets_btn.setChecked(True)
+        assert page._markets_btn.isChecked()
+
+        window._on_permuto_enabled_changed(False)
+
+        assert not page._markets_btn.isChecked(), (
+            "the markets polling switch did not follow the master switch")
+        assert page._markets_timer is None or not page._markets_timer.isActive()
+    finally:
+        window.close()
+        window.deleteLater()
+        app.processEvents()
+
+
+def test_the_backup_checkbox_is_never_cleared(app, monkeypatch):
+    """It is a record, not a switch.
+
+    It says the operator wrote down their recovery phrase, and it is the
+    only gate between them and an unrecoverable account. "Every Permuto
+    switch follows" must not reach it.
+    """
+    window, _reads = _window(monkeypatch, enabled=True)
+    page = window._unwrap(window._permuto_widget)
+    try:
+        page._backup_box.setEnabled(True)
+        page._backup_box.setChecked(True)
+
+        window._on_permuto_enabled_changed(False)
+
+        assert page._backup_box.isChecked(), (
+            "the backup confirmation was cleared -- that is a safety record")
     finally:
         window.close()
         window.deleteLater()

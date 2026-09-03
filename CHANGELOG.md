@@ -46,6 +46,18 @@ the venue -- including the ones that never will.
   as soon as `cancel_all` reports success, so hiding the page over a book
   that did not actually go away would remove the operator's close control
   and the net underneath it in the same click.
+- **Master off means every Permuto switch reads off.** An invariant, applied
+  on every Settings build and not only on a click, so a store carrying an
+  older `startup/permuto = "on"` — which is exactly what a machine that ran
+  the contest has — is corrected the first time Settings opens rather than
+  lying in wait until the subsystem comes back. "Permuto at startup" follows
+  to Off; the page's Markets polling switch is unchecked through its own
+  handler, so the button stops reading "Stop polling" over a stopped timer.
+  Two controls are deliberately exempt: the **overnight curfew**, whose off
+  position disarms a liquidation protection rather than stopping activity
+  and which does nothing at all while the subsystem is off, and the
+  **backup-confirmation checkbox**, which is a record that the operator
+  wrote down their recovery phrase, not a switch.
 - **Off applies immediately; on waits for a restart.** The toolbar switch
   and the page are built during window construction and the indices are
   positional, so a session that started without them has nowhere to put

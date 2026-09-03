@@ -1564,6 +1564,27 @@ class PermutoWidget(QWidget):
                 "color: %s; font-size: 14px; font-weight: bold;" % colour
             )
 
+    def suspend_for_disabled_subsystem(self) -> None:
+        """Put this page's switches in their off position, then stop work.
+
+        stop_background_work() alone stops the markets TIMER but leaves the
+        button reading "Stop polling", so the page claims to be polling a
+        venue it is no longer talking to -- and a later re-enable would find
+        a checked button with nothing behind it. Unchecking it runs the
+        widget's own toggle handler, which stops the timer, clears the note
+        and records it in the Activity log, so the page tells the same
+        story as the master switch.
+
+        The backup-confirmation checkbox is deliberately untouched: it is a
+        record that the operator wrote down their recovery phrase, not a
+        switch, and clearing it would falsify the one gate standing between
+        them and an unrecoverable account.
+        """
+        markets = getattr(self, "_markets_btn", None)
+        if markets is not None and markets.isChecked():
+            markets.setChecked(False)
+        self.stop_background_work()
+
     def stop_background_work(self) -> None:
         """Join EVERY worker before teardown.
 

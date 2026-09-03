@@ -2950,13 +2950,21 @@ class MainWindow(QMainWindow):
         # down; _apply_permuto_startup_state also checks the flag.
         self._startup_permuto = "off"
         # A hidden page whose 5-second markets timer still runs is still
-        # making requests to the venue.
+        # making requests to the venue -- and its polling button must read
+        # off too, or the page claims to be polling a venue it has stopped
+        # talking to. suspend_for_disabled_subsystem does both; the
+        # fallback covers a placeholder or an older page object.
         page = self._unwrap(self._permuto_widget)
-        if page is not None and hasattr(page, "stop_background_work"):
-            try:
-                page.stop_background_work()
-            except Exception:  # noqa: BLE001
-                _log.exception("[Permuto] page workers did not stop cleanly")
+        for method in ("suspend_for_disabled_subsystem",
+                       "stop_background_work"):
+            fn = getattr(page, method, None)
+            if callable(fn):
+                try:
+                    fn()
+                except Exception:  # noqa: BLE001
+                    _log.exception(
+                        "[Permuto] page workers did not stop cleanly")
+                break
         self._set_permuto_surfaces_visible(False)
         _log.info("[Permuto] subsystem disabled")
         self.statusBar().showMessage(
