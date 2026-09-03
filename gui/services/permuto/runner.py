@@ -1038,13 +1038,20 @@ class QuoteRunner:
             posture_stage = (scheduled
                              if scheduled not in (None, Stage.UNSCHEDULED)
                              else self._curfew.stage)
+        else:
+            scheduled = schedule_curfew.schedule_stage
+            posture_stage = (scheduled
+                             if scheduled not in (None, Stage.UNSCHEDULED)
+                             else schedule_curfew.stage)
         # Stage-level default; market-specific posture can tighten from here.
+        oracle_fresh_agg = not self._freeze.frozen(now_s)
         default_profile = (
             profile_for(
                 posture_stage,
-                oracle_fresh=not self._freeze.frozen(now_s),
+                oracle_fresh=oracle_fresh_agg,
             )
-            if self._curfew_enabled else uncurfewed_profile()
+            if (self._curfew_enabled or not oracle_fresh_agg)
+            else uncurfewed_profile()
         )
         self._eff_half_spread = (self._half_spread_pct
                                  * default_profile.spread_mult)
@@ -1081,10 +1088,13 @@ class QuoteRunner:
                 # treated as stale, or the loop refuses to quote anything
                 # until it has watched a second distinct value arrive.
                 fresh = not self._freeze.market_gone_quiet(market, now_s)
-            market_profile = (
-                profile_for(posture_stage, oracle_fresh=fresh)
-                if self._curfew_enabled else uncurfewed_profile()
-            )
+            if not fresh:
+                market_profile = profile_for(posture_stage, oracle_fresh=False)
+            else:
+                market_profile = (
+                    profile_for(posture_stage, oracle_fresh=True)
+                    if self._curfew_enabled else uncurfewed_profile()
+                )
             profile_by_market[market] = market_profile
             eff_half_spread_by_market[market] = (
                 self._half_spread_pct * market_profile.spread_mult

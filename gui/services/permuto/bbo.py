@@ -172,7 +172,8 @@ def _first_price(levels) -> Optional[float]:
         if math.isfinite(val) and val > 0.0:
             return val
     except (IndexError, KeyError, TypeError, ValueError):
-        pass
+        # Malformed or unparseable price entry; return None so caller treats it as unreadable
+        return None
     return None
 
 
