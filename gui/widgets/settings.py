@@ -118,15 +118,19 @@ def load_permuto_enabled() -> bool:
     part that matters -- no identity read and no venue traffic. Every one of
     those runs today whether or not the operator ever arms Permuto.
 
-    Defaults to FALSE -- opt in, like ``load_startup_states`` defaults
-    Permuto to "off". The venue is dormant: the account was liquidated on
-    2026-09-01 and the contest is over, so the machine that has never been
-    told otherwise should not be reading a BLS key off disk on a timer for
-    it. An operator who wants Permuto ticks one box and restarts, and the
-    Startup tab's own "Permuto at startup" preference is waiting for them
-    exactly as they left it.
+    Defaults to FALSE -- opt in, exactly as ``load_startup_states`` has
+    always defaulted Permuto to "off". An installation that has never been
+    told it wants this venue should not be reading a BLS key off disk on
+    every bridge tick for it: that cost is paid whether or not anybody ever
+    arms the switch, and it is invisible, which is why it went unnoticed.
 
-    This is the one default in the file that is deliberately NOT "the
+    NOTE THIS IS NOT A CLAIM THAT THE VENUE IS FINISHED. Permuto is under
+    active development, and an operator who wants it ticks one box and
+    restarts -- with the Startup tab's own "Permuto at startup" and curfew
+    preferences waiting exactly as they left them. The default governs the
+    machine that has expressed no preference, not the one that has.
+
+    This is the one default in the file deliberately NOT chosen as "the
     software you had yesterday". Everything it turns off is either inert
     (a page nobody opens) or invisible (a secrets read on a tick), and the
     one thing that is neither -- a live quoting session -- cannot exist at
@@ -1467,9 +1471,10 @@ class SettingsWidget(QWidget):
         and -- the reason it exists -- stops the identity read and the venue
         traffic that run today regardless of whether anyone ever arms it.
 
-        OFF BY DEFAULT. The venue is dormant and everything it does when
-        idle is either invisible or useless, so a machine that has never
-        been told otherwise does not run it.
+        OFF BY DEFAULT, because everything the subsystem does while idle is
+        either invisible or useless and is paid for anyway. Not a statement
+        that the venue is finished: it governs the machine that has
+        expressed no preference, not the one that has.
 
         ASYMMETRIC ON PURPOSE. Off applies immediately, because a control
         that promises a subsystem is gone has to be honest the moment it is
@@ -1498,8 +1503,8 @@ class SettingsWidget(QWidget):
         box.addWidget(self._permuto_enabled_box)
 
         note = QLabel(
-            "Off by default -- the Permuto venue is dormant, and leaving it "
-            "on costs a read of the trading identity on every tick. Turning "
+            "Off by default -- leaving it on costs a read of the trading "
+            "identity on every tick whether or not you ever quote. Turning "
             "it ON takes effect the next time XOPTrader starts, because the "
             "toolbar switch and the page are built at startup; your "
             "'Permuto at startup' and curfew preferences are kept and apply "

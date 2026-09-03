@@ -88,11 +88,11 @@ def _window(monkeypatch, *, enabled: bool):
 def test_the_loader_defaults_to_disabled(monkeypatch):
     """Opt in, matching load_startup_states' own "off" for Permuto.
 
-    The venue is dormant -- the account was liquidated on 2026-09-01 -- so a
-    machine that has never been told otherwise must not read a BLS key off
-    disk on a tick for it. Nothing is lost by the default: the operator's
-    startup and curfew preferences are kept and apply again the moment they
-    switch it on.
+    A machine that has expressed no preference must not read a BLS key off
+    disk on every tick for a venue nobody asked for. Not a claim that the
+    venue is finished -- nothing is lost by the default, because the
+    operator's startup and curfew preferences are kept and apply again the
+    moment they switch it on.
     """
     from PySide6.QtCore import QSettings
 

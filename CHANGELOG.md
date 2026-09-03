@@ -19,17 +19,20 @@ nobody has armed is still working:
   again — during window construction, before anything is shown.
 - `set_bridge` schedules the "Permuto: On at startup" arm on a 1.5 s timer.
 
-With the account liquidated on 2026-09-01 and the contest over, that is a
-running subsystem with nothing to do.
+That cost is paid on every installation, whether or not anyone ever arms
+the venue -- including the ones that never will.
 
 - **A master switch**, in Settings → Advanced → Subsystems, persisted to
   `QSettings` under `permuto/enabled` beside the existing `permuto/curfew_enabled`.
   Off removes the toolbar switch, the sidebar entry and the page, refuses the
   startup arm, and stops both identity reads. It **defaults to off** — opt
   in, matching `load_startup_states`, which has always defaulted Permuto to
-  `"off"` for the same reason. Nothing is lost by it: the Startup tab's
-  "Permuto at startup" and curfew preferences are kept untouched and apply
-  again from the first launch after the switch goes on.
+  `"off"` for the same reason. That is not a statement that the venue is
+  finished -- it is under active development -- but an installation that
+  has expressed no preference should not pay for it. Nothing is lost
+  either way: the Startup tab's "Permuto at startup" and curfew
+  preferences are kept untouched and apply again from the first launch
+  after the switch goes on.
 - **Hidden, never renumbered.** `_NAV_ITEMS` keeps all eleven entries and
   index 9 keeps a page — a placeholder rather than a `PermutoWidget`. The
   page indices are positional, and the last time that slipped, `_PAGE_SETTINGS`
