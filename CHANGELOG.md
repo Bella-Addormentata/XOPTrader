@@ -32,11 +32,7 @@ valid QQQ and TSLA earning windows shut.
   monitor now reads and labels the venue-published ring instead of assuming 2%.
 - Set the contest posture to $6,000 target depth per market and a $30,000
   position cap. Two currently placeable markets project 413.6M depth-seconds
-  over the measured remaining stage schedule from a freshly funded account.
-
-The competition account is liquidated at zero equity and still requires a
-sponsor reset. No software version can place orders or increase its depth
-counter until that simulated balance is restored.
+  over the measured remaining stage schedule from a funded account.
 
 ## [0.10.13] — 2026-09-01 — one side of a book can be junk
 

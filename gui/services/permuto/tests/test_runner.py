@@ -104,8 +104,8 @@ def test_a_pause_KEEPS_the_session_warm():
     begins with the case that breaks it.
 
     The old reasoning was "nothing can be placed while paused, so renewing is
-    a wasted round trip". But the sponsor resets balances on Sunday evening
-    during a trading pause that un-pauses at the 09:30 ET open -- fourteen-odd
+    a wasted round trip". But the venue pauses before the contest open on
+    Sunday evening and un-pauses at the 09:30 ET open -- fourteen-odd
     hours. Letting the session lapse through that means the first tick after
     the open spends a full challenge/sign/auth round trip before it can place
     anything, at the moment every entrant reconnects at once, on a metric

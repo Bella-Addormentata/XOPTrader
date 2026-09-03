@@ -670,15 +670,14 @@ class QuoteRunner:
         # [discord 2026-08-27] RENEWED THROUGH A PAUSE, deliberately.
         #
         # This used to be `if not paused`, and the contest begins with
-        # exactly the case that breaks: the sponsor resets balances on
-        # Sunday evening during a trading pause that un-pauses at the
-        # 09:30 ET open -- fourteen-odd hours in which the session would
-        # have expired unrenewed. The first tick after the open would
-        # then spend a full challenge/sign/auth round trip before it
-        # could place anything, at the exact moment every entrant
-        # reconnects at once, on a metric that only accrues while
-        # quoting. If that reauth failed we would be backing off through
-        # the open.
+        # exactly the case that breaks: the venue pauses before the contest
+        # open on Sunday evening and un-pauses at the 09:30 ET open --
+        # fourteen-odd hours in which the session would have expired
+        # unrenewed. The first tick after the open would then spend a full
+        # challenge/sign/auth round trip before it could place anything,
+        # at the exact moment every entrant reconnects at once, on a metric
+        # that only accrues while quoting. If that reauth failed we would
+        # be backing off through the open.
         #
         # Authentication is not a trading route, so it works while
         # trading is paused. The result changes nothing while paused --
