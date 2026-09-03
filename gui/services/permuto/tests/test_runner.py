@@ -3599,6 +3599,17 @@ def test_uncapped_disabled_curfew_applies_carried_overnight_scaling():
     assert total_size == pytest.approx(4285.0, abs=5.0)
 
 
+def test_venue_ring_larger_than_legal_band_is_rejected_and_retains_default():
+    """ring_pct > 5.0% exceeds legal venue band and must be ignored."""
+    c = _Client(account=_account(0.0), batch_response=_venue_ok())
+    r = _runner(c, ring_pct=2.0)
+    r.tick(_MID_SESSION, _ORACLE, {"ring_pct": 6.0})
+    assert r._ring_pct == 2.0
+
+    r.tick(_MID_SESSION, _ORACLE, {"ring_pct": 3.5})
+    assert r._ring_pct == 3.5
+
+
 def test_bbo_revalidation_checks_adjusted_prices_even_when_oracle_unchanged(monkeypatch):
     """If preflight/band_guard modifies BBO leg price, BBO is revalidated against the book."""
     from gui.services.permuto.bbo import Book

@@ -649,8 +649,11 @@ class QuoteRunner:
         if venue_ring is not None:
             try:
                 v_ring = float(venue_ring)
-                if math.isfinite(v_ring) and v_ring > 0.0:
+                if math.isfinite(v_ring) and 0.0 < v_ring <= VENUE_BAND_PCT:
                     self._ring_pct = v_ring
+                else:
+                    _log.debug("permuto: ring_pct %r outside (0, %.1f]; retaining %.1f",
+                               venue_ring, VENUE_BAND_PCT, self._ring_pct)
             except (TypeError, ValueError) as exc:
                 # Invalid ring_pct flag; retain current self._ring_pct
                 _log.debug("permuto: invalid ring_pct flag: %r, retaining %.1f (%s)",

@@ -48,6 +48,7 @@ from typing import Any, Optional
 _log = logging.getLogger(__name__)
 
 DEFAULT_RING_PCT = 2.0
+MAX_LEGAL_RING_PCT = 5.0  # VENUE_BAND_PCT
 
 
 def active_ring_pct(meta: Any, default: float = DEFAULT_RING_PCT) -> tuple[float, str]:
@@ -61,7 +62,7 @@ def active_ring_pct(meta: Any, default: float = DEFAULT_RING_PCT) -> tuple[float
                     value = float(node["vol_aggressive_ring_pct"])
                 except (TypeError, ValueError):
                     value = 0.0
-                if math.isfinite(value) and value > 0.0:
+                if math.isfinite(value) and 0.0 < value <= MAX_LEGAL_RING_PCT:
                     return value, "venue"
             stack.extend(node.values())
         elif isinstance(node, list):
