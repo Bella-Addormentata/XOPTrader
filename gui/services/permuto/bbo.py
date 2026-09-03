@@ -286,8 +286,10 @@ def earning_window(side: str, oracle: float, book: Book, *,
         micro_tick = 1e-6
         s_low = (book.best_bid is not None and book.best_bid >= ring_lo - _EPS * micro_tick) if side == "ask" else False
         s_high = (book.best_ask is not None and book.best_ask <= ring_hi + _EPS * micro_tick) if side == "bid" else False
+        low_m = low - (0.5 * micro_tick if side == "bid" else 0.0)
+        high_m = high + (0.5 * micro_tick if side == "ask" else 0.0)
         first_m, last_m = _grid_bounds(
-            low, high, micro_tick,
+            low_m, high_m, micro_tick,
             strict_low=s_low, strict_high=s_high)
         ticks_m = (int(round((last_m - first_m) / micro_tick)) + 1
                    if last_m >= first_m - _EPS * micro_tick else 0)
@@ -412,7 +414,7 @@ def rests_and_earns(side: str, price: float, oracle: float, book: Book, *,
             and math.isfinite(tick_size) and tick_size > 0.0):
         return False
     deviation = abs(price / oracle - 1.0) * 100.0
-    if deviation > ring_pct + 1e-9:
+    if deviation > ring_pct + 1e-3:
         return False
     epsilon = min(tick_size, 1e-6) * _EPS
     if side == "ask":
