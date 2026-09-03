@@ -329,7 +329,9 @@ def test_the_portfolio_budget_binds_before_any_market_does():
                                                                  budget)
     # Neighbours holding exposure take it away, one for one.
     assert portfolio_cap_usd(equity, "C", per_market,
-                             {"A": 100_000.0, "B": 50_000.0}) == budget - 150_000.0
+                             {"A": 100_000.0, "B": 50_000.0}) == min(per_market, budget - 150_000.0)
+    assert portfolio_cap_usd(equity, "C", per_market,
+                             {"A": budget - 50_000.0}) == 50_000.0
     # Once the budget is spent there is no room at all, however far this
     # market is from its own limit.
     assert portfolio_cap_usd(equity, "C", per_market,

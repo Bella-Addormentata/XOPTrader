@@ -786,7 +786,7 @@ class PermutoWidget(QWidget):
         # only 206.8M depth-seconds and $5k leaves just 14.9% outage headroom.
         # $6k projects 413.6M while the SESSION profile sends only $3k/side.
         self._target_depth_usd = 6_000.0
-        self._max_position_usd = 30_000.0
+        self._max_position_usd = 150_000.0
         self._ring_pct: float = 2.0
         self._build()
         self.refresh()

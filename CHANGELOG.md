@@ -5,6 +5,16 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.17] — 2026-09-03 — unblock two-sided Permuto depth quoting & recalibrate portfolio exposure
+
+- Recalibrate portfolio max exposure fraction to 2.5x equity (aligned with Permuto's 10x
+  clearinghouse leverage limit) so existing inventory holdings do not prematurely choke
+  off risk-increasing opposite-side quotes.
+- Prevent preflight quantisation from rounding valid BBO micro-tick prices back into the best bid,
+  preserving two-sided resting placements inside the +/-2% credit ring.
+- Wire runtime sizing defaults to $6,000 target depth and $150,000 max position to sustain continuous
+  balanced depth accrual toward the 300M competition eligibility gate.
+
 ## [0.10.16] — 2026-09-03 — micro-tick Permuto BBO depth & carried stress margin fallback
 
 - Micro-tick (`1e-6`) resolution fallback in Permuto BBO calculation: when competitor

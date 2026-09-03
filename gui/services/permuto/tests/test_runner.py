@@ -3423,14 +3423,14 @@ def test_the_portfolio_budget_stops_new_exposure_but_never_a_reduction():
 
     # A neighbour has spent the whole budget and we are FLAT -- the case
     # every per-market check calls harmless.
-    action, sides = _run({_MKT: 0.0, "NVDA-VOL-PERP": 4_400_000.0})
+    action, sides = _run({_MKT: 0.0, "NVDA-VOL-PERP": 20_000_000.0})
     assert sides == [], (
         "risk-increasing legs went out after the portfolio budget was "
         "exhausted: %s" % sides)
     assert action == "risk_blocked", action
 
     # Over budget and SHORT: the buy reduces us, and must survive.
-    action, sides = _run({_MKT: -50_000.0, "NVDA-VOL-PERP": 4_400_000.0})
+    action, sides = _run({_MKT: -50_000.0, "NVDA-VOL-PERP": 20_000_000.0})
     assert sides == ["buy"], (
         "the reducing leg was blocked, trapping the book over budget: %s"
         % sides)
