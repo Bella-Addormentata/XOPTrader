@@ -22,6 +22,7 @@
 
 #include <xop/execution/offer_manager.hpp>
 
+#include <xop/execution/cancel_retry.hpp>
 #include <xop/execution/wallet_poll_throttle.hpp>
 #include <xop/risk/watchdog.hpp>
 
@@ -1232,79 +1233,202 @@ asio::awaitable<std::vector<std::string>> OfferManager::cancel_stale(
 // cancel_all -- shutdown: cancel every pending offer
 // ---------------------------------------------------------------------------
 
-asio::awaitable<std::vector<std::string>> OfferManager::cancel_all()
+asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(
+    std::chrono::steady_clock::time_point deadline)
 {
     logger_->info("cancel_all: initiating bulk cancellation");
+
+    CancelOutcome out;
 
     auto all_offers = state_->get_all_offers();
     if (all_offers.empty()) {
         logger_->info("cancel_all: no pending offers to cancel");
-        co_return std::vector<std::string>{};
+        co_return out;
     }
-
-    // ISO/IEC 5055: track which offers were successfully cancelled.
-    // Only clear offers whose cancellation succeeded.
-    // Failed cancellations remain tracked for retry on next heartbeat.
-    std::vector<std::string> cancelled_ids;
-    cancelled_ids.reserve(all_offers.size());
 
     // Attempt bulk cancellation first (wallet cancel_offers endpoint).
     bool bulk_ok = false;
     std::string bulk_err;
     try {
         co_await cancel_offers_charged(current_fee_mojos_, /*secure=*/true);
-        logger_->info("cancel_all: bulk cancel_offers succeeded");
         bulk_ok = true;
     } catch (const rpc::ChiaRPCError& e) {
         bulk_err = e.what();
     }
 
     if (bulk_ok) {
-        // Bulk success: all offers are considered cancelled.
+        // Bulk success: one RPC accepted, so every id is SUBMITTED. Not
+        // confirmed -- a secure cancel spends the offer coins on-chain and
+        // the book is not empty until those spends land. `bulk_submitted`
+        // carries that qualification to the caller instead of leaving the
+        // two shutdown paths in engine.cpp to disagree about it in prose.
         logger_->info("cancel_all: bulk cancel_offers succeeded");
+        out.bulk_submitted = true;
+        out.cancelled.reserve(all_offers.size());
         for (const auto& po : all_offers) {
-            cancelled_ids.push_back(po.offer_id);
+            out.cancelled.push_back(po.offer_id);
         }
     } else {
         // Bulk cancel failed -- fall back to individual cancellation.
         logger_->warn("Bulk cancel_offers failed: {} -- falling back to "
                       "individual cancellation", bulk_err);
 
-        for (const auto& po : all_offers) {
-            bool cancel_ok = false;
-            bool needs_emergency = false;
-            try {
-                co_await cancel_offer_charged(
-                    po.offer_id, current_fee_mojos_, /*secure=*/true);
-                logger_->debug("Cancelled offer {}", po.offer_id.substr(0, 12));
-                cancel_ok = true;
-            } catch (const rpc::ChiaRPCError& inner_e) {
-                const std::string_view msg{inner_e.what()};
-                needs_emergency =
-                    msg.find("insufficient funds") != std::string_view::npos ||
-                    msg.find("spendable balance") != std::string_view::npos;
-                if (!needs_emergency) {
-                    logger_->error("Failed to cancel offer {}: {}",
-                                   po.offer_id.substr(0, 12), inner_e.what());
-                }
-            }
-            if (needs_emergency)
-                cancel_ok = co_await emergency_cancel(
-                    po.offer_id, "cancel_all");
-            if (cancel_ok)
-                cancelled_ids.push_back(po.offer_id);
+        std::vector<std::string> ids;
+        ids.reserve(all_offers.size());
+        for (const auto& po : all_offers) ids.push_back(po.offer_id);
+
+        out = co_await cancel_ids(ids, deadline);
+        // [S46] Keep the bulk refusal when the per-offer loop produced no
+        // text of its own. Reporting an empty last_error after a failed
+        // sweep would classify as TakeFailureClass::Other and put the
+        // dominant, self-clearing sync refusal on the short leash.
+        if (out.last_error.empty() && !out.failed.empty()) {
+            out.last_error  = bulk_err;
+            // ...and the class with it. Setting the text without the class
+            // would leave worst_class at its Other default while the operator
+            // reads a sync refusal in the log -- the two disagreeing about
+            // the same failure is what this field exists to stop.
+            out.worst_class = execution::classify_take_failure(bulk_err);
         }
     }
 
     // Mark offers whose cancellation succeeded as cancel_pending.
     // detect_fills will handle final removal when the wallet confirms.
-    for (const auto& id : cancelled_ids) {
+    for (const auto& id : out.cancelled) {
         state_->mark_cancel_pending(id);
     }
 
     logger_->info("cancel_all: {}/{} offers cancelled successfully",
-                  cancelled_ids.size(), all_offers.size());
-    co_return cancelled_ids;
+                  out.cancelled.size(), all_offers.size());
+    co_return out;
+}
+
+// ---------------------------------------------------------------------------
+// [S46] cancel_ids -- cancel exactly this set, and report what did not go.
+//
+// This is the retry leg. It exists because the wallet's bulk endpoint takes
+// no offer id (chia_rpc.cpp:883-891), so "cancel the three that failed" is
+// not expressible through it, and re-running cancel_all() would re-charge a
+// fee against the four that already succeeded.
+//
+// The loop tries EVERY id -- a failure on one offer says nothing about the
+// next -- and the ids that did not go are RETURNED rather than logged and
+// dropped. The single exception is the wall-clock deadline, and even that
+// returns the untried remainder as `failed` rather than losing it.
+// ---------------------------------------------------------------------------
+
+asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_ids(
+    const std::vector<std::string>& offer_ids,
+    std::chrono::steady_clock::time_point deadline)
+{
+    CancelOutcome out;
+    if (offer_ids.empty()) co_return out;
+
+    out.cancelled.reserve(offer_ids.size());
+
+    // The most-retryable class seen so far. Tracked with an explicit "have we
+    // seen one" flag rather than seeded from the default, because the default
+    // is Other and more_retryable(Other, Funding) is Other -- an all-funding
+    // batch would then never report Funding and would never escalate.
+    bool have_class = false;
+
+    for (std::size_t i = 0; i < offer_ids.size(); ++i) {
+        const auto& oid = offer_ids[i];
+
+        if (std::chrono::steady_clock::now() >= deadline) {
+            // Budget spent mid-loop. Everything untried is STILL LIVE and is
+            // reported as such: "we ran out of time" is not "it is gone".
+            for (std::size_t j = i; j < offer_ids.size(); ++j) {
+                out.failed.push_back(offer_ids[j]);
+            }
+            out.deadline_hit = true;
+            logger_->error("cancel_ids: wall-clock deadline reached with {} "
+                           "of {} offer(s) never attempted -- returned as "
+                           "STILL LIVE",
+                           offer_ids.size() - i, offer_ids.size());
+            break;
+        }
+
+        // An offer that left State between attempts settled, was already
+        // cancelled, or was reconciled away. Charging a secure cancel
+        // against it spends a fee on nothing.
+        const PendingOffer po = state_->get_offer(oid);
+        if (po.offer_id.empty()) {
+            logger_->info("cancel_ids: {} is no longer tracked -- skipping",
+                          oid.substr(0, 12));
+            continue;
+        }
+
+        // [review] The guard every other cancel path in this file already
+        // carries and this one did not: cancel_stale skips cancel_pending
+        // offers, classify_tier_staleness skips them ("Already being
+        // cancelled"), the peg-suspend drain skips them, and the Step 8
+        // draining gate's safety argument is literally "cancel_stale skips
+        // cancel_pending offers, so no double-spend".
+        //
+        // Without it, sweep_cancel_intent charged a fresh secure cancel here
+        // every heartbeat against offers whose cancel spend was already in
+        // flight. recheck_terminal returns Revived for PENDING_CANCEL and
+        // calls mark_cancel_pending() precisely to stop this -- but only
+        // callers that READ the flag are stopped by it.
+        if (po.cancel_pending) {
+            logger_->info("cancel_ids: {} already has a cancel in flight -- "
+                          "skipping (a second secure cancel would pay a "
+                          "second fee for the same spend)",
+                          oid.substr(0, 12));
+            out.already_pending.push_back(oid);
+            continue;
+        }
+
+        bool cancel_ok       = false;
+        bool needs_emergency = false;
+        // [S46] Per-offer, NOT written straight into out.last_error. An
+        // error from an offer that then succeeded through the emergency
+        // ladder must not survive to be classified: `last_error` is the
+        // retry policy's only evidence, and an empty-or-wrong string there
+        // puts the dominant sync refusal on the short unmodelled leash.
+        // out.last_error is therefore assigned ONLY on the failed branch.
+        std::string err;
+        try {
+            co_await cancel_offer_charged(oid, current_fee_mojos_,
+                                          /*secure=*/true);
+            logger_->debug("Cancelled offer {}", oid.substr(0, 12));
+            cancel_ok = true;
+        } catch (const rpc::ChiaRPCError& inner_e) {
+            err = inner_e.what();
+            const std::string_view msg{err};
+            needs_emergency =
+                msg.find("insufficient funds") != std::string_view::npos ||
+                msg.find("spendable balance") != std::string_view::npos;
+            if (!needs_emergency) {
+                logger_->error("Failed to cancel offer {}: {}",
+                               oid.substr(0, 12), err);
+            }
+        }
+        if (needs_emergency) {
+            // The emergency ladder is the answer to a funding refusal.
+            cancel_ok = co_await emergency_cancel(oid, "cancel_ids");
+        }
+
+        if (cancel_ok) {
+            out.cancelled.push_back(oid);
+            state_->mark_cancel_pending(oid);
+        } else {
+            out.failed.push_back(oid);
+            if (!err.empty()) {
+                // Fold the class across the WHOLE batch before anyone gets to
+                // classify one arbitrary sample of it.
+                const auto cls = execution::classify_take_failure(err);
+                out.worst_class = have_class
+                    ? execution::more_retryable(out.worst_class, cls)
+                    : cls;
+                have_class = true;
+                out.last_error = std::move(err);
+            }
+        }
+    }
+
+    co_return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -2485,6 +2609,10 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
 {
     std::vector<std::string> cancelled_ids;
 
+    // [S46] Describes THIS call only -- same contract as
+    // last_terminal_offers_. Cleared before anything can populate it.
+    db_leg_ = StartupDbLeg{};
+
     logger_->info("[startup_reconcile] Scanning wallet for orphaned offers...");
 
     // -- Wallet sync pre-check -----------------------------------------------
@@ -2520,9 +2648,16 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
     };
     std::vector<WalletOffer> wallet_offers;
 
+    // [S46] Every trade id the scan MENTIONED, at any status -- not just the
+    // PENDING_ACCEPT subset kept in wallet_offers. This is the set the DB leg
+    // below subtracts, so a DB row the wallet answered about (in any state)
+    // costs no extra probe, and only genuinely unmentioned rows are walked.
+    std::unordered_set<std::string> scanned_ids;
+
     constexpr std::int64_t kPageSize = 50;
     std::int64_t offset = 0;
     bool more = true;
+    bool scan_complete = true;
 
     while (more) {
         std::vector<json> trade_records;
@@ -2533,7 +2668,16 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
         } catch (const rpc::ChiaRPCError& e) {
             logger_->error("[startup_reconcile] get_all_offers failed: {}",
                            e.what());
-            co_return cancelled_ids;
+            // [S46] Do NOT return here with the DB leg unwalked. A failed
+            // scan is exactly the state in which DB rows are stranded, and
+            // the old early return is what made "0 wallet offers scanned"
+            // read as a clean bill of health. We learned nothing about any
+            // DB-pending row, so every one of them is UNVERIFIABLE -- the
+            // rows stay pending and the caller keeps asking on the
+            // heartbeat.
+            scan_complete = false;
+            more = false;
+            break;
         }
 
         if (trade_records.empty() ||
@@ -2547,6 +2691,8 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
             }
             std::string trade_id = rec["trade_id"].get<std::string>();
             int status = trade_status::parse(rec["status"]);
+
+            scanned_ids.insert(trade_id);
 
             if (status != trade_status::kPendingAccept) {
                 continue;
@@ -2562,6 +2708,85 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
         offset += kPageSize;
     }
 
+    // ---- Phase 1b: THE DB -> WALLET LEG -----------------------------------
+    // [S46 2026-09-02] The direction that did not exist. Everything above
+    // asks "what does the wallet hold, and do we know about it?". A DB row
+    // the wallet never mentions is not reached by that question at all.
+    //
+    // get_offer() is the only wallet call keyed by OUR id, and
+    // reconcile_offers() already uses it with the right posture: an RPC
+    // error keeps the offer tracked and retries, a CONFIRMED status keeps it
+    // tracked so detect_fills books the fill, and only CANCELLED/FAILED is
+    // treated as terminal. That posture is reused verbatim here rather than
+    // written a second time.
+    {
+        std::size_t probes = 0;
+        for (const auto& id : known_offer_ids) {
+            if (scan_complete && scanned_ids.count(id) > 0) {
+                continue;  // the wallet answered about it already
+            }
+            if (!scan_complete) {
+                db_leg_.unverifiable.push_back(id);
+                continue;
+            }
+            if (probes >= kMaxStartupDbProbes) {
+                // Not "assume gone" -- assume NOTHING. The heartbeat sweep
+                // is unbounded in cycles and is where a long walk belongs.
+                db_leg_.unverifiable.push_back(id);
+                continue;
+            }
+            ++probes;
+
+            int status = -1;
+            try {
+                const json rec = co_await wallet_->get_offer(
+                    id, /*file_contents=*/false);
+                if (rec.contains("status")) {
+                    status = trade_status::parse(rec["status"]);
+                }
+            } catch (const rpc::ChiaRPCError& e) {
+                // Fail safe. An unsynced wallet refuses here exactly as it
+                // refused the cancel on the way down, and treating that as
+                // "gone" would be the same fail-open one process later.
+                logger_->warn("[startup_reconcile] get_offer failed for {} -- "
+                              "row stays pending, heartbeat will retry: {}",
+                              id.substr(0, 12), e.what());
+                db_leg_.unverifiable.push_back(id);
+                continue;
+            }
+
+            if (status == trade_status::kCancelled
+                || status == trade_status::kFailed) {
+                db_leg_.terminal.push_back(id);
+            } else if (status == trade_status::kConfirmed) {
+                db_leg_.confirmed.push_back(id);
+            } else if (status == trade_status::kPendingAccept) {
+                db_leg_.still_live.push_back(id);
+            } else {
+                // kPendingConfirm, kPendingCancel, or an unrecognised code.
+                // A recognised pending state is not terminal and an
+                // unrecognised one is no evidence at all; neither authorises
+                // stamping the row.
+                db_leg_.unverifiable.push_back(id);
+            }
+        }
+
+        if (db_leg_.total() > 0) {
+            logger_->warn("[startup_reconcile] DB->wallet leg: {} DB-pending "
+                          "row(s) absent from the wallet scan -- {} terminal, "
+                          "{} still live, {} confirmed/filling, {} "
+                          "UNVERIFIABLE (kept pending for the heartbeat)",
+                          db_leg_.total(), db_leg_.terminal.size(),
+                          db_leg_.still_live.size(),
+                          db_leg_.confirmed.size(),
+                          db_leg_.unverifiable.size());
+        }
+    }
+
+    if (!scan_complete) {
+        co_return cancelled_ids;
+    }
+
     // Separate known from orphans.
     std::size_t total_pending = wallet_offers.size();
     std::vector<WalletOffer*> orphans;
@@ -2575,9 +2800,17 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
     }
 
     if (orphans.empty()) {
+        // [S46] The DB-leg counts are on this line deliberately. Its previous
+        // wording -- "0 wallet offers scanned, 0 known/restored, 0 orphans" --
+        // is what the engine logged on 2026-09-02 with seven stranded DB rows,
+        // and an operator reading it had no way to tell a genuinely empty book
+        // from a wallet that answered nothing.
         logger_->info("[startup_reconcile] Complete: {} wallet offers scanned, "
-                      "{} known/restored, 0 orphans",
-                      total_pending, restored);
+                      "{} known/restored, 0 orphans; DB-leg {} probed "
+                      "({} terminal, {} live, {} unverifiable)",
+                      total_pending, restored, db_leg_.total(),
+                      db_leg_.terminal.size(), db_leg_.still_live.size(),
+                      db_leg_.unverifiable.size());
         co_return cancelled_ids;
     }
 

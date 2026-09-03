@@ -650,7 +650,115 @@ private:
     void watchdog_loop();
     /// Cancel every resting offer through a private wallet RPC.
     /// `why` is the operator-facing reason, already formatted.
-    void watchdog_cancel_book(const std::string& why);
+    /// [S46 2026-09-02] `live_ids` are the offers we still believe are
+    /// RESTING, and they are not optional decoration.
+    ///
+    /// The 2026-09-02 alert said "Offers are still live and unmanaged" and
+    /// "cancel them by hand NOW" without naming a single one. The seven ids
+    /// were recoverable only by querying offer_log afterwards, which is not
+    /// something an operator can do at 13:10 with a live book. They are in
+    /// scope at every call site (state_->get_all_offers(), or the failed
+    /// list from the cancel), so passing them costs nothing.
+    void watchdog_cancel_book(const std::string&              why,
+                              const std::vector<std::string>& live_ids = {});
+
+    // -- [S46] Write-ahead cancel intent -------------------------------------
+    //
+    // The durable half of the shutdown fix, and the half that survives the
+    // routes no retry can help: SIGTERM, taskkill /F, console-window close,
+    // and kill_old_instances() run NO shutdown path at all.
+    //
+    // The problem it solves is that the INTENT to cancel was never persisted
+    // anywhere. An offer_log row left at status="pending" is byte-identical
+    // to a healthy resting offer, so the next engine restored all seven of
+    // them into State and resumed quoting as if nothing had happened. No
+    // startup path can act on a state that was never written.
+    //
+    // WRITE-AHEAD is load-bearing. The set is written BEFORE the first cancel
+    // attempt, and it is NOT pruned as ids succeed -- a secure cancel is a
+    // SUBMISSION, and the book is not empty until those spends confirm.
+    // Written after the failure instead, a hard kill in the window between
+    // would lose it and we would be fail-open again by a slightly later route.
+    //
+    // A file rather than a DB column: offer_log has no such status today,
+    // query_pending_offers() filters on status='pending' exactly, and a row
+    // moved to some new status would vanish from the restore at boot -- a
+    // schema change whose failure mode is worse than the bug. The file is
+    // additive and the DB rows keep their existing meaning.
+    std::filesystem::path cancel_intent_path_;
+    /// The pre-review name. Read once at boot if the current path is absent,
+    /// so an intent file written by an older build is not silently orphaned.
+    /// (It was never JSON: one bare id per line.)
+    std::filesystem::path cancel_intent_legacy_path_;
+
+    /// [review] How sure are we that this offer's cancel actually went out?
+    ///
+    /// Without this distinction every clean shutdown left a file full of ids
+    /// and every subsequent boot fired a CRITICAL DeadMansSwitch alert saying
+    /// a previous engine "could not confirm" cancels that had in fact been
+    /// accepted and stamped in the DB. The channel that has to be believed at
+    /// the next 13:10:17 cannot be the channel that fires on every deploy --
+    /// write_cancel_intent's own comment names the cost: "a recovery
+    /// mechanism that cries wolf on every start is one that gets switched
+    /// off."
+    ///
+    /// Both tags are still SWEPT and still verified against the wallet. The
+    /// tag changes how loudly boot announces them, never whether they are
+    /// checked.
+    enum class CancelIntentTag : int {
+        /// ZERO, and the value a missing or unrecognised tag decodes to: the
+        /// alarming reading is the safe default. We ordered this cancel and
+        /// have no evidence the wallet took it.
+        Ordered   = 0,
+        /// The wallet ACCEPTED the cancel; the spend must still confirm.
+        Submitted = 1,
+    };
+
+    /// Offers a previous process MEANT to cancel, with how far each got.
+    /// Loaded at boot; drained by sweep_cancel_intent() on the heartbeat.
+    std::unordered_map<std::string, CancelIntentTag> cancel_intent_;
+
+    /// The set as last written to disk, so an unchanged sweep does not
+    /// rewrite the file every 5 s in the directory the GUI watches.
+    std::unordered_map<std::string, CancelIntentTag> cancel_intent_on_disk_;
+
+    /// Persist `ids` as the current outstanding cancel intent. An empty map
+    /// REMOVES the file -- "nothing outstanding" must not be represented by
+    /// a stale file that makes the next boot chase settled offers.
+    void write_cancel_intent(
+        const std::unordered_map<std::string, CancelIntentTag>& ids);
+
+    /// Read the intent file left by a previous process into cancel_intent_.
+    void load_cancel_intent();
+
+    /// [S46] The heartbeat leg.
+    ///
+    /// Runs from poll_loop_coro ABOVE the whole Step-8 gate chain, not from
+    /// inside step_manage_offers.
+    ///
+    /// [review] It first shipped inside step_manage_offers, above that
+    /// function's wallet-sync gate, and the reasoning stopped one level too
+    /// shallow: step_manage_offers has exactly ONE call site, in the final
+    /// arm of a seven-way if/else-if chain. xch_recovery_mode_,
+    /// watchdog_fired_, cancel_all_inflight_/draining_, wallet_circuit_open_,
+    /// gui_pause_active_, breaker_pause_active_ and any non-Normal
+    /// flash-crash state each short-circuit before it. Two of those --
+    /// watchdog_fired_ and breaker_pause_active_ -- are documented as cleared
+    /// only by restart, so one tripped breaker disabled the recovery for the
+    /// life of the process; and wallet_circuit_open_ opens for precisely the
+    /// wallet sickness that strands offers in the first place. That is the
+    /// same detector-downstream-of-the-fault shape, one level out. The repo
+    /// had already made and retrofitted this exact mistake for the less
+    /// urgent TTL drain (every branch carries step_sweep_stale_offers under
+    /// [STOPDRAIN review #3/#10/#13/#19]).
+    ///
+    /// Safe above the gates on the same terms those branches already accept
+    /// for the TTL sweep: it posts nothing, it issues no fee-bearing RPC
+    /// unless the wallet confirms an offer is still live, it never sleeps and
+    /// never loops internally, so it cannot wedge a cycle. Unbounded in
+    /// CYCLES, which is the point: this is what stops the shutdown failure
+    /// from simply moving to boot time.
+    asio::awaitable<void> sweep_cancel_intent(BlockHeight block);
     /// [S28] Which RPC answers "what block is it?", re-decided every poll.
     ///
     /// This is the TRANSITION STATE: the streak counters and the hysteresis
