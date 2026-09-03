@@ -5,6 +5,13 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.18] — 2026-09-03 — seamless carried stress margin risk-reducing order execution
+
+- Automatically extract and post risk-reducing limit orders via `/exchange/order` when the venue's
+  carried-session 8x stress margin check rejects full `batch_upsert` payloads.
+- Prevents unhandled HTTP 400 error latching and toolbar "blocked" state while actively working off
+  held short inventory overnight.
+
 ## [0.10.17] — 2026-09-03 — unblock two-sided Permuto depth quoting & recalibrate portfolio exposure
 
 - Recalibrate portfolio max exposure fraction to 2.5x equity (aligned with Permuto's 10x
