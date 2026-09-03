@@ -461,17 +461,24 @@ def _default_identity_factory():
 
 
 def _default_market_reader() -> dict:
-    """Oracle prices and the pause flag, from the public routes.
+    """Oracle prices, pause flag, and active ring percentage from the public routes.
 
     Deliberately the ONLY network call this page makes without a session:
     both routes are unauthenticated reads, so opening the Markets section can
     never be an action against the account.
     """
     from gui.services.permuto.auth import _request
+    from gui.services.permuto.bbo import active_ring_pct
 
     prices = (_request("GET", "/info/oracle") or {}).get("prices") or {}
-    flags = (_request("GET", "/info/meta") or {}).get("flags") or {}
-    return {"prices": prices, "trading_paused": bool(flags.get("trading_paused"))}
+    meta = _request("GET", "/info/meta") or {}
+    flags = meta.get("flags") or {}
+    ring_pct, ring_src = active_ring_pct(meta)
+    return {
+        "prices": prices,
+        "trading_paused": bool(flags.get("trading_paused")),
+        "ring_pct": ring_pct if ring_src == "venue" else None,
+    }
 
 
 from gui.services.permuto.live import MARKETS as _MARKETS_FOR_BUDGET
@@ -757,8 +764,7 @@ class PermutoWidget(QWidget):
         #: True while the quoting loop owns a venue session.
         self._quoting_live: bool = False
         self._markets_worker: Optional[Any] = None
-        # [2026-08-31] Target stays SMALL, cap goes wide, and the two are
-        # deliberately no longer equal.
+        # [2026-09-02] Target and cap are deliberately no longer equal.
         #
         # They were both $1,200, which meant one nearly-complete quote fill
         # took a flat market straight to its position limit -- and at the
@@ -768,15 +774,20 @@ class PermutoWidget(QWidget):
         # to score at all. A cap has to sit several fills away from the
         # quote size, not one.
         #
-        # The cap is sized to TOLERATE the ~$188k position already on the
-        # book so the loop can quote two-sided again; it is not an
-        # invitation to build one. The target stays at $1,200 on purpose:
-        # the 2026-08-31 recovery review is explicit that "quote
-        # correctness and uptime dominate size" and that $25k/market on the
-        # current code path would only multiply rejected orders. Ramp the
-        # target only against a measured leaderboard slope.
-        self._target_depth_usd = 1_200.0
-        self._max_position_usd = 250_000.0
+        # The old $250k cap existed only to tolerate the account's already
+        # accumulated ~$188k short. That account is now flat and liquidated;
+        # carrying the emergency cap into a fresh identity would authorize the same
+        # loss again. Ten full quote fills is enough room for skew and repair
+        # without turning a depth target into a directional position budget.
+        #
+        # Integrating the actual CLOSED/PREOPEN/SETTLING/SESSION/RAMP/EXIT
+        # profiles over the 44.6 hours left gives 9.575 target-equivalent
+        # hours per market. With two currently placeable markets, $3k projects
+        # only 206.8M depth-seconds and $5k leaves just 14.9% outage headroom.
+        # $6k projects 413.6M while the SESSION profile sends only $3k/side.
+        self._target_depth_usd = 6_000.0
+        self._max_position_usd = 30_000.0
+        self._ring_pct: float = 2.0
         self._build()
         self.refresh()
 
@@ -1371,9 +1382,21 @@ class PermutoWidget(QWidget):
         if paused:
             self._markets_note.setText(
                 "TRADING IS PAUSED at the venue. Quotes are rejected while "
-                "this holds, and the Sunday reset happens inside a pause.")
+                "this holds.")
         else:
             self._markets_note.setText("Trading is open.")
+
+        venue_ring = snapshot.get("ring_pct")
+        if venue_ring is not None:
+            try:
+                v_ring = float(venue_ring)
+                if math.isfinite(v_ring) and 0.0 < v_ring <= 5.0:
+                    if self._ring_pct != v_ring:
+                        self._ring_pct = v_ring
+                        self._refresh_quoting()
+            except (TypeError, ValueError) as exc:
+                # Invalid ring_pct; retain current self._ring_pct
+                _log.debug("permuto: invalid ring_pct in markets snapshot: %r (%s)", venue_ring, exc)
 
     # -- quoting ------------------------------------------------------------ #
 
@@ -1384,7 +1407,7 @@ class PermutoWidget(QWidget):
         rows = [
             ("target depth per side", "$%.0f" % self._target_depth_usd),
             ("max position", "$%.0f of notional" % self._max_position_usd),
-            ("aggressive ring", "+/-2.00%  (depth credit + purge boundary)"),
+            ("aggressive ring", "+/-%.2f%%  (depth credit + purge boundary)" % self._ring_pct),
             ("legal band", "+/-5.00%  (outside is HTTP 400)"),
             ("stop adding risk at", "%.0f%% margin utilisation"
                 % (_risk.MAX_MARGIN_UTILISATION * 100)),

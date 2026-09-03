@@ -125,6 +125,7 @@ def decide(
     ring_pct: float = 2.0,
     quote_when_carried: bool = True,
     one_sided_ok: bool = False,
+    requote_at_pct: Optional[float] = None,
 ) -> QuoteDecision:
     """One action for the current state. Total and side-effect free."""
 
@@ -202,11 +203,22 @@ def decide(
     # them replacing a quote with an identical copy of itself.
 
     trigger = ring_pct * REQUOTE_AT_RING_FRACTION
+    custom_ring_edge = False
+    if (requote_at_pct is not None
+            and math.isfinite(requote_at_pct)
+            and trigger < requote_at_pct <= ring_pct):
+        trigger = requote_at_pct
+        custom_ring_edge = math.isclose(
+            trigger, ring_pct, rel_tol=0.0, abs_tol=1e-9)
     for price in (resting.bid_price, resting.ask_price):
         if price is None:
             continue        # the forbidden side; nothing to drift-check
         drift = abs(price - view.oracle) / view.oracle * 100.0
-        if drift >= trigger:
+        past_trigger = drift >= trigger
+        if custom_ring_edge and math.isclose(
+                drift, trigger, rel_tol=0.0, abs_tol=1e-9):
+            past_trigger = False
+        if past_trigger:
             return QuoteDecision(
                 LoopAction.QUOTE,
                 "resting quote has drifted %.2f%% from the oracle (re-quote at "

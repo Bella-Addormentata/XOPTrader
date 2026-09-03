@@ -275,6 +275,28 @@ def test_quantisation_rounds_away_from_the_oracle():
     assert ask.price >= oracle * (1.0 + 0.25 / 100.0) - 1e-12
 
 
+def test_an_observed_full_ring_cap_reserves_the_quantisation_tick():
+    oracle = 0.1544391445921985
+    legs = quote_ladder(
+        "QQQ-VOL-PERP", oracle, 1000.0,
+        levels=1,
+        first_offset_pct=2.0,
+        max_offset_pct=2.0,
+        tick_size=0.0001,
+        lot_size=1.0,
+    )
+    assert legs
+    bid = next(o for o in legs if o.side is Side.BUY)
+    ask = next(o for o in legs if o.side is Side.SELL)
+    # Both legs override the default 1.8% cap and place at the full-ring grid boundary
+    assert bid.price == 0.1514
+    assert ask.price == 0.1575
+    for leg in legs:
+        deviation = abs(leg.price / oracle - 1.0) * 100.0
+        # Exceeds the default 90% cap (1.8%) while remaining inside the 2.0% ring
+        assert 1.8 < deviation <= 2.0 + 1e-9, leg
+
+
 def test_a_degenerate_quantised_pair_is_skipped_not_sent():
     """A tick wider than the spread crosses or zeroes the pair; the level is
     dropped rather than shipped."""

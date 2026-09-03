@@ -49,12 +49,16 @@ from .risk import (PORTFOLIO_MAX_EXPOSURE_FRACTION, MarginState,
                    RiskAction, assess, portfolio_cap_usd,
                    skewed_reference)
 from .band_guard import VENUE_BAND_PCT, BandGuard
+from .bbo import (placement_prices as bbo_placement_prices,
+                  required_ladder_offset_pct as bbo_required_offset_pct,
+                  rests_and_earns as bbo_rests_and_earns,
+                  _quantise as bbo_quantise)
 from .cross_backoff import CrossBackoff, headroom_pct
 from .preflight import (latest_oracle, preflight_leg_price,
                         quantise_toward, rescaled_size)
 from .curfew import (OPENS_UTC, OracleFreeze, Stage, assess_curfew,
                      permitted_leg_size)
-from .modes import Profile, profile_for
+from .modes import Profile, profile_for, uncurfewed_profile
 from .session import RenewAction
 
 #: How often a SUSTAINED full withdrawal re-asserts the cancel when we
@@ -231,9 +235,24 @@ class QuoteRunner:
         max_position_usd: float = 1_200.0,
         curfew_enabled: bool = True,
         ring_pct: float = 2.0,
+        # [DEPTH 2026-09-02] TRIED 0.05 AND REVERTED -- recorded so it is not
+        # retried. Cutting this does buy ring headroom (1.700% -> 1.900% at
+        # zero skew), but one tick is 0.14-0.28% of oracle on these markets,
+        # which is COARSER than the spread itself: at 0.05 the session and
+        # overnight placements both quantise to the same single tick and
+        # test_the_session_quotes_wider_than_the_overnight_window fails --
+        # correctly, because the 1.6x session widening stops existing. The
+        # 0.2% of headroom it buys does not close a ~1.5% gap anyway; skew is
+        # the term that matters. Width now comes from the ring-edge rule in
+        # _bbo_offset_pct instead, which is quantisation-proof.
         half_spread_pct: float = 0.25,
         quote_when_carried: bool = True,
         oracle_fetch: Any = None,
+        #: [BBO] Optional ``market -> bbo.Book | None``. When absent the
+        #: runner behaves exactly as before, learning the resting price from
+        #: refusals alone. When supplied, the book is CONSULTED instead of
+        #: guessed: see the note at the placement site for why that matters.
+        bbo_fetch: Any = None,
     ) -> None:
         self._client = client
         self._markets = list(markets)
@@ -288,6 +307,10 @@ class QuoteRunner:
         #: Tick size as a fraction of the oracle, per market, so headroom_pct
         #: can reserve the one-tick rounding margin ask/ceil adds.
         self._last_tick_frac: dict = {}
+        #: A quote forced wide by the observed BBO must not be born past the
+        #: ordinary drift trigger and replaced every tick. Recorded only
+        #: after the venue accepts the pair; bounded by the scoring ring.
+        self._requote_at_pct: dict = {}
         #: Markets currently one-sided because a side's room ran out.
         #: Distinct from a curfew-closed side: the cap is positive,
         #: the inventory has simply consumed all of it.
@@ -308,6 +331,7 @@ class QuoteRunner:
         # happened with a fresh fetch. Re-reading here shrinks the exposure
         # to one request's flight time, measured rather than assumed.
         self._oracle_fetch = oracle_fetch
+        self._bbo_fetch = bbo_fetch
         #: Measured duration of the last pre-send fetch: the best estimate
         #: of how long the NEXT request will take.
         self._send_latency_s = 0.25
@@ -351,8 +375,112 @@ class QuoteRunner:
     # ------------------------------------------------------------------ #
     # Belief
     # ------------------------------------------------------------------ #
+    def _bbo_offset_pct(self, market: str, oracle: Any, reference: Any,
+                        tick_size: float, eff_half_spread: float,
+                        learned_backoff: float, ring_backoff: float):
+        """``(status, (bid_price, ask_price), book)`` from the live book.
+
+        ``status`` is one of:
+
+        * ``"ok"``      -- exact per-side prices exist inside the ring.
+        * ``"shut"``    -- no tick-aligned price rests and earns on at least
+                           one side. Depth credit is ``min(bid, ask)``, so a
+                           market that cannot quote both sides earns nothing
+                           whatever we send: skip it rather than spend a
+                           rate-limit token on a refusal.
+        * ``"reset"``   -- our own resting order is the BBO that closes the
+                   other side. Cancel it once so the next tick sees
+                   the external book and can rebuild both sides.
+        * ``"unknown"`` -- the book could not be read. Fall back to the
+                           learned backoff; a monitoring failure must never
+                           be the reason a quote stops going out.
+
+        Prices are independent because inventory skew moves the ladder center.
+        A single symmetric offset can cross on one side or leave the scoring
+        ring on the other even when both side-specific windows are open.
+        """
+        try:
+            oracle_f = float(oracle or 0.0)
+            reference_f = float(reference or 0.0)
+        except (TypeError, ValueError):
+            return "unknown", 0.0, None
+        if not (oracle_f > 0.0 and reference_f > 0.0 and tick_size > 0.0):
+            return "unknown", 0.0, None
+        try:
+            book = self._bbo_fetch(market)
+        except Exception as exc:  # noqa: BLE001 - never fail the tick on this
+            _log.debug("permuto: %s BBO fetch raised: %s", market, exc)
+            return "unknown", 0.0, None
+        if book is None:
+            return "unknown", 0.0, None
+
+        resting = self._resting.get(market, RestingQuote())
+        needed = 0.0
+        for side in ("ask", "bid"):
+            off = bbo_required_offset_pct(
+                side, oracle_f, reference_f, book,
+                ring_pct=self._ring_pct, tick_size=tick_size)
+            if off is None:
+                blocker = (book.best_bid if side == "ask"
+                           else book.best_ask)
+                own_blocker = (resting.bid_price if side == "ask"
+                               else resting.ask_price)
+                tolerance = tick_size * 1e-4
+                own_is_blocker = (
+                    blocker is not None
+                    and own_blocker is not None
+                    and (own_blocker >= blocker - tolerance
+                         if side == "ask"
+                         else own_blocker <= blocker + tolerance)
+                )
+                if own_is_blocker:
+                    _log.info(
+                        "permuto: %s %s side is blocked by our own resting "
+                        "%s at %.6f -- cancelling the one-sided book once "
+                        "so the next tick can rebuild against the external "
+                        "BBO.", market, side,
+                        "bid" if side == "ask" else "ask", blocker)
+                    return "reset", 0.0, book
+                _log.info(
+                    "permuto: %s %s side has no placeable price -- best bid "
+                    "%s / best ask %s against a %.1f%% ring. Skipping: depth "
+                    "is min(bid, ask), so one side alone banks nothing.",
+                    market, side, book.best_bid, book.best_ask,
+                    self._ring_pct)
+                return "shut", 0.0, book
+            needed = max(needed, off)
+
+        if needed <= eff_half_spread:
+            # The configured spread already clears the book -- so go WIDE
+            # rather than resting where we happen to be.
+            #
+            # [DEPTH 2026-09-02] depth_credit_usd counts a leg's full notional
+            # anywhere inside the ring and gives nothing extra for being tight,
+            # so a leg at the ring edge earns exactly what a leg at 0.05%
+            # earns. What differs is the fill rate, and a fill is not neutral:
+            # it flattens one side, and credit is min(bid, ask), so the market
+            # banks ZERO until the restore lands. Width is therefore free
+            # eligibility bought with fewer holes in the book -- and less of
+            # the inventory that consumed the ring headroom to begin with.
+            preferred = eff_half_spread + max(ring_backoff, 0.0)
+        else:
+            preferred = max(
+                needed, eff_half_spread + max(learned_backoff, 0.0))
+        prices = bbo_placement_prices(
+            oracle_f, reference_f, book,
+            preferred_offset_pct=preferred,
+            ring_pct=self._ring_pct, tick_size=tick_size)
+        if prices is None:
+            _log.info(
+                "permuto: %s has open side windows but no valid two-sided "
+                "grid around reference %.6f; skipping rather than banking "
+                "zero.", market, reference_f)
+            return "shut", 0.0, book
+        return "ok", prices, book
+
     def _forget_book(self) -> None:
         self._resting = {m: RestingQuote() for m in self._markets}
+        self._requote_at_pct.clear()
 
     def reconcile(self, open_orders: Any) -> None:
         """Replace the belief with what the venue says is actually resting.
@@ -404,9 +532,11 @@ class QuoteRunner:
             if not math.isfinite(price):
                 continue
             if side in ("BUY", "BID", "B"):
-                seen[market]["bid"] = price
+                prev_bid = seen[market]["bid"]
+                seen[market]["bid"] = price if prev_bid is None else max(prev_bid, price)
             elif side in ("SELL", "ASK", "S"):
-                seen[market]["ask"] = price
+                prev_ask = seen[market]["ask"]
+                seen[market]["ask"] = price if prev_ask is None else min(prev_ask, price)
 
         self._resting = {
             m: RestingQuote(bid_price=v["bid"], ask_price=v["ask"])
@@ -464,44 +594,16 @@ class QuoteRunner:
         # cap, so observing early costs nothing and a missed observation
         # would loosen it.
         self._band_guard.observe(now_s, oracles)
-        # [audit] DELIBERATELY gated on the curfew, and it must stay that
-        # way. An audit flagged the obvious reading -- observation is about
-        # the ORACLE, the curfew is about inventory caps, so why couple
-        # them -- and ungating it looks like a strict improvement, because
-        # with the curfew off _changed_at_by_market_s stays empty and the
-        # stale-oracle gate never fires.
-        #
-        # It is not an improvement, it is a regression, and the reason is
-        # two lines below at posture_stage: with the curfew off,
-        # self._curfew is None, so posture_stage pins to UNSCHEDULED --
-        # which modes.profile_for() lists among the stages where a frozen
-        # oracle means WITHDRAW. Feeding the detector in that
-        # configuration therefore withdraws the book every night, because
-        # the overnight oracle is frozen BY DESIGN and there is no stage
-        # left to say so. That window is where the depth is actually
-        # earned. Measured and reproduced, not theorised.
-        #
-        # The honest semantics: the stale-price gate is part of the
-        # schedule-aware machinery, and curfew_enabled=False turns that
-        # machinery off wholesale. Distinguishing "the underlying is shut"
-        # from "our feed died" REQUIRES the schedule; without it the two
-        # are the same observation.
+        # Freeze observation and schedule assessment are unconditional to
+        # provide ground truth for carried-session detection and single-market
+        # quietness regardless of whether inventory caps are enabled.
+        self._freeze.observe(now_s, oracles)
+        schedule_curfew = assess_curfew(
+            now_s, self._max_position_usd if self._curfew_enabled else 0.0,
+            frozen_oracle=self._freeze.frozen(now_s))
+
         if self._curfew_enabled:
-            self._freeze.observe(now_s, oracles)
-            curfew = assess_curfew(
-                now_s, self._max_position_usd,
-                frozen_oracle=self._freeze.frozen(now_s))
-            # [review] THE POSTURE STAGE COUNTS TOO, not just the cap
-            # stage. With no position limit configured, curfew.stage is
-            # pinned at UNSCHEDULED forever while posture now follows
-            # schedule_stage -- so CLOSED -> PREOPEN moved the PROFILE
-            # (full size to half, 1.0x spread to 1.6x) and this latch
-            # never noticed. decide() answers HOLD for a quote that is
-            # still fresh and in-ring, so a full-size overnight book sat
-            # live straight through the run-up to the bell at a size the
-            # new posture does not allow. Introduced by the fix that
-            # gave posture its own stage; the transition key has to
-            # cover both or they drift apart.
+            curfew = schedule_curfew
             stage_key = (curfew.stage, curfew.schedule_stage)
             if stage_key != self._curfew_stage_key:
                 _log.warning("permuto: inventory curfew %s -> %s: %s "
@@ -511,45 +613,34 @@ class QuoteRunner:
                              curfew.long_cap_usd, curfew.short_cap_usd,
                              self._max_position_usd)
                 # [review] RETRACT THE BOOK THE NEW STAGE NO LONGER ALLOWS.
-                # The size clamp below only shapes legs we are about to
-                # place; an ask resting from before the close stays live and
-                # takeable, and decide() answers HOLD for a quote that is
-                # still fresh and in-ring -- so without this the short
-                # prohibition never reached the order that mattered. Only
-                # latch the new stage once the retraction actually
-                # succeeded, so a failed cancel is retried next tick rather
-                # than silently skipped.
-                # [live 2026-08-30] DEFERRED, not done here: this runs
-                # before ensure_session(), so on the first tick after a
-                # restart the cancel always failed with "needs a session
-                # and none is held". It self-healed a tick later, but the
-                # retraction belongs after the session exists.
-                #
-                # [review] EXCEPT INTO EXIT. That transition tightens the
-                # CAPS but does not forbid anything already resting: the
-                # danger is the OPEN, not the close, and a two-sided pair
-                # keeps earning credit right up to the bell. Blanket
-                # retraction here cancelled the book EXIT is supposed to
-                # leave alone -- and did it before the profile was ever
-                # consulted, so `withdraw=False` could never take effect.
-                # The caps still bind; nothing that would GROW inventory
-                # gets placed. This only spares what is already there.
-                # [review] AND THAT INCLUDES EXIT. An exemption was tried
-                # here so EXIT could keep earning credit to the bell, and
-                # it does not survive the cap invariant: a pair placed
-                # early in RAMP can be ~$420 a side, while EXIT permits
-                # ~$300 long / $120 short, and RestingQuote records PRICES
-                # but not quantities -- so nothing here can prove a
-                # retained order fits the tightened caps. A fill during
-                # EXIT would then breach the cap and carry the excess into
-                # the overnight window, which is the exact failure the
-                # curfew exists to prevent. Fifteen minutes of forgone
-                # credit is the cheaper side of that trade.
                 self._curfew_retract_pending = True
             self._curfew = curfew
+        else:
+            self._curfew = None
 
         paused = bool(flags.get("trading_paused"))
         carried = bool(flags.get("carried") or flags.get("carried_session"))
+        curfew_stages = {schedule_curfew.stage, schedule_curfew.schedule_stage}
+        if Stage.CLOSED in curfew_stages or Stage.PREOPEN in curfew_stages:
+            # /info/meta keeps VOL markets "active" while their equity
+            # oracle is carried, and /info/oracle publishes no carried bit.
+            # The schedule/freeze state computed above is therefore the only
+            # production signal for the venue's 8x stressed-margin regime.
+            carried = True
+
+        venue_ring = flags.get("ring_pct")
+        if venue_ring is not None:
+            try:
+                v_ring = float(venue_ring)
+                if math.isfinite(v_ring) and 0.0 < v_ring <= VENUE_BAND_PCT:
+                    self._ring_pct = v_ring
+                else:
+                    _log.debug("permuto: ring_pct %r outside (0, %.1f]; retaining %.1f",
+                               venue_ring, VENUE_BAND_PCT, self._ring_pct)
+            except (TypeError, ValueError) as exc:
+                # Invalid ring_pct flag; retain current self._ring_pct
+                _log.debug("permuto: invalid ring_pct flag: %r, retaining %.1f (%s)",
+                           venue_ring, self._ring_pct, exc, exc_info=True)
 
         # The un-pause edge, computed here because the venue does not announce
         # it. Latched rather than consumed immediately: the tick that observes
@@ -565,15 +656,14 @@ class QuoteRunner:
         # [discord 2026-08-27] RENEWED THROUGH A PAUSE, deliberately.
         #
         # This used to be `if not paused`, and the contest begins with
-        # exactly the case that breaks: the sponsor resets balances on
-        # Sunday evening during a trading pause that un-pauses at the
-        # 09:30 ET open -- fourteen-odd hours in which the session would
-        # have expired unrenewed. The first tick after the open would
-        # then spend a full challenge/sign/auth round trip before it
-        # could place anything, at the exact moment every entrant
-        # reconnects at once, on a metric that only accrues while
-        # quoting. If that reauth failed we would be backing off through
-        # the open.
+        # exactly the case that breaks: the venue pauses before the contest
+        # open on Sunday evening and un-pauses at the 09:30 ET open --
+        # fourteen-odd hours in which the session would have expired
+        # unrenewed. The first tick after the open would then spend a full
+        # challenge/sign/auth round trip before it could place anything,
+        # at the exact moment every entrant reconnects at once, on a metric
+        # that only accrues while quoting. If that reauth failed we would
+        # be backing off through the open.
         #
         # Authentication is not a trading route, so it works while
         # trading is paused. The result changes nothing while paused --
@@ -763,6 +853,7 @@ class QuoteRunner:
                 ring_pct=self._ring_pct,
                 quote_when_carried=self._quote_when_carried,
                 one_sided_ok=one_sided_ok,
+                requote_at_pct=self._requote_at_pct.get(market),
             )
             results[market] = (call.action.value, call.reason)
             if call.action is LoopAction.QUOTE:
@@ -933,10 +1024,20 @@ class QuoteRunner:
             posture_stage = (scheduled
                              if scheduled not in (None, Stage.UNSCHEDULED)
                              else self._curfew.stage)
+        else:
+            scheduled = schedule_curfew.schedule_stage
+            posture_stage = (scheduled
+                             if scheduled not in (None, Stage.UNSCHEDULED)
+                             else schedule_curfew.stage)
         # Stage-level default; market-specific posture can tighten from here.
-        default_profile = profile_for(
-            posture_stage,
-            oracle_fresh=not self._freeze.frozen(now_s),
+        oracle_fresh_agg = not self._freeze.frozen(now_s)
+        default_profile = (
+            profile_for(
+                posture_stage,
+                oracle_fresh=oracle_fresh_agg,
+            )
+            if (self._curfew_enabled or not oracle_fresh_agg)
+            else uncurfewed_profile()
         )
         self._eff_half_spread = (self._half_spread_pct
                                  * default_profile.spread_mult)
@@ -973,10 +1074,13 @@ class QuoteRunner:
                 # treated as stale, or the loop refuses to quote anything
                 # until it has watched a second distinct value arrive.
                 fresh = not self._freeze.market_gone_quiet(market, now_s)
-            market_profile = profile_for(
-                posture_stage,
-                oracle_fresh=fresh,
-            )
+            if not fresh:
+                market_profile = profile_for(posture_stage, oracle_fresh=False)
+            else:
+                market_profile = (
+                    profile_for(posture_stage, oracle_fresh=True)
+                    if self._curfew_enabled else uncurfewed_profile()
+                )
             profile_by_market[market] = market_profile
             eff_half_spread_by_market[market] = (
                 self._half_spread_pct * market_profile.spread_mult
@@ -1310,6 +1414,14 @@ class QuoteRunner:
 
         legs = []
         to_cancel: list = []
+        bbo_resets: list = []
+        bbo_placements: set = set()
+        bbo_initial_prices: dict = {}
+        observed_books: dict = {}
+        bbo_reduce_placements: set = set()
+        start_bbo_tick = getattr(self._bbo_fetch, "start_tick", None)
+        if callable(start_bbo_tick):
+            start_bbo_tick()
 
         for market, (action, _) in results.items():
             if action != LoopAction.QUOTE.value:
@@ -1416,26 +1528,116 @@ class QuoteRunner:
             _tick = _effective_tick(spec.get("tick_size"))
             self._last_tick_frac[market] = (
                 _tick / max(float(oracle or 1e-12), 1e-12))
+            # [review] Capped against CURRENT headroom and the re-quote
+            # trigger, not applied raw. See _requote_safe_backoff: an offset
+            # learned under wider headroom is illegal after a fill raises
+            # skew, and one inside the ring but past the trigger is replaced
+            # on the next tick -- the churn the budget exists to stop.
+            _safe_backoff = _requote_safe_backoff(
+                self._ring_pct, eff_half_spread,
+                self._last_skew.get(market, 0.0),
+                self._last_tick_frac.get(market, 0.0))
+            _ring_backoff = headroom_pct(
+                self._ring_pct, eff_half_spread,
+                self._last_skew.get(market, 0.0),
+                self._last_tick_frac.get(market, 0.0))
+            _extra_offset = min(self._cross_backoff.offset_pct(market),
+                                _safe_backoff)
+            _bbo_prices = None
+            _observed_book = None
+            # [BBO 2026-09-02] Ask the book rather than guessing at it.
+            #
+            # cross_backoff.py states the venue "publishes no L2/orderbook/
+            # ticker route". It does -- GET /info/l2/{market} -- and the
+            # consequence of assuming otherwise was total: with bids parked
+            # at exactly +2.00% (the ring ceiling), the 0.25%-per-refusal
+            # controller saturated at its headroom and every ask was refused
+            # post-only, tick after tick, for the whole session. Zero
+            # depth-seconds banked on 2026-09-02 against a 300M gate.
+            #
+            # One observation answers what the controller could only
+            # approach, and -- more importantly -- distinguishes "retreat
+            # further" from "no placeable price exists", which a blind
+            # controller cannot do and so retries forever.
+            if self._bbo_fetch is not None:
+                _status, _observed, _observed_book = self._bbo_offset_pct(
+                    market, oracle, reference, _tick, eff_half_spread,
+                    _extra_offset, _ring_backoff)
+                if _observed_book is not None:
+                    observed_books[market] = _observed_book
+                if (_status == "reset"
+                        and risk.action is not RiskAction.REDUCE_ONLY):
+                    to_cancel.append(market)
+                    bbo_resets.append(market)
+                    results[market] = (
+                        "withdraw",
+                        "our own one-sided quote is blocking the missing "
+                        "side at the public BBO; cancelling once and "
+                        "rebuilding next tick")
+                    continue
+                if _status in ("shut", "reset"):
+                    # [review] SKIP ONLY WHEN THERE IS NOTHING ELSE TO DO.
+                    #
+                    # The first version of this returned unconditionally,
+                    # which deadlocked the account it was written to help.
+                    # A market that cannot earn depth can still need its
+                    # inventory worked off, and the reduce-only branch below
+                    # rests exactly one leg for that. Reducing a SHORT means
+                    # resting a BID -- the side the ring wall does not touch
+                    # -- so the leg that unpins us is placeable precisely
+                    # when the earning leg is not.
+                    #
+                    # Skipping both meant no fills, so inventory never fell,
+                    # so the skew never released the ring headroom, so the
+                    # ask stayed unreachable: a loop that could not exit
+                    # itself. Depth is min(bid, ask) and stays zero here
+                    # either way; the difference is whether we are getting
+                    # closer to earning again or standing still.
+                    if risk.action is not RiskAction.REDUCE_ONLY:
+                        if not self._resting.get(market, RestingQuote()).empty:
+                            to_cancel.append(market)
+                        results[market] = (
+                            "skip",
+                            "no tick-aligned price rests inside the %.1f%% "
+                            "ring on both sides, and no inventory to work "
+                            "off -- a leg here would be refused or earn "
+                            "nothing" % (self._ring_pct,))
+                        continue
+                    _log.info(
+                        "permuto: %s cannot earn depth (ring shut) but is "
+                        "REDUCE_ONLY -- resting the reducing leg anyway so "
+                        "inventory falls and the skew stops eating ring "
+                        "headroom.", market)
+                elif _status == "ok":
+                    _bbo_prices = _observed
+                    bbo_placements.add(market)
+                    bbo_initial_prices[market] = _observed
+            try:
+                _lot = float(spec.get("lot_size", 1.0) or 1.0)
+            except (TypeError, ValueError):
+                _lot = 1.0
+            if not math.isfinite(_lot) or _lot <= 0.0:
+                _lot = 1.0
             ladder = quote_ladder(
                 market, reference, depth_usd,
                 levels=1,
-                # [review] Capped against CURRENT headroom and the
-                # re-quote trigger, not applied raw. See
-                # _requote_safe_backoff: an offset learned under wider
-                # headroom is illegal after a fill raises skew, and one
-                # inside the ring but past the trigger is replaced on the
-                # next tick -- the churn the budget exists to stop.
-                first_offset_pct=(
-                    eff_half_spread
-                    + min(self._cross_backoff.offset_pct(market),
-                          _requote_safe_backoff(
-                              self._ring_pct, eff_half_spread,
-                              self._last_skew.get(market, 0.0),
-                              self._last_tick_frac.get(market, 0.0)))),
+                first_offset_pct=eff_half_spread + _extra_offset,
                 ring_pct=self._ring_pct,
                 tick_size=_tick,
-                lot_size=spec.get("lot_size", 1.0),
+                lot_size=_lot,
             )
+            if _bbo_prices is not None:
+                bid_price, ask_price = _bbo_prices
+                placed = []
+                for leg in ladder:
+                    price = (bid_price if leg.side is Side.BUY else ask_price)
+                    size = rescaled_size(
+                        leg.size, leg.price, price, _lot)
+                    if size > 0.0:
+                        placed.append(type(leg)(
+                            leg.market, leg.side, price, size,
+                            leg.reduce_only))
+                ladder = placed
             if risk.action is RiskAction.REDUCE_ONLY:
                 # [review] batch_upsert is keyed on (market, side), so
                 # omitting the risk-increasing side does not remove it -- the
@@ -1456,8 +1658,43 @@ class QuoteRunner:
                     )
                     if not shrinking:
                         continue
-                    leg = type(leg)(leg.market, leg.side, leg.price,
-                                    leg.size, True)
+                    leg_price = leg.price
+                    min_passive = None
+                    max_passive = None
+                    if _bbo_prices is None:
+                        book = _observed_book
+                        if book is None and self._bbo_fetch is not None:
+                            try:
+                                book = self._bbo_fetch(market)
+                            except Exception as exc:  # noqa: BLE001
+                                _log.debug("permuto: BBO fetch for reduce-only leg failed for %s: %s", market, exc)
+                                book = None
+                        if book is not None:
+                            observed_books[market] = book
+                            if leg.side is Side.SELL and book.best_bid is not None:
+                                min_passive = bbo_quantise(book.best_bid + _tick, _tick, up=True)
+                                if leg_price < min_passive:
+                                    leg_price = min_passive
+                            elif leg.side is Side.BUY and book.best_ask is not None:
+                                max_passive = bbo_quantise(book.best_ask - _tick, _tick, up=False)
+                                if leg_price > max_passive:
+                                    leg_price = max_passive
+                    if oracle and oracle > 0.0:
+                        band_lo = oracle * (1.0 - VENUE_BAND_PCT / 100.0)
+                        band_hi = oracle * (1.0 + VENUE_BAND_PCT / 100.0)
+                        if leg_price < band_lo - 1e-9 or leg_price > band_hi + 1e-9:
+                            results[market] = (
+                                "skip",
+                                "reduce-only leg outside legal venue band")
+                            continue
+                    leg_size = (rescaled_size(leg.size, leg.price, leg_price, _lot)
+                                if leg_price != leg.price else leg.size)
+                    if leg_size <= 0.0:
+                        continue
+                    leg = type(leg)(leg.market, leg.side, leg_price,
+                                    leg_size, True)
+                    if market in observed_books:
+                        bbo_reduce_placements.add(market)
                 # [CURFEW] Clamp the leg to the room left under its side's
                 # cap. A yes/no veto was not enough: the ladder is sized to
                 # target_depth_usd, so a leg permitted merely because it
@@ -1487,6 +1724,23 @@ class QuoteRunner:
                             % (self._band_guard.velocity(market),
                                oracle_age))
                         continue
+                    if leg.reduce_only:
+                        if leg.side is Side.SELL and min_passive is not None and clamped < min_passive:
+                            if min_passive <= oracle * (1.0 + VENUE_BAND_PCT / 100.0) + 1e-9:
+                                clamped = min_passive
+                            else:
+                                results[market] = (
+                                    "skip",
+                                    "reduce-only ask cannot clear book within venue band")
+                                continue
+                        elif leg.side is Side.BUY and max_passive is not None and clamped > max_passive:
+                            if max_passive >= oracle * (1.0 - VENUE_BAND_PCT / 100.0) - 1e-9:
+                                clamped = max_passive
+                            else:
+                                results[market] = (
+                                    "skip",
+                                    "reduce-only bid cannot clear book within venue band")
+                                continue
                     if clamped != leg.price:
                         leg = type(leg)(leg.market, leg.side, clamped,
                                         leg.size, leg.reduce_only)
@@ -1544,8 +1798,26 @@ class QuoteRunner:
             self._client.cancel_all(now_s, to_cancel)
             for market in to_cancel:
                 self._resting[market] = RestingQuote()
+                self._requote_at_pct.pop(market, None)
 
         if not legs:
+            holding = [
+                market for market, (action, _reason) in results.items()
+                if action == LoopAction.HOLD.value
+                and not self._resting.get(market, RestingQuote()).empty
+            ]
+            if holding:
+                return TickResult(
+                    "hold",
+                    "%d market(s) resting; no replacement legs needed"
+                    % len(holding),
+                    results)
+            if bbo_resets:
+                return TickResult(
+                    "withdraw",
+                    "cancelled a self-blocking one-sided quote; rebuilding "
+                    "against the external BBO next tick",
+                    results)
             # [review round 10] NOT "hold". hold means "the book is resting
             # and correct"; here risk refused every leg, and after a
             # reduce-only cancel the book may be EMPTY. MainWindow treats
@@ -1680,6 +1952,31 @@ class QuoteRunner:
 
                 price = quantise_toward(
                     out.price if out.changed else leg.price, ref, m_tick)
+                if leg.reduce_only and leg.market in observed_books:
+                    book = observed_books[leg.market]
+                    if leg.side is Side.SELL and book.best_bid is not None:
+                        min_p = bbo_quantise(book.best_bid + m_tick, m_tick, up=True)
+                        if price < min_p:
+                            if min_p <= ref * (1.0 + VENUE_BAND_PCT / 100.0) + 1e-9:
+                                price = min_p
+                            else:
+                                results[leg.market] = (
+                                    "skip",
+                                    "reduce-only ask cannot clear book within venue band")
+                                dropped.add(leg.market)
+                                continue
+                    elif leg.side is Side.BUY and book.best_ask is not None:
+                        max_p = bbo_quantise(book.best_ask - m_tick, m_tick, up=False)
+                        if price > max_p:
+                            if max_p >= ref * (1.0 - VENUE_BAND_PCT / 100.0) - 1e-9:
+                                price = max_p
+                            else:
+                                results[leg.market] = (
+                                    "skip",
+                                    "reduce-only bid cannot clear book within venue band")
+                                dropped.add(leg.market)
+                                continue
+
                 if price <= 0.0:
                     results[leg.market] = (
                         "skip", "no on-grid price inside the band")
@@ -1696,7 +1993,156 @@ class QuoteRunner:
                                     leg.reduce_only)
                 send_refs[leg.market] = ref
                 kept_legs.append(leg)
+            if dropped:
+                # Depth is min(bid, ask) per market. Once either side cannot
+                # be sent, its sibling is pure exposure earning zero; retain
+                # only legs from unaffected markets.
+                kept_legs = [leg for leg in kept_legs
+                             if leg.market not in dropped]
             return kept_legs, dropped
+
+        def _revalidate_bbo(pending, sources):
+            """Drop BBO-shaped markets invalidated by price adjustments or newer oracle."""
+            dropped = set()
+            for market in bbo_placements:
+                original = latest_oracle(oracles, None, market)
+                current = 0.0
+                for source in sources:
+                    current = latest_oracle(source, None, market)
+                    if current > 0.0:
+                        break
+                if current <= 0.0:
+                    current = original
+
+                market_legs = [leg for leg in pending
+                               if leg.market == market]
+                if not market_legs:
+                    continue
+
+                initial_prices = bbo_initial_prices.get(market)
+                prices_unchanged = (
+                    initial_prices is not None
+                    and all(
+                        leg.price == (initial_prices[0] if leg.side is Side.BUY else initial_prices[1])
+                        for leg in market_legs
+                    )
+                )
+
+                if current == original and prices_unchanged:
+                    continue
+
+                book = None
+                if current == original and market in observed_books:
+                    book = observed_books[market]
+                elif self._bbo_fetch is not None:
+                    try:
+                        book = self._bbo_fetch(market)
+                    except Exception as exc:  # noqa: BLE001
+                        _log.debug("permuto: final BBO fetch failed for %s: %s",
+                                   market, exc)
+                        book = None
+
+                if book is None:
+                    dropped.add(market)
+                    results[market] = (
+                        "skip",
+                        "BBO price altered or oracle moved after read, and the "
+                        "final book could not be read inside the tick budget")
+                    continue
+                raw_specs = flags.get("specs")
+                spec = (raw_specs.get(market, {})
+                        if isinstance(raw_specs, dict) else {})
+                tick_size = _effective_tick(spec.get("tick_size"))
+                if all(
+                    bbo_rests_and_earns(
+                        "bid" if leg.side is Side.BUY else "ask",
+                        leg.price, current, book,
+                        ring_pct=self._ring_pct, tick_size=tick_size)
+                    for leg in market_legs
+                ):
+                    continue
+                dropped.add(market)
+                results[market] = (
+                    "skip",
+                    "adjusted BBO leg or refreshed oracle no longer admits "
+                    "both legs inside the depth ring")
+                _log.info(
+                    "permuto: %s BBO placement invalidated (oracle %.6f -> %.6f); "
+                    "dropping stale pair and rebuilding next tick",
+                    market, original, current)
+
+            for market in bbo_reduce_placements:
+                if market in dropped:
+                    continue
+                original = latest_oracle(oracles, None, market)
+                current = 0.0
+                for source in sources:
+                    current = latest_oracle(source, None, market)
+                    if current > 0.0:
+                        break
+                if current <= 0.0:
+                    current = original
+
+                market_legs = [leg for leg in pending
+                               if leg.market == market]
+                if not market_legs:
+                    continue
+
+                book = None
+                if current == original and market in observed_books:
+                    book = observed_books[market]
+                elif self._bbo_fetch is not None:
+                    try:
+                        book = self._bbo_fetch(market)
+                    except Exception as exc:  # noqa: BLE001
+                        _log.debug("permuto: final BBO fetch failed for reduce-only %s: %s",
+                                   market, exc)
+                        book = None
+                if book is None and market in observed_books:
+                    book = observed_books[market]
+
+                if book is None:
+                    dropped.add(market)
+                    results[market] = (
+                        "skip",
+                        "final book could not be read for reduce-only leg revalidation")
+                    continue
+
+                raw_specs = flags.get("specs")
+                spec = (raw_specs.get(market, {})
+                        if isinstance(raw_specs, dict) else {})
+                tick_size = _effective_tick(spec.get("tick_size"))
+                eps = tick_size * 1e-4
+                valid = True
+                for leg in market_legs:
+                    if leg.side is Side.SELL:
+                        if book.best_bid is not None and leg.price <= book.best_bid + eps:
+                            valid = False
+                            break
+                        if leg.price > current * (1.0 + VENUE_BAND_PCT / 100.0) + 1e-9:
+                            valid = False
+                            break
+                    elif leg.side is Side.BUY:
+                        if book.best_ask is not None and leg.price >= book.best_ask - eps:
+                            valid = False
+                            break
+                        if leg.price < current * (1.0 - VENUE_BAND_PCT / 100.0) - 1e-9:
+                            valid = False
+                            break
+
+                if not valid:
+                    dropped.add(market)
+                    results[market] = (
+                        "skip",
+                        "reduce-only leg would cross the refreshed book or exceed venue band")
+                    _log.info(
+                        "permuto: %s reduce-only leg invalidated against refreshed book or oracle; dropping leg",
+                        market)
+
+            if not dropped:
+                return list(pending), dropped
+            return ([leg for leg in pending if leg.market not in dropped],
+                    dropped)
 
         def _retract(markets, note):
             # True when the book is safe to build on. A failed retraction
@@ -1716,6 +2162,9 @@ class QuoteRunner:
         if self._oracle_fetch is not None and legs:
             fresh_oracles, _ = _fetch_refs()
             legs, preflight_cancel = _prepare(legs, (fresh_oracles, oracles))
+            legs, stale_bbo = _revalidate_bbo(
+                legs, (fresh_oracles, oracles))
+            preflight_cancel.update(stale_bbo)
 
             if preflight_cancel:
                 if not _retract(preflight_cancel, "first pass"):
@@ -1740,6 +2189,9 @@ class QuoteRunner:
                     # Newest first: second read, first pre-send read, tick.
                     legs, dropped2 = _prepare(
                         legs, (again, fresh_oracles, oracles))
+                    legs, stale_bbo2 = _revalidate_bbo(
+                        legs, (again, fresh_oracles, oracles))
+                    dropped2.update(stale_bbo2)
                     if dropped2 and not _retract(dropped2, "second pass"):
                         return TickResult(
                             "skip",
@@ -2033,6 +2485,28 @@ class QuoteRunner:
             else:
                 current = RestingQuote(current.bid_price, leg.price)
             self._resting[leg.market] = current
+
+        default_trigger = self._ring_pct * REQUOTE_AT_RING_FRACTION
+        for market in {leg.market for leg in legs}:
+            if market not in bbo_placements:
+                self._requote_at_pct.pop(market, None)
+                continue
+            ref = float(send_oracles.get(market) or 0.0)
+            market_legs = [leg for leg in legs if leg.market == market]
+            if ref <= 0.0 or not market_legs:
+                self._requote_at_pct.pop(market, None)
+                continue
+            widest = max(abs(leg.price / ref - 1.0) * 100.0
+                         for leg in market_legs)
+            if (default_trigger < widest
+                    and widest <= self._ring_pct + 1e-9):
+                widest = min(widest, self._ring_pct)
+                self._requote_at_pct[market] = min(
+                    self._ring_pct,
+                    widest + (self._ring_pct - widest) * 0.5,
+                )
+            else:
+                self._requote_at_pct.pop(market, None)
 
         self._reopen_pending = False
         return TickResult("quote", "%d legs" % len(legs), results)

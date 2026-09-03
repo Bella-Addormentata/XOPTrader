@@ -48,7 +48,7 @@ from dataclasses import dataclass
 
 from .curfew import Stage
 
-__all__ = ["Profile", "profile_for", "SESSION_SPREAD_MULT",
+__all__ = ["Profile", "profile_for", "uncurfewed_profile", "SESSION_SPREAD_MULT",
            "CLOSED_SPREAD_MULT"]
 
 #: Open hours: quote WIDER than the configured spread. Depth credit is flat
@@ -93,7 +93,9 @@ _DEPTH = {
     Stage.PREOPEN: 0.5,
     # The oracle may not have printed yet -- see profile_for.
     Stage.SETTLING: 0.25,
-    # Off the table entirely: behave as an ordinary session.
+    # The finite schedule abstains, but a moving oracle still means an ordinary
+    # live session. Curfew-disabled full-depth quoting is a separate posture;
+    # sharing this value doubled risk after the schedule table ended.
     Stage.UNSCHEDULED: 0.5,
 }
 
@@ -126,6 +128,17 @@ class Profile:
     #: left as a trap.
     withdraw: bool
     reason: str
+
+
+def uncurfewed_profile() -> Profile:
+    """Full-depth posture explicitly requested by disabling the curfew."""
+    return Profile(
+        quote=True,
+        spread_mult=SESSION_SPREAD_MULT,
+        depth_mult=1.0,
+        withdraw=False,
+        reason="inventory curfew disabled: quote the configured full depth",
+    )
 
 
 def profile_for(stage: Stage, *, oracle_fresh: bool = True) -> Profile:

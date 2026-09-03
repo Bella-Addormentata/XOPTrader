@@ -2778,6 +2778,7 @@ class MainWindow(QMainWindow):
             kwargs = {
                 "target_depth_usd": page._target_depth_usd,
                 "max_position_usd": page._max_position_usd,
+                "ring_pct": getattr(page, "_ring_pct", 2.0),
             }
         # [CURFEW] Read fresh per session, so toggling the setting takes
         # effect on the next arm rather than only on a GUI restart.

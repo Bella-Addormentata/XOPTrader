@@ -146,6 +146,21 @@ def test_drift_is_checked_on_both_sides():
     assert decide(view(), drifted).action is LoopAction.QUOTE
 
 
+def test_a_bbo_quote_at_the_ring_edge_holds_until_it_moves_outside():
+    edge = RestingQuote(
+        bid_price=ORACLE * 0.98,
+        ask_price=ORACLE * 1.02,
+    )
+    assert decide(view(), edge, requote_at_pct=2.0).action is LoopAction.HOLD
+
+    outside = RestingQuote(
+        bid_price=ORACLE * 0.98,
+        ask_price=ORACLE * 1.0201,
+    )
+    assert decide(
+        view(), outside, requote_at_pct=2.0).action is LoopAction.QUOTE
+
+
 def test_the_trigger_sits_inside_the_ring_not_on_it():
     assert 0.0 < REQUOTE_AT_RING_FRACTION < 1.0
 

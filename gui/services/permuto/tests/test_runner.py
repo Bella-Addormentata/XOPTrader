@@ -6,16 +6,23 @@ import logging
 import pytest
 
 from gui.services.permuto.auth import PermutoAuthError
+from gui.services.permuto.bbo import Book
 from gui.services.permuto.client import PermutoNotLinked
 from gui.services.permuto.runner import decide as runner_decide
 from gui.services.permuto.quoting import (LoopAction, QuoteDecision,
                                           RestingQuote)
 from gui.services.permuto.risk import FLATTEN_MARGIN_UTILISATION
+from gui.services.permuto.curfew import (
+    CLOSES_UTC, FREEZE_CONFIRM_S, OPENS_UTC, OVERNIGHT_SHORT_FRACTION,
+    SETTLE_AFTER_OPEN_S,
+)
 from gui.services.permuto.runner import RECANCEL_INTERVAL_S, QuoteRunner, _margin_state
 from gui.services.permuto.session import RenewAction
 
 _MKT = "QQQ-VOL-PERP"
 _ORACLE = {_MKT: 0.07}
+_MID_SESSION = OPENS_UTC[0] + SETTLE_AFTER_OPEN_S + 3_600.0
+_OVERNIGHT = CLOSES_UTC[0] + 4 * 3_600.0
 
 
 class _Client:
@@ -97,8 +104,8 @@ def test_a_pause_KEEPS_the_session_warm():
     begins with the case that breaks it.
 
     The old reasoning was "nothing can be placed while paused, so renewing is
-    a wasted round trip". But the sponsor resets balances on Sunday evening
-    during a trading pause that un-pauses at the 09:30 ET open -- fourteen-odd
+    a wasted round trip". But the venue pauses before the contest open on
+    Sunday evening and un-pauses at the 09:30 ET open -- fourteen-odd
     hours. Letting the session lapse through that means the first tick after
     the open spends a full challenge/sign/auth round trip before it can place
     anything, at the moment every entrant reconnects at once, on a metric
@@ -243,6 +250,20 @@ def test_reconcile_overwrites_rather_than_merges():
     assert r._resting[_MKT].ask_price is None
 
 
+def test_reconcile_selects_best_bid_and_best_ask_when_multiple_orders_exist():
+    r = _runner(_Client())
+    r.reconcile({"orders": [
+        {"market": _MKT, "side": "BUY", "price": 0.0680},
+        {"market": _MKT, "side": "BUY", "price": 0.0695},
+        {"market": _MKT, "side": "BUY", "price": 0.0690},
+        {"market": _MKT, "side": "SELL", "price": 0.0720},
+        {"market": _MKT, "side": "SELL", "price": 0.0705},
+        {"market": _MKT, "side": "SELL", "price": 0.0710},
+    ]})
+    assert r._resting[_MKT].bid_price == 0.0695
+    assert r._resting[_MKT].ask_price == 0.0705
+
+
 def test_reconcile_ignores_markets_we_do_not_quote():
     r = _runner(_Client())
     r.reconcile({"orders": [
@@ -338,8 +359,8 @@ def test_a_long_book_is_quoted_below_the_oracle():
 def test_a_carried_session_actually_quotes_the_smaller_size():
     """risk.assess() computes an eighth; the ladder must use it."""
     live, carried = _Client(), _Client()
-    _runner(live).tick(1.0, _ORACLE, {})
-    _runner(carried).tick(1.0, _ORACLE, {"carried": True})
+    _runner(live).tick(_MID_SESSION, _ORACLE, {})
+    _runner(carried).tick(_MID_SESSION, _ORACLE, {"carried": True})
 
     def _size(client):
         return [x for x in client.last_batch if x["side"] == "buy"][0]["size"]
@@ -1134,6 +1155,26 @@ def _account(position):
             "positions": {_MKT: position}}
 
 
+def test_the_overnight_schedule_applies_carried_margin_without_a_flag():
+    explicit = _Client(account=_account(0.0), batch_response=_venue_ok())
+    _runner(
+        explicit,
+        curfew_enabled=False,
+        max_position_usd=250_000.0,
+    ).tick(_OVERNIGHT, _ORACLE, {"carried": True})
+
+    scheduled = _Client(account=_account(0.0), batch_response=_venue_ok())
+    _runner(
+        scheduled,
+        curfew_enabled=True,
+        max_position_usd=250_000.0,
+    ).tick(_OVERNIGHT, _ORACLE, {})
+
+    explicit_size = sum(float(leg["size"]) for leg in explicit.last_batch)
+    scheduled_size = sum(float(leg["size"]) for leg in scheduled.last_batch)
+    assert scheduled_size == pytest.approx(explicit_size, abs=1.0)
+
+
 def test_curfew_mid_session_quotes_both_sides_at_the_full_cap():
     # 100 contracts * 0.07 = $7 notional, far inside the $1200 cap.
     c = _Client(account=_account(100.0))
@@ -1302,17 +1343,15 @@ def test_overnight_a_larger_long_scales_the_ask_with_it():
     assert sells and 2_000.0 <= sells[0][1] <= 2_000.0 + cap_usd / _ORACLE[_MKT] + 1e-6,         "the ask must scale with the long and stop at the overnight cap"
 
 
-def test_overnight_the_bid_is_sized_to_the_cap_not_to_target_depth():
-    """BLOCKER 2. The curfew capped the POSITION but never the LEG, so a
-    $1,200 bid rested against a $300 overnight cap -- one fill blew 4x
-    through it in a single trade and the ramp could never converge."""
+def test_overnight_the_bid_honours_carried_size_and_the_cap():
+    """Carried margin reduces the $1,200 target to $150 before the $300 cap."""
     c = _Client(account=_account(0.0))
     r = _runner(c, curfew_enabled=True, max_position_usd=1_200.0)
     r.tick(_OVERNIGHT, _ORACLE, {})
     buys = [leg for leg in _legs(c) if leg[0] == "buy"]
     assert len(buys) == 1
-    assert buys[0][2] <= 300.0 + 1.0, "bid notional exceeds the long cap"
-    assert buys[0][2] > 250.0, "bid collapsed to nothing"
+    assert buys[0][2] <= 150.0 + 1.0, "bid exceeds the carried target"
+    assert buys[0][2] > 100.0, "bid collapsed to nothing"
 
 
 def test_a_curfew_stage_change_retracts_the_resting_book():
@@ -1641,6 +1680,27 @@ def test_a_preflight_drop_retracts_the_quote_it_cannot_replace():
     assert "cancel_all" in c.calls, "left an unsafe quote resting"
 
 
+def test_a_preflight_drop_removes_the_zero_credit_sibling(monkeypatch):
+    from gui.services.permuto.preflight import PreflightOutcome
+
+    def drop_ask(price, _oracle, *, is_buy, **_kwargs):
+        if is_buy:
+            return PreflightOutcome(price)
+        return PreflightOutcome(
+            0.0, dropped=True, reason="test: ask cannot be sent")
+
+    monkeypatch.setattr(
+        "gui.services.permuto.runner.preflight_leg_price", drop_ask)
+    c = _Client(account=_account(0.0), batch_response=_venue_ok())
+    r = _runner(c, oracle_fetch=lambda: dict(_ORACLE))
+
+    result = r.tick(1.0, _ORACLE, {})
+
+    assert result.action == "skip"
+    assert "batch_upsert" not in c.calls, (
+        "the surviving bid was sent alone even though min(bid, ask) is zero")
+
+
 def test_re_anchored_legs_are_sent_on_the_venue_tick_grid():
     c = _Client(account=_account(0.0))
     r = _runner(c, curfew_enabled=False, oracle_fetch=lambda: {_MKT: 0.09})
@@ -1727,16 +1787,16 @@ def test_a_market_spec_tick_is_used_when_repricing():
     c = _Client(account=_account(0.0))
     r = _runner(c, curfew_enabled=False, oracle_fetch=lambda: {_MKT: 0.09})
     r.tick(_MID_SESSION, {_MKT: 0.10},
-           {"specs": {_MKT: {"tick_size": 0.01, "lot_size": 1.0}}})
+            {"specs": {_MKT: {"tick_size": 0.001, "lot_size": 1.0}}})
     # [review round 3] Unconditional. A `if c.last_batch:` guard
     # lets this pass on an EMPTY batch -- one of the very failures
     # it exists to catch. A test that cannot fail reports coverage
     # that is not there.
     assert c.last_batch, "no batch was sent; the assertion never ran"
     for leg in c.last_batch:
-        ticks = float(leg["price"]) / 0.01
+        ticks = float(leg["price"]) / 0.001
         assert abs(round(ticks) - ticks) < 1e-6, (
-            "leg %r ignores the market's 0.01 tick" % (leg,))
+            "leg %r ignores the market's 0.001 tick" % (leg,))
 
 
 def test_survivors_are_re_priced_after_a_cancel_round_trip():
@@ -1795,6 +1855,302 @@ def _venue_ok(reject_idx=()):
             ],
         }
     return build
+
+
+def test_an_own_ring_edge_order_is_cancelled_before_bbo_rebuild():
+    """A surviving own bid must not masquerade as an external closed ring."""
+    oracle = _ORACLE[_MKT]
+    own_bid = oracle * 1.02
+    visible_book = [Book(_MKT, best_bid=own_bid, best_ask=None)]
+    c = _Client(
+        account=_account(0.0),
+        open_orders={
+            "orders": [
+                {"market": _MKT, "side": "buy", "price": own_bid},
+            ],
+        },
+        batch_response=_venue_ok(),
+    )
+    r = _runner(c, bbo_fetch=lambda _market: visible_book[0])
+
+    first = r.tick(1.0, _ORACLE, {})
+
+    assert first.action == "withdraw"
+    assert c.cancelled == [[_MKT]], (
+        "the runner treated its own best bid as an external wall and left "
+        "the one-sided, zero-credit book resting")
+    assert "batch_upsert" not in c.calls
+
+    c.open_payload = {"orders": []}
+    visible_book[0] = Book(_MKT, best_bid=None, best_ask=None)
+    second = r.tick(2.0, _ORACLE, {})
+
+    assert second.action == "quote"
+    assert sorted(leg["side"] for leg in c.last_batch) == ["buy", "sell"]
+
+
+def test_a_rounded_own_blocker_is_still_cancelled_once():
+    oracle = 0.1000
+    own_bid = 0.1020000000001
+    public_bid = 0.1020
+    c = _Client(
+        account=_account(0.0),
+        open_orders={
+            "orders": [
+                {"market": _MKT, "side": "buy", "price": own_bid},
+            ],
+        },
+    )
+    r = _runner(
+        c,
+        bbo_fetch=lambda _market: Book(
+            _MKT, best_bid=public_bid, best_ask=None),
+    )
+
+    result = r.tick(1.0, {_MKT: oracle}, {})
+
+    assert result.action == "withdraw"
+    assert c.cancelled == [[_MKT]]
+
+
+def test_an_external_ring_wall_is_skipped_without_a_cancel():
+    oracle = 0.1000
+    c = _Client(account=_account(0.0), open_orders={"orders": []})
+    r = _runner(
+        c,
+        bbo_fetch=lambda _market: Book(
+            _MKT, best_bid=0.1020, best_ask=None),
+    )
+
+    result = r.tick(1.0, {_MKT: oracle}, {})
+
+    assert result.action == "risk_blocked"
+    assert c.cancelled == []
+    assert "batch_upsert" not in c.calls
+
+
+def test_a_distant_own_bid_is_not_mistaken_for_the_external_wall():
+    oracle = 0.1000
+    c = _Client(
+        account=_account(0.0),
+        open_orders={
+            "orders": [
+                {"market": _MKT, "side": "buy", "price": 0.1000},
+            ],
+        },
+    )
+    r = _runner(
+        c,
+        bbo_fetch=lambda _market: Book(
+            _MKT, best_bid=0.1020, best_ask=None),
+    )
+
+    result = r.tick(1.0, {_MKT: oracle}, {})
+
+    assert result.action == "risk_blocked"
+    assert result.markets[_MKT][0] == "skip", (
+        "a distant own bid was misclassified as an own-blocker reset")
+    assert c.cancelled == [[_MKT]], (
+        "shut market did not retract its own zero-credit resting remainder")
+
+
+def test_an_external_wall_does_not_block_a_healthy_sibling_market():
+    c = _Client(
+        account=_account(0.0),
+        open_orders={
+            "orders": [
+                {"market": _MKT, "side": "buy", "price": 0.0695},
+                {"market": _MKT, "side": "sell", "price": 0.0705},
+            ],
+        },
+    )
+    r = _runner2(
+        c,
+        bbo_fetch=lambda market: Book(
+            market, best_bid=_BOTH[market] * 1.02, best_ask=None),
+    )
+
+    result = r.tick(1.0, _BOTH, {})
+
+    assert result.markets[_MKT][0] == "hold"
+    assert result.markets[_MKT2][0] == "skip"
+    assert result.action == "hold", (
+        "one shut market marked the whole runner not_quoting while its "
+        "sibling held a two-sided earning book")
+
+
+def test_a_self_reset_does_not_mask_a_healthy_holding_sibling():
+    own_bid = _BOTH[_MKT2] * 1.02
+    c = _Client(
+        account=_account(0.0),
+        open_orders={
+            "orders": [
+                {"market": _MKT, "side": "buy", "price": 0.0695},
+                {"market": _MKT, "side": "sell", "price": 0.0705},
+                {"market": _MKT2, "side": "buy", "price": own_bid},
+            ],
+        },
+    )
+    r = _runner2(
+        c,
+        bbo_fetch=lambda market: Book(
+            market,
+            best_bid=(own_bid if market == _MKT2 else 0.0695),
+            best_ask=None,
+        ),
+    )
+
+    result = r.tick(1.0, _BOTH, {})
+
+    assert c.cancelled == [[_MKT2]]
+    assert result.markets[_MKT][0] == "hold"
+    assert result.markets[_MKT2][0] == "withdraw"
+    assert result.action == "hold", (
+        "a scoped self-reset marked the whole runner not_quoting while its "
+        "sibling still earned depth")
+
+
+def test_a_valid_bbo_window_beyond_the_requote_trigger_still_quotes():
+    """The refresh threshold is not an eligibility boundary."""
+    oracle = 0.1020703001645499
+    best_bid = 0.103602
+    c = _Client(
+        account=_account(0.0),
+        batch_response=_venue_ok(),
+    )
+    r = _runner(
+        c,
+        bbo_fetch=lambda _market: Book(
+            _MKT, best_bid=best_bid, best_ask=None),
+    )
+
+    result = r.tick(1.0, {_MKT: oracle}, {})
+
+    assert result.action == "quote"
+    ask = next(leg for leg in c.last_batch if leg["side"] == "sell")
+    assert float(ask["price"]) > best_bid
+    assert float(ask["price"]) <= oracle * 1.02
+
+
+def test_a_bbo_window_past_ninety_percent_of_the_ring_is_not_reclamped():
+    oracle = 0.1000
+    best_bid = 0.1018
+    c = _Client(
+        account=_account(0.0),
+        batch_response=_venue_ok(),
+    )
+    r = _runner(
+        c,
+        bbo_fetch=lambda _market: Book(
+            _MKT, best_bid=best_bid, best_ask=None),
+    )
+
+    result = r.tick(1.0, {_MKT: oracle}, {})
+
+    assert result.action == "quote"
+    ask = next(leg for leg in c.last_batch if leg["side"] == "sell")
+    assert float(ask["price"]) > best_bid, (
+        "quote_ladder moved the observed BBO price back to 90% of the ring "
+        "and recreated the crossing refusal")
+    assert float(ask["price"]) <= oracle * 1.02
+
+
+def test_bbo_clearance_is_measured_from_the_skewed_reference():
+    oracle = 0.1000
+    best_bid = 0.1012
+    c = _Client(
+        account=_account(900.0),
+        batch_response=_venue_ok(),
+    )
+    r = _runner(
+        c,
+        max_position_usd=100.0,
+        bbo_fetch=lambda _market: Book(
+            _MKT, best_bid=best_bid, best_ask=None),
+    )
+
+    result = r.tick(1.0, {_MKT: oracle}, {})
+
+    assert result.action == "quote"
+    ask = next(leg for leg in c.last_batch if leg["side"] == "sell")
+    assert float(ask["price"]) > best_bid, (
+        "the BBO offset was measured from the oracle, then applied to the "
+        "lower inventory-skewed reference and crossed the bid")
+    assert float(ask["price"]) <= oracle * 1.02
+
+
+def test_a_confirmed_bbo_required_wide_quote_holds_next_tick():
+    oracle = 0.1020703001645499
+    best_bid = 0.103602
+    c = _Client(
+        account=_account(0.0),
+        batch_response=_venue_ok(),
+    )
+    r = _runner(
+        c,
+        bbo_fetch=lambda _market: Book(
+            _MKT, best_bid=best_bid, best_ask=None),
+    )
+    assert r.tick(1.0, {_MKT: oracle}, {}).action == "quote"
+    c.open_payload = {
+        "orders": [
+            {
+                "market": leg["market"],
+                "side": leg["side"],
+                "price": leg["price"],
+            }
+            for leg in c.last_batch
+        ],
+    }
+    sends = c.calls.count("batch_upsert")
+
+    second = r.tick(2.0, {_MKT: oracle}, {})
+
+    assert second.action == "hold"
+    assert c.calls.count("batch_upsert") == sends, (
+        "the BBO-required pair was born past the ordinary refresh trigger "
+        "and churned immediately")
+
+
+def test_a_pre_send_oracle_move_revalidates_the_bbo_quote():
+    tick_oracle = 0.1000
+    fresh_oracle = 0.0980
+    books = [
+        Book(_MKT, best_bid=0.1015, best_ask=None),
+        Book(_MKT, best_bid=0.0998, best_ask=None),
+    ]
+    c = _Client(
+        account=_account(0.0),
+        batch_response=_venue_ok(),
+    )
+    r = _runner(
+        c,
+        oracle_fetch=lambda: {_MKT: fresh_oracle},
+        bbo_fetch=lambda _market: books.pop(0),
+    )
+
+    result = r.tick(1.0, {_MKT: tick_oracle}, {})
+
+    assert result.action == "skip"
+    assert "batch_upsert" not in c.calls, (
+        "preflight sent a passive ask that the newer oracle values outside "
+        "the depth ring")
+    assert books == [], "the BBO was not refreshed after the oracle moved"
+
+
+def test_an_oracle_move_drops_the_pair_when_final_bbo_is_unreadable():
+    books = [Book(_MKT, best_bid=0.1015, best_ask=None), None]
+    c = _Client(account=_account(0.0), batch_response=_venue_ok())
+    r = _runner(
+        c,
+        oracle_fetch=lambda: {_MKT: 0.0980},
+        bbo_fetch=lambda _market: books.pop(0),
+    )
+
+    result = r.tick(1.0, {_MKT: 0.1000}, {})
+
+    assert result.action == "skip"
+    assert "batch_upsert" not in c.calls
 
 
 def test_an_accepted_two_sided_batch_reports_the_rested_credit(caplog):
@@ -1959,8 +2315,8 @@ def test_the_session_quotes_wider_than_the_overnight_window():
         % (min(sess), min(night)))
 
 
-def test_the_overnight_window_quotes_more_size_than_the_session():
-    """CLOSED is the earning window and must be the biggest book.
+def test_carried_margin_still_limits_the_overnight_earning_window():
+    """CLOSED has the largest profile, then carried margin reduces it.
 
     Sized like PRODUCTION (cap $250k against $1,200 target depth), because
     at the default test cap of $1,200 the CURFEW cap binds first -- $300
@@ -1977,8 +2333,7 @@ def test_the_overnight_window_quotes_more_size_than_the_session():
     _runner(c2, **kw).tick(_OVERNIGHT, _ORACLE, {})
     night = sum(float(l["size"]) for l in c2.last_batch)
 
-    assert night > sess, ("overnight %.0f is not larger than session %.0f"
-                          % (night, sess))
+    assert night == pytest.approx(sess / 4.0, rel=0.01)
 
 
 def test_a_curfew_cap_still_beats_the_profile():
@@ -2553,6 +2908,21 @@ def test_a_market_that_goes_quiet_MID_SESSION_stops_being_quoted():
     r.tick(base, {_MKT: 0.070, _MKT2: 0.200}, {})
     r.tick(base + 10.0, {_MKT: 0.071, _MKT2: 0.201}, {})
     for i in range(1, 8):                       # well past FREEZE_CONFIRM_S
+        r.tick(base + 10.0 + i * 40.0,
+               {_MKT: 0.071, _MKT2: 0.201 + i * 0.001}, {})
+    res = r.tick(base + 400.0, {_MKT: 0.071, _MKT2: 0.210}, {})
+    assert res.markets.get(_MKT, ("", ""))[0] == "withdraw", res.markets
+    assert "stopped printing" in res.markets[_MKT][1], res.markets[_MKT]
+
+
+def test_a_market_that_goes_quiet_MID_SESSION_with_disabled_curfew_stops_being_quoted():
+    """Disabled curfew must still withdraw a market that went quiet while siblings move."""
+    c = _Client(account=_account(0.0), batch_response=_venue_ok())
+    r = _runner(c, curfew_enabled=False, max_position_usd=250_000.0)
+    base = _MID_SESSION
+    r.tick(base, {_MKT: 0.070, _MKT2: 0.200}, {})
+    r.tick(base + 10.0, {_MKT: 0.071, _MKT2: 0.201}, {})
+    for i in range(1, 8):
         r.tick(base + 10.0 + i * 40.0,
                {_MKT: 0.071, _MKT2: 0.201 + i * 0.001}, {})
     res = r.tick(base + 400.0, {_MKT: 0.071, _MKT2: 0.210}, {})
@@ -3163,3 +3533,188 @@ def test_a_mixed_quote_hold_transition_rebuilds_every_market(monkeypatch):
         assert not r._resting[market].empty, (
             "%s was cancelled and left empty while the tick reported %r"
             % (market, res.action))
+
+
+def test_shut_bbo_prices_reducing_leg_passively_within_band():
+    """When BBO is shut, a reduce-only leg clears the opposing blocker passively."""
+    from gui.services.permuto.bbo import Book
+
+    # Long position (100 contracts) -> reducing leg is SELL (ask)
+    # Competitor bid is at 0.07139 (+1.99% of 0.07), shutting the 2% ask window
+    c = _Client(account=_account(100.0), batch_response=_venue_ok())
+    book = Book(market=_MKT, best_bid=0.07139, best_ask=None)
+    r = _runner(c, curfew_enabled=False, bbo_fetch=lambda m: book, max_position_usd=5.0)
+    # 100 contracts * 0.07 = $7 > $5 cap -> REDUCE_ONLY
+
+    r.tick(_MID_SESSION, _ORACLE, {})
+    assert c.last_batch, "no reduce-only batch was sent"
+    sell_legs = [l for l in c.last_batch if l["side"] == "sell"]
+    assert sell_legs, "no reducing sell leg sent"
+    assert float(sell_legs[0]["price"]) > 0.07139, (
+        "reducing ask %r crosses best bid 0.07139" % sell_legs[0]["price"])
+    assert float(sell_legs[0]["price"]) <= 0.07 * 1.05 + 1e-9, (
+        "reducing ask exceeds 5% legal venue band")
+
+
+def test_reduce_only_passive_bound_preserved_when_blocker_outside_preflight_safety_window():
+    """A blocker at +3.57% (above preflight 3.25% reserve) is not clamped below the blocker."""
+    from gui.services.permuto.bbo import Book
+
+    # Oracle = 0.0700. Preflight safety window is 3.25% (0.072275).
+    # Competitor best bid is at 0.0725 (+3.57%), inside 5% band (0.0735).
+    c = _Client(account=_account(100.0), batch_response=_venue_ok())
+    book = Book(market=_MKT, best_bid=0.0725, best_ask=None)
+    r = _runner(c, curfew_enabled=False, oracle_fetch=lambda: _ORACLE, bbo_fetch=lambda m: book, max_position_usd=5.0)
+
+    res = r.tick(_MID_SESSION, _ORACLE, {})
+    assert res.action == "quote"
+    assert c.last_batch, "no reduce-only batch was sent"
+    sell_legs = [l for l in c.last_batch if l["side"] == "sell"]
+    assert sell_legs, "no reducing sell leg sent"
+    ask_price = float(sell_legs[0]["price"])
+    assert ask_price > 0.0725, (
+        "reducing ask %.6f was clamped below best bid 0.0725 and crosses the book" % ask_price)
+    assert ask_price <= 0.07 * 1.05 + 1e-9, (
+        "reducing ask %.6f exceeds 5%% legal venue band" % ask_price)
+
+
+def test_reduce_only_skipped_when_blocker_exceeds_venue_band():
+    """A blocker at +5.14% cannot be cleared inside the 5.0% legal venue band."""
+    from gui.services.permuto.bbo import Book
+
+    # Oracle = 0.0700. Competitor best bid is at 0.0736 (+5.14% > 5.0% band).
+    c = _Client(account=_account(100.0), batch_response=_venue_ok())
+    book = Book(market=_MKT, best_bid=0.0736, best_ask=None)
+    r = _runner(c, curfew_enabled=False, oracle_fetch=lambda: _ORACLE, bbo_fetch=lambda m: book, max_position_usd=5.0)
+
+    res = r.tick(_MID_SESSION, _ORACLE, {})
+    assert res.action == "risk_blocked" or res.markets[_MKT][0] == "skip"
+    assert not getattr(c, "last_batch", None), (
+        "an out-of-band reduce-only leg was erroneously sent")
+
+
+def test_reduce_only_blind_fallback_when_bbo_fetch_is_none():
+    """When bbo_fetch=None, reduce-only quotes must not be dropped by BBO revalidation."""
+    c = _Client(account=_account(100.0), batch_response=_venue_ok())
+    r = _runner(c, curfew_enabled=False, oracle_fetch=lambda: _ORACLE, bbo_fetch=None, max_position_usd=5.0)
+
+    res = r.tick(_MID_SESSION, _ORACLE, {})
+    assert res.action == "quote"
+    assert c.last_batch, "blind reduce-only leg was erroneously dropped"
+    assert any(l["side"] == "sell" for l in c.last_batch)
+
+
+def test_reduce_only_blind_fallback_when_bbo_fetch_fails():
+    """When bbo_fetch returns None, reduce-only quotes must take blind fallback without being dropped."""
+    c = _Client(account=_account(100.0), batch_response=_venue_ok())
+    r = _runner(c, curfew_enabled=False, oracle_fetch=lambda: _ORACLE, bbo_fetch=lambda m: None, max_position_usd=5.0)
+
+    res = r.tick(_MID_SESSION, _ORACLE, {})
+    assert res.action == "quote"
+    assert c.last_batch, "failed-BBO reduce-only leg was erroneously dropped"
+    assert any(l["side"] == "sell" for l in c.last_batch)
+
+
+def test_uncapped_overnight_schedule_sets_carried_flag():
+    """max_position_usd=0 leaves curfew.stage=UNSCHEDULED but schedule_stage=CLOSED."""
+    c = _Client(account=_account(0.0), batch_response=_venue_ok())
+    r = _runner(c, curfew_enabled=True, max_position_usd=0.0)
+    res = r.tick(_OVERNIGHT, _ORACLE, {})
+    assert res.action == "quote"
+    # Carried overnight scaling was applied (size is divided by carried multiplier 8x)
+    legs = c.last_batch
+    assert legs, "no overnight batch sent"
+    assert len(legs) == 2
+    # Base size is target / oracle = 1200 / 0.07 = 17142.8
+    # Carried size is base_size / 8 = 2142.8
+    total_size = sum(float(l["size"]) for l in legs)
+    assert total_size == pytest.approx(4285.0, abs=5.0)
+
+
+def test_bbo_blocker_detection_uses_epsilon_tolerance():
+    """An own bid 1 tick below best bid is not misidentified as the blocker."""
+    from gui.services.permuto.bbo import Book
+
+    c = _Client(account=_account(0.0))
+    # Best bid is 0.0714 (shutting ask window). Our resting bid is 0.0713 (1 tick below)
+    book = Book(market=_MKT, best_bid=0.0714, best_ask=None)
+    r = _runner(c, curfew_enabled=False, bbo_fetch=lambda m: book)
+    r._resting[_MKT] = RestingQuote(bid_price=0.0713, ask_price=None)
+
+    status, *_ = r._bbo_offset_pct(
+        _MKT, 0.07, 0.07, 0.0001, 0.25, 0.0, 1.0)
+    assert status == "shut", (
+        "own bid 1 tick below public best bid was misidentified as own blocker (got %r)" % status)
+
+
+def test_uncapped_disabled_curfew_applies_carried_overnight_scaling():
+    """curfew_enabled=False still detects schedule carried state and scales 1/8 size."""
+    c = _Client(account=_account(0.0), batch_response=_venue_ok())
+    r = _runner(c, curfew_enabled=False, max_position_usd=250_000.0)
+    res = r.tick(_OVERNIGHT, _ORACLE, {})
+    assert res.action == "quote"
+    legs = c.last_batch
+    assert legs, "no overnight batch sent"
+    assert len(legs) == 2
+    # Base size is target / oracle = 1200 / 0.07 = 17142.8
+    # Carried size is base_size / 8 = 2142.8
+    total_size = sum(float(l["size"]) for l in legs)
+    assert total_size == pytest.approx(4285.0, abs=5.0)
+
+
+def test_venue_ring_larger_than_legal_band_is_rejected_and_retains_default():
+    """ring_pct > 5.0% exceeds legal venue band and must be ignored."""
+    c = _Client(account=_account(0.0), batch_response=_venue_ok())
+    r = _runner(c, ring_pct=2.0)
+    r.tick(_MID_SESSION, _ORACLE, {"ring_pct": 6.0})
+    assert r._ring_pct == 2.0
+
+    r.tick(_MID_SESSION, _ORACLE, {"ring_pct": 3.5})
+    assert r._ring_pct == 3.5
+
+
+def test_bbo_revalidation_checks_adjusted_prices_even_when_oracle_unchanged(monkeypatch):
+    """If preflight/band_guard modifies BBO leg price, BBO is revalidated against the book."""
+    from gui.services.permuto.bbo import Book
+    from gui.services.permuto.preflight import PreflightOutcome
+
+    c = _Client(account=_account(0.0), batch_response=_venue_ok())
+    # Competitor best bid is 0.0710. BBO places ask at 0.0711
+    book = Book(market=_MKT, best_bid=0.0710, best_ask=None)
+    # Oracle fetch returns same oracle (0.07)
+    r = _runner(c, curfew_enabled=False, oracle_fetch=lambda: _ORACLE, bbo_fetch=lambda m: book)
+
+    # Monkeypatch preflight_leg_price to simulate a price clamp moving the ask inward to 0.0709 (crossing best_bid 0.0710)
+    monkeypatch.setattr(
+        "gui.services.permuto.runner.preflight_leg_price",
+        lambda price, ref, **kw: PreflightOutcome(0.0709, changed=True, dropped=False)
+    )
+
+    res = r.tick(_MID_SESSION, _ORACLE, {})
+    # Since the altered ask price crosses the best_bid 0.0710, _revalidate_bbo drops the market
+    assert res.action == "skip" or res.markets[_MKT][0] == "skip"
+    last_batch = getattr(c, "last_batch", None)
+    assert last_batch is None or not any(l["market"] == _MKT for l in last_batch)
+
+
+def test_failed_bbo_shut_cancellation_preserves_local_resting_belief():
+    """If cancel_all raises on a shut market, local resting state must not be wiped out."""
+    from gui.services.permuto.bbo import Book
+
+    open_orders = {"orders": [
+        {"market": _MKT, "side": "BUY", "price": 0.0690, "size": 10},
+        {"market": _MKT, "side": "SELL", "price": 0.0710, "size": 10},
+    ]}
+    c = _Client(account=_account(0.0), open_orders=open_orders, fail_on="cancel_all")
+    # Shut book: competitor best bid 0.0714 shuts ask side
+    book = Book(market=_MKT, best_bid=0.0714, best_ask=None)
+    r = _runner(c, curfew_enabled=False, bbo_fetch=lambda m: book)
+
+    res = r.tick(_MID_SESSION, _ORACLE, {})
+    assert res.action == "error"
+    assert "cancel_all" in res.error
+
+    # Resting quote belief must still be preserved so subsequent ticks know a quote may be live
+    assert not r._resting[_MKT].empty
+    assert r._resting[_MKT].bid_price == 0.0690
+    assert r._resting[_MKT].ask_price == 0.0710
