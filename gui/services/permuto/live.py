@@ -243,12 +243,23 @@ def _default_venue_state() -> dict:
                 active.add(name)
     carried = active != wanted
 
+    ring_pct = 2.0
+    try:
+        raw_ring = meta.get("vol_aggressive_ring_pct")
+        if raw_ring is not None:
+            val = float(raw_ring)
+            if math.isfinite(val) and val > 0.0:
+                ring_pct = val
+    except (TypeError, ValueError):
+        pass
+
     return {
         "oracles": oracles,
         "flags": {
             "trading_paused": bool(flags.get("trading_paused")),
             "carried": carried,
             "specs": specs,
+            "ring_pct": ring_pct,
         },
     }
 
@@ -393,6 +404,7 @@ class PermutoLive(QObject):
         target_depth_usd: float = 1_200.0,
         max_position_usd: float = 1_200.0,
         curfew_enabled: bool = True,
+        ring_pct: float = 2.0,
         venue_state: Optional[Callable[[], dict]] = None,
         client: Any = None,
     ) -> None:
@@ -412,6 +424,7 @@ class PermutoLive(QObject):
             target_depth_usd=target_depth_usd,
             max_position_usd=max_position_usd,
             curfew_enabled=curfew_enabled,
+            ring_pct=ring_pct,
             # [PREFLIGHT] The runner re-reads the oracle immediately before
             # sending, so leg prices are judged against the value the venue
             # will actually compare them to rather than one a tick older.

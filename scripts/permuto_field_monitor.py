@@ -50,20 +50,29 @@ def fetch_field():
         page = get("/exchange/leaderboard?offset=%d&limit=20" % offset)
         mm = page.get("market_makers") or []
         rows.extend(mm)
-        total = page.get("market_makers_total") or 0
+        raw_total = page.get("market_makers_total")
+        total = raw_total if isinstance(raw_total, int) and raw_total > 0 else 0
         offset += 20
-        if offset >= total or not mm:
+        if len(mm) < 20 or (total > 0 and len(rows) >= total):
             return rows, page
 
 
 def active_ring_pct(meta):
     """``(percent, source)`` from venue metadata, with a labeled fallback."""
-    try:
-        value = float((meta or {}).get("vol_aggressive_ring_pct"))
-    except (TypeError, ValueError):
-        value = 0.0
-    if math.isfinite(value) and value > 0.0:
-        return value, "venue"
+    stack = [meta]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            if "vol_aggressive_ring_pct" in node:
+                try:
+                    value = float(node["vol_aggressive_ring_pct"])
+                except (TypeError, ValueError):
+                    value = 0.0
+                if math.isfinite(value) and value > 0.0:
+                    return value, "venue"
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
     return DEFAULT_RING_PCT, "default"
 
 
@@ -123,7 +132,7 @@ def main():
                 now_t = row["t"]
                 dt_min = ((now_t - prev_t) / 60.0) if prev_t else None
 
-                movers, field_total, ours = [], 0.0, None
+                movers, entries, field_total, ours = [], [], 0.0, None
                 for r in rows:
                     uid = str(r.get("user_id", ""))
                     d5 = float(r.get("depth_seconds_5d") or 0.0)
@@ -134,6 +143,7 @@ def main():
                     entry = {"user": uid[:12], "depth_5d": d5,
                              "per_min": rate,
                              "eligible": bool(r.get("prize_eligible"))}
+                    entries.append(entry)
                     if uid.startswith(args.user):
                         ours = entry
                     if rate:
@@ -146,6 +156,7 @@ def main():
                 row["makers_gaining"] = len([m for m in movers
                                              if (m["per_min"] or 0) > 0])
                 row["top_gainers"] = movers[:5]
+                row["makers"] = entries
                 row["eligible_count"] = len(
                     [r for r in rows if r.get("prize_eligible")])
                 row["rebuild_status"] = page.get("leaderboard_rebuild_status")

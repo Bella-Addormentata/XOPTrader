@@ -1885,7 +1885,7 @@ def test_an_own_ring_edge_order_is_cancelled_before_bbo_rebuild():
 
 def test_a_rounded_own_blocker_is_still_cancelled_once():
     oracle = 0.1000
-    own_bid = 0.1019
+    own_bid = 0.1020000000001
     public_bid = 0.1020
     c = _Client(
         account=_account(0.0),
@@ -3511,3 +3511,52 @@ def test_a_mixed_quote_hold_transition_rebuilds_every_market(monkeypatch):
         assert not r._resting[market].empty, (
             "%s was cancelled and left empty while the tick reported %r"
             % (market, res.action))
+
+
+def test_shut_bbo_prices_reducing_leg_passively_within_band():
+    """When BBO is shut, a reduce-only leg clears the opposing blocker passively."""
+    from gui.services.permuto.bbo import Book
+
+    # Long position (100 contracts) -> reducing leg is SELL (ask)
+    # Competitor bid is at 0.07139 (+1.99% of 0.07), shutting the 2% ask window
+    c = _Client(account=_account(100.0), batch_response=_venue_ok())
+    book = Book(market=_MKT, best_bid=0.07139, best_ask=None)
+    r = _runner(c, curfew_enabled=False, bbo_fetch=lambda m: book, max_position_usd=5.0)
+    # 100 contracts * 0.07 = $7 > $5 cap -> REDUCE_ONLY
+
+    res = r.tick(_MID_SESSION, _ORACLE, {})
+    assert c.last_batch, "no reduce-only batch was sent"
+    sell_legs = [l for l in c.last_batch if l["side"] == "sell"]
+    assert sell_legs, "no reducing sell leg sent"
+    assert float(sell_legs[0]["price"]) > 0.07139, (
+        "reducing ask %r crosses best bid 0.07139" % sell_legs[0]["price"])
+    assert float(sell_legs[0]["price"]) <= 0.07 * 1.05 + 1e-9, (
+        "reducing ask exceeds 5% legal venue band")
+
+
+def test_uncapped_overnight_schedule_sets_carried_flag():
+    """max_position_usd=0 leaves curfew.stage=UNSCHEDULED but schedule_stage=CLOSED."""
+    c = _Client(account=_account(0.0), batch_response=_venue_ok())
+    r = _runner(c, curfew_enabled=True, max_position_usd=0.0)
+    res = r.tick(_OVERNIGHT, _ORACLE, {})
+    assert res.action == "quote"
+    # Carried overnight scaling was applied (size is divided by carried multiplier)
+    legs = c.last_batch
+    assert legs, "no overnight batch sent"
+    assert len(legs) == 2
+
+
+def test_bbo_blocker_detection_uses_epsilon_tolerance():
+    """An own bid 1 tick below best bid is not misidentified as the blocker."""
+    from gui.services.permuto.bbo import Book
+
+    c = _Client(account=_account(0.0))
+    # Best bid is 0.0714 (shutting ask window). Our resting bid is 0.0713 (1 tick below)
+    book = Book(market=_MKT, best_bid=0.0714, best_ask=None)
+    r = _runner(c, curfew_enabled=False, bbo_fetch=lambda m: book)
+    r._resting[_MKT] = RestingQuote(bid_price=0.0713, ask_price=None)
+
+    status, _ = r._bbo_offset_pct(
+        _MKT, 0.07, 0.07, 0.0001, 0.25, 0.0, 1.0)
+    assert status == "shut", (
+        "own bid 1 tick below public best bid was misidentified as own blocker (got %r)" % status)

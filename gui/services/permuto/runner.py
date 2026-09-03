@@ -51,7 +51,8 @@ from .risk import (PORTFOLIO_MAX_EXPOSURE_FRACTION, MarginState,
 from .band_guard import VENUE_BAND_PCT, BandGuard
 from .bbo import (placement_prices as bbo_placement_prices,
                   required_ladder_offset_pct as bbo_required_offset_pct,
-                  rests_and_earns as bbo_rests_and_earns)
+                  rests_and_earns as bbo_rests_and_earns,
+                  _quantise as bbo_quantise)
 from .cross_backoff import CrossBackoff, headroom_pct
 from .preflight import (latest_oracle, preflight_leg_price,
                         quantise_toward, rescaled_size)
@@ -424,7 +425,7 @@ class QuoteRunner:
                            else book.best_ask)
                 own_blocker = (resting.bid_price if side == "ask"
                                else resting.ask_price)
-                tolerance = tick_size * (1.0 + 1e-6)
+                tolerance = tick_size * 1e-4
                 own_is_blocker = (
                     blocker is not None
                     and own_blocker is not None
@@ -679,13 +680,23 @@ class QuoteRunner:
 
         paused = bool(flags.get("trading_paused"))
         carried = bool(flags.get("carried") or flags.get("carried_session"))
-        if (self._curfew is not None
-                and self._curfew.stage in (Stage.CLOSED, Stage.PREOPEN)):
-            # /info/meta keeps VOL markets "active" while their equity
-            # oracle is carried, and /info/oracle publishes no carried bit.
-            # The schedule/freeze state computed above is therefore the only
-            # production signal for the venue's 8x stressed-margin regime.
-            carried = True
+        if self._curfew is not None:
+            curfew_stages = {self._curfew.stage, self._curfew.schedule_stage}
+            if Stage.CLOSED in curfew_stages or Stage.PREOPEN in curfew_stages:
+                # /info/meta keeps VOL markets "active" while their equity
+                # oracle is carried, and /info/oracle publishes no carried bit.
+                # The schedule/freeze state computed above is therefore the only
+                # production signal for the venue's 8x stressed-margin regime.
+                carried = True
+
+        venue_ring = flags.get("ring_pct")
+        if venue_ring is not None:
+            try:
+                v_ring = float(venue_ring)
+                if math.isfinite(v_ring) and v_ring > 0.0:
+                    self._ring_pct = v_ring
+            except (TypeError, ValueError):
+                pass
 
         # The un-pause edge, computed here because the venue does not announce
         # it. Latched rather than consumed immediately: the tick that observes
@@ -1685,8 +1696,35 @@ class QuoteRunner:
                     )
                     if not shrinking:
                         continue
-                    leg = type(leg)(leg.market, leg.side, leg.price,
-                                    leg.size, True)
+                    leg_price = leg.price
+                    if self._bbo_fetch is not None and _bbo_prices is None:
+                        try:
+                            book = self._bbo_fetch(market)
+                        except Exception:
+                            book = None
+                        if book is not None:
+                            if leg.side is Side.SELL and book.best_bid is not None:
+                                min_passive = bbo_quantise(book.best_bid + _tick, _tick, up=True)
+                                if leg_price < min_passive:
+                                    leg_price = min_passive
+                            elif leg.side is Side.BUY and book.best_ask is not None:
+                                max_passive = bbo_quantise(book.best_ask - _tick, _tick, up=False)
+                                if leg_price > max_passive:
+                                    leg_price = max_passive
+                    if oracle and oracle > 0.0:
+                        band_lo = oracle * (1.0 - VENUE_BAND_PCT / 100.0)
+                        band_hi = oracle * (1.0 + VENUE_BAND_PCT / 100.0)
+                        if leg_price < band_lo - 1e-9 or leg_price > band_hi + 1e-9:
+                            results[market] = (
+                                "skip",
+                                "reduce-only leg outside legal venue band")
+                            continue
+                    leg_size = (rescaled_size(leg.size, leg.price, leg_price, _lot)
+                                if leg_price != leg.price else leg.size)
+                    if leg_size <= 0.0:
+                        continue
+                    leg = type(leg)(leg.market, leg.side, leg_price,
+                                    leg_size, True)
                 # [CURFEW] Clamp the leg to the room left under its side's
                 # cap. A yes/no veto was not enough: the ladder is sized to
                 # target_depth_usd, so a leg permitted merely because it

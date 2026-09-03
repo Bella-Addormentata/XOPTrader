@@ -338,3 +338,9 @@ def test_a_real_boolean_pause_flag_is_read():
     meta["flags"] = {"trading_paused": True}
     assert _venue_state(meta)["flags"]["trading_paused"] is True
 
+
+def test_venue_state_extracts_published_ring_pct():
+    meta = dict(_ACTIVE)
+    meta["vol_aggressive_ring_pct"] = "1.8"
+    assert _venue_state(meta)["flags"]["ring_pct"] == 1.8
+
