@@ -1403,11 +1403,38 @@ void Engine::shutdown()
                 const auto stop_reason          = ladder.stop_reason();
                 const std::string& last_error   = ladder.last_error();
 
+                // [review round 12] An already-pending offer is UNCONFIRMED,
+                // not cancelled, and it must count as live for the outcome
+                // decision below.
+                //
+                // The previous revision warned about these and then let the
+                // `!outstanding.empty()` test fall through to the success
+                // branch, so a shutdown that cancelled NOTHING could log
+                // "All outstanding offers cancelled", skip the S31 fallback,
+                // and exit with the book resting. That is the same fail-open
+                // this entire change exists to close, reintroduced one level
+                // up.
+                //
+                // The skip inside cancel_ids is still right -- not paying a
+                // second fee for a spend already in flight is the point --
+                // but "we did not re-charge it" is not "it is dead". The
+                // whole lesson of the 2026-09-02 incident is that a
+                // SUBMITTED cancel is not a CONFIRMED one.
+                //
+                // The fallback is the BULK endpoint and takes no ids, so
+                // including these changes nothing about what it cancels; it
+                // only decides whether it runs at all, and whether the
+                // operator is told.
+                std::vector<std::string> live = outstanding;
+                live.insert(live.end(),
+                            ladder.already_pending().begin(),
+                            ladder.already_pending().end());
+
                 if (!ladder.already_pending().empty()) {
                     spdlog::warn(
                         "[Engine] [S46] {} offer(s) already had a cancel "
                         "spend in flight and were not re-charged; their "
-                        "spends must still confirm",
+                        "spends are UNCONFIRMED and they are counted as live",
                         ladder.already_pending().size());
                 }
 
@@ -1427,7 +1454,7 @@ void Engine::shutdown()
                 // [S46] The shortfall test is now on the OUTSTANDING set, not
                 // on a count comparison. `cancelled.size() < pending_before`
                 // was never the question; "is anything still resting" is.
-                if (!outstanding.empty()) {
+                if (!live.empty()) {
                     spdlog::critical(
                         "[Engine] [S31] graceful cancellation got {}/{} after "
                         "{} attempt(s) in {} ms, stopped because {} (last "
@@ -1444,12 +1471,15 @@ void Engine::shutdown()
                         + " attempt(s), stopped because "
                         + execution::to_string(stop_reason)
                         + "; the fallback covers the remainder",
-                        outstanding);
+                        live);
                 } else if (bulk_submitted) {
                     spdlog::info("[Engine] All outstanding offers SUBMITTED "
                                  "for cancel via the bulk endpoint -- the "
                                  "spends must still confirm on-chain");
                 } else {
+                    // Reached only when BOTH outstanding and
+                    // already_pending are empty -- i.e. nothing is
+                    // believed live, confirmed or otherwise.
                     spdlog::info("[Engine] All outstanding offers cancelled "
                                  "({} attempt(s), {} ms)",
                                  attempts, elapsed_ms());

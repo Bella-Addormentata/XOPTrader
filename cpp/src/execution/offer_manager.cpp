@@ -1395,9 +1395,22 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_ids(
         // them, and the Step 8 draining gate's safety argument is literally
         // "cancel_stale skips cancel_pending offers, so no double-spend".
         //
-        // Within the shutdown ladder the only thing that sets this flag is a
-        // cancel THIS ladder already submitted and the wallet accepted, so
-        // the skip cannot hide an offer we never tried.
+        // [review round 12] AN EARLIER REVISION OF THIS COMMENT CLAIMED that
+        // "within the shutdown ladder the only thing that sets this flag is a
+        // cancel THIS ladder already submitted", and concluded the skip could
+        // not hide an offer we never tried. THAT IS FALSE. mark_cancel_pending
+        // is called from five other sites in this file -- cancel_stale,
+        // selective_cancel and the peg-suspend drain among them -- during
+        // NORMAL RUNNING, so an offer can arrive here already flagged from a
+        // cancel submitted minutes or hours ago that never landed.
+        //
+        // The skip itself is still correct: not paying a second fee for a
+        // spend already in flight is the whole point. What was wrong was the
+        // CONCLUSION drawn from it. These ids are UNCONFIRMED, not dead, so
+        // they are returned in already_pending and the caller counts them as
+        // live -- see the outcome branch in Engine::shutdown. A submitted
+        // cancel is not a confirmed one; that is the lesson of the 2026-09-02
+        // incident this whole change exists to answer.
         if (po.cancel_pending) {
             logger_->info("cancel_ids: {} already has a cancel in flight -- "
                           "skipping (a second secure cancel would pay a "
