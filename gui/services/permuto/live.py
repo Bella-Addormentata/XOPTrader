@@ -245,17 +245,19 @@ def _default_venue_state() -> dict:
     carried = active != wanted
 
     ring_pct, ring_src = active_ring_pct(meta)
-    if ring_src != "venue":
-        _log.debug("permuto: no valid vol_aggressive_ring_pct in meta; using default %.1f", ring_pct)
+    out_flags = {
+        "trading_paused": bool(flags.get("trading_paused")),
+        "carried": carried,
+        "specs": specs,
+    }
+    if ring_src == "venue":
+        out_flags["ring_pct"] = ring_pct
+    else:
+        _log.debug("permuto: no valid vol_aggressive_ring_pct in meta")
 
     return {
         "oracles": oracles,
-        "flags": {
-            "trading_paused": bool(flags.get("trading_paused")),
-            "carried": carried,
-            "specs": specs,
-            "ring_pct": ring_pct,
-        },
+        "flags": out_flags,
     }
 
 

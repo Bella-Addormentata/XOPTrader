@@ -344,3 +344,8 @@ def test_venue_state_extracts_published_ring_pct():
     meta["vol_aggressive_ring_pct"] = "1.8"
     assert _venue_state(meta)["flags"]["ring_pct"] == 1.8
 
+
+def test_venue_state_omits_ring_pct_when_not_in_meta():
+    meta = dict(_ACTIVE)
+    assert "ring_pct" not in _venue_state(meta)["flags"]
+

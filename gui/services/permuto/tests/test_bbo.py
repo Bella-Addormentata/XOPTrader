@@ -170,3 +170,55 @@ def test_an_unknown_side_is_a_programming_error_not_a_silent_zero():
     except ValueError:
         return
     raise AssertionError("expected ValueError for an unknown side")
+
+
+def test_empty_opposing_side_includes_exact_ring_boundary_prices():
+    """When opposing side is absent, ring floor/ceiling boundaries are inclusive."""
+    oracle = 0.1000  # ring: [0.0980, 0.1020]
+    # Ask window with no bids: lower bound 0.0980 is inclusive (0.0980 is legal ask)
+    w_ask = earning_window("ask", oracle, _book(bid=None, ask=None),
+                           ring_pct=RING, tick_size=TICK)
+    assert abs(w_ask.first - 0.0980) < 1e-9
+    assert abs(w_ask.last - 0.1020) < 1e-9
+    assert w_ask.ticks == 41
+
+    # Bid window with no asks: upper bound 0.1020 is inclusive (0.1020 is legal bid)
+    w_bid = earning_window("bid", oracle, _book(bid=None, ask=None),
+                           ring_pct=RING, tick_size=TICK)
+    assert abs(w_bid.first - 0.0980) < 1e-9
+    assert abs(w_bid.last - 0.1020) < 1e-9
+    assert w_bid.ticks == 41
+
+
+def test_fetch_book_validates_payload_shape_and_rejects_malformed(monkeypatch):
+    from gui.services.permuto import bbo
+
+    # 1. Error payload
+    monkeypatch.setattr(bbo, "_get", lambda url, timeout: {"error": "market paused"})
+    assert bbo.fetch_book("NVDA-VOL-PERP", base_url="https://test") is None
+
+    # 2. Non-dict payload
+    monkeypatch.setattr(bbo, "_get", lambda url, timeout: ["not", "a", "dict"])
+    assert bbo.fetch_book("NVDA-VOL-PERP", base_url="https://test") is None
+
+    # 3. Non-list bids/asks
+    monkeypatch.setattr(bbo, "_get", lambda url, timeout: {"bids": "junk", "asks": []})
+    assert bbo.fetch_book("NVDA-VOL-PERP", base_url="https://test") is None
+
+    # 4. Unparseable first price
+    monkeypatch.setattr(bbo, "_get", lambda url, timeout: {"bids": [{"price": "NaN"}], "asks": []})
+    assert bbo.fetch_book("NVDA-VOL-PERP", base_url="https://test") is None
+
+    # 5. Non-positive first price
+    monkeypatch.setattr(bbo, "_get", lambda url, timeout: {"bids": [{"price": "-0.05"}], "asks": []})
+    assert bbo.fetch_book("NVDA-VOL-PERP", base_url="https://test") is None
+
+    # 6. Valid book
+    monkeypatch.setattr(bbo, "_get", lambda url, timeout: {
+        "bids": [{"price": "0.1001", "size": "100"}],
+        "asks": [{"price": "0.1005", "size": "100"}]
+    })
+    valid = bbo.fetch_book("NVDA-VOL-PERP", base_url="https://test")
+    assert valid is not None
+    assert valid.best_bid == 0.1001
+    assert valid.best_ask == 0.1005

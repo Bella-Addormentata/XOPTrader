@@ -105,6 +105,8 @@ class Window:
     low: float
     high: float
     ticks: int
+    first: float = 0.0
+    last: float = 0.0
 
     @property
     def open(self) -> bool:
@@ -138,15 +140,17 @@ def _quantise(price: float, tick_size: float, *, up: bool) -> float:
     return ticks * tick_size
 
 
-def _grid_bounds(side: str, low: float, high: float,
-                 tick_size: float) -> tuple[float, float]:
-    """First and last legal grid prices for a side-specific open interval."""
+def _grid_bounds(low: float, high: float,
+                 tick_size: float, *,
+                 strict_low: bool = False,
+                 strict_high: bool = False) -> tuple[float, float]:
+    """First and last legal grid prices for a given interval."""
     epsilon = _EPS * tick_size
     first = _quantise(low, tick_size, up=True)
     last = _quantise(high, tick_size, up=False)
-    if side == "ask" and first <= low + epsilon:
+    if strict_low and first <= low + epsilon:
         first += tick_size
-    if side == "bid" and last >= high - epsilon:
+    if strict_high and last >= high - epsilon:
         last -= tick_size
     return first, last
 
@@ -159,10 +163,17 @@ def _get(url: str, timeout: float) -> dict:
 
 def _first_price(levels) -> Optional[float]:
     """Top-of-book price, or None. Tolerates the venue's string decimals."""
-    try:
-        return float(levels[0]["price"])
-    except (IndexError, KeyError, TypeError, ValueError):
+    if not isinstance(levels, list) or not levels:
         return None
+    if not isinstance(levels[0], dict):
+        return None
+    try:
+        val = float(levels[0]["price"])
+        if math.isfinite(val) and val > 0.0:
+            return val
+    except (IndexError, KeyError, TypeError, ValueError):
+        pass
+    return None
 
 
 def fetch_book(market: str, *, base_url: str,
@@ -174,14 +185,39 @@ def fetch_book(market: str, *, base_url: str,
     """
     url = "%s/info/l2/%s?levels=%d" % (base_url.rstrip("/"), market, _LEVELS)
     try:
-        payload = _get(url, timeout) or {}
+        payload = _get(url, timeout)
     except Exception as exc:  # noqa: BLE001 - a missing book is not fatal
         _log.debug("permuto: L2 fetch failed for %s: %s", market, exc)
         return None
+
+    if not isinstance(payload, dict) or payload.get("error"):
+        _log.debug("permuto: L2 payload invalid for %s: %r", market, payload)
+        return None
+
+    raw_bids = payload.get("bids")
+    raw_asks = payload.get("asks")
+    if not isinstance(raw_bids, list) or not isinstance(raw_asks, list):
+        _log.debug("permuto: L2 bids/asks not lists for %s: %r", market, payload)
+        return None
+
+    best_bid = None
+    if raw_bids:
+        best_bid = _first_price(raw_bids)
+        if best_bid is None:
+            _log.debug("permuto: L2 nonempty bids unparseable for %s: %r", market, raw_bids[:1])
+            return None
+
+    best_ask = None
+    if raw_asks:
+        best_ask = _first_price(raw_asks)
+        if best_ask is None:
+            _log.debug("permuto: L2 nonempty asks unparseable for %s: %r", market, raw_asks[:1])
+            return None
+
     return Book(
         market=market,
-        best_bid=_first_price(payload.get("bids") or []),
-        best_ask=_first_price(payload.get("asks") or []),
+        best_bid=best_bid,
+        best_ask=best_ask,
     )
 
 
@@ -200,7 +236,7 @@ def earning_window(side: str, oracle: float, book: Book, *,
     if not (math.isfinite(oracle) and oracle > 0.0
             and math.isfinite(ring_pct) and ring_pct > 0.0
             and math.isfinite(tick_size) and tick_size > 0.0):
-        return Window(side=side, low=0.0, high=0.0, ticks=0)
+        return Window(side=side, low=0.0, high=0.0, ticks=0, first=0.0, last=0.0)
 
     # The ring is a band AROUND the oracle and bounds BOTH sides. An earlier
     # revision applied only the near edge per side, which let a bid sit above
@@ -214,6 +250,8 @@ def earning_window(side: str, oracle: float, book: Book, *,
         # empty bid side removes the crossing bound, not the ring.
         floor = book.best_bid if book.best_bid is not None else ring_lo
         low, high = max(floor, ring_lo), ring_hi
+        strict_low = (book.best_bid is not None and book.best_bid >= ring_lo - _EPS * tick_size)
+        strict_high = False
     else:
         # Mirror: strictly below the best ask, and never outside the ring.
         # Clamped rather than left infinite when the ask side is empty --
@@ -221,13 +259,19 @@ def earning_window(side: str, oracle: float, book: Book, *,
         # empty ask book observed 2026-09-02.
         ceil = book.best_ask if book.best_ask is not None else ring_hi
         low, high = ring_lo, min(ceil, ring_hi)
+        strict_low = False
+        strict_high = (book.best_ask is not None and book.best_ask <= ring_hi + _EPS * tick_size)
 
     if not (high > low):
-        return Window(side=side, low=low, high=high, ticks=0)
-    first, last = _grid_bounds(side, low, high, tick_size)
+        return Window(side=side, low=low, high=high, ticks=0, first=0.0, last=0.0)
+    first, last = _grid_bounds(
+        low, high, tick_size,
+        strict_low=strict_low, strict_high=strict_high)
     ticks = (int(round((last - first) / tick_size)) + 1
              if last >= first - _EPS * tick_size else 0)
-    return Window(side=side, low=low, high=high, ticks=max(ticks, 0))
+    if ticks <= 0:
+        return Window(side=side, low=low, high=high, ticks=0, first=0.0, last=0.0)
+    return Window(side=side, low=low, high=high, ticks=ticks, first=first, last=last)
 
 
 def required_offset_pct(side: str, oracle: float, book: Book, *,
@@ -271,8 +315,7 @@ def required_ladder_offset_pct(
         return 0.0
     if side == "bid" and book.best_ask is None:
         return 0.0
-    first, last = _grid_bounds(side, window.low, window.high, tick_size)
-    target = first if side == "ask" else last
+    target = window.first if side == "ask" else window.last
     if side == "ask":
         return max(0.0, (target / reference - 1.0) * 100.0)
     return max(0.0, (1.0 - target / reference) * 100.0)
@@ -305,10 +348,8 @@ def placement_prices(
     if not (bid_window.open and ask_window.open):
         return None
 
-    bid_low, bid_high = _grid_bounds(
-        "bid", bid_window.low, bid_window.high, tick_size)
-    ask_low, ask_high = _grid_bounds(
-        "ask", ask_window.low, ask_window.high, tick_size)
+    bid_low, bid_high = bid_window.first, bid_window.last
+    ask_low, ask_high = ask_window.first, ask_window.last
     desired_bid = _quantise(
         reference * (1.0 - preferred_offset_pct / 100.0),
         tick_size, up=False)

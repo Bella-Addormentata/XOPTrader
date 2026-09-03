@@ -769,7 +769,7 @@ class PermutoWidget(QWidget):
         #
         # The old $250k cap existed only to tolerate the account's already
         # accumulated ~$188k short. That account is now flat and liquidated;
-        # carrying the emergency cap into a reset would authorize the same
+        # carrying the emergency cap into a fresh identity would authorize the same
         # loss again. Ten full quote fills is enough room for skew and repair
         # without turning a depth target into a directional position budget.
         #
