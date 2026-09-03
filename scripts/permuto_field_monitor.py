@@ -8,10 +8,9 @@ earning against the same book -- and that gap is the one remaining question
 worth measuring overnight.
 
 So this records, every poll: our depth, every other maker's depth, and the
-per-minute rate for each. If the field is also flat, the wall is universal
-and the contest is frozen. If the field keeps climbing while asks are
-impossible, they are earning by some route we have not identified, and the
-deltas plus the concurrent L2 snapshot are the evidence needed to find it.
+per-minute rate for each. Note that depth_seconds_5d is a rolling 5-day
+accumulator, so rate is the delta of the rolling counter (where a flat
+value can reflect new accrual matching window roll-off).
 
 Read-only and unauthenticated: GET /exchange/leaderboard and GET /info/l2.
 Places no orders and holds no session.
@@ -150,15 +149,14 @@ def main():
                     entries.append(entry)
                     if uid.startswith(args.user):
                         ours = entry
-                    if rate:
+                    if rate is not None and rate > 0.0:
                         movers.append(entry)
                     prev[uid] = d5
 
-                movers.sort(key=lambda e: -(e["per_min"] or 0.0))
+                movers.sort(key=lambda e: -e["per_min"])
                 row["ours"] = ours
                 row["field_total_depth"] = field_total
-                row["makers_gaining"] = len([m for m in movers
-                                             if (m["per_min"] or 0) > 0])
+                row["makers_gaining"] = len(movers)
                 row["top_gainers"] = movers[:5]
                 row["makers"] = entries
                 row["eligible_count"] = len(

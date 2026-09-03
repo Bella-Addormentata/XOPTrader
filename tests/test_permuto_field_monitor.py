@@ -19,6 +19,14 @@ def test_field_monitor_labels_its_default_ring_fallback():
     assert active_ring_pct({}) == (DEFAULT_RING_PCT, "default")
     assert active_ring_pct({"vol_aggressive_ring_pct": float("nan")}) == (
         DEFAULT_RING_PCT, "default")
+    assert active_ring_pct({"vol_aggressive_ring_pct": True}) == (
+        DEFAULT_RING_PCT, "default")
+    assert active_ring_pct({"vol_aggressive_ring_pct": False}) == (
+        DEFAULT_RING_PCT, "default")
+    assert active_ring_pct({"vol_aggressive_ring_pct": 0.0}) == (
+        DEFAULT_RING_PCT, "default")
+    assert active_ring_pct({"vol_aggressive_ring_pct": 10.0}) == (
+        DEFAULT_RING_PCT, "default")
 
 
 def test_fetch_field_pages_until_empty_page_when_total_invalid(monkeypatch):

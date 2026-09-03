@@ -3621,10 +3621,14 @@ def test_uncapped_overnight_schedule_sets_carried_flag():
     r = _runner(c, curfew_enabled=True, max_position_usd=0.0)
     res = r.tick(_OVERNIGHT, _ORACLE, {})
     assert res.action == "quote"
-    # Carried overnight scaling was applied (size is divided by carried multiplier)
+    # Carried overnight scaling was applied (size is divided by carried multiplier 8x)
     legs = c.last_batch
     assert legs, "no overnight batch sent"
     assert len(legs) == 2
+    # Base size is target / oracle = 1200 / 0.07 = 17142.8
+    # Carried size is base_size / 8 = 2142.8
+    total_size = sum(float(l["size"]) for l in legs)
+    assert total_size == pytest.approx(4285.0, abs=5.0)
 
 
 def test_bbo_blocker_detection_uses_epsilon_tolerance():

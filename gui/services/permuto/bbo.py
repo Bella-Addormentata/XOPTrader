@@ -58,22 +58,24 @@ def active_ring_pct(meta: Any, default: float = DEFAULT_RING_PCT) -> tuple[float
         node = stack.pop()
         if isinstance(node, dict):
             if "vol_aggressive_ring_pct" in node:
-                try:
-                    value = float(node["vol_aggressive_ring_pct"])
-                except (TypeError, ValueError):
-                    value = 0.0
-                if math.isfinite(value) and 0.0 < value <= MAX_LEGAL_RING_PCT:
-                    return value, "venue"
+                raw_val = node["vol_aggressive_ring_pct"]
+                if not isinstance(raw_val, bool):
+                    try:
+                        value = float(raw_val)
+                        if math.isfinite(value) and 0.0 < value <= MAX_LEGAL_RING_PCT:
+                            return value, "venue"
+                    except (TypeError, ValueError):
+                        pass
             stack.extend(node.values())
         elif isinstance(node, list):
             stack.extend(node)
     return default, "default"
 
 
-#: Levels requested per side. We only need the top of book, but asking for a
-#: few costs nothing and lets a caller see whether the top level is a lone
-#: dust order or a genuine wall.
-_LEVELS = 5
+#: Levels requested per side. We only need the top of book (level 0) to
+#: calculate resting BBO and earning windows. Requesting 1 level minimizes
+#: response payload size and network flight time within the sub-tick budget.
+_LEVELS = 1
 
 _HEADERS = {
     "User-Agent": "Mozilla/5.0 (XOPTrader)",
