@@ -34,7 +34,28 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (XOPTrader)", "Accept": "application/json"
 OUT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                    "data", "field_monitor.jsonl")
 MARKETS = ("NVDA-VOL-PERP", "QQQ-VOL-PERP", "TSLA-VOL-PERP")
-DEFAULT_RING_PCT = 2.0
+
+try:
+    from gui.services.permuto.bbo import DEFAULT_RING_PCT, active_ring_pct
+except ImportError:
+    DEFAULT_RING_PCT = 2.0
+
+    def active_ring_pct(meta, default=DEFAULT_RING_PCT):
+        stack = [meta]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, dict):
+                if "vol_aggressive_ring_pct" in node:
+                    try:
+                        value = float(node["vol_aggressive_ring_pct"])
+                    except (TypeError, ValueError):
+                        value = 0.0
+                    if math.isfinite(value) and value > 0.0:
+                        return value, "venue"
+                stack.extend(node.values())
+            elif isinstance(node, list):
+                stack.extend(node)
+        return default, "default"
 
 
 def get(path, timeout=25):
@@ -55,25 +76,6 @@ def fetch_field():
         offset += 20
         if len(mm) < 20 or (total > 0 and len(rows) >= total):
             return rows, page
-
-
-def active_ring_pct(meta):
-    """``(percent, source)`` from venue metadata, with a labeled fallback."""
-    stack = [meta]
-    while stack:
-        node = stack.pop()
-        if isinstance(node, dict):
-            if "vol_aggressive_ring_pct" in node:
-                try:
-                    value = float(node["vol_aggressive_ring_pct"])
-                except (TypeError, ValueError):
-                    value = 0.0
-                if math.isfinite(value) and value > 0.0:
-                    return value, "venue"
-            stack.extend(node.values())
-        elif isinstance(node, list):
-            stack.extend(node)
-    return DEFAULT_RING_PCT, "default"
 
 
 def ring_state():

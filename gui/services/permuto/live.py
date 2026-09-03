@@ -34,6 +34,7 @@ from typing import Any, Callable, Optional
 
 from PySide6.QtCore import QObject, QThread, Signal, Slot
 
+from gui.services.permuto.bbo import active_ring_pct
 from gui.services.permuto.client import PermutoClient
 from gui.services.permuto.quoting import MAX_ORACLE_AGE_S as _GRACE_S
 from gui.services.permuto.runner import QuoteRunner
@@ -243,17 +244,9 @@ def _default_venue_state() -> dict:
                 active.add(name)
     carried = active != wanted
 
-    ring_pct = 2.0
-    try:
-        raw_ring = meta.get("vol_aggressive_ring_pct")
-        if raw_ring is not None:
-            val = float(raw_ring)
-            if math.isfinite(val) and val > 0.0:
-                ring_pct = val
-    except (TypeError, ValueError) as exc:
-        # Invalid vol_aggressive_ring_pct in meta; fall back to default ring_pct = 2.0
-        _log.debug("permuto: invalid vol_aggressive_ring_pct in meta: %r, using default %.1f (%s)",
-                   raw_ring, ring_pct, exc, exc_info=True)
+    ring_pct, ring_src = active_ring_pct(meta)
+    if ring_src != "venue":
+        _log.debug("permuto: no valid vol_aggressive_ring_pct in meta; using default %.1f", ring_pct)
 
     return {
         "oracles": oracles,

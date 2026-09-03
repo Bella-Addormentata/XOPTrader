@@ -12,11 +12,17 @@ from gui.services.permuto.runner import decide as runner_decide
 from gui.services.permuto.quoting import (LoopAction, QuoteDecision,
                                           RestingQuote)
 from gui.services.permuto.risk import FLATTEN_MARGIN_UTILISATION
+from gui.services.permuto.curfew import (
+    CLOSES_UTC, FREEZE_CONFIRM_S, OPENS_UTC, OVERNIGHT_SHORT_FRACTION,
+    SETTLE_AFTER_OPEN_S,
+)
 from gui.services.permuto.runner import RECANCEL_INTERVAL_S, QuoteRunner, _margin_state
 from gui.services.permuto.session import RenewAction
 
 _MKT = "QQQ-VOL-PERP"
 _ORACLE = {_MKT: 0.07}
+_MID_SESSION = OPENS_UTC[0] + SETTLE_AFTER_OPEN_S + 3_600.0
+_OVERNIGHT = CLOSES_UTC[0] + 4 * 3_600.0
 
 
 class _Client:
@@ -353,8 +359,8 @@ def test_a_long_book_is_quoted_below_the_oracle():
 def test_a_carried_session_actually_quotes_the_smaller_size():
     """risk.assess() computes an eighth; the ladder must use it."""
     live, carried = _Client(), _Client()
-    _runner(live).tick(1.0, _ORACLE, {})
-    _runner(carried).tick(1.0, _ORACLE, {"carried": True})
+    _runner(live).tick(_MID_SESSION, _ORACLE, {})
+    _runner(carried).tick(_MID_SESSION, _ORACLE, {"carried": True})
 
     def _size(client):
         return [x for x in client.last_batch if x["side"] == "buy"][0]["size"]
@@ -3556,7 +3562,22 @@ def test_bbo_blocker_detection_uses_epsilon_tolerance():
     r = _runner(c, curfew_enabled=False, bbo_fetch=lambda m: book)
     r._resting[_MKT] = RestingQuote(bid_price=0.0713, ask_price=None)
 
-    status, _ = r._bbo_offset_pct(
+    status, *_ = r._bbo_offset_pct(
         _MKT, 0.07, 0.07, 0.0001, 0.25, 0.0, 1.0)
     assert status == "shut", (
         "own bid 1 tick below public best bid was misidentified as own blocker (got %r)" % status)
+
+
+def test_uncapped_disabled_curfew_applies_carried_overnight_scaling():
+    """curfew_enabled=False still detects schedule carried state and scales 1/8 size."""
+    c = _Client(account=_account(0.0), batch_response=_venue_ok())
+    r = _runner(c, curfew_enabled=False, max_position_usd=250_000.0)
+    res = r.tick(_OVERNIGHT, _ORACLE, {})
+    assert res.action == "quote"
+    legs = c.last_batch
+    assert legs, "no overnight batch sent"
+    assert len(legs) == 2
+    # Base size is target / oracle = 1200 / 0.07 = 17142.8
+    # Carried size is base_size / 8 = 2142.8
+    total_size = sum(float(l["size"]) for l in legs)
+    assert total_size == pytest.approx(4285.0, abs=5.0)

@@ -43,9 +43,31 @@ import logging
 import math
 import urllib.request
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 _log = logging.getLogger(__name__)
+
+DEFAULT_RING_PCT = 2.0
+
+
+def active_ring_pct(meta: Any, default: float = DEFAULT_RING_PCT) -> tuple[float, str]:
+    """``(percent, source)`` extracted recursively from venue metadata."""
+    stack = [meta]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            if "vol_aggressive_ring_pct" in node:
+                try:
+                    value = float(node["vol_aggressive_ring_pct"])
+                except (TypeError, ValueError):
+                    value = 0.0
+                if math.isfinite(value) and value > 0.0:
+                    return value, "venue"
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+    return default, "default"
+
 
 #: Levels requested per side. We only need the top of book, but asking for a
 #: few costs nothing and lets a caller see whether the top level is a lone

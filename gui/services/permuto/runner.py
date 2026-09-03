@@ -378,7 +378,7 @@ class QuoteRunner:
     def _bbo_offset_pct(self, market: str, oracle: Any, reference: Any,
                         tick_size: float, eff_half_spread: float,
                         learned_backoff: float, ring_backoff: float):
-        """``(status, (bid_price, ask_price))`` from the live book.
+        """``(status, (bid_price, ask_price), book)`` from the live book.
 
         ``status`` is one of:
 
@@ -403,16 +403,16 @@ class QuoteRunner:
             oracle_f = float(oracle or 0.0)
             reference_f = float(reference or 0.0)
         except (TypeError, ValueError):
-            return "unknown", 0.0
+            return "unknown", 0.0, None
         if not (oracle_f > 0.0 and reference_f > 0.0 and tick_size > 0.0):
-            return "unknown", 0.0
+            return "unknown", 0.0, None
         try:
             book = self._bbo_fetch(market)
         except Exception as exc:  # noqa: BLE001 - never fail the tick on this
             _log.debug("permuto: %s BBO fetch raised: %s", market, exc)
-            return "unknown", 0.0
+            return "unknown", 0.0, None
         if book is None:
-            return "unknown", 0.0
+            return "unknown", 0.0, None
 
         resting = self._resting.get(market, RestingQuote())
         needed = 0.0
@@ -440,14 +440,14 @@ class QuoteRunner:
                         "so the next tick can rebuild against the external "
                         "BBO.", market, side,
                         "bid" if side == "ask" else "ask", blocker)
-                    return "reset", 0.0
+                    return "reset", 0.0, book
                 _log.info(
                     "permuto: %s %s side has no placeable price -- best bid "
                     "%s / best ask %s against a %.1f%% ring. Skipping: depth "
                     "is min(bid, ask), so one side alone banks nothing.",
                     market, side, book.best_bid, book.best_ask,
                     self._ring_pct)
-                return "shut", 0.0
+                return "shut", 0.0, book
             needed = max(needed, off)
 
         if needed <= eff_half_spread:
@@ -475,8 +475,8 @@ class QuoteRunner:
                 "permuto: %s has open side windows but no valid two-sided "
                 "grid around reference %.6f; skipping rather than banking "
                 "zero.", market, reference_f)
-            return "shut", 0.0
-        return "ok", prices
+            return "shut", 0.0, book
+        return "ok", prices, book
 
     def _forget_book(self) -> None:
         self._resting = {m: RestingQuote() for m in self._markets}
@@ -611,27 +611,16 @@ class QuoteRunner:
         # left to say so. That window is where the depth is actually
         # earned. Measured and reproduced, not theorised.
         #
-        # The honest semantics: the stale-price gate is part of the
-        # schedule-aware machinery, and curfew_enabled=False turns that
-        # machinery off wholesale. Distinguishing "the underlying is shut"
-        # from "our feed died" REQUIRES the schedule; without it the two
-        # are the same observation.
+        # The schedule/freeze state computed from assess_curfew provides the
+        # ground truth for carried-session detection regardless of whether
+        # inventory caps are enabled.
+        self._freeze.observe(now_s, oracles)
+        schedule_curfew = assess_curfew(
+            now_s, self._max_position_usd if self._curfew_enabled else 0.0,
+            frozen_oracle=self._freeze.frozen(now_s))
+
         if self._curfew_enabled:
-            self._freeze.observe(now_s, oracles)
-            curfew = assess_curfew(
-                now_s, self._max_position_usd,
-                frozen_oracle=self._freeze.frozen(now_s))
-            # [review] THE POSTURE STAGE COUNTS TOO, not just the cap
-            # stage. With no position limit configured, curfew.stage is
-            # pinned at UNSCHEDULED forever while posture now follows
-            # schedule_stage -- so CLOSED -> PREOPEN moved the PROFILE
-            # (full size to half, 1.0x spread to 1.6x) and this latch
-            # never noticed. decide() answers HOLD for a quote that is
-            # still fresh and in-ring, so a full-size overnight book sat
-            # live straight through the run-up to the bell at a size the
-            # new posture does not allow. Introduced by the fix that
-            # gave posture its own stage; the transition key has to
-            # cover both or they drift apart.
+            curfew = schedule_curfew
             stage_key = (curfew.stage, curfew.schedule_stage)
             if stage_key != self._curfew_stage_key:
                 _log.warning("permuto: inventory curfew %s -> %s: %s "
@@ -641,53 +630,20 @@ class QuoteRunner:
                              curfew.long_cap_usd, curfew.short_cap_usd,
                              self._max_position_usd)
                 # [review] RETRACT THE BOOK THE NEW STAGE NO LONGER ALLOWS.
-                # The size clamp below only shapes legs we are about to
-                # place; an ask resting from before the close stays live and
-                # takeable, and decide() answers HOLD for a quote that is
-                # still fresh and in-ring -- so without this the short
-                # prohibition never reached the order that mattered. Only
-                # latch the new stage once the retraction actually
-                # succeeded, so a failed cancel is retried next tick rather
-                # than silently skipped.
-                # [live 2026-08-30] DEFERRED, not done here: this runs
-                # before ensure_session(), so on the first tick after a
-                # restart the cancel always failed with "needs a session
-                # and none is held". It self-healed a tick later, but the
-                # retraction belongs after the session exists.
-                #
-                # [review] EXCEPT INTO EXIT. That transition tightens the
-                # CAPS but does not forbid anything already resting: the
-                # danger is the OPEN, not the close, and a two-sided pair
-                # keeps earning credit right up to the bell. Blanket
-                # retraction here cancelled the book EXIT is supposed to
-                # leave alone -- and did it before the profile was ever
-                # consulted, so `withdraw=False` could never take effect.
-                # The caps still bind; nothing that would GROW inventory
-                # gets placed. This only spares what is already there.
-                # [review] AND THAT INCLUDES EXIT. An exemption was tried
-                # here so EXIT could keep earning credit to the bell, and
-                # it does not survive the cap invariant: a pair placed
-                # early in RAMP can be ~$420 a side, while EXIT permits
-                # ~$300 long / $120 short, and RestingQuote records PRICES
-                # but not quantities -- so nothing here can prove a
-                # retained order fits the tightened caps. A fill during
-                # EXIT would then breach the cap and carry the excess into
-                # the overnight window, which is the exact failure the
-                # curfew exists to prevent. Fifteen minutes of forgone
-                # credit is the cheaper side of that trade.
                 self._curfew_retract_pending = True
             self._curfew = curfew
+        else:
+            self._curfew = None
 
         paused = bool(flags.get("trading_paused"))
         carried = bool(flags.get("carried") or flags.get("carried_session"))
-        if self._curfew is not None:
-            curfew_stages = {self._curfew.stage, self._curfew.schedule_stage}
-            if Stage.CLOSED in curfew_stages or Stage.PREOPEN in curfew_stages:
-                # /info/meta keeps VOL markets "active" while their equity
-                # oracle is carried, and /info/oracle publishes no carried bit.
-                # The schedule/freeze state computed above is therefore the only
-                # production signal for the venue's 8x stressed-margin regime.
-                carried = True
+        curfew_stages = {schedule_curfew.stage, schedule_curfew.schedule_stage}
+        if Stage.CLOSED in curfew_stages or Stage.PREOPEN in curfew_stages:
+            # /info/meta keeps VOL markets "active" while their equity
+            # oracle is carried, and /info/oracle publishes no carried bit.
+            # The schedule/freeze state computed above is therefore the only
+            # production signal for the venue's 8x stressed-margin regime.
+            carried = True
 
         venue_ring = flags.get("ring_pct")
         if venue_ring is not None:
@@ -1590,6 +1546,7 @@ class QuoteRunner:
             _extra_offset = min(self._cross_backoff.offset_pct(market),
                                 _safe_backoff)
             _bbo_prices = None
+            _observed_book = None
             # [BBO 2026-09-02] Ask the book rather than guessing at it.
             #
             # cross_backoff.py states the venue "publishes no L2/orderbook/
@@ -1605,7 +1562,7 @@ class QuoteRunner:
             # further" from "no placeable price exists", which a blind
             # controller cannot do and so retries forever.
             if self._bbo_fetch is not None:
-                _status, _observed = self._bbo_offset_pct(
+                _status, _observed, _observed_book = self._bbo_offset_pct(
                     market, oracle, reference, _tick, eff_half_spread,
                     _extra_offset, _ring_backoff)
                 if (_status == "reset"
@@ -1699,12 +1656,14 @@ class QuoteRunner:
                     if not shrinking:
                         continue
                     leg_price = leg.price
-                    if self._bbo_fetch is not None and _bbo_prices is None:
-                        try:
-                            book = self._bbo_fetch(market)
-                        except Exception as exc:  # noqa: BLE001
-                            _log.debug("permuto: BBO fetch for reduce-only leg failed for %s: %s", market, exc)
-                            book = None
+                    if _bbo_prices is None:
+                        book = _observed_book
+                        if book is None and self._bbo_fetch is not None:
+                            try:
+                                book = self._bbo_fetch(market)
+                            except Exception as exc:  # noqa: BLE001
+                                _log.debug("permuto: BBO fetch for reduce-only leg failed for %s: %s", market, exc)
+                                book = None
                         if book is not None:
                             if leg.side is Side.SELL and book.best_bid is not None:
                                 min_passive = bbo_quantise(book.best_bid + _tick, _tick, up=True)
