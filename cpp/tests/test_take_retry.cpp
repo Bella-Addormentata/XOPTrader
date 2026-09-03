@@ -79,7 +79,39 @@
 
 using xop::Mojo;
 using xop::execution::add_same_wallet_fee;
-using xop::execution::ask_take_cost;
+
+// [2026-09-02] Test-local untyped adapter -- ask_take_cost now takes BaseMojos /
+// BaseMpu / QuoteMpu and returns QuoteMojos. Same reasoning as the adapters in
+// test_take_sizing.cpp: this file's assertions are about the SATURATING FEE
+// ARITHMETIC and the retry gate, not about denomination, and leaving them
+// byte-identical is what proves the retype did not move a value.
+//
+// add_same_wallet_fee needs no adapter: its bare-Mojo overload is retained in
+// take_retry.hpp on purpose, because Steps 9e/9f carry a runtime-denominated
+// spend cost (denom.hpp LIMIT 3).
+//
+// IN AN ANONYMOUS NAMESPACE, matching the adapters in test_take_sizing.cpp.
+// At global scope with `inline` it would be an ODR hazard rather than a link
+// error: the obvious thing to do when retyping the next test file is to add a
+// second global `inline ask_take_cost` shim with a slightly different body, and
+// two differing inline definitions of the same signature across TUs is silent
+// undefined behaviour, not a diagnostic. Internal linkage removes the question.
+namespace {
+
+[[nodiscard]] inline xop::Mojo ask_take_cost(xop::Mojo    base_size,
+                                             xop::Mojo    price,
+                                             std::int64_t base_mpu,
+                                             std::int64_t quote_mpu,
+                                             xop::Mojo    same_wallet_fee) noexcept
+{
+    return xop::execution::ask_take_cost(xop::BaseMojos{base_size}, price,
+                                         xop::BaseMpu{base_mpu},
+                                         xop::QuoteMpu{quote_mpu},
+                                         same_wallet_fee).v;
+}
+
+}  // namespace
+
 using xop::execution::classify_take_failure;
 using xop::execution::decide_funding;
 using xop::execution::FundingVerdict;

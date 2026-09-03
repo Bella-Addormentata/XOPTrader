@@ -218,12 +218,21 @@
 #include <limits>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "xop/types.hpp"
+// Denominated / BaseMojos / BaseMpu / QuoteMpu appear in this header's PUBLIC
+// signatures (ask_take_cost, the typed decide_funding, the typed
+// add_same_wallet_fee), so the dependency is declared directly rather than
+// inherited through take_sizing.hpp. Matching crossed_book.hpp, which took the
+// same dependency and included it directly. Without this line a future
+// scope-narrowing of take_sizing.hpp breaks a header on the live take path for
+// a reason unrelated to the edit.
+#include "xop/util/denom.hpp"
 #include "xop/execution/take_sizing.hpp"
 
 namespace xop::execution {
@@ -345,6 +354,94 @@ decide_funding(SpendableReading reading, Mojo cost) noexcept
 }
 
 // ---------------------------------------------------------------------------
+// IsSpendAmount -- the denominations that can legitimately BE a cost.
+//
+// BOTH BaseMojos AND QuoteMojos ARE REAL SPEND LEGS, which is why this admits
+// two tags rather than one: lifting an ASK spends the QUOTE asset, hitting a BID
+// delivers the BASE asset. Which of the two a given call carries is a runtime
+// fact (denom.hpp LIMIT 3), so a constraint naming only one would be wrong on
+// half the take path.
+//
+// The other three tags are NOT costs and must not bind:
+//
+//   OfferedMojos -- a competing offer's advertised size, whose denomination is
+//                   UNRESOLVED (base for an ask, quote for a bid). denom.hpp
+//                   says the only thing a holder can legitimately do with one is
+//                   send it through classify_offer_size(), which takes the Side
+//                   alongside it and returns both legs correctly typed.
+//   BaseMpu,     -- DENOMINATORS, not amounts. A mojos-per-unit is 1e12 on XCH
+//   QuoteMpu        and 1e3 on a CAT; it is a conversion factor, and asking a
+//                   wallet whether it can afford one is a category error.
+//
+// [2026-09-02] WHY THIS EXISTS -- the two overloads below were
+// `template <class Tag>` over ANY tag, which made the type on this path pure
+// decoration. Verified by compiling probes against these headers, not reasoned
+// about: `decide_funding(reading, OfferedMojos{...})` compiled, and so did
+// `decide_funding(reading, BaseMpu{...})` -- a DENOMINATOR passed as a COST.
+// Every rejection denom.hpp advertises held for quote_cost_for_ask,
+// base_size_for_bid and cap_mojos_for, and none of them held here.
+//
+// Deliberately NOT "any Denominated<Tag>". That is the same distinction
+// take_sizing.hpp's IsMpu draws for the mirror reason ("a BaseMojos amount must
+// not satisfy it either, or the constraint would only be documentation"), and
+// this concept is written in that shape on purpose.
+//
+// THIS CONSTRAINS THE TYPED OVERLOADS ONLY. The bare-Mojo overloads above and
+// below are untouched and stay callable: test_take_retry.cpp drives both with
+// plain integers deliberately, because those tests are about the VERDICT LOGIC
+// and the saturating add, not about denomination. `FundingDecidableWith<Mojo>`
+// and `FeeAddableTo<Mojo>` in the guard block below pin that, so an over-tight
+// constraint that broke the bare path would be caught here rather than in a test
+// file's compile error.
+// ---------------------------------------------------------------------------
+template <class T>
+concept IsSpendAmount =
+    std::is_same_v<T, BaseMojos> || std::is_same_v<T, QuoteMojos>;
+
+// ---------------------------------------------------------------------------
+// [2026-09-02] Typed overload. THIS IS AN UNWRAP BOUNDARY, and it is declared
+// here rather than left to every call site precisely so there is ONE of it.
+//
+// SpendableReading::spendable is a wallet balance whose denomination is the
+// SPEND asset -- quote for an ask take, base for a bid take -- so it is
+// RUNTIME-denominated and cannot carry a static tag (denom.hpp LIMIT 2 and
+// LIMIT 3). Typing the cost without typing the reading only moves the unwrap one
+// function later, so it is done here, explicitly, with the reason written down.
+//
+// IT HAS NO CALLER TODAY, and that is recorded here rather than left for a
+// reader to discover. Both live call sites -- engine.cpp Step 9e and Step 9f --
+// pass a bare Mojo `cost`, because it comes from the bare-Mojo
+// add_same_wallet_fee applied to a runtime-denominated `spend_cost` (LIMIT 3).
+// An earlier version of this comment said "the caller keeps its cost strongly
+// typed right up to this call". No caller does.
+//
+// Why that mattered enough to correct: a maintainer auditing denom.hpp's LIMIT 2
+// ("is extraction confined to the boundary?") would read this header, conclude
+// the cost stays typed until decide_funding, and never inspect the three sites
+// where a bare Mojo actually enters the funding path -- engine.cpp's `.v`
+// unwrap into gate(), and the two spend_cost extractions in Steps 9e and 9f.
+// Those are the real boundary; this function is not.
+//
+// It is retained because it FORWARDS (one line, below) rather than duplicating
+// the verdict logic, so it cannot rot out of step with the bare overload, and
+// because it is what a statically-denominated spend path would call on the day
+// one exists. If that day does not come, delete it.
+//
+// The bare-Mojo overload above is retained deliberately -- test_take_retry.cpp
+// drives decide_funding directly with plain integers, and those tests are about
+// the VERDICT LOGIC, not about denomination.
+//
+// CONSTRAINED to the two spend denominations. See IsSpendAmount above for why
+// both of them, and why not the other three tags.
+// ---------------------------------------------------------------------------
+template <IsSpendAmount C>
+[[nodiscard]] constexpr FundingVerdict
+decide_funding(SpendableReading reading, C cost) noexcept
+{
+    return decide_funding(reading, cost.v);
+}
+
+// ---------------------------------------------------------------------------
 // ask_take_cost -- what lifting an ASK actually costs the spend wallet.
 //
 // THE DENOMINATION IS THE WHOLE POINT AND IT IS WHY THIS WRAPPER EXISTS.
@@ -369,28 +466,73 @@ decide_funding(SpendableReading reading, Mojo cost) noexcept
 // @return 0 when the cost cannot be computed. Zero is a DECLINE via
 //         decide_funding()'s `cost <= 0` clause -- never "free".
 // ---------------------------------------------------------------------------
-[[nodiscard]] inline Mojo ask_take_cost(Mojo         base_size,
-                                        Mojo         price,
-                                        std::int64_t base_mojos_per_unit,
-                                        std::int64_t quote_mojos_per_unit,
-                                        Mojo         same_wallet_fee) noexcept
+// [2026-09-02] STRONGLY TYPED: base mojos in, QUOTE mojos out. Lifting an ask
+// spends the QUOTE asset, and the return type now says so, which means the
+// one-token edit this comment warns about (`cost = take_size`) no longer
+// compiles -- a BaseMojos take size cannot be assigned to a QuoteMojos cost.
+// The arithmetic, including the saturating add, is untouched.
+//
+// The `same_wallet_fee` stays a bare Mojo ON PURPOSE. It is a network fee in
+// XCH, and it is only ever passed non-zero when the spend asset IS xch -- i.e.
+// exactly when XCH is the quote asset and the fee is therefore already
+// quote-denominated. Wrapping it as QuoteMojos would be true on the paths where
+// it is non-zero and a lie on the paths where it is 0, so it is left bare and
+// the precondition stays in the @param note above.
+// ---------------------------------------------------------------------------
+[[nodiscard]] inline QuoteMojos ask_take_cost(BaseMojos base_size,
+                                              Mojo      price,
+                                              BaseMpu   base_mojos_per_unit,
+                                              QuoteMpu  quote_mojos_per_unit,
+                                              Mojo      same_wallet_fee) noexcept
 {
-    const Mojo cost = quote_cost_for_ask(base_size, price,
-                                         base_mojos_per_unit,
-                                         quote_mojos_per_unit);
-    if (cost <= 0) return 0;               // unpriceable -> decline
+    const QuoteMojos cost = quote_cost_for_ask(base_size, price,
+                                               base_mojos_per_unit,
+                                               quote_mojos_per_unit);
+    if (cost.v <= 0) return QuoteMojos{0};      // unpriceable -> decline
     if (same_wallet_fee <= 0) return cost;
     // Saturating add. A wrapped cost would read as affordable.
-    const Mojo headroom = std::numeric_limits<Mojo>::max() - cost;
-    return (same_wallet_fee > headroom) ? std::numeric_limits<Mojo>::max()
-                                        : cost + same_wallet_fee;
+    const Mojo headroom = std::numeric_limits<Mojo>::max() - cost.v;
+    return QuoteMojos{(same_wallet_fee > headroom)
+                          ? std::numeric_limits<Mojo>::max()
+                          : cost.v + same_wallet_fee};
 }
 
 /// Same, for a spend denominated in the BASE asset (Step 9e/9f bid takes).
 /// Kept beside ask_take_cost so the two sites cannot drift apart; each call
 /// site still chooses its own denomination.
-[[nodiscard]] inline Mojo add_same_wallet_fee(Mojo cost,
-                                              Mojo same_wallet_fee) noexcept
+///
+/// [2026-09-02] A TEMPLATE OVER THE DENOMINATION TAG, not two overloads. The
+/// spend asset on this path is quote for an ask take and base for a bid take --
+/// a runtime fact (denom.hpp LIMIT 3) -- but whichever it is, this function must
+/// return the SAME denomination it was given. Templating expresses exactly that
+/// and nothing more: it cannot silently change a cost's denomination, because
+/// the tag on the way out is the tag on the way in.
+///
+/// THE BARE-Mojo OVERLOAD IS RETAINED, and that is a deliberate decision rather
+/// than an oversight. Steps 9e and 9f carry `spend_cost` as a bare Mojo BECAUSE
+/// the spend asset there is runtime-selected (quote when lifting an ask, base
+/// when hitting a bid) -- denom.hpp LIMIT 3. Forcing those two call sites to
+/// invent a static tag would mean picking one arbitrarily and lying, which is
+/// strictly worse than an untyped value that is honestly untyped.
+///
+/// THE TEMPLATED OVERLOAD BELOW CURRENTLY HAS NO CONSUMER, and that is stated
+/// here rather than implied by a plausible-sounding citation. An earlier version
+/// of this comment claimed it served "Step 9c, which is ask-only". IT DOES NOT:
+/// Step 9c folds the fee inside `ask_take_cost(..., spend_is_xch ? fee : 0)` and
+/// never calls add_same_wallet_fee at all. The only two live callers are Step 9e
+/// and Step 9f, and both pass a bare Mojo for the reason above.
+///
+/// That mis-citation is the SAME defect shape this increment fixes in types.hpp,
+/// where a comment named a `LiquidityEngine::build_ladder()` that does not
+/// exist. A comment naming a call site that is not there is worse than no
+/// comment: it tells a reader the fee path is tag-preserving somewhere, so they
+/// do not go looking for the three places where a bare Mojo actually enters.
+///
+/// The overload is kept because the day a statically-denominated spend path does
+/// appear, the alternative is a hand-wrap at the call site. It FORWARDS to the
+/// bare overload rather than re-implementing it -- see below.
+[[nodiscard]] constexpr Mojo add_same_wallet_fee(Mojo cost,
+                                                 Mojo same_wallet_fee) noexcept
 {
     if (cost <= 0) return 0;
     if (same_wallet_fee <= 0) return cost;
@@ -398,6 +540,144 @@ decide_funding(SpendableReading reading, Mojo cost) noexcept
     return (same_wallet_fee > headroom) ? std::numeric_limits<Mojo>::max()
                                         : cost + same_wallet_fee;
 }
+
+/// FORWARDS to the bare overload. It must not re-implement the saturating add:
+/// the doc comment above justifies keeping these together with "so the two sites
+/// cannot drift apart", and an independent third copy of the overflow guard is
+/// exactly that drift. A future fix to the guard -- a checked builtin, or the
+/// `cost == INT64_MAX` edge -- would otherwise be applied to the bare overload
+/// (the one the tests drive and the one Steps 9e/9f call) and silently miss this
+/// one, with nothing to catch it: test_take_retry.cpp exercises only the bare
+/// overload and there is no differential test between the two.
+///
+/// One body now, so the tag is the only thing this adds.
+///
+/// [2026-09-02] CONSTRAINED to the two spend denominations (see IsSpendAmount).
+/// It was `template <class Tag>` over any tag, which meant a BaseMpu -- a
+/// mojos-per-unit CONVERSION FACTOR -- could have a network fee added to it and
+/// come back looking like a cost. The tag-preservation property this function
+/// exists for is unchanged: a C in gives a C out.
+template <IsSpendAmount C>
+[[nodiscard]] constexpr C add_same_wallet_fee(C    cost,
+                                              Mojo same_wallet_fee) noexcept
+{
+    return C{add_same_wallet_fee(cost.v, same_wallet_fee)};
+}
+
+// ---------------------------------------------------------------------------
+// COMPILE-TIME GUARD for the two TAGGED overloads above.
+//
+// Neither has a live caller -- both notes above now say so plainly -- and an
+// UNINSTANTIATED function template is NEVER FULLY TYPE-CHECKED. It emits no
+// /W4 /WX warning, and its body can rot out of step with the bare overload it
+// forwards to with no diagnostic at all, right up until the day a first caller
+// appears. Documenting "it has no consumer" does not fix that; instantiating it
+// does. These assertions instantiate BOTH templates, so whichever compiler is
+// building checks them -- GCC on CI included, which is the toolchain this
+// repo's five MSVC-pass/GCC-fail defects were only ever visible on.
+//
+// They also pin the two properties that actually matter about the tagged fee
+// add: THE TAG ON THE WAY OUT IS THE TAG ON THE WAY IN (a Denominated<Tag> in
+// gives a Denominated<Tag> out, so this function cannot silently change a
+// cost's denomination), and the add SATURATES rather than wrapping -- signed
+// overflow is UB, and as the note on ask_take_cost puts it, "a wrapped cost
+// would read as affordable".
+static_assert(add_same_wallet_fee(QuoteMojos{100}, 5) == QuoteMojos{105});
+static_assert(add_same_wallet_fee(BaseMojos{100}, 5)  == BaseMojos{105});
+static_assert(add_same_wallet_fee(BaseMojos{100}, 0)  == BaseMojos{100});
+static_assert(add_same_wallet_fee(QuoteMojos{0}, 5)   == QuoteMojos{0});
+static_assert(add_same_wallet_fee(QuoteMojos{-1}, 5)  == QuoteMojos{0});
+static_assert(add_same_wallet_fee(QuoteMojos{std::numeric_limits<Mojo>::max()},
+                                  100)
+              == QuoteMojos{std::numeric_limits<Mojo>::max()});   // SATURATES
+
+// The tagged decide_funding forwards to the bare verdict logic unchanged. The
+// third and fourth lines are the fail-closed clauses: an UNREAD balance is
+// never a pass, and a zero cost is UNPRICEABLE rather than "free".
+static_assert(decide_funding(SpendableReading{true, 1'000}, QuoteMojos{500})
+              == FundingVerdict::Fund);
+static_assert(decide_funding(SpendableReading{true, 100}, QuoteMojos{500})
+              == FundingVerdict::Insufficient);
+static_assert(decide_funding(SpendableReading{false, 10'000}, QuoteMojos{500})
+              == FundingVerdict::Unknown);
+static_assert(decide_funding(SpendableReading{true, 1'000}, BaseMojos{0})
+              == FundingVerdict::Unknown);
+
+// ---------------------------------------------------------------------------
+// CALLABILITY, both directions. The assertions above prove the tagged overloads
+// COMPUTE the right answer for the two tags a cost may carry; these prove the
+// overload set ADMITS exactly those two and nothing else.
+//
+// Without them the constraint is untested in the only way that matters. A future
+// edit that widens `IsSpendAmount` back to any Denominated -- or drops the
+// constraint entirely, which is the state this branch shipped in until
+// 2026-09-02 -- leaves every value assertion above green, because those only
+// ever pass BaseMojos and QuoteMojos. The negatives are the whole check.
+//
+// THESE MUST BE WRITTEN THROUGH A TEMPLATED CONCEPT AND NOT A BARE
+// requires-EXPRESSION. This is the trap take_sizing.hpp's ACCEPTANCE block
+// documents at length and it was hit again on this branch. The obvious spelling,
+//
+//     static_assert(!requires(SpendableReading r, OfferedMojos c)
+//                             { decide_funding(r, c); });
+//
+// does NOT work: a requires-expression yields `false` only when a requirement
+// fails while substituting TEMPLATE PARAMETERS, in the immediate context
+// ([expr.prim.req]). At namespace scope there is nothing to substitute, so the
+// body is checked eagerly and an ill-formed call is a HARD ERROR rather than a
+// false constraint -- the file does not compile at all. The dangerous part is
+// the obvious "fix": deleting the `!` yields a GREEN build asserting the exact
+// opposite of the intended guarantee. Routing through a template parameter is
+// what makes the substitution dependent and the rejection real.
+//
+// The POSITIVE lines are not padding. `FundingDecidableWith<Mojo>` and
+// `FeeAddableTo<Mojo>` pin the bare overloads that test_take_retry.cpp drives
+// with plain integers; the BaseMojos/QuoteMojos lines catch an OVER-TIGHT
+// constraint, which fails in the safe-looking direction and would otherwise only
+// surface as a compile error at some future call site.
+//
+// Note WHY the rejected tags are rejected all the way down rather than merely
+// dropped from the constrained template: a rejected Denominated cannot fall back
+// to the bare overload either, because denom.hpp asserts there is no implicit
+// conversion OUT of a wrapper (`!std::is_convertible_v<BaseMojos, Mojo>`) and
+// there is no `operator Mojo()`. So the call has no viable overload at all --
+// it fails CLOSED, at compile time, rather than silently unwrapping. Verified on
+// MSVC 2026-09-02 with a real call expression, not inferred from the concept:
+// `decide_funding(r, BaseMpu{1e12})` is C2664 with both halves of the reason
+// spelled out -- "the associated constraints are not satisfied" (the template is
+// gone) and "No user-defined-conversion operator available" (the bare overload
+// is not viable).
+//
+// MUTATION CHECK, run 2026-09-02, all three directions:
+//   * constraint removed from decide_funding       -> the 3 negatives below FAIL
+//   * constraint removed from add_same_wallet_fee  -> the 3 negatives below FAIL
+//   * constraint narrowed to BaseMojos alone       -> both QuoteMojos POSITIVES
+//                                                     FAIL
+// So neither the negatives nor the positives are vacuous. `<Mojo>` is the one
+// line NOT covered by a mutation of this fix: it pins the bare overloads'
+// continued EXISTENCE (deleting one turns it red), which the constraint cannot
+// affect either way.
+// ---------------------------------------------------------------------------
+template <class C>
+concept FundingDecidableWith =
+    requires(SpendableReading r, C c) { decide_funding(r, c); };
+
+static_assert( FundingDecidableWith<QuoteMojos>);    // lifting an ASK spends quote
+static_assert( FundingDecidableWith<BaseMojos>);     // hitting a BID delivers base
+static_assert( FundingDecidableWith<Mojo>);          // bare overload, kept for the tests
+static_assert(!FundingDecidableWith<OfferedMojos>);  // UNCLASSIFIED -- classify_offer_size first
+static_assert(!FundingDecidableWith<BaseMpu>);       // a DENOMINATOR is not a cost
+static_assert(!FundingDecidableWith<QuoteMpu>);      // likewise
+
+template <class C>
+concept FeeAddableTo = requires(C c, Mojo fee) { add_same_wallet_fee(c, fee); };
+
+static_assert( FeeAddableTo<QuoteMojos>);
+static_assert( FeeAddableTo<BaseMojos>);
+static_assert( FeeAddableTo<Mojo>);           // bare overload, kept for the tests
+static_assert(!FeeAddableTo<OfferedMojos>);
+static_assert(!FeeAddableTo<BaseMpu>);
+static_assert(!FeeAddableTo<QuoteMpu>);
 
 // ---------------------------------------------------------------------------
 // The offer's identity for retry purposes: NOT its id, but the two numbers

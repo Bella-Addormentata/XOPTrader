@@ -774,6 +774,31 @@ has to be true before it runs.
   - **Do not** synthesise `offer_log` rows for takes to make them appear. `offer_log` means "an offer we posted" and its `status`/`cancel_reason`/`competitiveness_score` columns are meaningless for a take; faking rows there would corrupt every fill-rate and competitiveness statistic that reads the table, including the 0.39% figure S39(b) rests on.
 - **Related and NOT deferred:** the take path itself had an inert size cap (S40). Fixed on this branch but **not deployed** -- the running binary predates it. Today's take was 1 XCH against a 5 XCH cap so it was recorded truthfully; a larger one would not have been. That is a deployment argument, not a GUI one.
 
+### S46: the dead man's switch cannot cancel when the wallet is unsynced -- observed live
+- **Files:** `cpp/src/engine.cpp` (`shutdown()` -> `cancel_all`, the S31 fallback), `cpp/src/engine.cpp:17687` (`check_shutdown_flag`)
+- **OBSERVED, not theorised. 2026-09-02 13:09:45 CDT**, during a planned graceful stop to deploy. `data/shutdown.flag` was consumed correctly and the full shutdown path ran, and then:
+  ```
+  13:10:17 [error]    Failed to cancel offer 0x9a72dfe913: Wallet needs to be fully synced
+                      before making transactions.
+  13:10:17 [info]     cancel_all: 0/7 offers cancelled successfully
+  13:10:17 [critical] [S31] graceful cancellation got 0/7 -- invoking the independent fallback
+  13:10:17 [critical] [S31] cancel FAILED: Wallet needs to be fully synced before making
+                      transactions.. Offers are STILL LIVE on a wedged engine -- cancel them by
+                      hand NOW.
+  13:10:17 [error]    [ALERT:CRITICAL] DEAD MAN'S SWITCH COULD NOT CANCEL
+  ```
+  **Seven offers were left live and unmanaged.** The engine then exited cleanly, so the operator's book outlived the process that was managing it.
+- **The switch failed for a TRANSIENT reason, and treated it as terminal.** S31 exists precisely to guarantee the book does not outlive the engine, and "the wallet is briefly out of sync" is one of the likeliest states in which an operator reaches for it. It is also, measurably, a flap rather than an outage: over 37.4h the live log carries **94 wallet-sync warnings, 89 of them at `unsynced_blocks=1/20`, max 4/20, each an isolated cycle** (see the failure taxonomy recorded for S40's retry work). A single retry after a few seconds -- or waiting out one block -- would very probably have cancelled all seven. Instead both the graceful path and its independent fallback tried once and gave up.
+- **The fallback is not independent of the failure it exists to survive.** The S31 fallback is described as the safety net for a wedged engine, but it goes through the same wallet RPC and therefore shares the same single point of failure. A net that fails for the same reason as the thing it is catching is not a second chance.
+- **Related but distinct from the offer TTL.** `offer_ttl_blocks: 400` (~5.8h at 52s blocks) means an abandoned book does eventually drain, so this is a bounded exposure rather than an open-ended one. On this occasion the offers were judged harmless by the operator. That is luck about market conditions, not a property of the design.
+- **Status:** `[ ]` -- OPEN. Suggested shape, in order:
+  - **Retry the cancel on a sync failure**, with a short bounded backoff, before declaring the switch failed. Distinguish "the wallet said no" (retryable, and the dominant case) from "the wallet is unreachable" (not). The classifier written for S40 (`cpp/include/xop/execution/take_retry.hpp`, `classify_take_failure`) already draws exactly this line and can be reused rather than re-invented.
+  - **Do not exit until the book is gone or the retries are exhausted.** Today `shutdown()` completes and the process exits regardless of the cancel result; the exit is what turns a recoverable condition into an unmanaged book.
+  - **Make the alert actionable.** "cancel them by hand NOW" does not say WHICH offers. The seven ids were recoverable only by querying `offer_log` afterwards. Print them.
+  - **Consider a pre-shutdown gate:** if the wallet is not synced, say so and refuse to exit until it is, or until the operator forces it -- the double-signal escape hatch documented at `main.cpp:21` already exists for the genuine emergency.
+- **CONFIRMED TRANSIENT, from the restart three minutes later.** The cancel failed at 13:10:17 on "wallet needs to be fully synced"; the replacement engine logged **`Wallet fully synced -- proceeding with inventory seed` at 13:13:30**, and its startup reconcile then called `get_all_offers` against a synced wallet without error. So the condition that defeated both the graceful cancel AND its independent fallback had cleared within about three minutes, unaided. That is the strongest possible argument for a bounded retry: the switch gave up on a state that resolved itself before the operator had finished reading the alert.
+- **Operationally, until this is fixed:** check wallet sync BEFORE requesting a graceful stop, and re-check `offer_log` for unresolved rows afterwards. A `0/N offers cancelled` line means the book is still live regardless of how clean the shutdown looked.
+
 ### P1: max_position_usd is PER MARKET and nothing aggregated it
 Three markets at the shipped 250,000 authorise **750,000 of exposure on a
 500,000 account** -- 1.5x equity before the venue's 8x carried multiplier,

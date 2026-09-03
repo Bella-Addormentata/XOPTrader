@@ -61,6 +61,13 @@
 
 #include <spdlog/spdlog.h>
 
+// Must follow spdlog: this is the fmt::formatter specialisation that lets the
+// strongly-typed mojo wrappers keep printing through the existing {} format
+// arguments without a `.v` at every log site. See denom_format.hpp for why the
+// formatter is separate from denom.hpp and why the log sites are deliberately
+// NOT part of the greppable-extraction list.
+#include "xop/util/denom_format.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -6641,7 +6648,23 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
         }
 
 
-        // Available capital for bids (quote asset) and asks (base asset).
+        // Available pools for bids and asks, BOTH IN BASE MOJOS.
+        //
+        // [2026-09-02] This comment used to read "bids (quote asset) and asks
+        // (base asset)", which contradicted :6680 twenty-nine lines below --
+        // "avail_capital is BASE-asset mojos (see the caps below)" -- about the
+        // same variable. A reader grepping for the bid pool's denomination
+        // found the wrong answer first, and would conclude the BaseMojos wraps
+        // at Steps 7/8 are bugs and "correct" them into a real denomination
+        // error on the exposure kill switch. Same stale claim that types.hpp's
+        // note on TierQuote::size was rewritten to remove; this was the
+        // PRODUCER site and it still said the old thing.
+        //
+        // BASE is the checked reading, not an assumption: strategy/
+        // liquidity.cpp takes std::min(cap, inv) across the two pools and
+        // applies one shared 1.0-XCH (1e12) min_pool_per_tier floor to both.
+        // A min() across two pools and a single XCH-denominated floor are only
+        // coherent if both pools are denominated the same way.
         Mojo avail_capital   = pcs.risk_quote.bid_size;
         Mojo avail_inventory = pcs.risk_quote.ask_size;
 
@@ -8671,10 +8694,29 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                             // ingested bid's. Saturation is handled inside
                             // it, so the isfinite/range branch this replaces
                             // is no longer needed.
+                            //
+                            // [2026-09-02] `.v` UNWRAP AT A DELIBERATE
+                            // BOUNDARY. `costs` is a std::vector<Mojo> handed
+                            // to tiers_within_budget(), and it is filled by
+                            // the `for (Side side : {Ask, Bid})` loop above --
+                            // ask iterations push base mojos, bid iterations
+                            // push quote mojos -- so the vector is RUNTIME
+                            // denominated and cannot carry a single static
+                            // tag. tiers_within_budget is shared generic
+                            // machinery; templating it on a denomination to
+                            // serve one call site is not worth it. Documented
+                            // as a known leak in denom.hpp LIMIT 2 rather
+                            // than papered over.
+                            //
+                            // The BaseMojos wrap on tq.size is sound: this is
+                            // OUR OWN ladder, and liquidity.cpp sets both
+                            // sides' tier size from base-denominated pools.
+                            // See the note on TierQuote::size in types.hpp,
+                            // whose comment used to claim the opposite.
                             costs.push_back(execution::quote_cost_for_ask(
-                                tq.size, tq.price,
-                                pair_cfg->base_mojos_per_unit,
-                                pair_cfg->quote_mojos_per_unit));
+                                BaseMojos{tq.size}, tq.price,
+                                BaseMpu{pair_cfg->base_mojos_per_unit},
+                                QuoteMpu{pair_cfg->quote_mojos_per_unit}).v);
                         }
                     }
                     const std::size_t keep = tiers_within_budget(
@@ -9682,11 +9724,14 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     // size at a price", which is what this needs: unlike an
                     // ingested bid, OUR OWN pending bid's `size` is already
                     // base mojos.
-                    auto quote_cost_for_base_size = [&](Mojo base_size, Mojo price) -> Mojo {
+                    // The lambda takes a BaseMojos so a caller cannot hand it a
+                    // raw, unclassified size; it returns a bare Mojo because
+                    // every consumer downstream is untyped accumulation.
+                    auto quote_cost_for_base_size = [&](BaseMojos base_size, Mojo price) -> Mojo {
                         return execution::quote_cost_for_ask(
                             base_size, price,
-                            gate_pc->base_mojos_per_unit,
-                            gate_pc->quote_mojos_per_unit);
+                            BaseMpu{gate_pc->base_mojos_per_unit},
+                            QuoteMpu{gate_pc->quote_mojos_per_unit}).v;
                     };
 
                     std::unordered_map<std::string, execution::TierClassification> tc_by_id;
@@ -9730,7 +9775,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                     {po.offer_id, spend, po.tier, staleness_rank, class_price});
                             }
                         } else {
-                            const Mojo spend = quote_cost_for_base_size(po.size, po.price);
+                            const Mojo spend = quote_cost_for_base_size(BaseMojos{po.size}, po.price);
                             if (spend > 0) {
                                 pair_quote_pending_spend = saturating_add_mojo(
                                     pair_quote_pending_spend, spend);
@@ -11057,11 +11102,11 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             // As above: our own pending offer's `size` is already base mojos,
             // so quote_cost_for_ask is the right arithmetic despite the
             // taker-flavoured name.
-            auto quote_cost_for_base_size = [&](Mojo base_size, Mojo price) -> Mojo {
+            auto quote_cost_for_base_size = [&](BaseMojos base_size, Mojo price) -> Mojo {
                 return execution::quote_cost_for_ask(
                     base_size, price,
-                    pair_cfg->base_mojos_per_unit,
-                    pair_cfg->quote_mojos_per_unit);
+                    BaseMpu{pair_cfg->base_mojos_per_unit},
+                    QuoteMpu{pair_cfg->quote_mojos_per_unit}).v;
             };
 
             Mojo pending_plus_new_ask = pair_base_pending_spend;
@@ -11076,7 +11121,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     // a value that drives can_bid/can_ask.
                     pending_plus_new_bid = saturating_add_mojo(
                         pending_plus_new_bid,
-                        quote_cost_for_base_size(tq.size, tq.price));
+                        quote_cost_for_base_size(BaseMojos{tq.size}, tq.price));
                 }
             }
 
@@ -11633,8 +11678,8 @@ asio::awaitable<void> Engine::step_check_arbitrage(
         // The pair denomination is preserved here on purpose: 9c caps in
         // pair.base_mojos_per_unit, NOT kMojosPerXch, so 5.0 means 5e12 mojos
         // on XCH/DBX and 5000 mojos on BYC/wUSDC.b.
-        const Mojo max_take_mojos = execution::cap_mojos_for(
-            max_take_xch, pair.base_mojos_per_unit);
+        const BaseMojos max_take_mojos = execution::cap_mojos_for(
+            max_take_xch, BaseMpu{pair.base_mojos_per_unit});
 
         const auto decision = execution::evaluate_crossed_book(
             comp_offers, min_edge_bps, max_take_mojos);
@@ -11731,7 +11776,7 @@ asio::awaitable<void> Engine::step_check_arbitrage(
         // unvalidated observation, not a fabricated cap) but it is a residual,
         // not a closed gap. FOLLOW-UP: re-derive the settled amounts from
         // take_offer()'s trade_record before recording.
-        const Mojo take_size = decision.take_size;
+        const BaseMojos take_size = decision.take_size;
 
         if (dry_run_) {
             spdlog::info("[Engine] Step 9c: {} DRY RUN -- would take offer "
@@ -11770,10 +11815,14 @@ asio::awaitable<void> Engine::step_check_arbitrage(
         // 5,000,000,000,000 against a 338,276-mojo DBX wallet and decline
         // every crossed-book take on every pair, forever, while looking
         // exactly like a working guard.
+        //
+        // [2026-09-02] `spend_cost` is now a QuoteMojos and `best_ask_size` a
+        // BaseMojos, so the `cost = take_size` edit this comment warns about is
+        // no longer merely discouraged -- it does not compile.
         const bool spend_is_xch = (pair.quote_asset_id == "xch");
-        const Mojo spend_cost = execution::ask_take_cost(
+        const QuoteMojos spend_cost = execution::ask_take_cost(
             decision.best_ask_size, best_ask_price,
-            pair.base_mojos_per_unit, pair.quote_mojos_per_unit,
+            BaseMpu{pair.base_mojos_per_unit}, QuoteMpu{pair.quote_mojos_per_unit},
             spend_is_xch ? static_cast<Mojo>(fee) : Mojo{0});
 
         // read_ok{false} is UNKNOWN and it is the DEFAULT. A number is never
@@ -11820,10 +11869,17 @@ asio::awaitable<void> Engine::step_check_arbitrage(
             balance_err = "no wallet is mapped for the spend asset";
         }
 
+        // `.v` at two boundaries, both deliberate and both documented in
+        // denom.hpp LIMIT 2. OfferFingerprint is an identity record -- two
+        // numbers that decide affordability, compared for equality against a
+        // previously-stored copy -- not an amount participating in arithmetic.
+        // And gate()'s cost is compared against SpendableReading::spendable,
+        // which is a wallet balance in the runtime-selected spend asset and so
+        // cannot carry a static tag.
         const execution::OfferFingerprint fp{best_ask_price,
-                                             decision.best_ask_size};
+                                             decision.best_ask_size.v};
         const auto tg = crossed_book_retry_.gate(
-            pair.name, best_ask_offer_id, fp, reading, spend_cost,
+            pair.name, best_ask_offer_id, fp, reading, spend_cost.v,
             static_cast<std::uint64_t>(block_height),
             crossed_book_retry_cfg_);
 
@@ -12017,7 +12073,7 @@ asio::awaitable<void> Engine::step_check_arbitrage(
                     record_taker_fill("crossed_book", trade_id,
                                       best_ask_offer_id, *tpc,
                                       /*we_bought_base=*/true,
-                                      take_size, best_ask_price, fee,
+                                      take_size.v, best_ask_price, fee,
                                       block_height);
                 }
 
@@ -12032,7 +12088,7 @@ asio::awaitable<void> Engine::step_check_arbitrage(
                         AlertRule::ArbitrageDetected,
                         pair.name + " crossed-book arb TAKEN: edge=" +
                         std::to_string(edge_bps) + "bps size=" +
-                        std::to_string(take_size) + " mojos");
+                        std::to_string(take_size.v) + " mojos");
                 }
             } else {
                 // Structurally near-dead: rpc_post() THROWS
@@ -12562,32 +12618,53 @@ asio::awaitable<void> Engine::step_check_arbitrage(
                 //
                 // The units were wrong too, independently of the clamp.
                 // Ingest denominates a BID's size in the QUOTE asset and an
-                // ASK's in the BASE asset (market_data.cpp:1933-1937), and
+                // ASK's in the BASE asset (market_data.cpp:2156-2159), and
                 // this lambda applied one base-denominated formula to both.
                 // On BYC/wUSDC.b the error is masked because base and quote
                 // mojos-per-unit are coincidentally equal (1000 each); on any
                 // pair where they differ, the cap, the funding estimate and
                 // the ledger were all in the wrong unit. take_sizing.hpp does
                 // the conversion and is tested.
-                const Mojo max_mojos = execution::cap_mojos_for(
-                    peg_max_units, pair.base_mojos_per_unit);
+                //
+                // [2026-09-02] THIS IS THE SITE THE STRONG TYPEDEFS WERE BUILT
+                // FOR. The defect above was `c.size` -- a bare, runtime
+                // denominated Mojo -- used as base mojos in the cap comparison,
+                // the funding estimate and both ledger legs. cap_mojos_for now
+                // returns BaseMojos, so `c.size > max_mojos` no longer compiles
+                // (there is no operator> between Mojo and BaseMojos, and no
+                // conversion either way), and quote_cost_for_ask's first
+                // parameter is BaseMojos with an explicit constructor, so
+                // passing a bid's raw size no longer compiles either. Both
+                // rejections are pinned as static_asserts in take_sizing.hpp's
+                // ACCEPTANCE block, with the exact compiler errors quoted.
+                const BaseMojos max_mojos = execution::cap_mojos_for(
+                    peg_max_units, BaseMpu{pair.base_mojos_per_unit});
+
+                // The side ternary that used to live here -- and in four other
+                // places -- is now ONE tested pure function. classify_offer_size
+                // is the only thing licensed to receive a runtime-denominated
+                // size next to its Side, and it returns BOTH legs, always, each
+                // correctly typed. What survives at this call site is a branch
+                // that selects WHICH ACCOUNT WE DEBIT, not which formula to
+                // apply -- see denom.hpp LIMIT 3.
+                const auto legs = execution::classify_offer_size(
+                    c.side, OfferedMojos{c.size}, c.price,
+                    BaseMpu{pair.base_mojos_per_unit},
+                    QuoteMpu{pair.quote_mojos_per_unit});
 
                 // base_sz: what we actually acquire or deliver, in BASE mojos
                 //          -- the number the cap bounds and the number
                 //          record_taker_fill() books.
+                const BaseMojos base_sz = legs.base;
+
                 // spend_cost: what leaves our wallet, in the asset we spend.
-                const Mojo base_sz = (c.side == Side::Ask)
-                    ? c.size
-                    : execution::base_size_for_bid(
-                          c.size, c.price,
-                          pair.base_mojos_per_unit,
-                          pair.quote_mojos_per_unit);
-                const Mojo spend_cost = (c.side == Side::Ask)
-                    ? execution::quote_cost_for_ask(
-                          c.size, c.price,
-                          pair.base_mojos_per_unit,
-                          pair.quote_mojos_per_unit)
-                    : base_sz;
+                // IRREDUCIBLY RUNTIME-DENOMINATED -- quote when we lift an ask,
+                // base when we hit a bid -- so it stays a bare Mojo and the
+                // unwrap is explicit and greppable. Both arms are correctly
+                // typed at the point of extraction, so they cannot be swapped.
+                const Mojo spend_cost =
+                    (legs.spend == execution::SpendAsset::Quote) ? legs.quote.v
+                                                                 : legs.base.v;
 
                 spdlog::info("[Engine] Step 9e: {} PEG-CROSS {} "
                              "price={} peg={} edge={:.1f}bps "
@@ -12596,7 +12673,7 @@ asio::awaitable<void> Engine::step_check_arbitrage(
                              c.price, peg_mojos, c.edge_bps,
                              c.id.substr(0, 12), c.size, base_sz, max_mojos);
 
-                if (max_mojos <= 0) {
+                if (max_mojos <= BaseMojos{0}) {
                     spdlog::warn("[Engine] Step 9e: {} take cap is unusable "
                                  "(peg_arb_max_take_units={} "
                                  "base_mojos_per_unit={}) -- taking nothing",
@@ -12604,7 +12681,12 @@ asio::awaitable<void> Engine::step_check_arbitrage(
                                  pair.base_mojos_per_unit);
                     co_return;
                 }
-                if (base_sz <= 0 || spend_cost <= 0) {
+                // `!legs.usable` is checked FIRST and is not redundant with the
+                // two size tests: classify_offer_size defaults to usable{false}
+                // and every early return in it declines, so this is the clause
+                // that catches an unpriceable offer even if a future edit makes
+                // one of the legs incidentally positive. Fail closed.
+                if (!legs.usable || base_sz <= BaseMojos{0} || spend_cost <= 0) {
                     spdlog::info("[Engine] Step 9e: {} offer {} carries no "
                                  "usable size (size={} base_size={} price={}) "
                                  "-- skipping",
@@ -12622,7 +12704,7 @@ asio::awaitable<void> Engine::step_check_arbitrage(
 
                 // The whole offer settles, and it has been checked against
                 // the cap. No clamp: see take_sizing.hpp.
-                const Mojo take_sz = base_sz;
+                const BaseMojos take_sz = base_sz;
 
                 if (dry_run_) {
                     spdlog::info("[Engine] Step 9e: {} DRY RUN -- "
@@ -12656,8 +12738,28 @@ asio::awaitable<void> Engine::step_check_arbitrage(
                 // For ASK takes (buying base) we need quote balance;
                 // for BID takes (selling base) we need base balance.
                 if (offer_mgr_) {
+                    // [2026-09-02] DRIVEN FROM `legs.spend`, not re-derived
+                    // from `c.side`. classify_offer_size() returns the spend
+                    // tag precisely to answer "which asset leaves our wallet",
+                    // and 75 lines above it already selects the AMOUNT
+                    // (`spend_cost`). Deriving the WALLET independently from
+                    // `c.side` put the same mapping in two places inside one
+                    // lambda: any edit to classify_offer_size's
+                    // `legs.spend = SpendAsset::Quote/Base` assignments would
+                    // change the amount's denomination here but NOT the wallet
+                    // it is checked against, so `spend_cost` would be priced in
+                    // one asset while `reading.spendable` was read from the
+                    // other -- e.g. 2e12 base mojos against a 338,276-mojo DBX
+                    // balance, or, in the FAIL-OPEN direction, a 3,000
+                    // quote-mojo cost against a full XCH balance. Nothing in
+                    // cpp/tests can reach this line (TODO S36), so the suite
+                    // would stay green either way.
+                    //
+                    // Behaviour is unchanged: legs.spend is Quote exactly when
+                    // side is Ask (take_sizing.hpp), so this selects the same
+                    // asset it always did. The mapping now exists once.
                     const std::string& spend_asset =
-                        (c.side == Side::Ask)
+                        (legs.spend == execution::SpendAsset::Quote)
                             ? pair.quote_asset_id
                             : pair.base_asset_id;
                     auto spend_wid =
@@ -12799,9 +12901,13 @@ asio::awaitable<void> Engine::step_check_arbitrage(
                     // [TAKER-RECORDING] Lifting an ASK means we bought base;
                     // hitting a BID means we sold it.
                     if (const PairConfig* tpc = find_pair_config(pair.name)) {
+                        // `.v` is the INTENDED extraction point: record_taker_fill
+                        // books its argument as base mojos, and take_sz is a
+                        // BaseMojos, so this is the wrapper doing its job right
+                        // up to the ledger boundary. Explicit, never implicit.
                         record_taker_fill("peg_arb", tid, c.id, *tpc,
                                           /*we_bought_base=*/c.side == Side::Ask,
-                                          take_sz, c.price,
+                                          take_sz.v, c.price,
                                           static_cast<std::uint64_t>(fee),
                                           block_height);
                     }
@@ -13119,8 +13225,21 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
 
         // Pick best ASK (lowest price) and best BID (highest price) that
         // fall within max_premium_bps of mid.
-        const Mojo max_mojos = static_cast<Mojo>(
-            max_units * static_cast<double>(pair.base_mojos_per_unit));
+        //
+        // [2026-09-02] ROUTED THROUGH cap_mojos_for. This line used to compute
+        // the cap inline as static_cast<Mojo>(max_units * base_mojos_per_unit),
+        // which skipped BOTH of that function's guards: the 9.0e18 bound that
+        // makes the double->int64 narrowing DEFINED (narrowing an out-of-range
+        // floating value is undefined behaviour, and crossed_book.hpp:143-157
+        // documents that this repo has already shipped one MSVC-passes/
+        // GCC-fails bug of exactly that shape), and the `cap > 0` decline. For
+        // every configured value today the two agree exactly -- 2.0 * 1e12 is
+        // dyadic and in range -- so this is not a behaviour change on any live
+        // config; it converts a latent UB into a documented decline. The strong
+        // typedefs are what surfaced it: the inline cast produces a bare Mojo,
+        // which no longer compares against a BaseMojos base size.
+        const BaseMojos max_mojos = execution::cap_mojos_for(
+            max_units, BaseMpu{pair.base_mojos_per_unit});
         // [S40 follow-up 2026-09-01] These four lambdas used to be spelled
         // out here. They were correct -- 9f is the step that got both the
         // all-or-nothing filter and the bid/ask denomination right -- but they
@@ -13129,23 +13248,27 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
         // The maths now lives in take_sizing.hpp, used by both steps and
         // pinned by cpp/tests/test_take_sizing.cpp. Same formulas, same
         // round-up direction, same zero-means-decline convention.
-        auto quote_cost_for_ask = [&](Mojo base_size, Mojo price) -> Mojo {
-            return execution::quote_cost_for_ask(
-                base_size, price,
-                pair.base_mojos_per_unit, pair.quote_mojos_per_unit);
-        };
-        auto base_cost_for_bid = [&](Mojo quote_size, Mojo price) -> Mojo {
-            return execution::base_size_for_bid(
-                quote_size, price,
-                pair.base_mojos_per_unit, pair.quote_mojos_per_unit);
-        };
+        //
+        // [2026-09-02] The two shim lambdas are gone. They existed only to
+        // re-apply the side ternary that classify_offer_size now performs once,
+        // in a tested pure function, returning both legs strongly typed. That
+        // removes the last two of the five open-coded copies of this ternary.
+        const BaseMpu  base_mpu{pair.base_mojos_per_unit};
+        const QuoteMpu quote_mpu{pair.quote_mojos_per_unit};
 
         struct Cand {
             std::string id;
             Mojo price{0};
-            Mojo size{0};
-            Mojo base_size{0};
-            Mojo spend_cost{0};
+            Mojo size{0};              ///< raw advertised size, runtime-denominated
+            BaseMojos base_size{};     ///< ALWAYS base -- cap, ledger, fill
+            Mojo spend_cost{0};        ///< runtime-denominated: see denom.hpp LIMIT 3
+            /// Which asset `spend_cost` is denominated in, carried from
+            /// classify_offer_size(). Travels WITH the cost so the funding
+            /// check below cannot read a balance from the other wallet --
+            /// `legs` is per-offer and out of scope by then, so without this
+            /// field the mapping had to be re-derived from `side`.
+            /// Defaults to Base, matching TakeLegs::spend.
+            execution::SpendAsset spend{execution::SpendAsset::Base};
             Side side{Side::Bid};
             double premium_bps{0.0};
         };
@@ -13156,10 +13279,38 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
             if (co.size == 0 || co.price == 0) continue;
             const double mid_d = static_cast<double>(mid);
             const double price_d = static_cast<double>(co.price);
+            // ONE classification per offer, shared by both branches. The
+            // CompetingOffer overload is used deliberately: passing `co` rather
+            // than `co.size` makes it impossible to pair one offer's size with
+            // another offer's side, which is the corruption a type alone cannot
+            // catch (denom.hpp LIMIT 1).
+            const auto legs = execution::classify_offer_size(co, base_mpu, quote_mpu);
+            if (!legs.usable) continue;
+
+            // [2026-09-02] ONE selection of the spend leg, driven by
+            // `legs.spend`, shared by both arms -- matching Step 9e.
+            //
+            // Both arms used to open-code the mapping instead (`legs.quote.v`
+            // in the ask arm because "an ask take spends QUOTE", `base_size.v`
+            // in the bid arm), so Step 9f consulted the runtime tag ZERO times
+            // while carrying two hand-written copies of what it says, and the
+            // funding check below re-derived it a third time from `side`. The
+            // tag exists to answer this exact question; using it is what makes
+            // classify_offer_size the single place the denomination is decided.
+            //
+            // Values are unchanged: legs.spend is Quote exactly when the offer
+            // is an Ask, so the ask arm still gets legs.quote.v and the bid arm
+            // still gets legs.base.v (== base_size.v). The `.v` remains the
+            // explicit, greppable extraction into a runtime-denominated field
+            // (denom.hpp LIMIT 3).
+            const BaseMojos base_size = legs.base;
+            const Mojo      spend_cost =
+                (legs.spend == execution::SpendAsset::Quote) ? legs.quote.v
+                                                             : legs.base.v;
+
             if (co.side == Side::Ask && want_ask) {
-                const Mojo base_size = co.size;
-                const Mojo spend_cost = quote_cost_for_ask(co.size, co.price);
-                if (base_size == 0 || spend_cost == 0 || base_size > max_mojos) {
+                if (base_size == BaseMojos{0} || spend_cost == 0
+                    || base_size > max_mojos) {
                     continue;
                 }
                 // premium = how much above mid we'd pay
@@ -13167,11 +13318,11 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
                 if (prem <= max_prem_bps &&
                     (!best_ask || co.price < best_ask->price)) {
                     best_ask = Cand{co.offer_id, co.price, co.size,
-                                    base_size, spend_cost, co.side, prem};
+                                    base_size, spend_cost, legs.spend,
+                                    co.side, prem};
                 }
             } else if (co.side == Side::Bid && want_bid) {
-                const Mojo base_size = base_cost_for_bid(co.size, co.price);
-                if (base_size == 0 || base_size > max_mojos) {
+                if (base_size == BaseMojos{0} || base_size > max_mojos) {
                     continue;
                 }
                 // premium = how much below mid we'd accept
@@ -13179,7 +13330,8 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
                 if (prem <= max_prem_bps &&
                     (!best_bid || co.price > best_bid->price)) {
                     best_bid = Cand{co.offer_id, co.price, co.size,
-                                    base_size, base_size, co.side, prem};
+                                    base_size, spend_cost, legs.spend,
+                                    co.side, prem};
                 }
             }
         }
@@ -13217,8 +13369,8 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
             continue;
         }
 
-        const Mojo take_sz = chosen->base_size;
-        if (take_sz == 0) continue;
+        const BaseMojos take_sz = chosen->base_size;
+        if (take_sz == BaseMojos{0}) continue;
 
         spdlog::info("[Engine] Step 9f: {} DRIFT-CORRECT {} "
                      "base={}({}) quote={}({}) price={} mid={} "
@@ -13265,8 +13417,11 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
 
         // Pre-balance check (mirrors Step 9e).
         if (offer_mgr_) {
+            // [2026-09-02] From `chosen->spend`, the tag carried alongside
+            // `chosen->spend_cost`, so the amount and the wallet it is checked
+            // against can no longer disagree. See Step 9e for the full note.
             const std::string& spend_asset =
-                (chosen->side == Side::Ask)
+                (chosen->spend == execution::SpendAsset::Quote)
                     ? pair.quote_asset_id : pair.base_asset_id;
             auto spend_wid = offer_mgr_->resolve_wallet_id(spend_asset);
             if (spend_wid > 0) {
@@ -13367,7 +13522,7 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
             if (const PairConfig* tpc = find_pair_config(pair.name)) {
                 record_taker_fill("drift_correct", tid, chosen->id, *tpc,
                                   /*we_bought_base=*/chosen->side == Side::Ask,
-                                  take_sz, chosen->price,
+                                  take_sz.v, chosen->price,
                                   static_cast<std::uint64_t>(fee),
                                   block_height);
             }
@@ -13599,7 +13754,13 @@ asio::awaitable<void> Engine::step_xch_recovery(BlockHeight block_height)
     // oversized candidate is SKIPPED, not clamped and not partially taken),
     // and the cap is scaled by the PAIR's denomination via cap_mojos_for so
     // an unrepresentable cap declines rather than reading as unbounded.
-    Mojo taken_mojos_this_block = 0;
+    // [2026-09-02] BaseMojos. This accumulator is ASK-ONLY BY CONSTRUCTION --
+    // the candidate loop below starts with `if (co.side != Side::Ask) continue;`
+    // -- so every size added to it is base-denominated and the budget it is
+    // compared against is a BaseMojos cap. Typing it made the double-literal
+    // comparison at the end of this function (`== 0.0`, an int64 against a
+    // floating literal) a compile error, which is how it was found.
+    BaseMojos taken_mojos_this_block{0};
 
     for (const auto& pair : config_.pairs) {
         if (!pair.enabled) continue;
@@ -13647,9 +13808,9 @@ asio::awaitable<void> Engine::step_xch_recovery(BlockHeight block_height)
         // the configured budget is unusable, which means TAKE NOTHING -- an
         // unrepresentable budget is an unbounded budget, and unbounded is the
         // defect being closed here.
-        const Mojo max_take_mojos_total = execution::cap_mojos_for(
-            rcfg.max_take_per_block_xch, pair.base_mojos_per_unit);
-        if (max_take_mojos_total <= 0) {
+        const BaseMojos max_take_mojos_total = execution::cap_mojos_for(
+            rcfg.max_take_per_block_xch, BaseMpu{pair.base_mojos_per_unit});
+        if (max_take_mojos_total <= BaseMojos{0}) {
             spdlog::warn("[Recovery] {} take budget is unusable "
                          "(max_take_per_block_xch={} base_mojos_per_unit={}) "
                          "-- taking nothing",
@@ -13664,14 +13825,14 @@ asio::awaitable<void> Engine::step_xch_recovery(BlockHeight block_height)
                          max_take_mojos_total);
             continue;
         }
-        const Mojo remaining_budget_mojos =
+        const BaseMojos remaining_budget_mojos =
             max_take_mojos_total - taken_mojos_this_block;
 
         // Find the cheapest asks (someone selling XCH) within our budget.
         struct CandidateAsk {
             std::string offer_id;
-            Mojo price;
-            Mojo size;
+            Mojo        price{0};
+            BaseMojos   size{};   ///< ask-only path, so statically base mojos
         };
         std::vector<CandidateAsk> candidates;
 
@@ -13687,7 +13848,14 @@ asio::awaitable<void> Engine::step_xch_recovery(BlockHeight block_height)
             // dropped here rather than clamped -- there is no way to lift
             // part of it, and a clamp would only mis-state the log and the
             // ledger, which is S40 verbatim.
-            if (co.size <= 0 || co.size > remaining_budget_mojos) {
+            //
+            // [2026-09-02] The BaseMojos wrap is sound BECAUSE of the
+            // `co.side != Side::Ask` filter at the top of this loop: an ask's
+            // advertised size is base mojos by the ingest invariant. Any edit
+            // that admits bids here must re-derive the denomination through
+            // classify_offer_size -- a wrap is a human judgement the type system
+            // cannot check (denom.hpp LIMIT 1).
+            if (co.size <= 0 || BaseMojos{co.size} > remaining_budget_mojos) {
                 spdlog::debug("[Recovery] {} ask {} size {} outside remaining "
                               "budget {} -- skipping (takes are "
                               "all-or-nothing, cannot partially fill)",
@@ -13696,7 +13864,7 @@ asio::awaitable<void> Engine::step_xch_recovery(BlockHeight block_height)
                 continue;
             }
 
-            candidates.push_back({co.offer_id, co.price, co.size});
+            candidates.push_back({co.offer_id, co.price, BaseMojos{co.size}});
         }
 
         // Sort by price ascending (cheapest first).
@@ -13792,7 +13960,7 @@ asio::awaitable<void> Engine::step_xch_recovery(BlockHeight block_height)
                         record_taker_fill("xch_recovery", trade_id,
                                           cand.offer_id, *tpc,
                                           /*we_bought_base=*/true,
-                                          cand.size, cand.price,
+                                          cand.size.v, cand.price,
                                           static_cast<std::uint64_t>(fee),
                                           block_height);
                     }
@@ -13826,7 +13994,30 @@ asio::awaitable<void> Engine::step_xch_recovery(BlockHeight block_height)
         }
     }
 
-    if (taken_mojos_this_block == 0.0) {
+    // [2026-09-02] WAS `== 0.0`: an int64 accumulator compared against a
+    // FLOATING literal.
+    //
+    // It was harmless, but NOT for the reason first written here. An earlier
+    // version of this comment said "every value in range converts exactly",
+    // which is false: int64 -> double is exact only up to 2^53, and above that
+    // the conversion rounds. int64 reaches ~9.22e18, so most of the range does
+    // NOT convert exactly, and a comment claiming otherwise invites the next
+    // reader to reuse `== 0.0` on an int64 EQUALITY that actually depends on
+    // exactness -- where it would be wrong.
+    //
+    // The NARROWER reason the old code was safe: this was a comparison against
+    // ZERO specifically. Converting a nonzero integer to double cannot yield
+    // zero -- rounding a value of magnitude >= 1 to the nearest double lands on
+    // a double of magnitude >= 1, never on 0 -- and integer 0 converts to 0.0
+    // exactly. So `x == 0.0` and `x == 0` agreed on every int64, at any
+    // magnitude, and the accuracy of the conversion elsewhere never entered
+    // into it.
+    //
+    // It is gone regardless, because it is precisely the implicit conversion the
+    // strong typedefs exist to refuse, and it became a compile error the moment
+    // this variable was typed. Now an exact integer comparison against a typed
+    // zero.
+    if (taken_mojos_this_block == BaseMojos{0}) {
         spdlog::info("[Recovery] No acceptable XCH asks found this block "
                      "(max premium: {:.0f}bps over CEX {:.6f})",
                      rcfg.max_premium_bps, cex_xch_usdc);

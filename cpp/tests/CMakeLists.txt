@@ -65,6 +65,7 @@ add_executable(xop_tests
     test_book_side_quality.cpp
     test_cross_guard.cpp
     test_crossed_book.cpp
+    test_denom.cpp
     test_take_sizing.cpp
     test_take_retry.cpp
     test_coin_pool_verdict.cpp

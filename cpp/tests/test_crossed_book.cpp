@@ -56,11 +56,35 @@
 using xop::CompetingOffer;
 using xop::Mojo;
 using xop::Side;
-using xop::execution::cap_mojos_for;
 using xop::execution::CrossedBookVerdict;
-using xop::execution::evaluate_crossed_book;
 
 namespace {
+
+// [2026-09-02] TEST-LOCAL UNTYPED ADAPTERS. cap_mojos_for now takes a BaseMpu
+// and returns BaseMojos, and evaluate_crossed_book takes a BaseMojos cap (see
+// cpp/include/xop/util/denom.hpp). Adapting at one point keeps all 20 cap
+// assertions below byte-identical, so `git diff` on this file shows no changed
+// NUMBERS -- which is the property that proves the retype did not move the
+// arithmetic. The denomination guarantee itself is asserted at compile time in
+// crossed_book.hpp (CapCallable) and exercised in cpp/tests/test_denom.cpp.
+//
+// The decision FIELDS are read through `.v` at the assertion sites rather than
+// adapted here, deliberately: the biconditional this file exists to defend
+// (take_size != 0 <=> verdict == Take) is about those fields specifically, and
+// hiding them behind a converting wrapper would make the regression test for
+// the std::min clamp read against a copy instead of the real struct.
+
+[[nodiscard]] Mojo cap_mojos_for(double units, std::int64_t base_mpu) noexcept
+{
+    return xop::execution::cap_mojos_for(units, xop::BaseMpu{base_mpu}).v;
+}
+
+[[nodiscard]] xop::execution::CrossedBookDecision evaluate_crossed_book(
+    const std::vector<CompetingOffer>& offers, double min_edge_bps, Mojo cap)
+{
+    return xop::execution::evaluate_crossed_book(offers, min_edge_bps,
+                                                 xop::BaseMojos{cap});
+}
 
 // The live denominations. config.cpp:638 gives base_mojos_per_unit = 1e12 for
 // an XCH base and 1000 for a CAT, so the SAME crossed_book_max_take_xch: 5.0
@@ -164,7 +188,7 @@ TEST(CrossedBook, UnusableCapMeansTakeNothingNotTakeAnything)
     // take of size zero.
     const auto d = evaluate_crossed_book(crossed_book(10), 1.0, 0);
     EXPECT_EQ(d.verdict, CrossedBookVerdict::CapUnusable);
-    EXPECT_EQ(d.take_size, 0);
+    EXPECT_EQ(d.take_size.v, 0);
 }
 
 // -- Book shapes ------------------------------------------------------------
@@ -173,8 +197,8 @@ TEST(CrossedBook, EmptyBookIsNoBook)
 {
     const auto d = evaluate_crossed_book({}, 1.0, kXchCap);
     EXPECT_EQ(d.verdict, CrossedBookVerdict::NoBook);
-    EXPECT_EQ(d.take_size, 0);
-    EXPECT_EQ(d.best_ask_size, 0);
+    EXPECT_EQ(d.take_size.v, 0);
+    EXPECT_EQ(d.best_ask_size.v, 0);
     EXPECT_TRUE(d.best_ask_offer_id.empty());
 }
 
@@ -188,16 +212,16 @@ TEST(CrossedBook, OneSidedBookIsNoBook)
     const std::vector<CompetingOffer> asks_only{mk(Side::Ask, kAsk, 10)};
     const auto a = evaluate_crossed_book(asks_only, 1.0, kXchCap);
     EXPECT_EQ(a.verdict, CrossedBookVerdict::NoBook);
-    EXPECT_EQ(a.take_size, 0);
+    EXPECT_EQ(a.take_size.v, 0);
     EXPECT_EQ(a.best_ask_price, 0);
-    EXPECT_EQ(a.best_ask_size, 0);
+    EXPECT_EQ(a.best_ask_size.v, 0);
     EXPECT_TRUE(a.best_ask_offer_id.empty());
 
     const std::vector<CompetingOffer> bids_only{mk(Side::Bid, kBid, 10)};
     const auto b = evaluate_crossed_book(bids_only, 1.0, kXchCap);
     EXPECT_EQ(b.verdict, CrossedBookVerdict::NoBook);
-    EXPECT_EQ(b.take_size, 0);
-    EXPECT_EQ(b.best_ask_size, 0);
+    EXPECT_EQ(b.take_size.v, 0);
+    EXPECT_EQ(b.best_ask_size.v, 0);
     EXPECT_TRUE(b.best_ask_offer_id.empty());
 }
 
@@ -217,12 +241,12 @@ TEST(CrossedBook, ADeclinedDecisionWithNoUsableCrossDescribesNoOffer)
     const auto d = evaluate_crossed_book(asks_only, 1.0, kXchCap);
     EXPECT_EQ(d.verdict, CrossedBookVerdict::NoBook);
     EXPECT_EQ(d.best_ask_price, 0);
-    EXPECT_EQ(d.best_ask_size, 0)
+    EXPECT_EQ(d.best_ask_size.v, 0)
         << "a NoBook decision reported a counterparty size next to a zero "
            "price -- the three ask fields must be written as a unit";
     EXPECT_TRUE(d.best_ask_offer_id.empty());
-    EXPECT_EQ(d.take_size, 0);
-    EXPECT_EQ(d.cap_mojos, 0);
+    EXPECT_EQ(d.take_size.v, 0);
+    EXPECT_EQ(d.cap_mojos.v, 0);
 }
 
 TEST(CrossedBook, UncrossedBookIsNotCrossed)
@@ -233,7 +257,7 @@ TEST(CrossedBook, UncrossedBookIsNotCrossed)
     };
     const auto d = evaluate_crossed_book(book, 1.0, kXchCap);
     EXPECT_EQ(d.verdict, CrossedBookVerdict::NotCrossed);
-    EXPECT_EQ(d.take_size, 0);
+    EXPECT_EQ(d.take_size.v, 0);
     EXPECT_EQ(d.best_bid_price, kAsk - 1);
     EXPECT_EQ(d.best_ask_price, kAsk);
 }
@@ -243,7 +267,7 @@ TEST(CrossedBook, CrossedButThinEdgeDeclines)
     // 100 bps of edge against a 250 bps minimum.
     const auto d = evaluate_crossed_book(crossed_book(10), 250.0, kXchCap);
     EXPECT_EQ(d.verdict, CrossedBookVerdict::EdgeTooThin);
-    EXPECT_EQ(d.take_size, 0);
+    EXPECT_EQ(d.take_size.v, 0);
     EXPECT_NEAR(d.edge_bps, 100.0, 1e-6);
 }
 
@@ -269,8 +293,8 @@ TEST(CrossedBook, ExactlyAtCapIsTakenBecause9dsFilterIsInclusive)
     // 5.0 XCH this boundary decides whether we trade at all.
     const auto d = evaluate_crossed_book(crossed_book(kXchCap), 1.0, kXchCap);
     EXPECT_EQ(d.verdict, CrossedBookVerdict::Take);
-    EXPECT_EQ(d.take_size, kXchCap);
-    EXPECT_EQ(d.take_size, d.best_ask_size);
+    EXPECT_EQ(d.take_size.v, kXchCap);
+    EXPECT_EQ(d.take_size.v, d.best_ask_size.v);
 }
 
 TEST(CrossedBook, OneMojoOverCapIsSkippedNotClamped)
@@ -282,10 +306,10 @@ TEST(CrossedBook, OneMojoOverCapIsSkippedNotClamped)
     const auto d = evaluate_crossed_book(crossed_book(oversized), 1.0, kXchCap);
 
     EXPECT_EQ(d.verdict, CrossedBookVerdict::SizeExceedsCap);
-    EXPECT_EQ(d.take_size, 0);
-    EXPECT_NE(d.take_size, kXchCap);       // the clamped value, explicitly
-    EXPECT_EQ(d.best_ask_size, oversized); // the TRUE size, for the log
-    EXPECT_EQ(d.cap_mojos, kXchCap);
+    EXPECT_EQ(d.take_size.v, 0);
+    EXPECT_NE(d.take_size.v, kXchCap);       // the clamped value, explicitly
+    EXPECT_EQ(d.best_ask_size.v, oversized); // the TRUE size, for the log
+    EXPECT_EQ(d.cap_mojos.v, kXchCap);
 }
 
 TEST(CrossedBook, TheLiveAtCapCaseIsDeclinedRatherThanTakenAtTheCap)
@@ -298,8 +322,8 @@ TEST(CrossedBook, TheLiveAtCapCaseIsDeclinedRatherThanTakenAtTheCap)
     const auto d = evaluate_crossed_book(crossed_book(real_offer), 1.0, kXchCap);
 
     EXPECT_EQ(d.verdict, CrossedBookVerdict::SizeExceedsCap);
-    EXPECT_EQ(d.take_size, 0);
-    EXPECT_EQ(d.best_ask_size, real_offer);
+    EXPECT_EQ(d.take_size.v, 0);
+    EXPECT_EQ(d.best_ask_size.v, real_offer);
 }
 
 TEST(CrossedBook, TheOneHistoricalSuccessIsUnchanged)
@@ -311,8 +335,8 @@ TEST(CrossedBook, TheOneHistoricalSuccessIsUnchanged)
     const auto d = evaluate_crossed_book(crossed_book(settled), 1.0, kXchCap);
 
     EXPECT_EQ(d.verdict, CrossedBookVerdict::Take);
-    EXPECT_EQ(d.take_size, settled);
-    EXPECT_EQ(d.take_size, d.best_ask_size);
+    EXPECT_EQ(d.take_size.v, settled);
+    EXPECT_EQ(d.take_size.v, d.best_ask_size.v);
 }
 
 // -- Zero size, which 9c never guarded --------------------------------------
@@ -325,11 +349,11 @@ TEST(CrossedBook, ZeroSizeOfferIsRefusedBecauseTheFillWouldNotBeRecorded)
     // no ledger legs at all. 9d guards this; now so does 9c.
     const auto d = evaluate_crossed_book(crossed_book(0), 1.0, kXchCap);
     EXPECT_EQ(d.verdict, CrossedBookVerdict::ZeroSizeOffer);
-    EXPECT_EQ(d.take_size, 0);
+    EXPECT_EQ(d.take_size.v, 0);
 
     const auto neg = evaluate_crossed_book(crossed_book(-1), 1.0, kXchCap);
     EXPECT_EQ(neg.verdict, CrossedBookVerdict::ZeroSizeOffer);
-    EXPECT_EQ(neg.take_size, 0);
+    EXPECT_EQ(neg.take_size.v, 0);
 }
 
 TEST(CrossedBook, ZeroPricedAskCannotManufactureInfiniteEdge)
@@ -366,7 +390,7 @@ TEST(CrossedBook, OversizedCheapestAskMakesUsSkipTheWholePairNotPickTheNextAsk)
     const auto d = evaluate_crossed_book(book, 1.0, kXchCap);
 
     EXPECT_EQ(d.verdict, CrossedBookVerdict::SizeExceedsCap);
-    EXPECT_EQ(d.take_size, 0);
+    EXPECT_EQ(d.take_size.v, 0);
     EXPECT_EQ(d.best_ask_offer_id, "cheapest-but-huge");
     EXPECT_NE(d.best_ask_offer_id, "pricier-but-would-fit");
 }
@@ -441,22 +465,22 @@ TEST(CrossedBook, TakeInvariantHoldsOverEverySyntheticBook)
                     if (d.verdict == CrossedBookVerdict::Take) {
                         ++takes;
                         // The clamp can never appear here.
-                        ASSERT_EQ(d.take_size, d.best_ask_size)
+                        ASSERT_EQ(d.take_size.v, d.best_ask_size.v)
                             << "size=" << size << " cap=" << cap;
-                        ASSERT_GT(d.take_size, 0);
-                        ASSERT_LE(d.take_size, d.cap_mojos)
+                        ASSERT_GT(d.take_size.v, 0);
+                        ASSERT_LE(d.take_size.v, d.cap_mojos.v)
                             << "size=" << size << " cap=" << cap;
-                        ASSERT_GT(d.cap_mojos, 0);
+                        ASSERT_GT(d.cap_mojos.v, 0);
                     } else {
                         ++declines;
-                        ASSERT_EQ(d.take_size, 0)
+                        ASSERT_EQ(d.take_size.v, 0)
                             << "a declined decision must carry no size: "
                             << "size=" << size << " cap=" << cap;
                     }
 
                     // The reported size is ALWAYS the counterparty's, never a
                     // derived one -- the log rule, enforced at the source.
-                    ASSERT_TRUE(d.best_ask_size == size || d.best_ask_size == 0)
+                    ASSERT_TRUE(d.best_ask_size.v == size || d.best_ask_size.v == 0)
                         << "size=" << size;
                 }
             }
@@ -474,6 +498,6 @@ TEST(CrossedBook, ADefaultConstructedDecisionDeclines)
     // A forgotten initialisation must fail CLOSED.
     const xop::execution::CrossedBookDecision d;
     EXPECT_EQ(d.verdict, CrossedBookVerdict::NoBook);
-    EXPECT_EQ(d.take_size, 0);
-    EXPECT_EQ(d.cap_mojos, 0);
+    EXPECT_EQ(d.take_size.v, 0);
+    EXPECT_EQ(d.cap_mojos.v, 0);
 }
