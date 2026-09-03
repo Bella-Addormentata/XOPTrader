@@ -2281,6 +2281,11 @@ class QuoteRunner:
                         "permuto: batch_upsert carried stress margin blocked (%s); "
                         "sending %d risk-reducing leg(s) via /exchange/order",
                         exc, len(reduce_legs))
+                    cancel_mkts = list({rleg["market"] for rleg in reduce_legs})
+                    try:
+                        self._client.cancel_all(now_s, cancel_mkts)
+                    except Exception as c_exc:
+                        _log.debug("permuto: pre-reduce cancel_all failed: %s", c_exc)
                     single_sent = 0
                     for rleg in reduce_legs:
                         try:

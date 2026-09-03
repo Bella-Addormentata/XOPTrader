@@ -5,6 +5,12 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.20] — 2026-09-03 — pre-reduce cancel-all to prevent single order accumulation
+
+- Added market-scoped pre-cancel before posting risk-reducing single orders in the carried-session
+  stress margin fallback, preventing open order accumulation toward the venue's 200-order cap.
+- Drained stale open order backlog from previous single-order executions.
+
 ## [0.10.19] — 2026-09-03 — full three-market two-sided depth quoting & sub-tick boundary clearance
 
 - Enhanced micro-tick BBO window calculation with floating sub-tick boundary tolerance in `bbo.py`
