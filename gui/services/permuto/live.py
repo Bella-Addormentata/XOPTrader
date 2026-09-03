@@ -71,8 +71,8 @@ TICK_S = 5.0
 #: All BBO reads in one tick share this budget. Three independent 4-second
 #: timeouts delayed risk and oracle handling by roughly 12 seconds when the
 #: public book route degraded, despite the loop's 5-second cadence.
-BBO_TICK_BUDGET_S = 1.0
-BBO_REQUEST_TIMEOUT_S = 0.5
+BBO_TICK_BUDGET_S = 2.0
+BBO_REQUEST_TIMEOUT_S = 1.0
 
 
 class VenueStateUnreadable(RuntimeError):
