@@ -5,7 +5,7 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — a switch for the venue, not just for the quoting
+## [0.10.22] — 2026-09-03 — a switch for the venue, not just for the quoting
 
 The toolbar switch says whether Permuto is QUOTING. Nothing said whether
 Permuto is *there* — and the difference is not cosmetic, because a venue
