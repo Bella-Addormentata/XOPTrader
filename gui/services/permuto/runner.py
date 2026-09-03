@@ -594,26 +594,9 @@ class QuoteRunner:
         # cap, so observing early costs nothing and a missed observation
         # would loosen it.
         self._band_guard.observe(now_s, oracles)
-        # [audit] DELIBERATELY gated on the curfew, and it must stay that
-        # way. An audit flagged the obvious reading -- observation is about
-        # the ORACLE, the curfew is about inventory caps, so why couple
-        # them -- and ungating it looks like a strict improvement, because
-        # with the curfew off _changed_at_by_market_s stays empty and the
-        # stale-oracle gate never fires.
-        #
-        # It is not an improvement, it is a regression, and the reason is
-        # two lines below at posture_stage: with the curfew off,
-        # self._curfew is None, so posture_stage pins to UNSCHEDULED --
-        # which modes.profile_for() lists among the stages where a frozen
-        # oracle means WITHDRAW. Feeding the detector in that
-        # configuration therefore withdraws the book every night, because
-        # the overnight oracle is frozen BY DESIGN and there is no stage
-        # left to say so. That window is where the depth is actually
-        # earned. Measured and reproduced, not theorised.
-        #
-        # The schedule/freeze state computed from assess_curfew provides the
-        # ground truth for carried-session detection regardless of whether
-        # inventory caps are enabled.
+        # Freeze observation and schedule assessment are unconditional to
+        # provide ground truth for carried-session detection and single-market
+        # quietness regardless of whether inventory caps are enabled.
         self._freeze.observe(now_s, oracles)
         schedule_curfew = assess_curfew(
             now_s, self._max_position_usd if self._curfew_enabled else 0.0,
@@ -1613,7 +1596,6 @@ class QuoteRunner:
                     if risk.action is not RiskAction.REDUCE_ONLY:
                         if not self._resting.get(market, RestingQuote()).empty:
                             to_cancel.append(market)
-                            self._resting[market] = RestingQuote()
                         results[market] = (
                             "skip",
                             "no tick-aligned price rests inside the %.1f%% "

@@ -3695,3 +3695,26 @@ def test_bbo_revalidation_checks_adjusted_prices_even_when_oracle_unchanged(monk
     assert res.action == "skip" or res.markets[_MKT][0] == "skip"
     last_batch = getattr(c, "last_batch", None)
     assert last_batch is None or not any(l["market"] == _MKT for l in last_batch)
+
+
+def test_failed_bbo_shut_cancellation_preserves_local_resting_belief():
+    """If cancel_all raises on a shut market, local resting state must not be wiped out."""
+    from gui.services.permuto.bbo import Book
+
+    open_orders = {"orders": [
+        {"market": _MKT, "side": "BUY", "price": 0.0690, "size": 10},
+        {"market": _MKT, "side": "SELL", "price": 0.0710, "size": 10},
+    ]}
+    c = _Client(account=_account(0.0), open_orders=open_orders, fail_on="cancel_all")
+    # Shut book: competitor best bid 0.0714 shuts ask side
+    book = Book(market=_MKT, best_bid=0.0714, best_ask=None)
+    r = _runner(c, curfew_enabled=False, bbo_fetch=lambda m: book)
+
+    res = r.tick(_MID_SESSION, _ORACLE, {})
+    assert res.action == "error"
+    assert "cancel_all" in res.error
+
+    # Resting quote belief must still be preserved so subsequent ticks know a quote may be live
+    assert not r._resting[_MKT].empty
+    assert r._resting[_MKT].bid_price == 0.0690
+    assert r._resting[_MKT].ask_price == 0.0710
