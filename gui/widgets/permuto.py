@@ -461,17 +461,24 @@ def _default_identity_factory():
 
 
 def _default_market_reader() -> dict:
-    """Oracle prices and the pause flag, from the public routes.
+    """Oracle prices, pause flag, and active ring percentage from the public routes.
 
     Deliberately the ONLY network call this page makes without a session:
     both routes are unauthenticated reads, so opening the Markets section can
     never be an action against the account.
     """
     from gui.services.permuto.auth import _request
+    from gui.services.permuto.bbo import active_ring_pct
 
     prices = (_request("GET", "/info/oracle") or {}).get("prices") or {}
-    flags = (_request("GET", "/info/meta") or {}).get("flags") or {}
-    return {"prices": prices, "trading_paused": bool(flags.get("trading_paused"))}
+    meta = _request("GET", "/info/meta") or {}
+    flags = meta.get("flags") or {}
+    ring_pct, ring_src = active_ring_pct(meta)
+    return {
+        "prices": prices,
+        "trading_paused": bool(flags.get("trading_paused")),
+        "ring_pct": ring_pct if ring_src == "venue" else None,
+    }
 
 
 from gui.services.permuto.live import MARKETS as _MARKETS_FOR_BUDGET
@@ -780,6 +787,7 @@ class PermutoWidget(QWidget):
         # $6k projects 413.6M while the SESSION profile sends only $3k/side.
         self._target_depth_usd = 6_000.0
         self._max_position_usd = 30_000.0
+        self._ring_pct: float = 2.0
         self._build()
         self.refresh()
 
@@ -1378,6 +1386,17 @@ class PermutoWidget(QWidget):
         else:
             self._markets_note.setText("Trading is open.")
 
+        venue_ring = snapshot.get("ring_pct")
+        if venue_ring is not None:
+            try:
+                v_ring = float(venue_ring)
+                if math.isfinite(v_ring) and 0.0 < v_ring <= 5.0:
+                    if self._ring_pct != v_ring:
+                        self._ring_pct = v_ring
+                        self._refresh_quoting()
+            except (TypeError, ValueError):
+                pass
+
     # -- quoting ------------------------------------------------------------ #
 
     def _refresh_quoting(self) -> None:
@@ -1387,7 +1406,7 @@ class PermutoWidget(QWidget):
         rows = [
             ("target depth per side", "$%.0f" % self._target_depth_usd),
             ("max position", "$%.0f of notional" % self._max_position_usd),
-            ("aggressive ring", "+/-2.00%  (depth credit + purge boundary)"),
+            ("aggressive ring", "+/-%.2f%%  (depth credit + purge boundary)" % self._ring_pct),
             ("legal band", "+/-5.00%  (outside is HTTP 400)"),
             ("stop adding risk at", "%.0f%% margin utilisation"
                 % (_risk.MAX_MARGIN_UTILISATION * 100)),

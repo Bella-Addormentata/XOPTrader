@@ -693,6 +693,14 @@ def test_the_quoting_summary_states_the_ring_and_the_risk_lines(page):
     assert "utilisation" in text
 
 
+def test_the_quoting_summary_updates_when_venue_ring_changes(page):
+    widget, _ = page
+    widget._on_markets_result({"prices": {"QQQ-VOL": 0.10}, "trading_paused": False, "ring_pct": 1.75})
+    assert widget._ring_pct == 1.75
+    text = widget._quoting_lbl.text()
+    assert "1.75%" in text
+
+
 def test_the_market_poll_does_not_run_on_the_gui_thread(qapp):
     """A slow venue must not freeze the application.
 
