@@ -3524,7 +3524,7 @@ def test_shut_bbo_prices_reducing_leg_passively_within_band():
     r = _runner(c, curfew_enabled=False, bbo_fetch=lambda m: book, max_position_usd=5.0)
     # 100 contracts * 0.07 = $7 > $5 cap -> REDUCE_ONLY
 
-    res = r.tick(_MID_SESSION, _ORACLE, {})
+    r.tick(_MID_SESSION, _ORACLE, {})
     assert c.last_batch, "no reduce-only batch was sent"
     sell_legs = [l for l in c.last_batch if l["side"] == "sell"]
     assert sell_legs, "no reducing sell leg sent"

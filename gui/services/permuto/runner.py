@@ -695,8 +695,10 @@ class QuoteRunner:
                 v_ring = float(venue_ring)
                 if math.isfinite(v_ring) and v_ring > 0.0:
                     self._ring_pct = v_ring
-            except (TypeError, ValueError):
-                pass
+            except (TypeError, ValueError) as exc:
+                # Invalid ring_pct flag; retain current self._ring_pct
+                _log.debug("permuto: invalid ring_pct flag: %r, retaining %.1f (%s)",
+                           venue_ring, self._ring_pct, exc, exc_info=True)
 
         # The un-pause edge, computed here because the venue does not announce
         # it. Latched rather than consumed immediately: the tick that observes
@@ -1700,7 +1702,8 @@ class QuoteRunner:
                     if self._bbo_fetch is not None and _bbo_prices is None:
                         try:
                             book = self._bbo_fetch(market)
-                        except Exception:
+                        except Exception as exc:  # noqa: BLE001
+                            _log.debug("permuto: BBO fetch for reduce-only leg failed for %s: %s", market, exc)
                             book = None
                         if book is not None:
                             if leg.side is Side.SELL and book.best_bid is not None:

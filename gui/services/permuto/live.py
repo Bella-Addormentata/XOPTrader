@@ -250,8 +250,10 @@ def _default_venue_state() -> dict:
             val = float(raw_ring)
             if math.isfinite(val) and val > 0.0:
                 ring_pct = val
-    except (TypeError, ValueError):
-        pass
+    except (TypeError, ValueError) as exc:
+        # Invalid vol_aggressive_ring_pct in meta; fall back to default ring_pct = 2.0
+        _log.debug("permuto: invalid vol_aggressive_ring_pct in meta: %r, using default %.1f (%s)",
+                   raw_ring, ring_pct, exc, exc_info=True)
 
     return {
         "oracles": oracles,
