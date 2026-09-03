@@ -2267,11 +2267,19 @@ class QuoteRunner:
             response = self._client.batch_upsert(payload, now_s)
         except (PermutoAuthError, BatchError) as exc:
             if "Carried-session stress margin" in str(exc):
-                reduce_legs = [l for l in payload if l.get("reduce_only")]
+                # When carrying positions into the overnight/carried session, the venue's
+                # 8x index stress margin check rejects batch_upsert (because it attempts to add risk on at least one leg).
+                # Fall back to extracting all risk-reducing legs for our current inventory and posting them
+                # as single reduce_only orders via /exchange/order.
+                reduce_legs = []
+                for l in payload:
+                    pos = float(state.positions.get(l["market"], 0.0) or 0.0)
+                    if l.get("reduce_only") or (pos < 0 and l["side"] == "buy") or (pos > 0 and l["side"] == "sell"):
+                        reduce_legs.append(l)
                 if reduce_legs:
                     _log.warning(
-                        "permuto: batch_upsert stress margin blocked (%s); "
-                        "sending %d reduce_only leg(s) via /exchange/order",
+                        "permuto: batch_upsert carried stress margin blocked (%s); "
+                        "sending %d risk-reducing leg(s) via /exchange/order",
                         exc, len(reduce_legs))
                     single_sent = 0
                     for rleg in reduce_legs:
@@ -2282,7 +2290,7 @@ class QuoteRunner:
                                 "price": rleg["price"],
                                 "size": rleg["size"],
                                 "order_type": "limit",
-                                "tif": rleg.get("tif", "gtc"),
+                                "tif": rleg.get("tif", "alo"),
                                 "reduce_only": True,
                             }, now_s)
                             single_sent += 1
@@ -2291,8 +2299,8 @@ class QuoteRunner:
                                          rleg["market"], sub_exc)
                     if single_sent > 0:
                         return TickResult(
-                            "quote", "placed reduce_only single orders under stress margin",
-                            {m: ("quote", "reduce_only posted") for m in self._markets})
+                            "quote", "placed reduce_only single orders under carried stress margin",
+                            {m: ("quote", "reduce_only resting") for m in self._markets})
             raise
 
         # [release review] "partial" IS HTTP success on this venue, and the
