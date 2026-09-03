@@ -1711,7 +1711,8 @@ class QuoteRunner:
                         continue
                     leg = type(leg)(leg.market, leg.side, leg_price,
                                     leg_size, True)
-                    bbo_reduce_placements.add(market)
+                    if market in observed_books:
+                        bbo_reduce_placements.add(market)
                 # [CURFEW] Clamp the leg to the room left under its side's
                 # cap. A yes/no veto was not enough: the ladder is sized to
                 # target_depth_usd, so a leg permitted merely because it
@@ -2115,6 +2116,8 @@ class QuoteRunner:
                         _log.debug("permuto: final BBO fetch failed for reduce-only %s: %s",
                                    market, exc)
                         book = None
+                if book is None and market in observed_books:
+                    book = observed_books[market]
 
                 if book is None:
                     dropped.add(market)

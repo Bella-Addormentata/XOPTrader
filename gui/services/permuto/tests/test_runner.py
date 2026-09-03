@@ -3593,6 +3593,28 @@ def test_reduce_only_skipped_when_blocker_exceeds_venue_band():
         "an out-of-band reduce-only leg was erroneously sent")
 
 
+def test_reduce_only_blind_fallback_when_bbo_fetch_is_none():
+    """When bbo_fetch=None, reduce-only quotes must not be dropped by BBO revalidation."""
+    c = _Client(account=_account(100.0), batch_response=_venue_ok())
+    r = _runner(c, curfew_enabled=False, oracle_fetch=lambda: _ORACLE, bbo_fetch=None, max_position_usd=5.0)
+
+    res = r.tick(_MID_SESSION, _ORACLE, {})
+    assert res.action == "quote"
+    assert c.last_batch, "blind reduce-only leg was erroneously dropped"
+    assert any(l["side"] == "sell" for l in c.last_batch)
+
+
+def test_reduce_only_blind_fallback_when_bbo_fetch_fails():
+    """When bbo_fetch returns None, reduce-only quotes must take blind fallback without being dropped."""
+    c = _Client(account=_account(100.0), batch_response=_venue_ok())
+    r = _runner(c, curfew_enabled=False, oracle_fetch=lambda: _ORACLE, bbo_fetch=lambda m: None, max_position_usd=5.0)
+
+    res = r.tick(_MID_SESSION, _ORACLE, {})
+    assert res.action == "quote"
+    assert c.last_batch, "failed-BBO reduce-only leg was erroneously dropped"
+    assert any(l["side"] == "sell" for l in c.last_batch)
+
+
 def test_uncapped_overnight_schedule_sets_carried_flag():
     """max_position_usd=0 leaves curfew.stage=UNSCHEDULED but schedule_stage=CLOSED."""
     c = _Client(account=_account(0.0), batch_response=_venue_ok())
