@@ -5,6 +5,17 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.16] — 2026-09-03 — micro-tick Permuto BBO depth & carried stress margin fallback
+
+- Micro-tick (`1e-6`) resolution fallback in Permuto BBO calculation: when competitor
+  orders park with sub-tick precision near the +2.0% ring ceiling, the runner falls back
+  to micro-tick resolution so valid resting asks inside the scoring ring are not falsely
+  shut down.
+- Carried-session stress margin fallback: when `batch_upsert` is rejected during
+  carried/overnight sessions by the venue's 8x portfolio stress margin check, the runner
+  automatically falls back to sending risk-reducing legs via `/exchange/order` so existing
+  short inventory can be actively worked off.
+
 ## [0.10.15] — 2026-09-03 — autodetect wallet fallback & reliable shutdown cancels
 
 - Fall back to inspecting local Chia wallet databases (`last_used_fingerprint`

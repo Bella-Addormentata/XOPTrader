@@ -226,7 +226,8 @@ def fetch_book(market: str, *, base_url: str,
 
 
 def earning_window(side: str, oracle: float, book: Book, *,
-                   ring_pct: float, tick_size: float) -> Window:
+                   ring_pct: float, tick_size: float,
+                   allow_subtick: bool = False) -> Window:
     """The prices on ``side`` that would both rest and earn credit.
 
     An ask must sit ABOVE the best bid or the venue refuses it post-only,
@@ -273,13 +274,32 @@ def earning_window(side: str, oracle: float, book: Book, *,
         strict_low=strict_low, strict_high=strict_high)
     ticks = (int(round((last - first) / tick_size)) + 1
              if last >= first - _EPS * tick_size else 0)
-    if ticks <= 0:
-        return Window(side=side, low=low, high=high, ticks=0, first=0.0, last=0.0)
-    return Window(side=side, low=low, high=high, ticks=ticks, first=first, last=last)
+    if ticks > 0:
+        return Window(side=side, low=low, high=high, ticks=ticks, first=first, last=last)
+
+    # [SUBTICK 2026-09-03] The venue accepts 6-decimal prices (1e-6 precision).
+    # When coarse tick_size (e.g. 0.0001) produces 0 ticks because competitor quotes
+    # sit with sub-tick precision near the ring ceiling (e.g. bid at 0.104103 vs ceiling 0.104111),
+    # fall back to micro-tick resolution (1e-6) so placeable resting asks inside the scoring ring
+    # are not falsely reported as shut.
+    if allow_subtick and tick_size > 1e-6:
+        micro_tick = 1e-6
+        s_low = (book.best_bid is not None and book.best_bid >= ring_lo - _EPS * micro_tick) if side == "ask" else False
+        s_high = (book.best_ask is not None and book.best_ask <= ring_hi + _EPS * micro_tick) if side == "bid" else False
+        first_m, last_m = _grid_bounds(
+            low, high, micro_tick,
+            strict_low=s_low, strict_high=s_high)
+        ticks_m = (int(round((last_m - first_m) / micro_tick)) + 1
+                   if last_m >= first_m - _EPS * micro_tick else 0)
+        if ticks_m > 0:
+            return Window(side=side, low=low, high=high, ticks=ticks_m, first=first_m, last=last_m)
+
+    return Window(side=side, low=low, high=high, ticks=0, first=0.0, last=0.0)
 
 
 def required_offset_pct(side: str, oracle: float, book: Book, *,
-                        ring_pct: float, tick_size: float) -> Optional[float]:
+                        ring_pct: float, tick_size: float,
+                        allow_subtick: bool = False) -> Optional[float]:
     """Offset from the oracle, in percent, that lands just clear of the book.
 
     Returns ``None`` when no such price exists -- the caller should then skip
@@ -291,7 +311,8 @@ def required_offset_pct(side: str, oracle: float, book: Book, *,
     """
     return required_ladder_offset_pct(
         side, oracle, oracle, book,
-        ring_pct=ring_pct, tick_size=tick_size)
+        ring_pct=ring_pct, tick_size=tick_size,
+        allow_subtick=allow_subtick)
 
 
 def required_ladder_offset_pct(
@@ -302,6 +323,7 @@ def required_ladder_offset_pct(
     *,
     ring_pct: float,
     tick_size: float,
+    allow_subtick: bool = False,
 ) -> Optional[float]:
     """Symmetric ladder offset that clears the book inside the oracle ring.
 
@@ -312,7 +334,8 @@ def required_ladder_offset_pct(
     if not (math.isfinite(reference) and reference > 0.0):
         return None
     window = earning_window(side, oracle, book,
-                            ring_pct=ring_pct, tick_size=tick_size)
+                            ring_pct=ring_pct, tick_size=tick_size,
+                            allow_subtick=allow_subtick)
     if not window.open:
         return None
     if side == "ask" and book.best_bid is None:
@@ -333,6 +356,7 @@ def placement_prices(
     preferred_offset_pct: float,
     ring_pct: float,
     tick_size: float,
+    allow_subtick: bool = True,
 ) -> Optional[tuple[float, float]]:
     """Exact ``(bid, ask)`` prices that rest and earn around a skewed center.
 
@@ -346,9 +370,11 @@ def placement_prices(
             and preferred_offset_pct >= 0.0):
         return None
     bid_window = earning_window(
-        "bid", oracle, book, ring_pct=ring_pct, tick_size=tick_size)
+        "bid", oracle, book, ring_pct=ring_pct, tick_size=tick_size,
+        allow_subtick=allow_subtick)
     ask_window = earning_window(
-        "ask", oracle, book, ring_pct=ring_pct, tick_size=tick_size)
+        "ask", oracle, book, ring_pct=ring_pct, tick_size=tick_size,
+        allow_subtick=allow_subtick)
     if not (bid_window.open and ask_window.open):
         return None
 
@@ -360,6 +386,14 @@ def placement_prices(
     desired_ask = _quantise(
         reference * (1.0 + preferred_offset_pct / 100.0),
         tick_size, up=True)
+    if desired_bid < bid_low or desired_bid > bid_high:
+        desired_bid = _quantise(
+            reference * (1.0 - preferred_offset_pct / 100.0),
+            1e-6, up=False)
+    if desired_ask < ask_low or desired_ask > ask_high:
+        desired_ask = _quantise(
+            reference * (1.0 + preferred_offset_pct / 100.0),
+            1e-6, up=True)
     bid = min(max(desired_bid, bid_low), bid_high)
     ask = min(max(desired_ask, ask_low), ask_high)
     if not (bid > 0.0 and ask > bid):
@@ -380,7 +414,7 @@ def rests_and_earns(side: str, price: float, oracle: float, book: Book, *,
     deviation = abs(price / oracle - 1.0) * 100.0
     if deviation > ring_pct + 1e-9:
         return False
-    epsilon = tick_size * _EPS
+    epsilon = min(tick_size, 1e-6) * _EPS
     if side == "ask":
         return (book.best_bid is None
                 or price > book.best_bid + epsilon)

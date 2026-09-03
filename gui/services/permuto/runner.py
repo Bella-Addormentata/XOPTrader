@@ -419,7 +419,8 @@ class QuoteRunner:
         for side in ("ask", "bid"):
             off = bbo_required_offset_pct(
                 side, oracle_f, reference_f, book,
-                ring_pct=self._ring_pct, tick_size=tick_size)
+                ring_pct=self._ring_pct, tick_size=tick_size,
+                allow_subtick=True)
             if off is None:
                 blocker = (book.best_bid if side == "ask"
                            else book.best_ask)
@@ -2259,7 +2260,37 @@ class QuoteRunner:
 
         payload = build_upsert_batch(legs, send_oracles,
                                      ring_pct=self._ring_pct)
-        response = self._client.batch_upsert(payload, now_s)
+        try:
+            response = self._client.batch_upsert(payload, now_s)
+        except (PermutoAuthError, BatchError) as exc:
+            if "Carried-session stress margin" in str(exc):
+                reduce_legs = [l for l in payload if l.get("reduce_only")]
+                if reduce_legs:
+                    _log.warning(
+                        "permuto: batch_upsert stress margin blocked (%s); "
+                        "sending %d reduce_only leg(s) via /exchange/order",
+                        exc, len(reduce_legs))
+                    single_sent = 0
+                    for rleg in reduce_legs:
+                        try:
+                            self._client.place_order({
+                                "market": rleg["market"],
+                                "side": rleg["side"],
+                                "price": rleg["price"],
+                                "size": rleg["size"],
+                                "order_type": "limit",
+                                "tif": rleg.get("tif", "gtc"),
+                                "reduce_only": True,
+                            }, now_s)
+                            single_sent += 1
+                        except Exception as sub_exc:
+                            _log.warning("permuto: single reduce_only order failed for %s: %s",
+                                         rleg["market"], sub_exc)
+                    if single_sent > 0:
+                        return TickResult(
+                            "quote", "placed reduce_only single orders under stress margin",
+                            {m: ("quote", "reduce_only posted") for m in self._markets})
+            raise
 
         # [release review] "partial" IS HTTP success on this venue, and the
         # response was thrown away -- a per-leg ALO refusal (a competitor's

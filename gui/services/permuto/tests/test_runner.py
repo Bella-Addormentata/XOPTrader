@@ -74,6 +74,14 @@ class _Client:
         self._maybe_fail("cancel_all")
         return {}
 
+    def place_order(self, leg, now_s):
+        self.calls.append("place_order")
+        if not hasattr(self, "placed_orders"):
+            self.placed_orders = []
+        self.placed_orders.append(leg)
+        self._maybe_fail("place_order")
+        return {"order_id": 123, "status": "posted"}
+
 
 def _runner(client, **kw):
     # [CURFEW] These tests tick at epoch 1.0, which the real session table
@@ -3718,3 +3726,27 @@ def test_failed_bbo_shut_cancellation_preserves_local_resting_belief():
     assert not r._resting[_MKT].empty
     assert r._resting[_MKT].bid_price == 0.0690
     assert r._resting[_MKT].ask_price == 0.0710
+
+
+def test_batch_upsert_stress_margin_fallback_sends_reduce_only_orders():
+    """When batch_upsert fails due to carried stress margin, reduce-only legs are sent via place_order."""
+    def fail_batch(legs):
+        raise PermutoAuthError('POST /exchange/batch_upsert -> HTTP 400 {"error":"Carried-session stress margin: need 1932053 USDC"}')
+
+    c = _Client(
+        account=_account(-100.0), # short position -> reduce-only buy
+        batch_response=fail_batch,
+    )
+
+    r = _runner(c, curfew_enabled=False, max_position_usd=5.0)
+    # Position $7 > $5 cap -> REDUCE_ONLY
+
+    res = r.tick(_MID_SESSION, _ORACLE, {})
+    assert res.action == "quote"
+    assert "place_order" in c.calls
+    assert len(c.placed_orders) == 1
+    placed = c.placed_orders[0]
+    assert placed["market"] == _MKT
+    assert placed["side"] == "buy"
+    assert placed["reduce_only"] is True
+    assert placed["order_type"] == "limit"

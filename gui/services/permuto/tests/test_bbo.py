@@ -222,3 +222,23 @@ def test_fetch_book_validates_payload_shape_and_rejects_malformed(monkeypatch):
     assert valid is not None
     assert valid.best_bid == 0.1001
     assert valid.best_ask == 0.1005
+
+
+def test_microtick_fallback_opens_window_under_subtick_squeeze():
+    """When a competitor bid sits at 0.104103 (6 decimals) near the +2.0% ceiling (0.104111),
+    coarse 0.0001 ticks would shut the window, but micro-ticks (1e-6) allow resting asks."""
+    from gui.services.permuto.bbo import placement_prices, rests_and_earns
+
+    oracle = 0.102070
+    book = _book(bid=0.104103, ask=None, market="QQQ-VOL-PERP")
+    window = earning_window("ask", oracle, book, ring_pct=RING, tick_size=TICK, allow_subtick=True)
+    assert window.open, "micro-tick fallback must open the earning window"
+    assert window.first == 0.104104
+    assert window.last <= oracle * 1.02 + 1e-9
+
+    prices = placement_prices(oracle, oracle, book, preferred_offset_pct=0.25, ring_pct=RING, tick_size=TICK, allow_subtick=True)
+    assert prices is not None
+    bid, ask = prices
+    assert ask == 0.104104
+    assert rests_and_earns("ask", ask, oracle, book, ring_pct=RING, tick_size=TICK)
+    assert rests_and_earns("bid", bid, oracle, book, ring_pct=RING, tick_size=TICK)
