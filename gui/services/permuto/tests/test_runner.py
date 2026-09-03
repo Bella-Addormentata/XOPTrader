@@ -1948,9 +1948,10 @@ def test_a_distant_own_bid_is_not_mistaken_for_the_external_wall():
     result = r.tick(1.0, {_MKT: oracle}, {})
 
     assert result.action == "risk_blocked"
-    assert c.cancelled == [], (
-        "a distant own bid was blamed for a competitor's ring wall and "
-        "needlessly cancelled")
+    assert result.markets[_MKT][0] == "skip", (
+        "a distant own bid was misclassified as an own-blocker reset")
+    assert c.cancelled == [[_MKT]], (
+        "shut market did not retract its own zero-credit resting remainder")
 
 
 def test_an_external_wall_does_not_block_a_healthy_sibling_market():
@@ -3581,3 +3582,27 @@ def test_uncapped_disabled_curfew_applies_carried_overnight_scaling():
     # Carried size is base_size / 8 = 2142.8
     total_size = sum(float(l["size"]) for l in legs)
     assert total_size == pytest.approx(4285.0, abs=5.0)
+
+
+def test_bbo_revalidation_checks_adjusted_prices_even_when_oracle_unchanged(monkeypatch):
+    """If preflight/band_guard modifies BBO leg price, BBO is revalidated against the book."""
+    from gui.services.permuto.bbo import Book
+    from gui.services.permuto.preflight import PreflightOutcome
+
+    c = _Client(account=_account(0.0), batch_response=_venue_ok())
+    # Competitor best bid is 0.0710. BBO places ask at 0.0711
+    book = Book(market=_MKT, best_bid=0.0710, best_ask=None)
+    # Oracle fetch returns same oracle (0.07)
+    r = _runner(c, curfew_enabled=False, oracle_fetch=lambda: _ORACLE, bbo_fetch=lambda m: book)
+
+    # Monkeypatch preflight_leg_price to simulate a price clamp moving the ask inward to 0.0709 (crossing best_bid 0.0710)
+    monkeypatch.setattr(
+        "gui.services.permuto.runner.preflight_leg_price",
+        lambda price, ref, **kw: PreflightOutcome(0.0709, changed=True, dropped=False)
+    )
+
+    res = r.tick(_MID_SESSION, _ORACLE, {})
+    # Since the altered ask price crosses the best_bid 0.0710, _revalidate_bbo drops the market
+    assert res.action == "skip" or res.markets[_MKT][0] == "skip"
+    last_batch = getattr(c, "last_batch", None)
+    assert last_batch is None or not any(l["market"] == _MKT for l in last_batch)

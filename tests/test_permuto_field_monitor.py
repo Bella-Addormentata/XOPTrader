@@ -38,3 +38,21 @@ def test_fetch_field_pages_until_empty_page_when_total_invalid(monkeypatch):
     monkeypatch.setattr(mod, "get", mock_get)
     rows, _ = fetch_field()
     assert len(rows) == 25
+
+
+def test_ring_state_computes_ask_ticks_on_empty_bid(monkeypatch):
+    import scripts.permuto_field_monitor as mod
+
+    def mock_get(path, timeout=25):
+        if path == "/info/oracle":
+            return {"prices": {"NVDA-VOL": 0.20, "QQQ-VOL": 0.10, "TSLA-VOL": 0.28}}
+        if path == "/info/meta":
+            return {"vol_aggressive_ring_pct": 2.0, "markets": [{"symbol": "QQQ-VOL-PERP", "tick_size": 0.0001}]}
+        if "/info/l2/" in path:
+            return {"bids": [], "asks": []}
+        return {}
+
+    monkeypatch.setattr(mod, "get", mock_get)
+    st = mod.ring_state()
+    assert st["QQQ-VOL-PERP"]["ask_ticks"] > 0
+    assert st["QQQ-VOL-PERP"]["best_bid"] is None

@@ -26,36 +26,26 @@ import argparse
 import json
 import math
 import os
+import sys
 import time
 import urllib.request
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from gui.services.permuto.bbo import (
+    DEFAULT_RING_PCT,
+    Book,
+    active_ring_pct,
+    earning_window,
+)
 
 BASE = "https://perps.permuto.capital"
 HEADERS = {"User-Agent": "Mozilla/5.0 (XOPTrader)", "Accept": "application/json"}
 OUT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                    "data", "field_monitor.jsonl")
 MARKETS = ("NVDA-VOL-PERP", "QQQ-VOL-PERP", "TSLA-VOL-PERP")
-
-try:
-    from gui.services.permuto.bbo import DEFAULT_RING_PCT, active_ring_pct
-except ImportError:
-    DEFAULT_RING_PCT = 2.0
-
-    def active_ring_pct(meta, default=DEFAULT_RING_PCT):
-        stack = [meta]
-        while stack:
-            node = stack.pop()
-            if isinstance(node, dict):
-                if "vol_aggressive_ring_pct" in node:
-                    try:
-                        value = float(node["vol_aggressive_ring_pct"])
-                    except (TypeError, ValueError):
-                        value = 0.0
-                    if math.isfinite(value) and value > 0.0:
-                        return value, "venue"
-                stack.extend(node.values())
-            elif isinstance(node, list):
-                stack.extend(node)
-        return default, "default"
 
 
 def get(path, timeout=25):
@@ -83,26 +73,38 @@ def ring_state():
     out = {}
     try:
         prices = (get("/info/oracle") or {}).get("prices") or {}
-        ring_pct, ring_source = active_ring_pct(get("/info/meta"))
+        meta = get("/info/meta") or {}
+        ring_pct, ring_source = active_ring_pct(meta)
+        specs = {}
+        for entry in (meta.get("markets") or []):
+            if isinstance(entry, dict) and entry.get("symbol"):
+                try:
+                    specs[entry["symbol"]] = float(entry.get("tick_size") or 0.0001)
+                except (TypeError, ValueError):
+                    pass
     except Exception as exc:  # noqa: BLE001
         return {"error": str(exc)[:120]}
     for market in MARKETS:
         try:
             oracle = float(prices[market.replace("-PERP", "")])
-            book = get("/info/l2/%s?levels=1" % market)
-            bids = book.get("bids") or []
+            book_raw = get("/info/l2/%s?levels=1" % market)
+            bids = book_raw.get("bids") or []
+            asks = book_raw.get("asks") or []
             best_bid = float(bids[0]["price"]) if bids else None
+            best_ask = float(asks[0]["price"]) if asks else None
+            tick_size = specs.get(market, 0.0001)
+            book_obj = Book(market=market, best_bid=best_bid, best_ask=best_ask)
+            window = earning_window("ask", oracle, book_obj, ring_pct=ring_pct, tick_size=tick_size)
             ring_hi = oracle * (1.0 + ring_pct / 100.0)
             out[market] = {
                 "oracle": oracle,
                 "best_bid": best_bid,
+                "best_ask": best_ask,
                 "ring_hi": ring_hi,
                 "ring_pct": ring_pct,
                 "ring_source": ring_source,
-                # Ticks of room for an ask that rests AND earns.
-                "ask_ticks": (int((ring_hi - best_bid) / 0.0001)
-                              if best_bid is not None and ring_hi > best_bid
-                              else 0),
+                "tick_size": tick_size,
+                "ask_ticks": window.ticks,
             }
         except Exception as exc:  # noqa: BLE001
             out[market] = {"error": str(exc)[:120]}

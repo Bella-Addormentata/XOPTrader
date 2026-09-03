@@ -1421,6 +1421,8 @@ class QuoteRunner:
         to_cancel: list = []
         bbo_resets: list = []
         bbo_placements: set = set()
+        bbo_initial_prices: dict = {}
+        observed_books: dict = {}
         start_bbo_tick = getattr(self._bbo_fetch, "start_tick", None)
         if callable(start_bbo_tick):
             start_bbo_tick()
@@ -1565,6 +1567,8 @@ class QuoteRunner:
                 _status, _observed, _observed_book = self._bbo_offset_pct(
                     market, oracle, reference, _tick, eff_half_spread,
                     _extra_offset, _ring_backoff)
+                if _observed_book is not None:
+                    observed_books[market] = _observed_book
                 if (_status == "reset"
                         and risk.action is not RiskAction.REDUCE_ONLY):
                     to_cancel.append(market)
@@ -1594,6 +1598,9 @@ class QuoteRunner:
                     # either way; the difference is whether we are getting
                     # closer to earning again or standing still.
                     if risk.action is not RiskAction.REDUCE_ONLY:
+                        if not self._resting.get(market, RestingQuote()).empty:
+                            to_cancel.append(market)
+                            self._resting[market] = RestingQuote()
                         results[market] = (
                             "skip",
                             "no tick-aligned price rests inside the %.1f%% "
@@ -1609,6 +1616,7 @@ class QuoteRunner:
                 elif _status == "ok":
                     _bbo_prices = _observed
                     bbo_placements.add(market)
+                    bbo_initial_prices[market] = _observed
             try:
                 _lot = float(spec.get("lot_size", 1.0) or 1.0)
             except (TypeError, ValueError):
@@ -1952,7 +1960,7 @@ class QuoteRunner:
             return kept_legs, dropped
 
         def _revalidate_bbo(pending, sources):
-            """Drop BBO-shaped markets invalidated by a newer oracle read."""
+            """Drop BBO-shaped markets invalidated by price adjustments or newer oracle."""
             dropped = set()
             for market in bbo_placements:
                 original = latest_oracle(oracles, None, market)
@@ -1961,29 +1969,48 @@ class QuoteRunner:
                     current = latest_oracle(source, None, market)
                     if current > 0.0:
                         break
-                if current <= 0.0 or current == original:
+                if current <= 0.0:
+                    current = original
+
+                market_legs = [leg for leg in pending
+                               if leg.market == market]
+                if not market_legs:
                     continue
-                try:
-                    book = self._bbo_fetch(market)
-                except Exception as exc:  # noqa: BLE001
-                    _log.debug("permuto: final BBO fetch failed for %s: %s",
-                               market, exc)
-                    book = None
+
+                initial_prices = bbo_initial_prices.get(market)
+                prices_unchanged = (
+                    initial_prices is not None
+                    and all(
+                        leg.price == (initial_prices[0] if leg.side is Side.BUY else initial_prices[1])
+                        for leg in market_legs
+                    )
+                )
+
+                if current == original and prices_unchanged:
+                    continue
+
+                book = None
+                if current == original and market in observed_books:
+                    book = observed_books[market]
+                elif self._bbo_fetch is not None:
+                    try:
+                        book = self._bbo_fetch(market)
+                    except Exception as exc:  # noqa: BLE001
+                        _log.debug("permuto: final BBO fetch failed for %s: %s",
+                                   market, exc)
+                        book = None
+
                 if book is None:
                     dropped.add(market)
                     results[market] = (
                         "skip",
-                        "oracle moved after the BBO read and the final book "
-                        "could not be read inside the tick budget")
+                        "BBO price altered or oracle moved after read, and the "
+                        "final book could not be read inside the tick budget")
                     continue
                 raw_specs = flags.get("specs")
                 spec = (raw_specs.get(market, {})
                         if isinstance(raw_specs, dict) else {})
                 tick_size = _effective_tick(spec.get("tick_size"))
-                market_legs = [leg for leg in pending
-                               if leg.market == market]
-                if not market_legs:
-                    continue
                 if all(
                     bbo_rests_and_earns(
                         "bid" if leg.side is Side.BUY else "ask",
@@ -1995,12 +2022,11 @@ class QuoteRunner:
                 dropped.add(market)
                 results[market] = (
                     "skip",
-                    "oracle moved after the BBO read; the refreshed book no "
-                    "longer admits both legs inside the depth ring")
+                    "adjusted BBO leg or refreshed oracle no longer admits "
+                    "both legs inside the depth ring")
                 _log.info(
-                    "permuto: %s oracle moved %.6f -> %.6f after BBO "
-                    "placement; dropping the stale pair and rebuilding "
-                    "from a coherent snapshot next tick",
+                    "permuto: %s BBO placement invalidated (oracle %.6f -> %.6f); "
+                    "dropping stale pair and rebuilding next tick",
                     market, original, current)
             if not dropped:
                 return list(pending), dropped
