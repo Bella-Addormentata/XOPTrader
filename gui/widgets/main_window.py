@@ -327,8 +327,26 @@ class MainWindow(QMainWindow):
         self._dexie_intent_synced: bool = False
         # Startup requests from the Settings > Startup tab, applied ONCE
         # through the same gates as a click. dexie: adopt|on|off.
-        from gui.widgets.settings import load_startup_states
+        from gui.widgets.settings import (
+            load_permuto_enabled,
+            load_startup_states,
+        )
         self._startup_dexie, self._startup_permuto = load_startup_states()
+        # [PERMUTO MASTER SWITCH] Read ONCE, before anything Permuto-shaped
+        # is built, because what it gates is construction: the toolbar
+        # switch, the page, and the identity read each of those performs.
+        # Everything downstream reads this attribute, never the store, so a
+        # runtime flip cannot leave half the window on the old answer.
+        self._permuto_enabled: bool = load_permuto_enabled()
+        # Whether the REAL surfaces were built this session. A subsystem
+        # switched off at startup has no switch and no page to bring back,
+        # so re-enabling it is a restart -- and this is how the window knows
+        # the difference between "hidden" and "never built".
+        self._permuto_built: bool = self._permuto_enabled
+        if not self._permuto_enabled:
+            # A stored "Permuto: On at startup" must not survive the master
+            # switch. Belt to the guard in _apply_permuto_startup_state.
+            self._startup_permuto = "off"
         # [STARTINTENT v0.10.11] The slider claims INTENT, and a stored
         # "start with dexie on" IS the operator's intent -- so it paints ON
         # from the first tick while the chip explains the engine is still
@@ -388,6 +406,13 @@ class MainWindow(QMainWindow):
         self._tab_order_panel: Optional[QWidget] = None
         self._warp_widget: Optional[QWidget] = None
         self._base_wallet_widget: Optional[QWidget] = None
+        # Declared like every other page. Both were previously assigned only
+        # inside their builders, which is why closeEvent and
+        # _make_permuto_live read them directly while other call sites went
+        # through getattr -- and why a window that never built them raised
+        # AttributeError rather than reading None.
+        self._permuto_widget: Optional[QWidget] = None
+        self._permuto_switch: Optional[QWidget] = None
 
         # -- Settings persistence -------------------------------------------
         self._settings = QSettings(_ORG_NAME, _APP_NAME)
@@ -438,7 +463,8 @@ class MainWindow(QMainWindow):
         # only on the page and identity existing -- a short defer covers
         # construction ordering. Dexie's request is applied in the intent
         # sync instead, where the gates are real.
-        QTimer.singleShot(1500, self._apply_permuto_startup_state)
+        if self._permuto_enabled:
+            QTimer.singleShot(1500, self._apply_permuto_startup_state)
         # [PEGSUSPEND] Wire the Depeg tab's live peg panel to the metrics
         # service and the re-enable channel.
         settings_widget = self._unwrap(self._settings_widget)
@@ -1724,10 +1750,24 @@ class MainWindow(QMainWindow):
             self._on_dexie_cancel_all)
         toolbar.addWidget(self._dexie_switch)
 
-        self._permuto_switch = VenueSwitch("permuto", self._gather_permuto)
-        self._permuto_switch.toggleRequested.connect(self._on_permuto_toggle)
-        self._permuto_switch.refused.connect(self._on_switch_refused)
-        toolbar.addWidget(self._permuto_switch)
+        # [PERMUTO MASTER SWITCH] Not built at all when the subsystem is
+        # off, rather than built and hidden. VenueSwitch.__init__ ends in
+        # self.refresh(), which calls _gather_permuto, which opens and parses
+        # secrets.yaml -- so constructing it is itself the thing the master
+        # switch promises is not happening. The QWidgetAction is kept so the
+        # switch can be hidden ACTION-and-all at runtime; hiding only the
+        # child widget leaves a QToolBar layout gap.
+        if self._permuto_enabled:
+            self._permuto_switch = VenueSwitch("permuto",
+                                               self._gather_permuto)
+            self._permuto_switch.toggleRequested.connect(
+                self._on_permuto_toggle)
+            self._permuto_switch.refused.connect(self._on_switch_refused)
+            self._permuto_switch_action = toolbar.addWidget(
+                self._permuto_switch)
+        else:
+            self._permuto_switch = None
+            self._permuto_switch_action = None
 
         # Pause / Resume button
         self._pause_resume_btn = QPushButton("Pause Trading")
@@ -1874,6 +1914,8 @@ class MainWindow(QMainWindow):
         # -- Sidebar --------------------------------------------------------
         self._sidebar = Sidebar(self)
         self._sidebar.page_changed.connect(self._on_page_changed)
+        # Hidden, not removed: _NAV_ITEMS positions ARE the page indices.
+        self._sidebar.set_page_visible(_PAGE_PERMUTO, self._permuto_enabled)
         outer_layout.addWidget(self._sidebar)
 
         # -- Vertical splitter (top content / bottom tabs) ------------------
@@ -1922,12 +1964,30 @@ class MainWindow(QMainWindow):
             BaseWalletWidget, "Base Wallet"
         )
         self._stacked.addWidget(self._base_wallet_widget)
-        self._permuto_widget = self._create_page_widget(            # index 9
-            PermutoWidget, "Permuto"
-        )
+        # [PERMUTO MASTER SWITCH] Index 9 is ALWAYS occupied, disabled or
+        # not. The page indices are positional -- _PAGE_SETTINGS is 10
+        # because Permuto is 9 -- and the last time that assumption slipped,
+        # the first-run "you have no config" redirect opened a key-generation
+        # page instead of Settings. A placeholder holds the slot; what it
+        # does not do is construct PermutoWidget, whose __init__ calls
+        # refresh() and reads the identity out of secrets.yaml.
+        if self._permuto_enabled:
+            self._permuto_widget = self._create_page_widget(     # index 9
+                PermutoWidget, "Permuto"
+            )
+        else:
+            self._permuto_widget = _placeholder_widget(
+                "The Permuto market maker is switched off.\n"
+                "Settings → Advanced → Subsystems"
+            )
         self._stacked.addWidget(self._permuto_widget)
         self._settings_widget = self._create_page_widget(SettingsWidget, "Settings")
         self._stacked.addWidget(self._settings_widget)              # index 10
+        settings_page = self._unwrap(self._settings_widget)
+        if settings_page is not None and hasattr(
+                settings_page, "permuto_enabled_changed"):
+            settings_page.permuto_enabled_changed.connect(
+                self._on_permuto_enabled_changed)
         self._splitter.addWidget(self._stacked)
 
         # Bottom area: tab widget (35 %)
@@ -2163,6 +2223,11 @@ class MainWindow(QMainWindow):
         index : int
             Zero-based page index.
         """
+        # Defence in depth behind Sidebar's own guard: a hidden page has no
+        # nav entry to show the selection, so landing on one strands the
+        # operator on a screen with nothing highlighted.
+        if not self._sidebar.is_page_visible(index):
+            index = _PAGE_DASHBOARD
         self._stacked.setCurrentIndex(index)
         self._sidebar.select_page(index)
 
@@ -2497,6 +2562,24 @@ class MainWindow(QMainWindow):
             return False
 
     def _gather_permuto(self) -> SwitchInputs:
+        # [PERMUTO MASTER SWITCH] Before the try, and that placement is the
+        # whole point. The identity probe below maps EVERY exception to
+        # "not_registered", so a sentinel raised from the factory would be
+        # swallowed and the chip would tell the operator their key is not
+        # registered with a venue they switched off. It also has to be
+        # before the read itself: this runs on every bridge tick, and the
+        # read it skips is an open() plus a full YAML parse of secrets.yaml
+        # several times a minute for a subsystem that is not running.
+        if not getattr(self, "_permuto_enabled", True):
+            return SwitchInputs(
+                desired_on=False,
+                gates=frozenset({"disabled"}),
+                book_is_empty=True,
+                book_observed=False,
+                # Nothing of ours can be resting, because nothing of ours
+                # was ever started this session.
+                book_verified=True,
+            )
         gates: set[str] = set()
         try:
             from gui.widgets.permuto import _default_identity_factory
@@ -2665,6 +2748,10 @@ class MainWindow(QMainWindow):
         re-arms itself instead of resting a cancelled book until a human
         notices.
         """
+        # BEFORE the one-shot latch, so a master switch flipped off inside
+        # the 1500 ms window also neutralises a timer already scheduled.
+        if not getattr(self, "_permuto_enabled", True):
+            return
         if self._startup_permuto_applied:
             return
         self._startup_permuto_applied = True
@@ -2693,6 +2780,15 @@ class MainWindow(QMainWindow):
                 _log.debug("permuto: could not update the close control")
 
     def _on_permuto_toggle(self, want_on: bool) -> None:
+        # [PERMUTO MASTER SWITCH] The ON branch only. venue_control's first
+        # rule is that nothing may stand between an operator and stopping,
+        # and disabling the subsystem is exactly when a stop is most needed
+        # -- this method is the stop path the disable handler itself calls.
+        if want_on and not getattr(self, "_permuto_enabled", True):
+            self._on_switch_refused(
+                "the Permuto market maker is switched off in "
+                "Settings > Advanced")
+            return
         if want_on:
             # [INTENT v0.10.7] The slider records intent unconditionally;
             # the START is what gates. With the widget no longer refusing
@@ -2762,6 +2858,120 @@ class MainWindow(QMainWindow):
                 self._permuto_runner.stop()
         self._refresh_venue_switches()
 
+    def _on_permuto_enabled_changed(self, enabled: bool) -> None:
+        """The Settings > Advanced master switch moved.
+
+        OFF is a venue STOP before it is a UI change, and the order is
+        load-bearing. Permuto orders rest at a remote venue and outlive this
+        process; the clean-stop path also DISARMS the venue-side scheduled
+        cancel once its own cancel_all reports success. So hiding the page
+        and the switch over a book that did not actually go away would take
+        the operator's last in-process way to retract it AND the venue-side
+        net underneath it -- the 2026-08-25 "OFF over a live book" incident,
+        replayed on a leveraged venue. Nothing is hidden until the book is
+        confirmed gone, and if the cancel fails the switch stays put.
+
+        ON cannot be applied here at all. The toolbar switch and the page
+        are built during window construction, and the sidebar and stack
+        indices are positional, so a session that started without them has
+        nowhere to put them. The operator is told to restart rather than
+        left looking for a control that will not appear.
+        """
+        if enabled:
+            if self._permuto_built:
+                # Built this session and merely hidden -- put it back.
+                self._permuto_enabled = True
+                self._set_permuto_surfaces_visible(True)
+                _log.info("[Permuto] subsystem re-enabled")
+                self.statusBar().showMessage(
+                    "Permuto market maker enabled.", 6000)
+            else:
+                _log.info("[Permuto] enable stored; applies at next start")
+                self.statusBar().showMessage(
+                    "Permuto will be enabled the next time XOPTrader "
+                    "starts.", 10000)
+            return
+
+        # -- OFF -----------------------------------------------------------
+        if self._permuto_runner is not None:
+            reply = QMessageBox.question(
+                self,
+                "Stop Permuto?",
+                "A Permuto session is live. Switching the subsystem off "
+                "will stop it and cancel every resting order first, which "
+                "can take up to 30 seconds.\n\nContinue?",
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                self._revert_permuto_enabled(True)
+                return
+
+            # may_turn_off is unconditional by design; this is the same stop
+            # an operator click performs.
+            self._on_permuto_toggle(False)
+            try:
+                # stop() only sets a flag -- the cancel runs on the worker
+                # thread and lands seconds later. join() is what waits for
+                # it, and waiting is the entire safety argument here.
+                self._permuto_runner.join()
+            except Exception:  # noqa: BLE001
+                _log.exception("[Permuto] session did not stop cleanly")
+
+            if not self._permuto_runner.book_is_empty():
+                _log.warning("[Permuto] refusing to hide the subsystem: the "
+                             "book is not confirmed empty")
+                self._revert_permuto_enabled(True)
+                QMessageBox.warning(
+                    self,
+                    "Permuto is still exposed",
+                    "The session stopped but its cancel was not confirmed, "
+                    "so orders may still be resting at the venue. The "
+                    "Permuto switch and page have been left in place so you "
+                    "can close the position. Try again once the book is "
+                    "flat.",
+                )
+                return
+
+        self._permuto_enabled = False
+        # A pending startup arm must not fire into a subsystem being torn
+        # down; _apply_permuto_startup_state also checks the flag.
+        self._startup_permuto = "off"
+        # A hidden page whose 5-second markets timer still runs is still
+        # making requests to the venue.
+        page = self._unwrap(self._permuto_widget)
+        if page is not None and hasattr(page, "stop_background_work"):
+            try:
+                page.stop_background_work()
+            except Exception:  # noqa: BLE001
+                _log.exception("[Permuto] page workers did not stop cleanly")
+        self._set_permuto_surfaces_visible(False)
+        _log.info("[Permuto] subsystem disabled")
+        self.statusBar().showMessage(
+            "Permuto market maker disabled.", 6000)
+
+    def _set_permuto_surfaces_visible(self, visible: bool) -> None:
+        """Show or hide every Permuto surface this window owns."""
+        # The ACTION, not just the widget: hiding a toolbar child without
+        # its QWidgetAction leaves the space it occupied behind.
+        action = getattr(self, "_permuto_switch_action", None)
+        if action is not None:
+            action.setVisible(visible)
+        if self._permuto_switch is not None:
+            self._permuto_switch.setVisible(visible)
+        self._sidebar.set_page_visible(_PAGE_PERMUTO, visible)
+        if not visible and self._stacked.currentIndex() == _PAGE_PERMUTO:
+            # Nothing else moves the current page, and there is no
+            # last-page persistence to fall back on.
+            self._switch_page(_PAGE_DASHBOARD)
+
+    def _revert_permuto_enabled(self, enabled: bool) -> None:
+        """Put the Settings checkbox back after a refused change."""
+        page = self._unwrap(self._settings_widget)
+        if page is not None and hasattr(page, "set_permuto_enabled"):
+            page.set_permuto_enabled(enabled)
+
     def _make_permuto_live(self):
         """Build the live session. Separated so tests can inject a fake."""
         from gui.services.permuto.live import PermutoLive
@@ -2774,10 +2984,21 @@ class MainWindow(QMainWindow):
         # loop trades another is how an operator misreads their own risk.
         page = self._unwrap(self._permuto_widget)
         kwargs = {}
-        if page is not None:
+        # getattr, not attribute access. Index 9 is not always a
+        # PermutoWidget: the master switch parks a placeholder there, and
+        # _create_page_widget already substitutes one whenever a page's
+        # import or constructor fails. Reading the attributes directly
+        # turned that into an AttributeError swallowed by the caller as
+        # "could not start Permuto quoting: '_placeholder' object has no
+        # attribute '_target_depth_usd'". Absent means "use PermutoLive's
+        # own defaults", which are the same numbers.
+        depth = getattr(page, "_target_depth_usd", None)
+        position = getattr(page, "_max_position_usd", None)
+        if depth is not None and position is not None:
             kwargs = {
-                "target_depth_usd": page._target_depth_usd,
-                "max_position_usd": page._max_position_usd,
+                "target_depth_usd": depth,
+                "max_position_usd": position,
+                # Already getattr on main -- the other two now match it.
                 "ring_pct": getattr(page, "_ring_pct", 2.0),
             }
         # [CURFEW] Read fresh per session, so toggling the setting takes

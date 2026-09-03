@@ -71,6 +71,8 @@ class VenueState(str, Enum):
 #: the switch reports the gate the engine is actually applying rather than a
 #: second opinion computed in the GUI.
 GATE_LABELS: dict[str, str] = {
+    "disabled": ("the Permuto market maker is switched off in "
+                 "Settings > Advanced"),
     "breaker": "a risk breaker has tripped -- restart required",
     "watchdog": "the dead man's switch fired -- restart required",
     "wallet_circuit": "the wallet circuit breaker is open",
@@ -324,6 +326,11 @@ def may_turn_on(inputs: SwitchInputs) -> tuple[bool, str]:
 
 #: Most-serious first, so the named reason is the one that matters most.
 _GATE_ORDER = (
+    # FIRST, above even the protection latches. They answer "why will this
+    # venue not trade"; this one answers "why is this venue here at all".
+    # An operator who switched the whole subsystem off must not be told the
+    # dead man's switch fired.
+    "disabled",
     "watchdog",
     "breaker",
     "flash_crash",

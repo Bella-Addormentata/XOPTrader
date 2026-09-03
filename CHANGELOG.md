@@ -5,6 +5,73 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — a switch for the venue, not just for the quoting
+
+The toolbar switch says whether Permuto is QUOTING. Nothing said whether
+Permuto is *there* — and the difference is not cosmetic, because a venue
+nobody has armed is still working:
+
+- `VenueSwitch.__init__` ends in `refresh()`, which calls `_gather_permuto`,
+  which opens and `yaml.safe_load`s the whole of `secrets.yaml`. So does
+  every later tick: `_refresh_venue_switches` runs from `_on_bridge_data`,
+  several times a minute, forever.
+- `PermutoWidget.__init__` calls `refresh()`, which reads the identity
+  again — during window construction, before anything is shown.
+- `set_bridge` schedules the "Permuto: On at startup" arm on a 1.5 s timer.
+
+With the account liquidated on 2026-09-01 and the contest over, that is a
+running subsystem with nothing to do.
+
+- **A master switch**, in Settings → Advanced → Subsystems, persisted to
+  `QSettings` under `permuto/enabled` beside the existing `permuto/curfew_enabled`.
+  Off removes the toolbar switch, the sidebar entry and the page, refuses the
+  startup arm, and stops both identity reads. It **defaults to on**: the
+  default has to be the software the operator had yesterday, and a silent
+  default of off would make an upgrade look like a venue that vanished.
+- **Hidden, never renumbered.** `_NAV_ITEMS` keeps all eleven entries and
+  index 9 keeps a page — a placeholder rather than a `PermutoWidget`. The
+  page indices are positional, and the last time that slipped, `_PAGE_SETTINGS`
+  stayed 9 while Permuto took it, and the first-run "you have no config"
+  redirect opened a key-generation screen instead of Settings.
+- **Off is a venue stop before it is a UI change.** With a live session the
+  toggle confirms, stops, and `join()`s — `stop()` only sets a flag; the
+  cancel lands seconds later on the worker thread — then verifies the book
+  is empty. If the cancel is not confirmed it **refuses to hide anything**
+  and says so. The clean-stop path disarms the venue-side scheduled cancel
+  as soon as `cancel_all` reports success, so hiding the page over a book
+  that did not actually go away would remove the operator's close control
+  and the net underneath it in the same click.
+- **Off applies immediately; on waits for a restart.** The toolbar switch
+  and the page are built during window construction and the indices are
+  positional, so a session that started without them has nowhere to put
+  them. The control says so rather than pretending.
+- `disabled` is a first-class gate in `venue_control`, ordered **above**
+  `watchdog` and `breaker`. Those say why a venue will not trade; this says
+  why the venue is not here, and an operator who switched Permuto off must
+  not be told the dead man's switch fired.
+
+Three pre-existing faults surfaced while gating this and are fixed here:
+
+- `_make_permuto_live` read `page._target_depth_usd` and `page._max_position_usd`
+  directly. Index 9 is not always a `PermutoWidget` — `_create_page_widget`
+  already substitutes a placeholder whenever a page's import or constructor
+  fails — so arming after such a failure raised `AttributeError`, swallowed
+  as `could not start Permuto quoting: '_placeholder' object has no attribute
+  '_target_depth_usd'`. Now `getattr`, falling back to `PermutoLive`'s own
+  defaults, which are the same numbers.
+- `Sidebar.select_page` bounds-checked its argument and nothing else, so a
+  hidden entry stayed programmatically selectable.
+- The Advanced tab's five dirty-tracking lambdas passed tab index 10, which
+  is Startup. Editing the raw YAML box put the unsaved marker on a tab whose
+  controls write straight to `QSettings` and are never part of a save, while
+  Advanced's own unsaved edits showed as clean.
+
+`tests/test_sizing_path_wiring.py` and the two window fixtures in
+`gui/services/permuto/tests/test_venue_control.py` now seal the identity and
+the startup/enabled loaders. The sizing test is the only one that calls
+`set_bridge` on a real window, and `set_bridge` schedules the startup arm:
+on a box whose operator had registered an identity and stored "Permuto: On
+at startup", a test run was one `start()` from placing live orders.
 ## [0.10.21] — 2026-09-03 — expand BBO fetch budget & micro-tick requote drift tolerance
 
 - Expanded per-tick BBO fetch budget to 2.0s (1.0s timeout per request) in `live.py` to prevent
