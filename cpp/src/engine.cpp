@@ -831,6 +831,21 @@ void Engine::watchdog_cancel_book(const std::string&              why,
         wal_cfg.tls.key_path     = config_.chia.wallet_key_path;
         wal_cfg.tls.ca_cert_path = config_.chia.ca_cert_path;
         wal_cfg.verify_ssl       = config_.chia.verify_ssl;
+        // [F6] PIN THE BOUND AT THE CALL SITE. This path takes no deadline
+        // and cannot be gated by one -- wioc.run() below blocks the calling
+        // thread until the RPC finishes, and there is no admission check to
+        // hang a deadline on. What bounds it is the RPC config, which was
+        // left at ChiaRPCConfig's defaults and then quoted as "123.5 s" in a
+        // comment 700 lines away. Set the three numbers here so the figure
+        // this file states is the figure this call actually uses:
+        //   (max_retries + 1) x request_timeout + backoff(0.5 + 1 + 2 s)
+        //   = 4 x 30 s + 3.5 s = 123.5 s.
+        // This is the LAST leg of a shutdown that reaches it, so it is a real
+        // addend in the per-path table at the top of Engine::shutdown(), not
+        // a footnote.
+        wal_cfg.request_timeout  = std::chrono::milliseconds(30'000);
+        wal_cfg.max_retries      = 3;
+        wal_cfg.retry_base_delay = std::chrono::milliseconds(500);
         auto wallet = std::make_shared<rpc::ChiaWalletRPC>(wioc, wal_cfg);
 
         std::string failure;
@@ -1245,11 +1260,53 @@ void Engine::shutdown()
                 // double-spends the book and can escalate into the
                 // watchdog fallback via the shortfall check. Plain-bool
                 // wait is safe: single ioc_ thread.
-                while (cancel_all_inflight_) {
-                    asio::steady_timer wait_timer(ioc_);
-                    wait_timer.expires_after(
-                        std::chrono::milliseconds(250));
-                    co_await wait_timer.async_wait(asio::use_awaitable);
+                //
+                // =========================================================
+                // [F6 2026-09-03] BOUNDED. THIS WAIT WAS THE HOLE UNDER
+                // EVERY NUMBER THIS FILE STATES.
+                // =========================================================
+                // It was `while (cancel_all_inflight_)` with no cap and no
+                // counter. The flag is cleared by a DIFFERENT coroutine
+                // (check_cancel_all_flag's), which awaits wallet RPCs -- so
+                // "TOTAL SHUTDOWN WORST CASE" was being quoted for a
+                // shutdown that could not begin until an unrelated
+                // coroutine finished, and before that coroutine was given a
+                // deadline of its own (see check_cancel_all_flag) its
+                // emergency ladder was unbounded outright. An engine that
+                // refuses to exit is its own outage.
+                //
+                // ON EXPIRY WE DO NOT STACK A CANCEL. The hand-over is
+                // REFUSED, not overridden: the write-ahead marker below
+                // still reaches disk (file I/O, no RPC), the operator is
+                // alerted, and BOTH spenders -- the retry ladder and the
+                // S31 fallback -- are skipped, because either one would
+                // issue the second charged cancel over the same coins that
+                // this wait exists to prevent. Refusing to spend is the
+                // safe direction: the cancel-all coroutine already wrote
+                // its own intent marker before it started, so the next
+                // engine finishes the job by asking the wallet.
+                //
+                // Stated plainly, because it is a real cost of bounding
+                // this: when we time out, ioc_.stop() below abandons that
+                // coroutine mid-RPC. That is a process about to exit either
+                // way, and the alternative was not exiting at all.
+                bool cancel_all_handover_failed = false;
+                {
+                    const auto handover_give_up =
+                        std::chrono::steady_clock::now()
+                        + std::chrono::milliseconds(
+                              execution::kCancelAllHandoverWaitMs);
+                    while (cancel_all_inflight_) {
+                        if (std::chrono::steady_clock::now()
+                                >= handover_give_up) {
+                            cancel_all_handover_failed = true;
+                            break;
+                        }
+                        asio::steady_timer wait_timer(ioc_);
+                        wait_timer.expires_after(
+                            std::chrono::milliseconds(250));
+                        co_await wait_timer.async_wait(asio::use_awaitable);
+                    }
                 }
                 // ---------------------------------------------------------
                 // [S46 2026-09-02] THE RETRY LEG.
@@ -1338,14 +1395,116 @@ void Engine::shutdown()
                 };
 
                 const execution::CancelRetryConfig retry_cfg{};
-                // The hard wall-clock stop, handed INTO cancel_ids so the
-                // budget bounds the RPCs and not merely the sleeps between
-                // them. Without this the loop re-checked the clock only after
-                // an attempt returned, and one attempt over a 7-offer book
-                // against a hanging wallet ran ~865 s -- past
+                // The wall-clock stop, handed INTO cancel_ids so the budget
+                // bounds when RPCs may START and not merely the sleeps
+                // between attempts. Without this the loop re-checked the
+                // clock only after an attempt returned, and one attempt over
+                // a 7-offer book against a hanging wallet ran ~865 s -- past
                 // watchdog_stall_seconds{600}, at which point the watchdog
                 // fires a second concurrent bulk cancel over the same offers
                 // and double-spends the fees.
+                //
+                // ============================================================
+                // [F5/F6] THIS IS NOT A HARD WALL-CLOCK BOUND, AND THE PR
+                // THAT SAID IT WAS, WAS WRONG. TWICE.
+                // ============================================================
+                // The deadline gates ADMISSION. It cannot interrupt a
+                // co_await already in progress: rpc_post offers no
+                // cancellation and abandoning the await is memory-unsafe
+                // (the blocking curl transfer writes into the outer
+                // coroutine frame by reference). It does set CURLOPT_TIMEOUT_MS
+                // from request_timeout (chia_rpc.cpp:449), so ONE rpc_post is
+                // bounded: max_retries{3}+1 = 4 transfers at 30 s plus
+                // 0.5+1+2 s of backoff = 123.5 s. Call that one RPC UNIT.
+                //
+                // THE HISTORY, because it is the reason this block is now a
+                // table and not a total. The PR first claimed a "hard bound"
+                // of 90 s; a review showed that false. The repair claimed
+                // ~247 s; verification showed THAT false too, on two
+                // reachable paths -- the S31 fallback below (never gated, not
+                // counted) and the operator cancel-all hand-over above (never
+                // bounded at all). A deadline was threaded into one path and
+                // then described as if it bounded every path. So: PER PATH,
+                // with what bounds each, and no figure that is not the sum of
+                // rows printed here.
+                //
+                // ---------------------------------------------------------
+                // EVERY LEG OF Engine::shutdown(), IN ORDER
+                // ---------------------------------------------------------
+                //  1. cancel-all hand-over wait (above)
+                //       BOUNDED  <= kCancelAllHandoverWaitMs = 20 s.
+                //       [F6] Previously UNBOUNDED. On expiry legs 3, 4, 5
+                //       and 6 are all SKIPPED -- we issue nothing rather
+                //       than stack a charged cancel. Leg 2 still runs; it is
+                //       the only thing that matters on that branch. So the
+                //       refusal costs 20 s plus local I/O and NO RPC at all.
+                //  2. write-ahead intent marker
+                //       BOUNDED  local file I/O, no RPC. Not a wall-clock leg.
+                //  3. pre-cancel sync probe (get_sync_status, below)
+                //       BOUNDED  <= 1 RPC unit = 123.5 s.
+                //       NOT deadline-gated: it is charged against the budget
+                //       but nothing refuses to start it. Deliberate -- see
+                //       the clock-placement note above.
+                //  4. ladder attempt 1: bulk cancel_offers
+                //       BOUNDED  <= 1 RPC unit = 123.5 s.
+                //       NOT deadline-gated, deliberately; attempt 1 is
+                //       unconditional (see OfferManager::cancel_all).
+                //  5. ladder attempts 1-fallback and 2..6 (cancel_ids)
+                //       BOUNDED  <= budget_ms (90 s) of ADMISSIONS
+                //                +  <= 1 RPC unit of tail  = 213.5 s.
+                //       The gate admits while now < deadline and cannot stop
+                //       an RPC it already admitted, so the overrun is one
+                //       id's work: its charged cancel, or -- on a funding
+                //       refusal, which returns fast -- one emergency_cancel
+                //       leg before the next may_start() rejects. One hanging
+                //       unit either way, not two.
+                //  6. S31 fallback watchdog_cancel_book
+                //       BOUNDED  <= 1 RPC unit = 123.5 s, by the RPC config
+                //       now pinned at that call site.
+                //       NOT deadline-gated and cannot be: it blocks on its
+                //       own io_context with no admission check. This leg was
+                //       omitted from the ~247 s figure entirely.
+                //  7. DB status persist, unlock_all, close_connections,
+                //     metrics shutdown
+                //       BOUNDED  local; sqlite, 3 attempts.
+                //
+                // ---------------------------------------------------------
+                // WORST CASE, and it is a sum of the rows above
+                // ---------------------------------------------------------
+                // Legs 3 and 4 each burn a full unit only if the wallet HANGS
+                // rather than refuses -- and if they do, the 90 s budget is
+                // already spent when leg 5 is reached, so leg 5 admits
+                // nothing. The two shapes are mutually exclusive, so take the
+                // larger:
+                //
+                //   hanging wallet:  20 + 123.5 + 123.5 +   0   + 123.5
+                //                        = 390.5 s
+                //   refusing wallet: 20 +   0   +   0   + 213.5 + 123.5
+                //                        = 357.0 s
+                //
+                //   SHUTDOWN WORST CASE  ~390.5 s, and 20 s of that exists
+                //   only when an operator cancel-all is in flight.
+                //
+                // 390.5 s is inside watchdog_stall_seconds{600}, which is
+                // what matters: past 600 s the watchdog fires a SECOND
+                // concurrent bulk cancel over these same offers and
+                // double-spends the fees. The margin is 209.5 s, not the
+                // 353 s the old figure implied.
+                //
+                // Before F5/F6 the same walk had no finite total at all: the
+                // hand-over wait had no cap, and the cancel-all it waits on
+                // ran emergency_cancel with time_point::max(), whose
+                // may_start() short-circuits TRUE -- ~25 fee halvings at up
+                // to one unit each, per offer.
+                //
+                // WHAT IS STILL NOT BOUNDED, NAMED: nothing on this path.
+                // What is not HARD is legs 3, 4 and 6, which are bounded by
+                // curl's own timeout rather than by a deadline this code
+                // enforces; a deadline that could interrupt an in-flight
+                // transfer needs a per-call timeout override threaded into
+                // rpc_post, which is real plumbing and is not in this change.
+                // Say 390.5 s, say which rows it is made of, and do not say
+                // "hard".
                 const auto cancel_deadline =
                     cancel_t0 + std::chrono::milliseconds(retry_cfg.budget_ms);
 
@@ -1355,7 +1514,12 @@ void Engine::shutdown()
                 // before calling shutdown() (see below), so a refusal would
                 // strand the operator's request with nothing to retry from,
                 // and an operator who wants out must get out.
-                if (!outstanding.empty()) {
+                //
+                // [F6] Skipped when the cancel-all hand-over failed: this is
+                // a wallet RPC like any other and costs up to 123.5 s, and
+                // we are about to issue no cancel at all, so spending the
+                // exit window on a status we will not act on is pure delay.
+                if (!outstanding.empty() && !cancel_all_handover_failed) {
                     try {
                         auto sync = co_await wallet_->get_sync_status();
                         const bool synced =
@@ -1392,6 +1556,13 @@ void Engine::shutdown()
                 execution::CancelLadder ladder(outstanding, retry_cfg);
 
                 for (;;) {
+                    // [F6] The cancel-all hand-over timed out. Issue
+                    // NOTHING: every attempt below is a charged secure
+                    // cancel over coins another coroutine is already
+                    // spending. `outstanding` therefore stays whole and is
+                    // reported as still-live by the branch below -- which is
+                    // the truth, and is not the same claim as "we tried".
+                    if (cancel_all_handover_failed) break;
                     const auto act = ladder.next(elapsed_ms());
                     if (act.step == execution::CancelLadderStep::Finish) break;
 
@@ -1436,6 +1607,14 @@ void Engine::shutdown()
                     // ladder from every offer that merely hit the sync flap.
                     res.worst_class     = oc.worst_class;
                     res.bulk_submitted  = oc.bulk_submitted;
+                    // [F3] CancelOutcome::deadline_hit has existed since S46
+                    // and was read by nobody -- set in cancel_ids, dropped
+                    // here. It is the gate's own report that it ran out of
+                    // time, and without it the ladder inferred a stop reason
+                    // from a failure class that a zero-RPC attempt never set,
+                    // and told the operator "attempts-exhausted" for a budget
+                    // expiry.
+                    res.deadline_hit    = oc.deadline_hit;
                     ladder.record(std::move(res));
                 }
 
@@ -1470,7 +1649,43 @@ void Engine::shutdown()
                 // [S46] The shortfall test is now on the OUTSTANDING set, not
                 // on a count comparison. `cancelled.size() < pending_before`
                 // was never the question; "is anything still resting" is.
-                if (!outstanding.empty()) {
+                if (cancel_all_handover_failed) {
+                    // [F6] Not a cancellation failure -- a cancellation
+                    // DECLINED. Worded so the operator cannot read it as
+                    // "the book is dealt with": it is not, and the reason it
+                    // is not is that dealing with it here would have paid a
+                    // second fee for a spend already in flight.
+                    spdlog::critical(
+                        "[Engine] [F6] an operator cancel-all was STILL IN "
+                        "FLIGHT after {} ms, so this shutdown issued NO "
+                        "cancel of its own -- stacking one would pay a "
+                        "second secure-cancel fee over the same coins. {} "
+                        "offer(s) may still be resting. The write-ahead "
+                        "intent marker is on disk and the next engine "
+                        "verifies every one of them against the wallet.",
+                        execution::kCancelAllHandoverWaitMs,
+                        outstanding.size());
+                    if (alerts_) {
+                        std::string ids;
+                        for (const auto& oid : outstanding) {
+                            if (!ids.empty()) ids += ", ";
+                            ids += oid;
+                        }
+                        alerts_->send_alert(
+                            AlertRule::DeadMansSwitch,
+                            "SHUTDOWN ISSUED NO CANCEL: an operator "
+                            "cancel-all was still in flight after "
+                            + std::to_string(
+                                  execution::kCancelAllHandoverWaitMs)
+                            + " ms. This engine deliberately did NOT stack a "
+                              "second charged cancel and did NOT run the "
+                              "fallback. "
+                            + std::to_string(outstanding.size())
+                            + " offer(s) may still be resting; the cancel "
+                              "intent marker records them for the next "
+                              "engine. IDS: " + ids);
+                    }
+                } else if (!outstanding.empty()) {
                     spdlog::critical(
                         "[Engine] [S31] graceful cancellation got {}/{} after "
                         "{} attempt(s) in {} ms, stopped because {} (last "
@@ -1677,6 +1892,11 @@ asio::awaitable<void> Engine::poll_loop_coro()
             // run neither posts nor cancels, so there is nothing for the
             // adopted state to be used by.
             std::vector<std::string> orphans;
+            // [F2] Ids the wallet reports PENDING_CANCEL. Collected from the
+            // DB->wallet leg and applied to State after the restore loop
+            // below -- mark_cancel_pending only sets the flag on an entry
+            // that already exists in State, so the order is load-bearing.
+            std::unordered_set<std::string> restore_cancel_pending;
             if (dry_run_) {
                 spdlog::warn("[Engine] [S31] dry run -- SKIPPING startup "
                              "reconciliation. It cancels offers it judges "
@@ -1697,9 +1917,10 @@ asio::awaitable<void> Engine::poll_loop_coro()
                 // logged "0 wallet offers scanned, 0 known/restored, 0
                 // orphans" and looked like a success.
                 //
-                // Three of the four buckets are handled here; the fourth --
+                // Four of the FIVE buckets are handled here; the fifth --
                 // `unverifiable` -- is deliberately NOT resolved at boot. See
-                // below.
+                // below. (F2 added `pending_cancel` and left this sentence
+                // saying four and three.)
                 // ---------------------------------------------------------
                 const auto& leg = offer_mgr_->last_db_leg();
 
@@ -1728,6 +1949,87 @@ asio::awaitable<void> Engine::poll_loop_coro()
                                  "wallet reports CONFIRMED -- left for the "
                                  "fill path, NOT stamped cancelled",
                                  leg.confirmed.size());
+                }
+
+                // [F2 2026-09-03] A cancel spend is ALREADY IN FLIGHT for
+                // these. Nothing is stamped -- the spend has not landed and
+                // "submitted" is not "confirmed" -- so they restore into
+                // State below exactly like any other pending row. What they
+                // must NOT restore as is cancel_pending=false, which is the
+                // PendingOffer default and which cancel_stale reads as
+                // "cancellable": a restored row past offer_ttl_blocks{400}
+                // was charged a SECOND secure cancel on the first heartbeat,
+                // paying a second fee and broadcasting a bundle that respends
+                // coins already in the mempool. That bundle cannot confirm,
+                // so it becomes exactly the stuck local transaction holding a
+                // locked fee coin that prune_stuck_transactions exists to
+                // clear -- and locked XCH against fee_reserve_xch is what
+                // pushes the NEXT cancel down the insufficient-funds branch
+                // into emergency_cancel.
+                //
+                // The set is remembered here and applied after the restore
+                // loop below, because mark_cancel_pending only sets the flag
+                // on an entry that is already in State.
+                //
+                // [F6 2026-09-03] AND ENROL THEM IN THE INTENT SET.
+                //
+                // F2 as first written latched cancel_pending and stopped
+                // there, which fixed the duplicate fee and created a second
+                // problem in the other direction. State::cancel_pending is
+                // ONE-WAY -- state.cpp:293 is its only mutator and it only
+                // sets; a repo-wide grep finds no clearer and no timeout --
+                // and every per-offer drain path skips a cancel_pending
+                // offer: cancel_stale, selective_cancel, cancel_ids,
+                // classify_tier_staleness, step_sweep_stale_offers, the
+                // peg-suspend drain, the exposure gate. So an offer whose
+                // cancel spend was submitted but never lands (the documented
+                // partial-broadcast state -- PENDING_CANCEL is not proof of a
+                // coin spend) was latched skip-forever and, because it went
+                // into no other set, was re-probed by nothing.
+                //
+                // sweep_cancel_intent is the one routine that re-asks the
+                // wallet about an id every heartbeat, and it already has the
+                // correct posture for exactly this state: a still-cancel-
+                // pending id goes to `awaiting` and is NOT re-charged, while
+                // a revived one is re-cancelled. Submitted is the right tag
+                // -- the criterion the `unverifiable` block below states is
+                // "ids a process actually ORDERED cancelled", and a wallet
+                // status of PENDING_CANCEL is direct evidence of precisely
+                // that, which is what distinguishes this bucket from that
+                // one.
+                //
+                // WHAT THIS DOES NOT DO, PLAINLY: it does not unstick the
+                // flag. recheck_terminal's readopt() deliberately never
+                // overwrites a live State entry ("Clobbering it would make
+                // cancel_stale pay a second cancellation fee"), so if the
+                // wallet later reports this offer back as PENDING_ACCEPT the
+                // existing entry keeps cancel_pending=true and the sweep
+                // still routes it to `awaiting`. What enrolment buys is
+                // durability across the next boot, a re-probe every
+                // heartbeat, and a log line naming the id for as long as it
+                // stays stuck -- not a self-heal. A cancel that is submitted
+                // and never lands still needs an operator; there is no
+                // timeout on cancel_pending and this change does not add one.
+                for (const auto& oid : leg.pending_cancel) {
+                    restore_cancel_pending.insert(oid);
+                    cancel_intent_.emplace(oid, CancelIntentTag::Submitted);
+                }
+                if (!leg.pending_cancel.empty()) {
+                    write_cancel_intent(cancel_intent_);
+                }
+                if (!leg.pending_cancel.empty()) {
+                    std::string ids;
+                    for (const auto& oid : leg.pending_cancel) {
+                        if (!ids.empty()) ids += ", ";
+                        ids += oid;
+                    }
+                    spdlog::warn(
+                        "[Engine] [F2] {} DB-pending offer(s) already have a "
+                        "cancel spend IN FLIGHT (wallet says PENDING_CANCEL) "
+                        "-- restored as cancel-pending so no sweep charges a "
+                        "second secure cancel for the same spend. They are "
+                        "not resolved until the spend confirms. IDS: {}",
+                        leg.pending_cancel.size(), ids);
                 }
 
                 if (!leg.unverifiable.empty()) {
@@ -1819,6 +2121,24 @@ asio::awaitable<void> Engine::poll_loop_coro()
                 po.created_at_block = rec.created_block;
                 po.fee_mojos       = rec.fee_mojos;
                 state_->upsert_offer(po);
+
+                // [F2] Immediately after the upsert, not in a later pass: an
+                // entry that exists in State with cancel_pending=false is
+                // already chargeable by anything that reads State, and the
+                // whole point is that this row must never be seen in that
+                // condition.
+                //
+                // [F6] STATED, NOT CLAIMED: these two lines are UNGUARDED.
+                // Neutering this `if` reinstates the F2 duplicate-fee defect
+                // with the whole suite green, and no test can reach it --
+                // S36, nothing in cpp/tests constructs an Engine. F2's
+                // classifier and its bucketing are both pinned now
+                // (test_startup_probe.cpp); this last hop from bucket to flag
+                // is hand-reasoned, exactly like F1's file I/O and F4's
+                // process handling. Do not let a report say F2 is covered.
+                if (restore_cancel_pending.count(rec.offer_id)) {
+                    state_->mark_cancel_pending(rec.offer_id);
+                }
 
                 // [STOPDRAIN review #2] An offer restored for a pair that
                 // is disabled or GONE from this config would be drained by
@@ -18104,14 +18424,56 @@ asio::awaitable<void> Engine::step_sweep_stale_offers(BlockHeight block_height)
 // ===========================================================================
 //
 // The retry ladder above covers the desync FLAP -- ~94% of ~100 measured
-// episodes clear inside one block. It covers nothing at all on the routes
-// that run no shutdown path: SIGTERM, taskkill /F, the console window's X,
-// and kill_old_instances() TerminateProcess-ing us on the way in. It is also
-// capped at 30 s in practice when the GUI is the stopper.
+// episodes clear inside one block. It does not cover a process that never
+// runs a shutdown path at all.
 //
-// So the retry is half a fix. This is the other half, and it is the half that
-// actually closes the hole, because it does not depend on the wallet being
-// healthy at the worst possible moment.
+// So the retry is half a fix. This is the other half. BE PRECISE ABOUT WHICH
+// HALF, because the previous wording of this paragraph was not, and was
+// self-refuting on its own line: it listed "SIGTERM, taskkill /F, the console
+// window's X, and kill_old_instances() TerminateProcess-ing us on the way in"
+// as routes the retry cannot cover, and then claimed THIS mechanism -- which
+// is reachable only from inside Engine::shutdown() -- "actually closes the
+// hole". Nothing written by a dying process outruns TerminateProcess, SIGKILL,
+// std::_Exit or a power cut.
+//
+// [F4 2026-09-03] What the marker actually covers:
+//
+//   COVERED -- the shutdown path runs and the marker is written:
+//     * SIGINT / Ctrl+C, and SIGTERM on POSIX. main.cpp installs
+//       signal_handler and the first signal calls engine->shutdown(), so the
+//       old claim that SIGTERM is uncovered was wrong in the other direction.
+//     * The GUI's graceful-close button, via data/shutdown.flag ->
+//       check_shutdown_flag() -> shutdown().
+//     * kill_old_instances() on POSIX: it sends SIGTERM and waits up to
+//       kGracefulExitWaitMs = 30 s before SIGKILL, so the old engine runs its
+//       own shutdown. (This block said 10 s -- the pre-F4 value -- in the
+//       same diff that raised it to 30 s.)
+//     * kill_old_instances() on WINDOWS -- newly, and only because F4 gave
+//       that branch the graceful-first rung the POSIX branch always had. It
+//       previously went straight to TerminateProcess, which made the normal
+//       redeploy on the production platform an uncovered hard kill. That was
+//       not an edge case; it was the common case.
+//
+//   NOT COVERED, and this file no longer pretends otherwise:
+//     * taskkill /F, kill -9, and the SIGKILL that kill_old_instances still
+//       sends to a POSIX survivor after its 30 s window.
+//     * A second Ctrl+C: main.cpp's documented escape hatch calls
+//       std::_Exit(EXIT_FAILURE). Racy -- write_cancel_intent runs early in
+//       the cancel block, but an operator double-tapping can beat it.
+//     * Console window close, logoff, OS shutdown. std::signal(SIGINT) covers
+//       Ctrl+C only; no SetConsoleCtrlHandler is installed anywhere in
+//       cpp/src, so CTRL_CLOSE_EVENT and CTRL_SHUTDOWN_EVENT kill us silently.
+//     * std::terminate / abort / access violation / stack overflow.
+//     * Power loss, BSOD, hypervisor kill.
+//
+// And this is worth stating plainly, because it bounds how bad "not covered"
+// is: for a hard kill during NORMAL QUOTING, restoring those DB rows as
+// ordinary offers is the CORRECT behaviour. Nobody ordered them dead. The
+// genuine residual hole is narrower than "hard kill" -- it is a hard kill
+// landing while the old process was mid-shutdown() or mid-cancel_ids after
+// mark_cancel_pending, which strands submitted-but-unconfirmed cancels. Those
+// restore with cancel_pending=false, which is F2, and is fixed by the
+// PENDING_CANCEL leg in startup_reconcile rather than by this file.
 //
 // THE THING THAT WAS MISSING WAS NOT A SCAN. IT WAS A RECORD.
 // -----------------------------------------------------------
@@ -18146,9 +18508,59 @@ void Engine::write_cancel_intent(
         // file: a stale marker would send every subsequent boot chasing
         // offers that settled weeks ago, and a recovery mechanism that cries
         // wolf on every start is one that gets switched off.
-        std::filesystem::remove(cancel_intent_path_, ec);
-        std::filesystem::remove(cancel_intent_legacy_path_, ec);
-        cancel_intent_on_disk_.clear();
+        //
+        // [F6 2026-09-03] CHECK THE REMOVE. This branch discarded both
+        // error_codes and then memoized success unconditionally -- the exact
+        // fail-open shape F1 fixed three lines below, left intact in the
+        // branch F1 did not touch. Its own reasoning applies verbatim here:
+        // "the memo below is what makes a failure permanent."
+        //
+        // The concrete failure is an open handle without FILE_SHARE_DELETE
+        // (AV scanner, backup agent, the GUI watching data/, an operator's
+        // file viewer during an incident). remove() fails with
+        // ERROR_SHARING_VIOLATION, the marker survives, and clearing the memo
+        // makes the unchanged-file short circuit above return before ever
+        // reaching remove() again -- for the rest of the process lifetime.
+        // The stale marker then survives into the next boot, where it raises
+        // a CRITICAL dead-man's-switch alert naming offers that were verified
+        // terminal, which is precisely the cry-wolf failure the comment above
+        // says kills the mechanism.
+        //
+        // Leaving the memo populated is what makes it self-healing: the next
+        // write_cancel_intent({}) fails the equality test above and retries
+        // the remove on the 5 s sweep.
+        std::error_code rm_ec;
+        std::error_code rm_legacy_ec;
+        std::filesystem::remove(cancel_intent_path_, rm_ec);
+        std::filesystem::remove(cancel_intent_legacy_path_, rm_legacy_ec);
+
+        // remove() on an absent file is not an error and sets no code, so
+        // "gone" is exists()==false, not "remove returned true".
+        std::error_code ex_ec;
+        std::error_code ex_legacy_ec;
+        const bool primary_gone =
+            !std::filesystem::exists(cancel_intent_path_, ex_ec);
+        const bool legacy_gone =
+            cancel_intent_legacy_path_.empty()
+            || !std::filesystem::exists(cancel_intent_legacy_path_,
+                                        ex_legacy_ec);
+
+        if (primary_gone && legacy_gone) {
+            cancel_intent_on_disk_.clear();
+            return;
+        }
+
+        spdlog::error(
+            "[Engine] [S46] [F6] could not remove the cancel-intent marker "
+            "(primary {}: {}; legacy {}: {}). The marker is STALE -- every "
+            "id in it is already resolved -- and a stale marker makes the "
+            "next boot raise a dead-man's-switch alert about offers that "
+            "settled. NOT recording the removal as done, so the next sweep "
+            "retries it.",
+            cancel_intent_path_.string(),
+            primary_gone ? "removed" : rm_ec.message(),
+            cancel_intent_legacy_path_.string(),
+            legacy_gone ? "removed" : rm_legacy_ec.message());
         return;
     }
 
@@ -18178,7 +18590,47 @@ void Engine::write_cancel_intent(
                                                           : "ordered")
                     << '\n';
             }
-            out.flush();
+
+            // [F1 2026-09-03] CHECK THE WRITE. Output streams do not throw by
+            // default: a disk-full, a quota refusal or a short write sets
+            // badbit and every operation after it is a silent no-op. The old
+            // code called flush() and DISCARDED its result, let the destructor
+            // close and swallow, renamed the bad temporary over the good
+            // marker, and then recorded the whole map as durable.
+            //
+            // At this book's size the failure is not a truncated file, it is
+            // an EMPTY one: a line is ~76 bytes and the largest book this
+            // system has ever held is 27 offers (~2.1 KB), so nothing leaves
+            // the 4096-byte filebuf until the flush and a failing flush
+            // produces zero bytes. That is the worst possible on-disk state.
+            // load_cancel_intent() opens it, reads no lines, and returns at
+            // its `if (cancel_intent_.empty()) return;` WITHOUT LOGGING
+            // ANYTHING -- indistinguishable from "nothing was outstanding".
+            // It is also precisely the state the comment above forbids:
+            // "'Nothing outstanding' is the ABSENCE of the file, never an
+            // empty file."
+            //
+            // close() explicitly rather than leaving it to the destructor,
+            // because the destructor's failure is unobservable and the final
+            // buffer flush happens there.
+            out.close();
+            if (!out) {
+                // The previous marker is still on disk and still correct --
+                // it is only ever replaced by a successful rename. Leave it,
+                // do not rename, and do NOT record this map as durable: the
+                // memo below is what makes a failure permanent.
+                std::error_code rm_ec;
+                std::filesystem::remove(tmp, rm_ec);
+                spdlog::error(
+                    "[Engine] [S46] [F1] writing {} FAILED (stream bad after "
+                    "close -- disk full, quota, or a short write). The "
+                    "temporary was discarded and the previous marker is "
+                    "untouched: the cancel intent for {} offer(s) is NOT "
+                    "durable and was NOT committed. If this process dies now "
+                    "the next engine adopts them as healthy quotes.",
+                    tmp.string(), ids.size());
+                return;
+            }
         }
         std::filesystem::rename(tmp, cancel_intent_path_, ec);
         if (ec) {
@@ -18227,6 +18679,11 @@ void Engine::load_cancel_intent()
                      src.string(), cancel_intent_path_.string());
     }
 
+    // [F6] The read outcome is carried past the catch rather than returning
+    // from inside it. See the catch below.
+    bool        read_failed = false;
+    std::string read_error;
+
     try {
         std::ifstream in(src);
         std::string line;
@@ -18241,6 +18698,18 @@ void Engine::load_cancel_intent()
             }
             if (line.empty()) continue;
 
+            // [F6] Strip the LEADING whitespace too. Without this a line
+            // like " <id> ordered" put find_first_of(" \t") at position 0,
+            // so id = substr(0, 0) was empty and the `continue` below
+            // discarded a real offer id with no log line at all -- the one
+            // abnormal condition in this reader that said nothing. The
+            // writer never emits leading whitespace, so this needs a
+            // corrupted file; but "corruption degrades into fewer ids" is
+            // only acceptable while it is LOUD about which ids.
+            const auto lead = line.find_first_not_of(" \t");
+            if (lead == std::string::npos) continue;
+            if (lead != 0) line.erase(0, lead);
+
             // "<id>" or "<id> <tag>". Anything that is not exactly the
             // "submitted" token -- including a missing token, a truncated
             // line, or a tag from some future build -- decodes to Ordered.
@@ -18252,19 +18721,116 @@ void Engine::load_cancel_intent()
                                   ? std::string{}
                                   : line.substr(line.find_first_not_of(" \t",
                                                                        sep));
-            if (id.empty()) continue;
+            if (id.empty()) {
+                // [F6] Unreachable now that the leading strip above runs,
+                // and kept as a guard rather than removed -- but it must
+                // never be the silent one again if it becomes reachable.
+                spdlog::warn("[Engine] [S46] [F6] a non-empty line in {} "
+                             "yielded no usable offer id and was DROPPED: "
+                             "\"{}\"", src.string(), line);
+                continue;
+            }
             cancel_intent_[id] = (tag == "submitted")
                                      ? CancelIntentTag::Submitted
                                      : CancelIntentTag::Ordered;
         }
     } catch (const std::exception& e) {
-        spdlog::error("[Engine] [S46] could not read {}: {} -- previously "
-                      "ordered cancels cannot be recovered from it",
-                      src.string(), e.what());
+        // [F6] Record and FALL THROUGH; do not return. Returning from here
+        // skipped both the empty-file check and the alert block below, so a
+        // partially-parsed marker produced a populated cancel_intent_ with no
+        // CRITICAL and no operator alert -- the loudest signal in this
+        // function replaced by one error line, which is the same severity
+        // inversion as the empty-file branch. Whatever was parsed before the
+        // throw is real and is reported below alongside the read failure.
+        read_failed = true;
+        read_error  = e.what();
+        spdlog::error("[Engine] [S46] could not finish reading {}: {} -- "
+                      "reporting the {} id(s) parsed before the failure; any "
+                      "beyond that point are NOT recovered from it",
+                      src.string(), read_error, cancel_intent_.size());
+    }
+
+    if (cancel_intent_.empty() && read_failed) {
+        // [F6] Empty because we could not READ it, which is not the same
+        // claim as empty because it CONTAINS nothing -- and the branch below
+        // deletes the file on the strength of the second claim. Do neither
+        // here: the marker may be entirely intact and merely unreadable
+        // right now, and destroying it would turn a transient read failure
+        // into permanent loss of the record.
+        spdlog::critical(
+            "[Engine] [S46] [F6] {} exists but could not be read ({}) and no "
+            "offer id was recovered from it. The marker is NOT removed -- it "
+            "may be intact. A previous process ordered an UNKNOWN number of "
+            "offers cancelled; the startup DB->wallet leg is the only "
+            "remaining check.",
+            src.string(), read_error);
+        if (alerts_) {
+            alerts_->send_alert(
+                AlertRule::DeadMansSwitch,
+                "CANCEL INTENT MARKER COULD NOT BE READ: " + src.string()
+                + " (" + read_error
+                + "). No offer id was recovered and the file was left in "
+                  "place. An UNKNOWN number of offers may have been ordered "
+                  "cancelled -- verify the book by hand.");
+        }
         return;
     }
 
-    if (cancel_intent_.empty()) return;
+    if (cancel_intent_.empty()) {
+        // [F1 2026-09-03] The file EXISTS -- we would have returned above if
+        // it did not -- and yielded no ids. This used to return silently,
+        // which made a zero-byte marker read exactly like a clean boot. It is
+        // the state a pre-F1 build produced on a failed flush, and it is the
+        // one state this mechanism was explicitly designed never to create:
+        // "'Nothing outstanding' is the ABSENCE of the file, never an empty
+        // file."
+        //
+        // Say so, and remove it. Removing it here is what makes the condition
+        // self-healing: cancel_intent_on_disk_ stays empty, so a later
+        // write_cancel_intent({}) short-circuits on the unchanged-file check
+        // and NEVER reaches its own remove(), and the bogus file would
+        // otherwise sit in data/ across every future boot.
+        //
+        // This is not a recovery -- nothing can be recovered from zero bytes.
+        // Any ids that write failed to record are unrecoverable from the file
+        // and the DB->wallet leg of startup_reconcile is what still sees
+        // those rows.
+        spdlog::error(
+            "[Engine] [S46] [F1] {} exists but contains no readable offer "
+            "id. This file is never written empty on purpose, so it is the "
+            "residue of a failed write (disk full or a short write) -- "
+            "whatever a previous process ordered cancelled is NOT recorded "
+            "in it. Removing it. DB-pending rows are still checked against "
+            "the wallet by the startup DB leg.",
+            src.string());
+
+        // [F6 2026-09-03] AND ALERT. This branch logged and returned before
+        // the alert block below, so the state carrying the LEAST information
+        // was the QUIETEST one this function has: a marker existed, so some
+        // process ordered some offers dead, and the record of WHICH is gone.
+        // Meanwhile the strictly-less-severe fully-recovered case -- ids
+        // present, readable, already being re-cancelled -- did fire a
+        // dead-man's-switch alert. The severity ordering was inverted, and on
+        // a bot whose operator channel is Telegram the residue of a failed
+        // write arrived as silence.
+        //
+        // The channel is live here: alerts_ is constructed and
+        // Telegram-initialised in this same constructor, above the call to
+        // this function. Nothing about this was unavailable; it was unused.
+        if (alerts_) {
+            alerts_->send_alert(
+                AlertRule::DeadMansSwitch,
+                "CANCEL INTENT MARKER UNREADABLE: " + src.string()
+                + " existed but recorded no offer ids. It is never written "
+                  "empty on purpose, so it is the residue of a failed write. "
+                  "An UNKNOWN number of offers may have been ordered "
+                  "cancelled and the record of which ones is gone. Nothing "
+                  "can be recovered from it. The startup DB->wallet leg is "
+                  "the only remaining check -- verify the book by hand.");
+        }
+        std::filesystem::remove(src, ec);
+        return;
+    }
     cancel_intent_on_disk_ = cancel_intent_;
 
     // [review] Split the two notifications. Every graceful stop with a
@@ -18574,11 +19140,35 @@ void Engine::check_cancel_all_flag()
         cancel_intent_.emplace(po.offer_id, CancelIntentTag::Ordered);
     }
     write_cancel_intent(cancel_intent_);
+
+    // [F6 2026-09-03] A DEADLINE, on the path that had none.
+    //
+    // This call used to be `cancel_all()` with the default argument, which is
+    // steady_clock::time_point::max(). That default is not "no limit" in any
+    // benign sense: OfferManager::emergency_cancel's may_start() gate
+    // short-circuits TRUE on time_point::max(), so a funding refusal here ran
+    // the full descending-fee ladder -- ~25 halvings, each up to one rpc_post
+    // (123.5 s) against a wallet that hangs -- entirely ungated. That is the
+    // ~64-minute shape F5 removed from the shutdown path and left standing on
+    // this one, and rpc_post's transfer blocks the io_context thread, so it is
+    // the whole engine that stops, not just this coroutine.
+    //
+    // It also sat underneath Engine::shutdown()'s hand-over wait, which is
+    // why every wall-clock figure that file states was conditional on it.
+    //
+    // Same budget as the shutdown ladder: this is the same book, the same
+    // wallet and the same failure modes, and having two numbers would mean
+    // neither is the one anybody remembers.
+    const execution::CancelRetryConfig cancel_all_cfg{};
+    const auto cancel_all_deadline =
+        std::chrono::steady_clock::now()
+        + std::chrono::milliseconds(cancel_all_cfg.budget_ms);
     asio::co_spawn(
         ioc_,
-        [this]() -> asio::awaitable<void> {
+        [this, cancel_all_deadline]() -> asio::awaitable<void> {
             try {
-                auto done = co_await offer_mgr_->cancel_all();
+                auto done = co_await offer_mgr_->cancel_all(
+                    cancel_all_deadline);
                 spdlog::warn("[Engine] [CANCELALL] {} offer(s) submitted "
                              "for cancel", done.cancelled.size());
                 // Submitted ids are downgraded from "ordered" to "submitted"
@@ -18645,9 +19235,23 @@ asio::awaitable<bool> Engine::sweep_reload_disabled_offers()
 {
     if (reload_pending_cancel_.empty()) co_return true;
 
+    // [F6 2026-09-03] `!po.cancel_pending` matches the peg-suspend drain
+    // 450 lines below, which builds its list the same way and filters while
+    // building. Without it this sweep could never report clean: selective_
+    // cancel SKIPS a cancel-pending offer before doing any work and does not
+    // return it, so done.size() < to_cancel.size() and the function logged a
+    // CRITICAL "the rest are STILL LIVE" about the one category of offer that
+    // is NOT unmanaged, every heartbeat, and never cleared the retry set.
+    //
+    // Two ways in, both live: an offer restored at boot as cancel_pending on
+    // a pair that is disabled or gone from the config (F2 seeds exactly that,
+    // and the restore loop seeds this set with its pair), and the ordinary
+    // partial-failure retry -- offers cancelled on attempt N are cancel_
+    // pending on attempt N+1 and were being counted as failures there too.
     std::vector<std::string> to_cancel;
     for (const auto& po : state_->get_all_offers()) {
-        if (reload_pending_cancel_.count(po.pair_name) > 0) {
+        if (reload_pending_cancel_.count(po.pair_name) > 0
+            && !po.cancel_pending) {
             to_cancel.push_back(po.offer_id);
         }
     }

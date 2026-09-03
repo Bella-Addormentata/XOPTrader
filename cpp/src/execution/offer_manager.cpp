@@ -39,17 +39,11 @@ namespace xop::execution {
 // Newer Chia wallet versions return status as a string enum; older versions
 // return an integer.  parse_trade_status() handles both.
 // ---------------------------------------------------------------------------
+// [F2 review] The CODES now live in offer_manager.hpp beside
+// classify_startup_probe(), so the pure classifier and its gtest can name
+// them. Only parse() -- the json-shaped half -- stays here. Defining them in
+// both places would be exactly the drift this move exists to prevent.
 namespace trade_status {
-    constexpr int kPendingAccept    = 0;
-    // [S25 2026-08-24] 1 and 2 had no names because nothing needed to
-    // distinguish them from "not terminal".  recheck_terminal does: a
-    // recognised pending state is evidence the offer is live, whereas an
-    // unrecognised code (parse returns -1) is no evidence at all.
-    constexpr int kPendingConfirm   = 1;
-    constexpr int kPendingCancel    = 2;
-    constexpr int kCancelled        = 3;
-    constexpr int kConfirmed        = 4;
-    constexpr int kFailed           = 5;
 
     inline int parse(const nlohmann::json& status_val) {
         if (status_val.is_number_integer()) {
@@ -57,14 +51,14 @@ namespace trade_status {
         }
         if (status_val.is_string()) {
             const auto& s = status_val.get_ref<const std::string&>();
-            if (s == "PENDING_ACCEPT")  return 0;
-            if (s == "PENDING_CONFIRM") return 1;
-            if (s == "PENDING_CANCEL")  return 2;
+            if (s == "PENDING_ACCEPT")  return kPendingAccept;
+            if (s == "PENDING_CONFIRM") return kPendingConfirm;
+            if (s == "PENDING_CANCEL")  return kPendingCancel;
             if (s == "CANCELLED")       return kCancelled;
             if (s == "CONFIRMED")       return kConfirmed;
             if (s == "FAILED")          return kFailed;
         }
-        return -1;  // Unknown status.
+        return kUnknown;
     }
 }  // namespace trade_status
 
@@ -1246,6 +1240,34 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(
         co_return out;
     }
 
+    // [F5 2026-09-03] THIS ONE RPC IS DELIBERATELY NOT DEADLINE-GATED, and
+    // that is a decision rather than the oversight the review took it for.
+    //
+    // cancel_all is only ever the FIRST attempt (engine.cpp dispatches
+    // attempt 1 here and every retry to cancel_ids), and CancelLadder
+    // authorises attempt 1 unconditionally, on purpose: an engine that exits
+    // having issued no cancel at all is strictly worse than the pre-S46 code,
+    // which at least got one attempt away. Gating this call would let a slow
+    // pre-cancel sync probe -- which runs before it and is charged against
+    // the same clock -- consume the entire budget and leave the book
+    // untouched. That is the exact failure the clock's placement comment in
+    // engine.cpp exists to prevent, and it must not be reintroduced here.
+    //
+    // So it is one UNGATED rpc_post -- ungated is not unbounded: rpc_post
+    // sets CURLOPT_TIMEOUT_MS from request_timeout, so the worst case is 4
+    // blocking curl transfers at 30 s plus 3.5 s of backoff = 123.5 s. It is
+    // leg 4 of the per-path table at the top of Engine::shutdown(), and it is
+    // one of the reasons that walk totals ~390.5 s rather than 90 s. Do not
+    // quote a shutdown total from this file: the table is there, this is one
+    // row of it, and the previous version of this comment quoted a figure
+    // (247 s) that omitted two other rows entirely.
+    //
+    // It cannot be made deadline-gated without a per-call timeout override in
+    // rpc_post, which is real plumbing and is not in this PR.
+    //
+    // The deadline DOES bind everything after it: the per-id fallback below,
+    // and (new in F5) the emergency ladder underneath that.
+    //
     // Attempt bulk cancellation first (wallet cancel_offers endpoint).
     bool bulk_ok = false;
     std::string bulk_err;
@@ -1335,7 +1357,21 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_ids(
     for (std::size_t i = 0; i < offer_ids.size(); ++i) {
         const auto& oid = offer_ids[i];
 
-        if (std::chrono::steady_clock::now() >= deadline) {
+        // [F3] The admission rule lives in cancel_retry.hpp beside the policy
+        // that schedules against it. It was a bare `now() >= deadline` here,
+        // related to the ladder by nothing but prose, and that is exactly how
+        // a ladder shipped whose final attempt woke AT the deadline and was
+        // rejected here without issuing a single RPC.
+        //
+        // [F6] AND THIS CALL SITE IS UNGUARDED. cancel_ids_admits() itself is
+        // proved by static_assert and gtest, but nothing in cpp/tests
+        // constructs an OfferManager, so replacing this whole `if` with
+        // `if (false)` -- deleting the wall-clock gate that IS the F3/F5 fix
+        // -- leaves all 1265 tests green. Same for emergency_cancel's
+        // may_start() ladder. The policy is tested; the call sites are
+        // hand-reasoned, in the same bucket as F1, F4 and F2's last hop.
+        if (!execution::cancel_ids_admits(std::chrono::steady_clock::now(),
+                                          deadline)) {
             // Budget spent mid-loop. Everything untried is STILL LIVE and is
             // reported as such: "we ran out of time" is not "it is gone".
             for (std::size_t j = i; j < offer_ids.size(); ++j) {
@@ -1407,7 +1443,14 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_ids(
         }
         if (needs_emergency) {
             // The emergency ladder is the answer to a funding refusal.
-            cancel_ok = co_await emergency_cancel(oid, "cancel_ids");
+            // [F5] Under the SAME deadline as the loop that called it. Left
+            // unbounded, one funding refusal turned a 90 s shutdown into a
+            // ~64 minute one and sailed past watchdog_stall_seconds{600},
+            // where the watchdog fires a second concurrent bulk cancel over
+            // these same offers -- the exact double-spend this deadline was
+            // introduced to prevent, on the exact path that spends real XCH.
+            cancel_ok = co_await emergency_cancel(
+                oid, "cancel_ids", /*prefer_zero_fee=*/false, deadline);
         }
 
         if (cancel_ok) {
@@ -2755,30 +2798,32 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
                 continue;
             }
 
-            if (status == trade_status::kCancelled
-                || status == trade_status::kFailed) {
-                db_leg_.terminal.push_back(id);
-            } else if (status == trade_status::kConfirmed) {
-                db_leg_.confirmed.push_back(id);
-            } else if (status == trade_status::kPendingAccept) {
-                db_leg_.still_live.push_back(id);
-            } else {
-                // kPendingConfirm, kPendingCancel, or an unrecognised code.
-                // A recognised pending state is not terminal and an
-                // unrecognised one is no evidence at all; neither authorises
-                // stamping the row.
-                db_leg_.unverifiable.push_back(id);
-            }
+            // [F2] One total function, in the header, with a gtest and
+            // static_asserts on it. The if/else chain this replaces ended in
+            // an `else` that swallowed kPendingCancel -- positive evidence of
+            // an in-flight cancel spend -- into the bucket that means "we
+            // learned nothing".
+            //
+            // [F6] ...and the bucketing is StartupDbLeg::add(), in the same
+            // header, for the same reason. The switch that used to be here
+            // was the untested half of F2: repointing its PendingCancel arm
+            // at `unverifiable` reinstated the duplicate-fee defect end to
+            // end with all 1265 tests green. Nothing decides in this file
+            // now; both halves are pinned by test_startup_probe.cpp.
+            db_leg_.add(classify_startup_probe(status), id);
         }
 
         if (db_leg_.total() > 0) {
             logger_->warn("[startup_reconcile] DB->wallet leg: {} DB-pending "
                           "row(s) absent from the wallet scan -- {} terminal, "
-                          "{} still live, {} confirmed/filling, {} "
-                          "UNVERIFIABLE (kept pending for the heartbeat)",
+                          "{} still live, {} confirmed/filling, {} with a "
+                          "cancel ALREADY IN FLIGHT (must restore "
+                          "cancel-pending), {} UNVERIFIABLE (kept pending for "
+                          "the heartbeat)",
                           db_leg_.total(), db_leg_.terminal.size(),
                           db_leg_.still_live.size(),
                           db_leg_.confirmed.size(),
+                          db_leg_.pending_cancel.size(),
                           db_leg_.unverifiable.size());
         }
     }
@@ -2807,9 +2852,11 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
         // from a wallet that answered nothing.
         logger_->info("[startup_reconcile] Complete: {} wallet offers scanned, "
                       "{} known/restored, 0 orphans; DB-leg {} probed "
-                      "({} terminal, {} live, {} unverifiable)",
+                      "({} terminal, {} live, {} cancel-in-flight, "
+                      "{} unverifiable)",
                       total_pending, restored, db_leg_.total(),
                       db_leg_.terminal.size(), db_leg_.still_live.size(),
+                      db_leg_.pending_cancel.size(),
                       db_leg_.unverifiable.size());
         co_return cancelled_ids;
     }
@@ -4068,12 +4115,38 @@ std::optional<SettledFill> OfferManager::parse_settled_fill(
 asio::awaitable<bool> OfferManager::emergency_cancel(
     const std::string& offer_id,
     const std::string& context,
-    bool prefer_zero_fee)
+    bool prefer_zero_fee,
+    std::chrono::steady_clock::time_point deadline)
 {
+    // [F5] One gate, the same one cancel_ids uses, checked before every leg
+    // that would start a new RPC. Legs are not cheap: each is an rpc_post
+    // worth up to 123.5 s against a wallet that hangs rather than refuses.
+    const auto may_start = [&deadline]() noexcept {
+        return deadline == std::chrono::steady_clock::time_point::max()
+            || execution::cancel_ids_admits(
+                   std::chrono::steady_clock::now(), deadline);
+    };
+    // Announced once, not per leg: a shutdown that is out of time should not
+    // also produce twenty-five log lines saying so.
+    bool abandoned_logged = false;
+    const auto abandon = [&](const char* leg) {
+        if (!abandoned_logged) {
+            abandoned_logged = true;
+            logger_->error(
+                "{}: [F5] emergency cancel for {} ABANDONED at the {} leg -- "
+                "the shutdown wall clock is spent. THE OFFER IS STILL LIVE "
+                "and is reported as such; nothing here assumes otherwise. "
+                "Cancel it by hand or let the next engine's startup "
+                "reconciliation find it.",
+                context, offer_id.substr(0, 12), leg);
+        }
+    };
+
     try {
         // When prefer_zero_fee is set (UTXO liberation), try the fee=0
         // secure cancel FIRST so we don't burn spendable XCH on fees.
         if (prefer_zero_fee) {
+            if (!may_start()) { abandon("zero-fee-first"); co_return false; }
             logger_->warn("{}: attempting zero-fee secure cancel for {}",
                           context, offer_id.substr(0, 12));
             bool zero_ok = false;
@@ -4093,6 +4166,7 @@ asio::awaitable<bool> OfferManager::emergency_cancel(
             // Fall through to descending fee loop.
         }
 
+        if (!may_start()) { abandon("balance-probe"); co_return false; }
         auto xch_bal = co_await wallet_->get_wallet_balance(1);
         Mojo xch_spendable = 0;
         if (xch_bal.contains("spendable_balance"))
@@ -4110,6 +4184,15 @@ asio::awaitable<bool> OfferManager::emergency_cancel(
                 std::max(Mojo{1}, xch_spendable - Mojo{1000}));
 
             while (attempt_fee >= 1) {
+                // [F5] THE loop. An "insufficient funds" answer CONTINUES it
+                // (see below), so without this check every one of ~25
+                // halvings can burn a full rpc_post ladder and still go
+                // round again. This is where the 64-minute shutdown came
+                // from.
+                if (!may_start()) {
+                    abandon("descending-fee");
+                    co_return false;
+                }
                 logger_->warn("{}: emergency cancel {} with fee "
                               "{} mojos (spendable {} mojos)",
                               context, offer_id.substr(0, 12),
@@ -4152,6 +4235,7 @@ asio::awaitable<bool> OfferManager::emergency_cancel(
         // bundle inputs, so no additional spendable XCH is needed.
         // Skip if prefer_zero_fee already tried this at the top.
         if (!prefer_zero_fee) {
+            if (!may_start()) { abandon("fee-zero-secure"); co_return false; }
             logger_->warn("{}: attempting secure cancel with fee=0 for {}",
                           context, offer_id.substr(0, 12));
             bool secure_zero_ok = false;
@@ -4176,6 +4260,7 @@ asio::awaitable<bool> OfferManager::emergency_cancel(
         // Last resort: local-only cancel.
         // No on-chain fee -- drops from wallet but doesn't invalidate the
         // offer on-chain.  Better than leaving funds locked forever.
+        if (!may_start()) { abandon("local-only"); co_return false; }
         logger_->warn("{}: zero XCH spendable -- local-only (insecure) "
                       "cancel for {}", context, offer_id.substr(0, 12));
         co_await cancel_offer_charged(

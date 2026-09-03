@@ -51,6 +51,7 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <string>
 #include <vector>
 
@@ -118,9 +119,11 @@ TEST(CancelRetry, TheLiveRefusalTextClassifiesAsUnsyncedViaTakeRetry)
 // the sleeping totals what the schedule says, and that it never exceeds the
 // budget. A policy that can loop forever is a worse bug than the one it fixes.
 //
-// MUTATION: remove the attempts ceiling -> the loop runs past 5 and the
-// EXPECT_LE(attempts, ...) trips. MUTATION: remove the budget clamp -> total
-// sleep exceeds budget_ms and the final EXPECT_LE trips.
+// MUTATION: remove the attempts ceiling -> the loop runs past 6 and the
+// EXPECT_EQ(attempts, 6u) below trips. MUTATION: remove the budget clamp ->
+// total sleep exceeds budget_ms and the final EXPECT_LE trips.
+// (These notes said "past 5" and named an EXPECT_LE(attempts, ...) that this
+// test does not contain; max_attempts is 6 and the assertion is an EXPECT_EQ.)
 TEST(CancelRetry, TheLadderTerminatesAndNeverOutrunsTheBudget)
 {
     const CancelRetryConfig cfg{};
@@ -141,29 +144,163 @@ TEST(CancelRetry, TheLadderTerminatesAndNeverOutrunsTheBudget)
     }
 
     EXPECT_EQ(attempts, 6u) << "six attempts: the original plus five retries";
-    EXPECT_EQ(total_sleep, 90'000u)
+    EXPECT_EQ(total_sleep, 85'000u)
         << "5s + 10s + 20s + 40s, then the fifth retry clamped from 40s into "
-           "the 15s of budget that is left";
-    EXPECT_LE(total_sleep, cfg.budget_ms) << "the budget is the hard bound";
+           "the 15s of budget that is left MINUS the 5s execution reserve";
+    EXPECT_LE(total_sleep, cfg.budget_ms) << "the budget bounds the sleeping";
     EXPECT_EQ(why, CancelStopReason::AttemptsExhausted);
 
-    // [review] THE POINT OF THE 90 s NUMBER, pinned as a test rather than a
-    // sentence in the header. max_attempts was 5, which made the ladder stop
-    // on its own ceiling at t=75 s -- so budget_ms never bound, and the
-    // header's claim to "clear the 80.9 s episode measured this session" was
-    // false by 5.9 s. The last attempt must go out AFTER the longest desync
-    // episode this repo has actually measured, or the whole sizing argument
-    // is decoration.
+    // [F3 2026-09-03] THE ASSERTION THAT USED TO BE TAUTOLOGICAL LIVES BELOW,
+    // in TheFinalAttemptIsAdmittedByTheDeadlineItRunsAgainst. What was here
+    // read `const std::uint32_t last_attempt_at = total_sleep;` -- TOTAL
+    // SLEEPING TIME read as LAST-ATTEMPT TIME -- and then compared the walked
+    // ladder against cancel_last_attempt_start_ms(), which is the same
+    // quantity computed twice. It could not have caught F3 and did not: the
+    // ladder authorised its final attempt at exactly budget_ms, cancel_ids
+    // rejected every id at `now >= deadline` without issuing an RPC, and the
+    // wallet was in fact last asked at 75'000 while this test proved 90'000.
     //
-    // MUTATION: set max_attempts back to 5 -> last attempt lands at 75'000
-    // and this FAILS.
-    const std::uint32_t last_attempt_at = total_sleep;
-    EXPECT_GE(last_attempt_at, kLongestMeasuredDesyncMs)
-        << "the ladder must still be trying when the longest MEASURED desync "
-           "episode would have cleared";
-    EXPECT_EQ(last_attempt_at,
+    // Total sleeping time is kept here as what it is, and nothing about
+    // coverage is claimed from it.
+    EXPECT_EQ(total_sleep,
               cancel_last_attempt_start_ms(cfg, TakeFailureClass::Unsynced))
-        << "the constexpr schedule proof and the walked ladder must agree";
+        << "the constexpr schedule proof and the walked ladder must agree "
+           "about when the ladder stops sleeping";
+}
+
+// ---------------------------------------------------------------------------
+// [F3 2026-09-03] The interaction the policy test could not see.
+//
+// The bug was never inside plan_cancel_retry and never inside cancel_ids. It
+// was in the composition of three facts, only one of which is in this header:
+//   1. the ladder authorises its final attempt at elapsed E;
+//   2. the engine passes D = t0 + cfg.budget_ms into cancel_ids;
+//   3. cancel_ids admits an id iff now < D.
+// E == D satisfied every existing assertion and issued zero RPCs.
+//
+// This is the assertion that must hold: E < D STRICTLY, for every attempt the
+// ladder authorises -- not just the last one.
+//
+// MUTATIONS THAT MUST TRIP THIS TEST:
+//   * set execution_reserve_ms to 0     -> final attempt lands at 90'000, is
+//                                          not admitted, coverage falls to
+//                                          75'000, both EXPECTs below fail.
+//   * relax cancel_ids_admits to `<=`   -> the 90'000 attempt is "admitted",
+//                                          AdmitsAtTheDeadline fails.
+//   * set max_attempts back to 5        -> coverage falls to 75'000 and the
+//                                          kLongestMeasuredDesyncMs EXPECT
+//                                          fails.
+// ---------------------------------------------------------------------------
+TEST(CancelRetry, TheFinalAttemptIsAdmittedByTheDeadlineItRunsAgainst)
+{
+    const CancelRetryConfig cfg{};
+    CancelAttemptState s = incident_state();
+
+    std::uint32_t elapsed         = 0;
+    std::uint32_t last_admitted   = 0;   // attempt 1 goes out at t=0
+    std::uint32_t authorised      = 1;
+    std::uint32_t admitted_count  = 1;
+
+    for (int guard = 0; guard < 1000; ++guard) {
+        const CancelRetryPlan p = plan_cancel_retry(s, cfg);
+        if (p.verdict != CancelRetryVerdict::Retry) break;
+        elapsed        += p.delay_ms;
+        s.elapsed_ms    = elapsed;
+        s.attempts_made = p.next_attempt;
+        authorised      = p.next_attempt;
+
+        // EVERY attempt the ladder authorises must be one the gate will let
+        // through. An authorised attempt that cannot issue an RPC is not a
+        // retry, it is a log line.
+        EXPECT_TRUE(cancel_ids_admits(elapsed, cfg.budget_ms))
+            << "attempt " << authorised << " was authorised at " << elapsed
+            << " ms against a " << cfg.budget_ms
+            << " ms deadline -- cancel_ids would reject every id before "
+               "issuing a single RPC";
+        if (cancel_ids_admits(elapsed, cfg.budget_ms)) {
+            last_admitted = elapsed;
+            ++admitted_count;
+        }
+    }
+
+    EXPECT_EQ(admitted_count, 6u)
+        << "all six attempts must actually reach the wallet; with the clamp "
+           "consuming the whole remaining budget the sixth reached nothing";
+    EXPECT_EQ(last_admitted, 85'000u);
+    EXPECT_LT(last_admitted, cfg.budget_ms)
+        << "STRICTLY before. Landing ON the deadline is the F3 defect";
+
+    // THE COVERAGE CLAIM, asserted on the last time the WALLET IS ASKED.
+    EXPECT_GE(last_admitted, kLongestMeasuredDesyncMs)
+        << "the ladder must still be ASKING THE WALLET when the longest "
+           "desync episode this repo has measured would have cleared";
+
+    // And the walked ladder must agree with the constexpr proof, which is a
+    // different function from the one above precisely because the two
+    // quantities are different.
+    EXPECT_EQ(last_admitted,
+              cancel_last_effective_attempt_start_ms(
+                  cfg, TakeFailureClass::Unsynced));
+}
+
+// The gate itself. One comparison, and the direction of the inequality is the
+// whole finding: an attempt starting exactly AT the deadline gets no
+// execution window.
+//
+// MUTATION: change cancel_ids_admits to `now_ms <= deadline_ms` -> fails.
+TEST(CancelRetry, TheDeadlineGateRefusesAnAttemptThatStartsOnIt)
+{
+    EXPECT_TRUE(cancel_ids_admits(0, 90'000));
+    EXPECT_TRUE(cancel_ids_admits(85'000, 90'000));
+    EXPECT_TRUE(cancel_ids_admits(89'999, 90'000));
+    EXPECT_FALSE(cancel_ids_admits(90'000, 90'000))
+        << "AT the deadline the engine's cancel_ids rejects every id without "
+           "an RPC, so authorising an attempt there delivers nothing";
+    EXPECT_FALSE(cancel_ids_admits(90'001, 90'000));
+
+    // The steady_clock overload must be the SAME rule, not a restatement of
+    // it. MUTATION: reimplement it as its own `now < deadline` and then
+    // change one of the two -> these disagree.
+    const auto now = std::chrono::steady_clock::now();
+    EXPECT_TRUE(cancel_ids_admits(now, now + std::chrono::seconds(5)));
+    EXPECT_FALSE(cancel_ids_admits(now, now));
+    EXPECT_FALSE(cancel_ids_admits(now, now - std::chrono::seconds(1)));
+}
+
+// The reserve is what buys the strict inequality. Without it the clamp always
+// schedules the final attempt to wake at exactly budget_ms, FOR ANY schedule
+// and ANY elapsed -- the general result, not an accident of these constants.
+//
+// MUTATION: restore `delay = budget_left` -> the zero-reserve arm here starts
+// passing the admits check and the EXPECT_FALSE fails.
+TEST(CancelRetry, WithoutTheExecutionReserveEveryClampedRetryIsDead)
+{
+    CancelRetryConfig cfg{};
+    cfg.execution_reserve_ms = 0;
+
+    // Walk to the clamped attempt with the reserve disabled.
+    CancelAttemptState s = incident_state();
+    std::uint32_t elapsed = 0;
+    std::uint32_t last    = 0;
+    for (int guard = 0; guard < 1000; ++guard) {
+        const CancelRetryPlan p = plan_cancel_retry(s, cfg);
+        if (p.verdict != CancelRetryVerdict::Retry) break;
+        elapsed        += p.delay_ms;
+        s.elapsed_ms    = elapsed;
+        s.attempts_made = p.next_attempt;
+        last            = elapsed;
+    }
+
+    EXPECT_EQ(last, cfg.budget_ms)
+        << "the clamp sets delay = budget_left, so the attempt always wakes "
+           "at exactly the budget";
+    EXPECT_FALSE(cancel_ids_admits(last, cfg.budget_ms))
+        << "...and is therefore rejected without issuing an RPC. This is F3.";
+    EXPECT_EQ(cancel_last_effective_attempt_start_ms(
+                  cfg, TakeFailureClass::Unsynced), 75'000u)
+        << "so real coverage collapses to 75 s -- 5.9 s short of the 80.9 s "
+           "episode the budget was sized for, which is the exact shortfall "
+           "the previous review believed raising max_attempts had fixed";
 }
 
 // A wallet that HANGS rather than refuses is the expensive shape: each
@@ -177,7 +314,7 @@ TEST(CancelRetry, AHangingWalletIsBoundedByWallClockNotByAttemptCount)
 {
     const CancelRetryConfig cfg{};
     CancelAttemptState s = incident_state();
-    s.attempts_made = 2;        // 3 of the 5 attempts still unused
+    s.attempts_made = 2;        // 4 of the 6 attempts still unused
     s.elapsed_ms    = 89'700;   // two slow attempts have eaten the budget
 
     const CancelRetryPlan p = plan_cancel_retry(s, cfg);
@@ -200,28 +337,62 @@ TEST(CancelRetry, AHangingWalletIsBoundedByWallClockNotByAttemptCount)
     // resolution and the next reader should be able to check which way it went.
 }
 
-// The tail of the budget is clamped into, not spun on. Between these two
-// cases the only difference is 3 seconds of remaining budget.
+// The tail of the budget is clamped into, not spun on -- and the clamp now
+// stops one execution reserve SHORT of the budget rather than at it.
 //
-// MUTATION: delete the min_useful_delay_ms guard -> the second case returns
-// Retry with a 400 ms sleep and FAILS.
-TEST(CancelRetry, ThePartialTailIsClampedAndAUselessTailIsRefused)
+// [F3 2026-09-03] This test previously asserted `elapsed=86'500 -> Retry with
+// delay 3'500, budget_left_ms 0`, i.e. an attempt scheduled to wake at
+// EXACTLY 90'000. That expectation was the defect written down as a
+// requirement: the engine hands 90'000 to cancel_ids as its deadline, and
+// cancel_ids admits an id only while `now < deadline`, so that attempt
+// rejected every id without issuing one RPC. `budget_left_ms == 0` was the
+// tell -- zero budget left after the sleep means zero time to do anything.
+//
+// The correct behaviour is below: a clamp is taken only when the attempt it
+// schedules lands STRICTLY inside the deadline with room to issue.
+//
+// MUTATION: delete the min_useful_delay_ms guard -> the useless case returns
+// Retry with a sub-second sleep and FAILS.
+// MUTATION: set execution_reserve_ms to 0 -> the dead-tail case below starts
+// returning Retry at 90'000 and FAILS.
+TEST(CancelRetry, ThePartialTailIsClampedShortOfTheDeadline)
 {
     const CancelRetryConfig cfg{};
 
+    // 10 s of budget left, next ladder step would be 20 s. Clamp to 5 s so
+    // the attempt lands at 85 s, inside the deadline, with the reserve left
+    // to actually issue it.
     CancelAttemptState usable = incident_state();
-    usable.attempts_made = 3;             // next ladder step would be 20 s
-    usable.elapsed_ms    = 86'500;        // only 3.5 s left
+    usable.attempts_made = 3;
+    usable.elapsed_ms    = 80'000;
     const CancelRetryPlan a = plan_cancel_retry(usable, cfg);
     EXPECT_EQ(a.verdict, CancelRetryVerdict::Retry);
-    EXPECT_EQ(a.delay_ms, 3'500u) << "clamped to what is left, not the full 20s";
-    EXPECT_EQ(a.budget_left_ms, 0u);
+    EXPECT_EQ(a.delay_ms, 5'000u)
+        << "clamped into what is left MINUS the execution reserve, not the "
+           "full 20s and not the full remaining budget";
+    EXPECT_EQ(a.budget_left_ms, cfg.execution_reserve_ms)
+        << "the reserve is what survives the sleep -- it is the window the "
+           "attempt gets to be admitted in";
+    EXPECT_TRUE(cancel_ids_admits(usable.elapsed_ms + a.delay_ms,
+                                  cfg.budget_ms))
+        << "the whole point: the attempt this plan authorises must be one "
+           "cancel_ids will actually let through";
+
+    // THE OLD EXPECTATION, now correctly a stop. 3.5 s left is less than the
+    // reserve, so any attempt scheduled from here would wake at or past the
+    // deadline and issue nothing. Refusing is strictly better than
+    // authorising a retry that cannot happen and then reporting it as one.
+    CancelAttemptState dead_tail = usable;
+    dead_tail.elapsed_ms = 86'500;
+    const CancelRetryPlan b = plan_cancel_retry(dead_tail, cfg);
+    EXPECT_EQ(b.verdict, CancelRetryVerdict::Stop);
+    EXPECT_EQ(b.stop_reason, CancelStopReason::BudgetExhausted);
 
     CancelAttemptState useless = usable;
     useless.elapsed_ms = 89'600;          // 400 ms left
-    const CancelRetryPlan b = plan_cancel_retry(useless, cfg);
-    EXPECT_EQ(b.verdict, CancelRetryVerdict::Stop);
-    EXPECT_EQ(b.stop_reason, CancelStopReason::BudgetExhausted);
+    const CancelRetryPlan c = plan_cancel_retry(useless, cfg);
+    EXPECT_EQ(c.verdict, CancelRetryVerdict::Stop);
+    EXPECT_EQ(c.stop_reason, CancelStopReason::BudgetExhausted);
 }
 
 // ---------------------------------------------------------------------------
@@ -759,5 +930,92 @@ TEST(CancelLadderState, SlowAttemptsExhaustTheBudgetNotJustTheSleeps)
     EXPECT_EQ(l.stop_reason(), CancelStopReason::BudgetExhausted)
         << "four attempts remain unused -- the clock is what ran out";
     EXPECT_FALSE(l.clean());
+    EXPECT_EQ(l.outstanding().size(), 7u);
+}
+
+// [F3 2026-09-03] CancelOutcome::deadline_hit was set by cancel_ids and READ
+// BY NOBODY -- never copied across the engine boundary, never consulted here.
+// It is the gate's own report that it ran out of time, and it is the only
+// signal that distinguishes "out of time" from "the wallet refused".
+//
+// Without it the ladder inferred a reason from the failure class, and an
+// attempt that issued no RPC classified nothing -- so worst_class fell back
+// to Other, whose ceiling is other_max_attempts{3}, and the operator's
+// CRITICAL alert announced "stopped because attempts-exhausted" for what was
+// plainly a budget expiry.
+//
+// MUTATION: drop the deadline_hit_ check from next() -> the ladder keeps
+// laddering and the stop_reason assertion FAILS.
+// MUTATION: fold oc.worst_class in unconditionally in record() -> the
+// worst_class assertion FAILS as the Unsynced flap is downgraded to Other.
+TEST(CancelLadderState, ADeadlineHitStopsTheLadderAndIsReportedAsTheBudget)
+{
+    CancelLadder l(kSevenIncidentOffers, CancelRetryConfig{});
+
+    // Attempt 1: a real sync refusal. The ladder learns the class.
+    ASSERT_EQ(l.next(0).step, CancelLadderStep::Attempt);
+    CancelAttemptOutcome first{};
+    first.failed      = kSevenIncidentOffers;
+    first.last_error  = kSyncRefusal;
+    first.worst_class = TakeFailureClass::Unsynced;
+    l.record(std::move(first));
+    EXPECT_EQ(l.worst_class(), TakeFailureClass::Unsynced);
+
+    // The ladder schedules a retry, and that retry finds the clock spent:
+    // cancel_ids admits nothing, issues nothing, classifies nothing.
+    const auto sleep_act = l.next(5'000);
+    ASSERT_EQ(sleep_act.step, CancelLadderStep::Sleep);
+    ASSERT_EQ(l.next(10'000).step, CancelLadderStep::Attempt);
+
+    CancelAttemptOutcome starved{};
+    starved.failed       = kSevenIncidentOffers;
+    starved.deadline_hit = true;
+    // No last_error and the default Other class -- exactly what a zero-RPC
+    // attempt produces.
+    l.record(std::move(starved));
+
+    EXPECT_EQ(l.worst_class(), TakeFailureClass::Unsynced)
+        << "an attempt that issued no RPC learned nothing about the failure "
+           "class and must not downgrade the flap onto the short leash";
+
+    const auto act = l.next(10'000);
+    EXPECT_EQ(act.step, CancelLadderStep::Finish);
+    EXPECT_EQ(l.stop_reason(), CancelStopReason::BudgetExhausted)
+        << "the gate said it was out of time. Reporting 'attempts-exhausted' "
+           "here sends the operator looking at the wrong constant";
+    EXPECT_EQ(l.outstanding().size(), 7u) << "still live, and still named";
+}
+
+// A granted sleep is not a standing authorisation. plan_cancel_retry reserves
+// an execution window so an overshoot should not happen on the schedule, but
+// the sleep is a real timer on a machine that may be swapping during a
+// shutdown. If it overshoots, the attempt it authorised would be rejected by
+// cancel_ids without issuing an RPC -- so the clock is re-read AFTER the wait
+// rather than the attempt being pre-committed before it.
+//
+// MUTATION: return the pre-committed Attempt without revalidating -> this
+// FAILS with step == Attempt.
+TEST(CancelLadderState, AnOvershotSleepDoesNotAuthoriseADeadAttempt)
+{
+    const CancelRetryConfig cfg{};
+    CancelLadder l(kSevenIncidentOffers, CancelRetryConfig{});
+
+    ASSERT_EQ(l.next(0).step, CancelLadderStep::Attempt);
+    CancelAttemptOutcome oc{};
+    oc.failed      = kSevenIncidentOffers;
+    oc.last_error  = kSyncRefusal;
+    oc.worst_class = TakeFailureClass::Unsynced;
+    l.record(std::move(oc));
+
+    // The ladder grants a sleep at t=5s...
+    const auto sleep_act = l.next(5'000);
+    ASSERT_EQ(sleep_act.step, CancelLadderStep::Sleep);
+
+    // ...and the process is descheduled; we wake past the budget.
+    const auto act = l.next(cfg.budget_ms + 250);
+    EXPECT_EQ(act.step, CancelLadderStep::Finish)
+        << "the authorised attempt would start at or past the deadline, so "
+           "cancel_ids would reject every id before issuing an RPC";
+    EXPECT_EQ(l.stop_reason(), CancelStopReason::BudgetExhausted);
     EXPECT_EQ(l.outstanding().size(), 7u);
 }

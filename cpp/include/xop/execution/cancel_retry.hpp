@@ -37,10 +37,27 @@
 //   hand-written shutdown.flag . ~600 s (the watchdog's own stall threshold)
 //   SIGTERM / taskkill /F ...... 0 s -- no handler runs at all
 //   console window close (X) ... ~5 s -- CTRL_CLOSE_EVENT is not mapped
-//   a new engine starting ...... 0 s -- kill_old_instances() TerminateProcess
+//   a new engine starting ...... 30 s -- kill_old_instances() writes
+//                                        shutdown.flag and waits, THEN
+//                                        TerminateProcess / SIGKILL
 //
-// The incident was the third row (600 s), NOT the first. Sizing this to 30 s
-// would size it for the one waiter that hard-kills us regardless.
+// [F6 2026-09-03] That last row said "0 s -- TerminateProcess", and F4 in
+// this same PR made it false on both platforms: Windows now writes
+// data/shutdown.flag and waits kGracefulExitWaitMs (main.cpp:120) before
+// terminating, and POSIX was raised from 10 s to the same 30 s. The argument
+// that used to sit here -- "sizing this to 30 s would size it for the one
+// waiter that hard-kills us regardless" -- described a waiter that no longer
+// hard-kills regardless, so it is withdrawn rather than repaired.
+//
+// The budget stays 90 s, for a reason that survives the correction: the
+// incident was the 600 s row, and the 30 s rows do not need the ladder to
+// finish. What they need is the INTENT MARKER, which Engine::shutdown()
+// writes before the first attempt. See "WHAT THIS CANNOT SAVE" below, and
+// read every coverage claim in this header with that split in mind:
+//
+//   85 s is the ladder's reach WHEN NOTHING PREEMPTS IT -- the 600 s row.
+//   Under a GUI stop or a redeploy the effective cap is 30 s, and what
+//   survives there is the marker, not the cancels.
 //
 // THE BUDGET, AND WHY 90 s
 // ------------------------
@@ -77,13 +94,24 @@
 //
 // WHAT THIS CANNOT SAVE, STATED PLAINLY
 // -------------------------------------
-// SIGTERM, taskkill /F, console-window close and kill_old_instances() run no
-// shutdown path at all, so no retry length whatsoever helps them. Under a GUI
-// stop the effective cap is 30 s no matter what this header says. That is why
-// the retry is only half the fix: the durable half is the write-ahead cancel
-// intent the engine persists BEFORE the first attempt, which the next engine
-// reads and finishes. This header covers the flap; the intent file covers the
-// kill.
+// taskkill /F, kill -9 and console-window close run no shutdown path at all,
+// so no retry length whatsoever helps them.
+//
+// [F6] Two names were in that sentence that do not belong there any more, and
+// the correction goes in BOTH directions:
+//   * SIGTERM on POSIX has always been covered -- main.cpp installs
+//     signal_handler and the first signal calls shutdown(). Listing it as
+//     uncovered was wrong in the pessimistic direction.
+//   * kill_old_instances() is covered SINCE F4 in this PR, on both platforms,
+//     and was genuinely uncovered on Windows before it.
+// Neither is a full-ladder cover: both cap the engine at 30 s.
+//
+// So under a GUI stop, a redeploy, or a POSIX SIGTERM, the effective cap is
+// 30 s no matter what this header says, and the ladder's 85 s reach is not
+// available there. That is why the retry is only half the fix: the durable
+// half is the write-ahead cancel intent the engine persists BEFORE the first
+// attempt, which the next engine reads and finishes. This header covers the
+// flap; the intent file covers the kill.
 //
 // ON THE ZERO ENUMERATOR -- A DELIBERATE DEPARTURE
 // ------------------------------------------------
@@ -125,6 +153,7 @@
 // ---------------------------------------------------------------------------
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -176,10 +205,39 @@ enum class CancelStopReason : int {
 // Tuning. Milliseconds, not blocks. See the header note.
 // ---------------------------------------------------------------------------
 struct CancelRetryConfig {
-    /// Hard wall-clock cap on the whole retry sequence, measured from the
-    /// START of the first attempt. This is the number that keeps the promise
-    /// "the shutdown does not hang".
+    /// Wall-clock cap on SCHEDULING, measured from the START of the first
+    /// attempt. After this the ladder authorises no further attempt and
+    /// cancel_ids admits no further id.
+    ///
+    /// [F5 review] This is NOT a hard bound on the shutdown's duration and
+    /// this header no longer says it is. It bounds when new work may START.
+    /// An RPC already in flight is not interrupted -- see the honest
+    /// worst-case arithmetic on cancel_ids_admits() below.
     std::uint32_t budget_ms{90'000};
+    /// Milliseconds of the budget reserved for ACTUALLY ISSUING the final
+    /// attempt, rather than for sleeping before it.
+    ///
+    /// [F3 2026-09-03] Without this the ladder's last retry was structurally
+    /// dead, for any schedule and any elapsed. The clamp below set
+    /// `delay = budget_left`, so the authorised attempt always woke at
+    /// exactly `t0 + budget_ms`; the engine passes that same instant to
+    /// cancel_ids as its deadline; and cancel_ids admits an id only while
+    /// `now < deadline`. Waking AT the deadline therefore meant every id was
+    /// rejected before a single RPC was issued. The clamp branch could never
+    /// produce a wallet call in the integrated path, and the comment claiming
+    /// "the last partial window is still a real chance at a flap that is
+    /// about to clear" described behaviour that did not exist.
+    ///
+    /// The consequence was measurable and was the exact thing the previous
+    /// review believed it had fixed: the last attempt that reached the wallet
+    /// went out at 75 s, 5.9 s short of kLongestMeasuredDesyncMs, while
+    /// cancel_last_attempt_start_ms proved "90'000" -- because it was
+    /// measuring total sleeping time, not the last time the wallet was asked.
+    ///
+    /// What the reserve buys is ADMISSION, not completion: it guarantees the
+    /// final attempt is inside the deadline when cancel_ids checks the clock.
+    /// How long that attempt then takes is F5's problem, not this one's.
+    std::uint32_t execution_reserve_ms{5'000};
     /// Total attempts including the first. 6 attempts => 5 retries at
     /// 5/10/20/40/40 s = 115 s of scheduled sleeping, which does NOT fit in
     /// budget_ms and is not meant to: `budget_ms` is what binds, and the last
@@ -189,9 +247,16 @@ struct CancelRetryConfig {
     /// attempt ceiling at t=75 s -- BEFORE the 90 s budget could ever bind,
     /// which made budget_ms decorative and made this header's own claim to
     /// "clear the 80.9 s episode measured this session" false: the last
-    /// attempt went out at 75 s, 5.9 s before that episode ended. Six
-    /// attempts put the final attempt at exactly budget_ms, which is proved
-    /// below by static_assert rather than asserted in prose.
+    /// attempt went out at 75 s, 5.9 s before that episode ended.
+    ///
+    /// [F3 2026-09-03] Raising it to 6 did NOT fix that. It moved the last
+    /// authorisation to exactly budget_ms, where cancel_ids rejects every id
+    /// without issuing an RPC, so the last attempt that reached the wallet
+    /// was still 75 s and the shortfall was still 5.9 s -- now hidden behind
+    /// a compile-time proof of a different quantity. What fixes it is
+    /// execution_reserve_ms, which lands the sixth attempt at 85 s, inside
+    /// the deadline. cancel_last_effective_attempt_start_ms() below proves
+    /// the number that matters: when the wallet is LAST ASKED.
     std::uint32_t max_attempts{6};
     /// First retry delay; doubles per retry to max_delay_ms.
     std::uint32_t base_delay_ms{5'000};
@@ -228,7 +293,12 @@ cancel_backoff_ms(std::uint32_t retry_index,
 /// Total sleeping the full ladder would do, if nothing else stopped it.
 /// Exists so a static_assert can prove the schedule fits inside the budget --
 /// the two constants are edited independently and a ladder that overruns its
-/// own cap would make the "does not hang" claim false at compile time.
+/// own cap would make the "stops scheduling on time" claim false at compile
+/// time.
+///
+/// [F5] SLEEPING is all this bounds. It says nothing about how long an RPC
+/// already in flight takes, and therefore nothing about the total duration of
+/// a shutdown; see the worst-case arithmetic in Engine::shutdown().
 [[nodiscard]] constexpr std::uint32_t
 cancel_schedule_total_ms(const CancelRetryConfig& cfg) noexcept
 {
@@ -255,6 +325,58 @@ static_assert(cancel_schedule_total_ms(CancelRetryConfig{})
               "the 90 s number came to be quoted for a ladder that actually "
               "stopped at 75 s");
 
+// ---------------------------------------------------------------------------
+// cancel_ids_admits -- THE gate between the policy and the wallet.
+//
+// [F3 2026-09-03] This one comparison is the entire coupling between the
+// retry schedule and whether an RPC is actually issued, and it used to exist
+// only as a bare `now() >= deadline` buried in offer_manager.cpp with nothing
+// relating it to the ladder that feeds it. That is why F3 was invisible: the
+// policy was proved in isolation against itself, the gate was proved not at
+// all, and the composition of the two -- where the bug lived -- was
+// expressible in neither. offer_manager.cpp::cancel_ids now calls this, so
+// the two halves cannot drift apart again.
+//
+// Strict `<`: an attempt starting exactly AT the deadline gets no execution
+// window and is the dead attempt this finding is about.
+//
+// NOTE, and it is the F5 caveat: admission is all this decides. Once an id is
+// admitted the RPC underneath is not interruptible -- rpc_post performs up to
+// max_retries+1 blocking curl transfers at request_timeout each, so one
+// admitted call can return long after `deadline_ms`. This gate bounds when
+// work may START, never when it finishes.
+// ---------------------------------------------------------------------------
+[[nodiscard]] constexpr bool
+cancel_ids_admits(std::uint32_t now_ms, std::uint32_t deadline_ms) noexcept
+{
+    return now_ms < deadline_ms;
+}
+
+static_assert(cancel_ids_admits(89'999, 90'000));
+static_assert(!cancel_ids_admits(90'000, 90'000),
+              "AT the deadline is refused. A ladder that authorises its final "
+              "attempt at exactly budget_ms issues no RPC at all");
+static_assert(!cancel_ids_admits(90'001, 90'000));
+
+/// The same rule at the call site, where the clock is a steady_clock rather
+/// than an elapsed count. DELEGATES rather than restating `now < deadline`:
+/// one comparison, one place. A sub-millisecond remainder is refused, which
+/// is the same judgement the execution reserve makes -- there is no
+/// meaningful execution window inside a millisecond.
+[[nodiscard]] inline bool
+cancel_ids_admits(std::chrono::steady_clock::time_point now,
+                  std::chrono::steady_clock::time_point deadline) noexcept
+{
+    if (deadline <= now) return cancel_ids_admits(0u, 0u);
+    const auto left_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)
+            .count();
+    const auto left = static_cast<std::uint32_t>(
+        std::min<std::int64_t>(left_ms, 0xFFFF'FFFF));
+    // "now" re-expressed against its own deadline: zero elapsed, `left` to go.
+    return cancel_ids_admits(0u, left);
+}
+
 /// The longest measured desync episode in this repo's Step-8 sync-gate
 /// sampling (7.18 h, 1159 cycles, 8 episodes). The budget is sized to reach
 /// PAST this, and the static_assert below is what makes that a fact rather
@@ -264,6 +386,34 @@ inline constexpr std::uint32_t kLongestMeasuredDesyncMs = 80'900;
 /// The worst desync episode ever observed here (take_retry.hpp, 35.2 h).
 /// The budget does NOT cover this and this header does not pretend it does.
 inline constexpr std::uint32_t kWorstObservedDesyncMs = 155'000;
+
+/// The hard-kill window every graceful stopper gives us: the GUI's
+/// _stop_engine_process (engine_bridge.py) and, since F4, both branches of
+/// main.cpp's kill_old_instances (main.cpp:120 kGracefulExitWaitMs). Stated
+/// here so the constant below can be checked against it at compile time
+/// rather than in prose.
+inline constexpr std::uint32_t kHardKillWindowMs = 30'000;
+
+/// [F6 2026-09-03] How long Engine::shutdown() waits for an operator
+/// cancel-all that is still in flight before REFUSING the hand-over.
+///
+/// The wait exists so a shutdown does not stack a second charged cancel on
+/// coins an operator-initiated cancel-all is already spending. It used to be
+/// uncapped, which made every wall-clock claim about shutdown conditional on
+/// a flag cleared by an unrelated coroutine that awaits wallet RPCs.
+///
+/// The cap can be SHORT precisely because the expiry path refuses to spend
+/// rather than proceeding to spend: no length of wait is needed to make
+/// "issue nothing" safe. What the wait must not do is eat the window in
+/// which we still have to write the intent marker and exit, hence the
+/// assert.
+inline constexpr std::uint32_t kCancelAllHandoverWaitMs = 20'000;
+
+static_assert(kCancelAllHandoverWaitMs < kHardKillWindowMs,
+              "the hand-over wait must leave room inside the 30 s hard-kill "
+              "window for the write-ahead marker and teardown that follow "
+              "it. A wait sized at or past the window turns every "
+              "cancel-all-then-close into a hard kill with nothing written");
 
 // ---------------------------------------------------------------------------
 // What the caller knows when it asks. Every field defaults to the value that
@@ -356,15 +506,27 @@ plan_cancel_retry(CancelAttemptState state,
     }
     const std::uint32_t budget_left = cfg.budget_ms - state.elapsed_ms;
 
+    // [F3] Sleeping may consume the budget only down to the execution
+    // reserve. What is left over is not slack -- it is the window in which
+    // the attempt this plan authorises has to be ADMITTED by
+    // cancel_ids_admits(). Scheduling into it is what made the final retry
+    // wake exactly at the deadline and be rejected without an RPC.
+    const std::uint32_t usable =
+        (budget_left > cfg.execution_reserve_ms)
+            ? budget_left - cfg.execution_reserve_ms
+            : 0;
+
     std::uint32_t delay = cancel_backoff_ms(state.attempts_made, cfg);
-    if (delay > budget_left) {
+    if (delay > usable) {
         // Clamp into what is left rather than refusing outright: the last
         // partial window is still a real chance at a flap that is about to
-        // clear. But a clamp below min_useful_delay_ms re-asks a wallet that
-        // has had no time to change its mind, so that becomes a stop.
-        delay = budget_left;
+        // clear -- and now it genuinely is one, because the attempt it
+        // schedules starts strictly before the deadline.
+        delay = usable;
     }
     if (delay < cfg.min_useful_delay_ms) {
+        // Either the wallet has had no time to change its mind, or the whole
+        // remaining budget is reserve. Both are a stop.
         plan.stop_reason = CancelStopReason::BudgetExhausted;
         return plan;
     }
@@ -415,20 +577,87 @@ cancel_last_attempt_start_ms(const CancelRetryConfig& cfg,
 
 static_assert(cancel_last_attempt_start_ms(CancelRetryConfig{},
                                            TakeFailureClass::Unsynced)
-                  == 90'000,
-              "the last Unsynced attempt must go out at the budget");
-static_assert(cancel_last_attempt_start_ms(CancelRetryConfig{},
-                                           TakeFailureClass::Unsynced)
+                  == 85'000,
+              "the last Unsynced attempt is authorised one execution reserve "
+              "before the budget, not AT it");
+
+// ---------------------------------------------------------------------------
+// cancel_last_effective_attempt_start_ms -- when is the wallet LAST ASKED?
+//
+// [F3 2026-09-03] The function above answers "when does the ladder stop
+// sleeping", and that is NOT the same question. The difference is one call to
+// cancel_ids_admits(), and the whole finding lived in that difference: the
+// ladder authorised attempt 6 at 90'000, the engine handed 90'000 to
+// cancel_ids as its deadline, `now >= deadline` rejected every id, and zero
+// RPCs went out. Coverage was 75'000 while the header proved 90'000.
+//
+// So this walks the same real policy but counts an attempt ONLY when the gate
+// would actually admit it. It is the number every coverage claim in this file
+// is now stated against, and the static_assert below is the mutation-check
+// for any future edit: remove the reserve, relax the gate to `>`, or drop
+// max_attempts back to 5, and this fails to COMPILE.
+// ---------------------------------------------------------------------------
+[[nodiscard]] constexpr std::uint32_t
+cancel_last_effective_attempt_start_ms(const CancelRetryConfig& cfg,
+                                       TakeFailureClass cls) noexcept
+{
+    std::uint32_t elapsed   = 0;
+    std::uint32_t attempts  = 0;
+    // Elapsed time of the last attempt the gate would ADMIT. Attempt 1 is
+    // unconditional -- the ladder never plans it -- and goes out at 0.
+    std::uint32_t last_live = 0;
+
+    for (std::uint32_t guard = 0; guard < 1'000; ++guard) {
+        ++attempts;
+        CancelAttemptState st{};
+        st.attempts_made    = attempts;
+        st.remaining_offers = 1;  // never finishes: the worst case
+        st.elapsed_ms       = elapsed;
+        st.last_class       = cls;
+        const auto plan = plan_cancel_retry(st, cfg);
+        if (plan.verdict != CancelRetryVerdict::Retry) return last_live;
+        elapsed += plan.delay_ms;
+        // The attempt the ladder just authorised runs at `elapsed`. It
+        // reaches the wallet only if cancel_ids would admit it there.
+        if (cancel_ids_admits(elapsed, cfg.budget_ms)) last_live = elapsed;
+    }
+    return last_live;
+}
+
+// [F6] READ THE THREE ASSERTS BELOW WITH THEIR SCOPE ATTACHED. They prove a
+// property of THIS SCHEDULE -- when the ladder would last ask the wallet if it
+// is allowed to run to completion. They say nothing about whether it is
+// allowed to, and on the production platform it usually is not: a GUI stop or
+// a redeploy terminates the engine at 30 s (kHardKillWindowMs), so the
+// attempts at 75 s and 85 s never happen and the 80.9 s episode is not
+// covered on those routes. What covers them is the intent marker. "85 s of a
+// measured-longest 80.9 s episode" is true of the ladder and false of a
+// redeploy; state it with the qualifier or not at all.
+static_assert(cancel_last_effective_attempt_start_ms(
+                  CancelRetryConfig{}, TakeFailureClass::Unsynced) == 85'000,
+              "the wallet is last asked at 85 s: five backoffs of "
+              "5/10/20/40 and a final clamp of 10 s, the clamp being what the "
+              "execution reserve shortens so the attempt lands INSIDE the "
+              "deadline instead of exactly on it");
+static_assert(cancel_last_effective_attempt_start_ms(
+                  CancelRetryConfig{}, TakeFailureClass::Unsynced)
                   >= kLongestMeasuredDesyncMs,
-              "the ladder must still be trying when the longest desync "
-              "episode this repo has actually measured would have cleared. "
-              "This is the claim the 90 s budget was chosen for");
-static_assert(cancel_last_attempt_start_ms(CancelRetryConfig{},
-                                           TakeFailureClass::Unsynced)
+              "THE CLAIM. The ladder must still be ASKING THE WALLET when the "
+              "longest desync episode this repo has actually measured would "
+              "have cleared. Asserted on the effective attempt, not on total "
+              "sleeping time: the previous version of this assert was "
+              "satisfied by a ladder whose final attempt issued no RPC");
+static_assert(cancel_last_effective_attempt_start_ms(
+                  CancelRetryConfig{}, TakeFailureClass::Unsynced)
                   < kWorstObservedDesyncMs,
               "and it must NOT claim to cover the worst episode ever seen. "
               "If this ever becomes false the header prose is lying in the "
               "other direction");
+static_assert(cancel_last_effective_attempt_start_ms(
+                  CancelRetryConfig{}, TakeFailureClass::Unsynced)
+                  <= cancel_last_attempt_start_ms(CancelRetryConfig{},
+                                                  TakeFailureClass::Unsynced),
+              "the wallet cannot be asked later than the ladder schedules");
 
 // ---------------------------------------------------------------------------
 // more_retryable -- fold N failure classes into the one that decides.
@@ -507,6 +736,13 @@ struct CancelAttemptOutcome {
     TakeFailureClass         worst_class{TakeFailureClass::Other};
     /// Set when `cancelled` came from the wallet-wide bulk endpoint.
     bool                     bulk_submitted{false};
+    /// [F3] The attempt stopped because the wall-clock deadline was reached,
+    /// not because the wallet refused anything. CancelOutcome::deadline_hit
+    /// has existed since S46 and was READ BY NOBODY -- it was set in
+    /// cancel_ids, never copied across this boundary, and the one signal that
+    /// distinguishes "out of time" from "the wallet said no" was discarded
+    /// where the two are told apart.
+    bool                     deadline_hit{false};
 };
 
 // ---------------------------------------------------------------------------
@@ -580,8 +816,30 @@ public:
             return act;
         }
 
+        // [F3] A previous attempt ran out the clock inside cancel_ids. That
+        // is the authoritative "out of time" signal -- it is the gate itself
+        // reporting -- and it used to be dropped at the engine boundary,
+        // leaving the operator alert to guess a reason from the failure class
+        // and announce "attempts-exhausted" for a budget expiry.
+        if (deadline_hit_) {
+            stop_reason_ = CancelStopReason::BudgetExhausted;
+            return act;  // Finish
+        }
+
         // A sleep already granted for the next attempt has been served.
         if (authorised_attempt_ > attempts_) {
+            // [F3] REVALIDATE, do not pre-commit. plan_cancel_retry now
+            // reserves an execution window so this cannot happen on the
+            // schedule, but the sleep is a real timer on a machine that may
+            // be swapping during a shutdown: if it overshot, the attempt this
+            // authorises would be rejected by cancel_ids without issuing an
+            // RPC, and would then report a stop reason describing the wrong
+            // thing. A strict inequality in the policy is not sufficient on
+            // its own -- the clock has to be re-read after the wait.
+            if (!cancel_ids_admits(elapsed_ms, cfg_.budget_ms)) {
+                stop_reason_ = CancelStopReason::BudgetExhausted;
+                return act;  // Finish
+            }
             act.step          = CancelLadderStep::Attempt;
             act.attempt_index = authorised_attempt_;
             return act;
@@ -625,13 +883,29 @@ public:
 
         outstanding_ = std::move(oc.failed);
 
-        if (!oc.last_error.empty()) last_error_ = std::move(oc.last_error);
+        // Did THIS attempt actually learn a failure class? Only an attempt
+        // that got a refusal out of the wallet did; the class travels with
+        // the text that produced it.
+        const bool learned_class = !oc.last_error.empty();
+
+        if (learned_class) last_error_ = std::move(oc.last_error);
         bulk_submitted_ = bulk_submitted_ || oc.bulk_submitted;
+        deadline_hit_   = deadline_hit_ || oc.deadline_hit;
 
         // Only a failing attempt carries class information. A clean attempt
         // must not reset the leash the previous failures earned.
-        if (!outstanding_.empty()) worst_class_ = oc.worst_class;
-        else stop_reason_ = CancelStopReason::Done;
+        //
+        // [F3] Nor must an attempt that issued NO RPC. When the deadline
+        // rejected every id, oc.worst_class is its Other default -- and
+        // folding that in downgraded a genuine Unsynced flap onto the
+        // three-attempt short leash, which is how the operator alert came to
+        // announce "attempts-exhausted" for what was plainly a budget expiry.
+        // An attempt that classified nothing must leave the class alone.
+        if (!outstanding_.empty()) {
+            if (learned_class) worst_class_ = oc.worst_class;
+        } else {
+            stop_reason_ = CancelStopReason::Done;
+        }
     }
 
     [[nodiscard]] const std::vector<std::string>& outstanding() const noexcept
@@ -670,6 +944,9 @@ private:
     CancelStopReason         stop_reason_{CancelStopReason::Unknown};
     TakeFailureClass         worst_class_{TakeFailureClass::Other};
     bool                     bulk_submitted_{false};
+    /// [F3] Sticky: the gate reported it was out of time. Once true the
+    /// ladder stops, and it stops with the RIGHT reason.
+    bool                     deadline_hit_{false};
 };
 
 }  // namespace xop::execution

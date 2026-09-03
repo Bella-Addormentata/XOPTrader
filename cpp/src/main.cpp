@@ -56,8 +56,10 @@
 #  include <dirent.h>
 #  include <signal.h>
 #  include <unistd.h>
-#  include <fstream>
 #endif
+// [F4] Both platforms now write data/shutdown.flag in kill_old_instances(),
+// so this can no longer live inside the POSIX branch.
+#include <fstream>
 
 // Third-party
 #include <sqlite3.h>
@@ -79,11 +81,47 @@ namespace fs = std::filesystem;
 // This function finds all other processes named "xop_trader" (or
 // "xop_trader.exe" on Windows), terminates them, and waits for cleanup
 // so the new instance can bind its ports cleanly.
+//
+// [F4 2026-09-03] GRACEFUL FIRST, ON BOTH PLATFORMS.
+//
+// The two branches were asymmetric and the asymmetry was expensive. POSIX
+// sent SIGTERM, waited up to 10 s, and only then SIGKILLed -- so the old
+// engine ran its own shutdown(), cancelled its book, and wrote its cancel
+// intent. WINDOWS went straight to TerminateProcess with no graceful rung at
+// all. Windows is the production platform, so the NORMAL REDEPLOY was an
+// uncovered hard kill: the old process died before the replacement Engine was
+// even constructed, no intent marker was ever written for its live book, and
+// startup reconciliation classified those rows as still_live and restored
+// them as ordinary quotes. The S46 PR described its durable recovery as
+// covering this route. It did not, and could not.
+//
+// The mechanism to fix it already existed and was already wired:
+// data/shutdown.flag, written by the GUI's graceful-close button and consumed
+// by Engine::check_shutdown_flag(), which invokes the same full shutdown().
+// This writes that flag and waits, exactly mirroring the POSIX ladder, before
+// falling through to the hard kill that always followed.
+//
+// Two properties worth stating, because they bound what the wait has to buy:
+//
+//   * The wait does NOT need to cover a full cancel ladder.
+//     Engine::shutdown() writes the intent marker EARLY -- before the retry
+//     loop, before the sync probe -- so an old process that is hard-killed at
+//     the end of this window has still recorded which offers it ordered dead.
+//     The marker is the durable half; the cancels are best-effort.
+//   * The flag is removed again before this function returns, unconditionally.
+//     A leftover fresh flag is not inert: the Engine constructor honours a
+//     flag younger than 60 s as a live close request, so failing to clean up
+//     would make the REPLACEMENT process immediately shut itself down.
 // =============================================================================
+
+/// How long to let an old instance shut itself down before terminating it.
+/// Matches the GUI's stop window and the POSIX branch's existing patience;
+/// see above for why this need not cover the whole 90 s cancel budget.
+static constexpr int kGracefulExitWaitMs = 30'000;
 
 #ifdef _WIN32
 
-static void kill_old_instances() {
+static void kill_old_instances(const std::filesystem::path& shutdown_flag) {
     const DWORD current_pid = GetCurrentProcessId();
 
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -113,16 +151,135 @@ static void kill_old_instances() {
         return;
     }
 
+    // ---- Graceful rung: ask, then wait, then kill -------------------------
+    // [F4] Written BEFORE any handle is opened so every old instance sees it
+    // at once, and cleaned up in the block below whatever happens afterwards.
+    bool flag_written = false;
+    if (!shutdown_flag.empty()) {
+        std::error_code fec;
+        std::filesystem::create_directories(shutdown_flag.parent_path(), fec);
+        std::ofstream flag(shutdown_flag, std::ios::trunc);
+        if (flag) {
+            flag << "kill_old_instances\n";
+            flag.close();
+            flag_written = flag.good();
+        }
+        if (flag_written) {
+            spdlog::info("[Startup] [F4] wrote {} -- giving {} old instance(s) "
+                         "up to {} ms to cancel their book and record their "
+                         "cancel intent before terminating",
+                         shutdown_flag.string(), old_pids.size(),
+                         kGracefulExitWaitMs);
+
+            // Poll rather than one long wait: the common case is a clean exit
+            // in a few seconds and there is no reason to make every redeploy
+            // pay the full window.
+            const auto give_up = std::chrono::steady_clock::now()
+                               + std::chrono::milliseconds(kGracefulExitWaitMs);
+            while (std::chrono::steady_clock::now() < give_up) {
+                bool any_alive = false;
+                for (const DWORD pid : old_pids) {
+                    HANDLE probe = OpenProcess(SYNCHRONIZE, FALSE, pid);
+                    if (probe == nullptr) {
+                        // [F6] "OpenProcess failed" is NOT "the process
+                        // exited". ERROR_ACCESS_DENIED means the process is
+                        // very much alive and we simply may not touch it --
+                        // an old xop_trader running elevated or as another
+                        // user while the replacement is not. Reading that as
+                        // "gone" broke the loop immediately, logged "exited
+                        // gracefully", and let two engines quote the same
+                        // book, which is the exact outcome this function
+                        // exists to prevent. Only ERROR_INVALID_PARAMETER
+                        // (no such pid) is evidence of exit.
+                        const DWORD probe_err = GetLastError();
+                        if (probe_err == ERROR_INVALID_PARAMETER) {
+                            continue;  // genuinely gone
+                        }
+                        any_alive = true;
+                        spdlog::warn("[Startup] [F6] cannot open PID {} "
+                                     "(err={}) -- treating it as ALIVE, not "
+                                     "as exited. If this is ACCESS_DENIED "
+                                     "the old instance is running at a "
+                                     "privilege this process cannot signal "
+                                     "and will NOT be killed below.",
+                                     pid, probe_err);
+                        break;
+                    }
+                    if (WaitForSingleObject(probe, 0) == WAIT_TIMEOUT) {
+                        any_alive = true;
+                    }
+                    CloseHandle(probe);
+                    if (any_alive) break;
+                }
+                if (!any_alive) {
+                    spdlog::info("[Startup] [F4] old instance(s) exited "
+                                 "gracefully -- no hard kill needed");
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            }
+        } else {
+            // Not fatal, but it means this redeploy is back to being a hard
+            // kill, and the operator should know which kind of event they are
+            // looking at when the next boot reports restored offers.
+            spdlog::error("[Startup] [F4] could NOT write {} -- falling back "
+                          "to an immediate hard kill. The old instance will "
+                          "not run its shutdown path, so it will record no "
+                          "cancel intent for whatever book it is holding.",
+                          shutdown_flag.string());
+        }
+    }
+
+    // Remove it unconditionally, INCLUDING on every early path below: the
+    // Engine constructor treats a flag younger than 60 s as a live close
+    // request, so leaving ours behind would shut down the process we are
+    // starting.
+    struct FlagCleanup {
+        const std::filesystem::path& path;
+        bool active;
+        ~FlagCleanup() {
+            if (!active) return;
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+        }
+    } flag_cleanup{shutdown_flag, flag_written};
+
     for (const DWORD pid : old_pids) {
         HANDLE proc = OpenProcess(
             PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid);
         if (proc == nullptr) {
-            spdlog::warn("[Startup] Cannot open PID {} (err={}) -- skipping",
-                         pid, GetLastError());
+            // Already gone is the EXPECTED outcome now that the graceful rung
+            // runs first, so ERROR_INVALID_PARAMETER is an info line.
+            //
+            // [F6] Anything else is not. This used to downgrade every open
+            // failure to info, including ACCESS_DENIED -- a live process we
+            // cannot terminate -- so the single-instance guarantee could fail
+            // with no warning-level trace anywhere in the log.
+            const DWORD open_err = GetLastError();
+            if (open_err == ERROR_INVALID_PARAMETER) {
+                spdlog::info("[Startup] PID {} is no longer open -- already "
+                             "exited", pid);
+            } else {
+                spdlog::error("[Startup] [F6] cannot open PID {} for "
+                              "termination (err={}) -- it may still be "
+                              "RUNNING and holding the Prometheus port, "
+                              "wallet RPC handles and a live book. TWO "
+                              "ENGINES MAY NOW BE QUOTING. Stop it by hand.",
+                              pid, open_err);
+            }
             continue;
         }
-        spdlog::info("[Startup] Terminating old xop_trader instance (PID {})",
-                     pid);
+        if (WaitForSingleObject(proc, 0) == WAIT_OBJECT_0) {
+            spdlog::info("[Startup] PID {} already exited -- no kill needed",
+                         pid);
+            CloseHandle(proc);
+            continue;
+        }
+        spdlog::warn("[Startup] PID {} did not exit gracefully within {} ms "
+                     "-- TERMINATING. Its cancel intent marker was written "
+                     "early in shutdown() and should be on disk, but its "
+                     "book may not be fully cancelled.",
+                     pid, kGracefulExitWaitMs);
         if (TerminateProcess(proc, 1)) {
             // Wait up to 10 s for the process to exit and release its
             // resources (Prometheus port, wallet RPC handles, etc.).
@@ -134,7 +291,7 @@ static void kill_old_instances() {
         CloseHandle(proc);
     }
 
-    spdlog::info("[Startup] Terminated {} old instance(s) -- waiting for "
+    spdlog::info("[Startup] Cleared {} old instance(s) -- waiting for "
                  "port release", old_pids.size());
     // Brief pause for the OS to fully release bound sockets.
     std::this_thread::sleep_for(std::chrono::seconds(2));
@@ -142,7 +299,7 @@ static void kill_old_instances() {
 
 #else  // POSIX (Linux / macOS)
 
-static void kill_old_instances() {
+static void kill_old_instances(const std::filesystem::path& shutdown_flag) {
     const pid_t current_pid = getpid();
     std::vector<pid_t> old_pids;
 
@@ -180,14 +337,50 @@ static void kill_old_instances() {
         return;
     }
 
+    // [F4] The flag as well as the signal. SIGTERM already reaches
+    // signal_handler -> engine->shutdown() here, so this branch was never the
+    // broken one -- but writing the same flag on both platforms means there
+    // is ONE graceful-stop channel to reason about, and it still works if a
+    // supervisor has the signal blocked or the handler has not been installed
+    // yet (there is a window during startup where it has not).
+    bool flag_written = false;
+    if (!shutdown_flag.empty()) {
+        std::error_code fec;
+        std::filesystem::create_directories(shutdown_flag.parent_path(), fec);
+        std::ofstream flag(shutdown_flag, std::ios::trunc);
+        if (flag) {
+            flag << "kill_old_instances\n";
+            flag.close();
+            flag_written = flag.good();
+        }
+        if (!flag_written) {
+            spdlog::warn("[Startup] [F4] could not write {} -- relying on "
+                         "SIGTERM alone", shutdown_flag.string());
+        }
+    }
+    struct FlagCleanup {
+        const std::filesystem::path& path;
+        bool active;
+        ~FlagCleanup() {
+            if (!active) return;
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+        }
+    } flag_cleanup{shutdown_flag, flag_written};
+
     for (const pid_t pid : old_pids) {
         spdlog::info("[Startup] Sending SIGTERM to old xop_trader "
                      "(PID {})", pid);
         kill(pid, SIGTERM);
     }
 
-    // Wait up to 10 s for graceful shutdown.
-    for (int i = 0; i < 20; ++i) {
+    // [F4] Wait the same window as the Windows branch. This was 10 s while
+    // Windows waited 0; the two platforms disagreeing about how much patience
+    // a graceful stop deserves is what let the Windows redeploy become an
+    // uncovered hard kill without anyone noticing.
+    const auto give_up = std::chrono::steady_clock::now()
+                       + std::chrono::milliseconds(kGracefulExitWaitMs);
+    while (std::chrono::steady_clock::now() < give_up) {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
         bool any_alive = false;
         for (const pid_t pid : old_pids) {
@@ -199,13 +392,16 @@ static void kill_old_instances() {
     // Force-kill survivors.
     for (const pid_t pid : old_pids) {
         if (kill(pid, 0) == 0) {
-            spdlog::warn("[Startup] PID {} did not exit gracefully -- "
-                         "sending SIGKILL", pid);
+            spdlog::warn("[Startup] PID {} did not exit gracefully within {} "
+                         "ms -- sending SIGKILL. Its cancel intent marker was "
+                         "written early in shutdown() and should be on disk, "
+                         "but its book may not be fully cancelled.",
+                         pid, kGracefulExitWaitMs);
             kill(pid, SIGKILL);
         }
     }
 
-    spdlog::info("[Startup] Terminated {} old instance(s) -- waiting for "
+    spdlog::info("[Startup] Cleared {} old instance(s) -- waiting for "
                  "port release", old_pids.size());
     std::this_thread::sleep_for(std::chrono::seconds(2));
 }
@@ -442,12 +638,13 @@ int main(int argc, char* argv[]) {
     //     conflicts are the Prometheus port and wallet RPC contention,
     //     which are inconveniences rather than money.
     // ------------------------------------------------------------------
-    if (cli.dry_run) {
-        spdlog::warn("[S31] dry run -- NOT killing any running engine. A live "
-                     "instance keeps its book and its dead man's switch.");
-    } else {
-        kill_old_instances();
-    }
+    //     [F4 2026-09-03] MOVED BELOW load_config. The graceful rung needs
+    //     the data directory to write data/shutdown.flag into, and that comes
+    //     from config_.database.path -- the same derivation the Engine uses.
+    //     Nothing between here and there depends on the old instance being
+    //     dead: load_config only reads YAML. The DB is opened afterwards,
+    //     which is the first thing that actually needs the exclusion.
+    // ------------------------------------------------------------------
 
     // ------------------------------------------------------------------
     // 4. Load and validate YAML configuration (xop::load_config)
@@ -464,6 +661,23 @@ int main(int argc, char* argv[]) {
         spdlog::shutdown();
         curl_global_cleanup();
         return EXIT_FAILURE;
+    }
+
+    // ------------------------------------------------------------------
+    // 3a (deferred). Kill any old xop_trader instances still running.
+    //
+    //     Graceful first on both platforms now -- see the long note on
+    //     kill_old_instances(). The flag path is derived exactly as
+    //     Engine's constructor derives it, so the old process recognises it.
+    // ------------------------------------------------------------------
+    if (cli.dry_run) {
+        spdlog::warn("[S31] dry run -- NOT killing any running engine. A live "
+                     "instance keeps its book and its dead man's switch.");
+    } else {
+        std::filesystem::path db_dir =
+            std::filesystem::path(app_config.database.path).parent_path();
+        if (db_dir.empty()) db_dir = std::filesystem::current_path();
+        kill_old_instances(db_dir / "shutdown.flag");
     }
 
     // ------------------------------------------------------------------

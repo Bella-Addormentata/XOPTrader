@@ -80,6 +80,113 @@ inline bool any_trigger(RebalanceReason r) noexcept {
 }
 
 // ---------------------------------------------------------------------------
+// Chia wallet trade-record status codes (from chia-blockchain source).
+//
+// [F2 review] These live in the header, not in offer_manager.cpp, because
+// classify_startup_probe() below is the pure half of the DB->wallet leg and a
+// gtest has to be able to name the codes it feeds in. parse() stays in the
+// .cpp -- it is the json-shaped half and nothing testable happens in it.
+// ---------------------------------------------------------------------------
+namespace trade_status {
+    constexpr int kPendingAccept    = 0;
+    // [S25 2026-08-24] 1 and 2 had no names because nothing needed to
+    // distinguish them from "not terminal".  recheck_terminal does: a
+    // recognised pending state is evidence the offer is live, whereas an
+    // unrecognised code (parse returns -1) is no evidence at all.
+    constexpr int kPendingConfirm   = 1;
+    constexpr int kPendingCancel    = 2;
+    constexpr int kCancelled        = 3;
+    constexpr int kConfirmed        = 4;
+    constexpr int kFailed           = 5;
+    /// What parse() yields for a status string no build of this bot knows.
+    constexpr int kUnknown          = -1;
+}  // namespace trade_status
+
+// ---------------------------------------------------------------------------
+// StartupProbeVerdict -- what one get_offer() answer means for a DB-pending
+// row that the wallet's own scan never mentioned.
+//
+// [F2 2026-09-03] This enum exists because PENDING_CANCEL used to be folded
+// into `unverifiable` along with PENDING_CONFIRM and every unrecognised code.
+// That is a fail-open of the documented family: PENDING_CANCEL is POSITIVE
+// evidence -- a cancel spend is already in flight against that offer coin --
+// and `unverifiable` means, in this file's own words, "we learned NOTHING".
+// Discarding evidence into a bucket whose meaning is the absence of evidence
+// is how the row came back as a PendingOffer with cancel_pending=false, and
+// how the TTL sweep then charged a SECOND secure cancel for one spend.
+//
+// recheck_terminal (offer_manager.cpp) already got this right one layer over
+// and says so in a comment. The startup leg is the same situation; it now
+// reaches the same conclusion through the same enumerator.
+// ---------------------------------------------------------------------------
+enum class StartupProbeVerdict : std::uint8_t {
+    /// CANCELLED / FAILED. Safe to stamp the DB row resolved.
+    Terminal      = 0,
+    /// PENDING_ACCEPT. Genuinely still resting; restore as an ordinary quote.
+    StillLive     = 1,
+    /// CONFIRMED. It FILLED -- never stamp cancelled; detect_fills owns it.
+    Confirmed     = 2,
+    /// PENDING_CANCEL. A cancel spend is ALREADY in flight. Not terminal (the
+    /// spend has not landed) and NOT no-evidence: the restored State entry
+    /// must carry cancel_pending=true or the next sweep pays a second fee.
+    PendingCancel = 3,
+    /// PENDING_CONFIRM, or a code from some future wallet build. Nothing is
+    /// concluded and nothing is stamped; the heartbeat keeps asking.
+    Unverifiable  = 4,
+};
+
+[[nodiscard]] constexpr const char*
+to_string(StartupProbeVerdict v) noexcept
+{
+    switch (v) {
+        case StartupProbeVerdict::Terminal:      return "terminal";
+        case StartupProbeVerdict::StillLive:     return "still-live";
+        case StartupProbeVerdict::Confirmed:     return "confirmed";
+        case StartupProbeVerdict::PendingCancel: return "pending-cancel";
+        case StartupProbeVerdict::Unverifiable:  break;
+    }
+    return "unverifiable";
+}
+
+/// The whole DB->wallet bucketing rule, as one total function of the parsed
+/// status code. Unverifiable is the default so an unrecognised code can never
+/// fall through into a bucket that authorises an action.
+[[nodiscard]] constexpr StartupProbeVerdict
+classify_startup_probe(int status) noexcept
+{
+    switch (status) {
+        case trade_status::kCancelled:
+        case trade_status::kFailed:
+            return StartupProbeVerdict::Terminal;
+        case trade_status::kConfirmed:
+            return StartupProbeVerdict::Confirmed;
+        case trade_status::kPendingAccept:
+            return StartupProbeVerdict::StillLive;
+        case trade_status::kPendingCancel:
+            return StartupProbeVerdict::PendingCancel;
+        default:
+            // kPendingConfirm, kUnknown, and anything a future wallet invents.
+            return StartupProbeVerdict::Unverifiable;
+    }
+}
+
+static_assert(classify_startup_probe(trade_status::kPendingCancel)
+                  == StartupProbeVerdict::PendingCancel,
+              "PENDING_CANCEL is positive evidence that a cancel spend is in "
+              "flight. Folding it into Unverifiable restores the row with "
+              "cancel_pending=false and pays a second secure cancel fee for "
+              "one spend -- the F2 defect");
+static_assert(classify_startup_probe(trade_status::kUnknown)
+                  == StartupProbeVerdict::Unverifiable,
+              "an unrecognised code is no evidence at all");
+static_assert(classify_startup_probe(trade_status::kPendingConfirm)
+                  == StartupProbeVerdict::Unverifiable);
+static_assert(classify_startup_probe(trade_status::kConfirmed)
+                  == StartupProbeVerdict::Confirmed,
+              "a CONFIRMED row FILLED. Stamping it cancelled is the "
+              "2026-07-31 defect that put six XCH/BYC fills off the books");
+
+// ---------------------------------------------------------------------------
 // TierStaleness -- per-tier classification for selective refresh
 // ---------------------------------------------------------------------------
 
@@ -479,6 +586,20 @@ public:
      *        at which point the watchdog fires a SECOND concurrent bulk
      *        cancel over the same offers. The overrun happens INSIDE one
      *        call, so only a mid-loop deadline can bound it.
+     *
+     *        [F5 2026-09-03] BE PRECISE ABOUT WHAT IT BOUNDS. The deadline
+     *        decides whether the NEXT id may be started. It cannot stop the
+     *        co_await already in progress, because rpc_post exposes neither a
+     *        per-call timeout nor cancellation, and abandoning the await
+     *        would be memory-unsafe -- the blocking transfer writes into the
+     *        outer coroutine frame by reference. So an id admitted at
+     *        `deadline - 1ms` can still return ~123.5 s later, and this is
+     *        NOT the "hard wall-clock bound" the S46 PR described.
+     *
+     *        What it now genuinely delivers, after F5 also bounded the
+     *        emergency ladder underneath it: at most ONE in-flight rpc_post
+     *        past the deadline per call, instead of the ~29-leg descending
+     *        fee ladder that made a 90 s shutdown run ~64 minutes.
      */
     asio::awaitable<CancelOutcome> cancel_ids(
         const std::vector<std::string>& offer_ids,
@@ -726,6 +847,21 @@ public:
         /// fill -- never stamp these cancelled (that destroyed six fills on
         /// 2026-07-31; see the SETTLE-FIX note in reconcile_offers).
         std::vector<std::string> confirmed;
+        /// Wallet says PENDING_CANCEL: a cancel spend is ALREADY in flight
+        /// against this offer's coins.
+        ///
+        /// [F2 2026-09-03] This bucket used to not exist and these ids went
+        /// into `unverifiable`. The row is restored into State either way --
+        /// the spend has not landed, so nothing may be stamped -- but the
+        /// caller MUST additionally set cancel_pending on the restored entry.
+        /// PendingOffer::cancel_pending defaults to false (types.hpp), and
+        /// cancel_stale skips only cancel_pending offers, so a restored row
+        /// past offer_ttl_blocks was charged a SECOND secure cancel on the
+        /// first heartbeat -- a second fee, and a bundle that respends coins
+        /// already in the mempool, which is how a never-confirmable local
+        /// transaction ends up holding a locked fee coin against
+        /// fee_reserve_xch.
+        std::vector<std::string> pending_cancel;
         /// The RPC failed, or returned a status we do not recognise. We
         /// learned NOTHING. The row stays pending and the caller must keep
         /// asking on the heartbeat -- this is the bucket that stops the
@@ -735,7 +871,49 @@ public:
         [[nodiscard]] std::size_t total() const noexcept
         {
             return terminal.size() + still_live.size()
-                 + confirmed.size() + unverifiable.size();
+                 + confirmed.size() + pending_cancel.size()
+                 + unverifiable.size();
+        }
+
+        /// [F6 2026-09-03] THE VERDICT->BUCKET STEP, MOVED HERE SO IT CAN BE
+        /// TESTED.
+        ///
+        /// F2 extracted classify_startup_probe() into this header and pinned
+        /// it with static_asserts, which is why mutating the CLASSIFIER now
+        /// fails to compile. It left the switch that turns a verdict into an
+        /// actual bucket in offer_manager.cpp, where nothing reaches it:
+        /// changing `case PendingCancel: pending_cancel.push_back(id)` to
+        /// push onto `unverifiable` instead reinstated the entire F2 defect
+        /// -- second secure cancel, second fee, respent coins -- with all
+        /// 1265 tests green. That is the shape cancel_retry.hpp:707 already
+        /// records: "the policy header was tested and the four lines of
+        /// plumbing that DECIDE WHAT IS STILL LIVE were not, and those four
+        /// lines are the whole bug that was being fixed."
+        ///
+        /// This struct is a plain aggregate, so a gtest can drive it without
+        /// constructing an OfferManager (S36). See test_startup_probe.cpp.
+        void add(StartupProbeVerdict verdict, std::string id)
+        {
+            switch (verdict) {
+                case StartupProbeVerdict::Terminal:
+                    terminal.push_back(std::move(id));
+                    return;
+                case StartupProbeVerdict::Confirmed:
+                    confirmed.push_back(std::move(id));
+                    return;
+                case StartupProbeVerdict::StillLive:
+                    still_live.push_back(std::move(id));
+                    return;
+                case StartupProbeVerdict::PendingCancel:
+                    pending_cancel.push_back(std::move(id));
+                    return;
+                case StartupProbeVerdict::Unverifiable:
+                    break;
+            }
+            // Not a default: label, so adding an enumerator without a bucket
+            // is a -Wswitch error rather than a silent fall into the bucket
+            // that means "we learned nothing".
+            unverifiable.push_back(std::move(id));
         }
     };
 
@@ -842,12 +1020,44 @@ public:
      *                         "utxo_liberation").
      * @param prefer_zero_fee  If true, try fee=0 secure cancel before the
      *                         descending fee loop (default: false).
+     * @param deadline         Wall-clock point after which NO FURTHER RPC is
+     *                         started. Defaults to time_point::max(), i.e.
+     *                         unbounded, which is right for every caller that
+     *                         is not racing a shutdown.
+     *
+     * [F5 2026-09-03] The deadline exists because this routine was the single
+     * largest hole in the shutdown's claimed wall-clock bound, by two orders
+     * of magnitude. It took no deadline and checked no clock, and the
+     * descending-fee loop CONTINUES on an "insufficient funds" answer -- only
+     * a non-balance error breaks it. With the live default
+     * strategy.offer_fee_mojos{10^7} the loop halves ~25 times, and each leg
+     * is an rpc_post that can burn max_retries+1 = 4 blocking curl transfers
+     * at request_timeout{30s} plus 3.5 s of backoff = 123.5 s. Twenty-nine
+     * legs is ~3,582 s, and the whole shutdown reached ~3,830 s (~64 min)
+     * against a hanging wallet while the PR described a 90 s bound.
+     *
+     * That is not merely a documentation error. engine.cpp justifies the
+     * cancel deadline by noting that an unbounded attempt runs past
+     * watchdog_stall_seconds{600}, at which point the WATCHDOG fires a second
+     * concurrent bulk cancel over the same offers and double-spends the fees.
+     * The deadline closed that for the hanging-wallet shape (247 s) and left
+     * it wide open on the funding shape -- the one path where this routine is
+     * spending real XCH on every iteration.
+     *
+     * The check is control flow only: no RPC is interrupted, no coroutine is
+     * abandoned. It refuses to START further legs. An engine that refuses to
+     * exit is worse than one that exits with a live book, and abandoning an
+     * in-flight rpc_post is memory-unsafe besides -- the transfer writes into
+     * the outer coroutine frame by reference.
+     *
      * @return true if the emergency cancel succeeded, false otherwise.
      */
     asio::awaitable<bool> emergency_cancel(
         const std::string& offer_id,
         const std::string& context,
-        bool prefer_zero_fee = false);
+        bool prefer_zero_fee = false,
+        std::chrono::steady_clock::time_point deadline =
+            std::chrono::steady_clock::time_point::max());
 
     /**
      * @brief Parse a wallet trade record into a PendingOffer.
