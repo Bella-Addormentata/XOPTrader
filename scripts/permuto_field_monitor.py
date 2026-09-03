@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import sys
 import time
@@ -35,7 +34,6 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from gui.services.permuto.bbo import (
-    DEFAULT_RING_PCT,
     Book,
     active_ring_pct,
     earning_window,
@@ -46,6 +44,7 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (XOPTrader)", "Accept": "application/json"
 OUT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                    "data", "field_monitor.jsonl")
 MARKETS = ("NVDA-VOL-PERP", "QQQ-VOL-PERP", "TSLA-VOL-PERP")
+DEFAULT_RING_PCT = 2.0
 
 
 def get(path, timeout=25):
@@ -81,6 +80,7 @@ def ring_state():
                 try:
                     specs[entry["symbol"]] = float(entry.get("tick_size") or 0.0001)
                 except (TypeError, ValueError):
+                    # Malformed or missing tick_size; downstream specs.get() falls back to 0.0001
                     pass
     except Exception as exc:  # noqa: BLE001
         return {"error": str(exc)[:120]}
