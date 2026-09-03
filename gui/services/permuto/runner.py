@@ -531,9 +531,11 @@ class QuoteRunner:
             if not math.isfinite(price):
                 continue
             if side in ("BUY", "BID", "B"):
-                seen[market]["bid"] = price
+                prev_bid = seen[market]["bid"]
+                seen[market]["bid"] = price if prev_bid is None else max(prev_bid, price)
             elif side in ("SELL", "ASK", "S"):
-                seen[market]["ask"] = price
+                prev_ask = seen[market]["ask"]
+                seen[market]["ask"] = price if prev_ask is None else min(prev_ask, price)
 
         self._resting = {
             m: RestingQuote(bid_price=v["bid"], ask_price=v["ask"])

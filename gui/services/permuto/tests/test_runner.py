@@ -244,6 +244,20 @@ def test_reconcile_overwrites_rather_than_merges():
     assert r._resting[_MKT].ask_price is None
 
 
+def test_reconcile_selects_best_bid_and_best_ask_when_multiple_orders_exist():
+    r = _runner(_Client())
+    r.reconcile({"orders": [
+        {"market": _MKT, "side": "BUY", "price": 0.0680},
+        {"market": _MKT, "side": "BUY", "price": 0.0695},
+        {"market": _MKT, "side": "BUY", "price": 0.0690},
+        {"market": _MKT, "side": "SELL", "price": 0.0720},
+        {"market": _MKT, "side": "SELL", "price": 0.0705},
+        {"market": _MKT, "side": "SELL", "price": 0.0710},
+    ]})
+    assert r._resting[_MKT].bid_price == 0.0695
+    assert r._resting[_MKT].ask_price == 0.0705
+
+
 def test_reconcile_ignores_markets_we_do_not_quote():
     r = _runner(_Client())
     r.reconcile({"orders": [
