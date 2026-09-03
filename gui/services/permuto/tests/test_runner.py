@@ -1661,7 +1661,6 @@ def test_a_preflight_drop_retracts_the_quote_it_cannot_replace():
 
 
 def test_a_preflight_drop_removes_the_zero_credit_sibling(monkeypatch):
-    import gui.services.permuto.runner as runner_mod
     from gui.services.permuto.preflight import PreflightOutcome
 
     def drop_ask(price, _oracle, *, is_buy, **_kwargs):
@@ -1670,7 +1669,8 @@ def test_a_preflight_drop_removes_the_zero_credit_sibling(monkeypatch):
         return PreflightOutcome(
             0.0, dropped=True, reason="test: ask cannot be sent")
 
-    monkeypatch.setattr(runner_mod, "preflight_leg_price", drop_ask)
+    monkeypatch.setattr(
+        "gui.services.permuto.runner.preflight_leg_price", drop_ask)
     c = _Client(account=_account(0.0), batch_response=_venue_ok())
     r = _runner(c, oracle_fetch=lambda: dict(_ORACLE))
 
