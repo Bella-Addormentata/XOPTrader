@@ -85,6 +85,25 @@ def test_manually_set_fingerprint_is_never_overwritten(tmp_path, monkeypatch):
     assert after["chia"]["wallet_fingerprint"] == 999_999_999
 
 
+def test_detect_wallet_fingerprint_falls_back_to_local_db_when_cli_absent(tmp_path, monkeypatch):
+    """When `chia keys show` is unavailable, read last_used_fingerprint or wallet DB filename."""
+    chia_root = tmp_path / ".chia" / "mainnet"
+    wallet_db_dir = chia_root / "wallet" / "db"
+    wallet_db_dir.mkdir(parents=True)
+    (wallet_db_dir / "last_used_fingerprint").write_text("311919707\n", encoding="utf-8")
+
+    # Simulate subprocess failure (no chia executable)
+    monkeypatch.setattr(gui_main.subprocess, "run", lambda *a, **kw: (_ for _ in ()).throw(FileNotFoundError("chia not found")))
+
+    assert gui_main._detect_wallet_fingerprint(chia_root) == 311_919_707
+
+    # Remove last_used_fingerprint and test wallet sqlite filename pattern fallback
+    (wallet_db_dir / "last_used_fingerprint").unlink()
+    (wallet_db_dir / "blockchain_wallet_v2_r1_mainnet_311919707.sqlite").write_text("", encoding="utf-8")
+
+    assert gui_main._detect_wallet_fingerprint(chia_root) == 311_919_707
+
+
 def test_example_templates_have_no_duplicate_keys():
     """config.example.yaml shipped a duplicated circuit_breaker block, which
     broke every comment-preserving write on fresh installs (ruamel refuses

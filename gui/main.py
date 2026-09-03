@@ -634,11 +634,13 @@ def _detect_chia_rpc_ports(chia_root: Path) -> dict[str, int]:
         return defaults
 
 
-def _detect_wallet_fingerprint() -> Optional[int]:
-    """Return the first wallet fingerprint reported by ``chia keys show``.
+def _detect_wallet_fingerprint(chia_root: Optional[Path] = None) -> Optional[int]:
+    """Return the first wallet fingerprint reported by ``chia keys show``
+    or discovered from the local Chia wallet database.
 
-    Runs ``chia`` from PATH with a 5-second timeout.  Returns *None* on
-    any error (not installed, no keys, timeout, parse failure).
+    Runs ``chia`` from PATH with a 5-second timeout. If ``chia`` is not in PATH
+    or returns no keys, checks ``last_used_fingerprint`` or wallet DB filenames
+    under ``chia_root``. Returns *None* on any error.
     """
     try:
         result = subprocess.run(
@@ -654,6 +656,25 @@ def _detect_wallet_fingerprint() -> Optional[int]:
                     return int(parts[1].strip())
     except Exception:
         pass
+
+    root = chia_root or _detect_chia_root()
+    if root:
+        wallet_db_dir = root / "wallet" / "db"
+        if wallet_db_dir.is_dir():
+            fp_file = wallet_db_dir / "last_used_fingerprint"
+            if fp_file.is_file():
+                try:
+                    content = fp_file.read_text(encoding="utf-8").strip()
+                    if content.isdigit():
+                        return int(content)
+                except Exception:
+                    pass
+            import re
+            for f in wallet_db_dir.glob("blockchain_wallet_v2_*_*.sqlite"):
+                match = re.search(r"_(\d+)\.sqlite$", f.name)
+                if match:
+                    return int(match.group(1))
+
     return None
 
 
@@ -684,7 +705,10 @@ def _patch_chia_auto_detect(config_path: Path) -> bool:
         return False
 
     chia_root = _detect_chia_root()
-    fingerprint = _detect_wallet_fingerprint()
+    try:
+        fingerprint = _detect_wallet_fingerprint(chia_root)
+    except TypeError:
+        fingerprint = _detect_wallet_fingerprint()
 
     if chia_root is None and fingerprint is None:
         return False
