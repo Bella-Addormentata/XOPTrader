@@ -101,13 +101,10 @@ def notional_usd(price: float, size: float) -> float:
 
 #: Relative tolerance on the band and ring comparisons.
 #:
-#: The venue expresses both as "within N%", but binary floats do not honour
-#: that at the boundary: 0.10 * 1.02 computes a deviation fractionally ABOVE
-#: 2%, so a quote placed exactly on the ring classified as purge-risk. Exactly
-#: the trap already fixed in the consolidate planner, arriving in a second
-#: module -- the direction is deliberate, because rejecting an order sitting
-#: on a limit is the surprising half and the venue is the one that decides.
-_EDGE_EPSILON = 1e-9
+#: The venue expresses both as "within N%", but binary floats and micro-tick
+#: rounding (6-decimal precision) can sit fractionally (e.g. 0.0003%) above
+#: 2.0% when clearing competitor sub-tick bids.
+_EDGE_EPSILON = 1e-3
 
 
 def _within(deviation: float, limit: float) -> bool:

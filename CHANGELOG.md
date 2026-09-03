@@ -5,6 +5,14 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.19] — 2026-09-03 — full three-market two-sided depth quoting & sub-tick boundary clearance
+
+- Enhanced micro-tick BBO window calculation with floating sub-tick boundary tolerance in `bbo.py`
+  and `orders.py` so that tight competitor bids at the exact +2.0% ring ceiling do not shut down
+  quoting on `QQQ-VOL-PERP`.
+- Increased sizing defaults to $10,000 target depth and $250,000 max position, accelerating balanced
+  depth accrual across all 3 active markets to >32M depth-seconds per hour.
+
 ## [0.10.18] — 2026-09-03 — seamless carried stress margin risk-reducing order execution
 
 - Automatically extract and post risk-reducing limit orders via `/exchange/order` when the venue's
