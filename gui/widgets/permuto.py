@@ -1382,7 +1382,7 @@ class PermutoWidget(QWidget):
         if paused:
             self._markets_note.setText(
                 "TRADING IS PAUSED at the venue. Quotes are rejected while "
-                "this holds, and the Sunday reset happens inside a pause.")
+                "this holds.")
         else:
             self._markets_note.setText("Trading is open.")
 
@@ -1394,8 +1394,9 @@ class PermutoWidget(QWidget):
                     if self._ring_pct != v_ring:
                         self._ring_pct = v_ring
                         self._refresh_quoting()
-            except (TypeError, ValueError):
-                pass
+            except (TypeError, ValueError) as exc:
+                # Invalid ring_pct; retain current self._ring_pct
+                _log.debug("permuto: invalid ring_pct in markets snapshot: %r (%s)", venue_ring, exc)
 
     # -- quoting ------------------------------------------------------------ #
 
