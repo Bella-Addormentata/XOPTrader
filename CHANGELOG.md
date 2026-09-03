@@ -5,6 +5,122 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.22] — 2026-09-03 — a switch for the venue, not just for the quoting
+
+The toolbar switch says whether Permuto is QUOTING. Nothing said whether
+Permuto is *there* — and the difference is not cosmetic, because a venue
+nobody has armed is still working:
+
+- `VenueSwitch.__init__` ends in `refresh()`, which calls `_gather_permuto`,
+  which opens and `yaml.safe_load`s the whole of `secrets.yaml`. So does
+  every later tick: `_refresh_venue_switches` runs from `_on_bridge_data`,
+  several times a minute, forever.
+- `PermutoWidget.__init__` calls `refresh()`, which reads the identity
+  again — during window construction, before anything is shown.
+- `set_bridge` schedules the "Permuto: On at startup" arm on a 1.5 s timer.
+
+That cost is paid on every installation, whether or not anyone ever arms
+the venue -- including the ones that never will.
+
+- **A master switch**, in Settings → Advanced → Subsystems, persisted to
+  `QSettings` under `permuto/enabled` beside the existing `permuto/curfew_enabled`.
+  Off removes the toolbar switch, the sidebar entry and the page, refuses the
+  startup arm, and stops both identity reads. It **defaults to off** — opt
+  in, matching `load_startup_states`, which has always defaulted Permuto to
+  `"off"` for the same reason. That is not a statement that the venue is
+  finished -- it is under active development -- but an installation that
+  has expressed no preference should not pay for it. Nothing is lost
+  either way: the Startup tab's "Permuto at startup" and curfew
+  preferences are kept untouched and apply again from the first launch
+  after the switch goes on.
+- **Hidden, never renumbered.** `_NAV_ITEMS` keeps all eleven entries and
+  index 9 keeps a page — a placeholder rather than a `PermutoWidget`. The
+  page indices are positional, and the last time that slipped, `_PAGE_SETTINGS`
+  stayed 9 while Permuto took it, and the first-run "you have no config"
+  redirect opened a key-generation screen instead of Settings.
+- **Off is a venue stop before it is a UI change.** With a live session the
+  toggle confirms, stops, and `join()`s — `stop()` only sets a flag; the
+  cancel lands seconds later on the worker thread — then verifies the book
+  is empty. If the cancel is not confirmed it **refuses to hide anything**
+  and says so. The clean-stop path disarms the venue-side scheduled cancel
+  as soon as `cancel_all` reports success, so hiding the page over a book
+  that did not actually go away would remove the operator's close control
+  and the net underneath it in the same click.
+- **Master off means every Permuto switch reads off.** An invariant, applied
+  on every Settings build and not only on a click, so a store carrying an
+  older `startup/permuto = "on"` — which is exactly what a machine that ran
+  the contest has — is corrected the first time Settings opens rather than
+  lying in wait until the subsystem comes back. "Permuto at startup" follows
+  to Off; the page's Markets polling switch is unchecked through its own
+  handler, so the button stops reading "Stop polling" over a stopped timer.
+  Two controls are deliberately exempt: the **overnight curfew**, whose off
+  position disarms a liquidation protection rather than stopping activity
+  and which does nothing at all while the subsystem is off, and the
+  **backup-confirmation checkbox**, which is a record that the operator
+  wrote down their recovery phrase, not a switch.
+- **Off applies immediately. On applies immediately too — unless the
+  session started with Permuto off.** Switching off and back on again just
+  unhides surfaces this session already built. Only a session that *started*
+  disabled has nothing to unhide: the toolbar switch and the page are built
+  during window construction and the indices are positional, so there is
+  nowhere to insert them afterwards. That case — and only that case — raises
+  a dialog saying so, because with the default now off it is the ordinary
+  path, and a tick box that appears to do nothing reads as broken.
+- `disabled` is a first-class gate in `venue_control`, ordered **above**
+  `watchdog` and `breaker`. Those say why a venue will not trade; this says
+  why the venue is not here, and an operator who switched Permuto off must
+  not be told the dead man's switch fired.
+
+Review round (PR #147) turned up three more, all in the disable path itself:
+
+- **The flatness verdict was read from a queued signal.** `PermutoLive`
+  emits `book_state` from the worker thread, so the slot that updates
+  `_book_empty` is queued to the GUI thread's event loop — the loop
+  `join()` stops pumping the moment it calls `wait()`. Reading
+  `book_is_empty()` straight after a blocking join returned the value
+  `start()` left behind, so an honest clean stop was refused as "the book is
+  not confirmed empty". `join()` now returns the worker's own record of the
+  final cancel, written on the worker thread before the emit, and the master
+  switch gates on that.
+- **The halted runner was kept.** `join()` fences the client with
+  `halt_placements()`, permanently and by design. Keeping the object meant
+  the next arm found `_permuto_runner is not None`, skipped building a fresh
+  session, and started the halted client — every `batch_upsert` back as
+  "placements halted for shutdown". It is discarded now.
+- **Any runner object counted as a live session.** An ordinary toolbar stop
+  leaves the object assigned after its thread finishes, so disabling later
+  raised a "a Permuto session is live" confirmation over a venue that had
+  been flat for hours, and ran the whole live-stop path. It asks
+  `is_running()`.
+
+Also: disabling now refuses while an operator close is in flight. That
+worker owns the venue session and cannot be joined away —
+`stop_background_work` gives it `CLOSE_JOIN_MS` and then abandons the thread
+rather than terminate it mid order — so hiding the page over it would take
+away the close control while the close was still on the wire.
+
+Three pre-existing faults surfaced while gating this and are fixed here:
+
+- `_make_permuto_live` read `page._target_depth_usd` and `page._max_position_usd`
+  directly. Index 9 is not always a `PermutoWidget` — `_create_page_widget`
+  already substitutes a placeholder whenever a page's import or constructor
+  fails — so arming after such a failure raised `AttributeError`, swallowed
+  as `could not start Permuto quoting: '_placeholder' object has no attribute
+  '_target_depth_usd'`. Now `getattr`, falling back to `PermutoLive`'s own
+  defaults, which are the same numbers.
+- `Sidebar.select_page` bounds-checked its argument and nothing else, so a
+  hidden entry stayed programmatically selectable.
+- The Advanced tab's five dirty-tracking lambdas passed tab index 10, which
+  is Startup. Editing the raw YAML box put the unsaved marker on a tab whose
+  controls write straight to `QSettings` and are never part of a save, while
+  Advanced's own unsaved edits showed as clean.
+
+`tests/test_sizing_path_wiring.py` and the two window fixtures in
+`gui/services/permuto/tests/test_venue_control.py` now seal the identity and
+the startup/enabled loaders. The sizing test is the only one that calls
+`set_bridge` on a real window, and `set_bridge` schedules the startup arm:
+on a box whose operator had registered an identity and stored "Permuto: On
+at startup", a test run was one `start()` from placing live orders.
 ## [0.10.21] — 2026-09-03 — expand BBO fetch budget & micro-tick requote drift tolerance
 
 - Expanded per-tick BBO fetch budget to 2.0s (1.0s timeout per request) in `live.py` to prevent

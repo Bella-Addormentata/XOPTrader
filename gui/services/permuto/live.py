@@ -281,6 +281,18 @@ class _Worker(QObject):
         #: The last successfully parsed (oracles, flags), for riding a
         #: transient venue blip inside the oracle grace.
         self._last_good: Optional[tuple] = None
+        #: The final cancel's outcome, written on this thread before the
+        #: matching book_state emit and read by join() after wait().
+        #:
+        #: The signal ALONE is not enough for a caller that blocks. It is a
+        #: cross-thread connection, so its slot is queued to the GUI thread's
+        #: event loop -- the very loop join() stops pumping when it calls
+        #: wait(). A blocking caller therefore reads _book_empty as it was
+        #: BEFORE the stop (start() sets it False), so a clean cancel looks
+        #: like a book still resting. thread.wait() returning is a
+        #: happens-before edge, which makes this plain attribute safe to
+        #: read there without a lock.
+        self.final_book_empty: Optional[bool] = None
 
     def request_stop(self) -> None:
         self._stop = True
@@ -376,9 +388,11 @@ class _Worker(QObject):
                     self._client.clear_schedule_cancel(time.time())
                 except Exception:  # noqa: BLE001
                     pass
+                self.final_book_empty = True
                 self.book_state.emit(True)
                 reason = "stopped; a cancel of every resting order was sent"
             except Exception as exc:  # noqa: BLE001
+                self.final_book_empty = False
                 self.book_state.emit(False)
                 reason = ("stopped, but the cancel FAILED (%s) -- orders may "
                           "still be resting" % exc)
@@ -474,16 +488,23 @@ class PermutoLive(QObject):
         if self._worker is not None:
             self._worker.request_stop()
 
-    def join(self, timeout_ms: int = 30_000) -> None:
+    def join(self, timeout_ms: int = 30_000) -> bool:
         """Block until the thread is down. Called on window close.
 
         Qt aborts the process if a running QThread is destroyed, and the
         cancel this waits for is the one that empties the book -- so the
         wait is generous and the terminate is a last resort.
+
+        Returns whether the book is believed EMPTY once the thread is down,
+        which is the same thing ``book_is_empty()`` reports afterwards.
+        Returned as well as recorded because a caller that gates on
+        flatness -- the Settings master switch does -- must not have to know
+        that reading the attribute is only safe after this call.
         """
         thread = self._thread
+        worker = self._worker
         if thread is None:
-            return
+            return self._book_empty
         self.stop()
         # [review round 9] Fence placements BEFORE anything else. A tick
         # already in flight cannot observe the stop flag until it returns, so
@@ -567,9 +588,18 @@ class PermutoLive(QObject):
                           "deadlock the GUI)")
             self._thread = None
             self._worker = None
-            return
+            # _book_empty was set directly by the last-resort cancel above,
+            # on this thread, so it is already current.
+            return self._book_empty
         self._thread = None
         self._worker = None
+        # The worker finished, so its own record of the final cancel is
+        # complete -- and it is the only reading available here, because the
+        # book_state slot is queued behind the loop this call just blocked.
+        final = getattr(worker, "final_book_empty", None)
+        if final is not None:
+            self._book_empty = bool(final)
+        return self._book_empty
 
     # -- signals ------------------------------------------------------------ #
     def _on_book_state(self, empty: bool) -> None:

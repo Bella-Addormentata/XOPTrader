@@ -254,6 +254,9 @@ def _wire(monkeypatch, in_flight):
     page = _FakePage(in_flight)
     mw = MainWindow.__new__(MainWindow)          # no Qt construction
     mw._permuto_widget = page
+    # __init__ never runs here, so every instance attribute the guard reads
+    # has to be set by hand. The master switch is one of them.
+    mw._permuto_enabled = True
     mw._permuto_runner = None
     mw._permuto_desired_on = False
     mw._unwrap = staticmethod(lambda w: w)

@@ -323,13 +323,45 @@ class Sidebar(QWidget):
     def select_page(self, index: int) -> None:
         """Programmatically select a page by index.
 
+        A HIDDEN entry is refused -- by _on_button_clicked, which is the
+        sole emitter of page_changed and therefore the only place the check
+        is load-bearing. Repeating it here would be a second guard no test
+        could distinguish from the first.
+
         Parameters
         ----------
         index : int
-            Zero-based page index (0 = Dashboard .. 5 = Settings).
+            Zero-based page index (0 = Dashboard .. 10 = Settings).
         """
         if 0 <= index < len(self._buttons):
             self._on_button_clicked(index)
+
+    def set_page_visible(self, index: int, visible: bool) -> None:
+        """Show or HIDE one nav entry without disturbing the indices.
+
+        Hiding rather than removing is deliberate.  Every page index in
+        MainWindow (the ``_PAGE_*`` constants, the QStackedWidget order, the
+        Ctrl+N shortcuts) is positional, and
+        ``test_page_constants_match_the_sidebar_order`` exists precisely
+        because an inserted page once shifted _PAGE_SETTINGS onto Permuto and
+        sent first-run users to a key-generation screen.  A hidden button
+        still occupies its slot, so nothing downstream has to know.
+
+        Parameters
+        ----------
+        index : int
+            Zero-based page index.
+        visible : bool
+            False hides the entry from the rail entirely.
+        """
+        if 0 <= index < len(self._buttons):
+            self._buttons[index].setVisible(visible)
+
+    def is_page_visible(self, index: int) -> bool:
+        """Whether the nav entry at *index* is currently shown."""
+        if 0 <= index < len(self._buttons):
+            return not self._buttons[index].isHidden()
+        return False
 
     @property
     def is_expanded(self) -> bool:
@@ -342,6 +374,12 @@ class Sidebar(QWidget):
         """Handle navigation button click -- exclusive selection."""
         if index == self._current_index:
             # Re-clicking the active page is a no-op.
+            return
+        if not self.is_page_visible(index):
+            # A hidden entry is not navigable. Qt will not deliver a click to
+            # a hidden widget, so this only fires for a programmatic caller
+            # -- and page_changed is the sole route into the stack, so
+            # refusing here is what keeps a hidden page unreachable.
             return
 
         # Deactivate previous, activate new

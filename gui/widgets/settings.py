@@ -109,6 +109,47 @@ def load_startup_states() -> tuple[str, str]:
     return dexie, permuto
 
 
+def load_permuto_enabled() -> bool:
+    """Whether the Permuto market-maker subsystem exists in this GUI at all.
+
+    The master switch behind Settings > Advanced. False means the venue is
+    not merely idle but ABSENT: no toolbar switch, no sidebar entry, no page,
+    no startup auto-arm, and -- the part that is invisible and therefore the
+    part that matters -- no identity read and no venue traffic. Every one of
+    those runs today whether or not the operator ever arms Permuto.
+
+    Defaults to FALSE -- opt in, exactly as ``load_startup_states`` has
+    always defaulted Permuto to "off". An installation that has never been
+    told it wants this venue should not be reading a BLS key off disk on
+    every bridge tick for it: that cost is paid whether or not anybody ever
+    arms the switch, and it is invisible, which is why it went unnoticed.
+
+    NOTE THIS IS NOT A CLAIM THAT THE VENUE IS FINISHED. Permuto is under
+    active development, and an operator who wants it ticks one box and
+    restarts -- with the Startup tab's own "Permuto at startup" and curfew
+    preferences waiting exactly as they left them. The default governs the
+    machine that has expressed no preference, not the one that has.
+
+    This is the one default in the file deliberately NOT chosen as "the
+    software you had yesterday". Everything it turns off is either inert
+    (a page nobody opens) or invisible (a secrets read on a tick), and the
+    one thing that is neither -- a live quoting session -- cannot exist at
+    the moment this is read, because it is read before anything is built.
+
+    Read from the store rather than a cached value, for the same reason
+    ``load_curfew_enabled`` does: the GUI is armed long after the settings
+    page wrote, and a stale read is the opposite of what was just chosen.
+    """
+    settings = QSettings("XOP", "XOPTrader")
+    settings.sync()
+    settings.beginGroup("permuto")
+    raw = settings.value("enabled", False)
+    settings.endGroup()
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in ("true", "1", "on", "yes")
+
+
 def load_curfew_enabled() -> bool:
     """Whether the Permuto overnight inventory curfew is armed.
 
@@ -352,6 +393,11 @@ class SettingsWidget(QWidget):
     # P&L display baseline.  Payload is the UTC baseline string
     # ("YYYY-MM-DD HH:MM:SS"), or "" when the reset was cleared.
     pnl_baseline_changed = Signal(str)
+    #: The Permuto master switch moved. Payload is the NEW state. MainWindow
+    #: owns what that means -- stopping a live session, hiding the toolbar
+    #: switch and the nav entry -- because this page knows nothing about
+    #: either. Emitted only on a genuine operator change, never on load.
+    permuto_enabled_changed = Signal(bool)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -471,6 +517,12 @@ class SettingsWidget(QWidget):
             self._tab_dirty[idx] = False
 
         root.addWidget(self._tabs, stretch=1)
+
+        # Advanced (11) is built after Startup (10), so the rows it governs
+        # exist by now. Applied once here rather than inside the builder so
+        # the initial state goes through exactly the same path as a click.
+        self._sync_permuto_dependent_rows(
+            self._permuto_enabled_box.isChecked())
 
         # -- Status bar --
         status_row = QHBoxLayout()
@@ -1114,13 +1166,18 @@ class SettingsWidget(QWidget):
             "Adopt from engine (default)", "On", "Off"])
         form.addRow("Dexie at startup:", self._startup_dexie)
 
+        # The two Permuto rows keep explicit label handles: the Advanced
+        # tab's master switch greys the whole row, and a QFormLayout-created
+        # label is not reachable without one.
         self._startup_permuto = QComboBox()
         self._startup_permuto.addItems(["Off (default)", "On"])
-        form.addRow("Permuto at startup:", self._startup_permuto)
+        self._startup_permuto_label = QLabel("Permuto at startup:")
+        form.addRow(self._startup_permuto_label, self._startup_permuto)
 
         self._permuto_curfew = QComboBox()
         self._permuto_curfew.addItems(["On (default)", "Off"])
-        form.addRow("Permuto overnight curfew:", self._permuto_curfew)
+        self._permuto_curfew_label = QLabel("Permuto overnight curfew:")
+        form.addRow(self._permuto_curfew_label, self._permuto_curfew)
 
         layout.addLayout(form)
 
@@ -1152,6 +1209,7 @@ class SettingsWidget(QWidget):
         )
         curfew_note.setWordWrap(True)
         curfew_note.setStyleSheet(f"color: {_C.TEXT_SECONDARY};")
+        self._permuto_curfew_note = curfew_note
         layout.addWidget(curfew_note)
         layout.addStretch(1)
 
@@ -1404,12 +1462,160 @@ class SettingsWidget(QWidget):
     # Advanced tab
     # -------------------------------------------------------------------
 
+    def _build_subsystems_group(self) -> QWidget:
+        """The Permuto master switch.
+
+        Not a trading control. The venue switch in the toolbar says whether
+        Permuto is QUOTING; this says whether Permuto is part of this GUI at
+        all. Off removes the toolbar switch, the sidebar entry and the page,
+        and -- the reason it exists -- stops the identity read and the venue
+        traffic that run today regardless of whether anyone ever arms it.
+
+        OFF BY DEFAULT, because everything the subsystem does while idle is
+        either invisible or useless and is paid for anyway. Not a statement
+        that the venue is finished: it governs the machine that has
+        expressed no preference, not the one that has.
+
+        ASYMMETRIC, BUT ONLY IN ONE CASE. Off applies immediately, because a
+        control that promises a subsystem is gone has to be honest the
+        moment it is clicked, and because it may have to stop a live session
+        first. On applies immediately TOO whenever this session actually
+        built the surfaces -- switching off and back on again just unhides
+        them. It is only a session that STARTED with Permuto off that has
+        nothing to unhide: the toolbar switch and the page are built during
+        window construction and the sidebar/page indices are positional, so
+        there is nowhere to insert them afterwards.
+
+        The wording has to carry that distinction rather than flatten it to
+        "restart required", which is wrong half the time and trains
+        operators to ignore it. MainWindow knows which case it is in and
+        raises a dialog only for the one that genuinely waits.
+        """
+        group = QGroupBox("Subsystems")
+        box = QVBoxLayout(group)
+        box.setSpacing(6)
+
+        self._permuto_enabled_box = QCheckBox(
+            "Enable the Permuto market maker")
+        self._permuto_enabled_box.setChecked(load_permuto_enabled())
+        self._permuto_enabled_box.setToolTip(
+            "Off by default. Off hides the Permuto toolbar switch, its "
+            "sidebar entry and its page, and stops every background read and "
+            "venue request the subsystem makes. Switching it back on in the "
+            "same session brings them straight back; if this session STARTED "
+            "with Permuto off, they appear the next time XOPTrader starts."
+        )
+        box.addWidget(self._permuto_enabled_box)
+
+        note = QLabel(
+            "Off by default -- leaving it on costs a read of the trading "
+            "identity on every tick whether or not you ever quote.\n\n"
+            "Turning it OFF takes effect immediately: if a session is "
+            "quoting it is stopped and its book cancelled first, and the "
+            "switch refuses to hide anything until that cancel is "
+            "confirmed. It also sets 'Permuto at startup' to Off. The "
+            "overnight curfew is left armed on purpose -- its off position "
+            "disarms a protection rather than stopping activity.\n\n"
+            "Turning it back ON is immediate too IF this session built the "
+            "Permuto surfaces -- that is, if you switched it off here a "
+            "moment ago. If XOPTrader STARTED with Permuto off, there is "
+            "nothing to unhide: the toolbar switch and the page are built "
+            "at startup, so they appear on the next launch and you will be "
+            "told so."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet(f"color: {_C.TEXT_SECONDARY}; font-size: 9pt;")
+        box.addWidget(note)
+
+        self._permuto_enabled_box.toggled.connect(
+            self._on_permuto_enabled_toggled)
+        return group
+
+    def _on_permuto_enabled_toggled(self, enabled: bool) -> None:
+        """Persist the master switch, then let MainWindow act on it.
+
+        Written to QSettings BEFORE the signal, so a listener that decides to
+        refuse (a live book that will not cancel) is correcting a value that
+        is already on disk rather than racing one that is not.
+        """
+        settings = QSettings("XOP", "XOPTrader")
+        settings.beginGroup("permuto")
+        settings.setValue("enabled", bool(enabled))
+        settings.endGroup()
+        settings.sync()
+        self._sync_permuto_dependent_rows(enabled)
+        self.permuto_enabled_changed.emit(bool(enabled))
+
+    def set_permuto_enabled(self, enabled: bool) -> None:
+        """Force the checkbox back, without re-entering the handler.
+
+        The refusal path: MainWindow could not hide the subsystem because a
+        real book is still resting at the venue, so the operator's click has
+        to be undone -- and undoing it must not fire another round trip.
+        Persists the corrected value for the same reason the handler does.
+        """
+        box = getattr(self, "_permuto_enabled_box", None)
+        if box is None or box.isChecked() == bool(enabled):
+            return
+        blocked = box.blockSignals(True)
+        try:
+            box.setChecked(bool(enabled))
+        finally:
+            box.blockSignals(blocked)
+        settings = QSettings("XOP", "XOPTrader")
+        settings.beginGroup("permuto")
+        settings.setValue("enabled", bool(enabled))
+        settings.endGroup()
+        settings.sync()
+        self._sync_permuto_dependent_rows(enabled)
+
+    def _sync_permuto_dependent_rows(self, enabled: bool) -> None:
+        """Master switch off means every Permuto switch reads off.
+
+        An INVARIANT, not a transition effect -- it is applied on every
+        build as well as on every click, so a store carrying an older
+        "Permuto: On at startup" is corrected the first time Settings opens
+        rather than lying in wait until the subsystem is switched back on.
+
+        "Permuto at startup" follows to Off. That is the whole point: with
+        the subsystem off it could not arm anyway, and a switch that still
+        reads On is describing something that cannot happen.
+
+        THE CURFEW IS DELIBERATELY NOT FOLLOWED, and it is the one control
+        here whose "off position" means LESS safety rather than less
+        activity. It is not an enabler -- it caps how much inventory
+        Permuto may carry once the underlying market shuts, and the venue
+        keeps matching against a frozen oracle through that close. Forcing
+        it Off would disarm a liquidation protection that has no effect
+        whatsoever while the subsystem is disabled, and would then persist
+        silently into the next session that DOES quote. So it greys out
+        armed. See _build_startup_tab's explainer for why it exists.
+        """
+        enabled = bool(enabled)
+        if not enabled:
+            combo = getattr(self, "_startup_permuto", None)
+            # Index 0 is "Off (default)". Setting it fires
+            # currentIndexChanged -> _save_startup_settings, which is how
+            # the corrected value reaches QSettings; already-off is a no-op
+            # because Qt does not emit for an unchanged index.
+            if combo is not None and combo.currentIndex() != 0:
+                combo.setCurrentIndex(0)
+
+        for name in ("_startup_permuto", "_permuto_curfew",
+                     "_startup_permuto_label", "_permuto_curfew_label",
+                     "_permuto_curfew_note"):
+            row = getattr(self, name, None)
+            if row is not None:
+                row.setEnabled(enabled)
+
     def _build_advanced_tab(self) -> QWidget:
-        """Build the Advanced tab: volatility, DB path, raw YAML editor."""
+        """Build the Advanced tab: subsystems, volatility, DB path, YAML."""
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(10)
+
+        layout.addWidget(self._build_subsystems_group())
 
         # -- Volatility section --
         vol_group = QGroupBox("Volatility (Yang-Zhang)")
@@ -1503,22 +1709,28 @@ class SettingsWidget(QWidget):
 
         layout.addWidget(yaml_group, stretch=1)
 
-        # Wire dirty tracking (tab index 10).
-        self._lookback_blocks.valueChanged.connect(
-            lambda _v, ti=10: self._mark_dirty(ti)
-        )
-        self._yz_alpha.valueChanged.connect(
-            lambda _v, ti=10: self._mark_dirty(ti)
-        )
-        self._candle_agg_blocks.valueChanged.connect(
-            lambda _v, ti=10: self._mark_dirty(ti)
-        )
-        self._db_path.textChanged.connect(
-            lambda _t, ti=10: self._mark_dirty(ti)
-        )
-        self._yaml_editor.textChanged.connect(
-            lambda ti=10: self._mark_dirty(ti)
-        )
+        # Wire dirty tracking.
+        #
+        # [drive-by fix] These five said 10, and Advanced is 11 -- 10 is
+        # Startup. Editing the YAML box put the unsaved marker on a tab whose
+        # controls write straight to QSettings and are never part of a save,
+        # while Advanced's own genuinely unsaved edits showed as clean. The
+        # index comes from the tab_builders list in _build_ui.
+        #
+        # The Permuto master switch above is deliberately NOT in this flow:
+        # it is a QSettings preference like the Startup and Appearance
+        # controls, saved the instant it is clicked, so marking it "unsaved"
+        # would be a lie about config.yaml.
+        for _widget_signal in (
+            self._lookback_blocks.valueChanged,
+            self._yz_alpha.valueChanged,
+            self._candle_agg_blocks.valueChanged,
+            self._db_path.textChanged,
+            self._yaml_editor.textChanged,
+        ):
+            _widget_signal.connect(
+                lambda *_a, ti=11: self._mark_dirty(ti)
+            )
 
         return page
 

@@ -207,10 +207,16 @@ def window():
     # seed dexie intent ON and invert this file's baseline chips.
     import gui.widgets.settings as settings_mod
 
+    # [PERMUTO MASTER SWITCH] Seal this for the same reason. It reads the
+    # machine's real QSettings, and an operator who switched Permuto off
+    # would build a window with no _permuto_switch at all -- every chip
+    # assertion in this file would fail on their box and nowhere else.
     real = permuto_mod._default_identity_factory
     real_loader = settings_mod.load_startup_states
+    real_enabled = settings_mod.load_permuto_enabled
     permuto_mod._default_identity_factory = lambda: _FakeIdentity()
     settings_mod.load_startup_states = lambda: ("adopt", "off")
+    settings_mod.load_permuto_enabled = lambda: True
     try:
         from gui.widgets.main_window import MainWindow
 
@@ -218,6 +224,7 @@ def window():
     finally:
         permuto_mod._default_identity_factory = real
         settings_mod.load_startup_states = real_loader
+        settings_mod.load_permuto_enabled = real_enabled
 
 
 def test_both_switches_start_honestly(window):
@@ -927,8 +934,10 @@ def _sealed_window(startup_dexie):
 
     real_identity = permuto_mod._default_identity_factory
     real_loader = settings_mod.load_startup_states
+    real_enabled = settings_mod.load_permuto_enabled
     permuto_mod._default_identity_factory = lambda: _FakeIdentity()
     settings_mod.load_startup_states = lambda: (startup_dexie, "off")
+    settings_mod.load_permuto_enabled = lambda: True
     try:
         from gui.widgets.main_window import MainWindow
 
@@ -936,6 +945,7 @@ def _sealed_window(startup_dexie):
     finally:
         permuto_mod._default_identity_factory = real_identity
         settings_mod.load_startup_states = real_loader
+        settings_mod.load_permuto_enabled = real_enabled
 
 
 def test_a_stored_on_request_paints_intent_before_the_engine():

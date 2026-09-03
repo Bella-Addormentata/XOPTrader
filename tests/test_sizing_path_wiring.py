@@ -115,6 +115,35 @@ def test_paths_reach_the_wallet_page_without_a_settings_widget(app, tmp_path):
         def set_sizing_paths(self, config_path, db_path) -> None:
             self.got = (config_path, db_path)
 
+    # [PERMUTO MASTER SWITCH / v0.10.4 field report] This is the only test
+    # that calls set_bridge on a REAL window, and set_bridge schedules the
+    # Permuto startup arm. On a box whose operator registered an identity
+    # and stored "Permuto: On at startup", that arm places live orders from
+    # a test run. Seal both, exactly as
+    # gui/services/permuto/tests/test_venue_control.py does.
+    from gui.widgets import permuto as permuto_mod
+    from gui.widgets import settings as settings_mod
+
+    class _UnregisteredInfo:
+        registered = False
+        link_attempted = False
+        backup_confirmed = False
+        listing_verified = False
+        user_id = None
+        trading_address = None
+        pubkey = "ab" * 48
+        created_at = None
+
+    class _FakeIdentity:
+        info = staticmethod(_UnregisteredInfo)
+
+    real_identity = permuto_mod._default_identity_factory
+    real_loader = settings_mod.load_startup_states
+    # The class IS the factory -- classes are callable, so this keeps the
+    # "call it to get an identity" contract without a wrapper lambda.
+    permuto_mod._default_identity_factory = _FakeIdentity
+    settings_mod.load_startup_states = lambda: ("adopt", "off")
+
     window = MainWindow()
     try:
         from gui.services.engine_bridge import EngineBridge
@@ -136,6 +165,8 @@ def test_paths_reach_the_wallet_page_without_a_settings_widget(app, tmp_path):
         window.close()
         window.deleteLater()
         app.processEvents()
+        permuto_mod._default_identity_factory = real_identity
+        settings_mod.load_startup_states = real_loader
 
 
 # ---------------------------------------------------------------------------
