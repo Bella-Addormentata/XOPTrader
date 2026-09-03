@@ -5,6 +5,17 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.15] — 2026-09-03 — autodetect wallet fallback & reliable shutdown cancels
+
+- Fall back to inspecting local Chia wallet databases (`last_used_fingerprint`
+  and `blockchain_wallet_v2_*_<fp>.sqlite`) during fresh install bootstrapping
+  when the `chia` CLI is absent from `PATH`, preventing initial startup failures.
+- Robust dead man's switch and shutdown cancellation: retry transient wallet
+  desyncs and network errors rather than leaving resting offers live on shutdown.
+- Money-path compile-time type safety via `denom.hpp` to prevent unit/scale
+  mixups across mojos, CATs, and USD notionals.
+- Documented S39(b) competitiveness-gate analysis for XCH/BYC and XCH/DBX.
+
 ## [0.10.14] — 2026-09-02 — place against the book that is actually there
 
 The Permuto runner banked zero depth through a full session while three legs
