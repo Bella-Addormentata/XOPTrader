@@ -13995,10 +13995,28 @@ asio::awaitable<void> Engine::step_xch_recovery(BlockHeight block_height)
     }
 
     // [2026-09-02] WAS `== 0.0`: an int64 accumulator compared against a
-    // FLOATING literal. Harmless in practice (every value in range converts
-    // exactly), but it is precisely the implicit conversion the strong typedefs
-    // exist to refuse, and it became a compile error the moment this variable
-    // was typed. Now an exact integer comparison against a typed zero.
+    // FLOATING literal.
+    //
+    // It was harmless, but NOT for the reason first written here. An earlier
+    // version of this comment said "every value in range converts exactly",
+    // which is false: int64 -> double is exact only up to 2^53, and above that
+    // the conversion rounds. int64 reaches ~9.22e18, so most of the range does
+    // NOT convert exactly, and a comment claiming otherwise invites the next
+    // reader to reuse `== 0.0` on an int64 EQUALITY that actually depends on
+    // exactness -- where it would be wrong.
+    //
+    // The NARROWER reason the old code was safe: this was a comparison against
+    // ZERO specifically. Converting a nonzero integer to double cannot yield
+    // zero -- rounding a value of magnitude >= 1 to the nearest double lands on
+    // a double of magnitude >= 1, never on 0 -- and integer 0 converts to 0.0
+    // exactly. So `x == 0.0` and `x == 0` agreed on every int64, at any
+    // magnitude, and the accuracy of the conversion elsewhere never entered
+    // into it.
+    //
+    // It is gone regardless, because it is precisely the implicit conversion the
+    // strong typedefs exist to refuse, and it became a compile error the moment
+    // this variable was typed. Now an exact integer comparison against a typed
+    // zero.
     if (taken_mojos_this_block == BaseMojos{0}) {
         spdlog::info("[Recovery] No acceptable XCH asks found this block "
                      "(max premium: {:.0f}bps over CEX {:.6f})",

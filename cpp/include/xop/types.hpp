@@ -607,10 +607,61 @@ struct TierQuote {
     // The tree therefore contains both conventions, one live and one dead. Its
     // removal is deliberately NOT bundled into this type change.
     //
-    // The execution layer (OfferManager::build_offer_dict) computes the
-    // counter-leg amount as:
-    //   Bid: quote_amount = size * price / quote_denom   (we spend quote, receive base)
-    //   Ask: quote_amount = size * price / quote_denom   (we spend base, receive quote)
+    // THE COUNTER-LEG. [2026-09-02] THE FORMULA WRITTEN HERE WAS DIMENSIONALLY
+    // WRONG -- it divided by quote_denom -- AND THIS BLOCK IS THE SECOND
+    // CORRECTION OF IT, so the derivation is spelled out rather than asserted.
+    // It read:
+    //
+    //     Bid: quote_amount = size * price / quote_denom
+    //     Ask: quote_amount = size * price / quote_denom
+    //
+    // What the code actually does. OfferManager::build_offer_dict
+    // (offer_manager.cpp:2911-2939) calls xop::quote_mojos_for (types.hpp:59),
+    // which is the ONE place the formula is allowed to be written:
+    //
+    //     quote_mojos = size * price * quote_denom / (base_denom * kMojosPerXch)
+    //
+    // DERIVATION, from the two conventions stated at the top of this file
+    // (types.hpp:43-44):
+    //
+    //     size  = base_units * base_denom            [base mojos]
+    //     price = (quote_units / base_unit) * kMojosPerXch   [pseudo-units]
+    //
+    //   so, unwinding each scaling in turn,
+    //
+    //     base_units  = size / base_denom
+    //     rate        = price / kMojosPerXch         [quote_units per base_unit]
+    //     quote_units = base_units * rate
+    //                 = size * price / (base_denom * kMojosPerXch)
+    //     quote_mojos = quote_units * quote_denom
+    //                 = size * price * quote_denom / (base_denom * kMojosPerXch)
+    //
+    // quote_denom is therefore a MULTIPLIER (quote mojos per quote unit), and
+    // the old text had it as a divisor with the base_denom and kMojosPerXch
+    // factors missing entirely. On XCH/CAT that is not a rounding quibble: for
+    // size = 1e12 (1 XCH), price = 5e10 (0.05 quote units per XCH),
+    // base_denom = 1e12, quote_denom = 1e3, the correct amount is
+    //
+    //     1e12 * 5e10 * 1e3 / (1e12 * 1e12) = 50 quote mojos   (= 0.05 units)
+    //
+    // where the old text gives 1e12 * 5e10 / 1e3 = 5e19 -- high by 1e18, and
+    // wrong in the direction that posts an offer paying eighteen orders of
+    // magnitude too much. This comment was written to PREVENT the v0.7.45
+    // 1e9-inflation defect (the missing quote_denom/base_denom factor, cited at
+    // types.hpp:52) and as written it documented a worse version of it.
+    //
+    // THE TWO SIDES DIFFER IN ROUNDING, NOT IN FORMULA, and that is the part the
+    // old text got accidentally right by writing the same expression twice:
+    //
+    //   Bid: we offer quote (negative), request `size` base (positive).
+    //        quote_amount = ceil(quote_mojos_for(...))  -- round UP, so we offer
+    //        at least enough quote to cover the base we asked for.
+    //   Ask: we offer `size` base (negative), request quote (positive).
+    //        quote_amount = floor(quote_mojos_for(...)) -- round DOWN, so we
+    //        request conservatively and the offer stays attractive to takers.
+    //
+    // Both roundings go AGAINST us by one mojo, which is the only safe direction
+    // for a maker; do not "simplify" them to a common llround.
     Mojo         size;
 
     double       spread_bps;   // Distance from mid-price in basis points
