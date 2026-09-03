@@ -5,6 +5,13 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.21] — 2026-09-03 — expand BBO fetch budget & micro-tick requote drift tolerance
+
+- Expanded per-tick BBO fetch budget to 2.0s (1.0s timeout per request) in `live.py` to prevent
+  premature sub-tick BBO timeouts across multiple markets.
+- Added micro-tick tolerance in `quoting.py` and `runner.py` requote-drift calculation to prevent
+  unnecessary churn on tight micro-tick ring-edge placements.
+
 ## [0.10.20] — 2026-09-03 — pre-reduce cancel-all to prevent single order accumulation
 
 - Added market-scoped pre-cancel before posting risk-reducing single orders in the carried-session

@@ -2546,7 +2546,7 @@ class QuoteRunner:
             widest = max(abs(leg.price / ref - 1.0) * 100.0
                          for leg in market_legs)
             if (default_trigger < widest
-                    and widest <= self._ring_pct + 1e-9):
+                    and widest <= self._ring_pct + 1e-3):
                 widest = min(widest, self._ring_pct)
                 self._requote_at_pct[market] = min(
                     self._ring_pct,

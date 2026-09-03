@@ -206,17 +206,17 @@ def decide(
     custom_ring_edge = False
     if (requote_at_pct is not None
             and math.isfinite(requote_at_pct)
-            and trigger < requote_at_pct <= ring_pct):
+            and trigger < requote_at_pct <= ring_pct + 1e-3):
         trigger = requote_at_pct
         custom_ring_edge = math.isclose(
-            trigger, ring_pct, rel_tol=0.0, abs_tol=1e-9)
+            trigger, ring_pct, rel_tol=0.0, abs_tol=1e-3)
     for price in (resting.bid_price, resting.ask_price):
         if price is None:
             continue        # the forbidden side; nothing to drift-check
         drift = abs(price - view.oracle) / view.oracle * 100.0
         past_trigger = drift >= trigger
-        if custom_ring_edge and math.isclose(
-                drift, trigger, rel_tol=0.0, abs_tol=1e-9):
+        if custom_ring_edge and (drift <= ring_pct + 1e-3 or math.isclose(
+                drift, trigger, rel_tol=0.0, abs_tol=1e-3)):
             past_trigger = False
         if past_trigger:
             return QuoteDecision(
