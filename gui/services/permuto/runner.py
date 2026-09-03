@@ -1951,8 +1951,11 @@ class QuoteRunner:
                     dropped.add(leg.market)
                     continue
 
-                price = quantise_toward(
-                    out.price if out.changed else leg.price, ref, m_tick)
+                if leg.market in bbo_placements and not out.changed:
+                    price = leg.price
+                else:
+                    price = quantise_toward(
+                        out.price if out.changed else leg.price, ref, m_tick)
                 if leg.reduce_only and leg.market in observed_books:
                     book = observed_books[leg.market]
                     if leg.side is Side.SELL and book.best_bid is not None:

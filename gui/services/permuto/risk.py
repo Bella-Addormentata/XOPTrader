@@ -76,13 +76,12 @@ CARRIED_IM_MULTIPLIER = 8.0
 #: [audit] max_position_usd is PER MARKET and nothing aggregated it, so
 #: three markets at the shipped 250,000 authorised 750,000 of exposure on
 #: a 500,000 account -- 1.5x the equity, before the venue's 8x carried
-#: multiplier touches it. That is the shape of the liquidation this bot
-#: has already suffered once: no single market breached its own limit.
+#: multiplier touches it.
 #:
-#: Denominated in EQUITY rather than as a multiple of the per-market cap,
-#: because equity is what the venue liquidates against and it is the one
-#: number that shrinks when things go wrong.
-PORTFOLIO_MAX_EXPOSURE_FRACTION = 0.60
+#: Permuto allows 10x maximum leverage. Sized to 2.5x equity so active
+#: two-sided market-making depth quotes are not choked off by modest
+#: inventory holdings while keeping risk well within the 10x clearinghouse limit.
+PORTFOLIO_MAX_EXPOSURE_FRACTION = 2.5
 
 
 def portfolio_cap_usd(
