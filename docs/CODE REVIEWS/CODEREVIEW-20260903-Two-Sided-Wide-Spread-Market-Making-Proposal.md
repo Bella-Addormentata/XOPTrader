@@ -140,19 +140,22 @@ XOPTrader maintains per-pair PID controllers (`SpreadPidState` and `Competitiven
      - Spans from $-10\%$ down to $-38\%$ on Bids: **$1.35, 1.30, 1.24, 1.20, 1.17, 1.13\text{ BYC/XCH}$**.
      - Takers sweeping the book are forced to walk up the ladder, capturing progressively higher profit margins ($10\% \to 50\%$).
 
-### I. Dynamic 24-Hour Activity-Adaptive Margin & Spacing Controller
-* **The Concept:**
-  - In illiquid markets ("desert books"), quoting tight spreads exposes the market maker to adverse selection with no compensation. When the market is quiet ($0$ fills and no competing offers), the engine should extract the **maximum liquidity premium** ($M_{\text{max}}$, $S_{\text{max}}$).
-  - When trade velocity accelerates ($\ge 24$ fills/day) OR when substantial competing liquidity already rests on the book ($N_{\text{book}} > 0$), inventory turnover velocity and price discovery are healthy, so spreads can safely compress toward the tightest setting ($M_{\text{min}}$, $S_{\text{min}}$) to compete for flow.
+### I. Dynamic 24-Hour Activity-Adaptive Margin & Spacing Controller (Cross-Side Replenishment Coupling)
+* **The Concept & Inventory Dynamics:**
+  - In illiquid markets ("desert books"), quoting tight spreads exposes the market maker to adverse selection and inventory depletion with no compensation.
+  - When trades occur primarily on one side (e.g. many Ask fills selling XCH without Bid fills to buy XCH back), inventory depletes. To protect capital and restore balance:
+    - **Cross-Side Ask Expansion:** When Bid fills are low ($\alpha_{\text{bid}} \to 0$), we are not replenishing inventory, so the **Ask margin and spacing expand** ($M_{\text{max}} = 800\text{ bps}$, $S_{\text{max}} = [600..4800]\text{ bps}$) to demand a higher liquidity premium and slow down XCH outflow.
+    - **Cross-Side Bid Tightening:** When Ask fills are high ($\alpha_{\text{ask}} \to 1.0$), we have accumulated quote asset (BYC) and need to buy XCH back, so the **Bid margin and spacing tighten** toward $M_{\text{min}} = 100\text{ bps}$ and $S_{\text{min}} = [100..1400]\text{ bps}$ to actively rebalance.
 * **The Implementation:**
   1. **Database Query (`cpp/src/database.cpp`):** Added `Database::query_trade_counts_by_side` to query confirmed fills grouped by side from `trade_log` within the 24-hour lookback window (default 1,662 blocks).
-  2. **Combined Activity Measure with Order-Book Depth Weighting (`activity_book_weight`):**
+  2. **Asymmetric Activity Scores with Book Depth Weighting (`activity_book_weight`):**
      $$\text{Effective Activity}_s = N_s^{24\text{h\_fills}} + w_{\text{book}} \cdot N_s^{\text{book\_offers}}$$
      $$\alpha_s = \min\left(1.0, \; \frac{\text{Effective Activity}_s}{N_{\text{target}}}\right)$$
-     Where $w_{\text{book}} = 0.5$ and $N_{\text{target}} = 24$.
-  3. **Continuous Interpolation (`cpp/src/engine.cpp` Step 7):**
-     $$M_{\text{eff}, s} = M_{\text{max}} - \alpha_s \cdot (M_{\text{max}} - M_{\text{min}})$$
-     $$S_{\text{eff}, s}[i] = S_{\text{max}}[i] - \alpha_s \cdot \big(S_{\text{max}}[i] - S_{\text{min}}[i]\big)$$
+  3. **Cross-Side Continuous Interpolation (`cpp/src/engine.cpp` Step 7):**
+     $$M_{\text{eff, ask}} = M_{\text{max}} - \alpha_{\text{bid}} \cdot (M_{\text{max}} - M_{\text{min}})$$
+     $$S_{\text{eff, ask}}[i] = S_{\text{max}}[i] - \alpha_{\text{bid}} \cdot \big(S_{\text{max}}[i] - S_{\text{min}}[i]\big)$$
+     $$M_{\text{eff, bid}} = M_{\text{max}} - \alpha_{\text{ask}} \cdot (M_{\text{max}} - M_{\text{min}})$$
+     $$S_{\text{eff, bid}}[i] = S_{\text{max}}[i] - \alpha_{\text{ask}} \cdot \big(S_{\text{max}}[i] - S_{\text{min}}[i]\big)$$
   4. **Order-Book Clamp Protection:** Clamping against `snap.best_bid` / `snap.best_ask` enforces a minimum margin of $\max(\text{step\_bps}, M_{\text{eff}, s})$, ensuring our top ask never rests flush against the best bid and always captures the intended profit margin.
 
 ---

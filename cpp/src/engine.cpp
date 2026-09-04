@@ -7748,8 +7748,16 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                 ? pair_cfg->min_profit_margin_max_bps_override.value()
                 : std::max(min_margin, min_margin * 2.0);
 
-            effective_bid_margin_bps = max_margin - alpha_bid * (max_margin - min_margin);
-            effective_ask_margin_bps = max_margin - alpha_ask * (max_margin - min_margin);
+            // CROSS-SIDE REPLENISHMENT COUPLING:
+            // When bids fill (buying base asset), we are actively replenishing inventory,
+            // so the ASK margin and spacing can safely tighten to sell (driven by alpha_bid).
+            // When asks fill (selling base asset), we are actively accumulating quote asset,
+            // so the BID margin and spacing can safely tighten to buy (driven by alpha_ask).
+            // Conversely, when there are very few bid fills (alpha_bid is low), we are not
+            // replenishing base inventory, so ASK margin/gap expands (to max_margin/max_spacing)
+            // to demand a higher liquidity premium and protect inventory.
+            effective_bid_margin_bps = max_margin - alpha_ask * (max_margin - min_margin);
+            effective_ask_margin_bps = max_margin - alpha_bid * (max_margin - min_margin);
 
             // Spacing interpolation: at 0 fills -> max_spacing; at >= target fills -> min_spacing
             const auto& min_spacings = ladder_cfg.tier_spacing_bps;
@@ -7763,11 +7771,11 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
             for (std::size_t i = 0; i < ladder_cfg.num_tiers; ++i) {
                 const double min_s = (i < min_spacings.size()) ? min_spacings[i] : (100.0 * (i + 1));
                 const double max_s = (i < max_spacings.size()) ? max_spacings[i] : min_s;
-                ladder_cfg.tier_spacing_bps_bid[i] = max_s - alpha_bid * (max_s - min_s);
-                ladder_cfg.tier_spacing_bps_ask[i] = max_s - alpha_ask * (max_s - min_s);
+                ladder_cfg.tier_spacing_bps_bid[i] = max_s - alpha_ask * (max_s - min_s);
+                ladder_cfg.tier_spacing_bps_ask[i] = max_s - alpha_bid * (max_s - min_s);
             }
 
-            spdlog::info("[Engine] Step 7: {} activity score: bids={:.1f} (24h_fills={} book={}), asks={:.1f} (24h_fills={} book={}) "
+            spdlog::info("[Engine] Step 7: {} cross-side activity: bids={:.1f} (24h_fills={} book={}), asks={:.1f} (24h_fills={} book={}) "
                          "-> alpha_bid={:.1f}%, alpha_ask={:.1f}%, bid_margin={:.0f}bps, ask_margin={:.0f}bps, bid_spacing_0={:.0f}bps, ask_spacing_0={:.0f}bps",
                          pair_name, eff_bids, bids_24h, book_bids, eff_asks, asks_24h, book_asks,
                          alpha_bid * 100.0, alpha_ask * 100.0,

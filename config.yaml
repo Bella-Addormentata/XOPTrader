@@ -74,7 +74,7 @@ pairs:
   max_half_spread_bps_override: 5000
   activity_adaptive_spacing_override: true
   activity_target_fills_24h_override: 24
-  activity_book_weight_override: 0.5
+  activity_book_weight_override: 0.0
   min_profit_margin_bps_override: 100
   min_profit_margin_max_bps_override: 800
   tier_spacing_bps_override:
