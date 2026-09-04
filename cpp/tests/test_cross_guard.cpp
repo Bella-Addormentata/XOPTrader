@@ -1,14 +1,13 @@
 // ---------------------------------------------------------------------------
 // [CROSSGUARD] The pre-post crossing predicate, both versions.
 //
-// Step 8 suppresses on the PUBLISHED-MID verdict; the canceller
-// (classify_tier_staleness) acts on the BBO verdict. They were the same rule
-// when the guard was written in 4d3f30d and diverged one day later in
-// a932a5d, which moved the canceller onto the BBO and left the guard behind.
-// The guard has never been modified since.
+// Step 8 suppresses on the BBO verdict (classify_cross_bbo), matching the
+// canceller (classify_tier_staleness). The legacy published-mid rule
+// (classify_cross_published_mid) is preserved as a fallback when BBO is
+// missing or invalid.
 //
-// These pin BOTH rules and, more importantly, the SHAPE OF THEIR
-// DISAGREEMENT -- which is the whole output of the shadow counter.
+// These tests pin BOTH rules and verify their behavior across normal,
+// crossed, inverted, and degenerate order books.
 // ---------------------------------------------------------------------------
 
 #include <gtest/gtest.h>

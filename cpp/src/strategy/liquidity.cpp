@@ -177,8 +177,13 @@ std::vector<TierQuote> LiquidityEngine::build_raw_ladder(
     const std::int64_t min_pool_per_tier = 1000000000000LL;  // 1.0 XCH
 
     for (std::uint32_t i = 0; i < cfg.num_tiers; ++i) {
-        const double spread_bps = cfg.tier_spacing_bps[i];
-        const double size_frac  = cfg.tier_size_pct[i];
+        const double bid_spread_bps = (!cfg.tier_spacing_bps_bid.empty() && i < cfg.tier_spacing_bps_bid.size())
+            ? cfg.tier_spacing_bps_bid[i]
+            : (i < cfg.tier_spacing_bps.size() ? cfg.tier_spacing_bps[i] : 0.0);
+        const double ask_spread_bps = (!cfg.tier_spacing_bps_ask.empty() && i < cfg.tier_spacing_bps_ask.size())
+            ? cfg.tier_spacing_bps_ask[i]
+            : (i < cfg.tier_spacing_bps.size() ? cfg.tier_spacing_bps[i] : 0.0);
+        const double size_frac  = (i < cfg.tier_size_pct.size()) ? cfg.tier_size_pct[i] : 0.0;
 
         auto tier_size_for_pool = [&](std::int64_t pool) {
             auto tier_size = static_cast<std::int64_t>(
@@ -190,10 +195,10 @@ std::vector<TierQuote> LiquidityEngine::build_raw_ladder(
         };
 
         // -- Bid tier --
-        // bid_price = mid * (1 - spread_bps / 10000)
+        // bid_price = mid * (1 - bid_spread_bps / 10000)
         // Rounding DOWN for bids is conservative (we pay less).
         const double bid_price_f =
-            static_cast<double>(mid) * (1.0 - spread_bps / 10000.0);
+            static_cast<double>(mid) * (1.0 - bid_spread_bps / 10000.0);
         const auto   bid_price   =
             static_cast<std::int64_t>(std::floor(bid_price_f));
 
@@ -205,15 +210,15 @@ std::vector<TierQuote> LiquidityEngine::build_raw_ladder(
             tq.side       = Side::Bid;
             tq.price      = bid_price;
             tq.size       = bid_size;
-            tq.spread_bps = spread_bps;
+            tq.spread_bps = bid_spread_bps;
             ladder.push_back(tq);
         }
 
         // -- Ask tier --
-        // ask_price = mid * (1 + spread_bps / 10000)
+        // ask_price = mid * (1 + ask_spread_bps / 10000)
         // Rounding UP for asks is conservative (we receive more).
         const double ask_price_f =
-            static_cast<double>(mid) * (1.0 + spread_bps / 10000.0);
+            static_cast<double>(mid) * (1.0 + ask_spread_bps / 10000.0);
         const auto   ask_price   =
             static_cast<std::int64_t>(std::ceil(ask_price_f));
 
@@ -226,7 +231,7 @@ std::vector<TierQuote> LiquidityEngine::build_raw_ladder(
             tq.side       = Side::Ask;
             tq.price      = ask_price;
             tq.size       = ask_size;
-            tq.spread_bps = spread_bps;
+            tq.spread_bps = ask_spread_bps;
             ladder.push_back(tq);
         }
     }

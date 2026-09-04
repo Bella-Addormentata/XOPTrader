@@ -230,6 +230,12 @@ struct LiquidityConfig {
     /// Default: [60, 200, 500, 1000] bps  (strategy doc Section 11 example).
     std::vector<double> tier_spacing_bps{60.0, 200.0, 500.0, 1000.0};
 
+    /// Optional separate tier spacing for Bid and Ask sides.
+    /// When non-empty, build_raw_ladder uses tier_spacing_bps_bid for Bids
+    /// and tier_spacing_bps_ask for Asks; otherwise falls back to tier_spacing_bps.
+    std::vector<double> tier_spacing_bps_bid;
+    std::vector<double> tier_spacing_bps_ask;
+
     /// Fraction of allocated capital (bids) or inventory (asks) placed at
     /// each tier.  Length must equal num_tiers.  Values should sum to ~1.0.
     /// Default: [0.30, 0.25, 0.25, 0.20].

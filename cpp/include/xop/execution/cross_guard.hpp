@@ -3,17 +3,19 @@
 // ---------------------------------------------------------------------------
 // cross_guard.hpp -- the pre-post crossing predicate, both versions of it.
 //
-// [CROSSGUARD 2026-09-01] SHADOW ONLY. Nothing here changes what is
-// suppressed. Step 8 still suppresses on the published-mid verdict exactly
-// as it has since 2026-04-12; the BBO verdict is computed alongside it and
-// only the DISAGREEMENT is logged. Measure first.
+// [CROSSGUARD 2026-09-03] PROMOTED TO ACTIVE DECISION (S33 RESOLVED).
+// Step 8 evaluates classify_cross_bbo to ensure offers do not cross opposite-side
+// BBO (bids >= best_ask, asks <= best_bid), aligning pre-post suppression with
+// OfferManager::classify_tier_staleness. On wide or asymmetric order books,
+// this allows valid non-crossing quotes to be posted rather than erroneously
+// suppressing all asks below the published midpoint.
 //
 // WHY BOTH EXIST
 // --------------
-// Step 8's crossed-mid guard drops a bid above the PUBLISHED MID and an ask
-// below it. Its stated purpose is to pre-empt the canceller: an offer that
-// crosses gets cancelled next cycle by classify_tier_staleness, wasting the
-// fee and carrying one block of adverse selection.
+// Step 8's legacy crossed-mid guard dropped a bid above the PUBLISHED MID and
+// an ask below it. Its stated purpose was to pre-empt the canceller: an offer
+// that crosses gets cancelled next cycle by classify_tier_staleness, wasting
+// the fee and carrying one block of adverse selection.
 //
 // It was a bit-exact predictor of that canceller when it was written, in
 // 4d3f30d (2026-04-12), because the canceller then used the model mid too.
@@ -24,33 +26,9 @@
 //      between mid and best_ask is a valid competitive bid, not a crossed
 //      offer."
 //
-// git log -L over the guard returns 4d3f30d alone: it has never been
-// modified. So for about four and a half months the guard has been strictly
-// STRICTER than the thing it claims to pre-empt. On an uncrossed book
-// best_bid <= mid <= best_ask, so it removes every ask in (best_bid, mid]
-// and every bid in [mid, best_ask) that the canceller would call Fresh --
-// which is precisely the profitable half-spread on each side.
-//
-// The divergence got worse, not better: since 2026-08-01 the ladder centre
-// is a fair-value blend that deliberately leaves the published mid behind
-// (measured p50 99 bps, p99 737 bps on XCH/DBX), so the tier prices the
-// guard judges are no longer in the same price frame as its reference.
-//
-// WHY THIS IS A SHADOW AND NOT A FIX
-// ----------------------------------
-// Because the numbers say there is nothing to recover and everything to
-// risk. The guard is INERT on the only enabled pair: zero firings across
-// six live log rotations, one firing in the entire retained corpus
-// (2026-08-19, one bid tier). Every pair with material guard activity is
-// enabled:false. And every "would have suppressed" figure available today
-// is a RECONSTRUCTION from persisted ladders, not an observation -- the
-// guard has never been instrumented.
-//
-// Meanwhile a change in this exact Step 8 family shipped a regression
-// through four review rounds and a thousand green tests, because nothing in
-// cpp/tests constructs an Engine. So: extract the predicate, pin it, count
-// the disagreement in production, and decide from data rather than from a
-// reading. If the counter stays at zero the question answers itself.
+// In PR #148 / S33, classify_cross_bbo was promoted to the active gate in
+// Step 8, with classify_cross_published_mid retained as a fallback and
+// for regression testing.
 //
 // Pure header, no engine types, so both predicates are driven directly by
 // cpp/tests/test_cross_guard.cpp.

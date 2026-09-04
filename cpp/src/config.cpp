@@ -808,6 +808,90 @@ std::vector<PairConfig> parse_pairs(const YAML::Node& root)
         read_dev_override("bbo_sanity_max_passive_dev_override",
                           p.bbo_sanity_max_passive_dev_override);
 
+        if (item["competitive_anchor_enabled_override"]
+            && item["competitive_anchor_enabled_override"].IsDefined()
+            && !item["competitive_anchor_enabled_override"].IsNull()) {
+            p.competitive_anchor_enabled_override =
+                item["competitive_anchor_enabled_override"].as<bool>();
+        }
+        if (item["competitive_anchor_max_distance_bps_override"]
+            && item["competitive_anchor_max_distance_bps_override"].IsDefined()
+            && !item["competitive_anchor_max_distance_bps_override"].IsNull()) {
+            double v = item["competitive_anchor_max_distance_bps_override"].as<double>();
+            if (!(v > 0.0)) {
+                throw ConfigError(idx + ".competitive_anchor_max_distance_bps_override must be > 0; got "
+                                  + std::to_string(v));
+            }
+            p.competitive_anchor_max_distance_bps_override = v;
+        }
+        if (item["competitive_anchor_stride_bps_override"]
+            && item["competitive_anchor_stride_bps_override"].IsDefined()
+            && !item["competitive_anchor_stride_bps_override"].IsNull()) {
+            double v = item["competitive_anchor_stride_bps_override"].as<double>();
+            if (!(v > 0.0)) {
+                throw ConfigError(idx + ".competitive_anchor_stride_bps_override must be > 0; got "
+                                  + std::to_string(v));
+            }
+            p.competitive_anchor_stride_bps_override = v;
+        }
+        if (item["fair_value_residual_widen_ratio_override"]
+            && item["fair_value_residual_widen_ratio_override"].IsDefined()
+            && !item["fair_value_residual_widen_ratio_override"].IsNull()) {
+            double v = item["fair_value_residual_widen_ratio_override"].as<double>();
+            if (v < 0.0) {
+                throw ConfigError(idx + ".fair_value_residual_widen_ratio_override must be >= 0; got "
+                                  + std::to_string(v));
+            }
+            p.fair_value_residual_widen_ratio_override = v;
+        }
+        if (item["activity_adaptive_spacing_override"]
+            && item["activity_adaptive_spacing_override"].IsDefined()
+            && !item["activity_adaptive_spacing_override"].IsNull()) {
+            p.activity_adaptive_spacing_override = item["activity_adaptive_spacing_override"].as<bool>();
+        }
+        if (item["activity_target_fills_24h_override"]
+            && item["activity_target_fills_24h_override"].IsDefined()
+            && !item["activity_target_fills_24h_override"].IsNull()) {
+            int v = item["activity_target_fills_24h_override"].as<int>();
+            if (v <= 0) {
+                throw ConfigError(idx + ".activity_target_fills_24h_override must be > 0; got " + std::to_string(v));
+            }
+            p.activity_target_fills_24h_override = v;
+        }
+        if (item["activity_book_weight_override"]
+            && item["activity_book_weight_override"].IsDefined()
+            && !item["activity_book_weight_override"].IsNull()) {
+            double v = item["activity_book_weight_override"].as<double>();
+            if (v < 0.0) {
+                throw ConfigError(idx + ".activity_book_weight_override must be >= 0; got " + std::to_string(v));
+            }
+            p.activity_book_weight_override = v;
+        }
+        if (item["min_profit_margin_max_bps_override"]
+            && item["min_profit_margin_max_bps_override"].IsDefined()
+            && !item["min_profit_margin_max_bps_override"].IsNull()) {
+            double v = item["min_profit_margin_max_bps_override"].as<double>();
+            if (v <= 0.0) {
+                throw ConfigError(idx + ".min_profit_margin_max_bps_override must be > 0; got " + std::to_string(v));
+            }
+            p.min_profit_margin_max_bps_override = v;
+        }
+        if (item["tier_spacing_max_bps_override"]
+            && item["tier_spacing_max_bps_override"].IsSequence()
+            && item["tier_spacing_max_bps_override"].size() > 0) {
+            std::vector<double> ts;
+            ts.reserve(item["tier_spacing_max_bps_override"].size());
+            for (std::size_t j = 0; j < item["tier_spacing_max_bps_override"].size(); ++j) {
+                double v = item["tier_spacing_max_bps_override"][j].as<double>();
+                if (!(v > 0.0)) {
+                    throw ConfigError(idx + ".tier_spacing_max_bps_override[" + std::to_string(j)
+                                      + "] must be > 0; got " + std::to_string(v));
+                }
+                ts.push_back(v);
+            }
+            p.tier_spacing_max_bps_override = std::move(ts);
+        }
+
         if (item["min_offer_size_units_override"]
             && item["min_offer_size_units_override"].IsDefined()
             && !item["min_offer_size_units_override"].IsNull()) {
@@ -1015,6 +1099,28 @@ StrategyConfig parse_strategy(const YAML::Node& root)
                      cfg.published_mid_band_floor_bps);
     opt_non_negative("published_mid_band_spread_frac",
                      cfg.published_mid_band_spread_frac);
+
+    if (node["activity_adaptive_spacing"] && node["activity_adaptive_spacing"].IsDefined()
+        && !node["activity_adaptive_spacing"].IsNull()) {
+        cfg.activity_adaptive_spacing = node["activity_adaptive_spacing"].as<bool>();
+    }
+    if (node["activity_target_fills_24h"] && node["activity_target_fills_24h"].IsDefined()
+        && !node["activity_target_fills_24h"].IsNull()) {
+        int v = node["activity_target_fills_24h"].as<int>();
+        if (v <= 0) {
+            throw ConfigError(sec + ".activity_target_fills_24h must be > 0; got " + std::to_string(v));
+        }
+        cfg.activity_target_fills_24h = v;
+    }
+    opt_non_negative("activity_book_weight", cfg.activity_book_weight);
+    if (node["activity_lookback_blocks"] && node["activity_lookback_blocks"].IsDefined()
+        && !node["activity_lookback_blocks"].IsNull()) {
+        int v = node["activity_lookback_blocks"].as<int>();
+        if (v <= 0) {
+            throw ConfigError(sec + ".activity_lookback_blocks must be > 0; got " + std::to_string(v));
+        }
+        cfg.activity_lookback_blocks = static_cast<std::uint32_t>(v);
+    }
 
     // The blend interpolates ACROSS [narrow, wide]; an inverted or empty band
     // has no interior and would silently collapse into a step function, which

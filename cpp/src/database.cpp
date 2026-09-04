@@ -415,6 +415,13 @@ GROUP BY tier
 ORDER BY tier ASC;
 )SQL";
 
+constexpr const char* kTradeCountsBySideSinceBlock = R"SQL(
+SELECT LOWER(side), COUNT(*)
+FROM trade_log
+WHERE pair_name = ? AND block_height >= ?
+GROUP BY LOWER(side);
+)SQL";
+
 } // anonymous namespace
 
 // ===========================================================================
@@ -462,6 +469,7 @@ Database::Database(const std::string& db_path)
     stmt_snapshot_count_     = prepare(kSnapshotCount);
     stmt_fill_rate_          = prepare(kFillRateSinceBlock);
     stmt_tier_fill_rates_    = prepare(kTierFillRates);
+    stmt_trade_counts_by_side_ = prepare(kTradeCountsBySideSinceBlock);
     stmt_insert_strategy_quote_ = prepare(kInsertStrategyQuote);
     stmt_insert_sanity_failure_ = prepare(kInsertSanityFailure);
 
@@ -491,6 +499,7 @@ Database::~Database()
     finalize(stmt_snapshot_count_);
     finalize(stmt_fill_rate_);
     finalize(stmt_tier_fill_rates_);
+    finalize(stmt_trade_counts_by_side_);
     finalize(stmt_insert_strategy_quote_);
     finalize(stmt_begin_);
     finalize(stmt_commit_);
@@ -1523,6 +1532,32 @@ std::vector<double> Database::query_tier_fill_rates(
     sqlite3_clear_bindings(stmt_tier_fill_rates_);
 
     return rates;
+}
+
+std::pair<int, int> Database::query_trade_counts_by_side(
+    const std::string& pair_name,
+    BlockHeight since_block) const
+{
+    std::lock_guard<std::mutex> lock(mtx_);
+    bind_text(stmt_trade_counts_by_side_, 1, pair_name);
+    bind_int64(stmt_trade_counts_by_side_, 2, static_cast<std::int64_t>(since_block));
+
+    int bids = 0;
+    int asks = 0;
+    while (sqlite3_step(stmt_trade_counts_by_side_) == SQLITE_ROW) {
+        const unsigned char* side_text = sqlite3_column_text(stmt_trade_counts_by_side_, 0);
+        int count = sqlite3_column_int(stmt_trade_counts_by_side_, 1);
+        if (side_text) {
+            std::string s(reinterpret_cast<const char*>(side_text));
+            if (s == "bid") bids = count;
+            else if (s == "ask") asks = count;
+        }
+    }
+
+    sqlite3_reset(stmt_trade_counts_by_side_);
+    sqlite3_clear_bindings(stmt_trade_counts_by_side_);
+
+    return {bids, asks};
 }
 
 bool Database::is_open() const noexcept

@@ -1411,6 +1411,7 @@ private:
     /// debounce streak, so one transient false read (a flaky wallet RPC
     /// corrupting an equity computation) cannot re-arm it mid-episode.
     int breaker_lift_streak_{0};
+    int window_loss_recover_streak_{0};
 
     /// [S17 2026-08-23] Last depeg status logged per pair, so Step 3 logs
     /// transitions at full severity and ongoing states at debug.

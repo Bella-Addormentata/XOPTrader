@@ -464,10 +464,10 @@ Engine::Engine(const AppConfig& config, bool dry_run)
         liq_cfg.max_gap_scan_bps   = config_.strategy.max_gap_scan_bps;
         liq_cfg.gap_blend_factor   = config_.strategy.gap_blend_factor;
 
-        // Competitive anchor pricing.
-        liq_cfg.competitive_anchor_enabled           = config_.strategy.competitive_anchor_enabled;
-        liq_cfg.competitive_anchor_max_distance_bps  = config_.strategy.competitive_anchor_max_distance_bps;
-        liq_cfg.competitive_anchor_stride_bps        = config_.strategy.competitive_anchor_stride_bps;
+        // Competitive anchor pricing (per-pair override takes precedence).
+        liq_cfg.competitive_anchor_enabled           = pair.competitive_anchor_enabled_override.value_or(config_.strategy.competitive_anchor_enabled);
+        liq_cfg.competitive_anchor_max_distance_bps  = pair.competitive_anchor_max_distance_bps_override.value_or(config_.strategy.competitive_anchor_max_distance_bps);
+        liq_cfg.competitive_anchor_stride_bps        = pair.competitive_anchor_stride_bps_override.value_or(config_.strategy.competitive_anchor_stride_bps);
 
         // Adverse-selection-aware tier sizing.
         liq_cfg.adverse_selection_sizing           = config_.strategy.adverse_selection_sizing;
@@ -7701,6 +7701,89 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
         // Query per-tier fill rates from the offer log for adaptive sizing.
         LiquidityConfig ladder_cfg = liq.config();
 
+        // 24-hour activity-adaptive margin and spacing scaling
+        const bool activity_adaptive = pair_cfg
+            ? pair_cfg->activity_adaptive_spacing_override.value_or(config_.strategy.activity_adaptive_spacing)
+            : config_.strategy.activity_adaptive_spacing;
+
+        double effective_bid_margin_bps = pair_cfg
+            ? pair_cfg->min_profit_margin_bps_override.value_or(config_.strategy.min_profit_margin_bps)
+            : config_.strategy.min_profit_margin_bps;
+        double effective_ask_margin_bps = effective_bid_margin_bps;
+
+        if (activity_adaptive) {
+            int bids_24h = 0;
+            int asks_24h = 0;
+            if (db_) {
+                const std::uint32_t lookback = config_.strategy.activity_lookback_blocks;
+                const BlockHeight since_block = (block_height > lookback) ? (block_height - lookback) : BlockHeight{0};
+                std::tie(bids_24h, asks_24h) = db_->query_trade_counts_by_side(pair_name, since_block);
+            }
+
+            std::size_t book_bids = 0;
+            std::size_t book_asks = 0;
+            for (const auto& co : comp_offers) {
+                if (co.side == Side::Bid) ++book_bids;
+                else if (co.side == Side::Ask) ++book_asks;
+            }
+
+            const double book_weight = pair_cfg
+                ? pair_cfg->activity_book_weight_override.value_or(config_.strategy.activity_book_weight)
+                : config_.strategy.activity_book_weight;
+
+            const double eff_bids = static_cast<double>(bids_24h) + book_weight * static_cast<double>(book_bids);
+            const double eff_asks = static_cast<double>(asks_24h) + book_weight * static_cast<double>(book_asks);
+
+            const int target_fills = pair_cfg
+                ? pair_cfg->activity_target_fills_24h_override.value_or(config_.strategy.activity_target_fills_24h)
+                : config_.strategy.activity_target_fills_24h;
+            const double target_d = std::max(1.0, static_cast<double>(target_fills));
+
+            const double alpha_bid = std::clamp(eff_bids / target_d, 0.0, 1.0);
+            const double alpha_ask = std::clamp(eff_asks / target_d, 0.0, 1.0);
+
+            // Margin interpolation: at 0 fills -> max_margin; at >= target fills -> min_margin
+            const double min_margin = effective_bid_margin_bps;
+            const double max_margin = (pair_cfg && pair_cfg->min_profit_margin_max_bps_override.has_value())
+                ? pair_cfg->min_profit_margin_max_bps_override.value()
+                : std::max(min_margin, min_margin * 2.0);
+
+            // CROSS-SIDE REPLENISHMENT COUPLING:
+            // When bids fill (buying base asset), we are actively replenishing inventory,
+            // so the ASK margin and spacing can safely tighten to sell (driven by alpha_bid).
+            // When asks fill (selling base asset), we are actively accumulating quote asset,
+            // so the BID margin and spacing can safely tighten to buy (driven by alpha_ask).
+            // Conversely, when there are very few bid fills (alpha_bid is low), we are not
+            // replenishing base inventory, so ASK margin/gap expands (to max_margin/max_spacing)
+            // to demand a higher liquidity premium and protect inventory.
+            effective_bid_margin_bps = max_margin - alpha_ask * (max_margin - min_margin);
+            effective_ask_margin_bps = max_margin - alpha_bid * (max_margin - min_margin);
+
+            // Spacing interpolation: at 0 fills -> max_spacing; at >= target fills -> min_spacing
+            const auto& min_spacings = ladder_cfg.tier_spacing_bps;
+            const auto& max_spacings = (pair_cfg && pair_cfg->tier_spacing_max_bps_override.has_value())
+                ? pair_cfg->tier_spacing_max_bps_override.value()
+                : min_spacings;
+
+            ladder_cfg.tier_spacing_bps_bid.resize(ladder_cfg.num_tiers);
+            ladder_cfg.tier_spacing_bps_ask.resize(ladder_cfg.num_tiers);
+
+            for (std::size_t i = 0; i < ladder_cfg.num_tiers; ++i) {
+                const double min_s = (i < min_spacings.size()) ? min_spacings[i] : (100.0 * (i + 1));
+                const double max_s = (i < max_spacings.size()) ? max_spacings[i] : min_s;
+                ladder_cfg.tier_spacing_bps_bid[i] = max_s - alpha_ask * (max_s - min_s);
+                ladder_cfg.tier_spacing_bps_ask[i] = max_s - alpha_bid * (max_s - min_s);
+            }
+
+            spdlog::info("[Engine] Step 7: {} cross-side activity: bids={:.1f} (24h_fills={} book={}), asks={:.1f} (24h_fills={} book={}) "
+                         "-> alpha_bid={:.1f}%, alpha_ask={:.1f}%, bid_margin={:.0f}bps, ask_margin={:.0f}bps, bid_spacing_0={:.0f}bps, ask_spacing_0={:.0f}bps",
+                         pair_name, eff_bids, bids_24h, book_bids, eff_asks, asks_24h, book_asks,
+                         alpha_bid * 100.0, alpha_ask * 100.0,
+                         effective_bid_margin_bps, effective_ask_margin_bps,
+                         ladder_cfg.tier_spacing_bps_bid.empty() ? 0.0 : ladder_cfg.tier_spacing_bps_bid.front(),
+                         ladder_cfg.tier_spacing_bps_ask.empty() ? 0.0 : ladder_cfg.tier_spacing_bps_ask.front());
+        }
+
         // Shift the whole spacing schedule outward (preserving inter-tier
         // gaps, so the ladder keeps its shape and tiers stay distinct) when
         // the innermost tier sits inside the minimum half-spread.
@@ -7710,6 +7793,8 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
             const double delta = quote_min_half_spread_bps
                                - ladder_cfg.tier_spacing_bps.front();
             for (double& s : ladder_cfg.tier_spacing_bps) s += delta;
+            for (double& s : ladder_cfg.tier_spacing_bps_bid) s += delta;
+            for (double& s : ladder_cfg.tier_spacing_bps_ask) s += delta;
             spdlog::info("[Engine] Step 7: {} sigma width floor: tier "
                          "spacing shifted +{:.0f}bps (min_half_spread="
                          "{:.0f}bps, combined_sigma={:.0f}bps, k={:.2f})",
@@ -7844,7 +7929,7 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
         // mid.  This prevents TibetSwap (0.7% fee) or other AMMs from
         // profitably arbitraging our offers.
         // -----------------------------------------------------------------
-        if (!comp_offers.empty() && mid_mojos > 0) {
+        if (ladder_cfg.competitive_anchor_enabled && !comp_offers.empty() && mid_mojos > 0) {
             // Separate competing offers by side, retaining size for
             // wall detection, and sort by quality.
             struct PricedOffer { Mojo price; Mojo size; };
@@ -8217,26 +8302,75 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
             int clamped_bids = 0;
             int clamped_asks = 0;
 
-            for (auto& tq : pcs.ladder) {
-                if (tq.side == Side::Bid && snap.best_ask > 0) {
-                    if (tq.price > snap.best_ask) {
+            const double step_bps = std::max(
+                50.0, config_.strategy.fair_value_clamp_tier_step_bps);
+            const double ask_margin_bps = std::max(step_bps, effective_ask_margin_bps);
+            const double bid_margin_bps = std::max(step_bps, effective_bid_margin_bps);
+
+            auto tiers_in_order = [&](Side side) {
+                std::vector<TierQuote*> out;
+                out.reserve(pcs.ladder.size());
+                for (auto& tq : pcs.ladder) {
+                    if (tq.side == side) out.push_back(&tq);
+                }
+                std::sort(out.begin(), out.end(),
+                          [](const TierQuote* a, const TierQuote* b) {
+                              return a->tier_index < b->tier_index;
+                          });
+                return out;
+            };
+            auto resync_spread = [&](TierQuote& tq) {
+                if (mid_mojos > 0) {
+                    tq.spread_bps =
+                        (static_cast<double>(tq.price)
+                       - static_cast<double>(mid_mojos))
+                        / static_cast<double>(mid_mojos) * 10'000.0;
+                }
+            };
+
+            // Bids: clamp down below snap.best_ask, stepping down for successive tiers
+            if (snap.best_ask > 0) {
+                Mojo next_max = static_cast<Mojo>(std::llround(
+                    static_cast<double>(snap.best_ask)
+                    * (1.0 - bid_margin_bps / 10'000.0)));
+                for (TierQuote* tqp : tiers_in_order(Side::Bid)) {
+                    TierQuote& tq = *tqp;
+                    if (tq.price > next_max) {
                         spdlog::info("[Engine] Step 7: {} BID tier {} clamped "
                                      "{} -> {} (dex best ask)",
                                      pair_name, tq.tier_index,
-                                     tq.price, snap.best_ask);
-                        tq.price = snap.best_ask;
+                                     tq.price, next_max);
+                        tq.price = next_max;
+                        resync_spread(tq);
                         ++clamped_bids;
                     }
+                    next_max = std::min(next_max, tq.price);
+                    next_max = static_cast<Mojo>(std::llround(
+                        static_cast<double>(next_max)
+                        * (1.0 - step_bps / 10'000.0)));
                 }
-                if (tq.side == Side::Ask && snap.best_bid > 0) {
-                    if (tq.price < snap.best_bid) {
+            }
+
+            // Asks: clamp up above snap.best_bid, stepping up for successive tiers
+            if (snap.best_bid > 0) {
+                Mojo next_min = static_cast<Mojo>(std::llround(
+                    static_cast<double>(snap.best_bid)
+                    * (1.0 + ask_margin_bps / 10'000.0)));
+                for (TierQuote* tqp : tiers_in_order(Side::Ask)) {
+                    TierQuote& tq = *tqp;
+                    if (tq.price < next_min) {
                         spdlog::info("[Engine] Step 7: {} ASK tier {} clamped "
                                      "{} -> {} (dex best bid)",
                                      pair_name, tq.tier_index,
-                                     tq.price, snap.best_bid);
-                        tq.price = snap.best_bid;
+                                     tq.price, next_min);
+                        tq.price = next_min;
+                        resync_spread(tq);
                         ++clamped_asks;
                     }
+                    next_min = std::max(next_min, tq.price);
+                    next_min = static_cast<Mojo>(std::llround(
+                        static_cast<double>(next_min)
+                        * (1.0 + step_bps / 10'000.0)));
                 }
             }
 
@@ -8300,8 +8434,12 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
             // they disagree -- which is why it survives an Unavailable tier.
             const auto residual_opt =
                 market_data_->get_fair_value_residual_bps(pair_name);
+            const PairConfig* rpc = find_pair_config(pair_name);
+            const double widen_ratio = (rpc && rpc->fair_value_residual_widen_ratio_override.has_value())
+                ? rpc->fair_value_residual_widen_ratio_override.value()
+                : config_.strategy.fair_value_residual_widen_ratio;
             if (residual_opt && mid_mojos > 0 && !pcs.ladder.empty()
-                && config_.strategy.fair_value_residual_widen_ratio > 0.0)
+                && widen_ratio > 0.0)
             {
                 const double excess =
                     std::abs(*residual_opt)
@@ -8309,7 +8447,7 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                 if (excess > 0.0) {
                     const double extra_bps =
                         excess
-                        * config_.strategy.fair_value_residual_widen_ratio;
+                        * widen_ratio;
                     // Cap the added width at the pair's own half-spread
                     // ceiling -- the same cap Step 5 applies, honouring any
                     // per-pair override -- so a runaway residual cannot push
@@ -8317,12 +8455,9 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                     // books disagree with the graph on 96% of heartbeats and
                     // the raw widening would exceed this cap most of the time;
                     // the cap is what keeps that from becoming a withdrawal.
-                    const double residual_cap = [&]() -> double {
-                        const PairConfig* rpc = find_pair_config(pair_name);
-                        if (rpc && rpc->max_half_spread_bps_override.has_value())
-                            return rpc->max_half_spread_bps_override.value();
-                        return config_.strategy.max_half_spread_bps;
-                    }();
+                    const double residual_cap = (rpc && rpc->max_half_spread_bps_override.has_value())
+                        ? rpc->max_half_spread_bps_override.value()
+                        : config_.strategy.max_half_spread_bps;
                     const double capped = std::min(extra_bps, residual_cap);
 
                     for (auto& tq : pcs.ladder) {
@@ -9653,13 +9788,18 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             }
         }
 
+        const PairConfig* cur_pc = find_pair_config(pair_name);
+        const bool anchor_active = cur_pc
+            ? cur_pc->competitive_anchor_enabled_override.value_or(config_.strategy.competitive_anchor_enabled)
+            : config_.strategy.competitive_anchor_enabled;
+
         auto tier_classes = offer_mgr_->classify_tier_staleness(
             pair_name, pcs.ladder, block_height,
             config_.strategy.offer_ttl_blocks,
             static_cast<Mojo>(std::llround(
                 market_data_->get_mid_price(pair_name)
                 * static_cast<double>(kMojosPerXch))),
-            config_.strategy.competitive_anchor_enabled,
+            anchor_active,
             can_bid_rebalance,
             can_ask_rebalance);
 
@@ -10372,13 +10512,28 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             }
         }
 
-        // All tiers fresh and nothing was cancelled -> no repost needed.
-        // (The early-continue was removed so balance gates can free capital
-        //  when both sides are suppressed, but when at least one side is
-        //  active, existing fresh offers are kept as-is.)
+        // All tiers fresh and nothing was cancelled -> no repost needed, UNLESS
+        // there are brand-new tiers in the ladder that were not previously pending.
         if (has_pending && cancelled_ids.empty()
             && stale_count == 0 && expired_count == 0) {
-            continue;
+            bool has_unposted = false;
+            std::unordered_set<std::string> pending_keys;
+            for (const auto& tc : tier_classes) {
+                pending_keys.insert(
+                    std::to_string(static_cast<int>(tc.side))
+                    + "_" + std::to_string(tc.tier_index));
+            }
+            for (const auto& tq : pcs.ladder) {
+                std::string key = std::to_string(static_cast<int>(tq.side))
+                                + "_" + std::to_string(tq.tier_index);
+                if (pending_keys.count(key) == 0) {
+                    has_unposted = true;
+                    break;
+                }
+            }
+            if (!has_unposted) {
+                continue;
+            }
         }
 
         // -- XCH fee reserve gate (pre-creation, UTXO-aware) ---------------
@@ -10888,6 +11043,10 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             // reconstruction rather than an observation, and a change in this
             // family already shipped a regression through four review rounds.
             // So: count first, decide from data.
+            // [S33 2026-09-03] BBO CROSSING GUARD.
+            // Evaluates whether a tier crosses the current BBO (best_bid for asks,
+            // best_ask for bids) or fallback mid buffer when no BBO exists,
+            // matching classify_tier_staleness.
             const auto book_snap_cg = state_->get_market(pair_name);
             const double cg_bid = static_cast<double>(book_snap_cg.best_bid);
             const double cg_ask = static_cast<double>(book_snap_cg.best_ask);
@@ -10896,70 +11055,41 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             std::vector<TierQuote> mid_safe;
             mid_safe.reserve(fee_filtered_tiers.size());
             std::size_t suppressed_count = 0;
-            std::size_t shadow_would_keep = 0;   // we drop, canceller would not
-            std::size_t shadow_would_drop = 0;   // we keep, canceller would drop
-            std::size_t shadow_indeterminate = 0;
-            bool        shadow_inverted = false;
-            bool        shadow_mid_fallback = false;
 
             for (const auto& tier : fee_filtered_tiers) {
                 const bool is_ask = (tier.side != Side::Bid);
                 const double px   = static_cast<double>(tier.price);
 
-                const auto live = execution::classify_cross_published_mid(
-                    is_ask, px, cg_mid);
-                const auto shadow = execution::classify_cross_bbo(
+                const auto bbo_check = execution::classify_cross_bbo(
                     is_ask, px, cg_bid, cg_ask, cg_mid);
-                shadow_inverted     |= shadow.book_inverted;
-                shadow_mid_fallback |= shadow.used_mid_fallback;
 
-                const bool live_crossed =
-                    (live == execution::CrossVerdict::Crossed);
-                if (shadow.verdict == execution::CrossVerdict::Indeterminate) {
-                    ++shadow_indeterminate;
-                } else {
-                    const bool shadow_crossed =
-                        (shadow.verdict == execution::CrossVerdict::Crossed);
-                    if (live_crossed && !shadow_crossed) ++shadow_would_keep;
-                    if (!live_crossed && shadow_crossed) ++shadow_would_drop;
-                }
+                const bool is_crossed =
+                    (bbo_check.verdict == execution::CrossVerdict::Crossed);
 
-                // SUPPRESSION IS THE LIVE VERDICT, UNCHANGED.
-                if (live_crossed) {
-                    spdlog::info("[Engine] Step 8: {} {} tier {} suppressed "
-                                 "-- price {} vs mid {} (crossed)",
-                                 pair_name, is_ask ? "ask" : "bid",
-                                 tier.tier_index, tier.price, mid);
+                if (is_crossed) {
+                    if (bbo_check.used_mid_fallback) {
+                        spdlog::info("[Engine] Step 8: {} {} tier {} suppressed "
+                                     "-- price {} crosses fallback mid band ({:.6f})",
+                                     pair_name, is_ask ? "ask" : "bid",
+                                     tier.tier_index, tier.price,
+                                     cg_mid);
+                    } else {
+                        spdlog::info("[Engine] Step 8: {} {} tier {} suppressed "
+                                     "-- price {} crosses BBO ({}/{})",
+                                     pair_name, is_ask ? "ask" : "bid",
+                                     tier.tier_index, tier.price,
+                                     book_snap_cg.best_bid, book_snap_cg.best_ask);
+                    }
                     ++suppressed_count;
                     continue;
                 }
                 mid_safe.push_back(tier);
             }
             if (suppressed_count > 0) {
-                spdlog::warn("[Engine] Step 8: {} crossed-mid guard removed "
+                spdlog::warn("[Engine] Step 8: {} BBO crossing guard removed "
                              "{}/{} tiers",
                              pair_name, suppressed_count,
                              fee_filtered_tiers.size());
-            }
-            if (shadow_would_keep > 0 || shadow_would_drop > 0) {
-                // The number this shadow exists to produce. If it stays at
-                // zero the question answers itself and the guard can be left
-                // alone; if it does not, this line is the evidence a fix
-                // would be built on.
-                spdlog::warn("[Engine] Step 8: {} [CROSSGUARD-SHADOW] "
-                             "published-mid and BBO verdicts disagree on "
-                             "{} tier(s) we dropped and {} we kept "
-                             "(mid={}, bbo={}/{}{}{}) -- suppression "
-                             "unchanged, this is measurement only",
-                             pair_name, shadow_would_keep, shadow_would_drop,
-                             mid, book_snap_cg.best_bid, book_snap_cg.best_ask,
-                             shadow_inverted ? ", BOOK INVERTED" : "",
-                             shadow_mid_fallback ? ", mid-fallback" : "");
-            }
-            if (shadow_indeterminate > 0) {
-                spdlog::debug("[Engine] Step 8: {} [CROSSGUARD-SHADOW] "
-                              "{} tier(s) had no usable reference",
-                              pair_name, shadow_indeterminate);
             }
             fee_filtered_tiers = std::move(mid_safe);
         }
@@ -11345,6 +11475,22 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 const int queue_ahead_score = score_queue_position(
                     queue_ahead_mojos,
                     tier.size);
+
+                const bool pair_comp_anchor_enabled = pair_cfg_comp
+                    ? pair_cfg_comp->competitive_anchor_enabled_override.value_or(config_.strategy.competitive_anchor_enabled)
+                    : config_.strategy.competitive_anchor_enabled;
+
+                if (!pair_comp_anchor_enabled) {
+                    spdlog::debug(
+                        "[Engine] Step 8: {} {} tier {} kept at wide spread -- "
+                        "competitiveness waived (competitive anchor disabled)",
+                        pair_name,
+                        (tier.side == Side::Bid ? "bid" : "ask"),
+                        tier.tier_index);
+                    competitive_tiers.push_back(tier);
+                    continue;
+                }
+
                 if (score >= kMinCompetitivenessScore) {
                     competitive_tiers.push_back(tier);
                     continue;
@@ -11485,6 +11631,56 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             continue;
         }
 
+        // [T5-01] Selective refresh filter: when we did a selective cancel
+        // (some tiers were Fresh and left live), only post replacements for
+        // the tiers that were actually cancelled.  Posting duplicates of
+        // Fresh tiers would create double-exposure at the same price level.
+        // Also include tiers that have no pending offer at all (brand new unposted tiers).
+        // This runs BEFORE the pending exposure projection below so that existing
+        // live fresh offers (already in pair_*_pending_spend) are not double-counted
+        // as new planned spend.
+        if (has_pending && fresh_count > 0) {
+            // Build a set of (side, tier_index) keys for cancelled tiers.
+            std::unordered_set<std::string> cancelled_keys;
+            for (const auto& tc : tier_classes) {
+                if (tc.staleness != execution::TierStaleness::Fresh) {
+                    cancelled_keys.insert(
+                        std::to_string(static_cast<int>(tc.side))
+                        + "_" + std::to_string(tc.tier_index));
+                }
+            }
+            // Also include tiers that have no pending offer at all
+            // (brand new tiers that weren't in the previous ladder).
+            std::unordered_set<std::string> pending_keys;
+            for (const auto& tc : tier_classes) {
+                pending_keys.insert(
+                    std::to_string(static_cast<int>(tc.side))
+                    + "_" + std::to_string(tc.tier_index));
+            }
+
+            std::vector<TierQuote> selective_tiers;
+            for (const auto& tq : fee_filtered_tiers) {
+                std::string key = std::to_string(static_cast<int>(tq.side))
+                                + "_" + std::to_string(tq.tier_index);
+                if (cancelled_keys.count(key) > 0 ||
+                    pending_keys.count(key) == 0) {
+                    selective_tiers.push_back(tq);
+                }
+            }
+
+            if (selective_tiers.empty()) {
+                spdlog::debug("[Engine] Step 8: {} selective refresh has no "
+                              "tiers to repost (all fresh)", pair_name);
+                continue;
+            }
+
+            spdlog::info("[Engine] Step 8: {} selective refresh -- posting "
+                         "{}/{} replacement tiers",
+                         pair_name, selective_tiers.size(),
+                         fee_filtered_tiers.size());
+            fee_filtered_tiers = std::move(selective_tiers);
+        }
+
         // Pending exposure guard (pre-post projection): include currently
         // pending offers plus candidate new tiers and suppress any side that
         // would breach reserve if all accepted.
@@ -11596,52 +11792,6 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             spdlog::info("[Engine] Step 8: {} all tiers filtered by pending "
                          "exposure projection", pair_name);
             continue;
-        }
-
-        // [T5-01] Selective refresh filter: when we did a selective cancel
-        // (some tiers were Fresh and left live), only post replacements for
-        // the tiers that were actually cancelled.  Posting duplicates of
-        // Fresh tiers would create double-exposure at the same price level.
-        if (has_pending && fresh_count > 0 && !cancelled_ids.empty()) {
-            // Build a set of (side, tier_index) keys for cancelled tiers.
-            std::unordered_set<std::string> cancelled_keys;
-            for (const auto& tc : tier_classes) {
-                if (tc.staleness != execution::TierStaleness::Fresh) {
-                    cancelled_keys.insert(
-                        std::to_string(static_cast<int>(tc.side))
-                        + "_" + std::to_string(tc.tier_index));
-                }
-            }
-            // Also include tiers that have no pending offer at all
-            // (brand new tiers that weren't in the previous ladder).
-            std::unordered_set<std::string> pending_keys;
-            for (const auto& tc : tier_classes) {
-                pending_keys.insert(
-                    std::to_string(static_cast<int>(tc.side))
-                    + "_" + std::to_string(tc.tier_index));
-            }
-
-            std::vector<TierQuote> selective_tiers;
-            for (const auto& tq : fee_filtered_tiers) {
-                std::string key = std::to_string(static_cast<int>(tq.side))
-                                + "_" + std::to_string(tq.tier_index);
-                if (cancelled_keys.count(key) > 0 ||
-                    pending_keys.count(key) == 0) {
-                    selective_tiers.push_back(tq);
-                }
-            }
-
-            if (selective_tiers.empty()) {
-                spdlog::debug("[Engine] Step 8: {} selective refresh has no "
-                              "tiers to repost (all fresh)", pair_name);
-                continue;
-            }
-
-            spdlog::info("[Engine] Step 8: {} selective refresh -- posting "
-                         "{}/{} replacement tiers",
-                         pair_name, selective_tiers.size(),
-                         fee_filtered_tiers.size());
-            fee_filtered_tiers = std::move(selective_tiers);
         }
 
         // [T1-03] co_await post_quotes directly instead of use_future.
@@ -17204,7 +17354,27 @@ void Engine::step_update_pnl(BlockHeight block_height)
         // (see the S20 note in mark_to_market).  An earlier cut of this
         // branch gated without that change and would have injected the
         // very discontinuity it was meant to prevent.
-        [this](const std::string& pair, [[maybe_unused]] const std::string& asset) -> Mojo {
+        //
+        // [XCH-MTM-ISOLATION 2026-09-04] Base asset XCH is the global
+        // reserve currency of the wallet.  Its USD value is known
+        // authoritatively from CEX/anchors (usd_per_xch / asset_usd_pseudo_price).
+        // Deriving the whole wallet's XCH mark from an individual CAT pair's
+        // local DEX spread (e.g. wide BYC vs tight DBX) caused MTM
+        // hopping of -$9 to -$12 whenever an illiquid CAT book widened,
+        // tripping Step 13's rolling-window circuit breaker.
+        // When asset is "xch", normalize the price to the canonical USD rate.
+        [this](const std::string& pair, const std::string& asset) -> Mojo {
+            if (asset == "xch") {
+                const Mojo xch_usd = asset_usd_pseudo_price(AssetId{"xch"});
+                const PairConfig* pc = find_pair_config(pair);
+                if (xch_usd > 0 && pc) {
+                    const double f = quote_usd_factor(*pc);
+                    if (f > 0.0) {
+                        return static_cast<Mojo>(std::llround(
+                            static_cast<double>(xch_usd) / f));
+                    }
+                }
+            }
             auto snap = state_->get_market(pair);
             return snap.mid_valuation_grade ? snap.mid_price : 0;
         },
@@ -17871,25 +18041,30 @@ void Engine::step_check_alerts(BlockHeight block_height)
     // breach from re-alerting every block.
     if (config_.risk.max_window_loss_bps > 0.0) {
 
-        // 1. Append current snapshot.
-        pnl_window_usd_.push_back({block_height, total.total_pnl_usd});
+        if (drawdown_grace_remaining_ > 0) {
+            pnl_window_usd_.clear();
+            pnl_window_usd_.push_back({block_height, total.total_pnl_usd});
+        } else {
+            // 1. Append current snapshot.
+            pnl_window_usd_.push_back({block_height, total.total_pnl_usd});
 
-        // 2. Trim entries that fall outside the rolling window.
-        //    Entries are ordered by ascending block_height; pop from front.
-        //    We keep only entries whose age is strictly less than
-        //    loss_window_blocks (i.e., within the window).  An entry is
-        //    considered stale when block_height - entry_block >= window_size.
-        while (pnl_window_usd_.size() > 1) {
-            const BlockHeight oldest = pnl_window_usd_.front().first;
-            if (block_height - oldest >= config_.risk.loss_window_blocks) {
-                pnl_window_usd_.pop_front();
-            } else {
-                break;
+            // 2. Trim entries that fall outside the rolling window.
+            //    Entries are ordered by ascending block_height; pop from front.
+            //    We keep only entries whose age is strictly less than
+            //    loss_window_blocks (i.e., within the window).  An entry is
+            //    considered stale when block_height - entry_block >= window_size.
+            while (pnl_window_usd_.size() > 1) {
+                const BlockHeight oldest = pnl_window_usd_.front().first;
+                if (block_height - oldest >= config_.risk.loss_window_blocks) {
+                    pnl_window_usd_.pop_front();
+                } else {
+                    break;
+                }
             }
         }
 
         // 3. Compute window_loss (positive = PnL decreased over the window).
-        if (pnl_window_usd_.size() >= 2) {
+        if (pnl_window_usd_.size() >= 2 && drawdown_grace_remaining_ == 0) {
             const double window_start_pnl = pnl_window_usd_.front().second;
             const double window_loss_usd =
                 window_start_pnl - total.total_pnl_usd;
@@ -17905,6 +18080,11 @@ void Engine::step_check_alerts(BlockHeight block_height)
                 equity_usd, anchor_fallback_usd,
                 config_.risk.max_window_loss_bps);
 
+            const double dd = (peak_equity_hwm_usd_ > 0.0)
+                ? risk::equity_drawdown_frac(peak_equity_hwm_usd_, equity_usd)
+                : 0.0;
+            const bool equity_healthy = (dd < max_drawdown_frac_) && !unvaluable_now;
+
             // 4. Fire if window_loss exceeds the threshold.
             // [S20] Also ungated, for the same fail-open reason as the
             // drawdown comparison above: a loss detector that switches
@@ -17913,6 +18093,7 @@ void Engine::step_check_alerts(BlockHeight block_height)
             if (window_loss_usd > 0.0 && threshold_usd > 0.0
                     && window_loss_usd > threshold_usd) {
 
+                window_loss_recover_streak_ = 0;
                 const BlockHeight window_actual =
                     block_height - pnl_window_usd_.front().first;
 
@@ -17945,6 +18126,29 @@ void Engine::step_check_alerts(BlockHeight block_height)
                     spdlog::debug("[Engine] Step 13: rolling-window breach "
                                   "persists while latched (loss=${:.4f})",
                                   window_loss_usd);
+                }
+            } else if (breaker_pause_active_) {
+                // Auto-cooldown for rolling-window loss breaker:
+                // If equity is healthy and window loss has normalized (or is within threshold),
+                // streak up to clear the latch.
+                if (window_loss_usd <= threshold_usd && equity_healthy) {
+                    ++window_loss_recover_streak_;
+                    constexpr int kWindowLossRecoverStreak = 5;
+                    if (window_loss_recover_streak_ >= kWindowLossRecoverStreak) {
+                        breaker_pause_active_ = false;
+                        breaker_skip_warned_  = false;
+                        window_loss_recover_streak_ = 0;
+                        pnl_window_usd_.clear();
+                        state_->set_status(BotStatus::Running);
+                        spdlog::info("[Engine] Step 13: rolling-window loss normalized (loss=${:.4f} <= threshold=${:.4f}) "
+                                     "-- auto-resuming trading", window_loss_usd, threshold_usd);
+                        if (alerts_) {
+                            alerts_->send_alert(AlertRule::CircuitBreaker,
+                                "Rolling-window loss normalized -- engine auto-resumed trading");
+                        }
+                    }
+                } else {
+                    window_loss_recover_streak_ = 0;
                 }
             }
         }
@@ -19399,14 +19603,26 @@ void Engine::check_pause_flag()
         gui_pause_active_ = false;
         if (state_->status() == BotStatus::Paused) {
             if (breaker_pause_active_) {
-                // The breaker owns this pause.  Flipping the status to
-                // Running here while Step 8 stays gated would have the GUI
-                // report a trading engine that is not trading -- the exact
-                // inverse of the bypass this PR fixes.  Status stays Paused
-                // until the restart the breaker already requires.
-                spdlog::info("[Engine] Pause flag removed, but a risk "
-                             "breaker holds the pause -- status stays "
-                             "Paused until restart");
+                // The operator explicitly removed the pause flag (clicked Resume in GUI).
+                // If equity is not in catastrophic drawdown (> max_drawdown_frac),
+                // reset breaker_pause_active_ and clear the rolling-window loss deque so
+                // trading can resume immediately without requiring a full process restart.
+                const double equity_usd = compute_portfolio_equity_usd();
+                const double peak = (peak_equity_hwm_usd_ > 0.0) ? peak_equity_hwm_usd_ : equity_usd;
+                const double dd = risk::equity_drawdown_frac(peak, equity_usd);
+                if (dd < max_drawdown_frac_) {
+                    breaker_pause_active_ = false;
+                    breaker_lift_streak_  = 0;
+                    window_loss_recover_streak_ = 0;
+                    breaker_skip_warned_  = false;
+                    pnl_window_usd_.clear();
+                    state_->set_status(BotStatus::Running);
+                    spdlog::info("[Engine] Operator cleared pause flag -- resetting risk breaker latch and resuming trading (equity=${:.2f}, drawdown={:.1f}%)",
+                                 equity_usd, dd * 100.0);
+                } else {
+                    spdlog::warn("[Engine] Operator removed pause flag, but severe drawdown ({:.1f}% >= {:.1f}%) still holds breaker -- status stays Paused",
+                                 dd * 100.0, max_drawdown_frac_ * 100.0);
+                }
             } else {
                 state_->set_status(BotStatus::Running);
                 spdlog::info("[Engine] Pause flag removed -- resuming trading");

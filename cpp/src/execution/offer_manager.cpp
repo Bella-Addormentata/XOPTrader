@@ -1903,7 +1903,9 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
             tc.staleness = TierStaleness::Stale;
         } else if (past_soft_ttl) {
             // (2) Soft TTL zone: gentler threshold on old offers.
-            if (tc.adverse && tc.price_deviation > kSoftTtlAdverseThreshold) {
+            // On aged offers, any meaningful price movement in either direction
+            // triggers expiration so fresh quotes can be established.
+            if (tc.price_deviation > kSoftTtlAdverseThreshold) {
                 tc.staleness = TierStaleness::Expired;
             } else {
                 tc.staleness = TierStaleness::Fresh;
@@ -1912,10 +1914,14 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
             // (3) Very young offer: protect from churn.
             tc.staleness = TierStaleness::Fresh;
         } else {
-            // (4) Normal zone: tier-scaled adverse threshold.
+            // (4) Normal zone: tier-scaled adverse threshold, plus a favorable
+            // drift threshold (3x) so disconnected/stagnant offers get refreshed.
             const double tier_threshold = kSelectiveRefreshThreshold
                 * (1.0 + static_cast<double>(po.tier) * kTierThresholdScale);
+            constexpr double kFavorableDriftMultiplier = 3.0;
             if (tc.adverse && tc.price_deviation > tier_threshold) {
+                tc.staleness = TierStaleness::Stale;
+            } else if (!tc.adverse && tc.price_deviation > tier_threshold * kFavorableDriftMultiplier) {
                 tc.staleness = TierStaleness::Stale;
             } else {
                 tc.staleness = TierStaleness::Fresh;
