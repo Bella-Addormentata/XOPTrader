@@ -834,6 +834,16 @@ std::vector<PairConfig> parse_pairs(const YAML::Node& root)
             }
             p.competitive_anchor_stride_bps_override = v;
         }
+        if (item["fair_value_residual_widen_ratio_override"]
+            && item["fair_value_residual_widen_ratio_override"].IsDefined()
+            && !item["fair_value_residual_widen_ratio_override"].IsNull()) {
+            double v = item["fair_value_residual_widen_ratio_override"].as<double>();
+            if (v < 0.0) {
+                throw ConfigError(idx + ".fair_value_residual_widen_ratio_override must be >= 0; got "
+                                  + std::to_string(v));
+            }
+            p.fair_value_residual_widen_ratio_override = v;
+        }
 
         if (item["min_offer_size_units_override"]
             && item["min_offer_size_units_override"].IsDefined()

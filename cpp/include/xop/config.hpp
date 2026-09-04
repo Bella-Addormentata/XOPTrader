@@ -142,6 +142,7 @@ struct PairConfig {
     std::optional<bool>     competitive_anchor_enabled_override;
     std::optional<double>   competitive_anchor_max_distance_bps_override;
     std::optional<double>   competitive_anchor_stride_bps_override;
+    std::optional<double>   fair_value_residual_widen_ratio_override;
 
     // [BBOPERPAIR 2026-09-01] Per-pair BBO proximity caps.
     //

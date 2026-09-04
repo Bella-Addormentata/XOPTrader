@@ -8343,8 +8343,12 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
             // they disagree -- which is why it survives an Unavailable tier.
             const auto residual_opt =
                 market_data_->get_fair_value_residual_bps(pair_name);
+            const PairConfig* rpc = find_pair_config(pair_name);
+            const double widen_ratio = (rpc && rpc->fair_value_residual_widen_ratio_override.has_value())
+                ? rpc->fair_value_residual_widen_ratio_override.value()
+                : config_.strategy.fair_value_residual_widen_ratio;
             if (residual_opt && mid_mojos > 0 && !pcs.ladder.empty()
-                && config_.strategy.fair_value_residual_widen_ratio > 0.0)
+                && widen_ratio > 0.0)
             {
                 const double excess =
                     std::abs(*residual_opt)
@@ -8352,7 +8356,7 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                 if (excess > 0.0) {
                     const double extra_bps =
                         excess
-                        * config_.strategy.fair_value_residual_widen_ratio;
+                        * widen_ratio;
                     // Cap the added width at the pair's own half-spread
                     // ceiling -- the same cap Step 5 applies, honouring any
                     // per-pair override -- so a runaway residual cannot push
@@ -8360,12 +8364,9 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                     // books disagree with the graph on 96% of heartbeats and
                     // the raw widening would exceed this cap most of the time;
                     // the cap is what keeps that from becoming a withdrawal.
-                    const double residual_cap = [&]() -> double {
-                        const PairConfig* rpc = find_pair_config(pair_name);
-                        if (rpc && rpc->max_half_spread_bps_override.has_value())
-                            return rpc->max_half_spread_bps_override.value();
-                        return config_.strategy.max_half_spread_bps;
-                    }();
+                    const double residual_cap = (rpc && rpc->max_half_spread_bps_override.has_value())
+                        ? rpc->max_half_spread_bps_override.value()
+                        : config_.strategy.max_half_spread_bps;
                     const double capped = std::min(extra_bps, residual_cap);
 
                     for (auto& tq : pcs.ladder) {
