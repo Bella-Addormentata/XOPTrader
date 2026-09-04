@@ -7844,7 +7844,7 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
         // mid.  This prevents TibetSwap (0.7% fee) or other AMMs from
         // profitably arbitraging our offers.
         // -----------------------------------------------------------------
-        if (!comp_offers.empty() && mid_mojos > 0) {
+        if (ladder_cfg.competitive_anchor_enabled && !comp_offers.empty() && mid_mojos > 0) {
             // Separate competing offers by side, retaining size for
             // wall detection, and sort by quality.
             struct PricedOffer { Mojo price; Mojo size; };
@@ -8217,26 +8217,69 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
             int clamped_bids = 0;
             int clamped_asks = 0;
 
-            for (auto& tq : pcs.ladder) {
-                if (tq.side == Side::Bid && snap.best_ask > 0) {
-                    if (tq.price > snap.best_ask) {
+            const double step_bps = std::max(
+                0.0, config_.strategy.fair_value_clamp_tier_step_bps);
+
+            auto tiers_in_order = [&](Side side) {
+                std::vector<TierQuote*> out;
+                out.reserve(pcs.ladder.size());
+                for (auto& tq : pcs.ladder) {
+                    if (tq.side == side) out.push_back(&tq);
+                }
+                std::sort(out.begin(), out.end(),
+                          [](const TierQuote* a, const TierQuote* b) {
+                              return a->tier_index < b->tier_index;
+                          });
+                return out;
+            };
+            auto resync_spread = [&](TierQuote& tq) {
+                if (mid_mojos > 0) {
+                    tq.spread_bps =
+                        (static_cast<double>(tq.price)
+                       - static_cast<double>(mid_mojos))
+                        / static_cast<double>(mid_mojos) * 10'000.0;
+                }
+            };
+
+            // Bids: clamp down to snap.best_ask, stepping down for successive tiers
+            if (snap.best_ask > 0) {
+                Mojo next_max = snap.best_ask;
+                for (TierQuote* tqp : tiers_in_order(Side::Bid)) {
+                    TierQuote& tq = *tqp;
+                    if (tq.price > next_max) {
                         spdlog::info("[Engine] Step 7: {} BID tier {} clamped "
                                      "{} -> {} (dex best ask)",
                                      pair_name, tq.tier_index,
-                                     tq.price, snap.best_ask);
-                        tq.price = snap.best_ask;
+                                     tq.price, next_max);
+                        tq.price = next_max;
+                        resync_spread(tq);
                         ++clamped_bids;
                     }
+                    next_max = std::min(next_max, tq.price);
+                    next_max = static_cast<Mojo>(std::llround(
+                        static_cast<double>(next_max)
+                        * (1.0 - step_bps / 10'000.0)));
                 }
-                if (tq.side == Side::Ask && snap.best_bid > 0) {
-                    if (tq.price < snap.best_bid) {
+            }
+
+            // Asks: clamp up to snap.best_bid, stepping up for successive tiers
+            if (snap.best_bid > 0) {
+                Mojo next_min = snap.best_bid;
+                for (TierQuote* tqp : tiers_in_order(Side::Ask)) {
+                    TierQuote& tq = *tqp;
+                    if (tq.price < next_min) {
                         spdlog::info("[Engine] Step 7: {} ASK tier {} clamped "
                                      "{} -> {} (dex best bid)",
                                      pair_name, tq.tier_index,
-                                     tq.price, snap.best_bid);
-                        tq.price = snap.best_bid;
+                                     tq.price, next_min);
+                        tq.price = next_min;
+                        resync_spread(tq);
                         ++clamped_asks;
                     }
+                    next_min = std::max(next_min, tq.price);
+                    next_min = static_cast<Mojo>(std::llround(
+                        static_cast<double>(next_min)
+                        * (1.0 + step_bps / 10'000.0)));
                 }
             }
 

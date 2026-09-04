@@ -127,6 +127,18 @@ XOPTrader maintains per-pair PID controllers (`SpreadPidState` and `Competitiven
   1. Restarting the engine process clears the in-memory breaker latch and re-initializes the rolling window PnL buffer cleanly against current spot prices.
   2. Because `book_side_agree_max_spread_bps: 1500.0` is now configured in `config.yaml`, wide books ($>15\%$ spread) are permanently denied `mid_valuation_grade`, preventing `XCH/BYC` from ever capturing the base asset mark or establishing an inflated carried price.
 
+### H. Stepped Anti-Collapse Price Guard & Progressive Fill-Span Ladder
+* **The Clamping Collapse Defect:**
+  - In `cpp/src/engine.cpp` Step 7 (*Order-book price guard*), when multiple ask tiers fell below `dex_best_bid` ($1.538$), the original guard inlined `tq.price = snap.best_bid;`.
+  - This collapsed tiers 0, 1, 2, 3, and 4 onto the exact same price ($1.538 \to 1.600$ after widening), creating a single flat price block of 5 offers at $1.60$ instead of a ladder. When takers swept the book, all 11 offers were bought at the floor price ($1.592 - 1.599$).
+* **The Solution & Progressive Tiering:**
+  1. **Stepped Order-Book Price Guard:** Updated Step 7's order-book guard in `cpp/src/engine.cpp` to iterate tiers in order and apply `step_bps` (`fair_value_clamp_tier_step_bps`), ensuring successive clamped tiers stay monotonically stepped and distinct.
+  2. **Gated Step 7 Competitive Cap:** Gated the secondary competitive cap block behind `ladder_cfg.competitive_anchor_enabled`, ensuring disabled pairs are not pulled back to resting touch prices.
+  3. **Progressive Spacing Calibration (`tier_spacing_bps_override: [1000, 1600, 2300, 3100, 4000, 5000]`):**
+     - Spans from $+10\%$ up to $+50\%$ above fair value ($1.44$) on Asks: **$1.60, 1.64, 1.69, 1.72, 1.75, 1.78 - 2.16\text{ BYC/XCH}$**, covering and exceeding the recent $1.94\text{ BYC/XCH}$ trade level.
+     - Spans from $-10\%$ down to $-38\%$ on Bids: **$1.35, 1.30, 1.24, 1.20, 1.17, 1.13\text{ BYC/XCH}$**.
+     - Takers sweeping the book are forced to walk up the ladder, capturing progressively higher profit margins ($10\% \to 50\%$).
+
 ---
 
 ## 4. Expected Outcomes & Success Verification
@@ -144,14 +156,15 @@ flowchart TD
 
 | Metric | Baseline (Pre-Change) | Target / Verified Live Results |
 | :--- | :--- | :--- |
-| **Active Dexie Asks** | $0$ (100% suppressed) | **Active resting offers (4–6 tiers)** |
+| **Active Dexie Asks** | $0$ (100% suppressed) | **Active resting offers (5–6 tiers)** |
 | **Active Dexie Bids** | 6 active | **Active resting offers (5–6 tiers)** |
-| **Ask Pricing Range** | None | **$\approx 1.600 - 1.658\text{ BYC/XCH}$** |
-| **Bid Pricing Range** | $1.34 - 1.40\text{ BYC/XCH}$ | **$\approx 1.350 - 1.357\text{ BYC/XCH}$** |
-| **Round-Trip Margin** | $0\%$ (One-sided) | **$15\% - 25\%$ per fill cycle** |
+| **Ask Pricing Range** | None | **$\approx 1.60 - 2.16\text{ BYC/XCH}$ (progressively stepped)** |
+| **Bid Pricing Range** | $1.34 - 1.40\text{ BYC/XCH}$ | **$\approx 1.13 - 1.35\text{ BYC/XCH}$ (progressively stepped)** |
+| **Round-Trip Margin** | $0\%$ (One-sided) | **$10\% - 50\%$ per fill cycle** |
 | **PID Authority** | Saturated at min limit | **Dynamic adaptation ($0.82\times - 1.30\times$)** |
 | **Circuit Breakers** | Tripped by phantom PnL swing | **Clear & stable (`xop_posting_gated: 0`)** |
 | **Competitive Anchor** | Collapsed wide ladder to 45 bps | **Per-pair override disables anchor on wide pairs** |
+| **Order-Book Guard** | Flattened clamped tiers to single price | **Stepped guard preserves distinct progressive tiers** |
 
 ---
 
@@ -173,6 +186,8 @@ flowchart TD
 - [x] Configure `market_data.book_side_agree_max_spread_bps: 1500.0` in `config.yaml`.
 - [x] Implement per-pair `competitive_anchor_enabled_override` in `cpp/include/xop/config.hpp`, `cpp/src/config.cpp`, and `cpp/src/engine.cpp`.
 - [x] Set `competitive_anchor_enabled_override: false` for `XCH/BYC` in `config.yaml`.
+- [x] Implement stepped anti-collapse logic in Step 7's order-book price guard in `cpp/src/engine.cpp`.
+- [x] Calibrate progressive tier spacings up to 50% ($1.60 - 2.16\text{ BYC/XCH}$) to cover recent fill levels.
 - [x] Compile Release build using CMake (`cmake --build cpp/build --config Release`).
 - [x] Run test suite (`ctest -C Release`).
 - [x] Restart engine and verify live two-sided quotes on Dexie without feedback loops or breaker trips.
