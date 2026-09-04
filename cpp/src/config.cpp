@@ -858,6 +858,15 @@ std::vector<PairConfig> parse_pairs(const YAML::Node& root)
             }
             p.activity_target_fills_24h_override = v;
         }
+        if (item["activity_book_weight_override"]
+            && item["activity_book_weight_override"].IsDefined()
+            && !item["activity_book_weight_override"].IsNull()) {
+            double v = item["activity_book_weight_override"].as<double>();
+            if (v < 0.0) {
+                throw ConfigError(idx + ".activity_book_weight_override must be >= 0; got " + std::to_string(v));
+            }
+            p.activity_book_weight_override = v;
+        }
         if (item["min_profit_margin_max_bps_override"]
             && item["min_profit_margin_max_bps_override"].IsDefined()
             && !item["min_profit_margin_max_bps_override"].IsNull()) {
@@ -1103,6 +1112,7 @@ StrategyConfig parse_strategy(const YAML::Node& root)
         }
         cfg.activity_target_fills_24h = v;
     }
+    opt_non_negative("activity_book_weight", cfg.activity_book_weight);
     if (node["activity_lookback_blocks"] && node["activity_lookback_blocks"].IsDefined()
         && !node["activity_lookback_blocks"].IsNull()) {
         int v = node["activity_lookback_blocks"].as<int>();

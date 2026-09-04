@@ -7711,18 +7711,36 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
             : config_.strategy.min_profit_margin_bps;
         double effective_ask_margin_bps = effective_bid_margin_bps;
 
-        if (activity_adaptive && db_) {
-            const std::uint32_t lookback = config_.strategy.activity_lookback_blocks;
-            const BlockHeight since_block = (block_height > lookback) ? (block_height - lookback) : BlockHeight{0};
-            const auto [bids_24h, asks_24h] = db_->query_trade_counts_by_side(pair_name, since_block);
+        if (activity_adaptive) {
+            int bids_24h = 0;
+            int asks_24h = 0;
+            if (db_) {
+                const std::uint32_t lookback = config_.strategy.activity_lookback_blocks;
+                const BlockHeight since_block = (block_height > lookback) ? (block_height - lookback) : BlockHeight{0};
+                std::tie(bids_24h, asks_24h) = db_->query_trade_counts_by_side(pair_name, since_block);
+            }
+
+            std::size_t book_bids = 0;
+            std::size_t book_asks = 0;
+            for (const auto& co : comp_offers) {
+                if (co.side == Side::Bid) ++book_bids;
+                else if (co.side == Side::Ask) ++book_asks;
+            }
+
+            const double book_weight = pair_cfg
+                ? pair_cfg->activity_book_weight_override.value_or(config_.strategy.activity_book_weight)
+                : config_.strategy.activity_book_weight;
+
+            const double eff_bids = static_cast<double>(bids_24h) + book_weight * static_cast<double>(book_bids);
+            const double eff_asks = static_cast<double>(asks_24h) + book_weight * static_cast<double>(book_asks);
 
             const int target_fills = pair_cfg
                 ? pair_cfg->activity_target_fills_24h_override.value_or(config_.strategy.activity_target_fills_24h)
                 : config_.strategy.activity_target_fills_24h;
             const double target_d = std::max(1.0, static_cast<double>(target_fills));
 
-            const double alpha_bid = std::clamp(static_cast<double>(bids_24h) / target_d, 0.0, 1.0);
-            const double alpha_ask = std::clamp(static_cast<double>(asks_24h) / target_d, 0.0, 1.0);
+            const double alpha_bid = std::clamp(eff_bids / target_d, 0.0, 1.0);
+            const double alpha_ask = std::clamp(eff_asks / target_d, 0.0, 1.0);
 
             // Margin interpolation: at 0 fills -> max_margin; at >= target fills -> min_margin
             const double min_margin = effective_bid_margin_bps;
@@ -7749,9 +7767,10 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                 ladder_cfg.tier_spacing_bps_ask[i] = max_s - alpha_ask * (max_s - min_s);
             }
 
-            spdlog::info("[Engine] Step 7: {} 24h activity: {} bids ({:.1f}%), {} asks ({:.1f}%) "
-                         "-> bid_margin={:.0f}bps, ask_margin={:.0f}bps, bid_spacing_0={:.0f}bps, ask_spacing_0={:.0f}bps",
-                         pair_name, bids_24h, alpha_bid * 100.0, asks_24h, alpha_ask * 100.0,
+            spdlog::info("[Engine] Step 7: {} activity score: bids={:.1f} (24h_fills={} book={}), asks={:.1f} (24h_fills={} book={}) "
+                         "-> alpha_bid={:.1f}%, alpha_ask={:.1f}%, bid_margin={:.0f}bps, ask_margin={:.0f}bps, bid_spacing_0={:.0f}bps, ask_spacing_0={:.0f}bps",
+                         pair_name, eff_bids, bids_24h, book_bids, eff_asks, asks_24h, book_asks,
+                         alpha_bid * 100.0, alpha_ask * 100.0,
                          effective_bid_margin_bps, effective_ask_margin_bps,
                          ladder_cfg.tier_spacing_bps_bid.empty() ? 0.0 : ladder_cfg.tier_spacing_bps_bid.front(),
                          ladder_cfg.tier_spacing_bps_ask.empty() ? 0.0 : ladder_cfg.tier_spacing_bps_ask.front());

@@ -142,12 +142,14 @@ XOPTrader maintains per-pair PID controllers (`SpreadPidState` and `Competitiven
 
 ### I. Dynamic 24-Hour Activity-Adaptive Margin & Spacing Controller
 * **The Concept:**
-  - In illiquid markets ("desert books"), quoting tight spreads exposes the market maker to adverse selection with no compensation. When the market is quiet ($0$ fills in trailing 24 hours), the engine should extract the **maximum liquidity premium** ($M_{\text{max}}$, $S_{\text{max}}$).
-  - When trade velocity accelerates to $\ge 1\text{ fill/hour}$ on a side ($\ge 24$ fills in 24h), inventory turnover velocity is high, and spreads can safely compress to the tightest setting ($M_{\text{min}}$, $S_{\text{min}}$) to compete for flow.
+  - In illiquid markets ("desert books"), quoting tight spreads exposes the market maker to adverse selection with no compensation. When the market is quiet ($0$ fills and no competing offers), the engine should extract the **maximum liquidity premium** ($M_{\text{max}}$, $S_{\text{max}}$).
+  - When trade velocity accelerates ($\ge 24$ fills/day) OR when substantial competing liquidity already rests on the book ($N_{\text{book}} > 0$), inventory turnover velocity and price discovery are healthy, so spreads can safely compress toward the tightest setting ($M_{\text{min}}$, $S_{\text{min}}$) to compete for flow.
 * **The Implementation:**
   1. **Database Query (`cpp/src/database.cpp`):** Added `Database::query_trade_counts_by_side` to query confirmed fills grouped by side from `trade_log` within the 24-hour lookback window (default 1,662 blocks).
-  2. **Asymmetric Per-Side Activity Scores ($\alpha_{\text{bid}}, \alpha_{\text{ask}}$):**
-     $$\alpha_s = \min\left(1.0, \; \frac{N_s^{24\text{h}}}{N_{\text{target}}}\right)$$
+  2. **Combined Activity Measure with Order-Book Depth Weighting (`activity_book_weight`):**
+     $$\text{Effective Activity}_s = N_s^{24\text{h\_fills}} + w_{\text{book}} \cdot N_s^{\text{book\_offers}}$$
+     $$\alpha_s = \min\left(1.0, \; \frac{\text{Effective Activity}_s}{N_{\text{target}}}\right)$$
+     Where $w_{\text{book}} = 0.5$ and $N_{\text{target}} = 24$.
   3. **Continuous Interpolation (`cpp/src/engine.cpp` Step 7):**
      $$M_{\text{eff}, s} = M_{\text{max}} - \alpha_s \cdot (M_{\text{max}} - M_{\text{min}})$$
      $$S_{\text{eff}, s}[i] = S_{\text{max}}[i] - \alpha_s \cdot \big(S_{\text{max}}[i] - S_{\text{min}}[i]\big)$$

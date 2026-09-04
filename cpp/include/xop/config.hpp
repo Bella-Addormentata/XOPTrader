@@ -145,6 +145,7 @@ struct PairConfig {
     std::optional<double>   fair_value_residual_widen_ratio_override;
     std::optional<bool>     activity_adaptive_spacing_override;
     std::optional<int>      activity_target_fills_24h_override;
+    std::optional<double>   activity_book_weight_override;
     std::optional<double>   min_profit_margin_max_bps_override;
     std::optional<std::vector<double>> tier_spacing_max_bps_override;
 
@@ -465,9 +466,11 @@ struct StrategyConfig {
 
     // -- 24h Activity-adaptive tier margin and spacing -----------------------
     /// When enabled, market maker margins and tier spacings dynamically scale
-    /// between configured minimums and maximums based on trailing confirmed fills.
+    /// between configured minimums and maximums based on trailing confirmed fills
+    /// and resting order-book depth.
     bool     activity_adaptive_spacing{false};
     int      activity_target_fills_24h{24};
+    double   activity_book_weight{0.5};
     std::uint32_t activity_lookback_blocks{1662};
 
     // -- Triangulation weights ----------------------------------------------
