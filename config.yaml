@@ -66,11 +66,22 @@ pairs:
   # the BYC balance: the bid side is the reason to be here, the ask side is
   # the risk. If BYC inventory rises rather than falls, that is the signal to
   # turn this back off.
-  enabled: false
+  enabled: true
   min_offer_size_units_override: 1.0
   name: XCH/BYC
   quote_asset_id: ae1536f56760e471ad85ead45f00d680ff9cca73b8cc3407be778f1c0c606eac
   ratio_target_override: 0.6923
+  max_half_spread_bps_override: 400
+  min_profit_margin_bps_override: 100
+  tier_spacing_bps_override:
+  - 100.0
+  - 250.0
+  - 450.0
+  - 700.0
+  - 1000.0
+  - 1400.0
+  bbo_sanity_max_passive_dev_override: 0.60
+  bbo_sanity_max_aggressive_dev_override: 0.10
 - base_asset_id: ae1536f56760e471ad85ead45f00d680ff9cca73b8cc3407be778f1c0c606eac
   depeg_bail_pct: 10.0
   depeg_sustained_blocks: 30
@@ -227,21 +238,21 @@ strategy:
   comp_pid_min_offset: -3
   comp_pid_max_offset: 3
   asset_target_allocations:
-    BYC: 0.2
-    DBX: 0.2
+    BYC: 0.3
+    DBX: 0.1
     XCH: 0.6
   ratio_target_by_pair:
-    XCH/BYC: 0.75
-    XCH/DBX: 0.75
+    XCH/BYC: 0.6666666666666666
+    XCH/DBX: 0.8571428571428571
   asset_target_tolerances:
-    BYC: 0.1
-    DBX: 0.15
+    BYC: 0.2
+    DBX: 0.09
     WMILLIETH.B: 0.05
     WUSDC.B: 0.08
     XCH: 0.4
   ratio_band_enter_by_pair:
-    XCH/BYC: 0.35
-    XCH/DBX: 0.38636363636363635
+    XCH/BYC: 0.38095238095238093
+    XCH/DBX: 0.3443223443223443
 risk:
   soft_limit_pct: 0.6
   hard_limit_pct: 0.8

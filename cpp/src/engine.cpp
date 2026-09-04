@@ -10372,13 +10372,28 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             }
         }
 
-        // All tiers fresh and nothing was cancelled -> no repost needed.
-        // (The early-continue was removed so balance gates can free capital
-        //  when both sides are suppressed, but when at least one side is
-        //  active, existing fresh offers are kept as-is.)
+        // All tiers fresh and nothing was cancelled -> no repost needed, UNLESS
+        // there are brand-new tiers in the ladder that were not previously pending.
         if (has_pending && cancelled_ids.empty()
             && stale_count == 0 && expired_count == 0) {
-            continue;
+            bool has_unposted = false;
+            std::unordered_set<std::string> pending_keys;
+            for (const auto& tc : tier_classes) {
+                pending_keys.insert(
+                    std::to_string(static_cast<int>(tc.side))
+                    + "_" + std::to_string(tc.tier_index));
+            }
+            for (const auto& tq : pcs.ladder) {
+                std::string key = std::to_string(static_cast<int>(tq.side))
+                                + "_" + std::to_string(tq.tier_index);
+                if (pending_keys.count(key) == 0) {
+                    has_unposted = true;
+                    break;
+                }
+            }
+            if (!has_unposted) {
+                continue;
+            }
         }
 
         // -- XCH fee reserve gate (pre-creation, UTXO-aware) ---------------
@@ -10888,6 +10903,10 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             // reconstruction rather than an observation, and a change in this
             // family already shipped a regression through four review rounds.
             // So: count first, decide from data.
+            // [S33 2026-09-03] BBO CROSSING GUARD.
+            // Evaluates whether a tier crosses the current BBO (best_bid for asks,
+            // best_ask for bids) or fallback mid buffer when no BBO exists,
+            // matching classify_tier_staleness.
             const auto book_snap_cg = state_->get_market(pair_name);
             const double cg_bid = static_cast<double>(book_snap_cg.best_bid);
             const double cg_ask = static_cast<double>(book_snap_cg.best_ask);
@@ -10896,70 +10915,33 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             std::vector<TierQuote> mid_safe;
             mid_safe.reserve(fee_filtered_tiers.size());
             std::size_t suppressed_count = 0;
-            std::size_t shadow_would_keep = 0;   // we drop, canceller would not
-            std::size_t shadow_would_drop = 0;   // we keep, canceller would drop
-            std::size_t shadow_indeterminate = 0;
-            bool        shadow_inverted = false;
-            bool        shadow_mid_fallback = false;
 
             for (const auto& tier : fee_filtered_tiers) {
                 const bool is_ask = (tier.side != Side::Bid);
                 const double px   = static_cast<double>(tier.price);
 
-                const auto live = execution::classify_cross_published_mid(
-                    is_ask, px, cg_mid);
-                const auto shadow = execution::classify_cross_bbo(
+                const auto bbo_check = execution::classify_cross_bbo(
                     is_ask, px, cg_bid, cg_ask, cg_mid);
-                shadow_inverted     |= shadow.book_inverted;
-                shadow_mid_fallback |= shadow.used_mid_fallback;
 
-                const bool live_crossed =
-                    (live == execution::CrossVerdict::Crossed);
-                if (shadow.verdict == execution::CrossVerdict::Indeterminate) {
-                    ++shadow_indeterminate;
-                } else {
-                    const bool shadow_crossed =
-                        (shadow.verdict == execution::CrossVerdict::Crossed);
-                    if (live_crossed && !shadow_crossed) ++shadow_would_keep;
-                    if (!live_crossed && shadow_crossed) ++shadow_would_drop;
-                }
+                const bool is_crossed =
+                    (bbo_check.verdict == execution::CrossVerdict::Crossed);
 
-                // SUPPRESSION IS THE LIVE VERDICT, UNCHANGED.
-                if (live_crossed) {
+                if (is_crossed) {
                     spdlog::info("[Engine] Step 8: {} {} tier {} suppressed "
-                                 "-- price {} vs mid {} (crossed)",
+                                 "-- price {} crosses BBO ({}/{})",
                                  pair_name, is_ask ? "ask" : "bid",
-                                 tier.tier_index, tier.price, mid);
+                                 tier.tier_index, tier.price,
+                                 book_snap_cg.best_bid, book_snap_cg.best_ask);
                     ++suppressed_count;
                     continue;
                 }
                 mid_safe.push_back(tier);
             }
             if (suppressed_count > 0) {
-                spdlog::warn("[Engine] Step 8: {} crossed-mid guard removed "
+                spdlog::warn("[Engine] Step 8: {} BBO crossing guard removed "
                              "{}/{} tiers",
                              pair_name, suppressed_count,
                              fee_filtered_tiers.size());
-            }
-            if (shadow_would_keep > 0 || shadow_would_drop > 0) {
-                // The number this shadow exists to produce. If it stays at
-                // zero the question answers itself and the guard can be left
-                // alone; if it does not, this line is the evidence a fix
-                // would be built on.
-                spdlog::warn("[Engine] Step 8: {} [CROSSGUARD-SHADOW] "
-                             "published-mid and BBO verdicts disagree on "
-                             "{} tier(s) we dropped and {} we kept "
-                             "(mid={}, bbo={}/{}{}{}) -- suppression "
-                             "unchanged, this is measurement only",
-                             pair_name, shadow_would_keep, shadow_would_drop,
-                             mid, book_snap_cg.best_bid, book_snap_cg.best_ask,
-                             shadow_inverted ? ", BOOK INVERTED" : "",
-                             shadow_mid_fallback ? ", mid-fallback" : "");
-            }
-            if (shadow_indeterminate > 0) {
-                spdlog::debug("[Engine] Step 8: {} [CROSSGUARD-SHADOW] "
-                              "{} tier(s) had no usable reference",
-                              pair_name, shadow_indeterminate);
             }
             fee_filtered_tiers = std::move(mid_safe);
         }
@@ -11602,7 +11584,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         // (some tiers were Fresh and left live), only post replacements for
         // the tiers that were actually cancelled.  Posting duplicates of
         // Fresh tiers would create double-exposure at the same price level.
-        if (has_pending && fresh_count > 0 && !cancelled_ids.empty()) {
+        if (has_pending && fresh_count > 0) {
             // Build a set of (side, tier_index) keys for cancelled tiers.
             std::unordered_set<std::string> cancelled_keys;
             for (const auto& tc : tier_classes) {
