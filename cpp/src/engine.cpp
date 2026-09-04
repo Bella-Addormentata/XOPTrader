@@ -17234,7 +17234,27 @@ void Engine::step_update_pnl(BlockHeight block_height)
         // (see the S20 note in mark_to_market).  An earlier cut of this
         // branch gated without that change and would have injected the
         // very discontinuity it was meant to prevent.
-        [this](const std::string& pair, [[maybe_unused]] const std::string& asset) -> Mojo {
+        //
+        // [XCH-MTM-ISOLATION 2026-09-04] Base asset XCH is the global
+        // reserve currency of the wallet.  Its USD value is known
+        // authoritatively from CEX/anchors (usd_per_xch / asset_usd_pseudo_price).
+        // Deriving the whole wallet's XCH mark from an individual CAT pair's
+        // local DEX spread (e.g. wide BYC vs tight DBX) caused MTM
+        // hopping of -$9 to -$12 whenever an illiquid CAT book widened,
+        // tripping Step 13's rolling-window circuit breaker.
+        // When asset is "xch", normalize the price to the canonical USD rate.
+        [this](const std::string& pair, const std::string& asset) -> Mojo {
+            if (asset == "xch") {
+                const Mojo xch_usd = asset_usd_pseudo_price(AssetId{"xch"});
+                const PairConfig* pc = find_pair_config(pair);
+                if (xch_usd > 0 && pc) {
+                    const double f = quote_usd_factor(*pc);
+                    if (f > 0.0) {
+                        return static_cast<Mojo>(std::llround(
+                            static_cast<double>(xch_usd) / f));
+                    }
+                }
+            }
             auto snap = state_->get_market(pair);
             return snap.mid_valuation_grade ? snap.mid_price : 0;
         },
@@ -17975,6 +17995,26 @@ void Engine::step_check_alerts(BlockHeight block_height)
                     spdlog::debug("[Engine] Step 13: rolling-window breach "
                                   "persists while latched (loss=${:.4f})",
                                   window_loss_usd);
+                }
+            } else if (breaker_pause_active_ && window_loss_usd <= threshold_usd) {
+                // Auto-cooldown for rolling-window loss breaker:
+                // If the rolling-window loss has normalized (window_loss_usd <= threshold_usd)
+                // and equity is healthy (no drawdown breach and valid book), auto-clear the latch.
+                constexpr int kWindowLossRecoverStreak = 10;
+                if (breaker_lift_streak_ >= kWindowLossRecoverStreak) {
+                    const double dd = risk::equity_drawdown_frac(peak_equity_hwm_usd_, equity_usd);
+                    if (dd < max_drawdown_frac_ && !unvaluable_now) {
+                        breaker_pause_active_ = false;
+                        breaker_skip_warned_  = false;
+                        breaker_lift_streak_  = 0;
+                        state_->set_status(BotStatus::Running);
+                        spdlog::info("[Engine] Step 13: rolling-window loss normalized (loss=${:.4f} <= threshold=${:.4f}) "
+                                     "-- auto-resuming trading", window_loss_usd, threshold_usd);
+                        if (alerts_) {
+                            alerts_->send_alert(AlertRule::CircuitBreaker,
+                                "Rolling-window loss normalized -- engine auto-resumed trading");
+                        }
+                    }
                 }
             }
         }
@@ -19429,14 +19469,25 @@ void Engine::check_pause_flag()
         gui_pause_active_ = false;
         if (state_->status() == BotStatus::Paused) {
             if (breaker_pause_active_) {
-                // The breaker owns this pause.  Flipping the status to
-                // Running here while Step 8 stays gated would have the GUI
-                // report a trading engine that is not trading -- the exact
-                // inverse of the bypass this PR fixes.  Status stays Paused
-                // until the restart the breaker already requires.
-                spdlog::info("[Engine] Pause flag removed, but a risk "
-                             "breaker holds the pause -- status stays "
-                             "Paused until restart");
+                // The operator explicitly removed the pause flag (clicked Resume in GUI).
+                // If equity is not in catastrophic drawdown (> max_drawdown_frac),
+                // reset breaker_pause_active_ and clear the rolling-window loss deque so
+                // trading can resume immediately without requiring a full process restart.
+                const double equity_usd = compute_portfolio_equity_usd();
+                const double peak = (peak_equity_hwm_usd_ > 0.0) ? peak_equity_hwm_usd_ : equity_usd;
+                const double dd = risk::equity_drawdown_frac(peak, equity_usd);
+                if (dd < max_drawdown_frac_) {
+                    breaker_pause_active_ = false;
+                    breaker_lift_streak_  = 0;
+                    breaker_skip_warned_  = false;
+                    pnl_window_usd_.clear();
+                    state_->set_status(BotStatus::Running);
+                    spdlog::info("[Engine] Operator cleared pause flag -- resetting risk breaker latch and resuming trading (equity=${:.2f}, drawdown={:.1f}%)",
+                                 equity_usd, dd * 100.0);
+                } else {
+                    spdlog::warn("[Engine] Operator removed pause flag, but severe drawdown ({:.1f}% >= {:.1f}%) still holds breaker -- status stays Paused",
+                                 dd * 100.0, max_drawdown_frac_ * 100.0);
+                }
             } else {
                 state_->set_status(BotStatus::Running);
                 spdlog::info("[Engine] Pause flag removed -- resuming trading");
