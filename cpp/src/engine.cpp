@@ -18021,25 +18021,30 @@ void Engine::step_check_alerts(BlockHeight block_height)
     // breach from re-alerting every block.
     if (config_.risk.max_window_loss_bps > 0.0) {
 
-        // 1. Append current snapshot.
-        pnl_window_usd_.push_back({block_height, total.total_pnl_usd});
+        if (drawdown_grace_remaining_ > 0) {
+            pnl_window_usd_.clear();
+            pnl_window_usd_.push_back({block_height, total.total_pnl_usd});
+        } else {
+            // 1. Append current snapshot.
+            pnl_window_usd_.push_back({block_height, total.total_pnl_usd});
 
-        // 2. Trim entries that fall outside the rolling window.
-        //    Entries are ordered by ascending block_height; pop from front.
-        //    We keep only entries whose age is strictly less than
-        //    loss_window_blocks (i.e., within the window).  An entry is
-        //    considered stale when block_height - entry_block >= window_size.
-        while (pnl_window_usd_.size() > 1) {
-            const BlockHeight oldest = pnl_window_usd_.front().first;
-            if (block_height - oldest >= config_.risk.loss_window_blocks) {
-                pnl_window_usd_.pop_front();
-            } else {
-                break;
+            // 2. Trim entries that fall outside the rolling window.
+            //    Entries are ordered by ascending block_height; pop from front.
+            //    We keep only entries whose age is strictly less than
+            //    loss_window_blocks (i.e., within the window).  An entry is
+            //    considered stale when block_height - entry_block >= window_size.
+            while (pnl_window_usd_.size() > 1) {
+                const BlockHeight oldest = pnl_window_usd_.front().first;
+                if (block_height - oldest >= config_.risk.loss_window_blocks) {
+                    pnl_window_usd_.pop_front();
+                } else {
+                    break;
+                }
             }
         }
 
         // 3. Compute window_loss (positive = PnL decreased over the window).
-        if (pnl_window_usd_.size() >= 2) {
+        if (pnl_window_usd_.size() >= 2 && drawdown_grace_remaining_ == 0) {
             const double window_start_pnl = pnl_window_usd_.front().second;
             const double window_loss_usd =
                 window_start_pnl - total.total_pnl_usd;
@@ -18055,6 +18060,11 @@ void Engine::step_check_alerts(BlockHeight block_height)
                 equity_usd, anchor_fallback_usd,
                 config_.risk.max_window_loss_bps);
 
+            const double dd = (peak_equity_hwm_usd_ > 0.0)
+                ? risk::equity_drawdown_frac(peak_equity_hwm_usd_, equity_usd)
+                : 0.0;
+            const bool equity_healthy = (dd < max_drawdown_frac_) && !unvaluable_now;
+
             // 4. Fire if window_loss exceeds the threshold.
             // [S20] Also ungated, for the same fail-open reason as the
             // drawdown comparison above: a loss detector that switches
@@ -18063,6 +18073,7 @@ void Engine::step_check_alerts(BlockHeight block_height)
             if (window_loss_usd > 0.0 && threshold_usd > 0.0
                     && window_loss_usd > threshold_usd) {
 
+                window_loss_recover_streak_ = 0;
                 const BlockHeight window_actual =
                     block_height - pnl_window_usd_.front().first;
 
@@ -18096,17 +18107,18 @@ void Engine::step_check_alerts(BlockHeight block_height)
                                   "persists while latched (loss=${:.4f})",
                                   window_loss_usd);
                 }
-            } else if (breaker_pause_active_ && window_loss_usd <= threshold_usd) {
+            } else if (breaker_pause_active_) {
                 // Auto-cooldown for rolling-window loss breaker:
-                // If the rolling-window loss has normalized (window_loss_usd <= threshold_usd)
-                // and equity is healthy (no drawdown breach and valid book), auto-clear the latch.
-                constexpr int kWindowLossRecoverStreak = 10;
-                if (breaker_lift_streak_ >= kWindowLossRecoverStreak) {
-                    const double dd = risk::equity_drawdown_frac(peak_equity_hwm_usd_, equity_usd);
-                    if (dd < max_drawdown_frac_ && !unvaluable_now) {
+                // If equity is healthy and window loss has normalized (or is within threshold),
+                // streak up to clear the latch.
+                if (window_loss_usd <= threshold_usd && equity_healthy) {
+                    ++window_loss_recover_streak_;
+                    constexpr int kWindowLossRecoverStreak = 5;
+                    if (window_loss_recover_streak_ >= kWindowLossRecoverStreak) {
                         breaker_pause_active_ = false;
                         breaker_skip_warned_  = false;
-                        breaker_lift_streak_  = 0;
+                        window_loss_recover_streak_ = 0;
+                        pnl_window_usd_.clear();
                         state_->set_status(BotStatus::Running);
                         spdlog::info("[Engine] Step 13: rolling-window loss normalized (loss=${:.4f} <= threshold=${:.4f}) "
                                      "-- auto-resuming trading", window_loss_usd, threshold_usd);
@@ -18115,6 +18127,8 @@ void Engine::step_check_alerts(BlockHeight block_height)
                                 "Rolling-window loss normalized -- engine auto-resumed trading");
                         }
                     }
+                } else {
+                    window_loss_recover_streak_ = 0;
                 }
             }
         }
@@ -19579,6 +19593,7 @@ void Engine::check_pause_flag()
                 if (dd < max_drawdown_frac_) {
                     breaker_pause_active_ = false;
                     breaker_lift_streak_  = 0;
+                    window_loss_recover_streak_ = 0;
                     breaker_skip_warned_  = false;
                     pnl_window_usd_.clear();
                     state_->set_status(BotStatus::Running);

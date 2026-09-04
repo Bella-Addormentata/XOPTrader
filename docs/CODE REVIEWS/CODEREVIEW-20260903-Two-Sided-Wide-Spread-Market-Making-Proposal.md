@@ -203,7 +203,12 @@ flowchart TD
 - [x] Implement per-pair `competitive_anchor_enabled_override` in `cpp/include/xop/config.hpp`, `cpp/src/config.cpp`, and `cpp/src/engine.cpp`.
 - [x] Set `competitive_anchor_enabled_override: false` for `XCH/BYC` in `config.yaml`.
 - [x] Implement stepped anti-collapse logic in Step 7's order-book price guard in `cpp/src/engine.cpp`.
+- [x] Implement base-asset XCH MTM valuation isolation in Step 11 (`cpp/src/engine.cpp`) to prevent MTM hopping.
+- [x] Add startup grace window and automated auto-cooldown recovery (`window_loss_recover_streak_`) to Step 13 rolling-window circuit breaker.
+- [x] Add operator GUI resume override to `check_pause_flag` to allow resetting breaker pause without process restart.
+- [x] Fix favorable drift staleness classification in `OfferManager::classify_tier_staleness` to refresh stagnant/disconnected offers.
+- [x] Implement dynamic 24-hour activity-adaptive margin and spacing controller with order-book depth weighting (`Database::query_trade_counts_by_side`).
 - [x] Calibrate progressive tier spacings up to 50% ($1.60 - 2.16\text{ BYC/XCH}$) to cover recent fill levels.
 - [x] Compile Release build using CMake (`cmake --build cpp/build --config Release`).
-- [x] Run test suite (`ctest -C Release`).
-- [x] Restart engine and verify live two-sided quotes on Dexie without feedback loops or breaker trips.
+- [x] Run test suite (`1,274 / 1,274` tests passing).
+- [x] Restart engine and verify live two-sided quotes and taker fills on Dexie without feedback loops or breaker trips.
