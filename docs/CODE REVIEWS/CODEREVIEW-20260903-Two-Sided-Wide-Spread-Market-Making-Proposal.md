@@ -117,6 +117,16 @@ XOPTrader maintains per-pair PID controllers (`SpreadPidState` and `Competitiven
   3. Set `competitive_anchor_enabled_override: false` on `XCH/BYC` in `config.yaml`.
   4. **Outcome:** `XCH/BYC` quotes its true model-generated wide ladder across the entire spread ($1.35\text{ Bids} \leftrightarrow 1.60 - 1.66\text{ Asks}$) without collapsing into a micro-staircase, while `XCH/DBX` continues using competitive anchoring.
 
+### G. Post-Fill Order Book Void & MTM Base-Asset Hopping (Second Leg Echo)
+* **The Second Leg Mechanism (Observed 2026-09-04 04:16–04:37 UTC):**
+  1. **Taker Execution:** 11 active ask offers on `XCH/BYC` were filled at $\approx 1.592 - 1.599\text{ BYC/XCH}$, realizing immediate trading profit and selling 11 XCH for ~17.5 BYC at a ~10-11% premium over fair value ($1.44).
+  2. **Order Book Void:** Once our resting asks were filled, the top ask on Dexie snapped back to the dormant outlier at $4.9995\text{ BYC/XCH}$. Dexie's order book midpoint instantly jumped from $1.569$ to $3.269$ ($+108\%$), widening the spread to $10,587\text{ bps}$ and causing `XCH/BYC` to lose its valuation grade.
+  3. **Base-Asset MTM Hopping:** In `cpp/src/monitoring/pnl.cpp` (`PnLTracker::mark_to_market`), `XCH` is the shared base asset of multiple pairs (`XCH/BYC` and `XCH/DBX`). While asks were active, `XCH/BYC` owned the XCH mark and valued the wallet's $67.57\text{ XCH}$ balance at its carried price ($1.598\text{ USD}$), inflating unrealized PnL to $+\$7.05$ (total PnL $\$40.04$). Once `XCH/BYC` lost its valuation grade, `XCH/DBX` took over the XCH mark at its live CEX spot rate ($85.06\text{ DBX/XCH} = \$1.43\text{ USD}$), plunging unrealized PnL to $-\$4.58$ (total PnL $\$28.39$).
+  4. **Circuit Breaker Latch:** Step 13's rolling-window loss circuit breaker (`max_window_loss_bps: 250`, threshold $\$5.80$) interpreted the $\$11.65$ PnL drop ($40.04 \to 28.39$) within 575 blocks as a real trading loss, transitioning the engine to `Paused` (`breaker_pause_active_ = true`) and halting new offer posting.
+* **Mitigation & Operational Recovery:**
+  1. Restarting the engine process clears the in-memory breaker latch and re-initializes the rolling window PnL buffer cleanly against current spot prices.
+  2. Because `book_side_agree_max_spread_bps: 1500.0` is now configured in `config.yaml`, wide books ($>15\%$ spread) are permanently denied `mid_valuation_grade`, preventing `XCH/BYC` from ever capturing the base asset mark or establishing an inflated carried price.
+
 ---
 
 ## 4. Expected Outcomes & Success Verification
