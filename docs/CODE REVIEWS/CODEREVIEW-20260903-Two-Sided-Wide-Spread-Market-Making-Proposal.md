@@ -106,6 +106,17 @@ XOPTrader maintains per-pair PID controllers (`SpreadPidState` and `Competitiven
 * **The Vulnerability:** When `XCH/BYC` spread narrowed to ~30% upon posting wide asks, the book earned `mid_valuation_grade = true` under the default $5,000\text{ bps}$ ($50\%$) agreement ceiling. In Step 11, `PnLTracker::mark_to_market` marked the wallet's $78.57\text{ XCH}$ balance against `XCH/BYC`'s mid ($1.81\text{ USD}$) instead of true spot ($1.44\text{ USD}$), causing a phantom $+\$28.85$ PnL spike followed by a $-\$32.20$ drop on reversion, which tripped Step 13's rolling-window loss circuit breaker.
 * **The Solution:** Set `market_data.book_side_agree_max_spread_bps: 1500.0` ($15\%$) in `config.yaml`. Books with spread $> 15\%$ are denied `mid_valuation_grade` and safely excluded from marking base asset equity, completely eliminating phantom PnL swings while allowing normal quoting to proceed.
 
+### F. Breaking the Competitive Anchor Feedback Loop on Illiquid Books
+* **The Feedback Loop Mechanism:**
+  1. The global `competitive_anchor_enabled: true` with `stride_bps: 45.0` was designed for tight, active books (`XCH/DBX`) where being top of book by 1 tick is desirable.
+  2. On an illiquid book where we are the only active market maker, posting wide tiers (e.g. $1.60 - 2.25$) caused the competitive anchor in `cpp/src/strategy/liquidity.cpp` to treat our own resting outer tiers as the "best competing ask" ($\approx 2.33\text{ BYC/XCH}$).
+  3. The anchor then compressed all 6 tiers into a tight 45 bps cluster ($2.333, 2.340, 2.347...$), overwriting the intended wide ladder spacing (`tier_spacing_bps_override`).
+* **The Solution:**
+  1. Added `competitive_anchor_enabled_override`, `competitive_anchor_max_distance_bps_override`, and `competitive_anchor_stride_bps_override` to `PairConfig` in `cpp/include/xop/config.hpp` and `cpp/src/config.cpp`.
+  2. In `cpp/src/engine.cpp`, honored `pair.competitive_anchor_enabled_override` in both `init_liquidity_engine` and `classify_tier_staleness`.
+  3. Set `competitive_anchor_enabled_override: false` on `XCH/BYC` in `config.yaml`.
+  4. **Outcome:** `XCH/BYC` quotes its true model-generated wide ladder across the entire spread ($1.35\text{ Bids} \leftrightarrow 1.60 - 1.66\text{ Asks}$) without collapsing into a micro-staircase, while `XCH/DBX` continues using competitive anchoring.
+
 ---
 
 ## 4. Expected Outcomes & Success Verification
@@ -125,11 +136,12 @@ flowchart TD
 | :--- | :--- | :--- |
 | **Active Dexie Asks** | $0$ (100% suppressed) | **Active resting offers (4–6 tiers)** |
 | **Active Dexie Bids** | 6 active | **Active resting offers (5–6 tiers)** |
-| **Ask Pricing Range** | None | **$\approx 2.33 - 2.36\text{ BYC/XCH}$** |
-| **Bid Pricing Range** | $1.34 - 1.40\text{ BYC/XCH}$ | **$\approx 1.35 - 1.36\text{ BYC/XCH}$** |
-| **Round-Trip Margin** | $0\%$ (One-sided) | **$15\% - 35\%$ per fill cycle** |
+| **Ask Pricing Range** | None | **$\approx 1.600 - 1.658\text{ BYC/XCH}$** |
+| **Bid Pricing Range** | $1.34 - 1.40\text{ BYC/XCH}$ | **$\approx 1.350 - 1.357\text{ BYC/XCH}$** |
+| **Round-Trip Margin** | $0\%$ (One-sided) | **$15\% - 25\%$ per fill cycle** |
 | **PID Authority** | Saturated at min limit | **Dynamic adaptation ($0.82\times - 1.30\times$)** |
 | **Circuit Breakers** | Tripped by phantom PnL swing | **Clear & stable (`xop_posting_gated: 0`)** |
+| **Competitive Anchor** | Collapsed wide ladder to 45 bps | **Per-pair override disables anchor on wide pairs** |
 
 ---
 
@@ -149,6 +161,8 @@ flowchart TD
 - [x] Update `cpp/src/engine.cpp` Step 8 to use `classify_cross_bbo`.
 - [x] Add `max_half_spread_bps_override` and `tier_spacing_bps_override` to `XCH/BYC` in `config.yaml`.
 - [x] Configure `market_data.book_side_agree_max_spread_bps: 1500.0` in `config.yaml`.
+- [x] Implement per-pair `competitive_anchor_enabled_override` in `cpp/include/xop/config.hpp`, `cpp/src/config.cpp`, and `cpp/src/engine.cpp`.
+- [x] Set `competitive_anchor_enabled_override: false` for `XCH/BYC` in `config.yaml`.
 - [x] Compile Release build using CMake (`cmake --build cpp/build --config Release`).
-- [x] Run test suite (`ctest -C Release -R CrossGuard`).
-- [x] Restart engine and verify live two-sided quotes on Dexie without breaker trips.
+- [x] Run test suite (`ctest -C Release`).
+- [x] Restart engine and verify live two-sided quotes on Dexie without feedback loops or breaker trips.

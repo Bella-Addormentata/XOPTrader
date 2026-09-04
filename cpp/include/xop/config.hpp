@@ -139,6 +139,9 @@ struct PairConfig {
     std::optional<std::vector<double>> tier_size_pct_override;
     std::optional<double>   max_half_spread_bps_override;
     std::optional<double>   min_offer_size_units_override;
+    std::optional<bool>     competitive_anchor_enabled_override;
+    std::optional<double>   competitive_anchor_max_distance_bps_override;
+    std::optional<double>   competitive_anchor_stride_bps_override;
 
     // [BBOPERPAIR 2026-09-01] Per-pair BBO proximity caps.
     //

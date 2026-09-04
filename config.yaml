@@ -82,6 +82,7 @@ pairs:
   - 1400.0
   bbo_sanity_max_passive_dev_override: 0.60
   bbo_sanity_max_aggressive_dev_override: 0.10
+  competitive_anchor_enabled_override: false
 - base_asset_id: ae1536f56760e471ad85ead45f00d680ff9cca73b8cc3407be778f1c0c606eac
   depeg_bail_pct: 10.0
   depeg_sustained_blocks: 30

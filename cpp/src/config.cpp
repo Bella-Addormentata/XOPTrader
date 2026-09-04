@@ -808,6 +808,33 @@ std::vector<PairConfig> parse_pairs(const YAML::Node& root)
         read_dev_override("bbo_sanity_max_passive_dev_override",
                           p.bbo_sanity_max_passive_dev_override);
 
+        if (item["competitive_anchor_enabled_override"]
+            && item["competitive_anchor_enabled_override"].IsDefined()
+            && !item["competitive_anchor_enabled_override"].IsNull()) {
+            p.competitive_anchor_enabled_override =
+                item["competitive_anchor_enabled_override"].as<bool>();
+        }
+        if (item["competitive_anchor_max_distance_bps_override"]
+            && item["competitive_anchor_max_distance_bps_override"].IsDefined()
+            && !item["competitive_anchor_max_distance_bps_override"].IsNull()) {
+            double v = item["competitive_anchor_max_distance_bps_override"].as<double>();
+            if (!(v > 0.0)) {
+                throw ConfigError(idx + ".competitive_anchor_max_distance_bps_override must be > 0; got "
+                                  + std::to_string(v));
+            }
+            p.competitive_anchor_max_distance_bps_override = v;
+        }
+        if (item["competitive_anchor_stride_bps_override"]
+            && item["competitive_anchor_stride_bps_override"].IsDefined()
+            && !item["competitive_anchor_stride_bps_override"].IsNull()) {
+            double v = item["competitive_anchor_stride_bps_override"].as<double>();
+            if (!(v > 0.0)) {
+                throw ConfigError(idx + ".competitive_anchor_stride_bps_override must be > 0; got "
+                                  + std::to_string(v));
+            }
+            p.competitive_anchor_stride_bps_override = v;
+        }
+
         if (item["min_offer_size_units_override"]
             && item["min_offer_size_units_override"].IsDefined()
             && !item["min_offer_size_units_override"].IsNull()) {

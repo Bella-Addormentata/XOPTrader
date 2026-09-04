@@ -464,10 +464,10 @@ Engine::Engine(const AppConfig& config, bool dry_run)
         liq_cfg.max_gap_scan_bps   = config_.strategy.max_gap_scan_bps;
         liq_cfg.gap_blend_factor   = config_.strategy.gap_blend_factor;
 
-        // Competitive anchor pricing.
-        liq_cfg.competitive_anchor_enabled           = config_.strategy.competitive_anchor_enabled;
-        liq_cfg.competitive_anchor_max_distance_bps  = config_.strategy.competitive_anchor_max_distance_bps;
-        liq_cfg.competitive_anchor_stride_bps        = config_.strategy.competitive_anchor_stride_bps;
+        // Competitive anchor pricing (per-pair override takes precedence).
+        liq_cfg.competitive_anchor_enabled           = pair.competitive_anchor_enabled_override.value_or(config_.strategy.competitive_anchor_enabled);
+        liq_cfg.competitive_anchor_max_distance_bps  = pair.competitive_anchor_max_distance_bps_override.value_or(config_.strategy.competitive_anchor_max_distance_bps);
+        liq_cfg.competitive_anchor_stride_bps        = pair.competitive_anchor_stride_bps_override.value_or(config_.strategy.competitive_anchor_stride_bps);
 
         // Adverse-selection-aware tier sizing.
         liq_cfg.adverse_selection_sizing           = config_.strategy.adverse_selection_sizing;
@@ -9653,13 +9653,18 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             }
         }
 
+        const PairConfig* cur_pc = find_pair_config(pair_name);
+        const bool anchor_active = cur_pc
+            ? cur_pc->competitive_anchor_enabled_override.value_or(config_.strategy.competitive_anchor_enabled)
+            : config_.strategy.competitive_anchor_enabled;
+
         auto tier_classes = offer_mgr_->classify_tier_staleness(
             pair_name, pcs.ladder, block_height,
             config_.strategy.offer_ttl_blocks,
             static_cast<Mojo>(std::llround(
                 market_data_->get_mid_price(pair_name)
                 * static_cast<double>(kMojosPerXch))),
-            config_.strategy.competitive_anchor_enabled,
+            anchor_active,
             can_bid_rebalance,
             can_ask_rebalance);
 
