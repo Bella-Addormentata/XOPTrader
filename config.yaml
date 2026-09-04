@@ -278,6 +278,7 @@ volatility:
   candle_aggregation_blocks: 10
 market_data:
   min_competitor_offer_size: 100000000000
+  book_side_agree_max_spread_bps: 1500.0
 monitoring:
   prometheus_port: 19090
 depeg:

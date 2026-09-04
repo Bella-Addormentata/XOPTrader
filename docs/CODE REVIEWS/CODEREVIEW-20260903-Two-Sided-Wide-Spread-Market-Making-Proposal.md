@@ -102,6 +102,10 @@ XOPTrader maintains per-pair PID controllers (`SpreadPidState` and `Competitiven
    * **Quiet Regime ($\text{fills} = 0$):** Multiplier tightens (e.g. $0.82\times$), stepping inward (e.g. $500\text{ bps} \to 410\text{ bps}$) to attract order flow.
    * **Active Regime ($\text{frequent fills}$):** Multiplier expands (up to $1.30\times$), stepping outward (e.g. $500\text{ bps} \to 650\text{ bps}$) to capture larger margins and avoid adverse selection.
 
+### E. Valuation Grade & Rolling-Window Breaker Protection
+* **The Vulnerability:** When `XCH/BYC` spread narrowed to ~30% upon posting wide asks, the book earned `mid_valuation_grade = true` under the default $5,000\text{ bps}$ ($50\%$) agreement ceiling. In Step 11, `PnLTracker::mark_to_market` marked the wallet's $78.57\text{ XCH}$ balance against `XCH/BYC`'s mid ($1.81\text{ USD}$) instead of true spot ($1.44\text{ USD}$), causing a phantom $+\$28.85$ PnL spike followed by a $-\$32.20$ drop on reversion, which tripped Step 13's rolling-window loss circuit breaker.
+* **The Solution:** Set `market_data.book_side_agree_max_spread_bps: 1500.0` ($15\%$) in `config.yaml`. Books with spread $> 15\%$ are denied `mid_valuation_grade` and safely excluded from marking base asset equity, completely eliminating phantom PnL swings while allowing normal quoting to proceed.
+
 ---
 
 ## 4. Expected Outcomes & Success Verification
@@ -121,10 +125,11 @@ flowchart TD
 | :--- | :--- | :--- |
 | **Active Dexie Asks** | $0$ (100% suppressed) | **Active resting offers (4–6 tiers)** |
 | **Active Dexie Bids** | 6 active | **Active resting offers (5–6 tiers)** |
-| **Ask Pricing Range** | None | **$\approx 2.07 - 2.25\text{ BYC/XCH}$** |
-| **Bid Pricing Range** | $1.34 - 1.40\text{ BYC/XCH}$ | **$\approx 1.35 - 1.38\text{ BYC/XCH}$** |
+| **Ask Pricing Range** | None | **$\approx 2.33 - 2.36\text{ BYC/XCH}$** |
+| **Bid Pricing Range** | $1.34 - 1.40\text{ BYC/XCH}$ | **$\approx 1.35 - 1.36\text{ BYC/XCH}$** |
 | **Round-Trip Margin** | $0\%$ (One-sided) | **$15\% - 35\%$ per fill cycle** |
 | **PID Authority** | Saturated at min limit | **Dynamic adaptation ($0.82\times - 1.30\times$)** |
+| **Circuit Breakers** | Tripped by phantom PnL swing | **Clear & stable (`xop_posting_gated: 0`)** |
 
 ---
 
@@ -141,8 +146,9 @@ flowchart TD
 
 ## 6. Implementation Checklist
 
-- [ ] Update `cpp/src/engine.cpp` Step 8 to use `classify_cross_bbo`.
-- [ ] Add `max_half_spread_bps_override` and `tier_spacing_bps_override` to `XCH/BYC` in `config.yaml`.
-- [ ] Compile Release build using CMake (`cmake --build cpp/build --config Release`).
-- [ ] Run test suite (`ctest -C Release -R CrossGuard`).
-- [ ] Restart engine and monitor Step 7 / Step 8 logs for two-sided offer generation.
+- [x] Update `cpp/src/engine.cpp` Step 8 to use `classify_cross_bbo`.
+- [x] Add `max_half_spread_bps_override` and `tier_spacing_bps_override` to `XCH/BYC` in `config.yaml`.
+- [x] Configure `market_data.book_side_agree_max_spread_bps: 1500.0` in `config.yaml`.
+- [x] Compile Release build using CMake (`cmake --build cpp/build --config Release`).
+- [x] Run test suite (`ctest -C Release -R CrossGuard`).
+- [x] Restart engine and verify live two-sided quotes on Dexie without breaker trips.
