@@ -8241,9 +8241,11 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                 }
             };
 
-            // Bids: clamp down to snap.best_ask, stepping down for successive tiers
+            // Bids: clamp down below snap.best_ask, stepping down for successive tiers
             if (snap.best_ask > 0) {
-                Mojo next_max = snap.best_ask;
+                Mojo next_max = static_cast<Mojo>(std::llround(
+                    static_cast<double>(snap.best_ask)
+                    * (1.0 - std::max(1.0, step_bps) / 10'000.0)));
                 for (TierQuote* tqp : tiers_in_order(Side::Bid)) {
                     TierQuote& tq = *tqp;
                     if (tq.price > next_max) {
@@ -8262,9 +8264,11 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                 }
             }
 
-            // Asks: clamp up to snap.best_bid, stepping up for successive tiers
+            // Asks: clamp up above snap.best_bid, stepping up for successive tiers
             if (snap.best_bid > 0) {
-                Mojo next_min = snap.best_bid;
+                Mojo next_min = static_cast<Mojo>(std::llround(
+                    static_cast<double>(snap.best_bid)
+                    * (1.0 + std::max(1.0, step_bps) / 10'000.0)));
                 for (TierQuote* tqp : tiers_in_order(Side::Ask)) {
                     TierQuote& tq = *tqp;
                     if (tq.price < next_min) {

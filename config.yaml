@@ -81,7 +81,7 @@ pairs:
   - 3200.0
   - 4500.0
   bbo_sanity_max_passive_dev_override: 0.80
-  bbo_sanity_max_aggressive_dev_override: 0.10
+  bbo_sanity_max_aggressive_dev_override: 0.80
   competitive_anchor_enabled_override: false
   fair_value_residual_widen_ratio_override: 0.0
 - base_asset_id: ae1536f56760e471ad85ead45f00d680ff9cca73b8cc3407be778f1c0c606eac
