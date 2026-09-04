@@ -7701,6 +7701,62 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
         // Query per-tier fill rates from the offer log for adaptive sizing.
         LiquidityConfig ladder_cfg = liq.config();
 
+        // 24-hour activity-adaptive margin and spacing scaling
+        const bool activity_adaptive = pair_cfg
+            ? pair_cfg->activity_adaptive_spacing_override.value_or(config_.strategy.activity_adaptive_spacing)
+            : config_.strategy.activity_adaptive_spacing;
+
+        double effective_bid_margin_bps = pair_cfg
+            ? pair_cfg->min_profit_margin_bps_override.value_or(config_.strategy.min_profit_margin_bps)
+            : config_.strategy.min_profit_margin_bps;
+        double effective_ask_margin_bps = effective_bid_margin_bps;
+
+        if (activity_adaptive && db_) {
+            const std::uint32_t lookback = config_.strategy.activity_lookback_blocks;
+            const BlockHeight since_block = (block_height > lookback) ? (block_height - lookback) : BlockHeight{0};
+            const auto [bids_24h, asks_24h] = db_->query_trade_counts_by_side(pair_name, since_block);
+
+            const int target_fills = pair_cfg
+                ? pair_cfg->activity_target_fills_24h_override.value_or(config_.strategy.activity_target_fills_24h)
+                : config_.strategy.activity_target_fills_24h;
+            const double target_d = std::max(1.0, static_cast<double>(target_fills));
+
+            const double alpha_bid = std::clamp(static_cast<double>(bids_24h) / target_d, 0.0, 1.0);
+            const double alpha_ask = std::clamp(static_cast<double>(asks_24h) / target_d, 0.0, 1.0);
+
+            // Margin interpolation: at 0 fills -> max_margin; at >= target fills -> min_margin
+            const double min_margin = effective_bid_margin_bps;
+            const double max_margin = (pair_cfg && pair_cfg->min_profit_margin_max_bps_override.has_value())
+                ? pair_cfg->min_profit_margin_max_bps_override.value()
+                : std::max(min_margin, min_margin * 2.0);
+
+            effective_bid_margin_bps = max_margin - alpha_bid * (max_margin - min_margin);
+            effective_ask_margin_bps = max_margin - alpha_ask * (max_margin - min_margin);
+
+            // Spacing interpolation: at 0 fills -> max_spacing; at >= target fills -> min_spacing
+            const auto& min_spacings = ladder_cfg.tier_spacing_bps;
+            const auto& max_spacings = (pair_cfg && pair_cfg->tier_spacing_max_bps_override.has_value())
+                ? pair_cfg->tier_spacing_max_bps_override.value()
+                : min_spacings;
+
+            ladder_cfg.tier_spacing_bps_bid.resize(ladder_cfg.num_tiers);
+            ladder_cfg.tier_spacing_bps_ask.resize(ladder_cfg.num_tiers);
+
+            for (std::size_t i = 0; i < ladder_cfg.num_tiers; ++i) {
+                const double min_s = (i < min_spacings.size()) ? min_spacings[i] : (100.0 * (i + 1));
+                const double max_s = (i < max_spacings.size()) ? max_spacings[i] : min_s;
+                ladder_cfg.tier_spacing_bps_bid[i] = max_s - alpha_bid * (max_s - min_s);
+                ladder_cfg.tier_spacing_bps_ask[i] = max_s - alpha_ask * (max_s - min_s);
+            }
+
+            spdlog::info("[Engine] Step 7: {} 24h activity: {} bids ({:.1f}%), {} asks ({:.1f}%) "
+                         "-> bid_margin={:.0f}bps, ask_margin={:.0f}bps, bid_spacing_0={:.0f}bps, ask_spacing_0={:.0f}bps",
+                         pair_name, bids_24h, alpha_bid * 100.0, asks_24h, alpha_ask * 100.0,
+                         effective_bid_margin_bps, effective_ask_margin_bps,
+                         ladder_cfg.tier_spacing_bps_bid.empty() ? 0.0 : ladder_cfg.tier_spacing_bps_bid.front(),
+                         ladder_cfg.tier_spacing_bps_ask.empty() ? 0.0 : ladder_cfg.tier_spacing_bps_ask.front());
+        }
+
         // Shift the whole spacing schedule outward (preserving inter-tier
         // gaps, so the ladder keeps its shape and tiers stay distinct) when
         // the innermost tier sits inside the minimum half-spread.
@@ -7710,6 +7766,8 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
             const double delta = quote_min_half_spread_bps
                                - ladder_cfg.tier_spacing_bps.front();
             for (double& s : ladder_cfg.tier_spacing_bps) s += delta;
+            for (double& s : ladder_cfg.tier_spacing_bps_bid) s += delta;
+            for (double& s : ladder_cfg.tier_spacing_bps_ask) s += delta;
             spdlog::info("[Engine] Step 7: {} sigma width floor: tier "
                          "spacing shifted +{:.0f}bps (min_half_spread="
                          "{:.0f}bps, combined_sigma={:.0f}bps, k={:.2f})",
@@ -8218,7 +8276,9 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
             int clamped_asks = 0;
 
             const double step_bps = std::max(
-                0.0, config_.strategy.fair_value_clamp_tier_step_bps);
+                50.0, config_.strategy.fair_value_clamp_tier_step_bps);
+            const double ask_margin_bps = std::max(step_bps, effective_ask_margin_bps);
+            const double bid_margin_bps = std::max(step_bps, effective_bid_margin_bps);
 
             auto tiers_in_order = [&](Side side) {
                 std::vector<TierQuote*> out;
@@ -8245,7 +8305,7 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
             if (snap.best_ask > 0) {
                 Mojo next_max = static_cast<Mojo>(std::llround(
                     static_cast<double>(snap.best_ask)
-                    * (1.0 - std::max(1.0, step_bps) / 10'000.0)));
+                    * (1.0 - bid_margin_bps / 10'000.0)));
                 for (TierQuote* tqp : tiers_in_order(Side::Bid)) {
                     TierQuote& tq = *tqp;
                     if (tq.price > next_max) {
@@ -8268,7 +8328,7 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
             if (snap.best_bid > 0) {
                 Mojo next_min = static_cast<Mojo>(std::llround(
                     static_cast<double>(snap.best_bid)
-                    * (1.0 + std::max(1.0, step_bps) / 10'000.0)));
+                    * (1.0 + ask_margin_bps / 10'000.0)));
                 for (TierQuote* tqp : tiers_in_order(Side::Ask)) {
                     TierQuote& tq = *tqp;
                     if (tq.price < next_min) {
@@ -11380,6 +11440,22 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 const int queue_ahead_score = score_queue_position(
                     queue_ahead_mojos,
                     tier.size);
+
+                const bool pair_comp_anchor_enabled = pair_cfg_comp
+                    ? pair_cfg_comp->competitive_anchor_enabled_override.value_or(config_.strategy.competitive_anchor_enabled)
+                    : config_.strategy.competitive_anchor_enabled;
+
+                if (!pair_comp_anchor_enabled) {
+                    spdlog::debug(
+                        "[Engine] Step 8: {} {} tier {} kept at wide spread -- "
+                        "competitiveness waived (competitive anchor disabled)",
+                        pair_name,
+                        (tier.side == Side::Bid ? "bid" : "ask"),
+                        tier.tier_index);
+                    competitive_tiers.push_back(tier);
+                    continue;
+                }
+
                 if (score >= kMinCompetitivenessScore) {
                     competitive_tiers.push_back(tier);
                     continue;

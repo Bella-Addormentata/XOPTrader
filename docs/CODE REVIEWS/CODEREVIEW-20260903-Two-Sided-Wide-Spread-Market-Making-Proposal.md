@@ -140,6 +140,19 @@ XOPTrader maintains per-pair PID controllers (`SpreadPidState` and `Competitiven
      - Spans from $-10\%$ down to $-38\%$ on Bids: **$1.35, 1.30, 1.24, 1.20, 1.17, 1.13\text{ BYC/XCH}$**.
      - Takers sweeping the book are forced to walk up the ladder, capturing progressively higher profit margins ($10\% \to 50\%$).
 
+### I. Dynamic 24-Hour Activity-Adaptive Margin & Spacing Controller
+* **The Concept:**
+  - In illiquid markets ("desert books"), quoting tight spreads exposes the market maker to adverse selection with no compensation. When the market is quiet ($0$ fills in trailing 24 hours), the engine should extract the **maximum liquidity premium** ($M_{\text{max}}$, $S_{\text{max}}$).
+  - When trade velocity accelerates to $\ge 1\text{ fill/hour}$ on a side ($\ge 24$ fills in 24h), inventory turnover velocity is high, and spreads can safely compress to the tightest setting ($M_{\text{min}}$, $S_{\text{min}}$) to compete for flow.
+* **The Implementation:**
+  1. **Database Query (`cpp/src/database.cpp`):** Added `Database::query_trade_counts_by_side` to query confirmed fills grouped by side from `trade_log` within the 24-hour lookback window (default 1,662 blocks).
+  2. **Asymmetric Per-Side Activity Scores ($\alpha_{\text{bid}}, \alpha_{\text{ask}}$):**
+     $$\alpha_s = \min\left(1.0, \; \frac{N_s^{24\text{h}}}{N_{\text{target}}}\right)$$
+  3. **Continuous Interpolation (`cpp/src/engine.cpp` Step 7):**
+     $$M_{\text{eff}, s} = M_{\text{max}} - \alpha_s \cdot (M_{\text{max}} - M_{\text{min}})$$
+     $$S_{\text{eff}, s}[i] = S_{\text{max}}[i] - \alpha_s \cdot \big(S_{\text{max}}[i] - S_{\text{min}}[i]\big)$$
+  4. **Order-Book Clamp Protection:** Clamping against `snap.best_bid` / `snap.best_ask` enforces a minimum margin of $\max(\text{step\_bps}, M_{\text{eff}, s})$, ensuring our top ask never rests flush against the best bid and always captures the intended profit margin.
+
 ---
 
 ## 4. Expected Outcomes & Success Verification

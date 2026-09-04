@@ -295,6 +295,49 @@ TEST(DatabaseTest, FilledStatusRemainsAuthoritativeAfterLaterReconcile)
     close_db();
 }
 
+TEST(DatabaseTest, TradeCountsBySideSinceBlock)
+{
+    TempDbPath temp_db{"xop_trade_counts_by_side"};
+    xop::Database db(temp_db.path().string());
+
+    auto insert_trade = [&](const std::string& id, const std::string& pair, const std::string& side, xop::BlockHeight block) {
+        xop::DbTradeRecord tr;
+        tr.timestamp = "2026-09-04T12:00:00Z";
+        tr.trade_id = id;
+        tr.pair_name = pair;
+        tr.side = side;
+        tr.price_mojos = 1500000000000LL;
+        tr.size_mojos = 1000000000000LL;
+        tr.fee_mojos = 10000;
+        tr.cost_basis_mojos = 1400000000000LL;
+        tr.realized_pnl_mojos = 100;
+        tr.block_height = block;
+        db.insert_trade(tr);
+    };
+
+    insert_trade("t1", "XCH/BYC", "bid", 100);
+    insert_trade("t2", "XCH/BYC", "bid", 150);
+    insert_trade("t3", "XCH/BYC", "ask", 120);
+    insert_trade("t4", "XCH/BYC", "ask", 200);
+    insert_trade("t5", "XCH/BYC", "ask", 250);
+    insert_trade("t6", "XCH/DBX", "bid", 250); // different pair
+
+    // Query since block 100
+    auto counts_100 = db.query_trade_counts_by_side("XCH/BYC", 100);
+    EXPECT_EQ(counts_100.first, 2);  // 2 bids
+    EXPECT_EQ(counts_100.second, 3); // 3 asks
+
+    // Query since block 150
+    auto counts_150 = db.query_trade_counts_by_side("XCH/BYC", 150);
+    EXPECT_EQ(counts_150.first, 1);  // 1 bid (t2)
+    EXPECT_EQ(counts_150.second, 2); // 2 asks (t4, t5)
+
+    // Query since block 300 (future)
+    auto counts_300 = db.query_trade_counts_by_side("XCH/BYC", 300);
+    EXPECT_EQ(counts_300.first, 0);
+    EXPECT_EQ(counts_300.second, 0);
+}
+
 // ===========================================================================
 // inventory_state -- cost-basis persistence (PNL-BASIS-PERSIST, 2026-07-30)
 // ===========================================================================
