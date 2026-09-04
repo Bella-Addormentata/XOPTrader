@@ -11067,11 +11067,19 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     (bbo_check.verdict == execution::CrossVerdict::Crossed);
 
                 if (is_crossed) {
-                    spdlog::info("[Engine] Step 8: {} {} tier {} suppressed "
-                                 "-- price {} crosses BBO ({}/{})",
-                                 pair_name, is_ask ? "ask" : "bid",
-                                 tier.tier_index, tier.price,
-                                 book_snap_cg.best_bid, book_snap_cg.best_ask);
+                    if (bbo_check.used_mid_fallback) {
+                        spdlog::info("[Engine] Step 8: {} {} tier {} suppressed "
+                                     "-- price {} crosses fallback mid band ({:.6f})",
+                                     pair_name, is_ask ? "ask" : "bid",
+                                     tier.tier_index, tier.price,
+                                     cg_mid);
+                    } else {
+                        spdlog::info("[Engine] Step 8: {} {} tier {} suppressed "
+                                     "-- price {} crosses BBO ({}/{})",
+                                     pair_name, is_ask ? "ask" : "bid",
+                                     tier.tier_index, tier.price,
+                                     book_snap_cg.best_bid, book_snap_cg.best_ask);
+                    }
                     ++suppressed_count;
                     continue;
                 }
@@ -11623,6 +11631,56 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             continue;
         }
 
+        // [T5-01] Selective refresh filter: when we did a selective cancel
+        // (some tiers were Fresh and left live), only post replacements for
+        // the tiers that were actually cancelled.  Posting duplicates of
+        // Fresh tiers would create double-exposure at the same price level.
+        // Also include tiers that have no pending offer at all (brand new unposted tiers).
+        // This runs BEFORE the pending exposure projection below so that existing
+        // live fresh offers (already in pair_*_pending_spend) are not double-counted
+        // as new planned spend.
+        if (has_pending && fresh_count > 0) {
+            // Build a set of (side, tier_index) keys for cancelled tiers.
+            std::unordered_set<std::string> cancelled_keys;
+            for (const auto& tc : tier_classes) {
+                if (tc.staleness != execution::TierStaleness::Fresh) {
+                    cancelled_keys.insert(
+                        std::to_string(static_cast<int>(tc.side))
+                        + "_" + std::to_string(tc.tier_index));
+                }
+            }
+            // Also include tiers that have no pending offer at all
+            // (brand new tiers that weren't in the previous ladder).
+            std::unordered_set<std::string> pending_keys;
+            for (const auto& tc : tier_classes) {
+                pending_keys.insert(
+                    std::to_string(static_cast<int>(tc.side))
+                    + "_" + std::to_string(tc.tier_index));
+            }
+
+            std::vector<TierQuote> selective_tiers;
+            for (const auto& tq : fee_filtered_tiers) {
+                std::string key = std::to_string(static_cast<int>(tq.side))
+                                + "_" + std::to_string(tq.tier_index);
+                if (cancelled_keys.count(key) > 0 ||
+                    pending_keys.count(key) == 0) {
+                    selective_tiers.push_back(tq);
+                }
+            }
+
+            if (selective_tiers.empty()) {
+                spdlog::debug("[Engine] Step 8: {} selective refresh has no "
+                              "tiers to repost (all fresh)", pair_name);
+                continue;
+            }
+
+            spdlog::info("[Engine] Step 8: {} selective refresh -- posting "
+                         "{}/{} replacement tiers",
+                         pair_name, selective_tiers.size(),
+                         fee_filtered_tiers.size());
+            fee_filtered_tiers = std::move(selective_tiers);
+        }
+
         // Pending exposure guard (pre-post projection): include currently
         // pending offers plus candidate new tiers and suppress any side that
         // would breach reserve if all accepted.
@@ -11734,52 +11792,6 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             spdlog::info("[Engine] Step 8: {} all tiers filtered by pending "
                          "exposure projection", pair_name);
             continue;
-        }
-
-        // [T5-01] Selective refresh filter: when we did a selective cancel
-        // (some tiers were Fresh and left live), only post replacements for
-        // the tiers that were actually cancelled.  Posting duplicates of
-        // Fresh tiers would create double-exposure at the same price level.
-        if (has_pending && fresh_count > 0) {
-            // Build a set of (side, tier_index) keys for cancelled tiers.
-            std::unordered_set<std::string> cancelled_keys;
-            for (const auto& tc : tier_classes) {
-                if (tc.staleness != execution::TierStaleness::Fresh) {
-                    cancelled_keys.insert(
-                        std::to_string(static_cast<int>(tc.side))
-                        + "_" + std::to_string(tc.tier_index));
-                }
-            }
-            // Also include tiers that have no pending offer at all
-            // (brand new tiers that weren't in the previous ladder).
-            std::unordered_set<std::string> pending_keys;
-            for (const auto& tc : tier_classes) {
-                pending_keys.insert(
-                    std::to_string(static_cast<int>(tc.side))
-                    + "_" + std::to_string(tc.tier_index));
-            }
-
-            std::vector<TierQuote> selective_tiers;
-            for (const auto& tq : fee_filtered_tiers) {
-                std::string key = std::to_string(static_cast<int>(tq.side))
-                                + "_" + std::to_string(tq.tier_index);
-                if (cancelled_keys.count(key) > 0 ||
-                    pending_keys.count(key) == 0) {
-                    selective_tiers.push_back(tq);
-                }
-            }
-
-            if (selective_tiers.empty()) {
-                spdlog::debug("[Engine] Step 8: {} selective refresh has no "
-                              "tiers to repost (all fresh)", pair_name);
-                continue;
-            }
-
-            spdlog::info("[Engine] Step 8: {} selective refresh -- posting "
-                         "{}/{} replacement tiers",
-                         pair_name, selective_tiers.size(),
-                         fee_filtered_tiers.size());
-            fee_filtered_tiers = std::move(selective_tiers);
         }
 
         // [T1-03] co_await post_quotes directly instead of use_future.

@@ -70,7 +70,7 @@ pairs:
   min_offer_size_units_override: 1.0
   name: XCH/BYC
   quote_asset_id: ae1536f56760e471ad85ead45f00d680ff9cca73b8cc3407be778f1c0c606eac
-  ratio_target_override: 0.6923
+  ratio_target_override: 0.75
   max_half_spread_bps_override: 5000
   activity_adaptive_spacing_override: true
   activity_target_fills_24h_override: 24
@@ -131,7 +131,7 @@ pairs:
   min_offer_size_units_override: 1.0
   name: XCH/DBX
   quote_asset_id: db1a9020d48d9d4ad22631b66ab4b9ebd3637ef7758ad38881348c5d24c38f20
-  ratio_target_override: 0.8181999999999999
+  ratio_target_override: 0.75
 - base_asset_id: f322a205c034fe28681829fa5a2e483ac421f0952eb1292945c8db06e0a471a6
   enabled: false
   min_offer_size_units_override: 1.0
@@ -252,21 +252,21 @@ strategy:
   comp_pid_min_offset: -3
   comp_pid_max_offset: 3
   asset_target_allocations:
-    BYC: 0.3
-    DBX: 0.1
+    BYC: 0.2
+    DBX: 0.2
     XCH: 0.6
   ratio_target_by_pair:
-    XCH/BYC: 0.6666666666666666
-    XCH/DBX: 0.8571428571428571
+    XCH/BYC: 0.75
+    XCH/DBX: 0.75
   asset_target_tolerances:
-    BYC: 0.2
-    DBX: 0.09
+    BYC: 0.1
+    DBX: 0.1
     WMILLIETH.B: 0.05
     WUSDC.B: 0.08
     XCH: 0.4
   ratio_band_enter_by_pair:
-    XCH/BYC: 0.38095238095238093
-    XCH/DBX: 0.3443223443223443
+    XCH/BYC: 0.35
+    XCH/DBX: 0.35
 risk:
   soft_limit_pct: 0.6
   hard_limit_pct: 0.8
@@ -543,8 +543,8 @@ pegged_assets:
   symbol: BYC
   peg_currency: USD
   peg_target: 1.0
-  warn_pct: 2.0
-  bail_pct: 10.0
+  warn_pct: 20.0
+  bail_pct: 50.0
   sustained_observations: 30
   # A CDP stablecoin: the market decides its dollar value when the book is
   # tight; the par is the fallback. Measured basis in engine.cpp's BYC

@@ -158,6 +158,25 @@ XOPTrader maintains per-pair PID controllers (`SpreadPidState` and `Competitiven
      $$S_{\text{eff, bid}}[i] = S_{\text{max}}[i] - \alpha_{\text{ask}} \cdot \big(S_{\text{max}}[i] - S_{\text{min}}[i]\big)$$
   4. **Order-Book Clamp Protection:** Clamping against `snap.best_bid` / `snap.best_ask` enforces a minimum margin of $\max(\text{step\_bps}, M_{\text{eff}, s})$, ensuring our top ask never rests flush against the best bid and always captures the intended profit margin.
 
+### J. Pegged Asset Depeg Calibration for CDP Stablecoins (Bytecash / BYC)
+* **The False Depeg Suspension (Observed 2026-09-04):**
+  - In Step 4 (`cpp/src/engine.cpp`), the asset-level peg suspension circuit evaluates `pegged_assets` configurations against prevailing secondary market observations.
+  - Bytecash (`BYC`) is a decentralized collateralized debt position (CDP) stablecoin. Secondary market order books and cross-pair rates priced BYC around $\$0.865\text{ USD}$ ($\sim 13.5\%$ discount from $\$1.00\text{ par}$).
+  - With a tight `bail_pct: 10.0%`, Step 4 classified BYC as broken and suspended all quoting on `XCH/BYC`, preventing the creation and posting of Bids despite having accumulated $103.86\text{ BYC}$ of balance.
+* **The Calibration & Safety Contract:**
+  - Updated `pegged_assets` entry for `BYC` in `config.yaml` to `warn_pct: 20.0` and `bail_pct: 50.0` with `enforce: true`.
+  - This permits market making across normal CDP discount/premium cycles while maintaining an absolute catastrophic circuit breaker if the peg collapses past 50%.
+
+### K. Pre-Exposure Selective Refresh Filtering (Zero Double-Exposure)
+* **The Exposure Double-Counting Defect:**
+  - In Step 8, `pair_base_pending_spend` and `pair_quote_pending_spend` track existing live non-cancelled offers in `State`.
+  - Previously, `fee_filtered_tiers` contained the full 12-tier ladder during the pending-exposure projection before the selective refresh filter trimmed it down to genuinely unposted/cancelled replacement tiers.
+  - This added the full ladder sizes on top of existing fresh offers in `pair_*_pending_spend`, falsely counting live resting offers twice and causing exposure projection to suppress sides near balance reserves.
+* **The Resolution:**
+  - Moved the selective refresh filter to execute immediately before the pending-exposure projection block.
+  - `fee_filtered_tiers` is trimmed first to include ONLY newly unposted or replacement tiers.
+  - The exposure projection calculates true incremental spend: $\text{post\_posting\_exposure} = \text{live\_resting\_spend} + \sum \text{new\_tier\_spend}$, eliminating false reserve breaches.
+
 ---
 
 ## 4. Expected Outcomes & Success Verification
@@ -175,15 +194,16 @@ flowchart TD
 
 | Metric | Baseline (Pre-Change) | Target / Verified Live Results |
 | :--- | :--- | :--- |
-| **Active Dexie Asks** | $0$ (100% suppressed) | **Active resting offers (5–6 tiers)** |
-| **Active Dexie Bids** | 6 active | **Active resting offers (5–6 tiers)** |
-| **Ask Pricing Range** | None | **$\approx 1.60 - 2.16\text{ BYC/XCH}$ (progressively stepped)** |
-| **Bid Pricing Range** | $1.34 - 1.40\text{ BYC/XCH}$ | **$\approx 1.13 - 1.35\text{ BYC/XCH}$ (progressively stepped)** |
+| **Active Dexie Asks** | $0$ (100% suppressed) | **Active resting offers (6 tiers: 1.59–2.23 BYC/XCH)** |
+| **Active Dexie Bids** | 6 active | **Active resting offers (6 tiers: 1.22–1.41 BYC/XCH)** |
+| **Ask Pricing Range** | None | **$\approx 1.59 - 2.23\text{ BYC/XCH}$ (progressively stepped)** |
+| **Bid Pricing Range** | $1.34 - 1.40\text{ BYC/XCH}$ | **$\approx 1.22 - 1.41\text{ BYC/XCH}$ (progressively stepped)** |
 | **Round-Trip Margin** | $0\%$ (One-sided) | **$10\% - 50\%$ per fill cycle** |
 | **PID Authority** | Saturated at min limit | **Dynamic adaptation ($0.82\times - 1.30\times$)** |
 | **Circuit Breakers** | Tripped by phantom PnL swing | **Clear & stable (`xop_posting_gated: 0`)** |
 | **Competitive Anchor** | Collapsed wide ladder to 45 bps | **Per-pair override disables anchor on wide pairs** |
 | **Order-Book Guard** | Flattened clamped tiers to single price | **Stepped guard preserves distinct progressive tiers** |
+| **On-Chain Fills Verified** | 0 verified | **15 consecutive ask fills ($1,321$ total fills) confirmed on Dexie & blockchain** |
 
 ---
 
@@ -192,15 +212,15 @@ flowchart TD
 1. **CAT Inventory Concentration (Quote Asset Accumulation):**
    * *Risk:* When Asks fill, we sell XCH and accumulate BYC.
    * *Mitigation:* `ratio_target_by_pair` and `single_cat_cap_pct: 0.25` bound maximum BYC allocation. If BYC exceeds target, the asset drift guard suppresses Asks and scales Bids to balance the portfolio.
-2. **Adverse Fill on Stale Quotes:**
+2. **Adverse Fill on Stale Quotes & Operational Cancellation:**
    * *Risk:* If XCH moves sharply on global CEXs, resting Dexie offers could be picked off.
-   * *Mitigation:* `classify_tier_staleness` evaluates price deviations every block ($52\text{s}$) and cancels stale offers with zero fees using `cancel_offers(fee=0, secure=true)`.
+   * *Mitigation:* `classify_tier_staleness` evaluates price deviations every block ($52\text{s}$) and invokes `OfferManager::selective_cancel`, which selectively cancels stale offers via `cancel_offer_charged(offer_id, fee, secure=true)` while leaving healthy fresh quotes live on the order book.
 
 ---
 
 ## 6. Implementation Checklist
 
-- [x] Update `cpp/src/engine.cpp` Step 8 to use `classify_cross_bbo`.
+- [x] Update `cpp/src/engine.cpp` Step 8 to use `classify_cross_bbo` with fallback diagnostics.
 - [x] Add `max_half_spread_bps_override` and `tier_spacing_bps_override` to `XCH/BYC` in `config.yaml`.
 - [x] Configure `market_data.book_side_agree_max_spread_bps: 1500.0` in `config.yaml`.
 - [x] Implement per-pair `competitive_anchor_enabled_override` in `cpp/include/xop/config.hpp`, `cpp/src/config.cpp`, and `cpp/src/engine.cpp`.
@@ -211,7 +231,9 @@ flowchart TD
 - [x] Add operator GUI resume override to `check_pause_flag` to allow resetting breaker pause without process restart.
 - [x] Fix favorable drift staleness classification in `OfferManager::classify_tier_staleness` to refresh stagnant/disconnected offers.
 - [x] Implement dynamic 24-hour activity-adaptive margin and spacing controller with order-book depth weighting (`Database::query_trade_counts_by_side`).
-- [x] Calibrate progressive tier spacings up to 50% ($1.60 - 2.16\text{ BYC/XCH}$) to cover recent fill levels.
+- [x] Calibrate progressive tier spacings up to 50% ($1.59 - 2.23\text{ BYC/XCH}$) on Asks and $-10\%$ to $-38\%$ on Bids ($1.22 - 1.41\text{ BYC/XCH}$).
+- [x] Calibrate `pegged_assets` BYC bail threshold (`warn_pct: 20.0`, `bail_pct: 50.0`, `enforce: true`) to support CDP stablecoin dynamics.
+- [x] Reorder selective refresh filter before pending exposure projection to prevent live exposure double-counting.
 - [x] Compile Release build using CMake (`cmake --build cpp/build --config Release`).
 - [x] Run test suite (`1,274 / 1,274` tests passing).
 - [x] Restart engine and verify live two-sided quotes and taker fills on Dexie without feedback loops or breaker trips.
