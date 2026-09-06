@@ -436,7 +436,44 @@ public:
      */
     asio::awaitable<json> get_additions_and_removals(
         const std::string& header_hash);
+
+    /**
+     * @brief Sync flags the node reported on its last blockchain-state
+     *        response.
+     *
+     * [S33 2026-09-05] get_block_height() already fetches
+     * get_blockchain_state and discards everything but peak.height --
+     * including the node's own `sync` object.  Caching it here lets health
+     * reporting tell "reachable" apart from "synced" without paying a
+     * second RPC every block: a node that is still catching up answers a
+     * peak height quite happily, so connectivity is not synchronisation.
+     */
+    struct SyncState {
+        bool synced{false};   ///< blockchain_state.sync.synced
+        bool syncing{false};  ///< blockchain_state.sync.sync_mode
+    };
+
+    /// Sync flags from the most recent blockchain-state response.  Both are
+    /// false until the node has answered at least once.
+    [[nodiscard]] SyncState last_sync_state() const noexcept
+    {
+        return last_sync_state_;
+    }
+
+private:
+    SyncState last_sync_state_{};
 };
+
+/**
+ * @brief Extract the node sync flags from a get_blockchain_state response.
+ *
+ * [S33 2026-09-05] A missing or non-boolean field leaves the corresponding
+ * flag at its @p previous value rather than substituting false: "the node
+ * did not say" must never be published as "the node is not syncing".
+ */
+[[nodiscard]] ChiaFullNodeRPC::SyncState node_sync_from_blockchain_state(
+    const json&                resp,
+    ChiaFullNodeRPC::SyncState previous = {});
 
 // ---------------------------------------------------------------------------
 // ChiaWalletRPC

@@ -2,9 +2,10 @@
 // [CROSSGUARD] The pre-post crossing predicate, both versions.
 //
 // Step 8 suppresses on the BBO verdict (classify_cross_bbo), matching the
-// canceller (classify_tier_staleness). The legacy published-mid rule
-// (classify_cross_published_mid) is preserved as a fallback when BBO is
-// missing or invalid.
+// canceller (classify_tier_staleness). Its own fallback for a missing BBO
+// is the +/-5% mid band. The legacy published-mid rule
+// (classify_cross_published_mid) has no production caller and is kept only
+// as the fixed reference these tests measure the S33 change against.
 //
 // These tests pin BOTH rules and verify their behavior across normal,
 // crossed, inverted, and degenerate order books.
@@ -224,19 +225,18 @@ TEST(CrossGuard, NonFiniteBboFallsBackRatherThanTrusting)
         << "a non-finite touch is not a BBO; use the documented fallback";
 }
 
-// -- The claim the whole shadow rests on ------------------------------------
+// -- The legacy rule, pinned as a fixed reference ---------------------------
 
 TEST(CrossGuard, SuppressionIsByteIdenticalToThePreShadowRule)
 {
-    // The shadow's entire safety claim is "suppression unchanged". Step 8
-    // previously inlined:
+    // [S33 2026-09-05] Step 8 no longer calls this predicate -- it suppresses
+    // on classify_cross_bbo. What is pinned here is the LEGACY rule Step 8
+    // inlined from 4d3f30d until S33:
     //     bid: tier.price > mid  -> suppress
     //     ask: tier.price < mid  -> suppress
-    // and now suppresses on classify_cross_published_mid(...) == Crossed.
-    // If those two ever diverge, a measurement-only change has silently
-    // become a behaviour change -- which is the single worst outcome here,
-    // and exactly the shape of the regression this codebase already shipped
-    // once in Step 8.
+    // classify_cross_published_mid must stay byte-identical to it, because
+    // the disagreement tests above measure the S33 change against it. If it
+    // drifts, those tests silently start measuring something else.
     //
     // Swept rather than spot-checked, including the degenerate inputs where
     // an inequality and a guarded predicate are most likely to part company.
@@ -261,25 +261,33 @@ TEST(CrossGuard, SuppressionIsByteIdenticalToThePreShadowRule)
     }
 }
 
-TEST(CrossGuard, TheShadowVerdictNeverInfluencesSuppression)
+TEST(CrossGuard, TheLiveVerdictMovesWithTheBookAndTheLegacyOneDoesNot)
 {
-    // Structural restatement of the same guarantee: the BBO predicate is a
-    // pure function of its own arguments and shares no state with the live
-    // one, so no BBO value can change what classify_cross_published_mid
-    // returns. Demonstrated by holding the tier and mid fixed while moving
-    // the book underneath, across an inverted book and a missing one.
+    // [S33 2026-09-05] The old contract here was "the BBO verdict never
+    // influences suppression". S33 inverted it: the BBO verdict is now the
+    // ONLY thing Step 8 suppresses on, and the published-mid rule is the
+    // fixed reference the disagreement tests are measured against. So the
+    // property worth pinning is that the live rule reacts to the book while
+    // the legacy one, which cannot see it, does not.
     const double px = 100.5;
-    const auto live = classify_cross_published_mid(kBid, px, kMid);
-    EXPECT_EQ(live, CrossVerdict::Crossed);
+    const auto legacy = classify_cross_published_mid(kBid, px, kMid);
+    EXPECT_EQ(legacy, CrossVerdict::Crossed);
+
+    // Same tier, same mid, two different books -- the live rule disagrees
+    // with itself, which is exactly what makes it the decision.
+    EXPECT_EQ(classify_cross_bbo(kBid, px, 101.0, 99.0, kMid).verdict,
+              CrossVerdict::Crossed) << "inverted book: 100.5 >= best_ask 99";
+    EXPECT_EQ(classify_cross_bbo(kBid, px, kBestBid, kBestAsk, kMid).verdict,
+              CrossVerdict::Ok) << "inside the spread is a valid bid now";
 
     for (const auto& bk : {std::pair<double, double>{99.0, 101.0},
                            std::pair<double, double>{101.0, 99.0},
                            std::pair<double, double>{0.0, 0.0},
                            std::pair<double, double>{50.0, 500.0}}) {
-        const auto shadow = classify_cross_bbo(kBid, px, bk.first, bk.second,
-                                               kMid);
-        (void)shadow;
-        EXPECT_EQ(classify_cross_published_mid(kBid, px, kMid), live)
-            << "the live verdict must not move with the book";
+        const auto live = classify_cross_bbo(kBid, px, bk.first, bk.second,
+                                             kMid);
+        (void)live;
+        EXPECT_EQ(classify_cross_published_mid(kBid, px, kMid), legacy)
+            << "the legacy reference must not move with the book";
     }
 }

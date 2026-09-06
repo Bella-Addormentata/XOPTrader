@@ -643,10 +643,36 @@ ChiaFullNodeRPC::ChiaFullNodeRPC(asio::io_context& ioc, ChiaRPCConfig cfg)
     : ChiaRPCBase(ioc, std::move(cfg), "chia.fullnode")
 {}
 
+ChiaFullNodeRPC::SyncState node_sync_from_blockchain_state(
+    const json& resp, ChiaFullNodeRPC::SyncState previous)
+{
+    if (!resp.contains("blockchain_state")
+        || !resp["blockchain_state"].contains("sync"))
+    {
+        return previous;
+    }
+    const json& node_sync = resp["blockchain_state"]["sync"];
+    if (node_sync.contains("synced") && node_sync["synced"].is_boolean()) {
+        previous.synced = node_sync["synced"].get<bool>();
+    }
+    // Chia names the in-progress flag `sync_mode`, not `syncing`.
+    if (node_sync.contains("sync_mode")
+        && node_sync["sync_mode"].is_boolean())
+    {
+        previous.syncing = node_sync["sync_mode"].get<bool>();
+    }
+    return previous;
+}
+
 asio::awaitable<std::int64_t> ChiaFullNodeRPC::get_block_height()
 {
     // The blockchain_state response includes peak.height.
     const json resp = co_await rpc_post("get_blockchain_state");
+
+    // [S33 2026-09-05] Record the sync object BEFORE the peak check below:
+    // a node that is still syncing is exactly the case that throws there,
+    // and it is the case health reporting most needs to see.
+    last_sync_state_ = node_sync_from_blockchain_state(resp, last_sync_state_);
 
     if (!resp.contains("blockchain_state") ||
         !resp["blockchain_state"].contains("peak") ||

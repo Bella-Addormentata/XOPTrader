@@ -468,3 +468,204 @@ TEST(DrawdownBreakerTest, S33_AFreshCarryElsewhereStopsTheLatch) {
     // unvaluable.
     EXPECT_TRUE(unvaluable_book_must_fail_closed(true, true, true, 500.0));
 }
+
+// ===========================================================================
+// [S33 2026-09-05] Rolling-window auto-cooldown: WHO OWNS THE PAUSE
+//
+// This is the decision that resumes a live bot, and it shipped with no test.
+// `breaker_pause_active_` is a SHARED latch: the max-drawdown, unvaluable-book
+// and ledger-divergence breakers set the same flag, and only the rolling-window
+// breaker has a self-clearing path.  `equity_healthy` covers the first two ONLY
+// WHILE THEY STILL HOLD, so a recovered-but-unacknowledged drawdown trip, or a
+// ledger divergence that has since re-baselined itself, was lifted by five
+// quiet window samples -- the cooldown resuming a bot another breaker had
+// deliberately stopped.  `window_loss_latched` is the ownership record.
+//
+// MUTATION CHECKS (each reinstates the exact pre-S33 expression):
+//   1. Drop the ownership term: `if (!breaker_pause_active) { ... }` instead of
+//      `if (!breaker_pause_active || !window_loss_latched)`.  This is the old
+//      `} else if (breaker_pause_active_) {` verbatim.
+//      -> WindowCooldownDoesNotLiftADrawdownPause and
+//         LedgerEscalationRevokesWindowOwnership go RED.
+//   2. Drop the operator-pause guard: return `{true, true}` instead of
+//      `{true, !gui_pause_active}` (the old unconditional
+//      `state_->set_status(BotStatus::Running)`).
+//      -> LatchClearedButStatusStaysPausedUnderGuiPause goes RED.
+//   3. Weaken the streak to 1 (`recover_streak < 1`).
+//      -> AQuietWindowMustNormalizeForFiveConsecutiveSamples goes RED.
+// ===========================================================================
+
+using xop::risk::evaluate_window_cooldown;
+using xop::risk::kWindowLossRecoverStreak;
+
+namespace {
+
+// Five consecutive quiet evaluations, returning the final decision.  Every
+// intermediate decision is asserted to be a no-op, so a cooldown that fires
+// EARLY is caught as well as one that fires when it must not.
+xop::risk::WindowCooldownDecision run_quiet_window(bool breaker_pause_active,
+                                                   bool window_loss_latched,
+                                                   bool gui_pause_active,
+                                                   int& streak,
+                                                   int  samples = 5)
+{
+    xop::risk::WindowCooldownDecision d;
+    for (int i = 0; i < samples; ++i) {
+        d = evaluate_window_cooldown(breaker_pause_active,
+                                     window_loss_latched, gui_pause_active,
+                                     /*window_loss_usd=*/0.10,
+                                     /*threshold_usd=*/3.75,
+                                     /*equity_healthy=*/true, streak);
+        if (i + 1 < samples) {
+            EXPECT_FALSE(d.clear_latch) << "fired early at sample " << (i + 1);
+        }
+    }
+    return d;
+}
+
+}  // namespace
+
+// (a) The headline: a max-drawdown pause is not the window's to lift, however
+// quiet the loss window goes.  The drawdown breaker has no self-clearing path
+// at all -- it ends in operator acknowledgement.
+TEST(BreakerOwnership, WindowCooldownDoesNotLiftADrawdownPause)
+{
+    int streak = 0;
+    const auto d = run_quiet_window(/*breaker_pause_active=*/true,
+                                    /*window_loss_latched=*/false,
+                                    /*gui_pause_active=*/false, streak,
+                                    /*samples=*/20);
+    EXPECT_FALSE(d.clear_latch)
+        << "another breaker owns this pause; five quiet window samples are "
+           "not an acknowledgement of it";
+    EXPECT_FALSE(d.set_running);
+    EXPECT_EQ(streak, 0)
+        << "no streak may accumulate toward lifting someone else's latch";
+}
+
+// (b) The window breaker trips FIRST and is then escalated over.  Ownership is
+// revoked at the escalation, and cannot be re-taken while the pause holds
+// (it is only taken on the window breaker's own false-to-true transition).
+TEST(BreakerOwnership, LedgerEscalationRevokesWindowOwnership)
+{
+    int streak = 0;
+
+    // Window breaker owns the pause and is part-way through its cooldown.
+    for (int i = 0; i < 3; ++i) {
+        const auto d = evaluate_window_cooldown(true, true, false, 0.10, 3.75,
+                                                true, streak);
+        EXPECT_FALSE(d.clear_latch);
+    }
+    EXPECT_EQ(streak, 3);
+
+    // LEDGER CONTROL fires: engine sets window_loss_latched_ = false.
+    const auto after = run_quiet_window(/*breaker_pause_active=*/true,
+                                        /*window_loss_latched=*/false,
+                                        /*gui_pause_active=*/false, streak,
+                                        /*samples=*/10);
+    EXPECT_FALSE(after.clear_latch)
+        << "this pause now ends in reconciliation, not in the loss window "
+           "going quiet";
+    EXPECT_EQ(streak, 0) << "the part-built streak is discarded, not banked";
+}
+
+// (c) Clearing this breaker's latch is not the same as resuming.  Step 13 runs
+// during a GUI pause by design, and check_pause_flag() only re-pauses on the
+// flag's false-to-true EDGE -- so publishing Running here would leave the
+// status Running with Step 8 skipped, and nothing would ever correct it.
+TEST(BreakerOwnership, LatchClearedButStatusStaysPausedUnderGuiPause)
+{
+    int streak = 0;
+    const auto d = run_quiet_window(/*breaker_pause_active=*/true,
+                                    /*window_loss_latched=*/true,
+                                    /*gui_pause_active=*/true, streak);
+    EXPECT_TRUE(d.clear_latch)
+        << "the breaker's own condition really has normalized";
+    EXPECT_FALSE(d.set_running)
+        << "the operator's pause flag is still set -- status stays Paused";
+}
+
+// The ordinary, intended case, for contrast: the window owns the pause, no
+// operator flag, so the cooldown both clears the latch and resumes trading.
+TEST(BreakerOwnership, AnOwnedPauseWithNoOperatorFlagResumesTrading)
+{
+    int streak = 0;
+    const auto d = run_quiet_window(true, true, false, streak);
+    EXPECT_TRUE(d.clear_latch);
+    EXPECT_TRUE(d.set_running);
+    EXPECT_EQ(streak, 0) << "the counter re-arms for the next episode";
+}
+
+// (d) Ownership is meaningless without a pause: nothing to lift, no streak.
+// This is the pure-function reading of the engine invariant
+// "window_loss_latched_ is false whenever breaker_pause_active_ is false" --
+// even if that invariant were violated, no cooldown could fire from it.
+TEST(BreakerOwnership, NoPauseMeansNothingToLift)
+{
+    int streak = 4;
+    const auto d = evaluate_window_cooldown(/*breaker_pause_active=*/false,
+                                            /*window_loss_latched=*/true,
+                                            false, 0.10, 3.75, true, streak);
+    EXPECT_FALSE(d.clear_latch);
+    EXPECT_FALSE(d.set_running);
+    EXPECT_EQ(streak, 0);
+}
+
+// The streak is a debounce: it must be CONSECUTIVE.
+TEST(BreakerOwnership, AQuietWindowMustNormalizeForFiveConsecutiveSamples)
+{
+    EXPECT_EQ(kWindowLossRecoverStreak, 5);
+
+    int streak = 0;
+    for (int i = 0; i < 4; ++i) {
+        EXPECT_FALSE(
+            evaluate_window_cooldown(true, true, false, 0.10, 3.75, true,
+                                     streak).clear_latch);
+    }
+    EXPECT_EQ(streak, 4);
+
+    // One evaluation with the loss back over the threshold resets it.
+    EXPECT_FALSE(evaluate_window_cooldown(true, true, false, 9.99, 3.75, true,
+                                          streak).clear_latch);
+    EXPECT_EQ(streak, 0);
+
+    // So four more quiet samples are still not enough.
+    for (int i = 0; i < 4; ++i) {
+        EXPECT_FALSE(
+            evaluate_window_cooldown(true, true, false, 0.10, 3.75, true,
+                                     streak).clear_latch);
+    }
+    EXPECT_TRUE(evaluate_window_cooldown(true, true, false, 0.10, 3.75, true,
+                                         streak).clear_latch);
+}
+
+// Equity health is the other half of the gate, and it is what blocks the
+// cooldown WHILE a drawdown or unvaluable-book condition still holds --
+// ownership is what blocks it after such a condition has numerically
+// recovered but was never acknowledged.
+TEST(BreakerOwnership, AnUnhealthyEquityBlocksTheCooldownEvenWhenOwned)
+{
+    int streak = 0;
+    for (int i = 0; i < 10; ++i) {
+        const auto d = evaluate_window_cooldown(true, true, false, 0.10, 3.75,
+                                                /*equity_healthy=*/false,
+                                                streak);
+        EXPECT_FALSE(d.clear_latch);
+    }
+    EXPECT_EQ(streak, 0);
+}
+
+// A loss exactly AT the threshold is normalized (the trip test is strictly
+// greater), and a NaN reading resets rather than counting toward a resume.
+TEST(BreakerOwnership, ThresholdBoundaryAndNanReadings)
+{
+    int streak = 0;
+    EXPECT_FALSE(evaluate_window_cooldown(true, true, false, 3.75, 3.75, true,
+                                          streak).clear_latch);
+    EXPECT_EQ(streak, 1) << "loss == threshold is inside the limit";
+
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    EXPECT_FALSE(evaluate_window_cooldown(true, true, false, nan, 3.75, true,
+                                          streak).clear_latch);
+    EXPECT_EQ(streak, 0) << "an unordered comparison must not resume trading";
+}

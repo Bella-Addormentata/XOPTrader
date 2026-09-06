@@ -175,6 +175,197 @@ struct PostedOfferInfo {
 };
 
 // ---------------------------------------------------------------------------
+// select_repost_keys -- which (side, tier) slots a selective refresh is
+// allowed to post a replacement into.
+//
+// [S33 2026-09-05] Extracted from Step 8's T5-01 filter so the rule is
+// reachable from ctest.  The filter used to derive its whitelist from tier
+// STALENESS, but OfferManager::selective_cancel returns only the offers it
+// actually cancelled: on a cancel RPC that throws anything other than an
+// insufficient-funds error it logs and moves on, leaving the offer live and
+// NOT marked cancel_pending.  A tier can therefore classify Stale and still
+// be resting on the book, so staleness alone is not proof that the old offer
+// left -- and reposting on that basis leaves two live offers at the same
+// price level, the exact double exposure the filter exists to prevent.
+//
+// [S33 2026-09-05, review] An earlier draft of this comment also gave
+// "selective_cancel skips offers already awaiting cancel confirmation" as a
+// second way to reach that state.  It is not one: classify_tier_staleness
+// does `if (po.cancel_pending) continue;` (offer_manager.cpp), so such an
+// offer never produces a TierClassification and is never seen here.  The
+// swallowed cancel RPC is the whole of it.  (An already-cancel_pending offer
+// is instead invisible to the caller's pending_keys, so its ladder slot looks
+// brand new -- a separate, pre-existing path that this function cannot see
+// and does not claim to cover.)
+//
+// @param tier_classes   Per-pending-offer staleness classification.
+// @param cancelled_ids  Offer IDs selective_cancel reported as CANCELLED.
+// @return "<side>_<tier_index>" keys whose replacement is safe to post.
+//         Tiers whose cancel failed are absent, deferring them to the next
+//         heartbeat where they still classify Stale/Expired.
+// ---------------------------------------------------------------------------
+[[nodiscard]] std::unordered_set<std::string> select_repost_keys(
+    const std::vector<execution::TierClassification>& tier_classes,
+    const std::vector<std::string>&                   cancelled_ids);
+
+// ---------------------------------------------------------------------------
+// select_resting_keys -- which (side, tier) slots still have an offer on the
+// book, and therefore must NOT be charged against the dynamic XCH budget.
+//
+// [S33-LIMITER 2026-09-05] Companion to select_repost_keys, for the other
+// half of the same accounting.  The dynamic tier limiter measures every tier
+// in the ladder against a budget derived from the wallet's spendable_balance
+// -- but spendable_balance has ALREADY had the coins locked by resting offers
+// removed from it.  Charging a still-resting tier against that budget counts
+// the same XCH twice, and near the fee reserve that trims the side before the
+// tier a selective refresh is trying to replace can be reposted.
+//
+// Successfully cancelled tiers are deliberately EXCLUDED from this set (i.e.
+// they keep being charged).  A cancel is only submitted here, not confirmed:
+// the coins do not return to spendable_balance until it lands on-chain, so
+// continuing to charge them keeps the limiter on the conservative side of the
+// 2026-08-23 zero-spendable incident (see the [XCH-LOCK-LEDGER] note above
+// xch_spendable_pre).  This function therefore only ever RELAXES the budget by
+// the amount that provably never left the wallet's locked set.
+//
+// [S33-LIMITER 2026-09-05, review] A slot with TWO pending offers (possible
+// after any earlier double post) whose cancels disagree is resolved toward
+// CHARGING: one cancelled leg removes the whole key from this set.  Otherwise
+// that key would be whitelisted for repost by select_repost_keys and excluded
+// from the budget by this one at the same time, which is precisely the
+// under-reservation the two functions exist to make impossible.  The
+// invariant they jointly maintain is `posted set is a subset of charged set`.
+//
+// @param tier_classes   Per-pending-offer staleness classification.
+// @param cancelled_ids  Offer IDs selective_cancel reported as CANCELLED.
+// @return "<side>_<tier_index>" keys whose offer is still resting on the book.
+// ---------------------------------------------------------------------------
+[[nodiscard]] std::unordered_set<std::string> select_resting_keys(
+    const std::vector<execution::TierClassification>& tier_classes,
+    const std::vector<std::string>&                   cancelled_ids);
+
+// ---------------------------------------------------------------------------
+// select_postable_tiers -- the whole of Step 8's T5-01 replacement decision:
+// which candidate ladder tiers may actually be posted after a cancel pass.
+//
+// [S33 2026-09-05] The filter body was already extracted (select_repost_keys);
+// its GATE was not, and the gate was the other half of the defect.  The call
+// site ran the filter only `if (has_pending && fresh_count > 0)`, so the
+// sibling FULL-CANCEL branch (has_pending && fresh_count == 0, which calls
+// selective_cancel over every tier) never consulted it at all.  That call
+// returns a SUBSET of the ids it was given, so with every tier stale and one
+// cancel failing, that branch left the old offer resting AND posted a whole
+// replacement ladder over it -- the exact double exposure select_repost_keys
+// exists to prevent, in the one branch it never ran in.  It also broke the
+// limiter's accounting in the unsafe direction: select_resting_keys runs
+// UNCONDITIONALLY, so the failed-cancel tier was excluded from the XCH budget
+// charge and then posted anyway, under-reserving against a budget built from
+// spendable_balance (the 2026-08-23 zero-spendable shape).
+//
+// The gate is now simply "there were pending offers", which is `tier_classes`
+// being non-empty -- so it lives in here, where a test can reach it.  The
+// filter body is correct in the all-stale branch unchanged: cancelled_ids is
+// the full-cancel result, and pending_keys still admits genuinely-new tiers.
+//
+// @param candidate_tiers  Tiers that survived every earlier Step 8 gate.
+// @param tier_classes     Per-pending-offer staleness classification.  EMPTY
+//                         means nothing was pending, so nothing can be a
+//                         duplicate and every candidate is postable.
+// @param cancelled_ids    Offer IDs selective_cancel reported as CANCELLED.
+// @return The candidates whose slot was actually freed by a cancel, plus the
+//         brand-new slots that had no pending offer at all, in input order.
+//         An empty result means "post nothing this heartbeat".
+// ---------------------------------------------------------------------------
+[[nodiscard]] std::vector<TierQuote> select_postable_tiers(
+    const std::vector<TierQuote>&                     candidate_tiers,
+    const std::vector<execution::TierClassification>& tier_classes,
+    const std::vector<std::string>&                   cancelled_ids);
+
+// ---------------------------------------------------------------------------
+// shift_schedule_to_floor -- push one tier-spacing schedule out to the
+// minimum half-spread, preserving its inter-tier gaps.
+//
+// [S33 2026-09-05] Extracted from Step 7 so the per-schedule rule is
+// reachable from ctest.  The shift used to be computed ONCE from the static
+// tier_spacing_bps and applied to all three schedules, but build_raw_ladder
+// prices from the activity controller's _bid/_ask schedules whenever they are
+// filled, and those are interpolated up toward tier_spacing_max_bps -- in the
+// low-activity case already wider than the floor.  Reusing the static
+// schedule's delta stacked the whole shift on top of an already-compliant
+// side schedule (base 100, adaptive 600, floor 400 -> 900 instead of 600),
+// and the converse failed too: a side schedule narrower than the base one was
+// not shifted at all.
+//
+// @param spacings           Schedule in bps, modified in place.  Read as
+//                           non-decreasing, so spacings.front() is its
+//                           innermost tier.
+// @param min_half_spread_bps  The floor the innermost tier must clear.
+// @return The shift actually applied, in bps; 0.0 when the schedule is empty
+//         or already at/outside the floor (in which case it is untouched).
+// ---------------------------------------------------------------------------
+[[nodiscard]] double shift_schedule_to_floor(std::vector<double>& spacings,
+                                             double min_half_spread_bps);
+
+// ---------------------------------------------------------------------------
+// xch_mark_price_mojos -- the XCH mark handed to PnLTracker::mark_to_market,
+// denominated in one pair's quote units.
+//
+// [XCH-MTM-ISOLATION 2026-09-04] XCH is the wallet's reserve currency and its
+// USD value is known authoritatively from CEX/anchors, so the mark must not be
+// derived from an individual CAT book's local DEX spread.
+//
+// [S33 2026-09-05] The divisor must be the factor step_update_pnl REGISTERED
+// for this pair, not the live one: mark_to_market converts both this price and
+// the cost basis back to USD with the registered factor, so dividing by a
+// different (live) factor yielded xch_usd * registered/live rather than
+// canonical XCH USD, and the wallet's XCH mark hopped between pairs.  The
+// carry map that holds the registered factor is also the grade gate that
+// quote_usd_factor() bypasses.
+//
+// @param xch_usd_mojos      Canonical USD value of 1 XCH, in mojos.
+// @param registered_factor  usd_per_quote_unit as REGISTERED for this pair;
+//                           0 (or negative) means the pair was registered
+//                           UNPRICEABLE.
+// @return The mark in this pair's quote mojos, or 0 for "do not mark".
+//         0 is deliberate for an unpriceable pair rather than falling back to
+//         the CAT book's own mid -- and it is inert, because the same missing
+//         factor makes mark_to_market zero that pair's basis, so the pair
+//         contributes nothing either way.  See the call site.
+// ---------------------------------------------------------------------------
+[[nodiscard]] Mojo xch_mark_price_mojos(Mojo   xch_usd_mojos,
+                                        double registered_factor);
+
+// ---------------------------------------------------------------------------
+// NodeHealthFlags / node_health_flags -- the full-node connectivity triple
+// published to SystemHealthSnapshot by both metrics exporters.
+//
+// [S33 2026-09-05] CONNECTIVITY IS NOT SYNCHRONISATION.  Both exporters used
+// to publish `node_synced = node_connected` and a hard `node_syncing = false`
+// (the member backing it had no writer anywhere in the tree), so a node that
+// answered a peak height while still catching up showed solid green and the
+// GUI's "Full Node: Syncing..." state was unreachable during exactly the
+// period an operator would be looking.  The derivation lives here, in one
+// place both exporters call, so reinstating that copy is a change a test can
+// see -- see cpp/tests/test_node_sync_state.cpp.
+//
+// @param reachable            Node is the live height source and answering.
+// @param node_reports_synced  `sync.synced` from the blockchain-state
+//                             response (rpc::ChiaFullNodeRPC::last_sync_state).
+// @param node_reports_syncing `sync.sync_mode` from the same response.
+// @return The triple to publish.  An unreachable node reports NEITHER synced
+//         nor syncing: the cached reading is stale and must not be republished
+//         (e.g. on a wallet-sourced heartbeat).
+// ---------------------------------------------------------------------------
+struct NodeHealthFlags {
+    bool connected{false};
+    bool synced{false};
+    bool syncing{false};
+};
+
+[[nodiscard]] NodeHealthFlags node_health_flags(
+    bool reachable, bool node_reports_synced, bool node_reports_syncing);
+
+// ---------------------------------------------------------------------------
 // Engine -- the top-level orchestrator.
 //
 // Owns all subsystems and drives the per-block heartbeat loop.
@@ -1413,6 +1604,23 @@ private:
     int breaker_lift_streak_{0};
     int window_loss_recover_streak_{0};
 
+    /// [S33 2026-09-05] True only while `breaker_pause_active_` is OWNED by
+    /// the rolling-window loss breaker.  That latch is SHARED with the
+    /// max-drawdown, unvaluable-book and ledger-divergence breakers, and the
+    /// rolling window's auto-cooldown must not lift a pause it did not set:
+    /// a ledger divergence ends in reconciliation and a drawdown trip in
+    /// operator acknowledgement, neither of which is "the loss window went
+    /// quiet".  Every OTHER site that sets `breaker_pause_active_` clears
+    /// this one -- the ledger, unvaluable-book and max-drawdown escalations
+    /// in Step 13, plus the S27 pre-trade unvaluable latch, where the clear
+    /// is a provable no-op kept so this rule needs no exceptions -- so the
+    /// window can never auto-resume out from under another breaker.
+    ///
+    /// Revocation is deliberately NOT reversible for the life of the pause:
+    /// see the note at the max-drawdown revoke in step_check_alerts.
+    /// Invariant: false whenever `breaker_pause_active_` is false.
+    bool window_loss_latched_{false};
+
     /// [S17 2026-08-23] Last depeg status logged per pair, so Step 3 logs
     /// transitions at full severity and ongoing states at debug.
     std::unordered_map<std::string, DepegStatus> depeg_logged_status_;
@@ -1911,9 +2119,13 @@ private:
 
     bool wallet_synced_{false};
     bool wallet_syncing_{false};
-    bool node_connected_{false};
-    bool node_synced_{false};
-    bool node_syncing_{false};
+    // [S33 2026-09-05] The node_connected_/node_synced_/node_syncing_ triplet
+    // that used to live here was declared but never assigned anywhere in the
+    // tree, so the metrics exporters published a hard syncing=false.  The
+    // node's own sync state now comes from
+    // rpc::ChiaFullNodeRPC::last_sync_state(), which caches the `sync` object
+    // of the blockchain-state response get_block_height() already fetches.
+    // The wallet_* pair above IS written (step_manage_offers) and stays.
 
     // -- [T4-04] Cached wallet balances for spendable-reserve gating ------
     // Populated from wallet RPC each heartbeat; keyed by wallet label.

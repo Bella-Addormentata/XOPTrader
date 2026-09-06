@@ -27,8 +27,10 @@
 //      offer."
 //
 // In PR #148 / S33, classify_cross_bbo was promoted to the active gate in
-// Step 8, with classify_cross_published_mid retained as a fallback and
-// for regression testing.
+// Step 8. classify_cross_published_mid now has NO production caller: the
+// fallback for a missing BBO is the +/-5% mid band inside classify_cross_bbo
+// itself. The legacy predicate is kept only so the tests can pin what the
+// old rule did and measure the S33 change against it.
 //
 // Pure header, no engine types, so both predicates are driven directly by
 // cpp/tests/test_cross_guard.cpp.
@@ -44,7 +46,9 @@ enum class CrossVerdict {
     Indeterminate,  ///< no usable reference -- decide nothing
 };
 
-/// WHAT STEP 8 DOES TODAY. Bid above the published mid, or ask below it.
+/// THE LEGACY RULE, kept as a test reference only. Bid above the published
+/// mid, or ask below it. This is what Step 8 inlined from 4d3f30d until S33
+/// promoted classify_cross_bbo below; it has no production caller now.
 ///
 /// @param is_ask  side of the tier.
 /// @param price   tier price.

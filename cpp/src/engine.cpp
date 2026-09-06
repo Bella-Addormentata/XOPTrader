@@ -218,6 +218,128 @@ int score_execution_quality(int competitiveness_score, int queue_ahead_score)
 
 }  // namespace
 
+// [S33 2026-09-05] See the contract in engine.hpp: the replacement whitelist
+// is keyed off the IDs selective_cancel actually returned, NOT off staleness,
+// because a cancel whose RPC failed leaves its offer live while its tier
+// still classifies Stale.
+std::unordered_set<std::string> select_repost_keys(
+    const std::vector<execution::TierClassification>& tier_classes,
+    const std::vector<std::string>&                   cancelled_ids)
+{
+    const std::unordered_set<std::string> cancelled_id_set(
+        cancelled_ids.begin(), cancelled_ids.end());
+
+    std::unordered_set<std::string> keys;
+    for (const auto& tc : tier_classes) {
+        if (tc.staleness != execution::TierStaleness::Fresh
+            && cancelled_id_set.count(tc.offer_id) > 0) {
+            keys.insert(std::to_string(static_cast<int>(tc.side))
+                        + "_" + std::to_string(tc.tier_index));
+        }
+    }
+    return keys;
+}
+
+// [S33-LIMITER 2026-09-05] See the contract in engine.hpp: a tier is "resting"
+// when no successful cancellation removed it, so its coins are still locked and
+// were already netted out of the spendable_balance the XCH budget is built from.
+std::unordered_set<std::string> select_resting_keys(
+    const std::vector<execution::TierClassification>& tier_classes,
+    const std::vector<std::string>&                   cancelled_ids)
+{
+    const std::unordered_set<std::string> cancelled_id_set(
+        cancelled_ids.begin(), cancelled_ids.end());
+
+    std::unordered_set<std::string> keys;
+    for (const auto& tc : tier_classes) {
+        if (cancelled_id_set.count(tc.offer_id) == 0) {
+            keys.insert(std::to_string(static_cast<int>(tc.side))
+                        + "_" + std::to_string(tc.tier_index));
+        }
+    }
+    // [S33-LIMITER 2026-09-05] One slot, two pending offers, disagreeing
+    // cancels: resolve toward CHARGING.  select_repost_keys whitelists that
+    // key for repost, so leaving it here would post a tier the budget never
+    // reserved for.  Second pass rather than one, because either leg may be
+    // visited first.
+    for (const auto& tc : tier_classes) {
+        if (cancelled_id_set.count(tc.offer_id) > 0) {
+            keys.erase(std::to_string(static_cast<int>(tc.side))
+                       + "_" + std::to_string(tc.tier_index));
+        }
+    }
+    return keys;
+}
+
+// [S33 2026-09-05] See the contract in engine.hpp: the gate is "there were
+// pending offers", NOT "some tier was Fresh".  The old gate skipped the
+// all-stale full-cancel branch entirely, which is the branch where a failed
+// cancel is most dangerous -- every tier is being replaced at once.
+std::vector<TierQuote> select_postable_tiers(
+    const std::vector<TierQuote>&                     candidate_tiers,
+    const std::vector<execution::TierClassification>& tier_classes,
+    const std::vector<std::string>&                   cancelled_ids)
+{
+    // Nothing was pending: no candidate can duplicate a live offer.
+    if (tier_classes.empty()) return candidate_tiers;
+
+    const std::unordered_set<std::string> cancelled_keys =
+        select_repost_keys(tier_classes, cancelled_ids);
+
+    // Slots that HAD a pending offer.  A candidate whose slot is absent here
+    // is brand new (it was not in the previous ladder) and always postable.
+    std::unordered_set<std::string> pending_keys;
+    for (const auto& tc : tier_classes) {
+        pending_keys.insert(std::to_string(static_cast<int>(tc.side))
+                            + "_" + std::to_string(tc.tier_index));
+    }
+
+    std::vector<TierQuote> postable;
+    postable.reserve(candidate_tiers.size());
+    for (const auto& tq : candidate_tiers) {
+        const std::string key = std::to_string(static_cast<int>(tq.side))
+                              + "_" + std::to_string(tq.tier_index);
+        if (cancelled_keys.count(key) > 0 || pending_keys.count(key) == 0) {
+            postable.push_back(tq);
+        }
+    }
+    return postable;
+}
+
+// [S33 2026-09-05] See the contract in engine.hpp.
+double shift_schedule_to_floor(std::vector<double>& spacings,
+                               double               min_half_spread_bps)
+{
+    if (spacings.empty() || min_half_spread_bps <= spacings.front()) {
+        return 0.0;
+    }
+    const double shift = min_half_spread_bps - spacings.front();
+    for (double& s : spacings) s += shift;
+    return shift;
+}
+
+// [S33 2026-09-05] See the contract in engine.hpp.
+Mojo xch_mark_price_mojos(Mojo xch_usd_mojos, double registered_factor)
+{
+    if (xch_usd_mojos > 0 && registered_factor > 0.0) {
+        return static_cast<Mojo>(std::llround(
+            static_cast<double>(xch_usd_mojos) / registered_factor));
+    }
+    return 0;
+}
+
+// [S33 2026-09-05] See the contract in engine.hpp.
+NodeHealthFlags node_health_flags(bool reachable,
+                                  bool node_reports_synced,
+                                  bool node_reports_syncing)
+{
+    NodeHealthFlags flags;
+    flags.connected = reachable;
+    flags.synced    = reachable && node_reports_synced;
+    flags.syncing   = reachable && node_reports_syncing;
+    return flags;
+}
+
 // ===========================================================================
 // Construction / destruction
 // ===========================================================================
@@ -2822,11 +2944,25 @@ asio::awaitable<void> Engine::run_startup_analysis()
         // wallet/node connectivity immediately, not only after
         // analysis completes and the main trading loop starts.
         if (metrics_->is_running()) {
+            // [S33 2026-09-05] Connectivity is not synchronisation.  A node
+            // answers a peak height while sync_mode is still true, so
+            // deriving synced from a successful poll -- and asserting
+            // syncing=false -- published solid green through exactly the
+            // startup a syncing node produces.  Both flags now come from the
+            // sync object of the blockchain-state response this poll already
+            // fetched (no extra RPC), and are held false while the WALLET is
+            // the height source, where the cached node reading is stale.
+            const auto node_sync =
+                full_node_ ? full_node_->last_sync_state()
+                           : rpc::ChiaFullNodeRPC::SyncState{};
+            const auto node_flags = node_health_flags(
+                !ask_wallet_first && !height_failed,
+                node_sync.synced, node_sync.syncing);
             SystemHealthSnapshot health;
             health.block_height     = current_block;
-            health.node_connected   = !ask_wallet_first && !height_failed;
-            health.node_synced      = health.node_connected;
-            health.node_syncing     = false;
+            health.node_connected   = node_flags.connected;
+            health.node_synced      = node_flags.synced;
+            health.node_syncing     = node_flags.syncing;
             health.wallet_connected = wallet_->is_open();
             health.wallet_synced    = wallet_synced_;
             health.wallet_syncing   = wallet_syncing_;
@@ -3383,6 +3519,14 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
             valuation_holds_anything_)
         && !breaker_pause_active_) {
         breaker_pause_active_ = true;
+        // [S33 2026-09-05] The fourth site that takes the shared latch, and
+        // the only one where the revocation is a provable NO-OP: this branch
+        // is gated on !breaker_pause_active_, and window_loss_latched_ implies
+        // breaker_pause_active_, so the flag is already false here.  Written
+        // anyway so engine.hpp's invariant ("all four sites clear this") needs
+        // no exception, and so a future edit to that gate cannot silently
+        // leave the window breaker owning an unvaluable-book pause.
+        window_loss_latched_ = false;
         // [review] Step 13's branch is gated on !breaker_pause_active_, so
         // latching here silently SUPPRESSED the detailed log and the
         // operator alert -- the exact report the comment promised. Record
@@ -7773,21 +7917,40 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                          ladder_cfg.tier_spacing_bps_ask.empty() ? 0.0 : ladder_cfg.tier_spacing_bps_ask.front());
         }
 
-        // Shift the whole spacing schedule outward (preserving inter-tier
-        // gaps, so the ladder keeps its shape and tiers stay distinct) when
-        // the innermost tier sits inside the minimum half-spread.
-        if (!ladder_cfg.tier_spacing_bps.empty()
-            && quote_min_half_spread_bps > ladder_cfg.tier_spacing_bps.front())
-        {
-            const double delta = quote_min_half_spread_bps
-                               - ladder_cfg.tier_spacing_bps.front();
-            for (double& s : ladder_cfg.tier_spacing_bps) s += delta;
-            for (double& s : ladder_cfg.tier_spacing_bps_bid) s += delta;
-            for (double& s : ladder_cfg.tier_spacing_bps_ask) s += delta;
+        // Shift each spacing schedule outward (preserving inter-tier gaps,
+        // so the ladder keeps its shape and tiers stay distinct) when its
+        // OWN innermost tier sits inside the minimum half-spread.
+        //
+        // [S33 2026-09-05] The delta is derived PER SCHEDULE, not once from
+        // the static tier_spacing_bps.  build_raw_ladder prices from
+        // tier_spacing_bps_bid/_ask whenever the activity controller filled
+        // them, and those are interpolated up toward tier_spacing_max_bps --
+        // in the low-activity case already WIDER than the floor.  Reusing the
+        // static schedule's delta stacked the whole shift on top of an
+        // already-compliant side schedule (base 100, adaptive 600, floor 400
+        // -> 900 instead of 600), widening a ladder the controller had
+        // deliberately sized and feeding straight back into the low-fill
+        // state that widened it.  The converse also failed: a side schedule
+        // narrower than the base one was not shifted at all.  The base
+        // schedule keeps its own floor treatment because it is still the
+        // fallback build_raw_ladder uses when the controller is off, and the
+        // baseline the gap-aware blend reads.
+        //
+        // The rule itself lives in shift_schedule_to_floor (engine.hpp) so
+        // ctest can reach it -- see cpp/tests/test_width_floor.cpp.
+        const double base_shift = shift_schedule_to_floor(
+            ladder_cfg.tier_spacing_bps, quote_min_half_spread_bps);
+        const double bid_shift = shift_schedule_to_floor(
+            ladder_cfg.tier_spacing_bps_bid, quote_min_half_spread_bps);
+        const double ask_shift = shift_schedule_to_floor(
+            ladder_cfg.tier_spacing_bps_ask, quote_min_half_spread_bps);
+        if (base_shift > 0.0 || bid_shift > 0.0 || ask_shift > 0.0) {
             spdlog::info("[Engine] Step 7: {} sigma width floor: tier "
-                         "spacing shifted +{:.0f}bps (min_half_spread="
-                         "{:.0f}bps, combined_sigma={:.0f}bps, k={:.2f})",
-                         pair_name, delta, quote_min_half_spread_bps,
+                         "spacing shifted +{:.0f}/{:.0f}/{:.0f}bps "
+                         "(base/bid/ask, min_half_spread={:.0f}bps, "
+                         "combined_sigma={:.0f}bps, k={:.2f})",
+                         pair_name, base_shift, bid_shift, ask_shift,
+                         quote_min_half_spread_bps,
                          quote_combined_sigma_bps,
                          config_.strategy.quote_width_sigma_mult);
         }
@@ -10930,6 +11093,32 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 const bool base_is_xch =
                     pair_cfg->base_asset_id == "xch";
 
+                // [S33-LIMITER 2026-09-05] Tiers whose offer is still resting
+                // cost nothing NEW: the wallet already excluded their locked
+                // coins from spendable_balance, which is what xch_budget is
+                // built from.  Charging them here counted the same XCH twice
+                // and, near the reserve, trimmed the side below the very tier
+                // a selective refresh was trying to replace -- so a cancelled
+                // tier could never be reposted.  Cancelled tiers stay charged
+                // (their coins are not free until the cancel confirms), so the
+                // budget only relaxes by what provably never left the lock.
+                //
+                // This pairs with select_postable_tiers below, which drops
+                // exactly the tiers excluded here: charged is a SUPERSET of
+                // posted on every branch.  Do not gate one without the other.
+                //
+                // [S33 2026-09-05] `cancelled_ids` deliberately holds only the
+                // Step 8 refresh/full-cancel results.  The three later
+                // selective_cancel calls (the two exposure-floor rebalances and
+                // the both-sides-suppressed sweep) keep their results in their
+                // own locals, so the tiers they cancel read as "resting" here
+                // and as "not repostable" below.  That is safe in both
+                // directions because each of those sites has already killed the
+                // affected side (can_ask/can_bid = false) or `continue`s the
+                // pair outright, so none of their tiers reaches either set.
+                const auto resting_keys =
+                    select_resting_keys(tier_classes, cancelled_ids);
+
                 // Accumulate cost from tier 0 upward.  Stop when adding
                 // the next tier would exceed the budget.
                 Mojo cumulative_cost = 0;
@@ -10940,6 +11129,10 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     int tier_offer_count = 0;
                     for (const auto& tq : fee_filtered_tiers) {
                         if (tq.tier_index != ti) continue;
+                        const std::string resting_key =
+                            std::to_string(static_cast<int>(tq.side))
+                            + "_" + std::to_string(tq.tier_index);
+                        if (resting_keys.count(resting_key) > 0) continue;
                         ++tier_offer_count;
                         tier_cost += kUtxoOverheadMojos;  // fee UTXO
                         // If base is XCH and this is an ask, the offer
@@ -11008,9 +11201,9 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             }
         }
 
-                // -- Crossed-mid pre-post guard -------------------------------------
+                // -- Pre-post crossing guard ----------------------------------------
         // Defense-in-depth: filter out any tier that would cross the
-        // current model mid-price BEFORE posting on-chain.
+        // opposite-side BBO BEFORE posting on-chain.
         //
         // The competitive anchor in liquidity.cpp already clamps to
         // min(bbo_ref, mid), but the model mid can change between Step 7
@@ -11022,21 +11215,14 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         // ~10M mojos and exposed us to adverse selection for one block
         // per offer before cancellation.
         if (mid > 0) {
-            // [CROSSGUARD 2026-09-01] SHADOW MEASUREMENT. Suppression is
-            // UNCHANGED -- still the published-mid verdict, exactly as since
-            // 4d3f30d. The BBO verdict is computed beside it and only the
-            // DISAGREEMENT is logged.
-            //
-            // Why: this guard was written to pre-empt classify_tier_staleness
-            // and was a bit-exact predictor of it, until a932a5d moved the
-            // canceller onto the BBO one day later and left the guard behind.
-            // It has never been modified since. See cross_guard.hpp for the
-            // full account. But it is INERT on the only enabled pair (zero
-            // firings in six live rotations, one in the whole retained
-            // corpus), every "would suppress" figure available is a
-            // reconstruction rather than an observation, and a change in this
-            // family already shipped a regression through four review rounds.
-            // So: count first, decide from data.
+            // [CROSSGUARD 2026-09-01 -> S33 2026-09-05] THE SHADOW IS OVER.
+            // This guard was written to pre-empt classify_tier_staleness and
+            // was a bit-exact predictor of it, until a932a5d moved the
+            // canceller onto the BBO one day later and left the guard on the
+            // published mid. The 2026-09-01 shadow measured that divergence
+            // without acting on it; S33 promoted the BBO verdict to the LIVE
+            // decision below, so suppression is NO LONGER the published-mid
+            // verdict. See cross_guard.hpp for the full account.
             // [S33 2026-09-03] BBO CROSSING GUARD.
             // Evaluates whether a tier crosses the current BBO (best_bid for asks,
             // best_ask for bids) or fallback mid buffer when no BBO exists,
@@ -11625,54 +11811,45 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             continue;
         }
 
-        // [T5-01] Selective refresh filter: when we did a selective cancel
-        // (some tiers were Fresh and left live), only post replacements for
-        // the tiers that were actually cancelled.  Posting duplicates of
-        // Fresh tiers would create double-exposure at the same price level.
+        // [T5-01] Replacement filter: after a cancel pass, only post into the
+        // (side, tier) slots that the pass actually FREED.  Posting into a slot
+        // whose offer is still live -- a Fresh tier left alone, or a tier
+        // whose cancel did not land -- creates double exposure at the same
+        // price level.
         // Also include tiers that have no pending offer at all (brand new unposted tiers).
         // This runs BEFORE the pending exposure projection below so that existing
         // live fresh offers (already in pair_*_pending_spend) are not double-counted
         // as new planned spend.
-        if (has_pending && fresh_count > 0) {
-            // Build a set of (side, tier_index) keys for cancelled tiers.
-            std::unordered_set<std::string> cancelled_keys;
-            for (const auto& tc : tier_classes) {
-                if (tc.staleness != execution::TierStaleness::Fresh) {
-                    cancelled_keys.insert(
-                        std::to_string(static_cast<int>(tc.side))
-                        + "_" + std::to_string(tc.tier_index));
-                }
-            }
-            // Also include tiers that have no pending offer at all
-            // (brand new tiers that weren't in the previous ladder).
-            std::unordered_set<std::string> pending_keys;
-            for (const auto& tc : tier_classes) {
-                pending_keys.insert(
-                    std::to_string(static_cast<int>(tc.side))
-                    + "_" + std::to_string(tc.tier_index));
-            }
+        // [S33 2026-09-05] Runs whenever anything was pending -- the gate used
+        // to be `has_pending && fresh_count > 0`, which skipped the sibling
+        // FULL-CANCEL branch (has_pending && fresh_count == 0) entirely.  That
+        // is the branch where a failed cancel does the most damage: with every
+        // tier stale, selective_cancel(all_ids) returns only the ids it really
+        // cancelled, and the unfiltered path then posted a whole replacement
+        // ladder over whatever stayed resting.  It also desynchronised the
+        // limiter above, which excludes resting tiers from the XCH budget
+        // unconditionally -- so those duplicates were posted UNRESERVED.  The
+        // filter body is unchanged and correct here: cancelled_ids is the
+        // full-cancel result and brand-new tiers still qualify through
+        // pending_keys.  The whole decision (gate included) now lives in
+        // select_postable_tiers so ctest can reach it.
+        if (has_pending) {
+            std::vector<TierQuote> postable = select_postable_tiers(
+                fee_filtered_tiers, tier_classes, cancelled_ids);
 
-            std::vector<TierQuote> selective_tiers;
-            for (const auto& tq : fee_filtered_tiers) {
-                std::string key = std::to_string(static_cast<int>(tq.side))
-                                + "_" + std::to_string(tq.tier_index);
-                if (cancelled_keys.count(key) > 0 ||
-                    pending_keys.count(key) == 0) {
-                    selective_tiers.push_back(tq);
-                }
-            }
-
-            if (selective_tiers.empty()) {
-                spdlog::debug("[Engine] Step 8: {} selective refresh has no "
-                              "tiers to repost (all fresh)", pair_name);
+            if (postable.empty()) {
+                spdlog::debug("[Engine] Step 8: {} no tiers to repost -- "
+                              "every candidate slot is still held by a live "
+                              "offer (fresh, or a cancel that did not land)",
+                              pair_name);
                 continue;
             }
 
-            spdlog::info("[Engine] Step 8: {} selective refresh -- posting "
-                         "{}/{} replacement tiers",
-                         pair_name, selective_tiers.size(),
+            spdlog::info("[Engine] Step 8: {} T5-01 replacement filter -- "
+                         "posting {}/{} candidate tiers",
+                         pair_name, postable.size(),
                          fee_filtered_tiers.size());
-            fee_filtered_tiers = std::move(selective_tiers);
+            fee_filtered_tiers = std::move(postable);
         }
 
         // Pending exposure guard (pre-post projection): include currently
@@ -16948,6 +17125,11 @@ void Engine::step_check_ledger_invariant(BlockHeight block_height)
             spdlog::error("[Engine] LEDGER CONTROL: pausing on {}",
                           asset.substr(0, 12));
             state_->set_status(BotStatus::Paused);
+            // [S33 2026-09-05] Escalation takes the shared latch away from the
+            // rolling-window cooldown, whether or not this control got there
+            // first: this pause ends in reconciliation, not in the loss window
+            // going quiet.
+            window_loss_latched_ = false;
             if (!breaker_pause_active_) {
                 // Latch on the false-to-true TRANSITION only.  Persistent
                 // conditions re-enter this block every heartbeat, and an
@@ -17360,14 +17542,46 @@ void Engine::step_update_pnl(BlockHeight block_height)
         [this](const std::string& pair, const std::string& asset) -> Mojo {
             if (asset == "xch") {
                 const Mojo xch_usd_mojos = asset_usd_pseudo_price(AssetId{"xch"});
-                const PairConfig* pc = find_pair_config(pair);
-                if (xch_usd_mojos > 0 && pc) {
-                    const double f = quote_usd_factor(*pc);
-                    if (f > 0.0) {
-                        return static_cast<Mojo>(std::llround(
-                            static_cast<double>(xch_usd_mojos) / f));
-                    }
-                }
+                // [S33 2026-09-05] Denominate with the factor the loop above
+                // REGISTERED for this pair, not the live one.  When the live
+                // factor is ungraded that loop registers the CARRIED
+                // last-trusted value instead, and mark_to_market converts
+                // both this price and the cost basis back to USD with the
+                // REGISTERED factor -- so dividing by the live factor here
+                // yielded xch_usd * carried/live rather than canonical XCH
+                // USD, and the wallet's XCH mark hopped between XCH/BYC (par:
+                // carried == live) and XCH/DBX (derived from its own mid)
+                // exactly as before this isolation existed.  The carry map is
+                // also the grade gate quote_usd_factor() bypasses: by
+                // construction it only ever holds TRUSTED factors, while
+                // quote_usd_factor's non-pegged branch is deliberately
+                // ungated and will happily derive one from an ungraded mid.
+                //
+                // NO CARRY ENTRY RETURNS 0, and that is a second, deliberate
+                // behaviour change: the pre-S33 code fell through to this CAT
+                // book's local mid (gated on mid_valuation_grade), which is
+                // the valuation this isolation exists to keep out of the XCH
+                // mark.  It is also INERT, for a reason worth stating rather
+                // than assuming: the registration loop above writes an entry
+                // for EVERY configured pair whenever it has a usable factor,
+                // so "no entry" is exactly "registered UNPRICEABLE
+                // (usd_per_quote_unit == 0)".  mark_to_market zeroes that
+                // pair's cost basis for the same reason, so has_position is
+                // false and the pair marks nothing whatever this callback
+                // returns -- it is not even deferred to the S20 carry pass,
+                // which needs a basis.  (An earlier draft of this comment said
+                // the carry "owns the decision" here.  It does not; nothing
+                // does, because the pair contributes nothing.)  Another pair
+                // with a real factor still marks XCH through the dedup.
+                // Pinned in cpp/tests/test_xch_mark_price.cpp and
+                // cpp/tests/test_pnl_tracker.cpp.
+                const auto carried_it =
+                    last_trusted_quote_usd_factor_.find(pair);
+                return xch_mark_price_mojos(
+                    xch_usd_mojos,
+                    carried_it != last_trusted_quote_usd_factor_.end()
+                        ? carried_it->second
+                        : 0.0);
             }
             auto snap = state_->get_market(pair);
             return snap.mid_valuation_grade ? snap.mid_price : 0;
@@ -17564,12 +17778,27 @@ void Engine::step_export_metrics(BlockHeight block_height)
     // here and published the FAILED node as synced, masking the outage in
     // monitoring and in the GUI for its whole duration -- which is the one
     // period anyone would be looking.
-    health.node_connected   = !wallet_only_configured_
-                          && !wallet_only_mode_
-                          && (full_node_ && full_node_->is_open())
-                          && height_source_.current == risk::HeightSource::FullNode;
-    health.node_synced      = health.node_connected;
-    health.node_syncing     = node_syncing_;
+    // [S33 2026-09-05] Same separation here.  node_synced was a copy of
+    // reachability and node_syncing_ had no writer anywhere in the tree, so
+    // this published a hard syncing=false and the GUI's "Full Node:
+    // Syncing..." state was unreachable for the whole of the one period an
+    // operator would be looking.  Both flags now come from the sync object of
+    // the blockchain-state response get_block_height() already fetches, gated
+    // on the NODE being the live height source so a wallet-sourced heartbeat
+    // cannot republish a stale node reading.  The derivation is shared with
+    // run_startup_analysis through node_health_flags() -- one rule, one test.
+    const auto node_sync = full_node_
+                               ? full_node_->last_sync_state()
+                               : rpc::ChiaFullNodeRPC::SyncState{};
+    const auto node_flags = node_health_flags(
+        !wallet_only_configured_
+            && !wallet_only_mode_
+            && (full_node_ && full_node_->is_open())
+            && height_source_.current == risk::HeightSource::FullNode,
+        node_sync.synced, node_sync.syncing);
+    health.node_connected   = node_flags.connected;
+    health.node_synced      = node_flags.synced;
+    health.node_syncing     = node_flags.syncing;
     health.wallet_connected = wallet_->is_open();
     health.wallet_synced    = wallet_synced_;
     health.wallet_syncing   = wallet_syncing_;
@@ -17856,6 +18085,11 @@ void Engine::step_check_alerts(BlockHeight block_height)
         || unvaluable_report_pending_) {
         unvaluable_report_pending_ = false;
         breaker_pause_active_ = true;
+        // [S33 2026-09-05] Same escalation rule as the ledger and drawdown
+        // controls: an unvaluable book is cleared by valuation returning, not
+        // by the loss window going quiet, so the rolling-window cooldown must
+        // not own this latch.
+        window_loss_latched_ = false;
         state_->set_status(BotStatus::Paused);
         if (valuation_all_unpriced_) {
             spdlog::error("[Engine] Step 13: [S27] NO held asset has a "
@@ -17941,6 +18175,33 @@ void Engine::step_check_alerts(BlockHeight block_height)
                 breaker_pause_active_ = true;
                 breaker_skip_warned_  = false;
             }
+            // [S33 2026-09-05] Same escalation rule as the ledger control, and
+            // deliberately OUTSIDE the transition-only if so it applies on
+            // every breached evaluation: a max-drawdown breach is never lifted
+            // by the rolling-window cooldown, so revoke that breaker's
+            // ownership of the shared latch even when it got there first.
+            //
+            // [review] This is PERMANENT for the life of the pause: ownership
+            // is only taken on the window breaker's own false-to-true
+            // transition, which cannot recur while the pause holds.  So a
+            // single TRANSIENT breach read -- the flaky-equity-computation
+            // shape the kRealertRearmStreak note below documents as observed
+            // live -- converts a self-clearing window pause into one that
+            // waits for an operator.  Accepted, deliberately:
+            //   - it costs nothing while the breach holds, because
+            //     equity_healthy is (dd < max_drawdown_frac_) && !unvaluable
+            //     and already resets the cooldown streak every breached
+            //     evaluation;
+            //   - the drawdown breaker has NO self-clearing path of its own,
+            //     so "breached at least once, now recovered but never
+            //     acknowledged" is exactly the state that must not auto-resume;
+            //   - it is not silent: breaker_realert_gate_ below fires the
+            //     CRITICAL max-drawdown alert on this same evaluation;
+            //   - it fails safe (stuck Paused, never stuck trading).
+            // Do not "fix" this by moving it inside the transition guard --
+            // that reinstates the bug, because the window breaker latching
+            // first makes breaker_pause_active_ already true here.
+            window_loss_latched_ = false;
             if (first_trip) {
                 spdlog::error("[Engine] Step 13: MAX DRAWDOWN BREACHED -- "
                               "equity ${:.2f} is {:.2f}% below peak "
@@ -18113,6 +18374,10 @@ void Engine::step_check_alerts(BlockHeight block_height)
                                                      : anchor_fallback_usd);
                     state_->set_status(BotStatus::Paused);
                     breaker_pause_active_ = true;
+                    // [S33 2026-09-05] This breaker now OWNS the shared latch.
+                    // Only taken on the false-to-true transition, so the latch
+                    // is provably unowned here.
+                    window_loss_latched_  = true;
                     breaker_skip_warned_  = false;
                     alerts_->send_alert(AlertRule::CircuitBreaker,
                         "Rolling-window circuit breaker triggered: lost $" +
@@ -18126,28 +18391,44 @@ void Engine::step_check_alerts(BlockHeight block_height)
                                   "persists while latched (loss=${:.4f})",
                                   window_loss_usd);
                 }
-            } else if (breaker_pause_active_) {
-                // Auto-cooldown for rolling-window loss breaker:
-                // If equity is healthy and window loss has normalized (or is within threshold),
-                // streak up to clear the latch.
-                if (window_loss_usd <= threshold_usd && equity_healthy) {
-                    ++window_loss_recover_streak_;
-                    constexpr int kWindowLossRecoverStreak = 5;
-                    if (window_loss_recover_streak_ >= kWindowLossRecoverStreak) {
-                        breaker_pause_active_ = false;
-                        breaker_skip_warned_  = false;
-                        window_loss_recover_streak_ = 0;
-                        pnl_window_usd_.clear();
+            } else {
+                // Auto-cooldown for the rolling-window loss breaker: when
+                // equity is healthy and the window loss has normalized, streak
+                // up to clear the latch.
+                //
+                // [S33 2026-09-05] The whole decision -- including the two
+                // guards this branch used to carry inline (does the window
+                // still OWN the shared latch, and is the operator's pause flag
+                // down) -- lives in risk::evaluate_window_cooldown so ctest can
+                // reach it.  It is the change in this family that decides
+                // whether a live bot resumes trading; see
+                // cpp/tests/test_drawdown_breaker.cpp.
+                const auto cooldown = risk::evaluate_window_cooldown(
+                    breaker_pause_active_, window_loss_latched_,
+                    gui_pause_active_, window_loss_usd, threshold_usd,
+                    equity_healthy, window_loss_recover_streak_);
+                if (cooldown.clear_latch) {
+                    breaker_pause_active_ = false;
+                    window_loss_latched_  = false;
+                    breaker_skip_warned_  = false;
+                    pnl_window_usd_.clear();
+                    if (cooldown.set_running) {
                         state_->set_status(BotStatus::Running);
-                        spdlog::info("[Engine] Step 13: rolling-window loss normalized (loss=${:.4f} <= threshold=${:.4f}) "
-                                     "-- auto-resuming trading", window_loss_usd, threshold_usd);
-                        if (alerts_) {
-                            alerts_->send_alert(AlertRule::CircuitBreaker,
-                                "Rolling-window loss normalized -- engine auto-resumed trading");
-                        }
                     }
-                } else {
-                    window_loss_recover_streak_ = 0;
+                    spdlog::info("[Engine] Step 13: rolling-window loss normalized (loss=${:.4f} <= threshold=${:.4f}) "
+                                 "-- breaker latch cleared{}", window_loss_usd, threshold_usd,
+                                 cooldown.set_running
+                                     ? " -- auto-resuming trading"
+                                     : " (operator pause flag still set -- status stays Paused)");
+                    if (alerts_) {
+                        alerts_->send_alert(AlertRule::CircuitBreaker,
+                            cooldown.set_running
+                                ? std::string("Rolling-window loss normalized -- engine "
+                                              "auto-resumed trading")
+                                : std::string("Rolling-window loss normalized -- breaker "
+                                              "latch cleared, but the operator pause flag "
+                                              "is still set so the engine stays PAUSED"));
+                    }
                 }
             }
         }
@@ -19611,6 +19892,10 @@ void Engine::check_pause_flag()
                 const double dd = risk::equity_drawdown_frac(peak, equity_usd);
                 if (dd < max_drawdown_frac_) {
                     breaker_pause_active_ = false;
+                    // [S33 2026-09-05] Keep the ownership flag false whenever
+                    // the latch itself is false, so a later breaker cannot
+                    // inherit a stale "the window owns this" true.
+                    window_loss_latched_  = false;
                     breaker_lift_streak_  = 0;
                     window_loss_recover_streak_ = 0;
                     breaker_skip_warned_  = false;
