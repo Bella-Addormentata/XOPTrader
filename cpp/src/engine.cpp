@@ -2824,23 +2824,12 @@ asio::awaitable<void> Engine::run_startup_analysis()
         if (metrics_->is_running()) {
             SystemHealthSnapshot health;
             health.block_height     = current_block;
-            // [review] Not unconditionally true. This block is reached
-            // after the wallet fallback rescues a poll the NODE just failed,
-            // so publishing node_synced here reported the unavailable node
-            // as healthy -- to monitoring and to the GUI -- for as long as
-            // analysis ran. Derive it from which source actually answered.
-            // [review] The node is synced only if the NODE answered. In
-            // explicit wallet-only mode, and after an auto-mode startup
-            // fallback, height_error is empty because the WALLET succeeded --
-            // so this reported a node that is unavailable, or does not
-            // exist, as healthy.
-            // [review round 11] From THIS poll's source. height_error is
-            // empty on a settled wallet-first poll and wallet_only_mode_ is
-            // untouched by the analysis-local fallback, so the old test
-            // reported the node healthy for wallet-sourced blocks through
-            // the whole outage.
-            health.node_synced      = !ask_wallet_first && !height_failed;
+            health.node_connected   = !ask_wallet_first && !height_failed;
+            health.node_synced      = health.node_connected;
+            health.node_syncing     = false;
             health.wallet_connected = wallet_->is_open();
+            health.wallet_synced    = wallet_synced_;
+            health.wallet_syncing   = wallet_syncing_;
             metrics_->update_system_health(health);
         }
 
@@ -9397,6 +9386,9 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         if (sync_status.contains("syncing"))
             syncing = sync_status["syncing"].get<bool>();
 
+        wallet_synced_ = synced && !syncing;
+        wallet_syncing_ = syncing;
+
         if (!synced || syncing) {
             ++consecutive_unsynced_blocks_;
             spdlog::warn("[Engine] Step 8: wallet not fully synced "
@@ -9436,6 +9428,8 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             consecutive_unsynced_blocks_ = 0;
         }
     } catch (const std::exception& e) {
+        wallet_synced_ = false;
+        wallet_syncing_ = false;
         spdlog::warn("[Engine] Step 8: wallet sync check failed: {} "
                      "-- skipping offer management cautiously", e.what());
         co_return;
@@ -17565,15 +17559,20 @@ void Engine::step_export_metrics(BlockHeight block_height)
 
     // Dashboard 4: System health
     SystemHealthSnapshot health;
-    health.block_height    = block_height;
+    health.block_height     = block_height;
     // [review] Derived, not asserted. Every wallet-driven heartbeat reached
     // here and published the FAILED node as synced, masking the outage in
     // monitoring and in the GUI for its whole duration -- which is the one
     // period anyone would be looking.
-    health.node_synced     = !wallet_only_configured_
+    health.node_connected   = !wallet_only_configured_
                           && !wallet_only_mode_
+                          && (full_node_ && full_node_->is_open())
                           && height_source_.current == risk::HeightSource::FullNode;
+    health.node_synced      = health.node_connected;
+    health.node_syncing     = node_syncing_;
     health.wallet_connected = wallet_->is_open();
+    health.wallet_synced    = wallet_synced_;
+    health.wallet_syncing   = wallet_syncing_;
     metrics_->update_system_health(health);
 
     // Dashboard 5: Offer lifecycle

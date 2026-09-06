@@ -828,6 +828,66 @@ class MainWindow(QMainWindow):
                 pnl=pnl,
             )
 
+        # Derive Node and Wallet connection & sync indicators.
+        health = data.get("health", {})
+        node_connected = bool(
+            health.get("node_connected", 0.0) >= 1.0
+            or health.get("node_synced", 0.0) >= 1.0
+            or (block_height > 0 and bool(data.get("metrics_connected", False)))
+        )
+        node_synced = bool(health.get("node_synced", 0.0) >= 1.0)
+        node_syncing = bool(health.get("node_syncing", 0.0) >= 1.0)
+
+        if not node_connected:
+            node_label = "Full Node: Disconnected"
+            node_colour = "red"
+        elif node_synced:
+            node_label = "Full Node: Synced"
+            node_colour = "green"
+        elif node_syncing:
+            node_label = "Full Node: Syncing..."
+            node_colour = "yellow"
+        else:
+            node_label = "Full Node: Not Synced"
+            node_colour = "yellow"
+
+        wallet_connected = bool(
+            health.get("wallet_connected", 0.0) >= 1.0
+            or bool(wallet_balances)
+        )
+        wallet_synced = bool(health.get("wallet_synced", 0.0) >= 1.0)
+        wallet_syncing = bool(health.get("wallet_syncing", 0.0) >= 1.0)
+
+        if not wallet_connected:
+            wallet_label = "Wallet: Disconnected"
+            wallet_colour = "red"
+        elif wallet_synced:
+            wallet_label = "Wallet: Synced"
+            wallet_colour = "green"
+        elif wallet_syncing:
+            wallet_label = "Wallet: Syncing..."
+            wallet_colour = "yellow"
+        else:
+            wallet_label = "Wallet: Not Synced"
+            wallet_colour = "yellow"
+
+        dexie_conn = bool(data.get("metrics_connected", False)) or bool(market_data)
+        dexie_label = "Dexie: Connected" if dexie_conn else "Dexie: Disconnected"
+        dexie_colour = "green" if dexie_conn else "red"
+
+        sync_parts = []
+        if node_syncing:
+            sync_parts.append("Node Syncing")
+        elif not node_synced and node_connected:
+            sync_parts.append("Node Not Synced")
+
+        if wallet_syncing:
+            sync_parts.append("Wallet Syncing")
+        elif not wallet_synced and wallet_connected:
+            sync_parts.append("Wallet Not Synced")
+
+        sync_summary = ", ".join(sync_parts)
+
         # [PNL-DISPLAY 2026-08-02] The status-bar headline shows the
         # restart-proof lifetime realized P&L from trade_log when the DB
         # figure has loaded; the engine's since-boot USD gauge is only a
@@ -840,8 +900,15 @@ class MainWindow(QMainWindow):
             block_height=block_height,
             xch_usd_rate=xch_usd,
             pnl_usd=status_pnl_usd,
+            sync_status=sync_summary,
         )
-        self._block_label.setText(f"Block: {block_height:,}")
+        if sync_summary:
+            self._block_label.setText(f"Block: {block_height:,} ({sync_summary})")
+            self._block_label.setStyleSheet(f"color: {_C.WARNING_YELLOW}; font-weight: bold;")
+        else:
+            self._block_label.setText(f"Block: {block_height:,}")
+            self._block_label.setStyleSheet(f"color: {TEXT_PRIMARY};")
+        self._block_label.setToolTip(f"Chain height: {block_height:,}\n{node_label}\n{wallet_label}")
 
         # Dashboard update -- translate bridge dict to card-keyed format.
         dashboard = self._unwrap(self._dashboard)
@@ -903,23 +970,34 @@ class MainWindow(QMainWindow):
                 colour_map = {"Running": "green", "Stopped": "red", "Disconnected": "red"}
                 dashboard.update_bot_status(status, colour=colour_map.get(status, "gray"))
             if hasattr(dashboard, "update_connection_status"):
-                full_node_connected = (
-                    health.get("node_synced", 0.0) >= 1.0
-                    or block_height > 0
-                    or bool(data.get("metrics_connected", False))
-                )
-                wallet_connected = (
-                    health.get("wallet_connected", 0.0) >= 1.0
-                    or bool(wallet_balances)
-                )
                 dashboard.update_connection_status({
-                    "Full Node": full_node_connected,
-                    "Wallet": wallet_connected,
-                    "Dexie": True,
+                    "Full Node": {
+                        "connected": node_connected,
+                        "synced": node_synced,
+                        "syncing": node_syncing,
+                        "label": node_label,
+                        "colour": node_colour,
+                    },
+                    "Wallet": {
+                        "connected": wallet_connected,
+                        "synced": wallet_synced,
+                        "syncing": wallet_syncing,
+                        "label": wallet_label,
+                        "colour": wallet_colour,
+                    },
+                    "Dexie": {
+                        "connected": dexie_conn,
+                        "label": dexie_label,
+                        "colour": dexie_colour,
+                    },
                 })
             if hasattr(dashboard, "update_block_info"):
                 # Use 0 timestamp as sentinel; dashboard handles it gracefully.
-                dashboard.update_block_info(block_height, time.time() if block_height > 0 else 0.0)
+                dashboard.update_block_info(
+                    block_height,
+                    time.time() if block_height > 0 else 0.0,
+                    sync_note=sync_summary or ("Synced" if (node_synced and wallet_synced) else ""),
+                )
             if hasattr(dashboard, "update_wallet_balances"):
                 reserve = data.get("spendable_reserve", {})
                 stuck = data.get("stuck_offers", 0)

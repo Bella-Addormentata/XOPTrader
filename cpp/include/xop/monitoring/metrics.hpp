@@ -108,9 +108,13 @@ struct InventorySkewSnapshot {
 // ---------------------------------------------------------------------------
 
 struct SystemHealthSnapshot {
-    BlockHeight block_height;    // Current chain tip height.
-    bool        node_synced;     // True if the full node is fully synced.
-    bool        wallet_connected;// True if the wallet RPC is reachable.
+    BlockHeight block_height{0};     // Current chain tip height.
+    bool        node_connected{false}; // True if the full node RPC is reachable.
+    bool        node_synced{false};    // True if the full node is fully synced.
+    bool        node_syncing{false};   // True if the full node is syncing.
+    bool        wallet_connected{false}; // True if the wallet RPC is reachable.
+    bool        wallet_synced{false};  // True if the wallet is fully synced.
+    bool        wallet_syncing{false}; // True if the wallet is syncing.
 };
 
 // ---------------------------------------------------------------------------
@@ -463,8 +467,13 @@ private:
 
     prometheus::Family<prometheus::Gauge>* sys_family_{nullptr};
     prometheus::Gauge* sys_block_height_{nullptr};
+    prometheus::Gauge* sys_node_connected_{nullptr};
     prometheus::Gauge* sys_node_synced_{nullptr};
+    prometheus::Gauge* sys_node_syncing_{nullptr};
+    prometheus::Gauge* sys_node_synced_legacy_{nullptr};
     prometheus::Gauge* sys_wallet_connected_{nullptr};
+    prometheus::Gauge* sys_wallet_synced_{nullptr};
+    prometheus::Gauge* sys_wallet_syncing_{nullptr};
     prometheus::Family<prometheus::Histogram>* offer_latency_family_{nullptr};
     prometheus::Histogram* offer_latency_{nullptr};
 

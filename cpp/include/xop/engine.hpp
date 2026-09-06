@@ -1909,6 +1909,12 @@ private:
     uint32_t consecutive_unsynced_blocks_{0};
     static constexpr uint32_t kWalletRestartThreshold{20};  // ~3 min
 
+    bool wallet_synced_{false};
+    bool wallet_syncing_{false};
+    bool node_connected_{false};
+    bool node_synced_{false};
+    bool node_syncing_{false};
+
     // -- [T4-04] Cached wallet balances for spendable-reserve gating ------
     // Populated from wallet RPC each heartbeat; keyed by wallet label.
     struct WalletBalanceEntry {

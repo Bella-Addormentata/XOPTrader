@@ -181,6 +181,8 @@ class StatusBar(QStatusBar):
             gauge, in which case the legacy path below runs -- note it
             wrongly treats the mixed quote-currency mojo total as XCH mojos
             and understates P&L by ~1e9 for CAT-quoted pairs.
+        sync_status : str
+            Optional sync description string (e.g. "Node Syncing", "Wallet Syncing").
         """
         # PnL -- colour-coded
         if pnl_usd is not None:
@@ -207,8 +209,17 @@ class StatusBar(QStatusBar):
         clamped: int = max(0, min(100, int(inventory_ratio * 100)))
         self._inventory_bar.setValue(clamped)
 
-        # Block height with thousands separator
-        self._block_label.setText(f"Block: {block_height:,}")
+        # Block height with thousands separator and optional sync note
+        if sync_status:
+            self._block_label.setText(f"Block: {block_height:,} ({sync_status})")
+            self._block_label.setStyleSheet(
+                f"color: {_C.WARNING_YELLOW}; font-size: 13px; font-weight: bold; padding: 0 6px;"
+            )
+        else:
+            self._block_label.setText(f"Block: {block_height:,}")
+            self._block_label.setStyleSheet(
+                f"color: {TEXT_SECONDARY}; font-size: 13px; padding: 0 6px;"
+            )
 
     def refresh_clock_and_memory(self) -> None:
         """Convenience method called by the 1-second timer in MainWindow."""

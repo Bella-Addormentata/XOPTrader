@@ -839,25 +839,37 @@ class DashboardWidget(QWidget):
         )
 
     def update_connection_status(
-        self, statuses: dict[str, bool]
+        self, statuses: dict[str, Any]
     ) -> None:
-        """Set green/red dots for each service.
+        """Set green/yellow/red dots and descriptive status for each service.
 
         Parameters
         ----------
         statuses:
             Mapping of service name (``"Full Node"``, ``"Wallet"``,
-            ``"Dexie"``) to connection boolean.
+            ``"Dexie"``) to connection boolean or detailed status dict with
+            ``colour`` and ``label``.
         """
-        for svc, connected in statuses.items():
+        for svc, val in statuses.items():
             entry = self._conn_dots.get(svc)
             if entry is None:
                 continue
             dot, label = entry
-            dot.set_colour("green" if connected else "red")
+            if isinstance(val, dict):
+                colour = val.get("colour", "gray")
+                text = val.get("label", svc)
+                dot.set_colour(colour)
+                label.setText(text)
+                label.setToolTip(val.get("tooltip", text))
+            elif isinstance(val, str):
+                dot.set_colour("green" if "synced" in val.lower() or "conn" in val.lower() else "red")
+                label.setText(f"{svc}: {val}")
+            else:
+                dot.set_colour("green" if val else "red")
+                label.setText(f"{svc}: {'Connected' if val else 'Disconnected'}")
 
     def update_block_info(
-        self, height: int, last_block_ts: float
+        self, height: int, last_block_ts: float, sync_note: str = ""
     ) -> None:
         """Update the Current Block card.
 
@@ -871,6 +883,8 @@ class DashboardWidget(QWidget):
             Latest block height.
         last_block_ts:
             Unix timestamp of the most recent block.
+        sync_note:
+            Optional sync description (e.g. "Synced", "Wallet Syncing").
         """
         # Guard: unknown block state produces placeholder display.
         if height == 0 or last_block_ts == 0.0:
@@ -886,7 +900,11 @@ class DashboardWidget(QWidget):
             age_str = f"{age_s / 60:.1f}m ago"
         else:
             age_str = f"{age_s / 3600:.1f}h ago"
-        self._block_age_label.setText(age_str)
+
+        if sync_note:
+            self._block_age_label.setText(f"{age_str} • {sync_note}")
+        else:
+            self._block_age_label.setText(age_str)
 
     def update_active_pairs(
         self, pairs: list[dict[str, Any]]

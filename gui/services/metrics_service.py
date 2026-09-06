@@ -477,7 +477,9 @@ class MetricsService(QObject):
         Returns
         -------
         dict[str, float]
-            Keys: ``block_height``, ``node_synced``, ``wallet_connected``.
+            Keys: ``block_height``, ``node_connected``, ``node_synced``,
+            ``node_syncing``, ``wallet_connected``, ``wallet_synced``,
+            ``wallet_syncing``.
             Boolean metrics are represented as ``1.0`` (true) / ``0.0``
             (false).
         """
@@ -485,8 +487,12 @@ class MetricsService(QObject):
             m = self._latest
         return {
             "block_height": _labelled(m, "xop_node", "metric", "block_height"),
-            "node_synced": _labelled(m, "xop_node", "metric", "synced"),
+            "node_connected": _labelled(m, "xop_node", "metric", "node_connected", default=_labelled(m, "xop_node", "metric", "synced")),
+            "node_synced": _labelled(m, "xop_node", "metric", "node_synced", default=_labelled(m, "xop_node", "metric", "synced")),
+            "node_syncing": _labelled(m, "xop_node", "metric", "node_syncing", default=0.0),
             "wallet_connected": _labelled(m, "xop_node", "metric", "wallet_connected"),
+            "wallet_synced": _labelled(m, "xop_node", "metric", "wallet_synced", default=0.0),
+            "wallet_syncing": _labelled(m, "xop_node", "metric", "wallet_syncing", default=0.0),
         }
 
     def has_data(self) -> bool:

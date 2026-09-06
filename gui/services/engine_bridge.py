@@ -501,9 +501,21 @@ class EngineBridge(QObject):
         else:
             analysis_data = {}
 
+        health = self._metrics_svc.get_health()
+        wallet_sync = self._wallet_svc.get_sync_status() if hasattr(self._wallet_svc, "get_sync_status") else {}
+        if wallet_sync:
+            if wallet_sync.get("connected"):
+                health["wallet_connected"] = 1.0
+            if wallet_sync.get("synced"):
+                health["wallet_synced"] = 1.0
+                health["wallet_syncing"] = 0.0
+            elif wallet_sync.get("syncing"):
+                health["wallet_synced"] = 0.0
+                health["wallet_syncing"] = 1.0
+
         data: dict[str, Any] = {
             "pnl": self._metrics_svc.get_pnl(),
-            "health": self._metrics_svc.get_health(),
+            "health": health,
             "offers": self._metrics_svc.get_offers_summary(),
             "risk": self._metrics_svc.get_risk(),
             "market_data": market_data,
