@@ -455,6 +455,10 @@ class MainWindow(QMainWindow):
             try:
                 self._dexie_cancel_all_pending = bool(
                     bridge.cancel_all_pending())
+                for panel in (self._order_panel, self._tab_order_panel):
+                    target = self._unwrap(panel)
+                    if target is not None and hasattr(target, "set_cancel_all_pending"):
+                        target.set_cancel_all_pending(self._dexie_cancel_all_pending)
             except Exception:  # noqa: BLE001
                 pass
         self.config_service = bridge.config_service
@@ -710,11 +714,13 @@ class MainWindow(QMainWindow):
         # The orders panels' Age (blocks) column: set_current_block existed
         # with no caller, so _current_block stayed 0 and every age rendered
         # as 0 since the panel was built.
-        if block_height > 0:
-            for panel in (self._order_panel, self._tab_order_panel):
-                target = self._unwrap(panel)
-                if target is not None and hasattr(target, "set_current_block"):
+        for panel in (self._order_panel, self._tab_order_panel):
+            target = self._unwrap(panel)
+            if target is not None:
+                if block_height > 0 and hasattr(target, "set_current_block"):
                     target.set_current_block(block_height)
+                if hasattr(target, "set_cancel_all_pending"):
+                    target.set_cancel_all_pending(self._dexie_cancel_all_pending)
 
         # Compute average spread from all pairs.
         market_data = data.get("market_data", {})
@@ -2530,6 +2536,10 @@ class MainWindow(QMainWindow):
                 if hasattr(self._bridge, "clear_cancel_all_pending"):
                     self._bridge.clear_cancel_all_pending()
             self._dexie_cancel_all_pending = False
+            for panel in (self._order_panel, self._tab_order_panel):
+                target = self._unwrap(panel)
+                if target is not None and hasattr(target, "set_cancel_all_pending"):
+                    target.set_cancel_all_pending(False)
         elif self._dexie_cancel_all_pending:
             # [review #22] Gate ANY on -- including the startup arm --
             # while a cancel-all is genuinely unconfirmed. (No longer
@@ -2802,6 +2812,10 @@ class MainWindow(QMainWindow):
         if not self._bridge.cancel_all_offers():
             return  # bridge already surfaced the error
         self._dexie_cancel_all_pending = True
+        for panel in (self._order_panel, self._tab_order_panel):
+            target = self._unwrap(panel)
+            if target is not None and hasattr(target, "set_cancel_all_pending"):
+                target.set_cancel_all_pending(True)
         if hasattr(self._bridge, "mark_cancel_all_pending"):
             # [review #8] Persisted beside the DB so a GUI restart during
             # the confirm window re-adopts the latch.

@@ -150,6 +150,82 @@ def test_fill_minutes_sort_numerically_in_both_directions(app):
         panel.hide()
 
 
+def test_cancel_all_pending_displays_cancelling_status_and_disables_button(app):
+    from PySide6.QtWidgets import QPushButton
+
+    panel = _panel(app)
+    panel.update_offers([_offer(offer_id="0x111", status="pending")])
+    try:
+        # Initially pending with active cancel button
+        assert panel._table.item(0, 6).text() == "Pending"
+        btn = panel._table.cellWidget(0, 11)
+        assert isinstance(btn, QPushButton)
+        assert btn.text() == "Cancel"
+        assert btn.isEnabled() is True
+
+        # Activate cancel-all pending
+        panel.set_cancel_all_pending(True)
+        assert panel._table.item(0, 6).text() == "Cancelling"
+        btn = panel._table.cellWidget(0, 11)
+        assert isinstance(btn, QPushButton)
+        assert btn.text() == "Cancelling..."
+        assert btn.isEnabled() is False
+
+        # Reset cancel-all pending
+        panel.set_cancel_all_pending(False)
+        assert panel._table.item(0, 6).text() == "Pending"
+        btn = panel._table.cellWidget(0, 11)
+        assert btn.text() == "Cancel"
+        assert btn.isEnabled() is True
+    finally:
+        panel.hide()
+
+
+def test_single_cancelling_offer_displays_cancelling_status(app):
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QPushButton
+
+    panel = _panel(app)
+    panel.update_offers([
+        _offer(offer_id="0x111", status="pending"),
+        _offer(offer_id="0x222", status="pending"),
+    ])
+    try:
+        panel.set_cancelling_offers({"0x111"})
+        # 0x111 should be cancelling, 0x222 remains pending
+        # Find rows by offer_id in UserRole
+        row_0x111 = 0 if panel._table.item(0, 0).data(Qt.ItemDataRole.UserRole) == "0x111" else 1
+        row_0x222 = 1 - row_0x111
+
+        assert panel._table.item(row_0x111, 6).text() == "Cancelling"
+        btn_111 = panel._table.cellWidget(row_0x111, 11)
+        assert btn_111.text() == "Cancelling..."
+        assert btn_111.isEnabled() is False
+
+        assert panel._table.item(row_0x222, 6).text() == "Pending"
+        btn_222 = panel._table.cellWidget(row_0x222, 11)
+        assert btn_222.text() == "Cancel"
+        assert btn_222.isEnabled() is True
+    finally:
+        panel.hide()
+
+
+def test_pending_filter_retains_cancelling_offers(app):
+    panel = _panel(app)
+    panel.update_offers([
+        _offer(offer_id="0x111", status="pending"),
+        _offer(offer_id="0x222", status="filled", resolved_block=9_184_050),
+    ])
+    try:
+        panel._combo_status.setCurrentText("Pending")
+        panel.set_cancel_all_pending(True)
+        # Filter is "Pending", but cancelling offers should still be visible
+        assert panel._table.rowCount() == 1
+        assert panel._table.item(0, 6).text() == "Cancelling"
+    finally:
+        panel.hide()
+
+
 def test_fill_minutes_are_right_aligned_like_the_other_numerics(app):
     from PySide6.QtCore import Qt
 
