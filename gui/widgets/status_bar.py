@@ -158,6 +158,7 @@ class StatusBar(QStatusBar):
         block_height: int,
         xch_usd_rate: float = 0.0,
         pnl_usd: float | None = None,
+        sync_status: str = "",
     ) -> None:
         """Push a new set of live metrics into the status bar.
 

@@ -17359,13 +17359,13 @@ void Engine::step_update_pnl(BlockHeight block_height)
         // When asset is "xch", normalize the price to the canonical USD rate.
         [this](const std::string& pair, const std::string& asset) -> Mojo {
             if (asset == "xch") {
-                const Mojo xch_usd = asset_usd_pseudo_price(AssetId{"xch"});
+                const Mojo xch_usd_mojos = asset_usd_pseudo_price(AssetId{"xch"});
                 const PairConfig* pc = find_pair_config(pair);
-                if (xch_usd > 0 && pc) {
+                if (xch_usd_mojos > 0 && pc) {
                     const double f = quote_usd_factor(*pc);
                     if (f > 0.0) {
                         return static_cast<Mojo>(std::llround(
-                            static_cast<double>(xch_usd) / f));
+                            static_cast<double>(xch_usd_mojos) / f));
                     }
                 }
             }
