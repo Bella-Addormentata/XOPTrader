@@ -181,33 +181,12 @@ def test_cancel_all_pending_displays_cancelling_status_and_disables_button(app):
         panel.hide()
 
 
-def test_single_cancelling_offer_displays_cancelling_status(app):
-    from PySide6.QtCore import Qt
-    from PySide6.QtWidgets import QPushButton
-
-    panel = _panel(app)
-    panel.update_offers([
-        _offer(offer_id="0x111", status="pending"),
-        _offer(offer_id="0x222", status="pending"),
-    ])
-    try:
-        panel.set_cancelling_offers({"0x111"})
-        # 0x111 should be cancelling, 0x222 remains pending
-        # Find rows by offer_id in UserRole
-        row_0x111 = 0 if panel._table.item(0, 0).data(Qt.ItemDataRole.UserRole) == "0x111" else 1
-        row_0x222 = 1 - row_0x111
-
-        assert panel._table.item(row_0x111, 6).text() == "Cancelling"
-        btn_111 = panel._table.cellWidget(row_0x111, 11)
-        assert btn_111.text() == "Cancelling..."
-        assert btn_111.isEnabled() is False
-
-        assert panel._table.item(row_0x222, 6).text() == "Pending"
-        btn_222 = panel._table.cellWidget(row_0x222, 11)
-        assert btn_222.text() == "Cancel"
-        assert btn_222.isEnabled() is True
-    finally:
-        panel.hide()
+# [S33 2026-09-05] test_single_cancelling_offer_displays_cancelling_status
+# is gone with the mechanism it exercised.  It drove the per-offer
+# "Cancelling" badge through set_cancelling_offers(), which c20 left with no
+# production caller once the optimistic click-latch was removed; the setter,
+# _cancelling_offer_ids, and the three display paths that read it have all
+# been deleted.  Cancel-all's badge is still covered above.
 
 
 def test_pending_filter_retains_cancelling_offers(app):
@@ -278,5 +257,64 @@ def test_no_tip_yet_means_unknown_not_zero(app):
     panel.update_offers([_offer()])
     try:
         assert panel._table.item(0, 9).text() == "—"
+    finally:
+        panel.hide()
+
+
+def test_single_cancel_click_does_not_latch_cancelling_state(app, monkeypatch):
+    """[S33 2026-09-05] Confirming a single-offer cancel must NOT mark the
+    row "Cancelling..." optimistically.  The signal lands on
+    EngineBridge.cancel_offer, a Phase-1 stub that submits nothing and only
+    emits an error, and nothing on that path ever unwinds the latch -- so
+    latching greys out the row's cancel button (and hides the context-menu
+    Cancel action, which is gated on the DISPLAYED status text) for a still
+    resting offer, permanently."""
+    from PySide6.QtWidgets import QMessageBox, QPushButton
+
+    panel = _panel(app)
+    panel.update_offers([_offer(offer_id="0x111", status="pending")])
+    emitted: list[str] = []
+    panel.cancel_offer_requested.connect(emitted.append)
+    monkeypatch.setattr(
+        QMessageBox, "question",
+        staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes),
+    )
+    try:
+        panel._on_cancel_single("0x111")
+
+        # The request itself is still made ...
+        assert emitted == ["0x111"]
+        # ... but no display state is latched off it.  (The per-offer latch
+        # set itself is gone; these assert the observable consequence, which
+        # is what any reintroduced latch would break.)
+        assert panel._table.item(0, 6).text() == "Pending", (
+            "the badge must not claim 'Cancelling' for an unsubmitted request"
+        )
+        btn = panel._table.cellWidget(0, 11)
+        assert isinstance(btn, QPushButton)
+        assert btn.text() == "Cancel"
+        assert btn.isEnabled() is True, (
+            "the row's retry control must survive -- disabling it is what "
+            "makes the false latch unrecoverable"
+        )
+    finally:
+        panel.hide()
+
+
+def test_declining_the_single_cancel_confirmation_emits_nothing(app, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    panel = _panel(app)
+    panel.update_offers([_offer(offer_id="0x111", status="pending")])
+    emitted: list[str] = []
+    panel.cancel_offer_requested.connect(emitted.append)
+    monkeypatch.setattr(
+        QMessageBox, "question",
+        staticmethod(lambda *a, **k: QMessageBox.StandardButton.No),
+    )
+    try:
+        panel._on_cancel_single("0x111")
+        assert emitted == []
+        assert panel._table.item(0, 6).text() == "Pending"
     finally:
         panel.hide()

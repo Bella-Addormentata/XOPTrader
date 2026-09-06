@@ -504,14 +504,24 @@ class EngineBridge(QObject):
         health = self._metrics_svc.get_health()
         wallet_sync = self._wallet_svc.get_sync_status() if hasattr(self._wallet_svc, "get_sync_status") else {}
         if wallet_sync:
-            if wallet_sync.get("connected"):
-                health["wallet_connected"] = 1.0
-            if wallet_sync.get("synced"):
-                health["wallet_synced"] = 1.0
-                health["wallet_syncing"] = 0.0
-            elif wallet_sync.get("syncing"):
-                health["wallet_synced"] = 0.0
-                health["wallet_syncing"] = 1.0
+            # [S33 2026-09-05] Copy the direct-RPC triple AUTHORITATIVELY,
+            # false values included.  The engine gauges are NOT a safe
+            # fallback for a "no" answer: xop_node wallet_connected is only
+            # ChiaRPCBase::is_open() (the client object was opened and never
+            # closed -- never a reachability check), and wallet_synced_ is
+            # written solely inside Engine::step_manage_offers, so it holds
+            # its last value for as long as an earlier gate short-circuits
+            # Step 8 (dry run, breaker pause, wallet circuit, GUI pause).
+            # Writing only the optimistic branches left a desynced or
+            # unreachable wallet painted "Wallet: Synced" green off those
+            # stale gauges.  wallet_service always publishes a COMPLETE
+            # triple per pass and caches it only when non-empty, so an empty
+            # dict (no fetch yet) still falls through to the engine gauges.
+            synced = bool(wallet_sync.get("synced"))
+            syncing = bool(wallet_sync.get("syncing")) and not synced
+            health["wallet_connected"] = 1.0 if wallet_sync.get("connected") else 0.0
+            health["wallet_synced"] = 1.0 if synced else 0.0
+            health["wallet_syncing"] = 1.0 if syncing else 0.0
 
         data: dict[str, Any] = {
             "pnl": self._metrics_svc.get_pnl(),
@@ -668,12 +678,22 @@ class EngineBridge(QObject):
 
     #: Whether this bridge can actually command the running engine.
     #:
-    #: False while start/stop/cancel are stubs. Callers MUST consult this
-    #: rather than checking that a method exists: every one of them does
-    #: exist, and calling them succeeds while doing nothing -- so a UI that
-    #: probes with hasattr concludes it retracted a book it never touched.
-    #: The dexie switch reads this to decide whether it may promise "off
-    #: means flat".
+    #: True since the flag-file channel landed: start_engine/stop_engine
+    #: manage a real subprocess, and pause/resume/reload/cancel-all are
+    #: flag files the engine consumes -- so "off means flat" is a promise
+    #: this bridge can keep.
+    #:
+    #: [S33 2026-09-05] It does NOT cover cancel_offer(): the single-offer
+    #: path above is still a Phase-1 stub that submits nothing and only
+    #: emits an error. This flag was written when everything was a stub and
+    #: its old text ("False while start/stop/cancel are stubs", "the dexie
+    #: switch reads this") outlived both facts -- the switch reads the
+    #: engine's published gates, and today the only reader in the tree is
+    #: tests/test_intent_switch.py, which pins the value. Callers that gain
+    #: a use for it MUST consult it rather than checking that a method
+    #: exists: every one of them does exist, and a stub call succeeds while
+    #: doing nothing -- so a UI that probes with hasattr concludes it
+    #: retracted a book it never touched.
     SUPPORTS_DIRECT_CONTROL: bool = True
 
     def cancel_all_offers(self) -> bool:

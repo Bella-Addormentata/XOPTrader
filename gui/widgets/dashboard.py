@@ -847,8 +847,21 @@ class DashboardWidget(QWidget):
         ----------
         statuses:
             Mapping of service name (``"Full Node"``, ``"Wallet"``,
-            ``"Dexie"``) to connection boolean or detailed status dict with
-            ``colour`` and ``label``.
+            ``"Dexie"``) to connection boolean, status string, or detailed
+            status dict with ``colour`` and ``label``.
+
+        [S33 2026-09-05] All three input forms are supported public API, but
+        only the dict form has a production caller: main_window.py:1002
+        passes a dict for Full Node, Wallet and Dexie alike, so the string
+        and bool branches below are reachable only from other embedders and
+        from tests/test_dashboard_connection_status.py.  They are kept
+        deliberately -- this widget is the app's one connection-status
+        renderer and a caller handing it a bare state string must not get a
+        green dot for a dead service -- not left behind by accident.  Their
+        colour rule is stricter than main_window's: "Not Synced" is red here
+        and yellow there.  Nothing mixes the two forms for one service, so
+        that cannot show up on screen; if a caller ever does, make the
+        string branch defer to the dict rule rather than the reverse.
         """
         for svc, val in statuses.items():
             entry = self._conn_dots.get(svc)
@@ -862,7 +875,28 @@ class DashboardWidget(QWidget):
                 label.setText(text)
                 label.setToolTip(val.get("tooltip", text))
             elif isinstance(val, str):
-                dot.set_colour("green" if "synced" in val.lower() or "conn" in val.lower() else "red")
+                # [S33 2026-09-05] Order matters and negatives must win.
+                # The old single substring test painted "Disconnected"
+                # green (it contains "conn") and "Not Synced" green (it
+                # contains "synced") -- alarm suppression: a green dot
+                # over a dead node.  Deleting the branch is not the fix
+                # either; strings would fall through to the else below,
+                # where ANY non-empty string is truthy, so "Disconnected"
+                # would still be green and would also be relabelled
+                # "Connected".  Negative and in-progress states are
+                # therefore matched FIRST and unrecognised text stays
+                # red, so an unknown state never reads as healthy.
+                low = val.lower()
+                negative = ("dis", "not", "no ", "error", "fail", "lost",
+                            "offline", "unknown", "stale", "timeout")
+                if any(word in low for word in negative):
+                    dot.set_colour("red")
+                elif "sync" in low and "synced" not in low:
+                    dot.set_colour("yellow")
+                elif "synced" in low or "conn" in low:
+                    dot.set_colour("green")
+                else:
+                    dot.set_colour("red")
                 label.setText(f"{svc}: {val}")
             else:
                 dot.set_colour("green" if val else "red")

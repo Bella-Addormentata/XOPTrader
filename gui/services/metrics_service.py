@@ -490,7 +490,17 @@ class MetricsService(QObject):
             "node_connected": _labelled(m, "xop_node", "metric", "node_connected", default=_labelled(m, "xop_node", "metric", "synced")),
             "node_synced": _labelled(m, "xop_node", "metric", "node_synced", default=_labelled(m, "xop_node", "metric", "synced")),
             "node_syncing": _labelled(m, "xop_node", "metric", "node_syncing", default=0.0),
-            "wallet_connected": _labelled(m, "xop_node", "metric", "wallet_connected"),
+            # [S33 2026-09-05] Legacy-engine compat belongs HERE, not in the
+            # indicator that reads it.  The default is used only when the
+            # sample is ABSENT, so an engine that predates the gauge but
+            # reports a synced wallet still reads connected, while an engine
+            # that explicitly publishes wallet_connected=0 is reported as 0
+            # and the wallet dot can reach "Disconnected".  Same shape as
+            # node_connected's fallback onto the legacy "synced" gauge above.
+            "wallet_connected": _labelled(
+                m, "xop_node", "metric", "wallet_connected",
+                default=_labelled(m, "xop_node", "metric", "wallet_synced"),
+            ),
             "wallet_synced": _labelled(m, "xop_node", "metric", "wallet_synced", default=0.0),
             "wallet_syncing": _labelled(m, "xop_node", "metric", "wallet_syncing", default=0.0),
         }

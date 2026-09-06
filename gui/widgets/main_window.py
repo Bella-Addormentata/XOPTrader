@@ -836,10 +836,20 @@ class MainWindow(QMainWindow):
 
         # Derive Node and Wallet connection & sync indicators.
         health = data.get("health", {})
+        # [S33 2026-09-05] Connectivity is ASSERTED by the engine, never
+        # inferred from a height.  The engine keeps publishing the last
+        # known height (wallet-sourced once height_source_ falls back to
+        # HeightSource::Wallet) right through a full-node outage, and stays
+        # scrapeable, so a "height > 0 and the scrape landed" fallback
+        # overrode an explicit node_connected=0 and painted the outage
+        # yellow "Not Synced" for its whole duration -- the red
+        # "Disconnected" state was unreachable exactly when it mattered.
+        # Engines predating the gauge are covered a layer down:
+        # MetricsService.get_health() defaults node_connected to the legacy
+        # xop_node{metric="synced"} gauge.
         node_connected = bool(
             health.get("node_connected", 0.0) >= 1.0
             or health.get("node_synced", 0.0) >= 1.0
-            or (block_height > 0 and bool(data.get("metrics_connected", False)))
         )
         node_synced = bool(health.get("node_synced", 0.0) >= 1.0)
         node_syncing = bool(health.get("node_syncing", 0.0) >= 1.0)
@@ -857,10 +867,22 @@ class MainWindow(QMainWindow):
             node_label = "Full Node: Not Synced"
             node_colour = "yellow"
 
-        wallet_connected = bool(
-            health.get("wallet_connected", 0.0) >= 1.0
-            or bool(wallet_balances)
-        )
+        # [S33 2026-09-05] Same rule as the node dot beside it: connectivity
+        # is ASSERTED, never inferred from remembered state.  The retained
+        # balances are not evidence of a reachable wallet -- WalletService
+        # merges each fetch into `_cached` and deliberately never clears it
+        # on failure (wallet_service.py, "prevents a single timed-out wallet
+        # RPC from erasing previously-fetched wallets"), so after the first
+        # successful fetch `bool(wallet_balances)` is permanently true.  That
+        # OR overrode the authoritative wallet_connected = 0 that
+        # EngineBridge now writes from the direct wallet RPC, and an
+        # unreachable wallet rendered yellow "Not Synced" instead of red
+        # "Disconnected" -- the alarm suppression this pass exists to remove.
+        # Engines predating the gauge are covered a layer down:
+        # MetricsService.get_health() defaults wallet_connected to the legacy
+        # xop_node{metric="wallet_synced"} gauge, exactly as node_connected
+        # defaults to the legacy {metric="synced"} one.
+        wallet_connected = bool(health.get("wallet_connected", 0.0) >= 1.0)
         wallet_synced = bool(health.get("wallet_synced", 0.0) >= 1.0)
         wallet_syncing = bool(health.get("wallet_syncing", 0.0) >= 1.0)
 
@@ -877,7 +899,14 @@ class MainWindow(QMainWindow):
             wallet_label = "Wallet: Not Synced"
             wallet_colour = "yellow"
 
-        dexie_conn = bool(data.get("metrics_connected", False)) or bool(market_data)
+        # [S33 2026-09-05] Liveness only.  `market_data` is rebuilt every tick
+        # from the RETAINED MetricsService snapshot (_on_failure clears
+        # _connected but deliberately keeps _latest) and carries an entry for
+        # every configured pair even before the first successful scrape -- so
+        # `or bool(market_data)` pinned this dot green from the first tick
+        # onward, making the indicator as inert as the hardcoded True it
+        # replaced.  `metrics_connected` is the only live signal published.
+        dexie_conn = bool(data.get("metrics_connected", False))
         dexie_label = "Dexie: Connected" if dexie_conn else "Dexie: Disconnected"
         dexie_colour = "green" if dexie_conn else "red"
 
