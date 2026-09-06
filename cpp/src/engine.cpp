@@ -318,6 +318,50 @@ double shift_schedule_to_floor(std::vector<double>& spacings,
     return shift;
 }
 
+// [S33 2026-09-05] See the contract in engine.hpp.  The cross-side coupling
+// (alpha_bid -> ASK, alpha_ask -> BID) and the inverted-range clamps are the
+// whole point of this function; do not "simplify" either.
+ActivitySchedules interpolate_activity_schedules(
+    double                     alpha_bid,
+    double                     alpha_ask,
+    double                     min_margin_bps,
+    double                     max_margin_bps,
+    const std::vector<double>& min_spacings,
+    const std::vector<double>& max_spacings,
+    std::size_t                num_tiers)
+{
+    ActivitySchedules out;
+
+    const double a_bid = std::clamp(alpha_bid, 0.0, 1.0);
+    const double a_ask = std::clamp(alpha_ask, 0.0, 1.0);
+
+    // An inverted margin range would run the interpolation backwards: zero
+    // activity would TIGHTEN quotes.  Raise the wide end to the tight end so
+    // the pair simply stops widening instead.
+    const double eff_max_margin = std::max(max_margin_bps, min_margin_bps);
+    out.margin_range_inverted = (max_margin_bps < min_margin_bps);
+
+    out.bid_margin_bps = eff_max_margin - a_ask * (eff_max_margin - min_margin_bps);
+    out.ask_margin_bps = eff_max_margin - a_bid * (eff_max_margin - min_margin_bps);
+
+    out.bid_spacings.resize(num_tiers);
+    out.ask_spacings.resize(num_tiers);
+    for (std::size_t i = 0; i < num_tiers; ++i) {
+        const double min_s = (i < min_spacings.size())
+            ? min_spacings[i]
+            : (100.0 * static_cast<double>(i + 1));
+        const double cfg_max_s = (i < max_spacings.size()) ? max_spacings[i] : min_s;
+        if (cfg_max_s < min_s) {
+            ++out.spacing_tiers_inverted;
+        }
+        const double max_s = std::max(cfg_max_s, min_s);
+        out.bid_spacings[i] = max_s - a_ask * (max_s - min_s);
+        out.ask_spacings[i] = max_s - a_bid * (max_s - min_s);
+    }
+
+    return out;
+}
+
 // [S33 2026-09-05] See the contract in engine.hpp.
 Mojo xch_mark_price_mojos(Mojo xch_usd_mojos, double registered_factor)
 {
@@ -7881,6 +7925,12 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                 ? pair_cfg->min_profit_margin_max_bps_override.value()
                 : std::max(min_margin, min_margin * 2.0);
 
+            // Spacing interpolation: at 0 fills -> max_spacing; at >= target fills -> min_spacing
+            const auto& min_spacings = ladder_cfg.tier_spacing_bps;
+            const auto& max_spacings = (pair_cfg && pair_cfg->tier_spacing_max_bps_override.has_value())
+                ? pair_cfg->tier_spacing_max_bps_override.value()
+                : min_spacings;
+
             // CROSS-SIDE REPLENISHMENT COUPLING:
             // When bids fill (buying base asset), we are actively replenishing inventory,
             // so the ASK margin and spacing can safely tighten to sell (driven by alpha_bid).
@@ -7889,23 +7939,41 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
             // Conversely, when there are very few bid fills (alpha_bid is low), we are not
             // replenishing base inventory, so ASK margin/gap expands (to max_margin/max_spacing)
             // to demand a higher liquidity premium and protect inventory.
-            effective_bid_margin_bps = max_margin - alpha_ask * (max_margin - min_margin);
-            effective_ask_margin_bps = max_margin - alpha_bid * (max_margin - min_margin);
+            //
+            // [S33 2026-09-05] The interpolation itself lives in
+            // interpolate_activity_schedules (engine.hpp) so ctest can reach the
+            // code that sets the live margins -- see
+            // cpp/tests/test_activity_interpolation.cpp.  It also clamps an
+            // inverted max/min range, which config.cpp cannot check: the maxima
+            // are only validated as positive there, and both operands (the
+            // pair's effective min margin, the pair's resolved ladder schedule)
+            // exist only here.
+            const ActivitySchedules sched = interpolate_activity_schedules(
+                alpha_bid, alpha_ask, min_margin, max_margin,
+                min_spacings, max_spacings, ladder_cfg.num_tiers);
 
-            // Spacing interpolation: at 0 fills -> max_spacing; at >= target fills -> min_spacing
-            const auto& min_spacings = ladder_cfg.tier_spacing_bps;
-            const auto& max_spacings = (pair_cfg && pair_cfg->tier_spacing_max_bps_override.has_value())
-                ? pair_cfg->tier_spacing_max_bps_override.value()
-                : min_spacings;
+            effective_bid_margin_bps = sched.bid_margin_bps;
+            effective_ask_margin_bps = sched.ask_margin_bps;
+            ladder_cfg.tier_spacing_bps_bid = sched.bid_spacings;
+            ladder_cfg.tier_spacing_bps_ask = sched.ask_spacings;
 
-            ladder_cfg.tier_spacing_bps_bid.resize(ladder_cfg.num_tiers);
-            ladder_cfg.tier_spacing_bps_ask.resize(ladder_cfg.num_tiers);
-
-            for (std::size_t i = 0; i < ladder_cfg.num_tiers; ++i) {
-                const double min_s = (i < min_spacings.size()) ? min_spacings[i] : (100.0 * (i + 1));
-                const double max_s = (i < max_spacings.size()) ? max_spacings[i] : min_s;
-                ladder_cfg.tier_spacing_bps_bid[i] = max_s - alpha_ask * (max_s - min_s);
-                ladder_cfg.tier_spacing_bps_ask[i] = max_s - alpha_bid * (max_s - min_s);
+            // Loud, but once per pair per process: an inverted override is a
+            // standing misconfiguration, so re-warning every heartbeat would be
+            // the same log spam Step 13 rate-limits.  Clamped, not refused --
+            // see the contract in engine.hpp.
+            if ((sched.margin_range_inverted || sched.spacing_tiers_inverted > 0)
+                && activity_range_warned_.insert(pair_name).second) {
+                spdlog::warn("[Engine] Step 7: {} INVERTED activity range in config -- "
+                             "min_profit_margin_max_bps_override ({:.0f}bps vs min {:.0f}bps, "
+                             "inverted={}) and/or tier_spacing_max_bps_override ({} of {} tiers "
+                             "below their base spacing). A maximum below its minimum would run "
+                             "the controller BACKWARDS (low activity would tighten quotes); each "
+                             "offending maximum is clamped up to its minimum, so this pair gets "
+                             "NO adaptive widening until the config is fixed.",
+                             pair_name, max_margin, min_margin,
+                             sched.margin_range_inverted,
+                             sched.spacing_tiers_inverted,
+                             static_cast<std::size_t>(ladder_cfg.num_tiers));
             }
 
             spdlog::info("[Engine] Step 7: {} cross-side activity: bids={:.1f} (24h_fills={} book={}), asks={:.1f} (24h_fills={} book={}) "

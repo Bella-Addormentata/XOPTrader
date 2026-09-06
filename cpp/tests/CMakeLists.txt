@@ -103,6 +103,7 @@ add_executable(xop_tests
     test_node_sync_state.cpp
     test_selective_repost.cpp
     test_width_floor.cpp
+    test_activity_interpolation.cpp
     test_xch_mark_price.cpp
     test_settled_fill.cpp
     test_wallet_poll_throttle.cpp

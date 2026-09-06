@@ -110,6 +110,7 @@
 #include <mutex>
 #include <thread>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <filesystem>
@@ -305,6 +306,73 @@ struct PostedOfferInfo {
 // ---------------------------------------------------------------------------
 [[nodiscard]] double shift_schedule_to_floor(std::vector<double>& spacings,
                                              double min_half_spread_bps);
+
+// ---------------------------------------------------------------------------
+// ActivitySchedules / interpolate_activity_schedules -- Step 7's 24h
+// activity-adaptive margin and tier-spacing controller.
+//
+// [S33 2026-09-05] Extracted from step_generate_ladder so the interpolation
+// that sets the LIVE bid/ask margins is reachable from ctest -- see
+// cpp/tests/test_activity_interpolation.cpp.
+//
+// THE COUPLING IS CROSS-SIDE BY DESIGN, and it is the part most likely to be
+// "fixed" into a bug: alpha_bid (bid-side fill activity) drives the ASK
+// schedule and alpha_ask drives the BID schedule.  When bids fill we are
+// replenishing base inventory, so the ask side can safely tighten to sell it;
+// when asks fill we are accumulating quote, so the bid side can tighten to
+// buy.  A side that is NOT being replenished widens toward its maximum to
+// demand a liquidity premium and protect inventory.
+//
+// INVERTED RANGES ARE CLAMPED, NOT REJECTED.  min_profit_margin_max_bps_override
+// and tier_spacing_max_bps_override are validated only as positive at config
+// load, and config.cpp cannot do better: the maximum has to be compared
+// against the pair's EFFECTIVE minimum margin and the pair's resolved ladder
+// spacing schedule, and neither operand exists until the ladder config is
+// built here.  With max < min the interpolation runs BACKWARDS -- zero
+// activity would tighten quotes instead of widening them, inverting the
+// controller's protective contract on a live book.  Clamping each effective
+// maximum up to its minimum degrades that pair to "no adaptive widening",
+// which is exactly the controller-off behaviour, while a throw at load would
+// refuse to boot the bot over one fat-fingered override (the S39 pid_min_mult
+// reasoning in config.cpp, same call).  The clamp is loud: the call site warns
+// once per pair on the flags returned here.
+//
+// @param alpha_bid       Bid-side activity in [0, 1] (clamped defensively);
+//                        drives the ASK schedule.
+// @param alpha_ask       Ask-side activity in [0, 1]; drives the BID schedule.
+// @param min_margin_bps  Margin at or above target activity (the tight end).
+// @param max_margin_bps  Margin at zero activity (the wide end).  Raised to
+//                        min_margin_bps when configured below it.
+// @param min_spacings    Base per-tier spacing schedule (the tight end).
+//                        Tiers past its end default to 100 * (tier + 1) bps,
+//                        matching the pre-extraction call site.
+// @param max_spacings    Zero-activity per-tier schedule (the wide end).
+//                        Tiers past its end, and any entry below the tier's
+//                        minimum, fall back to that minimum.
+// @param num_tiers       Length of the schedules to produce.
+// @return Both margins and both spacing schedules, plus what was clamped.
+//         The zero-activity end is never narrower than the active end.
+// ---------------------------------------------------------------------------
+struct ActivitySchedules {
+    double bid_margin_bps{0.0};
+    double ask_margin_bps{0.0};
+    std::vector<double> bid_spacings;
+    std::vector<double> ask_spacings;
+    /// max_margin_bps was below min_margin_bps and was raised to it.
+    bool margin_range_inverted{false};
+    /// How many tiers had a configured maximum spacing below their base
+    /// spacing and were raised to it; 0 when the schedule was well-formed.
+    std::size_t spacing_tiers_inverted{0};
+};
+
+[[nodiscard]] ActivitySchedules interpolate_activity_schedules(
+    double                     alpha_bid,
+    double                     alpha_ask,
+    double                     min_margin_bps,
+    double                     max_margin_bps,
+    const std::vector<double>& min_spacings,
+    const std::vector<double>& max_spacings,
+    std::size_t                num_tiers);
 
 // ---------------------------------------------------------------------------
 // xch_mark_price_mojos -- the XCH mark handed to PnLTracker::mark_to_market,
@@ -1555,6 +1623,15 @@ private:
     /// debug -- re-warning every block for an indefinite pause is the same
     /// log spam Step 13 rate-limits.
     bool breaker_skip_warned_{false};
+
+    /// [S33 2026-09-05] Pairs already warned about an INVERTED activity range
+    /// (min_profit_margin_max_bps_override below the effective minimum margin,
+    /// or a tier_spacing_max_bps_override entry below its base spacing).
+    /// interpolate_activity_schedules clamps such a maximum rather than
+    /// refusing to boot, so the warning is the only signal an operator gets --
+    /// but the condition is a standing misconfiguration that would otherwise
+    /// re-warn on every heartbeat for the life of the process.
+    std::set<std::string> activity_range_warned_;
 
     /// [S19 review round 11] Whether the bridge scan can currently act
     /// as the bridge asset's inventory maintainer.  The Step 8 recovery

@@ -847,10 +847,19 @@ class MainWindow(QMainWindow):
         # Engines predating the gauge are covered a layer down:
         # MetricsService.get_health() defaults node_connected to the legacy
         # xop_node{metric="synced"} gauge.
-        node_connected = bool(
-            health.get("node_connected", 0.0) >= 1.0
-            or health.get("node_synced", 0.0) >= 1.0
-        )
+        #
+        # [S33 2026-09-05] The legacy fallback applies only when the key is
+        # ABSENT.  An earlier cut of this fix wrote `node_connected >= 1.0 or
+        # node_synced >= 1.0`, which re-opened the very hole it removed from
+        # the height fallback: an engine explicitly reporting
+        # node_connected = 0 alongside a stale node_synced = 1 was still
+        # painted connected.  When the gauge is present its value wins,
+        # including a false one.
+        _node_connected_gauge = health.get("node_connected")
+        if _node_connected_gauge is None:
+            node_connected = bool(health.get("node_synced", 0.0) >= 1.0)
+        else:
+            node_connected = bool(_node_connected_gauge >= 1.0)
         node_synced = bool(health.get("node_synced", 0.0) >= 1.0)
         node_syncing = bool(health.get("node_syncing", 0.0) >= 1.0)
 

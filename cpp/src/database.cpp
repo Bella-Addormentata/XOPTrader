@@ -254,6 +254,19 @@ CREATE INDEX IF NOT EXISTS idx_trade_log_pair
     ON trade_log(pair_name, timestamp);
 )SQL";
 
+// [S33 2026-09-05] The 24h activity controller filters trade_log by
+// (pair_name, block_height) once per enabled pair on every heartbeat
+// (kTradeCountsBySideSinceBlock).  idx_trade_log_pair above is
+// (pair_name, timestamp), so SQLite could use only its pair_name prefix and
+// then scanned that pair's whole append-only history to apply the block
+// filter -- work that grows without bound while the 24h window does not.
+// CREATE INDEX IF NOT EXISTS in run_migrations builds it on open, so the
+// existing 100MB+ live database gets it without a separate migration step.
+constexpr const char* kIndexTradePairBlock = R"SQL(
+CREATE INDEX IF NOT EXISTS idx_trade_log_pair_block
+    ON trade_log(pair_name, block_height);
+)SQL";
+
 constexpr const char* kIndexOfferStatus = R"SQL(
 CREATE INDEX IF NOT EXISTS idx_offer_log_status
     ON offer_log(status);
@@ -1647,6 +1660,7 @@ void Database::run_migrations()
         kIndexTakerFillsTime,
         kIndexTradeTimestamp,
         kIndexTradePair,
+        kIndexTradePairBlock,
         kIndexOfferStatus,
         kIndexOfferPair,
         kIndexOfferClosureEventsOffer,

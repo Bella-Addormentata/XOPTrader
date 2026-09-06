@@ -217,3 +217,26 @@ def test_the_dexie_dot_is_green_while_the_scrape_is_live(window):
     window._on_bridge_data(_payload())
 
     assert _dot_label(window, "Dexie") == "Dexie: Connected"
+
+
+def test_an_explicit_node_disconnect_beats_a_stale_synced_gauge(window):
+    """The second masking route, found by review after the first fix landed.
+
+    The first cut of the height-fallback fix replaced one disjunct with
+    another -- ``node_connected >= 1.0 or node_synced >= 1.0`` -- which
+    re-opened the same hole from the other side: an engine explicitly
+    reporting ``node_connected = 0`` while ``node_synced`` was still 1 (a
+    stale reading, or the legacy gauge) was painted connected again.
+
+    The legacy fallback is a fallback for an ABSENT key, not a second vote.
+    When the gauge is present its value wins, including a false one, which
+    is what ``MetricsService.get_health()`` already assumes one layer down.
+    """
+    payload = _payload(node_connected=0.0, node_synced=1.0, node_syncing=0.0)
+    assert payload["health"]["node_connected"] == 0.0, "premise: gauge present and false"
+    assert payload["health"]["node_synced"] == 1.0, "premise: stale synced still 1"
+
+    window._on_bridge_data(payload)
+
+    assert "Full Node: Disconnected" in window._block_label.toolTip()
+    assert _dot_label(window, "Full Node") == "Full Node: Disconnected"
