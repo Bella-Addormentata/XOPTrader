@@ -156,7 +156,11 @@ TEST(WidthFloor, ShiftingPreservesOrderAndGaps)
     EXPECT_DOUBLE_EQ(shift, 240.0);
     for (std::size_t i = 0; i < spacings.size(); ++i) {
         EXPECT_DOUBLE_EQ(spacings[i], before[i] + shift);
-        if (i > 0) EXPECT_GE(spacings[i], spacings[i - 1]);
+        // Braces are required, not style: EXPECT_GE expands to an if/else, so
+        // an unbraced `if` body trips GCC's -Werror=dangling-else.
+        if (i > 0) {
+            EXPECT_GE(spacings[i], spacings[i - 1]);
+        }
     }
 }
 
