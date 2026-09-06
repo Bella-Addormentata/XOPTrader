@@ -59,7 +59,9 @@ mid_safe.push_back(tier);
 ```
 
 ### B. Configuration: Pair-Specific Wide Market Making Overrides
-In `config.yaml`, configure `XCH/BYC` with dedicated overrides to capture wide spreads while respecting risk boundaries:
+In `config.yaml`, configure `XCH/BYC` with dedicated overrides to capture wide spreads while respecting risk boundaries.
+
+**[S33 2026-09-05] The block below is the SHIPPED configuration at HEAD, not the 2026-09-03 first cut.** This document is a chronological, layered record: the original proposal's numbers were revised in place by Sections F, H, I and J as each defect was found. Rather than leave a stale snapshot at the top, the block is reproduced here as deployed, with the superseded value called out inline where it matters. The prose of each later section still describes its own change in the order it happened.
 
 ```yaml
 pairs:
@@ -68,25 +70,57 @@ pairs:
   base_asset_id: xch
   quote_asset_id: ae1536f56760e471ad85ead45f00d680ff9cca73b8cc3407be778f1c0c606eac
   min_offer_size_units_override: 1.0
+  ratio_target_override: 0.75
 
-  # 1. Cap symmetric residual widening at 4.0% (400 bps) to prevent excessive bid dislocation
-  max_half_spread_bps_override: 400
+  # 1. Step 5 half-spread ceiling.  Originally 400 (4.0%), to cap the symmetric
+  #    residual widener.  RAISED to 5000 on 2026-09-04 with the progressive
+  #    ladder (Section H): a 4% ceiling contradicts a ladder deliberately
+  #    spaced out to +50%.  Section C explains why the original rationale is
+  #    now inert on this pair.
+  max_half_spread_bps_override: 5000
 
-  # 2. Tier spacing ladder (1% to 14% margin from fair value)
-  tier_spacing_bps_override: [100, 250, 450, 700, 1000, 1400]
+  # 2. 24h activity-adaptive margin & spacing controller (Section I).
+  #    Book-depth weighting is off, so alpha is driven by realized fills alone.
+  activity_adaptive_spacing_override: true
+  activity_target_fills_24h_override: 24
+  activity_book_weight_override: 0.0
 
-  # 3. Minimum profit margin floor (1.0%)
+  # 3. Profit-margin band interpolated by cross-side activity: 1.0% at full
+  #    activity (M_min) out to 8.0% on a dead side (M_max).
   min_profit_margin_bps_override: 100
+  min_profit_margin_max_bps_override: 800
 
-  # 4. BBO proximity sanity overrides (allow passive resting quotes)
-  bbo_sanity_max_passive_dev_override: 0.60
-  bbo_sanity_max_aggressive_dev_override: 0.10
+  # 4. Tier spacing ladders.  S_min (1% - 14%) applies as alpha -> 1.0,
+  #    S_max (6% - 48%) as alpha -> 0; Step 7 interpolates between them.
+  tier_spacing_bps_override: [100, 250, 450, 700, 1000, 1400]
+  tier_spacing_max_bps_override: [600, 1200, 1900, 2700, 3600, 4800]
+
+  # 5. BBO proximity sanity overrides (allow passive resting quotes)
+  bbo_sanity_max_passive_dev_override: 0.80
+  bbo_sanity_max_aggressive_dev_override: 0.80
+
+  # 6. Disable the competitive anchor on this illiquid book (Section F)
+  competitive_anchor_enabled_override: false
+
+  # 7. Disable the Step 7 symmetric residual widener on this asymmetric
+  #    book -- 0.0 fails the `widen_ratio > 0.0` guard (Section C)
+  fair_value_residual_widen_ratio_override: 0.0
+
+  # 8. The Engine constructor's per-pair liquidity loop sets
+  #    gap_aware_spacing = false for this pair, so
+  #    ladder width comes from the Section I controller alone.  Added
+  #    2026-09-04 with that controller.
+  stablecoin_skip_gap_aware: true
 ```
 
 ### C. Consistency Residual Widening & Bid Calibration
 In Step 7, the engine's consistency residual widener expands ladder width by $\min(\text{residual} \times 0.5, \text{max\_half\_spread})$.
-* **Initial Observation:** With `max_half_spread_bps_override` set to $3500\text{ bps}$ ($35\%$), the $35\%$ symmetric widening pushed Bids down to $\approx 0.89\text{ BYC/XCH}$ ($\approx 89\text{ cents}$).
-* **Calibration Applied:** Constraining `max_half_spread_bps_override` to $400\text{ bps}$ ($4.0\%$) and tuning `tier_spacing_bps_override` keeps Bids tightly focused around **$1.35 - 1.38\text{ BYC/XCH}$** while allowing Asks to quote profitably at **$2.07 - 2.25\text{ BYC/XCH}$**.
+* **Initial Observation (2026-09-03):** With `max_half_spread_bps_override` set to $3500\text{ bps}$ ($35\%$), the $35\%$ symmetric widening pushed Bids down to $\approx 0.89\text{ BYC/XCH}$ ($\approx 89\text{ cents}$).
+* **Calibration Applied (2026-09-03) -- SUPERSEDED:** Constraining `max_half_spread_bps_override` to $400\text{ bps}$ ($4.0\%$) and tuning `tier_spacing_bps_override` kept Bids tightly focused around **$1.35 - 1.38\text{ BYC/XCH}$** while allowing Asks to quote profitably at **$2.07 - 2.25\text{ BYC/XCH}$**. That was the correct fix for the residual widener as it then stood, and it is the number the original PR summary quotes.
+* **[S33 2026-09-05] Deployed value is $5{,}000\text{ bps}$, not $400$ -- and the cap is no longer what holds the Bids in.** Two later changes retired this calibration, in this order:
+  1. **2026-09-04, with the progressive ladder (Section H):** raised to $5{,}000\text{ bps}$ in the same change that widened tier spacing toward $+50\%$. A $400\text{ bps}$ Step 5 ceiling directly contradicts a ladder that is deliberately spaced out an order of magnitude further; the two cannot both be intended.
+  2. **2026-09-04, `fair_value_residual_widen_ratio_override: 0.0`:** added to stop bid blowout on this asymmetric book. The Step 7 widener is gated on `widen_ratio > 0.0`, and the parser stores an explicit $0.0$ as an engaged override rather than falling back to the global, so **the residual widener this section was calibrated against does not execute at all on `XCH/BYC`.** The bullets above describe a code path that is now dead for this pair.
+* **What actually sets posted prices now:** the ladder is built by `compute_ladder(mid_mojos, ...)` around the *market mid*, with per-tier widths from `tier_spacing_bps_override` / `tier_spacing_max_bps_override` (Section I), then the min-profit floor, the stepped order-book guard (Section H) and the Step 8 BBO cross guard (Section A). `max_half_spread_bps_override` bounds only `spread_result.half_spread`, which feeds the Step 6 risk-sizing quote, the loss-manager `MarketParams` and telemetry -- plus the now-inert residual cap. Lowering it back to $400$ would **not** tighten the posted ladder; it would clip the risk/telemetry spread figure and re-arm a ceiling on a branch that never runs.
 
 ### D. Dynamic PID Tuning: Fill-Rate Feedback on Wide Pairs
 XOPTrader maintains per-pair PID controllers (`SpreadPidState` and `CompetitivenessPid`) in Step 5:
@@ -113,7 +147,10 @@ XOPTrader maintains per-pair PID controllers (`SpreadPidState` and `Competitiven
   3. The anchor then compressed all 6 tiers into a tight 45 bps cluster ($2.333, 2.340, 2.347...$), overwriting the intended wide ladder spacing (`tier_spacing_bps_override`).
 * **The Solution:**
   1. Added `competitive_anchor_enabled_override`, `competitive_anchor_max_distance_bps_override`, and `competitive_anchor_stride_bps_override` to `PairConfig` in `cpp/include/xop/config.hpp` and `cpp/src/config.cpp`.
-  2. In `cpp/src/engine.cpp`, honored `pair.competitive_anchor_enabled_override` in both `init_liquidity_engine` and `classify_tier_staleness`.
+  2. In `cpp/src/engine.cpp`, honored `pair.competitive_anchor_enabled_override` at all three consumption sites. **[S33 2026-09-05] These are cited by enclosing symbol, not by line number.** The earlier `engine.cpp:490 / 9844 / 11524` citations were written against a mid-edit tree and matched neither `main` nor the branch; `engine.cpp` shifts by tens of lines in a single PR, so any line number here is stale on arrival. The three sites are:
+     - the per-pair `LiquidityConfig` loop in the `Engine` constructor, which seeds `liq_cfg.competitive_anchor_enabled` (together with `competitive_anchor_max_distance_bps` / `competitive_anchor_stride_bps`) from the per-pair override, falling back to `config_.strategy.competitive_anchor_enabled`;
+     - in `Engine::step_manage_offers`, the `anchor_active` flag passed to `OfferManager::classify_tier_staleness` (the staleness path);
+     - also in `Engine::step_manage_offers`, `pair_comp_anchor_enabled` in the Step 8 competitiveness filter, which waives the competitiveness cut and keeps the wide tier when the anchor is disabled for the pair.
   3. Set `competitive_anchor_enabled_override: false` on `XCH/BYC` in `config.yaml`.
   4. **Outcome:** `XCH/BYC` quotes its true model-generated wide ladder across the entire spread ($1.35\text{ Bids} \leftrightarrow 1.60 - 1.66\text{ Asks}$) without collapsing into a micro-staircase, while `XCH/DBX` continues using competitive anchoring.
 
@@ -124,7 +161,7 @@ XOPTrader maintains per-pair PID controllers (`SpreadPidState` and `Competitiven
   3. **Base-Asset MTM Hopping:** In `cpp/src/monitoring/pnl.cpp` (`PnLTracker::mark_to_market`), `XCH` is the shared base asset of multiple pairs (`XCH/BYC` and `XCH/DBX`). While asks were active, `XCH/BYC` owned the XCH mark and valued the wallet's $67.57\text{ XCH}$ balance at its carried price ($1.598\text{ USD}$), inflating unrealized PnL to $+\$7.05$ (total PnL $\$40.04$). Once `XCH/BYC` lost its valuation grade, `XCH/DBX` took over the XCH mark at its live CEX spot rate ($85.06\text{ DBX/XCH} = \$1.43\text{ USD}$), plunging unrealized PnL to $-\$4.58$ (total PnL $\$28.39$).
   4. **Circuit Breaker Latch:** Step 13's rolling-window loss circuit breaker (`max_window_loss_bps: 250`, threshold $\$5.80$) interpreted the $\$11.65$ PnL drop ($40.04 \to 28.39$) within 575 blocks as a real trading loss, transitioning the engine to `Paused` (`breaker_pause_active_ = true`) and halting new offer posting.
 * **The Architectural Fix & Self-Healing Resumption (Shipped 2026-09-04):**
-  1. **Canonical Base-Asset MTM Normalization:** In `cpp/src/engine.cpp` (`step_update_pnl`), when evaluating `asset == "xch"`, the price fed into `mark_to_market` is normalized directly against the authoritative CEX / anchor price (`asset_usd_pseudo_price(AssetId{"xch"}) / quote_usd_factor(pair)`). This guarantees all XCH pairs yield the exact same USD unrealized PnL, completely eliminating mark-to-market hopping and phantom PnL jumps when secondary CAT order books clear.
+  1. **Canonical Base-Asset MTM Normalization:** In `cpp/src/engine.cpp` (`step_update_pnl`), when evaluating `asset == "xch"`, the price fed into `mark_to_market` is normalized directly against the authoritative CEX / anchor price, `asset_usd_pseudo_price(AssetId{"xch"})`, divided by this pair's quote-to-USD factor. **[S33 2026-09-05]** That divisor is the factor `step_update_pnl` *registered* for the pair on this pass -- the `last_trusted_quote_usd_factor_` carry -- not the live `quote_usd_factor(pair)` this bullet originally named; `mark_to_market` converts both this price and the cost basis back with the registered factor, so dividing by the live one yielded `xch_usd * carried/live` whenever the live factor was ungraded. This guarantees all XCH pairs yield the exact same USD unrealized PnL, completely eliminating mark-to-market hopping and phantom PnL jumps when secondary CAT order books clear.
   2. **Rolling-Window Breaker Auto-Cooldown:** In `cpp/src/engine.cpp` Step 13, added auto-cooldown logic: when `window_loss_usd <= threshold_usd` for `kWindowLossRecoverStreak` consecutive blocks (~2-3 min) and equity remains healthy (`dd < max_drawdown_frac` and valid book), `breaker_pause_active_` is automatically cleared and trading resumes without intervention.
   3. **Operator GUI Resume Override:** In `cpp/src/engine.cpp` (`check_pause_flag`), when the operator explicitly clicks "Resume" in the GUI (removing `pause.flag`), if equity is not in active drawdown violation, `breaker_pause_active_` is cleared and `pnl_window_usd_` is reset, allowing instant recovery without process restarts.
 
@@ -135,10 +172,16 @@ XOPTrader maintains per-pair PID controllers (`SpreadPidState` and `Competitiven
 * **The Solution & Progressive Tiering:**
   1. **Stepped Order-Book Price Guard:** Updated Step 7's order-book guard in `cpp/src/engine.cpp` to iterate tiers in order and apply `step_bps` (`fair_value_clamp_tier_step_bps`), ensuring successive clamped tiers stay monotonically stepped and distinct.
   2. **Gated Step 7 Competitive Cap:** Gated the secondary competitive cap block behind `ladder_cfg.competitive_anchor_enabled`, ensuring disabled pairs are not pulled back to resting touch prices.
-  3. **Progressive Spacing Calibration (`tier_spacing_bps_override: [1000, 1600, 2300, 3100, 4000, 5000]`):**
+  3. **Progressive Spacing Calibration, first cut 2026-09-04 (`tier_spacing_bps_override: [1000, 1600, 2300, 3100, 4000, 5000]`):**
      - Spans from $+10\%$ up to $+50\%$ above fair value ($1.44$) on Asks: **$1.60, 1.64, 1.69, 1.72, 1.75, 1.78 - 2.16\text{ BYC/XCH}$**, covering and exceeding the recent $1.94\text{ BYC/XCH}$ trade level.
      - Spans from $-10\%$ down to $-38\%$ on Bids: **$1.35, 1.30, 1.24, 1.20, 1.17, 1.13\text{ BYC/XCH}$**.
      - Takers sweeping the book are forced to walk up the ladder, capturing progressively higher profit margins ($10\% \to 50\%$).
+     - `max_half_spread_bps_override` was raised $400 \to 5000$ in this same change: a $4\%$ Step 5 ceiling is not a coherent companion to a ladder deliberately spaced to $+50\%$. Section C records exactly what that cap does and does not govern.
+  4. **[S33 2026-09-05] This fixed ladder is SUPERSEDED; do not read it as the shipped configuration.** It was revised twice the same day:
+     - First narrowed to `[400, 800, 1400, 2200, 3200, 4500]` alongside `fair_value_residual_widen_ratio_override: 0.0`, once the symmetric widener was identified as the real source of bid dislocation on this asymmetric book.
+     - Then replaced entirely by Section I's **two** ladders: a single fixed vector cannot express "tight when the other side is filling, wide when it is not". The deployed pair of ladders is
+       $$S_{\text{min}} = [100, 250, 450, 700, 1000, 1400]\text{ bps} \qquad S_{\text{max}} = [600, 1200, 1900, 2700, 3600, 4800]\text{ bps}$$
+       interpolated per tier by the cross-side activity score. The $+50\%$ reach of this section survives as $S_{\text{max}}$'s outer tier ($4800\text{ bps} = +48\%$) on a side with no replenishing flow; the $10\% \to 50\%$ walk-up above is therefore the *inactive-book* regime, not a constant. The prices quoted in the bullets above are the 2026-09-04 observation under the fixed ladder and were not re-measured after the controller landed -- see the live results table in Section 4 for the post-controller figures.
 
 ### I. Dynamic 24-Hour Activity-Adaptive Margin & Spacing Controller (Cross-Side Replenishment Coupling)
 * **The Concept & Inventory Dynamics:**
@@ -151,6 +194,7 @@ XOPTrader maintains per-pair PID controllers (`SpreadPidState` and `Competitiven
   2. **Asymmetric Activity Scores with Book Depth Weighting (`activity_book_weight`):**
      $$\text{Effective Activity}_s = N_s^{24\text{h\_fills}} + w_{\text{book}} \cdot N_s^{\text{book\_offers}}$$
      $$\alpha_s = \min\left(1.0, \; \frac{\text{Effective Activity}_s}{N_{\text{target}}}\right)$$
+     * **[S33 2026-09-05] Deployed on `XCH/BYC`:** $N_{\text{target}} = 24$ and $w_{\text{book}} = \mathbf{0.0}$ -- the book-depth term was introduced at the global default $0.5$ and then zeroed for this pair when cross-side coupling landed, so $\alpha_s$ here is driven by **realized 24 h fills alone**. Resting-offer depth still contributes on any pair that leaves `activity_book_weight_override` unset.
   3. **Cross-Side Continuous Interpolation (`cpp/src/engine.cpp` Step 7):**
      $$M_{\text{eff, ask}} = M_{\text{max}} - \alpha_{\text{bid}} \cdot (M_{\text{max}} - M_{\text{min}})$$
      $$S_{\text{eff, ask}}[i] = S_{\text{max}}[i] - \alpha_{\text{bid}} \cdot \big(S_{\text{max}}[i] - S_{\text{min}}[i]\big)$$

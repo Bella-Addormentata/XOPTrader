@@ -260,10 +260,23 @@ strategy:
     XCH/DBX: 0.75
   asset_target_tolerances:
     BYC: 0.1
+    # [S33-DBX-NORMALIZE 2026-09-05] DBX deliberately shares BYC's tolerance
+    # (was 0.15) now that both CATs sit at the same 0.2 allocation and the same
+    # 0.75 ratio target -- one calibration for the two comparable CAT books
+    # rather than two. Live effect: with asset_drift_guard_max_factor 1.5 the
+    # DBX no-action weight band tightens from [0.05, 0.35] to [0.10, 0.30], so
+    # the drift guard begins tapering the DBX-acquiring side earlier.
     DBX: 0.1
     WMILLIETH.B: 0.05
     WUSDC.B: 0.08
     XCH: 0.4
+  # [S33-DBX-NORMALIZE 2026-09-05] Both pairs share one enter band for the same
+  # reason as the tolerance above. For XCH/DBX (was 0.38636...) this moves the
+  # AcquireBase trigger from ratio <= 0.3636 to <= 0.40, so rebalancing engages
+  # slightly earlier; the AcquireQuote side is unreachable either way (both
+  # thresholds exceed 1.0) and exit_band = min(0.04, enter*0.5) = 0.04 is
+  # unchanged, so hysteresis is untouched. ratio_force_one_sided is false, so
+  # ratio mode scales tier sizes rather than suppressing a side outright.
   ratio_band_enter_by_pair:
     XCH/BYC: 0.35
     XCH/DBX: 0.35
