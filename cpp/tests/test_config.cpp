@@ -1668,8 +1668,14 @@ TEST(ConfigParserTest, S33ActivityOverrides_OutOfRangeValuesRejected) {
     }
     // Per ELEMENT, not just the first: a bad maximum anywhere in S_max would
     // run that tier's interpolation backwards.
+    // [S33 2026-09-12] `.inf` at BOTH positions. The old `!(v > 0.0)` guard
+    // rejected NaN but ADMITTED +inf, and the two positions fail
+    // differently: at index 0 shift_schedule_to_floor spreads the resulting
+    // NaN across EVERY tier of BOTH side schedules, so the pair stops
+    // quoting outright; at a later index only that tier is lost.
     for (const char* seq : {"[0, 1200, 1900]", "[600, -1200, 1900]",
-                            "[600, 1200, .nan]"}) {
+                            "[600, 1200, .nan]",
+                            "[.inf, 1200, 1900]", "[600, 1200, .inf]"}) {
         TempYaml tmp(with_pair_extra(
             std::string("tier_spacing_max_bps_override: ") + seq));
         EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError)
