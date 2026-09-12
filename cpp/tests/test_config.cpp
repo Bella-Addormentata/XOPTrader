@@ -587,6 +587,19 @@ std::string with_strategy_keys(const std::string& extra) {
     return y;
 }
 
+/// kMinimalValidYaml with one existing [strategy] line swapped out.
+/// with_strategy_keys() appends, which would leave a DUPLICATE key for the
+/// required scalars (gamma, q_max, ...) and make the test depend on yaml-cpp's
+/// duplicate-key resolution. Replacing is deterministic.
+std::string with_strategy_replaced(const std::string& from,
+                                   const std::string& to) {
+    std::string y(kMinimalValidYaml);
+    const auto pos = y.find(from);
+    if (pos == std::string::npos) return y;
+    y.replace(pos, from.size(), to);
+    return y;
+}
+
 std::string with_pair_extra(const std::string& line) {
     // Insert a key into the single pair in kMinimalValidYaml. The pair block
     // is indented four spaces, so the inserted line must match or YAML
@@ -1655,8 +1668,14 @@ TEST(ConfigParserTest, S33ActivityOverrides_OutOfRangeValuesRejected) {
     }
     // Per ELEMENT, not just the first: a bad maximum anywhere in S_max would
     // run that tier's interpolation backwards.
+    // [S33 2026-09-12] `.inf` at BOTH positions. The old `!(v > 0.0)` guard
+    // rejected NaN but ADMITTED +inf, and the two positions fail
+    // differently: at index 0 shift_schedule_to_floor spreads the resulting
+    // NaN across EVERY tier of BOTH side schedules, so the pair stops
+    // quoting outright; at a later index only that tier is lost.
     for (const char* seq : {"[0, 1200, 1900]", "[600, -1200, 1900]",
-                            "[600, 1200, .nan]"}) {
+                            "[600, 1200, .nan]",
+                            "[.inf, 1200, 1900]", "[600, 1200, .inf]"}) {
         TempYaml tmp(with_pair_extra(
             std::string("tier_spacing_max_bps_override: ") + seq));
         EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError)
@@ -1750,6 +1769,125 @@ TEST(ConfigParserTest, S33ActivityOverrides_NonFiniteRejected) {
             expect_non_finite_rejected(
                 with_pair_extra(std::string(key) + ": " + bad), key, bad);
         }
+    }
+}
+
+TEST(ConfigParserTest, PairPositiveOverrides_NonFiniteRejected) {
+    // [INFGUARD] The OTHER half of the same hole. These keys were guarded
+    // `!(v > 0.0)`, which rejects NaN (every NaN comparison is false) but
+    // ACCEPTS +infinity. The two that matter most for safety:
+    // depeg_bail_pct at +inf permanently disables the depeg bail, and
+    // min_offer_size_units_override at +inf silently stops the pair quoting.
+    for (const char* key : {"gamma_override",
+                            "kappa_override",
+                            "phi_override",
+                            "q_max_override",
+                            "min_profit_margin_bps_override",
+                            "depeg_warn_pct",
+                            "depeg_bail_pct",
+                            "competitive_anchor_max_distance_bps_override",
+                            "competitive_anchor_stride_bps_override",
+                            // [review #151] Its own loop in
+                            // S33ActivityOverrides_OutOfRangeValuesRejected
+                            // carries .nan but NOT .inf, and this guard is a
+                            // SEPARATE parser copy: removing its isfinite
+                            // left the suite green.
+                            "max_half_spread_bps_override"}) {
+        for (const char* bad : {".inf", "-.inf", ".nan"}) {
+            expect_non_finite_rejected(
+                with_pair_extra(std::string(key) + ": " + bad), key, bad);
+        }
+    }
+    // >= 0 variant: 0.0 must STILL parse (it is the documented disable), so
+    // only the non-finite legs are asserted here.
+    for (const char* bad : {".inf", "-.inf", ".nan"}) {
+        expect_non_finite_rejected(
+            with_pair_extra(std::string("min_offer_size_units_override: ")
+                            + bad),
+            "min_offer_size_units_override", bad);
+    }
+
+    // [review #151] The NARROW-end sequence had NO coverage of any kind --
+    // zero mentions in this file -- while carrying its own copy of the
+    // guard. Both positions, because a first-element failure and a later one
+    // propagate differently through the ladder.
+    //
+    // Two elements, not three: kMinimalValidYaml declares num_tiers: 2, so a
+    // longer list risks throwing on a LENGTH check instead of the finiteness
+    // guard -- which would look like coverage while proving nothing.
+    for (const char* seq : {"[.inf, 80]", "[40, .inf]",
+                            "[-.inf, 80]", "[40, .nan]"}) {
+        expect_non_finite_rejected(
+            with_pair_extra(std::string("tier_spacing_bps_override: ") + seq),
+            "tier_spacing_bps_override", seq);
+    }
+}
+
+TEST(ConfigParserTest, PairPositiveOverrides_ZeroDisableStillParses) {
+    // The acceptance direction. A guard that over-rejected would remove the
+    // operator's documented escape hatch at load time.
+    TempYaml tmp(with_pair_extra("min_offer_size_units_override: 0.0"));
+    auto cfg = xop::load_config(tmp.path());
+    ASSERT_FALSE(cfg.pairs.empty());
+    ASSERT_TRUE(cfg.pairs[0].min_offer_size_units_override.has_value());
+    EXPECT_DOUBLE_EQ(*cfg.pairs[0].min_offer_size_units_override, 0.0);
+}
+
+TEST(ConfigParserTest, GlobalStrategyScalars_NonFiniteRejected) {
+    // [INFGUARD] The REQUIRED global keys, which share read_positive_double.
+    // This is the larger half of the hole: q_max at +inf yields an infinite
+    // order size that becomes INT64_MIN downstream, and the pair posts
+    // nothing from the first heartbeat while the config loads cleanly.
+    struct Sub { const char* line; const char* prefix; const char* key; };
+    const Sub subs[] = {
+        {"  gamma: 0.01",                  "  gamma: ",                 "gamma"},
+        {"  kappa: 1.5",                   "  kappa: ",                 "kappa"},
+        {"  phi: 0.5",                     "  phi: ",                   "phi"},
+        {"  q_max: 1000.0",                "  q_max: ",                 "q_max"},
+        {"  min_profit_margin_bps: 35.0",  "  min_profit_margin_bps: ",
+         "min_profit_margin_bps"},
+    };
+    for (const auto& s : subs) {
+        for (const char* bad : {".inf", "-.inf", ".nan"}) {
+            expect_non_finite_rejected(
+                with_strategy_replaced(s.line, std::string(s.prefix) + bad),
+                s.key, bad);
+        }
+    }
+}
+
+TEST(ConfigParserTest, GlobalTierSpacingSeq_NonFiniteRejected) {
+    // read_positive_double_seq: an infinite spacing reaches
+    // `mid * (1.0 - v/10000.0)` and then a static_cast<int64_t> of -inf.
+    for (const char* bad : {".inf", "-.inf", ".nan"}) {
+        expect_non_finite_rejected(
+            with_strategy_replaced("  tier_spacing_bps: [40, 80]",
+                                   std::string("  tier_spacing_bps: [")
+                                   + bad + ", 80]"),
+            "tier_spacing_bps", bad);
+    }
+}
+
+TEST(ConfigParserTest, GlobalMaxHalfSpread_NonFiniteRejected) {
+    // The `<= 0.0` twin, which admitted BOTH NaN and +inf.
+    for (const char* bad : {".inf", "-.inf", ".nan"}) {
+        expect_non_finite_rejected(
+            with_strategy_keys(std::string("\n  max_half_spread_bps: ") + bad),
+            "max_half_spread_bps", bad);
+    }
+}
+
+TEST(ConfigParserTest, GlobalBlockTimeSeconds_NonFiniteRejected) {
+    // [INFGUARD] Found independently by review on #150. Same `<= 0.0` shape
+    // as the max_half_spread_bps twin, so it admitted NaN and +inf alike.
+    // Downstream this value is used to convert block counts into wall-clock
+    // bounds, and a non-finite result reaches static_cast<std::int64_t>,
+    // which is undefined behaviour -- not a clamped number.
+    for (const char* bad : {".inf", "-.inf", ".nan"}) {
+        expect_non_finite_rejected(
+            with_strategy_keys(std::string(R"(
+  block_time_seconds: )") + bad),
+            "block_time_seconds", bad);
     }
 }
 
@@ -2268,6 +2406,141 @@ pegged_assets:
     EXPECT_EQ(a->sustained_observations, 7u);
     EXPECT_FALSE(a->prefer_market_cross);
     EXPECT_TRUE(a->enforce);
+}
+
+TEST(ConfigParserTest, PeggedAssets_ThresholdsAreNotAdvertisedAsUnwired) {
+    // The parser used to warn at startup that warn_pct / bail_pct /
+    // sustained_observations were "NOT YET WIRED to a detector". The wiring
+    // landed one day after that comment was written and the warning has been
+    // false ever since -- it told operators to treat live suspension
+    // thresholds as dead config.
+    //
+    // CAVEAT: CapturedLog is a ringbuffer holding the LAST 256 records. These
+    // are negative assertions, which is the direction eviction breaks -- if
+    // load_config ever emits more than 256 advisories the needle is evicted
+    // and this passes for the wrong reason. The (A) block below is what stops
+    // the test being vacuous today.
+    CapturedLog log;
+    TempYaml tmp(with_pegs(R"(
+pegged_assets:
+- asset_id: aabb000000000000000000000000000000000000000000000000000000000000
+  symbol: wTEST
+  peg_currency: USD
+  peg_target: 1.0
+  warn_pct: 3.0
+  bail_pct: 12.0
+  sustained_observations: 7
+)"));
+    auto cfg = xop::load_config(tmp.path());
+
+    // (A) ANTI-VACUITY: prove the load actually reached the threshold keys.
+    // Without this, a YAML that failed to parse or a silently skipped section
+    // would satisfy (B) trivially.
+    const auto* a = cfg.pegged_assets.find(
+        "aabb000000000000000000000000000000000000000000000000000000000000");
+    ASSERT_NE(a, nullptr);
+    EXPECT_DOUBLE_EQ(a->warn_pct, 3.0);
+    EXPECT_DOUBLE_EQ(a->bail_pct, 12.0);
+    EXPECT_EQ(a->sustained_observations, 7u);
+
+    // (B) THE PIN: two independent substrings from the two false sentences,
+    // so restoring either half alone still fails.
+    EXPECT_FALSE(log.warned_containing("NOT YET WIRED"))
+        << "startup must not advertise live suspension thresholds as dead";
+    EXPECT_FALSE(log.warned_containing("still comes only from pairs marked"))
+        << "the asset-level watcher is a second watcher, not absent";
+}
+
+TEST(ConfigParserTest, PeggedAssets_EnforcedButUnobservableAssetWarns) {
+    // [review #151] The partner of ThresholdsAreNotAdvertisedAsUnwired: that
+    // test pins the FALSE blanket warning staying gone; this pins the TRUE
+    // targeted one appearing. Deleting a wrong warning should not leave the
+    // real case silent.
+    //
+    // kMinimalValidYaml's single pair is XCH/DBX, so an asset declared here
+    // is crossed by no enabled pair and is genuinely unobservable.
+    CapturedLog log;
+    TempYaml tmp(with_pegs(R"(
+pegged_assets:
+- asset_id: aabb000000000000000000000000000000000000000000000000000000000000
+  symbol: wLONELY
+  peg_currency: USD
+  peg_target: 1.0
+  enforce: true
+)"));
+    auto cfg = xop::load_config(tmp.path());
+
+    // Anti-vacuity: the declaration really did load and really is enforced.
+    const auto* a = cfg.pegged_assets.find(
+        "aabb000000000000000000000000000000000000000000000000000000000000");
+    ASSERT_NE(a, nullptr);
+    EXPECT_TRUE(a->enforce);
+
+    EXPECT_TRUE(log.warned_containing("NO ENABLED pair crosses it against XCH"))
+        << "an enforced peg nothing observes must not be silent";
+    EXPECT_TRUE(log.warned_containing("wLONELY"))
+        << "the warning must name the asset";
+    // And the deleted blanket warning must STAY deleted.
+    EXPECT_FALSE(log.warned_containing("NOT YET WIRED"));
+}
+
+TEST(ConfigParserTest, PeggedAssets_ObservedAssetIsSilent) {
+    // [review #151] THE HALF THAT WAS UNPINNED. A mutation removing the
+    // `observed` early-continue reddened NOTHING, because neither other test
+    // declares an asset that IS observed -- so the guard rested on
+    // inspection. This closes that.
+    //
+    // kMinimalValidYaml's single ENABLED pair is XCH/TEST, base xch, quote
+    // 0123...cdef. Declaring THAT asset id means an enabled pair really does
+    // cross it against XCH, so the warning must stay silent. The asset id
+    // must match exactly: a typo would make this pass for the wrong reason
+    // (nothing matched) rather than the right one (it is observed).
+    CapturedLog log;
+    TempYaml tmp(with_pegs(R"(
+pegged_assets:
+- asset_id: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  symbol: wSEEN
+  peg_currency: USD
+  peg_target: 1.0
+  enforce: true
+)"));
+    auto cfg = xop::load_config(tmp.path());
+
+    // Anti-vacuity: the asset loaded, is enforced, AND an enabled pair
+    // really does cross it against XCH.
+    const auto* a = cfg.pegged_assets.find(
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+    ASSERT_NE(a, nullptr);
+    EXPECT_TRUE(a->enforce);
+    ASSERT_FALSE(cfg.pairs.empty());
+    EXPECT_TRUE(cfg.pairs[0].enabled);
+    EXPECT_EQ(cfg.pairs[0].base_asset_id, "xch");
+    EXPECT_EQ(cfg.pairs[0].quote_asset_id, a->asset_id);
+
+    EXPECT_FALSE(log.warned_containing("NO ENABLED pair crosses it against XCH"))
+        << "this asset IS observed -- warning here would be a false alarm on "
+           "a correctly configured deployment";
+}
+
+TEST(ConfigParserTest, PeggedAssets_UnenforcedAssetIsSilent) {
+    // enforce:false is an explicit operator instruction meaning "do not
+    // enforce this peg". Warning about it would re-create the noise the
+    // blanket warning was deleted for.
+    CapturedLog log;
+    TempYaml tmp(with_pegs(R"(
+pegged_assets:
+- asset_id: dead000000000000000000000000000000000000000000000000000000000000
+  symbol: wQUIET
+  peg_currency: USD
+  peg_target: 1.0
+  enforce: false
+)"));
+    auto cfg = xop::load_config(tmp.path());
+    ASSERT_NE(cfg.pegged_assets.find(
+        "dead000000000000000000000000000000000000000000000000000000000000"),
+        nullptr);
+    EXPECT_FALSE(log.warned_containing("NO ENABLED pair crosses it against XCH"))
+        << "enforce:false is deliberate, not a watch gap";
 }
 
 TEST(ConfigParserTest, PeggedAssets_AHalfDeclarationIsRefused) {

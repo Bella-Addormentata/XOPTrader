@@ -669,9 +669,26 @@ asio::awaitable<std::int64_t> ChiaFullNodeRPC::get_block_height()
     // The blockchain_state response includes peak.height.
     const json resp = co_await rpc_post("get_blockchain_state");
 
-    // [S33 2026-09-05] Record the sync object BEFORE the peak check below:
-    // a node that is still syncing is exactly the case that throws there,
-    // and it is the case health reporting most needs to see.
+    // [S33 2026-09-05, CORRECTED 2026-09-12] Record the sync object BEFORE
+    // the peak check below, so the CACHED SYNC FLAGS survive a throw.
+    //
+    // Two wrong claims have stood here, in opposite directions. The original
+    // said "a node that is still syncing is exactly the case that throws
+    // there" -- false, and it misled an audit: a catching-up node reports a
+    // peak alongside sync_mode=true (cpp/tests/test_node_sync_state.cpp),
+    // returns NORMALLY, and already renders as "Full Node: Syncing...".
+    //
+    // The correction then overstated the other way, claiming a node that
+    // answers is never reported as silent. It can be. Only the sync CACHE is
+    // written before the throw; the REACHABILITY STAMP is not.
+    // node_last_probe_ is set only after a SUCCESSFUL return (engine.cpp
+    // 2500 / 2568 / 2856 / 2905), so on the no-peak branch below
+    // node_probe_is_live takes its never-probed clause (engine.cpp:413) and
+    // the node IS reported as not connected.
+    //
+    // So: the case that throws is a node with NO peak at all -- an empty or
+    // rebuilding database before its first peak -- which genuinely cannot
+    // serve a height, and whose gauges stay dark until one arrives.
     last_sync_state_ = node_sync_from_blockchain_state(resp, last_sync_state_);
 
     if (!resp.contains("blockchain_state") ||
