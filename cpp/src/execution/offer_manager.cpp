@@ -119,23 +119,29 @@ OfferManager::OfferManager(asio::io_context&                    /*ioc*/,
     {
         const auto check_expiry =
             [&](std::uint32_t secs, const std::string& who) {
-                if (expiry_outlasts_hard_ttl(secs,
-                                             strategy_cfg_.offer_ttl_blocks,
-                                             kHardTtlMultiplier,
-                                             kSecondsPerBlock)) {
+                if (expiry_outlasts_hard_ttl(
+                        secs, strategy_cfg_.offer_ttl_blocks,
+                        kHardTtlMultiplier,
+                        strategy_cfg_.block_time_seconds)) {
                     return;
                 }
                 const auto floor_s = static_cast<std::int64_t>(
                     hard_ttl_seconds(strategy_cfg_.offer_ttl_blocks,
-                                     kHardTtlMultiplier, kSecondsPerBlock));
+                                     kHardTtlMultiplier,
+                                     strategy_cfg_.block_time_seconds)
+                    * kExpiryFloorMargin);
                 throw std::invalid_argument(
                     who + " offer_expiry_secs (" + std::to_string(secs)
-                    + "s) must exceed the hard TTL of "
-                    + std::to_string(floor_s) + "s (offer_ttl_blocks "
+                    + "s) must exceed " + std::to_string(floor_s)
+                    + "s -- the hard TTL (offer_ttl_blocks "
                     + std::to_string(strategy_cfg_.offer_ttl_blocks)
                     + " x " + std::to_string(kHardTtlMultiplier)
-                    + " blocks); otherwise the chain would expire offers "
-                      "this engine still tracks as live");
+                    + " blocks at a configured "
+                    + std::to_string(strategy_cfg_.block_time_seconds)
+                    + "s/block) times a safety margin, because the real "
+                      "block rate varies and an expiry inside the TTL would "
+                      "let the chain expire offers this engine still tracks "
+                      "as live");
             };
 
         check_expiry(strategy_cfg_.offer_expiry_secs, "strategy");
@@ -200,6 +206,14 @@ OfferManager::retire_offer_failed_expiry(const PendingOffer& adopt,
         co_await cancel_offer_charged(
             adopt.offer_id, xop::risk::watchdog_cancel().fee_mojos,
             xop::risk::watchdog_cancel().secure);
+        // [review #150] Mark it, exactly as cancel_stale does after its own
+        // successful cancel.  Without this the adopted record keeps
+        // cancel_pending == false, so the next refresh sees a live-looking
+        // offer, fires a SECOND secure cancel, and pays a second fee on a
+        // spend already in flight.  The record deliberately stays in State
+        // either way: a secure cancel is unconfirmed, and a counterparty can
+        // still win the race.
+        state_->mark_cancel_pending(adopt.offer_id);
     } catch (const std::exception& e) {
         logger_->critical("[offer-expiry] could not cancel {} -- it is LIVE "
                           "with no expiry: {}", adopt.offer_id, e.what());
@@ -3832,12 +3846,27 @@ asio::awaitable<int> OfferManager::post_merged_side(
     // one trade_id.
     if (expiry_max_time.has_value()
         && !expiry_echo_ok(result, *expiry_max_time)) {
+        // [review #150] ONE AGGREGATE RECORD, not the first tier.  This is a
+        // single wallet trade carrying every merged tier, and upsert_offer is
+        // keyed by offer_id alone -- recording only tiers.front() under-books
+        // the size, so if the cancel loses the race to a taker the fill is
+        // accounted at a fraction of what was actually filled.  Same shape as
+        // the late-merged-create path above (round 11): total size, priced at
+        // the most conservative (worst-for-us) tier so fill accounting cannot
+        // overstate what the race can win.
         PendingOffer adopt;
         adopt.offer_id         = trade_id;
         adopt.pair_name        = pair.name;
         adopt.side             = tiers.front().side;
         adopt.price            = tiers.front().price;
-        adopt.size             = tiers.front().size;
+        adopt.size             = 0;
+        for (const auto& t : tiers) {
+            adopt.size += t.size;
+            const bool worse = (t.side == Side::Bid)
+                ? t.price > adopt.price
+                : t.price < adopt.price;
+            if (worse) adopt.price = t.price;
+        }
         adopt.tier             = tiers.front().tier_index;
         adopt.created_at_block = block_height;
         adopt.created_at_ts    = std::chrono::system_clock::now();

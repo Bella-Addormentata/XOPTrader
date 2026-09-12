@@ -60,7 +60,10 @@ json response_with_max_time(const json& max_time_value) {
 
 constexpr std::uint32_t kTtlBlocks = 60;
 constexpr std::uint32_t kHardMult  = 2;
-constexpr double        kSecsBlock = 18.75;
+// The repo's CONFIGURED mean inter-block interval
+// (StrategyConfig::block_time_seconds), not the 18.75s this code used to
+// invent for itself -- see TheFloorTracksTheConfiguredBlockTimeNotAConstant.
+constexpr double        kSecsBlock = 52.0;
 
 }  // namespace
 
@@ -140,6 +143,17 @@ TEST(OfferExpiry, EchoRejectedOnWrongType) {
     EXPECT_FALSE(expiry_echo_ok(response_with_max_time("1757086400"), want));
 }
 
+TEST(OfferExpiry, EchoRejectedOnAFloatThatTruncatesToTheExpectedValue) {
+    // [review #150] The check used is_number(), which admits number_float,
+    // and get<uint64_t>() TRUNCATES -- so this passed an exact-echo test.
+    // Chia's max_time is a uint64; a float is not that wallet's answer.
+    const std::uint64_t want = 1'757'086'400ull;
+    EXPECT_FALSE(expiry_echo_ok(response_with_max_time(1757086400.5), want));
+    EXPECT_FALSE(expiry_echo_ok(response_with_max_time(1757086400.0), want));
+    // A signed value cannot be a uint64 echo either.
+    EXPECT_FALSE(expiry_echo_ok(response_with_max_time(-1), want));
+}
+
 TEST(OfferExpiry, EchoRejectedOnMalformedResponses) {
     const std::uint64_t want = 1'757'086'400ull;
     // No trade_record at all.
@@ -161,9 +175,11 @@ TEST(OfferExpiry, EchoRejectedOnMalformedResponses) {
 // ===========================================================================
 
 TEST(OfferExpiry, HardTtlSecondsIsSoftTtlTimesMultiplier) {
-    // 60 blocks x 2 x 18.75s = 2250s.
+    // 60 blocks x 2 x 52s = 6240s at the configured rate.
     EXPECT_DOUBLE_EQ(hard_ttl_seconds(kTtlBlocks, kHardMult, kSecsBlock),
-                     2250.0);
+                     6240.0);
+    // And it is a pure product -- the rate is an INPUT, never a constant.
+    EXPECT_DOUBLE_EQ(hard_ttl_seconds(60u, 2u, 18.75), 2250.0);
 }
 
 TEST(OfferExpiry, DisabledExpiryIsTriviallySafe) {
@@ -172,23 +188,43 @@ TEST(OfferExpiry, DisabledExpiryIsTriviallySafe) {
 }
 
 TEST(OfferExpiry, ExpiryInsideTheHardTtlIsRejected) {
-    // 1800s < 2250s: the chain would retire offers the canceller still
-    // considers live, with no cancel ever recorded.
+    // Hard TTL is 6240s at the configured rate; the floor is that times
+    // kExpiryFloorMargin.  Anything inside the raw TTL is plainly unsafe:
+    // the chain would retire offers the canceller still considers live,
+    // with no cancel ever recorded.
     EXPECT_FALSE(expiry_outlasts_hard_ttl(1800u, kTtlBlocks, kHardMult,
                                           kSecsBlock));
-}
-
-TEST(OfferExpiry, ExpiryExactlyOnTheHardTtlIsRejected) {
-    // A tie is a race between the chain and the canceller; not worth entering.
-    EXPECT_FALSE(expiry_outlasts_hard_ttl(2250u, kTtlBlocks, kHardMult,
+    EXPECT_FALSE(expiry_outlasts_hard_ttl(6240u, kTtlBlocks, kHardMult,
                                           kSecsBlock));
 }
 
-TEST(OfferExpiry, ExpiryBeyondTheHardTtlIsAccepted) {
-    EXPECT_TRUE(expiry_outlasts_hard_ttl(2251u, kTtlBlocks, kHardMult,
+TEST(OfferExpiry, ExpiryInsideTheSafetyMarginIsAlsoRejected) {
+    // [review #150] THE REGRESSION THIS PINS.  6241s outlasts the RAW hard
+    // TTL but not the margin.  The TTL is counted in BLOCKS and the expiry
+    // fires on WALL CLOCK: when blocks arrive slower than the configured
+    // mean the TTL stretches in seconds while a bare floor does not, and a
+    // value in this band expires while the engine still tracks the offer as
+    // live.  A tie is likewise a race not worth entering.
+    EXPECT_FALSE(expiry_outlasts_hard_ttl(6241u, kTtlBlocks, kHardMult,
+                                          kSecsBlock));
+    EXPECT_FALSE(expiry_outlasts_hard_ttl(12480u, kTtlBlocks, kHardMult,
+                                          kSecsBlock));
+}
+
+TEST(OfferExpiry, ExpiryBeyondTheMarginIsAccepted) {
+    EXPECT_TRUE(expiry_outlasts_hard_ttl(12481u, kTtlBlocks, kHardMult,
                                          kSecsBlock));
     EXPECT_TRUE(expiry_outlasts_hard_ttl(86400u, kTtlBlocks, kHardMult,
                                          kSecsBlock));
+}
+
+TEST(OfferExpiry, TheFloorTracksTheConfiguredBlockTimeNotAConstant) {
+    // [review #150] The floor used an invented 18.75s/block while this
+    // repo's configured mean is 52s -- making it ~2.8x too LOW.  Passing
+    // the rate in is what lets the operator's real configuration bind: the
+    // SAME expiry that clears at 18.75s/block is refused at 52s/block.
+    EXPECT_TRUE(expiry_outlasts_hard_ttl(5000u, kTtlBlocks, kHardMult, 18.75));
+    EXPECT_FALSE(expiry_outlasts_hard_ttl(5000u, kTtlBlocks, kHardMult, 52.0));
 }
 
 // ===========================================================================
@@ -246,10 +282,13 @@ TEST(OfferExpiryPayload, BaseFieldsAreUnchangedByExpiry) {
 }
 
 TEST(OfferExpiry, TheFloorTracksTheConfiguredTtlRatherThanAFixedNumber) {
-    // The example config ships offer_ttl_blocks: 600 -> hard TTL 22500s, so
-    // a value that is generous at TTL 60 is REJECTED at TTL 600.  This is
-    // why the bound is computed from config instead of hardcoded.
-    EXPECT_TRUE(expiry_outlasts_hard_ttl(3600u, 60u, kHardMult, kSecsBlock));
-    EXPECT_FALSE(expiry_outlasts_hard_ttl(3600u, 600u, kHardMult, kSecsBlock));
-    EXPECT_TRUE(expiry_outlasts_hard_ttl(86400u, 600u, kHardMult, kSecsBlock));
+    // The example config ships offer_ttl_blocks: 600, so at the configured
+    // rate the hard TTL is 62400s and the floor 124800s.  A value generous
+    // at TTL 60 is therefore REJECTED at TTL 600 -- which is why the bound
+    // is computed from config rather than hardcoded.
+    EXPECT_TRUE(expiry_outlasts_hard_ttl(86400u, 60u, kHardMult, kSecsBlock));
+    EXPECT_FALSE(expiry_outlasts_hard_ttl(86400u, 600u, kHardMult,
+                                          kSecsBlock));
+    EXPECT_TRUE(expiry_outlasts_hard_ttl(200000u, 600u, kHardMult,
+                                         kSecsBlock));
 }

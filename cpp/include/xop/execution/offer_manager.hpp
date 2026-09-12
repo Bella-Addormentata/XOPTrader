@@ -826,13 +826,11 @@ public:
     /// age are always expired regardless of price accuracy.
     static constexpr std::uint32_t kHardTtlMultiplier = 2;
 
-    /// Nominal Chia block time in seconds.  Used ONLY to compare an
-    /// offer-expiry configured in seconds against a TTL configured in
-    /// blocks, once, at startup.  Nothing schedules on it, so drift in the
-    /// real block rate cannot desynchronise anything; it would only make
-    /// the startup floor slightly conservative, which is the safe way to be
-    /// wrong.
-    static constexpr double kSecondsPerBlock = 18.75;
+    // [review #150] kSecondsPerBlock (18.75) lived here and was BOTH a
+    // second source of truth for a safety bound and ~2.8x too fast.  The
+    // configured mean inter-block interval already exists as
+    // StrategyConfig::block_time_seconds (52.0), parsed and range-checked
+    // in config.cpp -- that is what the startup floor now reads.
 
     // -- [OFFER-EXPIRY] wiring (the decisions are in offer_expiry.hpp) ------
 

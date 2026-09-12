@@ -94,8 +94,14 @@ namespace xop::execution {
     }
     const auto& vt = tr["valid_times"];
     // A null max_time is the shape a wallet returns when it ignored the
-    // request, so is_number() is the load-bearing check here.
-    if (!vt.contains("max_time") || !vt["max_time"].is_number()) {
+    // request, so this type check is the load-bearing one.
+    //
+    // [review #150] It was `is_number()`, which ALSO admits number_float --
+    // and `get<std::uint64_t>()` truncates.  An echoed `expected + 0.5`
+    // therefore compared equal and passed a check whose entire purpose is
+    // exactness.  Chia's max_time is a uint64; require that representation
+    // rather than anything numeric that happens to round to it.
+    if (!vt.contains("max_time") || !vt["max_time"].is_number_unsigned()) {
         return false;
     }
     return vt["max_time"].get<std::uint64_t>() == expected_max_time;
@@ -120,9 +126,37 @@ namespace xop::execution {
 /// quietly unlock, and the book thins with nothing in the log to explain it.
 /// A disabled expiry (0) is trivially safe -- there is nothing to outlast.
 ///
-/// Strictly greater, not >=: an expiry landing exactly on the hard TTL is a
-/// coin-flip between the chain and the canceller, which is not a race worth
-/// entering.
+/// Safety margin applied to the floor.
+///
+/// [review #150] THE TWO QUANTITIES ARE NOT IN THE SAME UNITS, AND CANNOT BE
+/// MADE SO.  The hard TTL fires after a COUNT OF OBSERVED BLOCK HEIGHTS;
+/// max_time fires at an ABSOLUTE WALL-CLOCK INSTANT.  Converting between
+/// them needs a block rate, and the real rate varies.  When blocks arrive
+/// slower than the configured mean, the hard TTL stretches in wall-clock
+/// terms while a floor computed from that mean does not -- so a value
+/// accepted just above the floor expires FIRST, recreating precisely the
+/// tracked-as-live state this validation exists to prevent.
+///
+/// An earlier revision of this header asserted the opposite: that rate drift
+/// "cannot desynchronise anything" and could only make the floor "slightly
+/// conservative".  That was wrong, and wrong in the dangerous direction.
+///
+/// The margin is the honest answer: require the expiry to outlast the hard
+/// TTL by this factor, so ordinary rate variation cannot invert the
+/// ordering.  Being over-conservative costs an operator a longer configured
+/// expiry; being under-conservative costs offers that die on-chain while the
+/// engine still believes they rest.
+inline constexpr double kExpiryFloorMargin = 2.0;
+
+/// Whether a configured expiry is safe to use.
+///
+/// Strictly greater, not >=: a tie is a race between the chain and the
+/// canceller, which is not a race worth entering.
+///
+/// @param secs_per_block  The CONFIGURED mean inter-block interval
+///        (StrategyConfig::block_time_seconds, default 52.0) -- never a
+///        constant invented here.  A second source of truth for a safety
+///        bound is what this codebase keeps getting bitten by.
 [[nodiscard]] inline bool expiry_outlasts_hard_ttl(
     std::uint32_t expiry_secs,
     std::uint32_t ttl_blocks,
@@ -131,7 +165,8 @@ namespace xop::execution {
 {
     if (expiry_secs == 0) return true;
     return static_cast<double>(expiry_secs)
-         > hard_ttl_seconds(ttl_blocks, hard_multiplier, secs_per_block);
+         > hard_ttl_seconds(ttl_blocks, hard_multiplier, secs_per_block)
+           * kExpiryFloorMargin;
 }
 
 }  // namespace xop::execution
