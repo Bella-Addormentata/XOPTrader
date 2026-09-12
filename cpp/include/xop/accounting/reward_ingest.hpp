@@ -104,6 +104,43 @@ inline constexpr int kOutgoingTrade = 5;
     return true;
 }
 
+/// How far back a receipt may sit and still be fairly valued at the CURRENT
+/// price.  4,608 blocks is ~24h by this codebase's convention (config.hpp:
+/// `epoch_blocks{4608};  // Daily cap reset period (~24h)`), so two days
+/// covers an overnight restart plus one missed daily batch.
+inline constexpr BlockHeight kMaxRewardBacklogBlocks{9'216};
+
+/// Is this receipt recent enough for the live price to stand in for the
+/// receipt-time price?
+///
+/// [review 2026-09-12] value_reward() takes ONE live usd_per_unit and the
+/// ledger row it feeds is idempotent on event_id, so whatever price the FIRST
+/// scan sees is the price that receipt keeps forever.  That satisfies the
+/// receipt-FMV contract only while the receipt is recent -- and it is not, on
+/// the first restart after the reverse=false window fix: ingest shipped
+/// 2026-08-01 and booked nothing until now, so the whole unbooked backlog
+/// inside the 200-row window arrives in one heartbeat.
+///
+/// The genesis gate above does NOT bound that: it is the asset's OPENING
+/// block, written once ever, ~197k blocks below the head.
+///
+/// An excluded receipt is not lost accounting -- it stays wallet-vs-books
+/// divergence for the invariant control to absorb, the documented fate of any
+/// reward that scrolls past the window.
+///
+/// @param confirmed_height    Receipt block (0 is rejected upstream).
+/// @param current_height      This heartbeat's block.
+/// @param max_backlog_blocks  0 disables the bound entirely.
+[[nodiscard]] constexpr bool reward_receipt_is_recent(
+    BlockHeight confirmed_height,
+    BlockHeight current_height,
+    BlockHeight max_backlog_blocks = kMaxRewardBacklogBlocks) noexcept
+{
+    if (max_backlog_blocks == 0) return true;             // bound disabled
+    if (confirmed_height >= current_height) return true;  // same block, or ahead
+    return (current_height - confirmed_height) <= max_backlog_blocks;
+}
+
 /// Fair-value numbers for one reward receipt.
 struct RewardValuation {
     /// Cost-basis price in the InventoryTracker's USD-pseudo convention:

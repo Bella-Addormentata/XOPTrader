@@ -16601,6 +16601,7 @@ asio::awaitable<void> Engine::step_ingest_reward_inflows(
 
     const auto now = std::chrono::system_clock::now();
     std::size_t booked = 0;
+    std::size_t stale_skipped = 0;
     Mojo        booked_mojos = 0;
     double      booked_usd   = 0.0;
 
@@ -16614,6 +16615,18 @@ asio::awaitable<void> Engine::step_ingest_reward_inflows(
                 type, amount, height, genesis_block,
                 acc.reward_max_mojos_per_coin,
                 outgoing.count({height, amount}) > 0)) {
+            continue;
+        }
+
+        // [review 2026-09-12] usd_per_unit above is ONE live price and this
+        // ledger row is idempotent, so a receipt booked today keeps today's
+        // price forever.  On the FIRST restart after the reverse=false window
+        // fix the entire never-booked backlog arrives at once, and the genesis
+        // gate does NOT bound it -- that is the asset's opening block, weeks
+        // below the head.  Skipped receipts remain wallet-vs-books divergence
+        // for the invariant, the documented fate of any reward past the window.
+        if (!accounting::reward_receipt_is_recent(height, block_height)) {
+            stale_skipped += 1;
             continue;
         }
 
@@ -16670,6 +16683,14 @@ asio::awaitable<void> Engine::step_ingest_reward_inflows(
                      "(FMV ${:.6f} @ ${:.6f}/unit, tx {})",
                      asset.substr(0, 12), amount, height, val.income_usd,
                      usd_per_unit, tx_name.substr(0, 18));
+    }
+
+    if (stale_skipped > 0) {
+        spdlog::warn("[Engine] Reward ingest: skipped {} reward inflow(s) "
+                     "older than {} blocks -- valuing them at today's price "
+                     "would misstate receipt FMV; they remain wallet-vs-books "
+                     "divergence for the invariant control",
+                     stale_skipped, accounting::kMaxRewardBacklogBlocks);
     }
 
     if (booked > 0) {

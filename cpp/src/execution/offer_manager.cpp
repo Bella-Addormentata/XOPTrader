@@ -24,6 +24,7 @@
 
 #include <xop/execution/cancel_retry.hpp>
 #include <xop/execution/cross_guard.hpp>
+#include <xop/execution/stuck_tx_verdict.hpp>
 #include <xop/execution/wallet_poll_throttle.hpp>
 #include <xop/risk/watchdog.hpp>
 
@@ -3318,14 +3319,22 @@ asio::awaitable<int> OfferManager::prune_stuck_transactions(
             auto txs = co_await wallet_->get_transactions(wid, 0, 200);
 
             int stuck_count = 0;
+            int fresh_count = 0;
             for (const auto& tx : txs) {
                 // Only examine unconfirmed transactions.
                 if (tx.contains("confirmed") && tx["confirmed"].get<bool>()) {
                     continue;
                 }
 
-                // Check age.
-                if (!tx.contains("created_at_time")) continue;
+                // Check age.  [S33 review] An unconfirmed row whose age
+                // cannot be read is UNKNOWN, not old.  It counts as FRESH,
+                // because the delete below is wallet-wide and would take it
+                // regardless -- "Unknown is its own state, and it authorises
+                // nothing" (coin_pool_verdict.hpp).
+                if (!tx.contains("created_at_time")) {
+                    ++fresh_count;
+                    continue;
+                }
                 auto created = tx["created_at_time"].get<std::int64_t>();
                 auto age = now_epoch - created;
 
@@ -3341,7 +3350,10 @@ asio::awaitable<int> OfferManager::prune_stuck_transactions(
                     ? max_age_seconds * 3   // 30 min for broadcast-but-dropped
                     : max_age_seconds;       // 10 min for never-broadcast
 
-                if (age < threshold) continue;
+                if (age < threshold) {
+                    ++fresh_count;
+                    continue;
+                }
 
                 ++stuck_count;
 
@@ -3361,10 +3373,30 @@ asio::awaitable<int> OfferManager::prune_stuck_transactions(
                 }
             }
 
-            if (stuck_count > 0) {
-                logger_->warn("[prune_stuck_tx] wallet {} has {} stuck "
-                              "transactions (no spend bundle, age > {}s) "
-                              "-- clearing unconfirmed",
+            // [S33 review] delete_unconfirmed_transactions is WALLET-WIDE, so
+            // one old row must not authorise deleting this heartbeat's offer
+            // creations and unconfirmed cancel spends beside it.  The decision
+            // lives in execution/stuck_tx_verdict.hpp so ctest drives the same
+            // code this does; THIS CALL SITE IS NOT COVERED -- nothing in
+            // cpp/tests constructs an OfferManager.
+            if (stuck_count > 0 && fresh_count > 0) {
+                logger_->info("[prune_stuck_tx] wallet {} has {} stuck "
+                              "transaction(s) but {} fresh/unknown-age "
+                              "unconfirmed row(s) -- HOLDING the wallet-wide "
+                              "delete; it cannot be aimed",
+                              wid, stuck_count, fresh_count);
+            }
+            if (authorises_wallet_wide_delete(/*past_threshold=*/stuck_count,
+                                              /*fresh_or_unknown=*/fresh_count)) {
+                // [S33 review] Text corrected: the 3x branch above also counts
+                // rows that DO carry a spend bundle, and reverse=false makes
+                // that branch reachable for the first time, so the old
+                // "(no spend bundle, ...)" wording would now be printed while
+                // deleting on the strength of bundled rows.
+                logger_->warn("[prune_stuck_tx] wallet {} has {} unconfirmed "
+                              "transaction(s) past their stuck threshold "
+                              "(base {}s; 3x that when a spend bundle exists) "
+                              "and none fresher -- clearing unconfirmed",
                               wid, stuck_count, max_age_seconds);
                 co_await wallet_->delete_unconfirmed_transactions(wid);
                 ++wallets_pruned;

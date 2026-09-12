@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -174,6 +175,23 @@ TEST(WalletRequests, BatchCountSurvivesADegenerateBatchSize) {
     EXPECT_EQ(cancel_offers_batch_count(7, 0), 7);
     EXPECT_EQ(cancel_offers_batch_count(7, -1), 7);
     EXPECT_EQ(cancel_offers_batch_count(-3, 5), 0);
+}
+
+// [review 2026-09-12] The ceiling must not be computed as
+// (n_offers + bs - 1) / bs: that addition is signed overflow -- UB -- once
+// n_offers comes within bs of INT64_MAX.  Unreachable from today's only
+// caller (reserve_bulk_cancel passes max(book size, 25)), but a WRAPPED
+// count goes negative and reserve_bulk_cancel's `batches < 1` clamp would
+// collapse it to a single batch -- relaundering it into the exact
+// single-fee under-reservation this ceiling exists to prevent.
+TEST(WalletRequests, BatchCountIsSafeAtTheInt64Boundary) {
+    constexpr std::int64_t kMax = std::numeric_limits<std::int64_t>::max();
+
+    EXPECT_EQ(cancel_offers_batch_count(kMax, 1), kMax);
+    EXPECT_EQ(cancel_offers_batch_count(kMax, 5), 1'844'674'407'370'955'162LL);
+    EXPECT_EQ(cancel_offers_batch_count(kMax - 1, 5),
+              1'844'674'407'370'955'162LL);
+    EXPECT_GT(cancel_offers_batch_count(kMax, 5), 0);
 }
 
 // ---------------------------------------------------------------------------

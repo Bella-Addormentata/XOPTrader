@@ -73,7 +73,16 @@ inline constexpr int kCancelOffersBatchSize = 5;
     if (n_offers <= 0) return 0;
     if (batch_size <= 0) return n_offers;   // degenerate; charge worst case
     const std::int64_t bs = static_cast<std::int64_t>(batch_size);
-    return (n_offers + bs - 1) / bs;
+    // [review 2026-09-12] Subtraction form, NOT (n_offers + bs - 1) / bs:
+    // that addition is signed overflow -- UB -- once n_offers comes within bs
+    // of INT64_MAX.  Both guards above already established n_offers >= 1 and
+    // bs >= 1, and for those operands floor((n - 1) / bs) + 1 == ceil(n / bs)
+    // exactly, while n_offers - 1 cannot underflow and the quotient + 1 cannot
+    // leave the type.  Unreachable from today's only caller (reserve_bulk_cancel
+    // passes max(book size, 25)), but a wrapped count goes NEGATIVE and the
+    // `batches < 1` clamp there would relaunder it into the single-fee
+    // under-reservation this function exists to prevent.
+    return (n_offers - 1) / bs + 1;
 }
 
 /// Build the cancel_offers payload.

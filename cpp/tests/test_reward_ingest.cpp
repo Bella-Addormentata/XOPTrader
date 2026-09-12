@@ -34,6 +34,37 @@ constexpr xop::BlockHeight kGenesis  = 9'080'000;  // ledger opening block
 // Filter: what is (and is not) a reward inflow
 // ============================================================================
 
+// [review 2026-09-12] The BACKLOG bound.  value_reward() takes ONE live
+// usd_per_unit and the ledger row it feeds is idempotent on event_id, so
+// whatever price the FIRST scan sees is the price that receipt keeps forever.
+// The genesis gate below does NOT bound that: it is the asset's OPENING
+// block, written once ever and ~197k blocks under the head, so the whole
+// never-booked backlog passes it and would book at today's price on the
+// first restart after the reverse=false window fix.
+TEST(RewardIngestFilterTest, StaleBacklogReceiptsAreNotValuedAtTodaysPrice) {
+    constexpr xop::BlockHeight kNow = 9'277'273;   // measured head, 2026-09-11
+
+    // Recent receipts price fairly at the live rate.
+    EXPECT_TRUE(reward_receipt_is_recent(kNow, kNow));
+    EXPECT_TRUE(reward_receipt_is_recent(kNow - 4'608, kNow));
+
+    // The measured 2026-07-31 burst PASSES the genesis gate -- which is
+    // exactly why this second bound has to exist.
+    EXPECT_TRUE(is_reward_inflow(kIncomingTx, 22, 9'085'813, kGenesis,
+                                 kMaxRewardMojos, false));
+    EXPECT_FALSE(reward_receipt_is_recent(9'085'813, kNow));
+
+    // Boundary, both sides of it.
+    EXPECT_TRUE(reward_receipt_is_recent(kNow - kMaxRewardBacklogBlocks, kNow));
+    EXPECT_FALSE(reward_receipt_is_recent(kNow - kMaxRewardBacklogBlocks - 1,
+                                          kNow));
+
+    // Degenerate: a height at or ahead of the head (lagging head, reorg) is
+    // not stale, and a zero bound disables the check entirely.
+    EXPECT_TRUE(reward_receipt_is_recent(kNow + 10, kNow));
+    EXPECT_TRUE(reward_receipt_is_recent(9'085'813, kNow, 0));
+}
+
 TEST(RewardIngestFilterTest, MeasuredRewardCoinIsAccepted) {
     // A coin from the observed 2026-07-31 burst: 22 mojos, plain incoming,
     // confirmed at 9085813 (after genesis), no matching outgoing.
