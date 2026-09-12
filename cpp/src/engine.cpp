@@ -16618,6 +16618,26 @@ asio::awaitable<void> Engine::step_ingest_reward_inflows(
             continue;
         }
 
+        const std::string tx_name = t.value("name", std::string{});
+        if (tx_name.empty()) continue;   // no stable idempotency key
+
+        const std::string event_id = "reward:" + tx_name;
+
+        // [review 3997843761] IDEMPOTENCY BEFORE FRESHNESS.
+        //
+        // The freshness gate used to run first, so a receipt booked days ago
+        // -- while it was still fresh -- was re-counted as stale the moment it
+        // aged past the cutoff, and the warning below then reported it as
+        // still being wallet-vs-books divergence when it had in fact been
+        // booked.  The wallet's newest-200 window holds such rows for weeks,
+        // so that ran on every heartbeat.
+        //
+        // An already-journalled receipt is finished business at any age: skip
+        // it silently.  This is a READ -- the scan cannot learn "already
+        // booked" from append_ledger_entries, because for a stale receipt it
+        // deliberately performs no insert at all.
+        if (db_->ledger_has_event(event_id)) continue;
+
         // [review 2026-09-12] usd_per_unit above is ONE live price and this
         // ledger row is idempotent, so a receipt booked today keeps today's
         // price forever.  On the FIRST restart after the reverse=false window
@@ -16626,12 +16646,13 @@ asio::awaitable<void> Engine::step_ingest_reward_inflows(
         // below the head.  Skipped receipts remain wallet-vs-books divergence
         // for the invariant, the documented fate of any reward past the window.
         if (!accounting::reward_receipt_is_recent(height, block_height)) {
-            stale_skipped += 1;
+            // Report each unbooked stale receipt ONCE per process rather than
+            // on every heartbeat for as long as it sits in the window.
+            if (reward_stale_warned_.insert(event_id).second) {
+                stale_skipped += 1;
+            }
             continue;
         }
-
-        const std::string tx_name = t.value("name", std::string{});
-        if (tx_name.empty()) continue;   // no stable idempotency key
 
         if (usd_per_unit <= 0.0) {
             spdlog::info("[Engine] Reward ingest: {} inflow of {} mojos at "
@@ -16649,7 +16670,7 @@ asio::awaitable<void> Engine::step_ingest_reward_inflows(
         DbLedgerEntry e;
         e.entry_time   = PnLTracker::timestamp_to_iso(now);
         e.event_type   = "reward";
-        e.event_id     = "reward:" + tx_name;
+        e.event_id     = event_id;
         e.leg          = "reward";
         e.asset_id     = asset;
         e.delta_mojos  = amount;
@@ -16686,10 +16707,12 @@ asio::awaitable<void> Engine::step_ingest_reward_inflows(
     }
 
     if (stale_skipped > 0) {
-        spdlog::warn("[Engine] Reward ingest: skipped {} reward inflow(s) "
-                     "older than {} blocks -- valuing them at today's price "
-                     "would misstate receipt FMV; they remain wallet-vs-books "
-                     "divergence for the invariant control",
+        spdlog::warn("[Engine] Reward ingest: skipped {} newly-seen reward "
+                     "inflow(s) older than {} blocks (~2 days) -- valuing them "
+                     "at today's price would misstate receipt FMV. These were "
+                     "never booked, so they remain wallet-vs-books divergence "
+                     "for the invariant control; already-booked receipts are "
+                     "not counted here, and each id is reported once",
                      stale_skipped, accounting::kMaxRewardBacklogBlocks);
     }
 
