@@ -560,9 +560,23 @@ public:
      *
      * @param batch_fee  Fee in mojos charged ONCE PER BATCH of
      *                   kCancelOffersBatchSize offers -- NOT once per call.
-     *                   A caller that reserves XCH for this must reserve
-     *                   batch_fee * ceil(n_offers / kCancelOffersBatchSize);
-     *                   see OfferManager::cancel_offers_charged.
+     *
+     *                   [review 2026-09-12] A caller that reserves XCH for
+     *                   this must reserve ONE WHOLE FEE-BEARING COIN PER
+     *                   BATCH -- not batch_fee * batches, which an earlier
+     *                   revision of this line recommended.  Each batch is a
+     *                   separate transaction submitted inside the same
+     *                   cycle, so the change from one cannot fund the next
+     *                   and each locks a different whole coin.  Reserving
+     *                   the combined AMOUNT models one coin for the lot and
+     *                   undercounts the locks -- the 2026-08-23
+     *                   zero-spendable shape.
+     *
+     *                   Use execution::reserve_bulk_cancel (a loop of
+     *                   single-fee note_lock()s, with a >= 1 batch clamp);
+     *                   see OfferManager::cancel_offers_charged, and
+     *                   CoinLockLedgerTest.BulkCancelReservesOneWholeFeeCoin
+     *                   PerBatch, which pins the distinction explicitly.
      * @param secure     On-chain vs local-only cancellation.
      * @return JSON confirmation.
      */

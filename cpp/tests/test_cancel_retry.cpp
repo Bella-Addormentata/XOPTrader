@@ -823,12 +823,19 @@ TEST(CancelLadderState, SlowAttemptsExhaustTheBudgetNotJustTheSleeps)
 // TRUE for a sweep the wallet had refused: a refusal reading as success, the
 // exact fail-open this family keeps removing.
 //
-// HOW IT IS REACHED, since the honest answer is "narrowly, but really".  The
-// shutdown seeds this ladder from State, so an empty book means cancel_all is
-// never called at all.  The reachable interleaving is that State empties
-// BETWEEN the seed and the call: the pre-cancel sync probe co_awaits, and a
-// single-threaded io_context still runs other coroutines across that
-// suspension.  The OPERATOR Cancel All path has no such guard -- it calls
+// HOW IT IS REACHED.  [review 2026-09-12] Two ways, and this note used to
+// claim only the second -- it said an empty book meant cancel_all was never
+// called at all, which THIS PR falsified.
+//
+//   1. DIRECTLY, on an empty shutdown book.  Engine::shutdown constructs the
+//      ladder with sweep_when_empty=true (engine.cpp), and the ctor gate is
+//      `outstanding_.empty() && !sweep_when_empty_` (cancel_retry.hpp), so an
+//      initially empty ladder now authorises attempt 1 and reaches
+//      cancel_all() -- which is the whole point of that flag, and is pinned
+//      by AnEmptyLocalBookStillSweepsTheWallet above.
+//   2. BY INTERLEAVING, on a book that empties after the seed: the
+//      pre-cancel sync probe co_awaits, and a single-threaded io_context
+//      still runs other coroutines across that suspension.  The OPERATOR Cancel All path has no such guard -- it calls
 // cancel_all unconditionally, with no ladder -- which is why the flag is on
 // CancelOutcome and not only in here.
 //
