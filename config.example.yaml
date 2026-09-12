@@ -209,7 +209,7 @@ pairs:
     # competitive_anchor_max_distance_bps_override: 250.0  # [OPTIONAL, default: unset -> strategy.competitive_anchor_max_distance_bps] must be > 0
     # competitive_anchor_stride_bps_override: 20.0         # [OPTIONAL, default: unset -> strategy.competitive_anchor_stride_bps] must be > 0
     # fair_value_residual_widen_ratio_override: 0.25       # [OPTIONAL, default: unset -> strategy.fair_value_residual_widen_ratio] 0 disables residual widening here; must be >= 0
-    # offer_expiry_secs_override: 86400                    # [OPTIONAL, default: unset -> strategy.offer_expiry_secs] 0 binds and means "never expire THIS pair's offers"; must outlast the hard TTL
+    # offer_expiry_secs_override: 172800                   # [OPTIONAL, default: unset -> strategy.offer_expiry_secs] 0 binds and means "never expire THIS pair's offers"; must outlast the hard TTL x2 safety margin
 
     # -- Per-pair 24h activity-adaptive controller --
     # See strategy.activity_adaptive_spacing for what the controller does.
@@ -315,7 +315,7 @@ strategy:
   min_profit_margin_bps: 35  # [REQUIRED] Never post ask below cost_basis + this margin
   high_vol_multiplier: 1.3   # [OPTIONAL, default: 1.3] Spread widening multiplier during high-vol regimes
   sigma_floor: 0.001         # [OPTIONAL, default: 0.001] Minimum annualized sigma for GLFT formula (prevents degenerate spreads when market is flat)
-  offer_ttl_blocks: 600      # [REQUIRED] Soft TTL: cancel stale offers after N blocks (~5 hours at 600)
+  offer_ttl_blocks: 600      # [REQUIRED] Soft TTL: cancel stale offers after N blocks (~8.7 hours at 600)
   # [OFFER-EXPIRY] On-chain expiry attached to offers we CREATE, in seconds.
   # Commented out because 0/unset is the default and the safe posture: no
   # timelock is attached and offers behave exactly as they always have.
@@ -329,12 +329,14 @@ strategy:
   # can fail to take an offer that carries one, and we cannot survey what
   # wallets our takers run.  Enable per pair, deliberately.
   #
-  # MUST exceed this bot's own hard TTL -- that is offer_ttl_blocks x 2, at
-  # ~18.75s per block.  At offer_ttl_blocks: 600 the floor is 22500s, so any
-  # value at or below ~6.25 hours is REJECTED at startup: an expiry inside
+  # MUST exceed this bot's own hard TTL -- offer_ttl_blocks x 2 at the
+  # configured strategy.block_time_seconds (52.0s) -- times a 2x safety
+  # margin, because the real block rate varies.  At offer_ttl_blocks: 600
+  # the floor is 124800s, so any value at or below ~34.7 hours is
+  # REJECTED at startup: an expiry inside
   # our own TTL would let the chain retire offers the engine still tracks as
   # live, with no cancel ever recorded.
-  # offer_expiry_secs: 86400   # [OPTIONAL, default: 0 = disabled] 24h
+  # offer_expiry_secs: 172800  # [OPTIONAL, default: 0 = disabled] 48h
   num_tiers: 4               # [REQUIRED] Multi-tier offer ladder depth (4 recommended: fewer, larger tiers)
   tier_spacing_bps: [35, 100, 200, 300]  # [REQUIRED] Spread per tier (bps)
   tier_size_pct: [0.15, 0.20, 0.30, 0.35] # [REQUIRED] Capital fraction per tier (sum ≈ 1.0)
