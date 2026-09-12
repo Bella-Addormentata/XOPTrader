@@ -282,11 +282,30 @@ TEST(RestingKeys, BrandNewTiersAreNotRestingAndStayCharged)
         << "keys are side-qualified: the ask side of tier 0 is unposted";
 }
 
-// One (side, tier) slot holding TWO pending offers is possible after any
-// earlier double post.  If their cancels disagree, select_repost_keys
-// whitelists the slot for repost -- so the limiter must CHARGE it, or the
-// replacement is posted against a budget that never reserved for it.
-TEST(RestingKeys, ADuplicatedSlotWithOneCancelledLegIsCharged)
+// ---------------------------------------------------------------------------
+// [S33 2026-09-12] One (side, tier) slot holding TWO pending offers, which is
+// possible after any earlier double post.
+//
+// THE FINDING: the whitelist admitted the slot as soon as ONE non-Fresh
+// occupant appeared in cancelled_ids, so with both legs Stale and only "a"
+// cancelled, the replacement was posted while "b" was STILL LIVE -- the double
+// exposure reached through the slot rather than through the tier.  The old
+// tests pinned that as intended behaviour, and select_resting_keys carried a
+// second pass that charged the slot to keep the budget consistent with it.
+//
+// MUTATION CHECK for this pair: reinstate the any-occupant rule in
+// select_repost_keys, i.e. drop the `vetoed` set and go back to
+//
+//     if (tc.staleness != execution::TierStaleness::Fresh
+//         && cancelled_id_set.count(tc.offer_id) > 0) { keys.insert(...); }
+//
+// -> ADuplicatedSlotWithAFailedLegIsRestingAndNotReposted goes RED.
+// ---------------------------------------------------------------------------
+
+// The unsafe half: "b"'s cancel failed, so the slot still holds a live offer
+// and nothing may be posted into it -- and because nothing is posted, the
+// still-locked coins must not be charged to the budget a second time.
+TEST(RestingKeys, ADuplicatedSlotWithAFailedLegIsRestingAndNotReposted)
 {
     const std::vector<TierClassification> classes{
         tier("a", TierStaleness::Stale, 0),
@@ -297,11 +316,50 @@ TEST(RestingKeys, ADuplicatedSlotWithOneCancelledLegIsCharged)
     const auto resting = select_resting_keys(classes, cancelled_ids);
     const auto repost  = select_repost_keys(classes, cancelled_ids);
 
+    EXPECT_EQ(repost.count(key(Side::Bid, 0)), 0u)
+        << "\"b\" is still on the book, so a replacement in that slot is "
+           "the double exposure this whitelist exists to prevent";
+    EXPECT_EQ(resting.count(key(Side::Bid, 0)), 1u)
+        << "the wallet still locks \"b\"'s coins and nothing is posted "
+           "there, so charging the slot counts the same XCH twice";
+}
+
+// ...and the half that keeps the fix from being "never repost a shared slot":
+// both legs cancelled leaves nothing live, so the slot IS repostable -- and
+// is charged, because a submitted cancel has not confirmed on-chain.
+TEST(RestingKeys, ADuplicatedSlotWithEveryLegCancelledIsRepostableAndCharged)
+{
+    const std::vector<TierClassification> classes{
+        tier("a", TierStaleness::Stale,   0),
+        tier("b", TierStaleness::Expired, 0),   // same slot as "a"
+    };
+    const std::vector<std::string> cancelled_ids{"a", "b"};
+
+    const auto resting = select_resting_keys(classes, cancelled_ids);
+    const auto repost  = select_repost_keys(classes, cancelled_ids);
+
     EXPECT_EQ(repost.count(key(Side::Bid, 0)), 1u)
-        << "one leg was cancelled, so the whitelist admits the slot";
+        << "no occupant of the slot is still live";
     EXPECT_EQ(resting.count(key(Side::Bid, 0)), 0u)
-        << "a slot that may be reposted must never be excluded from the "
-           "budget charge -- posted must stay a subset of charged";
+        << "posted must stay a subset of charged";
+}
+
+// A Fresh occupant was never asked to cancel, so it is live whatever happened
+// to the leg beside it -- the slot is blocked by its mere presence.
+TEST(RestingKeys, ADuplicatedSlotWithAFreshLegIsNeverReposted)
+{
+    const std::vector<TierClassification> classes{
+        tier("a", TierStaleness::Stale, 0),
+        tier("b", TierStaleness::Fresh, 0),   // same slot as "a"
+    };
+    const std::vector<std::string> cancelled_ids{"a"};
+
+    const auto resting = select_resting_keys(classes, cancelled_ids);
+    const auto repost  = select_repost_keys(classes, cancelled_ids);
+
+    EXPECT_EQ(repost.count(key(Side::Bid, 0)), 0u)
+        << "the Fresh leg is resting and was never cancelled";
+    EXPECT_EQ(resting.count(key(Side::Bid, 0)), 1u);
 }
 
 // ---------------------------------------------------------------------------
@@ -435,6 +493,31 @@ TEST(PostableTiers, EveryCancelFailedAndNoNewTiersPostsNothing)
     const std::vector<TierQuote> candidates{candidate(0), candidate(1)};
 
     EXPECT_TRUE(select_postable_tiers(candidates, classes, {}).empty());
+}
+
+// [S33 2026-09-12] The duplicate-slot finding at the level where the double
+// exposure actually happens: the filter posts a candidate whenever its slot is
+// in the whitelist, so an over-permissive whitelist IS a second live offer at
+// that price level.  The limiter must agree, as on every other branch.
+TEST(PostableTiers, ADuplicatedSlotWithAFailedLegPostsNothing)
+{
+    const std::vector<TierClassification> classes{
+        tier("a", TierStaleness::Stale, 0),
+        tier("b", TierStaleness::Stale, 0),   // same slot as "a"
+        tier("c", TierStaleness::Stale, 1),
+    };
+    const std::vector<std::string> cancelled_ids{"a", "c"};  // "b" failed
+
+    const std::vector<TierQuote> candidates{candidate(0), candidate(1)};
+
+    const auto postable = select_postable_tiers(candidates, classes,
+                                                cancelled_ids);
+
+    EXPECT_EQ(keys_of(postable), (std::set<std::string>{key(Side::Bid, 1)}))
+        << "tier 0 still holds \"b\" -- posting its replacement is the "
+           "double exposure, reached through the slot rather than the tier";
+    EXPECT_EQ(keys_of(postable),
+              charged_keys(candidates, classes, cancelled_ids));
 }
 
 // A Fresh tier is never reposted, whatever else happened this heartbeat.

@@ -1514,6 +1514,184 @@ TEST(ConfigParserTest, BboSanityPerPairOverrides_BoundaryOneIsAccepted) {
     EXPECT_DOUBLE_EQ(*cfg.pairs[0].bbo_sanity_max_aggressive_dev_override, 1.0);
 }
 
+// ============================================================================
+// [S33 2026-09-12] Per-pair activity / margin / spacing override PARSING.
+//
+// The behavioural tests for this family (test_activity_interpolation.cpp)
+// build the interpolation inputs directly and never open a YAML file, so
+// until now NOTHING drove these keys through load_config.  A key misspelled
+// in parse_pairs, an optional bound to the wrong field, or a dropped bound
+// would leave every one of those tests green while the deployed pair silently
+// fell back to the global strategy value -- on XCH/BYC that is the difference
+// between the Section I controller running and not existing at all.
+//
+// The bounds are NOT uniform, so each is pinned to what config.cpp actually
+// enforces rather than to a house rule:
+//   max_half_spread_bps_override             > 0
+//   min_profit_margin_max_bps_override       > 0
+//   tier_spacing_max_bps_override[i]         > 0   (per element)
+//   activity_target_fills_24h_override       > 0   (int)
+//   activity_book_weight_override            >= 0  (0 is legal)
+//   fair_value_residual_widen_ratio_override >= 0  (0 is legal AND engaged)
+//   activity_adaptive_spacing_override       bool  -- no range to violate
+//   competitive_anchor_enabled_override      bool  -- no range to violate
+// ============================================================================
+
+TEST(ConfigParserTest, S33ActivityOverrides_ExplicitValuesRoundTrip) {
+    TempYaml tmp(with_pair_extra(
+        "max_half_spread_bps_override: 5000.0\n"
+        "    min_profit_margin_max_bps_override: 800.0\n"
+        "    tier_spacing_max_bps_override: [600, 1200, 1900, 2700, 3600, 4800]\n"
+        "    activity_adaptive_spacing_override: true\n"
+        "    activity_target_fills_24h_override: 24\n"
+        "    activity_book_weight_override: 0.5\n"
+        "    competitive_anchor_enabled_override: false\n"
+        "    fair_value_residual_widen_ratio_override: 0.25"));
+    auto cfg = xop::load_config(tmp.path());
+    ASSERT_FALSE(cfg.pairs.empty());
+    const auto& pc = cfg.pairs[0];
+
+    ASSERT_TRUE(pc.max_half_spread_bps_override.has_value());
+    EXPECT_DOUBLE_EQ(*pc.max_half_spread_bps_override, 5000.0);
+    ASSERT_TRUE(pc.min_profit_margin_max_bps_override.has_value());
+    EXPECT_DOUBLE_EQ(*pc.min_profit_margin_max_bps_override, 800.0);
+
+    // The whole vector, not merely "a vector": a parser that read only the
+    // first element would still satisfy has_value() while the outer tiers of
+    // S_max silently reverted to the base ladder.
+    ASSERT_TRUE(pc.tier_spacing_max_bps_override.has_value());
+    ASSERT_EQ(pc.tier_spacing_max_bps_override->size(), 6u);
+    EXPECT_DOUBLE_EQ((*pc.tier_spacing_max_bps_override)[0], 600.0);
+    EXPECT_DOUBLE_EQ((*pc.tier_spacing_max_bps_override)[2], 1900.0);
+    EXPECT_DOUBLE_EQ((*pc.tier_spacing_max_bps_override)[5], 4800.0);
+
+    ASSERT_TRUE(pc.activity_adaptive_spacing_override.has_value());
+    EXPECT_TRUE(*pc.activity_adaptive_spacing_override);
+    ASSERT_TRUE(pc.activity_target_fills_24h_override.has_value());
+    EXPECT_EQ(*pc.activity_target_fills_24h_override, 24);
+    ASSERT_TRUE(pc.activity_book_weight_override.has_value());
+    EXPECT_DOUBLE_EQ(*pc.activity_book_weight_override, 0.5);
+
+    // Engaged-FALSE, not "unset".  This is the Section F knob: if a dropped
+    // binding left it nullopt the pair would fall back to the global
+    // competitive_anchor_enabled: true and the wide ladder would collapse
+    // back into a 45 bps staircase -- with every behavioural test passing.
+    ASSERT_TRUE(pc.competitive_anchor_enabled_override.has_value());
+    EXPECT_FALSE(*pc.competitive_anchor_enabled_override);
+
+    ASSERT_TRUE(pc.fair_value_residual_widen_ratio_override.has_value());
+    EXPECT_DOUBLE_EQ(*pc.fair_value_residual_widen_ratio_override, 0.25);
+}
+
+TEST(ConfigParserTest, S33ActivityOverrides_ReversedBoolPolarityRoundTrips) {
+    // The mirror of the test above: a parser that hard-coded either bool
+    // would pass one polarity and fail the other.
+    TempYaml tmp(with_pair_extra(
+        "activity_adaptive_spacing_override: false\n"
+        "    competitive_anchor_enabled_override: true"));
+    auto cfg = xop::load_config(tmp.path());
+    ASSERT_FALSE(cfg.pairs.empty());
+    ASSERT_TRUE(cfg.pairs[0].activity_adaptive_spacing_override.has_value());
+    EXPECT_FALSE(*cfg.pairs[0].activity_adaptive_spacing_override);
+    ASSERT_TRUE(cfg.pairs[0].competitive_anchor_enabled_override.has_value());
+    EXPECT_TRUE(*cfg.pairs[0].competitive_anchor_enabled_override);
+}
+
+TEST(ConfigParserTest, S33ActivityOverrides_AbsentMeansUnsetNotDefaulted) {
+    // Absence must be nullopt, NOT a default-constructed value: every
+    // consumption site in Step 7 is `override.value_or(strategy_value)`, so a
+    // defaulted optional would pin every pair to 0 / false and make the
+    // strategy-level setting unreachable.
+    TempYaml tmp(kMinimalValidYaml);
+    auto cfg = xop::load_config(tmp.path());
+    ASSERT_FALSE(cfg.pairs.empty());
+    const auto& pc = cfg.pairs[0];
+    EXPECT_FALSE(pc.max_half_spread_bps_override.has_value());
+    EXPECT_FALSE(pc.min_profit_margin_max_bps_override.has_value());
+    EXPECT_FALSE(pc.tier_spacing_max_bps_override.has_value());
+    EXPECT_FALSE(pc.activity_adaptive_spacing_override.has_value());
+    EXPECT_FALSE(pc.activity_target_fills_24h_override.has_value());
+    EXPECT_FALSE(pc.activity_book_weight_override.has_value());
+    EXPECT_FALSE(pc.competitive_anchor_enabled_override.has_value());
+    EXPECT_FALSE(pc.fair_value_residual_widen_ratio_override.has_value());
+}
+
+TEST(ConfigParserTest, S33ActivityOverrides_OutOfRangeValuesRejected) {
+    // Strictly positive knobs.  `.nan` is included only where the guard is
+    // written `!(v > 0.0)`, which catches it; it is deliberately NOT asserted
+    // against the `v < 0.0` guards, where NaN compares false and is accepted
+    // -- asserting there would pin behaviour this change does not implement.
+    for (const char* v : {"0", "0.0", "-1.0", ".nan"}) {
+        TempYaml tmp(with_pair_extra(
+            std::string("max_half_spread_bps_override: ") + v));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError)
+            << "max_half_spread_bps_override " << v;
+    }
+    for (const char* v : {"0", "0.0", "-800.0"}) {
+        TempYaml tmp(with_pair_extra(
+            std::string("min_profit_margin_max_bps_override: ") + v));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError)
+            << "min_profit_margin_max_bps_override " << v;
+    }
+    for (const char* v : {"0", "-24"}) {
+        TempYaml tmp(with_pair_extra(
+            std::string("activity_target_fills_24h_override: ") + v));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError)
+            << "activity_target_fills_24h_override " << v;
+    }
+    // These two are >= 0, so only the negative side is out of range.
+    for (const char* v : {"-0.5", "-1.0"}) {
+        TempYaml tmp(with_pair_extra(
+            std::string("activity_book_weight_override: ") + v));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError)
+            << "activity_book_weight_override " << v;
+    }
+    for (const char* v : {"-0.25", "-1.0"}) {
+        TempYaml tmp(with_pair_extra(
+            std::string("fair_value_residual_widen_ratio_override: ") + v));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError)
+            << "fair_value_residual_widen_ratio_override " << v;
+    }
+    // Per ELEMENT, not just the first: a bad maximum anywhere in S_max would
+    // run that tier's interpolation backwards.
+    for (const char* seq : {"[0, 1200, 1900]", "[600, -1200, 1900]",
+                            "[600, 1200, .nan]"}) {
+        TempYaml tmp(with_pair_extra(
+            std::string("tier_spacing_max_bps_override: ") + seq));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError)
+            << "tier_spacing_max_bps_override " << seq;
+    }
+}
+
+TEST(ConfigParserTest, S33ActivityOverrides_LegalZeroIsAcceptedAndEngaged) {
+    // 0.0 is legal for both of these AND must arrive ENGAGED, not read as a
+    // fallback to the global.  Section C turns on exactly this:
+    // fair_value_residual_widen_ratio_override: 0.0 is how XCH/BYC disables
+    // the Step 7 symmetric widener, and activity_book_weight_override: 0.0 is
+    // how it drives the activity score from realized fills alone.  A parser
+    // that treated 0.0 as "absent" would re-arm both globals.
+    TempYaml tmp(with_pair_extra(
+        "activity_book_weight_override: 0.0\n"
+        "    fair_value_residual_widen_ratio_override: 0.0"));
+    auto cfg = xop::load_config(tmp.path());
+    ASSERT_FALSE(cfg.pairs.empty());
+    ASSERT_TRUE(cfg.pairs[0].activity_book_weight_override.has_value());
+    EXPECT_DOUBLE_EQ(*cfg.pairs[0].activity_book_weight_override, 0.0);
+    ASSERT_TRUE(cfg.pairs[0].fair_value_residual_widen_ratio_override.has_value());
+    EXPECT_DOUBLE_EQ(*cfg.pairs[0].fair_value_residual_widen_ratio_override, 0.0);
+}
+
+TEST(ConfigParserTest, S33ActivityOverrides_EmptyMaxSpacingSequenceIsNotAnOverride) {
+    // Observed parser behaviour, pinned so it cannot drift unnoticed: the
+    // max-spacing block is gated on IsSequence() && size() > 0, so `[]` loads
+    // and leaves the optional UNSET (the pair keeps its base ladder) rather
+    // than installing an empty S_max for the Step 7 interpolation to index.
+    TempYaml tmp(with_pair_extra("tier_spacing_max_bps_override: []"));
+    auto cfg = xop::load_config(tmp.path());
+    ASSERT_FALSE(cfg.pairs.empty());
+    EXPECT_FALSE(cfg.pairs[0].tier_spacing_max_bps_override.has_value());
+}
+
 TEST(ConfigParserTest, SideQualityKnobs_ExplicitValuesParse) {
     TempYaml tmp(with_market_data(
         "  book_side_anchor_band_ratio: 2.5\n"

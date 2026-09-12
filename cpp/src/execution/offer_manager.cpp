@@ -23,6 +23,7 @@
 #include <xop/execution/offer_manager.hpp>
 
 #include <xop/execution/cancel_retry.hpp>
+#include <xop/execution/cross_guard.hpp>
 #include <xop/execution/wallet_poll_throttle.hpp>
 #include <xop/risk/watchdog.hpp>
 
@@ -1799,10 +1800,14 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
             }
             {
                 // Use BBO for crossing check (same logic as main branch).
+                // [S33 2026-09-12] Gated on the OPPOSITE touch alone -- see
+                // the twin block below, and cross_guard.hpp for why.
                 const auto bbo_snap  = state_->get_market(pair_name);
                 const double bbo_ask = static_cast<double>(bbo_snap.best_ask);
                 const double bbo_bid = static_cast<double>(bbo_snap.best_bid);
-                if (bbo_ask > 0.0 && bbo_bid > 0.0) {
+                const bool have_opposite = (po.side == Side::Bid)
+                    ? (bbo_ask > 0.0) : (bbo_bid > 0.0);
+                if (have_opposite) {
                     if (po.side == Side::Bid && old_p >= bbo_ask) {
                         tc.crossed = true;
                     } else if (po.side == Side::Ask && old_p <= bbo_bid) {
@@ -1855,19 +1860,31 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
         // a bid between mid and best_ask is a valid competitive bid, not a
         // crossed offer.  When BBO is unavailable, fall back to mid with a
         // generous buffer (5%) to avoid false positives.
+        //
+        // [S33 2026-09-12] Each side is gated on the OPPOSITE touch ALONE.
+        // Requiring both touches meant a one-sided book -- a standing bid
+        // with nothing offered, routine on dexie -- fell through to the
+        // +/-5% band, and that band is far too loose to catch a cross: an
+        // ask at 99 sitting on a bid of 100 passed as 99 >= 100*0.95.  The
+        // missing half of the book must not disable the half that is
+        // present.  Kept bit-identical to classify_cross_bbo in
+        // cross_guard.hpp, the pre-post guard for this same rule -- those
+        // two disagreeing is what S33 is about.
         {
             const auto bbo_snap  = state_->get_market(pair_name);
             const double bbo_ask = static_cast<double>(bbo_snap.best_ask);
             const double bbo_bid = static_cast<double>(bbo_snap.best_bid);
-            if (bbo_ask > 0.0 && bbo_bid > 0.0) {
-                // Full BBO available: real crossing check.
+            const bool have_opposite = (po.side == Side::Bid)
+                ? (bbo_ask > 0.0) : (bbo_bid > 0.0);
+            if (have_opposite) {
+                // The touch that could take this offer exists: real check.
                 if (po.side == Side::Bid && old_p >= bbo_ask) {
                     tc.crossed = true;
                 } else if (po.side == Side::Ask && old_p <= bbo_bid) {
                     tc.crossed = true;
                 }
             } else if (mid_price > 0) {
-                // BBO unavailable: fall back to mid +/-5% buffer.
+                // No opposite touch: fall back to mid +/-5% buffer.
                 constexpr double kCrossBuffer = 0.05;
                 if (po.side == Side::Bid && old_p > mid_p * (1.0 + kCrossBuffer)) {
                     tc.crossed = true;
@@ -1900,33 +1917,30 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
         //        tier 0 -> 0.50%   tier 1 -> 0.75%
         //        tier 2 -> 1.00%   tier 3 -> 1.25%
 
-        if (tc.crossed) {
-            // (1) Urgent: offer crossed mid-price.
-            tc.staleness = TierStaleness::Stale;
-        } else if (past_soft_ttl) {
-            // (2) Soft TTL zone: gentler threshold on old offers.
-            // On aged offers, any meaningful price movement in either direction
-            // triggers expiration so fresh quotes can be established.
-            if (tc.price_deviation > kSoftTtlAdverseThreshold) {
-                tc.staleness = TierStaleness::Expired;
-            } else {
-                tc.staleness = TierStaleness::Fresh;
-            }
-        } else if (age < kMinRefreshAgeBlocks) {
-            // (3) Very young offer: protect from churn.
-            tc.staleness = TierStaleness::Fresh;
-        } else {
-            // (4) Normal zone: tier-scaled adverse threshold, plus a favorable
-            // drift threshold (3x) so disconnected/stagnant offers get refreshed.
+        // [S33 2026-09-12] The four zones above are now selected by
+        // classify_tier_refresh (cross_guard.hpp).  Same order, same
+        // inequalities, same 3x favorable multiplier -- moved only so
+        // xop_tests can drive them: OfferManager cannot be constructed
+        // without a wallet RPC client, so nothing was covering this.
+        {
             const double tier_threshold = kSelectiveRefreshThreshold
                 * (1.0 + static_cast<double>(po.tier) * kTierThresholdScale);
-            constexpr double kFavorableDriftMultiplier = 3.0;
-            if (tc.adverse && tc.price_deviation > tier_threshold) {
-                tc.staleness = TierStaleness::Stale;
-            } else if (!tc.adverse && tc.price_deviation > tier_threshold * kFavorableDriftMultiplier) {
-                tc.staleness = TierStaleness::Stale;
-            } else {
-                tc.staleness = TierStaleness::Fresh;
+            switch (classify_tier_refresh(tc.crossed,
+                                          past_soft_ttl,
+                                          age < kMinRefreshAgeBlocks,
+                                          tc.adverse,
+                                          tc.price_deviation,
+                                          tier_threshold,
+                                          kSoftTtlAdverseThreshold)) {
+                case TierRefresh::Fresh:
+                    tc.staleness = TierStaleness::Fresh;
+                    break;
+                case TierRefresh::Stale:
+                    tc.staleness = TierStaleness::Stale;
+                    break;
+                case TierRefresh::Expired:
+                    tc.staleness = TierStaleness::Expired;
+                    break;
             }
         }
 

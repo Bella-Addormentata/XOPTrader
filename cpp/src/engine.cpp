@@ -229,14 +229,27 @@ std::unordered_set<std::string> select_repost_keys(
     const std::unordered_set<std::string> cancelled_id_set(
         cancelled_ids.begin(), cancelled_ids.end());
 
+    // [S33 2026-09-12] EVERY occupant of the slot, not one of them.  Two
+    // pending offers can share a (side, tier) slot after any earlier double
+    // post; admitting the slot because ONE of them was cancelled posts a
+    // replacement over the other, which is the exact double exposure this
+    // helper exists to prevent.  A Fresh occupant was never asked to cancel
+    // and is still live, so it vetoes its slot too.
     std::unordered_set<std::string> keys;
+    std::unordered_set<std::string> vetoed;
     for (const auto& tc : tier_classes) {
+        const std::string slot_key = std::to_string(static_cast<int>(tc.side))
+                                   + "_" + std::to_string(tc.tier_index);
         if (tc.staleness != execution::TierStaleness::Fresh
             && cancelled_id_set.count(tc.offer_id) > 0) {
-            keys.insert(std::to_string(static_cast<int>(tc.side))
-                        + "_" + std::to_string(tc.tier_index));
+            keys.insert(slot_key);
+        } else {
+            vetoed.insert(slot_key);
         }
     }
+    // Applied after the classification loop, not inside it: either leg of a
+    // shared slot may be visited first.
+    for (const auto& vetoed_key : vetoed) keys.erase(vetoed_key);
     return keys;
 }
 
@@ -257,17 +270,16 @@ std::unordered_set<std::string> select_resting_keys(
                         + "_" + std::to_string(tc.tier_index));
         }
     }
-    // [S33-LIMITER 2026-09-05] One slot, two pending offers, disagreeing
-    // cancels: resolve toward CHARGING.  select_repost_keys whitelists that
-    // key for repost, so leaving it here would post a tier the budget never
-    // reserved for.  Second pass rather than one, because either leg may be
-    // visited first.
-    for (const auto& tc : tier_classes) {
-        if (cancelled_id_set.count(tc.offer_id) > 0) {
-            keys.erase(std::to_string(static_cast<int>(tc.side))
-                       + "_" + std::to_string(tc.tier_index));
-        }
-    }
+    // [S33 2026-09-12] The second pass that used to follow -- erasing any
+    // slot with a cancelled leg, "resolving toward CHARGING" -- is gone with
+    // the rule it compensated for.  select_repost_keys no longer admits a
+    // slot on one cancelled leg, so the slot it erased is not reposted; all
+    // the erase did was charge the budget for a slot nothing is posted into
+    // while the failed leg's coins really are still locked out of
+    // spendable_balance, i.e. double-count them.  The invariant survives
+    // directly: a slot is repostable only when NO occupant is uncancelled,
+    // and such a slot is not resting here, so posted stays a subset of
+    // charged.
     return keys;
 }
 
@@ -382,6 +394,26 @@ NodeHealthFlags node_health_flags(bool reachable,
     flags.synced    = reachable && node_reports_synced;
     flags.syncing   = reachable && node_reports_syncing;
     return flags;
+}
+
+// [S33 2026-09-12] See the contract in engine.hpp.  Freshness, not selection:
+// a syncing node answers every probe while staying behind the wallet, so
+// asking "is the node the height source?" reported it disconnected for the
+// whole catch-up.  Asking "did a probe answer recently?" reports it connected
+// and syncing, and still refuses to republish a cached reading once the
+// answers stop.
+bool node_probe_is_live(bool                                  node_client_open,
+                        std::chrono::steady_clock::time_point last_probe,
+                        std::chrono::steady_clock::time_point now,
+                        std::chrono::seconds                  liveness_window)
+{
+    if (!node_client_open) return false;
+    // Never probed in this run: the cached sync flags are still their
+    // zero-initialised defaults and mean nothing about this node.
+    if (last_probe == std::chrono::steady_clock::time_point{}) return false;
+    // A `now` before the probe is a clock oddity, not evidence of staleness.
+    if (now < last_probe) return true;
+    return (now - last_probe) <= liveness_window;
 }
 
 // ===========================================================================
@@ -2447,6 +2479,12 @@ asio::awaitable<void> Engine::poll_loop_coro()
                         }
                         const std::int64_t probe =
                             co_await full_node_->get_block_height();
+                        // [S33 2026-09-12] It ANSWERED.  Stamped before the
+                        // acceptance rule below, which is about whether the
+                        // answer is usable as a HEIGHT -- a node catching up
+                        // is rejected there and is reachable all the same,
+                        // and that is the state the gauges used to deny.
+                        node_last_probe_ = std::chrono::steady_clock::now();
                         // Answering is not the same as being usable. A node
                         // resyncing from genesis answers every poll with a
                         // height far BELOW the wallet's; counting those as
@@ -2512,6 +2550,9 @@ asio::awaitable<void> Engine::poll_loop_coro()
             } else {
                 try {
                     height = co_await full_node_->get_block_height();
+                    // [S33 2026-09-12] Reachability, stamped on the answer
+                    // itself -- not on the usable/progressing verdict below.
+                    node_last_probe_ = std::chrono::steady_clock::now();
                     // [review] USABLE, not merely non-negative. A stale or
                     // malformed node answers every poll with a height that
                     // is rejected below -- but counting it as a success
@@ -2796,6 +2837,10 @@ asio::awaitable<void> Engine::run_startup_analysis()
                         }
                         const auto probe =
                             co_await full_node_->get_block_height();
+                        // [S33 2026-09-12] Same as the main loop's recovery
+                        // probe: answering is reachability, whatever the
+                        // acceptance rule below makes of the height.
+                        node_last_probe_ = std::chrono::steady_clock::now();
                         // [review round 11] The main loop's acceptance
                         // rule, against the ANALYSIS-local last height.
                         // `probe >= height` compared against the wallet
@@ -2844,6 +2889,7 @@ asio::awaitable<void> Engine::run_startup_analysis()
                 }
             } else {
                 height = co_await full_node_->get_block_height();
+                node_last_probe_ = std::chrono::steady_clock::now();
             }
         } catch (const std::exception& ex) {
             height_error = ex.what();
@@ -2999,8 +3045,13 @@ asio::awaitable<void> Engine::run_startup_analysis()
             const auto node_sync =
                 full_node_ ? full_node_->last_sync_state()
                            : rpc::ChiaFullNodeRPC::SyncState{};
+            // [S33 2026-09-12] `!ask_wallet_first && !height_failed` asked
+            // which RPC served THIS poll's height, which is selection, not
+            // reachability: once analysis settles on the wallet fallback,
+            // ask_wallet_first is true on every poll and the node read as
+            // disconnected even as its recovery probes were answering.
             const auto node_flags = node_health_flags(
-                !ask_wallet_first && !height_failed,
+                node_probe_live_now(),
                 node_sync.synced, node_sync.syncing);
             SystemHealthSnapshot health;
             health.block_height     = current_block;
@@ -17796,6 +17847,16 @@ void Engine::step_update_pnl(BlockHeight block_height)
 }
 
 // Step 12: Export metrics to Prometheus.
+// [S33 2026-09-12] See the contract in engine.hpp.  One rule, one place:
+// this is the `reachable` both exporters pass to node_health_flags().
+bool Engine::node_probe_live_now() const
+{
+    return node_probe_is_live(
+        !wallet_only_configured_ && full_node_ && full_node_->is_open(),
+        node_last_probe_,
+        std::chrono::steady_clock::now());
+}
+
 void Engine::step_export_metrics(BlockHeight block_height)
 {
     if (!metrics_->is_running()) return;
@@ -17869,11 +17930,14 @@ void Engine::step_export_metrics(BlockHeight block_height)
     const auto node_sync = full_node_
                                ? full_node_->last_sync_state()
                                : rpc::ChiaFullNodeRPC::SyncState{};
+    // [S33 2026-09-12] The height-source clause that used to sit here
+    // (`&& height_source_.current == FullNode`, with the wallet_only_mode_
+    // latch it moves in step with) denied reachability for the whole of an
+    // auto fallback -- including the catch-up during which the node answers
+    // every probe.  Freshness carries the anti-stale property instead; see
+    // node_probe_is_live().
     const auto node_flags = node_health_flags(
-        !wallet_only_configured_
-            && !wallet_only_mode_
-            && (full_node_ && full_node_->is_open())
-            && height_source_.current == risk::HeightSource::FullNode,
+        node_probe_live_now(),
         node_sync.synced, node_sync.syncing);
     health.node_connected   = node_flags.connected;
     health.node_synced      = node_flags.synced;

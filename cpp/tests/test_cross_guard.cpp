@@ -13,6 +13,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cmath>
 #include <limits>
 #include <utility>
 
@@ -20,7 +21,9 @@
 
 using xop::execution::classify_cross_bbo;
 using xop::execution::classify_cross_published_mid;
+using xop::execution::classify_tier_refresh;
 using xop::execution::CrossVerdict;
+using xop::execution::TierRefresh;
 
 namespace {
 constexpr bool kBid = false;
@@ -190,14 +193,71 @@ TEST(CrossGuard, NoBboFallsBackToTheMidWithTheCancellersFivePercentBuffer)
               CrossVerdict::Crossed);
 }
 
-TEST(CrossGuard, OneSidedBooksUseTheFallbackNotHalfABbo)
+TEST(CrossGuard, OneSidedBooksFallBackOnlyWhenTheRelevantTouchIsMissing)
 {
-    // A single side is not a BBO. Judging against half of one would invent
-    // a reference the book does not contain.
+    // [S33 2026-09-12] A bid is judged against best_ask and an ask against
+    // best_bid, so the touch missing in each of these is precisely the one
+    // that mattered, and the mid band is all that is left to judge with.
     EXPECT_TRUE(classify_cross_bbo(kBid, 100.0, kBestBid, 0.0, kMid)
-                    .used_mid_fallback);
+                    .used_mid_fallback) << "a bid with no best_ask";
     EXPECT_TRUE(classify_cross_bbo(kAsk, 100.0, 0.0, kBestAsk, kMid)
-                    .used_mid_fallback);
+                    .used_mid_fallback) << "an ask with no best_bid";
+}
+
+TEST(CrossGuard, AOneSidedBookStillCatchesACrossAgainstTheTouchThatExists)
+{
+    // [S33 2026-09-12] THE FINDING, in the reviewer's exact numbers. An ask
+    // at 99 with a standing bid of 100 and nothing offered is liftable the
+    // instant it is posted. The old rule demanded BOTH touches, so it fell
+    // through to the +/-5% band, asked 99 < 100*0.95 = 95, answered no, and
+    // posted the crossed ask. This is the LIVE suppression gate as of
+    // PR #148, and one-sided books are the condition PR #148 exists for.
+    const auto ask = classify_cross_bbo(kAsk, 99.0, /*best_bid=*/100.0,
+                                        /*best_ask=*/0.0, /*mid=*/100.0);
+    EXPECT_EQ(ask.verdict, CrossVerdict::Crossed);
+    EXPECT_FALSE(ask.used_mid_fallback)
+        << "best_bid is present, so the band is not the reference here";
+    EXPECT_FALSE(ask.book_inverted)
+        << "inversion is a claim about two touches; there is only one";
+
+    // The mirror: a bid at 101 lifting a lone offer at 100.
+    const auto bid = classify_cross_bbo(kBid, 101.0, /*best_bid=*/0.0,
+                                        /*best_ask=*/100.0, /*mid=*/100.0);
+    EXPECT_EQ(bid.verdict, CrossVerdict::Crossed);
+    EXPECT_FALSE(bid.used_mid_fallback);
+}
+
+TEST(CrossGuard, AOneSidedBookStillPassesAQuoteThatDoesNotCrossIt)
+{
+    // The fix must not collapse into "one side missing -> suppress
+    // everything": an ask above the lone bid is a perfectly good quote.
+    // The canceller's NON-STRICT inequality has to survive the change too.
+    EXPECT_EQ(classify_cross_bbo(kAsk, 101.0, 100.0, 0.0, kMid).verdict,
+              CrossVerdict::Ok);
+    EXPECT_EQ(classify_cross_bbo(kAsk, 100.0, 100.0, 0.0, kMid).verdict,
+              CrossVerdict::Crossed) << "at the touch is crossed, not Ok";
+    EXPECT_EQ(classify_cross_bbo(kBid, 99.0, 0.0, 100.0, kMid).verdict,
+              CrossVerdict::Ok);
+    EXPECT_EQ(classify_cross_bbo(kBid, 100.0, 0.0, 100.0, kMid).verdict,
+              CrossVerdict::Crossed);
+}
+
+TEST(CrossGuard, TheIrrelevantTouchNeitherDecidesNorDisablesTheDecision)
+{
+    // Whatever the SAME-side touch does -- absent, present, inverted or
+    // junk -- it must neither move the verdict nor push us to the fallback.
+    for (const double other : {0.0, 101.0, 98.0, kNaN, kInf}) {
+        const auto r = classify_cross_bbo(kAsk, 99.0, /*best_bid=*/100.0,
+                                          other, kMid);
+        EXPECT_EQ(r.verdict, CrossVerdict::Crossed) << "best_ask=" << other;
+        EXPECT_FALSE(r.used_mid_fallback) << "best_ask=" << other;
+    }
+    for (const double other : {0.0, 99.0, 102.0, kNaN, kInf}) {
+        const auto r = classify_cross_bbo(kBid, 101.0, other,
+                                          /*best_ask=*/100.0, kMid);
+        EXPECT_EQ(r.verdict, CrossVerdict::Crossed) << "best_bid=" << other;
+        EXPECT_FALSE(r.used_mid_fallback) << "best_bid=" << other;
+    }
 }
 
 TEST(CrossGuard, NoReferenceAtAllDecidesNothing)
@@ -218,11 +278,17 @@ TEST(CrossGuard, NoReferenceAtAllDecidesNothing)
     }
 }
 
-TEST(CrossGuard, NonFiniteBboFallsBackRatherThanTrusting)
+TEST(CrossGuard, ANonFiniteRelevantTouchFallsBackRatherThanTrusting)
 {
-    const auto r = classify_cross_bbo(kBid, 100.0, kNaN, kBestAsk, kMid);
-    EXPECT_TRUE(r.used_mid_fallback)
-        << "a non-finite touch is not a BBO; use the documented fallback";
+    // [S33 2026-09-12] The touch that has to be finite is the one being
+    // judged against: best_ask for a bid, best_bid for an ask.
+    EXPECT_TRUE(classify_cross_bbo(kBid, 100.0, kBestBid, kNaN, kMid)
+                    .used_mid_fallback)
+        << "a non-finite touch is not a touch; use the documented fallback";
+    EXPECT_TRUE(classify_cross_bbo(kAsk, 100.0, kNaN, kBestAsk, kMid)
+                    .used_mid_fallback);
+    EXPECT_TRUE(classify_cross_bbo(kBid, 100.0, kBestBid, kInf, kMid)
+                    .used_mid_fallback) << "infinite likewise";
 }
 
 // -- The legacy rule, pinned as a fixed reference ---------------------------
@@ -290,4 +356,151 @@ TEST(CrossGuard, TheLiveVerdictMovesWithTheBookAndTheLegacyOneDoesNot)
         EXPECT_EQ(classify_cross_published_mid(kBid, px, kMid), legacy)
             << "the legacy reference must not move with the book";
     }
+}
+
+// -- The canceller's refresh zones ------------------------------------------
+//
+// [S33 2026-09-12] classify_tier_refresh was lifted out of
+// OfferManager::classify_tier_staleness, which no test could reach: the
+// class will not construct without an io_context, a wallet RPC client, a
+// Dexie client and the shared State. Nothing covered the zone ORDER, the
+// tier threshold, or the 3x favorable multiplier -- any of which could be
+// changed without a single test failing.
+
+namespace {
+// kSelectiveRefreshThreshold at tier 0, and kSoftTtlAdverseThreshold.
+constexpr double kTierThreshold = 0.010;
+constexpr double kSoftTtl       = 0.02;
+
+struct Drift {
+    double deviation;
+    bool   adverse;
+};
+
+/// Mirrors classify_tier_staleness's own deviation arithmetic so the cases
+/// below read as "a live bid of 100 whose optimal moved to 97" rather than
+/// as pre-digested booleans -- the sign convention (a bid is adverse when
+/// the optimal FALLS, an ask when it RISES) is half of the contract.
+[[nodiscard]] Drift drift_of(bool is_ask, double live_px, double optimal_px)
+{
+    const double signed_dev = (optimal_px - live_px) / live_px;
+    return Drift{std::abs(signed_dev),
+                 is_ask ? (signed_dev > 0.0) : (signed_dev < 0.0)};
+}
+
+[[nodiscard]] TierRefresh refresh_of(bool is_ask, double live_px,
+                                     double optimal_px, bool below_min_age)
+{
+    const Drift d = drift_of(is_ask, live_px, optimal_px);
+    return classify_tier_refresh(/*crossed=*/false, /*past_soft_ttl=*/false,
+                                 below_min_age, d.adverse, d.deviation,
+                                 kTierThreshold, kSoftTtl);
+}
+}  // namespace
+
+TEST(TierRefresh, AdverseDriftRefreshesPastTheTierThresholdOnBothSides)
+{
+    // Adverse = the market moved against the live quote: the new optimal
+    // bid is BELOW ours (we are overpaying), the new optimal ask is ABOVE
+    // ours (we are underselling). Tier 0 tolerates 1%.
+    EXPECT_EQ(refresh_of(kBid, 100.0, 98.5, false), TierRefresh::Stale)
+        << "bid 1.5% too high";
+    EXPECT_EQ(refresh_of(kBid, 100.0, 99.5, false), TierRefresh::Fresh)
+        << "bid 0.5% too high -- inside the threshold";
+    EXPECT_EQ(refresh_of(kAsk, 100.0, 101.5, false), TierRefresh::Stale)
+        << "ask 1.5% too low";
+    EXPECT_EQ(refresh_of(kAsk, 100.0, 100.5, false), TierRefresh::Fresh)
+        << "ask 0.5% too low -- inside the threshold";
+
+    // The inequality is strict. Pinned exactly rather than with a nearby
+    // decimal that rounding could drop on either side of the boundary.
+    EXPECT_EQ(classify_tier_refresh(false, false, false, /*adverse=*/true,
+                                    kTierThreshold, kTierThreshold, kSoftTtl),
+              TierRefresh::Fresh) << "exactly at the threshold is not past it";
+    EXPECT_EQ(classify_tier_refresh(false, false, false, true,
+                                    std::nextafter(kTierThreshold, 1.0),
+                                    kTierThreshold, kSoftTtl),
+              TierRefresh::Stale) << "one ulp past it is";
+}
+
+TEST(TierRefresh, FavorableDriftIsToleratedThreeTimesFurther)
+{
+    // THE UNTESTED BRANCH. Favorable = the quote drifted in OUR favour (the
+    // optimal bid rose above our live bid; the optimal ask fell below our
+    // live ask). It is still earning, so it is refreshed only past 3x the
+    // threshold -- 3% at tier 0 -- instead of at 1%.
+    EXPECT_EQ(refresh_of(kBid, 100.0, 102.0, false), TierRefresh::Fresh)
+        << "bid 2% conservative: past 1x but not 3x -- keep it";
+    EXPECT_EQ(refresh_of(kBid, 100.0, 104.0, false), TierRefresh::Stale)
+        << "bid 4% conservative: disconnected, refresh it";
+    EXPECT_EQ(refresh_of(kAsk, 100.0, 98.0, false), TierRefresh::Fresh);
+    EXPECT_EQ(refresh_of(kAsk, 100.0, 96.0, false), TierRefresh::Stale);
+
+    // The multiplier itself, to the ulp on both sides: 2x or 4x in place of
+    // 3x fails here, and so does relaxing '>' to '>='.
+    EXPECT_EQ(classify_tier_refresh(false, false, false, /*adverse=*/false,
+                                    kTierThreshold * 3.0,
+                                    kTierThreshold, kSoftTtl),
+              TierRefresh::Fresh) << "exactly 3x is not past 3x";
+    EXPECT_EQ(classify_tier_refresh(false, false, false, false,
+                                    std::nextafter(kTierThreshold * 3.0, 1.0),
+                                    kTierThreshold, kSoftTtl),
+              TierRefresh::Stale) << "one ulp past 3x is";
+    // ... and the widening is real: the same drift, adverse, refreshes.
+    EXPECT_EQ(classify_tier_refresh(false, false, false, /*adverse=*/true,
+                                    kTierThreshold * 2.0,
+                                    kTierThreshold, kSoftTtl),
+              TierRefresh::Stale);
+}
+
+TEST(TierRefresh, TheMinimumAgeGuardOutranksDriftButNotACross)
+{
+    // A young offer is protected from churn: the cancel+recreate round trip
+    // costs more than the adverse selection it would avoid. Both sides,
+    // both directions.
+    EXPECT_EQ(refresh_of(kBid, 100.0, 90.0, /*below_min_age=*/true),
+              TierRefresh::Fresh) << "10% adverse, but too young to touch";
+    EXPECT_EQ(refresh_of(kAsk, 100.0, 110.0, true), TierRefresh::Fresh);
+    EXPECT_EQ(refresh_of(kAsk, 100.0, 50.0, true), TierRefresh::Fresh)
+        << "50% favorable, still too young";
+
+    // Past the guard the very same drifts refresh -- without this half the
+    // test above would also pass against a function that never says Stale.
+    EXPECT_EQ(refresh_of(kBid, 100.0, 90.0, false), TierRefresh::Stale);
+    EXPECT_EQ(refresh_of(kAsk, 100.0, 110.0, false), TierRefresh::Stale);
+    EXPECT_EQ(refresh_of(kAsk, 100.0, 50.0, false), TierRefresh::Stale);
+
+    // A cross bypasses the guard. That ordering is why `crossed` is tested
+    // first, and it is what ties this predicate to classify_cross_bbo --
+    // the two halves of one decision, which is why they share this header.
+    EXPECT_EQ(classify_tier_refresh(/*crossed=*/true, /*past_soft_ttl=*/false,
+                                    /*below_min_age=*/true, /*adverse=*/false,
+                                    /*price_deviation=*/0.0,
+                                    kTierThreshold, kSoftTtl),
+              TierRefresh::Stale);
+}
+
+TEST(TierRefresh, PastTheSoftTtlDirectionStopsMatteringAndTheVerdictIsExpired)
+{
+    // On an aged offer any meaningful movement ends it, either direction --
+    // and as Expired, which is a different cancel reason from Stale.
+    EXPECT_EQ(classify_tier_refresh(false, /*past_soft_ttl=*/true, false,
+                                    /*adverse=*/false, 0.05,
+                                    kTierThreshold, kSoftTtl),
+              TierRefresh::Expired);
+    EXPECT_EQ(classify_tier_refresh(false, true, false, /*adverse=*/true,
+                                    0.05, kTierThreshold, kSoftTtl),
+              TierRefresh::Expired);
+    // A still well-priced old offer is kept rather than churned.
+    EXPECT_EQ(classify_tier_refresh(false, true, false, true, 0.01,
+                                    kTierThreshold, kSoftTtl),
+              TierRefresh::Fresh);
+    EXPECT_EQ(classify_tier_refresh(false, true, false, false,
+                                    std::nextafter(kSoftTtl, 1.0),
+                                    kTierThreshold, kSoftTtl),
+              TierRefresh::Expired) << "one ulp past the soft-TTL threshold";
+    // The soft-TTL zone outranks the minimum-age guard below it.
+    EXPECT_EQ(classify_tier_refresh(false, true, /*below_min_age=*/true,
+                                    true, 0.05, kTierThreshold, kSoftTtl),
+              TierRefresh::Expired);
 }

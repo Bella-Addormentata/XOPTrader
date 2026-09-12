@@ -32,8 +32,11 @@
 // itself. The legacy predicate is kept only so the tests can pin what the
 // old rule did and measure the S33 change against it.
 //
-// Pure header, no engine types, so both predicates are driven directly by
-// cpp/tests/test_cross_guard.cpp.
+// It also carries classify_tier_refresh, the canceller's zone selection,
+// for the reason given above that function.
+//
+// Pure header, no engine types, so every predicate here is driven directly
+// by cpp/tests/test_cross_guard.cpp.
 // ---------------------------------------------------------------------------
 
 #include <cmath>
@@ -87,7 +90,23 @@ struct BboCrossCheck {
 /// rather than an artifact of two nearly-similar rules.
 ///
 /// Bid crosses iff price >= best_ask; ask crosses iff price <= best_bid.
-/// With no BBO, fall back to the published mid with a 5% buffer.
+/// Each side is judged against the OPPOSITE touch ALONE: a bid needs only
+/// best_ask, an ask needs only best_bid. The +/-5% published-mid band is
+/// the fallback for a missing RELEVANT touch, not for a missing full BBO.
+///
+/// [S33 2026-09-12] It used to demand BOTH touches before it would reach
+/// either verdict, so a one-sided book fell straight through to the mid
+/// band -- which is far too loose to catch a cross. An ask at 99 against a
+/// standing bid of 100, with no best_ask at all, is plainly liftable, yet
+/// the band asked 99 < 100*0.95 = 95, answered no, and the ask got posted
+/// into the bid. One-sided and asymmetric books are the exact condition
+/// this gate exists for (it is the live suppression gate at engine.cpp
+/// Step 8 since PR #148), so the missing half of the book must not
+/// disable the half that is present.
+///
+/// book_inverted still requires both touches: it is a claim about the
+/// book, not about one quote, and with one touch there is nothing to
+/// invert. It stays reported-not-special-cased for the reason above.
 [[nodiscard]] inline BboCrossCheck classify_cross_bbo(
     bool   is_ask,
     double price,
@@ -99,10 +118,14 @@ struct BboCrossCheck {
     if (!(price > 0.0) || !std::isfinite(price)) {
         return r;
     }
-    const bool have_bbo = best_bid > 0.0 && best_ask > 0.0
-                       && std::isfinite(best_bid) && std::isfinite(best_ask);
-    if (have_bbo) {
-        r.book_inverted = best_bid >= best_ask;
+    const bool have_bid = best_bid > 0.0 && std::isfinite(best_bid);
+    const bool have_ask = best_ask > 0.0 && std::isfinite(best_ask);
+    r.book_inverted = have_bid && have_ask && best_bid >= best_ask;
+
+    // The touch on the other side of the book -- the one that could take
+    // this quote the moment it is posted. Only that one gates the verdict.
+    const bool have_opposite = is_ask ? have_bid : have_ask;
+    if (have_opposite) {
         r.verdict = is_ask ? (price <= best_bid ? CrossVerdict::Crossed
                                                 : CrossVerdict::Ok)
                            : (price >= best_ask ? CrossVerdict::Crossed
@@ -130,6 +153,78 @@ struct BboCrossCheck {
         case CrossVerdict::Indeterminate: break;
     }
     return "indeterminate";
+}
+
+// ---------------------------------------------------------------------------
+// [S33 2026-09-12] THE CANCELLER'S REFRESH ZONES, lifted out so they can be
+// driven from a test.
+//
+// classify_tier_staleness is a member of OfferManager, which cannot be
+// constructed without an io_context, a wallet RPC client, a Dexie client and
+// the shared State -- i.e. not from xop_tests. Its zone selection is
+// nonetheless pure arithmetic on numbers the caller already has, so it lives
+// here and offer_manager.cpp calls it. Same move the repo already made for
+// select_repost_keys and shift_schedule_to_floor in engine.hpp.
+//
+// It sits in this header rather than a new one because it is the OTHER half
+// of the same decision: classify_tier_staleness computes `crossed` with the
+// predicate above and then picks a zone with the predicate below, and the
+// two drifting apart is the bug class this whole file documents.
+// ---------------------------------------------------------------------------
+
+/// How much further a FAVORABLE drift is tolerated than an adverse one
+/// before the offer is refreshed. A quote that drifted in our favour is
+/// still earning; only a gross disconnect is worth the cancel+repost fee.
+inline constexpr double kFavorableDriftMultiplier = 3.0;
+
+/// Mirrors TierStaleness (offer_manager.hpp). Restated rather than included
+/// so this header stays free of engine types and the tests stay pure.
+enum class TierRefresh {
+    Fresh,    ///< keep the offer live
+    Stale,    ///< cancel and repost at the new price
+    Expired,  ///< aged out; cancel regardless of price
+};
+
+/// The zone selection of classify_tier_staleness, in its own order. The
+/// order is the contract: a cross outranks every age guard, and the soft-TTL
+/// zone outranks the minimum-age guard.
+///
+/// @param crossed             from classify_cross_bbo, above.
+/// @param past_soft_ttl       age >= ttl_blocks.
+/// @param below_min_age       age < kMinRefreshAgeBlocks.
+/// @param adverse             the drift makes our quote more generous.
+/// @param price_deviation     ABSOLUTE fractional deviation from optimal.
+/// @param tier_threshold      kSelectiveRefreshThreshold x (1 + tier x scale).
+/// @param soft_ttl_threshold  kSoftTtlAdverseThreshold.
+[[nodiscard]] inline TierRefresh classify_tier_refresh(
+    bool   crossed,
+    bool   past_soft_ttl,
+    bool   below_min_age,
+    bool   adverse,
+    double price_deviation,
+    double tier_threshold,
+    double soft_ttl_threshold) noexcept
+{
+    // (1) Crossed: urgent, ahead of every age guard.
+    if (crossed) {
+        return TierRefresh::Stale;
+    }
+    // (2) Soft TTL zone: an aged offer refreshes on any meaningful drift,
+    //     in either direction, and expires rather than going merely stale.
+    if (past_soft_ttl) {
+        return price_deviation > soft_ttl_threshold ? TierRefresh::Expired
+                                                    : TierRefresh::Fresh;
+    }
+    // (3) Too young: the cancel+recreate round trip costs more than the
+    //     adverse selection it would avoid.
+    if (below_min_age) {
+        return TierRefresh::Fresh;
+    }
+    // (4) Normal zone: tier-scaled threshold, widened for favorable drift.
+    const double limit = adverse
+        ? tier_threshold
+        : tier_threshold * kFavorableDriftMultiplier;
+    return price_deviation > limit ? TierRefresh::Stale : TierRefresh::Fresh;
 }
 
 }  // namespace xop::execution
