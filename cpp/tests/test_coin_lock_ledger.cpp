@@ -17,6 +17,9 @@ using xop::execution::reserve_bulk_cancel;
 constexpr Mojo kXch = 1'000'000'000'000LL;
 constexpr Mojo kFee = 28'922;  // the live per-offer fee from the incident
 constexpr Mojo kBatchFee = 10'000'000;  // live current_fee_mojos_, per batch
+// The live wallet refusal text, verbatim (take_retry.hpp classifies it).
+constexpr const char* kSweepRefusal =
+    "Wallet needs to be fully synced before making transactions.";
 
 TEST(CoinLockLedgerTest, ReplaysTheIncidentBatchExactly) {
     // [XCH-LOCK-LEDGER 2026-08-23] 2026-08-23 13:48:58Z: spendable was
@@ -325,6 +328,82 @@ TEST(CoinLockLedgerTest, BulkCancelDrainLeavesLessRoomForTheNextOffer) {
     EXPECT_EQ(ledger.remaining(), 6 * kXch);
     EXPECT_FALSE(ledger.try_lock(kXch, 0));   // floor refuses; cap is fine
     EXPECT_EQ(ledger.remaining(), 6 * kXch);  // a refusal locks nothing
+}
+
+// ---------------------------------------------------------------------------
+// [S33 2026-09-12] A REFUSED WALLET-WIDE SWEEP MUST SURVIVE THE PER-ID
+// FALLBACK.
+//
+// cancel_all sends cancel_all:true.  When that wallet-wide sweep is REFUSED
+// but the local book is NOT empty, cancel_all falls back to cancelling each
+// tracked id -- and cancel_ids() returns a FRESH CancelOutcome.  Assigning it
+// (`out = co_await cancel_ids(...)`) discarded sweep_refused wholesale, so a
+// fallback that succeeded produced `failed` empty and sweep_refused false:
+// CancelLadder::record() took its Done branch, clean() returned true, and
+// shutdown logged "All outstanding offers cancelled" after a sweep the wallet
+// had REFUSED.  The per-id leg can never reach the untracked book the sweep
+// was refused over, so its success proves nothing about it.
+//
+// MUTATION CHECK, run 2026-09-12, each defect reinstated exactly and alone:
+//   M13  drop `fallback.sweep_refused = true;` (i.e. the plain assignment
+//        the fold replaced)   -> BOTH tests below FAIL, on sweep_refused and
+//                               on all_cancelled().
+//   M14  restore [S46]'s extra `&& !fallback.failed.empty()` guard on the
+//        last_error carry     -> TheFallbacksFreshOutcomeCannotDropTheRefusal
+//                               FAILS: the refusal reaches the operator with
+//                               no text at all, which is the one case where
+//                               it is the only thing that went wrong.
+//   M15  carry the bulk text unconditionally (drop the empty check)
+//                             -> ThePerIdLoopsOwnFailureTextWins FAILS: the
+//                               sweep's sync refusal overwrites the funding
+//                               refusal the per-id loop actually hit, and
+//                               worst_class with it.
+//
+// WHAT THIS DOES NOT REACH, stated plainly rather than implied away: nothing
+// in cpp/tests constructs an OfferManager (S36), so cancel_all's WIRING has
+// no coverage.  Reinstating the deleted `if (all_offers.empty()) co_return
+// out;` early return, or sizing the reservation from the tracked count alone,
+// leaves every test in this file green.  Those lines were verified by
+// reading, not by ctest.
+// ---------------------------------------------------------------------------
+
+TEST(CancelOutcomeFoldTest, TheFallbacksFreshOutcomeCannotDropTheRefusal) {
+    // The per-id leg was handed every tracked id and every one went through,
+    // so it knows nothing of the sweep and its `failed` is empty.  That is
+    // exactly the outcome that used to read as a clean shutdown.
+    OfferManager::CancelOutcome fallback;
+    fallback.cancelled = {"offer-a", "offer-b"};
+
+    const auto out =
+        OfferManager::fold_refused_sweep(fallback, kSweepRefusal);
+
+    EXPECT_TRUE(out.sweep_refused);
+    EXPECT_FALSE(out.all_cancelled())
+        << "an empty `failed` after a REFUSED sweep is not success";
+    EXPECT_EQ(out.last_error, kSweepRefusal)
+        << "the refusal is the only thing that went wrong here; reporting it "
+           "with no text leaves the operator nothing to read";
+    EXPECT_EQ(out.worst_class, xop::execution::TakeFailureClass::Unsynced);
+    // The fallback's own work is kept, not thrown away with the assignment.
+    EXPECT_EQ(out.cancelled.size(), 2u);
+}
+
+TEST(CancelOutcomeFoldTest, ThePerIdLoopsOwnFailureTextWins) {
+    // When the per-id leg failed too, ITS text is the operator-facing one:
+    // the sweep's self-clearing sync refusal must not overwrite a funding
+    // refusal, which is the class that earns the short leash.
+    OfferManager::CancelOutcome fallback;
+    fallback.failed      = {"offer-c"};
+    fallback.last_error  = "insufficient funds in wallet 8";
+    fallback.worst_class = xop::execution::TakeFailureClass::Funding;
+
+    const auto out =
+        OfferManager::fold_refused_sweep(fallback, kSweepRefusal);
+
+    EXPECT_TRUE(out.sweep_refused);
+    EXPECT_EQ(out.last_error, "insufficient funds in wallet 8");
+    EXPECT_EQ(out.worst_class, xop::execution::TakeFailureClass::Funding);
+    EXPECT_FALSE(out.all_cancelled());
 }
 
 // ---------------------------------------------------------------------------

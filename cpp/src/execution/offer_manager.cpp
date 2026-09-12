@@ -1242,18 +1242,87 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(
     CancelOutcome out;
 
     auto all_offers = state_->get_all_offers();
-    if (all_offers.empty()) {
-        logger_->info("cancel_all: no pending offers to cancel");
-        co_return out;
-    }
+    // [S33 2026-09-12] NO EARLY RETURN ON AN EMPTY LOCAL BOOK.
+    //
+    // This used to co_return here whenever state_->get_all_offers() was empty,
+    // which meant the sweep never went out for exactly the book it exists to
+    // clear: cancel_all:true cancels every pending offer IN THE WALLET, and a
+    // book left resting by a previous instance is in the wallet and in nobody's
+    // memory.  LOCAL EMPTINESS IS NOT WALLET EMPTINESS.
+    //
+    // The reservation cannot come from that list either -- offers we never
+    // tracked are extra BATCHES and batch_fee is charged per batch -- so an
+    // empty list is sized from the fixed conservative bound below instead.
+    const auto tracked_n = static_cast<std::int64_t>(all_offers.size());
+
+    // [S33 2026-09-12] THE FLOOR FOR A BOOK WE CANNOT SEE.
+    //
+    // The sweep goes out even with an empty local book -- that is the whole
+    // point of the removed early return above -- and cancel_all:true then
+    // cancels offers this process never tracked.  batch_fee is charged PER
+    // BATCH, so those offers are extra BATCHES, and reserve_bulk_cancel
+    // models each batch as a WHOLE fee coin leaving the cycle ledger.
+    // Reserving the tracked count of ZERO there is the 2026-08-23
+    // zero-spendable shape: real coin locks the ledger does not know about,
+    // and every later try_lock admitting against coins already spent.
+    //
+    // 25 offers is ceil(25 / kCancelOffersBatchSize) = 5 batches = 5 whole
+    // coins.  It is HEADROOM over the largest book this deployment's ladder
+    // can rest, not a derivation from it: the live config runs num_tiers 6
+    // with one enabled pair, so a full ladder is 1 x 6 x 2 = 12 offers, and
+    // 25 leaves room for a second pair being enabled without revisiting this
+    // number.  A previous instance cannot have left more than one full ladder
+    // resting unless cancel_stale and the on-chain reconciler had BOTH failed
+    // as well.
+    //
+    // [S33 2026-09-12] Deliberately NOT computed from config at compile time.
+    // An earlier draft of this comment derived 24 from config.example.yaml's
+    // 3 pairs x 4 tiers, which is not what the bot runs -- a derivation that
+    // silently drifts with a file nobody edits is worse than a stated floor
+    // with its headroom written down.  If the enabled-pair count grows past
+    // two full ladders, raise this and re-read the availability argument
+    // below, which is what actually caps it.
+    //
+    // WHY NOT HIGHER.  cancel_all also runs from the operator Cancel All
+    // flag while the bot is STILL TRADING (engine.cpp check_cancel_all_flag),
+    // and every reserved batch drains a whole coin from the live cycle
+    // ledger.  At 50 offers that is 10 coins -- more than the incident
+    // wallet HELD (14.59 XCH in ~2-XCH coins), and note_lock with a need it
+    // cannot cover CLEARS the pool outright, so try_lock refuses every offer
+    // for the rest of the cycle.  That cost is bounded, since
+    // begin_xch_lock_cycle rebuilds the ledger each ~1-minute cycle, but it
+    // is paid on EVERY empty-book cancel_all and it is paid while quoting.
+    //
+    // WHY NOT LOWER.  One batch is what this code did before: it under-models
+    // by exactly the untracked offers the sweep exists for.
+    //
+    // WHY NOT AN RPC.  A wallet-wide count was tried and cut.  It asked
+    // get_all_offers with the wallet-default sort_key, under which PENDING
+    // offers sort LAST, so a single 50-row page would usually have counted
+    // ZERO pending offers and reported a COMPLETE scan -- collapsing this
+    // reservation to the >= 1 clamp, which is worse than the fixed bound it
+    // replaced.  Both other wallet scanners in this repo pass "RELEVANCE"
+    // for that exact reason (reconcile_offers here, and
+    // on_chain_reconciler.cpp).  A bound that is right by construction beats
+    // a number computed wrong at ~1.6-2 s per page on a shutdown path.
+    constexpr std::int64_t kUnknownWalletBookBound = 25;
+
+    const std::int64_t reserve_n =
+        tracked_n > 0 ? tracked_n : kUnknownWalletBookBound;
+
+    logger_->info("cancel_all: {} tracked offer(s) -- reserving fees for {} "
+                  "offer(s) ({})", tracked_n, reserve_n,
+                  tracked_n > 0
+                      ? "the tracked book"
+                      : "local book EMPTY: the conservative bound for a book "
+                        "this process never tracked");
 
     // Attempt bulk cancellation first (wallet cancel_offers endpoint).
     bool bulk_ok = false;
     std::string bulk_err;
     try {
         co_await cancel_offers_charged(
-            current_fee_mojos_, /*secure=*/true,
-            static_cast<std::int64_t>(all_offers.size()));
+            current_fee_mojos_, /*secure=*/true, reserve_n);
         bulk_ok = true;
     } catch (const rpc::ChiaRPCError& e) {
         bulk_err = e.what();
@@ -1271,6 +1340,26 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(
         for (const auto& po : all_offers) {
             out.cancelled.push_back(po.offer_id);
         }
+    } else if (all_offers.empty()) {
+        // [S33 2026-09-12] There is no per-offer fallback to take: the ids the
+        // sweep would have cancelled are the wallet's, not ours, and the bulk
+        // endpoint takes no offer id at all.  REPORT the refusal rather than
+        // returning a default-constructed outcome, which reads as "nothing to
+        // do" -- that misreading is the whole defect being fixed here.
+        logger_->error("cancel_all: wallet-wide sweep REFUSED ({}) and no "
+                       "locally tracked ids exist to retry individually -- "
+                       "anything resting in the wallet is STILL LIVE",
+                       bulk_err);
+        out.last_error  = bulk_err;
+        out.worst_class = execution::classify_take_failure(bulk_err);
+        // [S33 2026-09-12] THE FLAG IS THE WHOLE POINT OF THIS ARM. Setting
+        // last_error and worst_class while leaving `failed` empty still read
+        // as success at every consumer: CancelLadder::record() sets
+        // outstanding_ empty and stop_reason Done, clean() returns true, the
+        // shutdown logs "All outstanding offers cancelled", and the operator
+        // Cancel All path skips its own error block. A refusal must not be
+        // reported through fields that only failures happen to fill.
+        out.sweep_refused = true;
     } else {
         // Bulk cancel failed -- fall back to individual cancellation.
         logger_->warn("Bulk cancel_offers failed: {} -- falling back to "
@@ -1280,19 +1369,16 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(
         ids.reserve(all_offers.size());
         for (const auto& po : all_offers) ids.push_back(po.offer_id);
 
-        out = co_await cancel_ids(ids, deadline);
-        // [S46] Keep the bulk refusal when the per-offer loop produced no
-        // text of its own. Reporting an empty last_error after a failed
-        // sweep would classify as TakeFailureClass::Other and put the
-        // dominant, self-clearing sync refusal on the short leash.
-        if (out.last_error.empty() && !out.failed.empty()) {
-            out.last_error  = bulk_err;
-            // ...and the class with it. Setting the text without the class
-            // would leave worst_class at its Other default while the operator
-            // reads a sync refusal in the log -- the two disagreeing about
-            // the same failure is what this field exists to stop.
-            out.worst_class = execution::classify_take_failure(bulk_err);
-        }
+        // [S33 2026-09-12] ROUTED, NOT ASSIGNED.  cancel_ids returns a FRESH
+        // CancelOutcome, so assigning it here DISCARDED the wallet-wide
+        // sweep's refusal wholesale: a per-id fallback that then succeeded
+        // reported `failed` empty and sweep_refused false, the ladder took
+        // its Done branch, and shutdown logged "All outstanding offers
+        // cancelled" after a sweep the wallet had REFUSED.  fold_refused_sweep
+        // cannot be called without setting the flag, and it keeps the [S46]
+        // carry of the refusal text.  Pinned by CancelOutcomeFoldTest.
+        CancelOutcome fallback = co_await cancel_ids(ids, deadline);
+        out = fold_refused_sweep(std::move(fallback), bulk_err);
     }
 
     // Mark offers whose cancellation succeeded as cancel_pending.
@@ -1301,8 +1387,18 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(
         state_->mark_cancel_pending(id);
     }
 
-    logger_->info("cancel_all: {}/{} offers cancelled successfully",
-                  out.cancelled.size(), all_offers.size());
+    if (all_offers.empty()) {
+        // [S33 2026-09-12] Say only what we know.  The sweep was accepted
+        // wallet-wide, but the ids it touched were never ours, so a count of
+        // "offers cancelled" here would be invented.  bulk_submitted carries
+        // the acceptance; `cancelled` stays empty on purpose.
+        logger_->info("cancel_all: no locally tracked offers -- wallet-wide "
+                      "sweep {}; the ids it covered are not known to this "
+                      "process", bulk_ok ? "SUBMITTED" : "REFUSED");
+    } else {
+        logger_->info("cancel_all: {}/{} offers cancelled successfully",
+                      out.cancelled.size(), all_offers.size());
+    }
     co_return out;
 }
 

@@ -761,3 +761,117 @@ TEST(CancelLadderState, SlowAttemptsExhaustTheBudgetNotJustTheSleeps)
     EXPECT_FALSE(l.clean());
     EXPECT_EQ(l.outstanding().size(), 7u);
 }
+
+// ---------------------------------------------------------------------------
+// [S33 2026-09-12] A REFUSED WALLET-WIDE SWEEP MUST NOT READ AS CLEAN.
+//
+// cancel_all sends cancel_all:true, which sweeps every pending offer IN THE
+// WALLET -- including a book left resting by a previous instance that this
+// process never tracked.  The bulk endpoint takes no offer id at all, so when
+// that sweep is REFUSED there is nothing to put in `failed`.  An empty
+// `failed` set outstanding_ empty and stop_reason Done, so clean() returned
+// TRUE for a sweep the wallet had refused: a refusal reading as success, the
+// exact fail-open this family keeps removing.
+//
+// HOW IT IS REACHED, since the honest answer is "narrowly, but really".  The
+// shutdown seeds this ladder from State, so an empty book means cancel_all is
+// never called at all.  The reachable interleaving is that State empties
+// BETWEEN the seed and the call: the pre-cancel sync probe co_awaits, and a
+// single-threaded io_context still runs other coroutines across that
+// suspension.  The OPERATOR Cancel All path has no such guard -- it calls
+// cancel_all unconditionally, with no ladder -- which is why the flag is on
+// CancelOutcome and not only in here.
+//
+// MUTATION CHECK, run 2026-09-12, each defect reinstated exactly and alone:
+//   M9   drop `&& !sweep_refused_` from clean()
+//                          -> STILL GREEN, and recorded as such rather than
+//                             quietly dropped. With record() and next() both
+//                             honouring the flag, stop_reason_ is ALREADY
+//                             SweepRefused whenever sweep_refused_ is set, so
+//                             that clause of clean() is unreachable
+//                             defence-in-depth. It is kept on purpose --
+//                             clean() is the predicate every caller is meant
+//                             to trust, so it should not rest on a second
+//                             field staying correct -- but NOTHING below pins
+//                             it, and no test here should be read as if
+//                             something did.
+//   M10  restore the unconditional `else stop_reason_ = Done;` in record()
+//                          -> BOTH tests below FAIL, each on stop_reason.
+//                             (clean() still returns false via M9's clause,
+//                             which is exactly why that clause is not what
+//                             these tests are pinning.)
+//   M11  drop the `if (!sweep_refused_)` guard in next()
+//                          -> ARefusedSweepIsNotACleanShutdown FAILS on its
+//                             post-next() assertions: next() launders the
+//                             refusal back into Done one line after record()
+//                             closed it.
+//   M12  make sweep_refused_ an assignment instead of `||` (non-sticky)
+//                          -> ARefusedSweepSurvivesALaterPerIdAttempt FAILS.
+// ---------------------------------------------------------------------------
+
+TEST(CancelLadderState, ARefusedSweepIsNotACleanShutdown)
+{
+    CancelLadder l(kSevenIncidentOffers, CancelRetryConfig{});
+    ASSERT_EQ(l.next(0).step, CancelLadderStep::Attempt);
+
+    // Attempt 1 is the bulk one. It reports a REFUSED wallet-wide sweep and,
+    // because State emptied underneath it, no ids at all.
+    CancelAttemptOutcome oc{};
+    oc.last_error    = kSyncRefusal;
+    oc.worst_class   = TakeFailureClass::Unsynced;
+    oc.sweep_refused = true;   // and `failed` stays EMPTY -- that is the bug
+    l.record(std::move(oc));
+
+    EXPECT_TRUE(l.outstanding().empty())
+        << "the refused sweep names no ids; that is precisely why an empty "
+           "`failed` could not be trusted to mean success";
+    EXPECT_TRUE(l.sweep_refused());
+    EXPECT_EQ(l.stop_reason(), CancelStopReason::SweepRefused);
+    EXPECT_FALSE(l.clean())
+        << "a sweep the wallet REFUSED must never read as a clean shutdown";
+
+    // The driver calls next() once more to learn that it should stop. That
+    // call must not launder the refusal back into Done.
+    EXPECT_EQ(l.next(1'000).step, CancelLadderStep::Finish);
+    EXPECT_EQ(l.stop_reason(), CancelStopReason::SweepRefused);
+    EXPECT_FALSE(l.clean());
+
+    // The operator-facing name of the stop, so the new enumerator cannot be
+    // added to the switch and left to fall through to "unknown".
+    EXPECT_STREQ(xop::execution::to_string(CancelStopReason::SweepRefused),
+                 "wallet-wide-sweep-refused");
+}
+
+TEST(CancelLadderState, ARefusedSweepSurvivesALaterPerIdAttempt)
+{
+    CancelLadder l(kSevenIncidentOffers, CancelRetryConfig{});
+    ASSERT_EQ(l.next(0).step, CancelLadderStep::Attempt);
+
+    // Attempt 1: the wallet-wide sweep is refused, one id went through, and
+    // the remaining six are reported live by id.
+    CancelAttemptOutcome first{};
+    first.cancelled.push_back(kSevenIncidentOffers.front());
+    first.failed.assign(kSevenIncidentOffers.begin() + 1,
+                        kSevenIncidentOffers.end());
+    first.last_error    = kSyncRefusal;
+    first.worst_class   = TakeFailureClass::Unsynced;
+    first.sweep_refused = true;
+    l.record(std::move(first));
+    ASSERT_EQ(l.outstanding().size(), 6u);
+    EXPECT_FALSE(l.clean());
+
+    // The retry leg is per-id and it takes the rest. That clears the LOCAL
+    // book and can never clear the untracked one: cancel_ids only ever names
+    // ids this process tracks. So the ladder must not now call this clean.
+    CancelAttemptOutcome second{};
+    second.cancelled.assign(kSevenIncidentOffers.begin() + 1,
+                            kSevenIncidentOffers.end());
+    l.record(std::move(second));   // failed empty; sweep_refused NOT re-set
+
+    EXPECT_TRUE(l.outstanding().empty());
+    EXPECT_TRUE(l.sweep_refused())
+        << "sticky: no per-id attempt can reach the book the sweep was "
+           "refused over, so a later success cannot retire the refusal";
+    EXPECT_EQ(l.stop_reason(), CancelStopReason::SweepRefused);
+    EXPECT_FALSE(l.clean());
+}

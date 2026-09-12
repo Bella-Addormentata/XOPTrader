@@ -1641,6 +1641,11 @@ void Engine::shutdown()
                     // ladder from every offer that merely hit the sync flap.
                     res.worst_class     = oc.worst_class;
                     res.bulk_submitted  = oc.bulk_submitted;
+                    // [S33 2026-09-12] Without this the ladder cannot see a
+                    // refused wallet-wide sweep at all: cancel_all reports it
+                    // with an EMPTY `failed` (the bulk endpoint names no ids),
+                    // which record() would read as "nothing left -- Done".
+                    res.sweep_refused   = oc.sweep_refused;
                     ladder.record(std::move(res));
                 }
 
@@ -1692,6 +1697,38 @@ void Engine::shutdown()
                         + " attempt(s), stopped because "
                         + execution::to_string(stop_reason)
                         + "; the fallback covers the remainder",
+                        outstanding);
+                } else if (stop_reason ==
+                           execution::CancelStopReason::SweepRefused) {
+                    // [S33 2026-09-12] Nothing is outstanding ONLY because a
+                    // refused wallet-wide sweep names no ids -- the bulk
+                    // endpoint takes no offer id at all. The wallet's book is
+                    // UNKNOWN, never proven empty, and this case used to fall
+                    // through to the "All outstanding offers cancelled"
+                    // branch below: a refusal logged as a success.
+                    //
+                    // The escalation is a real one and not a re-run of what
+                    // just failed. watchdog_cancel_book cancels WALLET-WIDE,
+                    // which is the only thing that can reach a book this
+                    // process never tracked; it goes through its OWN
+                    // short-lived client and io_context rather than the
+                    // shared one that may be wedged; and it pays the zero fee
+                    // risk::watchdog_cancel() fixes, so a funding refusal
+                    // cannot block it the way it can block the charged sweep.
+                    // It renders an empty id list as "not available at this
+                    // call site", which is the honest rendering here -- the
+                    // refused sweep never named any.
+                    spdlog::critical(
+                        "[Engine] [S33] the wallet-wide sweep was REFUSED "
+                        "after {} attempt(s) in {} ms (last error: {}) and "
+                        "this process tracks no ids to retry individually -- "
+                        "anything resting in the wallet is STILL LIVE",
+                        attempts, elapsed_ms(),
+                        last_error.empty() ? "none" : last_error);
+                    watchdog_cancel_book(
+                        "graceful shutdown could not sweep the wallet: the "
+                        "wallet-wide cancel was refused and no locally "
+                        "tracked offer ids exist to retry individually",
                         outstanding);
                 } else if (bulk_submitted) {
                     spdlog::info("[Engine] All outstanding offers SUBMITTED "
@@ -19399,6 +19436,24 @@ void Engine::check_cancel_all_flag()
                 auto done = co_await offer_mgr_->cancel_all();
                 spdlog::warn("[Engine] [CANCELALL] {} offer(s) submitted "
                              "for cancel", done.cancelled.size());
+                // [S33 2026-09-12] The one outcome this path could not see.
+                // With an EMPTY local book a refused wallet-wide sweep fills
+                // neither `cancelled` nor `failed` -- the bulk endpoint names
+                // no offer id at all -- so the operator read "0 offer(s)
+                // submitted for cancel" and the failure block below was
+                // skipped entirely. That is the HEADLINE case, not a corner:
+                // offers left resting by a previous instance, tracked by
+                // nobody here, which is exactly what cancel_all:true is sent
+                // to clear.
+                if (done.sweep_refused) {
+                    spdlog::critical(
+                        "[Engine] [CANCELALL] the wallet-wide sweep was "
+                        "REFUSED ({}) and this process tracks no ids to retry "
+                        "individually -- anything resting in the wallet is "
+                        "STILL LIVE and Cancel All did NOT clear it",
+                        done.last_error.empty() ? "no error text"
+                                                : done.last_error);
+                }
                 // Submitted ids are downgraded from "ordered" to "submitted"
                 // but stay in the set: the heartbeat sweep owns them until
                 // the wallet says they are terminal. The refused ids keep

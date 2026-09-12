@@ -425,12 +425,63 @@ public:
         /// this for a long time; the flag is here so a caller cannot read
         /// bulk acceptance as proof without saying that it is doing so.
         bool                     bulk_submitted{false};
+        /// [S33 2026-09-12] True when the WALLET-WIDE sweep was REFUSED and
+        /// no id in `failed` represents that refusal.
+        ///
+        /// Reachable only when the sweep is refused with an EMPTY local book,
+        /// which is not a corner: it is the headline case this flag's whole
+        /// change exists for -- a previous instance's offers resting in the
+        /// wallet, tracked by nobody, which is exactly what cancel_all:true
+        /// is sent to clear. The bulk endpoint takes no offer id, so there is
+        /// nothing to put in `failed`, and an empty `failed` read as success
+        /// everywhere downstream. See CancelAttemptOutcome::sweep_refused.
+        bool                     sweep_refused{false};
 
         [[nodiscard]] bool all_cancelled() const noexcept
         {
-            return failed.empty();
+            // [S33 2026-09-12] A refused wallet-wide sweep is NOT "all
+            // cancelled" merely because it named no ids to fail.
+            return failed.empty() && !sweep_refused;
         }
     };
+
+    /// [S33 2026-09-12] Fold a REFUSED wallet-wide sweep into the outcome
+    /// the per-offer fallback produced.
+    ///
+    /// THE DEFECT THIS EXISTS TO MAKE UNWRITABLE.  cancel_ids() builds a
+    /// FRESH CancelOutcome, so cancel_all's `out = co_await cancel_ids(...)`
+    /// ASSIGNED OVER the sweep_refused this call had already established.
+    /// Wallet-wide sweep REFUSED + tracked offers present + the per-id
+    /// fallback succeeding then produced `failed` empty and sweep_refused
+    /// false; CancelLadder::record() took its Done branch, clean() returned
+    /// true, and shutdown logged "All outstanding offers cancelled" after a
+    /// sweep the wallet had REFUSED.  The same fail-open as the empty-book
+    /// arm, one branch over.
+    ///
+    /// The fallback is therefore ROUTED through here instead of assigned.
+    /// There is no parameter to forget: this function is reachable only from
+    /// the refused-sweep branch and cannot be asked NOT to set the flag.
+    ///
+    /// It also carries the sweep's refusal text when the per-id loop produced
+    /// none of its own.  That widens [S46], which additionally required a
+    /// non-empty `failed`: a refused sweep whose fallback fully succeeded is
+    /// exactly the case where the refusal is the ONLY thing that went wrong,
+    /// and it reached the operator with last_error empty.
+    [[nodiscard]] static CancelOutcome fold_refused_sweep(
+        CancelOutcome fallback, const std::string& bulk_err)
+    {
+        fallback.sweep_refused = true;
+        if (fallback.last_error.empty()) {
+            fallback.last_error = bulk_err;
+            // The class goes with the text.  Setting one without the other
+            // leaves worst_class at its Other default while the operator
+            // reads a sync refusal in the log -- the two disagreeing about
+            // one failure is what worst_class exists to stop.
+            fallback.worst_class = execution::classify_take_failure(bulk_err);
+        }
+        return fallback;
+    }
+
 
     /**
      * @brief Cancel every pending offer.  Called during graceful shutdown.
