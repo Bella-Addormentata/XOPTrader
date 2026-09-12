@@ -96,6 +96,16 @@ pairs:
   competitive_anchor_enabled_override: false
   fair_value_residual_widen_ratio_override: 0.0
   stablecoin_skip_gap_aware: true
+  # [S33 2026-09-12] The two-sides-agree ceiling, SCOPED TO THIS PAIR.
+  # This was market_data.book_side_agree_max_spread_bps: 1500.0 -- a global
+  # knob feeding the ONE MarketDataFeed that serves every market, so a value
+  # chosen for THIS book (10,769 bps, an absent ask side rather than a wide
+  # market) also denied the bypass to every other pair whose spread fell
+  # between 1500 and the 5000 default. Same number, applied where it was
+  # meant; every other pair is back on the default.
+  # The effective value is still min(this, mid_gate_book_confirm_max_spread_bps)
+  # and THAT gate remains global -- read config.hpp before changing either.
+  book_side_agree_max_spread_bps_override: 1500.0
 - base_asset_id: ae1536f56760e471ad85ead45f00d680ff9cca73b8cc3407be778f1c0c606eac
   depeg_bail_pct: 10.0
   depeg_sustained_blocks: 30
@@ -305,7 +315,6 @@ volatility:
   candle_aggregation_blocks: 10
 market_data:
   min_competitor_offer_size: 100000000000
-  book_side_agree_max_spread_bps: 1500.0
 monitoring:
   prometheus_port: 19090
 depeg:
@@ -556,6 +565,39 @@ pegged_assets:
   symbol: BYC
   peg_currency: USD
   peg_target: 1.0
+  # [S33 2026-09-12] WHY THIS BAND IS TEN AND FIVE TIMES wUSDC.b's ABOVE,
+  # AND WHAT IT COSTS. Reviewed 2026-09-12 and KEPT deliberately.
+  #
+  # WHAT IS EVIDENCED. BYC is a Chia-native CDP stablecoin, not a bridged
+  # claim on a custodied dollar, so its dollar value is market-determined
+  # rather than redeemable at par (engine.cpp's BYC anchor branch). Every
+  # real anchor measured there puts it at ~$1.01 -- 7-day traded VWAP 1.001,
+  # dexie tickers 1.011, executable bids 1.000-1.014 -- against a measured
+  # p50 book spread of 1163 bps. That is why prefer_market_cross: true is set
+  # below, and why that cross is trusted only when its own spread is <= 300
+  # bps: a midpoint off this book carries a worst-case location error of
+  # ~spread/2, still ~150 bps even at that tightness, while the par
+  # assumption erred by at most ~140 bps against every anchor measured.
+  #
+  # WHAT IS NOT. Nothing in this repo measures a BYC deviation anywhere near
+  # 20%, let alone 50%. The distance between the ~150 bps of measurement
+  # error above and these thresholds is an OPERATOR MARGIN for a coin whose
+  # price is allowed to move -- it is not derived from data. Recorded as such
+  # so the next reader does not mistake it for a measurement.
+  #
+  # THE RISK ENVELOPE THIS BUYS. bail_pct is not a display value:
+  # step_observe_asset_pegs passes it to risk::observe_peg, and that
+  # function's JustSuspended is what suspends the par, disables every pair
+  # touching BYC and cancels their resting offers until an operator
+  # re-enables from the GUI's Depeg tab. So at 50.0 this bot KEEPS QUOTING
+  # THROUGH A 49% DEPEG indefinitely; and even past 50% it keeps quoting
+  # until 30 CONSECUTIVE observations (sustained_observations below) are at
+  # or past bail, because a single observation back inside 50% resets that
+  # streak to zero. warn_pct 20.0 means no warning of any kind below 20% off
+  # par. The band that stops this book's width from reading as a depeg is the
+  # same band that delays a genuine one; this entry chooses the delay
+  # knowingly. If the exit thesis for the BYC inventory changes, revisit this
+  # number first.
   warn_pct: 20.0
   bail_pct: 50.0
   sustained_observations: 30

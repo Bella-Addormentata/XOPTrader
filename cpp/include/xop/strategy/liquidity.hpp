@@ -233,6 +233,11 @@ struct LiquidityConfig {
     /// Optional separate tier spacing for Bid and Ask sides.
     /// When non-empty, build_raw_ladder uses tier_spacing_bps_bid for Bids
     /// and tier_spacing_bps_ask for Asks; otherwise falls back to tier_spacing_bps.
+    ///
+    /// [S33 2026-09-12] Populated per heartbeat by the engine's cross-side
+    /// activity controller (engine.cpp Step 7).  Because build_raw_ladder
+    /// PREFERS these whenever they are non-empty, they also switch the
+    /// gap-aware spacing pass off -- see gap_aware_spacing_active().
     std::vector<double> tier_spacing_bps_bid;
     std::vector<double> tier_spacing_bps_ask;
 
@@ -282,6 +287,10 @@ struct LiquidityConfig {
     /// find underserved price ranges and adjusts tier_spacing_bps to place
     /// liquidity in those valleys.  tier_spacing_bps is still used as a
     /// baseline/fallback when no gaps are detected.
+    ///
+    /// The pass reads and writes tier_spacing_bps ONLY, so it is inert
+    /// whenever a per-side schedule is populated; gap_aware_spacing_active()
+    /// is the single authority on whether it runs.
     /// Default: true.
     bool gap_aware_spacing{true};
 
@@ -410,6 +419,49 @@ struct LiquidityConfig {
     bool book_bid_side_anchor_ok{true};
     bool book_ask_side_anchor_ok{true};
 };
+
+// ---------------------------------------------------------------------------
+// gap_aware_spacing_active -- may the gap-aware pass run for this config?
+//
+// [S33 2026-09-12, Copilot round 6] The gap-aware pass in compute_ladder
+// blends each tier toward the nearest order-book gap centre and stores the
+// result in tier_spacing_bps.  But build_raw_ladder PREFERS
+// tier_spacing_bps_bid/_ask whenever they are non-empty, and the engine's
+// cross-side activity controller populates exactly those every heartbeat
+// (engine.cpp Step 7).  With activity adaptation on, the blend was therefore
+// computed, stored and silently discarded: no error, no log, no failing
+// test.  XCH/BYC sets stablecoin_skip_gap_aware, which is why the pair this
+// branch enables never exercised it -- other pairs do not set that flag.
+//
+// The two modes are now explicitly mutually exclusive, the way gap-aware is
+// already exclusive with competitive anchoring.  Rationale for excluding
+// rather than re-targeting the blend at the side schedules:
+//
+//   1. ORDERING.  The engine applies the Step 7 sigma width floor to the
+//      side schedules (shift_schedule_to_floor, engine.cpp) immediately
+//      BEFORE calling compute_ladder.  The blend is floored only at 10 bps
+//      and can move a tier inward (closest_gap < baseline), so writing it
+//      over the side schedules would let a gap centre pull tiers back
+//      INSIDE the uncertainty floor the engine had just enforced -- on
+//      exactly the pairs the controller serves.
+//   2. IT WOULD FIGHT THE CONTROLLER.  The side schedules are a closed-loop
+//      output: low fill activity interpolates them up toward
+//      tier_spacing_max_bps.  Blending them back toward gap centres would
+//      partly undo that widening and feed straight into the low-fill state
+//      that caused it -- the same failure engine.cpp documents for the
+//      width-floor delta.
+//   3. THE BLEND'S CROSS-SIDE PREMISE DIES.  It deliberately merges gaps
+//      from BOTH sides because build_raw_ladder historically used one
+//      schedule for both.  Per-side schedules invalidate that premise, so
+//      fix (a) would additionally require re-deciding side-aware gap
+//      selection -- a live pricing change with no pair to validate it on.
+//
+// A config that asks for both gets one warning per engine instance and the
+// activity controller's schedules; nothing is silently discarded.
+//
+// @return True when the gap-aware pass will actually reach the prices
+//         build_raw_ladder produces.
+bool gap_aware_spacing_active(const LiquidityConfig& cfg) noexcept;
 
 // ---------------------------------------------------------------------------
 // LiquidityEngine -- the multi-tier liquidity provision engine.
@@ -605,6 +657,12 @@ private:
 
     /// Most recent rebalance reason (set by should_rebalance).
     mutable RebalanceReason last_reason_{RebalanceReason::None};
+
+    /// [S33 2026-09-12] Set once the "gap-aware requested but a per-side
+    /// schedule is populated" warning has been emitted for this engine.
+    /// One engine per pair, so this is one warning per pair per process:
+    /// a standing misconfiguration must not re-warn every heartbeat.
+    mutable bool gap_aware_side_schedule_warned_{false};
 
     /// Block height at which the last rebalance was executed.
     BlockHeight  last_rebalance_block_{0};

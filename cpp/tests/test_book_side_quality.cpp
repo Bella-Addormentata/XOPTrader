@@ -2263,3 +2263,153 @@ TEST(BookSideQualityFeed, TheTwoOffSwitchesAcrossEveryBookShape)
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// [S33 2026-09-12] THE TWO-SIDES-AGREE CEILING IS PER PAIR.
+//
+// market_data.book_side_agree_max_spread_bps reaches MarketDataConfig ONCE,
+// and the single MarketDataFeed built from it serves every enabled market. So
+// a value chosen for one dislocated book -- 1500, for XCH/BYC's 10,769 bps
+// absent ask side -- also denied the two-sides-agree bypass to every OTHER
+// pair whose spread fell between it and the 5000 default. The override is
+// looked up by pair name at both consumption sites; a pair without one keeps
+// the bot-wide value.
+//
+// The gate operand (mid_gate_book_confirm_max_spread_bps) is deliberately NOT
+// per-pair: the min() in effective_agree_max_spread_bps is what stops a
+// per-pair value from ever being more permissive than the gate, so scoping
+// this knob can only make ONE pair stricter, never any pair looser.
+// ---------------------------------------------------------------------------
+
+TEST(BookSideQualityPerPair, TheOverrideIsUsedOnlyByThePairThatCarriesIt)
+{
+    MarketDataConfig cfg;
+    cfg.book_side_agree_max_spread_bps = 5000.0;
+    cfg.set_agree_max_spread_bps_for("XCH/BYC", 1500.0);
+
+    EXPECT_DOUBLE_EQ(cfg.agree_max_spread_bps_for("XCH/BYC"), 1500.0);
+    EXPECT_DOUBLE_EQ(cfg.agree_max_spread_bps_for("XCH/DBX"), 5000.0)
+        << "a pair with no override must keep the bot-wide value -- this is "
+           "the whole defect: one pair's number reached all of them";
+    EXPECT_DOUBLE_EQ(cfg.agree_max_spread_bps_for(""), 5000.0);
+
+    // 0 is the documented "bypass off" SETTING and must survive the lookup as
+    // itself. ABSENCE is the map entry being missing, which is a different
+    // thing and must not be confused with it.
+    cfg.set_agree_max_spread_bps_for("XCH/wUSDC.b", 0.0);
+    EXPECT_DOUBLE_EQ(cfg.agree_max_spread_bps_for("XCH/wUSDC.b"), 0.0)
+        << "0 is a setting, not an absent value";
+}
+
+// SITE 1 -- ingest_competing_offers / classify_sides. One feed, two pairs,
+// IDENTICAL books: 3947 bps wide with both touches far outside the 3x band,
+// so the bypass is the only thing that can keep either side qualified.
+//
+//   XCH/BYC  override 1500 -> 3947 > 1500, no bypass -> both sides refused
+//   XCH/DBX  default  5000 -> 3947 <= 5000, bypassed -> both sides trusted
+//
+// Before the override existed both pairs took the first verdict.
+TEST(BookSideQualityFeed, APairOverrideScopesTheSideVerdictToThatPairAlone)
+{
+    MarketDataConfig cfg = sq_cfg();
+    cfg.book_side_agree_max_spread_bps = 5000.0;
+    cfg.set_agree_max_spread_bps_for("XCH/BYC", 1500.0);
+
+    State state;
+    MarketDataFeed feed(cfg, state);
+    const std::string scoped   = "XCH/BYC";   // carries the 1500 override
+    const std::string bot_wide = "XCH/DBX";   // keeps the 5000 default
+
+    feed.ingest_block_height(100);
+    for (const std::string& pair : {scoped, bot_wide}) {
+        feed.ingest_reference_anchor(pair, kAnchor, 0.0);
+        feed.ingest_competing_offers(
+            pair,
+            {sq_offer("b1", Side::Bid, 5.60,  5'000'000'000'000LL),
+             sq_offer("a1", Side::Ask, 8.354, 5'000'000'000'000LL)},
+            {}, kMojosPerXch, 1'000);
+    }
+    feed.refresh({scoped, bot_wide});
+
+    const auto scoped_snap   = state.get_market(scoped);
+    const auto bot_wide_snap = state.get_market(bot_wide);
+
+    ASSERT_NEAR(scoped_snap.spread_bps, 3947.0, 5.0)
+        << "precondition: the book sits BETWEEN the override and the default, "
+           "which is the only range in which the two can disagree";
+    ASSERT_NEAR(bot_wide_snap.spread_bps, 3947.0, 5.0);
+    ASSERT_GT(5.60 / kAnchor, kBand)
+        << "precondition: without the bypass the bid is out of band (3.97x)";
+    ASSERT_GT(8.354 / kAnchor, kBand)
+        << "precondition: and so is the ask (5.92x)";
+
+    EXPECT_FALSE(scoped_snap.bid_side_anchor_ok)
+        << "1500 is THIS pair's ceiling: 3947 bps is not coherent enough to "
+           "trust a book whose touches are 4x and 6x the anchor";
+    EXPECT_FALSE(scoped_snap.ask_side_anchor_ok);
+
+    EXPECT_TRUE(bot_wide_snap.bid_side_anchor_ok)
+        << "THE REGRESSION. This pair never asked for 1500; at the 5000 "
+           "default a 3947 bps two-sided book still takes the bypass";
+    EXPECT_TRUE(bot_wide_snap.ask_side_anchor_ok);
+    // book_side_ref is a Mojo, so convert EXPLICITLY rather than letting the
+    // comparison promote it (MSVC C4244 / GCC -Wdouble-promotion, both errors
+    // here).
+    EXPECT_NEAR(static_cast<double>(bot_wide_snap.book_side_ref)
+                    / static_cast<double>(kMojosPerXch),
+                kAnchor, 1e-6)
+        << "non-vacuity: the classifier DID run on this pair with the anchor "
+           "in hand -- the flags above are its verdict, not their defaults";
+}
+
+// SITE 2 -- apply_mid_gate's coherence conjunct, which is the half of this
+// knob that decides whether a mid may MARK EQUITY. Same two pairs, same one
+// feed, and a book that is 4000 bps wide with BOTH touches comfortably inside
+// the band: sides_examined and book_sides_ok are therefore true for both
+// pairs, and the coherence conjunct is the only thing left that can differ.
+TEST(BookSideQualityFeed, APairOverrideScopesValuationGradeToThatPairAlone)
+{
+    MarketDataConfig cfg = sq_cfg();
+    cfg.book_side_agree_max_spread_bps = 5000.0;
+    cfg.set_agree_max_spread_bps_for("XCH/BYC", 1500.0);
+
+    State state;
+    MarketDataFeed feed(cfg, state);
+    const std::string scoped   = "XCH/BYC";
+    const std::string bot_wide = "XCH/DBX";
+
+    feed.ingest_block_height(100);
+    for (const std::string& pair : {scoped, bot_wide}) {
+        feed.ingest_reference_anchor(pair, kAnchor, 0.0);
+        feed.ingest_competing_offers(
+            pair,
+            {sq_offer("b1", Side::Bid, 1.20, 5'000'000'000'000LL),
+             sq_offer("a1", Side::Ask, 1.80, 5'000'000'000'000LL)},
+            {}, kMojosPerXch, 1'000);
+    }
+    feed.refresh({scoped, bot_wide});
+
+    const auto scoped_snap   = state.get_market(scoped);
+    const auto bot_wide_snap = state.get_market(bot_wide);
+
+    ASSERT_NEAR(scoped_snap.spread_bps, 4000.0, 5.0)
+        << "precondition: between the override and the default";
+    ASSERT_NEAR(bot_wide_snap.spread_bps, 4000.0, 5.0);
+    ASSERT_TRUE(scoped_snap.bid_side_anchor_ok)
+        << "precondition: both touches are INSIDE the band (0.85x and 1.28x), "
+           "so no side verdict is what separates these two pairs";
+    ASSERT_TRUE(scoped_snap.ask_side_anchor_ok);
+    ASSERT_TRUE(bot_wide_snap.bid_side_anchor_ok);
+    ASSERT_TRUE(bot_wide_snap.ask_side_anchor_ok);
+    ASSERT_GT(scoped_snap.mid_price, 0)
+        << "precondition: the mid is published (1.06x the anchor -- the gate "
+           "accepts at its early exit), so grade is the live question";
+
+    EXPECT_FALSE(scoped_snap.mid_valuation_grade)
+        << "this pair's own 1500 ceiling refuses a 4000 bps book the right to "
+           "mark equity -- which is what PR #148 set out to do";
+    EXPECT_TRUE(bot_wide_snap.mid_valuation_grade)
+        << "THE REGRESSION, on the valuation path. A pair on the 5000 default "
+           "must keep grading its own coherent book; losing it here drops the "
+           "pair to the S20 carry and then degrades the cycle";
+}

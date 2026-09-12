@@ -55,6 +55,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <mutex>
 #include <shared_mutex>
@@ -477,6 +478,62 @@ struct MarketDataConfig {
     /// Dislocation is one side moving ALONE, which leaves a wide spread
     /// and fails this test.
     double book_side_agree_max_spread_bps{5000.0};
+
+    /// [S33 2026-09-12] Per-pair overrides of the scalar above, keyed by
+    /// PairConfig::name.  Engine populates this from
+    /// PairConfig::book_side_agree_max_spread_bps_override; a pair with no
+    /// entry keeps the scalar.
+    ///
+    /// WHY THIS EXISTS.  One MarketDataFeed serves every pair, so the scalar
+    /// above is a BOT-WIDE setting however local the intent behind it was:
+    /// setting it to 1500 to stop one dislocated book from marking equity
+    /// also denied the two-sides-agree bypass to every other market whose
+    /// spread happened to fall between that value and the 5000 default.
+    ///
+    /// Read it through agree_max_spread_bps_for(), never by reaching for the
+    /// scalar directly -- that is the bug this closes.
+    ///
+    /// Held behind a shared_ptr, and SHARED rather than copied, because this
+    /// whole struct is deep-copied under a shared_lock on nearly every feed
+    /// call (`const auto cfg = [&]{ ...; return config_; }()`).  A map by
+    /// value there is a heap allocation per call for data that never changes
+    /// after construction; a null pointer means "no pair has an override".
+    std::shared_ptr<const std::unordered_map<std::string, double>>
+        book_side_agree_max_spread_bps_by_pair;
+
+    /// Record one pair's override.  Copy-on-write, so a config already shared
+    /// with a running feed is never mutated underneath it.
+    void set_agree_max_spread_bps_for(const std::string& pair_name, double bps)
+    {
+        auto next = book_side_agree_max_spread_bps_by_pair
+            ? std::make_shared<std::unordered_map<std::string, double>>(
+                  *book_side_agree_max_spread_bps_by_pair)
+            : std::make_shared<std::unordered_map<std::string, double>>();
+        (*next)[pair_name] = bps;
+        book_side_agree_max_spread_bps_by_pair = std::move(next);
+    }
+
+    /// The two-sides-agree ceiling CONFIGURED for @p pair_name: its own
+    /// override when it has one, otherwise the bot-wide value.
+    ///
+    /// Still RAW.  The value actually used is
+    /// bookside::effective_agree_max_spread_bps(this,
+    /// mid_gate_book_confirm_max_spread_bps), which min()s it against the
+    /// published-mid gate's own threshold.  That gate threshold is NOT
+    /// per-pair, so an override can only ever make one pair STRICTER than
+    /// the bot-wide setting; one wider than the gate has no effect, exactly
+    /// as the global knob behaves.
+    [[nodiscard]] double agree_max_spread_bps_for(
+        const std::string& pair_name) const
+    {
+        if (!book_side_agree_max_spread_bps_by_pair) {
+            return book_side_agree_max_spread_bps;
+        }
+        const auto it = book_side_agree_max_spread_bps_by_pair->find(pair_name);
+        return it == book_side_agree_max_spread_bps_by_pair->end()
+                   ? book_side_agree_max_spread_bps
+                   : it->second;
+    }
 };
 
 // ---------------------------------------------------------------------------
