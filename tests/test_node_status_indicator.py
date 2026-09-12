@@ -70,6 +70,7 @@ def _payload(**health_overrides) -> dict:
         "wallet_connected": 1.0,
         "wallet_synced": 1.0,
         "wallet_syncing": 0.0,
+        "dexie_connected": 1.0,
     }
     health.update(health_overrides)
     return {
@@ -252,6 +253,56 @@ def test_the_dexie_dot_is_green_while_the_scrape_is_live(window):
     window._on_bridge_data(_payload())
 
     assert _dot_label(window, "Dexie") == "Dexie: Connected"
+
+
+# -- Dexie indicator, second form (review 3997548811) --------------------
+#
+# c19 replaced `or bool(market_data)` with `metrics_connected`, which made
+# the dot report whether the GUI could scrape the ENGINE.  That is engine
+# health, not venue reachability: a healthy engine whose every Dexie request
+# fails kept the dot green.  The engine now publishes the venue signal.
+
+
+def test_an_unreachable_dexie_is_not_masked_by_a_healthy_engine(window):
+    """THE finding: engine up, scrape live, Dexie down."""
+    payload = _payload(dexie_connected=0.0)
+    assert payload["metrics_connected"] is True, "premise: the engine is scrapeable"
+    assert payload["market_data"], "premise: the last snapshot is retained"
+
+    window._on_bridge_data(payload)
+
+    assert _dot_label(window, "Dexie") == "Dexie: Disconnected", (
+        "a green dot here is the fail-open status bug: the GUI could reach "
+        "the engine, the engine could not reach Dexie"
+    )
+
+
+def test_the_scrape_gate_still_applies_to_the_dexie_dot(window):
+    """The engine signal does not REPLACE the scrape gate, it joins it.
+
+    A retained dexie_connected=1 from a dead scrape is remembered state, and
+    every dot in this method reports asserted liveness, never memory.
+    """
+    payload = _payload(dexie_connected=1.0)
+    payload["metrics_connected"] = False
+
+    window._on_bridge_data(payload)
+
+    assert _dot_label(window, "Dexie") == "Dexie: Disconnected"
+
+
+def test_an_engine_predating_the_dexie_gauge_fails_closed(window):
+    """No legacy gauge exists to fall back to, unlike node_connected.
+
+    An engine that cannot be asked whether Dexie is up is not evidence that
+    Dexie is up, so the absent key reads as not-reachable rather than green.
+    """
+    payload = _payload()
+    del payload["health"]["dexie_connected"]
+
+    window._on_bridge_data(payload)
+
+    assert _dot_label(window, "Dexie") == "Dexie: Disconnected"
 
 
 def test_an_explicit_node_disconnect_beats_a_stale_synced_gauge(window):

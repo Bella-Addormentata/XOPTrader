@@ -469,6 +469,22 @@ bool node_probe_is_live(bool                                  node_client_open,
     return (now - last_probe) <= liveness_window;
 }
 
+// [review 3997548811] See the contract in engine.hpp.  Same shape as
+// node_probe_is_live above, its own window: the node is probed on a poll
+// throttle, Dexie on block arrival.
+bool dexie_probe_is_live(bool                                  dexie_client_open,
+                         std::chrono::steady_clock::time_point last_success,
+                         std::chrono::steady_clock::time_point now,
+                         std::chrono::seconds                  liveness_window)
+{
+    if (!dexie_client_open) return false;
+    // Never answered in this run: nothing has been observed about the venue.
+    if (last_success == std::chrono::steady_clock::time_point{}) return false;
+    // A `now` before the stamp is a clock oddity, not evidence of staleness.
+    if (now < last_success) return true;
+    return (now - last_success) <= liveness_window;
+}
+
 // ===========================================================================
 // Construction / destruction
 // ===========================================================================
@@ -3127,6 +3143,7 @@ asio::awaitable<void> Engine::run_startup_analysis()
             health.wallet_connected = wallet_->is_open();
             health.wallet_synced    = wallet_synced_;
             health.wallet_syncing   = wallet_syncing_;
+            health.dexie_connected  = dexie_probe_live_now();
             metrics_->update_system_health(health);
         }
 
@@ -4187,6 +4204,13 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
             pair.base_asset_id,
             pair.quote_asset_id);
         if (ticker) {
+            // [review 3997548811] REACHABILITY, stamped before any judgement
+            // about the prices.  A ticker that answers at all proves the
+            // venue is up; whether its prices are usable is a separate
+            // question that pair_data_ok below already answers.  A failed
+            // request -- nullopt, or a throw into the per-pair catch --
+            // stamps nothing, and the window closes on its own.
+            dexie_last_success_at_ = std::chrono::steady_clock::now();
             market_data_->ingest_dexie(
                 pair.name,
                 ticker->price_buy,
@@ -17943,6 +17967,16 @@ bool Engine::node_probe_live_now() const
         std::chrono::steady_clock::now());
 }
 
+// [review 3997548811] See the contract in engine.hpp.  One rule, one place:
+// this is the `dexie_connected` both exporters publish.
+bool Engine::dexie_probe_live_now() const
+{
+    return dexie_probe_is_live(
+        dexie_ && dexie_->is_open(),
+        dexie_last_success_at_,
+        std::chrono::steady_clock::now());
+}
+
 void Engine::step_export_metrics(BlockHeight block_height)
 {
     if (!metrics_->is_running()) return;
@@ -18031,6 +18065,7 @@ void Engine::step_export_metrics(BlockHeight block_height)
     health.wallet_connected = wallet_->is_open();
     health.wallet_synced    = wallet_synced_;
     health.wallet_syncing   = wallet_syncing_;
+    health.dexie_connected  = dexie_probe_live_now();
     metrics_->update_system_health(health);
 
     // Dashboard 5: Offer lifecycle

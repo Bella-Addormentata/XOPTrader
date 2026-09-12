@@ -938,8 +938,22 @@ class MainWindow(QMainWindow):
         # every configured pair even before the first successful scrape -- so
         # `or bool(market_data)` pinned this dot green from the first tick
         # onward, making the indicator as inert as the hardcoded True it
-        # replaced.  `metrics_connected` is the only live signal published.
-        dexie_conn = bool(data.get("metrics_connected", False))
+        # replaced.  `metrics_connected` was THEN the only live signal
+        # published; that is no longer true -- see the round-10 note below.
+        # [review 3997548811] `metrics_connected` answers "can the GUI
+        # scrape the engine?", which is engine health, not venue
+        # reachability -- so with the engine healthy and every Dexie ticker
+        # failing, this dot stayed green and the fail-open bug c19 was
+        # opened to remove survived in a second form.  The engine now
+        # publishes xop_node{metric="dexie_connected"}, a freshness window
+        # over the last ANSWERED Dexie request (see kDexieProbeLivenessWindow).
+        #
+        # BOTH are required, which is why the scrape gate stays: a stale
+        # dexie_connected=1 read from a dead scrape is remembered state, and
+        # the rule for every dot in this method is that connectivity is
+        # ASSERTED, never inferred from what was last seen.
+        dexie_conn = (bool(data.get("metrics_connected", False))
+                      and bool(health.get("dexie_connected", 0.0) >= 1.0))
         dexie_label = "Dexie: Connected" if dexie_conn else "Dexie: Disconnected"
         dexie_colour = "green" if dexie_conn else "red"
 

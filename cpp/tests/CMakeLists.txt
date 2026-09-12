@@ -101,6 +101,7 @@ add_executable(xop_tests
     test_watchdog.cpp
     test_height_source.cpp
     test_node_sync_state.cpp
+    test_dexie_probe_liveness.cpp
     test_selective_repost.cpp
     test_width_floor.cpp
     test_activity_interpolation.cpp

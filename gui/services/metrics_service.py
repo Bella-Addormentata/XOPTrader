@@ -503,6 +503,14 @@ class MetricsService(QObject):
             ),
             "wallet_synced": _labelled(m, "xop_node", "metric", "wallet_synced", default=0.0),
             "wallet_syncing": _labelled(m, "xop_node", "metric", "wallet_syncing", default=0.0),
+            # [review 3997548811] Engine-published VENUE reachability, as
+            # distinct from whether this scrape reached the engine.
+            # Fail-closed on absence: unlike node_connected there is no
+            # legacy gauge to fall back to, and an engine too old to
+            # publish this cannot be asked whether Dexie is up -- so the
+            # honest answer is "not known to be reachable", which is the
+            # same default the syncing gauges already take.
+            "dexie_connected": _labelled(m, "xop_node", "metric", "dexie_connected", default=0.0),
         }
 
     def has_data(self) -> bool:

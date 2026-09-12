@@ -115,6 +115,7 @@ struct SystemHealthSnapshot {
     bool        wallet_connected{false}; // True if the wallet RPC is reachable.
     bool        wallet_synced{false};  // True if the wallet is fully synced.
     bool        wallet_syncing{false}; // True if the wallet is syncing.
+    bool        dexie_connected{false}; // True if Dexie answered recently.
 };
 
 // ---------------------------------------------------------------------------
@@ -474,6 +475,7 @@ private:
     prometheus::Gauge* sys_wallet_connected_{nullptr};
     prometheus::Gauge* sys_wallet_synced_{nullptr};
     prometheus::Gauge* sys_wallet_syncing_{nullptr};
+    prometheus::Gauge* sys_dexie_connected_{nullptr};
     prometheus::Family<prometheus::Histogram>* offer_latency_family_{nullptr};
     prometheus::Histogram* offer_latency_{nullptr};
 

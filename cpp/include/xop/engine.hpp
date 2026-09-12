@@ -547,6 +547,61 @@ inline constexpr std::chrono::seconds kNodeProbeLivenessWindow{150};
     std::chrono::seconds liveness_window = kNodeProbeLivenessWindow);
 
 // ---------------------------------------------------------------------------
+// dexie_probe_is_live -- has a Dexie request answered recently?
+//
+// [review 3997548811] The Dexie status dot was driven by `metrics_connected`,
+// which reports only whether the GUI can scrape THIS engine's Prometheus
+// endpoint.  That is engine health, not venue reachability: with the engine
+// healthy and every Dexie ticker failing, the dot stayed green.  This is the
+// signal the dot needs, published BY the engine about the venue.
+//
+// Deliberately a separate function from node_probe_is_live rather than a
+// shared one: the two windows differ because the two cadences differ (the
+// node is probed on a poll throttle, Dexie on block arrival), and each
+// window has to be justified against its own cadence.  The SHAPE is
+// identical on purpose.
+//
+// @param dexie_client_open  The Dexie client exists and is open.
+// @param last_success       When a Dexie request last ANSWERED.
+//                           Default-constructed means "never in this run",
+//                           which is not live.
+// @param now                Monotonic reference point (steady_clock).
+// @param liveness_window    How long one answer stands as evidence.
+// @return Whether Dexie may be reported reachable at all.
+// ---------------------------------------------------------------------------
+
+/// How long one successful Dexie request stands as evidence of reachability.
+///
+/// Sized off the real cadence, not guessed.  step_update_market_state is
+/// BLOCK-gated at both call sites -- run_startup_analysis skips on
+/// `current_block <= last_analysis_block`, and on_new_block_coro is entered
+/// only under `current_block > last_block_` -- so Dexie tickers are fetched
+/// once per NEW BLOCK, not once per kPollInterval.
+///
+/// Chia's block time averages ~52s, but the mean is the wrong statistic to
+/// size a window against: this engine's own logs record a worst single
+/// interval of 181 s over 2,418 measured (see the cadence note in
+/// run_startup_analysis).  A 3x-the-mean window (~156 s) would therefore
+/// blink this gauge dark on ONE legitimately slow block -- precisely the
+/// false "Disconnected" that kNodeProbeLivenessWindow's own sizing note
+/// exists to prevent.  181 s plus one further block (~52 s) is 233 s;
+/// 300 s rounds that up with margin and still darkens the gauge five
+/// minutes into a real outage.
+///
+/// KNOWN COUPLING, stated rather than hidden: because Step 1 runs only on
+/// block arrival, a CHAIN stall also darkens this gauge.  That is the
+/// intended reading -- with no heartbeat the engine has no current evidence
+/// Dexie is reachable, and fail-closed on absent evidence is the rule the
+/// node and wallet dots already follow.
+inline constexpr std::chrono::seconds kDexieProbeLivenessWindow{300};
+
+[[nodiscard]] bool dexie_probe_is_live(
+    bool                                  dexie_client_open,
+    std::chrono::steady_clock::time_point last_success,
+    std::chrono::steady_clock::time_point now,
+    std::chrono::seconds liveness_window = kDexieProbeLivenessWindow);
+
+// ---------------------------------------------------------------------------
 // Engine -- the top-level orchestrator.
 //
 // Owns all subsystems and drives the per-block heartbeat loop.
@@ -839,12 +894,24 @@ private:
     /// node whose reachability the health gauges used to deny.
     std::chrono::steady_clock::time_point node_last_probe_{};
 
+    /// [review 3997548811] When a Dexie request last ANSWERED.  Stamped in
+    /// Step 1 on a returned ticker -- reachability, which is a different
+    /// question from whether the prices were usable: a ticker that answers
+    /// with price_last == 0 still proves the venue is up, and the separate
+    /// per-pair market_data_valid already carries usability.
+    std::chrono::steady_clock::time_point dexie_last_success_at_{};
+
     /// The reachability argument both metrics exporters pass to
     /// node_health_flags(), in ONE place.  They share that function precisely
     /// so there is a single rule; each computing its own expression is how
     /// they came to disagree (one asked the height source, the other asked
     /// whether this poll had used the wallet).
     [[nodiscard]] bool node_probe_live_now() const;
+
+    /// The Dexie reachability argument both metrics exporters publish, in
+    /// ONE place -- same reason as node_probe_live_now() above: two sites
+    /// each computing their own expression is how they came to disagree.
+    [[nodiscard]] bool dexie_probe_live_now() const;
 
     /// The RUNTIME latch disabling full-node-dependent behaviour.
     ///
