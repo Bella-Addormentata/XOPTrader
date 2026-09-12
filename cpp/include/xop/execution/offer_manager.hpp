@@ -994,8 +994,14 @@ private:
     asio::awaitable<json> cancel_offer_charged(const std::string& trade_id,
                                                std::uint64_t      fee,
                                                bool               secure);
+    /// [BULKCANCEL 2026-09-11] `n_offers` is not cosmetic.  The wallet
+    /// charges batch_fee ONCE PER BATCH, so a bulk cancel of n offers really
+    /// spends batch_fee * ceil(n / kCancelOffersBatchSize).  Reserving a
+    /// single fee under-reserves XCH, which is the 2026-08-23 zero-spendable
+    /// incident's exact shape.
     asio::awaitable<json> cancel_offers_charged(std::uint64_t fee,
-                                                bool          secure);
+                                                bool          secure,
+                                                std::int64_t  n_offers);
 
     CoinLockLedger xch_cycle_ledger_;
     bool           xch_ledger_refusal_logged_{false};

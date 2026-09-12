@@ -110,6 +110,7 @@ add_executable(xop_tests
     test_client_logger.cpp
     test_pid_reachability.cpp
     test_pid_rail_latch.cpp
+    test_wallet_requests.cpp
 )
 
 target_link_libraries(xop_tests

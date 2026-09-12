@@ -12,9 +12,11 @@ namespace {
 using xop::Mojo;
 using xop::execution::CoinLockLedger;
 using xop::execution::OfferManager;
+using xop::execution::reserve_bulk_cancel;
 
 constexpr Mojo kXch = 1'000'000'000'000LL;
 constexpr Mojo kFee = 28'922;  // the live per-offer fee from the incident
+constexpr Mojo kBatchFee = 10'000'000;  // live current_fee_mojos_, per batch
 
 TEST(CoinLockLedgerTest, ReplaysTheIncidentBatchExactly) {
     // [XCH-LOCK-LEDGER 2026-08-23] 2026-08-23 13:48:58Z: spendable was
@@ -260,6 +262,69 @@ TEST(CoinLockLedgerTest, InactiveLedgerAdmitsEverything) {
     EXPECT_TRUE(ledger.try_lock(1'000 * kXch, kFee));
     ledger.note_lock(kXch, kFee);
     EXPECT_EQ(ledger.committed(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Bulk-cancel fee reservation ([S33 2026-09-11]: the one change on this branch
+// that moves real XCH, and it shipped with no coverage -- reinstating the
+// single note_lock(0, fee) turned no test red).  These drive a real ledger
+// through the same helper OfferManager::cancel_offers_charged calls, and
+// assert on POOL STATE, so none of them can pass vacuously.
+// ---------------------------------------------------------------------------
+
+TEST(CoinLockLedgerTest, BulkCancelReservesOneWholeFeeCoinPerBatch) {
+    // 20 offers at kCancelOffersBatchSize 5 is FOUR batch transactions, and
+    // the daemon charges batch_fee once per batch.  Reserving a single fee
+    // under-reserved by 4x -- the 2026-08-23 zero-spendable shape.
+    std::vector<Mojo> coins(10, kXch);
+    CoinLockLedger ledger(coins, /*floor=*/0, /*commit_frac=*/1.0);
+
+    reserve_bulk_cancel(ledger, kBatchFee, /*n_offers=*/20);
+
+    // WHOLE COINS, not 4 x kBatchFee: each batch transaction is submitted
+    // inside the same cycle, so the change from one cannot fund the next and
+    // each locks a different whole XCH coin.  This is the behaviour we mean
+    // to pin -- a 4-coin drain, not a 0.00004 XCH drain.
+    EXPECT_EQ(ledger.remaining(), 6 * kXch);
+    EXPECT_NE(ledger.remaining(), 10 * kXch - 4 * kBatchFee);
+    // Cancel fees are pool drains, never offer commitment (see note_lock).
+    EXPECT_EQ(ledger.committed(), 0);
+
+    // 21 offers cross into a fifth batch: the count follows the batch size
+    // the request actually carries, not a round number.
+    std::vector<Mojo> more(10, kXch);
+    CoinLockLedger spilled(more, 0, 1.0);
+    reserve_bulk_cancel(spilled, kBatchFee, /*n_offers=*/21);
+    EXPECT_EQ(spilled.remaining(), 5 * kXch);
+}
+
+TEST(CoinLockLedgerTest, BulkCancelWithNoTrackedOffersStillReservesOneBatch) {
+    // cancel_all:true cancels offers this process never tracked (a previous
+    // instance's book), so an empty tracked book is NOT a free call.  The
+    // >= 1 clamp must still reserve one whole fee coin.
+    std::vector<Mojo> coins(10, kXch);
+    CoinLockLedger ledger(coins, /*floor=*/0, /*commit_frac=*/1.0);
+
+    reserve_bulk_cancel(ledger, kBatchFee, /*n_offers=*/0);
+
+    EXPECT_EQ(ledger.remaining(), 9 * kXch);
+    EXPECT_EQ(ledger.committed(), 0);
+}
+
+TEST(CoinLockLedgerTest, BulkCancelDrainLeavesLessRoomForTheNextOffer) {
+    // The reservation is not bookkeeping -- it decides admissions.  Ten
+    // 1-XCH coins behind a 6-XCH fee-reserve floor: four batch drains land
+    // the pool exactly ON the floor, so the next offer lock must be refused.
+    // Reserving a single fee would leave 9 XCH and wrongly admit it, which
+    // is how an under-reservation walks the wallet toward zero spendable.
+    std::vector<Mojo> coins(10, kXch);
+    CoinLockLedger ledger(coins, /*floor=*/6 * kXch, /*commit_frac=*/1.0);
+
+    reserve_bulk_cancel(ledger, kBatchFee, /*n_offers=*/20);
+
+    EXPECT_EQ(ledger.remaining(), 6 * kXch);
+    EXPECT_FALSE(ledger.try_lock(kXch, 0));   // floor refuses; cap is fine
+    EXPECT_EQ(ledger.remaining(), 6 * kXch);  // a refusal locks nothing
 }
 
 // ---------------------------------------------------------------------------

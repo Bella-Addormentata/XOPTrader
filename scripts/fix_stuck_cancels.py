@@ -54,7 +54,11 @@ if not offers:
 else:
     # Step 3: Re-cancel with fee
     print(f"\n=== Step 3: Cancel {len(offers)} offers with fee={FEE/1e12} XCH ===")
-    r = rpc("cancel_offers", {"secure": True, "fee": FEE, "batch_fee": FEE})
+    # [S33 2026-09-11] cancel_all is required: without it the handler keeps
+    # only offers whose arbitrage() contains the XCH key and stops at the
+    # first batch of 5 holding none, so CAT/CAT offers survived this script.
+    # The "fee" key is ignored by the handler; batch_fee is what it reads.
+    r = rpc("cancel_offers", {"secure": True, "batch_fee": FEE, "cancel_all": True})
     print(f"  Result: success={r.get('success')}")
     if not r.get("success"):
         print(f"  Error: {r.get('error', 'unknown')}")

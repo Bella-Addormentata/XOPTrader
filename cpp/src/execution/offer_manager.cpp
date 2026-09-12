@@ -1250,7 +1250,9 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(
     bool bulk_ok = false;
     std::string bulk_err;
     try {
-        co_await cancel_offers_charged(current_fee_mojos_, /*secure=*/true);
+        co_await cancel_offers_charged(
+            current_fee_mojos_, /*secure=*/true,
+            static_cast<std::int64_t>(all_offers.size()));
         bulk_ok = true;
     } catch (const rpc::ChiaRPCError& e) {
         bulk_err = e.what();
@@ -3241,10 +3243,15 @@ asio::awaitable<json> OfferManager::cancel_offer_charged(
     co_return co_await wallet_->cancel_offer(trade_id, fee, secure);
 }
 
-asio::awaitable<json> OfferManager::cancel_offers_charged(std::uint64_t fee,
-                                                          bool          secure)
+asio::awaitable<json> OfferManager::cancel_offers_charged(
+    std::uint64_t fee, bool secure, std::int64_t n_offers)
 {
-    xch_cycle_ledger_.note_lock(0, static_cast<Mojo>(fee));
+    // [BULKCANCEL 2026-09-11] batch_fee is charged PER BATCH, so reserve one
+    // whole fee coin per batch rather than one for the whole call.
+    // [S33 2026-09-11] The arithmetic, the >= 1 clamp and the rationale live
+    // in execution/coin_lock_ledger.hpp so that ctest drives the same code
+    // this does -- inline here, the reservation had no coverage at all.
+    reserve_bulk_cancel(xch_cycle_ledger_, static_cast<Mojo>(fee), n_offers);
     co_return co_await wallet_->cancel_offers(fee, secure);
 }
 

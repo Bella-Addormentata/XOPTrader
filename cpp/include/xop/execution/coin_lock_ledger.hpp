@@ -47,10 +47,12 @@
 #ifndef XOP_EXECUTION_COIN_LOCK_LEDGER_HPP
 #define XOP_EXECUTION_COIN_LOCK_LEDGER_HPP
 
+#include "xop/rpc/wallet_requests.hpp"
 #include "xop/types.hpp"
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <vector>
 
@@ -320,6 +322,56 @@ private:
     Mojo              committed_{0};  // OFFER locks only
     bool              active_{false};
 };
+
+// ---------------------------------------------------------------------------
+// Bulk-cancel fee reservation
+// ---------------------------------------------------------------------------
+
+/// Reserve the XCH that one bulk `cancel_offers` of `n_offers` really locks.
+///
+/// [S33 2026-09-11] Extracted from OfferManager::cancel_offers_charged so that
+/// production and ctest run the SAME code: while these lines sat inside a
+/// coroutine needing a live wallet, reinstating the original single
+/// note_lock(0, fee) turned no test red.
+///
+/// ONE FEE PER BATCH IS EXACT; THE WHOLE-COIN DRAIN IS A DELIBERATE CEILING.
+/// The daemon charges batch_fee ONCE PER BATCH, so the call really spends
+/// fee * ceil(n_offers / batch_size).  That half is arithmetic.
+///
+/// The whole-coin half is the conservative one, and its mechanism is narrower
+/// than it first appears.  In chia 2.7.4 trade_manager.py the STANDARD_WALLET
+/// branch pays the fee OUT OF THE CANCELLATION COIN ITSELF
+/// (`if fee_to_pay > coin.amount: select_coins(fee_to_pay - coin.amount)`),
+/// reaching the free pool only for the SHORTFALL.  A free XCH coin is locked
+/// only when the batch's first cancellation coin is a CAT coin (bid offers) or
+/// is smaller than the fee.  So this reservation is EXACT for CAT-leg batches
+/// and OVER-RESERVES for XCH-leg ones -- the right direction on a shutdown
+/// path, since the pool reseeds every ~1-minute cycle while under-reserving is
+/// the 2026-08-23 zero-spendable incident.
+///
+/// It is still a loop of single-fee note_lock()s rather than one combined
+/// note_lock(0, fee * batches): a combined need would select ONE coin for the
+/// lot and undercount the locks -- the exact modelling error this ledger
+/// exists to fix (see the header comment).
+///
+/// The batch count is a FLOOR, not an exact figure: cancel_all:true also
+/// cancels offers this process never tracked (a previous instance's book),
+/// which can only ADD batches.  Over-reserving is the conservative direction;
+/// under-reserving is the 2026-08-23 zero-spendable incident.  The clamp to at
+/// least one batch covers n_offers == 0 for that same reason.
+inline void reserve_bulk_cancel(CoinLockLedger& ledger,
+                                Mojo            fee,
+                                std::int64_t    n_offers)
+{
+    std::int64_t batches = rpc::cancel_offers_batch_count(
+        n_offers, rpc::kCancelOffersBatchSize);
+    if (batches < 1) {
+        batches = 1;
+    }
+    for (std::int64_t i = 0; i < batches; ++i) {
+        ledger.note_lock(0, fee);
+    }
+}
 
 }  // namespace xop::execution
 

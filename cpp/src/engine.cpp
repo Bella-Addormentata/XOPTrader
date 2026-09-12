@@ -14482,10 +14482,14 @@ asio::awaitable<void> Engine::step_xch_recovery(BlockHeight block_height)
         // (~1 block) rather than immediately.
         bool cancel_ok = false;
         try {
-            co_await wallet_->cancel_offers(/*fee=*/0, /*secure=*/true);
-            spdlog::info("[Recovery] Wallet-level cancel_offers(fee=0, "
-                         "secure=true) succeeded -- cancel spends "
-                         "submitted for all pending offers");
+            co_await wallet_->cancel_offers(/*batch_fee=*/0, /*secure=*/true);
+            // [S33 2026-09-11] Name the parameters actually sent: the key
+            // is batch_fee (a plain "fee" is ignored by the handler), and
+            // cancel_all is what makes this cover CAT/CAT offers too.
+            spdlog::info("[Recovery] Wallet-level cancel_offers("
+                         "batch_fee=0, secure=true, cancel_all=true) "
+                         "succeeded -- cancel spends submitted for all "
+                         "pending offers");
             cancel_ok = true;
 
             // Also mark all tracked offers as cancel_pending.
@@ -16350,7 +16354,14 @@ asio::awaitable<void> Engine::step_ingest_reward_inflows(
     }
 
     // Newest 200 transactions comfortably cover the churn between daily
-    // reward batches (300 wallet transactions spanned ~7 weeks live).  A
+    // reward batches (300 wallet transactions spanned ~7 weeks live).
+    //
+    // [BULKCANCEL 2026-09-11] "Newest" is only NOW true.  get_transactions
+    // used to pass reverse=true, which RELEVANCE-orders confirmed rows
+    // OLDEST first: on the live DBX wallet (9,640 transactions) this window
+    // sat at block 8,543,202 while the chain was at 9,277,273, so every row
+    // fell at or below the ledger genesis block and is_reward_inflow
+    // rejected all of them.  Reward ingest was booking nothing at all.  A
     // reward that ever scrolled past this window would simply remain
     // wallet-vs-books divergence for the invariant to absorb -- the
     // pre-existing behaviour, not a new failure mode.
