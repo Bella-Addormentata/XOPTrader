@@ -104,11 +104,145 @@ OfferManager::OfferManager(asio::io_context&                    /*ioc*/,
         pair_config_map_.emplace(pc.name, pc);
     }
 
+    // [OFFER-EXPIRY] An on-chain expiry MUST outlast the longest life this
+    // bot itself intends for an offer.  If it does not, the chain retires
+    // offers the engine still believes are live: no cancel is ever
+    // recorded, and the book thins with nothing in the log to explain it.
+    // [review #150] Not claimed: that the coins come back.  Expiry makes an
+    // offer untakeable; only a cancel or a fill retires the trade, and
+    // nothing here documents what get_locked_coins() returns for an expired
+    // one -- so this bound protects tracking, not collateral.
+    //
+    // Checked here rather than in the config parser because this is where
+    // kHardTtlMultiplier lives; restating the multiplier in config.cpp
+    // would give one safety bound two definitions, free to drift apart.
+    //
+    // Every pair is checked, not only the global: a per-pair override is
+    // exactly where someone sets a short expiry without revisiting the TTL.
+    {
+        const auto check_expiry =
+            [&](std::uint32_t secs, const std::string& who) {
+                if (expiry_outlasts_hard_ttl(
+                        secs, strategy_cfg_.offer_ttl_blocks,
+                        kHardTtlMultiplier,
+                        strategy_cfg_.block_time_seconds)) {
+                    return;
+                }
+                const auto floor_s = static_cast<std::int64_t>(
+                    hard_ttl_seconds(strategy_cfg_.offer_ttl_blocks,
+                                     kHardTtlMultiplier,
+                                     strategy_cfg_.block_time_seconds)
+                    * kExpiryFloorMargin);
+                throw std::invalid_argument(
+                    who + " offer_expiry_secs (" + std::to_string(secs)
+                    + "s) must exceed " + std::to_string(floor_s)
+                    + "s -- the hard TTL (offer_ttl_blocks "
+                    + std::to_string(strategy_cfg_.offer_ttl_blocks)
+                    + " x " + std::to_string(kHardTtlMultiplier)
+                    + " blocks at a configured "
+                    + std::to_string(strategy_cfg_.block_time_seconds)
+                    + "s/block) times a safety margin, because the real "
+                      "block rate varies and an expiry inside the TTL would "
+                      "let the chain expire offers this engine still tracks "
+                      "as live");
+            };
+
+        check_expiry(strategy_cfg_.offer_expiry_secs, "strategy");
+        for (const auto& pc : config.pairs) {
+            if (pc.offer_expiry_secs_override.has_value()) {
+                check_expiry(*pc.offer_expiry_secs_override,
+                             "pair " + pc.name);
+            }
+        }
+    }
+
     logger_->info("OfferManager initialised: {} tiers, TTL {} blocks, "
                   "{} pairs",
                   strategy_cfg_.num_tiers,
                   strategy_cfg_.offer_ttl_blocks,
                   pair_config_map_.size());
+}
+
+// ---------------------------------------------------------------------------
+// [OFFER-EXPIRY] wiring -- the decisions live in offer_expiry.hpp
+// ---------------------------------------------------------------------------
+
+std::optional<std::uint64_t>
+OfferManager::expiry_max_time_for(const PairConfig& pair) const
+{
+    const std::uint32_t secs = effective_offer_expiry_secs(
+        pair.offer_expiry_secs_override, strategy_cfg_.offer_expiry_secs);
+
+    const auto now_s = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+
+    const auto max_time = expiry_max_time_from(
+        static_cast<std::int64_t>(now_s), secs);
+
+    if (secs > 0 && !max_time.has_value()) {
+        // Expiry was asked for and we declined to build one: the only way
+        // that happens is an unusable clock, which is worth saying out loud
+        // rather than silently posting an unbounded offer.
+        logger_->error("[offer-expiry] system clock returned {} -- posting "
+                       "{} WITHOUT an expiry", now_s, pair.name);
+    }
+    return max_time;
+}
+
+asio::awaitable<void>
+OfferManager::retire_offer_failed_expiry(const PendingOffer& adopt,
+                                         std::uint64_t expected_max_time,
+                                         const char*   context)
+{
+    logger_->error("[offer-expiry] {} offer {} for {} was created WITHOUT the "
+                   "requested expiry (max_time={}); retiring it rather than "
+                   "resting an offer whose lifetime we cannot bound",
+                   context, adopt.offer_id.substr(0, 12), adopt.pair_name,
+                   expected_max_time);
+
+    // Adopt BEFORE cancelling: the cancel is an unconfirmed spend and a
+    // counterparty can still take this offer first.  A fill on an unadopted
+    // trade is invisible to fill detection and to the next startup.
+    state_->upsert_offer(adopt);
+
+    try {
+        co_await cancel_offer_charged(
+            adopt.offer_id, xop::risk::watchdog_cancel().fee_mojos,
+            xop::risk::watchdog_cancel().secure);
+        // [review #150] Mark it, exactly as cancel_stale does after its own
+        // successful cancel.  Without this the adopted record keeps
+        // cancel_pending == false, so the next refresh sees a live-looking
+        // offer, fires a SECOND secure cancel, and pays a second fee on a
+        // spend already in flight.  The record deliberately stays in State
+        // either way: a secure cancel is unconfirmed, and a counterparty can
+        // still win the race.
+        state_->mark_cancel_pending(adopt.offer_id);
+    } catch (const std::exception& e) {
+        // [review #150] This path serves BOTH "the wallet dropped max_time"
+        // and "the wallet echoed a DIFFERENT max_time" -- expiry_echo_ok
+        // compares for equality, and EchoRejectedOnMismatch pins that.  In
+        // the second case the offer DOES carry a timelock, at an instant we
+        // do not know and which may be SOONER than our own TTL, so calling
+        // it unbounded inverts the remediation on the highest-severity page
+        // this feature can emit.  Report the echo failure and the value we
+        // requested; do not assert an absence we never verified.
+        logger_->critical("[offer-expiry] could not cancel {} -- it is LIVE "
+                          "with an UNVERIFIED expiry (requested max_time={}, "
+                          "not echoed back): {}",
+                          adopt.offer_id, expected_max_time, e.what());
+        if (escalate_) {
+            escalate_("an offer was created without its requested on-chain "
+                      "expiry (requested max_time="
+                      + std::to_string(expected_max_time)
+                      + ", not echoed back) and could NOT be cancelled; it is "
+                      "LIVE and its expiry is UNVERIFIED -- it may carry no "
+                      "timelock at all, or one at a different time: trade "
+                      + adopt.offer_id + " (" + e.what()
+                      + "). It IS tracked in State, so fills on it will be "
+                      "seen.");
+        }
+    }
+    co_return;
 }
 
 // ---------------------------------------------------------------------------
@@ -504,10 +638,15 @@ asio::awaitable<int> OfferManager::post_quotes(
         }
 
         // Step 2: Call wallet.create_offer() to produce the spend bundle.
+        // [OFFER-EXPIRY] nullopt unless this pair opted in, in which case
+        // the payload is unchanged from before the feature existed.
+        const std::optional<std::uint64_t> expiry_max_time =
+            expiry_max_time_for(pair);
         json result;
         try {
             result = co_await wallet_->create_offer(
-                offer_dict, current_fee_mojos_, /*validate_only=*/false);
+                offer_dict, current_fee_mojos_, /*validate_only=*/false,
+                expiry_max_time);
         } catch (const rpc::ChiaRPCError& e) {
             logger_->error("create_offer failed for {} {} tier {}: {}",
                            pair.name, to_string(tier.side),
@@ -601,6 +740,27 @@ asio::awaitable<int> OfferManager::post_quotes(
         } else {
             logger_->warn("No trade_id in create_offer response for {} tier {}",
                           pair.name, tier.tier_index);
+            continue;
+        }
+
+        // [OFFER-EXPIRY] Verified BEFORE dexie: publishing an offer whose
+        // expiry silently did not take would advertise a mis-specified
+        // offer to the whole market, while we believed it self-retires.
+        if (expiry_max_time.has_value()
+            && !expiry_echo_ok(result, *expiry_max_time)) {
+            PendingOffer adopt;
+            adopt.offer_id         = trade_id;
+            adopt.pair_name        = pair.name;
+            adopt.side             = tier.side;
+            adopt.price            = tier.price;
+            adopt.size             = tier.size;
+            adopt.tier             = tier.tier_index;
+            adopt.created_at_block = block_height;
+            adopt.created_at_ts    = std::chrono::system_clock::now();
+            adopt.fee_mojos        = current_fee_mojos_;
+            adopt.post_spread_bps  = tier.spread_bps;
+            co_await retire_offer_failed_expiry(adopt, *expiry_max_time,
+                                                "tier");
             continue;
         }
 
@@ -3432,12 +3592,17 @@ asio::awaitable<int> OfferManager::post_merged_side(
     // co_await cannot appear inside a catch handler in a C++20 coroutine,
     // so capture any exception info here and perform the fallback after the
     // try/catch block.
+    // [OFFER-EXPIRY] One merged offer, one timelock: the merged spend is a
+    // single offer and carries a single max_time.
+    const std::optional<std::uint64_t> expiry_max_time =
+        expiry_max_time_for(pair);
     json result;
     bool batch_failed = false;
     std::string batch_err;
     try {
         result = co_await wallet_->create_offer(
-            merged_dict, current_fee_mojos_, /*validate_only=*/false);
+            merged_dict, current_fee_mojos_, /*validate_only=*/false,
+            expiry_max_time);
     } catch (const rpc::ChiaRPCError& e) {
         batch_failed = true;
         batch_err = e.what();
@@ -3480,7 +3645,8 @@ asio::awaitable<int> OfferManager::post_merged_side(
             json sr;
             try {
                 sr = co_await wallet_->create_offer(
-                    single_dict, current_fee_mojos_, /*validate_only=*/false);
+                    single_dict, current_fee_mojos_, /*validate_only=*/false,
+                    expiry_max_time);
             } catch (const rpc::ChiaRPCError& e2) {
                 tier_failed = true;
                 tier_err = e2.what();
@@ -3541,6 +3707,27 @@ asio::awaitable<int> OfferManager::post_merged_side(
                 && sr.contains("trade_record")
                 && sr["trade_record"].contains("trade_id")
                 && sr["trade_record"]["trade_id"].is_string()) {
+                // [OFFER-EXPIRY] The fallback posts real, individual
+                // offers; skipping the check here would leave exactly one
+                // posting path able to rest an unbounded offer.
+                if (expiry_max_time.has_value()
+                    && !expiry_echo_ok(sr, *expiry_max_time)) {
+                    PendingOffer adopt;
+                    adopt.offer_id =
+                        sr["trade_record"]["trade_id"].get<std::string>();
+                    adopt.pair_name        = pair.name;
+                    adopt.side             = tier.side;
+                    adopt.price            = tier.price;
+                    adopt.size             = tier.size;
+                    adopt.tier             = tier.tier_index;
+                    adopt.created_at_block = block_height;
+                    adopt.created_at_ts    = std::chrono::system_clock::now();
+                    adopt.fee_mojos        = current_fee_mojos_;
+                    adopt.post_spread_bps  = tier.spread_bps;
+                    co_await retire_offer_failed_expiry(
+                        adopt, *expiry_max_time, "batch fallback");
+                    continue;
+                }
                 std::string offer_text = sr["offer"].get<std::string>();
                 PendingOffer po;
                 // Retain dexie's id so this offer is excluded from our own
@@ -3674,6 +3861,43 @@ asio::awaitable<int> OfferManager::post_merged_side(
 
     std::string trade_id   = result["trade_record"]["trade_id"].get<std::string>();
     std::string offer_text = result["offer"].get<std::string>();
+
+    // [OFFER-EXPIRY] Same fail-closed check as the single path, before the
+    // dexie submission.  One adoption record stands in for the whole merged
+    // offer, exactly as the tier loop below tracks every tier under this
+    // one trade_id.
+    if (expiry_max_time.has_value()
+        && !expiry_echo_ok(result, *expiry_max_time)) {
+        // [review #150] ONE AGGREGATE RECORD, not the first tier.  This is a
+        // single wallet trade carrying every merged tier, and upsert_offer is
+        // keyed by offer_id alone -- recording only tiers.front() under-books
+        // the size, so if the cancel loses the race to a taker the fill is
+        // accounted at a fraction of what was actually filled.  Same shape as
+        // the late-merged-create path above (round 11): total size, priced at
+        // the most conservative (worst-for-us) tier so fill accounting cannot
+        // overstate what the race can win.
+        PendingOffer adopt;
+        adopt.offer_id         = trade_id;
+        adopt.pair_name        = pair.name;
+        adopt.side             = tiers.front().side;
+        adopt.price            = tiers.front().price;
+        adopt.size             = 0;
+        for (const auto& t : tiers) {
+            adopt.size += t.size;
+            const bool worse = (t.side == Side::Bid)
+                ? t.price > adopt.price
+                : t.price < adopt.price;
+            if (worse) adopt.price = t.price;
+        }
+        adopt.tier             = tiers.front().tier_index;
+        adopt.created_at_block = block_height;
+        adopt.created_at_ts    = std::chrono::system_clock::now();
+        adopt.fee_mojos        = current_fee_mojos_;
+        adopt.post_spread_bps  = tiers.front().spread_bps;
+        co_await retire_offer_failed_expiry(adopt, *expiry_max_time,
+                                            "merged batch");
+        co_return 0;
+    }
 
     // Submit to dexie (best-effort).  Retain the id: every tier merged into
     // this batch rests on the book under it, and own-offer exclusion in the

@@ -1713,6 +1713,71 @@ TEST(ConfigParserTest, S33ActivityOverrides_EmptyMaxSpacingSequenceIsNotAnOverri
 }
 
 // ============================================================================
+// [OFFER-EXPIRY 2026-09-12] The per-pair expiry override, through the PARSER.
+//
+// test_offer_expiry.cpp drives effective_offer_expiry_secs() with an optional
+// it builds itself and never opens a YAML file -- this file contained ZERO
+// mentions of offer_expiry before these tests.  The gap is not cosmetic: the
+// bind is also the GATE on the startup floor check in OfferManager, so a
+// parser that quietly stopped binding would remove the pair from the one
+// validation standing between a short expiry and offers the chain retires
+// while the engine still tracks them as live.  Deleting the bind reddened
+// nothing before this.
+// ============================================================================
+
+TEST(ConfigParserTest, OfferExpiryOverride_ExplicitValueRoundTrips) {
+    // The load-bearing direction.  If this value never reaches the config the
+    // pair falls back to strategy.offer_expiry_secs -- 0 by default, i.e. NO
+    // timelock on precisely the pair configured to carry one, silently.
+    TempYaml tmp(with_pair_extra("offer_expiry_secs_override: 172800"));
+    auto cfg = xop::load_config(tmp.path());
+    ASSERT_FALSE(cfg.pairs.empty());
+    ASSERT_TRUE(cfg.pairs[0].offer_expiry_secs_override.has_value());
+    EXPECT_EQ(*cfg.pairs[0].offer_expiry_secs_override, 172800u);
+}
+
+TEST(ConfigParserTest, OfferExpiryOverride_ZeroBindsRatherThanInheriting) {
+    // 0 is a REAL setting -- "never expire this pair's offers" -- and must
+    // BIND, not read as absence.  The pure test that pins the value_or side
+    // builds its optional directly, so it stays green under a parser that
+    // drops an explicit 0.
+    TempYaml tmp(with_pair_extra("offer_expiry_secs_override: 0"));
+    auto cfg = xop::load_config(tmp.path());
+    ASSERT_FALSE(cfg.pairs.empty());
+    ASSERT_TRUE(cfg.pairs[0].offer_expiry_secs_override.has_value());
+    EXPECT_EQ(*cfg.pairs[0].offer_expiry_secs_override, 0u);
+}
+
+TEST(ConfigParserTest, OfferExpiryOverride_AbsentLeavesTheOptionalUnset) {
+    // Absence must be nullopt, NOT a defaulted 0: the consumer is
+    // effective_offer_expiry_secs(override, global), so a defaulted optional
+    // would pin every pair to "no expiry" and make the global unreachable.
+    TempYaml tmp(kMinimalValidYaml);
+    auto cfg = xop::load_config(tmp.path());
+    ASSERT_FALSE(cfg.pairs.empty());
+    EXPECT_FALSE(cfg.pairs[0].offer_expiry_secs_override.has_value());
+}
+
+TEST(ConfigParserTest, OfferExpiryOverride_NegativeAndAboveUint32Rejected) {
+    // CWE-681: straight to uint32 a YAML -1 wraps to 4294967295s (~136
+    // years), which reads as "configured" and behaves as "never expires" --
+    // and being enormous it also sails through the OfferManager floor check,
+    // so nothing downstream catches it.
+    //
+    // 4294967296 is UINT32_MAX + 1, the smallest value the upper bound owns,
+    // and deliberately not a larger literal: as<std::int64_t>() throws
+    // YAML::TypedBadConversion before this code runs, and parse_pairs is not
+    // inside a YAML::Exception handler, so a bigger number would not surface
+    // as a ConfigError at all.
+    for (const char* v : {"-1", "-86400", "4294967296"}) {
+        TempYaml tmp(with_pair_extra(
+            std::string("offer_expiry_secs_override: ") + v));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError)
+            << "offer_expiry_secs_override " << v;
+    }
+}
+
+// ============================================================================
 // [S33 2026-09-12] Non-finite values in the numeric knobs.
 //
 // yaml-cpp accepts `.nan` and `.inf`, and NaN makes EVERY comparison false --
