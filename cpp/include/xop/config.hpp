@@ -379,8 +379,17 @@ struct StrategyConfig {
     /// constructor, which can see that constant -- config.cpp cannot, and
     /// restating the multiplier there would give a safety bound two sources
     /// of truth.  An expiry inside our own TTL would silently retire offers
-    /// the engine still believes are live: no cancel is recorded, the coins
-    /// unlock, and the book thins with nothing in the log to explain it.
+    /// the engine still believes are live: no cancel is recorded, and the
+    /// book thins with nothing in the log to explain it.
+    ///
+    /// [review #150] What the COINS do is deliberately not claimed.
+    /// max_time stops an offer being TAKEN; whether the wallet still counts
+    /// an expired PENDING_ACCEPT trade in get_locked_coins() is established
+    /// nowhere in this repo, and an earlier revision asserted the
+    /// reassuring half of that ("the coins unlock") on no evidence.  What IS
+    /// verified is narrower: spendable selection subtracts get_locked_coins()
+    /// (docs/warp-unwrap-design.md section 7).  Do not rely on an expiry to
+    /// return collateral -- land a cancel.
     uint32_t offer_expiry_secs{0};
 
     // [ALWAYSOFFER 2026-08-30] Side-aware BBO sanity (see bbo_sanity.hpp).

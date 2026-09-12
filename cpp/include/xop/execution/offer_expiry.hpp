@@ -58,12 +58,33 @@ namespace xop::execution {
     return pair_override.value_or(global_secs);
 }
 
+/// The earliest wall-clock reading that could describe a LIVE Chia offer:
+/// mainnet genesis, 2021-03-19.
+///
+/// [review #150] The guard below rejected only now_unix_s <= 0.  A host
+/// reading 1 -- a dead RTC, a VM restored from a cold snapshot, a boot that
+/// beat NTP -- passed it and minted a max_time of 86401: an offer born
+/// expired.  Nothing downstream catches that, because expiry_echo_ok
+/// compares the wallet's echo against what we ASKED for, so an honest wallet
+/// echoing 86401 CONFIRMS it and the posting path publishes it.
+///
+/// This is a PLAUSIBILITY FLOOR, not a skew detector, and the difference is
+/// the honest part: with one untrusted clock and no second opinion, a clock
+/// merely hours slow is undetectable here -- and the config floor puts
+/// expiry_secs above 2x the hard TTL, so "hours slow" is the interesting
+/// range.  No trusted timestamp exists at the call site: OfferManager holds
+/// no full-node client, no wallet endpoint returns a wall clock, and
+/// deriving one from block height is the units error this header already
+/// refuses at kExpiryFloorMargin.  What it does catch is every clock wrong
+/// enough to be obvious, routed into the same fail-safe as a zero reading.
+inline constexpr std::int64_t kMinPlausibleUnixTime = 1'616'162'400;
+
 /// The absolute unix timestamp to send as max_time, or nullopt when no
 /// timelock should be attached at all.
 ///
-/// nullopt for a disabled expiry, and nullopt for a nonsensical clock: a
-/// wallet host whose clock reads at or before the epoch would otherwise turn
-/// a safety feature into an offer that is born expired.  Posting without an
+/// nullopt for a disabled expiry, and nullopt for a clock too far in the
+/// past to be describing a live offer: such a host would otherwise turn a
+/// safety feature into an offer that is born expired.  Posting without an
 /// expiry is the safe way to be wrong here -- the offer still rests, and the
 /// bot's own TTL still cancels it.
 [[nodiscard]] inline std::optional<std::uint64_t> expiry_max_time_from(
@@ -71,7 +92,7 @@ namespace xop::execution {
     std::uint32_t expiry_secs) noexcept
 {
     if (expiry_secs == 0) return std::nullopt;
-    if (now_unix_s <= 0)  return std::nullopt;
+    if (now_unix_s < kMinPlausibleUnixTime) return std::nullopt;
     return static_cast<std::uint64_t>(now_unix_s)
          + static_cast<std::uint64_t>(expiry_secs);
 }
@@ -122,8 +143,11 @@ namespace xop::execution {
 /// Whether a configured expiry is safe to use.
 ///
 /// An expiry INSIDE our own hard TTL would let the chain retire offers the
-/// engine still believes are live: no cancel is ever recorded, the coins
-/// quietly unlock, and the book thins with nothing in the log to explain it.
+/// engine still believes are live: no cancel is ever recorded, and the book
+/// thins with nothing in the log to explain it.  [review #150] Whether the
+/// coins are released is NOT claimed here: max_time governs takeability, and
+/// this repo establishes only that spendable selection subtracts
+/// get_locked_coins() -- not what that call returns for an EXPIRED trade.
 /// A disabled expiry (0) is trivially safe -- there is nothing to outlast.
 ///
 /// Safety margin applied to the floor.

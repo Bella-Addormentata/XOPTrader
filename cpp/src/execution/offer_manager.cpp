@@ -107,8 +107,11 @@ OfferManager::OfferManager(asio::io_context&                    /*ioc*/,
     // [OFFER-EXPIRY] An on-chain expiry MUST outlast the longest life this
     // bot itself intends for an offer.  If it does not, the chain retires
     // offers the engine still believes are live: no cancel is ever
-    // recorded, the coins quietly unlock, and the book thins with nothing
-    // in the log to explain it.
+    // recorded, and the book thins with nothing in the log to explain it.
+    // [review #150] Not claimed: that the coins come back.  Expiry makes an
+    // offer untakeable; only a cancel or a fill retires the trade, and
+    // nothing here documents what get_locked_coins() returns for an expired
+    // one -- so this bound protects tracking, not collateral.
     //
     // Checked here rather than in the config parser because this is where
     // kHardTtlMultiplier lives; restating the multiplier in config.cpp
@@ -215,14 +218,28 @@ OfferManager::retire_offer_failed_expiry(const PendingOffer& adopt,
         // still win the race.
         state_->mark_cancel_pending(adopt.offer_id);
     } catch (const std::exception& e) {
+        // [review #150] This path serves BOTH "the wallet dropped max_time"
+        // and "the wallet echoed a DIFFERENT max_time" -- expiry_echo_ok
+        // compares for equality, and EchoRejectedOnMismatch pins that.  In
+        // the second case the offer DOES carry a timelock, at an instant we
+        // do not know and which may be SOONER than our own TTL, so calling
+        // it unbounded inverts the remediation on the highest-severity page
+        // this feature can emit.  Report the echo failure and the value we
+        // requested; do not assert an absence we never verified.
         logger_->critical("[offer-expiry] could not cancel {} -- it is LIVE "
-                          "with no expiry: {}", adopt.offer_id, e.what());
+                          "with an UNVERIFIED expiry (requested max_time={}, "
+                          "not echoed back): {}",
+                          adopt.offer_id, expected_max_time, e.what());
         if (escalate_) {
             escalate_("an offer was created without its requested on-chain "
-                      "expiry and could NOT be cancelled; it is LIVE and "
-                      "unbounded: trade " + adopt.offer_id + " ("
-                      + e.what() + "). It IS tracked in State, so fills on "
-                      "it will be seen.");
+                      "expiry (requested max_time="
+                      + std::to_string(expected_max_time)
+                      + ", not echoed back) and could NOT be cancelled; it is "
+                      "LIVE and its expiry is UNVERIFIED -- it may carry no "
+                      "timelock at all, or one at a different time: trade "
+                      + adopt.offer_id + " (" + e.what()
+                      + "). It IS tracked in State, so fills on it will be "
+                      "seen.");
         }
     }
     co_return;

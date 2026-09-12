@@ -835,7 +835,15 @@ std::vector<PairConfig> parse_pairs(const YAML::Node& root)
 
         // [OFFER-EXPIRY] Per-pair expiry, in seconds.  Parsed through
         // int64_t so a negative literal is REJECTED rather than wrapping to
-        // a four-billion-second expiry (CWE-681, as read_uint32 does).
+        // a four-billion-second expiry (CWE-681).
+        //
+        // [review #150] An earlier revision of this comment blamed
+        // read_uint32 for that wrap.  It does not wrap: config.cpp:230-242
+        // reads through int64_t and throws on value < 0 or > UINT32_MAX --
+        // the same bound this block applies.  The hand-rolled copy is
+        // therefore redundant, not necessary.  It is kept here only because
+        // the tests below pin THIS shape; collapsing it into read_uint32 is
+        // the right follow-up, and would leave one definition of one bound.
         // 0 is a real setting -- "never expire this pair's offers" -- and
         // binds; absence leaves the optional empty and inherits the global.
         if (item["offer_expiry_secs_override"]

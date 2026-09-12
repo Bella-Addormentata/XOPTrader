@@ -105,6 +105,17 @@ TEST(OfferExpiry, NormalClockProducesNowPlusExpiry) {
     EXPECT_EQ(*t, 1'757'000'000ull + 86400ull);
 }
 
+TEST(OfferExpiry, StalePositiveClockAlsoProducesNoTimelock) {
+    // [review #150] The guard rejected only epoch-and-before, so a host clock
+    // reading 1 minted max_time 86401 -- an offer born expired.  An honest
+    // wallet echoes that back EXACTLY, so expiry_echo_ok CONFIRMS it and the
+    // posting path publishes an unfillable offer.
+    EXPECT_FALSE(expiry_max_time_from(1, 86400u).has_value());
+    EXPECT_FALSE(expiry_max_time_from(1'000'000'000, 86400u).has_value());
+    // A floor, not a window: genesis itself still yields a timelock.
+    EXPECT_TRUE(expiry_max_time_from(1'616'162'400, 86400u).has_value());
+}
+
 TEST(OfferExpiry, BrokenClockProducesNoTimelockRatherThanABornExpiredOffer) {
     // A host clock at or before the epoch would otherwise mint a max_time in
     // the past: the offer would be dead on arrival while we believed it live.
