@@ -1617,10 +1617,11 @@ TEST(ConfigParserTest, S33ActivityOverrides_AbsentMeansUnsetNotDefaulted) {
 }
 
 TEST(ConfigParserTest, S33ActivityOverrides_OutOfRangeValuesRejected) {
-    // Strictly positive knobs.  `.nan` is included only where the guard is
-    // written `!(v > 0.0)`, which catches it; it is deliberately NOT asserted
-    // against the `v < 0.0` guards, where NaN compares false and is accepted
-    // -- asserting there would pin behaviour this change does not implement.
+    // Strictly positive knobs.  `.nan` was once asserted only where the guard
+    // was written `!(v > 0.0)`, because the `v < 0.0` guards accepted it.
+    // That hole is now closed for this whole family -- see
+    // S33ActivityOverrides_NonFiniteRejected below, which owns the non-finite
+    // cases; the ordinary out-of-range values stay here.
     for (const char* v : {"0", "0.0", "-1.0", ".nan"}) {
         TempYaml tmp(with_pair_extra(
             std::string("max_half_spread_bps_override: ") + v));
@@ -1690,6 +1691,147 @@ TEST(ConfigParserTest, S33ActivityOverrides_EmptyMaxSpacingSequenceIsNotAnOverri
     auto cfg = xop::load_config(tmp.path());
     ASSERT_FALSE(cfg.pairs.empty());
     EXPECT_FALSE(cfg.pairs[0].tier_spacing_max_bps_override.has_value());
+}
+
+// ============================================================================
+// [S33 2026-09-12] Non-finite values in the numeric knobs.
+//
+// yaml-cpp accepts `.nan` and `.inf`, and NaN makes EVERY comparison false --
+// so `v < 0.0` and `v <= 0.0` were not bounds at all against it.  What gets
+// through is not a visibly wrong number in a log line:
+//
+//   * a NaN fair_value_residual_widen_ratio_override then fails the Step 7
+//     consumer's own `widen_ratio > 0.0` gate, SILENTLY DISABLING the
+//     residual widener on precisely the pair configured to use it;
+//   * a non-finite activity_book_weight_override rides eff_bids/eff_asks
+//     through the interpolated side spacings into the ladder prices, as a
+//     double, right up to the integer conversion;
+//   * a non-finite min_profit_margin_max_bps_override collapses the activity
+//     interpolation that reads it as the wide end.
+//
+// The house already rejects non-finite values explicitly at peg_target,
+// strategy.xch_cycle_commit_frac and the market_data bounds, so these sites
+// were an inconsistency rather than a deliberate permissiveness.
+// ============================================================================
+
+namespace {
+
+/// Assert load_config rejects `yaml` AND that the message names `key` and
+/// cites finiteness.  A bare EXPECT_THROW would also be satisfied by a throw
+/// for an unrelated reason -- a mis-spliced YAML line, say -- and would then
+/// pin nothing at all while reading as a passing guard test.
+void expect_non_finite_rejected(const std::string& yaml,
+                                const char* key,
+                                const char* bad) {
+    TempYaml tmp(yaml);
+    try {
+        xop::load_config(tmp.path());
+        ADD_FAILURE() << key << " accepted " << bad;
+    } catch (const xop::ConfigError& e) {
+        const std::string msg = e.what();
+        EXPECT_NE(msg.find(key), std::string::npos)
+            << key << " = " << bad << ": threw, but not about that key: "
+            << msg;
+        EXPECT_NE(msg.find("finite"), std::string::npos)
+            << key << " = " << bad << ": threw, but not the finiteness "
+            << "guard: " << msg;
+    }
+}
+
+}  // namespace
+
+TEST(ConfigParserTest, S33ActivityOverrides_NonFiniteRejected) {
+    // The three per-pair keys whose guards were written `v < 0.0` / `v <= 0.0`
+    // and so admitted NaN; `.inf` is the other half of the same hole.
+    for (const char* key : {"fair_value_residual_widen_ratio_override",
+                            "activity_book_weight_override",
+                            "min_profit_margin_max_bps_override"}) {
+        for (const char* bad : {".nan", ".inf", "-.inf"}) {
+            expect_non_finite_rejected(
+                with_pair_extra(std::string(key) + ": " + bad), key, bad);
+        }
+    }
+}
+
+TEST(ConfigParserTest, S33ActivityOverrides_FiniteValuesStillParseAfterGuard) {
+    // The acceptance direction, which matters as much as the rejection: 0.0 is
+    // the DOCUMENTED disable for both >= 0 knobs (Section C drives XCH/BYC
+    // with exactly these), and a guard that over-rejected would take the
+    // operator's escape hatch away at load time.
+    TempYaml tmp(with_pair_extra(
+        "min_profit_margin_max_bps_override: 800.0\n"
+        "    activity_book_weight_override: 0.0\n"
+        "    fair_value_residual_widen_ratio_override: 0.0"));
+    auto cfg = xop::load_config(tmp.path());
+    ASSERT_FALSE(cfg.pairs.empty());
+    const auto& pc = cfg.pairs[0];
+    ASSERT_TRUE(pc.min_profit_margin_max_bps_override.has_value());
+    EXPECT_DOUBLE_EQ(*pc.min_profit_margin_max_bps_override, 800.0);
+    ASSERT_TRUE(pc.activity_book_weight_override.has_value());
+    EXPECT_DOUBLE_EQ(*pc.activity_book_weight_override, 0.0);
+    ASSERT_TRUE(pc.fair_value_residual_widen_ratio_override.has_value());
+    EXPECT_DOUBLE_EQ(*pc.fair_value_residual_widen_ratio_override, 0.0);
+}
+
+TEST(ConfigParserTest, StrategyNonNegativeKnobs_NonFiniteRejected) {
+    // The shared opt_non_negative helper feeds all 23 keys below, so the hole
+    // was 23 keys wide -- including activity_book_weight, newly exposed as a
+    // global by this branch.  Every one of them is a magnitude whose
+    // documented "disabled" setting is 0 (config.hpp), so none wants +inf.
+    for (const char* key : {"max_fair_value_deviation_bps",
+                            "blind_quote_widen_pct",
+                            "fair_value_clamp_tier_step_bps",
+                            "quote_width_sigma_mult",
+                            "as_reservation_gamma",
+                            "as_reservation_max_offset_bps",
+                            "fair_value_feed_sigma_bps",
+                            "fair_value_amm_sigma_bps",
+                            "fair_value_amm_depth_k_bps",
+                            "fair_value_amm_max_age_sec",
+                            "fair_value_min_book_sigma_bps",
+                            "fair_value_stale_sigma_bps_per_print",
+                            "fair_value_depth_ref_bps",
+                            "fair_value_max_sigma_bps",
+                            "fair_value_tight_sigma_bps",
+                            "fair_value_sigma_band_mult",
+                            "fair_value_residual_widen_ratio",
+                            "fair_value_residual_widen_floor_bps",
+                            "microprice_narrow_bps",
+                            "microprice_wide_bps",
+                            "published_mid_band_floor_bps",
+                            "published_mid_band_spread_frac",
+                            "activity_book_weight"}) {
+        for (const char* bad : {".nan", ".inf", "-.inf"}) {
+            expect_non_finite_rejected(
+                with_strategy_keys(std::string("\n  ") + key + ": " + bad),
+                key, bad);
+        }
+    }
+}
+
+TEST(ConfigParserTest, StrategyNonNegativeKnobs_FiniteValuesStillParse) {
+    // Valid values must survive the guard and reach the config.  The pairs
+    // chosen here also satisfy the two cross-checks that run AFTER the
+    // helper (wide > narrow, tight <= max), so a failure here is the guard
+    // and not a coherence rule firing.
+    TempYaml tmp(with_strategy_keys(
+        "\n  activity_book_weight: 0.75"
+        "\n  fair_value_residual_widen_ratio: 0.3"
+        "\n  microprice_narrow_bps: 150.0"
+        "\n  microprice_wide_bps: 900.0"
+        "\n  fair_value_max_sigma_bps: 250.0"
+        "\n  fair_value_tight_sigma_bps: 120.0"
+        "\n  quote_width_sigma_mult: 0.0"));
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_DOUBLE_EQ(cfg.strategy.activity_book_weight, 0.75);
+    EXPECT_DOUBLE_EQ(cfg.strategy.fair_value_residual_widen_ratio, 0.3);
+    EXPECT_DOUBLE_EQ(cfg.strategy.microprice_narrow_bps, 150.0);
+    EXPECT_DOUBLE_EQ(cfg.strategy.microprice_wide_bps, 900.0);
+    EXPECT_DOUBLE_EQ(cfg.strategy.fair_value_max_sigma_bps, 250.0);
+    EXPECT_DOUBLE_EQ(cfg.strategy.fair_value_tight_sigma_bps, 120.0);
+    // 0 is the documented "disabled" setting for the sigma term and must
+    // still load -- the finiteness guard must not narrow the legal domain.
+    EXPECT_DOUBLE_EQ(cfg.strategy.quote_width_sigma_mult, 0.0);
 }
 
 TEST(ConfigParserTest, SideQualityKnobs_ExplicitValuesParse) {

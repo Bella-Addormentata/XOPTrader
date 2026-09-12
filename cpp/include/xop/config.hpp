@@ -181,6 +181,41 @@ struct PairConfig {
     std::optional<double>   bbo_sanity_max_aggressive_dev_override;
     std::optional<double>   bbo_sanity_max_passive_dev_override;
 
+    // [S33 2026-09-12] Per-pair ceiling for the two-sides-agree bypass,
+    // overriding market_data.book_side_agree_max_spread_bps for this pair.
+    //
+    // That knob is ONE number for the WHOLE BOT: it reaches MarketDataConfig
+    // once in Engine::Engine and the single MarketDataFeed built from it
+    // serves every enabled market. So lowering it to 1500 to stop XCH/BYC's
+    // 10,769 bps book from marking equity also denied the bypass to every
+    // other pair whose book happened to sit between 15% and 50% wide -- a
+    // retune nobody asked for, invisible in the diff that caused it.
+    //
+    // Absent -> the market_data value, so every pair without an entry is
+    // unchanged.
+    //
+    // BEFORE SETTING THIS, READ THE MarketDataConfig COMMENT ON
+    // book_side_agree_max_spread_bps IN THIS FILE, AND READ IT TOGETHER WITH
+    // mid_gate_book_confirm_max_spread_bps -- that header says the two must
+    // be read together before either is changed, and a per-pair value does
+    // not excuse you from it. Three consequences carry over unchanged:
+    //
+    //   * the value actually used is the min() of this and the gate's
+    //     mid_gate_book_confirm_max_spread_bps
+    //     (bookside::effective_agree_max_spread_bps), so RAISING this above
+    //     the gate does nothing;
+    //   * the gate threshold is NOT per-pair, so this can only ever make one
+    //     pair STRICTER than the bot-wide setting, never more permissive
+    //     than the gate;
+    //   * 0 is the documented "bypass off" SETTING and binds; absence is the
+    //     empty optional, which is a different thing.
+    //
+    // And the cost is per-pair too: lowering this can cost THIS pair its
+    // mid_valuation_grade (apply_mid_gate requires the book's own spread to
+    // be within the effective value), which falls to the S20 carry and then
+    // degrades the cycle. Fail-closed, and intended -- but budget for it.
+    std::optional<double>   book_side_agree_max_spread_bps_override;
+
     // -- Market revival -----------------------------------------------------
     // Opt-in for a pair whose third-party book is expected to be empty or
     // stale (every offer outside the 20% outlier band).  Normally Step 7

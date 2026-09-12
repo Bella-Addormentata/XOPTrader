@@ -808,6 +808,31 @@ std::vector<PairConfig> parse_pairs(const YAML::Node& root)
         read_dev_override("bbo_sanity_max_passive_dev_override",
                           p.bbo_sanity_max_passive_dev_override);
 
+        // [S33 2026-09-12] Per-pair two-sides-agree ceiling. Same UNITS and
+        // the same validation as the market_data section's own copy of this
+        // knob (bps, finite, >= 0) -- deliberately identical, because the
+        // per-pair value is substituted for the global one rather than
+        // combined with it.  0 is the documented "bypass off" SETTING and is
+        // accepted as such; ABSENCE is the key being missing, which leaves
+        // the optional empty and the pair on the global value.  There is no
+        // upper bound to check here: a value wider than
+        // market_data.mid_gate_book_confirm_max_spread_bps is not an error,
+        // it simply has no effect (see effective_agree_max_spread_bps).
+        if (item["book_side_agree_max_spread_bps_override"]
+            && item["book_side_agree_max_spread_bps_override"].IsDefined()
+            && !item["book_side_agree_max_spread_bps_override"].IsNull()) {
+            const double agree_bps =
+                item["book_side_agree_max_spread_bps_override"].as<double>();
+            if (!std::isfinite(agree_bps) || agree_bps < 0.0) {
+                throw ConfigError(
+                    idx + ".book_side_agree_max_spread_bps_override must be a "
+                    "finite value >= 0 (basis points; 0 disables the "
+                    "two-sides-agree bypass for this pair); got "
+                    + std::to_string(agree_bps));
+            }
+            p.book_side_agree_max_spread_bps_override = agree_bps;
+        }
+
         if (item["competitive_anchor_enabled_override"]
             && item["competitive_anchor_enabled_override"].IsDefined()
             && !item["competitive_anchor_enabled_override"].IsNull()) {
@@ -838,8 +863,15 @@ std::vector<PairConfig> parse_pairs(const YAML::Node& root)
             && item["fair_value_residual_widen_ratio_override"].IsDefined()
             && !item["fair_value_residual_widen_ratio_override"].IsNull()) {
             double v = item["fair_value_residual_widen_ratio_override"].as<double>();
-            if (v < 0.0) {
-                throw ConfigError(idx + ".fair_value_residual_widen_ratio_override must be >= 0; got "
+            // [S33 2026-09-12] Finiteness explicitly, as at peg_target above.
+            // yaml-cpp accepts `.nan`, NaN fails `v < 0.0`, and the Step 7
+            // consumer then gates on `widen_ratio > 0.0` -- false for NaN too
+            // -- so a NaN here SILENTLY DISABLES the residual widener on
+            // exactly the pair configured to use it.  +inf is the opposite
+            // failure: it widens every tier without bound.
+            if (!std::isfinite(v) || v < 0.0) {
+                throw ConfigError(idx + ".fair_value_residual_widen_ratio_override must be a "
+                                        "finite value >= 0; got "
                                   + std::to_string(v));
             }
             p.fair_value_residual_widen_ratio_override = v;
@@ -862,8 +894,14 @@ std::vector<PairConfig> parse_pairs(const YAML::Node& root)
             && item["activity_book_weight_override"].IsDefined()
             && !item["activity_book_weight_override"].IsNull()) {
             double v = item["activity_book_weight_override"].as<double>();
-            if (v < 0.0) {
-                throw ConfigError(idx + ".activity_book_weight_override must be >= 0; got " + std::to_string(v));
+            // [S33 2026-09-12] A non-finite weight is not contained: it flows
+            // into eff_bids/eff_asks, through the interpolated per-side
+            // spacings, and reaches the ladder prices as a double before they
+            // are converted to integers -- where NaN/inf is a domain error,
+            // not a visibly wrong number.  Reject it at load.
+            if (!std::isfinite(v) || v < 0.0) {
+                throw ConfigError(idx + ".activity_book_weight_override must be a finite "
+                                        "value >= 0; got " + std::to_string(v));
             }
             p.activity_book_weight_override = v;
         }
@@ -871,8 +909,12 @@ std::vector<PairConfig> parse_pairs(const YAML::Node& root)
             && item["min_profit_margin_max_bps_override"].IsDefined()
             && !item["min_profit_margin_max_bps_override"].IsNull()) {
             double v = item["min_profit_margin_max_bps_override"].as<double>();
-            if (v <= 0.0) {
-                throw ConfigError(idx + ".min_profit_margin_max_bps_override must be > 0; got " + std::to_string(v));
+            // [S33 2026-09-12] `NaN <= 0.0` is false, so the bare check let a
+            // non-finite wide-end margin through and collapsed the activity
+            // interpolation that reads it.
+            if (!std::isfinite(v) || v <= 0.0) {
+                throw ConfigError(idx + ".min_profit_margin_max_bps_override must be a finite "
+                                        "value > 0; got " + std::to_string(v));
             }
             p.min_profit_margin_max_bps_override = v;
         }
@@ -1040,8 +1082,16 @@ StrategyConfig parse_strategy(const YAML::Node& root)
     auto opt_non_negative = [&](const char* key, double& dest) {
         if (!node[key] || !node[key].IsDefined() || node[key].IsNull()) return;
         const double v = node[key].as<double>();
-        if (v < 0.0) {
-            throw ConfigError(sec + "." + key + " must be >= 0; got "
+        // [S33 2026-09-12] Rejected HERE rather than at each call site: every
+        // key routed through this helper is a magnitude -- a sigma, a bps
+        // bound, a ratio, a weight -- and each one documents 0 as its
+        // "disabled" setting (see config.hpp), so none of them needs +inf as
+        // a sentinel.  NaN passes `v < 0.0` and then poisons whatever it
+        // feeds; +inf turns a cap into no cap at all.  Same treatment as
+        // strategy.xch_cycle_commit_frac and the market_data bounds.
+        if (!std::isfinite(v) || v < 0.0) {
+            throw ConfigError(sec + "." + key + " must be a finite value "
+                                                ">= 0; got "
                               + std::to_string(v));
         }
         dest = v;

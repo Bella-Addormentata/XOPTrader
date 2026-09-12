@@ -571,6 +571,19 @@ Engine::Engine(const AppConfig& config, bool dry_run)
         config_.market_data.book_side_anchor_band_ratio;
     md_cfg.book_side_agree_max_spread_bps =
         config_.market_data.book_side_agree_max_spread_bps;
+    // [S33 2026-09-12] ...and the per-pair overrides of it.  ONE feed serves
+    // every pair, so without this the line above is a bot-wide retune however
+    // local the operator's intent was.  Populated for EVERY pair, not just
+    // the enabled ones: the map is keyed by name and read on lookup, so
+    // carrying a disabled pair's override costs nothing and stops the value
+    // from silently vanishing when a pair is enabled and the engine restarted.
+    for (const auto& md_pair_cfg : config_.pairs) {
+        if (md_pair_cfg.book_side_agree_max_spread_bps_override) {
+            md_cfg.set_agree_max_spread_bps_for(
+                md_pair_cfg.name,
+                *md_pair_cfg.book_side_agree_max_spread_bps_override);
+        }
+    }
     market_data_ = std::make_unique<MarketDataFeed>(md_cfg, *state_);
 
     // -- Data / analytics (per-pair estimators) --------------------------------
