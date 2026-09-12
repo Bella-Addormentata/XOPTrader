@@ -1786,7 +1786,13 @@ TEST(ConfigParserTest, PairPositiveOverrides_NonFiniteRejected) {
                             "depeg_warn_pct",
                             "depeg_bail_pct",
                             "competitive_anchor_max_distance_bps_override",
-                            "competitive_anchor_stride_bps_override"}) {
+                            "competitive_anchor_stride_bps_override",
+                            // [review #151] Its own loop in
+                            // S33ActivityOverrides_OutOfRangeValuesRejected
+                            // carries .nan but NOT .inf, and this guard is a
+                            // SEPARATE parser copy: removing its isfinite
+                            // left the suite green.
+                            "max_half_spread_bps_override"}) {
         for (const char* bad : {".inf", "-.inf", ".nan"}) {
             expect_non_finite_rejected(
                 with_pair_extra(std::string(key) + ": " + bad), key, bad);
@@ -1799,6 +1805,21 @@ TEST(ConfigParserTest, PairPositiveOverrides_NonFiniteRejected) {
             with_pair_extra(std::string("min_offer_size_units_override: ")
                             + bad),
             "min_offer_size_units_override", bad);
+    }
+
+    // [review #151] The NARROW-end sequence had NO coverage of any kind --
+    // zero mentions in this file -- while carrying its own copy of the
+    // guard. Both positions, because a first-element failure and a later one
+    // propagate differently through the ladder.
+    //
+    // Two elements, not three: kMinimalValidYaml declares num_tiers: 2, so a
+    // longer list risks throwing on a LENGTH check instead of the finiteness
+    // guard -- which would look like coverage while proving nothing.
+    for (const char* seq : {"[.inf, 80]", "[40, .inf]",
+                            "[-.inf, 80]", "[40, .nan]"}) {
+        expect_non_finite_rejected(
+            with_pair_extra(std::string("tier_spacing_bps_override: ") + seq),
+            "tier_spacing_bps_override", seq);
     }
 }
 
