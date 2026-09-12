@@ -216,6 +216,13 @@ struct PairConfig {
     // degrades the cycle. Fail-closed, and intended -- but budget for it.
     std::optional<double>   book_side_agree_max_spread_bps_override;
 
+    // [OFFER-EXPIRY] Per-pair override of strategy.offer_expiry_secs.
+    // Absence inherits the global; 0 is a real setting ("never expire this
+    // pair's offers") and binds, exactly as with the agree-ceiling above.
+    // Expiry is opt-in per pair because its cost falls on TAKERS running
+    // older wallets, a population we cannot survey from here.
+    std::optional<std::uint32_t> offer_expiry_secs_override;
+
     // -- Market revival -----------------------------------------------------
     // Opt-in for a pair whose third-party book is expected to be empty or
     // stale (every offer outside the 20% outlier band).  Normally Step 7
@@ -349,6 +356,32 @@ struct StrategyConfig {
     double   q_max{1000.0};
     double   min_profit_margin_bps{35.0};   // Never ask below cost + this.
     uint32_t offer_ttl_blocks{60};          // Cancel stale offers after N blocks.
+
+    /// [OFFER-EXPIRY] On-chain expiry for offers we CREATE, in seconds.
+    /// 0 (the default) disables the feature entirely: no timelock is
+    /// attached and offers behave exactly as they did before it existed.
+    ///
+    /// Sent to create_offer_for_ids as `max_time` -- an ABSOLUTE unix
+    /// timestamp (now + this) that becomes ASSERT_BEFORE_SECONDS_ABSOLUTE on
+    /// the offer's spend, so an offer we lose track of stops being takeable
+    /// without us having to land a cancel for it.
+    ///
+    /// ONLY max_time is ever sent.  Chia exposes four absolute timelock
+    /// flags, but per Chia's own Offer RPC reference the reference wallet
+    /// "will only recognize max_time"; max_height, min_height and min_time
+    /// are enforced on-chain yet a reference-wallet taker's transaction
+    /// "will be initiated, but will fail".  For a market maker that is an
+    /// outage wearing the costume of a safety feature -- the book still
+    /// shows our offer, takers still try, and every take fails.
+    ///
+    /// Must exceed this bot's OWN hard TTL (offer_ttl_blocks x
+    /// OfferManager::kHardTtlMultiplier).  Validated in OfferManager's
+    /// constructor, which can see that constant -- config.cpp cannot, and
+    /// restating the multiplier there would give a safety bound two sources
+    /// of truth.  An expiry inside our own TTL would silently retire offers
+    /// the engine still believes are live: no cancel is recorded, the coins
+    /// unlock, and the book thins with nothing in the log to explain it.
+    uint32_t offer_expiry_secs{0};
 
     // [ALWAYSOFFER 2026-08-30] Side-aware BBO sanity (see bbo_sanity.hpp).
     // Aggressive deviation (would EXECUTE dislocated) keeps the tight

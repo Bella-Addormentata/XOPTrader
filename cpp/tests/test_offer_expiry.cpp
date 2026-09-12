@@ -1,0 +1,255 @@
+// ---------------------------------------------------------------------------
+// [OFFER-EXPIRY] The on-chain offer-expiry decisions.
+//
+// These pin four things, each of which is a way the feature could quietly
+// become harmful rather than protective:
+//
+//   1. A per-pair 0 means "no expiry HERE" and must bind, not inherit.
+//   2. A broken host clock must produce no timelock, never a born-expired
+//      offer.
+//   3. The wallet's echo must be verified, and every not-honoured shape --
+//      absent, null, wrong type, mismatched -- must read as failure.  A
+//      wallet that ignores max_time returns SUCCESS with the flag missing,
+//      so a permissive check here would rest offers we wrongly believe
+//      self-retire.
+//   4. An expiry must outlast our own hard TTL, or the chain retires offers
+//      the engine still tracks as live.
+//
+// The functions are pure and clock-free precisely so this file can drive
+// them; nothing here constructs an OfferManager.
+// ---------------------------------------------------------------------------
+
+#include <gtest/gtest.h>
+
+#include <nlohmann/json.hpp>
+
+#include <cstdint>
+#include <limits>
+#include <optional>
+
+#include "xop/execution/offer_expiry.hpp"
+#include "xop/rpc/chia_rpc.hpp"
+
+using nlohmann::json;
+using xop::execution::effective_offer_expiry_secs;
+using xop::execution::expiry_echo_ok;
+using xop::execution::expiry_max_time_from;
+using xop::execution::expiry_outlasts_hard_ttl;
+using xop::execution::hard_ttl_seconds;
+using xop::rpc::ChiaWalletRPC;
+
+namespace {
+
+// A response shaped like the one chia 2.7.3 actually returns; the
+// valid_times block below was captured from a live get_all_offers.
+json response_with_max_time(const json& max_time_value) {
+    json vt = {
+        {"max_blocks_after_created", nullptr},
+        {"max_height",               nullptr},
+        {"max_secs_after_created",   nullptr},
+        {"max_time",                 max_time_value},
+        {"min_blocks_since_created", nullptr},
+        {"min_height",               nullptr},
+        {"min_secs_since_created",   nullptr},
+        {"min_time",                 nullptr},
+    };
+    return json{{"offer", "offer1abc"},
+                {"trade_record", {{"trade_id", "0xdeadbeef"},
+                                  {"valid_times", vt}}}};
+}
+
+constexpr std::uint32_t kTtlBlocks = 60;
+constexpr std::uint32_t kHardMult  = 2;
+constexpr double        kSecsBlock = 18.75;
+
+}  // namespace
+
+// ===========================================================================
+// 1. Which expiry applies to a pair
+// ===========================================================================
+
+TEST(OfferExpiry, AbsentOverrideInheritsTheGlobal) {
+    EXPECT_EQ(effective_offer_expiry_secs(std::nullopt, 86400u), 86400u);
+    EXPECT_EQ(effective_offer_expiry_secs(std::nullopt, 0u), 0u);
+}
+
+TEST(OfferExpiry, PresentOverrideWins) {
+    EXPECT_EQ(effective_offer_expiry_secs(std::optional<std::uint32_t>{7200u},
+                                          86400u),
+              7200u);
+}
+
+TEST(OfferExpiry, ZeroOverrideBindsAndDoesNotInherit) {
+    // The whole point of the optional: 0 is "never expire THIS pair's
+    // offers".  If this ever returns the global, a pair deliberately opted
+    // out of expiry starts attaching timelocks anyway.
+    EXPECT_EQ(effective_offer_expiry_secs(std::optional<std::uint32_t>{0u},
+                                          86400u),
+              0u);
+}
+
+// ===========================================================================
+// 2. Turning that into an absolute max_time
+// ===========================================================================
+
+TEST(OfferExpiry, DisabledProducesNoTimelock) {
+    EXPECT_FALSE(expiry_max_time_from(1'757'000'000, 0u).has_value());
+}
+
+TEST(OfferExpiry, NormalClockProducesNowPlusExpiry) {
+    const auto t = expiry_max_time_from(1'757'000'000, 86400u);
+    ASSERT_TRUE(t.has_value());
+    EXPECT_EQ(*t, 1'757'000'000ull + 86400ull);
+}
+
+TEST(OfferExpiry, BrokenClockProducesNoTimelockRatherThanABornExpiredOffer) {
+    // A host clock at or before the epoch would otherwise mint a max_time in
+    // the past: the offer would be dead on arrival while we believed it live.
+    for (std::int64_t now : {std::int64_t{0}, std::int64_t{-1},
+                             std::numeric_limits<std::int64_t>::min()}) {
+        EXPECT_FALSE(expiry_max_time_from(now, 86400u).has_value())
+            << "clock " << now << " must produce no timelock";
+    }
+}
+
+// ===========================================================================
+// 3. Verifying the wallet's echo -- every check fails closed
+// ===========================================================================
+
+TEST(OfferExpiry, EchoAcceptedOnlyWhenItMatchesExactly) {
+    const std::uint64_t want = 1'757'086'400ull;
+    EXPECT_TRUE(expiry_echo_ok(response_with_max_time(want), want));
+}
+
+TEST(OfferExpiry, EchoRejectedWhenTheWalletSilentlyDroppedTheFlag) {
+    // This is the shape a wallet that does not support max_time returns:
+    // a successful create whose valid_times carries a null max_time.
+    const std::uint64_t want = 1'757'086'400ull;
+    EXPECT_FALSE(expiry_echo_ok(response_with_max_time(nullptr), want));
+}
+
+TEST(OfferExpiry, EchoRejectedOnMismatch) {
+    const std::uint64_t want = 1'757'086'400ull;
+    EXPECT_FALSE(expiry_echo_ok(response_with_max_time(want - 1), want));
+    EXPECT_FALSE(expiry_echo_ok(response_with_max_time(want + 1), want));
+}
+
+TEST(OfferExpiry, EchoRejectedOnWrongType) {
+    // A string that happens to spell the right number is not an echo.
+    const std::uint64_t want = 1'757'086'400ull;
+    EXPECT_FALSE(expiry_echo_ok(response_with_max_time("1757086400"), want));
+}
+
+TEST(OfferExpiry, EchoRejectedOnMalformedResponses) {
+    const std::uint64_t want = 1'757'086'400ull;
+    // No trade_record at all.
+    EXPECT_FALSE(expiry_echo_ok(json{{"offer", "offer1abc"}}, want));
+    // trade_record present but not an object.
+    EXPECT_FALSE(expiry_echo_ok(json{{"trade_record", "nope"}}, want));
+    // trade_record without valid_times -- the pre-2.x response shape.
+    EXPECT_FALSE(expiry_echo_ok(
+        json{{"trade_record", {{"trade_id", "0xabc"}}}}, want));
+    // valid_times present but not an object.
+    EXPECT_FALSE(expiry_echo_ok(
+        json{{"trade_record", {{"valid_times", 5}}}}, want));
+    // Entirely empty.
+    EXPECT_FALSE(expiry_echo_ok(json::object(), want));
+}
+
+// ===========================================================================
+// 4. The startup floor: expiry must outlast our own hard TTL
+// ===========================================================================
+
+TEST(OfferExpiry, HardTtlSecondsIsSoftTtlTimesMultiplier) {
+    // 60 blocks x 2 x 18.75s = 2250s.
+    EXPECT_DOUBLE_EQ(hard_ttl_seconds(kTtlBlocks, kHardMult, kSecsBlock),
+                     2250.0);
+}
+
+TEST(OfferExpiry, DisabledExpiryIsTriviallySafe) {
+    EXPECT_TRUE(expiry_outlasts_hard_ttl(0u, kTtlBlocks, kHardMult,
+                                         kSecsBlock));
+}
+
+TEST(OfferExpiry, ExpiryInsideTheHardTtlIsRejected) {
+    // 1800s < 2250s: the chain would retire offers the canceller still
+    // considers live, with no cancel ever recorded.
+    EXPECT_FALSE(expiry_outlasts_hard_ttl(1800u, kTtlBlocks, kHardMult,
+                                          kSecsBlock));
+}
+
+TEST(OfferExpiry, ExpiryExactlyOnTheHardTtlIsRejected) {
+    // A tie is a race between the chain and the canceller; not worth entering.
+    EXPECT_FALSE(expiry_outlasts_hard_ttl(2250u, kTtlBlocks, kHardMult,
+                                          kSecsBlock));
+}
+
+TEST(OfferExpiry, ExpiryBeyondTheHardTtlIsAccepted) {
+    EXPECT_TRUE(expiry_outlasts_hard_ttl(2251u, kTtlBlocks, kHardMult,
+                                         kSecsBlock));
+    EXPECT_TRUE(expiry_outlasts_hard_ttl(86400u, kTtlBlocks, kHardMult,
+                                         kSecsBlock));
+}
+
+// ===========================================================================
+// 5. The RPC payload -- what we send, and more importantly what we never send
+// ===========================================================================
+
+TEST(OfferExpiryPayload, NoTimelockKeysAtAllWhenExpiryIsDisabled) {
+    const auto p = ChiaWalletRPC::build_create_offer_payload(
+        json{{"1", -1000}}, 10000000ull, false, std::nullopt);
+    // Byte-identical to the pre-feature payload: three keys, nothing else.
+    EXPECT_EQ(p.size(), 3u);
+    EXPECT_TRUE(p.contains("offer"));
+    EXPECT_TRUE(p.contains("fee"));
+    EXPECT_TRUE(p.contains("validate_only"));
+    EXPECT_FALSE(p.contains("max_time"));
+}
+
+TEST(OfferExpiryPayload, MaxTimeIsSentWhenRequested) {
+    const auto p = ChiaWalletRPC::build_create_offer_payload(
+        json{{"1", -1000}}, 10000000ull, false,
+        std::optional<std::uint64_t>{1'757'086'400ull});
+    ASSERT_TRUE(p.contains("max_time"));
+    EXPECT_EQ(p["max_time"].get<std::uint64_t>(), 1'757'086'400ull);
+}
+
+TEST(OfferExpiryPayload, NeverSendsTheFlagsThatBreakTakers) {
+    // THE load-bearing test of this feature.  max_height, min_height and
+    // min_time are enforced on-chain but a reference-wallet taker fails on
+    // them, so an offer carrying one is visible and unfillable.  If this
+    // ever goes red, offers stop being takeable by most of the market.
+    for (const auto& mt : {std::optional<std::uint64_t>{},
+                           std::optional<std::uint64_t>{1'757'086'400ull}}) {
+        const auto p = ChiaWalletRPC::build_create_offer_payload(
+            json{{"1", -1000}}, 10000000ull, false, mt);
+        EXPECT_FALSE(p.contains("max_height"));
+        EXPECT_FALSE(p.contains("min_height"));
+        EXPECT_FALSE(p.contains("min_time"));
+        // The relative flags are not supported by this API at all.
+        EXPECT_FALSE(p.contains("max_blocks_after_created"));
+        EXPECT_FALSE(p.contains("max_secs_after_created"));
+        EXPECT_FALSE(p.contains("min_blocks_since_created"));
+        EXPECT_FALSE(p.contains("min_secs_since_created"));
+    }
+}
+
+TEST(OfferExpiryPayload, BaseFieldsAreUnchangedByExpiry) {
+    const json dict{{"1", -1000}, {"2", 50}};
+    const auto without = ChiaWalletRPC::build_create_offer_payload(
+        dict, 12345ull, true, std::nullopt);
+    auto with = ChiaWalletRPC::build_create_offer_payload(
+        dict, 12345ull, true, std::optional<std::uint64_t>{999ull});
+    with.erase("max_time");
+    // Adding an expiry must change NOTHING else about the request.
+    EXPECT_EQ(without, with);
+}
+
+TEST(OfferExpiry, TheFloorTracksTheConfiguredTtlRatherThanAFixedNumber) {
+    // The example config ships offer_ttl_blocks: 600 -> hard TTL 22500s, so
+    // a value that is generous at TTL 60 is REJECTED at TTL 600.  This is
+    // why the bound is computed from config instead of hardcoded.
+    EXPECT_TRUE(expiry_outlasts_hard_ttl(3600u, 60u, kHardMult, kSecsBlock));
+    EXPECT_FALSE(expiry_outlasts_hard_ttl(3600u, 600u, kHardMult, kSecsBlock));
+    EXPECT_TRUE(expiry_outlasts_hard_ttl(86400u, 600u, kHardMult, kSecsBlock));
+}

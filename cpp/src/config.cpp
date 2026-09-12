@@ -833,6 +833,30 @@ std::vector<PairConfig> parse_pairs(const YAML::Node& root)
             p.book_side_agree_max_spread_bps_override = agree_bps;
         }
 
+        // [OFFER-EXPIRY] Per-pair expiry, in seconds.  Parsed through
+        // int64_t so a negative literal is REJECTED rather than wrapping to
+        // a four-billion-second expiry (CWE-681, as read_uint32 does).
+        // 0 is a real setting -- "never expire this pair's offers" -- and
+        // binds; absence leaves the optional empty and inherits the global.
+        if (item["offer_expiry_secs_override"]
+            && item["offer_expiry_secs_override"].IsDefined()
+            && !item["offer_expiry_secs_override"].IsNull()) {
+            const std::int64_t secs =
+                item["offer_expiry_secs_override"].as<std::int64_t>();
+            if (secs < 0
+                || secs > static_cast<std::int64_t>(
+                              std::numeric_limits<std::uint32_t>::max())) {
+                throw ConfigError(
+                    idx + ".offer_expiry_secs_override must be in [0, "
+                    + std::to_string(
+                          std::numeric_limits<std::uint32_t>::max())
+                    + "] seconds (0 disables on-chain expiry for this pair); "
+                      "got " + std::to_string(secs));
+            }
+            p.offer_expiry_secs_override =
+                static_cast<std::uint32_t>(secs);
+        }
+
         if (item["competitive_anchor_enabled_override"]
             && item["competitive_anchor_enabled_override"].IsDefined()
             && !item["competitive_anchor_enabled_override"].IsNull()) {
@@ -1018,6 +1042,20 @@ StrategyConfig parse_strategy(const YAML::Node& root)
     }
     cfg.min_profit_margin_bps = read_positive_double(node, "min_profit_margin_bps", sec);
     cfg.offer_ttl_blocks     = read_uint32_positive(node, "offer_ttl_blocks", sec);
+
+    // [OFFER-EXPIRY] Optional.  Absent or 0 means no on-chain expiry is
+    // attached to the offers we create -- the behaviour that existed before
+    // this key, and the behaviour every deployment keeps until it opts in.
+    //
+    // The floor (an expiry must outlast our OWN hard TTL) is deliberately
+    // NOT checked here: kHardTtlMultiplier lives in offer_manager.hpp, which
+    // this layer does not include, and restating the multiplier would fork a
+    // safety bound into two constants that can drift apart.  OfferManager's
+    // constructor owns that check.
+    if (node["offer_expiry_secs"] && node["offer_expiry_secs"].IsDefined()
+        && !node["offer_expiry_secs"].IsNull()) {
+        cfg.offer_expiry_secs = read_uint32(node, "offer_expiry_secs", sec);
+    }
     cfg.num_tiers            = read_uint32_positive(node, "num_tiers", sec);
 
     cfg.tier_spacing_bps = read_positive_double_seq(node, "tier_spacing_bps", sec);

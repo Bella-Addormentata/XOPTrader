@@ -34,6 +34,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -865,9 +866,26 @@ asio::awaitable<std::vector<json>> ChiaWalletRPC::get_wallets()
 asio::awaitable<json>
 ChiaWalletRPC::create_offer(const json&   offer_dict,
                              std::uint64_t fee,
-                             bool          validate_only)
+                             bool          validate_only,
+                             std::optional<std::uint64_t> max_time)
 {
     // The Chia wallet RPC endpoint is "create_offer_for_ids".
+    const json payload = build_create_offer_payload(
+        offer_dict, fee, validate_only, max_time);
+
+    const json resp = co_await rpc_post("create_offer_for_ids", payload);
+
+    // Return the full response so callers can access both the bech32 offer
+    // text (.offer) and the trade record (.trade_record).
+    co_return resp;
+}
+
+json ChiaWalletRPC::build_create_offer_payload(
+    const json&    offer_dict,
+    std::uint64_t  fee,
+    bool           validate_only,
+    const std::optional<std::uint64_t>& max_time)
+{
     // offer_dict maps wallet_id (as string key) -> signed mojo amount.
     json payload = {
         {"offer",         offer_dict},
@@ -875,11 +893,22 @@ ChiaWalletRPC::create_offer(const json&   offer_dict,
         {"validate_only", validate_only}
     };
 
-    const json resp = co_await rpc_post("create_offer_for_ids", payload);
-
-    // Return the full response so callers can access both the bech32 offer
-    // text (.offer) and the trade record (.trade_record).
-    co_return resp;
+    // [OFFER-EXPIRY] Attached only when the caller asks, so an unconfigured
+    // deployment sends exactly the payload it sent before this existed.
+    //
+    // max_time is the ONLY one of Chia's four absolute timelock flags that a
+    // reference-wallet TAKER honours.  max_height, min_height and min_time
+    // are enforced by the chain, but the reference wallet does not apply
+    // them until it submits the spend bundle to the mempool, so taking such
+    // an offer "will be initiated, but will fail" (Chia Offer RPC
+    // reference).  Sending one would leave our offers visible and
+    // unfillable -- strictly worse than having no expiry at all.  The
+    // relative flags (max_blocks_after_created and friends) are not
+    // supported by this API.  test_offer_expiry pins all of this.
+    if (max_time.has_value()) {
+        payload["max_time"] = *max_time;
+    }
+    return payload;
 }
 
 asio::awaitable<json>

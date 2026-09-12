@@ -51,6 +51,7 @@
 #include <nlohmann/json.hpp>
 
 #include "xop/execution/coin_lock_ledger.hpp"
+#include "xop/execution/offer_expiry.hpp"
 #include "xop/execution/take_retry.hpp"
 #include <spdlog/spdlog.h>
 
@@ -824,6 +825,34 @@ public:
     /// (soft × multiplier) is the absolute safety cap: offers past this
     /// age are always expired regardless of price accuracy.
     static constexpr std::uint32_t kHardTtlMultiplier = 2;
+
+    /// Nominal Chia block time in seconds.  Used ONLY to compare an
+    /// offer-expiry configured in seconds against a TTL configured in
+    /// blocks, once, at startup.  Nothing schedules on it, so drift in the
+    /// real block rate cannot desynchronise anything; it would only make
+    /// the startup floor slightly conservative, which is the safe way to be
+    /// wrong.
+    static constexpr double kSecondsPerBlock = 18.75;
+
+    // -- [OFFER-EXPIRY] wiring (the decisions are in offer_expiry.hpp) ------
+
+    /// The absolute max_time to attach to @p pair's next offer, or nullopt
+    /// when this pair has expiry disabled -- in which case the RPC payload
+    /// is byte-identical to the one sent before this feature existed.
+    /// Supplies the clock and the config; the arithmetic is
+    /// expiry_max_time_from().
+    std::optional<std::uint64_t> expiry_max_time_for(
+        const PairConfig& pair) const;
+
+    /// Adopt, then cancel, an offer created WITHOUT the expiry we asked
+    /// for.  Adoption comes first for the same reason as the watchdog's
+    /// late-create path: a secure cancel is an unconfirmed spend, and a
+    /// fill on an unadopted trade is invisible both to fill detection and
+    /// to the next startup reconcile.
+    asio::awaitable<void> retire_offer_failed_expiry(
+        const PendingOffer& adopt,
+        std::uint64_t       expected_max_time,
+        const char*         context);
 
     /**
      * @brief Emergency cancel with reduced or zero fee.
