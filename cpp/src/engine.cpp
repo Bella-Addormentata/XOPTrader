@@ -374,12 +374,42 @@ ActivitySchedules interpolate_activity_schedules(
     return out;
 }
 
+// [S33 2026-09-12] See the contract in engine.hpp.  The gate IS this
+// function; a version that counts every offer is the defect it exists to
+// close.  EQUALITY -- not >=, not a wall-clock age: heights are unique per
+// heartbeat, so anything not stamped with THIS height was carried over.
+BookActivity fresh_book_depth(const std::vector<CompetingOffer>& offers,
+                              BlockHeight                        now_block)
+{
+    BookActivity out;
+    for (const auto& co : offers) {
+        if (co.last_seen_block != now_block) {
+            ++out.stale_ignored;
+            continue;
+        }
+        if (co.side == Side::Bid) ++out.bids;
+        else if (co.side == Side::Ask) ++out.asks;
+    }
+    return out;
+}
+
 // [S33 2026-09-05] See the contract in engine.hpp.
 Mojo xch_mark_price_mojos(Mojo xch_usd_mojos, double registered_factor)
 {
     if (xch_usd_mojos > 0 && registered_factor > 0.0) {
-        return static_cast<Mojo>(std::llround(
-            static_cast<double>(xch_usd_mojos) / registered_factor));
+        // [S33 review] Checked, not cast.  The guard above screens sign and
+        // NaN, not MAGNITUDE: nothing bounds peg_target from below (config.cpp
+        // requires finite and > 0; PeggedAsset::is_coherent requires > 0 and
+        // <= kMaxPegTarget), and a par asset is trusted by construction, so an
+        // arbitrarily small positive factor reaches this divisor and the
+        // quotient leaves Mojo.  llround on an out-of-range double returns an
+        // UNSPECIFIED value, so the check has to be BEFORE the call.  Falling
+        // through to the existing `return 0` is this function's established
+        // "do not mark", exactly as for an unpriceable pair.
+        if (const auto m = to_mojo_checked(
+                static_cast<double>(xch_usd_mojos) / registered_factor)) {
+            return *m;
+        }
     }
     return 0;
 }
@@ -6855,7 +6885,7 @@ void Engine::update_fair_values()
 }
 
 // Step 7: Generate multi-tier offer ladder.
-void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
+void Engine::step_generate_ladder(BlockHeight block_height)
 {
     // -- Per-asset portfolio percentages (for asset-level drift guard) ----
     // Computed once per cycle: XCH-equivalent value of each asset divided
@@ -7961,11 +7991,26 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                 std::tie(bids_24h, asks_24h) = db_->query_trade_counts_by_side(pair_name, since_block);
             }
 
-            std::size_t book_bids = 0;
-            std::size_t book_asks = 0;
-            for (const auto& co : comp_offers) {
-                if (co.side == Side::Bid) ++book_bids;
-                else if (co.side == Side::Ask) ++book_asks;
+            // [S33 2026-09-12] FRESHNESS GATE -- see the contract in
+            // engine.hpp.  competing_offers_ has no TTL and no pruner, so an
+            // offers-fetch failure leaves Step 7 holding the PREVIOUS cycle's
+            // book (the stale-book path documented at the fetch above).
+            // Counting those retained offers as live depth holds alpha up,
+            // and alpha interpolates DOWN toward the tight end -- so an
+            // outage would leave quotes TIGHT through exactly the window the
+            // wide schedule exists to protect.  bids_24h/asks_24h are NOT
+            // gated: they come from the DB and survive the outage, so a stale
+            // book degrades this pair to fills-only activity, not to zero.
+            const BookActivity book_depth =
+                fresh_book_depth(comp_offers, block_height);
+            const std::size_t book_bids = book_depth.bids;
+            const std::size_t book_asks = book_depth.asks;
+            if (book_depth.stale_ignored > 0) {
+                spdlog::warn("[Engine] Step 7: ignored {} competing offers "
+                             "not seen in block {} for {} activity "
+                             "(offers feed down?)",
+                             book_depth.stale_ignored, block_height,
+                             pair_name);
             }
 
             const double book_weight = pair_cfg

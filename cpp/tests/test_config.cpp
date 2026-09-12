@@ -1773,6 +1773,88 @@ TEST(ConfigParserTest, S33ActivityOverrides_FiniteValuesStillParseAfterGuard) {
     EXPECT_DOUBLE_EQ(*pc.fair_value_residual_widen_ratio_override, 0.0);
 }
 
+TEST(ConfigParserTest, S33BookSideAgreeOverride_RoundTripsAbsentAndLegalZero) {
+    // [S33 2026-09-12] The per-pair two-sides-agree ceiling had no PARSER
+    // test.  The behavioural tests build a MarketDataConfig by hand and call
+    // set_agree_max_spread_bps_for() directly, so a misspelled key or a lost
+    // `p.` assignment in the pairs loop would leave this optional empty, drop
+    // the pair back to the bot-wide 5000 bps default, and break no test.
+    // The fallback is silent and strictly MORE permissive -- it re-arms the
+    // two-sides-agree bypass on a dislocated book, which is the phantom mark
+    // this branch exists to stop.  Parser only: engine.cpp populating the
+    // MarketDataConfig map from these optionals is not reachable from here.
+
+    // Round-trip: pins the key SPELLING and the optional binding.
+    TempYaml tmp_set(with_pair_extra(
+        "book_side_agree_max_spread_bps_override: 1500.0"));
+    auto cfg_set = xop::load_config(tmp_set.path());
+    ASSERT_FALSE(cfg_set.pairs.empty());
+    const auto& pc_set = cfg_set.pairs[0];
+    ASSERT_TRUE(pc_set.book_side_agree_max_spread_bps_override.has_value());
+    EXPECT_DOUBLE_EQ(*pc_set.book_side_agree_max_spread_bps_override, 1500.0);
+
+    // Absent: nullopt, NOT a defaulted number.  The engine tests the optional
+    // to decide whether to record a map entry at all, so a defaulted 0 would
+    // pin every pair to a DISABLED bypass instead of the global value.
+    TempYaml tmp_absent(kMinimalValidYaml);
+    auto cfg_absent = xop::load_config(tmp_absent.path());
+    ASSERT_FALSE(cfg_absent.pairs.empty());
+    EXPECT_FALSE(cfg_absent.pairs[0]
+                     .book_side_agree_max_spread_bps_override.has_value());
+
+    // Legal zero, ENGAGED.  0 is the documented "bypass off" SETTING for the
+    // pair, not absence; a presence check rewritten as a truthiness check
+    // (`v > 0.0`) breaks only this case and leaves 1500.0 working.
+    TempYaml tmp_zero(with_pair_extra(
+        "book_side_agree_max_spread_bps_override: 0.0"));
+    auto cfg_zero = xop::load_config(tmp_zero.path());
+    ASSERT_FALSE(cfg_zero.pairs.empty());
+    const auto& pc_zero = cfg_zero.pairs[0];
+    ASSERT_TRUE(pc_zero.book_side_agree_max_spread_bps_override.has_value());
+    EXPECT_DOUBLE_EQ(*pc_zero.book_side_agree_max_spread_bps_override, 0.0);
+}
+
+TEST(ConfigParserTest, S33BookSideAgreeOverride_NonFiniteRejected) {
+    // [review] The fourth case the review asked for, and the rejection twin
+    // of the round-trip test above.  yaml-cpp hands back `.nan` / `.inf`
+    // happily; the guard is `!std::isfinite(v) || v < 0.0`, and THIS test
+    // pins only the isfinite conjunct -- the negative half is pinned
+    // separately below so a mutation can tell the two apart.
+    //
+    // An admitted `.inf` here would be the permissive direction: an infinite
+    // ceiling re-arms the two-sides-agree bypass on any book, which is the
+    // phantom mark this branch exists to stop.
+    const char* const kKey = "book_side_agree_max_spread_bps_override";
+    for (const char* bad : {".nan", ".inf", "-.inf"}) {
+        expect_non_finite_rejected(
+            with_pair_extra(std::string(kKey) + ": " + bad), kKey, bad);
+    }
+}
+
+TEST(ConfigParserTest, S33BookSideAgreeOverride_NegativeRejected) {
+    // The OTHER conjunct.  A finite negative is not "non-finite", so it does
+    // not belong in the helper above despite throwing from the same site --
+    // and keeping it separate is what lets a mutation that drops `v < 0.0`
+    // go red HERE while the non-finite test stays green.
+    //
+    // Not a bare EXPECT_THROW: load_config throws for many reasons, and a
+    // mis-spliced YAML line would satisfy one while pinning nothing.  The
+    // message must name the key.
+    const char* const kKey = "book_side_agree_max_spread_bps_override";
+    for (const char* bad : {"-1.0", "-0.1"}) {
+        TempYaml tmp(with_pair_extra(std::string(kKey) + ": " + bad));
+        try {
+            xop::load_config(tmp.path());
+            ADD_FAILURE() << kKey << " accepted negative " << bad;
+        } catch (const xop::ConfigError& e) {
+            const std::string msg = e.what();
+            EXPECT_NE(msg.find(kKey), std::string::npos)
+                << kKey << " = " << bad
+                << ": threw, but not about that key: " << msg;
+        }
+    }
+}
+
 TEST(ConfigParserTest, StrategyNonNegativeKnobs_NonFiniteRejected) {
     // The shared opt_non_negative helper feeds all 23 keys below, so the hole
     // was 23 keys wide -- including activity_book_weight, newly exposed as a

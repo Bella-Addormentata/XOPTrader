@@ -1700,7 +1700,10 @@ asio::awaitable<void> OfferManager::ensure_wallet_ids()
 //     - Bid: new optimal < old price -> our bid is too high (overpaying)
 //     - Ask: new optimal > old price -> our ask is too low (underselling)
 //   Favorable deviations (bid drifted below optimal, ask drifted above)
-//   make the offer more conservative and are safe to leave live.
+//   make the offer more conservative and are safe to leave live -- with one
+//   exception: in the normal zone [S33] refreshes a favorable drift past 3x
+//   the tier threshold (kFavorableDriftMultiplier, cross_guard.hpp) as a
+//   disconnected quote.  Past the soft TTL, direction alone decides.
 //
 //   Additionally, if the offer has crossed the mid-price it is flagged
 //   for urgent cancellation regardless of threshold.
@@ -1916,10 +1919,12 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
         //        tier 2 -> 1.00%   tier 3 -> 1.25%
 
         // [S33 2026-09-12] The four zones above are now selected by
-        // classify_tier_refresh (cross_guard.hpp).  Same order, same
-        // inequalities, same 3x favorable multiplier -- moved only so
-        // xop_tests can drive them: OfferManager cannot be constructed
-        // without a wallet RPC client, so nothing was covering this.
+        // classify_tier_refresh (cross_guard.hpp) -- moved only so xop_tests
+        // can drive them: OfferManager cannot be constructed without a wallet
+        // RPC client, so nothing was covering this.  The extraction itself is
+        // behavior-preserving, but this block is NOT identical to main: the
+        // normal zone's 3x favorable multiplier was added by 922b183 earlier
+        // in this same PR.
         {
             const double tier_threshold = kSelectiveRefreshThreshold
                 * (1.0 + static_cast<double>(po.tier) * kTierThresholdScale);

@@ -210,6 +210,18 @@ pairs:
     # competitive_anchor_stride_bps_override: 20.0         # [OPTIONAL, default: unset -> strategy.competitive_anchor_stride_bps] must be > 0
     # fair_value_residual_widen_ratio_override: 0.25       # [OPTIONAL, default: unset -> strategy.fair_value_residual_widen_ratio] 0 disables residual widening here; must be >= 0
 
+    # -- Per-pair override of a MARKET_DATA-level key (not a strategy one) --
+    # Ceiling in BASIS POINTS -- not a fraction; contrast the BBO block below.
+    # Absent -> market_data.book_side_agree_max_spread_bps (5000 by default).
+    # Must be finite and >= 0; 0 disables the two-sides-agree bypass for this
+    # pair.  ONE-WAY: the effective value is min(this,
+    # market_data.mid_gate_book_confirm_max_spread_bps), so RAISING it above
+    # that gate does NOTHING -- this can only make one pair STRICTER, never
+    # more permissive than the bot-wide gate.  Lowering it can cost THIS pair
+    # its mid_valuation_grade (valuation falls to the S20 carry); read the
+    # market_data comment on book_side_agree_max_spread_bps before setting it.
+    # book_side_agree_max_spread_bps_override: 1500.0      # [OPTIONAL, default: unset -> market_data.book_side_agree_max_spread_bps]
+
     # -- Per-pair 24h activity-adaptive controller --
     # See strategy.activity_adaptive_spacing for what the controller does.
     # The first three mirror their strategy-level namesakes and are unset by

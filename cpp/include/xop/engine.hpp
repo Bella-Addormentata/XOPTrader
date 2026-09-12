@@ -391,6 +391,50 @@ struct ActivitySchedules {
     std::size_t                num_tiers);
 
 // ---------------------------------------------------------------------------
+// BookActivity / fresh_book_depth -- the resting-depth half of Step 7's
+// activity controller, with the staleness gate that term requires.
+//
+// [S33 2026-09-12] MarketDataFeed::competing_offers_ has no TTL and no
+// pruner, and ingest_competing_offers is its only writer.  When the dexie
+// offers fetch throws, Step 1 warns and CONTINUES, so the store keeps the
+// previous cycle's book and get_competing_book hands it back unchanged --
+// the same stale-book path Step 7's fetch comment documents.  Counting those
+// retained offers as live depth holds alpha up, and because alpha
+// interpolates DOWN toward the tight end (see interpolate_activity_schedules
+// above), an offers outage would leave quotes TIGHT precisely when the
+// controller is meant to widen them.
+//
+// SEEN IN THIS BLOCK -- NOT A WALL-CLOCK AGE.  [review] The heartbeat runs
+// only when the polled height is STRICTLY greater than the last one
+// processed (poll_loop_coro: `if (current_block > last_block_)`), so no two
+// cycles ever share a height, and ingest re-stamps every surviving offer with
+// the current one (step_update_market_state).  A retained book therefore
+// always carries a SMALLER last_seen_block, and equality catches it on the
+// very next heartbeat.
+//
+// An earlier revision of this function aged offers against the wall clock and
+// was WRONG.  Blocks average ~52s, so a book retained across one block is
+// routinely YOUNGER than any sane age threshold and would score FRESH --
+// missing exactly the outage the gate exists for.  The review that asked for
+// last_seen_block was right; this note records why, so the cheaper-looking
+// wall-clock version does not come back.
+//
+// @param offers    The book as handed out by get_competing_book().
+// @param now_block The height this heartbeat is processing.
+// @return Fresh per-side counts, plus how many offers were ignored as stale
+//         (0 in normal operation; nonzero means the offers feed is down).
+// ---------------------------------------------------------------------------
+struct BookActivity {
+    std::size_t bids{0};
+    std::size_t asks{0};
+    std::size_t stale_ignored{0};
+};
+
+[[nodiscard]] BookActivity fresh_book_depth(
+    const std::vector<CompetingOffer>& offers,
+    BlockHeight                        now_block);
+
+// ---------------------------------------------------------------------------
 // xch_mark_price_mojos -- the XCH mark handed to PnLTracker::mark_to_market,
 // denominated in one pair's quote units.
 //

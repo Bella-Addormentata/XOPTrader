@@ -1147,9 +1147,12 @@ private:
     static constexpr double kVolSpikeMult            = 2.0;
 
     /// [T5-01] Selective refresh: fractional price deviation threshold.
-    /// Only *adverse* deviations (bid too high / ask too low) trigger
-    /// staleness.  Favorable deviations (bid drifted lower / ask drifted
-    /// higher) make the offer more conservative, not dangerous.
+    /// Adverse deviations (bid too high / ask too low) trigger staleness at
+    /// this threshold.  Favorable deviations (bid drifted lower / ask drifted
+    /// higher) make the offer more conservative, so [S33] refreshes them only
+    /// past kFavorableDriftMultiplier x the TIER-SCALED threshold
+    /// (cross_guard.hpp) -- that multiplier applies to the scaled value, not
+    /// to this tier-0 base.
     /// Set to 1.0% adverse deviation for tier 0 (innermost).  Outer
     /// tiers apply a wider threshold scaled by kTierThresholdScale.
     /// [v0.7.47] Raised 0.005 -> 0.010 after live audit showed 49/50

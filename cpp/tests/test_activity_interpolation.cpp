@@ -42,9 +42,92 @@
 #include "xop/engine.hpp"
 
 using xop::ActivitySchedules;
+using xop::BookActivity;
+using xop::fresh_book_depth;
 using xop::interpolate_activity_schedules;
 
 namespace {
+
+constexpr xop::BlockHeight kThisBlock = 100;
+constexpr xop::BlockHeight kLastBlock = 99;
+
+xop::CompetingOffer make_offer(xop::Side side, xop::BlockHeight seen_block)
+{
+    xop::CompetingOffer o;
+    o.offer_id         = "o";
+    o.pair_name        = "XCH/BYC";
+    o.side             = side;
+    o.price            = 1000;
+    o.size             = 1000;
+    o.first_seen_block = seen_block;
+    o.last_seen_block  = seen_block;
+    o.last_seen_ts     = xop::Timestamp{};
+    return o;
+}
+
+// THE REGRESSION TEST.  A book frozen by a failed offers fetch must not
+// contribute depth.  The heartbeat only runs on a STRICTLY greater height,
+// so a carried-over book is always stamped with an earlier one.  With the
+// gate removed this reports the full book as live depth.
+TEST(ActivityBookDepth, AStaleBookContributesNoDepth)
+{
+    std::vector<xop::CompetingOffer> book;
+    for (int i = 0; i < 3; ++i) book.push_back(make_offer(xop::Side::Bid, kLastBlock));
+    for (int i = 0; i < 2; ++i) book.push_back(make_offer(xop::Side::Ask, kLastBlock));
+
+    const BookActivity d = fresh_book_depth(book, kThisBlock);
+
+    EXPECT_EQ(d.bids, 0u);
+    EXPECT_EQ(d.asks, 0u);
+    EXPECT_EQ(d.stale_ignored, 5u);
+}
+
+// Staleness is judged PER OFFER.  A gate keyed on the newest offer, or on a
+// single book-level marker, would admit the whole vector.
+TEST(ActivityBookDepth, StalenessIsJudgedPerOffer)
+{
+    std::vector<xop::CompetingOffer> book;
+    book.push_back(make_offer(xop::Side::Bid, kThisBlock));
+    book.push_back(make_offer(xop::Side::Bid, kLastBlock));
+    book.push_back(make_offer(xop::Side::Ask, kLastBlock));
+
+    const BookActivity d = fresh_book_depth(book, kThisBlock);
+
+    EXPECT_EQ(d.bids, 1u);
+    EXPECT_EQ(d.asks, 0u);
+    EXPECT_EQ(d.stale_ignored, 2u);
+}
+
+// A fresh book still counts, per side.  Guards the gate against being applied
+// backwards, which would zero the term in normal operation and pin every pair
+// permanently wide.
+TEST(ActivityBookDepth, FreshOffersAreCountedPerSide)
+{
+    std::vector<xop::CompetingOffer> book;
+    for (int i = 0; i < 3; ++i) book.push_back(make_offer(xop::Side::Bid, kThisBlock));
+    for (int i = 0; i < 2; ++i) book.push_back(make_offer(xop::Side::Ask, kThisBlock));
+
+    const BookActivity d = fresh_book_depth(book, kThisBlock);
+
+    EXPECT_EQ(d.bids, 3u);
+    EXPECT_EQ(d.asks, 2u);
+    EXPECT_EQ(d.stale_ignored, 0u);
+}
+
+// The comparison is EQUALITY, not `<`.  An offer stamped AHEAD of the height
+// being processed was not observed in it either, so it is not live depth.
+// Relaxing the gate to `last_seen_block < now_block` would silently admit it
+// and only this test would notice.
+TEST(ActivityBookDepth, AnOfferStampedAheadOfThisBlockIsNotCounted)
+{
+    std::vector<xop::CompetingOffer> book;
+    book.push_back(make_offer(xop::Side::Bid, kThisBlock + 1));
+
+    const BookActivity d = fresh_book_depth(book, kThisBlock);
+
+    EXPECT_EQ(d.bids, 0u);
+    EXPECT_EQ(d.stale_ignored, 1u);
+}
 
 // The controller's headline contract: with no activity on either side, both
 // sides sit at the WIDE end.  A reversed interpolation puts them at min.
