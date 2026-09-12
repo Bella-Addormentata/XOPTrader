@@ -236,8 +236,11 @@ pairs:
     # Wide end of the spacing ramp: one entry per tier, aligned with
     # tier_spacing_bps_override above (which is the NARROW end).  Unset ->
     # the ramp is flat (max == base), so spacing never moves and only the
-    # margin adapts.  Every entry must be > 0; tiers past the end of the
-    # list keep their base spacing.
+    # margin adapts.  Every entry must be > 0.  A list SHORTER than the tier
+    # count no longer leaves the later tiers at their base spacing: each is
+    # carried at least one base gap outside the tier before it, because a
+    # schedule that steps back INWARD would post that tier inside its
+    # predecessor and the width floor then collapses both onto one price.
     # tier_spacing_max_bps_override: [12, 20, 32, 60, 100, 160]
 
     # [BBOPERPAIR 2026-09-01] Per-pair BBO proximity caps: "do not quote

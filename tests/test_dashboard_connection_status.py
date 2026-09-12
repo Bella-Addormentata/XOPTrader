@@ -83,6 +83,23 @@ def test_a_syncing_string_is_shown_as_a_yellow_dot(app):
     assert PROFIT_GREEN not in style
 
 
+def test_a_connecting_string_is_shown_as_a_yellow_dot(app):
+    dash = _dash()
+    dash.update_connection_status({"Dexie": "Connecting"})
+    style = _dot_style(dash, "Dexie")
+    assert WARNING in style, (
+        '"Connecting" contains the substring "conn" -- an in-progress '
+        "connection is not a live one"
+    )
+    assert PROFIT_GREEN not in style
+
+
+def test_a_reconnecting_string_is_not_shown_as_a_green_dot(app):
+    dash = _dash()
+    dash.update_connection_status({"Full Node": "Reconnecting"})
+    assert PROFIT_GREEN not in _dot_style(dash, "Full Node")
+
+
 def test_unrecognised_text_fails_closed(app):
     dash = _dash()
     dash.update_connection_status({"Full Node": "Ohai"})

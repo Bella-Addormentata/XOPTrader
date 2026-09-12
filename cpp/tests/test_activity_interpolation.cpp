@@ -251,14 +251,43 @@ TEST(ActivityInterpolation, AnInvertedSpacingEntryIsClampedPerTier)
 
     EXPECT_EQ(zero.spacing_tiers_inverted, 1u);
     EXPECT_DOUBLE_EQ(zero.bid_spacings[0], 600.0) << "tier 0 is well-formed";
-    EXPECT_DOUBLE_EQ(zero.bid_spacings[1], 200.0) << "tier 1 clamped up to min";
-    EXPECT_DOUBLE_EQ(zero.ask_spacings[1], 200.0);
+    EXPECT_DOUBLE_EQ(zero.bid_spacings[1], 700.0)
+        << "clamped to one base gap OUTSIDE tier 0, not merely up to its own "
+           "minimum: 200 would price inside tier 0, and 600 would tie with it";
+    EXPECT_DOUBLE_EQ(zero.ask_spacings[1], 700.0);
+    EXPECT_GT(zero.bid_spacings[1], zero.bid_spacings[0])
+        << "the repaired schedule must be ordered AND distinct";
     for (std::size_t i = 0; i < zero.bid_spacings.size(); ++i) {
         EXPECT_GE(zero.bid_spacings[i], busy.bid_spacings[i])
             << "the zero-activity schedule must never be narrower than the "
                "active one, tier " << i;
         EXPECT_GE(zero.ask_spacings[i], busy.ask_spacings[i]);
     }
+}
+
+// THE SILENT SHAPE.  Every entry is ABOVE its own base spacing, so the
+// per-tier minimum clamp sees nothing wrong -- 300 > 200 -- yet the schedule
+// steps back inward.  Before the fix this produced [900, 300] with
+// spacing_tiers_inverted == 0: the pair lost a rung to the width floor and
+// NOTHING was logged, because the counter only ever compared a maximum to its
+// own minimum.
+TEST(ActivityInterpolation, ANonAscendingMaxScheduleIsNormalizedAndReported)
+{
+    const std::vector<double> min_s{100.0, 200.0};
+    const std::vector<double> max_s{900.0, 300.0};
+
+    const ActivitySchedules zero = interpolate_activity_schedules(
+        0.0, 0.0, 50.0, 250.0, min_s, max_s, 2);
+
+    EXPECT_DOUBLE_EQ(zero.bid_spacings[0], 900.0);
+    EXPECT_DOUBLE_EQ(zero.bid_spacings[1], 1000.0);
+    EXPECT_DOUBLE_EQ(zero.ask_spacings[1], 1000.0);
+    EXPECT_GT(zero.bid_spacings[1], zero.bid_spacings[0])
+        << "non-decreasing is the documented precondition of "
+           "shift_schedule_to_floor, which only ever measures front()";
+    EXPECT_EQ(zero.spacing_tiers_inverted, 1u)
+        << "and it must be LOUD: this shape trips no min-clamp, so the pair "
+           "would otherwise lose a rung with nothing in the log";
 }
 
 // The no-override case: max_spacings IS min_spacings (the call site passes the
@@ -284,8 +313,12 @@ TEST(ActivityInterpolation, WithNoSpacingOverrideTheScheduleIsActivityIndependen
 }
 
 // num_tiers past the end of both schedules: the call site's historical default
-// is 100 * (tier + 1) bps, and with no maximum for that tier it is flat.
-// Boundary document -- it pins the fallback, it kills no mutation on its own.
+// for the base is 100 * (tier + 1) bps.  [review 2026-09-12] A tier with no
+// configured maximum is NOT left at that base any more -- it is carried one
+// base gap outside the tier before it.  It has to be: tier 0 may be widened
+// to 600 while tier 1's base is 200, and leaving 200 there is a schedule that
+// steps back INWARD, which the width-floor pass resolves by collapsing the
+// two onto one price.  Still not a misconfiguration, so the counter stays 0.
 TEST(ActivityInterpolation, TiersPastTheScheduleFallBackToTheDefaultSpacing)
 {
     const std::vector<double> min_s{100.0};
@@ -296,8 +329,8 @@ TEST(ActivityInterpolation, TiersPastTheScheduleFallBackToTheDefaultSpacing)
 
     ASSERT_EQ(s.bid_spacings.size(), 3u);
     EXPECT_DOUBLE_EQ(s.bid_spacings[0], 600.0);
-    EXPECT_DOUBLE_EQ(s.bid_spacings[1], 200.0);
-    EXPECT_DOUBLE_EQ(s.bid_spacings[2], 300.0);
+    EXPECT_DOUBLE_EQ(s.bid_spacings[1], 700.0);
+    EXPECT_DOUBLE_EQ(s.bid_spacings[2], 800.0);
     EXPECT_EQ(s.spacing_tiers_inverted, 0u)
         << "a tier with no configured maximum is not a misconfiguration";
 }

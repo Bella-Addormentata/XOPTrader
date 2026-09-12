@@ -891,7 +891,7 @@ class DashboardWidget(QWidget):
                             "offline", "unknown", "stale", "timeout")
                 if any(word in low for word in negative):
                     dot.set_colour("red")
-                elif "sync" in low and "synced" not in low:
+                elif ("sync" in low and "synced" not in low) or "connecting" in low:
                     dot.set_colour("yellow")
                 elif "synced" in low or "conn" in low:
                     dot.set_colour("green")
