@@ -23,6 +23,8 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
+
 #include "xop/engine.hpp"
 #include "xop/rpc/chia_rpc.hpp"
 
@@ -179,4 +181,126 @@ TEST(NodeHealthFlags, TheParseAndTheDerivationAgreeOnACatchingUpNode)
     const auto flags  = node_health_flags(true, parsed.synced, parsed.syncing);
     EXPECT_FALSE(flags.synced);
     EXPECT_TRUE(flags.syncing);
+}
+
+// ---------------------------------------------------------------------------
+// [S33 2026-09-12] The REACHABILITY argument, which is where the finding
+// actually lived.  node_health_flags is honest; both exporters fed it an
+// expression that required the node to be the SELECTED HEIGHT SOURCE.
+//
+// During an auto fallback those are different things.  A full node catching
+// up answers every probe while staying behind the wallet, so height_source_
+// stays Wallet -- and the gauges published connected=false, syncing=false.
+// The GUI then read "Full Node: Disconnected" during precisely the period an
+// operator is watching: a reachable node, catching up, about to come back.
+//
+// node_probe_is_live() is the replacement notion, and it has to keep what the
+// height-source gate was protecting: last_sync_state() is a cache, so a
+// wallet-sourced heartbeat must not republish a minutes-old node reading.
+// Freshness delivers that -- an outage stops producing successful probes.
+//
+// MUTATION CHECK: make node_probe_is_live ignore freshness,
+//
+//     return node_client_open;      // the whole body
+//
+// -> ANeverProbedNodePublishesNothing and AStaleProbeDoesNotRepublishTheCache
+//    go RED.  Drop only the never-probed clause and the first goes red alone.
+//
+// WHAT THESE STILL CANNOT SEE, stated plainly because the group above it
+// makes the same admission: no test constructs an Engine, so the two call
+// sites' argument is not reachable from ctest.  What is reachable is that
+// both now pass the SAME one-line helper (Engine::node_probe_live_now), which
+// is why the expression could drift apart at the two sites in the first place.
+// ---------------------------------------------------------------------------
+
+using xop::kNodeProbeLivenessWindow;
+using xop::node_probe_is_live;
+
+namespace {
+using Clock = std::chrono::steady_clock;
+}  // namespace
+
+// THE finding: reachable and catching up, while the WALLET is the height
+// source.  No height source appears in this call at all -- that is the fix.
+TEST(NodeProbeLiveness, AReachableSyncingNodePublishesSyncingOffTheWalletSource)
+{
+    const auto now  = Clock::now();
+    const auto live = node_probe_is_live(/*node_client_open=*/true,
+                                         /*last_probe=*/now
+                                             - std::chrono::seconds{20},
+                                         now);
+    ASSERT_TRUE(live)
+        << "a probe that answered 20s ago is reachability, whatever the "
+           "height source says";
+
+    const auto flags = node_health_flags(live,
+                                         /*node_reports_synced=*/false,
+                                         /*node_reports_syncing=*/true);
+    EXPECT_TRUE(flags.connected)
+        << "this published \"Full Node: Disconnected\" for the whole of a "
+           "catch-up, because the node was not the selected height source";
+    EXPECT_FALSE(flags.synced);
+    EXPECT_TRUE(flags.syncing)
+        << "the catch-up is the one period an operator is looking";
+}
+
+// The window is not a guess: it must cover the throttled recovery cadence,
+// or a healthy recovering node blinks dark between two successful probes.
+TEST(NodeProbeLiveness, TheWindowCoversTheThrottledProbeCadence)
+{
+    const auto now = Clock::now();
+    // kNodeProbeEveryNPolls (10) * kPollInterval (5s).
+    EXPECT_TRUE(node_probe_is_live(true, now - std::chrono::seconds{50}, now));
+    EXPECT_GE(kNodeProbeLivenessWindow, std::chrono::seconds{50});
+}
+
+// The anti-stale property the height-source gate used to carry: a node that
+// has stopped answering must not have its CACHED reading republished by a
+// wallet-sourced heartbeat.
+TEST(NodeProbeLiveness, AStaleProbeDoesNotRepublishTheCache)
+{
+    const auto now  = Clock::now();
+    const auto live = node_probe_is_live(
+        true, now - (kNodeProbeLivenessWindow + std::chrono::seconds{30}),
+        now);
+    EXPECT_FALSE(live);
+
+    // last_sync_state() still holds the healthy reading from before the
+    // outage.  None of it may be published.
+    const auto flags = node_health_flags(live, /*synced=*/true,
+                                         /*syncing=*/false);
+    EXPECT_FALSE(flags.connected);
+    EXPECT_FALSE(flags.synced)
+        << "the cached reading is stale -- republishing it is the outage-"
+           "masking this whole separation exists to stop";
+    EXPECT_FALSE(flags.syncing);
+}
+
+// "Never probed in this run" is not liveness either: the cached flags are
+// still their zero-initialised defaults and say nothing about this node.
+TEST(NodeProbeLiveness, ANeverProbedNodePublishesNothing)
+{
+    const auto flags = node_health_flags(
+        node_probe_is_live(true, Clock::time_point{}, Clock::now()),
+        /*node_reports_synced=*/true, /*node_reports_syncing=*/false);
+    EXPECT_FALSE(flags.connected);
+    EXPECT_FALSE(flags.synced);
+    EXPECT_FALSE(flags.syncing);
+}
+
+// Wallet-only configuration, or a client closed by a startup fallback: there
+// is nothing to be reachable.
+TEST(NodeProbeLiveness, AClosedNodeClientIsNotLive)
+{
+    const auto now = Clock::now();
+    EXPECT_FALSE(node_probe_is_live(/*node_client_open=*/false, now, now))
+        << "a fresh probe stamp cannot make a closed client reachable";
+}
+
+// A clock that steps backwards must not read as a stale probe and blank a
+// gauge that is answering.
+TEST(NodeProbeLiveness, AProbeInTheFutureIsTreatedAsLive)
+{
+    const auto now = Clock::now();
+    EXPECT_TRUE(node_probe_is_live(true, now + std::chrono::seconds{5}, now));
 }

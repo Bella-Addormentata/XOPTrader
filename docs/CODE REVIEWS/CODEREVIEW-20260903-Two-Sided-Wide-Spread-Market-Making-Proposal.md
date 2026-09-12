@@ -14,7 +14,7 @@ During live monitoring of XOPTrader's Dexie market making operations on 2026-09-
 2. **Asymmetric Quoting (One-Sided Bids):** On `XCH/BYC`, the engine was generating 6 active BIDs but **0 ASKs**. All 6 ASK tiers were dropped before posting to Dexie.
 3. **Dislocated Books & Realized Spread Opportunity:** Dexie's `XCH/BYC` order book has an empty interior ($1.538\text{ BBO bid} \leftrightarrow 4.9995\text{ BBO ask}$, orderbook mid $3.269\text{ BYC/XCH}$). On-chain transaction records (e.g. trade `3yNYeZV4cx...` settling $104.0\text{ XCH}$ for $202.0\text{ BYC}$ at $1.9423\text{ BYC/XCH}$) demonstrate that liquidity takers periodically cross the book at significant premiums.
 
-This proposal provides the architectural design, mathematical justification, code adjustments, and configuration tuning required to enable **two-sided market making on wide pairs**, capture wide bid-ask margins ($15\% - 35\%$), and dynamically adjust quoting width via **per-pair PID feedback**.
+This proposal provides the architectural design, mathematical justification, code adjustments, and configuration tuning required to enable **two-sided market making on wide pairs**, capture wide bid-ask margins ($15\% - 35\%$), and dynamically adjust the modelled spread via **per-pair PID feedback**. **[S33 2026-09-12]** "Quoting width" overstated that last clause: the PID moves the Step 5 spread and the risk sizing it feeds, not the posted tier spacing -- see Section D.
 
 ---
 
@@ -130,11 +130,14 @@ XOPTrader maintains per-pair PID controllers (`SpreadPidState` and `Competitiven
    $$\text{output}_t = K_p \cdot \text{error}_t + K_i \sum \text{error}_t + K_d \cdot \Delta\text{error}_t$$
    $$\text{mult}_t = \text{clamp}(1.0 - \text{output}_t, \text{min\_mult}, \text{max\_mult})$$
 
-2. **Step 7 Dynamic Spacing Integration:**
-   Scale nominal tier spacings by `pid.current_mult`:
-   $$\text{tier\_spacing}_{i, t} = \text{tier\_spacing\_override}_i \times \text{pid.current\_mult}_t$$
-   * **Quiet Regime ($\text{fills} = 0$):** Multiplier tightens (e.g. $0.82\times$), stepping inward (e.g. $500\text{ bps} \to 410\text{ bps}$) to attract order flow.
-   * **Active Regime ($\text{frequent fills}$):** Multiplier expands (up to $1.30\times$), stepping outward (e.g. $500\text{ bps} \to 650\text{ bps}$) to capture larger margins and avoid adverse selection.
+2. **[S33 2026-09-12] What the multiplier actually scales -- and what it does not:**
+   `pid.current_mult` is applied in **Step 5**, to the modelled spread alone:
+   $$\text{total\_spread\_bps}_t \leftarrow \text{total\_spread\_bps}_t \times \text{pid.current\_mult}_t$$
+   with $\text{half\_spread} = \text{total\_spread\_bps} / 2$ recomputed downstream. That figure feeds the Step 6 risk-sizing quote, the loss-manager `MarketParams`, the `max_half_spread_bps_override` ceiling (Section C) and the `spread_pid_mult` telemetry gauge. Those are its only consumers.
+   **Step 7 tier spacings are NOT scaled by it.** The ladder is built by `compute_ladder(mid, sigma, inventory_ratio, available_capital, available_inventory, ladder_cfg)`, which takes no spread argument at all; `ladder_cfg.tier_spacing_bps_bid` / `_ask` are produced by `interpolate_activity_schedules` from `tier_spacing_bps_override` and `tier_spacing_max_bps_override` (Section I), and nothing multiplies them by the PID value.
+   * **Quiet Regime ($\text{fills} = 0$):** the multiplier falls toward `pid_min_mult` ($0.70$ by default), tightening the *modelled* spread and therefore the Step 6 sizing quote. Posted ladder width does not move. What widens a quiet book on this pair is the Section I activity controller ($\alpha_s \to 0 \Rightarrow S_{\text{max}}$), not the PID.
+   * **Active Regime (frequent fills):** the multiplier rises toward `pid_max_mult` ($1.30$ by default), widening the modelled spread. Posted tier spacing is again untouched.
+   * **Retracted:** an earlier revision of this section specified $\text{tier\_spacing}_{i, t} = \text{tier\_spacing\_override}_i \times \text{pid.current\_mult}_t$ and worked it through as $500\text{ bps} \to 410\text{ bps}$ (quiet) and $500\text{ bps} \to 650\text{ bps}$ (active). **That integration was never implemented, so those two figures are arithmetic over a code path that does not exist, not observations.** They are deleted rather than recomputed: there is no measured substitute to put in their place, and an operator calibrating tier spacing against them would be sizing a ladder to a multiplier the ladder never sees.
 
 ### E. Valuation Grade & Rolling-Window Breaker Protection
 * **The Vulnerability:** When `XCH/BYC` spread narrowed to ~30% upon posting wide asks, the book earned `mid_valuation_grade = true` under the default $5,000\text{ bps}$ ($50\%$) agreement ceiling. In Step 11, `PnLTracker::mark_to_market` marked the wallet's $78.57\text{ XCH}$ balance against `XCH/BYC`'s mid ($1.81\text{ USD}$) instead of true spot ($1.44\text{ USD}$), causing a phantom $+\$28.85$ PnL spike followed by a $-\$32.20$ drop on reversion, which tripped Step 13's rolling-window loss circuit breaker.
@@ -243,7 +246,7 @@ flowchart TD
 | **Ask Pricing Range** | None | **$\approx 1.59 - 2.23\text{ BYC/XCH}$ (progressively stepped)** |
 | **Bid Pricing Range** | $1.34 - 1.40\text{ BYC/XCH}$ | **$\approx 1.22 - 1.41\text{ BYC/XCH}$ (progressively stepped)** |
 | **Round-Trip Margin** | $0\%$ (One-sided) | **$10\% - 50\%$ per fill cycle** |
-| **PID Authority** | Saturated at min limit | **Dynamic adaptation ($0.82\times - 1.30\times$)** |
+| **PID Authority** | Saturated at min limit | **Dynamic adaptation ($0.82\times - 1.30\times$) of the Step 5 modelled spread; tier spacing is not scaled by it (Section D)** |
 | **Circuit Breakers** | Tripped by phantom PnL swing | **Clear & stable (`xop_posting_gated: 0`)** |
 | **Competitive Anchor** | Collapsed wide ladder to 45 bps | **Per-pair override disables anchor on wide pairs** |
 | **Order-Book Guard** | Flattened clamped tiers to single price | **Stepped guard preserves distinct progressive tiers** |

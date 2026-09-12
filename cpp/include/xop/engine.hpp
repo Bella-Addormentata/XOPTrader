@@ -199,10 +199,21 @@ struct PostedOfferInfo {
 // brand new -- a separate, pre-existing path that this function cannot see
 // and does not claim to cover.)
 //
+// [S33 2026-09-12, review] EVERY OCCUPANT OF THE SLOT, not one of them.  Two
+// pending offers can share a (side, tier) slot after any earlier double post,
+// and the rule used to admit the slot as soon as ONE non-Fresh occupant
+// appeared in cancelled_ids -- so with both legs Stale and only one cancel
+// landing, a replacement was posted while the other leg was still live.  That
+// is the very double exposure this function exists to prevent, reached through
+// the slot rather than through the tier.  A slot is whitelisted only when
+// every classified occupant was successfully cancelled; a Fresh occupant was
+// never asked to cancel and is still resting, so it vetoes its slot too.
+//
 // @param tier_classes   Per-pending-offer staleness classification.
 // @param cancelled_ids  Offer IDs selective_cancel reported as CANCELLED.
-// @return "<side>_<tier_index>" keys whose replacement is safe to post.
-//         Tiers whose cancel failed are absent, deferring them to the next
+// @return "<side>_<tier_index>" keys whose replacement is safe to post, i.e.
+//         those whose every occupant was cancelled.  Slots holding a failed
+//         cancel or a Fresh offer are absent, deferring them to the next
 //         heartbeat where they still classify Stale/Expired.
 // ---------------------------------------------------------------------------
 [[nodiscard]] std::unordered_set<std::string> select_repost_keys(
@@ -229,13 +240,18 @@ struct PostedOfferInfo {
 // xch_spendable_pre).  This function therefore only ever RELAXES the budget by
 // the amount that provably never left the wallet's locked set.
 //
-// [S33-LIMITER 2026-09-05, review] A slot with TWO pending offers (possible
-// after any earlier double post) whose cancels disagree is resolved toward
-// CHARGING: one cancelled leg removes the whole key from this set.  Otherwise
-// that key would be whitelisted for repost by select_repost_keys and excluded
-// from the budget by this one at the same time, which is precisely the
-// under-reservation the two functions exist to make impossible.  The
-// invariant they jointly maintain is `posted set is a subset of charged set`.
+// [S33 2026-09-12, review] A slot with TWO pending offers (possible after any
+// earlier double post) whose cancels disagree is RESTING, full stop.  This
+// used to resolve toward CHARGING -- one cancelled leg erased the whole key
+// from this set -- because select_repost_keys would whitelist that slot and
+// the pair must never post a tier the budget did not reserve for.  Now that
+// repost requires EVERY occupant cancelled, that slot is not reposted at all,
+// so the erase only charged the budget for a slot nothing is posted into
+// while the wallet still locks the failed leg's coins: the same XCH counted
+// twice, which is what this function exists to stop.  The invariant the two
+// jointly maintain -- `posted set is a subset of charged set` -- now holds
+// directly: a repostable slot has no uncancelled occupant, is therefore not
+// in this set, and is therefore charged.
 //
 // @param tier_classes   Per-pending-offer staleness classification.
 // @param cancelled_ids  Offer IDs selective_cancel reported as CANCELLED.
@@ -416,7 +432,19 @@ struct ActivitySchedules {
 // place both exporters call, so reinstating that copy is a change a test can
 // see -- see cpp/tests/test_node_sync_state.cpp.
 //
-// @param reachable            Node is the live height source and answering.
+// [S33 2026-09-12, review] REACHABILITY IS NOT HEIGHT-SOURCE SELECTION, and
+// this function was never the defect -- its `reachable` ARGUMENT was.  Both
+// exporters passed an expression that required the node to be the SELECTED
+// height source, so during an auto fallback a node that answers every probe
+// while it catches up -- still behind the wallet, so still not the source --
+// published connected=false and syncing=false, and the GUI read "Full Node:
+// Disconnected" through exactly the catching-up period an operator is looking
+// at.  `reachable` now means node_probe_is_live() below: a recent successful
+// probe, which is what connectivity actually is.
+//
+// @param reachable            A node PROBE succeeded recently -- see
+//                             node_probe_is_live().  NOT "the node is the
+//                             selected height source".
 // @param node_reports_synced  `sync.synced` from the blockchain-state
 //                             response (rpc::ChiaFullNodeRPC::last_sync_state).
 // @param node_reports_syncing `sync.sync_mode` from the same response.
@@ -432,6 +460,47 @@ struct NodeHealthFlags {
 
 [[nodiscard]] NodeHealthFlags node_health_flags(
     bool reachable, bool node_reports_synced, bool node_reports_syncing);
+
+// ---------------------------------------------------------------------------
+// node_probe_is_live -- has the full node answered recently?
+//
+// [S33 2026-09-12] The freshness half of the health triple, kept separate from
+// height-source SELECTION on purpose.  A syncing node is reachable and not
+// selected at the same time; folding the two together is what published
+// "Disconnected" during a catch-up.
+//
+// It still has to keep the property the height-source gate was there to
+// protect: last_sync_state() is a CACHE, so a wallet-sourced heartbeat must
+// not republish a node reading taken minutes ago as if the node had just
+// answered.  Freshness, not selection, is what actually delivers that -- an
+// outage stops producing successful probes, and the window closes on its own.
+//
+// @param node_client_open   The node RPC client exists and is open.
+// @param last_probe         When the last SUCCESSFUL node probe answered.
+//                           Default-constructed means "never in this run",
+//                           which is not live: the cached sync flags are then
+//                           still their zero-initialised defaults.
+// @param now                Monotonic reference point (steady_clock).
+// @param liveness_window    How long a probe stays evidence of reachability.
+// @return Whether the cached node reading may be published at all.
+// ---------------------------------------------------------------------------
+
+/// How long one successful node probe stands as evidence of reachability.
+///
+/// Sized off the THROTTLED probe cadence, not guessed: while the engine is on
+/// the wallet fallback it probes the node every kNodeProbeEveryNPolls (10)
+/// polls at kPollInterval (5s), i.e. every ~50s.  A window below that would
+/// blink the gauge dark between two successful probes of a perfectly healthy
+/// recovering node -- the same false "Disconnected" this finding is about, one
+/// layer down.  3x the cadence absorbs a slow answer and a missed probe, and
+/// still darkens the gauge ~2.5 minutes into a real outage.
+inline constexpr std::chrono::seconds kNodeProbeLivenessWindow{150};
+
+[[nodiscard]] bool node_probe_is_live(
+    bool                                  node_client_open,
+    std::chrono::steady_clock::time_point last_probe,
+    std::chrono::steady_clock::time_point now,
+    std::chrono::seconds liveness_window = kNodeProbeLivenessWindow);
 
 // ---------------------------------------------------------------------------
 // Engine -- the top-level orchestrator.
@@ -716,6 +785,22 @@ private:
     /// resets the failure streak forever and the wallet fallback is never
     /// reached. A node that says yes and never moves is a dead node.
     std::uint32_t        node_no_progress_polls_{0};
+
+    /// [S33 2026-09-12] When the full node last ANSWERED a probe, which is a
+    /// different question from whether it is the selected height source.
+    /// Stamped by every successful get_block_height() -- the main loop's node
+    /// branch and its throttled recovery probe, and both of the analysis
+    /// loop's -- including the answers that are rejected as a height (behind
+    /// the wallet, not advancing).  Those rejections are exactly the syncing
+    /// node whose reachability the health gauges used to deny.
+    std::chrono::steady_clock::time_point node_last_probe_{};
+
+    /// The reachability argument both metrics exporters pass to
+    /// node_health_flags(), in ONE place.  They share that function precisely
+    /// so there is a single rule; each computing its own expression is how
+    /// they came to disagree (one asked the height source, the other asked
+    /// whether this poll had used the wallet).
+    [[nodiscard]] bool node_probe_live_now() const;
 
     /// The RUNTIME latch disabling full-node-dependent behaviour.
     ///
