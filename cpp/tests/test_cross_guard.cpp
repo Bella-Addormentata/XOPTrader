@@ -425,7 +425,7 @@ TEST(TierRefresh, AdverseDriftRefreshesPastTheTierThresholdOnBothSides)
 
 TEST(TierRefresh, FavorableDriftIsToleratedThreeTimesFurther)
 {
-    // THE UNTESTED BRANCH. Favorable = the quote drifted in OUR favour (the
+    // THE BRANCH 922b183 ADDED IN THIS PR. Favorable = the quote drifted in OUR favour (the
     // optimal bid rose above our live bid; the optimal ask fell below our
     // live ask). It is still earning, so it is refreshed only past 3x the
     // threshold -- 3% at tier 0 -- instead of at 1%.
@@ -480,22 +480,39 @@ TEST(TierRefresh, TheMinimumAgeGuardOutranksDriftButNotACross)
               TierRefresh::Stale);
 }
 
-TEST(TierRefresh, PastTheSoftTtlDirectionStopsMatteringAndTheVerdictIsExpired)
+TEST(TierRefresh, PastTheSoftTtlOnlyAdverseDriftExpiresAndFavorableRestsToHardTtl)
 {
-    // On an aged offer any meaningful movement ends it, either direction --
-    // and as Expired, which is a different cancel reason from Stale.
+    // An aged offer that drifted AGAINST us ends -- and as Expired, which is
+    // a different cancel reason from Stale.
     EXPECT_EQ(classify_tier_refresh(false, /*past_soft_ttl=*/true, false,
-                                    /*adverse=*/false, 0.05,
+                                    /*adverse=*/true, 0.05,
                                     kTierThreshold, kSoftTtl),
-              TierRefresh::Expired);
-    EXPECT_EQ(classify_tier_refresh(false, true, false, /*adverse=*/true,
-                                    0.05, kTierThreshold, kSoftTtl),
               TierRefresh::Expired);
     // A still well-priced old offer is kept rather than churned.
     EXPECT_EQ(classify_tier_refresh(false, true, false, true, 0.01,
                                     kTierThreshold, kSoftTtl),
               TierRefresh::Fresh);
+    // Direction keeps mattering past the soft TTL. A quote that drifted in
+    // OUR favour is more conservative than the one we would post now, so it
+    // rests to the hard TTL instead of paying cancel+repost to be replaced
+    // by a worse price. This is the contract kHardTtlMultiplier documents
+    // (offer_manager.hpp:821-826).
+    EXPECT_EQ(classify_tier_refresh(false, true, false, /*adverse=*/false,
+                                    0.05, kTierThreshold, kSoftTtl),
+              TierRefresh::Fresh)
+        << "5% in our favour on an aged offer: still earning, keep it";
+    // ... and the soft-TTL zone outranks the normal zone's 3x favorable
+    // rule, so a favorable drift that would be Stale at age 12 is neither
+    // Stale nor Expired here: past the soft TTL, favorable means Fresh.
     EXPECT_EQ(classify_tier_refresh(false, true, false, false,
+                                    kTierThreshold * 4.0,
+                                    kTierThreshold, kSoftTtl),
+              TierRefresh::Fresh);
+    // The adverse threshold, to the ulp on both sides.
+    EXPECT_EQ(classify_tier_refresh(false, true, false, /*adverse=*/true,
+                                    kSoftTtl, kTierThreshold, kSoftTtl),
+              TierRefresh::Fresh) << "exactly at the threshold is not past it";
+    EXPECT_EQ(classify_tier_refresh(false, true, false, true,
                                     std::nextafter(kSoftTtl, 1.0),
                                     kTierThreshold, kSoftTtl),
               TierRefresh::Expired) << "one ulp past the soft-TTL threshold";

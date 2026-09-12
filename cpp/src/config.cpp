@@ -248,8 +248,15 @@ double read_positive_double(const YAML::Node& parent,
 {
     require_scalar(parent, key, section);
     double value = parent[key].as<double>();
-    if (!(value > 0.0)) {  // Also catches NaN.
-        throw ConfigError(section + "." + key + " must be > 0; got "
+    // [INFGUARD] `!(v > 0.0)` catches NaN (every NaN comparison is false) but
+    // NOT +infinity, which satisfies `> 0.0`. yaml-cpp returns `.inf` happily,
+    // and a config generator emitting 1e999 produces the same value. This
+    // helper gates the REQUIRED global strategy keys -- gamma, kappa, phi,
+    // q_max, min_profit_margin_bps -- so the hole here is strictly larger
+    // than the per-pair ones below.
+    if (!std::isfinite(value) || !(value > 0.0)) {
+        throw ConfigError(section + "." + key
+                          + " must be a finite value > 0; got "
                           + std::to_string(value));
     }
     return value;
@@ -293,9 +300,14 @@ std::vector<double> read_positive_double_seq(const YAML::Node& parent,
     result.reserve(parent[key].size());
     for (std::size_t i = 0; i < parent[key].size(); ++i) {
         double v = parent[key][i].as<double>();
-        if (!(v > 0.0)) {
+        // [INFGUARD] See read_positive_double. Feeds strategy.tier_spacing_bps,
+        // where an infinite entry reaches liquidity.cpp's
+        // `mid * (1.0 - v/10000.0)` and then static_cast<int64_t> of -inf,
+        // which is undefined behaviour rather than a clamped price.
+        if (!std::isfinite(v) || !(v > 0.0)) {
             throw ConfigError(section + "." + key + "[" + std::to_string(i)
-                              + "] must be > 0; got " + std::to_string(v));
+                              + "] must be a finite value > 0; got "
+                              + std::to_string(v));
         }
         result.push_back(v);
     }
@@ -526,26 +538,34 @@ PegRegistry parse_pegged_assets(const YAML::Node& root)
         if (item["prefer_market_cross"]) {
             a.prefer_market_cross = item["prefer_market_cross"].as<bool>();
         }
-        // [review] These three are PARSED AND STORED, but nothing consumes
-        // them yet: PegRegistry::classify() has no production caller, and
-        // DepegDetector is still built and fed solely from
-        // PairConfig::is_stablecoin and the pair loop. An operator who sets
-        // them is configuring a monitor that does not run -- which is the
-        // exact shape of the S30 failure, where BYC's only peg watch lived
-        // on a pair that had been disabled. Say so rather than accept them
-        // silently; wiring an asset-level detector is what closes S29.
-        if (item["warn_pct"] || item["bail_pct"]
-                || item["sustained_observations"]) {
-            spdlog::warn(
-                "[Config] pegged_assets.{}: warn_pct / bail_pct / "
-                "sustained_observations are recorded but NOT YET WIRED to a "
-                "detector. Peg monitoring still comes only from pairs marked "
-                "`is_stablecoin`, so declaring thresholds here does not by "
-                "itself watch this asset. (Since [PARANCHOR] the declared "
-                "par CAN feed fair value as a last-resort anchor when "
-                "nothing else prices a pair -- one more reason the watch "
-                "gap matters.)", a.asset_id);
-        }
+        // [review 2026-08-28, CORRECTED 2026-09-12] This block used to warn
+        // at startup that these three were "NOT YET WIRED to a detector".
+        // That was written one day before the wiring landed (comment cc5a62f
+        // 2026-08-28; asset-level peg suspension b673706 2026-08-29) and has
+        // been false ever since. They ARE consumed on the live path:
+        // Engine::step_observe_asset_pegs runs every heartbeat over
+        // pegged_assets.all() and passes bail_pct / warn_pct /
+        // sustained_observations straight into risk::observe_peg, whose
+        // JustSuspended result suspends the declared par and cancels every
+        // resting offer on every pair touching the asset. Defaults when
+        // nothing is declared are PeggedAsset's own (peg_registry.hpp) --
+        // not restated here, because that would be a third copy.
+        //
+        // WHAT IS NOT GUARANTEED, and why the deleted warning's last clause
+        // was pointing at something real even though its reason was wrong.
+        // An asset is actually observed only when ALL THREE hold: enforce is
+        // true; SOME ENABLED pair crosses this asset against XCH; and the USD
+        // anchor is not this asset's own declared par (a circular anchor is
+        // refused, leaving the observation NaN, which HOLDS the streak rather
+        // than clearing it). Fail any one and a declared asset with
+        // thresholds is not watched at all -- that is the S30 shape, where
+        // BYC's only peg watch lived on a pair that had been disabled.
+        //
+        // Still true, and NOT what these fields feed: PegRegistry::classify()
+        // has no production caller, and the pair-level DepegDetector is still
+        // built and fed solely from PairConfig::is_stablecoin. That is the
+        // SECOND watcher, not the only one -- which is the word the deleted
+        // warning got wrong.
 
         if (!reg.add(std::move(a))) {
             // Loud: a half-declared peg silently dropped is how an asset
@@ -642,36 +662,36 @@ std::vector<PairConfig> parse_pairs(const YAML::Node& root)
         if (item["gamma_override"] && item["gamma_override"].IsDefined()
             && !item["gamma_override"].IsNull()) {
             double v = item["gamma_override"].as<double>();
-            if (!(v > 0.0)) {
-                throw ConfigError(idx + ".gamma_override must be > 0; got "
-                                  + std::to_string(v));
+            if (!std::isfinite(v) || !(v > 0.0)) {
+                throw ConfigError(idx + ".gamma_override must be a finite value > 0; "
+                                  "got " + std::to_string(v));
             }
             p.gamma_override = v;
         }
         if (item["kappa_override"] && item["kappa_override"].IsDefined()
             && !item["kappa_override"].IsNull()) {
             double v = item["kappa_override"].as<double>();
-            if (!(v > 0.0)) {
-                throw ConfigError(idx + ".kappa_override must be > 0; got "
-                                  + std::to_string(v));
+            if (!std::isfinite(v) || !(v > 0.0)) {
+                throw ConfigError(idx + ".kappa_override must be a finite value > 0; "
+                                  "got " + std::to_string(v));
             }
             p.kappa_override = v;
         }
         if (item["phi_override"] && item["phi_override"].IsDefined()
             && !item["phi_override"].IsNull()) {
             double v = item["phi_override"].as<double>();
-            if (!(v > 0.0)) {
-                throw ConfigError(idx + ".phi_override must be > 0; got "
-                                  + std::to_string(v));
+            if (!std::isfinite(v) || !(v > 0.0)) {
+                throw ConfigError(idx + ".phi_override must be a finite value > 0; "
+                                  "got " + std::to_string(v));
             }
             p.phi_override = v;
         }
         if (item["q_max_override"] && item["q_max_override"].IsDefined()
             && !item["q_max_override"].IsNull()) {
             double v = item["q_max_override"].as<double>();
-            if (!(v > 0.0)) {
-                throw ConfigError(idx + ".q_max_override must be > 0; got "
-                                  + std::to_string(v));
+            if (!std::isfinite(v) || !(v > 0.0)) {
+                throw ConfigError(idx + ".q_max_override must be a finite value > 0; "
+                                  "got " + std::to_string(v));
             }
             p.q_max_override = v;
         }
@@ -679,9 +699,9 @@ std::vector<PairConfig> parse_pairs(const YAML::Node& root)
             && item["min_profit_margin_bps_override"].IsDefined()
             && !item["min_profit_margin_bps_override"].IsNull()) {
             double v = item["min_profit_margin_bps_override"].as<double>();
-            if (!(v > 0.0)) {
-                throw ConfigError(idx + ".min_profit_margin_bps_override must be > 0; got "
-                                  + std::to_string(v));
+            if (!std::isfinite(v) || !(v > 0.0)) {
+                throw ConfigError(idx + ".min_profit_margin_bps_override must be a finite value > 0; "
+                                  "got " + std::to_string(v));
             }
             p.min_profit_margin_bps_override = v;
         }
@@ -692,9 +712,10 @@ std::vector<PairConfig> parse_pairs(const YAML::Node& root)
             ts.reserve(item["tier_spacing_bps_override"].size());
             for (std::size_t j = 0; j < item["tier_spacing_bps_override"].size(); ++j) {
                 double v = item["tier_spacing_bps_override"][j].as<double>();
-                if (!(v > 0.0)) {
+                if (!std::isfinite(v) || !(v > 0.0)) {
                     throw ConfigError(idx + ".tier_spacing_bps_override[" + std::to_string(j)
-                                      + "] must be > 0; got " + std::to_string(v));
+                                      + "] must be a finite value > 0; got "
+                                      + std::to_string(v));
                 }
                 ts.push_back(v);
             }
@@ -751,18 +772,18 @@ std::vector<PairConfig> parse_pairs(const YAML::Node& root)
         if (item["depeg_warn_pct"] && item["depeg_warn_pct"].IsDefined()
             && !item["depeg_warn_pct"].IsNull()) {
             double v = item["depeg_warn_pct"].as<double>();
-            if (!(v > 0.0)) {
-                throw ConfigError(idx + ".depeg_warn_pct must be > 0; got "
-                                  + std::to_string(v));
+            if (!std::isfinite(v) || !(v > 0.0)) {
+                throw ConfigError(idx + ".depeg_warn_pct must be a finite value > 0; "
+                                  "got " + std::to_string(v));
             }
             p.depeg_warn_pct = v;
         }
         if (item["depeg_bail_pct"] && item["depeg_bail_pct"].IsDefined()
             && !item["depeg_bail_pct"].IsNull()) {
             double v = item["depeg_bail_pct"].as<double>();
-            if (!(v > 0.0)) {
-                throw ConfigError(idx + ".depeg_bail_pct must be > 0; got "
-                                  + std::to_string(v));
+            if (!std::isfinite(v) || !(v > 0.0)) {
+                throw ConfigError(idx + ".depeg_bail_pct must be a finite value > 0; "
+                                  "got " + std::to_string(v));
             }
             p.depeg_bail_pct = v;
         }
@@ -776,9 +797,9 @@ std::vector<PairConfig> parse_pairs(const YAML::Node& root)
             && item["max_half_spread_bps_override"].IsDefined()
             && !item["max_half_spread_bps_override"].IsNull()) {
             double v = item["max_half_spread_bps_override"].as<double>();
-            if (!(v > 0.0)) {
-                throw ConfigError(idx + ".max_half_spread_bps_override must be > 0; got "
-                                  + std::to_string(v));
+            if (!std::isfinite(v) || !(v > 0.0)) {
+                throw ConfigError(idx + ".max_half_spread_bps_override must be a finite value > 0; "
+                                  "got " + std::to_string(v));
             }
             p.max_half_spread_bps_override = v;
         }
@@ -833,6 +854,38 @@ std::vector<PairConfig> parse_pairs(const YAML::Node& root)
             p.book_side_agree_max_spread_bps_override = agree_bps;
         }
 
+        // [OFFER-EXPIRY] Per-pair expiry, in seconds.  Parsed through
+        // int64_t so a negative literal is REJECTED rather than wrapping to
+        // a four-billion-second expiry (CWE-681).
+        //
+        // [review #150] An earlier revision of this comment blamed
+        // read_uint32 for that wrap.  It does not wrap: config.cpp:230-242
+        // reads through int64_t and throws on value < 0 or > UINT32_MAX --
+        // the same bound this block applies.  The hand-rolled copy is
+        // therefore redundant, not necessary.  It is kept here only because
+        // the tests below pin THIS shape; collapsing it into read_uint32 is
+        // the right follow-up, and would leave one definition of one bound.
+        // 0 is a real setting -- "never expire this pair's offers" -- and
+        // binds; absence leaves the optional empty and inherits the global.
+        if (item["offer_expiry_secs_override"]
+            && item["offer_expiry_secs_override"].IsDefined()
+            && !item["offer_expiry_secs_override"].IsNull()) {
+            const std::int64_t secs =
+                item["offer_expiry_secs_override"].as<std::int64_t>();
+            if (secs < 0
+                || secs > static_cast<std::int64_t>(
+                              std::numeric_limits<std::uint32_t>::max())) {
+                throw ConfigError(
+                    idx + ".offer_expiry_secs_override must be in [0, "
+                    + std::to_string(
+                          std::numeric_limits<std::uint32_t>::max())
+                    + "] seconds (0 disables on-chain expiry for this pair); "
+                      "got " + std::to_string(secs));
+            }
+            p.offer_expiry_secs_override =
+                static_cast<std::uint32_t>(secs);
+        }
+
         if (item["competitive_anchor_enabled_override"]
             && item["competitive_anchor_enabled_override"].IsDefined()
             && !item["competitive_anchor_enabled_override"].IsNull()) {
@@ -843,9 +896,9 @@ std::vector<PairConfig> parse_pairs(const YAML::Node& root)
             && item["competitive_anchor_max_distance_bps_override"].IsDefined()
             && !item["competitive_anchor_max_distance_bps_override"].IsNull()) {
             double v = item["competitive_anchor_max_distance_bps_override"].as<double>();
-            if (!(v > 0.0)) {
-                throw ConfigError(idx + ".competitive_anchor_max_distance_bps_override must be > 0; got "
-                                  + std::to_string(v));
+            if (!std::isfinite(v) || !(v > 0.0)) {
+                throw ConfigError(idx + ".competitive_anchor_max_distance_bps_override must be a finite value > 0; "
+                                  "got " + std::to_string(v));
             }
             p.competitive_anchor_max_distance_bps_override = v;
         }
@@ -853,9 +906,9 @@ std::vector<PairConfig> parse_pairs(const YAML::Node& root)
             && item["competitive_anchor_stride_bps_override"].IsDefined()
             && !item["competitive_anchor_stride_bps_override"].IsNull()) {
             double v = item["competitive_anchor_stride_bps_override"].as<double>();
-            if (!(v > 0.0)) {
-                throw ConfigError(idx + ".competitive_anchor_stride_bps_override must be > 0; got "
-                                  + std::to_string(v));
+            if (!std::isfinite(v) || !(v > 0.0)) {
+                throw ConfigError(idx + ".competitive_anchor_stride_bps_override must be a finite value > 0; "
+                                  "got " + std::to_string(v));
             }
             p.competitive_anchor_stride_bps_override = v;
         }
@@ -925,9 +978,10 @@ std::vector<PairConfig> parse_pairs(const YAML::Node& root)
             ts.reserve(item["tier_spacing_max_bps_override"].size());
             for (std::size_t j = 0; j < item["tier_spacing_max_bps_override"].size(); ++j) {
                 double v = item["tier_spacing_max_bps_override"][j].as<double>();
-                if (!(v > 0.0)) {
+                if (!std::isfinite(v) || !(v > 0.0)) {
                     throw ConfigError(idx + ".tier_spacing_max_bps_override[" + std::to_string(j)
-                                      + "] must be > 0; got " + std::to_string(v));
+                                      + "] must be a finite value > 0; got "
+                                      + std::to_string(v));
                 }
                 ts.push_back(v);
             }
@@ -938,8 +992,12 @@ std::vector<PairConfig> parse_pairs(const YAML::Node& root)
             && item["min_offer_size_units_override"].IsDefined()
             && !item["min_offer_size_units_override"].IsNull()) {
             double v = item["min_offer_size_units_override"].as<double>();
-            if (!(v >= 0.0)) {
-                throw ConfigError(idx + ".min_offer_size_units_override must be >= 0; got "
+            // 0.0 stays legal -- it is the documented disable. Only the
+            // non-finite half is new: +inf here silently stops the pair
+            // quoting at all (the up-scaled floor drops every tier).
+            if (!std::isfinite(v) || !(v >= 0.0)) {
+                throw ConfigError(idx + ".min_offer_size_units_override must "
+                                  "be a finite value >= 0; got "
                                   + std::to_string(v));
             }
             p.min_offer_size_units_override = v;
@@ -1018,6 +1076,20 @@ StrategyConfig parse_strategy(const YAML::Node& root)
     }
     cfg.min_profit_margin_bps = read_positive_double(node, "min_profit_margin_bps", sec);
     cfg.offer_ttl_blocks     = read_uint32_positive(node, "offer_ttl_blocks", sec);
+
+    // [OFFER-EXPIRY] Optional.  Absent or 0 means no on-chain expiry is
+    // attached to the offers we create -- the behaviour that existed before
+    // this key, and the behaviour every deployment keeps until it opts in.
+    //
+    // The floor (an expiry must outlast our OWN hard TTL) is deliberately
+    // NOT checked here: kHardTtlMultiplier lives in offer_manager.hpp, which
+    // this layer does not include, and restating the multiplier would fork a
+    // safety bound into two constants that can drift apart.  OfferManager's
+    // constructor owns that check.
+    if (node["offer_expiry_secs"] && node["offer_expiry_secs"].IsDefined()
+        && !node["offer_expiry_secs"].IsNull()) {
+        cfg.offer_expiry_secs = read_uint32(node, "offer_expiry_secs", sec);
+    }
     cfg.num_tiers            = read_uint32_positive(node, "num_tiers", sec);
 
     cfg.tier_spacing_bps = read_positive_double_seq(node, "tier_spacing_bps", sec);
@@ -1068,8 +1140,13 @@ StrategyConfig parse_strategy(const YAML::Node& root)
     if (node["max_half_spread_bps"] && node["max_half_spread_bps"].IsDefined()
         && !node["max_half_spread_bps"].IsNull()) {
         cfg.max_half_spread_bps = node["max_half_spread_bps"].as<double>();
-        if (cfg.max_half_spread_bps <= 0.0) {
-            throw ConfigError(sec + ".max_half_spread_bps must be > 0; got "
+        // [INFGUARD] `<= 0.0` is false for BOTH NaN and +inf, so this global
+        // twin of the per-pair override admitted either. An infinite cap is a
+        // suppression control that can never bind.
+        if (!std::isfinite(cfg.max_half_spread_bps)
+            || cfg.max_half_spread_bps <= 0.0) {
+            throw ConfigError(sec + ".max_half_spread_bps must be a finite "
+                              "value > 0; got "
                               + std::to_string(cfg.max_half_spread_bps));
         }
     }
@@ -1302,8 +1379,16 @@ StrategyConfig parse_strategy(const YAML::Node& root)
     if (node["block_time_seconds"] && node["block_time_seconds"].IsDefined()
         && !node["block_time_seconds"].IsNull()) {
         cfg.block_time_seconds = node["block_time_seconds"].as<double>();
-        if (cfg.block_time_seconds <= 0.0) {
-            throw ConfigError(sec + ".block_time_seconds must be > 0");
+        // [INFGUARD] `<= 0.0` is false for BOTH NaN and +inf -- the same
+        // shape as the max_half_spread_bps twin above. This one is worse
+        // than a bad number: consumers convert derived block-count bounds to
+        // integers, and static_cast<std::int64_t> of a non-finite double is
+        // undefined behaviour rather than a clamp.
+        if (!std::isfinite(cfg.block_time_seconds)
+            || cfg.block_time_seconds <= 0.0) {
+            throw ConfigError(sec + ".block_time_seconds must be a finite "
+                              "value > 0; got "
+                              + std::to_string(cfg.block_time_seconds));
         }
     }
     if (node["arb_reserve_coins"] && node["arb_reserve_coins"].IsDefined()
@@ -3825,6 +3910,56 @@ void validate_usd_anchor(const AppConfig& cfg)
         enabled_names);
 }
 
+// [review #151] A DECLARED, ENFORCED ASSET THAT NOTHING OBSERVES.
+//
+// Deleting the blanket "NOT YET WIRED" warning was right -- it was false --
+// but it was also the only startup surface that hinted an asset could carry
+// thresholds and no watch. This reports the case that is actually true, and
+// only that case.
+//
+// step_observe_asset_pegs skips an asset with enforce:false, and otherwise
+// needs SOME ENABLED pair crossing that asset against XCH to produce an
+// observation. Without one, usd_obs stays NaN, which enters observe_peg's
+// data-gap branch and HOLDS the streak rather than clearing it -- so the
+// asset is not watched at all, indefinitely, and nothing says so.
+//
+// Deliberately NOT keyed on whether thresholds were declared: the defaults
+// are live values, so an asset with enforce:true and no declared thresholds
+// is just as unobserved. enforce:false is an explicit operator instruction
+// and is silent by design.
+//
+// A sibling of validate_usd_anchor rather than part of it: that function
+// returns on the FIRST usable anchor, so it cannot also walk every asset.
+void validate_enforced_pegs_are_observable(const AppConfig& cfg)
+{
+    for (const PeggedAsset* a : cfg.pegged_assets.all()) {
+        if (a == nullptr || !a->enforce) continue;
+
+        bool observed = false;
+        for (const auto& pair : cfg.pairs) {
+            if (!pair.enabled) continue;
+            const bool xch_base  = pair.base_asset_id == "xch"
+                                && pair.quote_asset_id == a->asset_id;
+            const bool xch_quote = pair.quote_asset_id == "xch"
+                                && pair.base_asset_id == a->asset_id;
+            if (xch_base || xch_quote) { observed = true; break; }
+        }
+        if (observed) continue;
+
+        spdlog::warn(
+            "[Config] pegged_assets.{} ({}) is declared with enforce: true "
+            "but NO ENABLED pair crosses it against XCH, so "
+            "step_observe_asset_pegs produces no observation for it. Its "
+            "peg is NOT being watched: the deviation streak is held, not "
+            "cleared, so it will never warn and never suspend. This is the "
+            "S30 shape -- an asset everyone believes is monitored while its "
+            "only watch lived on a pair that had been disabled. Either "
+            "enable a pair crossing it against XCH, or set enforce: false "
+            "to say the peg is deliberately unenforced.",
+            a->asset_id, a->symbol);
+    }
+}
+
 AppConfig load_config(const std::string& path,
                       const std::string& secrets_path)
 {
@@ -3907,6 +4042,7 @@ AppConfig load_config(const std::string& path,
     cfg.accounting = parse_accounting(root);
     cfg.market_data = parse_market_data(root);
     validate_usd_anchor(cfg);
+    validate_enforced_pegs_are_observable(cfg);
 
     // [S27 review round 3] Since usd_per_xch() now prefers the external
     // CoinGecko price, a polling interval LONGER than the freshness window

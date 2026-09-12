@@ -209,11 +209,16 @@ enum class TierRefresh {
     if (crossed) {
         return TierRefresh::Stale;
     }
-    // (2) Soft TTL zone: an aged offer refreshes on any meaningful drift,
-    //     in either direction, and expires rather than going merely stale.
+    // (2) Soft TTL zone: an aged offer expires -- rather than going merely
+    //     stale -- on ADVERSE drift past the gentler soft-TTL threshold.
+    //     Direction still decides here: a favorably drifted quote is more
+    //     conservative than the one we would post now, so it is left to rest
+    //     until the hard TTL (kHardTtlMultiplier, offer_manager.hpp:821-826)
+    //     expires it unconditionally.
     if (past_soft_ttl) {
-        return price_deviation > soft_ttl_threshold ? TierRefresh::Expired
-                                                    : TierRefresh::Fresh;
+        return (adverse && price_deviation > soft_ttl_threshold)
+            ? TierRefresh::Expired
+            : TierRefresh::Fresh;
     }
     // (3) Too young: the cancel+recreate round trip costs more than the
     //     adverse selection it would avoid.

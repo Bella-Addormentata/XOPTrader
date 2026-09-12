@@ -141,7 +141,8 @@ XOPTrader maintains per-pair PID controllers (`SpreadPidState` and `Competitiven
 
 ### E. Valuation Grade & Rolling-Window Breaker Protection
 * **The Vulnerability:** When `XCH/BYC` spread narrowed to ~30% upon posting wide asks, the book earned `mid_valuation_grade = true` under the default $5,000\text{ bps}$ ($50\%$) agreement ceiling. In Step 11, `PnLTracker::mark_to_market` marked the wallet's $78.57\text{ XCH}$ balance against `XCH/BYC`'s mid ($1.81\text{ USD}$) instead of true spot ($1.44\text{ USD}$), causing a phantom $+\$28.85$ PnL spike followed by a $-\$32.20$ drop on reversion, which tripped Step 13's rolling-window loss circuit breaker.
-* **The Solution:** Set `market_data.book_side_agree_max_spread_bps: 1500.0` ($15\%$) in `config.yaml`. Books with spread $> 15\%$ are denied `mid_valuation_grade` and safely excluded from marking base asset equity, completely eliminating phantom PnL swings while allowing normal quoting to proceed.
+* **The Solution:** Set `book_side_agree_max_spread_bps_override: 1500.0` ($15\%$) on the `XCH/BYC` pair in `config.yaml`. Books with spread $> 15\%$ are denied `mid_valuation_grade` and safely excluded from marking base asset equity, completely eliminating phantom PnL swings while allowing normal quoting to proceed.
+* **[S33 2026-09-12] This was the global `market_data.book_side_agree_max_spread_bps` until c749aab.** That knob reaches `MarketDataConfig` once in `Engine::Engine`, and the single `MarketDataFeed` built from it serves every enabled market -- so a value chosen for THIS book also denied the bypass to every other pair whose spread sat between $1{,}500$ and the $5{,}000$ default. The ceiling is now a per-pair override; the global key is absent from `config.yaml` and falls back to $5{,}000$. The effective value remains $\min(\text{override}, \texttt{mid\_gate\_book\_confirm\_max\_spread\_bps})$ via `bookside::effective_agree_max_spread_bps`, and that gate is still global.
 
 ### F. Breaking the Competitive Anchor Feedback Loop on Illiquid Books
 * **The Feedback Loop Mechanism:**
@@ -269,7 +270,7 @@ flowchart TD
 
 - [x] Update `cpp/src/engine.cpp` Step 8 to use `classify_cross_bbo` with fallback diagnostics.
 - [x] Add `max_half_spread_bps_override` and `tier_spacing_bps_override` to `XCH/BYC` in `config.yaml`.
-- [x] Configure `market_data.book_side_agree_max_spread_bps: 1500.0` in `config.yaml`.
+- [x] Scope the two-sides-agree ceiling to `XCH/BYC` with `book_side_agree_max_spread_bps_override: 1500.0` in `config.yaml` (S33 2026-09-12, c749aab). The global `market_data.book_side_agree_max_spread_bps` is **absent** from `config.yaml`; every other pair keeps the 5000 default from `MarketDataConfig`.
 - [x] Implement per-pair `competitive_anchor_enabled_override` in `cpp/include/xop/config.hpp`, `cpp/src/config.cpp`, and `cpp/src/engine.cpp`.
 - [x] Set `competitive_anchor_enabled_override: false` for `XCH/BYC` in `config.yaml`.
 - [x] Implement stepped anti-collapse logic in Step 7's order-book price guard in `cpp/src/engine.cpp`.

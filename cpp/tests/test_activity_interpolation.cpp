@@ -42,9 +42,92 @@
 #include "xop/engine.hpp"
 
 using xop::ActivitySchedules;
+using xop::BookActivity;
+using xop::fresh_book_depth;
 using xop::interpolate_activity_schedules;
 
 namespace {
+
+constexpr xop::BlockHeight kThisBlock = 100;
+constexpr xop::BlockHeight kLastBlock = 99;
+
+xop::CompetingOffer make_offer(xop::Side side, xop::BlockHeight seen_block)
+{
+    xop::CompetingOffer o;
+    o.offer_id         = "o";
+    o.pair_name        = "XCH/BYC";
+    o.side             = side;
+    o.price            = 1000;
+    o.size             = 1000;
+    o.first_seen_block = seen_block;
+    o.last_seen_block  = seen_block;
+    o.last_seen_ts     = xop::Timestamp{};
+    return o;
+}
+
+// THE REGRESSION TEST.  A book frozen by a failed offers fetch must not
+// contribute depth.  The heartbeat only runs on a STRICTLY greater height,
+// so a carried-over book is always stamped with an earlier one.  With the
+// gate removed this reports the full book as live depth.
+TEST(ActivityBookDepth, AStaleBookContributesNoDepth)
+{
+    std::vector<xop::CompetingOffer> book;
+    for (int i = 0; i < 3; ++i) book.push_back(make_offer(xop::Side::Bid, kLastBlock));
+    for (int i = 0; i < 2; ++i) book.push_back(make_offer(xop::Side::Ask, kLastBlock));
+
+    const BookActivity d = fresh_book_depth(book, kThisBlock);
+
+    EXPECT_EQ(d.bids, 0u);
+    EXPECT_EQ(d.asks, 0u);
+    EXPECT_EQ(d.stale_ignored, 5u);
+}
+
+// Staleness is judged PER OFFER.  A gate keyed on the newest offer, or on a
+// single book-level marker, would admit the whole vector.
+TEST(ActivityBookDepth, StalenessIsJudgedPerOffer)
+{
+    std::vector<xop::CompetingOffer> book;
+    book.push_back(make_offer(xop::Side::Bid, kThisBlock));
+    book.push_back(make_offer(xop::Side::Bid, kLastBlock));
+    book.push_back(make_offer(xop::Side::Ask, kLastBlock));
+
+    const BookActivity d = fresh_book_depth(book, kThisBlock);
+
+    EXPECT_EQ(d.bids, 1u);
+    EXPECT_EQ(d.asks, 0u);
+    EXPECT_EQ(d.stale_ignored, 2u);
+}
+
+// A fresh book still counts, per side.  Guards the gate against being applied
+// backwards, which would zero the term in normal operation and pin every pair
+// permanently wide.
+TEST(ActivityBookDepth, FreshOffersAreCountedPerSide)
+{
+    std::vector<xop::CompetingOffer> book;
+    for (int i = 0; i < 3; ++i) book.push_back(make_offer(xop::Side::Bid, kThisBlock));
+    for (int i = 0; i < 2; ++i) book.push_back(make_offer(xop::Side::Ask, kThisBlock));
+
+    const BookActivity d = fresh_book_depth(book, kThisBlock);
+
+    EXPECT_EQ(d.bids, 3u);
+    EXPECT_EQ(d.asks, 2u);
+    EXPECT_EQ(d.stale_ignored, 0u);
+}
+
+// The comparison is EQUALITY, not `<`.  An offer stamped AHEAD of the height
+// being processed was not observed in it either, so it is not live depth.
+// Relaxing the gate to `last_seen_block < now_block` would silently admit it
+// and only this test would notice.
+TEST(ActivityBookDepth, AnOfferStampedAheadOfThisBlockIsNotCounted)
+{
+    std::vector<xop::CompetingOffer> book;
+    book.push_back(make_offer(xop::Side::Bid, kThisBlock + 1));
+
+    const BookActivity d = fresh_book_depth(book, kThisBlock);
+
+    EXPECT_EQ(d.bids, 0u);
+    EXPECT_EQ(d.stale_ignored, 1u);
+}
 
 // The controller's headline contract: with no activity on either side, both
 // sides sit at the WIDE end.  A reversed interpolation puts them at min.
@@ -168,14 +251,43 @@ TEST(ActivityInterpolation, AnInvertedSpacingEntryIsClampedPerTier)
 
     EXPECT_EQ(zero.spacing_tiers_inverted, 1u);
     EXPECT_DOUBLE_EQ(zero.bid_spacings[0], 600.0) << "tier 0 is well-formed";
-    EXPECT_DOUBLE_EQ(zero.bid_spacings[1], 200.0) << "tier 1 clamped up to min";
-    EXPECT_DOUBLE_EQ(zero.ask_spacings[1], 200.0);
+    EXPECT_DOUBLE_EQ(zero.bid_spacings[1], 700.0)
+        << "clamped to one base gap OUTSIDE tier 0, not merely up to its own "
+           "minimum: 200 would price inside tier 0, and 600 would tie with it";
+    EXPECT_DOUBLE_EQ(zero.ask_spacings[1], 700.0);
+    EXPECT_GT(zero.bid_spacings[1], zero.bid_spacings[0])
+        << "the repaired schedule must be ordered AND distinct";
     for (std::size_t i = 0; i < zero.bid_spacings.size(); ++i) {
         EXPECT_GE(zero.bid_spacings[i], busy.bid_spacings[i])
             << "the zero-activity schedule must never be narrower than the "
                "active one, tier " << i;
         EXPECT_GE(zero.ask_spacings[i], busy.ask_spacings[i]);
     }
+}
+
+// THE SILENT SHAPE.  Every entry is ABOVE its own base spacing, so the
+// per-tier minimum clamp sees nothing wrong -- 300 > 200 -- yet the schedule
+// steps back inward.  Before the fix this produced [900, 300] with
+// spacing_tiers_inverted == 0: the pair lost a rung to the width floor and
+// NOTHING was logged, because the counter only ever compared a maximum to its
+// own minimum.
+TEST(ActivityInterpolation, ANonAscendingMaxScheduleIsNormalizedAndReported)
+{
+    const std::vector<double> min_s{100.0, 200.0};
+    const std::vector<double> max_s{900.0, 300.0};
+
+    const ActivitySchedules zero = interpolate_activity_schedules(
+        0.0, 0.0, 50.0, 250.0, min_s, max_s, 2);
+
+    EXPECT_DOUBLE_EQ(zero.bid_spacings[0], 900.0);
+    EXPECT_DOUBLE_EQ(zero.bid_spacings[1], 1000.0);
+    EXPECT_DOUBLE_EQ(zero.ask_spacings[1], 1000.0);
+    EXPECT_GT(zero.bid_spacings[1], zero.bid_spacings[0])
+        << "non-decreasing is the documented precondition of "
+           "shift_schedule_to_floor, which only ever measures front()";
+    EXPECT_EQ(zero.spacing_tiers_inverted, 1u)
+        << "and it must be LOUD: this shape trips no min-clamp, so the pair "
+           "would otherwise lose a rung with nothing in the log";
 }
 
 // The no-override case: max_spacings IS min_spacings (the call site passes the
@@ -201,8 +313,12 @@ TEST(ActivityInterpolation, WithNoSpacingOverrideTheScheduleIsActivityIndependen
 }
 
 // num_tiers past the end of both schedules: the call site's historical default
-// is 100 * (tier + 1) bps, and with no maximum for that tier it is flat.
-// Boundary document -- it pins the fallback, it kills no mutation on its own.
+// for the base is 100 * (tier + 1) bps.  [review 2026-09-12] A tier with no
+// configured maximum is NOT left at that base any more -- it is carried one
+// base gap outside the tier before it.  It has to be: tier 0 may be widened
+// to 600 while tier 1's base is 200, and leaving 200 there is a schedule that
+// steps back INWARD, which the width-floor pass resolves by collapsing the
+// two onto one price.  Still not a misconfiguration, so the counter stays 0.
 TEST(ActivityInterpolation, TiersPastTheScheduleFallBackToTheDefaultSpacing)
 {
     const std::vector<double> min_s{100.0};
@@ -213,8 +329,8 @@ TEST(ActivityInterpolation, TiersPastTheScheduleFallBackToTheDefaultSpacing)
 
     ASSERT_EQ(s.bid_spacings.size(), 3u);
     EXPECT_DOUBLE_EQ(s.bid_spacings[0], 600.0);
-    EXPECT_DOUBLE_EQ(s.bid_spacings[1], 200.0);
-    EXPECT_DOUBLE_EQ(s.bid_spacings[2], 300.0);
+    EXPECT_DOUBLE_EQ(s.bid_spacings[1], 700.0);
+    EXPECT_DOUBLE_EQ(s.bid_spacings[2], 800.0);
     EXPECT_EQ(s.spacing_tiers_inverted, 0u)
         << "a tier with no configured maximum is not a misconfiguration";
 }

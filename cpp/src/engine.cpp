@@ -358,15 +358,38 @@ ActivitySchedules interpolate_activity_schedules(
 
     out.bid_spacings.resize(num_tiers);
     out.ask_spacings.resize(num_tiers);
+    double prev_max_s = 0.0;
+    double prev_min_s = 0.0;
     for (std::size_t i = 0; i < num_tiers; ++i) {
         const double min_s = (i < min_spacings.size())
             ? min_spacings[i]
             : (100.0 * static_cast<double>(i + 1));
         const double cfg_max_s = (i < max_spacings.size()) ? max_spacings[i] : min_s;
-        if (cfg_max_s < min_s) {
+        // [review] The wide end must clear this tier's OWN base spacing AND
+        // stay at least one base gap outside the tier before it.  Clamping
+        // against min_s alone leaves the schedule NON-ASCENDING in two
+        // reachable shapes: [900, 300] over a [100, 200] base clamps to
+        // itself (300 > 200, so nothing looks wrong), and a max list SHORTER
+        // than num_tiers falls back to base spacings that are narrower than
+        // the tier before -- the case config.example.yaml documents as
+        // supported.  Nothing downstream repairs it: shift_schedule_to_floor
+        // only ever measures front(), and build_raw_ladder prices each tier
+        // independently.  The width-floor pass does catch the price, but by
+        // collapsing the tier onto its predecessor's exact price level, so
+        // that rung's size lands at the MOST aggressive price instead of
+        // spreading -- the inverse of what the ladder is for.
+        //
+        // Carrying the gap rather than flattening to prev_max_s is what
+        // keeps the repaired tiers DISTINCT: flattening would turn a short
+        // max list into N tiers at one price, which is the same collapse.
+        const double gap = (i == 0) ? 0.0 : std::max(0.0, min_s - prev_min_s);
+        const double floor_s = std::max(min_s, prev_max_s + gap);
+        if (cfg_max_s < floor_s && i < max_spacings.size()) {
             ++out.spacing_tiers_inverted;
         }
-        const double max_s = std::max(cfg_max_s, min_s);
+        const double max_s = std::max(cfg_max_s, floor_s);
+        prev_max_s = max_s;
+        prev_min_s = min_s;
         out.bid_spacings[i] = max_s - a_ask * (max_s - min_s);
         out.ask_spacings[i] = max_s - a_bid * (max_s - min_s);
     }
@@ -374,12 +397,42 @@ ActivitySchedules interpolate_activity_schedules(
     return out;
 }
 
+// [S33 2026-09-12] See the contract in engine.hpp.  The gate IS this
+// function; a version that counts every offer is the defect it exists to
+// close.  EQUALITY -- not >=, not a wall-clock age: heights are unique per
+// heartbeat, so anything not stamped with THIS height was carried over.
+BookActivity fresh_book_depth(const std::vector<CompetingOffer>& offers,
+                              BlockHeight                        now_block)
+{
+    BookActivity out;
+    for (const auto& co : offers) {
+        if (co.last_seen_block != now_block) {
+            ++out.stale_ignored;
+            continue;
+        }
+        if (co.side == Side::Bid) ++out.bids;
+        else if (co.side == Side::Ask) ++out.asks;
+    }
+    return out;
+}
+
 // [S33 2026-09-05] See the contract in engine.hpp.
 Mojo xch_mark_price_mojos(Mojo xch_usd_mojos, double registered_factor)
 {
     if (xch_usd_mojos > 0 && registered_factor > 0.0) {
-        return static_cast<Mojo>(std::llround(
-            static_cast<double>(xch_usd_mojos) / registered_factor));
+        // [S33 review] Checked, not cast.  The guard above screens sign and
+        // NaN, not MAGNITUDE: nothing bounds peg_target from below (config.cpp
+        // requires finite and > 0; PeggedAsset::is_coherent requires > 0 and
+        // <= kMaxPegTarget), and a par asset is trusted by construction, so an
+        // arbitrarily small positive factor reaches this divisor and the
+        // quotient leaves Mojo.  llround on an out-of-range double returns an
+        // UNSPECIFIED value, so the check has to be BEFORE the call.  Falling
+        // through to the existing `return 0` is this function's established
+        // "do not mark", exactly as for an unpriceable pair.
+        if (const auto m = to_mojo_checked(
+                static_cast<double>(xch_usd_mojos) / registered_factor)) {
+            return *m;
+        }
     }
     return 0;
 }
@@ -6903,7 +6956,7 @@ void Engine::update_fair_values()
 }
 
 // Step 7: Generate multi-tier offer ladder.
-void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
+void Engine::step_generate_ladder(BlockHeight block_height)
 {
     // -- Per-asset portfolio percentages (for asset-level drift guard) ----
     // Computed once per cycle: XCH-equivalent value of each asset divided
@@ -8009,11 +8062,26 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                 std::tie(bids_24h, asks_24h) = db_->query_trade_counts_by_side(pair_name, since_block);
             }
 
-            std::size_t book_bids = 0;
-            std::size_t book_asks = 0;
-            for (const auto& co : comp_offers) {
-                if (co.side == Side::Bid) ++book_bids;
-                else if (co.side == Side::Ask) ++book_asks;
+            // [S33 2026-09-12] FRESHNESS GATE -- see the contract in
+            // engine.hpp.  competing_offers_ has no TTL and no pruner, so an
+            // offers-fetch failure leaves Step 7 holding the PREVIOUS cycle's
+            // book (the stale-book path documented at the fetch above).
+            // Counting those retained offers as live depth holds alpha up,
+            // and alpha interpolates DOWN toward the tight end -- so an
+            // outage would leave quotes TIGHT through exactly the window the
+            // wide schedule exists to protect.  bids_24h/asks_24h are NOT
+            // gated: they come from the DB and survive the outage, so a stale
+            // book degrades this pair to fills-only activity, not to zero.
+            const BookActivity book_depth =
+                fresh_book_depth(comp_offers, block_height);
+            const std::size_t book_bids = book_depth.bids;
+            const std::size_t book_asks = book_depth.asks;
+            if (book_depth.stale_ignored > 0) {
+                spdlog::warn("[Engine] Step 7: ignored {} competing offers "
+                             "not seen in block {} for {} activity "
+                             "(offers feed down?)",
+                             book_depth.stale_ignored, block_height,
+                             pair_name);
             }
 
             const double book_weight = pair_cfg
@@ -8078,9 +8146,12 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                 spdlog::warn("[Engine] Step 7: {} INVERTED activity range in config -- "
                              "min_profit_margin_max_bps_override ({:.0f}bps vs min {:.0f}bps, "
                              "inverted={}) and/or tier_spacing_max_bps_override ({} of {} tiers "
-                             "below their base spacing). A maximum below its minimum would run "
-                             "the controller BACKWARDS (low activity would tighten quotes); each "
-                             "offending maximum is clamped up to its minimum, so this pair gets "
+                             "below their tier floor). A maximum below its own minimum would run "
+                             "the controller BACKWARDS (low activity would tighten quotes), and "
+                             "one below the PREVIOUS tier's maximum would post that tier inside "
+                             "its predecessor; each offending maximum is clamped up to the "
+                             "greater of its own minimum and one base gap outside the tier "
+                             "before it, so this pair gets "
                              "NO adaptive widening until the config is fixed.",
                              pair_name, max_margin, min_margin,
                              sched.margin_range_inverted,
@@ -8486,9 +8557,21 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
         // the sweep day every one of those was pulling toward a book that
         // was itself the mispriced object, so the floor must be the LAST
         // word on how close to the centre a quote may sit.  Tiers inside
-        // the floor are pushed to its edge, stepped apart so they do not
-        // collapse onto one price level (same rationale as the fair-value
-        // clamp's tier step).  Sizes are untouched.
+        // the floor are pushed to its edge.  Sizes are untouched.
+        //
+        // [review 2026-09-12] KNOWN GAP, stated rather than overclaimed: an
+        // earlier revision of this comment promised the floored tiers are
+        // "stepped apart so they do not collapse onto one price level".
+        // They are not.  The compliant branch below sets next_max to that
+        // tier's own price and SKIPS the step, so the first floored tier
+        // after a compliant one is handed the compliant tier's exact price.
+        // The same shape written correctly is the order-book guard's clamp
+        // ~130 lines down, which applies the min and the step
+        // unconditionally.  Not repaired here: this pass is inside
+        // step_generate_ladder and nothing in cpp/tests constructs an
+        // Engine, so the change could not be pinned by a test, and stepping
+        // after a compliant tier would reprice tiers currently left alone.
+        // Filed as separate work.
         // -----------------------------------------------------------------
         if (mid_mojos > 0 && quote_min_half_spread_bps > 0.0
             && !pcs.ladder.empty())
@@ -8524,8 +8607,9 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
             int floored_bids = 0;
             int floored_asks = 0;
 
-            // BID side: running ceiling stepping DOWN, so successive
-            // floored tiers stay distinct and ordered.
+            // BID side: running ceiling stepping DOWN.  Successive FLOORED
+            // tiers stay distinct; a floored tier immediately after a
+            // compliant one does not -- see the known gap above.
             Mojo next_max = floor_bid_edge;
             for (TierQuote* tqp : tiers_in_order(Side::Bid)) {
                 TierQuote& tq = *tqp;

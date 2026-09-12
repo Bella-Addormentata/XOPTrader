@@ -209,6 +209,19 @@ pairs:
     # competitive_anchor_max_distance_bps_override: 250.0  # [OPTIONAL, default: unset -> strategy.competitive_anchor_max_distance_bps] must be > 0
     # competitive_anchor_stride_bps_override: 20.0         # [OPTIONAL, default: unset -> strategy.competitive_anchor_stride_bps] must be > 0
     # fair_value_residual_widen_ratio_override: 0.25       # [OPTIONAL, default: unset -> strategy.fair_value_residual_widen_ratio] 0 disables residual widening here; must be >= 0
+    # offer_expiry_secs_override: 172800                   # [OPTIONAL, default: unset -> strategy.offer_expiry_secs] 0 binds and means "never expire THIS pair's offers"; must outlast the hard TTL x2 safety margin
+
+    # -- Per-pair override of a MARKET_DATA-level key (not a strategy one) --
+    # Ceiling in BASIS POINTS -- not a fraction; contrast the BBO block below.
+    # Absent -> market_data.book_side_agree_max_spread_bps (5000 by default).
+    # Must be finite and >= 0; 0 disables the two-sides-agree bypass for this
+    # pair.  ONE-WAY: the effective value is min(this,
+    # market_data.mid_gate_book_confirm_max_spread_bps), so RAISING it above
+    # that gate does NOTHING -- this can only make one pair STRICTER, never
+    # more permissive than the bot-wide gate.  Lowering it can cost THIS pair
+    # its mid_valuation_grade (valuation falls to the S20 carry); read the
+    # market_data comment on book_side_agree_max_spread_bps before setting it.
+    # book_side_agree_max_spread_bps_override: 1500.0      # [OPTIONAL, default: unset -> market_data.book_side_agree_max_spread_bps]
 
     # -- Per-pair 24h activity-adaptive controller --
     # See strategy.activity_adaptive_spacing for what the controller does.
@@ -224,8 +237,11 @@ pairs:
     # Wide end of the spacing ramp: one entry per tier, aligned with
     # tier_spacing_bps_override above (which is the NARROW end).  Unset ->
     # the ramp is flat (max == base), so spacing never moves and only the
-    # margin adapts.  Every entry must be > 0; tiers past the end of the
-    # list keep their base spacing.
+    # margin adapts.  Every entry must be > 0.  A list SHORTER than the tier
+    # count no longer leaves the later tiers at their base spacing: each is
+    # carried at least one base gap outside the tier before it, because a
+    # schedule that steps back INWARD would post that tier inside its
+    # predecessor and the width floor then collapses both onto one price.
     # tier_spacing_max_bps_override: [12, 20, 32, 60, 100, 160]
 
     # [BBOPERPAIR 2026-09-01] Per-pair BBO proximity caps: "do not quote
@@ -314,7 +330,28 @@ strategy:
   min_profit_margin_bps: 35  # [REQUIRED] Never post ask below cost_basis + this margin
   high_vol_multiplier: 1.3   # [OPTIONAL, default: 1.3] Spread widening multiplier during high-vol regimes
   sigma_floor: 0.001         # [OPTIONAL, default: 0.001] Minimum annualized sigma for GLFT formula (prevents degenerate spreads when market is flat)
-  offer_ttl_blocks: 600      # [REQUIRED] Soft TTL: cancel stale offers after N blocks (~5 hours at 600)
+  offer_ttl_blocks: 600      # [REQUIRED] Soft TTL: cancel stale offers after N blocks (~8.7 hours at 600)
+  # [OFFER-EXPIRY] On-chain expiry attached to offers we CREATE, in seconds.
+  # Commented out because 0/unset is the default and the safe posture: no
+  # timelock is attached and offers behave exactly as they always have.
+  #
+  # What it buys: if we ever lose the ability to cancel an offer, the chain
+  # retires it for us instead of leaving it takeable indefinitely.
+  #
+  # What it costs, and why it is opt-in: the expiry is sent as `max_time`,
+  # the ONLY one of Chia's four absolute timelock flags the reference wallet
+  # honours when TAKING an offer.  Even so, a taker on an old enough wallet
+  # can fail to take an offer that carries one, and we cannot survey what
+  # wallets our takers run.  Enable per pair, deliberately.
+  #
+  # MUST exceed this bot's own hard TTL -- offer_ttl_blocks x 2 at the
+  # configured strategy.block_time_seconds (52.0s) -- times a 2x safety
+  # margin, because the real block rate varies.  At offer_ttl_blocks: 600
+  # the floor is 124800s, so any value at or below ~34.7 hours is
+  # REJECTED at startup: an expiry inside
+  # our own TTL would let the chain retire offers the engine still tracks as
+  # live, with no cancel ever recorded.
+  # offer_expiry_secs: 172800  # [OPTIONAL, default: 0 = disabled] 48h
   num_tiers: 4               # [REQUIRED] Multi-tier offer ladder depth (4 recommended: fewer, larger tiers)
   tier_spacing_bps: [35, 100, 200, 300]  # [REQUIRED] Spread per tier (bps)
   tier_size_pct: [0.15, 0.20, 0.30, 0.35] # [REQUIRED] Capital fraction per tier (sum ≈ 1.0)

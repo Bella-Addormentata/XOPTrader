@@ -89,8 +89,10 @@ TEST(XchMarkPrice, AnUnpriceablePairMarksNothing)
     EXPECT_EQ(xch_mark_price_mojos(kXchUsdMojos, 0.0), Mojo{0});
 }
 
-// Defensive, and NaN-safe by construction: `> 0.0` is false for NaN, so a
-// poisoned factor cannot produce an inf/NaN mark for llround to trap on.
+// Defensive.  `> 0.0` is false for NaN, so a poisoned factor is rejected
+// before the division -- but that guard screens SIGN, not MAGNITUDE, and the
+// earlier claim here that it made llround trap-proof was wrong.  The case it
+// does not cover is pinned directly below.
 TEST(XchMarkPrice, ANegativeOrNanFactorMarksNothing)
 {
     EXPECT_EQ(xch_mark_price_mojos(kXchUsdMojos, -1.0), Mojo{0});
@@ -98,6 +100,32 @@ TEST(XchMarkPrice, ANegativeOrNanFactorMarksNothing)
                   kXchUsdMojos,
                   std::numeric_limits<double>::quiet_NaN()),
               Mojo{0});
+}
+
+// The MAGNITUDE gap.  Nothing bounds peg_target from below -- config.cpp
+// requires only finite and > 0, PeggedAsset::is_coherent only > 0 and
+// <= kMaxPegTarget -- and a par asset is trusted by construction, so a
+// mis-declared 1e-9 (a plausible slip from someone thinking in mojos) reaches
+// this divisor.  1.5e12 / 1e-9 is 1.5e21, far outside Mojo, and llround on an
+// out-of-range double returns an UNSPECIFIED value.  MEASURED on this
+// toolchain (MSVC, x64), that value is 0 -- the same answer to_mojo_checked
+// produces deliberately -- so HERE the defect and the guard are
+// indistinguishable through the return value, and no assertion in this file
+// can separate them.  The guard still earns its place: "unspecified" is not
+// "0", a target that yields INT64_MIN would hand that straight to
+// mark_to_market, and the guard makes the answer a deterministic 0
+// everywhere.  HONEST LIMIT: this test pins the CONTRACT, not the defect --
+// reinstating the unchecked cast leaves it green on this platform.
+// test_peg_registry.cpp already asserts 1e12 / 1e-9 is unrepresentable; this
+// pins the boundary at the call site that actually divides.
+TEST(XchMarkPrice, AnUnrepresentableQuotientMarksNothing)
+{
+    EXPECT_EQ(xch_mark_price_mojos(kXchUsdMojos, 1e-9), Mojo{0});
+    // Not a blanket rejection of small factors: 1.5e12 / 1e-6 is 1.5e18,
+    // under to_mojo_checked's ~9.2233720368547748e18 ceiling, so it marks.
+    // Deliberately EXPECT_GT and not an exact value -- 1e-6 is not exactly
+    // representable, so the quotient is 1.4999999999999999686e18, not 1.5e18.
+    EXPECT_GT(xch_mark_price_mojos(kXchUsdMojos, 1e-6), Mojo{0});
 }
 
 // No USD anchor for XCH yet (pre-first-fetch, or every anchor down): mark
