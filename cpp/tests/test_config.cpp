@@ -2369,6 +2369,98 @@ pegged_assets:
         << "the asset-level watcher is a second watcher, not absent";
 }
 
+TEST(ConfigParserTest, PeggedAssets_EnforcedButUnobservableAssetWarns) {
+    // [review #151] The partner of ThresholdsAreNotAdvertisedAsUnwired: that
+    // test pins the FALSE blanket warning staying gone; this pins the TRUE
+    // targeted one appearing. Deleting a wrong warning should not leave the
+    // real case silent.
+    //
+    // kMinimalValidYaml's single pair is XCH/DBX, so an asset declared here
+    // is crossed by no enabled pair and is genuinely unobservable.
+    CapturedLog log;
+    TempYaml tmp(with_pegs(R"(
+pegged_assets:
+- asset_id: aabb000000000000000000000000000000000000000000000000000000000000
+  symbol: wLONELY
+  peg_currency: USD
+  peg_target: 1.0
+  enforce: true
+)"));
+    auto cfg = xop::load_config(tmp.path());
+
+    // Anti-vacuity: the declaration really did load and really is enforced.
+    const auto* a = cfg.pegged_assets.find(
+        "aabb000000000000000000000000000000000000000000000000000000000000");
+    ASSERT_NE(a, nullptr);
+    EXPECT_TRUE(a->enforce);
+
+    EXPECT_TRUE(log.warned_containing("NO ENABLED pair crosses it against XCH"))
+        << "an enforced peg nothing observes must not be silent";
+    EXPECT_TRUE(log.warned_containing("wLONELY"))
+        << "the warning must name the asset";
+    // And the deleted blanket warning must STAY deleted.
+    EXPECT_FALSE(log.warned_containing("NOT YET WIRED"));
+}
+
+TEST(ConfigParserTest, PeggedAssets_ObservedAssetIsSilent) {
+    // [review #151] THE HALF THAT WAS UNPINNED. A mutation removing the
+    // `observed` early-continue reddened NOTHING, because neither other test
+    // declares an asset that IS observed -- so the guard rested on
+    // inspection. This closes that.
+    //
+    // kMinimalValidYaml's single ENABLED pair is XCH/TEST, base xch, quote
+    // 0123...cdef. Declaring THAT asset id means an enabled pair really does
+    // cross it against XCH, so the warning must stay silent. The asset id
+    // must match exactly: a typo would make this pass for the wrong reason
+    // (nothing matched) rather than the right one (it is observed).
+    CapturedLog log;
+    TempYaml tmp(with_pegs(R"(
+pegged_assets:
+- asset_id: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  symbol: wSEEN
+  peg_currency: USD
+  peg_target: 1.0
+  enforce: true
+)"));
+    auto cfg = xop::load_config(tmp.path());
+
+    // Anti-vacuity: the asset loaded, is enforced, AND an enabled pair
+    // really does cross it against XCH.
+    const auto* a = cfg.pegged_assets.find(
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+    ASSERT_NE(a, nullptr);
+    EXPECT_TRUE(a->enforce);
+    ASSERT_FALSE(cfg.pairs.empty());
+    EXPECT_TRUE(cfg.pairs[0].enabled);
+    EXPECT_EQ(cfg.pairs[0].base_asset_id, "xch");
+    EXPECT_EQ(cfg.pairs[0].quote_asset_id, a->asset_id);
+
+    EXPECT_FALSE(log.warned_containing("NO ENABLED pair crosses it against XCH"))
+        << "this asset IS observed -- warning here would be a false alarm on "
+           "a correctly configured deployment";
+}
+
+TEST(ConfigParserTest, PeggedAssets_UnenforcedAssetIsSilent) {
+    // enforce:false is an explicit operator instruction meaning "do not
+    // enforce this peg". Warning about it would re-create the noise the
+    // blanket warning was deleted for.
+    CapturedLog log;
+    TempYaml tmp(with_pegs(R"(
+pegged_assets:
+- asset_id: dead000000000000000000000000000000000000000000000000000000000000
+  symbol: wQUIET
+  peg_currency: USD
+  peg_target: 1.0
+  enforce: false
+)"));
+    auto cfg = xop::load_config(tmp.path());
+    ASSERT_NE(cfg.pegged_assets.find(
+        "dead000000000000000000000000000000000000000000000000000000000000"),
+        nullptr);
+    EXPECT_FALSE(log.warned_containing("NO ENABLED pair crosses it against XCH"))
+        << "enforce:false is deliberate, not a watch gap";
+}
+
 TEST(ConfigParserTest, PeggedAssets_AHalfDeclarationIsRefused) {
     // [review round 11] PeggedAsset defaults peg_currency to "USD" and
     // peg_target to 1.0, and the parser only overwrote PRESENT keys -- so an

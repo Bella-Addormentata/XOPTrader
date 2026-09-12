@@ -3864,6 +3864,56 @@ void validate_usd_anchor(const AppConfig& cfg)
         enabled_names);
 }
 
+// [review #151] A DECLARED, ENFORCED ASSET THAT NOTHING OBSERVES.
+//
+// Deleting the blanket "NOT YET WIRED" warning was right -- it was false --
+// but it was also the only startup surface that hinted an asset could carry
+// thresholds and no watch. This reports the case that is actually true, and
+// only that case.
+//
+// step_observe_asset_pegs skips an asset with enforce:false, and otherwise
+// needs SOME ENABLED pair crossing that asset against XCH to produce an
+// observation. Without one, usd_obs stays NaN, which enters observe_peg's
+// data-gap branch and HOLDS the streak rather than clearing it -- so the
+// asset is not watched at all, indefinitely, and nothing says so.
+//
+// Deliberately NOT keyed on whether thresholds were declared: the defaults
+// are live values, so an asset with enforce:true and no declared thresholds
+// is just as unobserved. enforce:false is an explicit operator instruction
+// and is silent by design.
+//
+// A sibling of validate_usd_anchor rather than part of it: that function
+// returns on the FIRST usable anchor, so it cannot also walk every asset.
+void validate_enforced_pegs_are_observable(const AppConfig& cfg)
+{
+    for (const PeggedAsset* a : cfg.pegged_assets.all()) {
+        if (a == nullptr || !a->enforce) continue;
+
+        bool observed = false;
+        for (const auto& pair : cfg.pairs) {
+            if (!pair.enabled) continue;
+            const bool xch_base  = pair.base_asset_id == "xch"
+                                && pair.quote_asset_id == a->asset_id;
+            const bool xch_quote = pair.quote_asset_id == "xch"
+                                && pair.base_asset_id == a->asset_id;
+            if (xch_base || xch_quote) { observed = true; break; }
+        }
+        if (observed) continue;
+
+        spdlog::warn(
+            "[Config] pegged_assets.{} ({}) is declared with enforce: true "
+            "but NO ENABLED pair crosses it against XCH, so "
+            "step_observe_asset_pegs produces no observation for it. Its "
+            "peg is NOT being watched: the deviation streak is held, not "
+            "cleared, so it will never warn and never suspend. This is the "
+            "S30 shape -- an asset everyone believes is monitored while its "
+            "only watch lived on a pair that had been disabled. Either "
+            "enable a pair crossing it against XCH, or set enforce: false "
+            "to say the peg is deliberately unenforced.",
+            a->asset_id, a->symbol);
+    }
+}
+
 AppConfig load_config(const std::string& path,
                       const std::string& secrets_path)
 {
@@ -3946,6 +3996,7 @@ AppConfig load_config(const std::string& path,
     cfg.accounting = parse_accounting(root);
     cfg.market_data = parse_market_data(root);
     validate_usd_anchor(cfg);
+    validate_enforced_pegs_are_observable(cfg);
 
     // [S27 review round 3] Since usd_per_xch() now prefers the external
     // CoinGecko price, a polling interval LONGER than the freshness window
