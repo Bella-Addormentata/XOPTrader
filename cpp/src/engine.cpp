@@ -1607,7 +1607,18 @@ void Engine::shutdown()
                 // Engine) is satisfied by moving the state out, not by
                 // leaving it untested. What remains below is a switch that
                 // awaits and hands the result back.
-                execution::CancelLadder ladder(outstanding, retry_cfg);
+                // [S33 2026-09-12] The third argument is the whole point
+                // of this sweep at this call site. `outstanding` is seeded
+                // from State above, so an engine that recovered a previous
+                // instance's offers but could not re-adopt them -- the wallet
+                // was unsynced, every probe returned NoVerdict -- builds an
+                // EMPTY ladder, and an empty ladder used to Finish before
+                // attempt 1. cancel_all() was therefore never awaited, the
+                // SweepRefused branch below was unreachable, and the stop
+                // reported "All outstanding offers cancelled (0 attempt(s),
+                // 0 ms)" having swept nothing.
+                execution::CancelLadder ladder(outstanding, retry_cfg,
+                                               /*sweep_when_empty=*/true);
 
                 for (;;) {
                     const auto act = ladder.next(elapsed_ms());
@@ -19461,9 +19472,9 @@ void Engine::check_cancel_all_flag()
                 if (done.sweep_refused) {
                     spdlog::critical(
                         "[Engine] [CANCELALL] the wallet-wide sweep was "
-                        "REFUSED ({}) and this process tracks no ids to retry "
-                        "individually -- anything resting in the wallet is "
-                        "STILL LIVE and Cancel All did NOT clear it",
+                        "REFUSED ({}) -- the wallet's book is UNKNOWN: "
+                        "offers this process never tracked may still be "
+                        "RESTING and Cancel All did NOT clear them",
                         done.last_error.empty() ? "no error text"
                                                 : done.last_error);
                 }

@@ -576,10 +576,23 @@ struct CancelLadderAction {
 // ---------------------------------------------------------------------------
 class CancelLadder {
 public:
-    CancelLadder(std::vector<std::string> ids, CancelRetryConfig cfg) noexcept
-        : cfg_(cfg), outstanding_(std::move(ids))
+    /// [S33 2026-09-12] `sweep_when_empty` authorises attempt 1 even when
+    /// `ids` is EMPTY. Attempt 1 is the WALLET-WIDE sweep (the driver routes
+    /// attempt_index == 1 to cancel_all and every retry to cancel_ids), and a
+    /// book a previous instance left resting is in the wallet and in nobody's
+    /// id list: LOCAL EMPTINESS IS NOT WALLET EMPTINESS. Defaulted OFF, so a
+    /// ladder that can only ever act on ids keeps "no book is the one
+    /// genuinely clean start".
+    CancelLadder(std::vector<std::string> ids, CancelRetryConfig cfg,
+                 bool sweep_when_empty = false) noexcept
+        : cfg_(cfg), outstanding_(std::move(ids)),
+          sweep_when_empty_(sweep_when_empty)
     {
-        if (outstanding_.empty()) stop_reason_ = CancelStopReason::Done;
+        // An empty book is Done only when nothing is going to be asked of the
+        // wallet. With the sweep pending, nothing is proven yet.
+        if (outstanding_.empty() && !sweep_when_empty_) {
+            stop_reason_ = CancelStopReason::Done;
+        }
     }
 
     /// The decision. `elapsed_ms` is wall clock since the FIRST attempt began
@@ -588,7 +601,16 @@ public:
     {
         CancelLadderAction act{};
 
-        if (outstanding_.empty()) {
+        // [S33 2026-09-12] An empty id list finishes the ladder EXCEPT on the
+        // very first step of a sweeping ladder. That one attempt is the
+        // wallet-wide cancel_all, the only thing that can reach offers the
+        // wallet knows about and we do not; without this exception a stop with
+        // an empty State issued ZERO cancel RPCs and still logged "All
+        // outstanding offers cancelled (0 attempt(s), 0 ms)". Once it has been
+        // recorded (attempts_ > 0) the gate closes again: there is nothing to
+        // retry per-id, so there is no second sweep and no ladder.
+        if (outstanding_.empty()
+            && !(sweep_when_empty_ && attempts_ == 0)) {
             // [S33 2026-09-12] Empty is Done ONLY when nothing was refused
             // wallet-wide. Without this guard next() overwrote the
             // SweepRefused that record() had just set -- the driver calls
@@ -724,6 +746,9 @@ private:
     CancelStopReason         stop_reason_{CancelStopReason::Unknown};
     TakeFailureClass         worst_class_{TakeFailureClass::Other};
     bool                     bulk_submitted_{false};
+    /// [S33 2026-09-12] Authorises attempt 1 -- the wallet-wide sweep -- from
+    /// an EMPTY id list. Set only by the shutdown driver.
+    bool                     sweep_when_empty_{false};
 };
 
 }  // namespace xop::execution

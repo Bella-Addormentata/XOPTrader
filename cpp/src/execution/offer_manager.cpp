@@ -1307,15 +1307,21 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(
     // a number computed wrong at ~1.6-2 s per page on a shutdown path.
     constexpr std::int64_t kUnknownWalletBookBound = 25;
 
+    // [S33 2026-09-12] A FLOOR FOR EVERY BOOK SHAPE, NOT ONLY THE EMPTY ONE.
+    // cancel_all:true sweeps the whole WALLET book whether or not we track
+    // any of it, so untracked offers add BATCHES to a mixed book exactly as
+    // they do to an empty one. Selecting tracked_n alone reserved 1 batch for
+    // 1 tracked + 12 untracked while the daemon charges 3. max() keeps the
+    // bound the FLOOR that reserve_bulk_cancel's contract already says it is.
     const std::int64_t reserve_n =
-        tracked_n > 0 ? tracked_n : kUnknownWalletBookBound;
+        std::max(tracked_n, kUnknownWalletBookBound);
 
     logger_->info("cancel_all: {} tracked offer(s) -- reserving fees for {} "
                   "offer(s) ({})", tracked_n, reserve_n,
-                  tracked_n > 0
+                  reserve_n == tracked_n
                       ? "the tracked book"
-                      : "local book EMPTY: the conservative bound for a book "
-                        "this process never tracked");
+                      : "the conservative bound for offers cancel_all also "
+                        "sweeps but this process never tracked");
 
     // Attempt bulk cancellation first (wallet cancel_offers endpoint).
     bool bulk_ok = false;

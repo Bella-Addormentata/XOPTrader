@@ -717,6 +717,56 @@ TEST(CancelLadderState, AnUnsteppedLadderAuthorisesNothing)
     EXPECT_EQ(empty.attempts(), 0u);
 }
 
+// [S33 2026-09-12] THE SWEEP MUST STILL GO OUT WHEN THE LOCAL BOOK IS EMPTY.
+//
+// Attempt 1 is the WALLET-WIDE one: Engine::shutdown routes attempt_index == 1
+// to OfferManager::cancel_all and every later attempt to cancel_ids, which can
+// only ever name ids this process tracks. A ladder that finishes before
+// attempt 1 therefore cannot reach a book a previous instance left resting --
+// the shutdown issued zero cancel RPCs and logged "All outstanding offers
+// cancelled (0 attempt(s), 0 ms)" over it. `sweep_when_empty` authorises that
+// single attempt, and only that one: after it is recorded the ladder stops,
+// because there are no ids to retry individually.
+//
+// The default stays OFF, which AnUnsteppedLadderAuthorisesNothing above pins:
+// flip the default argument to true and that test fails on its first EXPECT.
+//
+// MUTATION: restore the unguarded `if (outstanding_.empty()) {` gate in next()
+//   -> the first two EXPECTs FAIL (Finish, attempt_index 0). That is the bug.
+// MUTATION: drop `&& !sweep_when_empty_` from the ctor
+//   -> the pre-step EXPECT_FALSE(clean()) FAILS: an unswept wallet reading as
+//      a clean stop.
+// NOT COVERED, and stated rather than faked: that engine.cpp actually passes
+// sweep_when_empty=true, and that attempt 1 reaches cancel_all(), needs an
+// Engine and an OfferManager, and cpp/tests constructs neither.
+TEST(CancelLadderState, AnEmptyLocalBookStillSweepsTheWallet)
+{
+    CancelLadder swept(std::vector<std::string>{}, CancelRetryConfig{},
+                       /*sweep_when_empty=*/true);
+    EXPECT_FALSE(swept.clean())
+        << "nothing has been asked of the wallet yet, so nothing is proven";
+
+    const auto first = swept.next(0);
+    EXPECT_EQ(first.step, CancelLadderStep::Attempt);
+    EXPECT_EQ(first.attempt_index, 1u)
+        << "attempt 1 is the wallet-wide sweep -- the only attempt that can "
+           "reach a book this process never tracked";
+
+    // The wallet refuses it. The bulk endpoint takes no offer id at all, so
+    // the refusal names none either.
+    CancelAttemptOutcome oc{};
+    oc.last_error    = kSyncRefusal;
+    oc.worst_class   = TakeFailureClass::Unsynced;
+    oc.sweep_refused = true;
+    swept.record(std::move(oc));
+
+    EXPECT_EQ(swept.next(1000).step, CancelLadderStep::Finish)
+        << "one sweep, then stop: there are no ids to retry individually";
+    EXPECT_EQ(swept.attempts(), 1u);
+    EXPECT_EQ(swept.stop_reason(), CancelStopReason::SweepRefused);
+    EXPECT_FALSE(swept.clean());
+}
+
 // The first attempt is authorised WITHOUT consulting the retry policy: there
 // is no failure to classify yet, and plan_cancel_retry correctly refuses to
 // authorise anything from attempts_made == 0. If the ladder ever routed

@@ -428,8 +428,10 @@ public:
         /// [S33 2026-09-12] True when the WALLET-WIDE sweep was REFUSED and
         /// no id in `failed` represents that refusal.
         ///
-        /// Reachable only when the sweep is refused with an EMPTY local book,
-        /// which is not a corner: it is the headline case this flag's whole
+        /// ALSO set when the sweep is refused with a NON-EMPTY local book --
+        /// fold_refused_sweep() sets it unconditionally, so this flag with a
+        /// NON-EMPTY `failed` is reachable and must NOT be read as "no ids
+        /// are known".  The EMPTY-local-book case is what this flag's whole
         /// change exists for -- a previous instance's offers resting in the
         /// wallet, tracked by nobody, which is exactly what cancel_all:true
         /// is sent to clear. The bulk endpoint takes no offer id, so there is
