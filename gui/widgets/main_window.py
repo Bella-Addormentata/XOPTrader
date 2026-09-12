@@ -855,6 +855,26 @@ class MainWindow(QMainWindow):
         # node_connected = 0 alongside a stale node_synced = 1 was still
         # painted connected.  When the gauge is present its value wins,
         # including a false one.
+        # [review round 8] LIVENESS GATES THE WHOLE TRIPLE.  MetricsService
+        # ._on_failure() clears _connected but deliberately RETAINS _latest
+        # ("the dashboard should keep showing the last known figures rather
+        # than blanking"), so every value in `health` is the LAST GOOD
+        # scrape, not a current one.  Ungated, a node that was synced when
+        # the endpoint died stays green for the entire outage -- the same
+        # retained-state masking c18 removed from the height disjunct and
+        # c19 removed from the Dexie dot, arriving one layer up through
+        # `health` itself.
+        #
+        # Default FALSE, deliberately unlike self._metrics_live above: this
+        # is a health indicator, and the rule stated for the wallet dot
+        # below -- connectivity is ASSERTED, never inferred from remembered
+        # state -- makes fail-closed the only safe default.  _metrics_live's
+        # True default serves a P&L rate, not an alarm.
+        #
+        # The WALLET triple below is deliberately NOT gated: EngineBridge
+        # overwrites wallet_connected from the direct wallet RPC, which
+        # survives a metrics outage.
+        _health_is_live = bool(data.get("metrics_connected", False))
         _node_connected_gauge = health.get("node_connected")
         if _node_connected_gauge is None:
             node_connected = bool(health.get("node_synced", 0.0) >= 1.0)
@@ -862,6 +882,10 @@ class MainWindow(QMainWindow):
             node_connected = bool(_node_connected_gauge >= 1.0)
         node_synced = bool(health.get("node_synced", 0.0) >= 1.0)
         node_syncing = bool(health.get("node_syncing", 0.0) >= 1.0)
+        if not _health_is_live:
+            node_connected = False
+            node_synced = False
+            node_syncing = False
 
         if not node_connected:
             node_label = "Full Node: Disconnected"

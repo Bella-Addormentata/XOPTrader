@@ -149,6 +149,41 @@ def test_an_engine_predating_the_node_connected_gauge_still_reads_connected(wind
     assert "Full Node: Synced" in window._block_label.toolTip()
 
 
+def test_a_dead_scrape_is_not_masked_by_retained_node_health(window):
+    """[review round 8] The same masking as c18/c19, one layer up.
+
+    MetricsService._on_failure() clears _connected but deliberately RETAINS
+    _latest, so ``health`` keeps reporting the last good scrape for the whole
+    outage.  A node that was synced when the endpoint died must not stay
+    green through it.
+    """
+    payload = _payload()
+    payload["metrics_connected"] = False
+    assert payload["health"]["node_synced"] == 1.0, (
+        "premise: the gauges are retained and still look healthy"
+    )
+
+    window._on_bridge_data(payload)
+
+    assert _dot_label(window, "Full Node") == "Full Node: Disconnected"
+
+
+def test_an_absent_metrics_liveness_key_fails_closed(window):
+    """The DEFAULT is load-bearing, so it gets its own case.
+
+    Every other payload in this file sets ``metrics_connected`` explicitly,
+    so flipping the default would otherwise redden nothing.  A health
+    indicator must fail closed -- deliberately unlike ``_metrics_live``,
+    whose True default serves a P&L rate rather than an alarm.
+    """
+    payload = _payload()
+    payload.pop("metrics_connected")
+
+    window._on_bridge_data(payload)
+
+    assert _dot_label(window, "Full Node") == "Full Node: Disconnected"
+
+
 # -- Wallet indicator (c13) ----------------------------------------------
 
 
