@@ -587,6 +587,19 @@ std::string with_strategy_keys(const std::string& extra) {
     return y;
 }
 
+/// kMinimalValidYaml with one existing [strategy] line swapped out.
+/// with_strategy_keys() appends, which would leave a DUPLICATE key for the
+/// required scalars (gamma, q_max, ...) and make the test depend on yaml-cpp's
+/// duplicate-key resolution. Replacing is deterministic.
+std::string with_strategy_replaced(const std::string& from,
+                                   const std::string& to) {
+    std::string y(kMinimalValidYaml);
+    const auto pos = y.find(from);
+    if (pos == std::string::npos) return y;
+    y.replace(pos, from.size(), to);
+    return y;
+}
+
 std::string with_pair_extra(const std::string& line) {
     // Insert a key into the single pair in kMinimalValidYaml. The pair block
     // is indented four spaces, so the inserted line must match or YAML
@@ -1753,6 +1766,104 @@ TEST(ConfigParserTest, S33ActivityOverrides_NonFiniteRejected) {
     }
 }
 
+TEST(ConfigParserTest, PairPositiveOverrides_NonFiniteRejected) {
+    // [INFGUARD] The OTHER half of the same hole. These keys were guarded
+    // `!(v > 0.0)`, which rejects NaN (every NaN comparison is false) but
+    // ACCEPTS +infinity. The two that matter most for safety:
+    // depeg_bail_pct at +inf permanently disables the depeg bail, and
+    // min_offer_size_units_override at +inf silently stops the pair quoting.
+    for (const char* key : {"gamma_override",
+                            "kappa_override",
+                            "phi_override",
+                            "q_max_override",
+                            "min_profit_margin_bps_override",
+                            "depeg_warn_pct",
+                            "depeg_bail_pct",
+                            "competitive_anchor_max_distance_bps_override",
+                            "competitive_anchor_stride_bps_override"}) {
+        for (const char* bad : {".inf", "-.inf", ".nan"}) {
+            expect_non_finite_rejected(
+                with_pair_extra(std::string(key) + ": " + bad), key, bad);
+        }
+    }
+    // >= 0 variant: 0.0 must STILL parse (it is the documented disable), so
+    // only the non-finite legs are asserted here.
+    for (const char* bad : {".inf", "-.inf", ".nan"}) {
+        expect_non_finite_rejected(
+            with_pair_extra(std::string("min_offer_size_units_override: ")
+                            + bad),
+            "min_offer_size_units_override", bad);
+    }
+}
+
+TEST(ConfigParserTest, PairPositiveOverrides_ZeroDisableStillParses) {
+    // The acceptance direction. A guard that over-rejected would remove the
+    // operator's documented escape hatch at load time.
+    TempYaml tmp(with_pair_extra("min_offer_size_units_override: 0.0"));
+    auto cfg = xop::load_config(tmp.path());
+    ASSERT_FALSE(cfg.pairs.empty());
+    ASSERT_TRUE(cfg.pairs[0].min_offer_size_units_override.has_value());
+    EXPECT_DOUBLE_EQ(*cfg.pairs[0].min_offer_size_units_override, 0.0);
+}
+
+TEST(ConfigParserTest, GlobalStrategyScalars_NonFiniteRejected) {
+    // [INFGUARD] The REQUIRED global keys, which share read_positive_double.
+    // This is the larger half of the hole: q_max at +inf yields an infinite
+    // order size that becomes INT64_MIN downstream, and the pair posts
+    // nothing from the first heartbeat while the config loads cleanly.
+    struct Sub { const char* line; const char* prefix; const char* key; };
+    const Sub subs[] = {
+        {"  gamma: 0.01",                  "  gamma: ",                 "gamma"},
+        {"  kappa: 1.5",                   "  kappa: ",                 "kappa"},
+        {"  phi: 0.5",                     "  phi: ",                   "phi"},
+        {"  q_max: 1000.0",                "  q_max: ",                 "q_max"},
+        {"  min_profit_margin_bps: 35.0",  "  min_profit_margin_bps: ",
+         "min_profit_margin_bps"},
+    };
+    for (const auto& s : subs) {
+        for (const char* bad : {".inf", "-.inf", ".nan"}) {
+            expect_non_finite_rejected(
+                with_strategy_replaced(s.line, std::string(s.prefix) + bad),
+                s.key, bad);
+        }
+    }
+}
+
+TEST(ConfigParserTest, GlobalTierSpacingSeq_NonFiniteRejected) {
+    // read_positive_double_seq: an infinite spacing reaches
+    // `mid * (1.0 - v/10000.0)` and then a static_cast<int64_t> of -inf.
+    for (const char* bad : {".inf", "-.inf", ".nan"}) {
+        expect_non_finite_rejected(
+            with_strategy_replaced("  tier_spacing_bps: [40, 80]",
+                                   std::string("  tier_spacing_bps: [")
+                                   + bad + ", 80]"),
+            "tier_spacing_bps", bad);
+    }
+}
+
+TEST(ConfigParserTest, GlobalMaxHalfSpread_NonFiniteRejected) {
+    // The `<= 0.0` twin, which admitted BOTH NaN and +inf.
+    for (const char* bad : {".inf", "-.inf", ".nan"}) {
+        expect_non_finite_rejected(
+            with_strategy_keys(std::string("\n  max_half_spread_bps: ") + bad),
+            "max_half_spread_bps", bad);
+    }
+}
+
+TEST(ConfigParserTest, GlobalBlockTimeSeconds_NonFiniteRejected) {
+    // [INFGUARD] Found independently by review on #150. Same `<= 0.0` shape
+    // as the max_half_spread_bps twin, so it admitted NaN and +inf alike.
+    // Downstream this value is used to convert block counts into wall-clock
+    // bounds, and a non-finite result reaches static_cast<std::int64_t>,
+    // which is undefined behaviour -- not a clamped number.
+    for (const char* bad : {".inf", "-.inf", ".nan"}) {
+        expect_non_finite_rejected(
+            with_strategy_keys(std::string(R"(
+  block_time_seconds: )") + bad),
+            "block_time_seconds", bad);
+    }
+}
+
 TEST(ConfigParserTest, S33ActivityOverrides_FiniteValuesStillParseAfterGuard) {
     // The acceptance direction, which matters as much as the rejection: 0.0 is
     // the DOCUMENTED disable for both >= 0 knobs (Section C drives XCH/BYC
@@ -2186,6 +2297,49 @@ pegged_assets:
     EXPECT_EQ(a->sustained_observations, 7u);
     EXPECT_FALSE(a->prefer_market_cross);
     EXPECT_TRUE(a->enforce);
+}
+
+TEST(ConfigParserTest, PeggedAssets_ThresholdsAreNotAdvertisedAsUnwired) {
+    // The parser used to warn at startup that warn_pct / bail_pct /
+    // sustained_observations were "NOT YET WIRED to a detector". The wiring
+    // landed one day after that comment was written and the warning has been
+    // false ever since -- it told operators to treat live suspension
+    // thresholds as dead config.
+    //
+    // CAVEAT: CapturedLog is a ringbuffer holding the LAST 256 records. These
+    // are negative assertions, which is the direction eviction breaks -- if
+    // load_config ever emits more than 256 advisories the needle is evicted
+    // and this passes for the wrong reason. The (A) block below is what stops
+    // the test being vacuous today.
+    CapturedLog log;
+    TempYaml tmp(with_pegs(R"(
+pegged_assets:
+- asset_id: aabb000000000000000000000000000000000000000000000000000000000000
+  symbol: wTEST
+  peg_currency: USD
+  peg_target: 1.0
+  warn_pct: 3.0
+  bail_pct: 12.0
+  sustained_observations: 7
+)"));
+    auto cfg = xop::load_config(tmp.path());
+
+    // (A) ANTI-VACUITY: prove the load actually reached the threshold keys.
+    // Without this, a YAML that failed to parse or a silently skipped section
+    // would satisfy (B) trivially.
+    const auto* a = cfg.pegged_assets.find(
+        "aabb000000000000000000000000000000000000000000000000000000000000");
+    ASSERT_NE(a, nullptr);
+    EXPECT_DOUBLE_EQ(a->warn_pct, 3.0);
+    EXPECT_DOUBLE_EQ(a->bail_pct, 12.0);
+    EXPECT_EQ(a->sustained_observations, 7u);
+
+    // (B) THE PIN: two independent substrings from the two false sentences,
+    // so restoring either half alone still fails.
+    EXPECT_FALSE(log.warned_containing("NOT YET WIRED"))
+        << "startup must not advertise live suspension thresholds as dead";
+    EXPECT_FALSE(log.warned_containing("still comes only from pairs marked"))
+        << "the asset-level watcher is a second watcher, not absent";
 }
 
 TEST(ConfigParserTest, PeggedAssets_AHalfDeclarationIsRefused) {

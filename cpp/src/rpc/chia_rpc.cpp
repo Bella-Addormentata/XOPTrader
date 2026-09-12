@@ -669,9 +669,17 @@ asio::awaitable<std::int64_t> ChiaFullNodeRPC::get_block_height()
     // The blockchain_state response includes peak.height.
     const json resp = co_await rpc_post("get_blockchain_state");
 
-    // [S33 2026-09-05] Record the sync object BEFORE the peak check below:
-    // a node that is still syncing is exactly the case that throws there,
-    // and it is the case health reporting most needs to see.
+    // [S33 2026-09-05, CORRECTED 2026-09-12] Record the sync object BEFORE
+    // the peak check below, so a node that answers is never reported as
+    // silent.
+    //
+    // The original wording said "a node that is still syncing is exactly the
+    // case that throws there". That is FALSE and it misled a later audit: a
+    // catching-up node reports a peak alongside sync_mode=true (see
+    // cpp/tests/test_node_sync_state.cpp), returns NORMALLY here, and already
+    // renders as "Full Node: Syncing...". The case that throws below is a
+    // node with NO peak at all -- an empty or rebuilding database before its
+    // first peak -- which genuinely cannot serve a height.
     last_sync_state_ = node_sync_from_blockchain_state(resp, last_sync_state_);
 
     if (!resp.contains("blockchain_state") ||
