@@ -1,0 +1,81 @@
+// ---------------------------------------------------------------------------
+// [BULKCANCEL-B 2026-09-13] rpc_post's re-send decision, per endpoint.
+//
+// rpc_post re-sent every endpoint on every transient failure.  On 2026-09-12
+// a wallet-wide cancel_offers timed out after 30 s, was re-sent while the
+// first request was still running inside the wallet, and only a lucky
+// "Wallet needs to be fully synced" refusal kept the copy from running the
+// whole sweep a second time.  See rpc/rpc_retry_policy.hpp for the full
+// account and the chia 2.7.4 handler behaviour it rests on.
+//
+// These tests call the production decision functions directly.  That
+// rpc_post actually CONSULTS them on both of its re-send paths is pinned
+// separately by tests/test_rpc_retry_wiring.py, because rpc_post needs a live
+// mTLS endpoint and ChiaWalletRPC is final.
+// ---------------------------------------------------------------------------
+
+#include <gtest/gtest.h>
+
+#include <curl/curl.h>
+
+#include "xop/rpc/rpc_retry_policy.hpp"
+
+using xop::rpc::may_resend;
+using xop::rpc::retry_policy_for_endpoint;
+using xop::rpc::RpcRetryPolicy;
+
+TEST(RpcRetryPolicy, CancelEndpointsNeverResend) {
+    // The two endpoints whose second copy is a second cancel.  Spelled
+    // exactly as ChiaWalletRPC::cancel_offers / cancel_offer pass them.
+    EXPECT_EQ(retry_policy_for_endpoint("cancel_offers"),
+              RpcRetryPolicy::NeverResend);
+    EXPECT_EQ(retry_policy_for_endpoint("cancel_offer"),
+              RpcRetryPolicy::NeverResend);
+
+    // Reads keep the transient retry: a duplicate costs one round trip.
+    EXPECT_EQ(retry_policy_for_endpoint("get_offer"),
+              RpcRetryPolicy::RetryTransient);
+    EXPECT_EQ(retry_policy_for_endpoint("get_all_offers"),
+              RpcRetryPolicy::RetryTransient);
+    EXPECT_EQ(retry_policy_for_endpoint("get_sync_status"),
+              RpcRetryPolicy::RetryTransient);
+}
+
+TEST(RpcRetryPolicy, ATimeoutIsNeverResentForACancel) {
+    const RpcRetryPolicy cancel = RpcRetryPolicy::NeverResend;
+
+    // The 2026-09-12 shape: CURL error 28 after 30 s, request possibly
+    // still executing wallet-side.  is_transient says true; the policy
+    // must still say no.
+    EXPECT_FALSE(may_resend(cancel, CURLE_OPERATION_TIMEDOUT, /*transient=*/true));
+
+    // Every other transient transport failure can follow a request the
+    // wallet already received.
+    EXPECT_FALSE(may_resend(cancel, CURLE_RECV_ERROR, true));
+    EXPECT_FALSE(may_resend(cancel, CURLE_GOT_NOTHING, true));
+    EXPECT_FALSE(may_resend(cancel, CURLE_SEND_ERROR, true));
+    EXPECT_FALSE(may_resend(cancel, CURLE_PARTIAL_FILE, true));
+
+    // An HTTP 5xx: rpc_post passes CURLE_OK with the HTTP-level transient
+    // flag.  The handler ran; it is not re-sent.
+    EXPECT_FALSE(may_resend(cancel, CURLE_OK, true));
+
+    // No connection, or no completed TLS handshake: the request cannot have
+    // reached the handler, so re-sending it is safe.
+    EXPECT_TRUE(may_resend(cancel, CURLE_COULDNT_CONNECT, true));
+    EXPECT_TRUE(may_resend(cancel, CURLE_SSL_CONNECT_ERROR, true));
+
+    // Never wider than the transient classifier itself.
+    EXPECT_FALSE(may_resend(cancel, CURLE_COULDNT_CONNECT, false));
+}
+
+TEST(RpcRetryPolicy, ReadsStillRetryTransientFailures) {
+    const RpcRetryPolicy read = RpcRetryPolicy::RetryTransient;
+
+    EXPECT_TRUE(may_resend(read, CURLE_OPERATION_TIMEDOUT, /*transient=*/true));
+    EXPECT_TRUE(may_resend(read, CURLE_RECV_ERROR, true));
+    EXPECT_TRUE(may_resend(read, CURLE_OK, true));  // e.g. HTTP 503
+
+    EXPECT_FALSE(may_resend(read, CURLE_OPERATION_TIMEDOUT, false));
+    EXPECT_FALSE(may_resend(read, CURLE_OK, false));  // e.g. HTTP 404
+}

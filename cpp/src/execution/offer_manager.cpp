@@ -1427,14 +1427,18 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(
     // zero-spendable shape: real coin locks the ledger does not know about,
     // and every later try_lock admitting against coins already spent.
     //
-    // 25 offers is ceil(25 / kCancelOffersBatchSize) = 5 batches = 5 whole
-    // coins.  It is HEADROOM over the largest book this deployment's ladder
+    // 25 offers is HEADROOM over the largest book this deployment's ladder
     // can rest, not a derivation from it: the live config runs num_tiers 6
     // with one enabled pair, so a full ladder is 1 x 6 x 2 = 12 offers, and
     // 25 leaves room for a second pair being enabled without revisiting this
     // number.  A previous instance cannot have left more than one full ladder
     // resting unless cancel_stale and the on-chain reconciler had BOTH failed
     // as well.
+    //
+    // [BULKCANCEL-B 2026-09-13] At rpc::kCancelOffersSingleBatchSize (100)
+    // the floor is ONE batch and so ONE whole coin; at the old batch size of
+    // 5 it was five of each.  The live wallet held 22 open offers of its own
+    // on 2026-09-13, inside the floor.
     //
     // [S33 2026-09-12] Deliberately NOT computed from config at compile time.
     // An earlier draft of this comment derived 24 from config.example.yaml's
@@ -1447,15 +1451,21 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(
     // WHY NOT HIGHER.  cancel_all also runs from the operator Cancel All
     // flag while the bot is STILL TRADING (engine.cpp check_cancel_all_flag),
     // and every reserved batch drains a whole coin from the live cycle
-    // ledger.  At 50 offers that is 10 coins -- more than the incident
-    // wallet HELD (14.59 XCH in ~2-XCH coins), and note_lock with a need it
-    // cannot cover CLEARS the pool outright, so try_lock refuses every offer
-    // for the rest of the cycle.  That cost is bounded, since
-    // begin_xch_lock_cycle rebuilds the ledger each ~1-minute cycle, but it
-    // is paid on EVERY empty-book cancel_all and it is paid while quoting.
+    // ledger.  At the old batch size of 5, 50 offers was 10 coins -- more
+    // than the incident wallet HELD (14.59 XCH in ~2-XCH coins), and
+    // note_lock with a need it cannot cover CLEARS the pool outright, so
+    // try_lock refuses every offer for the rest of the cycle.  That cost is
+    // bounded, since begin_xch_lock_cycle rebuilds the ledger each ~1-minute
+    // cycle, but it is paid on EVERY empty-book cancel_all and it is paid
+    // while quoting.  [BULKCANCEL-B 2026-09-13] At the single-batch size any
+    // floor up to 100 offers drains ONE coin, so this argument binds again
+    // only if the batch size is lowered.
     //
-    // WHY NOT LOWER.  One batch is what this code did before: it under-models
-    // by exactly the untracked offers the sweep exists for.
+    // WHY NOT LOWER.  One batch is what this code did before: at the old batch
+    // size of 5 it under-modelled by exactly the untracked offers the sweep
+    // exists for.  [BULKCANCEL-B 2026-09-13] At the single-batch size the
+    // floor already IS one batch; it matters again only past 100 offers or
+    // if the batch size is lowered.
     //
     // WHY NOT AN RPC.  A wallet-wide count was tried and cut.  It asked
     // get_all_offers with the wallet-default sort_key, under which PENDING
@@ -1472,8 +1482,9 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(
     // cancel_all:true sweeps the whole WALLET book whether or not we track
     // any of it, so untracked offers add BATCHES to a mixed book exactly as
     // they do to an empty one. Selecting tracked_n alone reserved 1 batch for
-    // 1 tracked + 12 untracked while the daemon charges 3. max() keeps the
-    // bound the FLOOR that reserve_bulk_cancel's contract already says it is.
+    // 1 tracked + 12 untracked while the daemon charged 3 at the old batch
+    // size of 5. max() keeps the bound the FLOOR that reserve_bulk_cancel's
+    // contract already says it is.
     const std::int64_t reserve_n =
         std::max(tracked_n, kUnknownWalletBookBound);
 

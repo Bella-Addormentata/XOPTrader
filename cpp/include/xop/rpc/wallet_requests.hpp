@@ -48,19 +48,85 @@ using json = nlohmann::json;
 // cancel_offers
 // ---------------------------------------------------------------------------
 
-/// Offers cancelled per on-chain batch by the daemon's paging loop.
+/// Offers the daemon cancels per batch -- sized so that a wallet-wide sweep
+/// of any book this deployment rests goes out as ONE batch.
 ///
-/// [BULKCANCEL 2026-09-11] Deliberately pinned to the handler's own default
-/// of 5 rather than raised.  The paging loop runs INSIDE the daemon, so this
-/// value costs us no client round trips -- it buys only fewer on-chain
-/// transactions, at 0.00001 XCH each, against a book that is bounded by the
-/// ladder (tens of offers, so single-digit batches).  Raising it would bundle
-/// more cancel spends into one transaction, and a bundle rejected for cost
-/// takes every cancel in it down together -- trading a trivial fee saving for
-/// a new way to fail a shutdown path.  It is named and explicit so that the
-/// fee reservation in OfferManager::cancel_offers_charged cannot silently
-/// disagree with what the daemon actually does.
-inline constexpr int kCancelOffersBatchSize = 5;
+/// [BULKCANCEL-B 2026-09-13] Raised from the handler's own default of 5, which
+/// the 2026-09-11 revision of this comment pinned on purpose: a sweep split
+/// into batches cannot be funded as a whole.  From the chia 2.7.4 source:
+///
+///   * wallet_rpc_api.py cancel_offers pages the book batch_size trades at a
+///     time and calls TradeManager.cancel_pending_offers once PER BATCH, with
+///     every batch inside the one action scope its tx_endpoint wrapper opened.
+///   * trade_manager.py cancel_pending_offers charges the fee on the first
+///     cancellation coin of each call, so batch_fee is paid once per batch.
+///     When that coin is a CAT coin, CATWallet.create_tandem_xch_tx selects
+///     the XCH fee coin inside scopes nested in the one cancel_pending_offers
+///     opens for that coin with excluded_coin_ids=[].  The choice is recorded
+///     only in those nested scopes, never in the scope the batches share, so
+///     no other batch sees it -- and nothing reaches the wallet DB, where
+///     unconfirmed removals would exclude the coin, until the shared scope
+///     closes after the LAST batch.
+///     coin_selection.py is deterministic for identical inputs (coins sorted
+///     by amount; the knapsack's random.Random has a fixed seed), so those
+///     batches all pick the SAME fee coin.
+///   * wallet_rpc_metadata.py registers cancel_offers with
+///     auto_merge_spends=False, so each batch is pushed as its OWN spend
+///     bundle.  mempool_manager.py can_replace admits a conflicting bundle
+///     only if it spends a superset of the other's coins, so of the bundles
+///     sharing a fee coin at most one can land -- after cancel_pending_offers
+///     has already set every trade in every batch PENDING_CANCEL.
+///
+/// One batch pays batch_fee once, selects at most one fee coin, and ties all
+/// of its cancellations into a single bundle through their announcement ring.
+///
+/// THE RISK THE OLD VALUE GUARDED.  A bundle rejected for cost takes every
+/// cancel in it down together, and the bound is real: mempool_manager.py
+/// rejects cost > max_tx_clvm_cost (MAX_BLOCK_COST_CLVM // 2) with
+/// BLOCK_COST_EXCEEDS_MAX.  So the batch is sized against MEASURED costs, not
+/// raised without limit.  Across the 15,330 confirmed cancellation bundles in
+/// the live wallet, costed on 2026-09-13 with chia_rs 0.47 at the 2.7.4 cost
+/// constants: 18,185 of 18,187 offers cancelled with ONE coin spend; a CAT
+/// offer coin's cancel spend cost at most 34,442,386, an XCH one 17,788,814,
+/// and a fee spend 8,817,766; and a bundle cost the sum of its spends to
+/// within 504,000.  The largest bundle this wallet ever pushed carried 15
+/// offers at 388,803,130.  At the ceilings below a full batch of 100 costs
+/// 3,518,000,000 -- 64% of the bound -- where 1,000 would be 6.4x over it and
+/// cancel nothing.
+///
+/// ABOVE 100 OFFERS the daemon splits the sweep again, and the fee-coin
+/// collision returns for the later batches.  That is far outside what this
+/// deployment rests (the live wallet held 22 open offers of its own on
+/// 2026-09-13; OfferManager::cancel_all reserves for 25), and it is the
+/// better of the two failures: one bundle too large for the mempool cancels
+/// nothing at all.
+inline constexpr int kCancelOffersSingleBatchSize = 100;
+
+/// chia 2.7.4 mempool_manager.py: max_tx_clvm_cost = MAX_BLOCK_COST_CLVM // 2.
+/// A spend bundle costing more is rejected with Err.BLOCK_COST_EXCEEDS_MAX.
+inline constexpr std::uint64_t kMempoolMaxTxClvmCost = 11'000'000'000ULL / 2;
+
+/// Ceiling on ONE offer's cancellation spend.  Measured maximum 34,442,386
+/// (a CAT offer coin; XCH offer coins at most 17,788,814), rounded up.  An
+/// observation of this wallet's offers, not a consensus value.
+inline constexpr std::uint64_t kCancelSpendCostCeiling = 35'000'000ULL;
+
+/// Ceiling on the XCH fee spend a batch adds when its fee cannot come out of
+/// its first cancellation coin.  Measured maximum 8,817,766; set to cover
+/// the largest standard XCH spend seen in any cancellation (17,788,814).
+inline constexpr std::uint64_t kCancelFeeSpendCostCeiling = 18'000'000ULL;
+
+/// Upper estimate of the mempool cost of one cancel_offers batch of
+/// `batch_size` single-coin offers plus its fee spend.  A degenerate size
+/// costs the fee spend alone.
+[[nodiscard]] constexpr std::uint64_t cancel_batch_cost_ceiling(
+    int batch_size) noexcept
+{
+    const std::uint64_t offers = batch_size > 0
+        ? static_cast<std::uint64_t>(batch_size)
+        : std::uint64_t{0};
+    return offers * kCancelSpendCostCeiling + kCancelFeeSpendCostCeiling;
+}
 
 /// The number of batches -- and therefore the number of times batch_fee is
 /// CHARGED -- when the daemon cancels `n_offers` at `batch_size` per batch.
@@ -90,11 +156,11 @@ inline constexpr int kCancelOffersBatchSize = 5;
 /// @param batch_fee  Fee in mojos charged PER BATCH (the handler's
 ///                   `batch_fee`; a plain "fee" key is ignored by it).
 /// @param secure     On-chain cancel (spends the offer coins) vs local-only.
-/// @param batch_size Offers per batch; see kCancelOffersBatchSize.
+/// @param batch_size Offers per batch; see kCancelOffersSingleBatchSize.
 [[nodiscard]] inline json make_cancel_offers_request(
     std::uint64_t batch_fee,
     bool          secure,
-    int           batch_size = kCancelOffersBatchSize)
+    int           batch_size = kCancelOffersSingleBatchSize)
 {
     return json{
         // cancel_all:true is what makes this a BULK cancel at all.  Without

@@ -13,6 +13,7 @@ using xop::Mojo;
 using xop::execution::CoinLockLedger;
 using xop::execution::OfferManager;
 using xop::execution::reserve_bulk_cancel;
+using xop::rpc::kCancelOffersSingleBatchSize;
 
 constexpr Mojo kXch = 1'000'000'000'000LL;
 constexpr Mojo kFee = 28'922;  // the live per-offer fee from the incident
@@ -275,30 +276,37 @@ TEST(CoinLockLedgerTest, InactiveLedgerAdmitsEverything) {
 // assert on POOL STATE, so none of them can pass vacuously.
 // ---------------------------------------------------------------------------
 
-TEST(CoinLockLedgerTest, BulkCancelReservesOneWholeFeeCoinPerBatch) {
-    // 20 offers at kCancelOffersBatchSize 5 is FOUR batch transactions, and
-    // the daemon charges batch_fee once per batch.  Reserving a single fee
-    // under-reserved by 4x -- the 2026-08-23 zero-spendable shape.
+TEST(CoinLockLedgerTest, BulkCancelReservesOneFeeCoinForTheSingleBatch) {
+    // [BULKCANCEL-B 2026-09-13] 20 offers is ONE batch at
+    // kCancelOffersSingleBatchSize: the daemon charges batch_fee once and
+    // selects at most one fee coin.  The old batch size of 5 drained FOUR
+    // whole coins here, for a sweep whose later batches would each pick their
+    // fee coin blind to the first (see rpc/wallet_requests.hpp).
     std::vector<Mojo> coins(10, kXch);
     CoinLockLedger ledger(coins, /*floor=*/0, /*commit_frac=*/1.0);
 
     reserve_bulk_cancel(ledger, kBatchFee, /*n_offers=*/20);
 
-    // WHOLE COINS, not 4 x kBatchFee: each batch transaction is submitted
-    // inside the same cycle, so the change from one cannot fund the next and
-    // each locks a different whole XCH coin.  This is the behaviour we mean
-    // to pin -- a 4-coin drain, not a 0.00004 XCH drain.
-    EXPECT_EQ(ledger.remaining(), 6 * kXch);
-    EXPECT_NE(ledger.remaining(), 10 * kXch - 4 * kBatchFee);
+    // A WHOLE coin, not kBatchFee: the fee coin is spent whole and its change
+    // comes back only when the cancel confirms.
+    EXPECT_EQ(ledger.remaining(), 9 * kXch);
+    EXPECT_NE(ledger.remaining(), 10 * kXch - kBatchFee);
     // Cancel fees are pool drains, never offer commitment (see note_lock).
     EXPECT_EQ(ledger.committed(), 0);
 
-    // 21 offers cross into a fifth batch: the count follows the batch size
-    // the request actually carries, not a round number.
+    // 21 offers is the same single batch -- no longer a fifth one.
     std::vector<Mojo> more(10, kXch);
-    CoinLockLedger spilled(more, 0, 1.0);
-    reserve_bulk_cancel(spilled, kBatchFee, /*n_offers=*/21);
-    EXPECT_EQ(spilled.remaining(), 5 * kXch);
+    CoinLockLedger same_batch(more, 0, 1.0);
+    reserve_bulk_cancel(same_batch, kBatchFee, /*n_offers=*/21);
+    EXPECT_EQ(same_batch.remaining(), 9 * kXch);
+
+    // Past the batch size the daemon splits the sweep, and the count follows
+    // the batch size the request actually carries: two batches, two coins.
+    std::vector<Mojo> split_pool(10, kXch);
+    CoinLockLedger two_batches(split_pool, 0, 1.0);
+    reserve_bulk_cancel(two_batches, kBatchFee,
+                        /*n_offers=*/kCancelOffersSingleBatchSize + 1);
+    EXPECT_EQ(two_batches.remaining(), 8 * kXch);
 }
 
 TEST(CoinLockLedgerTest, BulkCancelWithNoTrackedOffersStillReservesOneBatch) {
@@ -316,18 +324,19 @@ TEST(CoinLockLedgerTest, BulkCancelWithNoTrackedOffersStillReservesOneBatch) {
 
 TEST(CoinLockLedgerTest, BulkCancelDrainLeavesLessRoomForTheNextOffer) {
     // The reservation is not bookkeeping -- it decides admissions.  Ten
-    // 1-XCH coins behind a 6-XCH fee-reserve floor: four batch drains land
-    // the pool exactly ON the floor, so the next offer lock must be refused.
-    // Reserving a single fee would leave 9 XCH and wrongly admit it, which
-    // is how an under-reservation walks the wallet toward zero spendable.
+    // 1-XCH coins behind a 9-XCH fee-reserve floor: the single batch's one
+    // whole-coin drain lands the pool exactly ON the floor, so the next offer
+    // lock must be refused.  Reserving no coin would leave 10 XCH and wrongly
+    // admit it, which is how an under-reservation walks the wallet toward
+    // zero spendable.
     std::vector<Mojo> coins(10, kXch);
-    CoinLockLedger ledger(coins, /*floor=*/6 * kXch, /*commit_frac=*/1.0);
+    CoinLockLedger ledger(coins, /*floor=*/9 * kXch, /*commit_frac=*/1.0);
 
     reserve_bulk_cancel(ledger, kBatchFee, /*n_offers=*/20);
 
-    EXPECT_EQ(ledger.remaining(), 6 * kXch);
+    EXPECT_EQ(ledger.remaining(), 9 * kXch);
     EXPECT_FALSE(ledger.try_lock(kXch, 0));   // floor refuses; cap is fine
-    EXPECT_EQ(ledger.remaining(), 6 * kXch);  // a refusal locks nothing
+    EXPECT_EQ(ledger.remaining(), 9 * kXch);  // a refusal locks nothing
 }
 
 // ---------------------------------------------------------------------------

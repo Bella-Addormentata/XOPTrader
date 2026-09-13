@@ -1076,9 +1076,10 @@ private:
                                                bool               secure);
     /// [BULKCANCEL 2026-09-11] `n_offers` is not cosmetic.  The wallet
     /// charges batch_fee ONCE PER BATCH, so a bulk cancel of n offers really
-    /// spends batch_fee * ceil(n / kCancelOffersBatchSize).  Reserving a
-    /// single fee under-reserves XCH, which is the 2026-08-23 zero-spendable
-    /// incident's exact shape.
+    /// spends batch_fee * ceil(n / kCancelOffersSingleBatchSize) -- ONE batch
+    /// for any book up to 100 offers [BULKCANCEL-B 2026-09-13].  Reserving
+    /// one fee for a sweep that spans batches under-reserves XCH, which is the
+    /// 2026-08-23 zero-spendable incident's exact shape.
     asio::awaitable<json> cancel_offers_charged(std::uint64_t fee,
                                                 bool          secure,
                                                 std::int64_t  n_offers);

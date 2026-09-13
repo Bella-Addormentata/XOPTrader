@@ -245,6 +245,12 @@ protected:
      *   - HTTP 429, 500, 502, 503, 504
      *   - Up to max_retries attempts with exponential backoff.
      *
+     * [BULKCANCEL-B 2026-09-13] rpc/rpc_retry_policy.hpp narrows that per
+     * endpoint: cancel_offers and cancel_offer are re-sent only after
+     * CURLE_COULDNT_CONNECT or CURLE_SSL_CONNECT_ERROR, where the request
+     * cannot have reached the handler.  A timeout or a 5xx on either one
+     * throws ChiaRPCTransportError from the FIRST attempt.
+     *
      * On a non-retryable error, or when retries are exhausted, the
      * appropriate ChiaRPC*Error exception is thrown.
      *
@@ -592,24 +598,28 @@ public:
      * rpc/wallet_requests.hpp for the defect this replaced.
      *
      * @param batch_fee  Fee in mojos charged ONCE PER BATCH of
-     *                   kCancelOffersBatchSize offers -- NOT once per call.
+     *                   kCancelOffersSingleBatchSize offers -- NOT once per
+     *                   call.  [BULKCANCEL-B 2026-09-13] Any book up to that
+     *                   size is ONE batch, and so one fee.
      *
      *                   [review 2026-09-12] A caller that reserves XCH for
      *                   this must reserve ONE WHOLE FEE-BEARING COIN PER
      *                   BATCH -- not batch_fee * batches, which an earlier
-     *                   revision of this line recommended.  Each batch is a
-     *                   separate transaction submitted inside the same
-     *                   cycle, so the change from one cannot fund the next
-     *                   and each locks a different whole coin.  Reserving
-     *                   the combined AMOUNT models one coin for the lot and
-     *                   undercounts the locks -- the 2026-08-23
-     *                   zero-spendable shape.
+     *                   revision of this line recommended.  Each batch is its
+     *                   own spend bundle (chia 2.7.4 registers cancel_offers
+     *                   with auto_merge_spends=False), so the change from one
+     *                   cannot fund the next.  Reserving the combined AMOUNT
+     *                   models one coin for the lot and undercounts the locks
+     *                   -- the 2026-08-23 zero-spendable shape.  A batch that
+     *                   funds its fee from the free pool picks that coin
+     *                   blind to the other batches, which is why a sweep goes
+     *                   out as one batch (rpc/wallet_requests.hpp).
      *
      *                   Use execution::reserve_bulk_cancel (a loop of
      *                   single-fee note_lock()s, with a >= 1 batch clamp);
      *                   see OfferManager::cancel_offers_charged, and
-     *                   CoinLockLedgerTest.BulkCancelReservesOneWholeFeeCoin
-     *                   PerBatch, which pins the distinction explicitly.
+     *                   CoinLockLedgerTest.BulkCancelReservesOneFeeCoinFor
+     *                   TheSingleBatch, which pins it explicitly.
      * @param secure     On-chain vs local-only cancellation.
      * @return JSON confirmation.
      */
