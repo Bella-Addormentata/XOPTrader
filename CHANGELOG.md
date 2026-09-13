@@ -5,6 +5,82 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.23] — 2026-09-13 — guards that can be aimed, and status that is asserted
+
+Four merged branches, and one theme runs through most of them: a control that
+cannot be aimed, or a signal that reports memory instead of liveness, is worse
+than no control at all — because it reads as working.
+
+### The crossing guard, and books with only one side (#148)
+
+- **`classify_cross_bbo` is the live gate.** It previously fell back to a ±5%
+  band around the published mid unless *both* touches existed, so on a
+  one-sided book an ask at 99 against a bid of 100 was posted as uncrossed.
+  The gate now consults whichever opposite touch exists — the one that could
+  take the quote the moment it is posted — and falls back to the mid band only
+  when that touch is missing. `book_inverted` still requires both sides. The
+  staleness canceller was brought to the same rule; the two disagreeing was
+  the original S33 defect.
+- **Not strictly more conservative, and that is intended.** An ask at 90 over a
+  bid of 80 with no ask side now posts where the mid band suppressed it. A
+  resting ask above the bid is not crossed.
+- **The soft-TTL contract is restored.** The `adverse` conjunct deleted in
+  `922b183` had been expiring favourably-drifted aged offers.
+- **Duplicate-slot double exposure**, breaker ownership, and MTM valuation
+  defects closed; tier spacing no longer collapses an inverted ladder.
+- **XCH/BYC ships DISABLED.** The calibration work is in, but enabling a
+  trading pair is a deliberate act, not a side effect of merging a branch.
+
+### Status that is asserted, never remembered (#148)
+
+Five indicators reported health from retained state, so a real outage rendered
+as a healthy-ish UI — the one period an operator is actually looking.
+
+- The **node** dot no longer treats a retained block height as evidence; an
+  explicit `node_connected = 0` wins, and "Syncing" became reachable.
+- The **wallet** dot no longer reads merge-only cached balances as liveness.
+- The **Dexie** dot is driven by a new engine-published signal,
+  `xop_node{metric="dexie_connected"}` — a freshness window over the last
+  *answered* Dexie request. `metrics_connected` only ever said whether the GUI
+  could reach the **engine**; with the engine healthy and every Dexie request
+  failing, the dot stayed green. Both gates are now required.
+- Single-cancel rows no longer latch on "Cancelling…" forever.
+
+### Wallet-wide operations that could not be aimed (#149)
+
+- **Bulk cancel missed non-XCH offers**, and the transaction window hid
+  unconfirmed rows entirely — `reverse=true` sorted them out of the newest-200
+  window on wallets holding 32,966 and 9,640 rows.
+- **Stuck-transaction pruning was dead code**, and fixing the window made a
+  destructive path reachable: `delete_unconfirmed_transactions` is
+  wallet-wide, so one stale row would have authorised deleting this
+  heartbeat's offer creations and any unconfirmed secure cancel beside it. It
+  is now gated on no fresh row existing, and a row whose age cannot be read
+  counts as fresh — an unknown age is not evidence of staleness.
+- **A stop with an empty local book never swept the wallet**, so a shutdown
+  could report "all offers cancelled" having issued no cancel at all.
+
+### Reward accounting (#149)
+
+- **Reward ingest was booking nothing**, for the same window reason: the scan
+  read the oldest 200 rows, which sat below the ledger genesis block.
+- Receipts are now **bounded to two days** before they stop being valued at the
+  live price, because the ledger row is idempotent — the first price a receipt
+  sees becomes its cost basis permanently.
+- **Idempotency is consulted before freshness.** A receipt booked while fresh
+  was being re-counted as stale once it aged past the cutoff, and the warning
+  then reported already-booked rows as unresolved divergence, every heartbeat,
+  for as long as the window held them.
+
+### Configuration and offers (#150, #151)
+
+- **Non-finite numerics are rejected at config load** rather than propagating
+  `inf`/`nan` into pricing, and a startup warning that had been false for two
+  weeks was deleted.
+- **Opt-in on-chain offer expiry** via `max_time`, verified fail-closed: a
+  wallet that ignores the field must not leave offers resting forever without
+  anyone noticing.
+
 ## [0.10.22] — 2026-09-03 — a switch for the venue, not just for the quoting
 
 The toolbar switch says whether Permuto is QUOTING. Nothing said whether
