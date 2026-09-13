@@ -84,6 +84,18 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from gui.ratio_targets import (
+    RATIO_TARGETS_KEY,
+    WALLET_OWNED_STRATEGY_KEYS,
+    RatioRow,
+    describe_ratio_target_changes,
+    describe_ratio_target_conflicts,
+    format_ratio_pct,
+    legacy_ratio_mirrors,
+    merge_ratio_targets,
+    ratio_targets_from,
+    valid_ratio,
+)
 from gui.theme import COLORS, HitTargetCheckBox, fit_row_height
 from gui.widgets.sub_tabs import SubTabPages
 
@@ -182,6 +194,16 @@ _VALID_BORDER: Final[str] = f"border: 1px solid {_C.BORDER};"
 
 # Default config.yaml file name when none is provided.
 _DEFAULT_CONFIG_FILENAME: Final[str] = "config.yaml"
+
+# [RATIO-SOT] Item-data roles on the Ratio Target cell (pairs column 4).  The
+# NAME cell's UserRole holds the stashed pair dict; these ride on a different
+# item and are offset from UserRole anyway, so the two can never be confused.
+#: The pair name the row was populated under ("" for a pair added in the UI).
+_RATIO_SOURCE_ROLE: Final[int] = int(Qt.ItemDataRole.UserRole) + 1
+#: The exact fraction the cell was populated with (None for blank).
+_RATIO_SHOWN_ROLE: Final[int] = int(Qt.ItemDataRole.UserRole) + 2
+#: The exact fraction the page last knew to be on disk for the row.
+_RATIO_BASELINE_ROLE: Final[int] = int(Qt.ItemDataRole.UserRole) + 3
 
 # Tooltip for the read-only "Suggested (%)" pairs-table column.
 _SUGGESTED_TOOLTIP_BASE: Final[str] = (
@@ -410,6 +432,15 @@ class SettingsWidget(QWidget):
         self._sizing_db_path: Optional[str] = None
         self._last_saved_time: Optional[str] = None
         self._clean_snapshot: dict[str, Any] = {}
+        # [RATIO-SOT] Pair names the pairs table was last populated with, or
+        # rebased to by a save.  A name in here that the table no longer
+        # holds was removed or renamed away, so a save drops its ratio target.
+        self._populated_ratio_pair_names: frozenset[str] = frozenset()
+        # (pair name, repr(value)) of the retired ratio_target_override keys
+        # load_config has already warned about: the warning is one-time.
+        self._warned_legacy_ratio_mirrors: frozenset[tuple[str, str]] = (
+            frozenset()
+        )
         self._dirty: bool = False
         self._tab_dirty: dict[int, bool] = {}
 
@@ -730,7 +761,7 @@ class SettingsWidget(QWidget):
         self._pairs_table.setHorizontalHeaderLabels(
             [
                 "Enabled", "Name", "Base Asset", "Quote Asset",
-                "Ratio Target Override (%)", "Suggested (%)", "Revive",
+                "Ratio Target (%)", "Suggested (%)", "Revive",
                 "Actions",
             ]
         )
@@ -2736,7 +2767,6 @@ class SettingsWidget(QWidget):
         # the name item's UserRole) so extras like is_stablecoin,
         # peg_target, depeg_*, *_override, etc. survive a Save.
         pairs_list: list[dict[str, Any]] = []
-        ratio_target_by_pair: dict[str, float] = {}
         for row in range(self._pairs_table.rowCount()):
             cb_container = self._pairs_table.cellWidget(row, 0)
             cb = cb_container.findChild(QCheckBox) if cb_container else None
@@ -2744,7 +2774,6 @@ class SettingsWidget(QWidget):
             name_item = self._pairs_table.item(row, 1)
             base_item = self._pairs_table.item(row, 2)
             quote_item = self._pairs_table.item(row, 3)
-            ratio_item = self._pairs_table.item(row, 4)
             original = (
                 name_item.data(Qt.ItemDataRole.UserRole)
                 if name_item is not None else None
@@ -2773,23 +2802,12 @@ class SettingsWidget(QWidget):
             else:
                 merged.pop("revive_market", None)
 
-            ratio_text = ratio_item.text().strip() if ratio_item else ""
-            ratio_text = ratio_text.replace("%", "")
-            if ratio_text:
-                try:
-                    ratio_pct = float(ratio_text)
-                except ValueError:
-                    ratio_pct = -1.0
-                if 0.0 < ratio_pct < 100.0:
-                    ratio_fraction = ratio_pct / 100.0
-                    merged["ratio_target_override"] = ratio_fraction
-                    pair_name = merged["name"]
-                    if pair_name:
-                        ratio_target_by_pair[pair_name] = ratio_fraction
-                else:
-                    merged.pop("ratio_target_override", None)
-            else:
-                merged.pop("ratio_target_override", None)
+            # [RATIO-SOT] The Ratio Target column is saved to
+            # strategy.ratio_target_by_pair (below, and in save_config), never
+            # into the pair.  A retired pairs[].ratio_target_override key
+            # rides through *merged* untouched, like any other per-pair
+            # extra: nothing reads it, and a save must not delete a line the
+            # operator did not ask to delete (load_config warns about it).
 
             pairs_list.append(merged)
         cfg["pairs"] = pairs_list
@@ -2823,7 +2841,6 @@ class SettingsWidget(QWidget):
             "min_reserve_units": self._min_reserve_units.value(),
             "min_trading_units": self._min_trading_units.value(),
             "auto_rebalance_enabled": self._auto_rebalance.isChecked(),
-            "ratio_target_by_pair": ratio_target_by_pair,
         }
         # Pass through strategy keys the Settings UI does not own
         # (xch_cycle_commit_frac, min_spendable_reserve_pct, ...): the
@@ -2834,6 +2851,18 @@ class SettingsWidget(QWidget):
         snapshot_strategy = (
             getattr(self, "_clean_snapshot", None) or {}
         ).get("strategy") or {}
+        # [RATIO-SOT] The ratio map as a save would patch it onto the LOADED
+        # snapshot: only the rows the operator changed, never a map rebuilt
+        # from the 2-decimal column.  No file I/O here -- this runs on every
+        # edit (_mark_dirty); save_config repeats the merge onto a fresh
+        # read of the file it saves over.
+        ratio_targets = merge_ratio_targets(
+            ratio_targets_from(snapshot_strategy),
+            self._ratio_rows(),
+            self._populated_ratio_pair_names,
+        )
+        if ratio_targets or RATIO_TARGETS_KEY in snapshot_strategy:
+            cfg["strategy"][RATIO_TARGETS_KEY] = ratio_targets
         for _key, _value in snapshot_strategy.items():
             cfg["strategy"].setdefault(_key, _value)
 
@@ -2955,13 +2984,23 @@ class SettingsWidget(QWidget):
     # Config population (dict -> widgets)
     # ===================================================================
 
-    def _populate_from_dict(self, cfg: dict[str, Any]) -> None:
+    def _populate_from_dict(
+        self,
+        cfg: dict[str, Any],
+        ratio_baseline_cfg: Optional[dict[str, Any]] = None,
+    ) -> None:
         """Write a config dict into every widget, suppressing dirty signals.
 
         Parameters
         ----------
         cfg : dict[str, Any]
             Nested configuration dictionary matching the YAML schema.
+        ratio_baseline_cfg : dict[str, Any] | None
+            The config the page last knew to be on disk, when *cfg* is NOT
+            that config (Load from Editor).  A ratio target that differs from
+            it is then saved even if its cell renders the same, and its pairs
+            count as populated, so a pair deleted in the editor loses its
+            target.  ``None`` when *cfg* is the on-disk state itself.
         """
         # Block signals during bulk population to avoid false dirty marks.
         self._block_all_signals(True)
@@ -2996,27 +3035,40 @@ class SettingsWidget(QWidget):
             )
 
             strat = cfg.get("strategy", {})
-            ratio_target_by_pair = strat.get("ratio_target_by_pair", {})
-            if not isinstance(ratio_target_by_pair, dict):
-                ratio_target_by_pair = {}
+            # [RATIO-SOT] The Ratio Target column shows the engine's map and
+            # nothing else.  The retired pairs[].ratio_target_override
+            # mirror is never read: the Wallet tab's Apply rewrites the map
+            # without touching it, and a stale mirror used to win here.
+            ratio_targets = ratio_targets_from(strat)
+            baseline_targets = (
+                None if ratio_baseline_cfg is None
+                else ratio_targets_from(ratio_baseline_cfg.get("strategy"))
+            )
 
             # -- pairs --
             pairs = cfg.get("pairs", [])
             self._pairs_table.setRowCount(0)
+            populated_names: set[str] = set()
             for pair in pairs:
-                pair_row = copy.deepcopy(pair)
-                pair_name = str(pair_row.get("name", ""))
-                if (
-                    "ratio_target_override" not in pair_row
-                    and pair_name in ratio_target_by_pair
-                ):
-                    try:
-                        ratio_value = float(ratio_target_by_pair[pair_name])
-                    except (TypeError, ValueError):
-                        ratio_value = 0.0
-                    if 0.0 < ratio_value < 1.0:
-                        pair_row["ratio_target_override"] = ratio_value
-                self._insert_pair_row(pair_row)
+                pair_name = str(pair.get("name", ""))
+                populated_names.add(pair_name)
+                shown = valid_ratio(ratio_targets.get(pair_name))
+                self._insert_pair_row(
+                    copy.deepcopy(pair),
+                    ratio_target=shown,
+                    baseline=(
+                        shown if baseline_targets is None
+                        else valid_ratio(baseline_targets.get(pair_name))
+                    ),
+                    source_name=pair_name,
+                )
+            if ratio_baseline_cfg is not None:
+                # A pair deleted in the editor was still on disk: count it as
+                # populated, so the save drops its ratio target with it.
+                for pair in ratio_baseline_cfg.get("pairs") or []:
+                    if isinstance(pair, dict):
+                        populated_names.add(str(pair.get("name", "")))
+            self._populated_ratio_pair_names = frozenset(populated_names)
 
             # -- strategy --
             self._gamma.setValue(float(strat.get("gamma", 0.01)))
@@ -3212,6 +3264,9 @@ class SettingsWidget(QWidget):
             self._db_path.setText(str(db.get("path", "data/xop_trader.db")))
 
             # -- raw YAML editor --
+            # The raw dict, retired ratio_target_override lines included:
+            # they ride through Load from Editor and Save unchanged, and
+            # deleting one here (then Load from Editor, Save) removes it.
             self._yaml_editor.setPlainText(
                 yaml.safe_dump(cfg, default_flow_style=False, sort_keys=False)
             )
@@ -3291,13 +3346,29 @@ class SettingsWidget(QWidget):
     # Pairs table helpers
     # ===================================================================
 
-    def _insert_pair_row(self, pair: dict[str, Any]) -> None:
+    def _insert_pair_row(
+        self,
+        pair: dict[str, Any],
+        *,
+        ratio_target: Optional[float] = None,
+        baseline: Optional[float] = None,
+        source_name: str = "",
+    ) -> None:
         """Append a single pair to the pairs table.
 
         Parameters
         ----------
         pair : dict[str, Any]
             Must contain keys: name, base_asset_id, quote_asset_id, enabled.
+        ratio_target : float | None
+            This pair's ``strategy.ratio_target_by_pair`` value, shown in the
+            Ratio Target column (blank when ``None``).
+        baseline : float | None
+            The value the page last knew to be on disk for this pair (see
+            :class:`gui.ratio_targets.RatioRow`).
+        source_name : str
+            The pair name the row is populated under; ``""`` for a pair
+            added in the UI.
         """
         row = self._pairs_table.rowCount()
         self._pairs_table.insertRow(row)
@@ -3340,22 +3411,24 @@ class SettingsWidget(QWidget):
         )
         self._pairs_table.setItem(row, 3, quote_item)
 
-        # Optional per-pair ratio target override as percent.
-        ratio_override = pair.get("ratio_target_override")
-        ratio_text = ""
-        try:
-            ratio_val = float(ratio_override)
-            if 0.0 < ratio_val < 1.0:
-                ratio_text = f"{ratio_val * 100.0:.2f}"
-        except (TypeError, ValueError):
-            ratio_text = ""
-        ratio_item = QTableWidgetItem(ratio_text)
+        # [RATIO-SOT] This pair's strategy.ratio_target_by_pair entry as a
+        # percent.  The exact fractions and the populated name ride on the
+        # item, so a save can tell an edit from a re-render and a rename
+        # from a new pair (see gui.ratio_targets).  Set before setItem,
+        # while no cellChanged can fire for them.
+        ratio_item = QTableWidgetItem(format_ratio_pct(ratio_target))
         ratio_item.setFlags(
             ratio_item.flags() | Qt.ItemFlag.ItemIsEditable
         )
+        ratio_item.setData(_RATIO_SHOWN_ROLE, valid_ratio(ratio_target))
+        ratio_item.setData(_RATIO_BASELINE_ROLE, valid_ratio(baseline))
+        ratio_item.setData(_RATIO_SOURCE_ROLE, source_name)
         ratio_item.setToolTip(
-            "Optional override percent for this pair only. "
-            "Leave blank to use portfolio/global ratio target."
+            "Target base-value ratio for this pair, in percent, saved to "
+            "strategy.ratio_target_by_pair -- the only per-pair target the "
+            "engine reads.  Leave blank to use strategy.ratio_target.  The "
+            "Wallet tab's Apply also writes this map; a Save changes only "
+            "the cells you edit and keeps every other entry as it is on disk."
         )
         self._pairs_table.setItem(row, 4, ratio_item)
 
@@ -3454,6 +3527,77 @@ class SettingsWidget(QWidget):
         if reply == QMessageBox.StandardButton.Yes:
             self._pairs_table.removeRow(row)
             self._mark_dirty(1)
+
+    def _ratio_rows(self) -> list[RatioRow]:
+        """The pairs table as :func:`gui.ratio_targets.merge_ratio_targets` reads it."""
+        rows: list[RatioRow] = []
+        for row in range(self._pairs_table.rowCount()):
+            name_item = self._pairs_table.item(row, 1)
+            # Unstripped, exactly as _collect_config_dict saves the name.
+            name = name_item.text() if name_item is not None else ""
+            ratio_item = self._pairs_table.item(row, 4)
+            if ratio_item is None:
+                rows.append(RatioRow(name=name))
+                continue
+            source = ratio_item.data(_RATIO_SOURCE_ROLE)
+            rows.append(RatioRow(
+                name=name,
+                text=ratio_item.text(),
+                shown=valid_ratio(ratio_item.data(_RATIO_SHOWN_ROLE)),
+                baseline=valid_ratio(ratio_item.data(_RATIO_BASELINE_ROLE)),
+                source_name=source if isinstance(source, str) else "",
+            ))
+        return rows
+
+    def _rebase_ratio_cells(self, targets: dict[Any, Any]) -> None:
+        """Show *targets* -- what a save just wrote -- and make it the baseline.
+
+        Without this, a cell edited and saved still reads as an edit, so the
+        NEXT save would re-apply it over any newer on-disk value: a Wallet
+        tab Apply made in between would be reverted.
+        """
+        names: set[str] = set()
+        blocked = self._pairs_table.blockSignals(True)
+        try:
+            for row in range(self._pairs_table.rowCount()):
+                name_item = self._pairs_table.item(row, 1)
+                if name_item is None:
+                    continue
+                name = name_item.text()
+                names.add(name)
+                ratio_item = self._pairs_table.item(row, 4)
+                if ratio_item is None:
+                    continue
+                value = valid_ratio(targets.get(name))
+                ratio_item.setText(format_ratio_pct(value))
+                ratio_item.setData(_RATIO_SHOWN_ROLE, value)
+                ratio_item.setData(_RATIO_BASELINE_ROLE, value)
+                ratio_item.setData(_RATIO_SOURCE_ROLE, name)
+        finally:
+            self._pairs_table.blockSignals(blocked)
+        self._populated_ratio_pair_names = frozenset(names)
+
+    def _warn_legacy_ratio_mirrors(self, path: Path, pairs: Any) -> None:
+        """Warn ONCE per key about retired pairs[].ratio_target_override lines.
+
+        [RATIO-SOT] Operator decision: a Save never deletes them (no silent
+        deletion), so the log names them instead -- once per (pair, value),
+        not on every load of the same file.
+        """
+        mirrors = legacy_ratio_mirrors(pairs)
+        found = frozenset((name, repr(value)) for name, value in mirrors)
+        if not found or found <= self._warned_legacy_ratio_mirrors:
+            return
+        self._warned_legacy_ratio_mirrors |= found
+        log.warning(
+            "Settings: %s carries retired pairs[].ratio_target_override keys. "
+            "Nothing reads them -- the engine never did; its per-pair target "
+            "is strategy.ratio_target_by_pair, which the Ratio Target column "
+            "shows -- and a Save leaves these lines untouched. You may delete "
+            "them: %s",
+            path,
+            ", ".join(f"{name}={value!r}" for name, value in mirrors),
+        )
 
     # ===================================================================
     # Suggested ratio targets (advisory, async)
@@ -3907,6 +4051,7 @@ class SettingsWidget(QWidget):
 
         self._config_path = str(resolved)
         self._populate_from_dict(raw)
+        self._warn_legacy_ratio_mirrors(resolved, raw.get("pairs"))
 
         # Snapshot for reset.
         self._clean_snapshot = copy.deepcopy(raw)
@@ -3919,6 +4064,31 @@ class SettingsWidget(QWidget):
         # Advisory column: recompute the flow-keyed suggestions for the
         # freshly loaded pair list (async; never blocks the UI thread).
         self._refresh_suggested_targets()
+
+    def _read_disk_strategy(self) -> Optional[dict[str, Any]]:
+        """The ``strategy`` section of the loaded config.yaml as it is NOW.
+
+        ``None`` when no path is loaded, or the file cannot be read or does
+        not parse to a mapping; the save then merges onto its loaded snapshot
+        instead.  Reads config.yaml only: ``strategy`` holds no secrets
+        (config_split.SECRET_KEYS), so secrets.yaml is never opened here.
+        """
+        if not self._config_path:
+            return None
+        try:
+            with open(self._config_path, encoding="utf-8") as fh:
+                root = yaml.safe_load(fh)
+        except (OSError, ValueError, yaml.YAMLError) as exc:
+            log.warning(
+                "Settings save: could not re-read %s (%s); ratio targets and "
+                "Wallet-owned strategy keys merge onto the loaded snapshot",
+                self._config_path, exc,
+            )
+            return None
+        if not isinstance(root, dict):
+            return None
+        strategy = root.get("strategy")
+        return strategy if isinstance(strategy, dict) else {}
 
     def save_config(self, path: Optional[str] = None) -> bool:
         """Validate and write the current settings to a YAML file.
@@ -3971,15 +4141,45 @@ class SettingsWidget(QWidget):
         cfg = copy.deepcopy(self._clean_snapshot) if self._clean_snapshot else {}
         deep_merge(cfg, cfg_edits)
 
-        # Deep-merge keeps old dict keys, which can leave stale pair ratio
-        # overrides behind after users clear/remove them. Replace this map
-        # explicitly with the current table-derived value.
-        strategy_edits = cfg_edits.get("strategy", {})
-        if isinstance(strategy_edits, dict) and "ratio_target_by_pair" in strategy_edits:
-            cfg.setdefault("strategy", {})
-            cfg["strategy"]["ratio_target_by_pair"] = copy.deepcopy(
-                strategy_edits["ratio_target_by_pair"]
-            )
+        # [RATIO-SOT] strategy.ratio_target_by_pair is PATCHED, not rebuilt.
+        # This used to REPLACE the map with one derived from the 2-decimal
+        # table -- rounding every value, adding entries for disabled pairs,
+        # and reverting whatever the Wallet tab's Apply wrote since this page
+        # loaded.  Merge only the rows the operator changed onto a FRESH read
+        # of the file being saved over (the loaded snapshot when saving
+        # anywhere else), so untouched entries stay exactly as they are on
+        # disk and a removed or renamed pair takes its entry with it.
+        snapshot_strategy = (self._clean_snapshot or {}).get("strategy") or {}
+        if not isinstance(snapshot_strategy, dict):
+            snapshot_strategy = {}
+        same_file = bool(self._config_path) and (
+            Path(dest).expanduser().resolve()
+            == Path(self._config_path).expanduser().resolve()
+        )
+        disk = self._read_disk_strategy() if same_file else None
+        base = disk if disk is not None else snapshot_strategy
+        before = ratio_targets_from(base)
+        ratio_rows = self._ratio_rows()
+        merged_targets = merge_ratio_targets(
+            before, ratio_rows, self._populated_ratio_pair_names
+        )
+        conflicts = describe_ratio_target_conflicts(before, ratio_rows)
+        strategy_out = cfg.setdefault("strategy", {})
+        if merged_targets or RATIO_TARGETS_KEY in base:
+            strategy_out[RATIO_TARGETS_KEY] = merged_targets
+        else:
+            strategy_out.pop(RATIO_TARGETS_KEY, None)
+        # [RATIO-SOT] The rest of the Wallet tab Apply's write set.  It writes
+        # these together with the map and this page has no widget for any of
+        # them, so the file is their source of truth too: taking them from
+        # the snapshot would keep a fresh Apply's map while reverting its
+        # allocations and bands -- a mix nobody ever chose.
+        if disk is not None:
+            for key in WALLET_OWNED_STRATEGY_KEYS:
+                if key in disk:
+                    strategy_out[key] = copy.deepcopy(disk[key])
+                else:
+                    strategy_out.pop(key, None)
 
         # The deep-merge preserves unmanaged keys from the on-disk snapshot,
         # which is exactly wrong for keys the ENGINE refuses to start on: a
@@ -4002,6 +4202,16 @@ class SettingsWidget(QWidget):
             )
             return False
 
+        # [RATIO-SOT] The audit trail: every change this save made to the
+        # engine's targets, and every edit that replaced a value changed on
+        # disk after this page loaded (the edit wins; nothing goes silently).
+        for line in describe_ratio_target_changes(before, merged_targets):
+            log.info("Settings save: strategy.ratio_target_by_pair %s", line)
+        for line in conflicts:
+            log.warning(
+                "Settings save: strategy.ratio_target_by_pair %s", line
+            )
+
         # Persist GUI-only appearance settings separately.
         self._save_appearance_settings()
 
@@ -4009,6 +4219,9 @@ class SettingsWidget(QWidget):
         # so subsequent saves keep preserving unmanaged keys.
         self._config_path = str(resolved)
         self._clean_snapshot = copy.deepcopy(cfg)
+        # [RATIO-SOT] Show what hit disk, and make it the baseline, so a later
+        # save cannot re-apply this save's edits over a newer on-disk value.
+        self._rebase_ratio_cells(merged_targets)
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._last_saved_time = now
         # [RELOAD] The truthful "does this reach the running engine?"
@@ -4226,7 +4439,12 @@ class SettingsWidget(QWidget):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply == QMessageBox.StandardButton.Yes:
-            self._populate_from_dict(parsed)
+            # [RATIO-SOT] The loaded snapshot is the ratio baseline: a target
+            # the editor changed is saved exactly even when it renders like
+            # the old value, and a pair deleted in the editor loses its entry.
+            self._populate_from_dict(
+                parsed, ratio_baseline_cfg=self._clean_snapshot
+            )
             # Mark all tabs dirty since we cannot diff selectively.
             for idx in self._tab_titles:
                 self._mark_dirty(idx)
