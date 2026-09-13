@@ -20012,7 +20012,98 @@ asio::awaitable<void> Engine::escalate_stuck_cancels(BlockHeight block)
                           static_cast<int>(proof),
                           execution::escalation_verdict_name(verdict));
 
-            bool stop_sweep = false;
+            // The fee-bearing branch sits OUTSIDE the switch below: nothing in
+            // this codebase co_awaits inside a switch, and GCC's coroutine
+            // transform has had defects in exactly that shape. `break` ends the
+            // sweep, `continue` moves to the next candidate.
+            if (verdict == execution::CancelEscalationVerdict::Escalate) {
+                // [review] Re-check right before the fee-bearing call: a
+                // co_spawned operator cancel-all can start during the
+                // co_awaits above.
+                if (graceful_cancel_active_.load(std::memory_order_acquire)
+                    || cancel_all_inflight_
+                    || !state_->get_offer(offer_id).cancel_pending) {
+                    break;
+                }
+                const std::uint64_t fee = execution::escalation_fee_mojos(
+                    base_fee, track.last_fee_mojos, prior_ceiling, params);
+                std::optional<std::string> error;
+                try {
+                    error = co_await offer_mgr_->recancel_secure(offer_id, fee);
+                } catch (const std::exception& e) {
+                    error = std::string{e.what()};
+                }
+                std::uint64_t paid = fee;
+                if (error && fee > 0
+                    && execution::classify_take_failure(*error)
+                           == execution::TakeFailureClass::Funding) {
+                    // [review] Short of XCH: a SECURE cancel at fee 0 needs
+                    // none -- the offer's own coins are the inputs, the dead
+                    // man's switch recipe. It cannot replace a conflicting
+                    // spend, but the stranded case has none.
+                    const std::uint64_t zero_fee = risk::watchdog_cancel().fee_mojos;
+                    std::optional<std::string> zero_error;
+                    try {
+                        zero_error = co_await offer_mgr_->recancel_secure(
+                            offer_id, zero_fee);
+                    } catch (const std::exception& e) {
+                        zero_error = std::string{e.what()};
+                    }
+                    if (!zero_error) {
+                        paid = zero_fee;
+                        error.reset();
+                    } else {
+                        *error += " | zero-fee retry: " + *zero_error;
+                    }
+                }
+                if (error) {
+                    s14_bump(track.consecutive_errors);
+                    const std::uint64_t backoff = execution::escalation_backoff_blocks(
+                        track.consecutive_errors, params);
+                    track.retry_after_block = now_block + backoff;
+                    spdlog::warn("[Engine] [S14] escalated re-cancel FAILED for {} "
+                                 "({}) at fee {} mojos -- not counted toward the "
+                                 "cap; next attempt in {} blocks: {}",
+                                 offer_id, pair_name, fee, backoff, *error);
+                    if (!track.alerted
+                        && track.consecutive_errors
+                               >= execution::kEscalationErrorAlertThreshold) {
+                        cancel_unresolved_alerts_.enqueue(s14_alert_entry(
+                            offer_id, pair_name, track.escalations,
+                            execution::UnresolvedReason::ResubmitFailing,
+                            *error));
+                    }
+                    // [review] The first failure of any kind ends the sweep.
+                    break;
+                }
+                s14_bump(track.escalations);
+                track.anchor_block       = now_block;
+                track.retry_after_block  = 0;
+                track.last_fee_mojos     = std::max(track.last_fee_mojos, paid);
+                track.idle_probes        = 0;
+                track.consecutive_errors = 0;
+                if (fee_tracker_ && fee_tracker_->enabled() && paid > 0) {
+                    fee_tracker_->record_fee(paid, block);
+                }
+                try {
+                    if (db_) {
+                        db_->mark_offer_cancel_submitted(
+                            offer_id, block,
+                            "cancel_escalation_" + std::to_string(track.escalations));
+                    }
+                } catch (const std::exception& e) {
+                    spdlog::debug("[Engine] [S14] could not record escalation {} "
+                                  "for {}: {}", track.escalations, offer_id, e.what());
+                }
+                spdlog::warn("[Engine] [S14] escalated re-cancel {}/{} SUBMITTED for "
+                             "{} ({}) at fee {} mojos -- the wallet reports {} and "
+                             "every maker coin is unspent on-chain",
+                             track.escalations, params.max_escalations,
+                             offer_id, pair_name, paid,
+                             execution::wallet_cancel_state_name(wallet_state));
+                continue;
+            }
+
             switch (verdict) {
                 case execution::CancelEscalationVerdict::AnchorNow:
                 case execution::CancelEscalationVerdict::Wait: {
@@ -20052,101 +20143,8 @@ asio::awaitable<void> Engine::escalate_stuck_cancels(BlockHeight block)
                     }
                     break;
                 }
-                case execution::CancelEscalationVerdict::Escalate: {
-                    // [review] Re-check right before the fee-bearing call: a
-                    // co_spawned operator cancel-all can start during the
-                    // co_awaits above.
-                    if (graceful_cancel_active_.load(std::memory_order_acquire)
-                        || cancel_all_inflight_
-                        || !state_->get_offer(offer_id).cancel_pending) {
-                        stop_sweep = true;
-                        break;
-                    }
-                    const std::uint64_t fee = execution::escalation_fee_mojos(
-                        base_fee, track.last_fee_mojos, prior_ceiling, params);
-                    std::optional<std::string> error;
-                    try {
-                        error = co_await offer_mgr_->recancel_secure(offer_id, fee);
-                    } catch (const std::exception& e) {
-                        error = std::string{e.what()};
-                    }
-                    std::uint64_t paid = fee;
-                    if (error && fee > 0
-                        && execution::classify_take_failure(*error)
-                               == execution::TakeFailureClass::Funding) {
-                        // [review] Short of XCH: a SECURE cancel at fee 0 needs
-                        // none -- the offer's own coins are the inputs, the dead
-                        // man's switch recipe. It cannot replace a conflicting
-                        // spend, but the stranded case has none.
-                        const std::uint64_t zero_fee = risk::watchdog_cancel().fee_mojos;
-                        std::optional<std::string> zero_error;
-                        try {
-                            zero_error = co_await offer_mgr_->recancel_secure(
-                                offer_id, zero_fee);
-                        } catch (const std::exception& e) {
-                            zero_error = std::string{e.what()};
-                        }
-                        if (!zero_error) {
-                            paid = zero_fee;
-                            error.reset();
-                        } else {
-                            *error += " | zero-fee retry: " + *zero_error;
-                        }
-                    }
-                    if (!error) {
-                        s14_bump(track.escalations);
-                        track.anchor_block       = now_block;
-                        track.retry_after_block  = 0;
-                        track.last_fee_mojos     = std::max(track.last_fee_mojos, paid);
-                        track.idle_probes        = 0;
-                        track.consecutive_errors = 0;
-                        if (fee_tracker_ && fee_tracker_->enabled() && paid > 0) {
-                            fee_tracker_->record_fee(paid, block);
-                        }
-                        try {
-                            if (db_) {
-                                db_->mark_offer_cancel_submitted(
-                                    offer_id, block,
-                                    "cancel_escalation_"
-                                        + std::to_string(track.escalations));
-                            }
-                        } catch (const std::exception& e) {
-                            spdlog::debug("[Engine] [S14] could not record escalation "
-                                          "{} for {}: {}", track.escalations,
-                                          offer_id, e.what());
-                        }
-                        spdlog::warn("[Engine] [S14] escalated re-cancel {}/{} "
-                                     "SUBMITTED for {} ({}) at fee {} mojos -- the "
-                                     "wallet reports {} and every maker coin is "
-                                     "unspent on-chain",
-                                     track.escalations, params.max_escalations,
-                                     offer_id, pair_name, paid,
-                                     execution::wallet_cancel_state_name(wallet_state));
-                    } else {
-                        s14_bump(track.consecutive_errors);
-                        const std::uint64_t backoff = execution::escalation_backoff_blocks(
-                            track.consecutive_errors, params);
-                        track.retry_after_block = now_block + backoff;
-                        spdlog::warn("[Engine] [S14] escalated re-cancel FAILED for {} "
-                                     "({}) at fee {} mojos -- not counted toward the "
-                                     "cap; next attempt in {} blocks: {}",
-                                     offer_id, pair_name, fee, backoff, *error);
-                        if (!track.alerted
-                            && track.consecutive_errors
-                                   >= execution::kEscalationErrorAlertThreshold) {
-                            cancel_unresolved_alerts_.enqueue(s14_alert_entry(
-                                offer_id, pair_name, track.escalations,
-                                execution::UnresolvedReason::ResubmitFailing,
-                                *error));
-                        }
-                        // [review] The first failure of any kind ends the sweep.
-                        stop_sweep = true;
-                    }
-                    break;
-                }
-            }
-            if (stop_sweep) {
-                break;
+                case execution::CancelEscalationVerdict::Escalate:
+                    break;   // handled above, outside the switch
             }
         }
     }
