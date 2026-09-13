@@ -39,6 +39,9 @@ GOLDEN = (
     "written_at=2026-09-12T22:41:07\n"
 )
 BOM = chr(0xFEFF)
+#: Arabic-Indic "42": str.isdigit() is True and int() reads it as 42, but the
+#: engine's parser takes ASCII 0-9 only.
+ARABIC_INDIC_42 = chr(0x0664) + chr(0x0662)
 INCIDENT_WRITE = datetime(2026, 9, 12, 22, 41, 7)
 
 
@@ -96,6 +99,11 @@ PARSE_CASES = [
     ("over-max", "pid=4294967296\n", RequestKind.MALFORMED, None),
     ("max", "pid=4294967295\n", RequestKind.ADDRESSED, 4294967295),
     ("duplicate", "pid=1\npid=2\n", RequestKind.MALFORMED, None),
+    # int() accepts all three and the engine accepts none: only the digit rule
+    # in _decimal_pid keeps the two parsers agreeing.
+    ("plus-sign", "pid=+42\n", RequestKind.MALFORMED, None),
+    ("digit-separator", "pid=4_2\n", RequestKind.MALFORMED, None),
+    ("non-ascii-digits", "pid=" + ARABIC_INDIC_42 + "\n", RequestKind.MALFORMED, None),
 ]
 
 
