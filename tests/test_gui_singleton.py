@@ -363,6 +363,31 @@ def test_posix_kill_path_uses_the_label_rule_and_cleans_up(tmp_path, monkeypatch
 
 
 # --------------------------------------------------------------------------- #
+# POSIX liveness: an unreaped zombie
+# --------------------------------------------------------------------------- #
+
+def test_posix_liveness_treats_an_unreaped_zombie_as_exited(tmp_path, monkeypatch):
+    """A zombie still answers signal 0, so only its /proc state shows it has
+    exited. The real-process test below cannot reach this branch on Linux:
+    child.wait() reaps the child before the second call, so signal 0 already
+    fails with ProcessLookupError."""
+    signals = []
+    monkeypatch.setattr(gui_main.os, "kill", lambda pid, sig: signals.append((pid, sig)))
+    proc_root = tmp_path / "proc"
+    stat = proc_root / "4242" / "stat"
+    stat.parent.mkdir(parents=True)
+
+    stat.write_text("4242 (xop_trader) Z 1 4242 4242 0 -1\n")
+    assert gui_main._posix_process_alive(4242, proc_root=proc_root) is False
+
+    # A command name may itself contain ")": the state follows the LAST one.
+    stat.write_text("4242 (xop (trader)) S 1 4242 4242 0 -1\n")
+    assert gui_main._posix_process_alive(4242, proc_root=proc_root) is True
+
+    assert signals == [(4242, 0), (4242, 0)], "existence is probed with signal 0 only"
+
+
+# --------------------------------------------------------------------------- #
 # The real wait, against a real child process
 # --------------------------------------------------------------------------- #
 

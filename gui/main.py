@@ -189,8 +189,13 @@ def _wait_for_process_exit_win32(pid: int, timeout_s: float) -> Optional[bool]:
         kernel32.CloseHandle(handle)
 
 
-def _posix_process_alive(pid: int) -> Optional[bool]:
-    """Signal 0 checks existence on POSIX and delivers nothing."""
+def _posix_process_alive(pid: int, proc_root: Path = Path("/proc")) -> Optional[bool]:
+    """Signal 0 checks existence on POSIX and delivers nothing.
+
+    An exited child its parent has not reaped yet is a zombie: it still
+    answers signal 0, so its /proc state decides. Without /proc (macOS) a
+    zombie reads as alive until it is reaped.
+    """
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -199,13 +204,12 @@ def _posix_process_alive(pid: int) -> Optional[bool]:
         return True  # it exists; it belongs to someone else
     except OSError:
         return None
-    # An exited child its parent has not reaped yet is a zombie: gone.
     try:
-        stat = Path(f"/proc/{pid}/stat").read_text()
+        stat = (proc_root / str(pid) / "stat").read_text()
         if stat.rsplit(")", 1)[1].split()[0] in ("Z", "X"):
             return False
     except (OSError, IndexError):
-        pass
+        pass  # no /proc entry, or an unexpected format: signal 0 said it exists
     return True
 
 

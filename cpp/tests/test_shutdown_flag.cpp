@@ -48,6 +48,7 @@
 #endif
 
 using xop::util::capture_process_identity;
+using xop::util::creation_time_is_plausible;
 using xop::util::decide_shutdown_flag;
 using xop::util::flag_age_vs_start_ms;
 using xop::util::parse_shutdown_flag;
@@ -494,6 +495,25 @@ TEST(ProcessIdentityCapture, TheStartIsTheKernelCreationTimeOnWindows)
     EXPECT_EQ(capture.source, ProcessStartSource::MainEntryClock)
         << process_start_source_name(capture.source);
 #endif
+}
+
+// The run-time representation check behind the Windows start instant. A real
+// process's creation time always passes it, so only synthetic values can show
+// it working: a toolchain whose file_clock does not share FILETIME's epoch and
+// unit yields a "creation time" centuries away, and that -- or one in the
+// future -- must fall back to the clock. Both bounds are inclusive.
+TEST(ProcessIdentityCapture, ACreationTimeIsUsedOnlyWithinADayBeforeNow)
+{
+    using std::chrono::hours;
+    using std::chrono::seconds;
+    const std::filesystem::file_time_type now{hours{24 * 365 * 30}};
+
+    EXPECT_TRUE(creation_time_is_plausible(now, now));
+    EXPECT_TRUE(creation_time_is_plausible(now - hours{24}, now));
+    EXPECT_FALSE(creation_time_is_plausible(now - hours{24} - seconds{1}, now));
+    EXPECT_FALSE(creation_time_is_plausible(now + seconds{1}, now));
+    EXPECT_FALSE(creation_time_is_plausible(now - hours{24 * 365 * 100}, now))
+        << "a century off: the epoch or the unit disagrees";
 }
 
 // End to end through the real clocks: a request this process could only have

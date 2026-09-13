@@ -46,7 +46,7 @@ ProcessIdentityCapture capture_process_identity() noexcept
         // The representation check. MSVC's file_clock and a FILETIME share
         // epoch (1601-01-01) and unit (100 ns); a toolchain where they do not
         // lands centuries away and fails this test, keeping the clock above.
-        if (created <= now && (now - created) <= std::chrono::hours{24}) {
+        if (creation_time_is_plausible(created, now)) {
             capture.identity.start = created;
             capture.source = ProcessStartSource::KernelCreationTime;
         }

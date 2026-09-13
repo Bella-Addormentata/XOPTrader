@@ -25,7 +25,7 @@
 // from 1601 that last_write_time() reports, and capture_process_identity()
 // verifies that assumption at run time instead of trusting it: a creation
 // time in the future, or more than a day before main() began, falls back to
-// the clock.
+// the clock (creation_time_is_plausible, below).
 //
 // POSIX: the start is file_clock::now() at the first statement of main(). A
 // request written between fork() and that statement -- or within one coarse
@@ -34,6 +34,7 @@
 // unaffected in practice because it cannot close within that window.
 // ---------------------------------------------------------------------------
 
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 
@@ -67,6 +68,24 @@ struct ProcessIdentityCapture {
     ProcessIdentity identity{};
     ProcessStartSource source{ProcessStartSource::MainEntryClock};
 };
+
+/// [review] The run-time representation check behind the Windows start
+/// instant. A creation time is used only if it is not after `now` and no more
+/// than kMaxPlausibleProcessAge before it; both bounds are inclusive. On a
+/// toolchain whose file_clock does not share FILETIME's epoch and unit the
+/// value lands centuries away and fails this, so the capture keeps the clock.
+///
+/// Written as `created >= now - kMaxPlausibleProcessAge`, not as
+/// `now - created <= kMaxPlausibleProcessAge`: subtracting a value centuries
+/// away could overflow a 1 ns file_clock, which spans about +-292 years.
+inline constexpr std::chrono::hours kMaxPlausibleProcessAge{24};
+
+[[nodiscard]] constexpr bool creation_time_is_plausible(
+    std::filesystem::file_time_type created,
+    std::filesystem::file_time_type now) noexcept
+{
+    return created <= now && created >= now - kMaxPlausibleProcessAge;
+}
 
 /// Capture this process's PID and start instant. Never throws.
 ///
