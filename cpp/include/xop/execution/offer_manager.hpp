@@ -533,6 +533,12 @@ public:
      *        at which point the watchdog fires a SECOND concurrent bulk
      *        cancel over the same offers. The overrun happens INSIDE one
      *        call, so only a mid-loop deadline can bound it.
+     *
+     *        [BULKCANCEL-B 2026-09-13] cancel_offer is no longer re-sent
+     *        after a timeout (rpc/rpc_retry_policy.hpp), so against a hanging
+     *        wallet one call now costs one request_timeout, ~30 s, not ~123 s,
+     *        and the same 7-offer book ~210 s. That is still past the 90 s
+     *        budget, so the deadline still binds.
      */
     asio::awaitable<CancelOutcome> cancel_ids(
         const std::vector<std::string>& offer_ids,

@@ -167,9 +167,12 @@ TEST(CancelRetry, TheLadderTerminatesAndNeverOutrunsTheBudget)
 }
 
 // A wallet that HANGS rather than refuses is the expensive shape: each
-// attempt can burn request_timeout{30s} x max_retries{3}. The loop must be
-// bounded on wall clock, not on the attempt counter, or a hung wallet turns a
-// five-attempt ladder into many minutes of a shutdown that will not finish.
+// attempt can burn a request_timeout{30s} per cancel call, and a per-id
+// attempt makes one call per offer. ([BULKCANCEL-B 2026-09-13] Until cancels
+// stopped being re-sent after a timeout, each call could burn up to four.)
+// The loop must be bounded on wall clock, not on the attempt counter, or a
+// hung wallet turns a five-attempt ladder into many minutes of a shutdown
+// that will not finish.
 //
 // MUTATION: drop the `elapsed_ms >= budget_ms` clause -> returns Retry here
 // and FAILS.

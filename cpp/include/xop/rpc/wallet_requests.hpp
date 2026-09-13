@@ -86,13 +86,30 @@ using json = nlohmann::json;
 /// BLOCK_COST_EXCEEDS_MAX.  So the batch is sized against MEASURED costs, not
 /// raised without limit.  Across the 15,330 confirmed cancellation bundles in
 /// the live wallet, costed on 2026-09-13 with chia_rs 0.47 at the 2.7.4 cost
-/// constants: 18,185 of 18,187 offers cancelled with ONE coin spend; a CAT
-/// offer coin's cancel spend cost at most 34,442,386, an XCH one 17,788,814,
-/// and a fee spend 8,817,766; and a bundle cost the sum of its spends to
-/// within 504,000.  The largest bundle this wallet ever pushed carried 15
-/// offers at 388,803,130.  At the ceilings below a full batch of 100 costs
-/// 3,518,000,000 -- 64% of the bound -- where 1,000 would be 6.4x over it and
-/// cancel nothing.
+/// constants: 18,185 of 18,187 offers cancelled with ONE coin spend, and the
+/// other two with two; a CAT offer coin's cancel spend cost at most
+/// 34,442,386, an XCH one 17,788,814, and a fee spend 8,817,766; and a bundle
+/// cost the sum of its spends to within 504,000.  The largest bundle this
+/// wallet ever pushed carried 15 offers at 388,803,130.
+///
+/// THE ONE-SPEND ASSUMPTION.  Cost is paid per cancellation SPEND, not per
+/// offer: trade_manager.py cancel_pending_offers spends every coin that
+/// Offer.get_cancellation_coins() returns.  Those can be fewer than the coins
+/// the offer itself spent.  offer.py drops each coin that asserts an
+/// announcement another coin in the offer makes (and whatever depends on it),
+/// because spending that provider already invalidates it -- so an offer's
+/// root coin count bounds its cancellation spends only from above.  The 22
+/// offers live on 2026-09-13 spent 2 to 7 root coins each; their cancellation
+/// spends were not counted.
+///
+/// At ONE spend per offer and the ceilings below, a full batch of 100 costs
+/// at most 3,518,000,000 -- 64% of the bound -- where 1,000 would be 6.4x over
+/// it and cancel nothing.  Only that shape is covered: 100 offers of two CAT
+/// cancellation spends each would cost up to 7,018,000,000, over the bound.
+/// Were every root coin of the 22 live offers to need its own spend at the
+/// measured maxima, they would cost up to 1,934,824,884 (35% of the bound),
+/// about 88,000,000 each, and one bundle of such offers would overflow past
+/// about 62.
 ///
 /// ABOVE 100 OFFERS the daemon splits the sweep again, and the fee-coin
 /// collision returns for the later batches.  That is far outside what this
@@ -106,9 +123,11 @@ inline constexpr int kCancelOffersSingleBatchSize = 100;
 /// A spend bundle costing more is rejected with Err.BLOCK_COST_EXCEEDS_MAX.
 inline constexpr std::uint64_t kMempoolMaxTxClvmCost = 11'000'000'000ULL / 2;
 
-/// Ceiling on ONE offer's cancellation spend.  Measured maximum 34,442,386
-/// (a CAT offer coin; XCH offer coins at most 17,788,814), rounded up.  An
-/// observation of this wallet's offers, not a consensus value.
+/// Ceiling on ONE cancellation SPEND -- one coin, not one offer.  Measured
+/// maximum 34,442,386 (a CAT offer coin; XCH offer coins at most 17,788,814),
+/// rounded up.  An observation of this wallet's offers, not a consensus value.
+/// An offer whose cancellation needs k spends costs up to k times this; see
+/// THE ONE-SPEND ASSUMPTION above.
 inline constexpr std::uint64_t kCancelSpendCostCeiling = 35'000'000ULL;
 
 /// Ceiling on the XCH fee spend a batch adds when its fee cannot come out of
@@ -117,7 +136,9 @@ inline constexpr std::uint64_t kCancelSpendCostCeiling = 35'000'000ULL;
 inline constexpr std::uint64_t kCancelFeeSpendCostCeiling = 18'000'000ULL;
 
 /// Upper estimate of the mempool cost of one cancel_offers batch of
-/// `batch_size` single-coin offers plus its fee spend.  A degenerate size
+/// `batch_size` offers that each cancel with ONE coin spend, plus the batch's
+/// fee spend.  It models that shape only and says nothing about an offer that
+/// needs more spends (THE ONE-SPEND ASSUMPTION above).  A degenerate size
 /// costs the fee spend alone.
 [[nodiscard]] constexpr std::uint64_t cancel_batch_cost_ceiling(
     int batch_size) noexcept

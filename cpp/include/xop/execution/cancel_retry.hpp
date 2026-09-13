@@ -75,6 +75,12 @@
 // refusing -- costs request_timeout{30s} x max_retries{3} per call, and an
 // attempt-counted loop would then run for many minutes.
 //
+// [BULKCANCEL-B 2026-09-13] The cancel calls this ladder makes are no longer
+// re-sent after a timeout or a 5xx (rpc/rpc_retry_policy.hpp), so a hanging
+// wallet now costs one request_timeout, ~30 s, per call rather than up to
+// four.  The wall-clock bound still decides: a per-id attempt makes one call
+// per offer, so an attempt is still not a unit of time.
+//
 // WHAT THIS CANNOT SAVE, STATED PLAINLY
 // -------------------------------------
 // SIGTERM, taskkill /F, console-window close and kill_old_instances() run no

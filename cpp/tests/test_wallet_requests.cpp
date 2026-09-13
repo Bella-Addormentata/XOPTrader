@@ -169,19 +169,27 @@ TEST(WalletRequests, CancelOffersIsOneBatch) {
     EXPECT_LE(batch_size, 65535);
 }
 
-TEST(WalletRequests, OneCancelBatchFitsTheMempoolCostBound) {
+TEST(WalletRequests, OneBatchFitsTheMempoolCostBoundAtOneSpendPerOffer) {
     // [BULKCANCEL-B 2026-09-13] The risk the old batch size guarded against is
     // real: mempool_manager.py rejects a bundle costing more than
     // max_tx_clvm_cost, and one rejected bundle takes every cancel in it down.
     // So the single batch is sized under that bound at measured per-spend
     // costs rather than raised without limit.
+    //
+    // [review 2026-09-13] AT ONE CANCELLATION SPEND PER OFFER -- the shape of
+    // 18,185 of the 18,187 offers this wallet has cancelled -- and no further.
+    // cancel_batch_cost_ceiling models only that shape, so this test cannot
+    // see a book whose offers need more: 100 offers of two CAT cancellation
+    // spends each would cost up to 7,018,000,000, over the bound, and every
+    // assertion below would still pass.  See THE ONE-SPEND ASSUMPTION in
+    // wallet_requests.hpp.
     EXPECT_EQ(kMempoolMaxTxClvmCost, 5'500'000'000ULL);  // 11e9 // 2
     EXPECT_LE(cancel_batch_cost_ceiling(kCancelOffersSingleBatchSize),
               kMempoolMaxTxClvmCost);
 
     // A first draft of this change proposed 1000 per batch.  At these
-    // ceilings that bundle is 6.4x over the bound: a sweep that size would
-    // cancel nothing.
+    // ceilings that bundle is 6.4x over the bound even at one spend per
+    // offer: a sweep that size would cancel nothing.
     EXPECT_GT(cancel_batch_cost_ceiling(1000), kMempoolMaxTxClvmCost);
 
     // A degenerate size costs the fee spend alone and never wraps.

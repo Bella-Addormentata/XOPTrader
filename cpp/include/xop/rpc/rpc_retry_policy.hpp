@@ -34,15 +34,41 @@
 // handle for every attempt, so neither code can describe a reused connection
 // that had already carried the request.  A timeout, a receive or send error,
 // an empty reply, a partial transfer and an HTTP 5xx can each follow a
-// request the wallet has already acted on, so they surface to the caller --
-// for OfferManager::cancel_all that is its per-id fallback, and on shutdown
-// the S46 retry ladder.
+// request the wallet has already acted on, so they surface to the caller.
+//
+// WHO GETS THAT FAILURE.  This layer only stops the automatic copy.  Every
+// caller still reads a surfaced timeout as a refusal, never as "possibly
+// still running" -- and now gets it about 30 s after the send, where before
+// it got it only once the re-sends ran out (up to four 30 s attempts plus
+// 3.5 s of backoff, ~124 s):
+//
+//   OfferManager::cancel_all   falls back to per-id cancel_offer calls for
+//                              the offers it tracks.  Those can queue behind
+//                              a bulk request that is still running and then
+//                              spend the same offer coins again.
+//   the S46 shutdown ladder    retries the survivors per id from attempt 2,
+//                              and ends in the S31 path below if it stops
+//                              with offers still live or the sweep refused.
+//   the S31 dead man's switch  (Engine::watchdog_cancel_book) makes ONE
+//                              attempt on its own client, then reports FAILED
+//                              and tells the operator to cancel by hand,
+//                              although the sweep may still be running.
+//   XCH recovery               (Engine::step_xch_recovery, with
+//                              recovery.cancel_on_enter set) sends the
+//                              wallet-wide cancel_offers AGAIN on its next
+//                              block while recovery lasts.  That copy can
+//                              overlap a first request that has not finished
+//                              -- the duplicate this header exists to stop,
+//                              made one layer up.
+//
+// Telling "no answer yet" apart from "refused" is a change for those callers,
+// and this header does not make it.
 //
 // DELIBERATELY CONSERVATIVE.  A connect-phase timeout (CURLOPT_CONNECTTIMEOUT_MS)
 // also reports CURLE_OPERATION_TIMEDOUT, which this layer cannot tell apart
-// from a response timeout, so it is not re-sent either.  Surfacing a cancel
-// that never left is recoverable by the callers above; duplicating one that
-// did is not recoverable at all.
+// from a response timeout, so it is not re-sent either.  A cancel that never
+// left surfaces as a failure the callers above already handle; a second copy
+// of one that did arrive cannot be called back.
 //
 // Pure and constexpr, no I/O.  The decision is unit-tested in
 // tests/test_rpc_retry_policy.cpp; tests/test_rpc_retry_wiring.py pins that
