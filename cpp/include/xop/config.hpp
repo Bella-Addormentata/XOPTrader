@@ -875,6 +875,40 @@ struct StrategyConfig {
     /// "stuck" and eligible for forced cancellation + alerting.
     uint32_t stuck_offer_age_blocks{30};
 
+    // -- [S14 2026-09-13] Proof-gated cancel escalation ---------------------
+    //
+    // An accepted cancel can strand: the wallet reports PENDING_CANCEL for
+    // days while every maker coin stays unspent and the offer stays takeable.
+    // The engine re-cancels such an offer (secure, with a raised fee) only
+    // when the wallet reports the trade live AND the full node shows every
+    // maker coin unspent.  Defaults equal the constants in
+    // execution/cancel_escalation.hpp (a test pins that).  Block counts are
+    // peak-height blocks, ~18.75 s each.
+
+    /// Master switch.  false = never re-cancel automatically; stranded
+    /// cancels are then only visible as 'Cancelling' rows.
+    bool          cancel_escalation_enabled{true};
+    /// Blocks a PENDING_CANCEL offer is left alone before a re-cancel, and
+    /// the spacing between escalations.  96 = ~30 min.  >= 1.
+    std::uint32_t cancel_escalation_window_blocks{96};
+    /// Fee-bearing re-cancels per offer (counted across restarts) before
+    /// ONE CancelUnresolved alert.  0 = alert without ever paying.
+    std::uint32_t cancel_escalation_max_attempts{3};
+    /// Fee added over the highest earlier cancel fee.  >= 10,000,000 (chia
+    /// MEMPOOL_MIN_FEE_INCREASE): a smaller step cannot replace a conflicting
+    /// spend.
+    std::uint64_t cancel_escalation_fee_step_mojos{10'000'000ULL};
+    /// Ceiling on one escalated cancel fee.  > the fee step.
+    /// 100,000,000 = 0.0001 XCH.
+    std::uint64_t cancel_escalation_max_fee_mojos{100'000'000ULL};
+    /// Minimum blocks between two probes of one offer (a doubling back-off,
+    /// capped at the window) and the window for a PENDING_ACCEPT record.
+    /// 8 = 2.5 min.  In [1, window].
+    std::uint32_t cancel_escalation_retry_blocks{8};
+    /// Offers probed per heartbeat (one wallet get_offer and one node coin
+    /// lookup each).  >= 1.
+    std::uint32_t cancel_escalation_max_probes{5};
+
     // -- Minimum balance management -----------------------------------------
 
     /// XCH to hold back from offer allocation for paying on-chain fees

@@ -60,8 +60,15 @@ _COLUMNS: list[tuple[str, int]] = [
     ("Actions",        80),
 ]
 
-# Offer status values used throughout the system.
-_STATUSES: list[str] = ["All", "Pending", "Filled", "Cancelled", "Expired"]
+# Offer status values used throughout the system.  [S14] "Cancelling" is the
+# display name of offer_log's 'cancel_pending': the cancel was submitted, no
+# terminal verdict has arrived, and the offer can still be taken.
+_STATUSES: list[str] = ["All", "Pending", "Cancelling", "Filled", "Cancelled", "Expired"]
+
+
+def _db_status(display_status: str) -> str:
+    """The offer_log status a lower-cased display status filters on."""
+    return "cancel_pending" if display_status == "cancelling" else display_status
 
 
 class _SortByUserRoleItem(QTableWidgetItem):
@@ -543,8 +550,8 @@ class OrderPanel(QWidget):
         Parameters
         ----------
         stats:
-            ``{"total", "pending", "filled", "cancelled", "expired",
-            "locked_mojos"}`` -- counts over the whole ``offer_log``.
+            ``{"total", "pending", "cancel_pending", "filled", "cancelled",
+            "expired", "locked_mojos"}`` -- counts over the whole ``offer_log``.
         """
         self._summary_stats = dict(stats or {})
         self._update_summary()
@@ -592,7 +599,7 @@ class OrderPanel(QWidget):
         status = self._combo_status.currentText()
         self.offers_query_requested.emit(
             "" if pair == "All Pairs" else pair,
-            "" if status.lower() == "all" else status.lower(),
+            "" if status.lower() == "all" else _db_status(status.lower()),
             _QUERY_LIMIT,
         )
         self._apply_filters()
@@ -623,16 +630,12 @@ class OrderPanel(QWidget):
                 continue
             # Status filter
             raw_status = text(offer, "status").lower()
-            effective_status = raw_status
-            if raw_status == "pending" and self._cancel_all_pending:
-                effective_status = "cancelling"
-
-            if status_filter != "all":
-                if status_filter == "pending":
-                    if effective_status not in ("pending", "cancelling"):
-                        continue
-                elif status_filter != effective_status:
-                    continue
+            # Filter on the STORED status, exactly as the SQL slice does:
+            # "Pending" keeps a pending row even while the cancel-all latch
+            # displays it as Cancelling, and "Cancelling" is offer_log's
+            # 'cancel_pending'.  [S14]
+            if status_filter != "all" and raw_status != _db_status(status_filter):
+                continue
             # Free-text search (matches against offer_id and pair_name)
             if search_text:
                 searchable = (
@@ -673,7 +676,7 @@ class OrderPanel(QWidget):
         if status == "all":
             available = int(self._summary_stats.get("total", 0) or 0)
         else:
-            available = int(self._summary_stats.get(status, 0) or 0)
+            available = int(self._summary_stats.get(_db_status(status), 0) or 0)
         # No aggregates yet -- fall back to what the payload showed.
         available = max(available, matched)
 
@@ -849,7 +852,11 @@ class OrderPanel(QWidget):
             # -- Status (coloured badge) --
             raw_status: str = text(offer, "status")
             status: str = raw_status
-            if raw_status.lower() == "pending" and self._cancel_all_pending:
+            if raw_status.lower() == "cancel_pending" or (
+                raw_status.lower() == "pending" and self._cancel_all_pending
+            ):
+                # [S14] cancel_pending: submitted, not confirmed -- shown as
+                # Cancelling with the cancel control disabled.
                 status = "cancelling"
             self._item(row_idx, 6, status.capitalize()).setForeground(
                 _status_color(status)
@@ -980,6 +987,7 @@ class OrderPanel(QWidget):
         if stats:
             total = int(stats.get("total", 0) or 0)
             pending = int(stats.get("pending", 0) or 0)
+            cancel_pending = int(stats.get("cancel_pending", 0) or 0)
             filled = int(stats.get("filled", 0) or 0)
             locked_mojos = int(stats.get("locked_mojos", 0) or 0)
         else:
@@ -987,23 +995,33 @@ class OrderPanel(QWidget):
             pending = sum(
                 1 for o in self._all_offers if text(o, "status").lower() == "pending"
             )
+            cancel_pending = sum(
+                1 for o in self._all_offers
+                if text(o, "status").lower() == "cancel_pending"
+            )
             filled = sum(
                 1 for o in self._all_offers if text(o, "status").lower() == "filled"
             )
-            # Total value locked = sum of sizes of pending offers.
+            # Total value locked = sum of sizes of resting offers, including
+            # [S14] cancel_pending ones: their coins stay locked until the
+            # cancel confirms.
             locked_mojos = sum(
                 int(num(o, "size_mojos"))
                 for o in self._all_offers
-                if text(o, "status").lower() == "pending"
+                if text(o, "status").lower() in ("pending", "cancel_pending")
             )
         fill_rate = (filled / total * 100.0) if total > 0 else 0.0
 
         self._lbl_total.setText(f"Total: {total}")
+        # [S14] Submitted-but-unconfirmed cancels get their own wording.
+        # "Cancelling: N" belongs to the cancel-all latch below; reusing it
+        # would make the two indistinguishable.
+        cancel_note = f" | Cancel pending: {cancel_pending}" if cancel_pending > 0 else ""
         if self._cancel_all_pending and pending > 0:
-            self._lbl_pending.setText(f"Cancelling: {pending}")
+            self._lbl_pending.setText(f"Cancelling: {pending}{cancel_note}")
             self._lbl_pending.setStyleSheet(f"color: {COLORS.INFO_BLUE}; font-size: 9pt; font-weight: bold;")
         else:
-            self._lbl_pending.setText(f"Pending: {pending}")
+            self._lbl_pending.setText(f"Pending: {pending}{cancel_note}")
             self._lbl_pending.setStyleSheet(f"color: {COLORS.TEXT_SECONDARY}; font-size: 9pt;")
 
         self._lbl_filled.setText(f"Filled: {filled}")
@@ -1114,11 +1132,17 @@ class OrderPanel(QWidget):
         # Use the whole-table count: the payload only holds the selected
         # status, so counting it would refuse to cancel anything while
         # the user is looking at, e.g., the Filled list.
+        # [S14] cancel_pending offers count: the wallet-wide cancel re-fires a
+        # PENDING_CANCEL trade, which is the manual remedy for a cancel that
+        # never landed -- refusing here would block exactly that.
         if self._summary_stats:
-            pending_count = int(self._summary_stats.get("pending", 0) or 0)
+            pending_count = int(self._summary_stats.get("pending", 0) or 0) + int(
+                self._summary_stats.get("cancel_pending", 0) or 0
+            )
         else:
             pending_count = sum(
-                1 for o in self._all_offers if o.get("status", "").lower() == "pending"
+                1 for o in self._all_offers
+                if o.get("status", "").lower() in ("pending", "cancel_pending")
             )
         if pending_count == 0:
             QMessageBox.information(self, "Cancel All", "No pending offers to cancel.")

@@ -15,6 +15,7 @@
 
 #include <xop/config.hpp>
 #include <xop/execution/book_side_quality.hpp>
+#include <xop/execution/cancel_escalation_config.hpp>
 
 #include <spdlog/sinks/ringbuffer_sink.h>
 #include <spdlog/spdlog.h>
@@ -2844,4 +2845,71 @@ TEST(ConfigParserTest, DuplicatePairNames_Throw) {
         "    enabled: true\n");
     TempYaml tmp(yaml.c_str());
     EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+}
+
+// ============================================================================
+// [S14 2026-09-13] strategy.cancel_escalation_*
+//
+// Keys are spliced in with this file's with_strategy_keys() helper (above),
+// which inserts directly after "  tier_size_pct: [0.6, 0.4]" and returns the
+// YAML unchanged if that anchor ever moves -- hence the ASSERT_NE guards.
+// ============================================================================
+
+TEST(CancelEscalationConfig, DefaultsMatchTheHeaderConstants)
+{
+    TempYaml tmp(kMinimalValidYaml);
+    const auto cfg = xop::load_config(tmp.path());
+    EXPECT_TRUE(cfg.strategy.cancel_escalation_enabled);
+
+    const auto params = xop::execution::cancel_escalation_params_from(cfg.strategy);
+    const xop::execution::CancelEscalationParams header{};
+    EXPECT_EQ(params.window_blocks, header.window_blocks);
+    EXPECT_EQ(params.max_escalations, header.max_escalations);
+    EXPECT_EQ(params.fee_step_mojos, header.fee_step_mojos);
+    EXPECT_EQ(params.max_fee_mojos, header.max_fee_mojos);
+    EXPECT_EQ(params.retry_blocks, header.retry_blocks);
+    EXPECT_EQ(params.max_probes_per_sweep, header.max_probes_per_sweep);
+}
+
+TEST(CancelEscalationConfig, KeysParseIntoTheParams)
+{
+    const std::string yaml = with_strategy_keys(
+        "\n  cancel_escalation_enabled: false"
+        "\n  cancel_escalation_window_blocks: 120"
+        "\n  cancel_escalation_max_attempts: 5"
+        "\n  cancel_escalation_fee_step_mojos: 15000000"
+        "\n  cancel_escalation_max_fee_mojos: 250000000"
+        "\n  cancel_escalation_retry_blocks: 12"
+        "\n  cancel_escalation_max_probes: 7");
+    ASSERT_NE(yaml, std::string(kMinimalValidYaml)) << "the strategy anchor moved";
+    TempYaml tmp(yaml.c_str());
+    const auto cfg = xop::load_config(tmp.path());
+
+    EXPECT_FALSE(cfg.strategy.cancel_escalation_enabled);
+    const auto params = xop::execution::cancel_escalation_params_from(cfg.strategy);
+    EXPECT_EQ(params.window_blocks, 120u);
+    EXPECT_EQ(params.max_escalations, 5u);
+    EXPECT_EQ(params.fee_step_mojos, 15'000'000u);
+    EXPECT_EQ(params.max_fee_mojos, 250'000'000u);
+    EXPECT_EQ(params.retry_blocks, 12u);
+    EXPECT_EQ(params.max_probes_per_sweep, 7u);
+}
+
+TEST(CancelEscalationConfig, UnsafeValuesAreRejected)
+{
+    const char* const unsafe[] = {
+        // Below chia's replacement increment: cannot replace a conflict.
+        "\n  cancel_escalation_fee_step_mojos: 9999999",
+        "\n  cancel_escalation_window_blocks: 0",
+        "\n  cancel_escalation_retry_blocks: 0",
+        "\n  cancel_escalation_window_blocks: 8\n  cancel_escalation_retry_blocks: 9",
+        "\n  cancel_escalation_max_fee_mojos: 10000000",
+        "\n  cancel_escalation_max_probes: 0",
+    };
+    for (const char* keys : unsafe) {
+        const std::string yaml = with_strategy_keys(keys);
+        ASSERT_NE(yaml, std::string(kMinimalValidYaml)) << "the strategy anchor moved";
+        TempYaml tmp(yaml.c_str());
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError) << keys;
+    }
 }

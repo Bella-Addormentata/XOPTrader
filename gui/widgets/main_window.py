@@ -1271,8 +1271,9 @@ class MainWindow(QMainWindow):
         """
         if self._order_book is None or not hasattr(self._order_book, "set_own_orders"):
             return
-        # Filter to pending offers only
-        own = [o for o in offers if o.get("status") == "pending"]
+        # Resting offers: pending, and [S14] cancel_pending -- a submitted
+        # cancel is still takeable until it confirms.
+        own = [o for o in offers if o.get("status") in ("pending", "cancel_pending")]
         self._order_book.set_own_orders(own)
 
     def _on_bridge_data_for_order_book(self, data: dict) -> None:
