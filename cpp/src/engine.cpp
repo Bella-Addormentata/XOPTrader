@@ -2219,9 +2219,11 @@ asio::awaitable<void> Engine::poll_loop_coro()
                 // resolve_wallet_id() answers 1 for "xch" and -1 for every
                 // CAT, and a `> 0` filter then dropped the CATs without a
                 // word: at 23:24:25.792 on 2026-09-12 the scan visited wallet
-                // 1 alone, and the map was not built until 23:24:27.548 (by
-                // the ensure_wallet_ids() before the inventory seed, which is
-                // a no-op once this call has succeeded).
+                // 1 alone, and the map was not built until 23:24:27.548, by
+                // the ensure_wallet_ids() before the inventory seed.  The map
+                // built here is released again after the scan (below).
+                const bool wallet_map_built_before_scan =
+                    offer_mgr_->wallet_ids_resolved();
                 co_await offer_mgr_->ensure_wallet_ids();
 
                 std::vector<std::int64_t> prune_candidates;
@@ -2254,6 +2256,19 @@ asio::awaitable<void> Engine::poll_loop_coro()
                         spdlog::info("[Engine] Startup: pruned stuck transactions "
                                      "from {} wallet(s)", pruned);
                     }
+                }
+                // [PRUNE-SCOPE] Release the map this scan built.  The
+                // process's map is then first built after the wallet sync
+                // wait below, as it was before the scan needed one.  Built
+                // here, ahead of that wait, it could miss CAT wallets that a
+                // resyncing wallet creates later, and invalidate_wallet_ids()
+                // runs again only when the wallet breaker closes, so those
+                // assets would resolve to -1 for the life of the process.  It
+                // would also hand the startup coin pool CAT wallet ids that
+                // pool has never had at startup.  Costs one get_wallets().
+                if (!wallet_map_built_before_scan
+                    && offer_mgr_->wallet_ids_resolved()) {
+                    offer_mgr_->invalidate_wallet_ids();
                 }
             }
         } catch (const std::exception& ex) {
@@ -10243,9 +10258,15 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         // [WALLET-CIRCUIT] C2, at every pair boundary.  co_return, NOT break:
         // a break falls through to the consecutive_pending_blocks_ reset below
         // the loop, so one transport failure before any pair reached Gate 1
-        // would restart the force-delete escalation.  The checkpoints inside
-        // the iteration (stuck-offer cancel, each balance query, post_quotes)
-        // return the same way.
+        // would restart the force-delete escalation.  Inside the iteration,
+        // every wallet call that can follow a failure has its own checkpoint
+        // that returns the same way: the stuck-offer cancel, each balance
+        // query, each force-delete, both exposure-floor cancels, the
+        // both-sides-suppressed cancel, the XCH fee-reserve query and
+        // post_quotes.  The refresh cancels just below follow this check
+        // directly, and the periodic prune follows an answered balance
+        // query.  A routine that is already running -- selective_cancel,
+        // cancel_stale, post_quotes -- still finishes its own loop.
         if (!wallet_step_may_run("Step 8 pair loop")) {
             co_return;
         }
@@ -10548,8 +10569,11 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                      gate_pc->quote_mojos_per_unit, false});
 
                 for (const auto& sb : sides) {
-                    // [WALLET-CIRCUIT] Per side: the other side's balance
-                    // query, or its periodic prune, may just have failed.
+                    // [WALLET-CIRCUIT] Per side: the previous side's periodic
+                    // prune or force-delete, or a cancel issued earlier in this
+                    // pair, may just have failed.  A failed balance query never
+                    // gets here: its catch breaks out of this loop, and the
+                    // checkpoints after the loop stop what follows it.
                     if (!wallet_step_may_run("Step 8 balance gate")) {
                         co_return;
                     }
@@ -10688,6 +10712,17 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                              consecutive_pending_blocks_,
                                              pending_wallets_this_block.size());
                                 for (auto pw : pending_wallets_this_block) {
+                                    // [WALLET-CIRCUIT] The periodic prune
+                                    // above, or the previous delete, may
+                                    // have failed at the transport level;
+                                    // both swallow it.  co_return, NOT
+                                    // break: the reset below must not run,
+                                    // so the escalation stays armed for the
+                                    // next heartbeat instead of restarting
+                                    // its kForceDeletePendingBlocks count.
+                                    if (!wallet_step_may_run("Step 8 force-delete")) {
+                                        co_return;
+                                    }
                                     try {
                                         co_await wallet_->
                                             delete_unconfirmed_transactions(pw);
@@ -10916,6 +10951,13 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                 }
                             }
                             if (!cancel_ids.empty()) {
+                                // [WALLET-CIRCUIT] Nothing between the sides
+                                // loop above and this cancel checks the gate,
+                                // and a failed balance query breaks out of
+                                // that loop.
+                                if (!wallet_step_may_run("Step 8 exposure-floor cancel (asks)")) {
+                                    co_return;
+                                }
                                 auto cancelled = co_await offer_mgr_->selective_cancel(cancel_ids);
                                 if (!cancelled.empty()) {
                                     pair_base_pending_spend = (pair_base_pending_spend > freed)
@@ -10966,6 +11008,11 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                 }
                             }
                             if (!cancel_ids.empty()) {
+                                // [WALLET-CIRCUIT] As for the asks; the ask
+                                // cancel above may also just have failed.
+                                if (!wallet_step_may_run("Step 8 exposure-floor cancel (bids)")) {
+                                    co_return;
+                                }
                                 auto cancelled = co_await offer_mgr_->selective_cancel(cancel_ids);
                                 if (!cancelled.empty()) {
                                     pair_quote_pending_spend = (pair_quote_pending_spend > freed)
@@ -11012,6 +11059,13 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                             stale_ids.push_back(tc.offer_id);
                     }
                     if (!stale_ids.empty()) {
+                        // [WALLET-CIRCUIT] A balance query that failed at the
+                        // transport level lands here: its catch suppresses both
+                        // sides.  Unchecked, every stale offer would then get a
+                        // secure cancel sent into the same stall.
+                        if (!wallet_step_may_run("Step 8 capital-free cancel")) {
+                            co_return;
+                        }
                         auto freed = co_await offer_mgr_->selective_cancel(stale_ids);
                         if (!freed.empty()) {
                             spdlog::info("[Engine] Step 8: {} both sides suppressed "
@@ -11077,6 +11131,11 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         // from capital starvation.  For XCH-base pairs, bid buys XCH;
         // for XCH-quote pairs, ask buys XCH.
         if (config_.strategy.fee_reserve_xch > 0.0) {
+            // [WALLET-CIRCUIT] A prune, force-delete or exposure-floor cancel
+            // above can fail without suppressing either side.
+            if (!wallet_step_may_run("Step 8 XCH fee reserve")) {
+                co_return;
+            }
             try {
                 auto xch_bal = co_await wallet_->get_wallet_balance(1);
                 Mojo xch_spendable = 0;
@@ -12588,6 +12647,11 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                             static_cast<std::int64_t>(wid)).second) {
                         continue;
                     }
+                    // [WALLET-CIRCUIT] Per wallet: the previous wallet's coin
+                    // query swallows its failure.
+                    if (!wallet_step_may_run("Step 8 on-chain coin scan")) {
+                        co_return;
+                    }
                     try {
                         auto coins = co_await wallet_->get_spendable_coins(wid);
                         for (const auto& cr : coins) {
@@ -12605,6 +12669,13 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     } catch (...) { /* best-effort puzzle hash collection */ }
                 }
 
+                // [WALLET-CIRCUIT] The last coin query above may just have
+                // failed.  Once running, the reconciler makes its own wallet
+                // calls in series (verify_pending_offer_coins, then
+                // reconcile_balances per wallet) and is not stopped mid-way.
+                if (!wallet_step_may_run("Step 8 on-chain reconciler")) {
+                    co_return;
+                }
                 auto [stale_ids, balance_discreps] =
                     co_await on_chain_reconciler_->run_full_reconciliation(
                         wallet_ids, block_height, our_puzzle_hashes);

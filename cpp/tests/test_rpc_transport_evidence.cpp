@@ -132,7 +132,6 @@ private:
 class SilentLoopbackPort {
 public:
     SilentLoopbackPort()
-        : acceptor_(ioc_)
     {
         const asio::ip::tcp::endpoint ep(asio::ip::address_v4::loopback(), 0);
         acceptor_.open(ep.protocol());
@@ -145,7 +144,7 @@ public:
 
 private:
     asio::io_context        ioc_{};
-    asio::ip::tcp::acceptor acceptor_;
+    asio::ip::tcp::acceptor acceptor_{ioc_};  // after ioc_: members init in declaration order
 };
 
 ChiaRPCConfig unreachable_wallet(const EmptyTlsFiles& files,
