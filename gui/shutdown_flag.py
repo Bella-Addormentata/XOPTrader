@@ -9,10 +9,12 @@ younger than 60 s"; it cancelled 1 of 12 offers and exited, and no engine ran
 for 35 minutes.
 
 A request now names its target. The engine honours it only if it names the
-engine's own PID and was written at or after that process started
-(``cpp/include/xop/util/shutdown_flag.hpp``). This module writes the request,
-reads it back, classifies how a stop really ended, and removes a request whose
-engine was terminated before it could honour it.
+engine's own PID and was written at or after that process started; content
+with no pid line at all (an operator's hand-written flag) needs only the second
+half (``cpp/include/xop/util/shutdown_flag.hpp``). This module writes the
+request, reads it back, classifies how a stop really ended, removes a request
+whose engine was terminated before it could honour it, and names the stop
+marker a closing GUI keeps while its stop is under way.
 
 FORMAT v1 (ASCII, LF line endings, replaced atomically)::
 
@@ -150,7 +152,7 @@ def _unlink_quietly(path: Path) -> None:
     try:
         path.unlink()
     except OSError:
-        pass
+        pass  # best effort: the engine never reads a leftover temp file
 
 
 def write_shutdown_request(
@@ -160,14 +162,15 @@ def write_shutdown_request(
     requester_pid: Optional[int] = None,
     now: Optional[datetime] = None,
 ) -> None:
-    """Write a v1 request for *target_pid*, atomically.
+    """Write a v1 request for *target_pid* to *flag_path*, atomically.
 
-    The bytes go to a temporary file beside the flag and are moved over it
+    The bytes go to a temporary file beside the target and are moved over it
     with ``os.replace``, so the engine never reads a half-written request.
     The engine's reader holds the flag without FILE_SHARE_DELETE, so a
     replace that lands during a read fails with PermissionError and is
     retried. Raises ValueError for an unaddressable PID and OSError when the
-    write cannot be completed.
+    write cannot be completed. The stop marker (:func:`stop_marker_path`) is
+    written the same way.
     """
     flag_path = Path(flag_path)
     content = render_shutdown_request(
@@ -176,7 +179,7 @@ def write_shutdown_request(
         written_at=(now or datetime.now()).isoformat(timespec="seconds"),
     )
     flag_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = flag_path.with_name(f"{FLAG_NAME}.{os.getpid()}.tmp")
+    tmp = flag_path.with_name(f"{flag_path.name}.{os.getpid()}.tmp")
     # Bytes, not text: Windows text mode would turn every LF into CRLF.
     tmp.write_bytes(content.encode("ascii"))
     for attempt in range(1, _REPLACE_ATTEMPTS + 1):
@@ -312,6 +315,24 @@ def cleanup_after_singleton_kill(
         )
     except Exception:  # noqa: BLE001 -- startup cleanup must never raise
         return None
+
+
+# ---------------------------------------------------------------------------
+# A stop under way
+# ---------------------------------------------------------------------------
+
+#: [review 2026-09-13] Kept beside shutdown.flag for the whole of a GUI's stop
+#: (``EngineBridge._stop_engine_process``). The engine consumes shutdown.flag
+#: within one poll and only THEN cancels its book, so the flag alone stops
+#: showing a relaunched GUI that a stop is under way; this marker shows it until
+#: the stop returns. Same v1 content: ``pid=`` names the engine being stopped,
+#: ``requested_by_pid=`` the GUI stopping it. The engine never reads it.
+STOP_MARKER_NAME = "gui_stop_in_progress.marker"
+
+
+def stop_marker_path(flag_path: Path) -> Path:
+    """The stop marker that lives beside *flag_path*."""
+    return Path(flag_path).with_name(STOP_MARKER_NAME)
 
 
 # ---------------------------------------------------------------------------

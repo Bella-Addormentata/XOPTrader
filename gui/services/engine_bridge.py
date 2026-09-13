@@ -1220,6 +1220,13 @@ class EngineBridge(QObject):
         engine never removed is deleted here once the engine is gone, so no
         later engine can inherit it.
 
+        [review] For the whole stop this GUI also keeps the stop marker beside
+        shutdown.flag, and removes it however the stop ends, exceptions
+        included. The engine consumes the flag within one poll and only then
+        cancels its book, so without the marker a GUI relaunched mid-cancel
+        (gui/main.py _await_stop_in_progress) would see no stop under way and
+        terminate the engine and this GUI at once.
+
         Returns the outcome, or None when no process was being managed. On
         STILL_RUNNING the process handle is kept: clearing it would let
         start_engine() launch a second engine beside the live one.
@@ -1232,55 +1239,20 @@ class EngineBridge(QObject):
         if proc.poll() is None:
             pid = proc.pid
             flag = self._db_path.parent / shutdown_flag.FLAG_NAME
-            forced = False
-            request_written = False
+            marker: Optional[Path] = shutdown_flag.stop_marker_path(flag)
             try:
-                shutdown_flag.write_shutdown_request(flag, pid)
-                request_written = True
-                _log.info(
-                    "Wrote shutdown.flag addressed to engine PID %d; waiting up "
-                    "to %d s for it to cancel its book and exit.",
-                    pid, _GRACEFUL_STOP_WAIT_S)
-                proc.wait(timeout=_GRACEFUL_STOP_WAIT_S)
-            except subprocess.TimeoutExpired:
-                forced = True
-                _log.warning(
-                    "Engine PID %d did not exit within %d s of shutdown.flag; "
-                    "terminating.", pid, _GRACEFUL_STOP_WAIT_S)
+                shutdown_flag.write_shutdown_request(marker, pid)
             except (OSError, ValueError) as exc:
-                forced = True
+                marker = None
                 _log.warning(
-                    "Could not write shutdown.flag (%s); terminating engine "
-                    "PID %d.", exc, pid)
-
-            if forced:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    _log.warning(
-                        "Engine PID %d did not exit within 10 s of terminate; "
-                        "killing it.", pid)
-                    proc.kill()
-                    try:
-                        proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        pass
-
-            outcome = shutdown_flag.classify_stop_outcome(
-                proc.returncode,
-                request_written=request_written,
-                flag_still_names_target=shutdown_flag.flag_names_pid(flag, pid),
-                forced=forced,
-            )
-            self._log_stop_outcome(outcome, pid, proc.returncode)
-
-            if (shutdown_flag.outcome_leaves_undelivered_flag(outcome)
-                    and shutdown_flag.remove_if_addressed_to(flag, pid)):
-                _log.warning(
-                    "Removed the undelivered shutdown.flag addressed to engine "
-                    "PID %d so no later engine can inherit it.", pid)
-
+                    "Could not write %s (%s); a GUI launched after the engine "
+                    "consumes shutdown.flag will not wait for this stop.",
+                    shutdown_flag.STOP_MARKER_NAME, exc)
+            try:
+                outcome = self._stop_running_engine(proc, pid, flag)
+            finally:
+                if marker is not None:
+                    shutdown_flag.remove_if_addressed_to(marker, pid)
             if outcome is shutdown_flag.StopOutcome.STILL_RUNNING:
                 return outcome
         else:
@@ -1292,6 +1264,69 @@ class EngineBridge(QObject):
             self._engine_log_fh = None
         self._engine_log_path = None
         self._engine_launch_dir = None
+        return outcome
+
+    def _stop_running_engine(
+        self,
+        proc: subprocess.Popen,
+        pid: int,
+        flag: Path,
+    ) -> shutdown_flag.StopOutcome:
+        """Request a graceful stop of *proc*, escalate if needed, and classify it.
+
+        Writes the addressed request, waits, terminates and kills as needed,
+        logs the one outcome line, and removes a request the engine never
+        consumed once it is gone. The caller owns the stop marker and the
+        process handle.
+        """
+        forced = False
+        request_written = False
+        try:
+            shutdown_flag.write_shutdown_request(flag, pid)
+            request_written = True
+            _log.info(
+                "Wrote shutdown.flag addressed to engine PID %d; waiting up "
+                "to %d s for it to cancel its book and exit.",
+                pid, _GRACEFUL_STOP_WAIT_S)
+            proc.wait(timeout=_GRACEFUL_STOP_WAIT_S)
+        except subprocess.TimeoutExpired:
+            forced = True
+            _log.warning(
+                "Engine PID %d did not exit within %d s of shutdown.flag; "
+                "terminating.", pid, _GRACEFUL_STOP_WAIT_S)
+        except (OSError, ValueError) as exc:
+            forced = True
+            _log.warning(
+                "Could not write shutdown.flag (%s); terminating engine "
+                "PID %d.", exc, pid)
+
+        if forced:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                _log.warning(
+                    "Engine PID %d did not exit within 10 s of terminate; "
+                    "killing it.", pid)
+                proc.kill()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass  # still running: classified STILL_RUNNING below
+
+        outcome = shutdown_flag.classify_stop_outcome(
+            proc.returncode,
+            request_written=request_written,
+            flag_still_names_target=shutdown_flag.flag_names_pid(flag, pid),
+            forced=forced,
+        )
+        self._log_stop_outcome(outcome, pid, proc.returncode)
+
+        if (shutdown_flag.outcome_leaves_undelivered_flag(outcome)
+                and shutdown_flag.remove_if_addressed_to(flag, pid)):
+            _log.warning(
+                "Removed the undelivered shutdown.flag addressed to engine "
+                "PID %d so no later engine can inherit it.", pid)
         return outcome
 
     @staticmethod

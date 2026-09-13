@@ -14,6 +14,7 @@ captures at WARNING unless told otherwise, so without caplog.set_level every
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 
 import pytest
@@ -245,3 +246,59 @@ def test_an_engine_that_already_exited_is_torn_down_without_a_request(tmp_path, 
     assert any("already exited (rc=3)" in m for m in _messages(caplog, logging.INFO))
     assert not _flag(tmp_path).exists()
     assert bridge._engine_process is None
+
+
+# --------------------------------------------------------------------------- #
+# The stop marker a relaunched GUI waits on
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("ending", ["graceful", "terminated", "still-running"])
+def test_the_stop_marker_lasts_exactly_as_long_as_the_stop(tmp_path, ending):
+    """[review] The engine removes shutdown.flag as soon as it consumes it --
+    before it cancels its book -- so the marker is what shows a relaunched GUI
+    that this stop is still under way. It must be in place whenever the engine
+    is waited for, and gone once the stop is over, however it ended."""
+    marker = shutdown_flag.stop_marker_path(_flag(tmp_path))
+    seen = []
+
+    def script(proc, timeout):
+        seen.append(shutdown_flag.read_shutdown_request(marker))
+        if ending == "graceful":
+            _flag(tmp_path).unlink()  # consumed ...
+            proc.returncode = 0  # ... the book cancelled, the engine gone
+        elif ending == "terminated" and timeout == 10:
+            proc.returncode = 1
+        else:
+            raise subprocess.TimeoutExpired("xop_trader.exe", timeout)
+
+    proc = ScriptedEngine(ENGINE_PID, script)
+    _bridge(tmp_path, proc)._stop_engine_process()
+
+    assert len(seen) == {"graceful": 1, "terminated": 2, "still-running": 3}[ending]
+    for request in seen:
+        assert request is not None, "the marker is in place whenever the engine is waited for"
+        assert (request.kind, request.pid, request.requester_pid) == (
+            shutdown_flag.RequestKind.ADDRESSED, ENGINE_PID, os.getpid())
+    assert not marker.exists(), "the stop is over, whatever its outcome"
+
+
+def test_a_stop_that_raises_still_removes_its_marker(tmp_path):
+    """A marker naming a running engine and a running GUI would make every
+    later relaunch sit out its bounded wait for a stop nobody is performing."""
+    marker = shutdown_flag.stop_marker_path(_flag(tmp_path))
+    seen = []
+
+    class RefusesTerminate(ScriptedEngine):
+        def terminate(self):
+            raise PermissionError(5, "Access is denied")
+
+    def times_out(proc, timeout):
+        seen.append(marker.exists())
+        raise subprocess.TimeoutExpired("xop_trader.exe", timeout)
+
+    proc = RefusesTerminate(ENGINE_PID, times_out)
+    with pytest.raises(PermissionError):
+        _bridge(tmp_path, proc)._stop_engine_process()
+
+    assert seen == [True], "the marker was in place while the engine was waited for"
+    assert not marker.exists()

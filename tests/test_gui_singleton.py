@@ -4,9 +4,11 @@ lets a stop that is already under way finish, and cleans up after itself.
 At 23:24:21 a relaunched installed GUI logged "No old GUI or engine instances
 found" while the 22:41 GUI was still running: the kill list knew only
 xoptrader-gui.exe and xoptrader_gui.exe, never xop_trader_gui.exe. Fixing only
-the name would terminate a GUI that is inside its blocking stop, so a request
-already addressed to a running engine is waited for (bounded, 45 s) first, and
-a request whose engine is terminated anyway is removed afterwards.
+the name would terminate a GUI that is inside its blocking stop, so a stop
+already under way -- shutdown.flag, or the closing GUI's stop marker once the
+engine has consumed the flag, naming a running engine -- is waited for
+(bounded, 45 s) first, and a request whose engine is terminated anyway is
+removed afterwards.
 
 os.kill, subprocess.run, time.sleep and the process-exit wait are patched
 before every call that could reach them: on Windows os.kill IS
@@ -223,6 +225,43 @@ def test_no_wait_for_an_unaddressed_request(windows, tmp_path):
     assert windows.waits == [], "an unaddressed request names no engine to wait for"
     assert ENGINE in windows.killed_pids()
     assert not flag.exists()
+
+
+def test_relaunch_waits_for_a_stop_whose_flag_the_engine_already_consumed(
+        windows, tmp_path, caplog):
+    """[review] A healthy engine consumes shutdown.flag within one 5 s poll and
+    only then cancels its book, while the closing GUI waits on it. A relaunch
+    in that window finds no flag; the closing GUI's stop marker is what shows
+    the stop is still under way."""
+    flag = tmp_path / "data" / "shutdown.flag"
+    _request(shutdown_flag.stop_marker_path(flag), ENGINE, requester=CHILD)
+    windows.exits_during_wait = {
+        ENGINE: [ENGINE],  # the engine finishes its shutdown cancel and exits
+        CHILD: [CHILD, BOOTLOADER],  # then the closing GUI finishes its stop
+    }
+    assert not flag.exists(), "the engine has already consumed its request"
+
+    gui_main._kill_old_instances_win32(OWN_PIDS, flag)
+
+    assert [pid for pid, _timeout in windows.waits] == [ENGINE, CHILD]
+    assert windows.waits[0][1] == 45.0
+    assert windows.killed_pids() == set(), "a stop in mid-cancel is not cut off"
+    assert any(
+        shutdown_flag.STOP_MARKER_NAME in m and "engine PID 5001" in m
+        for m in _messages(caplog, logging.WARNING)
+    )
+
+
+def test_a_stop_marker_whose_gui_has_gone_does_not_delay_startup(windows, tmp_path):
+    """A GUI killed mid-stop never removes its marker. Once that GUI is gone
+    nobody is stopping the engine, so the relaunch must not wait on it."""
+    flag = tmp_path / "data" / "shutdown.flag"
+    _request(shutdown_flag.stop_marker_path(flag), ENGINE, requester=7777)
+
+    gui_main._kill_old_instances_win32(OWN_PIDS, flag)
+
+    assert windows.waits == []
+    assert windows.killed_pids() == {BOOTLOADER, CHILD, ENGINE}
 
 
 # --------------------------------------------------------------------------- #

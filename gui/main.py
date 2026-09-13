@@ -66,11 +66,11 @@ _BUNDLED_GUI_MARKERS_POSIX: Final[tuple[str, ...]] = (
 _ENGINE_MARKER_POSIX: Final[str] = "xop_trader"
 
 #: [shutdown-flag-race, operator decision 2026-09-13] How long a relaunched
-#: GUI waits for a stop that is already under way -- a running engine that a
-#: shutdown.flag names -- before terminating anything. 45 s is the closing
-#: GUI's own worst case (30 s graceful wait, 10 s after terminate, 5 s after
-#: kill) counted from ITS write, so waiting this long from our start covers
-#: it whenever it began.
+#: GUI waits for a stop that is already under way -- a running engine that
+#: shutdown.flag, or a closing GUI's stop marker, names -- before terminating
+#: anything. 45 s is the closing GUI's own worst case (30 s graceful wait, 10 s
+#: after terminate, 5 s after kill) counted from ITS write, so waiting this
+#: long from our start covers it whenever it began.
 _STOP_IN_PROGRESS_WAIT_S: Final[float] = 45.0
 _EXIT_POLL_S: Final[float] = 0.25
 
@@ -228,33 +228,68 @@ def _await_stop_in_progress(
     engine_pids: Callable[[], Iterable[int]],
     gui_pids: Callable[[], Iterable[int]],
 ) -> None:
-    """[operator decision 2026-09-13] Let a stop that is under way finish.
+    """[operator decision 2026-09-13] Let a stop that is under way finish, bounded.
 
-    A closing GUI writes shutdown.flag addressed to its engine and then blocks
-    for up to 45 s waiting for it -- after its window has gone, which is
-    exactly when an operator relaunches. Terminating that engine cancels
-    nothing (22:41:14 on 2026-09-12), and terminating that GUI cuts off its
-    own outcome line and cleanup. So when the flag names a running engine,
-    wait -- bounded -- for that engine, then for the GUI that asked, before
-    anything is terminated. Whatever is still running afterwards is
-    terminated as before.
+    A closing GUI stops its engine from ``aboutToQuit`` -- after its window
+    has gone, which is exactly when an operator relaunches -- and blocks for up
+    to 45 s doing it. Terminating that engine cuts off its shutdown cancel, and
+    terminating that GUI cuts off its own outcome line and cleanup. So wait --
+    bounded -- for that engine, then for the GUI that asked, before anything is
+    terminated. Whatever is still running afterwards is terminated as before.
+
+    Two files show a stop under way:
+
+    * ``shutdown.flag`` naming a running engine. On its own it misses most of
+      a stop: a healthy engine consumes the flag within one 5 s poll and only
+      THEN cancels its book.
+    * the stop marker (``shutdown_flag.STOP_MARKER_NAME``) naming a running
+      engine, which the closing GUI keeps for its whole stop. It counts only
+      while the GUI that wrote it is still running, because a GUI killed
+      mid-stop never removes it.
+
+    A relaunch in the moment after the closing GUI removed its marker, before
+    that GUI exits, finds no stop and terminates that GUI as before; its engine
+    has already exited by then.
     """
     if flag_path is None:
         return
-    request = shutdown_flag.read_shutdown_request(flag_path)
-    if request is None or request.kind is not shutdown_flag.RequestKind.ADDRESSED:
+    addressed = shutdown_flag.RequestKind.ADDRESSED
+    flag_request = shutdown_flag.read_shutdown_request(flag_path)
+    if flag_request is None or flag_request.kind is not addressed:
+        flag_request = None
+    marker_request = shutdown_flag.read_shutdown_request(
+        shutdown_flag.stop_marker_path(flag_path))
+    if marker_request is None or marker_request.kind is not addressed:
+        marker_request = None
+    if flag_request is None and marker_request is None:
         return
+
+    running_engines = set(engine_pids())
+    running_guis: set[int] = set()
+    if flag_request is not None and flag_request.pid in running_engines:
+        request, named_by = flag_request, shutdown_flag.FLAG_NAME
+        if request.requester_pid is not None:
+            running_guis = set(gui_pids())
+    elif marker_request is not None and marker_request.pid in running_engines:
+        running_guis = set(gui_pids())
+        if marker_request.requester_pid not in running_guis:
+            # The GUI that wrote this marker is gone -- killed mid-stop, so it
+            # never removed it -- and nobody is stopping that engine any more.
+            return
+        request, named_by = marker_request, shutdown_flag.STOP_MARKER_NAME
+    else:
+        return
+
     target = request.pid
-    if target not in set(engine_pids()):
-        return
     requester = request.requester_pid
-    if requester is not None and requester not in set(gui_pids()):
+    if requester is not None and requester not in running_guis:
         requester = None
 
     _log.warning(
-        "[Startup] shutdown.flag asks engine PID %d to stop and that engine is "
-        "still running -- a previous GUI%s is closing it; waiting up to %.0f s "
-        "before terminating old instances",
+        "[Startup] %s names engine PID %d, which is still running -- a previous "
+        "GUI%s is stopping it; waiting up to %.0f s before terminating old "
+        "instances",
+        named_by,
         target,
         f" (PID {requester})" if requester is not None else "",
         _STOP_IN_PROGRESS_WAIT_S,
