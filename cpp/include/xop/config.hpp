@@ -1398,6 +1398,15 @@ struct StrategyConfig {
     int      comp_pid_max_offset{+3};
 };
 
+/// [STEP6-CAUSE 2026-09-13] The q_max a pair's AvellanedaStoikov is built
+/// with: the pair's q_max_override when set, else strategy.q_max.  The one
+/// copy of that resolution: the Engine constructor builds the strategies
+/// with it, and Step 4 stores it so Step 6 can print it next to q.  Step 5
+/// (step_apply_spread_optimizer) still reads the global strategy.q_max on
+/// purpose -- switching it would change quoting (TODO S50).
+[[nodiscard]] double effective_q_max(const PairConfig& pair_cfg,
+                                     const StrategyConfig& strategy_cfg) noexcept;
+
 // ---------------------------------------------------------------------------
 // Risk / inventory management thresholds.
 //

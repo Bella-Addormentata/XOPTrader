@@ -1158,6 +1158,19 @@ TEST(ApplyDeployIdleFloor, RespectsArmingWalletAndExistingPool) {
     EXPECT_EQ(xop::apply_deploy_idle_floor(0, 0, true, 1.0, true), 0);
 }
 
+TEST(EffectiveQMax, PairOverrideWinsElseStrategyDefault) {
+    // [STEP6-CAUSE 2026-09-13] The one copy of the q_max resolution: the
+    // Engine constructor builds each AvellanedaStoikov with it, and Step 4
+    // stores it for Step 6's no-quote line.
+    xop::PairConfig pair_cfg{};
+    xop::StrategyConfig strategy_cfg{};
+    strategy_cfg.q_max = 20.0;
+    EXPECT_DOUBLE_EQ(xop::effective_q_max(pair_cfg, strategy_cfg), 20.0);
+
+    pair_cfg.q_max_override = 6.0;
+    EXPECT_DOUBLE_EQ(xop::effective_q_max(pair_cfg, strategy_cfg), 6.0);
+}
+
 
 TEST(ConfigParserTest, ReviveMarketWindowNarrowerThanPolling_Throws) {
     // A 300s poll with the default 120s freshness window means no fetch

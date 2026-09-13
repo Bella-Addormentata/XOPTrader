@@ -142,7 +142,8 @@ struct AssetRecord {
 // Usage (typical per-block loop):
 //   1. Call record_buy / record_sell when fills are confirmed on-chain.
 //   2. Call get_risk_status before posting new quotes.
-//   3. Call compute_kelly_size to determine position size.
+//   3. compute_kelly_size is available but has NO production caller: the
+//      engine's Step 6 does no Kelly sizing.
 //   4. Call allocate_capital / free_capital when offers are created / cancelled.
 // ---------------------------------------------------------------------------
 

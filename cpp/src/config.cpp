@@ -4300,4 +4300,12 @@ AppConfig load_config(const std::string& path,
     return cfg;
 }
 
+// [STEP6-CAUSE 2026-09-13] See config.hpp.  Deliberately at xop namespace
+// scope, after the anonymous namespace has closed.
+double effective_q_max(const PairConfig& pair_cfg,
+                       const StrategyConfig& strategy_cfg) noexcept
+{
+    return pair_cfg.q_max_override.value_or(strategy_cfg.q_max);
+}
+
 } // namespace xop
