@@ -25,6 +25,7 @@
 #include <xop/execution/cancel_retry.hpp>
 #include <xop/execution/cross_guard.hpp>
 #include <xop/execution/stuck_tx_verdict.hpp>
+#include <xop/execution/wallet_circuit.hpp>
 #include <xop/execution/wallet_poll_throttle.hpp>
 #include <xop/risk/watchdog.hpp>
 
@@ -913,6 +914,13 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
     std::vector<std::string> polled_ids;
     std::size_t              skipped_age = 0, skipped_backoff = 0;
     trade_records.reserve(pending_map.size());
+    // [WALLET-CIRCUIT 2026-09-13] After one get_offer fails at the transport
+    // level, every later one in this loop is another ~15.5 s of doomed
+    // retries -- block 9284260 issued six in a row.  The mark is LOCAL to this
+    // call, so the first due poll is always issued; a poll skipped here is
+    // exactly a throttled one -- delayed detection, never a lost fill.
+    const rpc::TransportCounters poll_start = wallet_->transport_counters();
+    std::size_t skipped_transport = 0;
     for (const auto& [trade_id, po] : pending_map) {
         const std::int64_t age_blocks =
             (current_block > 0 && po.created_at_block > 0
@@ -954,6 +962,12 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
             continue;
         }
 
+        if (unanswered_transport_failure_since(
+                poll_start, wallet_->transport_counters())) {
+            ++skipped_transport;
+            continue;
+        }
+
         try {
             trade_records.push_back(
                 co_await wallet_->get_offer(trade_id,
@@ -965,6 +979,12 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
         }
     }
 
+    if (skipped_transport > 0) {
+        logger_->warn("detect_fills: wallet transport failed -- {} due "
+                      "poll(s) deferred to the next heartbeat (delayed "
+                      "detection, never a lost fill)",
+                      skipped_transport);
+    }
     if (skipped_age + skipped_backoff > 0) {
         logger_->debug("detect_fills: polled {}/{} tracked offers "
                        "(skipped {} too-young, {} backed-off)",

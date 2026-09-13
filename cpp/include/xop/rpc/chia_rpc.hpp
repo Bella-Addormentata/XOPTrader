@@ -48,6 +48,8 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include "xop/rpc/transport_evidence.hpp"
+
 namespace xop::rpc {
 
 // ---------------------------------------------------------------------------
@@ -218,6 +220,24 @@ public:
      */
     [[nodiscard]] bool is_open() const noexcept;
 
+    /**
+     * @brief How this client's calls have ended so far
+     *        (rpc/transport_evidence.hpp).
+     *
+     * [WALLET-CIRCUIT 2026-09-13] Read by the engine's wallet gate and by
+     * OfferManager::detect_fills.  rpc_post updates it once per call, after
+     * its co_await on the CURL pool has resumed on the CALLING coroutine's
+     * executor -- for the engine that is its io_context, run on one thread (a
+     * single ioc_.run() in Engine::run()), so the reads and writes never race.
+     * The dead man's switch polls from its own thread through its OWN client
+     * and io_context, and never touches these counters.  A client driven
+     * from several threads at once would need this synchronised.
+     */
+    [[nodiscard]] TransportCounters transport_counters() const noexcept
+    {
+        return transport_;
+    }
+
 protected:
     /**
      * @brief Construct with an io_context reference and endpoint config.
@@ -334,6 +354,19 @@ private:
 
     /// True after successful open(), false after close().
     bool open_{false};
+
+    /// [WALLET-CIRCUIT 2026-09-13] How this client's calls ended; see
+    /// transport_counters().  Declared after open_ so the move constructor
+    /// initialises it last, in declaration order (-Wreorder).
+    TransportCounters transport_{};
+
+    /// Fold one call ending into transport_.  rpc_post calls this exactly
+    /// once per call that got past its is_open() check, immediately before
+    /// it throws or returns.
+    void note_call_end(RpcCallEnd end) noexcept
+    {
+        transport_ = observe_call_end(transport_, end);
+    }
 };
 
 // ---------------------------------------------------------------------------
