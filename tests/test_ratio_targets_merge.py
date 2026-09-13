@@ -142,10 +142,10 @@ def test_conflicts_name_only_edits_that_replace_a_value_changed_on_disk():
     ]
 
     assert describe_ratio_target_conflicts(on_disk, rows) == [
-        "A/B: edited to 0.6, replacing 0.55, which changed on disk after "
-        "this page loaded 0.5",
-        "K/L: edited to (removed), replacing 0.25, which changed on disk "
-        "after this page loaded 0.2",
+        ("A/B: edited to 0.6, replacing 0.55, which changed on disk after "
+         "this page loaded 0.5"),
+        ("K/L: edited to (removed), replacing 0.25, which changed on disk "
+         "after this page loaded 0.2"),
     ]
 
 

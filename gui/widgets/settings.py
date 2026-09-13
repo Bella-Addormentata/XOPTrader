@@ -3582,13 +3582,20 @@ class SettingsWidget(QWidget):
 
         [RATIO-SOT] Operator decision: a Save never deletes them (no silent
         deletion), so the log names them instead -- once per (pair, value),
-        not on every load of the same file.
+        not on every load of the same file.  A later load names only the
+        entries no earlier warning has named.
         """
         mirrors = legacy_ratio_mirrors(pairs)
-        found = frozenset((name, repr(value)) for name, value in mirrors)
-        if not found or found <= self._warned_legacy_ratio_mirrors:
+        unseen = [
+            (name, value)
+            for name, value in mirrors
+            if (name, repr(value)) not in self._warned_legacy_ratio_mirrors
+        ]
+        if not unseen:
             return
-        self._warned_legacy_ratio_mirrors |= found
+        self._warned_legacy_ratio_mirrors |= frozenset(
+            (name, repr(value)) for name, value in unseen
+        )
         log.warning(
             "Settings: %s carries retired pairs[].ratio_target_override keys. "
             "Nothing reads them -- the engine never did; its per-pair target "
@@ -3596,7 +3603,7 @@ class SettingsWidget(QWidget):
             "shows -- and a Save leaves these lines untouched. You may delete "
             "them: %s",
             path,
-            ", ".join(f"{name}={value!r}" for name, value in mirrors),
+            ", ".join(f"{name}={value!r}" for name, value in unseen),
         )
 
     # ===================================================================

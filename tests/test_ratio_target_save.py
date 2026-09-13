@@ -451,10 +451,10 @@ def test_save_logs_every_ratio_target_change(panel, live_cfg, caplog):
         and "strategy.ratio_target_by_pair" in record.getMessage()
     ]
     assert changes == [
-        "Settings save: strategy.ratio_target_by_pair XCH/DBX: "
-        "0.5263157894736842 -> 0.6",
-        "Settings save: strategy.ratio_target_by_pair XCH/BYC: "
-        "0.9090909090909091 -> (removed)",
+        ("Settings save: strategy.ratio_target_by_pair XCH/DBX: "
+         "0.5263157894736842 -> 0.6"),
+        ("Settings save: strategy.ratio_target_by_pair XCH/BYC: "
+         "0.9090909090909091 -> (removed)"),
     ]
 
 
@@ -475,6 +475,34 @@ def test_load_warns_once_about_the_retired_mirrors(panel, live_cfg, caplog):
     for fragment in (f"{USDC}=0.6429", f"{BYC}=0.75", f"{DBX}=0.75",
                      "untouched", "delete"):
         assert fragment in warnings[0], fragment
+
+
+def test_a_later_load_names_only_mirrors_not_named_before(
+    panel, live_cfg, caplog
+):
+    """Once per (pair, value): after a hand edit of one retired key, the next
+    load names that entry alone, not every key an earlier warning named."""
+    with caplog.at_level(logging.WARNING, logger=SETTINGS_LOGGER):
+        panel.load_config(str(live_cfg))
+        # A hand edit of one retired key between the two loads.
+        raw = _written(live_cfg)
+        for pair in raw["pairs"]:
+            if pair["name"] == DBX:
+                pair["ratio_target_override"] = 0.8
+        live_cfg.write_text(
+            yaml.safe_dump(raw, sort_keys=False), encoding="utf-8"
+        )
+        panel.load_config(str(live_cfg))
+
+    warnings = [
+        record.getMessage() for record in caplog.records
+        if "ratio_target_override" in record.getMessage()
+    ]
+    assert len(warnings) == 2, warnings
+    assert f"{DBX}=0.8" in warnings[1], warnings[1]
+    for named_before in (f"{USDC}=0.6429", f"{BYC}=0.75"):
+        assert named_before in warnings[0], named_before
+        assert named_before not in warnings[1], named_before
 
 
 if __name__ == "__main__":  # pragma: no cover
