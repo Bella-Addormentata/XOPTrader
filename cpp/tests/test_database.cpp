@@ -1220,6 +1220,39 @@ TEST(DatabaseTest, EscalationCountSurvivesARestart)
     EXPECT_EQ(reopened.count_cancel_escalations("offer-never-logged"), 0u);
 }
 
+// [review, round 2] The fee floor survives a restart.  last_fee_mojos lived
+// only in memory, so after a restart escalation N+1 bid exactly what
+// escalation N had paid -- below MEMPOOL_MIN_FEE_INCREASE, refused as a
+// replacement while N's spend was still in the mempool, and still counted.
+TEST(DatabaseTest, EscalationFeeSurvivesARestart)
+{
+    TempDbPath temp_db{"xop_s14_escalation_fee"};
+
+    {
+        xop::Database db(temp_db.path().string());
+        db.insert_offer(make_offer("offer-escalated"));
+        // An initial cancel that carries a fee is not an escalation.
+        db.mark_offer_cancel_submitted("offer-escalated", 9224185,
+                                       "price_adverse(2.021%)", 60'000'000ULL);
+        // Out of order on purpose (a cap lowered across a restart): the floor
+        // is the HIGHEST fee an escalation recorded, not the latest one.
+        db.mark_offer_cancel_submitted("offer-escalated", 9224281,
+                                       "cancel_escalation_1", 40'000'000ULL);
+        db.mark_offer_cancel_submitted("offer-escalated", 9224377,
+                                       "cancel_escalation_2", 30'000'000ULL);
+        db.insert_offer(make_offer("offer-unescalated"));
+        db.mark_offer_cancel_submitted("offer-unescalated", 9224185, "stuck",
+                                       70'000'000ULL);
+    }
+
+    xop::Database reopened(temp_db.path().string());
+    EXPECT_EQ(reopened.max_cancel_escalation_fee("offer-escalated"), 40'000'000ULL);
+    EXPECT_EQ(reopened.count_cancel_escalations("offer-escalated"), 2u);
+    EXPECT_EQ(reopened.max_cancel_escalation_fee("offer-unescalated"), 0ULL)
+        << "only cancel_escalation_N events set the floor";
+    EXPECT_EQ(reopened.max_cancel_escalation_fee("offer-never-logged"), 0ULL);
+}
+
 // A row persisted straight into cancel_pending -- a boot orphan whose cancel
 // was accepted, an offer post_quotes already retracted -- takes its cause
 // from the first mark, and later marks still keep it.

@@ -39,7 +39,6 @@
 #include <cstdint>
 #include <mutex>
 #include <optional>
-#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -411,11 +410,15 @@ public:
     /// @param new_status     New status string ("filled", "cancelled", "expired").
     /// @param resolved_block Block height at which the status changed.
     /// @param cancel_reason  Human-readable reason for cancellation (empty for fills).
+    /// @param fee_mojos      [S14] The fee the recorded submission carries, stored
+    ///                       on its closure event (NULL there when absent).  Only
+    ///                       the cancel escalation passes one.
     /// @throws std::runtime_error if no row matches offer_id.
-    void update_offer_status(const std::string& offer_id,
-                             const std::string& new_status,
-                             BlockHeight        resolved_block,
-                             const std::string& cancel_reason = "");
+    void update_offer_status(const std::string&           offer_id,
+                             const std::string&           new_status,
+                             BlockHeight                  resolved_block,
+                             const std::string&           cancel_reason = "",
+                             std::optional<std::uint64_t> fee_mojos = std::nullopt);
 
     /// Return every offer_log row the engine must still manage: status
     /// 'pending' or 'cancel_pending'.  Used on startup to restore offers that
@@ -439,11 +442,17 @@ public:
     /// cancel RPC used to stamp 'cancelled', and three XCH/BYC bids rested
     /// takeable for thirteen days under that label.
     ///
+    /// `fee_mojos`, when given, is stored on the closure event.  The cancel
+    /// escalation passes the fee it is ABOUT to pay and writes this record
+    /// before paying it, so max_cancel_escalation_fee can restore the fee
+    /// floor after a restart.  Initial cancels pass none.
+    ///
     /// @throws OfferNotFound      no row for offer_id.
     /// @throws std::runtime_error on a database fault.
-    void mark_offer_cancel_submitted(const std::string& offer_id,
-                                     BlockHeight        submit_block,
-                                     const std::string& reason);
+    void mark_offer_cancel_submitted(const std::string&           offer_id,
+                                     BlockHeight                  submit_block,
+                                     const std::string&           reason,
+                                     std::optional<std::uint64_t> fee_mojos = std::nullopt);
 
     /// [S14] The offer_log status of one offer, or nullopt when no row
     /// exists.  A database fault throws std::runtime_error; it is never
@@ -469,6 +478,14 @@ public:
     /// @throws std::runtime_error on a database fault.
     [[nodiscard]]
     std::uint32_t count_cancel_escalations(const std::string& offer_id) const;
+
+    /// [S14] The highest fee recorded on those cancel_escalation_ events, or 0
+    /// when none carries one.  Seeds the escalation fee floor at first
+    /// sighting: without it, escalation N+1 after a restart bid exactly what
+    /// escalation N had paid, which the mempool refuses as a replacement.
+    /// @throws std::runtime_error on a database fault.
+    [[nodiscard]]
+    std::uint64_t max_cancel_escalation_fee(const std::string& offer_id) const;
 
     // -- Snapshots -----------------------------------------------------------
 
@@ -668,6 +685,9 @@ private:
 
     /// Bind a double value to a prepared statement parameter.
     static void bind_double(sqlite3_stmt* stmt, int index, double val);
+
+    /// Bind SQL NULL to a prepared statement parameter.
+    static void bind_null(sqlite3_stmt* stmt, int index);
 
     /// Execute a prepared statement that does not return rows (INSERT/UPDATE).
     /// Resets the statement after execution so it can be reused.

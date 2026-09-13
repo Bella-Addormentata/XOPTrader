@@ -20,7 +20,8 @@
 //     classify_coin_records).  It FAILS CLOSED: no proof means no fee, and
 //     nothing here ever authorises a terminal stamp -- a spent maker coin can
 //     be a FILL, so the wallet stays the only source of a terminal verdict;
-//   * how much a re-cancel pays (escalation_fee_mojos);
+//   * how much a re-cancel pays (escalation_fee_mojos), and when a sweep
+//     suspended in an RPC must stop before it pays (escalation_must_yield);
 //   * when the operator hears about it, in a way a rate limit cannot swallow
 //     (unresolved_alert_due, UnresolvedAlertQueue);
 //   * what boot does with a wallet PENDING_CANCEL record (startup_scan_bucket,
@@ -160,11 +161,17 @@ struct CancelEscalationTrack {
     /// Block the offer was first seen cancel_pending, or of its last
     /// escalation.  0 = not seen yet.
     std::uint64_t anchor_block{0};
-    /// Fee-bearing re-cancels submitted (seeded from the DB at first sight).
+    /// Fee-bearing re-cancels this offer has used.  Seeded at first sight
+    /// from its recorded cancel_escalation_N events -- each written BEFORE its
+    /// fee is paid, so a submission that then failed counts too -- and raised
+    /// by each submission this process completes.
     std::uint32_t escalations{0};
     /// No probe before this block.
     std::uint64_t retry_after_block{0};
-    /// Fee paid by the last escalation this process submitted.
+    /// Highest fee an escalation of this offer has bid.  Seeded at first
+    /// sight from the fees recorded on those events
+    /// (Database::max_cancel_escalation_fee), then raised by each escalation
+    /// this process pays.
     std::uint64_t last_fee_mojos{0};
     /// Consecutive probes that found nothing to do (drives the back-off).
     std::uint32_t idle_probes{0};
@@ -607,6 +614,39 @@ template <class NameOf>
 // (b) The escalation decision.
 // ---------------------------------------------------------------------------
 
+/// [review, round 2] The gates another thread, or a co_spawned coroutine, can
+/// close while the sweep is suspended in a wallet or node RPC.  The engine
+/// reads all three at its entry gate, before each candidate, and again
+/// immediately before each fee-bearing call:
+///   * graceful_cancel_active -- shutdown() is walking the book;
+///   * cancel_all_inflight    -- a co_spawned operator Cancel All is;
+///   * watchdog_fired         -- the dead man's switch fired.  It latches the
+///     flag on ITS OWN thread, then sends a wallet-wide zero-fee cancel.  An
+///     escalated bundle conflicts with that bundle on the offer coin and
+///     neither is a superset of the other, so if the escalation reaches the
+///     mempool first, the watchdog's whole batch is refused.
+/// wallet_circuit_open_ and xch_recovery_mode_ are written only inside the
+/// cycle, so they cannot change while the sweep is suspended.
+///
+/// RESIDUAL RACE: a watchdog that fires after the last read -- while the
+/// escalation's record is written or its re-cancel is in flight -- is not
+/// stopped by any flag.  Closing that needs a claim both threads take.
+struct EscalationAsyncGates {
+    bool graceful_cancel_active{false};
+    bool cancel_all_inflight{false};
+    bool watchdog_fired{false};
+};
+
+/// Whether the sweep must stop before its next probe or fee: any
+/// asynchronous gate is closed.
+[[nodiscard]] constexpr bool escalation_must_yield(
+    const EscalationAsyncGates& gates) noexcept
+{
+    return gates.graceful_cancel_active
+        || gates.cancel_all_inflight
+        || gates.watchdog_fired;
+}
+
 /// Whether a tracked offer may be probed (wallet + node) this block: seen
 /// before, at least retry_blocks since the anchor, and past its back-off.
 [[nodiscard]] constexpr bool escalation_probe_due(
@@ -699,10 +739,28 @@ template <class NameOf>
 /// and the adaptive tracker can lower the base between attempts -- each of
 /// which put the increment below MEMPOOL_MIN_FEE_INCREASE, and the wallet
 /// RPC still reports success, so a refused replacement was counted toward
-/// the cap.  The floor is therefore the highest fee any earlier cancel of
-/// this offer could have paid:
+/// the cap.  The floor therefore takes the last escalation fee and a ceiling
+/// on the cancel being replaced:
 ///
 ///   fee = min(cap, max(base, last escalation fee, prior-cancel ceiling) + step)
+///
+/// [review, round 2] What those two inputs actually bound.  The floor is NOT
+/// the highest fee every earlier cancel of this offer could have paid:
+///   * last escalation fee -- the highest fee an escalation of this offer has
+///     bid.  It PERSISTS: each escalation records its fee before paying it,
+///     and first sighting seeds it back, so after a restart escalation N+1
+///     no longer bids exactly what escalation N paid.
+///   * prior-cancel ceiling -- twice the dynamic fee AT PROBE TIME, not the
+///     fee the original cancel paid.  Initial cancel fees are NOT persisted,
+///     and the adaptive fee can move by orders of magnitude between that
+///     cancel and this probe (the tracker clamps it only to
+///     fees.min_fee_mojos .. fees.max_fee_mojos and the fee budget).
+///   * STRUCTURAL LIMIT -- emergency_cancel's top tier pays up to twice the
+///     dynamic fee, so up to 2 x fees.max_fee_mojos, while one escalation is
+///     capped at params.max_fee_mojos (strategy.cancel_escalation_max_fee_mojos).
+///     A conflicting cancel that paid more than cap - step (90,000,000 mojos
+///     with the defaults) cannot be outbid by any escalation, whatever is
+///     persisted.
 ///
 /// HONEST LIMIT: a valid replacement also needs a SUPERSET of the conflicting
 /// spend's coins, and a CAT-leg cancel re-selects its XCH fee coin

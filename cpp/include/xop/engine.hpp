@@ -1230,9 +1230,10 @@ private:
     /// Send the queued CancelUnresolved alert when its window is open, and
     /// mark exactly the offers it names as alerted.
     void flush_cancel_unresolved_alerts();
-    /// Per-offer escalation state.  In memory; the escalation COUNT is
-    /// re-seeded from offer_closure_events at first sighting, so a restart
-    /// does not grant a fresh ladder.
+    /// Per-offer escalation state.  In memory; the escalation COUNT and the
+    /// highest escalation FEE are re-seeded from offer_closure_events at first
+    /// sighting, so a restart grants neither a fresh ladder nor a bid that
+    /// only repeats the last one.
     std::unordered_map<std::string, execution::CancelEscalationTrack>
         cancel_escalation_tracks_;
     /// Offers waiting to be named in a CancelUnresolved alert.

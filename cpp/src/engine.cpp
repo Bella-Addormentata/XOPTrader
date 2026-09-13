@@ -19735,8 +19735,9 @@ asio::awaitable<void> Engine::sweep_cancel_intent(BlockHeight block)
 // whose cancel the wallet accepted but the chain never saw.
 //
 // Every heartbeat, for each cancel_pending offer in State:
-//   * first sighting: anchor it and seed its escalation count from
-//     offer_closure_events (the cap is per offer, not per process);
+//   * first sighting: anchor it and seed its escalation count, and the
+//     highest fee an escalation of it recorded, from offer_closure_events
+//     (the cap and the fee floor are per offer, not per process);
 //   * once due (execution::escalation_probe_due), probe it -- wallet
 //     get_offer, then the full node's coin records for its coins_of_interest
 //     -- oldest anchor first, at most max_probes_per_sweep per heartbeat;
@@ -19752,7 +19753,14 @@ asio::awaitable<void> Engine::sweep_cancel_intent(BlockHeight block)
 // hanging rpc_post costs ~123 s against watchdog_stall_seconds (600 s).  So
 // the sweep stops at the FIRST failed RPC of any kind, is skipped entirely
 // when Step 2 failed this cycle, and checks a wall-clock budget before each
-// probe.
+// probe.  The dead man's switch itself runs on another thread, so its flag is
+// re-read with the other asynchronous gates before every candidate and every
+// fee (execution::escalation_must_yield).
+//
+// WRITE AHEAD.  Each escalation records its cancel_escalation_N event, with the
+// fee it is about to pay, BEFORE the fee-bearing call, and pays nothing when
+// that record cannot be written.  A submission that then fails still counts
+// after a restart: fewer paid attempts, never more.
 // ---------------------------------------------------------------------------
 namespace {
 
@@ -19830,6 +19838,19 @@ asio::awaitable<void> Engine::escalate_stuck_cancels(BlockHeight block)
     // wallet, and "still takeable" must not wait for the wallet to recover.
     flush_cancel_unresolved_alerts();
 
+    // [review, round 2] The gates another thread or a co_spawned coroutine can
+    // close while this sweep is suspended in an RPC -- the dead man's switch
+    // included.  Read here, before each candidate, and immediately before each
+    // fee-bearing call.
+    const auto async_gates = [this]() {
+        execution::EscalationAsyncGates gates;
+        gates.graceful_cancel_active =
+            graceful_cancel_active_.load(std::memory_order_acquire);
+        gates.cancel_all_inflight = cancel_all_inflight_;
+        gates.watchdog_fired      = watchdog_fired_.load(std::memory_order_acquire);
+        return gates;
+    };
+
     // [review] The states this sweep declines to run in:
     //  * graceful_cancel_active_ / cancel_all_inflight_ -- another cancel is
     //    walking this book right now; a re-cancel underneath it pays a second
@@ -19841,12 +19862,10 @@ asio::awaitable<void> Engine::escalate_stuck_cancels(BlockHeight block)
     //    because XCH is depleted; operator decision: no escalation there.
     //  * watchdog_fired_ -- the book was cancelled by a process that gave up
     //    managing it; operator decision: no escalation until restart.
-    if (graceful_cancel_active_.load(std::memory_order_acquire)
-        || cancel_all_inflight_
+    if (execution::escalation_must_yield(async_gates())
         || wallet_circuit_open_
         || wallet_consecutive_failures_ > 0
-        || xch_recovery_mode_
-        || watchdog_fired_.load(std::memory_order_acquire)) {
+        || xch_recovery_mode_) {
         spdlog::debug("[Engine] [S14] cancel escalation deferred this heartbeat "
                       "(cancel in flight, wallet failing, XCH recovery or dead "
                       "man's switch)");
@@ -19881,19 +19900,27 @@ asio::awaitable<void> Engine::escalate_stuck_cancels(BlockHeight block)
         const std::string& offer_id = entry.first;
         execution::CancelEscalationTrack& track = cancel_escalation_tracks_[offer_id];
         if (track.anchor_block == 0) {
-            // First sighting. Seed the count so a restart does not grant a
-            // fresh ladder; on a read failure stay unanchored and retry.
-            std::uint32_t prior = 0;
+            // First sighting. Seed the count, and the highest fee an earlier
+            // escalation recorded, so a restart grants neither a fresh ladder
+            // nor a bid that only repeats the last one -- which the mempool
+            // refuses as a replacement.  On a read failure stay unanchored
+            // and retry.
+            std::uint32_t prior     = 0;
+            std::uint64_t prior_fee = 0;
             try {
-                prior = db_ ? db_->count_cancel_escalations(offer_id) : 0U;
+                if (db_) {
+                    prior     = db_->count_cancel_escalations(offer_id);
+                    prior_fee = db_->max_cancel_escalation_fee(offer_id);
+                }
             } catch (const std::exception& e) {
-                spdlog::debug("[Engine] [S14] could not read the escalation count "
+                spdlog::debug("[Engine] [S14] could not read the escalation history "
                               "for {}: {} -- retried next heartbeat",
                               offer_id, e.what());
                 continue;
             }
-            track.anchor_block = now_block;
-            track.escalations  = prior;
+            track.anchor_block   = now_block;
+            track.escalations    = prior;
+            track.last_fee_mojos = prior_fee;
             continue;
         }
         if (execution::escalation_probe_due(track, now_block, params)) {
@@ -19912,8 +19939,10 @@ asio::awaitable<void> Engine::escalate_stuck_cancels(BlockHeight block)
         const std::uint64_t base_fee = fee_tracker_
             ? fee_tracker_->get_recommended_fee(config_.strategy.offer_fee_mojos, block)
             : config_.strategy.offer_fee_mojos;
-        // The cancel being replaced may have paid up to twice the dynamic fee
-        // (emergency_cancel's top tier).
+        // A ceiling on the cancel being replaced: emergency_cancel's top tier
+        // pays up to twice the dynamic fee.  It is the dynamic fee NOW, not the
+        // one that cancel saw -- initial cancel fees are not persisted (see
+        // execution::escalation_fee_mojos).
         const std::uint64_t dynamic_fee = offer_mgr_->current_fee();
         const std::uint64_t prior_ceiling =
             dynamic_fee > std::numeric_limits<std::uint64_t>::max() / 2U
@@ -19930,8 +19959,7 @@ asio::awaitable<void> Engine::escalate_stuck_cancels(BlockHeight block)
                               "remaining probes wait for the next heartbeat");
                 break;
             }
-            if (graceful_cancel_active_.load(std::memory_order_acquire)
-                || cancel_all_inflight_ || wallet_circuit_open_) {
+            if (execution::escalation_must_yield(async_gates()) || wallet_circuit_open_) {
                 break;
             }
             if (!state_->get_offer(offer_id).cancel_pending) {
@@ -20017,16 +20045,44 @@ asio::awaitable<void> Engine::escalate_stuck_cancels(BlockHeight block)
             // transform has had defects in exactly that shape. `break` ends the
             // sweep, `continue` moves to the next candidate.
             if (verdict == execution::CancelEscalationVerdict::Escalate) {
-                // [review] Re-check right before the fee-bearing call: a
-                // co_spawned operator cancel-all can start during the
-                // co_awaits above.
-                if (graceful_cancel_active_.load(std::memory_order_acquire)
-                    || cancel_all_inflight_
+                // [review] Re-check right before the fee-bearing call: shutdown,
+                // a co_spawned operator cancel-all, or the dead man's switch on
+                // its own thread can close a gate during the co_awaits above.
+                if (execution::escalation_must_yield(async_gates())
                     || !state_->get_offer(offer_id).cancel_pending) {
                     break;
                 }
                 const std::uint64_t fee = execution::escalation_fee_mojos(
                     base_fee, track.last_fee_mojos, prior_ceiling, params);
+                const std::uint64_t attempt =
+                    static_cast<std::uint64_t>(track.escalations) + 1U;
+                // [review, round 2] WRITE AHEAD, FAIL CLOSED.  The cap and the
+                // fee floor are seeded from recorded events alone, so the record
+                // goes in BEFORE the fee is paid, and without one nothing is
+                // paid: an attempt a restart cannot see would be paid again.
+                bool recorded = false;
+                std::string record_error{"no database"};
+                if (db_) {
+                    try {
+                        db_->mark_offer_cancel_submitted(
+                            offer_id, block,
+                            "cancel_escalation_" + std::to_string(attempt), fee);
+                        recorded = true;
+                    } catch (const std::exception& e) {
+                        record_error = e.what();
+                    }
+                }
+                if (!recorded) {
+                    track.retry_after_block = now_block
+                        + execution::escalation_backoff_blocks(track.idle_probes, params);
+                    s14_bump(track.idle_probes);
+                    spdlog::warn("[Engine] [S14] escalated re-cancel {} for {} ({}) NOT "
+                                 "submitted: its record could not be written, and no "
+                                 "fee is paid without one; the sweep stops for this "
+                                 "heartbeat: {}", attempt, offer_id, pair_name,
+                                 record_error);
+                    break;
+                }
                 std::optional<std::string> error;
                 try {
                     error = co_await offer_mgr_->recancel_secure(offer_id, fee);
@@ -20063,7 +20119,8 @@ asio::awaitable<void> Engine::escalate_stuck_cancels(BlockHeight block)
                     track.retry_after_block = now_block + backoff;
                     spdlog::warn("[Engine] [S14] escalated re-cancel FAILED for {} "
                                  "({}) at fee {} mojos -- not counted toward the "
-                                 "cap; next attempt in {} blocks: {}",
+                                 "cap by this process, though its record counts "
+                                 "after a restart; next attempt in {} blocks: {}",
                                  offer_id, pair_name, fee, backoff, *error);
                     if (!track.alerted
                         && track.consecutive_errors
@@ -20084,16 +20141,6 @@ asio::awaitable<void> Engine::escalate_stuck_cancels(BlockHeight block)
                 track.consecutive_errors = 0;
                 if (fee_tracker_ && fee_tracker_->enabled() && paid > 0) {
                     fee_tracker_->record_fee(paid, block);
-                }
-                try {
-                    if (db_) {
-                        db_->mark_offer_cancel_submitted(
-                            offer_id, block,
-                            "cancel_escalation_" + std::to_string(track.escalations));
-                    }
-                } catch (const std::exception& e) {
-                    spdlog::debug("[Engine] [S14] could not record escalation {} "
-                                  "for {}: {}", track.escalations, offer_id, e.what());
                 }
                 spdlog::warn("[Engine] [S14] escalated re-cancel {}/{} SUBMITTED for "
                              "{} ({}) at fee {} mojos -- the wallet reports {} and "

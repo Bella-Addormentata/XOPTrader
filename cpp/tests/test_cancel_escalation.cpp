@@ -610,3 +610,30 @@ TEST(CancelUnresolvedAlert, TheMessageNamesEveryOfferAndSaysWhetherItIsTakeable)
     EXPECT_NE(msg.find("3 escalated"), std::string::npos) << msg;
     EXPECT_NE(msg.find("+2 more"), std::string::npos) << msg;
 }
+
+// ===========================================================================
+// Gates the sweep re-reads while it is suspended
+// ===========================================================================
+
+// [review, round 2] The dead man's switch latches watchdog_fired_ on its own
+// thread, then sends a wallet-wide zero-fee cancel.  The re-check before the
+// fee-bearing call read shutdown and Cancel All but not the watchdog, so a
+// sweep suspended in an RPC could still pay -- and an escalated bundle that
+// reaches the mempool first gets the watchdog's conflicting batch refused.
+TEST(CancelEscalationGates, AFiredWatchdogStopsTheFeeBearingCall)
+{
+    ex::EscalationAsyncGates gates;
+    EXPECT_FALSE(ex::escalation_must_yield(gates)) << "every gate open: the sweep may pay";
+
+    gates.watchdog_fired = true;
+    EXPECT_TRUE(ex::escalation_must_yield(gates))
+        << "the dead man's switch fired while the sweep was suspended";
+
+    gates = ex::EscalationAsyncGates{};
+    gates.graceful_cancel_active = true;
+    EXPECT_TRUE(ex::escalation_must_yield(gates)) << "shutdown is walking the book";
+
+    gates = ex::EscalationAsyncGates{};
+    gates.cancel_all_inflight = true;
+    EXPECT_TRUE(ex::escalation_must_yield(gates)) << "an operator Cancel All is in flight";
+}

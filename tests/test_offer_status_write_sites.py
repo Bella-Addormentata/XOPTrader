@@ -103,6 +103,24 @@ def _region(text: str, start_marker: str, end_marker: str) -> str:
     return text[start:text.index(end_marker, start)]
 
 
+def _escalation_sweep(engine: str) -> str:
+    return _region(engine,
+                   "asio::awaitable<void> Engine::escalate_stuck_cancels(BlockHeight block)",
+                   "void Engine::check_shutdown_flag()")
+
+
+def _first_call(text: str, callee: str, start: int = 0) -> int:
+    """Offset of the first `<callee>(` at or after `start` that is code, not a //
+    comment; -1 when there is none."""
+    for match in re.finditer(re.escape(callee) + r"\s*\(", text):
+        if match.start() < start:
+            continue
+        line_start = text.rfind("\n", 0, match.start()) + 1
+        if "//" not in text[line_start:match.start()]:
+            return match.start()
+    return -1
+
+
 def test_every_cancelled_write_is_wallet_verified():
     calls = [args for args in _call_arguments(_read(ENGINE), "update_offer_status")
              if '"cancelled"' in args]
@@ -211,3 +229,76 @@ def test_startup_scan_collects_pending_cancel_records_through_the_bucket_functio
                         "// ---- Phase 1b: THE DB -> WALLET LEG")
     assert "StartupScanBucket::PendingCancelObserved" in phase_one
     assert "wallet_pending_cancel_.push_back(" in phase_one
+
+
+def test_every_escalation_gate_yields_to_the_dead_mans_switch():
+    """[review, round 2] The dead man's switch latches watchdog_fired_ on its own
+    thread, then sends a wallet-wide zero-fee cancel.  The per-candidate gate and
+    the re-check before the fee-bearing call read shutdown and Cancel All but not
+    the watchdog, so a sweep suspended in an RPC could still pay.  The decision is
+    gtest-pinned (CancelEscalationGates); this pins that the sweep reads every
+    flag into it and asks it at each gate."""
+    sweep = _escalation_sweep(_read(ENGINE))
+    snapshot = _region(sweep, "const auto async_gates = [this]() {", "return gates;")
+    for flag in ("graceful_cancel_active_.load(", "cancel_all_inflight_",
+                 "watchdog_fired_.load("):
+        assert flag in snapshot, "the asynchronous gate snapshot must read %s" % flag
+    yields = _call_arguments(sweep, "execution::escalation_must_yield")
+    assert len(yields) == 3 and all("async_gates()" in args for args in yields), (
+        "the entry gate, the per-candidate gate and the pre-fee re-check must each "
+        "ask escalation_must_yield(async_gates()); found %r" % yields
+    )
+    per_candidate = _region(sweep, "for (const auto& candidate : due) {",
+                            "// 1. The wallet's word.")
+    assert _call_arguments(per_candidate, "execution::escalation_must_yield"), (
+        "the per-candidate gate must yield to every asynchronous gate"
+    )
+    escalate = sweep.index("if (verdict == execution::CancelEscalationVerdict::Escalate)")
+    pay = _first_call(sweep, "recancel_secure", escalate)
+    assert pay > escalate, "the Escalate branch must pay through recancel_secure"
+    assert _call_arguments(sweep[escalate:pay], "execution::escalation_must_yield"), (
+        "the last gate before the fee-bearing call must include the dead man's switch"
+    )
+
+
+def test_a_restart_restores_the_escalation_fee_floor():
+    """[review, round 2] last_fee_mojos lived only in memory, so after a restart at
+    unchanged fees escalation N+1 bid exactly what escalation N had paid -- below
+    MEMPOOL_MIN_FEE_INCREASE, refused as a replacement, and still counted.  The
+    query is gtest-pinned (EscalationFeeSurvivesARestart); this pins the wiring."""
+    sweep = _escalation_sweep(_read(ENGINE))
+    first_sighting = _region(sweep, "if (track.anchor_block == 0) {",
+                             "if (execution::escalation_probe_due(track, now_block, params)) {")
+    seeded = re.search(r"(\w+)\s*=\s*db_->max_cancel_escalation_fee\(offer_id\)",
+                       first_sighting)
+    assert seeded, "first sighting must read the highest recorded escalation fee"
+    assert re.search(r"track\.last_fee_mojos\s*=\s*%s\s*;" % re.escape(seeded.group(1)),
+                     first_sighting), (
+        "first sighting must seed track.last_fee_mojos from max_cancel_escalation_fee"
+    )
+    records = _call_arguments(sweep, "mark_offer_cancel_submitted")
+    assert records and all(re.search(r",\s*fee\s*$", args) for args in records), (
+        "the escalation record must carry the fee it is about to pay: %r" % records
+    )
+
+
+def test_the_escalation_persists_before_it_pays():
+    """[review, round 2] The cancel_escalation_N event was written AFTER the
+    fee-bearing call, in a try that logged at debug and moved on, so a failed
+    write lost a paid attempt: after a restart neither the cap nor the fee floor
+    could see it.  Engine is not constructible in xop_tests, so the ordering is
+    pinned only here."""
+    sweep = _escalation_sweep(_read(ENGINE))
+    records = _call_arguments(sweep, "mark_offer_cancel_submitted")
+    assert len(records) == 1, (
+        "one escalation record, written before the fee -- found %d" % len(records)
+    )
+    escalate = sweep.index("if (verdict == execution::CancelEscalationVerdict::Escalate)")
+    record_at = _first_call(sweep, "mark_offer_cancel_submitted", escalate)
+    pay_at = _first_call(sweep, "recancel_secure", escalate)
+    assert 0 <= record_at < pay_at, (
+        "the escalation must write its record before recancel_secure pays the fee"
+    )
+    assert re.search(r"\bbreak\s*;", sweep[record_at:pay_at]), (
+        "a record that cannot be written must end the sweep before any fee is paid"
+    )
