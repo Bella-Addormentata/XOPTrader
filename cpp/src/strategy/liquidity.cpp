@@ -177,8 +177,13 @@ std::vector<TierQuote> LiquidityEngine::build_raw_ladder(
     const std::int64_t min_pool_per_tier = 1000000000000LL;  // 1.0 XCH
 
     for (std::uint32_t i = 0; i < cfg.num_tiers; ++i) {
-        const double spread_bps = cfg.tier_spacing_bps[i];
-        const double size_frac  = cfg.tier_size_pct[i];
+        const double bid_spread_bps = (!cfg.tier_spacing_bps_bid.empty() && i < cfg.tier_spacing_bps_bid.size())
+            ? cfg.tier_spacing_bps_bid[i]
+            : (i < cfg.tier_spacing_bps.size() ? cfg.tier_spacing_bps[i] : 0.0);
+        const double ask_spread_bps = (!cfg.tier_spacing_bps_ask.empty() && i < cfg.tier_spacing_bps_ask.size())
+            ? cfg.tier_spacing_bps_ask[i]
+            : (i < cfg.tier_spacing_bps.size() ? cfg.tier_spacing_bps[i] : 0.0);
+        const double size_frac  = (i < cfg.tier_size_pct.size()) ? cfg.tier_size_pct[i] : 0.0;
 
         auto tier_size_for_pool = [&](std::int64_t pool) {
             auto tier_size = static_cast<std::int64_t>(
@@ -190,10 +195,10 @@ std::vector<TierQuote> LiquidityEngine::build_raw_ladder(
         };
 
         // -- Bid tier --
-        // bid_price = mid * (1 - spread_bps / 10000)
+        // bid_price = mid * (1 - bid_spread_bps / 10000)
         // Rounding DOWN for bids is conservative (we pay less).
         const double bid_price_f =
-            static_cast<double>(mid) * (1.0 - spread_bps / 10000.0);
+            static_cast<double>(mid) * (1.0 - bid_spread_bps / 10000.0);
         const auto   bid_price   =
             static_cast<std::int64_t>(std::floor(bid_price_f));
 
@@ -205,15 +210,15 @@ std::vector<TierQuote> LiquidityEngine::build_raw_ladder(
             tq.side       = Side::Bid;
             tq.price      = bid_price;
             tq.size       = bid_size;
-            tq.spread_bps = spread_bps;
+            tq.spread_bps = bid_spread_bps;
             ladder.push_back(tq);
         }
 
         // -- Ask tier --
-        // ask_price = mid * (1 + spread_bps / 10000)
+        // ask_price = mid * (1 + ask_spread_bps / 10000)
         // Rounding UP for asks is conservative (we receive more).
         const double ask_price_f =
-            static_cast<double>(mid) * (1.0 + spread_bps / 10000.0);
+            static_cast<double>(mid) * (1.0 + ask_spread_bps / 10000.0);
         const auto   ask_price   =
             static_cast<std::int64_t>(std::ceil(ask_price_f));
 
@@ -226,7 +231,7 @@ std::vector<TierQuote> LiquidityEngine::build_raw_ladder(
             tq.side       = Side::Ask;
             tq.price      = ask_price;
             tq.size       = ask_size;
-            tq.spread_bps = spread_bps;
+            tq.spread_bps = ask_spread_bps;
             ladder.push_back(tq);
         }
     }
@@ -538,6 +543,27 @@ BlockHeight LiquidityEngine::last_rebalance_block() const noexcept {
 
 std::int64_t LiquidityEngine::last_rebalance_price() const noexcept {
     return last_rebalance_price_;
+}
+
+// ===========================================================================
+// Gap-aware activation
+// ===========================================================================
+
+bool gap_aware_spacing_active(const LiquidityConfig& cfg) noexcept {
+    // Pre-existing rule: competitive anchoring re-prices every tier from the
+    // best competing offer, so a gap blend underneath it is dead work.
+    if (!cfg.gap_aware_spacing || cfg.competitive_anchor_enabled) {
+        return false;
+    }
+
+    // [S33 2026-09-12] The blend reads and writes tier_spacing_bps, which
+    // build_raw_ladder consults only when NEITHER per-side schedule is
+    // populated.  Either one being non-empty is enough to switch the pass
+    // off: on a partially populated config (or a schedule shorter than
+    // num_tiers) the blend would otherwise reach ONLY the tiers that still
+    // fall back to tier_spacing_bps, giving a ladder that is neither mode.
+    return cfg.tier_spacing_bps_bid.empty()
+        && cfg.tier_spacing_bps_ask.empty();
 }
 
 // ===========================================================================
@@ -894,7 +920,32 @@ std::vector<TierQuote> LiquidityEngine::compute_ladder(
     // Skipped when competitive anchor pricing is active (the two approaches
     // are mutually exclusive: anchor places tiers relative to best competing
     // offer; gap-aware places tiers in empty zones).
+    //
+    // [S33 2026-09-12, Copilot round 6] Also skipped when the engine's
+    // activity controller has supplied a per-side schedule.  This pass
+    // writes tier_spacing_bps, but build_raw_ladder prices from
+    // tier_spacing_bps_bid/_ask whenever those are non-empty, so the blend
+    // used to be computed, stored and silently discarded.  The modes are now
+    // mutually exclusive and the conflict is logged once per pair --
+    // gap_aware_spacing_active() carries the full rationale for excluding
+    // rather than re-targeting the blend.
     if (adj_cfg.gap_aware_spacing && !adj_cfg.competitive_anchor_enabled
+        && !gap_aware_spacing_active(adj_cfg)
+        && !gap_aware_side_schedule_warned_)
+    {
+        gap_aware_side_schedule_warned_ = true;
+        spdlog::warn("[Liquidity] {} config enables gap_aware_spacing AND the "
+                     "activity controller supplies per-side tier spacing "
+                     "(bid={} ask={} entries). build_raw_ladder prices from "
+                     "those schedules, so the gap blend is NOT applied -- the "
+                     "two modes are mutually exclusive. Quoting with the "
+                     "activity schedules; disable one to silence this.",
+                     pair_name_,
+                     adj_cfg.tier_spacing_bps_bid.size(),
+                     adj_cfg.tier_spacing_bps_ask.size());
+    }
+
+    if (gap_aware_spacing_active(adj_cfg)
         && !competing_offers.empty() && mid > 0) {
         auto gaps = analyse_order_book_gaps(
             competing_offers, mid,

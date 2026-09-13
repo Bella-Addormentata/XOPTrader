@@ -178,6 +178,7 @@ def _status_color(status: str) -> QColor:
         _STATUS_COLORS.update({
             "filled": QColor(COLORS.PROFIT_GREEN),
             "pending": QColor(COLORS.WARNING_YELLOW),
+            "cancelling": QColor(COLORS.INFO_BLUE),
             "cancelled": QColor(COLORS.TEXT_SECONDARY),
             "expired": QColor(COLORS.LOSS_RED),
             "": QColor(COLORS.TEXT_PRIMARY),
@@ -254,6 +255,12 @@ class OrderPanel(QWidget):
         # pair_name -> mojos-per-base-unit, resolved once per pair
         # instead of once per row.
         self._mpu_cache: dict[str, int] = {}
+
+        # In-flight cancellation state.  Cancel-all only: there is no
+        # per-offer equivalent because there is no single-offer command
+        # API to report one (see _on_cancel_single).
+        self._cancel_all_pending: bool = False
+        self._btn_cancel_all: Optional[QPushButton] = None
 
         # Per-row objects hoisted out of the population loop: constructing
         # a QFont/QColor per cell dominated the rebuild cost.
@@ -339,10 +346,10 @@ class OrderPanel(QWidget):
         bar.addWidget(btn_refresh)
 
         # Cancel All button (danger variant)
-        btn_cancel_all = QPushButton("Cancel All")
-        btn_cancel_all.setObjectName("dangerButton")
-        btn_cancel_all.clicked.connect(self._on_cancel_all)
-        bar.addWidget(btn_cancel_all)
+        self._btn_cancel_all = QPushButton("Cancel All")
+        self._btn_cancel_all.setObjectName("dangerButton")
+        self._btn_cancel_all.clicked.connect(self._on_cancel_all)
+        bar.addWidget(self._btn_cancel_all)
 
         return bar
 
@@ -496,6 +503,34 @@ class OrderPanel(QWidget):
         """
         self._offer_ttl = ttl_blocks
 
+    def set_cancel_all_pending(self, pending: bool) -> None:
+        """Update whether a cancel-all request is in flight.
+
+        Parameters
+        ----------
+        pending:
+            True when cancel-all is submitted and awaiting on-chain confirmation.
+        """
+        if self._cancel_all_pending != pending:
+            self._cancel_all_pending = pending
+            if self._btn_cancel_all is not None:
+                if pending:
+                    self._btn_cancel_all.setEnabled(False)
+                    self._btn_cancel_all.setText("Cancelling All...")
+                else:
+                    self._btn_cancel_all.setEnabled(True)
+                    self._btn_cancel_all.setText("Cancel All")
+            self._apply_filters()
+
+    # [S33 2026-09-05] set_cancelling_offers() and the _cancelling_offer_ids
+    # set it fed are gone.  c20 removed the only thing that ever populated
+    # them (an optimistic latch on the row's Cancel click, which stuck
+    # forever because the request lands on a stub), leaving an unwired
+    # setter and three display paths that could never fire.  A per-offer
+    # "Cancelling" badge needs a single-offer command API that reports
+    # success; when one exists, reintroduce the latch beside it rather than
+    # ahead of it.
+
     def update_offer_summary(self, stats: dict) -> None:
         """Adopt whole-table offer aggregates computed in SQL.
 
@@ -587,8 +622,17 @@ class OrderPanel(QWidget):
             if side_filter != "all" and text(offer, "side").lower() != side_filter:
                 continue
             # Status filter
-            if status_filter != "all" and text(offer, "status").lower() != status_filter:
-                continue
+            raw_status = text(offer, "status").lower()
+            effective_status = raw_status
+            if raw_status == "pending" and self._cancel_all_pending:
+                effective_status = "cancelling"
+
+            if status_filter != "all":
+                if status_filter == "pending":
+                    if effective_status not in ("pending", "cancelling"):
+                        continue
+                elif status_filter != effective_status:
+                    continue
             # Free-text search (matches against offer_id and pair_name)
             if search_text:
                 searchable = (
@@ -803,7 +847,10 @@ class OrderPanel(QWidget):
             self._item(row_idx, 5, f"{tier} ({TIER_NAMES.get(tier, '?')})")
 
             # -- Status (coloured badge) --
-            status: str = text(offer, "status")
+            raw_status: str = text(offer, "status")
+            status: str = raw_status
+            if raw_status.lower() == "pending" and self._cancel_all_pending:
+                status = "cancelling"
             self._item(row_idx, 6, status.capitalize()).setForeground(
                 _status_color(status)
             )
@@ -827,7 +874,7 @@ class OrderPanel(QWidget):
             # paths -- has an UNKNOWN age: aging it against the live tip
             # forever would just be a subtler version of the original bug.
             resolved_block: int = num(offer, "resolved_block")
-            is_terminal = status.lower() in ("filled", "cancelled", "expired")
+            is_terminal = raw_status.lower() in ("filled", "cancelled", "expired")
             if is_terminal and resolved_block <= 0:
                 age_text, age_val = "—", None
             else:
@@ -883,7 +930,18 @@ class OrderPanel(QWidget):
             # -- Actions (cancel button for pending offers) --
             self._item(row_idx, 11, "")
             btn_cancel = table.cellWidget(row_idx, 11)
-            if status.lower() == "pending":
+            if status.lower() == "cancelling":
+                if not isinstance(btn_cancel, QPushButton):
+                    btn_cancel = QPushButton("Cancelling...")
+                    btn_cancel.setObjectName("dangerButton")
+                    btn_cancel.setProperty("compact", True)
+                    btn_cancel.clicked.connect(self._on_cancel_button)
+                    table.setCellWidget(row_idx, 11, btn_cancel)
+                else:
+                    btn_cancel.setText("Cancelling...")
+                btn_cancel.setProperty("offer_id", oid)
+                btn_cancel.setEnabled(False)
+            elif status.lower() == "pending":
                 if not isinstance(btn_cancel, QPushButton):
                     btn_cancel = QPushButton("Cancel")
                     btn_cancel.setObjectName("dangerButton")
@@ -897,7 +955,10 @@ class OrderPanel(QWidget):
                     # reused button can never cancel a stale offer.
                     btn_cancel.clicked.connect(self._on_cancel_button)
                     table.setCellWidget(row_idx, 11, btn_cancel)
+                else:
+                    btn_cancel.setText("Cancel")
                 btn_cancel.setProperty("offer_id", oid)
+                btn_cancel.setEnabled(True)
             elif btn_cancel is not None:
                 table.removeCellWidget(row_idx, 11)
 
@@ -938,7 +999,13 @@ class OrderPanel(QWidget):
         fill_rate = (filled / total * 100.0) if total > 0 else 0.0
 
         self._lbl_total.setText(f"Total: {total}")
-        self._lbl_pending.setText(f"Pending: {pending}")
+        if self._cancel_all_pending and pending > 0:
+            self._lbl_pending.setText(f"Cancelling: {pending}")
+            self._lbl_pending.setStyleSheet(f"color: {COLORS.INFO_BLUE}; font-size: 9pt; font-weight: bold;")
+        else:
+            self._lbl_pending.setText(f"Pending: {pending}")
+            self._lbl_pending.setStyleSheet(f"color: {COLORS.TEXT_SECONDARY}; font-size: 9pt;")
+
         self._lbl_filled.setText(f"Filled: {filled}")
         self._lbl_fill_rate.setText(f"Fill rate: {fill_rate:.1f}%")
         self._lbl_locked.setText(f"Locked: {mojos_to_xch(locked_mojos)}")
@@ -1021,10 +1088,29 @@ class OrderPanel(QWidget):
             QMessageBox.StandardButton.No,
         )
         if reply == QMessageBox.StandardButton.Yes:
+            # [S33 2026-09-05] Do NOT latch "Cancelling..." optimistically.
+            # cancel_offer_requested lands on EngineBridge.cancel_offer, a
+            # Phase-1 stub that submits nothing and only emits an error, so
+            # latching here greys out the row's cancel button AND hides the
+            # context-menu Cancel action (which is gated on the DISPLAYED
+            # status text, rewritten to "Cancelling" by the same latch),
+            # leaving a still-resting offer permanently unrecoverable until
+            # it leaves pending by TTL or fill.  Cancel-all also arms its
+            # latch optimistically (_on_cancel_all below), but there the
+            # authoritative value lives in MainWindow._dexie_cancel_all_pending
+            # -- set only after a successful flag write, and re-pushed to
+            # both panels on every refresh tick (main_window.py:722-723) --
+            # so an arm the bridge refused is unwound within one tick.
+            # Nothing owns or reports a per-offer cancellation, so an
+            # optimistic latch here would never be unwound at all.  When a
+            # real single-offer command API exists, the latch belongs with
+            # its success signal, not ahead of it.
             self.cancel_offer_requested.emit(offer_id)
 
     def _on_cancel_all(self) -> None:
         """Request cancellation of every pending offer after confirmation."""
+        if self._cancel_all_pending:
+            return
         # Use the whole-table count: the payload only holds the selected
         # status, so counting it would refuse to cancel anything while
         # the user is looking at, e.g., the Filled list.
@@ -1046,6 +1132,7 @@ class OrderPanel(QWidget):
             QMessageBox.StandardButton.No,
         )
         if reply == QMessageBox.StandardButton.Yes:
+            self.set_cancel_all_pending(True)
             self.cancel_all_requested.emit()
 
     @staticmethod

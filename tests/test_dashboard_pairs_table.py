@@ -430,6 +430,91 @@ def test_gauge_columns_are_withheld_when_metrics_are_down():
     assert "_metrics_live" in body, "gauge columns ignore the liveness flag"
 
 
+def test_no_connection_indicator_is_derived_from_a_cached_payload(app):
+    """[S33 2026-09-05] The same retention rule as above, for the dots.
+
+    All three indicators had OR-fallbacks onto remembered state -- a retained
+    ``block_height``, a retained ``market_data`` snapshot, a retained
+    ``wallet_balances`` dict -- so a real outage rendered green or yellow
+    instead of red.
+
+    Driven through the real window rather than asserted on the source text of
+    main_window.py: the earlier version of this test only grepped for the old
+    spellings, so any rename of the identical cached read passed it while the
+    dots went on lying.
+
+    Two payloads, because the node and Dexie fallbacks needed opposite scrape
+    states to fire: the node one only masked while the engine was still
+    scrapeable, the Dexie one only mattered once it was not.  Both carry
+    every remembered value -- a retained height, a retained market_data
+    snapshot, a retained wallet balance.
+    """
+    from gui.widgets.main_window import MainWindow
+
+    def _payload(metrics_connected: bool) -> dict:
+        return {
+            "health": {
+                # The engine keeps publishing the last known height
+                # (wallet-sourced) right through a full-node outage.
+                "block_height": 9_184_000.0,
+                "node_connected": 0.0,
+                "node_synced": 0.0,
+                "node_syncing": 0.0,
+                "wallet_connected": 0.0,
+                "wallet_synced": 0.0,
+                "wallet_syncing": 0.0,
+            },
+            "metrics_connected": metrics_connected,
+            "pnl": {},
+            "offers": {},
+            "risk": {},
+            # MetricsService._on_failure clears _connected but deliberately
+            # RETAINS _latest, so the snapshot outlives the endpoint.
+            "market_data": {
+                "XCH/wUSDC.b": {"mid_price": 1_486_000_000_000.0,
+                                "spread_bps": 42.0, "volume_24h": 1.0},
+            },
+            # WalletService._cached is merge-only and is never cleared on a
+            # failed fetch, so known wallets outlive the wallet RPC.
+            "wallet_balances": {
+                "Chia Wallet": {"wallet_type": 0.0, "asset_id": "",
+                                "confirmed": 16.5},
+            },
+        }
+
+    window = MainWindow()
+    try:
+        dashboard = window._unwrap(window._dashboard)
+
+        def _dot(name: str) -> str:
+            return dashboard._conn_dots[name][1].text()
+
+        # The node and wallet outage: both back ends unreachable while the
+        # engine itself is still exporting metrics.
+        window._on_bridge_data(_payload(metrics_connected=True))
+
+        assert _dot("Full Node") == "Full Node: Disconnected", (
+            "the node dot infers connectivity from a retained height"
+        )
+        assert _dot("Wallet") == "Wallet: Disconnected", (
+            "the wallet dot infers connectivity from retained balances"
+        )
+        tooltip = window._block_label.toolTip()
+        assert "Full Node: Disconnected" in tooltip
+        assert "Wallet: Disconnected" in tooltip
+
+        # The scrape itself dies; the last snapshot is still in the payload.
+        window._on_bridge_data(_payload(metrics_connected=False))
+
+        assert _dot("Dexie") == "Dexie: Disconnected", (
+            "the Dexie dot reads a retained market-data snapshot"
+        )
+    finally:
+        window.close()
+        window.deleteLater()
+        app.processEvents()
+
+
 def test_a_withheld_spread_is_an_em_dash_not_a_zero(app):
     """0.0 is a real spread claim; a dead metrics feed has no claim to make."""
     from gui.widgets.dashboard import DashboardWidget

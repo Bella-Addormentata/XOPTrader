@@ -218,6 +218,273 @@ int score_execution_quality(int competitiveness_score, int queue_ahead_score)
 
 }  // namespace
 
+// [S33 2026-09-05] See the contract in engine.hpp: the replacement whitelist
+// is keyed off the IDs selective_cancel actually returned, NOT off staleness,
+// because a cancel whose RPC failed leaves its offer live while its tier
+// still classifies Stale.
+std::unordered_set<std::string> select_repost_keys(
+    const std::vector<execution::TierClassification>& tier_classes,
+    const std::vector<std::string>&                   cancelled_ids)
+{
+    const std::unordered_set<std::string> cancelled_id_set(
+        cancelled_ids.begin(), cancelled_ids.end());
+
+    // [S33 2026-09-12] EVERY occupant of the slot, not one of them.  Two
+    // pending offers can share a (side, tier) slot after any earlier double
+    // post; admitting the slot because ONE of them was cancelled posts a
+    // replacement over the other, which is the exact double exposure this
+    // helper exists to prevent.  A Fresh occupant was never asked to cancel
+    // and is still live, so it vetoes its slot too.
+    std::unordered_set<std::string> keys;
+    std::unordered_set<std::string> vetoed;
+    for (const auto& tc : tier_classes) {
+        const std::string slot_key = std::to_string(static_cast<int>(tc.side))
+                                   + "_" + std::to_string(tc.tier_index);
+        if (tc.staleness != execution::TierStaleness::Fresh
+            && cancelled_id_set.count(tc.offer_id) > 0) {
+            keys.insert(slot_key);
+        } else {
+            vetoed.insert(slot_key);
+        }
+    }
+    // Applied after the classification loop, not inside it: either leg of a
+    // shared slot may be visited first.
+    for (const auto& vetoed_key : vetoed) keys.erase(vetoed_key);
+    return keys;
+}
+
+// [S33-LIMITER 2026-09-05] See the contract in engine.hpp: a tier is "resting"
+// when no successful cancellation removed it, so its coins are still locked and
+// were already netted out of the spendable_balance the XCH budget is built from.
+std::unordered_set<std::string> select_resting_keys(
+    const std::vector<execution::TierClassification>& tier_classes,
+    const std::vector<std::string>&                   cancelled_ids)
+{
+    const std::unordered_set<std::string> cancelled_id_set(
+        cancelled_ids.begin(), cancelled_ids.end());
+
+    std::unordered_set<std::string> keys;
+    for (const auto& tc : tier_classes) {
+        if (cancelled_id_set.count(tc.offer_id) == 0) {
+            keys.insert(std::to_string(static_cast<int>(tc.side))
+                        + "_" + std::to_string(tc.tier_index));
+        }
+    }
+    // [S33 2026-09-12] The second pass that used to follow -- erasing any
+    // slot with a cancelled leg, "resolving toward CHARGING" -- is gone with
+    // the rule it compensated for.  select_repost_keys no longer admits a
+    // slot on one cancelled leg, so the slot it erased is not reposted; all
+    // the erase did was charge the budget for a slot nothing is posted into
+    // while the failed leg's coins really are still locked out of
+    // spendable_balance, i.e. double-count them.  The invariant survives
+    // directly: a slot is repostable only when NO occupant is uncancelled,
+    // and such a slot is not resting here, so posted stays a subset of
+    // charged.
+    return keys;
+}
+
+// [S33 2026-09-05] See the contract in engine.hpp: the gate is "there were
+// pending offers", NOT "some tier was Fresh".  The old gate skipped the
+// all-stale full-cancel branch entirely, which is the branch where a failed
+// cancel is most dangerous -- every tier is being replaced at once.
+std::vector<TierQuote> select_postable_tiers(
+    const std::vector<TierQuote>&                     candidate_tiers,
+    const std::vector<execution::TierClassification>& tier_classes,
+    const std::vector<std::string>&                   cancelled_ids)
+{
+    // Nothing was pending: no candidate can duplicate a live offer.
+    if (tier_classes.empty()) return candidate_tiers;
+
+    const std::unordered_set<std::string> cancelled_keys =
+        select_repost_keys(tier_classes, cancelled_ids);
+
+    // Slots that HAD a pending offer.  A candidate whose slot is absent here
+    // is brand new (it was not in the previous ladder) and always postable.
+    std::unordered_set<std::string> pending_keys;
+    for (const auto& tc : tier_classes) {
+        pending_keys.insert(std::to_string(static_cast<int>(tc.side))
+                            + "_" + std::to_string(tc.tier_index));
+    }
+
+    std::vector<TierQuote> postable;
+    postable.reserve(candidate_tiers.size());
+    for (const auto& tq : candidate_tiers) {
+        const std::string key = std::to_string(static_cast<int>(tq.side))
+                              + "_" + std::to_string(tq.tier_index);
+        if (cancelled_keys.count(key) > 0 || pending_keys.count(key) == 0) {
+            postable.push_back(tq);
+        }
+    }
+    return postable;
+}
+
+// [S33 2026-09-05] See the contract in engine.hpp.
+double shift_schedule_to_floor(std::vector<double>& spacings,
+                               double               min_half_spread_bps)
+{
+    if (spacings.empty() || min_half_spread_bps <= spacings.front()) {
+        return 0.0;
+    }
+    const double shift = min_half_spread_bps - spacings.front();
+    for (double& s : spacings) s += shift;
+    return shift;
+}
+
+// [S33 2026-09-05] See the contract in engine.hpp.  The cross-side coupling
+// (alpha_bid -> ASK, alpha_ask -> BID) and the inverted-range clamps are the
+// whole point of this function; do not "simplify" either.
+ActivitySchedules interpolate_activity_schedules(
+    double                     alpha_bid,
+    double                     alpha_ask,
+    double                     min_margin_bps,
+    double                     max_margin_bps,
+    const std::vector<double>& min_spacings,
+    const std::vector<double>& max_spacings,
+    std::size_t                num_tiers)
+{
+    ActivitySchedules out;
+
+    const double a_bid = std::clamp(alpha_bid, 0.0, 1.0);
+    const double a_ask = std::clamp(alpha_ask, 0.0, 1.0);
+
+    // An inverted margin range would run the interpolation backwards: zero
+    // activity would TIGHTEN quotes.  Raise the wide end to the tight end so
+    // the pair simply stops widening instead.
+    const double eff_max_margin = std::max(max_margin_bps, min_margin_bps);
+    out.margin_range_inverted = (max_margin_bps < min_margin_bps);
+
+    out.bid_margin_bps = eff_max_margin - a_ask * (eff_max_margin - min_margin_bps);
+    out.ask_margin_bps = eff_max_margin - a_bid * (eff_max_margin - min_margin_bps);
+
+    out.bid_spacings.resize(num_tiers);
+    out.ask_spacings.resize(num_tiers);
+    double prev_max_s = 0.0;
+    double prev_min_s = 0.0;
+    for (std::size_t i = 0; i < num_tiers; ++i) {
+        const double min_s = (i < min_spacings.size())
+            ? min_spacings[i]
+            : (100.0 * static_cast<double>(i + 1));
+        const double cfg_max_s = (i < max_spacings.size()) ? max_spacings[i] : min_s;
+        // [review] The wide end must clear this tier's OWN base spacing AND
+        // stay at least one base gap outside the tier before it.  Clamping
+        // against min_s alone leaves the schedule NON-ASCENDING in two
+        // reachable shapes: [900, 300] over a [100, 200] base clamps to
+        // itself (300 > 200, so nothing looks wrong), and a max list SHORTER
+        // than num_tiers falls back to base spacings that are narrower than
+        // the tier before -- the case config.example.yaml documents as
+        // supported.  Nothing downstream repairs it: shift_schedule_to_floor
+        // only ever measures front(), and build_raw_ladder prices each tier
+        // independently.  The width-floor pass does catch the price, but by
+        // collapsing the tier onto its predecessor's exact price level, so
+        // that rung's size lands at the MOST aggressive price instead of
+        // spreading -- the inverse of what the ladder is for.
+        //
+        // Carrying the gap rather than flattening to prev_max_s is what
+        // keeps the repaired tiers DISTINCT: flattening would turn a short
+        // max list into N tiers at one price, which is the same collapse.
+        const double gap = (i == 0) ? 0.0 : std::max(0.0, min_s - prev_min_s);
+        const double floor_s = std::max(min_s, prev_max_s + gap);
+        if (cfg_max_s < floor_s && i < max_spacings.size()) {
+            ++out.spacing_tiers_inverted;
+        }
+        const double max_s = std::max(cfg_max_s, floor_s);
+        prev_max_s = max_s;
+        prev_min_s = min_s;
+        out.bid_spacings[i] = max_s - a_ask * (max_s - min_s);
+        out.ask_spacings[i] = max_s - a_bid * (max_s - min_s);
+    }
+
+    return out;
+}
+
+// [S33 2026-09-12] See the contract in engine.hpp.  The gate IS this
+// function; a version that counts every offer is the defect it exists to
+// close.  EQUALITY -- not >=, not a wall-clock age: heights are unique per
+// heartbeat, so anything not stamped with THIS height was carried over.
+BookActivity fresh_book_depth(const std::vector<CompetingOffer>& offers,
+                              BlockHeight                        now_block)
+{
+    BookActivity out;
+    for (const auto& co : offers) {
+        if (co.last_seen_block != now_block) {
+            ++out.stale_ignored;
+            continue;
+        }
+        if (co.side == Side::Bid) ++out.bids;
+        else if (co.side == Side::Ask) ++out.asks;
+    }
+    return out;
+}
+
+// [S33 2026-09-05] See the contract in engine.hpp.
+Mojo xch_mark_price_mojos(Mojo xch_usd_mojos, double registered_factor)
+{
+    if (xch_usd_mojos > 0 && registered_factor > 0.0) {
+        // [S33 review] Checked, not cast.  The guard above screens sign and
+        // NaN, not MAGNITUDE: nothing bounds peg_target from below (config.cpp
+        // requires finite and > 0; PeggedAsset::is_coherent requires > 0 and
+        // <= kMaxPegTarget), and a par asset is trusted by construction, so an
+        // arbitrarily small positive factor reaches this divisor and the
+        // quotient leaves Mojo.  llround on an out-of-range double returns an
+        // UNSPECIFIED value, so the check has to be BEFORE the call.  Falling
+        // through to the existing `return 0` is this function's established
+        // "do not mark", exactly as for an unpriceable pair.
+        if (const auto m = to_mojo_checked(
+                static_cast<double>(xch_usd_mojos) / registered_factor)) {
+            return *m;
+        }
+    }
+    return 0;
+}
+
+// [S33 2026-09-05] See the contract in engine.hpp.
+NodeHealthFlags node_health_flags(bool reachable,
+                                  bool node_reports_synced,
+                                  bool node_reports_syncing)
+{
+    NodeHealthFlags flags;
+    flags.connected = reachable;
+    flags.synced    = reachable && node_reports_synced;
+    flags.syncing   = reachable && node_reports_syncing;
+    return flags;
+}
+
+// [S33 2026-09-12] See the contract in engine.hpp.  Freshness, not selection:
+// a syncing node answers every probe while staying behind the wallet, so
+// asking "is the node the height source?" reported it disconnected for the
+// whole catch-up.  Asking "did a probe answer recently?" reports it connected
+// and syncing, and still refuses to republish a cached reading once the
+// answers stop.
+bool node_probe_is_live(bool                                  node_client_open,
+                        std::chrono::steady_clock::time_point last_probe,
+                        std::chrono::steady_clock::time_point now,
+                        std::chrono::seconds                  liveness_window)
+{
+    if (!node_client_open) return false;
+    // Never probed in this run: the cached sync flags are still their
+    // zero-initialised defaults and mean nothing about this node.
+    if (last_probe == std::chrono::steady_clock::time_point{}) return false;
+    // A `now` before the probe is a clock oddity, not evidence of staleness.
+    if (now < last_probe) return true;
+    return (now - last_probe) <= liveness_window;
+}
+
+// [review 3997548811] See the contract in engine.hpp.  Same shape as
+// node_probe_is_live above, its own window: the node is probed on a poll
+// throttle, Dexie on block arrival.
+bool dexie_probe_is_live(bool                                  dexie_client_open,
+                         std::chrono::steady_clock::time_point last_success,
+                         std::chrono::steady_clock::time_point now,
+                         std::chrono::seconds                  liveness_window)
+{
+    if (!dexie_client_open) return false;
+    // Never answered in this run: nothing has been observed about the venue.
+    if (last_success == std::chrono::steady_clock::time_point{}) return false;
+    // A `now` before the stamp is a clock oddity, not evidence of staleness.
+    if (now < last_success) return true;
+    return (now - last_success) <= liveness_window;
+}
+
 // ===========================================================================
 // Construction / destruction
 // ===========================================================================
@@ -373,6 +640,19 @@ Engine::Engine(const AppConfig& config, bool dry_run)
         config_.market_data.book_side_anchor_band_ratio;
     md_cfg.book_side_agree_max_spread_bps =
         config_.market_data.book_side_agree_max_spread_bps;
+    // [S33 2026-09-12] ...and the per-pair overrides of it.  ONE feed serves
+    // every pair, so without this the line above is a bot-wide retune however
+    // local the operator's intent was.  Populated for EVERY pair, not just
+    // the enabled ones: the map is keyed by name and read on lookup, so
+    // carrying a disabled pair's override costs nothing and stops the value
+    // from silently vanishing when a pair is enabled and the engine restarted.
+    for (const auto& md_pair_cfg : config_.pairs) {
+        if (md_pair_cfg.book_side_agree_max_spread_bps_override) {
+            md_cfg.set_agree_max_spread_bps_for(
+                md_pair_cfg.name,
+                *md_pair_cfg.book_side_agree_max_spread_bps_override);
+        }
+    }
     market_data_ = std::make_unique<MarketDataFeed>(md_cfg, *state_);
 
     // -- Data / analytics (per-pair estimators) --------------------------------
@@ -464,10 +744,10 @@ Engine::Engine(const AppConfig& config, bool dry_run)
         liq_cfg.max_gap_scan_bps   = config_.strategy.max_gap_scan_bps;
         liq_cfg.gap_blend_factor   = config_.strategy.gap_blend_factor;
 
-        // Competitive anchor pricing.
-        liq_cfg.competitive_anchor_enabled           = config_.strategy.competitive_anchor_enabled;
-        liq_cfg.competitive_anchor_max_distance_bps  = config_.strategy.competitive_anchor_max_distance_bps;
-        liq_cfg.competitive_anchor_stride_bps        = config_.strategy.competitive_anchor_stride_bps;
+        // Competitive anchor pricing (per-pair override takes precedence).
+        liq_cfg.competitive_anchor_enabled           = pair.competitive_anchor_enabled_override.value_or(config_.strategy.competitive_anchor_enabled);
+        liq_cfg.competitive_anchor_max_distance_bps  = pair.competitive_anchor_max_distance_bps_override.value_or(config_.strategy.competitive_anchor_max_distance_bps);
+        liq_cfg.competitive_anchor_stride_bps        = pair.competitive_anchor_stride_bps_override.value_or(config_.strategy.competitive_anchor_stride_bps);
 
         // Adverse-selection-aware tier sizing.
         liq_cfg.adverse_selection_sizing           = config_.strategy.adverse_selection_sizing;
@@ -2281,6 +2561,12 @@ asio::awaitable<void> Engine::poll_loop_coro()
                         }
                         const std::int64_t probe =
                             co_await full_node_->get_block_height();
+                        // [S33 2026-09-12] It ANSWERED.  Stamped before the
+                        // acceptance rule below, which is about whether the
+                        // answer is usable as a HEIGHT -- a node catching up
+                        // is rejected there and is reachable all the same,
+                        // and that is the state the gauges used to deny.
+                        node_last_probe_ = std::chrono::steady_clock::now();
                         // Answering is not the same as being usable. A node
                         // resyncing from genesis answers every poll with a
                         // height far BELOW the wallet's; counting those as
@@ -2346,6 +2632,9 @@ asio::awaitable<void> Engine::poll_loop_coro()
             } else {
                 try {
                     height = co_await full_node_->get_block_height();
+                    // [S33 2026-09-12] Reachability, stamped on the answer
+                    // itself -- not on the usable/progressing verdict below.
+                    node_last_probe_ = std::chrono::steady_clock::now();
                     // [review] USABLE, not merely non-negative. A stale or
                     // malformed node answers every poll with a height that
                     // is rejected below -- but counting it as a success
@@ -2630,6 +2919,10 @@ asio::awaitable<void> Engine::run_startup_analysis()
                         }
                         const auto probe =
                             co_await full_node_->get_block_height();
+                        // [S33 2026-09-12] Same as the main loop's recovery
+                        // probe: answering is reachability, whatever the
+                        // acceptance rule below makes of the height.
+                        node_last_probe_ = std::chrono::steady_clock::now();
                         // [review round 11] The main loop's acceptance
                         // rule, against the ANALYSIS-local last height.
                         // `probe >= height` compared against the wallet
@@ -2678,6 +2971,7 @@ asio::awaitable<void> Engine::run_startup_analysis()
                 }
             } else {
                 height = co_await full_node_->get_block_height();
+                node_last_probe_ = std::chrono::steady_clock::now();
             }
         } catch (const std::exception& ex) {
             height_error = ex.what();
@@ -2822,25 +3116,34 @@ asio::awaitable<void> Engine::run_startup_analysis()
         // wallet/node connectivity immediately, not only after
         // analysis completes and the main trading loop starts.
         if (metrics_->is_running()) {
+            // [S33 2026-09-05] Connectivity is not synchronisation.  A node
+            // answers a peak height while sync_mode is still true, so
+            // deriving synced from a successful poll -- and asserting
+            // syncing=false -- published solid green through exactly the
+            // startup a syncing node produces.  Both flags now come from the
+            // sync object of the blockchain-state response this poll already
+            // fetched (no extra RPC), and are held false while the WALLET is
+            // the height source, where the cached node reading is stale.
+            const auto node_sync =
+                full_node_ ? full_node_->last_sync_state()
+                           : rpc::ChiaFullNodeRPC::SyncState{};
+            // [S33 2026-09-12] `!ask_wallet_first && !height_failed` asked
+            // which RPC served THIS poll's height, which is selection, not
+            // reachability: once analysis settles on the wallet fallback,
+            // ask_wallet_first is true on every poll and the node read as
+            // disconnected even as its recovery probes were answering.
+            const auto node_flags = node_health_flags(
+                node_probe_live_now(),
+                node_sync.synced, node_sync.syncing);
             SystemHealthSnapshot health;
             health.block_height     = current_block;
-            // [review] Not unconditionally true. This block is reached
-            // after the wallet fallback rescues a poll the NODE just failed,
-            // so publishing node_synced here reported the unavailable node
-            // as healthy -- to monitoring and to the GUI -- for as long as
-            // analysis ran. Derive it from which source actually answered.
-            // [review] The node is synced only if the NODE answered. In
-            // explicit wallet-only mode, and after an auto-mode startup
-            // fallback, height_error is empty because the WALLET succeeded --
-            // so this reported a node that is unavailable, or does not
-            // exist, as healthy.
-            // [review round 11] From THIS poll's source. height_error is
-            // empty on a settled wallet-first poll and wallet_only_mode_ is
-            // untouched by the analysis-local fallback, so the old test
-            // reported the node healthy for wallet-sourced blocks through
-            // the whole outage.
-            health.node_synced      = !ask_wallet_first && !height_failed;
+            health.node_connected   = node_flags.connected;
+            health.node_synced      = node_flags.synced;
+            health.node_syncing     = node_flags.syncing;
             health.wallet_connected = wallet_->is_open();
+            health.wallet_synced    = wallet_synced_;
+            health.wallet_syncing   = wallet_syncing_;
+            health.dexie_connected  = dexie_probe_live_now();
             metrics_->update_system_health(health);
         }
 
@@ -3394,6 +3697,14 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
             valuation_holds_anything_)
         && !breaker_pause_active_) {
         breaker_pause_active_ = true;
+        // [S33 2026-09-05] The fourth site that takes the shared latch, and
+        // the only one where the revocation is a provable NO-OP: this branch
+        // is gated on !breaker_pause_active_, and window_loss_latched_ implies
+        // breaker_pause_active_, so the flag is already false here.  Written
+        // anyway so engine.hpp's invariant ("all four sites clear this") needs
+        // no exception, and so a future edit to that gate cannot silently
+        // leave the window breaker owning an unvaluable-book pause.
+        window_loss_latched_ = false;
         // [review] Step 13's branch is gated on !breaker_pause_active_, so
         // latching here silently SUPPRESSED the detailed log and the
         // operator alert -- the exact report the comment promised. Record
@@ -3893,6 +4204,13 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
             pair.base_asset_id,
             pair.quote_asset_id);
         if (ticker) {
+            // [review 3997548811] REACHABILITY, stamped before any judgement
+            // about the prices.  A ticker that answers at all proves the
+            // venue is up; whether its prices are usable is a separate
+            // question that pair_data_ok below already answers.  A failed
+            // request -- nullopt, or a throw into the per-pair catch --
+            // stamps nothing, and the window closes on its own.
+            dexie_last_success_at_ = std::chrono::steady_clock::now();
             market_data_->ingest_dexie(
                 pair.name,
                 ticker->price_buy,
@@ -6614,7 +6932,7 @@ void Engine::update_fair_values()
 }
 
 // Step 7: Generate multi-tier offer ladder.
-void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
+void Engine::step_generate_ladder(BlockHeight block_height)
 {
     // -- Per-asset portfolio percentages (for asset-level drift guard) ----
     // Computed once per cycle: XCH-equivalent value of each asset divided
@@ -7701,19 +8019,165 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
         // Query per-tier fill rates from the offer log for adaptive sizing.
         LiquidityConfig ladder_cfg = liq.config();
 
-        // Shift the whole spacing schedule outward (preserving inter-tier
-        // gaps, so the ladder keeps its shape and tiers stay distinct) when
-        // the innermost tier sits inside the minimum half-spread.
-        if (!ladder_cfg.tier_spacing_bps.empty()
-            && quote_min_half_spread_bps > ladder_cfg.tier_spacing_bps.front())
-        {
-            const double delta = quote_min_half_spread_bps
-                               - ladder_cfg.tier_spacing_bps.front();
-            for (double& s : ladder_cfg.tier_spacing_bps) s += delta;
+        // 24-hour activity-adaptive margin and spacing scaling
+        const bool activity_adaptive = pair_cfg
+            ? pair_cfg->activity_adaptive_spacing_override.value_or(config_.strategy.activity_adaptive_spacing)
+            : config_.strategy.activity_adaptive_spacing;
+
+        double effective_bid_margin_bps = pair_cfg
+            ? pair_cfg->min_profit_margin_bps_override.value_or(config_.strategy.min_profit_margin_bps)
+            : config_.strategy.min_profit_margin_bps;
+        double effective_ask_margin_bps = effective_bid_margin_bps;
+
+        if (activity_adaptive) {
+            int bids_24h = 0;
+            int asks_24h = 0;
+            if (db_) {
+                const std::uint32_t lookback = config_.strategy.activity_lookback_blocks;
+                const BlockHeight since_block = (block_height > lookback) ? (block_height - lookback) : BlockHeight{0};
+                std::tie(bids_24h, asks_24h) = db_->query_trade_counts_by_side(pair_name, since_block);
+            }
+
+            // [S33 2026-09-12] FRESHNESS GATE -- see the contract in
+            // engine.hpp.  competing_offers_ has no TTL and no pruner, so an
+            // offers-fetch failure leaves Step 7 holding the PREVIOUS cycle's
+            // book (the stale-book path documented at the fetch above).
+            // Counting those retained offers as live depth holds alpha up,
+            // and alpha interpolates DOWN toward the tight end -- so an
+            // outage would leave quotes TIGHT through exactly the window the
+            // wide schedule exists to protect.  bids_24h/asks_24h are NOT
+            // gated: they come from the DB and survive the outage, so a stale
+            // book degrades this pair to fills-only activity, not to zero.
+            const BookActivity book_depth =
+                fresh_book_depth(comp_offers, block_height);
+            const std::size_t book_bids = book_depth.bids;
+            const std::size_t book_asks = book_depth.asks;
+            if (book_depth.stale_ignored > 0) {
+                spdlog::warn("[Engine] Step 7: ignored {} competing offers "
+                             "not seen in block {} for {} activity "
+                             "(offers feed down?)",
+                             book_depth.stale_ignored, block_height,
+                             pair_name);
+            }
+
+            const double book_weight = pair_cfg
+                ? pair_cfg->activity_book_weight_override.value_or(config_.strategy.activity_book_weight)
+                : config_.strategy.activity_book_weight;
+
+            const double eff_bids = static_cast<double>(bids_24h) + book_weight * static_cast<double>(book_bids);
+            const double eff_asks = static_cast<double>(asks_24h) + book_weight * static_cast<double>(book_asks);
+
+            const int target_fills = pair_cfg
+                ? pair_cfg->activity_target_fills_24h_override.value_or(config_.strategy.activity_target_fills_24h)
+                : config_.strategy.activity_target_fills_24h;
+            const double target_d = std::max(1.0, static_cast<double>(target_fills));
+
+            const double alpha_bid = std::clamp(eff_bids / target_d, 0.0, 1.0);
+            const double alpha_ask = std::clamp(eff_asks / target_d, 0.0, 1.0);
+
+            // Margin interpolation: at 0 fills -> max_margin; at >= target fills -> min_margin
+            const double min_margin = effective_bid_margin_bps;
+            const double max_margin = (pair_cfg && pair_cfg->min_profit_margin_max_bps_override.has_value())
+                ? pair_cfg->min_profit_margin_max_bps_override.value()
+                : std::max(min_margin, min_margin * 2.0);
+
+            // Spacing interpolation: at 0 fills -> max_spacing; at >= target fills -> min_spacing
+            const auto& min_spacings = ladder_cfg.tier_spacing_bps;
+            const auto& max_spacings = (pair_cfg && pair_cfg->tier_spacing_max_bps_override.has_value())
+                ? pair_cfg->tier_spacing_max_bps_override.value()
+                : min_spacings;
+
+            // CROSS-SIDE REPLENISHMENT COUPLING:
+            // When bids fill (buying base asset), we are actively replenishing inventory,
+            // so the ASK margin and spacing can safely tighten to sell (driven by alpha_bid).
+            // When asks fill (selling base asset), we are actively accumulating quote asset,
+            // so the BID margin and spacing can safely tighten to buy (driven by alpha_ask).
+            // Conversely, when there are very few bid fills (alpha_bid is low), we are not
+            // replenishing base inventory, so ASK margin/gap expands (to max_margin/max_spacing)
+            // to demand a higher liquidity premium and protect inventory.
+            //
+            // [S33 2026-09-05] The interpolation itself lives in
+            // interpolate_activity_schedules (engine.hpp) so ctest can reach the
+            // code that sets the live margins -- see
+            // cpp/tests/test_activity_interpolation.cpp.  It also clamps an
+            // inverted max/min range, which config.cpp cannot check: the maxima
+            // are only validated as positive there, and both operands (the
+            // pair's effective min margin, the pair's resolved ladder schedule)
+            // exist only here.
+            const ActivitySchedules sched = interpolate_activity_schedules(
+                alpha_bid, alpha_ask, min_margin, max_margin,
+                min_spacings, max_spacings, ladder_cfg.num_tiers);
+
+            effective_bid_margin_bps = sched.bid_margin_bps;
+            effective_ask_margin_bps = sched.ask_margin_bps;
+            ladder_cfg.tier_spacing_bps_bid = sched.bid_spacings;
+            ladder_cfg.tier_spacing_bps_ask = sched.ask_spacings;
+
+            // Loud, but once per pair per process: an inverted override is a
+            // standing misconfiguration, so re-warning every heartbeat would be
+            // the same log spam Step 13 rate-limits.  Clamped, not refused --
+            // see the contract in engine.hpp.
+            if ((sched.margin_range_inverted || sched.spacing_tiers_inverted > 0)
+                && activity_range_warned_.insert(pair_name).second) {
+                spdlog::warn("[Engine] Step 7: {} INVERTED activity range in config -- "
+                             "min_profit_margin_max_bps_override ({:.0f}bps vs min {:.0f}bps, "
+                             "inverted={}) and/or tier_spacing_max_bps_override ({} of {} tiers "
+                             "below their tier floor). A maximum below its own minimum would run "
+                             "the controller BACKWARDS (low activity would tighten quotes), and "
+                             "one below the PREVIOUS tier's maximum would post that tier inside "
+                             "its predecessor; each offending maximum is clamped up to the "
+                             "greater of its own minimum and one base gap outside the tier "
+                             "before it, so this pair gets "
+                             "NO adaptive widening until the config is fixed.",
+                             pair_name, max_margin, min_margin,
+                             sched.margin_range_inverted,
+                             sched.spacing_tiers_inverted,
+                             static_cast<std::size_t>(ladder_cfg.num_tiers));
+            }
+
+            spdlog::info("[Engine] Step 7: {} cross-side activity: bids={:.1f} (24h_fills={} book={}), asks={:.1f} (24h_fills={} book={}) "
+                         "-> alpha_bid={:.1f}%, alpha_ask={:.1f}%, bid_margin={:.0f}bps, ask_margin={:.0f}bps, bid_spacing_0={:.0f}bps, ask_spacing_0={:.0f}bps",
+                         pair_name, eff_bids, bids_24h, book_bids, eff_asks, asks_24h, book_asks,
+                         alpha_bid * 100.0, alpha_ask * 100.0,
+                         effective_bid_margin_bps, effective_ask_margin_bps,
+                         ladder_cfg.tier_spacing_bps_bid.empty() ? 0.0 : ladder_cfg.tier_spacing_bps_bid.front(),
+                         ladder_cfg.tier_spacing_bps_ask.empty() ? 0.0 : ladder_cfg.tier_spacing_bps_ask.front());
+        }
+
+        // Shift each spacing schedule outward (preserving inter-tier gaps,
+        // so the ladder keeps its shape and tiers stay distinct) when its
+        // OWN innermost tier sits inside the minimum half-spread.
+        //
+        // [S33 2026-09-05] The delta is derived PER SCHEDULE, not once from
+        // the static tier_spacing_bps.  build_raw_ladder prices from
+        // tier_spacing_bps_bid/_ask whenever the activity controller filled
+        // them, and those are interpolated up toward tier_spacing_max_bps --
+        // in the low-activity case already WIDER than the floor.  Reusing the
+        // static schedule's delta stacked the whole shift on top of an
+        // already-compliant side schedule (base 100, adaptive 600, floor 400
+        // -> 900 instead of 600), widening a ladder the controller had
+        // deliberately sized and feeding straight back into the low-fill
+        // state that widened it.  The converse also failed: a side schedule
+        // narrower than the base one was not shifted at all.  The base
+        // schedule keeps its own floor treatment because it is still the
+        // fallback build_raw_ladder uses when the controller is off, and the
+        // baseline the gap-aware blend reads.
+        //
+        // The rule itself lives in shift_schedule_to_floor (engine.hpp) so
+        // ctest can reach it -- see cpp/tests/test_width_floor.cpp.
+        const double base_shift = shift_schedule_to_floor(
+            ladder_cfg.tier_spacing_bps, quote_min_half_spread_bps);
+        const double bid_shift = shift_schedule_to_floor(
+            ladder_cfg.tier_spacing_bps_bid, quote_min_half_spread_bps);
+        const double ask_shift = shift_schedule_to_floor(
+            ladder_cfg.tier_spacing_bps_ask, quote_min_half_spread_bps);
+        if (base_shift > 0.0 || bid_shift > 0.0 || ask_shift > 0.0) {
             spdlog::info("[Engine] Step 7: {} sigma width floor: tier "
-                         "spacing shifted +{:.0f}bps (min_half_spread="
-                         "{:.0f}bps, combined_sigma={:.0f}bps, k={:.2f})",
-                         pair_name, delta, quote_min_half_spread_bps,
+                         "spacing shifted +{:.0f}/{:.0f}/{:.0f}bps "
+                         "(base/bid/ask, min_half_spread={:.0f}bps, "
+                         "combined_sigma={:.0f}bps, k={:.2f})",
+                         pair_name, base_shift, bid_shift, ask_shift,
+                         quote_min_half_spread_bps,
                          quote_combined_sigma_bps,
                          config_.strategy.quote_width_sigma_mult);
         }
@@ -7844,7 +8308,7 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
         // mid.  This prevents TibetSwap (0.7% fee) or other AMMs from
         // profitably arbitraging our offers.
         // -----------------------------------------------------------------
-        if (!comp_offers.empty() && mid_mojos > 0) {
+        if (ladder_cfg.competitive_anchor_enabled && !comp_offers.empty() && mid_mojos > 0) {
             // Separate competing offers by side, retaining size for
             // wall detection, and sort by quality.
             struct PricedOffer { Mojo price; Mojo size; };
@@ -8069,9 +8533,21 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
         // the sweep day every one of those was pulling toward a book that
         // was itself the mispriced object, so the floor must be the LAST
         // word on how close to the centre a quote may sit.  Tiers inside
-        // the floor are pushed to its edge, stepped apart so they do not
-        // collapse onto one price level (same rationale as the fair-value
-        // clamp's tier step).  Sizes are untouched.
+        // the floor are pushed to its edge.  Sizes are untouched.
+        //
+        // [review 2026-09-12] KNOWN GAP, stated rather than overclaimed: an
+        // earlier revision of this comment promised the floored tiers are
+        // "stepped apart so they do not collapse onto one price level".
+        // They are not.  The compliant branch below sets next_max to that
+        // tier's own price and SKIPS the step, so the first floored tier
+        // after a compliant one is handed the compliant tier's exact price.
+        // The same shape written correctly is the order-book guard's clamp
+        // ~130 lines down, which applies the min and the step
+        // unconditionally.  Not repaired here: this pass is inside
+        // step_generate_ladder and nothing in cpp/tests constructs an
+        // Engine, so the change could not be pinned by a test, and stepping
+        // after a compliant tier would reprice tiers currently left alone.
+        // Filed as separate work.
         // -----------------------------------------------------------------
         if (mid_mojos > 0 && quote_min_half_spread_bps > 0.0
             && !pcs.ladder.empty())
@@ -8107,8 +8583,9 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
             int floored_bids = 0;
             int floored_asks = 0;
 
-            // BID side: running ceiling stepping DOWN, so successive
-            // floored tiers stay distinct and ordered.
+            // BID side: running ceiling stepping DOWN.  Successive FLOORED
+            // tiers stay distinct; a floored tier immediately after a
+            // compliant one does not -- see the known gap above.
             Mojo next_max = floor_bid_edge;
             for (TierQuote* tqp : tiers_in_order(Side::Bid)) {
                 TierQuote& tq = *tqp;
@@ -8217,26 +8694,75 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
             int clamped_bids = 0;
             int clamped_asks = 0;
 
-            for (auto& tq : pcs.ladder) {
-                if (tq.side == Side::Bid && snap.best_ask > 0) {
-                    if (tq.price > snap.best_ask) {
+            const double step_bps = std::max(
+                50.0, config_.strategy.fair_value_clamp_tier_step_bps);
+            const double ask_margin_bps = std::max(step_bps, effective_ask_margin_bps);
+            const double bid_margin_bps = std::max(step_bps, effective_bid_margin_bps);
+
+            auto tiers_in_order = [&](Side side) {
+                std::vector<TierQuote*> out;
+                out.reserve(pcs.ladder.size());
+                for (auto& tq : pcs.ladder) {
+                    if (tq.side == side) out.push_back(&tq);
+                }
+                std::sort(out.begin(), out.end(),
+                          [](const TierQuote* a, const TierQuote* b) {
+                              return a->tier_index < b->tier_index;
+                          });
+                return out;
+            };
+            auto resync_spread = [&](TierQuote& tq) {
+                if (mid_mojos > 0) {
+                    tq.spread_bps =
+                        (static_cast<double>(tq.price)
+                       - static_cast<double>(mid_mojos))
+                        / static_cast<double>(mid_mojos) * 10'000.0;
+                }
+            };
+
+            // Bids: clamp down below snap.best_ask, stepping down for successive tiers
+            if (snap.best_ask > 0) {
+                Mojo next_max = static_cast<Mojo>(std::llround(
+                    static_cast<double>(snap.best_ask)
+                    * (1.0 - bid_margin_bps / 10'000.0)));
+                for (TierQuote* tqp : tiers_in_order(Side::Bid)) {
+                    TierQuote& tq = *tqp;
+                    if (tq.price > next_max) {
                         spdlog::info("[Engine] Step 7: {} BID tier {} clamped "
                                      "{} -> {} (dex best ask)",
                                      pair_name, tq.tier_index,
-                                     tq.price, snap.best_ask);
-                        tq.price = snap.best_ask;
+                                     tq.price, next_max);
+                        tq.price = next_max;
+                        resync_spread(tq);
                         ++clamped_bids;
                     }
+                    next_max = std::min(next_max, tq.price);
+                    next_max = static_cast<Mojo>(std::llround(
+                        static_cast<double>(next_max)
+                        * (1.0 - step_bps / 10'000.0)));
                 }
-                if (tq.side == Side::Ask && snap.best_bid > 0) {
-                    if (tq.price < snap.best_bid) {
+            }
+
+            // Asks: clamp up above snap.best_bid, stepping up for successive tiers
+            if (snap.best_bid > 0) {
+                Mojo next_min = static_cast<Mojo>(std::llround(
+                    static_cast<double>(snap.best_bid)
+                    * (1.0 + ask_margin_bps / 10'000.0)));
+                for (TierQuote* tqp : tiers_in_order(Side::Ask)) {
+                    TierQuote& tq = *tqp;
+                    if (tq.price < next_min) {
                         spdlog::info("[Engine] Step 7: {} ASK tier {} clamped "
                                      "{} -> {} (dex best bid)",
                                      pair_name, tq.tier_index,
-                                     tq.price, snap.best_bid);
-                        tq.price = snap.best_bid;
+                                     tq.price, next_min);
+                        tq.price = next_min;
+                        resync_spread(tq);
                         ++clamped_asks;
                     }
+                    next_min = std::max(next_min, tq.price);
+                    next_min = static_cast<Mojo>(std::llround(
+                        static_cast<double>(next_min)
+                        * (1.0 + step_bps / 10'000.0)));
                 }
             }
 
@@ -8300,8 +8826,12 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
             // they disagree -- which is why it survives an Unavailable tier.
             const auto residual_opt =
                 market_data_->get_fair_value_residual_bps(pair_name);
+            const PairConfig* rpc = find_pair_config(pair_name);
+            const double widen_ratio = (rpc && rpc->fair_value_residual_widen_ratio_override.has_value())
+                ? rpc->fair_value_residual_widen_ratio_override.value()
+                : config_.strategy.fair_value_residual_widen_ratio;
             if (residual_opt && mid_mojos > 0 && !pcs.ladder.empty()
-                && config_.strategy.fair_value_residual_widen_ratio > 0.0)
+                && widen_ratio > 0.0)
             {
                 const double excess =
                     std::abs(*residual_opt)
@@ -8309,7 +8839,7 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                 if (excess > 0.0) {
                     const double extra_bps =
                         excess
-                        * config_.strategy.fair_value_residual_widen_ratio;
+                        * widen_ratio;
                     // Cap the added width at the pair's own half-spread
                     // ceiling -- the same cap Step 5 applies, honouring any
                     // per-pair override -- so a runaway residual cannot push
@@ -8317,12 +8847,9 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                     // books disagree with the graph on 96% of heartbeats and
                     // the raw widening would exceed this cap most of the time;
                     // the cap is what keeps that from becoming a withdrawal.
-                    const double residual_cap = [&]() -> double {
-                        const PairConfig* rpc = find_pair_config(pair_name);
-                        if (rpc && rpc->max_half_spread_bps_override.has_value())
-                            return rpc->max_half_spread_bps_override.value();
-                        return config_.strategy.max_half_spread_bps;
-                    }();
+                    const double residual_cap = (rpc && rpc->max_half_spread_bps_override.has_value())
+                        ? rpc->max_half_spread_bps_override.value()
+                        : config_.strategy.max_half_spread_bps;
                     const double capped = std::min(extra_bps, residual_cap);
 
                     for (auto& tq : pcs.ladder) {
@@ -9262,6 +9789,9 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         if (sync_status.contains("syncing"))
             syncing = sync_status["syncing"].get<bool>();
 
+        wallet_synced_ = synced && !syncing;
+        wallet_syncing_ = syncing;
+
         if (!synced || syncing) {
             ++consecutive_unsynced_blocks_;
             spdlog::warn("[Engine] Step 8: wallet not fully synced "
@@ -9301,6 +9831,8 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             consecutive_unsynced_blocks_ = 0;
         }
     } catch (const std::exception& e) {
+        wallet_synced_ = false;
+        wallet_syncing_ = false;
         spdlog::warn("[Engine] Step 8: wallet sync check failed: {} "
                      "-- skipping offer management cautiously", e.what());
         co_return;
@@ -9653,13 +10185,18 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             }
         }
 
+        const PairConfig* cur_pc = find_pair_config(pair_name);
+        const bool anchor_active = cur_pc
+            ? cur_pc->competitive_anchor_enabled_override.value_or(config_.strategy.competitive_anchor_enabled)
+            : config_.strategy.competitive_anchor_enabled;
+
         auto tier_classes = offer_mgr_->classify_tier_staleness(
             pair_name, pcs.ladder, block_height,
             config_.strategy.offer_ttl_blocks,
             static_cast<Mojo>(std::llround(
                 market_data_->get_mid_price(pair_name)
                 * static_cast<double>(kMojosPerXch))),
-            config_.strategy.competitive_anchor_enabled,
+            anchor_active,
             can_bid_rebalance,
             can_ask_rebalance);
 
@@ -10372,13 +10909,28 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             }
         }
 
-        // All tiers fresh and nothing was cancelled -> no repost needed.
-        // (The early-continue was removed so balance gates can free capital
-        //  when both sides are suppressed, but when at least one side is
-        //  active, existing fresh offers are kept as-is.)
+        // All tiers fresh and nothing was cancelled -> no repost needed, UNLESS
+        // there are brand-new tiers in the ladder that were not previously pending.
         if (has_pending && cancelled_ids.empty()
             && stale_count == 0 && expired_count == 0) {
-            continue;
+            bool has_unposted = false;
+            std::unordered_set<std::string> pending_keys;
+            for (const auto& tc : tier_classes) {
+                pending_keys.insert(
+                    std::to_string(static_cast<int>(tc.side))
+                    + "_" + std::to_string(tc.tier_index));
+            }
+            for (const auto& tq : pcs.ladder) {
+                std::string key = std::to_string(static_cast<int>(tq.side))
+                                + "_" + std::to_string(tq.tier_index);
+                if (pending_keys.count(key) == 0) {
+                    has_unposted = true;
+                    break;
+                }
+            }
+            if (!has_unposted) {
+                continue;
+            }
         }
 
         // -- XCH fee reserve gate (pre-creation, UTXO-aware) ---------------
@@ -10781,6 +11333,32 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 const bool base_is_xch =
                     pair_cfg->base_asset_id == "xch";
 
+                // [S33-LIMITER 2026-09-05] Tiers whose offer is still resting
+                // cost nothing NEW: the wallet already excluded their locked
+                // coins from spendable_balance, which is what xch_budget is
+                // built from.  Charging them here counted the same XCH twice
+                // and, near the reserve, trimmed the side below the very tier
+                // a selective refresh was trying to replace -- so a cancelled
+                // tier could never be reposted.  Cancelled tiers stay charged
+                // (their coins are not free until the cancel confirms), so the
+                // budget only relaxes by what provably never left the lock.
+                //
+                // This pairs with select_postable_tiers below, which drops
+                // exactly the tiers excluded here: charged is a SUPERSET of
+                // posted on every branch.  Do not gate one without the other.
+                //
+                // [S33 2026-09-05] `cancelled_ids` deliberately holds only the
+                // Step 8 refresh/full-cancel results.  The three later
+                // selective_cancel calls (the two exposure-floor rebalances and
+                // the both-sides-suppressed sweep) keep their results in their
+                // own locals, so the tiers they cancel read as "resting" here
+                // and as "not repostable" below.  That is safe in both
+                // directions because each of those sites has already killed the
+                // affected side (can_ask/can_bid = false) or `continue`s the
+                // pair outright, so none of their tiers reaches either set.
+                const auto resting_keys =
+                    select_resting_keys(tier_classes, cancelled_ids);
+
                 // Accumulate cost from tier 0 upward.  Stop when adding
                 // the next tier would exceed the budget.
                 Mojo cumulative_cost = 0;
@@ -10791,6 +11369,10 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     int tier_offer_count = 0;
                     for (const auto& tq : fee_filtered_tiers) {
                         if (tq.tier_index != ti) continue;
+                        const std::string resting_key =
+                            std::to_string(static_cast<int>(tq.side))
+                            + "_" + std::to_string(tq.tier_index);
+                        if (resting_keys.count(resting_key) > 0) continue;
                         ++tier_offer_count;
                         tier_cost += kUtxoOverheadMojos;  // fee UTXO
                         // If base is XCH and this is an ask, the offer
@@ -10859,9 +11441,9 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             }
         }
 
-                // -- Crossed-mid pre-post guard -------------------------------------
+                // -- Pre-post crossing guard ----------------------------------------
         // Defense-in-depth: filter out any tier that would cross the
-        // current model mid-price BEFORE posting on-chain.
+        // opposite-side BBO BEFORE posting on-chain.
         //
         // The competitive anchor in liquidity.cpp already clamps to
         // min(bbo_ref, mid), but the model mid can change between Step 7
@@ -10873,21 +11455,18 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         // ~10M mojos and exposed us to adverse selection for one block
         // per offer before cancellation.
         if (mid > 0) {
-            // [CROSSGUARD 2026-09-01] SHADOW MEASUREMENT. Suppression is
-            // UNCHANGED -- still the published-mid verdict, exactly as since
-            // 4d3f30d. The BBO verdict is computed beside it and only the
-            // DISAGREEMENT is logged.
-            //
-            // Why: this guard was written to pre-empt classify_tier_staleness
-            // and was a bit-exact predictor of it, until a932a5d moved the
-            // canceller onto the BBO one day later and left the guard behind.
-            // It has never been modified since. See cross_guard.hpp for the
-            // full account. But it is INERT on the only enabled pair (zero
-            // firings in six live rotations, one in the whole retained
-            // corpus), every "would suppress" figure available is a
-            // reconstruction rather than an observation, and a change in this
-            // family already shipped a regression through four review rounds.
-            // So: count first, decide from data.
+            // [CROSSGUARD 2026-09-01 -> S33 2026-09-05] THE SHADOW IS OVER.
+            // This guard was written to pre-empt classify_tier_staleness and
+            // was a bit-exact predictor of it, until a932a5d moved the
+            // canceller onto the BBO one day later and left the guard on the
+            // published mid. The 2026-09-01 shadow measured that divergence
+            // without acting on it; S33 promoted the BBO verdict to the LIVE
+            // decision below, so suppression is NO LONGER the published-mid
+            // verdict. See cross_guard.hpp for the full account.
+            // [S33 2026-09-03] BBO CROSSING GUARD.
+            // Evaluates whether a tier crosses the current BBO (best_bid for asks,
+            // best_ask for bids) or fallback mid buffer when no BBO exists,
+            // matching classify_tier_staleness.
             const auto book_snap_cg = state_->get_market(pair_name);
             const double cg_bid = static_cast<double>(book_snap_cg.best_bid);
             const double cg_ask = static_cast<double>(book_snap_cg.best_ask);
@@ -10896,70 +11475,41 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             std::vector<TierQuote> mid_safe;
             mid_safe.reserve(fee_filtered_tiers.size());
             std::size_t suppressed_count = 0;
-            std::size_t shadow_would_keep = 0;   // we drop, canceller would not
-            std::size_t shadow_would_drop = 0;   // we keep, canceller would drop
-            std::size_t shadow_indeterminate = 0;
-            bool        shadow_inverted = false;
-            bool        shadow_mid_fallback = false;
 
             for (const auto& tier : fee_filtered_tiers) {
                 const bool is_ask = (tier.side != Side::Bid);
                 const double px   = static_cast<double>(tier.price);
 
-                const auto live = execution::classify_cross_published_mid(
-                    is_ask, px, cg_mid);
-                const auto shadow = execution::classify_cross_bbo(
+                const auto bbo_check = execution::classify_cross_bbo(
                     is_ask, px, cg_bid, cg_ask, cg_mid);
-                shadow_inverted     |= shadow.book_inverted;
-                shadow_mid_fallback |= shadow.used_mid_fallback;
 
-                const bool live_crossed =
-                    (live == execution::CrossVerdict::Crossed);
-                if (shadow.verdict == execution::CrossVerdict::Indeterminate) {
-                    ++shadow_indeterminate;
-                } else {
-                    const bool shadow_crossed =
-                        (shadow.verdict == execution::CrossVerdict::Crossed);
-                    if (live_crossed && !shadow_crossed) ++shadow_would_keep;
-                    if (!live_crossed && shadow_crossed) ++shadow_would_drop;
-                }
+                const bool is_crossed =
+                    (bbo_check.verdict == execution::CrossVerdict::Crossed);
 
-                // SUPPRESSION IS THE LIVE VERDICT, UNCHANGED.
-                if (live_crossed) {
-                    spdlog::info("[Engine] Step 8: {} {} tier {} suppressed "
-                                 "-- price {} vs mid {} (crossed)",
-                                 pair_name, is_ask ? "ask" : "bid",
-                                 tier.tier_index, tier.price, mid);
+                if (is_crossed) {
+                    if (bbo_check.used_mid_fallback) {
+                        spdlog::info("[Engine] Step 8: {} {} tier {} suppressed "
+                                     "-- price {} crosses fallback mid band ({:.6f})",
+                                     pair_name, is_ask ? "ask" : "bid",
+                                     tier.tier_index, tier.price,
+                                     cg_mid);
+                    } else {
+                        spdlog::info("[Engine] Step 8: {} {} tier {} suppressed "
+                                     "-- price {} crosses BBO ({}/{})",
+                                     pair_name, is_ask ? "ask" : "bid",
+                                     tier.tier_index, tier.price,
+                                     book_snap_cg.best_bid, book_snap_cg.best_ask);
+                    }
                     ++suppressed_count;
                     continue;
                 }
                 mid_safe.push_back(tier);
             }
             if (suppressed_count > 0) {
-                spdlog::warn("[Engine] Step 8: {} crossed-mid guard removed "
+                spdlog::warn("[Engine] Step 8: {} BBO crossing guard removed "
                              "{}/{} tiers",
                              pair_name, suppressed_count,
                              fee_filtered_tiers.size());
-            }
-            if (shadow_would_keep > 0 || shadow_would_drop > 0) {
-                // The number this shadow exists to produce. If it stays at
-                // zero the question answers itself and the guard can be left
-                // alone; if it does not, this line is the evidence a fix
-                // would be built on.
-                spdlog::warn("[Engine] Step 8: {} [CROSSGUARD-SHADOW] "
-                             "published-mid and BBO verdicts disagree on "
-                             "{} tier(s) we dropped and {} we kept "
-                             "(mid={}, bbo={}/{}{}{}) -- suppression "
-                             "unchanged, this is measurement only",
-                             pair_name, shadow_would_keep, shadow_would_drop,
-                             mid, book_snap_cg.best_bid, book_snap_cg.best_ask,
-                             shadow_inverted ? ", BOOK INVERTED" : "",
-                             shadow_mid_fallback ? ", mid-fallback" : "");
-            }
-            if (shadow_indeterminate > 0) {
-                spdlog::debug("[Engine] Step 8: {} [CROSSGUARD-SHADOW] "
-                              "{} tier(s) had no usable reference",
-                              pair_name, shadow_indeterminate);
             }
             fee_filtered_tiers = std::move(mid_safe);
         }
@@ -11345,6 +11895,22 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 const int queue_ahead_score = score_queue_position(
                     queue_ahead_mojos,
                     tier.size);
+
+                const bool pair_comp_anchor_enabled = pair_cfg_comp
+                    ? pair_cfg_comp->competitive_anchor_enabled_override.value_or(config_.strategy.competitive_anchor_enabled)
+                    : config_.strategy.competitive_anchor_enabled;
+
+                if (!pair_comp_anchor_enabled) {
+                    spdlog::debug(
+                        "[Engine] Step 8: {} {} tier {} kept at wide spread -- "
+                        "competitiveness waived (competitive anchor disabled)",
+                        pair_name,
+                        (tier.side == Side::Bid ? "bid" : "ask"),
+                        tier.tier_index);
+                    competitive_tiers.push_back(tier);
+                    continue;
+                }
+
                 if (score >= kMinCompetitivenessScore) {
                     competitive_tiers.push_back(tier);
                     continue;
@@ -11485,6 +12051,47 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             continue;
         }
 
+        // [T5-01] Replacement filter: after a cancel pass, only post into the
+        // (side, tier) slots that the pass actually FREED.  Posting into a slot
+        // whose offer is still live -- a Fresh tier left alone, or a tier
+        // whose cancel did not land -- creates double exposure at the same
+        // price level.
+        // Also include tiers that have no pending offer at all (brand new unposted tiers).
+        // This runs BEFORE the pending exposure projection below so that existing
+        // live fresh offers (already in pair_*_pending_spend) are not double-counted
+        // as new planned spend.
+        // [S33 2026-09-05] Runs whenever anything was pending -- the gate used
+        // to be `has_pending && fresh_count > 0`, which skipped the sibling
+        // FULL-CANCEL branch (has_pending && fresh_count == 0) entirely.  That
+        // is the branch where a failed cancel does the most damage: with every
+        // tier stale, selective_cancel(all_ids) returns only the ids it really
+        // cancelled, and the unfiltered path then posted a whole replacement
+        // ladder over whatever stayed resting.  It also desynchronised the
+        // limiter above, which excludes resting tiers from the XCH budget
+        // unconditionally -- so those duplicates were posted UNRESERVED.  The
+        // filter body is unchanged and correct here: cancelled_ids is the
+        // full-cancel result and brand-new tiers still qualify through
+        // pending_keys.  The whole decision (gate included) now lives in
+        // select_postable_tiers so ctest can reach it.
+        if (has_pending) {
+            std::vector<TierQuote> postable = select_postable_tiers(
+                fee_filtered_tiers, tier_classes, cancelled_ids);
+
+            if (postable.empty()) {
+                spdlog::debug("[Engine] Step 8: {} no tiers to repost -- "
+                              "every candidate slot is still held by a live "
+                              "offer (fresh, or a cancel that did not land)",
+                              pair_name);
+                continue;
+            }
+
+            spdlog::info("[Engine] Step 8: {} T5-01 replacement filter -- "
+                         "posting {}/{} candidate tiers",
+                         pair_name, postable.size(),
+                         fee_filtered_tiers.size());
+            fee_filtered_tiers = std::move(postable);
+        }
+
         // Pending exposure guard (pre-post projection): include currently
         // pending offers plus candidate new tiers and suppress any side that
         // would breach reserve if all accepted.
@@ -11596,52 +12203,6 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             spdlog::info("[Engine] Step 8: {} all tiers filtered by pending "
                          "exposure projection", pair_name);
             continue;
-        }
-
-        // [T5-01] Selective refresh filter: when we did a selective cancel
-        // (some tiers were Fresh and left live), only post replacements for
-        // the tiers that were actually cancelled.  Posting duplicates of
-        // Fresh tiers would create double-exposure at the same price level.
-        if (has_pending && fresh_count > 0 && !cancelled_ids.empty()) {
-            // Build a set of (side, tier_index) keys for cancelled tiers.
-            std::unordered_set<std::string> cancelled_keys;
-            for (const auto& tc : tier_classes) {
-                if (tc.staleness != execution::TierStaleness::Fresh) {
-                    cancelled_keys.insert(
-                        std::to_string(static_cast<int>(tc.side))
-                        + "_" + std::to_string(tc.tier_index));
-                }
-            }
-            // Also include tiers that have no pending offer at all
-            // (brand new tiers that weren't in the previous ladder).
-            std::unordered_set<std::string> pending_keys;
-            for (const auto& tc : tier_classes) {
-                pending_keys.insert(
-                    std::to_string(static_cast<int>(tc.side))
-                    + "_" + std::to_string(tc.tier_index));
-            }
-
-            std::vector<TierQuote> selective_tiers;
-            for (const auto& tq : fee_filtered_tiers) {
-                std::string key = std::to_string(static_cast<int>(tq.side))
-                                + "_" + std::to_string(tq.tier_index);
-                if (cancelled_keys.count(key) > 0 ||
-                    pending_keys.count(key) == 0) {
-                    selective_tiers.push_back(tq);
-                }
-            }
-
-            if (selective_tiers.empty()) {
-                spdlog::debug("[Engine] Step 8: {} selective refresh has no "
-                              "tiers to repost (all fresh)", pair_name);
-                continue;
-            }
-
-            spdlog::info("[Engine] Step 8: {} selective refresh -- posting "
-                         "{}/{} replacement tiers",
-                         pair_name, selective_tiers.size(),
-                         fee_filtered_tiers.size());
-            fee_filtered_tiers = std::move(selective_tiers);
         }
 
         // [T1-03] co_await post_quotes directly instead of use_future.
@@ -16804,6 +17365,11 @@ void Engine::step_check_ledger_invariant(BlockHeight block_height)
             spdlog::error("[Engine] LEDGER CONTROL: pausing on {}",
                           asset.substr(0, 12));
             state_->set_status(BotStatus::Paused);
+            // [S33 2026-09-05] Escalation takes the shared latch away from the
+            // rolling-window cooldown, whether or not this control got there
+            // first: this pause ends in reconciliation, not in the loss window
+            // going quiet.
+            window_loss_latched_ = false;
             if (!breaker_pause_active_) {
                 // Latch on the false-to-true TRANSITION only.  Persistent
                 // conditions re-enter this block every heartbeat, and an
@@ -17204,7 +17770,59 @@ void Engine::step_update_pnl(BlockHeight block_height)
         // (see the S20 note in mark_to_market).  An earlier cut of this
         // branch gated without that change and would have injected the
         // very discontinuity it was meant to prevent.
-        [this](const std::string& pair, [[maybe_unused]] const std::string& asset) -> Mojo {
+        //
+        // [XCH-MTM-ISOLATION 2026-09-04] Base asset XCH is the global
+        // reserve currency of the wallet.  Its USD value is known
+        // authoritatively from CEX/anchors (usd_per_xch / asset_usd_pseudo_price).
+        // Deriving the whole wallet's XCH mark from an individual CAT pair's
+        // local DEX spread (e.g. wide BYC vs tight DBX) caused MTM
+        // hopping of -$9 to -$12 whenever an illiquid CAT book widened,
+        // tripping Step 13's rolling-window circuit breaker.
+        // When asset is "xch", normalize the price to the canonical USD rate.
+        [this](const std::string& pair, const std::string& asset) -> Mojo {
+            if (asset == "xch") {
+                const Mojo xch_usd_mojos = asset_usd_pseudo_price(AssetId{"xch"});
+                // [S33 2026-09-05] Denominate with the factor the loop above
+                // REGISTERED for this pair, not the live one.  When the live
+                // factor is ungraded that loop registers the CARRIED
+                // last-trusted value instead, and mark_to_market converts
+                // both this price and the cost basis back to USD with the
+                // REGISTERED factor -- so dividing by the live factor here
+                // yielded xch_usd * carried/live rather than canonical XCH
+                // USD, and the wallet's XCH mark hopped between XCH/BYC (par:
+                // carried == live) and XCH/DBX (derived from its own mid)
+                // exactly as before this isolation existed.  The carry map is
+                // also the grade gate quote_usd_factor() bypasses: by
+                // construction it only ever holds TRUSTED factors, while
+                // quote_usd_factor's non-pegged branch is deliberately
+                // ungated and will happily derive one from an ungraded mid.
+                //
+                // NO CARRY ENTRY RETURNS 0, and that is a second, deliberate
+                // behaviour change: the pre-S33 code fell through to this CAT
+                // book's local mid (gated on mid_valuation_grade), which is
+                // the valuation this isolation exists to keep out of the XCH
+                // mark.  It is also INERT, for a reason worth stating rather
+                // than assuming: the registration loop above writes an entry
+                // for EVERY configured pair whenever it has a usable factor,
+                // so "no entry" is exactly "registered UNPRICEABLE
+                // (usd_per_quote_unit == 0)".  mark_to_market zeroes that
+                // pair's cost basis for the same reason, so has_position is
+                // false and the pair marks nothing whatever this callback
+                // returns -- it is not even deferred to the S20 carry pass,
+                // which needs a basis.  (An earlier draft of this comment said
+                // the carry "owns the decision" here.  It does not; nothing
+                // does, because the pair contributes nothing.)  Another pair
+                // with a real factor still marks XCH through the dedup.
+                // Pinned in cpp/tests/test_xch_mark_price.cpp and
+                // cpp/tests/test_pnl_tracker.cpp.
+                const auto carried_it =
+                    last_trusted_quote_usd_factor_.find(pair);
+                return xch_mark_price_mojos(
+                    xch_usd_mojos,
+                    carried_it != last_trusted_quote_usd_factor_.end()
+                        ? carried_it->second
+                        : 0.0);
+            }
             auto snap = state_->get_market(pair);
             return snap.mid_valuation_grade ? snap.mid_price : 0;
         },
@@ -17339,6 +17957,26 @@ void Engine::step_update_pnl(BlockHeight block_height)
 }
 
 // Step 12: Export metrics to Prometheus.
+// [S33 2026-09-12] See the contract in engine.hpp.  One rule, one place:
+// this is the `reachable` both exporters pass to node_health_flags().
+bool Engine::node_probe_live_now() const
+{
+    return node_probe_is_live(
+        !wallet_only_configured_ && full_node_ && full_node_->is_open(),
+        node_last_probe_,
+        std::chrono::steady_clock::now());
+}
+
+// [review 3997548811] See the contract in engine.hpp.  One rule, one place:
+// this is the `dexie_connected` both exporters publish.
+bool Engine::dexie_probe_live_now() const
+{
+    return dexie_probe_is_live(
+        dexie_ && dexie_->is_open(),
+        dexie_last_success_at_,
+        std::chrono::steady_clock::now());
+}
+
 void Engine::step_export_metrics(BlockHeight block_height)
 {
     if (!metrics_->is_running()) return;
@@ -17395,15 +18033,39 @@ void Engine::step_export_metrics(BlockHeight block_height)
 
     // Dashboard 4: System health
     SystemHealthSnapshot health;
-    health.block_height    = block_height;
+    health.block_height     = block_height;
     // [review] Derived, not asserted. Every wallet-driven heartbeat reached
     // here and published the FAILED node as synced, masking the outage in
     // monitoring and in the GUI for its whole duration -- which is the one
     // period anyone would be looking.
-    health.node_synced     = !wallet_only_configured_
-                          && !wallet_only_mode_
-                          && height_source_.current == risk::HeightSource::FullNode;
+    // [S33 2026-09-05] Same separation here.  node_synced was a copy of
+    // reachability and node_syncing_ had no writer anywhere in the tree, so
+    // this published a hard syncing=false and the GUI's "Full Node:
+    // Syncing..." state was unreachable for the whole of the one period an
+    // operator would be looking.  Both flags now come from the sync object of
+    // the blockchain-state response get_block_height() already fetches, gated
+    // on the NODE being the live height source so a wallet-sourced heartbeat
+    // cannot republish a stale node reading.  The derivation is shared with
+    // run_startup_analysis through node_health_flags() -- one rule, one test.
+    const auto node_sync = full_node_
+                               ? full_node_->last_sync_state()
+                               : rpc::ChiaFullNodeRPC::SyncState{};
+    // [S33 2026-09-12] The height-source clause that used to sit here
+    // (`&& height_source_.current == FullNode`, with the wallet_only_mode_
+    // latch it moves in step with) denied reachability for the whole of an
+    // auto fallback -- including the catch-up during which the node answers
+    // every probe.  Freshness carries the anti-stale property instead; see
+    // node_probe_is_live().
+    const auto node_flags = node_health_flags(
+        node_probe_live_now(),
+        node_sync.synced, node_sync.syncing);
+    health.node_connected   = node_flags.connected;
+    health.node_synced      = node_flags.synced;
+    health.node_syncing     = node_flags.syncing;
     health.wallet_connected = wallet_->is_open();
+    health.wallet_synced    = wallet_synced_;
+    health.wallet_syncing   = wallet_syncing_;
+    health.dexie_connected  = dexie_probe_live_now();
     metrics_->update_system_health(health);
 
     // Dashboard 5: Offer lifecycle
@@ -17687,6 +18349,11 @@ void Engine::step_check_alerts(BlockHeight block_height)
         || unvaluable_report_pending_) {
         unvaluable_report_pending_ = false;
         breaker_pause_active_ = true;
+        // [S33 2026-09-05] Same escalation rule as the ledger and drawdown
+        // controls: an unvaluable book is cleared by valuation returning, not
+        // by the loss window going quiet, so the rolling-window cooldown must
+        // not own this latch.
+        window_loss_latched_ = false;
         state_->set_status(BotStatus::Paused);
         if (valuation_all_unpriced_) {
             spdlog::error("[Engine] Step 13: [S27] NO held asset has a "
@@ -17772,6 +18439,33 @@ void Engine::step_check_alerts(BlockHeight block_height)
                 breaker_pause_active_ = true;
                 breaker_skip_warned_  = false;
             }
+            // [S33 2026-09-05] Same escalation rule as the ledger control, and
+            // deliberately OUTSIDE the transition-only if so it applies on
+            // every breached evaluation: a max-drawdown breach is never lifted
+            // by the rolling-window cooldown, so revoke that breaker's
+            // ownership of the shared latch even when it got there first.
+            //
+            // [review] This is PERMANENT for the life of the pause: ownership
+            // is only taken on the window breaker's own false-to-true
+            // transition, which cannot recur while the pause holds.  So a
+            // single TRANSIENT breach read -- the flaky-equity-computation
+            // shape the kRealertRearmStreak note below documents as observed
+            // live -- converts a self-clearing window pause into one that
+            // waits for an operator.  Accepted, deliberately:
+            //   - it costs nothing while the breach holds, because
+            //     equity_healthy is (dd < max_drawdown_frac_) && !unvaluable
+            //     and already resets the cooldown streak every breached
+            //     evaluation;
+            //   - the drawdown breaker has NO self-clearing path of its own,
+            //     so "breached at least once, now recovered but never
+            //     acknowledged" is exactly the state that must not auto-resume;
+            //   - it is not silent: breaker_realert_gate_ below fires the
+            //     CRITICAL max-drawdown alert on this same evaluation;
+            //   - it fails safe (stuck Paused, never stuck trading).
+            // Do not "fix" this by moving it inside the transition guard --
+            // that reinstates the bug, because the window breaker latching
+            // first makes breaker_pause_active_ already true here.
+            window_loss_latched_ = false;
             if (first_trip) {
                 spdlog::error("[Engine] Step 13: MAX DRAWDOWN BREACHED -- "
                               "equity ${:.2f} is {:.2f}% below peak "
@@ -17871,25 +18565,30 @@ void Engine::step_check_alerts(BlockHeight block_height)
     // breach from re-alerting every block.
     if (config_.risk.max_window_loss_bps > 0.0) {
 
-        // 1. Append current snapshot.
-        pnl_window_usd_.push_back({block_height, total.total_pnl_usd});
+        if (drawdown_grace_remaining_ > 0) {
+            pnl_window_usd_.clear();
+            pnl_window_usd_.push_back({block_height, total.total_pnl_usd});
+        } else {
+            // 1. Append current snapshot.
+            pnl_window_usd_.push_back({block_height, total.total_pnl_usd});
 
-        // 2. Trim entries that fall outside the rolling window.
-        //    Entries are ordered by ascending block_height; pop from front.
-        //    We keep only entries whose age is strictly less than
-        //    loss_window_blocks (i.e., within the window).  An entry is
-        //    considered stale when block_height - entry_block >= window_size.
-        while (pnl_window_usd_.size() > 1) {
-            const BlockHeight oldest = pnl_window_usd_.front().first;
-            if (block_height - oldest >= config_.risk.loss_window_blocks) {
-                pnl_window_usd_.pop_front();
-            } else {
-                break;
+            // 2. Trim entries that fall outside the rolling window.
+            //    Entries are ordered by ascending block_height; pop from front.
+            //    We keep only entries whose age is strictly less than
+            //    loss_window_blocks (i.e., within the window).  An entry is
+            //    considered stale when block_height - entry_block >= window_size.
+            while (pnl_window_usd_.size() > 1) {
+                const BlockHeight oldest = pnl_window_usd_.front().first;
+                if (block_height - oldest >= config_.risk.loss_window_blocks) {
+                    pnl_window_usd_.pop_front();
+                } else {
+                    break;
+                }
             }
         }
 
         // 3. Compute window_loss (positive = PnL decreased over the window).
-        if (pnl_window_usd_.size() >= 2) {
+        if (pnl_window_usd_.size() >= 2 && drawdown_grace_remaining_ == 0) {
             const double window_start_pnl = pnl_window_usd_.front().second;
             const double window_loss_usd =
                 window_start_pnl - total.total_pnl_usd;
@@ -17905,6 +18604,11 @@ void Engine::step_check_alerts(BlockHeight block_height)
                 equity_usd, anchor_fallback_usd,
                 config_.risk.max_window_loss_bps);
 
+            const double dd = (peak_equity_hwm_usd_ > 0.0)
+                ? risk::equity_drawdown_frac(peak_equity_hwm_usd_, equity_usd)
+                : 0.0;
+            const bool equity_healthy = (dd < max_drawdown_frac_) && !unvaluable_now;
+
             // 4. Fire if window_loss exceeds the threshold.
             // [S20] Also ungated, for the same fail-open reason as the
             // drawdown comparison above: a loss detector that switches
@@ -17913,6 +18617,7 @@ void Engine::step_check_alerts(BlockHeight block_height)
             if (window_loss_usd > 0.0 && threshold_usd > 0.0
                     && window_loss_usd > threshold_usd) {
 
+                window_loss_recover_streak_ = 0;
                 const BlockHeight window_actual =
                     block_height - pnl_window_usd_.front().first;
 
@@ -17933,6 +18638,10 @@ void Engine::step_check_alerts(BlockHeight block_height)
                                                      : anchor_fallback_usd);
                     state_->set_status(BotStatus::Paused);
                     breaker_pause_active_ = true;
+                    // [S33 2026-09-05] This breaker now OWNS the shared latch.
+                    // Only taken on the false-to-true transition, so the latch
+                    // is provably unowned here.
+                    window_loss_latched_  = true;
                     breaker_skip_warned_  = false;
                     alerts_->send_alert(AlertRule::CircuitBreaker,
                         "Rolling-window circuit breaker triggered: lost $" +
@@ -17945,6 +18654,45 @@ void Engine::step_check_alerts(BlockHeight block_height)
                     spdlog::debug("[Engine] Step 13: rolling-window breach "
                                   "persists while latched (loss=${:.4f})",
                                   window_loss_usd);
+                }
+            } else {
+                // Auto-cooldown for the rolling-window loss breaker: when
+                // equity is healthy and the window loss has normalized, streak
+                // up to clear the latch.
+                //
+                // [S33 2026-09-05] The whole decision -- including the two
+                // guards this branch used to carry inline (does the window
+                // still OWN the shared latch, and is the operator's pause flag
+                // down) -- lives in risk::evaluate_window_cooldown so ctest can
+                // reach it.  It is the change in this family that decides
+                // whether a live bot resumes trading; see
+                // cpp/tests/test_drawdown_breaker.cpp.
+                const auto cooldown = risk::evaluate_window_cooldown(
+                    breaker_pause_active_, window_loss_latched_,
+                    gui_pause_active_, window_loss_usd, threshold_usd,
+                    equity_healthy, window_loss_recover_streak_);
+                if (cooldown.clear_latch) {
+                    breaker_pause_active_ = false;
+                    window_loss_latched_  = false;
+                    breaker_skip_warned_  = false;
+                    pnl_window_usd_.clear();
+                    if (cooldown.set_running) {
+                        state_->set_status(BotStatus::Running);
+                    }
+                    spdlog::info("[Engine] Step 13: rolling-window loss normalized (loss=${:.4f} <= threshold=${:.4f}) "
+                                 "-- breaker latch cleared{}", window_loss_usd, threshold_usd,
+                                 cooldown.set_running
+                                     ? " -- auto-resuming trading"
+                                     : " (operator pause flag still set -- status stays Paused)");
+                    if (alerts_) {
+                        alerts_->send_alert(AlertRule::CircuitBreaker,
+                            cooldown.set_running
+                                ? std::string("Rolling-window loss normalized -- engine "
+                                              "auto-resumed trading")
+                                : std::string("Rolling-window loss normalized -- breaker "
+                                              "latch cleared, but the operator pause flag "
+                                              "is still set so the engine stays PAUSED"));
+                    }
                 }
             }
         }
@@ -19399,14 +20147,30 @@ void Engine::check_pause_flag()
         gui_pause_active_ = false;
         if (state_->status() == BotStatus::Paused) {
             if (breaker_pause_active_) {
-                // The breaker owns this pause.  Flipping the status to
-                // Running here while Step 8 stays gated would have the GUI
-                // report a trading engine that is not trading -- the exact
-                // inverse of the bypass this PR fixes.  Status stays Paused
-                // until the restart the breaker already requires.
-                spdlog::info("[Engine] Pause flag removed, but a risk "
-                             "breaker holds the pause -- status stays "
-                             "Paused until restart");
+                // The operator explicitly removed the pause flag (clicked Resume in GUI).
+                // If equity is not in catastrophic drawdown (> max_drawdown_frac),
+                // reset breaker_pause_active_ and clear the rolling-window loss deque so
+                // trading can resume immediately without requiring a full process restart.
+                const double equity_usd = compute_portfolio_equity_usd();
+                const double peak = (peak_equity_hwm_usd_ > 0.0) ? peak_equity_hwm_usd_ : equity_usd;
+                const double dd = risk::equity_drawdown_frac(peak, equity_usd);
+                if (dd < max_drawdown_frac_) {
+                    breaker_pause_active_ = false;
+                    // [S33 2026-09-05] Keep the ownership flag false whenever
+                    // the latch itself is false, so a later breaker cannot
+                    // inherit a stale "the window owns this" true.
+                    window_loss_latched_  = false;
+                    breaker_lift_streak_  = 0;
+                    window_loss_recover_streak_ = 0;
+                    breaker_skip_warned_  = false;
+                    pnl_window_usd_.clear();
+                    state_->set_status(BotStatus::Running);
+                    spdlog::info("[Engine] Operator cleared pause flag -- resetting risk breaker latch and resuming trading (equity=${:.2f}, drawdown={:.1f}%)",
+                                 equity_usd, dd * 100.0);
+                } else {
+                    spdlog::warn("[Engine] Operator removed pause flag, but severe drawdown ({:.1f}% >= {:.1f}%) still holds breaker -- status stays Paused",
+                                 dd * 100.0, max_drawdown_frac_ * 100.0);
+                }
             } else {
                 state_->set_status(BotStatus::Running);
                 spdlog::info("[Engine] Pause flag removed -- resuming trading");

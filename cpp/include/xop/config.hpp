@@ -139,6 +139,15 @@ struct PairConfig {
     std::optional<std::vector<double>> tier_size_pct_override;
     std::optional<double>   max_half_spread_bps_override;
     std::optional<double>   min_offer_size_units_override;
+    std::optional<bool>     competitive_anchor_enabled_override;
+    std::optional<double>   competitive_anchor_max_distance_bps_override;
+    std::optional<double>   competitive_anchor_stride_bps_override;
+    std::optional<double>   fair_value_residual_widen_ratio_override;
+    std::optional<bool>     activity_adaptive_spacing_override;
+    std::optional<int>      activity_target_fills_24h_override;
+    std::optional<double>   activity_book_weight_override;
+    std::optional<double>   min_profit_margin_max_bps_override;
+    std::optional<std::vector<double>> tier_spacing_max_bps_override;
 
     // [BBOPERPAIR 2026-09-01] Per-pair BBO proximity caps.
     //
@@ -171,6 +180,48 @@ struct PairConfig {
     // blocks. See cpp/include/xop/strategy/bbo_sanity.hpp.
     std::optional<double>   bbo_sanity_max_aggressive_dev_override;
     std::optional<double>   bbo_sanity_max_passive_dev_override;
+
+    // [S33 2026-09-12] Per-pair ceiling for the two-sides-agree bypass,
+    // overriding market_data.book_side_agree_max_spread_bps for this pair.
+    //
+    // That knob is ONE number for the WHOLE BOT: it reaches MarketDataConfig
+    // once in Engine::Engine and the single MarketDataFeed built from it
+    // serves every enabled market. So lowering it to 1500 to stop XCH/BYC's
+    // 10,769 bps book from marking equity also denied the bypass to every
+    // other pair whose book happened to sit between 15% and 50% wide -- a
+    // retune nobody asked for, invisible in the diff that caused it.
+    //
+    // Absent -> the market_data value, so every pair without an entry is
+    // unchanged.
+    //
+    // BEFORE SETTING THIS, READ THE MarketDataConfig COMMENT ON
+    // book_side_agree_max_spread_bps IN THIS FILE, AND READ IT TOGETHER WITH
+    // mid_gate_book_confirm_max_spread_bps -- that header says the two must
+    // be read together before either is changed, and a per-pair value does
+    // not excuse you from it. Three consequences carry over unchanged:
+    //
+    //   * the value actually used is the min() of this and the gate's
+    //     mid_gate_book_confirm_max_spread_bps
+    //     (bookside::effective_agree_max_spread_bps), so RAISING this above
+    //     the gate does nothing;
+    //   * the gate threshold is NOT per-pair, so this can only ever make one
+    //     pair STRICTER than the bot-wide setting, never more permissive
+    //     than the gate;
+    //   * 0 is the documented "bypass off" SETTING and binds; absence is the
+    //     empty optional, which is a different thing.
+    //
+    // And the cost is per-pair too: lowering this can cost THIS pair its
+    // mid_valuation_grade (apply_mid_gate requires the book's own spread to
+    // be within the effective value), which falls to the S20 carry and then
+    // degrades the cycle. Fail-closed, and intended -- but budget for it.
+    std::optional<double>   book_side_agree_max_spread_bps_override;
+
+    // [OFFER-EXPIRY] Per-pair override of strategy.offer_expiry_secs.
+    // Absence inherits the global; 0 is a real setting ("never expire this
+    // pair's offers") and binds, exactly as with the agree-ceiling above.
+    // Expiry is opt-in per pair because its cost falls on TAKERS running
+    // older wallets, a population we cannot survey from here.
+    std::optional<std::uint32_t> offer_expiry_secs_override;
 
     // -- Market revival -----------------------------------------------------
     // Opt-in for a pair whose third-party book is expected to be empty or
@@ -305,6 +356,41 @@ struct StrategyConfig {
     double   q_max{1000.0};
     double   min_profit_margin_bps{35.0};   // Never ask below cost + this.
     uint32_t offer_ttl_blocks{60};          // Cancel stale offers after N blocks.
+
+    /// [OFFER-EXPIRY] On-chain expiry for offers we CREATE, in seconds.
+    /// 0 (the default) disables the feature entirely: no timelock is
+    /// attached and offers behave exactly as they did before it existed.
+    ///
+    /// Sent to create_offer_for_ids as `max_time` -- an ABSOLUTE unix
+    /// timestamp (now + this) that becomes ASSERT_BEFORE_SECONDS_ABSOLUTE on
+    /// the offer's spend, so an offer we lose track of stops being takeable
+    /// without us having to land a cancel for it.
+    ///
+    /// ONLY max_time is ever sent.  Chia exposes four absolute timelock
+    /// flags, but per Chia's own Offer RPC reference the reference wallet
+    /// "will only recognize max_time"; max_height, min_height and min_time
+    /// are enforced on-chain yet a reference-wallet taker's transaction
+    /// "will be initiated, but will fail".  For a market maker that is an
+    /// outage wearing the costume of a safety feature -- the book still
+    /// shows our offer, takers still try, and every take fails.
+    ///
+    /// Must exceed this bot's OWN hard TTL (offer_ttl_blocks x
+    /// OfferManager::kHardTtlMultiplier).  Validated in OfferManager's
+    /// constructor, which can see that constant -- config.cpp cannot, and
+    /// restating the multiplier there would give a safety bound two sources
+    /// of truth.  An expiry inside our own TTL would silently retire offers
+    /// the engine still believes are live: no cancel is recorded, and the
+    /// book thins with nothing in the log to explain it.
+    ///
+    /// [review #150] What the COINS do is deliberately not claimed.
+    /// max_time stops an offer being TAKEN; whether the wallet still counts
+    /// an expired PENDING_ACCEPT trade in get_locked_coins() is established
+    /// nowhere in this repo, and an earlier revision asserted the
+    /// reassuring half of that ("the coins unlock") on no evidence.  What IS
+    /// verified is narrower: spendable selection subtracts get_locked_coins()
+    /// (docs/warp-unwrap-design.md section 7).  Do not rely on an expiry to
+    /// return collateral -- land a cancel.
+    uint32_t offer_expiry_secs{0};
 
     // [ALWAYSOFFER 2026-08-30] Side-aware BBO sanity (see bbo_sanity.hpp).
     // Aggressive deviation (would EXECUTE dislocated) keeps the tight
@@ -454,6 +540,15 @@ struct StrategyConfig {
     /// Applied symmetrically to both signs of imbalance.  0 disables the
     /// offset entirely (a zero cap admits no shift).
     double   as_reservation_max_offset_bps{100.0};
+
+    // -- 24h Activity-adaptive tier margin and spacing -----------------------
+    /// When enabled, market maker margins and tier spacings dynamically scale
+    /// between configured minimums and maximums based on trailing confirmed fills
+    /// and resting order-book depth.
+    bool     activity_adaptive_spacing{false};
+    int      activity_target_fills_24h{24};
+    double   activity_book_weight{0.5};
+    std::uint32_t activity_lookback_blocks{1662};
 
     // -- Triangulation weights ----------------------------------------------
     // The fair value is a weighted least-squares solve over the graph of

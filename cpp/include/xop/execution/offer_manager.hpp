@@ -51,6 +51,7 @@
 #include <nlohmann/json.hpp>
 
 #include "xop/execution/coin_lock_ledger.hpp"
+#include "xop/execution/offer_expiry.hpp"
 #include "xop/execution/take_retry.hpp"
 #include <spdlog/spdlog.h>
 
@@ -825,6 +826,32 @@ public:
     /// age are always expired regardless of price accuracy.
     static constexpr std::uint32_t kHardTtlMultiplier = 2;
 
+    // [review #150] kSecondsPerBlock (18.75) lived here and was BOTH a
+    // second source of truth for a safety bound and ~2.8x too fast.  The
+    // configured mean inter-block interval already exists as
+    // StrategyConfig::block_time_seconds (52.0), parsed and range-checked
+    // in config.cpp -- that is what the startup floor now reads.
+
+    // -- [OFFER-EXPIRY] wiring (the decisions are in offer_expiry.hpp) ------
+
+    /// The absolute max_time to attach to @p pair's next offer, or nullopt
+    /// when this pair has expiry disabled -- in which case the RPC payload
+    /// is byte-identical to the one sent before this feature existed.
+    /// Supplies the clock and the config; the arithmetic is
+    /// expiry_max_time_from().
+    std::optional<std::uint64_t> expiry_max_time_for(
+        const PairConfig& pair) const;
+
+    /// Adopt, then cancel, an offer created WITHOUT the expiry we asked
+    /// for.  Adoption comes first for the same reason as the watchdog's
+    /// late-create path: a secure cancel is an unconfirmed spend, and a
+    /// fill on an unadopted trade is invisible both to fill detection and
+    /// to the next startup reconcile.
+    asio::awaitable<void> retire_offer_failed_expiry(
+        const PendingOffer& adopt,
+        std::uint64_t       expected_max_time,
+        const char*         context);
+
     /**
      * @brief Emergency cancel with reduced or zero fee.
      *
@@ -1147,9 +1174,12 @@ private:
     static constexpr double kVolSpikeMult            = 2.0;
 
     /// [T5-01] Selective refresh: fractional price deviation threshold.
-    /// Only *adverse* deviations (bid too high / ask too low) trigger
-    /// staleness.  Favorable deviations (bid drifted lower / ask drifted
-    /// higher) make the offer more conservative, not dangerous.
+    /// Adverse deviations (bid too high / ask too low) trigger staleness at
+    /// this threshold.  Favorable deviations (bid drifted lower / ask drifted
+    /// higher) make the offer more conservative, so [S33] refreshes them only
+    /// past kFavorableDriftMultiplier x the TIER-SCALED threshold
+    /// (cross_guard.hpp) -- that multiplier applies to the scaled value, not
+    /// to this tier-0 base.
     /// Set to 1.0% adverse deviation for tier 0 (innermost).  Outer
     /// tiers apply a wider threshold scaled by kTierThresholdScale.
     /// [v0.7.47] Raised 0.005 -> 0.010 after live audit showed 49/50

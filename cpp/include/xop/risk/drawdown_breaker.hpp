@@ -223,6 +223,77 @@ namespace xop::risk {
     return anchor * max_window_loss_bps / 10'000.0;
 }
 
+// ---------------------------------------------------------------------------
+// Rolling-window auto-cooldown ([S33 2026-09-05]).
+//
+// The rolling-window loss breaker is the ONLY breaker with a self-clearing
+// path: five consecutive evaluations with the window loss back inside its
+// threshold and equity healthy lift the pause.  But `breaker_pause_active_`
+// is a SHARED latch -- max-drawdown, unvaluable book and ledger divergence
+// set the same flag -- and `equity_healthy` only covers the first two WHILE
+// THEY STILL HOLD.  A recovered-but-unacknowledged drawdown trip, or a ledger
+// divergence that has since re-baselined itself, was therefore lifted by five
+// quiet window samples: the cooldown resumed a bot another breaker had
+// deliberately stopped.  `window_loss_latched` is the engine's record that
+// the window breaker is the one that took the latch, and every other breaker
+// revokes it on escalation.
+//
+// Second decision here: clearing THIS breaker's latch is not the same as
+// resuming.  Step 13 runs during a GUI pause by design, so the operator's
+// pause flag can still be down; publishing Running then leaves Step 8 skipped
+// by the gui_pause_active_ arm while the status reads Running, and
+// check_pause_flag() only re-pauses on the flag's false-to-true EDGE, so
+// nothing would ever correct it.
+// ---------------------------------------------------------------------------
+
+/// Consecutive normalized evaluations required to lift the rolling-window
+/// pause.  ~5 heartbeats of quiet, long enough to outlive a single odd P&L
+/// snapshot and short enough that a genuine recovery resumes promptly.
+inline constexpr int kWindowLossRecoverStreak = 5;
+
+/// What the cooldown evaluation decided this heartbeat.
+struct WindowCooldownDecision {
+    /// Clear `breaker_pause_active_` AND `window_loss_latched_`.
+    bool clear_latch{false};
+    /// Publish BotStatus::Running.  Only ever true together with
+    /// clear_latch; false under an operator pause, where the status must
+    /// stay Paused even though the breaker latch is gone.
+    bool set_running{false};
+};
+
+/// One heartbeat of the rolling-window auto-cooldown.  Call it only on the
+/// evaluations where the window did NOT breach (the engine's else-branch).
+///
+/// `recover_streak` is the engine's persistent counter, updated in place:
+/// incremented on a normalized evaluation, reset on any other outcome
+/// (including "the window does not own this pause", so no streak accumulates
+/// toward lifting someone else's latch), and reset again when it fires.
+[[nodiscard]] inline WindowCooldownDecision evaluate_window_cooldown(
+    bool   breaker_pause_active,
+    bool   window_loss_latched,
+    bool   gui_pause_active,
+    double window_loss_usd,
+    double threshold_usd,
+    bool   equity_healthy,
+    int&   recover_streak) noexcept
+{
+    if (!breaker_pause_active || !window_loss_latched) {
+        // Not paused, or paused by a breaker that ends in reconciliation /
+        // operator acknowledgement rather than in the loss window going
+        // quiet.  Never lift, and do not accumulate a streak toward it.
+        recover_streak = 0;
+        return {};
+    }
+    if (!(window_loss_usd <= threshold_usd) || !equity_healthy) {
+        recover_streak = 0;   // NaN-safe: an unordered comparison resets
+        return {};
+    }
+    ++recover_streak;
+    if (recover_streak < kWindowLossRecoverStreak) return {};
+    recover_streak = 0;
+    return {/*clear_latch=*/true, /*set_running=*/!gui_pause_active};
+}
+
 /// Fixed nominal for the window-loss anchor when NOTHING can be valued
 /// yet (no equity, no live 1-XCH USD price): $1.50, near the 2026-08 spot
 /// (~$1.39-1.58).  A LOWER anchor means a LOWER loss threshold -- the

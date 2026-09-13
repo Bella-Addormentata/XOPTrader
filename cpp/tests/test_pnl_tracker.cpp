@@ -1013,3 +1013,72 @@ TEST_F(PnLTrackerTest, AnUnregisteredRetiredPairStillUsesTheSymbolFallback) {
     EXPECT_DOUBLE_EQ(s.realized_pnl_usd, 500.0)
         << "the retired-pair fallback was lost";
 }
+
+// ---------------------------------------------------------------------------
+// [S33 2026-09-05] The XCH mark's "no registered factor" case, at the layer an
+// operator sees.
+//
+// engine.cpp's price callback returns 0 for base asset "xch" when the pair has
+// no entry in last_trusted_quote_usd_factor_.  That is a SECOND behaviour
+// change beside the carried-vs-live divisor fix (the pre-S33 code fell through
+// to the CAT book's own mid), and the comment there claims it is inert.  This
+// is that claim, asserted rather than asserted-about: "no carry entry" is
+// exactly "registered with usd_per_quote_unit == 0", and mark_to_market zeroes
+// such a pair's cost basis, so has_position is false and the pair marks
+// nothing WHATEVER the price callback returns.
+//
+// NON-VACUITY (not a mutation check -- the engine-side call site is not
+// reachable from any test, and pnl.cpp is not this change's file): the third
+// case runs the identical setup with a real factor and shows a non-zero mark,
+// so the zeros above are the basis rule and not an inert fixture.
+// ---------------------------------------------------------------------------
+TEST_F(PnLTrackerTest, AnUnpriceablePairMarksNothingWhateverThePriceSays) {
+    // Returns the pair's inventory_pnl after one mark_to_market pass.
+    auto mark_once = [&](const char* db_name,
+                         double      usd_per_quote_unit,
+                         xop::Mojo   price_from_callback) -> xop::Mojo {
+        const std::string path = (dir_ / db_name).string();
+        xop::PnLTracker t(path);
+        t.init_database();
+        t.set_pair_conversion("XCH/DBX", "xch", kBaseXchD, kCatDenomD,
+                              usd_per_quote_unit);
+
+        xop::Fill f = make_fill("trade-unpriceable", xop::Side::Ask,
+                                static_cast<xop::Mojo>(2.5e12),
+                                static_cast<xop::Mojo>(1e12));
+        f.pair_name = "XCH/DBX";
+        EXPECT_TRUE(t.record_fill(f, 0, static_cast<xop::Mojo>(2.0e12), 0));
+
+        t.mark_to_market(
+            [&](const std::string&, const std::string&) -> xop::Mojo {
+                return price_from_callback;
+            },
+            [](const std::string&) -> xop::Mojo {
+                return static_cast<xop::Mojo>(1e12);   // 1 XCH held
+            },
+            [](const std::string&) -> xop::Mojo {
+                return static_cast<xop::Mojo>(2.0e12); // USD-pseudo basis $2
+            },
+            /*xch_usd_price=*/2.5,
+            [](const std::string&) -> double {
+                return kCatDenomD / kBaseXchD;
+            });
+        return t.get_pair_pnl("XCH/DBX").inventory_pnl;
+    };
+
+    // 1. What the S33 callback actually returns for an unpriceable pair.
+    EXPECT_EQ(mark_once("zero_price.db", 0.0, 0), 0);
+
+    // 2. What the PRE-S33 code returned instead -- this CAT book's own mid.
+    //    Identical outcome, because the missing factor already zeroed the
+    //    basis: the deferral is a no-op, so returning 0 costs nothing and
+    //    keeps the local DEX mid out of the XCH mark by construction.
+    EXPECT_EQ(mark_once("local_mid.db", 0.0,
+                        static_cast<xop::Mojo>(2.5e12)), 0)
+        << "an unpriceable pair must contribute nothing either way";
+
+    // 3. Non-vacuity: the same fixture with a real registered factor marks.
+    EXPECT_EQ(mark_once("priced.db", 1.0, static_cast<xop::Mojo>(2.5e12)),
+              500)
+        << "($2.50 - $2.00) x 1 XCH = $0.50 = 500 quote mojos";
+}

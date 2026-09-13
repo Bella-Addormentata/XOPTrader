@@ -477,7 +477,9 @@ class MetricsService(QObject):
         Returns
         -------
         dict[str, float]
-            Keys: ``block_height``, ``node_synced``, ``wallet_connected``.
+            Keys: ``block_height``, ``node_connected``, ``node_synced``,
+            ``node_syncing``, ``wallet_connected``, ``wallet_synced``,
+            ``wallet_syncing``.
             Boolean metrics are represented as ``1.0`` (true) / ``0.0``
             (false).
         """
@@ -485,8 +487,30 @@ class MetricsService(QObject):
             m = self._latest
         return {
             "block_height": _labelled(m, "xop_node", "metric", "block_height"),
-            "node_synced": _labelled(m, "xop_node", "metric", "synced"),
-            "wallet_connected": _labelled(m, "xop_node", "metric", "wallet_connected"),
+            "node_connected": _labelled(m, "xop_node", "metric", "node_connected", default=_labelled(m, "xop_node", "metric", "synced")),
+            "node_synced": _labelled(m, "xop_node", "metric", "node_synced", default=_labelled(m, "xop_node", "metric", "synced")),
+            "node_syncing": _labelled(m, "xop_node", "metric", "node_syncing", default=0.0),
+            # [S33 2026-09-05] Legacy-engine compat belongs HERE, not in the
+            # indicator that reads it.  The default is used only when the
+            # sample is ABSENT, so an engine that predates the gauge but
+            # reports a synced wallet still reads connected, while an engine
+            # that explicitly publishes wallet_connected=0 is reported as 0
+            # and the wallet dot can reach "Disconnected".  Same shape as
+            # node_connected's fallback onto the legacy "synced" gauge above.
+            "wallet_connected": _labelled(
+                m, "xop_node", "metric", "wallet_connected",
+                default=_labelled(m, "xop_node", "metric", "wallet_synced"),
+            ),
+            "wallet_synced": _labelled(m, "xop_node", "metric", "wallet_synced", default=0.0),
+            "wallet_syncing": _labelled(m, "xop_node", "metric", "wallet_syncing", default=0.0),
+            # [review 3997548811] Engine-published VENUE reachability, as
+            # distinct from whether this scrape reached the engine.
+            # Fail-closed on absence: unlike node_connected there is no
+            # legacy gauge to fall back to, and an engine too old to
+            # publish this cannot be asked whether Dexie is up -- so the
+            # honest answer is "not known to be reachable", which is the
+            # same default the syncing gauges already take.
+            "dexie_connected": _labelled(m, "xop_node", "metric", "dexie_connected", default=0.0),
         }
 
     def has_data(self) -> bool:

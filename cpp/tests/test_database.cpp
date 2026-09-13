@@ -295,6 +295,113 @@ TEST(DatabaseTest, FilledStatusRemainsAuthoritativeAfterLaterReconcile)
     close_db();
 }
 
+TEST(DatabaseTest, TradeCountsBySideSinceBlock)
+{
+    TempDbPath temp_db{"xop_trade_counts_by_side"};
+    xop::Database db(temp_db.path().string());
+
+    auto insert_trade = [&](const std::string& id, const std::string& pair, const std::string& side, xop::BlockHeight block) {
+        xop::DbTradeRecord tr;
+        tr.timestamp = "2026-09-04T12:00:00Z";
+        tr.trade_id = id;
+        tr.pair_name = pair;
+        tr.side = side;
+        tr.price_mojos = 1500000000000LL;
+        tr.size_mojos = 1000000000000LL;
+        tr.fee_mojos = 10000;
+        tr.cost_basis_mojos = 1400000000000LL;
+        tr.realized_pnl_mojos = 100;
+        tr.block_height = block;
+        db.insert_trade(tr);
+    };
+
+    insert_trade("t1", "XCH/BYC", "bid", 100);
+    insert_trade("t2", "XCH/BYC", "bid", 150);
+    insert_trade("t3", "XCH/BYC", "ask", 120);
+    insert_trade("t4", "XCH/BYC", "ask", 200);
+    insert_trade("t5", "XCH/BYC", "ask", 250);
+    insert_trade("t6", "XCH/DBX", "bid", 250); // different pair
+
+    // Query since block 100
+    auto counts_100 = db.query_trade_counts_by_side("XCH/BYC", 100);
+    EXPECT_EQ(counts_100.first, 2);  // 2 bids
+    EXPECT_EQ(counts_100.second, 3); // 3 asks
+
+    // Query since block 150
+    auto counts_150 = db.query_trade_counts_by_side("XCH/BYC", 150);
+    EXPECT_EQ(counts_150.first, 1);  // 1 bid (t2)
+    EXPECT_EQ(counts_150.second, 2); // 2 asks (t4, t5)
+
+    // Query since block 300 (future)
+    auto counts_300 = db.query_trade_counts_by_side("XCH/BYC", 300);
+    EXPECT_EQ(counts_300.first, 0);
+    EXPECT_EQ(counts_300.second, 0);
+}
+
+// [S33 2026-09-05] The activity controller runs the query above once per
+// enabled pair on EVERY heartbeat.  The only pair index used to be
+// idx_trade_log_pair (pair_name, timestamp), whose pair_name prefix bounds
+// nothing here -- SQLite scanned that pair's entire append-only history to
+// apply the block_height filter, so a 24-hour window cost grew with the whole
+// table (the live database is already 100MB+).  This asserts the PLAN, not
+// merely that the index exists: an index the planner declines to use is not a
+// fix.  Delete kIndexTradePairBlock from run_migrations' ddl_statements and
+// this goes red.
+TEST(DatabaseTest, TradeCountsBySideUsesTheBlockHeightIndex)
+{
+    TempDbPath temp_db{"xop_trade_counts_plan"};
+    xop::Database db(temp_db.path().string());
+
+    sqlite3* raw = nullptr;
+    ASSERT_EQ(sqlite3_open(temp_db.path().string().c_str(), &raw), SQLITE_OK);
+
+    // The index must be created idempotently on OPEN, so that the pre-existing
+    // live database picks it up without a hand-run migration.
+    {
+        sqlite3_stmt* st = nullptr;
+        ASSERT_EQ(sqlite3_prepare_v2(
+                      raw,
+                      "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index'"
+                      "  AND name = 'idx_trade_log_pair_block';",
+                      -1, &st, nullptr),
+                  SQLITE_OK);
+        ASSERT_EQ(sqlite3_step(st), SQLITE_ROW);
+        EXPECT_EQ(sqlite3_column_int(st, 0), 1);
+        sqlite3_finalize(st);
+    }
+
+    // Byte-for-byte the statement Database prepares for the controller.
+    std::string plan;
+    {
+        sqlite3_stmt* st = nullptr;
+        ASSERT_EQ(sqlite3_prepare_v2(
+                      raw,
+                      "EXPLAIN QUERY PLAN "
+                      "SELECT LOWER(side), COUNT(*) "
+                      "FROM trade_log "
+                      "WHERE pair_name = ? AND block_height >= ? "
+                      "GROUP BY LOWER(side);",
+                      -1, &st, nullptr),
+                  SQLITE_OK);
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            const unsigned char* detail = sqlite3_column_text(st, 3);
+            if (detail) {
+                plan += reinterpret_cast<const char*>(detail);
+                plan += "\n";
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    sqlite3_close(raw);
+
+    EXPECT_NE(plan.find("idx_trade_log_pair_block"), std::string::npos)
+        << "the 24h window must stay bounded as trade_log grows; plan was:\n"
+        << plan;
+    EXPECT_EQ(plan.find("SCAN trade_log"), std::string::npos)
+        << "a full scan of the pair's history is the defect; plan was:\n"
+        << plan;
+}
+
 // ===========================================================================
 // inventory_state -- cost-basis persistence (PNL-BASIS-PERSIST, 2026-07-30)
 // ===========================================================================

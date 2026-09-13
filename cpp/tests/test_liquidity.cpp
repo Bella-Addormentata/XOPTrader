@@ -509,6 +509,102 @@ TEST_F(GapAwareSpacingTest, BlendFactorZero_BaselineUnchanged) {
     }
 }
 
+// [S33 2026-09-12, Copilot round 6] The gap-aware pass writes
+// tier_spacing_bps, but build_raw_ladder prices from tier_spacing_bps_bid/
+// _ask whenever those are non-empty -- and the engine's cross-side activity
+// controller populates exactly those every heartbeat (engine.cpp Step 7).
+// The blend was therefore computed, stored and silently discarded.  The two
+// modes are now explicitly mutually exclusive; gap_aware_spacing_active() is
+// the single gate.
+TEST_F(GapAwareSpacingTest, SideScheduleDisablesGapPass) {
+    // Baseline: no side schedule, gap-aware runs.
+    const LiquidityConfig cfg = make_config();
+    EXPECT_TRUE(gap_aware_spacing_active(cfg));
+
+    // Either side alone is enough to switch it off: a half-applied blend
+    // (both-sides-merged gaps reaching only the fallback tiers) is neither
+    // mode's behaviour.
+    LiquidityConfig bid_only = make_config();
+    bid_only.tier_spacing_bps_bid = {80.0, 220.0, 520.0, 1020.0};
+    EXPECT_FALSE(gap_aware_spacing_active(bid_only));
+
+    LiquidityConfig ask_only = make_config();
+    ask_only.tier_spacing_bps_ask = {80.0, 220.0, 520.0, 1020.0};
+    EXPECT_FALSE(gap_aware_spacing_active(ask_only));
+
+    LiquidityConfig both_sides = make_config();
+    both_sides.tier_spacing_bps_bid = {80.0, 220.0, 520.0, 1020.0};
+    both_sides.tier_spacing_bps_ask = {90.0, 230.0, 530.0, 1030.0};
+    EXPECT_FALSE(gap_aware_spacing_active(both_sides));
+
+    // Pre-existing exclusivity rules are unchanged.
+    LiquidityConfig anchored = make_config();
+    anchored.competitive_anchor_enabled = true;
+    EXPECT_FALSE(gap_aware_spacing_active(anchored));
+
+    LiquidityConfig disabled = make_config();
+    disabled.gap_aware_spacing = false;
+    EXPECT_FALSE(gap_aware_spacing_active(disabled));
+}
+
+// The discard was invisible in the prices only while the side schedules
+// covered every tier.  A schedule SHORTER than num_tiers makes it visible:
+// build_raw_ladder falls back to tier_spacing_bps for the uncovered tiers,
+// so the blend used to reach tiers 2-3 while the controller owned tiers 0-1.
+// With the gate in place the uncovered tiers keep their documented baseline.
+TEST_F(GapAwareSpacingTest, PartialSideSchedule_GapBlendNeverReachesFallbackTiers) {
+    LiquidityConfig cfg = make_config();
+    cfg.tier_spacing_bps_bid = {60.0, 200.0};   // tiers 2-3 fall back
+    cfg.tier_spacing_bps_ask = {60.0, 200.0};
+
+    LiquidityEngine engine("TEST/PAIR", cfg);
+
+    const Mojo mid = 1'000'000'000'000LL;
+
+    // Bid offers at 30 and 400 bps leave a ~370 bps gap (centre ~215) and a
+    // wide outer gap; the blend would pull the fallback tiers off 500/1000.
+    std::vector<CompetingOffer> offers = {
+        make_offer(Side::Bid, static_cast<Mojo>(
+            static_cast<double>(mid) * (1.0 - 30.0/10000.0))),
+        make_offer(Side::Bid, static_cast<Mojo>(
+            static_cast<double>(mid) * (1.0 - 400.0/10000.0))),
+    };
+
+    auto ladder_gap_on = engine.compute_ladder(
+        mid, 0.03, 0.5, 10'000'000'000'000LL, 10'000'000'000'000LL,
+        offers, cfg);
+
+    LiquidityConfig cfg_gap_off = cfg;
+    cfg_gap_off.gap_aware_spacing = false;
+    auto ladder_gap_off = engine.compute_ladder(
+        mid, 0.03, 0.5, 10'000'000'000'000LL, 10'000'000'000'000LL,
+        offers, cfg_gap_off);
+
+    // Gap-aware on must now be a no-op: identical prices AND identical
+    // assigned half-spreads, on every tier of both sides.
+    ASSERT_EQ(ladder_gap_on.size(), ladder_gap_off.size());
+    for (std::size_t i = 0; i < ladder_gap_on.size(); ++i) {
+        EXPECT_EQ(ladder_gap_on[i].price, ladder_gap_off[i].price)
+            << "entry " << i << " side="
+            << static_cast<int>(ladder_gap_on[i].side)
+            << " tier=" << static_cast<int>(ladder_gap_on[i].tier_index);
+        EXPECT_DOUBLE_EQ(ladder_gap_on[i].spread_bps,
+                         ladder_gap_off[i].spread_bps)
+            << "entry " << i;
+    }
+
+    // And the fallback tiers must still be the configured baseline, not a
+    // blended value: tier 2 = 500 bps, tier 3 = 1000 bps on both sides.
+    for (const auto& tq : ladder_gap_on) {
+        if (tq.tier_index == 2) {
+            EXPECT_DOUBLE_EQ(tq.spread_bps, 500.0);
+        }
+        if (tq.tier_index == 3) {
+            EXPECT_DOUBLE_EQ(tq.spread_bps, 1000.0);
+        }
+    }
+}
+
 // ============================================================================
 // 4. AMM-aware mid-price blending
 // ============================================================================

@@ -77,6 +77,7 @@ class _WalletWorker(QObject):
     # wallet map on success or an empty dict on failure -- the service
     # merges into its cache and clears the in-flight guard either way.
     balances_ready = Signal(dict)
+    sync_status_ready = Signal(dict)
 
     def __init__(self, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
@@ -85,6 +86,7 @@ class _WalletWorker(QObject):
         self._fingerprint: Optional[int] = None
         self._cert_path: Path = Path("")
         self._key_path: Path = Path("")
+        self._last_sync_status: dict[str, Any] = {}
 
     @Slot(dict)
     def set_params(self, params: dict) -> None:
@@ -123,6 +125,8 @@ class _WalletWorker(QObject):
         except Exception as exc:  # noqa: BLE001 -- never kill the worker
             _log.warning("Wallet balance fetch failed unexpectedly: %s", exc)
             result = {}
+            self._last_sync_status = {"connected": False, "synced": False, "syncing": False}
+        self.sync_status_ready.emit(self._last_sync_status)
         self.balances_ready.emit(result)
 
     def _fetch_impl(self) -> dict[str, dict[str, float]]:
@@ -141,9 +145,11 @@ class _WalletWorker(QObject):
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         except ImportError:
             _log.debug("requests library not available")
+            self._last_sync_status = {"connected": False, "synced": False, "syncing": False}
             return {}
 
         if not self._certs_available():
+            self._last_sync_status = {"connected": False, "synced": False, "syncing": False}
             return {}
 
         base_url = f"https://{self._host}:{self._port}"
@@ -160,6 +166,31 @@ class _WalletWorker(QObject):
                 )
             except requests.RequestException:
                 pass  # Login may already be active.
+
+        # Step 1.5: Query wallet sync status.
+        try:
+            sync_resp = requests.post(
+                f"{base_url}/get_sync_status",
+                json={},
+                cert=(str(self._cert_path), str(self._key_path)),
+                verify=False,
+                timeout=_RPC_TIMEOUT_S,
+            )
+            if sync_resp.ok:
+                s_data = sync_resp.json()
+                if s_data.get("success"):
+                    self._last_sync_status = {
+                        "connected": True,
+                        "synced": bool(s_data.get("synced", False)),
+                        "syncing": bool(s_data.get("syncing", False)),
+                    }
+                else:
+                    self._last_sync_status = {"connected": True, "synced": False, "syncing": False}
+            else:
+                self._last_sync_status = {"connected": False, "synced": False, "syncing": False}
+        except Exception as exc:
+            _log.debug("Failed to get wallet sync status: %s", exc)
+            self._last_sync_status = {"connected": False, "synced": False, "syncing": False}
 
         # Step 2: Get list of wallets.
         try:
@@ -325,6 +356,7 @@ class WalletService(QObject):
         super().__init__(parent)
         self._mutex = QMutex()
         self._cached: dict[str, dict[str, float]] = {}
+        self._last_sync_status: dict[str, Any] = {}
         self._fetch_in_flight: bool = False
 
         # -- Worker thread --------------------------------------------------
@@ -336,6 +368,7 @@ class WalletService(QObject):
 
         # Worker signals -> main-thread slots (auto == queued here).
         self._worker.balances_ready.connect(self._on_balances_ready)
+        self._worker.sync_status_ready.connect(self._on_sync_status_ready)
 
         # Queued connections: emit trigger signals to invoke worker slots
         # on the worker thread rather than blocking the GUI thread.
@@ -406,9 +439,21 @@ class WalletService(QObject):
         """Return cached balances without making an RPC call."""
         return self._get_cached()
 
+    def get_sync_status(self) -> dict[str, Any]:
+        """Return the latest cached wallet sync status from direct RPC."""
+        with QMutexLocker(self._mutex):
+            return dict(self._last_sync_status)
+
     # ===================================================================
     # Internal slots (GUI thread)
     # ===================================================================
+
+    @Slot(dict)
+    def _on_sync_status_ready(self, status: dict) -> None:
+        """Cache the latest wallet sync status."""
+        if status:
+            with QMutexLocker(self._mutex):
+                self._last_sync_status = dict(status)
 
     @Slot(dict)
     def _on_balances_ready(self, result: dict) -> None:

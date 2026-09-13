@@ -110,6 +110,7 @@
 #include <mutex>
 #include <thread>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <filesystem>
@@ -173,6 +174,432 @@ struct PostedOfferInfo {
     Mojo        size;           ///< Size in mojos.
     int         tier_index;     ///< Tier index in the ladder.
 };
+
+// ---------------------------------------------------------------------------
+// select_repost_keys -- which (side, tier) slots a selective refresh is
+// allowed to post a replacement into.
+//
+// [S33 2026-09-05] Extracted from Step 8's T5-01 filter so the rule is
+// reachable from ctest.  The filter used to derive its whitelist from tier
+// STALENESS, but OfferManager::selective_cancel returns only the offers it
+// actually cancelled: on a cancel RPC that throws anything other than an
+// insufficient-funds error it logs and moves on, leaving the offer live and
+// NOT marked cancel_pending.  A tier can therefore classify Stale and still
+// be resting on the book, so staleness alone is not proof that the old offer
+// left -- and reposting on that basis leaves two live offers at the same
+// price level, the exact double exposure the filter exists to prevent.
+//
+// [S33 2026-09-05, review] An earlier draft of this comment also gave
+// "selective_cancel skips offers already awaiting cancel confirmation" as a
+// second way to reach that state.  It is not one: classify_tier_staleness
+// does `if (po.cancel_pending) continue;` (offer_manager.cpp), so such an
+// offer never produces a TierClassification and is never seen here.  The
+// swallowed cancel RPC is the whole of it.  (An already-cancel_pending offer
+// is instead invisible to the caller's pending_keys, so its ladder slot looks
+// brand new -- a separate, pre-existing path that this function cannot see
+// and does not claim to cover.)
+//
+// [S33 2026-09-12, review] EVERY OCCUPANT OF THE SLOT, not one of them.  Two
+// pending offers can share a (side, tier) slot after any earlier double post,
+// and the rule used to admit the slot as soon as ONE non-Fresh occupant
+// appeared in cancelled_ids -- so with both legs Stale and only one cancel
+// landing, a replacement was posted while the other leg was still live.  That
+// is the very double exposure this function exists to prevent, reached through
+// the slot rather than through the tier.  A slot is whitelisted only when
+// every classified occupant was successfully cancelled; a Fresh occupant was
+// never asked to cancel and is still resting, so it vetoes its slot too.
+//
+// @param tier_classes   Per-pending-offer staleness classification.
+// @param cancelled_ids  Offer IDs selective_cancel reported as CANCELLED.
+// @return "<side>_<tier_index>" keys whose replacement is safe to post, i.e.
+//         those whose every occupant was cancelled.  Slots holding a failed
+//         cancel or a Fresh offer are absent, deferring them to the next
+//         heartbeat where they still classify Stale/Expired.
+// ---------------------------------------------------------------------------
+[[nodiscard]] std::unordered_set<std::string> select_repost_keys(
+    const std::vector<execution::TierClassification>& tier_classes,
+    const std::vector<std::string>&                   cancelled_ids);
+
+// ---------------------------------------------------------------------------
+// select_resting_keys -- which (side, tier) slots still have an offer on the
+// book, and therefore must NOT be charged against the dynamic XCH budget.
+//
+// [S33-LIMITER 2026-09-05] Companion to select_repost_keys, for the other
+// half of the same accounting.  The dynamic tier limiter measures every tier
+// in the ladder against a budget derived from the wallet's spendable_balance
+// -- but spendable_balance has ALREADY had the coins locked by resting offers
+// removed from it.  Charging a still-resting tier against that budget counts
+// the same XCH twice, and near the fee reserve that trims the side before the
+// tier a selective refresh is trying to replace can be reposted.
+//
+// Successfully cancelled tiers are deliberately EXCLUDED from this set (i.e.
+// they keep being charged).  A cancel is only submitted here, not confirmed:
+// the coins do not return to spendable_balance until it lands on-chain, so
+// continuing to charge them keeps the limiter on the conservative side of the
+// 2026-08-23 zero-spendable incident (see the [XCH-LOCK-LEDGER] note above
+// xch_spendable_pre).  This function therefore only ever RELAXES the budget by
+// the amount that provably never left the wallet's locked set.
+//
+// [S33 2026-09-12, review] A slot with TWO pending offers (possible after any
+// earlier double post) whose cancels disagree is RESTING, full stop.  This
+// used to resolve toward CHARGING -- one cancelled leg erased the whole key
+// from this set -- because select_repost_keys would whitelist that slot and
+// the pair must never post a tier the budget did not reserve for.  Now that
+// repost requires EVERY occupant cancelled, that slot is not reposted at all,
+// so the erase only charged the budget for a slot nothing is posted into
+// while the wallet still locks the failed leg's coins: the same XCH counted
+// twice, which is what this function exists to stop.  The invariant the two
+// jointly maintain -- `posted set is a subset of charged set` -- now holds
+// directly: a repostable slot has no uncancelled occupant, is therefore not
+// in this set, and is therefore charged.
+//
+// @param tier_classes   Per-pending-offer staleness classification.
+// @param cancelled_ids  Offer IDs selective_cancel reported as CANCELLED.
+// @return "<side>_<tier_index>" keys whose offer is still resting on the book.
+// ---------------------------------------------------------------------------
+[[nodiscard]] std::unordered_set<std::string> select_resting_keys(
+    const std::vector<execution::TierClassification>& tier_classes,
+    const std::vector<std::string>&                   cancelled_ids);
+
+// ---------------------------------------------------------------------------
+// select_postable_tiers -- the whole of Step 8's T5-01 replacement decision:
+// which candidate ladder tiers may actually be posted after a cancel pass.
+//
+// [S33 2026-09-05] The filter body was already extracted (select_repost_keys);
+// its GATE was not, and the gate was the other half of the defect.  The call
+// site ran the filter only `if (has_pending && fresh_count > 0)`, so the
+// sibling FULL-CANCEL branch (has_pending && fresh_count == 0, which calls
+// selective_cancel over every tier) never consulted it at all.  That call
+// returns a SUBSET of the ids it was given, so with every tier stale and one
+// cancel failing, that branch left the old offer resting AND posted a whole
+// replacement ladder over it -- the exact double exposure select_repost_keys
+// exists to prevent, in the one branch it never ran in.  It also broke the
+// limiter's accounting in the unsafe direction: select_resting_keys runs
+// UNCONDITIONALLY, so the failed-cancel tier was excluded from the XCH budget
+// charge and then posted anyway, under-reserving against a budget built from
+// spendable_balance (the 2026-08-23 zero-spendable shape).
+//
+// The gate is now simply "there were pending offers", which is `tier_classes`
+// being non-empty -- so it lives in here, where a test can reach it.  The
+// filter body is correct in the all-stale branch unchanged: cancelled_ids is
+// the full-cancel result, and pending_keys still admits genuinely-new tiers.
+//
+// @param candidate_tiers  Tiers that survived every earlier Step 8 gate.
+// @param tier_classes     Per-pending-offer staleness classification.  EMPTY
+//                         means nothing was pending, so nothing can be a
+//                         duplicate and every candidate is postable.
+// @param cancelled_ids    Offer IDs selective_cancel reported as CANCELLED.
+// @return The candidates whose slot was actually freed by a cancel, plus the
+//         brand-new slots that had no pending offer at all, in input order.
+//         An empty result means "post nothing this heartbeat".
+// ---------------------------------------------------------------------------
+[[nodiscard]] std::vector<TierQuote> select_postable_tiers(
+    const std::vector<TierQuote>&                     candidate_tiers,
+    const std::vector<execution::TierClassification>& tier_classes,
+    const std::vector<std::string>&                   cancelled_ids);
+
+// ---------------------------------------------------------------------------
+// shift_schedule_to_floor -- push one tier-spacing schedule out to the
+// minimum half-spread, preserving its inter-tier gaps.
+//
+// [S33 2026-09-05] Extracted from Step 7 so the per-schedule rule is
+// reachable from ctest.  The shift used to be computed ONCE from the static
+// tier_spacing_bps and applied to all three schedules, but build_raw_ladder
+// prices from the activity controller's _bid/_ask schedules whenever they are
+// filled, and those are interpolated up toward tier_spacing_max_bps -- in the
+// low-activity case already wider than the floor.  Reusing the static
+// schedule's delta stacked the whole shift on top of an already-compliant
+// side schedule (base 100, adaptive 600, floor 400 -> 900 instead of 600),
+// and the converse failed too: a side schedule narrower than the base one was
+// not shifted at all.
+//
+// @param spacings           Schedule in bps, modified in place.  Read as
+//                           non-decreasing, so spacings.front() is its
+//                           innermost tier.
+// @param min_half_spread_bps  The floor the innermost tier must clear.
+// @return The shift actually applied, in bps; 0.0 when the schedule is empty
+//         or already at/outside the floor (in which case it is untouched).
+// ---------------------------------------------------------------------------
+[[nodiscard]] double shift_schedule_to_floor(std::vector<double>& spacings,
+                                             double min_half_spread_bps);
+
+// ---------------------------------------------------------------------------
+// ActivitySchedules / interpolate_activity_schedules -- Step 7's 24h
+// activity-adaptive margin and tier-spacing controller.
+//
+// [S33 2026-09-05] Extracted from step_generate_ladder so the interpolation
+// that sets the LIVE bid/ask margins is reachable from ctest -- see
+// cpp/tests/test_activity_interpolation.cpp.
+//
+// THE COUPLING IS CROSS-SIDE BY DESIGN, and it is the part most likely to be
+// "fixed" into a bug: alpha_bid (bid-side fill activity) drives the ASK
+// schedule and alpha_ask drives the BID schedule.  When bids fill we are
+// replenishing base inventory, so the ask side can safely tighten to sell it;
+// when asks fill we are accumulating quote, so the bid side can tighten to
+// buy.  A side that is NOT being replenished widens toward its maximum to
+// demand a liquidity premium and protect inventory.
+//
+// INVERTED RANGES ARE CLAMPED, NOT REJECTED.  min_profit_margin_max_bps_override
+// and tier_spacing_max_bps_override are validated only as positive at config
+// load, and config.cpp cannot do better: the maximum has to be compared
+// against the pair's EFFECTIVE minimum margin and the pair's resolved ladder
+// spacing schedule, and neither operand exists until the ladder config is
+// built here.  With max < min the interpolation runs BACKWARDS -- zero
+// activity would tighten quotes instead of widening them, inverting the
+// controller's protective contract on a live book.  Clamping each effective
+// maximum up to its minimum degrades that pair to "no adaptive widening",
+// which is exactly the controller-off behaviour, while a throw at load would
+// refuse to boot the bot over one fat-fingered override (the S39 pid_min_mult
+// reasoning in config.cpp, same call).  The clamp is loud: the call site warns
+// once per pair on the flags returned here.
+//
+// @param alpha_bid       Bid-side activity in [0, 1] (clamped defensively);
+//                        drives the ASK schedule.
+// @param alpha_ask       Ask-side activity in [0, 1]; drives the BID schedule.
+// @param min_margin_bps  Margin at or above target activity (the tight end).
+// @param max_margin_bps  Margin at zero activity (the wide end).  Raised to
+//                        min_margin_bps when configured below it.
+// @param min_spacings    Base per-tier spacing schedule (the tight end).
+//                        Tiers past its end default to 100 * (tier + 1) bps,
+//                        matching the pre-extraction call site.
+// @param max_spacings    Zero-activity per-tier schedule (the wide end).
+//                        Tiers past its end, and any entry below the tier's
+//                        minimum, fall back to that minimum.
+// @param num_tiers       Length of the schedules to produce.
+// @return Both margins and both spacing schedules, plus what was clamped.
+//         The zero-activity end is never narrower than the active end.
+// ---------------------------------------------------------------------------
+struct ActivitySchedules {
+    double bid_margin_bps{0.0};
+    double ask_margin_bps{0.0};
+    std::vector<double> bid_spacings;
+    std::vector<double> ask_spacings;
+    /// max_margin_bps was below min_margin_bps and was raised to it.
+    bool margin_range_inverted{false};
+    /// How many tiers had a configured maximum spacing below their base
+    /// spacing and were raised to it; 0 when the schedule was well-formed.
+    std::size_t spacing_tiers_inverted{0};
+};
+
+[[nodiscard]] ActivitySchedules interpolate_activity_schedules(
+    double                     alpha_bid,
+    double                     alpha_ask,
+    double                     min_margin_bps,
+    double                     max_margin_bps,
+    const std::vector<double>& min_spacings,
+    const std::vector<double>& max_spacings,
+    std::size_t                num_tiers);
+
+// ---------------------------------------------------------------------------
+// BookActivity / fresh_book_depth -- the resting-depth half of Step 7's
+// activity controller, with the staleness gate that term requires.
+//
+// [S33 2026-09-12] MarketDataFeed::competing_offers_ has no TTL and no
+// pruner, and ingest_competing_offers is its only writer.  When the dexie
+// offers fetch throws, Step 1 warns and CONTINUES, so the store keeps the
+// previous cycle's book and get_competing_book hands it back unchanged --
+// the same stale-book path Step 7's fetch comment documents.  Counting those
+// retained offers as live depth holds alpha up, and because alpha
+// interpolates DOWN toward the tight end (see interpolate_activity_schedules
+// above), an offers outage would leave quotes TIGHT precisely when the
+// controller is meant to widen them.
+//
+// SEEN IN THIS BLOCK -- NOT A WALL-CLOCK AGE.  [review] The heartbeat runs
+// only when the polled height is STRICTLY greater than the last one
+// processed (poll_loop_coro: `if (current_block > last_block_)`), so no two
+// cycles ever share a height, and ingest re-stamps every surviving offer with
+// the current one (step_update_market_state).  A retained book therefore
+// always carries a SMALLER last_seen_block, and equality catches it on the
+// very next heartbeat.
+//
+// An earlier revision of this function aged offers against the wall clock and
+// was WRONG.  Blocks average ~52s, so a book retained across one block is
+// routinely YOUNGER than any sane age threshold and would score FRESH --
+// missing exactly the outage the gate exists for.  The review that asked for
+// last_seen_block was right; this note records why, so the cheaper-looking
+// wall-clock version does not come back.
+//
+// @param offers    The book as handed out by get_competing_book().
+// @param now_block The height this heartbeat is processing.
+// @return Fresh per-side counts, plus how many offers were ignored as stale
+//         (0 in normal operation; nonzero means the offers feed is down).
+// ---------------------------------------------------------------------------
+struct BookActivity {
+    std::size_t bids{0};
+    std::size_t asks{0};
+    std::size_t stale_ignored{0};
+};
+
+[[nodiscard]] BookActivity fresh_book_depth(
+    const std::vector<CompetingOffer>& offers,
+    BlockHeight                        now_block);
+
+// ---------------------------------------------------------------------------
+// xch_mark_price_mojos -- the XCH mark handed to PnLTracker::mark_to_market,
+// denominated in one pair's quote units.
+//
+// [XCH-MTM-ISOLATION 2026-09-04] XCH is the wallet's reserve currency and its
+// USD value is known authoritatively from CEX/anchors, so the mark must not be
+// derived from an individual CAT book's local DEX spread.
+//
+// [S33 2026-09-05] The divisor must be the factor step_update_pnl REGISTERED
+// for this pair, not the live one: mark_to_market converts both this price and
+// the cost basis back to USD with the registered factor, so dividing by a
+// different (live) factor yielded xch_usd * registered/live rather than
+// canonical XCH USD, and the wallet's XCH mark hopped between pairs.  The
+// carry map that holds the registered factor is also the grade gate that
+// quote_usd_factor() bypasses.
+//
+// @param xch_usd_mojos      Canonical USD value of 1 XCH, in mojos.
+// @param registered_factor  usd_per_quote_unit as REGISTERED for this pair;
+//                           0 (or negative) means the pair was registered
+//                           UNPRICEABLE.
+// @return The mark in this pair's quote mojos, or 0 for "do not mark".
+//         0 is deliberate for an unpriceable pair rather than falling back to
+//         the CAT book's own mid -- and it is inert, because the same missing
+//         factor makes mark_to_market zero that pair's basis, so the pair
+//         contributes nothing either way.  See the call site.
+// ---------------------------------------------------------------------------
+[[nodiscard]] Mojo xch_mark_price_mojos(Mojo   xch_usd_mojos,
+                                        double registered_factor);
+
+// ---------------------------------------------------------------------------
+// NodeHealthFlags / node_health_flags -- the full-node connectivity triple
+// published to SystemHealthSnapshot by both metrics exporters.
+//
+// [S33 2026-09-05] CONNECTIVITY IS NOT SYNCHRONISATION.  Both exporters used
+// to publish `node_synced = node_connected` and a hard `node_syncing = false`
+// (the member backing it had no writer anywhere in the tree), so a node that
+// answered a peak height while still catching up showed solid green and the
+// GUI's "Full Node: Syncing..." state was unreachable during exactly the
+// period an operator would be looking.  The derivation lives here, in one
+// place both exporters call, so reinstating that copy is a change a test can
+// see -- see cpp/tests/test_node_sync_state.cpp.
+//
+// [S33 2026-09-12, review] REACHABILITY IS NOT HEIGHT-SOURCE SELECTION, and
+// this function was never the defect -- its `reachable` ARGUMENT was.  Both
+// exporters passed an expression that required the node to be the SELECTED
+// height source, so during an auto fallback a node that answers every probe
+// while it catches up -- still behind the wallet, so still not the source --
+// published connected=false and syncing=false, and the GUI read "Full Node:
+// Disconnected" through exactly the catching-up period an operator is looking
+// at.  `reachable` now means node_probe_is_live() below: a recent successful
+// probe, which is what connectivity actually is.
+//
+// @param reachable            A node PROBE succeeded recently -- see
+//                             node_probe_is_live().  NOT "the node is the
+//                             selected height source".
+// @param node_reports_synced  `sync.synced` from the blockchain-state
+//                             response (rpc::ChiaFullNodeRPC::last_sync_state).
+// @param node_reports_syncing `sync.sync_mode` from the same response.
+// @return The triple to publish.  An unreachable node reports NEITHER synced
+//         nor syncing: the cached reading is stale and must not be republished
+//         (e.g. on a wallet-sourced heartbeat).
+// ---------------------------------------------------------------------------
+struct NodeHealthFlags {
+    bool connected{false};
+    bool synced{false};
+    bool syncing{false};
+};
+
+[[nodiscard]] NodeHealthFlags node_health_flags(
+    bool reachable, bool node_reports_synced, bool node_reports_syncing);
+
+// ---------------------------------------------------------------------------
+// node_probe_is_live -- has the full node answered recently?
+//
+// [S33 2026-09-12] The freshness half of the health triple, kept separate from
+// height-source SELECTION on purpose.  A syncing node is reachable and not
+// selected at the same time; folding the two together is what published
+// "Disconnected" during a catch-up.
+//
+// It still has to keep the property the height-source gate was there to
+// protect: last_sync_state() is a CACHE, so a wallet-sourced heartbeat must
+// not republish a node reading taken minutes ago as if the node had just
+// answered.  Freshness, not selection, is what actually delivers that -- an
+// outage stops producing successful probes, and the window closes on its own.
+//
+// @param node_client_open   The node RPC client exists and is open.
+// @param last_probe         When the last SUCCESSFUL node probe answered.
+//                           Default-constructed means "never in this run",
+//                           which is not live: the cached sync flags are then
+//                           still their zero-initialised defaults.
+// @param now                Monotonic reference point (steady_clock).
+// @param liveness_window    How long a probe stays evidence of reachability.
+// @return Whether the cached node reading may be published at all.
+// ---------------------------------------------------------------------------
+
+/// How long one successful node probe stands as evidence of reachability.
+///
+/// Sized off the THROTTLED probe cadence, not guessed: while the engine is on
+/// the wallet fallback it probes the node every kNodeProbeEveryNPolls (10)
+/// polls at kPollInterval (5s), i.e. every ~50s.  A window below that would
+/// blink the gauge dark between two successful probes of a perfectly healthy
+/// recovering node -- the same false "Disconnected" this finding is about, one
+/// layer down.  3x the cadence absorbs a slow answer and a missed probe, and
+/// still darkens the gauge ~2.5 minutes into a real outage.
+inline constexpr std::chrono::seconds kNodeProbeLivenessWindow{150};
+
+[[nodiscard]] bool node_probe_is_live(
+    bool                                  node_client_open,
+    std::chrono::steady_clock::time_point last_probe,
+    std::chrono::steady_clock::time_point now,
+    std::chrono::seconds liveness_window = kNodeProbeLivenessWindow);
+
+// ---------------------------------------------------------------------------
+// dexie_probe_is_live -- has a Dexie request answered recently?
+//
+// [review 3997548811] The Dexie status dot was driven by `metrics_connected`,
+// which reports only whether the GUI can scrape THIS engine's Prometheus
+// endpoint.  That is engine health, not venue reachability: with the engine
+// healthy and every Dexie ticker failing, the dot stayed green.  This is the
+// signal the dot needs, published BY the engine about the venue.
+//
+// Deliberately a separate function from node_probe_is_live rather than a
+// shared one: the two windows differ because the two cadences differ (the
+// node is probed on a poll throttle, Dexie on block arrival), and each
+// window has to be justified against its own cadence.  The SHAPE is
+// identical on purpose.
+//
+// @param dexie_client_open  The Dexie client exists and is open.
+// @param last_success       When a Dexie request last ANSWERED.
+//                           Default-constructed means "never in this run",
+//                           which is not live.
+// @param now                Monotonic reference point (steady_clock).
+// @param liveness_window    How long one answer stands as evidence.
+// @return Whether Dexie may be reported reachable at all.
+// ---------------------------------------------------------------------------
+
+/// How long one successful Dexie request stands as evidence of reachability.
+///
+/// Sized off the real cadence, not guessed.  step_update_market_state is
+/// BLOCK-gated at both call sites -- run_startup_analysis skips on
+/// `current_block <= last_analysis_block`, and on_new_block_coro is entered
+/// only under `current_block > last_block_` -- so Dexie tickers are fetched
+/// once per NEW BLOCK, not once per kPollInterval.
+///
+/// Chia's block time averages ~52s, but the mean is the wrong statistic to
+/// size a window against: this engine's own logs record a worst single
+/// interval of 181 s over 2,418 measured (see the cadence note in
+/// run_startup_analysis).  A 3x-the-mean window (~156 s) would therefore
+/// blink this gauge dark on ONE legitimately slow block -- precisely the
+/// false "Disconnected" that kNodeProbeLivenessWindow's own sizing note
+/// exists to prevent.  181 s plus one further block (~52 s) is 233 s;
+/// 300 s rounds that up with margin and still darkens the gauge five
+/// minutes into a real outage.
+///
+/// KNOWN COUPLING, stated rather than hidden: because Step 1 runs only on
+/// block arrival, a CHAIN stall also darkens this gauge.  That is the
+/// intended reading -- with no heartbeat the engine has no current evidence
+/// Dexie is reachable, and fail-closed on absent evidence is the rule the
+/// node and wallet dots already follow.
+inline constexpr std::chrono::seconds kDexieProbeLivenessWindow{300};
+
+[[nodiscard]] bool dexie_probe_is_live(
+    bool                                  dexie_client_open,
+    std::chrono::steady_clock::time_point last_success,
+    std::chrono::steady_clock::time_point now,
+    std::chrono::seconds liveness_window = kDexieProbeLivenessWindow);
 
 // ---------------------------------------------------------------------------
 // Engine -- the top-level orchestrator.
@@ -457,6 +884,34 @@ private:
     /// resets the failure streak forever and the wallet fallback is never
     /// reached. A node that says yes and never moves is a dead node.
     std::uint32_t        node_no_progress_polls_{0};
+
+    /// [S33 2026-09-12] When the full node last ANSWERED a probe, which is a
+    /// different question from whether it is the selected height source.
+    /// Stamped by every successful get_block_height() -- the main loop's node
+    /// branch and its throttled recovery probe, and both of the analysis
+    /// loop's -- including the answers that are rejected as a height (behind
+    /// the wallet, not advancing).  Those rejections are exactly the syncing
+    /// node whose reachability the health gauges used to deny.
+    std::chrono::steady_clock::time_point node_last_probe_{};
+
+    /// [review 3997548811] When a Dexie request last ANSWERED.  Stamped in
+    /// Step 1 on a returned ticker -- reachability, which is a different
+    /// question from whether the prices were usable: a ticker that answers
+    /// with price_last == 0 still proves the venue is up, and the separate
+    /// per-pair market_data_valid already carries usability.
+    std::chrono::steady_clock::time_point dexie_last_success_at_{};
+
+    /// The reachability argument both metrics exporters pass to
+    /// node_health_flags(), in ONE place.  They share that function precisely
+    /// so there is a single rule; each computing its own expression is how
+    /// they came to disagree (one asked the height source, the other asked
+    /// whether this poll had used the wallet).
+    [[nodiscard]] bool node_probe_live_now() const;
+
+    /// The Dexie reachability argument both metrics exporters publish, in
+    /// ONE place -- same reason as node_probe_live_now() above: two sites
+    /// each computing their own expression is how they came to disagree.
+    [[nodiscard]] bool dexie_probe_live_now() const;
 
     /// The RUNTIME latch disabling full-node-dependent behaviour.
     ///
@@ -1365,6 +1820,15 @@ private:
     /// log spam Step 13 rate-limits.
     bool breaker_skip_warned_{false};
 
+    /// [S33 2026-09-05] Pairs already warned about an INVERTED activity range
+    /// (min_profit_margin_max_bps_override below the effective minimum margin,
+    /// or a tier_spacing_max_bps_override entry below its base spacing).
+    /// interpolate_activity_schedules clamps such a maximum rather than
+    /// refusing to boot, so the warning is the only signal an operator gets --
+    /// but the condition is a standing misconfiguration that would otherwise
+    /// re-warn on every heartbeat for the life of the process.
+    std::set<std::string> activity_range_warned_;
+
     /// [S19 review round 11] Whether the bridge scan can currently act
     /// as the bridge asset's inventory maintainer.  The Step 8 recovery
     /// seed and Step 11 one-shot reconcile exclude the asset ONLY while
@@ -1411,6 +1875,24 @@ private:
     /// debounce streak, so one transient false read (a flaky wallet RPC
     /// corrupting an equity computation) cannot re-arm it mid-episode.
     int breaker_lift_streak_{0};
+    int window_loss_recover_streak_{0};
+
+    /// [S33 2026-09-05] True only while `breaker_pause_active_` is OWNED by
+    /// the rolling-window loss breaker.  That latch is SHARED with the
+    /// max-drawdown, unvaluable-book and ledger-divergence breakers, and the
+    /// rolling window's auto-cooldown must not lift a pause it did not set:
+    /// a ledger divergence ends in reconciliation and a drawdown trip in
+    /// operator acknowledgement, neither of which is "the loss window went
+    /// quiet".  Every OTHER site that sets `breaker_pause_active_` clears
+    /// this one -- the ledger, unvaluable-book and max-drawdown escalations
+    /// in Step 13, plus the S27 pre-trade unvaluable latch, where the clear
+    /// is a provable no-op kept so this rule needs no exceptions -- so the
+    /// window can never auto-resume out from under another breaker.
+    ///
+    /// Revocation is deliberately NOT reversible for the life of the pause:
+    /// see the note at the max-drawdown revoke in step_check_alerts.
+    /// Invariant: false whenever `breaker_pause_active_` is false.
+    bool window_loss_latched_{false};
 
     /// [S17 2026-08-23] Last depeg status logged per pair, so Step 3 logs
     /// transitions at full severity and ongoing states at debug.
@@ -1907,6 +2389,16 @@ private:
     // prevents the force-delete from ever firing.
     uint32_t consecutive_unsynced_blocks_{0};
     static constexpr uint32_t kWalletRestartThreshold{20};  // ~3 min
+
+    bool wallet_synced_{false};
+    bool wallet_syncing_{false};
+    // [S33 2026-09-05] The node_connected_/node_synced_/node_syncing_ triplet
+    // that used to live here was declared but never assigned anywhere in the
+    // tree, so the metrics exporters published a hard syncing=false.  The
+    // node's own sync state now comes from
+    // rpc::ChiaFullNodeRPC::last_sync_state(), which caches the `sync` object
+    // of the blockchain-state response get_block_height() already fetches.
+    // The wallet_* pair above IS written (step_manage_offers) and stays.
 
     // -- [T4-04] Cached wallet balances for spendable-reserve gating ------
     // Populated from wallet RPC each heartbeat; keyed by wallet label.

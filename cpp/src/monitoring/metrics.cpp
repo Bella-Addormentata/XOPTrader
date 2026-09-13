@@ -220,12 +220,18 @@ void MetricsExporter::register_metrics()
 
     sys_family_ = &prometheus::BuildGauge()
         .Name("xop_node")
-        .Help("Node and wallet connectivity status")
+        .Help("Node, wallet and venue connectivity and sync status")
         .Register(*registry_);
 
-    sys_block_height_    = &sys_family_->Add({{"metric", "block_height"}});
-    sys_node_synced_     = &sys_family_->Add({{"metric", "synced"}});
-    sys_wallet_connected_ = &sys_family_->Add({{"metric", "wallet_connected"}});
+    sys_block_height_       = &sys_family_->Add({{"metric", "block_height"}});
+    sys_node_connected_     = &sys_family_->Add({{"metric", "node_connected"}});
+    sys_node_synced_        = &sys_family_->Add({{"metric", "node_synced"}});
+    sys_node_syncing_       = &sys_family_->Add({{"metric", "node_syncing"}});
+    sys_node_synced_legacy_ = &sys_family_->Add({{"metric", "synced"}});
+    sys_wallet_connected_   = &sys_family_->Add({{"metric", "wallet_connected"}});
+    sys_wallet_synced_      = &sys_family_->Add({{"metric", "wallet_synced"}});
+    sys_wallet_syncing_     = &sys_family_->Add({{"metric", "wallet_syncing"}});
+    sys_dexie_connected_    = &sys_family_->Add({{"metric", "dexie_connected"}});
 
     // Offer-creation latency histogram with bucket boundaries chosen for
     // Chia's ~52-second block time.  Most offer creations complete in
@@ -525,8 +531,14 @@ void MetricsExporter::update_system_health(const SystemHealthSnapshot& health)
     }
 
     sys_block_height_->Set(static_cast<double>(health.block_height));
+    sys_node_connected_->Set(health.node_connected ? 1.0 : 0.0);
     sys_node_synced_->Set(health.node_synced ? 1.0 : 0.0);
+    sys_node_syncing_->Set(health.node_syncing ? 1.0 : 0.0);
+    sys_node_synced_legacy_->Set(health.node_synced ? 1.0 : 0.0);
     sys_wallet_connected_->Set(health.wallet_connected ? 1.0 : 0.0);
+    sys_wallet_synced_->Set(health.wallet_synced ? 1.0 : 0.0);
+    sys_wallet_syncing_->Set(health.wallet_syncing ? 1.0 : 0.0);
+    sys_dexie_connected_->Set(health.dexie_connected ? 1.0 : 0.0);
 }
 
 void MetricsExporter::observe_offer_latency_ms(double latency_ms)

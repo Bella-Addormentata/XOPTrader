@@ -100,11 +100,18 @@ add_executable(xop_tests
     test_drawdown_breaker.cpp
     test_watchdog.cpp
     test_height_source.cpp
+    test_node_sync_state.cpp
+    test_dexie_probe_liveness.cpp
+    test_selective_repost.cpp
+    test_width_floor.cpp
+    test_activity_interpolation.cpp
+    test_xch_mark_price.cpp
     test_settled_fill.cpp
     test_wallet_poll_throttle.cpp
     test_client_logger.cpp
     test_pid_reachability.cpp
     test_pid_rail_latch.cpp
+    test_offer_expiry.cpp
 )
 
 target_link_libraries(xop_tests

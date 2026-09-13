@@ -35,6 +35,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -436,7 +437,44 @@ public:
      */
     asio::awaitable<json> get_additions_and_removals(
         const std::string& header_hash);
+
+    /**
+     * @brief Sync flags the node reported on its last blockchain-state
+     *        response.
+     *
+     * [S33 2026-09-05] get_block_height() already fetches
+     * get_blockchain_state and discards everything but peak.height --
+     * including the node's own `sync` object.  Caching it here lets health
+     * reporting tell "reachable" apart from "synced" without paying a
+     * second RPC every block: a node that is still catching up answers a
+     * peak height quite happily, so connectivity is not synchronisation.
+     */
+    struct SyncState {
+        bool synced{false};   ///< blockchain_state.sync.synced
+        bool syncing{false};  ///< blockchain_state.sync.sync_mode
+    };
+
+    /// Sync flags from the most recent blockchain-state response.  Both are
+    /// false until the node has answered at least once.
+    [[nodiscard]] SyncState last_sync_state() const noexcept
+    {
+        return last_sync_state_;
+    }
+
+private:
+    SyncState last_sync_state_{};
 };
+
+/**
+ * @brief Extract the node sync flags from a get_blockchain_state response.
+ *
+ * [S33 2026-09-05] A missing or non-boolean field leaves the corresponding
+ * flag at its @p previous value rather than substituting false: "the node
+ * did not say" must never be published as "the node is not syncing".
+ */
+[[nodiscard]] ChiaFullNodeRPC::SyncState node_sync_from_blockchain_state(
+    const json&                resp,
+    ChiaFullNodeRPC::SyncState previous = {});
 
 // ---------------------------------------------------------------------------
 // ChiaWalletRPC
@@ -482,12 +520,44 @@ public:
      *                       negative = requesting). e.g. {1: -100, 2: 50}
      * @param fee            Transaction fee in mojos (default 0).
      * @param validate_only  If true, validate without creating (dry run).
+     * @param max_time       Optional ABSOLUTE unix timestamp after which the
+     *                       offer is no longer valid.  Omitted from the
+     *                       payload entirely when unset, so every existing
+     *                       caller sends a byte-identical request.  This is
+     *                       the ONLY timelock flag we send -- see
+     *                       StrategyConfig::offer_expiry_secs for why
+     *                       max_height/min_height/min_time are not.
      * @return JSON containing "offer" (bech32 text) and "trade_record".
+     *         When max_time was sent, trade_record.valid_times.max_time
+     *         echoes it back; callers must VERIFY that echo rather than
+     *         assume the wallet honoured the request.
      */
     asio::awaitable<json> create_offer(
         const json&    offer_dict,
         std::uint64_t  fee           = 0,
-        bool           validate_only = false);
+        bool           validate_only = false,
+        std::optional<std::uint64_t> max_time = std::nullopt);
+
+    /**
+     * @brief Build the create_offer_for_ids request body.
+     *
+     * Static and pure so the invariant below is a TEST rather than a
+     * comment.  The load-bearing property is negative: this payload must
+     * never carry max_height, min_height or min_time.  All three are
+     * enforced on-chain, but Chia's reference wallet does not apply them
+     * until it submits the spend bundle to the mempool, so a taker using it
+     * has the transaction "initiated, but will fail" -- our offers would
+     * stay visible on the aggregator and be unfillable by most of the
+     * market.  Only max_time is recognised by a reference-wallet taker.
+     *
+     * @param max_time  Absent leaves the payload byte-identical to the one
+     *                  sent before offer expiry existed.
+     */
+    [[nodiscard]] static json build_create_offer_payload(
+        const json&    offer_dict,
+        std::uint64_t  fee,
+        bool           validate_only,
+        const std::optional<std::uint64_t>& max_time);
 
     /**
      * @brief Accept (take) an existing offer.

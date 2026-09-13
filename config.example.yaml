@@ -201,6 +201,49 @@ pairs:
     tier_size_pct_override: [0.30, 0.25, 0.20, 0.12, 0.08, 0.05]
     min_offer_size_units_override: 1    # Drop tiers below 1 unit — prevents dust offers
 
+    # -- Per-pair overrides that mirror a strategy-level key --
+    # Each is UNSET by default: omit it and the pair uses the strategy-level
+    # value of the same name.  Commented out here because unset IS the
+    # default; uncomment only the ones this pair actually needs.
+    # competitive_anchor_enabled_override: true            # [OPTIONAL, default: unset -> strategy.competitive_anchor_enabled]
+    # competitive_anchor_max_distance_bps_override: 250.0  # [OPTIONAL, default: unset -> strategy.competitive_anchor_max_distance_bps] must be > 0
+    # competitive_anchor_stride_bps_override: 20.0         # [OPTIONAL, default: unset -> strategy.competitive_anchor_stride_bps] must be > 0
+    # fair_value_residual_widen_ratio_override: 0.25       # [OPTIONAL, default: unset -> strategy.fair_value_residual_widen_ratio] 0 disables residual widening here; must be >= 0
+    # offer_expiry_secs_override: 172800                   # [OPTIONAL, default: unset -> strategy.offer_expiry_secs] 0 binds and means "never expire THIS pair's offers"; must outlast the hard TTL x2 safety margin
+
+    # -- Per-pair override of a MARKET_DATA-level key (not a strategy one) --
+    # Ceiling in BASIS POINTS -- not a fraction; contrast the BBO block below.
+    # Absent -> market_data.book_side_agree_max_spread_bps (5000 by default).
+    # Must be finite and >= 0; 0 disables the two-sides-agree bypass for this
+    # pair.  ONE-WAY: the effective value is min(this,
+    # market_data.mid_gate_book_confirm_max_spread_bps), so RAISING it above
+    # that gate does NOTHING -- this can only make one pair STRICTER, never
+    # more permissive than the bot-wide gate.  Lowering it can cost THIS pair
+    # its mid_valuation_grade (valuation falls to the S20 carry); read the
+    # market_data comment on book_side_agree_max_spread_bps before setting it.
+    # book_side_agree_max_spread_bps_override: 1500.0      # [OPTIONAL, default: unset -> market_data.book_side_agree_max_spread_bps]
+
+    # -- Per-pair 24h activity-adaptive controller --
+    # See strategy.activity_adaptive_spacing for what the controller does.
+    # The first three mirror their strategy-level namesakes and are unset by
+    # default.  The two *_max_* keys have NO strategy-level counterpart --
+    # they are per-pair only, and both are read ONLY while the controller is
+    # enabled for this pair.
+    # activity_adaptive_spacing_override: true   # [OPTIONAL, default: unset -> strategy.activity_adaptive_spacing]
+    # activity_target_fills_24h_override: 12     # [OPTIONAL, default: unset -> strategy.activity_target_fills_24h] must be > 0
+    # activity_book_weight_override: 0.25        # [OPTIONAL, default: unset -> strategy.activity_book_weight] must be >= 0
+    # min_profit_margin_max_bps_override: 20     # [OPTIONAL, default: unset -> 2x this pair's min_profit_margin_bps] Wide end of the margin ramp; must be > 0
+    #
+    # Wide end of the spacing ramp: one entry per tier, aligned with
+    # tier_spacing_bps_override above (which is the NARROW end).  Unset ->
+    # the ramp is flat (max == base), so spacing never moves and only the
+    # margin adapts.  Every entry must be > 0.  A list SHORTER than the tier
+    # count no longer leaves the later tiers at their base spacing: each is
+    # carried at least one base gap outside the tier before it, because a
+    # schedule that steps back INWARD would post that tier inside its
+    # predecessor and the width floor then collapses both onto one price.
+    # tier_spacing_max_bps_override: [12, 20, 32, 60, 100, 160]
+
     # [BBOPERPAIR 2026-09-01] Per-pair BBO proximity caps: "do not quote
     # further than X from the market on THIS pair".
     #
@@ -287,7 +330,28 @@ strategy:
   min_profit_margin_bps: 35  # [REQUIRED] Never post ask below cost_basis + this margin
   high_vol_multiplier: 1.3   # [OPTIONAL, default: 1.3] Spread widening multiplier during high-vol regimes
   sigma_floor: 0.001         # [OPTIONAL, default: 0.001] Minimum annualized sigma for GLFT formula (prevents degenerate spreads when market is flat)
-  offer_ttl_blocks: 600      # [REQUIRED] Soft TTL: cancel stale offers after N blocks (~5 hours at 600)
+  offer_ttl_blocks: 600      # [REQUIRED] Soft TTL: cancel stale offers after N blocks (~8.7 hours at 600)
+  # [OFFER-EXPIRY] On-chain expiry attached to offers we CREATE, in seconds.
+  # Commented out because 0/unset is the default and the safe posture: no
+  # timelock is attached and offers behave exactly as they always have.
+  #
+  # What it buys: if we ever lose the ability to cancel an offer, the chain
+  # retires it for us instead of leaving it takeable indefinitely.
+  #
+  # What it costs, and why it is opt-in: the expiry is sent as `max_time`,
+  # the ONLY one of Chia's four absolute timelock flags the reference wallet
+  # honours when TAKING an offer.  Even so, a taker on an old enough wallet
+  # can fail to take an offer that carries one, and we cannot survey what
+  # wallets our takers run.  Enable per pair, deliberately.
+  #
+  # MUST exceed this bot's own hard TTL -- offer_ttl_blocks x 2 at the
+  # configured strategy.block_time_seconds (52.0s) -- times a 2x safety
+  # margin, because the real block rate varies.  At offer_ttl_blocks: 600
+  # the floor is 124800s, so any value at or below ~34.7 hours is
+  # REJECTED at startup: an expiry inside
+  # our own TTL would let the chain retire offers the engine still tracks as
+  # live, with no cancel ever recorded.
+  # offer_expiry_secs: 172800  # [OPTIONAL, default: 0 = disabled] 48h
   num_tiers: 4               # [REQUIRED] Multi-tier offer ladder depth (4 recommended: fewer, larger tiers)
   tier_spacing_bps: [35, 100, 200, 300]  # [REQUIRED] Spread per tier (bps)
   tier_size_pct: [0.15, 0.20, 0.30, 0.35] # [REQUIRED] Capital fraction per tier (sum ≈ 1.0)
@@ -342,6 +406,19 @@ strategy:
   # defaults must protect an unconfigured deployment.  wide must exceed narrow.
   # microprice_narrow_bps: 200           # At or below: micro-price used whole
   # microprice_wide_bps: 800             # At or above: plain BBO midpoint only
+  #
+  # Published-mid band clamp.  The blend above runs AFTER the order-book mid
+  # was clamped to its own BBO, so the PUBLISHED mid can leave the book again
+  # whenever the CEX or AMM disagree.  While the dex book is two-sided and
+  # fresh, the blended mid is therefore clamped back to that BBO widened by
+  #   band_bps = max(published_mid_band_floor_bps (default 150),
+  #                  published_mid_band_spread_frac * book_spread_bps)
+  # A wide book is a weak claim about location, so an honest external
+  # reference is allowed to pull proportionally further outside it, while a
+  # tight book gets the flat floor.  A binding clamp logs at warning level.
+  # The clamp is skipped entirely when the dex book is stale or one-sided --
+  # a stale book is history and should not pin fresh external data.
+  published_mid_band_spread_frac: 0.25 # [OPTIONAL, default: 0.25] Band as a fraction of the book's own relative spread; must be >= 0
   # Startup market analysis: observe this many blocks before trading begins.
   # 0 = skip analysis and start trading immediately (default).
   # Example: 20 blocks (~17 min at 52 s/block).
@@ -429,6 +506,32 @@ strategy:
   competitive_anchor_enabled: false     # [OPTIONAL, default: false] Enable anchor pricing
   competitive_anchor_max_distance_bps: 500.0  # [OPTIONAL, default: 500] Max anchor dist from mid
   competitive_anchor_stride_bps: 65.0   # [OPTIONAL, default: 65]  Inter-tier spacing from anchor
+
+  # -- 24h activity-adaptive tier margin and spacing --
+  # A slow feedback controller on TRADE FLOW, not on price.  Per side it
+  # counts confirmed fills over the trailing lookback window, adds a weighted
+  # count of the resting competing offers on that side, and divides by the
+  # target.  The resulting activity ratio (clamped to [0, 1]) interpolates
+  # BOTH the profit margin and the tier spacing between the base schedule
+  # (min_profit_margin_bps / tier_spacing_bps, incl. their per-pair
+  # overrides) and a per-pair maximum schedule.  At or above the target the
+  # base schedule is used unchanged; at zero activity the maximum is used.
+  #
+  # The coupling is CROSS-SIDE: bid activity drives the ASK schedule and ask
+  # activity drives the BID schedule.  Bids filling means base inventory is
+  # being replenished, so the ask side can afford to tighten and sell it;
+  # when nothing is being replenished the ask widens to demand a higher
+  # liquidity premium and protect inventory.
+  #
+  # Off by default.  Note that with the controller ON but no per-pair maximum
+  # configured, the spacing maximum equals the base spacing (spacing does not
+  # move at all) and the margin maximum is 2x min_profit_margin_bps.  The
+  # maxima are per-pair only -- see tier_spacing_max_bps_override and
+  # min_profit_margin_max_bps_override in the pairs: section.
+  activity_adaptive_spacing: false     # [OPTIONAL, default: false] Enable the 24h activity controller
+  activity_target_fills_24h: 24        # [OPTIONAL, default: 24]    Per-side activity that restores the base schedule; must be > 0
+  activity_book_weight: 0.5            # [OPTIONAL, default: 0.5]   Weight of one resting competing offer vs. one confirmed fill; must be >= 0
+  activity_lookback_blocks: 1662       # [OPTIONAL, default: 1662]  Fill-count window (~24 h at 52 s/block); must be > 0. No per-pair override
 
   # -- Adverse-selection-aware tier sizing --
   # On slow blockchains (Chia ~52 s/block), tier 0 (tightest) is most

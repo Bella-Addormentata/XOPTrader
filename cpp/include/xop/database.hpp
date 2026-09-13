@@ -529,6 +529,16 @@ public:
                                               const std::string& cutoff_ts,
                                               std::uint32_t max_tiers) const;
 
+    /// Query the count of confirmed fills by side (bids, asks) for a trading pair
+    /// from the trade_log table since a given block height.
+    ///
+    /// @param pair_name   Trading pair to query.
+    /// @param since_block Lower bound block height (inclusive).
+    /// @return            std::pair<int, int> where first is bid count, second is ask count.
+    [[nodiscard]]
+    std::pair<int, int> query_trade_counts_by_side(const std::string& pair_name,
+                                                   BlockHeight since_block) const;
+
     /// True if the database connection is open and usable.
     [[nodiscard]] bool is_open() const noexcept;
 
@@ -630,6 +640,9 @@ private:
 
     /// Per-tier fill rate query: filled / total resolved per tier for a pair
     sqlite3_stmt* stmt_tier_fill_rates_{nullptr};
+
+    /// 24h trade counts query by side for a pair since a block height
+    sqlite3_stmt* stmt_trade_counts_by_side_{nullptr};
 
     /// INSERT INTO strategy_quotes (per-tier quote)
     sqlite3_stmt* stmt_insert_strategy_quote_{nullptr};

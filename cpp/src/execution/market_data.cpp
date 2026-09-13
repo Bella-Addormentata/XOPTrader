@@ -1792,8 +1792,15 @@ void MarketDataFeed::apply_mid_gate(PairState& ps, const MarketDataConfig& cfg)
     //
     // Note the ORDER: agree_max_bps must be computed before the witness that
     // now consumes it.
+    //
+    // [S33 2026-09-12] PER PAIR, not bot-wide.  This feed serves every pair,
+    // so reading cfg.book_side_agree_max_spread_bps here applied one market's
+    // ceiling to all of them.  ps.pair_name selects the override when the
+    // pair has one.  The gate operand is deliberately NOT per-pair: it is the
+    // published-mid gate's own threshold, and the min() below is what keeps a
+    // per-pair value from ever being more permissive than the gate.
     const double agree_max_bps = bookside::effective_agree_max_spread_bps(
-        cfg.book_side_agree_max_spread_bps,
+        cfg.agree_max_spread_bps_for(ps.pair_name),
         cfg.mid_gate_book_confirm_max_spread_bps);
     // Screened is unaffected by this argument, so the two documented escapes
     // keep working exactly as their tests pin them while the band is on. It
@@ -2326,9 +2333,13 @@ void MarketDataFeed::ingest_competing_offers(
         // disqualify a side of its own book is the self-referential lock-in
         // that made the 187.461980 mid unkillable.  Only an INDEPENDENT
         // anchor may disqualify.
+        //
+        // [S33 2026-09-12] PER PAIR: pair_name selects this pair's own
+        // ceiling when it has one, and the bot-wide value otherwise.  The
+        // gate operand stays global -- see agree_max_spread_bps_for().
         const double agree_max =
             bookside::effective_agree_max_spread_bps(
-                cfg.book_side_agree_max_spread_bps,
+                cfg.agree_max_spread_bps_for(pair_name),
                 cfg.mid_gate_book_confirm_max_spread_bps);
         const auto sq = bookside::classify_sides(
             filtered_best_bid, filtered_best_ask, ref_price,

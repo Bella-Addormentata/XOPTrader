@@ -455,6 +455,10 @@ class MainWindow(QMainWindow):
             try:
                 self._dexie_cancel_all_pending = bool(
                     bridge.cancel_all_pending())
+                for panel in (self._order_panel, self._tab_order_panel):
+                    target = self._unwrap(panel)
+                    if target is not None and hasattr(target, "set_cancel_all_pending"):
+                        target.set_cancel_all_pending(self._dexie_cancel_all_pending)
             except Exception:  # noqa: BLE001
                 pass
         self.config_service = bridge.config_service
@@ -710,11 +714,13 @@ class MainWindow(QMainWindow):
         # The orders panels' Age (blocks) column: set_current_block existed
         # with no caller, so _current_block stayed 0 and every age rendered
         # as 0 since the panel was built.
-        if block_height > 0:
-            for panel in (self._order_panel, self._tab_order_panel):
-                target = self._unwrap(panel)
-                if target is not None and hasattr(target, "set_current_block"):
+        for panel in (self._order_panel, self._tab_order_panel):
+            target = self._unwrap(panel)
+            if target is not None:
+                if block_height > 0 and hasattr(target, "set_current_block"):
                     target.set_current_block(block_height)
+                if hasattr(target, "set_cancel_all_pending"):
+                    target.set_cancel_all_pending(self._dexie_cancel_all_pending)
 
         # Compute average spread from all pairs.
         market_data = data.get("market_data", {})
@@ -828,6 +834,142 @@ class MainWindow(QMainWindow):
                 pnl=pnl,
             )
 
+        # Derive Node and Wallet connection & sync indicators.
+        health = data.get("health", {})
+        # [S33 2026-09-05] Connectivity is ASSERTED by the engine, never
+        # inferred from a height.  The engine keeps publishing the last
+        # known height (wallet-sourced once height_source_ falls back to
+        # HeightSource::Wallet) right through a full-node outage, and stays
+        # scrapeable, so a "height > 0 and the scrape landed" fallback
+        # overrode an explicit node_connected=0 and painted the outage
+        # yellow "Not Synced" for its whole duration -- the red
+        # "Disconnected" state was unreachable exactly when it mattered.
+        # Engines predating the gauge are covered a layer down:
+        # MetricsService.get_health() defaults node_connected to the legacy
+        # xop_node{metric="synced"} gauge.
+        #
+        # [S33 2026-09-05] The legacy fallback applies only when the key is
+        # ABSENT.  An earlier cut of this fix wrote `node_connected >= 1.0 or
+        # node_synced >= 1.0`, which re-opened the very hole it removed from
+        # the height fallback: an engine explicitly reporting
+        # node_connected = 0 alongside a stale node_synced = 1 was still
+        # painted connected.  When the gauge is present its value wins,
+        # including a false one.
+        # [review round 8] LIVENESS GATES THE WHOLE TRIPLE.  MetricsService
+        # ._on_failure() clears _connected but deliberately RETAINS _latest
+        # ("the dashboard should keep showing the last known figures rather
+        # than blanking"), so every value in `health` is the LAST GOOD
+        # scrape, not a current one.  Ungated, a node that was synced when
+        # the endpoint died stays green for the entire outage -- the same
+        # retained-state masking c18 removed from the height disjunct and
+        # c19 removed from the Dexie dot, arriving one layer up through
+        # `health` itself.
+        #
+        # Default FALSE, deliberately unlike self._metrics_live above: this
+        # is a health indicator, and the rule stated for the wallet dot
+        # below -- connectivity is ASSERTED, never inferred from remembered
+        # state -- makes fail-closed the only safe default.  _metrics_live's
+        # True default serves a P&L rate, not an alarm.
+        #
+        # The WALLET triple below is deliberately NOT gated: EngineBridge
+        # overwrites wallet_connected from the direct wallet RPC, which
+        # survives a metrics outage.
+        _health_is_live = bool(data.get("metrics_connected", False))
+        _node_connected_gauge = health.get("node_connected")
+        if _node_connected_gauge is None:
+            node_connected = bool(health.get("node_synced", 0.0) >= 1.0)
+        else:
+            node_connected = bool(_node_connected_gauge >= 1.0)
+        node_synced = bool(health.get("node_synced", 0.0) >= 1.0)
+        node_syncing = bool(health.get("node_syncing", 0.0) >= 1.0)
+        if not _health_is_live:
+            node_connected = False
+            node_synced = False
+            node_syncing = False
+
+        if not node_connected:
+            node_label = "Full Node: Disconnected"
+            node_colour = "red"
+        elif node_synced:
+            node_label = "Full Node: Synced"
+            node_colour = "green"
+        elif node_syncing:
+            node_label = "Full Node: Syncing..."
+            node_colour = "yellow"
+        else:
+            node_label = "Full Node: Not Synced"
+            node_colour = "yellow"
+
+        # [S33 2026-09-05] Same rule as the node dot beside it: connectivity
+        # is ASSERTED, never inferred from remembered state.  The retained
+        # balances are not evidence of a reachable wallet -- WalletService
+        # merges each fetch into `_cached` and deliberately never clears it
+        # on failure (wallet_service.py, "prevents a single timed-out wallet
+        # RPC from erasing previously-fetched wallets"), so after the first
+        # successful fetch `bool(wallet_balances)` is permanently true.  That
+        # OR overrode the authoritative wallet_connected = 0 that
+        # EngineBridge now writes from the direct wallet RPC, and an
+        # unreachable wallet rendered yellow "Not Synced" instead of red
+        # "Disconnected" -- the alarm suppression this pass exists to remove.
+        # Engines predating the gauge are covered a layer down:
+        # MetricsService.get_health() defaults wallet_connected to the legacy
+        # xop_node{metric="wallet_synced"} gauge, exactly as node_connected
+        # defaults to the legacy {metric="synced"} one.
+        wallet_connected = bool(health.get("wallet_connected", 0.0) >= 1.0)
+        wallet_synced = bool(health.get("wallet_synced", 0.0) >= 1.0)
+        wallet_syncing = bool(health.get("wallet_syncing", 0.0) >= 1.0)
+
+        if not wallet_connected:
+            wallet_label = "Wallet: Disconnected"
+            wallet_colour = "red"
+        elif wallet_synced:
+            wallet_label = "Wallet: Synced"
+            wallet_colour = "green"
+        elif wallet_syncing:
+            wallet_label = "Wallet: Syncing..."
+            wallet_colour = "yellow"
+        else:
+            wallet_label = "Wallet: Not Synced"
+            wallet_colour = "yellow"
+
+        # [S33 2026-09-05] Liveness only.  `market_data` is rebuilt every tick
+        # from the RETAINED MetricsService snapshot (_on_failure clears
+        # _connected but deliberately keeps _latest) and carries an entry for
+        # every configured pair even before the first successful scrape -- so
+        # `or bool(market_data)` pinned this dot green from the first tick
+        # onward, making the indicator as inert as the hardcoded True it
+        # replaced.  `metrics_connected` was THEN the only live signal
+        # published; that is no longer true -- see the round-10 note below.
+        # [review 3997548811] `metrics_connected` answers "can the GUI
+        # scrape the engine?", which is engine health, not venue
+        # reachability -- so with the engine healthy and every Dexie ticker
+        # failing, this dot stayed green and the fail-open bug c19 was
+        # opened to remove survived in a second form.  The engine now
+        # publishes xop_node{metric="dexie_connected"}, a freshness window
+        # over the last ANSWERED Dexie request (see kDexieProbeLivenessWindow).
+        #
+        # BOTH are required, which is why the scrape gate stays: a stale
+        # dexie_connected=1 read from a dead scrape is remembered state, and
+        # the rule for every dot in this method is that connectivity is
+        # ASSERTED, never inferred from what was last seen.
+        dexie_conn = (bool(data.get("metrics_connected", False))
+                      and bool(health.get("dexie_connected", 0.0) >= 1.0))
+        dexie_label = "Dexie: Connected" if dexie_conn else "Dexie: Disconnected"
+        dexie_colour = "green" if dexie_conn else "red"
+
+        sync_parts = []
+        if node_syncing:
+            sync_parts.append("Node Syncing")
+        elif not node_synced and node_connected:
+            sync_parts.append("Node Not Synced")
+
+        if wallet_syncing:
+            sync_parts.append("Wallet Syncing")
+        elif not wallet_synced and wallet_connected:
+            sync_parts.append("Wallet Not Synced")
+
+        sync_summary = ", ".join(sync_parts)
+
         # [PNL-DISPLAY 2026-08-02] The status-bar headline shows the
         # restart-proof lifetime realized P&L from trade_log when the DB
         # figure has loaded; the engine's since-boot USD gauge is only a
@@ -840,8 +982,15 @@ class MainWindow(QMainWindow):
             block_height=block_height,
             xch_usd_rate=xch_usd,
             pnl_usd=status_pnl_usd,
+            sync_status=sync_summary,
         )
-        self._block_label.setText(f"Block: {block_height:,}")
+        if sync_summary:
+            self._block_label.setText(f"Block: {block_height:,} ({sync_summary})")
+            self._block_label.setStyleSheet(f"color: {_C.WARNING_YELLOW}; font-weight: bold;")
+        else:
+            self._block_label.setText(f"Block: {block_height:,}")
+            self._block_label.setStyleSheet(f"color: {TEXT_PRIMARY};")
+        self._block_label.setToolTip(f"Chain height: {block_height:,}\n{node_label}\n{wallet_label}")
 
         # Dashboard update -- translate bridge dict to card-keyed format.
         dashboard = self._unwrap(self._dashboard)
@@ -903,23 +1052,34 @@ class MainWindow(QMainWindow):
                 colour_map = {"Running": "green", "Stopped": "red", "Disconnected": "red"}
                 dashboard.update_bot_status(status, colour=colour_map.get(status, "gray"))
             if hasattr(dashboard, "update_connection_status"):
-                full_node_connected = (
-                    health.get("node_synced", 0.0) >= 1.0
-                    or block_height > 0
-                    or bool(data.get("metrics_connected", False))
-                )
-                wallet_connected = (
-                    health.get("wallet_connected", 0.0) >= 1.0
-                    or bool(wallet_balances)
-                )
                 dashboard.update_connection_status({
-                    "Full Node": full_node_connected,
-                    "Wallet": wallet_connected,
-                    "Dexie": True,
+                    "Full Node": {
+                        "connected": node_connected,
+                        "synced": node_synced,
+                        "syncing": node_syncing,
+                        "label": node_label,
+                        "colour": node_colour,
+                    },
+                    "Wallet": {
+                        "connected": wallet_connected,
+                        "synced": wallet_synced,
+                        "syncing": wallet_syncing,
+                        "label": wallet_label,
+                        "colour": wallet_colour,
+                    },
+                    "Dexie": {
+                        "connected": dexie_conn,
+                        "label": dexie_label,
+                        "colour": dexie_colour,
+                    },
                 })
             if hasattr(dashboard, "update_block_info"):
                 # Use 0 timestamp as sentinel; dashboard handles it gracefully.
-                dashboard.update_block_info(block_height, time.time() if block_height > 0 else 0.0)
+                dashboard.update_block_info(
+                    block_height,
+                    time.time() if block_height > 0 else 0.0,
+                    sync_note=sync_summary or ("Synced" if (node_synced and wallet_synced) else ""),
+                )
             if hasattr(dashboard, "update_wallet_balances"):
                 reserve = data.get("spendable_reserve", {})
                 stuck = data.get("stuck_offers", 0)
@@ -2452,6 +2612,10 @@ class MainWindow(QMainWindow):
                 if hasattr(self._bridge, "clear_cancel_all_pending"):
                     self._bridge.clear_cancel_all_pending()
             self._dexie_cancel_all_pending = False
+            for panel in (self._order_panel, self._tab_order_panel):
+                target = self._unwrap(panel)
+                if target is not None and hasattr(target, "set_cancel_all_pending"):
+                    target.set_cancel_all_pending(False)
         elif self._dexie_cancel_all_pending:
             # [review #22] Gate ANY on -- including the startup arm --
             # while a cancel-all is genuinely unconfirmed. (No longer
@@ -2724,6 +2888,10 @@ class MainWindow(QMainWindow):
         if not self._bridge.cancel_all_offers():
             return  # bridge already surfaced the error
         self._dexie_cancel_all_pending = True
+        for panel in (self._order_panel, self._tab_order_panel):
+            target = self._unwrap(panel)
+            if target is not None and hasattr(target, "set_cancel_all_pending"):
+                target.set_cancel_all_pending(True)
         if hasattr(self._bridge, "mark_cancel_all_pending"):
             # [review #8] Persisted beside the DB so a GUI restart during
             # the confirm window re-adopts the latch.

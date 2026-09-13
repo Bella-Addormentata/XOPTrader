@@ -32,27 +32,40 @@ pairs:
   # TIMING changed.
   #
   # Why it was backed out rather than left set: an enable is inert until the
-  # engine restarts, but the running engine is still the PRE-#134 binary, and
-  # the GUI relaunches the engine whenever the GUI itself restarts. So the
-  # flag was a latent trigger -- any GUI restart, for any reason, would have
-  # armed the failure below without anyone choosing to. Leaving a loaded
-  # trigger in a config file and relying on nobody touching it is not a
-  # safety argument.
+  # engine restarts, and the GUI relaunches the engine whenever the GUI
+  # itself restarts. So a set flag was a latent trigger -- any GUI restart,
+  # for any reason, would have armed the failure below without anyone
+  # choosing to. Leaving a loaded trigger in a config file and relying on
+  # nobody touching it is not a safety argument.
   #
-  # TO RE-ENABLE: merge #134, build, stop the engine, restart the GUI (it
-  # launches the engine), THEN set this true and restart once more. In that
-  # order the failure below cannot occur, because every link in it is fixed.
+  # [2026-09-12, review round 9] STATUS UPDATE. The instructions below had
+  # gone stale, and a checked-in config that contradicts its own safety
+  # guidance is how an operator gets hurt at 3am.
   #
-  # *** DO NOT SET THIS TRUE ON A PRE-#134 BINARY. ***
-  # An enable takes effect only on restart (engine.cpp refuses live enables),
-  # and on the old binary a restart here reproduces the 2026-08-30 incident
-  # exactly: the competitive anchor caps bids against a book midpoint built
-  # half from the junk ask stack, the ladder self-crosses and drops 12/12
-  # tiers, then the mojo-scale bug in step_observe_asset_pegs latches a FALSE
-  # depeg ~10 min in and cancels every offer on every pair touching BYC. The
-  # bogus valuation then feeds the 10% drawdown breaker, which PAUSES THE
-  # WHOLE ENGINE and takes XCH/DBX -- the only earning pair -- down with it.
-  # PR #134 fixes all three. Merge, build, deploy, THEN restart.
+  #   * PR #134 MERGED 2026-09-02 and is an ancestor of main.
+  #   * The RUNNING engine -- the installed binary, not the build tree -- was
+  #     built 2026-09-03, i.e. AFTER #134 landed.  So the PRE-#134 hazard
+  #     described below is no longer the live situation.  (Build time after
+  #     merge time is strong evidence, not proof: a build can be made from an
+  #     older checkout.  Confirm the deployed build before relying on it.)
+  #
+  # WHY THIS STILL SHIPS false.  Enabling is a TRADING decision, not a side
+  # effect of merging a branch.  Shipping true would turn the pair on at the
+  # next deploy because some unrelated work was merged -- exactly the latent
+  # trigger objection recorded above.  The operator enables it deliberately,
+  # as its own act.
+  #
+  # TO RE-ENABLE on a post-#134 binary: set this true and restart the engine.
+  # An enable is inert until restart -- engine.cpp refuses live enables.
+  #
+  # THE HISTORICAL HAZARD, kept because it is why the ordering above exists
+  # and what a PRE-#134 binary would still do: the competitive anchor caps
+  # bids against a book midpoint built half from the junk ask stack, the
+  # ladder self-crosses and drops 12/12 tiers, then the mojo-scale bug in
+  # step_observe_asset_pegs latches a FALSE depeg ~10 min in and cancels
+  # every offer on every pair touching BYC.  The bogus valuation then feeds
+  # the 10% drawdown breaker, which PAUSES THE WHOLE ENGINE and takes
+  # XCH/DBX -- the only earning pair -- down with it.  #134 fixes all three.
   #
   # What re-enabling actually buys, and what it costs, in this pair's own
   # orientation (base XCH, quote BYC, so price is BYC per XCH):
@@ -70,7 +83,42 @@ pairs:
   min_offer_size_units_override: 1.0
   name: XCH/BYC
   quote_asset_id: ae1536f56760e471ad85ead45f00d680ff9cca73b8cc3407be778f1c0c606eac
-  ratio_target_override: 0.6923
+  ratio_target_override: 0.75
+  max_half_spread_bps_override: 5000
+  activity_adaptive_spacing_override: true
+  activity_target_fills_24h_override: 24
+  activity_book_weight_override: 0.0
+  min_profit_margin_bps_override: 100
+  min_profit_margin_max_bps_override: 800
+  tier_spacing_bps_override:
+  - 100.0
+  - 250.0
+  - 450.0
+  - 700.0
+  - 1000.0
+  - 1400.0
+  tier_spacing_max_bps_override:
+  - 600.0
+  - 1200.0
+  - 1900.0
+  - 2700.0
+  - 3600.0
+  - 4800.0
+  bbo_sanity_max_passive_dev_override: 0.80
+  bbo_sanity_max_aggressive_dev_override: 0.80
+  competitive_anchor_enabled_override: false
+  fair_value_residual_widen_ratio_override: 0.0
+  stablecoin_skip_gap_aware: true
+  # [S33 2026-09-12] The two-sides-agree ceiling, SCOPED TO THIS PAIR.
+  # This was market_data.book_side_agree_max_spread_bps: 1500.0 -- a global
+  # knob feeding the ONE MarketDataFeed that serves every market, so a value
+  # chosen for THIS book (10,769 bps, an absent ask side rather than a wide
+  # market) also denied the bypass to every other pair whose spread fell
+  # between 1500 and the 5000 default. Same number, applied where it was
+  # meant; every other pair is back on the default.
+  # The effective value is still min(this, mid_gate_book_confirm_max_spread_bps)
+  # and THAT gate remains global -- read config.hpp before changing either.
+  book_side_agree_max_spread_bps_override: 1500.0
 - base_asset_id: ae1536f56760e471ad85ead45f00d680ff9cca73b8cc3407be778f1c0c606eac
   depeg_bail_pct: 10.0
   depeg_sustained_blocks: 30
@@ -106,7 +154,7 @@ pairs:
   min_offer_size_units_override: 1.0
   name: XCH/DBX
   quote_asset_id: db1a9020d48d9d4ad22631b66ab4b9ebd3637ef7758ad38881348c5d24c38f20
-  ratio_target_override: 0.8181999999999999
+  ratio_target_override: 0.75
 - base_asset_id: f322a205c034fe28681829fa5a2e483ac421f0952eb1292945c8db06e0a471a6
   enabled: false
   min_offer_size_units_override: 1.0
@@ -235,13 +283,26 @@ strategy:
     XCH/DBX: 0.75
   asset_target_tolerances:
     BYC: 0.1
-    DBX: 0.15
+    # [S33-DBX-NORMALIZE 2026-09-05] DBX deliberately shares BYC's tolerance
+    # (was 0.15) now that both CATs sit at the same 0.2 allocation and the same
+    # 0.75 ratio target -- one calibration for the two comparable CAT books
+    # rather than two. Live effect: with asset_drift_guard_max_factor 1.5 the
+    # DBX no-action weight band tightens from [0.05, 0.35] to [0.10, 0.30], so
+    # the drift guard begins tapering the DBX-acquiring side earlier.
+    DBX: 0.1
     WMILLIETH.B: 0.05
     WUSDC.B: 0.08
     XCH: 0.4
+  # [S33-DBX-NORMALIZE 2026-09-05] Both pairs share one enter band for the same
+  # reason as the tolerance above. For XCH/DBX (was 0.38636...) this moves the
+  # AcquireBase trigger from ratio <= 0.3636 to <= 0.40, so rebalancing engages
+  # slightly earlier; the AcquireQuote side is unreachable either way (both
+  # thresholds exceed 1.0) and exit_band = min(0.04, enter*0.5) = 0.04 is
+  # unchanged, so hysteresis is untouched. ratio_force_one_sided is false, so
+  # ratio mode scales tier sizes rather than suppressing a side outright.
   ratio_band_enter_by_pair:
     XCH/BYC: 0.35
-    XCH/DBX: 0.38636363636363635
+    XCH/DBX: 0.35
 risk:
   soft_limit_pct: 0.6
   hard_limit_pct: 0.8
@@ -517,8 +578,41 @@ pegged_assets:
   symbol: BYC
   peg_currency: USD
   peg_target: 1.0
-  warn_pct: 2.0
-  bail_pct: 10.0
+  # [S33 2026-09-12] WHY THIS BAND IS TEN AND FIVE TIMES wUSDC.b's ABOVE,
+  # AND WHAT IT COSTS. Reviewed 2026-09-12 and KEPT deliberately.
+  #
+  # WHAT IS EVIDENCED. BYC is a Chia-native CDP stablecoin, not a bridged
+  # claim on a custodied dollar, so its dollar value is market-determined
+  # rather than redeemable at par (engine.cpp's BYC anchor branch). Every
+  # real anchor measured there puts it at ~$1.01 -- 7-day traded VWAP 1.001,
+  # dexie tickers 1.011, executable bids 1.000-1.014 -- against a measured
+  # p50 book spread of 1163 bps. That is why prefer_market_cross: true is set
+  # below, and why that cross is trusted only when its own spread is <= 300
+  # bps: a midpoint off this book carries a worst-case location error of
+  # ~spread/2, still ~150 bps even at that tightness, while the par
+  # assumption erred by at most ~140 bps against every anchor measured.
+  #
+  # WHAT IS NOT. Nothing in this repo measures a BYC deviation anywhere near
+  # 20%, let alone 50%. The distance between the ~150 bps of measurement
+  # error above and these thresholds is an OPERATOR MARGIN for a coin whose
+  # price is allowed to move -- it is not derived from data. Recorded as such
+  # so the next reader does not mistake it for a measurement.
+  #
+  # THE RISK ENVELOPE THIS BUYS. bail_pct is not a display value:
+  # step_observe_asset_pegs passes it to risk::observe_peg, and that
+  # function's JustSuspended is what suspends the par, disables every pair
+  # touching BYC and cancels their resting offers until an operator
+  # re-enables from the GUI's Depeg tab. So at 50.0 this bot KEEPS QUOTING
+  # THROUGH A 49% DEPEG indefinitely; and even past 50% it keeps quoting
+  # until 30 CONSECUTIVE observations (sustained_observations below) are at
+  # or past bail, because a single observation back inside 50% resets that
+  # streak to zero. warn_pct 20.0 means no warning of any kind below 20% off
+  # par. The band that stops this book's width from reading as a depeg is the
+  # same band that delays a genuine one; this entry chooses the delay
+  # knowingly. If the exit thesis for the BYC inventory changes, revisit this
+  # number first.
+  warn_pct: 20.0
+  bail_pct: 50.0
   sustained_observations: 30
   # A CDP stablecoin: the market decides its dollar value when the book is
   # tight; the par is the fallback. Measured basis in engine.cpp's BYC
