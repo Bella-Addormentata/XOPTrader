@@ -126,6 +126,55 @@ TEST(RewardIngestFilterTest, DegenerateAmountsAreRejected) {
                                   /*max=*/0, false));
 }
 
+// ---------------------------------------------------------------------------
+// classify_reward_row -- the per-row ordering the reward scan delegates to.
+//
+// [review 2026-09-13] This ordering used to live inline in engine.cpp, where
+// no test could reach it. The loop now CALLS this function, so these drive
+// production code.
+//
+// MUTATION CHECK: move the already_booked clause BELOW the is_recent clause
+// (the original defect) -> ABookedReceiptIsFinishedBusinessAtAnyAge goes RED
+// and nothing else does.
+// ---------------------------------------------------------------------------
+
+TEST(RewardRowClassification, ARecentUnbookedInflowIsBooked) {
+    EXPECT_EQ(classify_reward_row(/*is_reward_inflow=*/true,
+                                  /*has_idempotency_key=*/true,
+                                  /*already_booked=*/false,
+                                  /*is_recent=*/true),
+              RewardRowAction::Book);
+}
+
+// THE DEFECT round 11 fixed: a receipt booked while it was fresh must not be
+// re-classified as stale once it ages past the cutoff. It was, and the warning
+// then called those rows unresolved divergence on every heartbeat.
+TEST(RewardRowClassification, ABookedReceiptIsFinishedBusinessAtAnyAge) {
+    EXPECT_EQ(classify_reward_row(true, true,
+                                  /*already_booked=*/true,
+                                  /*is_recent=*/false),
+              RewardRowAction::AlreadyBooked)
+        << "idempotency outranks freshness; a booked row is not stale work";
+    EXPECT_EQ(classify_reward_row(true, true, true, true),
+              RewardRowAction::AlreadyBooked);
+}
+
+TEST(RewardRowClassification, AnUnbookedStaleReceiptIsReportedNotBooked) {
+    EXPECT_EQ(classify_reward_row(true, true, false, /*is_recent=*/false),
+              RewardRowAction::TooStale);
+}
+
+TEST(RewardRowClassification, NoTxNameMeansNoStableLedgerKey) {
+    EXPECT_EQ(classify_reward_row(true, /*has_idempotency_key=*/false, false, true),
+              RewardRowAction::NoIdempotencyKey);
+}
+
+TEST(RewardRowClassification, NonRewardsAreRejectedBeforeAnythingElse) {
+    EXPECT_EQ(classify_reward_row(/*is_reward_inflow=*/false, true, true, true),
+              RewardRowAction::NotAReward)
+        << "the inflow test comes first so a non-reward never costs a DB read";
+}
+
 // ============================================================================
 // Valuation: booking at fair value (acceptance: "booking at FMV")
 // ============================================================================

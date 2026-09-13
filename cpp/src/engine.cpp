@@ -16611,47 +16611,42 @@ asio::awaitable<void> Engine::step_ingest_reward_inflows(
         const BlockHeight height = static_cast<BlockHeight>(
             t.value("confirmed_at_height", 0));
 
-        if (!accounting::is_reward_inflow(
-                type, amount, height, genesis_block,
-                acc.reward_max_mojos_per_coin,
-                outgoing.count({height, amount}) > 0)) {
-            continue;
-        }
+        const bool is_inflow = accounting::is_reward_inflow(
+            type, amount, height, genesis_block,
+            acc.reward_max_mojos_per_coin,
+            outgoing.count({height, amount}) > 0);
 
         const std::string tx_name = t.value("name", std::string{});
-        if (tx_name.empty()) continue;   // no stable idempotency key
+        const bool        has_key = !tx_name.empty();
+        const std::string event_id =
+            has_key ? "reward:" + tx_name : std::string{};
 
-        const std::string event_id = "reward:" + tx_name;
-
-        // [review 3997843761] IDEMPOTENCY BEFORE FRESHNESS.
+        // [review 2026-09-13] The row decision, INCLUDING the ordering that
+        // idempotency outranks freshness, lives in reward_ingest.hpp so ctest
+        // drives this exact rule rather than a copy of it. Only the JSON
+        // reading and the DB calls around it stay uncovered.
         //
-        // The freshness gate used to run first, so a receipt booked days ago
-        // -- while it was still fresh -- was re-counted as stale the moment it
-        // aged past the cutoff, and the warning below then reported it as
-        // still being wallet-vs-books divergence when it had in fact been
-        // booked.  The wallet's newest-200 window holds such rows for weeks,
-        // so that ran on every heartbeat.
-        //
-        // An already-journalled receipt is finished business at any age: skip
-        // it silently.  This is a READ -- the scan cannot learn "already
-        // booked" from append_ledger_entries, because for a stale receipt it
-        // deliberately performs no insert at all.
-        if (db_->ledger_has_event(event_id)) continue;
+        // already_booked is evaluated last and short-circuited: it is a DB
+        // read, and this scan walks ~200 rows per heartbeat of which most are
+        // not rewards at all.
+        const auto action = accounting::classify_reward_row(
+            is_inflow,
+            has_key,
+            /*already_booked=*/is_inflow && has_key &&
+                db_->ledger_has_event(event_id),
+            /*is_recent=*/accounting::reward_receipt_is_recent(
+                height, block_height));
 
-        // [review 2026-09-12] usd_per_unit above is ONE live price and this
-        // ledger row is idempotent, so a receipt booked today keeps today's
-        // price forever.  On the FIRST restart after the reverse=false window
-        // fix the entire never-booked backlog arrives at once, and the genesis
-        // gate does NOT bound it -- that is the asset's opening block, weeks
-        // below the head.  Skipped receipts remain wallet-vs-books divergence
-        // for the invariant, the documented fate of any reward past the window.
-        if (!accounting::reward_receipt_is_recent(height, block_height)) {
+        if (action == accounting::RewardRowAction::TooStale) {
             // Report each unbooked stale receipt ONCE per process rather than
             // on every heartbeat for as long as it sits in the window.
             if (reward_stale_warned_.insert(event_id).second) {
                 stale_skipped += 1;
             }
             continue;
+        }
+        if (action != accounting::RewardRowAction::Book) {
+            continue;   // not a reward, no idempotency key, or already booked
         }
 
         if (usd_per_unit <= 0.0) {

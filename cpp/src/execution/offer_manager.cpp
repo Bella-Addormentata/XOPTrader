@@ -3321,36 +3321,28 @@ asio::awaitable<int> OfferManager::prune_stuck_transactions(
             int stuck_count = 0;
             int fresh_count = 0;
             for (const auto& tx : txs) {
-                // Only examine unconfirmed transactions.
-                if (tx.contains("confirmed") && tx["confirmed"].get<bool>()) {
+                const bool confirmed =
+                    tx.contains("confirmed") && tx["confirmed"].get<bool>();
+                const bool age_known = tx.contains("created_at_time");
+                const std::int64_t age =
+                    age_known
+                        ? (now_epoch - tx["created_at_time"].get<std::int64_t>())
+                        : 0;
+                const bool has_bundle = tx.contains("spend_bundle") &&
+                                        !tx["spend_bundle"].is_null();
+
+                // [review 2026-09-13] The per-row rule -- unknown age counts
+                // as FRESH, and a row carrying a spend bundle gets 3x the
+                // threshold -- lives in stuck_tx_verdict.hpp so ctest drives
+                // the same code this does rather than a copy of it. Only the
+                // JSON field reading above is still uncovered.
+                const auto row_class = classify_stuck_row(
+                    confirmed, age_known, age, has_bundle, max_age_seconds);
+
+                if (row_class == StuckRowClass::Confirmed) {
                     continue;
                 }
-
-                // Check age.  [S33 review] An unconfirmed row whose age
-                // cannot be read is UNKNOWN, not old.  It counts as FRESH,
-                // because the delete below is wallet-wide and would take it
-                // regardless -- "Unknown is its own state, and it authorises
-                // nothing" (coin_pool_verdict.hpp).
-                if (!tx.contains("created_at_time")) {
-                    ++fresh_count;
-                    continue;
-                }
-                auto created = tx["created_at_time"].get<std::int64_t>();
-                auto age = now_epoch - created;
-
-                // Transactions without a spend bundle are stuck immediately
-                // after max_age_seconds (wallet failed to build the bundle).
-                // Transactions WITH a spend bundle that remain unconfirmed
-                // past 3x max_age_seconds (default 30 min) are also stuck:
-                // the mempool drops transactions after ~5 minutes, so if
-                // they haven't confirmed after 30 min they never will.
-                bool has_bundle = tx.contains("spend_bundle") &&
-                                  !tx["spend_bundle"].is_null();
-                std::int64_t threshold = has_bundle
-                    ? max_age_seconds * 3   // 30 min for broadcast-but-dropped
-                    : max_age_seconds;       // 10 min for never-broadcast
-
-                if (age < threshold) {
+                if (row_class == StuckRowClass::FreshOrUnknown) {
                     ++fresh_count;
                     continue;
                 }
