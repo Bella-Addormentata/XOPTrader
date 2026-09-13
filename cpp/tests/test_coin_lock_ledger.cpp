@@ -12,9 +12,14 @@ namespace {
 using xop::Mojo;
 using xop::execution::CoinLockLedger;
 using xop::execution::OfferManager;
+using xop::execution::reserve_bulk_cancel;
 
 constexpr Mojo kXch = 1'000'000'000'000LL;
 constexpr Mojo kFee = 28'922;  // the live per-offer fee from the incident
+constexpr Mojo kBatchFee = 10'000'000;  // live current_fee_mojos_, per batch
+// The live wallet refusal text, verbatim (take_retry.hpp classifies it).
+constexpr const char* kSweepRefusal =
+    "Wallet needs to be fully synced before making transactions.";
 
 TEST(CoinLockLedgerTest, ReplaysTheIncidentBatchExactly) {
     // [XCH-LOCK-LEDGER 2026-08-23] 2026-08-23 13:48:58Z: spendable was
@@ -260,6 +265,145 @@ TEST(CoinLockLedgerTest, InactiveLedgerAdmitsEverything) {
     EXPECT_TRUE(ledger.try_lock(1'000 * kXch, kFee));
     ledger.note_lock(kXch, kFee);
     EXPECT_EQ(ledger.committed(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Bulk-cancel fee reservation ([S33 2026-09-11]: the one change on this branch
+// that moves real XCH, and it shipped with no coverage -- reinstating the
+// single note_lock(0, fee) turned no test red).  These drive a real ledger
+// through the same helper OfferManager::cancel_offers_charged calls, and
+// assert on POOL STATE, so none of them can pass vacuously.
+// ---------------------------------------------------------------------------
+
+TEST(CoinLockLedgerTest, BulkCancelReservesOneWholeFeeCoinPerBatch) {
+    // 20 offers at kCancelOffersBatchSize 5 is FOUR batch transactions, and
+    // the daemon charges batch_fee once per batch.  Reserving a single fee
+    // under-reserved by 4x -- the 2026-08-23 zero-spendable shape.
+    std::vector<Mojo> coins(10, kXch);
+    CoinLockLedger ledger(coins, /*floor=*/0, /*commit_frac=*/1.0);
+
+    reserve_bulk_cancel(ledger, kBatchFee, /*n_offers=*/20);
+
+    // WHOLE COINS, not 4 x kBatchFee: each batch transaction is submitted
+    // inside the same cycle, so the change from one cannot fund the next and
+    // each locks a different whole XCH coin.  This is the behaviour we mean
+    // to pin -- a 4-coin drain, not a 0.00004 XCH drain.
+    EXPECT_EQ(ledger.remaining(), 6 * kXch);
+    EXPECT_NE(ledger.remaining(), 10 * kXch - 4 * kBatchFee);
+    // Cancel fees are pool drains, never offer commitment (see note_lock).
+    EXPECT_EQ(ledger.committed(), 0);
+
+    // 21 offers cross into a fifth batch: the count follows the batch size
+    // the request actually carries, not a round number.
+    std::vector<Mojo> more(10, kXch);
+    CoinLockLedger spilled(more, 0, 1.0);
+    reserve_bulk_cancel(spilled, kBatchFee, /*n_offers=*/21);
+    EXPECT_EQ(spilled.remaining(), 5 * kXch);
+}
+
+TEST(CoinLockLedgerTest, BulkCancelWithNoTrackedOffersStillReservesOneBatch) {
+    // cancel_all:true cancels offers this process never tracked (a previous
+    // instance's book), so an empty tracked book is NOT a free call.  The
+    // >= 1 clamp must still reserve one whole fee coin.
+    std::vector<Mojo> coins(10, kXch);
+    CoinLockLedger ledger(coins, /*floor=*/0, /*commit_frac=*/1.0);
+
+    reserve_bulk_cancel(ledger, kBatchFee, /*n_offers=*/0);
+
+    EXPECT_EQ(ledger.remaining(), 9 * kXch);
+    EXPECT_EQ(ledger.committed(), 0);
+}
+
+TEST(CoinLockLedgerTest, BulkCancelDrainLeavesLessRoomForTheNextOffer) {
+    // The reservation is not bookkeeping -- it decides admissions.  Ten
+    // 1-XCH coins behind a 6-XCH fee-reserve floor: four batch drains land
+    // the pool exactly ON the floor, so the next offer lock must be refused.
+    // Reserving a single fee would leave 9 XCH and wrongly admit it, which
+    // is how an under-reservation walks the wallet toward zero spendable.
+    std::vector<Mojo> coins(10, kXch);
+    CoinLockLedger ledger(coins, /*floor=*/6 * kXch, /*commit_frac=*/1.0);
+
+    reserve_bulk_cancel(ledger, kBatchFee, /*n_offers=*/20);
+
+    EXPECT_EQ(ledger.remaining(), 6 * kXch);
+    EXPECT_FALSE(ledger.try_lock(kXch, 0));   // floor refuses; cap is fine
+    EXPECT_EQ(ledger.remaining(), 6 * kXch);  // a refusal locks nothing
+}
+
+// ---------------------------------------------------------------------------
+// [S33 2026-09-12] A REFUSED WALLET-WIDE SWEEP MUST SURVIVE THE PER-ID
+// FALLBACK.
+//
+// cancel_all sends cancel_all:true.  When that wallet-wide sweep is REFUSED
+// but the local book is NOT empty, cancel_all falls back to cancelling each
+// tracked id -- and cancel_ids() returns a FRESH CancelOutcome.  Assigning it
+// (`out = co_await cancel_ids(...)`) discarded sweep_refused wholesale, so a
+// fallback that succeeded produced `failed` empty and sweep_refused false:
+// CancelLadder::record() took its Done branch, clean() returned true, and
+// shutdown logged "All outstanding offers cancelled" after a sweep the wallet
+// had REFUSED.  The per-id leg can never reach the untracked book the sweep
+// was refused over, so its success proves nothing about it.
+//
+// MUTATION CHECK, run 2026-09-12, each defect reinstated exactly and alone:
+//   M13  drop `fallback.sweep_refused = true;` (i.e. the plain assignment
+//        the fold replaced)   -> BOTH tests below FAIL, on sweep_refused and
+//                               on all_cancelled().
+//   M14  restore [S46]'s extra `&& !fallback.failed.empty()` guard on the
+//        last_error carry     -> TheFallbacksFreshOutcomeCannotDropTheRefusal
+//                               FAILS: the refusal reaches the operator with
+//                               no text at all, which is the one case where
+//                               it is the only thing that went wrong.
+//   M15  carry the bulk text unconditionally (drop the empty check)
+//                             -> ThePerIdLoopsOwnFailureTextWins FAILS: the
+//                               sweep's sync refusal overwrites the funding
+//                               refusal the per-id loop actually hit, and
+//                               worst_class with it.
+//
+// WHAT THIS DOES NOT REACH, stated plainly rather than implied away: nothing
+// in cpp/tests constructs an OfferManager (S36), so cancel_all's WIRING has
+// no coverage.  Reinstating the deleted `if (all_offers.empty()) co_return
+// out;` early return, or sizing the reservation from the tracked count alone,
+// leaves every test in this file green.  Those lines were verified by
+// reading, not by ctest.
+// ---------------------------------------------------------------------------
+
+TEST(CancelOutcomeFoldTest, TheFallbacksFreshOutcomeCannotDropTheRefusal) {
+    // The per-id leg was handed every tracked id and every one went through,
+    // so it knows nothing of the sweep and its `failed` is empty.  That is
+    // exactly the outcome that used to read as a clean shutdown.
+    OfferManager::CancelOutcome fallback;
+    fallback.cancelled = {"offer-a", "offer-b"};
+
+    const auto out =
+        OfferManager::fold_refused_sweep(fallback, kSweepRefusal);
+
+    EXPECT_TRUE(out.sweep_refused);
+    EXPECT_FALSE(out.all_cancelled())
+        << "an empty `failed` after a REFUSED sweep is not success";
+    EXPECT_EQ(out.last_error, kSweepRefusal)
+        << "the refusal is the only thing that went wrong here; reporting it "
+           "with no text leaves the operator nothing to read";
+    EXPECT_EQ(out.worst_class, xop::execution::TakeFailureClass::Unsynced);
+    // The fallback's own work is kept, not thrown away with the assignment.
+    EXPECT_EQ(out.cancelled.size(), 2u);
+}
+
+TEST(CancelOutcomeFoldTest, ThePerIdLoopsOwnFailureTextWins) {
+    // When the per-id leg failed too, ITS text is the operator-facing one:
+    // the sweep's self-clearing sync refusal must not overwrite a funding
+    // refusal, which is the class that earns the short leash.
+    OfferManager::CancelOutcome fallback;
+    fallback.failed      = {"offer-c"};
+    fallback.last_error  = "insufficient funds in wallet 8";
+    fallback.worst_class = xop::execution::TakeFailureClass::Funding;
+
+    const auto out =
+        OfferManager::fold_refused_sweep(fallback, kSweepRefusal);
+
+    EXPECT_TRUE(out.sweep_refused);
+    EXPECT_EQ(out.last_error, "insufficient funds in wallet 8");
+    EXPECT_EQ(out.worst_class, xop::execution::TakeFailureClass::Funding);
+    EXPECT_FALSE(out.all_cancelled());
 }
 
 // ---------------------------------------------------------------------------

@@ -1676,7 +1676,18 @@ void Engine::shutdown()
                 // Engine) is satisfied by moving the state out, not by
                 // leaving it untested. What remains below is a switch that
                 // awaits and hands the result back.
-                execution::CancelLadder ladder(outstanding, retry_cfg);
+                // [S33 2026-09-12] The third argument is the whole point
+                // of this sweep at this call site. `outstanding` is seeded
+                // from State above, so an engine that recovered a previous
+                // instance's offers but could not re-adopt them -- the wallet
+                // was unsynced, every probe returned NoVerdict -- builds an
+                // EMPTY ladder, and an empty ladder used to Finish before
+                // attempt 1. cancel_all() was therefore never awaited, the
+                // SweepRefused branch below was unreachable, and the stop
+                // reported "All outstanding offers cancelled (0 attempt(s),
+                // 0 ms)" having swept nothing.
+                execution::CancelLadder ladder(outstanding, retry_cfg,
+                                               /*sweep_when_empty=*/true);
 
                 for (;;) {
                     const auto act = ladder.next(elapsed_ms());
@@ -1723,6 +1734,11 @@ void Engine::shutdown()
                     // ladder from every offer that merely hit the sync flap.
                     res.worst_class     = oc.worst_class;
                     res.bulk_submitted  = oc.bulk_submitted;
+                    // [S33 2026-09-12] Without this the ladder cannot see a
+                    // refused wallet-wide sweep at all: cancel_all reports it
+                    // with an EMPTY `failed` (the bulk endpoint names no ids),
+                    // which record() would read as "nothing left -- Done".
+                    res.sweep_refused   = oc.sweep_refused;
                     ladder.record(std::move(res));
                 }
 
@@ -1774,6 +1790,54 @@ void Engine::shutdown()
                         + " attempt(s), stopped because "
                         + execution::to_string(stop_reason)
                         + "; the fallback covers the remainder",
+                        outstanding);
+                } else if (stop_reason ==
+                           execution::CancelStopReason::SweepRefused) {
+                    // [S33 2026-09-12, corrected 2026-09-13] An empty
+                    // `outstanding` here has TWO causes, and the earlier
+                    // wording claimed only the first:
+                    //
+                    //   1. the local book was empty, so the refused
+                    //      wallet-wide sweep named no ids -- the bulk
+                    //      endpoint takes no offer id at all; or
+                    //   2. the local book was NOT empty, the sweep failed,
+                    //      and the per-ID fallback then cancelled every
+                    //      tracked offer. `outstanding` is empty because the
+                    //      fallback SUCCEEDED.
+                    //
+                    // fold_refused_sweep (offer_manager.cpp) sets
+                    // sweep_refused unconditionally on the fallback outcome,
+                    // and cancel_retry folds it as `sweep_refused_ ||
+                    // oc.sweep_refused`, so route 2 reaches this branch with
+                    // nothing failed. What is uncertain in BOTH cases is the
+                    // same thing: the UNTRACKED wallet book, which no per-ID
+                    // cancel can reach. It is never proven empty, and this
+                    // case used to fall through to the "All outstanding
+                    // offers cancelled" branch below: a refusal logged as a
+                    // success.
+                    //
+                    // The escalation is a real one and not a re-run of what
+                    // just failed. watchdog_cancel_book cancels WALLET-WIDE,
+                    // which is the only thing that can reach a book this
+                    // process never tracked; it goes through its OWN
+                    // short-lived client and io_context rather than the
+                    // shared one that may be wedged; and it pays the zero fee
+                    // risk::watchdog_cancel() fixes, so a funding refusal
+                    // cannot block it the way it can block the charged sweep.
+                    // It renders an empty id list as "not available at this
+                    // call site", which is the honest rendering here -- the
+                    // refused sweep never named any.
+                    spdlog::critical(
+                        "[Engine] [S33] the wallet-wide sweep was REFUSED "
+                        "after {} attempt(s) in {} ms (last error: {}) and "
+                        "this process tracks no ids to retry individually -- "
+                        "anything resting in the wallet is STILL LIVE",
+                        attempts, elapsed_ms(),
+                        last_error.empty() ? "none" : last_error);
+                    watchdog_cancel_book(
+                        "graceful shutdown could not sweep the wallet: the "
+                        "wallet-wide cancel was refused and no locally "
+                        "tracked offer ids exist to retry individually",
                         outstanding);
                 } else if (bulk_submitted) {
                     spdlog::info("[Engine] All outstanding offers SUBMITTED "
@@ -14654,10 +14718,14 @@ asio::awaitable<void> Engine::step_xch_recovery(BlockHeight block_height)
         // (~1 block) rather than immediately.
         bool cancel_ok = false;
         try {
-            co_await wallet_->cancel_offers(/*fee=*/0, /*secure=*/true);
-            spdlog::info("[Recovery] Wallet-level cancel_offers(fee=0, "
-                         "secure=true) succeeded -- cancel spends "
-                         "submitted for all pending offers");
+            co_await wallet_->cancel_offers(/*batch_fee=*/0, /*secure=*/true);
+            // [S33 2026-09-11] Name the parameters actually sent: the key
+            // is batch_fee (a plain "fee" is ignored by the handler), and
+            // cancel_all is what makes this cover CAT/CAT offers too.
+            spdlog::info("[Recovery] Wallet-level cancel_offers("
+                         "batch_fee=0, secure=true, cancel_all=true) "
+                         "succeeded -- cancel spends submitted for all "
+                         "pending offers");
             cancel_ok = true;
 
             // Also mark all tracked offers as cancel_pending.
@@ -16522,7 +16590,14 @@ asio::awaitable<void> Engine::step_ingest_reward_inflows(
     }
 
     // Newest 200 transactions comfortably cover the churn between daily
-    // reward batches (300 wallet transactions spanned ~7 weeks live).  A
+    // reward batches (300 wallet transactions spanned ~7 weeks live).
+    //
+    // [BULKCANCEL 2026-09-11] "Newest" is only NOW true.  get_transactions
+    // used to pass reverse=true, which RELEVANCE-orders confirmed rows
+    // OLDEST first: on the live DBX wallet (9,640 transactions) this window
+    // sat at block 8,543,202 while the chain was at 9,277,273, so every row
+    // fell at or below the ledger genesis block and is_reward_inflow
+    // rejected all of them.  Reward ingest was booking nothing at all.  A
     // reward that ever scrolled past this window would simply remain
     // wallet-vs-books divergence for the invariant to absorb -- the
     // pre-existing behaviour, not a new failure mode.
@@ -16566,6 +16641,7 @@ asio::awaitable<void> Engine::step_ingest_reward_inflows(
 
     const auto now = std::chrono::system_clock::now();
     std::size_t booked = 0;
+    std::size_t stale_skipped = 0;
     Mojo        booked_mojos = 0;
     double      booked_usd   = 0.0;
 
@@ -16575,15 +16651,43 @@ asio::awaitable<void> Engine::step_ingest_reward_inflows(
         const BlockHeight height = static_cast<BlockHeight>(
             t.value("confirmed_at_height", 0));
 
-        if (!accounting::is_reward_inflow(
-                type, amount, height, genesis_block,
-                acc.reward_max_mojos_per_coin,
-                outgoing.count({height, amount}) > 0)) {
-            continue;
-        }
+        const bool is_inflow = accounting::is_reward_inflow(
+            type, amount, height, genesis_block,
+            acc.reward_max_mojos_per_coin,
+            outgoing.count({height, amount}) > 0);
 
         const std::string tx_name = t.value("name", std::string{});
-        if (tx_name.empty()) continue;   // no stable idempotency key
+        const bool        has_key = !tx_name.empty();
+        const std::string event_id =
+            has_key ? "reward:" + tx_name : std::string{};
+
+        // [review 2026-09-13] The row decision, INCLUDING the ordering that
+        // idempotency outranks freshness, lives in reward_ingest.hpp so ctest
+        // drives this exact rule rather than a copy of it. Only the JSON
+        // reading and the DB calls around it stay uncovered.
+        //
+        // already_booked is evaluated last and short-circuited: it is a DB
+        // read, and this scan walks ~200 rows per heartbeat of which most are
+        // not rewards at all.
+        const auto action = accounting::classify_reward_row(
+            is_inflow,
+            has_key,
+            /*already_booked=*/is_inflow && has_key &&
+                db_->ledger_has_event(event_id),
+            /*is_recent=*/accounting::reward_receipt_is_recent(
+                height, block_height));
+
+        if (action == accounting::RewardRowAction::TooStale) {
+            // Report each unbooked stale receipt ONCE per process rather than
+            // on every heartbeat for as long as it sits in the window.
+            if (reward_stale_warned_.insert(event_id).second) {
+                stale_skipped += 1;
+            }
+            continue;
+        }
+        if (action != accounting::RewardRowAction::Book) {
+            continue;   // not a reward, no idempotency key, or already booked
+        }
 
         if (usd_per_unit <= 0.0) {
             spdlog::info("[Engine] Reward ingest: {} inflow of {} mojos at "
@@ -16601,7 +16705,7 @@ asio::awaitable<void> Engine::step_ingest_reward_inflows(
         DbLedgerEntry e;
         e.entry_time   = PnLTracker::timestamp_to_iso(now);
         e.event_type   = "reward";
-        e.event_id     = "reward:" + tx_name;
+        e.event_id     = event_id;
         e.leg          = "reward";
         e.asset_id     = asset;
         e.delta_mojos  = amount;
@@ -16635,6 +16739,16 @@ asio::awaitable<void> Engine::step_ingest_reward_inflows(
                      "(FMV ${:.6f} @ ${:.6f}/unit, tx {})",
                      asset.substr(0, 12), amount, height, val.income_usd,
                      usd_per_unit, tx_name.substr(0, 18));
+    }
+
+    if (stale_skipped > 0) {
+        spdlog::warn("[Engine] Reward ingest: skipped {} newly-seen reward "
+                     "inflow(s) older than {} blocks (~2 days) -- valuing them "
+                     "at today's price would misstate receipt FMV. These were "
+                     "never booked, so they remain wallet-vs-books divergence "
+                     "for the invariant control; already-booked receipts are "
+                     "not counted here, and each id is reported once",
+                     stale_skipped, accounting::kMaxRewardBacklogBlocks);
     }
 
     if (booked > 0) {
@@ -19520,6 +19634,24 @@ void Engine::check_cancel_all_flag()
                 auto done = co_await offer_mgr_->cancel_all();
                 spdlog::warn("[Engine] [CANCELALL] {} offer(s) submitted "
                              "for cancel", done.cancelled.size());
+                // [S33 2026-09-12] The one outcome this path could not see.
+                // With an EMPTY local book a refused wallet-wide sweep fills
+                // neither `cancelled` nor `failed` -- the bulk endpoint names
+                // no offer id at all -- so the operator read "0 offer(s)
+                // submitted for cancel" and the failure block below was
+                // skipped entirely. That is the HEADLINE case, not a corner:
+                // offers left resting by a previous instance, tracked by
+                // nobody here, which is exactly what cancel_all:true is sent
+                // to clear.
+                if (done.sweep_refused) {
+                    spdlog::critical(
+                        "[Engine] [CANCELALL] the wallet-wide sweep was "
+                        "REFUSED ({}) -- the wallet's book is UNKNOWN: "
+                        "offers this process never tracked may still be "
+                        "RESTING and Cancel All did NOT clear them",
+                        done.last_error.empty() ? "no error text"
+                                                : done.last_error);
+                }
                 // Submitted ids are downgraded from "ordered" to "submitted"
                 // but stay in the set: the heartbeat sweep owns them until
                 // the wallet says they are terminal. The refused ids keep

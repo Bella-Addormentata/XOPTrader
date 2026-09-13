@@ -587,12 +587,34 @@ public:
     /**
      * @brief Cancel ALL outstanding offers.
      *
-     * @param fee     Transaction fee in mojos (applied per cancellation).
-     * @param secure  On-chain vs local-only cancellation.
+     * [BULKCANCEL 2026-09-11] Sends cancel_all:true and passes the fee as
+     * batch_fee, which is what the handler actually reads.  See
+     * rpc/wallet_requests.hpp for the defect this replaced.
+     *
+     * @param batch_fee  Fee in mojos charged ONCE PER BATCH of
+     *                   kCancelOffersBatchSize offers -- NOT once per call.
+     *
+     *                   [review 2026-09-12] A caller that reserves XCH for
+     *                   this must reserve ONE WHOLE FEE-BEARING COIN PER
+     *                   BATCH -- not batch_fee * batches, which an earlier
+     *                   revision of this line recommended.  Each batch is a
+     *                   separate transaction submitted inside the same
+     *                   cycle, so the change from one cannot fund the next
+     *                   and each locks a different whole coin.  Reserving
+     *                   the combined AMOUNT models one coin for the lot and
+     *                   undercounts the locks -- the 2026-08-23
+     *                   zero-spendable shape.
+     *
+     *                   Use execution::reserve_bulk_cancel (a loop of
+     *                   single-fee note_lock()s, with a >= 1 batch clamp);
+     *                   see OfferManager::cancel_offers_charged, and
+     *                   CoinLockLedgerTest.BulkCancelReservesOneWholeFeeCoin
+     *                   PerBatch, which pins the distinction explicitly.
+     * @param secure     On-chain vs local-only cancellation.
      * @return JSON confirmation.
      */
-    asio::awaitable<json> cancel_offers(std::uint64_t fee    = 0,
-                                        bool          secure = true);
+    asio::awaitable<json> cancel_offers(std::uint64_t batch_fee = 0,
+                                        bool          secure    = true);
 
     /**
      * @brief Retrieve a single offer/trade record by trade ID.
@@ -767,8 +789,10 @@ public:
      * @brief Retrieve recent transactions for a wallet.
      *
      * Wraps the Chia wallet RPC "get_transactions" endpoint with
-     * descending time order.  Used to detect stuck transactions
-     * that lack a spend bundle.
+     * sort_key RELEVANCE and reverse=FALSE, which orders UNCONFIRMED rows
+     * first and then confirmed rows NEWEST first.  Both consumers depend on
+     * that: the stuck-transaction pruner reads only unconfirmed rows, and
+     * the reward scan wants recent ones.  See rpc/wallet_requests.hpp.
      *
      * @param wallet_id  Target wallet ID.
      * @param start      Starting index (0-based).

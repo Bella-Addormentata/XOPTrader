@@ -479,6 +479,20 @@ public:
     /// balances are established exactly once in the ledger's lifetime.
     [[nodiscard]] bool has_ledger_opening(const AssetId& asset_id) const;
 
+    /// True when this event_id already has a journalled leg.
+    ///
+    /// [review 3997843761] The read-only counterpart to
+    /// append_ledger_entries' idempotency. A caller that must decide
+    /// something BEFORE writing cannot learn "already booked" from an insert
+    /// it deliberately will not perform -- the reward scan skips stale
+    /// receipts rather than journalling them, so it has no insert to read the
+    /// answer from. Rides the UNIQUE(event_id, leg, asset_id) index.
+    ///
+    /// Returns false if the query cannot be prepared. That is the safe
+    /// direction here: the caller then treats the receipt as unbooked, which
+    /// can only produce a redundant log line, never a skipped booking.
+    [[nodiscard]] bool ledger_has_event(const std::string& event_id) const;
+
     /// The entry_time of this asset's 'opening' leg (ISO-8601 UTC), or ""
     /// when none exists / the query fails.  [S19] The bridge ingester
     /// skips jobs completed at or before this instant: their flow is

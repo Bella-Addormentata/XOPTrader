@@ -104,6 +104,85 @@ inline constexpr int kOutgoingTrade = 5;
     return true;
 }
 
+/// How far back a receipt may sit and still be fairly valued at the CURRENT
+/// price.  4,608 blocks is ~24h by this codebase's convention (config.hpp:
+/// `epoch_blocks{4608};  // Daily cap reset period (~24h)`), so two days
+/// covers an overnight restart plus one missed daily batch.
+inline constexpr BlockHeight kMaxRewardBacklogBlocks{9'216};
+
+/// Is this receipt recent enough for the live price to stand in for the
+/// receipt-time price?
+///
+/// [review 2026-09-12] value_reward() takes ONE live usd_per_unit and the
+/// ledger row it feeds is idempotent on event_id, so whatever price the FIRST
+/// scan sees is the price that receipt keeps forever.  That satisfies the
+/// receipt-FMV contract only while the receipt is recent -- and it is not, on
+/// the first restart after the reverse=false window fix: ingest shipped
+/// 2026-08-01 and booked nothing until now, so the whole unbooked backlog
+/// inside the 200-row window arrives in one heartbeat.
+///
+/// The genesis gate above does NOT bound that: it is the asset's OPENING
+/// block, written once ever, ~197k blocks below the head.
+///
+/// An excluded receipt is not lost accounting -- it stays wallet-vs-books
+/// divergence for the invariant control to absorb, the documented fate of any
+/// reward that scrolls past the window.
+///
+/// @param confirmed_height    Receipt block (0 is rejected upstream).
+/// @param current_height      This heartbeat's block.
+/// @param max_backlog_blocks  0 disables the bound entirely.
+[[nodiscard]] constexpr bool reward_receipt_is_recent(
+    BlockHeight confirmed_height,
+    BlockHeight current_height,
+    BlockHeight max_backlog_blocks = kMaxRewardBacklogBlocks) noexcept
+{
+    if (max_backlog_blocks == 0) return true;             // bound disabled
+    if (confirmed_height >= current_height) return true;  // same block, or ahead
+    return (current_height - confirmed_height) <= max_backlog_blocks;
+}
+
+/// What the reward scan should do with ONE wallet row.
+enum class RewardRowAction {
+    NotAReward,         ///< Fails is_reward_inflow: ignore entirely.
+    NoIdempotencyKey,   ///< No tx name, so nothing stable to key the ledger on.
+    AlreadyBooked,      ///< Journalled already: finished business at ANY age.
+    TooStale,           ///< Unbooked and too old to value at the live price.
+    Book,               ///< Unbooked, recent: value and journal it.
+};
+
+/// Decide what to do with one reward row.
+///
+/// [review 2026-09-13] Lifted out of the loop in engine.cpp so ctest drives
+/// this exact ordering. The loop that reads JSON and performs the DB calls is
+/// still not reachable from ctest -- nothing constructs an Engine -- but the
+/// decision it makes now is.
+///
+/// THE ORDERING IS THE POINT, and it is what a previous round got wrong.
+/// AlreadyBooked outranks TooStale: a receipt journalled days ago while it was
+/// still fresh must NOT be re-counted as stale once it ages past the cutoff.
+/// It used to be, and the warning then reported those rows as unresolved
+/// wallet-vs-books divergence -- on every heartbeat, for as long as the
+/// newest-200 window held them.
+///
+/// @param is_reward_inflow     Result of is_reward_inflow() for this row.
+/// @param has_idempotency_key  The row carries a usable tx name.
+/// @param already_booked       A ledger entry for this event_id exists.
+///                             Callers should evaluate this LAST (it is a DB
+///                             read) and only when the two flags above hold.
+/// @param is_recent            Result of reward_receipt_is_recent().
+[[nodiscard]] constexpr RewardRowAction classify_reward_row(
+    bool is_reward_inflow,
+    bool has_idempotency_key,
+    bool already_booked,
+    bool is_recent) noexcept
+{
+    if (!is_reward_inflow) return RewardRowAction::NotAReward;
+    if (!has_idempotency_key) return RewardRowAction::NoIdempotencyKey;
+    if (already_booked) return RewardRowAction::AlreadyBooked;
+    if (!is_recent) return RewardRowAction::TooStale;
+    return RewardRowAction::Book;
+}
+
 /// Fair-value numbers for one reward receipt.
 struct RewardValuation {
     /// Cost-basis price in the InventoryTracker's USD-pseudo convention:

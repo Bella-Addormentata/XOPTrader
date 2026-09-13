@@ -2521,6 +2521,16 @@ private:
     /// than reporting a divergence it caused itself.
     bool ledger_incomplete_{false};
 
+    /// [review 3997843761] Reward receipts already reported as too old to
+    /// value at the live price.
+    ///
+    /// Without this the warning re-fired every heartbeat: a stale receipt is
+    /// neither booked nor removed, and the wallet's newest-200 window keeps
+    /// it in view for weeks. Process-local on purpose -- it suppresses a
+    /// repeated LOG LINE, not an accounting decision, so a restart
+    /// legitimately re-reports whatever it still finds unbooked.
+    std::unordered_set<std::string> reward_stale_warned_;
+
     // -- [T4-05] GUI-requested pause via signal file ----------------------
     // The GUI creates / removes a "pause.flag" file next to the database.
     // The engine checks once per heartbeat and transitions between

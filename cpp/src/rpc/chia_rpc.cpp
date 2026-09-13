@@ -31,6 +31,7 @@
  */
 
 #include "xop/rpc/chia_rpc.hpp"
+#include "xop/rpc/wallet_requests.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -953,13 +954,17 @@ ChiaWalletRPC::cancel_offer(const std::string& trade_id,
 }
 
 asio::awaitable<json>
-ChiaWalletRPC::cancel_offers(std::uint64_t fee, bool secure)
+ChiaWalletRPC::cancel_offers(std::uint64_t batch_fee, bool secure)
 {
-    const json payload = {
-        {"fee",    fee},
-        {"secure", secure}
-    };
-    co_return co_await rpc_post("cancel_offers", payload);
+    // [BULKCANCEL 2026-09-11] The payload shape is pinned and tested in
+    // wallet_requests.hpp.  The previous {"fee","secure"} body was ignored
+    // by the handler on all three counts that matter: it reads batch_fee
+    // (so every bulk cancel went out at ZERO fee), it defaults cancel_all
+    // to false (so only offers with an XCH leg matched -- a CAT/CAT offer
+    // was never cancelled), and its paging loop breaks on the first batch
+    // that matched nothing (so the scan stopped early).
+    co_return co_await rpc_post(
+        "cancel_offers", make_cancel_offers_request(batch_fee, secure));
 }
 
 asio::awaitable<json>
@@ -1199,13 +1204,14 @@ ChiaWalletRPC::get_transactions(std::int64_t wallet_id,
                                 std::int64_t start,
                                 std::int64_t end)
 {
-    const json payload = {
-        {"wallet_id", wallet_id},
-        {"start",     start},
-        {"end",       end},
-        {"sort_key",  "RELEVANCE"},
-        {"reverse",   true}
-    };
+    // [BULKCANCEL 2026-09-11] reverse=FALSE, and it is load-bearing for both
+    // consumers -- see order_as_daemon() in tests/test_wallet_requests.cpp,
+    // which models the daemon's ORDER BY over this payload.  Under
+    // reverse=true, RELEVANCE returns CONFIRMED rows first and OLDEST first,
+    // so a 0..200 window on a busy wallet (live wallet 1: 32,966 rows)
+    // contains no unconfirmed row at all and nothing recent either.
+    const json payload =
+        make_get_transactions_request(wallet_id, start, end);
 
     const json resp = co_await rpc_post("get_transactions", payload);
 

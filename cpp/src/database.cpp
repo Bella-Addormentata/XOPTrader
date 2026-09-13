@@ -1325,6 +1325,26 @@ bool Database::has_ledger_opening(const AssetId& asset_id) const
     return found;
 }
 
+// [review 3997843761] See the contract in database.hpp. Deliberately the same
+// shape as has_ledger_opening above, against the UNIQUE(event_id, leg,
+// asset_id) index rather than a scan.
+bool Database::ledger_has_event(const std::string& event_id) const
+{
+    static constexpr const char* kSelect = R"SQL(
+        SELECT 1 FROM ledger_entries WHERE event_id = ?1 LIMIT 1;
+    )SQL";
+
+    std::lock_guard<std::mutex> lock(mtx_);
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, kSelect, -1, &stmt, nullptr) != SQLITE_OK) {
+        return false;
+    }
+    sqlite3_bind_text(stmt, 1, event_id.c_str(), -1, SQLITE_TRANSIENT);
+    const bool found = (sqlite3_step(stmt) == SQLITE_ROW);
+    sqlite3_finalize(stmt);
+    return found;
+}
+
 std::string Database::ledger_opening_time(const AssetId& asset_id) const
 {
     static constexpr const char* kSelect = R"SQL(

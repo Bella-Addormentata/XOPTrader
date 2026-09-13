@@ -34,6 +34,37 @@ constexpr xop::BlockHeight kGenesis  = 9'080'000;  // ledger opening block
 // Filter: what is (and is not) a reward inflow
 // ============================================================================
 
+// [review 2026-09-12] The BACKLOG bound.  value_reward() takes ONE live
+// usd_per_unit and the ledger row it feeds is idempotent on event_id, so
+// whatever price the FIRST scan sees is the price that receipt keeps forever.
+// The genesis gate below does NOT bound that: it is the asset's OPENING
+// block, written once ever and ~197k blocks under the head, so the whole
+// never-booked backlog passes it and would book at today's price on the
+// first restart after the reverse=false window fix.
+TEST(RewardIngestFilterTest, StaleBacklogReceiptsAreNotValuedAtTodaysPrice) {
+    constexpr xop::BlockHeight kNow = 9'277'273;   // measured head, 2026-09-11
+
+    // Recent receipts price fairly at the live rate.
+    EXPECT_TRUE(reward_receipt_is_recent(kNow, kNow));
+    EXPECT_TRUE(reward_receipt_is_recent(kNow - 4'608, kNow));
+
+    // The measured 2026-07-31 burst PASSES the genesis gate -- which is
+    // exactly why this second bound has to exist.
+    EXPECT_TRUE(is_reward_inflow(kIncomingTx, 22, 9'085'813, kGenesis,
+                                 kMaxRewardMojos, false));
+    EXPECT_FALSE(reward_receipt_is_recent(9'085'813, kNow));
+
+    // Boundary, both sides of it.
+    EXPECT_TRUE(reward_receipt_is_recent(kNow - kMaxRewardBacklogBlocks, kNow));
+    EXPECT_FALSE(reward_receipt_is_recent(kNow - kMaxRewardBacklogBlocks - 1,
+                                          kNow));
+
+    // Degenerate: a height at or ahead of the head (lagging head, reorg) is
+    // not stale, and a zero bound disables the check entirely.
+    EXPECT_TRUE(reward_receipt_is_recent(kNow + 10, kNow));
+    EXPECT_TRUE(reward_receipt_is_recent(9'085'813, kNow, 0));
+}
+
 TEST(RewardIngestFilterTest, MeasuredRewardCoinIsAccepted) {
     // A coin from the observed 2026-07-31 burst: 22 mojos, plain incoming,
     // confirmed at 9085813 (after genesis), no matching outgoing.
@@ -93,6 +124,55 @@ TEST(RewardIngestFilterTest, DegenerateAmountsAreRejected) {
     // A zero ceiling disables ingestion entirely.
     EXPECT_FALSE(is_reward_inflow(kIncomingTx, 1, 9'085'813, kGenesis,
                                   /*max=*/0, false));
+}
+
+// ---------------------------------------------------------------------------
+// classify_reward_row -- the per-row ordering the reward scan delegates to.
+//
+// [review 2026-09-13] This ordering used to live inline in engine.cpp, where
+// no test could reach it. The loop now CALLS this function, so these drive
+// production code.
+//
+// MUTATION CHECK: move the already_booked clause BELOW the is_recent clause
+// (the original defect) -> ABookedReceiptIsFinishedBusinessAtAnyAge goes RED
+// and nothing else does.
+// ---------------------------------------------------------------------------
+
+TEST(RewardRowClassification, ARecentUnbookedInflowIsBooked) {
+    EXPECT_EQ(classify_reward_row(/*is_reward_inflow=*/true,
+                                  /*has_idempotency_key=*/true,
+                                  /*already_booked=*/false,
+                                  /*is_recent=*/true),
+              RewardRowAction::Book);
+}
+
+// THE DEFECT round 11 fixed: a receipt booked while it was fresh must not be
+// re-classified as stale once it ages past the cutoff. It was, and the warning
+// then called those rows unresolved divergence on every heartbeat.
+TEST(RewardRowClassification, ABookedReceiptIsFinishedBusinessAtAnyAge) {
+    EXPECT_EQ(classify_reward_row(true, true,
+                                  /*already_booked=*/true,
+                                  /*is_recent=*/false),
+              RewardRowAction::AlreadyBooked)
+        << "idempotency outranks freshness; a booked row is not stale work";
+    EXPECT_EQ(classify_reward_row(true, true, true, true),
+              RewardRowAction::AlreadyBooked);
+}
+
+TEST(RewardRowClassification, AnUnbookedStaleReceiptIsReportedNotBooked) {
+    EXPECT_EQ(classify_reward_row(true, true, false, /*is_recent=*/false),
+              RewardRowAction::TooStale);
+}
+
+TEST(RewardRowClassification, NoTxNameMeansNoStableLedgerKey) {
+    EXPECT_EQ(classify_reward_row(true, /*has_idempotency_key=*/false, false, true),
+              RewardRowAction::NoIdempotencyKey);
+}
+
+TEST(RewardRowClassification, NonRewardsAreRejectedBeforeAnythingElse) {
+    EXPECT_EQ(classify_reward_row(/*is_reward_inflow=*/false, true, true, true),
+              RewardRowAction::NotAReward)
+        << "the inflow test comes first so a non-reward never costs a DB read";
 }
 
 // ============================================================================

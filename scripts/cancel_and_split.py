@@ -36,8 +36,13 @@ def get_spendable_coins():
 
 
 def cancel_all():
-    print("=== Step 1: Cancel ALL offers (fee=0, secure=true) ===")
-    d = rpc("cancel_offers", {"fee": 0, "secure": True})
+    print("=== Step 1: Cancel ALL offers (batch_fee=0, secure=true, cancel_all=true) ===")
+    # [S33 2026-09-11] cancel_all and batch_fee are both load-bearing. The
+    # handler reads batch_fee -- a "fee" key is silently ignored -- and
+    # without cancel_all it keeps only offers whose arbitrage() contains the
+    # XCH key, then stops at the first batch of 5 holding none. CAT/CAT
+    # offers were never cancelled by this script.
+    d = rpc("cancel_offers", {"batch_fee": 0, "secure": True, "cancel_all": True})
     success = d.get("success", False)
     print(f"  Result: {'OK' if success else 'FAILED'}")
     if not success:

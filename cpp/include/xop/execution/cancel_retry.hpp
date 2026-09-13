@@ -153,6 +153,10 @@ enum class CancelStopReason : int {
     AttemptsExhausted    = 2,  ///< ladder ran out with offers still live.
     BudgetExhausted      = 3,  ///< wall-clock budget ran out.
     NeedsEmergencyLadder = 4,  ///< funding refusal: escalate, do not wait.
+    /// [S33 2026-09-12] A wallet-wide sweep was REFUSED. Nothing is
+    /// outstanding only because the refused sweep names no ids -- the
+    /// wallet's book is UNKNOWN, never proven empty. NOT a clean stop.
+    SweepRefused         = 5,
 };
 
 [[nodiscard]] constexpr const char* to_string(CancelStopReason r) noexcept
@@ -162,6 +166,7 @@ enum class CancelStopReason : int {
         case CancelStopReason::AttemptsExhausted:    return "attempts-exhausted";
         case CancelStopReason::BudgetExhausted:      return "budget-exhausted";
         case CancelStopReason::NeedsEmergencyLadder: return "needs-emergency-ladder";
+        case CancelStopReason::SweepRefused:         return "wallet-wide-sweep-refused";
         case CancelStopReason::Unknown:              break;
     }
     return "unknown";
@@ -507,6 +512,24 @@ struct CancelAttemptOutcome {
     TakeFailureClass         worst_class{TakeFailureClass::Other};
     /// Set when `cancelled` came from the wallet-wide bulk endpoint.
     bool                     bulk_submitted{false};
+    /// [S33 2026-09-12] Set when a WALLET-WIDE sweep was attempted and
+    /// REFUSED, and no id in `failed` represents that refusal.
+    ///
+    /// THE SHAPE THIS CLOSES.  cancel_all sends cancel_all:true, which sweeps
+    /// every pending offer IN THE WALLET -- including a book left resting by a
+    /// previous instance that this process never tracked.  When that sweep is
+    /// refused and the local book is empty there are no ids to put in
+    /// `failed`, because the bulk endpoint takes no offer id at all.  An empty
+    /// `failed` set outstanding_ empty and stop_reason Done, so clean()
+    /// returned TRUE for a sweep the wallet REFUSED: a refusal reading as
+    /// success, which is the exact fail-open this family keeps removing.
+    ///
+    /// A sentinel id in `failed` was the alternative, and it is worse: the
+    /// retry leg is cancel_ids (which looks ids up in State) and the shutdown
+    /// alert names still-live ids to an operator, so both would end up
+    /// handling an offer id that does not exist.  A flag cannot be mistaken
+    /// for an offer.
+    bool                     sweep_refused{false};
 };
 
 // ---------------------------------------------------------------------------
@@ -553,10 +576,23 @@ struct CancelLadderAction {
 // ---------------------------------------------------------------------------
 class CancelLadder {
 public:
-    CancelLadder(std::vector<std::string> ids, CancelRetryConfig cfg) noexcept
-        : cfg_(cfg), outstanding_(std::move(ids))
+    /// [S33 2026-09-12] `sweep_when_empty` authorises attempt 1 even when
+    /// `ids` is EMPTY. Attempt 1 is the WALLET-WIDE sweep (the driver routes
+    /// attempt_index == 1 to cancel_all and every retry to cancel_ids), and a
+    /// book a previous instance left resting is in the wallet and in nobody's
+    /// id list: LOCAL EMPTINESS IS NOT WALLET EMPTINESS. Defaulted OFF, so a
+    /// ladder that can only ever act on ids keeps "no book is the one
+    /// genuinely clean start".
+    CancelLadder(std::vector<std::string> ids, CancelRetryConfig cfg,
+                 bool sweep_when_empty = false) noexcept
+        : cfg_(cfg), outstanding_(std::move(ids)),
+          sweep_when_empty_(sweep_when_empty)
     {
-        if (outstanding_.empty()) stop_reason_ = CancelStopReason::Done;
+        // An empty book is Done only when nothing is going to be asked of the
+        // wallet. With the sweep pending, nothing is proven yet.
+        if (outstanding_.empty() && !sweep_when_empty_) {
+            stop_reason_ = CancelStopReason::Done;
+        }
     }
 
     /// The decision. `elapsed_ms` is wall clock since the FIRST attempt began
@@ -565,8 +601,24 @@ public:
     {
         CancelLadderAction act{};
 
-        if (outstanding_.empty()) {
-            stop_reason_ = CancelStopReason::Done;
+        // [S33 2026-09-12] An empty id list finishes the ladder EXCEPT on the
+        // very first step of a sweeping ladder. That one attempt is the
+        // wallet-wide cancel_all, the only thing that can reach offers the
+        // wallet knows about and we do not; without this exception a stop with
+        // an empty State issued ZERO cancel RPCs and still logged "All
+        // outstanding offers cancelled (0 attempt(s), 0 ms)". Once it has been
+        // recorded (attempts_ > 0) the gate closes again: there is nothing to
+        // retry per-id, so there is no second sweep and no ladder.
+        if (outstanding_.empty()
+            && !(sweep_when_empty_ && attempts_ == 0)) {
+            // [S33 2026-09-12] Empty is Done ONLY when nothing was refused
+            // wallet-wide. Without this guard next() overwrote the
+            // SweepRefused that record() had just set -- the driver calls
+            // next() once more to learn it should Finish -- handing the
+            // fail-open straight back one line after it was closed.
+            if (!sweep_refused_) {
+                stop_reason_ = CancelStopReason::Done;
+            }
             return act;  // Finish
         }
 
@@ -627,11 +679,24 @@ public:
 
         if (!oc.last_error.empty()) last_error_ = std::move(oc.last_error);
         bulk_submitted_ = bulk_submitted_ || oc.bulk_submitted;
+        // [S33 2026-09-12] STICKY for the life of the ladder. A refused
+        // wallet-wide sweep cannot be undone by a later per-id attempt:
+        // cancel_ids only ever names ids this process tracks, so it can never
+        // reach the untracked book the sweep was refused over.
+        sweep_refused_ = sweep_refused_ || oc.sweep_refused;
 
         // Only a failing attempt carries class information. A clean attempt
         // must not reset the leash the previous failures earned.
-        if (!outstanding_.empty()) worst_class_ = oc.worst_class;
-        else stop_reason_ = CancelStopReason::Done;
+        if (!outstanding_.empty()) {
+            worst_class_ = oc.worst_class;
+        } else if (sweep_refused_) {
+            // [S33 2026-09-12] An EMPTY `failed` is not automatically Done.
+            // A refused wallet-wide sweep has nothing to put in `failed` and
+            // has proved nothing dead either.
+            stop_reason_ = CancelStopReason::SweepRefused;
+        } else {
+            stop_reason_ = CancelStopReason::Done;
+        }
     }
 
     [[nodiscard]] const std::vector<std::string>& outstanding() const noexcept
@@ -649,6 +714,10 @@ public:
     { return last_error_; }
     [[nodiscard]] bool bulk_submitted() const noexcept
     { return bulk_submitted_; }
+    /// [S33 2026-09-12] True when a wallet-wide sweep was REFUSED during this
+    /// ladder. The wallet's book is UNKNOWN, never proven empty.
+    [[nodiscard]] bool sweep_refused() const noexcept
+    { return sweep_refused_; }
     [[nodiscard]] TakeFailureClass worst_class() const noexcept
     { return worst_class_; }
     /// True when this ladder finished with nothing believed live. The ONLY
@@ -656,6 +725,11 @@ public:
     [[nodiscard]] bool clean() const noexcept
     {
         return outstanding_.empty()
+               // [S33 2026-09-12] Stated independently of stop_reason_ on
+               // purpose: "the wallet refused to sweep its book" must fail
+               // this predicate on its own evidence, not via a second field
+               // that some later edit could set back to Done.
+               && !sweep_refused_
                && stop_reason_ == CancelStopReason::Done;
     }
 
@@ -666,10 +740,15 @@ private:
     std::vector<std::string> already_pending_{};
     std::string              last_error_{};
     std::uint32_t            attempts_{0};
+    /// [S33 2026-09-12] Sticky: a wallet-wide sweep was refused.
+    bool                     sweep_refused_{false};
     std::uint32_t            authorised_attempt_{0};
     CancelStopReason         stop_reason_{CancelStopReason::Unknown};
     TakeFailureClass         worst_class_{TakeFailureClass::Other};
     bool                     bulk_submitted_{false};
+    /// [S33 2026-09-12] Authorises attempt 1 -- the wallet-wide sweep -- from
+    /// an EMPTY id list. Set only by the shutdown driver.
+    bool                     sweep_when_empty_{false};
 };
 
 }  // namespace xop::execution
