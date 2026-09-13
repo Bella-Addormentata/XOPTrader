@@ -28,6 +28,7 @@ from typing import Any, Final, Optional
 
 from PySide6.QtCore import QObject, Qt, QTimer, Signal, Slot
 
+from gui import shutdown_flag
 from gui.services.config_service import ConfigService
 from gui.services.config_split import split_and_save
 from gui.services.database_service import DatabaseService
@@ -58,6 +59,10 @@ STATUS_DISCONNECTED: Final[str] = "Disconnected"
 _DEFAULT_CONFIG_PATH: Final[str] = "config.yaml"
 _DEFAULT_DB_PATH: Final[str] = "data/xop_trader.db"
 _DEFAULT_METRICS_URL: Final[str] = "http://localhost:9090/metrics"
+
+# [shutdown-flag-race] How long _stop_engine_process waits for the engine to
+# honour its addressed shutdown.flag before terminating it.
+_GRACEFUL_STOP_WAIT_S: Final[int] = 30
 
 # How long the per-pair last-trade-price cache stays warm before we
 # re-query trade_log.  Trades arrive at human pace (seconds to minutes),
@@ -569,7 +574,13 @@ class EngineBridge(QObject):
 
     def stop_engine(self) -> None:
         """Gracefully stop the managed C++ engine subprocess."""
-        self._stop_engine_process()
+        outcome = self._stop_engine_process()
+        if outcome is shutdown_flag.StopOutcome.STILL_RUNNING:
+            # [shutdown-flag-race] The Stop Trading button shows "Stopped"
+            # whatever happens here; say so when that is not true.
+            self.error.emit(
+                "The engine did not stop -- it is still running after "
+                "terminate and kill. See gui.log.")
 
     def pause_trading(self) -> None:
         """Pause trading by creating the signal file the engine watches.
@@ -1192,54 +1203,88 @@ class EngineBridge(QObject):
         except Exception:
             return False
 
-    def _stop_engine_process(self) -> None:
-        """Terminate the managed engine subprocess if it is still running."""
-        if self._engine_process is None:
-            return
+    def _stop_engine_process(self) -> Optional[shutdown_flag.StopOutcome]:
+        """Stop the managed engine subprocess and report truthfully how it ended.
 
-        if self._engine_process.poll() is None:
-            # [review #7] Windows terminate() is a hard kill the engine
-            # never sees -- closing the GUI mid-drain left the book
-            # resting unmanaged. Ask for a GRACEFUL stop first via
-            # shutdown.flag (the engine's fast poll consumes it and runs
-            # the full shutdown path, cancelling the book); only escalate
-            # to terminate/kill if it does not exit in time.
+        [review #7] Windows terminate() is a hard kill the engine never sees
+        -- closing the GUI mid-drain left the book resting unmanaged -- so a
+        GRACEFUL stop is requested first through shutdown.flag, and
+        terminate/kill are only the escalation.
+
+        [shutdown-flag-race 2026-09-12] The request is addressed to this
+        engine's PID and written atomically. The outcome is classified from
+        what can be observed -- the exit code, and whether the engine removed
+        the flag -- instead of assumed. At 22:41:14.587 this method reported a
+        graceful exit 6 ms after another GUI had terminated the engine, and it
+        reported a clean exit after its own TerminateProcess. A request the
+        engine never removed is deleted here once the engine is gone, so no
+        later engine can inherit it.
+
+        Returns the outcome, or None when no process was being managed. On
+        STILL_RUNNING the process handle is kept: clearing it would let
+        start_engine() launch a second engine beside the live one.
+        """
+        proc = self._engine_process
+        if proc is None:
+            return None
+
+        outcome: Optional[shutdown_flag.StopOutcome] = None
+        if proc.poll() is None:
+            pid = proc.pid
+            flag = self._db_path.parent / shutdown_flag.FLAG_NAME
+            forced = False
+            request_written = False
             try:
-                sf = self._db_path.parent / "shutdown.flag"
-                sf.parent.mkdir(parents=True, exist_ok=True)
-                sf.write_text("shutdown", encoding="utf-8")
-                _log.info("Wrote shutdown.flag; waiting for the engine to "
-                          "cancel its book and exit (PID %d).",
-                          self._engine_process.pid)
-                self._engine_process.wait(timeout=30)
-                _log.info("Engine exited gracefully.")
-                return
+                shutdown_flag.write_shutdown_request(flag, pid)
+                request_written = True
+                _log.info(
+                    "Wrote shutdown.flag addressed to engine PID %d; waiting up "
+                    "to %d s for it to cancel its book and exit.",
+                    pid, _GRACEFUL_STOP_WAIT_S)
+                proc.wait(timeout=_GRACEFUL_STOP_WAIT_S)
             except subprocess.TimeoutExpired:
-                _log.warning("Engine ignored shutdown.flag for 30 s; "
-                             "terminating.")
-            except OSError as exc:  # noqa: BLE001
-                _log.warning("Could not write shutdown.flag (%s); "
-                             "terminating.", exc)
-            _log.info(
-                "Terminating C++ engine (PID %d).",
-                self._engine_process.pid,
-            )
-            self._engine_process.terminate()
-            try:
-                self._engine_process.wait(timeout=10)
-                _log.info("Engine process exited cleanly.")
-            except subprocess.TimeoutExpired:
-                _log.warning("Engine did not exit in 10 s; sending SIGKILL.")
-                self._engine_process.kill()
+                forced = True
+                _log.warning(
+                    "Engine PID %d did not exit within %d s of shutdown.flag; "
+                    "terminating.", pid, _GRACEFUL_STOP_WAIT_S)
+            except (OSError, ValueError) as exc:
+                forced = True
+                _log.warning(
+                    "Could not write shutdown.flag (%s); terminating engine "
+                    "PID %d.", exc, pid)
+
+            if forced:
+                proc.terminate()
                 try:
-                    self._engine_process.wait(timeout=5)
+                    proc.wait(timeout=10)
                 except subprocess.TimeoutExpired:
-                    _log.error("Engine process could not be killed.")
-        else:
-            _log.info(
-                "Engine process already exited (rc=%d).",
-                self._engine_process.returncode,
+                    _log.warning(
+                        "Engine PID %d did not exit within 10 s of terminate; "
+                        "killing it.", pid)
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
+
+            outcome = shutdown_flag.classify_stop_outcome(
+                proc.returncode,
+                request_written=request_written,
+                flag_still_names_target=shutdown_flag.flag_names_pid(flag, pid),
+                forced=forced,
             )
+            self._log_stop_outcome(outcome, pid, proc.returncode)
+
+            if (shutdown_flag.outcome_leaves_undelivered_flag(outcome)
+                    and shutdown_flag.remove_if_addressed_to(flag, pid)):
+                _log.warning(
+                    "Removed the undelivered shutdown.flag addressed to engine "
+                    "PID %d so no later engine can inherit it.", pid)
+
+            if outcome is shutdown_flag.StopOutcome.STILL_RUNNING:
+                return outcome
+        else:
+            _log.info("Engine process already exited (rc=%s).", proc.returncode)
 
         self._engine_process = None
         if self._engine_log_fh is not None:
@@ -1247,6 +1292,64 @@ class EngineBridge(QObject):
             self._engine_log_fh = None
         self._engine_log_path = None
         self._engine_launch_dir = None
+        return outcome
+
+    @staticmethod
+    def _log_stop_outcome(
+        outcome: shutdown_flag.StopOutcome,
+        pid: int,
+        returncode: Optional[int],
+    ) -> None:
+        """Exactly one line per stop, saying only what was observed.
+
+        "shutdown.flag was removed" means the ENGINE removed it -- consumed, or
+        discarded as not addressed to it -- which is why no line but the rc=0
+        one claims a graceful exit.
+        """
+        kinds = shutdown_flag.StopOutcome
+        if outcome is kinds.GRACEFUL:
+            _log.info(
+                "Engine exited gracefully (PID %d removed shutdown.flag and "
+                "exited rc=0).", pid)
+        elif outcome is kinds.EXITED_WITHOUT_CONSUMING:
+            _log.warning(
+                "Engine PID %d exited (rc=%s) but shutdown.flag still names it: "
+                "the request was NOT consumed, so this is NOT a confirmed "
+                "graceful exit. Most likely something else stopped it (a newly "
+                "launched GUI or engine terminating old instances, taskkill, a "
+                "crash); only if engine.log says 'could not remove "
+                "shutdown.flag' did the engine honour it. The next engine "
+                "reconciles the book.", pid, returncode)
+        elif outcome is kinds.FLAG_GONE_ABNORMAL_EXIT:
+            _log.warning(
+                "Engine PID %d exited with rc=%s after shutdown.flag was removed "
+                "by the engine (consumed, or discarded as not addressed to it -- "
+                "see engine.log) -- NOT a clean shutdown; the next engine "
+                "verifies any cancel intent it left (data/uncancelled.txt).",
+                pid, returncode)
+        elif outcome is kinds.TERMINATED_BEFORE_CONSUMING:
+            _log.warning(
+                "Engine PID %d was terminated (rc=%s) before it consumed "
+                "shutdown.flag -- NOT a graceful exit; this stop cancelled "
+                "nothing.", pid, returncode)
+        elif outcome is kinds.TERMINATED_AFTER_CONSUMING:
+            _log.warning(
+                "Engine PID %d had not exited within %d s and was terminated "
+                "(rc=%s); shutdown.flag had been removed by the engine "
+                "(consumed, or discarded as not addressed to it -- see "
+                "engine.log) -- NOT a graceful exit: the book may be partly "
+                "cancelled, and the next engine verifies the cancel intent "
+                "(data/uncancelled.txt).", pid, _GRACEFUL_STOP_WAIT_S,
+                returncode)
+        elif outcome is kinds.TERMINATED_WITHOUT_REQUEST:
+            _log.warning(
+                "Engine PID %d was terminated (rc=%s) without a graceful "
+                "request.", pid, returncode)
+        else:
+            _log.error(
+                "Engine PID %d is still running after terminate and kill; "
+                "shutdown.flag is left in place for it and its process handle "
+                "is kept.", pid)
 
     # ===================================================================
     # Internal helpers
