@@ -578,6 +578,42 @@ TEST(DatabaseTest, LedgerOpeningRecordedOncePerAsset) {
     EXPECT_EQ(db.ledger_balances().at("xch"), 61'685'000'000'000LL);
 }
 
+// [review 2026-09-13] ledger_has_event is the READ-ONLY counterpart to
+// append_ledger_entries' idempotency: the reward scan must decide "already
+// booked?" BEFORE it decides whether a receipt is too old to value, and for a
+// stale receipt it deliberately performs no insert to learn that from.
+//
+// A query or binding regression here returns false for a receipt that IS
+// booked, which sends it back to the freshness gate and reports it as
+// unresolved wallet-vs-books divergence -- the exact misreport the ordering
+// fix removed.
+//
+// MUTATION CHECK: bind the wrong column, or drop the WHERE clause so any row
+// matches -> LedgerHasEventAnswersBeforeAndAfterTheWrite goes RED.
+TEST(DatabaseTest, LedgerHasEventAnswersBeforeAndAfterTheWrite) {
+    TempDbPath temp("ledger_has_event");
+    xop::Database db(temp.path().string());
+
+    EXPECT_FALSE(db.ledger_has_event("reward:abc123"))
+        << "nothing is journalled yet";
+
+    ASSERT_EQ(db.append_ledger_entries({
+        leg("reward:abc123", "reward", "dbx", 618LL, "reward"),
+    }).value_or(999), 1u);
+
+    EXPECT_TRUE(db.ledger_has_event("reward:abc123"))
+        << "this is the question the reward scan asks before calling a "
+           "receipt stale";
+    EXPECT_FALSE(db.ledger_has_event("reward:some-other-tx"))
+        << "an unrelated event id must not report as booked";
+
+    // A re-post of the same event is a no-op, and the predicate still holds.
+    EXPECT_EQ(db.append_ledger_entries({
+        leg("reward:abc123", "reward", "dbx", 618LL, "reward"),
+    }).value_or(999), 0u);
+    EXPECT_TRUE(db.ledger_has_event("reward:abc123"));
+}
+
 TEST(DatabaseTest, LedgerSurvivesReopen) {
     TempDbPath temp("ledger_reopen");
     {

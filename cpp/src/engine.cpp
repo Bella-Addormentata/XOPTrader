@@ -1777,12 +1777,28 @@ void Engine::shutdown()
                         outstanding);
                 } else if (stop_reason ==
                            execution::CancelStopReason::SweepRefused) {
-                    // [S33 2026-09-12] Nothing is outstanding ONLY because a
-                    // refused wallet-wide sweep names no ids -- the bulk
-                    // endpoint takes no offer id at all. The wallet's book is
-                    // UNKNOWN, never proven empty, and this case used to fall
-                    // through to the "All outstanding offers cancelled"
-                    // branch below: a refusal logged as a success.
+                    // [S33 2026-09-12, corrected 2026-09-13] An empty
+                    // `outstanding` here has TWO causes, and the earlier
+                    // wording claimed only the first:
+                    //
+                    //   1. the local book was empty, so the refused
+                    //      wallet-wide sweep named no ids -- the bulk
+                    //      endpoint takes no offer id at all; or
+                    //   2. the local book was NOT empty, the sweep failed,
+                    //      and the per-ID fallback then cancelled every
+                    //      tracked offer. `outstanding` is empty because the
+                    //      fallback SUCCEEDED.
+                    //
+                    // fold_refused_sweep (offer_manager.cpp) sets
+                    // sweep_refused unconditionally on the fallback outcome,
+                    // and cancel_retry folds it as `sweep_refused_ ||
+                    // oc.sweep_refused`, so route 2 reaches this branch with
+                    // nothing failed. What is uncertain in BOTH cases is the
+                    // same thing: the UNTRACKED wallet book, which no per-ID
+                    // cancel can reach. It is never proven empty, and this
+                    // case used to fall through to the "All outstanding
+                    // offers cancelled" branch below: a refusal logged as a
+                    // success.
                     //
                     // The escalation is a real one and not a re-run of what
                     // just failed. watchdog_cancel_book cancels WALLET-WIDE,
