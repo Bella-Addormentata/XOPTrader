@@ -138,6 +138,9 @@ add_library(xop_core STATIC
     src/engine.cpp
     src/backtest.cpp
 
+    # -- Utilities -------------------------------------------------------------
+    src/util/process_identity.cpp
+
     # -- Strategy layer --------------------------------------------------------
     src/strategy/spread.cpp
     src/strategy/avellaneda.cpp

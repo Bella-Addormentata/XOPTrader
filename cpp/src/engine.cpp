@@ -68,6 +68,7 @@
 // formatter is separate from denom.hpp and why the log sites are deliberately
 // NOT part of the greppable-extraction list.
 #include "xop/util/denom_format.hpp"
+#include "xop/util/shutdown_flag.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -489,7 +490,8 @@ bool dexie_probe_is_live(bool                                  dexie_client_open
 // Construction / destruction
 // ===========================================================================
 
-Engine::Engine(const AppConfig& config, bool dry_run)
+Engine::Engine(const AppConfig& config, bool dry_run,
+               util::ProcessIdentity process_identity)
     : config_(config)
     , dry_run_(dry_run)
     , ioc_()
@@ -498,6 +500,17 @@ Engine::Engine(const AppConfig& config, bool dry_run)
     , drawdown_grace_remaining_(config.risk.drawdown_grace_blocks)
     , max_drawdown_frac_(config.risk.max_drawdown_frac)
 {
+    // [shutdown-flag-race] Assigned in the body, not the initialiser list:
+    // the member is declared long after the ones listed above (-Wreorder).
+    process_identity_ = process_identity;
+    spdlog::info("[Engine] process identity: PID {}, started {} ms before "
+                 "engine construction -- a shutdown.flag stop request is "
+                 "honoured only if it names this PID and was written at or "
+                 "after that start",
+                 process_identity_.pid,
+                 std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::filesystem::file_time_type::clock::now()
+                     - process_identity_.start).count());
     spdlog::info("[Engine] Initializing subsystems (dry_run={})", dry_run);
     spdlog::info("[Engine] Circuit breakers: max_drawdown={:.1f}% of equity "
                  "window_loss={:.0f}bps of equity/{} blocks "
@@ -951,8 +964,10 @@ Engine::Engine(const AppConfig& config, bool dry_run)
         config_reload_flag_path_ = db_dir / "config_reload.flag";
         // [STOPDRAIN] The GUI's Cancel All button.
         cancel_all_flag_path_ = db_dir / "cancel_all.flag";
-        // [STOPDRAIN review #7] Graceful-close request; a leftover from a
-        // previous run must not kill this boot.
+        // [STOPDRAIN review #7] Graceful-close request. [shutdown-flag-race]
+        // It is addressed to one engine process: a leftover written for any
+        // other process -- including a predecessor that held this same PID --
+        // must not stop this boot (see evaluate_shutdown_flag).
         shutdown_flag_path_ = db_dir / "shutdown.flag";
         // [S46] The write-ahead cancel intent. Unlike every other flag in
         // this directory, a leftover here is NOT stale garbage to be cleared
@@ -971,27 +986,20 @@ Engine::Engine(const AppConfig& config, bool dry_run)
         cancel_intent_path_        = db_dir / "uncancelled.txt";
         cancel_intent_legacy_path_ = db_dir / "uncancelled.json";
         load_cancel_intent();
-        {
-            // [R2 review] Staleness is mtime-based, not delete-on-boot: a
-            // flag YOUNGER than this process is a live close request from
-            // the managing GUI (written during our own startup), and
-            // deleting it would silently ignore the operator.
-            std::error_code sf_ec;
-            if (std::filesystem::exists(shutdown_flag_path_, sf_ec)) {
-                const auto flag_time = std::filesystem::last_write_time(
-                    shutdown_flag_path_, sf_ec);
-                if (!sf_ec
-                    && flag_time < std::filesystem::file_time_type::clock::
-                           now() - std::chrono::seconds(60)) {
-                    std::filesystem::remove(shutdown_flag_path_, sf_ec);
-                    spdlog::info("[Engine] removed stale shutdown.flag "
-                                 "from a previous run");
-                } else {
-                    spdlog::warn("[Engine] shutdown.flag is FRESH -- "
-                                 "honouring it as a live close request");
-                }
-            }
-        }
+        // [shutdown-flag-race 2026-09-12] The boot sweep. A request written
+        // for another process, or before this one started, is removed here
+        // with a WARNING and never stops this engine. A request addressed to
+        // this process is left for the first stop checkpoint: the constructor
+        // never calls shutdown(), and ioc_ is not running yet.
+        //
+        // This replaced a 60 s window whose comment claimed a flag "YOUNGER
+        // than this process" was a live close request, while the code
+        // compared the mtime against now() - 60 s. On 2026-09-12 engine 11616
+        // honoured, at 22:41:19.729, a flag the closing GUI had written at
+        // 22:41:07.954 for engine 15916 -- which a newly launched GUI had
+        // already terminated. It consumed it at its first analysis poll,
+        // cancelled 1 of 12 offers and exited; no engine ran until 23:24.
+        evaluate_shutdown_flag(util::ShutdownFlagSite::BootSweep);
     }
 
     state_->set_status(BotStatus::Initializing);
@@ -2192,6 +2200,13 @@ asio::awaitable<void> Engine::poll_loop_coro()
                              db_pending.size());
             }
 
+            // [shutdown-flag-race] BC0. The prune below deletes unconfirmed
+            // transactions WALLET-WIDE; once a stop is requested it must not
+            // run beside the shutdown continuation's cancels.
+            if (boot_stop_checkpoint("before the stuck-transaction prune")) {
+                co_return;
+            }
+
             // -- Prune stuck transactions ------------------------------------
             // After offer reconciliation, scan wallet transaction lists for
             // transactions that were created but never broadcast (no spend
@@ -2241,6 +2256,16 @@ asio::awaitable<void> Engine::poll_loop_coro()
         }
     }
 
+    // [shutdown-flag-race 2026-09-12] BC1. Nothing between open_connections()
+    // and the first analysis poll used to look at shutdown.flag: on 2026-09-12
+    // a request sat through reconcile, prune, coin-pool maintenance and 12
+    // failed sync probes (~6 min) before that poll consumed it. Once a stop is
+    // requested the remaining startup steps -- coin splits, inventory seeding,
+    // the genesis ledger, analysis -- are skipped.
+    if (boot_stop_checkpoint("before coin pool maintenance")) {
+        co_return;
+    }
+
     // -- Coin pool maintenance at startup ------------------------------------
     if (!wallet_circuit_open_ && (config_.strategy.coin_pool_target_count > 0
             || config_.strategy.cat_coin_pool_target_count > 0)) {
@@ -2256,8 +2281,13 @@ asio::awaitable<void> Engine::poll_loop_coro()
     // still syncing.  Poll sync status until fully synced, with a
     // timeout to avoid blocking forever on a stuck wallet.
     if (wallet_) {
-        constexpr int kMaxSyncWaitBlocks = 30;  // ~26 min at 52s/block
-        for (int attempt = 0; attempt < kMaxSyncWaitBlocks; ++attempt) {
+        // 30 PROBES, not blocks -- one get_sync_status RPC plus a 10 s sleep
+        // each, a 5 min floor; a timing-out wallet adds its retry budget per
+        // probe: measured 2026-09-12 22:42:37-22:47:18 at ~25.5 s per failed
+        // iteration (~13 min for 30); 52 s is transaction-block spacing,
+        // unrelated to this loop.
+        constexpr int kMaxSyncWaitProbes = 30;
+        for (int attempt = 0; attempt < kMaxSyncWaitProbes; ++attempt) {
             try {
                 auto ss = co_await wallet_->get_sync_status();
                 bool synced  = ss.value("synced", false);
@@ -2270,7 +2300,7 @@ asio::awaitable<void> Engine::poll_loop_coro()
                 spdlog::info("[Engine] Waiting for wallet sync "
                              "(synced={}, syncing={}, attempt {}/{})",
                              synced, syncing, attempt + 1,
-                             kMaxSyncWaitBlocks);
+                             kMaxSyncWaitProbes);
             } catch (const std::exception& e) {
                 spdlog::warn("[Engine] Wallet sync check failed: {}",
                              e.what());
@@ -2279,8 +2309,20 @@ asio::awaitable<void> Engine::poll_loop_coro()
             co_await asio::steady_timer(
                 co_await asio::this_coro::executor,
                 std::chrono::seconds(10)).async_wait(asio::use_awaitable);
-            if (stop_requested_.load(std::memory_order_relaxed)) break;
+            // [shutdown-flag-race] BC2. This was a bare `break` on a signal,
+            // after which boot carried on seeding; it now also reads
+            // shutdown.flag, and a stop ends boot instead of skipping ahead.
+            if (boot_stop_checkpoint("waiting for wallet sync")) {
+                co_return;
+            }
         }
+    }
+
+    // [shutdown-flag-race] BC3. A stop requested during coin-pool maintenance,
+    // or on the probe that found the wallet synced, must not seed inventory
+    // or write the genesis ledger.
+    if (boot_stop_checkpoint("before inventory seeding")) {
+        co_return;
     }
 
     // -- Register pair asset-ID keys with State for mark-to-xch lookup ---
@@ -2437,6 +2479,12 @@ asio::awaitable<void> Engine::poll_loop_coro()
             spdlog::warn("[Engine] Startup inventory seeding failed: {}; "
                          "continuing with zero inventory", ex.what());
         }
+    }
+
+    // [shutdown-flag-race] BC4. The last boot checkpoint; the analysis loop
+    // reads the flag itself from its first poll on.
+    if (boot_stop_checkpoint("before startup market analysis")) {
+        co_return;
     }
 
     // -- Startup market analysis phase ---------------------------------------
@@ -19148,10 +19196,6 @@ asio::awaitable<void> Engine::step_sweep_stale_offers(BlockHeight block_height)
     co_return;
 }
 
-// [STOPDRAIN review #7] Consume data/shutdown.flag: the GUI asked for a
-// graceful stop. shutdown() is the existing full path -- cancel the book,
-// then stop -- the same thing SIGINT triggers on platforms where the GUI
-// could deliver it.
 // ===========================================================================
 // [S46 2026-09-02] Write-ahead cancel intent, and the recovery that reads it
 // ===========================================================================
@@ -19554,16 +19598,149 @@ asio::awaitable<void> Engine::sweep_cancel_intent(BlockHeight block)
     co_return;
 }
 
+// [STOPDRAIN review #7] Consume data/shutdown.flag: the GUI asked for a
+// graceful stop. shutdown() is the existing full path -- cancel the book,
+// then stop -- the same thing SIGINT triggers on platforms where the GUI
+// could deliver it.
+//
+// [shutdown-flag-race 2026-09-12] Only a request ADDRESSED to this process
+// stops it -- see evaluate_shutdown_flag. Called from the fast poll, the
+// analysis poll and the boot checkpoints.
 void Engine::check_shutdown_flag()
 {
+    evaluate_shutdown_flag(util::ShutdownFlagSite::Checkpoint);
+}
+
+// [shutdown-flag-race 2026-09-12] Read data/shutdown.flag, decide with
+// util::decide_shutdown_flag (the rule, and the incident that forced it, are
+// in xop/util/shutdown_flag.hpp) and act as util::plan_shutdown_flag_action
+// says for `site`.
+//
+// NOT covered by a test: nothing in cpp/tests constructs an Engine (S36). The
+// decision and the verdict->action table are covered; this function's file
+// read, the site each caller passes, the mtime re-check, the remove and the
+// shutdown() call are not.
+util::ShutdownFlagDecision Engine::evaluate_shutdown_flag(util::ShutdownFlagSite site)
+{
     namespace fs = std::filesystem;
-    if (shutdown_flag_path_.empty()) return;
     std::error_code ec;
-    if (!fs::exists(shutdown_flag_path_, ec)) return;
-    fs::remove(shutdown_flag_path_, ec);
-    spdlog::warn("[Engine] shutdown.flag consumed -- graceful shutdown "
-                 "(the book is cancelled on the way down)");
+    if (shutdown_flag_path_.empty() || !fs::exists(shutdown_flag_path_, ec)) {
+        shutdown_flag_keep_warned_ = false;  // re-arm for the next appearance
+        return {};
+    }
+
+    util::ShutdownFlagFacts facts{};
+    facts.identity = process_identity_;
+    {
+        std::error_code mtime_ec;
+        const fs::file_time_type flag_mtime =
+            fs::last_write_time(shutdown_flag_path_, mtime_ec);
+        if (!mtime_ec) {
+            facts.mtime_known = true;
+            facts.mtime = flag_mtime;
+        }
+    }
+    {
+        std::ifstream in(shutdown_flag_path_, std::ios::binary);
+        if (in.is_open()) {
+            std::string content(util::kShutdownFlagMaxBytes, '\0');
+            in.read(content.data(), static_cast<std::streamsize>(content.size()));
+            if (!in.bad()) {
+                content.resize(static_cast<std::size_t>(in.gcount()));
+                facts.content_known = true;
+                facts.parsed = util::parse_shutdown_flag(content);
+            }
+        }
+    }
+
+    const util::ShutdownFlagDecision decision = util::decide_shutdown_flag(facts);
+    const util::ShutdownFlagAction action =
+        util::plan_shutdown_flag_action(decision.verdict, site);
+    const std::int64_t age_ms = util::flag_age_vs_start_ms(facts);
+    const char* const reason_name = util::shutdown_flag_reason_name(decision.reason);
+
+    if (decision.verdict == util::ShutdownFlagVerdict::Keep) {
+        if (!shutdown_flag_keep_warned_) {
+            shutdown_flag_keep_warned_ = true;
+            spdlog::warn("[Engine] shutdown.flag present but undecidable ({}) -- "
+                         "left in place, re-read at the next check", reason_name);
+        }
+        return decision;
+    }
+    shutdown_flag_keep_warned_ = false;
+
+    if (action.remove_file) {
+        // A request REPLACED while this one was being evaluated is the next
+        // check's to read, not this one's to delete. This narrows the race;
+        // it does not close it -- a replace landing between this re-check and
+        // remove() is still removed.
+        if (facts.mtime_known) {
+            std::error_code recheck_ec;
+            const fs::file_time_type mtime_now =
+                fs::last_write_time(shutdown_flag_path_, recheck_ec);
+            if (recheck_ec || mtime_now != facts.mtime) {
+                spdlog::info("[Engine] shutdown.flag changed while it was being "
+                             "evaluated -- re-read at the next check");
+                return {};
+            }
+        }
+        fs::remove(shutdown_flag_path_, ec);
+    }
+
+    if (decision.verdict == util::ShutdownFlagVerdict::Discard) {
+        if (ec) {
+            spdlog::warn("[Engine] shutdown.flag is NOT addressed to this process "
+                         "({}; flag PID {}, this PID {}, written {} ms relative to "
+                         "this process start) but could not be removed ({}) -- "
+                         "ignored, and re-read at the next check",
+                         reason_name, facts.parsed.pid, process_identity_.pid,
+                         age_ms, ec.message());
+        } else {
+            spdlog::warn("[Engine] removed shutdown.flag NOT addressed to this "
+                         "process ({}; flag PID {}, this PID {}, written {} ms "
+                         "relative to this process start) -- a stop request is "
+                         "never inherited by a successor",
+                         reason_name, facts.parsed.pid, process_identity_.pid,
+                         age_ms);
+        }
+        return decision;
+    }
+
+    if (!action.request_shutdown) {
+        spdlog::info("[Engine] shutdown.flag addressed to this process ({}) -- "
+                     "left for the first stop checkpoint", reason_name);
+        return decision;
+    }
+
+    if (ec) {
+        spdlog::error("[Engine] could not remove shutdown.flag: {} -- the GUI "
+                      "will report this stop as unconsumed", ec.message());
+    }
+    spdlog::warn("[Engine] shutdown.flag consumed ({}; this PID {}, written {} ms "
+                 "after start) -- graceful shutdown (the book is cancelled on "
+                 "the way down)", reason_name, process_identity_.pid, age_ms);
     shutdown();
+    return decision;
+}
+
+// [shutdown-flag-race 2026-09-12] A stop checkpoint for poll_loop_coro's boot
+// sequence. Before it, nothing between open_connections() and the first
+// analysis poll looked at shutdown.flag, and a signal only broke the
+// wallet-sync wait -- after which boot carried on splitting coins and seeding
+// inventory while the shutdown continuation cancelled the book.
+//
+// co_return after `true` is safe: shutdown() has already co_spawned its
+// continuation, which ends in ioc_.stop(), and run() skips the S31
+// died-without-a-request path because stop_requested_ is set.
+bool Engine::boot_stop_checkpoint(const char* where)
+{
+    check_shutdown_flag();
+    if (!stop_requested_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    spdlog::warn("[Engine] stop requested during boot ({}) -- remaining startup "
+                 "steps skipped; the shutdown continuation owns teardown", where);
+    return true;
 }
 
 // Consume data/cancel_all.flag: the operator asked for the book to be gone

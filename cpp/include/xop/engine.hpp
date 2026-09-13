@@ -17,7 +17,8 @@
 //   main loop.
 //
 // Lifecycle:
-//   Engine(AppConfig, dry_run)  -- construct all subsystems, validate config
+//   Engine(AppConfig, dry_run, ProcessIdentity)
+//                               -- construct all subsystems, validate config
 //   run()                       -- open connections, enter main loop, block
 //   shutdown()                  -- signal stop, cancel all offers, close
 //
@@ -70,6 +71,7 @@
 #include "xop/risk/valuation_authority.hpp"
 #include "xop/risk/peg_suspension.hpp"
 #include "xop/config_reload.hpp"
+#include "xop/util/process_identity.hpp"
 #include "xop/strategy/bbo_sanity.hpp"
 #include "xop/strategy/no_loss_floor.hpp"
 #include "xop/risk/usd_route.hpp"
@@ -607,6 +609,14 @@ inline constexpr std::chrono::seconds kDexieProbeLivenessWindow{300};
 // Owns all subsystems and drives the per-block heartbeat loop.
 // ---------------------------------------------------------------------------
 
+namespace util {
+// [shutdown-flag-race] Defined in xop/util/shutdown_flag.hpp, which only
+// engine.cpp includes: declared here so a change to that decision header does
+// not rebuild every translation unit that includes engine.hpp.
+enum class ShutdownFlagSite : int;
+struct ShutdownFlagDecision;
+}  // namespace util
+
 class Engine {
 public:
     // -- Construction --------------------------------------------------------
@@ -617,9 +627,15 @@ public:
     /// @param dry_run  If true, the engine simulates all wallet operations
     ///                 without broadcasting transactions on-chain.  Useful
     ///                 for integration testing against a live full node.
+    /// @param process_identity  This process's PID and start instant, from
+    ///                 util::capture_process_identity() as the first
+    ///                 statement of main(). A data/shutdown.flag stop request
+    ///                 is honoured only if it names this PID and was written
+    ///                 at or after this start.
     ///
     /// @throws std::runtime_error if any subsystem fails to initialise.
-    Engine(const AppConfig& config, bool dry_run);
+    Engine(const AppConfig& config, bool dry_run,
+           util::ProcessIdentity process_identity);
 
     /// [RELOAD] Tell the engine which files its config was loaded from so
     /// a GUI save can be re-read live. Optional: never calling it simply
@@ -1088,11 +1104,28 @@ private:
     // [STOPDRAIN review #7] data/shutdown.flag: the GUI's graceful-close
     // request. On Windows the bridge cannot deliver SIGINT, so terminate()
     // used to hard-kill the engine past its shutdown cancel -- closing the
-    // GUI mid-drain left the book resting unmanaged. Consumed on the fast
-    // poll path; a stale flag is deleted at startup so a leftover cannot
-    // kill a fresh boot.
+    // GUI mid-drain left the book resting unmanaged.
+    //
+    // [shutdown-flag-race 2026-09-12] The request is ADDRESSED. It is honoured
+    // only if it names this process's PID and was written at or after this
+    // process started (xop/util/shutdown_flag.hpp); anything else is removed
+    // and never inherited. The pre-fix "any flag under 60 s old" rule let
+    // engine 11616 honour a request written for the engine a new GUI had just
+    // killed. The constructor sweeps once (BootSweep: discard, never stop);
+    // the fast poll, the analysis poll and the boot checkpoints act on it
+    // (Checkpoint).
     std::filesystem::path shutdown_flag_path_;
+    util::ProcessIdentity process_identity_{};
+    /// An undecidable flag (Keep) is warned about once per appearance.
+    bool shutdown_flag_keep_warned_{false};
+    /// Read the flag, decide, and act for `site`. Callers ignore the returned
+    /// decision, so this is deliberately NOT [[nodiscard]].
+    util::ShutdownFlagDecision evaluate_shutdown_flag(util::ShutdownFlagSite site);
     void check_shutdown_flag();
+    /// A boot stop checkpoint: evaluates the flag, then reports whether a stop
+    /// (flag or signal) is requested. On true the caller must co_return --
+    /// shutdown() has already spawned the continuation that owns teardown.
+    [[nodiscard]] bool boot_stop_checkpoint(const char* where);
 
     [[nodiscard]] bool asset_peg_suspended(const std::string& asset_id) const;
     [[nodiscard]] bool pair_peg_suspended(const PairConfig& pc) const;

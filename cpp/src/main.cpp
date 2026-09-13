@@ -3,11 +3,14 @@
 // =============================================================================
 //
 // Initialization order (strict -- later steps depend on earlier ones):
+//   0. Capture the process identity (PID + start instant -- first, before
+//                                    anything can block; see main())
 //   1. Initialize libcurl globally  (curl_global_init, once per process)
 //   2. Parse CLI arguments           (--config, --dry-run, --verbose)
 //   3. Initialize structured logging (spdlog -- must precede any log calls)
 //   4. Load and validate YAML config via xop::load_config()
-//   5. Construct xop::Engine(config, dry_run) -- owns io_context, all subsystems
+//   5. Construct xop::Engine(config, dry_run, identity) -- owns io_context,
+//                                    all subsystems
 //   6. Install signal handlers       (SIGINT, SIGTERM via std::signal)
 //   7. Call engine.run()             (blocks until shutdown completes)
 //
@@ -35,6 +38,7 @@
 #include "xop/engine.hpp"
 #include "xop/config.hpp"
 #include "xop/version.hpp"
+#include "xop/util/process_identity.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -371,6 +375,21 @@ static void init_logging(bool verbose) {
 
 int main(int argc, char* argv[]) {
     // ------------------------------------------------------------------
+    // 0. [shutdown-flag-race 2026-09-12] Capture this process's identity
+    //    FIRST. A data/shutdown.flag stop request is honoured only if it
+    //    names this PID and was written at or after this process started.
+    //
+    //    On Windows the start is the kernel's creation time, which does not
+    //    depend on where this runs. On POSIX (and the Windows fallback) it is
+    //    the clock at this call, so it must precede anything that can block:
+    //    kill_old_instances() below can wait more than 12 s, and a capture
+    //    after it -- or in the Engine constructor -- would discard stop
+    //    requests legitimately written during that wait.
+    // ------------------------------------------------------------------
+    const xop::util::ProcessIdentityCapture identity_capture =
+        xop::util::capture_process_identity();
+
+    // ------------------------------------------------------------------
     // 1. Initialize libcurl globally (ISO/IEC 5055: resource init once).
     //
     //    curl_global_init() is NOT thread-safe.  It must be called exactly
@@ -414,6 +433,9 @@ int main(int argc, char* argv[]) {
                  getpid()
 #endif
     );
+    spdlog::info("[Startup] stop-request identity: PID {}, start instant from "
+                 "the {}", identity_capture.identity.pid,
+                 xop::util::process_start_source_name(identity_capture.source));
 
     if (cli.dry_run) {
         spdlog::warn("*** DRY-RUN MODE -- no offers will be submitted ***");
@@ -656,15 +678,18 @@ int main(int argc, char* argv[]) {
     // ------------------------------------------------------------------
     // 5. Construct the Engine (owns io_context, State, all subsystems).
     //
-    //    xop::Engine takes (const AppConfig&, bool dry_run) and internally
-    //    constructs the io_context, State, Database, RPC clients, strategy
-    //    layer, risk layer, and monitoring layer in dependency order.
+    //    xop::Engine takes (const AppConfig&, bool dry_run,
+    //    util::ProcessIdentity) and internally constructs the io_context,
+    //    State, Database, RPC clients, strategy layer, risk layer, and
+    //    monitoring layer in dependency order. The identity is step 0's; the
+    //    constructor's shutdown.flag boot sweep needs it.
     //    The constructor validates the full configuration and fails fast
     //    if any subsystem cannot initialise.
     // ------------------------------------------------------------------
     std::unique_ptr<xop::Engine> engine;
     try {
-        engine = std::make_unique<xop::Engine>(app_config, cli.dry_run);
+        engine = std::make_unique<xop::Engine>(app_config, cli.dry_run,
+                                               identity_capture.identity);
     } catch (const std::exception& e) {
         spdlog::critical("Engine construction failed: {}", e.what());
         spdlog::shutdown();
