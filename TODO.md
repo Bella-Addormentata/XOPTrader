@@ -352,7 +352,9 @@ exposure this week.
   (PnLSummary::net_deposits_usd, Prometheus component="net_deposits",
   dashboard "Net Deposits" card); the drawdown peak is NOT adjusted
   in place for flows (owner decision after review rounds 24-41 refuted
-  every in-place scheme -- fills are tracked base-side only, so wallet
+  every in-place scheme -- fills do not all reach the inventory tracker
+  (maker fills book both legs since [FILL-LEGS 2026-09-13]; taker fills
+  still book none, S48), so wallet
   movement cannot be attributed to a specific flow): booking an
   in-process flow resets the peak and the next equity valuation
   re-anchors it, identical to the accepted restart semantics.
@@ -804,6 +806,18 @@ has to be true before it runs.
   - **Consider a pre-shutdown gate:** if the wallet is not synced, say so and refuse to exit until it is, or until the operator forces it -- the double-signal escape hatch documented at `main.cpp:21` already exists for the genuine emergency.
 - **CONFIRMED TRANSIENT, from the restart three minutes later.** The cancel failed at 13:10:17 on "wallet needs to be fully synced"; the replacement engine logged **`Wallet fully synced -- proceeding with inventory seed` at 13:13:30**, and its startup reconcile then called `get_all_offers` against a synced wallet without error. So the condition that defeated both the graceful cancel AND its independent fallback had cleared within about three minutes, unaided. That is the strongest possible argument for a bounded retry: the switch gave up on a state that resolved itself before the operator had finished reading the alert.
 - **Operationally, until this is fixed:** check wallet sync BEFORE requesting a graceful stop, and re-check `offer_log` for unresolved rows afterwards. A `0/N offers cancelled` line means the book is still live regardless of how clean the shutdown looked.
+
+### S48: taker fills book no inventory legs -- and now that maker fills book both, the gap can raise false quote-leg rejections
+- **Files:** `cpp/src/engine.cpp` (`Engine::record_taker_fill`, called from the `crossed_book`, `cross_stable`, `peg_arb`, `drift_correct` and `xch_recovery` take paths), `cpp/include/xop/accounting/maker_fill_legs.hpp`
+- **Issue:** `record_taker_fill` writes `taker_fills` and the ledger legs only. It makes no `inventory_` (or State) mutation for the base leg, the quote leg or the fee. Until [FILL-LEGS 2026-09-13] maker fills booked only their base leg, so the tracker was wrong for every fill; maker fills now book base, quote and XCH fee, and takes are the remaining gap.
+- **The new consequence.** Tracked QUOTE holdings now move on maker fills but still not on takes. A take that RECEIVED DBX or BYC leaves tracked quote below the wallet until the next restart's Step 11 one-shot reconcile, so a later maker bid whose spend exceeds the tracked quote is refused with an ExposureBreach alert although the wallet covers it. The base leg has had the same exposure all along: a take that bought XCH leaves tracked XCH below the wallet.
+- **Why it was not fixed with the maker path:** takes are booked when the `take_offer` RPC succeeds, not at on-chain confirmation (S44 records one the chain never settled). Reusing `apply_maker_fill_legs` there first needs a confirmation signal, plus a guard so a self-take is not booked by both paths.
+- **Status:** `[ ]` -- OPEN.
+
+### S49: Step 11's one-shot reconcile can absorb a settled-but-undetected fill that Step 2 then applies again
+- **Files:** `cpp/src/engine.cpp` (Step 11 one-shot wallet reconcile, gated on `pending_unconfirmed_fills_.empty()` and `kReconcileGraceBlocks` = 20)
+- **Issue:** the gate waits for the CONFIRMATION buffer to drain and for 20 blocks of grace, but it does not know about fills not yet DETECTED. A fill that settled while the engine was down enters that buffer only when `detect_fills` reports it, and detection is throttled (`detect_fills_min_age_blocks`, and after `detect_fills_backoff_polls` pending polls an offer is polled only every `detect_fills_backoff_interval` heartbeats). If the one-shot runs first, set-to-wallet absorbs the fill and Step 2 applies it again once it is detected. Pre-existing for base legs; since [FILL-LEGS 2026-09-13] the quote and fee legs double-apply too. The equity error is smaller than a base-only double-apply because the legs offset, but `inventory_ratio` shifts twice. The bridge asset's set-to reconcile heals on the next heartbeat; the one-shot does not until the next restart.
+- **Status:** `[ ]` -- OPEN, raised in review of the FILL-LEGS change and not reproduced live. Suggested shape: gate the one-shot on the wallet reporting no settled-but-unprocessed trade for the asset, not on the confirmation buffer alone.
 
 ### P1: max_position_usd is PER MARKET and nothing aggregated it
 Three markets at the shipped 250,000 authorise **750,000 of exposure on a

@@ -16,9 +16,11 @@
 // than a blind adjustment.  The USD amount accumulates in a NET DEPOSITS
 // figure kept out of trading P&L.  Drawdown-peak policy (engine.cpp,
 // owner decision after review rounds 24-41): the peak is NOT adjusted
-// in place for flows -- fills are tracked base-side only, so no wallet
-// movement can be attributed to a specific flow, and every in-place
-// factor scheme was refuted.  Instead, booking an IN-PROCESS flow
+// in place for flows -- fills do not all reach the inventory tracker
+// (taker fills book no legs, TODO S48; maker fills booked only their base
+// leg until [FILL-LEGS 2026-09-13]), so no wallet movement can be
+// attributed to a specific flow, and every in-place factor scheme was
+// refuted.  Instead, booking an IN-PROCESS flow
 // resets the peak to its unseeded state and the next equity valuation
 // re-anchors it, exactly the accepted restart semantics: drawdown
 // measurement restarts at the capital event.  Flows completed before

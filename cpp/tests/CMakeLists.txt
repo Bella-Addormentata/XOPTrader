@@ -97,6 +97,7 @@ add_executable(xop_tests
     test_reservation_offset.cpp
     test_bridge_ingest.cpp
     test_reward_ingest.cpp
+    test_maker_fill_legs.cpp
     test_drawdown_breaker.cpp
     test_watchdog.cpp
     test_height_source.cpp
