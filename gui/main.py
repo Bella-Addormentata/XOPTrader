@@ -15,9 +15,11 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
-from typing import Final, Optional
+from typing import Callable, Final, Iterable, Optional
 
+from gui import shutdown_flag
 from gui.app import XOPTraderApp
 from gui.services.engine_bridge import EngineBridge
 from gui.utils import (
@@ -35,11 +37,58 @@ _log: logging.Logger = logging.getLogger(__name__)
 # Singleton enforcement -- kill stale GUI and engine instances
 # ---------------------------------------------------------------------------
 
-def _kill_old_instances() -> None:
+#: [shutdown-flag-race] The INSTALLED GUI executable is xop_trader_gui.exe:
+#: release.yml builds it with ``--name xop_trader_gui`` (:317 and :420), and
+#: installer.iss installs it (:72) and taskkills it (:159). Only the two
+#: legacy spellings used to be listed, so a relaunched installed GUI never
+#: closed the old one -- at 23:24:21 on 2026-09-12 it logged "No old GUI or
+#: engine instances found" while the 22:41 GUI was still running, and both
+#: then polled side by side. One installed GUI is TWO processes of this name
+#: (PyInstaller's one-file bootloader and its child); protected_pids covers
+#: this instance's own pair.
+_INSTALLED_GUI_EXE_WIN32: Final[str] = "xop_trader_gui.exe"
+_GUI_EXE_NAMES_WIN32: Final[tuple[str, ...]] = (
+    "xop_trader_gui.exe",
+    "xoptrader-gui.exe",
+    "xoptrader_gui.exe",
+)
+_ENGINE_EXE_NAMES_WIN32: Final[tuple[str, ...]] = ("xop_trader.exe",)
+
+#: POSIX command-line markers. An installed bundle's name CONTAINS
+#: "xop_trader", so without its own marker an installed GUI was labelled an
+#: engine. The SIGKILL sweep uses the same rule (it had its own inline copy).
+_SOURCE_GUI_MARKERS_POSIX: Final[tuple[str, ...]] = ("gui.main", "gui/main")
+_BUNDLED_GUI_MARKERS_POSIX: Final[tuple[str, ...]] = (
+    "xop_trader_gui",
+    "xoptrader-gui",
+    "xoptrader_gui",
+)
+_ENGINE_MARKER_POSIX: Final[str] = "xop_trader"
+
+#: [shutdown-flag-race, operator decision 2026-09-13] How long a relaunched
+#: GUI waits for a stop that is already under way -- a running engine that a
+#: shutdown.flag names -- before terminating anything. 45 s is the closing
+#: GUI's own worst case (30 s graceful wait, 10 s after terminate, 5 s after
+#: kill) counted from ITS write, so waiting this long from our start covers
+#: it whenever it began.
+_STOP_IN_PROGRESS_WAIT_S: Final[float] = 45.0
+_EXIT_POLL_S: Final[float] = 0.25
+
+
+def _kill_old_instances(
+    flag_path: Optional[Path] = None,
+    *,
+    dry_run: bool = False,
+) -> None:
     """Terminate any previously-running GUI and engine processes.
 
     Ensures only one GUI and one engine run at a time, preventing
     double-posting offers, port conflicts, and wallet RPC contention.
+
+    *flag_path* is where this launch's shutdown.flag lives. A stop already
+    addressed to a running engine is waited for, bounded, before anything is
+    terminated, and a request whose engine this startup terminates is removed
+    afterwards. *dry_run* keeps the installed GUI alive (Windows).
 
     On Windows, uses WMI via ``Get-CimInstance`` to match on command line.
     On POSIX, reads ``/proc/<pid>/cmdline``.
@@ -51,16 +100,217 @@ def _kill_old_instances() -> None:
     protected_pids = {current_pid, parent_pid}
 
     if platform.system() == "Windows":
-        _kill_old_instances_win32(protected_pids)
+        _kill_old_instances_win32(protected_pids, flag_path, dry_run=dry_run)
     else:
-        _kill_old_instances_posix(protected_pids)
+        _kill_old_instances_posix(protected_pids, flag_path)
 
 
-def _kill_old_instances_win32(protected_pids: set[int]) -> None:
-    """Windows implementation: kill old GUI python procs and engine exes."""
-    killed = 0
+def _resolve_startup_stop_flag(
+    config_arg: Optional[Path],
+    db_arg: Optional[Path],
+) -> Optional[Path]:
+    """The shutdown.flag path EngineBridge will use for this launch, or None.
 
-    # --- Kill old GUI processes (python running gui.main) ----------------
+    The same target computation as _bootstrap_config_info (the config) and
+    EngineBridge (the database, including ConfigService's validation gate),
+    done read-only before either exists. A failure only skips the
+    stop-request handling; it never blocks startup.
+    """
+    try:
+        from gui.services.config_service import ConfigService  # noqa: WPS433
+
+        early_cfg = (
+            Path(config_arg).resolve() if config_arg else default_config_path()
+        )
+        return shutdown_flag.resolve_shutdown_flag_path(
+            early_cfg, db_arg, validate=ConfigService._validate)
+    except Exception as exc:  # noqa: BLE001 -- startup must go on
+        _log.warning(
+            "[Startup] could not resolve shutdown.flag (%s); skipping "
+            "stop-request handling", exc)
+        return None
+
+
+def _wait_for_process_exit(pid: int, timeout_s: float) -> Optional[bool]:
+    """Wait up to *timeout_s* for *pid* to exit, without ever signalling it.
+
+    True: it exited, or no process has that PID. False: still running at the
+    deadline. None: its state cannot be observed (access denied, say), so
+    nothing was waited for.
+
+    Never ``os.kill(pid, 0)`` on Windows: there it is TerminateProcess.
+    """
+    if platform.system() == "Windows":
+        return _wait_for_process_exit_win32(pid, timeout_s)
+    return _wait_for_process_exit_posix(pid, timeout_s)
+
+
+def _wait_for_process_exit_win32(pid: int, timeout_s: float) -> Optional[bool]:
+    """OpenProcess(SYNCHRONIZE) + WaitForSingleObject: observes, never signals.
+
+    Waits in short slices so Ctrl+C still lands during a long wait. The handle
+    pins the process object, so a PID recycled mid-wait is not mistaken for
+    the engine.
+    """
+    import ctypes  # noqa: WPS433
+    from ctypes import wintypes  # noqa: WPS433
+
+    synchronize = 0x00100000
+    wait_object_0 = 0x00000000
+    wait_timeout = 0x00000102
+    error_invalid_parameter = 87  # no process has this PID
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    handle = kernel32.OpenProcess(synchronize, False, pid)
+    if not handle:
+        if ctypes.get_last_error() == error_invalid_parameter:
+            return True
+        return None
+    try:
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        while True:
+            remaining = deadline - time.monotonic()
+            slice_ms = int(max(0.0, min(remaining, _EXIT_POLL_S)) * 1000)
+            status = kernel32.WaitForSingleObject(handle, slice_ms)
+            if status == wait_object_0:
+                return True
+            if status != wait_timeout:
+                return None
+            if remaining <= 0:
+                return False
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _posix_process_alive(pid: int) -> Optional[bool]:
+    """Signal 0 checks existence on POSIX and delivers nothing."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # it exists; it belongs to someone else
+    except OSError:
+        return None
+    # An exited child its parent has not reaped yet is a zombie: gone.
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        if stat.rsplit(")", 1)[1].split()[0] in ("Z", "X"):
+            return False
+    except (OSError, IndexError):
+        pass
+    return True
+
+
+def _wait_for_process_exit_posix(pid: int, timeout_s: float) -> Optional[bool]:
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    while True:
+        alive = _posix_process_alive(pid)
+        if alive is None:
+            return None
+        if not alive:
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(_EXIT_POLL_S, remaining))
+
+
+def _await_stop_in_progress(
+    flag_path: Optional[Path],
+    engine_pids: Callable[[], Iterable[int]],
+    gui_pids: Callable[[], Iterable[int]],
+) -> None:
+    """[operator decision 2026-09-13] Let a stop that is under way finish.
+
+    A closing GUI writes shutdown.flag addressed to its engine and then blocks
+    for up to 45 s waiting for it -- after its window has gone, which is
+    exactly when an operator relaunches. Terminating that engine cancels
+    nothing (22:41:14 on 2026-09-12), and terminating that GUI cuts off its
+    own outcome line and cleanup. So when the flag names a running engine,
+    wait -- bounded -- for that engine, then for the GUI that asked, before
+    anything is terminated. Whatever is still running afterwards is
+    terminated as before.
+    """
+    if flag_path is None:
+        return
+    request = shutdown_flag.read_shutdown_request(flag_path)
+    if request is None or request.kind is not shutdown_flag.RequestKind.ADDRESSED:
+        return
+    target = request.pid
+    if target not in set(engine_pids()):
+        return
+    requester = request.requester_pid
+    if requester is not None and requester not in set(gui_pids()):
+        requester = None
+
+    _log.warning(
+        "[Startup] shutdown.flag asks engine PID %d to stop and that engine is "
+        "still running -- a previous GUI%s is closing it; waiting up to %.0f s "
+        "before terminating old instances",
+        target,
+        f" (PID {requester})" if requester is not None else "",
+        _STOP_IN_PROGRESS_WAIT_S,
+    )
+    started = time.monotonic()
+    engine_exited = _wait_for_process_exit(target, _STOP_IN_PROGRESS_WAIT_S)
+    waited = time.monotonic() - started
+    if engine_exited is True:
+        _log.info(
+            "[Startup] engine PID %d exited %.1f s into the wait -- its stop "
+            "finished without this startup terminating it", target, waited)
+    elif engine_exited is False:
+        _log.warning(
+            "[Startup] engine PID %d was still running after %.0f s -- "
+            "terminating it with the other old instances", target,
+            _STOP_IN_PROGRESS_WAIT_S)
+    else:
+        _log.warning(
+            "[Startup] engine PID %d cannot be observed -- not waiting for it",
+            target)
+
+    if requester is None:
+        return
+    remaining = max(0.0, _STOP_IN_PROGRESS_WAIT_S - waited)
+    gui_exited = _wait_for_process_exit(requester, remaining)
+    if gui_exited is True:
+        _log.info(
+            "[Startup] previous GUI PID %d exited %.1f s into the wait -- it "
+            "finished its own stop", requester, time.monotonic() - started)
+    elif gui_exited is False:
+        _log.warning(
+            "[Startup] previous GUI PID %d was still running when the %.0f s "
+            "wait ended -- terminating it with the other old instances",
+            requester, _STOP_IN_PROGRESS_WAIT_S)
+    else:
+        _log.warning(
+            "[Startup] previous GUI PID %d cannot be observed -- not waiting "
+            "for it", requester)
+
+
+def _terminate_pids(pids: Iterable[int], label: str) -> list[int]:
+    """SIGTERM each PID (TerminateProcess on Windows); return those signalled."""
+    killed: list[int] = []
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            continue
+        killed.append(pid)
+        _log.info("[Startup] Terminated old %s (PID %d)", label, pid)
+    return killed
+
+
+def _scan_python_gui_pids_win32(protected_pids: set[int]) -> list[int]:
+    """Other python processes running our GUI module, via WMI."""
+    pids: list[int] = []
     try:
         result = subprocess.run(
             [
@@ -86,52 +336,19 @@ def _kill_old_instances_win32(protected_pids: set[int]) -> None:
                     continue
                 # Match processes running our GUI module.
                 if "gui.main" in cmd or "gui\\main" in cmd:
-                    try:
-                        os.kill(pid, signal.SIGTERM)
-                        killed += 1
-                        _log.info(
-                            "[Startup] Terminated old GUI process (PID %d)",
-                            pid,
-                        )
-                    except OSError:
-                        pass
+                    pids.append(pid)
     except Exception as exc:
         _log.warning("[Startup] GUI process scan failed: %s", exc)
-
-    # --- Kill old PyInstaller-bundled GUI --------------------------------
-    _kill_processes_by_name_win32(
-        ["xoptrader-gui.exe", "xoptrader_gui.exe"],
-        protected_pids,
-        "GUI",
-    )
-    killed_count = killed  # track for summary
-
-    # --- Kill old engine processes ---------------------------------------
-    killed_count += _kill_processes_by_name_win32(
-        ["xop_trader.exe"],
-        protected_pids,
-        "engine",
-    )
-
-    if killed_count > 0:
-        # Brief pause so OS can release ports and file handles.
-        import time
-        time.sleep(2)
-        _log.info(
-            "[Startup] Terminated %d old instance(s) -- ports released",
-            killed_count,
-        )
-    else:
-        _log.info("[Startup] No old GUI or engine instances found")
+    return pids
 
 
-def _kill_processes_by_name_win32(
-    names: list[str],
+def _scan_processes_by_name_win32(
+    names: Iterable[str],
     protected_pids: set[int],
     label: str,
-) -> int:
-    """Kill Windows processes matching any of the given executable names."""
-    killed = 0
+) -> list[int]:
+    """PIDs of Windows processes whose executable is one of *names*."""
+    pids: list[int] = []
     try:
         result = subprocess.run(
             [
@@ -155,83 +372,175 @@ def _kill_processes_by_name_win32(
                 if pid in protected_pids or pid == 0:
                     continue
                 if pname in name_set:
-                    try:
-                        os.kill(pid, signal.SIGTERM)
-                        killed += 1
-                        _log.info(
-                            "[Startup] Terminated old %s (PID %d)",
-                            label,
-                            pid,
-                        )
-                    except OSError:
-                        pass
+                    pids.append(pid)
     except Exception as exc:
         _log.warning("[Startup] %s process scan failed: %s", label, exc)
-    return killed
+    return pids
 
 
-def _kill_old_instances_posix(protected_pids: set[int]) -> None:
-    """POSIX implementation: scan /proc for old GUI and engine processes."""
-    killed = 0
-    proc_dir = Path("/proc")
-    if not proc_dir.is_dir():
-        return
+def _kill_processes_by_name_win32(
+    names: Iterable[str],
+    protected_pids: set[int],
+    label: str,
+) -> list[int]:
+    """Kill Windows processes matching any of the given executable names.
 
-    for entry in proc_dir.iterdir():
+    Returns the PIDs actually signalled: the caller counts them, and hands
+    the engine PIDs to the stop-request cleanup.
+    """
+    return _terminate_pids(
+        _scan_processes_by_name_win32(names, protected_pids, label), label)
+
+
+def _kill_old_instances_win32(
+    protected_pids: set[int],
+    flag_path: Optional[Path] = None,
+    *,
+    dry_run: bool = False,
+) -> None:
+    """Windows implementation: kill old GUI processes and engine exes."""
+    gui_names = tuple(
+        name for name in _GUI_EXE_NAMES_WIN32
+        if not (dry_run and name == _INSTALLED_GUI_EXE_WIN32)
+    )
+    if dry_run:
+        # [review] The engine refuses to kill a live engine in a dry run
+        # (main.cpp [S31]); this GUI-name kill is new, so a dry run must not
+        # widen it to the live installed GUI.
+        _log.warning(
+            "[Startup] --dry-run: installed GUI processes (%s) are NOT "
+            "terminated", _INSTALLED_GUI_EXE_WIN32)
+
+    _await_stop_in_progress(
+        flag_path,
+        engine_pids=lambda: _scan_processes_by_name_win32(
+            _ENGINE_EXE_NAMES_WIN32, protected_pids, "engine"),
+        gui_pids=lambda: [
+            *_scan_python_gui_pids_win32(protected_pids),
+            *_scan_processes_by_name_win32(gui_names, protected_pids, "GUI"),
+        ],
+    )
+
+    # --- Kill old GUI processes (python running gui.main) ----------------
+    gui_killed = len(_terminate_pids(
+        _scan_python_gui_pids_win32(protected_pids), "GUI process"))
+
+    # --- Kill old PyInstaller-bundled GUIs, the installed one included ----
+    gui_killed += len(_kill_processes_by_name_win32(gui_names, protected_pids, "GUI"))
+
+    # --- Kill old engine processes ---------------------------------------
+    engine_pids = _kill_processes_by_name_win32(
+        _ENGINE_EXE_NAMES_WIN32, protected_pids, "engine")
+
+    total = gui_killed + len(engine_pids)
+    if total > 0:
+        # Brief pause so OS can release ports and file handles.
+        time.sleep(2)
+        _log.info(
+            "[Startup] Terminated %d old instance(s) (%d GUI process(es), "
+            "%d engine(s)) -- ports released",
+            total, gui_killed, len(engine_pids),
+        )
+    else:
+        _log.info("[Startup] No old GUI or engine instances found")
+
+    stop_cleanup = shutdown_flag.cleanup_after_singleton_kill(flag_path, engine_pids)
+    if stop_cleanup:
+        _log.warning("[Startup] %s", stop_cleanup)
+
+
+def _posix_instance_label(cmdline: str) -> Optional[str]:
+    """'GUI', 'engine', or None for a process command line."""
+    if any(marker in cmdline for marker in _SOURCE_GUI_MARKERS_POSIX):
+        return "GUI"
+    if any(marker in cmdline for marker in _BUNDLED_GUI_MARKERS_POSIX):
+        return "GUI"
+    if _ENGINE_MARKER_POSIX in cmdline:
+        return "engine"
+    return None
+
+
+def _scan_posix_instances(
+    protected_pids: set[int],
+    proc_root: Path,
+) -> list[tuple[int, str]]:
+    """(pid, label) for every other GUI or engine process under *proc_root*."""
+    found: list[tuple[int, str]] = []
+    try:
+        entries = sorted(proc_root.iterdir())
+    except OSError:
+        return found
+    for entry in entries:
         if not entry.name.isdigit():
             continue
         pid = int(entry.name)
         if pid in protected_pids:
             continue
         try:
-            cmdline = (entry / "cmdline").read_text().replace("\x00", " ")
+            cmdline = (entry / "cmdline").read_text().replace(chr(0), " ")
         except OSError:
             continue
+        label = _posix_instance_label(cmdline)
+        if label is not None:
+            found.append((pid, label))
+    return found
 
-        is_gui = "gui.main" in cmdline or "gui/main" in cmdline
-        is_bundled_gui = "xoptrader-gui" in cmdline or "xoptrader_gui" in cmdline
-        is_engine = "xop_trader" in cmdline
 
-        if is_gui or is_bundled_gui or is_engine:
-            label = "GUI" if (is_gui or is_bundled_gui) else "engine"
-            try:
-                os.kill(pid, signal.SIGTERM)
-                killed += 1
-                _log.info(
-                    "[Startup] Sent SIGTERM to old %s (PID %d)", label, pid
-                )
-            except OSError:
-                pass
+def _kill_old_instances_posix(
+    protected_pids: set[int],
+    flag_path: Optional[Path] = None,
+    *,
+    proc_root: Path = Path("/proc"),
+) -> None:
+    """POSIX implementation: scan /proc for old GUI and engine processes."""
+    if not proc_root.is_dir():
+        return
+
+    def _pids_labelled(wanted: str) -> list[int]:
+        return [pid for pid, label in _scan_posix_instances(protected_pids, proc_root)
+                if label == wanted]
+
+    _await_stop_in_progress(
+        flag_path,
+        engine_pids=lambda: _pids_labelled("engine"),
+        gui_pids=lambda: _pids_labelled("GUI"),
+    )
+
+    killed = 0
+    engine_pids: list[int] = []
+    for pid, label in _scan_posix_instances(protected_pids, proc_root):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            continue
+        killed += 1
+        if label == "engine":
+            engine_pids.append(pid)
+        _log.info("[Startup] Sent SIGTERM to old %s (PID %d)", label, pid)
 
     if killed > 0:
-        import time
         time.sleep(2)
-        # Send SIGKILL to any stubborn survivors.
-        for entry in proc_dir.iterdir():
-            if not entry.name.isdigit():
-                continue
-            pid = int(entry.name)
-            if pid in protected_pids:
-                continue
+        # Send SIGKILL to any stubborn survivors, by the same label rule; a
+        # surviving engine joins the stop-request cleanup. (getattr: this
+        # path is also exercised by tests on Windows, which has no SIGKILL.)
+        sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+        for pid, label in _scan_posix_instances(protected_pids, proc_root):
             try:
-                cmdline = (entry / "cmdline").read_text().replace("\x00", " ")
+                os.kill(pid, sigkill)
             except OSError:
                 continue
-            if any(
-                s in cmdline
-                for s in ("gui.main", "gui/main", "xoptrader-gui",
-                           "xoptrader_gui", "xop_trader")
-            ):
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                    _log.info("[Startup] Sent SIGKILL to PID %d", pid)
-                except OSError:
-                    pass
+            if label == "engine" and pid not in engine_pids:
+                engine_pids.append(pid)
+            _log.info("[Startup] Sent SIGKILL to PID %d", pid)
         _log.info(
             "[Startup] Terminated %d old instance(s)", killed
         )
     else:
         _log.info("[Startup] No old GUI or engine instances found")
+
+    cleanup_message = shutdown_flag.cleanup_after_singleton_kill(flag_path, engine_pids)
+    if cleanup_message:
+        _log.warning("[Startup] %s", cleanup_message)
 
 
 # ---------------------------------------------------------------------------
@@ -351,7 +660,7 @@ def _build_parser() -> argparse.ArgumentParser:
     argparse.ArgumentParser ready for ``parse_args()``.
     """
     parser = argparse.ArgumentParser(
-        prog="xoptrader-gui",
+        prog="xop_trader_gui",
         description="XOPTrader -- CHIA DEX Market-Maker Control Panel",
     )
     parser.add_argument(
@@ -922,8 +1231,13 @@ def main() -> None:
     except Exception:
         pass
 
+    # [shutdown-flag-race] Where this launch's shutdown.flag lives, resolved
+    # read-only BEFORE the kill: the singleton needs it to let a stop that is
+    # already under way finish, and to remove a request whose engine it
+    # terminates.
+    stop_flag = _resolve_startup_stop_flag(args.config, args.db)
     # Enforce singleton: kill any old GUI and engine processes.
-    _kill_old_instances()
+    _kill_old_instances(stop_flag, dry_run=args.dry_run)
 
     # Build the Qt application with the user's font-size preference.
     app = XOPTraderApp(

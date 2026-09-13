@@ -781,7 +781,7 @@ has to be true before it runs.
 - **Related and NOT deferred:** the take path itself had an inert size cap (S40). Fixed on this branch but **not deployed** -- the running binary predates it. Today's take was 1 XCH against a 5 XCH cap so it was recorded truthfully; a larger one would not have been. That is a deployment argument, not a GUI one.
 
 ### S46: the dead man's switch cannot cancel when the wallet is unsynced -- observed live
-- **Files:** `cpp/src/engine.cpp` (`shutdown()` -> `cancel_all`, the S31 fallback), `cpp/src/engine.cpp:17687` (`check_shutdown_flag`)
+- **Files:** `cpp/src/engine.cpp` (`shutdown()` -> `cancel_all`, the S31 fallback), `cpp/src/engine.cpp:19609` (`check_shutdown_flag`)
 - **OBSERVED, not theorised. 2026-09-02 13:09:45 CDT**, during a planned graceful stop to deploy. `data/shutdown.flag` was consumed correctly and the full shutdown path ran, and then:
   ```
   13:10:17 [error]    Failed to cancel offer 0x9a72dfe913: Wallet needs to be fully synced
@@ -804,6 +804,14 @@ has to be true before it runs.
   - **Consider a pre-shutdown gate:** if the wallet is not synced, say so and refuse to exit until it is, or until the operator forces it -- the double-signal escape hatch documented at `main.cpp:21` already exists for the genuine emergency.
 - **CONFIRMED TRANSIENT, from the restart three minutes later.** The cancel failed at 13:10:17 on "wallet needs to be fully synced"; the replacement engine logged **`Wallet fully synced -- proceeding with inventory seed` at 13:13:30**, and its startup reconcile then called `get_all_offers` against a synced wallet without error. So the condition that defeated both the graceful cancel AND its independent fallback had cleared within about three minutes, unaided. That is the strongest possible argument for a bounded retry: the switch gave up on a state that resolved itself before the operator had finished reading the alert.
 - **Operationally, until this is fixed:** check wallet sync BEFORE requesting a graceful stop, and re-check `offer_log` for unresolved rows afterwards. A `0/N offers cancelled` line means the book is still live regardless of how clean the shutdown looked.
+
+### S47: `cancel_all.flag` and `pause.flag` are not addressed, so a successor engine inherits them
+- **Files:** `gui/services/engine_bridge.py` (`pause_trading`, `cancel_all_offers`), `cpp/src/engine.cpp` (`check_pause_flag`, `check_cancel_all_flag`, and the analysis poll that consumes both)
+- **Found while fixing the same shape in `shutdown.flag` (2026-09-13).** On 2026-09-12 a successor engine honoured a stop request written for the engine a newly launched GUI had just killed. `shutdown.flag` is now addressed to one engine PID and honoured only if written at or after that process started (`cpp/include/xop/util/shutdown_flag.hpp`). Its two siblings were deliberately left out of that change:
+  - **`cancel_all.flag`** -- the GUI writes the literal `cancel_all`, with no address, and `check_cancel_all_flag()` consumes ANY existing file, on the fast poll and during startup analysis. A leftover therefore fires a fee-bearing, wallet-wide cancel at the next boot's first poll. The analysis-poll comment says honouring "a flag written while the engine was down" is intended, so changing it needs an operator decision rather than a quiet fix.
+  - **`pause.flag`** -- existence-based and never consumed. A pause outliving the engine is the FEATURE (a restarted engine stays paused), so addressing it the way `shutdown.flag` now is would break that. The open question is only whether a pause set for an engine that was killed should survive a GUI relaunch.
+  - `peg_reenable.flag` has the same unaddressed shape; its effect (re-enabling a suspended peg) was not assessed.
+- **Status:** `[ ]` -- OPEN. Decide per flag whether inheritance is intended. Where it is not, reuse the v1 request format and `util::decide_shutdown_flag`'s rule (PID plus process start) instead of inventing a second one.
 
 ### P1: max_position_usd is PER MARKET and nothing aggregated it
 Three markets at the shipped 250,000 authorise **750,000 of exposure on a
