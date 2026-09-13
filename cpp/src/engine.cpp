@@ -505,8 +505,8 @@ Engine::Engine(const AppConfig& config, bool dry_run,
     process_identity_ = process_identity;
     spdlog::info("[Engine] process identity: PID {}, started {} ms before "
                  "engine construction -- a shutdown.flag stop request is "
-                 "honoured only if it names this PID and was written at or "
-                 "after that start",
+                 "honoured only if it names this PID (or no PID) and was "
+                 "written at or after that start",
                  process_identity_.pid,
                  std::chrono::duration_cast<std::chrono::milliseconds>(
                      std::filesystem::file_time_type::clock::now()
@@ -986,11 +986,11 @@ Engine::Engine(const AppConfig& config, bool dry_run,
         cancel_intent_path_        = db_dir / "uncancelled.txt";
         cancel_intent_legacy_path_ = db_dir / "uncancelled.json";
         load_cancel_intent();
-        // [shutdown-flag-race 2026-09-12] The boot sweep. A request written
-        // for another process, or before this one started, is removed here
-        // with a WARNING and never stops this engine. A request addressed to
-        // this process is left for the first stop checkpoint: the constructor
-        // never calls shutdown(), and ioc_ is not running yet.
+        // [shutdown-flag-race 2026-09-12] The boot sweep. A request for another
+        // PID, one written before this process started, or a malformed one is
+        // removed here with a WARNING and never stops this engine. Anything
+        // else is left for the first stop checkpoint: the constructor never
+        // calls shutdown(), and ioc_ is not running yet.
         //
         // This replaced a 60 s window whose comment claimed a flag "YOUNGER
         // than this process" was a live close request, while the code
@@ -19603,9 +19603,9 @@ asio::awaitable<void> Engine::sweep_cancel_intent(BlockHeight block)
 // then stop -- the same thing SIGINT triggers on platforms where the GUI
 // could deliver it.
 //
-// [shutdown-flag-race 2026-09-12] Only a request ADDRESSED to this process
-// stops it -- see evaluate_shutdown_flag. Called from the fast poll, the
-// analysis poll and the boot checkpoints.
+// [shutdown-flag-race 2026-09-12] Only a request naming this PID, or no PID,
+// and written at or after this process started stops it (decide_shutdown_flag).
+// Called from the fast poll, the analysis poll and the boot checkpoints.
 void Engine::check_shutdown_flag()
 {
     evaluate_shutdown_flag(util::ShutdownFlagSite::Checkpoint);
@@ -19707,7 +19707,7 @@ util::ShutdownFlagDecision Engine::evaluate_shutdown_flag(util::ShutdownFlagSite
     }
 
     if (!action.request_shutdown) {
-        spdlog::info("[Engine] shutdown.flag addressed to this process ({}) -- "
+        spdlog::info("[Engine] shutdown.flag is for this process ({}) -- "
                      "left for the first stop checkpoint", reason_name);
         return decision;
     }

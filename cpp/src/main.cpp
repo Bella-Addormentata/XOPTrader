@@ -377,7 +377,7 @@ int main(int argc, char* argv[]) {
     // ------------------------------------------------------------------
     // 0. [shutdown-flag-race 2026-09-12] Capture this process's identity
     //    FIRST. A data/shutdown.flag stop request is honoured only if it
-    //    names this PID and was written at or after this process started.
+    //    names this PID (or no PID) and was written at or after this start.
     //
     //    On Windows the start is the kernel's creation time, which does not
     //    depend on where this runs. On POSIX (and the Windows fallback) it is

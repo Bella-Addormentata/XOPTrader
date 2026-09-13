@@ -4,9 +4,9 @@
 // process_identity.hpp -- which process is this, and since when?
 //
 // [shutdown-flag-race 2026-09-12] A stop request in data/shutdown.flag is
-// honoured only when it names THIS process's PID and was written at or after
-// THIS process started (see shutdown_flag.hpp). Both halves are captured here,
-// once, as the first statement of main().
+// honoured only when it names THIS process's PID (or no PID at all) and was
+// written at or after THIS process started (see shutdown_flag.hpp). Both are
+// captured here, once, as the first statement of main().
 //
 // WHY THE START IS THE KERNEL'S CREATION TIME ON WINDOWS
 // -----------------------------------------------------

@@ -630,8 +630,8 @@ public:
     /// @param process_identity  This process's PID and start instant, from
     ///                 util::capture_process_identity() as the first
     ///                 statement of main(). A data/shutdown.flag stop request
-    ///                 is honoured only if it names this PID and was written
-    ///                 at or after this start.
+    ///                 is honoured only if it names this PID (or no PID) and
+    ///                 was written at or after this start.
     ///
     /// @throws std::runtime_error if any subsystem fails to initialise.
     Engine(const AppConfig& config, bool dry_run,
@@ -1106,14 +1106,16 @@ private:
     // used to hard-kill the engine past its shutdown cancel -- closing the
     // GUI mid-drain left the book resting unmanaged.
     //
-    // [shutdown-flag-race 2026-09-12] The request is ADDRESSED. It is honoured
-    // only if it names this process's PID and was written at or after this
-    // process started (xop/util/shutdown_flag.hpp); anything else is removed
-    // and never inherited. The pre-fix "any flag under 60 s old" rule let
-    // engine 11616 honour a request written for the engine a new GUI had just
-    // killed. The constructor sweeps once (BootSweep: discard, never stop);
-    // the fast poll, the analysis poll and the boot checkpoints act on it
-    // (Checkpoint).
+    // [shutdown-flag-race 2026-09-12] The GUI's request is ADDRESSED. A flag
+    // is honoured only if it names this PID -- or no PID, as a hand-written
+    // flag does -- and was written at or after this process started
+    // (xop/util/shutdown_flag.hpp). One for another PID, an older one or a
+    // malformed one is removed and never inherited; one that cannot be judged
+    // (unreadable, or its age or this PID unknown) is left in place. The
+    // pre-fix "any flag under 60 s old" rule let engine 11616 honour a request
+    // written for the engine a new GUI had just killed. The constructor sweeps
+    // once (BootSweep: discard, never stop); the fast poll, the analysis poll
+    // and the boot checkpoints act on it (Checkpoint).
     std::filesystem::path shutdown_flag_path_;
     util::ProcessIdentity process_identity_{};
     /// An undecidable flag (Keep) is warned about once per appearance.
