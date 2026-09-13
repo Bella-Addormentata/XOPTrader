@@ -31,6 +31,7 @@
 #include "xop/execution/take_retry.hpp"
 #include "xop/execution/cancel_retry.hpp"
 #include "xop/execution/coin_pool_verdict.hpp"
+#include "xop/execution/stuck_prune_scope.hpp"
 #include "xop/execution/wallet_circuit.hpp"
 #include "xop/strategy/tier_gain.hpp"
 #include "xop/strategy/competitiveness_gate.hpp"
@@ -2213,23 +2214,42 @@ asio::awaitable<void> Engine::poll_loop_coro()
                              "transactions wallet-wide, which would take a "
                              "live engine's pending spends with it.");
             } else {
-                std::vector<std::int64_t> wallet_ids;
+                // [PRUNE-SCOPE 2026-09-13] Build the wallet-ID map FIRST.
+                // This list used to be built from an empty map, where
+                // resolve_wallet_id() answers 1 for "xch" and -1 for every
+                // CAT, and a `> 0` filter then dropped the CATs without a
+                // word: at 23:24:25.792 on 2026-09-12 the scan visited wallet
+                // 1 alone, and the map was not built until 23:24:27.548 (by
+                // the ensure_wallet_ids() before the inventory seed, which is
+                // a no-op once this call has succeeded).
+                co_await offer_mgr_->ensure_wallet_ids();
+
+                std::vector<std::int64_t> prune_candidates;
                 for (const auto& pair : config_.pairs) {
                     if (!pair.enabled) continue;
-                    auto bwid = offer_mgr_->resolve_wallet_id(pair.base_asset_id);
-                    auto qwid = offer_mgr_->resolve_wallet_id(pair.quote_asset_id);
-                    if (bwid > 0) wallet_ids.push_back(bwid);
-                    if (qwid > 0) wallet_ids.push_back(qwid);
+                    prune_candidates.push_back(
+                        offer_mgr_->resolve_wallet_id(pair.base_asset_id));
+                    prune_candidates.push_back(
+                        offer_mgr_->resolve_wallet_id(pair.quote_asset_id));
                 }
-                // Deduplicate wallet IDs.
-                std::sort(wallet_ids.begin(), wallet_ids.end());
-                wallet_ids.erase(
-                    std::unique(wallet_ids.begin(), wallet_ids.end()),
-                    wallet_ids.end());
+                // execution/stuck_prune_scope.hpp: an unbuilt map DEFERS the
+                // whole scan instead of shrinking it to whatever resolved.
+                const execution::PruneScope boot_scope =
+                    execution::stuck_prune_scope(
+                        offer_mgr_->wallet_ids_resolved(), prune_candidates);
 
-                if (!wallet_ids.empty()) {
+                if (!boot_scope.complete) {
+                    spdlog::warn("[Engine] [PRUNE-SCOPE] Startup stuck-"
+                                 "transaction prune SKIPPED: the wallet-ID "
+                                 "map could not be built, so the enabled "
+                                 "pairs' CAT wallets cannot be named, and "
+                                 "scanning only what resolved would scan the "
+                                 "XCH wallet alone. Step 8's periodic prune "
+                                 "still covers wallets that report pending "
+                                 "change.");
+                } else if (!boot_scope.scan.empty()) {
                     auto pruned = co_await offer_mgr_->prune_stuck_transactions(
-                        wallet_ids, 600);
+                        boot_scope.scan, 600);
                     if (pruned > 0) {
                         spdlog::info("[Engine] Startup: pruned stuck transactions "
                                      "from {} wallet(s)", pruned);
