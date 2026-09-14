@@ -48,6 +48,7 @@
 #include "xop/rpc/tibetswap_client.hpp"
 
 // Execution layer
+#include "xop/execution/cancel_escalation.hpp"
 #include "xop/execution/coin_manager.hpp"
 #include "xop/execution/market_data.hpp"
 #include "xop/execution/offer_manager.hpp"
@@ -1172,11 +1173,11 @@ private:
     // Written after the failure instead, a hard kill in the window between
     // would lose it and we would be fail-open again by a slightly later route.
     //
-    // A file rather than a DB column: offer_log has no such status today,
-    // query_pending_offers() filters on status='pending' exactly, and a row
-    // moved to some new status would vanish from the restore at boot -- a
-    // schema change whose failure mode is worse than the bug. The file is
-    // additive and the DB rows keep their existing meaning.
+    // A file rather than a DB column, and still a file after [S14]: offer_log
+    // now has a 'cancel_pending' status, and query_pending_offers() restores
+    // it, but that status records a SUBMITTED cancel. This file records an
+    // ORDERED one -- written before the first attempt -- which is exactly the
+    // half a hard kill between the order and the RPC would otherwise lose.
     std::filesystem::path cancel_intent_path_;
     /// The pre-review name. Read once at boot if the current path is absent,
     /// so an intent file written by an older build is not silently orphaned.
@@ -1251,6 +1252,39 @@ private:
     /// CYCLES, which is the point: this is what stops the shutdown failure
     /// from simply moving to boot time.
     asio::awaitable<void> sweep_cancel_intent(BlockHeight block);
+
+    // -- [S14 2026-09-13] Proof-gated escalation of stranded cancels ----------
+    //
+    // Owns every cancel_pending offer.  An accepted cancel is a submission,
+    // and the wallet can sit in PENDING_CANCEL indefinitely with the offer
+    // still takeable; nothing else re-cancels such an offer (cancel_stale and
+    // selective_cancel skip cancel_pending by design).  Runs from
+    // poll_loop_coro right after sweep_cancel_intent, above the Step 7/8 gate
+    // chain, on the same terms: it posts nothing, and it pays a fee only when
+    // the wallet reports the trade live AND the full node shows every maker
+    // coin unspent.  The decisions live in execution/cancel_escalation.hpp.
+    asio::awaitable<void> escalate_stuck_cancels(BlockHeight block);
+    /// Send the queued CancelUnresolved alert when its window is open, and
+    /// mark exactly the offers it names as alerted.
+    void flush_cancel_unresolved_alerts();
+    /// Per-offer escalation state.  In memory; the escalation COUNT and the
+    /// highest escalation FEE are re-seeded from offer_closure_events at first
+    /// sighting, so a restart grants neither a fresh ladder nor a bid that
+    /// only repeats the last one.
+    std::unordered_map<std::string, execution::CancelEscalationTrack>
+        cancel_escalation_tracks_;
+    /// Offers waiting to be named in a CancelUnresolved alert.
+    execution::UnresolvedAlertQueue cancel_unresolved_alerts_{};
+    /// [S14] Step 8 stuck summary: logged on a count change or every
+    /// kStuckSummaryLogIntervalBlocks, not every block.
+    struct StuckLogState {
+        std::size_t last_count{0};
+        BlockHeight last_logged_block{0};
+    };
+    std::unordered_map<std::string, StuckLogState> stuck_log_state_;
+    /// [S14] The S46 "cancel spend already in flight" count last logged, so
+    /// that line is written on a change rather than every heartbeat.
+    std::size_t s46_awaiting_logged_{0};
     /// [S28] Which RPC answers "what block is it?", re-decided every poll.
     ///
     /// This is the TRANSITION STATE: the streak counters and the hysteresis

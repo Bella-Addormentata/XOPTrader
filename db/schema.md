@@ -163,6 +163,7 @@ reorg-defence tooling.
 | `closure_reason` | TEXT    | Mirrors `offer_log.cancel_reason` when set     |
 | `resolved_block` | INTEGER |                                                |
 | `created_at`     | TEXT    |                                                |
+| `fee_mojos`      | INTEGER | Fee a `cancel_escalation_N` event recorded before that fee was paid; NULL on every other event. Added by migration, so it follows `created_at` |
 
 Stuck cancels (offers cancelled because they got wedged in the wallet) are
 already emitted here via `update_offer_status(..., "stuck")`.

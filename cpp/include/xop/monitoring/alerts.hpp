@@ -125,6 +125,14 @@ enum class AlertRule : std::uint8_t {
                                // rate-limited away by unrelated warnings --
                                // the operator just clicked Save and is
                                // watching for exactly this message.
+    CancelUnresolved     = 21, // [S14] A cancel_pending offer is unresolved:
+                               // maker coins proven unspent after the
+                               // escalation cap (STILL TAKEABLE), a re-cancel
+                               // that keeps failing, or no proof either way
+                               // for the full ladder. Its own rule so no
+                               // other CRITICAL alert's cooldown can swallow
+                               // it; the engine itself sends at most one per
+                               // 65 s and names every offer.
 
     LedgerDivergence     = 16  // Books and wallet disagree beyond tolerance.
                                // Its own rule so accounting noise can never

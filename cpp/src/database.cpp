@@ -29,6 +29,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -340,7 +341,7 @@ constexpr const char* kQueryPendingOffers = R"SQL(
 SELECT offer_id, pair_name, side, price_mojos, size_mojos, tier,
        status, created_block, fee_mojos
 FROM offer_log
-WHERE status = 'pending'
+WHERE status IN ('pending', 'cancel_pending')
 ORDER BY created_block ASC;
 )SQL";
 
@@ -354,17 +355,38 @@ WHERE offer_id = ?
 LIMIT 1;
 )SQL";
 
+// [S14] resolved_at stays NULL while the offer is unresolved: 'pending', or
+// 'cancel_pending' (a cancel was submitted, nothing has confirmed).
 constexpr const char* kUpdateOfferStatus = R"SQL(
 UPDATE offer_log
-SET status = ?, resolved_block = ?, resolved_at = CURRENT_TIMESTAMP, cancel_reason = ?
-WHERE offer_id = ?;
+SET status = ?1,
+    resolved_block = ?2,
+    resolved_at = CASE WHEN ?1 IN ('pending', 'cancel_pending')
+                       THEN NULL ELSE CURRENT_TIMESTAMP END,
+    cancel_reason = ?3
+WHERE offer_id = ?4;
+)SQL";
+
+// [S14] The earliest height a cancel of this offer was submitted at: the
+// first status_update that moved it to 'cancel_pending' (or, for a row the
+// old code stamped at submit time, to 'cancelled').  Used when a terminal
+// verdict's writer knows no height -- the S46 writers pass 0.
+constexpr const char* kQueryCancelSubmitBlock = R"SQL(
+SELECT resolved_block
+FROM offer_closure_events
+WHERE offer_id = ?1
+  AND event_type = 'status_update'
+  AND observed_status IN ('cancel_pending', 'cancelled')
+  AND COALESCE(resolved_block, 0) > 0
+ORDER BY id ASC
+LIMIT 1;
 )SQL";
 
 constexpr const char* kInsertOfferClosureEvent = R"SQL(
 INSERT INTO offer_closure_events
     (offer_id, pair_name, event_type, previous_status, observed_status,
-     closure_reason, resolved_block)
-VALUES (?, ?, ?, ?, ?, ?, ?);
+     closure_reason, resolved_block, fee_mojos)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?);
 )SQL";
 
 constexpr const char* kInsertSnapshot = R"SQL(
@@ -474,6 +496,7 @@ Database::Database(const std::string& db_path)
     stmt_query_pending_      = prepare(kQueryPendingOffers);
     stmt_query_offer_status_ = prepare(kQueryOfferStatus);
     stmt_update_offer_       = prepare(kUpdateOfferStatus);
+    stmt_query_cancel_submit_block_ = prepare(kQueryCancelSubmitBlock);
     stmt_insert_offer_closure_event_ = prepare(kInsertOfferClosureEvent);
     stmt_insert_snapshot_    = prepare(kInsertSnapshot);
     stmt_last_snapshot_      = prepare(kLastSnapshot);
@@ -504,6 +527,7 @@ Database::~Database()
     finalize(stmt_query_pending_);
     finalize(stmt_query_offer_status_);
     finalize(stmt_update_offer_);
+    finalize(stmt_query_cancel_submit_block_);
     finalize(stmt_insert_offer_closure_event_);
     finalize(stmt_insert_snapshot_);
     finalize(stmt_last_snapshot_);
@@ -651,7 +675,7 @@ std::vector<DbOfferRecord> Database::query_pending_offers() const
         rec.price_mojos   = sqlite3_column_int64(stmt_query_pending_, 3);
         rec.size_mojos    = sqlite3_column_int64(stmt_query_pending_, 4);
         rec.tier          = static_cast<int>(sqlite3_column_int64(stmt_query_pending_, 5));
-        // Column 6 is `status` (always the literal 'pending' given the WHERE
+        // Column 6 is `status` ('pending' or 'cancel_pending' given the WHERE
         // clause), 7 is created_block, 8 is fee_mojos.
         //
         // [FEE-INDEX-FIX 2026-07-30] These two used to read columns 6 and 7,
@@ -660,7 +684,9 @@ std::vector<DbOfferRecord> Database::query_pending_offers() const
         // the restored fee was unused, but FEE-FIX now propagates a restored
         // offer's fee into trade_log.fee_mojos, which would have booked
         // block heights as fees for every fill that settled during downtime.
-        rec.status        = "pending";
+        // [S14] The stored status, so a restored cancel_pending row stays one.
+        const char* p6 = reinterpret_cast<const char*>(sqlite3_column_text(stmt_query_pending_, 6));
+        rec.status        = p6 ? p6 : kOfferStatusPending;
         rec.created_block = static_cast<BlockHeight>(sqlite3_column_int64(stmt_query_pending_, 7));
         rec.fee_mojos     = static_cast<std::uint64_t>(sqlite3_column_int64(stmt_query_pending_, 8));
         results.push_back(std::move(rec));
@@ -672,10 +698,11 @@ std::vector<DbOfferRecord> Database::query_pending_offers() const
     return results;
 }
 
-void Database::update_offer_status(const std::string& offer_id,
-                                   const std::string& new_status,
-                                   BlockHeight        resolved_block,
-                                   const std::string& cancel_reason)
+void Database::update_offer_status(const std::string&           offer_id,
+                                   const std::string&           new_status,
+                                   BlockHeight                  resolved_block,
+                                   const std::string&           cancel_reason,
+                                   std::optional<std::uint64_t> fee_mojos)
 {
     std::lock_guard<std::mutex> lock(mtx_);
     bind_text(stmt_query_offer_status_, 1, offer_id);
@@ -739,9 +766,39 @@ void Database::update_offer_status(const std::string& offer_id,
         stored_reason.clear();
         should_update_offer_row = true;
         event_type = "status_update";
+    } else if (current_status == kOfferStatusCancelPending
+               && new_status == kOfferStatusCancelPending) {
+        // [S14] A repeat submit -- an escalation, an S46 re-cancel, a second
+        // writer.  The FIRST cause stays; only an empty one is filled in.
+        if (stored_reason.empty() && !cancel_reason.empty()) {
+            stored_reason = cancel_reason;
+            should_update_offer_row = true;
+            event_type = "status_update";
+        } else {
+            event_type = new_reason_is_reconcile
+                ? "reconcile_observation"
+                : "status_observation";
+        }
+    } else if (current_status == kOfferStatusCancelPending
+               && (new_status == "cancelled" || new_status == "expired")) {
+        // [S14] A wallet verdict completes a submitted cancel.  The row keeps
+        // the cause that submitted it ("price_adverse(2.021%)"), not the
+        // verdict's generic "wallet reported terminal".  A writer that knows
+        // no height falls back to the height the cancel was submitted at.
+        stored_status = new_status;
+        stored_resolved_block = (resolved_block != 0)
+            ? resolved_block
+            : first_cancel_submit_block_locked(offer_id);
+        stored_reason = current_reason.empty() ? cancel_reason : current_reason;
+        should_update_offer_row = true;
+        event_type = "status_update";
     } else if (!is_terminal_status(current_status)) {
         stored_status = new_status;
-        stored_resolved_block = resolved_block;
+        // [S14] A submitted cancel has resolved nothing: the ROW keeps
+        // resolved_block 0, while the closure event records the height.
+        stored_resolved_block = (new_status == kOfferStatusCancelPending)
+            ? BlockHeight{0}
+            : resolved_block;
         stored_reason = cancel_reason;
         should_update_offer_row = true;
         event_type = "status_update";
@@ -798,12 +855,211 @@ void Database::update_offer_status(const std::string& offer_id,
     bind_text  (stmt_insert_offer_closure_event_, 5, new_status);
     bind_text  (stmt_insert_offer_closure_event_, 6, cancel_reason);
     bind_int64 (stmt_insert_offer_closure_event_, 7, static_cast<std::int64_t>(resolved_block));
+    if (fee_mojos.has_value()) {
+        // SQLite stores a signed 64-bit integer: saturate rather than wrap.
+        const auto max_storable =
+            static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
+        bind_int64(stmt_insert_offer_closure_event_, 8,
+                   static_cast<std::int64_t>(*fee_mojos > max_storable ? max_storable
+                                                                       : *fee_mojos));
+    } else {
+        bind_null(stmt_insert_offer_closure_event_, 8);
+    }
     step_and_reset(stmt_insert_offer_closure_event_);
 
     spdlog::debug("[Database] Offer '{}' status='{}' -> '{}' event='{}' "
                   "stored_reason='{}' observed_reason='{}'",
                   offer_id, current_status, stored_status, event_type,
                   stored_reason, cancel_reason);
+}
+
+// ---------------------------------------------------------------------------
+// [S14 2026-09-13] cancel_pending: an accepted cancel is a submission
+// ---------------------------------------------------------------------------
+
+BlockHeight Database::first_cancel_submit_block_locked(const std::string& offer_id)
+{
+    bind_text(stmt_query_cancel_submit_block_, 1, offer_id);
+    BlockHeight block = 0;
+    if (sqlite3_step(stmt_query_cancel_submit_block_) == SQLITE_ROW) {
+        block = static_cast<BlockHeight>(
+            sqlite3_column_int64(stmt_query_cancel_submit_block_, 0));
+    }
+    sqlite3_reset(stmt_query_cancel_submit_block_);
+    sqlite3_clear_bindings(stmt_query_cancel_submit_block_);
+    return block;
+}
+
+void Database::mark_offer_cancel_submitted(const std::string&           offer_id,
+                                           BlockHeight                  submit_block,
+                                           const std::string&           reason,
+                                           std::optional<std::uint64_t> fee_mojos)
+{
+    update_offer_status(offer_id, kOfferStatusCancelPending, submit_block, reason,
+                        fee_mojos);
+}
+
+std::optional<std::string> Database::query_offer_status(
+    const std::string& offer_id) const
+{
+    std::lock_guard<std::mutex> lock(mtx_);
+    bind_text(stmt_query_offer_status_, 1, offer_id);
+    const int rc = sqlite3_step(stmt_query_offer_status_);
+    if (rc == SQLITE_DONE) {
+        sqlite3_reset(stmt_query_offer_status_);
+        sqlite3_clear_bindings(stmt_query_offer_status_);
+        return std::nullopt;
+    }
+    if (rc != SQLITE_ROW) {
+        const std::string db_error =
+            db_ ? sqlite3_errmsg(db_) : "no database handle";
+        sqlite3_reset(stmt_query_offer_status_);
+        sqlite3_clear_bindings(stmt_query_offer_status_);
+        throw std::runtime_error(
+            "[Database] query_offer_status: step failed for id '" + offer_id
+            + "': rc=" + std::to_string(rc) + " (" + db_error + ")");
+    }
+    const char* status_text = reinterpret_cast<const char*>(
+        sqlite3_column_text(stmt_query_offer_status_, 1));
+    std::string status = status_text ? status_text : "";
+    sqlite3_reset(stmt_query_offer_status_);
+    sqlite3_clear_bindings(stmt_query_offer_status_);
+    return status;
+}
+
+bool Database::reopen_cancelled_as_cancel_pending(const std::string& offer_id,
+                                                  BlockHeight        observed_block,
+                                                  const std::string& reason)
+{
+    std::lock_guard<std::mutex> lock(mtx_);
+    bind_text(stmt_query_offer_status_, 1, offer_id);
+    const int rc = sqlite3_step(stmt_query_offer_status_);
+    if (rc != SQLITE_ROW) {
+        const std::string db_error =
+            db_ ? sqlite3_errmsg(db_) : "no database handle";
+        sqlite3_reset(stmt_query_offer_status_);
+        sqlite3_clear_bindings(stmt_query_offer_status_);
+        if (rc == SQLITE_DONE) {
+            throw OfferNotFound(
+                "[Database] reopen_cancelled_as_cancel_pending: no offer found "
+                "with id '" + offer_id + "'");
+        }
+        throw std::runtime_error(
+            "[Database] reopen_cancelled_as_cancel_pending: step failed for id '"
+            + offer_id + "': rc=" + std::to_string(rc) + " (" + db_error + ")");
+    }
+    const char* pair_text = reinterpret_cast<const char*>(
+        sqlite3_column_text(stmt_query_offer_status_, 0));
+    const char* status_text = reinterpret_cast<const char*>(
+        sqlite3_column_text(stmt_query_offer_status_, 1));
+    const char* reason_text = reinterpret_cast<const char*>(
+        sqlite3_column_text(stmt_query_offer_status_, 3));
+    const std::string pair_name = pair_text ? pair_text : "";
+    const std::string current_status = status_text ? status_text : "";
+    const std::string current_reason = reason_text ? reason_text : "";
+    sqlite3_reset(stmt_query_offer_status_);
+    sqlite3_clear_bindings(stmt_query_offer_status_);
+
+    if (current_status != "cancelled") {
+        return false;
+    }
+
+    bind_text  (stmt_update_offer_, 1, kOfferStatusCancelPending);
+    bind_int64 (stmt_update_offer_, 2, 0);
+    bind_text  (stmt_update_offer_, 3, current_reason);
+    bind_text  (stmt_update_offer_, 4, offer_id);
+    step_and_reset(stmt_update_offer_);
+    if (sqlite3_changes(db_) == 0) {
+        throw std::runtime_error(
+            "[Database] reopen_cancelled_as_cancel_pending: no offer found with "
+            "id '" + offer_id + "'");
+    }
+
+    bind_text  (stmt_insert_offer_closure_event_, 1, offer_id);
+    bind_text  (stmt_insert_offer_closure_event_, 2, pair_name);
+    bind_text  (stmt_insert_offer_closure_event_, 3, "reopen_observation");
+    bind_text  (stmt_insert_offer_closure_event_, 4, current_status);
+    bind_text  (stmt_insert_offer_closure_event_, 5, kOfferStatusCancelPending);
+    bind_text  (stmt_insert_offer_closure_event_, 6, reason);
+    bind_int64 (stmt_insert_offer_closure_event_, 7,
+                static_cast<std::int64_t>(observed_block));
+    bind_null  (stmt_insert_offer_closure_event_, 8);
+    step_and_reset(stmt_insert_offer_closure_event_);
+
+    spdlog::info("[Database] Offer '{}' reopened: 'cancelled' -> 'cancel_pending' "
+                 "(kept cause '{}', observed '{}')",
+                 offer_id, current_reason, reason);
+    return true;
+}
+
+std::uint32_t Database::count_cancel_escalations(const std::string& offer_id) const
+{
+    static constexpr const char* kSelect = R"SQL(
+        SELECT COUNT(*)
+        FROM offer_closure_events
+        WHERE offer_id = ?1
+          AND substr(COALESCE(closure_reason, ''), 1, 18) = 'cancel_escalation_';
+    )SQL";
+
+    std::lock_guard<std::mutex> lock(mtx_);
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, kSelect, -1, &stmt, nullptr) != SQLITE_OK) {
+        throw std::runtime_error(
+            std::string{"[Database] count_cancel_escalations: prepare failed: "}
+            + (db_ ? sqlite3_errmsg(db_) : "no database handle"));
+    }
+    sqlite3_bind_text(stmt, 1, offer_id.c_str(), -1, SQLITE_TRANSIENT);
+    const int rc = sqlite3_step(stmt);
+    std::int64_t count = 0;
+    if (rc == SQLITE_ROW) {
+        count = sqlite3_column_int64(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_ROW) {
+        throw std::runtime_error(
+            "[Database] count_cancel_escalations: step failed for id '"
+            + offer_id + "': rc=" + std::to_string(rc));
+    }
+    if (count <= 0) {
+        return 0;
+    }
+    if (count > static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max())) {
+        return std::numeric_limits<std::uint32_t>::max();
+    }
+    return static_cast<std::uint32_t>(count);
+}
+
+std::uint64_t Database::max_cancel_escalation_fee(const std::string& offer_id) const
+{
+    // The events count_cancel_escalations counts.  MAX skips the NULL fee of
+    // an event written without one.
+    static constexpr const char* kSelect = R"SQL(
+        SELECT COALESCE(MAX(fee_mojos), 0)
+        FROM offer_closure_events
+        WHERE offer_id = ?1
+          AND substr(COALESCE(closure_reason, ''), 1, 18) = 'cancel_escalation_';
+    )SQL";
+
+    std::lock_guard<std::mutex> lock(mtx_);
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, kSelect, -1, &stmt, nullptr) != SQLITE_OK) {
+        throw std::runtime_error(
+            std::string{"[Database] max_cancel_escalation_fee: prepare failed: "}
+            + (db_ ? sqlite3_errmsg(db_) : "no database handle"));
+    }
+    sqlite3_bind_text(stmt, 1, offer_id.c_str(), -1, SQLITE_TRANSIENT);
+    const int rc = sqlite3_step(stmt);
+    std::int64_t fee = 0;
+    if (rc == SQLITE_ROW) {
+        fee = sqlite3_column_int64(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_ROW) {
+        throw std::runtime_error(
+            "[Database] max_cancel_escalation_fee: step failed for id '"
+            + offer_id + "': rc=" + std::to_string(rc));
+    }
+    return fee > 0 ? static_cast<std::uint64_t>(fee) : std::uint64_t{0};
 }
 
 // ===========================================================================
@@ -1722,6 +1978,13 @@ void Database::run_migrations()
     sqlite3_exec(db_, "ALTER TABLE offer_log ADD COLUMN book_best_ask INTEGER DEFAULT 0;",
                  nullptr, nullptr, nullptr);
 
+    // [S14] The fee a cancel escalation recorded before paying it
+    // (max_cancel_escalation_fee); NULL on every other event.  Added only here,
+    // not in kCreateOfferClosureEvents, so a fresh database -- every test --
+    // takes the same path an existing one does.
+    sqlite3_exec(db_, "ALTER TABLE offer_closure_events ADD COLUMN fee_mojos INTEGER;",
+                 nullptr, nullptr, nullptr);
+
     // Phase 2: strategy decision parameters on snapshots table.
     sqlite3_exec(db_, "ALTER TABLE snapshots ADD COLUMN reservation_price_mojos INTEGER DEFAULT 0;",
                  nullptr, nullptr, nullptr);
@@ -1797,6 +2060,15 @@ void Database::bind_double(sqlite3_stmt* stmt, int index, double val)
     int rc = sqlite3_bind_double(stmt, index, val);
     if (rc != SQLITE_OK) {
         throw std::runtime_error("[Database] bind_double failed at index " +
+                                 std::to_string(index));
+    }
+}
+
+void Database::bind_null(sqlite3_stmt* stmt, int index)
+{
+    int rc = sqlite3_bind_null(stmt, index);
+    if (rc != SQLITE_OK) {
+        throw std::runtime_error("[Database] bind_null failed at index " +
                                  std::to_string(index));
     }
 }

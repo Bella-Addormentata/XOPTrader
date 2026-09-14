@@ -29,6 +29,7 @@
 #include "xop/execution/crossed_book.hpp"
 #include "xop/execution/take_sizing.hpp"
 #include "xop/execution/take_retry.hpp"
+#include "xop/execution/cancel_escalation_config.hpp"
 #include "xop/execution/cancel_retry.hpp"
 #include "xop/execution/coin_pool_verdict.hpp"
 #include "xop/execution/stuck_prune_scope.hpp"
@@ -1885,12 +1886,19 @@ void Engine::shutdown()
                 // Shutdown is our last chance to update the audit trail; stale
                 // "pending" records cause ghost offers on next startup.  Retry
                 // up to 3 times with short delays before giving up.
+                //
+                // [S14] 'cancel_pending', not 'cancelled': the wallet accepted
+                // these cancels and nothing has confirmed. The next engine
+                // restores the rows cancel_pending, and the wallet verdict (or
+                // the escalation) finishes them.
+                const BlockHeight shutdown_block =
+                    last_block_.load(std::memory_order_relaxed);
                 for (const auto& oid : shutdown_cancelled) {
                     bool persisted = false;
                     for (int attempt = 0; attempt < 3 && !persisted; ++attempt) {
                         try {
-                            db_->update_offer_status(oid, "cancelled", 0,
-                                                    "shutdown");
+                            db_->mark_offer_cancel_submitted(oid, shutdown_block,
+                                                             "shutdown");
                             persisted = true;
                         } catch (const std::exception& e) {
                             spdlog::warn("[Engine] shutdown update_offer_status "
@@ -2125,18 +2133,15 @@ asio::awaitable<void> Engine::poll_loop_coro()
                 }
             }
 
-            // Mark cancelled orphans in the DB.  Adopted orphans were
-            // already upserted into State by startup_reconcile; persist
-            // them to the DB as well so they survive the next restart.
-            for (const auto& oid : orphans) {
-                try {
-                    db_->update_offer_status(oid, "cancelled", 0,
-                                            "startup_orphan");
-                } catch (const std::exception& e) {
-                    spdlog::debug("[Engine] startup_reconcile update_offer_status "
-                                 "failed for {}: {}",
-                                 oid.substr(0, 12), e.what());
-                }
+            // [S14] Cancelled orphans are no longer stamped 'cancelled'. The
+            // cancel was only SUBMITTED: startup_reconcile adopts each one into
+            // State flagged cancel_pending, and the persist loop below writes
+            // its row as 'cancel_pending'. (The old stamp never landed either:
+            // an orphan has no offer_log row, so it threw OfferNotFound.)
+            if (!orphans.empty()) {
+                spdlog::info("[Engine] [S14] {} orphan(s) cancelled at boot -- "
+                             "tracked as cancel_pending until the wallet "
+                             "reports them terminal", orphans.size());
             }
 
             // Persist adopted orphans so they show up as DB-pending on
@@ -2154,10 +2159,15 @@ asio::awaitable<void> Engine::poll_loop_coro()
                         rec.price_mojos   = po.price;
                         rec.size_mojos    = po.size;
                         rec.tier          = static_cast<int>(po.tier);
-                        rec.status        = "pending";
+                        rec.status        = db_status_for(po);
                         rec.created_block = po.created_at_block;
                         rec.fee_mojos     = po.fee_mojos;
                         db_->insert_offer(rec);
+                        if (po.cancel_pending) {
+                            // The row's cause and an event.
+                            db_->mark_offer_cancel_submitted(
+                                po.offer_id, startup_block, "startup_orphan");
+                        }
                     } catch (const std::exception& e) {
                         spdlog::debug("[Engine] Failed to persist adopted "
                                       "orphan {}: {}",
@@ -2171,15 +2181,8 @@ asio::awaitable<void> Engine::poll_loop_coro()
                 if (!known_ids.count(rec.offer_id)) {
                     continue;  // Was cancelled as orphan somehow.
                 }
-                PendingOffer po;
-                po.offer_id        = rec.offer_id;
-                po.pair_name       = rec.pair_name;
-                po.side            = (rec.side == "bid") ? Side::Bid : Side::Ask;
-                po.price           = rec.price_mojos;
-                po.size            = rec.size_mojos;
-                po.tier            = static_cast<std::uint8_t>(rec.tier);
-                po.created_at_block = rec.created_block;
-                po.fee_mojos       = rec.fee_mojos;
+                // [S14] A 'cancel_pending' row comes back cancel_pending.
+                const PendingOffer po = pending_offer_from_db(rec);
                 state_->upsert_offer(po);
 
                 // [STOPDRAIN review #2] An offer restored for a pair that
@@ -2201,6 +2204,105 @@ asio::awaitable<void> Engine::poll_loop_coro()
             if (!db_pending.empty()) {
                 spdlog::info("[Engine] Restored {} pending offers from DB into State",
                              db_pending.size());
+            }
+
+            // -- [S14 2026-09-13] Wallet PENDING_CANCEL records -----------------
+            // startup_reconcile keeps every PENDING_CANCEL trade its wallet scan
+            // saw. Each is matched to offer_log:
+            //   'pending'        the cancel was never recorded: mark it;
+            //   'cancel_pending' restored above: make sure State agrees;
+            //   'cancelled'      stamped at RPC acceptance while the wallet never
+            //                    finished it (the XCH/BYC bids of 2026-08-30):
+            //                    reopen the row and adopt the offer, so
+            //                    detect_fills polls it and a take is booked;
+            //   no row           not a bot offer: left alone (policy boundary).
+            // From here the escalation owns them. No RPC: Phase 1 kept each
+            // record, so adoption parses it rather than asking the wallet again
+            // while the watchdog is already armed.
+            if (!dry_run_) {
+                std::size_t pc_not_ours = 0;
+                std::size_t pc_marked = 0;
+                std::size_t pc_already = 0;
+                std::vector<std::string> pc_reopened;
+                for (const auto& pc : offer_mgr_->last_wallet_pending_cancel()) {
+                    std::optional<std::string> pc_db_status;
+                    try {
+                        pc_db_status = db_->query_offer_status(pc.trade_id);
+                    } catch (const std::exception& e) {
+                        spdlog::warn("[Engine] [S14] could not read offer_log for "
+                                     "wallet PENDING_CANCEL {}: {} -- left for "
+                                     "the next boot", pc.trade_id, e.what());
+                        continue;
+                    }
+                    switch (execution::startup_pending_cancel_action(pc_db_status)) {
+                        case execution::StartupPendingCancelAction::IgnoreNotOurs: {
+                            ++pc_not_ours;
+                            break;
+                        }
+                        case execution::StartupPendingCancelAction::MarkCancelPending: {
+                            offer_mgr_->adopt_wallet_pending_cancel(pc, startup_block);
+                            try {
+                                db_->mark_offer_cancel_submitted(
+                                    pc.trade_id, startup_block,
+                                    "wallet_pending_cancel_observed");
+                            } catch (const std::exception& e) {
+                                spdlog::warn("[Engine] [S14] could not mark {} "
+                                             "cancel_pending: {}",
+                                             pc.trade_id, e.what());
+                            }
+                            ++pc_marked;
+                            break;
+                        }
+                        case execution::StartupPendingCancelAction::AlreadyCancelPending: {
+                            offer_mgr_->adopt_wallet_pending_cancel(pc, startup_block);
+                            ++pc_already;
+                            break;
+                        }
+                        case execution::StartupPendingCancelAction::ReopenMislabelled: {
+                            bool reopened_row = false;
+                            try {
+                                reopened_row = db_->reopen_cancelled_as_cancel_pending(
+                                    pc.trade_id, startup_block,
+                                    "wallet_pending_cancel_recovered");
+                            } catch (const std::exception& e) {
+                                spdlog::warn("[Engine] [S14] could not reopen {}: {}",
+                                             pc.trade_id, e.what());
+                            }
+                            if (reopened_row) {
+                                offer_mgr_->adopt_wallet_pending_cancel(pc, startup_block);
+                                pc_reopened.push_back(pc.trade_id);
+                            }
+                            break;
+                        }
+                        case execution::StartupPendingCancelAction::Inconsistent: {
+                            spdlog::warn("[Engine] [S14] the wallet reports {} "
+                                         "PENDING_CANCEL but offer_log says '{}' "
+                                         "-- left alone",
+                                         pc.trade_id, pc_db_status.value_or(""));
+                            break;
+                        }
+                    }
+                }
+                if (!pc_reopened.empty()) {
+                    std::string reopened_ids;
+                    for (const auto& reopened_id : pc_reopened) {
+                        if (!reopened_ids.empty()) reopened_ids += ", ";
+                        reopened_ids += reopened_id;
+                    }
+                    spdlog::warn("[Engine] [S14] {} offer(s) were stamped "
+                                 "'cancelled' when their cancel RPC was accepted, "
+                                 "but the wallet still reports them PENDING_CANCEL "
+                                 "-- reopened as cancel_pending and tracked again "
+                                 "(a take is now booked; the escalation re-checks "
+                                 "the chain). IDS: {}",
+                                 pc_reopened.size(), reopened_ids);
+                }
+                if (pc_marked + pc_already + pc_not_ours > 0) {
+                    spdlog::info("[Engine] [S14] wallet PENDING_CANCEL at boot: {} "
+                                 "marked cancel_pending, {} already cancel_pending, "
+                                 "{} with no offer_log row (not ours; left alone)",
+                                 pc_marked, pc_already, pc_not_ours);
+                }
             }
 
             // [shutdown-flag-race] BC0. The prune below deletes unconfirmed
@@ -3930,6 +4032,18 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
         // intent set is unchanged by a throw, so the next heartbeat retries.
         spdlog::error("[Engine] [S46] intent sweep failed: {} -- the intent "
                       "set is retained and retried next heartbeat", e.what());
+    }
+
+    // [S14] Proof-gated escalation of stranded cancels, beside the intent
+    // sweep and for the same reason: the gates below mean "not trading",
+    // which is no reason to leave a cancel the chain never saw unanswered.
+    // It declines only the states it names itself (another cancel in flight,
+    // a wallet failing this cycle, XCH recovery, a fired dead man's switch).
+    // Step 2 has already run, so a fill that won the race is booked first.
+    try { co_await escalate_stuck_cancels(block_height); }
+    catch (const std::exception& e) {
+        spdlog::error("[Engine] [S14] cancel escalation sweep failed: {} -- "
+                      "retried next heartbeat", e.what());
     }
 
     // Gate Steps 7-8 when in XCH recovery mode (no market-making until
@@ -10150,7 +10264,11 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             // Filter to only stale offers.
             std::vector<PendingOffer> stale_offers;
             for (const auto& po : all_offers) {
-                if (block_height >= po.created_at_block + kMinOfferAgeBlocks) {
+                // [S14] Never a cancel_pending offer: its cancel is already
+                // out, and a zero-fee re-fire here cannot replace it. The
+                // escalation owns those.
+                if (!po.cancel_pending
+                    && block_height >= po.created_at_block + kMinOfferAgeBlocks) {
                     stale_offers.push_back(po);
                 }
             }
@@ -10159,8 +10277,9 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 // All offers are fresh -- don't cancel, just enter
                 // buy-only mode until they age or get filled.
                 spdlog::info("[Engine] UTXO liberation: spendable {:.6f} XCH "
-                             "< reserve {:.4f} XCH but all {} offers are "
-                             "younger than {} blocks -- XCH-buy-only mode",
+                             "< reserve {:.4f} XCH but none of {} offers is a "
+                             "candidate (younger than {} blocks, or already "
+                             "cancel-pending) -- XCH-buy-only mode",
                              static_cast<double>(xch_spendable_pre) / kMojosPerXch,
                              config_.strategy.fee_reserve_xch,
                              all_offers.size(),
@@ -10190,9 +10309,8 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 if (ok) {
                     state_->mark_cancel_pending(po.offer_id);
                     try {
-                        db_->update_offer_status(
-                            po.offer_id, "cancelled",
-                            block_height, "utxo_liberation");
+                        db_->mark_offer_cancel_submitted(
+                            po.offer_id, block_height, "utxo_liberation");
                     } catch (const std::exception& e) {
                         spdlog::debug("[Engine] UTXO liberation "
                                       "update_offer_status failed for "
@@ -10528,8 +10646,9 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     auto it = cancel_reasons.find(oid);
                     const std::string reason = (it != cancel_reasons.end())
                         ? it->second : "stale";
-                    db_->update_offer_status(oid, "cancelled", block_height,
-                                            reason);
+                    // [S14] Submitted, not cancelled: the wallet verdict (or
+                    // the escalation) finishes it.
+                    db_->mark_offer_cancel_submitted(oid, block_height, reason);
                 } catch (const std::exception& e) {
                     spdlog::debug("[Engine] update_offer_status failed for {}: {}",
                                  oid.substr(0, 12), e.what());
@@ -10557,23 +10676,43 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 * execution::OfferManager::kHardTtlMultiplier;
             const uint32_t stuck_threshold =
                 hard_ttl + config_.strategy.stuck_offer_age_blocks;
-            int stuck_count = 0;
+            // [S14] The counter and cancel_stale share ONE predicate. The
+            // counter used to include cancel_pending offers that cancel_stale
+            // skips, so "N stuck offers -- attempting forced cancel" fired
+            // every block and cancelled nothing (215 lines in four hours for
+            // five XCH/DBX offers). Those offers belong to the escalation.
+            std::size_t stuck_count = 0;
             for (const auto& po : all_offers) {
                 if (po.pair_name != pair_name) continue;
-                if (block_height > po.created_at_block &&
-                    (block_height - po.created_at_block) > stuck_threshold) {
+                if (execution::is_forced_cancel_candidate(
+                        po.cancel_pending, po.created_at_block, block_height,
+                        stuck_threshold)) {
                     ++stuck_count;
-                    spdlog::warn("[Engine] Stuck offer {} pair={} side={} tier={} "
-                                 "age={} blocks fee={} mojos",
-                                 po.offer_id.substr(0, 12), po.pair_name,
-                                 to_string(po.side), po.tier,
-                                 block_height - po.created_at_block,
-                                 po.fee_mojos);
+                    spdlog::debug("[Engine] Stuck offer {} pair={} side={} tier={} "
+                                  "age={} blocks fee={} mojos",
+                                  po.offer_id.substr(0, 12), po.pair_name,
+                                  to_string(po.side), po.tier,
+                                  block_height - po.created_at_block,
+                                  po.fee_mojos);
                 }
             }
+            auto& stuck_log = stuck_log_state_[pair_name];
+            if (execution::stuck_summary_log_due(
+                    stuck_log.last_count, stuck_count,
+                    stuck_log.last_logged_block, block_height)) {
+                if (stuck_count > 0) {
+                    spdlog::warn("[Engine] Step 8: {} stuck offers for {} -- "
+                                 "attempting forced cancel (logged on a change "
+                                 "or every {} blocks)", stuck_count, pair_name,
+                                 execution::kStuckSummaryLogIntervalBlocks);
+                } else {
+                    spdlog::info("[Engine] Step 8: no stuck offers remain for {}",
+                                 pair_name);
+                }
+                stuck_log.last_logged_block = block_height;
+            }
+            stuck_log.last_count = stuck_count;
             if (stuck_count > 0) {
-                spdlog::warn("[Engine] Step 8: {} stuck offers for {} -- "
-                             "attempting forced cancel", stuck_count, pair_name);
                 if (!wallet_step_may_run("Step 8 stuck-offer cancel")) {
                     co_return;
                 }
@@ -10581,15 +10720,15 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     pair_name, block_height, stuck_threshold);
                 for (const auto& oid : stuck_cancelled) {
                     try {
-                        db_->update_offer_status(oid, "cancelled", block_height,
-                                                "stuck");
+                        db_->mark_offer_cancel_submitted(oid, block_height,
+                                                         "stuck");
                     } catch (const std::exception& e) {
-                        spdlog::debug("[Engine] update_offer_status failed for {}: {}",
-                                     oid.substr(0, 12), e.what());
+                        spdlog::debug("[Engine] mark_offer_cancel_submitted failed "
+                                      "for {}: {}", oid.substr(0, 12), e.what());
                     }
                 }
             }
-            total_stuck_offers += stuck_count;
+            total_stuck_offers += static_cast<int>(stuck_count);
         }
 
         // -- Spendable reserve & pending-change gating ----------------------
@@ -11081,8 +11220,8 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                                  cancelled.size());
                                     for (const auto& oid : cancelled) {
                                         try {
-                                            db_->update_offer_status(
-                                                oid, "cancelled", block_height,
+                                            db_->mark_offer_cancel_submitted(
+                                                oid, block_height,
                                                 "exposure_floor_rebalance");
                                         } catch (...) {}
                                     }
@@ -11136,8 +11275,8 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                                  cancelled.size());
                                     for (const auto& oid : cancelled) {
                                         try {
-                                            db_->update_offer_status(
-                                                oid, "cancelled", block_height,
+                                            db_->mark_offer_cancel_submitted(
+                                                oid, block_height,
                                                 "exposure_floor_rebalance");
                                         } catch (...) {}
                                     }
@@ -11179,9 +11318,9 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                          pair_name, freed.size(), fresh_count);
                             for (const auto& oid : freed) {
                                 try {
-                                    db_->update_offer_status(oid, "cancelled",
-                                                            block_height,
-                                                            "suppressed_capital_free");
+                                    db_->mark_offer_cancel_submitted(
+                                        oid, block_height,
+                                        "suppressed_capital_free");
                                 } catch (...) {}
                             }
                         }
@@ -12602,6 +12741,10 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 if (id_it != tier_to_id.end()) {
                     // [T2-09] Use the actual wallet-assigned offer ID.
                     orec.offer_id = id_it->second;
+                    // [S14] post_quotes may already have cancelled this offer
+                    // (asymmetric ladder, late create, failed expiry) and
+                    // flagged it cancel_pending: persist what State says.
+                    orec.status = db_status_for(state_->get_offer(orec.offer_id));
                 } else {
                     // post_quotes may have skipped this tier due to a wallet
                     // RPC error (for example insufficient funds).  Do not
@@ -12614,6 +12757,16 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     continue;
                 }
                 db_->insert_offer(orec);
+                if (orec.status == kOfferStatusCancelPending) {
+                    try {
+                        db_->mark_offer_cancel_submitted(
+                            orec.offer_id, block_height, "post_quotes_retract");
+                    } catch (const std::exception& e) {
+                        spdlog::debug("[Engine] Step 8: could not record the "
+                                      "retract cause for {}: {}",
+                                      orec.offer_id.substr(0, 12), e.what());
+                    }
+                }
                 competitiveness_sum += orec.competitiveness_score;
                 queue_ahead_sum += orec.queue_ahead_score;
                 execution_quality_sum += orec.execution_quality_score;
@@ -12706,7 +12859,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                         rec.price_mojos   = po.price;
                         rec.size_mojos    = po.size;
                         rec.tier          = static_cast<int>(po.tier);
-                        rec.status        = "pending";
+                        rec.status        = db_status_for(po);
                         rec.created_block = po.created_at_block;
                         rec.fee_mojos     = po.fee_mojos;
                         db_->insert_offer(rec);
@@ -14985,10 +15138,19 @@ asio::awaitable<void> Engine::step_xch_recovery(BlockHeight block_height)
                          "pending offers");
             cancel_ok = true;
 
-            // Also mark all tracked offers as cancel_pending.
+            // Also mark all tracked offers as cancel_pending -- in State and,
+            // [S14], in offer_log: the bulk cancel was only submitted.
             auto tracked = state_->get_all_offers();
             for (const auto& po : tracked) {
                 state_->mark_cancel_pending(po.offer_id);
+                try {
+                    db_->mark_offer_cancel_submitted(po.offer_id, block_height,
+                                                     "xch_recovery");
+                } catch (const std::exception& e) {
+                    spdlog::debug("[Recovery] could not mark {} cancel_pending "
+                                  "in offer_log: {}", po.offer_id.substr(0, 12),
+                                  e.what());
+                }
             }
             spdlog::info("[Recovery] Marked {} offers as cancel_pending",
                          tracked.size());
@@ -19256,10 +19418,11 @@ asio::awaitable<void> Engine::step_sweep_stale_offers(BlockHeight block_height)
     // DRAIN FAILING chip text.
     std::size_t eligible = 0;
     for (const auto& po : state_->get_all_offers()) {
-        if (!po.cancel_pending
-            && block_height > po.created_at_block
-            && block_height - po.created_at_block
-                   > config_.strategy.offer_ttl_blocks) {
+        // [S14] cancel_stale's own predicate. The strict '>' here disagreed
+        // with cancel_stale's '>=' by one block.
+        if (execution::is_forced_cancel_candidate(
+                po.cancel_pending, po.created_at_block, block_height,
+                config_.strategy.offer_ttl_blocks)) {
             ++eligible;
         }
     }
@@ -19317,8 +19480,8 @@ asio::awaitable<void> Engine::step_sweep_stale_offers(BlockHeight block_height)
             total_cancelled += cancelled.size();
             for (const auto& oid : cancelled) {
                 try {
-                    db_->update_offer_status(oid, "cancelled", block_height,
-                                             "ttl_while_stopped");
+                    db_->mark_offer_cancel_submitted(oid, block_height,
+                                                     "ttl_while_stopped");
                 } catch (const std::exception& e) {
                     spdlog::debug("[Engine] [STOPDRAIN] update_offer_status "
                                   "failed for {}: {}", oid.substr(0, 12),
@@ -19360,9 +19523,8 @@ asio::awaitable<void> Engine::step_sweep_stale_offers(BlockHeight block_height)
                 total_cancelled += cancelled.size();
                 for (const auto& oid : cancelled) {
                     try {
-                        db_->update_offer_status(oid, "cancelled",
-                                                 block_height,
-                                                 "ttl_while_stopped");
+                        db_->mark_offer_cancel_submitted(oid, block_height,
+                                                         "ttl_while_stopped");
                     } catch (const std::exception& e) {
                         spdlog::debug("[Engine] [STOPDRAIN] "
                                       "update_offer_status failed for "
@@ -19775,11 +19937,18 @@ asio::awaitable<void> Engine::sweep_cancel_intent(BlockHeight block)
                      ids.size() - probed, ids.size());
     }
 
-    if (!awaiting.empty()) {
-        spdlog::info("[Engine] [S46] {} recovered intent offer(s) already "
-                     "have a cancel spend in flight -- waiting for it to "
-                     "confirm, NOT re-charging",
-                     awaiting.size());
+    // [S14] Logged when the count changes, not every heartbeat (613 lines in
+    // the last 60,000). A spend that never confirms is no longer waited on
+    // forever: escalate_stuck_cancels owns these offers.
+    if (awaiting.size() != s46_awaiting_logged_) {
+        if (!awaiting.empty()) {
+            spdlog::info("[Engine] [S46] {} recovered intent offer(s) already "
+                         "have a cancel spend in flight -- waiting for it to "
+                         "confirm, NOT re-charging (the cancel escalation "
+                         "re-checks the chain)",
+                         awaiting.size());
+        }
+        s46_awaiting_logged_ = awaiting.size();
     }
 
     // [WALLET-CIRCUIT] Nor is a re-cancel sent into a stall a probe just hit:
@@ -19812,6 +19981,13 @@ asio::awaitable<void> Engine::sweep_cancel_intent(BlockHeight block)
             spdlog::warn("[Engine] [S46] re-cancel SUBMITTED for {} -- kept "
                          "in the intent set until the wallet confirms it "
                          "terminal", id.substr(0, 12));
+            // [S14] Submitted, so offer_log says cancel_pending.
+            try {
+                db_->mark_offer_cancel_submitted(id, block, "s46_intent_recancel");
+            } catch (const std::exception& e) {
+                spdlog::debug("[Engine] [S46] could not mark {} cancel_pending: {}",
+                              id.substr(0, 12), e.what());
+            }
         }
         if (!oc.failed.empty()) {
             spdlog::error("[Engine] [S46] re-cancel failed for {} offer(s) "
@@ -19908,6 +20084,486 @@ bool Engine::wallet_step_may_run(std::string_view step)
             return false;
     }
     return false;
+}
+
+// ---------------------------------------------------------------------------
+// [S14 2026-09-13] escalate_stuck_cancels -- proof-gated re-cancel of offers
+// whose cancel the wallet accepted but the chain never saw.
+//
+// Every heartbeat, for each cancel_pending offer in State:
+//   * first sighting: anchor it and seed its escalation count, and the
+//     highest fee an escalation of it recorded, from offer_closure_events
+//     (the cap and the fee floor are per offer, not per process);
+//   * once due (execution::escalation_probe_due), probe it -- wallet
+//     get_offer, then the full node's coin records for its coins_of_interest
+//     -- oldest anchor first, at most max_probes_per_sweep per heartbeat;
+//   * act on execution::decide_cancel_escalation: wait, back off, re-cancel
+//     SECURE at execution::escalation_fee_mojos, or queue ONE alert.
+//
+// FAIL CLOSED.  No wallet answer, no complete chain answer, or an answer
+// that cannot be read means nothing is paid and nothing is stamped terminal.
+// A spent maker coin can be a FILL, so the chain is never used to write a
+// terminal status: the wallet verdict remains the only one.
+//
+// WATCHDOG.  last_beat_ms_ is stamped only when a cycle completes, and one
+// hanging rpc_post costs ~123 s against watchdog_stall_seconds (600 s).  So
+// the sweep stops at the FIRST failed RPC of any kind, is skipped entirely
+// when Step 2 failed this cycle, and checks a wall-clock budget before each
+// probe.  The dead man's switch itself runs on another thread, so its flag is
+// re-read with the other asynchronous gates before every candidate and every
+// fee (execution::escalation_must_yield).
+//
+// WRITE AHEAD.  Each escalation records its cancel_escalation_N event, with the
+// fee it is about to pay, BEFORE the fee-bearing call, and pays nothing when
+// that record cannot be written.  A submission that then fails still counts
+// after a restart: fewer paid attempts, never more.
+// ---------------------------------------------------------------------------
+namespace {
+
+/// compute_coin_name behind a catch: it throws on malformed hex and when an
+/// OpenSSL digest step fails.  Either way there is no name, and a missing
+/// name voids the proof.
+std::string s14_coin_name(const execution::CoinRef& ref)
+{
+    try {
+        return execution::CoinManager::compute_coin_name(
+            ref.parent_hex, ref.puzzle_hash_hex, static_cast<Mojo>(ref.amount));
+    } catch (const std::exception&) {
+        return {};
+    }
+}
+
+std::int64_t s14_steady_now_ms()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+void s14_bump(std::uint32_t& counter) noexcept
+{
+    if (counter != std::numeric_limits<std::uint32_t>::max()) {
+        ++counter;
+    }
+}
+
+execution::UnresolvedAlertEntry s14_alert_entry(const std::string&          offer_id,
+                                               const std::string&          pair_name,
+                                               std::uint32_t               escalations,
+                                               execution::UnresolvedReason reason,
+                                               std::string                 detail)
+{
+    execution::UnresolvedAlertEntry entry;
+    entry.offer_id    = offer_id;
+    entry.pair_name   = pair_name;
+    entry.escalations = escalations;
+    entry.reason      = reason;
+    entry.detail      = std::move(detail);
+    return entry;
+}
+
+}  // namespace
+
+void Engine::flush_cancel_unresolved_alerts()
+{
+    auto batch = cancel_unresolved_alerts_.take_due(
+        s14_steady_now_ms(), execution::kMaxIdsPerCancelUnresolvedAlert);
+    if (batch.empty()) {
+        return;
+    }
+    const std::string message = execution::format_cancel_unresolved_alert(
+        batch, cancel_unresolved_alerts_.size());
+    spdlog::critical("[Engine] {}", message);
+    if (alerts_) {
+        alerts_->send_alert(AlertRule::CancelUnresolved, message);
+    }
+    for (const auto& entry : batch) {
+        const auto it = cancel_escalation_tracks_.find(entry.offer_id);
+        if (it != cancel_escalation_tracks_.end()) {
+            it->second.alerted = true;
+        }
+    }
+}
+
+asio::awaitable<void> Engine::escalate_stuck_cancels(BlockHeight block)
+{
+    if (!config_.strategy.cancel_escalation_enabled || dry_run_ || !offer_mgr_
+        || !wallet_ || !state_ || block == 0) {
+        co_return;
+    }
+    // Queued alerts go out whatever the gates below say: an alert touches no
+    // wallet, and "still takeable" must not wait for the wallet to recover.
+    flush_cancel_unresolved_alerts();
+
+    // [review, round 2] The gates another thread or a co_spawned coroutine can
+    // close while this sweep is suspended in an RPC -- the dead man's switch
+    // included.  Read here, before each candidate, and immediately before each
+    // fee-bearing call.
+    const auto async_gates = [this]() {
+        execution::EscalationAsyncGates gates;
+        gates.graceful_cancel_active =
+            graceful_cancel_active_.load(std::memory_order_acquire);
+        gates.cancel_all_inflight = cancel_all_inflight_;
+        gates.watchdog_fired      = watchdog_fired_.load(std::memory_order_acquire);
+        return gates;
+    };
+
+    // [review] The states this sweep declines to run in:
+    //  * graceful_cancel_active_ / cancel_all_inflight_ -- another cancel is
+    //    walking this book right now; a re-cancel underneath it pays a second
+    //    fee for one spend.
+    //  * wallet_circuit_open_ / wallet_consecutive_failures_ > 0 -- the wallet
+    //    is failing (Step 2 failed THIS cycle); probing it is how a remedy
+    //    runs a cycle past the dead man's switch.
+    //    [v0.10.24 integration] #156 removed wallet_consecutive_failures_,
+    //    which counted throws a stalled wallet never raised.  "Failing" is
+    //    now #156's own decision, execution::wallet_gate, read here without
+    //    wallet_step_may_run's side effects (no log, no breaker trip): a
+    //    wallet call failed at the transport level since this heartbeat's
+    //    mark with nothing answering since, or enough consecutive failures
+    //    to open the breaker.
+    //  * xch_recovery_mode_ -- every tracked offer is marked cancel_pending
+    //    because XCH is depleted; operator decision: no escalation there.
+    //  * watchdog_fired_ -- the book was cancelled by a process that gave up
+    //    managing it; operator decision: no escalation until restart.
+    if (execution::escalation_must_yield(async_gates())
+        || wallet_circuit_open_
+        || execution::wallet_gate(wallet_transport_at_cycle_start_,
+                                  wallet_->transport_counters())
+               != execution::WalletGate::Run
+        || xch_recovery_mode_) {
+        spdlog::debug("[Engine] [S14] cancel escalation deferred this heartbeat "
+                      "(cancel in flight, wallet failing, XCH recovery or dead "
+                      "man's switch)");
+        co_return;
+    }
+
+    const execution::CancelEscalationParams params =
+        execution::cancel_escalation_params_from(config_.strategy);
+    const std::uint64_t now_block = block;
+    const std::vector<PendingOffer> offers = state_->get_all_offers();
+
+    // Tracks follow State: an offer that left State, or is no longer
+    // cancel_pending, has resolved one way or another.
+    std::unordered_map<std::string, const PendingOffer*> cancel_pending;
+    for (const auto& po : offers) {
+        if (po.cancel_pending) {
+            cancel_pending.emplace(po.offer_id, &po);
+        }
+    }
+    for (auto it = cancel_escalation_tracks_.begin();
+         it != cancel_escalation_tracks_.end();) {
+        if (cancel_pending.count(it->first) == 0) {
+            cancel_unresolved_alerts_.forget(it->first);
+            it = cancel_escalation_tracks_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    std::vector<std::pair<std::uint64_t, const PendingOffer*>> due;
+    for (const auto& entry : cancel_pending) {
+        const std::string& offer_id = entry.first;
+        execution::CancelEscalationTrack& track = cancel_escalation_tracks_[offer_id];
+        if (track.anchor_block == 0) {
+            // First sighting. Seed the count, and the highest fee an earlier
+            // escalation recorded, so a restart grants neither a fresh ladder
+            // nor a bid that only repeats the last one -- which the mempool
+            // refuses as a replacement.  On a read failure stay unanchored
+            // and retry.
+            std::uint32_t prior     = 0;
+            std::uint64_t prior_fee = 0;
+            try {
+                if (db_) {
+                    prior     = db_->count_cancel_escalations(offer_id);
+                    prior_fee = db_->max_cancel_escalation_fee(offer_id);
+                }
+            } catch (const std::exception& e) {
+                spdlog::debug("[Engine] [S14] could not read the escalation history "
+                              "for {}: {} -- retried next heartbeat",
+                              offer_id, e.what());
+                continue;
+            }
+            track.anchor_block   = now_block;
+            track.escalations    = prior;
+            track.last_fee_mojos = prior_fee;
+            continue;
+        }
+        if (execution::escalation_probe_due(track, now_block, params)) {
+            due.emplace_back(track.anchor_block, entry.second);
+        }
+    }
+    std::sort(due.begin(), due.end(), [](const auto& a, const auto& b) {
+        return a.first != b.first ? a.first < b.first
+                                  : a.second->offer_id < b.second->offer_id;
+    });
+    if (due.size() > params.max_probes_per_sweep) {
+        due.resize(params.max_probes_per_sweep);
+    }
+
+    if (!due.empty()) {
+        const std::uint64_t base_fee = fee_tracker_
+            ? fee_tracker_->get_recommended_fee(config_.strategy.offer_fee_mojos, block)
+            : config_.strategy.offer_fee_mojos;
+        // A ceiling on the cancel being replaced: emergency_cancel's top tier
+        // pays up to twice the dynamic fee.  It is the dynamic fee NOW, not the
+        // one that cancel saw -- initial cancel fees are not persisted (see
+        // execution::escalation_fee_mojos).
+        const std::uint64_t dynamic_fee = offer_mgr_->current_fee();
+        const std::uint64_t prior_ceiling =
+            dynamic_fee > std::numeric_limits<std::uint64_t>::max() / 2U
+                ? std::numeric_limits<std::uint64_t>::max()
+                : dynamic_fee * 2U;
+        const std::int64_t started_ms = s14_steady_now_ms();
+
+        for (const auto& candidate : due) {
+            const std::string offer_id  = candidate.second->offer_id;
+            const std::string pair_name = candidate.second->pair_name;
+
+            if (s14_steady_now_ms() - started_ms >= execution::kEscalationSweepBudgetMs) {
+                spdlog::debug("[Engine] [S14] escalation sweep budget spent -- the "
+                              "remaining probes wait for the next heartbeat");
+                break;
+            }
+            if (execution::escalation_must_yield(async_gates()) || wallet_circuit_open_) {
+                break;
+            }
+            if (!state_->get_offer(offer_id).cancel_pending) {
+                continue;   // resolved while earlier candidates were probed
+            }
+            const auto track_it = cancel_escalation_tracks_.find(offer_id);
+            if (track_it == cancel_escalation_tracks_.end()) {
+                continue;
+            }
+            execution::CancelEscalationTrack& track = track_it->second;
+
+            // 1. The wallet's word.
+            nlohmann::json record;
+            bool wallet_failed = false;
+            std::string failure;
+            try {
+                record = co_await wallet_->get_offer(offer_id, /*file_contents=*/false);
+            } catch (const std::exception& e) {
+                wallet_failed = true;
+                failure = e.what();
+            }
+            if (wallet_failed) {
+                track.retry_after_block = now_block
+                    + execution::escalation_backoff_blocks(track.idle_probes, params);
+                s14_bump(track.idle_probes);
+                spdlog::warn("[Engine] [S14] escalation probe: get_offer failed for "
+                             "{} -- no verdict, nothing paid; the sweep stops for "
+                             "this heartbeat: {}", offer_id, failure);
+                break;
+            }
+            const execution::WalletCancelState wallet_state =
+                execution::wallet_cancel_state_from_record(record);
+
+            // 2. The chain's word -- only when the wallet gave one, and never
+            //    from a node the height source has stopped trusting.
+            execution::CoinProof proof = execution::CoinProof::Unknown;
+            if (wallet_state != execution::WalletCancelState::Unknown
+                && full_node_ && !wallet_only_mode_) {
+                const std::vector<std::string> names = execution::coin_names_for(
+                    execution::parse_coins_of_interest(record), &s14_coin_name);
+                if (!names.empty()) {
+                    std::vector<nlohmann::json> coin_records;
+                    bool node_failed = false;
+                    try {
+                        coin_records = co_await full_node_->get_coin_records_by_names(
+                            names, /*include_spent=*/true);
+                    } catch (const std::exception& e) {
+                        node_failed = true;
+                        failure = e.what();
+                    }
+                    if (node_failed) {
+                        track.retry_after_block = now_block
+                            + execution::escalation_backoff_blocks(track.idle_probes, params);
+                        s14_bump(track.idle_probes);
+                        spdlog::warn("[Engine] [S14] escalation probe: coin lookup "
+                                     "failed for {} -- no proof, nothing paid; the "
+                                     "sweep stops for this heartbeat: {}",
+                                     offer_id, failure);
+                        break;
+                    }
+                    proof = execution::classify_coin_records(names, coin_records,
+                                                             &s14_coin_name);
+                }
+            }
+
+            // 3. Decide.
+            execution::CancelEscalationInput input;
+            input.current_block = now_block;
+            input.track         = track;
+            input.wallet        = wallet_state;
+            input.coins         = proof;
+            input.params        = params;
+            const execution::CancelEscalationVerdict verdict =
+                execution::decide_cancel_escalation(input);
+            spdlog::debug("[Engine] [S14] escalation probe {} ({}): wallet {}, "
+                          "chain proof {}, verdict {}", offer_id, pair_name,
+                          execution::wallet_cancel_state_name(wallet_state),
+                          static_cast<int>(proof),
+                          execution::escalation_verdict_name(verdict));
+
+            // The fee-bearing branch sits OUTSIDE the switch below: nothing in
+            // this codebase co_awaits inside a switch, and GCC's coroutine
+            // transform has had defects in exactly that shape. `break` ends the
+            // sweep, `continue` moves to the next candidate.
+            if (verdict == execution::CancelEscalationVerdict::Escalate) {
+                // [review] Re-check right before the fee-bearing call: shutdown,
+                // a co_spawned operator cancel-all, or the dead man's switch on
+                // its own thread can close a gate during the co_awaits above.
+                if (execution::escalation_must_yield(async_gates())
+                    || !state_->get_offer(offer_id).cancel_pending) {
+                    break;
+                }
+                const std::uint64_t fee = execution::escalation_fee_mojos(
+                    base_fee, track.last_fee_mojos, prior_ceiling, params);
+                const std::uint64_t attempt =
+                    static_cast<std::uint64_t>(track.escalations) + 1U;
+                // [review, round 2] WRITE AHEAD, FAIL CLOSED.  The cap and the
+                // fee floor are seeded from recorded events alone, so the record
+                // goes in BEFORE the fee is paid, and without one nothing is
+                // paid: an attempt a restart cannot see would be paid again.
+                bool recorded = false;
+                std::string record_error{"no database"};
+                if (db_) {
+                    try {
+                        db_->mark_offer_cancel_submitted(
+                            offer_id, block,
+                            "cancel_escalation_" + std::to_string(attempt), fee);
+                        recorded = true;
+                    } catch (const std::exception& e) {
+                        record_error = e.what();
+                    }
+                }
+                if (!recorded) {
+                    track.retry_after_block = now_block
+                        + execution::escalation_backoff_blocks(track.idle_probes, params);
+                    s14_bump(track.idle_probes);
+                    spdlog::warn("[Engine] [S14] escalated re-cancel {} for {} ({}) NOT "
+                                 "submitted: its record could not be written, and no "
+                                 "fee is paid without one; the sweep stops for this "
+                                 "heartbeat: {}", attempt, offer_id, pair_name,
+                                 record_error);
+                    break;
+                }
+                std::optional<std::string> error;
+                try {
+                    error = co_await offer_mgr_->recancel_secure(offer_id, fee);
+                } catch (const std::exception& e) {
+                    error = std::string{e.what()};
+                }
+                std::uint64_t paid = fee;
+                if (error && fee > 0
+                    && execution::classify_take_failure(*error)
+                           == execution::TakeFailureClass::Funding) {
+                    // [review] Short of XCH: a SECURE cancel at fee 0 needs
+                    // none -- the offer's own coins are the inputs, the dead
+                    // man's switch recipe. It cannot replace a conflicting
+                    // spend, but the stranded case has none.
+                    const std::uint64_t zero_fee = risk::watchdog_cancel().fee_mojos;
+                    std::optional<std::string> zero_error;
+                    try {
+                        zero_error = co_await offer_mgr_->recancel_secure(
+                            offer_id, zero_fee);
+                    } catch (const std::exception& e) {
+                        zero_error = std::string{e.what()};
+                    }
+                    if (!zero_error) {
+                        paid = zero_fee;
+                        error.reset();
+                    } else {
+                        *error += " | zero-fee retry: " + *zero_error;
+                    }
+                }
+                if (error) {
+                    s14_bump(track.consecutive_errors);
+                    const std::uint64_t backoff = execution::escalation_backoff_blocks(
+                        track.consecutive_errors, params);
+                    track.retry_after_block = now_block + backoff;
+                    spdlog::warn("[Engine] [S14] escalated re-cancel FAILED for {} "
+                                 "({}) at fee {} mojos -- not counted toward the "
+                                 "cap by this process, though its record counts "
+                                 "after a restart; next attempt in {} blocks: {}",
+                                 offer_id, pair_name, fee, backoff, *error);
+                    if (!track.alerted
+                        && track.consecutive_errors
+                               >= execution::kEscalationErrorAlertThreshold) {
+                        cancel_unresolved_alerts_.enqueue(s14_alert_entry(
+                            offer_id, pair_name, track.escalations,
+                            execution::UnresolvedReason::ResubmitFailing,
+                            *error));
+                    }
+                    // [review] The first failure of any kind ends the sweep.
+                    break;
+                }
+                s14_bump(track.escalations);
+                track.anchor_block       = now_block;
+                track.retry_after_block  = 0;
+                track.last_fee_mojos     = std::max(track.last_fee_mojos, paid);
+                track.idle_probes        = 0;
+                track.consecutive_errors = 0;
+                if (fee_tracker_ && fee_tracker_->enabled() && paid > 0) {
+                    fee_tracker_->record_fee(paid, block);
+                }
+                spdlog::warn("[Engine] [S14] escalated re-cancel {}/{} SUBMITTED for "
+                             "{} ({}) at fee {} mojos -- the wallet reports {} and "
+                             "every maker coin is unspent on-chain",
+                             track.escalations, params.max_escalations,
+                             offer_id, pair_name, paid,
+                             execution::wallet_cancel_state_name(wallet_state));
+                continue;
+            }
+
+            switch (verdict) {
+                case execution::CancelEscalationVerdict::AnchorNow:
+                case execution::CancelEscalationVerdict::Wait: {
+                    // Probed inside a PENDING_CANCEL window: look again when
+                    // the window closes, not every retry interval.
+                    track.retry_after_block = track.anchor_block + params.window_blocks;
+                    break;
+                }
+                case execution::CancelEscalationVerdict::ResolvedByWallet:
+                case execution::CancelEscalationVerdict::Resolving:
+                case execution::CancelEscalationVerdict::NoProof: {
+                    track.retry_after_block = now_block
+                        + execution::escalation_backoff_blocks(track.idle_probes, params);
+                    s14_bump(track.idle_probes);
+                    if (verdict != execution::CancelEscalationVerdict::ResolvedByWallet
+                        && execution::unresolved_alert_due(track, now_block, params)) {
+                        const bool spent_but_pending =
+                            proof == execution::CoinProof::SomeSpent;
+                        cancel_unresolved_alerts_.enqueue(s14_alert_entry(
+                            offer_id, pair_name, track.escalations,
+                            spent_but_pending
+                                ? execution::UnresolvedReason::WalletNotReconciled
+                                : execution::UnresolvedReason::Unverifiable,
+                            std::string{"wallet "}
+                                + execution::wallet_cancel_state_name(wallet_state)));
+                    }
+                    break;
+                }
+                case execution::CancelEscalationVerdict::Exhausted: {
+                    track.retry_after_block = now_block + params.window_blocks;
+                    if (!track.alerted) {
+                        cancel_unresolved_alerts_.enqueue(s14_alert_entry(
+                            offer_id, pair_name, track.escalations,
+                            execution::UnresolvedReason::StillTakeable,
+                            std::string{"wallet "}
+                                + execution::wallet_cancel_state_name(wallet_state)));
+                    }
+                    break;
+                }
+                case execution::CancelEscalationVerdict::Escalate:
+                    break;   // handled above, outside the switch
+            }
+        }
+    }
+
+    // One alert per window; offers are marked alerted only when named in a send.
+    flush_cancel_unresolved_alerts();
+    co_return;
 }
 
 // [STOPDRAIN review #7] Consume data/shutdown.flag: the GUI asked for a
@@ -20149,8 +20805,19 @@ void Engine::check_cancel_all_flag()
                 // but stay in the set: the heartbeat sweep owns them until
                 // the wallet says they are terminal. The refused ids keep
                 // their Ordered tag and the sweep re-issues their cancel.
+                const BlockHeight cancel_all_block =
+                    last_block_.load(std::memory_order_relaxed);
                 for (const auto& id : done.cancelled) {
                     cancel_intent_[id] = CancelIntentTag::Submitted;
+                    // [S14] Submitted, so offer_log says cancel_pending.
+                    try {
+                        db_->mark_offer_cancel_submitted(
+                            id, cancel_all_block, "operator_cancel_all");
+                    } catch (const std::exception& e) {
+                        spdlog::debug("[Engine] [CANCELALL] could not mark {} "
+                                      "cancel_pending: {}", id.substr(0, 12),
+                                      e.what());
+                    }
                 }
                 for (const auto& id : done.already_pending) {
                     cancel_intent_[id] = CancelIntentTag::Submitted;
@@ -20211,7 +20878,11 @@ asio::awaitable<bool> Engine::sweep_reload_disabled_offers()
 
     std::vector<std::string> to_cancel;
     for (const auto& po : state_->get_all_offers()) {
-        if (reload_pending_cancel_.count(po.pair_name) > 0) {
+        // [S14] selective_cancel skips cancel_pending offers, so counting them
+        // made this sweep log CRITICAL every heartbeat. The escalation owns
+        // them.
+        if (reload_pending_cancel_.count(po.pair_name) > 0
+            && !po.cancel_pending) {
             to_cancel.push_back(po.offer_id);
         }
     }
@@ -20221,6 +20892,18 @@ asio::awaitable<bool> Engine::sweep_reload_disabled_offers()
     }
     try {
         auto done = co_await offer_mgr_->selective_cancel(to_cancel);
+        const BlockHeight reload_block = last_block_.load(std::memory_order_relaxed);
+        for (const auto& id : done) {
+            // [S14] Submitted, so offer_log says cancel_pending.
+            try {
+                db_->mark_offer_cancel_submitted(id, reload_block,
+                                                 "reload_disabled_pair");
+            } catch (const std::exception& mark_error) {
+                spdlog::debug("[Engine] [RELOAD] could not mark {} "
+                              "cancel_pending: {}", id.substr(0, 12),
+                              mark_error.what());
+            }
+        }
         if (done.size() >= to_cancel.size()) {
             spdlog::warn("[Engine] [RELOAD] cancelled {}/{} resting offers "
                          "on live-disabled pairs",
@@ -20670,6 +21353,17 @@ asio::awaitable<void> Engine::step_observe_asset_pegs(BlockHeight block_height)
         if (!to_cancel.empty()) {
             try {
                 auto done = co_await offer_mgr_->selective_cancel(to_cancel);
+                for (const auto& id : done) {
+                    // [S14] Submitted, so offer_log says cancel_pending.
+                    try {
+                        db_->mark_offer_cancel_submitted(id, block_height,
+                                                         "peg_suspended");
+                    } catch (const std::exception& mark_error) {
+                        spdlog::debug("[Engine] [PEGSUSPEND] could not mark {} "
+                                      "cancel_pending: {}", id.substr(0, 12),
+                                      mark_error.what());
+                    }
+                }
                 if (done.size() < to_cancel.size()) {
                     spdlog::critical("[Engine] [PEGSUSPEND] only {}/{} "
                                      "offers cancelled on suspended pairs "

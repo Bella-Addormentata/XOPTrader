@@ -82,6 +82,7 @@ const char* to_string(AlertRule rule) noexcept
         case AlertRule::DeadMansSwitch:       return "DeadMansSwitch";
         case AlertRule::DeadMansSwitchLive:   return "DeadMansSwitchLive";
         case AlertRule::ConfigReload:         return "ConfigReload";
+        case AlertRule::CancelUnresolved:     return "CancelUnresolved";
     }
     return "UNKNOWN";
 }
@@ -124,6 +125,9 @@ AlertTier tier_for_rule(AlertRule rule) noexcept
         // An offer live behind a fired switch is the worst state this
         // process can report.
         case AlertRule::DeadMansSwitchLive:
+        // [S14] A cancel the chain never saw, on an offer that may still be
+        // taken.
+        case AlertRule::CancelUnresolved:
             return AlertTier::CRITICAL;
 
         // INFO (rules 12-15).

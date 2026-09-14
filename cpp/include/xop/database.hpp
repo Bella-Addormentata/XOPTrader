@@ -92,13 +92,50 @@ struct DbOfferRecord {
     Mojo        queue_ahead_mojos{0}; ///< Same-side competing size priced ahead of this offer.
     int         queue_ahead_score{0}; ///< 1-10 score for queue position vs same-side depth.
     int         execution_quality_score{0}; ///< Weighted 70/30 blend of price competitiveness and queue position.
-    std::string status{"pending"};  ///< "pending", "filled", "cancelled", "expired".
+    /// "pending", "cancel_pending", "filled", "cancelled" or "expired".
+    /// [S14] "cancel_pending" = a cancel was SUBMITTED (the wallet accepted
+    /// the RPC) and no terminal verdict has arrived.  Not terminal: the offer
+    /// can still be taken until the wallet reports CANCELLED/FAILED, and a
+    /// fill still wins.
+    std::string status{"pending"};
     BlockHeight created_block{0};   ///< Block at which the offer was broadcast.
     BlockHeight resolved_block{0};  ///< Block at which the offer was resolved (0 if pending).
     std::uint64_t fee_mojos{0};      ///< Fee attached to this offer (mojos).
     Mojo        book_best_bid{0};   ///< Best competing bid at offer creation.
     Mojo        book_best_ask{0};   ///< Best competing ask at offer creation.
 };
+
+/// [S14 2026-09-13] offer_log status values for a live offer and for an
+/// accepted-but-unconfirmed cancel.
+inline constexpr const char* kOfferStatusPending       = "pending";
+inline constexpr const char* kOfferStatusCancelPending = "cancel_pending";
+
+/// [S14] The offer_log status a State entry is persisted with.  One helper
+/// for every persist site -- boot orphan adoption, the reconcile mirror, the
+/// post-quote insert -- so none can write a literal "pending" for an offer
+/// whose cancel is already out.
+[[nodiscard]] inline const char* db_status_for(const PendingOffer& offer) noexcept
+{
+    return offer.cancel_pending ? kOfferStatusCancelPending : kOfferStatusPending;
+}
+
+/// [S14] The State entry a restored offer_log row becomes.  A
+/// 'cancel_pending' row comes back cancel_pending: restored as a live offer
+/// it would be handed to Step 8, which re-cancels blind and pays again.
+[[nodiscard]] inline PendingOffer pending_offer_from_db(const DbOfferRecord& rec)
+{
+    PendingOffer po{};
+    po.offer_id         = rec.offer_id;
+    po.pair_name        = rec.pair_name;
+    po.side             = (rec.side == "bid") ? Side::Bid : Side::Ask;
+    po.price            = rec.price_mojos;
+    po.size             = rec.size_mojos;
+    po.tier             = static_cast<std::uint8_t>(rec.tier);
+    po.created_at_block = rec.created_block;
+    po.fee_mojos        = rec.fee_mojos;
+    po.cancel_pending   = (rec.status == kOfferStatusCancelPending);
+    return po;
+}
 
 // ---------------------------------------------------------------------------
 // DbSnapshot -- maps 1:1 to a row in the snapshots table.
@@ -373,19 +410,82 @@ public:
     /// @param new_status     New status string ("filled", "cancelled", "expired").
     /// @param resolved_block Block height at which the status changed.
     /// @param cancel_reason  Human-readable reason for cancellation (empty for fills).
+    /// @param fee_mojos      [S14] The fee the recorded submission carries, stored
+    ///                       on its closure event (NULL there when absent).  Only
+    ///                       the cancel escalation passes one.
     /// @throws std::runtime_error if no row matches offer_id.
-    void update_offer_status(const std::string& offer_id,
-                             const std::string& new_status,
-                             BlockHeight        resolved_block,
-                             const std::string& cancel_reason = "");
+    void update_offer_status(const std::string&           offer_id,
+                             const std::string&           new_status,
+                             BlockHeight                  resolved_block,
+                             const std::string&           cancel_reason = "",
+                             std::optional<std::uint64_t> fee_mojos = std::nullopt);
 
-    /// Return all offers with status='pending' from the offer_log table.
-    /// Used on startup to recover offers that were pending when the engine
-    /// last shut down, enabling orphan detection against the wallet.
+    /// Return every offer_log row the engine must still manage: status
+    /// 'pending' or 'cancel_pending'.  Used on startup to restore offers that
+    /// were resting -- or whose cancel had been submitted but not confirmed --
+    /// when the engine last shut down.  Each record carries its real status,
+    /// so a restored cancel_pending row stays cancel_pending.
     ///
-    /// @return Vector of DbOfferRecord with status "pending".
+    /// @return Vector of DbOfferRecord with status "pending" or
+    ///         "cancel_pending", oldest created_block first.
     [[nodiscard]]
     std::vector<DbOfferRecord> query_pending_offers() const;
+
+    /// [S14 2026-09-13] Record that a cancel was SUBMITTED for an offer: the
+    /// wallet accepted the RPC and nothing has confirmed.  The row becomes
+    /// 'cancel_pending' (resolved_block 0, resolved_at NULL) and keeps its
+    /// FIRST cause; a repeat submit only appends an observation event.  The
+    /// row turns 'cancelled'/'expired' when a wallet verdict is written with
+    /// update_offer_status, and 'filled' still wins from any status.
+    ///
+    /// This is how every submit-time site writes offer_log.  An accepted
+    /// cancel RPC used to stamp 'cancelled', and three XCH/BYC bids rested
+    /// takeable for thirteen days under that label.
+    ///
+    /// `fee_mojos`, when given, is stored on the closure event.  The cancel
+    /// escalation passes the fee it is ABOUT to pay and writes this record
+    /// before paying it, so max_cancel_escalation_fee can restore the fee
+    /// floor after a restart.  Initial cancels pass none.
+    ///
+    /// @throws OfferNotFound      no row for offer_id.
+    /// @throws std::runtime_error on a database fault.
+    void mark_offer_cancel_submitted(const std::string&           offer_id,
+                                     BlockHeight                  submit_block,
+                                     const std::string&           reason,
+                                     std::optional<std::uint64_t> fee_mojos = std::nullopt);
+
+    /// [S14] The offer_log status of one offer, or nullopt when no row
+    /// exists.  A database fault throws std::runtime_error; it is never
+    /// reported as "no row".
+    [[nodiscard]]
+    std::optional<std::string> query_offer_status(const std::string& offer_id) const;
+
+    /// [S14] Reopen a row stamped 'cancelled' at RPC acceptance whose wallet
+    /// record is still PENDING_CANCEL: status -> 'cancel_pending',
+    /// resolved_block 0, resolved_at NULL, cancel_reason KEPT, plus a
+    /// reopen_observation closure event carrying `reason`.  Returns false and
+    /// writes nothing unless the row is exactly 'cancelled'.
+    ///
+    /// @throws OfferNotFound      no row for offer_id.
+    /// @throws std::runtime_error on a database fault.
+    bool reopen_cancelled_as_cancel_pending(const std::string& offer_id,
+                                            BlockHeight        observed_block,
+                                            const std::string& reason);
+
+    /// [S14] Escalated re-cancels already recorded for an offer: closure
+    /// events whose reason starts "cancel_escalation_".  Seeds the per-offer
+    /// cap so a restart does not grant a fresh ladder.
+    /// @throws std::runtime_error on a database fault.
+    [[nodiscard]]
+    std::uint32_t count_cancel_escalations(const std::string& offer_id) const;
+
+    /// [S14] The highest fee recorded on those cancel_escalation_ events, or 0
+    /// when none carries one.  Seeds the escalation fee floor at first
+    /// sighting: without it, escalation N+1 after a restart bid exactly what
+    /// escalation N had paid, which the mempool refuses as a replacement.
+    /// @throws std::runtime_error on a database fault.
+    [[nodiscard]]
+    std::uint64_t max_cancel_escalation_fee(const std::string& offer_id) const;
 
     // -- Snapshots -----------------------------------------------------------
 
@@ -586,6 +686,9 @@ private:
     /// Bind a double value to a prepared statement parameter.
     static void bind_double(sqlite3_stmt* stmt, int index, double val);
 
+    /// Bind SQL NULL to a prepared statement parameter.
+    static void bind_null(sqlite3_stmt* stmt, int index);
+
     /// Execute a prepared statement that does not return rows (INSERT/UPDATE).
     /// Resets the statement after execution so it can be reused.
     void step_and_reset(sqlite3_stmt* stmt) const;
@@ -627,6 +730,12 @@ private:
 
     /// UPDATE offer_log SET status = ?, resolved_block = ?, resolved_at = ?
     sqlite3_stmt* stmt_update_offer_{nullptr};
+
+    /// [S14] SELECT the earliest cancel submit height for one offer.
+    sqlite3_stmt* stmt_query_cancel_submit_block_{nullptr};
+
+    /// [S14] That height, or 0 when none is recorded.  The caller holds mtx_.
+    BlockHeight first_cancel_submit_block_locked(const std::string& offer_id);
 
     /// INSERT INTO offer_closure_events
     sqlite3_stmt* stmt_insert_offer_closure_event_{nullptr};

@@ -1347,6 +1347,61 @@ StrategyConfig parse_strategy(const YAML::Node& root)
         cfg.stuck_offer_age_blocks = node["stuck_offer_age_blocks"].as<uint32_t>();
     }
 
+    // [S14 2026-09-13] Proof-gated cancel escalation (all keys optional).
+    {
+        const auto present = [&node](const char* key) {
+            return node[key] && node[key].IsDefined() && !node[key].IsNull();
+        };
+        const auto read_mojos = [&node, &sec](const char* key) {
+            const auto value = node[key].as<std::int64_t>();
+            if (value < 0) {
+                throw ConfigError(sec + "." + key + " must be >= 0");
+            }
+            return static_cast<std::uint64_t>(value);
+        };
+        if (present("cancel_escalation_enabled")) {
+            cfg.cancel_escalation_enabled =
+                node["cancel_escalation_enabled"].as<bool>();
+        }
+        if (present("cancel_escalation_window_blocks")) {
+            cfg.cancel_escalation_window_blocks = read_uint32_positive(
+                node, "cancel_escalation_window_blocks", sec);
+        }
+        if (present("cancel_escalation_max_attempts")) {
+            cfg.cancel_escalation_max_attempts = read_uint32(
+                node, "cancel_escalation_max_attempts", sec);
+        }
+        if (present("cancel_escalation_fee_step_mojos")) {
+            cfg.cancel_escalation_fee_step_mojos =
+                read_mojos("cancel_escalation_fee_step_mojos");
+        }
+        if (present("cancel_escalation_max_fee_mojos")) {
+            cfg.cancel_escalation_max_fee_mojos =
+                read_mojos("cancel_escalation_max_fee_mojos");
+        }
+        if (present("cancel_escalation_retry_blocks")) {
+            cfg.cancel_escalation_retry_blocks = read_uint32_positive(
+                node, "cancel_escalation_retry_blocks", sec);
+        }
+        if (present("cancel_escalation_max_probes")) {
+            cfg.cancel_escalation_max_probes = read_uint32_positive(
+                node, "cancel_escalation_max_probes", sec);
+        }
+        if (cfg.cancel_escalation_retry_blocks > cfg.cancel_escalation_window_blocks) {
+            throw ConfigError(sec + ".cancel_escalation_retry_blocks must be <= "
+                              "cancel_escalation_window_blocks");
+        }
+        if (cfg.cancel_escalation_fee_step_mojos < 10'000'000ULL) {
+            throw ConfigError(sec + ".cancel_escalation_fee_step_mojos must be >= "
+                              "10000000 (chia MEMPOOL_MIN_FEE_INCREASE): a smaller "
+                              "step cannot replace a conflicting cancel");
+        }
+        if (cfg.cancel_escalation_max_fee_mojos <= cfg.cancel_escalation_fee_step_mojos) {
+            throw ConfigError(sec + ".cancel_escalation_max_fee_mojos must be > "
+                              "cancel_escalation_fee_step_mojos");
+        }
+    }
+
     // -- Minimum balance management -----------------------------------------
     if (node["fee_reserve_xch"] && node["fee_reserve_xch"].IsDefined()
         && !node["fee_reserve_xch"].IsNull()) {
@@ -3197,6 +3252,15 @@ void log_config_summary(const AppConfig& cfg)
         << "  batch_offers = " << (cfg.strategy.batch_offers_enabled ? "ON" : "off") << "\n"
         << "  spendable_reserve = " << (cfg.strategy.min_spendable_reserve_pct * 100.0) << "%\n"
         << "  stuck_age  = " << cfg.strategy.stuck_offer_age_blocks << " blocks\n"
+        << "  cancel_escalation = "
+        << (cfg.strategy.cancel_escalation_enabled ? "ON" : "off")
+        << " (window " << cfg.strategy.cancel_escalation_window_blocks
+        << " blocks, " << cfg.strategy.cancel_escalation_max_attempts
+        << " attempts, step " << cfg.strategy.cancel_escalation_fee_step_mojos
+        << " / cap " << cfg.strategy.cancel_escalation_max_fee_mojos
+        << " mojos, retry " << cfg.strategy.cancel_escalation_retry_blocks
+        << " blocks, " << cfg.strategy.cancel_escalation_max_probes
+        << " probes/heartbeat)\n"
         << "  fee_reserve_xch = " << cfg.strategy.fee_reserve_xch << "\n"
         << "  fee_min_spendable = " << cfg.strategy.fee_min_spendable_xch << "\n"
         << "  taker_min_spendable = " << cfg.strategy.taker_min_spendable_xch << "\n"

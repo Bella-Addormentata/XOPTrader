@@ -22,6 +22,7 @@
 
 #include <xop/execution/offer_manager.hpp>
 
+#include <xop/execution/cancel_escalation.hpp>
 #include <xop/execution/cancel_retry.hpp>
 #include <xop/execution/cross_guard.hpp>
 #include <xop/execution/stuck_tx_verdict.hpp>
@@ -1259,10 +1260,12 @@ OfferManager::recheck_terminal(const std::string& trade_id,
         // pay a second cancellation fee on an offer it has already
         // cancelled.
         if (!state_->get_offer(trade_id).offer_id.empty()) {
-            logger_->info("[S25] recheck_terminal: {} reports {} and is "
-                          "already tracked in State -- leaving the live "
-                          "entry alone",
-                          trade_id.substr(0, 12), why);
+            // [S14] debug: the S46 intent sweep re-asks every heartbeat, and
+            // this line was 3,065 of the last 60,000 in engine.log.
+            logger_->debug("[S25] recheck_terminal: {} reports {} and is "
+                           "already tracked in State -- leaving the live "
+                           "entry alone",
+                           trade_id.substr(0, 12), why);
             return true;
         }
         auto parsed = try_parse_wallet_offer(rec, current_block);
@@ -1361,13 +1364,12 @@ asio::awaitable<std::vector<std::string>> OfferManager::cancel_stale(
             continue;
         }
 
-        // Skip offers already awaiting cancel confirmation.
-        if (po.cancel_pending) {
-            continue;
-        }
-
-        // Check if the offer has exceeded its TTL.
-        if (current_block < po.created_at_block + ttl_blocks) {
+        // [S14] One predicate for the forced-cancel set, shared with the
+        // Step 8 stuck counter and the STOPDRAIN eligibility count.  Offers
+        // already awaiting cancel confirmation belong to the escalation, and
+        // an offer is due at created + ttl (written without the overflow).
+        if (!is_forced_cancel_candidate(po.cancel_pending, po.created_at_block,
+                                        current_block, ttl_blocks)) {
             continue;
         }
 
@@ -2922,6 +2924,8 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
     // [S46] Describes THIS call only -- same contract as
     // last_terminal_offers_. Cleared before anything can populate it.
     db_leg_ = StartupDbLeg{};
+    // [S14] Same contract.
+    wallet_pending_cancel_.clear();
 
     logger_->info("[startup_reconcile] Scanning wallet for orphaned offers...");
 
@@ -2964,6 +2968,9 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
     // costs no extra probe, and only genuinely unmentioned rows are walked.
     std::unordered_set<std::string> scanned_ids;
 
+    // [S14] PENDING_CANCEL records past kMaxStartupPendingCancelRecords.
+    std::size_t pending_cancel_overflow = 0;
+
     constexpr std::int64_t kPageSize = 50;
     std::int64_t offset = 0;
     bool more = true;
@@ -3004,18 +3011,45 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
 
             scanned_ids.insert(trade_id);
 
-            if (status != trade_status::kPendingAccept) {
+            // [S14] PENDING_CANCEL records are kept too.  This scan used to
+            // keep PENDING_ACCEPT only, so a trade whose cancel never landed
+            // -- still takeable, every maker coin unspent -- was invisible to
+            // the whole engine.  The decision is a pure function so a test
+            // can pin it.
+            const StartupScanBucket bucket = startup_scan_bucket(
+                status, known_offer_ids.count(trade_id) > 0);
+            if (bucket == StartupScanBucket::PendingCancelObserved) {
+                if (wallet_pending_cancel_.size() < kMaxStartupPendingCancelRecords) {
+                    wallet_pending_cancel_.push_back(
+                        WalletPendingCancelRecord{trade_id, std::move(rec)});
+                } else {
+                    ++pending_cancel_overflow;
+                }
+                continue;
+            }
+            if (bucket == StartupScanBucket::Ignore) {
                 continue;
             }
 
             wallet_offers.push_back(WalletOffer{
                 trade_id,
                 std::move(rec),
-                known_offer_ids.count(trade_id) > 0
+                bucket == StartupScanBucket::KnownLive
             });
         }
 
         offset += kPageSize;
+    }
+
+    if (!wallet_pending_cancel_.empty()) {
+        logger_->info("[startup_reconcile] [S14] {} wallet trade(s) are "
+                      "PENDING_CANCEL -- kept for boot recovery",
+                      wallet_pending_cancel_.size());
+    }
+    if (pending_cancel_overflow > 0) {
+        logger_->warn("[startup_reconcile] [S14] {} further PENDING_CANCEL "
+                      "trade(s) beyond the cap of {} were NOT kept this boot",
+                      pending_cancel_overflow, kMaxStartupPendingCancelRecords);
     }
 
     // ---- Phase 1b: THE DB -> WALLET LEG -----------------------------------
@@ -3269,6 +3303,13 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
                         wo->trade_id, "startup_reconcile");
                 } // end wallet_synced
                 if (cancel_ok) {
+                    // [S14] An accepted cancel is a SUBMISSION.  The orphan
+                    // stays takeable until the spend confirms, and a take on
+                    // an untracked trade is booked nowhere -- so track it,
+                    // flagged cancel_pending, until the wallet verdict (or
+                    // the escalation) resolves it.
+                    adopt_wallet_record(wo->trade_id, wo->record, current_block);
+                    state_->mark_cancel_pending(wo->trade_id);
                     cancelled_ids.push_back(wo->trade_id);
                     if (eval.disposition == OrphanDisposition::Cancel)
                         ++cancelled;
@@ -3282,22 +3323,7 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
                     // pending offers but 0 spendable XCH -- permanent
                     // stall.  Adopting lets UTXO liberation or the next
                     // cancel cycle free the locked coins.
-                    auto parsed = try_parse_wallet_offer(
-                        wo->record, current_block);
-                    if (parsed) {
-                        state_->upsert_offer(*parsed);
-                    } else {
-                        PendingOffer po;
-                        po.offer_id        = wo->trade_id;
-                        po.pair_name       = "UNKNOWN";
-                        po.side            = Side::Bid;
-                        po.price           = 0;
-                        po.size            = 0;
-                        po.tier            = 0;
-                        po.fee_mojos       = 0;
-                        po.created_at_block = 0;
-                        state_->upsert_offer(po);
-                    }
+                    adopt_wallet_record(wo->trade_id, wo->record, current_block);
                     ++adopted;
                     logger_->warn(
                         "[startup_reconcile] FORCE-ADOPTED uncancellable "
@@ -3566,6 +3592,53 @@ asio::awaitable<json> OfferManager::cancel_offer_charged(
 {
     xch_cycle_ledger_.note_lock(0, static_cast<Mojo>(fee));
     co_return co_await wallet_->cancel_offer(trade_id, fee, secure);
+}
+
+// ---------------------------------------------------------------------------
+// [S14 2026-09-13] The cancel escalation's wallet write and boot adoption
+// ---------------------------------------------------------------------------
+
+asio::awaitable<std::optional<std::string>> OfferManager::recancel_secure(
+    const std::string& trade_id, std::uint64_t fee)
+{
+    std::optional<std::string> error;
+    try {
+        co_await cancel_offer_charged(trade_id, fee, /*secure=*/true);
+    } catch (const rpc::ChiaRPCError& e) {
+        error = std::string{e.what()};
+    }
+    co_return error;
+}
+
+bool OfferManager::adopt_wallet_record(const std::string& trade_id,
+                                       const json&        record,
+                                       BlockHeight        current_block)
+{
+    auto parsed = try_parse_wallet_offer(record, current_block);
+    if (parsed) {
+        state_->upsert_offer(*parsed);
+        return true;
+    }
+    PendingOffer po;
+    po.offer_id        = trade_id;
+    po.pair_name       = "UNKNOWN";
+    po.side            = Side::Bid;
+    po.price           = 0;
+    po.size            = 0;
+    po.tier            = 0;
+    po.fee_mojos       = 0;
+    po.created_at_block = 0;
+    state_->upsert_offer(po);
+    return false;
+}
+
+void OfferManager::adopt_wallet_pending_cancel(
+    const WalletPendingCancelRecord& pending, BlockHeight current_block)
+{
+    if (state_->get_offer(pending.trade_id).offer_id.empty()) {
+        adopt_wallet_record(pending.trade_id, pending.record, current_block);
+    }
+    state_->mark_cancel_pending(pending.trade_id);
 }
 
 asio::awaitable<json> OfferManager::cancel_offers_charged(

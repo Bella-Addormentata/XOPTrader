@@ -539,6 +539,23 @@ public:
         std::chrono::steady_clock::time_point deadline =
             std::chrono::steady_clock::time_point::max());
 
+    /**
+     * @brief [S14 2026-09-13] One SECURE re-cancel of an offer whose cancel
+     *        the chain proves never landed, at an explicit fee.
+     *
+     * The cancel escalation's only wallet write.  Deliberately NOT routed
+     * through emergency_cancel: its last resort is an insecure local cancel,
+     * which flips the wallet record to CANCELLED while the maker coins stay
+     * spendable, so the escalation would read "resolved by wallet" off its
+     * own fallback.  The fee goes through cancel_offer_charged so the cycle
+     * ledger is charged like every other cancel.
+     *
+     * @return nullopt when the wallet accepted the cancel; otherwise the
+     *         verbatim RPC error text (for classify_take_failure).
+     */
+    asio::awaitable<std::optional<std::string>> recancel_secure(
+        const std::string& trade_id, std::uint64_t fee);
+
     // -- Selective refresh --------------------------------------------------
 
     /**
@@ -807,6 +824,33 @@ public:
         return db_leg_;
     }
 
+    /// [S14 2026-09-13] A wallet trade record the startup scan found in
+    /// PENDING_CANCEL, kept whole so boot can adopt it without another RPC.
+    struct WalletPendingCancelRecord {
+        std::string    trade_id{};
+        nlohmann::json record{};
+    };
+
+    /// PENDING_CANCEL records seen by the most recent startup_reconcile()
+    /// (cleared at its start, at most kMaxStartupPendingCancelRecords).  The
+    /// scan used to keep PENDING_ACCEPT only, so a trade whose cancel never
+    /// landed -- still takeable -- was invisible to the whole engine.
+    [[nodiscard]] const std::vector<WalletPendingCancelRecord>&
+    last_wallet_pending_cancel() const noexcept
+    {
+        return wallet_pending_cancel_;
+    }
+
+    /// Bound on the records above.  Boot adopts them by parsing the record,
+    /// with no RPC per id, so the bound is about memory and log volume.
+    static constexpr std::size_t kMaxStartupPendingCancelRecords = 256;
+
+    /// [S14] Put a wallet PENDING_CANCEL record into State -- parsed, else
+    /// minimal metadata -- unless it is already tracked, then mark it
+    /// cancel_pending.  No RPC.
+    void adopt_wallet_pending_cancel(const WalletPendingCancelRecord& pending,
+                                     BlockHeight                      current_block);
+
     /// Hard cap on get_offer() probes in one startup_reconcile(). A stale-row
     /// cluster can be large (40 rows on 2026-08-25, the oldest 17 days old)
     /// and boot is not the place to serialise an unbounded RPC walk.
@@ -1050,6 +1094,16 @@ private:
     /// [S46 2026-09-02] Result of the DB -> wallet leg of the most recent
     /// startup_reconcile().  See last_db_leg().
     StartupDbLeg db_leg_;
+
+    /// [S14] See last_wallet_pending_cancel().
+    std::vector<WalletPendingCancelRecord> wallet_pending_cancel_{};
+
+    /// [S14] Put a wallet trade record into State: parsed when possible,
+    /// otherwise with minimal metadata so its coins are not locked
+    /// invisibly.  Returns true when the record parsed.  No RPC.
+    bool adopt_wallet_record(const std::string&    trade_id,
+                             const nlohmann::json& record,
+                             BlockHeight           current_block);
 
     /// Probe-only admission mirror of xch_ledger_admits, run against a
     /// COPY of the cycle ledger by the ladder preflight: same charges,

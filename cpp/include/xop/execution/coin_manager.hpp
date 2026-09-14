@@ -477,6 +477,26 @@ public:
      */
     void log_coin_summary(std::int64_t wallet_id) const;
 
+    /**
+     * @brief Compute the sha256-based coin_name from its components.
+     *
+     * coin_name = sha256(parent_coin_info || puzzle_hash || amount_clvm)
+     *
+     * Used when an RPC response carries no coin name and it must be derived.
+     * [S14 2026-09-13] Public so the cancel escalation can name a trade
+     * record's coins_of_interest for the full node's
+     * get_coin_records_by_names: trade records carry no coin names.
+     *
+     * @param parent_id    Parent coin identifier (32 bytes, hex).
+     * @param puzzle_hash  Puzzle hash (32 bytes, hex).
+     * @param amount       Coin amount in mojos (>= 0).
+     * @return 64-character lowercase hex coin_name.
+     * @throws std::exception on malformed hex or an OpenSSL digest failure.
+     */
+    static std::string compute_coin_name(const std::string& parent_id,
+                                         const std::string& puzzle_hash,
+                                         Mojo               amount);
+
 private:
     // -- Internal helpers ---------------------------------------------------
 
@@ -497,23 +517,6 @@ private:
      * @return Populated CoinInfo.
      */
     static CoinInfo parse_coin(const json& coin_json);
-
-    /**
-     * @brief Compute the sha256-based coin_name from its components.
-     *
-     * coin_name = sha256(parent_coin_info || puzzle_hash || amount_bytes)
-     *
-     * This is used when the RPC response does not include the coin_name
-     * directly and it must be derived.
-     *
-     * @param parent_id    Parent coin identifier (32 bytes, hex).
-     * @param puzzle_hash  Puzzle hash (32 bytes, hex).
-     * @param amount       Coin amount in mojos.
-     * @return 64-character hex-encoded coin_name.
-     */
-    static std::string compute_coin_name(const std::string& parent_id,
-                                         const std::string& puzzle_hash,
-                                         Mojo               amount);
 
     // -- Member data --------------------------------------------------------
 
