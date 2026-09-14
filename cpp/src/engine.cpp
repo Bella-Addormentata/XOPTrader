@@ -3289,6 +3289,10 @@ asio::awaitable<void> Engine::run_startup_analysis()
         // held progress at 0/5 until the poll timeout force-completed the
         // phase with partial data -- four minutes of every restart spent
         // waiting, and regime detection started from almost nothing.
+        // (Those two prices are Dexie's /v1/markets buy[0] and sell[0] for
+        // that pair -- still 373.97 and 0.95 on 2026-09-13 -- i.e. its ask
+        // and bid read backwards; see TickerData.  Read correctly the book
+        // was bid 0.95 / ask 373.97: not crossed, just a junk ask.)
         //
         // Before S20 the junk mid WAS ingested, so the counter advanced on
         // garbage.  Neither is right: a pair given its full share of polls
@@ -4277,8 +4281,8 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
             dexie_last_success_at_ = std::chrono::steady_clock::now();
             market_data_->ingest_dexie(
                 pair.name,
-                ticker->price_buy,
-                ticker->price_sell,
+                ticker->best_bid,
+                ticker->best_ask,
                 ticker->price_last,
                 ticker->volume_xch_daily);
 
@@ -4291,12 +4295,12 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
             // dexie ticker snapshot.  The ticker provides best-level prices;
             // daily volume serves as a top-of-book depth proxy.
             // ISO/IEC 5055: guard against zero/negative prices.
-            if (ticker->price_buy > 0.0 && ticker->price_sell > 0.0) {
+            if (ticker->best_bid > 0.0 && ticker->best_ask > 0.0) {
                 market_data_->ingest_book_snapshot_for_ofi(
                     pair.name,
-                    ticker->price_buy,
+                    ticker->best_bid,
                     ticker->volume_xch_daily,   // bid-side depth proxy
-                    ticker->price_sell,
+                    ticker->best_ask,
                     ticker->volume_xch_daily);  // ask-side depth proxy
             }
         }

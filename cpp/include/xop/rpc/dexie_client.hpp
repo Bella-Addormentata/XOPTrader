@@ -137,37 +137,94 @@ struct OffersPage {
 };
 
 /// 24-hour ticker data from /v1/markets (one market entry).
+///
+/// WHICH DEXIE ARRAY IS THE BID.  Dexie groups markets under a key asset
+/// ("xch", or a CAT id) and lists each token under it, quoting every price
+/// in KEY units per TOKEN.  Its two depth arrays are named for what a TAKER
+/// does with the token, not for the side of the book:
+///
+///   prices.buy[]   what a taker PAYS to buy the token   -> the token's ASK
+///   prices.sell[]  what a taker GETS to sell the token  -> the token's BID
+///
+/// Verified 2026-09-13 against our own resting offer.  The XCH/BYC tier-0
+/// BID was posted at pseudo-price 1450889106845 for 1 XCH, i.e. 1451 BYC
+/// mojos = 1.451 BYC per XCH.  Under "xch" Dexie listed BYC with
+/// buy[depth 0] = 0.6891798759476223 = 1/1.451 and sell[depth 0] = 0.3:
+/// our bid gives BYC away, so it is an ASK for the token.  Dexie's reverse
+/// listing (XCH under the BYC key) agrees: sell[depth 0] = 1.451, our bid,
+/// and buy[depth 0] = 3.3333333333333335 = 1/0.3.
+///
+/// Before that, the parse read buy as the bid (fields price_buy/price_sell)
+/// and every ticker came out with its sides exchanged: XCH/BYC read bid
+/// 3.333333 / ask 1.451, logged as a crossed book every heartbeat, over a
+/// book that was bid 1.451 / ask 3.333333.  The Case A reciprocal-and-flip
+/// (04e96e1) was always the correct transformation; it was fed swapped
+/// inputs.  TODO S7 (2026-08) proposed this relabel and was closed "not a
+/// defect" because the flip existed -- which never tested what "buy" means.
+/// test_dexie_market_ticker.cpp pins both halves against the live listings.
+///
+/// ORIENTATION.  best_bid / best_ask are the bid and ask of the pair the
+/// struct describes, in that pair's quote units per base unit:
+///   * parse_market_ticker() / get_tickers(): the pair AS LISTED --
+///     base = the token (id), quote = the market key (pair_id).
+///   * orient_market_ticker() / get_ticker(): the pair that was requested.
+/// The volume fields are NOT oriented; they stay keyed as listed.
 struct TickerData {
-    std::string id;           ///< CAT asset ID of the quote token.
+    std::string id;           ///< Listed token's asset id ("xch" under a CAT key).
     std::string code;
     std::string name;
-    std::string pair_id;
+    std::string pair_id;      ///< The market key the token is listed under.
     bool        incentives = false;
 
-    /// Daily volume denominated in XCH.
+    /// Daily volume in the MARKET KEY's asset: XCH under "xch", but the CAT
+    /// under a CAT key, whatever the name says.
     double volume_xch_daily = 0.0;
-    /// Daily volume denominated in the quote token.
+    /// Daily volume in the listed token.
     double volume_quote_daily = 0.0;
 
-    /// Best buy / sell / last price at depth-0.
-    ///
-    /// As produced by ``parse_ticker_`` these are RAW Dexie values in the
-    /// market's own denomination (XCH per CAT); they are NOT yet bid/ask in
-    /// our quote-per-base convention.  ``get_ticker`` applies the invert and
-    /// swap for Case A (``dexie_client.cpp`` "Invert and swap bid/ask"), so
-    /// only values returned by ``get_ticker`` satisfy bid == price_buy and
-    /// ask == price_sell.
-    ///
-    /// Do NOT "correct" the apparent side labels inside ``parse_ticker_``.
-    /// A 2026-08 audit (TODO S7) read that function in isolation and
-    /// proposed exactly that swap; applying it would double-invert and put
-    /// bid and ask backwards on every Case A pair at once.
-    double price_buy  = 0.0;
-    double price_sell = 0.0;
+    /// Depth-0 bid and ask (see above).  0.0 means no offer on that side.
+    double best_bid   = 0.0;
+    double best_ask   = 0.0;
+    /// Last trade and 24-hour high / low, oriented like best_bid/best_ask.
     double price_last = 0.0;
     double price_high = 0.0;
     double price_low  = 0.0;
 };
+
+/// One /v1/markets entry, found for a requested base/quote pair.
+struct MarketTickerMatch {
+    /// The entry exactly as Dexie lists it (base = token, quote = key).
+    TickerData listed{};
+    /// The same entry oriented to the requested pair.
+    TickerData oriented{};
+    /// True when the market key is the requested BASE (Case A): every price
+    /// was replaced by its reciprocal and the sides exchanged.
+    bool inverted{false};
+};
+
+/// Parse one /v1/markets entry listed under `market_key`, AS LISTED:
+/// best_bid from "sell" and best_ask from "buy", both at depth 0, in
+/// market_key units per token.  Pure -- no I/O.
+[[nodiscard]] TickerData parse_market_ticker(const nlohmann::json& entry,
+                                             std::string_view      market_key);
+
+/// Find base/quote in a /v1/markets "markets" object and orient it to that
+/// pair.  Pure -- no I/O; get_ticker() is this plus the HTTP fetch.
+///
+///   (A) key == base  (XCH/BYC under "xch"): prices are base per quote.  A
+///       bid for the base is paid in the token, i.e. it is an ASK for the
+///       token, so: bid = 1/token ask, ask = 1/token bid, last = 1/last,
+///       high = 1/token low, low = 1/token high.
+///   (B) key == quote (BYC/wUSDC.b under wUSDC.b's key): prices are already
+///       quote per base, so the listing is returned as it is.
+///
+/// (A) is searched under every key before (B), the order get_ticker always
+/// used.  An absent (zero) price stays zero.  nullopt when nothing matches
+/// or `markets` is not an object.
+[[nodiscard]] std::optional<MarketTickerMatch> orient_market_ticker(
+    const nlohmann::json& markets,
+    std::string_view      base_asset_id,
+    std::string_view      quote_asset_id);
 
 /// Result of POST /v1/offers (offer submission).
 struct SubmitResult {
@@ -424,12 +481,13 @@ public:
         std::optional<int> status   = std::nullopt);
 
     /// GET /v1/markets
-    /// Returns 24-hour ticker data for every market grouped by base asset.
+    /// Returns 24-hour ticker data for every market entry, AS LISTED: each
+    /// describes <token>/<market key> (see TickerData).
     [[nodiscard]] boost::asio::awaitable<std::vector<TickerData>> get_tickers();
 
     /// GET /v1/markets  (filtered client-side for a single asset pair)
-    /// Convenience wrapper that returns only the ticker matching the
-    /// configured base and quote asset IDs.
+    /// Returns the ticker for the configured base and quote asset IDs,
+    /// oriented to that pair by orient_market_ticker().
     [[nodiscard]] boost::asio::awaitable<std::optional<TickerData>> get_ticker(
         std::string_view base_asset_id,
         std::string_view quote_asset_id);
@@ -531,8 +589,9 @@ private:
 
     [[nodiscard]] static AssetInfo   parse_asset_(const nlohmann::json& j);
     [[nodiscard]] static OfferRecord parse_offer_(const nlohmann::json& j);
-    [[nodiscard]] static TickerData  parse_ticker_(const nlohmann::json& j,
-                                                   std::string_view base_asset);
+    // Market entries are parsed by the free parse_market_ticker() and
+    // orient_market_ticker() above, so the side convention is testable
+    // without constructing a client.
 
     // -- State ------------------------------------------------------------
 

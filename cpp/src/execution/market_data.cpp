@@ -541,6 +541,12 @@ void MarketDataFeed::ingest_dexie(const std::string& pair_name,
     // this does NOT indicate bad data -- it just means no one has taken
     // the arbitrage yet.  Accept the data and let the price guard in
     // Step 7 clamp our offers safely outside the cross.
+    //
+    // [2026-09-13] True of Dexie, but NOT what this line reported every
+    // heartbeat on XCH/BYC and XCH/DBX until then: those were the ticker's
+    // two sides read backwards (TickerData, dexie_client.hpp).  With the
+    // sides read correctly a crossed ticker is the exception, so when this
+    // fires now it is describing the book.
     if (best_bid > 0.0 && best_ask > 0.0 && best_bid >= best_ask) {
         spdlog::info("[MarketData] Crossed book for {}: bid={:.6f} >= "
                      "ask={:.6f} (normal on Dexie -- no matching engine)",

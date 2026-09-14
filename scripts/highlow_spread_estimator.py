@@ -1051,9 +1051,10 @@ def dexie_high_low(payload: dict, pair: str,
     at 2.  The value actually applied is returned in the row so the report
     can print the limit that fired rather than one it assumed.
 
-    These are the same price_high / price_low that dexie_client.cpp:647-650
-    parses into TickerData and dexie_client.cpp:821-828 orientation-swaps --
-    and that nothing in the engine then reads.  They are free input.
+    These are the same price_high / price_low that parse_market_ticker()
+    (dexie_client.cpp) parses into TickerData and orient_market_ticker()
+    orientation-swaps -- and that nothing in the engine then reads.  They
+    are free input.
 
     ORIENTATION: dexie keys markets by pair_id and quotes CAT_XCH, i.e.
     price is XCH per CAT.  Our XCH/BYC is BYC per XCH, so the swap is a

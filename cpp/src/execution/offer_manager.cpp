@@ -3117,8 +3117,8 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
                 auto ticker = co_await dexie_client_->get_ticker(
                     pcfg.base_asset_id, pcfg.quote_asset_id);
                 if (ticker.has_value()) {
-                    // Mid = (buy + sell) / 2, in XCH mojos.
-                    const double mid = (ticker->price_buy + ticker->price_sell) / 2.0;
+                    // Mid = (best_bid + best_ask) / 2, in XCH mojos.
+                    const double mid = (ticker->best_bid + ticker->best_ask) / 2.0;
                     if (mid > 0.0) {
                         mid_prices[pname] = static_cast<Mojo>(std::llround(
                             mid * static_cast<double>(kMojosPerXch)));
