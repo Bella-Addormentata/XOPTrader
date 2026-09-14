@@ -120,6 +120,7 @@ add_executable(xop_tests
     test_wallet_circuit.cpp
     test_rpc_transport_evidence.cpp
     test_stuck_prune_scope.cpp
+    test_shutdown_flag.cpp
 )
 
 target_link_libraries(xop_tests

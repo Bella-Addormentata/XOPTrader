@@ -38,6 +38,9 @@
 //   SIGTERM / taskkill /F ...... 0 s -- no handler runs at all
 //   console window close (X) ... ~5 s -- CTRL_CLOSE_EVENT is not mapped
 //   a new engine starting ...... 0 s -- kill_old_instances() TerminateProcess
+//   a new GUI starting ......... 0 s, or up to 45 s while shutdown.flag or a
+//                                closing GUI's stop marker names this engine --
+//                                then TerminateProcess of the old GUI AND of us
 //
 // The incident was the third row (600 s), NOT the first. Sizing this to 30 s
 // would size it for the one waiter that hard-kills us regardless.
