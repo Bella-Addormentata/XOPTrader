@@ -300,7 +300,7 @@ TEST(DexieMarketTicker, BothListingsOfOneMarketAgree)
     // in both units, and the BYC-keyed one sits outside its own 1.25-2.0
     // range.  Every CAT-keyed listing in the saved response does the same,
     // with 1/last inside its range, so Dexie appears to serve `last`
-    // reciprocally under CAT keys -- TODO S48, not a property of ours.
+    // reciprocally under CAT keys -- TODO S53, not a property of ours.
 }
 
 // [round 3] Dexie can list one market under BOTH keys, and the saved response

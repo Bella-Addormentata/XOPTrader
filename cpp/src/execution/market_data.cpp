@@ -968,7 +968,7 @@ FairValueObservation MarketDataFeed::get_fair_value_inputs(
     // conjuncts are deliberately NOT added: requiring them would change the
     // filtered path.  (print_age widens a filtered book that stops moving,
     // but it advances only when a filtered ingest runs, so a book that no
-    // fetch refreshes keeps its weight -- pre-existing, TODO S49.)
+    // fetch refreshes keeps its weight -- pre-existing, TODO S54.)
     if (ps.bbo_from_filtered_book
         && ps.dex_best_bid > 0.0 && ps.dex_best_ask > 0.0
         && ps.dex_best_ask >= ps.dex_best_bid) {
