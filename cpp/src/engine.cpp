@@ -2403,7 +2403,7 @@ asio::awaitable<void> Engine::poll_loop_coro()
                     // real mojos held.
                     inventory_->seed_position(AssetId{aid}, seed_qty,
                                               Mojo{1});
-                    // Also seed State positions so that apply_limits()
+                    // Also seed State positions so that evaluate_limits()
                     // has accurate balances from the start (not just
                     // from detected fills).
                     state_->record_buy(AssetId{aid}, seed_qty, Mojo{1});
@@ -5668,9 +5668,10 @@ void Engine::step_compute_quotes(BlockHeight block_height)
         if (config_.strategy.sigma_floor > 0.0) {
             sigma = std::max(sigma, config_.strategy.sigma_floor);
         }
-        // Compute inventory (signed net position in the pair's base asset).
-        // Convert from mojos to base-asset display units so that q and q_max
-        // are in the same units (T1-12 fix: prevents ~10^12 ratio error).
+        // q is the WHOLE holding of the pair's base asset, not a signed
+        // per-pair position or a gap from a target: net_inventory returns the
+        // asset's total_quantity (>= 0), so sizing sees the entire balance.
+        // In display units like q_max (T1-12 fix: prevents ~10^12 ratio error).
         double q = static_cast<double>(
             inventory_->net_inventory(AssetId{pair_cfg->base_asset_id}))
             / static_cast<double>(pair_cfg->base_mojos_per_unit);

@@ -264,12 +264,14 @@ private:
 //
 //     Quote q = strategy.compute_quotes(...);
 //     q = risk.enforce_no_loss(q, cost_basis, enable_constraint);
-//     auto checked = risk.apply_limits(q, pair, base, quote, state);
-//     if (!checked) {
-//         // both sizes zero after limits (evaluate_limits() says which
-//         // side a limit zeroed) -- skip this cycle
+//     const LimitsDecision decision =
+//         risk.evaluate_limits(q, base_id, quote_id, state);
+//     if (!decision.has_quote) {
+//         // both sizes zero after limits -- skip this cycle.  For each of
+//         // decision.trace.bid and .ask, side_zero_cause() says whether it
+//         // arrived at 0 or a limit zeroed it, and zeroed_by names the rule.
 //     }
-//     offer_manager.post(*checked);
+//     offer_manager.post(decision.quote);
 //
 // ---------------------------------------------------------------------------
 
