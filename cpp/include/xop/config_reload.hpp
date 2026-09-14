@@ -83,6 +83,16 @@ template <typename PairT>
     return out;
 }
 
+/// [PACE 2026-09-13] The pace controller may be turned OFF live: the
+/// heartbeat's config reload runs before every pace hook, and turning things
+/// OFF must never wait on a restart (above).  Turning it ON, or editing any
+/// pace key, needs a restart, which the reload reports wholesale.
+[[nodiscard]] inline constexpr bool pace_disables_live(bool running_enabled,
+                                                       bool saved_enabled) noexcept
+{
+    return running_enabled && !saved_enabled;
+}
+
 }  // namespace xop
 
 #endif  // XOP_CONFIG_RELOAD_HPP

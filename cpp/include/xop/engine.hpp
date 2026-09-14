@@ -17,7 +17,8 @@
 //   main loop.
 //
 // Lifecycle:
-//   Engine(AppConfig, dry_run)  -- construct all subsystems, validate config
+//   Engine(AppConfig, dry_run, ProcessIdentity)
+//                               -- construct all subsystems, validate config
 //   run()                       -- open connections, enter main loop, block
 //   shutdown()                  -- signal stop, cancel all offers, close
 //
@@ -47,6 +48,7 @@
 #include "xop/rpc/tibetswap_client.hpp"
 
 // Execution layer
+#include "xop/execution/cancel_escalation.hpp"
 #include "xop/execution/coin_manager.hpp"
 #include "xop/execution/market_data.hpp"
 #include "xop/execution/offer_manager.hpp"
@@ -70,7 +72,9 @@
 #include "xop/risk/valuation_authority.hpp"
 #include "xop/risk/peg_suspension.hpp"
 #include "xop/config_reload.hpp"
+#include "xop/util/process_identity.hpp"
 #include "xop/strategy/bbo_sanity.hpp"
+#include "xop/strategy/pace_controller.hpp"
 #include "xop/strategy/no_loss_floor.hpp"
 #include "xop/risk/usd_route.hpp"
 #include "xop/risk/inventory.hpp"
@@ -118,6 +122,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -607,6 +612,14 @@ inline constexpr std::chrono::seconds kDexieProbeLivenessWindow{300};
 // Owns all subsystems and drives the per-block heartbeat loop.
 // ---------------------------------------------------------------------------
 
+namespace util {
+// [shutdown-flag-race] Defined in xop/util/shutdown_flag.hpp, which only
+// engine.cpp includes: declared here so a change to that decision header does
+// not rebuild every translation unit that includes engine.hpp.
+enum class ShutdownFlagSite : int;
+struct ShutdownFlagDecision;
+}  // namespace util
+
 class Engine {
 public:
     // -- Construction --------------------------------------------------------
@@ -617,9 +630,15 @@ public:
     /// @param dry_run  If true, the engine simulates all wallet operations
     ///                 without broadcasting transactions on-chain.  Useful
     ///                 for integration testing against a live full node.
+    /// @param process_identity  This process's PID and start instant, from
+    ///                 util::capture_process_identity() as the first
+    ///                 statement of main(). A data/shutdown.flag stop request
+    ///                 is honoured only if it names this PID (or no PID) and
+    ///                 was written at or after this start.
     ///
     /// @throws std::runtime_error if any subsystem fails to initialise.
-    Engine(const AppConfig& config, bool dry_run);
+    Engine(const AppConfig& config, bool dry_run,
+           util::ProcessIdentity process_identity);
 
     /// [RELOAD] Tell the engine which files its config was loaded from so
     /// a GUI save can be re-read live. Optional: never calling it simply
@@ -704,7 +723,7 @@ private:
     ///  3. Update volatility, PIN, regime estimates
     ///  4. Compute optimal quotes (A-S / GLFT)
     ///  5. Apply spread optimizer adjustments
-    ///  6. Apply risk limits (inventory, Kelly, no-loss)
+    ///  6. Apply risk limits (no-loss floor, concentration, CAT and pair caps)
     ///  7. Generate multi-tier offer ladder
     ///  8. Cancel stale offers, post new ones
     ///  9. Check arbitrage opportunities
@@ -750,8 +769,33 @@ private:
     void step_apply_spread_optimizer(BlockHeight block_height);
 
     /// Step 6: Apply pre-trade risk checks (never-sell-at-loss, inventory
-    /// limits, Kelly sizing, CAT concentration cap).
+    /// concentration limits, single-CAT cap, pair-capital cap).  No Kelly
+    /// sizing: InventoryTracker::compute_kelly_size has no production caller.
     void step_apply_risk_limits(BlockHeight block_height);
+
+    /// [PACE 2026-09-13] Pace controller glue (the decisions live in
+    /// xop/strategy/pace_controller.hpp).  Heartbeat, immediately before
+    /// Step 6: top up the targeted assets' cached wallet balances when no
+    /// other writer kept them fresh (at most one RPC per asset per half the
+    /// freshness bound) ...
+    asio::awaitable<void> refresh_pace_balances(BlockHeight block_height);
+
+    /// ... then gather the pace inputs, run strategy::pace::decide, and store
+    /// each pair's plan in cycle_[pair].pace.  Disabled: clears every plan and
+    /// map, so a live disable leaves no stale latch behind.
+    void step_evaluate_pace(BlockHeight block_height);
+
+    /// Step 8, before the main loop: manage the resting offers of pace-managed
+    /// pairs -- hard TTL and crossing for an idle (hold, no-quote or empty)
+    /// ladder, and the increasing-side, absent-tier and budget cancels.
+    asio::awaitable<void> step_enforce_pace_caps(BlockHeight block_height,
+                                                 std::uint64_t recommended_fee);
+
+    [[nodiscard]] strategy::pace::PaceParams pace_params_from_config() const;
+
+    /// "XCH" -> "xch"; any other symbol -> the asset id of the first
+    /// configured pair leg whose upper-cased symbol equals it.
+    [[nodiscard]] std::optional<std::string> pace_asset_id_for_key(const std::string& key) const;
 
     /// Step 7: Expand the risk-filtered quotes into a multi-tier offer
     /// ladder via the LiquidityEngine.
@@ -1036,6 +1080,14 @@ private:
     /// True while the operator has been told the cancel failed; cleared
     /// (with a follow-up alert) when a retry finally succeeds.
     bool reload_cancel_alert_pending_ = false;
+    /// [review 2026-09-13, round 4] Set by every sweep_reload_disabled_offers
+    /// run that gets past its empty check: true when it only DEFERRED the
+    /// cancel because an operator Cancel All was in flight.  A deferral is
+    /// not a failure, and the reload alerts must not call it one.
+    bool reload_cancel_deferred_ = false;
+    /// [review 2026-09-13, round 4] The pending alert above stands for a
+    /// deferred cancel, not a failed one.
+    bool reload_cancel_alert_deferred_ = false;
     /// mtime of a flag file that could not be DELETED (AV lock, perms):
     /// skip re-processing until the file changes, instead of re-parsing
     /// the config and spamming the log every heartbeat.
@@ -1058,6 +1110,15 @@ private:
     // via the same TTL sweep, which also runs in the breaker skip branch.
     std::filesystem::path cancel_all_flag_path_;
     bool cancel_all_inflight_ = false;
+    /// [review 2026-09-13, round 4] When operator Cancel All last saw its
+    /// wallet-wide sweep get no usable answer, and which tracked offers State
+    /// already had a cancel in flight for just before that sweep.  shutdown()
+    /// reads both: a stop while that branch runs sends no second wallet-wide
+    /// sweep before the rest of the wait, and those offers are no evidence the
+    /// sweep ran.  [round 5] The branch clears both when it ends any way other
+    /// than a shutdown request.  ioc_ thread only, like cancel_all_inflight_.
+    std::optional<std::chrono::steady_clock::time_point> unanswered_sweep_at_;
+    std::unordered_set<std::string> unanswered_sweep_pending_before_;
     /// [R2 #20] Durable engine-side gate: true from the operator's
     /// cancel-all until every marked cancel CONFIRMS (no tracked offer
     /// still cancel_pending). Unlike cancel_all_inflight_ (submission),
@@ -1088,11 +1149,30 @@ private:
     // [STOPDRAIN review #7] data/shutdown.flag: the GUI's graceful-close
     // request. On Windows the bridge cannot deliver SIGINT, so terminate()
     // used to hard-kill the engine past its shutdown cancel -- closing the
-    // GUI mid-drain left the book resting unmanaged. Consumed on the fast
-    // poll path; a stale flag is deleted at startup so a leftover cannot
-    // kill a fresh boot.
+    // GUI mid-drain left the book resting unmanaged.
+    //
+    // [shutdown-flag-race 2026-09-12] The GUI's request is ADDRESSED. A flag
+    // is honoured only if it names this PID -- or no PID, as a hand-written
+    // flag does -- and was written at or after this process started
+    // (xop/util/shutdown_flag.hpp). One for another PID, an older one or a
+    // malformed one is removed and never inherited; one that cannot be judged
+    // (unreadable, or its age or this PID unknown) is left in place. The
+    // pre-fix "any flag under 60 s old" rule let engine 11616 honour a request
+    // written for the engine a new GUI had just killed. The constructor sweeps
+    // once (BootSweep: discard, never stop); the fast poll, the analysis poll
+    // and the boot checkpoints act on it (Checkpoint).
     std::filesystem::path shutdown_flag_path_;
+    util::ProcessIdentity process_identity_{};
+    /// An undecidable flag (Keep) is warned about once per appearance.
+    bool shutdown_flag_keep_warned_{false};
+    /// Read the flag, decide, and act for `site`. Callers ignore the returned
+    /// decision, so this is deliberately NOT [[nodiscard]].
+    util::ShutdownFlagDecision evaluate_shutdown_flag(util::ShutdownFlagSite site);
     void check_shutdown_flag();
+    /// A boot stop checkpoint: evaluates the flag, then reports whether a stop
+    /// (flag or signal) is requested. On true the caller must co_return --
+    /// shutdown() has already spawned the continuation that owns teardown.
+    [[nodiscard]] bool boot_stop_checkpoint(const char* where);
 
     [[nodiscard]] bool asset_peg_suspended(const std::string& asset_id) const;
     [[nodiscard]] bool pair_peg_suspended(const PairConfig& pc) const;
@@ -1135,11 +1215,11 @@ private:
     // Written after the failure instead, a hard kill in the window between
     // would lose it and we would be fail-open again by a slightly later route.
     //
-    // A file rather than a DB column: offer_log has no such status today,
-    // query_pending_offers() filters on status='pending' exactly, and a row
-    // moved to some new status would vanish from the restore at boot -- a
-    // schema change whose failure mode is worse than the bug. The file is
-    // additive and the DB rows keep their existing meaning.
+    // A file rather than a DB column, and still a file after [S14]: offer_log
+    // now has a 'cancel_pending' status, and query_pending_offers() restores
+    // it, but that status records a SUBMITTED cancel. This file records an
+    // ORDERED one -- written before the first attempt -- which is exactly the
+    // half a hard kill between the order and the RPC would otherwise lose.
     std::filesystem::path cancel_intent_path_;
     /// The pre-review name. Read once at boot if the current path is absent,
     /// so an intent file written by an older build is not silently orphaned.
@@ -1214,6 +1294,39 @@ private:
     /// CYCLES, which is the point: this is what stops the shutdown failure
     /// from simply moving to boot time.
     asio::awaitable<void> sweep_cancel_intent(BlockHeight block);
+
+    // -- [S14 2026-09-13] Proof-gated escalation of stranded cancels ----------
+    //
+    // Owns every cancel_pending offer.  An accepted cancel is a submission,
+    // and the wallet can sit in PENDING_CANCEL indefinitely with the offer
+    // still takeable; nothing else re-cancels such an offer (cancel_stale and
+    // selective_cancel skip cancel_pending by design).  Runs from
+    // poll_loop_coro right after sweep_cancel_intent, above the Step 7/8 gate
+    // chain, on the same terms: it posts nothing, and it pays a fee only when
+    // the wallet reports the trade live AND the full node shows every maker
+    // coin unspent.  The decisions live in execution/cancel_escalation.hpp.
+    asio::awaitable<void> escalate_stuck_cancels(BlockHeight block);
+    /// Send the queued CancelUnresolved alert when its window is open, and
+    /// mark exactly the offers it names as alerted.
+    void flush_cancel_unresolved_alerts();
+    /// Per-offer escalation state.  In memory; the escalation COUNT and the
+    /// highest escalation FEE are re-seeded from offer_closure_events at first
+    /// sighting, so a restart grants neither a fresh ladder nor a bid that
+    /// only repeats the last one.
+    std::unordered_map<std::string, execution::CancelEscalationTrack>
+        cancel_escalation_tracks_;
+    /// Offers waiting to be named in a CancelUnresolved alert.
+    execution::UnresolvedAlertQueue cancel_unresolved_alerts_{};
+    /// [S14] Step 8 stuck summary: logged on a count change or every
+    /// kStuckSummaryLogIntervalBlocks, not every block.
+    struct StuckLogState {
+        std::size_t last_count{0};
+        BlockHeight last_logged_block{0};
+    };
+    std::unordered_map<std::string, StuckLogState> stuck_log_state_;
+    /// [S14] The S46 "cancel spend already in flight" count last logged, so
+    /// that line is written on a change rather than every heartbeat.
+    std::size_t s46_awaiting_logged_{0};
     /// [S28] Which RPC answers "what block is it?", re-decided every poll.
     ///
     /// This is the TRANSITION STATE: the streak counters and the hysteresis
@@ -1791,20 +1904,43 @@ private:
     std::atomic<bool> shutdown_cancel_done_{false};
 
     // -- Wallet circuit breaker ----------------------------------------------
-    // After consecutive wallet RPC failures, skip wallet-dependent heartbeat
-    // steps (2 and 8) and poll for wallet recovery instead.  This prevents
-    // timeout cascades from stalling the entire heartbeat loop when the
-    // wallet daemon is unreachable.
+    // [WALLET-CIRCUIT 2026-09-13] Stops wallet timeout cascades from stalling
+    // the heartbeat.  It used to count THROWS out of Steps 2 and 8, and
+    // neither step throws for a stalled wallet: detect_fills swallows every
+    // get_offer failure, and Step 8's sync check logs and co_returns.  On
+    // 2026-09-12 blocks 9284260, 9284302 and 9284313 took 156-173 s each --
+    // 9-11 wallet calls in series, every one exhausting ~15.5 s of libcurl
+    // retries -- and the breaker never opened in any of three stall windows.
+    //
+    // It now reads the wallet CLIENT's transport evidence (rpc_post records
+    // how every call ended, whoever swallows the exception;
+    // rpc/transport_evidence.hpp) through execution::wallet_gate
+    // (execution/wallet_circuit.hpp), at every wallet_step_may_run() gate:
+    //   * one transport failure since this heartbeat's mark, with nothing
+    //     answering since, skips the rest of the heartbeat's wallet work;
+    //   * execution::kWalletCircuitTripFailures consecutive transport
+    //     failures, across callers and heartbeats, open the breaker; the poll
+    //     loop's get_sync_status probe is still what closes it.
 
-    /// Number of consecutive wallet RPC failures.
-    std::uint32_t wallet_consecutive_failures_{0};
+    /// The wallet client's transport counters at the top of the current
+    /// heartbeat.  Only a failure after this mark skips the heartbeat, so the
+    /// first wallet call of every heartbeat is always issued (the canary).
+    rpc::TransportCounters wallet_transport_at_cycle_start_{};
 
-    /// Threshold: after this many consecutive failures, wallet-dependent
-    /// heartbeat steps are skipped until the wallet recovers.
-    static constexpr std::uint32_t kWalletCircuitBreakerThreshold{3};
+    /// The per-heartbeat skip warns once per heartbeat, then drops to debug.
+    bool wallet_skip_warned_this_cycle_{false};
 
     /// True when the circuit breaker has tripped (wallet assumed unreachable).
     bool wallet_circuit_open_{false};
+
+    /// The one gate every wallet-dependent heartbeat step consults before
+    /// its wallet calls.  false while the breaker is open, after a transport
+    /// failure this heartbeat that nothing has answered since, and on the
+    /// call that trips the breaker (which it opens).  @p step names the
+    /// caller in the log line.  Deliberately NOT consulted by the S46 intent
+    /// sweep (above every gate; it keeps its own per-id check), by startup,
+    /// or by the breaker's probe.
+    [[nodiscard]] bool wallet_step_may_run(std::string_view step);
 
     /// Set by every RISK-BREAKER pause (max-drawdown, rolling-window loss,
     /// ledger divergence) and never cleared at runtime: manual intervention
@@ -1828,6 +1964,13 @@ private:
     /// but the condition is a standing misconfiguration that would otherwise
     /// re-warn on every heartbeat for the life of the process.
     std::set<std::string> activity_range_warned_;
+
+    /// [STEP6-CAUSE 2026-09-13] One no-quote warn gate per pair.  Step 6's
+    /// no-quote warn used to fire on every heartbeat -- 556 XCH/BYC lines
+    /// between the 2026-09-12 23:24 restart and 04:45, about 106 an hour.
+    /// Process-local on purpose: it suppresses a log line, never a quoting
+    /// decision.
+    std::unordered_map<std::string, LimitBlockWarnGate> step6_no_quote_warn_gates_;
 
     /// [S19 review round 11] Whether the bridge scan can currently act
     /// as the bridge asset's inventory maintainer.  The Step 8 recovery
@@ -1914,7 +2057,9 @@ private:
         QuoteResult   raw_quote{};          ///< Output of strategy.
         SpreadResult  spread_result{};      ///< Output of spread optimizer.
         Quote         risk_quote{};         ///< After risk filter.
-        bool          quote_valid{false};   ///< False if risk killed both sides.
+        bool          quote_valid{false};   ///< False once a step drops the pair this cycle;
+                                            ///< at Step 6, both sizes zero after the limits
+                                            ///< (one may be the strategy's own 0).
         std::vector<TierQuote> ladder;      ///< Multi-tier expansion.
 
         // [T3-24] Dependency-aware gating: set to true only when Step 1
@@ -1968,6 +2113,20 @@ private:
         // 0 until Step 5 runs compute_spread() for this pair this cycle;
         // consumers treat 0 as "no reading" rather than as 1.0x.
         double        spread_base_bps{0.0};
+
+        // [STEP6-CAUSE 2026-09-13] Step 4's inventory input and the q_max
+        // the pair's strategy was built with (effective_q_max).  Avellaneda
+        // sizes bid = q_max*max(0, 1-q/q_max) from TOTAL base holdings
+        // (avellaneda.cpp:268-270), so Step 6 prints both when it explains a
+        // zero side.  Both stay 0 until Step 4 quotes the pair; cycle_ is
+        // rebuilt every heartbeat.
+        double        strategy_q{0.0};
+        double        strategy_q_max{0.0};
+
+        // [PACE 2026-09-13] This heartbeat's pace plan for the pair.  The
+        // default (managed == false) makes every pace hook a no-op, and cycle_
+        // is rebuilt every heartbeat, so a plan never outlives its heartbeat.
+        strategy::pace::PairPlan pace{};
     };
 
     /// Per-pair cycle state for the current block.
@@ -2423,6 +2582,23 @@ private:
         bool fields_validated{false};
     };
     std::unordered_map<std::string, WalletBalanceEntry> cached_wallet_balances_;
+
+    // -- [PACE 2026-09-13] Pace controller state -----------------------------
+    // The only pace state kept between heartbeats is each asset's activation
+    // latch and ramp; both reset on restart, which is the conservative
+    // direction (re-activation needs share > enter, tightening ramps from 0).
+    // Every size is re-derived from the DB, the wallet and the fair value each
+    // heartbeat.  remaining/consumed carry this heartbeat's Step 9f budget.
+    std::unordered_map<std::string, strategy::pace::AssetMemory> pace_memory_{};
+    std::unordered_map<std::string, double>                      pace_remaining_units_{};
+    std::unordered_set<std::string>                              pace_assets_consumed_this_cycle_{};
+    std::unordered_map<std::string, strategy::pace::PaceStatus>  pace_last_status_{};
+    std::unordered_set<std::string>                              pace_band_conflict_logged_{};
+    // [PACE round 2] refresh_pace_balances' own per-asset backoff: the block of
+    // its last balance RPC for each asset id, whatever the outcome, and the
+    // failures in a row it has seen there (for the rate-limited warning).
+    std::unordered_map<std::string, BlockHeight>                 pace_refresh_attempted_at_{};
+    std::unordered_map<std::string, std::uint32_t>               pace_refresh_failures_{};
 
     // -- [PNL-BASIS-PERSIST 2026-07-30] One-shot wallet reconcile ---------
     // After restart the restored inventory quantities can drift from the

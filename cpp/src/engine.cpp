@@ -29,8 +29,11 @@
 #include "xop/execution/crossed_book.hpp"
 #include "xop/execution/take_sizing.hpp"
 #include "xop/execution/take_retry.hpp"
+#include "xop/execution/cancel_escalation_config.hpp"
 #include "xop/execution/cancel_retry.hpp"
 #include "xop/execution/coin_pool_verdict.hpp"
+#include "xop/execution/stuck_prune_scope.hpp"
+#include "xop/execution/wallet_circuit.hpp"
 #include "xop/strategy/tier_gain.hpp"
 #include "xop/strategy/competitiveness_gate.hpp"
 #include "xop/execution/mid_gate.hpp"
@@ -39,6 +42,7 @@
 
 #include "xop/accounting/bridge_ingest.hpp"
 #include "xop/accounting/reward_ingest.hpp"
+#include "xop/accounting/maker_fill_legs.hpp"
 
 // [S19] Real SQLite API for the read-only warp_jobs.db scan.  database.hpp
 // deliberately forward-declares only the opaque handles; a .cpp that calls
@@ -68,6 +72,7 @@
 // formatter is separate from denom.hpp and why the log sites are deliberately
 // NOT part of the greppable-extraction list.
 #include "xop/util/denom_format.hpp"
+#include "xop/util/shutdown_flag.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -489,7 +494,8 @@ bool dexie_probe_is_live(bool                                  dexie_client_open
 // Construction / destruction
 // ===========================================================================
 
-Engine::Engine(const AppConfig& config, bool dry_run)
+Engine::Engine(const AppConfig& config, bool dry_run,
+               util::ProcessIdentity process_identity)
     : config_(config)
     , dry_run_(dry_run)
     , ioc_()
@@ -498,6 +504,17 @@ Engine::Engine(const AppConfig& config, bool dry_run)
     , drawdown_grace_remaining_(config.risk.drawdown_grace_blocks)
     , max_drawdown_frac_(config.risk.max_drawdown_frac)
 {
+    // [shutdown-flag-race] Assigned in the body, not the initialiser list:
+    // the member is declared long after the ones listed above (-Wreorder).
+    process_identity_ = process_identity;
+    spdlog::info("[Engine] process identity: PID {}, started {} ms before "
+                 "engine construction -- a shutdown.flag stop request is "
+                 "honoured only if it names this PID (or no PID) and was "
+                 "written at or after that start",
+                 process_identity_.pid,
+                 std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::filesystem::file_time_type::clock::now()
+                     - process_identity_.start).count());
     spdlog::info("[Engine] Initializing subsystems (dry_run={})", dry_run);
     spdlog::info("[Engine] Circuit breakers: max_drawdown={:.1f}% of equity "
                  "window_loss={:.0f}bps of equity/{} blocks "
@@ -702,7 +719,7 @@ Engine::Engine(const AppConfig& config, bool dry_run)
         AvellanedaConfig as_strat_cfg;
         as_strat_cfg.gamma = pair.gamma_override.value_or(config_.strategy.gamma);
         as_strat_cfg.kappa = pair.kappa_override.value_or(config_.strategy.kappa);
-        as_strat_cfg.q_max = pair.q_max_override.value_or(config_.strategy.q_max);
+        as_strat_cfg.q_max = effective_q_max(pair, config_.strategy);
         as_strat_cfg.min_margin_bps =
             pair.min_profit_margin_bps_override.value_or(
                 config_.strategy.min_profit_margin_bps);
@@ -951,8 +968,10 @@ Engine::Engine(const AppConfig& config, bool dry_run)
         config_reload_flag_path_ = db_dir / "config_reload.flag";
         // [STOPDRAIN] The GUI's Cancel All button.
         cancel_all_flag_path_ = db_dir / "cancel_all.flag";
-        // [STOPDRAIN review #7] Graceful-close request; a leftover from a
-        // previous run must not kill this boot.
+        // [STOPDRAIN review #7] Graceful-close request. [shutdown-flag-race]
+        // It is addressed to one engine process: a leftover written for any
+        // other process -- including a predecessor that held this same PID --
+        // must not stop this boot (see evaluate_shutdown_flag).
         shutdown_flag_path_ = db_dir / "shutdown.flag";
         // [S46] The write-ahead cancel intent. Unlike every other flag in
         // this directory, a leftover here is NOT stale garbage to be cleared
@@ -971,27 +990,20 @@ Engine::Engine(const AppConfig& config, bool dry_run)
         cancel_intent_path_        = db_dir / "uncancelled.txt";
         cancel_intent_legacy_path_ = db_dir / "uncancelled.json";
         load_cancel_intent();
-        {
-            // [R2 review] Staleness is mtime-based, not delete-on-boot: a
-            // flag YOUNGER than this process is a live close request from
-            // the managing GUI (written during our own startup), and
-            // deleting it would silently ignore the operator.
-            std::error_code sf_ec;
-            if (std::filesystem::exists(shutdown_flag_path_, sf_ec)) {
-                const auto flag_time = std::filesystem::last_write_time(
-                    shutdown_flag_path_, sf_ec);
-                if (!sf_ec
-                    && flag_time < std::filesystem::file_time_type::clock::
-                           now() - std::chrono::seconds(60)) {
-                    std::filesystem::remove(shutdown_flag_path_, sf_ec);
-                    spdlog::info("[Engine] removed stale shutdown.flag "
-                                 "from a previous run");
-                } else {
-                    spdlog::warn("[Engine] shutdown.flag is FRESH -- "
-                                 "honouring it as a live close request");
-                }
-            }
-        }
+        // [shutdown-flag-race 2026-09-12] The boot sweep. A request for another
+        // PID, one written before this process started, or a malformed one is
+        // removed here with a WARNING and never stops this engine. Anything
+        // else is left for the first stop checkpoint: the constructor never
+        // calls shutdown(), and ioc_ is not running yet.
+        //
+        // This replaced a 60 s window whose comment claimed a flag "YOUNGER
+        // than this process" was a live close request, while the code
+        // compared the mtime against now() - 60 s. On 2026-09-12 engine 11616
+        // honoured, at 22:41:19.729, a flag the closing GUI had written at
+        // 22:41:07.954 for engine 15916 -- which a newly launched GUI had
+        // already terminated. It consumed it at its first analysis poll,
+        // cancelled 1 of 12 offers and exited; no engine ran until 23:24.
+        evaluate_shutdown_flag(util::ShutdownFlagSite::BootSweep);
     }
 
     state_->set_status(BotStatus::Initializing);
@@ -1624,7 +1636,14 @@ void Engine::shutdown()
                         std::min<std::int64_t>(d, 0xFFFF'FFFF));
                 };
 
-                const execution::CancelRetryConfig retry_cfg{};
+                // [review 2026-09-13, round 2] The least wait before retrying
+                // after a wallet-wide sweep that got NO ANSWER is one request
+                // timeout of THIS wallet client plus a margin, read from the
+                // client rather than assumed (cancel_retry.hpp).
+                execution::CancelRetryConfig retry_cfg{};
+                retry_cfg.possibly_submitted_wait_ms =
+                    execution::wait_after_possibly_submitted_ms(
+                        wallet_->request_timeout().count());
                 // The hard wall-clock stop, handed INTO cancel_ids so the
                 // budget bounds the RPCs and not merely the sleeps between
                 // them. Without this the loop re-checked the clock only after
@@ -1689,6 +1708,53 @@ void Engine::shutdown()
                 execution::CancelLadder ladder(outstanding, retry_cfg,
                                                /*sweep_when_empty=*/true);
 
+                // [review 2026-09-13, round 4] NO SECOND WALLET-WIDE SWEEP WHILE
+                // AN UNANSWERED ONE MAY STILL RUN (cancel_retry.hpp). A stop ends
+                // operator Cancel All's no-answer branch at once, and attempt 1
+                // below would send a second wallet-wide cancel_offers while that
+                // sweep may still be running. While that branch runs -- until its
+                // deadline [round 5], not one wait -- or once this stop ended it,
+                // the ladder records that sweep as its attempt 1 instead: every
+                // tracked id stays outstanding, it sleeps only the rest of the
+                // wait, and it re-checks each offer before it cancels any.
+                const std::uint64_t since_unanswered_ms =
+                    unanswered_sweep_at_
+                        ? static_cast<std::uint64_t>(std::max<std::int64_t>(
+                              0,
+                              std::chrono::duration_cast<
+                                  std::chrono::milliseconds>(
+                                  std::chrono::steady_clock::now()
+                                  - *unanswered_sweep_at_)
+                                  .count()))
+                        : std::uint64_t{0};
+                const std::uint32_t seed_wait_ms =
+                    execution::unanswered_sweep_remaining_wait_ms(
+                        unanswered_sweep_at_.has_value(), since_unanswered_ms,
+                        retry_cfg);
+                // [review 2026-09-13, round 4] The offers State already had a
+                // cancel in flight for before the sweep this ladder re-checks
+                // after -- the engine's own TTL or rebalance cancels. They are
+                // no evidence that sweep ran (partition_rechecked_offer).
+                std::unordered_set<std::string> pending_before_sweep;
+                if (seed_wait_ms != 0) {
+                    pending_before_sweep = unanswered_sweep_pending_before_;
+                    spdlog::warn(
+                        "[Engine] [S46] operator Cancel All's wallet-wide sweep "
+                        "got no usable answer {} ms ago and may still be "
+                        "running -- NOT sending a second one: waiting at least "
+                        "the remaining {} ms, then re-checking {} offer(s) "
+                        "before any is cancelled",
+                        since_unanswered_ms, seed_wait_ms, outstanding.size());
+                    ladder.record(execution::seeded_unanswered_sweep_outcome(
+                        outstanding, seed_wait_ms));
+                } else {
+                    for (const auto& po : state_->get_all_offers()) {
+                        if (po.cancel_pending) {
+                            pending_before_sweep.insert(po.offer_id);
+                        }
+                    }
+                }
+
                 for (;;) {
                     const auto act = ladder.next(elapsed_ms());
                     if (act.step == execution::CancelLadderStep::Finish) break;
@@ -1710,6 +1776,61 @@ void Engine::shutdown()
                             std::chrono::milliseconds(act.delay_ms));
                         co_await retry_timer.async_wait(asio::use_awaitable);
                         continue;
+                    }
+
+                    // [review 2026-09-13, round 2] THE RETRY AFTER A SWEEP
+                    // THAT GOT NO ANSWER. The ladder has already made this
+                    // attempt wait at least one request timeout, and the
+                    // sweep may still have run: a per-id cancel of an offer
+                    // it already cancelled builds a second, conflicting
+                    // spend. So ask the wallet about every outstanding offer
+                    // FIRST, and hand cancel_ids only the ones it reports
+                    // live with no cancel spend in flight. needs_recheck()
+                    // stays set for every later retry of this ladder.
+                    // Probing stops at the deadline, and an offer left
+                    // unasked is a NoVerdict: kept outstanding, never
+                    // cancelled blind.
+                    if (ladder.needs_recheck()) {
+                        const BlockHeight recheck_block =
+                            last_block_.load(std::memory_order_relaxed);
+                        execution::RecheckPartition part;
+                        for (const auto& id : ladder.outstanding()) {
+                            execution::TerminalRecheck verdict =
+                                execution::TerminalRecheck::NoVerdict;
+                            if (std::chrono::steady_clock::now()
+                                < cancel_deadline) {
+                                verdict = co_await offer_mgr_->recheck_terminal(
+                                    id, recheck_block);
+                            }
+                            execution::partition_rechecked_offer(
+                                part, id, verdict,
+                                state_->get_offer(id).cancel_pending,
+                                pending_before_sweep.count(id) != 0);
+                        }
+                        spdlog::warn(
+                            "[Engine] [S46] attempt {} follows a wallet-wide "
+                            "sweep that got no answer -- re-checked {} "
+                            "offer(s): {} still live, {} already cancelling, "
+                            "{} cancelled or failed, {} FILLED, {} with no "
+                            "verdict (kept outstanding, not cancelled)",
+                            act.attempt_index, ladder.outstanding().size(),
+                            part.recancel.size(), part.already_pending.size(),
+                            part.dead.size(), part.filled.size(),
+                            part.unknown.size());
+                        // [review 2026-09-13, round 3] record_recheck holds the
+                        // live ids back when the re-check shows the sweep still
+                        // working through the book (cancel_retry.hpp).
+                        const std::size_t live_found = part.recancel.size();
+                        ladder.record_recheck(std::move(part));
+                        if (ladder.outstanding().size() < live_found) {
+                            spdlog::warn(
+                                "[Engine] [S46] the re-check shows the sweep "
+                                "still working through the book -- {} still-live "
+                                "offer(s) held back from attempt {}, not "
+                                "cancelled",
+                                live_found - ladder.outstanding().size(),
+                                act.attempt_index);
+                        }
                     }
 
                     // The first attempt keeps the bulk endpoint (one RPC for
@@ -1739,7 +1860,28 @@ void Engine::shutdown()
                     // with an EMPTY `failed` (the bulk endpoint names no ids),
                     // which record() would read as "nothing left -- Done".
                     res.sweep_refused   = oc.sweep_refused;
+                    // [review 2026-09-13, round 2] Without this the ladder
+                    // reads a sweep that got no answer as a refusal, and its
+                    // next attempt cancels every id again at once.
+                    res.bulk_possibly_submitted = oc.bulk_possibly_submitted;
                     ladder.record(std::move(res));
+                }
+
+                // [review 2026-09-13, round 5] A ladder seeded above with no
+                // tracked offer to re-check stops at once. Sleep out the rest of
+                // the operator sweep's wait before the S31 fallback below sends
+                // its own wallet-wide cancel. No other stop owes a wait: S31
+                // after a full ladder stays as it was (review F3).
+                if (const std::uint32_t owed = ladder.wait_owed_before_fallback();
+                    owed != 0) {
+                    spdlog::warn(
+                        "[Engine] [S46] no tracked offer to re-check after operator "
+                        "Cancel All's unanswered sweep -- waiting the remaining {} "
+                        "ms before the fallback's wallet-wide cancel",
+                        owed);
+                    asio::steady_timer owed_timer(ioc_);
+                    owed_timer.expires_after(std::chrono::milliseconds(owed));
+                    co_await owed_timer.async_wait(asio::use_awaitable);
                 }
 
                 outstanding = ladder.outstanding();
@@ -1774,6 +1916,17 @@ void Engine::shutdown()
                 // on a count comparison. `cancelled.size() < pending_before`
                 // was never the question; "is anything still resting" is.
                 if (!outstanding.empty()) {
+                    if (ladder.possibly_submitted()) {
+                        // [review 2026-09-13, round 2] Say why these ids may
+                        // not be what they look like.
+                        spdlog::warn(
+                            "[Engine] [S46] the wallet-wide sweep got NO "
+                            "ANSWER during this stop: {} offer(s) are still "
+                            "believed live, but a sweep that was still running "
+                            "may have cancelled some of them since they were "
+                            "last asked about",
+                            outstanding.size());
+                    }
                     spdlog::critical(
                         "[Engine] [S31] graceful cancellation got {}/{} after "
                         "{} attempt(s) in {} ms, stopped because {} (last "
@@ -1839,6 +1992,32 @@ void Engine::shutdown()
                         "wallet-wide cancel was refused and no locally "
                         "tracked offer ids exist to retry individually",
                         outstanding);
+                } else if (stop_reason ==
+                           execution::CancelStopReason::SweepPossiblySubmitted) {
+                    // [review 2026-09-13, round 2] Nothing is outstanding, but
+                    // the wallet-wide sweep got NO ANSWER: every tracked offer
+                    // is resolved, cancelled or already cancelling, and the
+                    // untracked book is as unproven as after a refusal.
+                    // Without this branch the stop would fall through to "All
+                    // outstanding offers cancelled". The S31 path runs as it
+                    // does after a refusal: it is wallet-wide, so a duplicate
+                    // of a sweep that did run strands no untracked offer --
+                    // though it can still report FAILED while that sweep is
+                    // running.
+                    spdlog::critical(
+                        "[Engine] [S33] the wallet-wide sweep got NO ANSWER "
+                        "after {} attempt(s) in {} ms (last error: {}): it may "
+                        "have run, may still be running, or may never have "
+                        "arrived. No tracked offer is still believed live, but "
+                        "offers this process never tracked may still be "
+                        "RESTING",
+                        attempts, elapsed_ms(),
+                        last_error.empty() ? "none" : last_error);
+                    watchdog_cancel_book(
+                        "graceful shutdown could not confirm the wallet-wide "
+                        "sweep: it got no answer, and the offers this process "
+                        "never tracked are unverified",
+                        outstanding);
                 } else if (bulk_submitted) {
                     spdlog::info("[Engine] All outstanding offers SUBMITTED "
                                  "for cancel via the bulk endpoint -- the "
@@ -1847,6 +2026,31 @@ void Engine::shutdown()
                     spdlog::info("[Engine] All outstanding offers cancelled "
                                  "({} attempt(s), {} ms)",
                                  attempts, elapsed_ms());
+                }
+
+                // [review 2026-09-13, round 2] Offers a re-check found
+                // already resolved left the ladder.
+                //
+                // [review 2026-09-13, round 3] CANCELLED or FAILED: NOT
+                // stamped here. Tagged Submitted, so the next engine's intent
+                // sweep asks the wallet again and stamps the row through its
+                // own wallet-verified writer (s46_intent_recovery) -- the
+                // operator path leaves resolved ids to that same sweep. A
+                // stamp from this site was one more terminal 'cancelled'
+                // writer beside the wallet-verified ones, for no gain: the
+                // row is stamped one boot later either way.
+                // CONFIRMED: it FILLED, so drop the intent and do NOT stamp it
+                // cancelled -- its offer_log row stays pending, which the next
+                // engine restores at boot and books through the fill path.
+                for (const auto& id : ladder.resolved_dead()) {
+                    cancel_intent_[id] = CancelIntentTag::Submitted;
+                }
+                for (const auto& id : ladder.resolved_filled()) {
+                    cancel_intent_.erase(id);
+                    spdlog::warn("[Engine] [S46] offer {} FILLED before the "
+                                 "cancel landed -- NOT stamped cancelled; the "
+                                 "next engine restores it and books the fill",
+                                 id.substr(0, 12));
                 }
 
                 // [review] Record HOW FAR each id got, so the next boot can
@@ -1874,12 +2078,19 @@ void Engine::shutdown()
                 // Shutdown is our last chance to update the audit trail; stale
                 // "pending" records cause ghost offers on next startup.  Retry
                 // up to 3 times with short delays before giving up.
+                //
+                // [S14] 'cancel_pending', not 'cancelled': the wallet accepted
+                // these cancels and nothing has confirmed. The next engine
+                // restores the rows cancel_pending, and the wallet verdict (or
+                // the escalation) finishes them.
+                const BlockHeight shutdown_block =
+                    last_block_.load(std::memory_order_relaxed);
                 for (const auto& oid : shutdown_cancelled) {
                     bool persisted = false;
                     for (int attempt = 0; attempt < 3 && !persisted; ++attempt) {
                         try {
-                            db_->update_offer_status(oid, "cancelled", 0,
-                                                    "shutdown");
+                            db_->mark_offer_cancel_submitted(oid, shutdown_block,
+                                                             "shutdown");
                             persisted = true;
                         } catch (const std::exception& e) {
                             spdlog::warn("[Engine] shutdown update_offer_status "
@@ -2114,18 +2325,15 @@ asio::awaitable<void> Engine::poll_loop_coro()
                 }
             }
 
-            // Mark cancelled orphans in the DB.  Adopted orphans were
-            // already upserted into State by startup_reconcile; persist
-            // them to the DB as well so they survive the next restart.
-            for (const auto& oid : orphans) {
-                try {
-                    db_->update_offer_status(oid, "cancelled", 0,
-                                            "startup_orphan");
-                } catch (const std::exception& e) {
-                    spdlog::debug("[Engine] startup_reconcile update_offer_status "
-                                 "failed for {}: {}",
-                                 oid.substr(0, 12), e.what());
-                }
+            // [S14] Cancelled orphans are no longer stamped 'cancelled'. The
+            // cancel was only SUBMITTED: startup_reconcile adopts each one into
+            // State flagged cancel_pending, and the persist loop below writes
+            // its row as 'cancel_pending'. (The old stamp never landed either:
+            // an orphan has no offer_log row, so it threw OfferNotFound.)
+            if (!orphans.empty()) {
+                spdlog::info("[Engine] [S14] {} orphan(s) cancelled at boot -- "
+                             "tracked as cancel_pending until the wallet "
+                             "reports them terminal", orphans.size());
             }
 
             // Persist adopted orphans so they show up as DB-pending on
@@ -2143,10 +2351,15 @@ asio::awaitable<void> Engine::poll_loop_coro()
                         rec.price_mojos   = po.price;
                         rec.size_mojos    = po.size;
                         rec.tier          = static_cast<int>(po.tier);
-                        rec.status        = "pending";
+                        rec.status        = db_status_for(po);
                         rec.created_block = po.created_at_block;
                         rec.fee_mojos     = po.fee_mojos;
                         db_->insert_offer(rec);
+                        if (po.cancel_pending) {
+                            // The row's cause and an event.
+                            db_->mark_offer_cancel_submitted(
+                                po.offer_id, startup_block, "startup_orphan");
+                        }
                     } catch (const std::exception& e) {
                         spdlog::debug("[Engine] Failed to persist adopted "
                                       "orphan {}: {}",
@@ -2160,15 +2373,8 @@ asio::awaitable<void> Engine::poll_loop_coro()
                 if (!known_ids.count(rec.offer_id)) {
                     continue;  // Was cancelled as orphan somehow.
                 }
-                PendingOffer po;
-                po.offer_id        = rec.offer_id;
-                po.pair_name       = rec.pair_name;
-                po.side            = (rec.side == "bid") ? Side::Bid : Side::Ask;
-                po.price           = rec.price_mojos;
-                po.size            = rec.size_mojos;
-                po.tier            = static_cast<std::uint8_t>(rec.tier);
-                po.created_at_block = rec.created_block;
-                po.fee_mojos       = rec.fee_mojos;
+                // [S14] A 'cancel_pending' row comes back cancel_pending.
+                const PendingOffer po = pending_offer_from_db(rec);
                 state_->upsert_offer(po);
 
                 // [STOPDRAIN review #2] An offer restored for a pair that
@@ -2192,6 +2398,112 @@ asio::awaitable<void> Engine::poll_loop_coro()
                              db_pending.size());
             }
 
+            // -- [S14 2026-09-13] Wallet PENDING_CANCEL records -----------------
+            // startup_reconcile keeps every PENDING_CANCEL trade its wallet scan
+            // saw. Each is matched to offer_log:
+            //   'pending'        the cancel was never recorded: mark it;
+            //   'cancel_pending' restored above: make sure State agrees;
+            //   'cancelled'      stamped at RPC acceptance while the wallet never
+            //                    finished it (the XCH/BYC bids of 2026-08-30):
+            //                    reopen the row and adopt the offer, so
+            //                    detect_fills polls it and a take is booked;
+            //   no row           not a bot offer: left alone (policy boundary).
+            // From here the escalation owns them. No RPC: Phase 1 kept each
+            // record, so adoption parses it rather than asking the wallet again
+            // while the watchdog is already armed.
+            if (!dry_run_) {
+                std::size_t pc_not_ours = 0;
+                std::size_t pc_marked = 0;
+                std::size_t pc_already = 0;
+                std::vector<std::string> pc_reopened;
+                for (const auto& pc : offer_mgr_->last_wallet_pending_cancel()) {
+                    std::optional<std::string> pc_db_status;
+                    try {
+                        pc_db_status = db_->query_offer_status(pc.trade_id);
+                    } catch (const std::exception& e) {
+                        spdlog::warn("[Engine] [S14] could not read offer_log for "
+                                     "wallet PENDING_CANCEL {}: {} -- left for "
+                                     "the next boot", pc.trade_id, e.what());
+                        continue;
+                    }
+                    switch (execution::startup_pending_cancel_action(pc_db_status)) {
+                        case execution::StartupPendingCancelAction::IgnoreNotOurs: {
+                            ++pc_not_ours;
+                            break;
+                        }
+                        case execution::StartupPendingCancelAction::MarkCancelPending: {
+                            offer_mgr_->adopt_wallet_pending_cancel(pc, startup_block);
+                            try {
+                                db_->mark_offer_cancel_submitted(
+                                    pc.trade_id, startup_block,
+                                    "wallet_pending_cancel_observed");
+                            } catch (const std::exception& e) {
+                                spdlog::warn("[Engine] [S14] could not mark {} "
+                                             "cancel_pending: {}",
+                                             pc.trade_id, e.what());
+                            }
+                            ++pc_marked;
+                            break;
+                        }
+                        case execution::StartupPendingCancelAction::AlreadyCancelPending: {
+                            offer_mgr_->adopt_wallet_pending_cancel(pc, startup_block);
+                            ++pc_already;
+                            break;
+                        }
+                        case execution::StartupPendingCancelAction::ReopenMislabelled: {
+                            bool reopened_row = false;
+                            try {
+                                reopened_row = db_->reopen_cancelled_as_cancel_pending(
+                                    pc.trade_id, startup_block,
+                                    "wallet_pending_cancel_recovered");
+                            } catch (const std::exception& e) {
+                                spdlog::warn("[Engine] [S14] could not reopen {}: {}",
+                                             pc.trade_id, e.what());
+                            }
+                            if (reopened_row) {
+                                offer_mgr_->adopt_wallet_pending_cancel(pc, startup_block);
+                                pc_reopened.push_back(pc.trade_id);
+                            }
+                            break;
+                        }
+                        case execution::StartupPendingCancelAction::Inconsistent: {
+                            spdlog::warn("[Engine] [S14] the wallet reports {} "
+                                         "PENDING_CANCEL but offer_log says '{}' "
+                                         "-- left alone",
+                                         pc.trade_id, pc_db_status.value_or(""));
+                            break;
+                        }
+                    }
+                }
+                if (!pc_reopened.empty()) {
+                    std::string reopened_ids;
+                    for (const auto& reopened_id : pc_reopened) {
+                        if (!reopened_ids.empty()) reopened_ids += ", ";
+                        reopened_ids += reopened_id;
+                    }
+                    spdlog::warn("[Engine] [S14] {} offer(s) were stamped "
+                                 "'cancelled' when their cancel RPC was accepted, "
+                                 "but the wallet still reports them PENDING_CANCEL "
+                                 "-- reopened as cancel_pending and tracked again "
+                                 "(a take is now booked; the escalation re-checks "
+                                 "the chain). IDS: {}",
+                                 pc_reopened.size(), reopened_ids);
+                }
+                if (pc_marked + pc_already + pc_not_ours > 0) {
+                    spdlog::info("[Engine] [S14] wallet PENDING_CANCEL at boot: {} "
+                                 "marked cancel_pending, {} already cancel_pending, "
+                                 "{} with no offer_log row (not ours; left alone)",
+                                 pc_marked, pc_already, pc_not_ours);
+                }
+            }
+
+            // [shutdown-flag-race] BC0. The prune below deletes unconfirmed
+            // transactions WALLET-WIDE; once a stop is requested it must not
+            // run beside the shutdown continuation's cancels.
+            if (boot_stop_checkpoint("before the stuck-transaction prune")) {
+                co_return;
+            }
+
             // -- Prune stuck transactions ------------------------------------
             // After offer reconciliation, scan wallet transaction lists for
             // transactions that were created but never broadcast (no spend
@@ -2212,33 +2524,77 @@ asio::awaitable<void> Engine::poll_loop_coro()
                              "transactions wallet-wide, which would take a "
                              "live engine's pending spends with it.");
             } else {
-                std::vector<std::int64_t> wallet_ids;
+                // [PRUNE-SCOPE 2026-09-13] Build the wallet-ID map FIRST.
+                // This list used to be built from an empty map, where
+                // resolve_wallet_id() answers 1 for "xch" and -1 for every
+                // CAT, and a `> 0` filter then dropped the CATs without a
+                // word: at 23:24:25.792 on 2026-09-12 the scan visited wallet
+                // 1 alone, and the map was not built until 23:24:27.548, by
+                // the ensure_wallet_ids() before the inventory seed.  The map
+                // built here is released again after the scan (below).
+                const bool wallet_map_built_before_scan =
+                    offer_mgr_->wallet_ids_resolved();
+                co_await offer_mgr_->ensure_wallet_ids();
+
+                std::vector<std::int64_t> prune_candidates;
                 for (const auto& pair : config_.pairs) {
                     if (!pair.enabled) continue;
-                    auto bwid = offer_mgr_->resolve_wallet_id(pair.base_asset_id);
-                    auto qwid = offer_mgr_->resolve_wallet_id(pair.quote_asset_id);
-                    if (bwid > 0) wallet_ids.push_back(bwid);
-                    if (qwid > 0) wallet_ids.push_back(qwid);
+                    prune_candidates.push_back(
+                        offer_mgr_->resolve_wallet_id(pair.base_asset_id));
+                    prune_candidates.push_back(
+                        offer_mgr_->resolve_wallet_id(pair.quote_asset_id));
                 }
-                // Deduplicate wallet IDs.
-                std::sort(wallet_ids.begin(), wallet_ids.end());
-                wallet_ids.erase(
-                    std::unique(wallet_ids.begin(), wallet_ids.end()),
-                    wallet_ids.end());
+                // execution/stuck_prune_scope.hpp: an unbuilt map DEFERS the
+                // whole scan instead of shrinking it to whatever resolved.
+                const execution::PruneScope boot_scope =
+                    execution::stuck_prune_scope(
+                        offer_mgr_->wallet_ids_resolved(), prune_candidates);
 
-                if (!wallet_ids.empty()) {
+                if (!boot_scope.complete) {
+                    spdlog::warn("[Engine] [PRUNE-SCOPE] Startup stuck-"
+                                 "transaction prune SKIPPED: the wallet-ID "
+                                 "map could not be built, so the enabled "
+                                 "pairs' CAT wallets cannot be named, and "
+                                 "scanning only what resolved would scan the "
+                                 "XCH wallet alone. Step 8's periodic prune "
+                                 "still covers wallets that report pending "
+                                 "change.");
+                } else if (!boot_scope.scan.empty()) {
                     auto pruned = co_await offer_mgr_->prune_stuck_transactions(
-                        wallet_ids, 600);
+                        boot_scope.scan, 600);
                     if (pruned > 0) {
                         spdlog::info("[Engine] Startup: pruned stuck transactions "
                                      "from {} wallet(s)", pruned);
                     }
+                }
+                // [PRUNE-SCOPE] Release the map this scan built.  The
+                // process's map is then first built after the wallet sync
+                // wait below, as it was before the scan needed one.  Built
+                // here, ahead of that wait, it could miss CAT wallets that a
+                // resyncing wallet creates later, and invalidate_wallet_ids()
+                // runs again only when the wallet breaker closes, so those
+                // assets would resolve to -1 for the life of the process.  It
+                // would also hand the startup coin pool CAT wallet ids that
+                // pool has never had at startup.  Costs one get_wallets().
+                if (!wallet_map_built_before_scan
+                    && offer_mgr_->wallet_ids_resolved()) {
+                    offer_mgr_->invalidate_wallet_ids();
                 }
             }
         } catch (const std::exception& ex) {
             spdlog::warn("[Engine] Startup offer reconciliation failed: {}; "
                          "continuing without recovery", ex.what());
         }
+    }
+
+    // [shutdown-flag-race 2026-09-12] BC1. Nothing between open_connections()
+    // and the first analysis poll used to look at shutdown.flag: on 2026-09-12
+    // a request sat through reconcile, prune, coin-pool maintenance and 12
+    // failed sync probes (~6 min) before that poll consumed it. Once a stop is
+    // requested the remaining startup steps -- coin splits, inventory seeding,
+    // the genesis ledger, analysis -- are skipped.
+    if (boot_stop_checkpoint("before coin pool maintenance")) {
+        co_return;
     }
 
     // -- Coin pool maintenance at startup ------------------------------------
@@ -2256,8 +2612,13 @@ asio::awaitable<void> Engine::poll_loop_coro()
     // still syncing.  Poll sync status until fully synced, with a
     // timeout to avoid blocking forever on a stuck wallet.
     if (wallet_) {
-        constexpr int kMaxSyncWaitBlocks = 30;  // ~26 min at 52s/block
-        for (int attempt = 0; attempt < kMaxSyncWaitBlocks; ++attempt) {
+        // 30 PROBES, not blocks -- one get_sync_status RPC plus a 10 s sleep
+        // each, a 5 min floor; a timing-out wallet adds its retry budget per
+        // probe: measured 2026-09-12 22:42:37-22:47:18 at ~25.5 s per failed
+        // iteration (~13 min for 30); 52 s is transaction-block spacing,
+        // unrelated to this loop.
+        constexpr int kMaxSyncWaitProbes = 30;
+        for (int attempt = 0; attempt < kMaxSyncWaitProbes; ++attempt) {
             try {
                 auto ss = co_await wallet_->get_sync_status();
                 bool synced  = ss.value("synced", false);
@@ -2270,7 +2631,7 @@ asio::awaitable<void> Engine::poll_loop_coro()
                 spdlog::info("[Engine] Waiting for wallet sync "
                              "(synced={}, syncing={}, attempt {}/{})",
                              synced, syncing, attempt + 1,
-                             kMaxSyncWaitBlocks);
+                             kMaxSyncWaitProbes);
             } catch (const std::exception& e) {
                 spdlog::warn("[Engine] Wallet sync check failed: {}",
                              e.what());
@@ -2279,8 +2640,20 @@ asio::awaitable<void> Engine::poll_loop_coro()
             co_await asio::steady_timer(
                 co_await asio::this_coro::executor,
                 std::chrono::seconds(10)).async_wait(asio::use_awaitable);
-            if (stop_requested_.load(std::memory_order_relaxed)) break;
+            // [shutdown-flag-race] BC2. This was a bare `break` on a signal,
+            // after which boot carried on seeding; it now also reads
+            // shutdown.flag, and a stop ends boot instead of skipping ahead.
+            if (boot_stop_checkpoint("waiting for wallet sync")) {
+                co_return;
+            }
         }
+    }
+
+    // [shutdown-flag-race] BC3. A stop requested during coin-pool maintenance,
+    // or on the probe that found the wallet synced, must not seed inventory
+    // or write the genesis ledger.
+    if (boot_stop_checkpoint("before inventory seeding")) {
+        co_return;
     }
 
     // -- Register pair asset-ID keys with State for mark-to-xch lookup ---
@@ -2403,7 +2776,7 @@ asio::awaitable<void> Engine::poll_loop_coro()
                     // real mojos held.
                     inventory_->seed_position(AssetId{aid}, seed_qty,
                                               Mojo{1});
-                    // Also seed State positions so that apply_limits()
+                    // Also seed State positions so that evaluate_limits()
                     // has accurate balances from the start (not just
                     // from detected fills).
                     state_->record_buy(AssetId{aid}, seed_qty, Mojo{1});
@@ -2437,6 +2810,12 @@ asio::awaitable<void> Engine::poll_loop_coro()
             spdlog::warn("[Engine] Startup inventory seeding failed: {}; "
                          "continuing with zero inventory", ex.what());
         }
+    }
+
+    // [shutdown-flag-race] BC4. The last boot checkpoint; the analysis loop
+    // reads the flag itself from its first poll on.
+    if (boot_stop_checkpoint("before startup market analysis")) {
+        co_return;
     }
 
     // -- Startup market analysis phase ---------------------------------------
@@ -2484,9 +2863,10 @@ asio::awaitable<void> Engine::poll_loop_coro()
                     wallet_last_probe_ = now;
                     try {
                         co_await wallet_->get_sync_status();
-                        // Success -- wallet is back.
-                        wallet_circuit_open_       = false;
-                        wallet_consecutive_failures_ = 0;
+                        // Success -- wallet is back.  No counter to clear:
+                        // this probe's answer has already reset the wallet
+                        // client's transport streak (rpc_post records it).
+                        wallet_circuit_open_ = false;
                         spdlog::info("[Engine] Wallet circuit breaker CLOSED "
                                      "-- wallet is reachable again");
                         // [T5-10] Invalidate the wallet-ID cache so that
@@ -3289,6 +3669,10 @@ asio::awaitable<void> Engine::run_startup_analysis()
         // held progress at 0/5 until the poll timeout force-completed the
         // phase with partial data -- four minutes of every restart spent
         // waiting, and regime detection started from almost nothing.
+        // (Those two prices are Dexie's /v1/markets buy[0] and sell[0] for
+        // that pair -- still 373.97 and 0.95 on 2026-09-13 -- i.e. its ask
+        // and bid read backwards; see TickerData.  Read correctly the book
+        // was bid 0.95 / ask 373.97: not crossed, just a junk ask.)
         //
         // Before S20 the junk mid WAS ingested, so the counter advanced on
         // garbage.  Neither is right: a pair given its full share of polls
@@ -3435,6 +3819,14 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
     // Clear per-cycle working state from the previous block.
     cycle_.clear();
 
+    // [WALLET-CIRCUIT] Mark the wallet client's transport evidence.  Only a
+    // failure AFTER this mark can skip this heartbeat's wallet steps, so the
+    // first wallet call of every heartbeat is always issued -- the canary.
+    if (wallet_) {
+        wallet_transport_at_cycle_start_ = wallet_->transport_counters();
+    }
+    wallet_skip_warned_this_cycle_ = false;
+
     // [T3-08] Reset NHE accumulators for this cycle.
     nhe_net_inventory_change_ = 0.0;
     nhe_total_volume_         = 0.0;
@@ -3491,35 +3883,29 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
     }
 
     // [T1-03] Step 2 is a coroutine (co_awaits detect_fills).
-    // Gated by the wallet circuit breaker to avoid timeout cascades.
-    if (!wallet_circuit_open_) {
+    // [WALLET-CIRCUIT] Gated by wallet_step_may_run: the breaker, or an
+    // unanswered wallet transport failure earlier in this heartbeat.  A throw
+    // no longer counts toward the breaker -- a stalled wallet does not make
+    // this step throw, and a throw that is not a transport failure is not
+    // evidence the wallet is unreachable.  See engine.hpp.
+    if (wallet_step_may_run("Step 2 (fills)")) {
         try {
             co_await step_process_fills(block_height);
-            wallet_consecutive_failures_ = 0;  // Reset on success.
         }
         catch (const std::exception& e) {
             spdlog::error("[Engine] Step 2 (fills) failed: {}", e.what());
-            ++wallet_consecutive_failures_;
-            if (wallet_consecutive_failures_ >= kWalletCircuitBreakerThreshold) {
-                wallet_circuit_open_ = true;
-                wallet_last_probe_   = std::chrono::steady_clock::now();
-                spdlog::warn("[Engine] Wallet circuit breaker OPEN after {} "
-                             "consecutive failures -- skipping wallet-dependent "
-                             "steps until recovery",
-                             wallet_consecutive_failures_);
-            }
         }
-    } else {
-        spdlog::debug("[Engine] Step 2 SKIPPED: wallet circuit breaker open");
     }
 
     // -- Periodic coin pool maintenance (XCH + CAT) -------------------------
-    if (!wallet_circuit_open_
-        && (config_.strategy.coin_pool_target_count > 0
+    // [WALLET-CIRCUIT] The wallet gate is evaluated LAST, so it is consulted
+    // (and logs a skip) only when the pool is actually due.
+    if ((config_.strategy.coin_pool_target_count > 0
             || config_.strategy.cat_coin_pool_target_count > 0)
         && config_.strategy.coin_pool_interval_blocks > 0
         && block_height >= coin_pool_last_block_
-                           + config_.strategy.coin_pool_interval_blocks) {
+                           + config_.strategy.coin_pool_interval_blocks
+        && wallet_step_may_run("coin pool maintenance")) {
         try {
             co_await step_maintain_coin_pool(block_height);
         } catch (const std::exception& e) {
@@ -3653,6 +4039,26 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
         spdlog::error("[Engine] Flash crash check failed: {}", e.what());
     }
 
+    // [PACE 2026-09-13] Pace controller, immediately before Step 6: top up the
+    // targeted wallet balances, then plan every pace-managed pair.  After the
+    // flash-crash update and after the config reload above, so a live disable
+    // is already applied.  A failed evaluation leaves every plan inert for
+    // this heartbeat (the latch is kept) and clears the remaining budget, so
+    // Step 9f refuses spends of an Active asset.  refresh_pace_balances checks
+    // P25's gates (the engine modes that skip Step 8) itself, before any RPC.
+    if (config_.strategy.pace_enabled) {
+        try { co_await refresh_pace_balances(block_height); }
+        catch (const std::exception& e) {
+            spdlog::warn("[Engine] Pace balance refresh failed: {}", e.what());
+        }
+    }
+    try { step_evaluate_pace(block_height); }
+    catch (const std::exception& e) {
+        for (auto& kv : cycle_) { kv.second.pace = strategy::pace::PairPlan{}; }
+        pace_remaining_units_.clear();
+        spdlog::error("[Engine] Pace evaluation failed: {} -- pace inert this cycle", e.what());
+    }
+
     try { step_apply_risk_limits(block_height); }
     catch (const std::exception& e) {
         spdlog::error("[Engine] Step 6 (risk limits) failed: {}", e.what());
@@ -3678,8 +4084,8 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
     // contradicts "no trading until restart" outright. The switch's own
     // cancel uses fee=0 precisely so it never depends on having XCH, so
     // gating this cannot strand the wind-down.
-    if (!wallet_circuit_open_
-            && !watchdog_fired_.load(std::memory_order_acquire)) {
+    if (!watchdog_fired_.load(std::memory_order_acquire)
+            && wallet_step_may_run("XCH recovery")) {
         try {
             co_await step_xch_recovery(block_height);
         } catch (const std::exception& e) {
@@ -3805,9 +4211,12 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
     // Every gate ahead of it silently disabled the recovery:
     //
     //   xch_recovery_mode_     skips Steps 7-8 wholesale;
-    //   wallet_circuit_open_   opens after kWalletCircuitBreakerThreshold
-    //                          Step-8 throws -- i.e. for exactly the wallet
-    //                          sickness that strands offers on the way down;
+    //   wallet_circuit_open_   opens after
+    //                          execution::kWalletCircuitTripFailures
+    //                          consecutive wallet transport failures -- i.e.
+    //                          for exactly the wallet sickness that strands
+    //                          offers on the way down (and wallet_step_may_run
+    //                          skips a heartbeat after the first one);
     //   breaker_pause_active_  "set by every risk breaker and cleared only by
     //                          restart", so ONE tripped breaker killed the
     //                          recovery for the life of the process;
@@ -3837,6 +4246,18 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
                       "set is retained and retried next heartbeat", e.what());
     }
 
+    // [S14] Proof-gated escalation of stranded cancels, beside the intent
+    // sweep and for the same reason: the gates below mean "not trading",
+    // which is no reason to leave a cancel the chain never saw unanswered.
+    // It declines only the states it names itself (another cancel in flight,
+    // a wallet failing this cycle, XCH recovery, a fired dead man's switch).
+    // Step 2 has already run, so a fill that won the race is booked first.
+    try { co_await escalate_stuck_cancels(block_height); }
+    catch (const std::exception& e) {
+        spdlog::error("[Engine] [S14] cancel escalation sweep failed: {} -- "
+                      "retried next heartbeat", e.what());
+    }
+
     // Gate Steps 7-8 when in XCH recovery mode (no market-making until
     // XCH balance is restored).
     if (xch_recovery_mode_) {
@@ -3858,7 +4279,7 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
     // ladder generator can hard-cap avail_inventory against reality.
     // step_generate_ladder is synchronous (non-coroutine) so it cannot
     // co_await the wallet RPC itself.
-    if (!wallet_circuit_open_) {
+    if (wallet_step_may_run("Step 7 XCH balance cap")) {
         try {
             auto xch_bal = co_await wallet_->get_wallet_balance(1);
             if (xch_bal.contains("confirmed_wallet_balance"))
@@ -3883,8 +4304,9 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
     // trades, and a pause that stops passive posting while active taking
     // continues is not a pause -- the audit found the latch gated Step 8
     // alone while every taker path kept trading.
-    if (!wallet_circuit_open_ && !breaker_pause_active_
-            && !watchdog_fired_.load(std::memory_order_acquire)) {
+    if (!breaker_pause_active_
+            && !watchdog_fired_.load(std::memory_order_acquire)
+            && wallet_step_may_run("Step 9f (drift corrector)")) {
         try { co_await step_run_drift_corrector(block_height); }
         catch (const std::exception& e) {
             // [S40 remainder] Finding C, recorded not fixed: 9f has no
@@ -3961,8 +4383,13 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
                               "failed: {}", e.what());
             }
         }
-    } else if (wallet_circuit_open_) {
-        spdlog::debug("[Engine] Step 8 SKIPPED: wallet circuit breaker open");
+    } else if (!wallet_step_may_run("Step 8 (offers)")) {
+        // [WALLET-CIRCUIT] The breaker is open, or a wallet call failed at the
+        // transport level earlier in this heartbeat with nothing answering
+        // since; wallet_step_may_run has logged which.  Arm order unchanged:
+        // exactly like the open breaker before it, this also bypasses the
+        // gui-pause and breaker-pause TTL sweeps below, whose get_sync_status
+        // and cancels would be the same doomed wallet calls.
     } else if (gui_pause_active_) {
         spdlog::debug("[Engine] Step 8 SKIPPED: trading paused by GUI "
                       "-- running the TTL sweep only");
@@ -4000,21 +4427,13 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
                           "failed: {}", e.what());
         }
     } else if (flash_crash_state_ == FlashCrashState::Normal) {
+        // [WALLET-CIRCUIT] A throw no longer counts toward the breaker; the
+        // wallet client's transport evidence does (see engine.hpp).
         try {
             co_await step_manage_offers(block_height);
-            wallet_consecutive_failures_ = 0;  // Reset on success.
         }
         catch (const std::exception& e) {
             spdlog::error("[Engine] Step 8 (offers) failed: {}", e.what());
-            ++wallet_consecutive_failures_;
-            if (wallet_consecutive_failures_ >= kWalletCircuitBreakerThreshold) {
-                wallet_circuit_open_ = true;
-                wallet_last_probe_   = std::chrono::steady_clock::now();
-                spdlog::warn("[Engine] Wallet circuit breaker OPEN after {} "
-                             "consecutive failures -- skipping wallet-dependent "
-                             "steps until recovery",
-                             wallet_consecutive_failures_);
-            }
         }
     } else {
         // [STOPDRAIN review #10] Deliberate: with intent ON, Crash/
@@ -4277,8 +4696,8 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
             dexie_last_success_at_ = std::chrono::steady_clock::now();
             market_data_->ingest_dexie(
                 pair.name,
-                ticker->price_buy,
-                ticker->price_sell,
+                ticker->best_bid,
+                ticker->best_ask,
                 ticker->price_last,
                 ticker->volume_xch_daily);
 
@@ -4291,12 +4710,12 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
             // dexie ticker snapshot.  The ticker provides best-level prices;
             // daily volume serves as a top-of-book depth proxy.
             // ISO/IEC 5055: guard against zero/negative prices.
-            if (ticker->price_buy > 0.0 && ticker->price_sell > 0.0) {
+            if (ticker->best_bid > 0.0 && ticker->best_ask > 0.0) {
                 market_data_->ingest_book_snapshot_for_ofi(
                     pair.name,
-                    ticker->price_buy,
+                    ticker->best_bid,
                     ticker->volume_xch_daily,   // bid-side depth proxy
-                    ticker->price_sell,
+                    ticker->best_ask,
                     ticker->volume_xch_daily);  // ask-side depth proxy
             }
         }
@@ -4847,6 +5266,14 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
                 continue;
             }
 
+            // [WALLET-CIRCUIT] Not after an unanswered wallet transport
+            // failure this heartbeat.  Keep the entry, and do not charge
+            // kMaxTerminalRechecks for it: nothing was asked.
+            if (!wallet_step_may_run("Step 2 terminal re-check")) {
+                terminal_still_pending.push_back(std::move(t));
+                continue;
+            }
+
             // Re-verify against the wallet before the one-way write.
             const execution::TerminalRecheck verdict =
                 co_await offer_mgr_->recheck_terminal(t.offer_id,
@@ -5100,7 +5527,14 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
         // Record the offer as filled in the offer log.
         db_->update_offer_status(fill.offer_id, "filled", fill.block_height, "");
 
-        // Update the inventory tracker using the pair's actual base asset.
+        // Update the inventory tracker with EVERY leg of the fill: base,
+        // quote and the XCH creation fee ([FILL-LEGS 2026-09-13]).  Until then
+        // only the base leg was booked, so an ask removed the XCH it sold
+        // without adding the proceeds (equity read low -- the 2026-09-11
+        // drawdown trip) and a bid added XCH without removing the quote it
+        // spent (equity read high).  What to book, at what price, with the
+        // no-loss rule bypassed and seed sentinels kept repairable, is decided
+        // in accounting/maker_fill_legs.hpp, where ctest can reach it (S36).
         auto now = std::chrono::system_clock::now();
         // [H3] fill_pair_cfg is guaranteed non-null (guarded above).
         const std::string& fill_base = fill_pair_cfg->base_asset_id;
@@ -5114,52 +5548,62 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
             fill_price_usd = asset_usd_pseudo_price(AssetId{fill_base});
         }
 
-        // If BOTH fail there is no defensible cost for this lot.  Do NOT
-        // substitute a placeholder price: record_buy's sentinel branch would
-        // re-mark the ENTIRE holding at that price and clear the sentinel
-        // flag, permanently destroying the basis with no way for the
-        // mark-at-first-observation upgrade to repair it -- exactly the
-        // failure this change set exists to eliminate.  Track the quantity
-        // and leave the basis (and its provenance) untouched instead.
-        bool inventory_ok = true;
+        // If BOTH fail there is no defensible cost for either leg.  No
+        // placeholder price is substituted -- maker_fill_legs.hpp explains
+        // why that would destroy the basis permanently -- so both legs are
+        // applied to quantity only.
         if (fill_price_usd <= 0) {
             spdlog::warn("[Engine] Step 2: no USD valuation available for {} "
-                         "({}) -- applying fill to quantity only, cost basis "
-                         "left intact for later repair",
+                         "({}) -- applying BOTH legs to quantity only, cost "
+                         "bases left intact for later repair",
                          fill.pair_name, fill_base.substr(0, 12));
-            inventory_ok = inventory_->record_fill_unpriced(
-                fill_base, fill.size, /*is_buy=*/fill.side == Side::Bid,
-                fill.block_height, now);
-        } else if (fill.side == Side::Bid) {
-            inventory_->record_buy(fill_base, fill.size, fill_price_usd,
-                                   fill.block_height, now);
-        } else {
-            // Confirmed fills must always reduce tracked inventory. The
-            // never-sell-at-loss rule is a pre-trade control, so bypass it
-            // here and only fail on missing or insufficient tracked quantity.
-            // ISO/IEC 5055: checked return value on every code path.
-            inventory_ok = inventory_->record_sell(
-                fill_base, fill.size, fill_price_usd,
-                fill.block_height, now, /*enforce_no_loss=*/false);
         }
+        // The quote leg is priced only when this pair's quote-USD factor is
+        // trusted; otherwise it books unpriced and Step 11 repairs it from a
+        // graded mark.
+        const auto legs = accounting::maker_fill_inventory_legs(
+            fill, *fill_pair_cfg, fill_price_usd,
+            quote_usd_factor_trusted(*fill_pair_cfg));
+        const auto applied = accounting::apply_maker_fill_legs(
+            *inventory_, *fill_pair_cfg, legs, fill.block_height, now);
 
-        if (!inventory_ok) {
+        const std::string_view rejected_legs =
+            accounting::rejected_fill_legs(legs, applied);
+        if (!rejected_legs.empty()) {
             spdlog::error("[Engine] Step 2: inventory update REJECTED fill "
                           "for {} {} @ {} mojos (block {}) -- "
                           "tracked inventory missing or insufficient.  "
                           "Fill was confirmed on-chain but the inventory "
-                          "tracker refused it.",
+                          "tracker refused it -- {} leg(s)",
                           fill.pair_name, fill.size, fill.price,
-                          fill.block_height);
+                          fill.block_height, rejected_legs);
+            if (legs.quote_invalid) {
+                spdlog::error("[Engine] Step 2: fill {} has no derivable "
+                              "quote quantity (price {}, base_mojos_per_unit "
+                              "{}, quote_mojos_per_unit {}) -- quote holding "
+                              "left unchanged",
+                              fill.offer_id.substr(0, 12), fill.price,
+                              fill_pair_cfg->base_mojos_per_unit,
+                              fill_pair_cfg->quote_mojos_per_unit);
+            }
             // Alert on the inconsistency so the operator can investigate.
             alerts_->send_alert(AlertRule::ExposureBreach,
                 "inventory update rejected confirmed fill for " +
-                fill.pair_name + " at block " +
+                fill.pair_name + " (" + std::string(rejected_legs) +
+                " leg(s)) at block " +
                 std::to_string(fill.block_height) +
                 " -- state inconsistency");
         }
+        if (!applied.fee_ok) {
+            // Warn only, never an alert: a fill's fee is ~1e-8 XCH.
+            spdlog::warn("[Engine] Step 2: XCH fee {} mojos for fill {} not "
+                         "booked -- tracked XCH missing or below the fee",
+                         fill.fee_mojos, fill.offer_id.substr(0, 12));
+        }
 
         // [PNL-BASIS-PERSIST] Durable basis: snapshot after every mutation.
+        // ONE persist after all three legs, so persistence stays
+        // all-or-nothing per fill.
         persist_inventory_state();
 
         // [LEDGER 2026-07-30] Post the balanced legs for this fill.  Safe to
@@ -5168,15 +5612,14 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
         // quantities are the bot's OWN belief about the fill -- the whole
         // point is for the invariant to surface where that belief and the
         // wallet disagree.
-        {
-            const Mojo quote_mojos = static_cast<Mojo>(std::llround(
-                quote_mojos_for(
-                    static_cast<double>(fill.size),
-                    static_cast<double>(fill.price),
-                    static_cast<double>(fill_pair_cfg->base_mojos_per_unit),
-                    static_cast<double>(fill_pair_cfg->quote_mojos_per_unit))));
-            post_ledger_fill(fill, *fill_pair_cfg, quote_mojos);
-        }
+        //
+        // [FILL-LEGS] The quote quantity is the one the tracker just booked,
+        // not a second derivation of the same formula.  It equals the former
+        // llround(quote_mojos_for(...)) for every representable quantity; an
+        // out-of-range one is now 0 (no leg) instead of llround's unspecified
+        // result.
+        post_ledger_fill(fill, *fill_pair_cfg,
+                         legs.quote_invalid ? Mojo{0} : legs.quote.qty_mojos);
 
         if (!fill_newly_recorded) {
             spdlog::warn("[Engine] Step 2: fill {} was already journalled -- "
@@ -5668,9 +6111,10 @@ void Engine::step_compute_quotes(BlockHeight block_height)
         if (config_.strategy.sigma_floor > 0.0) {
             sigma = std::max(sigma, config_.strategy.sigma_floor);
         }
-        // Compute inventory (signed net position in the pair's base asset).
-        // Convert from mojos to base-asset display units so that q and q_max
-        // are in the same units (T1-12 fix: prevents ~10^12 ratio error).
+        // q is the WHOLE holding of the pair's base asset, not a signed
+        // per-pair position or a gap from a target: net_inventory returns the
+        // asset's total_quantity (>= 0), so sizing sees the entire balance.
+        // In display units like q_max (T1-12 fix: prevents ~10^12 ratio error).
         double q = static_cast<double>(
             inventory_->net_inventory(AssetId{pair_cfg->base_asset_id}))
             / static_cast<double>(pair_cfg->base_mojos_per_unit);
@@ -5707,9 +6151,24 @@ void Engine::step_compute_quotes(BlockHeight block_height)
         pcs.raw_quote = strategy.compute_quotes(mid, sigma, q, block_height);
         pcs.quote_valid = true;  // Mark as valid for steps 5-8.
 
-        spdlog::debug("[Engine] Step 4: {} bid={:.6f} ask={:.6f} spread={:.1f}bps",
+        // [STEP6-CAUSE 2026-09-13] Keep q and the q_max this pair's strategy
+        // was built with.  Avellaneda sizes the bid from TOTAL base holdings
+        // (net_inventory returns total_quantity, inventory.cpp:273-277), so
+        // once the wallet holds more than q_max base units the bid is 0
+        // before any risk limit runs -- live XCH/BYC: 24.57 XCH against
+        // q_max 20.  The debug line below reaches only logs/xop_trader.log
+        // (engine.log captures the console sink, which is info-level unless
+        // --verbose, main.cpp:330), which is why Step 6 carries q and q_max
+        // into its own lines.
+        pcs.strategy_q     = q;
+        pcs.strategy_q_max = effective_q_max(*pair_cfg, config_.strategy);
+
+        spdlog::debug("[Engine] Step 4: {} bid={:.6f} ask={:.6f} spread={:.1f}bps "
+                      "bid_size={:.6f} ask_size={:.6f} q={:.6f} q_max={:.6f}",
                       pair_name, pcs.raw_quote.bid_price,
-                      pcs.raw_quote.ask_price, pcs.raw_quote.spread_bps);
+                      pcs.raw_quote.ask_price, pcs.raw_quote.spread_bps,
+                      pcs.raw_quote.bid_size, pcs.raw_quote.ask_size,
+                      pcs.strategy_q, pcs.strategy_q_max);
     }
 }
 
@@ -6232,7 +6691,444 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
     }
 }
 
-// Step 6: Apply risk limits (inventory, Kelly, no-loss).
+// ---------------------------------------------------------------------------
+// [PACE 2026-09-13] Pace controller glue.  Every decision is a pure function
+// in xop/strategy/pace_controller.hpp; these methods only gather its inputs
+// (wallet-confirmed balances, independent fair values, fills from the DB)
+// and store its outputs.  Spec: pace-controller.v2.md sections 3 and 6.
+// ---------------------------------------------------------------------------
+
+strategy::pace::PaceParams Engine::pace_params_from_config() const
+{
+    const StrategyConfig& sc = config_.strategy;
+    strategy::pace::PaceParams p{};
+    p.enabled                = sc.pace_enabled;
+    p.assets                 = sc.pace_assets;
+    p.horizon_blocks         = sc.pace_horizon_blocks;
+    p.enter_tol_mult         = sc.pace_enter_tol_mult;
+    p.exit_tol_mult          = sc.pace_exit_tol_mult;
+    p.max_resting_frac       = sc.pace_max_resting_frac;
+    p.min_tier_units         = sc.pace_min_tier_units;
+    p.max_tier_units         = sc.pace_max_tier_units;
+    p.max_tiers              = sc.pace_max_tiers;
+    p.tighten_step_bps       = sc.pace_tighten_step_bps;
+    p.tighten_max_bps        = sc.pace_tighten_max_bps;
+    p.max_fv_sigma_bps       = sc.pace_max_fair_value_sigma_bps;
+    p.max_balance_age_blocks = sc.pace_max_balance_age_blocks;
+    p.global_min_offer_units = sc.min_offer_size_units;
+    p.global_max_offer_units = sc.max_offer_size_units;
+    return p;
+}
+
+std::optional<std::string> Engine::pace_asset_id_for_key(const std::string& key) const
+{
+    if (key == "XCH") {
+        return std::string{"xch"};
+    }
+    for (const auto& pace_pc : config_.pairs) {
+        const auto pace_slash = pace_pc.name.find('/');
+        if (pace_slash == std::string::npos) {
+            continue;
+        }
+        std::string pace_base_sym = pace_pc.name.substr(0, pace_slash);
+        std::string pace_quote_sym = pace_pc.name.substr(pace_slash + 1);
+        for (auto& c : pace_base_sym) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        for (auto& c : pace_quote_sym) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        if (pace_base_sym == key) {
+            return pace_pc.base_asset_id;
+        }
+        if (pace_quote_sym == key) {
+            return pace_pc.quote_asset_id;
+        }
+    }
+    return std::nullopt;
+}
+
+asio::awaitable<void> Engine::refresh_pace_balances(BlockHeight block_height)
+{
+    // [PACE round 2] No wallet RPC while an engine mode that skips Step 8 is
+    // active (the balances only feed a plan that could not post), nor while
+    // wallet_consecutive_failures_ > 0.  Step 8's own wallet-sync and
+    // fee-budget checks are not among these gates, so the refresh still runs
+    // while either holds Step 8 back.  Nor do the gates keep pace out of a
+    // wallet brown-out: wallet_consecutive_failures_ rarely rises in one,
+    // because detect_fills catches RPC errors and Step 8's sync check catches
+    // and returns.  What bounds the load pace adds is the per-asset backoff
+    // below -- at most one balance RPC per asset per refresh age, whatever the
+    // outcome.  The decision is the pure header's (P25).
+    // [v0.10.24 integration] #156 removed wallet_consecutive_failures_, which
+    // counted Step 2 and Step 8 throws.  The gate below now reads the wallet
+    // client's transport streak, rpc::TransportCounters::consecutive_failures:
+    // calls that ended in a transport failure since the last answered one.
+    // Unlike the throw counter it does rise in a brown-out, because rpc_post
+    // records every call however its caller handles the exception.
+    strategy::pace::RefreshGates pace_gates{};
+    pace_gates.pace_enabled                = config_.strategy.pace_enabled;
+    pace_gates.dry_run                     = dry_run_;
+    pace_gates.wallet_circuit_open         = wallet_circuit_open_;
+    pace_gates.watchdog_fired              = watchdog_fired_.load(std::memory_order_acquire);
+    pace_gates.wallet_consecutive_failures =
+        wallet_ ? wallet_->transport_counters().consecutive_failures : 0u;
+    pace_gates.gui_pause                   = gui_pause_active_;
+    pace_gates.breaker_pause               = breaker_pause_active_;
+    pace_gates.cancel_all_inflight         = cancel_all_inflight_;
+    pace_gates.cancel_all_draining         = cancel_all_draining_;
+    pace_gates.flash_crash_normal          = (flash_crash_state_ == FlashCrashState::Normal);
+    pace_gates.xch_recovery                = xch_recovery_mode_;
+    if (!strategy::pace::pace_refresh_gates_open(pace_gates) || !offer_mgr_ || !wallet_) {
+        co_return;
+    }
+    std::set<std::string> pace_keys;
+    for (const auto& kv : config_.strategy.asset_target_allocations) { pace_keys.insert(kv.first); }
+    for (const auto& pace_asset : config_.strategy.pace_assets) { pace_keys.insert(pace_asset); }
+    // h = max(1, max_age / 2): an entry refreshed every h blocks stays fresh,
+    // and the per-asset backoff retries a failed attempt at age 2h.
+    const std::uint32_t pace_refresh_age =
+        strategy::pace::pace_refresh_age_blocks(config_.strategy.pace_max_balance_age_blocks);
+    for (const auto& pace_key : pace_keys) {
+        const auto pace_id = pace_asset_id_for_key(pace_key);
+        if (!pace_id) {
+            continue;
+        }
+        const auto pace_cached = cached_wallet_balances_.find(*pace_id);
+        const bool pace_cache_present = (pace_cached != cached_wallet_balances_.end());
+        const auto pace_attempt = pace_refresh_attempted_at_.find(*pace_id);
+        const bool pace_attempted = (pace_attempt != pace_refresh_attempted_at_.end());
+        if (!strategy::pace::pace_refresh_due(
+                pace_cache_present, pace_cache_present && pace_cached->second.fields_validated,
+                pace_cache_present ? pace_cached->second.as_of_block : BlockHeight{0},
+                pace_attempted, pace_attempted ? pace_attempt->second : BlockHeight{0},
+                block_height, pace_refresh_age)) {
+            continue;
+        }
+        // The CAT wallet-id map fills lazily in post_quotes, so the first
+        // heartbeats after start may skip here: DataUnavailable, inert.
+        const auto pace_wid = offer_mgr_->resolve_wallet_id(*pace_id);
+        if (pace_wid <= 0) {
+            continue;
+        }
+        // Recorded BEFORE the RPC: a failed, timed-out or malformed attempt
+        // backs off exactly like a good one, so this refresh sends at most one
+        // balance RPC per asset per refresh age.
+        pace_refresh_attempted_at_[*pace_id] = block_height;
+        std::string pace_failure;
+        try {
+            auto pace_bal = co_await wallet_->get_wallet_balance(pace_wid);
+            Mojo spendable = 0, confirmed = 0, pending = 0;
+            if (pace_bal.contains("spendable_balance"))
+                spendable = pace_bal["spendable_balance"].get<Mojo>();
+            if (pace_bal.contains("confirmed_wallet_balance"))
+                confirmed = pace_bal["confirmed_wallet_balance"].get<Mojo>();
+            if (pace_bal.contains("pending_change"))
+                pending = pace_bal["pending_change"].get<Mojo>();
+            const bool pace_fields_validated = pace_bal.contains("confirmed_wallet_balance")
+                && pace_bal.contains("pending_change");
+            // The liveness refresh's exact write shape: a defaulted zero is
+            // never marked validated.
+            cached_wallet_balances_[*pace_id] =
+                {spendable, confirmed, pending, block_height, pace_fields_validated};
+            if (!pace_fields_validated) {
+                pace_failure = "the reply lacks confirmed_wallet_balance or pending_change";
+            }
+        } catch (const std::exception& e) {
+            pace_failure = e.what();
+        }
+        if (pace_failure.empty()) {
+            const auto pace_fail_it = pace_refresh_failures_.find(*pace_id);
+            if (pace_fail_it != pace_refresh_failures_.end()) {
+                spdlog::info("[Engine] Pace: balance refresh for {} recovered after {} failed attempt(s)",
+                             pace_key, pace_fail_it->second);
+                pace_refresh_failures_.erase(pace_fail_it);
+            }
+            continue;
+        }
+        // Rate-limited: warn on the first failure of a run and on every 10th
+        // (attempts are already a refresh age apart), debug otherwise.
+        const std::uint32_t pace_failures = ++pace_refresh_failures_[*pace_id];
+        if (pace_failures == 1u || pace_failures % 10u == 0u) {
+            spdlog::warn("[Engine] Pace: balance refresh for {} failed ({} in a row; next attempt in >= {} "
+                         "blocks): {}", pace_key, pace_failures, pace_refresh_age, pace_failure);
+        } else {
+            spdlog::debug("[Engine] Pace: balance refresh for {} failed ({} in a row): {}",
+                          pace_key, pace_failures, pace_failure);
+        }
+    }
+    co_return;
+}
+
+void Engine::step_evaluate_pace(BlockHeight block_height)
+{
+    if (!config_.strategy.pace_enabled) {
+        // Off (including a live disable): every plan inert, every map empty,
+        // so no hook -- Step 9f included -- acts on a stale latch.
+        for (auto& kv : cycle_) { kv.second.pace = strategy::pace::PairPlan{}; }
+        pace_memory_.clear();
+        pace_remaining_units_.clear();
+        pace_assets_consumed_this_cycle_.clear();
+        pace_last_status_.clear();
+        pace_band_conflict_logged_.clear();
+        pace_refresh_attempted_at_.clear();
+        pace_refresh_failures_.clear();
+        return;
+    }
+
+    // The CoinGecko FEED age, not the solve's timestamp: fair_value_updated_at
+    // is re-stamped every heartbeat from cached solver output.
+    const bool pace_feed_fresh = coingecko_feed_fresh_for_revival(
+        !coingecko_prices_.empty(), coingecko_last_fetch_, std::chrono::steady_clock::now(),
+        config_.market_data.cex_freshness_threshold_sec);
+    // The ramp advances only while the engine is in a posting state.
+    // xch_recovery_mode_ is re-evaluated after Step 6, so this reads the
+    // previous heartbeat's value: a one-heartbeat lag, accepted.
+    const bool pace_ramp_running = !gui_pause_active_ && !breaker_pause_active_
+        && !watchdog_fired_.load(std::memory_order_acquire) && !wallet_circuit_open_
+        && !xch_recovery_mode_ && flash_crash_state_ == FlashCrashState::Normal
+        && !cancel_all_inflight_ && !cancel_all_draining_;
+
+    strategy::pace::PaceInputs pace_inputs{};
+    pace_inputs.now = block_height;
+    pace_inputs.ramp_running = pace_ramp_running;
+    pace_inputs.params = pace_params_from_config();
+
+    auto pace_upper = [](std::string text) {
+        for (auto& c : text) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        return text;
+    };
+    auto pace_mojos_per_unit = [this](const std::string& asset) -> std::int64_t {
+        if (asset == "xch") return kMojosPerXch;
+        for (const auto& mpu_pc : config_.pairs) {
+            if (mpu_pc.base_asset_id == asset) return mpu_pc.base_mojos_per_unit;
+            if (mpu_pc.quote_asset_id == asset) return mpu_pc.quote_mojos_per_unit;
+        }
+        return 0;
+    };
+
+    // Holdings: every targeted key plus every pace asset.
+    std::set<std::string> pace_keys;
+    for (const auto& kv : config_.strategy.asset_target_allocations) { pace_keys.insert(kv.first); }
+    for (const auto& pace_asset : config_.strategy.pace_assets) { pace_keys.insert(pace_asset); }
+    for (const auto& pace_key : pace_keys) {
+        strategy::pace::HoldingInput holding{};
+        holding.key = pace_key;
+        const auto target_it = config_.strategy.asset_target_allocations.find(pace_key);
+        holding.targeted = (target_it != config_.strategy.asset_target_allocations.end());
+        holding.target = holding.targeted ? target_it->second : 0.0;
+        const auto tol_it = config_.strategy.asset_target_tolerances.find(pace_key);
+        holding.tol = (tol_it != config_.strategy.asset_target_tolerances.end()) ? tol_it->second : 0.0;
+        holding.is_xch = (pace_key == "XCH");
+        const auto pace_id = pace_asset_id_for_key(pace_key);
+        holding.id_resolved = pace_id.has_value();
+        if (pace_id) {
+            const auto pace_cached = cached_wallet_balances_.find(*pace_id);
+            if (pace_cached != cached_wallet_balances_.end()) {
+                holding.cache_present = true;
+                holding.fields_validated = pace_cached->second.fields_validated;
+                holding.as_of_block = pace_cached->second.as_of_block;
+                const std::int64_t pace_mpu = pace_mojos_per_unit(*pace_id);
+                holding.units = (pace_mpu > 0)
+                    ? static_cast<double>(pace_cached->second.confirmed) / static_cast<double>(pace_mpu)
+                    : std::numeric_limits<double>::quiet_NaN();
+            }
+            if (!holding.is_xch) {
+                // The first ENABLED pair pricing this asset against XCH.
+                for (const auto& fv_pc : config_.pairs) {
+                    if (!fv_pc.enabled) continue;
+                    const bool as_quote = fv_pc.base_asset_id == "xch" && fv_pc.quote_asset_id == *pace_id;
+                    const bool as_base = fv_pc.quote_asset_id == "xch" && fv_pc.base_asset_id == *pace_id;
+                    if (!as_quote && !as_base) continue;
+                    const auto pace_fv = market_data_->get_fair_value(fv_pc.name);
+                    holding.fv_present = pace_fv.has_value();
+                    if (pace_fv) {
+                        holding.fv_tier_available = pace_fv->tier != FairValueTier::Unavailable;
+                        holding.fv_price = pace_fv->price;
+                        holding.fv_sigma_bps = pace_fv->sigma_bps;
+                    }
+                    holding.asset_is_quote = as_quote;
+                    break;
+                }
+                holding.fv_feed_fresh = pace_feed_fresh;
+            }
+        }
+        pace_inputs.holdings.push_back(holding);
+    }
+
+    // Pairs: every CONFIGURED pair with a leg that is a pace asset, and its
+    // fills over the horizon (flows on a pair disabled since still moved the
+    // wallet).
+    const std::uint32_t pace_horizon = config_.strategy.pace_horizon_blocks;
+    const BlockHeight pace_since = (block_height > pace_horizon) ? block_height - pace_horizon : BlockHeight{0};
+    for (const auto& pace_pc : config_.pairs) {
+        const auto pace_slash = pace_pc.name.find('/');
+        if (pace_slash == std::string::npos) continue;
+        const std::string base_key = pace_upper(pace_pc.name.substr(0, pace_slash));
+        const std::string quote_key = pace_upper(pace_pc.name.substr(pace_slash + 1));
+        const bool touches_pace_asset = std::any_of(
+            config_.strategy.pace_assets.begin(), config_.strategy.pace_assets.end(),
+            [&](const std::string& pace_asset) { return pace_asset == base_key || pace_asset == quote_key; });
+        if (!touches_pace_asset) continue;
+
+        strategy::pace::PairInput pair_in{};
+        pair_in.name = pace_pc.name;
+        pair_in.base_key = base_key;
+        pair_in.quote_key = quote_key;
+        pair_in.enabled = pace_pc.enabled;
+        const auto cycle_it = cycle_.find(pace_pc.name);
+        pair_in.quote_valid = (cycle_it != cycle_.end()) && cycle_it->second.quote_valid;
+        pair_in.base_mpu = pace_pc.base_mojos_per_unit;
+        pair_in.quote_mpu = pace_pc.quote_mojos_per_unit;
+        pair_in.min_offer_override = pace_pc.min_offer_size_units_override;
+        pair_in.xch_base = (pace_pc.base_asset_id == "xch");
+        const auto liq_it = liquidity_engines_.find(pace_pc.name);
+        pair_in.side_tier_count = (liq_it != liquidity_engines_.end() && liq_it->second)
+            ? static_cast<std::uint32_t>(liq_it->second->config().num_tiers)
+            : 0u;
+        const auto pace_fv = market_data_->get_fair_value(pace_pc.name);
+        pair_in.fv_ok = pace_fv.has_value()
+            && strategy::pace::xch_per_unit_from_fair_value(
+                   true, pace_fv->tier != FairValueTier::Unavailable, pace_feed_fresh,
+                   pace_fv->price, pace_fv->sigma_bps,
+                   config_.strategy.pace_max_fair_value_sigma_bps).has_value();
+        if (pace_fv) {
+            pair_in.fv_price = pace_fv->price;
+            pair_in.fv_sigma_bps = pace_fv->sigma_bps;
+        }
+        if (!db_) {
+            pair_in.fills_ok = false;
+        } else {
+            try {
+                for (const auto& row : db_->query_pace_fills(pace_pc.name, pace_since)) {
+                    strategy::pace::FillRow fill{};
+                    fill.pair_name = pace_pc.name;
+                    fill.is_taker = row.is_taker;
+                    fill.side_lower = row.side_lower;
+                    fill.size_mojos = row.size_mojos;
+                    fill.price_mojos = row.price_mojos;
+                    fill.we_bought_base = row.we_bought_base;
+                    fill.base_delta_mojos = row.base_delta_mojos;
+                    fill.quote_delta_mojos = row.quote_delta_mojos;
+                    fill.block_height = row.block_height;
+                    pace_inputs.fills.push_back(std::move(fill));
+                }
+            } catch (const std::exception& e) {
+                pair_in.fills_ok = false;
+                spdlog::debug("[Engine] Pace: fills query for {} failed: {}", pace_pc.name, e.what());
+            }
+        }
+        pace_inputs.pairs.push_back(std::move(pair_in));
+    }
+
+    pace_inputs.memory = pace_memory_;
+    strategy::pace::PaceDecision pace_decision = strategy::pace::decide(pace_inputs);
+    pace_memory_ = std::move(pace_decision.memory);
+    pace_remaining_units_ = std::move(pace_decision.remaining_units);
+    for (auto& kv : cycle_) {
+        const auto plan_it = pace_decision.pairs.find(kv.first);
+        kv.second.pace = (plan_it != pace_decision.pairs.end()) ? plan_it->second : strategy::pace::PairPlan{};
+    }
+    pace_assets_consumed_this_cycle_.clear();
+
+    // -- Logging: live assets every heartbeat; transitions (with the reason)
+    // once; DataUnavailable, ConfigConflict and band conflicts only when they
+    // change (S17).
+    auto pace_data_gap = [&](const std::string& pace_key) -> std::string {
+        std::string why;
+        auto add = [&why](const std::string& part) { why += (why.empty() ? "" : "; ") + part; };
+        if (!pace_feed_fresh) { add("CoinGecko feed stale"); }
+        for (const auto& h : pace_inputs.holdings) {
+            if (!h.targeted && h.key != pace_key) continue;
+            if (!h.id_resolved) { add(h.key + " asset id unresolved"); continue; }
+            if (!h.cache_present) { add(h.key + " balance not cached"); continue; }
+            if (!h.fields_validated) { add(h.key + " balance unvalidated"); continue; }
+            if (!strategy::pace::balance_is_fresh(true, h.as_of_block, block_height,
+                                                  config_.strategy.pace_max_balance_age_blocks)) {
+                add(h.key + " balance stale");
+                continue;
+            }
+            if (!h.is_xch && !(h.fv_present && h.fv_tier_available)) { add(h.key + " fair value unavailable"); }
+        }
+        for (const auto& p : pace_inputs.pairs) {
+            if (p.base_key != pace_key && p.quote_key != pace_key) continue;
+            if (!p.fills_ok) { add(p.name + " fills query failed"); }
+            if (p.enabled && !p.quote_valid) { add(p.name + " not quote-valid"); }
+            if (p.enabled && !p.fv_ok) { add(p.name + " fair value unusable"); }
+        }
+        return why.empty() ? std::string{"no data gap identified"} : why;
+    };
+    for (const auto& ad : pace_decision.assets) {
+        const auto last_it = pace_last_status_.find(ad.key);
+        const bool first_seen = (last_it == pace_last_status_.end());
+        if (first_seen || last_it->second != ad.status) {
+            std::string reason;
+            switch (ad.status) {
+                case strategy::pace::PaceStatus::Active:
+                    reason = "share " + std::to_string(ad.share * 100.0) + "% above exit "
+                           + std::to_string(ad.exit_level * 100.0) + "% (enter "
+                           + std::to_string(ad.enter_level * 100.0) + "%)";
+                    break;
+                case strategy::pace::PaceStatus::Inactive:
+                    reason = "share " + std::to_string(ad.share * 100.0) + "%, enter "
+                           + std::to_string(ad.enter_level * 100.0) + "%, exit "
+                           + std::to_string(ad.exit_level * 100.0) + "%";
+                    break;
+                case strategy::pace::PaceStatus::Exhausted:
+                    reason = "sold today " + std::to_string(ad.sold_window_units) + " of a daily budget of "
+                           + std::to_string(ad.budget_window_units);
+                    break;
+                case strategy::pace::PaceStatus::ConfigConflict:
+                    reason = "target, tolerance and multipliers do not form a valid band";
+                    break;
+                case strategy::pace::PaceStatus::Hold:
+                case strategy::pace::PaceStatus::DataUnavailable:
+                    reason = pace_data_gap(ad.key);
+                    break;
+            }
+            if (first_seen) {
+                spdlog::info("[Engine] Pace: {} {} ({})", ad.key, strategy::pace::to_string(ad.status), reason);
+            } else {
+                spdlog::warn("[Engine] Pace: {} {} -> {} ({})", ad.key, strategy::pace::to_string(last_it->second),
+                             strategy::pace::to_string(ad.status), reason);
+            }
+        }
+        if (ad.status == strategy::pace::PaceStatus::Active || ad.status == strategy::pace::PaceStatus::Exhausted
+            || ad.status == strategy::pace::PaceStatus::Hold) {
+            std::string pairs_text;
+            for (const auto& kv : pace_decision.pairs) {
+                const strategy::pace::PairPlan& plan = kv.second;
+                if (!plan.managed || plan.asset != ad.key) continue;
+                const PairConfig* plan_pc = find_pair_config(kv.first);
+                const double plan_mpu = (plan_pc && plan_pc->base_mojos_per_unit > 0)
+                    ? static_cast<double>(plan_pc->base_mojos_per_unit) : 1.0;
+                pairs_text += " | " + kv.first + (plan.hold ? " HOLD" : "")
+                    + " tiers=" + std::to_string(plan.tiers) + "x"
+                    + std::to_string(static_cast<double>(plan.tier_size_base_mojos) / plan_mpu)
+                    + " pool=" + std::to_string(static_cast<double>(plan.pool_base_mojos) / plan_mpu);
+            }
+            spdlog::info("[Engine] Pace: {} {} share={:.2f}% enter={:.2f}% exit={:.2f}% excess={:.3f} "
+                         "budget/day={:.3f} sold/day={:.3f} reduced_h={:.3f} remaining={:.3f} "
+                         "resting_cap={:.3f} headroom={:.3f} tighten=+{:.0f}bps ramp={} pairs={}{}",
+                         ad.key, strategy::pace::to_string(ad.status), ad.share * 100.0,
+                         ad.enter_level * 100.0, ad.exit_level * 100.0, ad.excess_units,
+                         ad.budget_window_units, ad.sold_window_units, ad.reduced_horizon_units,
+                         ad.remaining_units, ad.resting_cap_units, ad.headroom_units, ad.tighten_bps,
+                         ad.ramp_blocks, ad.eligible_pairs, pairs_text);
+        }
+        if (ad.band_conflict) {
+            if (pace_band_conflict_logged_.insert(ad.key).second) {
+                spdlog::warn("[Engine] Pace: {} offer-size band conflict: no tier size lies within "
+                             "both [pace_min_tier_units, pace_max_tier_units] and a managed pair's "
+                             "offer-size band -- that pair rests nothing", ad.key);
+            }
+        } else {
+            pace_band_conflict_logged_.erase(ad.key);
+        }
+        pace_last_status_[ad.key] = ad.status;
+    }
+}
+
+// Step 6: Apply risk limits (inventory-aging relief and the no-loss ask floor,
+// the optional loss manager / circuit breaker, then concentration, single-CAT
+// cap and pair-capital cap via PreTradeCheck::evaluate_limits).  No Kelly
+// sizing runs here.
 void Engine::step_apply_risk_limits(BlockHeight block_height)
 {
     for (auto& [pair_name, pcs] : cycle_) {
@@ -6604,41 +7500,73 @@ void Engine::step_apply_risk_limits(BlockHeight block_height)
             }
         }
 
-        // Apply inventory limits, Kelly sizing, CAT cap.
-        auto checked = pre_trade_->apply_limits(
-            quote, pair_name,
+        // [STEP6-CAUSE 2026-09-13] Concentration, single-CAT cap and
+        // pair-capital cap.  evaluate_limits runs the same arithmetic as
+        // apply_limits (which now delegates to it) and also records, per
+        // side, which rule lowered or zeroed it.  The old warn printed
+        // pair-level breach flags from get_limit_status and called BOTH zero
+        // sides "blocked by risk limits" when the live XCH/BYC bid was the
+        // strategy's own 0 (q=24.57 >= q_max=20) and only the ask was cut,
+        // to 0 by the CAT cap's full block.
+        //
+        // [PACE D1 2026-09-13] With this pair's effective concentration
+        // limits: its soft/hard overrides where configured, else the global
+        // pair.  pair_cfg is this pair's own config, so no other pair's
+        // override can apply; without overrides these are the same two
+        // doubles evaluate_limits read before.  Named conc_limits so it
+        // cannot collide with a `limits` local.
+        const ConcentrationLimits conc_limits =
+            effective_concentration_limits(config_.risk, pair_cfg);
+        // [PACE 2026-09-13] A pace-managed pair offers its pace pool as the
+        // bid, in place of the strategy's size, BEFORE the limits run -- so
+        // every rule below tapers it (operator decision D1).  A hold plan
+        // offers 0; an unmanaged plan returns the quote unchanged.
+        quote = strategy::pace::inject_reducing_side(quote, pcs.pace);
+        const LimitsDecision limits_decision = pre_trade_->evaluate_limits(
+            quote,
             AssetId{pair_cfg->base_asset_id},
             AssetId{pair_cfg->quote_asset_id},
-            *state_);
+            *state_,
+            conc_limits);
 
-        if (checked) {
-            pcs.risk_quote  = *checked;
+        if (limits_decision.has_quote) {
+            pcs.risk_quote  = limits_decision.quote;
             pcs.quote_valid = true;
+
+            // Repeats of the no-quote warn are rate-limited, so the warn
+            // going quiet no longer means the pair quotes again: say so, once
+            // per warn.
+            const auto gate_it = step6_no_quote_warn_gates_.find(pair_name);
+            if (gate_it != step6_no_quote_warn_gates_.end()
+                && gate_it->second.should_log_recovery()) {
+                spdlog::info("[Engine] {}",
+                             format_step6_quote_resumed(
+                                 pair_name, gate_it->second.last_warn_height(),
+                                 kLimitBlockWarnReminderBlocks));
+            }
+
+            if (side_zero_cause(limits_decision.trace.bid) != SideZeroCause::NotZero
+                || side_zero_cause(limits_decision.trace.ask) != SideZeroCause::NotZero) {
+                spdlog::debug("[Engine] Step 6: {} -- one-sided after limits: {}",
+                              pair_name,
+                              describe_limits_block(limits_decision.trace,
+                                                    pair_cfg->base_mojos_per_unit,
+                                                    pcs.strategy_q,
+                                                    pcs.strategy_q_max));
+            }
         } else {
             pcs.quote_valid = false;
-            const auto limits = pre_trade_->get_limit_status(
-                AssetId{pair_cfg->base_asset_id},
-                AssetId{pair_cfg->quote_asset_id},
-                *state_);
-
-            spdlog::warn(
-                "[Engine] Step 6: {} -- both sides blocked by risk limits "
-                "(base_conc={:.3f} soft_breach={} hard_breach={} "
-                "cat_pct={:.3f} cat_breach={} pair_pct={:.3f} "
-                "pair_breach={} cfg_soft={:.3f} cfg_hard={:.3f} "
-                "cfg_cat={:.3f} cfg_pair={:.3f})",
-                pair_name,
-                limits.base_concentration,
-                limits.soft_limit_breached,
-                limits.hard_limit_breached,
-                limits.cat_portfolio_pct,
-                limits.cat_cap_breached,
-                limits.pair_capital_pct,
-                limits.pair_cap_breached,
-                config_.risk.soft_limit_pct,
-                config_.risk.hard_limit_pct,
-                config_.risk.single_cat_cap_pct,
-                config_.risk.max_capital_per_pair_pct);
+            const std::string no_quote_line = format_step6_no_quote(
+                pair_name, limits_decision.trace, pair_cfg->base_mojos_per_unit,
+                pcs.strategy_q, pcs.strategy_q_max, config_.risk, conc_limits,
+                kLimitBlockWarnReminderBlocks);
+            if (step6_no_quote_warn_gates_[pair_name].should_warn(
+                    limit_block_signature(limits_decision.trace), block_height,
+                    kLimitBlockWarnReminderBlocks)) {
+                spdlog::warn("[Engine] {}", no_quote_line);
+            } else {
+                spdlog::debug("[Engine] {} [repeat]", no_quote_line);
+            }
         }
     }
 }
@@ -7521,6 +8449,11 @@ void Engine::step_generate_ladder(BlockHeight block_height)
             }
         }
 
+        // [PACE 2026-09-13] The CAT wallet cap on the bid, captured for the
+        // pace pool composition below.
+        bool pace_wallet_cap_known = false;
+        Mojo pace_wallet_cap_bid = 0;
+
         // -- Symmetric CAT wallet-balance caps (mirrors the XCH cap above
         // for non-XCH base/quote assets).  The ask pool consumes the BASE
         // asset; the bid pool consumes the QUOTE asset.  Without these
@@ -7589,6 +8522,10 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                         market_mid,
                         static_cast<double>(pair_cfg->base_mojos_per_unit));
                     const Mojo bid_cap_base = bid_cap.value_or(Mojo{0});
+                    if (bid_cap.has_value()) {
+                        pace_wallet_cap_known = true;
+                        pace_wallet_cap_bid = bid_cap_base;
+                    }
                     if (bid_cap.has_value() && avail_capital > bid_cap_base) {
                         spdlog::warn("[Engine] Step 7: {} bid pool {:.4f} {} "
                                      "(={:.4f} {} @ {:.6f}) > wallet {:.4f} {} "
@@ -7959,6 +8896,56 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                     avail_inventory = floored;
                 }
             }
+        }
+
+        // -- [PACE 2026-09-13] Pace pool composition -------------------------
+        // After every pool-sizing heuristic (allocator, ratio scaling,
+        // deploy-idle floor: not risk limits, and min() also blocks their
+        // upward moves) and before the final XCH caps (which never act on a
+        // pace bid: it spends the CAT).  bid = min(pace pool, risk-tapered bid,
+        // CAT wallet cap), then the concentration taper computed on WALLET
+        // balances at the same published-mid marks apply_limits uses (State
+        // lags the wallet: taker fills never update it -- the stricter reading
+        // binds), then the drift guard's bid scale; tiers are re-planned from
+        // the result and the ask is 0.
+        if (config_.strategy.pace_enabled && pcs.pace.managed && pair_cfg) {
+            double pace_wallet_keep = 1.0;
+            if (!pcs.pace.hold) {
+                const auto pace_xch_it = cached_wallet_balances_.find("xch");
+                const auto pace_quote_it = cached_wallet_balances_.find(pair_cfg->quote_asset_id);
+                if (pace_xch_it != cached_wallet_balances_.end()
+                    && pace_quote_it != cached_wallet_balances_.end()) {
+                    Position pace_wallet_base{AssetId{"xch"}};
+                    pace_wallet_base.balance = pace_xch_it->second.confirmed;
+                    Position pace_wallet_quote{AssetId{pair_cfg->quote_asset_id}};
+                    pace_wallet_quote.balance = pace_quote_it->second.confirmed;
+                    const double pace_wallet_conc = PreTradeCheck::compute_concentration(
+                        pace_wallet_base, pace_wallet_quote, *state_);
+                    pace_wallet_keep = PreTradeCheck::concentration_keep_fraction(
+                        pace_wallet_conc, effective_concentration_limits(config_.risk, pair_cfg)).value_or(1.0);
+                }
+            }
+            const strategy::pace::PoolInputs pace_pool_in{
+                avail_capital, avail_inventory, pcs.risk_quote.bid_size,
+                pace_wallet_cap_known, pace_wallet_cap_bid, pace_wallet_keep, drift_bid_scale};
+            const strategy::pace::ComposedPools pace_composed =
+                strategy::pace::compose_pace_pools(pcs.pace, pace_pool_in);
+            if (pace_composed.bid != avail_capital || pace_composed.ask != avail_inventory
+                || pace_composed.binding != strategy::pace::PoolBinding::Pace) {
+                spdlog::info("[Engine] Step 7: {} pace pools bid {} -> {} ask {} -> {} tiers={} size={} "
+                             "binding={} (risk_bid={} wallet_cap={} wallet_keep={:.4f} drift={:.2f})",
+                             pair_name, avail_capital, pace_composed.bid, avail_inventory, pace_composed.ask,
+                             pace_composed.tiers, pace_composed.tier_size_base_mojos,
+                             strategy::pace::to_string(pace_composed.binding), pcs.risk_quote.bid_size,
+                             pace_wallet_cap_known ? std::to_string(pace_wallet_cap_bid) : std::string{"unknown"},
+                             pace_wallet_keep, drift_bid_scale);
+            }
+            pcs.pace.tiers                = pace_composed.tiers;
+            pcs.pace.tier_size_base_mojos = pace_composed.tier_size_base_mojos;
+            pcs.pace.pool_base_mojos      = pace_composed.bid;
+            pcs.pace.binding              = pace_composed.binding;
+            avail_capital   = pace_composed.bid;
+            avail_inventory = pace_composed.ask;
         }
 
         // -- [v0.7.38 -> S3 round-2] FINAL XCH wallet caps ------------------
@@ -8838,6 +9825,10 @@ void Engine::step_generate_ladder(BlockHeight block_height)
             }
         }
 
+        // [PACE 2026-09-13] The residual widening this heartbeat applied, in
+        // bps (0 = none), for the pace price post-pass below.
+        double pace_residual_widen_bps = 0.0;
+
         // -----------------------------------------------------------------
         // Fair-value deviation guard.
         //
@@ -8929,6 +9920,7 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                             / static_cast<double>(mid_mojos) * 10'000.0;
                     }
 
+                    pace_residual_widen_bps = capped;
                     spdlog::warn(
                         "[Engine] Step 7: {} book disagrees with the rest of "
                         "the graph by {:+.0f}bps -- widening every tier by "
@@ -9132,6 +10124,12 @@ void Engine::step_generate_ladder(BlockHeight block_height)
             }
         }
 
+        // [PACE 2026-09-13] What the inventory throttle did to the BID side,
+        // for the pace post-passes: its size scale, and whether it touched the
+        // side at all.  Its early returns leave these at "no throttle".
+        double pace_bid_throttle_scale = 1.0;
+        bool pace_bid_throttled = false;
+
         // -----------------------------------------------------------------
         // Smooth inventory throttle (all assets, both sides): when the asset
         // consumed by a side is running low, progressively make that side
@@ -9310,6 +10308,10 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                         return false;
                     });
                 pcs.ladder.erase(it, pcs.ladder.end());
+                if (side == Side::Bid) {
+                    pace_bid_throttle_scale = size_scale;
+                    pace_bid_throttled = (repriced > 0 || resized > 0 || dropped > 0);
+                }
 
                 if (repriced > 0 || resized > 0 || dropped > 0) {
                     spdlog::info("[Engine] Step 7: {} {}-side throttle asset={} "
@@ -9513,6 +10515,87 @@ void Engine::step_generate_ladder(BlockHeight block_height)
             }
         }
 
+        // [PACE round 2] The order-book guard's per-tier step (above): pace tiers
+        // keep at least this spacing, in the price post-pass (P17) and in the
+        // fair-value cap after the size post-pass (P24).
+        const double pace_tier_spacing_bps =
+            std::max(50.0, config_.strategy.fair_value_clamp_tier_step_bps);
+
+        // -- [PACE 2026-09-13] Pace price post-pass ---------------------------
+        // When a pace asset is behind schedule, tighten its pair's bids toward
+        // FV x (1 - max(min_edge, k x sigma)).  Placed after every pass that
+        // widens or clamps (width floor, order-book guard, fair-value guard,
+        // throttle, no-loss lift, peg guard), so only Step 8's own gates act on
+        // bid prices after it -- and apply_pace_bid_price pre-checks both of
+        // those.  Never on a throttled bid side, never in a heartbeat whose
+        // residual widening fired, and never without a usable fair value (a
+        // blind ladder is never tightened).
+        if (config_.strategy.pace_enabled && pcs.pace.managed && !pcs.pace.hold
+            && pcs.pace.tiers > 0u && pcs.pace.tighten_bps > 0.0
+            && !pace_bid_throttled && !(pace_residual_widen_bps > 0.0)) {
+            const auto pace_fv = market_data_->get_fair_value(pair_name);
+            const bool pace_fv_usable = pace_fv.has_value()
+                && strategy::pace::xch_per_unit_from_fair_value(
+                       true, pace_fv->tier != FairValueTier::Unavailable, quote_anchor_feed_fresh,
+                       pace_fv->price, pace_fv->sigma_bps,
+                       config_.strategy.pace_max_fair_value_sigma_bps).has_value();
+            if (pace_fv_usable) {
+                strategy::pace::PriceGuards pace_guards{};
+                pace_guards.fair_value_px       = pace_fv->price * static_cast<double>(kMojosPerXch);
+                pace_guards.fv_sigma_bps        = pace_fv->sigma_bps;
+                pace_guards.min_edge_bps        = config_.strategy.pace_min_edge_bps;
+                pace_guards.edge_sigma_mult     = config_.strategy.pace_edge_sigma_mult;
+                pace_guards.centre_px           = static_cast<double>(pcs.quote_mid_mojos);
+                pace_guards.min_half_spread_bps = pcs.quote_min_half_spread_bps;
+                pace_guards.best_bid_px         = static_cast<double>(snap.best_bid);
+                pace_guards.best_ask_px         = static_cast<double>(snap.best_ask);
+                // The order-book guard's own bid margin, above.
+                pace_guards.book_guard_margin_bps = std::max(
+                    std::max(50.0, config_.strategy.fair_value_clamp_tier_step_bps),
+                    effective_bid_margin_bps);
+                // RE-READ: market_mid above was replaced by the fair-value blend.
+                pace_guards.published_mid_px =
+                    market_data_->get_mid_price(pair_name) * static_cast<double>(kMojosPerXch);
+                pace_guards.has_bbo = snap.best_bid > 0 && snap.best_ask > 0;
+                if (pace_guards.has_bbo) {
+                    const auto pace_refs = bookside::step8_references(
+                        snap.bid_side_anchor_ok, snap.ask_side_anchor_ok,
+                        static_cast<double>(snap.book_side_ref),
+                        static_cast<double>((snap.best_bid + snap.best_ask) / 2),
+                        static_cast<double>(snap.best_bid),
+                        static_cast<double>(snap.best_ask));
+                    pace_guards.bid_tier_ref_px  = pace_refs.bid_tier_ref;
+                    pace_guards.effective_mid_px = pace_refs.effective_mid;
+                }
+                pace_guards.max_aggressive_dev =
+                    (pair_cfg && pair_cfg->bbo_sanity_max_aggressive_dev_override.has_value())
+                        ? pair_cfg->bbo_sanity_max_aggressive_dev_override.value()
+                        : config_.strategy.bbo_sanity_max_aggressive_dev;
+                pace_guards.max_passive_dev =
+                    (pair_cfg && pair_cfg->bbo_sanity_max_passive_dev_override.has_value())
+                        ? pair_cfg->bbo_sanity_max_passive_dev_override.value()
+                        : config_.strategy.bbo_sanity_max_passive_dev;
+                pace_guards.tier_step_bps = pace_tier_spacing_bps;
+                Mojo pace_tier0_before = 0;
+                for (const auto& pace_tq : pcs.ladder) {
+                    if (pace_tq.side == Side::Bid && pace_tq.tier_index == 0) { pace_tier0_before = pace_tq.price; }
+                }
+                pcs.pace.untightened_bid_px = strategy::pace::tighten_bid_side(
+                    pcs.ladder, pcs.pace.tighten_bps, config_.strategy.pace_tighten_step_bps, pace_guards);
+                Mojo pace_tier0_after = 0;
+                for (const auto& pace_tq : pcs.ladder) {
+                    if (pace_tq.side == Side::Bid && pace_tq.tier_index == 0) { pace_tier0_after = pace_tq.price; }
+                }
+                spdlog::info("[Engine] Step 7: {} pace price +{:.0f}bps: tier-0 bid {} -> {} "
+                             "(fv={:.6f} sigma={:.0f}bps edge>={:.0f}bps book_ask={} margin={:.0f}bps)",
+                             pair_name, pcs.pace.tighten_bps, pace_tier0_before, pace_tier0_after,
+                             pace_fv->price, pace_fv->sigma_bps,
+                             std::max(config_.strategy.pace_min_edge_bps,
+                                      config_.strategy.pace_edge_sigma_mult * pace_fv->sigma_bps),
+                             snap.best_ask, pace_guards.book_guard_margin_bps);
+            }
+        }
+
         // -----------------------------------------------------------------
         // Final sanity: drop any tier with a non-positive price.
         // -----------------------------------------------------------------
@@ -9605,6 +10688,35 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                 spdlog::info("[Engine] Step 7: {} up-scaled {} tiers to "
                              "the min offer size ({:.2f} units)",
                              pair_name, bumped_tiers, eff_min_units);
+            }
+
+            // -- [PACE 2026-09-13] Pace size post-pass -------------------------
+            // A pace-managed pair keeps only the bid tiers whose INDEX is below
+            // the composed tier count and posts no ask.  Every kept tier gets
+            // the composed tier size scaled by the throttle's bid size scale,
+            // which can RAISE a tier above its ladder size (1.0 -> 1.213 XCH
+            // today); the kept total stays within the composed pool.  After
+            // the up-scale above (the pace size already meets the pair
+            // minimum), before the funding re-enforcement and the dust filter
+            // below, which still run and still drop unfundable tiers.
+            if (config_.strategy.pace_enabled && pcs.pace.managed) {
+                pcs.pace.throttle_bid_size_scale = pace_bid_throttle_scale;
+                strategy::pace::shape_bid_side(pcs.ladder, pcs.pace);
+                // [PACE round 2] The fair-value cap on every kept bid, whatever
+                // the state of the price post-pass above, which runs only when
+                // behind schedule and neither throttled nor widened: nothing
+                // else keeps a centre-blend bid below fair value.  Step 8 writes
+                // no bid price after this point, so these are the posted prices.
+                const strategy::pace::FairValueCap pace_cap = strategy::pace::cap_bids_at_fair_value(
+                    pcs.ladder, pcs.pace, config_.strategy.pace_min_edge_bps,
+                    config_.strategy.pace_edge_sigma_mult, pace_tier_spacing_bps,
+                    static_cast<double>(pcs.quote_mid_mojos));
+                if (pace_cap.lowered > 0u || pace_cap.dropped > 0u) {
+                    spdlog::info("[Engine] Step 7: {} pace fair-value cap {}: lowered {} bid(s), dropped {} "
+                                 "(fv={:.6f} sigma={:.0f}bps spacing={:.0f}bps)",
+                                 pair_name, pace_cap.cap_px, pace_cap.lowered, pace_cap.dropped,
+                                 pcs.pace.fv_price, pcs.pace.fv_sigma_bps, pace_tier_spacing_bps);
+                }
             }
 
             // -- [S3 rounds 5+7] Re-enforce EVERY side's funding budget
@@ -9816,6 +10928,127 @@ void Engine::step_generate_ladder(BlockHeight block_height)
 // [T2-09] Persists actual wallet-assigned offer IDs to the database
 // by reading them from shared State after post_quotes returns.
 // [T3-24] Gates on market_data_valid to prevent posting with stale data.
+// ---------------------------------------------------------------------------
+// [PACE 2026-09-13] step_enforce_pace_caps -- Step 8's pace pass, before the
+// main loop (inside step_manage_offers, so below its dry-run, wallet-sync and
+// fee-budget returns, and behind every Step 8 gate of the heartbeat).
+//   * An idle ladder (hold plan, no Step 6 quote, or empty) is invisible to
+//     the main loop, which skips empty ladders; its resting offers still get
+//     the canceller's own hard-TTL and crossing rules, through
+//     classify_tier_staleness with an EMPTY ladder.
+//   * A non-hold plan cancels asks (the increasing side), bids at an absent
+//     tier index, and resting size above the caps (select_resting_to_cancel).
+//     After a Step 9f take spent the asset, the plan is re-planned first.
+// A hold plan never cancels for pace: a data blip must not cancel the ladder.
+// ---------------------------------------------------------------------------
+asio::awaitable<void> Engine::step_enforce_pace_caps(BlockHeight block_height,
+                                                     std::uint64_t recommended_fee)
+{
+    if (!config_.strategy.pace_enabled) {
+        co_return;
+    }
+    for (auto& [pair_name, pcs] : cycle_) {
+        // The main loop's own rule: never act on a pair without valid data.
+        if (!pcs.pace.managed || !pcs.market_data_valid) {
+            continue;
+        }
+        const PairConfig* pace_pc = find_pair_config(pair_name);
+        if (!pace_pc) {
+            continue;
+        }
+        std::vector<std::string> pace_ids;
+        std::unordered_map<std::string, std::string> pace_why;
+        const auto pace_add = [&](const std::vector<std::string>& ids, const char* reason) {
+            for (const auto& oid : ids) {
+                if (pace_why.emplace(oid, reason).second) {
+                    pace_ids.push_back(oid);
+                }
+            }
+        };
+        if (pcs.pace.hold || !pcs.quote_valid || pcs.ladder.empty()) {
+            const auto pace_mid = static_cast<Mojo>(std::llround(
+                market_data_->get_mid_price(pair_name) * static_cast<double>(kMojosPerXch)));
+            const std::vector<TierQuote> pace_no_ladder{};
+            for (const auto& pace_tc : offer_mgr_->classify_tier_staleness(
+                     pair_name, pace_no_ladder, block_height, config_.strategy.offer_ttl_blocks,
+                     pace_mid, false, true, true)) {
+                if (pace_tc.staleness == execution::TierStaleness::Fresh) {
+                    continue;
+                }
+                pace_add({pace_tc.offer_id}, pace_tc.staleness == execution::TierStaleness::Expired
+                                                 ? "pace_idle_ttl" : "pace_idle_crossed");
+            }
+        }
+        if (!pcs.pace.hold) {
+            if (!pcs.quote_valid) {
+                // Step 6 returned no quote: nothing may rest for pace.
+                pcs.pace.tiers = 0u;
+                pcs.pace.pool_base_mojos = 0;
+            }
+            if (pace_assets_consumed_this_cycle_.count(pcs.pace.asset) != 0u) {
+                const auto pace_rem_it = pace_remaining_units_.find(pcs.pace.asset);
+                strategy::pace::replan_after_take(
+                    pcs.pace, pace_rem_it != pace_remaining_units_.end() ? pace_rem_it->second : 0.0,
+                    pace_params_from_config(), pace_pc->base_mojos_per_unit);
+                strategy::pace::shape_bid_side(pcs.ladder, pcs.pace);
+            }
+            std::vector<strategy::pace::RestingOffer> pace_resting;
+            for (const auto& pace_po : state_->get_all_offers()) {
+                if (pace_po.pair_name != pair_name) {
+                    continue;
+                }
+                strategy::pace::RestingOffer pace_ro{};
+                pace_ro.id             = pace_po.offer_id;
+                pace_ro.side           = pace_po.side;
+                pace_ro.tier           = pace_po.tier;
+                pace_ro.price          = pace_po.price;
+                pace_ro.size           = pace_po.size;
+                pace_ro.cancel_pending = pace_po.cancel_pending;
+                pace_resting.push_back(std::move(pace_ro));
+            }
+            const strategy::pace::CancelPick pace_pick = strategy::pace::select_resting_to_cancel(
+                pace_resting, pcs.pace, pace_pc->base_mojos_per_unit, pace_pc->quote_mojos_per_unit);
+            pace_add(pace_pick.increasing_ids, "pace_increasing");
+            pace_add(pace_pick.tier_ids, "pace_tier");
+            // [PACE round 2] Resting bids a fair-value drop left above fair value.
+            pace_add(strategy::pace::select_resting_above_fair_value(pace_resting, pcs.pace), "pace_above_fv");
+            pace_add(pace_pick.budget_ids, "pace_budget");
+        }
+        if (pace_ids.empty()) {
+            continue;
+        }
+        // [v0.10.24 integration] #156's Step 8 rule: every wallet call site has a
+        // checkpoint of its own.  The liveness refresh just before this pass
+        // swallows its failures, and an earlier pair's pace cancel may just have
+        // failed; returning here leaves Step 8 to the pair loop's own checkpoint.
+        if (!wallet_step_may_run("Step 8 pace caps")) {
+            co_return;
+        }
+        const std::vector<std::string> pace_freed = co_await offer_mgr_->selective_cancel(pace_ids);
+        // [v0.10.24 integration] #157: an accepted cancel is only a submission,
+        // so offer_log says cancel_pending, with the pace reason as its cause,
+        // until the wallet reports the offer terminal.
+        for (const auto& oid : pace_freed) {
+            try {
+                db_->mark_offer_cancel_submitted(oid, block_height, pace_why[oid]);
+            } catch (const std::exception& e) {
+                spdlog::debug("[Engine] Pace: mark_offer_cancel_submitted failed for {}: {}",
+                              oid.substr(0, 12), e.what());
+            }
+        }
+        if (fee_tracker_->enabled() && !pace_freed.empty()) {
+            fee_tracker_->record_fee(static_cast<std::uint64_t>(pace_freed.size()) * recommended_fee,
+                                     block_height);
+        }
+        spdlog::warn("[Engine] Pace: {} cancelled {}/{} resting offers (binding={}, tiers={}, "
+                     "cap={:.4f} units)",
+                     pair_name, pace_freed.size(), pace_ids.size(),
+                     strategy::pace::to_string(pcs.pace.binding), pcs.pace.tiers,
+                     std::min(pcs.pace.resting_cap_units, pcs.pace.remaining_units));
+    }
+    co_return;
+}
+
 asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
 {
     if (dry_run_) {
@@ -9928,6 +11161,13 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
 
     offer_mgr_->set_dynamic_fee(recommended_fee);
 
+    // [WALLET-CIRCUIT] C1.  The sync check and the XCH lock-ledger snapshot
+    // above are this step's first wallet calls.  The sync check's own catch
+    // already co_returns; the snapshot swallows its failure, so look here.
+    if (!wallet_step_may_run("Step 8 (offers)")) {
+        co_return;
+    }
+
     // -- UTXO Liberation ------------------------------------------------
     // The Chia wallet locks *entire* UTXOs when creating offers.  A small
     // fee (0.005 XCH) can lock a 16 XCH UTXO, draining spendable to
@@ -9990,7 +11230,11 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             // Filter to only stale offers.
             std::vector<PendingOffer> stale_offers;
             for (const auto& po : all_offers) {
-                if (block_height >= po.created_at_block + kMinOfferAgeBlocks) {
+                // [S14] Never a cancel_pending offer: its cancel is already
+                // out, and a zero-fee re-fire here cannot replace it. The
+                // escalation owns those.
+                if (!po.cancel_pending
+                    && block_height >= po.created_at_block + kMinOfferAgeBlocks) {
                     stale_offers.push_back(po);
                 }
             }
@@ -9999,8 +11243,9 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 // All offers are fresh -- don't cancel, just enter
                 // buy-only mode until they age or get filled.
                 spdlog::info("[Engine] UTXO liberation: spendable {:.6f} XCH "
-                             "< reserve {:.4f} XCH but all {} offers are "
-                             "younger than {} blocks -- XCH-buy-only mode",
+                             "< reserve {:.4f} XCH but none of {} offers is a "
+                             "candidate (younger than {} blocks, or already "
+                             "cancel-pending) -- XCH-buy-only mode",
                              static_cast<double>(xch_spendable_pre) / kMojosPerXch,
                              config_.strategy.fee_reserve_xch,
                              all_offers.size(),
@@ -10019,15 +11264,19 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             int liberated = 0;
             for (const auto& po : stale_offers) {
                 if (liberated >= kMaxLiberate) break;
+                // [WALLET-CIRCUIT] Each emergency cancel (and its re-check)
+                // is a wallet call; stop at an unanswered transport failure.
+                if (!wallet_step_may_run("Step 8 UTXO liberation")) {
+                    co_return;
+                }
                 bool ok = co_await offer_mgr_->emergency_cancel(
                     po.offer_id, "utxo_liberation",
                     /*prefer_zero_fee=*/true);
                 if (ok) {
                     state_->mark_cancel_pending(po.offer_id);
                     try {
-                        db_->update_offer_status(
-                            po.offer_id, "cancelled",
-                            block_height, "utxo_liberation");
+                        db_->mark_offer_cancel_submitted(
+                            po.offer_id, block_height, "utxo_liberation");
                     } catch (const std::exception& e) {
                         spdlog::debug("[Engine] UTXO liberation "
                                       "update_offer_status failed for "
@@ -10138,6 +11387,10 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         std::set<std::string> refreshed;
         for (auto& [pair_name, pcs] : cycle_) {
             if (!pcs.ladder.empty()) continue;
+            // [PACE 2026-09-13] A pace-managed pair's empty ladder is pace's own
+            // decision, not the deadlock this refresh breaks, and
+            // refresh_pace_balances keeps its assets fresh.
+            if (config_.strategy.pace_enabled && pcs.pace.managed) continue;
             const PairConfig* live_pc = find_pair_config(pair_name);
             if (!live_pc) continue;
             const std::string assets[2] = {live_pc->base_asset_id,
@@ -10147,6 +11400,9 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 if (!refreshed.insert(asset).second) continue;
                 const auto wid = offer_mgr_->resolve_wallet_id(asset);
                 if (wid <= 0) continue;
+                if (!wallet_step_may_run("Step 8 liveness refresh")) {
+                    co_return;
+                }
                 std::optional<Mojo> prior;
                 if (auto it = cached_wallet_balances_.find(asset);
                     it != cached_wallet_balances_.end()) {
@@ -10188,9 +11444,31 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         }
     }
 
+    // [PACE 2026-09-13] Manage the resting offers of pace-managed pairs before
+    // the main loop: cancels land as cancel_pending, which the main loop's
+    // classifier skips, so a tier is re-posted at its shaped size in this
+    // same Step 8.
+    co_await step_enforce_pace_caps(block_height, recommended_fee);
+
     std::set<std::int64_t> pending_wallets_this_block;
     for (auto& [pair_name, pcs] : cycle_) {
         if (!pcs.quote_valid || pcs.ladder.empty()) continue;
+
+        // [WALLET-CIRCUIT] C2, at every pair boundary.  co_return, NOT break:
+        // a break falls through to the consecutive_pending_blocks_ reset below
+        // the loop, so one transport failure before any pair reached Gate 1
+        // would restart the force-delete escalation.  Inside the iteration,
+        // every wallet call that can follow a failure has its own checkpoint
+        // that returns the same way: the stuck-offer cancel, each balance
+        // query, each force-delete, both exposure-floor cancels, the
+        // both-sides-suppressed cancel, the XCH fee-reserve query and
+        // post_quotes.  The refresh cancels just below follow this check
+        // directly, and the periodic prune follows an answered balance
+        // query.  A routine that is already running -- selective_cancel,
+        // cancel_stale, post_quotes -- still finishes its own loop.
+        if (!wallet_step_may_run("Step 8 pair loop")) {
+            co_return;
+        }
 
         // [T3-24] Final gate: do not post offers if market data was invalid.
         if (!pcs.market_data_valid) {
@@ -10264,6 +11542,44 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             can_bid_rebalance,
             can_ask_rebalance);
 
+        // [PACE 2026-09-13] Pace reprice.  To the canceller a tighter desired
+        // bid is FAVOURABLE drift, refreshed only past 3x the tier threshold
+        // (and never past the soft TTL), so a pace tier would otherwise rest
+        // at its old price until the hard TTL.  A Fresh resting bid at a
+        // planned tier is marked Stale when should_reprice_bid says the
+        // tightened price beats both its resting and its untightened price by
+        // the configured margin, after the configured age.
+        std::unordered_set<std::string> pace_reprice_ids;
+        if (config_.strategy.pace_enabled && pcs.pace.managed && !pcs.pace.hold
+            && pcs.pace.tighten_bps > 0.0) {
+            for (auto& pace_tc : tier_classes) {
+                if (pace_tc.side != Side::Bid || pace_tc.staleness != execution::TierStaleness::Fresh) {
+                    continue;
+                }
+                // tier_index is uint8_t, which promotes to int: cast before comparing.
+                const auto pace_tier = static_cast<std::uint32_t>(pace_tc.tier_index);
+                if (pace_tier >= pcs.pace.tiers
+                    || static_cast<std::size_t>(pace_tier) >= pcs.pace.untightened_bid_px.size()) {
+                    continue;
+                }
+                const auto pace_lit = std::find_if(pcs.ladder.begin(), pcs.ladder.end(),
+                    [&](const TierQuote& pace_tq) {
+                        return pace_tq.side == Side::Bid && pace_tq.tier_index == pace_tc.tier_index;
+                    });
+                if (pace_lit == pcs.ladder.end()) {
+                    continue;
+                }
+                const PendingOffer pace_po = state_->get_offer(pace_tc.offer_id);
+                if (strategy::pace::should_reprice_bid(
+                        pace_po.price, pace_lit->price, pcs.pace.untightened_bid_px[pace_tier],
+                        strategy::pace::sat_sub_blocks(block_height, pace_po.created_at_block),
+                        config_.strategy.pace_reprice_min_age_blocks, config_.strategy.pace_reprice_min_bps)) {
+                    pace_tc.staleness = execution::TierStaleness::Stale;
+                    pace_reprice_ids.insert(pace_tc.offer_id);
+                }
+            }
+        }
+
         bool has_pending = !tier_classes.empty();
         int fresh_count = 0, stale_count = 0, expired_count = 0;
         for (const auto& tc : tier_classes) {
@@ -10336,6 +11652,9 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 }
             }
         }
+        for (const auto& pace_id : pace_reprice_ids) {
+            cancel_reasons[pace_id] = "pace_reprice";
+        }
 
         if (!cancelled_ids.empty()) {
             // Persist cancellation status to database.
@@ -10344,8 +11663,9 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     auto it = cancel_reasons.find(oid);
                     const std::string reason = (it != cancel_reasons.end())
                         ? it->second : "stale";
-                    db_->update_offer_status(oid, "cancelled", block_height,
-                                            reason);
+                    // [S14] Submitted, not cancelled: the wallet verdict (or
+                    // the escalation) finishes it.
+                    db_->mark_offer_cancel_submitted(oid, block_height, reason);
                 } catch (const std::exception& e) {
                     spdlog::debug("[Engine] update_offer_status failed for {}: {}",
                                  oid.substr(0, 12), e.what());
@@ -10373,36 +11693,59 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 * execution::OfferManager::kHardTtlMultiplier;
             const uint32_t stuck_threshold =
                 hard_ttl + config_.strategy.stuck_offer_age_blocks;
-            int stuck_count = 0;
+            // [S14] The counter and cancel_stale share ONE predicate. The
+            // counter used to include cancel_pending offers that cancel_stale
+            // skips, so "N stuck offers -- attempting forced cancel" fired
+            // every block and cancelled nothing (215 lines in four hours for
+            // five XCH/DBX offers). Those offers belong to the escalation.
+            std::size_t stuck_count = 0;
             for (const auto& po : all_offers) {
                 if (po.pair_name != pair_name) continue;
-                if (block_height > po.created_at_block &&
-                    (block_height - po.created_at_block) > stuck_threshold) {
+                if (execution::is_forced_cancel_candidate(
+                        po.cancel_pending, po.created_at_block, block_height,
+                        stuck_threshold)) {
                     ++stuck_count;
-                    spdlog::warn("[Engine] Stuck offer {} pair={} side={} tier={} "
-                                 "age={} blocks fee={} mojos",
-                                 po.offer_id.substr(0, 12), po.pair_name,
-                                 to_string(po.side), po.tier,
-                                 block_height - po.created_at_block,
-                                 po.fee_mojos);
+                    spdlog::debug("[Engine] Stuck offer {} pair={} side={} tier={} "
+                                  "age={} blocks fee={} mojos",
+                                  po.offer_id.substr(0, 12), po.pair_name,
+                                  to_string(po.side), po.tier,
+                                  block_height - po.created_at_block,
+                                  po.fee_mojos);
                 }
             }
+            auto& stuck_log = stuck_log_state_[pair_name];
+            if (execution::stuck_summary_log_due(
+                    stuck_log.last_count, stuck_count,
+                    stuck_log.last_logged_block, block_height)) {
+                if (stuck_count > 0) {
+                    spdlog::warn("[Engine] Step 8: {} stuck offers for {} -- "
+                                 "attempting forced cancel (logged on a change "
+                                 "or every {} blocks)", stuck_count, pair_name,
+                                 execution::kStuckSummaryLogIntervalBlocks);
+                } else {
+                    spdlog::info("[Engine] Step 8: no stuck offers remain for {}",
+                                 pair_name);
+                }
+                stuck_log.last_logged_block = block_height;
+            }
+            stuck_log.last_count = stuck_count;
             if (stuck_count > 0) {
-                spdlog::warn("[Engine] Step 8: {} stuck offers for {} -- "
-                             "attempting forced cancel", stuck_count, pair_name);
+                if (!wallet_step_may_run("Step 8 stuck-offer cancel")) {
+                    co_return;
+                }
                 auto stuck_cancelled = co_await offer_mgr_->cancel_stale(
                     pair_name, block_height, stuck_threshold);
                 for (const auto& oid : stuck_cancelled) {
                     try {
-                        db_->update_offer_status(oid, "cancelled", block_height,
-                                                "stuck");
+                        db_->mark_offer_cancel_submitted(oid, block_height,
+                                                         "stuck");
                     } catch (const std::exception& e) {
-                        spdlog::debug("[Engine] update_offer_status failed for {}: {}",
-                                     oid.substr(0, 12), e.what());
+                        spdlog::debug("[Engine] mark_offer_cancel_submitted failed "
+                                      "for {}: {}", oid.substr(0, 12), e.what());
                     }
                 }
             }
-            total_stuck_offers += stuck_count;
+            total_stuck_offers += static_cast<int>(stuck_count);
         }
 
         // -- Spendable reserve & pending-change gating ----------------------
@@ -10487,6 +11830,14 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                      gate_pc->quote_mojos_per_unit, false});
 
                 for (const auto& sb : sides) {
+                    // [WALLET-CIRCUIT] Per side: the previous side's periodic
+                    // prune or force-delete, or a cancel issued earlier in this
+                    // pair, may just have failed.  A failed balance query never
+                    // gets here: its catch breaks out of this loop, and the
+                    // checkpoints after the loop stop what follows it.
+                    if (!wallet_step_may_run("Step 8 balance gate")) {
+                        co_return;
+                    }
                     try {
                         auto bal_json = co_await wallet_->get_wallet_balance(sb.wid);
                         Mojo spendable = 0, confirmed = 0, pending = 0;
@@ -10622,6 +11973,17 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                              consecutive_pending_blocks_,
                                              pending_wallets_this_block.size());
                                 for (auto pw : pending_wallets_this_block) {
+                                    // [WALLET-CIRCUIT] The periodic prune
+                                    // above, or the previous delete, may
+                                    // have failed at the transport level;
+                                    // both swallow it.  co_return, NOT
+                                    // break: the reset below must not run,
+                                    // so the escalation stays armed for the
+                                    // next heartbeat instead of restarting
+                                    // its kForceDeletePendingBlocks count.
+                                    if (!wallet_step_may_run("Step 8 force-delete")) {
+                                        co_return;
+                                    }
                                     try {
                                         co_await wallet_->
                                             delete_unconfirmed_transactions(pw);
@@ -10850,6 +12212,13 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                 }
                             }
                             if (!cancel_ids.empty()) {
+                                // [WALLET-CIRCUIT] Nothing between the sides
+                                // loop above and this cancel checks the gate,
+                                // and a failed balance query breaks out of
+                                // that loop.
+                                if (!wallet_step_may_run("Step 8 exposure-floor cancel (asks)")) {
+                                    co_return;
+                                }
                                 auto cancelled = co_await offer_mgr_->selective_cancel(cancel_ids);
                                 if (!cancelled.empty()) {
                                     pair_base_pending_spend = (pair_base_pending_spend > freed)
@@ -10868,8 +12237,8 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                                  cancelled.size());
                                     for (const auto& oid : cancelled) {
                                         try {
-                                            db_->update_offer_status(
-                                                oid, "cancelled", block_height,
+                                            db_->mark_offer_cancel_submitted(
+                                                oid, block_height,
                                                 "exposure_floor_rebalance");
                                         } catch (...) {}
                                     }
@@ -10900,6 +12269,11 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                 }
                             }
                             if (!cancel_ids.empty()) {
+                                // [WALLET-CIRCUIT] As for the asks; the ask
+                                // cancel above may also just have failed.
+                                if (!wallet_step_may_run("Step 8 exposure-floor cancel (bids)")) {
+                                    co_return;
+                                }
                                 auto cancelled = co_await offer_mgr_->selective_cancel(cancel_ids);
                                 if (!cancelled.empty()) {
                                     pair_quote_pending_spend = (pair_quote_pending_spend > freed)
@@ -10918,8 +12292,8 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                                  cancelled.size());
                                     for (const auto& oid : cancelled) {
                                         try {
-                                            db_->update_offer_status(
-                                                oid, "cancelled", block_height,
+                                            db_->mark_offer_cancel_submitted(
+                                                oid, block_height,
                                                 "exposure_floor_rebalance");
                                         } catch (...) {}
                                     }
@@ -10946,6 +12320,13 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                             stale_ids.push_back(tc.offer_id);
                     }
                     if (!stale_ids.empty()) {
+                        // [WALLET-CIRCUIT] A balance query that failed at the
+                        // transport level lands here: its catch suppresses both
+                        // sides.  Unchecked, every stale offer would then get a
+                        // secure cancel sent into the same stall.
+                        if (!wallet_step_may_run("Step 8 capital-free cancel")) {
+                            co_return;
+                        }
                         auto freed = co_await offer_mgr_->selective_cancel(stale_ids);
                         if (!freed.empty()) {
                             spdlog::info("[Engine] Step 8: {} both sides suppressed "
@@ -10954,9 +12335,9 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                          pair_name, freed.size(), fresh_count);
                             for (const auto& oid : freed) {
                                 try {
-                                    db_->update_offer_status(oid, "cancelled",
-                                                            block_height,
-                                                            "suppressed_capital_free");
+                                    db_->mark_offer_cancel_submitted(
+                                        oid, block_height,
+                                        "suppressed_capital_free");
                                 } catch (...) {}
                             }
                         }
@@ -11011,6 +12392,11 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         // from capital starvation.  For XCH-base pairs, bid buys XCH;
         // for XCH-quote pairs, ask buys XCH.
         if (config_.strategy.fee_reserve_xch > 0.0) {
+            // [WALLET-CIRCUIT] A prune, force-delete or exposure-floor cancel
+            // above can fail without suppressing either side.
+            if (!wallet_step_may_run("Step 8 XCH fee reserve")) {
+                co_return;
+            }
             try {
                 auto xch_bal = co_await wallet_->get_wallet_balance(1);
                 Mojo xch_spendable = 0;
@@ -12294,6 +13680,10 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                           pair_cfg->name);
             co_return;
         }
+        // [WALLET-CIRCUIT] post_quotes issues a create_offer per tier.
+        if (!wallet_step_may_run("Step 8 post_quotes")) {
+            co_return;
+        }
         int posted = co_await offer_mgr_->post_quotes(
             *pair_cfg, fee_filtered_tiers, block_height, fee_override);
 
@@ -12368,6 +13758,10 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 if (id_it != tier_to_id.end()) {
                     // [T2-09] Use the actual wallet-assigned offer ID.
                     orec.offer_id = id_it->second;
+                    // [S14] post_quotes may already have cancelled this offer
+                    // (asymmetric ladder, late create, failed expiry) and
+                    // flagged it cancel_pending: persist what State says.
+                    orec.status = db_status_for(state_->get_offer(orec.offer_id));
                 } else {
                     // post_quotes may have skipped this tier due to a wallet
                     // RPC error (for example insufficient funds).  Do not
@@ -12380,6 +13774,16 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     continue;
                 }
                 db_->insert_offer(orec);
+                if (orec.status == kOfferStatusCancelPending) {
+                    try {
+                        db_->mark_offer_cancel_submitted(
+                            orec.offer_id, block_height, "post_quotes_retract");
+                    } catch (const std::exception& e) {
+                        spdlog::debug("[Engine] Step 8: could not record the "
+                                      "retract cause for {}: {}",
+                                      orec.offer_id.substr(0, 12), e.what());
+                    }
+                }
                 competitiveness_sum += orec.competitiveness_score;
                 queue_ahead_sum += orec.queue_ahead_score;
                 execution_quality_sum += orec.execution_quality_score;
@@ -12429,6 +13833,11 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
     // Report the aggregate stuck-offer count across all pairs for this cycle.
     metrics_->update_stuck_offers(total_stuck_offers);
 
+    // [WALLET-CIRCUIT] C3.  Everything below is wallet reconciliation.
+    if (!wallet_step_may_run("Step 8 reconciliation")) {
+        co_return;
+    }
+
     // -- [T4-11] Periodic offer-state reconciliation -------------------------
     // Every reconciliation_interval_blocks, perform a full comparison of
     // the in-memory pending-offer map against the authoritative wallet RPC
@@ -12467,7 +13876,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                         rec.price_mojos   = po.price;
                         rec.size_mojos    = po.size;
                         rec.tier          = static_cast<int>(po.tier);
-                        rec.status        = "pending";
+                        rec.status        = db_status_for(po);
                         rec.created_block = po.created_at_block;
                         rec.fee_mojos     = po.fee_mojos;
                         db_->insert_offer(rec);
@@ -12484,7 +13893,10 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         // -- On-chain reconciliation (full node ground truth) ----------------
         // Runs alongside the wallet reconciliation every interval.  Verifies
         // balance consistency and detects stale offers via blockchain data.
-        if (on_chain_reconciler_) {
+        // [WALLET-CIRCUIT] It opens with a get_spendable_coins per wallet, so
+        // not after reconcile_offers above has hit a transport failure.
+        if (on_chain_reconciler_
+            && wallet_step_may_run("Step 8 on-chain reconciliation")) {
             try {
                 // Build wallet ID map from enabled pairs.
                 std::unordered_map<std::string, std::int64_t> wallet_ids;
@@ -12510,6 +13922,11 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                             static_cast<std::int64_t>(wid)).second) {
                         continue;
                     }
+                    // [WALLET-CIRCUIT] Per wallet: the previous wallet's coin
+                    // query swallows its failure.
+                    if (!wallet_step_may_run("Step 8 on-chain coin scan")) {
+                        co_return;
+                    }
                     try {
                         auto coins = co_await wallet_->get_spendable_coins(wid);
                         for (const auto& cr : coins) {
@@ -12527,6 +13944,13 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     } catch (...) { /* best-effort puzzle hash collection */ }
                 }
 
+                // [WALLET-CIRCUIT] The last coin query above may just have
+                // failed.  Once running, the reconciler makes its own wallet
+                // calls in series (verify_pending_offer_coins, then
+                // reconcile_balances per wallet) and is not stopped mid-way.
+                if (!wallet_step_may_run("Step 8 on-chain reconciler")) {
+                    co_return;
+                }
                 auto [stale_ids, balance_discreps] =
                     co_await on_chain_reconciler_->run_full_reconciliation(
                         wallet_ids, block_height, our_puzzle_hashes);
@@ -12655,9 +14079,10 @@ asio::awaitable<void> Engine::step_check_arbitrage(
     // the shape someone adds a mutating call underneath. A comment cannot be
     // mistaken for protection.
 
-    if (wallet_circuit_open_) {
-        spdlog::debug("[Engine] Step 9c: crossed-book SKIPPED -- wallet "
-                      "circuit breaker open");
+    // [WALLET-CIRCUIT] The breaker, or an unanswered wallet transport failure
+    // earlier in this heartbeat (wallet_step_may_run logs which).  Like the
+    // breaker check it replaces, this returns from every take path below.
+    if (!wallet_step_may_run("Step 9c (crossed-book)")) {
         co_return;
     }
 
@@ -13204,7 +14629,8 @@ asio::awaitable<void> Engine::step_check_arbitrage(
 
     if (config_.arbitrage.enabled &&
         config_.arbitrage.cross_stable_arb_enabled &&
-        dexie_ && wallet_ && !dry_run_ && !wallet_circuit_open_)
+        dexie_ && wallet_ && !dry_run_ &&
+        wallet_step_may_run("Step 9 cross-stable arb"))
     {
         // Identify XCH-base stablecoin pairs.
         struct XchStablePair {
@@ -13558,7 +14984,8 @@ asio::awaitable<void> Engine::step_check_arbitrage(
 
     if (config_.arbitrage.enabled &&
         config_.arbitrage.peg_arb_enabled &&
-        dexie_ && wallet_ && depeg_detector_ && !wallet_circuit_open_) {
+        dexie_ && wallet_ && depeg_detector_ &&
+        wallet_step_may_run("Step 9e peg-crossing taker")) {
 
         const double peg_min_edge = config_.arbitrage.peg_arb_min_edge_bps;
         const double peg_max_units = config_.arbitrage.peg_arb_max_take_units;
@@ -14427,6 +15854,57 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
                      chosen->id.substr(0, 12), take_sz,
                      recent_ask_share, recent_fill_bias_bps);
 
+        // [PACE 2026-09-13] A take must not undo pacing.  One that would
+        // ACQUIRE a pace-Active asset is refused outright; one that SPENDS it
+        // must be priced at or below the independent fair value (re-read here;
+        // unusable means refuse) and fit the remaining budget.  9f's own
+        // premium is measured against the book midpoint, not a fair value.
+        std::string pace_take_key;
+        double pace_take_units = 0.0;
+        if (config_.strategy.pace_enabled) {
+            const bool pace_spend_quote = (chosen->spend == execution::SpendAsset::Quote);
+            const std::string& pace_spend_key   = pace_spend_quote ? quote_u : base_u;
+            const std::string& pace_acquire_key = pace_spend_quote ? base_u : quote_u;
+            const auto pace_is_active = [this](const std::string& pace_asset) {
+                const auto pace_mem_it = pace_memory_.find(pace_asset);
+                return pace_mem_it != pace_memory_.end() && pace_mem_it->second.active;
+            };
+            if (pace_is_active(pace_acquire_key)) {
+                spdlog::info("[Engine] Step 9f: {} SKIP -- pace: take would increase managed asset {}",
+                             pair.name, pace_acquire_key);
+                continue;
+            }
+            if (pace_is_active(pace_spend_key)) {
+                const double pace_units = static_cast<double>(chosen->spend_cost)
+                    / static_cast<double>(pace_spend_quote ? pair.quote_mojos_per_unit
+                                                           : pair.base_mojos_per_unit);
+                const auto pace_fv = market_data_->get_fair_value(pair.name);
+                const bool pace_feed_fresh = coingecko_feed_fresh_for_revival(
+                    !coingecko_prices_.empty(), coingecko_last_fetch_, std::chrono::steady_clock::now(),
+                    config_.market_data.cex_freshness_threshold_sec);
+                const bool pace_fv_usable = pace_fv.has_value()
+                    && strategy::pace::xch_per_unit_from_fair_value(
+                           true, pace_fv->tier != FairValueTier::Unavailable, pace_feed_fresh,
+                           pace_fv->price, pace_fv->sigma_bps,
+                           config_.strategy.pace_max_fair_value_sigma_bps).has_value();
+                const double pace_fv_price = pace_fv_usable ? pace_fv->price : 0.0;
+                const double pace_take_px =
+                    static_cast<double>(chosen->price) / static_cast<double>(kMojosPerXch);
+                const auto pace_rem_it = pace_remaining_units_.find(pace_spend_key);
+                const double pace_remaining =
+                    (pace_rem_it != pace_remaining_units_.end()) ? pace_rem_it->second : 0.0;
+                if (!strategy::pace::take_allowed(pace_take_px, pace_fv_price, pace_units, pace_remaining)) {
+                    spdlog::info("[Engine] Step 9f: {} SKIP -- pace: take {:.4f} {} at {:.6f} vs fair "
+                                 "value {:.6f} (remaining {:.4f})",
+                                 pair.name, pace_units, pace_spend_key, pace_take_px, pace_fv_price,
+                                 pace_remaining);
+                    continue;
+                }
+                pace_take_key = pace_spend_key;
+                pace_take_units = pace_units;
+            }
+        }
+
         if (dry_run_) {
             spdlog::info("[Engine] Step 9f: {} DRY RUN -- would take {}",
                          pair.name, chosen->id.substr(0, 12));
@@ -14565,6 +16043,14 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
                                   take_sz.v, chosen->price,
                                   static_cast<std::uint64_t>(fee),
                                   block_height);
+            }
+
+            // [PACE 2026-09-13] A take that spent a pace asset uses its budget;
+            // Step 8's cap pass re-plans that asset's pairs before posting.
+            if (!pace_take_key.empty()) {
+                double& pace_rem = pace_remaining_units_[pace_take_key];
+                pace_rem = std::max(0.0, pace_rem - pace_take_units);
+                pace_assets_consumed_this_cycle_.insert(pace_take_key);
             }
 
             if (fee_tracker_)
@@ -14728,10 +16214,19 @@ asio::awaitable<void> Engine::step_xch_recovery(BlockHeight block_height)
                          "pending offers");
             cancel_ok = true;
 
-            // Also mark all tracked offers as cancel_pending.
+            // Also mark all tracked offers as cancel_pending -- in State and,
+            // [S14], in offer_log: the bulk cancel was only submitted.
             auto tracked = state_->get_all_offers();
             for (const auto& po : tracked) {
                 state_->mark_cancel_pending(po.offer_id);
+                try {
+                    db_->mark_offer_cancel_submitted(po.offer_id, block_height,
+                                                     "xch_recovery");
+                } catch (const std::exception& e) {
+                    spdlog::debug("[Recovery] could not mark {} cancel_pending "
+                                  "in offer_log: {}", po.offer_id.substr(0, 12),
+                                  e.what());
+                }
             }
             spdlog::info("[Recovery] Marked {} offers as cancel_pending",
                          tracked.size());
@@ -16601,6 +18096,12 @@ asio::awaitable<void> Engine::step_ingest_reward_inflows(
     // reward that ever scrolled past this window would simply remain
     // wallet-vs-books divergence for the invariant to absorb -- the
     // pre-existing behaviour, not a new failure mode.
+    // [WALLET-CIRCUIT 2026-09-13] Not after an unanswered wallet transport
+    // failure earlier in this heartbeat; the next heartbeat re-reads the same
+    // 200-row window, so nothing is lost by waiting.
+    if (!wallet_step_may_run("reward ingestion")) {
+        co_return;
+    }
     const auto txs = co_await wallet_->get_transactions(wallet_id, 0, 200);
 
     // The bot's own coin management appears as PAIRED outgoing+incoming
@@ -17009,8 +18510,12 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
     // Booking simply defers until the scheduled probe closes the
     // circuit -- the awaitable-scan design already books through
     // arbitrarily long deferrals.
-    if (!snapshot_current && !wallet_circuit_open_
-        && offer_mgr_ && wallet_ && wallet_->is_open()) {
+    // [WALLET-CIRCUIT 2026-09-13] The same deferral now starts one wallet
+    // transport failure sooner: wallet_step_may_run also refuses after an
+    // unanswered failure earlier in this heartbeat.  Evaluated last, so it is
+    // consulted only when a fetch is actually needed.
+    if (!snapshot_current && offer_mgr_ && wallet_ && wallet_->is_open()
+        && wallet_step_may_run("bridge ingest")) {
         const std::int64_t wid = offer_mgr_->resolve_wallet_id(asset);
         if (wid > 0) {
             try {
@@ -17284,8 +18789,10 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
 
     // FLOW-TRIGGERED RE-ANCHOR (round 42, owner decision).  Rounds
     // 24-41 tried to adjust the drawdown peak in place for external
-    // flows, and every variant was refuted: fills are tracked
-    // base-side only (round 17), so neither the wallet delta, the
+    // flows, and every variant was refuted: fills do not all reach
+    // the tracker (round 17 found them base-side only; maker fills
+    // book both legs since [FILL-LEGS 2026-09-13], but taker fills
+    // still book none -- TODO S48), so neither the wallet delta, the
     // mid-heartbeat equity snapshot, nor amount-matched provenance
     // can attribute a wallet movement to a specific flow -- rounds 39
     // and 41 ended by demanding OPPOSITE policies for the same
@@ -18987,10 +20494,11 @@ asio::awaitable<void> Engine::step_sweep_stale_offers(BlockHeight block_height)
     // DRAIN FAILING chip text.
     std::size_t eligible = 0;
     for (const auto& po : state_->get_all_offers()) {
-        if (!po.cancel_pending
-            && block_height > po.created_at_block
-            && block_height - po.created_at_block
-                   > config_.strategy.offer_ttl_blocks) {
+        // [S14] cancel_stale's own predicate. The strict '>' here disagreed
+        // with cancel_stale's '>=' by one block.
+        if (execution::is_forced_cancel_candidate(
+                po.cancel_pending, po.created_at_block, block_height,
+                config_.strategy.offer_ttl_blocks)) {
             ++eligible;
         }
     }
@@ -19048,8 +20556,8 @@ asio::awaitable<void> Engine::step_sweep_stale_offers(BlockHeight block_height)
             total_cancelled += cancelled.size();
             for (const auto& oid : cancelled) {
                 try {
-                    db_->update_offer_status(oid, "cancelled", block_height,
-                                             "ttl_while_stopped");
+                    db_->mark_offer_cancel_submitted(oid, block_height,
+                                                     "ttl_while_stopped");
                 } catch (const std::exception& e) {
                     spdlog::debug("[Engine] [STOPDRAIN] update_offer_status "
                                   "failed for {}: {}", oid.substr(0, 12),
@@ -19091,9 +20599,8 @@ asio::awaitable<void> Engine::step_sweep_stale_offers(BlockHeight block_height)
                 total_cancelled += cancelled.size();
                 for (const auto& oid : cancelled) {
                     try {
-                        db_->update_offer_status(oid, "cancelled",
-                                                 block_height,
-                                                 "ttl_while_stopped");
+                        db_->mark_offer_cancel_submitted(oid, block_height,
+                                                         "ttl_while_stopped");
                     } catch (const std::exception& e) {
                         spdlog::debug("[Engine] [STOPDRAIN] "
                                       "update_offer_status failed for "
@@ -19148,10 +20655,6 @@ asio::awaitable<void> Engine::step_sweep_stale_offers(BlockHeight block_height)
     co_return;
 }
 
-// [STOPDRAIN review #7] Consume data/shutdown.flag: the GUI asked for a
-// graceful stop. shutdown() is the existing full path -- cancel the book,
-// then stop -- the same thing SIGINT triggers on platforms where the GUI
-// could deliver it.
 // ===========================================================================
 // [S46 2026-09-02] Write-ahead cancel intent, and the recovery that reads it
 // ===========================================================================
@@ -19429,7 +20932,27 @@ asio::awaitable<void> Engine::sweep_cancel_intent(BlockHeight block)
     std::vector<std::string> to_cancel; ///< alive -> re-issue the cancel
     std::vector<std::string> awaiting;  ///< a cancel spend is already in flight
 
+    // [WALLET-CIRCUIT 2026-09-13] This sweep sits above every wallet gate on
+    // purpose, so it keeps its OWN transport check, with a LOCAL mark: the
+    // first id is always probed, breaker open or not.  Once a probe has failed
+    // at the transport level with nothing answering since, the remaining ids
+    // are not probed this heartbeat -- they stay in the intent set untouched,
+    // exactly as a NoVerdict leaves them.  Without this a stall cost one
+    // ~15.5 s timeout per intent id per heartbeat (five ids were live on
+    // 2026-09-12), and ~123.5 s each against a daemon that accepts the
+    // connection and then hangs: 617.5 s for five, past the dead man's switch
+    // (watchdog_stall_seconds, 600).
+    const rpc::TransportCounters sweep_start =
+        wallet_ ? wallet_->transport_counters() : rpc::TransportCounters{};
+    std::size_t probed = 0;
+
     for (const auto& id : ids) {
+        if (wallet_
+            && execution::unanswered_transport_failure_since(
+                   sweep_start, wallet_->transport_counters())) {
+            break;
+        }
+        ++probed;
         // [S46] recheck_terminal() is REUSED here rather than re-implemented.
         // It is the repo's existing "ask the wallet about one of OUR trade
         // ids and decide what that means" routine, it already has the correct
@@ -19482,14 +21005,43 @@ asio::awaitable<void> Engine::sweep_cancel_intent(BlockHeight block)
         }
     }
 
-    if (!awaiting.empty()) {
-        spdlog::info("[Engine] [S46] {} recovered intent offer(s) already "
-                     "have a cancel spend in flight -- waiting for it to "
-                     "confirm, NOT re-charging",
-                     awaiting.size());
+    if (probed < ids.size()) {
+        spdlog::warn("[Engine] [S46] intent sweep: a wallet probe failed at "
+                     "the transport level and nothing has answered since -- "
+                     "{} of {} intent id(s) deferred to the next heartbeat, "
+                     "still in the intent set",
+                     ids.size() - probed, ids.size());
     }
 
-    if (!to_cancel.empty()) {
+    // [S14] Logged when the count changes, not every heartbeat (613 lines in
+    // the last 60,000). A spend that never confirms is no longer waited on
+    // forever: escalate_stuck_cancels owns these offers.
+    if (awaiting.size() != s46_awaiting_logged_) {
+        if (!awaiting.empty()) {
+            spdlog::info("[Engine] [S46] {} recovered intent offer(s) already "
+                         "have a cancel spend in flight -- waiting for it to "
+                         "confirm, NOT re-charging (the cancel escalation "
+                         "re-checks the chain)",
+                         awaiting.size());
+        }
+        s46_awaiting_logged_ = awaiting.size();
+    }
+
+    // [WALLET-CIRCUIT] Nor is a re-cancel sent into a stall a probe just hit:
+    // each is a secure cancel that would time out the same way.  The ids stay
+    // in the intent set, so the next heartbeat re-probes and re-orders them.
+    const bool sweep_transport_failed =
+        wallet_
+        && execution::unanswered_transport_failure_since(
+               sweep_start, wallet_->transport_counters());
+    if (!to_cancel.empty() && sweep_transport_failed) {
+        spdlog::error("[Engine] [S46] {} offer(s) a previous process ordered "
+                      "cancelled are STILL LIVE, but a wallet call has just "
+                      "failed at the transport level -- the re-cancel is "
+                      "deferred to the next heartbeat rather than sent into "
+                      "the stall",
+                      to_cancel.size());
+    } else if (!to_cancel.empty()) {
         spdlog::critical(
             "[Engine] [S46] {} offer(s) a previous process ordered cancelled "
             "are STILL LIVE -- re-issuing the cancel now",
@@ -19505,6 +21057,13 @@ asio::awaitable<void> Engine::sweep_cancel_intent(BlockHeight block)
             spdlog::warn("[Engine] [S46] re-cancel SUBMITTED for {} -- kept "
                          "in the intent set until the wallet confirms it "
                          "terminal", id.substr(0, 12));
+            // [S14] Submitted, so offer_log says cancel_pending.
+            try {
+                db_->mark_offer_cancel_submitted(id, block, "s46_intent_recancel");
+            } catch (const std::exception& e) {
+                spdlog::debug("[Engine] [S46] could not mark {} cancel_pending: {}",
+                              id.substr(0, 12), e.what());
+            }
         }
         if (!oc.failed.empty()) {
             spdlog::error("[Engine] [S46] re-cancel failed for {} offer(s) "
@@ -19554,16 +21113,682 @@ asio::awaitable<void> Engine::sweep_cancel_intent(BlockHeight block)
     co_return;
 }
 
+// ---------------------------------------------------------------------------
+// [WALLET-CIRCUIT 2026-09-13] wallet_step_may_run -- the one wallet gate.
+//
+// The decision is execution::wallet_gate (execution/wallet_circuit.hpp); this
+// member only applies it: it logs, opens the breaker, and starts the probe
+// clock.  See the breaker block in engine.hpp for the incident and the rule.
+// ---------------------------------------------------------------------------
+bool Engine::wallet_step_may_run(std::string_view step)
+{
+    if (wallet_circuit_open_) {
+        spdlog::debug("[Engine] {} SKIPPED: wallet circuit breaker open", step);
+        return false;
+    }
+    if (!wallet_) {
+        return true;
+    }
+    const rpc::TransportCounters evidence = wallet_->transport_counters();
+    switch (execution::wallet_gate(wallet_transport_at_cycle_start_, evidence)) {
+        case execution::WalletGate::Run:
+            return true;
+        case execution::WalletGate::SkipHeartbeat:
+            if (!wallet_skip_warned_this_cycle_) {
+                wallet_skip_warned_this_cycle_ = true;
+                spdlog::warn("[Engine] [WALLET-CIRCUIT] {} SKIPPED: a wallet "
+                             "call failed at the transport level this "
+                             "heartbeat (retries exhausted, or not retryable) "
+                             "and nothing has answered since ({} in a row) -- "
+                             "the rest of this heartbeat's wallet work is "
+                             "skipped; the next heartbeat tries again",
+                             step, evidence.consecutive_failures);
+            } else {
+                spdlog::debug("[Engine] [WALLET-CIRCUIT] {} SKIPPED: wallet "
+                              "transport failure earlier this heartbeat",
+                              step);
+            }
+            return false;
+        case execution::WalletGate::OpenCircuit:
+            wallet_circuit_open_ = true;
+            wallet_last_probe_   = std::chrono::steady_clock::now();
+            spdlog::warn("[Engine] Wallet circuit breaker OPEN after {} "
+                         "consecutive wallet transport failures (noticed at "
+                         "{}) -- skipping wallet-dependent steps until the "
+                         "probe gets an answer",
+                         evidence.consecutive_failures, step);
+            return false;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// [S14 2026-09-13] escalate_stuck_cancels -- proof-gated re-cancel of offers
+// whose cancel the wallet accepted but the chain never saw.
+//
+// Every heartbeat, for each cancel_pending offer in State:
+//   * first sighting: anchor it and seed its escalation count, and the
+//     highest fee an escalation of it recorded, from offer_closure_events
+//     (the cap and the fee floor are per offer, not per process);
+//   * once due (execution::escalation_probe_due), probe it -- wallet
+//     get_offer, then the full node's coin records for its coins_of_interest
+//     -- oldest anchor first, at most max_probes_per_sweep per heartbeat;
+//   * act on execution::decide_cancel_escalation: wait, back off, re-cancel
+//     SECURE at execution::escalation_fee_mojos, or queue ONE alert.
+//
+// FAIL CLOSED.  No wallet answer, no complete chain answer, or an answer
+// that cannot be read means nothing is paid and nothing is stamped terminal.
+// A spent maker coin can be a FILL, so the chain is never used to write a
+// terminal status: the wallet verdict remains the only one.
+//
+// WATCHDOG.  last_beat_ms_ is stamped only when a cycle completes, and one
+// hanging rpc_post costs ~123 s against watchdog_stall_seconds (600 s).  So
+// the sweep stops at the FIRST failed RPC of any kind, is skipped entirely
+// when Step 2 failed this cycle, and checks a wall-clock budget before each
+// probe.  The dead man's switch itself runs on another thread, so its flag is
+// re-read with the other asynchronous gates before every candidate and every
+// fee (execution::escalation_must_yield).
+//
+// WRITE AHEAD.  Each escalation records its cancel_escalation_N event, with the
+// fee it is about to pay, BEFORE the fee-bearing call, and pays nothing when
+// that record cannot be written.  A submission that then fails still counts
+// after a restart: fewer paid attempts, never more.
+// ---------------------------------------------------------------------------
+namespace {
+
+/// compute_coin_name behind a catch: it throws on malformed hex and when an
+/// OpenSSL digest step fails.  Either way there is no name, and a missing
+/// name voids the proof.
+std::string s14_coin_name(const execution::CoinRef& ref)
+{
+    try {
+        return execution::CoinManager::compute_coin_name(
+            ref.parent_hex, ref.puzzle_hash_hex, static_cast<Mojo>(ref.amount));
+    } catch (const std::exception&) {
+        return {};
+    }
+}
+
+std::int64_t s14_steady_now_ms()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+void s14_bump(std::uint32_t& counter) noexcept
+{
+    if (counter != std::numeric_limits<std::uint32_t>::max()) {
+        ++counter;
+    }
+}
+
+execution::UnresolvedAlertEntry s14_alert_entry(const std::string&          offer_id,
+                                               const std::string&          pair_name,
+                                               std::uint32_t               escalations,
+                                               execution::UnresolvedReason reason,
+                                               std::string                 detail)
+{
+    execution::UnresolvedAlertEntry entry;
+    entry.offer_id    = offer_id;
+    entry.pair_name   = pair_name;
+    entry.escalations = escalations;
+    entry.reason      = reason;
+    entry.detail      = std::move(detail);
+    return entry;
+}
+
+}  // namespace
+
+void Engine::flush_cancel_unresolved_alerts()
+{
+    auto batch = cancel_unresolved_alerts_.take_due(
+        s14_steady_now_ms(), execution::kMaxIdsPerCancelUnresolvedAlert);
+    if (batch.empty()) {
+        return;
+    }
+    const std::string message = execution::format_cancel_unresolved_alert(
+        batch, cancel_unresolved_alerts_.size());
+    spdlog::critical("[Engine] {}", message);
+    if (alerts_) {
+        alerts_->send_alert(AlertRule::CancelUnresolved, message);
+    }
+    for (const auto& entry : batch) {
+        const auto it = cancel_escalation_tracks_.find(entry.offer_id);
+        if (it != cancel_escalation_tracks_.end()) {
+            it->second.alerted = true;
+        }
+    }
+}
+
+asio::awaitable<void> Engine::escalate_stuck_cancels(BlockHeight block)
+{
+    if (!config_.strategy.cancel_escalation_enabled || dry_run_ || !offer_mgr_
+        || !wallet_ || !state_ || block == 0) {
+        co_return;
+    }
+    // Queued alerts go out whatever the gates below say: an alert touches no
+    // wallet, and "still takeable" must not wait for the wallet to recover.
+    flush_cancel_unresolved_alerts();
+
+    // [review, round 2] The gates another thread or a co_spawned coroutine can
+    // close while this sweep is suspended in an RPC -- the dead man's switch
+    // included.  Read here, before each candidate, and immediately before each
+    // fee-bearing call.
+    const auto async_gates = [this]() {
+        execution::EscalationAsyncGates gates;
+        gates.graceful_cancel_active =
+            graceful_cancel_active_.load(std::memory_order_acquire);
+        gates.cancel_all_inflight = cancel_all_inflight_;
+        gates.watchdog_fired      = watchdog_fired_.load(std::memory_order_acquire);
+        return gates;
+    };
+
+    // [review] The states this sweep declines to run in:
+    //  * graceful_cancel_active_ / cancel_all_inflight_ -- another cancel is
+    //    walking this book right now; a re-cancel underneath it pays a second
+    //    fee for one spend.
+    //  * wallet_circuit_open_ / wallet_consecutive_failures_ > 0 -- the wallet
+    //    is failing (Step 2 failed THIS cycle); probing it is how a remedy
+    //    runs a cycle past the dead man's switch.
+    //    [v0.10.24 integration] #156 removed wallet_consecutive_failures_,
+    //    which counted throws a stalled wallet never raised.  "Failing" is
+    //    now #156's own decision, execution::wallet_gate, read here without
+    //    wallet_step_may_run's side effects (no log, no breaker trip): a
+    //    wallet call failed at the transport level since this heartbeat's
+    //    mark with nothing answering since, or enough consecutive failures
+    //    to open the breaker.
+    //  * xch_recovery_mode_ -- every tracked offer is marked cancel_pending
+    //    because XCH is depleted; operator decision: no escalation there.
+    //  * watchdog_fired_ -- the book was cancelled by a process that gave up
+    //    managing it; operator decision: no escalation until restart.
+    if (execution::escalation_must_yield(async_gates())
+        || wallet_circuit_open_
+        || execution::wallet_gate(wallet_transport_at_cycle_start_,
+                                  wallet_->transport_counters())
+               != execution::WalletGate::Run
+        || xch_recovery_mode_) {
+        spdlog::debug("[Engine] [S14] cancel escalation deferred this heartbeat "
+                      "(cancel in flight, wallet failing, XCH recovery or dead "
+                      "man's switch)");
+        co_return;
+    }
+
+    const execution::CancelEscalationParams params =
+        execution::cancel_escalation_params_from(config_.strategy);
+    const std::uint64_t now_block = block;
+    const std::vector<PendingOffer> offers = state_->get_all_offers();
+
+    // Tracks follow State: an offer that left State, or is no longer
+    // cancel_pending, has resolved one way or another.
+    std::unordered_map<std::string, const PendingOffer*> cancel_pending;
+    for (const auto& po : offers) {
+        if (po.cancel_pending) {
+            cancel_pending.emplace(po.offer_id, &po);
+        }
+    }
+    for (auto it = cancel_escalation_tracks_.begin();
+         it != cancel_escalation_tracks_.end();) {
+        if (cancel_pending.count(it->first) == 0) {
+            cancel_unresolved_alerts_.forget(it->first);
+            it = cancel_escalation_tracks_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    std::vector<std::pair<std::uint64_t, const PendingOffer*>> due;
+    for (const auto& entry : cancel_pending) {
+        const std::string& offer_id = entry.first;
+        execution::CancelEscalationTrack& track = cancel_escalation_tracks_[offer_id];
+        if (track.anchor_block == 0) {
+            // First sighting. Seed the count, and the highest fee an earlier
+            // escalation recorded, so a restart grants neither a fresh ladder
+            // nor a bid that only repeats the last one -- which the mempool
+            // refuses as a replacement.  On a read failure stay unanchored
+            // and retry.
+            std::uint32_t prior     = 0;
+            std::uint64_t prior_fee = 0;
+            try {
+                if (db_) {
+                    prior     = db_->count_cancel_escalations(offer_id);
+                    prior_fee = db_->max_cancel_escalation_fee(offer_id);
+                }
+            } catch (const std::exception& e) {
+                spdlog::debug("[Engine] [S14] could not read the escalation history "
+                              "for {}: {} -- retried next heartbeat",
+                              offer_id, e.what());
+                continue;
+            }
+            track.anchor_block   = now_block;
+            track.escalations    = prior;
+            track.last_fee_mojos = prior_fee;
+            continue;
+        }
+        if (execution::escalation_probe_due(track, now_block, params)) {
+            due.emplace_back(track.anchor_block, entry.second);
+        }
+    }
+    std::sort(due.begin(), due.end(), [](const auto& a, const auto& b) {
+        return a.first != b.first ? a.first < b.first
+                                  : a.second->offer_id < b.second->offer_id;
+    });
+    if (due.size() > params.max_probes_per_sweep) {
+        due.resize(params.max_probes_per_sweep);
+    }
+
+    if (!due.empty()) {
+        const std::uint64_t base_fee = fee_tracker_
+            ? fee_tracker_->get_recommended_fee(config_.strategy.offer_fee_mojos, block)
+            : config_.strategy.offer_fee_mojos;
+        // A ceiling on the cancel being replaced: emergency_cancel's top tier
+        // pays up to twice the dynamic fee.  It is the dynamic fee NOW, not the
+        // one that cancel saw -- initial cancel fees are not persisted (see
+        // execution::escalation_fee_mojos).
+        const std::uint64_t dynamic_fee = offer_mgr_->current_fee();
+        const std::uint64_t prior_ceiling =
+            dynamic_fee > std::numeric_limits<std::uint64_t>::max() / 2U
+                ? std::numeric_limits<std::uint64_t>::max()
+                : dynamic_fee * 2U;
+        const std::int64_t started_ms = s14_steady_now_ms();
+
+        for (const auto& candidate : due) {
+            const std::string offer_id  = candidate.second->offer_id;
+            const std::string pair_name = candidate.second->pair_name;
+
+            if (s14_steady_now_ms() - started_ms >= execution::kEscalationSweepBudgetMs) {
+                spdlog::debug("[Engine] [S14] escalation sweep budget spent -- the "
+                              "remaining probes wait for the next heartbeat");
+                break;
+            }
+            if (execution::escalation_must_yield(async_gates()) || wallet_circuit_open_) {
+                break;
+            }
+            if (!state_->get_offer(offer_id).cancel_pending) {
+                continue;   // resolved while earlier candidates were probed
+            }
+            const auto track_it = cancel_escalation_tracks_.find(offer_id);
+            if (track_it == cancel_escalation_tracks_.end()) {
+                continue;
+            }
+            execution::CancelEscalationTrack& track = track_it->second;
+
+            // 1. The wallet's word.
+            nlohmann::json record;
+            bool wallet_failed = false;
+            std::string failure;
+            try {
+                record = co_await wallet_->get_offer(offer_id, /*file_contents=*/false);
+            } catch (const std::exception& e) {
+                wallet_failed = true;
+                failure = e.what();
+            }
+            if (wallet_failed) {
+                track.retry_after_block = now_block
+                    + execution::escalation_backoff_blocks(track.idle_probes, params);
+                s14_bump(track.idle_probes);
+                spdlog::warn("[Engine] [S14] escalation probe: get_offer failed for "
+                             "{} -- no verdict, nothing paid; the sweep stops for "
+                             "this heartbeat: {}", offer_id, failure);
+                break;
+            }
+            const execution::WalletCancelState wallet_state =
+                execution::wallet_cancel_state_from_record(record);
+
+            // 2. The chain's word -- only when the wallet gave one, and never
+            //    from a node the height source has stopped trusting.
+            execution::CoinProof proof = execution::CoinProof::Unknown;
+            if (wallet_state != execution::WalletCancelState::Unknown
+                && full_node_ && !wallet_only_mode_) {
+                const std::vector<std::string> names = execution::coin_names_for(
+                    execution::parse_coins_of_interest(record), &s14_coin_name);
+                if (!names.empty()) {
+                    std::vector<nlohmann::json> coin_records;
+                    bool node_failed = false;
+                    try {
+                        coin_records = co_await full_node_->get_coin_records_by_names(
+                            names, /*include_spent=*/true);
+                    } catch (const std::exception& e) {
+                        node_failed = true;
+                        failure = e.what();
+                    }
+                    if (node_failed) {
+                        track.retry_after_block = now_block
+                            + execution::escalation_backoff_blocks(track.idle_probes, params);
+                        s14_bump(track.idle_probes);
+                        spdlog::warn("[Engine] [S14] escalation probe: coin lookup "
+                                     "failed for {} -- no proof, nothing paid; the "
+                                     "sweep stops for this heartbeat: {}",
+                                     offer_id, failure);
+                        break;
+                    }
+                    proof = execution::classify_coin_records(names, coin_records,
+                                                             &s14_coin_name);
+                }
+            }
+
+            // 3. Decide.
+            execution::CancelEscalationInput input;
+            input.current_block = now_block;
+            input.track         = track;
+            input.wallet        = wallet_state;
+            input.coins         = proof;
+            input.params        = params;
+            const execution::CancelEscalationVerdict verdict =
+                execution::decide_cancel_escalation(input);
+            spdlog::debug("[Engine] [S14] escalation probe {} ({}): wallet {}, "
+                          "chain proof {}, verdict {}", offer_id, pair_name,
+                          execution::wallet_cancel_state_name(wallet_state),
+                          static_cast<int>(proof),
+                          execution::escalation_verdict_name(verdict));
+
+            // The fee-bearing branch sits OUTSIDE the switch below: nothing in
+            // this codebase co_awaits inside a switch, and GCC's coroutine
+            // transform has had defects in exactly that shape. `break` ends the
+            // sweep, `continue` moves to the next candidate.
+            if (verdict == execution::CancelEscalationVerdict::Escalate) {
+                // [review] Re-check right before the fee-bearing call: shutdown,
+                // a co_spawned operator cancel-all, or the dead man's switch on
+                // its own thread can close a gate during the co_awaits above.
+                if (execution::escalation_must_yield(async_gates())
+                    || !state_->get_offer(offer_id).cancel_pending) {
+                    break;
+                }
+                const std::uint64_t fee = execution::escalation_fee_mojos(
+                    base_fee, track.last_fee_mojos, prior_ceiling, params);
+                const std::uint64_t attempt =
+                    static_cast<std::uint64_t>(track.escalations) + 1U;
+                // [review, round 2] WRITE AHEAD, FAIL CLOSED.  The cap and the
+                // fee floor are seeded from recorded events alone, so the record
+                // goes in BEFORE the fee is paid, and without one nothing is
+                // paid: an attempt a restart cannot see would be paid again.
+                bool recorded = false;
+                std::string record_error{"no database"};
+                if (db_) {
+                    try {
+                        db_->mark_offer_cancel_submitted(
+                            offer_id, block,
+                            "cancel_escalation_" + std::to_string(attempt), fee);
+                        recorded = true;
+                    } catch (const std::exception& e) {
+                        record_error = e.what();
+                    }
+                }
+                if (!recorded) {
+                    track.retry_after_block = now_block
+                        + execution::escalation_backoff_blocks(track.idle_probes, params);
+                    s14_bump(track.idle_probes);
+                    spdlog::warn("[Engine] [S14] escalated re-cancel {} for {} ({}) NOT "
+                                 "submitted: its record could not be written, and no "
+                                 "fee is paid without one; the sweep stops for this "
+                                 "heartbeat: {}", attempt, offer_id, pair_name,
+                                 record_error);
+                    break;
+                }
+                std::optional<std::string> error;
+                try {
+                    error = co_await offer_mgr_->recancel_secure(offer_id, fee);
+                } catch (const std::exception& e) {
+                    error = std::string{e.what()};
+                }
+                std::uint64_t paid = fee;
+                if (error && fee > 0
+                    && execution::classify_take_failure(*error)
+                           == execution::TakeFailureClass::Funding) {
+                    // [review] Short of XCH: a SECURE cancel at fee 0 needs
+                    // none -- the offer's own coins are the inputs, the dead
+                    // man's switch recipe. It cannot replace a conflicting
+                    // spend, but the stranded case has none.
+                    const std::uint64_t zero_fee = risk::watchdog_cancel().fee_mojos;
+                    std::optional<std::string> zero_error;
+                    try {
+                        zero_error = co_await offer_mgr_->recancel_secure(
+                            offer_id, zero_fee);
+                    } catch (const std::exception& e) {
+                        zero_error = std::string{e.what()};
+                    }
+                    if (!zero_error) {
+                        paid = zero_fee;
+                        error.reset();
+                    } else {
+                        *error += " | zero-fee retry: " + *zero_error;
+                    }
+                }
+                if (error) {
+                    s14_bump(track.consecutive_errors);
+                    const std::uint64_t backoff = execution::escalation_backoff_blocks(
+                        track.consecutive_errors, params);
+                    track.retry_after_block = now_block + backoff;
+                    spdlog::warn("[Engine] [S14] escalated re-cancel FAILED for {} "
+                                 "({}) at fee {} mojos -- not counted toward the "
+                                 "cap by this process, though its record counts "
+                                 "after a restart; next attempt in {} blocks: {}",
+                                 offer_id, pair_name, fee, backoff, *error);
+                    if (!track.alerted
+                        && track.consecutive_errors
+                               >= execution::kEscalationErrorAlertThreshold) {
+                        cancel_unresolved_alerts_.enqueue(s14_alert_entry(
+                            offer_id, pair_name, track.escalations,
+                            execution::UnresolvedReason::ResubmitFailing,
+                            *error));
+                    }
+                    // [review] The first failure of any kind ends the sweep.
+                    break;
+                }
+                s14_bump(track.escalations);
+                track.anchor_block       = now_block;
+                track.retry_after_block  = 0;
+                track.last_fee_mojos     = std::max(track.last_fee_mojos, paid);
+                track.idle_probes        = 0;
+                track.consecutive_errors = 0;
+                if (fee_tracker_ && fee_tracker_->enabled() && paid > 0) {
+                    fee_tracker_->record_fee(paid, block);
+                }
+                spdlog::warn("[Engine] [S14] escalated re-cancel {}/{} SUBMITTED for "
+                             "{} ({}) at fee {} mojos -- the wallet reports {} and "
+                             "every maker coin is unspent on-chain",
+                             track.escalations, params.max_escalations,
+                             offer_id, pair_name, paid,
+                             execution::wallet_cancel_state_name(wallet_state));
+                continue;
+            }
+
+            switch (verdict) {
+                case execution::CancelEscalationVerdict::AnchorNow:
+                case execution::CancelEscalationVerdict::Wait: {
+                    // Probed inside a PENDING_CANCEL window: look again when
+                    // the window closes, not every retry interval.
+                    track.retry_after_block = track.anchor_block + params.window_blocks;
+                    break;
+                }
+                case execution::CancelEscalationVerdict::ResolvedByWallet:
+                case execution::CancelEscalationVerdict::Resolving:
+                case execution::CancelEscalationVerdict::NoProof: {
+                    track.retry_after_block = now_block
+                        + execution::escalation_backoff_blocks(track.idle_probes, params);
+                    s14_bump(track.idle_probes);
+                    if (verdict != execution::CancelEscalationVerdict::ResolvedByWallet
+                        && execution::unresolved_alert_due(track, now_block, params)) {
+                        const bool spent_but_pending =
+                            proof == execution::CoinProof::SomeSpent;
+                        cancel_unresolved_alerts_.enqueue(s14_alert_entry(
+                            offer_id, pair_name, track.escalations,
+                            spent_but_pending
+                                ? execution::UnresolvedReason::WalletNotReconciled
+                                : execution::UnresolvedReason::Unverifiable,
+                            std::string{"wallet "}
+                                + execution::wallet_cancel_state_name(wallet_state)));
+                    }
+                    break;
+                }
+                case execution::CancelEscalationVerdict::Exhausted: {
+                    track.retry_after_block = now_block + params.window_blocks;
+                    if (!track.alerted) {
+                        cancel_unresolved_alerts_.enqueue(s14_alert_entry(
+                            offer_id, pair_name, track.escalations,
+                            execution::UnresolvedReason::StillTakeable,
+                            std::string{"wallet "}
+                                + execution::wallet_cancel_state_name(wallet_state)));
+                    }
+                    break;
+                }
+                case execution::CancelEscalationVerdict::Escalate:
+                    break;   // handled above, outside the switch
+            }
+        }
+    }
+
+    // One alert per window; offers are marked alerted only when named in a send.
+    flush_cancel_unresolved_alerts();
+    co_return;
+}
+
+// [STOPDRAIN review #7] Consume data/shutdown.flag: the GUI asked for a
+// graceful stop. shutdown() is the existing full path -- cancel the book,
+// then stop -- the same thing SIGINT triggers on platforms where the GUI
+// could deliver it.
+//
+// [shutdown-flag-race 2026-09-12] Only a request naming this PID, or no PID,
+// and written at or after this process started stops it (decide_shutdown_flag).
+// Called from the fast poll, the analysis poll and the boot checkpoints.
 void Engine::check_shutdown_flag()
 {
+    evaluate_shutdown_flag(util::ShutdownFlagSite::Checkpoint);
+}
+
+// [shutdown-flag-race 2026-09-12] Read data/shutdown.flag, decide with
+// util::decide_shutdown_flag (the rule, and the incident that forced it, are
+// in xop/util/shutdown_flag.hpp) and act as util::plan_shutdown_flag_action
+// says for `site`.
+//
+// NOT covered by a test: nothing in cpp/tests constructs an Engine (S36). The
+// decision and the verdict->action table are covered; this function's file
+// read, the site each caller passes, the mtime re-check, the remove and the
+// shutdown() call are not.
+util::ShutdownFlagDecision Engine::evaluate_shutdown_flag(util::ShutdownFlagSite site)
+{
     namespace fs = std::filesystem;
-    if (shutdown_flag_path_.empty()) return;
     std::error_code ec;
-    if (!fs::exists(shutdown_flag_path_, ec)) return;
-    fs::remove(shutdown_flag_path_, ec);
-    spdlog::warn("[Engine] shutdown.flag consumed -- graceful shutdown "
-                 "(the book is cancelled on the way down)");
+    if (shutdown_flag_path_.empty() || !fs::exists(shutdown_flag_path_, ec)) {
+        shutdown_flag_keep_warned_ = false;  // re-arm for the next appearance
+        return {};
+    }
+
+    util::ShutdownFlagFacts facts{};
+    facts.identity = process_identity_;
+    {
+        std::error_code mtime_ec;
+        const fs::file_time_type flag_mtime =
+            fs::last_write_time(shutdown_flag_path_, mtime_ec);
+        if (!mtime_ec) {
+            facts.mtime_known = true;
+            facts.mtime = flag_mtime;
+        }
+    }
+    {
+        std::ifstream in(shutdown_flag_path_, std::ios::binary);
+        if (in.is_open()) {
+            std::string content(util::kShutdownFlagMaxBytes, '\0');
+            in.read(content.data(), static_cast<std::streamsize>(content.size()));
+            if (!in.bad()) {
+                content.resize(static_cast<std::size_t>(in.gcount()));
+                facts.content_known = true;
+                facts.parsed = util::parse_shutdown_flag(content);
+            }
+        }
+    }
+
+    const util::ShutdownFlagDecision decision = util::decide_shutdown_flag(facts);
+    const util::ShutdownFlagAction action =
+        util::plan_shutdown_flag_action(decision.verdict, site);
+    const std::int64_t age_ms = util::flag_age_vs_start_ms(facts);
+    const char* const reason_name = util::shutdown_flag_reason_name(decision.reason);
+
+    if (decision.verdict == util::ShutdownFlagVerdict::Keep) {
+        if (!shutdown_flag_keep_warned_) {
+            shutdown_flag_keep_warned_ = true;
+            spdlog::warn("[Engine] shutdown.flag present but undecidable ({}) -- "
+                         "left in place, re-read at the next check", reason_name);
+        }
+        return decision;
+    }
+    shutdown_flag_keep_warned_ = false;
+
+    if (action.remove_file) {
+        // A request REPLACED while this one was being evaluated is the next
+        // check's to read, not this one's to delete. This narrows the race;
+        // it does not close it -- a replace landing between this re-check and
+        // remove() is still removed.
+        if (facts.mtime_known) {
+            std::error_code recheck_ec;
+            const fs::file_time_type mtime_now =
+                fs::last_write_time(shutdown_flag_path_, recheck_ec);
+            if (recheck_ec || mtime_now != facts.mtime) {
+                spdlog::info("[Engine] shutdown.flag changed while it was being "
+                             "evaluated -- re-read at the next check");
+                return {};
+            }
+        }
+        fs::remove(shutdown_flag_path_, ec);
+    }
+
+    if (decision.verdict == util::ShutdownFlagVerdict::Discard) {
+        if (ec) {
+            spdlog::warn("[Engine] shutdown.flag is NOT addressed to this process "
+                         "({}; flag PID {}, this PID {}, written {} ms relative to "
+                         "this process start) but could not be removed ({}) -- "
+                         "ignored, and re-read at the next check",
+                         reason_name, facts.parsed.pid, process_identity_.pid,
+                         age_ms, ec.message());
+        } else {
+            spdlog::warn("[Engine] removed shutdown.flag NOT addressed to this "
+                         "process ({}; flag PID {}, this PID {}, written {} ms "
+                         "relative to this process start) -- a stop request is "
+                         "never inherited by a successor",
+                         reason_name, facts.parsed.pid, process_identity_.pid,
+                         age_ms);
+        }
+        return decision;
+    }
+
+    if (!action.request_shutdown) {
+        spdlog::info("[Engine] shutdown.flag is for this process ({}) -- "
+                     "left for the first stop checkpoint", reason_name);
+        return decision;
+    }
+
+    if (ec) {
+        spdlog::error("[Engine] could not remove shutdown.flag: {} -- the request "
+                      "was honoured ({}; this PID {}, written {} ms after start) and "
+                      "graceful shutdown proceeds; the GUI will report this stop as "
+                      "NOT consumed",
+                      ec.message(), reason_name, process_identity_.pid, age_ms);
+    } else {
+        spdlog::warn("[Engine] shutdown.flag consumed ({}; this PID {}, written {} ms "
+                     "after start) -- graceful shutdown (the book is cancelled on "
+                     "the way down)", reason_name, process_identity_.pid, age_ms);
+    }
     shutdown();
+    return decision;
+}
+
+// [shutdown-flag-race 2026-09-12] A stop checkpoint for poll_loop_coro's boot
+// sequence. Before it, nothing between open_connections() and the first
+// analysis poll looked at shutdown.flag, and a signal only broke the
+// wallet-sync wait -- after which boot carried on splitting coins and seeding
+// inventory while the shutdown continuation cancelled the book.
+//
+// co_return after `true` is safe: shutdown() has already co_spawned its
+// continuation, which ends in ioc_.stop(), and run() skips the S31
+// died-without-a-request path because stop_requested_ is set.
+bool Engine::boot_stop_checkpoint(const char* where)
+{
+    check_shutdown_flag();
+    if (!stop_requested_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    spdlog::warn("[Engine] stop requested during boot ({}) -- remaining startup "
+                 "steps skipped; the shutdown continuation owns teardown", where);
+    return true;
 }
 
 // Consume data/cancel_all.flag: the operator asked for the book to be gone
@@ -19630,8 +21855,258 @@ void Engine::check_cancel_all_flag()
     asio::co_spawn(
         ioc_,
         [this]() -> asio::awaitable<void> {
+            // [review 2026-09-13, round 2] Cleared on EVERY way out of this
+            // coroutine -- any exception, or the frame destroyed while it is
+            // suspended -- not only after the catch below. The branch for a
+            // sweep that got no answer suspends for a request timeout and
+            // more, and a flag left set defers the intent sweep, shutdown and
+            // every later Cancel All for the life of the process.
+            struct InflightGuard {
+                bool* flag;
+                ~InflightGuard() { *flag = false; }
+            } inflight_guard{&cancel_all_inflight_};
             try {
+                // [review 2026-09-13, round 4] The tracked offers State already
+                // has a cancel in flight for, taken just before the sweep: the
+                // engine's own cancels are no evidence that the sweep ran.
+                std::unordered_set<std::string> pending_before_sweep;
+                for (const auto& po : state_->get_all_offers()) {
+                    if (po.cancel_pending) {
+                        pending_before_sweep.insert(po.offer_id);
+                    }
+                }
                 auto done = co_await offer_mgr_->cancel_all();
+                // [review 2026-09-13, round 2] A WALLET-WIDE SWEEP THAT GOT NO
+                // ANSWER. cancel_all has sent nothing more -- every tracked id
+                // is in `failed` -- because the sweep may still be running
+                // inside the wallet, and a per-id cancel queued behind it
+                // builds a second, conflicting spend of an offer it already
+                // cancelled. Wait at least one request timeout of this wallet
+                // client with cancel_all_inflight_ still set, then ask the
+                // wallet about each offer and cancel only the ones it still
+                // reports live with no cancel spend in flight.
+                //
+                // [review 2026-09-13, round 3] WHAT THE FLAG DEFERS, AND WHAT
+                // IT DOES NOT. It defers the heartbeat intent sweep, the Step 8
+                // stale sweep and its drain, the peg-suspend drain, the reload
+                // drain for live-disabled pairs, a second Cancel All and a
+                // shutdown, which waits for it. It does NOT defer XCH
+                // recovery's wallet-wide re-send (recovery.cancel_on_enter,
+                // false in the live config) or the dead man's switch, which
+                // fires only on a real stall.
+                //
+                // [review 2026-09-13, round 3] BOUNDED, AND A SHUTDOWN WINS.
+                //   * A deadline: the wait plus the retry budget
+                //     (execution::possibly_submitted_deadline_ms). Probes and
+                //     re-cancels stop at it; only an RPC already in flight
+                //     runs past it.
+                //   * A shutdown request ends the branch at the next check --
+                //     every 250 ms while pausing, before each probe and before
+                //     each re-cancel -- so shutdown()'s wait on
+                //     cancel_all_inflight_ is bounded by one check plus one RPC
+                //     in flight. The ids not yet handled keep their Ordered
+                //     intent, and the shutdown's own cancel takes them over --
+                //     sending no second wallet-wide sweep within one wait of
+                //     this one [round 4]. The dead man's switch firing ends the
+                //     branch the same way [round 4]: its own wallet-wide cancel
+                //     takes the book over.
+                //   * A re-check that shows the sweep still working through
+                //     the book (execution::recheck_shows_sweep_running)
+                //     cancels nothing: it pauses and re-checks again while the
+                //     deadline allows, then re-cancels only the ids still live.
+                // Offers the wallet reports resolved keep their Ordered intent:
+                // the heartbeat intent sweep, which runs once the flag clears,
+                // stamps a cancelled one and hands a filled one to the fill
+                // path, as for any recovered intent.
+                if (done.bulk_possibly_submitted) {
+                    const std::uint32_t wait_ms =
+                        execution::wait_after_possibly_submitted_ms(
+                            wallet_->request_timeout().count());
+                    const std::uint64_t deadline_ms =
+                        execution::possibly_submitted_deadline_ms(
+                            wait_ms, execution::CancelRetryConfig{});
+                    const auto branch_t0 = std::chrono::steady_clock::now();
+                    // [review 2026-09-13, round 4] For a shutdown that ends this
+                    // branch early: it sends no second wallet-wide sweep before
+                    // the rest of the wait, and it reads the same snapshot.
+                    unanswered_sweep_at_ = branch_t0;
+                    unanswered_sweep_pending_before_ = pending_before_sweep;
+                    // [review 2026-09-13, round 5] Only for THAT shutdown. When
+                    // the branch ends any other way -- done, stopped by the dead
+                    // man's switch, or by an exception -- the stamp and the
+                    // snapshot go with it, so a later, unrelated stop is not
+                    // seeded by them.
+                    struct UnansweredSweepStamp {
+                        std::optional<std::chrono::steady_clock::time_point>* at;
+                        std::unordered_set<std::string>* pending_before;
+                        const std::atomic<bool>* shutdown_claim;
+                        ~UnansweredSweepStamp() {
+                            if (!shutdown_claim->load(std::memory_order_acquire)) {
+                                at->reset();
+                                pending_before->clear();
+                            }
+                        }
+                    } unanswered_sweep_stamp{&unanswered_sweep_at_,
+                                             &unanswered_sweep_pending_before_,
+                                             &graceful_cancel_active_};
+                    const auto deadline =
+                        branch_t0 + std::chrono::milliseconds(
+                            static_cast<std::int64_t>(deadline_ms));
+                    const auto branch_elapsed_ms = [branch_t0]() -> std::uint64_t {
+                        const auto d =
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - branch_t0)
+                                .count();
+                        return d > 0 ? static_cast<std::uint64_t>(d)
+                                     : std::uint64_t{0};
+                    };
+                    const auto shutdown_requested = [this]() {
+                        return graceful_cancel_active_.load(
+                                   std::memory_order_acquire)
+                            || watchdog_fired_.load(std::memory_order_acquire);
+                    };
+                    // One request timeout of this client is kept back before
+                    // the deadline for the final re-cancel.
+                    const std::uint64_t recancel_reserve_ms =
+                        static_cast<std::uint64_t>(std::max<std::int64_t>(
+                            0, wallet_->request_timeout().count()));
+                    spdlog::warn(
+                        "[Engine] [CANCELALL] the wallet-wide sweep got NO "
+                        "USABLE ANSWER ({}) and may still be running -- sending "
+                        "nothing for {} ms, then re-checking {} tracked "
+                        "offer(s) before any is cancelled again (deadline {} "
+                        "ms)",
+                        done.last_error.empty() ? "no error text"
+                                                : done.last_error,
+                        wait_ms, done.failed.size(), deadline_ms);
+
+                    const BlockHeight recheck_block =
+                        last_block_.load(std::memory_order_relaxed);
+                    // live: the last re-check reported it live with no cancel
+                    // in flight. undecided: not re-checked yet, or no verdict.
+                    std::vector<std::string> live;
+                    std::vector<std::string> undecided = std::move(done.failed);
+                    done.failed.clear();
+                    bool seen_running = false;
+                    bool stopped_for_shutdown = false;
+                    std::size_t rechecks = 0;
+                    std::size_t n_dead = 0;
+                    std::size_t n_filled = 0;
+                    std::uint32_t pause_ms = wait_ms;
+                    asio::steady_timer pause_timer(ioc_);
+                    for (;;) {
+                        // Pause, looking for a shutdown request every 250 ms.
+                        const auto wake_at = std::chrono::steady_clock::now()
+                            + std::chrono::milliseconds(pause_ms);
+                        while (std::chrono::steady_clock::now() < wake_at) {
+                            if (shutdown_requested()) {
+                                stopped_for_shutdown = true;
+                                break;
+                            }
+                            pause_timer.expires_after(
+                                std::min<std::chrono::steady_clock::duration>(
+                                    std::chrono::milliseconds(250),
+                                    wake_at - std::chrono::steady_clock::now()));
+                            co_await pause_timer.async_wait(asio::use_awaitable);
+                        }
+                        if (stopped_for_shutdown) break;
+
+                        // Re-check every offer still live or undecided. No
+                        // probe starts past the deadline or after a shutdown
+                        // request: that offer is a NoVerdict, never cancelled
+                        // blind.
+                        std::vector<std::string> to_probe = std::move(live);
+                        for (auto& id : undecided) to_probe.push_back(std::move(id));
+                        live.clear();
+                        undecided.clear();
+                        execution::RecheckPartition part;
+                        ++rechecks;
+                        for (const auto& id : to_probe) {
+                            if (shutdown_requested()) stopped_for_shutdown = true;
+                            execution::TerminalRecheck verdict =
+                                execution::TerminalRecheck::NoVerdict;
+                            if (!stopped_for_shutdown
+                                && std::chrono::steady_clock::now() < deadline) {
+                                verdict = co_await offer_mgr_->recheck_terminal(
+                                    id, recheck_block);
+                            }
+                            execution::partition_rechecked_offer(
+                                part, id, verdict,
+                                state_->get_offer(id).cancel_pending,
+                                pending_before_sweep.count(id) != 0);
+                        }
+                        const bool sweep_running =
+                            execution::recheck_shows_sweep_running(part, seen_running);
+                        seen_running =
+                            seen_running || execution::recheck_saw_the_sweep(part);
+                        for (auto& id : part.already_pending) {
+                            done.already_pending.push_back(std::move(id));
+                        }
+                        n_dead += part.dead.size();
+                        n_filled += part.filled.size();
+                        live = std::move(part.recancel);
+                        undecided = std::move(part.unknown);
+                        if (stopped_for_shutdown) break;
+
+                        pause_ms = execution::possibly_submitted_rewait_ms(
+                            sweep_running, branch_elapsed_ms(), deadline_ms,
+                            recancel_reserve_ms);
+                        if (pause_ms == 0) break;
+                        spdlog::warn(
+                            "[Engine] [CANCELALL] re-check {} shows the sweep "
+                            "still working through the book: {} offer(s) still "
+                            "live are NOT cancelled yet -- re-checking in {} ms",
+                            rechecks, live.size(), pause_ms);
+                    }
+
+                    // Re-cancel the offers still live, one at a time, so a
+                    // shutdown request or the deadline is seen between them.
+                    std::size_t recancelled = 0;
+                    for (const auto& id : live) {
+                        if (stopped_for_shutdown || shutdown_requested()) {
+                            stopped_for_shutdown = true;
+                            done.failed.push_back(id);
+                            continue;
+                        }
+                        if (std::chrono::steady_clock::now() >= deadline) {
+                            done.failed.push_back(id);
+                            continue;
+                        }
+                        const std::vector<std::string> one_id{id};
+                        auto one = co_await offer_mgr_->cancel_ids(one_id, deadline);
+                        recancelled += one.cancelled.size();
+                        for (auto& c : one.cancelled) {
+                            done.cancelled.push_back(std::move(c));
+                        }
+                        for (auto& a : one.already_pending) {
+                            done.already_pending.push_back(std::move(a));
+                        }
+                        for (auto& f : one.failed) {
+                            done.failed.push_back(std::move(f));
+                        }
+                        if (!one.last_error.empty()) {
+                            done.last_error  = std::move(one.last_error);
+                            done.worst_class = one.worst_class;
+                        }
+                    }
+                    for (auto& id : undecided) done.failed.push_back(std::move(id));
+
+                    spdlog::critical(
+                        "[Engine] [CANCELALL] after the wallet-wide sweep that "
+                        "got no usable answer: {} re-check(s), {} re-cancelled, "
+                        "{} already cancelling, {} resolved by the wallet ({} "
+                        "cancelled or failed, {} FILLED; the intent sweep "
+                        "records them), {} still live or unanswered{}. The "
+                        "sweep itself is UNCONFIRMED: offers this process "
+                        "never tracked may still be RESTING",
+                        rechecks, recancelled, done.already_pending.size(),
+                        n_dead + n_filled, n_dead, n_filled,
+                        done.failed.size(),
+                        stopped_for_shutdown
+                            ? " -- a shutdown was requested or the dead man's "
+                              "switch fired, and that cancel takes them over"
+                            : "");
+                }
                 spdlog::warn("[Engine] [CANCELALL] {} offer(s) submitted "
                              "for cancel", done.cancelled.size());
                 // [S33 2026-09-12] The one outcome this path could not see.
@@ -19656,8 +22131,19 @@ void Engine::check_cancel_all_flag()
                 // but stay in the set: the heartbeat sweep owns them until
                 // the wallet says they are terminal. The refused ids keep
                 // their Ordered tag and the sweep re-issues their cancel.
+                const BlockHeight cancel_all_block =
+                    last_block_.load(std::memory_order_relaxed);
                 for (const auto& id : done.cancelled) {
                     cancel_intent_[id] = CancelIntentTag::Submitted;
+                    // [S14] Submitted, so offer_log says cancel_pending.
+                    try {
+                        db_->mark_offer_cancel_submitted(
+                            id, cancel_all_block, "operator_cancel_all");
+                    } catch (const std::exception& e) {
+                        spdlog::debug("[Engine] [CANCELALL] could not mark {} "
+                                      "cancel_pending: {}", id.substr(0, 12),
+                                      e.what());
+                    }
                 }
                 for (const auto& id : done.already_pending) {
                     cancel_intent_[id] = CancelIntentTag::Submitted;
@@ -19689,8 +22175,12 @@ void Engine::check_cancel_all_flag()
                 spdlog::critical("[Engine] [CANCELALL] FAILED: {} -- offers "
                                  "may still be resting; the TTL sweep keeps "
                                  "draining them", e.what());
+            } catch (...) {
+                spdlog::critical("[Engine] [CANCELALL] FAILED with a "
+                                 "non-standard exception -- offers may still "
+                                 "be resting; the TTL sweep keeps draining "
+                                 "them");
             }
-            cancel_all_inflight_ = false;
             co_return;
         },
         asio::detached);
@@ -19716,9 +22206,31 @@ asio::awaitable<bool> Engine::sweep_reload_disabled_offers()
 {
     if (reload_pending_cancel_.empty()) co_return true;
 
+    // [review 2026-09-13, round 3] Not while an operator Cancel All is
+    // walking the same book -- above all while it waits out a wallet-wide
+    // sweep that got no usable answer, when selective_cancel here would queue
+    // per-id cancels behind that sweep. Deferred like the intent sweep and the
+    // Step 8 drain: the set is kept and reported not clean, so
+    // check_config_reload_flag's retry leg runs this again next heartbeat,
+    // once the flag has cleared.
+    //
+    // [review 2026-09-13, round 4] Recorded for both reload alerts, so that a
+    // deferral is never reported as a failure.
+    reload_cancel_deferred_ = cancel_all_inflight_;
+    if (cancel_all_inflight_) {
+        spdlog::info("[Engine] [RELOAD] cancelling the live-disabled pairs' "
+                     "offers is deferred: an operator Cancel All is in flight "
+                     "over the same book -- retrying next heartbeat");
+        co_return false;
+    }
+
     std::vector<std::string> to_cancel;
     for (const auto& po : state_->get_all_offers()) {
-        if (reload_pending_cancel_.count(po.pair_name) > 0) {
+        // [S14] selective_cancel skips cancel_pending offers, so counting them
+        // made this sweep log CRITICAL every heartbeat. The escalation owns
+        // them.
+        if (reload_pending_cancel_.count(po.pair_name) > 0
+            && !po.cancel_pending) {
             to_cancel.push_back(po.offer_id);
         }
     }
@@ -19728,6 +22240,18 @@ asio::awaitable<bool> Engine::sweep_reload_disabled_offers()
     }
     try {
         auto done = co_await offer_mgr_->selective_cancel(to_cancel);
+        const BlockHeight reload_block = last_block_.load(std::memory_order_relaxed);
+        for (const auto& id : done) {
+            // [S14] Submitted, so offer_log says cancel_pending.
+            try {
+                db_->mark_offer_cancel_submitted(id, reload_block,
+                                                 "reload_disabled_pair");
+            } catch (const std::exception& mark_error) {
+                spdlog::debug("[Engine] [RELOAD] could not mark {} "
+                              "cancel_pending: {}", id.substr(0, 12),
+                              mark_error.what());
+            }
+        }
         if (done.size() >= to_cancel.size()) {
             spdlog::warn("[Engine] [RELOAD] cancelled {}/{} resting offers "
                          "on live-disabled pairs",
@@ -19761,16 +22285,36 @@ asio::awaitable<void> Engine::check_config_reload_flag()
     namespace fs = std::filesystem;
     if (config_reload_flag_path_.empty()) co_return;
 
-    // Retry leg: offers that survived a previous disable's failed cancel.
+    // Retry leg: offers that survived a previous disable's failed -- or
+    // deferred -- cancel.
     if (!reload_pending_cancel_.empty()) {
         const bool clean = co_await sweep_reload_disabled_offers();
         if (clean && reload_cancel_alert_pending_) {
             reload_cancel_alert_pending_ = false;
             if (alerts_) {
+                // [review 2026-09-13, round 4] After a deferral nothing failed.
                 alerts_->send_alert(
                     AlertRule::ConfigReload,
-                    "Retry succeeded: the resting offers on live-disabled "
-                    "pairs are now cancelled.");
+                    reload_cancel_alert_deferred_
+                        ? "The cancel deferred while operator Cancel All was in "
+                          "flight has now run: the resting offers on "
+                          "live-disabled pairs are cancelled."
+                        : "Retry succeeded: the resting offers on live-disabled "
+                          "pairs are now cancelled.");
+            }
+            reload_cancel_alert_deferred_ = false;
+        } else if (!clean && !reload_cancel_deferred_
+                   && reload_cancel_alert_deferred_) {
+            // [review 2026-09-13, round 4] The deferred cancel has now run and
+            // FAILED: say so once, as the save's own alert would have.
+            reload_cancel_alert_deferred_ = false;
+            if (alerts_) {
+                alerts_->send_alert(
+                    AlertRule::ConfigReload,
+                    "WARNING: the cancel deferred while operator Cancel All was "
+                    "in flight has now run, and some resting offers on "
+                    "live-disabled pairs could NOT be cancelled and are STILL "
+                    "LIVE; the engine retries each heartbeat.");
             }
         }
     }
@@ -19811,14 +22355,17 @@ asio::awaitable<void> Engine::check_config_reload_flag()
         fresh = load_config(config_file_path_, secrets_file_path_);
     } catch (const std::exception& e) {
         spdlog::error("[Engine] [RELOAD] saved config was rejected: {} -- "
-                      "the engine keeps running on its previous settings",
+                      "the engine keeps running on its previous settings; NOTHING in "
+                      "this save was applied, pair and pace disables included",
                       e.what());
         if (alerts_) {
             alerts_->send_alert(
                 AlertRule::ConfigReload,
                 "Re-read " + config_file_path_ + ": REJECTED ("
                 + std::string(e.what())
-                + "). The engine keeps running on its previous settings.");
+                + "). The engine keeps running on its previous settings. NOTHING in "
+                  "this save was applied -- a pair disable or pace_enabled: false in "
+                  "the same save included. Fix the key named above and save again.");
         }
         co_return;
     }
@@ -19850,9 +22397,28 @@ asio::awaitable<void> Engine::check_config_reload_flag()
     }
 
     bool cancel_clean = true;
+    // [review 2026-09-13, round 4] Deferred behind an operator Cancel All,
+    // not failed: the alert below says which.
+    bool cancel_deferred = false;
     if (!diff.to_disable.empty()) {
         cancel_clean = co_await sweep_reload_disabled_offers();
-        if (!cancel_clean) reload_cancel_alert_pending_ = true;
+        cancel_deferred = !cancel_clean && reload_cancel_deferred_;
+        if (!cancel_clean) {
+            reload_cancel_alert_pending_ = true;
+            reload_cancel_alert_deferred_ = cancel_deferred;
+        }
+    }
+
+    // [PACE 2026-09-13] The pace controller may be turned OFF live; any other
+    // pace edit waits for a restart.  Off means the pre-pace pipeline, not
+    // flat: resting pace offers are left to the canceller.  The next
+    // step_evaluate_pace clears every plan and map.
+    const bool pace_disabled_live =
+        pace_disables_live(config_.strategy.pace_enabled, fresh.strategy.pace_enabled);
+    if (pace_disabled_live) {
+        config_.strategy.pace_enabled = false;
+        spdlog::warn("[Engine] [RELOAD] pace controller DISABLED live -- the ladder reverts to the "
+                     "pre-pace pipeline; resting pace offers are left to the canceller");
     }
 
     // Honesty about everything the reload did NOT do.
@@ -19876,12 +22442,19 @@ asio::awaitable<void> Engine::check_config_reload_flag()
     // in a different file needs to hear to catch the mismatch.
     if (alerts_) {
         std::string msg = "Re-read " + config_file_path_ + ": ";
+        if (pace_disabled_live) {
+            msg += "pace controller disabled live. ";
+        }
         if (!disabled_list.empty()) {
             msg += "disabled live: " + disabled_list + " -- ";
             msg += cancel_clean
                 ? "resting offers cancelled. "
-                : "WARNING: some resting offers could NOT be cancelled and "
-                  "are STILL LIVE; the engine retries each heartbeat. ";
+                : cancel_deferred
+                    ? "resting offers NOT cancelled yet: the cancel is "
+                      "deferred while operator Cancel All is in flight, and "
+                      "runs on the first heartbeat after it. "
+                    : "WARNING: some resting offers could NOT be cancelled and "
+                      "are STILL LIVE; the engine retries each heartbeat. ";
         }
         auto join = [](const std::vector<std::string>& v) {
             std::string out;
@@ -20177,6 +22750,17 @@ asio::awaitable<void> Engine::step_observe_asset_pegs(BlockHeight block_height)
         if (!to_cancel.empty()) {
             try {
                 auto done = co_await offer_mgr_->selective_cancel(to_cancel);
+                for (const auto& id : done) {
+                    // [S14] Submitted, so offer_log says cancel_pending.
+                    try {
+                        db_->mark_offer_cancel_submitted(id, block_height,
+                                                         "peg_suspended");
+                    } catch (const std::exception& mark_error) {
+                        spdlog::debug("[Engine] [PEGSUSPEND] could not mark {} "
+                                      "cancel_pending: {}", id.substr(0, 12),
+                                      mark_error.what());
+                    }
+                }
                 if (done.size() < to_cancel.size()) {
                     spdlog::critical("[Engine] [PEGSUSPEND] only {}/{} "
                                      "offers cancelled on suspended pairs "

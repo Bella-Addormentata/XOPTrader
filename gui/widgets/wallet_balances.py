@@ -304,7 +304,7 @@ class WalletBalancesWidget(QWidget):
             "value; offers lock whole coins, so this can exceed offer "
             "sizes).\n"
             "Offered = sum of resting offer sizes from offer_log "
-            "(status='pending').\n"
+            "(status 'pending' or 'cancel_pending').\n"
             "Percentages are USD-weighted across priced assets."
         )
         root.addWidget(self._deployed_label)
@@ -688,7 +688,7 @@ class WalletBalancesWidget(QWidget):
           the real committed value: on-chain offers lock WHOLE coins, so a
           2.8-XCH coin backing a 1-XCH offer locks all 2.8 XCH.
         - **offered** = sum of resting offer sizes from ``offer_log``
-          (status='pending'), via DatabaseService.
+          (status 'pending' or 'cancel_pending'), via DatabaseService.
 
         The column shows the locked-based percentage (the honest number);
         cell tooltips carry both figures.  The summary line is USD-weighted

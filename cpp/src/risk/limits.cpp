@@ -16,11 +16,17 @@
 #include "xop/risk/limits.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <stdexcept>
 #include <cstddef>
+#include <iomanip>
 #include <limits>
+#include <locale>
 #include <numeric>
+#include <sstream>
+#include <string>
+#include <string_view>
 
 namespace xop {
 
@@ -42,6 +48,60 @@ Mojo scale_size_with_floor(Mojo size, double keep_fraction) noexcept
     return std::max<Mojo>(1, kept);
 }
 
+// [STEP6-CAUSE 2026-09-13] The one place a limit changes a size.  It scales
+// exactly as the bare scale_size_with_floor() call it replaced, and records
+// the rule only when the size actually went DOWN, so a side that is already
+// 0 is never attributed to a rule that fires later.
+void apply_rule(SideLimitTrace& side, Mojo& size, double keep_fraction,
+                LimitRule rule) noexcept
+{
+    const Mojo before = size;
+    size = scale_size_with_floor(size, keep_fraction);
+    if (size < before) {
+        side.reduced_by = static_cast<std::uint8_t>(side.reduced_by | limit_rule_bit(rule));
+        if (size == 0) {
+            side.zeroed_by = rule;
+        }
+    }
+}
+
+// The order rule names print in: the order the rules run on one side.
+constexpr std::array<LimitRule, 4> kRuleOrder{{
+    LimitRule::SoftConcentration, LimitRule::HardConcentration,
+    LimitRule::SingleCatCap, LimitRule::PairCapitalCap}};
+
+// Base units to 6 dp, or raw mojos when there is no unit size.  The classic
+// locale keeps any process locale's digit grouping out of logs and tests.
+std::string format_units(Mojo size, std::int64_t mojos_per_unit)
+{
+    std::ostringstream out;
+    out.imbue(std::locale::classic());
+    if (mojos_per_unit > 0) {
+        out << std::fixed << std::setprecision(6)
+            << static_cast<double>(size) / static_cast<double>(mojos_per_unit);
+    } else {
+        out << size << " mojos";
+    }
+    return out.str();
+}
+
+// Names of the rules set in `mask`, in kRuleOrder, skipping `exclude`,
+// joined with '+'.
+std::string format_rules(std::uint8_t mask, LimitRule exclude)
+{
+    std::string joined;
+    for (const LimitRule rule : kRuleOrder) {
+        if (rule == exclude || !has_limit_rule(mask, rule)) {
+            continue;
+        }
+        if (!joined.empty()) {
+            joined += '+';
+        }
+        joined += to_string(rule);
+    }
+    return joined;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -57,6 +117,183 @@ const char* to_string(EmergencyRule r) noexcept {
         case EmergencyRule::ExploitDetected: return "ExploitDetected";
     }
     return "Unknown";
+}
+
+// ---------------------------------------------------------------------------
+// [STEP6-CAUSE 2026-09-13] Limit attribution: rule labels, per-side causes,
+// the operator-facing Step 6 text, and the no-quote warn gate.  See
+// limits.hpp for the contract of each.
+// ---------------------------------------------------------------------------
+
+const char* to_string(LimitRule r) noexcept {
+    switch (r) {
+        case LimitRule::None:              return "none";
+        case LimitRule::SoftConcentration: return "soft_concentration";
+        case LimitRule::HardConcentration: return "hard_concentration";
+        case LimitRule::SingleCatCap:      return "single_cat_cap";
+        case LimitRule::PairCapitalCap:    return "pair_capital_cap";
+    }
+    return "unknown";
+}
+
+SideZeroCause side_zero_cause(const SideLimitTrace& side) noexcept
+{
+    if (side.post_size > 0) {
+        return SideZeroCause::NotZero;
+    }
+    if (side.pre_size <= 0) {
+        return SideZeroCause::ZeroBeforeLimits;
+    }
+    return SideZeroCause::LimitZeroed;
+}
+
+std::string describe_side_limits(const SideLimitTrace& side,
+                                 std::int64_t base_mojos_per_unit)
+{
+    std::string reason;
+    switch (side_zero_cause(side)) {
+        case SideZeroCause::ZeroBeforeLimits:
+            // Sizes are converted to mojos before the limits run, so a tiny
+            // positive strategy size that rounds to 0 mojos also lands here;
+            // the wording says exactly that much and no more.
+            reason = "zero before limits: the strategy's size converted to 0 mojos; "
+                     "no risk limit acted on it";
+            break;
+        case SideZeroCause::LimitZeroed: {
+            reason = "zeroed by ";
+            reason += (side.zeroed_by == LimitRule::None) ? "an unrecorded rule"
+                                                          : to_string(side.zeroed_by);
+            const std::string others = format_rules(side.reduced_by, side.zeroed_by);
+            if (!others.empty()) {
+                reason += "; also reduced by ";
+                reason += others;
+            }
+            break;
+        }
+        case SideZeroCause::NotZero: {
+            const std::string all_rules = format_rules(side.reduced_by, LimitRule::None);
+            if (all_rules.empty()) {
+                reason = "no limit applied";
+            } else {
+                reason = "reduced by " + all_rules;
+            }
+            break;
+        }
+    }
+    return format_units(side.pre_size, base_mojos_per_unit) + " -> "
+         + format_units(side.post_size, base_mojos_per_unit) + " (" + reason + ")";
+}
+
+std::string describe_limits_block(const LimitsTrace& limits_trace,
+                                  std::int64_t base_mojos_per_unit,
+                                  double strategy_q,
+                                  double strategy_q_max)
+{
+    std::ostringstream out;
+    out.imbue(std::locale::classic());
+    out << "bid " << describe_side_limits(limits_trace.bid, base_mojos_per_unit)
+        << " | ask " << describe_side_limits(limits_trace.ask, base_mojos_per_unit)
+        << " | " << std::fixed << std::setprecision(3)
+        << "base_conc=" << limits_trace.base_concentration
+        << " quote_conc=" << limits_trace.quote_concentration;
+    if (limits_trace.base_is_cat) {
+        out << " base_cat_pct=" << limits_trace.base_cat_fraction
+            << " (full block at " << limits_trace.cat_full_block_pct << ")";
+    }
+    if (limits_trace.quote_is_cat) {
+        out << " quote_cat_pct=" << limits_trace.quote_cat_fraction
+            << " (full block at " << limits_trace.cat_full_block_pct << ")";
+    }
+    out << " pair_pct=" << limits_trace.pair_capital_fraction
+        << " | strategy " << std::setprecision(6)
+        << "q=" << strategy_q << " q_max=" << strategy_q_max;
+    return out.str();
+}
+
+std::string format_step6_no_quote(std::string_view pair_name,
+                                  const LimitsTrace& limits_trace,
+                                  std::int64_t base_mojos_per_unit,
+                                  double strategy_q,
+                                  double strategy_q_max,
+                                  const RiskConfig& risk_cfg,
+                                  BlockHeight reminder_blocks)
+{
+    // [PACE D1 2026-09-13] The global soft/hard pair, forwarded.
+    return format_step6_no_quote(pair_name, limits_trace, base_mojos_per_unit,
+                                 strategy_q, strategy_q_max, risk_cfg,
+                                 ConcentrationLimits{risk_cfg.soft_limit_pct,
+                                                     risk_cfg.hard_limit_pct},
+                                 reminder_blocks);
+}
+
+std::string format_step6_no_quote(std::string_view pair_name,
+                                  const LimitsTrace& limits_trace,
+                                  std::int64_t base_mojos_per_unit,
+                                  double strategy_q,
+                                  double strategy_q_max,
+                                  const RiskConfig& risk_cfg,
+                                  const ConcentrationLimits& conc_limits,
+                                  BlockHeight reminder_blocks)
+{
+    std::ostringstream out;
+    out.imbue(std::locale::classic());
+    out << "Step 6: " << pair_name << " -- no quote this block: "
+        << describe_limits_block(limits_trace, base_mojos_per_unit,
+                                 strategy_q, strategy_q_max)
+        << " | " << std::fixed << std::setprecision(3)
+        << "cfg_soft=" << conc_limits.soft_limit_pct
+        << " cfg_hard=" << conc_limits.hard_limit_pct
+        << " cfg_cat=" << risk_cfg.single_cat_cap_pct
+        << " cfg_pair=" << risk_cfg.max_capital_per_pair_pct
+        << " (same-cause repeats log at debug for " << reminder_blocks
+        << " blocks)";
+    return out.str();
+}
+
+std::string format_step6_quote_resumed(std::string_view pair_name,
+                                       BlockHeight last_warn_height,
+                                       BlockHeight reminder_blocks)
+{
+    std::ostringstream out;
+    out.imbue(std::locale::classic());
+    out << "Step 6: " << pair_name
+        << " -- limits let a quote through again after the no-quote warn at height "
+        << last_warn_height << "; a same-cause block before height "
+        << (last_warn_height + reminder_blocks) << " logs at debug only";
+    return out.str();
+}
+
+LimitBlockSignature limit_block_signature(const LimitsTrace& limits_trace) noexcept
+{
+    LimitBlockSignature sig{};
+    sig.bid_cause     = side_zero_cause(limits_trace.bid);
+    sig.bid_zeroed_by = limits_trace.bid.zeroed_by;
+    sig.ask_cause     = side_zero_cause(limits_trace.ask);
+    sig.ask_zeroed_by = limits_trace.ask.zeroed_by;
+    return sig;
+}
+
+bool LimitBlockWarnGate::should_warn(const LimitBlockSignature& sig,
+                                     BlockHeight height,
+                                     BlockHeight reminder_blocks) noexcept
+{
+    if (!fired_ || sig != last_sig_ || height - last_warn_height_ >= reminder_blocks) {
+        fired_            = true;
+        recovery_pending_ = true;
+        last_sig_         = sig;
+        last_warn_height_ = height;
+        return true;
+    }
+    return false;
+}
+
+bool LimitBlockWarnGate::should_log_recovery() noexcept
+{
+    if (!recovery_pending_) {
+        return false;
+    }
+    recovery_pending_ = false;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -151,23 +388,47 @@ Quote PreTradeCheck::enforce_no_loss(Quote quote,
 }
 
 // ---------------------------------------------------------------------------
-// apply_limits -- inventory, CAT cap, and capital-per-pair checks.
+// evaluate_limits -- inventory, CAT cap, and capital-per-pair checks, with a
+// per-side record of what each rule did.
 //
-// Design:  Each check can independently zero out a side of the quote.
-//          If both sides end up zeroed, the caller receives nullopt,
-//          signalling that no quote should be posted this cycle.
+// Design:  Each check can independently reduce or zero out a side of the
+//          quote.  If both sides end up zeroed, decision.has_quote is false
+//          (apply_limits() returns nullopt), signalling that no quote should
+//          be posted this cycle.
 //
-// Ordering of checks matters only for diagnostics (we always run all of
-// them so that get_limit_status can report every breach, not just the first).
+// [STEP6-CAUSE 2026-09-13] Every size cut goes through apply_rule(), which
+// scales exactly as the bare scale_size_with_floor() call it replaced and
+// records the rule on that side, so the trace cannot disagree with the
+// quote.  The order of the checks, every formula and constant, and the
+// no-quote condition are unchanged.
 // ---------------------------------------------------------------------------
 
-std::optional<Quote> PreTradeCheck::apply_limits(
-    Quote              quote,
-    const std::string& /*pair_name*/,
-    const AssetId&     base_id,
-    const AssetId&     quote_id,
-    const State&       state) const
+LimitsDecision PreTradeCheck::evaluate_limits(
+    Quote          quote,
+    const AssetId& base_id,
+    const AssetId& quote_id,
+    const State&   state) const
 {
+    // [PACE D1 2026-09-13] The global soft/hard pair, forwarded: the same two
+    // doubles the concentration rule read from risk_cfg_ before per-pair
+    // limits existed.
+    return evaluate_limits(quote, base_id, quote_id, state,
+                           ConcentrationLimits{risk_cfg_.soft_limit_pct,
+                                               risk_cfg_.hard_limit_pct});
+}
+
+LimitsDecision PreTradeCheck::evaluate_limits(
+    Quote                      quote,
+    const AssetId&             base_id,
+    const AssetId&             quote_id,
+    const State&               state,
+    const ConcentrationLimits& limits) const
+{
+    LimitsDecision decision{};
+    LimitsTrace& limits_trace = decision.trace;
+    limits_trace.bid.pre_size = quote.bid_size;
+    limits_trace.ask.pre_size = quote.ask_size;
+
     const Position base_pos  = state.get_position(base_id);
     const Position quote_pos = state.get_position(quote_id);
     const auto all_positions = state.get_all_positions();
@@ -189,53 +450,33 @@ std::optional<Quote> PreTradeCheck::apply_limits(
     // so that concentration reflects economic value, not raw token counts.
     const double base_conc = compute_concentration(base_pos, quote_pos, state);
     const double quote_conc = 1.0 - base_conc;
+    limits_trace.base_concentration  = base_conc;
+    limits_trace.quote_concentration = quote_conc;
 
-    // Base overweight?
-    if (base_conc >= risk_cfg_.hard_limit_pct) {
-        // Hard limit breach: leave only a tiny continuity quote so the bot
-        // does not collapse into a permanently one-sided book.  The size
-        // tapers to zero only as concentration approaches 100%.
-        const double taper = std::clamp(
-            1.0 - (base_conc - risk_cfg_.hard_limit_pct)
-                / std::max(1.0 - risk_cfg_.hard_limit_pct, 1e-9),
-            0.0, 1.0);
-        quote.bid_size = scale_size_with_floor(
-            quote.bid_size,
-            kHardLimitContinuityFloorPct * taper);
-    } else if (base_conc >= risk_cfg_.soft_limit_pct) {
-        // Soft limit: apply graduated proportional reduction instead of
-        // zeroing.  Linearly interpolate from full size at soft_limit to a
-        // tiny continuity quote at the hard limit, so the transition remains
-        // smooth without eliminating the side entirely.
-        // ISO/IEC 5055: clamped to [0.0, 1.0] to guard against config
-        // where soft_pct == hard_pct (division by zero yields 0.0 via clamp).
-        const double reduction = std::clamp(
-            (base_conc - risk_cfg_.soft_limit_pct)
-                / (risk_cfg_.hard_limit_pct - risk_cfg_.soft_limit_pct),
-            0.0, 1.0);
-        const double keep_fraction =
-            1.0 - reduction * (1.0 - kHardLimitContinuityFloorPct);
-        quote.bid_size = scale_size_with_floor(quote.bid_size, keep_fraction);
+    // [PACE D1 2026-09-13] Both sides go through concentration_keep_fraction()
+    // with THIS pair's limits.  The helper holds the two expressions this
+    // block used to spell out inline, in the same order and with the same
+    // constant, so the keep fractions are bit-identical when `limits` is the
+    // global pair, and the rule label is chosen by the same `>= hard`
+    // comparison the old if/else-if made:
+    //   - hard band (conc >= hard): a tiny continuity quote, so the bot does
+    //     not collapse into a permanently one-sided book; it tapers to zero
+    //     only as concentration approaches 100%;
+    //   - soft band (soft <= conc < hard): a linear reduction from full size
+    //     at soft to that continuity quote at hard;
+    //   - below soft, or NaN: no call at all, exactly as before.
+    // Base overweight: stop BUYING base, so the bid tapers.
+    if (const auto keep = concentration_keep_fraction(base_conc, limits)) {
+        apply_rule(limits_trace.bid, quote.bid_size, *keep,
+                   base_conc >= limits.hard_limit_pct ? LimitRule::HardConcentration
+                                                      : LimitRule::SoftConcentration);
     }
 
-    // Quote overweight?
-    if (quote_conc >= risk_cfg_.hard_limit_pct) {
-        const double taper = std::clamp(
-            1.0 - (quote_conc - risk_cfg_.hard_limit_pct)
-                / std::max(1.0 - risk_cfg_.hard_limit_pct, 1e-9),
-            0.0, 1.0);
-        quote.ask_size = scale_size_with_floor(
-            quote.ask_size,
-            kHardLimitContinuityFloorPct * taper);
-    } else if (quote_conc >= risk_cfg_.soft_limit_pct) {
-        // Soft limit: graduated proportional reduction (mirror of bid logic).
-        const double reduction = std::clamp(
-            (quote_conc - risk_cfg_.soft_limit_pct)
-                / (risk_cfg_.hard_limit_pct - risk_cfg_.soft_limit_pct),
-            0.0, 1.0);
-        const double keep_fraction =
-            1.0 - reduction * (1.0 - kHardLimitContinuityFloorPct);
-        quote.ask_size = scale_size_with_floor(quote.ask_size, keep_fraction);
+    // Quote overweight: stop SELLING base, so the ask tapers.
+    if (const auto keep = concentration_keep_fraction(quote_conc, limits)) {
+        apply_rule(limits_trace.ask, quote.ask_size, *keep,
+                   quote_conc >= limits.hard_limit_pct ? LimitRule::HardConcentration
+                                                       : LimitRule::SoftConcentration);
     }
 
     // ---- 2. Single-CAT cap (12% of total portfolio) ----------------------
@@ -249,6 +490,8 @@ std::optional<Quote> PreTradeCheck::apply_limits(
 
     if (base_id != "xch") {
         const double cat_frac = compute_portfolio_fraction(base_pos, all_positions, state);
+        limits_trace.base_is_cat       = true;
+        limits_trace.base_cat_fraction = cat_frac;
         if (cat_frac >= risk_cfg_.single_cat_cap_pct) {
             const double taper = std::clamp(
                 1.0 - (cat_frac - risk_cfg_.single_cat_cap_pct)
@@ -257,15 +500,17 @@ std::optional<Quote> PreTradeCheck::apply_limits(
                             * (kCatCapFullBlockMultiple - 1.0),
                         1e-9),
                 0.0, 1.0);
-            quote.bid_size = scale_size_with_floor(
-                quote.bid_size,
-                kCatCapContinuityFloorPct * taper);
+            apply_rule(limits_trace.bid, quote.bid_size,
+                       kCatCapContinuityFloorPct * taper,
+                       LimitRule::SingleCatCap);
         }
     }
 
     // Same check for quote side if the quote asset is a CAT.
     if (quote_id != "xch") {
         const double cat_frac = compute_portfolio_fraction(quote_pos, all_positions, state);
+        limits_trace.quote_is_cat       = true;
+        limits_trace.quote_cat_fraction = cat_frac;
         if (cat_frac >= risk_cfg_.single_cat_cap_pct) {
             const double taper = std::clamp(
                 1.0 - (cat_frac - risk_cfg_.single_cat_cap_pct)
@@ -274,11 +519,14 @@ std::optional<Quote> PreTradeCheck::apply_limits(
                             * (kCatCapFullBlockMultiple - 1.0),
                         1e-9),
                 0.0, 1.0);
-            quote.ask_size = scale_size_with_floor(
-                quote.ask_size,
-                kCatCapContinuityFloorPct * taper);
+            apply_rule(limits_trace.ask, quote.ask_size,
+                       kCatCapContinuityFloorPct * taper,
+                       LimitRule::SingleCatCap);
         }
     }
+
+    limits_trace.cat_full_block_pct =
+        risk_cfg_.single_cat_cap_pct * kCatCapFullBlockMultiple;
 
     // ---- 3. Max capital per pair ------------------------------------------
     //
@@ -289,6 +537,7 @@ std::optional<Quote> PreTradeCheck::apply_limits(
 
     const double pair_frac = compute_pair_capital_fraction(base_pos, quote_pos,
                                                            all_positions, state);
+    limits_trace.pair_capital_fraction = pair_frac;
     if (pair_frac >= risk_cfg_.max_capital_per_pair_pct) {
         const double reduction = std::clamp(
             (pair_frac - risk_cfg_.max_capital_per_pair_pct)
@@ -296,21 +545,112 @@ std::optional<Quote> PreTradeCheck::apply_limits(
             0.0, 1.0);
         const double keep_fraction =
             1.0 - reduction * (1.0 - kPairCapContinuityFloorPct);
-        quote.bid_size = scale_size_with_floor(
-            quote.bid_size,
-            keep_fraction);
-        quote.ask_size = scale_size_with_floor(
-            quote.ask_size,
-            keep_fraction);
+        apply_rule(limits_trace.bid, quote.bid_size, keep_fraction,
+                   LimitRule::PairCapitalCap);
+        apply_rule(limits_trace.ask, quote.ask_size, keep_fraction,
+                   LimitRule::PairCapitalCap);
     }
 
     // ---- Result -----------------------------------------------------------
 
+    limits_trace.bid.post_size = quote.bid_size;
+    limits_trace.ask.post_size = quote.ask_size;
     if (quote.bid_size == 0 && quote.ask_size == 0) {
-        return std::nullopt;  // both sides blocked -- skip this cycle
+        return decision;  // both sizes zero: no quote this cycle; the trace says why
     }
 
-    return quote;
+    decision.has_quote = true;
+    decision.quote     = quote;
+    return decision;
+}
+
+// ---------------------------------------------------------------------------
+// apply_limits -- the original interface.  It delegates, so the engine's
+// evaluate_limits() call and every apply_limits() caller run one copy of the
+// arithmetic.
+// ---------------------------------------------------------------------------
+
+std::optional<Quote> PreTradeCheck::apply_limits(
+    Quote              quote,
+    const std::string& pair_name,
+    const AssetId&     base_id,
+    const AssetId&     quote_id,
+    const State&       state) const
+{
+    // [PACE D1 2026-09-13] The global soft/hard pair, forwarded.
+    return apply_limits(quote, pair_name, base_id, quote_id, state,
+                        ConcentrationLimits{risk_cfg_.soft_limit_pct,
+                                            risk_cfg_.hard_limit_pct});
+}
+
+std::optional<Quote> PreTradeCheck::apply_limits(
+    Quote                      quote,
+    const std::string&         /*pair_name*/,
+    const AssetId&             base_id,
+    const AssetId&             quote_id,
+    const State&               state,
+    const ConcentrationLimits& limits) const
+{
+    const LimitsDecision decision = evaluate_limits(quote, base_id, quote_id, state, limits);
+    if (!decision.has_quote) {
+        return std::nullopt;
+    }
+    return decision.quote;
+}
+
+// ---------------------------------------------------------------------------
+// [PACE D1 2026-09-13] concentration_keep_fraction -- the concentration
+// rule's keep fraction for one side, with one pair's limits.  These are the
+// two expressions evaluate_limits() spelled out inline before per-pair limits
+// existed, in the same order and with the same constant.  At conc == soft the
+// soft branch returns exactly 1.0 (not nullopt), so the scale_size_with_floor
+// call -- and its size <= 0 -> 0 mapping -- still happens; a NaN fails both
+// comparisons and returns nullopt, which is the old "no call".
+// ---------------------------------------------------------------------------
+
+std::optional<double> PreTradeCheck::concentration_keep_fraction(
+    double concentration, const ConcentrationLimits& limits) noexcept
+{
+    if (concentration >= limits.hard_limit_pct) {
+        // Hard limit breach: leave only a tiny continuity quote so the bot
+        // does not collapse into a permanently one-sided book.  The size
+        // tapers to zero only as concentration approaches 100%.
+        const double taper = std::clamp(
+            1.0 - (concentration - limits.hard_limit_pct)
+                / std::max(1.0 - limits.hard_limit_pct, 1e-9),
+            0.0, 1.0);
+        return kHardLimitContinuityFloorPct * taper;
+    }
+    if (concentration >= limits.soft_limit_pct) {
+        // Soft limit: graduated proportional reduction instead of zeroing.
+        // ISO/IEC 5055: clamped to [0.0, 1.0] to guard against config
+        // where soft_pct == hard_pct (division by zero yields 0.0 via clamp).
+        const double reduction = std::clamp(
+            (concentration - limits.soft_limit_pct)
+                / (limits.hard_limit_pct - limits.soft_limit_pct),
+            0.0, 1.0);
+        return 1.0 - reduction * (1.0 - kHardLimitContinuityFloorPct);
+    }
+    return std::nullopt;
+}
+
+// ---------------------------------------------------------------------------
+// [PACE D1 2026-09-13] effective_concentration_limits -- see limits.hpp.
+// ---------------------------------------------------------------------------
+
+ConcentrationLimits effective_concentration_limits(const RiskConfig& risk,
+                                                   const PairConfig* pair) noexcept
+{
+    const ConcentrationLimits global{risk.soft_limit_pct, risk.hard_limit_pct};
+    if (pair == nullptr) {
+        return global;
+    }
+    const ConcentrationLimits eff{pair->soft_limit_pct_override.value_or(risk.soft_limit_pct),
+                                  pair->hard_limit_pct_override.value_or(risk.hard_limit_pct)};
+    const bool valid = std::isfinite(eff.soft_limit_pct) && std::isfinite(eff.hard_limit_pct)
+                    && eff.soft_limit_pct > 0.0 && eff.soft_limit_pct < eff.hard_limit_pct
+                    && eff.hard_limit_pct <= 1.0;
+    return valid ? eff : global;
 }
 
 // ---------------------------------------------------------------------------
@@ -450,6 +790,18 @@ LimitStatus PreTradeCheck::get_limit_status(
     const AssetId& quote_id,
     const State&   state) const
 {
+    // [PACE D1 2026-09-13] The global soft/hard pair, forwarded.
+    return get_limit_status(base_id, quote_id, state,
+                            ConcentrationLimits{risk_cfg_.soft_limit_pct,
+                                                risk_cfg_.hard_limit_pct});
+}
+
+LimitStatus PreTradeCheck::get_limit_status(
+    const AssetId&             base_id,
+    const AssetId&             quote_id,
+    const State&               state,
+    const ConcentrationLimits& limits) const
+{
     const Position base_pos  = state.get_position(base_id);
     const Position quote_pos = state.get_position(quote_id);
     const auto all_positions = state.get_all_positions();
@@ -458,12 +810,13 @@ LimitStatus PreTradeCheck::get_limit_status(
     ls.base_id  = base_id;
     ls.quote_id = quote_id;
 
-    // Inventory concentration (mark-to-market in XCH numeraire).
+    // Inventory concentration (mark-to-market in XCH numeraire), against this
+    // pair's effective limits.
     ls.base_concentration  = compute_concentration(base_pos, quote_pos, state);
-    ls.soft_limit_breached = (ls.base_concentration >= risk_cfg_.soft_limit_pct)
-                          || ((1.0 - ls.base_concentration) >= risk_cfg_.soft_limit_pct);
-    ls.hard_limit_breached = (ls.base_concentration >= risk_cfg_.hard_limit_pct)
-                          || ((1.0 - ls.base_concentration) >= risk_cfg_.hard_limit_pct);
+    ls.soft_limit_breached = (ls.base_concentration >= limits.soft_limit_pct)
+                          || ((1.0 - ls.base_concentration) >= limits.soft_limit_pct);
+    ls.hard_limit_breached = (ls.base_concentration >= limits.hard_limit_pct)
+                          || ((1.0 - ls.base_concentration) >= limits.hard_limit_pct);
 
     // Single-CAT cap (only relevant for CAT assets, mark-to-market).
     if (base_id != "xch") {

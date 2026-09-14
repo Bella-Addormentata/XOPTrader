@@ -48,6 +48,8 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include "xop/rpc/transport_evidence.hpp"
+
 namespace xop::rpc {
 
 // ---------------------------------------------------------------------------
@@ -147,6 +149,11 @@ private:
 
 /**
  * @brief Transport-level failure (DNS, TLS handshake, timeout, HTTP 5xx).
+ *
+ * [review 2026-09-13, round 3] Also a 2xx reply whose body is not valid JSON:
+ * curl_code() is then CURLE_OK and http_code() the 2xx status.  That request
+ * reached the handler and its answer was lost, which a caller deciding whether
+ * a cancel may have run needs to see (rpc::cancel_possibly_submitted).
  */
 class ChiaRPCTransportError : public ChiaRPCError {
 public:
@@ -218,6 +225,37 @@ public:
      */
     [[nodiscard]] bool is_open() const noexcept;
 
+    /**
+     * @brief How this client's calls have ended so far
+     *        (rpc/transport_evidence.hpp).
+     *
+     * [WALLET-CIRCUIT 2026-09-13] Read by the engine's wallet gate and by
+     * OfferManager::detect_fills.  rpc_post updates it once per call, after
+     * its co_await on the CURL pool has resumed on the CALLING coroutine's
+     * executor -- for the engine that is its io_context, run on one thread (a
+     * single ioc_.run() in Engine::run()), so the reads and writes never race.
+     * The dead man's switch polls from its own thread through its OWN client
+     * and io_context, and never touches these counters.  A client driven
+     * from several threads at once would need this synchronised.
+     */
+    [[nodiscard]] TransportCounters transport_counters() const noexcept
+    {
+        return transport_;
+    }
+
+    /**
+     * @brief The per-request timeout this client enforces.
+     *
+     * [review 2026-09-13, round 2] A caller that must wait out a request
+     * which may still be running inside the wallet sizes that wait from the
+     * client it sent the request through
+     * (execution::wait_after_possibly_submitted_ms), not from a default.
+     */
+    [[nodiscard]] std::chrono::milliseconds request_timeout() const noexcept
+    {
+        return config_.request_timeout;
+    }
+
 protected:
     /**
      * @brief Construct with an io_context reference and endpoint config.
@@ -244,6 +282,12 @@ protected:
      *   - Network errors (CURL codes indicating connection / timeout)
      *   - HTTP 429, 500, 502, 503, 504
      *   - Up to max_retries attempts with exponential backoff.
+     *
+     * [BULKCANCEL-B 2026-09-13] rpc/rpc_retry_policy.hpp narrows that per
+     * endpoint: cancel_offers and cancel_offer are re-sent only after
+     * CURLE_COULDNT_CONNECT or CURLE_SSL_CONNECT_ERROR, where the request
+     * cannot have reached the handler.  A timeout or a 5xx on either one
+     * throws ChiaRPCTransportError from the FIRST attempt.
      *
      * On a non-retryable error, or when retries are exhausted, the
      * appropriate ChiaRPC*Error exception is thrown.
@@ -334,6 +378,19 @@ private:
 
     /// True after successful open(), false after close().
     bool open_{false};
+
+    /// [WALLET-CIRCUIT 2026-09-13] How this client's calls ended; see
+    /// transport_counters().  Declared after open_ so the move constructor
+    /// initialises it last, in declaration order (-Wreorder).
+    TransportCounters transport_{};
+
+    /// Fold one call ending into transport_.  rpc_post calls this exactly
+    /// once per call that got past its is_open() check, immediately before
+    /// it throws or returns.
+    void note_call_end(RpcCallEnd end) noexcept
+    {
+        transport_ = observe_call_end(transport_, end);
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -592,24 +649,28 @@ public:
      * rpc/wallet_requests.hpp for the defect this replaced.
      *
      * @param batch_fee  Fee in mojos charged ONCE PER BATCH of
-     *                   kCancelOffersBatchSize offers -- NOT once per call.
+     *                   kCancelOffersSingleBatchSize offers -- NOT once per
+     *                   call.  [BULKCANCEL-B 2026-09-13] Any book up to that
+     *                   size is ONE batch, and so one fee.
      *
      *                   [review 2026-09-12] A caller that reserves XCH for
      *                   this must reserve ONE WHOLE FEE-BEARING COIN PER
      *                   BATCH -- not batch_fee * batches, which an earlier
-     *                   revision of this line recommended.  Each batch is a
-     *                   separate transaction submitted inside the same
-     *                   cycle, so the change from one cannot fund the next
-     *                   and each locks a different whole coin.  Reserving
-     *                   the combined AMOUNT models one coin for the lot and
-     *                   undercounts the locks -- the 2026-08-23
-     *                   zero-spendable shape.
+     *                   revision of this line recommended.  Each batch is its
+     *                   own spend bundle (chia 2.7.4 registers cancel_offers
+     *                   with auto_merge_spends=False), so the change from one
+     *                   cannot fund the next.  Reserving the combined AMOUNT
+     *                   models one coin for the lot and undercounts the locks
+     *                   -- the 2026-08-23 zero-spendable shape.  A batch that
+     *                   funds its fee from the free pool picks that coin
+     *                   blind to the other batches, which is why a sweep goes
+     *                   out as one batch (rpc/wallet_requests.hpp).
      *
      *                   Use execution::reserve_bulk_cancel (a loop of
      *                   single-fee note_lock()s, with a >= 1 batch clamp);
      *                   see OfferManager::cancel_offers_charged, and
-     *                   CoinLockLedgerTest.BulkCancelReservesOneWholeFeeCoin
-     *                   PerBatch, which pins the distinction explicitly.
+     *                   CoinLockLedgerTest.BulkCancelReservesOneFeeCoinFor
+     *                   TheSingleBatch, which pins it explicitly.
      * @param secure     On-chain vs local-only cancellation.
      * @return JSON confirmation.
      */

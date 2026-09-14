@@ -613,7 +613,7 @@ Shows which strategy modules execute at each step of the per-block heartbeat.
 | | | Asymmetric multipliers | **NOT WIRED** |
 | | | Thompson Sampling | Active (optional, config toggle) |
 | 6 | Apply risk limits | enforce_no_loss (loss_manager) | Active |
-| | | apply_limits (inventory, Kelly, CAT cap) | Active |
+| | | PreTradeCheck::evaluate_limits (inventory concentration, CAT cap, pair cap, per-side cause; no Kelly sizing; apply_limits delegates to it) | Active |
 | 7 | Generate ladder | LiquidityEngine (compute_ladder) | Active |
 | | | apply_inventory_skew | Active |
 | 8 | Manage offers | OfferManager (cancel_stale, post_quotes) | Active |

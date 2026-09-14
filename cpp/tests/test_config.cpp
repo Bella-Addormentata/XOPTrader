@@ -15,6 +15,7 @@
 
 #include <xop/config.hpp>
 #include <xop/execution/book_side_quality.hpp>
+#include <xop/execution/cancel_escalation_config.hpp>
 
 #include <spdlog/sinks/ringbuffer_sink.h>
 #include <spdlog/spdlog.h>
@@ -1156,6 +1157,19 @@ TEST(ApplyDeployIdleFloor, RespectsArmingWalletAndExistingPool) {
 
     // Degenerate min_pool: no-op.
     EXPECT_EQ(xop::apply_deploy_idle_floor(0, 0, true, 1.0, true), 0);
+}
+
+TEST(EffectiveQMax, PairOverrideWinsElseStrategyDefault) {
+    // [STEP6-CAUSE 2026-09-13] The one copy of the q_max resolution: the
+    // Engine constructor builds each AvellanedaStoikov with it, and Step 4
+    // stores it for Step 6's no-quote line.
+    xop::PairConfig pair_cfg{};
+    xop::StrategyConfig strategy_cfg{};
+    strategy_cfg.q_max = 20.0;
+    EXPECT_DOUBLE_EQ(xop::effective_q_max(pair_cfg, strategy_cfg), 20.0);
+
+    pair_cfg.q_max_override = 6.0;
+    EXPECT_DOUBLE_EQ(xop::effective_q_max(pair_cfg, strategy_cfg), 6.0);
 }
 
 
@@ -2844,4 +2858,458 @@ TEST(ConfigParserTest, DuplicatePairNames_Throw) {
         "    enabled: true\n");
     TempYaml tmp(yaml.c_str());
     EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+}
+
+// ============================================================================
+// [S14 2026-09-13] strategy.cancel_escalation_*
+//
+// Keys are spliced in with this file's with_strategy_keys() helper (above),
+// which inserts directly after "  tier_size_pct: [0.6, 0.4]" and returns the
+// YAML unchanged if that anchor ever moves -- hence the ASSERT_NE guards.
+// ============================================================================
+
+TEST(CancelEscalationConfig, DefaultsMatchTheHeaderConstants)
+{
+    TempYaml tmp(kMinimalValidYaml);
+    const auto cfg = xop::load_config(tmp.path());
+    EXPECT_TRUE(cfg.strategy.cancel_escalation_enabled);
+
+    const auto params = xop::execution::cancel_escalation_params_from(cfg.strategy);
+    const xop::execution::CancelEscalationParams header{};
+    EXPECT_EQ(params.window_blocks, header.window_blocks);
+    EXPECT_EQ(params.max_escalations, header.max_escalations);
+    EXPECT_EQ(params.fee_step_mojos, header.fee_step_mojos);
+    EXPECT_EQ(params.max_fee_mojos, header.max_fee_mojos);
+    EXPECT_EQ(params.retry_blocks, header.retry_blocks);
+    EXPECT_EQ(params.max_probes_per_sweep, header.max_probes_per_sweep);
+}
+
+TEST(CancelEscalationConfig, KeysParseIntoTheParams)
+{
+    const std::string yaml = with_strategy_keys(
+        "\n  cancel_escalation_enabled: false"
+        "\n  cancel_escalation_window_blocks: 120"
+        "\n  cancel_escalation_max_attempts: 5"
+        "\n  cancel_escalation_fee_step_mojos: 15000000"
+        "\n  cancel_escalation_max_fee_mojos: 250000000"
+        "\n  cancel_escalation_retry_blocks: 12"
+        "\n  cancel_escalation_max_probes: 7");
+    ASSERT_NE(yaml, std::string(kMinimalValidYaml)) << "the strategy anchor moved";
+    TempYaml tmp(yaml.c_str());
+    const auto cfg = xop::load_config(tmp.path());
+
+    EXPECT_FALSE(cfg.strategy.cancel_escalation_enabled);
+    const auto params = xop::execution::cancel_escalation_params_from(cfg.strategy);
+    EXPECT_EQ(params.window_blocks, 120u);
+    EXPECT_EQ(params.max_escalations, 5u);
+    EXPECT_EQ(params.fee_step_mojos, 15'000'000u);
+    EXPECT_EQ(params.max_fee_mojos, 250'000'000u);
+    EXPECT_EQ(params.retry_blocks, 12u);
+    EXPECT_EQ(params.max_probes_per_sweep, 7u);
+}
+
+TEST(CancelEscalationConfig, UnsafeValuesAreRejected)
+{
+    const char* const unsafe[] = {
+        // Below chia's replacement increment: cannot replace a conflict.
+        "\n  cancel_escalation_fee_step_mojos: 9999999",
+        "\n  cancel_escalation_window_blocks: 0",
+        "\n  cancel_escalation_retry_blocks: 0",
+        "\n  cancel_escalation_window_blocks: 8\n  cancel_escalation_retry_blocks: 9",
+        "\n  cancel_escalation_max_fee_mojos: 10000000",
+        "\n  cancel_escalation_max_probes: 0",
+    };
+    for (const char* keys : unsafe) {
+        const std::string yaml = with_strategy_keys(keys);
+        ASSERT_NE(yaml, std::string(kMinimalValidYaml)) << "the strategy anchor moved";
+        TempYaml tmp(yaml.c_str());
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError) << keys;
+    }
+}
+
+// ============================================================================
+// [PACE D1 2026-09-13] Per-pair concentration overrides
+// (pairs[i].soft_limit_pct_override / pairs[i].hard_limit_pct_override)
+// ============================================================================
+
+namespace {
+
+/// A second 64-hex CAT id, for configs that need two pairs.
+const char* const kTest2 =
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdee";
+
+/// load_config must reject `yaml` with a ConfigError whose message contains
+/// `needle`: an error raised for a different reason must not pass the test.
+void expect_config_error_containing(const std::string& yaml, const std::string& needle)
+{
+    TempYaml tmp(yaml);
+    try {
+        const auto cfg = xop::load_config(tmp.path());
+        static_cast<void>(cfg);
+        ADD_FAILURE() << "loaded; expected a ConfigError containing \"" << needle << "\"";
+    } catch (const xop::ConfigError& e) {
+        EXPECT_NE(std::string(e.what()).find(needle), std::string::npos)
+            << "ConfigError: " << e.what() << "\nexpected it to contain \"" << needle << "\"";
+    }
+}
+
+/// load_config must accept `yaml`.
+void expect_loads(const std::string& yaml)
+{
+    TempYaml tmp(yaml);
+    EXPECT_NO_THROW({
+        const auto cfg = xop::load_config(tmp.path());
+        static_cast<void>(cfg);
+    }) << yaml;
+}
+
+}  // namespace
+
+TEST(PairConcentrationOverride, AbsentByDefault) {
+    TempYaml tmp(kMinimalValidYaml);
+    const auto cfg = xop::load_config(tmp.path());
+    ASSERT_EQ(cfg.pairs.size(), 1u);
+    EXPECT_FALSE(cfg.pairs[0].soft_limit_pct_override.has_value());
+    EXPECT_FALSE(cfg.pairs[0].hard_limit_pct_override.has_value());
+}
+
+TEST(PairConcentrationOverride, ParsesBoth) {
+    TempYaml tmp(with_pair_extra(
+        "soft_limit_pct_override: 0.9\n    hard_limit_pct_override: 0.97"));
+    const auto cfg = xop::load_config(tmp.path());
+    ASSERT_EQ(cfg.pairs.size(), 1u);
+    ASSERT_TRUE(cfg.pairs[0].soft_limit_pct_override.has_value());
+    ASSERT_TRUE(cfg.pairs[0].hard_limit_pct_override.has_value());
+    EXPECT_DOUBLE_EQ(*cfg.pairs[0].soft_limit_pct_override, 0.9);
+    EXPECT_DOUBLE_EQ(*cfg.pairs[0].hard_limit_pct_override, 0.97);
+}
+
+// NonFiniteThrows and OutOfRangeThrows require the PARSE-stage message, not
+// just the key.  The effective soft < hard error names both override keys too,
+// and on its own it rejects a NaN override and a soft override above 1, so a
+// key-only needle would pass with the parse check deleted.
+TEST(PairConcentrationOverride, NonFiniteThrows) {
+    for (const char* key : {"soft_limit_pct_override", "hard_limit_pct_override"}) {
+        for (const char* value : {".nan", ".inf"}) {
+            SCOPED_TRACE(std::string(key) + ": " + value);
+            expect_config_error_containing(
+                with_pair_extra(std::string(key) + ": " + value),
+                std::string(key) + " must be a finite fraction in (0, 1]");
+        }
+    }
+}
+
+TEST(PairConcentrationOverride, OutOfRangeThrows) {
+    for (const char* key : {"soft_limit_pct_override", "hard_limit_pct_override"}) {
+        for (const char* value : {"0", "-0.1", "1.0001"}) {
+            SCOPED_TRACE(std::string(key) + ": " + value);
+            expect_config_error_containing(
+                with_pair_extra(std::string(key) + ": " + value),
+                std::string(key) + " must be a finite fraction in (0, 1]");
+        }
+    }
+}
+
+TEST(PairConcentrationOverride, EffectiveSoftNotBelowEffectiveHardThrows) {
+    // Both present, inverted.
+    expect_config_error_containing(
+        with_pair_extra("soft_limit_pct_override: 0.97\n    hard_limit_pct_override: 0.90"),
+        "effective soft limit");
+    // Soft-only above the global hard (0.80).
+    {
+        TempYaml tmp(with_pair_extra("soft_limit_pct_override: 0.85"));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+    }
+    // Hard-only below the global soft (0.60).
+    {
+        TempYaml tmp(with_pair_extra("hard_limit_pct_override: 0.55"));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+    }
+    // Soft-only below the global hard, and hard-only above the global soft.
+    expect_loads(with_pair_extra("soft_limit_pct_override: 0.70"));
+    expect_loads(with_pair_extra("hard_limit_pct_override: 0.97"));
+}
+
+TEST(PairConcentrationOverride, OtherPairsUnaffected) {
+    std::string yaml = kMinimalValidYaml;
+    const std::string anchor = "    enabled: true\n";
+    const auto pos = yaml.find(anchor);
+    ASSERT_NE(pos, std::string::npos);
+    yaml.insert(pos + anchor.size(),
+                std::string("    soft_limit_pct_override: 0.9\n"
+                            "    hard_limit_pct_override: 0.97\n"
+                            "  - base_asset_id: \"xch\"\n"
+                            "    quote_asset_id: \"") + kTest2 + "\"\n"
+                "    name: \"XCH/TEST2\"\n"
+                "    enabled: true\n");
+    TempYaml tmp(yaml);
+    const auto cfg = xop::load_config(tmp.path());
+    ASSERT_EQ(cfg.pairs.size(), 2u);
+    EXPECT_FALSE(cfg.pairs[1].soft_limit_pct_override.has_value());
+    EXPECT_FALSE(cfg.pairs[1].hard_limit_pct_override.has_value());
+    ASSERT_TRUE(cfg.pairs[0].soft_limit_pct_override.has_value());
+    ASSERT_TRUE(cfg.pairs[0].hard_limit_pct_override.has_value());
+    EXPECT_DOUBLE_EQ(*cfg.pairs[0].soft_limit_pct_override, 0.9);
+    EXPECT_DOUBLE_EQ(*cfg.pairs[0].hard_limit_pct_override, 0.97);
+}
+
+TEST(PairConcentrationOverride, OverrideLoggedAtLoad) {
+    CapturedLog log;
+    TempYaml tmp(with_pair_extra(
+        "soft_limit_pct_override: 0.9\n    hard_limit_pct_override: 0.97"));
+    EXPECT_NO_THROW({
+        const auto cfg = xop::load_config(tmp.path());
+        static_cast<void>(cfg);
+    });
+    EXPECT_TRUE(log.warned_containing("concentration limits overridden")) << log.text();
+}
+
+// ============================================================================
+// [PACE 2026-09-13] Pace controller keys (strategy.pace_*)
+// ============================================================================
+
+namespace {
+
+/// kMinimalValidYaml with `extra` (whole lines) spliced into the [strategy]
+/// block, after tier_size_pct.
+std::string pace_with_strategy(const std::string& extra)
+{
+    std::string y = kMinimalValidYaml;
+    const std::string anchor = "  tier_size_pct: [0.6, 0.4]\n";
+    const auto pos = y.find(anchor);
+    if (pos == std::string::npos) {
+        ADD_FAILURE() << "strategy anchor not found";
+        return y;
+    }
+    y.insert(pos + anchor.size(), extra);
+    return y;
+}
+
+/// `yaml` with `extra` (whole lines) spliced in after the first pair's
+/// `    enabled: true` line: more keys for that pair, or a second pair.
+std::string pace_after_first_pair(std::string yaml, const std::string& extra)
+{
+    const std::string anchor = "    enabled: true\n";
+    const auto pos = yaml.find(anchor);
+    if (pos == std::string::npos) {
+        ADD_FAILURE() << "pair anchor not found";
+        return yaml;
+    }
+    yaml.insert(pos + anchor.size(), extra);
+    return yaml;
+}
+
+const std::string kPaceTargets =
+    "  asset_target_allocations:\n    XCH: 0.5\n    TEST: 0.05\n"
+    "  asset_target_tolerances:\n    XCH: 0.4\n    TEST: 0.02\n";
+
+/// The topology checks iterate pace_assets, so a pair row without [TEST]
+/// would load for the wrong reason.
+const std::string kPaceOn = "  pace_enabled: true\n  pace_assets: [TEST]\n";
+
+/// kMinimalValidYaml's quote asset id: the TEST symbol.
+const std::string kTestId = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+}  // namespace
+
+TEST(PaceConfig, DefaultsKeepFeatureOff) {
+    TempYaml tmp(kMinimalValidYaml);
+    const auto cfg = xop::load_config(tmp.path());
+    const xop::StrategyConfig& strategy = cfg.strategy;
+    EXPECT_FALSE(strategy.pace_enabled);
+    EXPECT_TRUE(strategy.pace_assets.empty());
+    EXPECT_EQ(strategy.pace_horizon_blocks, 64512u);
+    EXPECT_DOUBLE_EQ(strategy.pace_enter_tol_mult, 1.5);
+    EXPECT_DOUBLE_EQ(strategy.pace_exit_tol_mult, 1.0);
+    EXPECT_DOUBLE_EQ(strategy.pace_max_resting_frac, 0.5);
+    EXPECT_DOUBLE_EQ(strategy.pace_min_tier_units, 1.0);
+    EXPECT_DOUBLE_EQ(strategy.pace_max_tier_units, 5.0);
+    EXPECT_EQ(strategy.pace_max_tiers, 3u);
+    EXPECT_DOUBLE_EQ(strategy.pace_tighten_step_bps, 25.0);
+    EXPECT_DOUBLE_EQ(strategy.pace_tighten_max_bps, 300.0);
+    EXPECT_DOUBLE_EQ(strategy.pace_min_edge_bps, 50.0);
+    EXPECT_DOUBLE_EQ(strategy.pace_edge_sigma_mult, 1.0);
+    EXPECT_DOUBLE_EQ(strategy.pace_max_fair_value_sigma_bps, 200.0);
+    EXPECT_EQ(strategy.pace_max_balance_age_blocks, 20u);
+    EXPECT_DOUBLE_EQ(strategy.pace_reprice_min_bps, 50.0);
+    EXPECT_EQ(strategy.pace_reprice_min_age_blocks, 96u);
+    ASSERT_EQ(cfg.pairs.size(), 1u);
+    EXPECT_FALSE(cfg.pairs[0].soft_limit_pct_override.has_value());
+    EXPECT_FALSE(cfg.pairs[0].hard_limit_pct_override.has_value());
+}
+
+TEST(PaceConfig, ParsesAllKeysAndUppercasesAssets) {
+    TempYaml tmp(pace_with_strategy(
+        "  pace_enabled: true\n"
+        "  pace_assets: [test]\n" + kPaceTargets +
+        "  pace_horizon_blocks: 32256\n"
+        "  pace_enter_tol_mult: 2.0\n"
+        "  pace_exit_tol_mult: 0.5\n"
+        "  pace_max_resting_frac: 0.25\n"
+        "  pace_min_tier_units: 1.5\n"
+        "  pace_max_tier_units: 4.0\n"
+        "  pace_max_tiers: 2\n"
+        "  pace_tighten_step_bps: 10\n"
+        "  pace_tighten_max_bps: 150\n"
+        "  pace_min_edge_bps: 60\n"
+        "  pace_edge_sigma_mult: 1.5\n"
+        "  pace_max_fair_value_sigma_bps: 150\n"
+        "  pace_max_balance_age_blocks: 30\n"
+        "  pace_reprice_min_bps: 40\n"
+        "  pace_reprice_min_age_blocks: 120\n"));
+    const auto cfg = xop::load_config(tmp.path());
+    const xop::StrategyConfig& strategy = cfg.strategy;
+    EXPECT_TRUE(strategy.pace_enabled);
+    EXPECT_EQ(strategy.pace_assets, std::vector<std::string>{"TEST"});
+    EXPECT_EQ(strategy.pace_horizon_blocks, 32256u);
+    EXPECT_DOUBLE_EQ(strategy.pace_enter_tol_mult, 2.0);
+    EXPECT_DOUBLE_EQ(strategy.pace_exit_tol_mult, 0.5);
+    EXPECT_DOUBLE_EQ(strategy.pace_max_resting_frac, 0.25);
+    EXPECT_DOUBLE_EQ(strategy.pace_min_tier_units, 1.5);
+    EXPECT_DOUBLE_EQ(strategy.pace_max_tier_units, 4.0);
+    EXPECT_EQ(strategy.pace_max_tiers, 2u);
+    EXPECT_DOUBLE_EQ(strategy.pace_tighten_step_bps, 10.0);
+    EXPECT_DOUBLE_EQ(strategy.pace_tighten_max_bps, 150.0);
+    EXPECT_DOUBLE_EQ(strategy.pace_min_edge_bps, 60.0);
+    EXPECT_DOUBLE_EQ(strategy.pace_edge_sigma_mult, 1.5);
+    EXPECT_DOUBLE_EQ(strategy.pace_max_fair_value_sigma_bps, 150.0);
+    EXPECT_EQ(strategy.pace_max_balance_age_blocks, 30u);
+    EXPECT_DOUBLE_EQ(strategy.pace_reprice_min_bps, 40.0);
+    EXPECT_EQ(strategy.pace_reprice_min_age_blocks, 120u);
+}
+
+TEST(PaceConfig, NonFiniteDoubleKeysThrow) {
+    // Every pace double key has a finite upper bound, so the .inf rows also
+    // trip the range check; only the .nan rows need the finiteness test.
+    const char* const keys[] = {
+        "pace_enter_tol_mult", "pace_exit_tol_mult", "pace_max_resting_frac", "pace_min_tier_units",
+        "pace_max_tier_units", "pace_tighten_step_bps", "pace_tighten_max_bps", "pace_min_edge_bps",
+        "pace_edge_sigma_mult", "pace_max_fair_value_sigma_bps", "pace_reprice_min_bps",
+    };
+    for (const char* key : keys) {
+        for (const char* value : {".nan", ".inf"}) {
+            SCOPED_TRACE(std::string(key) + ": " + value);
+            expect_config_error_containing(
+                pace_with_strategy(std::string("  ") + key + ": " + value + "\n"), key);
+        }
+    }
+}
+
+TEST(PaceConfig, OutOfRangeThrows) {
+    struct Row {
+        const char* key{nullptr};
+        const char* value{nullptr};
+    };
+    const Row rows[] = {
+        {"pace_horizon_blocks", "4607"},           {"pace_horizon_blocks", "414721"},
+        {"pace_enter_tol_mult", "0"},              {"pace_enter_tol_mult", "10.0001"},
+        {"pace_exit_tol_mult", "-0.0001"},         {"pace_exit_tol_mult", "10"},
+        {"pace_max_resting_frac", "0"},            {"pace_max_resting_frac", "1.0001"},
+        {"pace_min_tier_units", "0"},
+        {"pace_max_tier_units", "0"},              {"pace_max_tier_units", "1000000.1"},
+        {"pace_max_tiers", "0"},                   {"pace_max_tiers", "17"},
+        {"pace_tighten_step_bps", "0.9999"},       {"pace_tighten_step_bps", "1000.0001"},
+        {"pace_tighten_max_bps", "-1"},            {"pace_tighten_max_bps", "5000.0001"},
+        {"pace_min_edge_bps", "0"},                {"pace_min_edge_bps", "2000.0001"},
+        {"pace_edge_sigma_mult", "-0.0001"},       {"pace_edge_sigma_mult", "5.0001"},
+        {"pace_max_fair_value_sigma_bps", "0"},    {"pace_max_fair_value_sigma_bps", "2000.0001"},
+        {"pace_max_balance_age_blocks", "0"},      {"pace_max_balance_age_blocks", "4609"},
+        {"pace_reprice_min_bps", "0"},             {"pace_reprice_min_bps", "1000.0001"},
+        {"pace_reprice_min_age_blocks", "11"},     {"pace_reprice_min_age_blocks", "4609"},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(std::string(row.key) + ": " + row.value);
+        expect_config_error_containing(
+            pace_with_strategy(std::string("  ") + row.key + ": " + row.value + "\n"), row.key);
+    }
+}
+
+TEST(PaceConfig, ExitNotBelowEnterThrows) {
+    expect_config_error_containing(
+        pace_with_strategy("  pace_enter_tol_mult: 1.5\n  pace_exit_tol_mult: 1.5\n"), "pace_exit_tol_mult");
+}
+
+TEST(PaceConfig, MinTierAboveMaxTierThrows) {
+    expect_config_error_containing(
+        pace_with_strategy("  pace_min_tier_units: 6\n  pace_max_tier_units: 5\n"), "pace_min_tier_units");
+}
+
+TEST(PaceConfig, XchInAssetsThrowsWhenEnabled) {
+    expect_config_error_containing(
+        pace_with_strategy("  pace_enabled: true\n  pace_assets: [XCH]\n" + kPaceTargets),
+        "must not contain XCH");
+}
+
+TEST(PaceConfig, AssetWithoutTargetThrowsWhenEnabled) {
+    expect_config_error_containing(pace_with_strategy(kPaceOn), "asset_target_allocations");
+}
+
+TEST(PaceConfig, ZeroToleranceThrowsWhenEnabled) {
+    expect_config_error_containing(
+        pace_with_strategy(kPaceOn
+                           + "  asset_target_allocations:\n    XCH: 0.5\n    TEST: 0.05\n"
+                             "  asset_target_tolerances:\n    XCH: 0.4\n    TEST: 0.0\n"),
+        "asset_target_tolerances");
+}
+
+TEST(PaceConfig, SigmaCeilingAboveFairValueCeilingThrowsWhenEnabled) {
+    // 150 is the lowest fair_value_max_sigma_bps the repo's tight-sigma check
+    // accepts at the default fair_value_tight_sigma_bps of 150.
+    expect_config_error_containing(
+        pace_with_strategy(kPaceOn + kPaceTargets + "  fair_value_max_sigma_bps: 150\n"),
+        "pace_max_fair_value_sigma_bps");
+}
+
+TEST(PaceConfig, ChecksSkippedWhenDisabled) {
+    expect_loads(pace_with_strategy("  pace_assets: [XCH]\n  fair_value_max_sigma_bps: 150\n"));
+}
+
+TEST(PaceConfig, BaseManagedPairThrowsWhenEnabled) {
+    expect_config_error_containing(
+        pace_after_first_pair(pace_with_strategy(kPaceOn + kPaceTargets),
+                              "  - base_asset_id: \"" + kTestId + "\"\n"
+                              "    quote_asset_id: \"xch\"\n"
+                              "    name: \"TEST/XCH\"\n"
+                              "    enabled: true\n"),
+        "must be XCH/TEST");
+}
+
+TEST(PaceConfig, NonXchPairTouchingAssetThrowsWhenEnabled) {
+    expect_config_error_containing(
+        pace_after_first_pair(pace_with_strategy(kPaceOn + kPaceTargets),
+                              "  - base_asset_id: \"" + kTestId + "\"\n"
+                              "    quote_asset_id: \"" + std::string(kTest2) + "\"\n"
+                              "    name: \"TEST/OTHER\"\n"
+                              "    enabled: true\n"),
+        "must be XCH/TEST");
+}
+
+TEST(PaceConfig, DisabledPairTouchingAssetIgnored) {
+    expect_loads(
+        pace_after_first_pair(pace_with_strategy(kPaceOn + kPaceTargets),
+                              "  - base_asset_id: \"" + kTestId + "\"\n"
+                              "    quote_asset_id: \"" + std::string(kTest2) + "\"\n"
+                              "    name: \"TEST/OTHER\"\n"
+                              "    enabled: false\n"));
+}
+
+TEST(PaceConfig, StablecoinPacePairThrowsWhenEnabled) {
+    // The same is_stablecoin / peg_target shape loads without pace
+    // (ConfigParserTest.S20NonFinitePegTargetRejected).
+    expect_config_error_containing(
+        pace_after_first_pair(pace_with_strategy(kPaceOn + kPaceTargets),
+                              "    is_stablecoin: true\n    peg_target: 1.0\n"),
+        "must not set is_stablecoin");
+}
+
+TEST(PaceConfig, StaleFeedThresholdDisabledThrowsWhenEnabled) {
+    std::string yaml = pace_with_strategy(kPaceOn + kPaceTargets);
+    yaml += "\nmarket_data:\n  cex_freshness_threshold_sec: 0\n";
+    expect_config_error_containing(yaml, "cex_freshness_threshold_sec");
+}
+
+TEST(PaceConfig, EnabledWithEmptyAssetsWarns) {
+    CapturedLog log;
+    expect_loads(pace_with_strategy("  pace_enabled: true\n"));
+    EXPECT_TRUE(log.warned_containing("pace_assets is empty")) << log.text();
 }

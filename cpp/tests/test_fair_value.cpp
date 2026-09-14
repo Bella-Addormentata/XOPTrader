@@ -800,8 +800,31 @@ TEST_F(FairValueTest, PairsAreTrackedIndependently) {
 // Part 4 -- the solve's inputs, read back out of the feed
 // ===========================================================================
 
+// [PR #159] The two fixtures below used to arrive through ingest_dexie, the RAW
+// ticker.  The raw ticker is no longer a book observation at all -- it carries
+// our own offers; see RawTickerProvenance (test_raw_ticker_provenance.cpp) --
+// so they now drive the filtered ingest their names always described.  Left
+// on the raw path the first would assert the hole, and the second would pass
+// for the wrong reason: provenance, not one-sidedness.
+std::vector<CompetingOffer> third_party_book(double bid, double ask) {
+    std::vector<CompetingOffer> book;
+    auto add = [&book](const char* id, Side side, double px) {
+        CompetingOffer o;
+        o.offer_id = id;
+        o.side     = side;
+        o.price    = static_cast<Mojo>(
+            std::llround(px * static_cast<double>(kMojosPerXch)));
+        o.size     = 5 * kMojosPerXch;   // clears the default 1-XCH dust floor
+        book.push_back(o);
+    };
+    if (bid > 0.0) add("fv-bid", Side::Bid, bid);
+    if (ask > 0.0) add("fv-ask", Side::Ask, ask);
+    return book;
+}
+
 TEST_F(FairValueTest, InputsExposeTheSelfFilteredBookNotTheBlendedMid) {
-    feed_->ingest_dexie("XCH/BYC", 1.2000, 1.3400, 1.2673, 500.0);
+    feed_->ingest_competing_offers("XCH/BYC", third_party_book(1.2000, 1.3400),
+                                   {});
     feed_->refresh({"XCH/BYC"});
 
     const auto obs = feed_->get_fair_value_inputs("XCH/BYC");
@@ -814,7 +837,8 @@ TEST_F(FairValueTest, InputsExposeTheSelfFilteredBookNotTheBlendedMid) {
 TEST_F(FairValueTest, OneSidedBookYieldsNoObservation) {
     // Post-5e1ceb4 a zero side means no THIRD-PARTY offer rests there, not
     // that the price is zero.  A one-sided book is not a price.
-    feed_->ingest_dexie("XCH/BYC", 1.2000, 0.0, 1.2673, 500.0);
+    feed_->ingest_competing_offers("XCH/BYC", third_party_book(1.2000, 0.0),
+                                   {});
     feed_->refresh({"XCH/BYC"});
 
     const auto obs = feed_->get_fair_value_inputs("XCH/BYC");

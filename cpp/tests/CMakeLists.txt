@@ -58,6 +58,8 @@ add_executable(xop_tests
     test_advanced_trading.cpp
     test_market_analyzer.cpp
     test_limits.cpp
+    test_pace_controller.cpp
+    test_pace_wiring.cpp
     test_config.cpp
     test_config_reload.cpp
     test_reconcile_verdict.cpp
@@ -97,11 +99,14 @@ add_executable(xop_tests
     test_reservation_offset.cpp
     test_bridge_ingest.cpp
     test_reward_ingest.cpp
+    test_maker_fill_legs.cpp
     test_drawdown_breaker.cpp
     test_watchdog.cpp
     test_height_source.cpp
     test_node_sync_state.cpp
     test_dexie_probe_liveness.cpp
+    test_dexie_market_ticker.cpp
+    test_raw_ticker_provenance.cpp
     test_selective_repost.cpp
     test_width_floor.cpp
     test_activity_interpolation.cpp
@@ -114,6 +119,12 @@ add_executable(xop_tests
     test_offer_expiry.cpp
     test_wallet_requests.cpp
     test_stuck_tx_verdict.cpp
+    test_wallet_circuit.cpp
+    test_rpc_transport_evidence.cpp
+    test_stuck_prune_scope.cpp
+    test_shutdown_flag.cpp
+    test_cancel_escalation.cpp
+    test_rpc_retry_policy.cpp
 )
 
 target_link_libraries(xop_tests
@@ -127,6 +138,13 @@ target_link_libraries(xop_tests
 target_include_directories(xop_tests
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../include
+)
+
+# [PACE round 2] test_pace_wiring.cpp scans the pace glue in engine.cpp, which
+# no unit test can construct.
+target_compile_definitions(xop_tests
+    PRIVATE
+        XOP_TESTS_ENGINE_CPP="${CMAKE_CURRENT_SOURCE_DIR}/../src/engine.cpp"
 )
 
 # Register with CTest so that `ctest` discovers and runs the tests.

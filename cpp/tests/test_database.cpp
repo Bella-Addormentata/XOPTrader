@@ -2,9 +2,12 @@
 #include <sqlite3.h>
 
 #include <xop/database.hpp>
+#include <xop/execution/cancel_escalation.hpp>
 
 #include <chrono>
 #include <filesystem>
+#include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -336,6 +339,77 @@ TEST(DatabaseTest, TradeCountsBySideSinceBlock)
     auto counts_300 = db.query_trade_counts_by_side("XCH/BYC", 300);
     EXPECT_EQ(counts_300.first, 0);
     EXPECT_EQ(counts_300.second, 0);
+}
+
+// [PACE 2026-09-13] query_pace_fills returns RAW rows for ONE pair since a
+// block height: makers (trade_log) first, then takers (taker_fills), each
+// ascending by block.  The since-150 query must drop the bid at 100 and the
+// taker at 120; the other pair's rows must never appear.
+TEST(DatabaseTest, PaceFillsSinceBlockReturnsRawRowsForPairOnly)
+{
+    TempDbPath temp_db{"xop_pace_fills"};
+    xop::Database db(temp_db.path().string());
+
+    auto insert_trade = [&](const std::string& id, const std::string& pair, const std::string& side,
+                            xop::Mojo size, xop::Mojo price, xop::BlockHeight block) {
+        xop::DbTradeRecord tr;
+        tr.timestamp    = "2026-09-13T15:00:00Z";
+        tr.trade_id     = id;
+        tr.pair_name    = pair;
+        tr.side         = side;
+        tr.price_mojos  = price;
+        tr.size_mojos   = size;
+        tr.block_height = block;
+        db.insert_trade(tr);
+    };
+    auto insert_taker = [&](const std::string& id, const std::string& pair, bool we_bought_base,
+                            xop::Mojo base_delta, xop::Mojo quote_delta, xop::BlockHeight block) {
+        xop::DbTakerFill f;
+        f.taken_at              = "2026-09-13T15:00:00Z";
+        f.block_height          = block;
+        f.strategy              = "crossed_book";
+        f.trade_id              = id;
+        f.counterparty_offer_id = "offer-" + id;
+        f.pair_name             = pair;
+        f.we_bought_base        = we_bought_base;
+        f.base_asset            = "xch";
+        f.base_delta_mojos      = base_delta;
+        f.quote_asset           = "byc";
+        f.quote_delta_mojos     = quote_delta;
+        f.price_mojos           = 1'424'000'000'000;
+        db.insert_taker_fill(f);
+    };
+
+    insert_trade("m1", "XCH/BYC", "bid", 1'500'000'000'000, 1'400'000'000'000, 100);
+    insert_trade("m2", "XCH/BYC", "ask", 1'000'000'000'000, 1'885'000'000'000, 200);
+    insert_trade("m3", "XCH/DBX", "bid", 1'000'000'000'000, 83'000'000'000'000, 250);
+    insert_taker("t1", "XCH/BYC", true, 2'000'000'000'000, -2848, 120);
+    insert_taker("t2", "XCH/BYC", false, -1'000'000'000'000, 1500, 300);
+    insert_taker("t3", "XCH/DBX", true, 1'000'000'000'000, -83000, 320);
+
+    const auto since150 = db.query_pace_fills("XCH/BYC", 150);
+    ASSERT_EQ(since150.size(), 2u);
+    EXPECT_FALSE(since150[0].is_taker);
+    EXPECT_EQ(since150[0].side_lower, "ask");
+    EXPECT_EQ(since150[0].size_mojos, 1'000'000'000'000);
+    EXPECT_EQ(since150[0].price_mojos, 1'885'000'000'000);
+    EXPECT_EQ(since150[0].block_height, 200u);
+    EXPECT_TRUE(since150[1].is_taker);
+    EXPECT_FALSE(since150[1].we_bought_base);
+    EXPECT_EQ(since150[1].base_delta_mojos, -1'000'000'000'000);
+    EXPECT_EQ(since150[1].quote_delta_mojos, 1500);
+    EXPECT_EQ(since150[1].block_height, 300u);
+
+    const auto all = db.query_pace_fills("XCH/BYC", 0);
+    ASSERT_EQ(all.size(), 4u);
+    EXPECT_FALSE(all[0].is_taker);
+    EXPECT_EQ(all[0].block_height, 100u);
+    EXPECT_FALSE(all[1].is_taker);
+    EXPECT_EQ(all[1].block_height, 200u);
+    EXPECT_TRUE(all[2].is_taker);
+    EXPECT_EQ(all[2].block_height, 120u);
+    EXPECT_TRUE(all[3].is_taker);
+    EXPECT_EQ(all[3].block_height, 300u);
 }
 
 // [S33 2026-09-05] The activity controller runs the query above once per
@@ -950,4 +1024,367 @@ TEST(DatabaseTest, FillStillOverridesACancelledOffer)
     };
     EXPECT_EQ(query_offer_row(raw_db, offer_id).status, "filled");
     close_db();
+}
+
+// ===========================================================================
+// [S14 2026-09-13] cancel_pending: an accepted cancel is a submission.
+//
+// The three XCH/BYC bids posted 2026-08-30 were stamped 'cancelled' when the
+// wallet ACCEPTED their cancel RPC; the wallet kept them PENDING_CANCEL with
+// every maker coin unspent for thirteen days.  These pin the row lifecycle
+// that replaces the stamp.
+// ===========================================================================
+
+namespace {
+
+// resolved_at is NULL while an offer is unresolved (pending or
+// cancel_pending) and stamped when a terminal status is written.
+bool resolved_at_is_null(sqlite3* db, const std::string& offer_id)
+{
+    constexpr const char* kSql =
+        "SELECT resolved_at IS NULL FROM offer_log WHERE offer_id = ? LIMIT 1;";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db, kSql, -1, &stmt, nullptr) != SQLITE_OK) {
+        throw std::runtime_error(sqlite3_errmsg(db));
+    }
+    sqlite3_bind_text(stmt, 1, offer_id.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt) != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        throw std::runtime_error("offer row not found");
+    }
+    const bool is_null = sqlite3_column_int(stmt, 0) != 0;
+    sqlite3_finalize(stmt);
+    return is_null;
+}
+
+}  // namespace
+
+TEST(DatabaseTest, CancelSubmitIsNotTerminalAndCompletesOnWalletVerdict)
+{
+    TempDbPath temp_db{"xop_s14_submit"};
+    const std::string offer_id = "offer-s14-submit";
+
+    {
+        xop::Database db(temp_db.path().string());
+        db.insert_offer(make_offer(offer_id));
+        db.mark_offer_cancel_submitted(offer_id, 9224185, "price_adverse(2.021%)");
+
+        sqlite3* raw_db = open_db(temp_db.path());
+        const OfferRow submitted = query_offer_row(raw_db, offer_id);
+        const bool unresolved = resolved_at_is_null(raw_db, offer_id);
+        sqlite3_close(raw_db);
+        EXPECT_EQ(submitted.status, "cancel_pending");
+        EXPECT_EQ(submitted.resolved_block, 0u);
+        EXPECT_TRUE(unresolved) << "a submitted cancel has resolved nothing";
+
+        db.update_offer_status(offer_id, "cancelled", 9224300,
+                               "wallet reported terminal");
+    }
+
+    sqlite3* raw_db = open_db(temp_db.path());
+    const OfferRow done = query_offer_row(raw_db, offer_id);
+    const auto events = query_closure_events(raw_db, offer_id);
+    sqlite3_close(raw_db);
+
+    EXPECT_EQ(done.status, "cancelled");
+    EXPECT_EQ(done.resolved_block, 9224300u);
+    ASSERT_EQ(events.size(), 2u);
+    EXPECT_EQ(events[0].event_type, "status_update");
+    EXPECT_EQ(events[0].previous_status, "pending");
+    EXPECT_EQ(events[0].observed_status, "cancel_pending");
+    EXPECT_EQ(events[0].resolved_block, 9224185u);
+    EXPECT_EQ(events[1].event_type, "status_update");
+    EXPECT_EQ(events[1].previous_status, "cancel_pending");
+    EXPECT_EQ(events[1].observed_status, "cancelled");
+    EXPECT_EQ(events[1].closure_reason, "wallet reported terminal");
+}
+
+TEST(DatabaseTest, CompletionKeepsTheSubmitCause)
+{
+    TempDbPath temp_db{"xop_s14_cause"};
+    const std::string offer_id = "offer-s14-cause";
+
+    {
+        xop::Database db(temp_db.path().string());
+        db.insert_offer(make_offer(offer_id));
+        db.mark_offer_cancel_submitted(offer_id, 9224185, "price_adverse(2.021%)");
+        db.update_offer_status(offer_id, "cancelled", 9224300,
+                               "wallet reported terminal");
+    }
+
+    sqlite3* raw_db = open_db(temp_db.path());
+    const OfferRow row = query_offer_row(raw_db, offer_id);
+    sqlite3_close(raw_db);
+    EXPECT_EQ(row.cancel_reason, "price_adverse(2.021%)")
+        << "the verdict's generic text must not overwrite why the bot cancelled";
+}
+
+TEST(DatabaseTest, ATakerWinningTheCancelRaceIsBookedAsFilled)
+{
+    TempDbPath temp_db{"xop_s14_race"};
+    const std::string offer_id = "offer-s14-race";
+
+    {
+        xop::Database db(temp_db.path().string());
+        db.insert_offer(make_offer(offer_id));
+        db.mark_offer_cancel_submitted(offer_id, 9224185, "stuck");
+        db.update_offer_status(offer_id, "filled", 9224190, "");
+    }
+
+    sqlite3* raw_db = open_db(temp_db.path());
+    const OfferRow row = query_offer_row(raw_db, offer_id);
+    sqlite3_close(raw_db);
+    EXPECT_EQ(row.status, "filled");
+}
+
+TEST(DatabaseTest, ARepeatSubmitDoesNotOverwriteTheFirstCause)
+{
+    TempDbPath temp_db{"xop_s14_repeat"};
+    const std::string offer_id = "offer-s14-repeat";
+
+    {
+        xop::Database db(temp_db.path().string());
+        db.insert_offer(make_offer(offer_id));
+        db.mark_offer_cancel_submitted(offer_id, 9224185, "ttl_expired");
+        db.mark_offer_cancel_submitted(offer_id, 9224281, "cancel_escalation_1");
+    }
+
+    sqlite3* raw_db = open_db(temp_db.path());
+    const OfferRow row = query_offer_row(raw_db, offer_id);
+    const auto events = query_closure_events(raw_db, offer_id);
+    sqlite3_close(raw_db);
+    EXPECT_EQ(row.cancel_reason, "ttl_expired");
+    ASSERT_EQ(events.size(), 2u);
+    EXPECT_EQ(events[1].event_type, "status_observation");
+    EXPECT_EQ(events[1].closure_reason, "cancel_escalation_1");
+}
+
+TEST(DatabaseTest, PendingQueryRestoresCancelPendingRowsWithTheirStatus)
+{
+    TempDbPath temp_db{"xop_s14_restore"};
+    xop::Database db(temp_db.path().string());
+    db.insert_offer(make_offer("offer-live"));
+    db.insert_offer(make_offer("offer-submitted"));
+    db.mark_offer_cancel_submitted("offer-submitted", 9224185, "stuck");
+    db.insert_offer(make_offer("offer-done"));
+    db.update_offer_status("offer-done", "cancelled", 9224190,
+                           "wallet reported terminal");
+
+    const auto rows = db.query_pending_offers();
+    ASSERT_EQ(rows.size(), 2u);
+    std::set<std::string> seen;
+    for (const auto& rec : rows) {
+        seen.insert(rec.offer_id + "=" + rec.status);
+    }
+    EXPECT_EQ(seen, (std::set<std::string>{"offer-live=pending",
+                                           "offer-submitted=cancel_pending"}));
+}
+
+TEST(DatabaseTest, ReopenOnlyTurnsACancelledRowBackToCancelPending)
+{
+    TempDbPath temp_db{"xop_s14_reopen"};
+
+    {
+        xop::Database db(temp_db.path().string());
+        db.insert_offer(make_offer("offer-cancelled"));
+        db.update_offer_status("offer-cancelled", "cancelled", 9224185,
+                               "price_adverse(2.021%)");
+        db.insert_offer(make_offer("offer-filled"));
+        db.update_offer_status("offer-filled", "filled", 9224190, "");
+        db.insert_offer(make_offer("offer-pending"));
+
+        EXPECT_TRUE(db.reopen_cancelled_as_cancel_pending(
+            "offer-cancelled", 9285386, "wallet_pending_cancel_recovered"));
+        EXPECT_FALSE(db.reopen_cancelled_as_cancel_pending(
+            "offer-filled", 9285386, "wallet_pending_cancel_recovered"));
+        EXPECT_FALSE(db.reopen_cancelled_as_cancel_pending(
+            "offer-pending", 9285386, "wallet_pending_cancel_recovered"));
+        EXPECT_THROW(db.reopen_cancelled_as_cancel_pending(
+                         "offer-never-logged", 9285386, "x"),
+                     xop::OfferNotFound);
+    }
+
+    sqlite3* raw_db = open_db(temp_db.path());
+    const OfferRow reopened = query_offer_row(raw_db, "offer-cancelled");
+    const bool reopened_unresolved = resolved_at_is_null(raw_db, "offer-cancelled");
+    const auto reopened_events = query_closure_events(raw_db, "offer-cancelled");
+    const OfferRow filled = query_offer_row(raw_db, "offer-filled");
+    const auto filled_events = query_closure_events(raw_db, "offer-filled");
+    const OfferRow pending = query_offer_row(raw_db, "offer-pending");
+    sqlite3_close(raw_db);
+
+    EXPECT_EQ(reopened.status, "cancel_pending");
+    EXPECT_EQ(reopened.cancel_reason, "price_adverse(2.021%)");
+    EXPECT_EQ(reopened.resolved_block, 0u);
+    EXPECT_TRUE(reopened_unresolved);
+    ASSERT_FALSE(reopened_events.empty());
+    EXPECT_EQ(reopened_events.back().event_type, "reopen_observation");
+    EXPECT_EQ(reopened_events.back().previous_status, "cancelled");
+    EXPECT_EQ(reopened_events.back().observed_status, "cancel_pending");
+    EXPECT_EQ(reopened_events.back().closure_reason,
+              "wallet_pending_cancel_recovered");
+    EXPECT_EQ(reopened_events.back().resolved_block, 9285386u);
+
+    EXPECT_EQ(filled.status, "filled");
+    EXPECT_EQ(filled.resolved_block, 9224190u);
+    EXPECT_EQ(filled_events.size(), 1u);
+    EXPECT_EQ(pending.status, "pending");
+}
+
+TEST(DatabaseTest, QueryOfferStatusDistinguishesMissingFromPresent)
+{
+    TempDbPath temp_db{"xop_s14_status"};
+    xop::Database db(temp_db.path().string());
+    EXPECT_FALSE(db.query_offer_status("offer-never-logged").has_value());
+
+    db.insert_offer(make_offer("offer-s14-status"));
+    db.mark_offer_cancel_submitted("offer-s14-status", 9224185, "stuck");
+    const auto status = db.query_offer_status("offer-s14-status");
+    ASSERT_TRUE(status.has_value());
+    EXPECT_EQ(*status, "cancel_pending");
+}
+
+// [review] The S46 terminal writers pass resolved_block 0.  With the submit
+// height no longer stamped on the row at submit time, an offer resolving
+// across a restart would otherwise store 0 and the GUI Age would read an em
+// dash where the old stamp kept the submit height.
+TEST(DatabaseTest, AZeroBlockTerminalWriterKeepsTheSubmitHeight)
+{
+    TempDbPath temp_db{"xop_s14_zero_block"};
+    const std::string offer_id = "offer-s14-zero-block";
+
+    {
+        xop::Database db(temp_db.path().string());
+        db.insert_offer(make_offer(offer_id));
+        db.mark_offer_cancel_submitted(offer_id, 9224185, "price_adverse(2.536%)");
+        db.update_offer_status(offer_id, "cancelled", 0, "s46_intent_recovery");
+    }
+
+    sqlite3* raw_db = open_db(temp_db.path());
+    const OfferRow row = query_offer_row(raw_db, offer_id);
+    sqlite3_close(raw_db);
+    EXPECT_EQ(row.status, "cancelled");
+    EXPECT_EQ(row.resolved_block, 9224185u);
+}
+
+// [review] Escalation tracks live in memory.  The cap is seeded from these
+// events so a restart does not grant three more fee-bearing attempts.
+TEST(DatabaseTest, EscalationCountSurvivesARestart)
+{
+    TempDbPath temp_db{"xop_s14_escalations"};
+
+    {
+        xop::Database db(temp_db.path().string());
+        db.insert_offer(make_offer("offer-escalated"));
+        db.mark_offer_cancel_submitted("offer-escalated", 9224185, "ttl_expired");
+        db.mark_offer_cancel_submitted("offer-escalated", 9224281,
+                                       "cancel_escalation_1");
+        db.mark_offer_cancel_submitted("offer-escalated", 9224377,
+                                       "cancel_escalation_2");
+        db.insert_offer(make_offer("offer-plain"));
+        db.mark_offer_cancel_submitted("offer-plain", 9224185, "stuck");
+    }
+
+    xop::Database reopened(temp_db.path().string());
+    EXPECT_EQ(reopened.count_cancel_escalations("offer-escalated"), 2u);
+    EXPECT_EQ(reopened.count_cancel_escalations("offer-plain"), 0u);
+    EXPECT_EQ(reopened.count_cancel_escalations("offer-never-logged"), 0u);
+}
+
+// [review, round 2] The fee floor survives a restart.  last_fee_mojos lived
+// only in memory, so after a restart escalation N+1 bid exactly what
+// escalation N had paid -- below MEMPOOL_MIN_FEE_INCREASE, refused as a
+// replacement while N's spend was still in the mempool, and still counted.
+TEST(DatabaseTest, EscalationFeeSurvivesARestart)
+{
+    TempDbPath temp_db{"xop_s14_escalation_fee"};
+
+    {
+        xop::Database db(temp_db.path().string());
+        db.insert_offer(make_offer("offer-escalated"));
+        // An initial cancel that carries a fee is not an escalation.
+        db.mark_offer_cancel_submitted("offer-escalated", 9224185,
+                                       "price_adverse(2.021%)", 60'000'000ULL);
+        // Out of order on purpose (a cap lowered across a restart): the floor
+        // is the HIGHEST fee an escalation recorded, not the latest one.
+        db.mark_offer_cancel_submitted("offer-escalated", 9224281,
+                                       "cancel_escalation_1", 40'000'000ULL);
+        db.mark_offer_cancel_submitted("offer-escalated", 9224377,
+                                       "cancel_escalation_2", 30'000'000ULL);
+        db.insert_offer(make_offer("offer-unescalated"));
+        db.mark_offer_cancel_submitted("offer-unescalated", 9224185, "stuck",
+                                       70'000'000ULL);
+    }
+
+    xop::Database reopened(temp_db.path().string());
+    EXPECT_EQ(reopened.max_cancel_escalation_fee("offer-escalated"), 40'000'000ULL);
+    EXPECT_EQ(reopened.count_cancel_escalations("offer-escalated"), 2u);
+    EXPECT_EQ(reopened.max_cancel_escalation_fee("offer-unescalated"), 0ULL)
+        << "only cancel_escalation_N events set the floor";
+    EXPECT_EQ(reopened.max_cancel_escalation_fee("offer-never-logged"), 0ULL);
+}
+
+// A row persisted straight into cancel_pending -- a boot orphan whose cancel
+// was accepted, an offer post_quotes already retracted -- takes its cause
+// from the first mark, and later marks still keep it.
+TEST(DatabaseTest, AnInsertedCancelPendingRowTakesItsFirstCause)
+{
+    TempDbPath temp_db{"xop_s14_inserted"};
+    const std::string offer_id = "offer-s14-inserted";
+
+    {
+        xop::Database db(temp_db.path().string());
+        auto offer = make_offer(offer_id);
+        offer.status = xop::kOfferStatusCancelPending;
+        db.insert_offer(offer);
+        db.mark_offer_cancel_submitted(offer_id, 9285386, "startup_orphan");
+        db.mark_offer_cancel_submitted(offer_id, 9285482, "cancel_escalation_1");
+    }
+
+    sqlite3* raw_db = open_db(temp_db.path());
+    const OfferRow row = query_offer_row(raw_db, offer_id);
+    sqlite3_close(raw_db);
+    EXPECT_EQ(row.status, "cancel_pending");
+    EXPECT_EQ(row.cancel_reason, "startup_orphan");
+    EXPECT_EQ(row.resolved_block, 0u);
+}
+
+TEST(OfferStatusMapping, RestoredCancelPendingRowsStayCancelPending)
+{
+    auto rec = make_offer("offer-map");
+    rec.status        = "cancel_pending";
+    rec.side          = "bid";
+    rec.tier          = 2;
+    rec.fee_mojos     = 777;
+    rec.created_block = 9224185;
+
+    const xop::PendingOffer po = xop::pending_offer_from_db(rec);
+    EXPECT_TRUE(po.cancel_pending)
+        << "restored live, Step 8 would re-cancel it blind and pay again";
+    EXPECT_EQ(po.offer_id, "offer-map");
+    EXPECT_EQ(po.pair_name, "XCH/DBX");
+    EXPECT_EQ(po.side, xop::Side::Bid);
+    EXPECT_EQ(po.price, rec.price_mojos);
+    EXPECT_EQ(po.size, rec.size_mojos);
+    EXPECT_EQ(static_cast<int>(po.tier), 2);
+    EXPECT_EQ(po.created_at_block, 9224185u);
+    EXPECT_EQ(po.fee_mojos, 777u);
+
+    rec.status = "pending";
+    EXPECT_FALSE(xop::pending_offer_from_db(rec).cancel_pending);
+
+    // One spelling across the DB layer and the escalation header.
+    EXPECT_EQ(std::string{xop::kOfferStatusCancelPending},
+              std::string{xop::execution::kDbStatusCancelPending});
+    EXPECT_EQ(std::string{xop::kOfferStatusPending},
+              std::string{xop::execution::kDbStatusPending});
+}
+
+TEST(OfferStatusMapping, PersistedStatusFollowsTheStateFlag)
+{
+    xop::PendingOffer po{};
+    po.offer_id = "offer-flag";
+    EXPECT_STREQ(xop::db_status_for(po), "pending");
+    po.cancel_pending = true;
+    EXPECT_STREQ(xop::db_status_for(po), "cancel_pending");
 }

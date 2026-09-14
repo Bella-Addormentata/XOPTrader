@@ -327,10 +327,14 @@ class _DatabaseWorker(QObject):
             SELECT
                 COUNT(*)                                                          AS total,
                 COALESCE(SUM(CASE WHEN status = 'pending'   THEN 1 ELSE 0 END), 0) AS pending,
+                COALESCE(SUM(CASE WHEN status = 'cancel_pending'
+                                  THEN 1 ELSE 0 END), 0)                           AS cancel_pending,
                 COALESCE(SUM(CASE WHEN status = 'filled'    THEN 1 ELSE 0 END), 0) AS filled,
                 COALESCE(SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END), 0) AS cancelled,
                 COALESCE(SUM(CASE WHEN status = 'expired'   THEN 1 ELSE 0 END), 0) AS expired,
-                COALESCE(SUM(CASE WHEN status = 'pending'
+                -- [S14] A cancel_pending offer still locks its coins, and can
+                -- still be taken, until the wallet reports it terminal.
+                COALESCE(SUM(CASE WHEN status IN ('pending', 'cancel_pending')
                                   THEN size_mojos ELSE 0 END), 0)                  AS locked_mojos
             FROM offer_log
         """
@@ -690,7 +694,9 @@ class _DatabaseWorker(QObject):
         """Aggregate resting (pending) offers into per-asset offered amounts.
 
         [DEPLOYED 2026-08-04] Feeds the Balances tab's "Deployed %" column.
-        For each ``offer_log`` row with status='pending' on pair BASE/QUOTE:
+        For each ``offer_log`` row with status 'pending' or 'cancel_pending'
+        (a submitted cancel still locks its coins until it confirms) on pair
+        BASE/QUOTE:
 
         - an ASK locks the BASE asset: ``size_mojos`` base-asset mojos;
         - a BID locks the QUOTE asset: the engine pseudo-price is
@@ -722,7 +728,7 @@ class _DatabaseWorker(QObject):
                                 * CAST(price_mojos AS REAL)), 0.0) AS size_price_sum,
                    COUNT(*)                                        AS offer_count
             FROM offer_log
-            WHERE status = 'pending'
+            WHERE status IN ('pending', 'cancel_pending')
             GROUP BY pair_name, side
         """
         rows = self._execute_query(sql, [])
@@ -1089,7 +1095,8 @@ class _DatabaseWorker(QObject):
                 COALESCE(SUM(CASE WHEN status = 'filled'    THEN 1 ELSE 0 END), 0) AS filled,
                 COALESCE(SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END), 0) AS cancelled,
                 COALESCE(SUM(CASE WHEN status = 'expired'   THEN 1 ELSE 0 END), 0) AS expired,
-                COALESCE(SUM(CASE WHEN status = 'pending'   THEN 1 ELSE 0 END), 0) AS pending
+                COALESCE(SUM(CASE WHEN status IN ('pending', 'cancel_pending')
+                                  THEN 1 ELSE 0 END), 0)                          AS pending
             FROM offer_log
         """
         rows = self._execute_query(offer_sql, [])

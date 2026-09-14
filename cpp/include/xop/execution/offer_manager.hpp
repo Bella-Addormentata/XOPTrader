@@ -53,6 +53,7 @@
 #include "xop/execution/coin_lock_ledger.hpp"
 #include "xop/execution/offer_expiry.hpp"
 #include "xop/execution/take_retry.hpp"
+#include "xop/execution/terminal_recheck.hpp"
 #include <spdlog/spdlog.h>
 
 #include <chrono>
@@ -195,27 +196,8 @@ struct RebalanceSnapshot {
  *   6. Cancel stale offers (block-based TTL) or all offers on shutdown.
  *   7. Evaluate rebalancing triggers and return them to the engine.
  */
-/// [S25 2026-08-24] Verdict from OfferManager::recheck_terminal().
-enum class TerminalRecheck {
-    /// Wallet still reports CANCELLED/FAILED -- the buffered cancellation
-    /// may be written.
-    StillTerminal,
-    /// Wallet reports a recognised PENDING state again.  The offer has
-    /// been re-adopted into State by recheck_terminal; discard the
-    /// buffered write.
-    Revived,
-    /// Wallet reports CONFIRMED -- the observation was reorged into a
-    /// FILL.  recheck_terminal has put the offer back into State so
-    /// detect_fills() can record it; the caller must NOT write a
-    /// cancellation.
-    Confirmed,
-    /// Wallet unreachable, or its status is one this build does not
-    /// recognise.  NOT a verdict: the caller must retry rather than
-    /// assume any of the above.  An unknown code is specifically NOT
-    /// treated as "live" -- that would discard a one-way cancellation on
-    /// no evidence.
-    NoVerdict,
-};
+// TerminalRecheck, the verdict recheck_terminal() returns, is defined in
+// execution/terminal_recheck.hpp [review 2026-09-13, round 2].
 
 class OfferManager {
 public:
@@ -439,12 +421,34 @@ public:
         /// nothing to put in `failed`, and an empty `failed` read as success
         /// everywhere downstream. See CancelAttemptOutcome::sweep_refused.
         bool                     sweep_refused{false};
+        /// [review 2026-09-13, round 2] True when the wallet-wide sweep FAILED
+        /// AFTER IT MAY HAVE REACHED THE WALLET -- a timeout, an empty or
+        /// broken reply, an HTTP 5xx (rpc::cancel_possibly_submitted) -- so the
+        /// wallet may have run it, may still be running it, or may never have
+        /// received it.
+        ///
+        /// cancel_all then sends NOTHING more: every tracked id is in
+        /// `failed`, and no per-offer cancel goes out, because in chia 2.7.4 a
+        /// per-offer cancel queued behind a sweep that is still running builds
+        /// a second, conflicting spend of an offer the sweep already
+        /// cancelled.  The caller waits at least one request timeout and
+        /// re-checks each offer (execution::partition_rechecked_offer) before
+        /// it cancels any.
+        ///
+        /// HOW IT DIFFERS FROM sweep_refused.  A refusal is an ANSWER: the
+        /// sweep did not run, and sending it again at once is safe.  This is
+        /// the absence of one, and sending again at once is the duplicate.
+        /// Both leave the untracked wallet book unproven, and neither is ever
+        /// all_cancelled(): with an EMPTY local book this flag is the only
+        /// field that says anything went wrong.  cancel_all never sets both.
+        bool                     bulk_possibly_submitted{false};
 
         [[nodiscard]] bool all_cancelled() const noexcept
         {
             // [S33 2026-09-12] A refused wallet-wide sweep is NOT "all
             // cancelled" merely because it named no ids to fail.
-            return failed.empty() && !sweep_refused;
+            // [review 2026-09-13, round 2] Nor is one that got no answer.
+            return failed.empty() && !sweep_refused && !bulk_possibly_submitted;
         }
     };
 
@@ -493,6 +497,12 @@ public:
      * to guarantee all locked coins are released on-chain.  Falls back to a
      * per-offer loop when the bulk call is refused.
      *
+     * [review 2026-09-13, round 2] But NOT when it failed after it may have
+     * reached the wallet (rpc::cancel_possibly_submitted): then nothing more
+     * is sent, every tracked id is returned in `failed`, and
+     * CancelOutcome::bulk_possibly_submitted tells the caller to wait and
+     * re-check each offer before it cancels any.
+     *
      * @param deadline Passed through to the per-offer fallback loop. The
      *        fallback is not a rare path -- it is the one the 2026-09-02
      *        incident actually took, because the bulk endpoint was refused
@@ -533,11 +543,34 @@ public:
      *        at which point the watchdog fires a SECOND concurrent bulk
      *        cancel over the same offers. The overrun happens INSIDE one
      *        call, so only a mid-loop deadline can bound it.
+     *
+     *        [BULKCANCEL-B 2026-09-13] cancel_offer is no longer re-sent
+     *        after a timeout (rpc/rpc_retry_policy.hpp), so against a hanging
+     *        wallet one call now costs one request_timeout, ~30 s, not ~123 s,
+     *        and the same 7-offer book ~210 s. That is still past the 90 s
+     *        budget, so the deadline still binds.
      */
     asio::awaitable<CancelOutcome> cancel_ids(
         const std::vector<std::string>& offer_ids,
         std::chrono::steady_clock::time_point deadline =
             std::chrono::steady_clock::time_point::max());
+
+    /**
+     * @brief [S14 2026-09-13] One SECURE re-cancel of an offer whose cancel
+     *        the chain proves never landed, at an explicit fee.
+     *
+     * The cancel escalation's only wallet write.  Deliberately NOT routed
+     * through emergency_cancel: its last resort is an insecure local cancel,
+     * which flips the wallet record to CANCELLED while the maker coins stay
+     * spendable, so the escalation would read "resolved by wallet" off its
+     * own fallback.  The fee goes through cancel_offer_charged so the cycle
+     * ledger is charged like every other cancel.
+     *
+     * @return nullopt when the wallet accepted the cancel; otherwise the
+     *         verbatim RPC error text (for classify_take_failure).
+     */
+    asio::awaitable<std::optional<std::string>> recancel_secure(
+        const std::string& trade_id, std::uint64_t fee);
 
     // -- Selective refresh --------------------------------------------------
 
@@ -671,6 +704,15 @@ public:
     /// multiple times; only the first call performs the RPC query.
     asio::awaitable<void> ensure_wallet_ids();
 
+    /// [PRUNE-SCOPE 2026-09-13] True once the asset-to-wallet-ID cache has
+    /// been built from get_wallets().  ensure_wallet_ids() leaves it false
+    /// when that RPC fails, and resolve_wallet_id() then answers -1 for every
+    /// CAT -- which does NOT mean the wallet holds no such asset.
+    [[nodiscard]] bool wallet_ids_resolved() const noexcept
+    {
+        return wallet_ids_resolved_;
+    }
+
     // -- Dynamic fee control ------------------------------------------------
 
     /// Set the per-transaction fee used by subsequent post_quotes(),
@@ -797,6 +839,33 @@ public:
     {
         return db_leg_;
     }
+
+    /// [S14 2026-09-13] A wallet trade record the startup scan found in
+    /// PENDING_CANCEL, kept whole so boot can adopt it without another RPC.
+    struct WalletPendingCancelRecord {
+        std::string    trade_id{};
+        nlohmann::json record{};
+    };
+
+    /// PENDING_CANCEL records seen by the most recent startup_reconcile()
+    /// (cleared at its start, at most kMaxStartupPendingCancelRecords).  The
+    /// scan used to keep PENDING_ACCEPT only, so a trade whose cancel never
+    /// landed -- still takeable -- was invisible to the whole engine.
+    [[nodiscard]] const std::vector<WalletPendingCancelRecord>&
+    last_wallet_pending_cancel() const noexcept
+    {
+        return wallet_pending_cancel_;
+    }
+
+    /// Bound on the records above.  Boot adopts them by parsing the record,
+    /// with no RPC per id, so the bound is about memory and log volume.
+    static constexpr std::size_t kMaxStartupPendingCancelRecords = 256;
+
+    /// [S14] Put a wallet PENDING_CANCEL record into State -- parsed, else
+    /// minimal metadata -- unless it is already tracked, then mark it
+    /// cancel_pending.  No RPC.
+    void adopt_wallet_pending_cancel(const WalletPendingCancelRecord& pending,
+                                     BlockHeight                      current_block);
 
     /// Hard cap on get_offer() probes in one startup_reconcile(). A stale-row
     /// cluster can be large (40 rows on 2026-08-25, the oldest 17 days old)
@@ -1042,6 +1111,16 @@ private:
     /// startup_reconcile().  See last_db_leg().
     StartupDbLeg db_leg_;
 
+    /// [S14] See last_wallet_pending_cancel().
+    std::vector<WalletPendingCancelRecord> wallet_pending_cancel_{};
+
+    /// [S14] Put a wallet trade record into State: parsed when possible,
+    /// otherwise with minimal metadata so its coins are not locked
+    /// invisibly.  Returns true when the record parsed.  No RPC.
+    bool adopt_wallet_record(const std::string&    trade_id,
+                             const nlohmann::json& record,
+                             BlockHeight           current_block);
+
     /// Probe-only admission mirror of xch_ledger_admits, run against a
     /// COPY of the cycle ledger by the ladder preflight: same charges,
     /// no logging, no flag side effects.
@@ -1076,9 +1155,10 @@ private:
                                                bool               secure);
     /// [BULKCANCEL 2026-09-11] `n_offers` is not cosmetic.  The wallet
     /// charges batch_fee ONCE PER BATCH, so a bulk cancel of n offers really
-    /// spends batch_fee * ceil(n / kCancelOffersBatchSize).  Reserving a
-    /// single fee under-reserves XCH, which is the 2026-08-23 zero-spendable
-    /// incident's exact shape.
+    /// spends batch_fee * ceil(n / kCancelOffersSingleBatchSize) -- ONE batch
+    /// for any book of up to that many offers [BULKCANCEL-B 2026-09-13].
+    /// Reserving one fee for a sweep that spans batches under-reserves XCH,
+    /// which is the 2026-08-23 zero-spendable incident's exact shape.
     asio::awaitable<json> cancel_offers_charged(std::uint64_t fee,
                                                 bool          secure,
                                                 std::int64_t  n_offers);
