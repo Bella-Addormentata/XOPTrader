@@ -704,7 +704,7 @@ private:
     ///  3. Update volatility, PIN, regime estimates
     ///  4. Compute optimal quotes (A-S / GLFT)
     ///  5. Apply spread optimizer adjustments
-    ///  6. Apply risk limits (inventory, Kelly, no-loss)
+    ///  6. Apply risk limits (no-loss floor, concentration, CAT and pair caps)
     ///  7. Generate multi-tier offer ladder
     ///  8. Cancel stale offers, post new ones
     ///  9. Check arbitrage opportunities
@@ -750,7 +750,8 @@ private:
     void step_apply_spread_optimizer(BlockHeight block_height);
 
     /// Step 6: Apply pre-trade risk checks (never-sell-at-loss, inventory
-    /// limits, Kelly sizing, CAT concentration cap).
+    /// concentration limits, single-CAT cap, pair-capital cap).  No Kelly
+    /// sizing: InventoryTracker::compute_kelly_size has no production caller.
     void step_apply_risk_limits(BlockHeight block_height);
 
     /// Step 7: Expand the risk-filtered quotes into a multi-tier offer
@@ -1829,6 +1830,13 @@ private:
     /// re-warn on every heartbeat for the life of the process.
     std::set<std::string> activity_range_warned_;
 
+    /// [STEP6-CAUSE 2026-09-13] One no-quote warn gate per pair.  Step 6's
+    /// no-quote warn used to fire on every heartbeat -- 556 XCH/BYC lines
+    /// between the 2026-09-12 23:24 restart and 04:45, about 106 an hour.
+    /// Process-local on purpose: it suppresses a log line, never a quoting
+    /// decision.
+    std::unordered_map<std::string, LimitBlockWarnGate> step6_no_quote_warn_gates_;
+
     /// [S19 review round 11] Whether the bridge scan can currently act
     /// as the bridge asset's inventory maintainer.  The Step 8 recovery
     /// seed and Step 11 one-shot reconcile exclude the asset ONLY while
@@ -1914,7 +1922,9 @@ private:
         QuoteResult   raw_quote{};          ///< Output of strategy.
         SpreadResult  spread_result{};      ///< Output of spread optimizer.
         Quote         risk_quote{};         ///< After risk filter.
-        bool          quote_valid{false};   ///< False if risk killed both sides.
+        bool          quote_valid{false};   ///< False once a step drops the pair this cycle;
+                                            ///< at Step 6, both sizes zero after the limits
+                                            ///< (one may be the strategy's own 0).
         std::vector<TierQuote> ladder;      ///< Multi-tier expansion.
 
         // [T3-24] Dependency-aware gating: set to true only when Step 1
@@ -1968,6 +1978,15 @@ private:
         // 0 until Step 5 runs compute_spread() for this pair this cycle;
         // consumers treat 0 as "no reading" rather than as 1.0x.
         double        spread_base_bps{0.0};
+
+        // [STEP6-CAUSE 2026-09-13] Step 4's inventory input and the q_max
+        // the pair's strategy was built with (effective_q_max).  Avellaneda
+        // sizes bid = q_max*max(0, 1-q/q_max) from TOTAL base holdings
+        // (avellaneda.cpp:268-270), so Step 6 prints both when it explains a
+        // zero side.  Both stay 0 until Step 4 quotes the pair; cycle_ is
+        // rebuilt every heartbeat.
+        double        strategy_q{0.0};
+        double        strategy_q_max{0.0};
     };
 
     /// Per-pair cycle state for the current block.

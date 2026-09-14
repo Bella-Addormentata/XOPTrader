@@ -702,7 +702,7 @@ Engine::Engine(const AppConfig& config, bool dry_run)
         AvellanedaConfig as_strat_cfg;
         as_strat_cfg.gamma = pair.gamma_override.value_or(config_.strategy.gamma);
         as_strat_cfg.kappa = pair.kappa_override.value_or(config_.strategy.kappa);
-        as_strat_cfg.q_max = pair.q_max_override.value_or(config_.strategy.q_max);
+        as_strat_cfg.q_max = effective_q_max(pair, config_.strategy);
         as_strat_cfg.min_margin_bps =
             pair.min_profit_margin_bps_override.value_or(
                 config_.strategy.min_profit_margin_bps);
@@ -2403,7 +2403,7 @@ asio::awaitable<void> Engine::poll_loop_coro()
                     // real mojos held.
                     inventory_->seed_position(AssetId{aid}, seed_qty,
                                               Mojo{1});
-                    // Also seed State positions so that apply_limits()
+                    // Also seed State positions so that evaluate_limits()
                     // has accurate balances from the start (not just
                     // from detected fills).
                     state_->record_buy(AssetId{aid}, seed_qty, Mojo{1});
@@ -5668,9 +5668,10 @@ void Engine::step_compute_quotes(BlockHeight block_height)
         if (config_.strategy.sigma_floor > 0.0) {
             sigma = std::max(sigma, config_.strategy.sigma_floor);
         }
-        // Compute inventory (signed net position in the pair's base asset).
-        // Convert from mojos to base-asset display units so that q and q_max
-        // are in the same units (T1-12 fix: prevents ~10^12 ratio error).
+        // q is the WHOLE holding of the pair's base asset, not a signed
+        // per-pair position or a gap from a target: net_inventory returns the
+        // asset's total_quantity (>= 0), so sizing sees the entire balance.
+        // In display units like q_max (T1-12 fix: prevents ~10^12 ratio error).
         double q = static_cast<double>(
             inventory_->net_inventory(AssetId{pair_cfg->base_asset_id}))
             / static_cast<double>(pair_cfg->base_mojos_per_unit);
@@ -5707,9 +5708,24 @@ void Engine::step_compute_quotes(BlockHeight block_height)
         pcs.raw_quote = strategy.compute_quotes(mid, sigma, q, block_height);
         pcs.quote_valid = true;  // Mark as valid for steps 5-8.
 
-        spdlog::debug("[Engine] Step 4: {} bid={:.6f} ask={:.6f} spread={:.1f}bps",
+        // [STEP6-CAUSE 2026-09-13] Keep q and the q_max this pair's strategy
+        // was built with.  Avellaneda sizes the bid from TOTAL base holdings
+        // (net_inventory returns total_quantity, inventory.cpp:273-277), so
+        // once the wallet holds more than q_max base units the bid is 0
+        // before any risk limit runs -- live XCH/BYC: 24.57 XCH against
+        // q_max 20.  The debug line below reaches only logs/xop_trader.log
+        // (engine.log captures the console sink, which is info-level unless
+        // --verbose, main.cpp:330), which is why Step 6 carries q and q_max
+        // into its own lines.
+        pcs.strategy_q     = q;
+        pcs.strategy_q_max = effective_q_max(*pair_cfg, config_.strategy);
+
+        spdlog::debug("[Engine] Step 4: {} bid={:.6f} ask={:.6f} spread={:.1f}bps "
+                      "bid_size={:.6f} ask_size={:.6f} q={:.6f} q_max={:.6f}",
                       pair_name, pcs.raw_quote.bid_price,
-                      pcs.raw_quote.ask_price, pcs.raw_quote.spread_bps);
+                      pcs.raw_quote.ask_price, pcs.raw_quote.spread_bps,
+                      pcs.raw_quote.bid_size, pcs.raw_quote.ask_size,
+                      pcs.strategy_q, pcs.strategy_q_max);
     }
 }
 
@@ -6232,7 +6248,10 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
     }
 }
 
-// Step 6: Apply risk limits (inventory, Kelly, no-loss).
+// Step 6: Apply risk limits (inventory-aging relief and the no-loss ask floor,
+// the optional loss manager / circuit breaker, then concentration, single-CAT
+// cap and pair-capital cap via PreTradeCheck::evaluate_limits).  No Kelly
+// sizing runs here.
 void Engine::step_apply_risk_limits(BlockHeight block_height)
 {
     for (auto& [pair_name, pcs] : cycle_) {
@@ -6604,41 +6623,58 @@ void Engine::step_apply_risk_limits(BlockHeight block_height)
             }
         }
 
-        // Apply inventory limits, Kelly sizing, CAT cap.
-        auto checked = pre_trade_->apply_limits(
-            quote, pair_name,
+        // [STEP6-CAUSE 2026-09-13] Concentration, single-CAT cap and
+        // pair-capital cap.  evaluate_limits runs the same arithmetic as
+        // apply_limits (which now delegates to it) and also records, per
+        // side, which rule lowered or zeroed it.  The old warn printed
+        // pair-level breach flags from get_limit_status and called BOTH zero
+        // sides "blocked by risk limits" when the live XCH/BYC bid was the
+        // strategy's own 0 (q=24.57 >= q_max=20) and only the ask was cut,
+        // to 0 by the CAT cap's full block.
+        const LimitsDecision limits_decision = pre_trade_->evaluate_limits(
+            quote,
             AssetId{pair_cfg->base_asset_id},
             AssetId{pair_cfg->quote_asset_id},
             *state_);
 
-        if (checked) {
-            pcs.risk_quote  = *checked;
+        if (limits_decision.has_quote) {
+            pcs.risk_quote  = limits_decision.quote;
             pcs.quote_valid = true;
+
+            // Repeats of the no-quote warn are rate-limited, so the warn
+            // going quiet no longer means the pair quotes again: say so, once
+            // per warn.
+            const auto gate_it = step6_no_quote_warn_gates_.find(pair_name);
+            if (gate_it != step6_no_quote_warn_gates_.end()
+                && gate_it->second.should_log_recovery()) {
+                spdlog::info("[Engine] {}",
+                             format_step6_quote_resumed(
+                                 pair_name, gate_it->second.last_warn_height(),
+                                 kLimitBlockWarnReminderBlocks));
+            }
+
+            if (side_zero_cause(limits_decision.trace.bid) != SideZeroCause::NotZero
+                || side_zero_cause(limits_decision.trace.ask) != SideZeroCause::NotZero) {
+                spdlog::debug("[Engine] Step 6: {} -- one-sided after limits: {}",
+                              pair_name,
+                              describe_limits_block(limits_decision.trace,
+                                                    pair_cfg->base_mojos_per_unit,
+                                                    pcs.strategy_q,
+                                                    pcs.strategy_q_max));
+            }
         } else {
             pcs.quote_valid = false;
-            const auto limits = pre_trade_->get_limit_status(
-                AssetId{pair_cfg->base_asset_id},
-                AssetId{pair_cfg->quote_asset_id},
-                *state_);
-
-            spdlog::warn(
-                "[Engine] Step 6: {} -- both sides blocked by risk limits "
-                "(base_conc={:.3f} soft_breach={} hard_breach={} "
-                "cat_pct={:.3f} cat_breach={} pair_pct={:.3f} "
-                "pair_breach={} cfg_soft={:.3f} cfg_hard={:.3f} "
-                "cfg_cat={:.3f} cfg_pair={:.3f})",
-                pair_name,
-                limits.base_concentration,
-                limits.soft_limit_breached,
-                limits.hard_limit_breached,
-                limits.cat_portfolio_pct,
-                limits.cat_cap_breached,
-                limits.pair_capital_pct,
-                limits.pair_cap_breached,
-                config_.risk.soft_limit_pct,
-                config_.risk.hard_limit_pct,
-                config_.risk.single_cat_cap_pct,
-                config_.risk.max_capital_per_pair_pct);
+            const std::string no_quote_line = format_step6_no_quote(
+                pair_name, limits_decision.trace, pair_cfg->base_mojos_per_unit,
+                pcs.strategy_q, pcs.strategy_q_max, config_.risk,
+                kLimitBlockWarnReminderBlocks);
+            if (step6_no_quote_warn_gates_[pair_name].should_warn(
+                    limit_block_signature(limits_decision.trace), block_height,
+                    kLimitBlockWarnReminderBlocks)) {
+                spdlog::warn("[Engine] {}", no_quote_line);
+            } else {
+                spdlog::debug("[Engine] {} [repeat]", no_quote_line);
+            }
         }
     }
 }
