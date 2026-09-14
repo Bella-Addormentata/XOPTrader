@@ -211,9 +211,13 @@ struct FairValue {
 // aggregated mid: the aggregated mid may already blend a CEX reference, and
 // feeding that back into a solve anchored on the same CEX feed would double
 // count it.  The solve wants the raw market observation and nothing else.
+//
+// "Raw" there means unblended, NOT the raw ticker: has_book requires the BBO
+// to have come from the filtered third-party book (PairState::
+// bbo_from_filtered_book).  The ticker includes our own offers.
 // ---------------------------------------------------------------------------
 struct FairValueObservation {
-    bool         has_book{false};   // Two-sided third-party book exists.
+    bool         has_book{false};   // Two-sided FILTERED third-party book.
     double       mid{0.0};          // (best_bid + best_ask) / 2.
     double       spread_bps{0.0};   // Width of that book.
     std::int32_t print_age{0};      // Heartbeats since the mid last moved.
@@ -633,7 +637,8 @@ struct PairState {
     // ingest, CLEARED by the raw one.  Without it, a throwing offers fetch
     // lets the bot read its own quotes back as third-party evidence --
     // confirming the very band breach it should refuse, and marking equity
-    // on it.
+    // on it.  Required by book_evidence_fresh(), apply_mid_gate(),
+    // get_fair_value_inputs() and refresh()'s published spread_bps.
     bool        bbo_from_filtered_book{false};
 
     // [S20 2026-08-24] ...and whether that filtering ran against an
@@ -905,7 +910,9 @@ public:
     double get_mid_price(const std::string& pair_name) const;
 
     /// Current spread in basis points for a pair.
-    /// Returns 0.0 if the pair is unknown or has no quotes.
+    /// Returns 0.0 if the pair is unknown or has no quotes -- and when the
+    /// current BBO is the raw ticker's rather than the filtered book's
+    /// (PairState::bbo_from_filtered_book), which includes our own offers.
     double get_spread_bps(const std::string& pair_name) const;
 
     /// Rolling 24-hour volume in base asset units.
@@ -963,7 +970,8 @@ public:
 
     /// Raw book inputs the fair-value solve needs, fetched under one lock.
     /// Returns a default-constructed value (has_book == false) for an unknown
-    /// pair or one with no two-sided third-party book.
+    /// pair or one with no two-sided third-party book -- including a pair
+    /// whose current BBO is the raw ticker's, not the filtered book's.
     FairValueObservation get_fair_value_inputs(
         const std::string& pair_name) const;
 

@@ -419,8 +419,22 @@ void MarketDataFeed::refresh(const std::vector<std::string>& enabled_pairs) {
         // triangular-arb scan all at once.
         apply_mid_gate(ps, sweep_cfg);
 
-        // Step 5: Compute spread.
-        ps.spread_bps = compute_spread_bps(ps.dex_best_bid, ps.dex_best_ask);
+        // Step 5: Compute spread -- of the FILTERED book only.
+        //
+        // [PR #159] A raw ticker BBO (bbo_from_filtered_book false: the
+        // offers fetch failed this heartbeat, or competitor tracking is off)
+        // includes our own resting offers.  Until #159 its sides were read
+        // backwards, so an ordinary raw book looked crossed and this was 0.
+        // Read correctly it would publish that self-inclusive width to every
+        // spread_bps reader -- metrics and the snapshots table, the
+        // spread-widening alert, the startup analyzer, the market allocator,
+        // market-cross eligibility and the cross-stable arb cost.  0 is what
+        // each of them already reads as "no two-sided third-party book".
+        // apply_mid_gate measures the book's own width separately, so its
+        // coherence test is unaffected.
+        ps.spread_bps = ps.bbo_from_filtered_book
+            ? compute_spread_bps(ps.dex_best_bid, ps.dex_best_ask)
+            : 0.0;
 
         // Step 6: Detect staleness.
         //         A pair is stale if BOTH dex and cex timestamps are stale
@@ -941,7 +955,20 @@ FairValueObservation MarketDataFeed::get_fair_value_inputs(
     // Post-5e1ceb4 a side is 0.0 when no THIRD-PARTY offer rests there, so a
     // missing side means there is no external market to observe -- not that
     // the price is zero.  One-sided books contribute no edge to the solve.
-    if (ps.dex_best_bid > 0.0 && ps.dex_best_ask > 0.0
+    //
+    // [PR #159] And only the FILTERED book is that market.  When the offers
+    // fetch fails, or competitor tracking is off, dex_best_bid/ask hold the
+    // raw ticker, which includes our own resting offers.  Until #159 that
+    // ticker's sides were read backwards, so an ordinary raw book failed the
+    // ask >= bid test below and was excluded by accident; read correctly it
+    // passes, and the solve (Engine::update_fair_values) and the quote-centre
+    // blend (Engine::step_generate_ladder) would take our own quotes as
+    // independent evidence.  Provenance is the conjunct book_evidence_fresh()
+    // and apply_mid_gate() already require.  Their recency and movement
+    // conjuncts are deliberately NOT added: the solve prices a frozen book
+    // through print_age, and requiring them would change the filtered path.
+    if (ps.bbo_from_filtered_book
+        && ps.dex_best_bid > 0.0 && ps.dex_best_ask > 0.0
         && ps.dex_best_ask >= ps.dex_best_bid) {
         out.has_book   = true;
         out.mid        = (ps.dex_best_bid + ps.dex_best_ask) / 2.0;

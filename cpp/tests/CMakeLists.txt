@@ -103,6 +103,7 @@ add_executable(xop_tests
     test_node_sync_state.cpp
     test_dexie_probe_liveness.cpp
     test_dexie_market_ticker.cpp
+    test_raw_ticker_provenance.cpp
     test_selective_repost.cpp
     test_width_floor.cpp
     test_activity_interpolation.cpp
