@@ -1074,10 +1074,14 @@ inline std::vector<std::string> select_resting_above_fair_value(const std::vecto
 // P25 -- the wallet balance refresh's gates and backoff (engine glue inputs)
 // ===========================================================================
 
-/// P25a: refresh_pace_balances sends no wallet RPC unless every gate that
-/// stops Step 8 from posting is open -- the balances only feed a plan that
-/// could not post -- and the wallet has not failed since the last success of
-/// Step 2 or Step 8 (wallet_consecutive_failures == 0).
+/// P25a: refresh_pace_balances sends no wallet RPC unless pace is on, no
+/// engine mode that skips Step 8 is active (dry run, wallet circuit, watchdog,
+/// GUI or breaker pause, cancel-all in flight or draining, flash crash, XCH
+/// recovery) -- the balances only feed a plan that could not post -- and the
+/// wallet has not failed since the last success of Step 2 or Step 8
+/// (wallet_consecutive_failures == 0).  Step 8's own wallet-sync and
+/// fee-budget checks are not inputs: while either holds Step 8 back, the
+/// refresh still runs, bounded by P25c's per-asset backoff.
 [[nodiscard]] constexpr bool pace_refresh_gates_open(const RefreshGates& g) noexcept
 {
     return g.pace_enabled && !g.dry_run && !g.wallet_circuit_open && !g.watchdog_fired
@@ -1087,8 +1091,10 @@ inline std::vector<std::string> select_resting_above_fair_value(const std::vecto
 
 /// P25b: the refresh age h = max(1, max_balance_age_blocks / 2).  An entry
 /// refreshed every h blocks stays fresh, and one failed attempt at age h is
-/// retried at age 2h <= max_age (for max_age >= 2), so a single transient
-/// failure never lets a maintained balance go stale.
+/// retried at age 2h, which is <= max_age when max_age >= 2.  So, for
+/// max_age >= 2 and heartbeats that do not skip heights, a single transient
+/// failure never lets a maintained balance go stale.  With max_age 1, or a
+/// skipped height, one heartbeat may Hold instead, which fails safe.
 [[nodiscard]] constexpr std::uint32_t pace_refresh_age_blocks(std::uint32_t max_balance_age_blocks) noexcept
 {
     return std::max<std::uint32_t>(1u, max_balance_age_blocks / 2u);

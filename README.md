@@ -765,7 +765,7 @@ Key sections to configure before first run:
 | `tier_spacing_bps` | [60, 200, 500, 1000] | Spread per tier in basis points from mid |
 | `tier_size_pct` | [0.30, 0.25, 0.25, 0.20] | Capital fraction allocated to each tier |
 | `cross_pair_skew_phi` | 0.30 | Cross-pair inventory skew coordination strength (0–1.0). When pairs share an asset, skew from other pairs influences quotes. Higher = stronger cross-pair rebalancing |
-| `pace_enabled` | false | Pace controller master switch: sells an overweight CAT quote asset (`pace_assets`) toward its `asset_target_allocations` band through its XCH/asset bids, at a bounded daily budget and never above fair value; the risk limits still apply. Only a live disable applies without a restart, and only if the saved file still says false: a Settings Save writes back the value the GUI last loaded (see `config.example.yaml`) |
+| `pace_enabled` | false | Pace controller master switch: sells an overweight CAT quote asset (`pace_assets`) toward its `asset_target_allocations` band through its XCH/asset bids, at a bounded daily budget and never above fair value; the risk limits still apply. Every change needs a restart, turning it off included: stop the GUI, edit `config.yaml`, check `git diff config.yaml`, then restart. A live disable from the GUI is not supported (see `config.example.yaml`) |
 | `pace_assets` | [] | CAT symbols to pace, never XCH; every enabled pair touching one must be XCH/asset. The other `pace_*` keys are documented in `config.example.yaml` |
 | `pace_horizon_blocks` | 64512 | Horizon in peak blocks (14 days): daily budget = (excess + amount reduced in the horizon) x 4608 / horizon |
 

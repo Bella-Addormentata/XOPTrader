@@ -3659,7 +3659,7 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
     // is already applied.  A failed evaluation leaves every plan inert for
     // this heartbeat (the latch is kept) and clears the remaining budget, so
     // Step 9f refuses spends of an Active asset.  refresh_pace_balances checks
-    // every posting gate itself (P25), before any wallet RPC.
+    // P25's gates (the engine modes that skip Step 8) itself, before any RPC.
     if (config_.strategy.pace_enabled) {
         try { co_await refresh_pace_balances(block_height); }
         catch (const std::exception& e) {
@@ -6323,11 +6323,16 @@ std::optional<std::string> Engine::pace_asset_id_for_key(const std::string& key)
 
 asio::awaitable<void> Engine::refresh_pace_balances(BlockHeight block_height)
 {
-    // [PACE round 2] No wallet RPC while any gate that stops Step 8 from
-    // posting is closed (the balances only feed a plan that could not post),
-    // nor while the wallet has failed since Step 2's or Step 8's last success:
-    // pace must not add timeouts to a wallet brown-out ahead of Step 6.  The
-    // decision is the pure header's (P25).
+    // [PACE round 2] No wallet RPC while an engine mode that skips Step 8 is
+    // active (the balances only feed a plan that could not post), nor while
+    // wallet_consecutive_failures_ > 0.  Step 8's own wallet-sync and
+    // fee-budget checks are not among these gates, so the refresh still runs
+    // while either holds Step 8 back.  Nor do the gates keep pace out of a
+    // wallet brown-out: wallet_consecutive_failures_ rarely rises in one,
+    // because detect_fills catches RPC errors and Step 8's sync check catches
+    // and returns.  What bounds the load pace adds is the per-asset backoff
+    // below -- at most one balance RPC per asset per refresh age, whatever the
+    // outcome.  The decision is the pure header's (P25).
     strategy::pace::RefreshGates pace_gates{};
     pace_gates.pace_enabled                = config_.strategy.pace_enabled;
     pace_gates.dry_run                     = dry_run_;

@@ -489,13 +489,19 @@ strategy:
   # a target and a tolerance > 0 and must not be XCH; every ENABLED pair
   # touching it must be XCH/<asset> (base xch) and not a stablecoin pair;
   # pace_max_fair_value_sigma_bps <= fair_value_max_sigma_bps; and
-  # market_data.cex_freshness_threshold_sec must be finite and > 0.  Restart
-  # required, except that pace_enabled: false applies live -- but only if the
-  # file the engine re-reads still says false.  A Settings Save writes back the
-  # strategy values the GUI last LOADED, so a disk edit followed by a Save turns
-  # pace back on.  Either stop the GUI, edit, check `git diff config.yaml` and
-  # restart; or edit, then Settings > Load this same file, then Save.  Block
-  # counts are PEAK heights (4,608 per day).
+  # market_data.cex_freshness_threshold_sec must be finite and > 0.  Every pace
+  # change needs a restart, turning pace off included: stop the GUI (closing it
+  # stops the engine it launched; stop any engine it did not launch as well),
+  # edit this file, check `git diff config.yaml`, then restart.  Edit only with
+  # the GUI stopped: a Settings Save rewrites the file from what the GUI last
+  # loaded, so a key changed on disk meanwhile reverts and a key added
+  # meanwhile is deleted.  A live disable from the GUI is NOT supported: after
+  # Settings > Load, Save stays disabled until a setting is edited, so no
+  # reload reaches the engine, and `git diff` shows false while pace stays on.
+  # If a live disable is ever attempted through a real Settings edit plus Save,
+  # only the engine log line "[RELOAD] pace controller DISABLED live" confirms
+  # it, never `git diff`.  In dry run pace stays DataUnavailable (no balance
+  # refresh runs).  Block counts are PEAK heights (4,608 per day).
   # pace_enabled: false                  # [OPTIONAL, default: false] master switch
   # pace_assets: []                      # [OPTIONAL, default: []] CAT symbols, e.g. [BYC]; never XCH
   # pace_horizon_blocks: 64512           # [OPTIONAL, default: 64512 = 14 days] [4608, 414720]

@@ -824,6 +824,13 @@ has to be true before it runs.
 - **Not fixed in PR #160:** the recording is shared by every taker path and its other readers; a synthetic unique id (for example `unknown-<counterparty offer id>`) changes what those readers see.
 - **Status:** `[ ]` -- OPEN.
 
+### S59: a resting pace bid above fair value is cancelled the first time it is seen there, with no age or hysteresis guard
+- **Files:** `cpp/include/xop/strategy/pace_controller.hpp` (P26 `select_resting_above_fair_value`, pace_controller.hpp:1017-1038 at 0f893a8), `cpp/src/engine.cpp` (`step_enforce_pace_caps`, reason `pace_above_fv`, engine.cpp:10579 at 0f893a8)
+- **Found 2026-09-14 (PR #160 round-2 re-verification):** P26 selects every resting bid of a managed, non-hold pace plan priced above the plan's fair value, and Step 8 cancels it on that heartbeat. There is no minimum offer age and no band.
+- **Why it matters:** at the defaults it cannot flap. A pace bid is posted at or below floor(FV x (1 - edge)), with edge = max(`pace_min_edge_bps`, `pace_edge_sigma_mult` x sigma), so it starts at least 50 bps below the fair value it was posted against (172 bps live), and only a fair-value drop of about that size puts it above. An operator can configure a near-zero edge (`pace_min_edge_bps` close to 0 with `pace_edge_sigma_mult: 0`). A bid then sits within fair-value noise of the bound, and each swing below it costs a fee-paying cancel and a repost.
+- **Not fixed in PR #160:** pace defaults off, and the defaults cannot trigger it. A fix is a minimum offer age (as the reprice has) or a hysteresis band, pinned by a test at a near-zero edge.
+- **Status:** `[ ]` -- OPEN.
+
 ### P1: max_position_usd is PER MARKET and nothing aggregated it
 Three markets at the shipped 250,000 authorise **750,000 of exposure on a
 500,000 account** -- 1.5x equity before the venue's 8x carried multiplier,

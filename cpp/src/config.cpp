@@ -736,10 +736,13 @@ std::vector<PairConfig> parse_pairs(const YAML::Node& root)
             }
             p.q_max_override = v;
         }
-        // [PACE D1 2026-09-13] Per-pair concentration limits.  NaN is caught
-        // ONLY by the isfinite test (the range test lets it through), so that
-        // test stays observable; soft < hard across the EFFECTIVE pair is
-        // checked in load_config, once every section is parsed.
+        // [PACE D1 2026-09-13] Per-pair concentration limits.  In this parse,
+        // NaN is caught only by the isfinite test (the range test lets it
+        // through).  soft < hard across the EFFECTIVE pair is checked in
+        // load_config (validate_pair_concentration_overrides) once every
+        // section is parsed, and that check also rejects a NaN on either key
+        // and a soft override above 1: for those inputs only the error message
+        // tells the two apart, and the override tests pin this parse's message.
         if (item["soft_limit_pct_override"] && item["soft_limit_pct_override"].IsDefined()
             && !item["soft_limit_pct_override"].IsNull()) {
             const double v = item["soft_limit_pct_override"].as<double>();
