@@ -166,9 +166,9 @@ public:
     /// per unit.  Updates the weighted-average cost basis:
     ///   new_basis = (old_total_cost + fill_price * qty) / (old_qty + qty)
     ///
-    /// Preconditions:
-    ///   qty > 0, fill_price > 0.  Violations are logged and ignored.
-    void record_buy(const AssetId& asset_id,
+    /// Returns false (and does nothing) if qty <= 0, fill_price <= 0, or the
+    /// holding would overflow.
+    bool record_buy(const AssetId& asset_id,
                     Mojo           qty,
                     Mojo           fill_price,
                     BlockHeight    block,
@@ -335,8 +335,10 @@ public:
     /// entire holding with that price and clears the sentinel flag, making
     /// the damage permanent and unrepairable.
     ///
-    /// @return false when a sell exceeds tracked quantity (caller should
-    ///         alert); true otherwise.
+    /// @return false when qty <= 0, when a sell exceeds tracked quantity
+    ///         (caller should alert), or when a buy would overflow the
+    ///         holding -- quantity and basis are then unchanged; true
+    ///         otherwise.
     bool record_fill_unpriced(const AssetId& asset_id,
                               Mojo           qty,
                               bool           is_buy,

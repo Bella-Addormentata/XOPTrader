@@ -207,7 +207,8 @@ namespace detail {
 
 /// Book one leg: unpriced -> record_fill_unpriced; priced buy -> record_buy;
 /// priced sale -> record_sell with the no-loss rule bypassed, because a
-/// confirmed fill is not a pre-trade decision.
+/// confirmed fill is not a pre-trade decision.  Returns the tracker's own
+/// verdict, so false means exactly that the tracker refused the leg.
 [[nodiscard]] inline bool apply_fill_leg(InventoryTracker& inv,
                                          const AssetId& asset,
                                          const FillInventoryLeg& leg,
@@ -221,8 +222,8 @@ namespace detail {
                                         block, ts);
     }
     if (leg.is_buy) {
-        inv.record_buy(asset, leg.qty_mojos, leg.usd_pseudo_price, block, ts);
-        return true;
+        return inv.record_buy(asset, leg.qty_mojos, leg.usd_pseudo_price,
+                              block, ts);
     }
     return inv.record_sell(asset, leg.qty_mojos, leg.usd_pseudo_price, block,
                            ts, /*enforce_no_loss=*/false);

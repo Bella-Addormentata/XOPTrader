@@ -22,6 +22,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <string>
 
 namespace {
@@ -641,6 +642,62 @@ TEST_F(MakerFillInventoryTest, UntrustedQuoteFactorLeavesQuoteBasisRepairable) {
         EXPECT_EQ(dbx.weighted_avg_cost_basis, 18'000'000'000);
         EXPECT_FALSE(dbx.basis_is_seed_sentinel);
     }
+}
+
+// A refused PRICED buy must reach the result flags.  record_buy used to return
+// void, so apply_fill_leg reported success for a buy the tracker had refused
+// and the engine neither logged nor alerted.  The only refusal a priced buy
+// leg can meet is an overflow of the holding: legs never carry a quantity or a
+// price <= 0.  Neither test has a fee leg, so the refused holding can move
+// only through the refused leg.
+TEST_F(MakerFillInventoryTest, PricedBidBaseLegOverflowIsRejectedNotSwallowed) {
+    constexpr Mojo kNearMax = std::numeric_limits<Mojo>::max() - 1;
+    xop::InventoryTracker inv(risk_cfg_, 0, /*no_loss_constraint=*/true);
+    restore(inv, kXch, kNearMax, 1'500'000'000'000.0);
+    restore(inv, kDbx, 600'000, 18'000'000'000.0);
+
+    const auto legs = legs_for(xch_dbx(), Side::Bid, 1'000'000'000'000,
+                               80'000'000'000'000, 1'600'000'000'000,
+                               /*fee=*/0);
+    ASSERT_TRUE(legs.base.applies);
+    ASSERT_TRUE(legs.base.is_buy);
+    ASSERT_GT(legs.base.usd_pseudo_price, 0);  // priced: record_buy
+
+    const auto r = apply_maker_fill_legs(inv, xch_dbx(), legs, kBlock, now_);
+    EXPECT_FALSE(r.base_ok);
+    EXPECT_TRUE(r.quote_ok);
+    EXPECT_TRUE(r.fee_ok);
+    EXPECT_EQ(std::string(rejected_fill_legs(legs, r)), "base");
+
+    EXPECT_EQ(inv.net_inventory(kXch), kNearMax);
+    EXPECT_EQ(inv.get_record(kXch).weighted_avg_cost_basis, 1'500'000'000'000);
+    // The refusal does not stop the next leg: the 80 DBX spend still books.
+    EXPECT_EQ(inv.net_inventory(kDbx), 520'000);
+}
+
+TEST_F(MakerFillInventoryTest, PricedAskQuoteLegOverflowIsRejectedNotSwallowed) {
+    constexpr Mojo kNearMax = std::numeric_limits<Mojo>::max() - 1;
+    xop::InventoryTracker inv(risk_cfg_, 0, /*no_loss_constraint=*/true);
+    restore(inv, kXch, 25'000'000'000'000, 1'500'000'000'000.0);
+    restore(inv, kDbx, kNearMax, 18'000'000'000.0);
+
+    const auto legs = legs_for(xch_dbx(), Side::Ask, 1'000'000'000'000,
+                               80'000'000'000'000, 1'600'000'000'000,
+                               /*fee=*/0, /*trusted=*/true);
+    ASSERT_TRUE(legs.quote.applies);
+    ASSERT_TRUE(legs.quote.is_buy);
+    ASSERT_GT(legs.quote.usd_pseudo_price, 0);  // priced: record_buy
+
+    const auto r = apply_maker_fill_legs(inv, xch_dbx(), legs, kBlock, now_);
+    EXPECT_TRUE(r.base_ok);
+    EXPECT_FALSE(r.quote_ok);
+    EXPECT_TRUE(r.fee_ok);
+    EXPECT_EQ(std::string(rejected_fill_legs(legs, r)), "quote");
+
+    EXPECT_EQ(inv.net_inventory(kDbx), kNearMax);
+    EXPECT_EQ(inv.get_record(kDbx).weighted_avg_cost_basis, 18'000'000'000);
+    // The base sale still books.
+    EXPECT_EQ(inv.net_inventory(kXch), 24'000'000'000'000);
 }
 
 }  // namespace
