@@ -1019,10 +1019,15 @@ public:
     /// Same locking caveat as mid_valuation_grade.
     bool book_evidence_fresh(const std::string& pair_name) const;
 
-    /// Self-filtered dexie top-of-book as {best_bid, best_ask}.
-    /// Post-5e1ceb4 a side is 0.0 when no THIRD-PARTY offer exists there, so
-    /// {0, 0} means there is no external market to quote against at all.
-    /// Returns {0.0, 0.0} if the pair is unknown.
+    /// Current dexie top-of-book as {best_bid, best_ask} -- from WHICHEVER
+    /// writer ran last, so NOT necessarily self-filtered.  While
+    /// PairState::bbo_from_filtered_book is false (this heartbeat's offers
+    /// fetch failed, or competitor tracking is off) these are the RAW ticker,
+    /// which includes our own resting offers: never evidence of a third-party
+    /// market or of fair value -- use get_fair_value_inputs() or
+    /// book_evidence_fresh() for that.  From the filtered book (post-5e1ceb4)
+    /// a side is 0.0 when no THIRD-PARTY offer exists there.
+    /// Returns {0.0, 0.0} if the pair is unknown.  No production caller.
     std::pair<double, double> get_dex_bbo(const std::string& pair_name) const;
 
     /// Retrieve the latest block height ingested from the full node.

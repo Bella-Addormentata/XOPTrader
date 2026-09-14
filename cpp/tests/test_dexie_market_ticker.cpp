@@ -29,7 +29,8 @@
 //      -> BuyIsTheAskAndSellIsTheBid, CaseAXchBycBidIsOurOwnRestingBid,
 //         CaseAXchDbxMatchesTheEngineLogReadCorrectly,
 //         CaseBBycXchIsReturnedAsListed, CaseBBycWusdcbJunkAskIsTheAsk,
-//         MissingSideStaysZeroWhenInverted, MissingSideStaysZeroWhenDirect.
+//         MissingSideStaysZeroWhenInverted, MissingSideStaysZeroWhenDirect,
+//         WithBothListingsPresentCaseAIsSearchedFirst.
 //      BothListingsOfOneMarketAgree stays GREEN: the mislabel swaps both
 //      listings identically.  That is how S7's closure could look right --
 //      the flip is self-consistent; only our own bid shows which side is
@@ -37,12 +38,16 @@
 //   M2 Case A takes reciprocals without exchanging the sides
 //      -> CaseAXchBycBidIsOurOwnRestingBid,
 //         CaseAXchDbxMatchesTheEngineLogReadCorrectly,
-//         MissingSideStaysZeroWhenInverted, BothListingsOfOneMarketAgree.
+//         MissingSideStaysZeroWhenInverted, BothListingsOfOneMarketAgree,
+//         WithBothListingsPresentCaseAIsSearchedFirst.
 //   M3 Case B exchanges the sides
 //      -> CaseBBycXchIsReturnedAsListed, CaseBBycWusdcbJunkAskIsTheAsk,
 //         MissingSideStaysZeroWhenDirect.
 //   M4 Case A takes reciprocals of high/low without exchanging them
 //      -> InvertedHighAndLowAreExchanged, BothListingsOfOneMarketAgree.
+//   M7 the Case B search runs before Case A (round 3)
+//      -> WithBothListingsPresentCaseAIsSearchedFirst, alone: every other
+//         fixture lists each market once, so the order cannot show there.
 // ---------------------------------------------------------------------------
 
 #include <cmath>
@@ -293,7 +298,34 @@ TEST(DexieMarketTicker, BothListingsOfOneMarketAgree)
     EXPECT_NEAR(from_xch->oriented.price_low, as_listed.price_low, 1e-12);
     // NOT price_last: Dexie serves 0.5 in both listings, which cannot hold
     // in both units, and the BYC-keyed one sits outside its own 1.25-2.0
-    // range -- that field is Dexie's inconsistency, not a property of ours.
+    // range.  Every CAT-keyed listing in the saved response does the same,
+    // with 1/last inside its range, so Dexie appears to serve `last`
+    // reciprocally under CAT keys -- TODO S48, not a property of ours.
+}
+
+// [round 3] Dexie can list one market under BOTH keys, and the saved response
+// does so for XCH/BYC.  orient_market_ticker searches Case A under every key
+// before Case B, and that order is not cosmetic: the two listings disagree on
+// `last` (the xch-keyed 0.5 orients to 2.0; the BYC-keyed 0.5 would pass
+// through as 0.5), so the search order alone decides the last trade the
+// engine ingests.  Bid and ask agree either way, which is why they cannot
+// catch a reordering -- `inverted`, the listing's key and `last` can.
+TEST(DexieMarketTicker, WithBothListingsPresentCaseAIsSearchedFirst)
+{
+    auto m = nlohmann::json::parse(kXchMarkets);
+    const auto byc_key = nlohmann::json::parse(kBycKeyMarkets);
+    m[kByc] = byc_key.at(kByc);
+    ASSERT_TRUE(m.contains("xch"));
+    ASSERT_TRUE(m.contains(kByc)) << "precondition: both listings present";
+
+    const auto match = orient_market_ticker(m, "xch", kByc);
+    ASSERT_TRUE(match.has_value());
+    EXPECT_TRUE(match->inverted) << "Case A: the xch-keyed listing, inverted";
+    EXPECT_EQ(match->listed.pair_id, "xch");
+    EXPECT_DOUBLE_EQ(match->oriented.price_last, 2.0)
+        << "Case B would have returned the BYC-keyed listing's 0.5 verbatim";
+    EXPECT_DOUBLE_EQ(match->oriented.best_bid, 1.451);
+    EXPECT_DOUBLE_EQ(match->oriented.best_ask, 3.3333333333333335);
 }
 
 TEST(DexieMarketTicker, MissingSideStaysZeroWhenInverted)

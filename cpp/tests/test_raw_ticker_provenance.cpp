@@ -26,6 +26,7 @@
 //   M5 get_fair_value_inputs without the provenance conjunct (the code as it
 //      was before this gate)
 //      -> ARawTickerBookIsNotAFairValueObservation,
+//         ALockedRawTickerBookIsNotAFairValueObservation,
 //         ARawTickerIngestWithdrawsTheObservation,
 //         WithCompetitorTrackingOffNothingIsObserved
 //   M6 refresh publishes compute_spread_bps unconditionally (likewise)
@@ -140,6 +141,31 @@ TEST(RawTickerProvenance, AFilteredBookIsAFairValueObservation)
         << "the same two prices from the filtered book ARE an observation";
     EXPECT_NEAR(obs.mid, kMid, 1e-9);
     EXPECT_NEAR(obs.spread_bps, kSpreadBps, 1e-6);
+}
+
+// [round 3] LOCKED is the heaviest case, not a corner.  A locked raw book
+// (bid == ask) passes the ask >= bid test with compute_spread_bps' 0, so it
+// entered the solve at the MINIMUM book sigma -- the most weight any book can
+// carry -- before this PR, and after the relabel alone.  It is our own quotes.
+// Provenance excludes it like any other raw book.  (The published spread is 0
+// for a locked book with or without Gate 2, so only Gate 1 is asserted.)
+TEST(RawTickerProvenance, ALockedRawTickerBookIsNotAFairValueObservation)
+{
+    State state;
+    MarketDataFeed feed(provenance_cfg(), state);
+    feed.ingest_block_height(100);
+    feed.ingest_dexie(kPair, kAsk, kAsk, /*last=*/kAsk, /*vol_24h=*/0.21);
+    feed.refresh({kPair});
+
+    const auto bbo = feed.get_dex_bbo(kPair);
+    ASSERT_GT(bbo.first, 0.0);
+    ASSERT_DOUBLE_EQ(bbo.first, bbo.second) << "precondition: locked";
+
+    const auto obs = feed.get_fair_value_inputs(kPair);
+    EXPECT_FALSE(obs.has_book)
+        << "a locked raw book passes ask >= bid at spread 0 -- the minimum "
+           "sigma, so the heaviest weight -- and it is our own quotes";
+    EXPECT_DOUBLE_EQ(obs.mid, 0.0);
 }
 
 TEST(RawTickerProvenance, ARawTickerIngestWithdrawsTheObservation)

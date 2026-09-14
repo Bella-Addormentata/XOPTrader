@@ -965,8 +965,10 @@ FairValueObservation MarketDataFeed::get_fair_value_inputs(
     // blend (Engine::step_generate_ladder) would take our own quotes as
     // independent evidence.  Provenance is the conjunct book_evidence_fresh()
     // and apply_mid_gate() already require.  Their recency and movement
-    // conjuncts are deliberately NOT added: the solve prices a frozen book
-    // through print_age, and requiring them would change the filtered path.
+    // conjuncts are deliberately NOT added: requiring them would change the
+    // filtered path.  (print_age widens a filtered book that stops moving,
+    // but it advances only when a filtered ingest runs, so a book that no
+    // fetch refreshes keeps its weight -- pre-existing, TODO S49.)
     if (ps.bbo_from_filtered_book
         && ps.dex_best_bid > 0.0 && ps.dex_best_ask > 0.0
         && ps.dex_best_ask >= ps.dex_best_bid) {
