@@ -39,6 +39,7 @@
 
 #include "xop/accounting/bridge_ingest.hpp"
 #include "xop/accounting/reward_ingest.hpp"
+#include "xop/accounting/maker_fill_legs.hpp"
 
 // [S19] Real SQLite API for the read-only warp_jobs.db scan.  database.hpp
 // deliberately forward-declares only the opaque handles; a .cpp that calls
@@ -5100,7 +5101,14 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
         // Record the offer as filled in the offer log.
         db_->update_offer_status(fill.offer_id, "filled", fill.block_height, "");
 
-        // Update the inventory tracker using the pair's actual base asset.
+        // Update the inventory tracker with EVERY leg of the fill: base,
+        // quote and the XCH creation fee ([FILL-LEGS 2026-09-13]).  Until then
+        // only the base leg was booked, so an ask removed the XCH it sold
+        // without adding the proceeds (equity read low -- the 2026-09-11
+        // drawdown trip) and a bid added XCH without removing the quote it
+        // spent (equity read high).  What to book, at what price, with the
+        // no-loss rule bypassed and seed sentinels kept repairable, is decided
+        // in accounting/maker_fill_legs.hpp, where ctest can reach it (S36).
         auto now = std::chrono::system_clock::now();
         // [H3] fill_pair_cfg is guaranteed non-null (guarded above).
         const std::string& fill_base = fill_pair_cfg->base_asset_id;
@@ -5114,52 +5122,62 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
             fill_price_usd = asset_usd_pseudo_price(AssetId{fill_base});
         }
 
-        // If BOTH fail there is no defensible cost for this lot.  Do NOT
-        // substitute a placeholder price: record_buy's sentinel branch would
-        // re-mark the ENTIRE holding at that price and clear the sentinel
-        // flag, permanently destroying the basis with no way for the
-        // mark-at-first-observation upgrade to repair it -- exactly the
-        // failure this change set exists to eliminate.  Track the quantity
-        // and leave the basis (and its provenance) untouched instead.
-        bool inventory_ok = true;
+        // If BOTH fail there is no defensible cost for either leg.  No
+        // placeholder price is substituted -- maker_fill_legs.hpp explains
+        // why that would destroy the basis permanently -- so both legs are
+        // applied to quantity only.
         if (fill_price_usd <= 0) {
             spdlog::warn("[Engine] Step 2: no USD valuation available for {} "
-                         "({}) -- applying fill to quantity only, cost basis "
-                         "left intact for later repair",
+                         "({}) -- applying BOTH legs to quantity only, cost "
+                         "bases left intact for later repair",
                          fill.pair_name, fill_base.substr(0, 12));
-            inventory_ok = inventory_->record_fill_unpriced(
-                fill_base, fill.size, /*is_buy=*/fill.side == Side::Bid,
-                fill.block_height, now);
-        } else if (fill.side == Side::Bid) {
-            inventory_->record_buy(fill_base, fill.size, fill_price_usd,
-                                   fill.block_height, now);
-        } else {
-            // Confirmed fills must always reduce tracked inventory. The
-            // never-sell-at-loss rule is a pre-trade control, so bypass it
-            // here and only fail on missing or insufficient tracked quantity.
-            // ISO/IEC 5055: checked return value on every code path.
-            inventory_ok = inventory_->record_sell(
-                fill_base, fill.size, fill_price_usd,
-                fill.block_height, now, /*enforce_no_loss=*/false);
         }
+        // The quote leg is priced only when this pair's quote-USD factor is
+        // trusted; otherwise it books unpriced and Step 11 repairs it from a
+        // graded mark.
+        const auto legs = accounting::maker_fill_inventory_legs(
+            fill, *fill_pair_cfg, fill_price_usd,
+            quote_usd_factor_trusted(*fill_pair_cfg));
+        const auto applied = accounting::apply_maker_fill_legs(
+            *inventory_, *fill_pair_cfg, legs, fill.block_height, now);
 
-        if (!inventory_ok) {
+        const std::string_view rejected_legs =
+            accounting::rejected_fill_legs(legs, applied);
+        if (!rejected_legs.empty()) {
             spdlog::error("[Engine] Step 2: inventory update REJECTED fill "
                           "for {} {} @ {} mojos (block {}) -- "
                           "tracked inventory missing or insufficient.  "
                           "Fill was confirmed on-chain but the inventory "
-                          "tracker refused it.",
+                          "tracker refused it -- {} leg(s)",
                           fill.pair_name, fill.size, fill.price,
-                          fill.block_height);
+                          fill.block_height, rejected_legs);
+            if (legs.quote_invalid) {
+                spdlog::error("[Engine] Step 2: fill {} has no derivable "
+                              "quote quantity (price {}, base_mojos_per_unit "
+                              "{}, quote_mojos_per_unit {}) -- quote holding "
+                              "left unchanged",
+                              fill.offer_id.substr(0, 12), fill.price,
+                              fill_pair_cfg->base_mojos_per_unit,
+                              fill_pair_cfg->quote_mojos_per_unit);
+            }
             // Alert on the inconsistency so the operator can investigate.
             alerts_->send_alert(AlertRule::ExposureBreach,
                 "inventory update rejected confirmed fill for " +
-                fill.pair_name + " at block " +
+                fill.pair_name + " (" + std::string(rejected_legs) +
+                " leg(s)) at block " +
                 std::to_string(fill.block_height) +
                 " -- state inconsistency");
         }
+        if (!applied.fee_ok) {
+            // Warn only, never an alert: a fill's fee is ~1e-8 XCH.
+            spdlog::warn("[Engine] Step 2: XCH fee {} mojos for fill {} not "
+                         "booked -- tracked XCH missing or below the fee",
+                         fill.fee_mojos, fill.offer_id.substr(0, 12));
+        }
 
         // [PNL-BASIS-PERSIST] Durable basis: snapshot after every mutation.
+        // ONE persist after all three legs, so persistence stays
+        // all-or-nothing per fill.
         persist_inventory_state();
 
         // [LEDGER 2026-07-30] Post the balanced legs for this fill.  Safe to
@@ -5168,15 +5186,14 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
         // quantities are the bot's OWN belief about the fill -- the whole
         // point is for the invariant to surface where that belief and the
         // wallet disagree.
-        {
-            const Mojo quote_mojos = static_cast<Mojo>(std::llround(
-                quote_mojos_for(
-                    static_cast<double>(fill.size),
-                    static_cast<double>(fill.price),
-                    static_cast<double>(fill_pair_cfg->base_mojos_per_unit),
-                    static_cast<double>(fill_pair_cfg->quote_mojos_per_unit))));
-            post_ledger_fill(fill, *fill_pair_cfg, quote_mojos);
-        }
+        //
+        // [FILL-LEGS] The quote quantity is the one the tracker just booked,
+        // not a second derivation of the same formula.  It equals the former
+        // llround(quote_mojos_for(...)) for every representable quantity; an
+        // out-of-range one is now 0 (no leg) instead of llround's unspecified
+        // result.
+        post_ledger_fill(fill, *fill_pair_cfg,
+                         legs.quote_invalid ? Mojo{0} : legs.quote.qty_mojos);
 
         if (!fill_newly_recorded) {
             spdlog::warn("[Engine] Step 2: fill {} was already journalled -- "
@@ -17320,8 +17337,10 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
 
     // FLOW-TRIGGERED RE-ANCHOR (round 42, owner decision).  Rounds
     // 24-41 tried to adjust the drawdown peak in place for external
-    // flows, and every variant was refuted: fills are tracked
-    // base-side only (round 17), so neither the wallet delta, the
+    // flows, and every variant was refuted: fills do not all reach
+    // the tracker (round 17 found them base-side only; maker fills
+    // book both legs since [FILL-LEGS 2026-09-13], but taker fills
+    // still book none -- TODO S48), so neither the wallet delta, the
     // mid-heartbeat equity snapshot, nor amount-matched provenance
     // can attribute a wallet movement to a specific flow -- rounds 39
     // and 41 ended by demanding OPPOSITE policies for the same

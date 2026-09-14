@@ -137,7 +137,7 @@ InventoryTracker::InventoryTracker(const RiskConfig& risk_cfg,
 // Cost Basis Tracking
 // ===========================================================================
 
-void InventoryTracker::record_buy(const AssetId& asset_id,
+bool InventoryTracker::record_buy(const AssetId& asset_id,
                                   Mojo           qty,
                                   Mojo           fill_price,
                                   BlockHeight    block,
@@ -145,7 +145,7 @@ void InventoryTracker::record_buy(const AssetId& asset_id,
 {
     // Defensive: reject invalid inputs.
     if (qty <= 0 || fill_price <= 0) {
-        return;
+        return false;
     }
 
     std::unique_lock lock(mtx_records_);
@@ -154,11 +154,16 @@ void InventoryTracker::record_buy(const AssetId& asset_id,
     auto [it, inserted] = records_.try_emplace(asset_id, asset_id);
     AssetRecord& rec = it->second;
 
-    const Mojo new_total_qty  = rec.total_quantity + qty;
-    if (new_total_qty < rec.total_quantity) {
-        // Overflow detected -- reject silently rather than corrupt state.
-        return;
+    // Refuse a buy that would overflow the holding rather than corrupt
+    // state, and report it.  The check cannot overflow itself: the former
+    // `total + qty < total` form evaluated the signed sum first, which is
+    // undefined behaviour.  qty > 0 here, so only a positive holding can
+    // overflow, and max() - total_quantity is then in range.
+    if (rec.total_quantity > 0
+        && qty > std::numeric_limits<Mojo>::max() - rec.total_quantity) {
+        return false;
     }
+    const Mojo new_total_qty = rec.total_quantity + qty;
 
     if (rec.basis_is_seed_sentinel) {
         // [v0.7.46 #1] First real fill after a synthetic seed.
@@ -193,6 +198,7 @@ void InventoryTracker::record_buy(const AssetId& asset_id,
     // Update fill timestamp.
     rec.last_fill_block = block;
     rec.last_fill_time  = ts;
+    return true;
 }
 
 bool InventoryTracker::record_sell(const AssetId& asset_id,
@@ -708,10 +714,14 @@ bool InventoryTracker::record_fill_unpriced(const AssetId& asset_id,
     AssetRecord& rec = it->second;
 
     if (is_buy) {
-        const Mojo new_qty = rec.total_quantity + qty;
-        if (new_qty < rec.total_quantity) {
-            return false;  // overflow guard
+        // Same overflow refusal as record_buy, in a form that cannot itself
+        // overflow (the former `total + qty < total` check evaluated the
+        // signed sum first, which is undefined behaviour).
+        if (rec.total_quantity > 0
+            && qty > std::numeric_limits<Mojo>::max() - rec.total_quantity) {
+            return false;
         }
+        const Mojo new_qty = rec.total_quantity + qty;
         // Cost the new lot at the CURRENT basis so the weighted average is
         // unchanged.  When the record is still a sentinel this keeps basis
         // at the sentinel value AND keeps the flag set, so the later

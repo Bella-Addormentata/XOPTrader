@@ -20,6 +20,7 @@
 #include <xop/types.hpp>
 
 #include <chrono>
+#include <limits>
 #include <unordered_map>
 
 namespace {
@@ -225,16 +226,41 @@ TEST_F(CostBasisTest, InvalidBuyInputs) {
     xop::InventoryTracker tracker(risk_cfg_, 1'000'000'000LL);
 
     // Zero quantity.
-    tracker.record_buy("xch", 0, 2'700'000, 1, now_);
+    EXPECT_FALSE(tracker.record_buy("xch", 0, 2'700'000, 1, now_));
     EXPECT_EQ(tracker.net_inventory("xch"), 0);
 
     // Negative quantity.
-    tracker.record_buy("xch", -10, 2'700'000, 1, now_);
+    EXPECT_FALSE(tracker.record_buy("xch", -10, 2'700'000, 1, now_));
     EXPECT_EQ(tracker.net_inventory("xch"), 0);
 
     // Zero price.
-    tracker.record_buy("xch", 100, 0, 1, now_);
+    EXPECT_FALSE(tracker.record_buy("xch", 100, 0, 1, now_));
     EXPECT_EQ(tracker.net_inventory("xch"), 0);
+}
+
+// A buy that would take the holding past the Mojo range is refused and
+// reported, and leaves the record exactly as it was.  Reaching the maximum
+// exactly is not an overflow.
+TEST_F(CostBasisTest, BuyOverflowIsRefused) {
+    constexpr xop::Mojo kMax = std::numeric_limits<xop::Mojo>::max();
+    xop::InventoryTracker tracker(risk_cfg_, 1'000'000'000LL);
+    // (2^63 - 2) converts to exactly 2^63 as a double, so the restored basis
+    // is exactly 2,700,000.
+    tracker.restore_record("xch", kMax - 1,
+                           static_cast<double>(kMax - 1) * 2'700'000.0, false);
+
+    EXPECT_FALSE(tracker.record_buy("xch", 2, 3'000'000, 5, now_));
+    const auto rec = tracker.get_record("xch");
+    EXPECT_EQ(rec.total_quantity, kMax - 1);
+    EXPECT_EQ(rec.weighted_avg_cost_basis, 2'700'000);
+    EXPECT_EQ(rec.last_fill_block, xop::BlockHeight{0});
+
+    EXPECT_TRUE(tracker.record_buy("xch", 1, 2'700'000, 6, now_));
+    EXPECT_EQ(tracker.net_inventory("xch"), kMax);
+
+    // An ordinary buy on a fresh record.
+    EXPECT_TRUE(tracker.record_buy("cat", 100, 2'700'000, 7, now_));
+    EXPECT_EQ(tracker.net_inventory("cat"), 100);
 }
 
 // ============================================================================
@@ -759,6 +785,26 @@ TEST_F(CostBasisTest, UnpricedSellBeyondHoldingsIsRejected) {
     EXPECT_FALSE(tracker.record_fill_unpriced("xch", 500, /*is_buy=*/false,
                                               2, now_));
     EXPECT_EQ(tracker.get_record("xch").total_quantity, 100);
+}
+
+// The unpriced path refuses an overflowing buy the same way, and reports it.
+TEST_F(CostBasisTest, UnpricedBuyOverflowIsRefused) {
+    constexpr xop::Mojo kMax = std::numeric_limits<xop::Mojo>::max();
+    xop::InventoryTracker tracker(risk_cfg_, 1'000'000'000LL);
+    tracker.restore_record("xch", kMax - 1,
+                           static_cast<double>(kMax - 1) * 2'700'000.0, false);
+
+    EXPECT_FALSE(tracker.record_fill_unpriced("xch", 2, /*is_buy=*/true,
+                                              5, now_));
+    const auto rec = tracker.get_record("xch");
+    EXPECT_EQ(rec.total_quantity, kMax - 1);
+    EXPECT_EQ(rec.weighted_avg_cost_basis, 2'700'000);
+    EXPECT_EQ(rec.last_fill_block, xop::BlockHeight{0});
+
+    // Reaching the maximum exactly is not an overflow.
+    EXPECT_TRUE(tracker.record_fill_unpriced("xch", 1, /*is_buy=*/true,
+                                             6, now_));
+    EXPECT_EQ(tracker.net_inventory("xch"), kMax);
 }
 
 TEST_F(CostBasisTest, AdjustQuantityDepositWithoutPriceIsNoop) {
