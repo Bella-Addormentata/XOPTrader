@@ -817,6 +817,13 @@ has to be true before it runs.
 - **Not changed by `fix/step6-limit-attribution`**, which only makes Step 6 say which side a limit zeroed and rate-limits the warn.
 - **Status:** `[ ]` -- OPEN, operator decision: should a side the strategy zeroed still reach Step 7 (and the floor) when the other side is limit-zeroed, and is the CAT cap's full-block point right for BYC?
 
+### S58: a take whose wallet reply lacks a trade id is recorded as "unknown", and every later one is silently dropped
+- **Files:** `cpp/src/engine.cpp` (five `take_offer` success paths fall back to `"unknown"`: engine.cpp:13861, 14262, 14696, 15369 (Step 9f) and 15814 (XCH recovery) at 637693d), `cpp/src/database.cpp` (`taker_fills.trade_id TEXT UNIQUE`, `insert_taker_fill`'s `INSERT OR IGNORE`)
+- **Found 2026-09-14 (PR #160 round-2 verification):** when `take_offer` succeeds but its reply has no `trade_record.trade_id`, the take is recorded under trade_id `"unknown"`. `taker_fills.trade_id` is UNIQUE and the insert is `INSERT OR IGNORE`, so the first such row lands and every later one is dropped without a log line.
+- **Why it matters now:** the pace controller counts `taker_fills` rows toward its daily progress. A dropped take understates what was sold, so pace can over-sell against its schedule -- bounded by the excess, because remaining = min(budget - sold, excess, headroom). Every other reader of `taker_fills` loses the same rows.
+- **Not fixed in PR #160:** the recording is shared by every taker path and its other readers; a synthetic unique id (for example `unknown-<counterparty offer id>`) changes what those readers see.
+- **Status:** `[ ]` -- OPEN.
+
 ### P1: max_position_usd is PER MARKET and nothing aggregated it
 Three markets at the shipped 250,000 authorise **750,000 of exposure on a
 500,000 account** -- 1.5x equity before the venue's 8x carried multiplier,

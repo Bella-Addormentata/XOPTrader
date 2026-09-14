@@ -1165,6 +1165,34 @@ TEST(PaceTightenSide, ReturnsUntightenedPrices) {
     EXPECT_EQ(untight, (std::vector<Mojo>{1'460'000'000'000, 1'455'000'000'000}));
 }
 
+TEST(PaceTightenSide, MovedTierKeepsTheOrderBookGuardSpacing) {
+    // The engine passes the order-book guard's per-tier step (50 bps at the
+    // default fair_value_clamp_tier_step_bps).  Tier 1 moves to 1.466295 but
+    // does not collide with tier 0; it still has to stay 50 bps below it.
+    pace::PriceGuards g = guards_gnc();
+    g.tier_step_bps = 50.0;
+    std::vector<xop::TierQuote> ladder{tier_quote(0, xop::Side::Bid, 1'460'000'000'000),
+                                       tier_quote(1, xop::Side::Bid, 1'459'000'000'000)};
+    const std::vector<Mojo> untight = pace::tighten_bid_side(ladder, 50.0, 25.0, g);
+    static_cast<void>(untight);
+    ASSERT_EQ(ladder.size(), 2u);
+    EXPECT_NEAR(static_cast<double>(ladder[0].price), 1'467'172'980'000.0, 2.0);
+    EXPECT_NEAR(static_cast<double>(ladder[1].price), 1'459'837'115'100.0, 2.0);
+}
+
+TEST(PaceTightenSide, SpreadBpsResyncedForEveryBid) {
+    // Tier 1 cannot move (every candidate fails Check 2's passive bound), and
+    // its spread_bps is still resynced against the centre.
+    std::vector<xop::TierQuote> ladder{tier_quote(0, xop::Side::Bid, kBase0),
+                                       tier_quote(1, xop::Side::Bid, 300'000'000'000)};
+    const std::vector<Mojo> untight = pace::tighten_bid_side(ladder, 150.0, 25.0, guards_g());
+    static_cast<void>(untight);
+    ASSERT_EQ(ladder.size(), 2u);
+    EXPECT_NEAR(ladder[0].spread_bps, -306.615, 1e-3);
+    EXPECT_NEAR(ladder[1].spread_bps, -7991.296, 1e-3);
+    EXPECT_EQ(ladder[1].price, 300'000'000'000);
+}
+
 // ============================================================================
 // P18 -- plan S {managed, tiers 2u, tier_size 1'213'067'300'154, min_tier 1e12,
 // pool 2'426'134'600'308}; B6 = bids tier i at 1'426'312'378'968 - i x 5e10.
@@ -1245,6 +1273,171 @@ TEST(PaceShape, ThrottleScaleShrinksSize) {
     EXPECT_EQ(ladder[0].size, 606'533'650'077);
     EXPECT_EQ(ladder[1].tier_index, 1u);
     EXPECT_EQ(ladder[1].size, 606'533'650'077);
+}
+
+// ============================================================================
+// P24 -- plan V: plan S with the live fair value 1.49285 and sigma 172;
+// min_edge 50, k 1.0, spacing 50 (the order-book guard's step), centre
+// 1.4935e12.  Plan X: fair value 1.5, sigma 0, min_edge 2000, so the cap is
+// exactly 1'200'000'000'000.
+// ============================================================================
+
+pace::PairPlan cap_plan()
+{
+    pace::PairPlan p = shape_plan();
+    p.fv_price     = 1.49285;
+    p.fv_sigma_bps = 172.0;
+    return p;
+}
+
+pace::FairValueCap cap_live(std::vector<xop::TierQuote>& ladder, const pace::PairPlan& plan)
+{
+    return pace::cap_bids_at_fair_value(ladder, plan, 50.0, 1.0, 50.0, 1.4935e12);
+}
+
+pace::FairValueCap cap_exact(std::vector<xop::TierQuote>& ladder)
+{
+    pace::PairPlan p = shape_plan();
+    p.fv_price     = 1.5;
+    p.fv_sigma_bps = 0.0;
+    return pace::cap_bids_at_fair_value(ladder, p, 2000.0, 1.0, 50.0, 0.0);
+}
+
+TEST(PaceFairValueCap, StageBBidsAboveFairValueLoweredAndSpaced) {
+    // Stage B (pace_tighten_max_bps 0): the price post-pass never runs, so a
+    // centre-blend ladder above fair value would otherwise post as it is.
+    pace::PairPlan plan = cap_plan();
+    plan.tighten_bps = 0.0;
+    std::vector<xop::TierQuote> ladder{tier_quote(0, xop::Side::Bid, 1'520'000'000'000),
+                                       tier_quote(1, xop::Side::Bid, 1'500'000'000'000)};
+    const pace::FairValueCap cap = cap_live(ladder, plan);
+    ASSERT_EQ(ladder.size(), 2u);
+    EXPECT_NEAR(static_cast<double>(ladder[0].price), 1'467'172'980'000.0, 2.0);
+    EXPECT_NEAR(static_cast<double>(ladder[1].price), 1'459'837'115'100.0, 2.0);
+    EXPECT_EQ(ladder[0].size, kE12);
+    EXPECT_EQ(ladder[1].size, kE12);
+    EXPECT_NEAR(static_cast<double>(cap.cap_px), 1'467'172'980'000.0, 2.0);
+    EXPECT_EQ(cap.lowered, 2u);
+    EXPECT_EQ(cap.dropped, 0u);
+}
+
+TEST(PaceFairValueCap, RampZeroPlanStillCapped) {
+    // The first plan after an activation or a restart has ramp 0, so tighten
+    // 0 (PaceDecide.LiveCase_Byc14DayPlansTwoTiers).  Tier 0 at the A-S
+    // centre sits above fair value; tier 1 is below the cap and spaced.
+    pace::PairPlan plan = cap_plan();
+    plan.tighten_bps = 0.0;
+    std::vector<xop::TierQuote> ladder{tier_quote(0, xop::Side::Bid, 1'493'500'000'000),
+                                       tier_quote(1, xop::Side::Bid, 1'426'312'378'968)};
+    const pace::FairValueCap cap = cap_live(ladder, plan);
+    ASSERT_EQ(ladder.size(), 2u);
+    EXPECT_NEAR(static_cast<double>(ladder[0].price), 1'467'172'980'000.0, 2.0);
+    EXPECT_NEAR(static_cast<double>(ladder[1].price), 1'426'312'378'968.0, 2.0);
+    EXPECT_EQ(cap.lowered, 1u);
+    EXPECT_EQ(cap.dropped, 0u);
+}
+
+TEST(PaceFairValueCap, ThrottledHeartbeatShapedThenCapped) {
+    // A throttled heartbeat skips the price post-pass even when behind
+    // schedule, but not the size post-pass (P18); the cap follows it, in
+    // Step 7's order.
+    pace::PairPlan plan = cap_plan();
+    plan.tighten_bps             = 300.0;
+    plan.throttle_bid_size_scale = 0.5;
+    std::vector<xop::TierQuote> ladder{tier_quote(0, xop::Side::Bid, 1'510'000'000'000),
+                                       tier_quote(1, xop::Side::Bid, 1'505'000'000'000),
+                                       tier_quote(2, xop::Side::Bid, 1'500'000'000'000),
+                                       tier_quote(0, xop::Side::Ask, 1'600'000'000'000)};
+    pace::shape_bid_side(ladder, plan);
+    const pace::FairValueCap cap = cap_live(ladder, plan);
+    ASSERT_EQ(ladder.size(), 2u);
+    EXPECT_EQ(ladder[0].tier_index, 0u);
+    EXPECT_EQ(ladder[1].tier_index, 1u);
+    EXPECT_NEAR(static_cast<double>(ladder[0].price), 1'467'172'980'000.0, 2.0);
+    EXPECT_NEAR(static_cast<double>(ladder[1].price), 1'459'837'115'100.0, 2.0);
+    EXPECT_EQ(ladder[0].size, 606'533'650'077);
+    EXPECT_EQ(ladder[1].size, 606'533'650'077);
+    EXPECT_EQ(cap.lowered, 2u);
+    EXPECT_EQ(cap.dropped, 0u);
+}
+
+TEST(PaceFairValueCap, BidsAtOrBelowTheCapKeepTheirPrices) {
+    std::vector<xop::TierQuote> ladder{tier_quote(0, xop::Side::Bid, 1'200'000'000'000),
+                                       tier_quote(1, xop::Side::Bid, 1'100'000'000'000)};
+    const pace::FairValueCap cap = cap_exact(ladder);
+    ASSERT_EQ(ladder.size(), 2u);
+    EXPECT_EQ(ladder[0].price, 1'200'000'000'000);
+    EXPECT_EQ(ladder[1].price, 1'100'000'000'000);
+    EXPECT_EQ(cap.cap_px, 1'200'000'000'000);
+    EXPECT_EQ(cap.lowered, 0u);
+    EXPECT_EQ(cap.dropped, 0u);
+}
+
+TEST(PaceFairValueCap, OneMojoAboveTheCapIsLowered) {
+    std::vector<xop::TierQuote> ladder{tier_quote(0, xop::Side::Bid, 1'200'000'000'001)};
+    const pace::FairValueCap cap = cap_exact(ladder);
+    ASSERT_EQ(ladder.size(), 1u);
+    EXPECT_EQ(ladder[0].price, 1'200'000'000'000);
+    EXPECT_EQ(cap.lowered, 1u);
+    EXPECT_EQ(cap.dropped, 0u);
+}
+
+TEST(PaceFairValueCap, LowerTierKeepsTheGuardSpacing) {
+    // Tier 1 sits 8.3 bps under tier 0: below the cap, but inside the 50-bps
+    // step the order-book guard keeps between successive tiers.
+    std::vector<xop::TierQuote> ladder{tier_quote(0, xop::Side::Bid, 1'200'000'000'000),
+                                       tier_quote(1, xop::Side::Bid, 1'199'000'000'000)};
+    const pace::FairValueCap cap = cap_exact(ladder);
+    ASSERT_EQ(ladder.size(), 2u);
+    EXPECT_EQ(ladder[0].price, 1'200'000'000'000);
+    EXPECT_EQ(ladder[1].price, 1'194'000'000'000);
+    EXPECT_EQ(cap.lowered, 1u);
+    EXPECT_EQ(cap.dropped, 0u);
+}
+
+TEST(PaceFairValueCap, EdgeFloorUsedWhenSigmaSmall) {
+    // sigma 20 is below min_edge 50: the cap is FV x (1 - 50 bps).
+    pace::PairPlan plan = cap_plan();
+    plan.fv_sigma_bps = 20.0;
+    std::vector<xop::TierQuote> ladder{tier_quote(0, xop::Side::Bid, 1'490'000'000'000)};
+    const pace::FairValueCap cap = cap_live(ladder, plan);
+    ASSERT_EQ(ladder.size(), 1u);
+    EXPECT_NEAR(static_cast<double>(ladder[0].price), 1'485'385'750'000.0, 2.0);
+    EXPECT_NEAR(static_cast<double>(cap.cap_px), 1'485'385'750'000.0, 2.0);
+    EXPECT_EQ(cap.lowered, 1u);
+}
+
+TEST(PaceFairValueCap, UnusableFairValueDropsEveryBid) {
+    for (const double fv : {kNaN, 0.0}) {
+        SCOPED_TRACE(fv);
+        pace::PairPlan plan = cap_plan();
+        plan.fv_price = fv;
+        std::vector<xop::TierQuote> ladder{tier_quote(0, xop::Side::Bid, 1'400'000'000'000),
+                                           tier_quote(1, xop::Side::Bid, 1'390'000'000'000),
+                                           tier_quote(0, xop::Side::Ask, 1'600'000'000'000)};
+        const pace::FairValueCap cap = cap_live(ladder, plan);
+        ASSERT_EQ(ladder.size(), 1u);
+        EXPECT_EQ(ladder[0].side, xop::Side::Ask);
+        EXPECT_EQ(cap.cap_px, 0);
+        EXPECT_EQ(cap.lowered, 0u);
+        EXPECT_EQ(cap.dropped, 2u);
+    }
+}
+
+TEST(PaceFairValueCap, UnmanagedAndHoldAreNoOps) {
+    pace::PairPlan hold = cap_plan();
+    hold.hold = true;
+    for (const pace::PairPlan& plan : {pace::PairPlan{}, hold}) {
+        std::vector<xop::TierQuote> ladder{tier_quote(0, xop::Side::Bid, 1'520'000'000'000),
+                                           tier_quote(1, xop::Side::Bid, 1'500'000'000'000)};
+        const pace::FairValueCap cap = cap_live(ladder, plan);
+        ASSERT_EQ(ladder.size(), 2u);
+        EXPECT_EQ(ladder[0].price, 1'520'000'000'000);
+        EXPECT_EQ(ladder[1].price, 1'500'000'000'000);
+        EXPECT_EQ(cap.cap_px, 0);
+        EXPECT_EQ(cap.lowered, 0u);
+        EXPECT_EQ(cap.dropped, 0u);
+    }
 }
 
 // ============================================================================
@@ -1364,6 +1557,41 @@ TEST(PaceCancel, CancelPendingIgnored) {
 }
 
 // ============================================================================
+// P26 -- plan C with fair value 1.5, so the bound is exactly 1'500'000'000'000
+// ============================================================================
+
+pace::PairPlan above_fv_plan()
+{
+    pace::PairPlan p = cancel_plan();
+    p.fv_price = 1.5;
+    return p;
+}
+
+TEST(PaceRestingAboveFairValue, BidsAboveFairValueSelected) {
+    std::vector<pace::RestingOffer> resting{resting_bid("b0", 0, 1'500'000'000'001),
+                                            resting_bid("b1", 1, 1'500'000'000'000),
+                                            resting_bid("b2", 2, 1'426'312'378'968), resting_ask_a0()};
+    pace::RestingOffer pending = resting_bid("b3", 0, 1'600'000'000'000);
+    pending.cancel_pending = true;
+    resting.push_back(pending);
+    EXPECT_EQ(pace::select_resting_above_fair_value(resting, above_fv_plan()), Ids{"b0"});
+}
+
+TEST(PaceRestingAboveFairValue, HoldUnmanagedOrUnusableFairValueSelectsNothing) {
+    const std::vector<pace::RestingOffer> resting{resting_bid("b0", 0, 1'600'000'000'000)};
+    pace::PairPlan hold = above_fv_plan();
+    hold.hold = true;
+    pace::PairPlan nan_fv = above_fv_plan();
+    nan_fv.fv_price = kNaN;
+    pace::PairPlan zero_fv = above_fv_plan();
+    zero_fv.fv_price = 0.0;
+    EXPECT_TRUE(pace::select_resting_above_fair_value(resting, hold).empty());
+    EXPECT_TRUE(pace::select_resting_above_fair_value(resting, pace::PairPlan{}).empty());
+    EXPECT_TRUE(pace::select_resting_above_fair_value(resting, nan_fv).empty());
+    EXPECT_TRUE(pace::select_resting_above_fair_value(resting, zero_fv).empty());
+}
+
+// ============================================================================
 // P20 (resting, desired, untightened, age; min_age 96u, min_bps 50), P21
 // ============================================================================
 
@@ -1419,6 +1647,89 @@ TEST(PaceTake, NonFiniteRefused) {
 }
 
 // ============================================================================
+// P25 -- the balance refresh's gates, age and per-asset backoff
+// ============================================================================
+
+pace::RefreshGates open_gates()
+{
+    pace::RefreshGates g{};
+    g.pace_enabled       = true;
+    g.flash_crash_normal = true;
+    return g;
+}
+
+TEST(PaceRefreshGates, AllOpenAllowsRefresh) {
+    EXPECT_TRUE(pace::pace_refresh_gates_open(open_gates()));
+    EXPECT_FALSE(pace::pace_refresh_gates_open(pace::RefreshGates{}));
+}
+
+TEST(PaceRefreshGates, EachClosedGateBlocksRefresh) {
+    pace::RefreshGates g = open_gates();
+    g.pace_enabled = false;
+    EXPECT_FALSE(pace::pace_refresh_gates_open(g)) << "pace_enabled";
+    g = open_gates();
+    g.dry_run = true;
+    EXPECT_FALSE(pace::pace_refresh_gates_open(g)) << "dry_run";
+    g = open_gates();
+    g.wallet_circuit_open = true;
+    EXPECT_FALSE(pace::pace_refresh_gates_open(g)) << "wallet_circuit_open";
+    g = open_gates();
+    g.watchdog_fired = true;
+    EXPECT_FALSE(pace::pace_refresh_gates_open(g)) << "watchdog_fired";
+    g = open_gates();
+    g.wallet_consecutive_failures = 1u;
+    EXPECT_FALSE(pace::pace_refresh_gates_open(g)) << "wallet_consecutive_failures";
+    g = open_gates();
+    g.gui_pause = true;
+    EXPECT_FALSE(pace::pace_refresh_gates_open(g)) << "gui_pause";
+    g = open_gates();
+    g.breaker_pause = true;
+    EXPECT_FALSE(pace::pace_refresh_gates_open(g)) << "breaker_pause";
+    g = open_gates();
+    g.cancel_all_inflight = true;
+    EXPECT_FALSE(pace::pace_refresh_gates_open(g)) << "cancel_all_inflight";
+    g = open_gates();
+    g.cancel_all_draining = true;
+    EXPECT_FALSE(pace::pace_refresh_gates_open(g)) << "cancel_all_draining";
+    g = open_gates();
+    g.flash_crash_normal = false;
+    EXPECT_FALSE(pace::pace_refresh_gates_open(g)) << "flash_crash_normal";
+    g = open_gates();
+    g.xch_recovery = true;
+    EXPECT_FALSE(pace::pace_refresh_gates_open(g)) << "xch_recovery";
+}
+
+TEST(PaceRefreshAge, HalfTheFreshnessBoundAtLeastOne) {
+    EXPECT_EQ(pace::pace_refresh_age_blocks(20u), 10u);
+    EXPECT_EQ(pace::pace_refresh_age_blocks(21u), 10u);
+    EXPECT_EQ(pace::pace_refresh_age_blocks(3u), 1u);
+    EXPECT_EQ(pace::pace_refresh_age_blocks(1u), 1u);
+    EXPECT_EQ(pace::pace_refresh_age_blocks(0u), 1u);
+}
+
+TEST(PaceRefreshDue, MissingOrUnvalidatedEntryIsDue) {
+    EXPECT_TRUE(pace::pace_refresh_due(false, false, 0u, false, 0u, kNow, 10u));
+    EXPECT_TRUE(pace::pace_refresh_due(true, false, kNow, false, 0u, kNow, 10u));
+}
+
+TEST(PaceRefreshDue, DueFromHalfTheFreshnessBound) {
+    EXPECT_FALSE(pace::pace_refresh_due(true, true, kNow - 9u, false, 0u, kNow, 10u));
+    EXPECT_TRUE(pace::pace_refresh_due(true, true, kNow - 10u, false, 0u, kNow, 10u));
+}
+
+TEST(PaceRefreshDue, BacksOffAfterAnyAttempt) {
+    // A stale entry whose last attempt, good or bad, was 9 blocks ago waits;
+    // at 10 blocks it is retried.
+    EXPECT_FALSE(pace::pace_refresh_due(true, true, kNow - 30u, true, kNow - 9u, kNow, 10u));
+    EXPECT_TRUE(pace::pace_refresh_due(true, true, kNow - 30u, true, kNow - 10u, kNow, 10u));
+}
+
+TEST(PaceRefreshDue, HeightRegressionWaits) {
+    EXPECT_FALSE(pace::pace_refresh_due(true, true, kNow + 5u, false, 0u, kNow, 10u));
+    EXPECT_FALSE(pace::pace_refresh_due(false, false, 0u, true, kNow + 5u, kNow, 10u));
+}
+
+// ============================================================================
 // P22 (live fixture unless stated; "plan" is pairs.at("XCH/BYC"), "status" is
 // assets[0].status)
 // ============================================================================
@@ -1432,6 +1743,9 @@ void expect_memory(const pace::AssetMemory& m, bool active, std::uint32_t ramp, 
 
 pace::PaceStatus status_of(const pace::PaceDecision& d)
 {
+    // One decision per pace asset (the fixture paces BYC only).  A decision
+    // that was never produced must fail the test, not read as DataUnavailable.
+    EXPECT_EQ(d.assets.size(), 1u);
     return d.assets.empty() ? pace::PaceStatus::DataUnavailable : d.assets[0].status;
 }
 

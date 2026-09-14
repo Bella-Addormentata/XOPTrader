@@ -3658,9 +3658,9 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
     // flash-crash update and after the config reload above, so a live disable
     // is already applied.  A failed evaluation leaves every plan inert for
     // this heartbeat (the latch is kept) and clears the remaining budget, so
-    // Step 9f refuses spends of an Active asset.
-    if (config_.strategy.pace_enabled && !wallet_circuit_open_
-            && !watchdog_fired_.load(std::memory_order_acquire)) {
+    // Step 9f refuses spends of an Active asset.  refresh_pace_balances checks
+    // every posting gate itself (P25), before any wallet RPC.
+    if (config_.strategy.pace_enabled) {
         try { co_await refresh_pace_balances(block_height); }
         catch (const std::exception& e) {
             spdlog::warn("[Engine] Pace balance refresh failed: {}", e.what());
@@ -6323,27 +6323,47 @@ std::optional<std::string> Engine::pace_asset_id_for_key(const std::string& key)
 
 asio::awaitable<void> Engine::refresh_pace_balances(BlockHeight block_height)
 {
-    if (!config_.strategy.pace_enabled || wallet_circuit_open_
-        || watchdog_fired_.load(std::memory_order_acquire) || !offer_mgr_ || !wallet_) {
+    // [PACE round 2] No wallet RPC while any gate that stops Step 8 from
+    // posting is closed (the balances only feed a plan that could not post),
+    // nor while the wallet has failed since Step 2's or Step 8's last success:
+    // pace must not add timeouts to a wallet brown-out ahead of Step 6.  The
+    // decision is the pure header's (P25).
+    strategy::pace::RefreshGates pace_gates{};
+    pace_gates.pace_enabled                = config_.strategy.pace_enabled;
+    pace_gates.dry_run                     = dry_run_;
+    pace_gates.wallet_circuit_open         = wallet_circuit_open_;
+    pace_gates.watchdog_fired              = watchdog_fired_.load(std::memory_order_acquire);
+    pace_gates.wallet_consecutive_failures = wallet_consecutive_failures_;
+    pace_gates.gui_pause                   = gui_pause_active_;
+    pace_gates.breaker_pause               = breaker_pause_active_;
+    pace_gates.cancel_all_inflight         = cancel_all_inflight_;
+    pace_gates.cancel_all_draining         = cancel_all_draining_;
+    pace_gates.flash_crash_normal          = (flash_crash_state_ == FlashCrashState::Normal);
+    pace_gates.xch_recovery                = xch_recovery_mode_;
+    if (!strategy::pace::pace_refresh_gates_open(pace_gates) || !offer_mgr_ || !wallet_) {
         co_return;
     }
     std::set<std::string> pace_keys;
     for (const auto& kv : config_.strategy.asset_target_allocations) { pace_keys.insert(kv.first); }
     for (const auto& pace_asset : config_.strategy.pace_assets) { pace_keys.insert(pace_asset); }
-    // Refresh at half the freshness bound (saturating at 1), so an entry this
-    // refresh maintains is fresh on every heartbeat in between.
+    // h = max(1, max_age / 2): an entry refreshed every h blocks stays fresh,
+    // and the per-asset backoff retries a failed attempt at age 2h.
     const std::uint32_t pace_refresh_age =
-        std::max<std::uint32_t>(1u, config_.strategy.pace_max_balance_age_blocks / 2u);
+        strategy::pace::pace_refresh_age_blocks(config_.strategy.pace_max_balance_age_blocks);
     for (const auto& pace_key : pace_keys) {
         const auto pace_id = pace_asset_id_for_key(pace_key);
         if (!pace_id) {
             continue;
         }
         const auto pace_cached = cached_wallet_balances_.find(*pace_id);
-        const bool pace_needs_refresh = pace_cached == cached_wallet_balances_.end()
-            || !pace_cached->second.fields_validated
-            || strategy::pace::sat_sub_blocks(block_height, pace_cached->second.as_of_block) >= pace_refresh_age;
-        if (!pace_needs_refresh) {
+        const bool pace_cache_present = (pace_cached != cached_wallet_balances_.end());
+        const auto pace_attempt = pace_refresh_attempted_at_.find(*pace_id);
+        const bool pace_attempted = (pace_attempt != pace_refresh_attempted_at_.end());
+        if (!strategy::pace::pace_refresh_due(
+                pace_cache_present, pace_cache_present && pace_cached->second.fields_validated,
+                pace_cache_present ? pace_cached->second.as_of_block : BlockHeight{0},
+                pace_attempted, pace_attempted ? pace_attempt->second : BlockHeight{0},
+                block_height, pace_refresh_age)) {
             continue;
         }
         // The CAT wallet-id map fills lazily in post_quotes, so the first
@@ -6352,6 +6372,11 @@ asio::awaitable<void> Engine::refresh_pace_balances(BlockHeight block_height)
         if (pace_wid <= 0) {
             continue;
         }
+        // Recorded BEFORE the RPC: a failed, timed-out or malformed attempt
+        // backs off exactly like a good one, so this refresh sends at most one
+        // balance RPC per asset per refresh age.
+        pace_refresh_attempted_at_[*pace_id] = block_height;
+        std::string pace_failure;
         try {
             auto pace_bal = co_await wallet_->get_wallet_balance(pace_wid);
             Mojo spendable = 0, confirmed = 0, pending = 0;
@@ -6361,14 +6386,36 @@ asio::awaitable<void> Engine::refresh_pace_balances(BlockHeight block_height)
                 confirmed = pace_bal["confirmed_wallet_balance"].get<Mojo>();
             if (pace_bal.contains("pending_change"))
                 pending = pace_bal["pending_change"].get<Mojo>();
+            const bool pace_fields_validated = pace_bal.contains("confirmed_wallet_balance")
+                && pace_bal.contains("pending_change");
             // The liveness refresh's exact write shape: a defaulted zero is
             // never marked validated.
             cached_wallet_balances_[*pace_id] =
-                {spendable, confirmed, pending, block_height,
-                 pace_bal.contains("confirmed_wallet_balance")
-                     && pace_bal.contains("pending_change")};
+                {spendable, confirmed, pending, block_height, pace_fields_validated};
+            if (!pace_fields_validated) {
+                pace_failure = "the reply lacks confirmed_wallet_balance or pending_change";
+            }
         } catch (const std::exception& e) {
-            spdlog::debug("[Engine] Pace: balance refresh for {} failed: {}", pace_key, e.what());
+            pace_failure = e.what();
+        }
+        if (pace_failure.empty()) {
+            const auto pace_fail_it = pace_refresh_failures_.find(*pace_id);
+            if (pace_fail_it != pace_refresh_failures_.end()) {
+                spdlog::info("[Engine] Pace: balance refresh for {} recovered after {} failed attempt(s)",
+                             pace_key, pace_fail_it->second);
+                pace_refresh_failures_.erase(pace_fail_it);
+            }
+            continue;
+        }
+        // Rate-limited: warn on the first failure of a run and on every 10th
+        // (attempts are already a refresh age apart), debug otherwise.
+        const std::uint32_t pace_failures = ++pace_refresh_failures_[*pace_id];
+        if (pace_failures == 1u || pace_failures % 10u == 0u) {
+            spdlog::warn("[Engine] Pace: balance refresh for {} failed ({} in a row; next attempt in >= {} "
+                         "blocks): {}", pace_key, pace_failures, pace_refresh_age, pace_failure);
+        } else {
+            spdlog::debug("[Engine] Pace: balance refresh for {} failed ({} in a row): {}",
+                          pace_key, pace_failures, pace_failure);
         }
     }
     co_return;
@@ -6385,6 +6432,8 @@ void Engine::step_evaluate_pace(BlockHeight block_height)
         pace_assets_consumed_this_cycle_.clear();
         pace_last_status_.clear();
         pace_band_conflict_logged_.clear();
+        pace_refresh_attempted_at_.clear();
+        pace_refresh_failures_.clear();
         return;
     }
 
@@ -10031,6 +10080,12 @@ void Engine::step_generate_ladder(BlockHeight block_height)
             }
         }
 
+        // [PACE round 2] The order-book guard's per-tier step (above): pace tiers
+        // keep at least this spacing, in the price post-pass (P17) and in the
+        // fair-value cap after the size post-pass (P24).
+        const double pace_tier_spacing_bps =
+            std::max(50.0, config_.strategy.fair_value_clamp_tier_step_bps);
+
         // -- [PACE 2026-09-13] Pace price post-pass ---------------------------
         // When a pace asset is behind schedule, tighten its pair's bids toward
         // FV x (1 - max(min_edge, k x sigma)).  Placed after every pass that
@@ -10085,7 +10140,7 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                     (pair_cfg && pair_cfg->bbo_sanity_max_passive_dev_override.has_value())
                         ? pair_cfg->bbo_sanity_max_passive_dev_override.value()
                         : config_.strategy.bbo_sanity_max_passive_dev;
-                pace_guards.tier_step_bps = std::max(1.0, config_.strategy.fair_value_clamp_tier_step_bps);
+                pace_guards.tier_step_bps = pace_tier_spacing_bps;
                 Mojo pace_tier0_before = 0;
                 for (const auto& pace_tq : pcs.ladder) {
                     if (pace_tq.side == Side::Bid && pace_tq.tier_index == 0) { pace_tier0_before = pace_tq.price; }
@@ -10202,13 +10257,31 @@ void Engine::step_generate_ladder(BlockHeight block_height)
 
             // -- [PACE 2026-09-13] Pace size post-pass -------------------------
             // A pace-managed pair keeps only the bid tiers whose INDEX is below
-            // the composed tier count, at the composed tier size scaled by the
-            // throttle's bid size scale, and posts no ask.  After the up-scale
-            // above (the pace size already meets the pair minimum), before the
-            // funding re-enforcement and the dust filter below, which still run.
+            // the composed tier count and posts no ask.  Every kept tier gets
+            // the composed tier size scaled by the throttle's bid size scale,
+            // which can RAISE a tier above its ladder size (1.0 -> 1.213 XCH
+            // today); the kept total stays within the composed pool.  After
+            // the up-scale above (the pace size already meets the pair
+            // minimum), before the funding re-enforcement and the dust filter
+            // below, which still run and still drop unfundable tiers.
             if (config_.strategy.pace_enabled && pcs.pace.managed) {
                 pcs.pace.throttle_bid_size_scale = pace_bid_throttle_scale;
                 strategy::pace::shape_bid_side(pcs.ladder, pcs.pace);
+                // [PACE round 2] The fair-value cap on every kept bid, whatever
+                // the state of the price post-pass above, which runs only when
+                // behind schedule and neither throttled nor widened: nothing
+                // else keeps a centre-blend bid below fair value.  Step 8 writes
+                // no bid price after this point, so these are the posted prices.
+                const strategy::pace::FairValueCap pace_cap = strategy::pace::cap_bids_at_fair_value(
+                    pcs.ladder, pcs.pace, config_.strategy.pace_min_edge_bps,
+                    config_.strategy.pace_edge_sigma_mult, pace_tier_spacing_bps,
+                    static_cast<double>(pcs.quote_mid_mojos));
+                if (pace_cap.lowered > 0u || pace_cap.dropped > 0u) {
+                    spdlog::info("[Engine] Step 7: {} pace fair-value cap {}: lowered {} bid(s), dropped {} "
+                                 "(fv={:.6f} sigma={:.0f}bps spacing={:.0f}bps)",
+                                 pair_name, pace_cap.cap_px, pace_cap.lowered, pace_cap.dropped,
+                                 pcs.pace.fv_price, pcs.pace.fv_sigma_bps, pace_tier_spacing_bps);
+                }
             }
 
             // -- [S3 rounds 5+7] Re-enforce EVERY side's funding budget
@@ -10502,6 +10575,8 @@ asio::awaitable<void> Engine::step_enforce_pace_caps(BlockHeight block_height,
                 pace_resting, pcs.pace, pace_pc->base_mojos_per_unit, pace_pc->quote_mojos_per_unit);
             pace_add(pace_pick.increasing_ids, "pace_increasing");
             pace_add(pace_pick.tier_ids, "pace_tier");
+            // [PACE round 2] Resting bids a fair-value drop left above fair value.
+            pace_add(strategy::pace::select_resting_above_fair_value(pace_resting, pcs.pace), "pace_above_fv");
             pace_add(pace_pick.budget_ids, "pace_budget");
         }
         if (pace_ids.empty()) {
@@ -20634,14 +20709,17 @@ asio::awaitable<void> Engine::check_config_reload_flag()
         fresh = load_config(config_file_path_, secrets_file_path_);
     } catch (const std::exception& e) {
         spdlog::error("[Engine] [RELOAD] saved config was rejected: {} -- "
-                      "the engine keeps running on its previous settings",
+                      "the engine keeps running on its previous settings; NOTHING in "
+                      "this save was applied, pair and pace disables included",
                       e.what());
         if (alerts_) {
             alerts_->send_alert(
                 AlertRule::ConfigReload,
                 "Re-read " + config_file_path_ + ": REJECTED ("
                 + std::string(e.what())
-                + "). The engine keeps running on its previous settings.");
+                + "). The engine keeps running on its previous settings. NOTHING in "
+                  "this save was applied -- a pair disable or pace_enabled: false in "
+                  "the same save included. Fix the key named above and save again.");
         }
         co_return;
     }

@@ -2484,6 +2484,11 @@ private:
     std::unordered_set<std::string>                              pace_assets_consumed_this_cycle_{};
     std::unordered_map<std::string, strategy::pace::PaceStatus>  pace_last_status_{};
     std::unordered_set<std::string>                              pace_band_conflict_logged_{};
+    // [PACE round 2] refresh_pace_balances' own per-asset backoff: the block of
+    // its last balance RPC for each asset id, whatever the outcome, and the
+    // failures in a row it has seen there (for the rate-limited warning).
+    std::unordered_map<std::string, BlockHeight>                 pace_refresh_attempted_at_{};
+    std::unordered_map<std::string, std::uint32_t>               pace_refresh_failures_{};
 
     // -- [PNL-BASIS-PERSIST 2026-07-30] One-shot wallet reconcile ---------
     // After restart the restored inventory quantities can drift from the

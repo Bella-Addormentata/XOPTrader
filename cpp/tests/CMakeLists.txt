@@ -59,6 +59,7 @@ add_executable(xop_tests
     test_market_analyzer.cpp
     test_limits.cpp
     test_pace_controller.cpp
+    test_pace_wiring.cpp
     test_config.cpp
     test_config_reload.cpp
     test_reconcile_verdict.cpp
@@ -128,6 +129,13 @@ target_link_libraries(xop_tests
 target_include_directories(xop_tests
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../include
+)
+
+# [PACE round 2] test_pace_wiring.cpp scans the pace glue in engine.cpp, which
+# no unit test can construct.
+target_compile_definitions(xop_tests
+    PRIVATE
+        XOP_TESTS_ENGINE_CPP="${CMAKE_CURRENT_SOURCE_DIR}/../src/engine.cpp"
 )
 
 # Register with CTest so that `ctest` discovers and runs the tests.

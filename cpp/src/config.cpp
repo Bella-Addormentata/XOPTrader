@@ -3964,8 +3964,10 @@ void validate_pair_concentration_overrides(const AppConfig& cfg)
         if (!(soft_eff < hard_eff)) {
             throw ConfigError("pairs[" + std::to_string(i) + "] (" + pc.name
                               + "): effective soft limit " + std::to_string(soft_eff)
+                              + " (soft_limit_pct_override, else risk.soft_limit_pct)"
                               + " must be below effective hard limit "
-                              + std::to_string(hard_eff));
+                              + std::to_string(hard_eff)
+                              + " (hard_limit_pct_override, else risk.hard_limit_pct)");
         }
         if (soft_eff != cfg.risk.soft_limit_pct || hard_eff != cfg.risk.hard_limit_pct) {
             spdlog::warn("[Config] pairs[{}] ({}): concentration limits overridden -- "

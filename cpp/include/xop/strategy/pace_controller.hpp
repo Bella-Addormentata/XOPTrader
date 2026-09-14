@@ -20,9 +20,12 @@
 //     risk limits run, so they always apply.  Step 7 composes the pool with
 //     the risk-tapered bid, the CAT wallet cap, a wallet-truth concentration
 //     keep and the drift scale, re-plans the tiers, and zeroes the ask.
-//   * PRICE: when behind schedule the bid is tightened toward
-//     FV x (1 - max(min_edge, k x sigma)); never inside the width floor, never
-//     crossing, never failing Step 8's BBO proximity check.
+//   * PRICE: every kept bid is capped at FV x (1 - max(min_edge, k x sigma)),
+//     tiers spaced like the order-book guard, whatever the tightening state
+//     (P24), and a resting bid a fair-value drop left above fair value is
+//     cancelled (P26).  When behind schedule the bid is tightened toward that
+//     cap; never inside the width floor, never crossing, never failing Step 8's
+//     BBO proximity check.
 //
 // Every decision is a pure function of its arguments, so cpp/tests drives it
 // directly (S36: no Engine is constructed in xop_tests).  The engine glue
@@ -327,6 +330,29 @@ struct CancelPick {
     std::vector<std::string> budget_ids{};
     std::vector<std::string> tier_ids{};
     std::vector<std::string> increasing_ids{};
+};
+
+/// P24's result, for the Step 7 log.
+struct FairValueCap {
+    Mojo          cap_px{0};       ///< 0 when the plan's fair value is unusable
+    std::uint32_t lowered{0};
+    std::uint32_t dropped{0};
+};
+
+/// The engine states P25 reads.  A default-constructed value is closed
+/// (pace_enabled and flash_crash_normal are false).
+struct RefreshGates {
+    bool          pace_enabled{false};
+    bool          dry_run{false};
+    bool          wallet_circuit_open{false};
+    bool          watchdog_fired{false};
+    std::uint32_t wallet_consecutive_failures{0};
+    bool          gui_pause{false};
+    bool          breaker_pause{false};
+    bool          cancel_all_inflight{false};
+    bool          cancel_all_draining{false};
+    bool          flash_crash_normal{false};
+    bool          xch_recovery{false};
 };
 
 // ===========================================================================
@@ -719,7 +745,7 @@ static_assert(balance_is_fresh(true, 130u, 120u, 20u));
 // ===========================================================================
 
 /// P16: the most aggressive bid, in step quanta up to `tighten_bps` above
-/// `base_px`, that stays strictly below the ceiling
+/// `base_px`, that is at most floor(ceiling), where the ceiling is
 ///     min(FV x (1 - max(min_edge, k x sigma)), centre x (1 - min half-spread),
 ///         best ask x (1 - book margin))
 /// and passes both Step 8 gates this header can evaluate: classify_cross_bbo
@@ -776,11 +802,13 @@ static_assert(balance_is_fresh(true, 130u, 120u, 20u));
 }
 
 /// P17: tighten every bid of a ladder with P16, walking bids in ascending
-/// tier_index.  A tier that would reach or pass the tier above it is pulled
-/// back to tier_step_bps below that tier's final price -- but never below its
-/// own untightened price.  spread_bps is resynced against centre_px for a
-/// moved tier.  Asks are untouched.  Returns the untightened bid prices,
-/// indexed by tier_index (0 where the ladder has no such bid).
+/// tier_index.  A tier P16 moved must stay at least tier_step_bps below the
+/// final price of the tier above it, and strictly below it -- the engine
+/// passes the order-book guard's own per-tier step, max(50,
+/// fair_value_clamp_tier_step_bps) -- but never below its own untightened
+/// price.  spread_bps is resynced against centre_px for every walked bid.
+/// Asks are untouched.  Returns the untightened bid prices, indexed by
+/// tier_index (0 where the ladder has no such bid).
 inline std::vector<Mojo> tighten_bid_side(std::vector<TierQuote>& ladder, double tighten_bps,
                                           double step_bps, const PriceGuards& g)
 {
@@ -802,16 +830,16 @@ inline std::vector<Mojo> tighten_bid_side(std::vector<TierQuote>& ladder, double
         const Mojo orig = bid->price;
         untight[static_cast<std::size_t>(bid->tier_index)] = orig;
         Mojo new_px = apply_pace_bid_price(orig, tighten_bps, step_bps, g);
-        if (new_px > orig && prev_final.has_value() && new_px >= *prev_final) {
+        if (new_px > orig && prev_final.has_value()) {
             Mojo lim = to_mojo_checked(std::floor(static_cast<double>(*prev_final) * (1.0 - g.tier_step_bps / 1e4))).value_or(0);
             lim = std::min(lim, *prev_final - 1);
-            new_px = std::max(orig, lim);
-        }
-        if (new_px != orig) {
-            bid->price = new_px;
-            if (g.centre_px > 0.0) {
-                bid->spread_bps = (static_cast<double>(bid->price) - g.centre_px) / g.centre_px * 1e4;
+            if (new_px > lim) {
+                new_px = std::max(orig, lim);
             }
+        }
+        bid->price = new_px;
+        if (g.centre_px > 0.0) {
+            bid->spread_bps = (static_cast<double>(bid->price) - g.centre_px) / g.centre_px * 1e4;
         }
         prev_final = bid->price;
     }
@@ -849,9 +877,86 @@ inline void shape_bid_side(std::vector<TierQuote>& ladder, const PairPlan& plan)
     ladder = std::move(kept);
 }
 
+/// P24: the fair-value cap on EVERY kept bid of a managed, non-hold plan,
+/// whatever the tightening state -- Stage B's tighten 0, the first-day ramp,
+/// ahead of schedule, a throttled or residual-widened heartbeat -- so no pace
+/// bid is posted above floor(FV x (1 - max(min_edge, k x sigma))), the bound
+/// P16 tightens toward.  FV and sigma are the plan's own: the fair value this
+/// heartbeat's plan was sized on.  Bids are walked in ascending tier_index
+/// against a running ceiling: the cap for the first, and for each later bid
+/// also `spacing_bps` (the order-book guard's per-tier step) below the final
+/// price of the bid above it, and at least 1 mojo below it.  A bid above its
+/// ceiling is lowered to it, with spread_bps resynced against `centre_px` when
+/// that is > 0.  A bid whose ceiling is not > 0 cannot fit and is erased.
+/// Every bid is erased when the cap cannot be computed (a fair value that is
+/// not finite and > 0, min_edge not > 0, a negative or non-finite sigma,
+/// multiplier or spacing, or an edge of 100% or more): a bid that cannot be
+/// bounded is not posted.  Asks are untouched.  Unmanaged or hold: no-op.
+inline FairValueCap cap_bids_at_fair_value(std::vector<TierQuote>& ladder, const PairPlan& plan,
+                                           double min_edge_bps, double edge_sigma_mult,
+                                           double spacing_bps, double centre_px)
+{
+    FairValueCap out{};
+    if (!plan.managed || plan.hold) { return out; }
+    std::optional<Mojo> cap;
+    if (std::isfinite(plan.fv_price) && std::isfinite(plan.fv_sigma_bps) && std::isfinite(min_edge_bps)
+        && std::isfinite(edge_sigma_mult) && std::isfinite(spacing_bps) && plan.fv_price > 0.0
+        && min_edge_bps > 0.0 && plan.fv_sigma_bps >= 0.0 && edge_sigma_mult >= 0.0 && spacing_bps >= 0.0) {
+        const double edge = std::max(min_edge_bps, edge_sigma_mult * plan.fv_sigma_bps);
+        if (edge < 10'000.0) {
+            const double fv_px = plan.fv_price * static_cast<double>(kMojosPerXch);
+            cap = to_mojo_checked(std::floor(fv_px * (1.0 - edge / 1e4)));
+        }
+    }
+    std::vector<std::size_t> order;
+    order.reserve(ladder.size());
+    for (std::size_t i = 0; i < ladder.size(); ++i) {
+        if (ladder[i].side == Side::Bid) { order.push_back(i); }
+    }
+    std::stable_sort(order.begin(), order.end(), [&ladder](std::size_t lhs, std::size_t rhs) {
+        return ladder[lhs].tier_index < ladder[rhs].tier_index;
+    });
+    std::vector<bool> dropped_at(ladder.size(), false);
+    std::optional<Mojo> prev_final;
+    for (const std::size_t i : order) {
+        TierQuote& bid = ladder[i];
+        Mojo ceiling = cap.value_or(0);
+        if (prev_final.has_value()) {
+            Mojo lim = to_mojo_checked(std::floor(static_cast<double>(*prev_final) * (1.0 - spacing_bps / 1e4))).value_or(0);
+            lim = std::min(lim, *prev_final - 1);
+            ceiling = std::min(ceiling, lim);
+        }
+        if (ceiling <= 0 || bid.price <= 0) {
+            dropped_at[i] = true;
+            ++out.dropped;
+            continue;
+        }
+        if (bid.price > ceiling) {
+            bid.price = ceiling;
+            ++out.lowered;
+            if (centre_px > 0.0) {
+                bid.spread_bps = (static_cast<double>(bid.price) - centre_px) / centre_px * 1e4;
+            }
+        }
+        prev_final = bid.price;
+    }
+    if (out.dropped > 0u) {
+        std::vector<TierQuote> kept;
+        kept.reserve(ladder.size());
+        for (std::size_t i = 0; i < ladder.size(); ++i) {
+            if (!dropped_at[i]) { kept.push_back(ladder[i]); }
+        }
+        ladder = std::move(kept);
+    }
+    out.cap_px = cap.value_or(0);
+    return out;
+}
+
 /// P19: which resting offers of a managed pair Step 8 cancels.  Nothing for a
-/// hold plan (a data blip must not cancel the ladder) or an unmanaged pair;
-/// cancel_pending offers are skipped.  Asks go to increasing_ids; bids with
+/// hold plan (a data blip must not cancel the ladder) or an unmanaged pair.
+/// cancel_pending offers are skipped, so a bid whose cancel never landed on
+/// chain does not count against the caps (#157 escalates such cancels).
+/// Asks go to increasing_ids; bids with
 /// tier >= plan.tiers to tier_ids, in input order.  The remaining bids must
 /// fit BOTH min(resting cap, remaining) in managed units and the composed
 /// pool in base mojos: widest first (tier desc, price asc, id asc) are popped
@@ -909,6 +1014,29 @@ inline CancelPick select_resting_to_cancel(const std::vector<RestingOffer>& rest
     return pick;
 }
 
+/// P26: the resting reducing bids of a managed, non-hold plan priced ABOVE
+/// the plan's fair value -- posted before a fair-value drop that the
+/// canceller's adverse-drift threshold (1.0-2.0% by tier) has not yet
+/// refreshed.  Step 8 cancels them (reason pace_above_fv), so no pace bid
+/// keeps selling the managed asset below fair value.  The bound is the fair
+/// value itself, not P24's cap, so ordinary fair-value noise causes no churn.
+/// Asks and cancel_pending offers are skipped (asks are already cancelled as
+/// the increasing side).  Empty for an unmanaged or hold plan, or when the
+/// plan's fair value is not finite and > 0.
+inline std::vector<std::string> select_resting_above_fair_value(const std::vector<RestingOffer>& resting,
+                                                                const PairPlan& plan)
+{
+    std::vector<std::string> ids;
+    if (!plan.managed || plan.hold) { return ids; }
+    const double fv_px = plan.fv_price * static_cast<double>(kMojosPerXch);
+    if (!(std::isfinite(fv_px) && fv_px > 0.0)) { return ids; }
+    for (const RestingOffer& o : resting) {
+        if (o.cancel_pending || o.side != Side::Bid) { continue; }
+        if (static_cast<double>(o.price) > fv_px) { ids.push_back(o.id); }
+    }
+    return ids;
+}
+
 /// P20: Step 8 reprices a Fresh resting pace bid only when the desired
 /// (tightened) price beats the UNTIGHTENED price at all AND beats the larger
 /// of the resting and untightened prices by min_improve_bps, and the offer is
@@ -940,6 +1068,45 @@ inline CancelPick select_resting_to_cancel(const std::vector<RestingOffer>& rest
     if (!(fv_price > 0.0)) { return false; }
     if (take_price > fv_price) { return false; }
     return take_units <= remaining_units;
+}
+
+// ===========================================================================
+// P25 -- the wallet balance refresh's gates and backoff (engine glue inputs)
+// ===========================================================================
+
+/// P25a: refresh_pace_balances sends no wallet RPC unless every gate that
+/// stops Step 8 from posting is open -- the balances only feed a plan that
+/// could not post -- and the wallet has not failed since the last success of
+/// Step 2 or Step 8 (wallet_consecutive_failures == 0).
+[[nodiscard]] constexpr bool pace_refresh_gates_open(const RefreshGates& g) noexcept
+{
+    return g.pace_enabled && !g.dry_run && !g.wallet_circuit_open && !g.watchdog_fired
+        && g.wallet_consecutive_failures == 0u && !g.gui_pause && !g.breaker_pause
+        && !g.cancel_all_inflight && !g.cancel_all_draining && g.flash_crash_normal && !g.xch_recovery;
+}
+
+/// P25b: the refresh age h = max(1, max_balance_age_blocks / 2).  An entry
+/// refreshed every h blocks stays fresh, and one failed attempt at age h is
+/// retried at age 2h <= max_age (for max_age >= 2), so a single transient
+/// failure never lets a maintained balance go stale.
+[[nodiscard]] constexpr std::uint32_t pace_refresh_age_blocks(std::uint32_t max_balance_age_blocks) noexcept
+{
+    return std::max<std::uint32_t>(1u, max_balance_age_blocks / 2u);
+}
+
+/// P25c: one asset's refresh is due when its cached entry is missing,
+/// unvalidated or at least `refresh_age` blocks old -- and this refresh has
+/// not attempted the asset in the last `refresh_age` blocks, whatever that
+/// attempt's outcome.  So a failing, timing-out or malformed wallet reply
+/// costs at most one RPC per asset per `refresh_age` blocks.  A height
+/// regression counts as zero elapsed on both clocks.
+[[nodiscard]] constexpr bool pace_refresh_due(bool cached, bool validated, BlockHeight as_of, bool attempted,
+                                              BlockHeight last_attempt, BlockHeight now,
+                                              std::uint32_t refresh_age) noexcept
+{
+    const bool stale = !cached || !validated || sat_sub_blocks(now, as_of) >= refresh_age;
+    const bool backed_off = attempted && sat_sub_blocks(now, last_attempt) < refresh_age;
+    return stale && !backed_off;
 }
 
 // ===========================================================================
