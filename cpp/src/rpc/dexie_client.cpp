@@ -588,8 +588,8 @@ OfferRecord DexieClient::parse_offer_(const nlohmann::json& j) {
     return o;
 }
 
-TickerData DexieClient::parse_ticker_(const nlohmann::json& j,
-                                      std::string_view base_asset) {
+TickerData parse_market_ticker(const nlohmann::json& j,
+                               std::string_view      market_key) {
     TickerData t;
     t.id          = json_string_or(j, "id");
     t.code        = json_string_or(j, "code");
@@ -601,36 +601,39 @@ TickerData DexieClient::parse_ticker_(const nlohmann::json& j,
     // Volume -- keyed by asset id.
     if (j.contains("volume") && j["volume"].is_object()) {
         const auto& vol = j["volume"];
-        // XCH-denominated daily volume.
-        const std::string base_key(base_asset);
-        if (vol.contains(base_key) && vol[base_key].is_object()) {
-            t.volume_xch_daily = json_number_or<double>(vol[base_key], "daily", 0.0);
+        // Daily volume in the market key's asset (XCH under "xch").
+        const std::string key_id(market_key);
+        if (vol.contains(key_id) && vol[key_id].is_object()) {
+            t.volume_xch_daily = json_number_or<double>(vol[key_id], "daily", 0.0);
         }
-        // Quote-token-denominated daily volume.
+        // Daily volume in the listed token.
         if (vol.contains(t.id) && vol[t.id].is_object()) {
             t.volume_quote_daily = json_number_or<double>(vol[t.id], "daily", 0.0);
         }
     }
 
-    // Prices.
+    // Prices, in market-key units per token.  Dexie names the depth arrays
+    // for the TAKER: "buy" is what buying the token costs -- its ASK -- and
+    // "sell" is what selling it fetches -- its BID.  Reading "buy" as the
+    // bid was the defect; see TickerData for the evidence.
     if (j.contains("prices") && j["prices"].is_object()) {
         const auto& px = j["prices"];
 
-        // Best bid (buy depth 0).
+        // Best ASK: "buy" at depth 0.
         if (px.contains("buy") && px["buy"].is_array()) {
             for (const auto& lvl : px["buy"]) {
                 if (json_number_or<int>(lvl, "depth", -1) == 0) {
-                    t.price_buy = json_number_or<double>(lvl, "price", 0.0);
+                    t.best_ask = json_number_or<double>(lvl, "price", 0.0);
                     break;
                 }
             }
         }
 
-        // Best ask (sell depth 0).
+        // Best BID: "sell" at depth 0.
         if (px.contains("sell") && px["sell"].is_array()) {
             for (const auto& lvl : px["sell"]) {
                 if (json_number_or<int>(lvl, "depth", -1) == 0) {
-                    t.price_sell = json_number_or<double>(lvl, "price", 0.0);
+                    t.best_bid = json_number_or<double>(lvl, "price", 0.0);
                     break;
                 }
             }
@@ -651,6 +654,66 @@ TickerData DexieClient::parse_ticker_(const nlohmann::json& j,
     }
 
     return t;
+}
+
+std::optional<MarketTickerMatch> orient_market_ticker(
+    const nlohmann::json& markets,
+    std::string_view      base_asset_id,
+    std::string_view      quote_asset_id) {
+
+    if (!markets.is_object()) {
+        return std::nullopt;
+    }
+
+    const auto invert = [](double v) -> double {
+        return v > 0.0 ? (1.0 / v) : 0.0;
+    };
+
+    // --- Case (A): the market key is the requested BASE ---
+    for (const auto& [market_key, listing] : markets.items()) {
+        if (market_key != base_asset_id || !listing.is_array()) {
+            continue;
+        }
+        for (const auto& entry : listing) {
+            if (!entry.is_object()
+                || json_string_or(entry, "id") != quote_asset_id) {
+                continue;
+            }
+            MarketTickerMatch match;
+            match.listed   = parse_market_ticker(entry, market_key);
+            match.inverted = true;
+            match.oriented = match.listed;  // identity and volume fields
+            // A bid for the pair's base is paid in the token -- an offer to
+            // SELL the token, i.e. a token ask -- so each side comes from the
+            // opposite side of the listing.  The extremes swap the same way.
+            match.oriented.best_bid   = invert(match.listed.best_ask);
+            match.oriented.best_ask   = invert(match.listed.best_bid);
+            match.oriented.price_last = invert(match.listed.price_last);
+            match.oriented.price_high = invert(match.listed.price_low);
+            match.oriented.price_low  = invert(match.listed.price_high);
+            return match;
+        }
+    }
+
+    // --- Case (B): the market key is the requested QUOTE ---
+    for (const auto& [market_key, listing] : markets.items()) {
+        if (market_key != quote_asset_id || !listing.is_array()) {
+            continue;
+        }
+        for (const auto& entry : listing) {
+            if (!entry.is_object()
+                || json_string_or(entry, "id") != base_asset_id) {
+                continue;
+            }
+            MarketTickerMatch match;
+            match.listed   = parse_market_ticker(entry, market_key);
+            // Already quote per base: the listing's own sides are the pair's.
+            match.oriented = match.listed;
+            return match;
+        }
+    }
+
+    return std::nullopt;
 }
 
 // =======================================================================
@@ -753,12 +816,12 @@ asio::awaitable<std::vector<TickerData>> DexieClient::get_tickers() {
         co_return result;
     }
 
-    for (const auto& [base_asset, market_array] : json["markets"].items()) {
+    for (const auto& [market_key, market_array] : json["markets"].items()) {
         if (!market_array.is_array()) {
             continue;
         }
         for (const auto& m : market_array) {
-            result.push_back(parse_ticker_(m, base_asset));
+            result.push_back(parse_market_ticker(m, market_key));
         }
     }
 
@@ -785,81 +848,30 @@ asio::awaitable<std::optional<TickerData>> DexieClient::get_ticker(
         co_return std::nullopt;
     }
 
-    // --- Price-direction helper ---
-    // Dexie markets are always denominated in XCH: the JSON key in
-    // markets["xch"] is the denomination currency, and each array entry
-    // is a CAT token.  Prices are "XCH per CAT" (denomination per token).
-    //
-    // Our pair convention is quote-per-base.  Two cases arise:
-    //
-    //  (A) base_asset_id matches the JSON key  (e.g. pair XCH/wUSDC.b)
-    //      → raw prices are base-per-quote (XCH per CAT) — reciprocal
-    //        of what we need.  Invert and swap bid/ask.
-    //
-    //  (B) quote_asset_id matches the JSON key  (e.g. pair wUSDC.b/XCH)
-    //      → raw prices are quote-per-base (XCH per CAT) — already the
-    //        correct direction.  No inversion needed.
-    auto invert_price = [](double v) -> double {
-        return v > 0.0 ? (1.0 / v) : 0.0;
-    };
-
-    // --- Case (A): base_asset_id == JSON key → invert ---
-    for (const auto& [base_asset, market_array] : json["markets"].items()) {
-        if (base_asset != base_asset_id) {
-            continue;
-        }
-        if (!market_array.is_array()) {
-            continue;
-        }
-        for (const auto& m : market_array) {
-            if (m.value("id", "") == quote_asset_id) {
-                auto td = parse_ticker_(m, base_asset);
-
-                const double raw_buy  = td.price_buy;
-                const double raw_sell = td.price_sell;
-                const double raw_high = td.price_high;
-                const double raw_low  = td.price_low;
-
-                td.price_buy  = invert_price(raw_sell);
-                td.price_sell = invert_price(raw_buy);
-                td.price_last = invert_price(td.price_last);
-                td.price_high = invert_price(raw_low);
-                td.price_low  = invert_price(raw_high);
-
-                log_->info("get_ticker -> found {} ({}) [inverted: "
-                           "raw_buy={:.6f} raw_sell={:.6f} -> "
-                           "buy={:.6f} sell={:.6f}]",
-                           td.code, td.pair_id,
-                           raw_buy, raw_sell,
-                           td.price_buy, td.price_sell);
-                co_return td;
-            }
-        }
+    // Finding and orienting the entry is pure -- orient_market_ticker(),
+    // driven by test_dexie_market_ticker.cpp -- so which Dexie array is the
+    // bid is pinned without HTTP.  See TickerData for the convention, and
+    // note markets are keyed by XCH OR by a CAT (BYC/wUSDC.b is Case B).
+    const auto match = orient_market_ticker(json["markets"],
+                                            base_asset_id, quote_asset_id);
+    if (!match) {
+        log_->info("get_ticker -> base_asset_id={}, quote_asset_id={} not found",
+                   base_asset_id, quote_asset_id);
+        co_return std::nullopt;
     }
 
-    // --- Case (B): quote_asset_id == JSON key → direct (no inversion) ---
-    for (const auto& [base_asset, market_array] : json["markets"].items()) {
-        if (base_asset != quote_asset_id) {
-            continue;
-        }
-        if (!market_array.is_array()) {
-            continue;
-        }
-        for (const auto& m : market_array) {
-            if (m.value("id", "") != base_asset_id) {
-                continue;
-            }
-
-            auto td = parse_ticker_(m, base_asset);
-            log_->info("get_ticker -> found direct market {} ({})",
-                       td.code, td.pair_id);
-            co_return td;
-        }
+    if (match->inverted) {
+        log_->info("get_ticker -> found {} ({}) [inverted: "
+                   "raw_buy(ask)={:.6f} raw_sell(bid)={:.6f} -> "
+                   "bid={:.6f} ask={:.6f}]",
+                   match->oriented.code, match->oriented.pair_id,
+                   match->listed.best_ask, match->listed.best_bid,
+                   match->oriented.best_bid, match->oriented.best_ask);
+    } else {
+        log_->info("get_ticker -> found direct market {} ({})",
+                   match->oriented.code, match->oriented.pair_id);
     }
-
-    log_->info("get_ticker -> base_asset_id={}, quote_asset_id={} not found",
-               base_asset_id, quote_asset_id);
-    co_return std::nullopt;
+    co_return match->oriented;
 }
 
 // -----------------------------------------------------------------------

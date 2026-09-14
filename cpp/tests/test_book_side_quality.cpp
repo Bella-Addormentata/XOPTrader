@@ -786,8 +786,15 @@ TEST(BookSideQualityFeed, AnUnexaminedRawBookIsNotRescuedByAFreshCexLeg)
     ASSERT_EQ(snap.book_side_ref, 0)
         << "precondition: book_side_ref is the witness, and it is 0 because "
            "classify_sides never examined this book";
-    ASSERT_GT(snap.spread_bps, 0);
-    ASSERT_LT(snap.spread_bps, 5000.0)
+    // [PR #159] Measured from the touches, not snap.spread_bps: a raw ticker
+    // BBO publishes spread 0 by design, while apply_mid_gate judges this
+    // book's coherence from dex_best_bid/ask directly -- 99.5 bps here.
+    ASSERT_GT(snap.best_bid, 0);
+    ASSERT_GT(snap.best_ask, snap.best_bid);
+    ASSERT_LT(static_cast<double>(snap.best_ask - snap.best_bid)
+                  / (static_cast<double>(snap.best_ask + snap.best_bid) / 2.0)
+                  * 10000.0,
+              5000.0)
         << "precondition: this book IS coherent, so the spread conjunct "
            "cannot be what refuses it -- otherwise this test is vacuous";
     ASSERT_GT(snap.mid_price, 0);
@@ -1950,8 +1957,15 @@ TEST(BookSideQualityFeed, ADisabledBandDoesNotRescueAnUnexaminedRawBook)
         << "precondition: the verdicts are TRIVIALLY true -- nothing ran";
     ASSERT_EQ(snap.book_side_ref, 0)
         << "precondition: classify_sides never examined this book";
-    ASSERT_GT(snap.spread_bps, 0);
-    ASSERT_LT(snap.spread_bps, 5000.0)
+    // [PR #159] Measured from the touches, not snap.spread_bps: a raw ticker
+    // BBO publishes spread 0 by design, while apply_mid_gate judges this
+    // book's coherence from dex_best_bid/ask directly -- 99.5 bps here.
+    ASSERT_GT(snap.best_bid, 0);
+    ASSERT_GT(snap.best_ask, snap.best_bid);
+    ASSERT_LT(static_cast<double>(snap.best_ask - snap.best_bid)
+                  / (static_cast<double>(snap.best_ask + snap.best_bid) / 2.0)
+                  * 10000.0,
+              5000.0)
         << "precondition: this book IS coherent, so the spread conjunct "
            "cannot be what refuses it -- otherwise this test is vacuous";
     ASSERT_GT(snap.mid_price, 0);
