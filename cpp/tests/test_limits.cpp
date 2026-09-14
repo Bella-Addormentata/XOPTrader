@@ -16,6 +16,7 @@
 #include <gtest/gtest.h>
 
 #include <xop/risk/limits.hpp>
+#include <xop/strategy/pace_controller.hpp>
 #include <xop/config.hpp>
 #include <xop/types.hpp>
 
@@ -1056,6 +1057,106 @@ TEST(LimitStatusOverride, ThreeArgForwardsGlobal) {
     const xop::LimitStatus legacy = ptc.get_limit_status("xch", "byc", state);
     EXPECT_TRUE(legacy.soft_limit_breached);
     EXPECT_FALSE(legacy.hard_limit_breached);
+}
+
+// ============================================================================
+// [PACE 2026-09-13] The pace pool reaches apply_limits as the bid, and the
+// risk rules still taper it (operator decision D1: pace always respects the
+// risk limits).  The 5-argument apply_limits, as Step 6 calls it for a pair
+// without overrides.  Literals from the spec's mirror.
+// ============================================================================
+
+// The live risk config: soft 0.60 / hard 0.80, CAT cap 0.25, pair cap 0.85.
+xop::RiskConfig risk_injection()
+{
+    xop::RiskConfig r;
+    r.soft_limit_pct           = 0.60;
+    r.hard_limit_pct           = 0.80;
+    r.single_cat_cap_pct       = 0.25;
+    r.max_capital_per_pair_pct = 0.85;
+    return r;
+}
+
+xop::strategy::pace::PairPlan pace_pool_plan(xop::Mojo pool, bool hold)
+{
+    xop::strategy::pace::PairPlan p{};
+    p.managed         = true;
+    p.hold            = hold;
+    p.pool_base_mojos = pool;
+    return p;
+}
+
+TEST(PaceInject, LiveCase_CatCapZeroesAsk_PaceBidSurvivesApplyLimits) {
+    const xop::RiskConfig risk = risk_injection();
+    const xop::StrategyConfig strat = strategy_35bps();
+    const xop::PreTradeCheck ptc(risk, strat);
+    xop::State state;
+    seed_unit_rate_portfolio(state, {{"xch", 2452}, {"byc", 4610}, {"dbx", 2069}});
+
+    // Today: the strategy's bid is 0 (q >= q_max) and the CAT cap zeroes the ask.
+    const xop::Quote strategy_quote = sized_quote(0, 44570);
+    EXPECT_FALSE(ptc.apply_limits(strategy_quote, "XCH/BYC", "xch", "byc", state).has_value());
+
+    const auto injected = ptc.apply_limits(
+        xop::strategy::pace::inject_reducing_side(strategy_quote, pace_pool_plan(2000, false)),
+        "XCH/BYC", "xch", "byc", state);
+    ASSERT_TRUE(injected.has_value());
+    EXPECT_EQ(injected->bid_size, 2000);
+    EXPECT_EQ(injected->ask_size, 0);
+}
+
+TEST(PaceInject, ReplacesLargerStrategySize) {
+    const xop::RiskConfig risk = risk_injection();
+    const xop::StrategyConfig strat = strategy_35bps();
+    const xop::PreTradeCheck ptc(risk, strat);
+    xop::State state;
+    seed_unit_rate_portfolio(state, {{"xch", 2452}, {"byc", 4610}, {"dbx", 2069}});
+    const auto got = ptc.apply_limits(
+        xop::strategy::pace::inject_reducing_side(sized_quote(9000, 0), pace_pool_plan(2000, false)),
+        "XCH/BYC", "xch", "byc", state);
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got->bid_size, 2000);
+    EXPECT_EQ(got->ask_size, 0);
+}
+
+TEST(PaceInject, UnmanagedPlanIsIdentity) {
+    const xop::RiskConfig risk = risk_injection();
+    const xop::StrategyConfig strat = strategy_35bps();
+    const xop::PreTradeCheck ptc(risk, strat);
+    xop::State state;
+    seed_unit_rate_portfolio(state, {{"xch", 2452}, {"byc", 4610}, {"dbx", 2069}});
+    const auto got = ptc.apply_limits(
+        xop::strategy::pace::inject_reducing_side(sized_quote(9000, 0), xop::strategy::pace::PairPlan{}),
+        "XCH/BYC", "xch", "byc", state);
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got->bid_size, 9000);
+    EXPECT_EQ(got->ask_size, 0);
+}
+
+TEST(PaceInject, HoldZeroesBid) {
+    const xop::RiskConfig risk = risk_injection();
+    const xop::StrategyConfig strat = strategy_35bps();
+    const xop::PreTradeCheck ptc(risk, strat);
+    xop::State state;
+    seed_unit_rate_portfolio(state, {{"xch", 2452}, {"byc", 4610}, {"dbx", 2069}});
+    EXPECT_FALSE(ptc.apply_limits(
+        xop::strategy::pace::inject_reducing_side(sized_quote(9000, 0), pace_pool_plan(2000, true)),
+        "XCH/BYC", "xch", "byc", state).has_value());
+}
+
+TEST(PaceInject, SoftLimitTapersInjectedBid) {
+    // base_conc 0.70 sits in the soft band: the injected 2000 keeps 0.525.
+    const xop::RiskConfig risk = risk_injection();
+    const xop::StrategyConfig strat = strategy_35bps();
+    const xop::PreTradeCheck ptc(risk, strat);
+    xop::State state;
+    seed_unit_rate_portfolio(state, {{"xch", 700}, {"byc", 300}, {"dbx", 800}});
+    const auto got = ptc.apply_limits(
+        xop::strategy::pace::inject_reducing_side(sized_quote(0, 0), pace_pool_plan(2000, false)),
+        "XCH/BYC", "xch", "byc", state);
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got->bid_size, 1050);
+    EXPECT_EQ(got->ask_size, 0);
 }
 
 // [PACE D1] The no-quote warn prints the limits the concentration rule applied

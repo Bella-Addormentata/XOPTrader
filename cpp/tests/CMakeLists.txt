@@ -58,6 +58,7 @@ add_executable(xop_tests
     test_advanced_trading.cpp
     test_market_analyzer.cpp
     test_limits.cpp
+    test_pace_controller.cpp
     test_config.cpp
     test_config_reload.cpp
     test_reconcile_verdict.cpp

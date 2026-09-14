@@ -71,6 +71,7 @@
 #include "xop/risk/peg_suspension.hpp"
 #include "xop/config_reload.hpp"
 #include "xop/strategy/bbo_sanity.hpp"
+#include "xop/strategy/pace_controller.hpp"
 #include "xop/strategy/no_loss_floor.hpp"
 #include "xop/risk/usd_route.hpp"
 #include "xop/risk/inventory.hpp"
@@ -753,6 +754,30 @@ private:
     /// concentration limits, single-CAT cap, pair-capital cap).  No Kelly
     /// sizing: InventoryTracker::compute_kelly_size has no production caller.
     void step_apply_risk_limits(BlockHeight block_height);
+
+    /// [PACE 2026-09-13] Pace controller glue (the decisions live in
+    /// xop/strategy/pace_controller.hpp).  Heartbeat, immediately before
+    /// Step 6: top up the targeted assets' cached wallet balances when no
+    /// other writer kept them fresh (at most one RPC per asset per half the
+    /// freshness bound) ...
+    asio::awaitable<void> refresh_pace_balances(BlockHeight block_height);
+
+    /// ... then gather the pace inputs, run strategy::pace::decide, and store
+    /// each pair's plan in cycle_[pair].pace.  Disabled: clears every plan and
+    /// map, so a live disable leaves no stale latch behind.
+    void step_evaluate_pace(BlockHeight block_height);
+
+    /// Step 8, before the main loop: manage the resting offers of pace-managed
+    /// pairs -- hard TTL and crossing for an idle (hold, no-quote or empty)
+    /// ladder, and the increasing-side, absent-tier and budget cancels.
+    asio::awaitable<void> step_enforce_pace_caps(BlockHeight block_height,
+                                                 std::uint64_t recommended_fee);
+
+    [[nodiscard]] strategy::pace::PaceParams pace_params_from_config() const;
+
+    /// "XCH" -> "xch"; any other symbol -> the asset id of the first
+    /// configured pair leg whose upper-cased symbol equals it.
+    [[nodiscard]] std::optional<std::string> pace_asset_id_for_key(const std::string& key) const;
 
     /// Step 7: Expand the risk-filtered quotes into a multi-tier offer
     /// ladder via the LiquidityEngine.
@@ -1987,6 +2012,11 @@ private:
         // rebuilt every heartbeat.
         double        strategy_q{0.0};
         double        strategy_q_max{0.0};
+
+        // [PACE 2026-09-13] This heartbeat's pace plan for the pair.  The
+        // default (managed == false) makes every pace hook a no-op, and cycle_
+        // is rebuilt every heartbeat, so a plan never outlives its heartbeat.
+        strategy::pace::PairPlan pace{};
     };
 
     /// Per-pair cycle state for the current block.
@@ -2442,6 +2472,18 @@ private:
         bool fields_validated{false};
     };
     std::unordered_map<std::string, WalletBalanceEntry> cached_wallet_balances_;
+
+    // -- [PACE 2026-09-13] Pace controller state -----------------------------
+    // The only pace state kept between heartbeats is each asset's activation
+    // latch and ramp; both reset on restart, which is the conservative
+    // direction (re-activation needs share > enter, tightening ramps from 0).
+    // Every size is re-derived from the DB, the wallet and the fair value each
+    // heartbeat.  remaining/consumed carry this heartbeat's Step 9f budget.
+    std::unordered_map<std::string, strategy::pace::AssetMemory> pace_memory_{};
+    std::unordered_map<std::string, double>                      pace_remaining_units_{};
+    std::unordered_set<std::string>                              pace_assets_consumed_this_cycle_{};
+    std::unordered_map<std::string, strategy::pace::PaceStatus>  pace_last_status_{};
+    std::unordered_set<std::string>                              pace_band_conflict_logged_{};
 
     // -- [PNL-BASIS-PERSIST 2026-07-30] One-shot wallet reconcile ---------
     // After restart the restored inventory quantities can drift from the

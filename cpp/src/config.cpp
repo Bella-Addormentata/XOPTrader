@@ -262,6 +262,47 @@ double read_positive_double(const YAML::Node& parent,
     return value;
 }
 
+// [PACE 2026-09-13] An optional double within a range.  Missing or null
+// keeps `dflt`.  A non-finite value throws FIRST ([INFGUARD] above): every
+// range comparison below is false for NaN, so the finiteness test is the only
+// thing that rejects it -- and removing it is observable.
+double read_optional_finite_in_range(const YAML::Node& node, const std::string& key,
+                                     const std::string& sec, double dflt,
+                                     double lo, double hi, bool lo_open, bool hi_open)
+{
+    if (!node[key] || !node[key].IsDefined() || node[key].IsNull()) {
+        return dflt;
+    }
+    const double v = node[key].as<double>();
+    if (!std::isfinite(v)) {
+        throw ConfigError(sec + "." + key + " must be finite; got " + std::to_string(v));
+    }
+    if ((lo_open ? v <= lo : v < lo) || (hi_open ? v >= hi : v > hi)) {
+        std::ostringstream range;
+        range << (lo_open ? "(" : "[") << lo << ", " << hi << (hi_open ? ")" : "]");
+        throw ConfigError(sec + "." + key + " must be in " + range.str() + "; got "
+                          + std::to_string(v));
+    }
+    return v;
+}
+
+// [PACE 2026-09-13] An optional unsigned 32-bit integer within [lo, hi].
+// Parsed through int64_t exactly like read_uint32 (CWE-681).
+std::uint32_t read_optional_uint32_in_range(const YAML::Node& node, const std::string& key,
+                                            const std::string& sec, std::uint32_t dflt,
+                                            std::uint32_t lo, std::uint32_t hi)
+{
+    if (!node[key] || !node[key].IsDefined() || node[key].IsNull()) {
+        return dflt;
+    }
+    const std::int64_t value = node[key].as<std::int64_t>();
+    if (value < static_cast<std::int64_t>(lo) || value > static_cast<std::int64_t>(hi)) {
+        throw ConfigError(sec + "." + key + " must be in [" + std::to_string(lo) + ", "
+                          + std::to_string(hi) + "]; got " + std::to_string(value));
+    }
+    return static_cast<std::uint32_t>(value);
+}
+
 // Read a required double clamped to (0, 1].
 double read_fraction(const YAML::Node& parent,
                      const std::string& key,
@@ -1555,6 +1596,64 @@ StrategyConfig parse_strategy(const YAML::Node& root)
         }
         cfg.asset_drift_guard_max_factor = f;
     }
+
+    // [PACE 2026-09-13] Pace controller keys (default OFF).  Every double goes
+    // through read_optional_finite_in_range and every count through
+    // read_optional_uint32_in_range: one copy of each rule.
+    if (node["pace_enabled"] && node["pace_enabled"].IsDefined()
+        && !node["pace_enabled"].IsNull()) {
+        cfg.pace_enabled = node["pace_enabled"].as<bool>();
+    }
+    if (node["pace_assets"] && node["pace_assets"].IsDefined()
+        && !node["pace_assets"].IsNull()) {
+        const auto pace_list = node["pace_assets"];
+        if (!pace_list.IsSequence()) {
+            throw ConfigError(sec + ".pace_assets must be a sequence of asset symbols");
+        }
+        cfg.pace_assets.clear();
+        for (const auto& entry : pace_list) {
+            if (!entry.IsScalar()) {
+                throw ConfigError(sec + ".pace_assets must be a sequence of asset symbols");
+            }
+            std::string key = entry.as<std::string>();
+            // Upper-cased like asset_target_allocations.
+            for (auto& c : key) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            cfg.pace_assets.push_back(key);
+        }
+    }
+    cfg.pace_horizon_blocks = read_optional_uint32_in_range(
+        node, "pace_horizon_blocks", sec, cfg.pace_horizon_blocks, 4'608u, 414'720u);
+    cfg.pace_enter_tol_mult = read_optional_finite_in_range(
+        node, "pace_enter_tol_mult", sec, cfg.pace_enter_tol_mult, 0.0, 10.0, true, false);
+    cfg.pace_exit_tol_mult = read_optional_finite_in_range(
+        node, "pace_exit_tol_mult", sec, cfg.pace_exit_tol_mult, 0.0, 10.0, false, true);
+    cfg.pace_max_resting_frac = read_optional_finite_in_range(
+        node, "pace_max_resting_frac", sec, cfg.pace_max_resting_frac, 0.0, 1.0, true, false);
+    cfg.pace_min_tier_units = read_optional_finite_in_range(
+        node, "pace_min_tier_units", sec, cfg.pace_min_tier_units, 0.0, 1'000'000.0, true, false);
+    cfg.pace_max_tier_units = read_optional_finite_in_range(
+        node, "pace_max_tier_units", sec, cfg.pace_max_tier_units, 0.0, 1'000'000.0, true, false);
+    cfg.pace_max_tiers = read_optional_uint32_in_range(
+        node, "pace_max_tiers", sec, cfg.pace_max_tiers, 1u, 16u);
+    cfg.pace_tighten_step_bps = read_optional_finite_in_range(
+        node, "pace_tighten_step_bps", sec, cfg.pace_tighten_step_bps, 1.0, 1000.0, false, false);
+    cfg.pace_tighten_max_bps = read_optional_finite_in_range(
+        node, "pace_tighten_max_bps", sec, cfg.pace_tighten_max_bps, 0.0, 5000.0, false, false);
+    cfg.pace_min_edge_bps = read_optional_finite_in_range(
+        node, "pace_min_edge_bps", sec, cfg.pace_min_edge_bps, 0.0, 2000.0, true, false);
+    cfg.pace_edge_sigma_mult = read_optional_finite_in_range(
+        node, "pace_edge_sigma_mult", sec, cfg.pace_edge_sigma_mult, 0.0, 5.0, false, false);
+    cfg.pace_max_fair_value_sigma_bps = read_optional_finite_in_range(
+        node, "pace_max_fair_value_sigma_bps", sec, cfg.pace_max_fair_value_sigma_bps,
+        0.0, 2000.0, true, false);
+    // kMinRefreshAgeBlocks (offer_manager.hpp) is the lower bound on the
+    // reprice age: a younger offer is never refreshed by the canceller either.
+    cfg.pace_max_balance_age_blocks = read_optional_uint32_in_range(
+        node, "pace_max_balance_age_blocks", sec, cfg.pace_max_balance_age_blocks, 1u, 4'608u);
+    cfg.pace_reprice_min_bps = read_optional_finite_in_range(
+        node, "pace_reprice_min_bps", sec, cfg.pace_reprice_min_bps, 0.0, 1000.0, true, false);
+    cfg.pace_reprice_min_age_blocks = read_optional_uint32_in_range(
+        node, "pace_reprice_min_age_blocks", sec, cfg.pace_reprice_min_age_blocks, 12u, 4'608u);
     if (node["ratio_band_exit"] && node["ratio_band_exit"].IsDefined()
         && !node["ratio_band_exit"].IsNull()) {
         cfg.ratio_band_exit = node["ratio_band_exit"].as<double>();
@@ -2092,6 +2191,51 @@ StrategyConfig parse_strategy(const YAML::Node& root)
                          "nothing -- the floor is the gain budget, not the "
                          "clamp.",
                          sec, g.configured, g.authority, g.reachable);
+        }
+    }
+
+    // [PACE 2026-09-13] Cross-key rules, checked with pace on or off.  Each
+    // message names both keys, and the comparisons are written so a NaN
+    // (already rejected by the finiteness test) would pass them rather than
+    // throw for the wrong reason.
+    if (cfg.pace_exit_tol_mult >= cfg.pace_enter_tol_mult) {
+        throw ConfigError(sec + ".pace_exit_tol_mult (" + std::to_string(cfg.pace_exit_tol_mult)
+                          + ") must be below " + sec + ".pace_enter_tol_mult ("
+                          + std::to_string(cfg.pace_enter_tol_mult) + ")");
+    }
+    if (cfg.pace_min_tier_units > cfg.pace_max_tier_units) {
+        throw ConfigError(sec + ".pace_min_tier_units (" + std::to_string(cfg.pace_min_tier_units)
+                          + ") must be <= " + sec + ".pace_max_tier_units ("
+                          + std::to_string(cfg.pace_max_tier_units) + ")");
+    }
+    if (cfg.pace_enabled) {
+        for (const std::string& asset : cfg.pace_assets) {
+            if (asset == "XCH") {
+                throw ConfigError(sec + ".pace_assets must not contain XCH (pace manages CAT "
+                                  "quote assets only)");
+            }
+            if (cfg.asset_target_allocations.count(asset) == 0u) {
+                throw ConfigError(sec + ".pace_assets: " + asset + " has no entry in " + sec
+                                  + ".asset_target_allocations -- pace needs a target to sell toward");
+            }
+            const auto tol_it = cfg.asset_target_tolerances.find(asset);
+            if (tol_it == cfg.asset_target_tolerances.end() || !(tol_it->second > 0.0)) {
+                throw ConfigError(sec + ".pace_assets: " + asset + " needs a tolerance > 0 in " + sec
+                                  + ".asset_target_tolerances -- its enter and exit levels are "
+                                  "target + multiplier x tolerance");
+            }
+        }
+        if (cfg.pace_max_fair_value_sigma_bps > cfg.fair_value_max_sigma_bps) {
+            throw ConfigError(sec + ".pace_max_fair_value_sigma_bps ("
+                              + std::to_string(cfg.pace_max_fair_value_sigma_bps) + ") must be <= "
+                              + sec + ".fair_value_max_sigma_bps ("
+                              + std::to_string(cfg.fair_value_max_sigma_bps)
+                              + "): a fair value past that ceiling is never returned, so a higher "
+                                "pace ceiling would be a silent no-op");
+        }
+        if (cfg.pace_assets.empty()) {
+            spdlog::warn("[Config] strategy.pace_enabled is true but strategy.pace_assets is empty "
+                         "-- the pace controller is inert");
         }
     }
 
@@ -3247,6 +3391,26 @@ void log_config_summary(const AppConfig& cfg)
         << "  cross_pair_skew = " << (cfg.strategy.cross_pair_skew_enabled ? "ON" : "off") << "\n"
         << "  cross_pair_phi  = " << cfg.strategy.cross_pair_skew_phi << "\n";
 
+    // [PACE 2026-09-13] One line for the pace controller.
+    out << "  pace = " << (cfg.strategy.pace_enabled ? "ON" : "off") << " assets=[";
+    for (std::size_t i = 0; i < cfg.strategy.pace_assets.size(); ++i) {
+        out << (i > 0 ? "," : "") << cfg.strategy.pace_assets[i];
+    }
+    out << "] horizon=" << cfg.strategy.pace_horizon_blocks
+        << " enter=" << cfg.strategy.pace_enter_tol_mult
+        << " exit=" << cfg.strategy.pace_exit_tol_mult
+        << " resting_frac=" << cfg.strategy.pace_max_resting_frac
+        << " tier=" << cfg.strategy.pace_min_tier_units << "-" << cfg.strategy.pace_max_tier_units
+        << " max_tiers=" << cfg.strategy.pace_max_tiers
+        << " step=" << cfg.strategy.pace_tighten_step_bps
+        << " max=" << cfg.strategy.pace_tighten_max_bps
+        << " edge=" << cfg.strategy.pace_min_edge_bps << "bps|"
+        << cfg.strategy.pace_edge_sigma_mult << "sigma"
+        << " max_sigma=" << cfg.strategy.pace_max_fair_value_sigma_bps
+        << " age=" << cfg.strategy.pace_max_balance_age_blocks
+        << " reprice=" << cfg.strategy.pace_reprice_min_bps << "bps/"
+        << cfg.strategy.pace_reprice_min_age_blocks << "\n";
+
     // Volatility: new fields.
     out << "  candle_agg = " << cfg.volatility.candle_aggregation_blocks << " blocks\n";
 
@@ -3815,6 +3979,60 @@ void validate_pair_concentration_overrides(const AppConfig& cfg)
     }
 }
 
+// [PACE 2026-09-13] Checks that need more than the strategy section; they
+// run only with pace enabled.
+//   * The CoinGecko feed age must be establishable: pace refuses a fair value
+//     whose feed is stale, and a non-finite or non-positive threshold can
+//     never read fresh.
+//   * Scope: every ENABLED pair touching a pace asset K must be XCH/K (base
+//     xch, quote K), so the reducing side is always the bid.  Base-managed and
+//     CAT/CAT pacing are rejected; disabled pairs are ignored.
+//   * Such a pair must not be a stablecoin pair: the peg guard runs before
+//     the pace price post-pass, which could otherwise lift a bid past the peg.
+void validate_pace_config(const AppConfig& cfg)
+{
+    if (!cfg.strategy.pace_enabled) {
+        return;
+    }
+    const double threshold = cfg.market_data.cex_freshness_threshold_sec;
+    if (!(std::isfinite(threshold) && threshold > 0.0)) {
+        throw ConfigError("strategy.pace_enabled requires a finite "
+                          "market_data.cex_freshness_threshold_sec > 0 (got "
+                          + std::to_string(threshold) + "): pace refuses a fair value whose "
+                          "CoinGecko feed age cannot be established");
+    }
+    auto upper = [](std::string s) {
+        for (auto& c : s) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        return s;
+    };
+    for (const std::string& asset : cfg.strategy.pace_assets) {
+        for (std::size_t i = 0; i < cfg.pairs.size(); ++i) {
+            const PairConfig& pc = cfg.pairs[i];
+            if (!pc.enabled) {
+                continue;
+            }
+            const auto legs = split_pair_legs(pc.name);
+            const std::string base_leg = legs ? upper(legs->first) : std::string{};
+            const std::string quote_leg = legs ? upper(legs->second) : std::string{};
+            if (base_leg != asset && quote_leg != asset) {
+                continue;
+            }
+            if (pc.base_asset_id != "xch" || base_leg != "XCH" || quote_leg != asset) {
+                throw ConfigError("strategy.pace_assets: every enabled pair touching " + asset
+                                  + " must be XCH/" + asset + " (base xch, quote " + asset
+                                  + "); pairs[" + std::to_string(i) + "] (" + pc.name
+                                  + ") is not. Base-managed and CAT/CAT pacing are out of scope");
+            }
+            if (pc.is_stablecoin) {
+                throw ConfigError("strategy.pace_assets: pairs[" + std::to_string(i) + "] ("
+                                  + pc.name + ") paces " + asset + " and must not set "
+                                  "is_stablecoin: the peg guard runs before the pace price "
+                                  "post-pass, which could lift a bid past the peg");
+            }
+        }
+    }
+}
+
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -4106,6 +4324,7 @@ AppConfig load_config(const std::string& path,
     validate_usd_anchor(cfg);
     validate_enforced_pegs_are_observable(cfg);
     validate_pair_concentration_overrides(cfg);
+    validate_pace_config(cfg);
 
     // [S27 review round 3] Since usd_per_xch() now prefers the external
     // CoinGecko price, a polling interval LONGER than the freshness window

@@ -481,6 +481,35 @@ strategy:
   xch_ask_throttle_critical_xch: 0.35  # [OPTIONAL, default: 0.35] Keep only defensive outer ask below this
   xch_ask_throttle_aggressiveness: 1.0 # [OPTIONAL, default: 1.0] <1 gentler, >1 more protective
 
+  # -- Pace controller (default OFF) --
+  # Sells an overweight CAT QUOTE asset (pace_assets) down toward its
+  # asset_target_allocations band through the bids of its XCH/<asset> pairs,
+  # at a bounded daily budget, never above the independent fair value.  The
+  # risk limits still apply to every pace bid.  When enabled: every asset needs
+  # a target and a tolerance > 0 and must not be XCH; every ENABLED pair
+  # touching it must be XCH/<asset> (base xch) and not a stablecoin pair;
+  # pace_max_fair_value_sigma_bps <= fair_value_max_sigma_bps; and
+  # market_data.cex_freshness_threshold_sec must be finite and > 0.  Restart
+  # required, except that pace_enabled: false applies live.  Block counts are
+  # PEAK heights (4,608 per day).  Edit with the GUI STOPPED.
+  # pace_enabled: false                  # [OPTIONAL, default: false] master switch
+  # pace_assets: []                      # [OPTIONAL, default: []] CAT symbols, e.g. [BYC]; never XCH
+  # pace_horizon_blocks: 64512           # [OPTIONAL, default: 64512 = 14 days] [4608, 414720]
+  # pace_enter_tol_mult: 1.5             # [OPTIONAL, default: 1.5] (0, 10]; activate above target + mult x tol
+  # pace_exit_tol_mult: 1.0              # [OPTIONAL, default: 1.0] [0, 10), below enter; stop at target + mult x tol
+  # pace_max_resting_frac: 0.5           # [OPTIONAL, default: 0.5] (0, 1]; resting size <= frac x daily budget
+  # pace_min_tier_units: 1.0             # [OPTIONAL, default: 1.0] (0, 1e6] base units per tier
+  # pace_max_tier_units: 5.0             # [OPTIONAL, default: 5.0] (0, 1e6] base units per tier; >= min
+  # pace_max_tiers: 3                    # [OPTIONAL, default: 3] [1, 16] bid tiers per pair
+  # pace_tighten_step_bps: 25            # [OPTIONAL, default: 25] [1, 1000] price-tightening quantum
+  # pace_tighten_max_bps: 300            # [OPTIONAL, default: 300] [0, 5000]; 0 = size-only pacing
+  # pace_min_edge_bps: 50                # [OPTIONAL, default: 50] (0, 2000] minimum edge below fair value
+  # pace_edge_sigma_mult: 1.0            # [OPTIONAL, default: 1.0] [0, 5]; edge = max(min_edge, mult x fair-value sigma)
+  # pace_max_fair_value_sigma_bps: 200   # [OPTIONAL, default: 200] (0, 2000]; a fair value above this sigma is unusable
+  # pace_max_balance_age_blocks: 20      # [OPTIONAL, default: 20] [1, 4608] freshness bound on cached wallet balances
+  # pace_reprice_min_bps: 50             # [OPTIONAL, default: 50] (0, 1000] minimum improvement to reprice a pace bid
+  # pace_reprice_min_age_blocks: 96      # [OPTIONAL, default: 96] [12, 4608] minimum age to reprice a pace bid
+
   # -- Wall-aware retail niche pricing --
   # On Chia DEX, offers are atomic (all-or-nothing).  Small traders cannot
   # take large "wall" offers (e.g. 100 XCH) and must use our smaller ones.

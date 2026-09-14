@@ -3653,6 +3653,26 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
         spdlog::error("[Engine] Flash crash check failed: {}", e.what());
     }
 
+    // [PACE 2026-09-13] Pace controller, immediately before Step 6: top up the
+    // targeted wallet balances, then plan every pace-managed pair.  After the
+    // flash-crash update and after the config reload above, so a live disable
+    // is already applied.  A failed evaluation leaves every plan inert for
+    // this heartbeat (the latch is kept) and clears the remaining budget, so
+    // Step 9f refuses spends of an Active asset.
+    if (config_.strategy.pace_enabled && !wallet_circuit_open_
+            && !watchdog_fired_.load(std::memory_order_acquire)) {
+        try { co_await refresh_pace_balances(block_height); }
+        catch (const std::exception& e) {
+            spdlog::warn("[Engine] Pace balance refresh failed: {}", e.what());
+        }
+    }
+    try { step_evaluate_pace(block_height); }
+    catch (const std::exception& e) {
+        for (auto& kv : cycle_) { kv.second.pace = strategy::pace::PairPlan{}; }
+        pace_remaining_units_.clear();
+        spdlog::error("[Engine] Pace evaluation failed: {} -- pace inert this cycle", e.what());
+    }
+
     try { step_apply_risk_limits(block_height); }
     catch (const std::exception& e) {
         spdlog::error("[Engine] Step 6 (risk limits) failed: {}", e.what());
@@ -6248,6 +6268,379 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
     }
 }
 
+// ---------------------------------------------------------------------------
+// [PACE 2026-09-13] Pace controller glue.  Every decision is a pure function
+// in xop/strategy/pace_controller.hpp; these methods only gather its inputs
+// (wallet-confirmed balances, independent fair values, fills from the DB)
+// and store its outputs.  Spec: pace-controller.v2.md sections 3 and 6.
+// ---------------------------------------------------------------------------
+
+strategy::pace::PaceParams Engine::pace_params_from_config() const
+{
+    const StrategyConfig& sc = config_.strategy;
+    strategy::pace::PaceParams p{};
+    p.enabled                = sc.pace_enabled;
+    p.assets                 = sc.pace_assets;
+    p.horizon_blocks         = sc.pace_horizon_blocks;
+    p.enter_tol_mult         = sc.pace_enter_tol_mult;
+    p.exit_tol_mult          = sc.pace_exit_tol_mult;
+    p.max_resting_frac       = sc.pace_max_resting_frac;
+    p.min_tier_units         = sc.pace_min_tier_units;
+    p.max_tier_units         = sc.pace_max_tier_units;
+    p.max_tiers              = sc.pace_max_tiers;
+    p.tighten_step_bps       = sc.pace_tighten_step_bps;
+    p.tighten_max_bps        = sc.pace_tighten_max_bps;
+    p.max_fv_sigma_bps       = sc.pace_max_fair_value_sigma_bps;
+    p.max_balance_age_blocks = sc.pace_max_balance_age_blocks;
+    p.global_min_offer_units = sc.min_offer_size_units;
+    p.global_max_offer_units = sc.max_offer_size_units;
+    return p;
+}
+
+std::optional<std::string> Engine::pace_asset_id_for_key(const std::string& key) const
+{
+    if (key == "XCH") {
+        return std::string{"xch"};
+    }
+    for (const auto& pace_pc : config_.pairs) {
+        const auto pace_slash = pace_pc.name.find('/');
+        if (pace_slash == std::string::npos) {
+            continue;
+        }
+        std::string pace_base_sym = pace_pc.name.substr(0, pace_slash);
+        std::string pace_quote_sym = pace_pc.name.substr(pace_slash + 1);
+        for (auto& c : pace_base_sym) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        for (auto& c : pace_quote_sym) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        if (pace_base_sym == key) {
+            return pace_pc.base_asset_id;
+        }
+        if (pace_quote_sym == key) {
+            return pace_pc.quote_asset_id;
+        }
+    }
+    return std::nullopt;
+}
+
+asio::awaitable<void> Engine::refresh_pace_balances(BlockHeight block_height)
+{
+    if (!config_.strategy.pace_enabled || wallet_circuit_open_
+        || watchdog_fired_.load(std::memory_order_acquire) || !offer_mgr_ || !wallet_) {
+        co_return;
+    }
+    std::set<std::string> pace_keys;
+    for (const auto& kv : config_.strategy.asset_target_allocations) { pace_keys.insert(kv.first); }
+    for (const auto& pace_asset : config_.strategy.pace_assets) { pace_keys.insert(pace_asset); }
+    // Refresh at half the freshness bound (saturating at 1), so an entry this
+    // refresh maintains is fresh on every heartbeat in between.
+    const std::uint32_t pace_refresh_age =
+        std::max<std::uint32_t>(1u, config_.strategy.pace_max_balance_age_blocks / 2u);
+    for (const auto& pace_key : pace_keys) {
+        const auto pace_id = pace_asset_id_for_key(pace_key);
+        if (!pace_id) {
+            continue;
+        }
+        const auto pace_cached = cached_wallet_balances_.find(*pace_id);
+        const bool pace_needs_refresh = pace_cached == cached_wallet_balances_.end()
+            || !pace_cached->second.fields_validated
+            || strategy::pace::sat_sub_blocks(block_height, pace_cached->second.as_of_block) >= pace_refresh_age;
+        if (!pace_needs_refresh) {
+            continue;
+        }
+        // The CAT wallet-id map fills lazily in post_quotes, so the first
+        // heartbeats after start may skip here: DataUnavailable, inert.
+        const auto pace_wid = offer_mgr_->resolve_wallet_id(*pace_id);
+        if (pace_wid <= 0) {
+            continue;
+        }
+        try {
+            auto pace_bal = co_await wallet_->get_wallet_balance(pace_wid);
+            Mojo spendable = 0, confirmed = 0, pending = 0;
+            if (pace_bal.contains("spendable_balance"))
+                spendable = pace_bal["spendable_balance"].get<Mojo>();
+            if (pace_bal.contains("confirmed_wallet_balance"))
+                confirmed = pace_bal["confirmed_wallet_balance"].get<Mojo>();
+            if (pace_bal.contains("pending_change"))
+                pending = pace_bal["pending_change"].get<Mojo>();
+            // The liveness refresh's exact write shape: a defaulted zero is
+            // never marked validated.
+            cached_wallet_balances_[*pace_id] =
+                {spendable, confirmed, pending, block_height,
+                 pace_bal.contains("confirmed_wallet_balance")
+                     && pace_bal.contains("pending_change")};
+        } catch (const std::exception& e) {
+            spdlog::debug("[Engine] Pace: balance refresh for {} failed: {}", pace_key, e.what());
+        }
+    }
+    co_return;
+}
+
+void Engine::step_evaluate_pace(BlockHeight block_height)
+{
+    if (!config_.strategy.pace_enabled) {
+        // Off (including a live disable): every plan inert, every map empty,
+        // so no hook -- Step 9f included -- acts on a stale latch.
+        for (auto& kv : cycle_) { kv.second.pace = strategy::pace::PairPlan{}; }
+        pace_memory_.clear();
+        pace_remaining_units_.clear();
+        pace_assets_consumed_this_cycle_.clear();
+        pace_last_status_.clear();
+        pace_band_conflict_logged_.clear();
+        return;
+    }
+
+    // The CoinGecko FEED age, not the solve's timestamp: fair_value_updated_at
+    // is re-stamped every heartbeat from cached solver output.
+    const bool pace_feed_fresh = coingecko_feed_fresh_for_revival(
+        !coingecko_prices_.empty(), coingecko_last_fetch_, std::chrono::steady_clock::now(),
+        config_.market_data.cex_freshness_threshold_sec);
+    // The ramp advances only while the engine is in a posting state.
+    // xch_recovery_mode_ is re-evaluated after Step 6, so this reads the
+    // previous heartbeat's value: a one-heartbeat lag, accepted.
+    const bool pace_ramp_running = !gui_pause_active_ && !breaker_pause_active_
+        && !watchdog_fired_.load(std::memory_order_acquire) && !wallet_circuit_open_
+        && !xch_recovery_mode_ && flash_crash_state_ == FlashCrashState::Normal
+        && !cancel_all_inflight_ && !cancel_all_draining_;
+
+    strategy::pace::PaceInputs pace_inputs{};
+    pace_inputs.now = block_height;
+    pace_inputs.ramp_running = pace_ramp_running;
+    pace_inputs.params = pace_params_from_config();
+
+    auto pace_upper = [](std::string text) {
+        for (auto& c : text) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        return text;
+    };
+    auto pace_mojos_per_unit = [this](const std::string& asset) -> std::int64_t {
+        if (asset == "xch") return kMojosPerXch;
+        for (const auto& mpu_pc : config_.pairs) {
+            if (mpu_pc.base_asset_id == asset) return mpu_pc.base_mojos_per_unit;
+            if (mpu_pc.quote_asset_id == asset) return mpu_pc.quote_mojos_per_unit;
+        }
+        return 0;
+    };
+
+    // Holdings: every targeted key plus every pace asset.
+    std::set<std::string> pace_keys;
+    for (const auto& kv : config_.strategy.asset_target_allocations) { pace_keys.insert(kv.first); }
+    for (const auto& pace_asset : config_.strategy.pace_assets) { pace_keys.insert(pace_asset); }
+    for (const auto& pace_key : pace_keys) {
+        strategy::pace::HoldingInput holding{};
+        holding.key = pace_key;
+        const auto target_it = config_.strategy.asset_target_allocations.find(pace_key);
+        holding.targeted = (target_it != config_.strategy.asset_target_allocations.end());
+        holding.target = holding.targeted ? target_it->second : 0.0;
+        const auto tol_it = config_.strategy.asset_target_tolerances.find(pace_key);
+        holding.tol = (tol_it != config_.strategy.asset_target_tolerances.end()) ? tol_it->second : 0.0;
+        holding.is_xch = (pace_key == "XCH");
+        const auto pace_id = pace_asset_id_for_key(pace_key);
+        holding.id_resolved = pace_id.has_value();
+        if (pace_id) {
+            const auto pace_cached = cached_wallet_balances_.find(*pace_id);
+            if (pace_cached != cached_wallet_balances_.end()) {
+                holding.cache_present = true;
+                holding.fields_validated = pace_cached->second.fields_validated;
+                holding.as_of_block = pace_cached->second.as_of_block;
+                const std::int64_t pace_mpu = pace_mojos_per_unit(*pace_id);
+                holding.units = (pace_mpu > 0)
+                    ? static_cast<double>(pace_cached->second.confirmed) / static_cast<double>(pace_mpu)
+                    : std::numeric_limits<double>::quiet_NaN();
+            }
+            if (!holding.is_xch) {
+                // The first ENABLED pair pricing this asset against XCH.
+                for (const auto& fv_pc : config_.pairs) {
+                    if (!fv_pc.enabled) continue;
+                    const bool as_quote = fv_pc.base_asset_id == "xch" && fv_pc.quote_asset_id == *pace_id;
+                    const bool as_base = fv_pc.quote_asset_id == "xch" && fv_pc.base_asset_id == *pace_id;
+                    if (!as_quote && !as_base) continue;
+                    const auto pace_fv = market_data_->get_fair_value(fv_pc.name);
+                    holding.fv_present = pace_fv.has_value();
+                    if (pace_fv) {
+                        holding.fv_tier_available = pace_fv->tier != FairValueTier::Unavailable;
+                        holding.fv_price = pace_fv->price;
+                        holding.fv_sigma_bps = pace_fv->sigma_bps;
+                    }
+                    holding.asset_is_quote = as_quote;
+                    break;
+                }
+                holding.fv_feed_fresh = pace_feed_fresh;
+            }
+        }
+        pace_inputs.holdings.push_back(holding);
+    }
+
+    // Pairs: every CONFIGURED pair with a leg that is a pace asset, and its
+    // fills over the horizon (flows on a pair disabled since still moved the
+    // wallet).
+    const std::uint32_t pace_horizon = config_.strategy.pace_horizon_blocks;
+    const BlockHeight pace_since = (block_height > pace_horizon) ? block_height - pace_horizon : BlockHeight{0};
+    for (const auto& pace_pc : config_.pairs) {
+        const auto pace_slash = pace_pc.name.find('/');
+        if (pace_slash == std::string::npos) continue;
+        const std::string base_key = pace_upper(pace_pc.name.substr(0, pace_slash));
+        const std::string quote_key = pace_upper(pace_pc.name.substr(pace_slash + 1));
+        const bool touches_pace_asset = std::any_of(
+            config_.strategy.pace_assets.begin(), config_.strategy.pace_assets.end(),
+            [&](const std::string& pace_asset) { return pace_asset == base_key || pace_asset == quote_key; });
+        if (!touches_pace_asset) continue;
+
+        strategy::pace::PairInput pair_in{};
+        pair_in.name = pace_pc.name;
+        pair_in.base_key = base_key;
+        pair_in.quote_key = quote_key;
+        pair_in.enabled = pace_pc.enabled;
+        const auto cycle_it = cycle_.find(pace_pc.name);
+        pair_in.quote_valid = (cycle_it != cycle_.end()) && cycle_it->second.quote_valid;
+        pair_in.base_mpu = pace_pc.base_mojos_per_unit;
+        pair_in.quote_mpu = pace_pc.quote_mojos_per_unit;
+        pair_in.min_offer_override = pace_pc.min_offer_size_units_override;
+        pair_in.xch_base = (pace_pc.base_asset_id == "xch");
+        const auto liq_it = liquidity_engines_.find(pace_pc.name);
+        pair_in.side_tier_count = (liq_it != liquidity_engines_.end() && liq_it->second)
+            ? static_cast<std::uint32_t>(liq_it->second->config().num_tiers)
+            : 0u;
+        const auto pace_fv = market_data_->get_fair_value(pace_pc.name);
+        pair_in.fv_ok = pace_fv.has_value()
+            && strategy::pace::xch_per_unit_from_fair_value(
+                   true, pace_fv->tier != FairValueTier::Unavailable, pace_feed_fresh,
+                   pace_fv->price, pace_fv->sigma_bps,
+                   config_.strategy.pace_max_fair_value_sigma_bps).has_value();
+        if (pace_fv) {
+            pair_in.fv_price = pace_fv->price;
+            pair_in.fv_sigma_bps = pace_fv->sigma_bps;
+        }
+        if (!db_) {
+            pair_in.fills_ok = false;
+        } else {
+            try {
+                for (const auto& row : db_->query_pace_fills(pace_pc.name, pace_since)) {
+                    strategy::pace::FillRow fill{};
+                    fill.pair_name = pace_pc.name;
+                    fill.is_taker = row.is_taker;
+                    fill.side_lower = row.side_lower;
+                    fill.size_mojos = row.size_mojos;
+                    fill.price_mojos = row.price_mojos;
+                    fill.we_bought_base = row.we_bought_base;
+                    fill.base_delta_mojos = row.base_delta_mojos;
+                    fill.quote_delta_mojos = row.quote_delta_mojos;
+                    fill.block_height = row.block_height;
+                    pace_inputs.fills.push_back(std::move(fill));
+                }
+            } catch (const std::exception& e) {
+                pair_in.fills_ok = false;
+                spdlog::debug("[Engine] Pace: fills query for {} failed: {}", pace_pc.name, e.what());
+            }
+        }
+        pace_inputs.pairs.push_back(std::move(pair_in));
+    }
+
+    pace_inputs.memory = pace_memory_;
+    strategy::pace::PaceDecision pace_decision = strategy::pace::decide(pace_inputs);
+    pace_memory_ = std::move(pace_decision.memory);
+    pace_remaining_units_ = std::move(pace_decision.remaining_units);
+    for (auto& kv : cycle_) {
+        const auto plan_it = pace_decision.pairs.find(kv.first);
+        kv.second.pace = (plan_it != pace_decision.pairs.end()) ? plan_it->second : strategy::pace::PairPlan{};
+    }
+    pace_assets_consumed_this_cycle_.clear();
+
+    // -- Logging: live assets every heartbeat; transitions (with the reason)
+    // once; DataUnavailable, ConfigConflict and band conflicts only when they
+    // change (S17).
+    auto pace_data_gap = [&](const std::string& pace_key) -> std::string {
+        std::string why;
+        auto add = [&why](const std::string& part) { why += (why.empty() ? "" : "; ") + part; };
+        if (!pace_feed_fresh) { add("CoinGecko feed stale"); }
+        for (const auto& h : pace_inputs.holdings) {
+            if (!h.targeted && h.key != pace_key) continue;
+            if (!h.id_resolved) { add(h.key + " asset id unresolved"); continue; }
+            if (!h.cache_present) { add(h.key + " balance not cached"); continue; }
+            if (!h.fields_validated) { add(h.key + " balance unvalidated"); continue; }
+            if (!strategy::pace::balance_is_fresh(true, h.as_of_block, block_height,
+                                                  config_.strategy.pace_max_balance_age_blocks)) {
+                add(h.key + " balance stale");
+                continue;
+            }
+            if (!h.is_xch && !(h.fv_present && h.fv_tier_available)) { add(h.key + " fair value unavailable"); }
+        }
+        for (const auto& p : pace_inputs.pairs) {
+            if (p.base_key != pace_key && p.quote_key != pace_key) continue;
+            if (!p.fills_ok) { add(p.name + " fills query failed"); }
+            if (p.enabled && !p.quote_valid) { add(p.name + " not quote-valid"); }
+            if (p.enabled && !p.fv_ok) { add(p.name + " fair value unusable"); }
+        }
+        return why.empty() ? std::string{"no data gap identified"} : why;
+    };
+    for (const auto& ad : pace_decision.assets) {
+        const auto last_it = pace_last_status_.find(ad.key);
+        const bool first_seen = (last_it == pace_last_status_.end());
+        if (first_seen || last_it->second != ad.status) {
+            std::string reason;
+            switch (ad.status) {
+                case strategy::pace::PaceStatus::Active:
+                    reason = "share " + std::to_string(ad.share * 100.0) + "% above exit "
+                           + std::to_string(ad.exit_level * 100.0) + "% (enter "
+                           + std::to_string(ad.enter_level * 100.0) + "%)";
+                    break;
+                case strategy::pace::PaceStatus::Inactive:
+                    reason = "share " + std::to_string(ad.share * 100.0) + "%, enter "
+                           + std::to_string(ad.enter_level * 100.0) + "%, exit "
+                           + std::to_string(ad.exit_level * 100.0) + "%";
+                    break;
+                case strategy::pace::PaceStatus::Exhausted:
+                    reason = "sold today " + std::to_string(ad.sold_window_units) + " of a daily budget of "
+                           + std::to_string(ad.budget_window_units);
+                    break;
+                case strategy::pace::PaceStatus::ConfigConflict:
+                    reason = "target, tolerance and multipliers do not form a valid band";
+                    break;
+                case strategy::pace::PaceStatus::Hold:
+                case strategy::pace::PaceStatus::DataUnavailable:
+                    reason = pace_data_gap(ad.key);
+                    break;
+            }
+            if (first_seen) {
+                spdlog::info("[Engine] Pace: {} {} ({})", ad.key, strategy::pace::to_string(ad.status), reason);
+            } else {
+                spdlog::warn("[Engine] Pace: {} {} -> {} ({})", ad.key, strategy::pace::to_string(last_it->second),
+                             strategy::pace::to_string(ad.status), reason);
+            }
+        }
+        if (ad.status == strategy::pace::PaceStatus::Active || ad.status == strategy::pace::PaceStatus::Exhausted
+            || ad.status == strategy::pace::PaceStatus::Hold) {
+            std::string pairs_text;
+            for (const auto& kv : pace_decision.pairs) {
+                const strategy::pace::PairPlan& plan = kv.second;
+                if (!plan.managed || plan.asset != ad.key) continue;
+                const PairConfig* plan_pc = find_pair_config(kv.first);
+                const double plan_mpu = (plan_pc && plan_pc->base_mojos_per_unit > 0)
+                    ? static_cast<double>(plan_pc->base_mojos_per_unit) : 1.0;
+                pairs_text += " | " + kv.first + (plan.hold ? " HOLD" : "")
+                    + " tiers=" + std::to_string(plan.tiers) + "x"
+                    + std::to_string(static_cast<double>(plan.tier_size_base_mojos) / plan_mpu)
+                    + " pool=" + std::to_string(static_cast<double>(plan.pool_base_mojos) / plan_mpu);
+            }
+            spdlog::info("[Engine] Pace: {} {} share={:.2f}% enter={:.2f}% exit={:.2f}% excess={:.3f} "
+                         "budget/day={:.3f} sold/day={:.3f} reduced_h={:.3f} remaining={:.3f} "
+                         "resting_cap={:.3f} headroom={:.3f} tighten=+{:.0f}bps ramp={} pairs={}{}",
+                         ad.key, strategy::pace::to_string(ad.status), ad.share * 100.0,
+                         ad.enter_level * 100.0, ad.exit_level * 100.0, ad.excess_units,
+                         ad.budget_window_units, ad.sold_window_units, ad.reduced_horizon_units,
+                         ad.remaining_units, ad.resting_cap_units, ad.headroom_units, ad.tighten_bps,
+                         ad.ramp_blocks, ad.eligible_pairs, pairs_text);
+        }
+        if (ad.band_conflict) {
+            if (pace_band_conflict_logged_.insert(ad.key).second) {
+                spdlog::warn("[Engine] Pace: {} offer-size band conflict: no tier size lies within "
+                             "both [pace_min_tier_units, pace_max_tier_units] and a managed pair's "
+                             "offer-size band -- that pair rests nothing", ad.key);
+            }
+        } else {
+            pace_band_conflict_logged_.erase(ad.key);
+        }
+        pace_last_status_[ad.key] = ad.status;
+    }
+}
+
 // Step 6: Apply risk limits (inventory-aging relief and the no-loss ask floor,
 // the optional loss manager / circuit breaker, then concentration, single-CAT
 // cap and pair-capital cap via PreTradeCheck::evaluate_limits).  No Kelly
@@ -6640,6 +7033,11 @@ void Engine::step_apply_risk_limits(BlockHeight block_height)
         // cannot collide with a `limits` local.
         const ConcentrationLimits conc_limits =
             effective_concentration_limits(config_.risk, pair_cfg);
+        // [PACE 2026-09-13] A pace-managed pair offers its pace pool as the
+        // bid, in place of the strategy's size, BEFORE the limits run -- so
+        // every rule below tapers it (operator decision D1).  A hold plan
+        // offers 0; an unmanaged plan returns the quote unchanged.
+        quote = strategy::pace::inject_reducing_side(quote, pcs.pace);
         const LimitsDecision limits_decision = pre_trade_->evaluate_limits(
             quote,
             AssetId{pair_cfg->base_asset_id},
@@ -7567,6 +7965,11 @@ void Engine::step_generate_ladder(BlockHeight block_height)
             }
         }
 
+        // [PACE 2026-09-13] The CAT wallet cap on the bid, captured for the
+        // pace pool composition below.
+        bool pace_wallet_cap_known = false;
+        Mojo pace_wallet_cap_bid = 0;
+
         // -- Symmetric CAT wallet-balance caps (mirrors the XCH cap above
         // for non-XCH base/quote assets).  The ask pool consumes the BASE
         // asset; the bid pool consumes the QUOTE asset.  Without these
@@ -7635,6 +8038,10 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                         market_mid,
                         static_cast<double>(pair_cfg->base_mojos_per_unit));
                     const Mojo bid_cap_base = bid_cap.value_or(Mojo{0});
+                    if (bid_cap.has_value()) {
+                        pace_wallet_cap_known = true;
+                        pace_wallet_cap_bid = bid_cap_base;
+                    }
                     if (bid_cap.has_value() && avail_capital > bid_cap_base) {
                         spdlog::warn("[Engine] Step 7: {} bid pool {:.4f} {} "
                                      "(={:.4f} {} @ {:.6f}) > wallet {:.4f} {} "
@@ -8005,6 +8412,56 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                     avail_inventory = floored;
                 }
             }
+        }
+
+        // -- [PACE 2026-09-13] Pace pool composition -------------------------
+        // After every pool-sizing heuristic (allocator, ratio scaling,
+        // deploy-idle floor: not risk limits, and min() also blocks their
+        // upward moves) and before the final XCH caps (which never act on a
+        // pace bid: it spends the CAT).  bid = min(pace pool, risk-tapered bid,
+        // CAT wallet cap), then the concentration taper computed on WALLET
+        // balances at the same published-mid marks apply_limits uses (State
+        // lags the wallet: taker fills never update it -- the stricter reading
+        // binds), then the drift guard's bid scale; tiers are re-planned from
+        // the result and the ask is 0.
+        if (config_.strategy.pace_enabled && pcs.pace.managed && pair_cfg) {
+            double pace_wallet_keep = 1.0;
+            if (!pcs.pace.hold) {
+                const auto pace_xch_it = cached_wallet_balances_.find("xch");
+                const auto pace_quote_it = cached_wallet_balances_.find(pair_cfg->quote_asset_id);
+                if (pace_xch_it != cached_wallet_balances_.end()
+                    && pace_quote_it != cached_wallet_balances_.end()) {
+                    Position pace_wallet_base{AssetId{"xch"}};
+                    pace_wallet_base.balance = pace_xch_it->second.confirmed;
+                    Position pace_wallet_quote{AssetId{pair_cfg->quote_asset_id}};
+                    pace_wallet_quote.balance = pace_quote_it->second.confirmed;
+                    const double pace_wallet_conc = PreTradeCheck::compute_concentration(
+                        pace_wallet_base, pace_wallet_quote, *state_);
+                    pace_wallet_keep = PreTradeCheck::concentration_keep_fraction(
+                        pace_wallet_conc, effective_concentration_limits(config_.risk, pair_cfg)).value_or(1.0);
+                }
+            }
+            const strategy::pace::PoolInputs pace_pool_in{
+                avail_capital, avail_inventory, pcs.risk_quote.bid_size,
+                pace_wallet_cap_known, pace_wallet_cap_bid, pace_wallet_keep, drift_bid_scale};
+            const strategy::pace::ComposedPools pace_composed =
+                strategy::pace::compose_pace_pools(pcs.pace, pace_pool_in);
+            if (pace_composed.bid != avail_capital || pace_composed.ask != avail_inventory
+                || pace_composed.binding != strategy::pace::PoolBinding::Pace) {
+                spdlog::info("[Engine] Step 7: {} pace pools bid {} -> {} ask {} -> {} tiers={} size={} "
+                             "binding={} (risk_bid={} wallet_cap={} wallet_keep={:.4f} drift={:.2f})",
+                             pair_name, avail_capital, pace_composed.bid, avail_inventory, pace_composed.ask,
+                             pace_composed.tiers, pace_composed.tier_size_base_mojos,
+                             strategy::pace::to_string(pace_composed.binding), pcs.risk_quote.bid_size,
+                             pace_wallet_cap_known ? std::to_string(pace_wallet_cap_bid) : std::string{"unknown"},
+                             pace_wallet_keep, drift_bid_scale);
+            }
+            pcs.pace.tiers                = pace_composed.tiers;
+            pcs.pace.tier_size_base_mojos = pace_composed.tier_size_base_mojos;
+            pcs.pace.pool_base_mojos      = pace_composed.bid;
+            pcs.pace.binding              = pace_composed.binding;
+            avail_capital   = pace_composed.bid;
+            avail_inventory = pace_composed.ask;
         }
 
         // -- [v0.7.38 -> S3 round-2] FINAL XCH wallet caps ------------------
@@ -8884,6 +9341,10 @@ void Engine::step_generate_ladder(BlockHeight block_height)
             }
         }
 
+        // [PACE 2026-09-13] The residual widening this heartbeat applied, in
+        // bps (0 = none), for the pace price post-pass below.
+        double pace_residual_widen_bps = 0.0;
+
         // -----------------------------------------------------------------
         // Fair-value deviation guard.
         //
@@ -8975,6 +9436,7 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                             / static_cast<double>(mid_mojos) * 10'000.0;
                     }
 
+                    pace_residual_widen_bps = capped;
                     spdlog::warn(
                         "[Engine] Step 7: {} book disagrees with the rest of "
                         "the graph by {:+.0f}bps -- widening every tier by "
@@ -9178,6 +9640,12 @@ void Engine::step_generate_ladder(BlockHeight block_height)
             }
         }
 
+        // [PACE 2026-09-13] What the inventory throttle did to the BID side,
+        // for the pace post-passes: its size scale, and whether it touched the
+        // side at all.  Its early returns leave these at "no throttle".
+        double pace_bid_throttle_scale = 1.0;
+        bool pace_bid_throttled = false;
+
         // -----------------------------------------------------------------
         // Smooth inventory throttle (all assets, both sides): when the asset
         // consumed by a side is running low, progressively make that side
@@ -9356,6 +9824,10 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                         return false;
                     });
                 pcs.ladder.erase(it, pcs.ladder.end());
+                if (side == Side::Bid) {
+                    pace_bid_throttle_scale = size_scale;
+                    pace_bid_throttled = (repriced > 0 || resized > 0 || dropped > 0);
+                }
 
                 if (repriced > 0 || resized > 0 || dropped > 0) {
                     spdlog::info("[Engine] Step 7: {} {}-side throttle asset={} "
@@ -9559,6 +10031,81 @@ void Engine::step_generate_ladder(BlockHeight block_height)
             }
         }
 
+        // -- [PACE 2026-09-13] Pace price post-pass ---------------------------
+        // When a pace asset is behind schedule, tighten its pair's bids toward
+        // FV x (1 - max(min_edge, k x sigma)).  Placed after every pass that
+        // widens or clamps (width floor, order-book guard, fair-value guard,
+        // throttle, no-loss lift, peg guard), so only Step 8's own gates act on
+        // bid prices after it -- and apply_pace_bid_price pre-checks both of
+        // those.  Never on a throttled bid side, never in a heartbeat whose
+        // residual widening fired, and never without a usable fair value (a
+        // blind ladder is never tightened).
+        if (config_.strategy.pace_enabled && pcs.pace.managed && !pcs.pace.hold
+            && pcs.pace.tiers > 0u && pcs.pace.tighten_bps > 0.0
+            && !pace_bid_throttled && !(pace_residual_widen_bps > 0.0)) {
+            const auto pace_fv = market_data_->get_fair_value(pair_name);
+            const bool pace_fv_usable = pace_fv.has_value()
+                && strategy::pace::xch_per_unit_from_fair_value(
+                       true, pace_fv->tier != FairValueTier::Unavailable, quote_anchor_feed_fresh,
+                       pace_fv->price, pace_fv->sigma_bps,
+                       config_.strategy.pace_max_fair_value_sigma_bps).has_value();
+            if (pace_fv_usable) {
+                strategy::pace::PriceGuards pace_guards{};
+                pace_guards.fair_value_px       = pace_fv->price * static_cast<double>(kMojosPerXch);
+                pace_guards.fv_sigma_bps        = pace_fv->sigma_bps;
+                pace_guards.min_edge_bps        = config_.strategy.pace_min_edge_bps;
+                pace_guards.edge_sigma_mult     = config_.strategy.pace_edge_sigma_mult;
+                pace_guards.centre_px           = static_cast<double>(pcs.quote_mid_mojos);
+                pace_guards.min_half_spread_bps = pcs.quote_min_half_spread_bps;
+                pace_guards.best_bid_px         = static_cast<double>(snap.best_bid);
+                pace_guards.best_ask_px         = static_cast<double>(snap.best_ask);
+                // The order-book guard's own bid margin, above.
+                pace_guards.book_guard_margin_bps = std::max(
+                    std::max(50.0, config_.strategy.fair_value_clamp_tier_step_bps),
+                    effective_bid_margin_bps);
+                // RE-READ: market_mid above was replaced by the fair-value blend.
+                pace_guards.published_mid_px =
+                    market_data_->get_mid_price(pair_name) * static_cast<double>(kMojosPerXch);
+                pace_guards.has_bbo = snap.best_bid > 0 && snap.best_ask > 0;
+                if (pace_guards.has_bbo) {
+                    const auto pace_refs = bookside::step8_references(
+                        snap.bid_side_anchor_ok, snap.ask_side_anchor_ok,
+                        static_cast<double>(snap.book_side_ref),
+                        static_cast<double>((snap.best_bid + snap.best_ask) / 2),
+                        static_cast<double>(snap.best_bid),
+                        static_cast<double>(snap.best_ask));
+                    pace_guards.bid_tier_ref_px  = pace_refs.bid_tier_ref;
+                    pace_guards.effective_mid_px = pace_refs.effective_mid;
+                }
+                pace_guards.max_aggressive_dev =
+                    (pair_cfg && pair_cfg->bbo_sanity_max_aggressive_dev_override.has_value())
+                        ? pair_cfg->bbo_sanity_max_aggressive_dev_override.value()
+                        : config_.strategy.bbo_sanity_max_aggressive_dev;
+                pace_guards.max_passive_dev =
+                    (pair_cfg && pair_cfg->bbo_sanity_max_passive_dev_override.has_value())
+                        ? pair_cfg->bbo_sanity_max_passive_dev_override.value()
+                        : config_.strategy.bbo_sanity_max_passive_dev;
+                pace_guards.tier_step_bps = std::max(1.0, config_.strategy.fair_value_clamp_tier_step_bps);
+                Mojo pace_tier0_before = 0;
+                for (const auto& pace_tq : pcs.ladder) {
+                    if (pace_tq.side == Side::Bid && pace_tq.tier_index == 0) { pace_tier0_before = pace_tq.price; }
+                }
+                pcs.pace.untightened_bid_px = strategy::pace::tighten_bid_side(
+                    pcs.ladder, pcs.pace.tighten_bps, config_.strategy.pace_tighten_step_bps, pace_guards);
+                Mojo pace_tier0_after = 0;
+                for (const auto& pace_tq : pcs.ladder) {
+                    if (pace_tq.side == Side::Bid && pace_tq.tier_index == 0) { pace_tier0_after = pace_tq.price; }
+                }
+                spdlog::info("[Engine] Step 7: {} pace price +{:.0f}bps: tier-0 bid {} -> {} "
+                             "(fv={:.6f} sigma={:.0f}bps edge>={:.0f}bps book_ask={} margin={:.0f}bps)",
+                             pair_name, pcs.pace.tighten_bps, pace_tier0_before, pace_tier0_after,
+                             pace_fv->price, pace_fv->sigma_bps,
+                             std::max(config_.strategy.pace_min_edge_bps,
+                                      config_.strategy.pace_edge_sigma_mult * pace_fv->sigma_bps),
+                             snap.best_ask, pace_guards.book_guard_margin_bps);
+            }
+        }
+
         // -----------------------------------------------------------------
         // Final sanity: drop any tier with a non-positive price.
         // -----------------------------------------------------------------
@@ -9651,6 +10198,17 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                 spdlog::info("[Engine] Step 7: {} up-scaled {} tiers to "
                              "the min offer size ({:.2f} units)",
                              pair_name, bumped_tiers, eff_min_units);
+            }
+
+            // -- [PACE 2026-09-13] Pace size post-pass -------------------------
+            // A pace-managed pair keeps only the bid tiers whose INDEX is below
+            // the composed tier count, at the composed tier size scaled by the
+            // throttle's bid size scale, and posts no ask.  After the up-scale
+            // above (the pace size already meets the pair minimum), before the
+            // funding re-enforcement and the dust filter below, which still run.
+            if (config_.strategy.pace_enabled && pcs.pace.managed) {
+                pcs.pace.throttle_bid_size_scale = pace_bid_throttle_scale;
+                strategy::pace::shape_bid_side(pcs.ladder, pcs.pace);
             }
 
             // -- [S3 rounds 5+7] Re-enforce EVERY side's funding budget
@@ -9862,6 +10420,115 @@ void Engine::step_generate_ladder(BlockHeight block_height)
 // [T2-09] Persists actual wallet-assigned offer IDs to the database
 // by reading them from shared State after post_quotes returns.
 // [T3-24] Gates on market_data_valid to prevent posting with stale data.
+// ---------------------------------------------------------------------------
+// [PACE 2026-09-13] step_enforce_pace_caps -- Step 8's pace pass, before the
+// main loop (inside step_manage_offers, so below its dry-run, wallet-sync and
+// fee-budget returns, and behind every Step 8 gate of the heartbeat).
+//   * An idle ladder (hold plan, no Step 6 quote, or empty) is invisible to
+//     the main loop, which skips empty ladders; its resting offers still get
+//     the canceller's own hard-TTL and crossing rules, through
+//     classify_tier_staleness with an EMPTY ladder.
+//   * A non-hold plan cancels asks (the increasing side), bids at an absent
+//     tier index, and resting size above the caps (select_resting_to_cancel).
+//     After a Step 9f take spent the asset, the plan is re-planned first.
+// A hold plan never cancels for pace: a data blip must not cancel the ladder.
+// ---------------------------------------------------------------------------
+asio::awaitable<void> Engine::step_enforce_pace_caps(BlockHeight block_height,
+                                                     std::uint64_t recommended_fee)
+{
+    if (!config_.strategy.pace_enabled) {
+        co_return;
+    }
+    for (auto& [pair_name, pcs] : cycle_) {
+        // The main loop's own rule: never act on a pair without valid data.
+        if (!pcs.pace.managed || !pcs.market_data_valid) {
+            continue;
+        }
+        const PairConfig* pace_pc = find_pair_config(pair_name);
+        if (!pace_pc) {
+            continue;
+        }
+        std::vector<std::string> pace_ids;
+        std::unordered_map<std::string, std::string> pace_why;
+        const auto pace_add = [&](const std::vector<std::string>& ids, const char* reason) {
+            for (const auto& oid : ids) {
+                if (pace_why.emplace(oid, reason).second) {
+                    pace_ids.push_back(oid);
+                }
+            }
+        };
+        if (pcs.pace.hold || !pcs.quote_valid || pcs.ladder.empty()) {
+            const auto pace_mid = static_cast<Mojo>(std::llround(
+                market_data_->get_mid_price(pair_name) * static_cast<double>(kMojosPerXch)));
+            const std::vector<TierQuote> pace_no_ladder{};
+            for (const auto& pace_tc : offer_mgr_->classify_tier_staleness(
+                     pair_name, pace_no_ladder, block_height, config_.strategy.offer_ttl_blocks,
+                     pace_mid, false, true, true)) {
+                if (pace_tc.staleness == execution::TierStaleness::Fresh) {
+                    continue;
+                }
+                pace_add({pace_tc.offer_id}, pace_tc.staleness == execution::TierStaleness::Expired
+                                                 ? "pace_idle_ttl" : "pace_idle_crossed");
+            }
+        }
+        if (!pcs.pace.hold) {
+            if (!pcs.quote_valid) {
+                // Step 6 returned no quote: nothing may rest for pace.
+                pcs.pace.tiers = 0u;
+                pcs.pace.pool_base_mojos = 0;
+            }
+            if (pace_assets_consumed_this_cycle_.count(pcs.pace.asset) != 0u) {
+                const auto pace_rem_it = pace_remaining_units_.find(pcs.pace.asset);
+                strategy::pace::replan_after_take(
+                    pcs.pace, pace_rem_it != pace_remaining_units_.end() ? pace_rem_it->second : 0.0,
+                    pace_params_from_config(), pace_pc->base_mojos_per_unit);
+                strategy::pace::shape_bid_side(pcs.ladder, pcs.pace);
+            }
+            std::vector<strategy::pace::RestingOffer> pace_resting;
+            for (const auto& pace_po : state_->get_all_offers()) {
+                if (pace_po.pair_name != pair_name) {
+                    continue;
+                }
+                strategy::pace::RestingOffer pace_ro{};
+                pace_ro.id             = pace_po.offer_id;
+                pace_ro.side           = pace_po.side;
+                pace_ro.tier           = pace_po.tier;
+                pace_ro.price          = pace_po.price;
+                pace_ro.size           = pace_po.size;
+                pace_ro.cancel_pending = pace_po.cancel_pending;
+                pace_resting.push_back(std::move(pace_ro));
+            }
+            const strategy::pace::CancelPick pace_pick = strategy::pace::select_resting_to_cancel(
+                pace_resting, pcs.pace, pace_pc->base_mojos_per_unit, pace_pc->quote_mojos_per_unit);
+            pace_add(pace_pick.increasing_ids, "pace_increasing");
+            pace_add(pace_pick.tier_ids, "pace_tier");
+            pace_add(pace_pick.budget_ids, "pace_budget");
+        }
+        if (pace_ids.empty()) {
+            continue;
+        }
+        const std::vector<std::string> pace_freed = co_await offer_mgr_->selective_cancel(pace_ids);
+        for (const auto& oid : pace_freed) {
+            try {
+                db_->update_offer_status(oid, "cancelled", block_height, pace_why[oid]);
+            } catch (const std::exception& e) {
+                spdlog::debug("[Engine] Pace: update_offer_status failed for {}: {}",
+                              oid.substr(0, 12), e.what());
+            }
+        }
+        if (fee_tracker_->enabled() && !pace_freed.empty()) {
+            fee_tracker_->record_fee(static_cast<std::uint64_t>(pace_freed.size()) * recommended_fee,
+                                     block_height);
+        }
+        spdlog::warn("[Engine] Pace: {} cancelled {}/{} resting offers (binding={}, tiers={}, "
+                     "cap={:.4f} units)",
+                     pair_name, pace_freed.size(), pace_ids.size(),
+                     strategy::pace::to_string(pcs.pace.binding), pcs.pace.tiers,
+                     std::min(pcs.pace.resting_cap_units, pcs.pace.remaining_units));
+    }
+    co_return;
+}
+
 asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
 {
     if (dry_run_) {
@@ -10184,6 +10851,10 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         std::set<std::string> refreshed;
         for (auto& [pair_name, pcs] : cycle_) {
             if (!pcs.ladder.empty()) continue;
+            // [PACE 2026-09-13] A pace-managed pair's empty ladder is pace's own
+            // decision, not the deadlock this refresh breaks, and
+            // refresh_pace_balances keeps its assets fresh.
+            if (config_.strategy.pace_enabled && pcs.pace.managed) continue;
             const PairConfig* live_pc = find_pair_config(pair_name);
             if (!live_pc) continue;
             const std::string assets[2] = {live_pc->base_asset_id,
@@ -10233,6 +10904,12 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             }
         }
     }
+
+    // [PACE 2026-09-13] Manage the resting offers of pace-managed pairs before
+    // the main loop: cancels land as cancel_pending, which the main loop's
+    // classifier skips, so a tier is re-posted at its shaped size in this
+    // same Step 8.
+    co_await step_enforce_pace_caps(block_height, recommended_fee);
 
     std::set<std::int64_t> pending_wallets_this_block;
     for (auto& [pair_name, pcs] : cycle_) {
@@ -10310,6 +10987,44 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             can_bid_rebalance,
             can_ask_rebalance);
 
+        // [PACE 2026-09-13] Pace reprice.  To the canceller a tighter desired
+        // bid is FAVOURABLE drift, refreshed only past 3x the tier threshold
+        // (and never past the soft TTL), so a pace tier would otherwise rest
+        // at its old price until the hard TTL.  A Fresh resting bid at a
+        // planned tier is marked Stale when should_reprice_bid says the
+        // tightened price beats both its resting and its untightened price by
+        // the configured margin, after the configured age.
+        std::unordered_set<std::string> pace_reprice_ids;
+        if (config_.strategy.pace_enabled && pcs.pace.managed && !pcs.pace.hold
+            && pcs.pace.tighten_bps > 0.0) {
+            for (auto& pace_tc : tier_classes) {
+                if (pace_tc.side != Side::Bid || pace_tc.staleness != execution::TierStaleness::Fresh) {
+                    continue;
+                }
+                // tier_index is uint8_t, which promotes to int: cast before comparing.
+                const auto pace_tier = static_cast<std::uint32_t>(pace_tc.tier_index);
+                if (pace_tier >= pcs.pace.tiers
+                    || static_cast<std::size_t>(pace_tier) >= pcs.pace.untightened_bid_px.size()) {
+                    continue;
+                }
+                const auto pace_lit = std::find_if(pcs.ladder.begin(), pcs.ladder.end(),
+                    [&](const TierQuote& pace_tq) {
+                        return pace_tq.side == Side::Bid && pace_tq.tier_index == pace_tc.tier_index;
+                    });
+                if (pace_lit == pcs.ladder.end()) {
+                    continue;
+                }
+                const PendingOffer pace_po = state_->get_offer(pace_tc.offer_id);
+                if (strategy::pace::should_reprice_bid(
+                        pace_po.price, pace_lit->price, pcs.pace.untightened_bid_px[pace_tier],
+                        strategy::pace::sat_sub_blocks(block_height, pace_po.created_at_block),
+                        config_.strategy.pace_reprice_min_age_blocks, config_.strategy.pace_reprice_min_bps)) {
+                    pace_tc.staleness = execution::TierStaleness::Stale;
+                    pace_reprice_ids.insert(pace_tc.offer_id);
+                }
+            }
+        }
+
         bool has_pending = !tier_classes.empty();
         int fresh_count = 0, stale_count = 0, expired_count = 0;
         for (const auto& tc : tier_classes) {
@@ -10381,6 +11096,9 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                         .substr(0, 5) + "%)";
                 }
             }
+        }
+        for (const auto& pace_id : pace_reprice_ids) {
+            cancel_reasons[pace_id] = "pace_reprice";
         }
 
         if (!cancelled_ids.empty()) {
@@ -14473,6 +15191,57 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
                      chosen->id.substr(0, 12), take_sz,
                      recent_ask_share, recent_fill_bias_bps);
 
+        // [PACE 2026-09-13] A take must not undo pacing.  One that would
+        // ACQUIRE a pace-Active asset is refused outright; one that SPENDS it
+        // must be priced at or below the independent fair value (re-read here;
+        // unusable means refuse) and fit the remaining budget.  9f's own
+        // premium is measured against the book midpoint, not a fair value.
+        std::string pace_take_key;
+        double pace_take_units = 0.0;
+        if (config_.strategy.pace_enabled) {
+            const bool pace_spend_quote = (chosen->spend == execution::SpendAsset::Quote);
+            const std::string& pace_spend_key   = pace_spend_quote ? quote_u : base_u;
+            const std::string& pace_acquire_key = pace_spend_quote ? base_u : quote_u;
+            const auto pace_is_active = [this](const std::string& pace_asset) {
+                const auto pace_mem_it = pace_memory_.find(pace_asset);
+                return pace_mem_it != pace_memory_.end() && pace_mem_it->second.active;
+            };
+            if (pace_is_active(pace_acquire_key)) {
+                spdlog::info("[Engine] Step 9f: {} SKIP -- pace: take would increase managed asset {}",
+                             pair.name, pace_acquire_key);
+                continue;
+            }
+            if (pace_is_active(pace_spend_key)) {
+                const double pace_units = static_cast<double>(chosen->spend_cost)
+                    / static_cast<double>(pace_spend_quote ? pair.quote_mojos_per_unit
+                                                           : pair.base_mojos_per_unit);
+                const auto pace_fv = market_data_->get_fair_value(pair.name);
+                const bool pace_feed_fresh = coingecko_feed_fresh_for_revival(
+                    !coingecko_prices_.empty(), coingecko_last_fetch_, std::chrono::steady_clock::now(),
+                    config_.market_data.cex_freshness_threshold_sec);
+                const bool pace_fv_usable = pace_fv.has_value()
+                    && strategy::pace::xch_per_unit_from_fair_value(
+                           true, pace_fv->tier != FairValueTier::Unavailable, pace_feed_fresh,
+                           pace_fv->price, pace_fv->sigma_bps,
+                           config_.strategy.pace_max_fair_value_sigma_bps).has_value();
+                const double pace_fv_price = pace_fv_usable ? pace_fv->price : 0.0;
+                const double pace_take_px =
+                    static_cast<double>(chosen->price) / static_cast<double>(kMojosPerXch);
+                const auto pace_rem_it = pace_remaining_units_.find(pace_spend_key);
+                const double pace_remaining =
+                    (pace_rem_it != pace_remaining_units_.end()) ? pace_rem_it->second : 0.0;
+                if (!strategy::pace::take_allowed(pace_take_px, pace_fv_price, pace_units, pace_remaining)) {
+                    spdlog::info("[Engine] Step 9f: {} SKIP -- pace: take {:.4f} {} at {:.6f} vs fair "
+                                 "value {:.6f} (remaining {:.4f})",
+                                 pair.name, pace_units, pace_spend_key, pace_take_px, pace_fv_price,
+                                 pace_remaining);
+                    continue;
+                }
+                pace_take_key = pace_spend_key;
+                pace_take_units = pace_units;
+            }
+        }
+
         if (dry_run_) {
             spdlog::info("[Engine] Step 9f: {} DRY RUN -- would take {}",
                          pair.name, chosen->id.substr(0, 12));
@@ -14611,6 +15380,14 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
                                   take_sz.v, chosen->price,
                                   static_cast<std::uint64_t>(fee),
                                   block_height);
+            }
+
+            // [PACE 2026-09-13] A take that spent a pace asset uses its budget;
+            // Step 8's cap pass re-plans that asset's pairs before posting.
+            if (!pace_take_key.empty()) {
+                double& pace_rem = pace_remaining_units_[pace_take_key];
+                pace_rem = std::max(0.0, pace_rem - pace_take_units);
+                pace_assets_consumed_this_cycle_.insert(pace_take_key);
             }
 
             if (fee_tracker_)
@@ -19901,6 +20678,18 @@ asio::awaitable<void> Engine::check_config_reload_flag()
         if (!cancel_clean) reload_cancel_alert_pending_ = true;
     }
 
+    // [PACE 2026-09-13] The pace controller may be turned OFF live; any other
+    // pace edit waits for a restart.  Off means the pre-pace pipeline, not
+    // flat: resting pace offers are left to the canceller.  The next
+    // step_evaluate_pace clears every plan and map.
+    const bool pace_disabled_live =
+        pace_disables_live(config_.strategy.pace_enabled, fresh.strategy.pace_enabled);
+    if (pace_disabled_live) {
+        config_.strategy.pace_enabled = false;
+        spdlog::warn("[Engine] [RELOAD] pace controller DISABLED live -- the ladder reverts to the "
+                     "pre-pace pipeline; resting pace offers are left to the canceller");
+    }
+
     // Honesty about everything the reload did NOT do.
     for (const auto& name : diff.to_enable) {
         spdlog::warn("[Engine] [RELOAD] pair {} was ENABLED in the saved "
@@ -19922,6 +20711,9 @@ asio::awaitable<void> Engine::check_config_reload_flag()
     // in a different file needs to hear to catch the mismatch.
     if (alerts_) {
         std::string msg = "Re-read " + config_file_path_ + ": ";
+        if (pace_disabled_live) {
+            msg += "pace controller disabled live. ";
+        }
         if (!disabled_list.empty()) {
             msg += "disabled live: " + disabled_list + " -- ";
             msg += cancel_clean
