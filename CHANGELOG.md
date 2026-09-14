@@ -5,6 +5,255 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.24] — 2026-09-14 — record what happened, not what was asked for
+
+Nine merged branches, and most of them fix a record or a signal that reported a
+request as an outcome: a cancel the wallet accepted was stamped `cancelled`, a
+stop request was honoured by whichever engine read it, a maker fill was booked
+on one of its three legs, a strategy-zeroed side was blamed on risk limits, a
+stalled wallet never opened the wallet breaker, and the Dexie ticker's bid and
+ask were exchanged. One branch adds the pace controller, which ships off. No
+config change is required to upgrade, but the first restart acts on offers the
+wallet still holds as PENDING_CANCEL — see Operator notes.
+
+### Cancels stay pending until the wallet says they are done (#157)
+
+- **An accepted cancel is no longer a cancelled offer.** `offer_log` became
+  `cancelled` as soon as the wallet accepted a cancel RPC, although the wallet
+  marks a trade PENDING_CANCEL before it pushes the spend, and that spend can be
+  pruned or never broadcast: three XCH/BYC bids posted on 2026-08-30 were still
+  PENDING_CANCEL, every maker coin unspent, on 2026-09-13. Every cancel site now
+  writes the new status `cancel_pending`; only a wallet verdict completes the
+  row, and `filled` still wins. Boot re-adopts the wallet's PENDING_CANCEL
+  records, reopening rows already stamped `cancelled`, so a take on them is
+  booked.
+- **Re-cancel only with on-chain proof.** `escalate_stuck_cancels` sends a SECURE
+  re-cancel with a raised fee only when the wallet still reports the trade live
+  after its window (96 blocks, about 30 minutes) and the full node shows every
+  maker coin unspent. No answer, or a partial one, pays nothing, and the
+  escalation never marks an offer terminal. Each attempt is recorded with its
+  fee before the fee is paid, so the cap (3 per offer) and the fee floor hold
+  across restarts; after that, one CRITICAL `CancelUnresolved` alert. The sweep
+  does not run while another cancel is in flight, while the wallet is failing,
+  in XCH recovery mode, or after the dead man's switch has fired.
+- **Seven `strategy.cancel_escalation_*` keys**, read at startup: `enabled`
+  (true), `window_blocks` (96), `max_attempts` (3), `fee_step_mojos`
+  (10,000,000), `max_fee_mojos` (100,000,000), `retry_blocks` (8) and
+  `max_probes` (5). They are not yet documented in `config.example.yaml`.
+- **Detection and remedy agree.** The Step 8 stuck counter, `cancel_stale` and
+  the STOPDRAIN count share one predicate that excludes `cancel_pending`
+  offers, so the every-block "attempting forced cancel" warning and the reload
+  drain's every-heartbeat CRITICAL line stop.
+- **GUI.** A `cancel_pending` row shows as **Cancelling**, with its cancel button
+  disabled and a filter of its own; the Orders summary reads
+  `Pending: N | Cancel pending: M`.
+- **Database migration.** On first start `offer_closure_events` gains a nullable
+  `fee_mojos` column (an idempotent `ALTER TABLE ... ADD COLUMN`); existing rows
+  read NULL. It is the only schema change in this release.
+
+### Bulk cancels sent once, as one fundable batch (#158)
+
+- **A cancel is not re-sent after a failure that may have reached the wallet.**
+  `rpc_post` re-sent every endpoint after a timeout or an HTTP 429/5xx. On
+  2026-09-12 a re-sent `cancel_offers` arrived while the first request was still
+  writing cancel records, and in chia 2.7.4 an admitted copy cancels those
+  trades again and charges `batch_fee` again. `cancel_offers` and `cancel_offer`
+  are now re-sent only after `CURLE_COULDNT_CONNECT` or
+  `CURLE_SSL_CONNECT_ERROR`, which cannot have reached the handler.
+- **One batch of 50 offers at 2 spends each, instead of batches of 5.** In chia
+  2.7.4 each batch is its own bundle, and batches that start with a CAT coin
+  select the same XCH fee coin, so at most one of them could land.
+  `kCancelOffersSingleBatchSize` is 50, costed at two cancellation spends per
+  offer (3,518,000,000, 64% of the 5,500,000,000 mempool cost bound): a book of
+  up to 50 offers goes out as one fundable bundle with one `batch_fee` and one
+  reserved fee coin. Larger books still split.
+- **An unanswered sweep is not duplicated by an immediate per-offer cancel.** A
+  timeout, an empty or unparseable reply, or a 5xx now means "possibly
+  submitted": `cancel_all` logs `NO USABLE ANSWER` and treats every tracked
+  offer as still live instead of cancelling each one at once. A refusal or a 4xx
+  still falls back immediately. A 2xx reply whose body is not JSON now throws
+  `ChiaRPCTransportError`.
+- **Offers are re-checked before any re-cancel.** The shutdown ladder waits one
+  request timeout plus 5 s (35 s at the defaults), asks the wallet about each
+  offer, and re-cancels only those still live — none while the sweep still
+  shows as running.
+- **Operator Cancel All has a 125 s deadline**: that 35 s wait plus the shutdown
+  ladder's 90 s budget, counted from when the sweep returned. At the deadline it
+  re-cancels whatever is still live. No new probe or re-cancel starts after it,
+  but a re-cancel already in flight can still start its emergency ladder's RPCs
+  past it.
+- **Still open.** The dead man's switch's own wallet-wide cancel (S31) still
+  follows a shutdown ladder that stops unclean, and a sweep still queued behind
+  the wallet lock shows no evidence yet, so its offers can be re-cancelled while
+  it runs.
+
+### Stop requests addressed to one engine (#153)
+
+- **`shutdown.flag` is addressed to one engine PID.** At startup the engine
+  treated any flag under 60 s old as a live request. On 2026-09-12 a closing GUI
+  wrote one for its engine, a newly launched GUI killed that engine, and the
+  next engine honoured the flag and stopped. The GUI now writes the engine's
+  PID, and the engine honours a request only if it names this PID (or no PID)
+  and was written at or after this process started; any other flag is removed
+  with a WARNING.
+- **Boot can be stopped.** Five boot checkpoints — before the stuck-transaction
+  prune, before coin-pool maintenance, in the wallet-sync wait, before inventory
+  seeding and before startup analysis — end boot on a stop request.
+- **Stop outcomes are reported as observed.** The GUI logged
+  `Engine exited gracefully.` whenever its wait returned. Each stop now logs
+  what it saw — graceful, exited without consuming the request, terminated
+  before or after consuming it, or still running — and an engine that survives
+  terminate and kill stays managed, so Start cannot launch a second engine
+  beside it.
+- **Relaunching the installed GUI closes the old one.** The singleton kill never
+  matched the installed `xop_trader_gui.exe`. A relaunch that finds a stop under
+  way now waits up to 45 s for it before terminating anything.
+
+### A stalled wallet opens the breaker (#156)
+
+- **The breaker counted throws, and a stall throws nothing.** `detect_fills`
+  catches each failed `get_offer` and Step 8's sync check logs and returns, so on
+  2026-09-12 three heartbeats spent 156 to 173 s on doomed wallet calls and the
+  breaker never opened.
+- **It now reads transport evidence recorded in `rpc_post`.** Only a libcurl
+  failure on the attempt that ends a call counts; an HTTP error, a malformed
+  body or `success=false` is an answer. One unanswered transport failure skips
+  the rest of that heartbeat's wallet work (`[WALLET-CIRCUIT] <step> SKIPPED`),
+  and three consecutive failures, across callers and heartbeats, open the
+  breaker. Every wallet call site in Step 8 has a checkpoint. The cancel
+  escalation (#157), the pace balance refresh and Step 8's pace cancels (#160)
+  also stand down while the wallet is failing by this measure.
+- **Prune scope.** The startup stuck-transaction scan built its wallet list
+  before the wallet-ID map existed, so it scanned the XCH wallet alone. It now
+  builds the map first, scans every enabled pair's wallets, and skips the whole
+  scan with a warning if the map cannot be built.
+
+### Maker fills book every leg (#154)
+
+- **Step 2 booked a maker fill through its base asset only.** The quote leg and
+  the XCH fee never reached `InventoryTracker`, which feeds equity, the drawdown
+  check and `inventory_ratio`: an ask removed the XCH sold but never added the
+  proceeds. That was the false drawdown pause of 2026-09-11, after fourteen
+  XCH/DBX asks whose DBX proceeds were never booked.
+- **Every confirmed maker fill now books base, quote and XCH fee**, through the
+  pure header `accounting/maker_fill_legs.hpp`.
+- **`record_buy` refusals surface.** `InventoryTracker::record_buy` returns
+  `bool`, and a refused base or quote leg now reaches the Step 2 error line and
+  the ExposureBreach alert; a refused priced buy used to be reported as success.
+- **What moves.** `inventory_ratio` reflects true quote holdings, so sizing and
+  lean shift on the XCH pairs, and the first restart's one-shot reconcile
+  absorbs the historic gap once. Taker fills still book no inventory legs (TODO
+  S48).
+
+### Dexie ticker sides (#159)
+
+- **The ticker's bid and ask were swapped on every pair.** Dexie's `prices.buy`
+  is what buying the token costs — its ask — and `prices.sell` its bid;
+  XOPTrader read them the other way round on all four traded pairs. Our own
+  resting XCH/BYC bid at 1.451 BYC per XCH was listed as `buy[0]` = 1/1.451.
+  The fields are now `TickerData::best_bid` and `best_ask`, oriented by the pure
+  `orient_market_ticker()`.
+- **Fair value and the published spread are gated on book provenance.** Read
+  correctly, an ordinary raw ticker book no longer looks crossed, and looking
+  crossed was all that had kept it out of the fair-value inputs and the
+  published `spread_bps`. Both now require `bbo_from_filtered_book`, and a raw
+  book publishes spread 0. The every-heartbeat `Crossed book` lines on XCH/BYC
+  and XCH/DBX stop.
+
+### Step 6 names the side a limit cut (#155)
+
+- **The warning blamed risk limits for both sides.**
+  `Step 6: XCH/BYC -- both sides blocked by risk limits` fired every heartbeat,
+  but the bid's zero came from the strategy, which sizes the bid from total XCH
+  holdings above `q_max`; only the ask was zeroed by a limit.
+  `PreTradeCheck::evaluate_limits` now records, per side, the rule that zeroed
+  it and the rules that reduced it, and the line reads
+  `no quote this block: bid … | ask … (zeroed by single_cat_cap; …)`. Quoting
+  does not change.
+- **Rate-limited**: a warn on the first blocked heartbeat or a change of cause,
+  then once per 192 peak-height blocks (about an hour).
+
+### Pace controller and per-pair concentration limits, off by default (#160)
+
+- **Per-pair concentration limits.** `pairs[].soft_limit_pct_override` and
+  `pairs[].hard_limit_pct_override` replace `risk.soft_limit_pct` and
+  `risk.hard_limit_pct` for that pair only. With no override nothing changes.
+- **The pace controller** (`strategy.pace_enabled`, default false) sells an
+  overweight CAT quote asset listed in `pace_assets` toward its
+  `asset_target_allocations` band, through the bids of its `XCH/<asset>` pairs,
+  on a daily budget spread over `pace_horizon_blocks` (default 64,512, 14 days).
+  It values the asset only at the independent fair value with fresh
+  wallet-confirmed balances and holds on any data gap; every pace bid still
+  passes every risk limit and is capped below fair value by at least
+  `pace_min_edge_bps`. A pace cancel is recorded as `cancel_pending`, like every
+  other cancel (#157). All 17 `pace_*` keys are documented, commented out, in
+  `config.example.yaml`.
+
+### Settings Save patches the ratio targets (#152)
+
+- **A Settings Save no longer clobbers `strategy.ratio_target_by_pair`.** It
+  rebuilt that map, the only per-pair ratio target the engine reads, from a
+  GUI-only mirror that the Wallet tab's Apply never updates, so a Save could
+  revert live targets. A Save now re-reads the file and patches only the rows
+  the operator changed; untouched pairs keep their value on disk exactly, and
+  the four Wallet-owned keys are also taken from the file.
+
+### Operator notes
+
+- **No config change is required to upgrade.** Every new key has a default, and
+  the `offer_closure_events.fee_mojos` migration (#157) runs on first start.
+- **The first restart acts on live offers (#157).** Offers the wallet still holds
+  as PENDING_CANCEL are adopted as `cancel_pending`. About 96 blocks later, each
+  one the wallet still reports live with every maker coin unspent gets a
+  fee-bearing SECURE re-cancel — at most 3 per offer, then one `CancelUnresolved`
+  alert. To avoid that, set `strategy.cancel_escalation_enabled: false` before
+  restarting, or cancel those offers by hand first.
+- **Edit `config.yaml` only with the GUI stopped.** A Settings Save writes back
+  the snapshot the GUI loaded, so a key changed on disk while the GUI runs
+  reverts; #152 fixes that only for `strategy.ratio_target_by_pair` and the
+  Wallet-owned keys. Check `git diff config.yaml` before every restart.
+- **Pace is off by default and needs the staged rollout described in #160.**
+  Each stage is a `config.yaml` edit with the GUI stopped, a `git diff` check
+  and a GUI restart: (A) the keys present with `pace_enabled: false`; (B) size
+  only, `pace_enabled: true`, `pace_assets: [BYC]` and
+  `pace_tighten_max_bps: 0`, observed for at least 24 h; (C) price,
+  `pace_tighten_max_bps: 300`; (D) per-pair concentration overrides, only once
+  the log shows `binding=Risk` or `binding=WalletConcentration`; (E) a shorter
+  `pace_horizon_blocks`, only after (C) shows fills at the 14-day cap.
+- **Pace rollback is restart-only.** Stop the GUI, confirm no `xop_trader`
+  process is still running, set `pace_enabled: false` in `config.yaml`, check
+  `git diff config.yaml`, then restart the GUI and confirm the `pace = off`
+  startup line. A live disable from the GUI is not supported.
+- **Log text.** Anything matching `both sides blocked` should match
+  `no quote this block` instead (#155). New lines to expect:
+  `[WALLET-CIRCUIT] <step> SKIPPED` (#156), `NO USABLE ANSWER` (#158) and the
+  CRITICAL `CancelUnresolved` alert (#157).
+- **TODO renumbering.** #153 and #156 each added a TODO entry numbered S47. The
+  wallet breaker entry from #156 keeps S47; #153's entry, "`cancel_all.flag` and
+  `pause.flag` are not addressed, so a successor engine inherits them", is S65
+  in this release (#153's description still calls it S47).
+
+### Known limitations
+
+- **S36** — no test in `cpp/tests` constructs an `Engine`, so the engine wiring
+  of these changes is compiled but not executed under test; the decisions are
+  tested as pure functions, and call sites are pinned at most by source scans.
+- **S49** — Step 11's one-shot reconcile can absorb a settled but undetected
+  fill that Step 2 then applies again; since #154 its quote and fee legs
+  double-apply too.
+- **S52** — the cross-stable arb books an unmeasurable stable-pair spread as a
+  free return leg.
+- **S53** — Dexie's `last` under CAT keys looks reciprocal, so BYC/wUSDC.b may
+  ingest 0.48 instead of about 2.083 (plausible, unverified).
+- **S54** — fair-value inputs have provenance (#159) but no recency, so a pair
+  keeps its last filtered book, at its old weight, through a Dexie outage.
+- **S58** — a take whose wallet reply lacks a trade id is recorded as "unknown",
+  and every later one is silently dropped, so pace can undercount its progress.
+- **S59** — a resting pace bid above fair value is cancelled the first time it
+  is seen there, with no age or hysteresis guard.
+- **S65** — `cancel_all.flag` and `pause.flag` are not addressed, so a successor
+  engine inherits them.
+
 ## [0.10.23] — 2026-09-13 — guards that can be aimed, and status that is asserted
 
 Four merged branches, and one theme runs through most of them: a control that
