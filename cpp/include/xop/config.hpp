@@ -134,6 +134,17 @@ struct PairConfig {
     std::optional<double>   kappa_override;
     std::optional<double>   phi_override;
     std::optional<double>   q_max_override;
+    // [PACE D1 2026-09-13] This pair's soft / hard concentration limits for
+    // PreTradeCheck (evaluate_limits, apply_limits, get_limit_status), in
+    // place of risk.soft_limit_pct / risk.hard_limit_pct.  Absent -> the
+    // global value.  Each must be finite in (0, 1], and load_config requires
+    // the EFFECTIVE soft (override or global) to be below the effective hard.
+    // Symmetric: the same limits taper this pair's base-overweight bid AND its
+    // quote-overweight ask.  Deliberately still global: the drift analyzer,
+    // InventoryTracker::get_risk_status, the ExposureBreach alert and the GUI
+    // risk fields.
+    std::optional<double>   soft_limit_pct_override{};
+    std::optional<double>   hard_limit_pct_override{};
     std::optional<double>   min_profit_margin_bps_override;
     std::optional<std::vector<double>> tier_spacing_bps_override;
     std::optional<std::vector<double>> tier_size_pct_override;

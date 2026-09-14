@@ -211,6 +211,20 @@ pairs:
     # fair_value_residual_widen_ratio_override: 0.25       # [OPTIONAL, default: unset -> strategy.fair_value_residual_widen_ratio] 0 disables residual widening here; must be >= 0
     # offer_expiry_secs_override: 172800                   # [OPTIONAL, default: unset -> strategy.offer_expiry_secs] 0 binds and means "never expire THIS pair's offers"; must outlast the hard TTL x2 safety margin
 
+    # -- Per-pair override of RISK-level keys (concentration limits) --
+    # This pair's soft / hard concentration limits for the Step 6 risk filter,
+    # in place of risk.soft_limit_pct / risk.hard_limit_pct.  Each must be
+    # finite in (0, 1], and the EFFECTIVE soft (override or global) must be
+    # below the effective hard, or the config is rejected at load.  SYMMETRIC:
+    # the same limits taper this pair's base-overweight bid AND its
+    # quote-overweight ask.  A pair whose limits differ from the global pair
+    # logs a warning at load.  Restart required.  Add these with the GUI
+    # STOPPED: the Settings pairs table re-emits each pair from the dict it
+    # loaded, so a key added while the GUI runs is dropped on its next save.
+    # The values below are illustrative only.
+    # soft_limit_pct_override: 0.70                        # [OPTIONAL, default: unset -> risk.soft_limit_pct]
+    # hard_limit_pct_override: 0.90                        # [OPTIONAL, default: unset -> risk.hard_limit_pct]
+
     # -- Per-pair override of a MARKET_DATA-level key (not a strategy one) --
     # Ceiling in BASIS POINTS -- not a fraction; contrast the BBO block below.
     # Absent -> market_data.book_side_agree_max_spread_bps (5000 by default).

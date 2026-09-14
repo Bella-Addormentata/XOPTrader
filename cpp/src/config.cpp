@@ -695,6 +695,28 @@ std::vector<PairConfig> parse_pairs(const YAML::Node& root)
             }
             p.q_max_override = v;
         }
+        // [PACE D1 2026-09-13] Per-pair concentration limits.  NaN is caught
+        // ONLY by the isfinite test (the range test lets it through), so that
+        // test stays observable; soft < hard across the EFFECTIVE pair is
+        // checked in load_config, once every section is parsed.
+        if (item["soft_limit_pct_override"] && item["soft_limit_pct_override"].IsDefined()
+            && !item["soft_limit_pct_override"].IsNull()) {
+            const double v = item["soft_limit_pct_override"].as<double>();
+            if (!std::isfinite(v) || v <= 0.0 || v > 1.0) {
+                throw ConfigError(idx + ".soft_limit_pct_override must be a finite fraction in (0, 1]; got "
+                                  + std::to_string(v));
+            }
+            p.soft_limit_pct_override = v;
+        }
+        if (item["hard_limit_pct_override"] && item["hard_limit_pct_override"].IsDefined()
+            && !item["hard_limit_pct_override"].IsNull()) {
+            const double v = item["hard_limit_pct_override"].as<double>();
+            if (!std::isfinite(v) || v <= 0.0 || v > 1.0) {
+                throw ConfigError(idx + ".hard_limit_pct_override must be a finite fraction in (0, 1]; got "
+                                  + std::to_string(v));
+            }
+            p.hard_limit_pct_override = v;
+        }
         if (item["min_profit_margin_bps_override"]
             && item["min_profit_margin_bps_override"].IsDefined()
             && !item["min_profit_margin_bps_override"].IsNull()) {
@@ -3018,6 +3040,15 @@ void log_config_summary(const AppConfig& cfg)
         if (cfg.pairs[i].phi_override) {
             out << " [phi=" << *cfg.pairs[i].phi_override << "]";
         }
+        // [PACE D1 2026-09-13] The EFFECTIVE concentration limits, when either
+        // is overridden.
+        if (cfg.pairs[i].soft_limit_pct_override || cfg.pairs[i].hard_limit_pct_override) {
+            out << " [conc soft="
+                << cfg.pairs[i].soft_limit_pct_override.value_or(cfg.risk.soft_limit_pct)
+                << " hard="
+                << cfg.pairs[i].hard_limit_pct_override.value_or(cfg.risk.hard_limit_pct)
+                << "]";
+        }
         out << "\n";
     }
 
@@ -3753,6 +3784,37 @@ BuyerConfig parse_buyer(const YAML::Node& root)
     return cfg;
 }
 
+// [PACE D1 2026-09-13] Per-pair concentration overrides.  The EFFECTIVE soft
+// limit (override or risk.soft_limit_pct) must be below the effective hard
+// limit for every configured pair, enabled or not, with or without the pace
+// controller.  A pair whose effective limits differ from the global pair is
+// announced at warn level: relaxing a risk limit must never be silent.
+// parse_risk already requires risk.soft_limit_pct < risk.hard_limit_pct, so a
+// pair without overrides can never fail here.
+void validate_pair_concentration_overrides(const AppConfig& cfg)
+{
+    for (std::size_t i = 0; i < cfg.pairs.size(); ++i) {
+        const PairConfig& pc = cfg.pairs[i];
+        const double soft_eff = pc.soft_limit_pct_override.value_or(cfg.risk.soft_limit_pct);
+        const double hard_eff = pc.hard_limit_pct_override.value_or(cfg.risk.hard_limit_pct);
+        if (!(soft_eff < hard_eff)) {
+            throw ConfigError("pairs[" + std::to_string(i) + "] (" + pc.name
+                              + "): effective soft limit " + std::to_string(soft_eff)
+                              + " must be below effective hard limit "
+                              + std::to_string(hard_eff));
+        }
+        if (soft_eff != cfg.risk.soft_limit_pct || hard_eff != cfg.risk.hard_limit_pct) {
+            spdlog::warn("[Config] pairs[{}] ({}): concentration limits overridden -- "
+                         "soft {:.3f} (global {:.3f}), hard {:.3f} (global {:.3f}); "
+                         "apply_limits and get_limit_status use them for THIS pair "
+                         "only, on both the base-overweight bid and the "
+                         "quote-overweight ask",
+                         i, pc.name, soft_eff, cfg.risk.soft_limit_pct,
+                         hard_eff, cfg.risk.hard_limit_pct);
+        }
+    }
+}
+
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -4043,6 +4105,7 @@ AppConfig load_config(const std::string& path,
     cfg.market_data = parse_market_data(root);
     validate_usd_anchor(cfg);
     validate_enforced_pegs_are_observable(cfg);
+    validate_pair_concentration_overrides(cfg);
 
     // [S27 review round 3] Since usd_per_xch() now prefers the external
     // CoinGecko price, a polling interval LONGER than the freshness window

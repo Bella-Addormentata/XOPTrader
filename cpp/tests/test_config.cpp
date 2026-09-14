@@ -2858,3 +2858,134 @@ TEST(ConfigParserTest, DuplicatePairNames_Throw) {
     TempYaml tmp(yaml.c_str());
     EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
 }
+
+// ============================================================================
+// [PACE D1 2026-09-13] Per-pair concentration overrides
+// (pairs[i].soft_limit_pct_override / pairs[i].hard_limit_pct_override)
+// ============================================================================
+
+namespace {
+
+/// A second 64-hex CAT id, for configs that need two pairs.
+const char* const kTest2 =
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdee";
+
+/// load_config must reject `yaml` with a ConfigError whose message contains
+/// `needle`: an error raised for a different reason must not pass the test.
+void expect_config_error_containing(const std::string& yaml, const std::string& needle)
+{
+    TempYaml tmp(yaml);
+    try {
+        const auto cfg = xop::load_config(tmp.path());
+        static_cast<void>(cfg);
+        ADD_FAILURE() << "loaded; expected a ConfigError containing \"" << needle << "\"";
+    } catch (const xop::ConfigError& e) {
+        EXPECT_NE(std::string(e.what()).find(needle), std::string::npos)
+            << "ConfigError: " << e.what() << "\nexpected it to contain \"" << needle << "\"";
+    }
+}
+
+/// load_config must accept `yaml`.
+void expect_loads(const std::string& yaml)
+{
+    TempYaml tmp(yaml);
+    EXPECT_NO_THROW({
+        const auto cfg = xop::load_config(tmp.path());
+        static_cast<void>(cfg);
+    }) << yaml;
+}
+
+}  // namespace
+
+TEST(PairConcentrationOverride, AbsentByDefault) {
+    TempYaml tmp(kMinimalValidYaml);
+    const auto cfg = xop::load_config(tmp.path());
+    ASSERT_EQ(cfg.pairs.size(), 1u);
+    EXPECT_FALSE(cfg.pairs[0].soft_limit_pct_override.has_value());
+    EXPECT_FALSE(cfg.pairs[0].hard_limit_pct_override.has_value());
+}
+
+TEST(PairConcentrationOverride, ParsesBoth) {
+    TempYaml tmp(with_pair_extra(
+        "soft_limit_pct_override: 0.9\n    hard_limit_pct_override: 0.97"));
+    const auto cfg = xop::load_config(tmp.path());
+    ASSERT_EQ(cfg.pairs.size(), 1u);
+    ASSERT_TRUE(cfg.pairs[0].soft_limit_pct_override.has_value());
+    ASSERT_TRUE(cfg.pairs[0].hard_limit_pct_override.has_value());
+    EXPECT_DOUBLE_EQ(*cfg.pairs[0].soft_limit_pct_override, 0.9);
+    EXPECT_DOUBLE_EQ(*cfg.pairs[0].hard_limit_pct_override, 0.97);
+}
+
+TEST(PairConcentrationOverride, NonFiniteThrows) {
+    for (const char* key : {"soft_limit_pct_override", "hard_limit_pct_override"}) {
+        for (const char* value : {".nan", ".inf"}) {
+            SCOPED_TRACE(std::string(key) + ": " + value);
+            expect_config_error_containing(
+                with_pair_extra(std::string(key) + ": " + value), key);
+        }
+    }
+}
+
+TEST(PairConcentrationOverride, OutOfRangeThrows) {
+    for (const char* key : {"soft_limit_pct_override", "hard_limit_pct_override"}) {
+        for (const char* value : {"0", "-0.1", "1.0001"}) {
+            SCOPED_TRACE(std::string(key) + ": " + value);
+            expect_config_error_containing(
+                with_pair_extra(std::string(key) + ": " + value), key);
+        }
+    }
+}
+
+TEST(PairConcentrationOverride, EffectiveSoftNotBelowEffectiveHardThrows) {
+    // Both present, inverted.
+    expect_config_error_containing(
+        with_pair_extra("soft_limit_pct_override: 0.97\n    hard_limit_pct_override: 0.90"),
+        "effective soft limit");
+    // Soft-only above the global hard (0.80).
+    {
+        TempYaml tmp(with_pair_extra("soft_limit_pct_override: 0.85"));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+    }
+    // Hard-only below the global soft (0.60).
+    {
+        TempYaml tmp(with_pair_extra("hard_limit_pct_override: 0.55"));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+    }
+    // Soft-only below the global hard, and hard-only above the global soft.
+    expect_loads(with_pair_extra("soft_limit_pct_override: 0.70"));
+    expect_loads(with_pair_extra("hard_limit_pct_override: 0.97"));
+}
+
+TEST(PairConcentrationOverride, OtherPairsUnaffected) {
+    std::string yaml = kMinimalValidYaml;
+    const std::string anchor = "    enabled: true\n";
+    const auto pos = yaml.find(anchor);
+    ASSERT_NE(pos, std::string::npos);
+    yaml.insert(pos + anchor.size(),
+                std::string("    soft_limit_pct_override: 0.9\n"
+                            "    hard_limit_pct_override: 0.97\n"
+                            "  - base_asset_id: \"xch\"\n"
+                            "    quote_asset_id: \"") + kTest2 + "\"\n"
+                "    name: \"XCH/TEST2\"\n"
+                "    enabled: true\n");
+    TempYaml tmp(yaml);
+    const auto cfg = xop::load_config(tmp.path());
+    ASSERT_EQ(cfg.pairs.size(), 2u);
+    EXPECT_FALSE(cfg.pairs[1].soft_limit_pct_override.has_value());
+    EXPECT_FALSE(cfg.pairs[1].hard_limit_pct_override.has_value());
+    ASSERT_TRUE(cfg.pairs[0].soft_limit_pct_override.has_value());
+    ASSERT_TRUE(cfg.pairs[0].hard_limit_pct_override.has_value());
+    EXPECT_DOUBLE_EQ(*cfg.pairs[0].soft_limit_pct_override, 0.9);
+    EXPECT_DOUBLE_EQ(*cfg.pairs[0].hard_limit_pct_override, 0.97);
+}
+
+TEST(PairConcentrationOverride, OverrideLoggedAtLoad) {
+    CapturedLog log;
+    TempYaml tmp(with_pair_extra(
+        "soft_limit_pct_override: 0.9\n    hard_limit_pct_override: 0.97"));
+    EXPECT_NO_THROW({
+        const auto cfg = xop::load_config(tmp.path());
+        static_cast<void>(cfg);
+    });
+    EXPECT_TRUE(log.warned_containing("concentration limits overridden")) << log.text();
+}

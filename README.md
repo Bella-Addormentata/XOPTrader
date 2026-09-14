@@ -775,6 +775,8 @@ Key sections to configure before first run:
 | `single_cat_cap_pct` | 0.12 | Maximum portfolio allocation to any single CAT |
 | `kelly_fraction` | 0.5 | Half-Kelly position sizing (conservative) |
 | `max_capital_per_pair_pct` | 0.85 | Maximum capital deployed to any single pair (set high to allow rebalancing when one asset dominates) |
+| `pairs[].soft_limit_pct_override` | unset | Per-pair soft concentration limit, finite in (0, 1]; replaces `soft_limit_pct` for THAT pair only, on both its bid and its ask taper |
+| `pairs[].hard_limit_pct_override` | unset | Per-pair hard concentration limit, finite in (0, 1]; the effective soft limit (override or global) must stay below the effective hard limit |
 | `max_drawdown_pct` | 0.10 | All-time HWM drawdown fraction that pauses the engine (circuit breaker) |
 | `loss_window_blocks` | 1152 | Rolling window for time-windowed loss circuit breaker (~10 h at 52 s/block) |
 | `max_window_loss_bps` | 500 | Maximum loss in basis points within the rolling window; 0 = disabled |

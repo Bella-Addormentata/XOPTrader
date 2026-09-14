@@ -6631,11 +6631,21 @@ void Engine::step_apply_risk_limits(BlockHeight block_height)
         // sides "blocked by risk limits" when the live XCH/BYC bid was the
         // strategy's own 0 (q=24.57 >= q_max=20) and only the ask was cut,
         // to 0 by the CAT cap's full block.
+        //
+        // [PACE D1 2026-09-13] With this pair's effective concentration
+        // limits: its soft/hard overrides where configured, else the global
+        // pair.  pair_cfg is this pair's own config, so no other pair's
+        // override can apply; without overrides these are the same two
+        // doubles evaluate_limits read before.  Named conc_limits so it
+        // cannot collide with a `limits` local.
+        const ConcentrationLimits conc_limits =
+            effective_concentration_limits(config_.risk, pair_cfg);
         const LimitsDecision limits_decision = pre_trade_->evaluate_limits(
             quote,
             AssetId{pair_cfg->base_asset_id},
             AssetId{pair_cfg->quote_asset_id},
-            *state_);
+            *state_,
+            conc_limits);
 
         if (limits_decision.has_quote) {
             pcs.risk_quote  = limits_decision.quote;
@@ -6666,7 +6676,7 @@ void Engine::step_apply_risk_limits(BlockHeight block_height)
             pcs.quote_valid = false;
             const std::string no_quote_line = format_step6_no_quote(
                 pair_name, limits_decision.trace, pair_cfg->base_mojos_per_unit,
-                pcs.strategy_q, pcs.strategy_q_max, config_.risk,
+                pcs.strategy_q, pcs.strategy_q_max, config_.risk, conc_limits,
                 kLimitBlockWarnReminderBlocks);
             if (step6_no_quote_warn_gates_[pair_name].should_warn(
                     limit_block_signature(limits_decision.trace), block_height,
