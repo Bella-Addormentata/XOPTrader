@@ -53,8 +53,12 @@ SUBMIT_REASONS = (
     '"reload_disabled_pair"',
     '"peg_suspended"',
     '"cancel_escalation_"',
+    # [v0.10.24 integration] #160's Step 8 pace pass records its pace reason
+    # (pace_idle_ttl, pace_idle_crossed, pace_increasing, pace_tier,
+    # pace_above_fv, pace_budget) from pace_why.
+    "pace_why[oid]",
 )
-SUBMIT_SITE_COUNT = 18
+SUBMIT_SITE_COUNT = 19
 
 
 def _read(path: Path) -> str:

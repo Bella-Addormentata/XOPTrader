@@ -11017,12 +11017,22 @@ asio::awaitable<void> Engine::step_enforce_pace_caps(BlockHeight block_height,
         if (pace_ids.empty()) {
             continue;
         }
+        // [v0.10.24 integration] #156's Step 8 rule: every wallet call site has a
+        // checkpoint of its own.  The liveness refresh just before this pass
+        // swallows its failures, and an earlier pair's pace cancel may just have
+        // failed; returning here leaves Step 8 to the pair loop's own checkpoint.
+        if (!wallet_step_may_run("Step 8 pace caps")) {
+            co_return;
+        }
         const std::vector<std::string> pace_freed = co_await offer_mgr_->selective_cancel(pace_ids);
+        // [v0.10.24 integration] #157: an accepted cancel is only a submission,
+        // so offer_log says cancel_pending, with the pace reason as its cause,
+        // until the wallet reports the offer terminal.
         for (const auto& oid : pace_freed) {
             try {
-                db_->update_offer_status(oid, "cancelled", block_height, pace_why[oid]);
+                db_->mark_offer_cancel_submitted(oid, block_height, pace_why[oid]);
             } catch (const std::exception& e) {
-                spdlog::debug("[Engine] Pace: update_offer_status failed for {}: {}",
+                spdlog::debug("[Engine] Pace: mark_offer_cancel_submitted failed for {}: {}",
                               oid.substr(0, 12), e.what());
             }
         }
