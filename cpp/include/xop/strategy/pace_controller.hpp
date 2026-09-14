@@ -1090,11 +1090,13 @@ inline std::vector<std::string> select_resting_above_fair_value(const std::vecto
 }
 
 /// P25b: the refresh age h = max(1, max_balance_age_blocks / 2).  An entry
-/// refreshed every h blocks stays fresh, and one failed attempt at age h is
-/// retried at age 2h, which is <= max_age when max_age >= 2.  So, for
-/// max_age >= 2 and heartbeats that do not skip heights, a single transient
-/// failure never lets a maintained balance go stale.  With max_age 1, or a
-/// skipped height, one heartbeat may Hold instead, which fails safe.
+/// refreshed every h blocks stays fresh.  One failed attempt at age h is
+/// retried at age 2h, and the refresh runs before that heartbeat's
+/// evaluation, so the heartbeats in between see an age of at most
+/// 2h - 1 <= max_age, for every max_age >= 1.  So, while heartbeats do not
+/// skip heights, a single transient failure never lets a maintained balance
+/// go stale.  A skipped height, or a second failure in a row, can: pace then
+/// Holds until a refresh succeeds, which fails safe.
 [[nodiscard]] constexpr std::uint32_t pace_refresh_age_blocks(std::uint32_t max_balance_age_blocks) noexcept
 {
     return std::max<std::uint32_t>(1u, max_balance_age_blocks / 2u);

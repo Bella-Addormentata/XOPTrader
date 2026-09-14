@@ -492,10 +492,17 @@ strategy:
   # market_data.cex_freshness_threshold_sec must be finite and > 0.  Every pace
   # change needs a restart, turning pace off included: stop the GUI (closing it
   # stops the engine it launched; stop any engine it did not launch as well),
-  # edit this file, check `git diff config.yaml`, then restart.  Edit only with
-  # the GUI stopped: a Settings Save rewrites the file from what the GUI last
-  # loaded, so a key changed on disk meanwhile reverts and a key added
-  # meanwhile is deleted.  A live disable from the GUI is NOT supported: after
+  # edit this file, check `git diff config.yaml`, then restart.  Before
+  # restarting, confirm no `xop_trader` process is still running: the engine
+  # has no single-instance guard, and a GUI stop that cannot kill it only logs
+  # `Engine process could not be killed.`  Edit only with the GUI stopped: a
+  # Settings Save rewrites the file from what the GUI last loaded, so a key
+  # changed on disk meanwhile reverts and a key added meanwhile is deleted.
+  # This is config.yaml only: keys added to secrets.yaml survive
+  # (`config_split.py` merges onto the existing file), and the pairs list is
+  # rewritten position by position from the GUI's load-time list
+  # (`config_split.py:217-236`), so a pair added or reordered on disk is
+  # overwritten too.  A live disable from the GUI is NOT supported: after
   # Settings > Load, Save stays disabled until a setting is edited, so no
   # reload reaches the engine, and `git diff` shows false while pace stays on.
   # If a live disable is ever attempted through a real Settings edit plus Save,
