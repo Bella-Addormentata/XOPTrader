@@ -16,6 +16,7 @@
 #include <gtest/gtest.h>
 
 #include <xop/risk/limits.hpp>
+#include <xop/strategy/pace_controller.hpp>
 #include <xop/config.hpp>
 #include <xop/types.hpp>
 
@@ -707,6 +708,491 @@ TEST(PreTradeCheckConstruction, RejectsNegativeMargin) {
     strat.min_profit_margin_bps = -100.0;
 
     EXPECT_THROW(xop::PreTradeCheck(risk, strat), std::invalid_argument);
+}
+
+// ============================================================================
+// [PACE D1 2026-09-13] Per-pair concentration limits
+//
+// Every expected value is a LITERAL produced by the spec's Python mirror of
+// today's limits.cpp arithmetic (specs/pace_v2_work/pace_model.py), never by
+// calling the code under test.  Each test sets its own RiskConfig: the fixture
+// above uses a 0.12 CAT cap and a 0.20 pair cap, which would taper these
+// quotes for a different reason.
+// ============================================================================
+
+// base_conc = a / 64000 exactly (every asset marked at 1.0); pair fraction 0.5.
+void seed_conc_state(xop::State& state, xop::Mojo a)
+{
+    if (a > 0) {
+        state.record_buy("xch", a, 1);
+    }
+    if (64000 - a > 0) {
+        state.record_buy("byc", 64000 - a, 1);
+    }
+    state.record_buy("dbx", 64000, 1);
+    state.set_asset_xch_rate("byc", 1.0);
+    state.set_asset_xch_rate("dbx", 1.0);
+}
+
+// soft 0.60 / hard 0.80, with CAT and pair caps too wide to bind.
+xop::RiskConfig risk_wide()
+{
+    xop::RiskConfig r;
+    r.soft_limit_pct           = 0.60;
+    r.hard_limit_pct           = 0.80;
+    r.single_cat_cap_pct       = 0.99;
+    r.max_capital_per_pair_pct = 0.99;
+    return r;
+}
+
+xop::StrategyConfig strategy_35bps()
+{
+    xop::StrategyConfig s;
+    s.min_profit_margin_bps = 35.0;
+    return s;
+}
+
+// Pair A carries both overrides; pair B carries none.
+xop::PairConfig pair_a()
+{
+    xop::PairConfig p;
+    p.name = "XCH/BYC";
+    p.soft_limit_pct_override = 0.90;
+    p.hard_limit_pct_override = 0.97;
+    return p;
+}
+
+xop::PairConfig pair_b()
+{
+    xop::PairConfig p;
+    p.name = "XCH/BYC";
+    return p;
+}
+
+xop::Quote sized_quote(xop::Mojo bid, xop::Mojo ask)
+{
+    xop::Quote q{};
+    q.bid_size = bid;
+    q.ask_size = ask;
+    return q;
+}
+
+TEST(EffectiveLimits, NullPairIsGlobal) {
+    const xop::RiskConfig risk = risk_wide();
+    const xop::ConcentrationLimits l = xop::effective_concentration_limits(risk, nullptr);
+    EXPECT_DOUBLE_EQ(l.soft_limit_pct, 0.6);
+    EXPECT_DOUBLE_EQ(l.hard_limit_pct, 0.8);
+}
+
+TEST(EffectiveLimits, NoOverridesIsGlobal) {
+    const xop::RiskConfig risk = risk_wide();
+    const xop::PairConfig b = pair_b();
+    const xop::ConcentrationLimits l = xop::effective_concentration_limits(risk, &b);
+    EXPECT_DOUBLE_EQ(l.soft_limit_pct, 0.6);
+    EXPECT_DOUBLE_EQ(l.hard_limit_pct, 0.8);
+}
+
+TEST(EffectiveLimits, SoftOnly) {
+    const xop::RiskConfig risk = risk_wide();
+    xop::PairConfig p = pair_b();
+    p.soft_limit_pct_override = 0.70;
+    const xop::ConcentrationLimits l = xop::effective_concentration_limits(risk, &p);
+    EXPECT_DOUBLE_EQ(l.soft_limit_pct, 0.7);
+    EXPECT_DOUBLE_EQ(l.hard_limit_pct, 0.8);
+}
+
+TEST(EffectiveLimits, HardOnly) {
+    const xop::RiskConfig risk = risk_wide();
+    xop::PairConfig p = pair_b();
+    p.hard_limit_pct_override = 0.97;
+    const xop::ConcentrationLimits l = xop::effective_concentration_limits(risk, &p);
+    EXPECT_DOUBLE_EQ(l.soft_limit_pct, 0.6);
+    EXPECT_DOUBLE_EQ(l.hard_limit_pct, 0.97);
+}
+
+TEST(EffectiveLimits, Both) {
+    const xop::RiskConfig risk = risk_wide();
+    const xop::PairConfig a = pair_a();
+    const xop::ConcentrationLimits l = xop::effective_concentration_limits(risk, &a);
+    EXPECT_DOUBLE_EQ(l.soft_limit_pct, 0.9);
+    EXPECT_DOUBLE_EQ(l.hard_limit_pct, 0.97);
+}
+
+TEST(EffectiveLimits, InvalidCombinationFallsBackToGlobal) {
+    // soft 0.85 against the global hard 0.80: soft is not below hard.
+    const xop::RiskConfig risk = risk_wide();
+    xop::PairConfig p = pair_b();
+    p.soft_limit_pct_override = 0.85;
+    const xop::ConcentrationLimits l = xop::effective_concentration_limits(risk, &p);
+    EXPECT_DOUBLE_EQ(l.soft_limit_pct, 0.6);
+    EXPECT_DOUBLE_EQ(l.hard_limit_pct, 0.8);
+}
+
+TEST(EffectiveLimits, NaNOverrideFallsBackToGlobal) {
+    const xop::RiskConfig risk = risk_wide();
+    xop::PairConfig p = pair_b();
+    p.soft_limit_pct_override = std::nan("");
+    p.hard_limit_pct_override = 0.97;
+    const xop::ConcentrationLimits l = xop::effective_concentration_limits(risk, &p);
+    EXPECT_DOUBLE_EQ(l.soft_limit_pct, 0.6);
+    EXPECT_DOUBLE_EQ(l.hard_limit_pct, 0.8);
+}
+
+TEST(ConcentrationKeep, BelowSoftIsNullopt) {
+    const xop::ConcentrationLimits global{0.6, 0.8};
+    EXPECT_FALSE(xop::PreTradeCheck::concentration_keep_fraction(0.5, global).has_value());
+}
+
+TEST(ConcentrationKeep, ExactSoftIsOne) {
+    const xop::ConcentrationLimits global{0.6, 0.8};
+    const auto keep = xop::PreTradeCheck::concentration_keep_fraction(0.6, global);
+    ASSERT_TRUE(keep.has_value());
+    EXPECT_NEAR(*keep, 1.0, 1e-9);
+}
+
+TEST(ConcentrationKeep, SoftBandLinear) {
+    const xop::ConcentrationLimits global{0.6, 0.8};
+    const auto keep = xop::PreTradeCheck::concentration_keep_fraction(0.75, global);
+    ASSERT_TRUE(keep.has_value());
+    EXPECT_NEAR(*keep, 0.2875000000000001, 1e-12);
+}
+
+TEST(ConcentrationKeep, HardBandTaper) {
+    const xop::ConcentrationLimits global{0.6, 0.8};
+    const auto keep = xop::PreTradeCheck::concentration_keep_fraction(0.875, global);
+    ASSERT_TRUE(keep.has_value());
+    EXPECT_NEAR(*keep, 0.031250000000000014, 1e-12);
+}
+
+TEST(ConcentrationKeep, NaNIsNullopt) {
+    const xop::ConcentrationLimits global{0.6, 0.8};
+    EXPECT_FALSE(xop::PreTradeCheck::concentration_keep_fraction(std::nan(""), global).has_value());
+}
+
+TEST(ApplyLimitsToday, LiteralSweepBothSides) {
+    // The 5-argument overload across both concentration bands and both sides.
+    const xop::RiskConfig risk = risk_wide();
+    const xop::StrategyConfig strat = strategy_35bps();
+    const xop::PreTradeCheck ptc(risk, strat);
+    struct Row {
+        xop::Mojo a{0};
+        xop::Mojo bid{0};
+        xop::Mojo ask{0};
+    };
+    const Row rows[] = {
+        {16000, 2000, 575}, {32000, 2000, 2000}, {38000, 2000, 2000},
+        {38400, 2000, 2000}, {40000, 1763, 2000}, {48000, 575, 2000},
+        {51200, 100, 2000}, {56000, 63, 2000}, {62000, 16, 2000},
+        {64000, 0, 2000},
+    };
+    for (const Row& r : rows) {
+        xop::State state;
+        seed_conc_state(state, r.a);
+        const auto got = ptc.apply_limits(sized_quote(2000, 2000), "XCH/BYC", "xch", "byc", state);
+        ASSERT_TRUE(got.has_value()) << "a=" << r.a;
+        EXPECT_EQ(got->bid_size, r.bid) << "a=" << r.a;
+        EXPECT_EQ(got->ask_size, r.ask) << "a=" << r.a;
+    }
+}
+
+TEST(ApplyLimitsOverride, PairOverrideLiftsSoftTaper) {
+    const xop::RiskConfig risk = risk_wide();
+    const xop::StrategyConfig strat = strategy_35bps();
+    const xop::PreTradeCheck ptc(risk, strat);
+    xop::State state;
+    seed_conc_state(state, 48000);
+    const xop::PairConfig a = pair_a();
+    const xop::PairConfig b = pair_b();
+
+    const auto global = ptc.apply_limits(sized_quote(2000, 0), "XCH/BYC", "xch", "byc", state,
+                                         xop::effective_concentration_limits(risk, &b));
+    ASSERT_TRUE(global.has_value());
+    EXPECT_EQ(global->bid_size, 575);
+    EXPECT_EQ(global->ask_size, 0);
+
+    const auto overridden = ptc.apply_limits(sized_quote(2000, 0), "XCH/BYC", "xch", "byc", state,
+                                             xop::effective_concentration_limits(risk, &a));
+    ASSERT_TRUE(overridden.has_value());
+    EXPECT_EQ(overridden->bid_size, 2000);
+    EXPECT_EQ(overridden->ask_size, 0);
+}
+
+TEST(ApplyLimitsOverride, PairOverrideHardBand) {
+    const xop::RiskConfig risk = risk_wide();
+    const xop::StrategyConfig strat = strategy_35bps();
+    const xop::PreTradeCheck ptc(risk, strat);
+    xop::State state;
+    seed_conc_state(state, 63000);
+    const xop::PairConfig a = pair_a();
+    const xop::PairConfig b = pair_b();
+
+    const auto global = ptc.apply_limits(sized_quote(2000, 0), "XCH/BYC", "xch", "byc", state,
+                                         xop::effective_concentration_limits(risk, &b));
+    ASSERT_TRUE(global.has_value());
+    EXPECT_EQ(global->bid_size, 8);
+    EXPECT_EQ(global->ask_size, 0);
+
+    const auto overridden = ptc.apply_limits(sized_quote(2000, 0), "XCH/BYC", "xch", "byc", state,
+                                             xop::effective_concentration_limits(risk, &a));
+    ASSERT_TRUE(overridden.has_value());
+    EXPECT_EQ(overridden->bid_size, 52);
+    EXPECT_EQ(overridden->ask_size, 0);
+}
+
+TEST(ApplyLimitsOverride, PairOverrideAppliesToQuoteSide) {
+    const xop::RiskConfig risk = risk_wide();
+    const xop::StrategyConfig strat = strategy_35bps();
+    const xop::PreTradeCheck ptc(risk, strat);
+    xop::State state;
+    seed_conc_state(state, 16000);
+    const xop::PairConfig a = pair_a();
+    const xop::PairConfig b = pair_b();
+
+    const auto global = ptc.apply_limits(sized_quote(0, 2000), "XCH/BYC", "xch", "byc", state,
+                                         xop::effective_concentration_limits(risk, &b));
+    ASSERT_TRUE(global.has_value());
+    EXPECT_EQ(global->bid_size, 0);
+    EXPECT_EQ(global->ask_size, 575);
+
+    const auto overridden = ptc.apply_limits(sized_quote(0, 2000), "XCH/BYC", "xch", "byc", state,
+                                             xop::effective_concentration_limits(risk, &a));
+    ASSERT_TRUE(overridden.has_value());
+    EXPECT_EQ(overridden->bid_size, 0);
+    EXPECT_EQ(overridden->ask_size, 2000);
+}
+
+TEST(ApplyLimitsOverride, FiveArgForwardsGlobal) {
+    const xop::RiskConfig risk = risk_wide();
+    const xop::StrategyConfig strat = strategy_35bps();
+    const xop::PreTradeCheck ptc(risk, strat);
+    xop::State state;
+    seed_conc_state(state, 56000);
+    const xop::PairConfig b = pair_b();
+
+    const auto five = ptc.apply_limits(sized_quote(1600, 1600), "XCH/BYC", "xch", "byc", state);
+    ASSERT_TRUE(five.has_value());
+    EXPECT_EQ(five->bid_size, 50);
+    EXPECT_EQ(five->ask_size, 1600);
+
+    const auto six = ptc.apply_limits(sized_quote(1600, 1600), "XCH/BYC", "xch", "byc", state,
+                                      xop::effective_concentration_limits(risk, &b));
+    ASSERT_TRUE(six.has_value());
+    EXPECT_EQ(six->bid_size, 50);
+    EXPECT_EQ(six->ask_size, 1600);
+}
+
+TEST(LimitStatusOverride, PairOverrideChangesBreachFlags) {
+    const xop::RiskConfig risk = risk_wide();
+    const xop::StrategyConfig strat = strategy_35bps();
+    const xop::PreTradeCheck ptc(risk, strat);
+    xop::State state;
+    seed_conc_state(state, 48000);
+    const xop::PairConfig a = pair_a();
+    const xop::PairConfig b = pair_b();
+
+    const xop::LimitStatus global = ptc.get_limit_status(
+        "xch", "byc", state, xop::effective_concentration_limits(risk, &b));
+    const xop::LimitStatus overridden = ptc.get_limit_status(
+        "xch", "byc", state, xop::effective_concentration_limits(risk, &a));
+    EXPECT_TRUE(global.soft_limit_breached);
+    EXPECT_FALSE(overridden.soft_limit_breached);
+    EXPECT_FALSE(global.hard_limit_breached);
+    EXPECT_FALSE(overridden.hard_limit_breached);
+}
+
+// [PACE D1, re-anchored on #155] Step 6 reads evaluate_limits' per-side
+// attribution as well as its sizes, so the rule label must follow the limits
+// actually applied.  At base_conc 0.93 the global pair puts the bid in the
+// HARD band (2000 -> 35) while the 0.90/0.97 override puts it in the SOFT band
+// (2000 -> 1186).  Sizes from the mirror (scratchpad lits_extra.py).
+TEST(EvaluateLimitsOverride, RuleLabelFollowsTheAppliedLimits) {
+    const xop::RiskConfig risk = risk_wide();
+    const xop::StrategyConfig strat = strategy_35bps();
+    const xop::PreTradeCheck ptc(risk, strat);
+    xop::State state;
+    seed_conc_state(state, 59520);
+    const xop::PairConfig a = pair_a();
+    const xop::PairConfig b = pair_b();
+
+    const xop::LimitsDecision global = ptc.evaluate_limits(
+        sized_quote(2000, 0), "xch", "byc", state, xop::effective_concentration_limits(risk, &b));
+    ASSERT_TRUE(global.has_quote);
+    EXPECT_EQ(global.quote.bid_size, 35);
+    EXPECT_EQ(global.trace.bid.reduced_by, xop::limit_rule_bit(xop::LimitRule::HardConcentration));
+    EXPECT_EQ(global.trace.bid.zeroed_by, xop::LimitRule::None);
+
+    const xop::LimitsDecision overridden = ptc.evaluate_limits(
+        sized_quote(2000, 0), "xch", "byc", state, xop::effective_concentration_limits(risk, &a));
+    ASSERT_TRUE(overridden.has_quote);
+    EXPECT_EQ(overridden.quote.bid_size, 1186);
+    EXPECT_EQ(overridden.trace.bid.reduced_by, xop::limit_rule_bit(xop::LimitRule::SoftConcentration));
+    EXPECT_EQ(overridden.trace.bid.zeroed_by, xop::LimitRule::None);
+
+    // The mirror image on the ask: quote_conc 0.93 (base_conc 0.07), the same
+    // two sizes from the mirror.  Each side chooses its label separately.
+    xop::State ask_state;
+    seed_conc_state(ask_state, 4480);
+    const xop::LimitsDecision ask_global = ptc.evaluate_limits(
+        sized_quote(0, 2000), "xch", "byc", ask_state, xop::effective_concentration_limits(risk, &b));
+    ASSERT_TRUE(ask_global.has_quote);
+    EXPECT_EQ(ask_global.quote.ask_size, 35);
+    EXPECT_EQ(ask_global.trace.ask.reduced_by, xop::limit_rule_bit(xop::LimitRule::HardConcentration));
+
+    const xop::LimitsDecision ask_overridden = ptc.evaluate_limits(
+        sized_quote(0, 2000), "xch", "byc", ask_state, xop::effective_concentration_limits(risk, &a));
+    ASSERT_TRUE(ask_overridden.has_quote);
+    EXPECT_EQ(ask_overridden.quote.ask_size, 1186);
+    EXPECT_EQ(ask_overridden.trace.ask.reduced_by, xop::limit_rule_bit(xop::LimitRule::SoftConcentration));
+}
+
+// [PACE D1] The 3-argument get_limit_status forwards the global pair.  It has
+// no caller in cpp/src since #155 moved Step 6 to evaluate_limits; this pins
+// the forwarding so the public overload cannot drift.
+TEST(LimitStatusOverride, ThreeArgForwardsGlobal) {
+    const xop::RiskConfig risk = risk_wide();
+    const xop::StrategyConfig strat = strategy_35bps();
+    const xop::PreTradeCheck ptc(risk, strat);
+    xop::State state;
+    seed_conc_state(state, 48000);
+    const xop::LimitStatus legacy = ptc.get_limit_status("xch", "byc", state);
+    EXPECT_TRUE(legacy.soft_limit_breached);
+    EXPECT_FALSE(legacy.hard_limit_breached);
+}
+
+// ============================================================================
+// [PACE 2026-09-13] The pace pool reaches apply_limits as the bid, and the
+// risk rules still taper it (operator decision D1: pace always respects the
+// risk limits).  The 5-argument apply_limits, as Step 6 calls it for a pair
+// without overrides.  Literals from the spec's mirror.
+// ============================================================================
+
+// The live risk config: soft 0.60 / hard 0.80, CAT cap 0.25, pair cap 0.85.
+xop::RiskConfig risk_injection()
+{
+    xop::RiskConfig r;
+    r.soft_limit_pct           = 0.60;
+    r.hard_limit_pct           = 0.80;
+    r.single_cat_cap_pct       = 0.25;
+    r.max_capital_per_pair_pct = 0.85;
+    return r;
+}
+
+xop::strategy::pace::PairPlan pace_pool_plan(xop::Mojo pool, bool hold)
+{
+    xop::strategy::pace::PairPlan p{};
+    p.managed         = true;
+    p.hold            = hold;
+    p.pool_base_mojos = pool;
+    return p;
+}
+
+TEST(PaceInject, LiveCase_CatCapZeroesAsk_PaceBidSurvivesApplyLimits) {
+    const xop::RiskConfig risk = risk_injection();
+    const xop::StrategyConfig strat = strategy_35bps();
+    const xop::PreTradeCheck ptc(risk, strat);
+    xop::State state;
+    seed_unit_rate_portfolio(state, {{"xch", 2452}, {"byc", 4610}, {"dbx", 2069}});
+
+    // Today: the strategy's bid is 0 (q >= q_max) and the CAT cap zeroes the ask.
+    const xop::Quote strategy_quote = sized_quote(0, 44570);
+    EXPECT_FALSE(ptc.apply_limits(strategy_quote, "XCH/BYC", "xch", "byc", state).has_value());
+
+    const auto injected = ptc.apply_limits(
+        xop::strategy::pace::inject_reducing_side(strategy_quote, pace_pool_plan(2000, false)),
+        "XCH/BYC", "xch", "byc", state);
+    ASSERT_TRUE(injected.has_value());
+    EXPECT_EQ(injected->bid_size, 2000);
+    EXPECT_EQ(injected->ask_size, 0);
+}
+
+TEST(PaceInject, ReplacesLargerStrategySize) {
+    const xop::RiskConfig risk = risk_injection();
+    const xop::StrategyConfig strat = strategy_35bps();
+    const xop::PreTradeCheck ptc(risk, strat);
+    xop::State state;
+    seed_unit_rate_portfolio(state, {{"xch", 2452}, {"byc", 4610}, {"dbx", 2069}});
+    const auto got = ptc.apply_limits(
+        xop::strategy::pace::inject_reducing_side(sized_quote(9000, 0), pace_pool_plan(2000, false)),
+        "XCH/BYC", "xch", "byc", state);
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got->bid_size, 2000);
+    EXPECT_EQ(got->ask_size, 0);
+}
+
+TEST(PaceInject, UnmanagedPlanIsIdentity) {
+    const xop::RiskConfig risk = risk_injection();
+    const xop::StrategyConfig strat = strategy_35bps();
+    const xop::PreTradeCheck ptc(risk, strat);
+    xop::State state;
+    seed_unit_rate_portfolio(state, {{"xch", 2452}, {"byc", 4610}, {"dbx", 2069}});
+    const auto got = ptc.apply_limits(
+        xop::strategy::pace::inject_reducing_side(sized_quote(9000, 0), xop::strategy::pace::PairPlan{}),
+        "XCH/BYC", "xch", "byc", state);
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got->bid_size, 9000);
+    EXPECT_EQ(got->ask_size, 0);
+}
+
+TEST(PaceInject, HoldZeroesBid) {
+    const xop::RiskConfig risk = risk_injection();
+    const xop::StrategyConfig strat = strategy_35bps();
+    const xop::PreTradeCheck ptc(risk, strat);
+    xop::State state;
+    seed_unit_rate_portfolio(state, {{"xch", 2452}, {"byc", 4610}, {"dbx", 2069}});
+    EXPECT_FALSE(ptc.apply_limits(
+        xop::strategy::pace::inject_reducing_side(sized_quote(9000, 0), pace_pool_plan(2000, true)),
+        "XCH/BYC", "xch", "byc", state).has_value());
+}
+
+TEST(PaceInject, SoftLimitTapersInjectedBid) {
+    // base_conc 0.70 sits in the soft band: the injected 2000 keeps 0.525.
+    const xop::RiskConfig risk = risk_injection();
+    const xop::StrategyConfig strat = strategy_35bps();
+    const xop::PreTradeCheck ptc(risk, strat);
+    xop::State state;
+    seed_unit_rate_portfolio(state, {{"xch", 700}, {"byc", 300}, {"dbx", 800}});
+    const auto got = ptc.apply_limits(
+        xop::strategy::pace::inject_reducing_side(sized_quote(0, 0), pace_pool_plan(2000, false)),
+        "XCH/BYC", "xch", "byc", state);
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got->bid_size, 1050);
+    EXPECT_EQ(got->ask_size, 0);
+}
+
+// [PACE D1] The no-quote warn prints the limits the concentration rule applied
+// to THIS pair.  Without overrides those are risk.soft_limit_pct /
+// risk.hard_limit_pct, so the text must not move: the forwarding overload and
+// the new one handed the global pair agree exactly.
+TEST(Step6NoQuoteText, PrintsTheEffectiveLimits) {
+    xop::RiskConfig risk = risk_wide();
+    risk.single_cat_cap_pct       = 0.25;
+    risk.max_capital_per_pair_pct = 0.85;
+    xop::LimitsTrace t{};
+    t.ask.pre_size   = 44'569'719'126'041;
+    t.ask.reduced_by = rule_mask(xop::LimitRule::SoftConcentration, xop::LimitRule::SingleCatCap);
+    t.ask.zeroed_by  = xop::LimitRule::SingleCatCap;
+    t.base_concentration    = 0.346;
+    t.quote_concentration   = 0.654;
+    t.quote_is_cat          = true;
+    t.quote_cat_fraction    = 0.506;
+    t.cat_full_block_pct    = 0.50;
+    t.pair_capital_fraction = 0.774;
+
+    const std::string legacy = xop::format_step6_no_quote(
+        "XCH/BYC", t, 1'000'000'000'000, 24.569719126041, 20.0, risk,
+        xop::kLimitBlockWarnReminderBlocks);
+    const std::string global = xop::format_step6_no_quote(
+        "XCH/BYC", t, 1'000'000'000'000, 24.569719126041, 20.0, risk,
+        xop::ConcentrationLimits{0.60, 0.80}, xop::kLimitBlockWarnReminderBlocks);
+    EXPECT_EQ(legacy, global);
+    EXPECT_NE(legacy.find("cfg_soft=0.600 cfg_hard=0.800 cfg_cat=0.250 cfg_pair=0.850"),
+              std::string::npos) << legacy;
+
+    const std::string overridden = xop::format_step6_no_quote(
+        "XCH/BYC", t, 1'000'000'000'000, 24.569719126041, 20.0, risk,
+        xop::ConcentrationLimits{0.90, 0.97}, xop::kLimitBlockWarnReminderBlocks);
+    EXPECT_NE(overridden.find("cfg_soft=0.900 cfg_hard=0.970 cfg_cat=0.250 cfg_pair=0.850"),
+              std::string::npos) << overridden;
 }
 
 }  // namespace

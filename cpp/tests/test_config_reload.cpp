@@ -125,3 +125,13 @@ TEST(ConfigReloadDiff, empty_saved_pairs_is_all_structural_never_disables)
     EXPECT_TRUE(d.to_disable.empty());
     EXPECT_EQ(d.structural.size(), 2u);
 }
+
+// [PACE 2026-09-13] Pace may be turned OFF live; turning it ON waits for a
+// restart, and an unchanged flag does nothing.
+TEST(ConfigReloadPace, DisableAppliesLiveEnableDoesNot)
+{
+    EXPECT_TRUE(xop::pace_disables_live(true, false));
+    EXPECT_FALSE(xop::pace_disables_live(false, true));
+    EXPECT_FALSE(xop::pace_disables_live(true, true));
+    EXPECT_FALSE(xop::pace_disables_live(false, false));
+}

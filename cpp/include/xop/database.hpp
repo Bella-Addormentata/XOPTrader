@@ -318,6 +318,22 @@ struct DbTakerFill {
 };
 
 // ---------------------------------------------------------------------------
+// [PACE 2026-09-13] DbPaceFillRow -- one raw fill for the pace controller's
+// progress accounting: a maker row (trade_log) or a taker row (taker_fills).
+// No arithmetic happens in SQL: price x size reaches ~1e24, past int64.
+// ---------------------------------------------------------------------------
+struct DbPaceFillRow {
+    bool        is_taker{false};
+    std::string side_lower{};          ///< maker rows: "bid" | "ask"
+    Mojo        size_mojos{0};
+    Mojo        price_mojos{0};
+    bool        we_bought_base{false}; ///< taker rows
+    Mojo        base_delta_mojos{0};
+    Mojo        quote_delta_mojos{0};
+    BlockHeight block_height{0};
+};
+
+// ---------------------------------------------------------------------------
 // Database -- SQLite wrapper providing structured persistence for the bot.
 //
 // Lifecycle:
@@ -653,6 +669,13 @@ public:
     std::pair<int, int> query_trade_counts_by_side(const std::string& pair_name,
                                                    BlockHeight since_block) const;
 
+    /// [PACE 2026-09-13] Maker rows (trade_log) then taker rows (taker_fills)
+    /// for one pair at block_height >= since_block, each ordered by
+    /// (block_height, id).  Throws std::runtime_error on any SQLite error, so
+    /// the caller can tell "no fills" from "could not read the fills".
+    [[nodiscard]] std::vector<DbPaceFillRow> query_pace_fills(const std::string& pair_name,
+                                                              BlockHeight since_block) const;
+
     /// True if the database connection is open and usable.
     [[nodiscard]] bool is_open() const noexcept;
 
@@ -766,6 +789,10 @@ private:
 
     /// 24h trade counts query by side for a pair since a block height
     sqlite3_stmt* stmt_trade_counts_by_side_{nullptr};
+
+    /// [PACE] Raw maker / taker fill rows for one pair since a block height
+    sqlite3_stmt* stmt_pace_maker_fills_{nullptr};
+    sqlite3_stmt* stmt_pace_taker_fills_{nullptr};
 
     /// INSERT INTO strategy_quotes (per-tier quote)
     sqlite3_stmt* stmt_insert_strategy_quote_{nullptr};

@@ -765,6 +765,9 @@ Key sections to configure before first run:
 | `tier_spacing_bps` | [60, 200, 500, 1000] | Spread per tier in basis points from mid |
 | `tier_size_pct` | [0.30, 0.25, 0.25, 0.20] | Capital fraction allocated to each tier |
 | `cross_pair_skew_phi` | 0.30 | Cross-pair inventory skew coordination strength (0–1.0). When pairs share an asset, skew from other pairs influences quotes. Higher = stronger cross-pair rebalancing |
+| `pace_enabled` | false | Pace controller master switch: sells an overweight CAT quote asset (`pace_assets`) toward its `asset_target_allocations` band through its XCH/asset bids, at a bounded daily budget and never above fair value; the risk limits still apply. Every change needs a restart, turning it off included: stop the GUI, edit `config.yaml`, check `git diff config.yaml`, then restart. A live disable from the GUI is not supported (see `config.example.yaml`) |
+| `pace_assets` | [] | CAT symbols to pace, never XCH; every enabled pair touching one must be XCH/asset. The other `pace_*` keys are documented in `config.example.yaml` |
+| `pace_horizon_blocks` | 64512 | Horizon in peak blocks (14 days): daily budget = (excess + amount reduced in the horizon) x 4608 / horizon |
 
 ### Risk Parameters
 
@@ -775,6 +778,8 @@ Key sections to configure before first run:
 | `single_cat_cap_pct` | 0.12 | Maximum portfolio allocation to any single CAT |
 | `kelly_fraction` | 0.5 | Half-Kelly position sizing (conservative) |
 | `max_capital_per_pair_pct` | 0.85 | Maximum capital deployed to any single pair (set high to allow rebalancing when one asset dominates) |
+| `pairs[].soft_limit_pct_override` | unset | Per-pair soft concentration limit, finite in (0, 1]; replaces `soft_limit_pct` for THAT pair only, on both its bid and its ask taper |
+| `pairs[].hard_limit_pct_override` | unset | Per-pair hard concentration limit, finite in (0, 1]; the effective soft limit (override or global) must stay below the effective hard limit |
 | `max_drawdown_pct` | 0.10 | All-time HWM drawdown fraction that pauses the engine (circuit breaker) |
 | `loss_window_blocks` | 1152 | Rolling window for time-windowed loss circuit breaker (~10 h at 52 s/block) |
 | `max_window_loss_bps` | 500 | Maximum loss in basis points within the rolling window; 0 = disabled |

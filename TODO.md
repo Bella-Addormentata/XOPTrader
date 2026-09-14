@@ -880,6 +880,20 @@ has to be true before it runs.
 - **Pre-existing.** The condition before PR #159 admitted the same book; Gate 1 deliberately mirrors only the provenance conjunct so the filtered path is unchanged.
 - **Status:** `[ ]` -- OPEN. Candidate: add `book_evidence_fresh`'s recency conjunct (`now - ob_updated_at <= stale_threshold`) to Gate 1 -- after measuring its effect on a slow-but-live fetch cadence, which must not black out the solve.
 
+### S58: a take whose wallet reply lacks a trade id is recorded as "unknown", and every later one is silently dropped
+- **Files:** `cpp/src/engine.cpp` (five `take_offer` success paths fall back to `"unknown"`: engine.cpp:13861, 14262, 14696, 15369 (Step 9f) and 15814 (XCH recovery) at 637693d), `cpp/src/database.cpp` (`taker_fills.trade_id TEXT UNIQUE`, `insert_taker_fill`'s `INSERT OR IGNORE`)
+- **Found 2026-09-14 (PR #160 round-2 verification):** when `take_offer` succeeds but its reply has no `trade_record.trade_id`, the take is recorded under trade_id `"unknown"`. `taker_fills.trade_id` is UNIQUE and the insert is `INSERT OR IGNORE`, so the first such row lands and every later one is dropped without a log line.
+- **Why it matters now:** the pace controller counts `taker_fills` rows toward its daily progress. A dropped take understates what was sold, so pace can over-sell against its schedule -- bounded by the excess, because remaining = min(budget - sold, excess, headroom). Every other reader of `taker_fills` loses the same rows.
+- **Not fixed in PR #160:** the recording is shared by every taker path and its other readers; a synthetic unique id (for example `unknown-<counterparty offer id>`) changes what those readers see.
+- **Status:** `[ ]` -- OPEN.
+
+### S59: a resting pace bid above fair value is cancelled the first time it is seen there, with no age or hysteresis guard
+- **Files:** `cpp/include/xop/strategy/pace_controller.hpp` (P26 `select_resting_above_fair_value`, pace_controller.hpp:1017-1038 at 0f893a8), `cpp/src/engine.cpp` (`step_enforce_pace_caps`, reason `pace_above_fv`, engine.cpp:10579 at 0f893a8)
+- **Found 2026-09-14 (PR #160 round-2 re-verification):** P26 selects every resting bid of a managed, non-hold pace plan priced above the plan's fair value, and Step 8 cancels it on that heartbeat. There is no minimum offer age and no band.
+- **Why it matters:** at the defaults it cannot flap. A pace bid is posted at or below floor(FV x (1 - edge)), with edge = max(`pace_min_edge_bps`, `pace_edge_sigma_mult` x sigma), so it starts at least 50 bps below the fair value it was posted against (172 bps live), and only a fair-value drop of about that size puts it above. An operator can configure a near-zero edge (`pace_min_edge_bps` close to 0 with `pace_edge_sigma_mult: 0`). A bid then sits within fair-value noise of the bound, and each swing below it costs a fee-paying cancel and a repost.
+- **Not fixed in PR #160:** pace defaults off, and the defaults cannot trigger it. A fix is a minimum offer age (as the reprice has) or a hysteresis band, pinned by a test at a near-zero edge.
+- **Status:** `[ ]` -- OPEN.
+
 ### S65: `cancel_all.flag` and `pause.flag` are not addressed, so a successor engine inherits them
 - **Files:** `gui/services/engine_bridge.py` (`pause_trading`, `cancel_all_offers`), `cpp/src/engine.cpp` (`check_pause_flag`, `check_cancel_all_flag`, and the analysis poll that consumes both)
 - **Found while fixing the same shape in `shutdown.flag` (2026-09-13).** On 2026-09-12 a successor engine honoured a stop request written for the engine a newly launched GUI had just killed. `shutdown.flag` is now addressed to one engine PID and honoured only if written at or after that process started (`cpp/include/xop/util/shutdown_flag.hpp`). Its two siblings were deliberately left out of that change:

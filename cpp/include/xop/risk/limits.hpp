@@ -53,8 +53,8 @@ struct LimitStatus {
 
     // Inventory concentration (Section 8 -- Inventory Controls table).
     double      base_concentration;   // base_balance / (base_balance + quote_balance), [0,1]
-    bool        soft_limit_breached;  // concentration >= soft_limit_pct (60%)
-    bool        hard_limit_breached;  // concentration >= hard_limit_pct (80%)
+    bool        soft_limit_breached;  // concentration >= the effective per-pair soft limit
+    bool        hard_limit_breached;  // concentration >= the effective per-pair hard limit
 
     // Single-CAT cap (never exceed 12% of portfolio in any one CAT).
     double      cat_portfolio_pct;    // this CAT's value / total portfolio value, [0,1]
@@ -67,6 +67,31 @@ struct LimitStatus {
     // Flash-crash circuit breaker.
     bool        flash_crash_active;   // true while circuit breaker is engaged
 };
+
+// ---------------------------------------------------------------------------
+// [PACE D1 2026-09-13] Per-pair concentration limits.
+//
+// The concentration rule read risk.soft_limit_pct / risk.hard_limit_pct
+// directly, so no pair could be given more room than another.  A pair may
+// now carry soft_limit_pct_override / hard_limit_pct_override (PairConfig).
+// effective_concentration_limits() resolves them, and the PreTradeCheck
+// overloads that take a ConcentrationLimits apply them to THAT pair only.
+// The overloads without one forward the global pair, so every existing
+// caller computes exactly what it computed before.
+// ---------------------------------------------------------------------------
+
+/// Concentration thresholds in force for ONE pair.
+struct ConcentrationLimits {
+    double soft_limit_pct{0.60};
+    double hard_limit_pct{0.80};
+};
+
+/// `pair`'s soft/hard overrides where present, else `risk`'s.  Defence in
+/// depth (load_config already rejects these): unless the result is finite
+/// with 0 < soft < hard <= 1, the global pair is returned unchanged.
+/// nullptr -> global.
+[[nodiscard]] ConcentrationLimits effective_concentration_limits(
+    const RiskConfig& risk, const PairConfig* pair) noexcept;
 
 // ---------------------------------------------------------------------------
 // EmergencyRule -- named constants for the four playbook scenarios so that
@@ -187,6 +212,19 @@ struct LimitsDecision {
                                                 double strategy_q,
                                                 double strategy_q_max,
                                                 const RiskConfig& risk_cfg,
+                                                BlockHeight reminder_blocks);
+
+/// [PACE D1 2026-09-13] The same line, printing `conc_limits` as cfg_soft /
+/// cfg_hard: the limits evaluate_limits() actually applied to this pair.
+/// The overload above forwards risk_cfg's own soft/hard, so a pair without
+/// overrides prints exactly what it printed before.
+[[nodiscard]] std::string format_step6_no_quote(std::string_view pair_name,
+                                                const LimitsTrace& limits_trace,
+                                                std::int64_t base_mojos_per_unit,
+                                                double strategy_q,
+                                                double strategy_q_max,
+                                                const RiskConfig& risk_cfg,
+                                                const ConcentrationLimits& conc_limits,
                                                 BlockHeight reminder_blocks);
 
 /// Step 6's info line for the first quote after a no-quote warn.
@@ -318,6 +356,18 @@ public:
                                    const AssetId& quote_id,
                                    const State&   state) const;
 
+    /// [PACE D1 2026-09-13] evaluate_limits() with `limits` in place of the
+    /// global soft/hard concentration thresholds, on BOTH the base-overweight
+    /// bid and the quote-overweight ask.  The single-CAT and pair-capital caps
+    /// stay global.  The overload above forwards
+    /// ConcentrationLimits{soft_limit_pct, hard_limit_pct} of the RiskConfig.
+    [[nodiscard]]
+    LimitsDecision evaluate_limits(Quote                      quote,
+                                   const AssetId&             base_id,
+                                   const AssetId&             quote_id,
+                                   const State&               state,
+                                   const ConcentrationLimits& limits) const;
+
     /// Apply soft-limit, hard-limit, single-CAT cap, and max-capital-per-pair
     /// checks.  Returns a (possibly modified) quote, or std::nullopt when BOTH
     /// sizes are zero after the checks.
@@ -349,6 +399,25 @@ public:
                                       const AssetId&     base_id,
                                       const AssetId&     quote_id,
                                       const State&       state) const;
+
+    /// [PACE D1 2026-09-13] apply_limits() with this pair's effective
+    /// concentration limits; delegates to the 5-argument evaluate_limits().
+    /// The overload above forwards the RiskConfig's own soft/hard.
+    [[nodiscard]]
+    std::optional<Quote> apply_limits(Quote                      quote,
+                                      const std::string&         pair_name,
+                                      const AssetId&             base_id,
+                                      const AssetId&             quote_id,
+                                      const State&               state,
+                                      const ConcentrationLimits& limits) const;
+
+    /// [PACE D1 2026-09-13] The keep fraction the concentration rule scales
+    /// the overweight side by: nullopt below the soft limit (and for NaN),
+    /// otherwise exactly the soft-band or hard-band expression
+    /// evaluate_limits() applied before per-pair limits existed.
+    [[nodiscard]]
+    static std::optional<double> concentration_keep_fraction(
+        double concentration, const ConcentrationLimits& limits) noexcept;
 
     // -- Flash-crash circuit breaker ----------------------------------------
 
@@ -417,6 +486,15 @@ public:
                                  const AssetId& quote_id,
                                  const State&   state) const;
 
+    /// [PACE D1 2026-09-13] get_limit_status() with this pair's effective
+    /// concentration limits in the soft/hard breach flags.  The overload
+    /// above forwards the RiskConfig's own soft/hard.
+    [[nodiscard]]
+    LimitStatus get_limit_status(const AssetId&             base_id,
+                                 const AssetId&             quote_id,
+                                 const State&               state,
+                                 const ConcentrationLimits& limits) const;
+
 private:
     const RiskConfig&     risk_cfg_;
 
@@ -451,18 +529,21 @@ public:
     [[nodiscard]]
     static Mojo mark_to_xch(const Position& pos,
                              const State&    state) noexcept;
-private:
 
     /// Compute the concentration of base value relative to the sum of
     /// base and quote values (mark-to-market in XCH), returning [0, 1].
-    /// Returns 0.0 if both values are zero.
+    /// Returns 0.5 if both values are zero (limits.cpp compute_concentration).
     ///
     /// Uses mark_to_xch() so that different assets are compared in a common
     /// numeraire rather than by raw mojo count.
+    ///
+    /// [PACE D1 2026-09-13] Public: the pace controller's wallet-truth
+    /// concentration check (engine Step 7) runs it on wallet balances.
     [[nodiscard]]
     static double compute_concentration(const Position& base_pos,
                                         const Position& quote_pos,
                                         const State&    state) noexcept;
+private:
 
     /// Compute what fraction of total portfolio value (mark-to-market in XCH)
     /// a single asset represents.  Returns 0.0 if total portfolio value is zero.

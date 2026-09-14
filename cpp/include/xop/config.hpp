@@ -134,6 +134,17 @@ struct PairConfig {
     std::optional<double>   kappa_override;
     std::optional<double>   phi_override;
     std::optional<double>   q_max_override;
+    // [PACE D1 2026-09-13] This pair's soft / hard concentration limits for
+    // PreTradeCheck (evaluate_limits, apply_limits, get_limit_status), in
+    // place of risk.soft_limit_pct / risk.hard_limit_pct.  Absent -> the
+    // global value.  Each must be finite in (0, 1], and load_config requires
+    // the EFFECTIVE soft (override or global) to be below the effective hard.
+    // Symmetric: the same limits taper this pair's base-overweight bid AND its
+    // quote-overweight ask.  Deliberately still global: the drift analyzer,
+    // InventoryTracker::get_risk_status, the ExposureBreach alert and the GUI
+    // risk fields.
+    std::optional<double>   soft_limit_pct_override{};
+    std::optional<double>   hard_limit_pct_override{};
     std::optional<double>   min_profit_margin_bps_override;
     std::optional<std::vector<double>> tier_spacing_bps_override;
     std::optional<std::vector<double>> tier_size_pct_override;
@@ -1041,6 +1052,32 @@ struct StrategyConfig {
     /// drift to `target + 2*tol` is fully suppressed on the acquiring
     /// side.  Must be > 1.0.
     double   asset_drift_guard_max_factor{2.0};
+
+    // -- [PACE 2026-09-13] Pace controller (default OFF) -------------------
+    // Sells an overweight CAT QUOTE asset toward its asset_target_allocations
+    // band, at a bounded daily budget, through the bid ladder of its XCH/<K>
+    // pairs (xop/strategy/pace_controller.hpp).  Valuation uses the
+    // independent fair value and wallet balances only.  Validation:
+    // parse_strategy and load_config (config.cpp).  Every key is
+    // restart-required, except that pace may be DISABLED live.  Block counts
+    // are PEAK heights: 4,608 per day.
+    bool                     pace_enabled{false};
+    std::vector<std::string> pace_assets{};                        ///< upper-cased CAT symbols; never XCH
+    std::uint32_t            pace_horizon_blocks{64'512};          ///< [4608, 414720]; 14 days
+    double                   pace_enter_tol_mult{1.5};             ///< (0, 10]; enter when share > target + mult x tol
+    double                   pace_exit_tol_mult{1.0};              ///< [0, 10) and < enter; leave at target + mult x tol
+    double                   pace_max_resting_frac{0.5};           ///< (0, 1]; resting <= frac x daily budget
+    double                   pace_min_tier_units{1.0};             ///< (0, 1e6] base units; <= max
+    double                   pace_max_tier_units{5.0};             ///< (0, 1e6] base units
+    std::uint32_t            pace_max_tiers{3};                    ///< [1, 16]
+    double                   pace_tighten_step_bps{25.0};          ///< [1, 1000]
+    double                   pace_tighten_max_bps{300.0};          ///< [0, 5000]; 0 = size-only pacing
+    double                   pace_min_edge_bps{50.0};              ///< (0, 2000]
+    double                   pace_edge_sigma_mult{1.0};            ///< [0, 5]; edge = max(min_edge, mult x sigma)
+    double                   pace_max_fair_value_sigma_bps{200.0}; ///< (0, 2000]; <= fair_value_max_sigma_bps when enabled
+    std::uint32_t            pace_max_balance_age_blocks{20};      ///< [1, 4608]
+    double                   pace_reprice_min_bps{50.0};           ///< (0, 1000]
+    std::uint32_t            pace_reprice_min_age_blocks{96};      ///< [12, 4608]
 
     /// Exit rebalance mode when ratio returns inside this tighter band
     /// around ratio_target (hysteresis to avoid side-flip churn).

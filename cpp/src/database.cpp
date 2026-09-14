@@ -457,6 +457,22 @@ WHERE pair_name = ? AND block_height >= ?
 GROUP BY LOWER(side);
 )SQL";
 
+// [PACE 2026-09-13] Raw fill rows for the pace controller.  The maker query is
+// served by idx_trade_log_pair_block; taker_fills is small and is scanned.
+// LOWER(side) is belt and braces: the schema already constrains side to
+// lowercase.
+constexpr const char* kPaceMakerFillsSinceBlock = R"SQL(
+SELECT LOWER(side), size_mojos, price_mojos, block_height
+FROM trade_log WHERE pair_name = ? AND block_height >= ?
+ORDER BY block_height ASC, id ASC;
+)SQL";
+
+constexpr const char* kPaceTakerFillsSinceBlock = R"SQL(
+SELECT we_bought_base, base_delta_mojos, quote_delta_mojos, block_height
+FROM taker_fills WHERE pair_name = ? AND block_height >= ?
+ORDER BY block_height ASC, id ASC;
+)SQL";
+
 } // anonymous namespace
 
 // ===========================================================================
@@ -506,6 +522,8 @@ Database::Database(const std::string& db_path)
     stmt_fill_rate_          = prepare(kFillRateSinceBlock);
     stmt_tier_fill_rates_    = prepare(kTierFillRates);
     stmt_trade_counts_by_side_ = prepare(kTradeCountsBySideSinceBlock);
+    stmt_pace_maker_fills_   = prepare(kPaceMakerFillsSinceBlock);
+    stmt_pace_taker_fills_   = prepare(kPaceTakerFillsSinceBlock);
     stmt_insert_strategy_quote_ = prepare(kInsertStrategyQuote);
     stmt_insert_sanity_failure_ = prepare(kInsertSanityFailure);
 
@@ -537,6 +555,8 @@ Database::~Database()
     finalize(stmt_fill_rate_);
     finalize(stmt_tier_fill_rates_);
     finalize(stmt_trade_counts_by_side_);
+    finalize(stmt_pace_maker_fills_);
+    finalize(stmt_pace_taker_fills_);
     finalize(stmt_insert_strategy_quote_);
     finalize(stmt_begin_);
     finalize(stmt_commit_);
@@ -1847,6 +1867,55 @@ std::pair<int, int> Database::query_trade_counts_by_side(
     sqlite3_clear_bindings(stmt_trade_counts_by_side_);
 
     return {bids, asks};
+}
+
+std::vector<DbPaceFillRow> Database::query_pace_fills(const std::string& pair_name,
+                                                      BlockHeight since_block) const
+{
+    std::lock_guard<std::mutex> lock(mtx_);
+    std::vector<DbPaceFillRow> rows;
+
+    bind_text(stmt_pace_maker_fills_, 1, pair_name);
+    bind_int64(stmt_pace_maker_fills_, 2, static_cast<std::int64_t>(since_block));
+    int rc = SQLITE_ROW;
+    while ((rc = sqlite3_step(stmt_pace_maker_fills_)) == SQLITE_ROW) {
+        DbPaceFillRow r{};
+        r.is_taker = false;
+        const unsigned char* side_text = sqlite3_column_text(stmt_pace_maker_fills_, 0);
+        if (side_text) {
+            r.side_lower = reinterpret_cast<const char*>(side_text);
+        }
+        r.size_mojos   = sqlite3_column_int64(stmt_pace_maker_fills_, 1);
+        r.price_mojos  = sqlite3_column_int64(stmt_pace_maker_fills_, 2);
+        r.block_height = static_cast<BlockHeight>(sqlite3_column_int64(stmt_pace_maker_fills_, 3));
+        rows.push_back(std::move(r));
+    }
+    const std::string maker_error = (rc != SQLITE_DONE) ? std::string(sqlite3_errmsg(db_)) : std::string{};
+    sqlite3_reset(stmt_pace_maker_fills_);
+    sqlite3_clear_bindings(stmt_pace_maker_fills_);
+    if (rc != SQLITE_DONE) {
+        throw std::runtime_error("[Database] query_pace_fills: trade_log step failed: " + maker_error);
+    }
+
+    bind_text(stmt_pace_taker_fills_, 1, pair_name);
+    bind_int64(stmt_pace_taker_fills_, 2, static_cast<std::int64_t>(since_block));
+    rc = SQLITE_ROW;
+    while ((rc = sqlite3_step(stmt_pace_taker_fills_)) == SQLITE_ROW) {
+        DbPaceFillRow r{};
+        r.is_taker          = true;
+        r.we_bought_base    = sqlite3_column_int(stmt_pace_taker_fills_, 0) != 0;
+        r.base_delta_mojos  = sqlite3_column_int64(stmt_pace_taker_fills_, 1);
+        r.quote_delta_mojos = sqlite3_column_int64(stmt_pace_taker_fills_, 2);
+        r.block_height      = static_cast<BlockHeight>(sqlite3_column_int64(stmt_pace_taker_fills_, 3));
+        rows.push_back(std::move(r));
+    }
+    const std::string taker_error = (rc != SQLITE_DONE) ? std::string(sqlite3_errmsg(db_)) : std::string{};
+    sqlite3_reset(stmt_pace_taker_fills_);
+    sqlite3_clear_bindings(stmt_pace_taker_fills_);
+    if (rc != SQLITE_DONE) {
+        throw std::runtime_error("[Database] query_pace_fills: taker_fills step failed: " + taker_error);
+    }
+    return rows;
 }
 
 bool Database::is_open() const noexcept

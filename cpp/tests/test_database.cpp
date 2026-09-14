@@ -341,6 +341,77 @@ TEST(DatabaseTest, TradeCountsBySideSinceBlock)
     EXPECT_EQ(counts_300.second, 0);
 }
 
+// [PACE 2026-09-13] query_pace_fills returns RAW rows for ONE pair since a
+// block height: makers (trade_log) first, then takers (taker_fills), each
+// ascending by block.  The since-150 query must drop the bid at 100 and the
+// taker at 120; the other pair's rows must never appear.
+TEST(DatabaseTest, PaceFillsSinceBlockReturnsRawRowsForPairOnly)
+{
+    TempDbPath temp_db{"xop_pace_fills"};
+    xop::Database db(temp_db.path().string());
+
+    auto insert_trade = [&](const std::string& id, const std::string& pair, const std::string& side,
+                            xop::Mojo size, xop::Mojo price, xop::BlockHeight block) {
+        xop::DbTradeRecord tr;
+        tr.timestamp    = "2026-09-13T15:00:00Z";
+        tr.trade_id     = id;
+        tr.pair_name    = pair;
+        tr.side         = side;
+        tr.price_mojos  = price;
+        tr.size_mojos   = size;
+        tr.block_height = block;
+        db.insert_trade(tr);
+    };
+    auto insert_taker = [&](const std::string& id, const std::string& pair, bool we_bought_base,
+                            xop::Mojo base_delta, xop::Mojo quote_delta, xop::BlockHeight block) {
+        xop::DbTakerFill f;
+        f.taken_at              = "2026-09-13T15:00:00Z";
+        f.block_height          = block;
+        f.strategy              = "crossed_book";
+        f.trade_id              = id;
+        f.counterparty_offer_id = "offer-" + id;
+        f.pair_name             = pair;
+        f.we_bought_base        = we_bought_base;
+        f.base_asset            = "xch";
+        f.base_delta_mojos      = base_delta;
+        f.quote_asset           = "byc";
+        f.quote_delta_mojos     = quote_delta;
+        f.price_mojos           = 1'424'000'000'000;
+        db.insert_taker_fill(f);
+    };
+
+    insert_trade("m1", "XCH/BYC", "bid", 1'500'000'000'000, 1'400'000'000'000, 100);
+    insert_trade("m2", "XCH/BYC", "ask", 1'000'000'000'000, 1'885'000'000'000, 200);
+    insert_trade("m3", "XCH/DBX", "bid", 1'000'000'000'000, 83'000'000'000'000, 250);
+    insert_taker("t1", "XCH/BYC", true, 2'000'000'000'000, -2848, 120);
+    insert_taker("t2", "XCH/BYC", false, -1'000'000'000'000, 1500, 300);
+    insert_taker("t3", "XCH/DBX", true, 1'000'000'000'000, -83000, 320);
+
+    const auto since150 = db.query_pace_fills("XCH/BYC", 150);
+    ASSERT_EQ(since150.size(), 2u);
+    EXPECT_FALSE(since150[0].is_taker);
+    EXPECT_EQ(since150[0].side_lower, "ask");
+    EXPECT_EQ(since150[0].size_mojos, 1'000'000'000'000);
+    EXPECT_EQ(since150[0].price_mojos, 1'885'000'000'000);
+    EXPECT_EQ(since150[0].block_height, 200u);
+    EXPECT_TRUE(since150[1].is_taker);
+    EXPECT_FALSE(since150[1].we_bought_base);
+    EXPECT_EQ(since150[1].base_delta_mojos, -1'000'000'000'000);
+    EXPECT_EQ(since150[1].quote_delta_mojos, 1500);
+    EXPECT_EQ(since150[1].block_height, 300u);
+
+    const auto all = db.query_pace_fills("XCH/BYC", 0);
+    ASSERT_EQ(all.size(), 4u);
+    EXPECT_FALSE(all[0].is_taker);
+    EXPECT_EQ(all[0].block_height, 100u);
+    EXPECT_FALSE(all[1].is_taker);
+    EXPECT_EQ(all[1].block_height, 200u);
+    EXPECT_TRUE(all[2].is_taker);
+    EXPECT_EQ(all[2].block_height, 120u);
+    EXPECT_TRUE(all[3].is_taker);
+    EXPECT_EQ(all[3].block_height, 300u);
+}
+
 // [S33 2026-09-05] The activity controller runs the query above once per
 // enabled pair on EVERY heartbeat.  The only pair index used to be
 // idx_trade_log_pair (pair_name, timestamp), whose pair_name prefix bounds
