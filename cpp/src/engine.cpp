@@ -19713,12 +19713,16 @@ util::ShutdownFlagDecision Engine::evaluate_shutdown_flag(util::ShutdownFlagSite
     }
 
     if (ec) {
-        spdlog::error("[Engine] could not remove shutdown.flag: {} -- the GUI "
-                      "will report this stop as unconsumed", ec.message());
+        spdlog::error("[Engine] could not remove shutdown.flag: {} -- the request "
+                      "was honoured ({}; this PID {}, written {} ms after start) and "
+                      "graceful shutdown proceeds; the GUI will report this stop as "
+                      "NOT consumed",
+                      ec.message(), reason_name, process_identity_.pid, age_ms);
+    } else {
+        spdlog::warn("[Engine] shutdown.flag consumed ({}; this PID {}, written {} ms "
+                     "after start) -- graceful shutdown (the book is cancelled on "
+                     "the way down)", reason_name, process_identity_.pid, age_ms);
     }
-    spdlog::warn("[Engine] shutdown.flag consumed ({}; this PID {}, written {} ms "
-                 "after start) -- graceful shutdown (the book is cancelled on "
-                 "the way down)", reason_name, process_identity_.pid, age_ms);
     shutdown();
     return decision;
 }

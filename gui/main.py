@@ -153,7 +153,7 @@ def _wait_for_process_exit_win32(pid: int, timeout_s: float) -> Optional[bool]:
     the engine.
     """
     import ctypes  # noqa: WPS433
-    from ctypes import wintypes  # noqa: WPS433
+    import ctypes.wintypes as wintypes  # noqa: WPS433
 
     synchronize = 0x00100000
     wait_object_0 = 0x00000000
