@@ -339,10 +339,10 @@ private:
 /// fee * ceil(n_offers / batch_size).  That half is arithmetic.
 ///
 /// [BULKCANCEL-B 2026-09-13] At rpc::kCancelOffersSingleBatchSize every book
-/// up to 100 offers is ONE batch, so this reserves ONE whole coin -- where the
-/// old batch size of 5 reserved five for the 25-offer floor.  A sweep split
-/// into batches cannot be funded as a whole: a batch that funds its fee from
-/// the free pool picks that coin blind to the other batches
+/// up to that many offers is ONE batch, so this reserves ONE whole coin --
+/// where the old batch size of 5 reserved five for the 25-offer floor.  A
+/// sweep split into batches cannot be funded as a whole: a batch that funds
+/// its fee from the free pool picks that coin blind to the other batches
 /// (rpc/wallet_requests.hpp), which is what the single batch prevents.
 ///
 /// The whole-coin half is the conservative one, and its mechanism is narrower
@@ -359,7 +359,7 @@ private:
 /// It is still a loop of single-fee note_lock()s rather than one combined
 /// note_lock(0, fee * batches): a combined need would select ONE coin for the
 /// lot and undercount the locks -- the exact modelling error this ledger
-/// exists to fix (see the header comment).  Past 100 offers it reserves a
+/// exists to fix (see the header comment).  Past the batch size it reserves a
 /// whole coin per batch, a ceiling there too: batches that pick the same fee
 /// coin collide, and only one of them lands.
 ///

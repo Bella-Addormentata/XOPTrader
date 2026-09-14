@@ -37,6 +37,7 @@
 #define XOP_RPC_WALLET_REQUESTS_HPP
 
 #include <cstdint>
+#include <limits>
 
 #include <nlohmann/json.hpp>
 
@@ -92,32 +93,37 @@ using json = nlohmann::json;
 /// cost the sum of its spends to within 504,000.  The largest bundle this
 /// wallet ever pushed carried 15 offers at 388,803,130.
 ///
-/// THE ONE-SPEND ASSUMPTION.  Cost is paid per cancellation SPEND, not per
-/// offer: trade_manager.py cancel_pending_offers spends every coin that
-/// Offer.get_cancellation_coins() returns.  Those can be fewer than the coins
-/// the offer itself spent.  offer.py drops each coin that asserts an
-/// announcement another coin in the offer makes (and whatever depends on it),
-/// because spending that provider already invalidates it -- so an offer's
-/// root coin count bounds its cancellation spends only from above.  The 22
-/// offers live on 2026-09-13 spent 2 to 7 root coins each; their cancellation
-/// spends were not counted.
+/// THE TWO-SPEND BASIS.  [review 2026-09-13, operator decision] Cost is paid
+/// per cancellation SPEND, not per offer: trade_manager.py
+/// cancel_pending_offers spends every coin that Offer.get_cancellation_coins()
+/// returns.  Those can be fewer than the coins the offer itself spent.
+/// offer.py drops each coin that asserts an announcement another coin in the
+/// offer makes (and whatever depends on it), because spending that provider
+/// already invalidates it -- so an offer's root coin count bounds its
+/// cancellation spends only from above.  The wallet builds the offers, so no
+/// per-offer spend count can be enforced from this side.  The batch is
+/// therefore costed at kCancelCoinsPerOfferCeiling (2) spends per offer,
+/// twice the shape of 18,185 of the 18,187 offers this wallet has cancelled.
 ///
-/// At ONE spend per offer and the ceilings below, a full batch of 100 costs
-/// at most 3,518,000,000 -- 64% of the bound -- where 1,000 would be 6.4x over
-/// it and cancel nothing.  Only that shape is covered: 100 offers of two CAT
-/// cancellation spends each would cost up to 7,018,000,000, over the bound.
-/// Were every root coin of the 22 live offers to need its own spend at the
-/// measured maxima, they would cost up to 1,934,824,884 (35% of the bound),
-/// about 88,000,000 each, and one bundle of such offers would overflow past
-/// about 62.
+/// At two spends per offer and the ceilings below, a full batch of 50 costs
+/// at most 50 x 2 x 35,000,000 + 18,000,000 = 3,518,000,000 -- 64% of the
+/// bound.  A 50-offer bundle fits up to 156 cancellation spends in total.  The
+/// 22 offers live on 2026-09-13 cost 1,558,000,000 (28%) at two spends each,
+/// and at most 1,934,824,884 (35%) even if every one of their root coins (2 to
+/// 7 per offer) needed its own spend at the measured maxima.  A batch of 100
+/// would cost 7,018,000,000 at two spends per offer, over the bound, and 1,000
+/// is 6.4x over it even at one spend per offer and would cancel nothing.
 ///
-/// ABOVE 100 OFFERS the daemon splits the sweep again, and the fee-coin
-/// collision returns for the later batches.  That is far outside what this
+/// RE-MEASURE when the number of cancellation coins per offer changes -- a new
+/// offer shape, more coins behind a leg -- not when the book merely grows.
+///
+/// ABOVE 50 OFFERS the daemon splits the sweep again, and the fee-coin
+/// collision returns for the later batches.  That is outside what this
 /// deployment rests (the live wallet held 22 open offers of its own on
 /// 2026-09-13; OfferManager::cancel_all reserves for 25), and it is the
 /// better of the two failures: one bundle too large for the mempool cancels
 /// nothing at all.
-inline constexpr int kCancelOffersSingleBatchSize = 100;
+inline constexpr int kCancelOffersSingleBatchSize = 50;
 
 /// chia 2.7.4 mempool_manager.py: max_tx_clvm_cost = MAX_BLOCK_COST_CLVM // 2.
 /// A spend bundle costing more is rejected with Err.BLOCK_COST_EXCEEDS_MAX.
@@ -127,7 +133,7 @@ inline constexpr std::uint64_t kMempoolMaxTxClvmCost = 11'000'000'000ULL / 2;
 /// maximum 34,442,386 (a CAT offer coin; XCH offer coins at most 17,788,814),
 /// rounded up.  An observation of this wallet's offers, not a consensus value.
 /// An offer whose cancellation needs k spends costs up to k times this; see
-/// THE ONE-SPEND ASSUMPTION above.
+/// THE TWO-SPEND BASIS above.
 inline constexpr std::uint64_t kCancelSpendCostCeiling = 35'000'000ULL;
 
 /// Ceiling on the XCH fee spend a batch adds when its fee cannot come out of
@@ -135,18 +141,41 @@ inline constexpr std::uint64_t kCancelSpendCostCeiling = 35'000'000ULL;
 /// the largest standard XCH spend seen in any cancellation (17,788,814).
 inline constexpr std::uint64_t kCancelFeeSpendCostCeiling = 18'000'000ULL;
 
+/// Cancellation spends per offer that kCancelOffersSingleBatchSize is costed
+/// at.  [review 2026-09-13, operator decision] A stated ceiling, neither
+/// measured nor enforced, resting on this evidence:
+///   * 18,185 of the 18,187 offers this wallet has cancelled did so with ONE
+///     coin spend, and the other two with two;
+///   * chia 2.7.4 Offer.get_cancellation_coins() drops every coin that asserts
+///     an announcement another coin in the offer makes, so the root coins an
+///     offer spends bound its cancellation spends only from above.
+/// See THE TWO-SPEND BASIS above.
+inline constexpr int kCancelCoinsPerOfferCeiling = 2;
+
 /// Upper estimate of the mempool cost of one cancel_offers batch of
-/// `batch_size` offers that each cancel with ONE coin spend, plus the batch's
-/// fee spend.  It models that shape only and says nothing about an offer that
-/// needs more spends (THE ONE-SPEND ASSUMPTION above).  A degenerate size
-/// costs the fee spend alone.
+/// `batch_size` offers that each cancel with at most `cancel_coins_per_offer`
+/// coin spends, plus the batch's fee spend.  A degenerate size or spend count
+/// costs the fee spend alone, and a spend count too large for the type
+/// saturates at the maximum instead of wrapping.
 [[nodiscard]] constexpr std::uint64_t cancel_batch_cost_ceiling(
-    int batch_size) noexcept
+    int batch_size,
+    int cancel_coins_per_offer = kCancelCoinsPerOfferCeiling) noexcept
 {
-    const std::uint64_t offers = batch_size > 0
-        ? static_cast<std::uint64_t>(batch_size)
-        : std::uint64_t{0};
-    return offers * kCancelSpendCostCeiling + kCancelFeeSpendCostCeiling;
+    if (batch_size <= 0 || cancel_coins_per_offer <= 0) {
+        return kCancelFeeSpendCostCeiling;
+    }
+    // Each factor is below 2^31, so the spend count is below 2^62 and fits.
+    const std::uint64_t spends =
+        static_cast<std::uint64_t>(batch_size)
+        * static_cast<std::uint64_t>(cancel_coins_per_offer);
+    const std::uint64_t max_spends =
+        (std::numeric_limits<std::uint64_t>::max()
+         - kCancelFeeSpendCostCeiling)
+        / kCancelSpendCostCeiling;
+    if (spends > max_spends) {
+        return std::numeric_limits<std::uint64_t>::max();
+    }
+    return spends * kCancelSpendCostCeiling + kCancelFeeSpendCostCeiling;
 }
 
 /// The number of batches -- and therefore the number of times batch_fee is

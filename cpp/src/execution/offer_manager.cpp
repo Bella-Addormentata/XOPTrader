@@ -1435,7 +1435,7 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(
     // resting unless cancel_stale and the on-chain reconciler had BOTH failed
     // as well.
     //
-    // [BULKCANCEL-B 2026-09-13] At rpc::kCancelOffersSingleBatchSize (100)
+    // [BULKCANCEL-B 2026-09-13] At rpc::kCancelOffersSingleBatchSize (50)
     // the floor is ONE batch and so ONE whole coin; at the old batch size of
     // 5 it was five of each.  The live wallet held 22 open offers of its own
     // on 2026-09-13, inside the floor.
@@ -1458,14 +1458,14 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(
     // bounded, since begin_xch_lock_cycle rebuilds the ledger each ~1-minute
     // cycle, but it is paid on EVERY empty-book cancel_all and it is paid
     // while quoting.  [BULKCANCEL-B 2026-09-13] At the single-batch size any
-    // floor up to 100 offers drains ONE coin, so this argument binds again
-    // only if the batch size is lowered.
+    // floor up to kCancelOffersSingleBatchSize offers drains ONE coin, so this
+    // argument binds again only if the batch size is lowered.
     //
     // WHY NOT LOWER.  One batch is what this code did before: at the old batch
     // size of 5 it under-modelled by exactly the untracked offers the sweep
     // exists for.  [BULKCANCEL-B 2026-09-13] At the single-batch size the
-    // floor already IS one batch; it matters again only past 100 offers or
-    // if the batch size is lowered.
+    // floor already IS one batch; it matters again only past
+    // kCancelOffersSingleBatchSize offers or if the batch size is lowered.
     //
     // WHY NOT AN RPC.  A wallet-wide count was tried and cut.  It asked
     // get_all_offers with the wallet-default sort_key, under which PENDING
