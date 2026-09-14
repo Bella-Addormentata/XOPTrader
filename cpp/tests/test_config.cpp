@@ -2916,12 +2916,17 @@ TEST(PairConcentrationOverride, ParsesBoth) {
     EXPECT_DOUBLE_EQ(*cfg.pairs[0].hard_limit_pct_override, 0.97);
 }
 
+// NonFiniteThrows and OutOfRangeThrows require the PARSE-stage message, not
+// just the key.  The effective soft < hard error names both override keys too,
+// and on its own it rejects a NaN override and a soft override above 1, so a
+// key-only needle would pass with the parse check deleted.
 TEST(PairConcentrationOverride, NonFiniteThrows) {
     for (const char* key : {"soft_limit_pct_override", "hard_limit_pct_override"}) {
         for (const char* value : {".nan", ".inf"}) {
             SCOPED_TRACE(std::string(key) + ": " + value);
             expect_config_error_containing(
-                with_pair_extra(std::string(key) + ": " + value), key);
+                with_pair_extra(std::string(key) + ": " + value),
+                std::string(key) + " must be a finite fraction in (0, 1]");
         }
     }
 }
@@ -2931,7 +2936,8 @@ TEST(PairConcentrationOverride, OutOfRangeThrows) {
         for (const char* value : {"0", "-0.1", "1.0001"}) {
             SCOPED_TRACE(std::string(key) + ": " + value);
             expect_config_error_containing(
-                with_pair_extra(std::string(key) + ": " + value), key);
+                with_pair_extra(std::string(key) + ": " + value),
+                std::string(key) + " must be a finite fraction in (0, 1]");
         }
     }
 }
