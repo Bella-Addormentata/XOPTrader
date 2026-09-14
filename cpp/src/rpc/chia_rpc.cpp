@@ -18,6 +18,9 @@
  * Retry strategy: up to max_retries attempts with exponential backoff on
  * transient errors (network faults, HTTP 429/5xx).  Non-transient errors
  * propagate immediately as ChiaRPCApplicationError or ChiaRPCTransportError.
+ * An endpoint whose second copy is a second wallet action (cancel_offers,
+ * cancel_offer) is re-sent only when the request cannot have reached the
+ * handler -- see rpc/rpc_retry_policy.hpp.
  *
  * ISO/IEC 27001:2022 -- cert file contents are never logged; paths are
  *                       logged at debug level only.  SSL verification
@@ -31,6 +34,7 @@
  */
 
 #include "xop/rpc/chia_rpc.hpp"
+#include "xop/rpc/rpc_retry_policy.hpp"
 #include "xop/rpc/wallet_requests.hpp"
 
 #include <algorithm>
@@ -545,6 +549,12 @@ asio::awaitable<json> ChiaRPCBase::rpc_post(std::string_view endpoint,
     const auto        max_tries  = config_.max_retries + 1u; // 1 initial + N retries
     auto              backoff    = config_.retry_base_delay;
 
+    // [BULKCANCEL-B 2026-09-13] A re-send is a SECOND REQUEST, not a retry
+    // of the first.  For cancel_offers / cancel_offer the policy re-sends
+    // only a request that cannot have reached the handler; a timeout or a
+    // 5xx surfaces to the caller instead.  See rpc/rpc_retry_policy.hpp.
+    const RpcRetryPolicy policy = retry_policy_for_endpoint(endpoint);
+
     for (std::uint32_t attempt = 1; attempt <= max_tries; ++attempt) {
         std::string response_body;
         long        http_code = 0;
@@ -574,13 +584,23 @@ asio::awaitable<json> ChiaRPCBase::rpc_post(std::string_view endpoint,
         // --- Transport error -----------------------------------------------
         if (rc != CURLE_OK) {
             const bool retryable = is_transient(rc, 0);
-            logger_->warn("[attempt {}/{}] CURL error {}: {} (retryable={})",
+            const bool resend    = may_resend(policy, rc, retryable);
+            logger_->warn("[attempt {}/{}] CURL error {}: {} (retryable={}, "
+                          "resend={})",
                           attempt, max_tries,
                           static_cast<int>(rc),
                           curl_easy_strerror(rc),
-                          retryable);
+                          retryable, resend);
+            if (retryable && !resend) {
+                logger_->warn("{} is NOT re-sent after CURL error {}: the "
+                              "request may already have reached the wallet "
+                              "and still be running there, and a second "
+                              "copy is a second action -- failing this "
+                              "call instead",
+                              endpoint, static_cast<int>(rc));
+            }
 
-            if (retryable && attempt < max_tries) {
+            if (resend && attempt < max_tries) {
                 // Exponential backoff via an asio steady_timer (non-blocking).
                 asio::steady_timer timer(ioc_, backoff);
                 co_await timer.async_wait(asio::use_awaitable);
@@ -597,10 +617,20 @@ asio::awaitable<json> ChiaRPCBase::rpc_post(std::string_view endpoint,
         // --- HTTP error (non-2xx) ------------------------------------------
         if (http_code < 200 || http_code >= 300) {
             const bool retryable = is_transient(CURLE_OK, http_code);
-            logger_->warn("[attempt {}/{}] HTTP {} from {} (retryable={})",
-                          attempt, max_tries, http_code, url, retryable);
+            const bool resend    = may_resend(policy, CURLE_OK, retryable);
+            logger_->warn("[attempt {}/{}] HTTP {} from {} (retryable={}, "
+                          "resend={})",
+                          attempt, max_tries, http_code, url, retryable,
+                          resend);
+            if (retryable && !resend) {
+                logger_->warn("{} is NOT re-sent after HTTP {}: the "
+                              "handler received it, and a second copy is "
+                              "a second action -- failing this call "
+                              "instead",
+                              endpoint, http_code);
+            }
 
-            if (retryable && attempt < max_tries) {
+            if (resend && attempt < max_tries) {
                 asio::steady_timer timer(ioc_, backoff);
                 co_await timer.async_wait(asio::use_awaitable);
                 backoff *= 2;
@@ -619,11 +649,20 @@ asio::awaitable<json> ChiaRPCBase::rpc_post(std::string_view endpoint,
             result = json::parse(response_body);
         } catch (const json::parse_error& ex) {
             // Malformed JSON is not transient -- fail immediately.
+            //
+            // [review 2026-09-13, round 3] As a TRANSPORT failure carrying
+            // CURLE_OK and the 2xx status: the handler received this request
+            // and ran it, and only its answer was lost.  A cancel caller must
+            // read that as "possibly submitted"
+            // (rpc::cancel_possibly_submitted), never as a refusal.  Every
+            // other caller catches ChiaRPCError, which this derives from, so
+            // nothing else changes.
             logger_->error("JSON parse error from {}: {}", endpoint, ex.what());
             note_call_end(RpcCallEnd::MalformedBody);
-            throw ChiaRPCError(
+            throw ChiaRPCTransportError(
                 std::string("Failed to parse JSON response from ") +
-                    std::string(endpoint) + ": " + ex.what());
+                    std::string(endpoint) + ": " + ex.what(),
+                http_code, CURLE_OK);
         }
 
         // --- Application-level success check -------------------------------

@@ -338,6 +338,13 @@ private:
 /// The daemon charges batch_fee ONCE PER BATCH, so the call really spends
 /// fee * ceil(n_offers / batch_size).  That half is arithmetic.
 ///
+/// [BULKCANCEL-B 2026-09-13] At rpc::kCancelOffersSingleBatchSize every book
+/// up to that many offers is ONE batch, so this reserves ONE whole coin --
+/// where the old batch size of 5 reserved five for the 25-offer floor.  A
+/// sweep split into batches cannot be funded as a whole: a batch that funds
+/// its fee from the free pool picks that coin blind to the other batches
+/// (rpc/wallet_requests.hpp), which is what the single batch prevents.
+///
 /// The whole-coin half is the conservative one, and its mechanism is narrower
 /// than it first appears.  In chia 2.7.4 trade_manager.py the STANDARD_WALLET
 /// branch pays the fee OUT OF THE CANCELLATION COIN ITSELF
@@ -352,7 +359,9 @@ private:
 /// It is still a loop of single-fee note_lock()s rather than one combined
 /// note_lock(0, fee * batches): a combined need would select ONE coin for the
 /// lot and undercount the locks -- the exact modelling error this ledger
-/// exists to fix (see the header comment).
+/// exists to fix (see the header comment).  Past the batch size it reserves a
+/// whole coin per batch, a ceiling there too: batches that pick the same fee
+/// coin collide, and only one of them lands.
 ///
 /// The batch count is a FLOOR, not an exact figure: cancel_all:true also
 /// cancels offers this process never tracked (a previous instance's book),
@@ -364,7 +373,7 @@ inline void reserve_bulk_cancel(CoinLockLedger& ledger,
                                 std::int64_t    n_offers)
 {
     std::int64_t batches = rpc::cancel_offers_batch_count(
-        n_offers, rpc::kCancelOffersBatchSize);
+        n_offers, rpc::kCancelOffersSingleBatchSize);
     if (batches < 1) {
         batches = 1;
     }

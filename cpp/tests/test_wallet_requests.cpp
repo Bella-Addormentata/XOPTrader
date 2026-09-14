@@ -35,8 +35,12 @@
 #include "xop/rpc/wallet_requests.hpp"
 
 using nlohmann::json;
+using xop::rpc::cancel_batch_cost_ceiling;
 using xop::rpc::cancel_offers_batch_count;
-using xop::rpc::kCancelOffersBatchSize;
+using xop::rpc::kCancelCoinsPerOfferCeiling;
+using xop::rpc::kCancelFeeSpendCostCeiling;
+using xop::rpc::kCancelOffersSingleBatchSize;
+using xop::rpc::kMempoolMaxTxClvmCost;
 using xop::rpc::make_cancel_offers_request;
 using xop::rpc::make_get_transactions_request;
 
@@ -144,9 +148,67 @@ TEST(WalletRequests, CancelOffersSetsCancelAll) {
     EXPECT_TRUE(req.value("cancel_all", false));
 }
 
-TEST(WalletRequests, CancelOffersCarriesAnExplicitBatchSize) {
+TEST(WalletRequests, CancelOffersIsOneBatch) {
+    // [BULKCANCEL-B 2026-09-13] A wallet-wide sweep must go out as ONE batch.
+    // In chia 2.7.4 every batch pays batch_fee again, and a batch that funds
+    // its fee from the free XCH pool picks that coin blind to the batches
+    // before it and is pushed as its own bundle -- so a sweep split into
+    // batches cannot be funded as a whole.  See wallet_requests.hpp.
     const json req = make_cancel_offers_request(0, /*secure=*/true);
-    EXPECT_EQ(req.value("batch_size", -1), kCancelOffersBatchSize);
+    const int batch_size = req.value("batch_size", -1);
+    EXPECT_EQ(batch_size, kCancelOffersSingleBatchSize);
+
+    // OfferManager::cancel_all reserves for at least 25 offers when it cannot
+    // see the wallet's book (kUnknownWalletBookBound, offer_manager.cpp), and
+    // the live wallet held 22 open offers of its own on 2026-09-13.  The old
+    // batch size of 5 split either book into five batches.
+    EXPECT_GE(batch_size, 25);
+    EXPECT_EQ(cancel_offers_batch_count(25, batch_size), 1);
+
+    // CancelOffers.batch_size is a uint16 in chia 2.7.4
+    // (wallet_request_types.py).
+    EXPECT_LE(batch_size, 65535);
+}
+
+TEST(WalletRequests, OneBatchFitsTheMempoolCostBoundAtTwoSpendsPerOffer) {
+    // [BULKCANCEL-B 2026-09-13] The risk the old batch size guarded against is
+    // real: mempool_manager.py rejects a bundle costing more than
+    // max_tx_clvm_cost, and one rejected bundle takes every cancel in it down.
+    // So the single batch is sized under that bound at measured per-spend
+    // costs rather than raised without limit.
+    //
+    // [review 2026-09-13, operator decision] The ceilings are per cancellation
+    // SPEND, and an offer can need more than one, so the spend count is an
+    // explicit argument, costed at kCancelCoinsPerOfferCeiling: two, twice the
+    // shape of 18,185 of the 18,187 offers this wallet has cancelled.  See THE
+    // TWO-SPEND BASIS in wallet_requests.hpp.
+    EXPECT_EQ(kMempoolMaxTxClvmCost, 5'500'000'000ULL);  // 11e9 // 2
+    EXPECT_EQ(kCancelCoinsPerOfferCeiling, 2);
+    EXPECT_LE(cancel_batch_cost_ceiling(kCancelOffersSingleBatchSize, 2),
+              kMempoolMaxTxClvmCost);
+    // The default spend count is the ceiling the batch is sized at.
+    EXPECT_EQ(cancel_batch_cost_ceiling(kCancelOffersSingleBatchSize),
+              cancel_batch_cost_ceiling(kCancelOffersSingleBatchSize,
+                                        kCancelCoinsPerOfferCeiling));
+
+    // A batch of 100 -- this change's first size -- costs up to 7,018,000,000
+    // at two spends per offer: over the bound.
+    EXPECT_GT(cancel_batch_cost_ceiling(100, 2), kMempoolMaxTxClvmCost);
+
+    // A first draft of this change proposed 1000 per batch.  At these
+    // ceilings that bundle is 6.4x over the bound even at one spend per
+    // offer: a sweep that size would cancel nothing.
+    EXPECT_GT(cancel_batch_cost_ceiling(1000, 1), kMempoolMaxTxClvmCost);
+
+    // A degenerate size or spend count costs the fee spend alone, and a spend
+    // count too large for the type saturates instead of wrapping.
+    EXPECT_EQ(cancel_batch_cost_ceiling(0), kCancelFeeSpendCostCeiling);
+    EXPECT_EQ(cancel_batch_cost_ceiling(-5), kCancelFeeSpendCostCeiling);
+    EXPECT_EQ(cancel_batch_cost_ceiling(50, 0), kCancelFeeSpendCostCeiling);
+    EXPECT_EQ(cancel_batch_cost_ceiling(50, -1), kCancelFeeSpendCostCeiling);
+    EXPECT_EQ(cancel_batch_cost_ceiling(std::numeric_limits<int>::max(),
+                                        std::numeric_limits<int>::max()),
+              std::numeric_limits<std::uint64_t>::max());
 }
 
 TEST(WalletRequests, CancelOffersCarriesSecureBothWays) {

@@ -29,6 +29,7 @@
 #include <xop/execution/wallet_circuit.hpp>
 #include <xop/execution/wallet_poll_throttle.hpp>
 #include <xop/risk/watchdog.hpp>
+#include <xop/rpc/rpc_retry_policy.hpp>
 
 #include <algorithm>
 #include <cctype>
@@ -1449,14 +1450,18 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(
     // zero-spendable shape: real coin locks the ledger does not know about,
     // and every later try_lock admitting against coins already spent.
     //
-    // 25 offers is ceil(25 / kCancelOffersBatchSize) = 5 batches = 5 whole
-    // coins.  It is HEADROOM over the largest book this deployment's ladder
+    // 25 offers is HEADROOM over the largest book this deployment's ladder
     // can rest, not a derivation from it: the live config runs num_tiers 6
     // with one enabled pair, so a full ladder is 1 x 6 x 2 = 12 offers, and
     // 25 leaves room for a second pair being enabled without revisiting this
     // number.  A previous instance cannot have left more than one full ladder
     // resting unless cancel_stale and the on-chain reconciler had BOTH failed
     // as well.
+    //
+    // [BULKCANCEL-B 2026-09-13] At rpc::kCancelOffersSingleBatchSize (50)
+    // the floor is ONE batch and so ONE whole coin; at the old batch size of
+    // 5 it was five of each.  The live wallet held 22 open offers of its own
+    // on 2026-09-13, inside the floor.
     //
     // [S33 2026-09-12] Deliberately NOT computed from config at compile time.
     // An earlier draft of this comment derived 24 from config.example.yaml's
@@ -1469,15 +1474,21 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(
     // WHY NOT HIGHER.  cancel_all also runs from the operator Cancel All
     // flag while the bot is STILL TRADING (engine.cpp check_cancel_all_flag),
     // and every reserved batch drains a whole coin from the live cycle
-    // ledger.  At 50 offers that is 10 coins -- more than the incident
-    // wallet HELD (14.59 XCH in ~2-XCH coins), and note_lock with a need it
-    // cannot cover CLEARS the pool outright, so try_lock refuses every offer
-    // for the rest of the cycle.  That cost is bounded, since
-    // begin_xch_lock_cycle rebuilds the ledger each ~1-minute cycle, but it
-    // is paid on EVERY empty-book cancel_all and it is paid while quoting.
+    // ledger.  At the old batch size of 5, 50 offers was 10 coins -- more
+    // than the incident wallet HELD (14.59 XCH in ~2-XCH coins), and
+    // note_lock with a need it cannot cover CLEARS the pool outright, so
+    // try_lock refuses every offer for the rest of the cycle.  That cost is
+    // bounded, since begin_xch_lock_cycle rebuilds the ledger each ~1-minute
+    // cycle, but it is paid on EVERY empty-book cancel_all and it is paid
+    // while quoting.  [BULKCANCEL-B 2026-09-13] At the single-batch size any
+    // floor up to kCancelOffersSingleBatchSize offers drains ONE coin, so this
+    // argument binds again only if the batch size is lowered.
     //
-    // WHY NOT LOWER.  One batch is what this code did before: it under-models
-    // by exactly the untracked offers the sweep exists for.
+    // WHY NOT LOWER.  One batch is what this code did before: at the old batch
+    // size of 5 it under-modelled by exactly the untracked offers the sweep
+    // exists for.  [BULKCANCEL-B 2026-09-13] At the single-batch size the
+    // floor already IS one batch; it matters again only past
+    // kCancelOffersSingleBatchSize offers or if the batch size is lowered.
     //
     // WHY NOT AN RPC.  A wallet-wide count was tried and cut.  It asked
     // get_all_offers with the wallet-default sort_key, under which PENDING
@@ -1494,8 +1505,9 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(
     // cancel_all:true sweeps the whole WALLET book whether or not we track
     // any of it, so untracked offers add BATCHES to a mixed book exactly as
     // they do to an empty one. Selecting tracked_n alone reserved 1 batch for
-    // 1 tracked + 12 untracked while the daemon charges 3. max() keeps the
-    // bound the FLOOR that reserve_bulk_cancel's contract already says it is.
+    // 1 tracked + 12 untracked while the daemon charged 3 at the old batch
+    // size of 5. max() keeps the bound the FLOOR that reserve_bulk_cancel's
+    // contract already says it is.
     const std::int64_t reserve_n =
         std::max(tracked_n, kUnknownWalletBookBound);
 
@@ -1508,11 +1520,23 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(
 
     // Attempt bulk cancellation first (wallet cancel_offers endpoint).
     bool bulk_ok = false;
+    // [review 2026-09-13, round 2] The sweep failed AFTER it may have reached
+    // the wallet (rpc::cancel_possibly_submitted).
+    bool bulk_possibly_submitted = false;
     std::string bulk_err;
     try {
         co_await cancel_offers_charged(
             current_fee_mojos_, /*secure=*/true, reserve_n);
         bulk_ok = true;
+    } catch (const rpc::ChiaRPCTransportError& e) {
+        // BEFORE the base-class handler, which would take this too.  A
+        // transport failure is not one thing: a connect failure never reached
+        // the wallet, while a timeout or a 5xx may have -- and so did a 2xx
+        // reply whose body rpc_post could not parse [review 2026-09-13,
+        // round 3], which it reports as a transport failure with that status.
+        bulk_err = e.what();
+        bulk_possibly_submitted =
+            rpc::cancel_possibly_submitted(e.curl_code(), e.http_code());
     } catch (const rpc::ChiaRPCError& e) {
         bulk_err = e.what();
     }
@@ -1528,6 +1552,39 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(
         out.cancelled.reserve(all_offers.size());
         for (const auto& po : all_offers) {
             out.cancelled.push_back(po.offer_id);
+        }
+    } else if (bulk_possibly_submitted) {
+        // [review 2026-09-13, round 2] NO ANSWER IS NOT A REFUSAL.  The sweep
+        // may have run, may still be running inside the wallet, or may never
+        // have arrived, and nothing here says which.  In chia 2.7.4
+        // cancel_offers and cancel_offer both take the wallet state lock, and
+        // cancel_pending_offers does not check trade status, so the per-offer
+        // fallback further down would queue behind a sweep that is still
+        // running and build a SECOND, conflicting spend of every offer it
+        // already cancelled.  So send nothing more: every tracked id is
+        // reported still live, and the caller waits at least one request
+        // timeout and re-checks each offer before it cancels any
+        // (CancelLadder::needs_recheck at shutdown, and the operator path in
+        // Engine::check_cancel_all_flag).
+        //
+        // THE EMPTY LOCAL BOOK.  `failed` is then empty -- the bulk endpoint
+        // names no offer id -- so bulk_possibly_submitted is the only field
+        // that says anything went wrong, exactly as sweep_refused is for a
+        // refusal, and all_cancelled() reads it.  It is NOT folded into
+        // sweep_refused: a refusal is an answer, after which sending the
+        // sweep again at once is safe.  After this, sending again at once is
+        // the duplicate.
+        logger_->warn("cancel_all: bulk cancel_offers got NO USABLE ANSWER ({}) -- "
+                      "the wallet-wide sweep may still be running.  NOT "
+                      "falling back to individual cancellation: nothing is "
+                      "sent again until each of the {} tracked offer(s) is "
+                      "re-checked", bulk_err, all_offers.size());
+        out.bulk_possibly_submitted = true;
+        out.last_error  = bulk_err;
+        out.worst_class = execution::classify_take_failure(bulk_err);
+        out.failed.reserve(all_offers.size());
+        for (const auto& po : all_offers) {
+            out.failed.push_back(po.offer_id);
         }
     } else if (all_offers.empty()) {
         // [S33 2026-09-12] There is no per-offer fallback to take: the ids the
@@ -1581,9 +1638,15 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(
         // wallet-wide, but the ids it touched were never ours, so a count of
         // "offers cancelled" here would be invented.  bulk_submitted carries
         // the acceptance; `cancelled` stays empty on purpose.
+        // [review 2026-09-13, round 2] Three outcomes, not two: a sweep that
+        // got no answer was not refused.
         logger_->info("cancel_all: no locally tracked offers -- wallet-wide "
                       "sweep {}; the ids it covered are not known to this "
-                      "process", bulk_ok ? "SUBMITTED" : "REFUSED");
+                      "process",
+                      bulk_ok                   ? "SUBMITTED"
+                      : bulk_possibly_submitted ? "UNANSWERED (it may still "
+                                                  "be running)"
+                                                : "REFUSED");
     } else {
         logger_->info("cancel_all: {}/{} offers cancelled successfully",
                       out.cancelled.size(), all_offers.size());

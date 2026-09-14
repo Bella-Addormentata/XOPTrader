@@ -1055,6 +1055,14 @@ private:
     /// True while the operator has been told the cancel failed; cleared
     /// (with a follow-up alert) when a retry finally succeeds.
     bool reload_cancel_alert_pending_ = false;
+    /// [review 2026-09-13, round 4] Set by every sweep_reload_disabled_offers
+    /// run that gets past its empty check: true when it only DEFERRED the
+    /// cancel because an operator Cancel All was in flight.  A deferral is
+    /// not a failure, and the reload alerts must not call it one.
+    bool reload_cancel_deferred_ = false;
+    /// [review 2026-09-13, round 4] The pending alert above stands for a
+    /// deferred cancel, not a failed one.
+    bool reload_cancel_alert_deferred_ = false;
     /// mtime of a flag file that could not be DELETED (AV lock, perms):
     /// skip re-processing until the file changes, instead of re-parsing
     /// the config and spamming the log every heartbeat.
@@ -1077,6 +1085,15 @@ private:
     // via the same TTL sweep, which also runs in the breaker skip branch.
     std::filesystem::path cancel_all_flag_path_;
     bool cancel_all_inflight_ = false;
+    /// [review 2026-09-13, round 4] When operator Cancel All last saw its
+    /// wallet-wide sweep get no usable answer, and which tracked offers State
+    /// already had a cancel in flight for just before that sweep.  shutdown()
+    /// reads both: a stop while that branch runs sends no second wallet-wide
+    /// sweep before the rest of the wait, and those offers are no evidence the
+    /// sweep ran.  [round 5] The branch clears both when it ends any way other
+    /// than a shutdown request.  ioc_ thread only, like cancel_all_inflight_.
+    std::optional<std::chrono::steady_clock::time_point> unanswered_sweep_at_;
+    std::unordered_set<std::string> unanswered_sweep_pending_before_;
     /// [R2 #20] Durable engine-side gate: true from the operator's
     /// cancel-all until every marked cancel CONFIRMS (no tracked offer
     /// still cancel_pending). Unlike cancel_all_inflight_ (submission),
