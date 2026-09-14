@@ -403,8 +403,10 @@ def test_a_stop_soon_after_an_unanswered_operator_sweep_sends_no_second_sweep():
     _in_order(code, [
         "execution::CancelLadderladder(outstanding,retry_cfg,true);",
         "-*unanswered_sweep_at_)",
+        # ONE needle, split only for line length: the whole seed statement, so
+        # nothing can come between the call and the arguments it must pass.
         "conststd::uint32_tseed_wait_ms=execution::unanswered_sweep_remaining_wait_ms("
-        "unanswered_sweep_at_.has_value(),since_unanswered_ms,retry_cfg);",
+        + "unanswered_sweep_at_.has_value(),since_unanswered_ms,retry_cfg);",
         "if(seed_wait_ms!=0){",
         "ladder.record(execution::seeded_unanswered_sweep_outcome(outstanding,seed_wait_ms));",
         "?co_awaitoffer_mgr_->cancel_all(cancel_deadline)",
@@ -491,10 +493,14 @@ def test_a_finished_operator_branch_leaves_no_stamp_for_a_later_stop():
     _in_order(possibly, [
         "unanswered_sweep_pending_before_=pending_before_sweep;",
         "structUnansweredSweepStamp{",
+        # The next two are each ONE needle, split only for line length: the
+        # destructor's whole body, so nothing sits between the claim test and the
+        # resets, and the guard's whole initializer, so it binds exactly these
+        # three members.
         "~UnansweredSweepStamp(){if(!shutdown_claim->load(std::memory_order_acquire))"
-        "{at->reset();pending_before->clear();}}",
+        + "{at->reset();pending_before->clear();}}",
         "}unanswered_sweep_stamp{&unanswered_sweep_at_,&unanswered_sweep_pending_before_,"
-        "&graceful_cancel_active_};",
+        + "&graceful_cancel_active_};",
         "for(;;){",
     ])
 
