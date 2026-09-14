@@ -137,6 +137,7 @@
 #include <vector>
 
 #include "xop/execution/take_retry.hpp"
+#include "xop/execution/terminal_recheck.hpp"
 
 namespace xop::execution {
 
@@ -163,6 +164,13 @@ enum class CancelStopReason : int {
     /// outstanding only because the refused sweep names no ids -- the
     /// wallet's book is UNKNOWN, never proven empty. NOT a clean stop.
     SweepRefused         = 5,
+    /// [review 2026-09-13, round 2] A wallet-wide sweep got NO ANSWER -- a
+    /// timeout, an empty or broken reply, an HTTP 5xx -- and may have run,
+    /// may still be running, or may never have arrived. Nothing is
+    /// outstanding only because no TRACKED offer is still believed live: the
+    /// wallet's untracked book is UNKNOWN. NOT a clean stop, and not a
+    /// refusal either -- a refusal is an answer.
+    SweepPossiblySubmitted = 6,
 };
 
 [[nodiscard]] constexpr const char* to_string(CancelStopReason r) noexcept
@@ -173,6 +181,8 @@ enum class CancelStopReason : int {
         case CancelStopReason::BudgetExhausted:      return "budget-exhausted";
         case CancelStopReason::NeedsEmergencyLadder: return "needs-emergency-ladder";
         case CancelStopReason::SweepRefused:         return "wallet-wide-sweep-refused";
+        case CancelStopReason::SweepPossiblySubmitted:
+            return "wallet-wide-sweep-possibly-submitted";
         case CancelStopReason::Unknown:              break;
     }
     return "unknown";
@@ -181,6 +191,50 @@ enum class CancelStopReason : int {
 [[nodiscard]] constexpr const char* to_string(CancelRetryVerdict v) noexcept
 {
     return v == CancelRetryVerdict::Retry ? "retry" : "stop";
+}
+
+// ---------------------------------------------------------------------------
+// [review 2026-09-13, round 2] THE WAIT AFTER A SWEEP THAT GOT NO ANSWER.
+//
+// cancel_all's wallet-wide cancel_offers can fail AFTER the wallet received
+// it -- a timeout, an empty or broken reply, an HTTP 5xx
+// (rpc::cancel_possibly_submitted) -- and the wallet may still be running it.
+// On 2026-09-12 the failure reached the engine 30.7 s after the send, while
+// the first request was still writing cancel records at 53 s.  In chia 2.7.4
+// cancel_offers and cancel_offer both take the wallet state lock, and
+// cancel_pending_offers does not check trade status, so a per-id retry queued
+// behind the running sweep builds a SECOND, conflicting spend of an offer the
+// sweep already cancelled.
+//
+// So the retry after such an attempt waits at least one request timeout of
+// the wallet client plus kPossiblySubmittedWaitMarginMs, and then re-checks
+// every offer before it cancels any (CancelLadder::needs_recheck).  On the
+// 2026-09-12 timings a 35 s wait re-checks at ~66 s, about 13 s after the
+// last record the first request wrote.
+// ---------------------------------------------------------------------------
+
+/// Slack on top of the wallet client's request timeout, for a request the
+/// wallet was still running when curl gave up on it.
+inline constexpr std::uint32_t kPossiblySubmittedWaitMarginMs = 5'000;
+
+/// rpc::ChiaRPCConfig::request_timeout's default (chia_rpc.hpp), repeated only
+/// so that CancelRetryConfig{} is never built with a wait shorter than one
+/// timeout.  The engine passes its wallet client's real timeout, and
+/// test_cancel_retry.cpp pins this copy to the client's default.
+inline constexpr std::uint32_t kDefaultWalletRequestTimeoutMs = 30'000;
+
+/// The least sleep after an attempt whose sweep got no answer: one request
+/// timeout plus the margin.  A non-positive timeout waits the margin alone,
+/// and the result saturates instead of wrapping.
+[[nodiscard]] constexpr std::uint32_t
+wait_after_possibly_submitted_ms(std::int64_t request_timeout_ms) noexcept
+{
+    const std::uint64_t timeout = request_timeout_ms > 0
+        ? static_cast<std::uint64_t>(request_timeout_ms)
+        : std::uint64_t{0};
+    // timeout < 2^63, so adding the margin cannot wrap.
+    return static_cast<std::uint32_t>(std::min<std::uint64_t>(
+        timeout + kPossiblySubmittedWaitMarginMs, 0xFFFF'FFFFull));
 }
 
 // ---------------------------------------------------------------------------
@@ -214,6 +268,13 @@ struct CancelRetryConfig {
     /// TakeFailureClass::Other is not modelled. It gets a shorter leash than
     /// the sync flap: two retries, not four.
     std::uint32_t other_max_attempts{3};
+    /// [review 2026-09-13, round 2] The least sleep before the attempt that
+    /// follows a wallet-wide sweep that got NO ANSWER (see the note above).
+    /// Clamped by the budget like any delay, except that a budget unable to
+    /// fit it plus min_useful_delay_ms stops the ladder instead of retrying
+    /// early.  The engine sets it from its wallet client.
+    std::uint32_t possibly_submitted_wait_ms{
+        wait_after_possibly_submitted_ms(kDefaultWalletRequestTimeoutMs)};
 };
 
 // ---------------------------------------------------------------------------
@@ -265,6 +326,13 @@ static_assert(cancel_schedule_total_ms(CancelRetryConfig{})
               "ceiling and the wall-clock cap never fires -- which is how "
               "the 90 s number came to be quoted for a ladder that actually "
               "stopped at 75 s");
+static_assert(CancelRetryConfig{}.budget_ms
+                  >= kDefaultWalletRequestTimeoutMs
+                         + CancelRetryConfig{}.possibly_submitted_wait_ms
+                         + CancelRetryConfig{}.min_useful_delay_ms,
+              "a sweep that fails only after one full request timeout must "
+              "still leave the budget room for the wait and a re-check, or "
+              "every unanswered sweep at shutdown stops after attempt 1");
 
 /// The longest measured desync episode in this repo's Step-8 sync-gate
 /// sampling (7.18 h, 1159 cycles, 8 episodes). The budget is sized to reach
@@ -294,6 +362,11 @@ struct CancelAttemptState {
     /// Other, the short-leash class -- an unclassified failure must not
     /// inherit the sync flap's generous ladder.
     TakeFailureClass last_class{TakeFailureClass::Other};
+    /// [review 2026-09-13, round 2] The last attempt's wallet-wide sweep got
+    /// NO ANSWER and may still be running, so the next sleep is at least
+    /// cfg.possibly_submitted_wait_ms.  False keeps today's schedule;
+    /// CancelLadder sets it from the attempt it recorded.
+    bool             possibly_submitted{false};
 };
 
 struct CancelRetryPlan {
@@ -368,6 +441,24 @@ plan_cancel_retry(CancelAttemptState state,
     const std::uint32_t budget_left = cfg.budget_ms - state.elapsed_ms;
 
     std::uint32_t delay = cancel_backoff_ms(state.attempts_made, cfg);
+    // (4a) [review 2026-09-13, round 2] After a sweep that got NO ANSWER the
+    // next attempt must not start while that sweep may still be running, so
+    // it sleeps at least the configured wait.  A budget that cannot fit the
+    // wait and a useful moment after it stops the ladder HERE rather than
+    // clamping the wait into the tail: a clamped wait is exactly the early
+    // per-id re-cancel this exists to prevent.  BudgetExhausted is literally
+    // why, and every consumer already treats it as unclean and hands the
+    // still-live ids, by name, to the S31 fallback.
+    if (state.possibly_submitted) {
+        const std::uint64_t needed =
+            std::uint64_t{cfg.possibly_submitted_wait_ms}
+            + cfg.min_useful_delay_ms;
+        if (budget_left < needed) {
+            plan.stop_reason = CancelStopReason::BudgetExhausted;
+            return plan;
+        }
+        delay = std::max(delay, cfg.possibly_submitted_wait_ms);
+    }
     if (delay > budget_left) {
         // Clamp into what is left rather than refusing outright: the last
         // partial window is still a real chance at a flap that is about to
@@ -536,7 +627,72 @@ struct CancelAttemptOutcome {
     /// handling an offer id that does not exist.  A flag cannot be mistaken
     /// for an offer.
     bool                     sweep_refused{false};
+    /// [review 2026-09-13, round 2] Set when the attempt's WALLET-WIDE sweep
+    /// failed AFTER it may have reached the wallet (a timeout, an empty or
+    /// broken reply, an HTTP 5xx) and nothing was sent after it: every
+    /// tracked id is in `failed`, none of them cancelled again.  The ladder
+    /// then waits at least cfg.possibly_submitted_wait_ms and re-checks every
+    /// offer before any retry (needs_recheck).  Unlike sweep_refused this is
+    /// NOT an answer -- sending again at once is the duplicate -- but it
+    /// proves the untracked book empty no more than a refusal does.
+    bool                     bulk_possibly_submitted{false};
 };
+
+// ---------------------------------------------------------------------------
+// [review 2026-09-13, round 2] RecheckPartition -- what the wallet says about
+// each offer before a retry that follows a sweep that got no answer.
+//
+// One bucket per answer, decided by ONE pure function that both callers of
+// cancel_all use (the shutdown ladder and operator Cancel All), with the
+// posture Engine::sweep_cancel_intent already has:
+//
+//   Revived, no cancel spend in flight  -> recancel         still live
+//   Revived, cancel_pending in State    -> already_pending  the wallet is
+//        already cancelling it (PENDING_CANCEL); a second secure cancel
+//        builds a second spend and pays a second fee
+//   StillTerminal                       -> dead             cancelled/failed
+//   Confirmed                           -> filled           a taker won the
+//        race: NEVER cancelled again and NEVER stamped cancelled
+//   NoVerdict                           -> unknown          no evidence either
+//        way: not cancelled on this attempt, still outstanding
+//
+// `cancel_pending` is read from State AFTER recheck_terminal, which marks it
+// for a PENDING_CANCEL record -- that is how the two Revived rows are told
+// apart without widening TerminalRecheck.
+// ---------------------------------------------------------------------------
+struct RecheckPartition {
+    std::vector<std::string> recancel{};
+    std::vector<std::string> already_pending{};
+    std::vector<std::string> dead{};
+    std::vector<std::string> filled{};
+    std::vector<std::string> unknown{};
+};
+
+inline void partition_rechecked_offer(RecheckPartition& into,
+                                      std::string       id,
+                                      TerminalRecheck   verdict,
+                                      bool              cancel_pending)
+{
+    switch (verdict) {
+        case TerminalRecheck::StillTerminal:
+            into.dead.push_back(std::move(id));
+            return;
+        case TerminalRecheck::Confirmed:
+            into.filled.push_back(std::move(id));
+            return;
+        case TerminalRecheck::Revived:
+            if (cancel_pending) {
+                into.already_pending.push_back(std::move(id));
+            } else {
+                into.recancel.push_back(std::move(id));
+            }
+            return;
+        case TerminalRecheck::NoVerdict:
+            break;
+    }
+    // NoVerdict -- and any value this build does not name: keep, do not act.
+    into.unknown.push_back(std::move(id));
+}
 
 // ---------------------------------------------------------------------------
 // What the driver should do next.
@@ -622,7 +778,9 @@ public:
             // SweepRefused that record() had just set -- the driver calls
             // next() once more to learn it should Finish -- handing the
             // fail-open straight back one line after it was closed.
-            if (!sweep_refused_) {
+            // [review 2026-09-13, round 2] Nor after a sweep that got no
+            // answer.
+            if (!sweep_refused_ && !possibly_submitted_) {
                 stop_reason_ = CancelStopReason::Done;
             }
             return act;  // Finish
@@ -651,6 +809,9 @@ public:
             static_cast<std::uint32_t>(outstanding_.size());
         st.elapsed_ms       = elapsed_ms;
         st.last_class       = worst_class_;
+        // [review 2026-09-13, round 2] The wait follows the attempt whose
+        // sweep got no answer, not every later retry.
+        st.possibly_submitted = last_attempt_possibly_submitted_;
 
         const auto plan = plan_cancel_retry(st, cfg_);
         if (plan.verdict != CancelRetryVerdict::Retry) {
@@ -681,7 +842,13 @@ public:
             already_pending_.push_back(std::move(id));
         }
 
+        const bool attempt_failed = !oc.failed.empty();
         outstanding_ = std::move(oc.failed);
+        // [review 2026-09-13, round 2] Ids the re-check got no verdict for
+        // were held back from this attempt's cancel. As far as this ladder
+        // knows they are still live.
+        for (auto& id : held_back_) outstanding_.push_back(std::move(id));
+        held_back_.clear();
 
         if (!oc.last_error.empty()) last_error_ = std::move(oc.last_error);
         bulk_submitted_ = bulk_submitted_ || oc.bulk_submitted;
@@ -690,19 +857,56 @@ public:
         // cancel_ids only ever names ids this process tracks, so it can never
         // reach the untracked book the sweep was refused over.
         sweep_refused_ = sweep_refused_ || oc.sweep_refused;
+        // [review 2026-09-13, round 2] A sweep that got NO ANSWER. The wait
+        // applies to the next sleep only; the other two flags are STICKY: no
+        // later per-id success proves the untracked book swept, and no retry
+        // on this ladder cancels an id without asking the wallet first.
+        last_attempt_possibly_submitted_ = oc.bulk_possibly_submitted;
+        possibly_submitted_ = possibly_submitted_ || oc.bulk_possibly_submitted;
+        needs_recheck_      = needs_recheck_ || oc.bulk_possibly_submitted;
 
         // Only a failing attempt carries class information. A clean attempt
-        // must not reset the leash the previous failures earned.
+        // must not reset the leash the previous failures earned -- nor does
+        // one whose only outstanding ids are the held-back ones.
         if (!outstanding_.empty()) {
-            worst_class_ = oc.worst_class;
+            if (attempt_failed) worst_class_ = oc.worst_class;
         } else if (sweep_refused_) {
             // [S33 2026-09-12] An EMPTY `failed` is not automatically Done.
             // A refused wallet-wide sweep has nothing to put in `failed` and
             // has proved nothing dead either.
             stop_reason_ = CancelStopReason::SweepRefused;
+        } else if (possibly_submitted_) {
+            // [review 2026-09-13, round 2] Nor after a sweep that got no
+            // answer: no tracked offer is believed live, and the untracked
+            // book is unproven.
+            stop_reason_ = CancelStopReason::SweepPossiblySubmitted;
         } else {
             stop_reason_ = CancelStopReason::Done;
         }
+    }
+
+    /// [review 2026-09-13, round 2] Fold in the re-check the driver ran over
+    /// outstanding() for a retry that follows a sweep that got no answer
+    /// (needs_recheck()) -- BEFORE it hands outstanding() to cancel_ids.
+    ///
+    /// Afterwards outstanding() names ONLY the offers the wallet reports live
+    /// with no cancel spend in flight: the ids that attempt may cancel.
+    ///   already_pending  a cancel spend is in flight: reported, never charged
+    ///                    again;
+    ///   dead, filled     resolved by the wallet: they leave the ladder, and
+    ///                    the caller handles them as the intent sweep does --
+    ///                    a filled offer is never stamped cancelled;
+    ///   unknown          no verdict: NOT cancelled on this attempt, and put
+    ///                    back into outstanding() by the next record().
+    void record_recheck(RecheckPartition part)
+    {
+        for (auto& id : part.already_pending) {
+            already_pending_.push_back(std::move(id));
+        }
+        for (auto& id : part.dead) resolved_dead_.push_back(std::move(id));
+        for (auto& id : part.filled) resolved_filled_.push_back(std::move(id));
+        for (auto& id : part.unknown) held_back_.push_back(std::move(id));
+        outstanding_ = std::move(part.recancel);
     }
 
     [[nodiscard]] const std::vector<std::string>& outstanding() const noexcept
@@ -724,6 +928,24 @@ public:
     /// ladder. The wallet's book is UNKNOWN, never proven empty.
     [[nodiscard]] bool sweep_refused() const noexcept
     { return sweep_refused_; }
+    /// [review 2026-09-13, round 2] True once a wallet-wide sweep got NO
+    /// ANSWER during this ladder. Sticky: the untracked book is unproven.
+    [[nodiscard]] bool possibly_submitted() const noexcept
+    { return possibly_submitted_; }
+    /// [review 2026-09-13, round 2] True when the attempt about to run must
+    /// re-check every outstanding offer, and fold the answers in with
+    /// record_recheck(), before it cancels any. Sticky once a sweep got no
+    /// answer.
+    [[nodiscard]] bool needs_recheck() const noexcept
+    { return needs_recheck_; }
+    /// [review 2026-09-13, round 2] Offers a re-check found CANCELLED or
+    /// FAILED in the wallet.
+    [[nodiscard]] const std::vector<std::string>&
+    resolved_dead() const noexcept { return resolved_dead_; }
+    /// [review 2026-09-13, round 2] Offers a re-check found CONFIRMED: they
+    /// FILLED. Never stamp them cancelled.
+    [[nodiscard]] const std::vector<std::string>&
+    resolved_filled() const noexcept { return resolved_filled_; }
     [[nodiscard]] TakeFailureClass worst_class() const noexcept
     { return worst_class_; }
     /// True when this ladder finished with nothing believed live. The ONLY
@@ -736,6 +958,9 @@ public:
                // this predicate on its own evidence, not via a second field
                // that some later edit could set back to Done.
                && !sweep_refused_
+               // [review 2026-09-13, round 2] Nor a sweep that got no
+               // answer, on its own evidence too.
+               && !possibly_submitted_
                && stop_reason_ == CancelStopReason::Done;
     }
 
@@ -755,6 +980,19 @@ private:
     /// [S33 2026-09-12] Authorises attempt 1 -- the wallet-wide sweep -- from
     /// an EMPTY id list. Set only by the shutdown driver.
     bool                     sweep_when_empty_{false};
+    /// [review 2026-09-13, round 2] Sticky: a wallet-wide sweep got no answer.
+    bool                     possibly_submitted_{false};
+    /// [review 2026-09-13, round 2] The LAST recorded attempt's sweep got no
+    /// answer, so the next sleep is at least cfg_.possibly_submitted_wait_ms.
+    bool                     last_attempt_possibly_submitted_{false};
+    /// [review 2026-09-13, round 2] Sticky: re-check before every retry.
+    bool                     needs_recheck_{false};
+    /// [review 2026-09-13, round 2] No-verdict ids held back from the current
+    /// attempt's cancel; record() returns them to outstanding_.
+    std::vector<std::string> held_back_{};
+    /// [review 2026-09-13, round 2] Ids a re-check found resolved.
+    std::vector<std::string> resolved_dead_{};
+    std::vector<std::string> resolved_filled_{};
 };
 
 }  // namespace xop::execution

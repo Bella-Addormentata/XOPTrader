@@ -20,6 +20,7 @@
 
 #include "xop/rpc/rpc_retry_policy.hpp"
 
+using xop::rpc::cancel_possibly_submitted;
 using xop::rpc::may_resend;
 using xop::rpc::retry_policy_for_endpoint;
 using xop::rpc::RpcRetryPolicy;
@@ -78,4 +79,33 @@ TEST(RpcRetryPolicy, ReadsStillRetryTransientFailures) {
 
     EXPECT_FALSE(may_resend(read, CURLE_OPERATION_TIMEDOUT, false));
     EXPECT_FALSE(may_resend(read, CURLE_OK, false));  // e.g. HTTP 404
+}
+
+// [review 2026-09-13, round 2] The failures after which the wallet may have
+// run -- or may still be running -- a cancel.  OfferManager::cancel_all sends
+// nothing more after one of these until each offer has been re-checked; any
+// other failure keeps its immediate per-offer fallback.
+//
+// MUTATION: return false for CURLE_OPERATION_TIMEDOUT (the 2026-09-12 shape)
+// -> FAILS here, and nowhere else.
+TEST(RpcRetryPolicy, APostSendCancelFailureIsPossiblySubmitted) {
+    EXPECT_TRUE(cancel_possibly_submitted(CURLE_OPERATION_TIMEDOUT, 0));
+    EXPECT_TRUE(cancel_possibly_submitted(CURLE_GOT_NOTHING, 0));
+    EXPECT_TRUE(cancel_possibly_submitted(CURLE_SEND_ERROR, 0));
+    EXPECT_TRUE(cancel_possibly_submitted(CURLE_RECV_ERROR, 0));
+    EXPECT_TRUE(cancel_possibly_submitted(CURLE_PARTIAL_FILE, 0));
+    // rpc_post throws an HTTP failure with CURLE_OK: the handler, or the
+    // server in front of it, answered 5xx.
+    for (long code : {500L, 502L, 503L, 504L}) {
+        EXPECT_TRUE(cancel_possibly_submitted(CURLE_OK, code)) << "HTTP " << code;
+    }
+
+    // No connection, or no completed TLS handshake: the request was never
+    // written, so the per-offer fallback cannot race it.
+    EXPECT_FALSE(cancel_possibly_submitted(CURLE_COULDNT_CONNECT, 0));
+    EXPECT_FALSE(cancel_possibly_submitted(CURLE_SSL_CONNECT_ERROR, 0));
+    // Any other HTTP status is an answer, not an absence of one.
+    for (long code : {400L, 404L, 429L}) {
+        EXPECT_FALSE(cancel_possibly_submitted(CURLE_OK, code)) << "HTTP " << code;
+    }
 }

@@ -416,6 +416,49 @@ TEST(CancelOutcomeFoldTest, ThePerIdLoopsOwnFailureTextWins) {
 }
 
 // ---------------------------------------------------------------------------
+// [review 2026-09-13, round 2] A WALLET-WIDE SWEEP THAT GOT NO ANSWER IS NEVER
+// "ALL CANCELLED".
+//
+// cancel_all's bulk request can fail after it reached the wallet -- a timeout,
+// an empty or broken reply, an HTTP 5xx (rpc::cancel_possibly_submitted) --
+// and the wallet may still be running it.  cancel_all then sends nothing more,
+// puts every tracked id in `failed` and sets bulk_possibly_submitted.  With an
+// EMPTY local book there is no id to put in `failed` (the bulk endpoint names
+// none), so the flag is the only field that says anything went wrong: the same
+// shape as sweep_refused, which all_cancelled() already refuses to read as
+// success.  The two flags stay separate on purpose.  A refusal is an ANSWER --
+// the sweep did not run, so asking again at once is safe.  This is the absence
+// of one, and asking again at once is the duplicate spend.
+//
+// MUTATION: drop `&& !bulk_possibly_submitted` from all_cancelled() -> FAILS
+// here, on the empty-book assertion, and nowhere else.
+// NOT REACHED: cancel_all itself (S36; nothing in cpp/tests constructs an
+// OfferManager).  tests/test_rpc_retry_wiring.py pins that its
+// possibly-submitted branch issues no cancel_ids.
+// ---------------------------------------------------------------------------
+
+TEST(CancelOutcomePossiblySubmittedTest, NeverAllCancelledEvenWithAnEmptyBook) {
+    // The empty local book: nothing failed by id and nothing was refused --
+    // only the flag says the sweep may still be running.
+    OfferManager::CancelOutcome empty_book;
+    empty_book.last_error = "CURL transport failure: Timeout was reached";
+    empty_book.bulk_possibly_submitted = true;
+    ASSERT_TRUE(empty_book.failed.empty());
+    EXPECT_FALSE(empty_book.sweep_refused)
+        << "no answer is not a refusal; the two flags must stay distinct";
+    EXPECT_FALSE(empty_book.all_cancelled())
+        << "a sweep that may still be running has proved nothing cancelled";
+
+    // A tracked book: every id is reported failed as well.
+    OfferManager::CancelOutcome tracked = empty_book;
+    tracked.failed = {"offer-a", "offer-b"};
+    EXPECT_FALSE(tracked.all_cancelled());
+
+    // Control: nothing failed and nothing flagged is the one clean outcome.
+    EXPECT_TRUE(OfferManager::CancelOutcome{}.all_cancelled());
+}
+
+// ---------------------------------------------------------------------------
 // Ladder-preflight decision table (review round 9: these branches decide
 // whether an entire ladder disappears).
 // ---------------------------------------------------------------------------

@@ -51,10 +51,13 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
 #include "xop/execution/cancel_retry.hpp"
+#include "xop/rpc/chia_rpc.hpp"
 
 using namespace xop::execution;
 
@@ -934,4 +937,287 @@ TEST(CancelLadderState, ARefusedSweepSurvivesALaterPerIdAttempt)
            "refused over, so a later success cannot retire the refusal";
     EXPECT_EQ(l.stop_reason(), CancelStopReason::SweepRefused);
     EXPECT_FALSE(l.clean());
+}
+
+// ===========================================================================
+// [review 2026-09-13, round 2] A WALLET-WIDE SWEEP THAT GOT NO ANSWER.
+//
+// cancel_all's bulk request can fail AFTER the wallet received it: a timeout,
+// an empty or broken reply, an HTTP 5xx (rpc::cancel_possibly_submitted).  The
+// wallet may still be running it -- on 2026-09-12 the first request was still
+// writing cancel records 53 s after the send, 22 s after its timeout -- and in
+// chia 2.7.4 cancel_offers and cancel_offer both take the wallet state lock
+// while cancel_pending_offers does not check trade status.  A per-id retry
+// queued behind that sweep builds a SECOND, conflicting spend of an offer the
+// sweep already cancelled.
+//
+// So cancel_all sends nothing more and reports every tracked id failed with
+// bulk_possibly_submitted set, and the ladder:
+//   * sleeps at least cfg.possibly_submitted_wait_ms before the next attempt,
+//     clamped by the budget like any delay -- and when the budget cannot fit
+//     that wait plus min_useful_delay_ms it FINISHES (BudgetExhausted) rather
+//     than cancel again early;
+//   * makes that attempt re-check every offer first (needs_recheck), and hands
+//     cancel_ids only the ids partition_rechecked_offer puts in `recancel`;
+//   * keeps NoVerdict ids outstanding without cancelling them, drops resolved
+//     ids, and never calls a sweep that got no answer clean.
+//
+// NOT COVERED here, and pinned instead over the source text by
+// tests/test_rpc_retry_wiring.py (Engine and OfferManager are not constructible
+// in xop_tests): that cancel_all issues no cancel_ids after such a failure,
+// that the shutdown driver copies the flag and re-checks before cancel_ids,
+// and that the operator Cancel All path waits and re-checks the same way.
+// ===========================================================================
+
+namespace {
+
+constexpr const char* kTimeoutText =
+    "CURL transport failure: Timeout was reached";
+
+/// Attempt 1 as cancel_all reports a bulk request that timed out: nothing
+/// sent after it, every tracked id failed, the flag set.
+CancelAttemptOutcome possibly_submitted_sweep(
+    const std::vector<std::string>& ids)
+{
+    CancelAttemptOutcome oc{};
+    oc.failed                  = ids;
+    oc.last_error              = kTimeoutText;
+    oc.worst_class             = classify_take_failure(kTimeoutText);
+    oc.bulk_possibly_submitted = true;
+    return oc;
+}
+
+}  // namespace
+
+// MUTATION: plan_cancel_retry ignores CancelAttemptState::possibly_submitted
+// -> FAILS here (a 5 s sleep) and in
+// ABudgetThatCannotFitTheWaitFinishesWithoutAnAttempt, nowhere else.
+// MUTATION: CancelLadder::next() does not pass the flag to the policy -> the
+// same two tests FAIL.
+TEST(CancelLadderState, APossiblySubmittedSweepWaitsAtLeastOneRequestTimeout)
+{
+    const CancelRetryConfig cfg{};
+    CancelLadder l(kSevenIncidentOffers, cfg);
+    ASSERT_EQ(l.next(0).step, CancelLadderStep::Attempt);
+
+    // The sweep ran its whole request timeout and got no answer.
+    l.record(possibly_submitted_sweep(kSevenIncidentOffers));
+
+    const auto act = l.next(30'000);
+    ASSERT_EQ(act.step, CancelLadderStep::Sleep);
+    EXPECT_GE(act.delay_ms, cfg.possibly_submitted_wait_ms)
+        << "the next attempt must not start while the sweep may still be "
+           "running inside the wallet";
+    EXPECT_EQ(act.delay_ms, cfg.possibly_submitted_wait_ms)
+        << "the wait replaces the 5 s first backoff; it is not added to it";
+    EXPECT_EQ(act.attempt_index, 2u);
+    EXPECT_EQ(act.budget_left_ms,
+              cfg.budget_ms - 30'000u - cfg.possibly_submitted_wait_ms);
+}
+
+// MUTATION: drop the budget-fit check in plan_cancel_retry, so the wait is
+// clamped into the tail like any delay -> FAILS here, and nowhere else.
+TEST(CancelLadderState, ABudgetThatCannotFitTheWaitFinishesWithoutAnAttempt)
+{
+    const CancelRetryConfig cfg{};
+    // One millisecond short of the wait plus min_useful_delay_ms.
+    const std::uint32_t elapsed = cfg.budget_ms
+        - (cfg.possibly_submitted_wait_ms + cfg.min_useful_delay_ms) + 1u;
+
+    CancelLadder l(kSevenIncidentOffers, cfg);
+    ASSERT_EQ(l.next(0).step, CancelLadderStep::Attempt);
+    l.record(possibly_submitted_sweep(kSevenIncidentOffers));
+
+    const auto act = l.next(elapsed);
+    EXPECT_EQ(act.step, CancelLadderStep::Finish)
+        << "a wait clamped into the budget's tail is an early re-cancel of a "
+           "sweep that may still be running";
+    EXPECT_EQ(l.stop_reason(), CancelStopReason::BudgetExhausted)
+        << "the budget cannot fit the wait: that IS budget exhaustion, and "
+           "every consumer already treats it as unclean";
+    EXPECT_EQ(l.attempts(), 1u) << "no second attempt was authorised";
+    EXPECT_EQ(l.outstanding(), kSevenIncidentOffers)
+        << "the still-live ids go to the S31 fallback by name";
+    EXPECT_FALSE(l.clean());
+
+    // One millisecond more fits the wait exactly.
+    CancelLadder fits(kSevenIncidentOffers, cfg);
+    ASSERT_EQ(fits.next(0).step, CancelLadderStep::Attempt);
+    fits.record(possibly_submitted_sweep(kSevenIncidentOffers));
+    const auto ok = fits.next(elapsed - 1u);
+    EXPECT_EQ(ok.step, CancelLadderStep::Sleep);
+    EXPECT_GE(ok.delay_ms, cfg.possibly_submitted_wait_ms);
+}
+
+// MUTATION: record() never sets needs_recheck_ -> FAILS here, and nowhere
+// else.
+// MUTATION: record() drops the ids the re-check held back (NoVerdict) instead
+// of returning them to outstanding -> FAILS here, and nowhere else.
+// MUTATION: partition_rechecked_offer sends a Revived offer whose cancel is
+// already in flight to `recancel` -> FAILS here and in
+// CancelRecheckPartition.EachWalletVerdictLandsInExactlyOneBucket.
+TEST(CancelLadderState, TheAttemptAfterTheWaitReChecksBeforeItCancels)
+{
+    const CancelRetryConfig cfg{};
+    const auto& ids = kSevenIncidentOffers;
+    CancelLadder l(ids, cfg);
+    ASSERT_EQ(l.next(0).step, CancelLadderStep::Attempt);
+    EXPECT_FALSE(l.needs_recheck()) << "nothing has been sent yet";
+
+    l.record(possibly_submitted_sweep(ids));
+    EXPECT_TRUE(l.needs_recheck())
+        << "no id may be cancelled again before the wallet is asked about it";
+    EXPECT_TRUE(l.possibly_submitted());
+
+    ASSERT_EQ(l.next(30'000).step, CancelLadderStep::Sleep);
+    const auto second = l.next(30'000 + cfg.possibly_submitted_wait_ms);
+    ASSERT_EQ(second.step, CancelLadderStep::Attempt);
+    EXPECT_EQ(second.attempt_index, 2u);
+
+    // The wallet's answer for each of the seven, one of every shape.
+    RecheckPartition part;
+    partition_rechecked_offer(part, ids[0], TerminalRecheck::Revived, false);
+    partition_rechecked_offer(part, ids[1], TerminalRecheck::Revived, false);
+    partition_rechecked_offer(part, ids[2], TerminalRecheck::Revived,
+                              /*cancel_pending=*/true);
+    partition_rechecked_offer(part, ids[3], TerminalRecheck::Revived,
+                              /*cancel_pending=*/true);
+    partition_rechecked_offer(part, ids[4], TerminalRecheck::StillTerminal,
+                              false);
+    partition_rechecked_offer(part, ids[5], TerminalRecheck::Confirmed, false);
+    partition_rechecked_offer(part, ids[6], TerminalRecheck::NoVerdict, false);
+    l.record_recheck(std::move(part));
+
+    // cancel_ids is handed ONLY the two still live with no spend in flight.
+    EXPECT_EQ(l.outstanding(), (std::vector<std::string>{ids[0], ids[1]}));
+    EXPECT_EQ(l.already_pending(),
+              (std::vector<std::string>{ids[2], ids[3]}));
+    EXPECT_EQ(l.resolved_dead(), (std::vector<std::string>{ids[4]}));
+    EXPECT_EQ(l.resolved_filled(), (std::vector<std::string>{ids[5]}));
+
+    // The per-id attempt: one goes, one is refused on the sync flap.
+    CancelAttemptOutcome oc{};
+    oc.cancelled.push_back(ids[0]);
+    oc.failed.push_back(ids[1]);
+    oc.last_error  = kSyncRefusal;
+    oc.worst_class = TakeFailureClass::Unsynced;
+    l.record(std::move(oc));
+
+    // The refused offer AND the one the wallet gave no verdict for are still
+    // live as far as this ladder knows.
+    EXPECT_EQ(l.outstanding(), (std::vector<std::string>{ids[1], ids[6]}));
+    EXPECT_EQ(l.submitted(), (std::vector<std::string>{ids[0]}));
+    EXPECT_TRUE(l.needs_recheck())
+        << "sticky: no retry on this ladder cancels an id without asking "
+           "first";
+    EXPECT_FALSE(l.clean());
+
+    // Every id is in exactly one place.
+    EXPECT_EQ(l.outstanding().size() + l.submitted().size()
+                  + l.already_pending().size() + l.resolved_dead().size()
+                  + l.resolved_filled().size(),
+              ids.size());
+}
+
+// An ANSWER from the wallet is not a sweep that may still be running: a
+// refusal keeps today's first retry delay and needs no re-check.
+TEST(CancelLadderState, AnOrdinaryRefusalKeepsTodaysDelays)
+{
+    const CancelRetryConfig cfg{};
+    CancelLadder l(kSevenIncidentOffers, cfg);
+    ASSERT_EQ(l.next(0).step, CancelLadderStep::Attempt);
+
+    CancelAttemptOutcome oc{};
+    oc.failed      = kSevenIncidentOffers;
+    oc.last_error  = kSyncRefusal;
+    oc.worst_class = TakeFailureClass::Unsynced;
+    l.record(std::move(oc));
+
+    const auto act = l.next(0);
+    ASSERT_EQ(act.step, CancelLadderStep::Sleep);
+    EXPECT_EQ(act.delay_ms, cfg.base_delay_ms);
+    EXPECT_FALSE(l.needs_recheck());
+    EXPECT_FALSE(l.possibly_submitted());
+    EXPECT_EQ(l.next(act.delay_ms).step, CancelLadderStep::Attempt);
+}
+
+// The empty local book: the sweep got no answer and no tracked id exists to
+// re-check, so there is no wait and no second attempt -- and still no clean
+// stop.
+//
+// MUTATION: record() takes its Done branch for an empty `failed` after a
+// sweep that got no answer -> FAILS here, and nowhere else.
+TEST(CancelLadderState, AnUnansweredSweepOfAnEmptyBookIsNotACleanStop)
+{
+    CancelLadder swept(std::vector<std::string>{}, CancelRetryConfig{},
+                       /*sweep_when_empty=*/true);
+    ASSERT_EQ(swept.next(0).step, CancelLadderStep::Attempt);
+
+    swept.record(possibly_submitted_sweep({}));
+
+    EXPECT_TRUE(swept.outstanding().empty());
+    EXPECT_EQ(swept.stop_reason(), CancelStopReason::SweepPossiblySubmitted);
+    EXPECT_FALSE(swept.sweep_refused()) << "no answer is not a refusal";
+    EXPECT_FALSE(swept.clean())
+        << "a sweep that may still be running has proved nothing empty";
+
+    EXPECT_EQ(swept.next(1'000).step, CancelLadderStep::Finish);
+    EXPECT_EQ(swept.stop_reason(), CancelStopReason::SweepPossiblySubmitted);
+    EXPECT_FALSE(swept.clean());
+    EXPECT_STREQ(xop::execution::to_string(
+                     CancelStopReason::SweepPossiblySubmitted),
+                 "wallet-wide-sweep-possibly-submitted");
+}
+
+// MUTATION: send a Revived offer whose cancel is already in flight to
+// `recancel` -> FAILS here and in TheAttemptAfterTheWaitReChecksBeforeItCancels.
+TEST(CancelRecheckPartition, EachWalletVerdictLandsInExactlyOneBucket)
+{
+    RecheckPartition p;
+    partition_rechecked_offer(p, "live", TerminalRecheck::Revived, false);
+    partition_rechecked_offer(p, "spending", TerminalRecheck::Revived, true);
+    partition_rechecked_offer(p, "dead", TerminalRecheck::StillTerminal, false);
+    partition_rechecked_offer(p, "dead-p", TerminalRecheck::StillTerminal, true);
+    partition_rechecked_offer(p, "filled", TerminalRecheck::Confirmed, false);
+    partition_rechecked_offer(p, "filled-p", TerminalRecheck::Confirmed, true);
+    partition_rechecked_offer(p, "silent", TerminalRecheck::NoVerdict, false);
+    partition_rechecked_offer(p, "silent-p", TerminalRecheck::NoVerdict, true);
+
+    EXPECT_EQ(p.recancel, (std::vector<std::string>{"live"}))
+        << "only an offer live with no cancel spend in flight is cancelled "
+           "again";
+    EXPECT_EQ(p.already_pending, (std::vector<std::string>{"spending"}))
+        << "PENDING_CANCEL: a second secure cancel builds a second spend and "
+           "pays a second fee";
+    EXPECT_EQ(p.dead, (std::vector<std::string>{"dead", "dead-p"}));
+    EXPECT_EQ(p.filled, (std::vector<std::string>{"filled", "filled-p"}))
+        << "CONFIRMED is a FILL: never cancelled again, never stamped "
+           "cancelled";
+    EXPECT_EQ(p.unknown, (std::vector<std::string>{"silent", "silent-p"}))
+        << "no verdict is no evidence either way";
+}
+
+// MUTATION: make wait_after_possibly_submitted_ms ignore the request timeout
+// (the margin alone) -> FAILS here, and nowhere else.
+TEST(CancelRetry, ThePossiblySubmittedWaitIsOneRequestTimeoutPlusAMargin)
+{
+    EXPECT_EQ(kPossiblySubmittedWaitMarginMs, 5'000u);
+    EXPECT_EQ(wait_after_possibly_submitted_ms(30'000), 35'000u);
+    EXPECT_EQ(wait_after_possibly_submitted_ms(12'000), 17'000u);
+
+    // The default assumes the wallet client's own default timeout; the
+    // engine passes its client's real one.
+    EXPECT_EQ(static_cast<std::int64_t>(kDefaultWalletRequestTimeoutMs),
+              static_cast<std::int64_t>(
+                  xop::rpc::ChiaRPCConfig{}.request_timeout.count()));
+    EXPECT_EQ(CancelRetryConfig{}.possibly_submitted_wait_ms,
+              wait_after_possibly_submitted_ms(
+                  xop::rpc::ChiaRPCConfig{}.request_timeout.count()));
+
+    // Never negative, never wrapped.
+    EXPECT_EQ(wait_after_possibly_submitted_ms(-1),
+              kPossiblySubmittedWaitMarginMs);
+    EXPECT_EQ(wait_after_possibly_submitted_ms(
+                  std::numeric_limits<std::int64_t>::max()),
+              std::numeric_limits<std::uint32_t>::max());
 }

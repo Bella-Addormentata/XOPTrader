@@ -53,6 +53,7 @@
 #include "xop/execution/coin_lock_ledger.hpp"
 #include "xop/execution/offer_expiry.hpp"
 #include "xop/execution/take_retry.hpp"
+#include "xop/execution/terminal_recheck.hpp"
 #include <spdlog/spdlog.h>
 
 #include <chrono>
@@ -195,27 +196,8 @@ struct RebalanceSnapshot {
  *   6. Cancel stale offers (block-based TTL) or all offers on shutdown.
  *   7. Evaluate rebalancing triggers and return them to the engine.
  */
-/// [S25 2026-08-24] Verdict from OfferManager::recheck_terminal().
-enum class TerminalRecheck {
-    /// Wallet still reports CANCELLED/FAILED -- the buffered cancellation
-    /// may be written.
-    StillTerminal,
-    /// Wallet reports a recognised PENDING state again.  The offer has
-    /// been re-adopted into State by recheck_terminal; discard the
-    /// buffered write.
-    Revived,
-    /// Wallet reports CONFIRMED -- the observation was reorged into a
-    /// FILL.  recheck_terminal has put the offer back into State so
-    /// detect_fills() can record it; the caller must NOT write a
-    /// cancellation.
-    Confirmed,
-    /// Wallet unreachable, or its status is one this build does not
-    /// recognise.  NOT a verdict: the caller must retry rather than
-    /// assume any of the above.  An unknown code is specifically NOT
-    /// treated as "live" -- that would discard a one-way cancellation on
-    /// no evidence.
-    NoVerdict,
-};
+// TerminalRecheck, the verdict recheck_terminal() returns, is defined in
+// execution/terminal_recheck.hpp [review 2026-09-13, round 2].
 
 class OfferManager {
 public:
@@ -439,12 +421,34 @@ public:
         /// nothing to put in `failed`, and an empty `failed` read as success
         /// everywhere downstream. See CancelAttemptOutcome::sweep_refused.
         bool                     sweep_refused{false};
+        /// [review 2026-09-13, round 2] True when the wallet-wide sweep FAILED
+        /// AFTER IT MAY HAVE REACHED THE WALLET -- a timeout, an empty or
+        /// broken reply, an HTTP 5xx (rpc::cancel_possibly_submitted) -- so the
+        /// wallet may have run it, may still be running it, or may never have
+        /// received it.
+        ///
+        /// cancel_all then sends NOTHING more: every tracked id is in
+        /// `failed`, and no per-offer cancel goes out, because in chia 2.7.4 a
+        /// per-offer cancel queued behind a sweep that is still running builds
+        /// a second, conflicting spend of an offer the sweep already
+        /// cancelled.  The caller waits at least one request timeout and
+        /// re-checks each offer (execution::partition_rechecked_offer) before
+        /// it cancels any.
+        ///
+        /// HOW IT DIFFERS FROM sweep_refused.  A refusal is an ANSWER: the
+        /// sweep did not run, and sending it again at once is safe.  This is
+        /// the absence of one, and sending again at once is the duplicate.
+        /// Both leave the untracked wallet book unproven, and neither is ever
+        /// all_cancelled(): with an EMPTY local book this flag is the only
+        /// field that says anything went wrong.  cancel_all never sets both.
+        bool                     bulk_possibly_submitted{false};
 
         [[nodiscard]] bool all_cancelled() const noexcept
         {
             // [S33 2026-09-12] A refused wallet-wide sweep is NOT "all
             // cancelled" merely because it named no ids to fail.
-            return failed.empty() && !sweep_refused;
+            // [review 2026-09-13, round 2] Nor is one that got no answer.
+            return failed.empty() && !sweep_refused && !bulk_possibly_submitted;
         }
     };
 
@@ -492,6 +496,12 @@ public:
      * Uses the wallet's cancel_offers() bulk endpoint with secure=true
      * to guarantee all locked coins are released on-chain.  Falls back to a
      * per-offer loop when the bulk call is refused.
+     *
+     * [review 2026-09-13, round 2] But NOT when it failed after it may have
+     * reached the wallet (rpc::cancel_possibly_submitted): then nothing more
+     * is sent, every tracked id is returned in `failed`, and
+     * CancelOutcome::bulk_possibly_submitted tells the caller to wait and
+     * re-check each offer before it cancels any.
      *
      * @param deadline Passed through to the per-offer fallback loop. The
      *        fallback is not a rare path -- it is the one the 2026-09-02

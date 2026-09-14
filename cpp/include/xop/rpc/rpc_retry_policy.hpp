@@ -36,33 +36,37 @@
 // an empty reply, a partial transfer and an HTTP 5xx can each follow a
 // request the wallet has already acted on, so they surface to the caller.
 //
-// WHO GETS THAT FAILURE.  This layer only stops the automatic copy.  Every
-// caller still reads a surfaced timeout as a refusal, never as "possibly
-// still running" -- and now gets it about 30 s after the send, where before
-// it got it only once the re-sends ran out (up to four 30 s attempts plus
-// 3.5 s of backoff, ~124 s):
+// WHO GETS THAT FAILURE.  This layer only stops the automatic copy.  The
+// failure now reaches the caller about 30 s after the send, where before it
+// arrived only once the re-sends ran out (up to four 30 s attempts plus 3.5 s
+// of backoff, ~124 s).  [review 2026-09-13, round 2] cancel_possibly_submitted
+// below tells "no answer" apart from "refused", and the cancel_all path acts
+// on it:
 //
-//   OfferManager::cancel_all   falls back to per-id cancel_offer calls for
-//                              the offers it tracks.  Those can queue behind
-//                              a bulk request that is still running and then
-//                              spend the same offer coins again.
-//   the S46 shutdown ladder    retries the survivors per id from attempt 2,
-//                              and ends in the S31 path below if it stops
-//                              with offers still live or the sweep refused.
-//   the S31 dead man's switch  (Engine::watchdog_cancel_book) makes ONE
-//                              attempt on its own client, then reports FAILED
-//                              and tells the operator to cancel by hand,
-//                              although the sweep may still be running.
+//   OfferManager::cancel_all   sends NOTHING more after a possibly-submitted
+//                              failure: every tracked id comes back failed,
+//                              with CancelOutcome::bulk_possibly_submitted.
+//                              A refusal, or a failure before the request was
+//                              written, still falls back to per-id
+//                              cancel_offer calls at once.
+//   the S46 shutdown ladder    then waits at least one request timeout plus a
+//                              margin, re-checks every offer, and re-cancels
+//                              only the ones still live
+//                              (execution/cancel_retry.hpp).  It ends in the
+//                              S31 path below if it stops with offers still
+//                              live or the sweep unproven.
+//   operator Cancel All        waits the same way with cancel_all_inflight_
+//                              held, then re-checks and re-cancels.
+//   the S31 dead man's switch  (Engine::watchdog_cancel_book) is unchanged:
+//                              ONE attempt on its own client, then FAILED and
+//                              "cancel by hand", although the sweep may still
+//                              be running.
 //   XCH recovery               (Engine::step_xch_recovery, with
-//                              recovery.cancel_on_enter set) sends the
-//                              wallet-wide cancel_offers AGAIN on its next
-//                              block while recovery lasts.  That copy can
-//                              overlap a first request that has not finished
-//                              -- the duplicate this header exists to stop,
-//                              made one layer up.
-//
-// Telling "no answer yet" apart from "refused" is a change for those callers,
-// and this header does not make it.
+//                              recovery.cancel_on_enter set) is unchanged: it
+//                              sends the wallet-wide cancel_offers AGAIN on
+//                              its next block while recovery lasts, and that
+//                              copy can overlap a first request that has not
+//                              finished.
 //
 // DELIBERATELY CONSERVATIVE.  A connect-phase timeout (CURLOPT_CONNECTTIMEOUT_MS)
 // also reports CURLE_OPERATION_TIMEDOUT, which this layer cannot tell apart
@@ -129,6 +133,50 @@ enum class RpcRetryPolicy {
             && (rc == CURLE_COULDNT_CONNECT || rc == CURLE_SSL_CONNECT_ERROR);
     }
     return transient;
+}
+
+/// Did a cancel that FAILED possibly reach the wallet's handler -- so that
+/// the wallet may have run it, or may still be running it?
+///
+/// [review 2026-09-13, round 2] may_resend() above stops rpc_post sending a
+/// cancel twice.  This stops its CALLER doing the same one layer up:
+/// OfferManager::cancel_all used to answer any failed wallet-wide sweep with
+/// per-offer cancel_offer calls at once.  In chia 2.7.4 cancel_offers and
+/// cancel_offer both take the wallet state lock, and
+/// TradeManager.cancel_pending_offers builds spends without checking trade
+/// status, so a per-offer cancel queued behind a sweep that is still running
+/// builds a SECOND, conflicting spend of an offer the sweep already cancelled
+/// -- and neither bundle can replace the other.
+///
+/// TRUE when the failure can follow a request the handler received: a
+/// timeout, an empty reply, a send or receive error, a partial transfer, or
+/// an HTTP 5xx.  FALSE for every other code: those fail before the request
+/// is written (no connection, a failed TLS handshake, a bad URL), and any
+/// other HTTP status is an answer.
+///
+/// A CONNECT-PHASE TIMEOUT IS CLASSED AS POSSIBLY SUBMITTED ON PURPOSE.
+/// CURLOPT_CONNECTTIMEOUT_MS (3 s on localhost, chia_rpc.cpp) reports the
+/// same CURLE_OPERATION_TIMEDOUT as a response that never came, and nothing
+/// here can tell the two apart.  The two mistakes do not cost the same: a
+/// cancel that never left, misread as possibly submitted, costs one wait and
+/// one re-check before the offers still live are cancelled; a cancel that
+/// arrived, misread as never sent, builds a duplicate spend that cannot be
+/// called back.
+[[nodiscard]] constexpr bool cancel_possibly_submitted(
+    CURLcode rc, long http_code) noexcept
+{
+    switch (rc) {
+        case CURLE_OPERATION_TIMEDOUT:
+        case CURLE_GOT_NOTHING:
+        case CURLE_SEND_ERROR:
+        case CURLE_RECV_ERROR:
+        case CURLE_PARTIAL_FILE:
+            return true;
+        case CURLE_OK:
+            return http_code >= 500;
+        default:
+            return false;
+    }
 }
 
 }  // namespace xop::rpc

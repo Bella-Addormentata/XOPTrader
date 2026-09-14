@@ -218,6 +218,19 @@ public:
      */
     [[nodiscard]] bool is_open() const noexcept;
 
+    /**
+     * @brief The per-request timeout this client enforces.
+     *
+     * [review 2026-09-13, round 2] A caller that must wait out a request
+     * which may still be running inside the wallet sizes that wait from the
+     * client it sent the request through
+     * (execution::wait_after_possibly_submitted_ms), not from a default.
+     */
+    [[nodiscard]] std::chrono::milliseconds request_timeout() const noexcept
+    {
+        return config_.request_timeout;
+    }
+
 protected:
     /**
      * @brief Construct with an io_context reference and endpoint config.

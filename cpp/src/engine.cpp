@@ -1624,7 +1624,14 @@ void Engine::shutdown()
                         std::min<std::int64_t>(d, 0xFFFF'FFFF));
                 };
 
-                const execution::CancelRetryConfig retry_cfg{};
+                // [review 2026-09-13, round 2] The least wait before retrying
+                // after a wallet-wide sweep that got NO ANSWER is one request
+                // timeout of THIS wallet client plus a margin, read from the
+                // client rather than assumed (cancel_retry.hpp).
+                execution::CancelRetryConfig retry_cfg{};
+                retry_cfg.possibly_submitted_wait_ms =
+                    execution::wait_after_possibly_submitted_ms(
+                        wallet_->request_timeout().count());
                 // The hard wall-clock stop, handed INTO cancel_ids so the
                 // budget bounds the RPCs and not merely the sleeps between
                 // them. Without this the loop re-checked the clock only after
@@ -1712,6 +1719,47 @@ void Engine::shutdown()
                         continue;
                     }
 
+                    // [review 2026-09-13, round 2] THE RETRY AFTER A SWEEP
+                    // THAT GOT NO ANSWER. The ladder has already made this
+                    // attempt wait at least one request timeout, and the
+                    // sweep may still have run: a per-id cancel of an offer
+                    // it already cancelled builds a second, conflicting
+                    // spend. So ask the wallet about every outstanding offer
+                    // FIRST, and hand cancel_ids only the ones it reports
+                    // live with no cancel spend in flight. needs_recheck()
+                    // stays set for every later retry of this ladder.
+                    // Probing stops at the deadline, and an offer left
+                    // unasked is a NoVerdict: kept outstanding, never
+                    // cancelled blind.
+                    if (ladder.needs_recheck()) {
+                        const BlockHeight recheck_block =
+                            last_block_.load(std::memory_order_relaxed);
+                        execution::RecheckPartition part;
+                        for (const auto& id : ladder.outstanding()) {
+                            execution::TerminalRecheck verdict =
+                                execution::TerminalRecheck::NoVerdict;
+                            if (std::chrono::steady_clock::now()
+                                < cancel_deadline) {
+                                verdict = co_await offer_mgr_->recheck_terminal(
+                                    id, recheck_block);
+                            }
+                            execution::partition_rechecked_offer(
+                                part, id, verdict,
+                                state_->get_offer(id).cancel_pending);
+                        }
+                        spdlog::warn(
+                            "[Engine] [S46] attempt {} follows a wallet-wide "
+                            "sweep that got no answer -- re-checked {} "
+                            "offer(s): {} still live, {} already cancelling, "
+                            "{} cancelled or failed, {} FILLED, {} with no "
+                            "verdict (kept outstanding, not cancelled)",
+                            act.attempt_index, ladder.outstanding().size(),
+                            part.recancel.size(), part.already_pending.size(),
+                            part.dead.size(), part.filled.size(),
+                            part.unknown.size());
+                        ladder.record_recheck(std::move(part));
+                    }
+
                     // The first attempt keeps the bulk endpoint (one RPC for
                     // the whole book, the cheap path). Every retry goes
                     // per-id, because the bulk endpoint takes no offer id at
@@ -1739,6 +1787,10 @@ void Engine::shutdown()
                     // with an EMPTY `failed` (the bulk endpoint names no ids),
                     // which record() would read as "nothing left -- Done".
                     res.sweep_refused   = oc.sweep_refused;
+                    // [review 2026-09-13, round 2] Without this the ladder
+                    // reads a sweep that got no answer as a refusal, and its
+                    // next attempt cancels every id again at once.
+                    res.bulk_possibly_submitted = oc.bulk_possibly_submitted;
                     ladder.record(std::move(res));
                 }
 
@@ -1774,6 +1826,17 @@ void Engine::shutdown()
                 // on a count comparison. `cancelled.size() < pending_before`
                 // was never the question; "is anything still resting" is.
                 if (!outstanding.empty()) {
+                    if (ladder.possibly_submitted()) {
+                        // [review 2026-09-13, round 2] Say why these ids may
+                        // not be what they look like.
+                        spdlog::warn(
+                            "[Engine] [S46] the wallet-wide sweep got NO "
+                            "ANSWER during this stop: {} offer(s) are still "
+                            "believed live, but a sweep that was still running "
+                            "may have cancelled some of them since they were "
+                            "last asked about",
+                            outstanding.size());
+                    }
                     spdlog::critical(
                         "[Engine] [S31] graceful cancellation got {}/{} after "
                         "{} attempt(s) in {} ms, stopped because {} (last "
@@ -1839,6 +1902,32 @@ void Engine::shutdown()
                         "wallet-wide cancel was refused and no locally "
                         "tracked offer ids exist to retry individually",
                         outstanding);
+                } else if (stop_reason ==
+                           execution::CancelStopReason::SweepPossiblySubmitted) {
+                    // [review 2026-09-13, round 2] Nothing is outstanding, but
+                    // the wallet-wide sweep got NO ANSWER: every tracked offer
+                    // is resolved, cancelled or already cancelling, and the
+                    // untracked book is as unproven as after a refusal.
+                    // Without this branch the stop would fall through to "All
+                    // outstanding offers cancelled". The S31 path runs as it
+                    // does after a refusal: it is wallet-wide, so a duplicate
+                    // of a sweep that did run strands no untracked offer --
+                    // though it can still report FAILED while that sweep is
+                    // running.
+                    spdlog::critical(
+                        "[Engine] [S33] the wallet-wide sweep got NO ANSWER "
+                        "after {} attempt(s) in {} ms (last error: {}): it may "
+                        "have run, may still be running, or may never have "
+                        "arrived. No tracked offer is still believed live, but "
+                        "offers this process never tracked may still be "
+                        "RESTING",
+                        attempts, elapsed_ms(),
+                        last_error.empty() ? "none" : last_error);
+                    watchdog_cancel_book(
+                        "graceful shutdown could not confirm the wallet-wide "
+                        "sweep: it got no answer, and the offers this process "
+                        "never tracked are unverified",
+                        outstanding);
                 } else if (bulk_submitted) {
                     spdlog::info("[Engine] All outstanding offers SUBMITTED "
                                  "for cancel via the bulk endpoint -- the "
@@ -1847,6 +1936,33 @@ void Engine::shutdown()
                     spdlog::info("[Engine] All outstanding offers cancelled "
                                  "({} attempt(s), {} ms)",
                                  attempts, elapsed_ms());
+                }
+
+                // [review 2026-09-13, round 2] Offers a re-check found
+                // already resolved left the ladder. Handle them exactly as
+                // sweep_cancel_intent does. The wallet says CANCELLED or
+                // FAILED: stamp the row and drop the intent. The wallet says
+                // CONFIRMED: it FILLED, so drop the intent and do NOT stamp
+                // it cancelled -- its offer_log row stays pending, which the
+                // next engine restores at boot and books through the fill
+                // path.
+                for (const auto& id : ladder.resolved_dead()) {
+                    cancel_intent_.erase(id);
+                    try {
+                        db_->update_offer_status(id, "cancelled", 0,
+                                                 "shutdown_recheck");
+                    } catch (const std::exception& e) {
+                        spdlog::debug("[Engine] [S46] shutdown re-check could "
+                                      "not stamp {}: {}", id.substr(0, 12),
+                                      e.what());
+                    }
+                }
+                for (const auto& id : ladder.resolved_filled()) {
+                    cancel_intent_.erase(id);
+                    spdlog::warn("[Engine] [S46] offer {} FILLED before the "
+                                 "cancel landed -- NOT stamped cancelled; the "
+                                 "next engine restores it and books the fill",
+                                 id.substr(0, 12));
                 }
 
                 // [review] Record HOW FAR each id got, so the next boot can
@@ -19630,8 +19746,96 @@ void Engine::check_cancel_all_flag()
     asio::co_spawn(
         ioc_,
         [this]() -> asio::awaitable<void> {
+            // [review 2026-09-13, round 2] Cleared on EVERY way out of this
+            // coroutine -- any exception, or the frame destroyed while it is
+            // suspended -- not only after the catch below. The branch for a
+            // sweep that got no answer suspends for a request timeout and
+            // more, and a flag left set defers the intent sweep, shutdown and
+            // every later Cancel All for the life of the process.
+            struct InflightGuard {
+                bool* flag;
+                ~InflightGuard() { *flag = false; }
+            } inflight_guard{&cancel_all_inflight_};
             try {
                 auto done = co_await offer_mgr_->cancel_all();
+                // [review 2026-09-13, round 2] A WALLET-WIDE SWEEP THAT GOT NO
+                // ANSWER. cancel_all has sent nothing more -- every tracked id
+                // is in `failed` -- because the sweep may still be running
+                // inside the wallet, and a per-id cancel queued behind it
+                // builds a second, conflicting spend of an offer it already
+                // cancelled. Wait at least one request timeout of this wallet
+                // client, with cancel_all_inflight_ still set so the heartbeat
+                // intent sweep and every other cancel path stay deferred; then
+                // ask the wallet about each offer and cancel only the ones it
+                // still reports live with no cancel spend in flight. Offers
+                // the wallet reports resolved keep their Ordered intent: the
+                // heartbeat intent sweep, which runs once this clears the
+                // flag, stamps a cancelled one and hands a filled one to the
+                // fill path, as it does for any recovered intent.
+                if (done.bulk_possibly_submitted) {
+                    const std::uint32_t wait_ms =
+                        execution::wait_after_possibly_submitted_ms(
+                            wallet_->request_timeout().count());
+                    spdlog::warn(
+                        "[Engine] [CANCELALL] the wallet-wide sweep got NO "
+                        "ANSWER ({}) and may still be running -- sending "
+                        "nothing for {} ms, then re-checking {} tracked "
+                        "offer(s) before any is cancelled again",
+                        done.last_error.empty() ? "no error text"
+                                                : done.last_error,
+                        wait_ms, done.failed.size());
+                    asio::steady_timer wait_timer(ioc_);
+                    wait_timer.expires_after(std::chrono::milliseconds(wait_ms));
+                    co_await wait_timer.async_wait(asio::use_awaitable);
+
+                    const BlockHeight recheck_block =
+                        last_block_.load(std::memory_order_relaxed);
+                    execution::RecheckPartition part;
+                    for (const auto& id : done.failed) {
+                        const execution::TerminalRecheck verdict =
+                            co_await offer_mgr_->recheck_terminal(
+                                id, recheck_block);
+                        execution::partition_rechecked_offer(
+                            part, id, verdict,
+                            state_->get_offer(id).cancel_pending);
+                    }
+                    auto again = co_await offer_mgr_->cancel_ids(part.recancel);
+
+                    // Fold it back in, so the tagging and the logging below
+                    // see what is true now: what the re-cancel took, what was
+                    // already cancelling, and what is still live -- the
+                    // refused ids and the ones with no verdict.
+                    const std::size_t recancelled = again.cancelled.size();
+                    for (auto& id : again.cancelled) {
+                        done.cancelled.push_back(std::move(id));
+                    }
+                    for (auto& id : part.already_pending) {
+                        done.already_pending.push_back(std::move(id));
+                    }
+                    for (auto& id : again.already_pending) {
+                        done.already_pending.push_back(std::move(id));
+                    }
+                    done.failed = std::move(again.failed);
+                    for (auto& id : part.unknown) {
+                        done.failed.push_back(std::move(id));
+                    }
+                    if (!again.last_error.empty()) {
+                        done.last_error  = std::move(again.last_error);
+                        done.worst_class = again.worst_class;
+                    }
+                    spdlog::critical(
+                        "[Engine] [CANCELALL] after the wallet-wide sweep "
+                        "that got no answer: {} re-cancelled, {} already "
+                        "cancelling, {} resolved by the wallet ({} cancelled "
+                        "or failed, {} FILLED; the intent sweep records "
+                        "them), {} with no verdict. The sweep itself is "
+                        "UNCONFIRMED: offers this process never tracked may "
+                        "still be RESTING",
+                        recancelled, done.already_pending.size(),
+                        part.dead.size() + part.filled.size(),
+                        part.dead.size(), part.filled.size(),
+                        part.unknown.size());
+                }
                 spdlog::warn("[Engine] [CANCELALL] {} offer(s) submitted "
                              "for cancel", done.cancelled.size());
                 // [S33 2026-09-12] The one outcome this path could not see.
@@ -19689,8 +19893,12 @@ void Engine::check_cancel_all_flag()
                 spdlog::critical("[Engine] [CANCELALL] FAILED: {} -- offers "
                                  "may still be resting; the TTL sweep keeps "
                                  "draining them", e.what());
+            } catch (...) {
+                spdlog::critical("[Engine] [CANCELALL] FAILED with a "
+                                 "non-standard exception -- offers may still "
+                                 "be resting; the TTL sweep keeps draining "
+                                 "them");
             }
-            cancel_all_inflight_ = false;
             co_return;
         },
         asio::detached);

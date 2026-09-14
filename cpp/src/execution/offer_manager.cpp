@@ -27,6 +27,7 @@
 #include <xop/execution/stuck_tx_verdict.hpp>
 #include <xop/execution/wallet_poll_throttle.hpp>
 #include <xop/risk/watchdog.hpp>
+#include <xop/rpc/rpc_retry_policy.hpp>
 
 #include <algorithm>
 #include <cctype>
@@ -1497,11 +1498,21 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(
 
     // Attempt bulk cancellation first (wallet cancel_offers endpoint).
     bool bulk_ok = false;
+    // [review 2026-09-13, round 2] The sweep failed AFTER it may have reached
+    // the wallet (rpc::cancel_possibly_submitted).
+    bool bulk_possibly_submitted = false;
     std::string bulk_err;
     try {
         co_await cancel_offers_charged(
             current_fee_mojos_, /*secure=*/true, reserve_n);
         bulk_ok = true;
+    } catch (const rpc::ChiaRPCTransportError& e) {
+        // BEFORE the base-class handler, which would take this too.  A
+        // transport failure is not one thing: a connect failure never reached
+        // the wallet, while a timeout or a 5xx may have.
+        bulk_err = e.what();
+        bulk_possibly_submitted =
+            rpc::cancel_possibly_submitted(e.curl_code(), e.http_code());
     } catch (const rpc::ChiaRPCError& e) {
         bulk_err = e.what();
     }
@@ -1517,6 +1528,39 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(
         out.cancelled.reserve(all_offers.size());
         for (const auto& po : all_offers) {
             out.cancelled.push_back(po.offer_id);
+        }
+    } else if (bulk_possibly_submitted) {
+        // [review 2026-09-13, round 2] NO ANSWER IS NOT A REFUSAL.  The sweep
+        // may have run, may still be running inside the wallet, or may never
+        // have arrived, and nothing here says which.  In chia 2.7.4
+        // cancel_offers and cancel_offer both take the wallet state lock, and
+        // cancel_pending_offers does not check trade status, so the per-offer
+        // fallback further down would queue behind a sweep that is still
+        // running and build a SECOND, conflicting spend of every offer it
+        // already cancelled.  So send nothing more: every tracked id is
+        // reported still live, and the caller waits at least one request
+        // timeout and re-checks each offer before it cancels any
+        // (CancelLadder::needs_recheck at shutdown, and the operator path in
+        // Engine::check_cancel_all_flag).
+        //
+        // THE EMPTY LOCAL BOOK.  `failed` is then empty -- the bulk endpoint
+        // names no offer id -- so bulk_possibly_submitted is the only field
+        // that says anything went wrong, exactly as sweep_refused is for a
+        // refusal, and all_cancelled() reads it.  It is NOT folded into
+        // sweep_refused: a refusal is an answer, after which sending the
+        // sweep again at once is safe.  After this, sending again at once is
+        // the duplicate.
+        logger_->warn("cancel_all: bulk cancel_offers got NO ANSWER ({}) -- "
+                      "the wallet-wide sweep may still be running.  NOT "
+                      "falling back to individual cancellation: nothing is "
+                      "sent again until each of the {} tracked offer(s) is "
+                      "re-checked", bulk_err, all_offers.size());
+        out.bulk_possibly_submitted = true;
+        out.last_error  = bulk_err;
+        out.worst_class = execution::classify_take_failure(bulk_err);
+        out.failed.reserve(all_offers.size());
+        for (const auto& po : all_offers) {
+            out.failed.push_back(po.offer_id);
         }
     } else if (all_offers.empty()) {
         // [S33 2026-09-12] There is no per-offer fallback to take: the ids the
@@ -1570,9 +1614,15 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(
         // wallet-wide, but the ids it touched were never ours, so a count of
         // "offers cancelled" here would be invented.  bulk_submitted carries
         // the acceptance; `cancelled` stays empty on purpose.
+        // [review 2026-09-13, round 2] Three outcomes, not two: a sweep that
+        // got no answer was not refused.
         logger_->info("cancel_all: no locally tracked offers -- wallet-wide "
                       "sweep {}; the ids it covered are not known to this "
-                      "process", bulk_ok ? "SUBMITTED" : "REFUSED");
+                      "process",
+                      bulk_ok                   ? "SUBMITTED"
+                      : bulk_possibly_submitted ? "UNANSWERED (it may still "
+                                                  "be running)"
+                                                : "REFUSED");
     } else {
         logger_->info("cancel_all: {}/{} offers cancelled successfully",
                       out.cancelled.size(), all_offers.size());
