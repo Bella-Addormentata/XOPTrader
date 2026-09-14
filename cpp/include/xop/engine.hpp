@@ -1069,9 +1069,10 @@ private:
     /// [review 2026-09-13, round 4] When operator Cancel All last saw its
     /// wallet-wide sweep get no usable answer, and which tracked offers State
     /// already had a cancel in flight for just before that sweep.  shutdown()
-    /// reads both: a stop within one wait of that sweep sends no second
-    /// wallet-wide sweep, and those offers are no evidence the sweep ran.
-    /// ioc_ thread only, like cancel_all_inflight_.
+    /// reads both: a stop while that branch runs sends no second wallet-wide
+    /// sweep before the rest of the wait, and those offers are no evidence the
+    /// sweep ran.  [round 5] The branch clears both when it ends any way other
+    /// than a shutdown request.  ioc_ thread only, like cancel_all_inflight_.
     std::optional<std::chrono::steady_clock::time_point> unanswered_sweep_at_;
     std::unordered_set<std::string> unanswered_sweep_pending_before_;
     /// [R2 #20] Durable engine-side gate: true from the operator's

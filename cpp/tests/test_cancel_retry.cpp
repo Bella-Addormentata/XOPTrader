@@ -1454,15 +1454,24 @@ TEST(CancelRetry, TheOperatorPathWaitsAgainOnlyWhileTheSweepRunsAndTheDeadlineAl
               0u);
 }
 
-// [review 2026-09-13, round 4] N1. A stop that lands within one wait of an
-// operator sweep that got no usable answer owes only the rest of that wait,
-// never less than min_useful_delay_ms.  With no such sweep, or once a full
-// wait has passed, it owes nothing and attempt 1 goes out as usual.
-TEST(CancelRetry, AStopWithinOneWaitOfAnUnansweredSweepOwesOnlyTheRestOfIt)
+// [review 2026-09-13, round 4] N1, and [round 5] for the operator branch's
+// whole life.  A stop while operator Cancel All's no-answer branch runs --
+// until its deadline, the wait plus the retry budget -- owes the rest of the
+// wait, never less than min_useful_delay_ms; the ladder's ordinary first
+// backoff still applies on top of that
+// (ASeededUnansweredSweepSendsNoSecondSweepAndSleepsOnlyTheRest).  With no such
+// sweep, or past the branch's deadline, it owes nothing and attempt 1 goes out
+// as usual.
+//
+// MUTATION: seed only within one wait, as round 4 did -> FAILS here, and
+// nowhere else.
+TEST(CancelRetry, AStopDuringTheOperatorBranchOwesOnlyTheRestOfItsWait)
 {
     const CancelRetryConfig cfg{};
     const std::uint32_t wait = cfg.possibly_submitted_wait_ms;
+    const std::uint64_t deadline = possibly_submitted_deadline_ms(wait, cfg);
     ASSERT_GT(wait, 2 * cfg.min_useful_delay_ms);
+    ASSERT_GT(deadline, std::uint64_t{wait});
 
     EXPECT_EQ(unanswered_sweep_remaining_wait_ms(false, 0, cfg), 0u)
         << "no unanswered sweep: attempt 1 goes out";
@@ -1472,11 +1481,22 @@ TEST(CancelRetry, AStopWithinOneWaitOfAnUnansweredSweepOwesOnlyTheRestOfIt)
     EXPECT_EQ(unanswered_sweep_remaining_wait_ms(true, wait - 1u, cfg),
               cfg.min_useful_delay_ms)
         << "never a sleep too short to be worth taking";
-    EXPECT_EQ(unanswered_sweep_remaining_wait_ms(true, wait, cfg), 0u)
-        << "a full wait has passed";
+    // Past the wait the branch may still be re-checking a sweep it sees
+    // running: still seeded, at the floor.
+    EXPECT_EQ(unanswered_sweep_remaining_wait_ms(true, wait, cfg),
+              cfg.min_useful_delay_ms);
+    EXPECT_EQ(unanswered_sweep_remaining_wait_ms(true, deadline - 1u, cfg),
+              cfg.min_useful_delay_ms);
+    EXPECT_EQ(unanswered_sweep_remaining_wait_ms(true, deadline, cfg), 0u)
+        << "the branch is past its deadline";
     EXPECT_EQ(unanswered_sweep_remaining_wait_ms(
                   true, std::numeric_limits<std::uint64_t>::max(), cfg),
               0u);
+
+    // A zero floor still seeds.
+    CancelRetryConfig no_floor = cfg;
+    no_floor.min_useful_delay_ms = 0;
+    EXPECT_GT(unanswered_sweep_remaining_wait_ms(true, wait, no_floor), 0u);
 }
 
 // [review 2026-09-13, round 4] N1. The shutdown ladder records operator Cancel
@@ -1520,6 +1540,14 @@ TEST(CancelLadderState, ASeededUnansweredSweepSendsNoSecondSweepAndSleepsOnlyThe
     ASSERT_EQ(third.step, CancelLadderStep::Sleep);
     EXPECT_EQ(third.delay_ms, cancel_backoff_ms(2, cfg));
 
+    // [review 2026-09-13, round 5] A stop past the wait, while the branch still
+    // ran, is seeded at the floor, and the ordinary first backoff still applies.
+    CancelLadder late(ids, cfg, /*sweep_when_empty=*/true);
+    late.record(seeded_unanswered_sweep_outcome(ids, cfg.min_useful_delay_ms));
+    const auto late_pause = late.next(0);
+    ASSERT_EQ(late_pause.step, CancelLadderStep::Sleep);
+    EXPECT_EQ(late_pause.delay_ms, cancel_backoff_ms(1, cfg));
+
     // An empty local book seeded the same way stops at once, unclean, having
     // authorised no attempt.
     CancelLadder empty(std::vector<std::string>{}, cfg,
@@ -1528,4 +1556,52 @@ TEST(CancelLadderState, ASeededUnansweredSweepSendsNoSecondSweepAndSleepsOnlyThe
     EXPECT_EQ(empty.next(0).step, CancelLadderStep::Finish);
     EXPECT_EQ(empty.stop_reason(), CancelStopReason::SweepPossiblySubmitted);
     EXPECT_FALSE(empty.clean());
+}
+
+// [review 2026-09-13, round 5] A seeded ladder over an EMPTY local book stops
+// at once -- there is no tracked offer to re-check -- so it owes the rest of the
+// seeded wait before the S31 fallback sends its own wallet-wide cancel.  No
+// other stop owes anything: a seeded ladder that slept and re-checked, one the
+// budget stopped at once, and every unseeded ladder reach S31 as before.
+//
+// MUTATION: never owe a wait -> FAILS here, and nowhere else.
+TEST(CancelLadderState, ASeededLadderWithNothingToRecheckOwesTheRestOfTheWaitBeforeTheFallback)
+{
+    CancelRetryConfig cfg{};
+    cfg.possibly_submitted_wait_ms = 35'000;
+    const std::uint32_t rest = 25'000;
+
+    CancelLadder empty(std::vector<std::string>{}, cfg,
+                       /*sweep_when_empty=*/true);
+    empty.record(seeded_unanswered_sweep_outcome({}, rest));
+    ASSERT_EQ(empty.next(0).step, CancelLadderStep::Finish);
+    EXPECT_EQ(empty.wait_owed_before_fallback(), rest);
+
+    // Unseeded: attempt 1 was the ladder's own sweep, and nothing is owed.
+    CancelLadder unseeded(std::vector<std::string>{}, cfg,
+                          /*sweep_when_empty=*/true);
+    ASSERT_EQ(unseeded.next(0).step, CancelLadderStep::Attempt);
+    unseeded.record(possibly_submitted_sweep({}));
+    ASSERT_EQ(unseeded.next(0).step, CancelLadderStep::Finish);
+    EXPECT_EQ(unseeded.wait_owed_before_fallback(), 0u);
+
+    // Seeded with offers: the ladder sleeps the wait itself, and re-checks.
+    const auto& ids = kSevenIncidentOffers;
+    CancelLadder slept(ids, cfg, /*sweep_when_empty=*/true);
+    slept.record(seeded_unanswered_sweep_outcome(ids, rest));
+    ASSERT_EQ(slept.next(0).step, CancelLadderStep::Sleep);
+    ASSERT_EQ(slept.next(rest).step, CancelLadderStep::Attempt);
+    CancelAttemptOutcome all_pending{};
+    all_pending.already_pending = ids;
+    slept.record(std::move(all_pending));
+    ASSERT_EQ(slept.next(rest).step, CancelLadderStep::Finish);
+    EXPECT_EQ(slept.wait_owed_before_fallback(), 0u);
+
+    // Seeded with offers, but the budget is already spent (a slow sync
+    // probe): it stops at once and S31 runs as before (review F3).
+    CancelLadder spent(ids, cfg, /*sweep_when_empty=*/true);
+    spent.record(seeded_unanswered_sweep_outcome(ids, rest));
+    ASSERT_EQ(spent.next(cfg.budget_ms).step, CancelLadderStep::Finish);
+    EXPECT_EQ(spent.stop_reason(), CancelStopReason::BudgetExhausted);
+    EXPECT_EQ(spent.wait_owed_before_fallback(), 0u);
 }

@@ -1696,14 +1696,15 @@ void Engine::shutdown()
                 execution::CancelLadder ladder(outstanding, retry_cfg,
                                                /*sweep_when_empty=*/true);
 
-                // [review 2026-09-13, round 4] NO SECOND WALLET-WIDE SWEEP WITHIN
-                // ONE WAIT OF AN UNANSWERED ONE (cancel_retry.hpp). A stop ends
-                // operator Cancel All's wait at once, and attempt 1 below would
-                // send a second wallet-wide cancel_offers while that sweep may
-                // still be running. Within one wait of it, the ladder records
-                // that sweep as its attempt 1 instead: every tracked id stays
-                // outstanding, it sleeps only the rest of the wait, and it
-                // re-checks each offer before it cancels any.
+                // [review 2026-09-13, round 4] NO SECOND WALLET-WIDE SWEEP WHILE
+                // AN UNANSWERED ONE MAY STILL RUN (cancel_retry.hpp). A stop ends
+                // operator Cancel All's no-answer branch at once, and attempt 1
+                // below would send a second wallet-wide cancel_offers while that
+                // sweep may still be running. While that branch runs -- until its
+                // deadline [round 5], not one wait -- or once this stop ended it,
+                // the ladder records that sweep as its attempt 1 instead: every
+                // tracked id stays outstanding, it sleeps only the rest of the
+                // wait, and it re-checks each offer before it cancels any.
                 const std::uint64_t since_unanswered_ms =
                     unanswered_sweep_at_
                         ? static_cast<std::uint64_t>(std::max<std::int64_t>(
@@ -1852,6 +1853,23 @@ void Engine::shutdown()
                     // next attempt cancels every id again at once.
                     res.bulk_possibly_submitted = oc.bulk_possibly_submitted;
                     ladder.record(std::move(res));
+                }
+
+                // [review 2026-09-13, round 5] A ladder seeded above with no
+                // tracked offer to re-check stops at once. Sleep out the rest of
+                // the operator sweep's wait before the S31 fallback below sends
+                // its own wallet-wide cancel. No other stop owes a wait: S31
+                // after a full ladder stays as it was (review F3).
+                if (const std::uint32_t owed = ladder.wait_owed_before_fallback();
+                    owed != 0) {
+                    spdlog::warn(
+                        "[Engine] [S46] no tracked offer to re-check after operator "
+                        "Cancel All's unanswered sweep -- waiting the remaining {} "
+                        "ms before the fallback's wallet-wide cancel",
+                        owed);
+                    asio::steady_timer owed_timer(ioc_);
+                    owed_timer.expires_after(std::chrono::milliseconds(owed));
+                    co_await owed_timer.async_wait(asio::use_awaitable);
                 }
 
                 outstanding = ladder.outstanding();
@@ -19876,10 +19894,28 @@ void Engine::check_cancel_all_flag()
                             wait_ms, execution::CancelRetryConfig{});
                     const auto branch_t0 = std::chrono::steady_clock::now();
                     // [review 2026-09-13, round 4] For a shutdown that ends this
-                    // branch early: within one wait of now it sends no second
-                    // wallet-wide sweep, and it reads the same snapshot.
+                    // branch early: it sends no second wallet-wide sweep before
+                    // the rest of the wait, and it reads the same snapshot.
                     unanswered_sweep_at_ = branch_t0;
                     unanswered_sweep_pending_before_ = pending_before_sweep;
+                    // [review 2026-09-13, round 5] Only for THAT shutdown. When
+                    // the branch ends any other way -- done, stopped by the dead
+                    // man's switch, or by an exception -- the stamp and the
+                    // snapshot go with it, so a later, unrelated stop is not
+                    // seeded by them.
+                    struct UnansweredSweepStamp {
+                        std::optional<std::chrono::steady_clock::time_point>* at;
+                        std::unordered_set<std::string>* pending_before;
+                        const std::atomic<bool>* shutdown_claim;
+                        ~UnansweredSweepStamp() {
+                            if (!shutdown_claim->load(std::memory_order_acquire)) {
+                                at->reset();
+                                pending_before->clear();
+                            }
+                        }
+                    } unanswered_sweep_stamp{&unanswered_sweep_at_,
+                                             &unanswered_sweep_pending_before_,
+                                             &graceful_cancel_active_};
                     const auto deadline =
                         branch_t0 + std::chrono::milliseconds(
                             static_cast<std::int64_t>(deadline_ms));

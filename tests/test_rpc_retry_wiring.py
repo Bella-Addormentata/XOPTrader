@@ -80,6 +80,10 @@ def test_both_resend_paths_ask_the_policy():
 # cancels out of the evidence; the operator branch also stops for the dead
 # man's switch and looks for a stop at least once a second; a deferred reload
 # cancel is not reported as a failure.
+#
+# [review 2026-09-13, round 5] Added: a finished operator branch leaves no
+# stamp for a later stop; a seeded stop with no tracked offer waits before the
+# S31 fallback.
 # ---------------------------------------------------------------------------
 
 OFFER_MANAGER_CPP = REPO / "cpp" / "src" / "execution" / "offer_manager.cpp"
@@ -392,9 +396,9 @@ def test_a_stop_soon_after_an_unanswered_operator_sweep_sends_no_second_sweep():
     """[review 2026-09-13, round 4] N1.  A shutdown ends operator Cancel All's
     wait at once, and the ladder's attempt 1 is a wallet-wide cancel_all.  So
     the driver must ask how much of that sweep's wait is left BEFORE attempt 1
-    can run, and within the wait record that sweep as attempt 1 instead of
-    sending another.  The operator branch must record when its sweep went
-    unanswered."""
+    can run, and while the branch runs [round 5: until its deadline] record
+    that sweep as attempt 1 instead of sending another.  The operator branch
+    must record when its sweep went unanswered."""
     code = _code(_definition(ENGINE_CPP, "void Engine::shutdown()"))
     _in_order(code, [
         "execution::CancelLadderladder(outstanding,retry_cfg,true);",
@@ -475,3 +479,40 @@ def test_a_deferred_reload_cancel_is_not_reported_as_a_failure():
         "the follow-up alert has no separate wording for a deferred cancel"
     )
     assert "deferred while operator Cancel All is in flight" in raw
+
+
+def test_a_finished_operator_branch_leaves_no_stamp_for_a_later_stop():
+    """[review 2026-09-13, round 5] The seed window is the operator branch's
+    whole life, so a stamp that outlived its branch would seed a later,
+    unrelated stop.  The branch clears the stamp and the snapshot when it ends
+    -- done, through the dead man's switch, or by an exception -- unless a
+    shutdown request ended it."""
+    _, possibly = _operator_branch()
+    _in_order(possibly, [
+        "unanswered_sweep_pending_before_=pending_before_sweep;",
+        "structUnansweredSweepStamp{",
+        "~UnansweredSweepStamp(){if(!shutdown_claim->load(std::memory_order_acquire))"
+        "{at->reset();pending_before->clear();}}",
+        "}unanswered_sweep_stamp{&unanswered_sweep_at_,&unanswered_sweep_pending_before_,"
+        "&graceful_cancel_active_};",
+        "for(;;){",
+    ])
+
+
+def test_a_seeded_stop_with_no_tracked_offer_waits_before_the_fallback():
+    """[review 2026-09-13, round 5] A seeded ladder with no tracked offer to
+    re-check stops at once.  The driver must sleep the wait it still owes
+    before the S31 fallback sends its own wallet-wide cancel."""
+    code = _code(_definition(ENGINE_CPP, "void Engine::shutdown()"))
+    opener = "if(conststd::uint32_towed=ladder.wait_owed_before_fallback();owed!=0){"
+    owed = _block(code, opener)
+    _in_order(owed, [
+        "owed_timer.expires_after(std::chrono::milliseconds(owed));",
+        "co_awaitowed_timer.async_wait(asio::use_awaitable);",
+    ])
+    _in_order(code, [
+        "ladder.record(std::move(res));",
+        opener,
+        "outstanding=ladder.outstanding();",
+        "watchdog_cancel_book(",
+    ])

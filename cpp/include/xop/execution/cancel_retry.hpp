@@ -839,27 +839,39 @@ inline constexpr std::uint32_t kPossiblySubmittedRecheckIntervalMs = 10'000;
 // wallet and, in chia 2.7.4, cancels again every trade the first sweep marked
 // PENDING_CANCEL: the duplicate this header exists to prevent.
 //
-// So a shutdown that starts less than one wait after operator Cancel All saw
-// its sweep go unanswered records THAT sweep as its attempt 1
-// (seeded_unanswered_sweep_outcome) instead of sending another: every tracked
-// id stays outstanding, the ladder sleeps only the rest of the wait, and it
-// re-checks each offer before attempt 2 cancels any.  A budget that cannot fit
-// even that stops the ladder BudgetExhausted, and the S31 fallback runs as it
-// does today.
+// So a shutdown that starts while operator Cancel All's no-answer branch still
+// runs records THAT sweep as its attempt 1 (seeded_unanswered_sweep_outcome)
+// instead of sending another: every tracked id stays outstanding, the ladder
+// sleeps only the rest of the wait, and it re-checks each offer before
+// attempt 2 cancels any.  A budget that cannot fit even that stops the ladder
+// BudgetExhausted, and the S31 fallback runs as it does today.
+//
+// [review 2026-09-13, round 5] "While the branch still runs" means until its
+// deadline (possibly_submitted_deadline_ms), not one wait: past the wait the
+// branch keeps re-checking and pausing while its evidence says the sweep is
+// still running.  The engine clears its stamp when the branch ends any way
+// other than a shutdown request, so a finished branch seeds nothing later.  And
+// a seeded ladder with no tracked offer to re-check stops at once, so it owes
+// the rest of the wait before the S31 fallback sends its own wallet-wide cancel
+// (CancelLadder::wait_owed_before_fallback).
 // ---------------------------------------------------------------------------
 
 /// The part of the wait a shutdown still owes an operator sweep that got no
 /// usable answer `since_ms` ago.  0 when there was no such sweep (`seen`
-/// false) or it is at least one full wait old: attempt 1 then goes out as
+/// false) or its branch is past its deadline: attempt 1 then goes out as
 /// usual.  Otherwise the rest of the wait, never less than
-/// cfg.min_useful_delay_ms.
+/// cfg.min_useful_delay_ms -- nor less than 1, so a seed is never read as 0.
 [[nodiscard]] constexpr std::uint32_t unanswered_sweep_remaining_wait_ms(
     bool seen, std::uint64_t since_ms, const CancelRetryConfig& cfg) noexcept
 {
-    if (!seen || since_ms >= cfg.possibly_submitted_wait_ms) return 0;
+    if (!seen) return 0;
+    if (since_ms >= possibly_submitted_deadline_ms(cfg.possibly_submitted_wait_ms, cfg)) return 0;
+    const std::uint32_t least =
+        cfg.min_useful_delay_ms != 0 ? cfg.min_useful_delay_ms : std::uint32_t{1};
+    if (since_ms >= cfg.possibly_submitted_wait_ms) return least;
     const auto rest = static_cast<std::uint32_t>(
         cfg.possibly_submitted_wait_ms - since_ms);
-    return rest > cfg.min_useful_delay_ms ? rest : cfg.min_useful_delay_ms;
+    return rest > least ? rest : least;
 }
 
 /// The attempt a seeded shutdown ladder records in place of attempt 1: the
@@ -1052,6 +1064,10 @@ public:
         // for the next sleep only.
         last_attempt_wait_ms_ =
             oc.bulk_possibly_submitted ? oc.possibly_submitted_wait_ms : 0;
+        // [review 2026-09-13, round 5] A seed recorded as attempt 1.
+        if (attempts_ == 1 && oc.bulk_possibly_submitted) {
+            seeded_wait_ms_ = oc.possibly_submitted_wait_ms;
+        }
         possibly_submitted_ = possibly_submitted_ || oc.bulk_possibly_submitted;
         needs_recheck_      = needs_recheck_ || oc.bulk_possibly_submitted;
 
@@ -1160,6 +1176,16 @@ public:
     /// the sweep had already reached (cancelling or cancelled). Sticky.
     [[nodiscard]] bool sweep_seen_running() const noexcept
     { return sweep_seen_running_; }
+    /// [review 2026-09-13, round 5] The rest of a seeded wait this ladder never
+    /// slept, owed before the S31 fallback: non-zero only when the seed was its
+    /// only attempt and it stopped at once for want of a tracked offer to
+    /// re-check (SweepPossiblySubmitted).  Every other stop owes nothing.
+    [[nodiscard]] std::uint32_t wait_owed_before_fallback() const noexcept
+    {
+        return attempts_ == 1 && stop_reason_ == CancelStopReason::SweepPossiblySubmitted
+            ? seeded_wait_ms_
+            : 0;
+    }
     [[nodiscard]] TakeFailureClass worst_class() const noexcept
     { return worst_class_; }
     /// True when this ladder finished with nothing believed live. The ONLY
@@ -1202,6 +1228,8 @@ private:
     /// [review 2026-09-13, round 4] The part of that wait still owed, when the
     /// attempt was seeded; 0 means the whole configured wait.
     std::uint32_t            last_attempt_wait_ms_{0};
+    /// [review 2026-09-13, round 5] The wait a seeded attempt 1 still owed.
+    std::uint32_t            seeded_wait_ms_{0};
     /// [review 2026-09-13, round 2] Sticky: re-check before every retry.
     bool                     needs_recheck_{false};
     /// [review 2026-09-13, round 2] No-verdict ids held back from the current
