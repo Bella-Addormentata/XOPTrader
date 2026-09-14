@@ -86,7 +86,14 @@ TEST(RpcRetryPolicy, ReadsStillRetryTransientFailures) {
 // nothing more after one of these until each offer has been re-checked; any
 // other failure keeps its immediate per-offer fallback.
 //
-// MUTATION: return false for CURLE_OPERATION_TIMEDOUT (the 2026-09-12 shape)
+// [review 2026-09-13, round 3] The default is "possibly submitted": only a
+// failure that provably happens before the request is written is not.
+//
+// MUTATION: list CURLE_OPERATION_TIMEDOUT (the 2026-09-12 shape) among the
+// pre-send codes -> FAILS here, and nowhere else.
+// MUTATION: default an unlisted code to "not submitted" (round 2's rule)
+// -> FAILS here, and nowhere else.
+// MUTATION: class a 2xx -- an unparseable reply -- as not submitted
 // -> FAILS here, and nowhere else.
 TEST(RpcRetryPolicy, APostSendCancelFailureIsPossiblySubmitted) {
     EXPECT_TRUE(cancel_possibly_submitted(CURLE_OPERATION_TIMEDOUT, 0));
@@ -94,17 +101,32 @@ TEST(RpcRetryPolicy, APostSendCancelFailureIsPossiblySubmitted) {
     EXPECT_TRUE(cancel_possibly_submitted(CURLE_SEND_ERROR, 0));
     EXPECT_TRUE(cancel_possibly_submitted(CURLE_RECV_ERROR, 0));
     EXPECT_TRUE(cancel_possibly_submitted(CURLE_PARTIAL_FILE, 0));
+    // A code no list names is possibly submitted too: a garbled reply, an
+    // out-of-memory mid-transfer.
+    EXPECT_TRUE(cancel_possibly_submitted(CURLE_WEIRD_SERVER_REPLY, 0));
+    EXPECT_TRUE(cancel_possibly_submitted(CURLE_OUT_OF_MEMORY, 0));
     // rpc_post throws an HTTP failure with CURLE_OK: the handler, or the
     // server in front of it, answered 5xx.
     for (long code : {500L, 502L, 503L, 504L}) {
         EXPECT_TRUE(cancel_possibly_submitted(CURLE_OK, code)) << "HTTP " << code;
     }
+    // ...or 2xx, which reaches here only when the body could not be parsed:
+    // the wallet ran the request and its answer was lost.
+    EXPECT_TRUE(cancel_possibly_submitted(CURLE_OK, 200));
+    // A status that is not a refusal the client can read.
+    EXPECT_TRUE(cancel_possibly_submitted(CURLE_OK, 302));
 
-    // No connection, or no completed TLS handshake: the request was never
-    // written, so the per-offer fallback cannot race it.
+    // Never built, never resolved, never connected, or no completed TLS
+    // handshake: the request was never written, so the per-offer fallback
+    // cannot race it.
+    EXPECT_FALSE(cancel_possibly_submitted(CURLE_FAILED_INIT, 0));
+    EXPECT_FALSE(cancel_possibly_submitted(CURLE_URL_MALFORMAT, 0));
+    EXPECT_FALSE(cancel_possibly_submitted(CURLE_COULDNT_RESOLVE_HOST, 0));
     EXPECT_FALSE(cancel_possibly_submitted(CURLE_COULDNT_CONNECT, 0));
     EXPECT_FALSE(cancel_possibly_submitted(CURLE_SSL_CONNECT_ERROR, 0));
-    // Any other HTTP status is an answer, not an absence of one.
+    EXPECT_FALSE(cancel_possibly_submitted(CURLE_PEER_FAILED_VERIFICATION, 0));
+    EXPECT_FALSE(cancel_possibly_submitted(CURLE_SSL_CACERT_BADFILE, 0));
+    // A 4xx is an answer that the request was refused before any cancel ran.
     for (long code : {400L, 404L, 429L}) {
         EXPECT_FALSE(cancel_possibly_submitted(CURLE_OK, code)) << "HTTP " << code;
     }

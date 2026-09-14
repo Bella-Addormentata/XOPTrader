@@ -147,6 +147,11 @@ private:
 
 /**
  * @brief Transport-level failure (DNS, TLS handshake, timeout, HTTP 5xx).
+ *
+ * [review 2026-09-13, round 3] Also a 2xx reply whose body is not valid JSON:
+ * curl_code() is then CURLE_OK and http_code() the 2xx status.  That request
+ * reached the handler and its answer was lost, which a caller deciding whether
+ * a cancel may have run needs to see (rpc::cancel_possibly_submitted).
  */
 class ChiaRPCTransportError : public ChiaRPCError {
 public:

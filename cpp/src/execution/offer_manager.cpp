@@ -1509,7 +1509,9 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(
     } catch (const rpc::ChiaRPCTransportError& e) {
         // BEFORE the base-class handler, which would take this too.  A
         // transport failure is not one thing: a connect failure never reached
-        // the wallet, while a timeout or a 5xx may have.
+        // the wallet, while a timeout or a 5xx may have -- and so did a 2xx
+        // reply whose body rpc_post could not parse [review 2026-09-13,
+        // round 3], which it reports as a transport failure with that status.
         bulk_err = e.what();
         bulk_possibly_submitted =
             rpc::cancel_possibly_submitted(e.curl_code(), e.http_code());
@@ -1550,7 +1552,7 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(
         // sweep_refused: a refusal is an answer, after which sending the
         // sweep again at once is safe.  After this, sending again at once is
         // the duplicate.
-        logger_->warn("cancel_all: bulk cancel_offers got NO ANSWER ({}) -- "
+        logger_->warn("cancel_all: bulk cancel_offers got NO USABLE ANSWER ({}) -- "
                       "the wallet-wide sweep may still be running.  NOT "
                       "falling back to individual cancellation: nothing is "
                       "sent again until each of the {} tracked offer(s) is "

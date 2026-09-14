@@ -695,6 +695,104 @@ inline void partition_rechecked_offer(RecheckPartition& into,
 }
 
 // ---------------------------------------------------------------------------
+// [review 2026-09-13, round 3] IS THE SWEEP STILL RUNNING?
+//
+// The fixed wait (one request timeout plus 5 s) rests on ONE measured sweep:
+// 22 offers, still writing records 53 s after the send.  A book near the
+// 50-offer batch can take longer.  In chia 2.7.4 cancel_pending_offers sets
+// PENDING_CANCEL trade by trade inside the batch (trade_manager.py) while
+// get_offer takes no lock (wallet_rpc_api.py), so a re-check that lands
+// mid-sweep reads every offer the sweep has not reached yet as still live --
+// and a per-id cancel of those queues behind the sweep's lock and builds the
+// duplicate spend.
+//
+// The re-check can see it.  When it finds an offer the sweep already reached
+// -- cancelling (PENDING_CANCEL) or cancelled -- AND an offer still live with
+// no cancel in flight, the sweep is proven to have run and is taken to be
+// still working through the book.  The live ids are NOT re-cancelled then:
+//   * the shutdown ladder holds them back like a NoVerdict id: they stay
+//     outstanding, and another re-check follows only if the budget fits it
+//     (CancelLadder::record_recheck);
+//   * operator Cancel All pauses and re-checks again, and at its deadline
+//     re-cancels only the ids still live (possibly_submitted_rewait_ms).
+//
+// THE EVIDENCE IS CUMULATIVE.  A later re-check covers only the ids still
+// undecided, so the offers that proved the sweep ran are no longer in it.
+// Without carrying that evidence forward, a re-check of the still-live ids
+// alone would read as "the sweep never ran" and re-cancel them mid-sweep.
+//
+// CONSERVATIVE BY CONSTRUCTION.  An offer whose cancel was already in flight
+// BEFORE the sweep, or one already dead, counts as evidence too, so the rule
+// can hold ids back when the sweep never ran at all.  That costs time -- and,
+// at shutdown, hands the held ids by name to the S31 fallback -- but it never
+// builds a duplicate spend.  A FILLED offer is not evidence: a taker, not the
+// sweep, resolved it.
+// ---------------------------------------------------------------------------
+
+/// Did this re-check find an offer the sweep had already reached?
+[[nodiscard]] inline bool recheck_saw_the_sweep(
+    const RecheckPartition& p) noexcept
+{
+    return !p.already_pending.empty() || !p.dead.empty();
+}
+
+/// Does this re-check show the sweep still working through the book?  True
+/// when offers are still live with no cancel in flight (`recancel`) while the
+/// sweep is known to have reached others: in this re-check, or in an earlier
+/// re-check of the same book (`seen_before`).
+[[nodiscard]] inline bool recheck_shows_sweep_running(
+    const RecheckPartition& p, bool seen_before) noexcept
+{
+    return !p.recancel.empty() && (seen_before || recheck_saw_the_sweep(p));
+}
+
+// ---------------------------------------------------------------------------
+// [review 2026-09-13, round 3] OPERATOR CANCEL ALL: A DEADLINE OF ITS OWN.
+//
+// The shutdown ladder is bounded by budget_ms.  Operator Cancel All has no
+// ladder: after a sweep that got no answer it waits, re-checks and re-cancels
+// while cancel_all_inflight_ holds the other cancel paths -- and a shutdown --
+// behind it, and in round 2 nothing bounded that.  So it gets a deadline: the
+// wait plus the same budget_ms (90 s) the shutdown ladder gives its whole
+// retry sequence.  That leaves room for the re-checks a still-running sweep
+// needs and for the final re-cancel.  Probes and re-cancels stop at the
+// deadline; only an RPC already in flight can run past it.
+// ---------------------------------------------------------------------------
+
+/// Pause between re-checks while a re-check shows the sweep still running.
+/// The 2026-09-12 sweep wrote its cancel records in bursts about 6 s apart
+/// (40, 46 and 52 s after the send), so a 10 s pause spans at least one.
+inline constexpr std::uint32_t kPossiblySubmittedRecheckIntervalMs = 10'000;
+
+/// The operator path's deadline, in milliseconds after cancel_all returned:
+/// the wait, then the retry budget.
+[[nodiscard]] constexpr std::uint64_t possibly_submitted_deadline_ms(
+    std::uint32_t wait_ms, const CancelRetryConfig& cfg) noexcept
+{
+    return std::uint64_t{wait_ms} + cfg.budget_ms;
+}
+
+/// After a re-check on the operator path: pause this long and re-check
+/// again, or 0 to act now -- re-cancel the ids still live.  It pauses only
+/// while the re-check shows the sweep still running, and only while one more
+/// pause AND `recancel_reserve_ms` for the final re-cancel still fit before
+/// the deadline.  `elapsed_ms` and `deadline_ms` count from when cancel_all
+/// returned.
+[[nodiscard]] constexpr std::uint32_t possibly_submitted_rewait_ms(
+    bool          sweep_running,
+    std::uint64_t elapsed_ms,
+    std::uint64_t deadline_ms,
+    std::uint64_t recancel_reserve_ms) noexcept
+{
+    if (!sweep_running) return 0;
+    if (elapsed_ms >= deadline_ms) return 0;
+    const std::uint64_t needed =
+        std::uint64_t{kPossiblySubmittedRecheckIntervalMs} + recancel_reserve_ms;
+    if (needed > deadline_ms - elapsed_ms) return 0;
+    return kPossiblySubmittedRecheckIntervalMs;
+}
+
+// ---------------------------------------------------------------------------
 // What the driver should do next.
 // ---------------------------------------------------------------------------
 enum class CancelLadderStep : int {
@@ -898,15 +996,35 @@ public:
     ///                    a filled offer is never stamped cancelled;
     ///   unknown          no verdict: NOT cancelled on this attempt, and put
     ///                    back into outstanding() by the next record().
+    ///
+    /// [review 2026-09-13, round 3] And when the re-check shows the sweep
+    /// still working through the book (recheck_shows_sweep_running, with the
+    /// evidence kept across every re-check of this ladder), the live ids are
+    /// held back exactly like the unknown ones: outstanding() is left EMPTY,
+    /// so cancel_ids sends nothing on this attempt.
     void record_recheck(RecheckPartition part)
     {
+        // [review 2026-09-13, round 3] Decided on the wallet's answers as they
+        // came back, before any bucket moves.
+        const bool sweep_running =
+            recheck_shows_sweep_running(part, sweep_seen_running_);
+        sweep_seen_running_ = sweep_seen_running_ || recheck_saw_the_sweep(part);
+
         for (auto& id : part.already_pending) {
             already_pending_.push_back(std::move(id));
         }
         for (auto& id : part.dead) resolved_dead_.push_back(std::move(id));
         for (auto& id : part.filled) resolved_filled_.push_back(std::move(id));
+        if (sweep_running) {
+            // [review 2026-09-13, round 3] The next record() returns them to
+            // outstanding(), and next() re-checks them only if the budget and
+            // the attempt ceiling allow another attempt.
+            for (auto& id : part.recancel) held_back_.push_back(std::move(id));
+            outstanding_.clear();
+        } else {
+            outstanding_ = std::move(part.recancel);
+        }
         for (auto& id : part.unknown) held_back_.push_back(std::move(id));
-        outstanding_ = std::move(part.recancel);
     }
 
     [[nodiscard]] const std::vector<std::string>& outstanding() const noexcept
@@ -946,6 +1064,10 @@ public:
     /// FILLED. Never stamp them cancelled.
     [[nodiscard]] const std::vector<std::string>&
     resolved_filled() const noexcept { return resolved_filled_; }
+    /// [review 2026-09-13, round 3] True once a re-check has found an offer
+    /// the sweep had already reached (cancelling or cancelled). Sticky.
+    [[nodiscard]] bool sweep_seen_running() const noexcept
+    { return sweep_seen_running_; }
     [[nodiscard]] TakeFailureClass worst_class() const noexcept
     { return worst_class_; }
     /// True when this ladder finished with nothing believed live. The ONLY
@@ -993,6 +1115,8 @@ private:
     /// [review 2026-09-13, round 2] Ids a re-check found resolved.
     std::vector<std::string> resolved_dead_{};
     std::vector<std::string> resolved_filled_{};
+    /// [review 2026-09-13, round 3] Sticky: a re-check has seen the sweep.
+    bool                     sweep_seen_running_{false};
 };
 
 }  // namespace xop::execution

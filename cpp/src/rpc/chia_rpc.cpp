@@ -637,10 +637,19 @@ asio::awaitable<json> ChiaRPCBase::rpc_post(std::string_view endpoint,
             result = json::parse(response_body);
         } catch (const json::parse_error& ex) {
             // Malformed JSON is not transient -- fail immediately.
+            //
+            // [review 2026-09-13, round 3] As a TRANSPORT failure carrying
+            // CURLE_OK and the 2xx status: the handler received this request
+            // and ran it, and only its answer was lost.  A cancel caller must
+            // read that as "possibly submitted"
+            // (rpc::cancel_possibly_submitted), never as a refusal.  Every
+            // other caller catches ChiaRPCError, which this derives from, so
+            // nothing else changes.
             logger_->error("JSON parse error from {}: {}", endpoint, ex.what());
-            throw ChiaRPCError(
+            throw ChiaRPCTransportError(
                 std::string("Failed to parse JSON response from ") +
-                    std::string(endpoint) + ": " + ex.what());
+                    std::string(endpoint) + ": " + ex.what(),
+                http_code, CURLE_OK);
         }
 
         // --- Application-level success check -------------------------------

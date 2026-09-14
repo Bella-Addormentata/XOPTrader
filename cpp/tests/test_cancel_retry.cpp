@@ -1049,13 +1049,11 @@ TEST(CancelLadderState, ABudgetThatCannotFitTheWaitFinishesWithoutAnAttempt)
     EXPECT_GE(ok.delay_ms, cfg.possibly_submitted_wait_ms);
 }
 
-// MUTATION: record() never sets needs_recheck_ -> FAILS here, and nowhere
-// else.
+// MUTATION: record() never sets needs_recheck_ -> FAILS here and in
+// AMixedRecheckHoldsTheLiveOffersBackWhileTheSweepRuns.
 // MUTATION: record() drops the ids the re-check held back (NoVerdict) instead
-// of returning them to outstanding -> FAILS here, and nowhere else.
-// MUTATION: partition_rechecked_offer sends a Revived offer whose cancel is
-// already in flight to `recancel` -> FAILS here and in
-// CancelRecheckPartition.EachWalletVerdictLandsInExactlyOneBucket.
+// of returning them to outstanding -> FAILS here and in
+// AMixedRecheckHoldsTheLiveOffersBackWhileTheSweepRuns.
 TEST(CancelLadderState, TheAttemptAfterTheWaitReChecksBeforeItCancels)
 {
     const CancelRetryConfig cfg{};
@@ -1074,38 +1072,40 @@ TEST(CancelLadderState, TheAttemptAfterTheWaitReChecksBeforeItCancels)
     ASSERT_EQ(second.step, CancelLadderStep::Attempt);
     EXPECT_EQ(second.attempt_index, 2u);
 
-    // The wallet's answer for each of the seven, one of every shape.
+    // [review 2026-09-13, round 3] The wallet reports five still live, one
+    // FILLED and one it cannot answer for -- and none the sweep reached, so
+    // nothing shows the sweep ran.  (A re-check that does show it is
+    // AMixedRecheckHoldsTheLiveOffersBackWhileTheSweepRuns.)
     RecheckPartition part;
-    partition_rechecked_offer(part, ids[0], TerminalRecheck::Revived, false);
-    partition_rechecked_offer(part, ids[1], TerminalRecheck::Revived, false);
-    partition_rechecked_offer(part, ids[2], TerminalRecheck::Revived,
-                              /*cancel_pending=*/true);
-    partition_rechecked_offer(part, ids[3], TerminalRecheck::Revived,
-                              /*cancel_pending=*/true);
-    partition_rechecked_offer(part, ids[4], TerminalRecheck::StillTerminal,
-                              false);
+    for (std::size_t i = 0; i < 5; ++i) {
+        partition_rechecked_offer(part, ids[i], TerminalRecheck::Revived,
+                                  false);
+    }
     partition_rechecked_offer(part, ids[5], TerminalRecheck::Confirmed, false);
     partition_rechecked_offer(part, ids[6], TerminalRecheck::NoVerdict, false);
     l.record_recheck(std::move(part));
 
-    // cancel_ids is handed ONLY the two still live with no spend in flight.
-    EXPECT_EQ(l.outstanding(), (std::vector<std::string>{ids[0], ids[1]}));
-    EXPECT_EQ(l.already_pending(),
-              (std::vector<std::string>{ids[2], ids[3]}));
-    EXPECT_EQ(l.resolved_dead(), (std::vector<std::string>{ids[4]}));
+    // cancel_ids is handed ONLY the five still live with no spend in flight.
+    EXPECT_EQ(l.outstanding(),
+              (std::vector<std::string>{ids[0], ids[1], ids[2], ids[3],
+                                        ids[4]}));
+    EXPECT_FALSE(l.sweep_seen_running());
+    EXPECT_TRUE(l.already_pending().empty());
     EXPECT_EQ(l.resolved_filled(), (std::vector<std::string>{ids[5]}));
 
-    // The per-id attempt: one goes, one is refused on the sync flap.
+    // The per-id attempt: one goes, four are refused on the sync flap.
     CancelAttemptOutcome oc{};
     oc.cancelled.push_back(ids[0]);
-    oc.failed.push_back(ids[1]);
+    oc.failed.assign(ids.begin() + 1, ids.begin() + 5);
     oc.last_error  = kSyncRefusal;
     oc.worst_class = TakeFailureClass::Unsynced;
     l.record(std::move(oc));
 
-    // The refused offer AND the one the wallet gave no verdict for are still
+    // The refused offers AND the one the wallet gave no verdict for are still
     // live as far as this ladder knows.
-    EXPECT_EQ(l.outstanding(), (std::vector<std::string>{ids[1], ids[6]}));
+    EXPECT_EQ(l.outstanding(),
+              (std::vector<std::string>{ids[1], ids[2], ids[3], ids[4],
+                                        ids[6]}));
     EXPECT_EQ(l.submitted(), (std::vector<std::string>{ids[0]}));
     EXPECT_TRUE(l.needs_recheck())
         << "sticky: no retry on this ladder cancels an id without asking "
@@ -1170,7 +1170,8 @@ TEST(CancelLadderState, AnUnansweredSweepOfAnEmptyBookIsNotACleanStop)
 }
 
 // MUTATION: send a Revived offer whose cancel is already in flight to
-// `recancel` -> FAILS here and in TheAttemptAfterTheWaitReChecksBeforeItCancels.
+// `recancel` -> FAILS here and in
+// AMixedRecheckHoldsTheLiveOffersBackWhileTheSweepRuns.
 TEST(CancelRecheckPartition, EachWalletVerdictLandsInExactlyOneBucket)
 {
     RecheckPartition p;
@@ -1197,6 +1198,136 @@ TEST(CancelRecheckPartition, EachWalletVerdictLandsInExactlyOneBucket)
         << "no verdict is no evidence either way";
 }
 
+// [review 2026-09-13, round 3] A re-check that finds an offer the sweep
+// already reached, AND an offer still live, proves the sweep ran and is taken
+// to be still working through the book.  A filled offer is not evidence, and
+// evidence from an earlier re-check of the same book carries forward.
+//
+// MUTATION: a cancelled offer is not counted as evidence -> FAILS here, and
+// nowhere else.
+// MUTATION: evidence from an earlier re-check is ignored -> FAILS here and in
+// AMixedRecheckHoldsTheLiveOffersBackWhileTheSweepRuns.
+TEST(CancelRecheckPartition, AMixedRecheckShowsTheSweepStillRunning)
+{
+    const auto with_live = [](RecheckPartition p) {
+        p.recancel.push_back("live");
+        return p;
+    };
+    const RecheckPartition none{};
+    RecheckPartition cancelling{};
+    cancelling.already_pending.push_back("spending");
+    RecheckPartition cancelled{};
+    cancelled.dead.push_back("dead");
+    RecheckPartition filled{};
+    filled.filled.push_back("filled");
+    RecheckPartition silent{};
+    silent.unknown.push_back("silent");
+
+    EXPECT_FALSE(recheck_shows_sweep_running(with_live(none), false))
+        << "every offer still live: no sign the sweep ran";
+    EXPECT_TRUE(recheck_shows_sweep_running(with_live(cancelling), false));
+    EXPECT_TRUE(recheck_shows_sweep_running(with_live(cancelled), false));
+    EXPECT_FALSE(recheck_shows_sweep_running(with_live(filled), false))
+        << "a taker, not the sweep, resolved it";
+    EXPECT_FALSE(recheck_shows_sweep_running(with_live(silent), false))
+        << "no verdict is no evidence";
+
+    // Nothing live: nothing to hold back, whatever the evidence.
+    EXPECT_FALSE(recheck_shows_sweep_running(cancelling, false));
+    EXPECT_FALSE(recheck_shows_sweep_running(cancelling, true));
+
+    // Evidence from an earlier re-check of the same book carries forward.
+    EXPECT_TRUE(recheck_shows_sweep_running(with_live(none), true));
+
+    EXPECT_TRUE(recheck_saw_the_sweep(cancelling));
+    EXPECT_TRUE(recheck_saw_the_sweep(cancelled));
+    EXPECT_FALSE(recheck_saw_the_sweep(filled));
+    EXPECT_FALSE(recheck_saw_the_sweep(silent));
+    EXPECT_FALSE(recheck_saw_the_sweep(none));
+}
+
+// [review 2026-09-13, round 3] The shutdown ladder after a mixed re-check: the
+// live ids are held back like a NoVerdict id, a later re-check that shows no
+// fresh evidence still holds them back, and the ladder stops on its attempt
+// ceiling with every held id named for the S31 fallback.
+//
+// MUTATION: record_recheck hands the live ids to cancel_ids although the
+// re-check shows the sweep running -> FAILS here, and nowhere else.
+// MUTATION: record_recheck never keeps the evidence -> FAILS here, and
+// nowhere else.
+// (Also red here: the earlier-evidence mutation above, record() dropping
+// held-back ids, record() never asking for a re-check, and a Revived offer
+// with a cancel in flight sent to `recancel`.)
+TEST(CancelLadderState, AMixedRecheckHoldsTheLiveOffersBackWhileTheSweepRuns)
+{
+    const CancelRetryConfig cfg{};
+    const auto& ids = kSevenIncidentOffers;
+    CancelLadder l(ids, cfg);
+    ASSERT_EQ(l.next(0).step, CancelLadderStep::Attempt);
+    l.record(possibly_submitted_sweep(ids));
+    ASSERT_EQ(l.next(30'000).step, CancelLadderStep::Sleep);
+    std::uint32_t clock = 30'000 + cfg.possibly_submitted_wait_ms;
+    ASSERT_EQ(l.next(clock).step, CancelLadderStep::Attempt);
+    ASSERT_TRUE(l.needs_recheck());
+
+    // Attempt 2's re-check lands mid-sweep: two offers already cancelling,
+    // one cancelled, three the sweep has not reached yet, one silent.
+    RecheckPartition part;
+    partition_rechecked_offer(part, ids[0], TerminalRecheck::Revived, false);
+    partition_rechecked_offer(part, ids[1], TerminalRecheck::Revived, false);
+    partition_rechecked_offer(part, ids[2], TerminalRecheck::Revived, false);
+    partition_rechecked_offer(part, ids[3], TerminalRecheck::Revived,
+                              /*cancel_pending=*/true);
+    partition_rechecked_offer(part, ids[4], TerminalRecheck::Revived,
+                              /*cancel_pending=*/true);
+    partition_rechecked_offer(part, ids[5], TerminalRecheck::StillTerminal,
+                              false);
+    partition_rechecked_offer(part, ids[6], TerminalRecheck::NoVerdict, false);
+    l.record_recheck(std::move(part));
+
+    EXPECT_TRUE(l.outstanding().empty())
+        << "cancel_ids must be handed nothing while the sweep is shown still "
+           "running";
+    EXPECT_TRUE(l.sweep_seen_running());
+    EXPECT_EQ(l.already_pending(), (std::vector<std::string>{ids[3], ids[4]}));
+    EXPECT_EQ(l.resolved_dead(), (std::vector<std::string>{ids[5]}));
+
+    l.record(CancelAttemptOutcome{});  // cancel_ids({}) sent nothing
+    EXPECT_EQ(l.outstanding(),
+              (std::vector<std::string>{ids[0], ids[1], ids[2], ids[6]}))
+        << "held back, never dropped";
+    EXPECT_FALSE(l.clean());
+
+    // Another re-check follows, because the budget fits it.
+    const auto pause = l.next(clock);
+    ASSERT_EQ(pause.step, CancelLadderStep::Sleep);
+    clock += pause.delay_ms;
+    ASSERT_LE(clock, cfg.budget_ms);
+    const auto third = l.next(clock);
+    ASSERT_EQ(third.step, CancelLadderStep::Attempt);
+    EXPECT_EQ(third.attempt_index, 3u);
+
+    // Attempt 3 re-checks only the undecided ids.  None of them shows the
+    // sweep this time -- but attempt 2 already saw it, so still no re-cancel.
+    RecheckPartition again;
+    partition_rechecked_offer(again, ids[0], TerminalRecheck::Revived, false);
+    partition_rechecked_offer(again, ids[1], TerminalRecheck::Revived, false);
+    partition_rechecked_offer(again, ids[2], TerminalRecheck::Revived, false);
+    partition_rechecked_offer(again, ids[6], TerminalRecheck::NoVerdict, false);
+    l.record_recheck(std::move(again));
+    EXPECT_TRUE(l.outstanding().empty())
+        << "the evidence from attempt 2 carries forward";
+    l.record(CancelAttemptOutcome{});
+
+    // An unclassified transport failure gets three attempts: the ladder
+    // stops, unclean, and still names every held id.
+    EXPECT_EQ(l.next(clock).step, CancelLadderStep::Finish);
+    EXPECT_EQ(l.stop_reason(), CancelStopReason::AttemptsExhausted);
+    EXPECT_EQ(l.outstanding(),
+              (std::vector<std::string>{ids[0], ids[1], ids[2], ids[6]}));
+    EXPECT_FALSE(l.clean());
+}
+
 // MUTATION: make wait_after_possibly_submitted_ms ignore the request timeout
 // (the margin alone) -> FAILS here, and nowhere else.
 TEST(CancelRetry, ThePossiblySubmittedWaitIsOneRequestTimeoutPlusAMargin)
@@ -1220,4 +1351,46 @@ TEST(CancelRetry, ThePossiblySubmittedWaitIsOneRequestTimeoutPlusAMargin)
     EXPECT_EQ(wait_after_possibly_submitted_ms(
                   std::numeric_limits<std::int64_t>::max()),
               std::numeric_limits<std::uint32_t>::max());
+}
+
+// [review 2026-09-13, round 3] Operator Cancel All has no ladder, so its
+// possibly-submitted branch gets a deadline of its own -- the wait plus the
+// retry budget -- and pauses to re-check again only while a re-check shows
+// the sweep still running and one more pause still leaves the final
+// re-cancel a request timeout before the deadline.
+//
+// MUTATION: the pause is taken whether or not the sweep is shown running
+// -> FAILS here, and nowhere else.
+// MUTATION: the pause ignores the deadline -> FAILS here, and nowhere else.
+// MUTATION: the deadline reaches far past the retry budget -> FAILS here, and
+// nowhere else.
+TEST(CancelRetry, TheOperatorPathWaitsAgainOnlyWhileTheSweepRunsAndTheDeadlineAllows)
+{
+    const CancelRetryConfig cfg{};
+    const std::uint32_t wait = cfg.possibly_submitted_wait_ms;
+    const std::uint64_t deadline = possibly_submitted_deadline_ms(wait, cfg);
+    EXPECT_EQ(deadline, 125'000u) << "35 s of wait, then the 90 s budget";
+    EXPECT_EQ(kPossiblySubmittedRecheckIntervalMs, 10'000u);
+    const std::uint64_t reserve = kDefaultWalletRequestTimeoutMs;
+
+    // Right after the first re-check: pause only if the sweep is running.
+    EXPECT_EQ(possibly_submitted_rewait_ms(true, wait, deadline, reserve),
+              kPossiblySubmittedRecheckIntervalMs);
+    EXPECT_EQ(possibly_submitted_rewait_ms(false, wait, deadline, reserve), 0u)
+        << "no sign the sweep is still running: act now";
+
+    // The last pause that still leaves the reserve before the deadline...
+    const std::uint64_t last =
+        deadline - reserve - kPossiblySubmittedRecheckIntervalMs;
+    EXPECT_EQ(possibly_submitted_rewait_ms(true, last, deadline, reserve),
+              kPossiblySubmittedRecheckIntervalMs);
+    // ...and one millisecond later there is no room: re-cancel now.
+    EXPECT_EQ(possibly_submitted_rewait_ms(true, last + 1, deadline, reserve),
+              0u);
+    // At or past the deadline: never pause.
+    EXPECT_EQ(possibly_submitted_rewait_ms(true, deadline, deadline, reserve),
+              0u);
+    EXPECT_EQ(possibly_submitted_rewait_ms(true, deadline + 1, deadline,
+                                           reserve),
+              0u);
 }

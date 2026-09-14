@@ -65,9 +65,15 @@ def test_both_resend_paths_ask_the_policy():
 # the wallet (rpc::cancel_possibly_submitted) must not be sent again until
 # each offer has been re-checked.  The decisions are pure and pinned by gtest
 # (cancel_retry.hpp, test_cancel_retry.cpp).  OfferManager and Engine are not
-# constructible in xop_tests, so the three call sites that act on them are
-# pinned here, over the source text, with the same disclosure as above: these
-# prove the calls are present and ordered, not that they behave at run time.
+# constructible in xop_tests, so the call sites that act on them are pinned
+# here, over the source text, with the same disclosure as above: these prove
+# the calls are present and ordered, not that they behave at run time.
+#
+# [review 2026-09-13, round 3] Added: the shutdown never stamps an offer a
+# re-check found resolved; operator Cancel All is bounded by a deadline and
+# yields to a shutdown request; an unparseable reply is a transport failure;
+# the reload drain waits for an operator Cancel All.  The scans below are also
+# hardened against the reintroductions an independent review listed.
 # ---------------------------------------------------------------------------
 
 OFFER_MANAGER_CPP = REPO / "cpp" / "src" / "execution" / "offer_manager.cpp"
@@ -137,6 +143,11 @@ def _in_order(haystack: str, needles: list[str]) -> list[int]:
     return found
 
 
+def _operator_branch() -> tuple[str, str]:
+    code = _code(_definition(ENGINE_CPP, "void Engine::check_cancel_all_flag()"))
+    return code, _block(code, "if(done.bulk_possibly_submitted){")
+
+
 def test_cancel_all_sends_nothing_more_after_a_possibly_submitted_sweep():
     code = _code(_definition(
         OFFER_MANAGER_CPP,
@@ -166,6 +177,19 @@ def test_cancel_all_sends_nothing_more_after_a_possibly_submitted_sweep():
     assert code.count("cancel_ids(") == 1
     assert code.find("cancel_ids(") > branches[2]
 
+    # [review 2026-09-13, round 3] No RPC of ANY kind leaves that branch --
+    # not cancel_ids, not cancel_offer_charged, not emergency_cancel -- and
+    # nothing clears the classifier's answer before the branch reads it: the
+    # flag is written by its declaration, the classifier and the outcome only.
+    assert "co_await" not in possibly, (
+        "the possibly-submitted branch awaits an RPC: every cancel it sends can "
+        "queue behind the sweep and build a second, conflicting spend"
+    )
+    assert code.count("bulk_possibly_submitted=") == 3, (
+        "bulk_possibly_submitted is written somewhere else in cancel_all -- a "
+        "reset after the catch would send a timed-out sweep to the per-id fallback"
+    )
+
 
 def test_shutdown_ladder_rechecks_before_it_cancels_by_id():
     code = _code(_definition(ENGINE_CPP, "void Engine::shutdown()"))
@@ -186,24 +210,112 @@ def test_shutdown_ladder_rechecks_before_it_cancels_by_id():
         "if(ladder.needs_recheck()){")
 
 
-def test_operator_cancel_all_waits_and_rechecks_before_it_cancels_by_id():
-    code = _code(_definition(ENGINE_CPP, "void Engine::check_cancel_all_flag()"))
+def test_shutdown_tags_rechecked_dead_offers_and_never_stamps_them():
+    """[review 2026-09-13, round 3] A shutdown re-check that finds an offer
+    CANCELLED or FAILED tags it Submitted and leaves the stamp to the next
+    engine's intent sweep, whose writer is wallet-verified; a FILLED one only
+    drops its intent.  Stamping from this site added a terminal 'cancelled'
+    writer that the cancel-truth branch's offer_log write discipline rejects."""
+    code = _code(_definition(ENGINE_CPP, "void Engine::shutdown()"))
+    dead = _block(code, "for(constauto&id:ladder.resolved_dead()){")
+    assert "cancel_intent_[id]=CancelIntentTag::Submitted;" in dead
+    filled = _block(code, "for(constauto&id:ladder.resolved_filled()){")
+    assert "cancel_intent_.erase(id);" in filled
+    for loop, what in ((dead, "cancelled or failed"), (filled, "filled")):
+        for writer in ("update_offer_status(", "mark_offer_cancel_submitted("):
+            assert writer not in loop, (
+                "the shutdown writes offer_log for a %s offer a re-check found "
+                "resolved (%s) -- leave it to the intent sweep" % (what, writer)
+            )
+    after = code.find("for(constauto&id:ladder.resolved_filled()){")
+    assert code.find("write_cancel_intent(cancel_intent_);", after) != -1, (
+        "the tags must be written to the intent file after both loops"
+    )
 
-    possibly = _block(code, "if(done.bulk_possibly_submitted){")
+
+def test_operator_cancel_all_waits_and_rechecks_before_it_cancels_by_id():
+    code, possibly = _operator_branch()
+
+    # The first pause is one request timeout of this client, and nothing
+    # shortens it.
+    assert possibly.count(
+        "conststd::uint32_twait_ms=execution::wait_after_possibly_submitted_ms("
+        "wallet_->request_timeout().count());") == 1, (
+        "the wait must be one request timeout of the client that sent the sweep"
+    )
+    assert possibly.count("wait_ms=") == 1, "wait_ms is written a second time"
+    assert "std::uint32_tpause_ms=wait_ms;" in possibly
     _in_order(possibly, [
-        "wait_after_possibly_submitted_ms(wallet_->request_timeout().count())",
-        "expires_after(std::chrono::milliseconds(wait_ms));",
         "async_wait(asio::use_awaitable);",
         "recheck_terminal(",
         "execution::partition_rechecked_offer(",
-        "cancel_ids(part.recancel)",
+        "constboolsweep_running=execution::recheck_shows_sweep_running(part,seen_running);",
+        "live=std::move(part.recancel);",
+        "pause_ms=execution::possibly_submitted_rewait_ms(sweep_running,",
+        "cancel_ids(one_id",
     ])
+    # Only what a re-check found live is re-cancelled, one id at a time; an id
+    # with no verdict never is.
+    assert possibly.count("live=") == 1, (
+        "the re-cancel list is filled from something other than the re-check's "
+        "live bucket"
+    )
+    recancel = _block(possibly, "for(constauto&id:live){")
+    assert "conststd::vector<std::string>one_id{id};" in recancel
     assert code.count("cancel_ids(") == 1, (
         "operator Cancel All re-cancels by id outside the re-check"
     )
     # The wait and the re-check come before the intent tags and the logs.
     assert code.find("if(done.bulk_possibly_submitted){") < code.find(
         "cancel_intent_[id]=CancelIntentTag::Submitted;")
+
+
+def test_operator_cancel_all_is_bounded_by_its_deadline():
+    """[review 2026-09-13, round 3] The deadline is the wait plus the retry
+    budget.  No probe starts past it, the final re-cancel is handed it, and
+    the pause-and-re-check loop is planned against it."""
+    _, possibly = _operator_branch()
+    assert ("conststd::uint64_tdeadline_ms=execution::possibly_submitted_deadline_ms("
+            "wait_ms,execution::CancelRetryConfig{});") in possibly
+    assert ("constautodeadline=branch_t0+std::chrono::milliseconds("
+            "static_cast<std::int64_t>(deadline_ms));") in possibly
+    probes = _block(possibly, "for(constauto&id:to_probe){")
+    _in_order(probes, ["std::chrono::steady_clock::now()<deadline", "recheck_terminal("])
+    assert ("possibly_submitted_rewait_ms(sweep_running,branch_elapsed_ms(),"
+            "deadline_ms,recancel_reserve_ms)") in possibly
+    recancel = _block(possibly, "for(constauto&id:live){")
+    _in_order(recancel, [
+        "if(std::chrono::steady_clock::now()>=deadline){",
+        "cancel_ids(one_id,deadline)",
+    ])
+
+
+def test_operator_cancel_all_stops_for_a_shutdown():
+    """[review 2026-09-13, round 3] shutdown() waits on cancel_all_inflight_,
+    so this branch must yield to a shutdown request: while pausing, before
+    each probe and before each re-cancel."""
+    _, possibly = _operator_branch()
+    assert ("constautoshutdown_requested=[this](){returngraceful_cancel_active_.load("
+            "std::memory_order_acquire);};") in possibly
+    pause = _block(possibly, "while(std::chrono::steady_clock::now()<wake_at){")
+    _in_order(pause, [
+        "if(shutdown_requested()){stopped_for_shutdown=true;break;}",
+        "async_wait(asio::use_awaitable);",
+    ])
+    probes = _block(possibly, "for(constauto&id:to_probe){")
+    _in_order(probes, [
+        "if(shutdown_requested())stopped_for_shutdown=true;",
+        "if(!stopped_for_shutdown",
+        "recheck_terminal(",
+    ])
+    recancel = _block(possibly, "for(constauto&id:live){")
+    _in_order(recancel, [
+        "if(stopped_for_shutdown||shutdown_requested()){",
+        "cancel_ids(one_id",
+    ])
+    assert possibly.count("if(stopped_for_shutdown)break;") == 2, (
+        "a shutdown seen while pausing or probing must end the loop at once"
+    )
 
 
 def test_operator_cancel_all_clears_its_inflight_flag_on_every_exit():
@@ -219,4 +331,43 @@ def test_operator_cancel_all_clears_its_inflight_flag_on_every_exit():
         "a bare clear after the catch is back: an exception that is not a "
         "std::exception, or a frame destroyed during the wait, leaves the flag "
         "set and defers every later cancel"
+    )
+
+
+def test_an_unparseable_cancel_reply_is_classed_as_a_transport_failure():
+    """[review 2026-09-13, round 3] A 2xx whose body is not JSON reached the
+    handler, which ran the request.  rpc_post must report it as a transport
+    failure carrying CURLE_OK and that status, so cancel_all's classifier
+    reads it as possibly submitted instead of taking the per-id fallback."""
+    parse = _block(_code(_rpc_post_body()), "catch(constjson::parse_error&ex){")
+    assert "throwChiaRPCTransportError(" in parse, (
+        "an unparseable reply is thrown as a plain ChiaRPCError again -- a "
+        "timed-out-looking refusal to cancel_all, which re-cancels per id"
+    )
+    assert parse.endswith(",http_code,CURLE_OK);}")
+    assert "throwChiaRPCError(" not in parse
+
+
+def test_the_reload_drain_waits_for_an_operator_cancel_all():
+    """[review 2026-09-13, round 3] The reload drain for live-disabled pairs
+    defers while an operator Cancel All is in flight, reports itself not clean
+    so the set is kept, and the retry leg that runs every heartbeat picks it
+    up once the flag clears."""
+    drain = _code(_definition(
+        ENGINE_CPP, "asio::awaitable<bool> Engine::sweep_reload_disabled_offers()"))
+    gate = _block(drain, "if(cancel_all_inflight_){")
+    assert "co_returnfalse;" in gate, (
+        "a deferred drain must report not clean, or the retry leg never runs it"
+    )
+    assert "reload_pending_cancel_.clear()" not in gate
+    assert drain.find("if(cancel_all_inflight_){") < drain.find("selective_cancel("), (
+        "the drain cancels per id before it looks at cancel_all_inflight_"
+    )
+    reload = _code(_definition(
+        ENGINE_CPP, "asio::awaitable<void> Engine::check_config_reload_flag()"))
+    retry_leg = reload.find(
+        "if(!reload_pending_cancel_.empty()){constboolclean=co_awaitsweep_reload_disabled_offers();")
+    assert retry_leg != -1, "the heartbeat retry leg for a kept set is gone"
+    assert retry_leg < reload.find("if(!fs::exists(config_reload_flag_path_,ec))co_return;"), (
+        "the retry leg must run every heartbeat, before the reload flag is looked for"
     )

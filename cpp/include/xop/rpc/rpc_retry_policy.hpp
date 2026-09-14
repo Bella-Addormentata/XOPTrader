@@ -148,11 +148,33 @@ enum class RpcRetryPolicy {
 /// builds a SECOND, conflicting spend of an offer the sweep already cancelled
 /// -- and neither bundle can replace the other.
 ///
-/// TRUE when the failure can follow a request the handler received: a
-/// timeout, an empty reply, a send or receive error, a partial transfer, or
-/// an HTTP 5xx.  FALSE for every other code: those fail before the request
-/// is written (no connection, a failed TLS handshake, a bad URL), and any
-/// other HTTP status is an answer.
+/// [review 2026-09-13, round 3] THE DEFAULT IS "POSSIBLY SUBMITTED".  Only a
+/// failure that provably happens before the request is written counts as
+/// NOT submitted:
+///   * the request could not be built -- CURLE_FAILED_INIT (perform_request
+///     returns it when no handle can be created), CURLE_URL_MALFORMAT,
+///     CURLE_UNSUPPORTED_PROTOCOL;
+///   * no proxy or host address was resolved, or no TCP connection was made;
+///   * the TLS handshake failed or could not start: a local certificate,
+///     cipher, CA or CRL problem, or the server's certificate failing
+///     verification.  curl writes the HTTP request only after the handshake.
+/// Every other code may follow a request the handler received, so it is
+/// TRUE: a timeout, an empty or garbled reply (CURLE_GOT_NOTHING,
+/// CURLE_WEIRD_SERVER_REPLY), a send or receive error, a partial transfer, an
+/// out-of-memory mid-transfer -- and any code this list does not name,
+/// including one a newer libcurl adds.
+///
+/// With CURLE_OK the transfer completed and an HTTP status came back:
+///   * 4xx, 429 included, is FALSE: the server answered that it refused the
+///     request -- no such route, a malformed body, a rate limit -- before any
+///     cancel ran, so the per-offer fallback cannot race it;
+///   * 5xx is TRUE: the handler, or something in front of it, failed while
+///     the request may already have been acted on;
+///   * 2xx is TRUE: rpc_post reports a 2xx as a transport failure only when
+///     the body could not be parsed as JSON -- the wallet ran the request and
+///     only its answer was lost;
+///   * anything else (1xx, 3xx, no status) is not a refusal the client can
+///     read, so it is TRUE as well.
 ///
 /// A CONNECT-PHASE TIMEOUT IS CLASSED AS POSSIBLY SUBMITTED ON PURPOSE.
 /// CURLOPT_CONNECTTIMEOUT_MS (3 s on localhost, chia_rpc.cpp) reports the
@@ -166,16 +188,32 @@ enum class RpcRetryPolicy {
     CURLcode rc, long http_code) noexcept
 {
     switch (rc) {
-        case CURLE_OPERATION_TIMEDOUT:
-        case CURLE_GOT_NOTHING:
-        case CURLE_SEND_ERROR:
-        case CURLE_RECV_ERROR:
-        case CURLE_PARTIAL_FILE:
-            return true;
         case CURLE_OK:
-            return http_code >= 500;
-        default:
+            return !(http_code >= 400 && http_code < 500);
+        // The request was never built.
+        case CURLE_FAILED_INIT:
+        case CURLE_URL_MALFORMAT:
+        case CURLE_UNSUPPORTED_PROTOCOL:
+        // No address, or no connection.
+        case CURLE_COULDNT_RESOLVE_PROXY:
+        case CURLE_COULDNT_RESOLVE_HOST:
+        case CURLE_COULDNT_CONNECT:
+        // The TLS handshake failed, or could not start.
+        case CURLE_SSL_CONNECT_ERROR:
+        case CURLE_PEER_FAILED_VERIFICATION:
+        case CURLE_SSL_CERTPROBLEM:
+        case CURLE_SSL_CIPHER:
+        case CURLE_SSL_CACERT_BADFILE:
+        case CURLE_SSL_CRL_BADFILE:
+        case CURLE_SSL_ISSUER_ERROR:
+        case CURLE_SSL_PINNEDPUBKEYNOTMATCH:
+        case CURLE_SSL_INVALIDCERTSTATUS:
+        case CURLE_SSL_ENGINE_NOTFOUND:
+        case CURLE_SSL_ENGINE_SETFAILED:
+        case CURLE_SSL_ENGINE_INITFAILED:
             return false;
+        default:
+            return true;
     }
 }
 

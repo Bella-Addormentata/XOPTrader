@@ -1757,7 +1757,20 @@ void Engine::shutdown()
                             part.recancel.size(), part.already_pending.size(),
                             part.dead.size(), part.filled.size(),
                             part.unknown.size());
+                        // [review 2026-09-13, round 3] record_recheck holds the
+                        // live ids back when the re-check shows the sweep still
+                        // working through the book (cancel_retry.hpp).
+                        const std::size_t live_found = part.recancel.size();
                         ladder.record_recheck(std::move(part));
+                        if (ladder.outstanding().size() < live_found) {
+                            spdlog::warn(
+                                "[Engine] [S46] the re-check shows the sweep "
+                                "still working through the book -- {} still-live "
+                                "offer(s) held back from attempt {}, not "
+                                "cancelled",
+                                live_found - ladder.outstanding().size(),
+                                act.attempt_index);
+                        }
                     }
 
                     // The first attempt keeps the bulk endpoint (one RPC for
@@ -1939,23 +1952,21 @@ void Engine::shutdown()
                 }
 
                 // [review 2026-09-13, round 2] Offers a re-check found
-                // already resolved left the ladder. Handle them exactly as
-                // sweep_cancel_intent does. The wallet says CANCELLED or
-                // FAILED: stamp the row and drop the intent. The wallet says
-                // CONFIRMED: it FILLED, so drop the intent and do NOT stamp
-                // it cancelled -- its offer_log row stays pending, which the
-                // next engine restores at boot and books through the fill
-                // path.
+                // already resolved left the ladder.
+                //
+                // [review 2026-09-13, round 3] CANCELLED or FAILED: NOT
+                // stamped here. Tagged Submitted, so the next engine's intent
+                // sweep asks the wallet again and stamps the row through its
+                // own wallet-verified writer (s46_intent_recovery) -- the
+                // operator path leaves resolved ids to that same sweep. A
+                // stamp from this site was one more terminal 'cancelled'
+                // writer beside the wallet-verified ones, for no gain: the
+                // row is stamped one boot later either way.
+                // CONFIRMED: it FILLED, so drop the intent and do NOT stamp it
+                // cancelled -- its offer_log row stays pending, which the next
+                // engine restores at boot and books through the fill path.
                 for (const auto& id : ladder.resolved_dead()) {
-                    cancel_intent_.erase(id);
-                    try {
-                        db_->update_offer_status(id, "cancelled", 0,
-                                                 "shutdown_recheck");
-                    } catch (const std::exception& e) {
-                        spdlog::debug("[Engine] [S46] shutdown re-check could "
-                                      "not stamp {}: {}", id.substr(0, 12),
-                                      e.what());
-                    }
+                    cancel_intent_[id] = CancelIntentTag::Submitted;
                 }
                 for (const auto& id : ladder.resolved_filled()) {
                     cancel_intent_.erase(id);
@@ -19764,77 +19775,201 @@ void Engine::check_cancel_all_flag()
                 // inside the wallet, and a per-id cancel queued behind it
                 // builds a second, conflicting spend of an offer it already
                 // cancelled. Wait at least one request timeout of this wallet
-                // client, with cancel_all_inflight_ still set so the heartbeat
-                // intent sweep and every other cancel path stay deferred; then
-                // ask the wallet about each offer and cancel only the ones it
-                // still reports live with no cancel spend in flight. Offers
-                // the wallet reports resolved keep their Ordered intent: the
-                // heartbeat intent sweep, which runs once this clears the
-                // flag, stamps a cancelled one and hands a filled one to the
-                // fill path, as it does for any recovered intent.
+                // client with cancel_all_inflight_ still set, then ask the
+                // wallet about each offer and cancel only the ones it still
+                // reports live with no cancel spend in flight.
+                //
+                // [review 2026-09-13, round 3] WHAT THE FLAG DEFERS, AND WHAT
+                // IT DOES NOT. It defers the heartbeat intent sweep, the Step 8
+                // stale sweep and its drain, the peg-suspend drain, the reload
+                // drain for live-disabled pairs, a second Cancel All and a
+                // shutdown, which waits for it. It does NOT defer XCH
+                // recovery's wallet-wide re-send (recovery.cancel_on_enter,
+                // false in the live config) or the dead man's switch, which
+                // fires only on a real stall.
+                //
+                // [review 2026-09-13, round 3] BOUNDED, AND A SHUTDOWN WINS.
+                //   * A deadline: the wait plus the retry budget
+                //     (execution::possibly_submitted_deadline_ms). Probes and
+                //     re-cancels stop at it; only an RPC already in flight
+                //     runs past it.
+                //   * A shutdown request ends the branch at the next check --
+                //     every 250 ms while pausing, before each probe and before
+                //     each re-cancel -- so shutdown()'s wait on
+                //     cancel_all_inflight_ is bounded by one check plus one RPC
+                //     in flight. The ids not yet handled keep their Ordered
+                //     intent, and the shutdown's own cancel takes them over.
+                //   * A re-check that shows the sweep still working through
+                //     the book (execution::recheck_shows_sweep_running)
+                //     cancels nothing: it pauses and re-checks again while the
+                //     deadline allows, then re-cancels only the ids still live.
+                // Offers the wallet reports resolved keep their Ordered intent:
+                // the heartbeat intent sweep, which runs once the flag clears,
+                // stamps a cancelled one and hands a filled one to the fill
+                // path, as for any recovered intent.
                 if (done.bulk_possibly_submitted) {
                     const std::uint32_t wait_ms =
                         execution::wait_after_possibly_submitted_ms(
                             wallet_->request_timeout().count());
+                    const std::uint64_t deadline_ms =
+                        execution::possibly_submitted_deadline_ms(
+                            wait_ms, execution::CancelRetryConfig{});
+                    const auto branch_t0 = std::chrono::steady_clock::now();
+                    const auto deadline =
+                        branch_t0 + std::chrono::milliseconds(
+                            static_cast<std::int64_t>(deadline_ms));
+                    const auto branch_elapsed_ms = [branch_t0]() -> std::uint64_t {
+                        const auto d =
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - branch_t0)
+                                .count();
+                        return d > 0 ? static_cast<std::uint64_t>(d)
+                                     : std::uint64_t{0};
+                    };
+                    const auto shutdown_requested = [this]() {
+                        return graceful_cancel_active_.load(
+                            std::memory_order_acquire);
+                    };
+                    // One request timeout of this client is kept back before
+                    // the deadline for the final re-cancel.
+                    const std::uint64_t recancel_reserve_ms =
+                        static_cast<std::uint64_t>(std::max<std::int64_t>(
+                            0, wallet_->request_timeout().count()));
                     spdlog::warn(
                         "[Engine] [CANCELALL] the wallet-wide sweep got NO "
-                        "ANSWER ({}) and may still be running -- sending "
+                        "USABLE ANSWER ({}) and may still be running -- sending "
                         "nothing for {} ms, then re-checking {} tracked "
-                        "offer(s) before any is cancelled again",
+                        "offer(s) before any is cancelled again (deadline {} "
+                        "ms)",
                         done.last_error.empty() ? "no error text"
                                                 : done.last_error,
-                        wait_ms, done.failed.size());
-                    asio::steady_timer wait_timer(ioc_);
-                    wait_timer.expires_after(std::chrono::milliseconds(wait_ms));
-                    co_await wait_timer.async_wait(asio::use_awaitable);
+                        wait_ms, done.failed.size(), deadline_ms);
 
                     const BlockHeight recheck_block =
                         last_block_.load(std::memory_order_relaxed);
-                    execution::RecheckPartition part;
-                    for (const auto& id : done.failed) {
-                        const execution::TerminalRecheck verdict =
-                            co_await offer_mgr_->recheck_terminal(
-                                id, recheck_block);
-                        execution::partition_rechecked_offer(
-                            part, id, verdict,
-                            state_->get_offer(id).cancel_pending);
-                    }
-                    auto again = co_await offer_mgr_->cancel_ids(part.recancel);
+                    // live: the last re-check reported it live with no cancel
+                    // in flight. undecided: not re-checked yet, or no verdict.
+                    std::vector<std::string> live;
+                    std::vector<std::string> undecided = std::move(done.failed);
+                    done.failed.clear();
+                    bool seen_running = false;
+                    bool stopped_for_shutdown = false;
+                    std::size_t rechecks = 0;
+                    std::size_t n_dead = 0;
+                    std::size_t n_filled = 0;
+                    std::uint32_t pause_ms = wait_ms;
+                    asio::steady_timer pause_timer(ioc_);
+                    for (;;) {
+                        // Pause, looking for a shutdown request every 250 ms.
+                        const auto wake_at = std::chrono::steady_clock::now()
+                            + std::chrono::milliseconds(pause_ms);
+                        while (std::chrono::steady_clock::now() < wake_at) {
+                            if (shutdown_requested()) {
+                                stopped_for_shutdown = true;
+                                break;
+                            }
+                            pause_timer.expires_after(
+                                std::min<std::chrono::steady_clock::duration>(
+                                    std::chrono::milliseconds(250),
+                                    wake_at - std::chrono::steady_clock::now()));
+                            co_await pause_timer.async_wait(asio::use_awaitable);
+                        }
+                        if (stopped_for_shutdown) break;
 
-                    // Fold it back in, so the tagging and the logging below
-                    // see what is true now: what the re-cancel took, what was
-                    // already cancelling, and what is still live -- the
-                    // refused ids and the ones with no verdict.
-                    const std::size_t recancelled = again.cancelled.size();
-                    for (auto& id : again.cancelled) {
-                        done.cancelled.push_back(std::move(id));
+                        // Re-check every offer still live or undecided. No
+                        // probe starts past the deadline or after a shutdown
+                        // request: that offer is a NoVerdict, never cancelled
+                        // blind.
+                        std::vector<std::string> to_probe = std::move(live);
+                        for (auto& id : undecided) to_probe.push_back(std::move(id));
+                        live.clear();
+                        undecided.clear();
+                        execution::RecheckPartition part;
+                        ++rechecks;
+                        for (const auto& id : to_probe) {
+                            if (shutdown_requested()) stopped_for_shutdown = true;
+                            execution::TerminalRecheck verdict =
+                                execution::TerminalRecheck::NoVerdict;
+                            if (!stopped_for_shutdown
+                                && std::chrono::steady_clock::now() < deadline) {
+                                verdict = co_await offer_mgr_->recheck_terminal(
+                                    id, recheck_block);
+                            }
+                            execution::partition_rechecked_offer(
+                                part, id, verdict,
+                                state_->get_offer(id).cancel_pending);
+                        }
+                        const bool sweep_running =
+                            execution::recheck_shows_sweep_running(part, seen_running);
+                        seen_running =
+                            seen_running || execution::recheck_saw_the_sweep(part);
+                        for (auto& id : part.already_pending) {
+                            done.already_pending.push_back(std::move(id));
+                        }
+                        n_dead += part.dead.size();
+                        n_filled += part.filled.size();
+                        live = std::move(part.recancel);
+                        undecided = std::move(part.unknown);
+                        if (stopped_for_shutdown) break;
+
+                        pause_ms = execution::possibly_submitted_rewait_ms(
+                            sweep_running, branch_elapsed_ms(), deadline_ms,
+                            recancel_reserve_ms);
+                        if (pause_ms == 0) break;
+                        spdlog::warn(
+                            "[Engine] [CANCELALL] re-check {} shows the sweep "
+                            "still working through the book: {} offer(s) still "
+                            "live are NOT cancelled yet -- re-checking in {} ms",
+                            rechecks, live.size(), pause_ms);
                     }
-                    for (auto& id : part.already_pending) {
-                        done.already_pending.push_back(std::move(id));
+
+                    // Re-cancel the offers still live, one at a time, so a
+                    // shutdown request or the deadline is seen between them.
+                    std::size_t recancelled = 0;
+                    for (const auto& id : live) {
+                        if (stopped_for_shutdown || shutdown_requested()) {
+                            stopped_for_shutdown = true;
+                            done.failed.push_back(id);
+                            continue;
+                        }
+                        if (std::chrono::steady_clock::now() >= deadline) {
+                            done.failed.push_back(id);
+                            continue;
+                        }
+                        const std::vector<std::string> one_id{id};
+                        auto one = co_await offer_mgr_->cancel_ids(one_id, deadline);
+                        recancelled += one.cancelled.size();
+                        for (auto& c : one.cancelled) {
+                            done.cancelled.push_back(std::move(c));
+                        }
+                        for (auto& a : one.already_pending) {
+                            done.already_pending.push_back(std::move(a));
+                        }
+                        for (auto& f : one.failed) {
+                            done.failed.push_back(std::move(f));
+                        }
+                        if (!one.last_error.empty()) {
+                            done.last_error  = std::move(one.last_error);
+                            done.worst_class = one.worst_class;
+                        }
                     }
-                    for (auto& id : again.already_pending) {
-                        done.already_pending.push_back(std::move(id));
-                    }
-                    done.failed = std::move(again.failed);
-                    for (auto& id : part.unknown) {
-                        done.failed.push_back(std::move(id));
-                    }
-                    if (!again.last_error.empty()) {
-                        done.last_error  = std::move(again.last_error);
-                        done.worst_class = again.worst_class;
-                    }
+                    for (auto& id : undecided) done.failed.push_back(std::move(id));
+
                     spdlog::critical(
-                        "[Engine] [CANCELALL] after the wallet-wide sweep "
-                        "that got no answer: {} re-cancelled, {} already "
-                        "cancelling, {} resolved by the wallet ({} cancelled "
-                        "or failed, {} FILLED; the intent sweep records "
-                        "them), {} with no verdict. The sweep itself is "
-                        "UNCONFIRMED: offers this process never tracked may "
-                        "still be RESTING",
-                        recancelled, done.already_pending.size(),
-                        part.dead.size() + part.filled.size(),
-                        part.dead.size(), part.filled.size(),
-                        part.unknown.size());
+                        "[Engine] [CANCELALL] after the wallet-wide sweep that "
+                        "got no usable answer: {} re-check(s), {} re-cancelled, "
+                        "{} already cancelling, {} resolved by the wallet ({} "
+                        "cancelled or failed, {} FILLED; the intent sweep "
+                        "records them), {} still live or unanswered{}. The "
+                        "sweep itself is UNCONFIRMED: offers this process "
+                        "never tracked may still be RESTING",
+                        rechecks, recancelled, done.already_pending.size(),
+                        n_dead + n_filled, n_dead, n_filled,
+                        done.failed.size(),
+                        stopped_for_shutdown
+                            ? " -- a shutdown was requested, and its own "
+                              "cancel takes them over"
+                            : "");
                 }
                 spdlog::warn("[Engine] [CANCELALL] {} offer(s) submitted "
                              "for cancel", done.cancelled.size());
@@ -19923,6 +20058,20 @@ void Engine::set_config_paths(std::string config_path, std::string secrets_path)
 asio::awaitable<bool> Engine::sweep_reload_disabled_offers()
 {
     if (reload_pending_cancel_.empty()) co_return true;
+
+    // [review 2026-09-13, round 3] Not while an operator Cancel All is
+    // walking the same book -- above all while it waits out a wallet-wide
+    // sweep that got no usable answer, when selective_cancel here would queue
+    // per-id cancels behind that sweep. Deferred like the intent sweep and the
+    // Step 8 drain: the set is kept and reported not clean, so
+    // check_config_reload_flag's retry leg runs this again next heartbeat,
+    // once the flag has cleared.
+    if (cancel_all_inflight_) {
+        spdlog::info("[Engine] [RELOAD] cancelling the live-disabled pairs' "
+                     "offers is deferred: an operator Cancel All is in flight "
+                     "over the same book -- retrying next heartbeat");
+        co_return false;
+    }
 
     std::vector<std::string> to_cancel;
     for (const auto& po : state_->get_all_offers()) {
