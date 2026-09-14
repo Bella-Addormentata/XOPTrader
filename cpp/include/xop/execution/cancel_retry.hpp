@@ -367,6 +367,11 @@ struct CancelAttemptState {
     /// cfg.possibly_submitted_wait_ms.  False keeps today's schedule;
     /// CancelLadder sets it from the attempt it recorded.
     bool             possibly_submitted{false};
+    /// [review 2026-09-13, round 4] The part of that wait still owed, when
+    /// the attempt was seeded from a sweep whose wait had already partly run
+    /// (seeded_unanswered_sweep_outcome).  0 means the whole
+    /// cfg.possibly_submitted_wait_ms.
+    std::uint32_t    possibly_submitted_wait_ms{0};
 };
 
 struct CancelRetryPlan {
@@ -450,14 +455,19 @@ plan_cancel_retry(CancelAttemptState state,
     // why, and every consumer already treats it as unclean and hands the
     // still-live ids, by name, to the S31 fallback.
     if (state.possibly_submitted) {
+        // [review 2026-09-13, round 4] Only the rest of the wait, when the
+        // ladder was seeded from a sweep whose wait had already partly run.
+        // The sleep is still never shorter than today's backoff.
+        const std::uint32_t wait = state.possibly_submitted_wait_ms != 0
+            ? state.possibly_submitted_wait_ms
+            : cfg.possibly_submitted_wait_ms;
         const std::uint64_t needed =
-            std::uint64_t{cfg.possibly_submitted_wait_ms}
-            + cfg.min_useful_delay_ms;
+            std::uint64_t{wait} + cfg.min_useful_delay_ms;
         if (budget_left < needed) {
             plan.stop_reason = CancelStopReason::BudgetExhausted;
             return plan;
         }
-        delay = std::max(delay, cfg.possibly_submitted_wait_ms);
+        delay = std::max(delay, wait);
     }
     if (delay > budget_left) {
         // Clamp into what is left rather than refusing outright: the last
@@ -636,6 +646,11 @@ struct CancelAttemptOutcome {
     /// NOT an answer -- sending again at once is the duplicate -- but it
     /// proves the untracked book empty no more than a refusal does.
     bool                     bulk_possibly_submitted{false};
+    /// [review 2026-09-13, round 4] With bulk_possibly_submitted: the part of
+    /// the wait still owed, when that wait had already partly run before this
+    /// ladder began.  0 means the whole cfg.possibly_submitted_wait_ms.  Set
+    /// only by seeded_unanswered_sweep_outcome.
+    std::uint32_t            possibly_submitted_wait_ms{0};
 };
 
 // ---------------------------------------------------------------------------
@@ -659,6 +674,12 @@ struct CancelAttemptOutcome {
 // `cancel_pending` is read from State AFTER recheck_terminal, which marks it
 // for a PENDING_CANCEL record -- that is how the two Revived rows are told
 // apart without widening TerminalRecheck.
+//
+// [review 2026-09-13, round 4] `pending_before_sweep`: State already had a
+// cancel in flight for this offer BEFORE the sweep -- a TTL or rebalance
+// cancel the engine sent itself.  The offer still lands in already_pending or
+// dead, and is still never cancelled again, but it is no evidence that the
+// sweep reached the book, so it does not count in `sweep_evidence`.
 // ---------------------------------------------------------------------------
 struct RecheckPartition {
     std::vector<std::string> recancel{};
@@ -666,16 +687,22 @@ struct RecheckPartition {
     std::vector<std::string> dead{};
     std::vector<std::string> filled{};
     std::vector<std::string> unknown{};
+    /// [review 2026-09-13, round 4] Offers in already_pending or dead that
+    /// were NOT already being cancelled before the sweep: the only ones that
+    /// show the sweep reached the book (recheck_saw_the_sweep).
+    std::uint32_t            sweep_evidence{0};
 };
 
 inline void partition_rechecked_offer(RecheckPartition& into,
                                       std::string       id,
                                       TerminalRecheck   verdict,
-                                      bool              cancel_pending)
+                                      bool              cancel_pending,
+                                      bool              pending_before_sweep = false)
 {
     switch (verdict) {
         case TerminalRecheck::StillTerminal:
             into.dead.push_back(std::move(id));
+            if (!pending_before_sweep) ++into.sweep_evidence;
             return;
         case TerminalRecheck::Confirmed:
             into.filled.push_back(std::move(id));
@@ -683,6 +710,7 @@ inline void partition_rechecked_offer(RecheckPartition& into,
         case TerminalRecheck::Revived:
             if (cancel_pending) {
                 into.already_pending.push_back(std::move(id));
+                if (!pending_before_sweep) ++into.sweep_evidence;
             } else {
                 into.recancel.push_back(std::move(id));
             }
@@ -721,19 +749,28 @@ inline void partition_rechecked_offer(RecheckPartition& into,
 // Without carrying that evidence forward, a re-check of the still-live ids
 // alone would read as "the sweep never ran" and re-cancel them mid-sweep.
 //
-// CONSERVATIVE BY CONSTRUCTION.  An offer whose cancel was already in flight
-// BEFORE the sweep, or one already dead, counts as evidence too, so the rule
-// can hold ids back when the sweep never ran at all.  That costs time -- and,
-// at shutdown, hands the held ids by name to the S31 fallback -- but it never
-// builds a duplicate spend.  A FILLED offer is not evidence: a taker, not the
-// sweep, resolved it.
+// CONSERVATIVE, BUT NOT ON THE ENGINE'S OWN CANCELS.  An offer found cancelled
+// or cancelling counts even when something other than the sweep did it, so
+// the rule can hold ids back when the sweep never ran.  That costs time, and
+// it moves the cancel rather than removing it: at shutdown the held ids go to
+// the S31 fallback by name, and on the operator path they are re-cancelled at
+// its deadline.  [review 2026-09-13, round 4] What does NOT count is an offer
+// State already had a cancel in flight for BEFORE the sweep
+// (partition_rechecked_offer's pending_before_sweep): a TTL or rebalance
+// cancel the engine sent itself would otherwise hold every live offer back
+// after a sweep that never arrived.  A FILLED offer is not evidence either: a
+// taker, not the sweep, resolved it.
+//
+// NOT SEEN, AND DISCLOSED: a sweep still queued behind the wallet lock has
+// reached no tracked offer yet, so a re-check then finds no evidence and the
+// live offers are cancelled while that sweep may still run.
 // ---------------------------------------------------------------------------
 
 /// Did this re-check find an offer the sweep had already reached?
 [[nodiscard]] inline bool recheck_saw_the_sweep(
     const RecheckPartition& p) noexcept
 {
-    return !p.already_pending.empty() || !p.dead.empty();
+    return p.sweep_evidence != 0;
 }
 
 /// Does this re-check show the sweep still working through the book?  True
@@ -790,6 +827,55 @@ inline constexpr std::uint32_t kPossiblySubmittedRecheckIntervalMs = 10'000;
         std::uint64_t{kPossiblySubmittedRecheckIntervalMs} + recancel_reserve_ms;
     if (needed > deadline_ms - elapsed_ms) return 0;
     return kPossiblySubmittedRecheckIntervalMs;
+}
+
+// ---------------------------------------------------------------------------
+// [review 2026-09-13, round 4] NO SECOND WALLET-WIDE SWEEP WITHIN ONE WAIT OF
+// AN UNANSWERED ONE.
+//
+// A shutdown ends operator Cancel All's wait at once (engine.cpp), and the
+// shutdown ladder's attempt 1 is a wallet-wide cancel_all.  Sent while the
+// operator's sweep may still be running, it queues behind that sweep in the
+// wallet and, in chia 2.7.4, cancels again every trade the first sweep marked
+// PENDING_CANCEL: the duplicate this header exists to prevent.
+//
+// So a shutdown that starts less than one wait after operator Cancel All saw
+// its sweep go unanswered records THAT sweep as its attempt 1
+// (seeded_unanswered_sweep_outcome) instead of sending another: every tracked
+// id stays outstanding, the ladder sleeps only the rest of the wait, and it
+// re-checks each offer before attempt 2 cancels any.  A budget that cannot fit
+// even that stops the ladder BudgetExhausted, and the S31 fallback runs as it
+// does today.
+// ---------------------------------------------------------------------------
+
+/// The part of the wait a shutdown still owes an operator sweep that got no
+/// usable answer `since_ms` ago.  0 when there was no such sweep (`seen`
+/// false) or it is at least one full wait old: attempt 1 then goes out as
+/// usual.  Otherwise the rest of the wait, never less than
+/// cfg.min_useful_delay_ms.
+[[nodiscard]] constexpr std::uint32_t unanswered_sweep_remaining_wait_ms(
+    bool seen, std::uint64_t since_ms, const CancelRetryConfig& cfg) noexcept
+{
+    if (!seen || since_ms >= cfg.possibly_submitted_wait_ms) return 0;
+    const auto rest = static_cast<std::uint32_t>(
+        cfg.possibly_submitted_wait_ms - since_ms);
+    return rest > cfg.min_useful_delay_ms ? rest : cfg.min_useful_delay_ms;
+}
+
+/// The attempt a seeded shutdown ladder records in place of attempt 1: the
+/// operator's unanswered sweep, with every tracked id still outstanding and
+/// `remaining_wait_ms` (unanswered_sweep_remaining_wait_ms) still owed.
+[[nodiscard]] inline CancelAttemptOutcome seeded_unanswered_sweep_outcome(
+    std::vector<std::string> outstanding, std::uint32_t remaining_wait_ms)
+{
+    CancelAttemptOutcome oc{};
+    oc.failed                     = std::move(outstanding);
+    oc.last_error                 =
+        "operator Cancel All's wallet-wide sweep got no usable answer";
+    oc.worst_class                = classify_take_failure(oc.last_error);
+    oc.bulk_possibly_submitted    = true;
+    oc.possibly_submitted_wait_ms = remaining_wait_ms;
+    return oc;
 }
 
 // ---------------------------------------------------------------------------
@@ -910,6 +996,8 @@ public:
         // [review 2026-09-13, round 2] The wait follows the attempt whose
         // sweep got no answer, not every later retry.
         st.possibly_submitted = last_attempt_possibly_submitted_;
+        // [review 2026-09-13, round 4] Owed only after a seeded attempt.
+        st.possibly_submitted_wait_ms = last_attempt_wait_ms_;
 
         const auto plan = plan_cancel_retry(st, cfg_);
         if (plan.verdict != CancelRetryVerdict::Retry) {
@@ -960,6 +1048,10 @@ public:
         // later per-id success proves the untracked book swept, and no retry
         // on this ladder cancels an id without asking the wallet first.
         last_attempt_possibly_submitted_ = oc.bulk_possibly_submitted;
+        // [review 2026-09-13, round 4] The rest of a wait already partly run,
+        // for the next sleep only.
+        last_attempt_wait_ms_ =
+            oc.bulk_possibly_submitted ? oc.possibly_submitted_wait_ms : 0;
         possibly_submitted_ = possibly_submitted_ || oc.bulk_possibly_submitted;
         needs_recheck_      = needs_recheck_ || oc.bulk_possibly_submitted;
 
@@ -1107,6 +1199,9 @@ private:
     /// [review 2026-09-13, round 2] The LAST recorded attempt's sweep got no
     /// answer, so the next sleep is at least cfg_.possibly_submitted_wait_ms.
     bool                     last_attempt_possibly_submitted_{false};
+    /// [review 2026-09-13, round 4] The part of that wait still owed, when the
+    /// attempt was seeded; 0 means the whole configured wait.
+    std::uint32_t            last_attempt_wait_ms_{0};
     /// [review 2026-09-13, round 2] Sticky: re-check before every retry.
     bool                     needs_recheck_{false};
     /// [review 2026-09-13, round 2] No-verdict ids held back from the current

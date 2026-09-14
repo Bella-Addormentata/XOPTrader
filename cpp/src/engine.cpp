@@ -1696,6 +1696,52 @@ void Engine::shutdown()
                 execution::CancelLadder ladder(outstanding, retry_cfg,
                                                /*sweep_when_empty=*/true);
 
+                // [review 2026-09-13, round 4] NO SECOND WALLET-WIDE SWEEP WITHIN
+                // ONE WAIT OF AN UNANSWERED ONE (cancel_retry.hpp). A stop ends
+                // operator Cancel All's wait at once, and attempt 1 below would
+                // send a second wallet-wide cancel_offers while that sweep may
+                // still be running. Within one wait of it, the ladder records
+                // that sweep as its attempt 1 instead: every tracked id stays
+                // outstanding, it sleeps only the rest of the wait, and it
+                // re-checks each offer before it cancels any.
+                const std::uint64_t since_unanswered_ms =
+                    unanswered_sweep_at_
+                        ? static_cast<std::uint64_t>(std::max<std::int64_t>(
+                              0,
+                              std::chrono::duration_cast<
+                                  std::chrono::milliseconds>(
+                                  std::chrono::steady_clock::now()
+                                  - *unanswered_sweep_at_)
+                                  .count()))
+                        : std::uint64_t{0};
+                const std::uint32_t seed_wait_ms =
+                    execution::unanswered_sweep_remaining_wait_ms(
+                        unanswered_sweep_at_.has_value(), since_unanswered_ms,
+                        retry_cfg);
+                // [review 2026-09-13, round 4] The offers State already had a
+                // cancel in flight for before the sweep this ladder re-checks
+                // after -- the engine's own TTL or rebalance cancels. They are
+                // no evidence that sweep ran (partition_rechecked_offer).
+                std::unordered_set<std::string> pending_before_sweep;
+                if (seed_wait_ms != 0) {
+                    pending_before_sweep = unanswered_sweep_pending_before_;
+                    spdlog::warn(
+                        "[Engine] [S46] operator Cancel All's wallet-wide sweep "
+                        "got no usable answer {} ms ago and may still be "
+                        "running -- NOT sending a second one: waiting at least "
+                        "the remaining {} ms, then re-checking {} offer(s) "
+                        "before any is cancelled",
+                        since_unanswered_ms, seed_wait_ms, outstanding.size());
+                    ladder.record(execution::seeded_unanswered_sweep_outcome(
+                        outstanding, seed_wait_ms));
+                } else {
+                    for (const auto& po : state_->get_all_offers()) {
+                        if (po.cancel_pending) {
+                            pending_before_sweep.insert(po.offer_id);
+                        }
+                    }
+                }
+
                 for (;;) {
                     const auto act = ladder.next(elapsed_ms());
                     if (act.step == execution::CancelLadderStep::Finish) break;
@@ -1745,7 +1791,8 @@ void Engine::shutdown()
                             }
                             execution::partition_rechecked_offer(
                                 part, id, verdict,
-                                state_->get_offer(id).cancel_pending);
+                                state_->get_offer(id).cancel_pending,
+                                pending_before_sweep.count(id) != 0);
                         }
                         spdlog::warn(
                             "[Engine] [S46] attempt {} follows a wallet-wide "
@@ -19768,6 +19815,15 @@ void Engine::check_cancel_all_flag()
                 ~InflightGuard() { *flag = false; }
             } inflight_guard{&cancel_all_inflight_};
             try {
+                // [review 2026-09-13, round 4] The tracked offers State already
+                // has a cancel in flight for, taken just before the sweep: the
+                // engine's own cancels are no evidence that the sweep ran.
+                std::unordered_set<std::string> pending_before_sweep;
+                for (const auto& po : state_->get_all_offers()) {
+                    if (po.cancel_pending) {
+                        pending_before_sweep.insert(po.offer_id);
+                    }
+                }
                 auto done = co_await offer_mgr_->cancel_all();
                 // [review 2026-09-13, round 2] A WALLET-WIDE SWEEP THAT GOT NO
                 // ANSWER. cancel_all has sent nothing more -- every tracked id
@@ -19798,7 +19854,11 @@ void Engine::check_cancel_all_flag()
                 //     each re-cancel -- so shutdown()'s wait on
                 //     cancel_all_inflight_ is bounded by one check plus one RPC
                 //     in flight. The ids not yet handled keep their Ordered
-                //     intent, and the shutdown's own cancel takes them over.
+                //     intent, and the shutdown's own cancel takes them over --
+                //     sending no second wallet-wide sweep within one wait of
+                //     this one [round 4]. The dead man's switch firing ends the
+                //     branch the same way [round 4]: its own wallet-wide cancel
+                //     takes the book over.
                 //   * A re-check that shows the sweep still working through
                 //     the book (execution::recheck_shows_sweep_running)
                 //     cancels nothing: it pauses and re-checks again while the
@@ -19815,6 +19875,11 @@ void Engine::check_cancel_all_flag()
                         execution::possibly_submitted_deadline_ms(
                             wait_ms, execution::CancelRetryConfig{});
                     const auto branch_t0 = std::chrono::steady_clock::now();
+                    // [review 2026-09-13, round 4] For a shutdown that ends this
+                    // branch early: within one wait of now it sends no second
+                    // wallet-wide sweep, and it reads the same snapshot.
+                    unanswered_sweep_at_ = branch_t0;
+                    unanswered_sweep_pending_before_ = pending_before_sweep;
                     const auto deadline =
                         branch_t0 + std::chrono::milliseconds(
                             static_cast<std::int64_t>(deadline_ms));
@@ -19828,7 +19893,8 @@ void Engine::check_cancel_all_flag()
                     };
                     const auto shutdown_requested = [this]() {
                         return graceful_cancel_active_.load(
-                            std::memory_order_acquire);
+                                   std::memory_order_acquire)
+                            || watchdog_fired_.load(std::memory_order_acquire);
                     };
                     // One request timeout of this client is kept back before
                     // the deadline for the final re-cancel.
@@ -19897,7 +19963,8 @@ void Engine::check_cancel_all_flag()
                             }
                             execution::partition_rechecked_offer(
                                 part, id, verdict,
-                                state_->get_offer(id).cancel_pending);
+                                state_->get_offer(id).cancel_pending,
+                                pending_before_sweep.count(id) != 0);
                         }
                         const bool sweep_running =
                             execution::recheck_shows_sweep_running(part, seen_running);
@@ -19967,8 +20034,8 @@ void Engine::check_cancel_all_flag()
                         n_dead + n_filled, n_dead, n_filled,
                         done.failed.size(),
                         stopped_for_shutdown
-                            ? " -- a shutdown was requested, and its own "
-                              "cancel takes them over"
+                            ? " -- a shutdown was requested or the dead man's "
+                              "switch fired, and that cancel takes them over"
                             : "");
                 }
                 spdlog::warn("[Engine] [CANCELALL] {} offer(s) submitted "
@@ -20066,6 +20133,10 @@ asio::awaitable<bool> Engine::sweep_reload_disabled_offers()
     // Step 8 drain: the set is kept and reported not clean, so
     // check_config_reload_flag's retry leg runs this again next heartbeat,
     // once the flag has cleared.
+    //
+    // [review 2026-09-13, round 4] Recorded for both reload alerts, so that a
+    // deferral is never reported as a failure.
+    reload_cancel_deferred_ = cancel_all_inflight_;
     if (cancel_all_inflight_) {
         spdlog::info("[Engine] [RELOAD] cancelling the live-disabled pairs' "
                      "offers is deferred: an operator Cancel All is in flight "
@@ -20118,16 +20189,36 @@ asio::awaitable<void> Engine::check_config_reload_flag()
     namespace fs = std::filesystem;
     if (config_reload_flag_path_.empty()) co_return;
 
-    // Retry leg: offers that survived a previous disable's failed cancel.
+    // Retry leg: offers that survived a previous disable's failed -- or
+    // deferred -- cancel.
     if (!reload_pending_cancel_.empty()) {
         const bool clean = co_await sweep_reload_disabled_offers();
         if (clean && reload_cancel_alert_pending_) {
             reload_cancel_alert_pending_ = false;
             if (alerts_) {
+                // [review 2026-09-13, round 4] After a deferral nothing failed.
                 alerts_->send_alert(
                     AlertRule::ConfigReload,
-                    "Retry succeeded: the resting offers on live-disabled "
-                    "pairs are now cancelled.");
+                    reload_cancel_alert_deferred_
+                        ? "The cancel deferred while operator Cancel All was in "
+                          "flight has now run: the resting offers on "
+                          "live-disabled pairs are cancelled."
+                        : "Retry succeeded: the resting offers on live-disabled "
+                          "pairs are now cancelled.");
+            }
+            reload_cancel_alert_deferred_ = false;
+        } else if (!clean && !reload_cancel_deferred_
+                   && reload_cancel_alert_deferred_) {
+            // [review 2026-09-13, round 4] The deferred cancel has now run and
+            // FAILED: say so once, as the save's own alert would have.
+            reload_cancel_alert_deferred_ = false;
+            if (alerts_) {
+                alerts_->send_alert(
+                    AlertRule::ConfigReload,
+                    "WARNING: the cancel deferred while operator Cancel All was "
+                    "in flight has now run, and some resting offers on "
+                    "live-disabled pairs could NOT be cancelled and are STILL "
+                    "LIVE; the engine retries each heartbeat.");
             }
         }
     }
@@ -20207,9 +20298,16 @@ asio::awaitable<void> Engine::check_config_reload_flag()
     }
 
     bool cancel_clean = true;
+    // [review 2026-09-13, round 4] Deferred behind an operator Cancel All,
+    // not failed: the alert below says which.
+    bool cancel_deferred = false;
     if (!diff.to_disable.empty()) {
         cancel_clean = co_await sweep_reload_disabled_offers();
-        if (!cancel_clean) reload_cancel_alert_pending_ = true;
+        cancel_deferred = !cancel_clean && reload_cancel_deferred_;
+        if (!cancel_clean) {
+            reload_cancel_alert_pending_ = true;
+            reload_cancel_alert_deferred_ = cancel_deferred;
+        }
     }
 
     // Honesty about everything the reload did NOT do.
@@ -20237,8 +20335,12 @@ asio::awaitable<void> Engine::check_config_reload_flag()
             msg += "disabled live: " + disabled_list + " -- ";
             msg += cancel_clean
                 ? "resting offers cancelled. "
-                : "WARNING: some resting offers could NOT be cancelled and "
-                  "are STILL LIVE; the engine retries each heartbeat. ";
+                : cancel_deferred
+                    ? "resting offers NOT cancelled yet: the cancel is "
+                      "deferred while operator Cancel All is in flight, and "
+                      "runs on the first heartbeat after it. "
+                    : "WARNING: some resting offers could NOT be cancelled and "
+                      "are STILL LIVE; the engine retries each heartbeat. ";
         }
         auto join = [](const std::vector<std::string>& v) {
             std::string out;

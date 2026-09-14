@@ -74,6 +74,12 @@ def test_both_resend_paths_ask_the_policy():
 # yields to a shutdown request; an unparseable reply is a transport failure;
 # the reload drain waits for an operator Cancel All.  The scans below are also
 # hardened against the reintroductions an independent review listed.
+#
+# [review 2026-09-13, round 4] Added: a stop within one wait of an unanswered
+# operator sweep sends no second sweep; both re-checks leave the engine's own
+# cancels out of the evidence; the operator branch also stops for the dead
+# man's switch and looks for a stop at least once a second; a deferred reload
+# cancel is not reported as a failure.
 # ---------------------------------------------------------------------------
 
 OFFER_MANAGER_CPP = REPO / "cpp" / "src" / "execution" / "offer_manager.cpp"
@@ -293,10 +299,15 @@ def test_operator_cancel_all_is_bounded_by_its_deadline():
 def test_operator_cancel_all_stops_for_a_shutdown():
     """[review 2026-09-13, round 3] shutdown() waits on cancel_all_inflight_,
     so this branch must yield to a shutdown request: while pausing, before
-    each probe and before each re-cancel."""
+    each probe and before each re-cancel.  [round 4] It yields the same way
+    when the dead man's switch fires, whose wallet-wide cancel takes over."""
     _, possibly = _operator_branch()
     assert ("constautoshutdown_requested=[this](){returngraceful_cancel_active_.load("
-            "std::memory_order_acquire);};") in possibly
+            "std::memory_order_acquire)||watchdog_fired_.load(std::memory_order_acquire);};"
+            ) in possibly, (
+        "the operator branch no longer stops for a shutdown request, or for the "
+        "dead man's switch"
+    )
     pause = _block(possibly, "while(std::chrono::steady_clock::now()<wake_at){")
     _in_order(pause, [
         "if(shutdown_requested()){stopped_for_shutdown=true;break;}",
@@ -359,6 +370,10 @@ def test_the_reload_drain_waits_for_an_operator_cancel_all():
     assert "co_returnfalse;" in gate, (
         "a deferred drain must report not clean, or the retry leg never runs it"
     )
+    # [review 2026-09-13, round 4] ...and records that it only deferred.
+    assert drain.find("reload_cancel_deferred_=cancel_all_inflight_;") != -1
+    assert drain.find("reload_cancel_deferred_=cancel_all_inflight_;") < drain.find(
+        "if(cancel_all_inflight_){")
     assert "reload_pending_cancel_.clear()" not in gate
     assert drain.find("if(cancel_all_inflight_){") < drain.find("selective_cancel("), (
         "the drain cancels per id before it looks at cancel_all_inflight_"
@@ -371,3 +386,92 @@ def test_the_reload_drain_waits_for_an_operator_cancel_all():
     assert retry_leg < reload.find("if(!fs::exists(config_reload_flag_path_,ec))co_return;"), (
         "the retry leg must run every heartbeat, before the reload flag is looked for"
     )
+
+
+def test_a_stop_soon_after_an_unanswered_operator_sweep_sends_no_second_sweep():
+    """[review 2026-09-13, round 4] N1.  A shutdown ends operator Cancel All's
+    wait at once, and the ladder's attempt 1 is a wallet-wide cancel_all.  So
+    the driver must ask how much of that sweep's wait is left BEFORE attempt 1
+    can run, and within the wait record that sweep as attempt 1 instead of
+    sending another.  The operator branch must record when its sweep went
+    unanswered."""
+    code = _code(_definition(ENGINE_CPP, "void Engine::shutdown()"))
+    _in_order(code, [
+        "execution::CancelLadderladder(outstanding,retry_cfg,true);",
+        "-*unanswered_sweep_at_)",
+        "conststd::uint32_tseed_wait_ms=execution::unanswered_sweep_remaining_wait_ms("
+        "unanswered_sweep_at_.has_value(),since_unanswered_ms,retry_cfg);",
+        "if(seed_wait_ms!=0){",
+        "ladder.record(execution::seeded_unanswered_sweep_outcome(outstanding,seed_wait_ms));",
+        "?co_awaitoffer_mgr_->cancel_all(cancel_deadline)",
+    ])
+    assert code.count("seeded_unanswered_sweep_outcome(") == 1
+    _, possibly = _operator_branch()
+    assert "unanswered_sweep_at_=branch_t0;" in possibly, (
+        "operator Cancel All no longer records when its sweep went unanswered: a "
+        "stop during its wait sends a second wallet-wide sweep again"
+    )
+
+
+def test_both_rechecks_leave_the_engines_own_cancels_out_of_the_evidence():
+    """[review 2026-09-13, round 4] N2.  An offer State already had a cancel in
+    flight for before the sweep is no evidence the sweep ran.  Each caller
+    snapshots those ids just before its sweep -- the shutdown ladder reuses the
+    operator's snapshot when it records that sweep as its attempt 1 -- and
+    passes the flag to partition_rechecked_offer for every re-checked id."""
+    call = ("execution::partition_rechecked_offer(part,id,verdict,"
+            "state_->get_offer(id).cancel_pending,pending_before_sweep.count(id)!=0);")
+    snapshot = ("for(constauto&po:state_->get_all_offers()){if(po.cancel_pending)"
+                "{pending_before_sweep.insert(po.offer_id);}}")
+
+    shutdown = _code(_definition(ENGINE_CPP, "void Engine::shutdown()"))
+    _in_order(shutdown, [
+        "if(seed_wait_ms!=0){pending_before_sweep=unanswered_sweep_pending_before_;",
+        "}else{" + snapshot + "}",
+        "?co_awaitoffer_mgr_->cancel_all(cancel_deadline)",
+    ])
+    assert call in _block(shutdown, "if(ladder.needs_recheck()){"), (
+        "the shutdown re-check counts the engine's own cancels as sweep evidence"
+    )
+
+    code, possibly = _operator_branch()
+    assert snapshot + "autodone=co_awaitoffer_mgr_->cancel_all();" in code, (
+        "operator Cancel All must snapshot the cancels already in flight just "
+        "before its sweep"
+    )
+    assert "unanswered_sweep_pending_before_=pending_before_sweep;" in possibly
+    assert call in _block(possibly, "for(constauto&id:to_probe){"), (
+        "the operator re-check counts the engine's own cancels as sweep evidence"
+    )
+
+
+def test_the_operator_pause_looks_for_a_stop_at_least_once_a_second():
+    """[review 2026-09-13, round 4] N6.  The pause is sliced so that a stop is
+    seen while it lasts; a slice as long as the pause itself would look once
+    per wait.  One slice, at most a second."""
+    _, possibly = _operator_branch()
+    pause = _block(possibly, "while(std::chrono::steady_clock::now()<wake_at){")
+    slices = re.findall(r"std::chrono::milliseconds\(([0-9']+)\)", pause)
+    assert len(slices) == 1, f"expected one pause slice, found {slices}"
+    assert int(slices[0].replace("'", "")) <= 1000, (
+        f"the pause looks for a stop only every {slices[0]} ms"
+    )
+
+
+def test_a_deferred_reload_cancel_is_not_reported_as_a_failure():
+    """[review 2026-09-13, round 4] N5.  A GUI Save that disables a pair while
+    operator Cancel All is in flight defers the pair's cancel.  Neither the
+    save's alert nor the follow-up may call that a failure."""
+    raw = _definition(ENGINE_CPP, "asio::awaitable<void> Engine::check_config_reload_flag()")
+    reload = _code(raw)
+    assert "cancel_deferred=!cancel_clean&&reload_cancel_deferred_;" in reload, (
+        "the save no longer tells a deferred cancel from a failed one"
+    )
+    assert "reload_cancel_alert_deferred_=cancel_deferred;" in reload
+    assert re.search(r'msg\+=cancel_clean\?(?:"")+:cancel_deferred\?(?:"")+:(?:"")+;', reload), (
+        "the save's alert has no separate wording for a deferred cancel"
+    )
+    assert re.search(r'reload_cancel_alert_deferred_\?(?:"")+:(?:"")+\)', reload), (
+        "the follow-up alert has no separate wording for a deferred cancel"
+    )
+    assert "deferred while operator Cancel All is in flight" in raw
