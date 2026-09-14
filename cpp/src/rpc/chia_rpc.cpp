@@ -230,6 +230,7 @@ ChiaRPCBase::ChiaRPCBase(ChiaRPCBase&& other) noexcept
     , logger_(std::move(other.logger_))
     , thread_pool_(std::move(other.thread_pool_))
     , open_(std::exchange(other.open_, false))
+    , transport_(std::exchange(other.transport_, TransportCounters{}))
 {
     // Moving a shared_ptr leaves the SOURCE null, and open() dereferences
     // logger_ with no guard (:274, :278) -- reopening a moved-from client
@@ -249,6 +250,7 @@ ChiaRPCBase& ChiaRPCBase::operator=(ChiaRPCBase&& other) noexcept
         logger_      = std::move(other.logger_);
         thread_pool_ = std::move(other.thread_pool_);
         open_        = std::exchange(other.open_, false);
+        transport_   = std::exchange(other.transport_, TransportCounters{});
         // See the move ctor: do not leave the source with a null logger_.
         other.logger_ = logger_;
     }
@@ -530,6 +532,14 @@ asio::awaitable<json> ChiaRPCBase::rpc_post(std::string_view endpoint,
         throw ChiaRPCError("RPC client is not open -- call open() first");
     }
 
+    // [WALLET-CIRCUIT 2026-09-13] From here on every exit records how the call
+    // ended -- note_call_end() immediately before each throw below and before
+    // the co_return -- so a caller that swallows the exception still leaves
+    // evidence for the wallet breaker (rpc/transport_evidence.hpp).  The
+    // refusal above records nothing: a closed client is not a stalled daemon.
+    // An exception out of a co_await itself (the CURL pool, or the backoff
+    // timer being cancelled at shutdown) records nothing either.
+
     const std::string url        = build_url(endpoint);
     const std::string body       = payload.dump();
     const auto        max_tries  = config_.max_retries + 1u; // 1 initial + N retries
@@ -577,6 +587,7 @@ asio::awaitable<json> ChiaRPCBase::rpc_post(std::string_view endpoint,
                 backoff *= 2;
                 continue;
             }
+            note_call_end(RpcCallEnd::CurlFailed);
             throw ChiaRPCTransportError(
                 std::string("CURL transport failure: ") +
                     curl_easy_strerror(rc),
@@ -595,6 +606,7 @@ asio::awaitable<json> ChiaRPCBase::rpc_post(std::string_view endpoint,
                 backoff *= 2;
                 continue;
             }
+            note_call_end(RpcCallEnd::HttpError);
             throw ChiaRPCTransportError(
                 "HTTP " + std::to_string(http_code) + " from " +
                     std::string(endpoint),
@@ -608,6 +620,7 @@ asio::awaitable<json> ChiaRPCBase::rpc_post(std::string_view endpoint,
         } catch (const json::parse_error& ex) {
             // Malformed JSON is not transient -- fail immediately.
             logger_->error("JSON parse error from {}: {}", endpoint, ex.what());
+            note_call_end(RpcCallEnd::MalformedBody);
             throw ChiaRPCError(
                 std::string("Failed to parse JSON response from ") +
                     std::string(endpoint) + ": " + ex.what());
@@ -625,11 +638,13 @@ asio::awaitable<json> ChiaRPCBase::rpc_post(std::string_view endpoint,
                 err_msg = result["error"].get<std::string>();
             }
             logger_->error("{} failed: {}", endpoint, err_msg);
+            note_call_end(RpcCallEnd::ApplicationError);
             throw ChiaRPCApplicationError(err_msg, std::move(result));
         }
 
         logger_->debug("{} succeeded (HTTP {} , {} bytes)",
                        endpoint, http_code, response_body.size());
+        note_call_end(RpcCallEnd::Ok);
         co_return result;
     }
 

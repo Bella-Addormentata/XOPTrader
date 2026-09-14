@@ -118,6 +118,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -1792,20 +1793,43 @@ private:
     std::atomic<bool> shutdown_cancel_done_{false};
 
     // -- Wallet circuit breaker ----------------------------------------------
-    // After consecutive wallet RPC failures, skip wallet-dependent heartbeat
-    // steps (2 and 8) and poll for wallet recovery instead.  This prevents
-    // timeout cascades from stalling the entire heartbeat loop when the
-    // wallet daemon is unreachable.
+    // [WALLET-CIRCUIT 2026-09-13] Stops wallet timeout cascades from stalling
+    // the heartbeat.  It used to count THROWS out of Steps 2 and 8, and
+    // neither step throws for a stalled wallet: detect_fills swallows every
+    // get_offer failure, and Step 8's sync check logs and co_returns.  On
+    // 2026-09-12 blocks 9284260, 9284302 and 9284313 took 156-173 s each --
+    // 9-11 wallet calls in series, every one exhausting ~15.5 s of libcurl
+    // retries -- and the breaker never opened in any of three stall windows.
+    //
+    // It now reads the wallet CLIENT's transport evidence (rpc_post records
+    // how every call ended, whoever swallows the exception;
+    // rpc/transport_evidence.hpp) through execution::wallet_gate
+    // (execution/wallet_circuit.hpp), at every wallet_step_may_run() gate:
+    //   * one transport failure since this heartbeat's mark, with nothing
+    //     answering since, skips the rest of the heartbeat's wallet work;
+    //   * execution::kWalletCircuitTripFailures consecutive transport
+    //     failures, across callers and heartbeats, open the breaker; the poll
+    //     loop's get_sync_status probe is still what closes it.
 
-    /// Number of consecutive wallet RPC failures.
-    std::uint32_t wallet_consecutive_failures_{0};
+    /// The wallet client's transport counters at the top of the current
+    /// heartbeat.  Only a failure after this mark skips the heartbeat, so the
+    /// first wallet call of every heartbeat is always issued (the canary).
+    rpc::TransportCounters wallet_transport_at_cycle_start_{};
 
-    /// Threshold: after this many consecutive failures, wallet-dependent
-    /// heartbeat steps are skipped until the wallet recovers.
-    static constexpr std::uint32_t kWalletCircuitBreakerThreshold{3};
+    /// The per-heartbeat skip warns once per heartbeat, then drops to debug.
+    bool wallet_skip_warned_this_cycle_{false};
 
     /// True when the circuit breaker has tripped (wallet assumed unreachable).
     bool wallet_circuit_open_{false};
+
+    /// The one gate every wallet-dependent heartbeat step consults before
+    /// its wallet calls.  false while the breaker is open, after a transport
+    /// failure this heartbeat that nothing has answered since, and on the
+    /// call that trips the breaker (which it opens).  @p step names the
+    /// caller in the log line.  Deliberately NOT consulted by the S46 intent
+    /// sweep (above every gate; it keeps its own per-id check), by startup,
+    /// or by the breaker's probe.
+    [[nodiscard]] bool wallet_step_may_run(std::string_view step);
 
     /// Set by every RISK-BREAKER pause (max-drawdown, rolling-window loss,
     /// ledger divergence) and never cleared at runtime: manual intervention

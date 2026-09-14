@@ -117,6 +117,9 @@ add_executable(xop_tests
     test_offer_expiry.cpp
     test_wallet_requests.cpp
     test_stuck_tx_verdict.cpp
+    test_wallet_circuit.cpp
+    test_rpc_transport_evidence.cpp
+    test_stuck_prune_scope.cpp
 )
 
 target_link_libraries(xop_tests

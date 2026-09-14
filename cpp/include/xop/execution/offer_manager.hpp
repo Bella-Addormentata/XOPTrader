@@ -671,6 +671,15 @@ public:
     /// multiple times; only the first call performs the RPC query.
     asio::awaitable<void> ensure_wallet_ids();
 
+    /// [PRUNE-SCOPE 2026-09-13] True once the asset-to-wallet-ID cache has
+    /// been built from get_wallets().  ensure_wallet_ids() leaves it false
+    /// when that RPC fails, and resolve_wallet_id() then answers -1 for every
+    /// CAT -- which does NOT mean the wallet holds no such asset.
+    [[nodiscard]] bool wallet_ids_resolved() const noexcept
+    {
+        return wallet_ids_resolved_;
+    }
+
     // -- Dynamic fee control ------------------------------------------------
 
     /// Set the per-transaction fee used by subsequent post_quotes(),
