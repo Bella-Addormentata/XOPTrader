@@ -5,6 +5,48 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Cancel far fewer offers (S70-S72) -- three switches, all default OFF
+
+In the 14 days to block 9,319,413 the bot posted 1,283 offers, filled 15 and
+cancelled 1,254 -- about 84 fee-bearing spends per fill, into ~97% full blocks.
+Three rules made 97% of them. Each now has a replacement behind its own
+`strategy` key; every key defaults to the old rule and needs a restart.
+
+- **`ttl_cancel_mode: expire` (was 402 `ttl_expired` cancels).** An offer that
+  verifiably carries the on-chain expiry from #150 is no longer cancelled at the
+  hard TTL. The chain ages it out, and the bot then frees its coins with a free
+  local cancel -- read from the chia 2.7.4 source: an expired trade stays
+  PENDING_ACCEPT and stays in `get_locked_coins()` until cancelled, and
+  `cancel_offer secure=false` releases it with no spend. The cancel is sent only
+  when the WALLET's chain clock (`get_timestamp_for_height` at its finished-sync
+  height) is 600 s past `max_time`, the wallet still reports PENDING_ACCEPT, and
+  its record repeats the tracked `max_time`; this host's clock only decides
+  whether to look. `expire` with no expiry configured is refused at startup.
+- **`exposure_rule: unified` (was 528 `exposure_floor_rebalance` cancels).** The
+  pre-post projection and the resting-offer check now share one verdict. They
+  disagreed because `spendable_balance` already excludes coins locked by resting
+  offers, so posting an offer moved the second check by the size of whatever
+  coin the wallet locked: on 2026-09-13 the bot cancelled 267 XCH/DBX asks
+  this way, at one point re-posting the same tier every ~2.7 minutes. Unified
+  projects from
+  `unconfirmed_wallet_balance` against every resting offer that spends the asset,
+  cancels only below `reserve x (1 - exposure_cancel_hysteresis_pct)`, never an
+  offer younger than `exposure_cancel_min_age_blocks`, and suppresses the next
+  post instead.
+- **`price_cancel_mode: margin` (was 282 `price_adverse` cancels).** Cancel for
+  price only when a fill at the resting price would earn less than
+  `price_cancel_edge_retain` x the edge Step 7 demands of a new offer, against
+  Step 7's own centre. Crossed offers are still cancelled first; favourable
+  drift never cancels. Replayed over the recorded fortnight it would have made
+  82 of the 248 witnessed price cancels at the default 0.5 -- and the literal
+  rule (1.0) fires on MORE offers than the rule it replaces, which is why 0.5
+  is the default. New cancel reasons: `expired_onchain`, `margin_breach(..)`.
+
+Out of scope and unchanged: startup sweeps, Cancel All, reload-disabled pairs,
+shutdown, every safety cancel, UTXO liberation, and the stopped-engine TTL sweep.
+
 ## [0.10.24] — 2026-09-14 — record what happened, not what was asked for
 
 Nine merged branches, and most of them fix a record or a signal that reported a

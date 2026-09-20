@@ -3313,3 +3313,172 @@ TEST(PaceConfig, EnabledWithEmptyAssetsWarns) {
     expect_loads(pace_with_strategy("  pace_enabled: true\n"));
     EXPECT_TRUE(log.warned_containing("pace_assets is empty")) << log.text();
 }
+
+// ===========================================================================
+// [S70-S72 2026-09-20] The three cancel-reduction switches, through the PARSER.
+//
+// Each switch changes what the bot CANCELS, so the properties that matter
+// are: the default is the rule that existed before the key did; a mode is a
+// closed vocabulary (a typo must not silently keep the old rule while the
+// operator believes the new one is on); and `expire` cannot be selected with
+// nothing to expire.
+// ===========================================================================
+
+TEST(CancelReductionConfig, DefaultsAreTheRulesThatExistedBeforeTheKeys) {
+    TempYaml tmp(kMinimalValidYaml);
+    const auto cfg = xop::load_config(tmp.path());
+    const xop::StrategyConfig& s = cfg.strategy;
+    EXPECT_EQ(s.ttl_cancel_mode, xop::TtlCancelMode::Cancel);
+    EXPECT_EQ(s.exposure_rule, xop::ExposureRule::Legacy);
+    EXPECT_EQ(s.price_cancel_mode, xop::PriceCancelMode::Deviation);
+    EXPECT_DOUBLE_EQ(s.exposure_cancel_hysteresis_pct, 0.25);
+    EXPECT_EQ(s.exposure_cancel_min_age_blocks, 32u);
+    EXPECT_DOUBLE_EQ(s.price_cancel_edge_retain, 0.5);
+    // A default-constructed StrategyConfig (what the tests that never load a
+    // file get) agrees with the parser.
+    const xop::StrategyConfig fresh{};
+    EXPECT_EQ(fresh.ttl_cancel_mode, xop::TtlCancelMode::Cancel);
+    EXPECT_EQ(fresh.exposure_rule, xop::ExposureRule::Legacy);
+    EXPECT_EQ(fresh.price_cancel_mode, xop::PriceCancelMode::Deviation);
+}
+
+TEST(CancelReductionConfig, ParsesEveryKey) {
+    TempYaml tmp(pace_with_strategy(
+        "  offer_expiry_secs: 86400\n"
+        "  ttl_cancel_mode: expire\n"
+        "  exposure_rule: unified\n"
+        "  exposure_cancel_hysteresis_pct: 0.4\n"
+        "  exposure_cancel_min_age_blocks: 96\n"
+        "  price_cancel_mode: margin\n"
+        "  price_cancel_edge_retain: 0.75\n"));
+    const auto cfg = xop::load_config(tmp.path());
+    const xop::StrategyConfig& s = cfg.strategy;
+    EXPECT_EQ(s.ttl_cancel_mode, xop::TtlCancelMode::Expire);
+    EXPECT_EQ(s.exposure_rule, xop::ExposureRule::Unified);
+    EXPECT_EQ(s.price_cancel_mode, xop::PriceCancelMode::Margin);
+    EXPECT_DOUBLE_EQ(s.exposure_cancel_hysteresis_pct, 0.4);
+    EXPECT_EQ(s.exposure_cancel_min_age_blocks, 96u);
+    EXPECT_DOUBLE_EQ(s.price_cancel_edge_retain, 0.75);
+}
+
+TEST(CancelReductionConfig, TheRollbackValuesParseExplicitly) {
+    // The rollback for each switch is to WRITE the old mode, not only to
+    // delete the key -- so the old names must be accepted, not just implied.
+    TempYaml tmp(pace_with_strategy(
+        "  ttl_cancel_mode: cancel\n"
+        "  exposure_rule: legacy\n"
+        "  price_cancel_mode: deviation\n"));
+    const auto cfg = xop::load_config(tmp.path());
+    EXPECT_EQ(cfg.strategy.ttl_cancel_mode, xop::TtlCancelMode::Cancel);
+    EXPECT_EQ(cfg.strategy.exposure_rule, xop::ExposureRule::Legacy);
+    EXPECT_EQ(cfg.strategy.price_cancel_mode, xop::PriceCancelMode::Deviation);
+}
+
+TEST(CancelReductionConfig, NullKeepsTheDefault) {
+    expect_loads(pace_with_strategy(
+        "  ttl_cancel_mode: ~\n"
+        "  exposure_rule: ~\n"
+        "  price_cancel_mode: ~\n"
+        "  exposure_cancel_hysteresis_pct: ~\n"
+        "  exposure_cancel_min_age_blocks: ~\n"
+        "  price_cancel_edge_retain: ~\n"));
+}
+
+TEST(CancelReductionConfig, AnUnknownModeThrowsRatherThanFallingBack) {
+    struct Row {
+        const char* key{nullptr};
+        const char* value{nullptr};
+    };
+    const Row rows[] = {
+        {"ttl_cancel_mode", "expired"},     {"ttl_cancel_mode", "Expire"},
+        {"ttl_cancel_mode", "true"},        {"ttl_cancel_mode", "1"},
+        {"ttl_cancel_mode", "[expire]"},
+        {"exposure_rule", "unifed"},        {"exposure_rule", "UNIFIED"},
+        {"exposure_rule", "{a: b}"},
+        {"price_cancel_mode", "margins"},   {"price_cancel_mode", "edge"},
+        {"price_cancel_mode", "[margin]"},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(std::string(row.key) + ": " + row.value);
+        expect_config_error_containing(
+            pace_with_strategy("  offer_expiry_secs: 86400\n"
+                               + std::string("  ") + row.key + ": " + row.value + "\n"),
+            row.key);
+    }
+}
+
+TEST(CancelReductionConfig, OutOfRangeAndNonFiniteThrow) {
+    struct Row {
+        const char* key{nullptr};
+        const char* value{nullptr};
+    };
+    const Row rows[] = {
+        {"exposure_cancel_hysteresis_pct", "-0.0001"},
+        {"exposure_cancel_hysteresis_pct", "1.0001"},
+        {"exposure_cancel_hysteresis_pct", ".nan"},
+        {"exposure_cancel_hysteresis_pct", ".inf"},
+        {"exposure_cancel_min_age_blocks", "-1"},
+        {"exposure_cancel_min_age_blocks", "4609"},
+        // (0, 1]: 0 would mean "never cancel for price".
+        {"price_cancel_edge_retain", "0"},
+        {"price_cancel_edge_retain", "-0.5"},
+        {"price_cancel_edge_retain", "1.0001"},
+        {"price_cancel_edge_retain", ".nan"},
+        {"price_cancel_edge_retain", ".inf"},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(std::string(row.key) + ": " + row.value);
+        expect_config_error_containing(
+            pace_with_strategy(std::string("  ") + row.key + ": " + row.value + "\n"),
+            row.key);
+    }
+}
+
+TEST(CancelReductionConfig, TheRangeEndsAreLegal) {
+    // hysteresis 0 (cancel at the reserve) and 1 (suppress only) are both
+    // documented operator levers; min age 0 spares nothing; retain 1.0 is the
+    // literal rule.
+    expect_loads(pace_with_strategy(
+        "  exposure_cancel_hysteresis_pct: 0\n"
+        "  exposure_cancel_min_age_blocks: 0\n"
+        "  price_cancel_edge_retain: 1.0\n"));
+    expect_loads(pace_with_strategy(
+        "  exposure_cancel_hysteresis_pct: 1\n"
+        "  exposure_cancel_min_age_blocks: 4608\n"));
+}
+
+TEST(CancelReductionConfig, ExpireWithNothingToExpireIsRefused) {
+    // With no expiry on the strategy or any pair, `expire` spares no offer --
+    // yet the config would read as "age cancels are off".
+    expect_config_error_containing(
+        pace_with_strategy("  ttl_cancel_mode: expire\n"), "ttl_cancel_mode");
+    expect_config_error_containing(
+        pace_with_strategy("  ttl_cancel_mode: expire\n  offer_expiry_secs: 0\n"),
+        "offer_expiry_secs");
+    // A pair that explicitly opts OUT does not count as an expiry either.
+    expect_config_error_containing(
+        pace_after_first_pair(pace_with_strategy("  ttl_cancel_mode: expire\n"),
+                              "    offer_expiry_secs_override: 0\n"),
+        "ttl_cancel_mode");
+}
+
+TEST(CancelReductionConfig, ExpireIsSatisfiedByTheGlobalOrByOnePair) {
+    expect_loads(pace_with_strategy(
+        "  ttl_cancel_mode: expire\n  offer_expiry_secs: 86400\n"));
+    expect_loads(pace_after_first_pair(
+        pace_with_strategy("  ttl_cancel_mode: expire\n"),
+        "    offer_expiry_secs_override: 86400\n"));
+    // The default mode asks for nothing.
+    expect_loads(pace_with_strategy("  ttl_cancel_mode: cancel\n"));
+}
+
+TEST(CancelReductionConfig, ModeNamesRoundTripThroughToString) {
+    // The startup summary and the log print these; the names are the ones
+    // the parser accepts, so what is printed can be pasted back.
+    EXPECT_STREQ(xop::to_string(xop::TtlCancelMode::Cancel), "cancel");
+    EXPECT_STREQ(xop::to_string(xop::TtlCancelMode::Expire), "expire");
+    EXPECT_STREQ(xop::to_string(xop::ExposureRule::Legacy), "legacy");
+    EXPECT_STREQ(xop::to_string(xop::ExposureRule::Unified), "unified");
+    EXPECT_STREQ(xop::to_string(xop::PriceCancelMode::Deviation), "deviation");
+    EXPECT_STREQ(xop::to_string(xop::PriceCancelMode::Margin), "margin");
+}

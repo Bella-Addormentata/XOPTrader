@@ -145,6 +145,13 @@ public:
     /// on-chain race to a taker.  Returns true if the offer was found.
     bool mark_cancel_pending(const std::string& offer_id);
 
+    /// [S70] Set the VERIFIED on-chain expiry of a tracked offer (0 clears
+    /// it, handing the offer back to the hard TTL).  Only the field changes:
+    /// an upsert from a stale copy would clobber cancel_pending.  Returns
+    /// true if the offer was found.
+    bool set_offer_expiry(const std::string& offer_id,
+                          std::uint64_t      expiry_max_time);
+
     /// Get a single pending offer.  Returns nullptr-equivalent (empty
     /// optional) if not found.  Caller receives a copy -- no dangling refs.
     [[nodiscard]] PendingOffer get_offer(const std::string& offer_id) const;

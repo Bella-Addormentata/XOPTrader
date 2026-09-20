@@ -42,7 +42,9 @@ using xop::rpc::kCancelFeeSpendCostCeiling;
 using xop::rpc::kCancelOffersSingleBatchSize;
 using xop::rpc::kMempoolMaxTxClvmCost;
 using xop::rpc::make_cancel_offers_request;
+using xop::rpc::make_get_timestamp_for_height_request;
 using xop::rpc::make_get_transactions_request;
+using xop::rpc::parse_timestamp_for_height_response;
 
 namespace {
 
@@ -345,4 +347,53 @@ TEST(WalletRequests, ReverseTrueIsWhatBuriedTheUnconfirmedRows) {
     for (std::size_t i = 0; i < kWindow; ++i) {
         EXPECT_TRUE(ordered[i].confirmed);
     }
+}
+
+// ---------------------------------------------------------------------------
+// [S70 2026-09-20] get_timestamp_for_height -- the wallet's chain clock.
+//
+// The expired-offer retire frees an offer's coins with an INSECURE cancel on
+// the strength of this one number, so both directions are pinned: the key the
+// handler reads (chia 2.7.4 wallet_request_types.py GetTimestampForHeight has
+// exactly one field, `height`), and a parser that reads anything other than
+// the wallet's own uint64 as "no clock".  The response below is the live
+// 2.7.4 wallet's, captured 2026-09-20.
+// ---------------------------------------------------------------------------
+
+TEST(WalletRequests, TimestampForHeightSendsTheHeightAndNothingElse) {
+    const json p = make_get_timestamp_for_height_request(9'319'422);
+    ASSERT_TRUE(p.is_object());
+    EXPECT_EQ(p.size(), 1u);
+    ASSERT_TRUE(p.contains("height"));
+    EXPECT_EQ(p["height"].get<std::int64_t>(), 9'319'422);
+}
+
+TEST(WalletRequests, TimestampForHeightParsesTheLiveResponse) {
+    // Parsed from TEXT, as rpc_post parses the wire: that is what makes a
+    // non-negative integer number_unsigned.  A json built from an int
+    // literal is number_integer and would (rightly) read as "no clock".
+    const json live = json::parse(
+        R"({"success": true, "timestamp": 1789916920})");
+    ASSERT_TRUE(live["timestamp"].is_number_unsigned());
+    EXPECT_EQ(parse_timestamp_for_height_response(live), 1'789'916'920ull);
+}
+
+TEST(WalletRequests, TimestampForHeightFailsClosedOnAnythingElse) {
+    // 0 means "no chain clock", and nothing is retired on it.
+    EXPECT_EQ(parse_timestamp_for_height_response(json::object()), 0u);
+    EXPECT_EQ(parse_timestamp_for_height_response(json{{"success", true}}), 0u);
+    EXPECT_EQ(parse_timestamp_for_height_response(
+                  json{{"timestamp", nullptr}}), 0u);
+    EXPECT_EQ(parse_timestamp_for_height_response(
+                  json{{"timestamp", "1789916920"}}), 0u);
+    EXPECT_EQ(parse_timestamp_for_height_response(
+                  json{{"timestamp", 1789916920.0}}), 0u);
+    EXPECT_EQ(parse_timestamp_for_height_response(
+                  json{{"timestamp", -1}}), 0u);
+    EXPECT_EQ(parse_timestamp_for_height_response(json::array()), 0u);
+    EXPECT_EQ(parse_timestamp_for_height_response(json(nullptr)), 0u);
+    // get_height_info's field of a similar name is NOT this one: it follows
+    // the header peak, not the height the wallet has finished syncing to.
+    EXPECT_EQ(parse_timestamp_for_height_response(json::parse(
+                  R"({"latest_timestamp": 1789916920})")), 0u);
 }

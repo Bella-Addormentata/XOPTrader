@@ -1156,6 +1156,63 @@ StrategyConfig parse_strategy(const YAML::Node& root)
         && !node["offer_expiry_secs"].IsNull()) {
         cfg.offer_expiry_secs = read_uint32(node, "offer_expiry_secs", sec);
     }
+
+    // [S70-S72 2026-09-20] The three cancel-reduction switches.  All
+    // optional; absent or null keeps the rule that was in force before the
+    // key existed.  A mode is a closed vocabulary, so anything else -- a
+    // typo, a bool, a number -- throws rather than falling back: "expire"
+    // misspelt must not silently keep paying for TTL cancels.
+    const auto read_mode = [&](const char* key) -> std::optional<std::string> {
+        if (!node[key] || !node[key].IsDefined() || node[key].IsNull()) {
+            return std::nullopt;
+        }
+        if (!node[key].IsScalar()) {
+            throw ConfigError(sec + "." + key + " must be a scalar mode name");
+        }
+        return node[key].as<std::string>();
+    };
+    if (const auto m = read_mode("ttl_cancel_mode")) {
+        if (*m == "cancel") {
+            cfg.ttl_cancel_mode = TtlCancelMode::Cancel;
+        } else if (*m == "expire") {
+            cfg.ttl_cancel_mode = TtlCancelMode::Expire;
+        } else {
+            throw ConfigError(sec + ".ttl_cancel_mode must be 'cancel' or "
+                              "'expire'; got '" + *m + "'");
+        }
+    }
+    if (const auto m = read_mode("exposure_rule")) {
+        if (*m == "legacy") {
+            cfg.exposure_rule = ExposureRule::Legacy;
+        } else if (*m == "unified") {
+            cfg.exposure_rule = ExposureRule::Unified;
+        } else {
+            throw ConfigError(sec + ".exposure_rule must be 'legacy' or "
+                              "'unified'; got '" + *m + "'");
+        }
+    }
+    if (const auto m = read_mode("price_cancel_mode")) {
+        if (*m == "deviation") {
+            cfg.price_cancel_mode = PriceCancelMode::Deviation;
+        } else if (*m == "margin") {
+            cfg.price_cancel_mode = PriceCancelMode::Margin;
+        } else {
+            throw ConfigError(sec + ".price_cancel_mode must be 'deviation' "
+                              "or 'margin'; got '" + *m + "'");
+        }
+    }
+    cfg.exposure_cancel_hysteresis_pct = read_optional_finite_in_range(
+        node, "exposure_cancel_hysteresis_pct", sec,
+        cfg.exposure_cancel_hysteresis_pct, 0.0, 1.0, false, false);
+    cfg.exposure_cancel_min_age_blocks = read_optional_uint32_in_range(
+        node, "exposure_cancel_min_age_blocks", sec,
+        cfg.exposure_cancel_min_age_blocks, 0u, 4'608u);
+    // (0, 1]: 0 would mean "never cancel for price", which is what the
+    // crossed rule and the hard TTL are NOT a substitute for.
+    cfg.price_cancel_edge_retain = read_optional_finite_in_range(
+        node, "price_cancel_edge_retain", sec,
+        cfg.price_cancel_edge_retain, 0.0, 1.0, true, false);
+
     cfg.num_tiers            = read_uint32_positive(node, "num_tiers", sec);
 
     cfg.tier_spacing_bps = read_positive_double_seq(node, "tier_spacing_bps", sec);
@@ -3262,6 +3319,13 @@ void log_config_summary(const AppConfig& cfg)
         << "  q_max      = " << cfg.strategy.q_max << "\n"
         << "  min_margin = " << cfg.strategy.min_profit_margin_bps << " bps\n"
         << "  offer_ttl  = " << cfg.strategy.offer_ttl_blocks << " blocks\n"
+        << "  ttl_cancel = " << to_string(cfg.strategy.ttl_cancel_mode)
+        << " (offer_expiry_secs=" << cfg.strategy.offer_expiry_secs << ")\n"
+        << "  exposure   = " << to_string(cfg.strategy.exposure_rule)
+        << " (hysteresis=" << cfg.strategy.exposure_cancel_hysteresis_pct
+        << " min_age=" << cfg.strategy.exposure_cancel_min_age_blocks << ")\n"
+        << "  price_cancel = " << to_string(cfg.strategy.price_cancel_mode)
+        << " (edge_retain=" << cfg.strategy.price_cancel_edge_retain << ")\n"
         << "  tiers      = " << cfg.strategy.num_tiers << "\n"
         << "  spacing    = [";
     for (std::size_t i = 0; i < cfg.strategy.tier_spacing_bps.size(); ++i) {
@@ -4436,6 +4500,29 @@ AppConfig load_config(const std::string& path,
     cfg.market_allocator = parse_market_allocator(root);
     cfg.recovery   = parse_recovery(root);
     cfg.buyer      = parse_buyer(root);
+
+    // [S70 2026-09-20] Cross-section: ttl_cancel_mode: expire spares only an
+    // offer that carries an on-chain expiry.  With no expiry configured on
+    // the strategy or on any pair it spares nothing, yet the config would
+    // read as "age cancels are off" -- so refuse the combination at load,
+    // naming the way out, rather than let the operator watch ttl_expired
+    // cancels continue under a mode that claims to have stopped them.
+    if (cfg.strategy.ttl_cancel_mode == TtlCancelMode::Expire) {
+        bool any_expiry = cfg.strategy.offer_expiry_secs > 0;
+        for (const auto& p : cfg.pairs) {
+            if (p.offer_expiry_secs_override.value_or(0u) > 0u) {
+                any_expiry = true;
+            }
+        }
+        if (!any_expiry) {
+            throw ConfigError(
+                "strategy.ttl_cancel_mode: expire requires an on-chain expiry "
+                "-- set strategy.offer_expiry_secs (or a pair's "
+                "offer_expiry_secs_override) above 0, or set ttl_cancel_mode "
+                "back to 'cancel'. With no expiry attached, every offer keeps "
+                "the hard TTL and the mode changes nothing.");
+        }
+    }
 
     // Cross-section: revive_market quotes from the fair-value solve with
     // no order-book reference, so its whole safety envelope is carried by

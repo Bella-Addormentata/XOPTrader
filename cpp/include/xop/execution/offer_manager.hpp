@@ -111,6 +111,12 @@ struct TierClassification {
     bool            crossed{false};  ///< True when the offer crossed the mid-price.
     std::uint8_t    tier_index;      ///< Tier index of this offer.
     Side            side;            ///< Bid or Ask.
+    /// [S72] Stale because a fill at the resting price would earn less than
+    /// the resting floor (price_cancel_mode: margin), with the two numbers
+    /// the cancel reason records.  False for every other cause.
+    bool            margin_breach{false};
+    double          edge_bps{0.0};          ///< edge vs Step 7's centre, bps.
+    double          required_edge_bps{0.0}; ///< Step 7 floor x edge_retain.
 };
 
 // ---------------------------------------------------------------------------
@@ -348,12 +354,43 @@ public:
      * @param pair_name      Trading pair name (e.g. "XCH/wUSDC").
      * @param current_block  Latest known block height.
      * @param ttl_blocks     Maximum offer age in blocks before cancellation.
+     * @param spare_expiring [S70] When true, an offer that is left to its
+     *                       on-chain expiry under ttl_cancel_mode: expire
+     *                       (execution::age_limit_cancel_applies) is skipped.
+     *                       Only Step 8's stuck pass sets it -- that pass
+     *                       exists to retry the hard-TTL cancel, which such
+     *                       an offer never had.  The stopped-engine sweep
+     *                       leaves it false: a stopped book is aged out at
+     *                       the soft TTL whatever the mode.
      * @return Offer IDs that were successfully cancelled.
      */
     asio::awaitable<std::vector<std::string>> cancel_stale(
         const std::string& pair_name,
         BlockHeight        current_block,
-        BlockHeight        ttl_blocks);
+        BlockHeight        ttl_blocks,
+        bool               spare_expiring = false);
+
+    /**
+     * @brief [S70 2026-09-20] Retire resting offers whose on-chain expiry
+     *        has passed, with a FREE local cancel.
+     *
+     * No-op unless strategy.ttl_cancel_mode is `expire`.  For each tracked,
+     * not-cancel-pending offer whose verified max_time the host clock says
+     * has passed (a pre-filter only), it reads the wallet's chain clock ONCE
+     * (get_height_info -> get_timestamp_for_height), then for each such offer
+     * re-reads the trade record and applies execution::decide_expired_retire.
+     * Only RetireLocal sends cancel_offer(fee 0, secure=false) -- the single
+     * place outside emergency_cancel's last resort that may, and the reason
+     * it may is in execution/offer_expiry.hpp.  The offer is then marked
+     * cancel_pending and stays in State: only the wallet's CANCELLED verdict,
+     * seen by detect_fills, completes its offer_log row.
+     *
+     * @param current_block  Height, for logging.
+     * @return Offer IDs whose local cancel the wallet accepted; the caller
+     *         records each through mark_offer_cancel_submitted.
+     */
+    asio::awaitable<std::vector<std::string>> retire_expired_offers(
+        BlockHeight current_block);
 
     /**
      * @brief [S46 2026-09-02] The outcome of a cancel sweep, in enough
@@ -594,6 +631,13 @@ public:
      *                      not just adverse deviations.
      * @param can_bid       Whether bid (buy base) offers are currently allowed on this pair.
      * @param can_ask       Whether ask (sell base) offers are currently allowed on this pair.
+     * @param margin_centre        [S72] Step 7's ladder centre for the pair
+     *                      this cycle, in mojos (PairCycleState::quote_mid_mojos).
+     * @param margin_min_edge_bps  [S72] Step 7's minimum half-spread for the
+     *                      pair this cycle (quote_min_half_spread_bps).  Both
+     *                      are read only under price_cancel_mode: margin, and
+     *                      0 (the default, and what the pace pass sends)
+     *                      means "no reference": the deviation zones decide.
      * @return Per-offer classification results.
      */
     std::vector<TierClassification> classify_tier_staleness(
@@ -604,7 +648,9 @@ public:
         Mojo                           mid_price = 0,
         bool                           anchor_active = false,
         bool                           can_bid = true,
-        bool                           can_ask = true) const;
+        bool                           can_ask = true,
+        double                         margin_centre = 0.0,
+        double                         margin_min_edge_bps = 0.0) const;
 
     /**
      * @brief [T5-01] Cancel only the offers classified as Stale or Expired.

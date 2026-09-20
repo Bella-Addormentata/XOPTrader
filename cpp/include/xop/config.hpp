@@ -63,6 +63,44 @@ inline const char* to_string(ChiaMode m) noexcept {
 }
 
 // ---------------------------------------------------------------------------
+// [S70-S72 2026-09-20] The three cancel-reduction switches.  Each is a named
+// mode rather than a bool so the log and the config say WHICH rule ran, and
+// each defaults to the rule that was in force before the switch existed.
+// ---------------------------------------------------------------------------
+
+/// strategy.ttl_cancel_mode -- what ends an offer that is merely OLD.
+///   Cancel: the unconditional hard-TTL cancel (offer_ttl_blocks x
+///           OfferManager::kHardTtlMultiplier), a fee-bearing spend.
+///   Expire: an offer that VERIFIABLY carries an on-chain expiry
+///           (offer_expiry_secs) is left to the chain, then retired with a
+///           free local cancel once the chain clock is safely past its
+///           max_time (execution/offer_expiry.hpp).  An offer with no
+///           verified expiry keeps the hard TTL.
+enum class TtlCancelMode : std::uint8_t { Cancel = 0, Expire = 1 };
+
+/// strategy.exposure_rule -- how Step 8 projects reserve exposure.
+///   Legacy:  spendable - pending, at two sites that disagree the moment an
+///            offer locks a coin (execution/exposure_gate.hpp).
+///   Unified: one verdict from lock-invariant inputs, shared by both sites.
+enum class ExposureRule : std::uint8_t { Legacy = 0, Unified = 1 };
+
+/// strategy.price_cancel_mode -- when a resting offer is cancelled for PRICE.
+///   Deviation: drift from the tier's new optimal price past a threshold.
+///   Margin:    only when a fill at the resting price would earn less than
+///              the edge Step 7 demands against the current centre.
+enum class PriceCancelMode : std::uint8_t { Deviation = 0, Margin = 1 };
+
+inline const char* to_string(TtlCancelMode m) noexcept {
+    return m == TtlCancelMode::Expire ? "expire" : "cancel";
+}
+inline const char* to_string(ExposureRule m) noexcept {
+    return m == ExposureRule::Unified ? "unified" : "legacy";
+}
+inline const char* to_string(PriceCancelMode m) noexcept {
+    return m == PriceCancelMode::Margin ? "margin" : "deviation";
+}
+
+// ---------------------------------------------------------------------------
 // Chia blockchain RPC connectivity and authentication.
 // Covers both the full-node and wallet daemon endpoints.
 // ---------------------------------------------------------------------------
@@ -401,7 +439,58 @@ struct StrategyConfig {
     /// verified is narrower: spendable selection subtracts get_locked_coins()
     /// (docs/warp-unwrap-design.md section 7).  Do not rely on an expiry to
     /// return collateral -- land a cancel.
+    ///
+    /// [S70 2026-09-20] Since established from the chia 2.7.4 source, and the
+    /// caution was right: an expired PENDING_ACCEPT trade stays in
+    /// get_locked_coins() until it is cancelled.  ttl_cancel_mode below is
+    /// what lands that cancel -- locally and for free, once the chain clock
+    /// makes the offer untakeable.
     uint32_t offer_expiry_secs{0};
+
+    /// [S70 2026-09-20] What ends an offer that is merely OLD.  `cancel`
+    /// (default) is the unconditional hard-TTL cancel.  `expire` leaves an
+    /// offer that verifiably carries offer_expiry_secs' max_time to the
+    /// chain and retires it with a FREE local cancel once the wallet's chain
+    /// clock is kExpiredRetireSafetySecs past that max_time; the soft-TTL
+    /// adverse rule, every price rule and every safety cancel still apply,
+    /// and an offer with no verified expiry keeps the hard TTL.  The
+    /// reasoning and the wallet facts are in execution/offer_expiry.hpp.
+    /// `expire` with no expiry configured anywhere is rejected at load: it
+    /// would read as "TTL cancels are off" while changing nothing.
+    TtlCancelMode ttl_cancel_mode{TtlCancelMode::Cancel};
+
+    /// [S71 2026-09-20] Step 8's reserve-exposure rule.  `legacy` (default)
+    /// is the pair of spendable-based checks that cancelled 528 offers in 14
+    /// days at an average age of 27 blocks; `unified` is one verdict from
+    /// lock-invariant inputs (execution/exposure_gate.hpp).
+    ExposureRule  exposure_rule{ExposureRule::Legacy};
+    /// [S71] Unified rule only.  New posts are suppressed when the projected
+    /// balance is below the reserve; RESTING offers are cancelled only below
+    /// reserve x (1 - this).  [0, 1]; 1 never cancels (suppress only).
+    double        exposure_cancel_hysteresis_pct{0.25};
+    /// [S71] Unified rule only.  A resting offer younger than this is never
+    /// an exposure-cancel candidate.  Peak-height blocks (18.75 s): 32 is
+    /// ten minutes.  [0, 4608].
+    std::uint32_t exposure_cancel_min_age_blocks{32};
+
+    /// [S72 2026-09-20] When a resting offer is cancelled for PRICE.
+    /// `deviation` (default) is the selective refresh: drift from the tier's
+    /// new optimal price past kSelectiveRefreshThreshold x tier scale, the
+    /// soft-TTL adverse threshold, and the anchor override.  `margin`
+    /// replaces all three with one test -- would a fill at the resting price
+    /// still earn the edge Step 7 demands of a NEW offer against the current
+    /// centre (max(min_profit_margin, quote_width_sigma_mult x
+    /// combined_sigma, tibetswap fee))?  A crossed offer is still cancelled
+    /// first, kMinRefreshAgeBlocks still protects a young one, and
+    /// favourable drift never cancels (it only adds edge).
+    PriceCancelMode price_cancel_mode{PriceCancelMode::Deviation};
+    /// [S72] Margin rule only.  The fraction of Step 7's posting floor a
+    /// RESTING offer must keep.  (0, 1].  1.0 cancels the moment the edge
+    /// dips under the posting floor -- and Step 7 routinely posts tiers
+    /// exactly AT that floor, so at 1.0 any adverse tick refreshes them.
+    /// The post and cancel thresholds must not coincide; 0.5 keeps an offer
+    /// until it has lost half the edge a new one would need.
+    double        price_cancel_edge_retain{0.5};
 
     // [ALWAYSOFFER 2026-08-30] Side-aware BBO sanity (see bbo_sanity.hpp).
     // Aggressive deviation (would EXECUTE dislocated) keeps the tight

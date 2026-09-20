@@ -193,6 +193,183 @@ inline constexpr double kExpiryFloorMargin = 2.0;
            * kExpiryFloorMargin;
 }
 
+// ---------------------------------------------------------------------------
+// [S70 2026-09-20] strategy.ttl_cancel_mode: expire -- let the chain age an
+// offer out instead of paying for a cancel.
+//
+// THE PROBLEM.  The hard TTL cancels a correctly priced offer purely for its
+// age and reposts it at nearly the same price: 402 of 1,254 cancels in the 14
+// days to 2026-09-20, every one a fee-bearing spend into ~97% full blocks.
+// An offer that carries a VERIFIED max_time already has an age limit the
+// chain enforces for free, so in `expire` mode the hard TTL skips it.
+//
+// WHAT CHIA 2.7.4 DOES WITH AN EXPIRED OFFER -- read from the source at tag
+// 2.7.4 (commit 98aba3d1), not assumed.  This is the half that [review #150]
+// above declined to claim:
+//
+//   * The wallet never retires it.  Nothing in chia/wallet/trade_manager.py
+//     or wallet_node.py reads valid_times after the trade is stored; a trade
+//     leaves PENDING_ACCEPT only through coins_of_interest_farmed (a coin it
+//     watches was spent) or cancel_pending_offers.  An expired offer stays
+//     PENDING_ACCEPT indefinitely.
+//   * Its coins stay LOCKED.  TradeManager.get_locked_coins (trade_manager.py
+//     L210-230) returns the coins of every PENDING_ACCEPT / PENDING_CONFIRM /
+//     PENDING_CANCEL trade with no time test, and get_spendable_coins_for_
+//     wallet (wallet_state_manager.py L2002-2035) subtracts them.  So an
+//     expiry alone returns NO collateral.
+//   * cancel_offer with secure=false releases them with no spend.
+//     cancel_pending_offers (trade_manager.py L289-292) sets the trade
+//     CANCELLED and `continue`s before it builds any transaction, and a
+//     CANCELLED trade is outside get_locked_coins.  No fee, no mempool.
+//   * Nobody can take it afterwards.  max_time becomes
+//     ASSERT_BEFORE_SECONDS_ABSOLUTE on the maker's own signed spend, and
+//     chia_rs check_time_locks fails a bundle once
+//     `timestamp >= before_seconds_absolute`, where `timestamp` is the
+//     PREVIOUS TRANSACTION BLOCK's (mempool_manager.py L829-841 passes
+//     self.peak.timestamp).  Transaction-block timestamps only increase, so
+//     once one at or past max_time exists no later block can carry the spend.
+//
+// WHY A LOCAL CANCEL IS NORMALLY UNSAFE AND IS SAFE HERE.  secure=false leaves
+// the offer file valid: anyone holding it can still take it, and a take after
+// the local cancel is invisible, because get_trades_by_coin skips CANCELLED
+// trades, so the wallet never reports CONFIRMED and the fill is never booked.
+// That is a race the bot loses silently.  For an EXPIRED offer there is no
+// race left to lose -- provided the clock that says "expired" is the chain's.
+//
+// THE CLOCK IS THE CHAIN'S, NEVER THIS HOST'S.  max_time was minted from the
+// host clock but is ENFORCED against block timestamps, which trail wall time
+// by one transaction-block interval (~52 s typical, minutes on a slow patch)
+// and are themselves only loosely bound to it.  So "now >= max_time" on this
+// host proves nothing: the offer can still be taken until a transaction block
+// stamped >= max_time exists.  The retire decision therefore reads the
+// wallet's own chain clock -- get_timestamp_for_height at the height the
+// wallet has FINISHED syncing to -- which answers both questions at once: no
+// later block can carry the take, and the wallet has already processed every
+// block that could.  If it still says PENDING_ACCEPT, the offer was never
+// taken and never can be.
+//
+// kExpiredRetireSafetySecs is the reorg allowance on top: a reorg that
+// replaces the first transaction block stamped >= max_time could reopen the
+// window, so the chain clock must be this far PAST max_time first.
+//
+// Pure, like the rest of this header.  OfferManager::retire_expired_offers
+// supplies the wallet answers; cpp/tests/test_offer_expiry.cpp drives these.
+// ---------------------------------------------------------------------------
+
+/// Whether the bot's OWN age limit (the unconditional hard-TTL cancel, and the
+/// stuck-offer pass behind it) applies to an offer.
+///
+/// False only when the operator chose `expire` AND the offer verifiably
+/// carries an on-chain expiry.  0 means "no verified expiry" -- an offer
+/// created before the feature, one whose echo failed, or one restored from
+/// offer_log before the wallet record has been read back -- and such an offer
+/// keeps today's hard TTL, because nothing else bounds its life.
+[[nodiscard]] constexpr bool age_limit_cancel_applies(
+    bool          expire_mode,
+    std::uint64_t verified_max_time) noexcept
+{
+    return !(expire_mode && verified_max_time > 0);
+}
+
+/// The max_time a wallet trade record carries, or 0 when it carries none.
+///
+/// Takes the trade_record OBJECT itself (get_offer's "trade_record", or one
+/// element of get_all_offers' "trade_records").  Same fail-closed typing as
+/// expiry_echo_ok: a null, a float, a string or a negative number all read as
+/// "no verified expiry", so the offer keeps the bot's own hard TTL.
+[[nodiscard]] inline std::uint64_t trade_record_max_time(
+    const nlohmann::json& trade_record)
+{
+    if (!trade_record.is_object()
+        || !trade_record.contains("valid_times")
+        || !trade_record["valid_times"].is_object()) {
+        return 0;
+    }
+    const auto& vt = trade_record["valid_times"];
+    if (!vt.contains("max_time") || !vt["max_time"].is_number_unsigned()) {
+        return 0;
+    }
+    const auto max_time = vt["max_time"].get<std::uint64_t>();
+    // A timelock before mainnet genesis is not one this bot minted (see
+    // kMinPlausibleUnixTime); refuse to reason from it.
+    return max_time >= static_cast<std::uint64_t>(kMinPlausibleUnixTime)
+        ? max_time : 0;
+}
+
+/// How far the CHAIN clock must be past max_time before an expired offer is
+/// retired locally.  600 s is ~32 blocks at the 18.75 s peak-height cadence
+/// (4,608/day): the first transaction block stamped >= max_time would have to
+/// be reorged out from under that many successors to reopen the take window.
+/// It costs nothing but ten more minutes of locked coins on an offer that
+/// already cannot be taken.
+inline constexpr std::uint64_t kExpiredRetireSafetySecs = 600;
+
+/// True once the chain clock is at least kExpiredRetireSafetySecs past
+/// max_time.  @p chain_time_s is a TRANSACTION-BLOCK timestamp (the wallet's
+/// get_timestamp_for_height at its finished-sync height), never a host clock.
+/// 0 on either side reads as "unknown" and is never expired.
+[[nodiscard]] constexpr bool expired_beyond_safety(
+    std::uint64_t max_time,
+    std::uint64_t chain_time_s) noexcept
+{
+    if (max_time == 0 || chain_time_s == 0) return false;
+    // Subtraction form: max_time + safety could wrap for a hostile max_time.
+    return chain_time_s >= max_time
+        && chain_time_s - max_time >= kExpiredRetireSafetySecs;
+}
+
+/// A cheap PRE-FILTER on the host clock, so a heartbeat with nothing near its
+/// expiry asks the wallet nothing.  It only ever decides to LOOK: a fast host
+/// clock costs two read-only RPCs, a slow one delays a retire that is already
+/// harmless.  The retire itself is decided by expired_beyond_safety alone.
+[[nodiscard]] constexpr bool expiry_worth_checking(
+    std::uint64_t max_time,
+    std::int64_t  host_now_s) noexcept
+{
+    return max_time > 0
+        && host_now_s > 0
+        && static_cast<std::uint64_t>(host_now_s) >= max_time;
+}
+
+/// What to do with a resting offer whose on-chain expiry may have passed.
+enum class ExpiredRetire {
+    NotExpired,     ///< chain clock not far enough past max_time: leave it
+    LeaveToWallet,  ///< the wallet says it is no longer PENDING_ACCEPT: a fill
+                    ///< or a cancel is in hand, and those paths own it
+    Unverified,     ///< the wallet's record does not carry OUR max_time: keep
+                    ///< the offer, and let the hard TTL have it back
+    RetireLocal,    ///< expired, never taken, never takeable: free the coins
+};
+
+/// The retire decision.  Every input is a wallet answer read THIS heartbeat.
+///
+/// @param wallet_status_pending_accept  get_offer reported PENDING_ACCEPT.
+/// @param tracked_max_time   the expiry State holds for the offer.
+/// @param record_max_time    trade_record_max_time(get_offer's record).
+/// @param chain_time_s       the wallet's chain clock (see above).
+///
+/// Order is the contract.  The status is read first because a CONFIRMED
+/// trade is a FILL whatever the clock says, and `filled` always wins.  The
+/// record must then repeat the expiry we tracked, exactly: a local cancel on
+/// an offer whose timelock we cannot re-verify is the insecure cancel this
+/// repo otherwise refuses.
+[[nodiscard]] constexpr ExpiredRetire decide_expired_retire(
+    bool          wallet_status_pending_accept,
+    std::uint64_t tracked_max_time,
+    std::uint64_t record_max_time,
+    std::uint64_t chain_time_s) noexcept
+{
+    if (!wallet_status_pending_accept) {
+        return ExpiredRetire::LeaveToWallet;
+    }
+    if (tracked_max_time == 0 || record_max_time != tracked_max_time) {
+        return ExpiredRetire::Unverified;
+    }
+    return expired_beyond_safety(tracked_max_time, chain_time_s)
+        ? ExpiredRetire::RetireLocal
+        : ExpiredRetire::NotExpired;
+}
+
 }  // namespace xop::execution
 
 #endif  // XOP_EXECUTION_OFFER_EXPIRY_HPP

@@ -246,6 +246,46 @@ inline constexpr int kCancelCoinsPerOfferCeiling = 2;
     };
 }
 
+// ---------------------------------------------------------------------------
+// get_timestamp_for_height -- the wallet's CHAIN clock
+// ---------------------------------------------------------------------------
+//
+// [S70 2026-09-20] The one clock an offer's max_time is enforced against is a
+// transaction block's timestamp, so the expired-offer retire reads that and
+// never this host's clock (execution/offer_expiry.hpp has the argument).
+//
+// chia 2.7.4: wallet_request_types.py GetTimestampForHeight carries one field,
+// `height: uint32`, and GetTimestampForHeightResponse one, `timestamp:
+// uint64`.  wallet_node.py get_timestamp_for_height_from_peer returns "the
+// timestamp for transaction block at h=height, if not transaction block,
+// backtracks until it finds a recent transaction block" -- i.e. the latest
+// transaction-block timestamp AT OR BEFORE that height, which is exactly the
+// value consensus compares ASSERT_BEFORE_SECONDS_ABSOLUTE with for the next
+// block.  Asked at get_height_info's `height` (get_finished_sync_up_to, the
+// last block the wallet has finished processing), the answer also bounds what
+// the wallet has SEEN, not merely what exists.
+
+/// Build the get_timestamp_for_height payload.
+[[nodiscard]] inline json make_get_timestamp_for_height_request(
+    std::int64_t height)
+{
+    return json{{"height", height}};
+}
+
+/// The timestamp in a get_timestamp_for_height response, or 0 when the
+/// response does not carry one.  Fails closed like expiry_echo_ok: uint64 is
+/// the wallet's type, so a null, a float, a string or a negative all read as
+/// "no chain clock" and nothing is retired on them.
+[[nodiscard]] inline std::uint64_t parse_timestamp_for_height_response(
+    const json& response)
+{
+    if (!response.is_object() || !response.contains("timestamp")
+        || !response["timestamp"].is_number_unsigned()) {
+        return 0;
+    }
+    return response["timestamp"].get<std::uint64_t>();
+}
+
 }  // namespace xop::rpc
 
 #endif  // XOP_RPC_WALLET_REQUESTS_HPP

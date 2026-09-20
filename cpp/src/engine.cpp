@@ -112,7 +112,8 @@ namespace {
 // Two saturated summands overflow a signed int64, which is UNDEFINED
 // BEHAVIOUR, not a wrap: the compiler is entitled to assume it cannot happen
 // and optimise on that basis, and the number it corrupts feeds
-// exposure_breaches_reserve() and therefore can_bid/can_ask -- a quoting kill
+// decide_exposure() [S71; then exposure_breaches_reserve()] and therefore
+// can_bid/can_ask -- a quoting kill
 // switch.
 //
 // Unreachable today: these loops iterate only over OUR OWN offers and
@@ -11135,6 +11136,29 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         co_return;
     }
 
+    // [S70 2026-09-20] ttl_cancel_mode: expire -- free the coins of offers
+    // the chain has already aged out.  Here, below the sync gate, because the
+    // verdict rests on the wallet having PROCESSED the chain up to the clock
+    // it reports; and above the lock-ledger snapshot, so the coins a retire
+    // releases are in this cycle's budget.  A no-op in the default mode, and
+    // free of RPCs until the host clock says some offer's max_time has passed.
+    // An accepted local cancel is still only a SUBMISSION to offer_log: the
+    // wallet's CANCELLED verdict, seen by detect_fills, completes the row.
+    if (config_.strategy.ttl_cancel_mode == TtlCancelMode::Expire
+        && wallet_step_may_run("Step 8 expired-offer retire")) {
+        const std::vector<std::string> expired_retired =
+            co_await offer_mgr_->retire_expired_offers(block_height);
+        for (const auto& oid : expired_retired) {
+            try {
+                db_->mark_offer_cancel_submitted(oid, block_height,
+                                                 "expired_onchain");
+            } catch (const std::exception& e) {
+                spdlog::debug("[Engine] mark_offer_cancel_submitted failed "
+                              "for {}: {}", oid.substr(0, 12), e.what());
+            }
+        }
+    }
+
     // [XCH-LOCK-LEDGER 2026-08-23] Seed the per-cycle XCH coin-lock budget
     // from the wallet's real free-coin list before any pair posts.  This is
     // the cross-pair commitment cap the 2026-08-23 zero-spendable incident
@@ -11540,7 +11564,15 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 * static_cast<double>(kMojosPerXch))),
             anchor_active,
             can_bid_rebalance,
-            can_ask_rebalance);
+            can_ask_rebalance,
+            // [S72] price_cancel_mode: margin judges a resting offer against
+            // the SAME centre and floor Step 7 priced this cycle's ladder
+            // with -- threaded, not recomputed, so the canceller and the
+            // pricer cannot disagree about where the floor is.  Both are 0
+            // until Step 7 reaches ladder generation, which the classifier
+            // reads as "no reference" and answers with the deviation rule.
+            static_cast<double>(pcs.quote_mid_mojos),
+            pcs.quote_min_half_spread_bps);
 
         // [PACE 2026-09-13] Pace reprice.  To the canceller a tighter desired
         // bid is FAVOURABLE drift, refreshed only past 3x the tier threshold
@@ -11645,6 +11677,12 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     cancel_reasons[tc.offer_id] =
                         "crossed_mid(" + std::to_string(tc.price_deviation * 100.0)
                         .substr(0, 5) + "%)";
+                } else if (tc.margin_breach) {
+                    // [S72] edge the fill would earn / edge a resting offer
+                    // must keep, both in bps of Step 7's centre.
+                    cancel_reasons[tc.offer_id] =
+                        execution::margin_breach_reason(tc.edge_bps,
+                                                        tc.required_edge_bps);
                 } else {
                     cancel_reasons[tc.offer_id] =
                         "price_adverse(" + std::to_string(tc.price_deviation * 100.0)
@@ -11699,8 +11737,19 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             // every block and cancelled nothing (215 lines in four hours for
             // five XCH/DBX offers). Those offers belong to the escalation.
             std::size_t stuck_count = 0;
+            // [S70] An offer left to its on-chain expiry never had a hard-TTL
+            // cancel to get stuck: it is old by design, and
+            // retire_expired_offers owns it.  The counter and cancel_stale
+            // (spare_expiring) apply the SAME exemption, for the reason the
+            // [S14] note below gives.
+            const bool stuck_expire_mode =
+                config_.strategy.ttl_cancel_mode == TtlCancelMode::Expire;
             for (const auto& po : all_offers) {
                 if (po.pair_name != pair_name) continue;
+                if (!execution::age_limit_cancel_applies(stuck_expire_mode,
+                                                         po.expiry_max_time)) {
+                    continue;
+                }
                 if (execution::is_forced_cancel_candidate(
                         po.cancel_pending, po.created_at_block, block_height,
                         stuck_threshold)) {
@@ -11734,7 +11783,8 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     co_return;
                 }
                 auto stuck_cancelled = co_await offer_mgr_->cancel_stale(
-                    pair_name, block_height, stuck_threshold);
+                    pair_name, block_height, stuck_threshold,
+                    /*spare_expiring=*/true);
                 for (const auto& oid : stuck_cancelled) {
                     try {
                         db_->mark_offer_cancel_submitted(oid, block_height,
@@ -11766,6 +11816,40 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         Mojo pair_quote_pending_spend = 0;
         Mojo pair_base_reserve_mojos = 0;
         Mojo pair_quote_reserve_mojos = 0;
+        // [S71] exposure_rule: unified -- see the balance gate below.
+        Mojo pair_base_owned = 0;
+        Mojo pair_quote_owned = 0;
+        bool pair_base_owned_known = false;
+        bool pair_quote_owned_known = false;
+        const bool exposure_unified =
+            config_.strategy.exposure_rule == ExposureRule::Unified;
+        // Every resting offer's claim on the asset it spends, across ALL
+        // pairs, for the unified projection.  Rebuilt from State at each of
+        // the two sites, so a cancel the first site sends (cancel_pending) is
+        // already out of the second site's sum.
+        const auto exposure_resting_claims = [this]() {
+            std::vector<execution::RestingSpend> claims;
+            for (const auto& po : state_->get_all_offers()) {
+                const PairConfig* claim_pc = find_pair_config(po.pair_name);
+                if (!claim_pc) {
+                    continue;   // an adopted "UNKNOWN" offer has no legs to read
+                }
+                execution::RestingSpend claim;
+                claim.cancel_pending = po.cancel_pending;
+                if (po.side == Side::Ask) {
+                    claim.asset_id    = claim_pc->base_asset_id;
+                    claim.spend_mojos = po.size;
+                } else {
+                    claim.asset_id    = claim_pc->quote_asset_id;
+                    claim.spend_mojos = execution::quote_cost_for_ask(
+                        BaseMojos{po.size}, po.price,
+                        BaseMpu{claim_pc->base_mojos_per_unit},
+                        QuoteMpu{claim_pc->quote_mojos_per_unit}).v;
+                }
+                claims.push_back(std::move(claim));
+            }
+            return claims;
+        };
 
         // XCH-buy-only mode: when UTXO liberation couldn't restore the
         // fee reserve, only allow pairs that can acquire XCH, and only
@@ -11856,6 +11940,35 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                             pair_quote_balance_known = true;
                         }
 
+                        // [S71] exposure_rule: unified projects from what the
+                        // wallet OWNS net of its in-flight transactions --
+                        // unconfirmed_wallet_balance, which neither an
+                        // offer's coin lock nor a cancel's pending change
+                        // moves (exposure_gate.hpp).  Typed strictly; with
+                        // neither field present the side has no unified
+                        // verdict and nothing is cancelled on its account.
+                        {
+                            Mojo owned = 0;
+                            bool owned_known = false;
+                            if (bal_json.contains("unconfirmed_wallet_balance")
+                                && bal_json["unconfirmed_wallet_balance"]
+                                       .is_number_integer()) {
+                                owned = bal_json["unconfirmed_wallet_balance"]
+                                            .get<Mojo>();
+                                owned_known = true;
+                            } else if (bal_json.contains("confirmed_wallet_balance")) {
+                                owned = confirmed;
+                                owned_known = true;
+                            }
+                            if (sb.is_base) {
+                                pair_base_owned = owned;
+                                pair_base_owned_known = owned_known;
+                            } else {
+                                pair_quote_owned = owned;
+                                pair_quote_owned_known = owned_known;
+                            }
+                        }
+
                         // Update the cache for metrics.  Stamp the block so
                         // consumers can reject stale snapshots (Step 8 is
                         // skipped in several engine modes while Step 2 keeps
@@ -11911,7 +12024,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                         // alone.  spendable_balance already excludes in-flight
                         // coins, so the spendable-based gates below (2 and 3)
                         // and the exposure projections later in Step 8
-                        // (execution::exposure_breaches_reserve) decide
+                        // (execution::decide_exposure) decide
                         // whether the side can genuinely fund its ladder plus
                         // reserve.  The old unconditional suppression was
                         // backwards for bid fills: buying base put pending
@@ -12087,6 +12200,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                         std::uint8_t tier{0};
                         int staleness_rank{2};
                         Mojo price{0};
+                        BlockHeight created_block{0};  // [S71] min-age gate
                     };
                     // [2026-09-01] This was a verbatim third copy of
                     // take_sizing.hpp's old long double arithmetic -- a local
@@ -12150,7 +12264,8 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                 pair_base_pending_spend = saturating_add_mojo(
                                     pair_base_pending_spend, spend);
                                 ask_candidates.push_back(
-                                    {po.offer_id, spend, po.tier, staleness_rank, class_price});
+                                    {po.offer_id, spend, po.tier, staleness_rank, class_price,
+                                     po.created_at_block});
                             }
                         } else {
                             const Mojo spend = quote_cost_for_base_size(BaseMojos{po.size}, po.price);
@@ -12158,7 +12273,8 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                 pair_quote_pending_spend = saturating_add_mojo(
                                     pair_quote_pending_spend, spend);
                                 bid_candidates.push_back(
-                                    {po.offer_id, spend, po.tier, staleness_rank, class_price});
+                                    {po.offer_id, spend, po.tier, staleness_rank, class_price,
+                                     po.created_at_block});
                             }
                         }
                     }
@@ -12190,41 +12306,134 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                         });
                     };
 
-                    if (pair_base_balance_known && pair_base_reserve_mojos > 0
-                        && pair_base_spendable > 0 && pair_base_pending_spend > 0) {
-                        const Mojo projected_after_fill =
-                            execution::projected_balance_after_fills(
-                                pair_base_spendable, pair_base_pending_spend,
-                                /*planned_spend_mojos=*/0);
-                        if (execution::exposure_breaches_reserve(
-                                pair_base_spendable, pair_base_pending_spend,
-                                /*planned_spend_mojos=*/0,
-                                pair_base_reserve_mojos)) {
-                            Mojo need_to_free = pair_base_reserve_mojos - projected_after_fill;
-                            sort_candidates(ask_candidates, Side::Ask);
-                            std::vector<std::string> cancel_ids;
-                            Mojo freed = 0;
-                            for (const auto& cand : ask_candidates) {
-                                cancel_ids.push_back(cand.offer_id);
-                                freed += cand.spend_cost;
-                                if (freed >= need_to_free) {
-                                    break;
-                                }
+                    // [S71 2026-09-20] ONE verdict for this site and the
+                    // pre-post projection below: execution::decide_exposure.
+                    // exposure_rule: legacy reproduces the old arithmetic
+                    // exactly (spendable - this pair's pending < reserve, every
+                    // resting offer a candidate); unified projects from what
+                    // the wallet OWNS against every resting offer that spends
+                    // the asset, cancels only below the hysteresis floor, and
+                    // never buys back an offer younger than the minimum age --
+                    // it suppresses the NEXT post instead.  The plan is built
+                    // by a plain lambda so the cancel itself stays a direct
+                    // co_await below, one per side, as before.
+                    struct ExposurePlan {
+                        execution::ExposureDecision decision;
+                        std::vector<std::string>    cancel_ids;
+                        Mojo                        freed{0};
+                        Mojo                        resting{0};
+                        bool                        evaluated{false};
+                    };
+                    auto plan_exposure = [&](Side side) -> ExposurePlan {
+                        const bool is_ask = (side == Side::Ask);
+                        const bool balance_known = is_ask ? pair_base_balance_known
+                                                          : pair_quote_balance_known;
+                        const bool owned_known = is_ask ? pair_base_owned_known
+                                                        : pair_quote_owned_known;
+                        const Mojo reserve   = is_ask ? pair_base_reserve_mojos
+                                                      : pair_quote_reserve_mojos;
+                        const Mojo spendable = is_ask ? pair_base_spendable
+                                                      : pair_quote_spendable;
+                        const Mojo pending   = is_ask ? pair_base_pending_spend
+                                                      : pair_quote_pending_spend;
+                        auto& cands = is_ask ? ask_candidates : bid_candidates;
+
+                        ExposurePlan plan;
+                        // Legacy guards verbatim; unified needs `owned`, not a
+                        // positive spendable (all-coins-locked is its case).
+                        const bool inputs_ok = balance_known && reserve > 0 && pending > 0
+                            && (exposure_unified ? owned_known : spendable > 0);
+                        if (!inputs_ok) {
+                            return plan;
+                        }
+                        plan.evaluated = true;
+                        plan.resting = exposure_unified
+                            ? execution::resting_spend_on_asset(
+                                  exposure_resting_claims(),
+                                  is_ask ? gate_pc->base_asset_id
+                                         : gate_pc->quote_asset_id)
+                            : pending;
+
+                        execution::ExposureInputs in;
+                        in.owned_mojos         = is_ask ? pair_base_owned : pair_quote_owned;
+                        in.spendable_mojos     = spendable;
+                        in.resting_spend_mojos = plan.resting;
+                        in.planned_spend_mojos = 0;
+                        in.reserve_mojos       = reserve;
+                        plan.decision = execution::decide_exposure(
+                            exposure_unified, in,
+                            config_.strategy.exposure_cancel_hysteresis_pct);
+                        if (plan.decision.verdict
+                            != execution::ExposureVerdict::CancelResting) {
+                            return plan;
+                        }
+
+                        sort_candidates(cands, side);
+                        for (const auto& cand : cands) {
+                            if (!execution::exposure_cancel_candidate(
+                                    exposure_unified, cand.created_block, block_height,
+                                    config_.strategy.exposure_cancel_min_age_blocks)) {
+                                continue;
                             }
-                            if (!cancel_ids.empty()) {
-                                // [WALLET-CIRCUIT] Nothing between the sides
-                                // loop above and this cancel checks the gate,
-                                // and a failed balance query breaks out of
-                                // that loop.
-                                if (!wallet_step_may_run("Step 8 exposure-floor cancel (asks)")) {
-                                    co_return;
-                                }
-                                auto cancelled = co_await offer_mgr_->selective_cancel(cancel_ids);
-                                if (!cancelled.empty()) {
-                                    pair_base_pending_spend = (pair_base_pending_spend > freed)
-                                        ? (pair_base_pending_spend - freed)
-                                        : Mojo{0};
-                                    can_ask = false;
+                            plan.cancel_ids.push_back(cand.offer_id);
+                            plan.freed = saturating_add_mojo(plan.freed, cand.spend_cost);
+                            if (plan.freed >= plan.decision.need_to_free) {
+                                break;
+                            }
+                        }
+                        return plan;
+                    };
+                    // Unified only: a breach that is not (or not yet) worth a
+                    // cancel still stops this side ADDING exposure this cycle.
+                    const auto suppress_instead = [&](const ExposurePlan& plan,
+                                                      const char* side_name,
+                                                      const std::string& asset,
+                                                      Mojo reserve_mojos) {
+                        spdlog::info("[Engine] Step 8: {} exposure (unified) on {}: "
+                                     "owned - resting = {} vs reserve {} (resting={}) "
+                                     "-- suppressing new {} posts, no resting offer "
+                                     "cancelled (inside the hysteresis band, or every "
+                                     "candidate younger than {} blocks)",
+                                     pair_name, asset,
+                                     plan.decision.projected_mojos,
+                                     reserve_mojos,
+                                     plan.resting, side_name,
+                                     config_.strategy.exposure_cancel_min_age_blocks);
+                    };
+
+                    {
+                        ExposurePlan plan = plan_exposure(Side::Ask);
+                        if (exposure_unified && plan.evaluated
+                            && plan.decision.verdict != execution::ExposureVerdict::Ok
+                            && plan.cancel_ids.empty()) {
+                            can_ask = false;
+                            suppress_instead(plan, "ask", gate_pc->base_asset_id,
+                                             pair_base_reserve_mojos);
+                        }
+                        if (!plan.cancel_ids.empty()) {
+                            // [WALLET-CIRCUIT] Nothing between the sides
+                            // loop above and this cancel checks the gate,
+                            // and a failed balance query breaks out of
+                            // that loop.
+                            if (!wallet_step_may_run("Step 8 exposure-floor cancel (asks)")) {
+                                co_return;
+                            }
+                            auto cancelled = co_await offer_mgr_->selective_cancel(plan.cancel_ids);
+                            if (!cancelled.empty()) {
+                                pair_base_pending_spend = (pair_base_pending_spend > plan.freed)
+                                    ? (pair_base_pending_spend - plan.freed)
+                                    : Mojo{0};
+                                can_ask = false;
+                                if (exposure_unified) {
+                                    spdlog::warn("[Engine] Step 8: {} exposure (unified) on {} "
+                                                 "breached reserve (owned={} resting={} "
+                                                 "projected={} reserve={}) -- cancelled {} ask "
+                                                 "offers to rebalance exposure",
+                                                 pair_name, gate_pc->base_asset_id,
+                                                 pair_base_owned, plan.resting,
+                                                 plan.decision.projected_mojos,
+                                                 pair_base_reserve_mojos, cancelled.size());
+                                } else {
                                     spdlog::warn("[Engine] Step 8: {} pending exposure on {} "
                                                  "breached reserve (spendable={} pending={} "
                                                  "reserve={}) -- cancelled {} ask offers "
@@ -12235,51 +12444,49 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                                  pair_base_pending_spend,
                                                  pair_base_reserve_mojos,
                                                  cancelled.size());
-                                    for (const auto& oid : cancelled) {
-                                        try {
-                                            db_->mark_offer_cancel_submitted(
-                                                oid, block_height,
-                                                "exposure_floor_rebalance");
-                                        } catch (...) {}
-                                    }
+                                }
+                                for (const auto& oid : cancelled) {
+                                    try {
+                                        db_->mark_offer_cancel_submitted(
+                                            oid, block_height,
+                                            "exposure_floor_rebalance");
+                                    } catch (...) {}
                                 }
                             }
                         }
                     }
 
-                    if (pair_quote_balance_known && pair_quote_reserve_mojos > 0
-                        && pair_quote_spendable > 0 && pair_quote_pending_spend > 0) {
-                        const Mojo projected_after_fill =
-                            execution::projected_balance_after_fills(
-                                pair_quote_spendable, pair_quote_pending_spend,
-                                /*planned_spend_mojos=*/0);
-                        if (execution::exposure_breaches_reserve(
-                                pair_quote_spendable, pair_quote_pending_spend,
-                                /*planned_spend_mojos=*/0,
-                                pair_quote_reserve_mojos)) {
-                            Mojo need_to_free = pair_quote_reserve_mojos - projected_after_fill;
-                            sort_candidates(bid_candidates, Side::Bid);
-                            std::vector<std::string> cancel_ids;
-                            Mojo freed = 0;
-                            for (const auto& cand : bid_candidates) {
-                                cancel_ids.push_back(cand.offer_id);
-                                freed += cand.spend_cost;
-                                if (freed >= need_to_free) {
-                                    break;
-                                }
+                    {
+                        ExposurePlan plan = plan_exposure(Side::Bid);
+                        if (exposure_unified && plan.evaluated
+                            && plan.decision.verdict != execution::ExposureVerdict::Ok
+                            && plan.cancel_ids.empty()) {
+                            can_bid = false;
+                            suppress_instead(plan, "bid", gate_pc->quote_asset_id,
+                                             pair_quote_reserve_mojos);
+                        }
+                        if (!plan.cancel_ids.empty()) {
+                            // [WALLET-CIRCUIT] As for the asks; the ask
+                            // cancel above may also just have failed.
+                            if (!wallet_step_may_run("Step 8 exposure-floor cancel (bids)")) {
+                                co_return;
                             }
-                            if (!cancel_ids.empty()) {
-                                // [WALLET-CIRCUIT] As for the asks; the ask
-                                // cancel above may also just have failed.
-                                if (!wallet_step_may_run("Step 8 exposure-floor cancel (bids)")) {
-                                    co_return;
-                                }
-                                auto cancelled = co_await offer_mgr_->selective_cancel(cancel_ids);
-                                if (!cancelled.empty()) {
-                                    pair_quote_pending_spend = (pair_quote_pending_spend > freed)
-                                        ? (pair_quote_pending_spend - freed)
-                                        : Mojo{0};
-                                    can_bid = false;
+                            auto cancelled = co_await offer_mgr_->selective_cancel(plan.cancel_ids);
+                            if (!cancelled.empty()) {
+                                pair_quote_pending_spend = (pair_quote_pending_spend > plan.freed)
+                                    ? (pair_quote_pending_spend - plan.freed)
+                                    : Mojo{0};
+                                can_bid = false;
+                                if (exposure_unified) {
+                                    spdlog::warn("[Engine] Step 8: {} exposure (unified) on {} "
+                                                 "breached reserve (owned={} resting={} "
+                                                 "projected={} reserve={}) -- cancelled {} bid "
+                                                 "offers to rebalance exposure",
+                                                 pair_name, gate_pc->quote_asset_id,
+                                                 pair_quote_owned, plan.resting,
+                                                 plan.decision.projected_mojos,
+                                                 pair_quote_reserve_mojos, cancelled.size());
+                                } else {
                                     spdlog::warn("[Engine] Step 8: {} pending exposure on {} "
                                                  "breached reserve (spendable={} pending={} "
                                                  "reserve={}) -- cancelled {} bid offers "
@@ -12290,13 +12497,13 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                                  pair_quote_pending_spend,
                                                  pair_quote_reserve_mojos,
                                                  cancelled.size());
-                                    for (const auto& oid : cancelled) {
-                                        try {
-                                            db_->mark_offer_cancel_submitted(
-                                                oid, block_height,
-                                                "exposure_floor_rebalance");
-                                        } catch (...) {}
-                                    }
+                                }
+                                for (const auto& oid : cancelled) {
+                                    try {
+                                        db_->mark_offer_cancel_submitted(
+                                            oid, block_height,
+                                            "exposure_floor_rebalance");
+                                    } catch (...) {}
                                 }
                             }
                         }
@@ -13548,7 +13755,8 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         {
             // [2026-09-01] The fourth copy of the same long double formula,
             // and the most dangerous of them: this one feeds
-            // exposure_breaches_reserve() and therefore can_bid/can_ask --
+            // decide_exposure() [S71; then exposure_breaches_reserve()] and
+            // therefore can_bid/can_ask --
             // a quoting kill switch driven by platform-dependent arithmetic,
             // on every enabled pair. No test reaches it. Replaced with the
             // shared exact-integer implementation; see the banner in
@@ -13597,42 +13805,105 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 }
             }
 
-            bool suppress_ask_projection = false;
-            bool suppress_bid_projection = false;
-            if (can_ask && pair_base_balance_known && pair_base_reserve_mojos > 0) {
-                if (execution::exposure_breaches_reserve(
-                        pair_base_spendable,
-                        /*pending_spend_mojos=*/pending_plus_new_ask,
-                        /*planned_spend_mojos=*/0,
-                        pair_base_reserve_mojos)) {
-                    suppress_ask_projection = true;
-                    can_ask = false;
-                    spdlog::info("[Engine] Step 8: {} projected ask exposure "
-                                 "would breach reserve on {} (spendable={} "
-                                 "pending+new={} reserve={}) -- suppressing ask",
-                                 pair_name,
-                                 pair_cfg->base_asset_id,
-                                 pair_base_spendable,
-                                 pending_plus_new_ask,
-                                 pair_base_reserve_mojos);
+            // [S71 2026-09-20] The SAME verdict the resting-offer check above
+            // asked for, with the new tiers as `planned`: decide_exposure.
+            // Legacy inputs are the old ones (spendable, this pair's pending)
+            // and any non-Ok verdict suppresses, which is exactly the old
+            // exposure_breaches_reserve(spendable, pending+new, 0, reserve).
+            // Unified projects from `owned` against every resting offer that
+            // spends the asset -- re-read from State here, so an offer the
+            // first site just cancelled (cancel_pending) is already out of
+            // the sum -- and also refuses tiers the FREE coins cannot fund.
+            Mojo planned_ask = 0;
+            Mojo planned_bid = 0;
+            for (const auto& tq : fee_filtered_tiers) {
+                if (tq.side == Side::Ask) {
+                    planned_ask = saturating_add_mojo(planned_ask, tq.size);
+                } else {
+                    planned_bid = saturating_add_mojo(
+                        planned_bid,
+                        quote_cost_for_base_size(BaseMojos{tq.size}, tq.price));
                 }
             }
-            if (can_bid && pair_quote_balance_known && pair_quote_reserve_mojos > 0) {
-                if (execution::exposure_breaches_reserve(
-                        pair_quote_spendable,
-                        /*pending_spend_mojos=*/pending_plus_new_bid,
-                        /*planned_spend_mojos=*/0,
-                        pair_quote_reserve_mojos)) {
+            const std::vector<execution::RestingSpend> prepost_claims =
+                exposure_unified ? exposure_resting_claims()
+                                 : std::vector<execution::RestingSpend>{};
+            const auto projection_for = [&](bool is_ask) {
+                execution::ExposureInputs in;
+                in.owned_mojos     = is_ask ? pair_base_owned : pair_quote_owned;
+                in.spendable_mojos = is_ask ? pair_base_spendable
+                                            : pair_quote_spendable;
+                in.resting_spend_mojos = exposure_unified
+                    ? execution::resting_spend_on_asset(
+                          prepost_claims,
+                          is_ask ? pair_cfg->base_asset_id
+                                 : pair_cfg->quote_asset_id)
+                    : (is_ask ? pair_base_pending_spend : pair_quote_pending_spend);
+                in.planned_spend_mojos = is_ask ? planned_ask : planned_bid;
+                in.reserve_mojos = is_ask ? pair_base_reserve_mojos
+                                          : pair_quote_reserve_mojos;
+                return std::make_pair(
+                    in, execution::decide_exposure(
+                            exposure_unified, in,
+                            config_.strategy.exposure_cancel_hysteresis_pct));
+            };
+
+            bool suppress_ask_projection = false;
+            bool suppress_bid_projection = false;
+            if (can_ask && pair_base_balance_known && pair_base_reserve_mojos > 0
+                && (!exposure_unified || pair_base_owned_known)) {
+                const auto [ask_in, ask_dec] = projection_for(/*is_ask=*/true);
+                if (ask_dec.verdict != execution::ExposureVerdict::Ok) {
+                    suppress_ask_projection = true;
+                    can_ask = false;
+                    if (exposure_unified) {
+                        spdlog::info("[Engine] Step 8: {} projected ask exposure "
+                                     "(unified) would breach reserve on {} (owned={} "
+                                     "spendable={} resting={} new={} reserve={}) -- "
+                                     "suppressing ask",
+                                     pair_name, pair_cfg->base_asset_id,
+                                     ask_in.owned_mojos, ask_in.spendable_mojos,
+                                     ask_in.resting_spend_mojos,
+                                     ask_in.planned_spend_mojos,
+                                     ask_in.reserve_mojos);
+                    } else {
+                        spdlog::info("[Engine] Step 8: {} projected ask exposure "
+                                     "would breach reserve on {} (spendable={} "
+                                     "pending+new={} reserve={}) -- suppressing ask",
+                                     pair_name,
+                                     pair_cfg->base_asset_id,
+                                     pair_base_spendable,
+                                     pending_plus_new_ask,
+                                     pair_base_reserve_mojos);
+                    }
+                }
+            }
+            if (can_bid && pair_quote_balance_known && pair_quote_reserve_mojos > 0
+                && (!exposure_unified || pair_quote_owned_known)) {
+                const auto [bid_in, bid_dec] = projection_for(/*is_ask=*/false);
+                if (bid_dec.verdict != execution::ExposureVerdict::Ok) {
                     suppress_bid_projection = true;
                     can_bid = false;
-                    spdlog::info("[Engine] Step 8: {} projected bid exposure "
-                                 "would breach reserve on {} (spendable={} "
-                                 "pending+new={} reserve={}) -- suppressing bid",
-                                 pair_name,
-                                 pair_cfg->quote_asset_id,
-                                 pair_quote_spendable,
-                                 pending_plus_new_bid,
-                                 pair_quote_reserve_mojos);
+                    if (exposure_unified) {
+                        spdlog::info("[Engine] Step 8: {} projected bid exposure "
+                                     "(unified) would breach reserve on {} (owned={} "
+                                     "spendable={} resting={} new={} reserve={}) -- "
+                                     "suppressing bid",
+                                     pair_name, pair_cfg->quote_asset_id,
+                                     bid_in.owned_mojos, bid_in.spendable_mojos,
+                                     bid_in.resting_spend_mojos,
+                                     bid_in.planned_spend_mojos,
+                                     bid_in.reserve_mojos);
+                    } else {
+                        spdlog::info("[Engine] Step 8: {} projected bid exposure "
+                                     "would breach reserve on {} (spendable={} "
+                                     "pending+new={} reserve={}) -- suppressing bid",
+                                     pair_name,
+                                     pair_cfg->quote_asset_id,
+                                     pair_quote_spendable,
+                                     pending_plus_new_bid,
+                                     pair_quote_reserve_mojos);
+                    }
                 }
             }
 

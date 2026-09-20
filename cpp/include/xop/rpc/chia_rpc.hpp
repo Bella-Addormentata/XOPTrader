@@ -730,6 +730,19 @@ public:
     asio::awaitable<std::int64_t> get_height_info();
 
     /**
+     * @brief The wallet's CHAIN clock at @p height.
+     *
+     * [S70 2026-09-20] Calls the wallet RPC "get_timestamp_for_height": the
+     * timestamp of the latest TRANSACTION block at or before @p height --
+     * the value consensus compares an offer's max_time with.  Read-only.
+     * Payload and parsing are pinned in rpc/wallet_requests.hpp.
+     *
+     * @return The timestamp, or 0 when the response carries none.
+     * @throws ChiaRPCError on transport or application-level failure.
+     */
+    asio::awaitable<std::uint64_t> get_timestamp_for_height(std::int64_t height);
+
+    /**
      * @brief Retrieve the wallet's sync status.
      *
      * Calls the Chia wallet RPC "get_sync_status" endpoint.  Returns the

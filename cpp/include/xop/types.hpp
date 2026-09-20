@@ -404,6 +404,15 @@ struct PendingOffer {
     // the bot's own resting offers as counterparties (2026-07-30).
     // Empty when dexie submission failed or was skipped.
     std::string  dexie_id;
+
+    // [S70 2026-09-20] The on-chain expiry (unix s) this offer VERIFIABLY
+    // carries: the max_time the wallet echoed at creation, or the one its
+    // trade record reports (execution::trade_record_max_time).  0 = none
+    // verified -- the offer predates the feature, its echo failed, or it was
+    // restored from offer_log and the wallet record has not been read back
+    // yet -- and such an offer keeps the bot's own hard TTL.  Read only under
+    // strategy.ttl_cancel_mode: expire.
+    std::uint64_t expiry_max_time{0};
 };
 
 // ---------------------------------------------------------------------------
