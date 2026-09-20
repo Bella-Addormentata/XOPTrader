@@ -3958,6 +3958,7 @@ asio::awaitable<int> OfferManager::post_merged_side(
         expiry_max_time_for(pair);
     json result;
     bool batch_failed = false;
+    bool batch_uncertain = false;
     std::string batch_err;
     // [MIN-INPUT-COIN] The merged dict still has one spend leg, so the floor
     // scales with the merged amount.
@@ -3965,9 +3966,27 @@ asio::awaitable<int> OfferManager::post_merged_side(
         result = co_await create_offer_min_coin(
             merged_dict, expiry_max_time, pair, tiers.front().side,
             static_cast<int>(tiers.front().tier_index), "merged batch");
+    } catch (const rpc::ChiaRPCTransportError& e) {
+        batch_failed = true;
+        batch_err = e.what();
+        batch_uncertain =
+            rpc::create_possibly_submitted(e.curl_code(), e.http_code());
     } catch (const rpc::ChiaRPCError& e) {
         batch_failed = true;
         batch_err = e.what();
+    }
+
+    // [MIN-INPUT-COIN review #162, round 2] No answer is not a refusal.  The
+    // merged offer may already rest in the wallet, and creating the tiers
+    // individually would duplicate it tier by tier.  Post nothing more for
+    // this side this cycle; a refusal, or a failure before the request was
+    // written, still falls back below.
+    if (batch_failed && batch_uncertain) {
+        logger_->error("Batch create_offer for {} {} got NO ANSWER ({}) -- "
+                       "the merged offer may exist in the wallet, so the "
+                       "tiers are NOT created individually this cycle",
+                       pair.name, to_string(tiers.front().side), batch_err);
+        co_return 0;
     }
 
     if (batch_failed) {

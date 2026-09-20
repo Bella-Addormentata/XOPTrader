@@ -74,10 +74,17 @@
 // block of M. There may be other transactions pending or our minimum coin
 // amount is too high." (coin_selection.py).  The create is then sent ONCE
 // more without the floor.  Only that ANSWER triggers it -- a
-// ChiaRPCApplicationError, i.e. a parsed success=false, which proves the
-// wallet created nothing.  A timeout or any other transport failure is not
-// an answer (rpc/rpc_retry_policy.hpp) and is never followed by a second
-// create from here.
+// ChiaRPCApplicationError, i.e. a parsed success=false.  A timeout or any
+// other transport failure is not an answer (rpc/rpc_retry_policy.hpp) and is
+// never followed by a second create from here.
+//
+// [review #162, round 2] A refusal proves the wallet built nothing ONLY IF
+// it answers the one request the wallet saw.  rpc_post returns just its last
+// attempt, and it used to re-send this endpoint after a timeout: the refusal
+// could then answer a copy whose original had already built the offer and
+// lost its reply -- the original's coin locks being the very reason the copy
+// was refused.  create_offer_for_ids is therefore NeverResend, and the
+// static_assert beside the fallback makes reverting that a build error.
 //
 // Pure apart from the one coroutine template, which takes the wallet call as
 // a parameter so cpp/tests/test_offer_min_input_coin.cpp can drive a refusing
@@ -95,6 +102,7 @@
 #include <string_view>
 
 #include "xop/rpc/chia_rpc.hpp"
+#include "xop/rpc/rpc_retry_policy.hpp"
 
 namespace xop::execution {
 
@@ -272,13 +280,23 @@ static_assert(min_input_coin_mojos(1'000'000'000, 1.0 / 3.0) == 333'333'334u);
 ///                     second create, so the caller can log pair/side/tier.
 ///
 /// At most two creates are ever sent, and the second only after the wallet
-/// ANSWERED the first with a refusal, so at most one offer can exist.  Every
+/// ANSWERED the first with a refusal, so at most one offer can exist --
+/// given that `create` never re-sends a request the wallet may have received
+/// (the static_assert below).  Every
 /// other failure -- ChiaRPCTransportError above all: a timeout says nothing
 /// about whether the wallet built the offer -- propagates untouched from
 /// whichever create raised it, to the handling the call site already had.
 ///
 /// All parameters BY VALUE: this is a coroutine, and a reference parameter
 /// would dangle across the first suspension.
+// The premise of the fallback below, checked where it is relied on: if this
+// endpoint is ever re-sent after a possibly-delivered failure again, a refusal
+// stops proving that no offer exists, and the retry can create a second one.
+static_assert(rpc::retry_policy_for_endpoint("create_offer_for_ids")
+                  == rpc::RpcRetryPolicy::NeverResend,
+              "create_offer_with_min_coin_fallback needs create_offer_for_ids "
+              "to be NeverResend");
+
 template <class Create, class OnFallback>
 boost::asio::awaitable<nlohmann::json> create_offer_with_min_coin_fallback(
     Create                       create,

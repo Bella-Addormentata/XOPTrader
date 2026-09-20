@@ -292,3 +292,51 @@ def test_each_posting_path_admits_the_dict_it_then_creates():
             "%s is admitted by the ledger but created from another dict, so the "
             "floor the ledger models is not the one the wallet receives" % dict_name
         )
+
+
+# ---------------------------------------------------------------------------
+# [review #162, round 2] An uncertain create outcome must not be answered with
+# more creates.  The classification is pinned by gtest
+# (RpcRetryPolicy.AnUnansweredCreateMayHaveBuiltTheOffer); this pins that
+# post_merged_side asks it, and stops before the individual fallback.
+# ---------------------------------------------------------------------------
+
+MERGED_SIGNATURE = "asio::awaitable<int> OfferManager::post_merged_side("
+
+
+def test_an_unanswered_merged_create_is_not_followed_by_individual_creates():
+    body = _code(_definition(OFFER_MANAGER_CPP, MERGED_SIGNATURE))
+    transport = body.index("catch(constrpc::ChiaRPCTransportError&e)")
+    base = body.index("catch(constrpc::ChiaRPCError&e)")
+    assert transport < base, (
+        "the transport-error handler must come first: ChiaRPCTransportError "
+        "derives from ChiaRPCError, so behind it it is unreachable"
+    )
+    assert body.count(
+        "batch_uncertain=rpc::create_possibly_submitted(e.curl_code(),e.http_code());"
+    ) == 1, "post_merged_side no longer asks whether the merged create may have landed"
+    assert transport < body.index("batch_uncertain=rpc::create_possibly_submitted(") < base
+
+    bypass = body.index("if(batch_failed&&batch_uncertain){")
+    fallback = body.index("if(batch_failed){")
+    assert bypass < fallback, (
+        "the no-answer bypass must run before the individual fallback"
+    )
+    between = body[bypass:fallback]
+    assert "co_return0;" in between and "create_offer_min_coin(" not in between, (
+        "after an unanswered merged create the function must return without "
+        "creating anything else"
+    )
+
+
+def test_the_create_endpoint_is_never_resend_where_the_fallback_relies_on_it():
+    header = _read(REPO / "cpp" / "include" / "xop" / "execution" / "offer_min_input_coin.hpp")
+    code = _code(header, keep_strings=True)
+    assert ('static_assert(rpc::retry_policy_for_endpoint("create_offer_for_ids")'
+            "==rpc::RpcRetryPolicy::NeverResend,") in code, (
+        "the fallback's premise is no longer checked at compile time"
+    )
+    assert code.index("static_assert(rpc::retry_policy_for_endpoint(") < code.index(
+        "create_offer_with_min_coin_fallback(Createcreate,"), (
+        "the static_assert must sit with the fallback it protects"
+    )

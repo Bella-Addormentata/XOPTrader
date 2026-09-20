@@ -61,8 +61,19 @@ tracked like any other and retired by the usual cancels: the one posted at
 14:42 on 2026-09-19 was cancelled at 18:23. Until then it locks its coins while
 listed nowhere (`TODO.md` S66).
 
-**Not changed.** `rpc_post` still re-sends `create_offer_for_ids` after a
-transient transport failure, as it did before (#158 left it out of scope).
+**A create is no longer re-sent once it may have reached the wallet.** `rpc_post`
+re-sent `create_offer_for_ids` after a timeout or an HTTP 5xx, up to three more
+times, and returns only its last attempt (#158 had left the endpoint out of
+scope). A second copy of a create is a second offer, and the fallback above
+made that worse than it was: the wallet's refusal could answer a copy whose
+original had already built the offer and lost its reply, and the fallback then
+created another. `create_offer_for_ids` is now never re-sent unless the request
+cannot have reached the wallet (no connection, no TLS handshake), as the two
+cancel endpoints already were, so a create that times out fails after one
+attempt (30 s) instead of four (about 124 s). `take_offer` is unchanged. For the
+same reason a merged create that ends with no answer is no longer followed by
+one create per tier; a refusal, or a failure before the request was written,
+still is.
 
 ## [0.10.24] — 2026-09-14 — record what happened, not what was asked for
 
