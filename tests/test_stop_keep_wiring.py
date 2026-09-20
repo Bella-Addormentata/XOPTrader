@@ -291,6 +291,32 @@ def test_the_keep_report_cannot_reach_the_wallet_or_the_intent_file():
             "warn, and the GUI may hard-kill a stop that overruns its window")
 
 
+def test_a_keep_stop_that_cut_a_cycle_short_says_so():
+    """[review #165] A SIGNAL can deliver shutdown() while a heartbeat cycle is
+    suspended in an RPC -- shutdown.flag cannot, it is read between cycles. The
+    keep continuation then runs to ioc_.stop() without suspending, the cycle
+    never resumes, and an offer it was creating at that instant may exist in
+    the wallet unrecorded. The engine does not wait the cycle out (it would go
+    on posting and cancelling under a stop meant to be quiet); it SAYS so. This
+    pins the mark around the cycle and the line that reads it."""
+    poll = _code(_definition(ENGINE_CPP, "asio::awaitable<void> Engine::poll_loop_coro()"))
+    _in_order(poll, [
+        "structCycleMark{bool*flag;~CycleMark(){*flag=false;}}cycle_mark{&heartbeat_in_flight_};",
+        "heartbeat_in_flight_=true;",
+        "co_awaiton_new_block_coro(current_block);",
+    ])
+    assert poll.count("heartbeat_in_flight_=true;") == 1
+    assert "heartbeat_in_flight_=false;" not in poll, (
+        "a bare reset after the await is skipped by an exception; the RAII mark "
+        "is what clears it")
+    report = _code(_definition(ENGINE_CPP, "void Engine::report_offers_kept_on_stop()"))
+    assert "if(heartbeat_in_flight_){spdlog::warn(" in report
+    # The flag checkpoints really are outside the cycle: none inside it.
+    cycle = _code(_definition(
+        ENGINE_CPP, "asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)"))
+    assert "check_shutdown_flag(" not in cycle and "evaluate_shutdown_flag(" not in cycle
+
+
 def test_the_engine_header_documents_the_members_the_scans_rely_on():
     header = _code(_text(ENGINE_HPP))
     assert ("std::atomic<util::StopOffersRequest>stop_offers_request_{"
@@ -315,8 +341,8 @@ def test_startup_prints_the_default_and_warns_when_keep_has_no_expiry():
     warn = _block(code, "if(config_.engine.shutdown_offers==util::StopOffersPolicy::Keep){")
     _in_order(warn, [
         "if(!pair.enabled)continue;",
-        "execution::effective_offer_expiry_secs(pair.offer_expiry_secs_override,"
-        "config_.strategy.offer_expiry_secs)==0",
+        ("execution::effective_offer_expiry_secs(pair.offer_expiry_secs_override,"
+         + "config_.strategy.offer_expiry_secs)==0"),
         "spdlog::warn(",
     ])
     assert "engine.shutdown_offers is \\\"keep\\\"" in block

@@ -698,11 +698,23 @@ class EngineBridge(QObject):
             config = None
         return stop_offers.summarise_resting_offers(rows, config)
 
+    def _policy_for_request(self, requested: Optional[str]) -> Optional[str]:
+        """The policy that may be written for *requested*.
+
+        [review #165] The capability is consulted ONLY for an actual keep:
+        :attr:`engine_supports_keep_offers` may run a ``--help`` subprocess
+        under a 2 s timeout, and a session-end close (no policy) or a cancel
+        must not spend the OS's few shutdown seconds on a probe whose answer
+        cannot matter."""
+        if stop_offers.parse_policy(requested) != stop_offers.POLICY_KEEP:
+            return stop_offers.policy_to_send(requested, keep_supported=False)
+        return stop_offers.policy_to_send(
+            requested, keep_supported=self.engine_supports_keep_offers)
+
     def set_close_offers_policy(self, policy: Optional[str]) -> None:
         """Hold the close prompt's answer for :meth:`shutdown`. ``"keep"`` is
         held only for an engine that can honour it."""
-        self._close_offers_policy = stop_offers.policy_to_send(
-            policy, keep_supported=self.engine_supports_keep_offers)
+        self._close_offers_policy = self._policy_for_request(policy)
 
     def request_config_reload(self) -> None:
         """[RELOAD] Ask the running engine to re-read config.yaml.
@@ -1367,8 +1379,7 @@ class EngineBridge(QObject):
                     "Could not write %s (%s); a GUI launched after the engine "
                     "consumes shutdown.flag will not wait for this stop.",
                     shutdown_flag.STOP_MARKER_NAME, exc)
-            policy = stop_offers.policy_to_send(
-                offers_policy, keep_supported=self.engine_supports_keep_offers)
+            policy = self._policy_for_request(offers_policy)
             if (stop_offers.parse_policy(offers_policy) == stop_offers.POLICY_KEEP
                     and policy is None):
                 _log.error(

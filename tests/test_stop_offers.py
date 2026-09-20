@@ -25,7 +25,7 @@ import logging
 import os
 import sqlite3
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -238,6 +238,32 @@ def test_the_noninteractive_latch_is_set_once_and_stays():
         stop_offers.mark_noninteractive_quit("SIGTERM")
         stop_offers.mark_noninteractive_quit("OS session end")
         assert stop_offers.noninteractive_quit_reason() == "SIGTERM"
+    finally:
+        stop_offers.reset_noninteractive_quit()
+
+
+def test_the_noninteractive_mark_expires():
+    """[review #165] Windows lets the user or another application CANCEL a
+    log-off after commitDataRequest has fired. The GUI then keeps running, and
+    a mark that never expired would silence the stop prompt for the rest of the
+    session: every later Stop Trading would quietly use the config default."""
+    stop_offers.reset_noninteractive_quit()
+    try:
+        stop_offers.mark_noninteractive_quit("OS session end", now=1000.0)
+        standing = 1000.0 + stop_offers.NONINTERACTIVE_MARK_S
+        assert stop_offers.noninteractive_quit_reason(now=1000.0) == "OS session end"
+        assert stop_offers.noninteractive_quit_reason(now=standing) == "OS session end"
+        assert stop_offers.noninteractive_quit_reason(now=standing + 0.5) is None
+
+        # While it stands the first reason is kept; once it has lapsed a new
+        # quit is a new mark.
+        stop_offers.mark_noninteractive_quit("SIGTERM", now=1001.0)
+        assert stop_offers.noninteractive_quit_reason(now=1001.0) == "OS session end"
+        stop_offers.mark_noninteractive_quit("SIGTERM", now=standing + 1.0)
+        assert stop_offers.noninteractive_quit_reason(now=standing + 1.0) == "SIGTERM"
+        assert 30.0 <= stop_offers.NONINTERACTIVE_MARK_S <= 600.0, (
+            "long enough for a real quit to finish, short enough that a "
+            "cancelled log-off does not silence the prompt for the session")
     finally:
         stop_offers.reset_noninteractive_quit()
 
@@ -717,6 +743,37 @@ def test_a_failed_launch_probe_is_asked_once_more_and_only_once(bridge_factory, 
     nothing, _proc, _seen, _errors = bridge_factory(keep_supported=False)
     assert nothing.engine_supports_keep_offers is False
     assert probes == []
+
+
+def test_the_capability_is_probed_only_for_an_actual_keep(bridge_factory, monkeypatch):
+    """[review #165] The re-probe runs ``--help`` under a 2 s timeout. A
+    session-end close (no policy) or a cancel must not spend the OS's few
+    shutdown seconds on a probe whose answer cannot matter."""
+    from gui.services.engine_bridge import EngineBridge
+
+    probes = []
+
+    def fake_probe(self, engine_path, flag):
+        probes.append(engine_path)
+        return False
+
+    monkeypatch.setattr(EngineBridge, "_engine_supports_flag", fake_probe)
+    bridge, _proc, seen, _errors = bridge_factory(keep_supported=False)
+    bridge._engine_binary_path = Path("xop_trader.exe")
+
+    bridge.set_close_offers_policy(None)
+    bridge.set_close_offers_policy("cancel")
+    assert bridge._close_offers_policy == "cancel"
+    EngineBridge._stop_engine_process(bridge, offers_policy=None)
+    assert probes == [], "a stop that sends no keep probed the engine binary"
+    assert "offers=" not in seen["request"]
+
+    # ...and a keep does ask.
+    other, _proc, _seen, _errors = bridge_factory(keep_supported=False)
+    other._engine_binary_path = Path("xop_trader.exe")
+    other.set_close_offers_policy("keep")
+    assert probes == [Path("xop_trader.exe")]
+    assert other._close_offers_policy is None
 
 
 def test_a_close_with_keep_is_withheld_for_an_engine_that_cannot_keep(bridge_factory):

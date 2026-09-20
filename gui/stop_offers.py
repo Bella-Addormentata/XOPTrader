@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -206,28 +207,47 @@ def policy_to_send(requested: Optional[str], *, keep_supported: bool) -> Optiona
 
 # -- a close nobody at the machine started ----------------------------------
 
+#: How long a non-interactive mark stands. A quit that really happens ends the
+#: process within seconds. One that does NOT -- Windows lets the user or another
+#: application cancel a log-off after commitDataRequest has fired -- leaves the
+#: GUI running, and a mark that never expired would then silence the stop prompt
+#: for the rest of the session: every later Stop Trading would quietly use the
+#: config default. [review #165]
+NONINTERACTIVE_MARK_S = 120.0
+
 _noninteractive_quit_reason: Optional[str] = None
+_noninteractive_quit_at: float = 0.0
 
 
-def mark_noninteractive_quit(reason: str) -> None:
+def mark_noninteractive_quit(reason: str, *, now: Optional[float] = None) -> None:
     """Record that the application is quitting with nobody to answer a prompt
-    (SIGINT/SIGTERM, an OS session end). Latched until the process exits."""
-    global _noninteractive_quit_reason
-    if _noninteractive_quit_reason is None:
+    (SIGINT/SIGTERM, an OS session end). Stands for NONINTERACTIVE_MARK_S; the
+    first reason is kept while it stands."""
+    global _noninteractive_quit_reason, _noninteractive_quit_at
+    moment = time.monotonic() if now is None else now
+    if noninteractive_quit_reason(now=moment) is None:
         _noninteractive_quit_reason = reason
+        _noninteractive_quit_at = moment
         _log.info("Non-interactive quit (%s): the engine stop will not prompt; "
                   "engine.shutdown_offers decides what happens to the offers.",
                   reason)
 
 
-def noninteractive_quit_reason() -> Optional[str]:
+def noninteractive_quit_reason(*, now: Optional[float] = None) -> Optional[str]:
+    """The reason while the mark stands, else None."""
+    if _noninteractive_quit_reason is None:
+        return None
+    moment = time.monotonic() if now is None else now
+    if moment - _noninteractive_quit_at > NONINTERACTIVE_MARK_S:
+        return None
     return _noninteractive_quit_reason
 
 
 def reset_noninteractive_quit() -> None:
     """Tests only."""
-    global _noninteractive_quit_reason
+    global _noninteractive_quit_reason, _noninteractive_quit_at
     _noninteractive_quit_reason = None
+    _noninteractive_quit_at = 0.0
 
 
 # ---------------------------------------------------------------------------

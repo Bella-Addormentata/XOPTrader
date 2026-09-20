@@ -3628,10 +3628,22 @@ class MainWindow(QMainWindow):
             The close event from the windowing system.
         """
         # -- Check for unsaved settings ------------------------------------
-        if (
+        # [review #165] Not on a close nobody at the machine started: a log-off
+        # or a signal with a dirty Settings page would block on this modal for
+        # ever, exactly what the stop prompt below refuses to do. Unsaved edits
+        # are then DISCARDED, never saved -- a config the operator did not
+        # confirm must not reach the engine's next start.
+        interactive_close = stop_offers.noninteractive_quit_reason() is None
+        settings_dirty = (
             self._settings_widget is not None
             and getattr(self._settings_widget, "_dirty", False)
-        ):
+        )
+        if settings_dirty and not interactive_close:
+            _log.warning(
+                "Non-interactive close (%s) with unsaved Settings changes: "
+                "they are discarded, not saved.",
+                stop_offers.noninteractive_quit_reason())
+        if settings_dirty and interactive_close:
             reply = QMessageBox.question(
                 self,
                 "Unsaved Settings",

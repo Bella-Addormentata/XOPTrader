@@ -2319,6 +2319,24 @@ void Engine::report_offers_kept_on_stop()
                      "were given one so the next start restores them as known; "
                      "{} could not be written", rows_added, rows_failed);
     }
+    if (heartbeat_in_flight_) {
+        // [review #165] Only a SIGNAL gets here mid-cycle: shutdown.flag is
+        // read between cycles. This continuation runs the moment that cycle
+        // suspends in an RPC, and from here to ioc_.stop() nothing suspends,
+        // so the cycle never resumes. If the RPC it was waiting on was a
+        // create_offer, the wallet may complete it and this process will never
+        // see the answer: an offer in the wallet with no State entry and no
+        // offer_log row, never published to Dexie. Waiting the cycle out would
+        // let it go on posting and cancelling under a stop the operator asked
+        // to be quiet, so it is SAID, not waited for (TODO S76).
+        spdlog::warn("[Engine] [S74] this stop arrived by SIGNAL while a "
+                     "heartbeat cycle was in flight, and the cycle will not "
+                     "resume. If it was creating an offer at that instant, the "
+                     "wallet may hold one offer this engine never recorded: the "
+                     "next start meets it as an ORPHAN and re-prices or cancels "
+                     "it. Stops from the GUI are read between cycles and cannot "
+                     "do this.");
+    }
     if (cancel_all_inflight_) {
         spdlog::warn("[Engine] [S74] an operator Cancel All was still in flight "
                      "when this stop began. This stop sends nothing more and "
@@ -3395,6 +3413,17 @@ asio::awaitable<void> Engine::poll_loop_coro()
 
             // If we observed a new block, run the full heartbeat cycle.
             if (current_block > last_block_.load(std::memory_order_relaxed)) {
+                // [S74, review #165] Marked so a KEEP stop can say when it
+                // landed INSIDE a cycle. A shutdown.flag stop cannot: the
+                // flag is read above, between cycles. A SIGNAL can, and the
+                // keep continuation then runs the moment this cycle suspends
+                // in an RPC and stops the io_context -- see
+                // report_offers_kept_on_stop for what that can leave behind.
+                struct CycleMark {
+                    bool* flag;
+                    ~CycleMark() { *flag = false; }
+                } cycle_mark{&heartbeat_in_flight_};
+                heartbeat_in_flight_ = true;
                 co_await on_new_block_coro(current_block);
             }
         } catch (const std::exception& ex) {

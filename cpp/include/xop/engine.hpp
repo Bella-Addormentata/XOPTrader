@@ -1208,6 +1208,12 @@ private:
     /// stop reports exactly that instead of an empty book. ioc_ thread only.
     bool book_restored_from_offer_log_{false};
 
+    /// True while poll_loop_coro is inside a heartbeat cycle. Read only by the
+    /// keep report, to say when a SIGNAL-delivered keep stop cut a cycle short
+    /// (a shutdown.flag stop is read between cycles and never does). ioc_
+    /// thread only.
+    bool heartbeat_in_flight_{false};
+
     /// The keep path: mirror State into offer_log for any offer that has no row
     /// yet, then log the one line that says what was left resting
     /// (execution/kept_book.hpp). Deliberately NOT a coroutine -- it cannot

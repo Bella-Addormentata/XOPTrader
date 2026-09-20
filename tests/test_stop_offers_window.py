@@ -232,6 +232,66 @@ def test_a_close_nobody_started_shows_no_prompt_and_sends_no_policy(
         "no policy: the ENGINE's engine.shutdown_offers decides, not the GUI's copy of it")
 
 
+@pytest.fixture
+def dirty_settings(window):
+    """The window's real Settings page, flagged as having unsaved edits."""
+    page = window._settings_widget
+    assert hasattr(page, "_dirty"), "the Settings page is not the real widget"
+    saved = page._dirty
+    page._dirty = True
+    yield page
+    page._dirty = saved
+
+
+def test_a_close_nobody_started_skips_the_unsaved_settings_modal_too(
+        window, monkeypatch, dirty_settings, caplog):
+    """[review #165] The unsaved-settings box sits ABOVE the stop prompt in
+    closeEvent. With a dirty Settings page a log-off or a signal would block on
+    it for ever. The edits are discarded, never saved: a config nobody
+    confirmed must not reach the engine's next start."""
+    import logging
+
+    caplog.set_level(logging.WARNING)
+    saves = []
+    monkeypatch.setattr(dirty_settings, "save_config", lambda *a, **k: saves.append(1),
+                        raising=False)
+    bridge = BridgeDouble(default="keep")
+    window._bridge = bridge
+    calls = _no_prompt(monkeypatch)
+    stop_offers.mark_noninteractive_quit("OS session end")
+
+    event = QCloseEvent()
+    window.closeEvent(event)   # the fixture's QMessageBox.question raises if shown
+
+    assert event.isAccepted()
+    assert calls == [] and saves == []
+    assert bridge.close_policy is None
+    assert any("discarded, not saved" in r.getMessage() for r in caplog.records)
+
+
+def test_an_interactive_close_still_asks_about_unsaved_settings(
+        window, monkeypatch, dirty_settings):
+    """The other side of that gate: somebody IS there, so the box is shown, and
+    its Cancel keeps the window open before the stop prompt is ever reached."""
+    asked = []
+
+    def question(*_a, **_k):
+        asked.append(1)
+        return QMessageBox.StandardButton.Cancel
+
+    monkeypatch.setattr(QMessageBox, "question", staticmethod(question))
+    bridge = BridgeDouble()
+    window._bridge = bridge
+    calls = _no_prompt(monkeypatch)
+
+    event = QCloseEvent()
+    window.closeEvent(event)
+
+    assert asked == [1]
+    assert not event.isAccepted()
+    assert calls == [], "the stop prompt was shown after the close was cancelled"
+
+
 def test_a_close_with_no_engine_of_ours_asks_nothing(window, monkeypatch):
     bridge = BridgeDouble(running=False)
     window._bridge = bridge

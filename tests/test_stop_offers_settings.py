@@ -219,7 +219,8 @@ def test_choosing_keep_writes_exactly_that_key(panel, old_cfg):
     assert panel.save_config() is True
 
     after = _disk(old_cfg)
-    assert after.pop("engine") == {"shutdown_offers": "keep"}
+    engine_section = after.pop("engine", None)
+    assert engine_section == {"shutdown_offers": "keep"}
     assert after == _disk(control), (
         "the save changed something other than engine.shutdown_offers")
 
