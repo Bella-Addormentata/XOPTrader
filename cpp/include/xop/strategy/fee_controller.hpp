@@ -228,14 +228,24 @@ inline constexpr double kFullMempoolMinRate = 5.0;
 inline constexpr double        kFeeCeilingDouble = 9223372036854775808.0;
 inline constexpr std::uint64_t kFeeCeiling       = 9223372036854775808ULL;
 
-/// ceil(rate x cost) as mojos.  0 for a rate or cost that is not finite and
-/// > 0; saturates at 2^63.
+/// One part in 10^12: how far above a whole number a product may sit and still
+/// be that number.  (min_fee / cost) x cost is min_fee in exact arithmetic and
+/// min_fee x (1 + 2e-16) in doubles, and a bare ceil() would charge min_fee + 1
+/// for it -- "level 0 pays EXACTLY min_fee" would be off by a mojo on some
+/// inputs and not others, by platform.  Double rounding noise is ~1e-15; this
+/// is a thousand times that and still one mojo per trillion.
+inline constexpr double kCeilTolerance = 1e-12;
+
+/// ceil(rate x cost) as mojos -- never BELOW the computed requirement, up to
+/// kCeilTolerance.  0 for a rate or cost that is not finite and > 0; saturates
+/// at 2^63.
 [[nodiscard]] inline std::uint64_t fee_from_rate(double rate, std::uint64_t cost) noexcept
 {
     if (!std::isfinite(rate) || !(rate > 0.0) || cost == 0U) {
         return 0U;
     }
-    const double raw = std::ceil(rate * static_cast<double>(cost));
+    const double product = rate * static_cast<double>(cost);
+    const double raw     = std::ceil(product - product * kCeilTolerance);
     if (!(raw < kFeeCeilingDouble)) {
         return kFeeCeiling;
     }
@@ -258,7 +268,16 @@ struct BudgetedFee {
 ///
 ///   * a PRIORITY action (cancel, take) may use the whole headroom;
 ///   * an offer-attached fee may use only the headroom above `reserve`, the
-///     budget held back so the resting book can still be cancelled;
+///     budget held back so the resting book can still be cancelled -- and
+///     only a 1/`batch` share of it.  [review #163] Step 8 asks for ONE
+///     attached fee per heartbeat and then attaches it to every tier it posts,
+///     recording posted x fee afterwards, so a fee shaped for one offer let a
+///     ladder of ten spend ten times the room above the reserve.  `batch` is
+///     the number of offers the fee may be attached to before the budget is
+///     next consulted (the caller's upper bound; 0 counts as 1);
+///   * a PRIORITY action is NOT shaped by a batch, on purpose: a cancel that
+///     must happen pays, so for cancels the budget is a soft limit that one
+///     heartbeat can overshoot and the next degrades to min_fee;
 ///   * nothing is ever lowered below min_fee, the operator's own floor, and
 ///     nothing is ever 0: an exhausted budget degrades every fee to min_fee
 ///     and says so (`bound`), it does not stop the bot.
@@ -268,10 +287,12 @@ struct BudgetedFee {
                                                  std::uint64_t headroom,
                                                  std::uint64_t reserve,
                                                  std::uint64_t min_fee,
-                                                 bool          priority) noexcept
+                                                 bool          priority,
+                                                 std::uint64_t batch = 1U) noexcept
 {
+    const std::uint64_t above_reserve = headroom > reserve ? headroom - reserve : 0U;
     const std::uint64_t available =
-        priority ? headroom : (headroom > reserve ? headroom - reserve : 0U);
+        priority ? headroom : above_reserve / (batch == 0U ? 1U : batch);
     std::uint64_t fee = std::min(desired, available);
     if (fee < min_fee) {
         fee = std::min(desired, min_fee);
@@ -284,6 +305,12 @@ static_assert(apply_budget(200U, 1'000U, 900U, 10U, false).fee == 100U);
 static_assert(apply_budget(200U, 1'000U, 900U, 10U, false).bound);
 static_assert(apply_budget(200U, 0U, 0U, 10U, true).fee == 10U);
 static_assert(!apply_budget(200U, 200U, 0U, 10U, true).bound);
+// Ten offers share the 100 above the reserve: 10 each, not 100 each.
+static_assert(apply_budget(200U, 1'000U, 900U, 10U, false, 10U).fee == 10U);
+static_assert(apply_budget(200U, 1'000U, 900U, 1U, false, 4U).fee == 25U);
+static_assert(apply_budget(200U, 1'000U, 900U, 1U, false, 0U).fee == 100U);
+// A priority action is not shaped by the batch.
+static_assert(apply_budget(200U, 1'000U, 900U, 10U, true, 10U).fee == 200U);
 
 // ---------------------------------------------------------------------------
 // The wallet's own word: sent_to
@@ -480,9 +507,6 @@ public:
     /// attributed observation between them: three is x8 at the default step.
     static constexpr std::uint32_t kMaxUncorroboratedRaises = 3;
 
-    /// The anchor never rests on a min_fee below this (a min_fee of 0 would
-    /// make every multiple of it 0).
-    static constexpr std::uint64_t kAnchorFloorMojos = 1'000'000ULL;
 
     explicit Controller(ControllerConfig cfg = {},
                         std::uint64_t min_fee_mojos = 0,
@@ -491,9 +515,15 @@ public:
         , min_fee_{std::min(min_fee_mojos, max_fee_mojos)}
         , max_fee_{std::min(std::max(min_fee_mojos, max_fee_mojos), kFeeCeiling)}
     {
-        // level 0 <=> a CAT cancel, the commonest spend, pays exactly min_fee.
+        // level 0 <=> a CAT cancel, the commonest spend, pays EXACTLY min_fee,
+        // for every min_fee config.cpp accepts (any value >= 1 with the
+        // controller on).  [review #163] An earlier revision floored the
+        // anchor at 1,000,000 mojos, so min_fee_mojos: 5000 -- the value in
+        // config.example.yaml -- started at 200x the operator's floor.  The
+        // one-mojo guard below exists only for direct construction with 0,
+        // which the parser refuses; a multiple of 0 would be 0 for ever.
         const double ref_cost = static_cast<double>(std::max<std::uint64_t>(cfg_.costs.cancel_cat, 1U));
-        anchor_rate_ = static_cast<double>(std::max(min_fee_, kAnchorFloorMojos)) / ref_cost;
+        anchor_rate_ = static_cast<double>(std::max<std::uint64_t>(min_fee_, 1U)) / ref_cost;
 
         // [lo, hi]: outside it EVERY class is pinned at min_fee (below) or at
         // max_fee (above), so the level has no authority and further error
@@ -1082,6 +1112,38 @@ inline constexpr std::size_t kMaxTickets = 512;
     return confirmed_block >= t.submit_block ? confirmed_block - t.submit_block : 0U;
 }
 
+/// What Step 2's terminal verdict on a ticketed cancel tells the controller.
+///
+/// [review #163] OfferManager::recheck_terminal answers StillTerminal for the
+/// wallet statuses CANCELLED and FAILED alike.  Only CANCELLED says the cancel
+/// spend confirmed.  FAILED says the offer died some other way, and fed as an
+/// on-target confirmation it could validate a probe and LOWER the fee on no
+/// evidence.  So: `has` is false unless the wallet said CANCELLED, and the
+/// caller drops the ticket unheard.
+struct VerdictObservation {
+    bool        has{false};
+    Observation observation{};
+};
+
+[[nodiscard]] constexpr VerdictObservation observation_for_cancel_verdict(
+    const Ticket& t, bool wallet_says_cancelled, std::uint32_t observed_block,
+    std::uint32_t now) noexcept
+{
+    VerdictObservation out{};
+    if (!wallet_says_cancelled) {
+        return out;
+    }
+    out.has                      = true;
+    out.observation.signal       = Signal::Confirmed;
+    out.observation.blocks       = static_cast<double>(confirmation_delay(t, observed_block));
+    out.observation.attributed   = true;
+    out.observation.submit_level = t.submit_level;
+    out.observation.now          = now;
+    return out;
+}
+
+static_assert(!observation_for_cancel_verdict(Ticket{}, false, 10U, 10U).has);
+static_assert(observation_for_cancel_verdict(Ticket{}, true, 10U, 10U).has);
 static_assert(confirmation_delay(Ticket{ActionClass::Take, 100U, 0.0, 0U, false, 0U}, 96U) == 0U);
 static_assert(pending_observation_due(Ticket{ActionClass::Take, 100U, 0.0, 0U, false, 0U}, 109U, 8U));
 static_assert(!pending_observation_due(Ticket{ActionClass::Take, 100U, 0.0, 0U, false, 0U}, 108U, 8U));

@@ -157,7 +157,10 @@ def test_take_sites_pay_the_take_class_and_open_a_ticket():
 
 def test_step8_hands_offer_manager_class_aware_cancel_fees_only_when_active():
     body = _function_body(_engine(), "asio::awaitable<void> Engine::step_manage_offers(")
-    gate = body.index("fee_tracker_->controller_active()")
+    # [review #163] class_fees_active(), NOT controller_active(): with only
+    # fees.cost_aware_estimate on, a CAT cancel must still pay its own class.
+    gate = body.index("if (fee_tracker_->class_fees_active()) {")
+    assert "fee_tracker_->controller_active()" not in body[gate - 400:gate + 900]
     set_at = body.index("offer_mgr_->set_cancel_fees(", gate)
     clear_at = body.index("offer_mgr_->clear_cancel_fees()", set_at)
     assert gate < set_at < clear_at
@@ -250,33 +253,89 @@ def test_every_glue_function_is_inert_with_the_controller_off():
         "void Engine::fee_feedback_note(",
         "void Engine::fee_feedback_signal(",
         "void Engine::fee_feedback_track_take(",
+        "void Engine::fee_feedback_track_cancel(",
         "void Engine::fee_feedback_on_cancel_verdict(",
         "asio::awaitable<void> Engine::fee_feedback_sweep(",
     ):
         body = _function_body(engine, signature)
         head = body[:body.index("{") + 400]
         assert "!fee_tracker_->controller_active()" in head, signature
-    # cancel_fees_paid keeps the old product when off.
+    # cancel_fees_paid keeps the old product unless fees depend on the class.
     paid = _function_body(engine, "std::uint64_t Engine::cancel_fees_paid(")
+    assert "!fee_tracker_->class_fees_active()" in paid
     assert "static_cast<std::uint64_t>(ids.size()) * legacy_fee" in paid
     # The sweep pays nothing and cancels nothing: its only wallet call is a read.
     sweep = _function_body(engine, "asio::awaitable<void> Engine::fee_feedback_sweep(")
     assert re.findall(r"wallet_->(\w+)\(", sweep) == ["transport_counters", "get_offer"]
-    assert "offer_mgr_->cancel_fee_for(" in sweep
-    assert not re.search(r"offer_mgr_->(selective_cancel|cancel_|recancel|post_)", sweep.replace(
-        "offer_mgr_->cancel_fee_for(", ""))
+    assert not re.search(r"offer_mgr_->\w+\(", sweep), "the sweep calls nothing on OfferManager"
 
 
-def test_cancels_already_pending_at_boot_get_no_ticket():
-    """What a cancel adopted at boot paid is unknown, so its lateness is not
-    evidence about the level: it must never open a ticket."""
-    sweep = _function_body(_engine(), "asio::awaitable<void> Engine::fee_feedback_sweep(")
-    first = sweep.index("const bool first_sweep = !fee_sweep_ran_;")
-    mark = sweep.index("fee_unticketed_.insert(po.offer_id);", first)
-    skip = sweep.index("if (fee_unticketed_.count(po.offer_id) != 0", mark)
-    ticket = sweep.index("fee_tickets_.emplace(po.offer_id", skip)
-    assert first < mark < skip < ticket
-    assert re.search(r"if\s*\(first_sweep\)\s*\{\s*fee_unticketed_\.insert", sweep)
+def test_cancel_tickets_open_at_the_accepted_rpc_with_the_fee_really_paid():
+    """[review #163] A ticket opened a heartbeat later, from the CURRENT policy,
+    missed every cancel that confirmed inside that heartbeat and misattributed
+    any whose fee was not the policy's (an emergency tier, a zero-fee retry, an
+    escalation).  It is opened by OfferManager's cancel observer instead."""
+    om = _strip_line_comments(_read(OFFER_MANAGER))
+    charged = _function_body(om, "asio::awaitable<json> OfferManager::cancel_offer_charged(")
+    rpc = charged.index("co_await wallet_->cancel_offer(trade_id, fee, secure)")
+    seen = charged.index("cancel_observer_(trade_id, fee);", rpc)
+    assert rpc < seen, "only AFTER the wallet accepted it: a refusal throws past the observer"
+    assert re.search(r"if\s*\(secure\s*&&\s*cancel_observer_\)\s*\{\s*cancel_observer_\(trade_id, fee\);",
+                     charged), "a local-only cancel spends nothing on chain: no ticket"
+    # ... and every per-offer cancel in OfferManager goes through that choke point.
+    assert len(re.findall(r"wallet_->cancel_offer\(", om)) == 1
+
+    engine = _engine()
+    install = engine.index("offer_mgr_->set_cancel_observer(")
+    assert "fee_feedback_track_cancel(id, fee);" in engine[install:install + 300]
+    assert engine.index("offer_mgr_ = std::make_unique<execution::OfferManager>(") < install
+
+    track = _function_body(engine, "void Engine::fee_feedback_track_cancel(")
+    # The ticket carries the fee the observer was GIVEN, never a policy lookup.
+    args = _call_arguments(track, "fee_tracker_->make_ticket")
+    assert len(args) == 1 and re.search(r",\s*fee,\s*last_block_\.load\(", args[0]), args
+    assert "cancel_fee_for(" not in track and "get_recommended_fee(" not in track
+    assert "insert_or_assign(offer_id" in track, "a re-cancel replaces the ticket"
+
+    # The sweep opens NO cancel ticket: a cancel adopted at boot (fee unknown)
+    # therefore never has one.
+    sweep = _function_body(engine, "asio::awaitable<void> Engine::fee_feedback_sweep(")
+    assert "make_ticket" not in sweep and "fee_tickets_.emplace" not in sweep
+
+
+def test_only_a_wallet_verified_cancelled_reaches_the_controller():
+    """[review #163] recheck_terminal answers StillTerminal for CANCELLED and
+    FAILED alike; only the first says a cancel spend confirmed."""
+    om = _strip_line_comments(_read(OFFER_MANAGER))
+    recheck = _function_body(om, "OfferManager::recheck_terminal(")
+    assert re.search(r"\*wallet_cancelled_out\s*=\s*false;", recheck), "cleared on entry"
+    assert re.search(r"\*wallet_cancelled_out\s*=\s*\(status == trade_status::kCancelled\);", recheck)
+    assert len(re.findall(r"\*wallet_cancelled_out\s*=", recheck)) == 2
+
+    engine = _engine()
+    verdict = engine.index('"wallet reported terminal"')
+    flag = engine.rindex("bool wallet_says_cancelled = false;", 0, verdict)
+    call = engine.index("&wallet_says_cancelled);", flag)
+    hook = engine.index("fee_feedback_on_cancel_verdict(", verdict)
+    assert flag < call < verdict < hook
+    args = _call_arguments(engine[hook:hook + 400], "fee_feedback_on_cancel_verdict")[0]
+    assert args.rstrip().endswith("wallet_says_cancelled"), args
+    body = _function_body(engine, "void Engine::fee_feedback_on_cancel_verdict(")
+    assert "strategy::fee::observation_for_cancel_verdict(" in body
+    assert re.search(r"if\s*\(v\.has\)\s*\{\s*fee_feedback_note\(fee_tracker_->observe\(v\.observation\)", body)
+    assert "Signal::Confirmed" not in body, "the decision lives in the pure header"
+
+
+def test_step8_tells_the_budget_how_many_offers_one_attached_fee_covers():
+    """[review #163] One attached fee is asked for and then attached to every
+    tier posted; shaped for one offer, a ladder could spend the cancel reserve."""
+    body = _function_body(_engine(), "asio::awaitable<void> Engine::step_manage_offers(")
+    batch = body.index("fee_tracker_->set_attached_batch(")
+    ask = body.index("strategy::fee::ActionClass::OfferAttached")
+    assert batch < ask, "the batch must be set BEFORE the attached fee is asked for"
+    between = body[body.rindex("std::size_t may_post = 0;", 0, batch):batch]
+    assert "cycle_" in between and "ladder.size()" in between and "quote_valid" in between
+    assert len(re.findall(r"set_attached_batch\(", _engine())) == 1
 
 
 # ---------------------------------------------------------------------------

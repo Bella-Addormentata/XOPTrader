@@ -597,6 +597,14 @@ Engine::Engine(const AppConfig& config, bool dry_run,
     offer_mgr_->set_abort_predicate([this] {
         return watchdog_fired_.load(std::memory_order_acquire);
     });
+    // [S67, review #163] Every secure cancel the wallet accepts opens its fee
+    // ticket HERE, with the fee it really paid and the height it was
+    // submitted at.  Inert unless fees.controller_enabled.  Runs on the
+    // engine's strand: the dead man's switch cancels through its own wallet
+    // client, never through OfferManager.
+    offer_mgr_->set_cancel_observer([this](const std::string& id, std::uint64_t fee) {
+        fee_feedback_track_cancel(id, fee);
+    });
     // A late offer that could not be cancelled has to reach the operator.
     // The watchdog's own alert says a cancel of every resting offer was
     // SUBMITTED -- and this trade was created after that request enumerated
@@ -5310,9 +5318,13 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
             }
 
             // Re-verify against the wallet before the one-way write.
+            // [S67, review #163] StillTerminal covers CANCELLED and FAILED;
+            // the fee controller may only hear the first.
+            bool wallet_says_cancelled = false;
             const execution::TerminalRecheck verdict =
                 co_await offer_mgr_->recheck_terminal(t.offer_id,
-                                                      block_height);
+                                                      block_height,
+                                                      &wallet_says_cancelled);
 
             if (verdict == execution::TerminalRecheck::NoVerdict) {
                 // The wallet was unreachable.  Retry, but not forever: on
@@ -5372,7 +5384,8 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
                 // CHANGED (not this maturity height).  A no-op for an offer
                 // it holds no ticket for, and with the controller off.
                 fee_feedback_on_cancel_verdict(
-                    t.offer_id, static_cast<BlockHeight>(t.observed_block));
+                    t.offer_id, static_cast<BlockHeight>(t.observed_block),
+                    wallet_says_cancelled);
             } catch (const OfferNotFound& nf) {
                 // Genuinely unknown offer: nothing to update, ever.  This
                 // is a TYPED exception rather than a message match --
@@ -11191,6 +11204,21 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
     // OfferManager so that every subsequent create/cancel uses the
     // optimal fee.  When fee tracking is disabled, the static
     // offer_fee_mojos from StrategyConfig is used unchanged.
+    // [S67, review #163] ONE attached fee is asked for here and then attached
+    // to every tier this step posts, so the budget has to be told how many
+    // that can be: every tier of every quotable ladder, an upper bound (most
+    // already rest).  Read by the controller path only.
+    {
+        std::size_t may_post = 0;
+        for (const auto& [batch_pair, batch_pcs] : cycle_) {
+            static_cast<void>(batch_pair);
+            if (batch_pcs.quote_valid) {
+                may_post += batch_pcs.ladder.size();
+            }
+        }
+        fee_tracker_->set_attached_batch(static_cast<std::uint32_t>(
+            std::min<std::size_t>(may_post, 1'000'000U)));
+    }
     const std::uint64_t recommended_fee = fee_tracker_->get_recommended_fee(
         config_.strategy.offer_fee_mojos, block_height,
         strategy::fee::ActionClass::OfferAttached);
@@ -11203,10 +11231,12 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
 
     offer_mgr_->set_dynamic_fee(recommended_fee);
 
-    // [S67] With the controller on, a cancel pays for what it SPENDS: an
-    // XCH-offered cancel costs ~8.4M CLVM, a CAT-offered one ~42M.  Off, the
-    // override is cleared and every cancel pays recommended_fee as before.
-    if (fee_tracker_->controller_active()) {
+    // [S67] When fees depend on the action class -- the controller is on, or
+    // fees.cost_aware_estimate is [review #163] -- a cancel pays for what it
+    // SPENDS: an XCH-offered cancel costs ~8.4M CLVM, a CAT-offered one ~42M.
+    // With both off the override is cleared and every cancel pays
+    // recommended_fee as before.
+    if (fee_tracker_->class_fees_active()) {
         offer_mgr_->set_cancel_fees(
             fee_tracker_->get_recommended_fee(config_.strategy.offer_fee_mojos, block_height,
                                               strategy::fee::ActionClass::CancelXch),
@@ -21255,7 +21285,7 @@ bool Engine::wallet_step_may_run(std::string_view step)
 std::uint64_t Engine::cancel_fees_paid(const std::vector<std::string>& ids,
                                        std::uint64_t                   legacy_fee) const
 {
-    if (!fee_tracker_ || !fee_tracker_->controller_active() || !offer_mgr_) {
+    if (!fee_tracker_ || !fee_tracker_->class_fees_active() || !offer_mgr_) {
         // The pre-S67 accounting, unchanged: one fee for every cancel.
         return static_cast<std::uint64_t>(ids.size()) * legacy_fee;
     }
@@ -21320,8 +21350,30 @@ void Engine::fee_feedback_track_take(const std::string& trade_id, std::uint64_t 
                                        strategy::fee::ActionClass::Take, fee, block));
 }
 
+void Engine::fee_feedback_track_cancel(const std::string& offer_id, std::uint64_t fee)
+{
+    if (!fee_tracker_ || !fee_tracker_->controller_active() || !state_ || offer_id.empty()) {
+        return;
+    }
+    // A re-cancel (an escalation, an emergency tier) REPLACES the ticket: it
+    // is a new spend at a new fee, and evidence about it starts now.
+    if (fee_tickets_.size() >= strategy::fee::kMaxTickets
+        && fee_tickets_.count(offer_id) == 0) {
+        return;
+    }
+    const PendingOffer po = state_->get_offer(offer_id);
+    const PairConfig* pc = po.offer_id.empty() ? nullptr : find_pair_config(po.pair_name);
+    const bool offered_is_xch = pc != nullptr
+        && ((po.side == Side::Bid ? pc->quote_asset_id : pc->base_asset_id) == "xch");
+    fee_tickets_.insert_or_assign(offer_id, fee_tracker_->make_ticket(
+        pc != nullptr ? strategy::fee::cancel_class(offered_is_xch)
+                      : strategy::fee::ActionClass::CancelCat,
+        fee, last_block_.load(std::memory_order_relaxed)));
+}
+
 void Engine::fee_feedback_on_cancel_verdict(const std::string& offer_id,
-                                            BlockHeight        observed_block)
+                                            BlockHeight        observed_block,
+                                            bool               wallet_says_cancelled)
 {
     if (!fee_tracker_ || !fee_tracker_->controller_active()) {
         return;
@@ -21330,15 +21382,16 @@ void Engine::fee_feedback_on_cancel_verdict(const std::string& offer_id,
     if (it == fee_tickets_.end() || it->second.cls == strategy::fee::ActionClass::Take) {
         return;
     }
-    strategy::fee::Observation o;
-    o.signal       = strategy::fee::Signal::Confirmed;
-    o.blocks       = static_cast<double>(
-        strategy::fee::confirmation_delay(it->second, observed_block));
-    o.attributed   = true;
-    o.submit_level = it->second.submit_level;
-    o.now          = last_block_.load(std::memory_order_relaxed);
+    // Only a wallet-verified CANCELLED confirms the cancel spend; a FAILED
+    // offer closes the ticket unheard (strategy::fee::
+    // observation_for_cancel_verdict).
+    const BlockHeight now = last_block_.load(std::memory_order_relaxed);
+    const strategy::fee::VerdictObservation v = strategy::fee::observation_for_cancel_verdict(
+        it->second, wallet_says_cancelled, observed_block, now);
     fee_tickets_.erase(it);
-    fee_feedback_note(fee_tracker_->observe(o), o.now);
+    if (v.has) {
+        fee_feedback_note(fee_tracker_->observe(v.observation), now);
+    }
 }
 
 asio::awaitable<void> Engine::fee_feedback_sweep(BlockHeight block)
@@ -21360,41 +21413,16 @@ asio::awaitable<void> Engine::fee_feedback_sweep(BlockHeight block)
 
     const std::uint32_t target = fee_tracker_->controller().config().target_delay_blocks;
 
-    // 1. Every cancel_pending offer in State is a cancel of ours in flight.
-    //    First sighting opens its ticket: at most one heartbeat after the
-    //    submit, so a measured delay is short by that much, never long.
-    //    A cancel ALREADY pending when this process first looks (adopted at
-    //    boot from the wallet's PENDING_CANCEL records, possibly days old) gets
-    //    no ticket: what it paid is unknown, so its lateness is not evidence
-    //    about the level and its confirmation would not validate it.
-    const bool first_sweep = !fee_sweep_ran_;
-    fee_sweep_ran_ = true;
+    // 1. Which cancels are still in flight.  [review #163] Tickets are NOT
+    //    opened here: fee_feedback_track_cancel opens them at the accepted
+    //    cancel RPC, with the fee really paid.  So a cancel adopted at boot
+    //    from the wallet's PENDING_CANCEL records -- fee unknown -- never has
+    //    one, and a cancel that confirms before this sweep first runs does.
     std::unordered_set<std::string> cancels_in_flight;
     for (const auto& po : state_->get_all_offers()) {
-        if (!po.cancel_pending) {
-            continue;
+        if (po.cancel_pending) {
+            cancels_in_flight.insert(po.offer_id);
         }
-        cancels_in_flight.insert(po.offer_id);
-        if (first_sweep) {
-            fee_unticketed_.insert(po.offer_id);
-        }
-        if (fee_unticketed_.count(po.offer_id) != 0
-            || fee_tickets_.count(po.offer_id) != 0
-            || fee_tickets_.size() >= strategy::fee::kMaxTickets) {
-            continue;
-        }
-        const PairConfig* pc = find_pair_config(po.pair_name);
-        const bool offered_is_xch = pc != nullptr
-            && ((po.side == Side::Bid ? pc->quote_asset_id : pc->base_asset_id) == "xch");
-        fee_tickets_.emplace(po.offer_id, fee_tracker_->make_ticket(
-            pc != nullptr ? strategy::fee::cancel_class(offered_is_xch)
-                          : strategy::fee::ActionClass::CancelCat,
-            offer_mgr_->cancel_fee_for(po.offer_id), block));
-    }
-
-    // Forget boot-time cancels once they are gone, so the set cannot grow.
-    for (auto it = fee_unticketed_.begin(); it != fee_unticketed_.end();) {
-        it = cancels_in_flight.count(*it) == 0 ? fee_unticketed_.erase(it) : std::next(it);
     }
 
     // 2. Walk the tickets.  A take is polled below; a cancel that left
@@ -21717,7 +21745,7 @@ asio::awaitable<void> Engine::escalate_stuck_cancels(BlockHeight block)
         // fee, which can exceed current_fee() (the offer-attached fee), so the
         // ceiling rests on the larger of the two.  Off, this is current_fee().
         const std::uint64_t dynamic_fee =
-            (fee_tracker_ && fee_tracker_->controller_active())
+            (fee_tracker_ && fee_tracker_->class_fees_active())
                 ? std::max(offer_mgr_->current_fee(), base_fee)
                 : offer_mgr_->current_fee();
         const std::uint64_t prior_ceiling =

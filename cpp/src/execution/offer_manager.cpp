@@ -1218,8 +1218,12 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
 // ---------------------------------------------------------------------------
 asio::awaitable<TerminalRecheck>
 OfferManager::recheck_terminal(const std::string& trade_id,
-                               BlockHeight        current_block)
+                               BlockHeight        current_block,
+                               bool*              wallet_cancelled_out)
 {
+    if (wallet_cancelled_out != nullptr) {
+        *wallet_cancelled_out = false;
+    }
     json rec;
     try {
         rec = co_await wallet_->get_offer(trade_id, /*file_contents=*/false);
@@ -1242,6 +1246,11 @@ OfferManager::recheck_terminal(const std::string& trade_id,
     const int status = trade_status::parse(rec["status"]);
 
     if (status == trade_status::kCancelled || status == trade_status::kFailed) {
+        // [review #163] Both are terminal, but only CANCELLED says a cancel
+        // spend confirmed.
+        if (wallet_cancelled_out != nullptr) {
+            *wallet_cancelled_out = (status == trade_status::kCancelled);
+        }
         co_return TerminalRecheck::StillTerminal;
     }
 
@@ -2029,6 +2038,12 @@ void OfferManager::set_cancel_fees(std::uint64_t xch_offered_mojos,
 void OfferManager::clear_cancel_fees() noexcept
 {
     cancel_fees_active_ = false;
+}
+
+void OfferManager::set_cancel_observer(
+    std::function<void(const std::string&, std::uint64_t)> observer)
+{
+    cancel_observer_ = std::move(observer);
 }
 
 std::uint64_t OfferManager::cancel_fee_for(const std::string& offer_id) const
@@ -3719,7 +3734,14 @@ asio::awaitable<json> OfferManager::cancel_offer_charged(
     const std::string& trade_id, std::uint64_t fee, bool secure)
 {
     xch_cycle_ledger_.note_lock(0, static_cast<Mojo>(fee));
-    co_return co_await wallet_->cancel_offer(trade_id, fee, secure);
+    json reply = co_await wallet_->cancel_offer(trade_id, fee, secure);
+    // [review #163] The wallet ACCEPTED it (a refusal throws past this line).
+    // Tell the fee controller what was really paid, now -- see
+    // set_cancel_observer.  A local-only cancel spends nothing on chain.
+    if (secure && cancel_observer_) {
+        cancel_observer_(trade_id, fee);
+    }
+    co_return reply;
 }
 
 // ---------------------------------------------------------------------------

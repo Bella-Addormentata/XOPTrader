@@ -128,6 +128,28 @@ public:
     /// True when the closed-loop controller sets the fees.
     [[nodiscard]] bool controller_active() const noexcept { return controller_.enabled(); }
 
+    /// [review #163] True when a fee depends on its ACTION CLASS: the
+    /// controller is on, or fees.cost_aware_estimate is (with fees.enabled and
+    /// adaptive_enabled, the conditions under which the rate is read at all).
+    /// This -- not controller_active() -- is what gates the class-aware cancel
+    /// fees Step 8 hands OfferManager: with only the cost-aware estimate on, a
+    /// CAT cancel paid the OFFER-ATTACHED class's 21M-cost estimate instead of
+    /// its own 42.3M, half of what the key promised.  False with both off.
+    [[nodiscard]] bool class_fees_active() const noexcept
+    {
+        return controller_.enabled()
+            || (cfg_.enabled && cfg_.adaptive_enabled && cfg_.cost_aware_estimate);
+    }
+
+    /// [review #163] How many offers the NEXT offer-attached fee will be
+    /// attached to before the budget is consulted again.  Step 8 asks for one
+    /// fee per heartbeat and attaches it to every tier it posts; the room
+    /// above the cancel reserve is shared between that many offers instead
+    /// of being granted to each (strategy::fee::apply_budget).  Controller
+    /// path only; 0 counts as 1.
+    void set_attached_batch(std::uint32_t offers) noexcept { attached_batch_ = offers; }
+    [[nodiscard]] std::uint32_t attached_batch() const noexcept { return attached_batch_; }
+
     /// One node reading: the estimate as mojos per cost, and the node's own
     /// admission floor (0 when its mempool has room or it did not say).
     /// Feeds the cost-aware legacy path and the controller's floor.
@@ -189,6 +211,7 @@ private:
     /// [S67] The closed loop.  Inert unless fees.controller_enabled.
     strategy::fee::Controller controller_;
 
+    std::uint32_t attached_batch_{1};
     bool          budget_bound_{false};
     bool          budget_alert_pending_{false};
     std::uint64_t last_bound_desired_{0};

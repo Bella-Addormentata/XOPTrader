@@ -333,8 +333,16 @@ public:
     /// @param trade_id       Wallet trade id to re-query.
     /// @param current_block  Height used when re-adopting a CONFIRMED
     ///                       offer into State.
+    /// @param wallet_cancelled_out  [review #163] When not null, set to true
+    ///                       iff the verdict is StillTerminal AND the wallet's
+    ///                       status is CANCELLED.  StillTerminal also covers
+    ///                       FAILED, which is no evidence that a cancel spend
+    ///                       confirmed; the fee controller needs to tell them
+    ///                       apart and nothing else does.  Must outlive the
+    ///                       await (a local of the awaiting coroutine does).
     asio::awaitable<TerminalRecheck>
-    recheck_terminal(const std::string& trade_id, BlockHeight current_block);
+    recheck_terminal(const std::string& trade_id, BlockHeight current_block,
+                     bool* wallet_cancelled_out = nullptr);
 
     // -- Cancellation -------------------------------------------------------
 
@@ -761,6 +769,18 @@ public:
 
     /// Back to one fee for everything (the controller was switched off).
     void clear_cancel_fees() noexcept;
+
+    /// [review #163] Called after every per-offer SECURE cancel the wallet
+    /// ACCEPTED, with the trade id and the fee that cancel really paid --
+    /// whatever path chose it (Step 8, an emergency tier, a zero-fee retry,
+    /// an escalation).  The fee controller opens its ticket from this, at
+    /// the moment of submission: a ticket opened a heartbeat later from the
+    /// CURRENT policy missed every cancel that confirmed inside that
+    /// heartbeat and misattributed any whose fee was not the policy's.
+    /// Not called for a local-only (insecure) cancel, which spends nothing,
+    /// nor for the bulk cancel_offers sweep.  Unset: nothing happens.
+    void set_cancel_observer(
+        std::function<void(const std::string& trade_id, std::uint64_t fee_mojos)> observer);
 
     /// The fee a cancel of `offer_id` pays now: current_fee() unless
     /// set_cancel_fees() is in force, then the fee for the asset the offer
@@ -1322,6 +1342,7 @@ private:
     std::uint32_t fee_rejections_seen_{0};
     std::unordered_set<std::string> fee_rejections_reported_;
 
+    std::function<void(const std::string&, std::uint64_t)> cancel_observer_;
     std::function<bool()> abort_predicate_;
     std::function<void(const std::string&)> escalate_;
 

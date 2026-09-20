@@ -1312,8 +1312,8 @@ private:
     // The closed loop's engine glue (strategy/fee_controller.hpp holds every
     // decision).  All of it is inert unless fees.controller_enabled.
     //
-    /// Per-heartbeat: open a ticket for each cancel in flight, emit censored
-    /// observations for spends pending past the target delay, poll ONE
+    /// Per-heartbeat: emit censored observations for ticketed spends pending
+    /// past the target delay, retire tickets whose cancel left State, poll ONE
     /// pending take's status, send the budget-bound alert.  Runs beside
     /// escalate_stuck_cancels, above the Step 7/8 gate chain.
     asio::awaitable<void> fee_feedback_sweep(BlockHeight block);
@@ -1325,21 +1325,24 @@ private:
     /// A take was submitted at `fee`: open its ticket.
     void fee_feedback_track_take(const std::string& trade_id, std::uint64_t fee,
                                  BlockHeight block);
-    /// Step 2 wrote the wallet's terminal verdict for `offer_id`.
+    /// OfferManager's cancel observer: the wallet accepted a secure cancel of
+    /// `offer_id` at `fee`.  Opens (or replaces) its ticket with the fee
+    /// really paid, at the current height.
+    void fee_feedback_track_cancel(const std::string& offer_id, std::uint64_t fee);
+    /// Step 2 wrote the wallet's terminal verdict for `offer_id`.  Only a
+    /// wallet-verified CANCELLED is a confirmation; FAILED drops the ticket.
     void fee_feedback_on_cancel_verdict(const std::string& offer_id,
-                                        BlockHeight        observed_block);
+                                        BlockHeight        observed_block,
+                                        bool               wallet_says_cancelled);
     /// What cancelling `ids` cost, for the fee budget: ids.size() x legacy_fee
     /// with the controller off (unchanged), the per-offer class fees with it on.
     [[nodiscard]] std::uint64_t cancel_fees_paid(const std::vector<std::string>& ids,
                                                  std::uint64_t legacy_fee) const;
     /// Spends of ours awaiting a verdict, by offer id (cancels) or trade id
-    /// (takes).  In memory; a restart re-opens cancel tickets at first
-    /// sighting and forgets takes.
+    /// (takes), opened at the accepted RPC with the fee really paid.  In
+    /// memory: a restart forgets them, and a cancel adopted at boot (fee
+    /// unknown) never gets one.
     std::unordered_map<std::string, strategy::fee::Ticket> fee_tickets_;
-    /// Cancels that were already pending at the first sweep after boot: their
-    /// fee is unknown, so they never get a ticket.
-    std::unordered_set<std::string> fee_unticketed_;
-    bool fee_sweep_ran_{false};
     strategy::fee::ChangeLogGate fee_change_log_{};
 
     /// Send the queued CancelUnresolved alert when its window is open, and

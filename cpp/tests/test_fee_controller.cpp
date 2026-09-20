@@ -115,6 +115,28 @@ TEST(FeeController, LevelZeroPaysMinFeeForACatCancelAndScalesByCost)
     EXPECT_NEAR(static_cast<double>(take), 15'000'000.0 * 125.0 / 42.3, 2.0);
 }
 
+TEST(FeeController, LevelZeroPaysExactlyMinFeeForEveryMinFeeTheParserAccepts)
+{
+    // [review #163] config.cpp accepts any min_fee_mojos >= 1 with the
+    // controller on, and the contract is "level 0 = a CAT cancel pays exactly
+    // that".  An anchor floored at 1,000,000 mojos broke it for every smaller
+    // floor: 5,000 -- config.example.yaml's value -- started at 1,000,000.
+    for (const std::uint64_t min_fee : {1ULL, 7ULL, 5'000ULL, 123'457ULL, 999'999ULL,
+                                        1'000'000ULL, 15'000'000ULL, 99'999'989ULL}) {
+        const Controller c{on_config(), min_fee, kMaxFee};
+        EXPECT_EQ(c.fee_for(ActionClass::CancelCat, 100), min_fee) << min_fee;
+        EXPECT_NEAR(c.level_of(min_fee, ActionClass::CancelCat), 0.0, 1e-9) << min_fee;
+        // Every class is at or above the operator's floor, never below it.
+        EXPECT_GE(c.fee_for(ActionClass::CancelXch, 100), min_fee);
+        EXPECT_GE(c.fee_for(ActionClass::Take, 100), min_fee);
+    }
+    // The product (min_fee / cost) x cost is not always min_fee in doubles; the
+    // ceil must not turn that noise into an extra mojo, nor lose a real one.
+    EXPECT_EQ(fee::fee_from_rate(1.0 / 42'300'000.0, 42'300'000ULL), 1U);
+    EXPECT_EQ(fee::fee_from_rate(3.0000000001, 1'000'000'000ULL), 3'000'000'001ULL);
+    EXPECT_EQ(fee::fee_from_rate(1e-30, 1), 1U);        // positive is never free
+}
+
 TEST(FeeController, DisabledIsAPassthroughAndHearsNothing)
 {
     ControllerConfig cfg;   // enabled = false, the shipped default
@@ -351,8 +373,12 @@ TEST(FeeController, AStuckSpendStopsCountingOnceTheLevelHasAnsweredIt)
     // min_raise (1.0 = x2) above what it was submitted at, then no more.
     std::uint32_t now = 109;
     while (c.level() < c.config().min_raise - Controller::kLevelEps) {
+        // BOUNDED: a controller that stops hearing pending spends must FAIL
+        // this test, not hang it (a mutation run did exactly that, and the
+        // per-iteration failure records took the process to 11 GB).
+        ASSERT_LT(now, 200U) << "the level never reached min_raise";
         const auto ch = c.observe(pending(static_cast<double>(now - 100), 0.0, now));
-        EXPECT_EQ(ch.reason, ChangeReason::CensoredDelay);
+        ASSERT_EQ(ch.reason, ChangeReason::CensoredDelay);
         ++now;
     }
     const double answered_at = c.level();
@@ -614,7 +640,10 @@ TEST(FeeController, ASuccessfulRetestForgetsKnownBadAndResetsTheInterval)
     Controller c{cfg, kMinFee, kMaxFee};
     std::uint32_t now = lift(c, 3, 1'000);
     drive_fixed_floor(c, 2.9, 300, now);
-    while (c.probing()) { drive_fixed_floor(c, 2.9, 1, now); }   // let an in-flight probe fail
+    for (int guard = 0; c.probing(); ++guard) {                  // let an in-flight probe fail
+        ASSERT_LT(guard, 100) << "a probe below the floor never failed";
+        drive_fixed_floor(c, 2.9, 1, now);
+    }
     ASSERT_TRUE(c.bad_level_known());
     ASSERT_GT(c.probe_interval(), 4U);
     // The mempool drains: the floor falls away.  The next retest succeeds.
@@ -752,6 +781,14 @@ TEST(FeeController, NoProbeBelowTheBottomOfTheBand)
     EXPECT_NEAR(c.level(), c.level_lo(), 1e-9);
     EXPECT_EQ(c.fee_for(ActionClass::Take, now), kMinFee);
     EXPECT_EQ(c.fee_for(ActionClass::CancelCat, now), kMinFee);
+    // AT the bottom no probe is started at all -- not even one that moves
+    // nothing: a "probe" to the same level would sit in the probing state and
+    // treat the next late spend as a probe failure (restore + backoff) instead
+    // of as the raise it is.
+    for (int i = 0; i < 100; ++i) {
+        EXPECT_EQ(c.observe(confirmed(3.0, c.level(), ++now)).reason, ChangeReason::OnTarget);
+        EXPECT_FALSE(c.probing());
+    }
 }
 
 TEST(FeeController, AnUnattributedHardSignalDuringAProbeFailsItAtOnce)
@@ -839,6 +876,65 @@ TEST(FeeBudget, CancelsKeepTheReserveAndNothingIsEverZero)
     EXPECT_EQ(fee::apply_budget(200, 500, 900, 10, false).fee, 10U);
     // The floor never RAISES a fee above what was asked for.
     EXPECT_EQ(fee::apply_budget(5, 0, 0, 10, true).fee, 5U);
+}
+
+TEST(FeeBudget, OneAttachedFeeIsSharedAcrossTheBatchItWillBeAttachedTo)
+{
+    // [review #163] Step 8 asks once and attaches the answer to every tier it
+    // posts.  Headroom 1,000, reserve 900: the 100 above the reserve is ALL the
+    // attached fees may spend this heartbeat, whatever the ladder's size.
+    EXPECT_EQ(fee::apply_budget(200, 1'000, 900, 1, false, 1).fee, 100U);
+    EXPECT_EQ(fee::apply_budget(200, 1'000, 900, 1, false, 4).fee, 25U);
+    EXPECT_EQ(fee::apply_budget(200, 1'000, 900, 1, false, 10).fee, 10U);
+    for (const std::uint64_t batch : {1ULL, 2ULL, 3ULL, 7ULL, 10ULL, 25ULL, 100ULL}) {
+        const auto b = fee::apply_budget(200, 1'000, 900, 1, false, batch);
+        EXPECT_LE(b.fee * batch, 100U) << "batch " << batch << " would spend the cancel reserve";
+        EXPECT_TRUE(b.bound);
+    }
+    // Room for the whole batch: nothing is lowered.
+    EXPECT_EQ(fee::apply_budget(200, 10'000, 900, 1, false, 10).fee, 200U);
+    EXPECT_FALSE(fee::apply_budget(200, 10'000, 900, 1, false, 10).bound);
+    // A batch of 0 is a batch of 1, never a division by zero.
+    EXPECT_EQ(fee::apply_budget(200, 1'000, 900, 1, false, 0).fee, 100U);
+    // The min_fee floor still holds -- the ONE place the reserve is soft, by
+    // design: the operator's floor is what "degraded" means.
+    EXPECT_EQ(fee::apply_budget(200, 1'000, 900, 50, false, 10).fee, 50U);
+    // Cancels and takes are not shaped by the batch.
+    EXPECT_EQ(fee::apply_budget(200, 1'000, 900, 1, true, 10).fee, 200U);
+}
+
+TEST(FeeTicket, OnlyAWalletVerifiedCancelledIsAConfirmation)
+{
+    // [review #163] recheck_terminal answers StillTerminal for CANCELLED and
+    // for FAILED.  A FAILED offer did not confirm our cancel spend.
+    fee::Ticket t;
+    t.cls          = ActionClass::CancelCat;
+    t.submit_block = 1'000;
+    t.submit_level = 2.5;
+    const auto failed = fee::observation_for_cancel_verdict(t, /*cancelled=*/false, 1'003, 1'010);
+    EXPECT_FALSE(failed.has);
+    const auto ok = fee::observation_for_cancel_verdict(t, /*cancelled=*/true, 1'003, 1'010);
+    ASSERT_TRUE(ok.has);
+    EXPECT_EQ(ok.observation.signal, Signal::Confirmed);
+    EXPECT_DOUBLE_EQ(ok.observation.blocks, 3.0);        // observed - submitted, not now - submitted
+    EXPECT_TRUE(ok.observation.attributed);
+    EXPECT_DOUBLE_EQ(ok.observation.submit_level, 2.5);
+    EXPECT_EQ(ok.observation.now, 1'010U);
+
+    // What it protects: a FAILED verdict fed as a confirmation would count
+    // toward a probe.  Eight of them must leave the controller exactly as it was.
+    Controller c{on_config(), kMinFee, kMaxFee};
+    std::uint32_t now = lift(c, 3, 1'000);
+    for (std::uint32_t i = 0; i < 2 * c.config().probe_after_confirmations; ++i) {
+        fee::Ticket ticket;
+        ticket.submit_block = ++now;
+        ticket.submit_level = c.level();
+        const auto v = fee::observation_for_cancel_verdict(ticket, false, now + 2, now + 2);
+        if (v.has) { c.observe(v.observation); }
+    }
+    EXPECT_EQ(c.on_target_run(), 0U);
+    EXPECT_FALSE(c.probing());
+    EXPECT_DOUBLE_EQ(c.level(), 3.0);
 }
 
 TEST(FeeFeedback, SentToIsReadFromItsLatestEntryOnly)
@@ -944,6 +1040,11 @@ TEST(FeeReachability, TheLiveMaxFeeCannotClearAFullMempoolForCatSpends)
     }
     // Band [-1.56, +8.31] at these bounds; hard signals raise 1.0 each.
     EXPECT_EQ(roomy.raises_to_span, 10U);
+    // [review #163] The anchor is min_fee exactly, so the example file's 5,000
+    // mojo floor makes a band 18 doublings wide: FeeTracker warns above 16.
+    const auto wide = fee::reachability(on_config(), 5'000ULL, 100'000'000ULL);
+    EXPECT_EQ(wide.raises_to_span, 19U);
+    EXPECT_GT(wide.raises_to_span, 16U);
 }
 
 TEST(FeeReachability, GainsThatCannotSpanTheBandAreReported)
@@ -1459,6 +1560,65 @@ TEST(FeeTrackerController, TheReserveKeepsCancelsFundedWhileAttachedFeesAreSquee
     EXPECT_TRUE(t.take_budget_bound_alert());
     // Priority classes get what is left, never less than min_fee, never 0.
     EXPECT_EQ(t.get_recommended_fee(1, 2'001, ActionClass::CancelCat), kMinFee);
+}
+
+TEST(FeeTrackerController, ABatchOfAttachedFeesCannotSpendTheCancelReserve)
+{
+    // [review #163] The same squeeze as above, but Step 8 is about to attach
+    // the fee to TEN tiers.  Shaped for one offer, ten of them would spend
+    // 500M: the 50M above the reserve plus 450M of the reserve itself.
+    xop::FeeConfig cfg = tracker_config(true, false);
+    cfg.daily_budget_mojos = 8'000'000'000ULL;
+    cfg.controller_budget_reserve_cancels = 25;
+    cfg.controller_max_step_up = 8.0;
+    cfg.min_fee_mojos = 1'000'000ULL;                    // low floor so the share is visible
+    xop::FeeTracker t{cfg};
+    t.observe(hard(Signal::ForceDelete, 100));           // level 4: cancel_cat = 16M, reserve 400M
+    ASSERT_EQ(t.get_recommended_fee(1, 100, ActionClass::CancelCat), 16'000'000ULL);
+    t.record_fee(7'550'000'000ULL, 100);                 // headroom 450M: 50M above the reserve
+    EXPECT_EQ(t.attached_batch(), 1U);
+    const std::uint64_t alone = t.get_recommended_fee(1, 101, ActionClass::OfferAttached);
+    EXPECT_EQ(alone, 7'943'263ULL);                      // desired, unbound: 16 x 1M x 21/42.3
+    t.record_fee(45'000'000ULL, 101);                    // 5M above the reserve
+    EXPECT_EQ(t.get_recommended_fee(1, 102, ActionClass::OfferAttached), 5'000'000ULL);
+    t.set_attached_batch(10);
+    const std::uint64_t shared = t.get_recommended_fee(1, 102, ActionClass::OfferAttached);
+    EXPECT_EQ(shared, 1'000'000ULL);                     // 5M / 10 = 500k -> the min_fee floor
+    t.set_attached_batch(4);
+    EXPECT_EQ(t.get_recommended_fee(1, 102, ActionClass::OfferAttached), 1'250'000ULL);
+    EXPECT_LE(4 * 1'250'000ULL, 5'000'000ULL);
+    // Cancels ignore the batch.
+    EXPECT_EQ(t.get_recommended_fee(1, 102, ActionClass::CancelCat), 16'000'000ULL);
+    // The legacy path never reads it.
+    xop::FeeTracker legacy{tracker_config(false, false)};
+    legacy.update_mempool_estimate(37'000'000);
+    legacy.set_attached_batch(1'000);
+    EXPECT_EQ(legacy.get_recommended_fee(1, 100, ActionClass::OfferAttached), 37'000'000ULL);
+}
+
+TEST(FeeTrackerController, ClassFeesAreActiveForTheCostAwareEstimateToo)
+{
+    // [review #163] With only fees.cost_aware_estimate on, Step 8 used to gate
+    // the class-aware cancel fees on the CONTROLLER, so a CAT cancel paid the
+    // offer-attached class's estimate: half of its own.
+    EXPECT_FALSE(xop::FeeTracker{tracker_config(false, false)}.class_fees_active());
+    EXPECT_TRUE(xop::FeeTracker{tracker_config(false, true)}.class_fees_active());
+    EXPECT_TRUE(xop::FeeTracker{tracker_config(true, false)}.class_fees_active());
+    EXPECT_TRUE(xop::FeeTracker{tracker_config(true, true)}.class_fees_active());
+    // It follows the conditions under which the rate is READ: not with the
+    // fee tracker off, and not with adaptive mode off.
+    xop::FeeConfig off = tracker_config(false, true);
+    off.enabled = false;
+    EXPECT_FALSE(xop::FeeTracker{off}.class_fees_active());
+    xop::FeeConfig fixed = tracker_config(false, true);
+    fixed.adaptive_enabled = false;
+    EXPECT_FALSE(xop::FeeTracker{fixed}.class_fees_active());
+    // And what it buys: the two cancel classes differ, as their costs do.
+    xop::FeeTracker t{tracker_config(false, true)};
+    t.update_feed_forward(2.0, 0.0, 100);
+    EXPECT_EQ(t.get_recommended_fee(1, 100, ActionClass::CancelCat), 84'600'000ULL);
+    EXPECT_EQ(t.get_recommended_fee(1, 100, ActionClass::CancelXch), 16'800'000ULL);
+    EXPECT_EQ(t.get_recommended_fee(1, 100, ActionClass::OfferAttached), 42'000'000ULL);
 }
 
 TEST(FeeTrackerController, ConfigMapsEveryTuningKey)

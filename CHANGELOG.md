@@ -52,7 +52,17 @@ default to off, and with both off every fee is what v0.10.24 paid.
   takes keep a reserve (`controller_budget_reserve_cancels`, 25 CAT cancels)
   that offer-attached fees cannot spend; an exhausted budget degrades every fee
   to `min_fee_mojos` and sends one `FeeBudgetBound` alert. It never returns 0,
-  which made Step 8 skip cancelling stale quotes as well as posting.
+  which made Step 8 skip cancelling stale quotes as well as posting. Step 8
+  asks for one attached fee and attaches it to every tier it posts, so the room
+  above the reserve is shared across the tiers it may post that heartbeat
+  rather than granted to each. Cancels are deliberately not shaped that way: a
+  cancel that must happen pays, and the next heartbeat degrades.
+- **Tickets carry what was really paid.** A cancel's ticket opens when the
+  wallet accepts the cancel RPC, with that call's fee (an emergency tier, a
+  zero-fee retry and an escalation included) and its height; a re-cancel
+  replaces it. Only a wallet-verified CANCELLED closes it as a confirmation:
+  `recheck_terminal` answers "still terminal" for FAILED too, and a FAILED
+  offer says nothing about our fee. A cancel adopted at boot has no ticket.
 - **Observability.** One `[FeeController] rate a -> b mojos/cost (reason; n
   move(s)) -- fees now: ...` line per burst of changes, and two gauges,
   `xop_fees_controller_rate_mojos_per_cost` and `xop_fees_controller_level_log2`.
@@ -72,7 +82,12 @@ default to off, and with both off every fee is what v0.10.24 paid.
 ### Operator notes
 
 - **Nothing changes until a switch is turned on.** `cost_aware_estimate: true`
-  alone changes fees (about 4.5x for a CAT cancel at the same node rate).
+  alone changes fees (about 4.5x for a CAT cancel at the same node rate), and
+  it makes cancels pay by the asset the offer offered, as the controller does.
+- **Level 0 is `min_fee_mojos` exactly**, whatever its value. A very low floor
+  (the example file's 5000) makes a very wide band: the startup log says how
+  many raises, and roughly how many minutes, crossing it takes without the
+  node's floor.
 - **The live `max_fee_mojos: 100000000` cannot get a CAT cancel or a take into a
   full mempool** (100M / 42.3M cost = 2.4 mojos per cost, the node needs 5).
   Before enabling the controller raise it to at least 250,000,000, or

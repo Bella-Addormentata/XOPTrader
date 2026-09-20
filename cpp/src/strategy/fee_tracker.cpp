@@ -69,10 +69,22 @@ FeeTracker::FeeTracker(const FeeConfig& cfg)
     if (controller_.enabled()) {
         const strategy::fee::Reachability reach = strategy::fee::reachability(
             controller_.config(), cfg_.min_fee_mojos, cfg_.max_fee_mojos);
-        spdlog::info("[FeeController] ON: target {} peak heights, anchor {:.4f} mojos/cost, "
+        spdlog::info("[FeeController] ON: target {} peak heights, anchor {:.6f} mojos/cost, "
                      "level band [{:.2f}, {:.2f}] log2, {} hard signals span it",
                      controller_.config().target_delay_blocks, controller_.anchor_rate(),
                      controller_.level_lo(), controller_.level_hi(), reach.raises_to_span);
+        // [review #163] The anchor is min_fee_mojos exactly, so a tiny floor
+        // makes a very wide band: every raise is at most one doubling and the
+        // next cannot come for a whole target delay.  Say what that costs.
+        if (reach.raises_to_span > 16) {
+            spdlog::warn("[FeeController] fees.min_fee_mojos ({}) is so far below "
+                         "max_fee_mojos ({}) that the loop needs {} raises to cross the "
+                         "band -- about {} minutes with no node floor to help. Raise "
+                         "min_fee_mojos toward what a cancel normally pays.",
+                         cfg_.min_fee_mojos, cfg_.max_fee_mojos, reach.raises_to_span,
+                         static_cast<std::uint64_t>(reach.raises_to_span)
+                             * (controller_.config().target_delay_blocks + 4U) * 1875U / 6000U);
+        }
         if (reach.cannot_raise) {
             spdlog::warn("[FeeController] the gains cannot raise the fee across its band "
                          "(controller_ki is 0, or every gain is) -- only the node floor "
@@ -357,7 +369,8 @@ std::uint64_t FeeTracker::controller_fee(strategy::fee::ActionClass action,
             : cancel_fee * n;
 
     const strategy::fee::BudgetedFee budgeted = strategy::fee::apply_budget(
-        desired, headroom, reserve, cfg_.min_fee_mojos, strategy::fee::is_priority(action));
+        desired, headroom, reserve, cfg_.min_fee_mojos, strategy::fee::is_priority(action),
+        attached_batch_);
 
     if (budgeted.bound) {
         last_bound_desired_ = desired;
