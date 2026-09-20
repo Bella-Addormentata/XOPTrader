@@ -193,6 +193,62 @@ OfferManager::expiry_max_time_for(const PairConfig& pair) const
     return max_time;
 }
 
+// ---------------------------------------------------------------------------
+// [MIN-INPUT-COIN] wiring -- the decisions live in offer_min_input_coin.hpp
+// ---------------------------------------------------------------------------
+
+asio::awaitable<json> OfferManager::create_offer_min_coin(
+    const json&                  offer_dict,
+    std::optional<std::uint64_t> expiry_max_time,
+    const PairConfig&            pair,
+    Side                         side,
+    int                          tier_index,
+    const char*                  context)
+{
+    const double frac = strategy_cfg_.offer_min_input_coin_frac;
+    // nullopt for an XCH-funded offer, a disabled fraction, or any dict shape
+    // the rule was not designed for: the request is then the old one.
+    const std::optional<std::uint64_t> min_coin =
+        offer_min_input_coin(offer_dict, frac);
+
+    co_return co_await create_offer_with_min_coin_fallback(
+        // Deliberately NOT a coroutine lambda: it hands back the wallet's
+        // own awaitable, so nothing reads these captures after it returns.
+        [this, &offer_dict, expiry_max_time](
+            std::optional<std::uint64_t> coin_floor) {
+            return wallet_->create_offer(
+                offer_dict, current_fee_mojos_, /*validate_only=*/false,
+                expiry_max_time, coin_floor);
+        },
+        min_coin,
+        [this, &pair, side, tier_index, context, min_coin, frac](
+            const std::string& refusal) {
+            logger_->warn(
+                "[min-input-coin] wallet refused {} {} tier {} ({}) under "
+                "min_coin_amount={} mojos (strategy."
+                "offer_min_input_coin_frac={}): {} -- retrying ONCE without "
+                "the floor; the offer may then be built from dust, which "
+                "Dexie refuses above about 125 inputs",
+                pair.name, to_string(side), tier_index, context,
+                min_coin.value_or(0), frac, refusal);
+        });
+}
+
+void OfferManager::note_dexie_too_many_inputs(const std::string& posting,
+                                              std::size_t        offer_chars)
+{
+    ++dexie_too_many_inputs_count_;
+    logger_->warn(
+        "[dexie-too-many-inputs] Dexie refused {} ({} characters): too many "
+        "input coins.  The offer EXISTS in the wallet, is listed nowhere and "
+        "locks its coins until it is cancelled.  Remedy: combine the small "
+        "coins of the asset this offer spends (chia wallet coins combine), "
+        "or RAISE strategy.offer_min_input_coin_frac (now {}) -- lowering it "
+        "admits MORE dust.  Seen {} time(s) since start.",
+        posting, offer_chars, strategy_cfg_.offer_min_input_coin_frac,
+        dexie_too_many_inputs_count_);
+}
+
 asio::awaitable<void>
 OfferManager::retire_offer_failed_expiry(const PendingOffer& adopt,
                                          std::uint64_t expected_max_time,
@@ -646,11 +702,12 @@ asio::awaitable<int> OfferManager::post_quotes(
         // the payload is unchanged from before the feature existed.
         const std::optional<std::uint64_t> expiry_max_time =
             expiry_max_time_for(pair);
+        // [MIN-INPUT-COIN] Through the floor, like every create here.
         json result;
         try {
-            result = co_await wallet_->create_offer(
-                offer_dict, current_fee_mojos_, /*validate_only=*/false,
-                expiry_max_time);
+            result = co_await create_offer_min_coin(
+                offer_dict, expiry_max_time, pair, tier.side,
+                static_cast<int>(tier.tier_index), "tier");
         } catch (const rpc::ChiaRPCError& e) {
             logger_->error("create_offer failed for {} {} tier {}: {}",
                            pair.name, to_string(tier.side),
@@ -769,7 +826,10 @@ asio::awaitable<int> OfferManager::post_quotes(
         }
 
         // Step 4: Submit to dexie for cross-platform aggregation (best-effort).
-        const std::string dexie_id = co_await submit_to_dexie(offer_text);
+        const std::string dexie_id = co_await submit_to_dexie(
+            offer_text,
+            fmt::format("{} {} tier {}", pair.name, to_string(tier.side),
+                        tier.tier_index));
         if (dexie_id.empty()) {
             logger_->warn("Dexie submission failed for {} tier {} -- "
                           "offer is still valid on-chain, but with no dexie "
@@ -3888,10 +3948,12 @@ asio::awaitable<int> OfferManager::post_merged_side(
     json result;
     bool batch_failed = false;
     std::string batch_err;
+    // [MIN-INPUT-COIN] The merged dict still has one spend leg, so the floor
+    // scales with the merged amount.
     try {
-        result = co_await wallet_->create_offer(
-            merged_dict, current_fee_mojos_, /*validate_only=*/false,
-            expiry_max_time);
+        result = co_await create_offer_min_coin(
+            merged_dict, expiry_max_time, pair, tiers.front().side,
+            static_cast<int>(tiers.front().tier_index), "merged batch");
     } catch (const rpc::ChiaRPCError& e) {
         batch_failed = true;
         batch_err = e.what();
@@ -3933,9 +3995,9 @@ asio::awaitable<int> OfferManager::post_merged_side(
             std::string tier_err;
             json sr;
             try {
-                sr = co_await wallet_->create_offer(
-                    single_dict, current_fee_mojos_, /*validate_only=*/false,
-                    expiry_max_time);
+                sr = co_await create_offer_min_coin(
+                    single_dict, expiry_max_time, pair, tier.side,
+                    static_cast<int>(tier.tier_index), "batch fallback");
             } catch (const rpc::ChiaRPCError& e2) {
                 tier_failed = true;
                 tier_err = e2.what();
@@ -4022,7 +4084,10 @@ asio::awaitable<int> OfferManager::post_merged_side(
                 // Retain dexie's id so this offer is excluded from our own
                 // arbitrage scan; dropping it here would leave the fallback
                 // path takeable by our own taker.
-                po.dexie_id         = co_await submit_to_dexie(offer_text);
+                po.dexie_id         = co_await submit_to_dexie(
+                    offer_text,
+                    fmt::format("{} {} tier {} (batch fallback)", pair.name,
+                                to_string(tier.side), tier.tier_index));
                 po.offer_id         = sr["trade_record"]["trade_id"].get<std::string>();
                 po.pair_name        = pair.name;
                 po.side             = tier.side;
@@ -4191,7 +4256,10 @@ asio::awaitable<int> OfferManager::post_merged_side(
     // Submit to dexie (best-effort).  Retain the id: every tier merged into
     // this batch rests on the book under it, and own-offer exclusion in the
     // arbitrage taker matches on it.
-    const std::string batch_dexie_id = co_await submit_to_dexie(offer_text);
+    const std::string batch_dexie_id = co_await submit_to_dexie(
+        offer_text,
+        fmt::format("{} {} merged batch of {} tiers", pair.name,
+                    to_string(tiers.front().side), tiers.size()));
 
     // Track all constituent tiers with the same offer_id.
     for (const auto& tier : tiers) {
@@ -4223,7 +4291,8 @@ asio::awaitable<int> OfferManager::post_merged_side(
 // ---------------------------------------------------------------------------
 
 asio::awaitable<std::string> OfferManager::submit_to_dexie(
-    const std::string& offer_text)
+    const std::string& offer_text,
+    std::string        posting)
 {
     // Best-effort submission to the Dexie aggregator for cross-platform
     // visibility.  The offer is already valid on-chain regardless of
@@ -4262,6 +4331,9 @@ asio::awaitable<std::string> OfferManager::submit_to_dexie(
         // Log the reason but do not treat as a hard failure.
         logger_->warn("submit_to_dexie: rejected by Dexie -- {}",
                       result.error_message);
+        if (dexie_rejected_too_many_inputs(result.error_message)) {
+            note_dexie_too_many_inputs(posting, offer_text.size());
+        }
         co_return std::string{};
 
     } catch (const rpc::DexieRateLimitError& e) {
@@ -4272,6 +4344,12 @@ asio::awaitable<std::string> OfferManager::submit_to_dexie(
     } catch (const rpc::DexieClientError& e) {
         // Non-retryable 4xx error (bad request, invalid offer format, etc.).
         logger_->warn("submit_to_dexie: client error -- {}", e.what());
+        // [MIN-INPUT-COIN] The shape seen live: HTTP 400 whose body carries
+        // "Too many input coins".  Not an auto-cancel -- only the one line
+        // an operator can grep for and act on.
+        if (dexie_rejected_too_many_inputs(e.response_body)) {
+            note_dexie_too_many_inputs(posting, offer_text.size());
+        }
         co_return std::string{};
     } catch (const rpc::DexieServerError& e) {
         // Server-side 5xx that persisted after retries.

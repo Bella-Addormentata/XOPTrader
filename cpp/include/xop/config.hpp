@@ -403,6 +403,28 @@ struct StrategyConfig {
     /// return collateral -- land a cancel.
     uint32_t offer_expiry_secs{0};
 
+    /// [MIN-INPUT-COIN 2026-09-19] Smallest coin the wallet may use to fund
+    /// an offer, as a fraction of the amount the offer spends.  Sent to
+    /// create_offer_for_ids as `min_coin_amount` =
+    /// ceil(offered mojos x this), for CAT-funded offers only.
+    ///
+    /// Dexie pays rewards as one tiny coin per rewarded offer; the wallet's
+    /// coin selection prefers that dust, and an offer built from about 130
+    /// or more inputs is refused by Dexie ("Too many input coins") while it
+    /// still locks its coins in the wallet.  With every input at least this
+    /// fraction of the amount, ceil(1 / fraction) inputs always suffice:
+    /// 100 at the default, against a measured Dexie limit between 125 and
+    /// about 132.  So RAISING it tightens the bound and values much below
+    /// the default stop guaranteeing it.
+    ///
+    /// 0 disables the floor and restores the previous request byte for
+    /// byte.  Range [0, 1).  XCH-funded offers never carry it: their coins
+    /// are shaped by the coin pool and budgeted by the XCH lock ledger.  If
+    /// the wallet answers that the floor leaves too little to spend, the
+    /// create is retried once without it and a warning names the offer.
+    /// Read at startup.  See execution/offer_min_input_coin.hpp.
+    double offer_min_input_coin_frac{0.01};
+
     // [ALWAYSOFFER 2026-08-30] Side-aware BBO sanity (see bbo_sanity.hpp).
     // Aggressive deviation (would EXECUTE dislocated) keeps the tight
     // 10%; passive deviation (merely RESTS far from a thin book, e.g. a

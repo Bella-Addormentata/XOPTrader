@@ -117,6 +117,7 @@ add_executable(xop_tests
     test_pid_reachability.cpp
     test_pid_rail_latch.cpp
     test_offer_expiry.cpp
+    test_offer_min_input_coin.cpp
     test_wallet_requests.cpp
     test_stuck_tx_verdict.cpp
     test_wallet_circuit.cpp

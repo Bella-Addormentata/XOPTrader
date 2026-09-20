@@ -3313,3 +3313,59 @@ TEST(PaceConfig, EnabledWithEmptyAssetsWarns) {
     expect_loads(pace_with_strategy("  pace_enabled: true\n"));
     EXPECT_TRUE(log.warned_containing("pace_assets is empty")) << log.text();
 }
+
+// ============================================================================
+// [MIN-INPUT-COIN] strategy.offer_min_input_coin_frac
+//
+// The arithmetic is pinned in test_offer_min_input_coin.cpp; this is only the
+// parse: the default protects an unconfigured deployment, 0 is a real setting,
+// and everything outside [0, 1) is refused at load rather than reaching the
+// wallet as a floor nobody chose.
+// ============================================================================
+
+TEST(ConfigParserTest, OfferMinInputCoinFracDefaultsToOnePercent) {
+    TempYaml tmp(kMinimalValidYaml);
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_DOUBLE_EQ(cfg.strategy.offer_min_input_coin_frac, 0.01);
+}
+
+TEST(ConfigParserTest, OfferMinInputCoinFracIsOverridable) {
+    TempYaml tmp(with_strategy_keys("\n  offer_min_input_coin_frac: 0.025"));
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_DOUBLE_EQ(cfg.strategy.offer_min_input_coin_frac, 0.025);
+}
+
+TEST(ConfigParserTest, OfferMinInputCoinFracZeroDisablesAndIsAccepted) {
+    // 0 must bind as "send no floor", not be rejected as non-positive and
+    // not fall back to the default.
+    TempYaml tmp(with_strategy_keys("\n  offer_min_input_coin_frac: 0"));
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_DOUBLE_EQ(cfg.strategy.offer_min_input_coin_frac, 0.0);
+}
+
+TEST(ConfigParserTest, OfferMinInputCoinFracNullKeepsTheDefault) {
+    TempYaml tmp(with_strategy_keys("\n  offer_min_input_coin_frac: ~"));
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_DOUBLE_EQ(cfg.strategy.offer_min_input_coin_frac, 0.01);
+}
+
+TEST(ConfigParserTest, OfferMinInputCoinFracAcceptsJustBelowOne) {
+    TempYaml tmp(with_strategy_keys("\n  offer_min_input_coin_frac: 0.999"));
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_DOUBLE_EQ(cfg.strategy.offer_min_input_coin_frac, 0.999);
+}
+
+TEST(ConfigParserTest, OfferMinInputCoinFracOutsideTheRangeIsRejected) {
+    // 1 would demand a single coin at least as large as the whole offer; a
+    // negative or non-finite value has no meaning at all.  .nan is the row
+    // only the finiteness test can reject: every range comparison is false
+    // for it.
+    for (const char* v : {"1", "1.0", "1.5", "-0.01", "-1", ".nan", ".inf",
+                          "-.inf"}) {
+        SCOPED_TRACE(v);
+        expect_config_error_containing(
+            with_strategy_keys(std::string("\n  offer_min_input_coin_frac: ")
+                               + v),
+            "offer_min_input_coin_frac");
+    }
+}

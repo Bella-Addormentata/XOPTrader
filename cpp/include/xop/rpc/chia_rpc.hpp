@@ -584,6 +584,13 @@ public:
      *                       the ONLY timelock flag we send -- see
      *                       StrategyConfig::offer_expiry_secs for why
      *                       max_height/min_height/min_time are not.
+     * @param min_coin_amount  [MIN-INPUT-COIN] Optional floor, in mojos, on
+     *                       the coins the wallet may select.  ONE value
+     *                       governs every selection the request makes: the
+     *                       offered asset AND, for a CAT-funded offer, the
+     *                       XCH fee coin (chia 2.7.4 tx_endpoint /
+     *                       TXConfigLoader).  Omitted entirely when unset.
+     *                       See execution/offer_min_input_coin.hpp.
      * @return JSON containing "offer" (bech32 text) and "trade_record".
      *         When max_time was sent, trade_record.valid_times.max_time
      *         echoes it back; callers must VERIFY that echo rather than
@@ -593,7 +600,8 @@ public:
         const json&    offer_dict,
         std::uint64_t  fee           = 0,
         bool           validate_only = false,
-        std::optional<std::uint64_t> max_time = std::nullopt);
+        std::optional<std::uint64_t> max_time = std::nullopt,
+        std::optional<std::uint64_t> min_coin_amount = std::nullopt);
 
     /**
      * @brief Build the create_offer_for_ids request body.
@@ -609,12 +617,18 @@ public:
      *
      * @param max_time  Absent leaves the payload byte-identical to the one
      *                  sent before offer expiry existed.
+     * @param min_coin_amount  [MIN-INPUT-COIN] Absent leaves the payload
+     *                  byte-identical to the one sent before the floor
+     *                  existed.  Present, it is written at the TOP LEVEL --
+     *                  where chia 2.7.4 reads its coin-selection config --
+     *                  and never inside "offer".
      */
     [[nodiscard]] static json build_create_offer_payload(
         const json&    offer_dict,
         std::uint64_t  fee,
         bool           validate_only,
-        const std::optional<std::uint64_t>& max_time);
+        const std::optional<std::uint64_t>& max_time,
+        const std::optional<std::uint64_t>& min_coin_amount = std::nullopt);
 
     /**
      * @brief Accept (take) an existing offer.

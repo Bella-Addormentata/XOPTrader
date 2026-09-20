@@ -939,11 +939,12 @@ asio::awaitable<json>
 ChiaWalletRPC::create_offer(const json&   offer_dict,
                              std::uint64_t fee,
                              bool          validate_only,
-                             std::optional<std::uint64_t> max_time)
+                             std::optional<std::uint64_t> max_time,
+                             std::optional<std::uint64_t> min_coin_amount)
 {
     // The Chia wallet RPC endpoint is "create_offer_for_ids".
     const json payload = build_create_offer_payload(
-        offer_dict, fee, validate_only, max_time);
+        offer_dict, fee, validate_only, max_time, min_coin_amount);
 
     const json resp = co_await rpc_post("create_offer_for_ids", payload);
 
@@ -956,7 +957,8 @@ json ChiaWalletRPC::build_create_offer_payload(
     const json&    offer_dict,
     std::uint64_t  fee,
     bool           validate_only,
-    const std::optional<std::uint64_t>& max_time)
+    const std::optional<std::uint64_t>& max_time,
+    const std::optional<std::uint64_t>& min_coin_amount)
 {
     // offer_dict maps wallet_id (as string key) -> signed mojo amount.
     json payload = {
@@ -979,6 +981,15 @@ json ChiaWalletRPC::build_create_offer_payload(
     // supported by this API.  test_offer_expiry pins all of this.
     if (max_time.has_value()) {
         payload["max_time"] = *max_time;
+    }
+
+    // [MIN-INPUT-COIN] Attached only when the caller asks.  The key sits at
+    // the top level because that is where the wallet reads its coin-selection
+    // config (tx_endpoint -> TXConfigLoader.from_json_dict(request)); the same
+    // floor then governs the offered asset and the XCH fee coin alike.  A
+    // floor of 0 is the wallet's own default, so it is not worth a key.
+    if (min_coin_amount.has_value() && *min_coin_amount > 0) {
+        payload["min_coin_amount"] = *min_coin_amount;
     }
     return payload;
 }

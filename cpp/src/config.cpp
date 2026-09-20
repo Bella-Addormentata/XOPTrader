@@ -1156,6 +1156,15 @@ StrategyConfig parse_strategy(const YAML::Node& root)
         && !node["offer_expiry_secs"].IsNull()) {
         cfg.offer_expiry_secs = read_uint32(node, "offer_expiry_secs", sec);
     }
+
+    // [MIN-INPUT-COIN] Optional; absent or null keeps the 0.01 default.
+    // [0, 1): 0 is a real setting ("send no floor"), and 1 would demand a
+    // single coin at least as large as the whole offer.  Non-finite values
+    // throw inside the helper before the range test, which NaN would pass.
+    cfg.offer_min_input_coin_frac = read_optional_finite_in_range(
+        node, "offer_min_input_coin_frac", sec,
+        cfg.offer_min_input_coin_frac, 0.0, 1.0,
+        /*lo_open=*/false, /*hi_open=*/true);
     cfg.num_tiers            = read_uint32_positive(node, "num_tiers", sec);
 
     cfg.tier_spacing_bps = read_positive_double_seq(node, "tier_spacing_bps", sec);
