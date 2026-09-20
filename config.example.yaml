@@ -397,6 +397,12 @@ strategy:
   #   tibetswap fee)) against the current centre.  Crossed offers are still
   #   cancelled first; favourable drift never cancels.  Reason in offer_log:
   #   "margin_breach(<edge>/<floor>bps)".
+  #   COST, MEASURED: replayed over the 14 days to 2026-09-20 this rule fires,
+  #   at some block, on up to 7 of the 15 offers that actually FILLED (0-7 once
+  #   the unrecorded fair centre is bounded by the 100 bps A-S rail; 3-7 at
+  #   retain 1.0).  It can cancel offers that would have been taken, and
+  #   nothing in this mode pulls a favourably-drifted quote back toward the
+  #   touch.  See cpp/tests/test_price_cancel_replay.cpp.
   # price_cancel_mode: deviation           # [OPTIONAL, default: deviation] deviation | margin
   # price_cancel_edge_retain: 0.5          # [OPTIONAL, default: 0.5] (0, 1] margin only: 1.0 cancels the instant the edge dips under the POSTING floor, where Step 7 routinely rests tiers
   offer_fee_mojos: 10000000  # [OPTIONAL, default: 10000000] On-chain fee per offer/cancel

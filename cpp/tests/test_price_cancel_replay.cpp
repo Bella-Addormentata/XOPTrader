@@ -194,6 +194,15 @@ TEST(PriceCancelReplay, WhatItWouldHaveDoneToEveryOtherOffer)
         // half the edge a new offer would have needed.  By the rule's own
         // definition those are the fills it exists to avoid; to the operator
         // they are 7 of a fortnight's 15 fills.  Disclosed, not argued.
+        //
+        // HOW MUCH OF THAT SURVIVES THE TWO-CENTRE RULE.  This column is the
+        // one-centre upper bound (see the banner).  Step 7's fair centre is
+        // quote_mid / (1 - r) with |r| <= as_reservation_max_offset_bps /
+        // 10000 = 0.01, so replaying every admissible fair centre brackets the
+        // real count: retain 1.00 -> 3..7, 0.75 -> 3..7, 0.50 -> 0..7,
+        // 0.25 -> 0..6 (same arithmetic as replay(), fair_centre swept over
+        // the rail).  Not pinned here because the fair centre is not recorded
+        // (S73); what IS pinned is that the upper bound does not move.
         EXPECT_EQ(t.fires[kFill],  e.filled) << "retain " << e.retain;
     }
 }

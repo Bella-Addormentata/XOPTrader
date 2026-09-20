@@ -48,6 +48,15 @@ Three rules made 97% of them. Each now has a replacement behind its own
   82 of the 248 witnessed price cancels at the default 0.5 -- and the literal
   rule (1.0) fires on MORE offers than the rule it replaces, which is why 0.5
   is the default. New cancel reasons: `expired_onchain`, `margin_breach(..)`.
+  **Read this before enabling it: the same replay fires on up to 7 of the
+  fortnight's 15 FILLED offers**, at every retain from 0.5 up
+  (`PriceCancelReplay.WhatItWouldHaveDoneToEveryOtherOffer`). The replay judges
+  one centre where the live rule needs both to fail, so 7 is an upper bound;
+  bounding the unrecorded fair centre by the 100 bps A-S rail brackets the real
+  figure at 0 to 7 at retain 0.5, and at 3 to 7 at retain 1.0. This is the
+  switch's real cost: `margin` also drops the anchor override, so a quote the
+  market drifts AWAY from is never pulled back to the touch. It is not a pure
+  reduction in wasted cancels.
 
 Out of scope and unchanged: startup sweeps, Cancel All, reload-disabled pairs,
 shutdown, every safety cancel, UTXO liberation, and the stopped-engine TTL sweep.
