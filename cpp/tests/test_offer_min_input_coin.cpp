@@ -341,16 +341,17 @@ TEST(OfferMinInputCoin, ACatScaledFloorIsTinyInXchTerms) {
     // 10^12, which is what keeps that harmless.
     const std::uint64_t xch = static_cast<std::uint64_t>(xop::kMojosPerXch);
     // The incident offer: 804 mojos is under a billionth of an XCH.
-    EXPECT_LT(*offer_min_input_coin(cat_funded_bid(80'334), 0.01),
-              xch / 1'000'000'000u);
+    const Floor incident = offer_min_input_coin(cat_funded_bid(80'334), 0.01);
+    ASSERT_TRUE(incident.has_value());
+    EXPECT_LT(*incident, xch / 1'000'000'000u);
     // 100,000 CAT units: exactly CoinManager's XCH dust threshold
     // (1,000,000 mojos), below which the engine ignores XCH coins anyway.
-    EXPECT_EQ(*offer_min_input_coin(cat_funded_bid(100'000'000), 0.01),
-              std::uint64_t{1'000'000});
+    EXPECT_EQ(offer_min_input_coin(cat_funded_bid(100'000'000), 0.01),
+              Floor{1'000'000});
     // 1,000,000 CAT units -- far beyond any tier this bot posts: the fee
     // coin must be at least 0.00001 XCH.
-    EXPECT_EQ(*offer_min_input_coin(cat_funded_bid(1'000'000'000), 0.01),
-              xch / 100'000u);
+    EXPECT_EQ(offer_min_input_coin(cat_funded_bid(1'000'000'000), 0.01),
+              Floor{xch / 100'000u});
 }
 
 // ===========================================================================

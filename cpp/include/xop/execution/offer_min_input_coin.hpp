@@ -51,8 +51,8 @@
 // XCH-FUNDED OFFERS ARE LEFT ALONE.  XCH coins are already shaped by
 // CoinManager's pool (ensure_split) and budgeted by the XCH lock ledger,
 // which models whole-coin locking under the wallet's default selection.
-// Rewards are not paid in XCH, so there is no dust to keep out, and changing
-// which XCH coin the wallet picks would change what that ledger assumes.
+// The dust observed is CAT reward payouts, and changing which XCH coin the
+// wallet picks would change what that ledger assumes.
 //
 // THE FALLBACK, AND WHY IT CANNOT DOUBLE-POST
 // -------------------------------------------
