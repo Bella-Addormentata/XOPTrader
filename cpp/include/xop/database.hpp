@@ -137,6 +137,28 @@ inline constexpr const char* kOfferStatusCancelPending = "cancel_pending";
     return po;
 }
 
+/// [S74 2026-09-20] The offer_log row a State entry with NO row yet is given
+/// by a KEEP stop (Engine::report_offers_kept_on_stop).  The next boot's
+/// startup reconcile sorts wallet offers into "known" and "orphan" by
+/// offer_log, and an orphan is re-priced and possibly CANCELLED -- so an offer
+/// the stop promised to keep must not reach the next boot unknown.  The
+/// inverse of pending_offer_from_db, and it persists db_status_for(State):
+/// an offer whose cancel is already out is written cancel_pending, never live.
+[[nodiscard]] inline DbOfferRecord offer_log_row_for(const PendingOffer& offer)
+{
+    DbOfferRecord rec{};
+    rec.offer_id      = offer.offer_id;
+    rec.pair_name     = offer.pair_name;
+    rec.side          = (offer.side == Side::Bid) ? "bid" : "ask";
+    rec.price_mojos   = offer.price;
+    rec.size_mojos    = offer.size;
+    rec.tier          = static_cast<int>(offer.tier);
+    rec.status        = db_status_for(offer);
+    rec.created_block = offer.created_at_block;
+    rec.fee_mojos     = offer.fee_mojos;
+    return rec;
+}
+
 // ---------------------------------------------------------------------------
 // DbSnapshot -- maps 1:1 to a row in the snapshots table.
 // ---------------------------------------------------------------------------

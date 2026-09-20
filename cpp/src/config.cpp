@@ -4015,6 +4015,60 @@ BuyerConfig parse_buyer(const YAML::Node& root)
     return cfg;
 }
 
+// ---------------------------------------------------------------------------
+// parse_engine -- optional `engine:` section.  [S74 2026-09-20]
+//
+// One key today: shutdown_offers, the stop policy used when a stop request
+// names none (xop/util/stop_offers_policy.hpp).  Absent means "cancel", so a
+// config written before the key existed behaves exactly as it did.
+//
+// STRICT, unlike the older sections: a section that is not a mapping, a key
+// this build does not know and a value it cannot read are all errors.  This
+// key decides what happens to a live book when nobody is there to answer, and
+// every lenient reading of a typo ("shutdown_offer: keep", "engine: keep",
+// "shutdown_offers: kep") is a silent "cancel" the operator did not choose.
+// ---------------------------------------------------------------------------
+EngineConfig parse_engine(const YAML::Node& root)
+{
+    const std::string sec = "engine";
+    EngineConfig cfg;
+
+    if (!root[sec] || !root[sec].IsDefined() || root[sec].IsNull()) {
+        return cfg;
+    }
+    const YAML::Node& node = root[sec];
+    if (!node.IsMap()) {
+        throw ConfigError(sec + " must be a mapping with the key "
+                          "shutdown_offers (cancel or keep)");
+    }
+    for (auto it = node.begin(); it != node.end(); ++it) {
+        const std::string key =
+            it->first.IsScalar() ? it->first.as<std::string>() : std::string("<non-scalar key>");
+        if (key != "shutdown_offers") {
+            throw ConfigError(sec + "." + key + " is not a known key (the only "
+                              "key in this section is shutdown_offers)");
+        }
+    }
+
+    const YAML::Node& value = node["shutdown_offers"];
+    if (value && value.IsDefined() && !value.IsNull()) {
+        const std::optional<util::StopOffersPolicy> policy =
+            value.IsScalar()
+                ? util::parse_stop_offers_policy(value.as<std::string>())
+                : std::nullopt;
+        if (!policy.has_value()) {
+            throw ConfigError(
+                sec + ".shutdown_offers must be \"cancel\" or \"keep\" (got "
+                + (value.IsScalar() ? "\"" + value.as<std::string>() + "\""
+                                    : std::string("a non-scalar value"))
+                + "): it decides what a stop does with the resting offers "
+                  "when the stop request does not say");
+        }
+        cfg.shutdown_offers = *policy;
+    }
+    return cfg;
+}
+
 // [PACE D1 2026-09-13] Per-pair concentration overrides.  The EFFECTIVE soft
 // limit (override or risk.soft_limit_pct) must be below the effective hard
 // limit for every configured pair, enabled or not, with or without the pace
@@ -4436,6 +4490,7 @@ AppConfig load_config(const std::string& path,
     cfg.market_allocator = parse_market_allocator(root);
     cfg.recovery   = parse_recovery(root);
     cfg.buyer      = parse_buyer(root);
+    cfg.engine     = parse_engine(root);
 
     // Cross-section: revive_market quotes from the fair-value solve with
     // no order-book reference, so its whole safety envelope is carried by

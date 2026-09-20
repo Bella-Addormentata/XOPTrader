@@ -54,6 +54,19 @@
 // Only a line that STARTS at column 0 with "pid=" addresses the request.
 // Every other line is ignored, so "requested_by_pid=" can never match.
 //
+// [S74 2026-09-20] ONE OPTIONAL LINE MORE, still v1:
+//
+//   offers=<cancel|keep>
+//
+// says what the stop does with the resting book (stop_offers_policy.hpp). It
+// is read at column 0 like "pid=", and it never changes WHOSE request this is:
+// the verdict below does not look at it. No such line (every request written
+// before it existed, a hand-written flag) means "use engine.shutdown_offers".
+// A value this build cannot read, or two such lines, is Unrecognised: the stop
+// is still honoured and the config default decides. An engine that predates
+// the line ignores it and cancels the book, so the GUI writes "offers=keep"
+// only to an engine whose --help advertises the stop policy (main.cpp).
+//
 // SCOPE, stated honestly: these functions are the DECISION. Engine::
 // evaluate_shutdown_flag() reads the file, calls them and acts on the result;
 // nothing in cpp/tests constructs an Engine (S36), so that wiring -- the
@@ -62,6 +75,7 @@
 // ---------------------------------------------------------------------------
 
 #include "xop/util/process_identity.hpp"
+#include "xop/util/stop_offers_policy.hpp"
 
 #include <chrono>
 #include <cstddef>
@@ -89,6 +103,10 @@ enum class ShutdownFlagAddress : int {
 struct ParsedShutdownFlag {
     ShutdownFlagAddress address{ShutdownFlagAddress::Unaddressed};
     std::uint64_t pid{0};
+    /// [S74] What the request says about the book. NOT part of the address:
+    /// decide_shutdown_flag() never reads it, and a Malformed address reports
+    /// Unspecified because nobody's request has no policy to carry.
+    StopOffersRequest offers{StopOffersRequest::Unspecified};
 };
 
 /// Parse flag content. A leading UTF-8 BOM is dropped; lines split on '\n'
@@ -98,7 +116,9 @@ struct ParsedShutdownFlag {
 {
     constexpr std::string_view kUtf8Bom{"\xEF\xBB\xBF"};
     constexpr std::string_view kPidKey{"pid="};
-    constexpr ParsedShutdownFlag kMalformed{ShutdownFlagAddress::Malformed, 0};
+    constexpr std::string_view kOffersKey{"offers="};
+    constexpr ParsedShutdownFlag kMalformed{ShutdownFlagAddress::Malformed, 0,
+                                            StopOffersRequest::Unspecified};
 
     if (content.substr(0, kUtf8Bom.size()) == kUtf8Bom) {
         content.remove_prefix(kUtf8Bom.size());
@@ -106,6 +126,7 @@ struct ParsedShutdownFlag {
 
     bool seen_pid = false;
     std::uint64_t pid = 0;
+    StopOffersRequest offers = StopOffersRequest::Unspecified;
     while (!content.empty()) {
         const std::size_t newline = content.find('\n');
         std::string_view line = content.substr(0, newline);
@@ -116,6 +137,17 @@ struct ParsedShutdownFlag {
         }
         if (!line.empty() && line.back() == '\r') {
             line.remove_suffix(1);
+        }
+
+        // [S74] Column 0 only, like "pid=". The FIRST offers line is read; a
+        // second one makes the policy Unrecognised whatever either says --
+        // "keep" then "cancel" has no reading anyone could defend, and the
+        // config default is the operator's own answer for exactly that case.
+        if (line.substr(0, kOffersKey.size()) == kOffersKey) {
+            offers = (offers == StopOffersRequest::Unspecified)
+                ? stop_offers_request_from_value(line.substr(kOffersKey.size()))
+                : StopOffersRequest::Unrecognised;
+            continue;
         }
 
         // Column 0 only: "requested_by_pid=" must never address a request.
@@ -155,9 +187,9 @@ struct ParsedShutdownFlag {
     }
 
     if (seen_pid) {
-        return ParsedShutdownFlag{ShutdownFlagAddress::Addressed, pid};
+        return ParsedShutdownFlag{ShutdownFlagAddress::Addressed, pid, offers};
     }
-    return ParsedShutdownFlag{};
+    return ParsedShutdownFlag{ShutdownFlagAddress::Unaddressed, 0, offers};
 }
 
 // ===========================================================================

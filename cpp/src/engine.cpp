@@ -73,6 +73,8 @@
 // NOT part of the greppable-extraction list.
 #include "xop/util/denom_format.hpp"
 #include "xop/util/shutdown_flag.hpp"
+#include "xop/execution/kept_book.hpp"
+#include "xop/execution/offer_expiry.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -535,6 +537,40 @@ Engine::Engine(const AppConfig& config, bool dry_run,
                  config_.strategy.detect_fills_backoff_interval,
                  execution::kReconcileStopAfterOldPages,
                  execution::kReconcileScanSlackSecs / 3600);
+    // [S74 2026-09-20] Operator eyeball line for the stop policy, and the one
+    // combination worth a warning: "keep" leaves offers takeable with no engine
+    // behind them, and the on-chain expiry is the only thing that bounds that.
+    spdlog::info("[Engine] Stop policy: engine.shutdown_offers={} -- a stop "
+                 "whose request names no policy (Ctrl+C, SIGTERM, a service "
+                 "stop, an OS session end, a pre-policy GUI, a hand-written "
+                 "shutdown.flag) will {}; a request carrying \"offers=cancel\" "
+                 "or \"offers=keep\" overrides this default",
+                 util::stop_offers_policy_name(config_.engine.shutdown_offers),
+                 util::stop_book_action_name(
+                     util::plan_stop_offers(util::StopOffersRequest::Unspecified,
+                                            config_.engine.shutdown_offers,
+                                            /*dry_run=*/false).action));
+    if (config_.engine.shutdown_offers == util::StopOffersPolicy::Keep) {
+        std::string no_expiry_pairs;
+        for (const auto& pair : config_.pairs) {
+            if (!pair.enabled) continue;
+            if (execution::effective_offer_expiry_secs(
+                    pair.offer_expiry_secs_override,
+                    config_.strategy.offer_expiry_secs) == 0) {
+                no_expiry_pairs += (no_expiry_pairs.empty() ? "" : ", ") + pair.name;
+            }
+        }
+        if (!no_expiry_pairs.empty()) {
+            spdlog::warn("[Engine] [S74] engine.shutdown_offers is \"keep\" but "
+                         "these enabled pairs post offers with NO on-chain "
+                         "expiry (offer_expiry_secs is 0): {}. An offer kept "
+                         "across a stop on them stays takeable, unmanaged, until "
+                         "an engine or the operator cancels it -- however long "
+                         "the engine is down. Set strategy.offer_expiry_secs (or "
+                         "the pair's offer_expiry_secs_override), or use "
+                         "\"cancel\".", no_expiry_pairs);
+        }
+    }
 
     // -- Database (must be first: other subsystems may query on construction) --
     db_ = std::make_unique<Database>(config_.database.path);
@@ -1103,6 +1139,19 @@ void Engine::watchdog_cancel_book(const std::string&              why,
     // declaration for why concurrent entry is worse than a slow one.
     const std::lock_guard<std::mutex> cancel_lock(watchdog_cancel_mtx_);
 
+    // [S74 2026-09-20] A KEEP stop sends no cancel -- this one included.
+    // shutdown() sets the latch before it does anything else, and it is read
+    // HERE, under the mutex every route into this function takes, rather than
+    // in watchdog_loop(): a tick that passed the watchdog_stop_ check a moment
+    // before the operator's stop would otherwise still fire over a book the
+    // operator had just asked to keep.
+    if (offers_kept_on_stop_.load(std::memory_order_acquire)) {
+        spdlog::warn("[Engine] [S74] the dead man's switch path was reached "
+                     "during a stop that KEEPS the resting offers ({}) -- NOT "
+                     "cancelling: the operator's keep stands", why);
+        return;
+    }
+
     // [S46] The ids, rendered once, for every outcome branch below. The
     // 2026-09-02 alert told the operator to "cancel them by hand NOW" and
     // then did not say which -- so the only way to find out was to query
@@ -1471,7 +1520,39 @@ void Engine::shutdown()
         return;  // Already shutting down or stopped.
     }
 
+    // [S74 2026-09-20] WHAT THIS STOP DOES WITH THE BOOK.
+    //
+    // The request's policy (a shutdown.flag "offers=" line, latched by
+    // evaluate_shutdown_flag) or else engine.shutdown_offers; a signal carries
+    // none. The table is util::plan_stop_offers, and dry run is decided inside
+    // it, first. config_.engine is never written after construction, so this
+    // read is safe on whichever thread a signal delivers us on.
+    const util::StopOffersPlan stop_plan = util::plan_stop_offers(
+        stop_offers_request_.load(std::memory_order_acquire),
+        config_.engine.shutdown_offers, dry_run_);
+    const bool cancels_book = stop_plan.action == util::StopBookAction::CancelBook;
+    const bool keeps_book   = stop_plan.action == util::StopBookAction::KeepBook;
+    if (keeps_book) {
+        // FIRST, before a log line or a status change can take any time: the
+        // latch that turns watchdog_cancel_book() into a no-op, then the flag
+        // that ends the watchdog loop within its one-second tick. The thread
+        // is JOINED where it always was, in run() after ioc_.run() returns --
+        // not here, because a POSIX signal can deliver shutdown() ON the
+        // watchdog thread, and a thread cannot join itself.
+        //
+        // Disarming at the top of shutdown() is exactly what the cancel path
+        // must never do (engine.hpp, graceful_cancel_active_): there a wedged
+        // stop would leave a book the operator asked to be rid of. Here the
+        // operator asked for the book to STAY, so a wedged stop that ends in a
+        // hard kill leaves precisely what was asked for.
+        offers_kept_on_stop_.store(true, std::memory_order_release);
+        watchdog_stop_.store(true, std::memory_order_relaxed);
+    }
+
     spdlog::info("[Engine] Shutdown requested");
+    spdlog::warn("[Engine] [S74] this stop will {} ({})",
+                 util::stop_book_action_name(stop_plan.action),
+                 util::stop_policy_source_name(stop_plan.source));
     state_->set_status(BotStatus::ShuttingDown);
 
     // [review] A shutdown just requested is not a stall. The heartbeat is
@@ -1494,7 +1575,12 @@ void Engine::shutdown()
     // appeared -- the exact duplicate-spend race the claim exists to
     // prevent, reopened by its own delivery latency. The coroutine's
     // ClaimGuard still clears it when the cancel completes.
-    if (!dry_run_) {
+    //
+    // [S74] Only a stop that CANCELS claims anything. `cancels_book` is
+    // `!dry_run_` narrowed by the stop policy; a keep stop has no cancel for
+    // the claim to describe, and operator Cancel All reads this flag to decide
+    // whether a shutdown's sweep is about to take over from it.
+    if (cancels_book) {
         graceful_cancel_started_ms_.store(
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count(),
@@ -1524,9 +1610,13 @@ void Engine::shutdown()
     //
     // ISO/IEC 5055: no blocking .get()/.wait() calls; fully async teardown.
     // ISO/IEC 27001:2022: all cancellation outcomes are audit-logged.
-    asio::co_spawn(ioc_, [this]() -> asio::awaitable<void> {
+    asio::co_spawn(ioc_, [this, cancels_book, keeps_book]() -> asio::awaitable<void> {
         // --- Cancel outstanding offers (skip in dry-run mode) ---
-        if (!dry_run_) {
+        // [S74] ...and skip when the stop KEEPS the book. EVERY cancel this
+        // function can send, the intent file and the cancel_pending rows live
+        // inside this one block, and tests/test_stop_keep_wiring.py pins that:
+        // a cancel site added outside it would run on a keep stop too.
+        if (cancels_book) {
             // The claim was published synchronously in shutdown() -- see
             // the note there. This guard is what CLEARS it once the cancel
             // completes (or fails), so the watchdog resumes its own
@@ -2109,6 +2199,12 @@ void Engine::shutdown()
             } catch (const std::exception& ex) {
                 spdlog::error("[Engine] cancel_all exception: {}", ex.what());
             }
+        } else if (keeps_book) {
+            // [S74] No cancel, no intent file, no row changed, no RPC at all:
+            // a plain function, so nothing in it can await one. From here to
+            // ioc_.stop() below nothing suspends either, so no other coroutine
+            // (a heartbeat cycle, an operator Cancel All) runs again.
+            report_offers_kept_on_stop();
         }
 
         // --- Post-cancel cleanup (runs on io_context, no deadlock) ---
@@ -2132,6 +2228,111 @@ void Engine::shutdown()
 
         co_return;
     }, asio::detached);
+}
+
+// [S74 2026-09-20] The whole of what a KEEP stop does about the book.
+//
+// TWO things, neither of which can reach the wallet:
+//
+//   1. FLUSH. Every offer in State gets an offer_log row if it has none. The
+//      next boot's startup_reconcile splits the wallet's open offers into
+//      "known" (restored as they are) and "orphan" (re-priced, and cancelled if
+//      the price no longer suits) BY offer_log -- so an offer this stop promised
+//      to keep must not arrive there unknown. Rows are normally written right
+//      after post_quotes and by the periodic reconcile mirror; a stop that
+//      lands between an offer entering State and either of those is the gap.
+//      An EXISTING row is never touched: pending stays pending, cancel_pending
+//      stays cancel_pending.
+//   2. SAY SO. One line, at warn so the file sink flushes it even if the GUI's
+//      stop window then hard-kills the process (main.cpp flush_on(warn)).
+//
+// What it deliberately does NOT do, each pinned by tests/
+// test_stop_keep_wiring.py over this function's text: await anything, call the
+// wallet, the full node, Dexie or OfferManager, write or clear the cancel
+// intent file, or write an offer status. The intent file a previous process
+// left is left exactly as it is -- those cancels were ordered, and the next
+// engine's sweep still owns them.
+void Engine::report_offers_kept_on_stop()
+{
+    if (!book_restored_from_offer_log_) {
+        // The stop landed in boot, before offer_log's pending rows were
+        // restored into State. State is empty because nothing was LOADED, not
+        // because nothing rests -- so an "N offers left resting" line here
+        // would report this process's ignorance as a fact about the book.
+        spdlog::warn("[Engine] [S74] KEEP stop during startup, before this "
+                     "process had restored the book from offer_log: whatever "
+                     "was resting in the wallet is STILL RESTING and was not "
+                     "counted. No cancel was sent, no cancel intent was "
+                     "written, and the dead man's switch is disarmed for this "
+                     "stop. The next engine start re-adopts the offers.");
+        return;
+    }
+
+    const auto all_offers = state_->get_all_offers();
+
+    std::size_t rows_added = 0;
+    std::size_t rows_failed = 0;
+    for (const auto& po : all_offers) {
+        try {
+            if (db_->query_offer_status(po.offer_id).has_value()) {
+                continue;  // it has a row: leave it exactly as it is
+            }
+            db_->insert_offer(offer_log_row_for(po));
+            ++rows_added;
+        } catch (const std::exception& e) {
+            ++rows_failed;
+            spdlog::warn("[Engine] [S74] could not give kept offer {} an "
+                         "offer_log row: {} -- the next start will meet it as "
+                         "an ORPHAN and may re-price or cancel it",
+                         po.offer_id, e.what());
+        }
+    }
+
+    std::vector<execution::KeptOfferFacts> facts;
+    facts.reserve(all_offers.size());
+    for (const auto& po : all_offers) {
+        execution::KeptOfferFacts fact;
+        fact.pair_name      = po.pair_name;
+        fact.cancel_pending = po.cancel_pending;
+        // Stamped only by the posting paths; an offer restored at boot or
+        // adopted from the wallet keeps the epoch default.
+        const auto posted = std::chrono::duration_cast<std::chrono::seconds>(
+            po.created_at_ts.time_since_epoch()).count();
+        fact.posted_unix_s = posted > 0 ? static_cast<std::int64_t>(posted) : 0;
+        const PairConfig* pair = find_pair_config(po.pair_name);
+        fact.expiry_secs = execution::effective_offer_expiry_secs(
+            pair != nullptr ? pair->offer_expiry_secs_override : std::nullopt,
+            config_.strategy.offer_expiry_secs);
+        facts.push_back(std::move(fact));
+    }
+    const auto now_unix_s = static_cast<std::int64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    const execution::KeptBookSummary summary =
+        execution::summarise_kept_book(facts, now_unix_s);
+
+    spdlog::warn("[Engine] [S74] KEEP stop: {} No cancel was sent, no cancel "
+                 "intent was written, and the dead man's switch is disarmed "
+                 "for this stop.", execution::describe_kept_book(summary));
+    if (rows_added > 0 || rows_failed > 0) {
+        spdlog::warn("[Engine] [S74] offer_log: {} kept offer(s) had no row and "
+                     "were given one so the next start restores them as known; "
+                     "{} could not be written", rows_added, rows_failed);
+    }
+    if (cancel_all_inflight_) {
+        spdlog::warn("[Engine] [S74] an operator Cancel All was still in flight "
+                     "when this stop began. This stop sends nothing more and "
+                     "does not wait for it: whatever the wallet accepted shows "
+                     "there as PENDING_CANCEL, and the next start adopts those "
+                     "as cancel_pending.");
+    }
+    if (!cancel_intent_.empty()) {
+        spdlog::warn("[Engine] [S74] {} cancel intent(s) recovered from an "
+                     "earlier process are still unresolved; the intent file is "
+                     "left as it is and the next start keeps sweeping them. "
+                     "None of the offers kept by this stop was added to it.",
+                     cancel_intent_.size());
+    }
 }
 
 bool Engine::is_running() const noexcept
@@ -2397,6 +2598,10 @@ asio::awaitable<void> Engine::poll_loop_coro()
                 spdlog::info("[Engine] Restored {} pending offers from DB into State",
                              db_pending.size());
             }
+            // [S74] From here State describes the book. A KEEP stop that lands
+            // earlier in boot must not report "no offers were resting" about a
+            // book this process simply never loaded.
+            book_restored_from_offer_log_ = true;
 
             // -- [S14 2026-09-13] Wallet PENDING_CANCEL records -----------------
             // startup_reconcile keeps every PENDING_CANCEL trade its wallet scan
@@ -21647,6 +21852,10 @@ asio::awaitable<void> Engine::escalate_stuck_cancels(BlockHeight block)
 // then stop -- the same thing SIGINT triggers on platforms where the GUI
 // could deliver it.
 //
+// [S74 2026-09-20] ...unless the request says "offers=keep", or says nothing
+// and engine.shutdown_offers is "keep": then shutdown() stops WITHOUT
+// cancelling (xop/util/stop_offers_policy.hpp).
+//
 // [shutdown-flag-race 2026-09-12] Only a request naming this PID, or no PID,
 // and written at or after this process started stops it (decide_shutdown_flag).
 // Called from the fast poll, the analysis poll and the boot checkpoints.
@@ -21764,9 +21973,16 @@ util::ShutdownFlagDecision Engine::evaluate_shutdown_flag(util::ShutdownFlagSite
                       ec.message(), reason_name, process_identity_.pid, age_ms);
     } else {
         spdlog::warn("[Engine] shutdown.flag consumed ({}; this PID {}, written {} ms "
-                     "after start) -- graceful shutdown (the book is cancelled on "
-                     "the way down)", reason_name, process_identity_.pid, age_ms);
+                     "after start; offers policy in the request: {}) -- graceful "
+                     "shutdown", reason_name, process_identity_.pid, age_ms,
+                     util::stop_offers_request_name(facts.parsed.offers));
     }
+    // [S74 2026-09-20] Hand shutdown() what THIS request said about the book.
+    // Stored here and nowhere else, and only on the honour path: a discarded
+    // flag is somebody else's request, and its policy must never colour a
+    // later stop of this process (a Ctrl+C, say). shutdown() resolves it
+    // against engine.shutdown_offers and says which one decided.
+    stop_offers_request_.store(facts.parsed.offers, std::memory_order_release);
     shutdown();
     return decision;
 }

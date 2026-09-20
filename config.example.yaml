@@ -703,6 +703,46 @@ monitoring:
   # Prometheus
   prometheus_port: 9090             # [REQUIRED]
 
+# --- engine: OPTIONAL (omit the section and nothing changes) ------------------
+# [S74] What a STOP does with the offers resting on the book.
+#
+#   cancel  (default) The engine cancels the whole book on the way down: a
+#           wallet-wide cancel, a retry ladder, and a note in
+#           data/uncancelled.txt so the next start finishes what did not
+#           confirm. This is the only behaviour older versions had.
+#   keep    The engine cancels NOTHING. The offers stay on the book, the next
+#           start re-adopts them, and the stop takes about a second. No cancel
+#           spends to confirm and no locked coins to clean up -- which matters
+#           when blocks are full.
+#
+# The GUI ASKS on Stop Trading and when its window is closed, and only
+# preselects this value. THIS key decides every stop where nobody is asked:
+# Windows log-off / shutdown / restart, a signal (SIGINT, SIGTERM), Ctrl+C in a
+# console, a service stop, an older GUI, a hand-written data/shutdown.flag with
+# no "offers=" line. (A hard kill -- Task Manager, taskkill /F, the installer --
+# runs no stop at all, so the offers stay whatever this says.)
+#
+# READ THIS BEFORE CHOOSING keep. A kept offer is TAKEABLE with no engine behind
+# it: no repricing, no TTL, and no dead man's switch (risk.watchdog_stall_seconds
+# only watches a RUNNING engine, and a keep stop disarms it). If the market moves
+# while the engine is down, stale offers get filled at the old price. The ONLY
+# thing that bounds how long a kept offer can live is the on-chain expiry:
+#
+#   * use keep only together with strategy.offer_expiry_secs > 0 (and no pair
+#     with offer_expiry_secs_override: 0). The engine logs a WARNING at startup
+#     when keep is set and an enabled pair posts offers with no expiry;
+#   * the expiry is stamped when an offer is POSTED, so offers posted before the
+#     expiry was turned on carry none until they rotate out by TTL;
+#   * an offer whose expiry passes while the engine is down can no longer be
+#     taken, but the wallet still holds its coins until it is cancelled; the
+#     next start cancels it on its first cycle (it is past the hard TTL).
+#
+# Strict: only this key, only these two values -- anything else is a startup
+# error, because every lenient reading of a typo would be a silent "cancel".
+# Read at startup; a change applies from the next engine start.
+engine:
+  shutdown_offers: cancel           # [OPTIONAL, default: cancel] cancel | keep
+
 # --- depeg: OPTIONAL (omit section to disable depeg monitoring) --------------
 # Stablecoin depeg detection — global settings.
 # Per-pair thresholds are set in each pair's is_stablecoin / depeg_* fields.

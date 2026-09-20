@@ -73,6 +73,7 @@
 #include "xop/risk/peg_suspension.hpp"
 #include "xop/config_reload.hpp"
 #include "xop/util/process_identity.hpp"
+#include "xop/util/stop_offers_policy.hpp"
 #include "xop/strategy/bbo_sanity.hpp"
 #include "xop/strategy/pace_controller.hpp"
 #include "xop/strategy/no_loss_floor.hpp"
@@ -669,7 +670,13 @@ public:
     ///
     /// 1. Sets the bot status to ShuttingDown.
     /// 2. Cancels the polling timer.
-    /// 3. Cancels all outstanding offers (on-chain, secure).
+    /// 3. Cancels all outstanding offers (on-chain, secure) -- OR, [S74] when
+    ///    the stop policy is "keep", cancels nothing, writes no cancel intent,
+    ///    disarms the dead man's switch and reports what was left resting.
+    ///    The policy is the stop request's (a shutdown.flag "offers=" line,
+    ///    latched by evaluate_shutdown_flag before it calls this) or else
+    ///    engine.shutdown_offers; a signal carries none, so Ctrl+C and SIGTERM
+    ///    follow the config default (xop/util/stop_offers_policy.hpp).
     /// 4. Closes all RPC connections.
     /// 5. Shuts down the Prometheus exporter.
     /// 6. Sets the bot status to Stopped.
@@ -1173,6 +1180,41 @@ private:
     /// (flag or signal) is requested. On true the caller must co_return --
     /// shutdown() has already spawned the continuation that owns teardown.
     [[nodiscard]] bool boot_stop_checkpoint(const char* where);
+
+    // -- [S74 2026-09-20] A stop that KEEPS the resting offers ----------------
+    //
+    // What a stop does with the book is a policy: the stop request's, or else
+    // engine.shutdown_offers (xop/util/stop_offers_policy.hpp). shutdown()
+    // keeps its signature -- a signal handler calls it with no arguments, and
+    // the wiring scans find it by that signature -- so the request's policy
+    // travels in this atomic: evaluate_shutdown_flag() stores what the honoured
+    // flag said immediately before it calls shutdown(), and a signal leaves it
+    // Unspecified. An atomic because shutdown() runs on whichever thread the
+    // signal arrives on.
+    std::atomic<util::StopOffersRequest> stop_offers_request_{
+        util::StopOffersRequest::Unspecified};
+
+    /// Set by shutdown(), before anything else, when the stop keeps the book;
+    /// never cleared. watchdog_cancel_book() reads it under its mutex and sends
+    /// nothing once it is set, which is what makes "the dead man's switch does
+    /// not fire during a keep stop" true for a tick that had already passed
+    /// the watchdog_stop_ check -- and for every other route into that
+    /// function. A cancel the switch had ALREADY started before the operator
+    /// asked is not recalled: it holds the mutex, and it was a real firing.
+    std::atomic<bool> offers_kept_on_stop_{false};
+
+    /// Set by poll_loop_coro once boot has restored offer_log's pending rows
+    /// into State. Until then State says nothing about the book, and a keep
+    /// stop reports exactly that instead of an empty book. ioc_ thread only.
+    bool book_restored_from_offer_log_{false};
+
+    /// The keep path: mirror State into offer_log for any offer that has no row
+    /// yet, then log the one line that says what was left resting
+    /// (execution/kept_book.hpp). Deliberately NOT a coroutine -- it cannot
+    /// await an RPC, so it cannot send one: no cancel, no wallet read, nothing
+    /// that a wedged wallet could hold up. It never writes the cancel intent
+    /// file and never changes an existing offer_log row.
+    void report_offers_kept_on_stop();
 
     [[nodiscard]] bool asset_peg_suspended(const std::string& asset_id) const;
     [[nodiscard]] bool pair_peg_suspended(const PairConfig& pc) const;
