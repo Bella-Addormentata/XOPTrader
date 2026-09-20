@@ -377,7 +377,8 @@ strategy:
   # ttl_cancel_mode: expire -- an offer that verifiably carries the expiry
   #   above is no longer cancelled at the hard TTL; the chain ages it out and
   #   the bot then frees its coins with a FREE local cancel, once the WALLET'S
-  #   chain clock is 600s past max_time (never this host's clock).  Requires
+  #   chain clock, read 32 blocks back, is past max_time (never this host's
+  #   clock, and never the tip's: that proves no reorg depth).  Requires
   #   offer_expiry_secs (or a pair override) > 0 -- rejected at startup
   #   otherwise.  Log: "[offer-expiry] retired".  Offers with no verified
   #   expiry, and everything a stopped engine ages out, keep today's cancel.

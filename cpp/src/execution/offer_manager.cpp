@@ -283,11 +283,12 @@ OfferManager::retire_expired_offers(BlockHeight current_block)
         co_return retired;
     }
 
-    // The CHAIN clock, at the height the wallet has FINISHED syncing to:
-    // the latest transaction-block timestamp it has processed.  That one
-    // number says both that no later block can carry a take of an offer
-    // whose max_time it has passed, and that the wallet has already seen
-    // every block that could.
+    // The CHAIN clock, read kExpiredRetireDepthBlocks BELOW the height the
+    // wallet has FINISHED syncing to.  If the latest transaction block at
+    // that depth was already stamped >= an offer's max_time, then no later
+    // block can carry a take of it, the wallet has processed every block
+    // that could, and the block that expired it is buried that deep -- a
+    // seconds margin proves none of the last (see offer_expiry.hpp).
     const rpc::TransportCounters pass_start = wallet_->transport_counters();
     // This pass repeats every heartbeat while anything waits past its expiry,
     // and a wallet that cannot answer fails the same way each time: WARN once
@@ -301,8 +302,16 @@ OfferManager::retire_expired_offers(BlockHeight current_block)
     std::string clock_error;
     try {
         const std::int64_t synced_height = co_await wallet_->get_height_info();
-        chain_time_s =
-            co_await wallet_->get_timestamp_for_height(synced_height);
+        const std::int64_t clock_height =
+            expired_retire_clock_height(synced_height);
+        if (clock_height > 0) {
+            chain_time_s =
+                co_await wallet_->get_timestamp_for_height(clock_height);
+        } else {
+            clock_error = "the wallet is fewer than "
+                + std::to_string(kExpiredRetireDepthBlocks)
+                + " blocks into the chain";
+        }
     } catch (const std::exception& e) {
         clock_error = e.what();
     }
@@ -320,7 +329,7 @@ OfferManager::retire_expired_offers(BlockHeight current_block)
     }
 
     for (const auto& po : due) {
-        if (!expired_beyond_safety(po.expiry_max_time, chain_time_s)) {
+        if (!expired_at_depth(po.expiry_max_time, chain_time_s)) {
             continue;   // expired by the host clock only; ask again later
         }
         if (abort_predicate_ && abort_predicate_()) {
@@ -396,8 +405,8 @@ OfferManager::retire_expired_offers(BlockHeight current_block)
         state_->mark_cancel_pending(po.offer_id);
         retired.push_back(po.offer_id);
         logger_->info("[offer-expiry] retired {} ({} {} tier {}) at block {}: "
-                      "max_time={} chain_time={} (+{}s) -- local cancel, no "
-                      "fee, coins released",
+                      "max_time={} chain_time_at_depth={} (+{}s) -- "
+                      "local cancel, no fee, coins released",
                       po.offer_id.substr(0, 12), po.pair_name,
                       to_string(po.side), po.tier, current_block,
                       po.expiry_max_time, chain_time_s,
@@ -2274,7 +2283,8 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
     bool                           can_bid,
     bool                           can_ask,
     double                         margin_centre,
-    double                         margin_min_edge_bps) const
+    double                         margin_min_edge_bps,
+    double                         margin_fair_centre) const
 {
     std::vector<TierClassification> results;
 
@@ -2366,13 +2376,13 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
             return classify_tier_refresh_margin(
                 crossed, age < kMinRefreshAgeBlocks, po.side == Side::Ask,
                 static_cast<double>(po.price), margin_centre,
-                margin_min_edge_bps, edge_retain);
+                margin_fair_centre, margin_min_edge_bps, edge_retain);
         };
         const auto note_margin_breach = [&](TierClassification& out) {
             out.margin_breach     = true;
-            out.edge_bps          = resting_edge_bps(
+            out.edge_bps          = margin_edge_bps(
                 po.side == Side::Ask, static_cast<double>(po.price),
-                margin_centre);
+                margin_centre, margin_fair_centre);
             out.required_edge_bps = margin_min_edge_bps * edge_retain;
         };
 

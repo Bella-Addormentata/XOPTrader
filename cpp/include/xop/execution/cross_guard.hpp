@@ -251,11 +251,36 @@ enum class TierRefresh {
 // The margin rule asks the offer's own question: if this were taken right now
 // at its resting price, would it still earn the edge Step 7 demands of a NEW
 // offer -- max(min_profit_margin, quote_width_sigma_mult x combined_sigma,
-// tibetswap fee) -- against the CURRENT centre?  Both numbers are the ones
-// Step 7 threaded to Step 8 (PairCycleState::quote_mid_mojos and
-// quote_min_half_spread_bps), so the canceller cannot disagree with the
-// pricer about where the floor is; two rules for one decision drifting apart
-// is the bug class this file documents.
+// tibetswap fee) -- against the CURRENT centre?  Every number is one Step 7
+// threaded to Step 8 (PairCycleState), so the canceller cannot disagree with
+// the pricer about where the floor is; two rules for one decision drifting
+// apart is the bug class this file documents.
+//
+// WHICH CENTRE -- BOTH, AND THE KINDER ONE DECIDES.  [review #164]  Step 7
+// keeps two.  quote_fair_centre_mojos is what the asset is WORTH.
+// quote_mid_mojos is that centre after the Avellaneda-Stoikov reservation
+// shift (up to as_reservation_max_offset_bps, 100 bps), which moves quotes to
+// shed inventory and is what the width-floor pass measures the floor from.
+// engine.hpp is explicit that the shifted centre is the wrong frame for "how
+// much edge does this carry", and the first revision of this rule used it
+// alone.  But the fair centre alone is wrong the other way: on the side being
+// SHED, Step 7 deliberately posts at shifted x (1 +/- floor), i.e. with only
+// floor - shift of edge against fair value, so a canceller that demanded
+// retain x floor against fair value would cancel what the pricer had just
+// posted whenever shift > (1 - retain) x floor -- 61.5 bps at the live 123 bps
+// floor, inside the 100 bps rail -- and the pricer would post it again: the
+// post/cancel loop of S71, rebuilt one rule over.
+//
+// So an offer is cancelled for price only when it fails against BOTH centres:
+//   * on the shed side that reduces to the shifted-centre test: nothing the
+//     pricer would itself post now is ever cancelled;
+//   * on the other side it reduces to the fair-value test: an offer still
+//     earning its edge against what the asset is worth is not churned merely
+//     because the inventory skew moved the ladder away from it.  Inventory
+//     that must not grow is the business of the side gates (can_bid/can_ask,
+//     which classify_tier_staleness honours first), not of a price rule.
+// With no fair centre (0 until Step 7 reaches its capture point) the shifted
+// centre decides alone.
 //
 // WHY THE RESTING FLOOR IS A FRACTION OF THE POSTING FLOOR.  Step 7's
 // width-floor pass pushes tiers out to EXACTLY centre x (1 +/- floor), so an
@@ -279,6 +304,23 @@ enum class TierRefresh {
     }
     const double signed_gap = is_ask ? (price - centre) : (centre - price);
     return signed_gap / centre * 10'000.0;
+}
+
+/// The edge the margin rule judges: the KINDER of the edges against Step 7's
+/// shifted ladder centre and its fair-value centre (see the banner above for
+/// why both, and why the kinder).  An unusable @p fair_centre leaves the
+/// shifted centre to decide alone.
+[[nodiscard]] inline double margin_edge_bps(bool   is_ask,
+                                            double price,
+                                            double centre,
+                                            double fair_centre) noexcept
+{
+    const double vs_ladder = resting_edge_bps(is_ask, price, centre);
+    if (!(fair_centre > 0.0) || !std::isfinite(fair_centre)) {
+        return vs_ladder;
+    }
+    const double vs_fair = resting_edge_bps(is_ask, price, fair_centre);
+    return vs_fair > vs_ladder ? vs_fair : vs_ladder;
 }
 
 /// Whether Step 7 handed over a centre, a floor and a retain fraction the
@@ -310,7 +352,11 @@ enum class MarginRefresh {
 /// @param below_min_age age < kMinRefreshAgeBlocks.
 /// @param is_ask        side of the resting offer.
 /// @param price         its resting price.
-/// @param centre        Step 7's ladder centre for the pair, THIS cycle.
+/// @param centre        Step 7's SHIFTED ladder centre for the pair, THIS
+///                      cycle (quote_mid_mojos) -- the one the floor is
+///                      measured from, and the one that must be usable.
+/// @param fair_centre   Step 7's fair-value centre before the inventory shift
+///                      (quote_fair_centre_mojos); 0 = not captured.
 /// @param min_edge_bps  Step 7's minimum half-spread for the pair, THIS cycle.
 /// @param edge_retain   fraction of min_edge_bps a resting offer must keep.
 [[nodiscard]] inline MarginRefresh classify_tier_refresh_margin(
@@ -319,6 +365,7 @@ enum class MarginRefresh {
     bool   is_ask,
     double price,
     double centre,
+    double fair_centre,
     double min_edge_bps,
     double edge_retain) noexcept
 {
@@ -338,7 +385,8 @@ enum class MarginRefresh {
     // (3) The edge test.  Strictly below: an offer resting exactly on the
     //     resting floor is still acceptable, as one exactly on the posting
     //     floor is to Step 7.
-    return resting_edge_bps(is_ask, price, centre) < min_edge_bps * edge_retain
+    return margin_edge_bps(is_ask, price, centre, fair_centre)
+               < min_edge_bps * edge_retain
         ? MarginRefresh::Stale
         : MarginRefresh::Fresh;
 }

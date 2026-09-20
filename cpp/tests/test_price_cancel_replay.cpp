@@ -27,6 +27,11 @@
 //     different later life, and one it cancels would have been reposted at a
 //     different price.  "Fires at some block of its recorded life" counts
 //     lifetimes, not cancels.
+//   * ONE centre.  The live rule cancels only when an offer fails against
+//     BOTH of Step 7's centres (shifted ladder centre and fair value).  The
+//     recorded ladder yields one centre -- the shifted one -- so the replay
+//     runs that test alone, which can only OVERSTATE what the live rule
+//     cancels.
 //   * Two of the three live pairs recorded ladders in the window (XCH/DBX
 //     39,212 blocks, XCH/BYC 4,237); a block with no ladder is skipped, and an
 //     offer with none at all is reported as "no witness", never as "kept".
@@ -81,7 +86,8 @@ enum class Replay { NoWitness, Keeps, Fires };
     const double floor_bps = (ask - bid) / (2.0 * centre) * 10'000.0;
     switch (classify_tier_refresh_margin(
                 /*crossed=*/false, /*below_min_age=*/false, row.is_ask,
-                static_cast<double>(row.price), centre, floor_bps, retain)) {
+                static_cast<double>(row.price), centre,
+                /*fair_centre=*/0.0, floor_bps, retain)) {
         case MarginRefresh::Stale:       return Replay::Fires;
         case MarginRefresh::Fresh:       return Replay::Keeps;
         case MarginRefresh::NoReference: break;

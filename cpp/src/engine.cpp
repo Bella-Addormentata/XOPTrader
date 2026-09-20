@@ -11566,13 +11566,18 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             can_bid_rebalance,
             can_ask_rebalance,
             // [S72] price_cancel_mode: margin judges a resting offer against
-            // the SAME centre and floor Step 7 priced this cycle's ladder
+            // the SAME centres and floor Step 7 priced this cycle's ladder
             // with -- threaded, not recomputed, so the canceller and the
-            // pricer cannot disagree about where the floor is.  Both are 0
-            // until Step 7 reaches ladder generation, which the classifier
-            // reads as "no reference" and answers with the deviation rule.
+            // pricer cannot disagree about where the floor is.  The shifted
+            // centre and the floor are 0 until Step 7 reaches ladder
+            // generation, which the classifier reads as "no reference" and
+            // answers with the deviation rule.  [review #164] The fair-value
+            // centre rides along because the shifted one alone is the wrong
+            // frame for edge; an offer must fail against BOTH to be cancelled
+            // (cross_guard.hpp says why not the fair one alone).
             static_cast<double>(pcs.quote_mid_mojos),
-            pcs.quote_min_half_spread_bps);
+            pcs.quote_min_half_spread_bps,
+            static_cast<double>(pcs.quote_fair_centre_mojos));
 
         // [PACE 2026-09-13] Pace reprice.  To the canceller a tighter desired
         // bid is FAVOURABLE drift, refreshed only past 3x the tier threshold

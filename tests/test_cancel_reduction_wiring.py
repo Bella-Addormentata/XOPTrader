@@ -80,18 +80,23 @@ def test_the_local_cancel_sits_behind_the_expiry_verdict():
     )
     # Fee 0 through the one charged choke point, like every other cancel.
     assert "cancel_offer_charged(po.offer_id, 0, /*secure=*/false)" in retire
-    assert "expired_beyond_safety(po.expiry_max_time, chain_time_s)" in retire
+    assert "expired_at_depth(po.expiry_max_time, chain_time_s)" in retire
 
 
 def test_the_retire_reads_the_wallets_chain_clock_not_the_hosts():
     retire = _retire()
     height = retire.index("wallet_->get_height_info()")
-    clock = retire.index("wallet_->get_timestamp_for_height(synced_height)")
+    depth = retire.index("expired_retire_clock_height(synced_height)")
+    clock = retire.index("wallet_->get_timestamp_for_height(clock_height)")
     first_offer_read = retire.index("wallet_->get_offer(")
-    assert height < clock < first_offer_read, (
-        "the chain clock is read once, at the wallet's finished-sync height, "
-        "before any offer is judged"
+    assert height < depth < clock < first_offer_read, (
+        "the chain clock is read once, kExpiredRetireDepthBlocks below the "
+        "wallet's finished-sync height, before any offer is judged"
     )
+    # [review #164] A clock read at the TIP proves no confirmation depth: the
+    # first block stamped past max_time can be the tip itself.
+    assert "get_timestamp_for_height(synced_height)" not in retire
+    assert retire.count("get_timestamp_for_height(") == 1
     # The host clock feeds the pre-filter and nothing else.
     assert retire.count("host_now_s") == 2, retire.count("host_now_s")
     assert "expiry_worth_checking(po.expiry_max_time" in retire
@@ -256,7 +261,11 @@ def test_the_canceller_gets_step_sevens_own_centre_and_floor():
         "the pace pass has no ladder and sends no reference: the deviation zones decide"
     )
     main_call = main.split(";")[0]
-    assert "static_cast<double>(pcs.quote_mid_mojos),pcs.quote_min_half_spread_bps)" in main_call
+    assert ("static_cast<double>(pcs.quote_mid_mojos),pcs.quote_min_half_spread_bps,"
+            "static_cast<double>(pcs.quote_fair_centre_mojos))") in main_call, (
+        "[review #164] the shifted centre alone is the wrong frame for edge, and the "
+        "fair centre alone rebuilds the post/cancel loop: the canceller needs both"
+    )
     assert "execution::margin_breach_reason(tc.edge_bps,tc.required_edge_bps)" in _squash(engine)
 
 
@@ -268,7 +277,10 @@ def test_margin_mode_replaces_the_zones_and_the_anchor_override():
         "one call, in the shared lambda both branches use"
     )
     body = _squash(classify)
-    assert "margin_centre,margin_min_edge_bps,edge_retain);" in body
+    assert "margin_centre,margin_fair_centre,margin_min_edge_bps,edge_retain);" in body
+    assert "margin_edge_bps(po.side==Side::Ask,static_cast<double>(po.price),margin_centre,margin_fair_centre);" in body, (
+        "the recorded edge must be the one the verdict was reached on"
+    )
     assert "age<kMinRefreshAgeBlocks,po.side==Side::Ask" in body, "kMinRefreshAgeBlocks stays"
     assert "if(!margin_decided){" in body, "NoReference must fall back to the deviation zones"
     assert "caseMarginRefresh::NoReference:break;" in body

@@ -279,7 +279,7 @@ def test_the_book_window_follows_the_configured_ttl():
 def test_the_book_window_follows_the_onchain_expiry_in_expire_mode():
     """[S70] Under ttl_cancel_mode: expire a quote outlives the hard TTL.
 
-    It rests until its on-chain expiry plus the engine's 600 s retire delay --
+    It rests until its on-chain expiry plus the engine's 32-block (~600 s) retire depth --
     24 h 10 min at the live offer_expiry_secs: 86400, against a hard TTL of
     ~4.2 h.  A window sized from offer_ttl_blocks alone would show that side
     as absent for most of the offer's life.

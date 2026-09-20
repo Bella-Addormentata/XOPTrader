@@ -136,9 +136,10 @@ def our_book_window_hours(offer_ttl_blocks: int | None) -> float:
     return max(_OUR_BOOK_WINDOW_H, hours)
 
 
-#: execution::kExpiredRetireSafetySecs (cpp/include/xop/execution/offer_expiry.hpp):
-#: how far the chain clock must pass an offer's max_time before the engine
-#: retires it.  Until then the offer is still a 'pending' row.
+#: execution::kExpiredRetireDepthBlocks (cpp/include/xop/execution/offer_expiry.hpp)
+#: is 32 blocks: how deep the block that expired an offer must be buried before
+#: the engine retires it, ~600 s at 18.75 s/block.  Until then the offer is
+#: still a 'pending' row.
 _EXPIRED_RETIRE_SAFETY_S: int = 600
 
 

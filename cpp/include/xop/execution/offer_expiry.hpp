@@ -242,15 +242,23 @@ inline constexpr double kExpiryFloorMargin = 2.0;
 // and are themselves only loosely bound to it.  So "now >= max_time" on this
 // host proves nothing: the offer can still be taken until a transaction block
 // stamped >= max_time exists.  The retire decision therefore reads the
-// wallet's own chain clock -- get_timestamp_for_height at the height the
-// wallet has FINISHED syncing to -- which answers both questions at once: no
-// later block can carry the take, and the wallet has already processed every
-// block that could.  If it still says PENDING_ACCEPT, the offer was never
-// taken and never can be.
+// wallet's own chain clock -- get_timestamp_for_height, asked relative to the
+// height the wallet has FINISHED syncing to -- which answers both questions
+// at once: no later block can carry the take, and the wallet has already
+// processed every block that could.  If it still says PENDING_ACCEPT, the
+// offer was never taken and never can be.
 //
-// kExpiredRetireSafetySecs is the reorg allowance on top: a reorg that
-// replaces the first transaction block stamped >= max_time could reopen the
-// window, so the chain clock must be this far PAST max_time first.
+// THE REORG ALLOWANCE IS A DEPTH, NOT A NUMBER OF SECONDS.  [review #164] The
+// first revision required the chain clock to be 600 s PAST max_time and called
+// that "~32 blocks".  It is not: transaction-block timestamps must increase,
+// but by no particular step, so after a slow patch the FIRST block stamped past
+// max_time can be stamped 600 s past it -- satisfying a seconds margin at a
+// confirmation depth of one.  Reorg that one block (ordinary at the tip) and the
+// previous transaction block is again before max_time: the offer is takeable,
+// its trade is CANCELLED in the wallet, and the take is never booked.  So the
+// clock is read kExpiredRetireDepthBlocks BELOW the wallet's synced height:
+// if the chain was already past max_time that many blocks ago, the block that
+// expired the offer is buried at least that deep.
 //
 // Pure, like the rest of this header.  OfferManager::retire_expired_offers
 // supplies the wallet answers; cpp/tests/test_offer_expiry.cpp drives these.
@@ -296,32 +304,45 @@ inline constexpr double kExpiryFloorMargin = 2.0;
         ? max_time : 0;
 }
 
-/// How far the CHAIN clock must be past max_time before an expired offer is
-/// retired locally.  600 s is ~32 blocks at the 18.75 s peak-height cadence
-/// (4,608/day): the first transaction block stamped >= max_time would have to
-/// be reorged out from under that many successors to reopen the take window.
-/// It costs nothing but ten more minutes of locked coins on an offer that
-/// already cannot be taken.
-inline constexpr std::uint64_t kExpiredRetireSafetySecs = 600;
+/// How deep the block that expired an offer must be buried before the offer is
+/// retired locally, in peak-height blocks.  32 is ~10 min at the 18.75 s
+/// cadence (4,608/day) and over five times strategy.confirmation_depth_blocks'
+/// default of 6, which is what this engine asks of a FILL: an insecure cancel
+/// cannot be taken back, so it waits longer.  The cost is ten more minutes of
+/// locked coins on an offer that already cannot be taken.
+inline constexpr std::int64_t kExpiredRetireDepthBlocks = 32;
 
-/// True once the chain clock is at least kExpiredRetireSafetySecs past
-/// max_time.  @p chain_time_s is a TRANSACTION-BLOCK timestamp (the wallet's
-/// get_timestamp_for_height at its finished-sync height), never a host clock.
-/// 0 on either side reads as "unknown" and is never expired.
-[[nodiscard]] constexpr bool expired_beyond_safety(
-    std::uint64_t max_time,
-    std::uint64_t chain_time_s) noexcept
+/// The height whose chain clock the retire decision reads: @p synced_height
+/// (the wallet's get_height_info, i.e. get_finished_sync_up_to) less the
+/// depth.  0 when the wallet is not that deep into the chain -- no clock, and
+/// nothing is retired.
+[[nodiscard]] constexpr std::int64_t expired_retire_clock_height(
+    std::int64_t synced_height) noexcept
 {
-    if (max_time == 0 || chain_time_s == 0) return false;
-    // Subtraction form: max_time + safety could wrap for a hostile max_time.
-    return chain_time_s >= max_time
-        && chain_time_s - max_time >= kExpiredRetireSafetySecs;
+    return synced_height > kExpiredRetireDepthBlocks
+        ? synced_height - kExpiredRetireDepthBlocks
+        : 0;
+}
+
+/// True once the chain was ALREADY at or past max_time
+/// kExpiredRetireDepthBlocks below the wallet's synced height.
+/// @p chain_time_at_depth_s is a TRANSACTION-BLOCK timestamp -- the wallet's
+/// get_timestamp_for_height(expired_retire_clock_height(...)) -- never a host
+/// clock.  `>=`, as consensus has it: a spend asserting BEFORE max_time fails
+/// once the previous transaction block's timestamp is >= max_time.  0 on
+/// either side reads as "unknown" and is never expired: an unknown max_time
+/// by the first clause, an unknown clock because 0 is >= no real max_time.
+[[nodiscard]] constexpr bool expired_at_depth(
+    std::uint64_t max_time,
+    std::uint64_t chain_time_at_depth_s) noexcept
+{
+    return max_time != 0 && chain_time_at_depth_s >= max_time;
 }
 
 /// A cheap PRE-FILTER on the host clock, so a heartbeat with nothing near its
 /// expiry asks the wallet nothing.  It only ever decides to LOOK: a fast host
 /// clock costs two read-only RPCs, a slow one delays a retire that is already
-/// harmless.  The retire itself is decided by expired_beyond_safety alone.
+/// harmless.  The retire itself is decided by expired_at_depth alone.
 [[nodiscard]] constexpr bool expiry_worth_checking(
     std::uint64_t max_time,
     std::int64_t  host_now_s) noexcept
@@ -354,7 +375,7 @@ inline constexpr std::uint64_t kExpiryWarnIntervalBlocks = 96;
 
 /// What to do with a resting offer whose on-chain expiry may have passed.
 enum class ExpiredRetire {
-    NotExpired,     ///< chain clock not far enough past max_time: leave it
+    NotExpired,     ///< the chain was not yet past max_time at depth: leave it
     LeaveToWallet,  ///< the wallet says it is no longer PENDING_ACCEPT: a fill
                     ///< or a cancel is in hand, and those paths own it
     Unverified,     ///< the wallet's record does not carry OUR max_time: keep
@@ -367,7 +388,8 @@ enum class ExpiredRetire {
 /// @param wallet_status_pending_accept  get_offer reported PENDING_ACCEPT.
 /// @param tracked_max_time   the expiry State holds for the offer.
 /// @param record_max_time    trade_record_max_time(get_offer's record).
-/// @param chain_time_s       the wallet's chain clock (see above).
+/// @param chain_time_at_depth_s  the wallet's chain clock, read
+///                           kExpiredRetireDepthBlocks below its synced height.
 ///
 /// Order is the contract.  The status is read first because a CONFIRMED
 /// trade is a FILL whatever the clock says, and `filled` always wins.  The
@@ -378,7 +400,7 @@ enum class ExpiredRetire {
     bool          wallet_status_pending_accept,
     std::uint64_t tracked_max_time,
     std::uint64_t record_max_time,
-    std::uint64_t chain_time_s) noexcept
+    std::uint64_t chain_time_at_depth_s) noexcept
 {
     if (!wallet_status_pending_accept) {
         return ExpiredRetire::LeaveToWallet;
@@ -386,7 +408,7 @@ enum class ExpiredRetire {
     if (tracked_max_time == 0 || record_max_time != tracked_max_time) {
         return ExpiredRetire::Unverified;
     }
-    return expired_beyond_safety(tracked_max_time, chain_time_s)
+    return expired_at_depth(tracked_max_time, chain_time_at_depth_s)
         ? ExpiredRetire::RetireLocal
         : ExpiredRetire::NotExpired;
 }

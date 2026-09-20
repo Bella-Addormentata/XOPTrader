@@ -455,7 +455,8 @@ struct StrategyConfig {
     /// (default) is the unconditional hard-TTL cancel.  `expire` leaves an
     /// offer that verifiably carries offer_expiry_secs' max_time to the
     /// chain and retires it with a FREE local cancel once the wallet's chain
-    /// clock is kExpiredRetireSafetySecs past that max_time; the soft-TTL
+    /// clock, read kExpiredRetireDepthBlocks below its synced height, is
+    /// past that max_time; the soft-TTL
     /// adverse rule, every price rule and every safety cancel still apply,
     /// and an offer with no verified expiry keeps the hard TTL.  The
     /// reasoning and the wallet facts are in execution/offer_expiry.hpp --

@@ -37,12 +37,13 @@ using xop::execution::expiry_max_time_from;
 using xop::execution::expiry_outlasts_hard_ttl;
 using xop::execution::age_limit_cancel_applies;
 using xop::execution::decide_expired_retire;
-using xop::execution::expired_beyond_safety;
+using xop::execution::expired_at_depth;
+using xop::execution::expired_retire_clock_height;
 using xop::execution::ExpiredRetire;
 using xop::execution::expiry_warn_due;
 using xop::execution::expiry_worth_checking;
 using xop::execution::hard_ttl_seconds;
-using xop::execution::kExpiredRetireSafetySecs;
+using xop::execution::kExpiredRetireDepthBlocks;
 using xop::execution::kExpiryWarnIntervalBlocks;
 using xop::execution::kMinPlausibleUnixTime;
 using xop::execution::trade_record_max_time;
@@ -323,8 +324,9 @@ TEST(OfferExpiry, TheFloorTracksTheConfiguredTtlRatherThanAFixedNumber) {
 //      none leaves an offer nothing bounds.
 //   6. The expiry read back from a wallet record must fail closed exactly as
 //      the creation echo does.
-//   7. "Expired" is a statement about the CHAIN clock, with a reorg
-//      allowance; the host clock may only ever decide to look.
+//   7. "Expired" is a statement about the CHAIN clock, read at a confirmation
+//      DEPTH (a seconds margin is not one -- [review #164]); the host clock
+//      may only ever decide to look.
 //   8. A trade the wallet no longer reports PENDING_ACCEPT is never retired
 //      locally -- CONFIRMED is a fill, and `filled` always wins.
 //   9. A record that does not repeat the tracked expiry is never retired
@@ -427,35 +429,63 @@ TEST(OfferExpireMode, TheGetOfferWrapperIsNotWhatIsParsed) {
 
 // -- 7. "expired" is the chain's word ----------------------------------------
 
-TEST(OfferExpireMode, SafetyDelayIsTenMinutesOfChainTime) {
-    // ~32 blocks at the 18.75 s peak-height cadence.  Pinned because the
-    // comment, the PR and the operator procedure all quote it.
-    EXPECT_EQ(kExpiredRetireSafetySecs, 600u);
+TEST(OfferExpireMode, TheReorgAllowanceIsADepthInBlocks) {
+    // 32 peak-height blocks (~10 min at 18.75 s), over five times the 6 this
+    // engine asks of a fill.  Pinned because the header, the PR and the
+    // operator procedure all quote it.
+    EXPECT_EQ(kExpiredRetireDepthBlocks, 32);
+    // The clock is read that far BELOW the wallet's synced height...
+    EXPECT_EQ(expired_retire_clock_height(9'319'422), 9'319'390);
+    EXPECT_EQ(expired_retire_clock_height(33), 1);
+    // ...and a wallet not yet that deep into the chain has no clock at all,
+    // rather than a clamped height that would quietly read the tip.
+    EXPECT_EQ(expired_retire_clock_height(32), 0);
+    EXPECT_EQ(expired_retire_clock_height(1), 0);
+    EXPECT_EQ(expired_retire_clock_height(0), 0);
+    EXPECT_EQ(expired_retire_clock_height(-7), 0);
 }
 
-TEST(OfferExpireMode, NotExpiredUntilTheChainClockIsPastTheSafetyDelay) {
-    EXPECT_FALSE(expired_beyond_safety(kMaxTime, kMaxTime - 1));
-    // AT max_time the offer has just become untakeable; a reorg of the block
-    // that made it so could reopen the window.
-    EXPECT_FALSE(expired_beyond_safety(kMaxTime, kMaxTime));
-    EXPECT_FALSE(expired_beyond_safety(kMaxTime, kMaxTime + 599));
-    EXPECT_TRUE(expired_beyond_safety(kMaxTime, kMaxTime + 600));
-    EXPECT_TRUE(expired_beyond_safety(kMaxTime, kMaxTime + 86400));
+TEST(OfferExpireMode, ExpiredOnceTheChainAtDepthIsAtOrPastMaxTime) {
+    EXPECT_FALSE(expired_at_depth(kMaxTime, kMaxTime - 1));
+    // AT max_time counts, as it does in consensus: a spend asserting BEFORE
+    // max_time fails once the previous transaction block is stamped >= it.
+    EXPECT_TRUE(expired_at_depth(kMaxTime, kMaxTime));
+    EXPECT_TRUE(expired_at_depth(kMaxTime, kMaxTime + 86400));
 }
 
 TEST(OfferExpireMode, UnknownClockOrUnknownExpiryIsNeverExpired) {
-    EXPECT_FALSE(expired_beyond_safety(0u, kMaxTime + 86400));
-    EXPECT_FALSE(expired_beyond_safety(kMaxTime, 0u));
-    EXPECT_FALSE(expired_beyond_safety(0u, 0u));
+    EXPECT_FALSE(expired_at_depth(0u, kMaxTime + 86400));
+    EXPECT_FALSE(expired_at_depth(kMaxTime, 0u));
+    EXPECT_FALSE(expired_at_depth(0u, 0u));
 }
 
-TEST(OfferExpireMode, AHugeMaxTimeDoesNotWrapIntoExpired) {
-    // max_time + 600 computed naively wraps to a small number, and every
-    // chain time would then be "past" it.  The subtraction form cannot.
+TEST(OfferExpireMode, ASecondsMarginIsNotAConfirmationDepth) {
+    // [review #164] The scenario the first revision got wrong.  The last
+    // transaction block before the expiry was stamped max_time - 5; then the
+    // chain went quiet, and the NEXT transaction block -- the wallet's tip --
+    // is stamped max_time + 700.  A "600 s past max_time" margin read at the
+    // tip is satisfied at a confirmation depth of ONE; reorg that block and
+    // the offer is takeable again while its trade says CANCELLED.
+    //
+    // Read 32 blocks back instead, the chain clock is still max_time - 5, and
+    // the offer waits.  (That the pass ASKS for the clock at that height, not
+    // at the tip, is pinned in tests/test_cancel_reduction_wiring.py.)
+    const std::uint64_t clock_at_depth = kMaxTime - 5;
+    EXPECT_FALSE(expired_at_depth(kMaxTime, clock_at_depth));
+    EXPECT_EQ(decide_expired_retire(true, kMaxTime, kMaxTime, clock_at_depth),
+              ExpiredRetire::NotExpired);
+    // Thirty-two blocks later that same +700 block is what the at-depth read
+    // returns, and the offer retires.
+    EXPECT_EQ(decide_expired_retire(true, kMaxTime, kMaxTime, kMaxTime + 700),
+              ExpiredRetire::RetireLocal);
+}
+
+TEST(OfferExpireMode, AHugeMaxTimeHasNoArithmeticToWrap) {
+    // The decision compares; it never adds to or subtracts from max_time, so a
+    // hostile value cannot wrap into "long expired".
     const auto huge = std::numeric_limits<std::uint64_t>::max() - 10;
-    EXPECT_FALSE(expired_beyond_safety(huge, kMaxTime));
-    EXPECT_FALSE(expired_beyond_safety(
-        huge, std::numeric_limits<std::uint64_t>::max()));
+    EXPECT_FALSE(expired_at_depth(huge, kMaxTime));
+    EXPECT_TRUE(expired_at_depth(huge, huge));
 }
 
 TEST(OfferExpireMode, TheHostClockOnlyDecidesWhetherToLook) {
@@ -470,8 +500,8 @@ TEST(OfferExpireMode, TheHostClockOnlyDecidesWhetherToLook) {
 }
 
 TEST(OfferExpireMode, AFastHostClockCannotRetireAnything) {
-    // The host says the offer expired a day ago; the chain says it has two
-    // minutes left.  The pre-filter looks -- and the decision says no.
+    // The host says the offer expired a day ago; the chain, at depth, says it
+    // has two minutes left.  The pre-filter looks -- and the decision says no.
     const std::uint64_t chain_now = kMaxTime - 120;
     EXPECT_TRUE(expiry_worth_checking(
         kMaxTime, static_cast<std::int64_t>(kMaxTime) + 86400));
@@ -482,6 +512,8 @@ TEST(OfferExpireMode, AFastHostClockCannotRetireAnything) {
 // -- 8 and 9. the retire decision ---------------------------------------------
 
 TEST(OfferExpireMode, RetiresOnlyAnExpiredVerifiedPendingAcceptOffer) {
+    EXPECT_EQ(decide_expired_retire(true, kMaxTime, kMaxTime, kMaxTime),
+              ExpiredRetire::RetireLocal);
     EXPECT_EQ(decide_expired_retire(true, kMaxTime, kMaxTime, kMaxTime + 600),
               ExpiredRetire::RetireLocal);
 }
@@ -516,8 +548,8 @@ TEST(OfferExpireMode, ARecordThatDoesNotRepeatTheTrackedExpiryIsUnverified) {
               ExpiredRetire::Unverified);
 }
 
-TEST(OfferExpireMode, VerifiedButNotYetPastTheSafetyDelayWaits) {
-    EXPECT_EQ(decide_expired_retire(true, kMaxTime, kMaxTime, kMaxTime + 599),
+TEST(OfferExpireMode, VerifiedButNotYetExpiredAtDepthWaits) {
+    EXPECT_EQ(decide_expired_retire(true, kMaxTime, kMaxTime, kMaxTime - 1),
               ExpiredRetire::NotExpired);
     EXPECT_EQ(decide_expired_retire(true, kMaxTime, kMaxTime, 0u),
               ExpiredRetire::NotExpired);

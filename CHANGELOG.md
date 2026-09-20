@@ -21,7 +21,8 @@ Three rules made 97% of them. Each now has a replacement behind its own
   PENDING_ACCEPT and stays in `get_locked_coins()` until cancelled, and
   `cancel_offer secure=false` releases it with no spend. The cancel is sent only
   when the WALLET's chain clock (`get_timestamp_for_height` at its finished-sync
-  height) is 600 s past `max_time`, the wallet still reports PENDING_ACCEPT, and
+  height less 32 blocks -- a depth, because a seconds margin can be met by the
+  tip block alone) is past `max_time`, the wallet still reports PENDING_ACCEPT, and
   its record repeats the tracked `max_time`; this host's clock only decides
   whether to look. `expire` with no expiry configured is refused at startup.
   The GUI pairs table sizes its resting-offer window from the expiry in this
@@ -40,7 +41,9 @@ Three rules made 97% of them. Each now has a replacement behind its own
 - **`price_cancel_mode: margin` (was 282 `price_adverse` cancels).** Cancel for
   price only when a fill at the resting price would earn less than
   `price_cancel_edge_retain` x the edge Step 7 demands of a new offer, against
-  Step 7's own centre. Crossed offers are still cancelled first; favourable
+  BOTH of Step 7's centres (the shifted ladder centre and fair value), so it
+  never cancels what the pricer would itself post nor churns an offer that still
+  earns its edge. Crossed offers are still cancelled first; favourable
   drift never cancels. Replayed over the recorded fortnight it would have made
   82 of the 248 witnessed price cancels at the default 0.5 -- and the literal
   rule (1.0) fires on MORE offers than the rule it replaces, which is why 0.5

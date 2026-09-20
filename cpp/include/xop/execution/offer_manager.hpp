@@ -631,8 +631,12 @@ public:
      *                      not just adverse deviations.
      * @param can_bid       Whether bid (buy base) offers are currently allowed on this pair.
      * @param can_ask       Whether ask (sell base) offers are currently allowed on this pair.
-     * @param margin_centre        [S72] Step 7's ladder centre for the pair
-     *                      this cycle, in mojos (PairCycleState::quote_mid_mojos).
+     * @param margin_centre        [S72] Step 7's SHIFTED ladder centre for the
+     *                      pair this cycle, in mojos (PairCycleState::quote_mid_mojos).
+     * @param margin_fair_centre   [S72] Step 7's fair-value centre before the
+     *                      inventory shift (quote_fair_centre_mojos); an offer
+     *                      is cancelled for price only if it fails against
+     *                      BOTH (cross_guard.hpp).  0 = not captured.
      * @param margin_min_edge_bps  [S72] Step 7's minimum half-spread for the
      *                      pair this cycle (quote_min_half_spread_bps).  Both
      *                      are read only under price_cancel_mode: margin, and
@@ -650,7 +654,8 @@ public:
         bool                           can_bid = true,
         bool                           can_ask = true,
         double                         margin_centre = 0.0,
-        double                         margin_min_edge_bps = 0.0) const;
+        double                         margin_min_edge_bps = 0.0,
+        double                         margin_fair_centre = 0.0) const;
 
     /**
      * @brief [T5-01] Cancel only the offers classified as Stale or Expired.
