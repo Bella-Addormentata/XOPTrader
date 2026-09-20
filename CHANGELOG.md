@@ -24,6 +24,8 @@ Three rules made 97% of them. Each now has a replacement behind its own
   height) is 600 s past `max_time`, the wallet still reports PENDING_ACCEPT, and
   its record repeats the tracked `max_time`; this host's clock only decides
   whether to look. `expire` with no expiry configured is refused at startup.
+  The GUI pairs table sizes its resting-offer window from the expiry in this
+  mode, so a quote that legitimately rests 24 h is not shown as absent after 6.
 - **`exposure_rule: unified` (was 528 `exposure_floor_rebalance` cancels).** The
   pre-post projection and the resting-offer check now share one verdict. They
   disagreed because `spendable_balance` already excludes coins locked by resting

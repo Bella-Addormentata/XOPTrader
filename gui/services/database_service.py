@@ -136,6 +136,51 @@ def our_book_window_hours(offer_ttl_blocks: int | None) -> float:
     return max(_OUR_BOOK_WINDOW_H, hours)
 
 
+#: execution::kExpiredRetireSafetySecs (cpp/include/xop/execution/offer_expiry.hpp):
+#: how far the chain clock must pass an offer's max_time before the engine
+#: retires it.  Until then the offer is still a 'pending' row.
+_EXPIRED_RETIRE_SAFETY_S: int = 600
+
+
+def book_window_ttl_blocks(config: dict | None) -> int:
+    """[S70] The TTL, in blocks, to size :func:`our_book_window_hours` from.
+
+    Under ``strategy.ttl_cancel_mode: expire`` an offer that carries an
+    on-chain expiry is NOT cancelled at the hard TTL: it rests until its
+    ``max_time`` (``offer_expiry_secs``, or the longest pair override) plus
+    the engine's retire delay.  Sizing the window from ``offer_ttl_blocks``
+    alone would age a legitimately resting quote out of the pairs table after
+    ~6 h of a 24 h life, which is the false negative that function exists to
+    avoid.  In the default mode this returns ``offer_ttl_blocks`` unchanged.
+
+    ``our_book_window_hours`` doubles its argument (soft TTL -> hard TTL), so
+    the expiry is halved here to land on the intended wall-clock window.
+    """
+    cfg = config if isinstance(config, dict) else {}
+    strategy = cfg.get("strategy")
+    strategy = strategy if isinstance(strategy, dict) else {}
+
+    def _as_int(value: object) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    ttl_blocks = max(0, _as_int(strategy.get("offer_ttl_blocks")))
+    if str(strategy.get("ttl_cancel_mode") or "cancel") != "expire":
+        return ttl_blocks
+    longest_s = _as_int(strategy.get("offer_expiry_secs"))
+    pairs = cfg.get("pairs")
+    for pair in pairs if isinstance(pairs, list) else []:
+        if isinstance(pair, dict):
+            longest_s = max(longest_s, _as_int(pair.get("offer_expiry_secs_override")))
+    if longest_s <= 0:
+        return ttl_blocks
+    expiry_blocks = math.ceil(
+        (longest_s + _EXPIRED_RETIRE_SAFETY_S) / _SECONDS_PER_BLOCK / 2.0)
+    return max(ttl_blocks, expiry_blocks)
+
+
 class _DatabaseWorker(QObject):
     """Background worker that executes SQLite queries and emits results.
 

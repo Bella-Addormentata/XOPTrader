@@ -520,10 +520,13 @@ class MainWindow(QMainWindow):
         if hasattr(db, "query_pair_summary"):
             ttl_blocks = 0
             try:
+                # [S70] Under ttl_cancel_mode: expire a quote rests until its
+                # on-chain expiry, not the hard TTL; book_window_ttl_blocks
+                # sizes the window from whichever is longer.
+                from gui.services.database_service import book_window_ttl_blocks
+
                 cfg = bridge.config_service.get_full_config() or {}
-                ttl_blocks = int(
-                    (cfg.get("strategy") or {}).get("offer_ttl_blocks", 0) or 0
-                )
+                ttl_blocks = book_window_ttl_blocks(cfg)
             except Exception:      # config not loaded yet; the default applies
                 ttl_blocks = 0
             db.query_pair_summary(ttl_blocks)
