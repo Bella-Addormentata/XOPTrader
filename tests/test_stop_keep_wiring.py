@@ -147,6 +147,45 @@ def _functions_that_can_reach(path: Path, call: str) -> set[str]:
     return reach
 
 
+def _function_spans(code: str) -> list[tuple[str, int, int]]:
+    """(name, start, end) for each `Class::function` definition in *code*, which
+    must already be comment- and literal-stripped WITH its whitespace kept, so
+    offsets line up with the rest of the scan."""
+    starts = [(m.start(), m.group(1)) for m in re.finditer(
+        r"^[A-Za-z][^\n;]*?\b[A-Za-z_]+::([A-Za-z_]+)\(", code, re.M)]
+    return [(name, at, starts[i + 1][0] if i + 1 < len(starts) else len(code))
+            for i, (at, name) in enumerate(starts)]
+
+
+def _offer_creating_calls(code: str) -> list[int]:
+    """Where an offer is CREATED, as positions in *code*.
+
+    Usually `wallet_->create_offer(` itself. A function that issues that call and
+    records nothing (no `state_->upsert_offer(`) is a WRAPPER -- #162 adds exactly
+    one, `create_offer_min_coin` -- and then the creating calls are the calls TO
+    it, which is where the mark belongs: the window a keep stop must wait out runs
+    from the request until the offer is in State, and only the caller knows when
+    that is. Written this way so the scan states the property rather than today's
+    call shape (the previous round's scan broke on a merged tree for exactly that
+    reason, with both PRs' own CI green)."""
+    spans = _function_spans(code)
+    wrappers = {name for name, start, end in spans
+                if "->create_offer(" in code[start:end]
+                and "state_->upsert_offer(" not in code[start:end]}
+    positions: list[int] = []
+    for name, start, end in spans:
+        if name in wrappers:
+            continue  # its own create IS the wrapper; its callers carry the mark
+        body = code[start:end]
+        for m in re.finditer(r"->create_offer\(", body):
+            positions.append(start + m.start())
+        for wrapper in wrappers:
+            for m in re.finditer(
+                    r"(?<![A-Za-z0-9_:])" + re.escape(wrapper) + r"\s*\(", body):
+                positions.append(start + m.start())
+    return sorted(positions)
+
+
 def _in_order(haystack: str, needles: list[str]) -> list[int]:
     found = [haystack.find(s) for s in needles]
     missing = [s for s, at in zip(needles, found) if at == -1]
@@ -360,12 +399,12 @@ def test_every_create_offer_is_marked_one_at_a_time():
     in the same ladder is already in State, and the keep stop's flush gives each
     of those an offer_log row.
 
-    Stated over positions rather than over today's function names: every
-    create_offer call has its own mark, declared before it. An open PR moves
-    every create into a private helper; that helper has to carry the mark too,
-    and this says so."""
+    Stated over positions rather than over today's call shape: every
+    offer-creating call has its own mark, declared before it (see
+    _offer_creating_calls -- it follows the call through the wrapper #162
+    introduces, so this passes on that merged tree too)."""
     raw = _code(_text(OFFER_MANAGER_CPP), squeeze=False)
-    creates = [m.start() for m in re.finditer(r"->create_offer\(", raw)]
+    creates = _offer_creating_calls(raw)
     marks = [m.start() for m in re.finditer(
         r"PostingMark\s+[A-Za-z_]+\{posting_in_flight_flag_\};", raw)]
     assert creates, "no create_offer call in offer_manager.cpp: the scan is vacuous"
