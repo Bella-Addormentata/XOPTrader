@@ -5,6 +5,58 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### A stop can keep the offers on the book (S74)
+
+- **Stopping the engine no longer has to cancel everything.** A graceful stop
+  cancelled the whole book: a wallet-wide cancel, the retry ladder, a cancel
+  intent in `data/uncancelled.txt` and `cancel_pending` rows for the next start
+  to finish. With blocks about 97% full that leaves unconfirmed cancel spends
+  and locked coins behind every restart, and the only way to keep offers across
+  one was to hard-kill the GUI and the engine. A stop now carries a policy,
+  `cancel` or `keep`. With `keep` the engine sends no cancel of any kind (not
+  the sweep, not the ladder, not the dead man's switch), writes no cancel
+  intent, leaves every `offer_log` row as it is, disarms the dead man's switch
+  before anything else, and logs one line: how many offers were left resting,
+  on which pairs, and the soonest and latest on-chain expiry it knows of — or,
+  plainly, that they carry none. The next start re-adopts them through the
+  startup reconcile, exactly as it did after a hard kill.
+- **The GUI asks.** Stop Trading and closing the window show a prompt with three
+  choices — **Keep offers on the book**, **Cancel all offers**, **Don't stop** —
+  the number of resting offers per pair and, when the on-chain expiry is on, the
+  latest time a kept offer can stay takeable. It preselects the config default
+  and remembers nothing. An OS session end (log-off, shutdown, restart) and a
+  signal never show it: a modal box with nobody to answer would block the
+  shutdown for ever.
+- **`engine.shutdown_offers: cancel | keep`** (new optional section, default
+  `cancel`, so an upgrade changes nothing) decides every stop nobody answers:
+  a session end, SIGINT/SIGTERM, Ctrl+C in a console, a service stop, an older
+  GUI, a hand-written `shutdown.flag`. It is printed at startup, and the engine
+  warns there when `keep` is set while an enabled pair posts offers with no
+  on-chain expiry. Strict: an unknown key or value in `engine:` is a startup
+  error, because every lenient reading of a typo is a silent `cancel`. Settings
+  → Risk Management → *Stopping the Engine* edits it; the save writes that one
+  key only when the dropdown was changed, and re-reads the file first, so it
+  neither adds the key to an untouched config nor reverts a value edited on
+  disk.
+- **Protocol.** The addressed v1 stop request gains one optional line,
+  `offers=cancel|keep`. PID addressing, freshness and the truthful stop outcome
+  (#153) are unchanged, and a request without the line is byte-identical to
+  before. A line the engine cannot read does not refuse the stop: the config
+  default applies and the log says so. An engine that predates the line would
+  ignore it and cancel, so the GUI offers Keep only to an engine whose `--help`
+  advertises `shutdown.flag offers=cancel|keep`, and refuses to stop rather than
+  let a requested keep turn into a cancel.
+- **Operator notes.** Keep is for restarts. A kept offer is takeable with no
+  engine behind it — no repricing, no TTL, no dead man's switch — so use it
+  only with `strategy.offer_expiry_secs` set. An offer older than the hard TTL
+  (2 × `offer_ttl_blocks`) when the engine comes back is cancelled on its first
+  cycle anyway, and that includes every offer whose on-chain expiry passed: the
+  reference wallet goes on reporting such an offer `PENDING_ACCEPT` and keeps
+  its coins locked until it is cancelled (chia-blockchain 2.7.4,
+  `chia/wallet/trade_manager.py`). Operator **Cancel All** is unchanged.
+
 ## [0.10.24] — 2026-09-14 — record what happened, not what was asked for
 
 Nine merged branches, and most of them fix a record or a signal that reported a
