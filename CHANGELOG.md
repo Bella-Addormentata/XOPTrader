@@ -25,11 +25,23 @@ existed in the wallet and locked its coins, listed nowhere. `engine.log` holds
   (57,382 characters) and refused everything from 60,612 characters up.
 - **XCH-funded offers are unchanged.** Their coins are shaped by the coin pool
   and budgeted by the XCH lock ledger under the wallet's default selection.
-- **One value covers the fee coin too.** In chia 2.7.4 the coin-selection keys
-  are read from the top level of the request and one config governs every
-  selection it makes, including the XCH fee coin of a CAT-funded offer. The
-  floor is CAT-scaled (804 mojos for the offer above), so the fee coin is not
-  affected in practice.
+- **One value covers the fee coin too, and the XCH lock ledger models it.** In
+  chia 2.7.4 the coin-selection keys are read from the top level of the request
+  and one config governs every selection it makes, including the XCH fee coin
+  of a CAT-funded offer. The floor is CAT-scaled (804 mojos for the offer
+  above), but it changes which XCH coin pays the fee once it exceeds the fee:
+  an offer above fee / fraction CAT mojos, which is 1,000,000 CAT units at a
+  10,000,000-mojo fee and 500 at `fees.min_fee_mojos: 5000`. The wallet then
+  skips a small XCH coin and locks a larger one, so `CoinLockLedger::try_lock`
+  and `try_lock_floor_only` take the same floor, in the preflight probe and in
+  all three posting paths. Without it the ledger charged the coin the wallet
+  skipped and later creates could pass the cycle cap or the reserve floor on
+  XCH that was already locked.
+- **The fraction is applied in parts per billion, rounded up.** Rounded to
+  nearest, the applied fraction could fall below the configured one and the
+  input bound failed for ordinary values: at 1/3, three floor-sized coins of a
+  1,000,000,000-mojo offer totalled 999,999,999. The default 0.01 is exact and
+  unchanged.
 - **Fallback.** If the wallet answers that the coins at or above the floor
   cannot cover the amount ("... or our minimum coin amount is too high"), the
   create is sent once more without the floor and a `[min-input-coin]` warning

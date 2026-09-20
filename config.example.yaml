@@ -384,8 +384,13 @@ strategy:
   # Applies to CAT-funded offers only (a bid on XCH/<CAT>, an ask on
   # <CAT>/...).  XCH-funded offers are untouched: their coins are managed by
   # the coin pool.  The wallet applies the one value to the XCH fee coin of
-  # the same request as well, which is harmless because it is CAT-scaled
-  # (1% of an 80 DBX offer is 804 mojos, under a billionth of an XCH).
+  # the same request as well.  It is CAT-scaled, so it is small (1% of an
+  # 80 DBX offer is 804 mojos, under a billionth of an XCH), but once it
+  # exceeds the fee -- an offer above fee / fraction CAT mojos, i.e. 500 CAT
+  # units at fees.min_fee_mojos 5000 -- it can make the wallet skip a small
+  # XCH coin and lock a larger one.  The XCH lock ledger models the same
+  # floor, so the reserve and the cycle cap still see what is really locked.
+  # The fraction is applied in parts per billion, rounded up.
   #
   # If the coins at or above the floor cannot cover the amount, the wallet
   # refuses, and the engine retries ONCE without the floor and logs a
