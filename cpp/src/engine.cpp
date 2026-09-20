@@ -21425,10 +21425,25 @@ asio::awaitable<void> Engine::fee_feedback_sweep(BlockHeight block)
     if (fee_tracker_->take_budget_bound_alert() && alerts_) {
         alerts_->send_alert(
             AlertRule::FeeBudgetBound,
-            "Fee budget binds: wanted " + std::to_string(fee_tracker_->last_bound_desired())
+            "Fee budget binds: an offer-attached fee wanted "
+                + std::to_string(fee_tracker_->last_bound_desired())
                 + " mojos, budget allows " + std::to_string(fee_tracker_->last_bound_allowed())
-                + ". Fees degrade toward fees.min_fee_mojos; quoting and cancelling continue. "
-                  "Raise fees.daily_budget_mojos if spends stop confirming.");
+                + ". Attached fees degrade toward fees.min_fee_mojos; cancels and takes are "
+                  "NOT degraded and quoting continues. Raise fees.daily_budget_mojos.");
+    }
+    // [review #163] And the other edge: a cancel or a take the budget could not
+    // fund, paid in full so it can still be mined.
+    if (fee_tracker_->take_budget_unfunded_alert() && alerts_) {
+        alerts_->send_alert(
+            AlertRule::FeeBudgetUnfunded,
+            std::string("Fee budget exceeded on purpose: a ")
+                + strategy::fee::to_string(fee_tracker_->last_unfunded_action()) + " needs "
+                + std::to_string(fee_tracker_->last_unfunded_fee()) + " mojos to clear the node's "
+                  "admission floor and the window has only "
+                + std::to_string(fee_tracker_->last_unfunded_headroom())
+                + " left. It was PAID: a cancel priced below what the node admits never "
+                  "confirms, keeps its coins locked and ends in a wallet-wide force-delete. "
+                  "Raise fees.daily_budget_mojos.");
     }
 
     const std::uint32_t target = fee_tracker_->controller().config().target_delay_blocks;
@@ -21477,13 +21492,10 @@ asio::awaitable<void> Engine::fee_feedback_sweep(BlockHeight block)
             }
         } else if (strategy::fee::pending_observation_due(t, block, target)) {
             t.last_pending_block = block;
-            strategy::fee::Observation o;
-            o.signal       = strategy::fee::Signal::Pending;
-            o.blocks       = static_cast<double>(strategy::fee::ticket_age(t, block));
-            o.attributed   = true;
-            o.submit_level = t.submit_level;
-            o.now          = block;
-            fee_feedback_note(fee_tracker_->observe(o), block);
+            // [review #163] Built by the pure rule so the ticket's CLASS cannot
+            // be dropped here (strategy::fee::observation_for_pending).
+            fee_feedback_note(
+                fee_tracker_->observe(strategy::fee::observation_for_pending(t, block)), block);
         }
         ++it;
     }
@@ -21515,6 +21527,7 @@ asio::awaitable<void> Engine::fee_feedback_sweep(BlockHeight block)
     strategy::fee::Observation o;
     o.attributed   = true;
     o.submit_level = found->second.submit_level;
+    o.cls          = found->second.cls;   // [review #163] see Observation::cls
     o.now          = block;
     o.blocks       = static_cast<double>(strategy::fee::ticket_age(found->second, block));
     if (status == execution::WalletCancelState::Confirmed) {

@@ -886,10 +886,19 @@ fees:
   # controller_ff_max_age_blocks: 32 # A node reading older than this is dropped (node
   #                                  # unreachable): the learned fee then stands alone.
   # controller_budget_reserve_cancels: 25   # Budget held back from offer-attached fees so the
-  #                                  # book can still be cancelled: this many CAT cancels.
-  #                                  # With the controller ON an exhausted budget degrades
-  #                                  # fees to min_fee_mojos (one alert); it never returns
-  #                                  # 0 = "skip Step 8", which also stopped cancels.
+  #                                  # book can still be cancelled: this many CAT cancels at
+  #                                  # today's price, CAPPED at half of daily_budget_mojos so
+  #                                  # it can never exceed the budget itself.  [0, 1000]
+  #                                  # With the controller ON an exhausted budget degrades the
+  #                                  # OFFER-ATTACHED fee to min_fee_mojos (one FeeBudgetBound
+  #                                  # alert); it never returns 0 = "skip Step 8", which also
+  #                                  # stopped cancels.  A CANCEL or a TAKE is never degraded:
+  #                                  # min_fee_mojos on a 42.3M-cost CAT cancel is 0.35
+  #                                  # mojos/cost against the ~5 a full mempool admits, so a
+  #                                  # degraded cancel would never confirm, would keep its
+  #                                  # coins locked and would end in a wallet-wide
+  #                                  # force-delete.  It is paid in full and reported with one
+  #                                  # FeeBudgetUnfunded alert instead.
   # CLVM cost per action class, measured on the live wallet 2026-09-20 (321 spend
   # bundles costed with chia_rs).  fee = rate x cost, clamped to [min_fee, max_fee].
   # controller_cost_cancel_xch: 8400000      # cancel of an offer that offered XCH (8.33-8.38M)
@@ -898,13 +907,34 @@ fees:
   # controller_cost_offer_attached: 21000000 # maker's share of a fill; paid only if filled
   #
   # OPERATOR GUIDANCE at full-mempool fee levels (5 mojos/cost x 1.10 margin):
-  #   CAT cancel ~233M, XCH cancel ~46M, take ~690M mojos.  So:
+  #   CAT cancel 232650000, XCH cancel 46200000, take 687500000, offer-attached
+  #   115500000 mojos.  So:
   #   * max_fee_mojos 100000000 CANNOT get a CAT cancel or a take into a full
   #     mempool (the startup log says so).  Use >= 250000000 for cancels,
   #     >= 700000000 to cover takes.
-  #   * ~100 cancels + up to 6 takes a day is 0.01-0.04 XCH/day.  Size
-  #     daily_budget_mojos for the WINDOW: at fee_window_blocks 1662 (~8.7 h)
-  #     that is 5000000000-15000000000.
+  #   * daily_budget_mojos is spent over fee_window_blocks, NOT over a day, and
+  #     FeeTracker::record_fee books an attached fee for every offer POSTED.  At
+  #     the measured rate of this wallet (2026-09-20: 152 offers, 134 cancels
+  #     split 58 XCH / 76 CAT, up to 6 takes per DAY = 4608 peak heights) a full
+  #     mempool costs, per day,
+  #         152 x 115500000 = 17556000000   offer-attached
+  #          58 x  46200000 =  2679600000   XCH cancels
+  #          76 x 232650000 = 17681400000   CAT cancels
+  #           6 x 687500000 =  4125000000   takes
+  #                          -------------
+  #                           42042000000   per day
+  #     and at fee_window_blocks 1662 (~8.7 h) one WINDOW is
+  #         42042000000 x 1662 / 4608 = 15163585937 mojos.
+  #     The budget must not bind in ordinary operation, so carry twice that:
+  #         >= 30327171874.  Use 35000000000; 70000000000 is comfortable.
+  #     xop::strategy::fee::recommended_window_budget computes this from YOUR
+  #     costs, ff_margin and fee_window_blocks and the engine logs it (and warns
+  #     when daily_budget_mojos is below it) at startup, so the number here can
+  #     never be the stale one.
+  #     NB the range 5000000000-15000000000 recommended before 2026-09-20 was
+  #     wrong twice over: 5000000000 is LESS than the cancel reserve itself
+  #     (25 x 232650000 = 5816250000), and 15000000000 is about one window's
+  #     spend, so the budget bound continuously at either end.
   #   * strategy.cancel_escalation_max_fee_mojos caps the #157 re-cancel
   #     separately; raise it alongside max_fee_mojos.
 

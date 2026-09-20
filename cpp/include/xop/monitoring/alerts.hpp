@@ -140,6 +140,18 @@ enum class AlertRule : std::uint8_t {
                                // cooldown cannot swallow the one message
                                // that says why spends may stop confirming.
 
+    FeeBudgetUnfunded    = 23, // [S67, review #163] The budget could not fund
+                               // a CANCEL or a TAKE.  It was paid in full
+                               // anyway: a cancel priced below what the node
+                               // will admit never confirms, keeps its coins
+                               // locked and ends in a wallet-wide
+                               // force-delete.  Its own rule, not
+                               // FeeBudgetBound's, because that one says
+                               // "fees were lowered" and this one says "the
+                               // budget was exceeded on purpose" -- and
+                               // sharing a rule would let the 60 s cooldown
+                               // drop whichever arrived second.
+
     LedgerDivergence     = 16  // Books and wallet disagree beyond tolerance.
                                // Its own rule so accounting noise can never
                                // rate-limit or masquerade as ExposureBreach,

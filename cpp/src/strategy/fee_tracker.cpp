@@ -90,6 +90,38 @@ FeeTracker::FeeTracker(const FeeConfig& cfg)
                          "(controller_ki is 0, or every gain is) -- only the node floor "
                          "and the probes act");
         }
+        // [review #163 r3] FINDING 1: size the budget for the window it is
+        // actually spent over, at the prices the controller converges on.  One
+        // derivation serves this advisory and the range config.example.yaml
+        // recommends, so the documented number cannot drift from the code.
+        const std::uint64_t window_cost = strategy::fee::full_mempool_window_cost(
+            controller_.config().costs, controller_.config().ff_margin, cfg_.fee_window_blocks);
+        const std::uint64_t want_budget = strategy::fee::recommended_window_budget(
+            controller_.config().costs, controller_.config().ff_margin, cfg_.fee_window_blocks);
+        const std::uint64_t full_cancel = strategy::fee::fee_from_rate(
+            strategy::fee::kFullMempoolMinRate * controller_.config().ff_margin,
+            controller_.config().costs.cancel_cat);
+        const std::uint64_t n_reserve = cfg_.controller_budget_reserve_cancels;
+        const std::uint64_t uncapped_reserve =
+            (n_reserve != 0 && full_cancel > std::numeric_limits<std::uint64_t>::max() / n_reserve)
+                ? std::numeric_limits<std::uint64_t>::max()
+                : full_cancel * n_reserve;
+        spdlog::info("[FeeController] budget sizing: one window ({} peak heights) costs about {} "
+                     "mojos at full-mempool prices; the cancel reserve is {} x {} = {} mojos, "
+                     "capped at half the budget ({})",
+                     cfg_.fee_window_blocks, window_cost, n_reserve, full_cancel, uncapped_reserve,
+                     strategy::fee::budget_reserve(full_cancel, n_reserve,
+                                                   cfg_.daily_budget_mojos));
+        if (cfg_.daily_budget_mojos < want_budget) {
+            spdlog::warn("[FeeController] fees.daily_budget_mojos ({}) is below the {} mojos this "
+                         "configuration wants per window of {} peak heights (one window costs "
+                         "about {} at full-mempool prices, and the budget should not bind in "
+                         "ordinary operation). It WILL bind: offer-attached fees pin at "
+                         "fees.min_fee_mojos and one FeeBudgetBound alert fires. Cancels and "
+                         "takes are never degraded -- they are paid in full and reported "
+                         "FeeBudgetUnfunded.",
+                         cfg_.daily_budget_mojos, want_budget, cfg_.fee_window_blocks, window_cost);
+        }
         const strategy::fee::ActionClass all[strategy::fee::kActionClassCount] = {
             strategy::fee::ActionClass::OfferAttached, strategy::fee::ActionClass::CancelXch,
             strategy::fee::ActionClass::CancelCat, strategy::fee::ActionClass::Take};
@@ -353,24 +385,59 @@ bool FeeTracker::take_budget_bound_alert() noexcept
     return due;
 }
 
+bool FeeTracker::take_budget_unfunded_alert() noexcept
+{
+    const bool due = unfunded_alert_pending_;
+    unfunded_alert_pending_ = false;
+    return due;
+}
+
 std::uint64_t FeeTracker::controller_fee(strategy::fee::ActionClass action,
                                          BlockHeight current_block)
 {
     const std::uint64_t desired  = controller_.fee_for(action, current_block);
     const std::uint64_t headroom = budget_remaining(current_block);
 
-    // The reserve: enough budget to cancel the resting book at today's price.
+    // The reserve: enough budget to cancel the resting book at today's price,
+    // and [review #163 r3] NEVER more than half the budget.  The uncapped
+    // figure exceeds the whole budget at any plausible setting once the loop
+    // has converged on a full mempool -- 25 x 232,650,000 = 5,816,250,000 --
+    // which pinned every attached fee at min_fee from the first convergent
+    // heartbeat (strategy::fee::budget_reserve).
     const std::uint64_t cancel_fee =
         controller_.fee_for(strategy::fee::ActionClass::CancelCat, current_block);
-    const std::uint64_t n = cfg_.controller_budget_reserve_cancels;
-    const std::uint64_t reserve =
-        (n != 0 && cancel_fee > std::numeric_limits<std::uint64_t>::max() / n)
-            ? std::numeric_limits<std::uint64_t>::max()
-            : cancel_fee * n;
+    const std::uint64_t reserve = strategy::fee::budget_reserve(
+        cancel_fee, cfg_.controller_budget_reserve_cancels, cfg_.daily_budget_mojos);
 
     const strategy::fee::BudgetedFee budgeted = strategy::fee::apply_budget(
         desired, headroom, reserve, cfg_.min_fee_mojos, strategy::fee::is_priority(action),
         attached_batch_);
+
+    // [review #163 r3] A priority spend the budget cannot fund is PAID, and
+    // said out loud.  Degrading it to min_fee is what produced cancels the
+    // node would not admit; the budget's authority over a cancel ends at the
+    // report.  One alert per episode, cleared by the next funded cancel.
+    if (budgeted.over_budget) {
+        last_unfunded_fee_      = budgeted.fee;
+        last_unfunded_headroom_ = headroom;
+        last_unfunded_action_   = action;
+        if (!budget_unfunded_) {
+            budget_unfunded_        = true;
+            unfunded_alert_pending_ = true;
+            spdlog::warn("[FeeController] the fee budget CANNOT FUND a {}: it needs {} mojos "
+                         "(fees.max_fee_mojos and the node's own floor already bound that) and "
+                         "the window has {} left of {}. PAYING IT ANYWAY -- a cancel priced "
+                         "below what the node will admit never confirms, keeps its coins "
+                         "locked and ends in a wallet-wide force-delete. Raise "
+                         "fees.daily_budget_mojos.",
+                         strategy::fee::to_string(action), budgeted.fee, headroom,
+                         cfg_.daily_budget_mojos);
+        }
+    } else if (strategy::fee::is_priority(action) && budget_unfunded_) {
+        budget_unfunded_ = false;
+        spdlog::info("[FeeController] the fee budget funds priority spends again (headroom {} "
+                     "mojos)", headroom);
+    }
 
     if (budgeted.bound) {
         last_bound_desired_ = desired;
@@ -380,10 +447,12 @@ std::uint64_t FeeTracker::controller_fee(strategy::fee::ActionClass action,
             budget_alert_pending_ = true;
             spdlog::warn("[FeeController] the fee budget BINDS: {} wants {} mojos, the budget "
                          "allows {} (headroom {} of {} per {} peak heights, reserve {} for {} "
-                         "cancels). Fees degrade toward min_fee_mojos; nothing stops. Raise "
-                         "fees.daily_budget_mojos if spends stop confirming.",
+                         "cancels). Offer-attached fees degrade toward min_fee_mojos; cancels "
+                         "and takes are NOT degraded and nothing stops. Raise "
+                         "fees.daily_budget_mojos.",
                          strategy::fee::to_string(action), desired, budgeted.fee, headroom,
-                         cfg_.daily_budget_mojos, cfg_.fee_window_blocks, reserve, n);
+                         cfg_.daily_budget_mojos, cfg_.fee_window_blocks, reserve,
+                         cfg_.controller_budget_reserve_cancels);
         }
     } else if (!strategy::fee::is_priority(action) && budget_bound_) {
         // An offer-attached fee is the first thing the budget squeezes, so

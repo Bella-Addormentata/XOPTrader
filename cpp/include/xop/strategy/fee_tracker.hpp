@@ -175,6 +175,26 @@ public:
     [[nodiscard]] std::uint64_t last_bound_desired() const noexcept { return last_bound_desired_; }
     [[nodiscard]] std::uint64_t last_bound_allowed() const noexcept { return last_bound_allowed_; }
 
+    /// [review #163 r3] True ONCE per episode in which the budget could NOT
+    /// fund a priority spend (a cancel or a take).  That spend was paid in
+    /// full anyway -- a cancel priced below the node's admission floor never
+    /// confirms, keeps its coins locked and ends in a wallet-wide
+    /// force-delete -- so this is an alert about the BUDGET, not a degraded
+    /// fee.  The episode ends when a priority fee next fits the headroom.
+    [[nodiscard]] bool take_budget_unfunded_alert() noexcept;
+
+    /// The priority fee last paid over budget, the headroom it exceeded, and
+    /// what it was for.
+    [[nodiscard]] std::uint64_t last_unfunded_fee() const noexcept { return last_unfunded_fee_; }
+    [[nodiscard]] std::uint64_t last_unfunded_headroom() const noexcept
+    {
+        return last_unfunded_headroom_;
+    }
+    [[nodiscard]] strategy::fee::ActionClass last_unfunded_action() const noexcept
+    {
+        return last_unfunded_action_;
+    }
+
     [[nodiscard]] const strategy::fee::Controller& controller() const noexcept { return controller_; }
 
     // -- Accessors ----------------------------------------------------------
@@ -216,6 +236,15 @@ private:
     bool          budget_alert_pending_{false};
     std::uint64_t last_bound_desired_{0};
     std::uint64_t last_bound_allowed_{0};
+
+    /// [review #163 r3] The over-budget PRIORITY episode, kept apart from the
+    /// bound episode above: they mean different things to the operator and
+    /// neither must swallow the other.
+    bool          budget_unfunded_{false};
+    bool          unfunded_alert_pending_{false};
+    std::uint64_t last_unfunded_fee_{0};
+    std::uint64_t last_unfunded_headroom_{0};
+    strategy::fee::ActionClass last_unfunded_action_{strategy::fee::ActionClass::CancelCat};
 
     /// The controller path of get_recommended_fee.
     std::uint64_t controller_fee(strategy::fee::ActionClass action, BlockHeight current_block);

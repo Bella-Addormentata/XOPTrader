@@ -258,7 +258,10 @@ inline constexpr double kCeilTolerance = 1e-12;
 
 struct BudgetedFee {
     std::uint64_t fee{0};
-    bool          bound{false};   ///< the budget lowered the fee
+    bool          bound{false};        ///< the budget lowered the fee
+    /// [review #163 r3] A PRIORITY fee the budget could not fund.  It is paid
+    /// in full anyway and this says so, once, so the engine can alert.
+    bool          over_budget{false};
 };
 
 /// The rolling budget, made explicit.  Without the controller an exhausted
@@ -266,7 +269,24 @@ struct BudgetedFee {
 /// raises fees would then silently stop the bot from quoting AND from
 /// cancelling stale quotes.  With it:
 ///
-///   * a PRIORITY action (cancel, take) may use the whole headroom;
+///   * a PRIORITY action (cancel, take) is paid IN FULL, whatever is left of
+///     the budget.  [review #163 r3] It used to be degraded to min_fee like
+///     any other fee once the headroom ran out, and that reintroduced the
+///     exact failure this controller exists to remove: at full-mempool prices
+///     min_fee_mojos 15,000,000 on a 42,300,000-cost CAT cancel is 0.35
+///     mojos/cost against the node's ~5, i.e. 14x BELOW the admission floor,
+///     so the cancel never confirms, pending_change persists and Step 8
+///     force-deletes every unconfirmed transaction in the wallet (14 of those
+///     on 2026-09-20, with all 104 post batches pinned at the floor).  A
+///     cancel is the one spend that MUST confirm -- it frees locked coins --
+///     and `desired` is already the controller's own answer to "what does the
+///     node need", the feed-forward admission floor included
+///     (Controller::fee_for over effective_rate).  Submitting less than that
+///     is submitting a spend we ourselves believe cannot be mined.  The
+///     operator's ceiling on this is fees.max_fee_mojos, which has already
+///     clamped `desired`; the budget's remaining job for a priority spend is
+///     to REPORT (`over_budget`), which is an alertable condition, not a
+///     reason to pay a fee that cannot work;
 ///   * an offer-attached fee may use only the headroom above `reserve`, the
 ///     budget held back so the resting book can still be cancelled -- and
 ///     only a 1/`batch` share of it.  [review #163] Step 8 asks for ONE
@@ -274,13 +294,13 @@ struct BudgetedFee {
 ///     recording posted x fee afterwards, so a fee shaped for one offer let a
 ///     ladder of ten spend ten times the room above the reserve.  `batch` is
 ///     the number of offers the fee may be attached to before the budget is
-///     next consulted (the caller's upper bound; 0 counts as 1);
-///   * a PRIORITY action is NOT shaped by a batch, on purpose: a cancel that
-///     must happen pays, so for cancels the budget is a soft limit that one
-///     heartbeat can overshoot and the next degrades to min_fee;
+///     next consulted (the caller's upper bound; 0 counts as 1).  An attached
+///     fee is paid by a FILL that may never come and its own spend is the
+///     taker's, so degrading it strands nothing: it stays the first and only
+///     thing the budget squeezes;
 ///   * nothing is ever lowered below min_fee, the operator's own floor, and
-///     nothing is ever 0: an exhausted budget degrades every fee to min_fee
-///     and says so (`bound`), it does not stop the bot.
+///     nothing is ever 0: an exhausted budget degrades the attached fee to
+///     min_fee and says so (`bound`), it does not stop the bot.
 ///
 /// `desired` is already clamped to [min_fee, max_fee] by the caller.
 [[nodiscard]] constexpr BudgetedFee apply_budget(std::uint64_t desired,
@@ -290,27 +310,148 @@ struct BudgetedFee {
                                                  bool          priority,
                                                  std::uint64_t batch = 1U) noexcept
 {
+    if (priority) {
+        return BudgetedFee{desired, false, desired > headroom};
+    }
     const std::uint64_t above_reserve = headroom > reserve ? headroom - reserve : 0U;
-    const std::uint64_t available =
-        priority ? headroom : above_reserve / (batch == 0U ? 1U : batch);
+    const std::uint64_t available     = above_reserve / (batch == 0U ? 1U : batch);
     std::uint64_t fee = std::min(desired, available);
     if (fee < min_fee) {
         fee = std::min(desired, min_fee);
     }
-    return BudgetedFee{fee, fee < desired};
+    return BudgetedFee{fee, fee < desired, false};
 }
 
 static_assert(apply_budget(200U, 1'000U, 900U, 10U, true).fee == 200U);
 static_assert(apply_budget(200U, 1'000U, 900U, 10U, false).fee == 100U);
 static_assert(apply_budget(200U, 1'000U, 900U, 10U, false).bound);
-static_assert(apply_budget(200U, 0U, 0U, 10U, true).fee == 10U);
+// An exhausted budget does NOT price a cancel at min_fee: it pays what the
+// controller asked and flags the overrun.
+static_assert(apply_budget(200U, 0U, 0U, 10U, true).fee == 200U);
+static_assert(apply_budget(200U, 0U, 0U, 10U, true).over_budget);
+static_assert(!apply_budget(200U, 0U, 0U, 10U, true).bound);
 static_assert(!apply_budget(200U, 200U, 0U, 10U, true).bound);
+static_assert(!apply_budget(200U, 200U, 0U, 10U, true).over_budget);
+// An attached fee is still squeezed, and never reports an overrun.
+static_assert(apply_budget(200U, 0U, 0U, 10U, false).fee == 10U);
+static_assert(!apply_budget(200U, 0U, 0U, 10U, false).over_budget);
 // Ten offers share the 100 above the reserve: 10 each, not 100 each.
 static_assert(apply_budget(200U, 1'000U, 900U, 10U, false, 10U).fee == 10U);
 static_assert(apply_budget(200U, 1'000U, 900U, 1U, false, 4U).fee == 25U);
 static_assert(apply_budget(200U, 1'000U, 900U, 1U, false, 0U).fee == 100U);
-// A priority action is not shaped by the batch.
+// A priority action is not shaped by the batch, nor by the reserve.
 static_assert(apply_budget(200U, 1'000U, 900U, 10U, true, 10U).fee == 200U);
+
+// ---------------------------------------------------------------------------
+// Budget sizing -- ONE derivation for the code, the startup advisory and the
+// number config.example.yaml recommends, so the two cannot drift apart
+// ---------------------------------------------------------------------------
+
+/// [review #163 r3] The reserve may never exceed this share of the budget.
+///
+/// FINDING 1, and the arithmetic behind it.  The reserve is
+/// `controller_budget_reserve_cancels` CAT cancels AT TODAY'S PRICE.  Once the
+/// loop has converged on a full mempool that price is
+/// ceil(5.0 x 1.10 x 42,300,000) = 232,650,000 mojos, so the shipped default of
+/// 25 cancels asks for 5,816,250,000 -- MORE than the 5,000,000,000 bottom of
+/// the range config.example.yaml used to recommend for the window.  `headroom -
+/// reserve` was then 0 from the first convergent heartbeat: every
+/// offer-attached fee pinned at min_fee_mojos and FeeBudgetBound fired for
+/// ever, with no configuration of the reserve able to help.  Capping the
+/// reserve at half the budget makes that arithmetically impossible while
+/// keeping its meaning -- cancels have first claim on the budget, not all of
+/// it.  (The recommended range was wrong for a second reason too, which the
+/// cap does not fix; see recommended_window_budget below.)
+inline constexpr std::uint64_t kReserveBudgetShareDiv = 2U;
+
+[[nodiscard]] constexpr std::uint64_t budget_reserve(std::uint64_t cancel_fee,
+                                                     std::uint64_t cancels,
+                                                     std::uint64_t budget) noexcept
+{
+    const std::uint64_t want =
+        (cancels != 0U && cancel_fee > std::numeric_limits<std::uint64_t>::max() / cancels)
+            ? std::numeric_limits<std::uint64_t>::max()
+            : cancel_fee * cancels;
+    return std::min(want, budget / kReserveBudgetShareDiv);
+}
+
+// The live case: 25 CAT cancels at full-mempool prices is 5,816,250,000, which
+// the old 5e9 bottom of the documented range could not hold.
+static_assert(budget_reserve(232'650'000ULL, 25ULL, 5'000'000'000ULL) == 2'500'000'000ULL);
+static_assert(budget_reserve(232'650'000ULL, 25ULL, 30'000'000'000ULL) == 5'816'250'000ULL);
+static_assert(budget_reserve(1ULL, 0ULL, 100ULL) == 0ULL);
+static_assert(budget_reserve(std::numeric_limits<std::uint64_t>::max(), 2ULL, 100ULL) == 50ULL);
+static_assert(budget_reserve(7ULL, 3ULL, 0ULL) == 0ULL);
+
+/// Peak heights in a day: 4,608 at 18.75 s, never the ~52 s transaction-block
+/// figure (memory: block-cadence-conventions).
+inline constexpr std::uint32_t kPeakHeightsPerDay = 4'608U;
+
+/// What this wallet does in a DAY.  MEASURED 2026-09-20: offer_log shows 152
+/// offers posted and 134 cancels in 24 h, the three-day spend-bundle census
+/// behind ClassCosts splits cancels 133 XCH / 177 CAT (43% / 57%, so 58 / 76),
+/// and the drift corrector's quota is 6 takes.
+struct DailyActions {
+    std::uint32_t offers_posted{152};
+    std::uint32_t cancels_xch{58};
+    std::uint32_t cancels_cat{76};
+    std::uint32_t takes{6};
+};
+
+/// What ONE fee window costs with the mempool FULL -- the only regime in which
+/// the budget can bind, and the regime this controller exists for.  Every fee
+/// is at kFullMempoolMinRate x ff_margin mojos per cost.
+///
+/// Note this counts an offer-attached fee for every offer POSTED, because that
+/// is what FeeTracker::record_fee books (posted x fee, at post time) even
+/// though the fee is only really paid by a fill.  The budget is spent against
+/// the booking, so the sizing has to be too.
+[[nodiscard]] inline std::uint64_t full_mempool_window_cost(const ClassCosts&   costs,
+                                                            double              ff_margin,
+                                                            std::uint32_t       window_blocks,
+                                                            const DailyActions& a = {}) noexcept
+{
+    const double margin = (std::isfinite(ff_margin) && ff_margin >= 1.0) ? ff_margin : 1.0;
+    const double rate   = kFullMempoolMinRate * margin;
+    const double per_day =
+        static_cast<double>(a.offers_posted)
+            * static_cast<double>(fee_from_rate(rate, costs.offer_attached))
+        + static_cast<double>(a.cancels_xch)
+            * static_cast<double>(fee_from_rate(rate, costs.cancel_xch))
+        + static_cast<double>(a.cancels_cat)
+            * static_cast<double>(fee_from_rate(rate, costs.cancel_cat))
+        + static_cast<double>(a.takes) * static_cast<double>(fee_from_rate(rate, costs.take));
+    const double scaled = per_day * static_cast<double>(window_blocks)
+                        / static_cast<double>(kPeakHeightsPerDay);
+    if (!(scaled > 0.0)) {
+        return 0U;
+    }
+    if (!(scaled < kFeeCeilingDouble)) {
+        return kFeeCeiling;
+    }
+    return static_cast<std::uint64_t>(scaled);
+}
+
+/// Room for a day busier than the measured one.  The budget is a guard rail
+/// against a runaway loop, not a working constraint: it must NOT bind in
+/// ordinary full-mempool operation, because when it binds the attached fees
+/// pin at min_fee and every cancel is reported over budget.
+inline constexpr std::uint64_t kBudgetHeadroomMultiple = 2U;
+
+/// The smallest fees.daily_budget_mojos this configuration should carry.  At
+/// the shipped costs, ff_margin 1.10 and fee_window_blocks 1,662 this is
+/// 2 x 15,163,585,937 = 30,327,171,874 mojos -- SIX times the 5e9 the example
+/// file used to recommend, and twice its 15e9 top, which was itself almost
+/// exactly one window's spend.
+[[nodiscard]] inline std::uint64_t recommended_window_budget(const ClassCosts&   costs,
+                                                             double              ff_margin,
+                                                             std::uint32_t       window_blocks,
+                                                             const DailyActions& a = {}) noexcept
+{
+    const std::uint64_t one = full_mempool_window_cost(costs, ff_margin, window_blocks, a);
+    return one > kFeeCeiling / kBudgetHeadroomMultiple ? kFeeCeiling
+                                                       : one * kBudgetHeadroomMultiple;
+}
 
 // ---------------------------------------------------------------------------
 // The wallet's own word: sent_to
@@ -389,8 +530,9 @@ struct ControllerConfig {
     /// succeed / fail / succeed that kept the interval at its base forever:
     /// 9.3% of actions below the floor and a x1.81 swing, measured.
     ///
-    /// The cap is in on-target confirmations that TESTED the level (an XCH
-    /// cancel clamped up to min_fee does not).  Each failed retest leaves the
+    /// The cap is in on-target confirmations that TESTED the level -- a spend
+    /// that paid MORE than the loop would pay for its class today does not
+    /// (Controller::submitted_level_of).  Each failed retest leaves the
     /// two or three spends submitted at the probe level stuck, so the cap
     /// trades following a fallen floor against disturbing a fixed one:
     /// measured against the simulated floor, 64 put 4.0% of actions below the
@@ -433,6 +575,12 @@ struct Observation {
     /// known; `submit_level` is then level_of(fee paid, class).
     bool          attributed{false};
     double        submit_level{0.0};
+    /// [review #163 r3] The CLASS that spend belonged to, so `submit_level`
+    /// can be compared with the level the loop would really submit that class
+    /// at (Controller::submitted_level_of) rather than with the raw level.
+    /// Without it the on-target rule was unusable below the min_fee pin: see
+    /// the comment at step 3 of observe().
+    ActionClass   cls{ActionClass::CancelCat};
     /// Current peak height, for the dead-time rule.
     std::uint32_t now{0};
 };
@@ -606,6 +754,26 @@ public:
         return std::clamp(std::log2(rate / anchor_rate_), -kLevelAbsMax, kLevelAbsMax);
     }
 
+    /// The fee class `c` pays at the LEARNED level alone -- the
+    /// [min_fee, max_fee] clamp included, the feed-forward floor deliberately
+    /// NOT (a floor the node imposes says nothing about what the loop has
+    /// learned, and folding it in would let a spell of node-driven fees walk
+    /// the learned level down to the bottom of its band).
+    [[nodiscard]] std::uint64_t learned_fee_for(ActionClass c) const noexcept
+    {
+        return std::clamp(fee_from_rate(learned_rate(), cost_of(cfg_.costs, c)), min_fee_, max_fee_);
+    }
+
+    /// The level a spend of class `c` is REALLY submitted at while the loop
+    /// sits where it does: level_of() of the fee above.  Below the level at
+    /// which min_fee lifts that class this stops falling, which is precisely
+    /// why an observation's submit_level must be compared with THIS and never
+    /// with level() (see step 3 of observe()).
+    [[nodiscard]] double submitted_level_of(ActionClass c) const noexcept
+    {
+        return level_of(learned_fee_for(c), c);
+    }
+
     // -- feed-forward -------------------------------------------------------
 
     /// One node reading.  `estimate_rate` is get_fee_estimate's answer per
@@ -698,10 +866,30 @@ public:
         // 3. On target.
         if (!(err > 0.0)) {
             push_error(0.0);
-            // A confirmation says the rate it was SUBMITTED at works.  Paid
-            // above the level (clamped up by min_fee, or submitted before a
-            // probe-down), it says nothing about the level.
-            if (o.attributed && o.submit_level > level_ + kLevelEps) {
+            // A confirmation says the fee it was SUBMITTED at works.  Paid
+            // ABOVE what the loop would pay for that class now -- submitted
+            // before a probe-down, or escalated -- it says nothing about where
+            // the loop sits.
+            //
+            // [review #163 r3] FINDING 3.  This compared o.submit_level with
+            // level_, and those are not comparable quantities.  submit_level is
+            // level_of(fee PAID), and every fee the min_fee clamp LIFTS reads
+            // at that class's pin level however far below it the loop is: a CAT
+            // cancel at the shipped floor pays 15,000,000 on a 42,300,000 cost
+            // and reads 0 whether the level is 0, -0.23 or -1.5.  So the first
+            // probe-down from the starting level 0 -- eight on-target
+            // confirmations after boot -- made every later CAT cancel read
+            // "0 > level_", every on-target confirmation return HERE, and
+            // on_target() was never reached again: probe_confirms_ could not
+            // advance, probing_ could not clear, and the probe-down schedule
+            // was dead in exactly the region it exists to explore.
+            //
+            // The fix compares like with like: the level the spend was
+            // submitted at against the level this class is submitted at NOW,
+            // both through the same [min_fee, max_fee] clamp.  A spend that
+            // paid exactly what the loop would pay today has tested today's
+            // setting, whether or not the clamp is what decided the number.
+            if (o.attributed && o.submit_level > submitted_level_of(o.cls) + kLevelEps) {
                 out.reason = ChangeReason::OnTarget;
                 return out;
             }
@@ -1115,6 +1303,36 @@ inline constexpr std::size_t kMaxTickets = 512;
         && t.last_pending_block != now;
 }
 
+/// The censored observation a ticket that is still pending reports at `now`.
+/// The caller has already asked pending_observation_due().
+///
+/// [review #163 r3] This exists so the CLASS cannot be forgotten at the call
+/// site: an Observation without it defaults to CancelCat, and the on-target
+/// rule reads the wrong pin level for every XCH cancel and every take.
+[[nodiscard]] constexpr Observation observation_for_pending(const Ticket& t,
+                                                            std::uint32_t now) noexcept
+{
+    Observation o{};
+    o.signal       = Signal::Pending;
+    o.blocks       = static_cast<double>(ticket_age(t, now));
+    o.attributed   = true;
+    o.submit_level = t.submit_level;
+    o.cls          = t.cls;
+    o.now          = now;
+    return o;
+}
+
+static_assert(observation_for_pending(Ticket{ActionClass::CancelXch, 100U, 1.5, 0U, false, 0U},
+                                      112U).cls == ActionClass::CancelXch);
+static_assert(observation_for_pending(Ticket{ActionClass::Take, 100U, 1.5, 0U, false, 0U},
+                                      112U).cls == ActionClass::Take);
+static_assert(observation_for_pending(Ticket{ActionClass::Take, 100U, 1.5, 0U, false, 0U},
+                                      112U).blocks == 12.0);
+static_assert(observation_for_pending(Ticket{ActionClass::Take, 100U, 1.5, 0U, false, 0U},
+                                      112U).attributed);
+static_assert(observation_for_pending(Ticket{ActionClass::Take, 100U, 1.5, 0U, false, 0U},
+                                      112U).submit_level == 1.5);
+
 /// Has a ticket awaiting its verdict outlived kVerdictTtlBlocks?
 [[nodiscard]] constexpr bool verdict_expired(const Ticket& t, std::uint32_t now) noexcept
 {
@@ -1165,6 +1383,7 @@ struct VerdictObservation {
     out.observation.blocks       = static_cast<double>(confirmation_delay(t, observed_block));
     out.observation.attributed   = true;
     out.observation.submit_level = t.submit_level;
+    out.observation.cls          = t.cls;   // [review #163 r3] see Observation::cls
     out.observation.now          = now;
     return out;
 }
