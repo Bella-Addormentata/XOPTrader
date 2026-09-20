@@ -1343,6 +1343,13 @@ private:
     /// memory: a restart forgets them, and a cancel adopted at boot (fee
     /// unknown) never gets one.
     std::unordered_map<std::string, strategy::fee::Ticket> fee_tickets_;
+    /// [review #163 r2] The height the engine is working at NOW: the startup
+    /// height while the startup reconcile runs, then each cycle's own height,
+    /// stamped at the TOP of on_new_block_coro.  last_block_ cannot serve: it
+    /// is stored when a cycle ends, so it lags one cycle and is 0 at boot.
+    /// 0 means unknown, and a cancel observed then gets no ticket.  Engine
+    /// strand only, like fee_tickets_.
+    BlockHeight fee_now_block_{0};
     strategy::fee::ChangeLogGate fee_change_log_{};
 
     /// Send the queued CancelUnresolved alert when its window is open, and

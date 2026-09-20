@@ -2222,6 +2222,11 @@ asio::awaitable<void> Engine::poll_loop_coro()
             // [LEDGER] Anchor for genesis: fills that settled at or below
             // this height are already inside the opening wallet balance.
             startup_block_ = startup_block;
+            // [S67, review #163 r2] startup_reconcile() below issues SECURE
+            // cancels before the first cycle; they are ticketed at THIS height.
+            // If it could not be read it stays 0 and those cancels get no
+            // ticket at all (fee_feedback_track_cancel).
+            fee_now_block_ = startup_block;
 
             // Load what the DB remembers as pending.
             auto db_pending = db_->query_pending_offers();
@@ -3821,6 +3826,11 @@ asio::awaitable<void> Engine::run_startup_analysis()
 asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
 {
     spdlog::info("[Engine] Processing block {}", block_height);
+
+    // [S67, review #163 r2] The height THIS cycle works at, for the fee
+    // controller's tickets.  last_block_ is stored only when a cycle ENDS, so
+    // during cycle N it still reads N-1 (or 0 before the first one finishes).
+    fee_now_block_ = block_height;
 
     auto cycle_start = std::chrono::steady_clock::now();
 
@@ -21361,6 +21371,16 @@ void Engine::fee_feedback_track_cancel(const std::string& offer_id, std::uint64_
         && fee_tickets_.count(offer_id) == 0) {
         return;
     }
+    // [review #163 r2] The submission height is the cycle's own
+    // (fee_now_block_), NOT last_block_: that one lags a whole cycle, and is 0
+    // until the first cycle ends -- so a startup-reconcile cancel was ticketed
+    // at height 0 and its first sweep read an age of nine million heights, a
+    // maximum-error raise at every boot.  No known height, no ticket: a stale
+    // ticket for the same offer goes too, since this cancel replaced its spend.
+    if (fee_now_block_ == 0) {
+        fee_tickets_.erase(offer_id);
+        return;
+    }
     const PendingOffer po = state_->get_offer(offer_id);
     const PairConfig* pc = po.offer_id.empty() ? nullptr : find_pair_config(po.pair_name);
     const bool offered_is_xch = pc != nullptr
@@ -21368,7 +21388,7 @@ void Engine::fee_feedback_track_cancel(const std::string& offer_id, std::uint64_
     fee_tickets_.insert_or_assign(offer_id, fee_tracker_->make_ticket(
         pc != nullptr ? strategy::fee::cancel_class(offered_is_xch)
                       : strategy::fee::ActionClass::CancelCat,
-        fee, last_block_.load(std::memory_order_relaxed)));
+        fee, fee_now_block_));
 }
 
 void Engine::fee_feedback_on_cancel_verdict(const std::string& offer_id,
@@ -21385,7 +21405,7 @@ void Engine::fee_feedback_on_cancel_verdict(const std::string& offer_id,
     // Only a wallet-verified CANCELLED confirms the cancel spend; a FAILED
     // offer closes the ticket unheard (strategy::fee::
     // observation_for_cancel_verdict).
-    const BlockHeight now = last_block_.load(std::memory_order_relaxed);
+    const BlockHeight now = fee_now_block_;   // the cycle's height, not last_block_
     const strategy::fee::VerdictObservation v = strategy::fee::observation_for_cancel_verdict(
         it->second, wallet_says_cancelled, observed_block, now);
     fee_tickets_.erase(it);

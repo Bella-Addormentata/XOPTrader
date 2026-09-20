@@ -63,6 +63,12 @@ default to off, and with both off every fee is what v0.10.24 paid.
   replaces it. Only a wallet-verified CANCELLED closes it as a confirmation:
   `recheck_terminal` answers "still terminal" for FAILED too, and a FAILED
   offer says nothing about our fee. A cancel adopted at boot has no ticket.
+  A ticket's height is the height of the cycle that issued the spend (the
+  startup height for a cancel the startup reconcile issues), never the
+  last-processed-block marker, which trails by a cycle and is 0 at boot; with
+  no known height no ticket is opened, and a ticket at height 0 is never
+  evidence. Both fee bounds are capped at 2^63, so a floor above it cannot put
+  the minimum over the maximum.
 - **Observability.** One `[FeeController] rate a -> b mojos/cost (reason; n
   move(s)) -- fees now: ...` line per burst of changes, and two gauges,
   `xop_fees_controller_rate_mojos_per_cost` and `xop_fees_controller_level_log2`.

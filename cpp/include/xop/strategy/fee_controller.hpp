@@ -512,7 +512,13 @@ public:
                         std::uint64_t min_fee_mojos = 0,
                         std::uint64_t max_fee_mojos = 0)
         : cfg_{sanitised(cfg)}
-        , min_fee_{std::min(min_fee_mojos, max_fee_mojos)}
+        // [review #163 r2] BOTH bounds are capped at 2^63.  The parser accepts
+        // any uint64 for either, and capping only the ceiling left
+        // min_fee_ > max_fee_ whenever min_fee_mojos exceeded 2^63 -- after
+        // which std::clamp(raw, min_fee_, max_fee_) in fee_for() is called
+        // with lo > hi, which is undefined behaviour.  min(a,b) <= max(a,b)
+        // and the same cap on each keeps min_fee_ <= max_fee_ for EVERY input.
+        , min_fee_{std::min(std::min(min_fee_mojos, max_fee_mojos), kFeeCeiling)}
         , max_fee_{std::min(std::max(min_fee_mojos, max_fee_mojos), kFeeCeiling)}
     {
         // level 0 <=> a CAT cancel, the commonest spend, pays EXACTLY min_fee,
@@ -1087,10 +1093,24 @@ inline constexpr std::size_t kMaxTickets = 512;
 
 /// Is a Pending observation due for this ticket at `now`?  Only past the
 /// target, only while it is still pending, and once per height.
+/// [review #163 r2] A ticket is evidence only if its submission height is
+/// KNOWN.  Height 0 is "not known": the engine's height is 0 until the first
+/// one is read, and a cancel issued by the startup reconcile was once ticketed
+/// there.  Its first sweep then measured an age of nine million heights -- a
+/// maximum-error raise at every boot, from a spend that was seconds old.
+/// Unknown is its own state and it authorises nothing (coin_pool_verdict.hpp):
+/// such a ticket is never due and never yields a verdict observation.  The
+/// engine does not open one either; this is the second line.
+[[nodiscard]] constexpr bool ticket_is_usable(const Ticket& t) noexcept
+{
+    return t.submit_block != 0U;
+}
+
 [[nodiscard]] constexpr bool pending_observation_due(const Ticket& t, std::uint32_t now,
                                                      std::uint32_t target_delay_blocks) noexcept
 {
-    return !t.awaiting_verdict
+    return ticket_is_usable(t)
+        && !t.awaiting_verdict
         && ticket_age(t, now) > target_delay_blocks
         && t.last_pending_block != now;
 }
@@ -1104,8 +1124,10 @@ inline constexpr std::size_t kMaxTickets = 512;
 
 /// The confirmation delay of a ticket whose spend landed at
 /// `confirmed_block`, in peak heights; 0 when the verdict height is behind
-/// the submission (the first sighting can trail the real submission by one
-/// heartbeat, never lead it).
+/// the submission (a height regression; never a wrapped four billion).  The
+/// submission height is the height of the engine cycle that issued the spend
+/// -- stamped when the cycle STARTS, not the last-processed-block marker that
+/// trails it by a cycle.
 [[nodiscard]] constexpr std::uint32_t confirmation_delay(const Ticket& t,
                                                          std::uint32_t confirmed_block) noexcept
 {
@@ -1133,6 +1155,11 @@ struct VerdictObservation {
     if (!wallet_says_cancelled) {
         return out;
     }
+    // [review #163 r2] A delay measured from an UNKNOWN submission height is
+    // observed_block - 0: millions of heights "late", a maximum-error raise.
+    if (!ticket_is_usable(t)) {
+        return out;
+    }
     out.has                      = true;
     out.observation.signal       = Signal::Confirmed;
     out.observation.blocks       = static_cast<double>(confirmation_delay(t, observed_block));
@@ -1142,8 +1169,14 @@ struct VerdictObservation {
     return out;
 }
 
-static_assert(!observation_for_cancel_verdict(Ticket{}, false, 10U, 10U).has);
-static_assert(observation_for_cancel_verdict(Ticket{}, true, 10U, 10U).has);
+static_assert(!observation_for_cancel_verdict(Ticket{ActionClass::CancelCat, 5U, 0.0, 0U, false, 0U},
+                                              false, 10U, 10U).has);
+static_assert(observation_for_cancel_verdict(Ticket{ActionClass::CancelCat, 5U, 0.0, 0U, false, 0U},
+                                             true, 10U, 10U).has);
+// A ticket at height 0 -- submission height unknown -- is never evidence.
+static_assert(!ticket_is_usable(Ticket{}));
+static_assert(!observation_for_cancel_verdict(Ticket{}, true, 9'319'293U, 9'319'293U).has);
+static_assert(!pending_observation_due(Ticket{}, 9'319'293U, 8U));
 static_assert(confirmation_delay(Ticket{ActionClass::Take, 100U, 0.0, 0U, false, 0U}, 96U) == 0U);
 static_assert(pending_observation_due(Ticket{ActionClass::Take, 100U, 0.0, 0U, false, 0U}, 109U, 8U));
 static_assert(!pending_observation_due(Ticket{ActionClass::Take, 100U, 0.0, 0U, false, 0U}, 108U, 8U));

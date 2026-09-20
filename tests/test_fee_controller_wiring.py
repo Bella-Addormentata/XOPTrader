@@ -296,7 +296,7 @@ def test_cancel_tickets_open_at_the_accepted_rpc_with_the_fee_really_paid():
     track = _function_body(engine, "void Engine::fee_feedback_track_cancel(")
     # The ticket carries the fee the observer was GIVEN, never a policy lookup.
     args = _call_arguments(track, "fee_tracker_->make_ticket")
-    assert len(args) == 1 and re.search(r",\s*fee,\s*last_block_\.load\(", args[0]), args
+    assert len(args) == 1 and re.search(r",\s*fee,\s*fee_now_block_\s*$", args[0]), args
     assert "cancel_fee_for(" not in track and "get_recommended_fee(" not in track
     assert "insert_or_assign(offer_id" in track, "a re-cancel replaces the ticket"
 
@@ -304,6 +304,40 @@ def test_cancel_tickets_open_at_the_accepted_rpc_with_the_fee_really_paid():
     # therefore never has one.
     sweep = _function_body(engine, "asio::awaitable<void> Engine::fee_feedback_sweep(")
     assert "make_ticket" not in sweep and "fee_tickets_.emplace" not in sweep
+
+
+def test_cancel_tickets_are_opened_at_the_cycle_height_never_at_last_block():
+    """[review #163 r2] last_block_ is stored only when a cycle ENDS, so during
+    cycle N it reads N-1 and before the first cycle ends it reads 0.  A cancel
+    issued by the startup reconcile was ticketed at height 0, and its first
+    sweep measured an age of nine million heights: a maximum-error raise at
+    every boot.  Tickets use the cycle's own height, and none is opened while
+    that height is unknown."""
+    engine = _engine()
+    # last_block_ really is stored in exactly one place, at the end of a cycle:
+    # the premise of this test, pinned so a change to it is noticed here.
+    assert len(re.findall(r"last_block_\.store\(", engine)) == 1
+    cycle = _function_body(engine, "asio::awaitable<void> Engine::on_new_block_coro(")
+    stamp = cycle.index("fee_now_block_ = block_height;")
+    assert stamp < cycle.index("cycle_.clear();"), "stamped FIRST, before any step can cancel"
+    assert stamp < cycle.index("last_block_.store(block_height")
+    assert len(re.findall(r"fee_now_block_\s*=", cycle)) == 1
+
+    # Startup: stamped with the startup height BEFORE the reconcile that cancels.
+    boot = engine.index("fee_now_block_ = startup_block;")
+    assert engine.index("startup_block_ = startup_block;") < boot
+    assert boot < engine.index("offer_mgr_->startup_reconcile(")
+    # Those are the only two writers.
+    assert len(re.findall(r"fee_now_block_\s*=[^=]", engine)) == 2
+
+    track = _function_body(engine, "void Engine::fee_feedback_track_cancel(")
+    unknown = track.index("if (fee_now_block_ == 0) {")
+    ticket = track.index("fee_tracker_->make_ticket(")
+    assert unknown < ticket, "no known height, no ticket"
+    assert re.search(r"if \(fee_now_block_ == 0\) \{\s*fee_tickets_\.erase\(offer_id\);\s*return;", track)
+    assert "last_block_" not in track
+    verdict = _function_body(engine, "void Engine::fee_feedback_on_cancel_verdict(")
+    assert "last_block_" not in verdict and "fee_now_block_" in verdict
 
 
 def test_only_a_wallet_verified_cancelled_reaches_the_controller():

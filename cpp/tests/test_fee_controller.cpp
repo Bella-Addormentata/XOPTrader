@@ -355,6 +355,52 @@ TEST(FeeController, OutOfRangeTuningFallsBackToTheDefaults)
     EXPECT_EQ(c.config().costs.cancel_cat, d.costs.cancel_cat);
 }
 
+TEST(FeeController, BothBoundsAreCappedSoMinNeverExceedsMax)
+{
+    // [review #163 r2] The parser accepts any uint64 for min_fee_mojos and
+    // max_fee_mojos.  Capping only the ceiling at 2^63 left min > max for a
+    // floor above it, and std::clamp(raw, lo, hi) with lo > hi is undefined.
+    // The precondition itself is asserted FIRST, so a regression stops here
+    // and never reaches the undefined call below.
+    constexpr std::uint64_t kTop = std::numeric_limits<std::uint64_t>::max();
+    struct Bounds { std::uint64_t lo; std::uint64_t hi; };
+    const Bounds cases[] = {
+        {fee::kFeeCeiling + 5U, kTop},            // both above: the reported case
+        {kTop, kTop},
+        {kTop, fee::kFeeCeiling + 1U},            // swapped AND above
+        {fee::kFeeCeiling, kTop},                 // floor exactly at the cap
+        {fee::kFeeCeiling + 1U, 5U},              // swapped: the ceiling is tiny
+        {fee::kFeeCeiling - 1U, fee::kFeeCeiling + 1U},
+    };
+    for (const Bounds& b : cases) {
+        const Controller c{on_config(), b.lo, b.hi};
+        ASSERT_LE(c.min_fee(), c.max_fee()) << b.lo << " / " << b.hi;
+        ASSERT_LE(c.max_fee(), fee::kFeeCeiling);
+        for (const ActionClass cls : {ActionClass::OfferAttached, ActionClass::CancelXch,
+                                      ActionClass::CancelCat, ActionClass::Take}) {
+            const std::uint64_t f = c.fee_for(cls, 100);
+            EXPECT_GE(f, c.min_fee());
+            EXPECT_LE(f, c.max_fee());
+        }
+        EXPECT_LE(c.level_lo(), 0.0);
+        EXPECT_GE(c.level_hi(), 0.0);
+        EXPECT_TRUE(std::isfinite(c.anchor_rate()));
+    }
+    const Controller both{on_config(), fee::kFeeCeiling + 5U, kTop};
+    EXPECT_EQ(both.min_fee(), fee::kFeeCeiling);
+    EXPECT_EQ(both.max_fee(), fee::kFeeCeiling);
+    EXPECT_EQ(both.fee_for(ActionClass::Take, 100), fee::kFeeCeiling);
+    // The same through FeeTracker, which hands the config's numbers over raw.
+    xop::FeeConfig cfg;
+    cfg.enabled = true;
+    cfg.controller_enabled = true;
+    cfg.min_fee_mojos = fee::kFeeCeiling + 5U;
+    cfg.max_fee_mojos = kTop;
+    cfg.daily_budget_mojos = kTop;
+    xop::FeeTracker t{cfg};
+    EXPECT_EQ(t.get_recommended_fee(1, 100, ActionClass::CancelCat), fee::kFeeCeiling);
+}
+
 TEST(FeeController, SwappedBoundsAndZeroMinFeeStayWellDefined)
 {
     const Controller swapped{on_config(), /*min=*/100'000'000ULL, /*max=*/5'000'000ULL};
@@ -904,6 +950,83 @@ TEST(FeeBudget, OneAttachedFeeIsSharedAcrossTheBatchItWillBeAttachedTo)
     EXPECT_EQ(fee::apply_budget(200, 1'000, 900, 50, false, 10).fee, 50U);
     // Cancels and takes are not shaped by the batch.
     EXPECT_EQ(fee::apply_budget(200, 1'000, 900, 1, true, 10).fee, 200U);
+}
+
+/// One heartbeat of the engine's sweep over ONE cancel ticket, exactly as
+/// Engine::fee_feedback_sweep drives the pure rules: a censored observation
+/// when one is due.  Returns true when the controller was told something.
+bool sweep_one_ticket(Controller& c, fee::Ticket& t, std::uint32_t now)
+{
+    if (!fee::pending_observation_due(t, now, c.config().target_delay_blocks)) {
+        return false;
+    }
+    t.last_pending_block = now;
+    c.observe(pending(static_cast<double>(fee::ticket_age(t, now)), t.submit_level, now));
+    return true;
+}
+
+TEST(FeeTicket, ACancelObservedDuringStartupReconcileNeverRaisesTheFeeAtBoot)
+{
+    // [review #163 r2] The engine's height is 0 until the first one is read,
+    // and last_block_ stays 0 until the first CYCLE ends.  startup_reconcile()
+    // cancels orphans before that, and its cancels were ticketed at height 0:
+    // at the first sweep (live peak height 9,319,293) each looked nine million
+    // heights late -- a maximum-error raise at every boot, from a spend that
+    // was seconds old.
+    constexpr std::uint32_t kLivePeak = 9'319'293U;
+    xop::FeeConfig tracker_cfg;
+    tracker_cfg.enabled            = true;
+    tracker_cfg.controller_enabled = true;
+    tracker_cfg.min_fee_mojos      = kMinFee;
+    tracker_cfg.max_fee_mojos      = kMaxFee;
+    xop::FeeTracker tracker{tracker_cfg};
+    fee::Ticket boot = tracker.make_ticket(ActionClass::CancelCat, kMinFee, /*current_block=*/0);
+    ASSERT_EQ(boot.submit_block, 0U);
+    EXPECT_FALSE(fee::ticket_is_usable(boot));
+
+    Controller c{on_config(/*warmup=*/0), kMinFee, kMaxFee};
+    // Heartbeat after heartbeat, three such cancels in flight: nothing is said.
+    for (std::uint32_t h = kLivePeak; h < kLivePeak + 40U; ++h) {
+        for (int i = 0; i < 3; ++i) {
+            EXPECT_FALSE(sweep_one_ticket(c, boot, h));
+        }
+    }
+    EXPECT_DOUBLE_EQ(c.level(), 0.0);
+    EXPECT_EQ(c.fee_for(ActionClass::CancelCat, kLivePeak + 40U), kMinFee);
+    // Its wallet verdict is not a (nine-million-height-late) confirmation either.
+    EXPECT_FALSE(fee::observation_for_cancel_verdict(boot, true, kLivePeak + 3U, kLivePeak + 3U).has);
+
+    // The SAME cancel ticketed at the startup height -- what the engine does
+    // now -- behaves like any other: silent inside the target, heard after it,
+    // and a verdict three heights on is an on-target confirmation.
+    fee::Ticket known = tracker.make_ticket(ActionClass::CancelCat, kMinFee, kLivePeak);
+    EXPECT_TRUE(fee::ticket_is_usable(known));
+    for (std::uint32_t h = kLivePeak; h <= kLivePeak + kT; ++h) {
+        EXPECT_FALSE(sweep_one_ticket(c, known, h)) << h - kLivePeak;
+    }
+    EXPECT_DOUBLE_EQ(c.level(), 0.0);
+    const auto v = fee::observation_for_cancel_verdict(known, true, kLivePeak + 3U, kLivePeak + 4U);
+    ASSERT_TRUE(v.has);
+    EXPECT_DOUBLE_EQ(v.observation.blocks, 3.0);
+    EXPECT_EQ(c.observe(v.observation).reason, ChangeReason::OnTarget);
+    EXPECT_TRUE(sweep_one_ticket(c, known, kLivePeak + kT + 1U));   // genuinely late: heard
+    EXPECT_GT(c.level(), 0.0);
+}
+
+TEST(FeeTicket, OneHeightOfStaleSubmissionHeightIsOneHeightOfFalseLateness)
+{
+    // The other half of the same finding: last_block_ lags the running cycle by
+    // at least one height, so a ticket stamped from it aged every cancel one
+    // height early.  The rule is exact -- due strictly AFTER target heights
+    // from the TRUE submission height -- which is why the stamp has to be.
+    fee::Ticket truth;
+    truth.submit_block = 1'000;
+    fee::Ticket stale = truth;
+    stale.submit_block = 999;                      // what last_block_ said during cycle 1000
+    EXPECT_FALSE(fee::pending_observation_due(truth, 1'000 + kT, kT));
+    EXPECT_TRUE(fee::pending_observation_due(stale, 1'000 + kT, kT));    // heard a height early
+    EXPECT_EQ(fee::confirmation_delay(truth, 1'000 + kT), kT);           // on target
+    EXPECT_EQ(fee::confirmation_delay(stale, 1'000 + kT), kT + 1U);      // "late"
 }
 
 TEST(FeeTicket, OnlyAWalletVerifiedCancelledIsAConfirmation)
