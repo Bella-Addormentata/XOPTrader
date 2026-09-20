@@ -181,11 +181,30 @@ struct ExposureDecision {
     if (reserve_mojos <= 0) return 0;
     if (!(hysteresis_pct > 0.0)) return reserve_mojos;   // also NaN
     if (hysteresis_pct >= 1.0)   return 0;
-    const double floor_d =
-        static_cast<double>(reserve_mojos) * (1.0 - hysteresis_pct);
-    const Mojo floor_m = static_cast<Mojo>(floor_d);      // in [0, reserve]
+    const double reserve_d = static_cast<double>(reserve_mojos);
+    const double floor_d   = reserve_d * (1.0 - hysteresis_pct);
+    // [review #164] NOT "in [0, reserve]", as this line used to claim.  A
+    // reserve near Mojo max converts to a double that rounds UP -- to exactly
+    // 2^63 -- and 1.0 - h rounds to 1.0 for a tiny h, so floor_d can be 2^63,
+    // which no Mojo holds: the cast below would be undefined behaviour.  The
+    // same trap crossed_book.hpp records ("a previous saturation clamp in
+    // this repo rounded to 2^63 and passed MSVC while failing GCC").  Anything
+    // not strictly below reserve_d is "no discount": answer the reserve.
+    // What remains satisfies 0 <= floor_d < reserve_d <= 2^63, so it fits.
+    if (!(floor_d < reserve_d)) return reserve_mojos;
+    const Mojo floor_m = static_cast<Mojo>(floor_d);
     return floor_m > reserve_mojos ? reserve_mojos : floor_m;
 }
+
+// Evaluated by the COMPILER, so the out-of-range cast above cannot come back
+// unnoticed on a toolchain whose runtime happens to hide it: constant
+// evaluation forbids undefined behaviour outright.
+static_assert(exposure_cancel_floor(std::numeric_limits<Mojo>::max(), 1e-20)
+                  == std::numeric_limits<Mojo>::max(),
+              "a reserve that rounds up to 2^63 as a double must not be cast");
+static_assert(exposure_cancel_floor(Mojo{100'000'000'000}, 0.25)
+                  == Mojo{75'000'000'000},
+              "0.1 XCH at the default hysteresis is 0.075 XCH");
 
 /// The Step 8 exposure verdict.  Both sites call this; the post-hoc site
 /// passes planned_spend_mojos = 0.

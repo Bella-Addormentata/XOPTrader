@@ -280,6 +280,29 @@ TEST(ExposureRule, CancelFloorIsTheReserveScaledDownAndExactAtTheEnds) {
     EXPECT_EQ(exposure_cancel_floor(kMojo(-9), 0.25), kMojo(0));
 }
 
+TEST(ExposureRule, CancelFloorNeverCastsOutOfRange) {
+    // [review #164] (double)INT64_MAX rounds UP to exactly 2^63, and
+    // 1.0 - 1e-20 rounds to 1.0, so the product is 2^63 -- which no Mojo
+    // holds, and the unchecked cast is undefined behaviour.  The header also
+    // pins this with a static_assert, so a compiler that evaluates it refuses
+    // to BUILD the defect rather than run it.
+    const Mojo big = std::numeric_limits<Mojo>::max();
+    EXPECT_EQ(exposure_cancel_floor(big, 1e-20), big);
+    EXPECT_EQ(exposure_cancel_floor(big, std::numeric_limits<double>::denorm_min()),
+              big);
+    EXPECT_EQ(exposure_cancel_floor(big - 1, 1e-20), big - 1);
+    // A real hysteresis on the same reserve still scales, and stays a Mojo.
+    const Mojo quarter_off = exposure_cancel_floor(big, 0.25);
+    EXPECT_GT(quarter_off, big / 2);
+    EXPECT_LT(quarter_off, big);
+    // And the verdict built on it: nothing resting, everything owned -- Ok,
+    // not a cancel reasoned from a negative floor or a wrapped one.
+    ExposureInputs in;
+    in.owned_mojos   = big;
+    in.reserve_mojos = big;
+    EXPECT_EQ(decide_exposure(true, in, 1e-20).verdict, ExposureVerdict::Ok);
+}
+
 TEST(ExposureRule, UnifiedSuppressesInsideTheBandAndCancelsOnlyBelowIt) {
     // Resting alone leaves 0.09 XCH against a 0.1 reserve and a 0.075 cancel
     // floor: short of the reserve, so no new exposure -- but not worth a fee.

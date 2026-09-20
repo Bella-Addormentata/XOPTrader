@@ -3330,6 +3330,48 @@ TEST(CancelReductionConfig, ExpireWithNothingToExpireIsRefused) {
         "ttl_cancel_mode");
 }
 
+TEST(CancelReductionConfig, ExpireCountsEachPairsEffectiveExpiry) {
+    // [review #164] A present 0 override BINDS (effective_offer_expiry_secs),
+    // so a global expiry that the only pair opts out of attaches no timelock
+    // to anything.  The first revision counted the global regardless.
+    expect_config_error_containing(
+        pace_after_first_pair(
+            pace_with_strategy("  ttl_cancel_mode: expire\n  offer_expiry_secs: 86400\n"),
+            "    offer_expiry_secs_override: 0\n"),
+        "ttl_cancel_mode");
+    // Two enabled pairs, one opted out, one inheriting the global: satisfied.
+    expect_loads(pace_after_first_pair(
+        pace_with_strategy("  ttl_cancel_mode: expire\n  offer_expiry_secs: 86400\n"),
+        "    offer_expiry_secs_override: 0\n"
+        "  - base_asset_id: \"xch\"\n"
+        "    quote_asset_id: \"" + std::string(kTest2) + "\"\n"
+        "    name: \"XCH/OTHER\"\n"
+        "    enabled: true\n"));
+}
+
+TEST(CancelReductionConfig, ExpireIgnoresPairsThatPostNothing) {
+    // The enabled pair opts out; the only pair with an effective expiry is
+    // DISABLED, so no offer this engine posts carries one.
+    expect_config_error_containing(
+        pace_after_first_pair(
+            pace_with_strategy("  ttl_cancel_mode: expire\n  offer_expiry_secs: 86400\n"),
+            "    offer_expiry_secs_override: 0\n"
+            "  - base_asset_id: \"xch\"\n"
+            "    quote_asset_id: \"" + std::string(kTest2) + "\"\n"
+            "    name: \"XCH/OTHER\"\n"
+            "    enabled: false\n"),
+        "ENABLED pair");
+    // No enabled pair at all: nothing is posted, so there is nothing for the
+    // mode to mislead about -- an operator who has parked every pair must
+    // still be able to start the engine.
+    std::string parked = pace_with_strategy("  ttl_cancel_mode: expire\n");
+    const std::string on = "    enabled: true\n";
+    const auto at = parked.find(on);
+    ASSERT_NE(at, std::string::npos);
+    parked.replace(at, on.size(), "    enabled: false\n");
+    expect_loads(parked);
+}
+
 TEST(CancelReductionConfig, ExpireIsSatisfiedByTheGlobalOrByOnePair) {
     expect_loads(pace_with_strategy(
         "  ttl_cancel_mode: expire\n  offer_expiry_secs: 86400\n"));

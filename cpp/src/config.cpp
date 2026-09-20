@@ -15,6 +15,7 @@
 // ISO/IEC 25000 -- clear error messages citing the offending field.
 
 #include "xop/config.hpp"
+#include "xop/execution/offer_expiry.hpp"
 #include "xop/rpc/coingecko_parse.hpp"
 #include "xop/feed_listings.hpp"
 #include "xop/strategy/pid_reachability.hpp"
@@ -4507,20 +4508,37 @@ AppConfig load_config(const std::string& path,
     // read as "age cancels are off" -- so refuse the combination at load,
     // naming the way out, rather than let the operator watch ttl_expired
     // cancels continue under a mode that claims to have stopped them.
+    //
+    // [review #164] Judged on each pair's EFFECTIVE expiry, through the one
+    // function the posting path uses (execution::effective_offer_expiry_secs):
+    // a present 0 override BINDS, so a global expiry that every pair opts out
+    // of attaches no timelock anywhere.  The first revision counted the global
+    // regardless and accepted exactly that config.  Only ENABLED pairs count:
+    // a disabled pair posts nothing, and enabling one needs a restart, which
+    // re-runs this check.  With no enabled pair at all there is nothing for
+    // the mode to mislead about, and the config loads.
     if (cfg.strategy.ttl_cancel_mode == TtlCancelMode::Expire) {
-        bool any_expiry = cfg.strategy.offer_expiry_secs > 0;
+        bool any_enabled = false;
+        bool any_expiry  = false;
         for (const auto& p : cfg.pairs) {
-            if (p.offer_expiry_secs_override.value_or(0u) > 0u) {
+            if (!p.enabled) {
+                continue;
+            }
+            any_enabled = true;
+            if (execution::effective_offer_expiry_secs(
+                    p.offer_expiry_secs_override,
+                    cfg.strategy.offer_expiry_secs) > 0u) {
                 any_expiry = true;
             }
         }
-        if (!any_expiry) {
+        if (any_enabled && !any_expiry) {
             throw ConfigError(
                 "strategy.ttl_cancel_mode: expire requires an on-chain expiry "
-                "-- set strategy.offer_expiry_secs (or a pair's "
-                "offer_expiry_secs_override) above 0, or set ttl_cancel_mode "
-                "back to 'cancel'. With no expiry attached, every offer keeps "
-                "the hard TTL and the mode changes nothing.");
+                "on at least one ENABLED pair -- set strategy.offer_expiry_secs "
+                "above 0 (a pair's offer_expiry_secs_override: 0 opts that pair "
+                "out), or give a pair its own offer_expiry_secs_override, or "
+                "set ttl_cancel_mode back to 'cancel'. With no expiry attached, "
+                "every offer keeps the hard TTL and the mode changes nothing.");
         }
     }
 
