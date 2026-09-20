@@ -329,3 +329,37 @@ def test_a_close_with_no_bridge_at_all_still_closes(window, monkeypatch):
     window.closeEvent(event)
     assert calls == []
     assert event.isAccepted()
+
+
+def test_the_session_end_signal_is_real_on_this_qt_and_our_slot_marks_the_quit(app):
+    """[review #165, round 3] The OS-session-end row was pinned by a SOURCE SCAN
+    only (tests/test_stop_offers.py reads gui/main.py as text).
+
+    Nothing here can make Qt emit ``commitDataRequest``: that needs a real
+    log-off, and its argument is a ``QSessionManager`` a test cannot construct.
+    So this pins the two halves that CAN be checked at run time --
+
+    * the signal this PySide6/Qt build offers is the one ``gui/main.py``
+      connects to, and it accepts our slot. A rename or a signature change
+      would fail HERE rather than at the operator's log-off, where the symptom
+      is a modal prompt holding up a shutdown nobody can answer;
+    * the slot itself marks the quit non-interactive when it is called.
+
+    That Qt actually calls it at a session end is Qt's contract, not this
+    repo's, and remains unverified by any test -- the PR body says so.
+    """
+    from gui import main as gui_main
+
+    assert hasattr(app, "commitDataRequest"), (
+        "this Qt build has no QGuiApplication.commitDataRequest: gui/main.py "
+        "would raise at startup, or silently never be told the session is ending")
+    app.commitDataRequest.connect(gui_main._on_session_ending)
+    try:
+        stop_offers.reset_noninteractive_quit()
+        gui_main._on_session_ending(None)
+        assert stop_offers.noninteractive_quit_reason() == "OS session end", (
+            "the session-end slot no longer marks the quit non-interactive: a "
+            "log-off would reach the stop prompt with nobody to answer it")
+    finally:
+        app.commitDataRequest.disconnect(gui_main._on_session_ending)
+        stop_offers.reset_noninteractive_quit()

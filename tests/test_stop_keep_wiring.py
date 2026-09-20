@@ -161,7 +161,8 @@ def _shutdown() -> str:
 
 def _continuation(shutdown: str) -> str:
     """The coroutine shutdown() posts: everything from its co_spawn on."""
-    at = shutdown.find("asio::co_spawn(ioc_,[this,cancels_book,keeps_book]()")
+    at = shutdown.find(
+        "asio::co_spawn(ioc_,[this,cancels_book,keeps_book,drain_budget_ms]()")
     assert at != -1, "the shutdown continuation no longer captures the stop plan"
     return shutdown[at:]
 
@@ -314,12 +315,13 @@ def test_a_keep_stop_waits_for_an_in_flight_post_and_only_so_long():
     gtest-pinned (KeepStopDrain); this pins that the keep branch asks it, with
     the engine's own flag and the header's budget, waits on a timer only, and
     gives up rather than hang."""
-    coro = _continuation(_shutdown())
+    code = _shutdown()
+    coro = _continuation(code)
     keep = _block(coro, "elseif(keeps_book){")
     loop = _block(keep, "for(;;){")
     _in_order(loop, [
         "util::keep_stop_drain_step(posting_in_flight_,waited_for_post_ms,"
-        + "util::kKeepStopDrainBudgetMs);",
+        + "drain_budget_ms);",
         "if(drain==util::KeepStopDrainStep::Proceed)break;",
         "if(drain==util::KeepStopDrainStep::GiveUp){post_abandoned=true;break;}",
         "drain_timer.expires_after(std::chrono::milliseconds(util::kKeepStopDrainPollMs));",
@@ -328,30 +330,102 @@ def test_a_keep_stop_waits_for_an_in_flight_post_and_only_so_long():
     assert keep.count("util::keep_stop_drain_step(") == 1
     assert keep.find("for(;;){") < keep.find("report_offers_kept_on_stop("), (
         "the report runs before the wait: it would count a book still being posted")
+    # [review round 3] THE BUDGET IS SIZED, NOT GUESSED, and it is sized OUTSIDE
+    # the continuation so the keep branch touches no client: one create's whole
+    # retry ladder (the wallet's own request timeout, read from the client) plus
+    # the publish that stands between its answer and the offer entering State.
+    before_spawn = code[:code.find("asio::co_spawn(")]
+    _in_order(before_spawn, [
+        "conststd::uint64_tdrain_budget_ms=util::keep_stop_drain_budget_ms(",
+        "rpc_worst_case(wallet_?wallet_->request_timeout().count()",
+        "rpc_worst_case(dexie_defaults.request_timeout.count(),",
+    ])
+    assert "util::rpc_call_worst_case_ms(" in before_spawn, (
+        "the budget stopped being derived from the clients' own timeouts")
+    assert code.count("drain_budget_ms=") == 1, (
+        "the drain budget is written twice: a later override could shrink it "
+        "below the window it waits on")
 
 
-def test_the_one_offer_creating_call_is_marked_and_step_8_then_stops():
-    """[review #165] The wait above is only as good as the mark it reads.
-    post_quotes is the ONLY call through which the engine creates a maker offer;
-    it is marked (RAII, so a throw clears it) until that pair's rows are in
-    offer_log, and Step 8 then manages nothing further under a keep stop -- the
-    next pair's iteration would open with cancels."""
+def test_every_create_offer_is_marked_one_at_a_time():
+    """[review #165, round 3] The wait is only as good as the mark it reads, and
+    a mark that spans a whole LADDER is a mark the budget cannot cover: the live
+    config posts up to 2 x num_tiers = 12 creates per pair, each bounded by the
+    wallet's request timeout, so a 60 s budget expired with a create still in
+    flight -- the orphan the drain exists to prevent.
+
+    So OfferManager marks ONE create at a time, from the request until that
+    offer is in State (the Dexie submission sits in between, and an offer
+    created but not yet in State is the worst case). Everything created earlier
+    in the same ladder is already in State, and the keep stop's flush gives each
+    of those an offer_log row.
+
+    Stated over positions rather than over today's function names: every
+    create_offer call has its own mark, declared before it. An open PR moves
+    every create into a private helper; that helper has to carry the mark too,
+    and this says so."""
+    raw = _code(_text(OFFER_MANAGER_CPP), squeeze=False)
+    creates = [m.start() for m in re.finditer(r"->create_offer\(", raw)]
+    marks = [m.start() for m in re.finditer(
+        r"PostingMark\s+[A-Za-z_]+\{posting_in_flight_flag_\};", raw)]
+    assert creates, "no create_offer call in offer_manager.cpp: the scan is vacuous"
+    assert len(marks) == len(creates), (
+        f"{len(creates)} create_offer call(s) but {len(marks)} PostingMark(s): a "
+        "create the keep-stop drain cannot see is one it will not wait for")
+    for index, (mark, create) in enumerate(zip(marks, creates)):
+        assert mark < create, f"create #{index} is issued before its mark is set"
+        if index + 1 < len(creates):
+            assert creates[index] < marks[index + 1] < creates[index + 1], (
+                "two create_offer calls share one PostingMark: the drain would "
+                "have to outwait a whole ladder, which its budget is not for")
+    # The guard itself: armed on construction, cleared by the destructor as well
+    # as by release(), so a throw, a `continue`, a `break` and a coroutine frame
+    # destroyed by ioc_.stop() all clear it.
+    squeezed = _code(_text(OFFER_MANAGER_CPP))
+    assert ("explicitPostingMark(bool*flag)noexcept:flag_(flag)"
+            "{if(flag_!=nullptr){*flag_=true;}}") in squeezed
+    assert "~PostingMark(){release();}" in squeezed
+    assert ("voidrelease()noexcept{if(flag_!=nullptr){*flag_=false;flag_=nullptr;}}"
+            in squeezed)
+    # A mark is released EARLY only where the offer is already in State, or
+    # where the create answered with a failure and there is no offer at all.
+    # (A merge that moves these call sites must re-derive them -- that is the
+    # point of pinning the neighbouring statement, not just the count.)
+    for pinned in ("state_->upsert_offer(pending);posting_mark.release();",
+                   "state_->upsert_offer(po);fallback_mark.release();",
+                   "state_->upsert_offer(pending);}batch_mark.release();",
+                   "if(batch_failed){batch_mark.release();"):
+        assert pinned in squeezed, (
+            f"{pinned!r} is gone: a mark released before its offer is in State "
+            "lets a keep stop proceed while that offer exists nowhere")
+
+
+def test_the_engine_wires_the_drain_flag_and_never_writes_it_itself():
+    """The engine cannot see inside post_quotes, so OfferManager owns the flag.
+    Without this one line the drain would always read "nothing in flight"."""
+    engine = _code(_text(ENGINE_CPP))
+    assert engine.count(
+        "offer_mgr_->set_posting_in_flight_flag(&posting_in_flight_);") == 1
+    for bare in ("posting_in_flight_=true;", "posting_in_flight_=false;"):
+        assert bare not in engine, (
+            "the engine writes the drain flag itself again: a coarse mark around "
+            "post_quotes spans a whole ladder, which the budget is not sized for")
+
+
+def test_the_one_offer_creating_call_is_the_engines_and_step_8_then_stops():
+    """post_quotes is the ONLY call through which the engine creates a maker
+    offer, and Step 8 manages nothing further under a keep stop -- the next
+    pair's iteration would open with cancels."""
     engine = _code(_text(ENGINE_CPP))
     assert engine.count("offer_mgr_->post_quotes(") == 1, (
         "a second offer-creating call site is not covered by posting_in_flight_")
     step8 = _code(_definition(
         ENGINE_CPP, "asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)"))
     _in_order(step8, [
-        "structPostingMark{bool*flag;~PostingMark(){*flag=false;}}"
-        + "posting_mark{&posting_in_flight_};",
-        "posting_in_flight_=true;",
         "intposted=co_awaitoffer_mgr_->post_quotes(",
         "db_->insert_offer(orec);",
         "if(offers_kept_on_stop_.load(std::memory_order_acquire)){",
     ])
-    assert step8.count("posting_in_flight_=true;") == 1
-    assert "posting_in_flight_=false;" not in engine, (
-        "a bare reset is skipped by an exception; the RAII mark is what clears it")
     stop = _block(step8, "if(offers_kept_on_stop_.load(std::memory_order_acquire)){")
     assert stop.endswith("co_return;}"), "Step 8 must stop, not carry on to the next pair"
     # Every maker create in OfferManager is reached only through post_quotes.
@@ -424,6 +498,46 @@ def test_a_keep_stop_that_cut_a_cycle_short_says_so():
     cycle = _code(_definition(
         ENGINE_CPP, "asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)"))
     assert "check_shutdown_flag(" not in cycle and "evaluate_shutdown_flag(" not in cycle
+
+
+def test_no_step_starts_new_work_after_a_stop_is_latched_mid_cycle():
+    """[review #165, round 3] The gate at the TOP of the cycle only sees a stop
+    that arrived between cycles. shutdown() is co_spawned onto the same
+    io_context, so a signal-delivered stop runs whenever the cycle suspends --
+    and a keep stop then WAITS (bounded) for an in-flight create, handing
+    control back to the cycle at every poll. Step 8 has its own checks; without
+    a gate after it the rest of the cycle carried on under a stop the operator
+    had already asked for, and Step 9c can SEND a crossed-book take_offer.
+
+    Gated on stop_requested_, not on the keep latch: a cancelling stop must not
+    start new takes either, and its sweep is running over the same coins."""
+    cycle = _code(_definition(
+        ENGINE_CPP, "asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)"))
+    step8 = cycle.find("co_awaitstep_manage_offers(block_height);")
+    arb = cycle.find("co_awaitstep_check_arbitrage(block_height);")
+    drift = cycle.find("co_awaitstep_run_drift_corrector(block_height);")
+    assert -1 not in (step8, arb, drift), "the cycle no longer dispatches these steps"
+    assert drift < step8 < arb, "the cycle's step order changed; re-derive the gates"
+
+    gate = _block_followed_by(
+        cycle, "if(stop_requested_.load(std::memory_order_acquire)){", "spdlog::warn(")
+    at = cycle.find(gate)
+    assert step8 < at < arb, (
+        "the mid-cycle stop gate is not between Step 8 and Step 9: Steps 9-13 "
+        "(arbitrage TAKES, hedging, PnL, the ingest steps, metrics, alerts) "
+        "would start after the operator asked to stop")
+    assert gate.endswith("co_return;}"), (
+        "the gate logs and carries on: it must end the cycle")
+
+    # Step 9f initiates taker trades and runs BEFORE Step 8, so a keep stop's
+    # drain cannot hand control back to it -- but a cancelling stop awaits its
+    # whole sweep and this cycle resumes in every gap of it.
+    assert ("!watchdog_fired_.load(std::memory_order_acquire)&&"
+            "!stop_requested_.load(std::memory_order_acquire)&&"
+            'wallet_step_may_run("")){try{co_awaitstep_run_drift_corrector('
+            "block_height);}") in cycle, (
+        "the drift corrector -- the engine's own taker -- is no longer gated on "
+        "the stop latch")
 
 
 def test_the_engine_header_documents_the_members_the_scans_rely_on():

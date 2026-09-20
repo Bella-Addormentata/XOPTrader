@@ -255,21 +255,94 @@ struct StopOffersPlan {
 // ioc_.stop() at once -- the wallet could then complete the create with nobody
 // left to hear the answer: a resting offer with no State entry and no offer_log
 // row. The next boot files such an offer as an ORPHAN, and evaluate_orphan
-// CANCELS an orphan that is older than orphan_max_adopt_age_blocks, adversely
-// priced, or on a pair with no mid price (offer_manager.cpp) -- the one outcome
-// a keep stop exists to avoid.
+// CANCELS an orphan that is older than orphan_max_adopt_age_blocks (120 by
+// default -- about 37 MINUTES at the peak-height cadence of 18.75 s per block,
+// 4,608 a day; reading it at the 52 s TRANSACTION-block spacing gives 1.7 h and
+// is the wrong convention for a height comparison), adversely priced, or on a
+// pair with no mid price (offer_manager.cpp) -- the one outcome a keep stop
+// exists to avoid.
 //
-// So the keep continuation waits while a post is in flight, and only that
-// long: post_quotes records every offer it creates in State before it returns,
-// and Step 8 manages nothing further once it sees the keep latch. The wait is
-// BOUNDED. A wallet that never answers must not turn "stop" into "hang", and
-// past the budget the stop proceeds and says an offer may have been left
-// unrecorded.
+// So the keep continuation waits while such a create is in flight, and only
+// that long. WHAT IS MARKED IS ONE CREATE, NOT A LADDER (review round 3):
+// OfferManager sets the engine's flag immediately before each create_offer and
+// clears it once that offer is in State, so the wait is for the single call
+// actually outstanding. Everything the ladder already created is in State by
+// then, and the keep stop's flush gives each of those an offer_log row -- so
+// waiting for the rest of the ladder would buy nothing and cost, at the live
+// num_tiers: 6 over two sides, up to twelve creates' worth of stop latency.
+//
+// The wait is BOUNDED. A wallet that never answers must not turn "stop" into
+// "hang", and past the budget the stop proceeds and says an offer may have been
+// left unrecorded. The budget is SIZED TO THAT MARKED WINDOW rather than
+// guessed: see keep_stop_drain_budget_ms below.
 
-/// How long a keep stop waits for an in-flight post. One create_offer is
-/// bounded by the wallet client's request timeout (30 s); a pair's post is a
-/// few of them plus the Dexie submissions.
-inline constexpr unsigned long long kKeepStopDrainBudgetMs = 60'000;
+/// The worst case of ONE rpc_post call (rpc/chia_rpc.cpp): every attempt
+/// spending the whole request timeout, plus the doubling backoff between them.
+/// Saturating, so no configuration can wrap it.
+///
+/// With the shipped wallet client -- request_timeout 30 s, max_retries 3, so
+/// four attempts, backoff 0.5/1/2 s -- that is 123'500 ms. (Engine::shutdown
+/// reads the live timeout from the client rather than assuming this one.)
+[[nodiscard]] constexpr unsigned long long rpc_call_worst_case_ms(
+    unsigned long long request_timeout_ms,
+    unsigned long long attempts,
+    unsigned long long retry_base_delay_ms) noexcept
+{
+    constexpr unsigned long long kMax = ~0ULL;
+    const auto add = [](unsigned long long a, unsigned long long b) constexpr noexcept {
+        return (a > kMax - b) ? kMax : a + b;
+    };
+    unsigned long long total = 0;
+    unsigned long long delay = retry_base_delay_ms;
+    for (unsigned long long i = 0; i < attempts; ++i) {
+        total = add(total, request_timeout_ms);
+        if (i + 1 < attempts) {
+            total = add(total, delay);
+            delay = (delay > kMax / 2) ? kMax : delay * 2;
+        }
+    }
+    return total;
+}
+
+/// A keep stop never waits longer than this, whatever the client timeouts say.
+/// It binds only on a configuration far outside the shipped one (the shipped
+/// worst case is 247 s, pinned below); the operator's second Ctrl+C is the
+/// escape hatch either way (main.cpp: the second signal calls _Exit).
+inline constexpr unsigned long long kKeepStopDrainBudgetCapMs = 300'000;
+/// ...and never shorter than this, so a misconfigured 1 ms timeout still gives
+/// a create that was about to answer a chance to land.
+inline constexpr unsigned long long kKeepStopDrainBudgetFloorMs = 30'000;
+
+/// How long a keep stop waits for the ONE create that can still be in flight.
+///
+/// The marked window is [create_offer issued .. that offer is in State]. Two
+/// calls stand in it, each on its own client and each able to spend its full
+/// retry ladder: the create itself, and the publish that follows it before the
+/// offer is recorded (OfferManager submits the offer text to Dexie between the
+/// wallet's answer and state_->upsert_offer). So the budget is the sum of their
+/// worst cases -- 123.5 s + 123.5 s = 247 s with the shipped timeouts -- and
+/// NOT a round number that happens to be smaller than what it waits for.
+[[nodiscard]] constexpr unsigned long long keep_stop_drain_budget_ms(
+    unsigned long long create_worst_case_ms,
+    unsigned long long publish_worst_case_ms) noexcept
+{
+    constexpr unsigned long long kMax = ~0ULL;
+    const unsigned long long want =
+        (create_worst_case_ms > kMax - publish_worst_case_ms)
+            ? kMax
+            : create_worst_case_ms + publish_worst_case_ms;
+    if (want < kKeepStopDrainBudgetFloorMs) return kKeepStopDrainBudgetFloorMs;
+    if (want > kKeepStopDrainBudgetCapMs) return kKeepStopDrainBudgetCapMs;
+    return want;
+}
+
+/// What the two shipped clients cost in the worst case: the wallet RPC and the
+/// Dexie client both default to a 30 s request timeout, 3 retries and a 500 ms
+/// doubling backoff (rpc/chia_rpc.hpp, rpc/dexie_client.hpp). Used for the
+/// build-time pins below; the engine reads the wallet's live timeout instead.
+inline constexpr unsigned long long kShippedRpcWorstCaseMs =
+    rpc_call_worst_case_ms(30'000, 4, 500);
+
 /// How often the wait looks again. The cycle it is waiting on runs on the
 /// same thread, so this is also how long that cycle can run on past its post.
 inline constexpr unsigned long long kKeepStopDrainPollMs = 50;
@@ -295,9 +368,22 @@ enum class KeepStopDrainStep : int {
 // Build-time pins. GCC and MSVC both evaluate these, so a wrong row is a
 // compile error on every platform rather than a red runner on one.
 // ---------------------------------------------------------------------------
-static_assert(keep_stop_drain_step(false, 0, kKeepStopDrainBudgetMs) == KeepStopDrainStep::Proceed);
-static_assert(keep_stop_drain_step(true, 0, kKeepStopDrainBudgetMs) == KeepStopDrainStep::Wait);
-static_assert(keep_stop_drain_step(true, kKeepStopDrainBudgetMs, kKeepStopDrainBudgetMs)
+// One rpc_post call, and the budget that must outlast the window holding two
+// of them. If either number ever falls under what the drain waits for, this is
+// a compile error rather than a stop that abandons a create it was about to
+// record.
+static_assert(rpc_call_worst_case_ms(30'000, 1, 500) == 30'000);
+static_assert(kShippedRpcWorstCaseMs == 123'500);  // 4 x 30 s + 0.5 + 1 + 2 s
+static_assert(rpc_call_worst_case_ms(~0ULL, 4, ~0ULL) == ~0ULL);  // saturates
+static_assert(keep_stop_drain_budget_ms(kShippedRpcWorstCaseMs, kShippedRpcWorstCaseMs)
+              == 247'000);
+static_assert(keep_stop_drain_budget_ms(kShippedRpcWorstCaseMs, kShippedRpcWorstCaseMs)
+              >= 2 * kShippedRpcWorstCaseMs);  // the cap does not bind as shipped
+static_assert(keep_stop_drain_budget_ms(0, 0) == kKeepStopDrainBudgetFloorMs);
+static_assert(keep_stop_drain_budget_ms(~0ULL, ~0ULL) == kKeepStopDrainBudgetCapMs);
+static_assert(keep_stop_drain_step(false, 0, kKeepStopDrainBudgetCapMs) == KeepStopDrainStep::Proceed);
+static_assert(keep_stop_drain_step(true, 0, kKeepStopDrainBudgetCapMs) == KeepStopDrainStep::Wait);
+static_assert(keep_stop_drain_step(true, kKeepStopDrainBudgetCapMs, kKeepStopDrainBudgetCapMs)
               == KeepStopDrainStep::GiveUp);
 static_assert(plan_stop_offers(StopOffersRequest::Keep, StopOffersPolicy::Cancel, false).action
               == StopBookAction::KeepBook);

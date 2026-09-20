@@ -734,8 +734,21 @@ monitoring:
 #   * the expiry is stamped when an offer is POSTED, so offers posted before the
 #     expiry was turned on carry none until they rotate out by TTL;
 #   * an offer whose expiry passes while the engine is down can no longer be
-#     taken, but the wallet still holds its coins until it is cancelled; the
-#     next start cancels it on its first cycle (it is past the hard TTL).
+#     taken, but the wallet still holds its coins until it is cancelled.
+#
+# HOW LONG A KEPT OFFER CAN LIVE, exactly:
+#   * while nothing is running, only the on-chain expiry bounds it -- at
+#     offer_expiry_secs: 86400 that is up to 24 h from when each offer was
+#     POSTED, whatever the stop's length;
+#   * when the engine comes back with strategy.ttl_cancel_mode: age (the
+#     default), its first cycle cancels anything past the hard TTL --
+#     offer_ttl_blocks x 2, i.e. 800 blocks or about 4 h 10 min at the
+#     peak-height cadence of 18.75 s per block -- expired offers included;
+#   * with ttl_cancel_mode: expire, an offer that carries a verified expiry is
+#     NOT cancelled at the hard TTL: it rests until its own max_time passes and
+#     is then retired with a free local cancel about ten minutes later. The
+#     bound there is the expiry itself, not the hard TTL -- and the startup
+#     floor keeps the expiry well above it (see offer_expiry_secs).
 #
 # Strict: only this key, only these two values -- anything else is a startup
 # error, because every lenient reading of a typo would be a silent "cancel".

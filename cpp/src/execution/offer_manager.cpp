@@ -74,6 +74,65 @@ namespace trade_status {
 }  // namespace trade_status
 
 // ---------------------------------------------------------------------------
+// [S74 / review #165] PostingMark -- "a create_offer is out, and the offer it
+// makes is not in State yet"
+// ---------------------------------------------------------------------------
+//
+// Engine::shutdown()'s KEEP branch waits while the engine's posting_in_flight_
+// flag is set (util::keep_stop_drain_step), because stopping the io_context
+// inside this window lets the wallet finish a create with nobody left to record
+// it: the next boot meets that offer as an ORPHAN and may CANCEL it, which is
+// the one outcome a keep stop exists to prevent.
+//
+// The window is exactly [create_offer issued .. the offer is in State]. That
+// includes the Dexie submission, which sits between the wallet's answer and
+// state_->upsert_offer -- an offer created and published but not yet in State
+// is the WORST case, since it is unknown to the engine entirely.
+//
+// One mark per create, never one per ladder: everything created earlier in the
+// same post_quotes call is already in State, and a keep stop's flush gives each
+// of those an offer_log row. Holding the mark across the ladder would make a
+// stop wait for up to 2 x num_tiers creates (12 at the live config) for no
+// extra safety -- and would need a budget to match.
+//
+// RAII, so a throw, an early `continue`, a `break`, a `co_return` and a
+// coroutine frame destroyed by ioc_.stop() all clear it. Single-threaded: the
+// flag is written here and read by the shutdown continuation, both on the
+// io_context thread.
+// ---------------------------------------------------------------------------
+namespace {
+
+class PostingMark {
+public:
+    explicit PostingMark(bool* flag) noexcept : flag_(flag)
+    {
+        if (flag_ != nullptr) {
+            *flag_ = true;
+        }
+    }
+    ~PostingMark() { release(); }
+
+    PostingMark(const PostingMark&)            = delete;
+    PostingMark& operator=(const PostingMark&) = delete;
+    PostingMark(PostingMark&&)                 = delete;
+    PostingMark& operator=(PostingMark&&)      = delete;
+
+    /// The offer is in State (or there is no offer): a keep stop may proceed.
+    void release() noexcept
+    {
+        if (flag_ != nullptr) {
+            *flag_ = false;
+            flag_  = nullptr;
+        }
+    }
+
+private:
+    bool* flag_;
+};
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
 // Constructor
 // ---------------------------------------------------------------------------
 
@@ -647,6 +706,9 @@ asio::awaitable<int> OfferManager::post_quotes(
         const std::optional<std::uint64_t> expiry_max_time =
             expiry_max_time_for(pair);
         json result;
+        // [S74 / review #165] From here until this tier's offer is in State, a
+        // keep stop waits rather than stopping the io_context under it.
+        PostingMark posting_mark{posting_in_flight_flag_};
         try {
             result = co_await wallet_->create_offer(
                 offer_dict, current_fee_mojos_, /*validate_only=*/false,
@@ -797,6 +859,9 @@ asio::awaitable<int> OfferManager::post_quotes(
         pending.dexie_id         = dexie_id;
 
         state_->upsert_offer(pending);
+        // [S74] Recorded: a keep stop that stops the io_context now finds this
+        // offer in State, and its flush gives it an offer_log row.
+        posting_mark.release();
         ++created_count;
 
         logger_->info("Posted {} {} tier {} @ {} mojos, size {} mojos [{}]",
@@ -2005,6 +2070,11 @@ void OfferManager::set_escalation(
     std::function<void(const std::string&)> escalate)
 {
     escalate_ = std::move(escalate);
+}
+
+void OfferManager::set_posting_in_flight_flag(bool* flag) noexcept
+{
+    posting_in_flight_flag_ = flag;
 }
 
 std::uint64_t OfferManager::current_fee() const noexcept
@@ -3888,6 +3958,9 @@ asio::awaitable<int> OfferManager::post_merged_side(
     json result;
     bool batch_failed = false;
     std::string batch_err;
+    // [S74 / review #165] Held until the merged offer is in State (or until
+    // this call gives up on it): a keep stop waits for exactly this window.
+    PostingMark batch_mark{posting_in_flight_flag_};
     try {
         result = co_await wallet_->create_offer(
             merged_dict, current_fee_mojos_, /*validate_only=*/false,
@@ -3898,6 +3971,10 @@ asio::awaitable<int> OfferManager::post_merged_side(
     }
 
     if (batch_failed) {
+        // [S74] This create answered (with a failure): released here so the
+        // fallback tiers below are marked one at a time by their own marks,
+        // never nested inside this one.
+        batch_mark.release();
         // Fallback: if batch fails, fall through to individual creation.
         logger_->warn("Batch create_offer failed for {} {} -- "
                       "falling back to individual: {}",
@@ -3932,6 +4009,9 @@ asio::awaitable<int> OfferManager::post_merged_side(
             bool tier_failed = false;
             std::string tier_err;
             json sr;
+            // [S74 / review #165] One mark per fallback create, cleared when
+            // that tier's offer is in State below.
+            PostingMark fallback_mark{posting_in_flight_flag_};
             try {
                 sr = co_await wallet_->create_offer(
                     single_dict, current_fee_mojos_, /*validate_only=*/false,
@@ -4034,6 +4114,7 @@ asio::awaitable<int> OfferManager::post_merged_side(
                 // [WALLET-LOAD] For the fill-poll striking-distance reset.
                 po.post_spread_bps  = tier.spread_bps;
                 state_->upsert_offer(po);
+                fallback_mark.release();  // [S74] recorded
                 ++fallback_count;
 
                 // -- Fee reserve guard (batch fallback, UTXO-aware) ---------
@@ -4210,6 +4291,7 @@ asio::awaitable<int> OfferManager::post_merged_side(
         pending.dexie_id         = batch_dexie_id;
         state_->upsert_offer(pending);
     }
+    batch_mark.release();  // [S74] every constituent tier is in State
 
     logger_->info("Batch: posted {} {} ({} tiers merged) [{}]",
                   pair.name, to_string(tiers.front().side),

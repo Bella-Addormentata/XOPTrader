@@ -50,12 +50,22 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   let a requested keep turn into a cancel.
 - **Operator notes.** Keep is for restarts. A kept offer is takeable with no
   engine behind it — no repricing, no TTL, no dead man's switch — so use it
-  only with `strategy.offer_expiry_secs` set. An offer older than the hard TTL
-  (2 × `offer_ttl_blocks`) when the engine comes back is cancelled on its first
-  cycle anyway, and that includes every offer whose on-chain expiry passed: the
-  reference wallet goes on reporting such an offer `PENDING_ACCEPT` and keeps
-  its coins locked until it is cancelled (chia-blockchain 2.7.4,
-  `chia/wallet/trade_manager.py`). Operator **Cancel All** is unchanged.
+  only with `strategy.offer_expiry_secs` set. **While the engine is down the
+  on-chain expiry is the only bound**: it is stamped when each offer is posted,
+  so at the live `offer_expiry_secs: 86400` an offer can stay takeable for up to
+  24 h from the moment it was posted, however long the stop lasts. What happens
+  when the engine comes back depends on `strategy.ttl_cancel_mode`:
+  with `age` (the default, and every build before that key existed) the first
+  cycle cancels anything past the hard TTL — 2 × `offer_ttl_blocks`, 800 blocks
+  ≈ 4 h 10 min at the peak-height cadence of 18.75 s/block — including offers
+  whose expiry has already passed, because the reference wallet goes on
+  reporting such an offer `PENDING_ACCEPT` and keeps its coins locked until it
+  is cancelled (chia-blockchain 2.7.4, `chia/wallet/trade_manager.py`); with
+  `expire`, an offer carrying a verified expiry is **not** cancelled at the hard
+  TTL at all — it rests until its own `max_time` passes and is then retired with
+  a free local cancel about ten minutes later, so the bound is the expiry (~24 h
+  takeable, ~24 h 10 min of locked coins), not the hard TTL. Operator **Cancel
+  All** is unchanged.
 
 ## [0.10.24] — 2026-09-14 — record what happened, not what was asked for
 

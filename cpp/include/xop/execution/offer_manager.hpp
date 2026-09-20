@@ -746,6 +746,24 @@ public:
     /// it is for.
     void set_escalation(std::function<void(const std::string&)> escalate);
 
+    /// [S74 / review #165] The flag a KEEP stop's drain watches.
+    ///
+    /// Set while a create_offer is outstanding AND the offer it returns is not
+    /// yet in State -- the one window in which stopping the io_context can
+    /// leave a live offer this process never recorded, and the next boot meets
+    /// as an ORPHAN it may cancel. Cleared by RAII, so a throw, an early
+    /// `continue` and an abandoned coroutine frame all clear it.
+    ///
+    /// NOT held for a whole ladder: every offer created earlier in the same
+    /// post_quotes call is already in State, and the keep stop's flush gives
+    /// each of those an offer_log row. Holding it across the ladder would make
+    /// the stop wait for up to 2 x num_tiers creates for no extra safety
+    /// (xop/util/stop_offers_policy.hpp has the budget arithmetic).
+    ///
+    /// Unset means the marks do nothing, so nothing changes for a caller that
+    /// does not wire it. Read and written on the io_context thread only.
+    void set_posting_in_flight_flag(bool* flag) noexcept;
+
     /// Return the fee currently in effect (dynamic or static fallback).
     [[nodiscard]] std::uint64_t current_fee() const noexcept;
 
@@ -1288,6 +1306,10 @@ private:
     std::uint64_t current_fee_mojos_;
     std::function<bool()> abort_predicate_;
     std::function<void(const std::string&)> escalate_;
+
+    /// [S74 / review #165] set_posting_in_flight_flag(). Owned by the engine
+    /// (Engine::posting_in_flight_); nullptr until it is wired.
+    bool* posting_in_flight_flag_{nullptr};
 
     /// O(1) lookup: pair_name -> PairConfig.  Populated once in the
     /// constructor from AppConfig::pairs so that evaluate_rebalance()

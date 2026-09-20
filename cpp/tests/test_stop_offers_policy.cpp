@@ -272,15 +272,41 @@ TEST(KeepStopDrain, APostInFlightIsWaitedForUntilTheBudgetAndNoLonger)
     EXPECT_EQ(keep_stop_drain_step(true, 0, 0), KeepStopDrainStep::GiveUp);
 }
 
-TEST(KeepStopDrain, TheBudgetCoversACreateAndThePollIsShort)
+TEST(KeepStopDrain, OneRpcCallsWorstCaseIsEveryAttemptPlusTheBackoffBetweenThem)
 {
-    // One create_offer is bounded by the wallet client's 30 s request timeout;
-    // a budget under that gives up on a create that was about to answer. And it
-    // stays well inside a service manager's usual 90 s stop timeout.
-    EXPECT_GE(xop::util::kKeepStopDrainBudgetMs, 30'000ull);
-    EXPECT_LE(xop::util::kKeepStopDrainBudgetMs, 90'000ull);
+    using xop::util::rpc_call_worst_case_ms;
+    // rpc_post: max_retries + 1 attempts, each able to spend the whole request
+    // timeout, with the backoff doubling from retry_base_delay between them.
+    EXPECT_EQ(rpc_call_worst_case_ms(30'000, 1, 500), 30'000ull);
+    EXPECT_EQ(rpc_call_worst_case_ms(30'000, 2, 500), 60'500ull);
+    EXPECT_EQ(rpc_call_worst_case_ms(30'000, 4, 500), 123'500ull);  // as shipped
+    EXPECT_EQ(xop::util::kShippedRpcWorstCaseMs, 123'500ull);
+    // Degenerate inputs answer, and never wrap.
+    EXPECT_EQ(rpc_call_worst_case_ms(30'000, 0, 500), 0ull);
+    EXPECT_EQ(rpc_call_worst_case_ms(~0ull, 4, ~0ull), ~0ull);
+}
+
+TEST(KeepStopDrain, TheBudgetIsTheMarkedWindowsWorstCaseNotARoundNumber)
+{
+    using xop::util::keep_stop_drain_budget_ms;
+    const unsigned long long one = xop::util::kShippedRpcWorstCaseMs;
+    // [review round 3] THE POINT OF THIS TEST. The drain waits for ONE create
+    // and the publish that stands between the wallet's answer and the offer
+    // entering State (offer_manager.cpp PostingMark). Two rpc_post calls, so
+    // the budget must outlast two of them -- the 60 s constant this replaced
+    // could not even outlast one, and gave up with the create still in flight:
+    // exactly the orphan the drain exists to prevent.
+    EXPECT_GE(keep_stop_drain_budget_ms(one, one), 2 * one);
+    EXPECT_EQ(keep_stop_drain_budget_ms(one, one), 247'000ull);
+    // A stop still ends: the cap binds only on a configuration far outside the
+    // shipped one, and the floor keeps a 0 ms timeout from making the wait a
+    // no-op that is never seen to fail.
+    EXPECT_EQ(keep_stop_drain_budget_ms(~0ull, ~0ull),
+              xop::util::kKeepStopDrainBudgetCapMs);
+    EXPECT_EQ(keep_stop_drain_budget_ms(0, 0), xop::util::kKeepStopDrainBudgetFloorMs);
+    EXPECT_LT(keep_stop_drain_budget_ms(one, one), xop::util::kKeepStopDrainBudgetCapMs);
     // The cycle being waited on runs on the same thread and carries on for up
-    // to one poll after its post returns.
+    // to one poll after its create returns.
     EXPECT_GE(xop::util::kKeepStopDrainPollMs, 10ull);
     EXPECT_LE(xop::util::kKeepStopDrainPollMs, 250ull);
 }
@@ -501,4 +527,65 @@ TEST(KeptBookAfterRestart, AnExpiredOfferIsAlwaysPastTheHardTtl)
             << "ttl=" << c.ttl_blocks << ": an expired offer could still be inside the "
             << "hard TTL and be kept as a live quote after a restart";
     }
+}
+
+// [review round 3] ...AND THE HARD TTL IS NOT THE BOUND THE OPERATOR GETS.
+//
+// The test above says what happens to an offer that is ALREADY expired. The
+// operator note's claim was different and stronger -- "an offer older than the
+// hard TTL when the engine comes back is cancelled on its first cycle anyway"
+// -- and open PR #164 falsifies it: under strategy.ttl_cancel_mode: expire,
+// execution::age_limit_cancel_applies(expire_mode, verified_max_time) returns
+// false for any offer carrying a verified expiry, so the hard-TTL cancel is
+// skipped and the offer rests until retire_expired_offers frees it, after its
+// own on-chain expiry.
+//
+// That expiry is the LONGER of the two at every configuration anyone runs: the
+// startup floor this repo already enforces (#150, expiry_outlasts_hard_ttl)
+// demands it outlast kExpiryFloorMargin x the hard TTL measured at the
+// CONFIGURED block spacing, which at the shipped 52 s is already 5.5x the hard
+// TTL's real (peak-height) wall-clock length. So the operator note now states
+// both bounds rather than promising the shorter one.
+TEST(KeptBookAfterRestart, UnderExpireModeTheBoundIsTheExpiryAndItOutlastsTheHardTtl)
+{
+    constexpr std::uint32_t kHardMult = 2;  // OfferManager::kHardTtlMultiplier
+    // The hard TTL is a COUNT OF BLOCK HEIGHTS, so its wall-clock length uses
+    // the PEAK-HEIGHT cadence -- 4,608 blocks a day, 18.75 s -- and never
+    // strategy.block_time_seconds, which is TRANSACTION-block spacing (52 s)
+    // and is what the floor formula below uses for its own, different purpose.
+    // Reading 800 blocks at 52 s gives 11.6 h instead of 4 h 10 min; reading
+    // orphan_max_adopt_age_blocks: 120 that way gives 1.7 h instead of 37 min.
+    constexpr double kPeakHeightSecsPerBlock = 86'400.0 / 4'608.0;  // 18.75
+    // The live configuration, and three others the floor accepts.
+    struct Case {
+        std::uint32_t ttl_blocks;
+        double        secs_per_block;   // strategy.block_time_seconds
+        std::uint32_t expiry_secs;      // strategy.offer_expiry_secs
+    };
+    for (const Case c : {Case{400, 52.0, 86'400},   // LIVE: 24 h expiry
+                         Case{400, 52.0, 172'800},
+                         Case{200, 52.0, 86'400},
+                         Case{600, 18.75, 86'400}}) {
+        ASSERT_TRUE(xop::execution::expiry_outlasts_hard_ttl(
+            c.expiry_secs, c.ttl_blocks, kHardMult, c.secs_per_block))
+            << "the engine would refuse this configuration at startup";
+
+        // What the operator is told: how long a kept offer can stay takeable
+        // with no engine behind it. In `age` mode (today's default and every
+        // build before #164) the next start cancels it once it is past the hard
+        // TTL; in `expire` mode nothing does until its own max_time passes.
+        //
+        const double hard_ttl_wall_s =
+            static_cast<double>(c.ttl_blocks) * kHardMult * kPeakHeightSecsPerBlock;
+        EXPECT_GT(static_cast<double>(c.expiry_secs), hard_ttl_wall_s)
+            << "ttl=" << c.ttl_blocks << ": in expire mode a kept offer would be "
+            << "bounded by the hard TTL after all, and the operator note would hold";
+    }
+
+    // The live numbers, spelled out, because they are what the operator note
+    // says: 400 blocks x 2 = 800 peak-height blocks = 4 h 10 min, against a
+    // 24 h expiry. Nearly SIX times longer, not "cancelled on the first cycle".
+    const double live_hard_ttl_wall_s = 800.0 * kPeakHeightSecsPerBlock;
+    EXPECT_NEAR(live_hard_ttl_wall_s, 15'000.0, 1.0);   // 4 h 10 min
+    EXPECT_GT(86'400.0 / live_hard_ttl_wall_s, 5.0);
 }

@@ -1214,12 +1214,20 @@ private:
     /// thread only.
     bool heartbeat_in_flight_{false};
 
-    /// [review #165] True from just before Step 8 awaits post_quotes -- the ONLY
-    /// call through which this engine creates a maker offer -- until that
-    /// pair's rows are in offer_log. A keep stop waits (bounded,
-    /// util::keep_stop_drain_step) while this is set, so a create_offer the
-    /// wallet is still answering lands in State instead of becoming an orphan
-    /// the next boot may cancel. ioc_ thread only.
+    /// [review #165] True while ONE create_offer is outstanding and the offer it
+    /// makes is not yet in State. Set by OfferManager (offer_manager.cpp
+    /// PostingMark, wired in the constructor with set_posting_in_flight_flag),
+    /// because the engine cannot see inside post_quotes -- the only call through
+    /// which it creates a maker offer. A keep stop waits (bounded,
+    /// util::keep_stop_drain_step) while this is set, so a create the wallet is
+    /// still answering lands in State instead of becoming an orphan the next
+    /// boot may cancel.
+    ///
+    /// [review round 3] Deliberately NOT one mark per post_quotes call: a
+    /// pair's ladder is up to 2 x num_tiers creates (12 live), so a stop would
+    /// have to outwait all of them, and the 60 s budget it had did not. Every
+    /// offer created earlier in the same ladder is already in State, and the
+    /// keep stop's flush gives each of those an offer_log row. ioc_ thread only.
     bool posting_in_flight_{false};
 
     /// The keep path: mirror State into offer_log for any offer that has no row

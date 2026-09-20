@@ -633,6 +633,12 @@ Engine::Engine(const AppConfig& config, bool dry_run,
     offer_mgr_->set_abort_predicate([this] {
         return watchdog_fired_.load(std::memory_order_acquire);
     });
+    // [S74 / review #165] The flag a KEEP stop's drain waits on. OfferManager
+    // sets it while a create_offer is outstanding and the offer it makes is
+    // not yet in State -- the only window in which stopping the io_context can
+    // leave a live offer this process never recorded. Without this wiring the
+    // drain would always see "nothing in flight" and stop straight through it.
+    offer_mgr_->set_posting_in_flight_flag(&posting_in_flight_);
     // A late offer that could not be cancelled has to reach the operator.
     // The watchdog's own alert says a cancel of every resting offer was
     // SUBMITTED -- and this trade was created after that request enumerated
@@ -1610,7 +1616,39 @@ void Engine::shutdown()
     //
     // ISO/IEC 5055: no blocking .get()/.wait() calls; fully async teardown.
     // ISO/IEC 27001:2022: all cancellation outcomes are audit-logged.
-    asio::co_spawn(ioc_, [this, cancels_book, keeps_book]() -> asio::awaitable<void> {
+    //
+    // [S74 / review round 3] HOW LONG A KEEP STOP MAY WAIT FOR AN IN-FLIGHT
+    // CREATE, sized to the window it waits on rather than to a round number.
+    // OfferManager marks ONE create at a time (offer_manager.cpp PostingMark),
+    // so the worst case is that create's full retry ladder plus the publish
+    // that stands between its answer and the offer entering State -- two
+    // rpc_post calls, each up to request_timeout x attempts plus backoff. The
+    // wallet's timeout is read from the client, exactly as the S46 cancel
+    // ladder reads it; the retry knobs are the clients' own defaults, which
+    // this engine never overrides (see the constructor: host, port, TLS only).
+    // Computed HERE, not in the continuation, so the keep branch itself
+    // touches no client at all -- tests/test_stop_keep_wiring.py pins that.
+    const auto rpc_worst_case = [](std::int64_t  timeout_ms,
+                                   std::uint64_t retries,
+                                   std::int64_t  backoff_ms) {
+        return util::rpc_call_worst_case_ms(
+            timeout_ms > 0 ? static_cast<std::uint64_t>(timeout_ms) : 0ull,
+            retries + 1ull,
+            backoff_ms > 0 ? static_cast<std::uint64_t>(backoff_ms) : 0ull);
+    };
+    const rpc::ChiaRPCConfig wallet_rpc_defaults{};
+    const rpc::DexieConfig   dexie_defaults{};
+    const std::uint64_t drain_budget_ms = util::keep_stop_drain_budget_ms(
+        rpc_worst_case(wallet_ ? wallet_->request_timeout().count()
+                               : wallet_rpc_defaults.request_timeout.count(),
+                       wallet_rpc_defaults.max_retries,
+                       wallet_rpc_defaults.retry_base_delay.count()),
+        rpc_worst_case(dexie_defaults.request_timeout.count(),
+                       static_cast<std::uint64_t>(dexie_defaults.max_retries),
+                       dexie_defaults.retry_base_delay.count()));
+
+    asio::co_spawn(ioc_, [this, cancels_book, keeps_book, drain_budget_ms]()
+                   -> asio::awaitable<void> {
         // --- Cancel outstanding offers (skip in dry-run mode) ---
         // [S74] ...and skip when the stop KEEPS the book. EVERY cancel this
         // function can send, the intent file and the cancel_pending rows live
@@ -2200,15 +2238,17 @@ void Engine::shutdown()
                 spdlog::error("[Engine] cancel_all exception: {}", ex.what());
             }
         } else if (keeps_book) {
-            // [review #165] LET AN IN-FLIGHT POST LAND FIRST. A shutdown.flag
+            // [review #165] LET AN IN-FLIGHT CREATE LAND FIRST. A shutdown.flag
             // stop is read between cycles and never finds one; a SIGNAL can
-            // arrive while Step 8 is suspended in post_quotes. Stopping the
-            // io_context then would let the wallet finish a create_offer with
-            // nobody left to record it, and the next boot may CANCEL that
-            // orphan (util::keep_stop_drain_step has the whole argument). The
-            // only thing awaited here is a timer -- never an RPC -- and the
-            // wait is bounded, so a wallet that never answers cannot turn a
-            // stop into a hang.
+            // arrive while post_quotes is suspended in create_offer or in the
+            // Dexie submission that follows it. Stopping the io_context then
+            // would let the wallet finish a create with nobody left to record
+            // it, and the next boot may CANCEL that orphan
+            // (util::keep_stop_drain_step has the whole argument). The only
+            // thing awaited here is a timer -- never an RPC -- and the wait is
+            // bounded, so a wallet that never answers cannot turn a stop into
+            // a hang. The budget was sized before this continuation was posted
+            // (see shutdown() above): the keep branch itself touches no client.
             const auto drain_t0 = std::chrono::steady_clock::now();
             std::uint64_t waited_for_post_ms = 0;
             bool post_abandoned = false;
@@ -2220,8 +2260,7 @@ void Engine::shutdown()
                                std::chrono::steady_clock::now() - drain_t0)
                                .count()));
                 const util::KeepStopDrainStep drain = util::keep_stop_drain_step(
-                    posting_in_flight_, waited_for_post_ms,
-                    util::kKeepStopDrainBudgetMs);
+                    posting_in_flight_, waited_for_post_ms, drain_budget_ms);
                 if (drain == util::KeepStopDrainStep::Proceed) break;
                 if (drain == util::KeepStopDrainStep::GiveUp) {
                     post_abandoned = true;
@@ -2229,11 +2268,12 @@ void Engine::shutdown()
                 }
                 if (!drain_announced) {
                     drain_announced = true;
-                    spdlog::warn("[Engine] [S74] KEEP stop: an offer post is in "
-                                 "flight (this stop arrived by signal, inside a "
-                                 "heartbeat cycle) -- waiting up to {} ms for it "
-                                 "to land so the offer is recorded, not orphaned",
-                                 util::kKeepStopDrainBudgetMs);
+                    spdlog::warn("[Engine] [S74] KEEP stop: an offer create is "
+                                 "in flight (this stop arrived by signal, inside "
+                                 "a heartbeat cycle) -- waiting up to {} ms, one "
+                                 "create's worst case, for it to land so the "
+                                 "offer is recorded, not orphaned",
+                                 drain_budget_ms);
                 }
                 asio::steady_timer drain_timer(ioc_);
                 drain_timer.expires_after(
@@ -4588,8 +4628,14 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
     // trades, and a pause that stops passive posting while active taking
     // continues is not a pause -- the audit found the latch gated Step 8
     // alone while every taker path kept trading.
+    // [S74, review #165] ...and not after a stop was requested. 9f INITIATES
+    // taker trades. It sits BEFORE Step 8, so a keep stop's drain cannot hand
+    // control back here (the drain only waits on a create, which is inside
+    // Step 8) -- but a CANCELLING stop awaits its whole sweep, and this cycle
+    // resumes in every gap of it. The same gate covers Steps 9-13 below.
     if (!breaker_pause_active_
             && !watchdog_fired_.load(std::memory_order_acquire)
+            && !stop_requested_.load(std::memory_order_acquire)
             && wallet_step_may_run("Step 9f (drift corrector)")) {
         try { co_await step_run_drift_corrector(block_height); }
         catch (const std::exception& e) {
@@ -4733,6 +4779,30 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
     }
 
     } // end of !xch_recovery_mode_ block
+
+    // [S74, review #165] A STOP LATCHED WHILE THIS CYCLE WAS RUNNING ENDS IT
+    // HERE. The gate at the top of this function only sees a stop that arrived
+    // BETWEEN cycles; shutdown() is co_spawned onto the same io_context, so a
+    // stop delivered by a signal -- the only kind that can land mid-cycle --
+    // runs whenever this cycle suspends in an RPC, and a keep stop then waits
+    // (bounded) for an in-flight create, suspending itself and handing control
+    // back here. Without this gate the rest of the cycle carries on under a
+    // stop the operator has already asked for: Step 9c can SEND a crossed-book
+    // take_offer, and the ingest steps below open new wallet and node calls,
+    // all of them cut mid-flight by the ioc_.stop() that follows.
+    //
+    // Step 8 has its own checks (it re-reads the latch before posting and
+    // stops after the pair it was posting); everything after it is covered
+    // here. This is deliberately gated on stop_requested_, not on the keep
+    // latch alone: a CANCELLING stop must not start new takes either, and its
+    // sweep is running concurrently over the same coins.
+    if (stop_requested_.load(std::memory_order_acquire)) {
+        spdlog::warn("[Engine] block {} cut short: a stop was requested while "
+                     "this cycle was running -- Steps 9-13 (arbitrage takes, "
+                     "hedging, PnL, ingest, metrics, alerts) are NOT started",
+                     block_height);
+        co_return;
+    }
 
     if (!breaker_pause_active_
             && !watchdog_fired_.load(std::memory_order_acquire)) {
@@ -13968,15 +14038,12 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         if (!wallet_step_may_run("Step 8 post_quotes")) {
             co_return;
         }
-        // [review #165] post_quotes is the ONLY call through which this
-        // engine creates a maker offer. Marked until this pair's rows are in
-        // offer_log, so a keep stop delivered by a signal waits for an
-        // in-flight create to land instead of orphaning it (shutdown()).
-        struct PostingMark {
-            bool* flag;
-            ~PostingMark() { *flag = false; }
-        } posting_mark{&posting_in_flight_};
-        posting_in_flight_ = true;
+        // [review #165] post_quotes is the ONLY call through which this engine
+        // creates a maker offer. OfferManager marks posting_in_flight_ around
+        // each create_offer inside it -- from the request until that offer is
+        // in State -- so a keep stop delivered by a signal waits for the ONE
+        // call actually outstanding instead of orphaning it (shutdown(), and
+        // the PostingMark in offer_manager.cpp).
         int posted = co_await offer_mgr_->post_quotes(
             *pair_cfg, fee_filtered_tiers, block_height, fee_override);
 
