@@ -19,6 +19,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 ENGINE_CPP = REPO / "cpp" / "src" / "engine.cpp"
 ENGINE_HPP = REPO / "cpp" / "include" / "xop" / "engine.hpp"
+OFFER_MANAGER_CPP = REPO / "cpp" / "src" / "execution" / "offer_manager.cpp"
 
 #: Everything in Engine::shutdown() that submits a cancel, records one, or
 #: talks to the wallet on the way to one. A keep stop must reach none of them.
@@ -51,7 +52,7 @@ def _definition(path: Path, signature: str) -> str:
     return text[start:end]
 
 
-def _code(text: str) -> str:
+def _code(text: str, *, squeeze: bool = True) -> str:
     """Comments removed, string and char literals emptied, ALL whitespace
     squeezed out -- so a scan matches code, not prose or log text. A ' after a
     letter or digit is a digit separator (30'000), not a char literal."""
@@ -74,7 +75,8 @@ def _code(text: str) -> str:
         else:
             out.append(c)
             i += 1
-    return re.sub(r"\s+", "", "".join(out))
+    joined = "".join(out)
+    return re.sub(r"\s+", "", joined) if squeeze else joined
 
 
 def _block(code: str, opener: str) -> str:
@@ -112,6 +114,37 @@ def _block_followed_by(code: str, opener: str, following: str) -> str:
             if depth == 0:
                 return code[start:k + 1]
     raise AssertionError(f"unbalanced block after {opener!r}")
+
+
+def _functions_that_can_reach(path: Path, call: str) -> set[str]:
+    """Names of the `Class::function` definitions in *path* from which *call*
+    is reachable: those whose body contains it, closed over every function in
+    the same file that calls one of them.
+
+    Bodies keep their whitespace (comments and literals are still removed):
+    squeezed, `co_await helper(` reads `co_awaithelper(` and the call cannot be
+    told from a longer identifier."""
+    text = _text(path)
+    bodies: dict[str, str] = {}
+    starts = [(m.start(), m.group(1)) for m in re.finditer(
+        r"^[A-Za-z][^\n;]*?\b[A-Za-z_]+::([A-Za-z_]+)\(", text, re.M)]
+    for index, (at, name) in enumerate(starts):
+        end = starts[index + 1][0] if index + 1 < len(starts) else len(text)
+        bodies[name] = bodies.get(name, "") + _code(text[at:end], squeeze=False)
+    reach = {name for name, body in bodies.items() if call in body}
+    assert reach, f"{call!r} is called nowhere in {path.name}: the scan is vacuous"
+    grew = True
+    while grew:
+        grew = False
+        for name, body in bodies.items():
+            if name in reach:
+                continue
+            # A call, not a definition's own qualified name (`Class::name(`).
+            if any(re.search(r"(?<![A-Za-z0-9_:])" + re.escape(other) + r"\s*\(", body)
+                   for other in reach):
+                reach.add(name)
+                grew = True
+    return reach
 
 
 def _in_order(haystack: str, needles: list[str]) -> list[int]:
@@ -322,19 +355,18 @@ def test_the_one_offer_creating_call_is_marked_and_step_8_then_stops():
     stop = _block(step8, "if(offers_kept_on_stop_.load(std::memory_order_acquire)){")
     assert stop.endswith("co_return;}"), "Step 8 must stop, not carry on to the next pair"
     # Every maker create in OfferManager is reached only through post_quotes.
-    manager = _text(REPO / "cpp" / "src" / "execution" / "offer_manager.cpp")
-    creators = set()
-    current = None
-    for line in manager.splitlines():
-        found = re.match(r"^[A-Za-z].*\bOfferManager::([a-z_]+)\(", line)
-        if found:
-            current = found.group(1)
-        if "wallet_->create_offer(" in line and "//" not in line.split("wallet_->")[0]:
-            creators.add(current)
-    assert creators == {"post_quotes", "post_merged_side"}, creators
-    assert _code(manager).count("post_merged_side(") == 3, (
-        "post_merged_side must be reached only from post_quotes (its two calls "
-        "and its definition)")
+    # Stated as a PROPERTY, not as today's text: the functions that can reach
+    # the wallet's create_offer are closed over their callers inside
+    # offer_manager.cpp, and the only one of them the engine calls must be
+    # post_quotes. (An open PR moves every create_offer call into a private
+    # helper; a scan naming the two functions that hold the call today broke on
+    # that merged tree, with both PRs' own CI green.)
+    creators = _functions_that_can_reach(OFFER_MANAGER_CPP, "->create_offer(")
+    assert "post_quotes" in creators, creators
+    engine_calls = set(re.findall(r"offer_mgr_->([A-Za-z_]+)\(", engine))
+    assert creators & engine_calls == {"post_quotes"}, (
+        "the engine reaches an offer-creating OfferManager call that "
+        "posting_in_flight_ does not cover: %r" % sorted(creators & engine_calls))
 
 
 def test_the_keep_report_cannot_reach_the_wallet_or_the_intent_file():
