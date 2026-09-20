@@ -539,4 +539,119 @@ TEST(CoinLockLedgerWiringTest, SpendableAmountsTolerateBothRecordShapes) {
     EXPECT_EQ(amounts[1], 590'000'000'000LL);
 }
 
+// ---------------------------------------------------------------------------
+// [MIN-INPUT-COIN review #162] A CAT-funded create can carry
+// min_coin_amount, and chia applies it to the XCH fee coin as well.  The
+// ledger has to select from the pool the WALLET will select from.
+// ---------------------------------------------------------------------------
+
+constexpr Mojo kM = 1'000'000;  // a million mojos
+
+TEST(CoinLockLedgerMinCoinTest, TheFeeCoinTheWalletWillSkipIsNotTheOneCharged) {
+    // The review example: fee 10M, a 20M coin, floor 100M.  The wallet cannot
+    // see the 20M coin, so it locks the next one up -- a whole 1.5 XCH.
+    const std::vector<Mojo> coins = {20 * kM, 3 * kXch / 2, 2 * kXch};
+    CoinLockLedger with_floor(coins, 0, 1.0);
+    ASSERT_TRUE(with_floor.try_lock_floor_only(0, 10 * kM, 100 * kM));
+    EXPECT_EQ(with_floor.remaining(), 2 * kXch + 20 * kM);
+
+    // The same admission before the floor was modelled.
+    CoinLockLedger without(coins, 0, 1.0);
+    ASSERT_TRUE(without.try_lock_floor_only(0, 10 * kM));
+    EXPECT_EQ(without.remaining(), 3 * kXch / 2 + 2 * kXch);
+}
+
+TEST(CoinLockLedgerMinCoinTest, TheReserveIsCheckedAgainstWhatTheWalletLocks) {
+    // THE CONSEQUENCE.  Reserve 1 XCH, pool {20M, 1.5 XCH}.  Under the floor
+    // the wallet locks the 1.5 XCH coin and 20M is all that is left: refused.
+    // Charged the 20M coin instead, the ledger admitted it and reported 1.5
+    // XCH free that the wallet had already locked.
+    const std::vector<Mojo> coins = {20 * kM, 3 * kXch / 2};
+    CoinLockLedger ledger(coins, /*floor=*/kXch, 1.0);
+    EXPECT_FALSE(ledger.try_lock_floor_only(0, 10 * kM, 100 * kM));
+    EXPECT_EQ(ledger.remaining(), 3 * kXch / 2 + 20 * kM);  // nothing locked
+}
+
+TEST(CoinLockLedgerMinCoinTest, TheCapIsChargedTheFilteredCoinOnTheSpendPath) {
+    // try_lock takes the floor too (a CAT/CAT offer is not buy-XCH).  Cap is
+    // half of 3 XCH + 20M.  Each fee lock under the floor takes a whole 1-XCH
+    // coin, so the second crosses the cap; charged the 20M coin first, both
+    // were admitted.
+    const std::vector<Mojo> coins = {20 * kM, kXch, kXch, kXch};
+    CoinLockLedger ledger(coins, 0, 0.5);
+    EXPECT_TRUE(ledger.try_lock(0, 10 * kM, 100 * kM));
+    EXPECT_FALSE(ledger.try_lock(0, 10 * kM, 100 * kM));
+    EXPECT_EQ(ledger.committed(), kXch);
+    EXPECT_EQ(ledger.remaining(), 2 * kXch + 20 * kM);
+}
+
+TEST(CoinLockLedgerMinCoinTest, TheKnapsackUsesOnlyCoinsTheWalletCanSee) {
+    // Need 10M, floor 5.5M.  The sub-need coins the wallet can see are {6M}:
+    // not enough to knapsack, so it takes the smallest covering coin.  The
+    // two 5M coins are below the floor and must not complete the sum.
+    const std::vector<Mojo> coins = {5 * kM, 5 * kM, 6 * kM, kXch};
+    CoinLockLedger ledger(coins, 0, 1.0);
+    ASSERT_TRUE(ledger.try_lock_floor_only(0, 10 * kM, 5 * kM + kM / 2));
+    EXPECT_EQ(ledger.remaining(), 16 * kM);
+
+    // And when the visible sub-need coins DO cover the need, they are used,
+    // largest first, as before: {6M, 7M} of {3M, 6M, 7M}.
+    CoinLockLedger knapsack({3 * kM, 6 * kM, 7 * kM, kXch}, 0, 1.0);
+    ASSERT_TRUE(knapsack.try_lock_floor_only(0, 10 * kM, 4 * kM));
+    EXPECT_EQ(knapsack.remaining(), 3 * kM + kXch);
+}
+
+TEST(CoinLockLedgerMinCoinTest, AnExactMatchBelowTheFloorIsNotAvailable) {
+    // The wallet looks for its exact one-coin match among the FILTERED coins.
+    CoinLockLedger ledger({10 * kM, 50 * kM, kXch}, 0, 1.0);
+    ASSERT_TRUE(ledger.try_lock_floor_only(0, 10 * kM, 20 * kM));
+    EXPECT_EQ(ledger.remaining(), 10 * kM + kXch);
+}
+
+TEST(CoinLockLedgerMinCoinTest, ACoinExactlyAtTheFloorIsEligible) {
+    // chia's filter is inclusive: min_coin_amount <= coin.amount.
+    CoinLockLedger ledger({20 * kM, kXch}, 0, 1.0);
+    ASSERT_TRUE(ledger.try_lock_floor_only(0, 10 * kM, 20 * kM));
+    EXPECT_EQ(ledger.remaining(), kXch);
+}
+
+TEST(CoinLockLedgerMinCoinTest, WhenTheFloorLeavesTooLittleTheRetryIsModelled) {
+    // No coin at or above the floor: the wallet refuses, and OfferManager
+    // re-sends the create once WITHOUT the floor.  That create uses the
+    // default selection, so that is what the ledger charges -- refusing here
+    // would drop an offer the wallet goes on to fund.
+    CoinLockLedger ledger({20 * kM, 30 * kM}, 0, 1.0);
+    ASSERT_TRUE(ledger.try_lock_floor_only(0, 10 * kM, 100 * kM));
+    EXPECT_EQ(ledger.remaining(), 30 * kM);
+}
+
+TEST(CoinLockLedgerMinCoinTest, AFloorNoCoinFallsUnderChangesNothing) {
+    // A floor of 0, a negative one, one below every coin and one EQUAL to the
+    // smallest coin all leave every coin eligible, so each must reproduce the
+    // two-argument calls step for step.  The 3M coin is part of the first
+    // fee selection (3M + 7M is the 10M need exactly), so a filter that
+    // dropped it would change the trace.  That XCH-funded offers, which send
+    // no floor, select as before is pinned by the older tests in this file:
+    // they all use the two-argument calls and assert exact traces.
+    const std::vector<Mojo> coins = {3 * kM, 7 * kM, 40 * kM,
+                                     kXch, 2 * kXch, 2 * kXch};
+    for (Mojo min_coin : {Mojo{0}, Mojo{-5}, Mojo{1}, 3 * kM}) {
+        CoinLockLedger reference(coins, kXch / 2, 0.75);
+        CoinLockLedger subject(coins, kXch / 2, 0.75);
+        for (int i = 0; i < 6; ++i) {
+            const Mojo principal = (i % 2 == 0) ? kXch : Mojo{0};
+            EXPECT_EQ(subject.try_lock(principal, 10 * kM, min_coin),
+                      reference.try_lock(principal, 10 * kM))
+                << "min_coin " << min_coin << " step " << i;
+            EXPECT_EQ(subject.try_lock_floor_only(0, 10 * kM, min_coin),
+                      reference.try_lock_floor_only(0, 10 * kM))
+                << "min_coin " << min_coin << " step " << i;
+            EXPECT_EQ(subject.remaining(), reference.remaining())
+                << "min_coin " << min_coin << " step " << i;
+            EXPECT_EQ(subject.committed(), reference.committed())
+                << "min_coin " << min_coin << " step " << i;
+        }
+    }
+}
+
 }  // namespace

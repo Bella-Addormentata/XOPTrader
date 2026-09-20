@@ -232,3 +232,63 @@ def test_every_dexie_submission_names_the_offer():
             "a submit_to_dexie call passes no posting label, so a too-many-inputs "
             "warning could not say which offer it was: %r" % args
         )
+
+
+# ---------------------------------------------------------------------------
+# [review #162] chia applies the one min_coin_amount to the XCH fee coin too,
+# so the XCH lock ledger must admit against the same floor the create sends.
+# The selection itself is pinned by gtest (CoinLockLedgerMinCoinTest); these
+# pin that BOTH admission helpers hand it over, on BOTH ledger calls, and that
+# each posting path admits the very dict it then creates.
+# ---------------------------------------------------------------------------
+
+LEDGER_FLOOR = ("constMojomin_coin=ledger_min_coin_mojos("
+                "offer_dict,strategy_cfg_.offer_min_input_coin_frac);")
+
+
+def test_the_cycle_ledger_admits_against_the_floor_the_create_sends():
+    body = _code(_definition(OFFER_MANAGER_CPP, "bool OfferManager::xch_ledger_admits("))
+    assert body.count(LEDGER_FLOOR) == 1, (
+        "xch_ledger_admits no longer derives the floor from the offer_dict it admits"
+    )
+    assert body.count("xch_cycle_ledger_.try_lock_floor_only(0,current_fee_mojos_,min_coin)") == 1, (
+        "the buy-XCH admission charges the fee coin without the floor -- the "
+        "wallet skips coins below it and locks a larger one than the ledger records"
+    )
+    assert body.count("xch_cycle_ledger_.try_lock(principal,current_fee_mojos_,min_coin)") == 1, (
+        "the spend-side admission charges the fee coin without the floor"
+    )
+
+
+def test_the_preflight_probe_admits_against_the_same_floor():
+    body = _code(_definition(OFFER_MANAGER_CPP, "bool OfferManager::xch_ledger_probe_admits("))
+    assert body.count(LEDGER_FLOOR) == 1
+    assert body.count("probe.try_lock_floor_only(0,current_fee_mojos_,min_coin)") == 1, (
+        "the preflight probe admits buy-XCH tiers without the floor, so it can "
+        "keep a side the cycle ledger then refuses"
+    )
+    assert body.count(
+        "probe.try_lock(xch_principal_from_offer_dict(offer_dict),current_fee_mojos_,min_coin)"
+    ) == 1, "the preflight probe admits spend-side tiers without the floor"
+
+
+def test_no_ledger_admission_in_offer_manager_omits_the_floor():
+    whole = _code(_read(OFFER_MANAGER_CPP))
+    calls = (_call_arguments(whole, ".try_lock") + _call_arguments(whole, ".try_lock_floor_only"))
+    assert len(calls) == 4, "expected 4 ledger admissions, found %d: %r" % (len(calls), calls)
+    for args in calls:
+        assert _top_level_argument_count(args) == 3 and args.endswith(",min_coin"), (
+            "a ledger admission passes no min_coin: %r" % args
+        )
+
+
+def test_each_posting_path_admits_the_dict_it_then_creates():
+    whole = _code(_read(OFFER_MANAGER_CPP))
+    for dict_name in ("offer_dict", "merged_dict", "single_dict"):
+        assert whole.count("xch_ledger_admits(%s," % dict_name) == 1, (
+            "no ledger admission for %s" % dict_name
+        )
+        assert whole.count("co_awaitcreate_offer_min_coin(%s," % dict_name) == 1, (
+            "%s is admitted by the ledger but created from another dict, so the "
+            "floor the ledger models is not the one the wallet receives" % dict_name
+        )

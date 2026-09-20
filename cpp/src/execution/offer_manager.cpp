@@ -3831,11 +3831,15 @@ bool OfferManager::xch_ledger_probe_admits(CoinLockLedger&   probe,
     const bool buys_xch =
         (side == Side::Bid && pair.base_asset_id == "xch")
         || (side == Side::Ask && pair.quote_asset_id == "xch");
+    // [MIN-INPUT-COIN review #162] Same floor as the real admission, or the
+    // preflight would keep a side the cycle ledger then refuses.
+    const Mojo min_coin = ledger_min_coin_mojos(
+        offer_dict, strategy_cfg_.offer_min_input_coin_frac);
     if (buys_xch) {
-        return probe.try_lock_floor_only(0, current_fee_mojos_);
+        return probe.try_lock_floor_only(0, current_fee_mojos_, min_coin);
     }
     return probe.try_lock(xch_principal_from_offer_dict(offer_dict),
-                          current_fee_mojos_);
+                          current_fee_mojos_, min_coin);
 }
 
 bool OfferManager::xch_ledger_admits(const json&       offer_dict,
@@ -3859,8 +3863,15 @@ bool OfferManager::xch_ledger_admits(const json&       offer_dict,
     const bool buys_xch =
         (side == Side::Bid && pair.base_asset_id == "xch")
         || (side == Side::Ask && pair.quote_asset_id == "xch");
+    // [MIN-INPUT-COIN review #162] The floor create_offer_min_coin will send
+    // for THIS offer_dict -- per-tier, merged batch and batch fallback alike
+    // -- which the wallet also applies to the XCH fee coin.  0 for an
+    // XCH-funded offer, so those admissions are unchanged.
+    const Mojo min_coin = ledger_min_coin_mojos(
+        offer_dict, strategy_cfg_.offer_min_input_coin_frac);
     if (buys_xch) {
-        if (xch_cycle_ledger_.try_lock_floor_only(0, current_fee_mojos_)) {
+        if (xch_cycle_ledger_.try_lock_floor_only(0, current_fee_mojos_,
+                                                  min_coin)) {
             return true;
         }
         xch_ledger_suppressed_ = true;
@@ -3874,7 +3885,7 @@ bool OfferManager::xch_ledger_admits(const json&       offer_dict,
         return false;
     }
     const Mojo principal = xch_principal_from_offer_dict(offer_dict);
-    if (xch_cycle_ledger_.try_lock(principal, current_fee_mojos_)) {
+    if (xch_cycle_ledger_.try_lock(principal, current_fee_mojos_, min_coin)) {
         return true;
     }
     xch_ledger_suppressed_ = true;

@@ -48,6 +48,7 @@ namespace asio = boost::asio;
 using nlohmann::json;
 using xop::execution::create_offer_with_min_coin_fallback;
 using xop::execution::dexie_rejected_too_many_inputs;
+using xop::execution::ledger_min_coin_mojos;
 using xop::execution::min_input_coin_frac_ppb;
 using xop::execution::min_input_coin_mojos;
 using xop::execution::offer_min_input_coin;
@@ -200,15 +201,82 @@ TEST(OfferMinInputCoin, AnInvalidFractionDegradesToNoFloor) {
     }
 }
 
-TEST(OfferMinInputCoin, TheFractionIsReadInPartsPerBillion) {
+TEST(OfferMinInputCoin, TheFractionIsReadInPartsPerBillionRoundedUp) {
+    // Exact in ppb: unchanged by the direction of rounding.
     EXPECT_EQ(min_input_coin_frac_ppb(0.01), std::uint64_t{10'000'000});
     EXPECT_EQ(min_input_coin_frac_ppb(0.5), std::uint64_t{500'000'000});
     // Positive but below the resolution still means "on".
     EXPECT_EQ(min_input_coin_frac_ppb(1e-12), std::uint64_t{1});
-    // Just under 1 rounds to the full scale and is pulled back below it, so
-    // the floor can never exceed the amount offered.
+    // [review #162] Not exact in ppb: UP, never to nearest.  Both of these
+    // have a fractional part under one half, so nearest rounds them DOWN
+    // (10,101,010 and 333,333,333) and the applied fraction falls below the
+    // configured one.
+    EXPECT_EQ(min_input_coin_frac_ppb(0.0101010102), std::uint64_t{10'101'011});
+    EXPECT_EQ(min_input_coin_frac_ppb(1.0 / 3.0), std::uint64_t{333'333'334});
+    // Just under 1 reaches the full scale.  Pulling it back to scale - 1
+    // would be the one place the fraction is still rounded down.
     EXPECT_EQ(min_input_coin_frac_ppb(std::nextafter(1.0, 0.0)),
-              std::uint64_t{999'999'999});
+              std::uint64_t{1'000'000'000});
+}
+
+TEST(OfferMinInputCoin, AFractionJustUnderOneMakesTheFloorTheWholeOffer) {
+    // The full scale: only a coin at least as large as the offer may fund it.
+    // Equal to the amount, never above it -- and no wrap at the top of uint64,
+    // where q x ppb is the whole multiple of 10^9 below the amount.
+    const double almost_one = std::nextafter(1.0, 0.0);
+    for (std::uint64_t offered :
+         {std::uint64_t{1}, std::uint64_t{12'345}, std::uint64_t{1'000'000'000},
+          std::uint64_t{1'000'000'001},
+          std::numeric_limits<std::uint64_t>::max()}) {
+        const auto coin_floor = min_input_coin_mojos(offered, almost_one);
+        ASSERT_TRUE(coin_floor.has_value()) << offered;
+        EXPECT_EQ(*coin_floor, offered);
+    }
+}
+
+TEST(OfferMinInputCoin, TheReviewExampleReachesTheAmountInNinetyNineCoins) {
+    // [review #162] 0.0101010102 is a hair above 1/99, so ceil(1 / frac) is
+    // 99.  Rounded to nearest it became 10,101,010 ppb and 99 floor-sized
+    // coins of a 1,000,000,000-mojo offer totalled 999,999,990.
+    const auto coin_floor = min_input_coin_mojos(1'000'000'000, 0.0101010102);
+    ASSERT_TRUE(coin_floor.has_value());
+    EXPECT_EQ(*coin_floor, std::uint64_t{10'101'011});
+    EXPECT_EQ(static_cast<std::uint64_t>(std::ceil(1.0 / 0.0101010102)),
+              std::uint64_t{99});
+    EXPECT_GE(*coin_floor * 99u, std::uint64_t{1'000'000'000});
+}
+
+TEST(OfferMinInputCoin, TheInputBoundHoldsAtEveryReciprocalBoundary) {
+    // The documented bound, as a property: ceil(1 / frac) coins of floor size
+    // always reach the amount.  Reciprocals are where it is tightest -- k x
+    // frac is 1 with nothing to spare -- and rounding the fraction to nearest
+    // broke it for 901 of the 1,999 values of 1/k below (k = 3 first).
+    // Counted rather than asserted per case, so a regression prints one line.
+    std::uint64_t broken = 0;
+    std::string   first_broken;
+    for (std::uint64_t k = 2; k <= 2000; ++k) {
+        const double exact = 1.0 / static_cast<double>(k);
+        for (double frac : {exact, std::nextafter(exact, 1.0)}) {
+            const auto coins =
+                static_cast<std::uint64_t>(std::ceil(1.0 / frac));
+            for (std::uint64_t offered :
+                 {std::uint64_t{80'334}, std::uint64_t{999'999'937},
+                  std::uint64_t{1'000'000'000}, std::uint64_t{1'000'000'001},
+                  std::uint64_t{123'456'789'012}}) {
+                const auto coin_floor = min_input_coin_mojos(offered, frac);
+                if (!coin_floor.has_value() || *coin_floor * coins < offered) {
+                    if (broken == 0) {
+                        first_broken = "k=" + std::to_string(k) + " offered="
+                                     + std::to_string(offered) + " floor="
+                                     + std::to_string(coin_floor.value_or(0))
+                                     + " coins=" + std::to_string(coins);
+                    }
+                    ++broken;
+                }
+            }
+        }
+    }
+    EXPECT_EQ(broken, std::uint64_t{0}) << "first: " << first_broken;
 }
 
 TEST(OfferMinInputCoin, TheFloorNeverExceedsTheAmountOffered) {
@@ -330,6 +398,39 @@ TEST(OfferMinInputCoin, ExtremeAmountsAreReadWithoutWrapping) {
     EXPECT_EQ(offer_min_input_coin(big_receive, 0.01), Floor{1'000});
 }
 
+TEST(OfferMinInputCoin, TheLedgerIsGivenTheSameFloorTheWalletIs) {
+    // [review #162] The wallet applies the floor to the XCH fee coin too, so
+    // the XCH lock ledger admits against the same number.  Same offer_dict,
+    // same fraction, same answer -- as signed mojos, 0 for "none".
+    for (std::int64_t cat_mojos : {std::int64_t{1}, std::int64_t{80'334},
+                                   std::int64_t{10'000'000'000}}) {
+        const json dict = cat_funded_bid(cat_mojos);
+        const Floor sent = offer_min_input_coin(dict, 0.01);
+        ASSERT_TRUE(sent.has_value());
+        EXPECT_EQ(static_cast<std::uint64_t>(ledger_min_coin_mojos(dict, 0.01)),
+                  *sent);
+    }
+    EXPECT_EQ(ledger_min_coin_mojos(cat_funded_bid(80'334), 0.01), 804);
+    // No floor sent, no floor modelled: XCH-funded, disabled, unknown shape.
+    const json xch_ask{{"1", std::int64_t{-1'000'000'000'000}},
+                       {"5", std::int64_t{80'334}}};
+    EXPECT_EQ(ledger_min_coin_mojos(xch_ask, 0.01), 0);
+    EXPECT_EQ(ledger_min_coin_mojos(cat_funded_bid(80'334), 0.0), 0);
+    EXPECT_EQ(ledger_min_coin_mojos(json::object(), 0.01), 0);
+}
+
+TEST(OfferMinInputCoin, ALedgerFloorAboveInt64Saturates) {
+    // A spend of INT64_MIN at the full scale is a floor of 2^63, one past
+    // what a Mojo holds.  Wrapped, it is negative and the ledger would read
+    // it as "no floor"; saturated, it still filters every coin.
+    const json min_leg{{"5", std::numeric_limits<std::int64_t>::min()},
+                       {"1", std::int64_t{1}}};
+    ASSERT_EQ(offer_min_input_coin(min_leg, std::nextafter(1.0, 0.0)),
+              Floor{9'223'372'036'854'775'808ULL});
+    EXPECT_EQ(ledger_min_coin_mojos(min_leg, std::nextafter(1.0, 0.0)),
+              std::numeric_limits<std::int64_t>::max());
+}
+
 // ===========================================================================
 // 3. The XCH fee coin lives under the same floor
 // ===========================================================================
@@ -338,7 +439,9 @@ TEST(OfferMinInputCoin, ACatScaledFloorIsTinyInXchTerms) {
     // chia 2.7.4 applies ONE min_coin_amount to every selection in the
     // request, so for a CAT-funded offer the floor also filters the XCH fee
     // coin -- read as XCH mojos.  A CAT has 10^3 mojos per unit and XCH has
-    // 10^12, which is what keeps that harmless.
+    // 10^12, which keeps it small.  Small is not inert: above the fee it
+    // changes which coin pays, and test_coin_lock_ledger pins that the ledger
+    // models it.
     const std::uint64_t xch = static_cast<std::uint64_t>(xop::kMojosPerXch);
     // The incident offer: 804 mojos is under a billionth of an XCH.
     const Floor incident = offer_min_input_coin(cat_funded_bid(80'334), 0.01);

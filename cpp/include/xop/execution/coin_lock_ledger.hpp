@@ -35,6 +35,28 @@
 // knapsack is randomized, so this is a bounded approximation -- see
 // select_for for the layers that bound the divergence.
 //
+// [MIN-INPUT-COIN review #162] THE POOL IS THE ONE THE WALLET SELECTS FROM.
+// A CAT-funded create can carry min_coin_amount, and chia applies that one
+// value to the XCH fee coin too, so the wallet never sees XCH coins below it.
+// Admitting against the unfiltered pool charged a coin the wallet would skip:
+// fee 10,000,000, coins {20,000,000, 1.5 XCH}, floor 100,000,000 -- the
+// ledger took the 20M coin while the wallet locked the 1.5 XCH one, and later
+// creates passed the cap and the reserve floor on XCH that was already
+// locked.  It needs only floor > fee, i.e. offered CAT mojos > fee /
+// strategy.offer_min_input_coin_frac: 500 CAT units at the shipped
+// fees.min_fee_mojos of 5,000.  try_lock and try_lock_floor_only therefore
+// take the floor and select among coins at or above it.
+//
+// When those coins cannot cover the need the wallet REFUSES, and
+// OfferManager re-sends the create once without the floor, so the ledger
+// then models the default selection -- the same two steps, in the same
+// order.  One residual is left unmodelled: the floor changes the fee-coin
+// selection AND the wallet refuses for the CAT leg, so the retry locks the
+// default coin while the ledger holds the filtered one.  That over-counts
+// whenever it matters (the filtered coin is the larger); it can under-count
+// only when the default is a knapsack of sub-fee coins, by less than one
+// fee.  Reseeding every cycle bounds both.
+//
 // Pure and synchronous so it is unit-testable in isolation
 // (tests/test_coin_lock_ledger.cpp); the async snapshot fetch lives in
 // OfferManager::begin_xch_lock_cycle().
@@ -104,7 +126,13 @@ public:
     /// charge counts against the cap.  Refusal locks nothing.
     /// Over-counting after a failed create is the deliberate conservative
     /// direction.
-    [[nodiscard]] bool try_lock(Mojo principal_mojos, Mojo fee_mojos)
+    ///
+    /// @param min_coin_mojos  The min_coin_amount the create will carry
+    ///        (execution::ledger_min_coin_mojos); 0 or less means none, and
+    ///        the selection is then exactly what it was before the floor
+    ///        existed.
+    [[nodiscard]] bool try_lock(Mojo principal_mojos, Mojo fee_mojos,
+                                Mojo min_coin_mojos = 0)
     {
         if (!active_) {
             return true;
@@ -113,7 +141,7 @@ public:
         if (need == 0) {
             return true;
         }
-        const Selection sel = select_for(need);
+        const Selection sel = select_for(need, min_coin_mojos);
         if (!sel.covered) {
             return false;  // pool cannot fund this lock at all
         }
@@ -139,8 +167,12 @@ public:
     /// zero (the incident's five CAT-principal bids would have done
     /// exactly that through an unconditional bypass).  The charge does not
     /// count against committed(): the cap remains a spend-side budget.
+    ///
+    /// @param min_coin_mojos  As for try_lock.  This is the path every
+    ///        buy-XCH CAT-funded bid takes, so it is where the floor matters.
     [[nodiscard]] bool try_lock_floor_only(Mojo principal_mojos,
-                                           Mojo fee_mojos)
+                                           Mojo fee_mojos,
+                                           Mojo min_coin_mojos = 0)
     {
         if (!active_) {
             return true;
@@ -149,7 +181,7 @@ public:
         if (need == 0) {
             return true;
         }
-        const Selection sel = select_for(need);
+        const Selection sel = select_for(need, min_coin_mojos);
         if (!sel.covered) {
             return false;
         }
@@ -200,15 +232,36 @@ private:
         return saturating_add(principal, fee);
     }
 
-    /// Wallet-shaped selection (see header).  coins_ is sorted ascending,
-    /// so sub-need coins are a prefix and the smallest single covering
+    /// The selection for a create carrying `min_coin` (see the header).
+    /// Among the coins at or above it when they can cover the need -- that
+    /// is what the wallet does -- and otherwise the default selection,
+    /// because the wallet then refuses and the create is re-sent without
+    /// the floor.  No floor is the default selection, unchanged.
+    [[nodiscard]] Selection select_for(Mojo need, Mojo min_coin = 0) const
+    {
+        if (min_coin > 0) {
+            const auto first_eligible = static_cast<std::size_t>(
+                std::lower_bound(coins_.begin(), coins_.end(), min_coin)
+                - coins_.begin());
+            const Selection filtered = select_among(need, first_eligible);
+            if (filtered.covered) {
+                return filtered;
+            }
+        }
+        return select_among(need, 0);
+    }
+
+    /// Wallet-shaped selection (see header) over coins_[lo, end).  coins_ is
+    /// sorted ascending, so the eligible coins are a suffix, the sub-need
+    /// ones among them a contiguous run, and the smallest single covering
     /// coin is the first element at/after the boundary.  The knapsack
     /// prefix, when applicable, is what the wallet will actually lock --
     /// identity fidelity matters as much as value (review round 5).
-    [[nodiscard]] Selection select_for(Mojo need) const
+    [[nodiscard]] Selection select_among(Mojo need, std::size_t lo) const
     {
         Selection single_sel;
-        const auto it = std::lower_bound(coins_.begin(), coins_.end(), need);
+        const auto first = coins_.begin() + static_cast<std::ptrdiff_t>(lo);
+        const auto it = std::lower_bound(first, coins_.end(), need);
         if (it != coins_.end()) {
             single_sel.covered    = true;
             single_sel.locked     = *it;
@@ -242,7 +295,9 @@ private:
             std::size_t count   = 0;
             const auto  sub_need_end =
                 static_cast<std::size_t>(it - coins_.begin());
-            while (count < sub_need_end && covered < need) {
+            // Bounded below by `lo`: a coin under the floor is one the
+            // wallet cannot see, so it cannot be part of its knapsack.
+            while (count < sub_need_end - lo && covered < need) {
                 covered = saturating_add(
                     covered, coins_[sub_need_end - 1 - count]);
                 ++count;

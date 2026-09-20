@@ -32,10 +32,23 @@
 // get_coins_to_offer AND, for a CAT-funded offer that pays a fee, to
 // CATWallet.create_tandem_xch_tx, which selects the XCH fee coin under it.
 // So the number sent for a CAT leg is also a floor on the fee coin, read as
-// XCH mojos.  That is harmless by construction: a CAT has 1,000 mojos per
-// unit and XCH has 10^12, so the 804-mojo floor of the offer above is
-// 0.000000000804 XCH, and even a 1,000,000-unit CAT offer puts the fee-coin
-// floor at 0.00001 XCH.  test_offer_min_input_coin pins those magnitudes.
+// XCH mojos.  It is small: a CAT has 1,000 mojos per unit and XCH has 10^12,
+// so the 804-mojo floor of the offer above is 0.000000000804 XCH, and even a
+// 1,000,000-unit CAT offer puts the fee-coin floor at 0.00001 XCH.
+// test_offer_min_input_coin pins those magnitudes.
+//
+// SMALL IS NOT THE SAME AS INERT [review #162].  The floor changes which XCH
+// coin pays the fee as soon as it exceeds a coin the wallet would otherwise
+// have picked, and that needs only floor > fee: offered CAT mojos > fee /
+// fraction.  At the default fraction that is 100 x the fee -- 1,000,000 CAT
+// units at the 10,000,000-mojo offer_fee_mojos, but only 500 CAT units at
+// the shipped fees.min_fee_mojos of 5,000, which a merged XCH/DBX bid of
+// about 6 XCH reaches.  With an XCH coin sized in [fee, floor) in the
+// wallet, the default selection would take that small coin while the
+// filtered one skips it and locks the next larger one -- typically a whole
+// pool coin.  The XCH lock ledger therefore takes the same floor
+// (CoinLockLedger::try_lock / try_lock_floor_only, ledger_min_coin_mojos
+// below), so what it charges is what the wallet locks.
 //
 // THE RULE
 // --------
@@ -76,6 +89,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -84,8 +98,9 @@
 
 namespace xop::execution {
 
-/// The fraction is applied in parts per billion, so the arithmetic below is
-/// exact integer arithmetic and gives one answer on every compiler.
+/// The fraction is applied in parts per billion, ROUNDED UP, so the
+/// arithmetic below is exact integer arithmetic and gives one answer on
+/// every compiler.
 inline constexpr std::uint64_t kMinInputCoinFracScale = 1'000'000'000ULL;
 
 /// Wallet id 1 is the XCH wallet; offer_dict keys are wallet ids as strings.
@@ -96,18 +111,29 @@ inline constexpr std::string_view kXchWalletIdKey = "1";
 /// 0 for anything outside (0, 1), NaN included (both comparisons are false
 /// for NaN).  config.cpp rejects those values at load, so this is the second
 /// line: a bad fraction degrades to the pre-existing request, never to a
-/// floor nobody chose.  A positive fraction below the resolution still means
-/// "on", so it rounds up to 1 ppb rather than down to off.
+/// floor nobody chose.
+///
+/// ROUNDED UP, NEVER TO NEAREST [review #162].  The input bound needs the
+/// applied fraction to be at least the configured one: k = ceil(1 / frac)
+/// coins reach the amount only if k x applied >= 1.  Rounding to nearest
+/// rounds half of all fractions DOWN, and it broke the bound for ordinary
+/// values, not exotic ones: 1/3 became 333,333,333 ppb, and three floor-sized
+/// coins of a 1,000,000,000-mojo offer then totalled 999,999,999.  Rounded up,
+/// the applied fraction can exceed the configured one by under 1 ppb, which
+/// only raises the floor.  An operator-entered decimal can land one ppb high
+/// for the same reason (its double is a hair above it); 0.01 does not.
+///
+/// The result is in [1, scale]: a positive fraction below the resolution is
+/// still "on" (1 ppb), and one just under 1 reaches the full scale, where
+/// the floor equals the amount offered -- never more.
 [[nodiscard]] constexpr std::uint64_t min_input_coin_frac_ppb(
     double frac) noexcept
 {
     if (!(frac > 0.0) || !(frac < 1.0)) return 0;
-    const auto ppb = static_cast<std::uint64_t>(
-        frac * static_cast<double>(kMinInputCoinFracScale) + 0.5);
-    if (ppb == 0) return 1;
-    // frac < 1 can still round to the full scale; keep the result below it
-    // so the floor can never exceed the amount offered.
-    if (ppb >= kMinInputCoinFracScale) return kMinInputCoinFracScale - 1;
+    // In (0, 10^9], so the cast is defined, and truncation is floor.
+    const double scaled = frac * static_cast<double>(kMinInputCoinFracScale);
+    auto ppb = static_cast<std::uint64_t>(scaled);
+    if (static_cast<double>(ppb) < scaled) ++ppb;
     return ppb;
 }
 
@@ -120,7 +146,8 @@ inline constexpr std::string_view kXchWalletIdKey = "1";
 ///
 /// Always in [1, offered_mojos], so a coin exactly the size of the offer is
 /// never excluded.  Split at the scale so neither product can wrap:
-/// r x ppb < 10^18 and q x ppb < 1.845 x 10^19 for any uint64 amount.
+/// r x ppb < 10^18 and q x ppb <= offered_mojos for any uint64 amount, the
+/// full scale included.
 [[nodiscard]] constexpr std::optional<std::uint64_t> min_input_coin_mojos(
     std::uint64_t offered_mojos, double frac) noexcept
 {
@@ -145,6 +172,11 @@ static_assert(!min_input_coin_mojos(100'000, 1.0).has_value());
 static_assert(!min_input_coin_mojos(0, 0.01).has_value());
 static_assert(min_input_coin_mojos(UINT64_MAX, 0.01)
               == 184'467'440'737'095'517ULL);
+// [review #162] The fraction is rounded UP to ppb.  To nearest, the first is
+// 10,101,010 and 99 such coins total 999,999,990; the second is 333,333,333.
+static_assert(min_input_coin_mojos(1'000'000'000, 0.0101010102)
+              == 10'101'011u);
+static_assert(min_input_coin_mojos(1'000'000'000, 1.0 / 3.0) == 333'333'334u);
 
 /// The floor to send for the offer this offer_dict describes, or nullopt.
 ///
@@ -175,6 +207,25 @@ static_assert(min_input_coin_mojos(UINT64_MAX, 0.01)
     }
     if (!spent.has_value()) return std::nullopt;
     return min_input_coin_mojos(*spent, frac);
+}
+
+/// offer_min_input_coin() in the form the XCH lock ledger takes: signed
+/// mojos, 0 when no floor is sent.
+///
+/// [review #162] The wallet applies the one min_coin_amount to the XCH fee
+/// coin as well, so the ledger has to admit against the same filtered pool or
+/// it charges a coin the wallet will skip.  Deriving both numbers from the
+/// one offer_dict is what keeps them equal.  A floor above INT64_MAX (only a
+/// spend of INT64_MIN at a fraction near 1 gets there) saturates; wrapped
+/// negative it would read as "no floor".
+[[nodiscard]] inline std::int64_t ledger_min_coin_mojos(
+    const nlohmann::json& offer_dict, double frac)
+{
+    constexpr std::uint64_t kMax = static_cast<std::uint64_t>(
+        std::numeric_limits<std::int64_t>::max());
+    const std::uint64_t coin_floor =
+        offer_min_input_coin(offer_dict, frac).value_or(0);
+    return static_cast<std::int64_t>(coin_floor > kMax ? kMax : coin_floor);
 }
 
 /// Did the wallet refuse a create because the coins at or above
