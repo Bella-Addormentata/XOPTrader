@@ -366,6 +366,10 @@ strategy:
   # our own TTL would let the chain retire offers the engine still tracks as
   # live, with no cancel ever recorded.
   # offer_expiry_secs: 172800  # [OPTIONAL, default: 0 = disabled] 48h
+  num_tiers: 4               # [REQUIRED] Multi-tier offer ladder depth (4 recommended: fewer, larger tiers)
+  tier_spacing_bps: [35, 100, 200, 300]  # [REQUIRED] Spread per tier (bps)
+  tier_size_pct: [0.15, 0.20, 0.30, 0.35] # [REQUIRED] Capital fraction per tier (sum ≈ 1.0)
+  max_half_spread_bps: 250  # [OPTIONAL, default: 250] Global cap on half-spread
   # [S70-S72] Three switches that cut CANCELS (each is a fee-bearing spend).
   # Every one defaults to the rule in force before it existed; all need a
   # restart.  Enable one at a time and watch the log line named beside it.
@@ -394,10 +398,6 @@ strategy:
   #   "margin_breach(<edge>/<floor>bps)".
   # price_cancel_mode: deviation           # [OPTIONAL, default: deviation] deviation | margin
   # price_cancel_edge_retain: 0.5          # [OPTIONAL, default: 0.5] (0, 1] margin only: 1.0 cancels the instant the edge dips under the POSTING floor, where Step 7 routinely rests tiers
-  num_tiers: 4              # [REQUIRED] Multi-tier offer ladder depth (4 recommended: fewer, larger tiers)
-  tier_spacing_bps: [35, 100, 200, 300]  # [REQUIRED] Spread per tier (bps)
-  tier_size_pct: [0.15, 0.20, 0.30, 0.35] # [REQUIRED] Capital fraction per tier (sum ≈ 1.0)
-  max_half_spread_bps: 250  # [OPTIONAL, default: 250] Global cap on half-spread
   offer_fee_mojos: 10000000  # [OPTIONAL, default: 10000000] On-chain fee per offer/cancel
   # --- Triangulated fair-value guard ----------------------------------------
   # The ladder is centred on a dexie book mid.  These knobs validate that mid

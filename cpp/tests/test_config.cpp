@@ -3178,142 +3178,6 @@ TEST(PaceConfig, ParsesAllKeysAndUppercasesAssets) {
     EXPECT_EQ(strategy.pace_reprice_min_age_blocks, 120u);
 }
 
-TEST(PaceConfig, NonFiniteDoubleKeysThrow) {
-    // Every pace double key has a finite upper bound, so the .inf rows also
-    // trip the range check; only the .nan rows need the finiteness test.
-    const char* const keys[] = {
-        "pace_enter_tol_mult", "pace_exit_tol_mult", "pace_max_resting_frac", "pace_min_tier_units",
-        "pace_max_tier_units", "pace_tighten_step_bps", "pace_tighten_max_bps", "pace_min_edge_bps",
-        "pace_edge_sigma_mult", "pace_max_fair_value_sigma_bps", "pace_reprice_min_bps",
-    };
-    for (const char* key : keys) {
-        for (const char* value : {".nan", ".inf"}) {
-            SCOPED_TRACE(std::string(key) + ": " + value);
-            expect_config_error_containing(
-                pace_with_strategy(std::string("  ") + key + ": " + value + "\n"), key);
-        }
-    }
-}
-
-TEST(PaceConfig, OutOfRangeThrows) {
-    struct Row {
-        const char* key{nullptr};
-        const char* value{nullptr};
-    };
-    const Row rows[] = {
-        {"pace_horizon_blocks", "4607"},           {"pace_horizon_blocks", "414721"},
-        {"pace_enter_tol_mult", "0"},              {"pace_enter_tol_mult", "10.0001"},
-        {"pace_exit_tol_mult", "-0.0001"},         {"pace_exit_tol_mult", "10"},
-        {"pace_max_resting_frac", "0"},            {"pace_max_resting_frac", "1.0001"},
-        {"pace_min_tier_units", "0"},
-        {"pace_max_tier_units", "0"},              {"pace_max_tier_units", "1000000.1"},
-        {"pace_max_tiers", "0"},                   {"pace_max_tiers", "17"},
-        {"pace_tighten_step_bps", "0.9999"},       {"pace_tighten_step_bps", "1000.0001"},
-        {"pace_tighten_max_bps", "-1"},            {"pace_tighten_max_bps", "5000.0001"},
-        {"pace_min_edge_bps", "0"},                {"pace_min_edge_bps", "2000.0001"},
-        {"pace_edge_sigma_mult", "-0.0001"},       {"pace_edge_sigma_mult", "5.0001"},
-        {"pace_max_fair_value_sigma_bps", "0"},    {"pace_max_fair_value_sigma_bps", "2000.0001"},
-        {"pace_max_balance_age_blocks", "0"},      {"pace_max_balance_age_blocks", "4609"},
-        {"pace_reprice_min_bps", "0"},             {"pace_reprice_min_bps", "1000.0001"},
-        {"pace_reprice_min_age_blocks", "11"},     {"pace_reprice_min_age_blocks", "4609"},
-    };
-    for (const Row& row : rows) {
-        SCOPED_TRACE(std::string(row.key) + ": " + row.value);
-        expect_config_error_containing(
-            pace_with_strategy(std::string("  ") + row.key + ": " + row.value + "\n"), row.key);
-    }
-}
-
-TEST(PaceConfig, ExitNotBelowEnterThrows) {
-    expect_config_error_containing(
-        pace_with_strategy("  pace_enter_tol_mult: 1.5\n  pace_exit_tol_mult: 1.5\n"), "pace_exit_tol_mult");
-}
-
-TEST(PaceConfig, MinTierAboveMaxTierThrows) {
-    expect_config_error_containing(
-        pace_with_strategy("  pace_min_tier_units: 6\n  pace_max_tier_units: 5\n"), "pace_min_tier_units");
-}
-
-TEST(PaceConfig, XchInAssetsThrowsWhenEnabled) {
-    expect_config_error_containing(
-        pace_with_strategy("  pace_enabled: true\n  pace_assets: [XCH]\n" + kPaceTargets),
-        "must not contain XCH");
-}
-
-TEST(PaceConfig, AssetWithoutTargetThrowsWhenEnabled) {
-    expect_config_error_containing(pace_with_strategy(kPaceOn), "asset_target_allocations");
-}
-
-TEST(PaceConfig, ZeroToleranceThrowsWhenEnabled) {
-    expect_config_error_containing(
-        pace_with_strategy(kPaceOn
-                           + "  asset_target_allocations:\n    XCH: 0.5\n    TEST: 0.05\n"
-                             "  asset_target_tolerances:\n    XCH: 0.4\n    TEST: 0.0\n"),
-        "asset_target_tolerances");
-}
-
-TEST(PaceConfig, SigmaCeilingAboveFairValueCeilingThrowsWhenEnabled) {
-    // 150 is the lowest fair_value_max_sigma_bps the repo's tight-sigma check
-    // accepts at the default fair_value_tight_sigma_bps of 150.
-    expect_config_error_containing(
-        pace_with_strategy(kPaceOn + kPaceTargets + "  fair_value_max_sigma_bps: 150\n"),
-        "pace_max_fair_value_sigma_bps");
-}
-
-TEST(PaceConfig, ChecksSkippedWhenDisabled) {
-    expect_loads(pace_with_strategy("  pace_assets: [XCH]\n  fair_value_max_sigma_bps: 150\n"));
-}
-
-TEST(PaceConfig, BaseManagedPairThrowsWhenEnabled) {
-    expect_config_error_containing(
-        pace_after_first_pair(pace_with_strategy(kPaceOn + kPaceTargets),
-                              "  - base_asset_id: \"" + kTestId + "\"\n"
-                              "    quote_asset_id: \"xch\"\n"
-                              "    name: \"TEST/XCH\"\n"
-                              "    enabled: true\n"),
-        "must be XCH/TEST");
-}
-
-TEST(PaceConfig, NonXchPairTouchingAssetThrowsWhenEnabled) {
-    expect_config_error_containing(
-        pace_after_first_pair(pace_with_strategy(kPaceOn + kPaceTargets),
-                              "  - base_asset_id: \"" + kTestId + "\"\n"
-                              "    quote_asset_id: \"" + std::string(kTest2) + "\"\n"
-                              "    name: \"TEST/OTHER\"\n"
-                              "    enabled: true\n"),
-        "must be XCH/TEST");
-}
-
-TEST(PaceConfig, DisabledPairTouchingAssetIgnored) {
-    expect_loads(
-        pace_after_first_pair(pace_with_strategy(kPaceOn + kPaceTargets),
-                              "  - base_asset_id: \"" + kTestId + "\"\n"
-                              "    quote_asset_id: \"" + std::string(kTest2) + "\"\n"
-                              "    name: \"TEST/OTHER\"\n"
-                              "    enabled: false\n"));
-}
-
-TEST(PaceConfig, StablecoinPacePairThrowsWhenEnabled) {
-    // The same is_stablecoin / peg_target shape loads without pace
-    // (ConfigParserTest.S20NonFinitePegTargetRejected).
-    expect_config_error_containing(
-        pace_after_first_pair(pace_with_strategy(kPaceOn + kPaceTargets),
-                              "    is_stablecoin: true\n    peg_target: 1.0\n"),
-        "must not set is_stablecoin");
-}
-
-TEST(PaceConfig, StaleFeedThresholdDisabledThrowsWhenEnabled) {
-    std::string yaml = pace_with_strategy(kPaceOn + kPaceTargets);
-    yaml += "\nmarket_data:\n  cex_freshness_threshold_sec: 0\n";
-    expect_config_error_containing(yaml, "cex_freshness_threshold_sec");
-}
-
-TEST(PaceConfig, EnabledWithEmptyAssetsWarns) {
-    CapturedLog log;
-    expect_loads(pace_with_strategy("  pace_enabled: true\n"));
-    EXPECT_TRUE(log.warned_containing("pace_assets is empty")) << log.text();
-}
-
 // ===========================================================================
 // [S70-S72 2026-09-20] The three cancel-reduction switches, through the PARSER.
 //
@@ -3322,6 +3186,10 @@ TEST(PaceConfig, EnabledWithEmptyAssetsWarns) {
 // closed vocabulary (a typo must not silently keep the old rule while the
 // operator believes the new one is on); and `expire` cannot be selected with
 // nothing to expire.
+//
+// (Placed mid-file on purpose: two open branches add their config tests at the
+// top of the PaceConfig suite and at the end of this file, and these tests need
+// the helpers defined above both.)
 // ===========================================================================
 
 TEST(CancelReductionConfig, DefaultsAreTheRulesThatExistedBeforeTheKeys) {
@@ -3481,4 +3349,140 @@ TEST(CancelReductionConfig, ModeNamesRoundTripThroughToString) {
     EXPECT_STREQ(xop::to_string(xop::ExposureRule::Unified), "unified");
     EXPECT_STREQ(xop::to_string(xop::PriceCancelMode::Deviation), "deviation");
     EXPECT_STREQ(xop::to_string(xop::PriceCancelMode::Margin), "margin");
+}
+
+TEST(PaceConfig, NonFiniteDoubleKeysThrow) {
+    // Every pace double key has a finite upper bound, so the .inf rows also
+    // trip the range check; only the .nan rows need the finiteness test.
+    const char* const keys[] = {
+        "pace_enter_tol_mult", "pace_exit_tol_mult", "pace_max_resting_frac", "pace_min_tier_units",
+        "pace_max_tier_units", "pace_tighten_step_bps", "pace_tighten_max_bps", "pace_min_edge_bps",
+        "pace_edge_sigma_mult", "pace_max_fair_value_sigma_bps", "pace_reprice_min_bps",
+    };
+    for (const char* key : keys) {
+        for (const char* value : {".nan", ".inf"}) {
+            SCOPED_TRACE(std::string(key) + ": " + value);
+            expect_config_error_containing(
+                pace_with_strategy(std::string("  ") + key + ": " + value + "\n"), key);
+        }
+    }
+}
+
+TEST(PaceConfig, OutOfRangeThrows) {
+    struct Row {
+        const char* key{nullptr};
+        const char* value{nullptr};
+    };
+    const Row rows[] = {
+        {"pace_horizon_blocks", "4607"},           {"pace_horizon_blocks", "414721"},
+        {"pace_enter_tol_mult", "0"},              {"pace_enter_tol_mult", "10.0001"},
+        {"pace_exit_tol_mult", "-0.0001"},         {"pace_exit_tol_mult", "10"},
+        {"pace_max_resting_frac", "0"},            {"pace_max_resting_frac", "1.0001"},
+        {"pace_min_tier_units", "0"},
+        {"pace_max_tier_units", "0"},              {"pace_max_tier_units", "1000000.1"},
+        {"pace_max_tiers", "0"},                   {"pace_max_tiers", "17"},
+        {"pace_tighten_step_bps", "0.9999"},       {"pace_tighten_step_bps", "1000.0001"},
+        {"pace_tighten_max_bps", "-1"},            {"pace_tighten_max_bps", "5000.0001"},
+        {"pace_min_edge_bps", "0"},                {"pace_min_edge_bps", "2000.0001"},
+        {"pace_edge_sigma_mult", "-0.0001"},       {"pace_edge_sigma_mult", "5.0001"},
+        {"pace_max_fair_value_sigma_bps", "0"},    {"pace_max_fair_value_sigma_bps", "2000.0001"},
+        {"pace_max_balance_age_blocks", "0"},      {"pace_max_balance_age_blocks", "4609"},
+        {"pace_reprice_min_bps", "0"},             {"pace_reprice_min_bps", "1000.0001"},
+        {"pace_reprice_min_age_blocks", "11"},     {"pace_reprice_min_age_blocks", "4609"},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(std::string(row.key) + ": " + row.value);
+        expect_config_error_containing(
+            pace_with_strategy(std::string("  ") + row.key + ": " + row.value + "\n"), row.key);
+    }
+}
+
+TEST(PaceConfig, ExitNotBelowEnterThrows) {
+    expect_config_error_containing(
+        pace_with_strategy("  pace_enter_tol_mult: 1.5\n  pace_exit_tol_mult: 1.5\n"), "pace_exit_tol_mult");
+}
+
+TEST(PaceConfig, MinTierAboveMaxTierThrows) {
+    expect_config_error_containing(
+        pace_with_strategy("  pace_min_tier_units: 6\n  pace_max_tier_units: 5\n"), "pace_min_tier_units");
+}
+
+TEST(PaceConfig, XchInAssetsThrowsWhenEnabled) {
+    expect_config_error_containing(
+        pace_with_strategy("  pace_enabled: true\n  pace_assets: [XCH]\n" + kPaceTargets),
+        "must not contain XCH");
+}
+
+TEST(PaceConfig, AssetWithoutTargetThrowsWhenEnabled) {
+    expect_config_error_containing(pace_with_strategy(kPaceOn), "asset_target_allocations");
+}
+
+TEST(PaceConfig, ZeroToleranceThrowsWhenEnabled) {
+    expect_config_error_containing(
+        pace_with_strategy(kPaceOn
+                           + "  asset_target_allocations:\n    XCH: 0.5\n    TEST: 0.05\n"
+                             "  asset_target_tolerances:\n    XCH: 0.4\n    TEST: 0.0\n"),
+        "asset_target_tolerances");
+}
+
+TEST(PaceConfig, SigmaCeilingAboveFairValueCeilingThrowsWhenEnabled) {
+    // 150 is the lowest fair_value_max_sigma_bps the repo's tight-sigma check
+    // accepts at the default fair_value_tight_sigma_bps of 150.
+    expect_config_error_containing(
+        pace_with_strategy(kPaceOn + kPaceTargets + "  fair_value_max_sigma_bps: 150\n"),
+        "pace_max_fair_value_sigma_bps");
+}
+
+TEST(PaceConfig, ChecksSkippedWhenDisabled) {
+    expect_loads(pace_with_strategy("  pace_assets: [XCH]\n  fair_value_max_sigma_bps: 150\n"));
+}
+
+TEST(PaceConfig, BaseManagedPairThrowsWhenEnabled) {
+    expect_config_error_containing(
+        pace_after_first_pair(pace_with_strategy(kPaceOn + kPaceTargets),
+                              "  - base_asset_id: \"" + kTestId + "\"\n"
+                              "    quote_asset_id: \"xch\"\n"
+                              "    name: \"TEST/XCH\"\n"
+                              "    enabled: true\n"),
+        "must be XCH/TEST");
+}
+
+TEST(PaceConfig, NonXchPairTouchingAssetThrowsWhenEnabled) {
+    expect_config_error_containing(
+        pace_after_first_pair(pace_with_strategy(kPaceOn + kPaceTargets),
+                              "  - base_asset_id: \"" + kTestId + "\"\n"
+                              "    quote_asset_id: \"" + std::string(kTest2) + "\"\n"
+                              "    name: \"TEST/OTHER\"\n"
+                              "    enabled: true\n"),
+        "must be XCH/TEST");
+}
+
+TEST(PaceConfig, DisabledPairTouchingAssetIgnored) {
+    expect_loads(
+        pace_after_first_pair(pace_with_strategy(kPaceOn + kPaceTargets),
+                              "  - base_asset_id: \"" + kTestId + "\"\n"
+                              "    quote_asset_id: \"" + std::string(kTest2) + "\"\n"
+                              "    name: \"TEST/OTHER\"\n"
+                              "    enabled: false\n"));
+}
+
+TEST(PaceConfig, StablecoinPacePairThrowsWhenEnabled) {
+    // The same is_stablecoin / peg_target shape loads without pace
+    // (ConfigParserTest.S20NonFinitePegTargetRejected).
+    expect_config_error_containing(
+        pace_after_first_pair(pace_with_strategy(kPaceOn + kPaceTargets),
+                              "    is_stablecoin: true\n    peg_target: 1.0\n"),
+        "must not set is_stablecoin");
+}
+
+TEST(PaceConfig, StaleFeedThresholdDisabledThrowsWhenEnabled) {
+    std::string yaml = pace_with_strategy(kPaceOn + kPaceTargets);
+    yaml += "\nmarket_data:\n  cex_freshness_threshold_sec: 0\n";
+    expect_config_error_containing(yaml, "cex_freshness_threshold_sec");
+}
+
+TEST(PaceConfig, EnabledWithEmptyAssetsWarns) {
+    CapturedLog log;
+    expect_loads(pace_with_strategy("  pace_enabled: true\n"));
+    EXPECT_TRUE(log.warned_containing("pace_assets is empty")) << log.text();
 }

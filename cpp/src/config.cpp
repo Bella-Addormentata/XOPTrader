@@ -1156,63 +1156,6 @@ StrategyConfig parse_strategy(const YAML::Node& root)
         && !node["offer_expiry_secs"].IsNull()) {
         cfg.offer_expiry_secs = read_uint32(node, "offer_expiry_secs", sec);
     }
-
-    // [S70-S72 2026-09-20] The three cancel-reduction switches.  All
-    // optional; absent or null keeps the rule that was in force before the
-    // key existed.  A mode is a closed vocabulary, so anything else -- a
-    // typo, a bool, a number -- throws rather than falling back: "expire"
-    // misspelt must not silently keep paying for TTL cancels.
-    const auto read_mode = [&](const char* key) -> std::optional<std::string> {
-        if (!node[key] || !node[key].IsDefined() || node[key].IsNull()) {
-            return std::nullopt;
-        }
-        if (!node[key].IsScalar()) {
-            throw ConfigError(sec + "." + key + " must be a scalar mode name");
-        }
-        return node[key].as<std::string>();
-    };
-    if (const auto m = read_mode("ttl_cancel_mode")) {
-        if (*m == "cancel") {
-            cfg.ttl_cancel_mode = TtlCancelMode::Cancel;
-        } else if (*m == "expire") {
-            cfg.ttl_cancel_mode = TtlCancelMode::Expire;
-        } else {
-            throw ConfigError(sec + ".ttl_cancel_mode must be 'cancel' or "
-                              "'expire'; got '" + *m + "'");
-        }
-    }
-    if (const auto m = read_mode("exposure_rule")) {
-        if (*m == "legacy") {
-            cfg.exposure_rule = ExposureRule::Legacy;
-        } else if (*m == "unified") {
-            cfg.exposure_rule = ExposureRule::Unified;
-        } else {
-            throw ConfigError(sec + ".exposure_rule must be 'legacy' or "
-                              "'unified'; got '" + *m + "'");
-        }
-    }
-    if (const auto m = read_mode("price_cancel_mode")) {
-        if (*m == "deviation") {
-            cfg.price_cancel_mode = PriceCancelMode::Deviation;
-        } else if (*m == "margin") {
-            cfg.price_cancel_mode = PriceCancelMode::Margin;
-        } else {
-            throw ConfigError(sec + ".price_cancel_mode must be 'deviation' "
-                              "or 'margin'; got '" + *m + "'");
-        }
-    }
-    cfg.exposure_cancel_hysteresis_pct = read_optional_finite_in_range(
-        node, "exposure_cancel_hysteresis_pct", sec,
-        cfg.exposure_cancel_hysteresis_pct, 0.0, 1.0, false, false);
-    cfg.exposure_cancel_min_age_blocks = read_optional_uint32_in_range(
-        node, "exposure_cancel_min_age_blocks", sec,
-        cfg.exposure_cancel_min_age_blocks, 0u, 4'608u);
-    // (0, 1]: 0 would mean "never cancel for price", which is what the
-    // crossed rule and the hard TTL are NOT a substitute for.
-    cfg.price_cancel_edge_retain = read_optional_finite_in_range(
-        node, "price_cancel_edge_retain", sec,
-        cfg.price_cancel_edge_retain, 0.0, 1.0, true, false);
-
     cfg.num_tiers            = read_uint32_positive(node, "num_tiers", sec);
 
     cfg.tier_spacing_bps = read_positive_double_seq(node, "tier_spacing_bps", sec);
@@ -1769,6 +1712,63 @@ StrategyConfig parse_strategy(const YAML::Node& root)
         node, "pace_reprice_min_bps", sec, cfg.pace_reprice_min_bps, 0.0, 1000.0, true, false);
     cfg.pace_reprice_min_age_blocks = read_optional_uint32_in_range(
         node, "pace_reprice_min_age_blocks", sec, cfg.pace_reprice_min_age_blocks, 12u, 4'608u);
+
+    // [S70-S72 2026-09-20] The three cancel-reduction switches.  All
+    // optional; absent or null keeps the rule that was in force before the
+    // key existed.  A mode is a closed vocabulary, so anything else -- a
+    // typo, a bool, a number -- throws rather than falling back: "expire"
+    // misspelt must not silently keep paying for TTL cancels.
+    const auto read_mode = [&](const char* key) -> std::optional<std::string> {
+        if (!node[key] || !node[key].IsDefined() || node[key].IsNull()) {
+            return std::nullopt;
+        }
+        if (!node[key].IsScalar()) {
+            throw ConfigError(sec + "." + key + " must be a scalar mode name");
+        }
+        return node[key].as<std::string>();
+    };
+    if (const auto m = read_mode("ttl_cancel_mode")) {
+        if (*m == "cancel") {
+            cfg.ttl_cancel_mode = TtlCancelMode::Cancel;
+        } else if (*m == "expire") {
+            cfg.ttl_cancel_mode = TtlCancelMode::Expire;
+        } else {
+            throw ConfigError(sec + ".ttl_cancel_mode must be 'cancel' or "
+                              "'expire'; got '" + *m + "'");
+        }
+    }
+    if (const auto m = read_mode("exposure_rule")) {
+        if (*m == "legacy") {
+            cfg.exposure_rule = ExposureRule::Legacy;
+        } else if (*m == "unified") {
+            cfg.exposure_rule = ExposureRule::Unified;
+        } else {
+            throw ConfigError(sec + ".exposure_rule must be 'legacy' or "
+                              "'unified'; got '" + *m + "'");
+        }
+    }
+    if (const auto m = read_mode("price_cancel_mode")) {
+        if (*m == "deviation") {
+            cfg.price_cancel_mode = PriceCancelMode::Deviation;
+        } else if (*m == "margin") {
+            cfg.price_cancel_mode = PriceCancelMode::Margin;
+        } else {
+            throw ConfigError(sec + ".price_cancel_mode must be 'deviation' "
+                              "or 'margin'; got '" + *m + "'");
+        }
+    }
+    cfg.exposure_cancel_hysteresis_pct = read_optional_finite_in_range(
+        node, "exposure_cancel_hysteresis_pct", sec,
+        cfg.exposure_cancel_hysteresis_pct, 0.0, 1.0, false, false);
+    cfg.exposure_cancel_min_age_blocks = read_optional_uint32_in_range(
+        node, "exposure_cancel_min_age_blocks", sec,
+        cfg.exposure_cancel_min_age_blocks, 0u, 4'608u);
+    // (0, 1]: 0 would mean "never cancel for price", which is what the
+    // crossed rule and the hard TTL are NOT a substitute for.
+    cfg.price_cancel_edge_retain = read_optional_finite_in_range(
+        node, "price_cancel_edge_retain", sec,
+        cfg.price_cancel_edge_retain, 0.0, 1.0, true, false);
+
     if (node["ratio_band_exit"] && node["ratio_band_exit"].IsDefined()
         && !node["ratio_band_exit"].IsNull()) {
         cfg.ratio_band_exit = node["ratio_band_exit"].as<double>();

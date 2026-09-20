@@ -439,13 +439,17 @@ struct StrategyConfig {
     /// verified is narrower: spendable selection subtracts get_locked_coins()
     /// (docs/warp-unwrap-design.md section 7).  Do not rely on an expiry to
     /// return collateral -- land a cancel.
-    ///
-    /// [S70 2026-09-20] Since established from the chia 2.7.4 source, and the
-    /// caution was right: an expired PENDING_ACCEPT trade stays in
-    /// get_locked_coins() until it is cancelled.  ttl_cancel_mode below is
-    /// what lands that cancel -- locally and for free, once the chain clock
-    /// makes the offer untakeable.
     uint32_t offer_expiry_secs{0};
+
+    // [ALWAYSOFFER 2026-08-30] Side-aware BBO sanity (see bbo_sanity.hpp).
+    // Aggressive deviation (would EXECUTE dislocated) keeps the tight
+    // 10%; passive deviation (merely RESTS far from a thin book, e.g. a
+    // cost-floored ask above a crashed book) is allowed much wider.
+    // Check 1 (model mid vs BBO midpoint) gets its own threshold so a
+    // recovering one-sided book cannot re-suppress every tier.
+    double bbo_sanity_max_aggressive_dev{0.10};
+    double bbo_sanity_max_passive_dev{0.30};
+    double bbo_sanity_max_mid_dev{0.50};
 
     /// [S70 2026-09-20] What ends an offer that is merely OLD.  `cancel`
     /// (default) is the unconditional hard-TTL cancel.  `expire` leaves an
@@ -454,7 +458,10 @@ struct StrategyConfig {
     /// clock is kExpiredRetireSafetySecs past that max_time; the soft-TTL
     /// adverse rule, every price rule and every safety cancel still apply,
     /// and an offer with no verified expiry keeps the hard TTL.  The
-    /// reasoning and the wallet facts are in execution/offer_expiry.hpp.
+    /// reasoning and the wallet facts are in execution/offer_expiry.hpp --
+    /// including the one offer_expiry_secs above declined to claim: an
+    /// expired PENDING_ACCEPT trade stays in get_locked_coins() until it is
+    /// cancelled, so this mode is what lands that cancel.
     /// `expire` with no expiry configured anywhere is rejected at load: it
     /// would read as "TTL cancels are off" while changing nothing.
     TtlCancelMode ttl_cancel_mode{TtlCancelMode::Cancel};
@@ -491,16 +498,6 @@ struct StrategyConfig {
     /// The post and cancel thresholds must not coincide; 0.5 keeps an offer
     /// until it has lost half the edge a new one would need.
     double        price_cancel_edge_retain{0.5};
-
-    // [ALWAYSOFFER 2026-08-30] Side-aware BBO sanity (see bbo_sanity.hpp).
-    // Aggressive deviation (would EXECUTE dislocated) keeps the tight
-    // 10%; passive deviation (merely RESTS far from a thin book, e.g. a
-    // cost-floored ask above a crashed book) is allowed much wider.
-    // Check 1 (model mid vs BBO midpoint) gets its own threshold so a
-    // recovering one-sided book cannot re-suppress every tier.
-    double bbo_sanity_max_aggressive_dev{0.10};
-    double bbo_sanity_max_passive_dev{0.30};
-    double bbo_sanity_max_mid_dev{0.50};
 
     // [FLOOR 2026-08-30] The Step 7 ask floor mode: "strict" (never quote
     // below basis+margin -- the old unconditional behaviour), "aging"
