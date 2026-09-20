@@ -1326,6 +1326,12 @@ private:
     /// of the poll backoff schedule).
     std::uint64_t fill_poll_heartbeat_{0};
 
+    /// [S70] Block of retire_expired_offers' last WARN.  A wallet that cannot
+    /// supply the chain clock fails the same way every heartbeat while any
+    /// offer waits past its expiry; the repeats go to debug
+    /// (execution::expiry_warn_due), so the log says it once per ~30 min.
+    BlockHeight expiry_warned_block_{0};
+
     /// Per-pair rebalance baselines for trigger evaluation.
     std::unordered_map<std::string, RebalanceSnapshot> rebalance_baselines_;
 

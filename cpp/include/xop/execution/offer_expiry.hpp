@@ -331,6 +331,27 @@ inline constexpr std::uint64_t kExpiredRetireSafetySecs = 600;
         && static_cast<std::uint64_t>(host_now_s) >= max_time;
 }
 
+/// How often retire_expired_offers may repeat a WARN, in peak-height blocks:
+/// 96 is ~30 min at 18.75 s.  The pass runs every heartbeat while any offer
+/// waits past its expiry, and a wallet that cannot supply the chain clock
+/// fails identically each time.
+inline constexpr std::uint64_t kExpiryWarnIntervalBlocks = 96;
+
+/// Whether a retire-pass warning may be logged at WARN this block (it goes
+/// to debug otherwise).  0 = never warned.  A height that went BACKWARDS (a
+/// reorg, a height-source switch) warns rather than staying silent -- stated
+/// as its own clause although the unsigned subtraction below would wrap to
+/// the same answer, because a rule that is right only by wrap-around reads as
+/// a bug to the next person who touches it.
+[[nodiscard]] constexpr bool expiry_warn_due(
+    std::uint64_t last_warned_block,
+    std::uint64_t current_block) noexcept
+{
+    return last_warned_block == 0
+        || current_block < last_warned_block
+        || current_block - last_warned_block >= kExpiryWarnIntervalBlocks;
+}
+
 /// What to do with a resting offer whose on-chain expiry may have passed.
 enum class ExpiredRetire {
     NotExpired,     ///< chain clock not far enough past max_time: leave it

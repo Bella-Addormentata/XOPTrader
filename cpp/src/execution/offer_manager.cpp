@@ -289,21 +289,33 @@ OfferManager::retire_expired_offers(BlockHeight current_block)
     // whose max_time it has passed, and that the wallet has already seen
     // every block that could.
     const rpc::TransportCounters pass_start = wallet_->transport_counters();
+    // This pass repeats every heartbeat while anything waits past its expiry,
+    // and a wallet that cannot answer fails the same way each time: WARN once
+    // per kExpiryWarnIntervalBlocks, debug in between.
+    const bool warn_now = expiry_warn_due(expiry_warned_block_, current_block);
+    const auto problem_level =
+        warn_now ? spdlog::level::warn : spdlog::level::debug;
+    bool problem_logged = false;
+
     std::uint64_t chain_time_s = 0;
+    std::string clock_error;
     try {
         const std::int64_t synced_height = co_await wallet_->get_height_info();
         chain_time_s =
             co_await wallet_->get_timestamp_for_height(synced_height);
     } catch (const std::exception& e) {
-        logger_->warn("[offer-expiry] no chain clock this heartbeat ({}) -- "
-                      "{} expired offer(s) stay tracked; an expired offer "
-                      "cannot be taken, so nothing is at risk but its coins",
-                      e.what(), due.size());
-        co_return retired;
+        clock_error = e.what();
     }
     if (chain_time_s == 0) {
-        logger_->warn("[offer-expiry] the wallet returned no chain timestamp "
-                      "-- {} expired offer(s) stay tracked", due.size());
+        logger_->log(problem_level,
+                     "[offer-expiry] no chain clock this heartbeat ({}) -- {} "
+                     "offer(s) past their expiry stay tracked; an expired "
+                     "offer cannot be taken, so nothing is at risk but its "
+                     "locked coins",
+                     clock_error.empty() ? "the wallet returned no timestamp"
+                                         : clock_error.c_str(),
+                     due.size());
+        if (warn_now) expiry_warned_block_ = current_block;
         co_return retired;
     }
 
@@ -331,9 +343,11 @@ OfferManager::retire_expired_offers(BlockHeight current_block)
                                             trade_record_max_time(rec),
                                             chain_time_s);
         } catch (const std::exception& e) {
-            logger_->warn("[offer-expiry] get_offer failed for expired {}: {} "
-                          "-- left tracked", po.offer_id.substr(0, 12),
-                          e.what());
+            logger_->log(problem_level,
+                         "[offer-expiry] get_offer failed for expired {}: {} "
+                         "-- left tracked", po.offer_id.substr(0, 12),
+                         e.what());
+            problem_logged = true;
             continue;
         }
 
@@ -370,9 +384,11 @@ OfferManager::retire_expired_offers(BlockHeight current_block)
             // ONLY because of the verdict above -- see offer_expiry.hpp.
             co_await cancel_offer_charged(po.offer_id, 0, /*secure=*/false);
         } catch (const std::exception& e) {
-            logger_->warn("[offer-expiry] local cancel of expired {} failed: "
-                          "{} -- retried next heartbeat",
-                          po.offer_id.substr(0, 12), e.what());
+            logger_->log(problem_level,
+                         "[offer-expiry] local cancel of expired {} failed: "
+                         "{} -- retried next heartbeat",
+                         po.offer_id.substr(0, 12), e.what());
+            problem_logged = true;
             continue;
         }
         // cancel_pending, not removed: only the wallet's CANCELLED verdict,
@@ -388,6 +404,9 @@ OfferManager::retire_expired_offers(BlockHeight current_block)
                       chain_time_s - po.expiry_max_time);
     }
 
+    if (problem_logged && warn_now) {
+        expiry_warned_block_ = current_block;
+    }
     co_return retired;
 }
 

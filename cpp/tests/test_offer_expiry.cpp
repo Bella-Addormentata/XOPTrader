@@ -39,9 +39,11 @@ using xop::execution::age_limit_cancel_applies;
 using xop::execution::decide_expired_retire;
 using xop::execution::expired_beyond_safety;
 using xop::execution::ExpiredRetire;
+using xop::execution::expiry_warn_due;
 using xop::execution::expiry_worth_checking;
 using xop::execution::hard_ttl_seconds;
 using xop::execution::kExpiredRetireSafetySecs;
+using xop::execution::kExpiryWarnIntervalBlocks;
 using xop::execution::kMinPlausibleUnixTime;
 using xop::execution::trade_record_max_time;
 using xop::rpc::ChiaWalletRPC;
@@ -519,4 +521,18 @@ TEST(OfferExpireMode, VerifiedButNotYetPastTheSafetyDelayWaits) {
               ExpiredRetire::NotExpired);
     EXPECT_EQ(decide_expired_retire(true, kMaxTime, kMaxTime, 0u),
               ExpiredRetire::NotExpired);
+}
+
+TEST(OfferExpireMode, ARepeatedRetireWarningIsLoggedOncePerHalfHour) {
+    // The retire pass runs every heartbeat while any offer waits past its
+    // expiry, and a wallet that cannot supply the chain clock fails the same
+    // way each time.  96 peak-height blocks is ~30 min at 18.75 s.
+    EXPECT_EQ(kExpiryWarnIntervalBlocks, 96u);
+    EXPECT_TRUE(expiry_warn_due(0u, 9'319'000u)) << "never warned";
+    EXPECT_FALSE(expiry_warn_due(9'319'000u, 9'319'000u));
+    EXPECT_FALSE(expiry_warn_due(9'319'000u, 9'319'095u));
+    EXPECT_TRUE(expiry_warn_due(9'319'000u, 9'319'096u));
+    // A height that went backwards (a reorg, a height-source switch) must
+    // warn rather than wrap into a huge "age" -- or stay silent for good.
+    EXPECT_TRUE(expiry_warn_due(9'319'000u, 9'318'990u));
 }
