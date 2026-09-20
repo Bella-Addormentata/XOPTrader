@@ -29,6 +29,7 @@ import pytest  # noqa: E402
 
 pytest.importorskip("PySide6")
 
+from PySide6.QtCore import QCoreApplication, QEvent  # noqa: E402
 from PySide6.QtGui import QCloseEvent  # noqa: E402
 from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
@@ -69,22 +70,46 @@ def app():
     yield instance
 
 
-@pytest.fixture
-def window(app, monkeypatch):
+def _destroy(widget, app) -> None:
+    """Really delete *widget*, now.
+
+    ``deleteLater()`` alone never runs in a test: no event loop is running, and
+    ``processEvents()`` does not deliver DeferredDelete. A leaked top-level
+    widget is not harmless -- every later ``app.setStyleSheet()``
+    (tests/test_ui_sizing.py applies about twenty) re-polishes every widget of
+    every window still alive. Measured: that file takes 0.2 s alone, 190 s
+    after the six windows the smoke tests leave behind, and did not finish in
+    ten minutes after eleven more.
+    """
+    widget.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    app.processEvents()
+
+
+@pytest.fixture(scope="module")
+def shared_window(app):
+    """ONE MainWindow for the whole module, really destroyed at the end."""
     from gui.widgets.main_window import MainWindow
 
+    w = MainWindow()
+    yield w
+    w._bridge = None          # a teardown close must never prompt
+    w.close()
+    _destroy(w, app)
+
+
+@pytest.fixture
+def window(shared_window, monkeypatch):
     stop_offers.reset_noninteractive_quit()
     # Any OTHER modal box would hang an offscreen run instead of failing it.
     monkeypatch.setattr(QMessageBox, "question", staticmethod(
         lambda *a, **k: (_ for _ in ()).throw(
             AssertionError("the old yes/no stop confirmation was shown"))))
-    w = MainWindow()
-    yield w
+    shared_window._bridge = None
+    shared_window._bot_running = False
+    yield shared_window
     stop_offers.reset_noninteractive_quit()
-    w._bridge = None          # a teardown close must never prompt
-    w.close()
-    w.deleteLater()
-    app.processEvents()
+    shared_window._bridge = None
 
 
 def _prompt_returns(monkeypatch, choice):

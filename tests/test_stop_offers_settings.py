@@ -30,6 +30,7 @@ import yaml  # noqa: E402
 
 pytest.importorskip("PySide6")
 
+from PySide6.QtCore import QCoreApplication, QEvent  # noqa: E402
 from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
 from gui import stop_offers  # noqa: E402
@@ -65,7 +66,12 @@ def panel(qapp, monkeypatch):
     monkeypatch.setattr(QMessageBox, "critical", staticmethod(_no_modal_dialog))
     w = SettingsWidget()
     yield w
+    # Really deleted, not deleteLater() alone: see tests/
+    # test_stop_offers_window.py _destroy for what a leaked widget costs the
+    # tests that run after this file.
     w.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    qapp.processEvents()
 
 
 def _strip_engine_section(text: str) -> str:

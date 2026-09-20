@@ -483,6 +483,15 @@ def _dialog(qapp, *, default_policy=POLICY_CANCEL, keep_supported=True):
         default_policy=default_policy, keep_supported=keep_supported)
 
 
+def _destroy(dialog) -> None:
+    """deleteLater() alone never runs without an event loop, and a leaked
+    top-level widget slows every later app.setStyleSheet() in the suite."""
+    from PySide6.QtCore import QCoreApplication, QEvent
+
+    dialog.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
 def test_the_dialog_has_exactly_the_three_choices(qapp):
     from gui.widgets import stop_engine_dialog as dlg
 
@@ -496,7 +505,7 @@ def test_the_dialog_has_exactly_the_three_choices(qapp):
             "Keep offers on the book", "Cancel all offers", "Don't stop")
         assert "2 offer(s) are resting" in dialog.text()
     finally:
-        dialog.deleteLater()
+        _destroy(dialog)
 
 
 @pytest.mark.parametrize(("default_policy", "keep_supported", "preselected"), [
@@ -512,7 +521,7 @@ def test_the_dialog_preselects_the_config_default_and_escape_means_dont_stop(
         assert dialog.escapeButton() is dialog.button_for(StopChoice.DONT_STOP)
         assert dialog.button_for(StopChoice.KEEP).isEnabled() is keep_supported
     finally:
-        dialog.deleteLater()
+        _destroy(dialog)
 
 
 @pytest.mark.parametrize("choice", list(StopChoice))
@@ -522,7 +531,7 @@ def test_the_clicked_button_is_the_answer(qapp, choice):
         dialog.button_for(choice).click()
         assert dialog.choice() is choice
     finally:
-        dialog.deleteLater()
+        _destroy(dialog)
 
 
 def test_a_dialog_nobody_clicked_means_dont_stop(qapp):
@@ -532,7 +541,7 @@ def test_a_dialog_nobody_clicked_means_dont_stop(qapp):
         dialog.reject()  # Escape / the title-bar X
         assert dialog.choice() is StopChoice.DONT_STOP
     finally:
-        dialog.deleteLater()
+        _destroy(dialog)
 
 
 # --------------------------------------------------------------------------- #
