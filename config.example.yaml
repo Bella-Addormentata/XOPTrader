@@ -366,6 +366,33 @@ strategy:
   # our own TTL would let the chain retire offers the engine still tracks as
   # live, with no cancel ever recorded.
   # offer_expiry_secs: 172800  # [OPTIONAL, default: 0 = disabled] 48h
+  #
+  # --- Minimum input coin for the offers we create ---------------------------
+  # Dexie pays liquidity rewards as one tiny coin per rewarded offer, so a CAT
+  # wallet that earns them fills with dust.  The wallet's coin selection
+  # prefers that dust, and Dexie refuses an offer built from too many coins
+  # (HTTP 400 "Too many input coins"; measured limit between 125 and about
+  # 132 inputs).  The refused offer still exists in the wallet and locks its
+  # coins, but is listed nowhere.
+  #
+  # With this key the engine sends create_offer_for_ids a `min_coin_amount` of
+  # ceil(amount the offer spends x this fraction), so the wallet leaves smaller
+  # coins alone and an offer needs at most ceil(1 / fraction) inputs: 100 at
+  # the default, plus one fee coin.  RAISE it to tighten that bound; values
+  # much below the default no longer guarantee it.  0 disables the floor.
+  #
+  # Applies to CAT-funded offers only (a bid on XCH/<CAT>, an ask on
+  # <CAT>/...).  XCH-funded offers are untouched: their coins are managed by
+  # the coin pool.  The wallet applies the one value to the XCH fee coin of
+  # the same request as well, which is harmless because it is CAT-scaled
+  # (1% of an 80 DBX offer is 804 mojos, under a billionth of an XCH).
+  #
+  # If the coins at or above the floor cannot cover the amount, the wallet
+  # refuses, and the engine retries ONCE without the floor and logs a
+  # "[min-input-coin]" warning naming the pair, side and tier.  A Dexie
+  # refusal logs "[dexie-too-many-inputs]".  Either one means the dust should
+  # be combined (chia wallet coins combine).  Read at startup.
+  # offer_min_input_coin_frac: 0.01  # [OPTIONAL, default: 0.01] range [0, 1); 0 = disabled
   num_tiers: 4               # [REQUIRED] Multi-tier offer ladder depth (4 recommended: fewer, larger tiers)
   tier_spacing_bps: [35, 100, 200, 300]  # [REQUIRED] Spread per tier (bps)
   tier_size_pct: [0.15, 0.20, 0.30, 0.35] # [REQUIRED] Capital fraction per tier (sum ≈ 1.0)

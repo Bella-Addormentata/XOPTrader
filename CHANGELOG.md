@@ -5,6 +5,53 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — offers are no longer funded from reward dust
+
+Dexie pays liquidity rewards as one tiny coin per rewarded offer. On 2026-09-19
+the DBX wallet held 4,575 unspent coins, 4,389 of them under 0.1 DBX and worth
+84.6 DBX together. The wallet's coin selection minimises overshoot, which
+favours dust, so an XCH/DBX bid paying 80.334 DBX became a 62,228-character
+offer that Dexie refused with HTTP 400 "Too many input coins". The offer still
+existed in the wallet and locked its coins, listed nowhere. `engine.log` holds
+13 such refusals between 2026-09-10 and 2026-09-19.
+
+- **A floor on the coins an offer is funded from.** Every `create_offer_for_ids`
+  request for a CAT-funded offer now carries `min_coin_amount` =
+  ceil(mojos the offer spends x `strategy.offer_min_input_coin_frac`). The new
+  key defaults to 0.01, accepts [0, 1), is read at startup, and 0 disables it,
+  restoring the previous request byte for byte. With every input at least 1% of
+  the amount, 100 inputs plus one fee coin always suffice. Dexie does not
+  publish its limit; from this bot's own submissions it accepted 125 inputs
+  (57,382 characters) and refused everything from 60,612 characters up.
+- **XCH-funded offers are unchanged.** Their coins are shaped by the coin pool
+  and budgeted by the XCH lock ledger under the wallet's default selection.
+- **One value covers the fee coin too.** In chia 2.7.4 the coin-selection keys
+  are read from the top level of the request and one config governs every
+  selection it makes, including the XCH fee coin of a CAT-funded offer. The
+  floor is CAT-scaled (804 mojos for the offer above), so the fee coin is not
+  affected in practice.
+- **Fallback.** If the wallet answers that the coins at or above the floor
+  cannot cover the amount ("... or our minimum coin amount is too high"), the
+  create is sent once more without the floor and a `[min-input-coin]` warning
+  names the pair, side, tier and floor. Only that answer triggers it: a timeout
+  or any other transport failure is never followed by a second create from this
+  path. The offer built by the retry can again be one Dexie refuses.
+- **Detection.** A Dexie refusal for too many input coins now logs one
+  `[dexie-too-many-inputs]` warning that names the offer, its length, the
+  remedy (combine the coins, or raise the fraction) and a count since start.
+  No metric was added: `OfferManager` has no posting-failure metric to extend.
+  Nothing is cancelled automatically.
+
+**Operator note.** The dust already in the wallet is not touched: it stays
+spendable, the engine simply stops selecting it for offers, and it can be
+combined at any time (`chia wallet coins combine`). An offer Dexie refused is
+tracked like any other and retired by the usual cancels: the one posted at
+14:42 on 2026-09-19 was cancelled at 18:23. Until then it locks its coins while
+listed nowhere (`TODO.md` S66).
+
+**Not changed.** `rpc_post` still re-sends `create_offer_for_ids` after a
+transient transport failure, as it did before (#158 left it out of scope).
+
 ## [0.10.24] — 2026-09-14 — record what happened, not what was asked for
 
 Nine merged branches, and most of them fix a record or a signal that reported a
