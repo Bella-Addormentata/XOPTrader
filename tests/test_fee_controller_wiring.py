@@ -280,6 +280,9 @@ def test_cancel_tickets_open_at_the_accepted_rpc_with_the_fee_really_paid():
     rpc = charged.index("co_await wallet_->cancel_offer(trade_id, fee, secure)")
     seen = charged.index("cancel_observer_(trade_id, fee);", rpc)
     assert rpc < seen, "only AFTER the wallet accepted it: a refusal throws past the observer"
+    # Exactly ONE call.  A second one ahead of the RPC would ticket a cancel the
+    # wallet then refuses (a mutation that added one survived the check above).
+    assert len(re.findall(r"cancel_observer_\s*\(", charged)) == 1
     assert re.search(r"if\s*\(secure\s*&&\s*cancel_observer_\)\s*\{\s*cancel_observer_\(trade_id, fee\);",
                      charged), "a local-only cancel spends nothing on chain: no ticket"
     # ... and every per-offer cancel in OfferManager goes through that choke point.

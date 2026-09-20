@@ -121,7 +121,10 @@ TEST(FeeController, LevelZeroPaysExactlyMinFeeForEveryMinFeeTheParserAccepts)
     // controller on, and the contract is "level 0 = a CAT cancel pays exactly
     // that".  An anchor floored at 1,000,000 mojos broke it for every smaller
     // floor: 5,000 -- config.example.yaml's value -- started at 1,000,000.
-    for (const std::uint64_t min_fee : {1ULL, 7ULL, 5'000ULL, 123'457ULL, 999'999ULL,
+    // 25 and 100 are WITNESSES, not decoration: (25 / 42.3e6) x 42.3e6 is
+    // 25.000000000000004 in IEEE doubles, so a bare ceil() charges 26.  Without
+    // them this test passed with the tolerance removed (mutation R1b survived).
+    for (const std::uint64_t min_fee : {1ULL, 7ULL, 25ULL, 100ULL, 5'000ULL, 123'457ULL, 999'999ULL,
                                         1'000'000ULL, 15'000'000ULL, 99'999'989ULL}) {
         const Controller c{on_config(), min_fee, kMaxFee};
         EXPECT_EQ(c.fee_for(ActionClass::CancelCat, 100), min_fee) << min_fee;
