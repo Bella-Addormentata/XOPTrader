@@ -241,29 +241,104 @@ def test_every_cancel_site_in_shutdown_is_inside_the_cancel_block():
     for site in ("cancel_all(", "cancel_ids(", "watchdog_cancel_book(",
                  "write_cancel_intent(", "mark_offer_cancel_submitted("):
         assert cancel_block.count(site) >= 1, f"{site} vanished from the cancel path"
-    # No co_await outside the cancel block either: nothing else in shutdown()
-    # may reach an RPC, and the keep path must not be interleaved with a
-    # heartbeat cycle or an operator Cancel All before ioc_.stop().
-    assert coro.count("co_await") == cancel_block.count("co_await")
+    # Outside the cancel block shutdown() awaits exactly ONE thing, and it is a
+    # timer: the keep branch's bounded wait for an in-flight post. Nothing else
+    # may suspend -- an RPC there could hang a keep stop on a wedged wallet.
+    outside = coro.replace(cancel_block, "", 1)
+    assert outside.count("co_await") == 1, (
+        "shutdown() awaits something new outside the cancel block: %d awaits"
+        % outside.count("co_await"))
+    assert "co_awaitdrain_timer.async_wait(asio::use_awaitable);" in outside
 
 
-def test_the_keep_branch_is_the_else_of_the_cancel_block_and_only_reports():
+def test_the_keep_branch_is_the_else_of_the_cancel_block_and_only_waits_and_reports():
     coro = _continuation(_shutdown())
     cancel_block = _block_followed_by(coro, "if(cancels_book){", "structClaimGuard{")
     after = coro[coro.find(cancel_block) + len(cancel_block):]
-    assert after.startswith("elseif(keeps_book){report_offers_kept_on_stop();}"), (
-        "the keep branch must be the else of the cancel block and call only the "
-        "report: found %r" % after[:80])
+    assert after.startswith("elseif(keeps_book){"), (
+        "the keep branch must be the else of the cancel block: found %r" % after[:60])
+    keep = _block(after, "elseif(keeps_book){")
+    for forbidden in ("wallet_->", "offer_mgr_->", "full_node_->", "dexie_->",
+                      "db_->", "co_spawn") + CANCEL_SITES:
+        assert forbidden not in keep, (
+            f"the keep branch reaches {forbidden}: a keep stop sends no cancel "
+            "and must not depend on the wallet answering")
+    assert keep.count("co_await") == 1 and keep.endswith(
+        "report_offers_kept_on_stop(waited_for_post_ms,post_abandoned);}"), (
+        "the keep branch must end in the report, after at most a timer wait")
     _in_order(after, [
-        "report_offers_kept_on_stop();",
+        "report_offers_kept_on_stop(waited_for_post_ms,post_abandoned);",
         "coin_mgr_->unlock_all();",
         "close_connections();",
         "ioc_.stop();",
     ])
 
 
+def test_a_keep_stop_waits_for_an_in_flight_post_and_only_so_long():
+    """[review #165] A signal can deliver a keep stop while Step 8 is awaiting
+    create_offer. Stopping the io_context at once let the wallet finish a create
+    nobody recorded, and the next boot may CANCEL that orphan. The decision is
+    gtest-pinned (KeepStopDrain); this pins that the keep branch asks it, with
+    the engine's own flag and the header's budget, waits on a timer only, and
+    gives up rather than hang."""
+    coro = _continuation(_shutdown())
+    keep = _block(coro, "elseif(keeps_book){")
+    loop = _block(keep, "for(;;){")
+    _in_order(loop, [
+        "util::keep_stop_drain_step(posting_in_flight_,waited_for_post_ms,"
+        + "util::kKeepStopDrainBudgetMs);",
+        "if(drain==util::KeepStopDrainStep::Proceed)break;",
+        "if(drain==util::KeepStopDrainStep::GiveUp){post_abandoned=true;break;}",
+        "drain_timer.expires_after(std::chrono::milliseconds(util::kKeepStopDrainPollMs));",
+        "co_awaitdrain_timer.async_wait(asio::use_awaitable);",
+    ])
+    assert keep.count("util::keep_stop_drain_step(") == 1
+    assert keep.find("for(;;){") < keep.find("report_offers_kept_on_stop("), (
+        "the report runs before the wait: it would count a book still being posted")
+
+
+def test_the_one_offer_creating_call_is_marked_and_step_8_then_stops():
+    """[review #165] The wait above is only as good as the mark it reads.
+    post_quotes is the ONLY call through which the engine creates a maker offer;
+    it is marked (RAII, so a throw clears it) until that pair's rows are in
+    offer_log, and Step 8 then manages nothing further under a keep stop -- the
+    next pair's iteration would open with cancels."""
+    engine = _code(_text(ENGINE_CPP))
+    assert engine.count("offer_mgr_->post_quotes(") == 1, (
+        "a second offer-creating call site is not covered by posting_in_flight_")
+    step8 = _code(_definition(
+        ENGINE_CPP, "asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)"))
+    _in_order(step8, [
+        "structPostingMark{bool*flag;~PostingMark(){*flag=false;}}"
+        + "posting_mark{&posting_in_flight_};",
+        "posting_in_flight_=true;",
+        "intposted=co_awaitoffer_mgr_->post_quotes(",
+        "db_->insert_offer(orec);",
+        "if(offers_kept_on_stop_.load(std::memory_order_acquire)){",
+    ])
+    assert step8.count("posting_in_flight_=true;") == 1
+    assert "posting_in_flight_=false;" not in engine, (
+        "a bare reset is skipped by an exception; the RAII mark is what clears it")
+    stop = _block(step8, "if(offers_kept_on_stop_.load(std::memory_order_acquire)){")
+    assert stop.endswith("co_return;}"), "Step 8 must stop, not carry on to the next pair"
+    # Every maker create in OfferManager is reached only through post_quotes.
+    manager = _text(REPO / "cpp" / "src" / "execution" / "offer_manager.cpp")
+    creators = set()
+    current = None
+    for line in manager.splitlines():
+        found = re.match(r"^[A-Za-z].*\bOfferManager::([a-z_]+)\(", line)
+        if found:
+            current = found.group(1)
+        if "wallet_->create_offer(" in line and "//" not in line.split("wallet_->")[0]:
+            creators.add(current)
+    assert creators == {"post_quotes", "post_merged_side"}, creators
+    assert _code(manager).count("post_merged_side(") == 3, (
+        "post_merged_side must be reached only from post_quotes (its two calls "
+        "and its definition)")
+
+
 def test_the_keep_report_cannot_reach_the_wallet_or_the_intent_file():
-    raw = _definition(ENGINE_CPP, "void Engine::report_offers_kept_on_stop()")
+    raw = _definition(ENGINE_CPP, "void Engine::report_offers_kept_on_stop(std::uint64_t waited_for_post_ms,")
     code = _code(raw)
     assert "asio::awaitable" not in raw.split("{", 1)[0], (
         "the keep report became a coroutine: it could now await an RPC")
@@ -309,8 +384,10 @@ def test_a_keep_stop_that_cut_a_cycle_short_says_so():
     assert "heartbeat_in_flight_=false;" not in poll, (
         "a bare reset after the await is skipped by an exception; the RAII mark "
         "is what clears it")
-    report = _code(_definition(ENGINE_CPP, "void Engine::report_offers_kept_on_stop()"))
+    report = _code(_definition(ENGINE_CPP, "void Engine::report_offers_kept_on_stop(std::uint64_t waited_for_post_ms,"))
     assert "if(heartbeat_in_flight_){spdlog::warn(" in report
+    # ...and a post the bounded wait gave up on is said LOUDER than that.
+    assert "if(post_abandoned){spdlog::error(" in report
     # The flag checkpoints really are outside the cycle: none inside it.
     cycle = _code(_definition(
         ENGINE_CPP, "asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)"))
@@ -322,7 +399,9 @@ def test_the_engine_header_documents_the_members_the_scans_rely_on():
     assert ("std::atomic<util::StopOffersRequest>stop_offers_request_{"
             "util::StopOffersRequest::Unspecified};") in header
     assert "std::atomic<bool>offers_kept_on_stop_{false};" in header
-    assert "voidreport_offers_kept_on_stop();" in header
+    assert ("voidreport_offers_kept_on_stop(std::uint64_twaited_for_post_ms,"
+            "boolpost_abandoned);") in header
+    assert "boolposting_in_flight_{false};" in header
     # shutdown() keeps its signature: a signal handler calls it bare, and every
     # wiring scan finds it by that text.
     assert "voidshutdown();" in header

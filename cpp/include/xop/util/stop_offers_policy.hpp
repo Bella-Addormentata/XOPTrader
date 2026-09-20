@@ -244,10 +244,61 @@ struct StopOffersPlan {
     return StopOffersPlan{action_for(config_default), StopPolicySource::ConfigDefault};
 }
 
+// ===========================================================================
+// [review #165] A keep stop lets an in-flight post LAND before it stops
+// ===========================================================================
+//
+// shutdown.flag is read between heartbeat cycles, so a GUI stop never lands
+// inside one. A SIGNAL (Ctrl+C, SIGTERM) can: it may arrive while Step 8 is
+// suspended in post_quotes, awaiting create_offer or the Dexie submission. The
+// keep continuation does nothing that takes time, so it used to reach
+// ioc_.stop() at once -- the wallet could then complete the create with nobody
+// left to hear the answer: a resting offer with no State entry and no offer_log
+// row. The next boot files such an offer as an ORPHAN, and evaluate_orphan
+// CANCELS an orphan that is older than orphan_max_adopt_age_blocks, adversely
+// priced, or on a pair with no mid price (offer_manager.cpp) -- the one outcome
+// a keep stop exists to avoid.
+//
+// So the keep continuation waits while a post is in flight, and only that
+// long: post_quotes records every offer it creates in State before it returns,
+// and Step 8 manages nothing further once it sees the keep latch. The wait is
+// BOUNDED. A wallet that never answers must not turn "stop" into "hang", and
+// past the budget the stop proceeds and says an offer may have been left
+// unrecorded.
+
+/// How long a keep stop waits for an in-flight post. One create_offer is
+/// bounded by the wallet client's request timeout (30 s); a pair's post is a
+/// few of them plus the Dexie submissions.
+inline constexpr unsigned long long kKeepStopDrainBudgetMs = 60'000;
+/// How often the wait looks again. The cycle it is waiting on runs on the
+/// same thread, so this is also how long that cycle can run on past its post.
+inline constexpr unsigned long long kKeepStopDrainPollMs = 50;
+
+enum class KeepStopDrainStep : int {
+    Proceed = 0,  ///< nothing is being posted: report and stop
+    Wait    = 1,  ///< a post is in flight and the budget is not spent
+    GiveUp  = 2,  ///< a post is STILL in flight at the budget: stop, and say so
+};
+
+[[nodiscard]] constexpr KeepStopDrainStep keep_stop_drain_step(
+    bool               posting_in_flight,
+    unsigned long long waited_ms,
+    unsigned long long budget_ms) noexcept
+{
+    if (!posting_in_flight) {
+        return KeepStopDrainStep::Proceed;
+    }
+    return waited_ms < budget_ms ? KeepStopDrainStep::Wait : KeepStopDrainStep::GiveUp;
+}
+
 // ---------------------------------------------------------------------------
 // Build-time pins. GCC and MSVC both evaluate these, so a wrong row is a
 // compile error on every platform rather than a red runner on one.
 // ---------------------------------------------------------------------------
+static_assert(keep_stop_drain_step(false, 0, kKeepStopDrainBudgetMs) == KeepStopDrainStep::Proceed);
+static_assert(keep_stop_drain_step(true, 0, kKeepStopDrainBudgetMs) == KeepStopDrainStep::Wait);
+static_assert(keep_stop_drain_step(true, kKeepStopDrainBudgetMs, kKeepStopDrainBudgetMs)
+              == KeepStopDrainStep::GiveUp);
 static_assert(plan_stop_offers(StopOffersRequest::Keep, StopOffersPolicy::Cancel, false).action
               == StopBookAction::KeepBook);
 static_assert(plan_stop_offers(StopOffersRequest::Cancel, StopOffersPolicy::Keep, false).action

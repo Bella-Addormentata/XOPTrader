@@ -3395,7 +3395,14 @@ class MainWindow(QMainWindow):
         decides.
         """
         bridge = self._bridge
-        interactive = stop_offers.noninteractive_quit_reason() is None
+        # [review #165] The non-interactive mark governs CLOSES only. A close
+        # can be started by quit() with nobody at the machine (a signal, a
+        # session end); Stop Trading is a click, and a click is proof somebody
+        # is there. Without this, the 120 s the mark stands after a log-off
+        # that was then CANCELLED would silence the prompt for a manual stop
+        # too, and it would quietly use the config default.
+        interactive = (not closing
+                       or stop_offers.noninteractive_quit_reason() is None)
 
         def _ask() -> stop_offers.StopChoice:
             from gui.widgets.stop_engine_dialog import ask_stop_offers  # noqa: WPS433

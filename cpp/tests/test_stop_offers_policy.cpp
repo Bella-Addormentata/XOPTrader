@@ -240,6 +240,52 @@ TEST(StopOffersPlanTable, TheHelpTokenNamesBothPolicies)
 }
 
 // ===========================================================================
+// 2b. [review #165] A keep stop waits for an in-flight post, and only so long
+// ===========================================================================
+//
+// A signal can deliver a keep stop while Step 8 is awaiting create_offer.
+// Stopping at once would let the wallet finish a create nobody records, and the
+// next boot may CANCEL that orphan. So the stop waits while a post is in
+// flight -- bounded, because a wallet that never answers must not turn a stop
+// into a hang.
+
+TEST(KeepStopDrain, NothingInFlightProceedsAtOnceHoweverLongItHasWaited)
+{
+    using xop::util::keep_stop_drain_step;
+    using xop::util::KeepStopDrainStep;
+    // The GUI's case: shutdown.flag is read between cycles, nothing is posting.
+    EXPECT_EQ(keep_stop_drain_step(false, 0, 60'000), KeepStopDrainStep::Proceed);
+    EXPECT_EQ(keep_stop_drain_step(false, 59'999, 60'000), KeepStopDrainStep::Proceed);
+    EXPECT_EQ(keep_stop_drain_step(false, 600'000, 60'000), KeepStopDrainStep::Proceed);
+}
+
+TEST(KeepStopDrain, APostInFlightIsWaitedForUntilTheBudgetAndNoLonger)
+{
+    using xop::util::keep_stop_drain_step;
+    using xop::util::KeepStopDrainStep;
+    EXPECT_EQ(keep_stop_drain_step(true, 0, 60'000), KeepStopDrainStep::Wait);
+    EXPECT_EQ(keep_stop_drain_step(true, 59'999, 60'000), KeepStopDrainStep::Wait);
+    // AT the budget it gives up: a stop must end even if the wallet never answers.
+    EXPECT_EQ(keep_stop_drain_step(true, 60'000, 60'000), KeepStopDrainStep::GiveUp);
+    EXPECT_EQ(keep_stop_drain_step(true, 600'000, 60'000), KeepStopDrainStep::GiveUp);
+    // A zero budget never waits -- and never pretends nothing was in flight.
+    EXPECT_EQ(keep_stop_drain_step(true, 0, 0), KeepStopDrainStep::GiveUp);
+}
+
+TEST(KeepStopDrain, TheBudgetCoversACreateAndThePollIsShort)
+{
+    // One create_offer is bounded by the wallet client's 30 s request timeout;
+    // a budget under that gives up on a create that was about to answer. And it
+    // stays well inside a service manager's usual 90 s stop timeout.
+    EXPECT_GE(xop::util::kKeepStopDrainBudgetMs, 30'000ull);
+    EXPECT_LE(xop::util::kKeepStopDrainBudgetMs, 90'000ull);
+    // The cycle being waited on runs on the same thread and carries on for up
+    // to one poll after its post returns.
+    EXPECT_GE(xop::util::kKeepStopDrainPollMs, 10ull);
+    EXPECT_LE(xop::util::kKeepStopDrainPollMs, 250ull);
+}
+
+// ===========================================================================
 // 3. What a keep stop says it left behind
 // ===========================================================================
 

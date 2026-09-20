@@ -170,6 +170,23 @@ def test_dont_stop_leaves_the_engine_and_the_button_alone(window, monkeypatch):
     assert window._bot_running is True
 
 
+def test_stop_trading_prompts_even_while_a_noninteractive_mark_stands(window, monkeypatch):
+    """[review #165] A Windows log-off can be cancelled after it was announced.
+    The mark it left stands for up to 120 s and governs CLOSES; a click on Stop
+    Trading is proof somebody is there, so it must still prompt -- otherwise
+    that stop would quietly use the config default."""
+    bridge = BridgeDouble(default="cancel")
+    window._bridge = bridge
+    window._bot_running = True
+    calls = _prompt_returns(monkeypatch, StopChoice.KEEP)
+    stop_offers.mark_noninteractive_quit("OS session end")
+
+    window._on_start_stop()
+
+    assert len(calls) == 1, "a manual stop was silenced by a stale non-interactive mark"
+    assert bridge.stops == ["keep"]
+
+
 def test_the_prompt_remembers_nothing_between_stops(window, monkeypatch):
     """Two stops, two prompts, both preselecting the CONFIG default -- not the
     previous answer."""

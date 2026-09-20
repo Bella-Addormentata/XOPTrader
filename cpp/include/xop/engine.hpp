@@ -1214,13 +1214,27 @@ private:
     /// thread only.
     bool heartbeat_in_flight_{false};
 
+    /// [review #165] True from just before Step 8 awaits post_quotes -- the ONLY
+    /// call through which this engine creates a maker offer -- until that
+    /// pair's rows are in offer_log. A keep stop waits (bounded,
+    /// util::keep_stop_drain_step) while this is set, so a create_offer the
+    /// wallet is still answering lands in State instead of becoming an orphan
+    /// the next boot may cancel. ioc_ thread only.
+    bool posting_in_flight_{false};
+
     /// The keep path: mirror State into offer_log for any offer that has no row
     /// yet, then log the one line that says what was left resting
     /// (execution/kept_book.hpp). Deliberately NOT a coroutine -- it cannot
     /// await an RPC, so it cannot send one: no cancel, no wallet read, nothing
     /// that a wedged wallet could hold up. It never writes the cancel intent
     /// file and never changes an existing offer_log row.
-    void report_offers_kept_on_stop();
+    ///
+    /// [review #165] `waited_for_post_ms` is how long the stop waited for an
+    /// in-flight post to land (0: none was in flight); `post_abandoned` is true
+    /// when one was STILL in flight at the budget, and the line then says an
+    /// offer may have been left unrecorded.
+    void report_offers_kept_on_stop(std::uint64_t waited_for_post_ms,
+                                    bool          post_abandoned);
 
     [[nodiscard]] bool asset_peg_suspended(const std::string& asset_id) const;
     [[nodiscard]] bool pair_peg_suspended(const PairConfig& pc) const;

@@ -2200,11 +2200,52 @@ void Engine::shutdown()
                 spdlog::error("[Engine] cancel_all exception: {}", ex.what());
             }
         } else if (keeps_book) {
+            // [review #165] LET AN IN-FLIGHT POST LAND FIRST. A shutdown.flag
+            // stop is read between cycles and never finds one; a SIGNAL can
+            // arrive while Step 8 is suspended in post_quotes. Stopping the
+            // io_context then would let the wallet finish a create_offer with
+            // nobody left to record it, and the next boot may CANCEL that
+            // orphan (util::keep_stop_drain_step has the whole argument). The
+            // only thing awaited here is a timer -- never an RPC -- and the
+            // wait is bounded, so a wallet that never answers cannot turn a
+            // stop into a hang.
+            const auto drain_t0 = std::chrono::steady_clock::now();
+            std::uint64_t waited_for_post_ms = 0;
+            bool post_abandoned = false;
+            bool drain_announced = false;
+            for (;;) {
+                waited_for_post_ms = static_cast<std::uint64_t>(
+                    std::max<std::int64_t>(
+                        0, std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now() - drain_t0)
+                               .count()));
+                const util::KeepStopDrainStep drain = util::keep_stop_drain_step(
+                    posting_in_flight_, waited_for_post_ms,
+                    util::kKeepStopDrainBudgetMs);
+                if (drain == util::KeepStopDrainStep::Proceed) break;
+                if (drain == util::KeepStopDrainStep::GiveUp) {
+                    post_abandoned = true;
+                    break;
+                }
+                if (!drain_announced) {
+                    drain_announced = true;
+                    spdlog::warn("[Engine] [S74] KEEP stop: an offer post is in "
+                                 "flight (this stop arrived by signal, inside a "
+                                 "heartbeat cycle) -- waiting up to {} ms for it "
+                                 "to land so the offer is recorded, not orphaned",
+                                 util::kKeepStopDrainBudgetMs);
+                }
+                asio::steady_timer drain_timer(ioc_);
+                drain_timer.expires_after(
+                    std::chrono::milliseconds(util::kKeepStopDrainPollMs));
+                co_await drain_timer.async_wait(asio::use_awaitable);
+            }
+
             // [S74] No cancel, no intent file, no row changed, no RPC at all:
             // a plain function, so nothing in it can await one. From here to
             // ioc_.stop() below nothing suspends either, so no other coroutine
             // (a heartbeat cycle, an operator Cancel All) runs again.
-            report_offers_kept_on_stop();
+            report_offers_kept_on_stop(waited_for_post_ms, post_abandoned);
         }
 
         // --- Post-cancel cleanup (runs on io_context, no deadlock) ---
@@ -2252,7 +2293,8 @@ void Engine::shutdown()
 // intent file, or write an offer status. The intent file a previous process
 // left is left exactly as it is -- those cancels were ordered, and the next
 // engine's sweep still owns them.
-void Engine::report_offers_kept_on_stop()
+void Engine::report_offers_kept_on_stop(std::uint64_t waited_for_post_ms,
+                                        bool          post_abandoned)
 {
     if (!book_restored_from_offer_log_) {
         // The stop landed in boot, before offer_log's pending rows were
@@ -2319,23 +2361,31 @@ void Engine::report_offers_kept_on_stop()
                      "were given one so the next start restores them as known; "
                      "{} could not be written", rows_added, rows_failed);
     }
+    if (post_abandoned) {
+        // [review #165] The bounded wait ran out with post_quotes still
+        // awaiting the wallet. Say exactly what that can leave behind.
+        spdlog::error("[Engine] [S74] an offer post was STILL in flight after "
+                      "{} ms and this stop did not wait longer. If the wallet "
+                      "completes that create, it holds one offer this engine "
+                      "never recorded: the next start meets it as an ORPHAN and "
+                      "adopts it only if it is recent and not adversely priced "
+                      "-- otherwise it CANCELS it.", waited_for_post_ms);
+    } else if (waited_for_post_ms > 0) {
+        spdlog::warn("[Engine] [S74] waited {} ms for an in-flight offer post to "
+                     "land; what it created is recorded and counted above.",
+                     waited_for_post_ms);
+    }
     if (heartbeat_in_flight_) {
         // [review #165] Only a SIGNAL gets here mid-cycle: shutdown.flag is
-        // read between cycles. This continuation runs the moment that cycle
-        // suspends in an RPC, and from here to ioc_.stop() nothing suspends,
-        // so the cycle never resumes. If the RPC it was waiting on was a
-        // create_offer, the wallet may complete it and this process will never
-        // see the answer: an offer in the wallet with no State entry and no
-        // offer_log row, never published to Dexie. Waiting the cycle out would
-        // let it go on posting and cancelling under a stop the operator asked
-        // to be quiet, so it is SAID, not waited for (TODO S76).
+        // read between cycles. An in-flight POST was waited for above, so no
+        // maker offer is lost. Anything ELSE the cycle was awaiting is cut:
+        // from here to ioc_.stop() nothing suspends, so it never resumes.
         spdlog::warn("[Engine] [S74] this stop arrived by SIGNAL while a "
-                     "heartbeat cycle was in flight, and the cycle will not "
-                     "resume. If it was creating an offer at that instant, the "
-                     "wallet may hold one offer this engine never recorded: the "
-                     "next start meets it as an ORPHAN and re-prices or cancels "
-                     "it. Stops from the GUI are read between cycles and cannot "
-                     "do this.");
+                     "heartbeat cycle was in flight; the rest of that cycle "
+                     "will not run. No offer post was left unrecorded. A cancel "
+                     "or a take it was awaiting at that instant is settled by "
+                     "the wallet alone, and the next start reads the result "
+                     "from the wallet (PENDING_CANCEL records, balances).");
     }
     if (cancel_all_inflight_) {
         spdlog::warn("[Engine] [S74] an operator Cancel All was still in flight "
@@ -13918,6 +13968,15 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         if (!wallet_step_may_run("Step 8 post_quotes")) {
             co_return;
         }
+        // [review #165] post_quotes is the ONLY call through which this
+        // engine creates a maker offer. Marked until this pair's rows are in
+        // offer_log, so a keep stop delivered by a signal waits for an
+        // in-flight create to land instead of orphaning it (shutdown()).
+        struct PostingMark {
+            bool* flag;
+            ~PostingMark() { *flag = false; }
+        } posting_mark{&posting_in_flight_};
+        posting_in_flight_ = true;
         int posted = co_await offer_mgr_->post_quotes(
             *pair_cfg, fee_filtered_tiers, block_height, fee_override);
 
@@ -14055,6 +14114,17 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         spdlog::info("[Engine] Step 8: posted {} offers for {} (cancelled {}, "
                      "fee {} mojos/offer)",
                      posted, pair_name, cancelled_ids.size(), recommended_fee);
+
+        // [review #165] A keep stop landed while this pair was posting and is
+        // waiting for exactly this point: what was created is in State and in
+        // offer_log. Manage NOTHING further -- the next pair's iteration would
+        // open with cancels, under a stop that promised to send none.
+        if (offers_kept_on_stop_.load(std::memory_order_acquire)) {
+            spdlog::warn("[Engine] [S74] Step 8 stops after {}: a stop that "
+                         "keeps the resting offers is waiting on this post",
+                         pair_name);
+            co_return;
+        }
     }
 
     // Reset consecutive pending counter only when NO pair hit Gate 1
