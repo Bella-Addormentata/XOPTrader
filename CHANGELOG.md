@@ -31,7 +31,11 @@ default to off, and with both off every fee is what v0.10.24 paid.
   half way, and the force-delete itself. The law is a velocity-form PID in log
   fee space that only ever raises.
 - **Slow down by probing.** After 8 on-target confirmations the fee steps down
-  15%. A probe that fails returns to the last known-good fee plus 10%, the level
+  15%. A confirmation counts only if that spend paid no more than the loop pays
+  for its class now — compared as fees, after the `[min_fee, max_fee]` clamp, so
+  a cancel the `min_fee_mojos` floor lifted still counts for the levels at which
+  the loop would pay that same floor. A probe that fails returns to the last
+  known-good fee plus 10%, the level
   it failed at is remembered, and re-testing that level waits twice as long each
   time (cap 256 confirmations). A re-test that succeeds means the floor has
   fallen: the memory is dropped and probing resumes at the base interval.
@@ -48,15 +52,26 @@ default to off, and with both off every fee is what v0.10.24 paid.
   (`mempool_cost`, `mempool_max_total_cost`, `mempool_min_fees`). No node call
   is added, the wallet-only gate is unchanged, and a reading older than 32 peak
   heights is dropped: with the node unreachable the learned rate stands alone.
-- **The budget no longer stops the bot.** With the controller on, cancels and
-  takes keep a reserve (`controller_budget_reserve_cancels`, 25 CAT cancels)
-  that offer-attached fees cannot spend; an exhausted budget degrades every fee
-  to `min_fee_mojos` and sends one `FeeBudgetBound` alert. It never returns 0,
-  which made Step 8 skip cancelling stale quotes as well as posting. Step 8
-  asks for one attached fee and attaches it to every tier it posts, so the room
-  above the reserve is shared across the tiers it may post that heartbeat
-  rather than granted to each. Cancels are deliberately not shaped that way: a
-  cancel that must happen pays, and the next heartbeat degrades.
+- **The budget no longer stops the bot, and it never prices a cancel below what
+  the node will admit.** With the controller on, offer-attached fees may spend
+  only what is above a reserve (`controller_budget_reserve_cancels`, 25 CAT
+  cancels, capped at half the budget so it can never exceed the budget itself);
+  an exhausted budget degrades the attached fee to `min_fee_mojos` and sends one
+  `FeeBudgetBound` alert. It never returns 0, which made Step 8 skip cancelling
+  stale quotes as well as posting. Step 8 asks for one attached fee and attaches
+  it to every tier it posts, so the room above the reserve is shared across the
+  tiers it may post that heartbeat rather than granted to each. **A cancel or a
+  take is never degraded**: `min_fee_mojos` on a 42.3M-cost CAT cancel is 0.35
+  mojos per cost against the 5 a full mempool admits, so a degraded cancel is a
+  spend that cannot be mined, keeps its coins locked and ends in a wallet-wide
+  force-delete. It is paid in full — `max_fee_mojos` is the ceiling that bounds
+  it — and the overrun is reported with one `FeeBudgetUnfunded` alert.
+- **The budget is sized by derivation, not by a quoted number.** At full-mempool
+  prices and this wallet's measured action rates one `fee_window_blocks` window
+  costs 15,163,585,937 mojos, so `daily_budget_mojos` wants at least
+  30,327,171,874. The engine computes that from the operator's own costs and
+  window, logs it at startup and warns when the budget is below it;
+  `config.example.yaml` quotes the same figure and shows the arithmetic.
 - **Tickets carry what was really paid.** A cancel's ticket opens when the
   wallet accepts the cancel RPC, with that call's fee (an emergency tier, a
   zero-fee retry and an escalation included) and its height; a re-cancel
@@ -100,8 +115,13 @@ default to off, and with both off every fee is what v0.10.24 paid.
   700,000,000 to cover takes, and raise
   `strategy.cancel_escalation_max_fee_mojos` with it.
 - **`daily_budget_mojos` is per `fee_window_blocks`, and 1662 peak heights is
-  8.7 hours, not 24** (S69). At full-mempool fees about 100 cancels and 6 takes
-  a day cost 0.01-0.04 XCH.
+  8.7 hours, not 24** (S69). At full-mempool prices one such window costs
+  15,163,585,937 mojos on this wallet's measured action rates, so set the budget
+  to at least 30,327,171,874 (35000000000 is a round number); the engine logs
+  the figure for your configuration and warns below it. The 5000000000 to
+  15000000000 suggested in earlier drafts was wrong at both ends: the bottom is
+  less than the cancel reserve itself (25 x 232,650,000 = 5,816,250,000) and the
+  top is about one window's spend.
 - Found while measuring, not fixed here: Step 8's force-delete fires after a
   median of 176 seconds, not the ~10 minutes its constant documents (S68).
 
