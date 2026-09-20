@@ -41,14 +41,32 @@
 // coin pays the fee as soon as it exceeds a coin the wallet would otherwise
 // have picked, and that needs only floor > fee: offered CAT mojos > fee /
 // fraction.  At the default fraction that is 100 x the fee -- 1,000,000 CAT
-// units at the 10,000,000-mojo offer_fee_mojos, but only 500 CAT units at
-// the shipped fees.min_fee_mojos of 5,000, which a merged XCH/DBX bid of
-// about 6 XCH reaches.  With an XCH coin sized in [fee, floor) in the
-// wallet, the default selection would take that small coin while the
-// filtered one skips it and locks the next larger one -- typically a whole
-// pool coin.  The XCH lock ledger therefore takes the same floor
-// (CoinLockLedger::try_lock / try_lock_floor_only, ledger_min_coin_mojos
-// below), so what it charges is what the wallet locks.
+// units at the 10,000,000-mojo offer_fee_mojos, and 500 CAT units at the
+// 5,000-mojo fees.min_fee_mojos OF config.example.yaml, which a merged
+// XCH/DBX bid of about 6 XCH reaches.  With an XCH coin sized in
+// [fee, floor) in the wallet, the default selection would take that small
+// coin while the filtered one skips it and locks the next larger one --
+// typically a whole pool coin.  The XCH lock ledger therefore takes the
+// same floor (CoinLockLedger::try_lock / try_lock_floor_only,
+// ledger_min_coin_mojos below), so what it charges is what the wallet locks.
+//
+// WHAT THE LIVE DEPLOYMENT MAKES OF THAT, AS OF 2026-09-20.  The example
+// config is not the live one.  C:/GitHub/XOPTrader/config.yaml sets
+// fees.min_fee_mojos: 15000000 (operator-approved 2026-09-19, because
+// ~97%-full blocks were leaving 5,000-mojo spends unconfirmed), so
+// floor > fee needs offered CAT mojos > 15,000,000 / 0.01 = 1.5e9, i.e.
+// 1,500,000 DBX units -- four orders of magnitude above any tier this bot
+// posts.  The fee-coin interaction and the ledger floor are therefore
+// UNREACHABLE on the live deployment until that fee floor comes down again,
+// which its own comment there anticipates ("Lower this again once blocks
+// are no longer full"); at 5,000 the 500-unit threshold above is reinstated.
+// Separately, the ledger's coin pool comes from CoinManager, which ignores
+// XCH coins below 1,000,000 mojos, so a floor under that selects exactly the
+// coins the ledger already saw -- another way of saying the ledger half of
+// this is inert below an offered 100,000,000 CAT mojos whatever the fee is
+// (test_offer_min_input_coin, ACatScaledFloorIsTinyInXchTerms).  The floor
+// is modelled anyway: it is cheap, and the fee level is an operator knob
+// that has already moved twice this month.
 //
 // THE RULE
 // --------

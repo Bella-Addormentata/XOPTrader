@@ -19,7 +19,8 @@ existed in the wallet and locked its coins, listed nowhere. `engine.log` holds
   request for a CAT-funded offer now carries `min_coin_amount` =
   ceil(mojos the offer spends x `strategy.offer_min_input_coin_frac`). The new
   key defaults to 0.01, accepts [0, 1), is read at startup, and 0 disables it,
-  restoring the previous request byte for byte. With every input at least 1% of
+  restoring the previous request byte for byte — **the request only**, see the
+  operator note below. With every input at least 1% of
   the amount, 100 inputs plus one fee coin always suffice. Dexie does not
   publish its limit; from this bot's own submissions it accepted 125 inputs
   (57,382 characters) and refused everything from 60,612 characters up.
@@ -31,7 +32,13 @@ existed in the wallet and locked its coins, listed nowhere. `engine.log` holds
   of a CAT-funded offer. The floor is CAT-scaled (804 mojos for the offer
   above), but it changes which XCH coin pays the fee once it exceeds the fee:
   an offer above fee / fraction CAT mojos, which is 1,000,000 CAT units at a
-  10,000,000-mojo fee and 500 at `fees.min_fee_mojos: 5000`. The wallet then
+  10,000,000-mojo fee and 500 at the `fees.min_fee_mojos: 5000` of
+  `config.example.yaml`. **On the live deployment this is currently
+  unreachable:** `config.yaml` has run `fees.min_fee_mojos: 15000000` since
+  2026-09-19 (full blocks), which moves the threshold to 1,500,000 CAT units,
+  four orders of magnitude above any tier the bot posts. It comes back at 500
+  the moment that fee floor is lowered again, which the live config's own
+  comment says it should be. The wallet then
   skips a small XCH coin and locks a larger one, so `CoinLockLedger::try_lock`
   and `try_lock_floor_only` take the same floor, in the preflight probe and in
   all three posting paths. Without it the ledger charged the coin the wallet
@@ -53,6 +60,28 @@ existed in the wallet and locked its coins, listed nowhere. `engine.log` holds
   remedy (combine the coins, or raise the fraction) and a count since start.
   No metric was added: `OfferManager` has no posting-failure metric to extend.
   Nothing is cancelled automatically.
+
+**What changes on upgrade, with no config edit at all.** Three things, and only
+the first has a lever:
+
+1. **The floor is ON.** `strategy.offer_min_input_coin_frac` is absent from the
+   live `config.yaml`, so it takes its 0.01 default and every CAT-funded
+   `create_offer_for_ids` starts carrying `min_coin_amount` from the first
+   restart. Setting the key to `0` turns that off.
+2. **A create that fails is no longer re-sent** (the section below). This is
+   unconditional: `retry_policy_for_endpoint` keys off the endpoint name, not
+   off the fraction, so `offer_min_input_coin_frac: 0` does **not** restore the
+   old four-attempt behaviour. A create that times out now fails after one
+   attempt (30 s) instead of four (~124 s).
+3. **An unanswered MERGED create posts nothing else for that side this cycle**,
+   also unconditional and also unaffected by the fraction. If the other side of
+   the pair did post, the asymmetric-ladder guard in `post_quotes` can then
+   cancel it, so a merged-create timeout can cost one cycle of both sides
+   rather than one side.
+
+2 and 3 are strictly safer than what they replace — the risk they remove is a
+duplicate offer, which costs real money — but they are behaviour changes that
+ship whatever the new key is set to, and no config value reverts them.
 
 **Operator note.** The dust already in the wallet is not touched: it stays
 spendable, the engine simply stops selecting it for offers, and it can be

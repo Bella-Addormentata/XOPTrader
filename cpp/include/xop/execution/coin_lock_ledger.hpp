@@ -43,9 +43,19 @@
 // ledger took the 20M coin while the wallet locked the 1.5 XCH one, and later
 // creates passed the cap and the reserve floor on XCH that was already
 // locked.  It needs only floor > fee, i.e. offered CAT mojos > fee /
-// strategy.offer_min_input_coin_frac: 500 CAT units at the shipped
-// fees.min_fee_mojos of 5,000.  try_lock and try_lock_floor_only therefore
-// take the floor and select among coins at or above it.
+// strategy.offer_min_input_coin_frac: 500 CAT units at the 5,000-mojo
+// fees.min_fee_mojos OF config.example.yaml.  try_lock and
+// try_lock_floor_only therefore take the floor and select among coins at or
+// above it.
+//
+// NOT REACHABLE ON THE LIVE DEPLOYMENT TODAY.  The live config.yaml sets
+// fees.min_fee_mojos: 15000000 (2026-09-19, full blocks), which puts the
+// threshold at 1,500,000 DBX units instead of 500 -- far beyond any tier
+// this bot posts.  The modelling below is therefore dormant until that fee
+// floor is lowered again, as the live config's own comment says it will be.
+// Independently of the fee, this ledger's pool comes from CoinManager, which
+// already drops XCH coins below 1,000,000 mojos, so a floor under that
+// selects the very coins it selected before.
 //
 // When those coins cannot cover the need the wallet REFUSES, and
 // OfferManager re-sends the create once without the floor, so the ledger
