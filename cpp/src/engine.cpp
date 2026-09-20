@@ -4258,6 +4258,17 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
                       "retried next heartbeat", e.what());
     }
 
+    // [S67] The fee controller's feedback sweep: censored observations for
+    // spends of ours still pending past the target delay.  Beside the two
+    // sweeps above for the same reason -- "not trading" is no reason to stop
+    // learning that a cancel is stuck.  Pays nothing, posts nothing; inert
+    // unless fees.controller_enabled.
+    try { co_await fee_feedback_sweep(block_height); }
+    catch (const std::exception& e) {
+        spdlog::error("[Engine] [S67] fee feedback sweep failed: {} -- "
+                      "retried next heartbeat", e.what());
+    }
+
     // Gate Steps 7-8 when in XCH recovery mode (no market-making until
     // XCH balance is restored).
     if (xch_recovery_mode_) {
@@ -5014,9 +5025,33 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
     if (fee_tracker_->enabled() && config_.fees.adaptive_enabled
         && !wallet_only_mode_) {
         try {
-            auto est = co_await full_node_->get_fee_estimate(config_.fees.fee_estimate_target_seconds);
-            if (est > 0) {
-                fee_tracker_->update_mempool_estimate(est);
+            if (fee_tracker_->wants_rate_estimate()) {
+                // [S67] Same endpoint, same one call per cycle, same
+                // wallet-only gate above -- but asked for a RATE (explicit
+                // cost), which every action class then scales by its own
+                // CLVM cost.  The node's admission floor comes from the
+                // blockchain state get_block_height() already fetched, so
+                // no node call is added to the heartbeat.
+                const rpc::FeeEstimateReading reading = co_await
+                    full_node_->get_fee_rate_estimate(config_.fees.fee_estimate_target_seconds);
+                if (reading.ok) {
+                    rpc::MempoolState mempool = full_node_->last_mempool_state();
+                    if (!mempool.known && reading.mempool_known) {
+                        mempool.known          = reading.mempool_max_cost > 0;
+                        mempool.cost           = reading.mempool_cost;
+                        mempool.max_total_cost = reading.mempool_max_cost;
+                    }
+                    const double floor_rate = rpc::admission_floor_rate(
+                        mempool, strategy::fee::max_cost(fee_tracker_->controller().config().costs));
+                    fee_feedback_note(fee_tracker_->update_feed_forward(
+                                          reading.rate, floor_rate, block_height),
+                                      block_height);
+                }
+            } else {
+                auto est = co_await full_node_->get_fee_estimate(config_.fees.fee_estimate_target_seconds);
+                if (est > 0) {
+                    fee_tracker_->update_mempool_estimate(est);
+                }
             }
         } catch (const std::exception& e) {
             spdlog::debug("[Engine] Step 1: get_fee_estimate failed: {} "
@@ -5332,6 +5367,12 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
                     t.offer_id, "cancelled",
                     static_cast<BlockHeight>(t.observed_block),
                     "wallet reported terminal");
+                // [S67] The wallet's verdict on a cancel we submitted: the
+                // fee controller's confirmation, at the height the status
+                // CHANGED (not this maturity height).  A no-op for an offer
+                // it holds no ticket for, and with the controller off.
+                fee_feedback_on_cancel_verdict(
+                    t.offer_id, static_cast<BlockHeight>(t.observed_block));
             } catch (const OfferNotFound& nf) {
                 // Genuinely unknown offer: nothing to update, ever.  This
                 // is a TYPED exception rather than a message match --
@@ -11037,7 +11078,7 @@ asio::awaitable<void> Engine::step_enforce_pace_caps(BlockHeight block_height,
             }
         }
         if (fee_tracker_->enabled() && !pace_freed.empty()) {
-            fee_tracker_->record_fee(static_cast<std::uint64_t>(pace_freed.size()) * recommended_fee,
+            fee_tracker_->record_fee(cancel_fees_paid(pace_freed, recommended_fee),
                                      block_height);
         }
         spdlog::warn("[Engine] Pace: {} cancelled {}/{} resting offers (binding={}, tiers={}, "
@@ -11151,7 +11192,8 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
     // optimal fee.  When fee tracking is disabled, the static
     // offer_fee_mojos from StrategyConfig is used unchanged.
     const std::uint64_t recommended_fee = fee_tracker_->get_recommended_fee(
-        config_.strategy.offer_fee_mojos, block_height);
+        config_.strategy.offer_fee_mojos, block_height,
+        strategy::fee::ActionClass::OfferAttached);
 
     if (recommended_fee == 0 && fee_tracker_->enabled()) {
         spdlog::warn("[Engine] Step 8: fee budget exhausted -- "
@@ -11160,6 +11202,19 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
     }
 
     offer_mgr_->set_dynamic_fee(recommended_fee);
+
+    // [S67] With the controller on, a cancel pays for what it SPENDS: an
+    // XCH-offered cancel costs ~8.4M CLVM, a CAT-offered one ~42M.  Off, the
+    // override is cleared and every cancel pays recommended_fee as before.
+    if (fee_tracker_->controller_active()) {
+        offer_mgr_->set_cancel_fees(
+            fee_tracker_->get_recommended_fee(config_.strategy.offer_fee_mojos, block_height,
+                                              strategy::fee::ActionClass::CancelXch),
+            fee_tracker_->get_recommended_fee(config_.strategy.offer_fee_mojos, block_height,
+                                              strategy::fee::ActionClass::CancelCat));
+    } else {
+        offer_mgr_->clear_cancel_fees();
+    }
 
     // [WALLET-CIRCUIT] C1.  The sync check and the XCH lock-ledger snapshot
     // above are this step's first wallet calls.  The sync check's own catch
@@ -11674,7 +11729,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             // T4-03: Record cancel fees in the tracker.
             if (fee_tracker_->enabled()) {
                 fee_tracker_->record_fee(
-                    static_cast<std::uint64_t>(cancelled_ids.size()) * recommended_fee,
+                    cancel_fees_paid(cancelled_ids, recommended_fee),
                     block_height);
             }
         }
@@ -11934,6 +11989,13 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                             if (!saw_pending_change) {
                                 ++consecutive_pending_blocks_;
                                 saw_pending_change = true;
+                                // [S67] Half way to the force-delete: our own
+                                // spends are not confirming.  An edge, so one
+                                // run of pending_change speaks once.
+                                if (consecutive_pending_blocks_ == kForceDeletePendingBlocks / 2) {
+                                    fee_feedback_signal(
+                                        strategy::fee::Signal::PendingChangeStuck, block_height);
+                                }
                             }
 
                             // Periodic stuck-tx pruning.
@@ -11944,6 +12006,12 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                     auto pruned = co_await
                                         offer_mgr_->prune_stuck_transactions(
                                             {sb.wid}, /*max_age_seconds=*/600);
+                                    // [S67] The rows the pruner just read carry
+                                    // the node's own refusals (sent_to).
+                                    if (offer_mgr_->take_fee_rejections_seen() > 0) {
+                                        fee_feedback_signal(
+                                            strategy::fee::Signal::MempoolRejected, block_height);
+                                    }
                                     if (pruned > 0) {
                                         spdlog::info("[Engine] Step 8: pruned "
                                                      "stuck transactions from "
@@ -11998,6 +12066,10 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                                      pw, e.what());
                                     }
                                 }
+                                // [S67] The hardest "too low" there is: spends
+                                // sat unconfirmed until the wallet was wiped.
+                                fee_feedback_signal(strategy::fee::Signal::ForceDelete,
+                                                    block_height);
                                 consecutive_pending_blocks_ = 0;
                             }
                             // Fall through to Gates 2 and 3: they evaluate
@@ -14269,7 +14341,8 @@ asio::awaitable<void> Engine::step_check_arbitrage(
         // ------------------------------------------------------------------
         const std::uint64_t fee = fee_tracker_
             ? fee_tracker_->get_recommended_fee(
-                  config_.fees.min_fee_mojos, block_height)
+                  config_.fees.min_fee_mojos, block_height,
+                  strategy::fee::ActionClass::Take)
             : config_.fees.min_fee_mojos;
 
         // 9c lifts an ASK and only an ASK -- evaluate_crossed_book() has no
@@ -14546,6 +14619,7 @@ asio::awaitable<void> Engine::step_check_arbitrage(
                 if (fee_tracker_) {
                     fee_tracker_->record_fee(fee, block_height);
                 }
+                fee_feedback_track_take(trade_id, fee, block_height);   // [S67]
 
                 // Alert for visibility.
                 if (alerts_) {
@@ -14778,7 +14852,8 @@ asio::awaitable<void> Engine::step_check_arbitrage(
                     // against min_edge and so never accounted for any of it.
                     const std::uint64_t est_fee = fee_tracker_
                         ? fee_tracker_->get_recommended_fee(
-                              config_.fees.min_fee_mojos, block_height)
+                              config_.fees.min_fee_mojos, block_height,
+                              strategy::fee::ActionClass::Take)
                         : static_cast<std::uint64_t>(config_.fees.min_fee_mojos);
                     const double fee_bps_per_leg =
                         (best_ask_a_size > 0)
@@ -14888,7 +14963,8 @@ asio::awaitable<void> Engine::step_check_arbitrage(
                         const std::uint64_t fee = fee_tracker_
                             ? fee_tracker_->get_recommended_fee(
                                   config_.fees.min_fee_mojos,
-                                  block_height)
+                                  block_height,
+                                  strategy::fee::ActionClass::Take)
                             : config_.fees.min_fee_mojos;
 
                         spdlog::info("[Engine] Step 9d: TAKING "
@@ -14947,6 +15023,7 @@ asio::awaitable<void> Engine::step_check_arbitrage(
                                 fee_tracker_->record_fee(
                                     fee, block_height);
                             }
+                            fee_feedback_track_take(trade_id, fee, block_height);   // [S67]
 
                             if (alerts_) {
                                 alerts_->send_alert(
@@ -15197,7 +15274,8 @@ asio::awaitable<void> Engine::step_check_arbitrage(
 
                 const std::uint64_t fee = fee_tracker_
                     ? fee_tracker_->get_recommended_fee(
-                          config_.fees.min_fee_mojos, block_height)
+                          config_.fees.min_fee_mojos, block_height,
+                          strategy::fee::ActionClass::Take)
                     : config_.fees.min_fee_mojos;
 
                 // Pre-balance check: verify we have enough spendable
@@ -15381,6 +15459,7 @@ asio::awaitable<void> Engine::step_check_arbitrage(
 
                     if (fee_tracker_)
                         fee_tracker_->record_fee(fee, block_height);
+                    fee_feedback_track_take(tid, fee, block_height);   // [S67]
                     if (alerts_) {
                         alerts_->send_alert(
                             AlertRule::ArbitrageDetected,
@@ -15930,7 +16009,8 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
         // SAME wallet as the spend, so it is computed before the check.
         const std::uint64_t fee = fee_tracker_
             ? fee_tracker_->get_recommended_fee(
-                  config_.fees.min_fee_mojos, block_height)
+                  config_.fees.min_fee_mojos, block_height,
+                  strategy::fee::ActionClass::Take)
             : config_.fees.min_fee_mojos;
 
         // Pre-balance check (mirrors Step 9e).
@@ -16055,6 +16135,7 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
 
             if (fee_tracker_)
                 fee_tracker_->record_fee(fee, block_height);
+            fee_feedback_track_take(tid, fee, block_height);   // [S67]
             if (alerts_) {
                 alerts_->send_alert(
                     AlertRule::ArbitrageDetected,
@@ -21163,6 +21244,250 @@ bool Engine::wallet_step_may_run(std::string_view step)
 }
 
 // ---------------------------------------------------------------------------
+// [S67 2026-09-20] Fee controller feedback -- the engine glue.
+//
+// Every DECISION lives in strategy/fee_controller.hpp and is driven by ctest;
+// these functions only gather inputs and apply outputs, and every one of them
+// is inert unless fees.controller_enabled (FeeTracker::controller_active).
+// Every block count is a PEAK height.
+// ---------------------------------------------------------------------------
+
+std::uint64_t Engine::cancel_fees_paid(const std::vector<std::string>& ids,
+                                       std::uint64_t                   legacy_fee) const
+{
+    if (!fee_tracker_ || !fee_tracker_->controller_active() || !offer_mgr_) {
+        // The pre-S67 accounting, unchanged: one fee for every cancel.
+        return static_cast<std::uint64_t>(ids.size()) * legacy_fee;
+    }
+    std::uint64_t total = 0;
+    for (const auto& id : ids) {
+        const std::uint64_t fee = offer_mgr_->cancel_fee_for(id);
+        total = (fee > std::numeric_limits<std::uint64_t>::max() - total)
+                    ? std::numeric_limits<std::uint64_t>::max()
+                    : total + fee;
+    }
+    return total;
+}
+
+void Engine::fee_feedback_note(const strategy::fee::Change& change, BlockHeight block)
+{
+    if (!fee_tracker_ || !fee_tracker_->controller_active()) {
+        return;
+    }
+    if (metrics_) {
+        metrics_->update_fee_controller(fee_tracker_->controller().effective_rate(block),
+                                        fee_tracker_->controller().level());
+    }
+    // ONE line per burst of moves, old -> new with the latest reason; see
+    // strategy::fee::ChangeLogGate.  Nothing is logged for a change that
+    // moved nothing.
+    if (!fee_change_log_.note(change, block)) {
+        return;
+    }
+    const strategy::fee::Controller& c = fee_tracker_->controller();
+    spdlog::info("[FeeController] rate {:.4f} -> {:.4f} mojos/cost ({}; {} move(s); level "
+                 "{:+.2f} log2{}) -- fees now: cancel_xch {} cancel_cat {} take {} attached {}",
+                 fee_change_log_.first_old_rate, fee_change_log_.latest_new_rate,
+                 strategy::fee::to_string(fee_change_log_.latest_reason),
+                 fee_change_log_.folded, c.level(), c.probing() ? ", probing" : "",
+                 c.fee_for(strategy::fee::ActionClass::CancelXch, block),
+                 c.fee_for(strategy::fee::ActionClass::CancelCat, block),
+                 c.fee_for(strategy::fee::ActionClass::Take, block),
+                 c.fee_for(strategy::fee::ActionClass::OfferAttached, block));
+    fee_change_log_.emitted(block);
+}
+
+void Engine::fee_feedback_signal(strategy::fee::Signal signal, BlockHeight block)
+{
+    if (!fee_tracker_ || !fee_tracker_->controller_active()) {
+        return;
+    }
+    strategy::fee::Observation o;
+    o.signal = signal;
+    o.now    = block;
+    fee_feedback_note(fee_tracker_->observe(o), block);
+}
+
+void Engine::fee_feedback_track_take(const std::string& trade_id, std::uint64_t fee,
+                                     BlockHeight block)
+{
+    if (!fee_tracker_ || !fee_tracker_->controller_active()
+        || trade_id.empty() || trade_id == "unknown"
+        || fee_tickets_.size() >= strategy::fee::kMaxTickets) {
+        return;
+    }
+    fee_tickets_.emplace(trade_id, fee_tracker_->make_ticket(
+                                       strategy::fee::ActionClass::Take, fee, block));
+}
+
+void Engine::fee_feedback_on_cancel_verdict(const std::string& offer_id,
+                                            BlockHeight        observed_block)
+{
+    if (!fee_tracker_ || !fee_tracker_->controller_active()) {
+        return;
+    }
+    const auto it = fee_tickets_.find(offer_id);
+    if (it == fee_tickets_.end() || it->second.cls == strategy::fee::ActionClass::Take) {
+        return;
+    }
+    strategy::fee::Observation o;
+    o.signal       = strategy::fee::Signal::Confirmed;
+    o.blocks       = static_cast<double>(
+        strategy::fee::confirmation_delay(it->second, observed_block));
+    o.attributed   = true;
+    o.submit_level = it->second.submit_level;
+    o.now          = last_block_.load(std::memory_order_relaxed);
+    fee_tickets_.erase(it);
+    fee_feedback_note(fee_tracker_->observe(o), o.now);
+}
+
+asio::awaitable<void> Engine::fee_feedback_sweep(BlockHeight block)
+{
+    if (!fee_tracker_ || !fee_tracker_->controller_active() || dry_run_
+        || !state_ || !offer_mgr_ || block == 0) {
+        co_return;
+    }
+
+    // The budget bound: ONE alert per episode (FeeTracker owns the edge).
+    if (fee_tracker_->take_budget_bound_alert() && alerts_) {
+        alerts_->send_alert(
+            AlertRule::FeeBudgetBound,
+            "Fee budget binds: wanted " + std::to_string(fee_tracker_->last_bound_desired())
+                + " mojos, budget allows " + std::to_string(fee_tracker_->last_bound_allowed())
+                + ". Fees degrade toward fees.min_fee_mojos; quoting and cancelling continue. "
+                  "Raise fees.daily_budget_mojos if spends stop confirming.");
+    }
+
+    const std::uint32_t target = fee_tracker_->controller().config().target_delay_blocks;
+
+    // 1. Every cancel_pending offer in State is a cancel of ours in flight.
+    //    First sighting opens its ticket: at most one heartbeat after the
+    //    submit, so a measured delay is short by that much, never long.
+    //    A cancel ALREADY pending when this process first looks (adopted at
+    //    boot from the wallet's PENDING_CANCEL records, possibly days old) gets
+    //    no ticket: what it paid is unknown, so its lateness is not evidence
+    //    about the level and its confirmation would not validate it.
+    const bool first_sweep = !fee_sweep_ran_;
+    fee_sweep_ran_ = true;
+    std::unordered_set<std::string> cancels_in_flight;
+    for (const auto& po : state_->get_all_offers()) {
+        if (!po.cancel_pending) {
+            continue;
+        }
+        cancels_in_flight.insert(po.offer_id);
+        if (first_sweep) {
+            fee_unticketed_.insert(po.offer_id);
+        }
+        if (fee_unticketed_.count(po.offer_id) != 0
+            || fee_tickets_.count(po.offer_id) != 0
+            || fee_tickets_.size() >= strategy::fee::kMaxTickets) {
+            continue;
+        }
+        const PairConfig* pc = find_pair_config(po.pair_name);
+        const bool offered_is_xch = pc != nullptr
+            && ((po.side == Side::Bid ? pc->quote_asset_id : pc->base_asset_id) == "xch");
+        fee_tickets_.emplace(po.offer_id, fee_tracker_->make_ticket(
+            pc != nullptr ? strategy::fee::cancel_class(offered_is_xch)
+                          : strategy::fee::ActionClass::CancelCat,
+            offer_mgr_->cancel_fee_for(po.offer_id), block));
+    }
+
+    // Forget boot-time cancels once they are gone, so the set cannot grow.
+    for (auto it = fee_unticketed_.begin(); it != fee_unticketed_.end();) {
+        it = cancels_in_flight.count(*it) == 0 ? fee_unticketed_.erase(it) : std::next(it);
+    }
+
+    // 2. Walk the tickets.  A take is polled below; a cancel that left
+    //    cancel_pending waits for Step 2's wallet verdict (it may have been a
+    //    FILL, which says nothing about our fee) and is dropped unheard when
+    //    none comes.
+    std::string take_to_poll;
+    BlockHeight take_to_poll_block = 0;
+    for (auto it = fee_tickets_.begin(); it != fee_tickets_.end();) {
+        strategy::fee::Ticket& t = it->second;
+        const bool is_take = t.cls == strategy::fee::ActionClass::Take;
+        if (!is_take) {
+            const bool in_flight = cancels_in_flight.count(it->first) != 0;
+            if (!in_flight && !t.awaiting_verdict) {
+                t.awaiting_verdict = true;
+                t.left_block       = block;
+            } else if (in_flight && t.awaiting_verdict) {
+                t.awaiting_verdict = false;   // revived into State: pending again
+            }
+        } else if (strategy::fee::ticket_age(t, block) > strategy::fee::kVerdictTtlBlocks) {
+            it = fee_tickets_.erase(it);      // a take nobody could resolve
+            continue;
+        }
+        if (strategy::fee::verdict_expired(t, block)) {
+            it = fee_tickets_.erase(it);
+            continue;
+        }
+        if (is_take) {
+            if (take_to_poll.empty() || t.submit_block < take_to_poll_block) {
+                take_to_poll       = it->first;
+                take_to_poll_block = t.submit_block;
+            }
+        } else if (strategy::fee::pending_observation_due(t, block, target)) {
+            t.last_pending_block = block;
+            strategy::fee::Observation o;
+            o.signal       = strategy::fee::Signal::Pending;
+            o.blocks       = static_cast<double>(strategy::fee::ticket_age(t, block));
+            o.attributed   = true;
+            o.submit_level = t.submit_level;
+            o.now          = block;
+            fee_feedback_note(fee_tracker_->observe(o), block);
+        }
+        ++it;
+    }
+
+    // 3. ONE take per heartbeat, oldest first: a single wallet get_offer by
+    //    trade id, and none at all while the wallet is failing or the dead
+    //    man's switch has fired.  Take BOOKING is untouched -- this only
+    //    listens.
+    if (take_to_poll.empty() || !wallet_ || wallet_circuit_open_
+        || watchdog_fired_.load(std::memory_order_acquire)
+        || execution::wallet_gate(wallet_transport_at_cycle_start_,
+                                  wallet_->transport_counters())
+               != execution::WalletGate::Run) {
+        co_return;
+    }
+    nlohmann::json record;
+    try {
+        record = co_await wallet_->get_offer(take_to_poll, /*file_contents=*/false);
+    } catch (const std::exception& e) {
+        spdlog::debug("[Engine] [S67] take status read failed for {}: {} -- retried next "
+                      "heartbeat", take_to_poll.substr(0, 12), e.what());
+        co_return;
+    }
+    const auto found = fee_tickets_.find(take_to_poll);
+    if (found == fee_tickets_.end()) {
+        co_return;
+    }
+    const execution::WalletCancelState status = execution::wallet_cancel_state_from_record(record);
+    strategy::fee::Observation o;
+    o.attributed   = true;
+    o.submit_level = found->second.submit_level;
+    o.now          = block;
+    o.blocks       = static_cast<double>(strategy::fee::ticket_age(found->second, block));
+    if (status == execution::WalletCancelState::Confirmed) {
+        o.signal = strategy::fee::Signal::Confirmed;
+        fee_tickets_.erase(found);
+        fee_feedback_note(fee_tracker_->observe(o), block);
+    } else if (status == execution::WalletCancelState::Failed
+               || status == execution::WalletCancelState::Cancelled) {
+        // Someone else took it first, or the wallet gave up: not a verdict on
+        // the fee.
+        fee_tickets_.erase(found);
+    } else if (status == execution::WalletCancelState::PendingConfirm
+               && strategy::fee::pending_observation_due(found->second, block, target)) {
+        found->second.last_pending_block = block;
+        o.signal = strategy::fee::Signal::Pending;
+        fee_feedback_note(fee_tracker_->observe(o), block);
+    }
+    co_return;
+}
+
+// ---------------------------------------------------------------------------
 // [S14 2026-09-13] escalate_stuck_cancels -- proof-gated re-cancel of offers
 // whose cancel the wallet accepted but the chain never saw.
 //
@@ -21377,14 +21702,24 @@ asio::awaitable<void> Engine::escalate_stuck_cancels(BlockHeight block)
     }
 
     if (!due.empty()) {
+        // [S67] One class for the whole sweep: CancelCat, the dearer cancel.
+        // An escalation exists to get a stuck cancel IN, so an XCH-offered
+        // offer overpaying here is the cheap side of that error.
         const std::uint64_t base_fee = fee_tracker_
-            ? fee_tracker_->get_recommended_fee(config_.strategy.offer_fee_mojos, block)
+            ? fee_tracker_->get_recommended_fee(config_.strategy.offer_fee_mojos, block,
+                                                strategy::fee::ActionClass::CancelCat)
             : config_.strategy.offer_fee_mojos;
         // A ceiling on the cancel being replaced: emergency_cancel's top tier
         // pays up to twice the dynamic fee.  It is the dynamic fee NOW, not the
         // one that cancel saw -- initial cancel fees are not persisted (see
         // execution::escalation_fee_mojos).
-        const std::uint64_t dynamic_fee = offer_mgr_->current_fee();
+        // [S67] With the controller on the cancel being replaced paid a CLASS
+        // fee, which can exceed current_fee() (the offer-attached fee), so the
+        // ceiling rests on the larger of the two.  Off, this is current_fee().
+        const std::uint64_t dynamic_fee =
+            (fee_tracker_ && fee_tracker_->controller_active())
+                ? std::max(offer_mgr_->current_fee(), base_fee)
+                : offer_mgr_->current_fee();
         const std::uint64_t prior_ceiling =
             dynamic_fee > std::numeric_limits<std::uint64_t>::max() / 2U
                 ? std::numeric_limits<std::uint64_t>::max()

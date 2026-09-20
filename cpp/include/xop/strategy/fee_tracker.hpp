@@ -24,6 +24,7 @@
 #define XOP_STRATEGY_FEE_TRACKER_HPP
 
 #include "xop/config.hpp"
+#include "xop/strategy/fee_controller.hpp"
 #include "xop/types.hpp"
 
 #include <cstdint>
@@ -35,6 +36,11 @@ namespace xop {
 // ---------------------------------------------------------------------------
 // FeeTracker
 // ---------------------------------------------------------------------------
+
+/// [S67] The controller's tuning, copied out of the `fees:` section.  The
+/// controller is enabled only when fees.enabled is too: fees.enabled: false
+/// is the documented passthrough and it wins.
+[[nodiscard]] strategy::fee::ControllerConfig fee_controller_config_from(const FeeConfig& cfg);
 
 class FeeTracker {
 public:
@@ -88,9 +94,17 @@ public:
     ///
     /// @param static_fee_mojos  The statically configured offer_fee_mojos.
     /// @param current_block     Current block height (for budget check).
-    /// @return Recommended fee in mojos.
+    /// @param action            [S67] What the fee pays for.  There is NO
+    ///                          default on purpose: a call site that names no
+    ///                          class does not compile.  With
+    ///                          fees.cost_aware_estimate and the controller
+    ///                          both off the class is not read at all.
+    /// @return Recommended fee in mojos.  0 means "skip posting" on the
+    ///         legacy path only; with the controller on it is never 0 (see
+    ///         strategy::fee::apply_budget).
     std::uint64_t get_recommended_fee(std::uint64_t static_fee_mojos,
-                                      BlockHeight   current_block);
+                                      BlockHeight   current_block,
+                                      strategy::fee::ActionClass action);
 
     // -- Mempool estimate ingestion -----------------------------------------
 
@@ -100,6 +114,46 @@ public:
     ///
     /// @param estimated_fee_mojos  Fee estimate for ~60 s target time.
     void update_mempool_estimate(std::uint64_t estimated_fee_mojos);
+
+    // -- [S67] Cost-aware estimate and the fee controller -------------------
+
+    /// True when fees.cost_aware_estimate or the controller wants a RATE
+    /// from the node (get_fee_rate_estimate) rather than the legacy estimate.
+    [[nodiscard]] bool wants_rate_estimate() const noexcept
+    {
+        return cfg_.enabled && cfg_.adaptive_enabled
+            && (cfg_.cost_aware_estimate || controller_.enabled());
+    }
+
+    /// True when the closed-loop controller sets the fees.
+    [[nodiscard]] bool controller_active() const noexcept { return controller_.enabled(); }
+
+    /// One node reading: the estimate as mojos per cost, and the node's own
+    /// admission floor (0 when its mempool has room or it did not say).
+    /// Feeds the cost-aware legacy path and the controller's floor.
+    strategy::fee::Change update_feed_forward(double      estimate_rate,
+                                              double      admission_floor_rate,
+                                              BlockHeight current_block);
+
+    /// Feed one observation to the controller.  A no-op returning
+    /// ChangeReason::Disabled when the controller is off.
+    strategy::fee::Change observe(const strategy::fee::Observation& observation);
+
+    /// The ticket for a spend just submitted at `fee_paid_mojos`.
+    [[nodiscard]] strategy::fee::Ticket make_ticket(strategy::fee::ActionClass action,
+                                                    std::uint64_t fee_paid_mojos,
+                                                    BlockHeight   current_block) const noexcept;
+
+    /// True ONCE per episode in which the budget lowered a fee: the engine
+    /// turns it into one operator alert.  The episode ends when an
+    /// offer-attached fee next comes back unbound.
+    [[nodiscard]] bool take_budget_bound_alert() noexcept;
+
+    /// The fee the budget last refused to pay in full, and what it allowed.
+    [[nodiscard]] std::uint64_t last_bound_desired() const noexcept { return last_bound_desired_; }
+    [[nodiscard]] std::uint64_t last_bound_allowed() const noexcept { return last_bound_allowed_; }
+
+    [[nodiscard]] const strategy::fee::Controller& controller() const noexcept { return controller_; }
 
     // -- Accessors ----------------------------------------------------------
 
@@ -127,6 +181,21 @@ private:
 
     /// Latest mempool fee estimate (0 = not available).
     std::uint64_t mempool_estimate_{0};
+
+    /// [S67] Latest node estimate as a RATE, mojos per cost (0 = not
+    /// available), for fees.cost_aware_estimate.
+    double mempool_rate_{0.0};
+
+    /// [S67] The closed loop.  Inert unless fees.controller_enabled.
+    strategy::fee::Controller controller_;
+
+    bool          budget_bound_{false};
+    bool          budget_alert_pending_{false};
+    std::uint64_t last_bound_desired_{0};
+    std::uint64_t last_bound_allowed_{0};
+
+    /// The controller path of get_recommended_fee.
+    std::uint64_t controller_fee(strategy::fee::ActionClass action, BlockHeight current_block);
 };
 
 }  // namespace xop

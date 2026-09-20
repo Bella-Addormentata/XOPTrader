@@ -749,6 +749,31 @@ public:
     /// Return the fee currently in effect (dynamic or static fallback).
     [[nodiscard]] std::uint64_t current_fee() const noexcept;
 
+    // -- [S67] Class-aware cancel fees ---------------------------------------
+
+    /// The fee controller's cancel fees.  A secure cancel spends the coins
+    /// the offer OFFERED: an XCH coin costs ~8.4M CLVM, a CAT coin plus its
+    /// XCH fee coin ~42M, so one fee for both under- or over-pays by 5x.
+    /// Until this is called every cancel pays current_fee(), exactly as
+    /// before; the engine calls it only while fees.controller_enabled.
+    void set_cancel_fees(std::uint64_t xch_offered_mojos,
+                         std::uint64_t cat_offered_mojos) noexcept;
+
+    /// Back to one fee for everything (the controller was switched off).
+    void clear_cancel_fees() noexcept;
+
+    /// The fee a cancel of `offer_id` pays now: current_fee() unless
+    /// set_cancel_fees() is in force, then the fee for the asset the offer
+    /// offered (strategy::fee::cancel_fee_for).  An offer State does not
+    /// know pays the CAT fee, the larger.
+    [[nodiscard]] std::uint64_t cancel_fee_for(const std::string& offer_id) const;
+
+    /// Unconfirmed wallet rows whose LATEST sent_to entry is a fee refusal
+    /// (INVALID_FEE_TOO_CLOSE_TO_ZERO / INVALID_FEE_LOW_FEE), first seen by
+    /// prune_stuck_transactions() since this was last called.  Each row is
+    /// counted once, by transaction name.
+    [[nodiscard]] std::uint32_t take_fee_rejections_seen() noexcept;
+
     // -- Offer reconciliation -----------------------------------------------
 
     /**
@@ -1286,6 +1311,17 @@ private:
     /// Dynamic fee override.  Initialised from strategy_cfg_.offer_fee_mojos;
     /// updated at runtime by set_dynamic_fee() from the engine's FeeTracker.
     std::uint64_t current_fee_mojos_;
+
+    /// [S67] Class-aware cancel fees; inert until set_cancel_fees().
+    bool          cancel_fees_active_{false};
+    std::uint64_t cancel_fee_xch_mojos_{0};
+    std::uint64_t cancel_fee_cat_mojos_{0};
+
+    /// [S67] sent_to fee refusals seen by prune_stuck_transactions and not
+    /// yet taken, and the transaction names already counted (bounded).
+    std::uint32_t fee_rejections_seen_{0};
+    std::unordered_set<std::string> fee_rejections_reported_;
+
     std::function<bool()> abort_predicate_;
     std::function<void(const std::string&)> escalate_;
 

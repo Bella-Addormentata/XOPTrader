@@ -5,6 +5,85 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — a closed-loop fee controller, shipped off
+
+With Chia blocks about 97% full the node admits a spend only at 5 mojos or more
+per unit of CLVM cost. The engine paid the node's estimate for a plain XCH send
+and never checked whether its own cancels and takes confirmed, so they sat,
+`pending_change` persisted, and Step 8 force-deleted every unconfirmed wallet
+transaction 10-12 times a day. This adds the feedback. Both new switches
+default to off, and with both off every fee is what v0.10.24 paid.
+
+### Fee controller (S67)
+
+- **One controlled quantity: a fee rate, in mojos per CLVM cost.** Four action
+  classes turn it into a fee — cancel of an XCH-offered offer (8.4M cost), cancel
+  of a CAT-offered offer (42.3M), take (125M), fee attached to a posted offer
+  (21M). The costs were measured on this wallet's own spend bundles and are
+  configurable. Every `get_recommended_fee` call site now names its class; the
+  parameter has no default, so a site that forgets does not compile.
+- **Fast up on evidence that a fee is too low.** A cancel or take of ours still
+  pending after `controller_target_delay_blocks` (8 peak heights, 150 s) is a
+  censored observation and raises the rate at once — a too-low fee may never
+  confirm, so waiting for a confirmation would deadlock the loop. Also heard:
+  a late confirmation, the wallet's `sent_to` fee refusals (read from rows the
+  stuck-transaction pruner already holds), Step 8's `pending_change` counter at
+  half way, and the force-delete itself. The law is a velocity-form PID in log
+  fee space that only ever raises.
+- **Slow down by probing.** After 8 on-target confirmations the fee steps down
+  15%. A probe that fails returns to the last known-good fee plus 10%, the level
+  it failed at is remembered, and re-testing that level waits twice as long each
+  time (cap 256 confirmations). A re-test that succeeds means the floor has
+  fallen: the memory is dropped and probing resumes at the base interval.
+- **Anti-windup.** A stuck spend stops counting once the fee is `min_raise` above
+  what that spend paid, which also bounds what a fee clamped by `max_fee_mojos`
+  or the budget can do. Wallet-level signals are ignored for two target delays
+  after a raise, and at most three in a row may raise the fee without an
+  observation of one of our own spends in between.
+- **The node's numbers are a floor under the learned rate, never a multiplier.**
+  `get_fee_estimate` is now asked with an explicit `cost` instead of
+  `spend_type: send_xch_transaction`; the rate it returns is scaled by each
+  class's cost. The node's own admission floor is read from the
+  `get_blockchain_state` reply the height poll already fetches
+  (`mempool_cost`, `mempool_max_total_cost`, `mempool_min_fees`). No node call
+  is added, the wallet-only gate is unchanged, and a reading older than 32 peak
+  heights is dropped: with the node unreachable the learned rate stands alone.
+- **The budget no longer stops the bot.** With the controller on, cancels and
+  takes keep a reserve (`controller_budget_reserve_cancels`, 25 CAT cancels)
+  that offer-attached fees cannot spend; an exhausted budget degrades every fee
+  to `min_fee_mojos` and sends one `FeeBudgetBound` alert. It never returns 0,
+  which made Step 8 skip cancelling stale quotes as well as posting.
+- **Observability.** One `[FeeController] rate a -> b mojos/cost (reason; n
+  move(s)) -- fees now: ...` line per burst of changes, and two gauges,
+  `xop_fees_controller_rate_mojos_per_cost` and `xop_fees_controller_level_log2`.
+  At startup the controller reports which classes `max_fee_mojos` cannot get
+  into a full mempool.
+- **Keys**, all under `fees:` and read at startup: `cost_aware_estimate`,
+  `controller_enabled`, `controller_target_delay_blocks`, `controller_kp` / `_ki`
+  / `_kd`, `controller_max_error`, `controller_max_step_up`,
+  `controller_min_raise`, `controller_warmup_observations`,
+  `controller_probe_fraction`, `controller_probe_after_confirmations`,
+  `controller_probe_confirmations`, `controller_probe_fail_bump`,
+  `controller_probe_backoff_cap`, `controller_ff_margin`,
+  `controller_ff_max_age_blocks`, `controller_budget_reserve_cancels` and four
+  `controller_cost_*`. Ranges are validated; `controller_enabled` requires
+  `min_fee_mojos > 0`.
+
+### Operator notes
+
+- **Nothing changes until a switch is turned on.** `cost_aware_estimate: true`
+  alone changes fees (about 4.5x for a CAT cancel at the same node rate).
+- **The live `max_fee_mojos: 100000000` cannot get a CAT cancel or a take into a
+  full mempool** (100M / 42.3M cost = 2.4 mojos per cost, the node needs 5).
+  Before enabling the controller raise it to at least 250,000,000, or
+  700,000,000 to cover takes, and raise
+  `strategy.cancel_escalation_max_fee_mojos` with it.
+- **`daily_budget_mojos` is per `fee_window_blocks`, and 1662 peak heights is
+  8.7 hours, not 24** (S69). At full-mempool fees about 100 cancels and 6 takes
+  a day cost 0.01-0.04 XCH.
+- Found while measuring, not fixed here: Step 8's force-delete fires after a
+  median of 176 seconds, not the ~10 minutes its constant documents (S68).
+
 ## [0.10.24] — 2026-09-14 — record what happened, not what was asked for
 
 Nine merged branches, and most of them fix a record or a signal that reported a

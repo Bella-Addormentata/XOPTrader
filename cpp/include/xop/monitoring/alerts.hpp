@@ -134,6 +134,12 @@ enum class AlertRule : std::uint8_t {
                                // it; the engine itself sends at most one per
                                // 65 s and names every offer.
 
+    FeeBudgetBound       = 22, // [S67] The rolling fee budget lowered a fee
+                               // the controller asked for.  Sent once per
+                               // episode; its own rule so a busy WARNING
+                               // cooldown cannot swallow the one message
+                               // that says why spends may stop confirming.
+
     LedgerDivergence     = 16  // Books and wallet disagree beyond tolerance.
                                // Its own rule so accounting noise can never
                                // rate-limit or masquerade as ExposureBreach,

@@ -844,6 +844,70 @@ fees:
   fee_window_blocks: 1662            # Rolling window for budget (~24h at 52s/block)
   fee_estimate_target_seconds: 300   # Target inclusion time for fee estimate (300=5min, low urgency)
 
+  # -- [S67] Cost-aware estimate and the closed-loop fee controller ----------
+  # Both ship OFF; with both off every fee is what it was before they existed.
+  # Why: with Chia blocks ~97% full the node admits a spend only at >= 5 mojos
+  # per unit of CLVM cost and refuses the rest (INVALID_FEE_TOO_CLOSE_TO_ZERO).
+  # The old fee was the node's estimate for a PLAIN XCH SEND (9.4M cost) paid
+  # for CAT cancels (42M) and takes (93M-212M), and nothing checked whether our
+  # own spends confirmed.  Design and evidence: cpp/include/xop/strategy/
+  # fee_controller.hpp.  EVERY block count below is a PEAK height: 4,608 per
+  # day, 18.75 s each -- not the ~52 s transaction-block figure used above.
+  #
+  # NOTE fee_window_blocks above is compared against peak heights too, so 1662
+  # is ~8.7 hours, not 24: daily_budget_mojos is really a per-8.7-hour budget.
+  #
+  # cost_aware_estimate: false       # Ask the node for a fee RATE (explicit cost) and
+  #                                  # scale it by the action's own CLVM cost.  Changes
+  #                                  # fees paid even with the controller off (about
+  #                                  # 4.5x for a CAT cancel).  Implied by the controller.
+  # controller_enabled: false        # Master switch.  Needs enabled: true and min_fee_mojos > 0.
+  #                                  # Raises the fee rate fast when our spends are not
+  #                                  # confirming; lowers it by scheduled probes.
+  # controller_target_delay_blocks: 8   # A spend of ours should confirm within this many
+  #                                  # peak heights (8 = 150 s).  [1, 4608]
+  # controller_kp: 1.0               # Gains, log2 fee units per target-delay of lateness.
+  # controller_ki: 0.5               # Each in [0, 16].  ki: 0 means a sustained error
+  # controller_kd: 0.5               # raises once and then no more (warned at startup).
+  # controller_max_error: 2.0        # Cap on one observation's lateness; what a hard signal
+  #                                  # (force-delete, sent_to fee error) reports.  (0, 16]
+  # controller_max_step_up: 1.0      # Cap on one observation's raise, log2 (1.0 = x2).  (0, 8]
+  # controller_min_raise: 1.0        # A stuck spend keeps raising the fee until it is this
+  #                                  # far (log2) above what that spend paid.  (0, 8]
+  # controller_warmup_observations: 3   # Observations consumed before the fee may move.  [0, 1000]
+  # controller_probe_fraction: 0.15  # Probe-down step: lower the fee by this fraction ...
+  # controller_probe_after_confirmations: 8   # ... after this many on-target confirmations ...
+  # controller_probe_confirmations: 3         # ... good after this many more at the lower fee.
+  # controller_probe_fail_bump: 0.10 # A failed probe returns to last-good times (1 + this).  [0, 1]
+  # controller_probe_backoff_cap: 256   # Re-testing a fee that already failed waits 2x longer
+  #                                  # each time, up to this many confirmations.
+  # controller_ff_margin: 1.10       # Multiplier on the node's estimate and its admission
+  #                                  # floor, which act as a FLOOR under the learned fee.  [1, 4]
+  # controller_ff_max_age_blocks: 32 # A node reading older than this is dropped (node
+  #                                  # unreachable): the learned fee then stands alone.
+  # controller_budget_reserve_cancels: 25   # Budget held back from offer-attached fees so the
+  #                                  # book can still be cancelled: this many CAT cancels.
+  #                                  # With the controller ON an exhausted budget degrades
+  #                                  # fees to min_fee_mojos (one alert); it never returns
+  #                                  # 0 = "skip Step 8", which also stopped cancels.
+  # CLVM cost per action class, measured on the live wallet 2026-09-20 (321 spend
+  # bundles costed with chia_rs).  fee = rate x cost, clamped to [min_fee, max_fee].
+  # controller_cost_cancel_xch: 8400000      # cancel of an offer that offered XCH (8.33-8.38M)
+  # controller_cost_cancel_cat: 42300000     # cancel of an offer that offered a CAT (42.05-42.26M)
+  # controller_cost_take: 125000000          # take_offer (92.6M with one maker coin, +30.5M each)
+  # controller_cost_offer_attached: 21000000 # maker's share of a fill; paid only if filled
+  #
+  # OPERATOR GUIDANCE at full-mempool fee levels (5 mojos/cost x 1.10 margin):
+  #   CAT cancel ~233M, XCH cancel ~46M, take ~690M mojos.  So:
+  #   * max_fee_mojos 100000000 CANNOT get a CAT cancel or a take into a full
+  #     mempool (the startup log says so).  Use >= 250000000 for cancels,
+  #     >= 700000000 to cover takes.
+  #   * ~100 cancels + up to 6 takes a day is 0.01-0.04 XCH/day.  Size
+  #     daily_budget_mojos for the WINDOW: at fee_window_blocks 1662 (~8.7 h)
+  #     that is 5000000000-15000000000.
+  #   * strategy.cancel_escalation_max_fee_mojos caps the #157 re-cancel
+  #     separately; raise it alongside max_fee_mojos.
+
 # Inventory aging (T4-09): gradually relax the no-loss floor for positions
 # held underwater for an extended period.  Capital locked in permanently-
 # underwater positions has an opportunity cost; accepting a small controlled

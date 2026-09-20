@@ -14,6 +14,13 @@
 
 namespace {
 
+// [S67] get_recommended_fee now names an action class (no default, so a call
+// site that forgets one does not compile).  With fees.cost_aware_estimate and
+// the controller both off -- every test in this file -- the class is never
+// read.  Take is used rather than the zero enumerator so that a regression
+// which starts reading it changes these expectations, none of which moved.
+constexpr auto kAnyClass = xop::strategy::fee::ActionClass::Take;
+
 // ---------------------------------------------------------------------------
 // Helper: build a FeeConfig with overridable fields.
 // ---------------------------------------------------------------------------
@@ -50,9 +57,9 @@ TEST(FeeTrackerTest, DisabledReturnsStaticFee) {
     xop::FeeTracker tracker(cfg);
 
     // When disabled, get_recommended_fee returns static_fee unchanged.
-    EXPECT_EQ(tracker.get_recommended_fee(10'000'000, 100), 10'000'000ULL);
-    EXPECT_EQ(tracker.get_recommended_fee(1, 100), 1ULL);
-    EXPECT_EQ(tracker.get_recommended_fee(999'999'999, 100), 999'999'999ULL);
+    EXPECT_EQ(tracker.get_recommended_fee(10'000'000, 100, kAnyClass), 10'000'000ULL);
+    EXPECT_EQ(tracker.get_recommended_fee(1, 100, kAnyClass), 1ULL);
+    EXPECT_EQ(tracker.get_recommended_fee(999'999'999, 100, kAnyClass), 999'999'999ULL);
 }
 
 TEST(FeeTrackerTest, DisabledAlwaysAllowsPosting) {
@@ -75,8 +82,8 @@ TEST(FeeTrackerTest, ClampsToMinFee) {
     xop::FeeTracker tracker(cfg);
 
     // Static fee below min → clamped up.
-    EXPECT_EQ(tracker.get_recommended_fee(100, 100), 50'000ULL);
-    EXPECT_EQ(tracker.get_recommended_fee(1, 100), 50'000ULL);
+    EXPECT_EQ(tracker.get_recommended_fee(100, 100, kAnyClass), 50'000ULL);
+    EXPECT_EQ(tracker.get_recommended_fee(1, 100, kAnyClass), 50'000ULL);
 }
 
 TEST(FeeTrackerTest, ClampsToMaxFee) {
@@ -85,7 +92,7 @@ TEST(FeeTrackerTest, ClampsToMaxFee) {
     xop::FeeTracker tracker(cfg);
 
     // Static fee above max → clamped down.
-    EXPECT_EQ(tracker.get_recommended_fee(500'000'000, 100), 100'000'000ULL);
+    EXPECT_EQ(tracker.get_recommended_fee(500'000'000, 100, kAnyClass), 100'000'000ULL);
 }
 
 TEST(FeeTrackerTest, FeeWithinBandPassesThrough) {
@@ -94,7 +101,7 @@ TEST(FeeTrackerTest, FeeWithinBandPassesThrough) {
     xop::FeeTracker tracker(cfg);
 
     // Static fee inside [min, max] → returned unchanged.
-    EXPECT_EQ(tracker.get_recommended_fee(5'000'000, 100), 5'000'000ULL);
+    EXPECT_EQ(tracker.get_recommended_fee(5'000'000, 100, kAnyClass), 5'000'000ULL);
 }
 
 // ============================================================================
@@ -110,7 +117,7 @@ TEST(FeeTrackerTest, AdaptiveUsesLowMempoolEstimate) {
     tracker.update_mempool_estimate(200'000);
 
     // Should use the mempool estimate instead of static.
-    EXPECT_EQ(tracker.get_recommended_fee(10'000'000, 100), 200'000ULL);
+    EXPECT_EQ(tracker.get_recommended_fee(10'000'000, 100, kAnyClass), 200'000ULL);
 }
 
 TEST(FeeTrackerTest, AdaptiveMempoolBelowMinClampsUp) {
@@ -120,7 +127,7 @@ TEST(FeeTrackerTest, AdaptiveMempoolBelowMinClampsUp) {
 
     // Mempool estimate is below min_fee → clamped up to min.
     tracker.update_mempool_estimate(5'661);
-    EXPECT_EQ(tracker.get_recommended_fee(10'000'000, 100), 50'000ULL);
+    EXPECT_EQ(tracker.get_recommended_fee(10'000'000, 100, kAnyClass), 50'000ULL);
 }
 
 TEST(FeeTrackerTest, AdaptiveMempoolAboveMaxClampsDown) {
@@ -130,7 +137,7 @@ TEST(FeeTrackerTest, AdaptiveMempoolAboveMaxClampsDown) {
 
     // Mempool estimate exceeds max_fee → clamped down.
     tracker.update_mempool_estimate(500'000'000);
-    EXPECT_EQ(tracker.get_recommended_fee(10'000'000, 100), 100'000'000ULL);
+    EXPECT_EQ(tracker.get_recommended_fee(10'000'000, 100, kAnyClass), 100'000'000ULL);
 }
 
 TEST(FeeTrackerTest, AdaptiveNoEstimateFallsBackToStatic) {
@@ -139,7 +146,7 @@ TEST(FeeTrackerTest, AdaptiveNoEstimateFallsBackToStatic) {
     xop::FeeTracker tracker(cfg);
 
     // No mempool estimate fed → falls back to static (clamped).
-    EXPECT_EQ(tracker.get_recommended_fee(5'000'000, 100), 5'000'000ULL);
+    EXPECT_EQ(tracker.get_recommended_fee(5'000'000, 100, kAnyClass), 5'000'000ULL);
 }
 
 // ============================================================================
@@ -155,7 +162,7 @@ TEST(FeeTrackerTest, LowMinFeeAllowsCheapMempoolFee) {
 
     tracker.update_mempool_estimate(5'661);
 
-    const uint64_t fee = tracker.get_recommended_fee(10'000'000, 100);
+    const uint64_t fee = tracker.get_recommended_fee(10'000'000, 100, kAnyClass);
     // With min=50000, the mempool estimate 5661 is clamped up to 50000.
     // This is 50000/5661 = ~8.8x, much better than the old 5M/5661 = ~883x.
     EXPECT_EQ(fee, 50'000ULL);
@@ -170,7 +177,7 @@ TEST(FeeTrackerTest, HighMinFeeCausesMassiveOverpay) {
 
     tracker.update_mempool_estimate(5'661);
 
-    const uint64_t fee = tracker.get_recommended_fee(10'000'000, 100);
+    const uint64_t fee = tracker.get_recommended_fee(10'000'000, 100, kAnyClass);
     // With min=5M, the mempool estimate 5661 is clamped up to 5M: 883x overpay.
     EXPECT_EQ(fee, 5'000'000ULL);
     EXPECT_GT(fee, 5'661ULL * 100);  // Proves overpay > 100x
@@ -191,7 +198,7 @@ TEST(FeeTrackerTest, BudgetExhaustedReturnsZero) {
 
     // Budget = 100k, spent = 120k → exhausted.
     // get_recommended_fee should return 0 (headroom < min_fee).
-    EXPECT_EQ(tracker.get_recommended_fee(50'000, 102), 0ULL);
+    EXPECT_EQ(tracker.get_recommended_fee(50'000, 102, kAnyClass), 0ULL);
 }
 
 TEST(FeeTrackerTest, BudgetWithinLimitsAllowsFee) {
@@ -202,7 +209,7 @@ TEST(FeeTrackerTest, BudgetWithinLimitsAllowsFee) {
     tracker.record_fee(1'000'000, 100);
 
     // Budget = 10B, spent = 1M → plenty of headroom.
-    EXPECT_EQ(tracker.get_recommended_fee(5'000'000, 101), 5'000'000ULL);
+    EXPECT_EQ(tracker.get_recommended_fee(5'000'000, 101, kAnyClass), 5'000'000ULL);
 }
 
 TEST(FeeTrackerTest, OldFeesExpireFromWindow) {
@@ -219,7 +226,7 @@ TEST(FeeTrackerTest, OldFeesExpireFromWindow) {
 
     // At block 115 (block 100 has expired from 10-block window), budget freed.
     EXPECT_EQ(tracker.get_rolling_total(115), 0ULL);
-    EXPECT_NE(tracker.get_recommended_fee(50'000, 115), 0ULL);
+    EXPECT_NE(tracker.get_recommended_fee(50'000, 115, kAnyClass), 0ULL);
 }
 
 // ============================================================================

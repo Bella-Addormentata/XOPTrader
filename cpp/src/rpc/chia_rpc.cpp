@@ -746,6 +746,10 @@ asio::awaitable<std::int64_t> ChiaFullNodeRPC::get_block_height()
     // rebuilding database before its first peak -- which genuinely cannot
     // serve a height, and whose gauges stay dark until one arrives.
     last_sync_state_ = node_sync_from_blockchain_state(resp, last_sync_state_);
+    // [S67] Same response, same reason: the node's admission floor rides in it
+    // and costs no second RPC.  A reply without the mempool fields reads as
+    // UNKNOWN (known = false), never as an empty mempool.
+    last_mempool_state_ = node_mempool_from_blockchain_state(resp);
 
     if (!resp.contains("blockchain_state") ||
         !resp["blockchain_state"].contains("peak") ||
@@ -810,10 +814,10 @@ ChiaFullNodeRPC::get_fee_estimate(std::uint64_t target_time_seconds)
     // If the endpoint is unavailable (older node) or fails, return 0 so the
     // caller falls back to the static fee.
     try {
-        json payload = {
-            {"target_times", {target_time_seconds}},
-            {"spend_type", "send_xch_transaction"}
-        };
+        // [S67] The payload now lives in rpc/node_requests.hpp so ctest pins it.
+        // This is the LEGACY request, unchanged: fees.cost_aware_estimate and
+        // the fee controller use get_fee_rate_estimate() below instead.
+        const json payload = make_fee_estimate_request_legacy(target_time_seconds);
 
         const json resp = co_await rpc_post("get_fee_estimate", payload);
 
@@ -830,6 +834,23 @@ ChiaFullNodeRPC::get_fee_estimate(std::uint64_t target_time_seconds)
     }
 }
 
+asio::awaitable<FeeEstimateReading>
+ChiaFullNodeRPC::get_fee_rate_estimate(std::uint64_t target_time_seconds)
+{
+    // [S67] One request with an explicit reference cost; the handler returns
+    // rate x cost, so the rate falls out and every action class scales it by
+    // its own cost.  Failure is a reading with ok = false, never a throw: the
+    // caller is the heartbeat, and a fee estimate is not worth a cycle.
+    try {
+        // A named payload, not a temporary inside the co_await expression.
+        const json payload =
+            make_fee_estimate_request(target_time_seconds, kFeeEstimateReferenceCost);
+        const json resp = co_await rpc_post("get_fee_estimate", payload);
+        co_return parse_fee_estimate(resp, kFeeEstimateReferenceCost);
+    } catch (const ChiaRPCError&) {
+        co_return FeeEstimateReading{};
+    }
+}
 asio::awaitable<std::vector<json>>
 ChiaFullNodeRPC::get_coin_records_by_names(
     const std::vector<std::string>& names,

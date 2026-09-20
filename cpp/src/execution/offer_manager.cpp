@@ -25,6 +25,7 @@
 #include <xop/execution/cancel_escalation.hpp>
 #include <xop/execution/cancel_retry.hpp>
 #include <xop/execution/cross_guard.hpp>
+#include <xop/execution/fee_feedback.hpp>
 #include <xop/execution/stuck_tx_verdict.hpp>
 #include <xop/execution/wallet_circuit.hpp>
 #include <xop/execution/wallet_poll_throttle.hpp>
@@ -34,6 +35,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <unordered_set>
 
@@ -424,7 +426,7 @@ asio::awaitable<int> OfferManager::post_quotes(
                     bool needs_emergency = false;
                     try {
                         co_await cancel_offer_charged(
-                            po.offer_id, current_fee_mojos_, /*secure=*/true);
+                            po.offer_id, cancel_fee_for(po.offer_id), /*secure=*/true);
                         cancel_ok = true;
                     } catch (const rpc::ChiaRPCError& e) {
                         const std::string_view msg{e.what()};
@@ -459,7 +461,7 @@ asio::awaitable<int> OfferManager::post_quotes(
                     bool needs_emergency = false;
                     try {
                         co_await cancel_offer_charged(
-                            po.offer_id, current_fee_mojos_, /*secure=*/true);
+                            po.offer_id, cancel_fee_for(po.offer_id), /*secure=*/true);
                         cancel_ok = true;
                     } catch (const rpc::ChiaRPCError& e) {
                         const std::string_view msg{e.what()};
@@ -1379,7 +1381,7 @@ asio::awaitable<std::vector<std::string>> OfferManager::cancel_stale(
         bool needs_emergency = false;
         try {
             co_await cancel_offer_charged(
-                po.offer_id, current_fee_mojos_, /*secure=*/true);
+                po.offer_id, cancel_fee_for(po.offer_id), /*secure=*/true);
             cancel_ok = true;
         } catch (const rpc::ChiaRPCError& e) {
             const std::string_view msg{e.what()};
@@ -1741,7 +1743,7 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_ids(
         // out.last_error is therefore assigned ONLY on the failed branch.
         std::string err;
         try {
-            co_await cancel_offer_charged(oid, current_fee_mojos_,
+            co_await cancel_offer_charged(oid, cancel_fee_for(oid),
                                           /*secure=*/true);
             logger_->debug("Cancelled offer {}", oid.substr(0, 12));
             cancel_ok = true;
@@ -2010,6 +2012,54 @@ void OfferManager::set_escalation(
 std::uint64_t OfferManager::current_fee() const noexcept
 {
     return current_fee_mojos_;
+}
+
+// ---------------------------------------------------------------------------
+// [S67] Class-aware cancel fees
+// ---------------------------------------------------------------------------
+
+void OfferManager::set_cancel_fees(std::uint64_t xch_offered_mojos,
+                                   std::uint64_t cat_offered_mojos) noexcept
+{
+    cancel_fees_active_   = true;
+    cancel_fee_xch_mojos_ = xch_offered_mojos;
+    cancel_fee_cat_mojos_ = cat_offered_mojos;
+}
+
+void OfferManager::clear_cancel_fees() noexcept
+{
+    cancel_fees_active_ = false;
+}
+
+std::uint64_t OfferManager::cancel_fee_for(const std::string& offer_id) const
+{
+    if (!cancel_fees_active_) {
+        return current_fee_mojos_;   // the pre-S67 behaviour, untouched
+    }
+    // A bid offers the QUOTE asset, an ask the BASE: those are the coins a
+    // secure cancel spends.
+    bool known          = false;
+    bool offered_is_xch = false;
+    const PendingOffer po = state_->get_offer(offer_id);
+    if (!po.offer_id.empty()) {
+        const auto it = pair_config_map_.find(po.pair_name);
+        if (it != pair_config_map_.end()) {
+            const std::string& offered = (po.side == Side::Bid)
+                ? it->second.quote_asset_id : it->second.base_asset_id;
+            known          = true;
+            offered_is_xch = (offered == "xch");
+        }
+    }
+    return strategy::fee::cancel_fee_for(cancel_fees_active_, current_fee_mojos_,
+                                         cancel_fee_xch_mojos_, cancel_fee_cat_mojos_,
+                                         known, offered_is_xch);
+}
+
+std::uint32_t OfferManager::take_fee_rejections_seen() noexcept
+{
+    const std::uint32_t seen = fee_rejections_seen_;
+    fee_rejections_seen_ = 0;
+    return seen;
 }
 
 // ---------------------------------------------------------------------------
@@ -2384,7 +2434,7 @@ asio::awaitable<std::vector<std::string>> OfferManager::selective_cancel(
         bool needs_emergency = false;
         try {
             co_await cancel_offer_charged(
-                offer_id, current_fee_mojos_, /*secure=*/true);
+                offer_id, cancel_fee_for(offer_id), /*secure=*/true);
             cancel_ok = true;
         } catch (const rpc::ChiaRPCError& e) {
             const std::string_view msg{e.what()};
@@ -3343,7 +3393,7 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
                 bool needs_emergency = false;
                 try {
                     co_await cancel_offer_charged(wo->trade_id,
-                                                   current_fee_mojos_,
+                                                   cancel_fee_for(wo->trade_id),
                                                    /*secure=*/true);
                     cancel_ok = true;
                 } catch (const rpc::ChiaRPCError& e) {
@@ -3450,6 +3500,21 @@ asio::awaitable<int> OfferManager::prune_stuck_transactions(
 
                 if (row_class == StuckRowClass::Confirmed) {
                     continue;
+                }
+                // [S67] The wallet's own word that a fee is too low: the row's
+                // latest sent_to entry is a fee refusal.  Already in hand -- no
+                // RPC is added -- and counted once per transaction name.  It
+                // changes nothing this function decides.
+                if (execution::latest_sent_to_is_fee_rejection(tx)) {
+                    const std::string tx_key = (tx.contains("name") && tx["name"].is_string())
+                        ? tx["name"].get<std::string>() : std::string{};
+                    if (fee_rejections_reported_.size() >= execution::kMaxReportedFeeRejections) {
+                        fee_rejections_reported_.clear();
+                    }
+                    if (!tx_key.empty() && fee_rejections_reported_.insert(tx_key).second
+                        && fee_rejections_seen_ != std::numeric_limits<std::uint32_t>::max()) {
+                        ++fee_rejections_seen_;
+                    }
                 }
                 if (row_class == StuckRowClass::FreshOrUnknown) {
                     ++fresh_count;

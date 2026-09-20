@@ -1306,6 +1306,42 @@ private:
     // the wallet reports the trade live AND the full node shows every maker
     // coin unspent.  The decisions live in execution/cancel_escalation.hpp.
     asio::awaitable<void> escalate_stuck_cancels(BlockHeight block);
+
+    // -- [S67 2026-09-20] Fee controller feedback ------------------------------
+    //
+    // The closed loop's engine glue (strategy/fee_controller.hpp holds every
+    // decision).  All of it is inert unless fees.controller_enabled.
+    //
+    /// Per-heartbeat: open a ticket for each cancel in flight, emit censored
+    /// observations for spends pending past the target delay, poll ONE
+    /// pending take's status, send the budget-bound alert.  Runs beside
+    /// escalate_stuck_cancels, above the Step 7/8 gate chain.
+    asio::awaitable<void> fee_feedback_sweep(BlockHeight block);
+    /// Log (rate-limited) and publish one controller change.
+    void fee_feedback_note(const strategy::fee::Change& change, BlockHeight block);
+    /// A wallet-level signal: pending_change persisting, a sent_to fee
+    /// refusal, a force-delete.
+    void fee_feedback_signal(strategy::fee::Signal signal, BlockHeight block);
+    /// A take was submitted at `fee`: open its ticket.
+    void fee_feedback_track_take(const std::string& trade_id, std::uint64_t fee,
+                                 BlockHeight block);
+    /// Step 2 wrote the wallet's terminal verdict for `offer_id`.
+    void fee_feedback_on_cancel_verdict(const std::string& offer_id,
+                                        BlockHeight        observed_block);
+    /// What cancelling `ids` cost, for the fee budget: ids.size() x legacy_fee
+    /// with the controller off (unchanged), the per-offer class fees with it on.
+    [[nodiscard]] std::uint64_t cancel_fees_paid(const std::vector<std::string>& ids,
+                                                 std::uint64_t legacy_fee) const;
+    /// Spends of ours awaiting a verdict, by offer id (cancels) or trade id
+    /// (takes).  In memory; a restart re-opens cancel tickets at first
+    /// sighting and forgets takes.
+    std::unordered_map<std::string, strategy::fee::Ticket> fee_tickets_;
+    /// Cancels that were already pending at the first sweep after boot: their
+    /// fee is unknown, so they never get a ticket.
+    std::unordered_set<std::string> fee_unticketed_;
+    bool fee_sweep_ran_{false};
+    strategy::fee::ChangeLogGate fee_change_log_{};
+
     /// Send the queued CancelUnresolved alert when its window is open, and
     /// mark exactly the offers it names as alerted.
     void flush_cancel_unresolved_alerts();

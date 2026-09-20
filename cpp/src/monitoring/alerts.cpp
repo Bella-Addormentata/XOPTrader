@@ -83,6 +83,7 @@ const char* to_string(AlertRule rule) noexcept
         case AlertRule::DeadMansSwitchLive:   return "DeadMansSwitchLive";
         case AlertRule::ConfigReload:         return "ConfigReload";
         case AlertRule::CancelUnresolved:     return "CancelUnresolved";
+        case AlertRule::FeeBudgetBound:       return "FeeBudgetBound";
     }
     return "UNKNOWN";
 }
@@ -111,6 +112,9 @@ AlertTier tier_for_rule(AlertRule rule) noexcept
         // [RELOAD] A reload outcome is operator feedback on an action they
         // just took -- important, never capital-critical by itself.
         case AlertRule::ConfigReload:
+        // [S67] Fees are degrading, not stopping: it wants attention, not a
+        // page.
+        case AlertRule::FeeBudgetBound:
             return AlertTier::WARNING;
 
         // A quote stablecoin leaving its peg mis-values the entire book and

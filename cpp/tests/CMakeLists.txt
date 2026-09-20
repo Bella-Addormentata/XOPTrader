@@ -79,6 +79,7 @@ add_executable(xop_tests
     test_liquidity.cpp
     test_market_allocator.cpp
     test_fee_tracker.cpp
+    test_fee_controller.cpp
     test_pnl_units.cpp
     test_pnl_tracker.cpp
     test_competitiveness_pid.cpp
@@ -104,6 +105,7 @@ add_executable(xop_tests
     test_watchdog.cpp
     test_height_source.cpp
     test_node_sync_state.cpp
+    test_node_requests.cpp
     test_dexie_probe_liveness.cpp
     test_dexie_market_ticker.cpp
     test_raw_ticker_provenance.cpp

@@ -12,6 +12,8 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <numeric>
@@ -22,8 +24,35 @@ namespace xop {
 // Construction
 // ===========================================================================
 
+strategy::fee::ControllerConfig fee_controller_config_from(const FeeConfig& cfg)
+{
+    strategy::fee::ControllerConfig out;
+    out.enabled                   = cfg.enabled && cfg.controller_enabled;
+    out.target_delay_blocks       = cfg.controller_target_delay_blocks;
+    out.kp                        = cfg.controller_kp;
+    out.ki                        = cfg.controller_ki;
+    out.kd                        = cfg.controller_kd;
+    out.max_error                 = cfg.controller_max_error;
+    out.max_step_up               = cfg.controller_max_step_up;
+    out.min_raise                 = cfg.controller_min_raise;
+    out.warmup_observations       = cfg.controller_warmup_observations;
+    out.probe_fraction            = cfg.controller_probe_fraction;
+    out.probe_after_confirmations = cfg.controller_probe_after_confirmations;
+    out.probe_confirmations       = cfg.controller_probe_confirmations;
+    out.probe_fail_bump           = cfg.controller_probe_fail_bump;
+    out.probe_backoff_cap         = cfg.controller_probe_backoff_cap;
+    out.ff_margin                 = cfg.controller_ff_margin;
+    out.ff_max_age_blocks         = cfg.controller_ff_max_age_blocks;
+    out.costs.offer_attached      = cfg.controller_cost_offer_attached;
+    out.costs.cancel_xch          = cfg.controller_cost_cancel_xch;
+    out.costs.cancel_cat          = cfg.controller_cost_cancel_cat;
+    out.costs.take                = cfg.controller_cost_take;
+    return out;
+}
+
 FeeTracker::FeeTracker(const FeeConfig& cfg)
     : cfg_(cfg)
+    , controller_(fee_controller_config_from(cfg), cfg.min_fee_mojos, cfg.max_fee_mojos)
 {
     spdlog::info("[FeeTracker] Initialised: enabled={} budget={} mojos/day "
                  "gain_ratio={:.2f} min={} max={} adaptive={} window={} blocks",
@@ -34,6 +63,36 @@ FeeTracker::FeeTracker(const FeeConfig& cfg)
                  cfg_.max_fee_mojos,
                  cfg_.adaptive_enabled,
                  cfg_.fee_window_blocks);
+
+    // [S67] The reachability advisory: what the bounds and gains can do.
+    // Advice, never a refusal -- each finding resolves deterministically.
+    if (controller_.enabled()) {
+        const strategy::fee::Reachability reach = strategy::fee::reachability(
+            controller_.config(), cfg_.min_fee_mojos, cfg_.max_fee_mojos);
+        spdlog::info("[FeeController] ON: target {} peak heights, anchor {:.4f} mojos/cost, "
+                     "level band [{:.2f}, {:.2f}] log2, {} hard signals span it",
+                     controller_.config().target_delay_blocks, controller_.anchor_rate(),
+                     controller_.level_lo(), controller_.level_hi(), reach.raises_to_span);
+        if (reach.cannot_raise) {
+            spdlog::warn("[FeeController] the gains cannot raise the fee across its band "
+                         "(controller_ki is 0, or every gain is) -- only the node floor "
+                         "and the probes act");
+        }
+        const strategy::fee::ActionClass all[strategy::fee::kActionClassCount] = {
+            strategy::fee::ActionClass::OfferAttached, strategy::fee::ActionClass::CancelXch,
+            strategy::fee::ActionClass::CancelCat, strategy::fee::ActionClass::Take};
+        for (std::size_t i = 0; i < strategy::fee::kActionClassCount; ++i) {
+            if (reach.max_fee_below_full_mempool[i]) {
+                spdlog::warn("[FeeController] fees.max_fee_mojos ({}) cannot get a {} into a "
+                             "FULL mempool: the node needs {} mojos/cost and this class costs "
+                             "{} -- raise max_fee_mojos to at least {} to cover every class",
+                             cfg_.max_fee_mojos, strategy::fee::to_string(all[i]),
+                             strategy::fee::kFullMempoolMinRate,
+                             strategy::fee::cost_of(controller_.config().costs, all[i]),
+                             reach.max_fee_for_full_mempool);
+            }
+        }
+    }
 }
 
 // ===========================================================================
@@ -116,7 +175,12 @@ bool FeeTracker::should_post_offer(std::uint64_t expected_gain_mojos,
     }
 
     // Budget check: would this fee exceed the daily ceiling?
-    if (!is_within_budget(current_block, fee_mojos)) {
+    // [S67] Not with the controller on.  There the budget has ALREADY shaped
+    // the fee (controller_fee: the reserve, then the min_fee floor), and an
+    // exhausted budget degrades fees instead of stopping the bot.  Refusing
+    // every tier here would be exactly the silent stop that rule exists to
+    // prevent.  The fee-vs-gain check below still applies.
+    if (!controller_.enabled() && !is_within_budget(current_block, fee_mojos)) {
         spdlog::warn("[FeeTracker] Daily fee budget exhausted "
                      "(rolling={} + pending={} > budget={}). Skipping offer.",
                      get_rolling_total(current_block), fee_mojos,
@@ -159,16 +223,34 @@ bool FeeTracker::should_post_offer(std::uint64_t expected_gain_mojos,
 // ===========================================================================
 
 std::uint64_t FeeTracker::get_recommended_fee(std::uint64_t static_fee_mojos,
-                                              BlockHeight   current_block)
+                                              BlockHeight   current_block,
+                                              strategy::fee::ActionClass action)
 {
     if (!cfg_.enabled) {
         return static_fee_mojos;  // Passthrough when disabled.
     }
 
+    // [S67] The closed loop replaces everything below when it is on.
+    if (controller_.enabled()) {
+        return controller_fee(action, current_block);
+    }
+
     std::uint64_t fee = static_fee_mojos;
 
-    // When adaptive mode is on and we have a mempool estimate, prefer it.
-    if (cfg_.adaptive_enabled && mempool_estimate_ > 0) {
+    // [S67] fees.cost_aware_estimate: the node's RATE times this action's own
+    // CLVM cost, instead of its answer for a plain XCH send.  Same precedence
+    // as the legacy estimate below: used only when adaptive and available.
+    if (cfg_.adaptive_enabled && cfg_.cost_aware_estimate) {
+        const std::uint64_t scaled = strategy::fee::fee_from_rate(
+            mempool_rate_, strategy::fee::cost_of(controller_.config().costs, action));
+        if (scaled > 0) {
+            fee = scaled;
+            spdlog::debug("[FeeTracker] Using cost-aware estimate {} mojos for {} "
+                          "({:.4f} mojos/cost; static was {})", fee,
+                          strategy::fee::to_string(action), mempool_rate_, static_fee_mojos);
+        }
+    } else if (cfg_.adaptive_enabled && mempool_estimate_ > 0) {
+        // When adaptive mode is on and we have a mempool estimate, prefer it.
         fee = mempool_estimate_;
         spdlog::debug("[FeeTracker] Using mempool estimate {} mojos "
                       "(static was {})", fee, static_fee_mojos);
@@ -218,6 +300,86 @@ void FeeTracker::update_mempool_estimate(std::uint64_t estimated_fee_mojos)
     mempool_estimate_ = estimated_fee_mojos;
     spdlog::debug("[FeeTracker] Mempool fee estimate updated to {} mojos",
                   estimated_fee_mojos);
+}
+
+// ===========================================================================
+// [S67] Cost-aware estimate and the fee controller
+// ===========================================================================
+
+strategy::fee::Change FeeTracker::update_feed_forward(double      estimate_rate,
+                                                      double      admission_floor_rate,
+                                                      BlockHeight current_block)
+{
+    // The legacy path keeps its own rule: a reading of 0 does not replace the
+    // last non-zero one (Step 1 has always skipped est == 0).
+    if (std::isfinite(estimate_rate) && estimate_rate > 0.0) {
+        mempool_rate_ = estimate_rate;
+    }
+    return controller_.set_feed_forward(estimate_rate, admission_floor_rate, current_block);
+}
+
+strategy::fee::Change FeeTracker::observe(const strategy::fee::Observation& observation)
+{
+    return controller_.observe(observation);
+}
+
+strategy::fee::Ticket FeeTracker::make_ticket(strategy::fee::ActionClass action,
+                                              std::uint64_t fee_paid_mojos,
+                                              BlockHeight   current_block) const noexcept
+{
+    strategy::fee::Ticket ticket;
+    ticket.cls          = action;
+    ticket.submit_block = current_block;
+    ticket.submit_level = controller_.level_of(fee_paid_mojos, action);
+    return ticket;
+}
+
+bool FeeTracker::take_budget_bound_alert() noexcept
+{
+    const bool due = budget_alert_pending_;
+    budget_alert_pending_ = false;
+    return due;
+}
+
+std::uint64_t FeeTracker::controller_fee(strategy::fee::ActionClass action,
+                                         BlockHeight current_block)
+{
+    const std::uint64_t desired  = controller_.fee_for(action, current_block);
+    const std::uint64_t headroom = budget_remaining(current_block);
+
+    // The reserve: enough budget to cancel the resting book at today's price.
+    const std::uint64_t cancel_fee =
+        controller_.fee_for(strategy::fee::ActionClass::CancelCat, current_block);
+    const std::uint64_t n = cfg_.controller_budget_reserve_cancels;
+    const std::uint64_t reserve =
+        (n != 0 && cancel_fee > std::numeric_limits<std::uint64_t>::max() / n)
+            ? std::numeric_limits<std::uint64_t>::max()
+            : cancel_fee * n;
+
+    const strategy::fee::BudgetedFee budgeted = strategy::fee::apply_budget(
+        desired, headroom, reserve, cfg_.min_fee_mojos, strategy::fee::is_priority(action));
+
+    if (budgeted.bound) {
+        last_bound_desired_ = desired;
+        last_bound_allowed_ = budgeted.fee;
+        if (!budget_bound_) {
+            budget_bound_         = true;
+            budget_alert_pending_ = true;
+            spdlog::warn("[FeeController] the fee budget BINDS: {} wants {} mojos, the budget "
+                         "allows {} (headroom {} of {} per {} peak heights, reserve {} for {} "
+                         "cancels). Fees degrade toward min_fee_mojos; nothing stops. Raise "
+                         "fees.daily_budget_mojos if spends stop confirming.",
+                         strategy::fee::to_string(action), desired, budgeted.fee, headroom,
+                         cfg_.daily_budget_mojos, cfg_.fee_window_blocks, reserve, n);
+        }
+    } else if (!strategy::fee::is_priority(action) && budget_bound_) {
+        // An offer-attached fee is the first thing the budget squeezes, so
+        // one that comes back whole means the episode is over.
+        budget_bound_ = false;
+        spdlog::info("[FeeController] the fee budget no longer binds (headroom {} mojos)",
+                     headroom);
+    }
+    return budgeted.fee;
 }
 
 }  // namespace xop
