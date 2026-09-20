@@ -18,6 +18,7 @@ import pytest
 
 from gui import shutdown_flag
 from gui.shutdown_flag import (
+    OffersRequest,
     RequestKind,
     StopOutcome,
     classify_stop_outcome,
@@ -194,6 +195,137 @@ def test_remove_if_addressed_to_only_removes_its_own_request(tmp_path):
 
     flag.unlink()
     assert remove_if_addressed_to(flag, 15916) is False
+
+
+# --------------------------------------------------------------------------- #
+# [S74 2026-09-20] The optional "offers=" line: keep or cancel the resting offers
+# --------------------------------------------------------------------------- #
+
+# GOLDEN_KEEP / GOLDEN_CANCEL: byte-identical to kGoldenKeep / kGoldenCancel in
+# cpp/tests/test_shutdown_flag.cpp (enforced below, like GOLDEN).
+GOLDEN_KEEP = GOLDEN + "offers=keep\n"
+GOLDEN_CANCEL = GOLDEN + "offers=cancel\n"
+
+
+def test_render_without_a_policy_is_byte_identical_to_the_pre_policy_request():
+    """An upgrade changes nothing: no answer, no line, the same bytes."""
+    assert render_shutdown_request(
+        15916, requester_pid=19084, written_at="2026-09-12T22:41:07",
+        offers_policy=None,
+    ) == GOLDEN
+
+
+@pytest.mark.parametrize(("policy", "golden"), [
+    ("keep", GOLDEN_KEEP), ("cancel", GOLDEN_CANCEL)])
+def test_render_with_a_policy_appends_exactly_one_offers_line(policy, golden):
+    assert render_shutdown_request(
+        15916, requester_pid=19084, written_at="2026-09-12T22:41:07",
+        offers_policy=policy,
+    ) == golden
+
+
+@pytest.mark.parametrize("golden", [GOLDEN_KEEP, GOLDEN_CANCEL],
+                         ids=["keep", "cancel"])
+def test_the_policy_goldens_are_byte_identical_in_the_engine_test(golden):
+    cpp = (REPO / "cpp" / "tests" / "test_shutdown_flag.cpp").read_text(encoding="utf-8")
+    c_literal = '"' + golden.replace(chr(10), chr(92) + "n") + '"'
+    assert c_literal in cpp, (
+        "cpp/tests/test_shutdown_flag.cpp no longer carries this request "
+        "verbatim -- the engine's parser and the GUI's writer are being tested "
+        "against different requests")
+
+
+@pytest.mark.parametrize("bad", ["Keep", "KEEP", " keep", "kep", "", "keep-bids", "yes", True, 1])
+def test_render_refuses_a_policy_the_engine_cannot_read(bad):
+    """The writer is STRICT where the readers are tolerant: a request must
+    never carry a policy the engine would fall back from, because the GUI
+    would then believe it had said something."""
+    with pytest.raises(ValueError):
+        render_shutdown_request(
+            15916, requester_pid=19084, written_at="2026-09-12T22:41:07",
+            offers_policy=bad)
+
+
+@pytest.mark.parametrize(("policy", "expected"), [
+    (None, OffersRequest.UNSPECIFIED),
+    ("keep", OffersRequest.KEEP),
+    ("cancel", OffersRequest.CANCEL),
+])
+def test_write_then_read_round_trips_the_policy(tmp_path, policy, expected):
+    flag = _flag(tmp_path)
+    write_shutdown_request(flag, 15916, requester_pid=19084, now=INCIDENT_WRITE,
+                           offers_policy=policy)
+    parsed = shutdown_flag.read_shutdown_request(flag)
+    assert parsed is not None
+    assert (parsed.kind, parsed.pid, parsed.requester_pid, parsed.offers) == (
+        RequestKind.ADDRESSED, 15916, 19084, expected)
+    # The address helpers are blind to the policy: a keep request is removed,
+    # and recognised as naming its target, exactly like any other.
+    assert shutdown_flag.flag_names_pid(flag, 15916)
+    assert remove_if_addressed_to(flag, 15916) is True
+
+
+#: The engine's table, row for row (ShutdownFlagOffersPolicy in
+#: cpp/tests/test_shutdown_flag.cpp uses the same contents).
+OFFERS_CASES = [
+    ("golden-no-line", GOLDEN, RequestKind.ADDRESSED, OffersRequest.UNSPECIFIED),
+    ("pre-fix-gui", "shutdown", RequestKind.UNADDRESSED, OffersRequest.UNSPECIFIED),
+    ("golden-keep", GOLDEN_KEEP, RequestKind.ADDRESSED, OffersRequest.KEEP),
+    ("golden-cancel", GOLDEN_CANCEL, RequestKind.ADDRESSED, OffersRequest.CANCEL),
+    ("line-first", "offers=keep\npid=42\n", RequestKind.ADDRESSED, OffersRequest.KEEP),
+    ("no-newline", "pid=42\noffers=keep", RequestKind.ADDRESSED, OffersRequest.KEEP),
+    ("crlf", "pid=42\r\noffers=keep\r\n", RequestKind.ADDRESSED, OffersRequest.KEEP),
+    ("padded-capitalised", "pid=42\noffers= Keep \n", RequestKind.ADDRESSED, OffersRequest.KEEP),
+    ("bom", BOM + "offers=KEEP\r\npid=42\r\n", RequestKind.ADDRESSED, OffersRequest.KEEP),
+    ("tabs", "pid=42\noffers=\tkeep\t\n", RequestKind.ADDRESSED, OffersRequest.KEEP),
+    ("hand-written", "offers=keep\n", RequestKind.UNADDRESSED, OffersRequest.KEEP),
+    ("empty-value", "pid=42\noffers=\n", RequestKind.ADDRESSED, OffersRequest.UNRECOGNISED),
+    ("prefix", "pid=42\noffers=kee\n", RequestKind.ADDRESSED, OffersRequest.UNRECOGNISED),
+    ("later-build", "pid=42\noffers=keep-bids\n", RequestKind.ADDRESSED, OffersRequest.UNRECOGNISED),
+    ("yes", "pid=42\noffers=yes\n", RequestKind.ADDRESSED, OffersRequest.UNRECOGNISED),
+    ("digit", "pid=42\noffers=1\n", RequestKind.ADDRESSED, OffersRequest.UNRECOGNISED),
+    ("commented", "pid=42\n#offers=keep\n", RequestKind.ADDRESSED, OffersRequest.UNSPECIFIED),
+    ("two-words", "pid=42\noffers=keep cancel\n", RequestKind.ADDRESSED, OffersRequest.UNRECOGNISED),
+    ("contradiction", "pid=42\noffers=keep\noffers=cancel\n", RequestKind.ADDRESSED,
+     OffersRequest.UNRECOGNISED),
+    ("duplicate", "pid=42\noffers=keep\noffers=keep\n", RequestKind.ADDRESSED,
+     OffersRequest.UNRECOGNISED),
+    # str.lower() folds U+212A KELVIN SIGN to "k"; the engine compares bytes.
+    ("kelvin-sign", "pid=42\noffers=" + chr(0x212A) + "eep\n", RequestKind.ADDRESSED,
+     OffersRequest.UNRECOGNISED),
+    ("indented", "pid=42\n offers=keep\n", RequestKind.ADDRESSED, OffersRequest.UNSPECIFIED),
+    ("other-key", "pid=42\nkeep_offers=keep\n", RequestKind.ADDRESSED, OffersRequest.UNSPECIFIED),
+    ("malformed-address", "offers=keep\npid=abc\n", RequestKind.MALFORMED,
+     OffersRequest.UNSPECIFIED),
+    ("two-pids", "pid=1\noffers=keep\npid=2\n", RequestKind.MALFORMED,
+     OffersRequest.UNSPECIFIED),
+]
+
+
+@pytest.mark.parametrize(
+    ("text", "kind", "offers"),
+    [case[1:] for case in OFFERS_CASES],
+    ids=[case[0] for case in OFFERS_CASES],
+)
+def test_parse_reads_the_offers_line_as_the_engine_does(text, kind, offers):
+    parsed = parse_shutdown_request(text)
+    assert (parsed.kind, parsed.offers) == (kind, offers)
+
+
+def test_every_offers_case_is_also_in_the_engine_test():
+    """The Python table above and ShutdownFlagOffersPolicy are two copies of one
+    rule. Every flag content here that the engine test can spell as a plain C
+    string literal must appear there too, so a row cannot be added on one side."""
+    cpp = (REPO / "cpp" / "tests" / "test_shutdown_flag.cpp").read_text(encoding="utf-8")
+    skipped = {"golden-no-line", "pre-fix-gui", "golden-keep", "golden-cancel", "bom",
+               "kelvin-sign"}
+    for name, text, _kind, _offers in OFFERS_CASES:
+        if name in skipped:
+            continue
+        c_literal = '"' + (text.replace(chr(13), chr(92) + "r")
+                               .replace(chr(10), chr(92) + "n")
+                               .replace(chr(9), chr(92) + "t")) + '"'
+        assert c_literal in cpp, f"{name}: {c_literal} is not in the engine's test"
 
 
 # --------------------------------------------------------------------------- #

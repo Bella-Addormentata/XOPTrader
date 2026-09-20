@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
 )
 
 # -- Local widgets ----------------------------------------------------------
+from gui import stop_offers
 from gui.services.venue_control import SwitchInputs
 from gui.widgets.sidebar import Sidebar
 from gui.widgets.status_bar import StatusBar
@@ -3309,7 +3310,15 @@ class MainWindow(QMainWindow):
         trading engine to guard against accidental clicks
         (ISO/IEC 25000 -- error prevention).
         """
-        if self._bot_running:
+        stop_policy: Optional[str] = None
+        if self._bot_running and self._engine_stop_is_ours():
+            # [S74] Currently running, and this GUI's engine: ask what the
+            # stop does with the resting offers. "Don't stop" calls it off.
+            decision = self._decide_engine_stop(closing=False)
+            if not decision.proceed:
+                return
+            stop_policy = decision.policy
+        elif self._bot_running:
             # Currently running -- confirm stop
             reply = QMessageBox.question(
                 self,
@@ -3342,7 +3351,10 @@ class MainWindow(QMainWindow):
         # Delegate to bridge (Phase 1 stubs emit user-facing messages).
         if self._bridge is not None:
             if self._bot_running:
-                self._bridge.stop_engine()
+                if stop_policy is not None:
+                    self._bridge.stop_engine(offers_policy=stop_policy)
+                else:
+                    self._bridge.stop_engine()
             else:
                 self._bridge.start_engine()
 
@@ -3362,6 +3374,44 @@ class MainWindow(QMainWindow):
         self._bot_status_label.setText(status_text)
         self._bot_status_label.setStyleSheet(
             f"color: {colour}; font-weight: bold;"
+        )
+
+    # -- [S74] what a stop does with the resting offers ----------------------
+
+    def _engine_stop_is_ours(self) -> bool:
+        """True when a stop from this window would reach a live engine THIS
+        GUI launched -- the only case the offers prompt can do anything about."""
+        bridge = self._bridge
+        return bridge is not None and bool(
+            getattr(bridge, "engine_running_locally", False))
+
+    def _decide_engine_stop(self, *, closing: bool) -> stop_offers.StopDecision:
+        """Ask -- or, for a close nobody at the machine started, do not ask --
+        what the stop does with the resting offers (gui/stop_offers.py).
+
+        The prompt preselects the config default every time and remembers
+        nothing. A session end or a signal never reaches a dialog: the request
+        then carries no policy and the engine's own engine.shutdown_offers
+        decides.
+        """
+        bridge = self._bridge
+        interactive = stop_offers.noninteractive_quit_reason() is None
+
+        def _ask() -> stop_offers.StopChoice:
+            from gui.widgets.stop_engine_dialog import ask_stop_offers  # noqa: WPS433
+
+            return ask_stop_offers(
+                self,
+                bridge.resting_offers_summary(),
+                default_policy=bridge.stop_offers_default,
+                keep_supported=bool(bridge.engine_supports_keep_offers),
+                closing=closing,
+            )
+
+        return stop_offers.decide_stop(
+            engine_running=self._engine_stop_is_ours(),
+            interactive=interactive,
+            ask=_ask,
         )
 
     def _on_pause_resume(self) -> None:
@@ -3599,6 +3649,21 @@ class MainWindow(QMainWindow):
             if reply == QMessageBox.StandardButton.Save:
                 if hasattr(self._settings_widget, "save_config"):
                     self._settings_widget.save_config()
+
+        # -- [S74] Closing the window stops the engine: keep or cancel? -----
+        # Asked HERE, while the window is still up, because the stop itself
+        # runs from aboutToQuit after the window is gone. The answer rides on
+        # the bridge until then. A close nobody at the machine started (OS
+        # session end, SIGINT/SIGTERM -- gui/main.py marks both) shows no
+        # dialog: a modal box with nobody to answer it would block the
+        # shutdown for ever, so the engine's engine.shutdown_offers decides.
+        decision = self._decide_engine_stop(closing=True)
+        if not decision.proceed:
+            event.ignore()
+            return
+        if self._bridge is not None and hasattr(
+                self._bridge, "set_close_offers_policy"):
+            self._bridge.set_close_offers_policy(decision.policy)
 
         self._status_timer.stop()
         self._metrics_timer.stop()
