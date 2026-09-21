@@ -21462,8 +21462,9 @@ asio::awaitable<void> Engine::fee_feedback_sweep(BlockHeight block)
             "Fee budget binds: an offer-attached fee wanted "
                 + std::to_string(fee_tracker_->last_bound_desired())
                 + " mojos, budget allows " + std::to_string(fee_tracker_->last_bound_allowed())
-                + ". Attached fees degrade toward fees.min_fee_mojos; cancels and takes are "
-                  "NOT degraded and quoting continues. Raise fees.daily_budget_mojos.");
+                + ". Attached fees degrade toward fees.min_fee_mojos; PER-OFFER cancels and "
+                  "takes are NOT degraded and quoting continues. Raise fees.daily_budget_mojos. "
+                  "(The BULK stop/shutdown sweep still pays the attached fee -- TODO S67.)");
     }
     // [review #163] And the other edge: a cancel or a take the budget could not
     // fund, paid in full so it can still be mined.

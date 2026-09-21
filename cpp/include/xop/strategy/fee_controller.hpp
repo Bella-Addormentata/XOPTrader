@@ -368,7 +368,22 @@ struct BudgetedFee {
 ///     operator's ceiling on this is fees.max_fee_mojos, which has already
 ///     clamped `desired`; the budget's remaining job for a priority spend is
 ///     to REPORT (`over_budget`), which is an alertable condition, not a
-///     reason to pay a fee that cannot work;
+///     reason to pay a fee that cannot work.
+///
+///     [review #163 r8, Copilot] ONE CANCEL PATH IS NOT PRICED THROUGH HERE
+///     AND IS THEREFORE STILL DEGRADED.  OfferManager::cancel_all's BULK
+///     sweep passes `current_fee_mojos_` to cancel_offers_charged as the
+///     wallet's `batch_fee`, and `current_fee_mojos_` is what
+///     Engine::set_dynamic_fee last wrote: the budget-shaped OFFER-ATTACHED
+///     fee, which apply_budget may have degraded to min_fee_mojos.  The
+///     per-offer path is fine -- OfferManager::cancel_fee_for reads the
+///     class-aware cancel fees, which come from the priority branch above --
+///     so "a cancel is never degraded" holds for every cancel EXCEPT the bulk
+///     one.  Confirmed at cbf0301, NOT fixed here: it is a behaviour change to
+///     the stop/shutdown sweep and wants its own review.  See TODO S67;
+///     the shape is to pass max(cancel_fee_xch_mojos_, cancel_fee_cat_mojos_)
+///     while cancel_fees_active_, the same "an unclassifiable offer errs
+///     toward getting in" rule cancel_fee_for already applies;
 ///   * an offer-attached fee may use only the headroom above `reserve` -- and
 ///     only a 1/`batch` share of it.  [review #163] Step 8 asks for ONE
 ///     attached fee per heartbeat and then attaches it to every tier it posts,

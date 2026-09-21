@@ -68,7 +68,8 @@ default to off, and with both off every fee is what v0.10.24 paid.
   window past the budget at `min_fee_mojos` per tier. Only a correctly sized
   `daily_budget_mojos` prevents that, which is what the startup advisory is
   for. **A cancel or a
-  take is never degraded**: `min_fee_mojos` on a 42.3M-cost CAT cancel is 0.35
+  take is never degraded** — with one exception found at review round 8 and
+  recorded below, the bulk stop/shutdown sweep: `min_fee_mojos` on a 42.3M-cost CAT cancel is 0.35
   mojos per cost against the 5 a full mempool admits, so a degraded cancel is a
   spend that cannot be mined, keeps its coins locked and ends in a wallet-wide
   force-delete. It is paid in full — `max_fee_mojos` is the ceiling that bounds
@@ -162,6 +163,18 @@ default to off, and with both off every fee is what v0.10.24 paid.
   header always documented. Both are behind `controller_enabled` and both are
   load-bearing at the live `daily_budget_mojos: 10000000000`, which this PR's
   own startup advisory says is about 3x too small.
+- **One cancel path is still degraded, and "a cancel is never degraded" is
+  qualified rather than repeated.** `OfferManager::cancel_all`'s **bulk** sweep
+  hands `current_fee_mojos_` to the wallet as `batch_fee`, and that is the
+  budget-shaped *offer-attached* fee `Engine::set_dynamic_fee` last wrote — so
+  with the controller on and the budget exhausted, a stop/shutdown Cancel All
+  can go out at `min_fee_mojos` while the controller's own cancel fee is far
+  above it. Every *per-offer* cancel is unaffected (`cancel_fee_for` reads the
+  class-aware priority fees). Found by review at `cbf0301` and **not fixed
+  here** — it changes the stop/shutdown sweep and wants its own review; the
+  fix is to pass `max(cancel_fee_xch_mojos_, cancel_fee_cat_mojos_)` while the
+  class-aware fees are in force. It must land before `controller_enabled:
+  true`.
 - **Observability.** One `[FeeController] rate a -> b mojos/cost (reason; n
   move(s)) -- fees now: ...` line per burst of changes, and two gauges,
   `xop_fees_controller_rate_mojos_per_cost` and `xop_fees_controller_level_log2`.

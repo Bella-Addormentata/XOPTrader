@@ -902,13 +902,19 @@ fees:
   #                                  # With the controller ON an exhausted budget degrades the
   #                                  # OFFER-ATTACHED fee to min_fee_mojos (one FeeBudgetBound
   #                                  # alert); it never returns 0 = "skip Step 8", which also
-  #                                  # stopped cancels.  A CANCEL or a TAKE is never degraded:
+  #                                  # stopped cancels.  A PER-OFFER CANCEL or a TAKE is never
+  #                                  # degraded (the bulk sweep is the exception, see below):
   #                                  # min_fee_mojos on a 42.3M-cost CAT cancel is 0.35
   #                                  # mojos/cost against the ~5 a full mempool admits, so a
   #                                  # degraded cancel would never confirm, would keep its
   #                                  # coins locked and would end in a wallet-wide
   #                                  # force-delete.  It is paid in full and reported with one
   #                                  # FeeBudgetUnfunded alert instead.
+  #                                  # ONE EXCEPTION, found 2026-09-21 and NOT yet fixed: the
+  #                                  # BULK stop/shutdown sweep (wallet cancel_offers) still
+  #                                  # pays the single dynamic fee, which with the controller
+  #                                  # on IS the offer-attached fee -- so a Cancel All can go
+  #                                  # out at min_fee_mojos.  Per-offer cancels are unaffected.
   # CLVM cost per action class, measured on the live wallet 2026-09-20 (321 spend
   # bundles costed with chia_rs).  fee = rate x cost, clamped to [min_fee, max_fee].
   # controller_cost_cancel_xch: 8400000      # cancel of an offer that offered XCH (8.33-8.38M)

@@ -117,9 +117,10 @@ FeeTracker::FeeTracker(const FeeConfig& cfg)
                          "configuration wants per window of {} peak heights (one window costs "
                          "about {} at full-mempool prices, and the budget should not bind in "
                          "ordinary operation). It WILL bind: offer-attached fees pin at "
-                         "fees.min_fee_mojos and one FeeBudgetBound alert fires. Cancels and "
-                         "takes are never degraded -- they are paid in full and reported "
-                         "FeeBudgetUnfunded.",
+                         "fees.min_fee_mojos and one FeeBudgetBound alert fires. PER-OFFER "
+                         "cancels and takes are never degraded -- they are paid in full and "
+                         "reported FeeBudgetUnfunded. The BULK stop/shutdown sweep still pays "
+                         "the attached fee (TODO S67), so it pins at min_fee_mojos too.",
                          cfg_.daily_budget_mojos, want_budget, cfg_.fee_window_blocks, window_cost);
         }
         const strategy::fee::ActionClass all[strategy::fee::kActionClassCount] = {
@@ -511,8 +512,9 @@ std::uint64_t FeeTracker::controller_fee(strategy::fee::ActionClass action,
                          "budget's share for one is {} -- {} will be attached (fees.min_fee_mojos "
                          "{} is a floor the budget cannot lower). Headroom {} of {} per {} peak "
                          "heights, reserve {} for {} cancels. Offer-attached fees degrade toward "
-                         "min_fee_mojos; cancels and takes are NOT degraded and nothing stops. "
-                         "Raise fees.daily_budget_mojos.",
+                         "min_fee_mojos; PER-OFFER cancels and takes are NOT degraded and "
+                         "nothing stops (the BULK stop/shutdown sweep still pays this fee -- "
+                         "TODO S67). Raise fees.daily_budget_mojos.",
                          strategy::fee::to_string(action), desired, budgeted.allowance,
                          budgeted.fee, cfg_.min_fee_mojos, headroom, cfg_.daily_budget_mojos,
                          cfg_.fee_window_blocks, reserve,

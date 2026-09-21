@@ -141,7 +141,10 @@ enum class AlertRule : std::uint8_t {
                                // that says why spends may stop confirming.
 
     FeeBudgetUnfunded    = 23, // [S67, review #163] The budget could not fund
-                               // a CANCEL or a TAKE.  It was paid in full
+                               // a PER-OFFER CANCEL or a TAKE ([review #163
+                               // r8] the BULK stop/shutdown sweep is NOT
+                               // priced here and is still degraded; TODO
+                               // S67).  It was paid in full
                                // anyway: a cancel priced below what the node
                                // will admit never confirms, keeps its coins
                                // locked and ends in a wallet-wide
