@@ -37,7 +37,13 @@ Three rules made 97% of them. Each now has a replacement behind its own
   `unconfirmed_wallet_balance` against every resting offer that spends the asset,
   cancels only below `reserve x (1 - exposure_cancel_hysteresis_pct)`, never an
   offer younger than `exposure_cancel_min_age_blocks`, and suppresses the next
-  post instead.
+  post instead. A tracked offer whose pair this config cannot resolve -- an
+  adopted `UNKNOWN` wallet record, or a pair since REMOVED from the file; a
+  merely DISABLED pair is still mapped and still projected -- is recorded as
+  UNQUANTIFIABLE rather than dropped, because `owned` still counts the coins it
+  holds locked. While one is live, unified refuses to add exposure on either
+  side and says so in the log; it never cancels a resting offer on its account,
+  and the reload drain clears it on the next heartbeat.
 - **`price_cancel_mode: margin` (was 282 `price_adverse` cancels).** Cancel for
   price only when a fill at the resting price would earn less than
   `price_cancel_edge_retain` x the edge Step 7 demands of a new offer, against
