@@ -80,19 +80,37 @@
 //
 // WHAT THE LIVE DEPLOYMENT MAKES OF THAT, AS OF 2026-09-21.  The interaction
 // is inert there -- because of the COIN SET, not because of the fee.
-// Measured read-only on 2026-09-21 (chia rpc wallet get_spendable_coins and
-// get_coin_records, wallet_id 1): the XCH wallet held 54 unspent coins, the
-// smallest 13,494,209,440 mojos, and of the 30 spendable ones the smallest
-// was 20,757,615,448 mojos.  The largest floor this bot can emit is bounded
-// by the CAT balance one offer could spend -- that day 1,844,501 DBX mojos,
-// so 18,446 at the shipped 0.01 and 1,844,501 even at a fraction near 1.
-// Both are more than five orders of magnitude under the smallest XCH coin,
-// so nothing is filtered out and no selection changes.
+// Measured read-only on 2026-09-21 (chia rpc wallet get_spendable_coins,
+// get_coin_records, get_wallet_balance), twice in the day: 54 unspent XCH
+// coins both times, the smallest 13,494,209,440 mojos on the first read and
+// 13,314,209,440 on the second; spendable 30 then 42, its smallest
+// 20,757,615,448 then 13,314,209,440.  The arithmetic below uses the
+// smallest of those, 13,314,209,440.
 //
-// STATE, NOT POLICY.  That is a property of today's coin set and it moves:
-// the same smallest spendable coin read 20,787,615,448 mojos in the
+// THE MARGIN IS NOT ONE NUMBER, AND THE SCOPE IS BOTH CAT PAIRS
+// [review #162, round 7 -- CORRECTING THIS COMMENT].  An earlier revision
+// said "every floor this bot can emit" is more than five orders of magnitude
+// under the smallest XCH coin.  That is an absolute, and it is false at the
+// top of the fraction's range: the largest floor is bounded by the CAT mojos
+// ONE offer can spend, so it scales with the fraction.  It was also derived
+// from the DBX wallet alone, while XCH/BYC is enabled and CAT-funded too.
+//
+//   pair (CAT wallet)      balance     floor @ 0.01   floor @ frac just <1
+//   XCH/DBX (wallet 8)   1,844,501           18,446              1,844,501
+//   XCH/BYC (wallet 4)      88,845              889                 88,845
+//
+// DBX binds at every fraction.  Against 13,314,209,440 the margin is
+// 721,794x (5.86 orders) at the shipped 0.01 and 7,218x (3.86 orders) at a
+// fraction just under 1; five orders holds only up to frac ~ 0.072.  THE
+// CONCLUSION SURVIVES: even the largest floor the range [0, 1) permits, from
+// either CAT wallet, is over three orders of magnitude under the smallest
+// XCH coin, so nothing is filtered out and no selection changes.
+//
+// STATE, NOT POLICY.  That is a property of today's coin set and it moves --
+// it moved twice within 2026-09-21 (above), and the same smallest spendable
+// coin read 20,787,615,448 mojos in the
 // 2026-09-20 snapshot and 20,757,615,448 on 2026-09-21, exactly 30,000,000
-// lower -- what two 15,000,000-mojo fee spends would do, though only the two
+// lower -- what two 15,000,000-mojo fee spends would do, though only the
 // readings are measured and the attribution is an inference.  Any spend
 // leaving small change can put a coin under a floor.  fees.min_fee_mojos
 // does NOT govern reachability --
@@ -112,12 +130,46 @@
 // --------
 // min input coin = ceil(offered mojos x strategy.offer_min_input_coin_frac),
 // applied to the asset the offer SPENDS.  Relative, so it needs no per-asset
-// constant, and it bounds the input count: every selected coin is at least
-// `frac` of the target, so ceil(1 / frac) of them always reach it -- 100 at
-// the default 0.01, plus one fee coin.  Dexie does not publish its limit;
-// measured from this bot's own submissions it accepted 125 inputs (57,382
-// characters, about 459 per input) and refused everything from 60,612
+// constant, and it bounds the input count OF THE LEG IT APPLIES TO: every
+// selected CAT coin is at least `frac` of the target, so ceil(1 / frac) of
+// them always reach it -- 100 at the default 0.01.  Dexie does not publish
+// its limit; measured from this bot's own submissions it accepted 125 inputs
+// (57,382 characters, about 459 per input) and refused everything from 60,612
 // characters up, which puts the limit between 125 and about 132.
+//
+// IT BOUNDS THE CAT LEG ONLY, NOT THE OFFER [review #162, round 6 -- this
+// comment said "plus one fee coin", which is not a bound].  The XCH fee coin
+// of a CAT-funded offer is chosen by CATWallet::create_tandem_xch_tx in a
+// SEPARATE selection, and the floor is CAT-scaled, so in XCH mojos it is
+// negligible and constrains that selection not at all: the wallet may take
+// any number of XCH coins for one fee, and it demonstrably takes more than
+// one (TheKnapsackUsesOnlyCoinsTheWalletCanSee picks a {5M, 5M} pair).  So
+// the offer holds ceil(1 / frac) CAT inputs PLUS however many XCH coins the
+// fee takes, and the ~46,000-character estimate is a CAT-leg figure.
+//
+// ON TODAY'S COIN SET THE FEE LEG IS ONE COIN, which is again a measurement
+// and not a guarantee: the smallest XCH coin read on 2026-09-21 is
+// 13,314,209,440 mojos against the live fees.min_fee_mojos of 15,000,000,
+// i.e. 887x the fee, so any single coin covers it and select_coins settles on
+// one.  For a FLOORED create at 0.01 to reach Dexie's limit at all, the fee
+// leg would have to contribute 26 or more coins.
+//
+// THE INPUT COUNT IS NOT MONOTONE IN frac [review #162, round 7].  Raising
+// frac raises the floor, so it tightens ceil(1 / frac) -- but only while the
+// coins at or above the floor still cover the amount.  Feasibility is
+// monotone DECREASING in frac (the filtered set only shrinks), so above some
+// frac* the wallet refuses and THE FALLBACK builds the offer with no floor at
+// all: the count jumps straight back to the unfloored one.  Three
+// consequences, which the operator-facing text now states:
+//   * at 0.01 the CAT leg cannot exceed 100 inputs, under the 125 Dexie
+//     accepts, and the fee leg is one coin on this wallet, so a "Too many
+//     input coins" refusal is evidence the offer was built WITHOUT a floor --
+//     raising frac cannot have prevented it and only fires the fallback more
+//     often;
+//   * the only fraction change that can help is a REDUCTION, and not below
+//     about 1 / 124, where the CAT-leg bound alone reaches 125;
+//   * combining the coins is the only remedy that raises frac* instead of
+//     trading one failure for another.
 //
 // XCH-FUNDED OFFERS ARE LEFT ALONE.  XCH coins are already shaped by
 // CoinManager's pool (ensure_split) and budgeted by the XCH lock ledger,

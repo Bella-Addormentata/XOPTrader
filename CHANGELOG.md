@@ -16,9 +16,12 @@ existed in the wallet and locked its coins, listed nowhere. `engine.log` holds
 13 such refusals between 2026-09-10 and 2026-09-19.
 
 What the floor below does, stated plainly: the **first** create for each offer
-asks the wallet for coins of at least 1% of the amount, which bounds that
-offer at 100 inputs plus a fee coin — about 46,000 characters at the 459 per
-input measured here, against refusals that began at 60,612. Those 13 HTTP 400s
+asks the wallet for coins of at least 1% of the amount, which bounds its CAT
+leg at 100 inputs — about 46,000 characters at the 459 per input measured
+here, against refusals that began at 60,612. (That bounds the CAT leg only:
+the XCH fee coin is a separate selection this CAT-scaled value does not
+constrain — one coin while every XCH coin covers the fee, as today's do by
+about 887x, which is a measurement and not a guarantee.) Those 13 HTTP 400s
 become a create the wallet either satisfies or refuses up front, before any
 offer exists. What the floor does **not** do is guarantee the outcome: a
 refused create is re-sent once without the floor, and the offer that retry
@@ -33,8 +36,10 @@ builds is as exposed to dust as it was before this change.
   exposed to reward dust as it was before this change. The new
   key defaults to 0.01, accepts [0, 1), is read at startup, and 0 disables it,
   restoring the previous request byte for byte — **the request only**, see the
-  operator note below. With every input at least 1% of
-  the amount, 100 inputs plus one fee coin always suffice. Dexie does not
+  operator note below. With every CAT input at least 1% of
+  the amount, 100 of them always suffice — the **CAT leg** only; the XCH fee
+  coin is selected separately and this CAT-scaled floor does not bound that
+  count. Dexie does not
   publish its limit; from this bot's own submissions it accepted 125 inputs
   (57,382 characters) and refused everything from 60,612 characters up.
 - **XCH-funded offers are unchanged.** Their coins are shaped by the coin pool
@@ -60,18 +65,29 @@ builds is as exposed to dust as it was before this change.
   XCH that was already locked.
 - **On the live deployment this is inert today — because of the coin set, not
   the fee.** Measured read-only on 2026-09-21 (`chia rpc wallet
-  get_spendable_coins` and `get_coin_records`, wallet id 1), the operator's XCH
-  wallet held 54 unspent coins, the smallest **13,494,209,440 mojos**, of which
-  30 were spendable, the smallest **20,757,615,448 mojos**. The largest floor
-  the bot can emit is bounded by the CAT balance one offer could spend
-  (1,844,501 DBX mojos that day, so 18,446 at the shipped 0.01 and 1,844,501
-  even at a fraction near 1) — more than five orders of magnitude below the
-  smallest XCH coin, so nothing is filtered out and no selection changes. This
-  is a property of **today's coin set, which moves**: the same coin was
+  get_spendable_coins`, `get_coin_records`, `get_wallet_balance`), twice in the
+  day. The XCH wallet held 54 unspent coins both times, the smallest
+  **13,494,209,440 mojos** on the first read and **13,314,209,440** on the
+  second; spendable went 30 → 42 and its smallest 20,757,615,448 →
+  13,314,209,440. The figures below use the smallest of those readings. The
+  largest floor the bot can emit is bounded by the CAT mojos **one offer** can
+  spend, so it scales with the fraction, and **both** CAT-funded pairs enabled
+  in the live config are in scope — XCH/DBX (wallet 8, 1,844,501 mojos) and
+  XCH/BYC (wallet 4, 88,845 mojos). DBX binds at every fraction: 18,446 mojos
+  at the shipped 0.01, 1,844,501 at a fraction just under 1.
+  **The margin is therefore not one number.** Against 13,314,209,440 it is
+  721,794× (5.86 orders of magnitude) at 0.01 and 7,218× (3.86 orders) at the
+  top of the range — "more than five orders" holds only up to a fraction of
+  about 0.072, and it was previously stated as an absolute over every floor the
+  bot can emit, which it is not. **The conclusion survives the correction:**
+  even the largest floor the range `[0, 1)` permits, from either CAT wallet, is
+  over three orders of magnitude under the smallest XCH coin, so nothing is
+  filtered out and no selection changes. This is a property of **today's coin
+  set, which moves** — it moved twice within 2026-09-21, and the same coin was
   recorded at 20,787,615,448 mojos in the 2026-09-20 snapshot and at
-  20,757,615,448 on 2026-09-21 — exactly 30,000,000 lower, which is what two
+  20,757,615,448 on 2026-09-21, exactly 30,000,000 lower, which is what two
   15,000,000-mojo fee spends would do (that attribution is an inference; the
-  two measurements are not). `fees.min_fee_mojos` does not govern reachability
+  measurements are not). `fees.min_fee_mojos` does not govern reachability
   in either direction.
 - **The fraction is applied in parts per billion, rounded up.** Rounded to
   nearest, the applied fraction could fall below the configured one and the
@@ -86,9 +102,15 @@ builds is as exposed to dust as it was before this change.
   path. The offer built by the retry can again be one Dexie refuses.
 - **Detection.** A Dexie refusal for too many input coins now logs one
   `[dexie-too-many-inputs]` warning that names the offer, its length, the
-  remedy (combine the coins, or raise the fraction) and a count since start.
-  No metric was added: `OfferManager` has no posting-failure metric to extend.
-  Nothing is cancelled automatically.
+  remedy and a count since start. The remedy is to **combine the coins**, and
+  the warning says explicitly **not** to raise `offer_min_input_coin_frac`: the
+  input count is not monotone in the fraction, and at 0.01 a floored create's
+  CAT leg cannot exceed 100 inputs — under Dexie's limit, with the fee leg one
+  coin on this wallet — so an offer refused for input count was built
+  without a floor — raising the fraction only makes the wallet
+  refuse the floored create more often and fires the no-floor retry that builds
+  those offers. No metric was added: `OfferManager` has no posting-failure
+  metric to extend. Nothing is cancelled automatically.
 
 **What changes on upgrade, with no config edit at all.** Three things, and only
 the first has a lever:

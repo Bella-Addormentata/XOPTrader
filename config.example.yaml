@@ -378,11 +378,31 @@ strategy:
   # With this key the engine sends create_offer_for_ids a `min_coin_amount` of
   # ceil(amount the offer spends x this fraction) on the FIRST create for each
   # offer, so the wallet leaves smaller coins alone and an offer built by that
-  # attempt needs at most ceil(1 / fraction) inputs: 100 at the default, plus
-  # one fee coin.  RAISE it to tighten that bound; values much below the
-  # default no longer guarantee it.  0 disables the floor.  The bound is on
+  # attempt needs at most ceil(1 / fraction) CAT inputs: 100 at the default.
+  # 0 disables the floor.  The bound is on
   # that first attempt only -- the no-floor retry described below sends no
   # floor at all, and the offer it builds can be dust-funded again.
+  #
+  # IT BOUNDS THE CAT LEG, NOT THE WHOLE OFFER.  The XCH fee coin is chosen
+  # in a separate selection that this CAT-scaled value does not constrain, so
+  # the offer carries those CAT inputs PLUS however many XCH coins the fee
+  # takes.  That is one coin only while every XCH coin covers the fee, which
+  # is true of the live wallet by a factor of about 887 (smallest XCH coin
+  # 13,314,209,440 mojos on 2026-09-21 against fees.min_fee_mojos 15,000,000)
+  # -- a measurement, not a guarantee.
+  #
+  # THE INPUT COUNT IS NOT MONOTONE IN THIS FRACTION.  Raising it tightens
+  # ceil(1 / fraction) only while the coins at or above the floor can still
+  # cover the amount; past that the wallet refuses, the no-floor retry builds
+  # the offer from dust again, and the bound is gone.  So raising it AFTER a
+  # "Too many input coins" refusal makes that outcome more common, not less --
+  # that refusal is itself evidence the offer was built without a floor, since
+  # at 0.01 the CAT leg cannot exceed 100 inputs and the fee leg is one coin
+  # here.  Lowering it loosens the bound, and below about 1/124 the CAT-leg
+  # bound alone reaches the 125 inputs Dexie was measured to accept.  The
+  # remedy for a refusal is to combine the coins; the only fraction change
+  # that can help is a small REDUCTION, and only when it is the FLOORED
+  # create the wallet is refusing.
   #
   # Applies to CAT-funded offers only (a bid on XCH/<CAT>, an ask on
   # <CAT>/...).  XCH-funded offers are untouched: their coins are managed by

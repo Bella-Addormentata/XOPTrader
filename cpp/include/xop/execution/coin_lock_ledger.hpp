@@ -59,11 +59,20 @@
 // floor; the fee decides only whether excluding it changes the answer.
 //
 // INERT ON THE LIVE DEPLOYMENT TODAY -- BECAUSE OF THE COIN SET, NOT THE
-// FEE.  Measured read-only 2026-09-21 (chia rpc wallet get_spendable_coins
-// and get_coin_records, wallet_id 1): 54 unspent XCH coins, the smallest
-// 13,494,209,440 mojos; 30 spendable, the smallest 20,757,615,448.  Every
-// floor this bot can emit is more than five orders of magnitude below that,
-// so no coin is filtered out and the modelling changes no admission.  That
+// FEE.  Measured read-only 2026-09-21 (chia rpc wallet get_spendable_coins,
+// get_coin_records, get_wallet_balance), twice in the day: 54 unspent XCH
+// coins both times, the smallest 13,494,209,440 mojos then 13,314,209,440;
+// spendable 30 then 42, its smallest 20,757,615,448 then 13,314,209,440.
+// The largest floor this bot can emit is bounded by the CAT mojos ONE offer
+// can spend, so it SCALES WITH THE FRACTION and is not a single number
+// [review #162, round 7 -- correcting an absolute this comment made].  Over
+// both CAT-funded pairs the live config enables, DBX (1,844,501 mojos)
+// binds: 18,446 at the shipped 0.01, 1,844,501 at a fraction just under 1,
+// against BYC's 889 and 88,845.  So the margin is 721,794x (5.86 orders) at
+// 0.01 and 7,218x (3.86 orders) at the top of the range -- more than five
+// orders only up to frac ~ 0.072, but over three orders everywhere in
+// [0, 1), so no coin is filtered out and the modelling changes no admission
+// at any fraction this config accepts.  That
 // is a fact about today's coins rather than about fees.min_fee_mojos, and
 // one spend leaving small change undoes it.  This ledger's pool is seeded
 // from wallet_->get_spendable_coins(1) in

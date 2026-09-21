@@ -316,7 +316,11 @@ TEST(OfferMinInputCoin, HugeAmountsAreExactAndDoNotWrap) {
 TEST(OfferMinInputCoin, InputsAtTheFloorAlwaysReachTheAmountWithinTheBound) {
     // The property the default is chosen for: with every coin >= the floor,
     // ceil(1 / frac) coins cover the amount.  100 at 1%, against a Dexie
-    // limit measured between 125 and about 132 inputs.
+    // limit measured between 125 and about 132 inputs.  [review #162,
+    // round 6] That is the CAT LEG's count.  The XCH fee coin is chosen by
+    // create_tandem_xch_tx in a separate selection that this CAT-scaled
+    // floor does not constrain, so the offer carries these inputs plus
+    // however many XCH coins the fee takes -- see offer_min_input_coin.hpp.
     for (std::uint64_t offered : {std::uint64_t{80'334}, std::uint64_t{99'999},
                                   std::uint64_t{100'001},
                                   std::uint64_t{123'456'789}}) {

@@ -411,11 +411,33 @@ struct StrategyConfig {
     /// Dexie pays rewards as one tiny coin per rewarded offer; the wallet's
     /// coin selection prefers that dust, and an offer built from about 130
     /// or more inputs is refused by Dexie ("Too many input coins") while it
-    /// still locks its coins in the wallet.  With every input at least this
-    /// fraction of the amount, ceil(1 / fraction) inputs always suffice:
-    /// 100 at the default, against a measured Dexie limit between 125 and
-    /// about 132.  So RAISING it tightens the bound and values much below
-    /// the default stop guaranteeing it.
+    /// still locks its coins in the wallet.  With every CAT input at least
+    /// this fraction of the amount, ceil(1 / fraction) of them always
+    /// suffice: 100 at the default, against a measured Dexie limit between
+    /// 125 and about 132.
+    ///
+    /// THAT BOUNDS THE CAT LEG, NOT THE OFFER [review #162, round 6].  The
+    /// XCH fee coin is chosen in a separate selection that this CAT-scaled
+    /// value does not constrain, so the fee leg's coin count is not bounded
+    /// here -- it is one coin only while every XCH coin covers the fee,
+    /// which is true of today's wallet by a factor of about 887 and is a
+    /// measurement, not a guarantee.
+    ///
+    /// THE INPUT COUNT IS NOT MONOTONE IN THIS FRACTION [review #162,
+    /// round 7 -- CORRECTING THIS COMMENT].  An earlier revision said
+    /// "RAISING it tightens the bound", which is true only while the coins
+    /// at or above the floor can still cover the amount.  Past that point
+    /// the wallet refuses and the fallback below re-sends the create with
+    /// NO floor, so that offer is dust-funded again and the bound is gone:
+    /// raising the fraction further makes that outcome MORE common, not
+    /// less, and it is the outcome a Dexie "Too many input coins" refusal
+    /// reports.  Lowering the fraction loosens the bound instead, and below
+    /// about 1 / 124 the CAT-leg bound alone reaches the 125 inputs Dexie
+    /// was measured to accept.  So the useful
+    /// range is narrow, the remedy for a refusal is to combine the coins
+    /// (chia wallet coins combine), and the only fraction change that can
+    /// help is a small REDUCTION -- and only when it is the floored create
+    /// the wallet is refusing.
     ///
     /// 0 disables the floor and restores the previous request byte for
     /// byte.  Range [0, 1).  XCH-funded offers never carry it: their coins

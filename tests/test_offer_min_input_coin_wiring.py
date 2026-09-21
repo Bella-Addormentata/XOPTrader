@@ -173,11 +173,16 @@ def test_the_wrapper_applies_the_rule_and_the_fallback():
         "unexpected arguments to the wallet create: %r" % create_args
     )
     assert "[this,&offer_dict,expiry_max_time](std::optional<std::uint64_t>coin_floor)" in wrapper
-    # The warning has to name the offer and the constraint.
-    warn = _definition(OFFER_MANAGER_CPP, WRAPPER_SIGNATURE)
-    assert "[min-input-coin]" in warn
+    # The warning has to name the offer and the constraint.  Read through
+    # _code() so a COMMENT cannot satisfy the assertion: the tag has to live in
+    # a real string literal (keep_strings), the arguments in real code.
+    warn_def = _definition(OFFER_MANAGER_CPP, WRAPPER_SIGNATURE)
+    assert "[min-input-coin]" in _code(warn_def, keep_strings=True), (
+        "the fallback warning no longer carries the [min-input-coin] tag in a "
+        "string literal"
+    )
     for token in ("pair.name", "to_string(side)", "tier_index", "min_coin.value_or(0)", "frac"):
-        assert token in _code(warn), "the fallback warning no longer logs %s" % token
+        assert token in _code(warn_def), "the fallback warning no longer logs %s" % token
 
 
 def test_every_posting_path_creates_through_the_wrapper():
@@ -216,10 +221,45 @@ def test_both_dexie_rejection_shapes_are_checked_for_too_many_inputs():
     # Detection only: this PR must not grow an auto-cancel here.
     assert "cancel" not in code, "submit_to_dexie must not cancel anything"
 
-    note = _definition(OFFER_MANAGER_CPP, "void OfferManager::note_dexie_too_many_inputs(")
+    # Read through _code(keep_strings=True) so a COMMENT cannot satisfy any of
+    # these: whitespace is squeezed out inside literals too, hence the run-on
+    # tokens, and each must therefore live in ONE literal of the warning.
+    note = _code(_definition(OFFER_MANAGER_CPP,
+                             "void OfferManager::note_dexie_too_many_inputs("),
+                 keep_strings=True)
     assert "[dexie-too-many-inputs]" in note
-    assert "RAISE strategy.offer_min_input_coin_frac" in note, (
-        "the warning must tell the operator to RAISE the fraction, not lower it"
+    assert "(chiawalletcoinscombine)" in note, (
+        "the warning no longer names the one remedy that removes the cause"
+    )
+    # [review #162, round 7] THE DIRECTION, CORRECTED.  The input count is not
+    # monotone in the fraction: raising it raises the floor, and once the coins
+    # at or above the floor cannot cover the amount the wallet refuses and
+    # create_offer_with_min_coin_fallback re-sends the create with NO floor, so
+    # the offer is unbounded again.  At the shipped 0.01 a floored create's CAT
+    # leg cannot exceed 100 inputs -- under the 125 Dexie was measured to
+    # accept, with the XCH fee leg one coin on this wallet -- so an offer Dexie
+    # refuses for input count was built without a floor, and raising the
+    # fraction produces MORE of them, not fewer.
+    assert "DoNOTRAISEstrategy.offer_min_input_coin_frac" in note, (
+        "the warning must tell the operator NOT to raise the fraction: raising "
+        "it makes the wallet refuse the floored create more often, which fires "
+        "the no-floor retry that builds the offers Dexie refuses"
+    )
+    assert "orRAISEstrategy.offer_min_input_coin_frac" not in note, (
+        "the withdrawn advice ('or RAISE ... -- lowering it admits MORE dust') "
+        "is back in the warning"
+    )
+    assert "SMALLREDUCTION,neverbelowabout0.008" in note, (
+        "the warning no longer bounds the one fraction change that can help: a "
+        "small reduction, and not below about 1/124 where the CAT-leg bound "
+        "alone reaches the 125 inputs Dexie accepts"
+    )
+    # [review #162, round 6] The bound is on the CAT leg, not on the offer:
+    # the XCH fee coin is a separate selection this CAT-scaled floor does not
+    # constrain.  The warning must not promise a whole-offer bound.
+    assert "CATLEG" in note and "XCHFEELEG" in note, (
+        "the warning no longer distinguishes the CAT leg the floor bounds from "
+        "the XCH fee leg it does not"
     )
 
 

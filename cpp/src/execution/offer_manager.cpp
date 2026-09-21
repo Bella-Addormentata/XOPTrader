@@ -242,9 +242,20 @@ void OfferManager::note_dexie_too_many_inputs(const std::string& posting,
         "[dexie-too-many-inputs] Dexie refused {} ({} characters): too many "
         "input coins.  The offer EXISTS in the wallet, is listed nowhere and "
         "locks its coins until it is cancelled.  Remedy: combine the small "
-        "coins of the asset this offer spends (chia wallet coins combine), "
-        "or RAISE strategy.offer_min_input_coin_frac (now {}) -- lowering it "
-        "admits MORE dust.  Seen {} time(s) since start.",
+        "coins of the asset this offer spends (chia wallet coins combine) -- "
+        "the only remedy that removes the cause.  "
+        "Do NOT RAISE strategy.offer_min_input_coin_frac (now {}): the "
+        "floor bounds the CAT LEG at ceil(1 / frac) inputs -- 100 at 0.01, "
+        "against the 125 Dexie was measured to accept -- so an offer "
+        "refused for input count was built with NO floor (the no-floor "
+        "retry, or a posting path that carries none), and raising the floor "
+        "only makes the wallet refuse more floored creates and fire that "
+        "retry more often.  It does not bound the XCH FEE LEG, which is "
+        "selected separately and is one coin only while every XCH coin "
+        "covers the fee.  If the fraction is 0 the floor is off and 0.01 "
+        "turns it on; otherwise the only change that can help is "
+        "a SMALL REDUCTION, never below about 0.008: the CAT-leg "
+        "bound alone then exceeds 125.  Seen {} time(s) since start.",
         posting, offer_chars, strategy_cfg_.offer_min_input_coin_frac,
         dexie_too_many_inputs_count_);
 }
