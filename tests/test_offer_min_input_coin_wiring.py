@@ -92,7 +92,16 @@ def _call_arguments(code: str, callee: str) -> list[str]:
 
 
 def _split_arguments(args: str) -> list[str]:
-    """The top-level, comma-separated arguments of a whitespace-free call."""
+    """The top-level, comma-separated arguments of a whitespace-free call.
+
+    KNOWN LIMIT, stated because this round is about a scan's hidden fragility:
+    angle brackets are not tracked (they are ambiguous with comparison
+    operators), so an argument that is itself a template with a comma in its
+    parameter list -- `std::pair<int,int>{...}` -- would split wrongly and the
+    assertion would fail with an argument count, not silently pass.  Failing
+    loudly on a shape none of the four guarded calls uses is the safe side of
+    that trade; `_top_level_argument_count` below has the same limit.
+    """
     out: list[str] = []
     depth = 0
     quote = ""
