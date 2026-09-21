@@ -146,7 +146,17 @@ FeeTracker::FeeTracker(const FeeConfig& cfg)
 void FeeTracker::record_fee(std::uint64_t fee_mojos, BlockHeight block_height)
 {
     fee_history_.emplace_back(block_height, fee_mojos);
-    cached_total_ += fee_mojos;
+    // [review #163 r6] SATURATING, not wrapping.  is_within_budget() below has
+    // always guarded its own addition; this one did not, and it is the running
+    // total that guard reads.  A wrapped total is small, so budget_remaining()
+    // would report a large headroom and the guard rail would vanish silently
+    // -- a fail-OPEN on the one number the budget is.  Saturating fails the
+    // other way: the budget reads exhausted, attached fees degrade to min_fee
+    // and priority spends are still paid in full (apply_budget), which is the
+    // degradation this controller is designed around.
+    cached_total_ = (fee_mojos > std::numeric_limits<std::uint64_t>::max() - cached_total_)
+                        ? std::numeric_limits<std::uint64_t>::max()
+                        : cached_total_ + fee_mojos;
 
     spdlog::debug("[FeeTracker] Recorded fee {} mojos at block {} "
                   "(rolling total now {} mojos)",
@@ -169,8 +179,15 @@ void FeeTracker::prune(BlockHeight current_block)
             ? (current_block - cfg_.fee_window_blocks)
             : 0;
 
+    // [review #163 r6] The subtraction is saturating for the same reason the
+    // addition is: once record_fee() has saturated, cached_total_ is an
+    // OVER-estimate and the bookkeeping identity it restores no longer holds,
+    // so an unguarded `-=` could underflow to a near-UINT64_MAX total.  Both
+    // directions now clamp, which keeps the total an over-estimate for ever
+    // after a saturation -- the conservative direction for a budget.
     while (!fee_history_.empty() && fee_history_.front().first < cutoff) {
-        cached_total_ -= fee_history_.front().second;
+        const std::uint64_t oldest = fee_history_.front().second;
+        cached_total_ = (cached_total_ > oldest) ? cached_total_ - oldest : 0U;
         fee_history_.pop_front();
     }
 

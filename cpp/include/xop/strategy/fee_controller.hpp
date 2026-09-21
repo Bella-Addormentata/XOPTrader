@@ -224,11 +224,66 @@ static_assert(cancel_fee_for(true, 7U, 1U, 2U, false, true) == 2U);
 /// this many mojos per cost is refused (INVALID_FEE_TOO_CLOSE_TO_ZERO).
 inline constexpr double kFullMempoolMinRate = 5.0;
 
-/// 2^63, exactly representable.  The largest fee this header will emit; a
-/// constant "just below UINT64_MAX" rounds UP to 2^64 as a double and the
-/// cast back is undefined (memory: msvc-gcc-divergence).
-inline constexpr double        kFeeCeilingDouble = 9223372036854775808.0;
-inline constexpr std::uint64_t kFeeCeiling       = 9223372036854775808ULL;
+/// TWO DIFFERENT NUMBERS, AND THE DIFFERENCE IS THE WHOLE POINT.
+///
+/// `kFeeConversionBound` is 2^63 as a DOUBLE and is only ever compared against.
+/// It is exactly representable, which a constant "just below UINT64_MAX" is
+/// not: 18'446'744'073'709'551'000.0 rounds UP to exactly 2^64, so the cast
+/// back is undefined and GCC yielded 0 -- the precise wrap the saturation
+/// existed to prevent (memory: msvc-gcc-divergence).  That reasoning is right
+/// and this bound stays exactly where it was.
+///
+/// `kFeeCeiling` is the largest fee this header will EMIT, and it is 2^63 - 1,
+/// NOT 2^63.  [review #163 r6] It used to be 2^63, and the constant chosen
+/// precisely to make ONE conversion safe was the one value that wraps the
+/// NEXT one: this repo's `Mojo` is `std::int64_t` (types.hpp), whose maximum
+/// is 2^63 - 1, so 2^63 is the single uint64 that is not a Mojo.  C++20 makes
+/// the out-of-range uint64 -> int64 conversion modular rather than undefined
+/// (cpp/CMakeLists.txt sets C++20), which is worse here, not better: it is a
+/// silent, portable, exactly-reproducible INT64_MIN.  A fee that arrives
+/// negative is then dropped by every downstream guard -- CoinLockLedger's
+/// clamp_need() zeroes it, ask_take_cost() and add_same_wallet_fee() return
+/// the cost unchanged on `same_wallet_fee <= 0` -- so the coin-lock and
+/// balance checks stop seeing a fee the wallet is about to pay.  Callers
+/// converting to Mojo should still use xop::to_mojo_saturating(); this
+/// constant is what makes that conversion a no-op rather than a rescue.
+///
+/// The gap between the two constants is empty by construction: doubles near
+/// 2^63 step by 1024, so the largest double below the bound is 2^63 - 1024 and
+/// no double lies in [kFeeCeiling, kFeeConversionBound).  The saturating
+/// branch below therefore loses nothing by returning 2^63 - 1.
+inline constexpr double        kFeeConversionBound = 9223372036854775808.0;
+inline constexpr std::uint64_t kFeeCeiling         = 9223372036854775807ULL;
+
+// -- Compile-time pins.  MSVC does not predict the Ubuntu GCC -Werror job, and
+// constant evaluation forbids UB, so a wrong answer here is a build failure on
+// EVERY toolchain rather than a red runner nobody can reproduce locally
+// (memory: msvc-gcc-divergence).  The Mojo-typed round trip is asserted again
+// in fee_tracker.hpp, which is the first header to see both types; this one
+// stays pure and spells the type out.
+static_assert(kFeeCeiling == static_cast<std::uint64_t>(
+                                 std::numeric_limits<std::int64_t>::max()),
+              "the emitted fee ceiling must be INT64_MAX: xop::Mojo is int64_t");
+// THE ROUND TRIP.  uint64 -> Mojo -> uint64 must be the identity, and the
+// Mojo must be positive.  This is the assertion that fails if the ceiling is
+// ever put back to 2^63.
+static_assert(static_cast<std::uint64_t>(static_cast<std::int64_t>(kFeeCeiling))
+                  == kFeeCeiling,
+              "the emitted fee ceiling must survive a round trip through Mojo");
+static_assert(static_cast<std::int64_t>(kFeeCeiling) > 0,
+              "the emitted fee ceiling must be a POSITIVE Mojo");
+// ...and the witness for why: 2^63 does not.  C++20 modular conversion, so
+// this is a constant expression rather than UB, and it evaluates to INT64_MIN.
+static_assert(static_cast<std::int64_t>(9223372036854775808ULL)
+                  == std::numeric_limits<std::int64_t>::min(),
+              "2^63 is the one uint64 that is not a Mojo -- it becomes INT64_MIN");
+// The comparison bound is unchanged, exactly representable, and strictly above
+// the emitted ceiling with no double in between.
+static_assert(kFeeConversionBound == 9223372036854775808.0);
+static_assert(static_cast<std::uint64_t>(kFeeConversionBound)
+                  == 9223372036854775808ULL,
+              "kFeeConversionBound must be exactly 2^63 as a double");
+static_assert(kFeeCeiling < static_cast<std::uint64_t>(kFeeConversionBound));
 
 /// One part in 10^12: how far above a whole number a product may sit and still
 /// be that number.  (min_fee / cost) x cost is min_fee in exact arithmetic and
@@ -240,7 +295,8 @@ inline constexpr double kCeilTolerance = 1e-12;
 
 /// ceil(rate x cost) as mojos -- never BELOW the computed requirement, up to
 /// kCeilTolerance.  0 for a rate or cost that is not finite and > 0; saturates
-/// at 2^63.
+/// at kFeeCeiling, i.e. 2^63 - 1, which is a valid Mojo.  The COMPARISON is
+/// against 2^63 (kFeeConversionBound) and nothing in between exists.
 [[nodiscard]] inline std::uint64_t fee_from_rate(double rate, std::uint64_t cost) noexcept
 {
     if (!std::isfinite(rate) || !(rate > 0.0) || cost == 0U) {
@@ -248,7 +304,7 @@ inline constexpr double kCeilTolerance = 1e-12;
     }
     const double product = rate * static_cast<double>(cost);
     const double raw     = std::ceil(product - product * kCeilTolerance);
-    if (!(raw < kFeeCeilingDouble)) {
+    if (!(raw < kFeeConversionBound)) {
         return kFeeCeiling;
     }
     return static_cast<std::uint64_t>(raw);
@@ -431,7 +487,7 @@ struct DailyActions {
     if (!(scaled > 0.0)) {
         return 0U;
     }
-    if (!(scaled < kFeeCeilingDouble)) {
+    if (!(scaled < kFeeConversionBound)) {
         return kFeeCeiling;
     }
     return static_cast<std::uint64_t>(scaled);
@@ -665,12 +721,19 @@ public:
                         std::uint64_t min_fee_mojos = 0,
                         std::uint64_t max_fee_mojos = 0)
         : cfg_{sanitised(cfg)}
-        // [review #163 r2] BOTH bounds are capped at 2^63.  The parser accepts
-        // any uint64 for either, and capping only the ceiling left
-        // min_fee_ > max_fee_ whenever min_fee_mojos exceeded 2^63 -- after
-        // which std::clamp(raw, min_fee_, max_fee_) in fee_for() is called
-        // with lo > hi, which is undefined behaviour.  min(a,b) <= max(a,b)
-        // and the same cap on each keeps min_fee_ <= max_fee_ for EVERY input.
+        // [review #163 r2] BOTH bounds are capped at kFeeCeiling.  The parser
+        // accepts any uint64 for either (config.cpp read_u64 checks only
+        // min <= max), and capping only the ceiling left min_fee_ > max_fee_
+        // whenever min_fee_mojos exceeded the cap -- after which
+        // std::clamp(raw, min_fee_, max_fee_) in fee_for() is called with
+        // lo > hi, which is undefined behaviour.  min(a,b) <= max(a,b) and the
+        // same cap on each keeps min_fee_ <= max_fee_ for EVERY input.
+        //
+        // [review #163 r6] The cap itself moved from 2^63 to 2^63 - 1.  Because
+        // BOTH bounds carry it, it is also the only fee an operator can reach
+        // by configuration -- clamp(raw, min_fee_, max_fee_) cannot exceed
+        // max_fee_ -- so this line is what bounds the whole emitted range to
+        // values that are valid Mojos.  See kFeeCeiling.
         , min_fee_{std::min(std::min(min_fee_mojos, max_fee_mojos), kFeeCeiling)}
         , max_fee_{std::min(std::max(min_fee_mojos, max_fee_mojos), kFeeCeiling)}
     {

@@ -1082,7 +1082,7 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
                 // already called remove_offer(), which always returned a
                 // default (fee 0) -- trade_log.fee_mojos was silently 0 for
                 // every fill since June 2026.
-                fill.fee_mojos    = static_cast<Mojo>(po.fee_mojos);
+                fill.fee_mojos    = to_mojo_saturating(po.fee_mojos);
 
                 // Extract confirmed block height if available.
                 if (rec.contains("confirmed_at_index")) {
@@ -2986,7 +2986,7 @@ OrphanEvaluation OfferManager::evaluate_orphan(
     //   - Adverse but within threshold: adopt (cost to cancel > likely loss).
     //   - Adverse beyond threshold: cancel (likely loss > cancel cost).
     //   - Mild adverse (between half-threshold and threshold): adopt-stale.
-    eval.cancel_cost = static_cast<Mojo>(current_fee_mojos_);
+    eval.cancel_cost = to_mojo_saturating(current_fee_mojos_);
 
     if (!eval.adverse) {
         // Favorable deviation -- our offer is more conservative than
@@ -3733,7 +3733,11 @@ std::string OfferManager::late_trade_id(const json& result,
 asio::awaitable<json> OfferManager::cancel_offer_charged(
     const std::string& trade_id, std::uint64_t fee, bool secure)
 {
-    xch_cycle_ledger_.note_lock(0, static_cast<Mojo>(fee));
+    // [review #163 r6] to_mojo_saturating, not a bare cast: `fee` is a
+    // std::uint64_t and a wrapped negative is silently zeroed by
+    // CoinLockLedger::clamp_need(), which would leave the pool believing this
+    // cancel locks nothing.  See xop::to_mojo_saturating (types.hpp).
+    xch_cycle_ledger_.note_lock(0, to_mojo_saturating(fee));
     json reply = co_await wallet_->cancel_offer(trade_id, fee, secure);
     // [review #163] The wallet ACCEPTED it (a refusal throws past this line).
     // Tell the fee controller what was really paid, now -- see
@@ -3799,7 +3803,7 @@ asio::awaitable<json> OfferManager::cancel_offers_charged(
     // [S33 2026-09-11] The arithmetic, the >= 1 clamp and the rationale live
     // in execution/coin_lock_ledger.hpp so that ctest drives the same code
     // this does -- inline here, the reservation had no coverage at all.
-    reserve_bulk_cancel(xch_cycle_ledger_, static_cast<Mojo>(fee), n_offers);
+    reserve_bulk_cancel(xch_cycle_ledger_, to_mojo_saturating(fee), n_offers);
     co_return co_await wallet_->cancel_offers(fee, secure);
 }
 
@@ -3858,11 +3862,14 @@ bool OfferManager::xch_ledger_probe_admits(CoinLockLedger&   probe,
     const bool buys_xch =
         (side == Side::Bid && pair.base_asset_id == "xch")
         || (side == Side::Ask && pair.quote_asset_id == "xch");
+    // [review #163 r6] These two were IMPLICIT uint64 -> Mojo narrowings: the
+    // sinks take a Mojo and no diagnostic fires.  See xch_ledger_admits below
+    // and xop::to_mojo_saturating (types.hpp).
     if (buys_xch) {
-        return probe.try_lock_floor_only(0, current_fee_mojos_);
+        return probe.try_lock_floor_only(0, to_mojo_saturating(current_fee_mojos_));
     }
     return probe.try_lock(xch_principal_from_offer_dict(offer_dict),
-                          current_fee_mojos_);
+                          to_mojo_saturating(current_fee_mojos_));
 }
 
 bool OfferManager::xch_ledger_admits(const json&       offer_dict,
@@ -3887,7 +3894,8 @@ bool OfferManager::xch_ledger_admits(const json&       offer_dict,
         (side == Side::Bid && pair.base_asset_id == "xch")
         || (side == Side::Ask && pair.quote_asset_id == "xch");
     if (buys_xch) {
-        if (xch_cycle_ledger_.try_lock_floor_only(0, current_fee_mojos_)) {
+        if (xch_cycle_ledger_.try_lock_floor_only(
+                0, to_mojo_saturating(current_fee_mojos_))) {
             return true;
         }
         xch_ledger_suppressed_ = true;
@@ -3901,7 +3909,8 @@ bool OfferManager::xch_ledger_admits(const json&       offer_dict,
         return false;
     }
     const Mojo principal = xch_principal_from_offer_dict(offer_dict);
-    if (xch_cycle_ledger_.try_lock(principal, current_fee_mojos_)) {
+    if (xch_cycle_ledger_.try_lock(principal,
+                                   to_mojo_saturating(current_fee_mojos_))) {
         return true;
     }
     xch_ledger_suppressed_ = true;
@@ -4729,7 +4738,15 @@ asio::awaitable<bool> OfferManager::emergency_cancel(
             // insufficient funds at a given tier, halve and retry.
             // This lets us cancel even when spendable is far below the
             // configured minimum fee.
-            const auto fee_cap = static_cast<Mojo>(current_fee_mojos_ * 2);
+            // [review #163 r6] The DOUBLING happens in the uint64 domain, so
+            // it has to saturate BEFORE the conversion does: a bare
+            // `static_cast<Mojo>(current_fee_mojos_ * 2)` wraps the product
+            // first and then narrows the wrapped value, which no amount of
+            // care at the cast alone would catch.
+            const Mojo fee_cap = to_mojo_saturating(
+                current_fee_mojos_ > std::numeric_limits<std::uint64_t>::max() / 2U
+                    ? std::numeric_limits<std::uint64_t>::max()
+                    : current_fee_mojos_ * 2U);
             Mojo attempt_fee = std::min(
                 fee_cap,
                 std::max(Mojo{1}, xch_spendable - Mojo{1000}));

@@ -36,6 +36,34 @@
 namespace xop {
 
 // ---------------------------------------------------------------------------
+// [review #163 r6] THE TYPE-BOUNDARY PIN, stated in terms of Mojo itself.
+//
+// This is the first header that sees both strategy::fee (which emits fees as
+// std::uint64_t) and xop::Mojo (std::int64_t), so it is the only place the
+// round trip can be asserted over the REAL type rather than over a spelled-out
+// std::int64_t.  fee_controller.hpp pins the same property on its own, because
+// it is a pure header and must not depend on types.hpp; this one is the
+// assertion a reader of `Mojo` will actually find.
+//
+// The finding this replaces: kFeeCeiling was exactly 2^63, the single uint64
+// value that is not a Mojo, and it was emitted as a public result --
+// fee_for() clamps to [min_fee_, max_fee_] and both are capped AT the ceiling,
+// so an operator writing a 19- or 20-digit fees.max_fee_mojos (config.cpp
+// accepts any uint64; it validates only min <= max) got 2^63 out of
+// get_recommended_fee() and INT64_MIN into every Mojo consumer.
+// ---------------------------------------------------------------------------
+static_assert(to_mojo_saturating(strategy::fee::kFeeCeiling)
+                  == static_cast<Mojo>(strategy::fee::kFeeCeiling),
+              "the emitted fee ceiling must convert to a Mojo WITHOUT saturating: "
+              "if this fails the ceiling is out of Mojo range again");
+static_assert(static_cast<Mojo>(strategy::fee::kFeeCeiling) > 0,
+              "a fee that converts to a negative Mojo is silently dropped by "
+              "clamp_need(), ask_take_cost() and add_same_wallet_fee()");
+static_assert(static_cast<std::uint64_t>(static_cast<Mojo>(strategy::fee::kFeeCeiling))
+                  == strategy::fee::kFeeCeiling,
+              "uint64 -> Mojo -> uint64 must be the identity at the fee ceiling");
+
+// ---------------------------------------------------------------------------
 // FeeTracker
 // ---------------------------------------------------------------------------
 

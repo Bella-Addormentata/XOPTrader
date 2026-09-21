@@ -13801,8 +13801,14 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
 
         // T4-03: Record posting fees in the tracker.
         if (fee_tracker_->enabled() && posted > 0) {
+            // [review #163 r6] Saturating: posted x fee is the one place the
+            // attached-fee booking multiplies, and a wrapped product would
+            // under-book the window.
+            const std::uint64_t n_posted = static_cast<std::uint64_t>(posted);
             fee_tracker_->record_fee(
-                static_cast<std::uint64_t>(posted) * recommended_fee,
+                recommended_fee > std::numeric_limits<std::uint64_t>::max() / n_posted
+                    ? std::numeric_limits<std::uint64_t>::max()
+                    : n_posted * recommended_fee,
                 block_height);
         }
         // [T2-09] Persist actual wallet-assigned offer IDs to the database.
@@ -14401,7 +14407,7 @@ asio::awaitable<void> Engine::step_check_arbitrage(
         const QuoteMojos spend_cost = execution::ask_take_cost(
             decision.best_ask_size, best_ask_price,
             BaseMpu{pair.base_mojos_per_unit}, QuoteMpu{pair.quote_mojos_per_unit},
-            spend_is_xch ? static_cast<Mojo>(fee) : Mojo{0});
+            spend_is_xch ? to_mojo_saturating(fee) : Mojo{0});
 
         // read_ok{false} is UNKNOWN and it is the DEFAULT. A number is never
         // substituted for a failed read (coin_pool_verdict.hpp), which is why
@@ -15396,10 +15402,16 @@ asio::awaitable<void> Engine::step_check_arbitrage(
                             // otherwise. Inert on XCH/DBX and XCH/BYC ask
                             // takes; live on a bid take of an xch base and on
                             // the wmilliETH.b/XCH family.
+                            // [review #163 r6] to_mojo_saturating: a wrapped
+                            // negative fee is DROPPED by
+                            // add_same_wallet_fee's `same_wallet_fee <= 0`
+                            // clause -- the take path's own guard, not
+                            // clamp_need -- so the funding check would price
+                            // a spend without the fee the wallet pays.
                             const Mojo cost = execution::add_same_wallet_fee(
                                 spend_cost,
                                 spend_asset == "xch"
-                                    ? static_cast<Mojo>(fee) : Mojo{0});
+                                    ? to_mojo_saturating(fee) : Mojo{0});
 
                             const auto fv =
                                 execution::decide_funding(reading, cost);
@@ -16088,7 +16100,7 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
                     }
                     const Mojo cost = execution::add_same_wallet_fee(
                         chosen->spend_cost,
-                        spend_asset == "xch" ? static_cast<Mojo>(fee)
+                        spend_asset == "xch" ? to_mojo_saturating(fee)
                                              : Mojo{0});
                     const auto fv =
                         execution::decide_funding(reading, cost);
@@ -17979,7 +17991,7 @@ void Engine::record_taker_fill(const std::string& strategy,
         f.quote_asset           = pc.quote_asset_id;
         f.quote_delta_mojos     = quote_delta;
         f.price_mojos           = price_mojos;
-        f.fee_mojos             = static_cast<Mojo>(fee_mojos);
+        f.fee_mojos             = to_mojo_saturating(fee_mojos);
         db_->insert_taker_fill(f);
 
         // Ledger legs, keyed on the trade id so a retry cannot double-post.
@@ -18022,7 +18034,7 @@ void Engine::record_taker_fill(const std::string& strategy,
         add("base",  pc.base_asset_id,  base_delta);
         add("quote", pc.quote_asset_id, quote_delta);
         if (fee_mojos > 0) {
-            add("fee", AssetId{"xch"}, -static_cast<Mojo>(fee_mojos));
+            add("fee", AssetId{"xch"}, -to_mojo_saturating(fee_mojos));
         }
 
         // A real write failure IS a ledger-incompleteness event: legs that
@@ -21296,8 +21308,15 @@ std::uint64_t Engine::cancel_fees_paid(const std::vector<std::string>& ids,
                                        std::uint64_t                   legacy_fee) const
 {
     if (!fee_tracker_ || !fee_tracker_->class_fees_active() || !offer_mgr_) {
-        // The pre-S67 accounting, unchanged: one fee for every cancel.
-        return static_cast<std::uint64_t>(ids.size()) * legacy_fee;
+        // The pre-S67 accounting: one fee for every cancel.  [review #163 r6]
+        // The PRODUCT now saturates the same way the class-aware sum below
+        // already did -- an unguarded count x fee wraps for a large enough fee
+        // and hands FeeTracker::record_fee a small number.
+        const std::uint64_t n = static_cast<std::uint64_t>(ids.size());
+        if (n != 0U && legacy_fee > std::numeric_limits<std::uint64_t>::max() / n) {
+            return std::numeric_limits<std::uint64_t>::max();
+        }
+        return n * legacy_fee;
     }
     std::uint64_t total = 0;
     for (const auto& id : ids) {

@@ -33,6 +33,50 @@ using Mojo = std::int64_t;
 /// Conversion constant: mojos per whole XCH.
 inline constexpr Mojo kMojosPerXch = 1'000'000'000'000LL;
 
+/// [S67 review #163 r6] An UNSIGNED mojo amount as a Mojo, saturating at
+/// INT64_MAX instead of wrapping to a negative.
+///
+/// WHY THIS EXISTS AND WHY A BARE CAST IS NOT ENOUGH.  Fees cross this repo as
+/// std::uint64_t (FeeTracker, OfferManager::current_fee_mojos_, the wallet RPC
+/// layer) and are spent as Mojo.  The repo is C++20, so an out-of-range
+/// uint64 -> int64 conversion is WELL-DEFINED MODULAR WRAP, not UB -- there is
+/// no sanitiser, no warning and no platform divergence to catch it, just a
+/// silent negative.  And a negative mojo amount is worse than a large one,
+/// because every guard downstream is written to ignore it rather than to
+/// refuse: CoinLockLedger::clamp_need() maps a negative fee to 0 and then
+/// returns early on `need == 0`, and execution::ask_take_cost() and
+/// execution::add_same_wallet_fee() both return the cost unchanged on
+/// `same_wallet_fee <= 0`.  Each is individually reasonable and each turns a
+/// wrapped fee into a safety check that cannot see a spend the wallet is about
+/// to make -- a fail-open, in three different places, from one cast.
+///
+/// Saturating is the conservative direction at every one of those sinks: an
+/// INT64_MAX need is covered by no coin (the ledger refuses the lock, or
+/// drains the pool on the unconditional path) and an INT64_MAX cost exceeds
+/// every balance (decide_funding declines).  Too expensive to do is the right
+/// answer to a fee too large to represent; free is not.
+[[nodiscard]] constexpr Mojo to_mojo_saturating(std::uint64_t value) noexcept
+{
+    constexpr std::uint64_t kMax =
+        static_cast<std::uint64_t>(std::numeric_limits<Mojo>::max());
+    return (value >= kMax) ? std::numeric_limits<Mojo>::max()
+                           : static_cast<Mojo>(value);
+}
+
+static_assert(to_mojo_saturating(0U) == 0);
+static_assert(to_mojo_saturating(5'000'000U) == 5'000'000);
+// The value the fee controller now emits round-trips unchanged...
+static_assert(to_mojo_saturating(9'223'372'036'854'775'807ULL)
+              == std::numeric_limits<Mojo>::max());
+// ...and the one it used to emit saturates instead of becoming INT64_MIN.
+static_assert(to_mojo_saturating(9'223'372'036'854'775'808ULL)
+              == std::numeric_limits<Mojo>::max());
+static_assert(to_mojo_saturating(
+                  std::numeric_limits<std::uint64_t>::max())
+              == std::numeric_limits<Mojo>::max());
+// The property that matters at every call site: never negative.
+static_assert(to_mojo_saturating(9'223'372'036'854'775'808ULL) > 0);
+
 // ---------------------------------------------------------------------------
 // quote_mojos_for -- canonical conversion from (size_base_mojos, price_pseudo)
 //                    to quote-asset mojos.

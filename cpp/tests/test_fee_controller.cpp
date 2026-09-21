@@ -18,9 +18,12 @@
 
 #include <gtest/gtest.h>
 
+#include <xop/execution/coin_lock_ledger.hpp>
 #include <xop/execution/fee_feedback.hpp>
+#include <xop/execution/take_retry.hpp>
 #include <xop/strategy/fee_controller.hpp>
 #include <xop/strategy/fee_tracker.hpp>
+#include <xop/types.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -351,7 +354,14 @@ TEST(FeeController, NonFiniteAndNegativeInputsAreRefused)
     EXPECT_EQ(c.fee_for(ActionClass::CancelCat, 100), kMinFee);
 }
 
-TEST(FeeController, OverflowSaturatesInsteadOfWrapping)
+// [review #163 r6] RENAMED.  The old name was OverflowSaturatesInsteadOfWrapping,
+// and every assertion under it is about ONE conversion: double -> uint64 inside
+// fee_from_rate().  That is genuinely what this test guards, and the name now
+// says which conversion, because the header's saturation was safe there and
+// wrapped at the NEXT conversion (uint64 -> Mojo) -- see
+// TheEmittedCeilingIsAValidMojo below, which is the guard the old name was
+// wrongly read as providing.
+TEST(FeeController, TheDoubleToUint64ConversionSaturatesInsteadOfWrapping)
 {
     EXPECT_EQ(fee::fee_from_rate(1e300, 1'000'000'000ULL), fee::kFeeCeiling);
     EXPECT_EQ(fee::fee_from_rate(std::numeric_limits<double>::infinity(), 5), 0U);
@@ -360,11 +370,156 @@ TEST(FeeController, OverflowSaturatesInsteadOfWrapping)
     EXPECT_EQ(fee::fee_from_rate(1.0, 0), 0U);
     EXPECT_EQ(fee::fee_from_rate(0.3, 10), 3U);
     EXPECT_EQ(fee::fee_from_rate(0.31, 10), 4U);   // ceil: never below the requirement
-    // A max_fee above 2^63 is clamped to it, so no fee can exceed it.
+    // The COMPARISON bound is exactly 2^63 and stays there: a constant just
+    // below UINT64_MAX rounds UP to 2^64 as a double and the cast back is
+    // undefined (memory: msvc-gcc-divergence).
+    EXPECT_DOUBLE_EQ(fee::kFeeConversionBound, 9223372036854775808.0);
+    // Nothing is lost by emitting one less: no double exists between the two
+    // constants, because doubles up there are spaced 1024 apart.
+    EXPECT_LT(fee::kFeeCeiling, static_cast<std::uint64_t>(fee::kFeeConversionBound));
+    EXPECT_EQ(std::nextafter(fee::kFeeConversionBound, 0.0),
+              9223372036854774784.0);
+    EXPECT_LT(std::nextafter(fee::kFeeConversionBound, 0.0),
+              static_cast<double>(fee::kFeeCeiling));
+    // A max_fee above the ceiling is clamped to it, so no fee can exceed it.
     Controller c{on_config(), 1, std::numeric_limits<std::uint64_t>::max()};
     EXPECT_EQ(c.max_fee(), fee::kFeeCeiling);
     c.set_feed_forward(1e300, 0.0, 100);
     EXPECT_EQ(c.fee_for(ActionClass::Take, 100), fee::kFeeCeiling);
+}
+
+// [review #163 r6] THE GUARD THE OLD NAME DID NOT PROVIDE.
+//
+// kFeeCeiling was exactly 2^63 -- the single uint64 value that is not an
+// xop::Mojo (std::int64_t, max 2^63 - 1).  This repo is C++20, so the
+// out-of-range conversion is well-defined MODULAR WRAP, not UB: 2^63 becomes
+// exactly INT64_MIN, silently, on every compiler.
+//
+// THIS TEST MUST FAIL IF THE EMITTED CEILING IS PUT BACK TO 2^63.  That is why
+// every assertion below is on the PROPERTY and uses a BARE cast: writing
+// EXPECT_EQ(x, fee::kFeeCeiling) would follow the constant wherever it went and
+// prove nothing, and routing through xop::to_mojo_saturating() would rescue the
+// defect instead of detecting it.  (The same property is a static_assert in
+// fee_controller.hpp and fee_tracker.hpp, so the mutation is a BUILD failure
+// there; this test is what remains if those assertions are also removed.)
+TEST(FeeController, TheEmittedCeilingIsAValidMojo)
+{
+    using xop::Mojo;
+    // 1. The constant itself: positive as a Mojo, and a lossless round trip.
+    EXPECT_GT(static_cast<Mojo>(fee::kFeeCeiling), 0)
+        << "the emitted ceiling wrapped to a negative Mojo";
+    EXPECT_EQ(static_cast<std::uint64_t>(static_cast<Mojo>(fee::kFeeCeiling)),
+              fee::kFeeCeiling);
+    EXPECT_EQ(fee::kFeeCeiling,
+              static_cast<std::uint64_t>(std::numeric_limits<Mojo>::max()));
+
+    // 2. The value really is EMITTED, from the public API, so the constant is
+    //    not merely an internal bound.  Both bounds are capped at the ceiling,
+    //    so an operator's 19- or 20-digit fees.max_fee_mojos reaches it.
+    Controller c{on_config(), 1, std::numeric_limits<std::uint64_t>::max()};
+    c.set_feed_forward(1e300, 0.0, 100);
+    // Written out rather than using kAllClasses: that constant is declared
+    // further down this file, beside the FeeTracker layer.
+    for (const ActionClass cls : {ActionClass::OfferAttached, ActionClass::CancelXch,
+                                  ActionClass::CancelCat, ActionClass::Take}) {
+        const std::uint64_t f = c.fee_for(cls, 100);
+        EXPECT_GT(static_cast<Mojo>(f), 0) << fee::to_string(cls);
+        EXPECT_EQ(static_cast<std::uint64_t>(static_cast<Mojo>(f)), f)
+            << fee::to_string(cls);
+    }
+    // And through FeeTracker, the type the engine actually holds.
+    xop::FeeConfig cfg;
+    cfg.enabled            = true;
+    cfg.controller_enabled = true;
+    cfg.min_fee_mojos      = std::numeric_limits<std::uint64_t>::max();
+    cfg.max_fee_mojos      = std::numeric_limits<std::uint64_t>::max();
+    cfg.daily_budget_mojos = std::numeric_limits<std::uint64_t>::max();
+    xop::FeeTracker t{cfg};
+    const std::uint64_t paid = t.get_recommended_fee(1, 100, ActionClass::CancelCat);
+    EXPECT_EQ(paid, fee::kFeeCeiling);
+    EXPECT_GT(static_cast<Mojo>(paid), 0)
+        << "get_recommended_fee returned a fee that is not a Mojo";
+
+    // 3. Every fee_from_rate saturation, not just the ceiling constant.
+    EXPECT_GT(static_cast<Mojo>(fee::fee_from_rate(1e300, 1'000'000'000ULL)), 0);
+    EXPECT_GT(static_cast<Mojo>(fee::full_mempool_window_cost(
+                  fee::ClassCosts{}, 1e300, 1'662U)), 0);
+    EXPECT_GT(static_cast<Mojo>(fee::recommended_window_budget(
+                  fee::ClassCosts{}, 1e300, 1'662U)), 0);
+}
+
+// [review #163 r6] THE SINKS, and why a negative fee is worse than a huge one.
+//
+// Copilot named CoinLockLedger::clamp_need(); that is right for the CANCEL
+// path and wrong for the TAKE path, which is zeroed by ask_take_cost() and
+// add_same_wallet_fee()'s own `same_wallet_fee <= 0` clause instead.  Same
+// outcome -- a safety check that cannot see a fee the wallet is about to pay --
+// through a DIFFERENT guard, so a fix aimed only at clamp_need would have left
+// the take path broken.  Both are pinned here.
+//
+// The input is written out as a literal, NOT as fee::kFeeCeiling: this test is
+// about what the sinks do with an unrepresentable value, and it must keep
+// testing that after the ceiling stopped being one.
+TEST(FeeController, AnUnrepresentableFeeIsTooExpensiveAtEverySinkNotFree)
+{
+    using xop::Mojo;
+    using xop::to_mojo_saturating;
+    constexpr std::uint64_t kNotAMojo = 9'223'372'036'854'775'808ULL;   // 2^63
+
+    // The bare cast is the defect, stated once so the rest reads as contrast.
+    ASSERT_LT(static_cast<Mojo>(kNotAMojo), 0)
+        << "C++20 modular conversion: 2^63 is INT64_MIN";
+    EXPECT_EQ(static_cast<Mojo>(kNotAMojo), std::numeric_limits<Mojo>::min());
+    // The conversion every call site now uses refuses to produce that.
+    EXPECT_GT(to_mojo_saturating(kNotAMojo), 0);
+    EXPECT_EQ(to_mojo_saturating(kNotAMojo), std::numeric_limits<Mojo>::max());
+    EXPECT_EQ(to_mojo_saturating(std::numeric_limits<std::uint64_t>::max()),
+              std::numeric_limits<Mojo>::max());
+    EXPECT_EQ(to_mojo_saturating(15'000'000ULL), Mojo{15'000'000});
+
+    // -- the CANCEL path: CoinLockLedger -----------------------------------
+    // A fee larger than the pool must DRAIN it (note_lock is unconditional)
+    // and must REFUSE an offer lock (try_lock).  With the wrapped negative,
+    // clamp_need() returned 0 and both calls became no-ops.
+    {
+        xop::execution::CoinLockLedger drained{
+            std::vector<Mojo>{5'000'000'000LL, 3'000'000'000LL}, /*floor=*/0, 1.0};
+        ASSERT_TRUE(drained.active());
+        drained.note_lock(0, to_mojo_saturating(kNotAMojo));
+        EXPECT_EQ(drained.remaining(), 0)
+            << "an unfundable cancel fee must drain the pool, not be ignored";
+    }
+    {
+        xop::execution::CoinLockLedger refusing{
+            std::vector<Mojo>{5'000'000'000LL, 3'000'000'000LL}, /*floor=*/0, 1.0};
+        EXPECT_FALSE(refusing.try_lock(0, to_mojo_saturating(kNotAMojo)))
+            << "an unfundable fee must refuse the lock, not admit it";
+        EXPECT_FALSE(refusing.try_lock_floor_only(0, to_mojo_saturating(kNotAMojo)));
+        // Contrast: the wrapped value is silently ignored and ADMITS.
+        EXPECT_TRUE(refusing.try_lock(0, static_cast<Mojo>(kNotAMojo)))
+            << "this is the fail-open the fix removes -- clamp_need zeroes it";
+    }
+
+    // -- the TAKE path: its OWN guard, not clamp_need ------------------------
+    {
+        constexpr Mojo kCost = 1'000'000LL;
+        const Mojo with_fee =
+            xop::execution::add_same_wallet_fee(kCost, to_mojo_saturating(kNotAMojo));
+        EXPECT_EQ(with_fee, std::numeric_limits<Mojo>::max())
+            << "the take cost must saturate, so decide_funding declines";
+        EXPECT_EQ(xop::execution::decide_funding(
+                      xop::execution::SpendableReading{true, 500'000'000'000LL}, with_fee),
+                  xop::execution::FundingVerdict::Insufficient);
+        // Contrast: the wrapped fee is DROPPED by `same_wallet_fee <= 0`, and
+        // the take then looks affordable at the bare principal.
+        const Mojo dropped =
+            xop::execution::add_same_wallet_fee(kCost, static_cast<Mojo>(kNotAMojo));
+        EXPECT_EQ(dropped, kCost)
+            << "this is the take path's own fail-open, and it is NOT clamp_need";
+        EXPECT_EQ(xop::execution::decide_funding(
+                      xop::execution::SpendableReading{true, 500'000'000'000LL}, dropped),
+                  xop::execution::FundingVerdict::Fund);
+    }
 }
 
 TEST(FeeController, OutOfRangeTuningFallsBackToTheDefaults)
@@ -1846,6 +2001,52 @@ xop::FeeConfig tracker_config(bool controller_on, bool cost_aware)
 
 constexpr ActionClass kAllClasses[] = {ActionClass::OfferAttached, ActionClass::CancelXch,
                                        ActionClass::CancelCat, ActionClass::Take};
+
+// [review #163 r6] THE CUMULATIVE ACCOUNTING.  Copilot's third claim -- that
+// repeated record_fee() additions can wrap the unsigned rolling total -- is
+// REAL: `cached_total_ += fee_mojos` had no guard, while is_within_budget()
+// right below it has always had one for the identical addition.
+//
+// WHY WRAPPING IS THE DANGEROUS DIRECTION.  budget_remaining() is
+// daily_budget - rolling_total, so a total that wraps to near zero reports a
+// FULL budget and the guard rail disappears exactly when spending is extreme.
+// Saturating reports an exhausted budget instead, which degrades the attached
+// fee to min_fee and still pays cancels and takes in full (apply_budget) --
+// the designed behaviour, not a stop.
+TEST(FeeTrackerController, TheRollingTotalSaturatesInsteadOfWrapping)
+{
+    constexpr std::uint64_t kTop = std::numeric_limits<std::uint64_t>::max();
+    xop::FeeConfig cfg = tracker_config(false, false);
+    cfg.daily_budget_mojos = kTop;
+    xop::FeeTracker t{cfg};
+
+    // Two records of the fee the header USED to emit.  Unguarded, 2^63 + 2^63
+    // is exactly 0 and the window reads as if nothing had been spent at all.
+    // (Two records of the new ceiling sum to 2^64 - 2 and do NOT wrap, which
+    // is why this witness is the old value and not fee::kFeeCeiling.)
+    t.record_fee(9'223'372'036'854'775'808ULL, 100);
+    t.record_fee(9'223'372'036'854'775'808ULL, 100);
+    EXPECT_EQ(t.get_rolling_total(100), kTop)
+        << "the rolling total wrapped: the budget would read as untouched";
+    EXPECT_EQ(t.budget_remaining(100), 0U);
+    EXPECT_FALSE(t.is_within_budget(100, 1));
+
+    // A third record cannot move it back down either.
+    t.record_fee(1'000ULL, 100);
+    EXPECT_EQ(t.get_rolling_total(100), kTop);
+
+    // Pruning a saturated total stays clamped at 0 rather than underflowing
+    // into a near-UINT64_MAX "spend" that never happened.
+    const std::uint64_t after_prune = t.get_rolling_total(100 + 1'662 + 1);
+    EXPECT_LE(after_prune, kTop);
+    EXPECT_EQ(after_prune, 0U);
+
+    // And the ordinary case is untouched: exact arithmetic well below the top.
+    xop::FeeTracker plain{tracker_config(false, false)};
+    plain.record_fee(60'000ULL, 100);
+    plain.record_fee(40'000ULL, 101);
+    EXPECT_EQ(plain.get_rolling_total(101), 100'000ULL);
+}
 
 TEST(FeeTrackerController, BothFlagsOffEveryClassGetsTheLegacyFee)
 {
