@@ -86,11 +86,34 @@ default to off, and with both off every fee is what v0.10.24 paid.
   startup height for a cancel the startup reconcile issues), never the
   last-processed-block marker, which trails by a cycle and is 0 at boot; with
   no known height no ticket is opened, and a ticket at height 0 is never
-  evidence. Both fee bounds are capped at 2^63, so a floor above it cannot put
-  the minimum over the maximum. A take's ticket closes on the wallet's own
+  evidence. Both fee bounds are capped at the same ceiling, so a floor above it
+  cannot put the minimum over the maximum. A take's ticket closes on the wallet's own
   `confirmed_at_index`, not on the heartbeat that read it: the sweep polls one
   take per heartbeat, so a second ticketed take would otherwise turn an on-time
   confirmation into a late one and raise the fee.
+- **Every fee the controller emits is a valid `Mojo`, and the conversion to one
+  is now a named function.** The saturation ceiling was exactly 2^63 — the one
+  `std::uint64_t` value that is *not* an `xop::Mojo` (`std::int64_t`, maximum
+  2^63 − 1). It really was emitted: `fee_for()` clamps to
+  `[min_fee_mojos, max_fee_mojos]` and both bounds are capped at that ceiling,
+  so an operator writing a 19- or 20-digit `fees.max_fee_mojos` — the parser
+  accepts any `uint64` and validates only `min <= max` — got 2^63 back from
+  `get_recommended_fee`. C++20 makes the out-of-range conversion modular wrap
+  rather than undefined, so it became `INT64_MIN` silently, on every compiler.
+  The ceiling is now 2^63 − 1; the *comparison* bound stays at exactly 2^63
+  (a constant just below `UINT64_MAX` rounds up to 2^64 as a double) and is
+  renamed so the two can no longer be misread as the same number. A negative
+  fee is worse than a huge one because every guard downstream ignores it rather
+  than refusing — `CoinLockLedger::clamp_need()` zeroes it on the cancel path,
+  and `ask_take_cost()` / `add_same_wallet_fee()` drop it on their own
+  `<= 0` clause on the take path — so all fourteen `uint64` → `Mojo` fee
+  conversions, six of them implicit narrowings, now go through
+  `xop::to_mojo_saturating()`. The cumulative accounting saturates too:
+  `record_fee`'s running total, its pruning subtraction and the two
+  `posted × fee` products. `static_assert`s in `fee_controller.hpp` and
+  `fee_tracker.hpp` make a wrong ceiling a compile error on every toolchain.
+  **Not reachable on the shipped configuration** (`max_fee_mojos` 100,000,000),
+  and not reachable merely by enabling the controller.
 - **Observability.** One `[FeeController] rate a -> b mojos/cost (reason; n
   move(s)) -- fees now: ...` line per burst of changes, and two gauges,
   `xop_fees_controller_rate_mojos_per_cost` and `xop_fees_controller_level_log2`.

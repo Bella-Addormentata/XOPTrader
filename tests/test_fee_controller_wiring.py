@@ -500,9 +500,20 @@ def test_every_glue_function_is_inert_with_the_controller_off():
         head = body[:body.index("{") + 400]
         assert "!fee_tracker_->controller_active()" in head, signature
     # cancel_fees_paid keeps the old product unless fees depend on the class.
+    # [review #163 r6] The product is now computed in two statements so it can
+    # saturate, so this pins the SHAPE (count x legacy_fee, one fee per cancel,
+    # no per-class lookup) rather than one literal expression -- and pins the
+    # overflow guard beside it, since an unguarded product wraps and under-books
+    # the window.
     paid = _function_body(engine, "std::uint64_t Engine::cancel_fees_paid(")
     assert "!fee_tracker_->class_fees_active()" in paid
-    assert "static_cast<std::uint64_t>(ids.size()) * legacy_fee" in paid
+    legacy = paid[paid.index("class_fees_active"):paid.index("std::uint64_t total")]
+    assert "static_cast<std::uint64_t>(ids.size())" in legacy
+    assert "* legacy_fee" in legacy
+    assert "cancel_fee_for" not in legacy, "the legacy branch must not price per class"
+    assert "std::numeric_limits<std::uint64_t>::max() / n" in legacy, (
+        "the legacy count x fee product must saturate, not wrap"
+    )
     # The sweep pays nothing and cancels nothing: its only wallet call is a read.
     sweep = _function_body(engine, "asio::awaitable<void> Engine::fee_feedback_sweep(")
     assert re.findall(r"wallet_->(\w+)\(", sweep) == ["transport_counters", "get_offer"]
