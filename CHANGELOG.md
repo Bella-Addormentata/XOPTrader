@@ -20,11 +20,28 @@ Three rules made 97% of them. Each now has a replacement behind its own
   local cancel -- read from the chia 2.7.4 source: an expired trade stays
   PENDING_ACCEPT and stays in `get_locked_coins()` until cancelled, and
   `cancel_offer secure=false` releases it with no spend. The cancel is sent only
-  when the WALLET's chain clock (`get_timestamp_for_height` at its finished-sync
+  when a chain clock (`get_timestamp_for_height` at the wallet's finished-sync
   height less 32 blocks -- a depth, because a seconds margin can be met by the
   tip block alone) is past `max_time`, the wallet still reports PENDING_ACCEPT, and
   its record repeats the tracked `max_time`; this host's clock only decides
-  whether to look. `expire` with no expiry configured is refused at startup.
+  whether to look.
+  **That clock is one connected peer's unvalidated assertion, not a local fact**
+  -- chia's wallet forwards `get_timestamp_for_height` to whichever full-node
+  peer answers first, unanchored (no `expected_header_hash`), so nothing checks
+  a signature, a proof of space or a VDF, and the 32-block depth bounds reorgs
+  only, never a liar. The retire therefore censuses the wallet's full-node peers
+  (`get_connections`) before the clock and again after it, and retires nothing
+  unless every peer is on this host, where chia's own `is_trusted_peer` trusts
+  it unconditionally. **Enabling `expire` has a precondition: the wallet must
+  reach the chain only through a local full node.** While it does not -- most
+  obviously when that node is down -- retires pause, offers keep their coins
+  locked, and the log says `no trusted chain clock`.
+  `expire` with no expiry configured is refused at startup.
+  **No LOCAL signal can report a retire that went wrong**, because a take of a
+  CANCELLED trade is exactly what this wallet is structurally blind to; the
+  check that can fire is external -- an offer this bot retired should end at
+  Dexie `status: 6` with `spent_block_index: null`, and a `status: 4` with a
+  block index means someone took it after the retire.
   The GUI pairs table sizes its resting-offer window from the expiry in this
   mode, so a quote that legitimately rests 24 h is not shown as absent after 6.
 - **`exposure_rule: unified` (was 528 `exposure_floor_rebalance` cancels).** The

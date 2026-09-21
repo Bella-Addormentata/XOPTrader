@@ -376,12 +376,19 @@ strategy:
   #
   # ttl_cancel_mode: expire -- an offer that verifiably carries the expiry
   #   above is no longer cancelled at the hard TTL; the chain ages it out and
-  #   the bot then frees its coins with a FREE local cancel, once the WALLET'S
-  #   chain clock, read 32 blocks back, is past max_time (never this host's
-  #   clock, and never the tip's: that proves no reorg depth).  Requires
+  #   the bot then frees its coins with a FREE local cancel, once a chain
+  #   clock read 32 blocks back is past max_time (never this host's clock, and
+  #   never the tip's: that proves no reorg depth).  Requires
   #   offer_expiry_secs (or a pair override) > 0 -- rejected at startup
   #   otherwise.  Log: "[offer-expiry] retired".  Offers with no verified
   #   expiry, and everything a stopped engine ages out, keep today's cancel.
+  #   PRECONDITION -- the wallet must reach the chain ONLY through a full node
+  #   on this host.  The wallet RPC that supplies the clock answers from
+  #   whichever connected full node replies first, with no consensus check, so
+  #   the retire refuses to run while the wallet has ANY full-node peer this
+  #   host does not run -- which is what happens when the local node is down.
+  #   Then offers keep their coins locked until it returns; that is the safe
+  #   direction, and the log line naming it is "no trusted chain clock".
   # ttl_cancel_mode: cancel                # [OPTIONAL, default: cancel] cancel | expire
   #
   # exposure_rule: unified -- one reserve-exposure verdict for the pre-post

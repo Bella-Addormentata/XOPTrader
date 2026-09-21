@@ -38,6 +38,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <string>
 
 #include <nlohmann/json.hpp>
 
@@ -247,7 +248,7 @@ inline constexpr int kCancelCoinsPerOfferCeiling = 2;
 }
 
 // ---------------------------------------------------------------------------
-// get_timestamp_for_height -- the wallet's CHAIN clock
+// get_timestamp_for_height -- A CONNECTED PEER'S ANSWER, NOT A LOCAL FACT
 // ---------------------------------------------------------------------------
 //
 // [S70 2026-09-20] The one clock an offer's max_time is enforced against is a
@@ -261,9 +262,41 @@ inline constexpr int kCancelCoinsPerOfferCeiling = 2;
 // backtracks until it finds a recent transaction block" -- i.e. the latest
 // transaction-block timestamp AT OR BEFORE that height, which is exactly the
 // value consensus compares ASSERT_BEFORE_SECONDS_ABSOLUTE with for the next
-// block.  Asked at get_height_info's `height` (get_finished_sync_up_to, the
-// last block the wallet has finished processing), the answer also bounds what
-// the wallet has SEEN, not merely what exists.
+// block.
+//
+// [review #164, 2026-09-21] WHAT THIS ENDPOINT DOES *NOT* GIVE YOU, AND AN
+// EARLIER REVISION OF THIS COMMENT CLAIMED IT DID.  It said that, asked at
+// get_height_info's height, "the answer also bounds what the wallet has SEEN,
+// not merely what exists".  The HEIGHT bounds that.  The TIMESTAMP does not,
+// and it is not the wallet's own reading of its own chain:
+//
+//   * wallet_rpc_api.py:934-935 forwards straight to
+//     WalletNode.get_timestamp_for_height, which (wallet_node.py:1299-1304)
+//     walks get_full_node_peers_in_order() and returns the FIRST non-None
+//     answer any peer gives.
+//   * It calls get_timestamp_for_height_from_peer with expected_header_hash
+//     left at its None default (signature :1230-1232).  In that UNANCHORED
+//     mode the only validation on a cache miss is len(response) == 1 and
+//     block.height == request_height (:1258-1266); the two header-hash checks
+//     (:1247-1251, :1282-1284) are dead code when expected_hash is None, and
+//     request_header_blocks (wallet_sync_utils.py:258-272) validates nothing.
+//     No signature, no proof of space, no VDF, no consensus check at all.
+//   * The value returned is block.foliage_transaction_block.timestamp
+//     (:1290-1291), and it is cached UNVALIDATED, per peer
+//     (peer_request_cache.py:39-45).
+//   * Chia HAS an anchored mode and uses it on the peak path (:1354-1356,
+//     which passes new_peak_hb.header_hash).  This RPC path does not.
+//
+// So the number below is ONE CONNECTED PEER'S ASSERTION about a header block.
+// A peer willing to lie can return any timestamp it likes, including one past
+// an offer's max_time while the real chain still permits a take, and there is
+// no upper bound to catch it: parse_timestamp_for_height_response rejects only
+// a non-unsigned value, and execution::expired_at_depth only tests >=, so
+// 2^64-1 is accepted.  The 32-block read depth does NOT help -- forging a
+// timestamp at height H-32 costs a liar exactly what forging one at H costs.
+//
+// WHAT DOES HELP is knowing WHOSE answer it is, which is why the census below
+// exists and why the retire pass refuses to act without it.
 
 /// Build the get_timestamp_for_height payload.
 [[nodiscard]] inline json make_get_timestamp_for_height_request(
@@ -284,6 +317,114 @@ inline constexpr int kCancelCoinsPerOfferCeiling = 2;
         return 0;
     }
     return response["timestamp"].get<std::uint64_t>();
+}
+
+// ---------------------------------------------------------------------------
+// get_connections -- WHOSE chain clock the retire would be acting on
+// ---------------------------------------------------------------------------
+//
+// [review #164 2026-09-21] get_timestamp_for_height answers from whichever
+// connected full node replies first, with no consensus validation (above).
+// The only thing that makes that answer worth an irreversible local cancel is
+// the identity of the peers that could have supplied it -- so the retire pass
+// asks the wallet for its peer list and refuses to act unless EVERY full-node
+// peer is on this host.
+//
+// Why "every" and not "the one that answered": the RPC does not report which
+// peer answered, and get_full_node_peers_in_order() shuffles within buckets,
+// so the only sound gate is over the whole candidate set.
+//
+// The route is the shared RPC server's get_connections
+// (chia/rpc/rpc_server.py:286-294 -> default_get_connections :124-141, which
+// the wallet reaches through WalletNode.get_connections, wallet_node.py:230).
+// Each row carries `type` (NodeType), `peer_host`, `peer_port`, `node_id`.
+// Verified read-only against the live 2.7.4 wallet on 2026-09-21: one
+// connection, type 1, peer_host "127.0.0.1", peer_port 8444.
+//
+// THIS GATE IS DELIBERATELY NARROWER THAN CHIA'S OWN TRUST RULE.  chia/util/
+// network.py:144-149 is_trusted_peer trusts a peer when is_localhost(host)
+// OR its node_id is in the wallet config's `trusted_peers` OR its host is in
+// a `trusted_cidrs` entry.  Only the first is checked here, because the other
+// two live in the wallet's config file rather than in any RPC answer, and a
+// safety gate that reads a second source of truth is the shape this repo keeps
+// getting bitten by.  The cost is fail-CLOSED: an operator who trusts a remote
+// node by node_id or CIDR gets no retires and keeps the hard TTL, which is a
+// documented precondition of `ttl_cancel_mode: expire`, not a defect.
+
+/// chia/server/outbound_message.py NodeType.FULL_NODE.
+inline constexpr int kNodeTypeFullNode = 1;
+
+/// chia/util/network.py is_localhost (2.7.4), reproduced exactly -- the set
+/// that makes is_trusted_peer answer True unconditionally.
+[[nodiscard]] inline bool is_localhost_peer_host(
+    const std::string& host) noexcept
+{
+    return host == "127.0.0.1" || host == "localhost" || host == "::1"
+        || host == "0:0:0:0:0:0:0:1";
+}
+
+/// What a get_connections answer says about the wallet's full-node peers.
+///
+/// @p readable is false for any response this parser cannot fully account
+/// for -- that is the fail-closed reading, and it is NOT the same as "no
+/// peers", which is why the two are separate fields rather than a count of 0.
+struct FullNodePeerCensus {
+    bool        readable{false};          ///< every row was understood
+    int         full_node_peers{0};       ///< rows with type == FULL_NODE
+    int         non_local_peers{0};       ///< of those, not on this host
+    std::string first_non_local_host{};   ///< for the operator-facing log line
+};
+
+/// Census the FULL_NODE connections in a get_connections response.
+///
+/// Fails closed in one direction only: an unparseable response, or one row
+/// whose `type` cannot be read, yields readable == false, and the caller then
+/// retires nothing.  A full-node row with no usable `peer_host` counts as
+/// NON-local, because "we could not tell where this peer is" is not evidence
+/// that it is here.
+[[nodiscard]] inline FullNodePeerCensus census_full_node_peers(
+    const json& response)
+{
+    FullNodePeerCensus census{};
+    if (!response.is_object() || !response.contains("connections")
+        || !response["connections"].is_array()) {
+        return census;   // readable stays false
+    }
+    for (const auto& row : response["connections"]) {
+        if (!row.is_object() || !row.contains("type")
+            || !row["type"].is_number_integer()) {
+            // One row we cannot classify poisons the whole census: it may be
+            // the full node we are about to trust a timestamp from.
+            return FullNodePeerCensus{};
+        }
+        if (row["type"].get<std::int64_t>() != kNodeTypeFullNode) {
+            continue;
+        }
+        ++census.full_node_peers;
+        const bool has_host = row.contains("peer_host")
+                           && row["peer_host"].is_string();
+        const std::string host =
+            has_host ? row["peer_host"].get<std::string>() : std::string{};
+        if (has_host && is_localhost_peer_host(host)) {
+            continue;
+        }
+        ++census.non_local_peers;
+        if (census.first_non_local_host.empty()) {
+            census.first_non_local_host = has_host ? host : "<no peer_host>";
+        }
+    }
+    census.readable = true;
+    return census;
+}
+
+/// Build the get_connections payload that asks for full-node peers only.
+///
+/// The census re-filters on `type` regardless, so a daemon that ignored this
+/// key could not widen the gate -- it could only add rows the census then
+/// skips.
+[[nodiscard]] inline json make_get_connections_request()
+{
+    return json{{"node_type", kNodeTypeFullNode}};
 }
 
 }  // namespace xop::rpc

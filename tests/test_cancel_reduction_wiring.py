@@ -12,8 +12,11 @@ What each scan guards:
 
   S70  ttl_cancel_mode: expire sends the one INSECURE cancel this engine sends
        on purpose.  It must stay behind the expiry verdict, read the chain
-       clock from the wallet, leave the offer_log row to the wallet verdict,
-       and must not leak into the stopped-engine sweep.
+       clock from the wallet -- between two censuses establishing that every
+       full-node peer that could have answered is on this host ([review #164]:
+       the timestamp is a peer's unvalidated assertion, not a local fact) --
+       leave the offer_log row to the wallet verdict, and must not leak into
+       the stopped-engine sweep.
   S71  the two exposure sites must share ONE verdict and the unified inputs.
   S72  the canceller must be handed Step 7's OWN centre and floor, and the
        anchor override must not survive into margin mode.
@@ -83,7 +86,7 @@ def test_the_local_cancel_sits_behind_the_expiry_verdict():
     assert "expired_at_depth(po.expiry_max_time, chain_time_s)" in retire
 
 
-def test_the_retire_reads_the_wallets_chain_clock_not_the_hosts():
+def test_the_retire_reads_a_chain_clock_not_the_host_clock():
     retire = _retire()
     height = retire.index("wallet_->get_height_info()")
     depth = retire.index("expired_retire_clock_height(synced_height)")
@@ -102,6 +105,43 @@ def test_the_retire_reads_the_wallets_chain_clock_not_the_hosts():
     assert "expiry_worth_checking(po.expiry_max_time" in retire
     assert "decide_expired_retire(pending_accept" in retire
     assert "trade_record_max_time(rec)" in retire
+
+
+def test_the_clock_is_sandwiched_between_two_trusted_peer_censuses():
+    """[review #164] The timestamp is one connected peer's unvalidated
+    assertion (chia 2.7.4 asks peers in order with expected_header_hash=None),
+    so the pass must establish WHOSE it could have been.  Twice: the peer set
+    can change while the clock is being read, and the RPC never says which
+    peer answered.  A census only BEFORE would be a gate anything could walk
+    through; a census only after would read a set the clock never came from.
+    """
+    retire = _retire()
+    assert retire.count("wallet_->get_full_node_peer_census()") == 2, (
+        "before the clock and again after it"
+    )
+    before = retire.index("wallet_->get_full_node_peer_census()")
+    clock = retire.index("wallet_->get_timestamp_for_height(clock_height)")
+    after = retire.index("wallet_->get_full_node_peer_census()", clock)
+    assert before < clock < after
+    # Both censuses must be judged, each on its OWN reading, and only Trusted
+    # may proceed.
+    assert retire.count("trust_of(") == 2
+    assert "trust_of(before)" in retire and "trust_of(after)" in retire, (
+        "judging the second census on the first reading is the gate with its "
+        "second half removed"
+    )
+    assert _squash(retire).count("!=ChainClockTrust::Trusted){") == 2, (
+        "each census is compared against Trusted, not merely logged"
+    )
+    # The height is read only once the FIRST census has passed: an untrusted
+    # peer set must cost no further RPC and reach no arithmetic.
+    assert before < retire.index("wallet_->get_height_info()")
+    # The clock the offers are judged on is assigned only in the else branch
+    # of the second check -- never straight from the RPC.
+    assert "chain_time_s = answered;" in retire
+    assert "chain_time_s=co_await" not in _squash(retire), (
+        "assigning the clock straight from the RPC skips the second census"
+    )
 
 
 def test_the_retire_is_off_unless_the_operator_chose_expire():

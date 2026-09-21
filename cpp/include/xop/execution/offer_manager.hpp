@@ -376,9 +376,13 @@ public:
      *
      * No-op unless strategy.ttl_cancel_mode is `expire`.  For each tracked,
      * not-cancel-pending offer whose verified max_time the host clock says
-     * has passed (a pre-filter only), it reads the wallet's chain clock ONCE
-     * (get_height_info -> get_timestamp_for_height), then for each such offer
-     * re-reads the trade record and applies execution::decide_expired_retire.
+     * has passed (a pre-filter only), it censuses the wallet's full-node
+     * peers, reads the chain clock ONCE (get_height_info ->
+     * get_timestamp_for_height) only if every one of them is on this host,
+     * censuses them again, and discards the clock unless that still holds
+     * (execution::chain_clock_trust -- the clock is a peer's unvalidated
+     * assertion, not a local fact).  Then, for each such offer, it re-reads
+     * the trade record and applies execution::decide_expired_retire.
      * Only RetireLocal sends cancel_offer(fee 0, secure=false) -- the single
      * place outside emergency_cancel's last resort that may, and the reason
      * it may is in execution/offer_expiry.hpp.  The offer is then marked
@@ -1332,7 +1336,8 @@ private:
     std::uint64_t fill_poll_heartbeat_{0};
 
     /// [S70] Block of retire_expired_offers' last WARN.  A wallet that cannot
-    /// supply the chain clock fails the same way every heartbeat while any
+    /// supply a TRUSTED chain clock -- no answer, or a full-node peer this
+    /// host does not run -- fails the same way every heartbeat while any
     /// offer waits past its expiry; the repeats go to debug
     /// (execution::expiry_warn_due), so the log says it once per ~30 min.
     BlockHeight expiry_warned_block_{0};

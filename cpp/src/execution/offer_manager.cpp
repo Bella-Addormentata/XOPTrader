@@ -253,9 +253,15 @@ OfferManager::retire_offer_failed_expiry(const PendingOffer& adopt,
 // [S70 2026-09-20] retire_expired_offers -- ttl_cancel_mode: expire
 //
 // The decisions are in offer_expiry.hpp; this supplies the wallet's answers.
-// Every read is of THIS heartbeat, and the order is fixed: the chain clock
-// (once), then per offer the trade record, then the verdict, then -- only on
+// Every read is of THIS heartbeat, and the order is fixed: WHO the wallet's
+// full-node peers are, then the chain clock (once), then who they are again,
+// then per offer the trade record, then the verdict, then -- only on
 // RetireLocal -- the one insecure cancel this function exists to send.
+//
+// [review #164 2026-09-21] The peer census is not decoration.  The clock is
+// one connected peer's unvalidated assertion, and acting on a false one frees
+// the maker coins of a STILL-TAKEABLE offer with no spend and no undo, with
+// the take then invisible to this wallet forever.
 // ---------------------------------------------------------------------------
 
 asio::awaitable<std::vector<std::string>>
@@ -283,12 +289,19 @@ OfferManager::retire_expired_offers(BlockHeight current_block)
         co_return retired;
     }
 
-    // The CHAIN clock, read kExpiredRetireDepthBlocks BELOW the height the
+    // The chain clock, read kExpiredRetireDepthBlocks BELOW the height the
     // wallet has FINISHED syncing to.  If the latest transaction block at
     // that depth was already stamped >= an offer's max_time, then no later
-    // block can carry a take of it, the wallet has processed every block
-    // that could, and the block that expired it is buried that deep -- a
-    // seconds margin proves none of the last (see offer_expiry.hpp).
+    // block can carry a take of it and the block that expired it is buried
+    // that deep -- a seconds margin proves neither (see offer_expiry.hpp).
+    //
+    // [review #164 2026-09-21] AND IT IS ONLY WORTH ANYTHING IF THE PEER THAT
+    // ANSWERED IT IS OURS.  get_timestamp_for_height takes the first answer
+    // from any connected full node, unanchored and unvalidated, so the wallet
+    // is asked WHO those peers are -- before the clock and again after it,
+    // because the set can change under the read -- and nothing is retired
+    // unless every one of them is on this host both times.  The depth does not
+    // help here: forging a timestamp 32 blocks back is exactly as cheap.
     const rpc::TransportCounters pass_start = wallet_->transport_counters();
     // This pass repeats every heartbeat while anything waits past its expiry,
     // and a wallet that cannot answer fails the same way each time: WARN once
@@ -298,29 +311,62 @@ OfferManager::retire_expired_offers(BlockHeight current_block)
         warn_now ? spdlog::level::warn : spdlog::level::debug;
     bool problem_logged = false;
 
+    const auto trust_of = [](const rpc::FullNodePeerCensus& c) {
+        return chain_clock_trust(c.readable, c.full_node_peers,
+                                 c.non_local_peers);
+    };
+    const auto trust_error = [](ChainClockTrust t,
+                                const rpc::FullNodePeerCensus& c) {
+        std::string why = chain_clock_trust_reason(t);
+        if (!c.first_non_local_host.empty()) {
+            why += " (" + c.first_non_local_host + ")";
+        }
+        return why;
+    };
+
     std::uint64_t chain_time_s = 0;
     std::string clock_error;
     try {
-        const std::int64_t synced_height = co_await wallet_->get_height_info();
-        const std::int64_t clock_height =
-            expired_retire_clock_height(synced_height);
-        if (clock_height > 0) {
-            chain_time_s =
-                co_await wallet_->get_timestamp_for_height(clock_height);
+        const rpc::FullNodePeerCensus before =
+            co_await wallet_->get_full_node_peer_census();
+        const ChainClockTrust trust_before = trust_of(before);
+        if (trust_before != ChainClockTrust::Trusted) {
+            clock_error = trust_error(trust_before, before);
         } else {
-            clock_error = "the wallet is fewer than "
-                + std::to_string(kExpiredRetireDepthBlocks)
-                + " blocks into the chain";
+            const std::int64_t synced_height =
+                co_await wallet_->get_height_info();
+            const std::int64_t clock_height =
+                expired_retire_clock_height(synced_height);
+            if (clock_height <= 0) {
+                clock_error = "the wallet is fewer than "
+                    + std::to_string(kExpiredRetireDepthBlocks)
+                    + " blocks into the chain";
+            } else {
+                const std::uint64_t answered =
+                    co_await wallet_->get_timestamp_for_height(clock_height);
+                // The peer set can change WHILE the clock is being read, and
+                // the RPC never says which peer answered.  Re-ask.
+                const rpc::FullNodePeerCensus after =
+                    co_await wallet_->get_full_node_peer_census();
+                const ChainClockTrust trust_after = trust_of(after);
+                if (trust_after != ChainClockTrust::Trusted) {
+                    clock_error = "the peer set changed while the clock was "
+                                  "being read: " + trust_error(trust_after,
+                                                               after);
+                } else {
+                    chain_time_s = answered;
+                }
+            }
         }
     } catch (const std::exception& e) {
         clock_error = e.what();
     }
     if (chain_time_s == 0) {
         logger_->log(problem_level,
-                     "[offer-expiry] no chain clock this heartbeat ({}) -- {} "
-                     "offer(s) past their expiry stay tracked; an expired "
-                     "offer cannot be taken, so nothing is at risk but its "
-                     "locked coins",
+                     "[offer-expiry] no trusted chain clock this heartbeat "
+                     "({}) -- {} offer(s) past their expiry stay tracked and "
+                     "keep their coins locked; retiring on an untrusted or "
+                     "missing clock is the one mistake this pass cannot undo",
                      clock_error.empty() ? "the wallet returned no timestamp"
                                          : clock_error.c_str(),
                      due.size());
@@ -2359,9 +2405,9 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
         // carries an on-chain expiry already has that backstop, enforced by
         // the chain for free, so it is not cancelled merely for its age; it
         // falls through to every price rule below, and
-        // retire_expired_offers frees its coins once the chain clock is
-        // past its max_time.  An offer with no verified expiry (0) keeps
-        // the hard TTL.
+        // retire_expired_offers frees its coins once a TRUSTED peer's chain
+        // clock is past its max_time.  An offer with no verified expiry (0)
+        // keeps the hard TTL.
         if (past_hard_ttl
             && age_limit_cancel_applies(expire_mode, po.expiry_max_time)) {
             tc.staleness       = TierStaleness::Expired;

@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <string>
 
 #include "xop/execution/offer_expiry.hpp"
 #include "xop/rpc/chia_rpc.hpp"
@@ -36,6 +37,9 @@ using xop::execution::expiry_echo_ok;
 using xop::execution::expiry_max_time_from;
 using xop::execution::expiry_outlasts_hard_ttl;
 using xop::execution::age_limit_cancel_applies;
+using xop::execution::chain_clock_trust;
+using xop::execution::chain_clock_trust_reason;
+using xop::execution::ChainClockTrust;
 using xop::execution::decide_expired_retire;
 using xop::execution::expired_at_depth;
 using xop::execution::expired_retire_clock_height;
@@ -331,6 +335,9 @@ TEST(OfferExpiry, TheFloorTracksTheConfiguredTtlRatherThanAFixedNumber) {
 //      locally -- CONFIRMED is a fill, and `filled` always wins.
 //   9. A record that does not repeat the tracked expiry is never retired
 //      locally: that would be the insecure cancel on an unverified timelock.
+//  10. [review #164] The clock must come from a peer this host runs.  It is
+//      not a local fact and nothing about its VALUE can be checked, so the
+//      only defence is a check on WHOSE it is.
 // ===========================================================================
 
 namespace {
@@ -567,4 +574,108 @@ TEST(OfferExpireMode, ARepeatedRetireWarningIsLoggedOncePerHalfHour) {
     // A height that went backwards (a reorg, a height-source switch) must
     // warn rather than wrap into a huge "age" -- or stay silent for good.
     EXPECT_TRUE(expiry_warn_due(9'319'000u, 9'318'990u));
+}
+
+// ===========================================================================
+// 10. [review #164 2026-09-21] WHOSE clock it is.
+//
+// Copilot's finding, verified against the chia 2.7.4 source: the timestamp is
+// not anchored to the wallet's processed chain.  WalletNode.get_timestamp_for_
+// height walks its full-node peers and returns the first non-None answer, with
+// expected_header_hash left at None, so on a cache miss the only validation is
+// "one block came back" and "its height matches" -- no signature, PoSpace, VDF
+// or consensus.  Acting falsely on it frees a still-takeable offer's coins
+// with no spend and no undo, and the take is then invisible forever.
+//
+// The tests below pin the two halves of the honest answer: the arithmetic has
+// NO defence of its own (so nobody deletes the gate believing one is in here),
+// and the gate is a statement about the peer SET.
+// ===========================================================================
+
+TEST(OfferExpireMode, TheClockArithmeticHasNoDefenceAgainstAForgedTimestamp) {
+    // A peer answering the largest uint64 expires every offer that will ever
+    // exist.  Nothing in this header objects -- expired_at_depth tests only
+    // `>=`, and there is deliberately no plausibility ceiling.
+    const auto forged_far = std::numeric_limits<std::uint64_t>::max();
+    EXPECT_TRUE(expired_at_depth(kMaxTime, forged_far));
+    EXPECT_EQ(decide_expired_retire(true, kMaxTime, kMaxTime, forged_far),
+              ExpiredRetire::RetireLocal);
+
+    // And the crude lie is not the one to design against.  A patient peer
+    // answers max_time EXACTLY -- a second's worth of lie, which no ceiling
+    // and no "is this plausible" test could ever separate from the truth --
+    // and gets the same irreversible cancel.
+    EXPECT_EQ(decide_expired_retire(true, kMaxTime, kMaxTime, kMaxTime),
+              ExpiredRetire::RetireLocal);
+
+    // Nor would a monotonicity rule help: read an honest clock first, then a
+    // forged one, and the sequence is still strictly increasing, so a "the
+    // chain clock must never go backwards" gate passes both readings.
+    const std::uint64_t honest_earlier = kMaxTime - 600;
+    EXPECT_FALSE(expired_at_depth(kMaxTime, honest_earlier));
+    EXPECT_GT(forged_far, honest_earlier);
+    EXPECT_GT(kMaxTime, honest_earlier);
+
+    // Which is the whole argument for gating on WHO answered.
+}
+
+TEST(OfferExpireMode, TheClockIsTrustedOnlyWhenEveryFullNodePeerIsOnThisHost) {
+    EXPECT_EQ(chain_clock_trust(true, 1, 0), ChainClockTrust::Trusted);
+    EXPECT_EQ(chain_clock_trust(true, 4, 0), ChainClockTrust::Trusted);
+    // ONE stranger among four is enough.  The RPC never reports which peer
+    // answered and get_full_node_peers_in_order() shuffles within its
+    // buckets, so the candidate set is the only thing that can be gated.
+    EXPECT_EQ(chain_clock_trust(true, 4, 1), ChainClockTrust::UntrustedPeer);
+    EXPECT_EQ(chain_clock_trust(true, 3, 3), ChainClockTrust::UntrustedPeer);
+    // "Nothing could have answered" and "we could not read the answer" are
+    // different operator problems from "a stranger could have"; all three
+    // refuse, and each says which it was.
+    EXPECT_EQ(chain_clock_trust(true, 0, 0), ChainClockTrust::NoFullNodePeer);
+    EXPECT_EQ(chain_clock_trust(false, 1, 0), ChainClockTrust::Unreadable);
+    EXPECT_EQ(chain_clock_trust(false, 0, 0), ChainClockTrust::Unreadable);
+    // An unreadable census outranks whatever it might have contained: those
+    // counts were never established.
+    EXPECT_EQ(chain_clock_trust(false, 9, 0), ChainClockTrust::Unreadable);
+    EXPECT_EQ(chain_clock_trust(false, 9, 9), ChainClockTrust::Unreadable);
+}
+
+TEST(OfferExpireMode, TheTwoStatesThisOperatorHasBeenInBothRefuseTheClock) {
+    // (a) THE LOCAL NODE IS DOWN.  wallet_node.py:838-841 on_disconnect clears
+    //     local_node_synced and re-runs initialize_wallet_peers; discovery
+    //     connects to strangers and the wallet untrusted-syncs to them
+    //     (:1481-1499).  The node RPC was unreachable for hours on
+    //     2026-09-14 -- this is not a hypothetical.
+    EXPECT_EQ(chain_clock_trust(true, 3, 3), ChainClockTrust::UntrustedPeer);
+    // (b) THE TRANSIENT AFTER IT RETURNS.  The localhost peer is connected
+    //     again but sits in the `trusted` bucket (3rd) until its long_sync
+    //     finishes, while already-synced strangers sit in `synced` (2nd) --
+    //     so a stranger is asked FIRST for the whole window (:1203-1228).
+    EXPECT_EQ(chain_clock_trust(true, 4, 3), ChainClockTrust::UntrustedPeer);
+    // Neither is closed by the engine's wallet sync gate (get_sync_status):
+    // a wallet synced to strangers reports synced = true.  Only the steady
+    // state retires anything.
+    EXPECT_EQ(chain_clock_trust(true, 1, 0), ChainClockTrust::Trusted);
+}
+
+TEST(OfferExpireMode, EachRefusalNamesItselfToTheOperator) {
+    const std::string unreadable =
+        chain_clock_trust_reason(ChainClockTrust::Unreadable);
+    const std::string no_peer =
+        chain_clock_trust_reason(ChainClockTrust::NoFullNodePeer);
+    const std::string stranger =
+        chain_clock_trust_reason(ChainClockTrust::UntrustedPeer);
+    const std::string trusted =
+        chain_clock_trust_reason(ChainClockTrust::Trusted);
+    for (const std::string* s : {&unreadable, &no_peer, &stranger, &trusted}) {
+        EXPECT_FALSE(s->empty());
+    }
+    // A dead node, a wallet that would not say, and a wallet talking to
+    // strangers are three different things to go and fix.
+    EXPECT_NE(unreadable, no_peer);
+    EXPECT_NE(no_peer, stranger);
+    EXPECT_NE(unreadable, stranger);
+    // The one that matters most must say why the answer is worthless, not
+    // merely that a peer is foreign.
+    EXPECT_NE(stranger.find("this host does not run"), std::string::npos);
+    EXPECT_NE(stranger.find("whatever a peer says"), std::string::npos);
 }

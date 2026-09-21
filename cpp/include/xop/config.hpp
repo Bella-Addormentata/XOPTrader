@@ -73,9 +73,11 @@ inline const char* to_string(ChiaMode m) noexcept {
 ///           OfferManager::kHardTtlMultiplier), a fee-bearing spend.
 ///   Expire: an offer that VERIFIABLY carries an on-chain expiry
 ///           (offer_expiry_secs) is left to the chain, then retired with a
-///           free local cancel once the chain clock is safely past its
-///           max_time (execution/offer_expiry.hpp).  An offer with no
-///           verified expiry keeps the hard TTL.
+///           free local cancel once a chain clock supplied by a full node on
+///           THIS host is safely past its max_time
+///           (execution/offer_expiry.hpp).  An offer with no verified expiry
+///           keeps the hard TTL, and so does every offer while the wallet has
+///           any full-node peer this host does not run.
 enum class TtlCancelMode : std::uint8_t { Cancel = 0, Expire = 1 };
 
 /// strategy.exposure_rule -- how Step 8 projects reserve exposure.

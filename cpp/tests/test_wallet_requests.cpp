@@ -26,8 +26,10 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -42,6 +44,10 @@ using xop::rpc::kCancelFeeSpendCostCeiling;
 using xop::rpc::kCancelOffersSingleBatchSize;
 using xop::rpc::kMempoolMaxTxClvmCost;
 using xop::rpc::make_cancel_offers_request;
+using xop::rpc::census_full_node_peers;
+using xop::rpc::is_localhost_peer_host;
+using xop::rpc::kNodeTypeFullNode;
+using xop::rpc::make_get_connections_request;
 using xop::rpc::make_get_timestamp_for_height_request;
 using xop::rpc::make_get_transactions_request;
 using xop::rpc::parse_timestamp_for_height_response;
@@ -396,4 +402,185 @@ TEST(WalletRequests, TimestampForHeightFailsClosedOnAnythingElse) {
     // the header peak, not the height the wallet has finished syncing to.
     EXPECT_EQ(parse_timestamp_for_height_response(json::parse(
                   R"({"latest_timestamp": 1789916920})")), 0u);
+}
+
+// ---------------------------------------------------------------------------
+// [review #164 2026-09-21] get_connections -- WHOSE timestamp it was.
+//
+// The timestamp above is one connected peer's unvalidated assertion, so the
+// retire pass gates on the peer SET.  This parser is the only thing standing
+// between that gate and a response it did not understand, so every way of not
+// understanding one is pinned here, and each must read as "do not act".
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// A get_connections row in the live 2.7.4 shape (captured read-only from the
+/// running wallet on 2026-09-21; ids shortened).
+json connection_row(int type, const json& peer_host) {
+    return json{
+        {"bytes_read",       350754209},
+        {"bytes_written",    9855265},
+        {"creation_time",    1789574414.6896603},
+        {"last_message_time", 1790002944.2846308},
+        {"local_port",       0},
+        {"node_id",          "0xec9efefa2d8566141bf6eb47cdc6bed05fcb700f"},
+        {"peer_host",        peer_host},
+        {"peer_port",        8444},
+        {"peer_server_port", 8444},
+        {"type",             type}
+    };
+}
+
+json connections(std::initializer_list<json> rows) {
+    json arr = json::array();
+    for (const auto& row : rows) {
+        arr.push_back(row);
+    }
+    return json{{"success", true}, {"connections", std::move(arr)}};
+}
+
+/// A localhost full-node row with one field replaced, for the fail-closed
+/// cases below.
+json row_with(const char* key, const json& value) {
+    json row = connection_row(kNodeTypeFullNode, "127.0.0.1");
+    row[key] = value;
+    return row;
+}
+
+}  // namespace
+
+TEST(WalletRequests, ConnectionsRequestAsksForFullNodesOnly) {
+    const json p = make_get_connections_request();
+    ASSERT_TRUE(p.is_object());
+    EXPECT_EQ(p.size(), 1u);
+    ASSERT_TRUE(p.contains("node_type"));
+    // chia/server/outbound_message.py NodeType.FULL_NODE.
+    EXPECT_EQ(p["node_type"].get<int>(), 1);
+    EXPECT_EQ(kNodeTypeFullNode, 1);
+}
+
+TEST(WalletRequests, TheLocalhostSetIsChiasOwn) {
+    // chia/util/network.py:140-141, verbatim -- the set for which
+    // is_trusted_peer returns True with no further test.
+    EXPECT_TRUE(is_localhost_peer_host("127.0.0.1"));
+    EXPECT_TRUE(is_localhost_peer_host("localhost"));
+    EXPECT_TRUE(is_localhost_peer_host("::1"));
+    EXPECT_TRUE(is_localhost_peer_host("0:0:0:0:0:0:0:1"));
+    // Everything else, including things that merely look local.  A prefix
+    // test would admit the whole 127/8 range plus any host whose name starts
+    // with "localhost"; chia's rule is exact membership and so is this.
+    EXPECT_FALSE(is_localhost_peer_host("127.0.0.2"));
+    EXPECT_FALSE(is_localhost_peer_host("127.0.0.1:8444"));
+    EXPECT_FALSE(is_localhost_peer_host("localhost.attacker.example"));
+    EXPECT_FALSE(is_localhost_peer_host("192.168.1.10"));
+    EXPECT_FALSE(is_localhost_peer_host("::2"));
+    EXPECT_FALSE(is_localhost_peer_host(""));
+}
+
+TEST(WalletRequests, CensusReadsTheLiveOnePeerResponse) {
+    // Parsed from TEXT, as rpc_post parses the wire.  This is the live
+    // wallet's answer on 2026-09-21: exactly one full node, on this host.
+    const json live = json::parse(R"({
+        "connections": [{
+            "bytes_read": 350754209, "bytes_written": 9855265,
+            "creation_time": 1789574414.6896603,
+            "last_message_time": 1790002944.2846308, "local_port": 0,
+            "node_id": "0xec9efefa2d8566141bf6eb47cdc6bed05fcb700f",
+            "peer_host": "127.0.0.1", "peer_port": 8444,
+            "peer_server_port": 8444, "type": 1
+        }],
+        "success": true
+    })");
+    const auto c = census_full_node_peers(live);
+    EXPECT_TRUE(c.readable);
+    EXPECT_EQ(c.full_node_peers, 1);
+    EXPECT_EQ(c.non_local_peers, 0);
+    EXPECT_TRUE(c.first_non_local_host.empty());
+}
+
+TEST(WalletRequests, CensusCountsEveryNonLocalFullNodeAndNamesTheFirst) {
+    const auto c = census_full_node_peers(connections({
+        connection_row(kNodeTypeFullNode, "127.0.0.1"),
+        connection_row(kNodeTypeFullNode, "203.0.113.7"),
+        connection_row(kNodeTypeFullNode, "198.51.100.9")
+    }));
+    EXPECT_TRUE(c.readable);
+    EXPECT_EQ(c.full_node_peers, 3);
+    EXPECT_EQ(c.non_local_peers, 2);
+    // The operator has to be able to see WHICH stranger, not just that there
+    // was one.
+    EXPECT_EQ(c.first_non_local_host, "203.0.113.7");
+}
+
+TEST(WalletRequests, CensusIgnoresConnectionsThatAreNotFullNodes) {
+    // NodeType 2 is HARVESTER, 3 FARMER, 6 WALLET.  None of them can answer
+    // get_timestamp_for_height, so none of them may fail the gate either --
+    // otherwise a daemon that ignored node_type would wedge the retire.
+    const auto c = census_full_node_peers(connections({
+        connection_row(6, "10.0.0.5"),
+        connection_row(3, "10.0.0.6"),
+        connection_row(kNodeTypeFullNode, "127.0.0.1")
+    }));
+    EXPECT_TRUE(c.readable);
+    EXPECT_EQ(c.full_node_peers, 1);
+    EXPECT_EQ(c.non_local_peers, 0);
+}
+
+TEST(WalletRequests, CensusReadsAnEmptyPeerListAsReadableAndEmpty) {
+    // Readable, but with nothing that could have answered: a DIFFERENT state
+    // from "we could not tell", and the caller distinguishes them.
+    const auto c = census_full_node_peers(connections({}));
+    EXPECT_TRUE(c.readable);
+    EXPECT_EQ(c.full_node_peers, 0);
+    EXPECT_EQ(c.non_local_peers, 0);
+}
+
+TEST(WalletRequests, CensusFailsClosedOnAnythingItCannotAccountFor) {
+    for (const json& bad : {json::object(),
+                            json{{"success", true}},
+                            json{{"connections", nullptr}},
+                            json{{"connections", "127.0.0.1"}},
+                            json{{"connections", json::object()}},
+                            json::array(),
+                            json(nullptr)}) {
+        const auto c = census_full_node_peers(bad);
+        EXPECT_FALSE(c.readable) << bad.dump();
+        EXPECT_EQ(c.full_node_peers, 0) << bad.dump();
+    }
+}
+
+TEST(WalletRequests, OneUnclassifiableRowPoisonsTheWholeCensus) {
+    // The row we cannot type may BE the full node about to answer the clock,
+    // so a census that quietly skipped it would report "all local" on a peer
+    // set it never read.  Each of these leaves readable == false even though
+    // a genuine localhost full node is sitting right beside it.
+    for (const json& bad_row : {json("not an object"),
+                                json::object(),
+                                row_with("type", json(nullptr)),
+                                row_with("type", json("1")),
+                                row_with("type", json(1.0))}) {
+        const auto c = census_full_node_peers(connections({
+            connection_row(kNodeTypeFullNode, "127.0.0.1"), bad_row}));
+        EXPECT_FALSE(c.readable) << bad_row.dump();
+        EXPECT_EQ(c.full_node_peers, 0) << bad_row.dump();
+    }
+}
+
+TEST(WalletRequests, AFullNodeWithNoUsableHostCountsAsAStranger) {
+    // "We could not tell where this peer is" is not evidence that it is here.
+    for (const json& host : {json(nullptr), json(12345), json::object()}) {
+        const auto c = census_full_node_peers(connections({
+            connection_row(kNodeTypeFullNode, host)}));
+        EXPECT_TRUE(c.readable) << host.dump();
+        EXPECT_EQ(c.full_node_peers, 1) << host.dump();
+        EXPECT_EQ(c.non_local_peers, 1) << host.dump();
+        EXPECT_EQ(c.first_non_local_host, "<no peer_host>") << host.dump();
+    }
+    // A row missing the key entirely reads the same way.
+    json row = connection_row(kNodeTypeFullNode, "127.0.0.1");
+    row.erase("peer_host");
+    const auto c = census_full_node_peers(connections({row}));
+    EXPECT_TRUE(c.readable);
+    EXPECT_EQ(c.non_local_peers, 1);
 }
