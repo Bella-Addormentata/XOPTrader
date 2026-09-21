@@ -15,9 +15,13 @@ offer that Dexie refused with HTTP 400 "Too many input coins". The offer still
 existed in the wallet and locked its coins, listed nowhere. `engine.log` holds
 13 such refusals between 2026-09-10 and 2026-09-19.
 
-- **A floor on the coins an offer is funded from.** Every `create_offer_for_ids`
-  request for a CAT-funded offer now carries `min_coin_amount` =
-  ceil(mojos the offer spends x `strategy.offer_min_input_coin_frac`). The new
+- **A floor on the coins an offer is funded from.** The **first**
+  `create_offer_for_ids` attempt for a CAT-funded offer now carries
+  `min_coin_amount` =
+  ceil(mojos the offer spends x `strategy.offer_min_input_coin_frac`) — **the
+  first attempt only: the no-floor fallback below sends a second, distinct
+  create with the key omitted**, and an offer built by that retry is as
+  exposed to reward dust as it was before this change. The new
   key defaults to 0.01, accepts [0, 1), is read at startup, and 0 disables it,
   restoring the previous request byte for byte — **the request only**, see the
   operator note below. With every input at least 1% of
@@ -30,20 +34,33 @@ existed in the wallet and locked its coins, listed nowhere. `engine.log` holds
   chia 2.7.4 the coin-selection keys are read from the top level of the request
   and one config governs every selection it makes, including the XCH fee coin
   of a CAT-funded offer. The floor is CAT-scaled (804 mojos for the offer
-  above), but it changes which XCH coin pays the fee once it exceeds the fee:
-  an offer above fee / fraction CAT mojos, which is 1,000,000 CAT units at a
-  10,000,000-mojo fee and 500 at the `fees.min_fee_mojos: 5000` of
-  `config.example.yaml`. **On the live deployment this is currently
-  unreachable:** `config.yaml` has run `fees.min_fee_mojos: 15000000` since
-  2026-09-19 (full blocks), which moves the threshold to 1,500,000 CAT units,
-  four orders of magnitude above any tier the bot posts. It comes back at 500
-  the moment that fee floor is lowered again, which the live config's own
-  comment says it should be. The wallet then
-  skips a small XCH coin and locks a larger one, so `CoinLockLedger::try_lock`
+  above), and it changes which XCH coin pays the fee **exactly when the XCH
+  wallet holds a coin below the floor** — chia filters the candidate set
+  before it chooses a selection branch, so excluding one coin can flip the
+  branch whatever that coin's size relative to the fee. The fee decides only
+  whether the exclusion changes the answer. (An earlier revision of this entry
+  said the effect "needs floor > fee" and derived thresholds of 500 and
+  1,500,000 CAT units from `fees.min_fee_mojos`. That was wrong in both
+  directions and is withdrawn: a floor under the fee can still change the
+  selection, and a floor no coin falls under changes nothing however large.)
+  When the wallet does skip a small XCH coin it locks a larger one, so
+  `CoinLockLedger::try_lock`
   and `try_lock_floor_only` take the same floor, in the preflight probe and in
   all three posting paths. Without it the ledger charged the coin the wallet
   skipped and later creates could pass the cycle cap or the reserve floor on
   XCH that was already locked.
+- **On the live deployment this is inert today — because of the coin set, not
+  the fee.** Measured read-only on 2026-09-21 (`chia rpc wallet
+  get_spendable_coins` and `get_coin_records`, wallet id 1), the operator's XCH
+  wallet held 54 unspent coins, the smallest **13,494,209,440 mojos**, of which
+  30 were spendable, the smallest **20,757,615,448 mojos**. The largest floor
+  the bot can emit is bounded by the CAT balance one offer could spend
+  (1,844,501 DBX mojos that day, so 18,446 at the shipped 0.01 and 1,844,501
+  even at a fraction near 1) — more than five orders of magnitude below the
+  smallest XCH coin, so nothing is filtered out and no selection changes. This
+  is a property of **today's coin set, which moves**: the smallest spendable
+  coin fell by 30,000,000 mojos in fee spends between 2026-09-20 and
+  2026-09-21. `fees.min_fee_mojos` does not govern it in either direction.
 - **The fraction is applied in parts per billion, rounded up.** Rounded to
   nearest, the applied fraction could fall below the configured one and the
   input bound failed for ordinary values: at 1/3, three floor-sized coins of a
@@ -66,8 +83,14 @@ the first has a lever:
 
 1. **The floor is ON.** `strategy.offer_min_input_coin_frac` is absent from the
    live `config.yaml`, so it takes its 0.01 default and every CAT-funded
-   `create_offer_for_ids` starts carrying `min_coin_amount` from the first
-   restart. Setting the key to `0` turns that off.
+   `create_offer_for_ids` starts carrying `min_coin_amount` **on its first
+   attempt** from the first restart. It is not carried by the no-floor
+   fallback, which re-sends the create with the key omitted after a min-coin
+   refusal (Fallback bullet above): that request is byte-identical to the
+   pre-upgrade one, so the offer it builds has the pre-upgrade exposure to
+   reward dust — including the exposure that produced the 62,228-character
+   offer Dexie refused on 2026-09-19. Setting the key to `0` turns the floor
+   off altogether.
 2. **A create that fails is no longer re-sent** (the section below). This is
    unconditional: `retry_policy_for_endpoint` keys off the endpoint name, not
    off the fraction, so `offer_min_input_coin_frac: 0` does **not** restore the

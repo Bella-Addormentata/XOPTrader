@@ -385,14 +385,15 @@ strategy:
   # <CAT>/...).  XCH-funded offers are untouched: their coins are managed by
   # the coin pool.  The wallet applies the one value to the XCH fee coin of
   # the same request as well.  It is CAT-scaled, so it is small (1% of an
-  # 80 DBX offer is 804 mojos, under a billionth of an XCH), but once it
-  # exceeds the fee -- an offer above fee / fraction CAT mojos, i.e. 500 CAT
-  # units at THIS FILE'S fees.min_fee_mojos of 5000 below -- it can make the
-  # wallet skip a small XCH coin and lock a larger one.  The XCH lock ledger
-  # models the same floor, so the reserve and the cycle cap still see what is
-  # really locked.  Raise min_fee_mojos and that threshold rises with it: at
-  # 15000000 (what the live deployment ran from 2026-09-19, for full blocks)
-  # it is 1,500,000 CAT units and nothing this bot posts comes near it.
+  # 80 DBX offer is 804 mojos, under a billionth of an XCH).  Small is not
+  # the same as inert: it changes which XCH coin pays the fee whenever the
+  # XCH wallet holds a coin BELOW the floor, because chia filters the
+  # candidate set before it picks a selection branch.  It does NOT depend on
+  # the floor exceeding the fee -- a floor under the fee can still flip the
+  # branch, and a floor no coin falls under changes nothing however large it
+  # is.  fees.min_fee_mojos is therefore not the lever here; the sizes of the
+  # coins in the XCH wallet are.  The XCH lock ledger models the same floor,
+  # so the reserve and the cycle cap still see what is really locked.
   # The fraction is applied in parts per billion, rounded up.
   #
   # If the coins at or above the floor cannot cover the amount, the wallet

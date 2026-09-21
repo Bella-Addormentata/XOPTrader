@@ -586,7 +586,11 @@ TEST(CoinLockLedgerMinCoinTest, TheCapIsChargedTheFilteredCoinOnTheSpendPath) {
 }
 
 TEST(CoinLockLedgerMinCoinTest, TheKnapsackUsesOnlyCoinsTheWalletCanSee) {
-    // Need 10M, floor 5.5M.  The sub-need coins the wallet can see are {6M}:
+    // Need 10M, floor 5.5M -- a floor UNDER the need, which is why this test
+    // is also the counter-example to "the effect needs floor > fee" [review
+    // #162, round 3]: chia filters before it picks a branch, so excluding a
+    // sub-fee coin flips the branch by itself.
+    // The sub-need coins the wallet can see are {6M}:
     // not enough to knapsack, so it takes the smallest covering coin.  The
     // two 5M coins are below the floor and must not complete the sum.
     const std::vector<Mojo> coins = {5 * kM, 5 * kM, 6 * kM, kXch};

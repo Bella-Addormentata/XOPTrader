@@ -37,36 +37,69 @@
 // 1,000,000-unit CAT offer puts the fee-coin floor at 0.00001 XCH.
 // test_offer_min_input_coin pins those magnitudes.
 //
-// SMALL IS NOT THE SAME AS INERT [review #162].  The floor changes which XCH
-// coin pays the fee as soon as it exceeds a coin the wallet would otherwise
-// have picked, and that needs only floor > fee: offered CAT mojos > fee /
-// fraction.  At the default fraction that is 100 x the fee -- 1,000,000 CAT
-// units at the 10,000,000-mojo offer_fee_mojos, and 500 CAT units at the
-// 5,000-mojo fees.min_fee_mojos OF config.example.yaml, which a merged
-// XCH/DBX bid of about 6 XCH reaches.  With an XCH coin sized in
-// [fee, floor) in the wallet, the default selection would take that small
-// coin while the filtered one skips it and locks the next larger one --
-// typically a whole pool coin.  The XCH lock ledger therefore takes the
-// same floor (CoinLockLedger::try_lock / try_lock_floor_only,
-// ledger_min_coin_mojos below), so what it charges is what the wallet locks.
+// SMALL IS NOT THE SAME AS INERT [review #162].  When the floor excludes the
+// XCH coin the default selection would have taken, the wallet skips it and
+// locks the next larger one -- typically a whole pool coin.  The XCH lock
+// ledger therefore takes the same floor (CoinLockLedger::try_lock /
+// try_lock_floor_only, ledger_min_coin_mojos below), so what it charges is
+// what the wallet locks.
 //
-// WHAT THE LIVE DEPLOYMENT MAKES OF THAT, AS OF 2026-09-20.  The example
-// config is not the live one.  C:/GitHub/XOPTrader/config.yaml sets
-// fees.min_fee_mojos: 15000000 (operator-approved 2026-09-19, because
-// ~97%-full blocks were leaving 5,000-mojo spends unconfirmed), so
-// floor > fee needs offered CAT mojos > 15,000,000 / 0.01 = 1.5e9, i.e.
-// 1,500,000 DBX units -- four orders of magnitude above any tier this bot
-// posts.  The fee-coin interaction and the ledger floor are therefore
-// UNREACHABLE on the live deployment until that fee floor comes down again,
-// which its own comment there anticipates ("Lower this again once blocks
-// are no longer full"); at 5,000 the 500-unit threshold above is reinstated.
-// Separately, the ledger's coin pool comes from CoinManager, which ignores
-// XCH coins below 1,000,000 mojos, so a floor under that selects exactly the
-// coins the ledger already saw -- another way of saying the ledger half of
-// this is inert below an offered 100,000,000 CAT mojos whatever the fee is
-// (test_offer_min_input_coin, ACatScaledFloorIsTinyInXchTerms).  The floor
-// is modelled anyway: it is cheap, and the fee level is an operator knob
-// that has already moved twice this month.
+// WHEN THAT HAPPENS [review #162, round 3 -- CORRECTING THIS COMMENT].
+// Earlier revisions said the effect "needs only floor > fee" and derived
+// thresholds from fee / fraction.  That condition is neither necessary nor
+// sufficient, and the true one is simpler:
+//
+//   The floor changes fee-coin selection exactly when the XCH wallet holds a
+//   coin BELOW the floor.  The fee decides only whether excluding that coin
+//   changes the answer -- never whether the exclusion happens.
+//
+// Why: chia filters the candidate set BEFORE it chooses a branch.
+// select_coins builds valid_spendable_coins from
+// coin_selection_config.filter_coins(...) as its first act
+// (chia/wallet/coin_selection.py 2.7.4), and CoinSelectionConfig::filter_coins
+// keeps a coin only when min_coin_amount <= coin.amount <= max_coin_amount
+// (chia/wallet/util/tx_config.py).  Everything after that reads the filtered
+// set: the exact-match probe, the smaller_coin_sum accumulation, the
+// == / < / > branch choice, knapsack_coin_algorithm's input set,
+// sum_largest_coins and select_smallest_coin_over_target.  Removing one coin
+// can therefore flip the BRANCH, whatever that coin's size relative to the
+// fee.
+//
+// NOT NECESSARY: cpp/tests/test_coin_lock_ledger.cpp,
+// TheKnapsackUsesOnlyCoinsTheWalletCanSee, runs coins {5M, 5M, 6M, 1 XCH}
+// against a 10M fee under a 5.5M floor -- a floor UNDER the fee.  Unfiltered,
+// smaller_coins = {6M, 5M, 5M} sums to 16M > 10M and the knapsack finds the
+// exact {5M, 5M}; filtered, smaller_coins = {6M} sums to 6M < 10M, so the
+// wallet takes the smallest coin over the target: a whole 1 XCH.
+// NOT SUFFICIENT: a floor of 100M over a pool whose every coin is at least
+// 100M changes nothing, which AFloorNoCoinFallsUnderChangesNothing pins.
+//
+// WHAT THE LIVE DEPLOYMENT MAKES OF THAT, AS OF 2026-09-21.  The interaction
+// is inert there -- because of the COIN SET, not because of the fee.
+// Measured read-only on 2026-09-21 (chia rpc wallet get_spendable_coins and
+// get_coin_records, wallet_id 1): the XCH wallet held 54 unspent coins, the
+// smallest 13,494,209,440 mojos, and of the 30 spendable ones the smallest
+// was 20,757,615,448 mojos.  The largest floor this bot can emit is bounded
+// by the CAT balance one offer could spend -- that day 1,844,501 DBX mojos,
+// so 18,446 at the shipped 0.01 and 1,844,501 even at a fraction near 1.
+// Both are more than five orders of magnitude under the smallest XCH coin,
+// so nothing is filtered out and no selection changes.
+//
+// STATE, NOT POLICY.  That is a property of today's coin set and it moves:
+// the smallest spendable coin fell by exactly 30,000,000 mojos (fee spends)
+// between 2026-09-20 and 2026-09-21, and any spend leaving small change can
+// put a coin under a floor.  fees.min_fee_mojos does NOT govern it --
+// lowering the live 15,000,000 back to 5,000 would not by itself make the
+// interaction reachable, and raising it would not prevent it.  The floor is
+// modelled in the ledger for exactly that reason: a coin set is not a knob
+// anyone sets, and the modelling costs one parameter.
+//
+// THE LEDGER SEES THE SAME COINS THE WALLET DOES.  Its pool is seeded
+// directly from wallet_->get_spendable_coins(1) in
+// OfferManager::begin_xch_lock_cycle() (cpp/src/execution/offer_manager.cpp),
+// NOT from CoinManager's pool, so CoinManager's 1,000,000-mojo dust
+// threshold does not bound it and sub-1,000,000-mojo XCH coins are visible
+// to the ledger and to the wallet alike.
 //
 // THE RULE
 // --------

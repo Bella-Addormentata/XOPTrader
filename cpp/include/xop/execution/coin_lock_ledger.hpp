@@ -42,20 +42,34 @@
 // fee 10,000,000, coins {20,000,000, 1.5 XCH}, floor 100,000,000 -- the
 // ledger took the 20M coin while the wallet locked the 1.5 XCH one, and later
 // creates passed the cap and the reserve floor on XCH that was already
-// locked.  It needs only floor > fee, i.e. offered CAT mojos > fee /
-// strategy.offer_min_input_coin_frac: 500 CAT units at the 5,000-mojo
-// fees.min_fee_mojos OF config.example.yaml.  try_lock and
-// try_lock_floor_only therefore take the floor and select among coins at or
-// above it.
+// locked.  try_lock and try_lock_floor_only therefore take the floor and
+// select among coins at or above it.
 //
-// NOT REACHABLE ON THE LIVE DEPLOYMENT TODAY.  The live config.yaml sets
-// fees.min_fee_mojos: 15000000 (2026-09-19, full blocks), which puts the
-// threshold at 1,500,000 DBX units instead of 500 -- far beyond any tier
-// this bot posts.  The modelling below is therefore dormant until that fee
-// floor is lowered again, as the live config's own comment says it will be.
-// Independently of the fee, this ledger's pool comes from CoinManager, which
-// already drops XCH coins below 1,000,000 mojos, so a floor under that
-// selects the very coins it selected before.
+// [review #162, round 3] IT DOES NOT NEED floor > fee.  An earlier version
+// of this comment said it did, and derived a 500-CAT-unit threshold from
+// fee / strategy.offer_min_input_coin_frac.  Both are wrong.  chia filters
+// the candidate set BEFORE it chooses a branch -- select_coins builds
+// valid_spendable_coins from coin_selection_config.filter_coins(...) as its
+// first act -- so dropping any coin can flip the exact-match probe, the
+// smaller_coin_sum comparison, the knapsack's input set or the
+// smallest-coin-over-target fallback, whatever that coin's size relative to
+// the fee.  TheKnapsackUsesOnlyCoinsTheWalletCanSee below is exactly that
+// case: a 5.5M floor UNDER a 10M fee turns a {5M, 5M} knapsack into a whole
+// 1-XCH coin.  The true condition is that the wallet holds a coin below the
+// floor; the fee decides only whether excluding it changes the answer.
+//
+// INERT ON THE LIVE DEPLOYMENT TODAY -- BECAUSE OF THE COIN SET, NOT THE
+// FEE.  Measured read-only 2026-09-21 (chia rpc wallet get_spendable_coins
+// and get_coin_records, wallet_id 1): 54 unspent XCH coins, the smallest
+// 13,494,209,440 mojos; 30 spendable, the smallest 20,757,615,448.  Every
+// floor this bot can emit is more than five orders of magnitude below that,
+// so no coin is filtered out and the modelling changes no admission.  That
+// is a fact about today's coins rather than about fees.min_fee_mojos, and
+// one spend leaving small change undoes it.  This ledger's pool is seeded
+// from wallet_->get_spendable_coins(1) in
+// OfferManager::begin_xch_lock_cycle(), NOT from CoinManager, so
+// CoinManager's 1,000,000-mojo dust threshold does not bound what it sees
+// either.
 //
 // When those coins cannot cover the need the wallet REFUSES, and
 // OfferManager re-sends the create once without the floor, so the ledger

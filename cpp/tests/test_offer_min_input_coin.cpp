@@ -439,16 +439,20 @@ TEST(OfferMinInputCoin, ACatScaledFloorIsTinyInXchTerms) {
     // chia 2.7.4 applies ONE min_coin_amount to every selection in the
     // request, so for a CAT-funded offer the floor also filters the XCH fee
     // coin -- read as XCH mojos.  A CAT has 10^3 mojos per unit and XCH has
-    // 10^12, which keeps it small.  Small is not inert: above the fee it
-    // changes which coin pays, and test_coin_lock_ledger pins that the ledger
-    // models it.
+    // 10^12, which keeps it small.  Small is not inert: it changes which coin
+    // pays whenever the XCH wallet holds a coin BELOW the floor -- not only
+    // when the floor exceeds the fee -- and test_coin_lock_ledger pins that
+    // the ledger models it.
     const std::uint64_t xch = static_cast<std::uint64_t>(xop::kMojosPerXch);
     // The incident offer: 804 mojos is under a billionth of an XCH.
     const Floor incident = offer_min_input_coin(cat_funded_bid(80'334), 0.01);
     ASSERT_TRUE(incident.has_value());
     EXPECT_LT(*incident, xch / 1'000'000'000u);
-    // 100,000 CAT units: exactly CoinManager's XCH dust threshold
-    // (1,000,000 mojos), below which the engine ignores XCH coins anyway.
+    // 100,000 CAT units: numerically CoinManager's XCH dust threshold
+    // (1,000,000 mojos).  That is a coincidence of scale and nothing more --
+    // the XCH lock ledger is seeded from get_spendable_coins, not from
+    // CoinManager's pool, so a floor under 1,000,000 mojos is NOT a floor
+    // "the engine ignores anyway" [review #162, round 3].
     EXPECT_EQ(offer_min_input_coin(cat_funded_bid(100'000'000), 0.01),
               Floor{1'000'000});
     // 1,000,000 CAT units -- far beyond any tier this bot posts: the fee
