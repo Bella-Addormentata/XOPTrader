@@ -173,6 +173,51 @@ def test_step8_hands_offer_manager_class_aware_cancel_fees_only_when_active():
     assert gate < body.index("selective_cancel(")
 
 
+def _nth_argument(args: str, n: int) -> str:
+    """The nth top-level argument of a captured argument list.  Splits on commas
+    at paren/bracket depth 0, so `static_cast<std::uint64_t>(x)` stays whole."""
+    depth = 0
+    parts = []
+    current = []
+    for ch in args:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append("".join(current))
+            current = []
+            continue
+        current.append(ch)
+    parts.append("".join(current))
+    return parts[n].strip() if n < len(parts) else ""
+
+
+# [review #163 r4] The fee expression every cancel_offer_charged site is allowed
+# to pass, and why.  An ALLOWLIST, not a denylist: the previous form of this
+# scan counted `cancel_fee_for(` and rejected `current_fee_mojos_`, so a NEW
+# site with a hardcoded non-zero fee -- say `cancel_offer_charged(id,
+# 15000000, true)` -- was neither token and passed silently while paying a fee
+# no controller and no config could move.
+ALLOWED_CANCEL_FEES = {
+    # The per-offer controller fee.  This is the one that must be used.
+    "cancel_fee_for(": "the per-offer class-aware fee",
+    # [S31] The dead man's switch pays a fixed policy fee on purpose: the
+    # watchdog has given up managing the book and must not consult a loop.
+    "xop::risk::watchdog_cancel().fee_mojos": "the dead man's switch policy fee",
+    # [S14/#157] The escalation's own fee, itself derived from
+    # get_recommended_fee(CancelCat) -- pinned by the call-site scan above.
+    "attempt_fee": "the #157 escalation fee",
+    # The definition and the single internal forwarder.
+    "std::uint64_t fee": "the function's own parameter",
+    "fee": "forwarded from the caller",
+}
+# An explicit literal 0 is allowed: a genuinely free retire pays nothing, and
+# "free" is a decision a reader can check at a glance.  Any OTHER literal is
+# a hardcoded fee and fails.
+ZERO_FEE = "0"
+
+
 def test_offer_manager_cancels_pay_cancel_fee_for_not_the_single_fee():
     text = _strip_line_comments(_read(OFFER_MANAGER))
     calls = _call_arguments(text, "cancel_offer_charged")
@@ -184,6 +229,26 @@ def test_offer_manager_cancels_pay_cancel_fee_for_not_the_single_fee():
     # bulk cancel_offers_charged sweep keeps it: one batch fee for a whole book.)
     stale = [a for a in calls if re.search(r"\bcurrent_fee_mojos_\b", a)]
     assert not stale, stale
+
+    # [review #163 r4] And nothing else may invent a fee.  Every site's SECOND
+    # argument must be one of the allowed expressions or an explicit zero.
+    unknown = []
+    for args in calls:
+        fee_arg = " ".join(_nth_argument(args, 1).split())
+        if fee_arg == ZERO_FEE:
+            continue
+        if any(token in fee_arg for token in ALLOWED_CANCEL_FEES):
+            continue
+        unknown.append(fee_arg)
+    assert not unknown, (
+        "cancel_offer_charged sites paying a fee that is neither cancel_fee_for(), an "
+        "explicit 0, nor a documented policy fee: %r. A hardcoded fee cannot be moved by "
+        "the controller, by fees.min_fee_mojos or by the operator -- use cancel_fee_for(), "
+        "or add the new expression to ALLOWED_CANCEL_FEES with the reason it is exempt."
+        % (unknown,))
+    # The allowlist itself must stay honest: a token so loose it matches
+    # anything would silently re-open the hole.
+    assert all(len(token) >= 3 for token in ALLOWED_CANCEL_FEES)
     # Inert without the override: the first statement returns the legacy fee.
     body = _function_body(text, "std::uint64_t OfferManager::cancel_fee_for(")
     assert re.search(r"if\s*\(\s*!cancel_fees_active_\s*\)\s*\{\s*return current_fee_mojos_;", body)
@@ -245,6 +310,34 @@ def test_sweep_runs_every_heartbeat_beside_the_cancel_escalation():
     # After the escalation, above the Step 7/8 gate chain -- "not trading" is no
     # reason to stop hearing that a cancel is stuck.
     assert escalate < sweep < recovery_gate
+
+
+def test_every_ticket_has_an_unconditional_age_cap_not_just_takes():
+    """[review #163 r4] A cancel STRANDED by an exhausted #157 escalation sits
+    `cancel_pending` in State for ever, so it never leaves `cancels_in_flight`,
+    `awaiting_verdict` is never set and `verdict_expired` can never fire.  The
+    sweep must therefore drop tickets on AGE, for every class, before it looks
+    at anything else -- if the check sits behind an `is_take` branch, or after
+    the verdict bookkeeping, the stranded cancel speaks once per height for the
+    life of the process and fails every probe below the fee it paid."""
+    engine = _strip_line_comments(_engine())
+    body = _function_body(engine, "asio::awaitable<void> Engine::fee_feedback_sweep(")
+    loop = body.index("for (auto it = fee_tickets_.begin();")
+    abandoned = body.index("strategy::fee::ticket_abandoned(", loop)
+    # First thing in the loop: before the is_take split and before the
+    # awaiting_verdict bookkeeping, both of which a stranded cancel escapes.
+    is_take = body.index("const bool is_take =", loop)
+    verdict = body.index("strategy::fee::verdict_expired(", loop)
+    assert abandoned < is_take, "the age cap must not sit behind the take/cancel split"
+    assert abandoned < verdict, "the age cap must not sit behind the verdict rule"
+    # ... and it must actually erase, not merely be evaluated.
+    tail = body[abandoned:abandoned + 260]
+    assert "fee_tickets_.erase(it)" in tail and "continue;" in tail, tail
+    # The old take-only form must be gone: no age comparison may be reachable
+    # only for takes.
+    assert "strategy::fee::kVerdictTtlBlocks" not in body, (
+        "the sweep compares an age against kVerdictTtlBlocks directly; that was the "
+        "take-only rule ticket_abandoned replaced")
 
 
 def test_every_glue_function_is_inert_with_the_controller_off():

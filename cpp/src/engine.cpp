@@ -21468,6 +21468,17 @@ asio::awaitable<void> Engine::fee_feedback_sweep(BlockHeight block)
     BlockHeight take_to_poll_block = 0;
     for (auto it = fee_tickets_.begin(); it != fee_tickets_.end();) {
         strategy::fee::Ticket& t = it->second;
+        // [review #163 r4] The unconditional age cap, for EVERY class and
+        // before anything else.  A take always had one; a cancel had only
+        // verdict_expired, which needs awaiting_verdict, which is set only
+        // when the offer leaves cancel_pending -- and a cancel STRANDED by an
+        // exhausted #157 escalation never does.  Its ticket then spoke once
+        // per height for ever and failed every probe below the fee it paid.
+        // strategy::fee::ticket_abandoned has the whole argument.
+        if (strategy::fee::ticket_abandoned(t, block)) {
+            it = fee_tickets_.erase(it);      // dropped UNHEARD
+            continue;
+        }
         const bool is_take = t.cls == strategy::fee::ActionClass::Take;
         if (!is_take) {
             const bool in_flight = cancels_in_flight.count(it->first) != 0;
@@ -21477,9 +21488,6 @@ asio::awaitable<void> Engine::fee_feedback_sweep(BlockHeight block)
             } else if (in_flight && t.awaiting_verdict) {
                 t.awaiting_verdict = false;   // revived into State: pending again
             }
-        } else if (strategy::fee::ticket_age(t, block) > strategy::fee::kVerdictTtlBlocks) {
-            it = fee_tickets_.erase(it);      // a take nobody could resolve
-            continue;
         }
         if (strategy::fee::verdict_expired(t, block)) {
             it = fee_tickets_.erase(it);

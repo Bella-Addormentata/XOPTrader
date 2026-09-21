@@ -1278,11 +1278,55 @@ inline constexpr std::uint32_t kVerdictTtlBlocks = 256;
 /// not a budget.
 inline constexpr std::size_t kMaxTickets = 512;
 
+/// [review #163 r4] The longest ANY ticket may live, verdict or no verdict:
+/// 256 peak heights = 80 min.  Same scale as kVerdictTtlBlocks, a different
+/// rule -- that one starts when a ticket LEAVES the pending set, this one at
+/// submission, and a stranded cancel never leaves.
+///
+/// A take always had an unconditional age drop.  A cancel did not: it was
+/// erased only through verdict_expired, which needs `awaiting_verdict`, which
+/// the engine sets only when the offer leaves `cancel_pending` in State.  But
+/// escalate_stuck_cancels can give up -- CancelEscalationVerdict::Exhausted,
+/// "proven stranded, the cap is spent: alert" -- and the offer then sits
+/// cancel_pending for the life of the process.  Its ticket could never be
+/// erased and reported a censored observation once per height, for ever.
+///
+/// The ANSWERED rule keeps that from walking the level past
+/// `submit_level + min_raise`, so it was bounded -- but EVERY probe that steps
+/// below what that one stranded spend paid is failed by it, the retest
+/// interval doubles to its cap, and the loop can never price a cancel under
+/// that fee again.  A latch that cannot clear, defeating the same feature as
+/// the r3 finding did.
+///
+/// An expired ticket is dropped UNHEARD, which is the fail-safe direction: a
+/// spend that has not resolved in 80 minutes will not resolve at the fee it
+/// paid, #157's escalation owns it from there and opens a FRESH ticket at the
+/// fee its re-cancel really paid, and the loop keeps learning from spends
+/// that are still real.
+inline constexpr std::uint32_t kTicketMaxAgeBlocks = 256;
+
 /// Age of a ticket in peak heights; 0 on a height regression (no wrap).
 [[nodiscard]] constexpr std::uint32_t ticket_age(const Ticket& t, std::uint32_t now) noexcept
 {
     return now >= t.submit_block ? now - t.submit_block : 0U;
 }
+
+/// Has a ticket outlived its unconditional age cap?  Deliberately independent
+/// of `awaiting_verdict` and of the class: that flag is precisely the thing a
+/// stranded cancel never sets, and a rule that asked for it would be the bug.
+[[nodiscard]] constexpr bool ticket_abandoned(const Ticket& t, std::uint32_t now) noexcept
+{
+    return ticket_age(t, now) > kTicketMaxAgeBlocks;
+}
+
+// A cancel that never leaves cancel_pending: awaiting_verdict false for ever,
+// so only the age cap can end it.
+static_assert(!ticket_abandoned(Ticket{ActionClass::CancelCat, 100U, 0.0, 0U, false, 0U},
+                                100U + kTicketMaxAgeBlocks));
+static_assert(ticket_abandoned(Ticket{ActionClass::CancelCat, 100U, 0.0, 0U, false, 0U},
+                               101U + kTicketMaxAgeBlocks));
+// A height regression never expires a ticket early, and never wraps.
+static_assert(!ticket_abandoned(Ticket{ActionClass::Take, 1'000U, 0.0, 0U, false, 0U}, 4U));
 
 /// Is a Pending observation due for this ticket at `now`?  Only past the
 /// target, only while it is still pending, and once per height.
@@ -1338,12 +1382,22 @@ static_assert(observation_for_pending(Ticket{ActionClass::Take, 100U, 1.5, 0U, f
 static_assert(observation_for_pending(Ticket{ActionClass::Take, 100U, 1.5, 0U, false, 0U},
                                       112U).submit_level == 1.5);
 
-/// Has a ticket awaiting its verdict outlived kVerdictTtlBlocks?
+/// Has a ticket awaiting its verdict outlived kVerdictTtlBlocks?  This is the
+/// rule that needs `awaiting_verdict`, and [review #163 r4] it is therefore
+/// NOT a way out for a cancel that never leaves the pending set -- see
+/// kTicketMaxAgeBlocks and ticket_abandoned, which is.
 [[nodiscard]] constexpr bool verdict_expired(const Ticket& t, std::uint32_t now) noexcept
 {
     return t.awaiting_verdict
         && (now >= t.left_block ? now - t.left_block : 0U) > kVerdictTtlBlocks;
 }
+
+// A stranded cancel -- cancel_pending for ever, so awaiting_verdict never set
+// -- can NEVER be ended by verdict_expired, at any height.
+static_assert(!verdict_expired(Ticket{ActionClass::CancelCat, 100U, 0.0, 0U, false, 0U},
+                               100'000'000U));
+static_assert(ticket_abandoned(Ticket{ActionClass::CancelCat, 100U, 0.0, 0U, false, 0U},
+                               100'000'000U));
 
 /// The confirmation delay of a ticket whose spend landed at
 /// `confirmed_block`, in peak heights; 0 when the verdict height is behind

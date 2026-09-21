@@ -29,6 +29,8 @@
 #include <functional>
 #include <limits>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -1133,6 +1135,49 @@ bool sweep_one_ticket(Controller& c, fee::Ticket& t, std::uint32_t now)
     return true;
 }
 
+/// [review #163 r4] One heartbeat of Engine::fee_feedback_sweep's ticket WALK,
+/// driving the pure rules in the order and with the erase semantics the engine
+/// uses.  `cancels_in_flight` is the set of offers State still reports
+/// `cancel_pending`.  Returns how many censored observations were fed.
+///
+/// The take poll is the engine's own RPC and is not modelled; the erase rules
+/// are shared and are what this exercises.
+std::uint32_t sweep_tickets(Controller&                                   c,
+                            std::unordered_map<std::string, fee::Ticket>& tickets,
+                            const std::unordered_set<std::string>&        cancels_in_flight,
+                            std::uint32_t                                 now)
+{
+    std::uint32_t spoke = 0;
+    for (auto it = tickets.begin(); it != tickets.end();) {
+        fee::Ticket& t = it->second;
+        if (fee::ticket_abandoned(t, now)) {
+            it = tickets.erase(it);
+            continue;
+        }
+        const bool is_take = t.cls == ActionClass::Take;
+        if (!is_take) {
+            const bool in_flight = cancels_in_flight.count(it->first) != 0;
+            if (!in_flight && !t.awaiting_verdict) {
+                t.awaiting_verdict = true;
+                t.left_block       = now;
+            } else if (in_flight && t.awaiting_verdict) {
+                t.awaiting_verdict = false;
+            }
+        }
+        if (fee::verdict_expired(t, now)) {
+            it = tickets.erase(it);
+            continue;
+        }
+        if (!is_take && fee::pending_observation_due(t, now, c.config().target_delay_blocks)) {
+            t.last_pending_block = now;
+            c.observe(fee::observation_for_pending(t, now));
+            ++spoke;
+        }
+        ++it;
+    }
+    return spoke;
+}
+
 TEST(FeeTicket, ACancelObservedDuringStartupReconcileNeverRaisesTheFeeAtBoot)
 {
     // [review #163 r2] The engine's height is 0 until the first one is read,
@@ -1179,6 +1224,70 @@ TEST(FeeTicket, ACancelObservedDuringStartupReconcileNeverRaisesTheFeeAtBoot)
     EXPECT_EQ(c.observe(v.observation).reason, ChangeReason::OnTarget);
     EXPECT_TRUE(sweep_one_ticket(c, known, kLivePeak + kT + 1U));   // genuinely late: heard
     EXPECT_GT(c.level(), 0.0);
+}
+
+TEST(FeeTicket, AStrandedCancelTicketIsEndedByItsAgeCapNotByAVerdict)
+{
+    // [review #163 r4] escalate_stuck_cancels can give up
+    // (CancelEscalationVerdict::Exhausted, "proven stranded, the cap is
+    // spent") and leave the offer sitting cancel_pending in State for the life
+    // of the process.  Such a ticket NEVER leaves cancels_in_flight, so
+    // awaiting_verdict is never set and verdict_expired can never fire.  Only
+    // the unconditional age cap can end it.
+    Controller c{on_config(), kMinFee, kMaxFee};
+    const std::uint32_t submit = 1'000;
+    std::unordered_map<std::string, fee::Ticket> tickets;
+    fee::Ticket t;
+    t.cls          = ActionClass::CancelCat;
+    t.submit_block = submit;
+    t.submit_level = c.level();
+    tickets["stranded"] = t;
+    const std::unordered_set<std::string> never_leaves{"stranded"};
+
+    std::uint32_t spoke = 0;
+    for (std::uint32_t h = submit + 1; h <= submit + 4 * fee::kTicketMaxAgeBlocks; ++h) {
+        spoke += sweep_tickets(c, tickets, never_leaves, h);
+    }
+    EXPECT_TRUE(tickets.empty()) << "a stranded cancel ticket outlived every rule";
+    // It spoke once per height from the first height past the target delay to
+    // the cap inclusive, and then NOT ONCE in the three cap-lengths after.
+    EXPECT_EQ(spoke, fee::kTicketMaxAgeBlocks - c.config().target_delay_blocks);
+    // Its awaiting_verdict route really was closed the whole time.
+    fee::Ticket still_pending = t;
+    EXPECT_FALSE(fee::verdict_expired(still_pending, submit + 1'000'000U));
+    EXPECT_TRUE(fee::ticket_abandoned(still_pending, submit + 1'000'000U));
+}
+
+TEST(FeeTicket, AStrandedCancelCannotPinTheProbeScheduleUnderItsOwnFeeForEver)
+{
+    // The damage the cap prevents, end to end.  The ANSWERED rule stops one
+    // stranded spend walking the level past submit_level + min_raise, so the
+    // fee is bounded -- but while that ticket lives, EVERY probe that steps
+    // below what it paid is failed by it, the retest interval doubles to its
+    // cap, and the loop can never price a cancel under that fee again.
+    Controller c{on_config(), kMinFee, kMaxFee};
+    std::uint32_t now = lift(c, 3, 1'000);
+    const double pinned = c.level();
+    ASSERT_DOUBLE_EQ(pinned, 3.0);
+
+    std::unordered_map<std::string, fee::Ticket> tickets;
+    fee::Ticket t;
+    t.cls          = ActionClass::CancelCat;
+    t.submit_block = now;
+    t.submit_level = c.level_of(c.fee_for(ActionClass::CancelCat, now), ActionClass::CancelCat);
+    tickets["stranded"] = t;
+    const std::unordered_set<std::string> never_leaves{"stranded"};
+
+    // Healthy cancels confirm on target every height, as they would once the
+    // fee is adequate; the stranded one speaks until its cap.
+    for (std::uint32_t i = 0; i < 2 * fee::kTicketMaxAgeBlocks; ++i) {
+        ++now;
+        sweep_tickets(c, tickets, never_leaves, now);
+        c.observe(real_confirmed(c, ActionClass::CancelCat, 3.0, now));
+    }
+    EXPECT_TRUE(tickets.empty());
+    EXPECT_LT(c.level(), pinned)
+        << "the probe schedule never got under the fee the stranded cancel paid";
 }
 
 TEST(FeeTicket, OneHeightOfStaleSubmissionHeightIsOneHeightOfFalseLateness)
