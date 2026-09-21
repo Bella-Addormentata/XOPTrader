@@ -48,6 +48,21 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ignore it and cancel, so the GUI offers Keep only to an engine whose `--help`
   advertises `shutdown.flag offers=cancel|keep`, and refuses to stop rather than
   let a requested keep turn into a cancel.
+- **A keep stop delivered by a signal waits for the one offer it may have been
+  creating, and starts no more.** A GUI stop is read between heartbeat cycles
+  and never finds a create in flight; Ctrl+C, SIGTERM, a service stop or a
+  session end can arrive while one is outstanding, and stopping the event loop
+  there would let the wallet finish an offer nothing recorded — an orphan the
+  next start may cancel. The stop now waits for that create to land, on a timer
+  and never on the wallet, for at most one create plus one publish at their own
+  worst case (**247 s** with the shipped RPC timeouts). While it waits the
+  engine begins **no new create at all**, and cancels nothing that already
+  exists, so the wait really is one create's and not a whole ladder's.
+  **Do not hard-kill a stop that seems slow** — that wait is what keeps a
+  just-created offer from arriving at the next start as an orphan. A second
+  Ctrl+C still exits at once. If a create instead fails with *no answer* — a
+  timeout, an empty reply, a 5xx — that is not proof the wallet refused it, and
+  the keep stop now says so at error rather than reporting a clean book.
 - **Operator notes.** Keep is for restarts. A kept offer is takeable with no
   engine behind it — no repricing, no TTL, no dead man's switch — so use it
   only with `strategy.offer_expiry_secs` set. **While the engine is down the

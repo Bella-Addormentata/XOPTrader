@@ -271,10 +271,33 @@ struct StopOffersPlan {
 // waiting for the rest of the ladder would buy nothing and cost, at the live
 // num_tiers: 6 over two sides, up to twelve creates' worth of stop latency.
 //
+// AND NO NEW CREATE STARTS WHILE IT WAITS (review round 4). The wait suspends
+// on a poll timer, which hands control straight back to the coroutine it is
+// waiting for -- so post_quotes used to go on to the next tier, re-arm the
+// mark, and make the drain wait out a whole LADDER on a budget that covers one
+// create. Level-triggering a bool was never the flaw: a drain that caught every
+// transient false would still have been watching an engine that went on posting
+// offers after the operator asked it to stop, and a budget that expires mid
+// ladder abandons a create, which is the orphan this exists to prevent.
+// OfferManager now takes a second, NON-CANCELLING predicate
+// (set_stop_creating_predicate, wired to Engine::stop_requested_): once a stop
+// is latched no further create begins, and nothing already created is touched
+// -- which is why a keep stop can use it and cannot use the S31 abort
+// predicate, whose job is to cancel a create that landed late. Only then is the
+// budget below a real upper bound rather than a number sized for one create and
+// spent on many.
+//
 // The wait is BOUNDED. A wallet that never answers must not turn "stop" into
 // "hang", and past the budget the stop proceeds and says an offer may have been
 // left unrecorded. The budget is SIZED TO THAT MARKED WINDOW rather than
 // guessed: see keep_stop_drain_budget_ms below.
+//
+// WHAT THE BOUND STILL DOES NOT COVER (review round 4): a create that fails
+// with NO ANSWER. Its mark is released at once -- correctly, since nothing is
+// left for the io_context to wait for -- but a timeout, an empty reply or a 5xx
+// does not prove the wallet refused it (rpc::request_possibly_submitted). No
+// wait can fix that, so it is RECORDED instead: Engine::create_outcome_unknown_
+// makes the keep stop report a possibly-untracked offer rather than success.
 
 /// The worst case of ONE rpc_post call (rpc/chia_rpc.cpp): every attempt
 /// spending the whole request timeout, plus the doubling backoff between them.

@@ -633,12 +633,30 @@ Engine::Engine(const AppConfig& config, bool dry_run,
     offer_mgr_->set_abort_predicate([this] {
         return watchdog_fired_.load(std::memory_order_acquire);
     });
+    // [S74 / review #165, round 4] ...and the one that only STOPS CREATING.
+    // Once a stop is latched, no further create begins -- and nothing that
+    // already exists is cancelled, which is what makes this usable by a keep
+    // stop where set_abort_predicate is not. It is what makes the drain's
+    // budget a real bound: the keep stop then waits for the ONE create already
+    // in flight, never for the rest of a ladder that goes on starting new ones
+    // in the gaps of its own poll timer (TODO S76 (a)).
+    //
+    // stop_requested_, not the keep latch: a CANCELLING stop must not post a
+    // fresh book on top of the sweep it is running over the same coins either.
+    offer_mgr_->set_stop_creating_predicate([this] {
+        return stop_requested_.load(std::memory_order_acquire);
+    });
     // [S74 / review #165] The flag a KEEP stop's drain waits on. OfferManager
     // sets it while a create_offer is outstanding and the offer it makes is
     // not yet in State -- the only window in which stopping the io_context can
     // leave a live offer this process never recorded. Without this wiring the
     // drain would always see "nothing in flight" and stop straight through it.
     offer_mgr_->set_posting_in_flight_flag(&posting_in_flight_);
+    // [S74 / review #165, round 4] ...and the flag that says a create ended
+    // with no answer at all. The drain flag cannot carry that: it is cleared
+    // by RAII when the create throws, because nothing is then left for the
+    // io_context to wait for -- so the fact has to be recorded, not waited on.
+    offer_mgr_->set_create_outcome_unknown_flag(&create_outcome_unknown_);
     // [S74 / review round 3] ...and HOW LONG that drain may wait, sized to the
     // window it waits on rather than to a round number: one create's whole
     // retry ladder, plus the publish that stands between the wallet's answer
@@ -2411,6 +2429,25 @@ void Engine::report_offers_kept_on_stop(std::uint64_t waited_for_post_ms,
         spdlog::warn("[Engine] [S74] waited {} ms for an in-flight offer post to "
                      "land; what it created is recorded and counted above.",
                      waited_for_post_ms);
+    }
+    if (create_outcome_unknown_) {
+        // [review #165, round 4] THE DRAIN CANNOT COVER THIS ONE, and saying
+        // nothing would make the two lines above a false all-clear. A create
+        // that failed with no answer from the wallet -- a timeout, an empty
+        // reply, a 5xx -- released its mark at once, because nothing was left
+        // for the io_context to wait for. It is not proof the wallet refused
+        // it: this engine may be stopping with an offer it never recorded.
+        // Waiting longer could not have helped, and re-asking the wallet is
+        // the one thing a keep stop must not do.
+        spdlog::error("[Engine] [S74] at least one offer create in this "
+                      "process ended with NO ANSWER from the wallet, which is "
+                      "not a refusal. If the wallet built that offer it is "
+                      "NOT in the count above: the next start meets it as an "
+                      "ORPHAN and adopts it only if it is recent and not "
+                      "adversely priced -- otherwise it CANCELS it. Check the "
+                      "wallet's open offers against this book before "
+                      "assuming the stop was clean. (A periodic reconcile may "
+                      "already have adopted it; this latch is never cleared.)");
     }
     if (heartbeat_in_flight_) {
         // [review #165] Only a SIGNAL gets here mid-cycle: shutdown.flag is

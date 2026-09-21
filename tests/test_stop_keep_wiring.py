@@ -96,6 +96,24 @@ def _block(code: str, opener: str) -> str:
     raise AssertionError(f"unbalanced block after {opener!r}")
 
 
+def _block_at(code: str, start: int) -> str:
+    """The balanced `{...}` block whose opening brace is at or after *start*.
+
+    `_block` finds its block by a UNIQUE opener; this one takes a position, for
+    the scans that walk several identical gates and must look inside each."""
+    open_at = code.find("{", start)
+    assert open_at != -1, f"no block after offset {start}"
+    depth = 0
+    for k in range(open_at, len(code)):
+        if code[k] == "{":
+            depth += 1
+        elif code[k] == "}":
+            depth -= 1
+            if depth == 0:
+                return code[open_at:k + 1]
+    raise AssertionError(f"unbalanced block after offset {start}")
+
+
 def _block_followed_by(code: str, opener: str, following: str) -> str:
     """The balanced block of the ONE `opener` that is immediately followed by
     `following` -- for an opener (`if(cancels_book){`) that occurs more than
@@ -455,6 +473,151 @@ def test_every_create_offer_is_marked_one_at_a_time():
             "lets a keep stop proceed while that offer exists nowhere")
 
 
+def test_no_create_begins_once_a_stop_is_latched():
+    """[review #165, round 4 -- Copilot 4058780337] THE DRAIN'S BUDGET IS ONLY A
+    BOUND IF NO NEW CREATE CAN START.
+
+    The keep stop's wait suspends on a 50 ms poll timer, which hands control
+    straight back to the coroutine it is waiting for. Nothing stopped
+    post_quotes going on to the next tier and re-arming the mark, so a budget
+    sized for ONE create (247 s) was spent on a LADDER -- and could expire with
+    a create still outstanding, which is the orphan the drain exists to
+    prevent. Worse than the latency: the engine went on creating new offers
+    after the operator asked it to stop.
+
+    The fix is a second, NON-CANCELLING predicate. It cannot be the S31 abort
+    predicate: that one CANCELS a create that landed late, which is the one
+    thing a keep stop must not do.
+
+    Stated over positions, like the PostingMark scan above, so ONE create left
+    ungated fails it -- a scan that only proved the gate exists somewhere would
+    pass on a tree where the fallback loop lost its copy."""
+    raw = _code(_text(OFFER_MANAGER_CPP), squeeze=False)
+    creates = _offer_creating_calls(raw)
+    gates = [m.start() for m in re.finditer(
+        r"if\s*\(\s*stop_creating_predicate_\s*&&\s*stop_creating_predicate_\(\)\s*\)",
+        raw)]
+    assert creates, "no create_offer call in offer_manager.cpp: the scan is vacuous"
+    assert len(gates) == len(creates), (
+        f"{len(creates)} create_offer call(s) but {len(gates)} stop-creating "
+        "gate(s): a create that can still begin after the stop latch makes the "
+        "drain wait for more than the one create its budget is sized for")
+    for index, (gate, create) in enumerate(zip(gates, creates)):
+        assert gate < create, f"create #{index} is issued before its gate"
+        if index + 1 < len(creates):
+            assert creates[index] < gates[index + 1] < creates[index + 1], (
+                "two create_offer calls share one stop-creating gate: the "
+                "second can still begin after the latch")
+        # NON-cancelling, and it really stops: no wallet call, nothing adopted,
+        # nothing cancelled, and it leaves the loop rather than logging on.
+        body = re.sub(r"\s+", "", _block_at(raw, gate))
+        for forbidden in ("cancel", "upsert_offer", "co_await", "escalate_"):
+            assert forbidden not in body, (
+                f"the stop-creating gate reaches {forbidden}: a keep stop must "
+                "leave every offer that already exists exactly where it is")
+        assert body.endswith(("break;}", "co_return0;}")), (
+            "the stop-creating gate logs and carries on: found %r" % body[-24:])
+
+
+def test_the_engine_wires_the_stop_creating_predicate_to_the_stop_latch():
+    """...to stop_requested_, not to the keep latch: a CANCELLING stop must not
+    post a fresh book on top of the sweep it is running over the same coins
+    either. Wired beside the abort predicate, which it does not replace."""
+    ctor = _code(_definition(
+        ENGINE_CPP, "Engine::Engine(const AppConfig& config, bool dry_run,"))
+    _in_order(ctor, [
+        "offer_mgr_->set_abort_predicate([this]{"
+        "returnwatchdog_fired_.load(std::memory_order_acquire);});",
+        "offer_mgr_->set_stop_creating_predicate([this]{"
+        "returnstop_requested_.load(std::memory_order_acquire);});",
+        "offer_mgr_->set_posting_in_flight_flag(&posting_in_flight_);",
+    ])
+    engine = _code(_text(ENGINE_CPP))
+    assert engine.count("offer_mgr_->set_stop_creating_predicate(") == 1, (
+        "the stop-creating predicate is wired more than once, or not at all")
+
+
+def test_a_create_that_got_no_answer_is_recorded_and_the_keep_stop_says_so():
+    """[review #165, round 4 -- Copilot 4058780326] A TIMED-OUT CREATE IS NOT
+    "NO OFFER".
+
+    PostingMark is cleared by its destructor when create_offer throws, and that
+    is right: the mark exists only to keep the io_context alive until THIS
+    coroutine reaches state_->upsert_offer, and once the create has thrown
+    there is nothing left to wait for. Holding it would burn the drain budget
+    and still end with an untracked offer.
+
+    What was wrong was the CLAIM. A transport failure does not prove the wallet
+    refused the request (rpc::request_possibly_submitted; #162 encodes the same
+    principle for this RPC family), so the keep stop must not report clean
+    success. The fact is recorded instead -- one flag, no RPC, no change to the
+    drain's bound -- and the keep report says it.
+
+    Positional again: every create has its own note, or a create whose outcome
+    nobody knows is one nobody reports."""
+    raw = _code(_text(OFFER_MANAGER_CPP), squeeze=False)
+    creates = _offer_creating_calls(raw)
+    notes = [m.start() for m in re.finditer(
+        r"note_create_outcome_unknown\(e", raw)]
+    assert len(notes) == len(creates), (
+        f"{len(creates)} create_offer call(s) but {len(notes)} recorded "
+        "outcome(s): a create that fails with no answer would be reported as "
+        "no offer at all")
+    for index, (create, note) in enumerate(zip(creates, notes)):
+        assert create < note, f"create #{index} records its outcome before it runs"
+        if index + 1 < len(creates):
+            assert notes[index] < creates[index + 1], (
+                "a create's outcome is recorded after the NEXT create begins")
+
+    # Each note sits in its create's OWN transport handler, and that handler
+    # comes first: a base ChiaRPCError handler written above it makes the
+    # transport one unreachable, and every timed-out create is classed as a
+    # refusal again -- silently, because the code still compiles.
+    catches = [(m.start(), m.group(1)) for m in re.finditer(
+        r"catch\s*\(\s*const\s+rpc::(\w+)\s*&", raw)]
+    for index, (create, note) in enumerate(zip(creates, notes)):
+        after = [(at, name) for at, name in catches if at > create]
+        assert after, f"create #{index} has no handler at all"
+        first_at, first_name = after[0]
+        assert first_name == "ChiaRPCTransportError", (
+            f"create #{index}'s first handler is {first_name}, so its "
+            "transport handler is unreachable")
+        assert first_at < note, (
+            f"create #{index} records its outcome outside its transport handler")
+        later = [at for at, _ in catches if at > first_at]
+        assert not later or note < later[0], (
+            f"create #{index}'s note is in a later handler than the transport "
+            "one it belongs to")
+    # The rule itself: only a failure that MAY have reached the wallet counts,
+    # and the generic predicate is the one that decides.
+    note_body = _code(_definition(
+        OFFER_MANAGER_CPP, "void OfferManager::note_create_outcome_unknown("))
+    _in_order(note_body, [
+        "if(!rpc::request_possibly_submitted(e.curl_code(),e.http_code())){return;}",
+        "if(create_outcome_unknown_flag_!=nullptr){*create_outcome_unknown_flag_=true;}",
+    ])
+    for forbidden in ("co_await", "create_offer(", "cancel", "upsert_offer"):
+        assert forbidden not in note_body, (
+            f"recording the uncertainty reaches {forbidden}: it must send "
+            "nothing and wait for nothing")
+
+    engine = _code(_text(ENGINE_CPP))
+    assert engine.count(
+        "offer_mgr_->set_create_outcome_unknown_flag(&create_outcome_unknown_);") == 1
+    for bare in ("create_outcome_unknown_=true;", "create_outcome_unknown_=false;"):
+        assert bare not in engine, (
+            "the engine writes the uncertainty flag itself: only the create "
+            "that failed knows how it failed")
+    report = _code(_definition(
+        ENGINE_CPP,
+        "void Engine::report_offers_kept_on_stop(std::uint64_t waited_for_post_ms,"))
+    assert "if(create_outcome_unknown_){spdlog::error(" in report, (
+        "the keep report no longer says it may be finishing with an offer the "
+        "wallet holds and this process never recorded -- which would make the "
+        "'what it created is recorded and counted above' line a false "
+        "all-clear")
+
+
 def test_the_engine_wires_the_drain_flag_and_never_writes_it_itself():
     """The engine cannot see inside post_quotes, so OfferManager owns the flag.
     Without this one line the drain would always read "nothing in flight"."""
@@ -603,6 +766,7 @@ def test_the_engine_header_documents_the_members_the_scans_rely_on():
     assert ("voidreport_offers_kept_on_stop(std::uint64_twaited_for_post_ms,"
             "boolpost_abandoned);") in header
     assert "boolposting_in_flight_{false};" in header
+    assert "boolcreate_outcome_unknown_{false};" in header
     # shutdown() keeps its signature: a signal handler calls it bare, and every
     # wiring scan finds it by that text.
     assert "voidshutdown();" in header

@@ -1230,6 +1230,23 @@ private:
     /// keep stop's flush gives each of those an offer_log row. ioc_ thread only.
     bool posting_in_flight_{false};
 
+    /// [review #165, round 4] True once a create has ended with NO ANSWER in a
+    /// way that does not prove the wallet refused it (a timeout, an empty or
+    /// garbled reply, a 5xx, a 2xx whose body would not parse --
+    /// rpc::request_possibly_submitted). Set by OfferManager, wired in the
+    /// constructor with set_create_outcome_unknown_flag.
+    ///
+    /// It is NOT the drain flag. That one says a create is outstanding now, and
+    /// is cleared by RAII whichever way the create ends -- including a throw,
+    /// where holding it would only burn the budget, because nothing is left for
+    /// the io_context to wait for. This one records that the window closed
+    /// WITHOUT proving where the offer went, so the keep stop reports a
+    /// possibly-untracked offer instead of clean success.
+    ///
+    /// Never cleared: only a reconcile against the wallet could retire the
+    /// doubt, and the keep path deliberately sends nothing. ioc_ thread only.
+    bool create_outcome_unknown_{false};
+
     /// [review round 3] How long that wait may last: one create's worst case
     /// plus the publish that follows it before the offer is in State -- two
     /// rpc_post calls, each up to request_timeout x attempts plus backoff.
