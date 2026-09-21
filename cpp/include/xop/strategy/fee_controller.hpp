@@ -57,9 +57,11 @@
 //     counts only while level < s + min_raise.  Once the level has been raised
 //     that far the spend has been answered; whether the NEW level works is
 //     not known until a spend submitted at it is late too.  This is also what
-//     bounds windup behind a saturated actuator (a fee clamped by max_fee or
-//     by the budget was submitted BELOW the level, so it stops counting as
-//     soon as the gap reaches min_raise);
+//     bounds windup behind a saturated actuator: a fee clamped by max_fee was
+//     submitted BELOW the level, so it stops counting as soon as the gap
+//     reaches min_raise.  (The budget no longer saturates anything that
+//     produces evidence -- [review #163] a cancel or a take is paid in full
+//     and the overrun reported; see apply_budget.);
 //   * DEAD TIME: wallet-level signals that cannot be attributed to one spend
 //     (pending_change persisting, force-delete, a sent_to fee error) are
 //     ignored for TWO target delays after a raise.  One is not enough: Step 8
@@ -287,9 +289,12 @@ struct BudgetedFee {
 ///     clamped `desired`; the budget's remaining job for a priority spend is
 ///     to REPORT (`over_budget`), which is an alertable condition, not a
 ///     reason to pay a fee that cannot work;
-///   * an offer-attached fee may use only the headroom above `reserve`, the
-///     budget held back so the resting book can still be cancelled -- and
-///     only a 1/`batch` share of it.  [review #163] Step 8 asks for ONE
+///   * an offer-attached fee may use only the headroom above `reserve` -- and
+///     only a 1/`batch` share of it.  The reserve is the budget set aside for
+///     the resting book's cancels: since those are now paid whatever the
+///     headroom, what it really buys is that the attached fees cannot spend
+///     the window down to the point where every cancel reports over budget.
+///     [review #163] Step 8 asks for ONE
 ///     attached fee per heartbeat and then attaches it to every tier it posts,
 ///     recording posted x fee afterwards, so a fee shaped for one offer let a
 ///     ladder of ten spend ten times the room above the reserve.  `batch` is

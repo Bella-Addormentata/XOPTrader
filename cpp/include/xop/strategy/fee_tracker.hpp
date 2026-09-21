@@ -166,12 +166,13 @@ public:
                                                     std::uint64_t fee_paid_mojos,
                                                     BlockHeight   current_block) const noexcept;
 
-    /// True ONCE per episode in which the budget lowered a fee: the engine
-    /// turns it into one operator alert.  The episode ends when an
-    /// offer-attached fee next comes back unbound.
+    /// True ONCE per episode in which the budget lowered an OFFER-ATTACHED fee
+    /// (the only kind it may lower): the engine turns it into one operator
+    /// alert.  The episode ends when an attached fee next comes back unbound.
     [[nodiscard]] bool take_budget_bound_alert() noexcept;
 
-    /// The fee the budget last refused to pay in full, and what it allowed.
+    /// The attached fee the budget last refused to pay in full, and what it
+    /// allowed.
     [[nodiscard]] std::uint64_t last_bound_desired() const noexcept { return last_bound_desired_; }
     [[nodiscard]] std::uint64_t last_bound_allowed() const noexcept { return last_bound_allowed_; }
 
