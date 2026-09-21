@@ -91,6 +91,91 @@ def _call_arguments(code: str, callee: str) -> list[str]:
     return results
 
 
+def _split_arguments(args: str) -> list[str]:
+    """The top-level, comma-separated arguments of a whitespace-free call."""
+    out: list[str] = []
+    depth = 0
+    quote = ""
+    cur: list[str] = []
+    for ch in args:
+        if quote:
+            cur.append(ch)
+            if ch == quote:
+                quote = ""
+            continue
+        if ch == '"':
+            quote = ch
+        elif ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            out.append("".join(cur))
+            cur = []
+            continue
+        cur.append(ch)
+    if cur:
+        out.append("".join(cur))
+    return out
+
+
+# An argument that is ZERO however it is spelled or wrapped -- `0`, `Mojo(0)`,
+# `to_mojo_saturating(0)`.  Anything naming a variable fails to match, which is
+# the property a floor-only admission needs: it charges no principal.
+_ZERO_ARGUMENT = re.compile(r"(?:[A-Za-z_][\w:]*\()*0\)*\Z")
+
+
+def _assert_ledger_admission(body: str, callee: str, principal: str,
+                             what: str) -> None:
+    """`callee` charges `principal`, the CURRENT FEE, and the min-coin floor.
+
+    MATCHED BY CONTENT, NOT BY SPELLING [review #162, round 6].  These
+    assertions used to pin the literal text
+    `try_lock_floor_only(0,current_fee_mojos_,min_coin)`.  PR #163 wraps the fee
+    at these same four call sites as `to_mojo_saturating(current_fee_mojos_)` --
+    a change that conflicts with nothing in THIS file, so git reports no
+    conflict and the compiler is happy, and only running this scan against the
+    MERGED tree shows the breakage.  A source scan that pins literal text is
+    itself a merge hazard: it is the one check a sibling PR can invalidate
+    without touching the file it guards.
+
+    What this scan exists to pin is that the admission charges the fee the
+    create will pay, against the right principal, WITH the floor the create
+    will send -- not how any of those three is spelled.  `principal` is the
+    substring the principal argument must CONTAIN, or the literal "0" to
+    require that it is zero.
+    """
+    calls = _call_arguments(body, callee)
+    assert len(calls) == 1, (
+        "%s: expected exactly one %s( call, found %d" % (what, callee, len(calls))
+    )
+    args = _split_arguments(calls[0])
+    assert len(args) == 3, (
+        "%s: %s takes %d arguments, expected 3 (principal, fee, floor): %r"
+        % (what, callee, len(args), args)
+    )
+    if principal == "0":
+        assert _ZERO_ARGUMENT.match(args[0]), (
+            "%s: a floor-only admission must charge NO principal, but the first "
+            "argument is %r" % (what, args[0])
+        )
+    else:
+        assert principal in args[0], (
+            "%s: admits against %r, which does not mention %r"
+            % (what, args[0], principal)
+        )
+    assert "current_fee_mojos_" in args[1], (
+        "%s: the fee argument is %r, which does not mention current_fee_mojos_ "
+        "-- the ledger is not being charged the fee the create will pay"
+        % (what, args[1])
+    )
+    assert args[2] == "min_coin", (
+        "%s: the third argument is %r, not min_coin -- the ledger admits "
+        "against a different floor from the one the create sends"
+        % (what, args[2])
+    )
+
+
 def _top_level_argument_count(args: str) -> int:
     depth = 0
     count = 1 if args else 0
@@ -143,12 +228,33 @@ def test_the_endpoint_is_posted_only_by_create_offer_with_the_floor_in_its_paylo
         "create_offer_for_ids is posted from more than one place in chia_rpc.cpp"
     )
     body = _code(_definition(CHIA_RPC_CPP, "ChiaWalletRPC::create_offer("), keep_strings=True)
-    assert 'rpc_post("create_offer_for_ids",payload)' in body
-    assert ("build_create_offer_payload(offer_dict,fee,validate_only,max_time,"
-            "min_coin_amount)") in body, (
-        "create_offer no longer hands min_coin_amount to the payload builder, so "
-        "the floor is computed and then dropped"
+    # [review #162, round 6] BY CONTENT, not by spelling -- see
+    # _assert_ledger_admission for why a literal argument-list pin is a merge
+    # hazard.  The property is that this one endpoint is posted with the
+    # payload, and that the payload builder is handed all five values in order
+    # -- min_coin_amount above all, or the floor is computed and then dropped.
+    (post_args,) = _call_arguments(body, "rpc_post")
+    posted = _split_arguments(post_args)
+    assert len(posted) == 2 and posted[0] == '"create_offer_for_ids"', (
+        "create_offer no longer posts create_offer_for_ids: %r" % posted
     )
+    assert "payload" in posted[1], (
+        "create_offer posts something other than the built payload: %r" % posted[1]
+    )
+    (payload_args,) = _call_arguments(body, "build_create_offer_payload")
+    built = _split_arguments(payload_args)
+    assert len(built) == 5, (
+        "the payload builder takes %d arguments, expected 5: %r" % (len(built), built)
+    )
+    for i, token in enumerate(("offer_dict", "fee", "validate_only", "max_time",
+                               "min_coin_amount")):
+        assert token in built[i], (
+            "argument %d of build_create_offer_payload is %r, which does not "
+            "mention %r -- %s" % (
+                i + 1, built[i], token,
+                "the floor is computed and then dropped"
+                if token == "min_coin_amount" else "the payload is built wrong")
+        )
 
 
 def test_the_wrapper_applies_the_rule_and_the_fallback():
@@ -168,10 +274,25 @@ def test_the_wrapper_applies_the_rule_and_the_fallback():
     )
     # The floor the fallback hands to the lambda is what reaches the wallet, as
     # the FIFTH argument (after offer_dict, fee, validate_only, max_time).
+    # [review #162, round 6] BY CONTENT, not by spelling -- see
+    # _assert_ledger_admission.  The property is the five values in order, the
+    # fifth being the floor the FALLBACK chose for this attempt (nullopt on the
+    # retry), not the literal spelling of any of them.
     (create_args,) = _call_arguments(wrapper, "wallet_->create_offer")
-    assert create_args == "offer_dict,current_fee_mojos_,false,expiry_max_time,coin_floor", (
-        "unexpected arguments to the wallet create: %r" % create_args
+    passed = _split_arguments(create_args)
+    assert len(passed) == 5, (
+        "the wallet create takes %d arguments, expected 5: %r" % (len(passed), passed)
     )
+    for i, (token, why) in enumerate((
+            ("offer_dict", "the dict the floor was derived from"),
+            ("current_fee_mojos_", "the fee the engine is paying"),
+            ("false", "validate_only must stay off -- a validating create builds nothing"),
+            ("expiry_max_time", "the requested offer expiry"),
+            ("coin_floor", "the floor the fallback chose for THIS attempt"))):
+        assert token in passed[i], (
+            "argument %d of the wallet create is %r, which does not mention %r "
+            "(%s)" % (i + 1, passed[i], token, why)
+        )
     assert "[this,&offer_dict,expiry_max_time](std::optional<std::uint64_t>coin_floor)" in wrapper
     # The warning has to name the offer and the constraint.  Read through
     # _code() so a COMMENT cannot satisfy the assertion: the tag has to live in
@@ -291,25 +412,24 @@ def test_the_cycle_ledger_admits_against_the_floor_the_create_sends():
     assert body.count(LEDGER_FLOOR) == 1, (
         "xch_ledger_admits no longer derives the floor from the offer_dict it admits"
     )
-    assert body.count("xch_cycle_ledger_.try_lock_floor_only(0,current_fee_mojos_,min_coin)") == 1, (
-        "the buy-XCH admission charges the fee coin without the floor -- the "
-        "wallet skips coins below it and locks a larger one than the ledger records"
-    )
-    assert body.count("xch_cycle_ledger_.try_lock(principal,current_fee_mojos_,min_coin)") == 1, (
-        "the spend-side admission charges the fee coin without the floor"
-    )
+    # The buy-XCH admission: no principal, the current fee, the floor.  Without
+    # the floor the wallet skips coins below it and locks a larger one than the
+    # ledger records.
+    _assert_ledger_admission(body, "xch_cycle_ledger_.try_lock_floor_only", "0",
+                             "the buy-XCH cycle admission")
+    _assert_ledger_admission(body, "xch_cycle_ledger_.try_lock", "principal",
+                             "the spend-side cycle admission")
 
 
 def test_the_preflight_probe_admits_against_the_same_floor():
     body = _code(_definition(OFFER_MANAGER_CPP, "bool OfferManager::xch_ledger_probe_admits("))
     assert body.count(LEDGER_FLOOR) == 1
-    assert body.count("probe.try_lock_floor_only(0,current_fee_mojos_,min_coin)") == 1, (
-        "the preflight probe admits buy-XCH tiers without the floor, so it can "
-        "keep a side the cycle ledger then refuses"
-    )
-    assert body.count(
-        "probe.try_lock(xch_principal_from_offer_dict(offer_dict),current_fee_mojos_,min_coin)"
-    ) == 1, "the preflight probe admits spend-side tiers without the floor"
+    # Without the floor the probe can keep a side the cycle ledger then refuses.
+    _assert_ledger_admission(body, "probe.try_lock_floor_only", "0",
+                             "the preflight probe, buy-XCH tiers")
+    _assert_ledger_admission(body, "probe.try_lock",
+                             "xch_principal_from_offer_dict",
+                             "the preflight probe, spend-side tiers")
 
 
 def test_no_ledger_admission_in_offer_manager_omits_the_floor():
