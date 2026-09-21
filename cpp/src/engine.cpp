@@ -21351,8 +21351,15 @@ void Engine::fee_feedback_signal(strategy::fee::Signal signal, BlockHeight block
 void Engine::fee_feedback_track_take(const std::string& trade_id, std::uint64_t fee,
                                      BlockHeight block)
 {
-    if (!fee_tracker_ || !fee_tracker_->controller_active()
-        || trade_id.empty() || trade_id == "unknown"
+    if (!fee_tracker_ || !fee_tracker_->controller_active()) {
+        return;
+    }
+    // [review #163 r5] The take SUCCEEDED -- this hook is called only after
+    // the wallet accepted it -- so an over-budget Take quote is now a real
+    // overrun and may open the episode.  Before the ticket guards below: the
+    // spend happened whether or not we can track it.
+    fee_tracker_->note_priority_spend(strategy::fee::ActionClass::Take, fee);
+    if (trade_id.empty() || trade_id == "unknown"
         || fee_tickets_.size() >= strategy::fee::kMaxTickets) {
         return;
     }
@@ -21365,6 +21372,20 @@ void Engine::fee_feedback_track_cancel(const std::string& offer_id, std::uint64_
     if (!fee_tracker_ || !fee_tracker_->controller_active() || !state_ || offer_id.empty()) {
         return;
     }
+    const PendingOffer cancelled = state_->get_offer(offer_id);
+    const PairConfig*  cancelled_pc =
+        cancelled.offer_id.empty() ? nullptr : find_pair_config(cancelled.pair_name);
+    const bool cancelled_offered_xch = cancelled_pc != nullptr
+        && ((cancelled.side == Side::Bid ? cancelled_pc->quote_asset_id
+                                         : cancelled_pc->base_asset_id) == "xch");
+    const strategy::fee::ActionClass cls = cancelled_pc != nullptr
+        ? strategy::fee::cancel_class(cancelled_offered_xch)
+        : strategy::fee::ActionClass::CancelCat;
+    // [review #163 r5] The wallet ACCEPTED this cancel (OfferManager's
+    // observer runs past the RPC, never before it), so an over-budget quote
+    // for its class is now a real overrun.  Ahead of every ticket guard
+    // below: the mojos are committed whether or not a ticket can be opened.
+    fee_tracker_->note_priority_spend(cls, fee);
     // A re-cancel (an escalation, an emergency tier) REPLACES the ticket: it
     // is a new spend at a new fee, and evidence about it starts now.
     if (fee_tickets_.size() >= strategy::fee::kMaxTickets
@@ -21381,14 +21402,8 @@ void Engine::fee_feedback_track_cancel(const std::string& offer_id, std::uint64_
         fee_tickets_.erase(offer_id);
         return;
     }
-    const PendingOffer po = state_->get_offer(offer_id);
-    const PairConfig* pc = po.offer_id.empty() ? nullptr : find_pair_config(po.pair_name);
-    const bool offered_is_xch = pc != nullptr
-        && ((po.side == Side::Bid ? pc->quote_asset_id : pc->base_asset_id) == "xch");
-    fee_tickets_.insert_or_assign(offer_id, fee_tracker_->make_ticket(
-        pc != nullptr ? strategy::fee::cancel_class(offered_is_xch)
-                      : strategy::fee::ActionClass::CancelCat,
-        fee, fee_now_block_));
+    fee_tickets_.insert_or_assign(offer_id,
+                                  fee_tracker_->make_ticket(cls, fee, fee_now_block_));
 }
 
 void Engine::fee_feedback_on_cancel_verdict(const std::string& offer_id,
@@ -21537,9 +21552,22 @@ asio::awaitable<void> Engine::fee_feedback_sweep(BlockHeight block)
     o.submit_level = found->second.submit_level;
     o.cls          = found->second.cls;   // [review #163] see Observation::cls
     o.now          = block;
-    o.blocks       = static_cast<double>(strategy::fee::ticket_age(found->second, block));
+    // [review #163 r5] o.blocks is set PER BRANCH.  Set once here it was the
+    // age at THIS heartbeat, and only one take is polled per heartbeat
+    // (oldest first, the `is_take` selection above), so a second ticketed
+    // take delays this read a heartbeat at a time -- turning an on-time
+    // confirmation into a late observation that raises the fee or fails a
+    // probe that was right.  Only another TAKE can do that: cancels are
+    // serviced in the same pass and never contend for the poll slot.
     if (status == execution::WalletCancelState::Confirmed) {
         o.signal = strategy::fee::Signal::Confirmed;
+        // Measured from the height the spend LANDED at, which the record
+        // already carries -- the same contract the cancel verdict has kept
+        // since r1 (strategy::fee::observation_for_cancel_verdict).  The
+        // helper clamps a height regression to 0, and a record that states no
+        // usable height falls back to `block`, the old behaviour.
+        o.blocks = static_cast<double>(strategy::fee::confirmation_delay(
+            found->second, execution::confirmed_height_from_record(record, block)));
         fee_tickets_.erase(found);
         fee_feedback_note(fee_tracker_->observe(o), block);
     } else if (status == execution::WalletCancelState::Failed
@@ -21551,6 +21579,9 @@ asio::awaitable<void> Engine::fee_feedback_sweep(BlockHeight block)
                && strategy::fee::pending_observation_due(found->second, block, target)) {
         found->second.last_pending_block = block;
         o.signal = strategy::fee::Signal::Pending;
+        // Still pending: there is no confirmation height, and the age at this
+        // heartbeat is exactly what a censored observation means.
+        o.blocks = static_cast<double>(strategy::fee::ticket_age(found->second, block));
         fee_feedback_note(fee_tracker_->observe(o), block);
     }
     co_return;

@@ -27,6 +27,8 @@
 #include "xop/strategy/fee_controller.hpp"
 #include "xop/types.hpp"
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <utility>
@@ -176,12 +178,37 @@ public:
     [[nodiscard]] std::uint64_t last_bound_desired() const noexcept { return last_bound_desired_; }
     [[nodiscard]] std::uint64_t last_bound_allowed() const noexcept { return last_bound_allowed_; }
 
+    /// [review #163 r5] A PRIORITY spend the wallet ACCEPTED, at the fee
+    /// really paid.  This -- not a quote -- is what turns an over-budget
+    /// recommendation into an over-budget EPISODE.
+    ///
+    /// Why it has to be separate from `get_recommended_fee`.  Step 8 asks for
+    /// both cancel classes every heartbeat before any cancellation, and a take
+    /// fee is computed while a candidate is still being evaluated.  Latching
+    /// the overrun there recorded "a priority spend was PAID over budget",
+    /// queued FeeBudgetUnfunded and logged "PAYING IT ANYWAY" on heartbeats
+    /// where no wallet RPC was sent at all -- a quote is not a spend.
+    ///
+    /// The engine calls this from the two places a priority spend becomes
+    /// real: OfferManager's cancel observer (the wallet accepted the cancel)
+    /// and the take-success hook.  It is also where the episode CLEARS: a
+    /// priority spend accepted at a fee its class's last quote could fund
+    /// means the budget funds priority spends again.
+    ///
+    /// @param action          The class of the spend (OfferAttached is
+    ///                        ignored: an attached fee is paid by a fill, and
+    ///                        the budget never reports it over).
+    /// @param fee_paid_mojos  What was actually paid.
+    void note_priority_spend(strategy::fee::ActionClass action,
+                             std::uint64_t              fee_paid_mojos);
+
     /// [review #163 r3] True ONCE per episode in which the budget could NOT
     /// fund a priority spend (a cancel or a take).  That spend was paid in
     /// full anyway -- a cancel priced below the node's admission floor never
     /// confirms, keeps its coins locked and ends in a wallet-wide
     /// force-delete -- so this is an alert about the BUDGET, not a degraded
-    /// fee.  The episode ends when a priority fee next fits the headroom.
+    /// fee.  [review #163 r5] The episode opens at note_priority_spend, never
+    /// at a quote, and ends when an accepted priority spend fits the headroom.
     [[nodiscard]] bool take_budget_unfunded_alert() noexcept;
 
     /// The priority fee last paid over budget, the headroom it exceeded, and
@@ -246,6 +273,24 @@ private:
     std::uint64_t last_unfunded_fee_{0};
     std::uint64_t last_unfunded_headroom_{0};
     strategy::fee::ActionClass last_unfunded_action_{strategy::fee::ActionClass::CancelCat};
+
+    /// [review #163 r5] The would-be overrun of the LAST quote for each action
+    /// class: INERT DATA, not an episode.  controller_fee writes it and
+    /// changes nothing else; note_priority_spend promotes it when the spend
+    /// is real.
+    ///
+    /// One slot PER CLASS, not one slot overall, because Step 8 quotes
+    /// CancelXch and then CancelCat in the same heartbeat: with a single slot
+    /// the XCH cancel that is accepted afterwards would read the CAT quote,
+    /// which is a different fee against the same headroom -- and would take
+    /// the "the budget funds priority spends again" branch on a class
+    /// mismatch, clearing an episode nothing had resolved.
+    struct PendingUnfunded {
+        bool          over{false};
+        std::uint64_t fee{0};
+        std::uint64_t headroom{0};
+    };
+    std::array<PendingUnfunded, strategy::fee::kActionClassCount> pending_unfunded_{};
 
     /// The controller path of get_recommended_fee.
     std::uint64_t controller_fee(strategy::fee::ActionClass action, BlockHeight current_block);

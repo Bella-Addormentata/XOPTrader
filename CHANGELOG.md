@@ -65,7 +65,11 @@ default to off, and with both off every fee is what v0.10.24 paid.
   mojos per cost against the 5 a full mempool admits, so a degraded cancel is a
   spend that cannot be mined, keeps its coins locked and ends in a wallet-wide
   force-delete. It is paid in full — `max_fee_mojos` is the ceiling that bounds
-  it — and the overrun is reported with one `FeeBudgetUnfunded` alert.
+  it — and the overrun is reported with one `FeeBudgetUnfunded` alert. That
+  report is raised when the wallet ACCEPTS the spend, never when a fee is
+  merely quoted: Step 8 prices both cancel classes every heartbeat before it
+  cancels anything, so reporting at the quote would say "paid over budget" on
+  heartbeats that sent no wallet RPC at all.
 - **The budget is sized by derivation, not by a quoted number.** At full-mempool
   prices and this wallet's measured action rates one `fee_window_blocks` window
   costs 15,163,585,937 mojos, so `daily_budget_mojos` wants at least
@@ -83,7 +87,10 @@ default to off, and with both off every fee is what v0.10.24 paid.
   last-processed-block marker, which trails by a cycle and is 0 at boot; with
   no known height no ticket is opened, and a ticket at height 0 is never
   evidence. Both fee bounds are capped at 2^63, so a floor above it cannot put
-  the minimum over the maximum.
+  the minimum over the maximum. A take's ticket closes on the wallet's own
+  `confirmed_at_index`, not on the heartbeat that read it: the sweep polls one
+  take per heartbeat, so a second ticketed take would otherwise turn an on-time
+  confirmation into a late one and raise the fee.
 - **Observability.** One `[FeeController] rate a -> b mojos/cost (reason; n
   move(s)) -- fees now: ...` line per burst of changes, and two gauges,
   `xop_fees_controller_rate_mojos_per_cost` and `xop_fees_controller_level_log2`.

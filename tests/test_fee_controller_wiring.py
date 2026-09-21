@@ -194,28 +194,81 @@ def _nth_argument(args: str, n: int) -> str:
 
 
 # [review #163 r4] The fee expression every cancel_offer_charged site is allowed
-# to pass, and why.  An ALLOWLIST, not a denylist: the previous form of this
-# scan counted `cancel_fee_for(` and rejected `current_fee_mojos_`, so a NEW
-# site with a hardcoded non-zero fee -- say `cancel_offer_charged(id,
-# 15000000, true)` -- was neither token and passed silently while paying a fee
-# no controller and no config could move.
+# to pass, and why.  An ALLOWLIST, not a denylist: the form before r4 counted
+# `cancel_fee_for(` and rejected `current_fee_mojos_`, so a NEW site with a
+# hardcoded non-zero fee -- say `cancel_offer_charged(id, 15000000, true)` --
+# was neither token and passed silently while paying a fee no controller and no
+# config could move.
+#
+# [review #163 r5] ... and r4's allowlist was matched by SUBSTRING, with the
+# bare three-letter entry `fee` in it.  That one entry degenerated the whole
+# list: `hardcoded_fee`, `wrong_fee` and `fee_for_unknown_class()` all contain
+# it, so all three passed.  The tightening did catch the exact mutation the
+# integration check found -- a bare `15000000` contains none of the tokens --
+# but it narrowed the hole rather than closing it.  Matching is now EXACT, and
+# the one genuinely structural case has its own rule below.
 ALLOWED_CANCEL_FEES = {
-    # The per-offer controller fee.  This is the one that must be used.
-    "cancel_fee_for(": "the per-offer class-aware fee",
     # [S31] The dead man's switch pays a fixed policy fee on purpose: the
     # watchdog has given up managing the book and must not consult a loop.
     "xop::risk::watchdog_cancel().fee_mojos": "the dead man's switch policy fee",
     # [S14/#157] The escalation's own fee, itself derived from
     # get_recommended_fee(CancelCat) -- pinned by the call-site scan above.
-    "attempt_fee": "the #157 escalation fee",
-    # The definition and the single internal forwarder.
-    "std::uint64_t fee": "the function's own parameter",
-    "fee": "forwarded from the caller",
+    "static_cast<std::uint64_t>(attempt_fee)": "the #157 escalation fee",
+    # The definition and the single internal forwarder (recancel_secure).
+    "std::uint64_t fee": "the function's own parameter, i.e. the definition",
+    "fee": "forwarded unchanged by the one internal caller",
+    # An explicit literal 0: a genuinely free retire pays nothing, and "free"
+    # is a decision a reader can check at a glance.  Any OTHER literal is a
+    # hardcoded fee and fails.
+    "0": "an explicit free retire",
 }
-# An explicit literal 0 is allowed: a genuinely free retire pays nothing, and
-# "free" is a decision a reader can check at a glance.  Any OTHER literal is
-# a hardcoded fee and fails.
-ZERO_FEE = "0"
+
+# The one STRUCTURAL exemption: the per-offer class-aware fee, whose argument
+# is whatever local holds the offer id at that site.  Nothing may follow the
+# closing paren, so `cancel_fee_for(id) + 1` is not this rule.
+CANCEL_FEE_FOR = re.compile(r"cancel_fee_for\([^()]*\)\Z")
+
+
+def _cancel_fee_allowed(fee_arg: str) -> bool:
+    """Is `fee_arg` (whitespace-collapsed) a fee a cancel site may pay?"""
+    return fee_arg in ALLOWED_CANCEL_FEES or bool(CANCEL_FEE_FOR.match(fee_arg))
+
+
+def test_the_cancel_fee_allowlist_actually_rejects_an_invented_fee():
+    """[review #163 r5] The scan below is worth exactly as much as this: a
+    classifier that accepts everything pins nothing.  The three names here are
+    the counter-examples the reviewer gave against the r4 substring form, plus
+    the hardcoded literal r4 was written to catch and the stale member it
+    replaced."""
+    for bad in (
+        "hardcoded_fee",                # substring-matched `fee`
+        "wrong_fee",                    # substring-matched `fee`
+        "fee_for_unknown_class()",      # substring-matched `fee`
+        "some_fee",
+        "15000000",                     # the integration check's M7 mutation
+        "15'000'000ULL",
+        "current_fee_mojos_",           # the member the per-offer fee replaced
+        "cancel_fee_for(id) + 1",       # not the structural rule
+        "cancel_fee_for(id) * 2",
+        "std::max(cancel_fee_for(id), 15000000ULL)",
+        "fee + 1",
+        "fee * 2",
+        "0 + 1",
+        "1",
+    ):
+        assert not _cancel_fee_allowed(bad), bad
+    for good in (
+        "cancel_fee_for(po.offer_id)",
+        "cancel_fee_for(oid)",
+        "cancel_fee_for(offer_id)",
+        "cancel_fee_for(wo->trade_id)",
+        "xop::risk::watchdog_cancel().fee_mojos",
+        "static_cast<std::uint64_t>(attempt_fee)",
+        "std::uint64_t fee",
+        "fee",
+        "0",
+    ):
+        assert _cancel_fee_allowed(good), good
 
 
 def test_offer_manager_cancels_pay_cancel_fee_for_not_the_single_fee():
@@ -231,24 +284,25 @@ def test_offer_manager_cancels_pay_cancel_fee_for_not_the_single_fee():
     assert not stale, stale
 
     # [review #163 r4] And nothing else may invent a fee.  Every site's SECOND
-    # argument must be one of the allowed expressions or an explicit zero.
-    unknown = []
-    for args in calls:
-        fee_arg = " ".join(_nth_argument(args, 1).split())
-        if fee_arg == ZERO_FEE:
-            continue
-        if any(token in fee_arg for token in ALLOWED_CANCEL_FEES):
-            continue
-        unknown.append(fee_arg)
+    # argument must be an allowed expression -- [r5] by EQUALITY, or by the one
+    # structural cancel_fee_for(...) rule.
+    unknown = [
+        fee_arg for fee_arg in
+        (" ".join(_nth_argument(args, 1).split()) for args in calls)
+        if not _cancel_fee_allowed(fee_arg)
+    ]
     assert not unknown, (
         "cancel_offer_charged sites paying a fee that is neither cancel_fee_for(), an "
         "explicit 0, nor a documented policy fee: %r. A hardcoded fee cannot be moved by "
         "the controller, by fees.min_fee_mojos or by the operator -- use cancel_fee_for(), "
         "or add the new expression to ALLOWED_CANCEL_FEES with the reason it is exempt."
         % (unknown,))
-    # The allowlist itself must stay honest: a token so loose it matches
-    # anything would silently re-open the hole.
-    assert all(len(token) >= 3 for token in ALLOWED_CANCEL_FEES)
+    # Every allowlist entry must still be USED: a stale exemption is a hole
+    # nobody is looking at.
+    used = {" ".join(_nth_argument(args, 1).split()) for args in calls}
+    unused = sorted(set(ALLOWED_CANCEL_FEES) - used)
+    assert not unused, (
+        "allowlist entries no cancel site pays any more -- delete them: %r" % (unused,))
     # Inert without the override: the first statement returns the legacy fee.
     body = _function_body(text, "std::uint64_t OfferManager::cancel_fee_for(")
     assert re.search(r"if\s*\(\s*!cancel_fees_active_\s*\)\s*\{\s*return current_fee_mojos_;", body)
@@ -338,6 +392,98 @@ def test_every_ticket_has_an_unconditional_age_cap_not_just_takes():
     assert "strategy::fee::kVerdictTtlBlocks" not in body, (
         "the sweep compares an age against kVerdictTtlBlocks directly; that was the "
         "take-only rule ticket_abandoned replaced")
+
+
+def test_a_confirmed_take_is_aged_from_its_confirmation_height():
+    """[review #163 r5] The sweep polls ONE take per heartbeat, oldest first
+    (the selection sits inside `if (is_take)`, so only another TAKE can delay
+    it -- cancels are serviced in the same pass and never contend for the
+    slot).  `o.blocks` was set once, in the prologue above the status switch,
+    as the age at THIS heartbeat: a delayed poll then reported an on-time
+    confirmation as late, which raises the fee or fails a probe that was
+    right.  The CANCEL verdict has measured from the height the spend landed
+    at since r1 (observation_for_cancel_verdict); the take path kept the old
+    shape.  It is set PER BRANCH now."""
+    body = _function_body(_engine(), "asio::awaitable<void> Engine::fee_feedback_sweep(")
+    poll = body.index("co_await wallet_->get_offer(take_to_poll")
+    tail = body[poll:]
+
+    # Exactly two assignments, one per branch that speaks -- NOT one shared
+    # prologue assignment above the switch.
+    blocks = [m.start() for m in re.finditer(r"\bo\.blocks\s*=", tail)]
+    assert len(blocks) == 2, (
+        "o.blocks must be set inside each branch that observes, never once above the "
+        "status switch: found %d assignment(s)" % len(blocks))
+    confirmed = tail.index("strategy::fee::Signal::Confirmed")
+    pending = tail.index("strategy::fee::Signal::Pending", confirmed)
+    assert confirmed < blocks[0] < pending < blocks[1], (confirmed, blocks, pending)
+
+    # The confirmed one measures from the record's own height, through the
+    # helper that clamps a height regression to 0.
+    conf_stmt = tail[blocks[0]:tail.index(";", blocks[0])]
+    assert "strategy::fee::confirmation_delay(" in conf_stmt, conf_stmt
+    assert "execution::confirmed_height_from_record(record" in conf_stmt, conf_stmt
+    assert "ticket_age(" not in conf_stmt, (
+        "a confirmed take must not be aged to the heartbeat that noticed: %r" % conf_stmt)
+    # ... falling back to the heartbeat only when the record states no height.
+    assert re.search(r"confirmed_height_from_record\(record,\s*block\)", conf_stmt), conf_stmt
+
+    # A still-pending take has no confirmation height, so its censored
+    # observation IS the age at this heartbeat.
+    pend_stmt = tail[blocks[1]:tail.index(";", blocks[1])]
+    assert "strategy::fee::ticket_age(" in pend_stmt, pend_stmt
+    assert "confirmation_delay" not in pend_stmt, pend_stmt
+
+    # The premise: one take per heartbeat, and the selection is take-only.
+    assert len(re.findall(r"wallet_->get_offer\(", body)) == 1
+    take_only = body.index("if (is_take) {")
+    chosen = re.search(r"take_to_poll\s*=\s*it->first", body)
+    assert chosen is not None and take_only < chosen.start()
+
+
+def test_an_over_budget_quote_becomes_an_episode_only_at_an_accepted_spend():
+    """[review #163 r5] Step 8 calls get_recommended_fee for both cancel
+    classes every heartbeat BEFORE any cancellation, and a take fee is
+    computed during candidate evaluation.  Latching the overrun inside the
+    quote queued FeeBudgetUnfunded and logged "PAYING IT ANYWAY" on heartbeats
+    where no wallet RPC was sent at all."""
+    tracker = _strip_line_comments(_read(REPO / "cpp" / "src" / "strategy" / "fee_tracker.cpp"))
+    priced = _function_body(tracker, "std::uint64_t FeeTracker::controller_fee(")
+    # The quote records the would-be overrun and changes nothing else.
+    assert "pending_unfunded_[static_cast<std::size_t>(action)]" in priced
+    assert "budget_unfunded_" not in priced, (
+        "controller_fee must not latch the unfunded episode: it prices, it does not spend")
+    assert "unfunded_alert_pending_" not in priced
+    assert "PAYING IT ANYWAY" not in priced
+    # The BOUND episode is a different thing and stays here: it is a fact
+    # about the fee this call RETURNS (an attached fee really was degraded).
+    assert "budget_bound_" in priced
+
+    spent = _function_body(tracker, "void FeeTracker::note_priority_spend(")
+    assert "unfunded_alert_pending_ = true;" in spent
+    assert "budget_unfunded_        = true;" in spent
+    assert "budget_unfunded_ = false;" in spent, "and this is where the episode ends"
+    # Per class: Step 8 quotes CancelXch then CancelCat in the same heartbeat.
+    assert "pending_unfunded_[static_cast<std::size_t>(action)]" in spent
+    # An attached fee is never a priority spend.
+    assert "strategy::fee::is_priority(action)" in spent
+
+    engine = _engine()
+    # ... and the engine promotes it at the two places a spend becomes real.
+    notes = _call_arguments(engine, "fee_tracker_->note_priority_spend")
+    assert len(notes) == 2, notes
+    take = _function_body(engine, "void Engine::fee_feedback_track_take(")
+    cancel = _function_body(engine, "void Engine::fee_feedback_track_cancel(")
+    assert "fee_tracker_->note_priority_spend(strategy::fee::ActionClass::Take, fee);" in take
+    assert "fee_tracker_->note_priority_spend(cls, fee);" in cancel
+    # Ahead of every ticket guard: the mojos are committed whether or not a
+    # ticket can be opened for them.
+    assert take.index("note_priority_spend") < take.index("fee_tickets_.emplace(")
+    assert cancel.index("note_priority_spend") < cancel.index("if (fee_now_block_ == 0) {")
+    assert cancel.index("note_priority_spend") < cancel.index(
+        "fee_tickets_.size() >= strategy::fee::kMaxTickets")
+    # The cancel's class is decided once and used for both.
+    assert cancel.index("strategy::fee::cancel_class(") < cancel.index("note_priority_spend")
 
 
 def test_every_glue_function_is_inert_with_the_controller_off():

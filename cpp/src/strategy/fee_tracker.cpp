@@ -416,28 +416,19 @@ std::uint64_t FeeTracker::controller_fee(strategy::fee::ActionClass action,
     // [review #163 r3] A priority spend the budget cannot fund is PAID, and
     // said out loud.  Degrading it to min_fee is what produced cancels the
     // node would not admit; the budget's authority over a cancel ends at the
-    // report.  One alert per episode, cleared by the next funded cancel.
-    if (budgeted.over_budget) {
-        last_unfunded_fee_      = budgeted.fee;
-        last_unfunded_headroom_ = headroom;
-        last_unfunded_action_   = action;
-        if (!budget_unfunded_) {
-            budget_unfunded_        = true;
-            unfunded_alert_pending_ = true;
-            spdlog::warn("[FeeController] the fee budget CANNOT FUND a {}: it needs {} mojos "
-                         "(fees.max_fee_mojos and the node's own floor already bound that) and "
-                         "the window has {} left of {}. PAYING IT ANYWAY -- a cancel priced "
-                         "below what the node will admit never confirms, keeps its coins "
-                         "locked and ends in a wallet-wide force-delete. Raise "
-                         "fees.daily_budget_mojos.",
-                         strategy::fee::to_string(action), budgeted.fee, headroom,
-                         cfg_.daily_budget_mojos);
-        }
-    } else if (strategy::fee::is_priority(action) && budget_unfunded_) {
-        budget_unfunded_ = false;
-        spdlog::info("[FeeController] the fee budget funds priority spends again (headroom {} "
-                     "mojos)", headroom);
-    }
+    // report.
+    //
+    // [review #163 r5] But THIS IS A QUOTE, NOT A SPEND.  Step 8 asks for both
+    // cancel classes every heartbeat before any cancellation, and a take fee
+    // is computed while a candidate is still being evaluated -- so latching
+    // here recorded an episode in which a priority spend was PAID over budget,
+    // queued FeeBudgetUnfunded and logged "PAYING IT ANYWAY" on heartbeats
+    // where no wallet RPC was sent at all.  The overrun is stashed as inert
+    // data; note_priority_spend promotes it when the wallet accepts the spend.
+    PendingUnfunded& pending = pending_unfunded_[static_cast<std::size_t>(action)];
+    pending.over     = budgeted.over_budget;
+    pending.fee      = budgeted.fee;
+    pending.headroom = headroom;
 
     if (budgeted.bound) {
         last_bound_desired_ = desired;
@@ -462,6 +453,45 @@ std::uint64_t FeeTracker::controller_fee(strategy::fee::ActionClass action,
                      headroom);
     }
     return budgeted.fee;
+}
+
+void FeeTracker::note_priority_spend(strategy::fee::ActionClass action,
+                                     std::uint64_t              fee_paid_mojos)
+{
+    // [review #163 r5] The reporting half of controller_fee.  An attached fee
+    // is never reported over budget (strategy::fee::apply_budget degrades it
+    // instead), and with the controller off nothing here has an opinion.
+    if (!controller_.enabled() || !strategy::fee::is_priority(action)) {
+        return;
+    }
+    const PendingUnfunded& quote = pending_unfunded_[static_cast<std::size_t>(action)];
+    // The spend counts against the quote it was priced from.  A spend that
+    // came in UNDER that quote -- an escalation tier below it, a policy fee --
+    // did not overrun the headroom the quote measured, so it is not evidence.
+    if (quote.over && fee_paid_mojos >= quote.fee) {
+        last_unfunded_fee_      = fee_paid_mojos;
+        last_unfunded_headroom_ = quote.headroom;
+        last_unfunded_action_   = action;
+        if (!budget_unfunded_) {
+            budget_unfunded_        = true;
+            unfunded_alert_pending_ = true;
+            spdlog::warn("[FeeController] the fee budget CANNOT FUND a {}: it PAID {} mojos "
+                         "(fees.max_fee_mojos and the node's own floor already bound that) and "
+                         "the window had {} left of {}. PAID ANYWAY -- a cancel priced "
+                         "below what the node will admit never confirms, keeps its coins "
+                         "locked and ends in a wallet-wide force-delete. Raise "
+                         "fees.daily_budget_mojos.",
+                         strategy::fee::to_string(action), fee_paid_mojos, quote.headroom,
+                         cfg_.daily_budget_mojos);
+        }
+        return;
+    }
+    if (budget_unfunded_) {
+        budget_unfunded_ = false;
+        spdlog::info("[FeeController] the fee budget funds priority spends again (a {} of {} "
+                     "mojos was accepted within a headroom of {})",
+                     strategy::fee::to_string(action), fee_paid_mojos, quote.headroom);
+    }
 }
 
 }  // namespace xop

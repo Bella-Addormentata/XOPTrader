@@ -1934,10 +1934,16 @@ TEST(FeeTrackerController, ControllerOnRaisesOnEvidenceAndIsNeverZero)
     EXPECT_EQ(t.get_recommended_fee(1, 113, ActionClass::OfferAttached), kMinFee);
     // ... and the gate does not refuse every tier on budget grounds.
     EXPECT_TRUE(t.should_post_offer(10'000'000'000ULL, kMinFee, 113));
-    // One UNFUNDED alert per episode: the budget could not cover the cancel.
+    // [review #163 r5] The quotes above are RECOMMENDATIONS -- Step 8 asks for
+    // both cancel classes every heartbeat before it cancels anything -- so
+    // none of them is an episode yet.
+    EXPECT_FALSE(t.take_budget_unfunded_alert());
+    // One UNFUNDED alert per episode, opened by the spend the wallet accepted.
+    t.note_priority_spend(ActionClass::CancelCat, want_cancel);
     EXPECT_TRUE(t.take_budget_unfunded_alert());
     EXPECT_FALSE(t.take_budget_unfunded_alert());
     t.get_recommended_fee(1, 114, ActionClass::CancelCat);
+    t.note_priority_spend(ActionClass::CancelCat, want_cancel);
     EXPECT_FALSE(t.take_budget_unfunded_alert());
     EXPECT_EQ(t.last_unfunded_fee(), want_cancel);
     EXPECT_EQ(t.last_unfunded_headroom(), 0U);
@@ -1981,6 +1987,7 @@ TEST(FeeTrackerController, TheReserveKeepsCancelsFundedWhileAttachedFeesAreSquee
     EXPECT_EQ(t.get_recommended_fee(1, 101, ActionClass::Take), take);
     EXPECT_EQ(t.get_recommended_fee(1, 101, ActionClass::CancelXch),
               t.controller().fee_for(ActionClass::CancelXch, 101));
+    t.note_priority_spend(ActionClass::CancelCat, cancel);
     EXPECT_FALSE(t.take_budget_unfunded_alert());        // they all fit: nothing to report
 
     t.record_fee(45'000'000ULL, 101);                    // 5M above the reserve: under min_fee
@@ -2000,15 +2007,137 @@ TEST(FeeTrackerController, TheReserveKeepsCancelsFundedWhileAttachedFeesAreSquee
     // failure this controller exists to remove.
     EXPECT_EQ(t.get_recommended_fee(1, 2'001, ActionClass::CancelCat), cancel);
     EXPECT_EQ(t.get_recommended_fee(1, 2'001, ActionClass::Take), take);
+    // [review #163 r5] ... once the cancel is actually SENT, not when it is
+    // priced.
+    EXPECT_FALSE(t.take_budget_unfunded_alert());
+    t.note_priority_spend(ActionClass::CancelCat, cancel);
     EXPECT_TRUE(t.take_budget_unfunded_alert());
     EXPECT_FALSE(t.take_budget_unfunded_alert());
     EXPECT_EQ(t.last_unfunded_headroom(), 10'000'000ULL);
-    // The window rolls again: priority spends fit, and the episode ends.
+    // The window rolls again: priority spends fit, and the episode ends -- on
+    // the accepted spend, so the quote alone neither opens nor closes it.
     EXPECT_EQ(t.get_recommended_fee(1, 2'000 + 1'662 + 1, ActionClass::CancelCat), cancel);
+    t.note_priority_spend(ActionClass::CancelCat, cancel);
     EXPECT_FALSE(t.take_budget_unfunded_alert());
     t.record_fee(19'990'000'000ULL, 4'000);
     EXPECT_EQ(t.get_recommended_fee(1, 4'001, ActionClass::CancelCat), cancel);
+    t.note_priority_spend(ActionClass::CancelCat, cancel);
     EXPECT_TRUE(t.take_budget_unfunded_alert());
+}
+
+TEST(FeeTrackerController, AnOverBudgetQuoteIsNotAnEpisodeUntilTheSpendIsAccepted)
+{
+    // [review #163 r5] FINDING 2.  Step 8 calls get_recommended_fee for BOTH
+    // cancel classes every heartbeat before any cancellation, and a take fee
+    // is computed while a candidate is still being evaluated.  Latching the
+    // overrun on the quote queued FeeBudgetUnfunded and logged "PAYING IT
+    // ANYWAY" on heartbeats where no wallet RPC was sent at all.
+    xop::FeeConfig cfg = tracker_config(true, false);
+    cfg.daily_budget_mojos = 20'000'000'000ULL;
+    cfg.controller_max_step_up = 8.0;
+    xop::FeeTracker t{cfg};
+    t.observe(hard(Signal::ForceDelete, 100));           // level 4.0: every fee x16
+    const std::uint64_t cancel_cat = t.get_recommended_fee(1, 100, ActionClass::CancelCat);
+    const std::uint64_t cancel_xch = t.get_recommended_fee(1, 100, ActionClass::CancelXch);
+    const std::uint64_t take       = t.get_recommended_fee(1, 100, ActionClass::Take);
+    ASSERT_GT(cancel_cat, 0ULL);
+    ASSERT_GT(cancel_xch, 0ULL);
+    ASSERT_NE(cancel_cat, cancel_xch);                   // the classes really differ
+
+    t.record_fee(20'000'000'000ULL, 100);                // headroom 0: nothing fits
+    // A HUNDRED heartbeats of pure pricing.  Not one of them spends anything.
+    for (std::uint32_t h = 101; h < 201; ++h) {
+        EXPECT_EQ(t.get_recommended_fee(1, h, ActionClass::OfferAttached), kMinFee);
+        EXPECT_EQ(t.get_recommended_fee(1, h, ActionClass::CancelXch), cancel_xch);
+        EXPECT_EQ(t.get_recommended_fee(1, h, ActionClass::CancelCat), cancel_cat);
+        EXPECT_EQ(t.get_recommended_fee(1, h, ActionClass::Take), take);
+        EXPECT_FALSE(t.take_budget_unfunded_alert()) << "quoted at height " << h;
+    }
+    // One accepted cancel, and now it is an episode -- reporting the fee
+    // really PAID and the headroom its own class's quote measured.
+    t.note_priority_spend(ActionClass::CancelXch, cancel_xch);
+    EXPECT_TRUE(t.take_budget_unfunded_alert());
+    EXPECT_FALSE(t.take_budget_unfunded_alert());
+    EXPECT_EQ(t.last_unfunded_action(), ActionClass::CancelXch);
+    EXPECT_EQ(t.last_unfunded_fee(), cancel_xch);
+    EXPECT_EQ(t.last_unfunded_headroom(), 0U);
+
+    // An ATTACHED fee is never a priority spend, so it can neither open the
+    // episode nor close it.
+    t.note_priority_spend(ActionClass::OfferAttached, 1'000'000'000ULL);
+    EXPECT_FALSE(t.take_budget_unfunded_alert());
+
+    // The window rolls: the quotes fit again, but only an accepted spend ends
+    // the episode -- and then a fresh overrun alerts again.
+    EXPECT_EQ(t.get_recommended_fee(1, 100 + 1'662 + 1, ActionClass::CancelXch), cancel_xch);
+    t.note_priority_spend(ActionClass::CancelXch, cancel_xch);
+    t.record_fee(20'000'000'000ULL, 100 + 1'662 + 1);
+    EXPECT_EQ(t.get_recommended_fee(1, 100 + 1'662 + 2, ActionClass::CancelXch), cancel_xch);
+    t.note_priority_spend(ActionClass::CancelXch, cancel_xch);
+    EXPECT_TRUE(t.take_budget_unfunded_alert());
+}
+
+TEST(FeeTrackerController, EachPriorityClassCarriesItsOwnPendingOverrun)
+{
+    // [review #163 r5] Step 8 quotes CancelXch and then CancelCat in the SAME
+    // heartbeat.  With one pending slot for all classes, the XCH cancel that
+    // is accepted afterwards would read the CAT quote: a different fee
+    // against the same headroom, and -- on the class mismatch -- the "funds
+    // priority spends again" branch, clearing an episode nothing resolved.
+    xop::FeeConfig cfg = tracker_config(true, false);
+    cfg.daily_budget_mojos = 20'000'000'000ULL;
+    cfg.controller_max_step_up = 8.0;
+    xop::FeeTracker t{cfg};
+    t.observe(hard(Signal::ForceDelete, 100));
+    const std::uint64_t cancel_xch = t.get_recommended_fee(1, 100, ActionClass::CancelXch);
+    const std::uint64_t cancel_cat = t.get_recommended_fee(1, 100, ActionClass::CancelCat);
+    ASSERT_LT(cancel_xch, cancel_cat);                   // an XCH cancel is the cheaper spend
+
+    // Headroom that funds the XCH cancel and NOT the CAT one.
+    t.record_fee(20'000'000'000ULL - cancel_xch, 100);
+    ASSERT_EQ(t.budget_remaining(101), cancel_xch);
+    EXPECT_EQ(t.get_recommended_fee(1, 101, ActionClass::CancelXch), cancel_xch);
+    EXPECT_EQ(t.get_recommended_fee(1, 101, ActionClass::CancelCat), cancel_cat);
+
+    // The XCH cancel goes out and fits: no episode, though the LAST quote of
+    // the heartbeat (CancelCat) did not fit.
+    t.note_priority_spend(ActionClass::CancelXch, cancel_xch);
+    EXPECT_FALSE(t.take_budget_unfunded_alert());
+    // The CAT cancel goes out and does not fit: episode, at ITS fee.
+    t.note_priority_spend(ActionClass::CancelCat, cancel_cat);
+    EXPECT_TRUE(t.take_budget_unfunded_alert());
+    EXPECT_EQ(t.last_unfunded_action(), ActionClass::CancelCat);
+    EXPECT_EQ(t.last_unfunded_fee(), cancel_cat);
+    EXPECT_EQ(t.last_unfunded_headroom(), cancel_xch);
+}
+
+TEST(FeeTrackerController, AnAcceptedXchCancelReadsItsOwnQuoteNotTheCatOneQuotedAfterIt)
+{
+    // [review #163 r5] The case a SINGLE pending slot gets wrong.  Step 8
+    // quotes CancelXch and then CancelCat in one heartbeat, so the slot holds
+    // the CAT quote when the XCH cancel is accepted.  Both are over budget
+    // here, and the XCH fee is the smaller one -- so a single slot compares
+    // the XCH fee PAID against the CAT fee QUOTED, decides the spend came in
+    // under its quote, and takes the "the budget funds priority spends again"
+    // branch: no alert at all for a cancel that really was unfunded.
+    xop::FeeConfig cfg = tracker_config(true, false);
+    cfg.daily_budget_mojos = 20'000'000'000ULL;
+    cfg.controller_max_step_up = 8.0;
+    xop::FeeTracker t{cfg};
+    t.observe(hard(Signal::ForceDelete, 100));
+    t.record_fee(20'000'000'000ULL, 100);                // headroom 0: neither fits
+    ASSERT_EQ(t.budget_remaining(101), 0U);
+
+    const std::uint64_t cancel_xch = t.get_recommended_fee(1, 101, ActionClass::CancelXch);
+    const std::uint64_t cancel_cat = t.get_recommended_fee(1, 101, ActionClass::CancelCat);
+    ASSERT_LT(cancel_xch, cancel_cat);                   // the CAT quote is the larger
+
+    t.note_priority_spend(ActionClass::CancelXch, cancel_xch);
+    EXPECT_TRUE(t.take_budget_unfunded_alert())
+        << "an unfunded XCH cancel must alert on ITS OWN quote, not the CAT one after it";
+    EXPECT_EQ(t.last_unfunded_action(), ActionClass::CancelXch);
+    EXPECT_EQ(t.last_unfunded_fee(), cancel_xch);
+    EXPECT_EQ(t.last_unfunded_headroom(), 0U);
 }
 
 TEST(FeeTrackerController, TheCancelReserveCannotSwallowTheWholeBudget)

@@ -1411,6 +1411,15 @@ static_assert(ticket_abandoned(Ticket{ActionClass::CancelCat, 100U, 0.0, 0U, fal
     return confirmed_block >= t.submit_block ? confirmed_block - t.submit_block : 0U;
 }
 
+// [review #163 r5] The two measures are NOT interchangeable, and the gap is
+// the whole finding: a take submitted at 1'000 that confirmed at 1'003 is 3
+// heights late -- but if a second ticketed take held the single poll slot and
+// this one was not read until 1'010, its AGE is 10.  Fed as the confirmation
+// delay, that is a 7-height error charged to the fee.
+static_assert(confirmation_delay(Ticket{ActionClass::Take, 1'000U, 0.0, 0U, false, 0U},
+                                 1'003U) == 3U);
+static_assert(ticket_age(Ticket{ActionClass::Take, 1'000U, 0.0, 0U, false, 0U}, 1'010U) == 10U);
+
 /// What Step 2's terminal verdict on a ticketed cancel tells the controller.
 ///
 /// [review #163] OfferManager::recheck_terminal answers StillTerminal for the
