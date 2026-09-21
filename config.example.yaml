@@ -394,6 +394,15 @@ strategy:
   # exposure_rule: unified -- one reserve-exposure verdict for the pre-post
   #   projection AND the resting-offer check, from inputs that do not move
   #   when an offer locks a coin.  Log: "exposure (unified)".
+  #   FAILS CLOSED, and not as a reserve breach: while a LIVE resting offer's
+  #   pair cannot be resolved against this config (an adopted UNKNOWN wallet
+  #   record, or a pair since REMOVED from the file -- a merely DISABLED pair
+  #   is still mapped), the resting sum is a lower bound while the wallet
+  #   balance still counts the coins that offer locks, so new posts are
+  #   suppressed on both sides until it drains.  No resting offer is ever
+  #   cancelled on its account.  Watch for the line that says so in its own
+  #   words: "exposure (unified) ... cannot be projected -- a LIVE resting
+  #   offer's pair is not in this config".
   # exposure_rule: legacy                  # [OPTIONAL, default: legacy] legacy | unified
   # exposure_cancel_hysteresis_pct: 0.25   # [OPTIONAL, default: 0.25] [0, 1] unified only: resting offers are cancelled only below reserve x (1 - this); 1 = never cancel, suppress only
   # exposure_cancel_min_age_blocks: 32     # [OPTIONAL, default: 32] [0, 4608] unified only: younger offers are never exposure-cancelled (32 blocks = 10 min)
@@ -401,9 +410,11 @@ strategy:
   # price_cancel_mode: margin -- cancel for PRICE only when a fill at the
   #   resting price would earn less than price_cancel_edge_retain x the edge
   #   Step 7 demands of a new offer (max(min_profit_margin, sigma width,
-  #   tibetswap fee)) against the current centre.  Crossed offers are still
-  #   cancelled first; favourable drift never cancels.  Reason in offer_log:
-  #   "margin_breach(<edge>/<floor>bps)".
+  #   tibetswap fee)) -- judged against BOTH of Step 7's centres, the shifted
+  #   ladder centre and fair value, with the KINDER of the two edges deciding,
+  #   so it never cancels what the pricer would itself post.  Crossed offers
+  #   are still cancelled first; favourable drift never cancels.  Reason in
+  #   offer_log: "margin_breach(<edge>/<floor>bps)".
   #   COST, MEASURED: replayed over the 14 days to 2026-09-20 this rule fires,
   #   at some block, on up to 7 of the 15 offers that actually FILLED (0-7 once
   #   the unrecorded fair centre is bounded by the 100 bps A-S rail; 3-7 at

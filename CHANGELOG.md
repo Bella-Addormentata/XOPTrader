@@ -37,11 +37,19 @@ Three rules made 97% of them. Each now has a replacement behind its own
   obviously when that node is down -- retires pause, offers keep their coins
   locked, and the log says `no trusted chain clock`.
   `expire` with no expiry configured is refused at startup.
-  **No LOCAL signal can report a retire that went wrong**, because a take of a
-  CANCELLED trade is exactly what this wallet is structurally blind to; the
-  check that can fire is external -- an offer this bot retired should end at
-  Dexie `status: 6` with `spent_block_index: null`, and a `status: 4` with a
-  block index means someone took it after the retire.
+  **The wallet's TRADE RECORD is blind to a take of a retired offer. The
+  wallet is not, and an earlier draft of this bullet said it was.**
+  `get_trades_by_coin` skips CANCELLED (`trade_manager.py:131-139`), so
+  `coins_of_interest_farmed` never fires, the trade never reaches CONFIRMED and
+  no fill is booked -- that is the whole of what the evidence supports. A take
+  still spends our maker coin AND pays the requested asset to a puzzle hash the
+  maker's own wallet derived (`trade_manager.py:500,518`: each requested payment
+  is a notarized payment to `action_scope.get_puzzle_hash`), so it moves the
+  coin records and the balances this bot reads elsewhere. A sound local detector
+  is therefore constructible; it is filed with its design as S77 and is **not**
+  implemented here. Until it is, the shipped check is external: an offer this
+  bot retired should end at Dexie `status: 6` with `spent_block_index: null`,
+  and a `status: 4` with a block index means someone took it after the retire.
   The GUI pairs table sizes its resting-offer window from the expiry in this
   mode, so a quote that legitimately rests 24 h is not shown as absent after 6.
 - **`exposure_rule: unified` (was 528 `exposure_floor_rebalance` cancels).** The
