@@ -772,7 +772,7 @@ def test_the_keep_report_cannot_reach_the_wallet_or_the_intent_file():
         "if(db_->query_offer_status(po.offer_id).has_value()){continue;}",
         "db_->insert_offer(offer_log_row_for(po));",
         "execution::summarise_kept_book(",
-        "execution::describe_kept_book(summary)",
+        "execution::describe_kept_book(summary,",
     ])
     assert code.count("insert_offer(") == 1
     # Both forms of the keep line -- the ordinary one and the stop-during-boot
@@ -975,6 +975,37 @@ def test_the_switch_clause_is_conditional_on_the_fact_that_decides_it():
         "a keep line states the dead man's switch disarm without reading "
         "watchdog_fired_ -- both the ordinary line and the stop-during-boot "
         "one must, and engine.hpp refuses to state it flatly for a reason")
+
+
+def test_the_book_clause_is_conditional_on_the_untracked_create_facts():
+    """[review -- round 6] THE ROUND-4 FIX MOVED THE SENTENCE AND LEFT THE
+    FACTS BEHIND.
+
+    `describe_kept_book` took only the summary, so for a completely empty State
+    it returned the flat all-clear "nothing was left on the book" -- printed
+    BEFORE the error lines for `post_abandoned` and `create_outcome_unknown_`,
+    each of which qualifies the COUNT ("NOT in the count above") and therefore
+    retracts nothing about the word "nothing".
+
+    NEITHER GUARD ABOVE COULD SEE IT. The CLAIM_WORDING backstop does list that
+    exact sentence -- but it reads literals in engine.cpp, and the sentence now
+    lives in kept_book.hpp, which is the whole point of moving it. So the guard
+    that replaces it is this one: the ARGUMENTS. Pinning them here is what this
+    scan can do; the sentences they produce are `KeptBook` in
+    cpp/tests/test_stop_offers_policy.cpp, which reads what the operator reads.
+
+    Passing literal `false` here, or dropping an argument, fails this test --
+    and stating the all-clear anyway inside kept_book.hpp fails those gtests.
+    Reverting the pair needs both to be defeated."""
+    report = _code(_report_raw())
+    assert ("execution::describe_kept_book(summary,post_abandoned,"
+            "create_outcome_unknown_)") in report, (
+        "the keep report describes the book without passing the two facts that "
+        "decide whether it may call that book empty. An offer the wallet built "
+        "from a create this process never recorded is in NO count this report "
+        "computes -- so `nothing was left on the book` is a claim these facts "
+        "falsify, and the error lines printed after it qualify only the count. "
+        "Found: %r" % (re.findall(r"describe_kept_book\([^;]*", report),))
 
 
 # --------------------------------------------------------------------------- #

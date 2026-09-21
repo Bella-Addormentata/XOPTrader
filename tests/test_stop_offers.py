@@ -433,6 +433,49 @@ def test_the_prompt_never_shows_zero_for_a_database_it_could_not_read():
     assert "No offers are resting on the book." in _prompt(RestingSummary()).text
 
 
+def test_a_book_of_only_cancel_pending_offers_is_never_called_empty():
+    """[review] read_resting_rows selects cancel_pending rows and
+    summarise_resting_offers diverts every one of them out of `resting`, so a
+    book made ENTIRELY of them used to print "No offers are resting on the
+    book." -- and every informative line was gated on `summary.resting`, so the
+    operator was told nothing further about them either.
+
+    This repo's rule is the opposite: PENDING_CANCEL is the wallet's INTENT,
+    only a spent maker coin is proof, and three XCH/BYC bids stayed takeable
+    for 13 days after a cancel-all. The C++ half of this change already refuses
+    to call such a book empty (KeptBook in test_stop_offers_policy.cpp); this
+    is the same rule in the prompt the operator reads before choosing."""
+    text = _prompt(RestingSummary(resting=0, cancel_in_flight=3))
+    assert "No offers are resting on the book." not in text.text
+    assert "3 have a cancel in flight" in text.text
+    assert "NOT proof" in text.text
+    assert "still takeable" in text.text
+    # ...and the informative half is no longer silent about them.
+    assert "3 offer(s) already have a cancel in flight" in text.informative
+
+
+def test_the_prompt_says_how_each_choice_treats_a_cancel_already_in_flight():
+    """[review] "neither choice changes those" was false, and it was the only
+    line the operator had about these offers. The engine's cancel path seeds
+    its list from get_all_offers() with no cancel_pending filter, writes every
+    id into the cancel intent file, and its first attempt is the WALLET-WIDE
+    secure sweep -- which in chia 2.7.4 performs no trade-status check and
+    re-spends a PENDING_CANCEL trade. Keep sends nothing. (Only the per-offer
+    retries skip such an offer, so "retry path" is not the difference; the
+    wallet-wide leg is.)"""
+    informative = _prompt(RestingSummary(
+        resting=2, cancel_in_flight=1, per_pair=(("XCH/DBX", 2),))).informative
+    assert "neither choice changes those" not in informative
+    assert "Keep sends nothing for them" in informative
+    assert "wallet-wide sweep" in informative
+    assert "PENDING_CANCEL" in informative
+    # No claim is made about an expiry the summary never computed for them.
+    assert "No expiry is shown for them above." in informative
+    # A book with none of them says none of this.
+    assert "wallet-wide sweep" not in _prompt(
+        RestingSummary(resting=2, per_pair=(("XCH/DBX", 2),))).informative
+
+
 def test_the_close_prompt_says_what_dont_stop_means_there():
     closing = _prompt(RestingSummary(resting=1, per_pair=(("XCH/DBX", 1),)), closing=True)
     assert closing.title == "Close XOPTrader"

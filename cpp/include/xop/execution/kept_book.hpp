@@ -168,20 +168,82 @@ struct KeptBookSummary {
          + padded(rem % 60, 2) + " UTC";
 }
 
+/// The half-sentence naming a create this process could not book, or "" when
+/// there is none.
+///
+/// [review -- round 6] EVERY BRANCH OF describe_kept_book STATES A COUNT TAKEN
+/// FROM State, and an offer the wallet built from a create this process never
+/// recorded is in NONE of them -- not in `resting`, not in `cancel_in_flight`,
+/// not in `per_pair`. The empty-book branch is the lethal one, because there
+/// the count is spelled "nothing was left on the book": a flat all-clear, and
+/// the engine's own error lines for these two facts (engine.cpp) are printed
+/// AFTER it and qualify only the COUNT -- "NOT in the count above" -- so not
+/// one of them retracts the word "nothing".
+///
+/// This is the same defect as the one the round-4 fix moved out of engine.cpp
+/// (describe_cut_cycle below), one function along: the sentence was relocated
+/// to this header and the facts were not brought with it. Weaker than that
+/// one -- it needs a completely empty State rather than following from
+/// `post_abandoned` by construction, and the error lines land immediately
+/// after rather than forty lines above -- but the same shape, so it is fixed
+/// the same way: the facts are arguments, and a gtest reads the result.
+///
+/// @param post_abandoned          the bounded drain gave up with a create
+///                                still in flight.
+/// @param create_outcome_unknown  a create ended with no answer from the
+///                                wallet, which is not a refusal.
+[[nodiscard]] inline std::string describe_untracked_create(
+    bool post_abandoned, bool create_outcome_unknown)
+{
+    if (!post_abandoned && !create_outcome_unknown) return {};
+    std::string out = "a create this process began is UNACCOUNTED FOR (";
+    if (post_abandoned && create_outcome_unknown) {
+        out += "one was still in flight when this stop's drain budget ran out, "
+               "AND one ended with no answer from the wallet";
+    } else if (post_abandoned) {
+        out += "one was still in flight when this stop's drain budget ran out";
+    } else {
+        out += "one ended with no answer from the wallet, which is not a "
+               "refusal";
+    }
+    out += "), so the wallet may hold an offer this engine never recorded and "
+           "NO count here includes it -- see the error line(s) above";
+    return out;
+}
+
 /// The operator-facing line. One string, so the engine logs it once and a
 /// test reads exactly what the operator will.
-[[nodiscard]] inline std::string describe_kept_book(const KeptBookSummary& s)
+///
+/// The two bools are the untracked-create facts (describe_untracked_create):
+/// they are what decides whether this function may call the book empty, so
+/// they are arguments rather than something the caller prints afterwards.
+[[nodiscard]] inline std::string describe_kept_book(const KeptBookSummary& s,
+                                                    bool post_abandoned,
+                                                    bool create_outcome_unknown)
 {
+    const std::string untracked =
+        describe_untracked_create(post_abandoned, create_outcome_unknown);
+
     if (s.resting == 0) {
         if (s.cancel_in_flight == 0) {
-            return "no offers were resting and none had a cancel in flight, so "
-                   "nothing was left on the book";
+            if (untracked.empty()) {
+                return "no offers were resting and none had a cancel in "
+                       "flight, so nothing was left on the book";
+            }
+            // [review] NOT an empty book. State holds nothing, which is the
+            // whole of what this engine knows -- and one create's result is
+            // exactly what it does NOT know.
+            return "this engine held no offer RESTING and none with a cancel "
+                   "in flight, but " + untracked
+                 + ". DO NOT read this as an empty book: check the wallet's "
+                   "open offers against this stop before assuming there is "
+                   "nothing to take";
         }
         // [review] NOT "nothing was left on the book". A submitted cancel is
         // not proof: such an offer generally stays TAKEABLE until a maker coin
         // is spent, and this stop then disarms the dead man's switch and exits,
         // so nothing chases it until the next start.
-        return "this stop left no offer RESTING, but "
+        std::string out = "this stop left no offer RESTING, but "
              + std::to_string(s.cancel_in_flight)
              + " already had a cancel in flight before it began -- and a "
                "submitted cancel is NOT proof the offer is gone: until one of "
@@ -190,6 +252,9 @@ struct KeptBookSummary {
                "engine is down; the next start adopts them as cancel_pending "
                "and escalates. DO NOT read this as an empty book -- check the "
                "wallet's PENDING_CANCEL records against the chain";
+        // "left no offer RESTING" is a count from State like any other.
+        if (!untracked.empty()) out += ". Also, " + untracked;
+        return out;
     }
 
     std::string out = std::to_string(s.resting)
@@ -233,6 +298,8 @@ struct KeptBookSummary {
     out += " until then they are TAKEABLE and UNMANAGED: no TTL, no "
            "repricing, no dead man's switch. The next engine start re-adopts "
            "them from the wallet and offer_log.";
+    // The count above is this engine's own; an unbooked create is not in it.
+    if (!untracked.empty()) out += " Beyond that count, " + untracked + ".";
     return out;
 }
 

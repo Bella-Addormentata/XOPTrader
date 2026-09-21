@@ -86,10 +86,41 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - *"the dead man's switch is disarmed for this stop"* was flat, where
     `engine.hpp` is careful: a cancel the switch had **already begun** holds
     the mutex and is not recalled. The line now reads `watchdog_fired_` and
-    says which of the two happened.
+    says which of the two happened;
+  - and *"nothing was left on the book"* survived the move. Relocating the
+    sentence to `kept_book.hpp` took it away from `post_abandoned` and
+    `create_outcome_unknown_`, which were never passed in — so a stop with a
+    completely empty `State` printed the flat all-clear **first** and only
+    then the error lines for those facts, each of which qualifies the *count*
+    (*"NOT in the count above"*) and therefore retracts nothing about the word
+    *nothing*. Weaker than the mid-cycle defect above — it needs an empty book
+    rather than following by construction — but the same shape, so it has the
+    same fix: the two facts are arguments to `describe_kept_book`, every
+    branch of it says when a create this process began is unaccounted for, and
+    a gtest reads each result.
   Each of these sentences now lives in `kept_book.hpp`, where a gtest reads
   exactly what the operator reads — the `engine.cpp` wiring scan strips string
-  literals and structurally cannot.
+  literals and structurally cannot. That is also the limit the last item ran
+  into: the scan's `CLAIM_WORDING` backstop lists *"nothing was left on the
+  book"*, but it reads literals in `engine.cpp`, so moving the sentence out
+  moved it out of range. The replacement guard pins the **arguments** at the
+  call site, and the sentences they produce are gtests.
+- **The GUI stop prompt no longer says a cancel already in flight is untouched
+  by the choice.** It read *"neither choice changes those"*. **Keep** does send
+  nothing for them — but **Cancel all** seeds its list from every offer in
+  `State` with no `cancel_pending` filter, writes every one of those ids into
+  the cancel intent file before the first attempt, and its first attempt is the
+  wallet-wide secure sweep, which in chia 2.7.4 performs no trade-status check
+  at all: it takes the offer's cancellation coins and builds a fresh spend, so a
+  merely `PENDING_CANCEL` trade is swept and re-spent. That escalation is what
+  finally cleared the three XCH/BYC bids stuck for 13 days. (Only the per-offer
+  **retries** skip such an offer, to avoid paying a second fee for the same
+  spend; the wallet-wide leg does not.) The prompt now states the real
+  difference. In the same place, a book whose every offer is `cancel_pending`
+  was announced as *"No offers are resting on the book."* — the prompt reads
+  those rows and then diverts them out of `resting` — with every informative
+  line gated on `resting`, so the operator learned nothing else about them
+  either. Such a book is no longer called empty, and gets a line of its own.
 - **A blank `engine.shutdown_offers` is a startup error**, like every other
   value the section cannot read. `shutdown_offers:` with nothing after it used
   to fall through to `cancel` — the silent default this section exists to

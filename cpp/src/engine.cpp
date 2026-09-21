@@ -2414,9 +2414,19 @@ void Engine::report_offers_kept_on_stop(std::uint64_t waited_for_post_ms,
     // latched before any switch-initiated cancel and never cleared. engine.hpp
     // refuses to state the disarm flatly -- a cancel the switch had already
     // begun holds the mutex and is not recalled -- and neither does this line.
+    //
+    // [review -- round 6] The book clause is CONDITIONAL on the two
+    // untracked-create facts for the same reason. It is printed BEFORE the
+    // error lines below, and for a completely empty State it used to read
+    // "nothing was left on the book" -- a flat all-clear that those error
+    // lines never retract, because each of them qualifies only the COUNT.
+    // The facts are passed in, so the sentence is built from them under gtest
+    // (KeptBook in test_stop_offers_policy.cpp) rather than contradicted by
+    // them a few lines later.
     spdlog::warn("[Engine] [S74] KEEP stop: {} No cancel was sent, no cancel "
                  "intent was written, and {}.",
-                 execution::describe_kept_book(summary),
+                 execution::describe_kept_book(summary, post_abandoned,
+                                               create_outcome_unknown_),
                  execution::describe_watchdog_disarm(
                      watchdog_fired_.load(std::memory_order_acquire)));
     if (rows_added > 0 || rows_failed > 0) {

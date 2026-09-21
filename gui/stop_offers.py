@@ -413,14 +413,30 @@ def build_prompt_text(
     if summary is None:
         text = lead + ("The number of resting offers could not be read; assume "
                        "there are some.")
-    elif summary.resting == 0:
+    elif summary.resting == 0 and summary.cancel_in_flight == 0:
         text = lead + "No offers are resting on the book."
+    elif summary.resting == 0:
+        # [review] NOT "No offers are resting on the book". read_resting_rows
+        # selects cancel_pending rows too, and summarise_resting_offers diverts
+        # every one of them out of `resting` -- so a book made ENTIRELY of them
+        # reached that sentence, and every informative line below was gated on
+        # `summary.resting`, so the operator was told nothing else about them
+        # either. This repo's rule is the opposite (kept_book.hpp): a submitted
+        # cancel is not proof, only a spent maker coin is -- 24 such offers
+        # stayed takeable for 2.5 h after a cancel-all, three XCH/BYC bids for
+        # 13 days. The C++ half of this PR was changed to never call such a
+        # book empty; this is the same fix one level up, in the words the
+        # operator reads BEFORE choosing.
+        text = lead + (
+            f"No offer is resting, but {summary.cancel_in_flight} have a "
+            "cancel in flight -- which is NOT proof they are gone: until a "
+            "maker coin is spent they are still takeable.")
     else:
         pairs = ", ".join(f"{name} {count}" for name, count in summary.per_pair)
         text = lead + f"{summary.resting} offer(s) are resting on the book ({pairs})."
-    if summary is not None and summary.cancel_in_flight:
-        text += (f" {summary.cancel_in_flight} more already have a cancel in "
-                 "flight; neither choice changes those.")
+        if summary.cancel_in_flight:
+            text += (f" {summary.cancel_in_flight} more already have a cancel "
+                     "in flight and are not counted there.")
 
     lines: list[str] = []
     if summary is not None and summary.resting:
@@ -439,6 +455,30 @@ def build_prompt_text(
             lines.append(
                 f"The posting time of {summary.expiry_unknown} of them could "
                 "not be read, so no expiry is shown for them.")
+    if summary is not None and summary.cancel_in_flight:
+        # [review] "neither choice changes those" was FALSE, and it was the one
+        # line the operator had about these offers. The engine's cancel path
+        # seeds its list from state_->get_all_offers() with NO cancel_pending
+        # filter (engine.cpp), writes every one of those ids into the cancel
+        # intent file as Ordered before the first attempt, and its FIRST
+        # attempt is offer_mgr_->cancel_all() -- the wallet-wide secure sweep.
+        # In chia 2.7.4 cancel_pending_offers performs no trade-status check at
+        # all: it takes the offer's cancellation coins and builds a fresh
+        # spend, and a PENDING_CANCEL trade is not a completed one, so it is
+        # swept and re-spent. That escalation is exactly what cleared the three
+        # 13-day-stuck XCH/BYC bids. The keep path sends nothing and writes no
+        # intent. (Only the PER-OFFER retries skip a cancel_pending offer, to
+        # avoid paying a second fee for the same spend -- the wallet-wide leg
+        # does not.)
+        lines.append(
+            f"{summary.cancel_in_flight} offer(s) already have a cancel in "
+            "flight. A submitted cancel is NOT proof one is gone -- until a "
+            "maker coin is spent it stays takeable -- and the two choices do "
+            "NOT treat them alike. Keep sends nothing for them. Cancel all "
+            "begins with the wallet-wide sweep, which re-spends a trade that "
+            "is merely PENDING_CANCEL, and records their ids for the next "
+            "start to finish; that escalation is what has cleared bids stuck "
+            "for days. No expiry is shown for them above.")
     lines.append(
         "Keep offers on the book: nothing is cancelled. The offers stay "
         "takeable with NO engine behind them -- no repricing, no TTL, no dead "

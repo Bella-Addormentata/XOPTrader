@@ -41,6 +41,7 @@
 
 using xop::execution::describe_cut_cycle;
 using xop::execution::describe_kept_book;
+using xop::execution::describe_untracked_create;
 using xop::execution::describe_watchdog_disarm;
 using xop::execution::format_unix_utc;
 using xop::execution::KeptBookSummary;
@@ -393,7 +394,7 @@ TEST(KeptBook, APairWithNoExpiryIsSaidToHaveNone)
     EXPECT_EQ(s.expiry_known, 0u);
     EXPECT_EQ(s.expiry_unseen, 0u);
 
-    const std::string text = describe_kept_book(s);
+    const std::string text = describe_kept_book(s, false, false);
     EXPECT_NE(text.find("2 carry NO on-chain expiry"), std::string::npos) << text;
     EXPECT_EQ(text.find("stop being takeable between"), std::string::npos) << text;
 }
@@ -406,7 +407,8 @@ TEST(KeptBook, TheLineNamesCountPairsAndBothExpiryBounds)
         offer("XCH/BYC", 0, kDay),
         offer("XCH/BYC", kNow - 10, kDay, /*cancel_pending=*/true),
     };
-    const std::string text = describe_kept_book(summarise_kept_book(offers, kNow));
+    const std::string text =
+        describe_kept_book(summarise_kept_book(offers, kNow), false, false);
     EXPECT_NE(text.find("3 offer(s) left RESTING on the book and NOT cancelled"),
               std::string::npos) << text;
     EXPECT_NE(text.find("XCH/BYC 1, XCH/DBX 2"), std::string::npos) << text;
@@ -419,12 +421,96 @@ TEST(KeptBook, TheLineNamesCountPairsAndBothExpiryBounds)
     EXPECT_NE(text.find("TAKEABLE and UNMANAGED"), std::string::npos) << text;
 }
 
-TEST(KeptBook, AnEmptyBookSaysSoOnlyWhenNoCancelIsInFlight)
+TEST(KeptBook, AnEmptyBookSaysSoOnlyWithNoCancelAndNoUnbookedCreate)
 {
-    const std::string empty = describe_kept_book(summarise_kept_book({}, kNow));
+    // [review -- round 6] THE OLD NAME WAS THE DEFECT AGAIN. This test was
+    // `AnEmptyBookSaysSoOnlyWhenNoCancelIsInFlight`, and it passed an empty
+    // summary with NO untracked-create fact anywhere in it -- so the gtest
+    // added to "read what the operator reads" blessed the all-clear for a stop
+    // that had just told the operator an offer may be unrecorded. The only
+    // state in which "nothing was left on the book" is true is this one.
+    const std::string empty = describe_kept_book(summarise_kept_book({}, kNow),
+                                                 /*post_abandoned=*/false,
+                                                 /*create_outcome_unknown=*/false);
     EXPECT_NE(empty.find("no offers were resting and none had a cancel in flight"),
               std::string::npos) << empty;
     EXPECT_NE(empty.find("nothing was left on the book"), std::string::npos) << empty;
+}
+
+// The three states in which it is NOT true. Each is a stop that ALSO printed an
+// error saying the wallet may hold an offer this engine never recorded -- and
+// those errors qualify the COUNT ("NOT in the count above"), so not one of them
+// retracts the word "nothing". The all-clear is printed FIRST, so nothing
+// downstream can be relied on to take it back.
+TEST(KeptBook, AnUnbookedCreateIsNeverDescribedAsAnEmptyBook)
+{
+    const KeptBookSummary none = summarise_kept_book({}, kNow);
+    const std::array<std::pair<bool, bool>, 3> unbooked{{
+        {true, false},   // the drain budget ran out with a create in flight
+        {false, true},   // a create ended with no answer from the wallet
+        {true, true},    // both
+    }};
+    for (const auto& [abandoned, unknown] : unbooked) {
+        const std::string text = describe_kept_book(none, abandoned, unknown);
+        EXPECT_EQ(text.find("nothing was left on the book"), std::string::npos)
+            << text;
+        EXPECT_EQ(text.find("no offers were resting and none"), std::string::npos)
+            << text;
+        EXPECT_NE(text.find("UNACCOUNTED FOR"), std::string::npos) << text;
+        EXPECT_NE(text.find("DO NOT read this as an empty book"), std::string::npos)
+            << text;
+        EXPECT_NE(text.find("NO count here includes it"), std::string::npos) << text;
+    }
+}
+
+// The same fact on the other two shapes: every branch states a count taken from
+// State, and an offer built from a create this process never booked is in none
+// of them.
+TEST(KeptBook, AnUnbookedCreateQualifiesTheCountOnEveryShapeOfBook)
+{
+    const std::vector<KeptOfferFacts> resting{offer("XCH/DBX", kNow - 3600, kDay)};
+    const std::string with_resting =
+        describe_kept_book(summarise_kept_book(resting, kNow), true, false);
+    EXPECT_NE(with_resting.find("1 offer(s) left RESTING"), std::string::npos)
+        << with_resting;
+    EXPECT_NE(with_resting.find("Beyond that count,"), std::string::npos)
+        << with_resting;
+    EXPECT_NE(with_resting.find("UNACCOUNTED FOR"), std::string::npos) << with_resting;
+
+    const std::vector<KeptOfferFacts> only_pending{
+        offer("XCH/BYC", kNow - 10, kDay, /*cancel_pending=*/true)};
+    const std::string with_pending =
+        describe_kept_book(summarise_kept_book(only_pending, kNow), false, true);
+    EXPECT_NE(with_pending.find("this stop left no offer RESTING"), std::string::npos)
+        << with_pending;
+    EXPECT_NE(with_pending.find("UNACCOUNTED FOR"), std::string::npos) << with_pending;
+
+    // ...and none of the three says it when there is nothing to say.
+    for (const KeptBookSummary& s : {summarise_kept_book({}, kNow),
+                                     summarise_kept_book(resting, kNow),
+                                     summarise_kept_book(only_pending, kNow)}) {
+        const std::string clean = describe_kept_book(s, false, false);
+        EXPECT_EQ(clean.find("UNACCOUNTED FOR"), std::string::npos) << clean;
+    }
+}
+
+// The clause names WHICH fact, because the two are not the same failure and the
+// operator's next move differs: a drain that ran out has an error line with a
+// wait in ms beside it, a create with no answer never had one to wait for.
+TEST(KeptBook, TheUnbookedCreateClauseNamesWhichFactHolds)
+{
+    EXPECT_TRUE(describe_untracked_create(false, false).empty());
+    EXPECT_NE(describe_untracked_create(true, false).find(
+                  "still in flight when this stop's drain budget ran out"),
+              std::string::npos);
+    EXPECT_EQ(describe_untracked_create(true, false).find("no answer from the wallet"),
+              std::string::npos);
+    EXPECT_NE(describe_untracked_create(false, true).find(
+                  "ended with no answer from the wallet, which is not a refusal"),
+              std::string::npos);
+    const std::string both = describe_untracked_create(true, true);
+    EXPECT_NE(both.find("drain budget ran out, AND one ended with no answer"),
+              std::string::npos) << both;
 }
 
 // [review] THE OLD NAME WAS THE DEFECT. `AnEmptyBookSaysSoAndClaimsNothing`
@@ -444,7 +530,8 @@ TEST(KeptBook, ACancelInFlightIsNeverDescribedAsAnEmptyBook)
 {
     const std::vector<KeptOfferFacts> only_pending{
         offer("XCH/DBX", kNow - 10, kDay, /*cancel_pending=*/true)};
-    const std::string text = describe_kept_book(summarise_kept_book(only_pending, kNow));
+    const std::string text =
+        describe_kept_book(summarise_kept_book(only_pending, kNow), false, false);
 
     // Nothing was KEPT -- that part was right and stays.
     EXPECT_EQ(text.find("left RESTING"), std::string::npos) << text;
@@ -467,7 +554,8 @@ TEST(KeptBook, ACancelInFlightBesideARestingBookIsAlsoSaidToBeTakeable)
         offer("XCH/BYC", kNow - 10, kDay, /*cancel_pending=*/true),
         offer("XCH/BYC", kNow - 20, kDay, /*cancel_pending=*/true),
     };
-    const std::string text = describe_kept_book(summarise_kept_book(mixed, kNow));
+    const std::string text =
+        describe_kept_book(summarise_kept_book(mixed, kNow), false, false);
     EXPECT_NE(text.find("1 offer(s) left RESTING"), std::string::npos) << text;
     EXPECT_NE(text.find("2 more already had a cancel in flight"), std::string::npos) << text;
     EXPECT_NE(text.find("STILL TAKEABLE"), std::string::npos) << text;
