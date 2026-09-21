@@ -157,12 +157,16 @@
 // FeeTracker clamps to [fees.min_fee_mojos, fees.max_fee_mojos] --
 // [15,000,000, 100,000,000] live -- so the bound that matters is against the
 // CAP: 13,314,209,440 is 133x max_fee_mojos, and the largest fee actually
-// seen in the live log is 45,000,000 (296x).  Every XCH coin therefore covers
-// any fee the engine can send; chia's select_coins finds smaller_coin_sum
-// below the target, falls to select_smallest_coin_over_target and takes
-// exactly one coin.  The conclusion is unchanged, and it is now the strong
-// form.  For a FLOORED create at 0.01 to reach Dexie's limit at all, the fee
-// leg would have to contribute 26 or more coins.
+// seen in the live log is 45,000,000 (296x).
+//
+// The decisive form is not a ratio.  Of the 42 spendable XCH coins in the
+// 2026-09-21 read-only dump, ZERO are below max_fee_mojos, so no candidate
+// can ever be smaller than the target: select_coins accumulates
+// smaller_coin_sum = 0 < target and falls to select_smallest_coin_over_target,
+// which takes exactly ONE coin -- for every fee the engine is capable of
+// sending, not merely for the cheapest one.  The conclusion is unchanged and
+// it is now the strong form.  For a FLOORED create at 0.01 to reach Dexie's
+// limit at all, the fee leg would have to contribute 26 or more coins.
 //
 // kDexieFeeLegInputsToday encodes that 1 and kDexieMeasuredInputLimit the
 // 125, so the runtime warning and the load-time one derive the same
