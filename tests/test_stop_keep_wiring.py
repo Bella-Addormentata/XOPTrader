@@ -200,8 +200,7 @@ def _shutdown() -> str:
 
 def _continuation(shutdown: str) -> str:
     """The coroutine shutdown() posts: everything from its co_spawn on."""
-    at = shutdown.find(
-        "asio::co_spawn(ioc_,[this,cancels_book,keeps_book,drain_budget_ms]()")
+    at = shutdown.find("asio::co_spawn(ioc_,[this,cancels_book,keeps_book]()")
     assert at != -1, "the shutdown continuation no longer captures the stop plan"
     return shutdown[at:]
 
@@ -360,7 +359,7 @@ def test_a_keep_stop_waits_for_an_in_flight_post_and_only_so_long():
     loop = _block(keep, "for(;;){")
     _in_order(loop, [
         "util::keep_stop_drain_step(posting_in_flight_,waited_for_post_ms,"
-        + "drain_budget_ms);",
+        + "keep_stop_drain_budget_ms_);",
         "if(drain==util::KeepStopDrainStep::Proceed)break;",
         "if(drain==util::KeepStopDrainStep::GiveUp){post_abandoned=true;break;}",
         "drain_timer.expires_after(std::chrono::milliseconds(util::kKeepStopDrainPollMs));",
@@ -369,19 +368,36 @@ def test_a_keep_stop_waits_for_an_in_flight_post_and_only_so_long():
     assert keep.count("util::keep_stop_drain_step(") == 1
     assert keep.find("for(;;){") < keep.find("report_offers_kept_on_stop("), (
         "the report runs before the wait: it would count a book still being posted")
-    # [review round 3] THE BUDGET IS SIZED, NOT GUESSED, and it is sized OUTSIDE
-    # the continuation so the keep branch touches no client: one create's whole
-    # retry ladder (the wallet's own request timeout, read from the client) plus
-    # the publish that stands between its answer and the offer entering State.
+    # [review round 3] THE BUDGET IS SIZED, NOT GUESSED, and it is sized in the
+    # CONSTRUCTOR: one create's whole retry ladder (the wallet client's own
+    # request timeout) plus the publish that stands between its answer and the
+    # offer entering State. shutdown() only reads the number -- a POSIX signal
+    # can run it on any thread, and the keep branch must touch no client.
+    # Nothing of the sort is built on the way there. shutdown() runs on the
+    # caller's thread -- a POSIX signal handler, for the one stop that can find
+    # a create in flight -- and everything below the co_spawn runs on the
+    # io_context instead (the S46 cancel ladder reads the wallet's timeout
+    # there, which is why this is scoped to the part above it).
     before_spawn = code[:code.find("asio::co_spawn(")]
-    _in_order(before_spawn, [
-        "conststd::uint64_tdrain_budget_ms=util::keep_stop_drain_budget_ms(",
-        "rpc_worst_case(wallet_?wallet_->request_timeout().count()",
+    for built_in_shutdown in ("rpc::ChiaRPCConfig", "rpc::DexieConfig",
+                              "util::rpc_call_worst_case_ms(",
+                              "util::keep_stop_drain_budget_ms(",
+                              "wallet_->request_timeout("):
+        assert built_in_shutdown not in before_spawn, (
+            f"shutdown() builds {built_in_shutdown} on the caller's thread: a "
+            "POSIX signal can deliver it, and constructing a config there means "
+            "allocating in a signal handler")
+    ctor = _code(_definition(ENGINE_CPP, "Engine::Engine(const AppConfig& config, bool dry_run,"))
+    _in_order(ctor, [
+        "offer_mgr_->set_posting_in_flight_flag(&posting_in_flight_);",
+        "keep_stop_drain_budget_ms_=util::keep_stop_drain_budget_ms(",
+        "rpc_worst_case(wal_cfg.request_timeout.count(),wal_cfg.max_retries,",
         "rpc_worst_case(dexie_defaults.request_timeout.count(),",
     ])
-    assert "util::rpc_call_worst_case_ms(" in before_spawn, (
+    assert "util::rpc_call_worst_case_ms(" in ctor, (
         "the budget stopped being derived from the clients' own timeouts")
-    assert code.count("drain_budget_ms=") == 1, (
+    engine = _code(_text(ENGINE_CPP))
+    assert engine.count("keep_stop_drain_budget_ms_=") == 1, (
         "the drain budget is written twice: a later override could shrink it "
         "below the window it waits on")
 

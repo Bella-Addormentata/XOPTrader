@@ -1230,6 +1230,19 @@ private:
     /// keep stop's flush gives each of those an offer_log row. ioc_ thread only.
     bool posting_in_flight_{false};
 
+    /// [review round 3] How long that wait may last: one create's worst case
+    /// plus the publish that follows it before the offer is in State -- two
+    /// rpc_post calls, each up to request_timeout x attempts plus backoff.
+    ///
+    /// Computed ONCE, in the constructor, from the clients' own numbers. Not in
+    /// shutdown(): a POSIX signal can run shutdown() on any thread, and reading
+    /// the config there would mean constructing std::string/fs::path members in
+    /// a signal handler. The default below is the value for the shipped
+    /// timeouts, so even a build that never reaches that assignment waits the
+    /// right amount rather than a zero budget that abandons every create.
+    std::uint64_t keep_stop_drain_budget_ms_{util::keep_stop_drain_budget_ms(
+        util::kShippedRpcWorstCaseMs, util::kShippedRpcWorstCaseMs)};
+
     /// The keep path: mirror State into offer_log for any offer that has no row
     /// yet, then log the one line that says what was left resting
     /// (execution/kept_book.hpp). Deliberately NOT a coroutine -- it cannot

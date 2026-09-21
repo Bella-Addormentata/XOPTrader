@@ -639,6 +639,32 @@ Engine::Engine(const AppConfig& config, bool dry_run,
     // leave a live offer this process never recorded. Without this wiring the
     // drain would always see "nothing in flight" and stop straight through it.
     offer_mgr_->set_posting_in_flight_flag(&posting_in_flight_);
+    // [S74 / review round 3] ...and HOW LONG that drain may wait, sized to the
+    // window it waits on rather than to a round number: one create's whole
+    // retry ladder, plus the publish that stands between the wallet's answer
+    // and the offer entering State. Two rpc_post calls, each up to
+    // request_timeout x attempts plus backoff. The wallet's timeout is read
+    // from the client, exactly as the S46 cancel ladder reads it; the retry
+    // knobs are the clients' own defaults, which this engine never overrides
+    // (above: host, port and TLS only). Computed HERE and not in shutdown(),
+    // which a POSIX signal can run on any thread -- see engine.hpp.
+    {
+        const auto rpc_worst_case = [](std::int64_t  timeout_ms,
+                                       std::uint64_t retries,
+                                       std::int64_t  backoff_ms) {
+            return util::rpc_call_worst_case_ms(
+                timeout_ms > 0 ? static_cast<std::uint64_t>(timeout_ms) : 0ull,
+                retries + 1ull,
+                backoff_ms > 0 ? static_cast<std::uint64_t>(backoff_ms) : 0ull);
+        };
+        const rpc::DexieConfig dexie_defaults{};
+        keep_stop_drain_budget_ms_ = util::keep_stop_drain_budget_ms(
+            rpc_worst_case(wal_cfg.request_timeout.count(), wal_cfg.max_retries,
+                           wal_cfg.retry_base_delay.count()),
+            rpc_worst_case(dexie_defaults.request_timeout.count(),
+                           static_cast<std::uint64_t>(dexie_defaults.max_retries),
+                           dexie_defaults.retry_base_delay.count()));
+    }
     // A late offer that could not be cancelled has to reach the operator.
     // The watchdog's own alert says a cancel of every resting offer was
     // SUBMITTED -- and this trade was created after that request enumerated
@@ -1616,39 +1642,7 @@ void Engine::shutdown()
     //
     // ISO/IEC 5055: no blocking .get()/.wait() calls; fully async teardown.
     // ISO/IEC 27001:2022: all cancellation outcomes are audit-logged.
-    //
-    // [S74 / review round 3] HOW LONG A KEEP STOP MAY WAIT FOR AN IN-FLIGHT
-    // CREATE, sized to the window it waits on rather than to a round number.
-    // OfferManager marks ONE create at a time (offer_manager.cpp PostingMark),
-    // so the worst case is that create's full retry ladder plus the publish
-    // that stands between its answer and the offer entering State -- two
-    // rpc_post calls, each up to request_timeout x attempts plus backoff. The
-    // wallet's timeout is read from the client, exactly as the S46 cancel
-    // ladder reads it; the retry knobs are the clients' own defaults, which
-    // this engine never overrides (see the constructor: host, port, TLS only).
-    // Computed HERE, not in the continuation, so the keep branch itself
-    // touches no client at all -- tests/test_stop_keep_wiring.py pins that.
-    const auto rpc_worst_case = [](std::int64_t  timeout_ms,
-                                   std::uint64_t retries,
-                                   std::int64_t  backoff_ms) {
-        return util::rpc_call_worst_case_ms(
-            timeout_ms > 0 ? static_cast<std::uint64_t>(timeout_ms) : 0ull,
-            retries + 1ull,
-            backoff_ms > 0 ? static_cast<std::uint64_t>(backoff_ms) : 0ull);
-    };
-    const rpc::ChiaRPCConfig wallet_rpc_defaults{};
-    const rpc::DexieConfig   dexie_defaults{};
-    const std::uint64_t drain_budget_ms = util::keep_stop_drain_budget_ms(
-        rpc_worst_case(wallet_ ? wallet_->request_timeout().count()
-                               : wallet_rpc_defaults.request_timeout.count(),
-                       wallet_rpc_defaults.max_retries,
-                       wallet_rpc_defaults.retry_base_delay.count()),
-        rpc_worst_case(dexie_defaults.request_timeout.count(),
-                       static_cast<std::uint64_t>(dexie_defaults.max_retries),
-                       dexie_defaults.retry_base_delay.count()));
-
-    asio::co_spawn(ioc_, [this, cancels_book, keeps_book, drain_budget_ms]()
-                   -> asio::awaitable<void> {
+    asio::co_spawn(ioc_, [this, cancels_book, keeps_book]() -> asio::awaitable<void> {
         // --- Cancel outstanding offers (skip in dry-run mode) ---
         // [S74] ...and skip when the stop KEEPS the book. EVERY cancel this
         // function can send, the intent file and the cancel_pending rows live
@@ -2247,8 +2241,10 @@ void Engine::shutdown()
             // (util::keep_stop_drain_step has the whole argument). The only
             // thing awaited here is a timer -- never an RPC -- and the wait is
             // bounded, so a wallet that never answers cannot turn a stop into
-            // a hang. The budget was sized before this continuation was posted
-            // (see shutdown() above): the keep branch itself touches no client.
+            // a hang. The budget was sized in the CONSTRUCTOR from the
+            // clients' own timeouts (engine.hpp keep_stop_drain_budget_ms_),
+            // so the keep branch itself touches no client and a signal-thread
+            // shutdown() reads a number rather than building a config.
             const auto drain_t0 = std::chrono::steady_clock::now();
             std::uint64_t waited_for_post_ms = 0;
             bool post_abandoned = false;
@@ -2260,7 +2256,8 @@ void Engine::shutdown()
                                std::chrono::steady_clock::now() - drain_t0)
                                .count()));
                 const util::KeepStopDrainStep drain = util::keep_stop_drain_step(
-                    posting_in_flight_, waited_for_post_ms, drain_budget_ms);
+                    posting_in_flight_, waited_for_post_ms,
+                    keep_stop_drain_budget_ms_);
                 if (drain == util::KeepStopDrainStep::Proceed) break;
                 if (drain == util::KeepStopDrainStep::GiveUp) {
                     post_abandoned = true;
@@ -2273,7 +2270,7 @@ void Engine::shutdown()
                                  "a heartbeat cycle) -- waiting up to {} ms, one "
                                  "create's worst case, for it to land so the "
                                  "offer is recorded, not orphaned",
-                                 drain_budget_ms);
+                                 keep_stop_drain_budget_ms_);
                 }
                 asio::steady_timer drain_timer(ioc_);
                 drain_timer.expires_after(
