@@ -108,12 +108,33 @@ default to off, and with both off every fee is what v0.10.24 paid.
   and `ask_take_cost()` / `add_same_wallet_fee()` drop it on their own
   `<= 0` clause on the take path — so all fourteen `uint64` → `Mojo` fee
   conversions, six of them implicit narrowings, now go through
-  `xop::to_mojo_saturating()`. The cumulative accounting saturates too:
-  `record_fee`'s running total, its pruning subtraction and the two
-  `posted × fee` products. `static_assert`s in `fee_controller.hpp` and
-  `fee_tracker.hpp` make a wrong ceiling a compile error on every toolchain.
+  `xop::to_mojo_saturating()`. The two `posted × fee` products saturate too.
+  `static_assert`s in `fee_controller.hpp` and `fee_tracker.hpp` make a wrong
+  ceiling a compile error on every toolchain.
   **Not reachable on the shipped configuration** (`max_fee_mojos` 100,000,000),
   and not reachable merely by enabling the controller.
+- **The rolling fee window is accounted EXACTLY, and saturates only when it is
+  read.** An earlier draft of the paragraph above said the running total and
+  its pruning subtraction saturated as well, and that was the bug. Saturating
+  addition is lossy, so it is not invertible and no subtraction undoes it: with
+  a history of `[UINT64_MAX, 100]` the total saturated to `UINT64_MAX`, and
+  pruning the first entry compared `total > oldest` — `UINT64_MAX` against
+  `UINT64_MAX`, false — and set the window total to **zero** while 100 mojos
+  were still inside it. `budget_remaining()` is `daily_budget − total`, so the
+  budget reopened in full: a fail-open on the one number the budget is, in the
+  code added to close a fail-open. `FeeTracker` now keeps the window total as a
+  128-bit unsigned value in two 64-bit halves — a carry on the way in, the
+  matching borrow on the way out, both exact and O(1) — and clamps to
+  `UINT64_MAX` once, in `get_rolling_total()`, where the clamped number is
+  handed to a caller and never fed back into the arithmetic. The post-condition
+  is that `get_rolling_total()` is the true sum of the fees still inside the
+  window, or `UINT64_MAX` if and only if that true sum genuinely exceeds
+  `UINT64_MAX`; every consumer of it is monotone in it, so the clamp can only
+  refuse a spend, never allow one. **Also not reachable on the shipped
+  configuration**: at `max_fee_mojos` 100,000,000 and the ~1,400 fee-bearing
+  events this wallet's busiest day recorded, one window totals about 1.4e11
+  mojos against the 1.8e19 needed to saturate. It takes a `max_fee_mojos` near
+  2^63, which `config.cpp` accepts because it validates only `min <= max`.
 - **Observability.** One `[FeeController] rate a -> b mojos/cost (reason; n
   move(s)) -- fees now: ...` line per burst of changes, and two gauges,
   `xop_fees_controller_rate_mojos_per_cost` and `xop_fees_controller_level_log2`.

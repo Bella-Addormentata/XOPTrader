@@ -92,6 +92,13 @@ public:
 
     /// Sum of all fees paid within the rolling window ending at
     /// @p current_block.  Expired entries are pruned.
+    ///
+    /// [review #163 r7] THE POST-CONDITION, which holds after ANY sequence of
+    /// record_fee() and prune(): the value returned is the TRUE sum of the
+    /// fees still inside the window, or UINT64_MAX if and only if that true
+    /// sum genuinely exceeds UINT64_MAX.  Anything weaker is a fail-open --
+    /// this number is the budget, and an under-estimate reopens it.
+    ///
     /// @return Cumulative fee mojos in the window.
     std::uint64_t get_rolling_total(BlockHeight current_block);
 
@@ -275,8 +282,38 @@ private:
     /// Oldest entries are at the front; pruned when expired.
     std::deque<std::pair<BlockHeight, std::uint64_t>> fee_history_;
 
-    /// Cached rolling total (updated on prune).
-    std::uint64_t cached_total_{0};
+    /// [review #163 r7] The window total, kept EXACTLY, as a 128-bit unsigned
+    /// value in two halves: `cached_total_hi_ * 2^64 + cached_total_lo_`.
+    ///
+    /// Round 6 made record_fee()'s addition SATURATE (a wrapped total reads as
+    /// a huge headroom, which is a fail-open) and made prune()'s subtraction
+    /// clamp to match.  Saturating addition is LOSSY, so it has no inverse and
+    /// a clamped subtraction is not one: with a history of
+    /// `[UINT64_MAX @ h=100, 100 @ h=101]` the total saturates to UINT64_MAX,
+    /// and pruning the first entry compared `total > oldest` -- UINT64_MAX
+    /// against UINT64_MAX, FALSE -- and set the total to ZERO while 100 mojos
+    /// were still inside the window.  budget_remaining() then reopened the
+    /// whole budget: the same fail-open, one round later.
+    ///
+    /// Exact accumulation has no such branch.  A carry on the way in and a
+    /// borrow on the way out are exact inverses, `fee_history_` cannot hold
+    /// 2^64 entries so `hi` cannot overflow, and the SATURATION HAPPENS ONCE,
+    /// AT THE READ (saturated_total), where the clamped value is returned to a
+    /// caller and never fed back into this arithmetic.
+    std::uint64_t cached_total_lo_{0};
+    std::uint64_t cached_total_hi_{0};
+
+    /// The window total as one uint64: the true sum when it fits, UINT64_MAX
+    /// when -- and only when -- the true sum does not.  The ONLY saturation.
+    ///
+    /// Every consumer of this value compares it against the budget and is
+    /// MONOTONE in it (is_within_budget refuses, budget_remaining returns 0),
+    /// so clamping downward-safe here fails CLOSED; nothing subtracts from it.
+    [[nodiscard]] std::uint64_t saturated_total() const noexcept
+    {
+        return (cached_total_hi_ != 0U) ? std::numeric_limits<std::uint64_t>::max()
+                                        : cached_total_lo_;
+    }
 
     /// Block height at which the cache was last pruned.
     BlockHeight cached_prune_block_{0};

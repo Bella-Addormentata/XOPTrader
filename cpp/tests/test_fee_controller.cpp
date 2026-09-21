@@ -2035,8 +2035,17 @@ TEST(FeeTrackerController, TheRollingTotalSaturatesInsteadOfWrapping)
     t.record_fee(1'000ULL, 100);
     EXPECT_EQ(t.get_rolling_total(100), kTop);
 
-    // Pruning a saturated total stays clamped at 0 rather than underflowing
-    // into a near-UINT64_MAX "spend" that never happened.
+    // Pruning past the window empties it, so the total is 0 because NOTHING is
+    // left -- not because anything clamped.
+    //
+    // [review #163 r7] This comment used to say "stays clamped at 0 rather
+    // than underflowing", describing r6's
+    //     cached_total_ = (cached_total_ > oldest) ? cached_total_ - oldest : 0U;
+    // and that clamp was itself the next fail-open: it also answered 0 when
+    // only the SATURATING entry left and a real spend remained behind it.
+    // This case could not see it, because it prunes every entry and 0 is the
+    // right answer either way -- the discriminating case is the partial prune,
+    // in FeeTrackerTest.PruningASaturatingEntryLeavesTheRestOfTheWindowIntact.
     const std::uint64_t after_prune = t.get_rolling_total(100 + 1'662 + 1);
     EXPECT_LE(after_prune, kTop);
     EXPECT_EQ(after_prune, 0U);

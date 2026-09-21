@@ -146,21 +146,28 @@ FeeTracker::FeeTracker(const FeeConfig& cfg)
 void FeeTracker::record_fee(std::uint64_t fee_mojos, BlockHeight block_height)
 {
     fee_history_.emplace_back(block_height, fee_mojos);
-    // [review #163 r6] SATURATING, not wrapping.  is_within_budget() below has
-    // always guarded its own addition; this one did not, and it is the running
-    // total that guard reads.  A wrapped total is small, so budget_remaining()
-    // would report a large headroom and the guard rail would vanish silently
-    // -- a fail-OPEN on the one number the budget is.  Saturating fails the
-    // other way: the budget reads exhausted, attached fees degrade to min_fee
-    // and priority spends are still paid in full (apply_budget), which is the
-    // degradation this controller is designed around.
-    cached_total_ = (fee_mojos > std::numeric_limits<std::uint64_t>::max() - cached_total_)
-                        ? std::numeric_limits<std::uint64_t>::max()
-                        : cached_total_ + fee_mojos;
+    // [review #163 r6] The addition must not WRAP: a wrapped total is small,
+    // budget_remaining() would report a large headroom and the guard rail
+    // would vanish silently -- a fail-OPEN on the one number the budget is.
+    //
+    // [review #163 r7] But it must not SATURATE either, which is what r6 did.
+    // Saturation is lossy, and prune()'s matching clamp was therefore not its
+    // inverse: `[UINT64_MAX @ h=100, 100 @ h=101]` saturated here, and pruning
+    // the first entry drove the total to ZERO with 100 mojos still in the
+    // window -- the same fail-open, one round later.
+    //
+    // So: EXACT.  A carry into cached_total_hi_ is the precise inverse of the
+    // borrow prune() takes, and `hi` cannot itself overflow because that needs
+    // 2^64 entries in fee_history_.  The clamp lives at the READ instead
+    // (saturated_total), where it is handed to a caller rather than fed back.
+    cached_total_lo_ += fee_mojos;
+    if (cached_total_lo_ < fee_mojos) {
+        ++cached_total_hi_;  // unsigned addition is modular: this is the carry
+    }
 
     spdlog::debug("[FeeTracker] Recorded fee {} mojos at block {} "
                   "(rolling total now {} mojos)",
-                  fee_mojos, block_height, cached_total_);
+                  fee_mojos, block_height, saturated_total());
 }
 
 // ===========================================================================
@@ -179,15 +186,25 @@ void FeeTracker::prune(BlockHeight current_block)
             ? (current_block - cfg_.fee_window_blocks)
             : 0;
 
-    // [review #163 r6] The subtraction is saturating for the same reason the
-    // addition is: once record_fee() has saturated, cached_total_ is an
-    // OVER-estimate and the bookkeeping identity it restores no longer holds,
-    // so an unguarded `-=` could underflow to a near-UINT64_MAX total.  Both
-    // directions now clamp, which keeps the total an over-estimate for ever
-    // after a saturation -- the conservative direction for a budget.
+    // [review #163 r7] The exact 128-bit borrow, the precise inverse of the
+    // carry record_fee() takes.  `oldest` was added to (hi:lo) when it was
+    // recorded and has not been removed since, so (hi:lo) >= oldest and the
+    // borrow below is always available -- `lo < oldest` implies `hi > 0`.
+    //
+    // What this replaces, and why: r6 wrote
+    //     cached_total_ = (cached_total_ > oldest) ? cached_total_ - oldest : 0U;
+    // to mirror a SATURATING addition.  Saturating addition is lossy, so it is
+    // not invertible and no subtraction is its inverse.  With
+    // `[UINT64_MAX @ h=100, 100 @ h=101]` the total saturates to UINT64_MAX,
+    // `cached_total_ > oldest` is UINT64_MAX > UINT64_MAX -- FALSE -- and the
+    // else branch set the total to 0 while 100 mojos were still in the window,
+    // reopening the entire budget.  Exact arithmetic has no such branch.
     while (!fee_history_.empty() && fee_history_.front().first < cutoff) {
         const std::uint64_t oldest = fee_history_.front().second;
-        cached_total_ = (cached_total_ > oldest) ? cached_total_ - oldest : 0U;
+        if (cached_total_lo_ < oldest) {
+            --cached_total_hi_;  // borrow
+        }
+        cached_total_lo_ -= oldest;  // modular: exact given the borrow above
         fee_history_.pop_front();
     }
 
@@ -197,7 +214,9 @@ void FeeTracker::prune(BlockHeight current_block)
 std::uint64_t FeeTracker::get_rolling_total(BlockHeight current_block)
 {
     prune(current_block);
-    return cached_total_;
+    // [review #163 r7] The one and only saturation: the true window sum when
+    // it fits a uint64, UINT64_MAX when and only when it does not.
+    return saturated_total();
 }
 
 bool FeeTracker::is_within_budget(BlockHeight current_block,
@@ -205,7 +224,12 @@ bool FeeTracker::is_within_budget(BlockHeight current_block,
 {
     const std::uint64_t current = get_rolling_total(current_block);
 
-    // Overflow-safe addition check.
+    // Overflow-safe addition check.  [review #163 r7] `current` is the only
+    // value in this class that may be CLAMPED rather than exact, and both uses
+    // of it here are monotone increasing in it, so a clamp upward can only
+    // refuse: saturated means "over budget", which is the fail-CLOSED answer.
+    // Nothing subtracts from it -- that was r6's mistake, and it lived in
+    // prune().
     if (additional_fee_mojos >
         std::numeric_limits<std::uint64_t>::max() - current) {
         return false;
@@ -323,8 +347,18 @@ std::uint64_t FeeTracker::get_recommended_fee(std::uint64_t static_fee_mojos,
 
     // Warn when min_fee floor significantly exceeds the mempool estimate,
     // indicating the floor is configured too conservatively.
+    //
+    // [review #163 r7] The same audit that found prune()'s clamp: `pre_clamp`
+    // CAN be a saturated value -- strategy::fee::fee_from_rate returns
+    // kFeeCeiling (2^63-1) when the rate overflows -- and `pre_clamp * 10`
+    // WRAPS for anything above UINT64_MAX/10, which the first conjunct admits
+    // whenever fees.min_fee_mojos is larger still (config.cpp validates only
+    // min <= max).  Divide instead of multiply: `min/10 > pre_clamp` cannot
+    // overflow.  It shifts the threshold by less than one part in ten on a
+    // heuristic advisory, and it is log-only either way -- no control flow and
+    // no fee depends on it, which is also why no test pins it.
     if (pre_clamp < cfg_.min_fee_mojos &&
-        cfg_.min_fee_mojos > pre_clamp * 10) {
+        cfg_.min_fee_mojos / 10U > pre_clamp) {
         spdlog::warn("[FeeTracker] min_fee_mojos ({}) is {}x higher than "
                      "mempool estimate ({} mojos) -- consider lowering "
                      "min_fee_mojos to reduce costs",
