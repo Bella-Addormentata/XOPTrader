@@ -306,9 +306,17 @@ private:
     /// The window total as one uint64: the true sum when it fits, UINT64_MAX
     /// when -- and only when -- the true sum does not.  The ONLY saturation.
     ///
-    /// Every consumer of this value compares it against the budget and is
-    /// MONOTONE in it (is_within_budget refuses, budget_remaining returns 0),
-    /// so clamping downward-safe here fails CLOSED; nothing subtracts from it.
+    /// Said exactly, because the point of this round is that a comment must
+    /// not claim more than its code gives.  Clamping is an UNDER-estimate of a
+    /// true sum above UINT64_MAX, which is normally the dangerous direction --
+    /// it is safe here only because UINT64_MAX is at or above every
+    /// representable daily_budget_mojos, so a clamped read reports the budget
+    /// EXHAUSTED: budget_remaining() returns 0 and is_within_budget() refuses
+    /// every non-zero spend.  (The one answer it still gets wrong is
+    /// `is_within_budget(b, 0)` with daily_budget_mojos == UINT64_MAX, which
+    /// says yes; no caller asks whether spending nothing fits.)  Both
+    /// consumers are monotone non-decreasing in this value and NEITHER
+    /// subtracts from it -- subtracting from a clamped total was r6's mistake.
     [[nodiscard]] std::uint64_t saturated_total() const noexcept
     {
         return (cached_total_hi_ != 0U) ? std::numeric_limits<std::uint64_t>::max()
