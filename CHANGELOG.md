@@ -114,11 +114,17 @@ default to off, and with both off every fee is what v0.10.24 paid.
   fee is worse than a huge one because every guard downstream ignores it rather
   than refusing — `CoinLockLedger::clamp_need()` zeroes it on the cancel path,
   and `ask_take_cost()` / `add_same_wallet_fee()` drop it on their own
-  `<= 0` clause on the take path — so all fourteen `uint64` → `Mojo` fee
-  conversions, six of them implicit narrowings, now go through
-  `xop::to_mojo_saturating()`. The two `posted × fee` products saturate too.
+  `<= 0` clause on the take path — so all **fifteen** `uint64` → `Mojo` fee
+  conversions now go through `xop::to_mojo_saturating()`. Eleven replaced an
+  explicit `static_cast`; the other **four** were implicit narrowings with no
+  cast to grep for, and those four are exactly the `CoinLockLedger` fee
+  arguments in `offer_manager.cpp`. (Counted, after an earlier draft of this
+  entry said "fourteen … six of them implicit" — both numbers were wrong.) The
+  two `posted × fee` products saturate too.
   `static_assert`s in `fee_controller.hpp` and `fee_tracker.hpp` make a wrong
-  ceiling a compile error on every toolchain.
+  ceiling a compile error on every toolchain, and
+  `tests/test_fee_controller_wiring.py` now pins every one of the fifteen call
+  sites — see the entry below.
   **Not reachable on the shipped configuration** (`max_fee_mojos` 100,000,000),
   and not reachable merely by enabling the controller.
 - **The rolling fee window is accounted EXACTLY, and saturates only when it is
@@ -175,6 +181,26 @@ default to off, and with both off every fee is what v0.10.24 paid.
   fix is to pass `max(cancel_fee_xch_mojos_, cancel_fee_cat_mojos_)` while the
   class-aware fees are in force. It must land before `controller_enabled:
   true`.
+- **The saturating conversion had no guard of its own, and a merge gate proved
+  it by measurement.** This release introduced `xop::to_mojo_saturating()` and
+  routed fifteen fee conversions through it — and pinned none of them. On the
+  four-way merged tree the gate dropped the wrapper from each of the four
+  `CoinLockLedger` fee arguments in turn and **nothing caught it**: MSVC
+  `/W4 /WX` builds clean because `uint64` → `int64` is a same-size conversion
+  and `-Wconversion` is in neither toolchain's flags, the C++ suite passes
+  because nothing in `cpp/tests` constructs an `OfferManager`, and no source
+  scan mentioned `to_mojo_saturating` at all. The only thing ever holding those
+  four lines was a neighbouring PR's literal text pin, which was loosened —
+  correctly — so it could pass both alone and merged. Six assertions in
+  `tests/test_fee_controller_wiring.py` now pin the invariant where it belongs:
+  the `CoinLockLedger` fee argument is checked **positionally** (so a third
+  `min_coin` argument cannot break it), the ternary, assignment, bind and
+  ledger-leg shapes are checked individually, a bare narrowing cast on a fee is
+  refused, and an exact per-file census makes dropping any one of the fifteen
+  visible. **Scope, plainly: the code was correct at every site and the
+  reachable impact is negligible** — the narrowing needs a fee above 2^63 mojos
+  (~9.2 million XCH) and `current_fee_mojos_` is clamped by
+  `fees.max_fee_mojos`. This is guard erosion, not a live defect.
 - **Observability.** One `[FeeController] rate a -> b mojos/cost (reason; n
   move(s)) -- fees now: ...` line per burst of changes, and two gauges,
   `xop_fees_controller_rate_mojos_per_cost` and `xop_fees_controller_level_log2`.

@@ -671,3 +671,233 @@ def test_node_rpc_builds_both_payloads_from_the_pinned_helpers():
     height = _function_body(rpc, "asio::awaitable<std::int64_t> ChiaFullNodeRPC::get_block_height()")
     assert "last_mempool_state_ = node_mempool_from_blockchain_state(resp);" in height
     assert len(re.findall(r"rpc_post\(", height)) == 1, "no second RPC for the mempool state"
+
+
+# ---------------------------------------------------------------------------
+# [review #163 r8b] EVERY uint64 -> Mojo FEE CONVERSION SATURATES
+#
+# This PR introduced xop::to_mojo_saturating() and routed FIFTEEN fee
+# conversions through it (the helper does not exist on main).  It pinned NONE
+# of them, and a final merge gate proved the gap by measurement: on the
+# four-way merged tree it dropped the wrapper from each of the four
+# CoinLockLedger fee arguments in turn and NOTHING caught it --
+#
+#   * MSVC /W4 /WX builds clean, because uint64 -> int64 is a SAME-SIZE
+#     conversion and -Wconversion is in neither toolchain's flag set;
+#   * the C++ suite passes, because nothing in cpp/tests constructs an
+#     OfferManager;
+#   * no Python scan mentioned to_mojo_saturating at all.
+#
+# The only thing that had ever held those four lines was #162's literal pin on
+# `try_lock_floor_only(0,current_fee_mojos_,min_coin)` -- an ACCIDENT of a
+# neighbouring PR.  When #162 rightly loosened it to content matching so it
+# would pass both alone and merged, the bare form satisfied it too, and there
+# was nothing left.  The invariant is this PR's, so the guard belongs here.
+#
+# SCOPE, said plainly: the merged code is CORRECT at all four sites, and the
+# reachable impact today is negligible -- the narrowing needs a fee above 2^63
+# mojos (~9.2 million XCH) and current_fee_mojos_ is clamped by
+# fees.max_fee_mojos.  This is GUARD EROSION, not a live defect.
+#
+# These assertions are POSITIONAL and content-based on purpose.  #162 appends a
+# third `min_coin` argument to the two try_lock forms, so a literal match would
+# pass alone and fail merged -- which is exactly the failure being repaired.
+# ---------------------------------------------------------------------------
+
+DATABASE = REPO / "cpp" / "src" / "database.cpp"
+SATURATE = "to_mojo_saturating("
+
+# The fee always arrives SECOND.  #162's `min_coin` lands third, so the index
+# holds for both the two- and the three-argument form.
+LEDGER_FEE_SINKS = (
+    ("try_lock_floor_only", 1, 2),
+    ("try_lock", 1, 2),
+    ("note_lock", 1, 1),
+    ("reserve_bulk_cancel", 1, 1),
+)
+
+# Mojo-typed lvalues fed from a std::uint64_t fee.
+MOJO_FEE_ASSIGNMENTS = (
+    ("offer_manager.cpp", "fill.fee_mojos"),
+    ("offer_manager.cpp", "eval.cancel_cost"),
+    ("offer_manager.cpp", "const Mojo fee_cap"),
+    ("engine.cpp", "f.fee_mojos"),
+)
+
+# Every to_mojo_saturating call site, per file.  An exact count is the
+# anti-erosion ratchet: dropping one anywhere fails here even at a shape the
+# targeted tests above do not model.  Adding a legitimate new fee conversion
+# means updating this map ON PURPOSE.
+SATURATION_CENSUS = {
+    "cpp/src/database.cpp": 1,
+    "cpp/src/engine.cpp": 5,
+    "cpp/src/execution/offer_manager.cpp": 9,
+}
+
+# The shape this PR replaced: a fee expression narrowed by a bare cast.  The
+# `-?` covers engine.cpp's negated ledger leg.  `static_cast<std::uint64_t>` is
+# a WIDENING of a Mojo and is deliberately not matched.
+BARE_FEE_NARROWING = re.compile(
+    r"static_cast<\s*(?:Mojo|std::int64_t)\s*>\s*\(\s*-?\s*"
+    r"(?:current_fee_mojos_|fee|fee_mojos|[A-Za-z_]\w*\.fee_mojos)\s*[),*]")
+
+# The three take/arbitrage funding sites pay the fee only when the spend asset
+# is XCH; the other arm is a literal Mojo, which is why `: Mojo{0}` is the
+# stable half of the anchor.  `[^;]*?` cannot cross a statement boundary.
+TAKE_FEE_TERNARY = re.compile(
+    r'(?:spend_is_xch|spend_asset\s*==\s*"xch")\s*\?(?P<fee>[^;]*?):\s*Mojo\{0\}')
+
+
+def _split_arguments(args: str) -> list[str]:
+    """Top-level comma split of one call's argument text.
+
+    Tracks (), [], {} and string/char literals.  It does NOT track template
+    angle brackets, which is safe here only because every call this scan reads
+    has its argument count asserted -- a mis-split shows up as a count
+    mismatch rather than as a silent pass.
+    """
+    out: list[str] = []
+    depth = 0
+    quote = ""
+    start = 0
+    i = 0
+    while i < len(args):
+        ch = args[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = ""
+        elif ch == '"' or (ch == "'" and not args[i - 1:i].isalnum()):
+            quote = ch
+        elif ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            out.append(args[start:i].strip())
+            start = i + 1
+        i += 1
+    out.append(args[start:].strip())
+    return out
+
+
+def _offer_manager() -> str:
+    return _strip_line_comments(_read(OFFER_MANAGER))
+
+
+def _source(name: str) -> str:
+    return {"offer_manager.cpp": _offer_manager(),
+            "engine.cpp": _engine(),
+            "database.cpp": _strip_line_comments(_read(DATABASE))}[name]
+
+
+def test_every_coin_lock_ledger_fee_argument_saturates():
+    """DERIVED, not enumerated: every call to the four CoinLockLedger entry
+    points that take a fee is checked, so a NEW call site is covered the day it
+    is written.  These are the four sites the merge gate unwrapped one at a
+    time without anything going red, plus note_lock and reserve_bulk_cancel,
+    which are the same conversion into the same ledger."""
+    text = _offer_manager()
+    for callee, fee_index, expected_calls in LEDGER_FEE_SINKS:
+        calls = _call_arguments(text, callee)
+        assert len(calls) == expected_calls, (
+            "expected %d %s call site(s) in offer_manager.cpp, found %d -- this "
+            "scan must not pass vacuously" % (expected_calls, callee, len(calls)))
+        for raw in calls:
+            args = _split_arguments(raw)
+            assert len(args) > fee_index, (
+                "%s called with %d argument(s); the fee is argument %d: %r"
+                % (callee, len(args), fee_index + 1, raw))
+            fee_arg = args[fee_index]
+            assert "fee" in fee_arg, (
+                "argument %d of %s is not the fee any more -- re-derive this "
+                "scan rather than deleting it: %r" % (fee_index + 1, callee, raw))
+            assert SATURATE in fee_arg, (
+                "%s passes a std::uint64_t fee to a Mojo parameter WITHOUT "
+                "to_mojo_saturating: %r.  uint64 -> int64 is a same-size "
+                "conversion, so neither MSVC /W4 /WX nor GCC -Werror says a "
+                "word, and no gtest constructs an OfferManager."
+                % (callee, fee_arg))
+
+
+def test_every_take_fee_ternary_saturates():
+    """The three `<spend asset is xch> ? fee : Mojo{0}` arguments that price a
+    take's funding check.  A wrapped NEGATIVE fee is dropped by
+    add_same_wallet_fee's own `same_wallet_fee <= 0` clause, so the check would
+    silently price the spend without the fee the wallet pays."""
+    matches = list(TAKE_FEE_TERNARY.finditer(_engine()))
+    assert len(matches) == 3, (
+        "expected 3 take-fee ternaries in engine.cpp, found %d" % len(matches))
+    for m in matches:
+        assert SATURATE in m.group("fee"), (
+            "take fee ternary narrows without saturating: %r" % m.group(0))
+
+
+def test_every_mojo_fee_assignment_saturates():
+    """Mojo-typed lvalues fed from a std::uint64_t fee.  `fee_cap` is the one
+    that also has to saturate BEFORE the conversion: the doubling happens in
+    the uint64 domain, so a bare cast would wrap the product first and then
+    narrow the wrapped value, which no care at the cast alone would catch."""
+    for source_name, lvalue in MOJO_FEE_ASSIGNMENTS:
+        text = _source(source_name)
+        pattern = re.compile(re.escape(lvalue) + r"\s*=\s*([^;]*);")
+        found = pattern.findall(text)
+        assert len(found) == 1, (
+            "expected exactly one `%s = ...;` in %s, found %d"
+            % (lvalue, source_name, len(found)))
+        assert SATURATE in found[0], (
+            "`%s` in %s takes a uint64 fee without saturating: %r"
+            % (lvalue, source_name, found[0].strip()))
+
+
+def test_the_remaining_two_fee_conversions_saturate():
+    """The two that share no shape with anything else: the offer row's fee
+    column (SQLite stores a SIGNED 64-bit integer) and the taker fill's ledger
+    leg.  post_ledger_fill's own `add("fee", ...)` is deliberately NOT here --
+    it negates `fill.fee_mojos`, which is already a Mojo."""
+    db = _strip_line_comments(_read(DATABASE))
+    binds = [a for a in _call_arguments(db, "bind_int64")
+             if _split_arguments(a)[:2] == ["stmt_insert_offer_", "13"]]
+    assert len(binds) == 1, (
+        "expected one fee bind on the offer row, found %d" % len(binds))
+    assert SATURATE in _split_arguments(binds[0])[2], (
+        "the offer row's fee column is bound without saturating: %r" % binds[0])
+
+    taker = _function_body(_engine(), "void Engine::record_taker_fill(")
+    legs = re.findall(r'add\("fee",\s*AssetId\{"xch"\},\s*([^;]*)\);', taker)
+    assert len(legs) == 1, (
+        "expected one fee ledger leg in record_taker_fill, found %d" % len(legs))
+    assert SATURATE in legs[0], (
+        "record_taker_fill's fee leg narrows a uint64 without saturating: %r"
+        % legs[0])
+
+
+def test_no_fee_expression_is_narrowed_by_a_bare_cast():
+    """The other direction of the same invariant: the shape this PR replaced
+    must not come back.  Ten of the fifteen sites were an explicit
+    `static_cast<Mojo>` / `static_cast<std::int64_t>` on a fee; the other five
+    had no cast at all, which is why the census below exists as well."""
+    for rel in SATURATION_CENSUS:
+        text = _strip_line_comments(_read(REPO / rel))
+        hits = BARE_FEE_NARROWING.findall(text)
+        assert not hits, (
+            "%s narrows a fee expression with a bare cast again -- use "
+            "xop::to_mojo_saturating: %r" % (rel, hits))
+
+
+def test_every_uint64_to_mojo_fee_conversion_is_accounted_for():
+    """The ratchet.  Fifteen conversions, and the COUNT is what makes dropping
+    any one of them visible -- including at a shape the targeted tests above do
+    not model."""
+    actual = {}
+    for rel in SATURATION_CENSUS:
+        text = _strip_line_comments(_read(REPO / rel))
+        actual[rel] = len(_call_arguments(text, "to_mojo_saturating"))
+    assert actual == SATURATION_CENSUS, (
+        "to_mojo_saturating call sites moved: %r vs expected %r.  If a fee "
+        "conversion was legitimately added or removed, update "
+        "SATURATION_CENSUS on purpose -- do not delete this assertion."
+        % (actual, SATURATION_CENSUS))
+    assert sum(SATURATION_CENSUS.values()) == 15
