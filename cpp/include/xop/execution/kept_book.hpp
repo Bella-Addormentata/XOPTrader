@@ -32,7 +32,20 @@
 // them before the stop, so they are not "kept" -- the wallet verdict or the
 // next engine's escalation finishes them.
 //
-// Pure: no I/O, no engine types, and the clock is an argument.
+// COUNTED APART IS NOT GONE. [review] A submitted cancel is NOT proof the
+// offer is dead: PENDING_CANCEL means the wallet INTENDS to cancel, and a bulk
+// cancel can fail to broadcast most of its spends with no error anywhere. The
+// only ground truth is a spent maker coin. This repo has watched 24 such
+// offers stay takeable on dexie for 2.5 h after a cancel-all, and three
+// XCH/BYC bids stay takeable for 13 days. So the lines below never describe a
+// book with cancel_pending offers in it as empty, and never let the count of
+// RESTING offers stand as the whole of what is still takeable.
+//
+// Pure: no I/O, no engine types, and the clock is an argument. Every
+// operator-facing sentence a keep stop logs is built HERE rather than in
+// engine.cpp, because the engine wiring scan (tests/test_stop_keep_wiring.py)
+// strips string literals and structurally cannot read what the operator reads
+// -- only a gtest over these functions can.
 // ---------------------------------------------------------------------------
 
 #include <algorithm>
@@ -160,13 +173,23 @@ struct KeptBookSummary {
 [[nodiscard]] inline std::string describe_kept_book(const KeptBookSummary& s)
 {
     if (s.resting == 0) {
-        std::string none = "no offers were resting, so nothing was left on the book";
-        if (s.cancel_in_flight > 0) {
-            none += " (" + std::to_string(s.cancel_in_flight)
-                  + " already had a cancel in flight before the stop; this stop "
-                    "sent nothing for them)";
+        if (s.cancel_in_flight == 0) {
+            return "no offers were resting and none had a cancel in flight, so "
+                   "nothing was left on the book";
         }
-        return none;
+        // [review] NOT "nothing was left on the book". A submitted cancel is
+        // not proof: such an offer generally stays TAKEABLE until a maker coin
+        // is spent, and this stop then disarms the dead man's switch and exits,
+        // so nothing chases it until the next start.
+        return "this stop left no offer RESTING, but "
+             + std::to_string(s.cancel_in_flight)
+             + " already had a cancel in flight before it began -- and a "
+               "submitted cancel is NOT proof the offer is gone: until one of "
+               "its maker coins is spent it is STILL TAKEABLE. This stop sent "
+               "nothing more for them, and nothing chases them while the "
+               "engine is down; the next start adopts them as cancel_pending "
+               "and escalates. DO NOT read this as an empty book -- check the "
+               "wallet's PENDING_CANCEL records against the chain";
     }
 
     std::string out = std::to_string(s.resting)
@@ -177,9 +200,13 @@ struct KeptBookSummary {
     }
     out += ".";
     if (s.cancel_in_flight > 0) {
+        // [review] Same rule as the empty-book clause: not counted is not gone.
         out += " " + std::to_string(s.cancel_in_flight)
              + " more already had a cancel in flight before the stop and are "
-               "not counted; this stop sent nothing for them.";
+               "not counted above; this stop sent nothing for them. A "
+               "submitted cancel is NOT proof: until one of its maker coins is "
+               "spent such an offer is STILL TAKEABLE, and nothing chases it "
+               "until the next start adopts it as cancel_pending.";
     }
 
     out += " On-chain expiry:";
@@ -206,6 +233,86 @@ struct KeptBookSummary {
     out += " until then they are TAKEABLE and UNMANAGED: no TTL, no "
            "repricing, no dead man's switch. The next engine start re-adopts "
            "them from the wallet and offer_log.";
+    return out;
+}
+
+/// What a keep stop may say about the dead man's switch.
+///
+/// [review] NOT "the switch is disarmed for this stop", flat. engine.hpp is
+/// careful where the log line was not: `offers_kept_on_stop_` is set first
+/// thing in shutdown() and `watchdog_cancel_book` returns on it under the
+/// mutex, so no NEW firing can send anything -- but "a cancel the switch had
+/// ALREADY started before the operator asked is not recalled: it holds the
+/// mutex, and it was a real firing". `watchdog_fired_` is latched BEFORE that
+/// cancel and never cleared, so it is exactly the fact this sentence needs.
+[[nodiscard]] inline std::string describe_watchdog_disarm(bool already_fired)
+{
+    if (already_fired) {
+        return "the dead man's switch had ALREADY FIRED before this stop and a "
+               "cancel it had begun is NOT recalled -- part of the book may be "
+               "cancelled or cancel_pending whatever this stop kept; read the "
+               "[S31] lines above before trusting the counts here";
+    }
+    return "the dead man's switch sent nothing for this stop and can send "
+           "nothing more while it lasts";
+}
+
+/// The operator-facing line for a stop a SIGNAL delivered INSIDE a heartbeat
+/// cycle (shutdown.flag is read between cycles and never lands there).
+///
+/// [review -- MERGE BLOCKER] This sentence used to end with the flat assertion
+/// "No offer post was left unrecorded", logged UNCONDITIONALLY, forty lines
+/// below the two facts the report computes to say the opposite. The
+/// contradiction was GUARANTEED, not incidental: `post_abandoned` IMPLIES this
+/// branch, because the only path that sets `posting_in_flight_` runs inside
+/// the marked cycle -- so every stop that told the operator an offer may be
+/// untracked then told them, as the last word, that nothing was left
+/// unrecorded. It survived review because the wiring scan that pins both lines
+/// strips string literals.
+///
+/// So the reassurance is CONDITIONAL on both computed facts, and it lives here
+/// where a gtest reads exactly what the operator reads.
+///
+/// @param post_abandoned          the bounded drain gave up with a create
+///                                still in flight.
+/// @param create_outcome_unknown  a create ended with no answer from the
+///                                wallet, which is not a refusal.
+[[nodiscard]] inline std::string describe_cut_cycle(bool post_abandoned,
+                                                    bool create_outcome_unknown)
+{
+    std::string out =
+        "this stop arrived by SIGNAL while a heartbeat cycle was in flight; "
+        "the rest of that cycle will not run.";
+
+    if (post_abandoned || create_outcome_unknown) {
+        out += " AN OFFER POST MAY HAVE BEEN LEFT UNRECORDED";
+        if (post_abandoned && create_outcome_unknown) {
+            out += " (a create was still in flight when the drain budget ran "
+                   "out, AND a create ended with no answer from the wallet)";
+        } else if (post_abandoned) {
+            out += " (a create was still in flight when the drain budget ran "
+                   "out)";
+        } else {
+            out += " (a create ended with no answer from the wallet, which is "
+                   "not a refusal)";
+        }
+        out += " -- see the error line(s) above. This line is NOT an "
+               "all-clear.";
+    } else {
+        out += " No create was abandoned and none ended without an answer, so "
+               "every offer post this process began is recorded above.";
+    }
+
+    // [review] TODO.md S76 (c) says the opposite of "the next start reads the
+    // result from the wallet": a cancel is adopted from the wallet's
+    // PENDING_CANCEL record, but a TAKE completed after the cut is booked
+    // nowhere here, exactly as after a hard kill.
+    out += " A cancel or a take the cycle was awaiting at that instant is CUT, "
+           "and the wallet settles it alone: the next start adopts a cancel "
+           "from the wallet's PENDING_CANCEL record, but a TAKE that completes "
+           "that way is booked NOWHERE in this engine -- no trade row, no P&L, "
+           "only the balances move. Reconcile the wallet against this book "
+           "before trusting the ledger.";
     return out;
 }
 

@@ -2360,8 +2360,10 @@ void Engine::report_offers_kept_on_stop(std::uint64_t waited_for_post_ms,
                      "process had restored the book from offer_log: whatever "
                      "was resting in the wallet is STILL RESTING and was not "
                      "counted. No cancel was sent, no cancel intent was "
-                     "written, and the dead man's switch is disarmed for this "
-                     "stop. The next engine start re-adopts the offers.");
+                     "written, and {}. The next engine start re-adopts the "
+                     "offers.",
+                     execution::describe_watchdog_disarm(
+                         watchdog_fired_.load(std::memory_order_acquire)));
         return;
     }
 
@@ -2408,9 +2410,15 @@ void Engine::report_offers_kept_on_stop(std::uint64_t waited_for_post_ms,
     const execution::KeptBookSummary summary =
         execution::summarise_kept_book(facts, now_unix_s);
 
+    // [review] The switch clause is CONDITIONAL on watchdog_fired_, which is
+    // latched before any switch-initiated cancel and never cleared. engine.hpp
+    // refuses to state the disarm flatly -- a cancel the switch had already
+    // begun holds the mutex and is not recalled -- and neither does this line.
     spdlog::warn("[Engine] [S74] KEEP stop: {} No cancel was sent, no cancel "
-                 "intent was written, and the dead man's switch is disarmed "
-                 "for this stop.", execution::describe_kept_book(summary));
+                 "intent was written, and {}.",
+                 execution::describe_kept_book(summary),
+                 execution::describe_watchdog_disarm(
+                     watchdog_fired_.load(std::memory_order_acquire)));
     if (rows_added > 0 || rows_failed > 0) {
         spdlog::warn("[Engine] [S74] offer_log: {} kept offer(s) had no row and "
                      "were given one so the next start restores them as known; "
@@ -2451,15 +2459,20 @@ void Engine::report_offers_kept_on_stop(std::uint64_t waited_for_post_ms,
     }
     if (heartbeat_in_flight_) {
         // [review #165] Only a SIGNAL gets here mid-cycle: shutdown.flag is
-        // read between cycles. An in-flight POST was waited for above, so no
-        // maker offer is lost. Anything ELSE the cycle was awaiting is cut:
-        // from here to ioc_.stop() nothing suspends, so it never resumes.
-        spdlog::warn("[Engine] [S74] this stop arrived by SIGNAL while a "
-                     "heartbeat cycle was in flight; the rest of that cycle "
-                     "will not run. No offer post was left unrecorded. A cancel "
-                     "or a take it was awaiting at that instant is settled by "
-                     "the wallet alone, and the next start reads the result "
-                     "from the wallet (PENDING_CANCEL records, balances).");
+        // read between cycles. Anything the cycle was awaiting is cut: from
+        // here to ioc_.stop() nothing suspends, so it never resumes.
+        //
+        // [review -- MERGE BLOCKER] The wording is built by
+        // execution::describe_cut_cycle FROM THE TWO FACTS COMPUTED ABOVE, not
+        // written here. It used to end "No offer post was left unrecorded."
+        // unconditionally, which post_abandoned CONTRADICTS BY CONSTRUCTION --
+        // post_abandoned implies heartbeat_in_flight_, because the only path
+        // that sets posting_in_flight_ runs inside the marked cycle. The
+        // wiring scan over this file strips string literals and cannot see a
+        // sentence at all, so the claim lives where a gtest reads it.
+        spdlog::warn("[Engine] [S74] {}",
+                     execution::describe_cut_cycle(post_abandoned,
+                                                   create_outcome_unknown_));
     }
     if (cancel_all_inflight_) {
         spdlog::warn("[Engine] [S74] an operator Cancel All was still in flight "

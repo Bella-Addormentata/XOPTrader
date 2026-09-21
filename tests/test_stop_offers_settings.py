@@ -197,6 +197,77 @@ def test_the_keep_bullet_states_the_real_stop_latency_from_the_code_itself():
         "from becoming an orphan the next start may cancel")
 
 
+def test_no_document_names_a_ttl_cancel_mode_value_that_exists_in_no_build():
+    """[review] ``ttl_cancel_mode: age`` was named in a paragraph headed
+    "exactly", in three documents. That value exists in NO build: the key is
+    added by open PR #164 and spelled ``cancel | expire``, with ``cancel`` the
+    default. The mistake is the kind an operator acts on -- they would edit the
+    live config to a value the strict parser rejects, or read the default as
+    something other than what it is.
+
+    Checked across every document that carries the claim, because this round's
+    repeated failure has been a correction that missed a copy."""
+    offenders = []
+    for name in ("config.example.yaml", "CHANGELOG.md", "TODO.md", "README.md"):
+        path = _REPO / name
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8")
+        for pattern in (r"ttl_cancel_mode:\s*age\b", r"ttl_cancel_mode`?:?\s*`?age`"):
+            if re.search(pattern, text):
+                offenders.append(name)
+    assert not offenders, (
+        "these documents name strategy.ttl_cancel_mode: age, a value no build "
+        "accepts (#164 spells the key cancel | expire, default cancel): %r"
+        % (sorted(set(offenders)),))
+
+
+def test_the_keep_bullet_does_not_call_a_gui_stop_immediate():
+    """[review] THE PARAGRAPH WAS WRONG ABOUT THE PATH OPERATORS ACTUALLY USE.
+
+    It said a GUI stop "is immediate: it is read between heartbeat cycles, so
+    it never finds an offer being created". The clause offered as the
+    justification is the reason it is NOT immediate: ``check_shutdown_flag()``
+    runs once per 5 s poll iteration and the SAME iteration then ``co_await``s
+    the whole heartbeat cycle inline (``cpp/src/engine.cpp``), so a request
+    arriving just after a cycle starts is not read until that cycle ends.
+    Measured over 976 live cycles on 2026-09-21: median 10.4 s, p90 14.2 s,
+    1.5% over 30 s, longest 108.7 s."""
+    block = _engine_block()
+    assert "is\n#           immediate" not in block and " is immediate" not in block, (
+        "the keep bullet calls a GUI stop immediate again -- the flag is read "
+        "once per poll and only between cycles, which bounds the latency by a "
+        "whole heartbeat cycle")
+    for must_say in ("NOT instant", "once per 5 s poll", "108.7 s"):
+        assert must_say in block, (
+            f"the keep bullet no longer states {must_say!r}: an operator told "
+            "the stop is immediate will read a 30 s wait as a hang")
+
+
+def test_the_keep_bullet_discloses_the_guis_own_hard_kill():
+    """...and the GUI performs the very hard kill the paragraph forbids.
+
+    ``_GRACEFUL_STOP_WAIT_S`` seconds after writing ``shutdown.flag`` the GUI
+    calls ``proc.terminate()`` -- ``TerminateProcess`` on Windows. A killed
+    stop never reaches ``report_offers_kept_on_stop``, so the ``offer_log``
+    flush does not run and an offer with no row yet arrives at the next start
+    as an orphan. Pinned against the GUI's own constant, not a copied number:
+    if the window is retuned, this documentation must move with it."""
+    from gui.services import engine_bridge
+
+    wait_s = engine_bridge._GRACEFUL_STOP_WAIT_S
+    block = _engine_block()
+    assert f"{wait_s} SECONDS" in block or f"{wait_s} seconds" in block, (
+        f"the keep bullet does not state the GUI's own {wait_s} s stop window, "
+        "after which it hard-kills the engine it just asked to stop")
+    for must_say in ("_GRACEFUL_STOP_WAIT_S", "TerminateProcess", "offer_log flush",
+                     "ORPHAN"):
+        assert must_say in block, (
+            f"the keep bullet no longer says {must_say!r}: the operator is "
+            "told not to hard-kill a slow stop while the GUI does exactly "
+            "that, and the kill skips the flush that makes re-adoption clean")
+
+
 # --------------------------------------------------------------------------- #
 # An upgrade changes nothing
 # --------------------------------------------------------------------------- #

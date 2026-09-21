@@ -4027,6 +4027,10 @@ BuyerConfig parse_buyer(const YAML::Node& root)
 // key decides what happens to a live book when nobody is there to answer, and
 // every lenient reading of a typo ("shutdown_offer: keep", "engine: keep",
 // "shutdown_offers: kep") is a silent "cancel" the operator did not choose.
+// [review] "A value it cannot read" INCLUDES A BLANK ONE.  `shutdown_offers:`
+// with nothing after it used to fall through to the default -- a silent
+// "cancel" arriving through the one section whose whole point is that it never
+// does that.  An empty SECTION is still "not set": there the key is absent.
 // ---------------------------------------------------------------------------
 EngineConfig parse_engine(const YAML::Node& root)
 {
@@ -4041,6 +4045,7 @@ EngineConfig parse_engine(const YAML::Node& root)
         throw ConfigError(sec + " must be a mapping with the key "
                           "shutdown_offers (cancel or keep)");
     }
+    bool key_present = false;
     for (auto it = node.begin(); it != node.end(); ++it) {
         const std::string key =
             it->first.IsScalar() ? it->first.as<std::string>() : std::string("<non-scalar key>");
@@ -4048,24 +4053,41 @@ EngineConfig parse_engine(const YAML::Node& root)
             throw ConfigError(sec + "." + key + " is not a known key (the only "
                               "key in this section is shutdown_offers)");
         }
+        key_present = true;
+    }
+    // [review] An EMPTY section (`engine:`, `engine: {}`) really is "not set":
+    // the key was never written, and absent means cancel exactly as it did
+    // before the key existed.  A key that IS written and left BLANK
+    // (`shutdown_offers:`) is a different thing -- a half-finished edit -- and
+    // letting it read as "cancel" is precisely the silent default this section
+    // says it refuses.  Rejected below with the rest of the unreadable values.
+    if (!key_present) {
+        return cfg;
     }
 
     const YAML::Node& value = node["shutdown_offers"];
-    if (value && value.IsDefined() && !value.IsNull()) {
-        const std::optional<util::StopOffersPolicy> policy =
-            value.IsScalar()
-                ? util::parse_stop_offers_policy(value.as<std::string>())
-                : std::nullopt;
-        if (!policy.has_value()) {
-            throw ConfigError(
-                sec + ".shutdown_offers must be \"cancel\" or \"keep\" (got "
-                + (value.IsScalar() ? "\"" + value.as<std::string>() + "\""
-                                    : std::string("a non-scalar value"))
-                + "): it decides what a stop does with the resting offers "
-                  "when the stop request does not say");
+    const bool has_value = static_cast<bool>(value) && value.IsDefined()
+                           && !value.IsNull();
+    const std::optional<util::StopOffersPolicy> policy =
+        (has_value && value.IsScalar())
+            ? util::parse_stop_offers_policy(value.as<std::string>())
+            : std::nullopt;
+    if (!policy.has_value()) {
+        std::string got;
+        if (!has_value) {
+            got = "an empty value";
+        } else if (value.IsScalar()) {
+            got = "\"" + value.as<std::string>() + "\"";
+        } else {
+            got = "a non-scalar value";
         }
-        cfg.shutdown_offers = *policy;
+        throw ConfigError(
+            sec + ".shutdown_offers must be \"cancel\" or \"keep\" (got "
+            + got
+            + "): it decides what a stop does with the resting offers "
+              "when the stop request does not say");
     }
+    cfg.shutdown_offers = *policy;
     return cfg;
 }
 

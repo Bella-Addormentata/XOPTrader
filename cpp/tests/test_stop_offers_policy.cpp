@@ -39,7 +39,9 @@
 #include <utility>
 #include <vector>
 
+using xop::execution::describe_cut_cycle;
 using xop::execution::describe_kept_book;
+using xop::execution::describe_watchdog_disarm;
 using xop::execution::format_unix_utc;
 using xop::execution::KeptBookSummary;
 using xop::execution::KeptOfferFacts;
@@ -417,18 +419,158 @@ TEST(KeptBook, TheLineNamesCountPairsAndBothExpiryBounds)
     EXPECT_NE(text.find("TAKEABLE and UNMANAGED"), std::string::npos) << text;
 }
 
-TEST(KeptBook, AnEmptyBookSaysSoAndClaimsNothing)
+TEST(KeptBook, AnEmptyBookSaysSoOnlyWhenNoCancelIsInFlight)
 {
-    EXPECT_NE(describe_kept_book(summarise_kept_book({}, kNow)).find("no offers were resting"),
-              std::string::npos);
+    const std::string empty = describe_kept_book(summarise_kept_book({}, kNow));
+    EXPECT_NE(empty.find("no offers were resting and none had a cancel in flight"),
+              std::string::npos) << empty;
+    EXPECT_NE(empty.find("nothing was left on the book"), std::string::npos) << empty;
+}
 
-    // Only cancel_pending offers: still nothing was KEPT.
+// [review] THE OLD NAME WAS THE DEFECT. `AnEmptyBookSaysSoAndClaimsNothing`
+// blessed a line that said "nothing was left on the book" for a book whose
+// every offer was cancel_pending -- which summarise_kept_book deliberately
+// diverts out of `resting`, out of `per_pair` and out of the expiry
+// accounting.
+//
+// This repo's rule is the opposite of that reassurance: PENDING_CANCEL means
+// the wallet INTENDS to cancel, a bulk cancel can fail to broadcast most of
+// its spends with no error anywhere, and the only ground truth is a spent
+// maker coin. 24 such offers stayed takeable on dexie for 2.5 h after a
+// cancel-all on 2026-08-29; three XCH/BYC bids stayed takeable for 13 days.
+// The keep stop then disarms the dead man's switch and exits, so nothing
+// chases them until the next start adopts them.
+TEST(KeptBook, ACancelInFlightIsNeverDescribedAsAnEmptyBook)
+{
     const std::vector<KeptOfferFacts> only_pending{
         offer("XCH/DBX", kNow - 10, kDay, /*cancel_pending=*/true)};
     const std::string text = describe_kept_book(summarise_kept_book(only_pending, kNow));
-    EXPECT_NE(text.find("no offers were resting"), std::string::npos) << text;
-    EXPECT_NE(text.find("1 already had a cancel in flight"), std::string::npos) << text;
+
+    // Nothing was KEPT -- that part was right and stays.
     EXPECT_EQ(text.find("left RESTING"), std::string::npos) << text;
+    EXPECT_NE(text.find("this stop left no offer RESTING"), std::string::npos) << text;
+    EXPECT_NE(text.find("1 already had a cancel in flight"), std::string::npos) << text;
+
+    // ...and the book is NOT claimed to be empty, in any of its spellings.
+    EXPECT_EQ(text.find("nothing was left on the book"), std::string::npos) << text;
+    EXPECT_EQ(text.find("no offers were resting and none"), std::string::npos) << text;
+    // The operator is told the thing that decides what to do next.
+    EXPECT_NE(text.find("STILL TAKEABLE"), std::string::npos) << text;
+    EXPECT_NE(text.find("is NOT proof"), std::string::npos) << text;
+}
+
+// The same rule on the non-empty line: "not counted" must not read as "gone".
+TEST(KeptBook, ACancelInFlightBesideARestingBookIsAlsoSaidToBeTakeable)
+{
+    const std::vector<KeptOfferFacts> mixed{
+        offer("XCH/DBX", kNow - 3600, kDay),
+        offer("XCH/BYC", kNow - 10, kDay, /*cancel_pending=*/true),
+        offer("XCH/BYC", kNow - 20, kDay, /*cancel_pending=*/true),
+    };
+    const std::string text = describe_kept_book(summarise_kept_book(mixed, kNow));
+    EXPECT_NE(text.find("1 offer(s) left RESTING"), std::string::npos) << text;
+    EXPECT_NE(text.find("2 more already had a cancel in flight"), std::string::npos) << text;
+    EXPECT_NE(text.find("STILL TAKEABLE"), std::string::npos) << text;
+    EXPECT_NE(text.find("is NOT proof"), std::string::npos) << text;
+}
+
+// ===========================================================================
+// 3b. The two sentences the wiring scan structurally cannot read
+// ===========================================================================
+//
+// tests/test_stop_keep_wiring.py pins Engine::report_offers_kept_on_stop over
+// the SOURCE TEXT, and _code() empties every string literal before it matches.
+// So a log line can assert anything at all and the scan still passes -- which
+// is exactly how an unconditional "No offer post was left unrecorded." shipped
+// beside the two facts that contradict it. These sentences therefore live in
+// kept_book.hpp, and these tests read what the operator reads.
+
+TEST(CutCycleLine, WithNothingOutstandingItSaysThePostsAreRecorded)
+{
+    const std::string text = describe_cut_cycle(/*post_abandoned=*/false,
+                                                /*create_outcome_unknown=*/false);
+    EXPECT_NE(text.find("arrived by SIGNAL while a heartbeat cycle was in flight"),
+              std::string::npos) << text;
+    EXPECT_NE(text.find("every offer post this process began is recorded above"),
+              std::string::npos) << text;
+    EXPECT_EQ(text.find("MAY HAVE BEEN LEFT UNRECORDED"), std::string::npos) << text;
+}
+
+// THE MERGE BLOCKER, stated as a test. post_abandoned IMPLIES this branch --
+// the only path that sets posting_in_flight_ runs inside the marked cycle --
+// so an unconditional reassurance here contradicts the error line above it on
+// EVERY stop that abandons a post, not on some of them.
+TEST(CutCycleLine, AnAbandonedPostIsNeverFollowedByAnAllClear)
+{
+    const std::string text = describe_cut_cycle(/*post_abandoned=*/true,
+                                                /*create_outcome_unknown=*/false);
+    EXPECT_NE(text.find("AN OFFER POST MAY HAVE BEEN LEFT UNRECORDED"),
+              std::string::npos) << text;
+    EXPECT_NE(text.find("still in flight when the drain budget ran out"),
+              std::string::npos) << text;
+    EXPECT_NE(text.find("NOT an all-clear"), std::string::npos) << text;
+    // The sentence that used to be printed here regardless.
+    EXPECT_EQ(text.find("No offer post was left unrecorded"), std::string::npos) << text;
+    EXPECT_EQ(text.find("every offer post this process began is recorded above"),
+              std::string::npos) << text;
+}
+
+TEST(CutCycleLine, ACreateWithNoAnswerIsNeverFollowedByAnAllClear)
+{
+    const std::string text = describe_cut_cycle(/*post_abandoned=*/false,
+                                                /*create_outcome_unknown=*/true);
+    EXPECT_NE(text.find("AN OFFER POST MAY HAVE BEEN LEFT UNRECORDED"),
+              std::string::npos) << text;
+    EXPECT_NE(text.find("no answer from the wallet, which is not a refusal"),
+              std::string::npos) << text;
+    EXPECT_EQ(text.find("every offer post this process began is recorded above"),
+              std::string::npos) << text;
+}
+
+TEST(CutCycleLine, BothFactsAreNamedWhenBothHold)
+{
+    const std::string text = describe_cut_cycle(/*post_abandoned=*/true,
+                                                /*create_outcome_unknown=*/true);
+    EXPECT_NE(text.find("still in flight when the drain budget ran out, AND a "
+                        "create ended with no answer"), std::string::npos) << text;
+    EXPECT_EQ(text.find("every offer post this process began is recorded above"),
+              std::string::npos) << text;
+}
+
+// [review] TODO.md S76 (c) contradicts the clause this line used to end with.
+// A cancel really is recovered from the wallet's record; a TAKE completed
+// after the cut is booked nowhere -- no trade row, no P&L -- exactly as after
+// a hard kill. Said on every combination, because it is true on every one.
+TEST(CutCycleLine, ACutTakeIsNeverClaimedToBeRecovered)
+{
+    for (const bool abandoned : {false, true}) {
+        for (const bool unknown : {false, true}) {
+            const std::string text = describe_cut_cycle(abandoned, unknown);
+            EXPECT_NE(text.find("adopts a cancel from the wallet's PENDING_CANCEL record"),
+                      std::string::npos) << text;
+            EXPECT_NE(text.find("booked NOWHERE in this engine"), std::string::npos)
+                << text;
+            EXPECT_EQ(text.find("the next start reads the result from the wallet"),
+                      std::string::npos) << text;
+        }
+    }
+}
+
+// [review] engine.hpp: "A cancel the switch had ALREADY started before the
+// operator asked is not recalled: it holds the mutex, and it was a real
+// firing." The log line said "the dead man's switch is disarmed for this stop"
+// flat. watchdog_fired_ is latched BEFORE that cancel and never cleared, so it
+// is exactly the fact the sentence needs.
+TEST(WatchdogDisarmLine, ItIsFlatOnlyWhenTheSwitchNeverFired)
+{
+    const std::string quiet = describe_watchdog_disarm(/*already_fired=*/false);
+    EXPECT_NE(quiet.find("sent nothing for this stop"), std::string::npos) << quiet;
+    EXPECT_EQ(quiet.find("ALREADY FIRED"), std::string::npos) << quiet;
+
+    const std::string fired = describe_watchdog_disarm(/*already_fired=*/true);
+    EXPECT_NE(fired.find("had ALREADY FIRED before this stop"), std::string::npos) << fired;
+    EXPECT_NE(fired.find("NOT recalled"), std::string::npos) << fired;
+    EXPECT_EQ(fired.find("sent nothing for this stop"), std::string::npos) << fired;
 }
 
 TEST(KeptBook, UnixSecondsAreFormattedAsUtcCivilTime)

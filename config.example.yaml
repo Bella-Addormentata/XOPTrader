@@ -717,20 +717,41 @@ monitoring:
 #           coins locked, of course; what there is nothing to clean up AFTER is
 #           the cancelling stop's residue.)
 #
-#           HOW LONG THE STOP ITSELF TAKES. A stop you asked for in the GUI is
-#           immediate: it is read between heartbeat cycles, so it never finds
-#           an offer being created. A stop delivered by a SIGNAL (Ctrl+C,
-#           SIGTERM, a service stop, an OS session end) can land while the
-#           engine is in the middle of creating an offer, and it then WAITS for
-#           that one create to land so the offer is recorded instead of
-#           orphaned -- up to 247 seconds with the shipped RPC timeouts, which
-#           is one create plus one publish at their own worst case. It waits on
-#           a timer, never on the wallet, and starts no new offers while it
-#           waits. DO NOT HARD-KILL A STOP THAT SEEMS SLOW (Task Manager,
-#           taskkill /F, End Task, running the installer over a live bot):
-#           that is exactly the wait that keeps a just-created offer from
-#           becoming an orphan the NEXT start may cancel. A second Ctrl+C is
-#           the escape hatch if you truly need one.
+#           HOW LONG THE STOP ITSELF TAKES. A stop you ask for in the GUI is
+#           NOT instant. The engine reads data/shutdown.flag once per 5 s poll
+#           and only BETWEEN heartbeat cycles -- the same poll iteration then
+#           runs the whole cycle inline -- so a request that arrives just after
+#           a cycle starts is not even SEEN until that cycle ends. Being read
+#           between cycles is what keeps a GUI stop from ever finding an offer
+#           being created; it is not what makes it fast. Measured over 976 live
+#           cycles on the reference machine (2026-09-21, two enabled pairs at
+#           num_tiers: 6): median 10.4 s, 90th percentile 14.2 s, 1.5% longer
+#           than 30 s, longest 108.7 s. risk.watchdog_stall_seconds (600)
+#           is what the engine itself treats as too long.
+#
+#           AND THE GUI ITSELF HARD-KILLS A STOP THAT OVERRUNS 30 SECONDS
+#           (_GRACEFUL_STOP_WAIT_S in gui/services/engine_bridge.py, then
+#           TerminateProcess). About one cycle in 65 is longer than that on its
+#           own, so this does happen. A killed stop never reaches the keep
+#           report, so the offer_log flush it performs does not run: any offer
+#           that had entered State but had no offer_log row yet arrives at the
+#           next start as an ORPHAN, which the reconcile re-prices or CANCELS.
+#           The offers themselves stay resting either way -- a hard kill runs
+#           no cancel. If engine.log shows a stop being terminated, treat the
+#           next start's orphan lines as the thing to check.
+#
+#           A stop delivered by a SIGNAL (Ctrl+C, SIGTERM, a service stop, an
+#           OS session end) can land while the engine is in the middle of
+#           creating an offer, and it then WAITS for that one create to land so
+#           the offer is recorded instead of orphaned -- up to 247 seconds with
+#           the shipped RPC timeouts, which is one create plus one publish at
+#           their own worst case. It waits on a timer, never on the wallet, and
+#           starts no new offers while it waits; it says so when it begins
+#           ("KEEP stop: an offer create is in flight"). DO NOT HARD-KILL A
+#           STOP THAT SEEMS SLOW (Task Manager, taskkill /F, End Task, running
+#           the installer over a live bot): that is exactly the wait that keeps
+#           a just-created offer from becoming an orphan the NEXT start may
+#           cancel. A second Ctrl+C is the escape hatch if you truly need one.
 #
 # The GUI ASKS on Stop Trading and when its window is closed, and only
 # preselects this value. THIS key decides every stop where nobody is asked:
@@ -757,10 +778,12 @@ monitoring:
 #   * while nothing is running, only the on-chain expiry bounds it -- at
 #     offer_expiry_secs: 86400 that is up to 24 h from when each offer was
 #     POSTED, whatever the stop's length;
-#   * when the engine comes back with strategy.ttl_cancel_mode: age (the
-#     default), its first cycle cancels anything past the hard TTL --
-#     offer_ttl_blocks x 2, i.e. 800 blocks or about 4 h 10 min at the
-#     peak-height cadence of 18.75 s per block -- expired offers included;
+#   * when the engine comes back with strategy.ttl_cancel_mode: cancel (the
+#     default, and the only behaviour of any build before PR #164 added the
+#     key -- there is no value spelled "age"), its first cycle cancels anything
+#     past the hard TTL -- offer_ttl_blocks x 2, i.e. 800 blocks or about
+#     4 h 10 min at the peak-height cadence of 18.75 s per block -- expired
+#     offers included;
 #   * with ttl_cancel_mode: expire, an offer that carries a verified expiry is
 #     NOT cancelled at the hard TTL: it rests until its own max_time passes and
 #     is then retired with a free local cancel about ten minutes later. The
@@ -769,6 +792,9 @@ monitoring:
 #
 # Strict: only this key, only these two values -- anything else is a startup
 # error, because every lenient reading of a typo would be a silent "cancel".
+# "Anything else" includes a BLANK value: `shutdown_offers:` with nothing after
+# it is a half-finished edit, not a policy, and it is rejected. Omitting the
+# section, or leaving it empty, is still "not set" and still means cancel.
 # Read at startup; a change applies from the next engine start.
 engine:
   shutdown_offers: cancel           # [OPTIONAL, default: cancel] cancel | keep

@@ -63,6 +63,48 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Ctrl+C still exits at once. If a create instead fails with *no answer* — a
   timeout, an empty reply, a 5xx — that is not proof the wallet refused it, and
   the keep stop now says so at error rather than reporting a clean book.
+- **What the stop report may and may not claim.** Three operator-facing
+  sentences asserted safety the code does not provide, and are now built from
+  the facts the report has already computed:
+  - the mid-cycle line ended with a flat *"No offer post was left
+    unrecorded"*, logged **unconditionally** and forty lines below the two
+    facts (`post_abandoned`, `create_outcome_unknown_`) that exist to say the
+    opposite. The contradiction was guaranteed, not incidental: a
+    `post_abandoned` stop is always a mid-cycle one, because the only path
+    that marks a post in flight runs inside the marked cycle. The reassurance
+    is now conditional on both, and the same sentence no longer implies a
+    **take** cut by the stop is recovered — a cancel is adopted from the
+    wallet's `PENDING_CANCEL` record, but a take completed after the cut is
+    booked nowhere in this engine (TODO S76 (c));
+  - *"nothing was left on the book"* was printed whenever nothing was
+    **resting**, although every `cancel_pending` offer is deliberately excluded
+    from that count — and in this repo a submitted cancel is not proof: such an
+    offer generally stays **takeable** until a maker coin is spent (24 of them
+    for 2.5 h in August, three for 13 days). The stop then disarms the dead
+    man's switch and exits, so nothing chases them until the next start. The
+    line now says so, both when the book is otherwise empty and when it is not;
+  - *"the dead man's switch is disarmed for this stop"* was flat, where
+    `engine.hpp` is careful: a cancel the switch had **already begun** holds
+    the mutex and is not recalled. The line now reads `watchdog_fired_` and
+    says which of the two happened.
+  Each of these sentences now lives in `kept_book.hpp`, where a gtest reads
+  exactly what the operator reads — the `engine.cpp` wiring scan strips string
+  literals and structurally cannot.
+- **A blank `engine.shutdown_offers` is a startup error**, like every other
+  value the section cannot read. `shutdown_offers:` with nothing after it used
+  to fall through to `cancel` — the silent default this section exists to
+  prevent. An omitted or empty `engine:` section is still "not set" and still
+  means `cancel`.
+- **The documented stop latency is the real one.** `config.example.yaml` said a
+  GUI stop is *immediate* because the request is read between heartbeat cycles.
+  The clause is the reason it is **not**: the flag is read once per 5 s poll and
+  the same poll iteration then awaits the whole cycle inline. Measured over 976
+  live cycles: median 10.4 s, p90 14.2 s, 1.5% over 30 s, longest 108.7 s. The
+  paragraph now states that, and states that the GUI's own 30 s window ends in
+  `TerminateProcess` — the hard kill the same paragraph tells operators not to
+  perform — which skips the `offer_log` flush and can send an offer to the next
+  start as an orphan. The 30 s value is **unchanged in this PR** and flagged for
+  an operator decision (see the PR body).
 - **Operator notes.** Keep is for restarts. A kept offer is takeable with no
   engine behind it — no repricing, no TTL, no dead man's switch — so use it
   only with `strategy.offer_expiry_secs` set. **While the engine is down the
@@ -70,7 +112,8 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   so at the live `offer_expiry_secs: 86400` an offer can stay takeable for up to
   24 h from the moment it was posted, however long the stop lasts. What happens
   when the engine comes back depends on `strategy.ttl_cancel_mode`:
-  with `age` (the default, and every build before that key existed) the first
+  with `cancel` (the default, and the only behaviour of any build before that
+  key existed — there is no value spelled `age`) the first
   cycle cancels anything past the hard TTL — 2 × `offer_ttl_blocks`, 800 blocks
   ≈ 4 h 10 min at the peak-height cadence of 18.75 s/block — including offers
   whose expiry has already passed, because the reference wallet goes on

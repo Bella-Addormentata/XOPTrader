@@ -79,6 +79,101 @@ def _code(text: str, *, squeeze: bool = True) -> str:
     return re.sub(r"\s+", "", joined) if squeeze else joined
 
 
+def _no_comments(text: str) -> str:
+    """Comments removed, string literals KEPT, whitespace kept.
+
+    `_code` empties every literal -- that is its job, and it is exactly why
+    this scan could not see the sentence a keep stop actually prints. The two
+    guards at the bottom of this file read the source through here instead."""
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            out.append(text[i:j + 1])
+            i = j + 1
+        elif text.startswith("//", i):
+            j = text.find("\n", i)
+            i = n if j == -1 else j
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            i = n if j == -1 else j + 2
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def _brace_safe(src: str) -> str:
+    """*src* (comment-free, literals kept) with every literal BODY blanked to
+    spaces. Same length, so an offset found here indexes *src* -- and a brace
+    inside a format string ("{}") is not counted as a code brace."""
+    out = list(src)
+    i, n = 0, len(src)
+    while i < n:
+        if src[i] == '"':
+            j = i + 1
+            while j < n and src[j] != '"':
+                step = 2 if src[j] == "\\" else 1
+                for k in range(j, min(j + step, n)):
+                    out[k] = " "
+                j += step
+            i = j + 1
+        else:
+            i += 1
+    return "".join(out)
+
+
+def _brace_span(safe: str, start: int) -> tuple[int, int]:
+    """(open, close+1) of the balanced block whose `{` is at or after *start*,
+    measured over a `_brace_safe` string so literals cannot unbalance it."""
+    open_at = safe.find("{", start)
+    assert open_at != -1, f"no block after offset {start}"
+    depth = 0
+    for k in range(open_at, len(safe)):
+        if safe[k] == "{":
+            depth += 1
+        elif safe[k] == "}":
+            depth -= 1
+            if depth == 0:
+                return open_at, k + 1
+    raise AssertionError(f"unbalanced block after offset {start}")
+
+
+def _literals(text: str) -> list[str]:
+    """Every double-quoted literal in *text*, comments removed first, with
+    ADJACENT literals joined -- a C++ log message is normally written as one
+    literal per source line, and the operator reads the concatenation."""
+    src = _no_comments(text)
+    pieces: list[tuple[int, int, str]] = []
+    i, n = 0, len(src)
+    while i < n:
+        if src[i] == '"':
+            j = i + 1
+            buf: list[str] = []
+            while j < n and src[j] != '"':
+                if src[j] == "\\":
+                    buf.append(src[j:j + 2])
+                    j += 2
+                else:
+                    buf.append(src[j])
+                    j += 1
+            pieces.append((i, j + 1, "".join(buf)))
+            i = j + 1
+        else:
+            i += 1
+    joined: list[str] = []
+    for index, (start, end, body) in enumerate(pieces):
+        if index and not src[pieces[index - 1][1]:start].strip():
+            joined[-1] += body
+        else:
+            joined.append(body)
+    return joined
+
+
 def _block(code: str, opener: str) -> str:
     """The balanced `{...}` block that starts at the ONE occurrence of `opener`."""
     assert opener.endswith("{"), opener
@@ -709,7 +804,18 @@ def test_a_keep_stop_that_cut_a_cycle_short_says_so():
         "a bare reset after the await is skipped by an exception; the RAII mark "
         "is what clears it")
     report = _code(_definition(ENGINE_CPP, "void Engine::report_offers_kept_on_stop(std::uint64_t waited_for_post_ms,"))
-    assert "if(heartbeat_in_flight_){spdlog::warn(" in report
+    # [review -- MERGE BLOCKER] The line must be BUILT FROM the two facts the
+    # report computed, not written beside them. Pinning the arguments is the
+    # part this scan can do: pinning the SENTENCE is cpp/tests' job (CutCycleLine
+    # in test_stop_offers_policy.cpp), because _code() empties every literal.
+    assert ('if(heartbeat_in_flight_){spdlog::warn("",'
+            "execution::describe_cut_cycle(post_abandoned,create_outcome_unknown_));}"
+            ) in report, (
+        "the mid-cycle line no longer takes its wording from "
+        "execution::describe_cut_cycle(post_abandoned, create_outcome_unknown_) "
+        "-- a sentence written here is one no test reads, which is how an "
+        "unconditional 'No offer post was left unrecorded.' shipped beside the "
+        "two facts that contradict it")
     # ...and a post the bounded wait gave up on is said LOUDER than that.
     assert "if(post_abandoned){spdlog::error(" in report
     # The flag checkpoints really are outside the cycle: none inside it.
@@ -770,6 +876,105 @@ def test_the_engine_header_documents_the_members_the_scans_rely_on():
     # shutdown() keeps its signature: a signal handler calls it bare, and every
     # wiring scan finds it by that text.
     assert "voidshutdown();" in header
+
+
+# --------------------------------------------------------------------------- #
+# The claims the scan above structurally cannot read
+# --------------------------------------------------------------------------- #
+#
+# [review -- MERGE BLOCKER] EVERY SCAN IN THIS FILE GOES THROUGH _code(), WHICH
+# EMPTIES STRING LITERALS. That is correct for matching code and is precisely
+# why a flat "No offer post was left unrecorded." survived two rounds of review
+# in `report_offers_kept_on_stop`, logged unconditionally forty lines below
+# `post_abandoned` and `create_outcome_unknown_` -- the two facts computed to
+# say the opposite, and `post_abandoned` implies that branch, so the
+# contradiction was guaranteed rather than incidental.
+#
+# The real fix is structural: every operator-facing SENTENCE a keep stop prints
+# is built in xop/execution/kept_book.hpp, where cpp/tests reads exactly what
+# the operator reads (`CutCycleLine`, `WatchdogDisarmLine`, `KeptBook` in
+# test_stop_offers_policy.cpp). The two guards below keep it that way.
+#
+# DISCLOSED LIMIT: the second is a VOCABULARY guard, so it catches a returning
+# claim in the wording it returns in, not an arbitrary new one. A general
+# "no literal in this function may assert a safety property" needs every log
+# message moved out of engine.cpp; filed as TODO S77.
+
+#: Reassurance wording that must never be written into a literal in the keep
+#: report: it belongs in kept_book.hpp, where a gtest can read it. Each entry
+#: is a claim this function's OWN computed facts can contradict.
+CLAIM_WORDING = (
+    "was left unrecorded",
+    "were left unrecorded",
+    "nothing was left",
+    "nothing was lost",
+    "no offer was lost",
+    "all-clear",
+    "is disarmed for this stop",
+    "was a clean stop",
+    "settled by the wallet alone",
+    "nothing was left on the book",
+)
+
+
+def _report_raw() -> str:
+    return _definition(
+        ENGINE_CPP,
+        "void Engine::report_offers_kept_on_stop(std::uint64_t waited_for_post_ms,")
+
+
+def test_the_mid_cycle_line_is_a_format_shell_and_nothing_else():
+    """The branch that carried the false reassurance may hold ONE literal, and
+    it must be a bare format shell -- so every word the operator reads there
+    comes from `execution::describe_cut_cycle`, under gtest.
+
+    This is the general form of the guard: any prose written back into the
+    branch fails it, whatever the prose says."""
+    src = _no_comments(_report_raw())
+    safe = _brace_safe(src)
+    at = safe.find("if (heartbeat_in_flight_)")
+    assert at != -1, "the mid-cycle branch is gone from the keep report"
+    open_at, close_at = _brace_span(safe, at)
+    branch = src[open_at:close_at]
+    assert _literals(branch) == ["[Engine] [S74] {}"], (
+        "the mid-cycle branch writes its own words again: found %r. The "
+        "sentence must come from execution::describe_cut_cycle, which "
+        "CutCycleLine reads; a literal here is invisible to every scan in this "
+        "file, because _code() empties it." % (_literals(branch),))
+
+
+def test_no_literal_in_the_keep_report_asserts_a_safety_property():
+    """Vocabulary backstop over the WHOLE report, for the lines that are not
+    pure format shells yet. A claim like these is one the report's own facts
+    can falsify, so it belongs beside those facts in kept_book.hpp."""
+    found = [(claim, text) for text in _literals(_report_raw())
+             for claim in CLAIM_WORDING if claim in text.lower()]
+    assert not found, (
+        "the keep report asserts a safety property in a string literal, which "
+        "no scan in this file can read: %r. Build the sentence in "
+        "xop/execution/kept_book.hpp instead, where cpp/tests reads exactly "
+        "what the operator reads." % (found,))
+    # ...and the guard is not vacuous: it really is looking at the operator's
+    # words, not at emptied literals.
+    assert any("KEEP stop" in text for text in _literals(_report_raw())), (
+        "the literal walker found no message text in the keep report: the "
+        "guard above is vacuous")
+
+
+def test_the_switch_clause_is_conditional_on_the_fact_that_decides_it():
+    """[review] engine.hpp: "A cancel the switch had ALREADY started before the
+    operator asked is not recalled: it holds the mutex, and it was a real
+    firing." Both keep lines used to state the disarm flat. `watchdog_fired_`
+    is latched BEFORE any switch-initiated cancel and never cleared, so it is
+    the fact the sentence needs; the wording itself is under
+    `WatchdogDisarmLine`."""
+    report = _code(_report_raw())
+    assert report.count(
+        "execution::describe_watchdog_disarm(watchdog_fired_.load("
+        "std::memory_order_acquire))") == 2, (
+        "a keep line states the dead man's switch disarm without reading "
+        "watchdog_fired_ -- both the ordinary line and the stop-during-boot "
+        "one must, and engine.hpp refuses to state it flatly for a reason")
 
 
 # --------------------------------------------------------------------------- #

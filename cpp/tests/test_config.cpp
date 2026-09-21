@@ -1825,18 +1825,28 @@ TEST(ConfigParserTest, ShutdownOffers_BothPoliciesRoundTrip) {
                   xop::util::StopOffersPolicy::Keep);
     }
     {
-        // An empty section, and an explicit null, are both "not set".
+        // An EMPTY SECTION is "not set": the key was never written.
         TempYaml empty(std::string(kMinimalValidYaml) + "\nengine:\n");
         EXPECT_EQ(xop::load_config(empty.path()).engine.shutdown_offers,
                   xop::util::StopOffersPolicy::Cancel);
-        TempYaml null_value(std::string(kMinimalValidYaml) + "\nengine:\n  shutdown_offers:\n");
-        EXPECT_EQ(xop::load_config(null_value.path()).engine.shutdown_offers,
+        TempYaml braces(std::string(kMinimalValidYaml) + "\nengine: {}\n");
+        EXPECT_EQ(xop::load_config(braces.path()).engine.shutdown_offers,
                   xop::util::StopOffersPolicy::Cancel);
     }
+    // A key written and left BLANK is NOT "not set" -- see the rejected list.
 }
 
 TEST(ConfigParserTest, ShutdownOffers_AnythingElseIsRejectedNotDefaulted) {
+    // [review] A BLANK VALUE IS ONE OF THESE, not a default. `shutdown_offers:`
+    // with nothing after it is a half-finished edit, and reading it as "cancel"
+    // is exactly the silent default this section refuses -- arriving through
+    // the one section documented as STRICT. (`engine:` with no key at all is
+    // still "not set": covered above.)
     for (const char* section : {
+             "engine:\n  shutdown_offers:\n",              // written and left BLANK
+             "engine:\n  shutdown_offers: ~\n",            // an explicit YAML null
+             "engine:\n  shutdown_offers: null\n",
+             "engine:\n  shutdown_offers: \"\"\n",         // an empty string
              "engine:\n  shutdown_offers: kep\n",          // a typo in the value
              "engine:\n  shutdown_offers: true\n",         // a YAML boolean
              "engine:\n  shutdown_offers: 1\n",
