@@ -31,6 +31,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <limits>
 #include <utility>
 
 namespace xop {
@@ -59,9 +60,12 @@ static_assert(to_mojo_saturating(strategy::fee::kFeeCeiling)
 static_assert(static_cast<Mojo>(strategy::fee::kFeeCeiling) > 0,
               "a fee that converts to a negative Mojo is silently dropped by "
               "clamp_need(), ask_take_cost() and add_same_wallet_fee()");
-static_assert(static_cast<std::uint64_t>(static_cast<Mojo>(strategy::fee::kFeeCeiling))
-                  == strategy::fee::kFeeCeiling,
-              "uint64 -> Mojo -> uint64 must be the identity at the fee ceiling");
+// VALUE preservation, not a bit-pattern round trip: the latter is the identity
+// for every uint64 (modular conversion is a bijection), holds for 2^63, and was
+// measured in the round-6 campaign to be the one assertion that did NOT fire.
+static_assert(strategy::fee::kFeeCeiling
+                  <= static_cast<std::uint64_t>(std::numeric_limits<Mojo>::max()),
+              "the emitted fee ceiling must be in range for a Mojo");
 
 // ---------------------------------------------------------------------------
 // FeeTracker

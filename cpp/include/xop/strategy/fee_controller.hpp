@@ -264,12 +264,18 @@ inline constexpr std::uint64_t kFeeCeiling         = 9223372036854775807ULL;
 static_assert(kFeeCeiling == static_cast<std::uint64_t>(
                                  std::numeric_limits<std::int64_t>::max()),
               "the emitted fee ceiling must be INT64_MAX: xop::Mojo is int64_t");
-// THE ROUND TRIP.  uint64 -> Mojo -> uint64 must be the identity, and the
-// Mojo must be positive.  This is the assertion that fails if the ceiling is
-// ever put back to 2^63.
-static_assert(static_cast<std::uint64_t>(static_cast<std::int64_t>(kFeeCeiling))
-                  == kFeeCeiling,
-              "the emitted fee ceiling must survive a round trip through Mojo");
+// THE ROUND TRIP, AND THE FORM OF IT THAT WOULD PIN NOTHING.  A BIT-PATTERN
+// round trip -- uint64 -> int64 -> uint64 == the original -- is the identity
+// for EVERY uint64, because modular conversion is a bijection.  It holds for
+// 2^63 too, so asserting it is worthless.  This was not reasoned out: the
+// round-6 mutation campaign wrote that assertion, predicted it would fire when
+// the ceiling was put back to 2^63, and MEASURED it as the one assertion here
+// that did NOT.  What has to hold is that the VALUE survives, i.e. that the
+// ceiling is in range for a Mojo at all -- which the two below say directly.
+static_assert(kFeeCeiling <= static_cast<std::uint64_t>(
+                                 std::numeric_limits<std::int64_t>::max()),
+              "the emitted fee ceiling must be IN RANGE for a Mojo, so the "
+              "conversion preserves its value and not merely its bits");
 static_assert(static_cast<std::int64_t>(kFeeCeiling) > 0,
               "the emitted fee ceiling must be a POSITIVE Mojo");
 // ...and the witness for why: 2^63 does not.  C++20 modular conversion, so
