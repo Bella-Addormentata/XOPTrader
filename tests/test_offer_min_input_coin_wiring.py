@@ -379,10 +379,69 @@ def test_both_dexie_rejection_shapes_are_checked_for_too_many_inputs():
         "the withdrawn advice ('or RAISE ... -- lowering it admits MORE dust') "
         "is back in the warning"
     )
-    assert "SMALLREDUCTION,neverbelowabout0.008" in note, (
+    assert "SMALLREDUCTION,neverbelow" in note, (
         "the warning no longer bounds the one fraction change that can help: a "
-        "small reduction, and not below about 1/124 where the CAT-leg bound "
-        "alone reaches the 125 inputs Dexie accepts"
+        "small reduction, and not below 1/124 where the CAT-leg bound plus the "
+        "fee coin reaches the 125 inputs Dexie accepts"
+    )
+    # [review #162, round 7] THE ADVICE MUST BE COMPUTED, NOT FIXED.  The text
+    # above is right at the shipped 0.01 and BACKWARDS below 1/124, where
+    # ceil(1 / frac) exceeds Dexie's limit on its own and a create the wallet
+    # SATISFIES can be refused for input count.  config.cpp accepts [0, 1)
+    # with the low end closed, so that band is reachable by configuration
+    # alone.  The function is handed only the posting and the offer's length,
+    # so it must DERIVE the branch from the fraction it already prints.
+    code_note = _code(_definition(OFFER_MANAGER_CPP,
+                                  "void OfferManager::note_dexie_too_many_inputs("))
+    assert "min_input_coin_cat_leg_bound(frac)" in code_note, (
+        "the warning does not compute the CAT-leg bound, so it cannot know "
+        "which of its two branches of advice applies"
+    )
+    assert "min_input_coin_bound_fits_dexie(frac)" in code_note, (
+        "the warning does not test its own bound against Dexie's limit -- the "
+        "'a refusal means no floor was sent' inference holds only while it fits"
+    )
+    assert "RAISEthefractiontoatleast" in note, (
+        "the warning has no branch for a fraction BELOW 1/124, where the "
+        "advice inverts: the bound is over the limit by itself, so raising the "
+        "fraction is the change that helps"
+    )
+    # AND EACH PIECE OF ADVICE MUST SIT IN ITS OWN BRANCH.  Both texts being
+    # present proves nothing if they are the wrong way round -- that would give
+    # the "raise it" advice at the shipped 0.01 and "do not raise" below 1/124,
+    # which is the original defect with an extra step.
+    fits_branch = note.index("elseif(bound_fits){")
+    else_branch = note.index("}else{", fits_branch)
+    assert fits_branch < note.index('"DoNOTRAISE') < else_branch, (
+        "the 'do not raise' advice is not inside the branch where the bound "
+        "FITS -- it is only correct there"
+    )
+    assert note.index('"RAISEthefractiontoatleast') > else_branch, (
+        "the 'raise it' advice is not inside the branch where the bound does "
+        "NOT fit -- it is wrong everywhere else"
+    )
+    # The threshold must be FORMATTED from the derived constant, never spelled
+    # as a literal.  `0.008` was the rounded form of 1/124 and lands on the
+    # wrong side of it: ceil(1 / 0.008) is exactly 125, one over once the fee
+    # coin is counted.
+    assert "0.008" not in note, (
+        "the warning prints a literal 0.008 again -- it is BELOW 1/124, so the "
+        "value it recommends is itself over Dexie's limit"
+    )
+    assert "safe_frac" in code_note, (
+        "the safe fraction is not derived from min_input_coin_safe_frac(); a "
+        "literal will drift from the constants the bound is computed with"
+    )
+    # [review #162, round 7] The remedy names the CAT, because the dust is CAT
+    # reward payouts and the CAT leg is what the floor bounds.  It used to say
+    # "the asset this offer spends", which is the CAT -- and then blamed the
+    # fee leg one sentence later, whose coins are XCH.
+    assert "combinethesmallcoinsoftheCAT" in note, (
+        "the remedy no longer names the CAT as the asset whose coins to combine"
+    )
+    assert "areXCH,nottheCAT" in note, (
+        "the warning names the XCH fee leg as a possible cause but still sends "
+        "the operator to combine the CAT's coins for it"
     )
     # [review #162, round 5] The bound is on the CAT leg, not on the offer:
     # the XCH fee coin is a separate selection this CAT-scaled floor does not
@@ -509,3 +568,85 @@ def test_the_create_endpoint_is_never_resend_where_the_fallback_relies_on_it():
         "create_offer_with_min_coin_fallback(Createcreate,"), (
         "the static_assert must sit with the fallback it protects"
     )
+
+
+def test_a_fraction_whose_bound_exceeds_dexies_limit_is_warned_at_load():
+    """[review #162, round 7] The range is wider than the key is useful over.
+
+    `config.cpp` accepts `[0, 1)` with the low end CLOSED, so
+    `offer_min_input_coin_frac: 0.002` loads in silence and bounds the CAT leg
+    at 500 inputs -- above Dexie's measured 125 before the XCH fee coin is
+    counted.  A create the wallet SATISFIES can then be refused for input
+    count, which is the one case the runtime warning cannot tell apart from
+    the no-floor retry using its own two arguments.  Nothing said so.
+
+    Pinned as a PROPERTY, not as message text: the warning must be reached
+    through the same predicate the runtime warning branches on, and must not
+    fire for 0, which is a real setting meaning "send no floor".
+    """
+    config_cpp = _read(CPP_SRC / "config.cpp")
+    read_at = config_cpp.index('read_optional_finite_in_range(\n'
+                               '        node, "offer_min_input_coin_frac"')
+    # The guard and the warning follow the read of the key they are about.
+    tail = _code(config_cpp[read_at:read_at + 3000], keep_strings=True)
+    assert "min_input_coin_bound_fits_dexie(" in tail, (
+        "config load does not test the configured fraction's bound against "
+        "Dexie's limit, so a fraction below 1/124 loads with nothing said"
+    )
+    assert "min_input_coin_frac_ppb(" in tail, (
+        "the warning is not gated on the floor being ON; 0 disables the floor "
+        "and must not be warned about"
+    )
+    guard = tail.index("min_input_coin_frac_ppb(")
+    warn = tail.index("spdlog::warn(")
+    assert guard < warn, "the ppb guard must gate the warning, not follow it"
+    assert "!execution::min_input_coin_bound_fits_dexie(" in tail, (
+        "the warning fires on the fractions that DO fit -- the sense of the "
+        "test is inverted"
+    )
+    assert "offer_min_input_coin_frac({})leavestheCAT-leg" in tail, (
+        "the load warning no longer says what is wrong with the value"
+    )
+    # The value it RECOMMENDS must be derived too.  A literal here is how the
+    # load-time and run-time thresholds drift apart -- which is how `0.008`
+    # came to be printed as the safe floor in the first place.
+    assert "min_input_coin_safe_frac()" in tail, (
+        "the load warning spells its own safe fraction instead of deriving it "
+        "from the limit and the fee leg, so it can disagree with the runtime "
+        "warning"
+    )
+
+
+def test_the_runtime_and_load_warnings_share_one_threshold():
+    """Neither may spell the limit or the safe fraction as its own literal.
+
+    The shipped warning rounded 1/124 to `0.008` and printed it as the safe
+    floor; `ceil(1 / 0.008)` is exactly 125, which leaves no room for the fee
+    coin Dexie's own 125-input measurement included.  Both warnings now derive
+    the number from the two constants, so they cannot disagree.
+    """
+    header = _code(_read(REPO / "cpp" / "include" / "xop" / "execution"
+                         / "offer_min_input_coin.hpp"), keep_strings=True)
+    assert "kDexieMeasuredInputLimit=125;" in header, (
+        "the measured Dexie input limit is no longer a named constant"
+    )
+    assert "kDexieFeeLegInputsToday=1;" in header, (
+        "the fee leg's measured coin count is no longer a named constant -- "
+        "without it the CAT-leg bound is compared against the whole limit and "
+        "0.008 wrongly passes"
+    )
+    # The safe fraction is DERIVED from both, never written down.
+    assert ("return1.0/static_cast<double>(kDexieMeasuredInputLimit"
+            "-kDexieFeeLegInputsToday);") in header, (
+        "min_input_coin_safe_frac no longer derives 1/124 from the limit and "
+        "the fee leg"
+    )
+    assert "k+kDexieFeeLegInputsToday<=kDexieMeasuredInputLimit;" in header, (
+        "the fit test dropped the fee coin, which is exactly what made 0.008 "
+        "look safe"
+    )
+    for cpp in (OFFER_MANAGER_CPP, CPP_SRC / "config.cpp"):
+        body = _code(_read(cpp), keep_strings=True)
+        assert "neverbelowabout0.008" not in body, (
+            "%s spells the rounded 0.008 as the safe floor again" % cpp.name
+        )

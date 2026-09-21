@@ -420,8 +420,12 @@ struct StrategyConfig {
     /// XCH fee coin is chosen in a separate selection that this CAT-scaled
     /// value does not constrain, so the fee leg's coin count is not bounded
     /// here -- it is one coin only while every XCH coin covers the fee,
-    /// which is true of today's wallet by a factor of about 887 and is a
-    /// measurement, not a guarantee.
+    /// which is a measurement, not a guarantee.  The create pays
+    /// current_fee_mojos_, clamped by FeeTracker to
+    /// [fees.min_fee_mojos, fees.max_fee_mojos]; today's smallest XCH coin
+    /// is 133x that CAP, so every coin covers any fee the engine can send
+    /// [review #162, round 7 -- the 887x quoted here before was against
+    /// min_fee_mojos, the smallest fee, which is the weaker claim].
     ///
     /// THE INPUT COUNT IS NOT MONOTONE IN THIS FRACTION [review #162,
     /// round 5 -- CORRECTING THIS COMMENT].  An earlier revision said
@@ -431,13 +435,22 @@ struct StrategyConfig {
     /// NO floor, so that offer is dust-funded again and the bound is gone:
     /// raising the fraction further makes that outcome MORE common, not
     /// less, and it is the outcome a Dexie "Too many input coins" refusal
-    /// reports.  Lowering the fraction loosens the bound instead, and below
-    /// about 1 / 124 the CAT-leg bound alone reaches the 125 inputs Dexie
-    /// was measured to accept.  So the useful
+    /// reports AT THIS FRACTION.  Lowering the fraction loosens the bound
+    /// instead, and below 1 / 124 the CAT-leg bound plus the fee coin
+    /// exceeds the 125 inputs Dexie was measured to accept.  So the useful
     /// range is narrow, the remedy for a refusal is to combine the coins
     /// (chia wallet coins combine), and the only fraction change that can
     /// help is a small REDUCTION -- and only when it is the floored create
     /// the wallet is refusing.
+    ///
+    /// AND THE RANGE IS WIDER THAN THAT [review #162, round 7].  [0, 1) is
+    /// closed at the bottom, so 0.002 loads without complaint and bounds the
+    /// CAT leg at 500 -- above Dexie's limit on its own.  Under 1 / 124 the
+    /// floor stops guaranteeing what it exists for: a create the wallet
+    /// SATISFIES can be refused for input count, and "a refusal means no
+    /// floor was sent" is then false.  config.cpp warns at load, and the
+    /// [dexie-too-many-inputs] warning computes ceil(1 / frac) and inverts
+    /// its advice rather than assuming the 0.01 case.
     ///
     /// 0 disables the floor and restores the previous request byte for
     /// byte.  Range [0, 1).  XCH-funded offers never carry it: their coins

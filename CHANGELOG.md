@@ -21,7 +21,8 @@ leg at 100 inputs — about 46,000 characters at the 459 per input measured
 here, against refusals that began at 60,612. (That bounds the CAT leg only:
 the XCH fee coin is a separate selection this CAT-scaled value does not
 constrain — one coin while every XCH coin covers the fee, as today's do by
-about 887x, which is a measurement and not a guarantee.) Those 13 HTTP 400s
+133x the **cap** on that fee, which is a measurement and not a guarantee.)
+Those 13 HTTP 400s
 become a create the wallet either satisfies or refuses up front, before any
 offer exists. What the floor does **not** do is guarantee the outcome: a
 refused create is re-sent once without the floor, and the offer that retry
@@ -102,15 +103,45 @@ builds is as exposed to dust as it was before this change.
   path. The offer built by the retry can again be one Dexie refuses.
 - **Detection.** A Dexie refusal for too many input coins now logs one
   `[dexie-too-many-inputs]` warning that names the offer, its length, the
-  remedy and a count since start. The remedy is to **combine the coins**, and
-  the warning says explicitly **not** to raise `offer_min_input_coin_frac`: the
-  input count is not monotone in the fraction, and at 0.01 a floored create's
-  CAT leg cannot exceed 100 inputs — under Dexie's limit, with the fee leg one
-  coin on this wallet — so an offer refused for input count was built
-  without a floor — raising the fraction only makes the wallet
-  refuse the floored create more often and fires the no-floor retry that builds
-  those offers. No metric was added: `OfferManager` has no posting-failure
+  remedy and a count since start. The remedy is to **combine the coins** —
+  the CAT's, since the dust is CAT reward payouts and the CAT leg is what the
+  floor bounds; if the XCH fee leg ever contributes, the coins to combine
+  there are XCH.
+  **The rest of the advice is computed, not fixed.** The warning is handed the
+  posting and the offer's length and nothing about how the offer was built, so
+  it derives `ceil(1 / frac)` — the CAT-leg bound on a *floored* create — and
+  branches on whether that plus the one-coin fee leg fits inside the 125
+  inputs Dexie was measured to accept:
+  - **At or above 1/124** (the shipped 0.01 bounds it at 100): a floored
+    create *cannot* reach the limit, so a refusal is proof no floor was sent.
+    Do **not** raise the fraction — that makes the wallet refuse the floored
+    create more often and fires the no-floor retry that builds these offers.
+    Only a small **reduction** can help, never below 1/124.
+  - **Below 1/124** (0.002 bounds it at 500): the bound is over the limit on
+    its own, so a create the wallet **satisfied** can be refused exactly like
+    a dust-funded one and the refusal proves nothing. The advice inverts —
+    **raise** the fraction — and the warning names the preceding
+    `[min-input-coin]` line as the way to tell the two apart for that offer.
+  - **At 0**: the floor is off and nothing carries a bound.
+
+  The earlier text gave the first branch's advice unconditionally, which was
+  correct at 0.01 and backwards below 1/124; and it printed `0.008` as the
+  safe floor, which is on the wrong side of 1/124 — `ceil(1 / 0.008)` is
+  exactly 125, one over once the fee coin is counted. Both numbers are now
+  derived from `kDexieMeasuredInputLimit` and `kDexieFeeLegInputsToday`, so
+  they cannot drift apart again. The fallback fact is deliberately **not**
+  threaded into the warning: in the shipped branch it is deducible, and the
+  datum would have to be the optional floor rather than a "did the fallback
+  run" bool, since XCH-funded offers and skipped dict shapes also send no
+  floor. No metric was added: `OfferManager` has no posting-failure
   metric to extend. Nothing is cancelled automatically.
+- **Startup warns when the fraction cannot bound what it is for.** The range
+  `[0, 1)` is closed at the bottom, so a value like 0.002 loaded silently
+  although `ceil(1 / frac)` is then 500 — above Dexie's limit before the fee
+  coin. Config load now emits one `[Config]` warning for any fraction that is
+  on but below 1/124, naming the bound it gives and the value to use. `0` is a
+  real setting and is not warned about. Not an error: the key is not
+  load-bearing for safety.
 
 **What changes on upgrade, with no config edit at all.** Three things, and only
 the first has a lever:

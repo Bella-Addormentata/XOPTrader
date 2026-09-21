@@ -238,25 +238,96 @@ void OfferManager::note_dexie_too_many_inputs(const std::string& posting,
                                               std::size_t        offer_chars)
 {
     ++dexie_too_many_inputs_count_;
+
+    // [review #162, round 7] THE ADVICE IS COMPUTED, NOT FIXED.  This
+    // function is handed the posting and the offer's size and NOTHING about
+    // how the offer was built, so it cannot observe whether the no-floor
+    // retry ran -- and the shipped text drew a conclusion that needs exactly
+    // that fact ("was built with NO floor").
+    //
+    // What it CAN do is decide whether the fact is needed at all.  The
+    // floored create's own CAT leg is bounded at ceil(1 / frac), and while
+    // that plus today's one-coin XCH fee leg fits inside Dexie's measured
+    // accept, a refusal for input count is arithmetically impossible for a
+    // floored create -- so the conclusion is DERIVED, not assumed.  Below
+    // that fraction the bound exceeds the limit on its own, a create the
+    // wallet SATISFIES can be refused exactly like this one, and the advice
+    // inverts.  The range is open at the bottom (config.cpp takes [0, 1)
+    // with the low end closed), so that branch is reachable by configuration
+    // alone; config.cpp now warns at load as well.
+    //
+    // NOT THREADED ON PURPOSE.  Handing this function the floor the create
+    // sent would sharpen only the second branch, and it would have to be the
+    // optional floor, not a "did the fallback run" bool -- an XCH-funded
+    // offer and a dict shape the rule skips also send no floor, so a bool
+    // would answer "false" for them and seed a fresh wrong inference.  In
+    // the shipped branch the fact is deducible without it, and the second
+    // branch names the log line that already records it at the moment it
+    // happens.
+    const double        frac       = strategy_cfg_.offer_min_input_coin_frac;
+    const std::uint64_t cat_bound  = min_input_coin_cat_leg_bound(frac);
+    const bool          bound_fits = min_input_coin_bound_fits_dexie(frac);
+    const double        safe_frac  = min_input_coin_safe_frac();
+
+    std::string advice;
+    if (cat_bound == 0) {
+        advice = fmt::format(
+            "The floor is OFF (strategy.offer_min_input_coin_frac = {}), so "
+            "no create carries a bound and this offer was built from "
+            "whatever the wallet selected.  Setting it to the default 0.01 "
+            "bounds the CAT leg of each FLOORED create at {} inputs, inside "
+            "that limit.",
+            frac, min_input_coin_cat_leg_bound(0.01));
+    } else if (bound_fits) {
+        advice = fmt::format(
+            "Do NOT RAISE strategy.offer_min_input_coin_frac (now {}): it "
+            "bounds the CAT LEG of a FLOORED create at ceil(1 / frac) = {} "
+            "inputs, {} with today's one-coin XCH FEE LEG, inside that "
+            "limit -- so THIS offer was built with NO floor (the no-floor "
+            "retry, or a posting path that carries none: XCH-funded, or a "
+            "dict shape the rule skips).  Raising the floor only makes the "
+            "wallet refuse more floored creates and fire that retry more "
+            "often.  The only fraction change that can help is "
+            "a SMALL REDUCTION, never below {:.5f} (= 1 / {}), "
+            "where the CAT-leg bound plus the fee coin reaches the limit "
+            "exactly.",
+            frac, cat_bound, cat_bound + xop::execution::kDexieFeeLegInputsToday,
+            safe_frac,
+            xop::execution::kDexieMeasuredInputLimit
+                - xop::execution::kDexieFeeLegInputsToday);
+    } else {
+        advice = fmt::format(
+            "strategy.offer_min_input_coin_frac is {}, whose CAT-LEG bound "
+            "is ceil(1 / frac) = {} inputs -- ABOVE that limit on its own, "
+            "before the XCH FEE LEG.  At this fraction the floor is not a "
+            "bound Dexie will honour, so this refusal does NOT show that "
+            "the no-floor retry ran: a create the wallet SATISFIED can "
+            "carry {} inputs and be refused exactly like this one.  "
+            "RAISE the fraction to at least {:.5f} (= 1 / {}); "
+            "the default 0.01 "
+            "bounds it at {}.  To tell the two apart for THIS offer, look "
+            "for a preceding '[min-input-coin] wallet refused' line naming "
+            "the same pair and tier -- present means the retry ran and no "
+            "floor was sent.",
+            frac, cat_bound, cat_bound, safe_frac,
+            xop::execution::kDexieMeasuredInputLimit
+                - xop::execution::kDexieFeeLegInputsToday,
+            min_input_coin_cat_leg_bound(0.01));
+    }
+
     logger_->warn(
         "[dexie-too-many-inputs] Dexie refused {} ({} characters): too many "
         "input coins.  The offer EXISTS in the wallet, is listed nowhere and "
-        "locks its coins until it is cancelled.  Remedy: combine the small "
-        "coins of the asset this offer spends (chia wallet coins combine) -- "
-        "the only remedy that removes the cause.  "
-        "Do NOT RAISE strategy.offer_min_input_coin_frac (now {}): the "
-        "floor bounds the CAT LEG at ceil(1 / frac) inputs -- 100 at 0.01, "
-        "against the 125 Dexie was measured to accept -- so an offer "
-        "refused for input count was built with NO floor (the no-floor "
-        "retry, or a posting path that carries none), and raising the floor "
-        "only makes the wallet refuse more floored creates and fire that "
-        "retry more often.  It does not bound the XCH FEE LEG, which is "
-        "selected separately and is one coin only while every XCH coin "
-        "covers the fee.  If the fraction is 0 the floor is off and 0.01 "
-        "turns it on; otherwise the only change that can help is "
-        "a SMALL REDUCTION, never below about 0.008: the CAT-leg "
-        "bound alone then exceeds 125.  Seen {} time(s) since start.",
-        posting, offer_chars, strategy_cfg_.offer_min_input_coin_frac,
+        "locks its coins until it is cancelled.  Dexie was measured to "
+        "accept {} input coins.  Remedy: combine the small coins of the CAT "
+        "this offer spends (chia wallet coins combine) -- the only remedy "
+        "that removes the cause; the dust is CAT reward payouts and the CAT "
+        "LEG is what the floor bounds.  It does not bound the XCH FEE LEG, "
+        "which is a separate selection and is one coin only while every XCH "
+        "coin covers the fee; if that leg ever contributes, the coins to "
+        "combine there are XCH, not the CAT.  {}  Seen {} time(s) since "
+        "start.",
+        posting, offer_chars, xop::execution::kDexieMeasuredInputLimit, advice,
         dexie_too_many_inputs_count_);
 }
 

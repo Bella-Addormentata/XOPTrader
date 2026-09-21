@@ -49,8 +49,11 @@ using nlohmann::json;
 using xop::execution::create_offer_with_min_coin_fallback;
 using xop::execution::dexie_rejected_too_many_inputs;
 using xop::execution::ledger_min_coin_mojos;
+using xop::execution::min_input_coin_bound_fits_dexie;
+using xop::execution::min_input_coin_cat_leg_bound;
 using xop::execution::min_input_coin_frac_ppb;
 using xop::execution::min_input_coin_mojos;
+using xop::execution::min_input_coin_safe_frac;
 using xop::execution::offer_min_input_coin;
 using xop::execution::wallet_refused_for_min_coin;
 using xop::rpc::ChiaWalletRPC;
@@ -521,6 +524,81 @@ TEST(OfferMinInputCoin, NoOtherCoinSelectionKeyIsEverSent) {
 
 TEST(OfferMinInputCoin, TheShippedDefaultIsOnePercent) {
     EXPECT_DOUBLE_EQ(xop::StrategyConfig{}.offer_min_input_coin_frac, 0.01);
+}
+
+// ---------------------------------------------------------------------------
+// The CAT-leg bound, and whether it fits inside what Dexie accepts
+// [review #162, round 7].  The operator warning used to give the 0.01 case's
+// advice at EVERY fraction; it now branches on these two.  The header carries
+// static_asserts for the same values -- these run them, so a regression is a
+// failing test and not only a failing compile.
+// ---------------------------------------------------------------------------
+
+TEST(OfferMinInputCoinDexieBound, TheBoundIsCeilOfTheReciprocal) {
+    EXPECT_EQ(min_input_coin_cat_leg_bound(0.01), std::uint64_t{100});
+    EXPECT_EQ(min_input_coin_cat_leg_bound(0.005), std::uint64_t{200});
+    EXPECT_EQ(min_input_coin_cat_leg_bound(0.002), std::uint64_t{500});
+    // No floor is sent, so there is no bound -- not a bound of 1.
+    EXPECT_EQ(min_input_coin_cat_leg_bound(0.0), std::uint64_t{0});
+    EXPECT_EQ(min_input_coin_cat_leg_bound(1.0), std::uint64_t{0});
+}
+
+TEST(OfferMinInputCoinDexieBound, TheFeeCoinIsCountedSoOhOhEightDoesNotFit) {
+    // THE REGRESSION THIS EXISTS FOR.  The warning shipped "never below about
+    // 0.008" as the safe floor.  ceil(1 / 0.008) is exactly 125, which is the
+    // whole limit -- leaving no room for the XCH fee coin that Dexie's own
+    // 125-input measurement included (124 CAT + 1 fee).  A predicate that
+    // compares k alone against 125 admits 0.008 and re-ships the bug.
+    EXPECT_EQ(min_input_coin_cat_leg_bound(0.008), std::uint64_t{125});
+    EXPECT_FALSE(min_input_coin_bound_fits_dexie(0.008));
+
+    EXPECT_DOUBLE_EQ(min_input_coin_safe_frac(), 1.0 / 124.0);
+    EXPECT_EQ(min_input_coin_cat_leg_bound(min_input_coin_safe_frac()),
+              std::uint64_t{124});
+    EXPECT_TRUE(min_input_coin_bound_fits_dexie(min_input_coin_safe_frac()));
+    EXPECT_GT(min_input_coin_safe_frac(), 0.008)
+        << "1/124 is ABOVE 0.008; the rounded number is on the wrong side";
+
+    // THE BOUNDARY IS A PLATEAU, NOT AN ULP, and that is the ppb round-up
+    // doing its job: the APPLIED fraction is ceil(frac x 10^9) / 10^9, so a
+    // fraction a hair under 1/124 is applied as one a hair over and still
+    // bounds the leg at 124.  It stops fitting once the applied ppb drops
+    // below ceil(10^9 / 124) = 8,064,517, i.e. a little under 0.0080645.
+    EXPECT_TRUE(min_input_coin_bound_fits_dexie(
+        std::nextafter(min_input_coin_safe_frac(), 0.0)))
+        << "the applied fraction is rounded UP, so this is still 124";
+    EXPECT_EQ(min_input_coin_frac_ppb(min_input_coin_safe_frac()),
+              std::uint64_t{8'064'517});
+    EXPECT_FALSE(min_input_coin_bound_fits_dexie(0.008064))
+        << "ppb 8,064,000 bounds the leg at 125, which leaves no fee coin";
+    EXPECT_EQ(min_input_coin_cat_leg_bound(0.008064), std::uint64_t{125});
+}
+
+TEST(OfferMinInputCoinDexieBound, TheShippedFractionFitsAndTheOpenEndDoesNot) {
+    EXPECT_TRUE(min_input_coin_bound_fits_dexie(0.01));
+    // config.cpp accepts [0, 1) with the low end CLOSED, so these load.
+    EXPECT_FALSE(min_input_coin_bound_fits_dexie(0.005));
+    EXPECT_FALSE(min_input_coin_bound_fits_dexie(0.002));
+    // "Off" is not "fits": there is no bound to fit.
+    EXPECT_FALSE(min_input_coin_bound_fits_dexie(0.0));
+}
+
+TEST(OfferMinInputCoinDexieBound, TheBoundReallyCoversTheAmountItClaims) {
+    // Not a restatement of the formula: k coins of floor size must actually
+    // reach the offer, or the bound is not a bound.  Checked at the two
+    // fractions the branch turns on.
+    for (double frac : {0.01, min_input_coin_safe_frac(), 0.008, 0.002}) {
+        const std::uint64_t k = min_input_coin_cat_leg_bound(frac);
+        ASSERT_GT(k, std::uint64_t{0}) << frac;
+        for (std::uint64_t offered :
+             {std::uint64_t{80'334}, std::uint64_t{1'844'501},
+              std::uint64_t{1'000'000'001}}) {
+            const auto floor_mojos = min_input_coin_mojos(offered, frac);
+            ASSERT_TRUE(floor_mojos.has_value()) << frac << " " << offered;
+            EXPECT_GE(*floor_mojos * k, offered)
+                << "frac=" << frac << " k=" << k << " offered=" << offered;
+        }
+    }
 }
 
 // ===========================================================================

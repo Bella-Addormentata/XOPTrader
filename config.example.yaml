@@ -386,23 +386,37 @@ strategy:
   # IT BOUNDS THE CAT LEG, NOT THE WHOLE OFFER.  The XCH fee coin is chosen
   # in a separate selection that this CAT-scaled value does not constrain, so
   # the offer carries those CAT inputs PLUS however many XCH coins the fee
-  # takes.  That is one coin only while every XCH coin covers the fee, which
-  # is true of the live wallet by a factor of about 887 (smallest XCH coin
-  # 13,314,209,440 mojos on 2026-09-21 against fees.min_fee_mojos 15,000,000)
-  # -- a measurement, not a guarantee.
+  # takes.  That is one coin only while every XCH coin covers the fee -- a
+  # measurement, not a guarantee.  The create pays the dynamic fee, which is
+  # clamped to [fees.min_fee_mojos, fees.max_fee_mojos], so the comparison
+  # that bounds the leg is against the CAP: the smallest XCH coin on
+  # 2026-09-21, 13,314,209,440 mojos, is 133x a max_fee_mojos of 100,000,000.
+  # (An earlier revision said 887x, which is against min_fee_mojos -- the
+  # cheapest create, not every create.)
   #
   # THE INPUT COUNT IS NOT MONOTONE IN THIS FRACTION.  Raising it tightens
   # ceil(1 / fraction) only while the coins at or above the floor can still
   # cover the amount; past that the wallet refuses, the no-floor retry builds
   # the offer from dust again, and the bound is gone.  So raising it AFTER a
   # "Too many input coins" refusal makes that outcome more common, not less --
-  # that refusal is itself evidence the offer was built without a floor, since
-  # at 0.01 the CAT leg cannot exceed 100 inputs and the fee leg is one coin
-  # here.  Lowering it loosens the bound, and below about 1/124 the CAT-leg
-  # bound alone reaches the 125 inputs Dexie was measured to accept.  The
-  # remedy for a refusal is to combine the coins; the only fraction change
-  # that can help is a small REDUCTION, and only when it is the FLOORED
-  # create the wallet is refusing.
+  # at 0.01 that refusal is itself evidence the offer was built without a
+  # floor, since the CAT leg cannot exceed 100 inputs and the fee leg is one
+  # coin here.  Lowering it loosens the bound, and below 1/124 the CAT-leg
+  # bound plus the fee coin exceeds the 125 inputs Dexie was measured to
+  # accept.  The remedy for a refusal is to combine the coins; the only
+  # fraction change that can help is a small REDUCTION, and only when it is
+  # the FLOORED create the wallet is refusing.
+  #
+  # THAT EVIDENCE HOLDS ONLY ABOVE 1/124, AND THE RANGE GOES LOWER.  [0, 1)
+  # is closed at the bottom, so 0.002 loads and bounds the CAT leg at 500 --
+  # over Dexie's limit by itself.  Set below 1/124 the floor no longer
+  # guarantees what it is for: an offer the wallet builds WITHIN the floor can
+  # be refused for input count, and raising the fraction back is then the
+  # change that helps.  Startup warns when this key is in that band, and the
+  # [dexie-too-many-inputs] warning computes ceil(1 / fraction) and gives the
+  # advice that matches it.  (1/124 is about 0.00807; 0.008 is on the wrong
+  # side of it -- ceil(1 / 0.008) is exactly 125, one over once the fee coin
+  # is counted.)
   #
   # Applies to CAT-funded offers only (a bid on XCH/<CAT>, an ask on
   # <CAT>/...).  XCH-funded offers are untouched: their coins are managed by

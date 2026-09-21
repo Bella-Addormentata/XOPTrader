@@ -148,11 +148,25 @@
 // fee takes, and the ~46,000-character estimate is a CAT-leg figure.
 //
 // ON TODAY'S COIN SET THE FEE LEG IS ONE COIN, which is again a measurement
-// and not a guarantee: the smallest XCH coin read on 2026-09-21 is
-// 13,314,209,440 mojos against the live fees.min_fee_mojos of 15,000,000,
-// i.e. 887x the fee, so any single coin covers it and select_coins settles on
-// one.  For a FLOORED create at 0.01 to reach Dexie's limit at all, the fee
+// and not a guarantee.  [review #162, round 7 -- CORRECTING THE COMPARISON.]
+// Earlier revisions put the smallest XCH coin read on 2026-09-21,
+// 13,314,209,440 mojos, against the live fees.min_fee_mojos of 15,000,000 and
+// called it 887x.  min_fee_mojos is the SMALLEST fee the engine can send, so
+// that is the weakest form of the claim: it says one coin covers the cheapest
+// create, not every create.  The create carries current_fee_mojos_, which
+// FeeTracker clamps to [fees.min_fee_mojos, fees.max_fee_mojos] --
+// [15,000,000, 100,000,000] live -- so the bound that matters is against the
+// CAP: 13,314,209,440 is 133x max_fee_mojos, and the largest fee actually
+// seen in the live log is 45,000,000 (296x).  Every XCH coin therefore covers
+// any fee the engine can send; chia's select_coins finds smaller_coin_sum
+// below the target, falls to select_smallest_coin_over_target and takes
+// exactly one coin.  The conclusion is unchanged, and it is now the strong
+// form.  For a FLOORED create at 0.01 to reach Dexie's limit at all, the fee
 // leg would have to contribute 26 or more coins.
+//
+// kDexieFeeLegInputsToday encodes that 1 and kDexieMeasuredInputLimit the
+// 125, so the runtime warning and the load-time one derive the same
+// threshold from the same two numbers instead of each rounding their own.
 //
 // THE INPUT COUNT IS NOT MONOTONE IN frac [review #162, round 5].  Raising
 // frac raises the floor, so it tightens ceil(1 / frac) -- but only while the
@@ -167,9 +181,24 @@
 //     raising frac cannot have prevented it and only fires the fallback more
 //     often;
 //   * the only fraction change that can help is a REDUCTION, and not below
-//     about 1 / 124, where the CAT-leg bound alone reaches 125;
+//     1 / 124, where the CAT-leg bound reaches 124 and the fee coin takes the
+//     total to Dexie's 125;
 //   * combining the coins is the only remedy that raises frac* instead of
 //     trading one failure for another.
+//
+// THE FIRST CONSEQUENCE IS CONDITIONAL, AND THE CONDITION IS CONFIGURABLE
+// [review #162, round 7].  "A refusal is evidence the offer was built without
+// a floor" holds only while ceil(1 / frac) + the fee leg fits inside 125, and
+// config.cpp accepts [0, 1) with the low end CLOSED.  So 0.002 loads, bounds
+// the CAT leg at 500 -- capped in practice by chia's own selection ceiling,
+// not by this key -- and a create the wallet SATISFIES can carry far more
+// than 125 inputs and be refused exactly like a dust-funded one.  Below
+// 1 / 124 the evidence relation is simply false.  min_input_coin_cat_leg_bound
+// and min_input_coin_bound_fits_dexie make that testable, the operator
+// warning branches on it instead of asserting the 0.01 case, and config.cpp
+// warns at load.  The 0.008 that the warning printed as the safe floor was
+// the rounded form of 1 / 124 and lands on the wrong side of it: ceil(1 /
+// 0.008) is exactly 125, one over once the fee coin is counted.
 //
 // XCH-FUNDED OFFERS ARE LEFT ALONE.  XCH coins are already shaped by
 // CoinManager's pool (ensure_split) and budgeted by the XCH lock ledger,
@@ -224,6 +253,45 @@ inline constexpr std::uint64_t kMinInputCoinFracScale = 1'000'000'000ULL;
 /// Wallet id 1 is the XCH wallet; offer_dict keys are wallet ids as strings.
 inline constexpr std::string_view kXchWalletIdKey = "1";
 
+/// Dexie's measured accept, in INPUT COINS of the whole offer.
+///
+/// Not published; measured from this bot's own submissions.  The largest
+/// accepted offer was 57,382 characters and GET /v1/offers/{id} reports 125
+/// inputs for it -- 124 CAT plus 1 XCH fee coin.  Refusals began at 60,612
+/// characters, about 132 inputs, so the true limit is in [125, ~132]; 125 is
+/// the conservative end and the only one measured to be accepted.
+inline constexpr std::uint64_t kDexieMeasuredInputLimit = 125;
+
+/// XCH fee-leg inputs on TODAY'S coin set -- a measurement, not a guarantee.
+///
+/// The fee leg is a separate selection this CAT-scaled floor does not
+/// constrain (see IT BOUNDS THE CAT LEG ONLY above), so its count is bounded
+/// by the coin set alone.  The engine's create fee is clamped to
+/// [fees.min_fee_mojos, fees.max_fee_mojos] by FeeTracker, which is
+/// [15,000,000, 100,000,000] in the live config; the smallest XCH coin read
+/// on 2026-09-21 is 13,314,209,440 mojos, 133x that CAP.  So no candidate is
+/// under any fee the engine can send, chia's select_coins finds
+/// smaller_coin_sum < target and falls to select_smallest_coin_over_target,
+/// which takes exactly ONE coin.
+///
+/// [review #162, round 7] Earlier revisions quoted 887x, which is the margin
+/// against fees.min_fee_mojos -- the SMALLEST fee the engine can send, i.e.
+/// the weakest form of the claim.  The margin that actually bounds the leg is
+/// against the cap.  Both are overwhelming and the conclusion is unchanged.
+inline constexpr std::uint64_t kDexieFeeLegInputsToday = 1;
+
+/// The smallest fraction whose CAT-leg bound still fits: 1 / 124 here.
+///
+/// NOT 0.008.  ceil(1 / 0.008) is exactly 125, which with the fee coin is 126
+/// -- one over the measured accept.  The operator-facing text shipped the
+/// rounded 0.008 as if it were the bound [review #162, round 7]; it is now
+/// derived from the two constants above so the two cannot drift again.
+[[nodiscard]] constexpr double min_input_coin_safe_frac() noexcept
+{
+    return 1.0 / static_cast<double>(kDexieMeasuredInputLimit
+                                     - kDexieFeeLegInputsToday);
+}
+
 /// The configured fraction in parts per billion; 0 means "send no floor".
 ///
 /// 0 for anything outside (0, 1), NaN included (both comparisons are false
@@ -254,6 +322,59 @@ inline constexpr std::string_view kXchWalletIdKey = "1";
     if (static_cast<double>(ppb) < scaled) ++ppb;
     return ppb;
 }
+
+/// The largest CAT-leg input count a create carrying this floor can produce:
+/// ceil(1 / applied fraction), or 0 when no floor is sent.
+///
+/// Computed from the PPB value actually sent, not from the configured double,
+/// so it is the bound on the request the wallet really saw.  Every selected
+/// CAT coin is at least `applied` of the amount, so k of them reach it once
+/// k x applied >= 1, i.e. k = ceil(scale / ppb).
+///
+/// THIS IS A BOUND ON THE FLOORED CREATE ONLY.  The no-floor retry, an
+/// XCH-funded offer and any dict shape offer_min_input_coin returns nullopt
+/// for all send no floor, and carry no bound at all.
+[[nodiscard]] constexpr std::uint64_t min_input_coin_cat_leg_bound(
+    double frac) noexcept
+{
+    const std::uint64_t ppb = min_input_coin_frac_ppb(frac);
+    if (ppb == 0) return 0;
+    // scale + ppb - 1 < 2^31, so the integer ceil cannot wrap.
+    return (kMinInputCoinFracScale + ppb - 1) / ppb;
+}
+
+/// Can an offer built BY THE FLOORED CREATE still exceed what Dexie accepts?
+///
+/// False when the floor is off (there is then no bound to fit), and false
+/// when the CAT-leg bound plus today's fee leg exceeds the measured limit.
+/// TRUE is the property that makes a Dexie "too many input coins" refusal
+/// PROOF that no floor was sent -- which is the inference the operator
+/// warning used to draw unconditionally [review #162, round 7].
+[[nodiscard]] constexpr bool min_input_coin_bound_fits_dexie(
+    double frac) noexcept
+{
+    const std::uint64_t k = min_input_coin_cat_leg_bound(frac);
+    return k != 0 && k + kDexieFeeLegInputsToday <= kDexieMeasuredInputLimit;
+}
+
+// Evaluated by the compiler, so GCC and MSVC agree or the build fails.
+static_assert(min_input_coin_cat_leg_bound(0.0) == 0u, "no floor, no bound");
+static_assert(min_input_coin_cat_leg_bound(0.01) == 100u, "the shipped value");
+// THE RANGE IS OPEN AT THE BOTTOM: config.cpp accepts [0, 1) with the low end
+// CLOSED, so every one of these loads today.  The bound is what changes.
+static_assert(min_input_coin_cat_leg_bound(0.008) == 125u,
+              "0.008 is NOT the safe floor: 125 CAT inputs + 1 fee = 126");
+static_assert(min_input_coin_cat_leg_bound(0.005) == 200u);
+static_assert(min_input_coin_cat_leg_bound(0.002) == 500u);
+static_assert(min_input_coin_cat_leg_bound(min_input_coin_safe_frac()) == 124u,
+              "1/124 is the smallest fraction whose bound leaves room for the "
+              "fee coin");
+static_assert(min_input_coin_bound_fits_dexie(0.01));
+static_assert(min_input_coin_bound_fits_dexie(min_input_coin_safe_frac()));
+static_assert(!min_input_coin_bound_fits_dexie(0.008),
+              "the number the warning used to print as the safe floor");
+static_assert(!min_input_coin_bound_fits_dexie(0.002));
+static_assert(!min_input_coin_bound_fits_dexie(0.0), "off is not 'fits'");
 
 /// ceil(offered_mojos x frac), or nullopt when no floor should be sent
 /// (fraction off or invalid, or nothing offered).
