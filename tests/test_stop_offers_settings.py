@@ -15,6 +15,7 @@ never the repo config.yaml: load_config merges a sibling secrets.yaml.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -144,13 +145,56 @@ def _touch_something_else(panel) -> None:
 # The shipped example documents the key, at its default
 # --------------------------------------------------------------------------- #
 
+def _engine_block() -> str:
+    text = (_REPO / "config.example.yaml").read_text(encoding="utf-8")
+    return text[text.index("# --- engine:"):text.index("# --- depeg:")]
+
+
 def test_the_example_config_documents_the_key_at_its_default():
     raw = _disk(_REPO / "config.example.yaml")
     assert raw["engine"] == {"shutdown_offers": "cancel"}
-    text = (_REPO / "config.example.yaml").read_text(encoding="utf-8")
-    block = text[text.index("# --- engine:"):text.index("# --- depeg:")]
+    block = _engine_block()
     for must_say in ("offer_expiry_secs", "dead man", "log-off", "keep", "cancel"):
         assert must_say in block, f"the engine: comment block no longer mentions {must_say!r}"
+
+
+def test_the_keep_bullet_states_the_real_stop_latency_from_the_code_itself():
+    """[review #165, round 4 -- Copilot 4058780344] The bullet said a keep stop
+    "takes about a second". True of a GUI stop, which is read between cycles;
+    a SIGNAL-delivered one waits for an in-flight create, and the bound is the
+    code's own (``util::keep_stop_drain_budget_ms``, 247 s as shipped).
+
+    Pinned AGAINST THE HEADER, not against a copied constant: a number in
+    documentation is a claim, and this one drifts silently if the client
+    timeouts change. The header's own ``static_assert`` is the source."""
+    header = (_REPO / "cpp" / "include" / "xop" / "util"
+              / "stop_offers_policy.hpp").read_text(encoding="utf-8")
+    pin = re.search(
+        r"static_assert\(\s*keep_stop_drain_budget_ms\("
+        r"kShippedRpcWorstCaseMs,\s*kShippedRpcWorstCaseMs\)\s*==\s*([\d']+)\)",
+        header)
+    assert pin, "the shipped drain budget is no longer pinned in the header"
+    seconds = int(pin.group(1).replace("'", "")) // 1000
+    block = _engine_block()
+    assert f"{seconds} seconds" in block, (
+        f"the engine: comment block does not state the {seconds} s a "
+        "signal-delivered keep stop may wait")
+    assert "about a second" not in block, (
+        "the keep bullet still claims a keep stop takes about a second, which "
+        "is false for the one stop that can find a create in flight")
+    # The cancel-path residue is the comparison that made the bullet true, and
+    # it must survive the rewrite: a kept offer's OWN coins stay locked.
+    for must_say in ("uncancelled.txt", "cancel_pending", "coins locked"):
+        assert must_say in block, (
+            f"the keep bullet no longer says {must_say!r}: what a keep stop "
+            "avoids is the cancelling stop's residue, not locked coins")
+    # ...and the instruction the old text invited an operator to break. This
+    # repo has already had an installer hard-kill a running bot and leave the
+    # offers resting.
+    assert "DO NOT HARD-KILL" in block and "taskkill /F" in block, (
+        "the keep bullet no longer tells the operator not to kill a slow "
+        "stop -- which is exactly the wait that keeps a just-created offer "
+        "from becoming an orphan the next start may cancel")
 
 
 # --------------------------------------------------------------------------- #

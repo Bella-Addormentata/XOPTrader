@@ -710,17 +710,34 @@ monitoring:
 #           wallet-wide cancel, a retry ladder, and a note in
 #           data/uncancelled.txt so the next start finishes what did not
 #           confirm. This is the only behaviour older versions had.
-#   keep    The engine cancels NOTHING. The offers stay on the book, the next
-#           start re-adopts them, and the stop takes about a second. No cancel
-#           spends to confirm and no locked coins to clean up -- which matters
-#           when blocks are full.
+#   keep    The engine cancels NOTHING. The offers stay on the book and the
+#           next start re-adopts them. No cancel spends to confirm, no
+#           uncancelled.txt intent and no cancel_pending rows to clean up --
+#           which matters when blocks are full. (The kept offers keep their own
+#           coins locked, of course; what there is nothing to clean up AFTER is
+#           the cancelling stop's residue.)
+#
+#           HOW LONG THE STOP ITSELF TAKES. A stop you asked for in the GUI is
+#           immediate: it is read between heartbeat cycles, so it never finds
+#           an offer being created. A stop delivered by a SIGNAL (Ctrl+C,
+#           SIGTERM, a service stop, an OS session end) can land while the
+#           engine is in the middle of creating an offer, and it then WAITS for
+#           that one create to land so the offer is recorded instead of
+#           orphaned -- up to 247 seconds with the shipped RPC timeouts, which
+#           is one create plus one publish at their own worst case. It waits on
+#           a timer, never on the wallet, and starts no new offers while it
+#           waits. DO NOT HARD-KILL A STOP THAT SEEMS SLOW (Task Manager,
+#           taskkill /F, End Task, running the installer over a live bot):
+#           that is exactly the wait that keeps a just-created offer from
+#           becoming an orphan the NEXT start may cancel. A second Ctrl+C is
+#           the escape hatch if you truly need one.
 #
 # The GUI ASKS on Stop Trading and when its window is closed, and only
 # preselects this value. THIS key decides every stop where nobody is asked:
 # Windows log-off / shutdown / restart, a signal (SIGINT, SIGTERM), Ctrl+C in a
 # console, a service stop, an older GUI, a hand-written data/shutdown.flag with
 # no "offers=" line. (A hard kill -- Task Manager, taskkill /F, the installer --
-# runs no stop at all, so the offers stay whatever this says.)
+# runs no stop at all, so the offers stay, whatever this says.)
 #
 # READ THIS BEFORE CHOOSING keep. A kept offer is TAKEABLE with no engine behind
 # it: no repricing, no TTL, and no dead man's switch (risk.watchdog_stall_seconds
