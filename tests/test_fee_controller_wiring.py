@@ -456,13 +456,28 @@ def test_an_over_budget_quote_becomes_an_episode_only_at_an_accepted_spend():
     assert "unfunded_alert_pending_" not in priced
     assert "PAYING IT ANYWAY" not in priced
     # The BOUND episode is a different thing and stays here: it is a fact
-    # about the fee this call RETURNS (an attached fee really was degraded).
+    # about the fee this call RETURNS (the budget could not fund an attached
+    # fee).  [review #163 r8] And it is latched on what the BUDGET GRANTED, not
+    # on `bound` -- which is false whenever the attached fee is already pinned
+    # at min_fee_mojos, so an exhausted budget was silent on the whole bottom
+    # of the level band and an open episode was cleared from an empty window.
     assert "budget_bound_" in priced
+    assert "budgeted.allowance < desired" in priced, (
+        "the bound episode must latch on what the budget granted, not on "
+        "BudgetedFee::bound -- see review #163 r8 F1")
+    assert "budgeted.bound" not in priced, (
+        "`bound` says the fee was lowered; it is false at the min_fee pin "
+        "however empty the window is")
 
     spent = _function_body(tracker, "void FeeTracker::note_priority_spend(")
     assert "unfunded_alert_pending_ = true;" in spent
     assert "budget_unfunded_        = true;" in spent
     assert "budget_unfunded_ = false;" in spent, "and this is where the episode ends"
+    # [review #163 r8] ... and it ends only for a spend that FITS THE HEADROOM.
+    # The clear branch used to be the bare negation of the latch above.
+    assert "fee_paid_mojos > quote.headroom" in spent, (
+        "the unfunded episode must end on the headroom the quote measured, "
+        "not merely on a fee below that quote -- see review #163 r8 F2")
     # Per class: Step 8 quotes CancelXch then CancelCat in the same heartbeat.
     assert "pending_unfunded_[static_cast<std::size_t>(action)]" in spent
     # An attached fee is never a priority spend.

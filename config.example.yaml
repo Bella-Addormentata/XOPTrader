@@ -885,10 +885,20 @@ fees:
   #                                  # floor, which act as a FLOOR under the learned fee.  [1, 4]
   # controller_ff_max_age_blocks: 32 # A node reading older than this is dropped (node
   #                                  # unreachable): the learned fee then stands alone.
-  # controller_budget_reserve_cancels: 25   # Budget held back from offer-attached fees so the
-  #                                  # book can still be cancelled: this many CAT cancels at
-  #                                  # today's price, CAPPED at half of daily_budget_mojos so
-  #                                  # it can never exceed the budget itself.  [0, 1000]
+  # controller_budget_reserve_cancels: 25   # Budget held back from offer-attached fees: this
+  #                                  # many CAT cancels at today's price, CAPPED at half of
+  #                                  # daily_budget_mojos so it can never exceed the budget
+  #                                  # itself.  [0, 1000]
+  #                                  # WHAT IT DOES: attached fees start being squeezed while
+  #                                  # this much of the window is still unspent, instead of
+  #                                  # when the window empties.  WHAT IT DOES NOT DO: bound
+  #                                  # what attached fees spend.  min_fee_mojos overrides it
+  #                                  # unconditionally, nothing refuses to post on budget
+  #                                  # grounds with the controller on, and a fee is booked for
+  #                                  # every offer POSTED -- so a ladder can still drive the
+  #                                  # window past the budget at min_fee_mojos per tier.  Only
+  #                                  # daily_budget_mojos prevents that.  Cancels are funded
+  #                                  # because they are never shaped by the budget at all.
   #                                  # With the controller ON an exhausted budget degrades the
   #                                  # OFFER-ATTACHED fee to min_fee_mojos (one FeeBudgetBound
   #                                  # alert); it never returns 0 = "skip Step 8", which also
@@ -909,9 +919,14 @@ fees:
   # OPERATOR GUIDANCE at full-mempool fee levels (5 mojos/cost x 1.10 margin):
   #   CAT cancel 232650000, XCH cancel 46200000, take 687500000, offer-attached
   #   115500000 mojos.  So:
-  #   * max_fee_mojos 100000000 CANNOT get a CAT cancel or a take into a full
-  #     mempool (the startup log says so).  Use >= 250000000 for cancels,
-  #     >= 700000000 to cover takes.
+  #   * max_fee_mojos 100000000 CANNOT get an OFFER-ATTACHED fee, a CAT cancel
+  #     or a take into a full mempool -- THREE of the four classes, since all
+  #     three figures above (115500000, 232650000, 687500000) are over it.
+  #     Only the XCH cancel's 46200000 clears.  The startup log names each one.
+  #     Use >= 250000000 to cover the attached fee and cancels, >= 700000000 to
+  #     cover takes as well.  (The test is max_fee_mojos < 5 x
+  #     controller_ff_margin x cost, i.e. 5.5 mojos/cost at the default margin,
+  #     not a bare 5 -- the same margin the feed-forward floor carries.)
   #   * daily_budget_mojos is spent over fee_window_blocks, NOT over a day, and
   #     FeeTracker::record_fee books an attached fee for every offer POSTED.  At
   #     the measured rate of this wallet (2026-09-20: 152 offers, 134 cancels

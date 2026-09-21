@@ -1270,11 +1270,54 @@ TEST(FeeBudget, OneAttachedFeeIsSharedAcrossTheBatchItWillBeAttachedTo)
     EXPECT_FALSE(fee::apply_budget(200, 10'000, 900, 1, false, 10).bound);
     // A batch of 0 is a batch of 1, never a division by zero.
     EXPECT_EQ(fee::apply_budget(200, 1'000, 900, 1, false, 0).fee, 100U);
-    // The min_fee floor still holds -- the ONE place the reserve is soft, by
-    // design: the operator's floor is what "degraded" means.
+    // The min_fee floor still holds -- the one place the share is soft INSIDE
+    // apply_budget, by design: the operator's floor is what "degraded" means.
+    // [review #163 r8] It is also why the reserve bounds nothing cumulatively;
+    // see the comment on apply_budget.
     EXPECT_EQ(fee::apply_budget(200, 1'000, 900, 50, false, 10).fee, 50U);
     // Cancels and takes are not shaped by the batch.
     EXPECT_EQ(fee::apply_budget(200, 1'000, 900, 1, true, 10).fee, 200U);
+}
+
+TEST(FeeBudget, TheAllowanceIsWhatTheBudgetGrantsAndTheFloorCanExceedIt)
+{
+    // [review #163 r8] F1, at the level of apply_budget alone.  `bound` means
+    // "the budget LOWERED the fee".  It is FALSE whenever `desired` is already
+    // at min_fee, because the floor hands the whole fee back -- and it is
+    // false there whatever the headroom is, so nothing may read it as "the
+    // budget had room".  `allowance` is what the budget actually granted.
+    const auto pinned = fee::apply_budget(10, /*headroom=*/0, /*reserve=*/0, /*min_fee=*/10,
+                                          /*priority=*/false);
+    EXPECT_EQ(pinned.fee, 10U);            // the floor paid it ...
+    EXPECT_FALSE(pinned.bound);            // ... so nothing was lowered ...
+    EXPECT_EQ(pinned.allowance, 0U);       // ... and the budget granted nothing
+    EXPECT_FALSE(pinned.over_budget);
+
+    // Room for the whole fee: the allowance covers it and nothing binds.
+    const auto roomy = fee::apply_budget(200, 10'000, 900, 10, false, 10);
+    EXPECT_EQ(roomy.allowance, 910U);      // (10,000 - 900) / 10
+    EXPECT_EQ(roomy.fee, 200U);
+    EXPECT_FALSE(roomy.bound);
+    EXPECT_GE(roomy.allowance, 200U);
+
+    // Squeezed but still above the floor: the fee IS the allowance.
+    const auto squeezed = fee::apply_budget(200, 1'000, 900, 10, false, 10);
+    EXPECT_EQ(squeezed.allowance, 10U);    // (1,000 - 900) / 10
+    EXPECT_EQ(squeezed.fee, 10U);
+    EXPECT_TRUE(squeezed.bound);
+
+    // Squeezed BELOW the floor: the fee is above the allowance, and only the
+    // allowance says the budget could not fund it.
+    const auto floored = fee::apply_budget(200, 1'000, 900, 50, false, 10);
+    EXPECT_EQ(floored.allowance, 10U);
+    EXPECT_EQ(floored.fee, 50U);
+    EXPECT_GT(floored.fee, floored.allowance);
+    EXPECT_TRUE(floored.bound);            // desired 200 > 50: this one IS bound
+
+    // The priority path is shaped by neither, and says so rather than
+    // reporting a number that would be meaningless.
+    EXPECT_EQ(fee::apply_budget(200, 1'000, 900, 10, true, 10).allowance, 0U);
+    EXPECT_EQ(fee::apply_budget(200, 1'000, 900, 10, true, 10).fee, 200U);
 }
 
 /// One heartbeat of the engine's sweep over ONE cancel ticket, exactly as
@@ -1589,9 +1632,14 @@ TEST(FeeChangeLog, FoldsABurstIntoOneLineAndLetsHardReasonsThrough)
     EXPECT_FALSE(gate.note(ch, 200));           // nothing moved: nothing to say
 }
 
-TEST(FeeReachability, TheLiveMaxFeeCannotClearAFullMempoolForCatSpends)
+TEST(FeeReachability, TheLiveMaxFeeCannotClearAFullMempoolForThreeOfFourClasses)
 {
-    // Live 2026-09-20: min 15M, max 100M.  100M / 42.3M = 2.36 < 5.
+    // Live 2026-09-20: min 15M, max 100M.  [review #163 r8] THREE classes are
+    // flagged, not the two every operator document named: the predicate is
+    // max_fee < ceil(kFullMempoolMinRate x ff_margin x cost) = 5 x 1.10 = 5.5
+    // mojos per cost, and 100M is below 115,500,000 (offer-attached),
+    // 232,650,000 (CAT cancel) and 687,500,000 (take).  Only the XCH cancel's
+    // 46,200,000 clears.
     const auto live = fee::reachability(on_config(), 15'000'000ULL, 100'000'000ULL);
     EXPECT_FALSE(live.cannot_raise);
     EXPECT_FALSE(live.max_fee_below_full_mempool[static_cast<std::size_t>(ActionClass::CancelXch)]);
@@ -1600,6 +1648,15 @@ TEST(FeeReachability, TheLiveMaxFeeCannotClearAFullMempoolForCatSpends)
     EXPECT_TRUE(live.max_fee_below_full_mempool[static_cast<std::size_t>(ActionClass::Take)]);
     // 5 x 1.10 x 125M: what max_fee_mojos must be for a take to get in.
     EXPECT_EQ(live.max_fee_for_full_mempool, 687'500'000ULL);
+    // [review #163 r8] And the margin really is in the per-class predicate, not
+    // only in that total: 110,000,000 is ABOVE a bare 5 x 21,000,000 =
+    // 105,000,000 and BELOW 5.5 x 21,000,000 = 115,500,000, so it separates the
+    // two readings of the rule the header used to document as "< 5".
+    const auto margin_probe = fee::reachability(on_config(), 15'000'000ULL, 110'000'000ULL);
+    EXPECT_TRUE(margin_probe.max_fee_below_full_mempool[
+                    static_cast<std::size_t>(ActionClass::OfferAttached)]);
+    EXPECT_FALSE(margin_probe.max_fee_below_full_mempool[
+                     static_cast<std::size_t>(ActionClass::CancelXch)]);
     const auto roomy = fee::reachability(on_config(), 15'000'000ULL, 1'000'000'000ULL);
     for (std::size_t i = 0; i < fee::kActionClassCount; ++i) {
         EXPECT_FALSE(roomy.max_fee_below_full_mempool[i]);
@@ -2158,10 +2215,17 @@ TEST(FeeTrackerController, ControllerOnRaisesOnEvidenceAndIsNeverZero)
     EXPECT_EQ(t.last_unfunded_fee(), want_cancel);
     EXPECT_EQ(t.last_unfunded_headroom(), 0U);
     EXPECT_EQ(t.last_unfunded_action(), ActionClass::CancelCat);
-    // The attached fee was pinned at min_fee, which IS its desired fee here
-    // (0.709 x 21M = 14.9M, clamped up), so nothing was lowered and the BOUND
-    // alert -- a different condition -- did not fire.
-    EXPECT_FALSE(t.take_budget_bound_alert());
+    // [review #163 r8] The attached fee was pinned at min_fee, which IS its
+    // desired fee here (0.709 x 21M = 14.9M, clamped up), so NOTHING WAS
+    // LOWERED -- and the budget still granted it nothing at all.  That state
+    // used to be silent: the episode latched on `BudgetedFee::bound`, which is
+    // false exactly here, so an exhausted budget produced no FeeBudgetBound
+    // alert on the whole bottom of the level band.  It latches on the
+    // allowance now.
+    EXPECT_TRUE(t.take_budget_bound_alert());
+    EXPECT_EQ(t.last_bound_desired(), kMinFee);
+    EXPECT_EQ(t.last_bound_allowed(), 0U);
+    EXPECT_FALSE(t.take_budget_bound_alert());   // and only once per episode
 }
 
 TEST(FeeTrackerController, TheReserveKeepsCancelsFundedWhileAttachedFeesAreSqueezed)
@@ -2192,7 +2256,11 @@ TEST(FeeTrackerController, TheReserveKeepsCancelsFundedWhileAttachedFeesAreSquee
     EXPECT_TRUE(t.take_budget_bound_alert());
     EXPECT_EQ(t.last_bound_desired(), attached);
     EXPECT_EQ(t.last_bound_allowed(), 50'000'000ULL);
-    // Cancels and takes still pay in full: that is what the reserve is for.
+    // Cancels and takes still pay in full -- [review #163 r8] which is
+    // apply_budget's PRIORITY branch, not the reserve: that branch returns
+    // `desired` and never reads the reserve at all.  What the reserve buys is
+    // that the squeeze on attached fees STARTS here, with `reserve` mojos of
+    // the window still unspent, instead of when the window empties.
     EXPECT_EQ(t.get_recommended_fee(1, 101, ActionClass::CancelCat), cancel);
     EXPECT_EQ(t.get_recommended_fee(1, 101, ActionClass::Take), take);
     EXPECT_EQ(t.get_recommended_fee(1, 101, ActionClass::CancelXch),
@@ -2350,6 +2418,101 @@ TEST(FeeTrackerController, AnAcceptedXchCancelReadsItsOwnQuoteNotTheCatOneQuoted
     EXPECT_EQ(t.last_unfunded_headroom(), 0U);
 }
 
+TEST(FeeTrackerController, AnAttachedFeePinnedAtTheFloorIsStillAnUnfundedBudget)
+{
+    // [review #163 r8] F1, end to end.  The episode latched and cleared on
+    // `BudgetedFee::bound` -- "the budget LOWERED the fee" -- which is false
+    // whenever the controller's own answer for an attached fee is already at
+    // fees.min_fee_mojos.  That is every level at or below
+    // log2(42.3 / 21) = 1.010: the bottom 39% of the live band and the level
+    // the engine BOOTS at.  So an exhausted budget was silent there, and an
+    // open episode was closed by a quote from an empty window, logging
+    // "the fee budget no longer binds (headroom 0 mojos)".
+    xop::FeeConfig cfg = tracker_config(true, false);
+    cfg.daily_budget_mojos = 10'000'000'000ULL;
+    xop::FeeTracker t{cfg};
+
+    // Boot level: a CAT cancel pays exactly min_fee, so an attached fee's own
+    // rate is 21/42.3 of that and the CLAMP, not the rate, decides the number.
+    ASSERT_EQ(t.get_recommended_fee(1, 100, ActionClass::CancelCat), kMinFee);
+    ASSERT_LT(fee::fee_from_rate(t.controller().learned_rate(), 21'000'000ULL), kMinFee);
+    ASSERT_EQ(t.controller().fee_for(ActionClass::OfferAttached, 100), kMinFee);
+    EXPECT_EQ(t.get_recommended_fee(1, 100, ActionClass::OfferAttached), kMinFee);
+    EXPECT_FALSE(t.take_budget_bound_alert());   // a full window funds it: nothing binds
+
+    t.record_fee(10'000'000'000ULL, 100);        // the window is now empty
+    ASSERT_EQ(t.budget_remaining(101), 0U);
+    EXPECT_EQ(t.get_recommended_fee(1, 101, ActionClass::OfferAttached), kMinFee);
+    EXPECT_TRUE(t.take_budget_bound_alert())
+        << "the budget granted 0 and only the min_fee floor paid this fee";
+    EXPECT_EQ(t.last_bound_desired(), kMinFee);
+    EXPECT_EQ(t.last_bound_allowed(), 0U);       // what the BUDGET allowed, not what was paid
+    EXPECT_FALSE(t.take_budget_bound_alert());   // one alert per episode
+
+    // THE FALSE ALL-CLEAR.  Every later heartbeat quotes the same pinned fee
+    // against the same empty window.  None of them resolves anything.
+    for (std::uint32_t h = 102; h < 112; ++h) {
+        EXPECT_EQ(t.get_recommended_fee(1, h, ActionClass::OfferAttached), kMinFee);
+        EXPECT_FALSE(t.take_budget_bound_alert()) << "episode re-opened at height " << h;
+    }
+
+    // ... and the episode really does end when the window rolls and the budget
+    // can fund the fee again -- proved by a LATER squeeze alerting a second
+    // time, which it could not do from an episode that never closed.
+    EXPECT_EQ(t.get_recommended_fee(1, 100 + 1'662 + 1, ActionClass::OfferAttached), kMinFee);
+    ASSERT_EQ(t.budget_remaining(100 + 1'662 + 1), 10'000'000'000ULL);
+    EXPECT_FALSE(t.take_budget_bound_alert());
+    t.record_fee(10'000'000'000ULL, 100 + 1'662 + 1);
+    EXPECT_EQ(t.get_recommended_fee(1, 100 + 1'662 + 2, ActionClass::OfferAttached), kMinFee);
+    EXPECT_TRUE(t.take_budget_bound_alert())
+        << "the first episode never ended, so the second squeeze could not alert";
+}
+
+TEST(FeeTrackerController, ASpendBelowItsQuoteButAboveTheHeadroomDoesNotEndTheEpisode)
+{
+    // [review #163 r8] F2.  The clear branch was the bare negation of the latch
+    // condition -- !(quote.over && fee_paid >= quote.fee) -- and never compared
+    // the fee PAID with the headroom at all.  So any accepted priority spend
+    // strictly below its class's last quote read as "the budget funds priority
+    // spends again", however far above the headroom it really was.  The header
+    // says the episode ends when an accepted spend FITS THE HEADROOM.
+    xop::FeeConfig cfg = tracker_config(true, false);
+    cfg.daily_budget_mojos = 20'000'000'000ULL;
+    cfg.controller_max_step_up = 8.0;
+    xop::FeeTracker t{cfg};
+    t.observe(hard(Signal::ForceDelete, 100));           // level 4: every fee x16
+    t.record_fee(20'000'000'000ULL, 100);                // headroom 0
+    ASSERT_EQ(t.budget_remaining(101), 0U);
+    const std::uint64_t cancel = t.get_recommended_fee(1, 101, ActionClass::CancelCat);
+    ASSERT_EQ(cancel, 16 * kMinFee);                     // 240,000,000
+    t.note_priority_spend(ActionClass::CancelCat, cancel);
+    ASSERT_TRUE(t.take_budget_unfunded_alert());         // the episode is open
+
+    // An escalation tier one million BELOW the quote -- and 239,000,000 mojos
+    // ABOVE a headroom of nothing.  It funded nothing; it is no all-clear.
+    t.note_priority_spend(ActionClass::CancelCat, cancel - 1'000'000ULL);
+    EXPECT_FALSE(t.take_budget_unfunded_alert())
+        << "a spend below its quote is not this quote's overrun either";
+    // The proof that it did not end the episode: the SAME overrun as before
+    // must not be able to open a second one.
+    t.note_priority_spend(ActionClass::CancelCat, cancel);
+    EXPECT_FALSE(t.take_budget_unfunded_alert())
+        << "the episode was ended by a spend that overran the headroom by "
+           "239,000,000 mojos, so this overrun opened a second one";
+
+    // It DOES end on a spend that fits the headroom -- including one below its
+    // quote, which is the case the old rule got right by accident.
+    EXPECT_EQ(t.get_recommended_fee(1, 100 + 1'662 + 1, ActionClass::CancelCat), cancel);
+    ASSERT_GT(t.budget_remaining(100 + 1'662 + 1), cancel);
+    t.note_priority_spend(ActionClass::CancelCat, cancel - 1'000'000ULL);
+    // ... proved by exhausting the window again: the same spend alerts afresh.
+    t.record_fee(20'000'000'000ULL, 100 + 1'662 + 1);
+    EXPECT_EQ(t.get_recommended_fee(1, 100 + 1'662 + 2, ActionClass::CancelCat), cancel);
+    t.note_priority_spend(ActionClass::CancelCat, cancel);
+    EXPECT_TRUE(t.take_budget_unfunded_alert())
+        << "a spend that really fit the headroom must still end the episode";
+}
+
 TEST(FeeTrackerController, TheCancelReserveCannotSwallowTheWholeBudget)
 {
     // [review #163 r3] FINDING 1, end to end at the live numbers.  The node
@@ -2373,11 +2536,20 @@ TEST(FeeTrackerController, TheCancelReserveCannotSwallowTheWholeBudget)
     EXPECT_FALSE(t.take_budget_unfunded_alert());
 }
 
-TEST(FeeTrackerController, ABatchOfAttachedFeesCannotSpendTheCancelReserve)
+TEST(FeeTrackerController, TheAttachedBatchShareHoldsOnlyWhileItIsAboveTheMinFeeFloor)
 {
     // [review #163] The same squeeze as above, but Step 8 is about to attach
     // the fee to TEN tiers.  Shaped for one offer, ten of them would spend
     // 500M: the 50M above the reserve plus 450M of the reserve itself.
+    //
+    // [review #163 r8] AND THIS TEST WAS NAMED FOR A PROPERTY IT DISPROVES.
+    // It used to be called ABatchOfAttachedFeesCannotSpendTheCancelReserve.
+    // Its batch-of-ten case shows a batch of ten spending 10,000,000 where
+    // 5,000,000 was above the reserve -- twice the room, into the reserve --
+    // because the share falls under fees.min_fee_mojos and the floor overrides
+    // the budget unconditionally.  Only the batch-of-four case, where the
+    // floor does not bite, showed the share holding.  Renamed to what it
+    // shows, and the batch-of-ten overrun is now asserted instead of narrated.
     xop::FeeConfig cfg = tracker_config(true, false);
     cfg.daily_budget_mojos = 8'000'000'000ULL;
     cfg.controller_budget_reserve_cancels = 25;
@@ -2391,13 +2563,22 @@ TEST(FeeTrackerController, ABatchOfAttachedFeesCannotSpendTheCancelReserve)
     const std::uint64_t alone = t.get_recommended_fee(1, 101, ActionClass::OfferAttached);
     EXPECT_EQ(alone, 7'943'263ULL);                      // desired, unbound: 16 x 1M x 21/42.3
     t.record_fee(45'000'000ULL, 101);                    // 5M above the reserve
-    EXPECT_EQ(t.get_recommended_fee(1, 102, ActionClass::OfferAttached), 5'000'000ULL);
+    constexpr std::uint64_t kAboveReserve = 5'000'000ULL;
+    EXPECT_EQ(t.get_recommended_fee(1, 102, ActionClass::OfferAttached), kAboveReserve);
     t.set_attached_batch(10);
     const std::uint64_t shared = t.get_recommended_fee(1, 102, ActionClass::OfferAttached);
     EXPECT_EQ(shared, 1'000'000ULL);                     // 5M / 10 = 500k -> the min_fee floor
+    // [review #163 r8] ... and what ten of THOSE spend.  The share was
+    // 500,000; the floor lifted each back to min_fee_mojos, so the batch
+    // spends twice the room the share was computed from and 4,500,000 of it
+    // comes out of the cancel reserve.  Remove the floor from apply_budget and
+    // this line -- and the header's static_asserts -- are what say so.
+    EXPECT_GT(10ULL * shared, kAboveReserve)
+        << "the min_fee floor overrides the per-offer share, so the batch "
+           "spends more than the room above the reserve";
     t.set_attached_batch(4);
     EXPECT_EQ(t.get_recommended_fee(1, 102, ActionClass::OfferAttached), 1'250'000ULL);
-    EXPECT_LE(4 * 1'250'000ULL, 5'000'000ULL);
+    EXPECT_LE(4 * 1'250'000ULL, kAboveReserve);          // the share holds where it is above min_fee
     // Cancels ignore the batch.
     EXPECT_EQ(t.get_recommended_fee(1, 102, ActionClass::CancelCat), 16'000'000ULL);
     // The legacy path never reads it.

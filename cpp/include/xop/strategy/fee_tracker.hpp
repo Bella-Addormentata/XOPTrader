@@ -207,13 +207,29 @@ public:
                                                     std::uint64_t fee_paid_mojos,
                                                     BlockHeight   current_block) const noexcept;
 
-    /// True ONCE per episode in which the budget lowered an OFFER-ATTACHED fee
-    /// (the only kind it may lower): the engine turns it into one operator
-    /// alert.  The episode ends when an attached fee next comes back unbound.
+    /// True ONCE per episode in which the budget could not fund an
+    /// OFFER-ATTACHED fee (the only kind it shapes at all): the engine turns
+    /// it into one operator alert.
+    ///
+    /// [review #163 r8] "COULD NOT FUND", NOT "LOWERED".  The episode used to
+    /// open and close on `BudgetedFee::bound`, and `bound` is false whenever
+    /// the controller's own answer for an attached fee is already at
+    /// fees.min_fee_mojos -- every level at or below
+    /// log2(42.3/21) = 1.010, which on the live bounds is the bottom 39% of
+    /// the band and includes the level the engine BOOTS at.  There the floor
+    /// hands the whole fee back, so an exhausted budget never opened the
+    /// episode, and an already-open one was CLOSED by a quote from an empty
+    /// window: `[FeeController] the fee budget no longer binds (headroom 0
+    /// mojos)`, an all-clear contradicted by its own number.  The rule is now
+    /// `BudgetedFee::allowance < desired` on both edges, so the episode ends
+    /// only when the budget really has room for the fee.
     [[nodiscard]] bool take_budget_bound_alert() noexcept;
 
-    /// The attached fee the budget last refused to pay in full, and what it
-    /// allowed.
+    /// The attached fee the budget last could not fund, and what the BUDGET
+    /// ITSELF allowed for it (`BudgetedFee::allowance`).  The fee actually
+    /// attached may be HIGHER than `last_bound_allowed()`, because
+    /// fees.min_fee_mojos is the operator's floor and overrides the budget;
+    /// when it is, `allowed` is 0 or near it and that is the real number.
     [[nodiscard]] std::uint64_t last_bound_desired() const noexcept { return last_bound_desired_; }
     [[nodiscard]] std::uint64_t last_bound_allowed() const noexcept { return last_bound_allowed_; }
 
@@ -230,9 +246,19 @@ public:
     ///
     /// The engine calls this from the two places a priority spend becomes
     /// real: OfferManager's cancel observer (the wallet accepted the cancel)
-    /// and the take-success hook.  It is also where the episode CLEARS: a
-    /// priority spend accepted at a fee its class's last quote could fund
-    /// means the budget funds priority spends again.
+    /// and the take-success hook.  It is also where the episode CLEARS -- and
+    /// [review #163 r8] it clears only when `fee_paid_mojos` FITS THE HEADROOM
+    /// its class's last quote measured.  The clear branch used to be the bare
+    /// negation of the latch condition, so an accepted spend at any fee
+    /// strictly below that quote ended the episode however far above the
+    /// headroom it really was: a 239,000,000-mojo escalation against a
+    /// headroom of 0 read as "the budget funds priority spends again".
+    ///
+    /// A spend IN BETWEEN -- above the headroom, below the quote -- now does
+    /// neither.  It overran the window, so it is no all-clear; it is not the
+    /// quoted spend, so it is not this quote's overrun either.  (A spend of 0
+    /// mojos fits every headroom and therefore does clear: the budget really
+    /// did fund it.)
     ///
     /// @param action          The class of the spend (OfferAttached is
     ///                        ignored: an attached fee is paid by a fill, and
@@ -247,7 +273,9 @@ public:
     /// confirms, keeps its coins locked and ends in a wallet-wide
     /// force-delete -- so this is an alert about the BUDGET, not a degraded
     /// fee.  [review #163 r5] The episode opens at note_priority_spend, never
-    /// at a quote, and ends when an accepted priority spend fits the headroom.
+    /// at a quote, and [review #163 r8] ends when an accepted priority spend
+    /// fits the headroom -- which is now what the code compares, see
+    /// note_priority_spend.
     [[nodiscard]] bool take_budget_unfunded_alert() noexcept;
 
     /// The priority fee last paid over budget, the headroom it exceeded, and

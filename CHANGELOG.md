@@ -60,7 +60,14 @@ default to off, and with both off every fee is what v0.10.24 paid.
   `FeeBudgetBound` alert. It never returns 0, which made Step 8 skip cancelling
   stale quotes as well as posting. Step 8 asks for one attached fee and attaches
   it to every tier it posts, so the room above the reserve is shared across the
-  tiers it may post that heartbeat rather than granted to each. **A cancel or a
+  tiers it may post that heartbeat rather than granted to each. **The reserve
+  moves *when* that squeeze starts; it does not bound what attached fees
+  spend** — `min_fee_mojos` overrides it unconditionally, `should_post_offer`
+  no longer refuses a tier on budget grounds with the controller on, and a fee
+  is booked for every offer *posted* (S69), so a ladder can still push the
+  window past the budget at `min_fee_mojos` per tier. Only a correctly sized
+  `daily_budget_mojos` prevents that, which is what the startup advisory is
+  for. **A cancel or a
   take is never degraded**: `min_fee_mojos` on a 42.3M-cost CAT cancel is 0.35
   mojos per cost against the 5 a full mempool admits, so a degraded cancel is a
   spend that cannot be mined, keeps its coins locked and ends in a wallet-wide
@@ -135,6 +142,26 @@ default to off, and with both off every fee is what v0.10.24 paid.
   events this wallet's busiest day recorded, one window totals about 1.4e11
   mojos against the 1.8e19 needed to saturate. It takes a `max_fee_mojos` near
   2^63, which `config.cpp` accepts because it validates only `min <= max`.
+- **Both budget alerts told the operator the wrong thing, and both are the
+  signals the staged enable says to act on.** (1) The `FeeBudgetBound` episode
+  latched and cleared on "the budget *lowered* the fee", which is false
+  whenever the controller's own answer for an attached fee is already at
+  `min_fee_mojos` — every level at or below `log2(42.3/21) = 1.010`, the bottom
+  39% of the live band and the level the engine **boots at**. So an exhausted
+  budget raised no alert there at all, and an open episode was *closed* by a
+  quote taken from an empty window, logging `the fee budget no longer binds
+  (headroom 0 mojos)`: an all-clear contradicted by its own number. The rule is
+  now what the budget actually granted (`BudgetedFee::allowance`, the room
+  above the reserve divided by the batch) against what was asked for, on both
+  edges. (2) The `FeeBudgetUnfunded` episode's clear branch was the bare
+  negation of its latch and never compared the fee *paid* with the headroom, so
+  an accepted priority spend at any fee below its class's last quote ended the
+  episode however far above the headroom it was — a 239,000,000-mojo escalation
+  against a headroom of 0 read as "the budget funds priority spends again". It
+  now ends only when the accepted spend fits the headroom, which is what the
+  header always documented. Both are behind `controller_enabled` and both are
+  load-bearing at the live `daily_budget_mojos: 10000000000`, which this PR's
+  own startup advisory says is about 3x too small.
 - **Observability.** One `[FeeController] rate a -> b mojos/cost (reason; n
   move(s)) -- fees now: ...` line per burst of changes, and two gauges,
   `xop_fees_controller_rate_mojos_per_cost` and `xop_fees_controller_level_log2`.
@@ -160,10 +187,14 @@ default to off, and with both off every fee is what v0.10.24 paid.
   (the example file's 5000) makes a very wide band: the startup log says how
   many raises, and roughly how many minutes, crossing it takes without the
   node's floor.
-- **The live `max_fee_mojos: 100000000` cannot get a CAT cancel or a take into a
-  full mempool** (100M / 42.3M cost = 2.4 mojos per cost, the node needs 5).
-  Before enabling the controller raise it to at least 250,000,000, or
-  700,000,000 to cover takes, and raise
+- **The live `max_fee_mojos: 100000000` cannot get an offer-attached fee, a CAT
+  cancel or a take into a full mempool** — three of the four classes, not the
+  two earlier drafts of this entry named. The node admits at 5 mojos per cost
+  and the controller asks for `controller_ff_margin` × that (5.5 at the
+  default), so the classes need 115,500,000, 232,650,000 and 687,500,000
+  respectively; only the XCH cancel's 46,200,000 fits under 100,000,000. The
+  startup log names each one. Before enabling the controller raise it to at
+  least 250,000,000, or 700,000,000 to cover takes, and raise
   `strategy.cancel_escalation_max_fee_mojos` with it.
 - **`daily_budget_mojos` is per `fee_window_blocks`, and 1662 peak heights is
   8.7 hours, not 24** (S69). At full-mempool prices one such window costs

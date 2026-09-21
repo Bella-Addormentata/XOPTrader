@@ -2181,8 +2181,18 @@ struct FeeConfig {
     /// A node reading older than this many peak heights is dropped.
     uint32_t controller_ff_max_age_blocks{32};
 
-    /// Budget held back from offer-attached fees so the resting book can
-    /// still be cancelled: this many CAT cancels at the current fee.
+    /// Budget held back from offer-attached fees: this many CAT cancels at the
+    /// current fee, capped at half of daily_budget_mojos.
+    ///
+    /// [review #163 r8] It makes the squeeze on attached fees START while that
+    /// much of the window is still unspent; it is NOT a guarantee that the
+    /// resting book can still be cancelled, and this comment used to say it
+    /// was.  fees.min_fee_mojos overrides the reserve unconditionally, nothing
+    /// refuses to post on budget grounds with the controller on, and Step 8
+    /// books a fee for every offer POSTED, so attached fees can still drive the
+    /// window past the budget.  Cancels are funded because apply_budget's
+    /// PRIORITY branch never looks at the reserve at all -- they are paid in
+    /// full and the overrun reported.  See strategy::fee::apply_budget.
     uint32_t controller_budget_reserve_cancels{25};
 
     /// CLVM cost per action class, measured on this wallet 2026-09-20; see

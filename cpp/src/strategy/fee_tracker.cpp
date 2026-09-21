@@ -449,12 +449,16 @@ std::uint64_t FeeTracker::controller_fee(strategy::fee::ActionClass action,
     const std::uint64_t desired  = controller_.fee_for(action, current_block);
     const std::uint64_t headroom = budget_remaining(current_block);
 
-    // The reserve: enough budget to cancel the resting book at today's price,
-    // and [review #163 r3] NEVER more than half the budget.  The uncapped
-    // figure exceeds the whole budget at any plausible setting once the loop
-    // has converged on a full mempool -- 25 x 232,650,000 = 5,816,250,000 --
-    // which pinned every attached fee at min_fee from the first convergent
-    // heartbeat (strategy::fee::budget_reserve).
+    // The reserve: `controller_budget_reserve_cancels` CAT cancels at today's
+    // price, and [review #163 r3] NEVER more than half the budget.  The
+    // uncapped figure exceeds the whole budget at any plausible setting once
+    // the loop has converged on a full mempool -- 25 x 232,650,000 =
+    // 5,816,250,000 -- which pinned every attached fee at min_fee from the
+    // first convergent heartbeat (strategy::fee::budget_reserve).
+    //
+    // [review #163 r8] It moves WHEN attached fees start being squeezed; it
+    // does not bound what they spend.  Cancels are paid in full because
+    // apply_budget's priority branch ignores the reserve entirely.
     const std::uint64_t cancel_fee =
         controller_.fee_for(strategy::fee::ActionClass::CancelCat, current_block);
     const std::uint64_t reserve = strategy::fee::budget_reserve(
@@ -481,27 +485,48 @@ std::uint64_t FeeTracker::controller_fee(strategy::fee::ActionClass action,
     pending.fee      = budgeted.fee;
     pending.headroom = headroom;
 
-    if (budgeted.bound) {
+    // [review #163 r8] THE EPISODE IS "THE BUDGET CANNOT FUND AN ATTACHED
+    // FEE", WHICH IS NOT `budgeted.bound`.  `bound` is `fee < desired` -- the
+    // budget LOWERED the fee -- and it is false whenever `desired` is already
+    // at fees.min_fee_mojos, because the floor then hands the whole fee back.
+    // That is not a corner: an attached fee is pinned at the floor at every
+    // level at or below log2(cost_cancel_cat / cost_offer_attached) =
+    // log2(42.3/21) = 1.010, the bottom 39% of the live band and the level the
+    // engine BOOTS at.  So the old rule (a) never opened the episode there,
+    // however empty the window was, and (b) CLOSED an open one on a quote from
+    // an empty window, logging "the fee budget no longer binds (headroom 0
+    // mojos)" -- an all-clear its own number contradicted.  `allowance` is
+    // what the budget really granted, and `allowance < desired` is the
+    // condition on both edges.
+    const bool attached      = !strategy::fee::is_priority(action);
+    const bool budget_short  = attached && budgeted.allowance < desired;
+
+    if (budget_short) {
         last_bound_desired_ = desired;
-        last_bound_allowed_ = budgeted.fee;
+        last_bound_allowed_ = budgeted.allowance;
         if (!budget_bound_) {
             budget_bound_         = true;
             budget_alert_pending_ = true;
-            spdlog::warn("[FeeController] the fee budget BINDS: {} wants {} mojos, the budget "
-                         "allows {} (headroom {} of {} per {} peak heights, reserve {} for {} "
-                         "cancels). Offer-attached fees degrade toward min_fee_mojos; cancels "
-                         "and takes are NOT degraded and nothing stops. Raise "
-                         "fees.daily_budget_mojos.",
-                         strategy::fee::to_string(action), desired, budgeted.fee, headroom,
-                         cfg_.daily_budget_mojos, cfg_.fee_window_blocks, reserve,
+            spdlog::warn("[FeeController] the fee budget BINDS: an {} fee wants {} mojos and the "
+                         "budget's share for one is {} -- {} will be attached (fees.min_fee_mojos "
+                         "{} is a floor the budget cannot lower). Headroom {} of {} per {} peak "
+                         "heights, reserve {} for {} cancels. Offer-attached fees degrade toward "
+                         "min_fee_mojos; cancels and takes are NOT degraded and nothing stops. "
+                         "Raise fees.daily_budget_mojos.",
+                         strategy::fee::to_string(action), desired, budgeted.allowance,
+                         budgeted.fee, cfg_.min_fee_mojos, headroom, cfg_.daily_budget_mojos,
+                         cfg_.fee_window_blocks, reserve,
                          cfg_.controller_budget_reserve_cancels);
         }
-    } else if (!strategy::fee::is_priority(action) && budget_bound_) {
-        // An offer-attached fee is the first thing the budget squeezes, so
-        // one that comes back whole means the episode is over.
+    } else if (attached && budget_bound_) {
+        // An offer-attached fee the budget can pay for IN FULL: the squeeze is
+        // over.  `allowance >= desired >= min_fee_mojos >= 1`, so the headroom
+        // printed here can no longer be 0.
         budget_bound_ = false;
-        spdlog::info("[FeeController] the fee budget no longer binds (headroom {} mojos)",
-                     headroom);
+        spdlog::info("[FeeController] the fee budget funds offer-attached fees again (an {} fee "
+                     "wanted {} mojos and the budget's share for one was {}; headroom {} of {})",
+                     strategy::fee::to_string(action), desired, budgeted.allowance, headroom,
+                     cfg_.daily_budget_mojos);
     }
     return budgeted.fee;
 }
@@ -518,7 +543,7 @@ void FeeTracker::note_priority_spend(strategy::fee::ActionClass action,
     const PendingUnfunded& quote = pending_unfunded_[static_cast<std::size_t>(action)];
     // The spend counts against the quote it was priced from.  A spend that
     // came in UNDER that quote -- an escalation tier below it, a policy fee --
-    // did not overrun the headroom the quote measured, so it is not evidence.
+    // is not evidence that THIS quote's overrun was paid.
     if (quote.over && fee_paid_mojos >= quote.fee) {
         last_unfunded_fee_      = fee_paid_mojos;
         last_unfunded_headroom_ = quote.headroom;
@@ -535,6 +560,23 @@ void FeeTracker::note_priority_spend(strategy::fee::ActionClass action,
                          strategy::fee::to_string(action), fee_paid_mojos, quote.headroom,
                          cfg_.daily_budget_mojos);
         }
+        return;
+    }
+    // [review #163 r8] AND THE CLEAR SIDE COMPARES AGAINST THE HEADROOM.  The
+    // header says the episode ends when an accepted priority spend FITS THE
+    // HEADROOM; this branch was the bare negation of the latch above and never
+    // looked at one, so an accepted spend at ANY fee strictly below its
+    // class's last quote ended the episode -- however far above the headroom it
+    // really was.  With the window empty and a 240,000,000-mojo CAT cancel
+    // quoted, a 239,000,000-mojo escalation read as "the budget funds priority
+    // spends again", and the next full-price cancel opened a second episode
+    // and a second alert for a condition nothing had resolved.
+    //
+    // A spend IN BETWEEN -- above the headroom, below the quote -- now does
+    // neither: it overran the window, so it is no all-clear, and it is not the
+    // quoted spend, so it is not this quote's overrun.  (0 mojos fits every
+    // headroom and does clear; the budget really did fund it.)
+    if (fee_paid_mojos > quote.headroom) {
         return;
     }
     if (budget_unfunded_) {

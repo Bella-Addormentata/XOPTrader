@@ -326,6 +326,24 @@ struct BudgetedFee {
     /// [review #163 r3] A PRIORITY fee the budget could not fund.  It is paid
     /// in full anyway and this says so, once, so the engine can alert.
     bool          over_budget{false};
+    /// [review #163 r8] What the BUDGET ITSELF granted this offer-attached fee:
+    /// (headroom - reserve) / batch, BEFORE the min_fee floor.  `fee` may be
+    /// above it, because min_fee is the operator's floor and overrides the
+    /// budget unconditionally.
+    ///
+    /// THIS IS THE FIELD AN EPISODE LATCH NEEDS, AND `bound` IS NOT.  `bound`
+    /// says the budget LOWERED the fee; it is false whenever `desired` is
+    /// already AT min_fee, because the floor then hands the whole fee back --
+    /// however empty the window is.  "The budget could not fund this fee" is
+    /// `allowance < desired`, which is strictly weaker and true in that state
+    /// too.  Reading `bound` as "the budget had room" is wrong exactly there,
+    /// and that is where the live configuration spends its time: an attached
+    /// fee is pinned at min_fee at every level at or below
+    /// log2(cancel_cat cost / offer_attached cost) = log2(42.3/21) = 1.010.
+    ///
+    /// 0 on the priority path, where the budget shapes nothing at all; read it
+    /// only when !is_priority(action).
+    std::uint64_t allowance{0};
 };
 
 /// The rolling budget, made explicit.  Without the controller an exhausted
@@ -352,11 +370,7 @@ struct BudgetedFee {
 ///     to REPORT (`over_budget`), which is an alertable condition, not a
 ///     reason to pay a fee that cannot work;
 ///   * an offer-attached fee may use only the headroom above `reserve` -- and
-///     only a 1/`batch` share of it.  The reserve is the budget set aside for
-///     the resting book's cancels: since those are now paid whatever the
-///     headroom, what it really buys is that the attached fees cannot spend
-///     the window down to the point where every cancel reports over budget.
-///     [review #163] Step 8 asks for ONE
+///     only a 1/`batch` share of it.  [review #163] Step 8 asks for ONE
 ///     attached fee per heartbeat and then attaches it to every tier it posts,
 ///     recording posted x fee afterwards, so a fee shaped for one offer let a
 ///     ladder of ten spend ten times the room above the reserve.  `batch` is
@@ -365,9 +379,38 @@ struct BudgetedFee {
 ///     fee is paid by a FILL that may never come and its own spend is the
 ///     taker's, so degrading it strands nothing: it stays the first and only
 ///     thing the budget squeezes;
+///
+///     [review #163 r8] WHAT THE RESERVE IS, AND WHAT IT IS NOT.  It shapes
+///     ONE QUOTE and nothing else: the budget's answer for this fee is
+///     `allowance` = (headroom - reserve) / batch, so attached fees begin
+///     degrading while `reserve` mojos of the window are still unspent instead
+///     of at the moment the window empties.  It is NOT a bound on what
+///     attached fees may spend, and this header must not say it is -- the
+///     round-3 revision of this very sentence claimed the reserve "buys that
+///     the attached fees cannot spend the window down to the point where every
+///     cancel reports over budget", and that claim is false three times over:
+///
+///       - `min_fee` overrides the allowance UNCONDITIONALLY (the two lines
+///         after `available` below), so every attached fee is at least
+///         min(desired, min_fee) however empty the window is;
+///       - with the controller on, FeeTracker::should_post_offer no longer
+///         refuses a tier on budget grounds, so nothing declines to post;
+///       - Step 8 books `posted x fee` at POST time (TODO S69), so posting
+///         raises the window total whatever the budget said.
+///
+///     A ladder of `batch` tiers therefore keeps pushing the window past
+///     daily_budget_mojos at up to `batch x min_fee` per heartbeat, after
+///     which budget_remaining() is 0 and every priority spend that is really
+///     paid reports over budget (FeeTracker::note_priority_spend).  The
+///     reserve delays that; only a big enough daily_budget_mojos prevents it,
+///     which is what the startup advisory (recommended_window_budget) is for;
 ///   * nothing is ever lowered below min_fee, the operator's own floor, and
 ///     nothing is ever 0: an exhausted budget degrades the attached fee to
-///     min_fee and says so (`bound`), it does not stop the bot.
+///     min_fee, it does not stop the bot.  [review #163 r8] It says so through
+///     `allowance`, NOT through `bound`: once `desired` has itself reached
+///     min_fee there is nothing left to lower and `bound` goes false while the
+///     budget is as empty as ever.  `allowance < desired` is the condition
+///     that survives the floor, and it is what FeeTracker's episode uses.
 ///
 /// `desired` is already clamped to [min_fee, max_fee] by the caller.
 [[nodiscard]] constexpr BudgetedFee apply_budget(std::uint64_t desired,
@@ -378,7 +421,7 @@ struct BudgetedFee {
                                                  std::uint64_t batch = 1U) noexcept
 {
     if (priority) {
-        return BudgetedFee{desired, false, desired > headroom};
+        return BudgetedFee{desired, false, desired > headroom, 0U};
     }
     const std::uint64_t above_reserve = headroom > reserve ? headroom - reserve : 0U;
     const std::uint64_t available     = above_reserve / (batch == 0U ? 1U : batch);
@@ -386,7 +429,7 @@ struct BudgetedFee {
     if (fee < min_fee) {
         fee = std::min(desired, min_fee);
     }
-    return BudgetedFee{fee, fee < desired, false};
+    return BudgetedFee{fee, fee < desired, false, available};
 }
 
 static_assert(apply_budget(200U, 1'000U, 900U, 10U, true).fee == 200U);
@@ -408,6 +451,20 @@ static_assert(apply_budget(200U, 1'000U, 900U, 1U, false, 4U).fee == 25U);
 static_assert(apply_budget(200U, 1'000U, 900U, 1U, false, 0U).fee == 100U);
 // A priority action is not shaped by the batch, nor by the reserve.
 static_assert(apply_budget(200U, 1'000U, 900U, 10U, true, 10U).fee == 200U);
+
+// -- [review #163 r8] `allowance`, and the state `bound` cannot see ----------
+// `desired` is already AT min_fee here, so the floor hands the whole fee back
+// and NOTHING WAS LOWERED -- with a budget that granted zero.  A latch that
+// reads `bound` as "the budget had room" is wrong in exactly this state, which
+// is the one the live configuration boots into.
+static_assert(apply_budget(10U, 0U, 0U, 10U, false).fee == 10U);
+static_assert(!apply_budget(10U, 0U, 0U, 10U, false).bound);
+static_assert(apply_budget(10U, 0U, 0U, 10U, false).allowance == 0U);
+// The allowance IS the room above the reserve, per offer of the batch ...
+static_assert(apply_budget(200U, 1'000U, 900U, 10U, false, 10U).allowance == 10U);
+static_assert(apply_budget(200U, 10'000U, 900U, 10U, false, 10U).allowance == 910U);
+// ... and 0 on the priority path, which the budget does not shape.
+static_assert(apply_budget(200U, 10'000U, 900U, 10U, true, 10U).allowance == 0U);
 
 // ---------------------------------------------------------------------------
 // Budget sizing -- ONE derivation for the code, the startup advisory and the
@@ -1221,9 +1278,19 @@ struct Reachability {
     std::uint32_t raises_to_span{0};
     /// kp = ki = kd = 0: the loop can never raise.  Probes still lower it.
     bool          cannot_raise{false};
-    /// Per class: max_fee / cost < 5 mojos per cost, so NO level can get that
-    /// class into a full mempool.  This is the live configuration's state for
-    /// cancel_cat and take (100M / 42.3M = 2.4).
+    /// Per class: max_fee is below what a full mempool needs for it, so NO
+    /// level can get that class in.  [review #163 r8] The predicate the loop
+    /// below really applies is `max_fee < ceil(kFullMempoolMinRate x ff_margin
+    /// x cost)` -- 5 x 1.10 = 5.5 mojos per cost at the shipped margin, NOT a
+    /// bare 5; the margin is the same one the feed-forward floor carries, and
+    /// max_fee_for_full_mempool is derived from it.
+    ///
+    /// On the live configuration (min 15,000,000, max 100,000,000) that is
+    /// THREE classes, not two: offer_attached needs 115,500,000, cancel_cat
+    /// 232,650,000 and take 687,500,000, all above 100,000,000.  Only
+    /// cancel_xch (46,200,000) clears.  Every operator document that named
+    /// "a CAT cancel or a take" was understating it, and offer_attached is
+    /// over the line at a bare 5.0 as well (105,000,000).
     bool          max_fee_below_full_mempool[kActionClassCount]{};
     /// The smallest max_fee_mojos that clears a full mempool for every
     /// class, ff_margin included.
