@@ -56,8 +56,10 @@ default to off, and with both off every fee is what v0.10.24 paid.
   the node will admit.** With the controller on, offer-attached fees may spend
   only what is above a reserve (`controller_budget_reserve_cancels`, 25 CAT
   cancels, capped at half the budget so it can never exceed the budget itself);
-  an exhausted budget degrades the attached fee to `min_fee_mojos` and sends one
-  `FeeBudgetBound` alert. It never returns 0, which made Step 8 skip cancelling
+  an exhausted budget pins the attached fee at `min_fee_mojos` and sends one
+  `FeeBudgetBound` alert — which fires when the budget **could not fund** that
+  fee, not only when it *lowered* one: at the pin the emitted fee is exactly
+  what was asked for. It never returns 0, which made Step 8 skip cancelling
   stale quotes as well as posting. Step 8 asks for one attached fee and attaches
   it to every tier it posts, so the room above the reserve is shared across the
   tiers it may post that heartbeat rather than granted to each. **The reserve
@@ -201,6 +203,39 @@ default to off, and with both off every fee is what v0.10.24 paid.
   reachable impact is negligible** — the narrowing needs a fee above 2^63 mojos
   (~9.2 million XCH) and `current_fee_mojos_` is clamped by
   `fees.max_fee_mojos`. This is guard erosion, not a live defect.
+- **Review round 9: four corrections, one of them a real signal defect.**
+  (1) **`sent_to` is per peer, not a timeline**, so reading only its last tuple
+  was wrong in both directions. Measured against this wallet's own `debug.log`
+  (8 files, 38,250 non-empty lists): **8,289 carry more than one peer**, so an
+  accepting peer followed by a fee-refusing one would have raised the fee on a
+  spend already in a mempool; and **341 lists carry a fee refusal that is not
+  last** and were dropped silently. The parser now scans the whole array — any
+  peer reporting SUCCESS or PENDING suppresses the row, an unreadable tuple
+  stops the row rather than being skipped over (it could be the acceptance),
+  and otherwise any fee refusal counts. The residual is stated rather than
+  glossed: `filter_ok_mempool_status` strips the SUCCESS/PENDING tuples on the
+  resend tick, so a spend resting in an accepting peer's mempool later looks
+  identical to a refused one — across all 38,250 live lists, **zero** ever
+  carried a SUCCESS, which is what that filter looks like from outside. No
+  reading of `sent_to` alone can separate those; what bounds it is the
+  controller's dead time and its three-raise uncorroborated streak limit.
+  (2) **The rolling fee window booked intent.** `cancel_fees_paid` re-derived
+  each cancel's fee from a fresh `cancel_fee_for()` policy lookup, so a cancel
+  that fell through to `emergency_cancel` and went out at a halved tier, at a
+  secure fee of 0, or as a local-only cancel that spends nothing was booked at
+  the full policy fee. `OfferManager` now carries the accepted fee out
+  (`take_cancel_fees_accepted()`), which also books accepted cancels from
+  routines that reached no booking site at all. Gated with the rest — the
+  legacy branch is byte-identical to `main`.
+  (3) **"Reported once" was not an invariant**: the refused-name set tests its
+  capacity *before* inserting and then clears wholesale, so the sweep that
+  trips 256 re-counts every refused row still visible in it, and names of
+  deleted transactions are never shed.
+  (4) **Class-aware cancel fees start at Step 8, which is after startup
+  reconciliation** — so the bulk sweep is not the only cancel that misses them;
+  every cancel the boot reconciliation issues pays the raw constructor fee,
+  including the `OrphanDisposition::Unknown` path that fires for any resting
+  offer on a disabled pair.
 - **Observability.** One `[FeeController] rate a -> b mojos/cost (reason; n
   move(s)) -- fees now: ...` line per burst of changes, and two gauges,
   `xop_fees_controller_rate_mojos_per_cost` and `xop_fees_controller_level_log2`.
@@ -233,7 +268,17 @@ default to off, and with both off every fee is what v0.10.24 paid.
   default), so the classes need 115,500,000, 232,650,000 and 687,500,000
   respectively; only the XCH cancel's 46,200,000 fits under 100,000,000. The
   startup log names each one. Before enabling the controller raise it to at
-  least 250,000,000, or 700,000,000 to cover takes, and raise
+  least 250,000,000, or 700,000,000 to cover takes **as the shipped cost model
+  prices them** — that figure is `5.5 × controller_cost_take` at the modelled
+  125,000,000, and the measured take cost reaches **212,112,758**, which needs
+  **1,166,620,169**. Raising the cap alone will not make the loop ask for that:
+  the fee is `rate × controller_cost_take`, so pricing the largest measured
+  take needs `controller_cost_take: 212112758` **and** `max_fee_mojos >=
+  1166620169`. Keeping the shipped 125,000,000 is defensible — it was chosen to
+  cover 7 of the 11 measured bundles rather than make the common take pay for
+  the rare one — but then the 4 large takes are under-priced in a full mempool
+  and the controller compensates by raising the *rate*, which raises every
+  other class too. Also raise
   `strategy.cancel_escalation_max_fee_mojos` with it.
 - **`daily_budget_mojos` is per `fee_window_blocks`, and 1662 peak heights is
   8.7 hours, not 24** (S69). At full-mempool prices one such window costs

@@ -134,8 +134,15 @@ enum class AlertRule : std::uint8_t {
                                // it; the engine itself sends at most one per
                                // 65 s and names every offer.
 
-    FeeBudgetBound       = 22, // [S67] The rolling fee budget lowered a fee
-                               // the controller asked for.  Sent once per
+    FeeBudgetBound       = 22, // [S67] The rolling fee budget COULD NOT FUND
+                               // an offer-attached fee.  [review #163 r9] Not
+                               // "lowered a fee": round 8 moved the condition
+                               // from `bound` (fee < desired) to
+                               // `allowance < desired`, and the first is a
+                               // strict subset of the second -- at the
+                               // min_fee pin the emitted fee is exactly what
+                               // was asked for and nothing is lowered, while
+                               // the budget granted zero.  Sent once per
                                // episode; its own rule so a busy WARNING
                                // cooldown cannot swallow the one message
                                // that says why spends may stop confirming.
@@ -149,11 +156,13 @@ enum class AlertRule : std::uint8_t {
                                // will admit never confirms, keeps its coins
                                // locked and ends in a wallet-wide
                                // force-delete.  Its own rule, not
-                               // FeeBudgetBound's, because that one says
-                               // "fees were lowered" and this one says "the
-                               // budget was exceeded on purpose" -- and
-                               // sharing a rule would let the 60 s cooldown
-                               // drop whichever arrived second.
+                               // FeeBudgetBound's, because that one says "the
+                               // budget could not fund an ATTACHED fee, which
+                               // min_fee_mojos then paid anyway" and this one
+                               // says "a PRIORITY spend was made over budget
+                               // on purpose" -- and sharing a rule would let
+                               // the 60 s cooldown drop whichever arrived
+                               // second.
 
     LedgerDivergence     = 16  // Books and wallet disagree beyond tolerance.
                                // Its own rule so accounting noise can never

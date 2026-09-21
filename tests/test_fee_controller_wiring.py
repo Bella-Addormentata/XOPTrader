@@ -110,6 +110,30 @@ def _function_body(text: str, signature: str) -> str:
     return text[start:end]
 
 
+
+def _inside_secure_block(body: str, index: int) -> bool:
+    """True when `index` lies inside the `if (secure)` block of `body`.
+
+    Counts braces from that block's opening `{`; the depth must never return
+    to 0 before `index`.  Robust to how the block is nested or reformatted,
+    which a literal match is not.
+    """
+    guard = body.find("if (secure)")
+    if guard == -1 or guard > index:
+        return False
+    open_brace = body.find("{", guard)
+    if open_brace == -1 or open_brace > index:
+        return False
+    depth = 0
+    for i in range(open_brace, index):
+        if body[i] == "{":
+            depth += 1
+        elif body[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return False
+    return depth > 0
+
 def _engine() -> str:
     return _strip_line_comments(_read(ENGINE))
 
@@ -349,7 +373,7 @@ def test_prune_site_reads_the_sent_to_refusals_it_already_holds():
     assert prune < taken < hook and hook - prune < 900
     om = _strip_line_comments(_read(OFFER_MANAGER))
     pruner = _function_body(om, "asio::awaitable<int> OfferManager::prune_stuck_transactions(")
-    assert "execution::latest_sent_to_is_fee_rejection(tx)" in pruner
+    assert "execution::sent_to_reports_fee_rejection(tx)" in pruner
     # No RPC was added to read it: still exactly one get_transactions call and
     # one wallet-wide delete in the pruner.
     assert len(re.findall(r"wallet_->get_transactions\(", pruner)) == 1
@@ -522,7 +546,7 @@ def test_every_glue_function_is_inert_with_the_controller_off():
     # the window.
     paid = _function_body(engine, "std::uint64_t Engine::cancel_fees_paid(")
     assert "!fee_tracker_->class_fees_active()" in paid
-    legacy = paid[paid.index("class_fees_active"):paid.index("std::uint64_t total")]
+    legacy = paid[paid.index("class_fees_active"):paid.index("return accepted")]
     assert "static_cast<std::uint64_t>(ids.size())" in legacy
     assert "* legacy_fee" in legacy
     assert "cancel_fee_for" not in legacy, "the legacy branch must not price per class"
@@ -548,8 +572,12 @@ def test_cancel_tickets_open_at_the_accepted_rpc_with_the_fee_really_paid():
     # Exactly ONE call.  A second one ahead of the RPC would ticket a cancel the
     # wallet then refuses (a mutation that added one survived the check above).
     assert len(re.findall(r"cancel_observer_\s*\(", charged)) == 1
-    assert re.search(r"if\s*\(secure\s*&&\s*cancel_observer_\)\s*\{\s*cancel_observer_\(trade_id, fee\);",
-                     charged), "a local-only cancel spends nothing on chain: no ticket"
+    # [review #163 r9] This used to pin the literal `if (secure && cancel_observer_)`.
+    # The accepted-fee accumulator now shares that secure-only block, so the
+    # nesting changed while the PROPERTY did not: pin the property by brace
+    # depth instead of the spelling.
+    assert _inside_secure_block(charged, seen), (
+        "a local-only cancel spends nothing on chain: no ticket")
     # ... and every per-offer cancel in OfferManager goes through that choke point.
     assert len(re.findall(r"wallet_->cancel_offer\(", om)) == 1
 
@@ -901,3 +929,57 @@ def test_every_uint64_to_mojo_fee_conversion_is_accounted_for():
         "SATURATION_CENSUS on purpose -- do not delete this assertion."
         % (actual, SATURATION_CENSUS))
     assert sum(SATURATION_CENSUS.values()) == 15
+
+
+# ---------------------------------------------------------------------------
+# [review #163 r9] THE ROLLING WINDOW BOOKS WHAT WAS ACCEPTED
+#
+# Scan-pinned rather than gtest-pinned for the usual reason: nothing in
+# cpp/tests constructs an OfferManager or an Engine.  The DECISION here is
+# trivial (add the fee the wallet took); the thing that can rot is the WIRING,
+# which is exactly what a source scan is for.
+# ---------------------------------------------------------------------------
+
+def test_the_rolling_window_books_the_accepted_cancel_fee_not_a_policy_lookup():
+    """`Engine::cancel_fees_paid` used to re-derive each cancel's fee with a
+    fresh `cancel_fee_for()` lookup.  `selective_cancel` pushes an offer id
+    into its cancelled list whether the cancel went out at that fee or fell
+    through to `emergency_cancel`, which can succeed at a halved tier down to
+    1 mojo, at a secure fee of 0, or as a local-only cancel that spends nothing
+    on chain -- so every one of those was booked at the full policy fee."""
+    paid = _function_body(
+        _engine(), "std::uint64_t Engine::cancel_fees_paid(")
+    assert "offer_mgr_->take_cancel_fees_accepted()" in paid, (
+        "the window must book what the wallet ACCEPTED, carried out of the "
+        "cancel routine -- not a fresh policy quote (memory: "
+        "taker-fills-booked-at-submit)")
+    assert "cancel_fee_for(" not in paid, (
+        "cancel_fee_for() is a POLICY lookup; using it here books intent")
+    # Drained on BOTH paths, or the legacy branch lets the accumulator grow
+    # while the controller is off and hands a stale total to the first
+    # heartbeat after someone enables it.
+    assert paid.index("take_cancel_fees_accepted") < paid.index("class_fees_active"), (
+        "drain before the legacy early-return, not after it")
+    # ... and the legacy product itself is untouched, so nothing moves with
+    # both flags off.
+    assert "n * legacy_fee" in paid
+
+
+def test_only_an_accepted_secure_cancel_adds_to_the_accepted_fee_total():
+    """A local-only (insecure) cancel commits nothing on chain, so it must not
+    be booked; and the accumulation has to sit AFTER the wallet call, which is
+    what makes it "accepted" rather than "attempted" -- a refusal throws."""
+    om = _strip_line_comments(_read(OFFER_MANAGER))
+    charged = _function_body(
+        om, "asio::awaitable<json> OfferManager::cancel_offer_charged(")
+    assert "cancel_fees_accepted_" in charged, (
+        "the accepted fee is carried out from here, beside the ticket hook")
+    assert charged.index("wallet_->cancel_offer(") < charged.index("cancel_fees_accepted_"), (
+        "accumulate AFTER the wallet accepted it -- a refusal throws past this")
+    guard = charged.index("if (secure)")
+    assert guard < charged.index("cancel_fees_accepted_"), (
+        "an insecure local-only cancel spends nothing and must not be booked")
+    # One drain point, one accumulation point.
+    taker = _function_body(
+        om, "std::uint64_t OfferManager::take_cancel_fees_accepted()")
+    assert "cancel_fees_accepted_ = 0;" in taker

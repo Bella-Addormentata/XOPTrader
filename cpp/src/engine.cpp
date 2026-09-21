@@ -21307,6 +21307,14 @@ bool Engine::wallet_step_may_run(std::string_view step)
 std::uint64_t Engine::cancel_fees_paid(const std::vector<std::string>& ids,
                                        std::uint64_t                   legacy_fee) const
 {
+    // [review #163 r9] DRAIN FIRST, ON BOTH PATHS.  The accumulator is fed by
+    // every accepted secure cancel whatever the flags say, so the legacy
+    // branch has to empty it too or it would only ever grow (saturating) while
+    // the controller is off -- and then hand a stale total to the first
+    // heartbeat after someone enables it.
+    const std::uint64_t accepted =
+        offer_mgr_ ? offer_mgr_->take_cancel_fees_accepted() : std::uint64_t{0};
+
     if (!fee_tracker_ || !fee_tracker_->class_fees_active() || !offer_mgr_) {
         // The pre-S67 accounting: one fee for every cancel.  [review #163 r6]
         // The PRODUCT now saturates the same way the class-aware sum below
@@ -21318,14 +21326,25 @@ std::uint64_t Engine::cancel_fees_paid(const std::vector<std::string>& ids,
         }
         return n * legacy_fee;
     }
-    std::uint64_t total = 0;
-    for (const auto& id : ids) {
-        const std::uint64_t fee = offer_mgr_->cancel_fee_for(id);
-        total = (fee > std::numeric_limits<std::uint64_t>::max() - total)
-                    ? std::numeric_limits<std::uint64_t>::max()
-                    : total + fee;
-    }
-    return total;
+    // [review #163 r9] WHAT WAS ACCEPTED, NOT WHAT POLICY WOULD QUOTE NOW.
+    // This used to sum offer_mgr_->cancel_fee_for(id) over the ids, which is a
+    // FRESH POLICY LOOKUP and books INTENT: selective_cancel pushes an id into
+    // its cancelled list whether the cancel went out at cancel_fee_for() or
+    // fell through to emergency_cancel, and that path can succeed at a halved
+    // or quartered tier down to 1 mojo, at a secure fee of 0, or as a
+    // local-only cancel that spends nothing on chain -- every one of them
+    // booked at the full policy fee.  OfferManager now carries the accepted
+    // fee out of the cancel routine instead (memory:
+    // taker-fills-booked-at-submit -- the third instance of that family found
+    // on this PR).  `ids` is deliberately unused here: the accumulator counts
+    // what the wallet took, which is the thing the rolling window is for.
+    //
+    // It also picks up accepted cancels from routines that reached no booking
+    // site at all before (cancel_stale, the #157 escalation).  That makes the
+    // window MORE complete, not less, and it is gated with the rest: the
+    // legacy branch above is byte-identical to main, so nothing changes with
+    // both flags off.  `ids` is still read by that branch.
+    return accepted;
 }
 
 void Engine::fee_feedback_note(const strategy::fee::Change& change, BlockHeight block)

@@ -376,10 +376,18 @@ struct BudgetedFee {
 ///     wallet's `batch_fee`, and `current_fee_mojos_` is what
 ///     Engine::set_dynamic_fee last wrote: the budget-shaped OFFER-ATTACHED
 ///     fee, which apply_budget may have degraded to min_fee_mojos.  The
-///     per-offer path is fine -- OfferManager::cancel_fee_for reads the
-///     class-aware cancel fees, which come from the priority branch above --
-///     so "a cancel is never degraded" holds for every cancel EXCEPT the bulk
-///     one.  Confirmed at cbf0301, NOT fixed here: it is a behaviour change to
+///     per-offer path is fine ONCE STEP 8 HAS RUN -- OfferManager::cancel_fee_for
+///     reads the class-aware cancel fees, which come from the priority branch
+///     above.  [review #163 r9] There is a SECOND exception, and the r8 text
+///     said "every cancel EXCEPT the bulk one", which was one short: Step 8 is
+///     also where set_cancel_fees and set_dynamic_fee are called, and it first
+///     runs AFTER startup_reconcile, so every cancel the boot reconciliation
+///     issues -- including the OrphanDisposition::Unknown path, which fires for
+///     any resting offer on a pair the operator has disabled -- pays the raw
+///     constructor fee.  Nor is there a node floor to miss at that point:
+///     update_feed_forward is reached from run_startup_analysis, later still,
+///     so ff_known_ is false for the whole boot window.
+///     Confirmed at cbf0301, NOT fixed here: it is a behaviour change to
 ///     the stop/shutdown sweep and wants its own review.  See TODO S67;
 ///     the shape is to pass max(cancel_fee_xch_mojos_, cancel_fee_cat_mojos_)
 ///     while cancel_fees_active_, the same "an unclassifiable offer errs

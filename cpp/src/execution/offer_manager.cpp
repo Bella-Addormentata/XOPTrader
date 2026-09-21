@@ -2077,6 +2077,13 @@ std::uint32_t OfferManager::take_fee_rejections_seen() noexcept
     return seen;
 }
 
+std::uint64_t OfferManager::take_cancel_fees_accepted() noexcept
+{
+    const std::uint64_t paid = cancel_fees_accepted_;
+    cancel_fees_accepted_ = 0;
+    return paid;
+}
+
 // ---------------------------------------------------------------------------
 // invalidate_wallet_ids -- force the wallet-ID cache to be rebuilt
 // ---------------------------------------------------------------------------
@@ -3516,11 +3523,15 @@ asio::awaitable<int> OfferManager::prune_stuck_transactions(
                 if (row_class == StuckRowClass::Confirmed) {
                     continue;
                 }
-                // [S67] The wallet's own word that a fee is too low: the row's
-                // latest sent_to entry is a fee refusal.  Already in hand -- no
-                // RPC is added -- and counted once per transaction name.  It
-                // changes nothing this function decides.
-                if (execution::latest_sent_to_is_fee_rejection(tx)) {
+                // [S67] The wallet's own word that a fee is too low: some peer
+                // refused this row on the fee and none accepted it.  Already
+                // in hand -- no RPC is added -- and counted once per
+                // transaction name until the set is cleared (see
+                // kMaxReportedFeeRejections; "once" is a normal case, not an
+                // invariant).  It changes nothing this function decides.
+                // [review #163 r9] The whole sent_to array is read, not its
+                // last entry: the array is per PEER, not a timeline.
+                if (execution::sent_to_reports_fee_rejection(tx)) {
                     const std::string tx_key = (tx.contains("name") && tx["name"].is_string())
                         ? tx["name"].get<std::string>() : std::string{};
                     if (fee_rejections_reported_.size() >= execution::kMaxReportedFeeRejections) {
@@ -3742,8 +3753,22 @@ asio::awaitable<json> OfferManager::cancel_offer_charged(
     // [review #163] The wallet ACCEPTED it (a refusal throws past this line).
     // Tell the fee controller what was really paid, now -- see
     // set_cancel_observer.  A local-only cancel spends nothing on chain.
-    if (secure && cancel_observer_) {
-        cancel_observer_(trade_id, fee);
+    if (secure) {
+        // [review #163 r9] THE SAME LINE IS ALSO THE ONLY HONEST INPUT TO THE
+        // ROLLING FEE WINDOW.  Engine::cancel_fees_paid used to re-derive each
+        // cancel's fee from cancel_fee_for(), a FRESH POLICY LOOKUP -- so a
+        // cancel that fell through to emergency_cancel and went out at a
+        // halved tier, at a secure fee of 0, or as a local-only cancel that
+        // spends nothing was still booked at the full policy fee.  This
+        // accumulates what the wallet ACCEPTED instead; an insecure cancel
+        // contributes nothing because it commits nothing on chain.
+        cancel_fees_accepted_ = (fee > std::numeric_limits<std::uint64_t>::max()
+                                           - cancel_fees_accepted_)
+                                    ? std::numeric_limits<std::uint64_t>::max()
+                                    : cancel_fees_accepted_ + fee;
+        if (cancel_observer_) {
+            cancel_observer_(trade_id, fee);
+        }
     }
     co_return reply;
 }

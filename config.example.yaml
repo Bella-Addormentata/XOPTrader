@@ -933,6 +933,19 @@ fees:
   #     cover takes as well.  (The test is max_fee_mojos < 5 x
   #     controller_ff_margin x cost, i.e. 5.5 mojos/cost at the default margin,
   #     not a bare 5 -- the same margin the feed-forward floor carries.)
+  #     CAREFUL WITH THE 700000000 (corrected 2026-09-21).  It covers the
+  #     MODELLED take, 5.5 x controller_cost_take 125000000 = 687500000, and
+  #     nothing more.  The measured take cost RANGE is 92618934-212112758
+  #     (above), and 125000000 was chosen to cover 7 of those 11 bundles, so a
+  #     large multi-coin take is under-modelled and the loop will not even ASK
+  #     for enough -- raising the cap alone cannot fix that, because the fee is
+  #     rate x controller_cost_take.  To price the largest measured take you
+  #     need BOTH: controller_cost_take: 212112758 AND max_fee_mojos >=
+  #     1166620169 (= 5.5 x 212112758) to let the answer through.  Keeping the
+  #     shipped 125000000 model is a defensible choice -- it stops the 7 common
+  #     takes overpaying for the 4 rare ones -- but then the 4 rare ones are
+  #     under-priced in a full mempool, and the controller answers that by
+  #     raising the RATE, which raises every other class with it.
   #   * daily_budget_mojos is spent over fee_window_blocks, NOT over a day, and
   #     FeeTracker::record_fee books an attached fee for every offer POSTED.  At
   #     the measured rate of this wallet (2026-09-20: 152 offers, 134 cancels

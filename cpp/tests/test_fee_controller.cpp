@@ -1546,31 +1546,66 @@ TEST(FeeTicket, OnlyAWalletVerifiedCancelledIsAConfirmation)
     EXPECT_DOUBLE_EQ(c.level(), 3.0);
 }
 
-TEST(FeeFeedback, SentToIsReadFromItsLatestEntryOnly)
+TEST(FeeFeedback, SentToIsPerPeerSoEveryTupleIsRead)
 {
     using nlohmann::json;
+    using xop::execution::sent_to_reports_fee_rejection;
     const auto row = [](json sent_to) { return json{{"confirmed", false}, {"sent_to", std::move(sent_to)}}; };
     // Verbatim shape from the live wallet log, 2026-09-20.
-    EXPECT_TRUE(xop::execution::latest_sent_to_is_fee_rejection(
+    EXPECT_TRUE(sent_to_reports_fee_rejection(
         row(json::array({json::array({"ec9e", 3, "INVALID_FEE_TOO_CLOSE_TO_ZERO"})}))));
-    EXPECT_TRUE(xop::execution::latest_sent_to_is_fee_rejection(
+    EXPECT_TRUE(sent_to_reports_fee_rejection(
         row(json::array({json::array({"ec9e", 3, "INVALID_FEE_LOW_FEE"})}))));
-    // Refused, then accepted: it is in the mempool now.
-    EXPECT_FALSE(xop::execution::latest_sent_to_is_fee_rejection(
+
+    // [review #163 r9] THE TWO CASES back() GOT WRONG, both measured in this
+    // wallet's own debug.log: 8,289 of 38,250 non-empty lists carry more than
+    // one peer, and 341 carry a fee refusal that is not the last tuple.
+    //
+    // (a) A refusal followed by ANOTHER PEER'S unrelated failure is still a
+    //     fee refusal.  back() dropped these 341 silently.
+    EXPECT_TRUE(sent_to_reports_fee_rejection(row(json::array({
+        json::array({"peerA", 3, "INVALID_FEE_TOO_CLOSE_TO_ZERO"}),
+        json::array({"peerB", 3, "DOUBLE_SPEND"})}))));
+    // (b) An ACCEPTING peer anywhere in the list suppresses the row, wherever
+    //     it sits.  back() read the second of these as a refusal and would
+    //     have raised the fee on a spend already in a mempool.
+    EXPECT_FALSE(sent_to_reports_fee_rejection(row(json::array({
+        json::array({"peerA", 1, nullptr}),
+        json::array({"peerB", 3, "INVALID_FEE_LOW_FEE"})}))));
+    EXPECT_FALSE(sent_to_reports_fee_rejection(row(json::array({
+        json::array({"peerA", 2, nullptr}),
+        json::array({"peerB", 3, "INVALID_FEE_TOO_CLOSE_TO_ZERO"})}))));
+    // Refused, then accepted: still in the mempool, still not evidence.
+    EXPECT_FALSE(sent_to_reports_fee_rejection(
         row(json::array({json::array({"a", 3, "INVALID_FEE_LOW_FEE"}), json::array({"a", 1, nullptr})}))));
+
+    // An UNREADABLE tuple stops the whole row, because it might have been the
+    // SUCCESS that would have suppressed it -- skipping over it would let a
+    // malformed tuple hide an acceptance.
+    EXPECT_FALSE(sent_to_reports_fee_rejection(row(json::array({
+        json::array({"peerA", 3, "INVALID_FEE_LOW_FEE"}),
+        json::array({"peerB", "3", "DOUBLE_SPEND"})}))));
+    EXPECT_FALSE(sent_to_reports_fee_rejection(row(json::array({
+        json::array({"peerA", 3, "INVALID_FEE_LOW_FEE"}),
+        json::array({"peerB", 3})}))));
+
+    // A FAILED tuple with no readable error neither counts nor suppresses.
+    EXPECT_TRUE(sent_to_reports_fee_rejection(row(json::array({
+        json::array({"peerA", 3, nullptr}),
+        json::array({"peerB", 3, "INVALID_FEE_LOW_FEE"})}))));
     // Some other failure is not a fee signal.
-    EXPECT_FALSE(xop::execution::latest_sent_to_is_fee_rejection(
+    EXPECT_FALSE(sent_to_reports_fee_rejection(
         row(json::array({json::array({"a", 3, "MEMPOOL_CONFLICT"})}))));
     // A fee error name on a row that did not FAIL is not one either.
-    EXPECT_FALSE(xop::execution::latest_sent_to_is_fee_rejection(
+    EXPECT_FALSE(sent_to_reports_fee_rejection(
         row(json::array({json::array({"a", 2, "INVALID_FEE_LOW_FEE"})}))));
     // Unreadable is not evidence.
-    EXPECT_FALSE(xop::execution::latest_sent_to_is_fee_rejection(row(json::array())));
-    EXPECT_FALSE(xop::execution::latest_sent_to_is_fee_rejection(json{{"confirmed", false}}));
-    EXPECT_FALSE(xop::execution::latest_sent_to_is_fee_rejection(row(json::array({json::array({"a", 3})}))));
-    EXPECT_FALSE(xop::execution::latest_sent_to_is_fee_rejection(row(json::array({json::array({"a", "3", "INVALID_FEE_LOW_FEE"})}))));
-    EXPECT_FALSE(xop::execution::latest_sent_to_is_fee_rejection(row("nope")));
-    EXPECT_FALSE(xop::execution::latest_sent_to_is_fee_rejection(json::array()));
+    EXPECT_FALSE(sent_to_reports_fee_rejection(row(json::array())));
+    EXPECT_FALSE(sent_to_reports_fee_rejection(json{{"confirmed", false}}));
+    EXPECT_FALSE(sent_to_reports_fee_rejection(row(json::array({json::array({"a", 3})}))));
+    EXPECT_FALSE(sent_to_reports_fee_rejection(row(json::array({json::array({"a", "3", "INVALID_FEE_LOW_FEE"})}))));
+    EXPECT_FALSE(sent_to_reports_fee_rejection(row("nope")));
+    EXPECT_FALSE(sent_to_reports_fee_rejection(json::array()));
 }
 
 TEST(FeeCancelClass, FollowsTheOfferedAssetAndIsInertWithoutTheOverride)

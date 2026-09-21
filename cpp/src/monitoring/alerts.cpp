@@ -113,7 +113,9 @@ AlertTier tier_for_rule(AlertRule rule) noexcept
         // [RELOAD] A reload outcome is operator feedback on an action they
         // just took -- important, never capital-critical by itself.
         case AlertRule::ConfigReload:
-        // [S67] Fees are degrading, not stopping: it wants attention, not a
+        // [S67] The budget cannot fund offer-attached fees, so min_fee_mojos
+        // pays them: [review #163 r9] the fee is pinned at the floor rather
+        // than necessarily "degraded", and nothing stops.  Attention, not a
         // page.
         case AlertRule::FeeBudgetBound:
         // [review #163] The budget was exceeded on purpose so a cancel could
