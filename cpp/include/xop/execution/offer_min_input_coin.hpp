@@ -88,7 +88,7 @@
 // smallest of those, 13,314,209,440.
 //
 // THE MARGIN IS NOT ONE NUMBER, AND THE SCOPE IS BOTH CAT PAIRS
-// [review #162, round 7 -- CORRECTING THIS COMMENT].  An earlier revision
+// [review #162, round 5 -- CORRECTING THIS COMMENT].  An earlier revision
 // said "every floor this bot can emit" is more than five orders of magnitude
 // under the smallest XCH coin.  That is an absolute, and it is false at the
 // top of the fraction's range: the largest floor is bounded by the CAT mojos
@@ -137,7 +137,7 @@
 // (57,382 characters, about 459 per input) and refused everything from 60,612
 // characters up, which puts the limit between 125 and about 132.
 //
-// IT BOUNDS THE CAT LEG ONLY, NOT THE OFFER [review #162, round 6 -- this
+// IT BOUNDS THE CAT LEG ONLY, NOT THE OFFER [review #162, round 5 -- this
 // comment said "plus one fee coin", which is not a bound].  The XCH fee coin
 // of a CAT-funded offer is chosen by CATWallet::create_tandem_xch_tx in a
 // SEPARATE selection, and the floor is CAT-scaled, so in XCH mojos it is
@@ -154,7 +154,7 @@
 // one.  For a FLOORED create at 0.01 to reach Dexie's limit at all, the fee
 // leg would have to contribute 26 or more coins.
 //
-// THE INPUT COUNT IS NOT MONOTONE IN frac [review #162, round 7].  Raising
+// THE INPUT COUNT IS NOT MONOTONE IN frac [review #162, round 5].  Raising
 // frac raises the floor, so it tightens ceil(1 / frac) -- but only while the
 // coins at or above the floor still cover the amount.  Feasibility is
 // monotone DECREASING in frac (the filtered set only shrinks), so above some

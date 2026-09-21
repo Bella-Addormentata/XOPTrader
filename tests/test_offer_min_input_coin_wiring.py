@@ -231,7 +231,7 @@ def test_both_dexie_rejection_shapes_are_checked_for_too_many_inputs():
     assert "(chiawalletcoinscombine)" in note, (
         "the warning no longer names the one remedy that removes the cause"
     )
-    # [review #162, round 7] THE DIRECTION, CORRECTED.  The input count is not
+    # [review #162, round 5] THE DIRECTION, CORRECTED.  The input count is not
     # monotone in the fraction: raising it raises the floor, and once the coins
     # at or above the floor cannot cover the amount the wallet refuses and
     # create_offer_with_min_coin_fallback re-sends the create with NO floor, so
@@ -254,7 +254,7 @@ def test_both_dexie_rejection_shapes_are_checked_for_too_many_inputs():
         "small reduction, and not below about 1/124 where the CAT-leg bound "
         "alone reaches the 125 inputs Dexie accepts"
     )
-    # [review #162, round 6] The bound is on the CAT leg, not on the offer:
+    # [review #162, round 5] The bound is on the CAT leg, not on the offer:
     # the XCH fee coin is a separate selection this CAT-scaled floor does not
     # constrain.  The warning must not promise a whole-offer bound.
     assert "CATLEG" in note and "XCHFEELEG" in note, (

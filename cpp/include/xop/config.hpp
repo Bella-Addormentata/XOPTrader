@@ -416,7 +416,7 @@ struct StrategyConfig {
     /// suffice: 100 at the default, against a measured Dexie limit between
     /// 125 and about 132.
     ///
-    /// THAT BOUNDS THE CAT LEG, NOT THE OFFER [review #162, round 6].  The
+    /// THAT BOUNDS THE CAT LEG, NOT THE OFFER [review #162, round 5].  The
     /// XCH fee coin is chosen in a separate selection that this CAT-scaled
     /// value does not constrain, so the fee leg's coin count is not bounded
     /// here -- it is one coin only while every XCH coin covers the fee,
@@ -424,7 +424,7 @@ struct StrategyConfig {
     /// measurement, not a guarantee.
     ///
     /// THE INPUT COUNT IS NOT MONOTONE IN THIS FRACTION [review #162,
-    /// round 7 -- CORRECTING THIS COMMENT].  An earlier revision said
+    /// round 5 -- CORRECTING THIS COMMENT].  An earlier revision said
     /// "RAISING it tightens the bound", which is true only while the coins
     /// at or above the floor can still cover the amount.  Past that point
     /// the wallet refuses and the fallback below re-sends the create with

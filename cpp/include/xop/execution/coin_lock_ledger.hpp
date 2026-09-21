@@ -65,7 +65,7 @@
 // spendable 30 then 42, its smallest 20,757,615,448 then 13,314,209,440.
 // The largest floor this bot can emit is bounded by the CAT mojos ONE offer
 // can spend, so it SCALES WITH THE FRACTION and is not a single number
-// [review #162, round 7 -- correcting an absolute this comment made].  Over
+// [review #162, round 5 -- correcting an absolute this comment made].  Over
 // both CAT-funded pairs the live config enables, DBX (1,844,501 mojos)
 // binds: 18,446 at the shipped 0.01, 1,844,501 at a fraction just under 1,
 // against BYC's 889 and 88,845.  So the margin is 721,794x (5.86 orders) at
