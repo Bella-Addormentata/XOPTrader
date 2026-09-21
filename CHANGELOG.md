@@ -58,9 +58,12 @@ existed in the wallet and locked its coins, listed nowhere. `engine.log` holds
   (1,844,501 DBX mojos that day, so 18,446 at the shipped 0.01 and 1,844,501
   even at a fraction near 1) — more than five orders of magnitude below the
   smallest XCH coin, so nothing is filtered out and no selection changes. This
-  is a property of **today's coin set, which moves**: the smallest spendable
-  coin fell by 30,000,000 mojos in fee spends between 2026-09-20 and
-  2026-09-21. `fees.min_fee_mojos` does not govern it in either direction.
+  is a property of **today's coin set, which moves**: the same coin was
+  recorded at 20,787,615,448 mojos in the 2026-09-20 snapshot and at
+  20,757,615,448 on 2026-09-21 — exactly 30,000,000 lower, which is what two
+  15,000,000-mojo fee spends would do (that attribution is an inference; the
+  two measurements are not). `fees.min_fee_mojos` does not govern reachability
+  in either direction.
 - **The fraction is applied in parts per billion, rounded up.** Rounded to
   nearest, the applied fraction could fall below the configured one and the
   input bound failed for ordinary values: at 1/3, three floor-sized coins of a

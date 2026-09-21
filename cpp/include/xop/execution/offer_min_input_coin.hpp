@@ -86,9 +86,12 @@
 // so nothing is filtered out and no selection changes.
 //
 // STATE, NOT POLICY.  That is a property of today's coin set and it moves:
-// the smallest spendable coin fell by exactly 30,000,000 mojos (fee spends)
-// between 2026-09-20 and 2026-09-21, and any spend leaving small change can
-// put a coin under a floor.  fees.min_fee_mojos does NOT govern it --
+// the same smallest spendable coin read 20,787,615,448 mojos in the
+// 2026-09-20 snapshot and 20,757,615,448 on 2026-09-21, exactly 30,000,000
+// lower -- what two 15,000,000-mojo fee spends would do, though only the two
+// readings are measured and the attribution is an inference.  Any spend
+// leaving small change can put a coin under a floor.  fees.min_fee_mojos
+// does NOT govern reachability --
 // lowering the live 15,000,000 back to 5,000 would not by itself make the
 // interaction reachable, and raising it would not prevent it.  The floor is
 // modelled in the ledger for exactly that reason: a coin set is not a knob
