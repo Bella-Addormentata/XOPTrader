@@ -1,7 +1,11 @@
 #ifndef XOP_EXECUTION_OFFER_MIN_INPUT_COIN_HPP
 #define XOP_EXECUTION_OFFER_MIN_INPUT_COIN_HPP
 // ---------------------------------------------------------------------------
-// offer_min_input_coin.hpp -- keep reward dust out of the offers we create.
+// offer_min_input_coin.hpp -- keep reward dust out of the offers we create,
+// on the FIRST create for each offer.  Not a guarantee about every offer:
+// THE FALLBACK below re-sends the create with no floor at all after the
+// wallet refuses the floored one, and the offer that retry builds is as
+// exposed to dust as it was before this file existed.
 //
 // [MIN-INPUT-COIN 2026-09-19] Dexie pays liquidity rewards as one tiny coin
 // per rewarded offer, so a CAT wallet that earns them fills with dust.  On

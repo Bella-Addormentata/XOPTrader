@@ -5,7 +5,7 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — offers are no longer funded from reward dust
+## [Unreleased] — less reward dust in new offers, except on the no-floor retry
 
 Dexie pays liquidity rewards as one tiny coin per rewarded offer. On 2026-09-19
 the DBX wallet held 4,575 unspent coins, 4,389 of them under 0.1 DBX and worth
@@ -14,6 +14,15 @@ favours dust, so an XCH/DBX bid paying 80.334 DBX became a 62,228-character
 offer that Dexie refused with HTTP 400 "Too many input coins". The offer still
 existed in the wallet and locked its coins, listed nowhere. `engine.log` holds
 13 such refusals between 2026-09-10 and 2026-09-19.
+
+What the floor below does, stated plainly: the **first** create for each offer
+asks the wallet for coins of at least 1% of the amount, which bounds that
+offer at 100 inputs plus a fee coin — about 46,000 characters at the 459 per
+input measured here, against refusals that began at 60,612. Those 13 HTTP 400s
+become a create the wallet either satisfies or refuses up front, before any
+offer exists. What the floor does **not** do is guarantee the outcome: a
+refused create is re-sent once without the floor, and the offer that retry
+builds is as exposed to dust as it was before this change.
 
 - **A floor on the coins an offer is funded from.** The **first**
   `create_offer_for_ids` attempt for a CAT-funded offer now carries
