@@ -356,7 +356,10 @@ TEST(WalletRequests, ReverseTrueIsWhatBuriedTheUnconfirmedRows) {
 }
 
 // ---------------------------------------------------------------------------
-// [S70 2026-09-20] get_timestamp_for_height -- the wallet's chain clock.
+// [S70 2026-09-20] get_timestamp_for_height -- a connected peer's chain clock.
+// ([review #164] NOT the wallet's own: it forwards to whichever full-node peer
+// answers first, unanchored and unvalidated, which is why the census below
+// exists.)
 //
 // The expired-offer retire frees an offer's coins with an INSECURE cancel on
 // the strength of this one number, so both directions are pinned: the key the

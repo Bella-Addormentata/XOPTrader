@@ -461,8 +461,9 @@ inline constexpr std::int64_t kExpiredRetireDepthBlocks = 32;
 
 /// A cheap PRE-FILTER on the host clock, so a heartbeat with nothing near its
 /// expiry asks the wallet nothing.  It only ever decides to LOOK: a fast host
-/// clock costs two read-only RPCs, a slow one delays a retire that is already
-/// harmless.  The retire itself is decided by expired_at_depth alone.
+/// clock costs four read-only RPCs (the peer census, the height, the clock,
+/// the census again), a slow one delays a retire that is already harmless.
+/// The retire itself is decided by expired_at_depth behind chain_clock_trust.
 [[nodiscard]] constexpr bool expiry_worth_checking(
     std::uint64_t max_time,
     std::int64_t  host_now_s) noexcept
