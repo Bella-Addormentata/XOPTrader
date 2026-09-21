@@ -11837,7 +11837,20 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             for (const auto& po : state_->get_all_offers()) {
                 const PairConfig* claim_pc = find_pair_config(po.pair_name);
                 if (!claim_pc) {
-                    continue;   // an adopted "UNKNOWN" offer has no legs to read
+                    // [review #164] An adopted "UNKNOWN" offer has no legs to
+                    // read, and neither has one on a pair since REMOVED from
+                    // the file (a pair merely DISABLED is still in
+                    // pair_config_map_, which is built from config_.pairs
+                    // with no enabled filter, so it still projects normally).
+                    // Dropping the claim told the wallet-wide projection its
+                    // spend was ZERO while `owned` still counted the coins it
+                    // locks: a fail-open.  Record it as unquantifiable and
+                    // let decide_exposure refuse to add exposure instead.
+                    execution::RestingSpend unknown;
+                    unknown.pair_unmapped  = true;
+                    unknown.cancel_pending = po.cancel_pending;
+                    claims.push_back(std::move(unknown));
+                    continue;
                 }
                 execution::RestingSpend claim;
                 claim.cancel_pending = po.cancel_pending;
@@ -12352,9 +12365,14 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                             return plan;
                         }
                         plan.evaluated = true;
+                        // Legacy leaves this empty, so the claim-derived flag
+                        // below is false for it, as it must be.
+                        const std::vector<execution::RestingSpend> claims =
+                            exposure_unified ? exposure_resting_claims()
+                                             : std::vector<execution::RestingSpend>{};
                         plan.resting = exposure_unified
                             ? execution::resting_spend_on_asset(
-                                  exposure_resting_claims(),
+                                  claims,
                                   is_ask ? gate_pc->base_asset_id
                                          : gate_pc->quote_asset_id)
                             : pending;
@@ -12365,6 +12383,8 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                         in.resting_spend_mojos = plan.resting;
                         in.planned_spend_mojos = 0;
                         in.reserve_mojos       = reserve;
+                        in.resting_incomplete =
+                            execution::has_unmapped_live_claim(claims);
                         plan.decision = execution::decide_exposure(
                             exposure_unified, in,
                             config_.strategy.exposure_cancel_hysteresis_pct);
@@ -13847,6 +13867,11 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 in.planned_spend_mojos = is_ask ? planned_ask : planned_bid;
                 in.reserve_mojos = is_ask ? pair_base_reserve_mojos
                                           : pair_quote_reserve_mojos;
+                // [review #164] Legacy's prepost_claims is empty, so this is
+                // false for it; unified refuses to ADD exposure while any
+                // live resting offer's spend cannot be read.
+                in.resting_incomplete =
+                    execution::has_unmapped_live_claim(prepost_claims);
                 return std::make_pair(
                     in, execution::decide_exposure(
                             exposure_unified, in,
@@ -13861,7 +13886,21 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 if (ask_dec.verdict != execution::ExposureVerdict::Ok) {
                     suppress_ask_projection = true;
                     can_ask = false;
-                    if (exposure_unified) {
+                    if (exposure_unified && ask_in.resting_incomplete) {
+                        spdlog::warn("[Engine] Step 8: {} ask exposure (unified) "
+                                     "on {} cannot be projected -- a LIVE resting "
+                                     "offer's pair is not in this config (an "
+                                     "adopted UNKNOWN record, or a pair since "
+                                     "removed), so resting={} is a lower bound "
+                                     "and owned={} already counts the coins it "
+                                     "locks -- suppressing ask (new={} reserve={}); "
+                                     "no resting offer is cancelled on its account",
+                                     pair_name, pair_cfg->base_asset_id,
+                                     ask_in.resting_spend_mojos,
+                                     ask_in.owned_mojos,
+                                     ask_in.planned_spend_mojos,
+                                     ask_in.reserve_mojos);
+                    } else if (exposure_unified) {
                         spdlog::info("[Engine] Step 8: {} projected ask exposure "
                                      "(unified) would breach reserve on {} (owned={} "
                                      "spendable={} resting={} new={} reserve={}) -- "
@@ -13889,7 +13928,21 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 if (bid_dec.verdict != execution::ExposureVerdict::Ok) {
                     suppress_bid_projection = true;
                     can_bid = false;
-                    if (exposure_unified) {
+                    if (exposure_unified && bid_in.resting_incomplete) {
+                        spdlog::warn("[Engine] Step 8: {} bid exposure (unified) "
+                                     "on {} cannot be projected -- a LIVE resting "
+                                     "offer's pair is not in this config (an "
+                                     "adopted UNKNOWN record, or a pair since "
+                                     "removed), so resting={} is a lower bound "
+                                     "and owned={} already counts the coins it "
+                                     "locks -- suppressing bid (new={} reserve={}); "
+                                     "no resting offer is cancelled on its account",
+                                     pair_name, pair_cfg->quote_asset_id,
+                                     bid_in.resting_spend_mojos,
+                                     bid_in.owned_mojos,
+                                     bid_in.planned_spend_mojos,
+                                     bid_in.reserve_mojos);
+                    } else if (exposure_unified) {
                         spdlog::info("[Engine] Step 8: {} projected bid exposure "
                                      "(unified) would breach reserve on {} (owned={} "
                                      "spendable={} resting={} new={} reserve={}) -- "

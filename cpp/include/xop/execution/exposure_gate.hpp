@@ -161,6 +161,11 @@ struct ExposureInputs {
     Mojo resting_spend_mojos{0};  ///< unified: all pairs; legacy: this pair
     Mojo planned_spend_mojos{0};  ///< new tiers; 0 when only resting is judged
     Mojo reserve_mojos{0};        ///< balance that must survive every fill
+    /// [review #164] unified only: at least one LIVE resting offer's spend
+    /// could not be quantified, so resting_spend_mojos is a LOWER BOUND and
+    /// not the sum.  Set from has_unmapped_live_claim(); legacy never sets it
+    /// (its `resting` is this pair's own pending spend, not a claim sum).
+    bool resting_incomplete{false};
 };
 
 struct ExposureDecision {
@@ -247,6 +252,23 @@ static_assert(exposure_cancel_floor(Mojo{100'000'000'000}, 0.25)
         d.projected_mojos = resting_only;
         return d;
     }
+    // [review #164] Past that point the projection is only a LOWER BOUND when
+    // a live resting offer could not be mapped to a pair: `owned` counts the
+    // coins it has locked, and no asset sum can count its spend, so the
+    // remaining headroom above is partly imaginary.  ADD NOTHING on the
+    // strength of a sum known to be short -- the unquantifiable claim is not
+    // "no exposure", it is exposure that cannot be read.
+    //
+    // Deliberately NOT a cancel, and deliberately only when tiers are being
+    // added: need_to_free would be an invented number, and cancelling real
+    // offers to cover an unreadable one is exactly the walk-down-the-book
+    // cascade (exposure_floor_rebalance, 42% of this bot's cancels in the 14
+    // days to 2026-09-20) that this rule exists to stop.  The resting-offer
+    // site passes planned == 0 and therefore still gets Ok.
+    if (in.resting_incomplete && in.planned_spend_mojos > 0) {
+        d.verdict = ExposureVerdict::SuppressNew;
+        return d;
+    }
     if (d.projected_mojos < reserve) {
         d.verdict = ExposureVerdict::SuppressNew;
         return d;
@@ -263,9 +285,15 @@ static_assert(exposure_cancel_floor(Mojo{100'000'000'000}, 0.25)
 /// One resting offer, reduced to what the asset-wide projection needs: the
 /// asset it SPENDS (base for an ask, quote for a bid) and how much of it.
 struct RestingSpend {
-    std::string asset_id;
+    std::string asset_id{};
     Mojo        spend_mojos{0};
     bool        cancel_pending{false};
+    /// [review #164] The engine could not resolve this offer's pair -- an
+    /// adopted "UNKNOWN" wallet record, or a pair since REMOVED from the
+    /// config file -- so asset_id and spend_mojos are UNKNOWN, not zero.  It
+    /// is summed into no asset; it raises has_unmapped_live_claim() instead,
+    /// which stops unified mode adding exposure it cannot bound.
+    bool        pair_unmapped{false};
 };
 
 /// Unified rule: what every resting offer that spends @p asset_id would
@@ -274,13 +302,29 @@ struct RestingSpend {
 /// out, exactly as the legacy per-pair sum leaves it out: counting it would
 /// make a cancel the rule has just SENT still read as unfreed exposure, and
 /// the next cycle would cancel another offer for the same shortfall.
+///
+/// An UNMAPPED claim is skipped too, but that one is not an accounting
+/// decision: its asset is unknown, so it belongs to no asset's sum.  It is
+/// reported separately by has_unmapped_live_claim() and must not be read as
+/// zero exposure.
 [[nodiscard]] inline Mojo resting_spend_on_asset(
     const std::vector<RestingSpend>& offers,
     std::string_view                 asset_id) noexcept
 {
     Mojo total = 0;
     for (const auto& o : offers) {
-        if (o.cancel_pending || o.spend_mojos <= 0 || o.asset_id != asset_id) {
+        // [review #164] Keeping cancel_pending OUT is the point of this PR,
+        // not an oversight, and it cannot breach the reserve: decide_exposure
+        // returns Ok with planned > 0 only if its LAST test, "Funding: the
+        // new tiers must come out of coins that are free NOW", also passes
+        // -- spendable - planned >= reserve -- and the
+        // wallet still counts an unconfirmed cancel's maker coins as locked,
+        // so they are absent from `spendable`.  Counting them here instead
+        // re-creates exposure_floor_rebalance: one more live offer cancelled
+        // per cycle to cover a shortfall an in-flight cancel already covers
+        // (42% of every cancel this bot made in the 14 days to 2026-09-20).
+        if (o.cancel_pending || o.pair_unmapped
+            || o.spend_mojos <= 0 || o.asset_id != asset_id) {
             continue;
         }
         const Mojo headroom = std::numeric_limits<Mojo>::max() - total;
@@ -288,6 +332,31 @@ struct RestingSpend {
                                            : total + o.spend_mojos;
     }
     return total;
+}
+
+/// [review #164] True when a claim is UNQUANTIFIABLE and still live: the
+/// engine could not resolve its pair, so no asset's sum can include its
+/// spend, while `owned` still counts the coins it holds locked.  Feeds
+/// ExposureInputs::resting_incomplete, which stops unified mode adding
+/// exposure on the strength of a projection that is short by an unknown
+/// amount.
+///
+/// A cancel_pending unmapped claim is excluded on the same terms
+/// resting_spend_on_asset excludes a mapped one: the cancel has been sent,
+/// the escalation ladder owns the offer from there, and a boot that adopts
+/// unparseable PENDING_CANCEL records would otherwise suppress every pair
+/// until the wallet finished them -- which, as this repo's own escalation
+/// header records, it may never do on its own.  What bounds THAT offer is
+/// the funding test, not this flag.
+[[nodiscard]] inline bool has_unmapped_live_claim(
+    const std::vector<RestingSpend>& offers) noexcept
+{
+    for (const auto& o : offers) {
+        if (o.pair_unmapped && !o.cancel_pending) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /// Whether a resting offer may be an exposure-cancel candidate.  Legacy takes

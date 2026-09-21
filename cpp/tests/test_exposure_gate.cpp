@@ -28,6 +28,7 @@ using xop::execution::exposure_cancel_candidate;
 using xop::execution::exposure_cancel_floor;
 using xop::execution::ExposureInputs;
 using xop::execution::ExposureVerdict;
+using xop::execution::has_unmapped_live_claim;
 using xop::execution::resting_spend_on_asset;
 using xop::execution::RestingSpend;
 using xop::execution::projected_balance_after_fills;
@@ -365,13 +366,15 @@ TEST(ExposureRule, UnifiedARealOutflowIsStillCaught) {
 // -- unified: the asset-wide resting sum ---------------------------------------
 
 TEST(ExposureRule, RestingSpendSumsEveryPairThatSpendsTheAsset) {
+    // Every member spelled out: GCC's -Wmissing-field-initializers rides in
+    // on -Wextra, and this repo has been red on it before.
     const std::vector<RestingSpend> offers = {
-        {"xch", 1 * kXch, false},      // XCH/DBX ask
-        {"xch", 2 * kXch, false},      // XCH/BYC ask
-        {"dbx", 86'000, false},        // XCH/DBX bid spends DBX, not XCH
-        {"xch", 4 * kXch, true},       // a cancel already sent: not exposure
-        {"xch", kMojo(-5), false},     // hostile
-        {"xch", kMojo(0), false},
+        {"xch", 1 * kXch, false, false},   // XCH/DBX ask
+        {"xch", 2 * kXch, false, false},   // XCH/BYC ask
+        {"dbx", 86'000, false, false},     // XCH/DBX bid spends DBX, not XCH
+        {"xch", 4 * kXch, true, false},    // a cancel already sent: not exposure
+        {"xch", kMojo(-5), false, false},  // hostile
+        {"xch", kMojo(0), false, false},
     };
     EXPECT_EQ(resting_spend_on_asset(offers, "xch"), 3 * kXch);
     EXPECT_EQ(resting_spend_on_asset(offers, "dbx"), kMojo(86'000));
@@ -381,9 +384,95 @@ TEST(ExposureRule, RestingSpendSumsEveryPairThatSpendsTheAsset) {
 
 TEST(ExposureRule, RestingSpendSaturatesInsteadOfOverflowing) {
     const Mojo big = std::numeric_limits<Mojo>::max();
-    const std::vector<RestingSpend> offers = {
-        {"xch", big, false}, {"xch", big, false}, {"xch", 1, false}};
+    const std::vector<RestingSpend> offers = {{"xch", big, false, false},
+                                              {"xch", big, false, false},
+                                              {"xch", 1, false, false}};
     EXPECT_EQ(resting_spend_on_asset(offers, "xch"), big);
+}
+
+// -- unified: a claim this config cannot map -----------------------------------
+//
+// [review #164] `owned` is the whole wallet and counts the coins EVERY resting
+// offer has locked -- including one on a pair since REMOVED from the file, and
+// one adopted as "UNKNOWN" because its wallet record would not parse.  Neither
+// can be attributed to an asset, so no asset's sum can carry its spend.  Read
+// as zero, that is a fail-open: the projection reports headroom that does not
+// exist.  A pair merely DISABLED is unaffected -- it is still in the engine's
+// pair_config_map_ and still projects normally.
+
+TEST(ExposureRule, AnUnmappedClaimCountsOnlyWhileItIsLive) {
+    EXPECT_FALSE(has_unmapped_live_claim({}));
+    // Everything mapped: nothing to report, whatever state it is in.
+    EXPECT_FALSE(has_unmapped_live_claim(
+        {{"xch", 1 * kXch, false, false}, {"dbx", kMojo(86'000), true, false}}));
+    // Unmapped, but its cancel is sent: out of the flag on exactly the terms
+    // resting_spend_on_asset leaves a mapped cancel_pending offer out of the
+    // sum.  The escalation ladder owns it from there, and a boot that adopts
+    // unparseable PENDING_CANCEL records must not suppress every pair.
+    EXPECT_FALSE(has_unmapped_live_claim({{"", kMojo(0), true, true}}));
+    // Unmapped and live: unreadable exposure.
+    EXPECT_TRUE(has_unmapped_live_claim({{"", kMojo(0), false, true}}));
+    EXPECT_TRUE(has_unmapped_live_claim(
+        {{"xch", 1 * kXch, false, false}, {"", kMojo(0), false, true}}));
+}
+
+TEST(ExposureRule, RestingSumIgnoresAnUnmappedClaimEvenCarryingNumbers) {
+    // Defensive: an unmapped claim's asset and size are UNKNOWN.  Should some
+    // future caller fill them in anyway, they still belong to no asset's sum
+    // -- the flag, not the sum, is the channel for an unreadable claim.
+    const std::vector<RestingSpend> offers = {
+        {"xch", 1 * kXch, false, false},
+        {"xch", 9 * kXch, false, true},
+    };
+    EXPECT_EQ(resting_spend_on_asset(offers, "xch"), 1 * kXch);
+    EXPECT_TRUE(has_unmapped_live_claim(offers));
+}
+
+TEST(ExposureRule, UnifiedRefusesNewTiersWhileAClaimCannotBeQuantified) {
+    // The fail-open itself.  Plenty owned, one mapped XCH ask resting, free
+    // coins ample: every quantified test is comfortable and the tiers post.
+    auto in = unified_inputs(kOwned, kOwned, 1 * kXch, kNewAsk);
+    EXPECT_EQ(decide_exposure(true, in, 0.25).verdict, ExposureVerdict::Ok);
+    // Same inputs, except that the engine could not read one LIVE offer's
+    // pair, so `resting` is a lower bound.  Adding exposure on the strength
+    // of a sum known to be short is the defect.
+    in.resting_incomplete = true;
+    EXPECT_EQ(decide_exposure(true, in, 0.25).verdict,
+              ExposureVerdict::SuppressNew);
+}
+
+TEST(ExposureRule, AnUnquantifiableClaimNeverManufacturesACancel) {
+    // The resting-offer site passes planned == 0.  A cancel there would have
+    // to invent need_to_free, and would buy back a real offer to cover an
+    // unreadable one -- the walk-down-the-book cascade this rule exists to
+    // stop.  So the flag suppresses and never cancels.
+    auto in = unified_inputs(kOwned, kOwned, 1 * kXch, 0);
+    in.resting_incomplete = true;
+    const auto quiet = decide_exposure(true, in, 0.25);
+    EXPECT_EQ(quiet.verdict, ExposureVerdict::Ok);
+    EXPECT_EQ(quiet.need_to_free, kMojo(0));
+
+    // A breach the sum CAN see still cancels, ahead of the flag, and is still
+    // sized from the quantified part alone.
+    in.owned_mojos         = 6 * kXch + 74'000'000'000LL;
+    in.resting_spend_mojos = 6 * kXch;
+    in.planned_spend_mojos = kNewAsk;
+    const auto breach = decide_exposure(true, in, 0.25);
+    EXPECT_EQ(breach.verdict, ExposureVerdict::CancelResting);
+    EXPECT_EQ(breach.need_to_free, kReserve - 74'000'000'000LL);
+}
+
+TEST(ExposureRule, TheIncompleteFlagIsNotAnInputToLegacy) {
+    // Legacy's `resting` is this pair's own pending spend, not a claim sum,
+    // and the engine hands it no claims at all.  The flag must not move a
+    // single legacy verdict.
+    auto in = legacy_inputs(kSpendableBefore, kRestingBefore, kNewAsk);
+    const auto plain = decide_exposure(false, in, 0.25);
+    in.resting_incomplete = true;
+    const auto flagged = decide_exposure(false, in, 0.25);
+    EXPECT_EQ(plain.verdict, ExposureVerdict::Ok);
+    EXPECT_EQ(flagged.verdict, plain.verdict);
+    EXPECT_EQ(flagged.projected_mojos, plain.projected_mojos);
 }
 
 // -- unified: the minimum-age gate on candidates -------------------------------

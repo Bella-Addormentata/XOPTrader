@@ -234,6 +234,54 @@ def test_the_unified_inputs_are_owned_and_the_asset_wide_resting_sum():
     )
 
 
+def test_an_unmappable_offer_is_recorded_as_unknown_not_dropped():
+    """[review #164] The claims lambda used to `continue` on a pair it could
+    not resolve.  `owned` is the whole wallet and still counts the coins that
+    offer has locked, so dropping it told the wallet-wide projection its spend
+    was ZERO -- a fail-open, on an offer that is still takeable.  It must be
+    recorded as unquantifiable instead, carrying its cancel_pending state.
+    """
+    claims = _code(_region(_read(ENGINE),
+                           "const auto exposure_resting_claims = [this]() {",
+                           "// XCH-buy-only mode:"))
+    body = _squash(claims)
+    assert "if(!claim_pc){" in body
+    assert "unknown.pair_unmapped=true;" in body
+    assert "unknown.cancel_pending=po.cancel_pending;" in body
+    assert "claims.push_back(std::move(unknown));" in body
+    # Nothing may leave the iteration before the claim is recorded: a bare
+    # `continue` there IS the defect.
+    unresolved = body.index("if(!claim_pc){")
+    recorded = body.index("claims.push_back(std::move(unknown));")
+    assert "continue;" not in body[unresolved:recorded], (
+        "an unresolvable pair must record an unquantifiable claim before it "
+        "skips the offer, never drop it silently"
+    )
+
+
+def test_both_exposure_sites_fail_closed_on_an_unquantifiable_claim():
+    """Both sites must derive resting_incomplete from the claims they just
+    built -- not from a constant, and not only at one of the two."""
+    engine = _code(_read(ENGINE))
+    assert engine.count("execution::has_unmapped_live_claim(") == 2, (
+        "the resting-offer check and the pre-post projection"
+    )
+    body = _squash(engine)
+    assert body.count(
+        "in.resting_incomplete=execution::has_unmapped_live_claim(") == 2
+    # The resting-offer site builds the claims ONCE and reads both the asset
+    # sum and the flag off that same vector, so the two cannot disagree.
+    plan = _squash(_code(_region(_read(ENGINE),
+                                 "auto plan_exposure = [&](Side side) -> ExposurePlan {",
+                                 "const auto suppress_instead = [&]")))
+    assert ("conststd::vector<execution::RestingSpend>claims="
+            "exposure_unified?exposure_resting_claims()" in plan)
+    assert "execution::resting_spend_on_asset(claims," in plan
+    assert "execution::has_unmapped_live_claim(claims);" in plan
+    # The pre-post site reads the vector it already had.
+    assert "execution::has_unmapped_live_claim(prepost_claims);" in body
+
+
 def test_unified_spares_young_offers_and_suppresses_instead():
     engine = _code(_read(ENGINE))
     plan = _region(engine, "auto plan_exposure = [&](Side side) -> ExposurePlan {",
