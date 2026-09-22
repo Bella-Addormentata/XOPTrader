@@ -151,18 +151,18 @@ enum class RpcRetryPolicy {
     return transient;
 }
 
-/// Did a cancel that FAILED possibly reach the wallet's handler -- so that
-/// the wallet may have run it, or may still be running it?
+/// Did a request that FAILED possibly reach the daemon's handler -- so that
+/// the daemon may have run it, or may still be running it?
 ///
-/// [review 2026-09-13, round 2] may_resend() above stops rpc_post sending a
-/// cancel twice.  This stops its CALLER doing the same one layer up:
-/// OfferManager::cancel_all used to answer any failed wallet-wide sweep with
-/// per-offer cancel_offer calls at once.  In chia 2.7.4 cancel_offers and
-/// cancel_offer both take the wallet state lock, and
-/// TradeManager.cancel_pending_offers builds spends without checking trade
-/// status, so a per-offer cancel queued behind a sweep that is still running
-/// builds a SECOND, conflicting spend of an offer the sweep already cancelled
-/// -- and neither bundle can replace the other.
+/// TRANSPORT-GENERIC, and named that way since [review #165, round 4].  It
+/// reads a CURLcode and an HTTP status and knows nothing about the endpoint:
+/// the same question a failed CANCEL asks ("did the sweep run?") is the one a
+/// failed CREATE asks ("does the wallet now hold an offer nothing recorded?").
+/// cancel_possibly_submitted below is this function under its original name,
+/// kept because the cancel callers and their comments are written in it.
+/// #162 (open) adds a third spelling, create_possibly_submitted, forwarding
+/// the same way for its own caller; the three are one rule and collapsing
+/// them to one name is a follow-up for after both land.
 ///
 /// [review 2026-09-13, round 3] THE DEFAULT IS "POSSIBLY SUBMITTED".  Only a
 /// failure that provably happens before the request is written counts as
@@ -199,8 +199,10 @@ enum class RpcRetryPolicy {
 /// cancel that never left, misread as possibly submitted, costs one wait and
 /// one re-check before the offers still live are cancelled; a cancel that
 /// arrived, misread as never sent, builds a duplicate spend that cannot be
-/// called back.
-[[nodiscard]] constexpr bool cancel_possibly_submitted(
+/// called back.  The same asymmetry holds for a create: an offer the wallet
+/// made and nothing recorded is an orphan the next boot may cancel, while a
+/// create that never left costs one quieter cycle.
+[[nodiscard]] constexpr bool request_possibly_submitted(
     CURLcode rc, long http_code) noexcept
 {
     switch (rc) {
@@ -233,6 +235,28 @@ enum class RpcRetryPolicy {
     }
 }
 
+/// The same question, asked by the cancel callers.
+///
+/// [review 2026-09-13, round 2] may_resend() above stops rpc_post sending a
+/// cancel twice.  This stops its CALLER doing the same one layer up:
+/// OfferManager::cancel_all used to answer any failed wallet-wide sweep with
+/// per-offer cancel_offer calls at once.  In chia 2.7.4 cancel_offers and
+/// cancel_offer both take the wallet state lock, and
+/// TradeManager.cancel_pending_offers builds spends without checking trade
+/// status, so a per-offer cancel queued behind a sweep that is still running
+/// builds a SECOND, conflicting spend of an offer the sweep already cancelled
+/// -- and neither bundle can replace the other.
+///
+/// [review #165, round 4] A thin alias, not a second rule: the classification
+/// never depended on the endpoint, and a create asks it too.  Kept so the
+/// cancel call sites and the comments that explain them still read as written;
+/// the static_asserts below pin the two answers together.
+[[nodiscard]] constexpr bool cancel_possibly_submitted(
+    CURLcode rc, long http_code) noexcept
+{
+    return request_possibly_submitted(rc, http_code);
+}
+
 /// Did a create_offer_for_ids that FAILED possibly reach the wallet's
 /// handler -- so that the offer may exist although no reply said so?
 ///
@@ -243,11 +267,39 @@ enum class RpcRetryPolicy {
 /// creating every tier individually.  After a timeout the merged offer may
 /// already rest in the wallet, and the individual creates would then
 /// duplicate it tier by tier.  When this is true the fallback is skipped.
+///
+/// [MERGE #162 x #165] #165 renamed the rule to request_possibly_submitted and
+/// demoted the cancel spelling to an alias ABOVE this one, so this forwards to
+/// the rule directly.  Declared after it: the other order is use-before-
+/// declaration and does not compile.
 [[nodiscard]] constexpr bool create_possibly_submitted(
     CURLcode rc, long http_code) noexcept
 {
-    return cancel_possibly_submitted(rc, http_code);
+    return request_possibly_submitted(rc, http_code);
 }
+
+// ---------------------------------------------------------------------------
+// Build-time pins.  GCC and MSVC both evaluate these, so a wrong answer is a
+// compile error on every platform rather than a red runner on one.
+// ---------------------------------------------------------------------------
+// The default, and the three shapes the callers act on differently.
+static_assert(request_possibly_submitted(CURLE_OPERATION_TIMEDOUT, 0));
+static_assert(request_possibly_submitted(CURLE_GOT_NOTHING, 0));
+static_assert(request_possibly_submitted(CURLE_OK, 200));   // body unparseable
+static_assert(request_possibly_submitted(CURLE_OK, 500));
+static_assert(!request_possibly_submitted(CURLE_OK, 404));
+static_assert(!request_possibly_submitted(CURLE_COULDNT_CONNECT, 0));
+static_assert(!request_possibly_submitted(CURLE_SSL_CONNECT_ERROR, 0));
+// ...and the alias really is the same function, not a second copy that can
+// drift from it (the four codes the two cancel call sites actually meet).
+static_assert(cancel_possibly_submitted(CURLE_OPERATION_TIMEDOUT, 0)
+              == request_possibly_submitted(CURLE_OPERATION_TIMEDOUT, 0));
+static_assert(cancel_possibly_submitted(CURLE_COULDNT_CONNECT, 0)
+              == request_possibly_submitted(CURLE_COULDNT_CONNECT, 0));
+static_assert(cancel_possibly_submitted(CURLE_OK, 404)
+              == request_possibly_submitted(CURLE_OK, 404));
+static_assert(cancel_possibly_submitted(CURLE_OK, 502)
+              == request_possibly_submitted(CURLE_OK, 502));
 
 }  // namespace xop::rpc
 

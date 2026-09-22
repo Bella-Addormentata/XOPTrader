@@ -76,6 +76,80 @@ namespace trade_status {
 }  // namespace trade_status
 
 // ---------------------------------------------------------------------------
+// [S74 / review #165] PostingMark -- "a create_offer is out, and the offer it
+// makes is not in State yet"
+// ---------------------------------------------------------------------------
+//
+// Engine::shutdown()'s KEEP branch waits while the engine's posting_in_flight_
+// flag is set (util::keep_stop_drain_step), because stopping the io_context
+// inside this window lets the wallet finish a create with nobody left to record
+// it: the next boot meets that offer as an ORPHAN and may CANCEL it, which is
+// the one outcome a keep stop exists to prevent.
+//
+// The window is exactly [create_offer issued .. the offer is in State]. That
+// includes the Dexie submission, which sits between the wallet's answer and
+// state_->upsert_offer -- an offer created and published but not yet in State
+// is the WORST case, since it is unknown to the engine entirely.
+//
+// One mark per create, never one per ladder: everything created earlier in the
+// same post_quotes call is already in State, and a keep stop's flush gives each
+// of those an offer_log row. Holding the mark across the ladder would make a
+// stop wait for up to 2 x num_tiers creates (12 at the live config) for no
+// extra safety -- and would need a budget to match.
+//
+// RAII, so a throw, an early `continue`, a `break`, a `co_return` and a
+// coroutine frame destroyed by ioc_.stop() all clear it. Single-threaded: the
+// flag is written here and read by the shutdown continuation, both on the
+// io_context thread.
+// ---------------------------------------------------------------------------
+namespace {
+
+class PostingMark {
+public:
+    explicit PostingMark(bool* flag) noexcept : flag_(flag)
+    {
+        if (flag_ != nullptr) {
+            *flag_ = true;
+        }
+    }
+    ~PostingMark() { release(); }
+
+    PostingMark(const PostingMark&)            = delete;
+    PostingMark& operator=(const PostingMark&) = delete;
+    PostingMark(PostingMark&&)                 = delete;
+    PostingMark& operator=(PostingMark&&)      = delete;
+
+    /// This create's window is over: a keep stop may proceed.
+    ///
+    /// [review #165, round 4] IT DOES NOT SAY THE OFFER IS RECORDED. It used
+    /// to read "the offer is in State (or there is no offer)", which is a
+    /// FALSE assurance in one case the destructor also covers: a create that
+    /// threw a TRANSPORT error. A timeout, an empty reply or a 5xx does not
+    /// prove the wallet refused the request -- the handler may have built the
+    /// offer and only the answer was lost (rpc::request_possibly_submitted,
+    /// and PR #162 encodes the same principle for this RPC family: "no answer
+    /// is not a refusal"). The mark is released anyway, deliberately: it
+    /// exists only to keep the io_context alive until THIS coroutine reaches
+    /// state_->upsert_offer, and once the create has thrown there is nothing
+    /// left for it to wait for -- holding it would burn the drain budget and
+    /// still end with an untracked offer. What the caller does instead is
+    /// RECORD the uncertainty (create_outcome_unknown_flag_) so the keep stop
+    /// reports a possibly-untracked offer rather than clean success.
+    void release() noexcept
+    {
+        if (flag_ != nullptr) {
+            *flag_ = false;
+            flag_  = nullptr;
+        }
+    }
+
+private:
+    bool* flag_;
+};
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
 // Constructor
 // ---------------------------------------------------------------------------
 
@@ -997,6 +1071,21 @@ asio::awaitable<int> OfferManager::post_quotes(
             break;
         }
 
+        // [S74 / review #165, round 4] STOP CREATING, CANCEL NOTHING. A stop
+        // has been latched: start no further create. Not the same check as the
+        // abort above -- that one cancels a create that landed late, which a
+        // KEEP stop must never do. Without this, the keep stop's drain (which
+        // suspends on a poll timer, handing control straight back to this
+        // coroutine) waited out the rest of the ladder under a budget sized
+        // for ONE create, and this loop went on posting new offers after the
+        // operator asked the engine to stop.
+        if (stop_creating_predicate_ && stop_creating_predicate_()) {
+            logger_->warn("not creating any further {} tier: a stop is "
+                          "latched. Nothing already created is cancelled.",
+                          pair.name);
+            break;
+        }
+
         // Step 2: Call wallet.create_offer() to produce the spend bundle.
         // [OFFER-EXPIRY] nullopt unless this pair opted in, in which case
         // the payload is unchanged from before the feature existed.
@@ -1004,10 +1093,26 @@ asio::awaitable<int> OfferManager::post_quotes(
             expiry_max_time_for(pair);
         // [MIN-INPUT-COIN] Through the floor, like every create here.
         json result;
+        // [S74 / review #165] From here until this tier's offer is in State, a
+        // keep stop waits rather than stopping the io_context under it.
+        PostingMark posting_mark{posting_in_flight_flag_};
         try {
             result = co_await create_offer_min_coin(
                 offer_dict, expiry_max_time, pair, tier.side,
                 static_cast<int>(tier.tier_index), "tier");
+        } catch (const rpc::ChiaRPCTransportError& e) {
+            // [review #165, round 4] BEFORE the base handler, which would take
+            // this too. A transport failure is not a refusal: the wallet may
+            // have built the offer and only the answer was lost. Recorded so
+            // the keep stop stops calling this case "no offer" (the
+            // PostingMark comment has the whole argument). Nothing is sent
+            // and nothing is waited for -- there is no tier id to cancel,
+            // and a second create would be a second offer.
+            logger_->error("create_offer failed for {} {} tier {}: {}",
+                           pair.name, to_string(tier.side),
+                           tier.tier_index, e.what());
+            note_create_outcome_unknown(e, pair.name, "tier");
+            continue;
         } catch (const rpc::ChiaRPCError& e) {
             logger_->error("create_offer failed for {} {} tier {}: {}",
                            pair.name, to_string(tier.side),
@@ -1160,6 +1265,9 @@ asio::awaitable<int> OfferManager::post_quotes(
         pending.expiry_max_time  = expiry_max_time.value_or(0);
 
         state_->upsert_offer(pending);
+        // [S74] Recorded: a keep stop that stops the io_context now finds this
+        // offer in State, and its flush gives it an offer_log row.
+        posting_mark.release();
         ++created_count;
 
         logger_->info("Posted {} {} tier {} @ {} mojos, size {} mojos [{}]",
@@ -2414,10 +2522,47 @@ void OfferManager::set_abort_predicate(std::function<bool()> predicate)
     abort_predicate_ = std::move(predicate);
 }
 
+void OfferManager::set_stop_creating_predicate(std::function<bool()> predicate)
+{
+    stop_creating_predicate_ = std::move(predicate);
+}
+
 void OfferManager::set_escalation(
     std::function<void(const std::string&)> escalate)
 {
     escalate_ = std::move(escalate);
+}
+
+void OfferManager::set_posting_in_flight_flag(bool* flag) noexcept
+{
+    posting_in_flight_flag_ = flag;
+}
+
+void OfferManager::set_create_outcome_unknown_flag(bool* flag) noexcept
+{
+    create_outcome_unknown_flag_ = flag;
+}
+
+void OfferManager::note_create_outcome_unknown(
+    const rpc::ChiaRPCTransportError& e,
+    const std::string&                pair_name,
+    const char*                       context)
+{
+    // A connect or TLS failure happens before the request is written, so the
+    // wallet cannot have made an offer. Everything else may follow a request
+    // the handler received -- a timeout, an empty or garbled reply, a 5xx, or
+    // a 2xx whose body could not be parsed.
+    if (!rpc::request_possibly_submitted(e.curl_code(), e.http_code())) {
+        return;
+    }
+    logger_->error("{} create for {} failed with NO ANSWER ({}): this does "
+                   "not prove the wallet refused it. If the handler built the "
+                   "offer, this process holds no record of it and the next "
+                   "start meets it as an ORPHAN.",
+                   context, pair_name, e.what());
+    if (create_outcome_unknown_flag_ != nullptr) {
+        *create_outcome_unknown_flag_ = true;
+    }
 }
 
 std::uint64_t OfferManager::current_fee() const noexcept
@@ -4371,7 +4516,7 @@ bool OfferManager::xch_ledger_probe_admits(CoinLockLedger&   probe,
         || (side == Side::Ask && pair.quote_asset_id == "xch");
     // [MIN-INPUT-COIN review #162] Same floor as the real admission, or the
     // preflight would keep a side the cycle ledger then refuses.
-    // [review #163 r6] The fee was an IMPLICIT uint64 -> Mojo narrowing: the
+    // [review #163 r6] These two were IMPLICIT uint64 -> Mojo narrowings: the
     // sinks take a Mojo and no diagnostic fires.  See xch_ledger_admits below
     // and xop::to_mojo_saturating (types.hpp).
     const Mojo min_coin = ledger_min_coin_mojos(
@@ -4484,6 +4629,14 @@ asio::awaitable<int> OfferManager::post_merged_side(
         co_return 0;
     }
 
+    // [S74 / review #165, round 4] ...and the same on the batch path: a stop
+    // is latched, so start no create. Cancels nothing (see post_quotes).
+    if (stop_creating_predicate_ && stop_creating_predicate_()) {
+        logger_->warn("not creating the merged {} batch: a stop is latched. "
+                      "Nothing already created is cancelled.", pair.name);
+        co_return 0;
+    }
+
     // [XCH-LOCK-LEDGER] One merged offer, one lock: the merged dict's XCH
     // leg is the sum of every tier's, so the ledger charge is exact.
     if (!xch_ledger_admits(merged_dict, pair, tiers.front().side,
@@ -4505,15 +4658,28 @@ asio::awaitable<int> OfferManager::post_merged_side(
     std::string batch_err;
     // [MIN-INPUT-COIN] The merged dict still has one spend leg, so the floor
     // scales with the merged amount.
+    // [S74 / review #165] Held until the merged offer is in State (or until
+    // this call gives up on it): a keep stop waits for exactly this window.
+    PostingMark batch_mark{posting_in_flight_flag_};
     try {
         result = co_await create_offer_min_coin(
             merged_dict, expiry_max_time, pair, tiers.front().side,
             static_cast<int>(tiers.front().tier_index), "merged batch");
     } catch (const rpc::ChiaRPCTransportError& e) {
+        // [MERGE #162 x #165] ONE handler, not two. ChiaRPCTransportError
+        // derives from ChiaRPCError, so keeping both PRs' handlers on the same
+        // try is an unreachable duplicate (MSVC C2312, GCC -Wexceptions) --
+        // and both effects are wanted. Still BEFORE the base handler, which
+        // would otherwise take this too.
+        //   * #162: suppress the per-tier fallback, which would otherwise
+        //     rebuild the batch on top of a merged offer the wallet holds;
+        //   * #165: record the uncertainty, so a keep stop stops reporting a
+        //     clean book (the PostingMark comment has the whole argument).
         batch_failed = true;
         batch_err = e.what();
         batch_uncertain =
             rpc::create_possibly_submitted(e.curl_code(), e.http_code());
+        note_create_outcome_unknown(e, pair.name, "merged batch");
     } catch (const rpc::ChiaRPCError& e) {
         batch_failed = true;
         batch_err = e.what();
@@ -4533,6 +4699,10 @@ asio::awaitable<int> OfferManager::post_merged_side(
     }
 
     if (batch_failed) {
+        // [S74] This create answered (with a failure): released here so the
+        // fallback tiers below are marked one at a time by their own marks,
+        // never nested inside this one.
+        batch_mark.release();
         // Fallback: if batch fails, fall through to individual creation.
         logger_->warn("Batch create_offer failed for {} {} -- "
                       "falling back to individual: {}",
@@ -4564,13 +4734,32 @@ asio::awaitable<int> OfferManager::post_merged_side(
                                pair.name, tier.tier_index);
                 break;
             }
+            // [S74 / review #165, round 4] ...and the fallback loop is a
+            // create-per-tier loop like post_quotes', so it needs the same
+            // non-cancelling gate. Its own copy: a gate on one loop says
+            // nothing about another (see the "mutate every copy" rule).
+            if (stop_creating_predicate_ && stop_creating_predicate_()) {
+                logger_->warn("not creating any further {} fallback tier: a "
+                              "stop is latched. Nothing already created is "
+                              "cancelled.", pair.name);
+                break;
+            }
             bool tier_failed = false;
             std::string tier_err;
             json sr;
+            // [S74 / review #165] One mark per fallback create, cleared when
+            // that tier's offer is in State below.
+            PostingMark fallback_mark{posting_in_flight_flag_};
             try {
                 sr = co_await create_offer_min_coin(
                     single_dict, expiry_max_time, pair, tier.side,
                     static_cast<int>(tier.tier_index), "batch fallback");
+            } catch (const rpc::ChiaRPCTransportError& e2) {
+                // [review #165, round 4] Its own copy, for the same reason as
+                // the two above: no answer is not a refusal.
+                tier_failed = true;
+                tier_err = e2.what();
+                note_create_outcome_unknown(e2, pair.name, "batch fallback");
             } catch (const rpc::ChiaRPCError& e2) {
                 tier_failed = true;
                 tier_err = e2.what();
@@ -4674,6 +4863,7 @@ asio::awaitable<int> OfferManager::post_merged_side(
                 // [S70] Past expiry_echo_ok above: the wallet's echo.
                 po.expiry_max_time  = expiry_max_time.value_or(0);
                 state_->upsert_offer(po);
+                fallback_mark.release();  // [S74] recorded
                 ++fallback_count;
 
                 // -- Fee reserve guard (batch fallback, UTXO-aware) ---------
@@ -4855,6 +5045,7 @@ asio::awaitable<int> OfferManager::post_merged_side(
         pending.expiry_max_time  = expiry_max_time.value_or(0);
         state_->upsert_offer(pending);
     }
+    batch_mark.release();  // [S74] every constituent tier is in State
 
     logger_->info("Batch: posted {} {} ({} tiers merged) [{}]",
                   pair.name, to_string(tiers.front().side),

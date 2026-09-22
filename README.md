@@ -105,7 +105,7 @@ The bot connects to a locally running **Chia full node** (port 8555) and **Chia 
 - **All monetary values are `int64_t` mojos** (1 XCH = 10^12 mojos). No floating-point in financial paths. 128-bit intermediate arithmetic prevents overflow on multiplications.
 - **Thread-safe state** via three independent `std::shared_mutex` instances (positions, offers, markets). Deadlock-free by construction — no method ever holds two locks.
 - **Fault-isolated heartbeat** — each of the 13 steps has independent error handling. A transient RPC failure in step 1 does not prevent steps 2-13 from running with cached data.
-- **Graceful shutdown** — SIGINT/SIGTERM triggers offer cancellation on-chain before exit. Second signal force-stops immediately.
+- **Graceful shutdown** — SIGINT/SIGTERM stops the engine and, by default, cancels its offers on-chain before exit; `engine.shutdown_offers: keep` (or "Keep offers on the book" in the GUI's stop prompt) leaves them resting for the next start instead. Second signal force-stops immediately.
 
 ---
 
@@ -744,7 +744,9 @@ Key sections to configure before first run:
 
 ### Shutdown
 
-- **SIGINT** (Ctrl+C) or **SIGTERM**: Gracefully cancels all pending offers on-chain, then exits.
+- **SIGINT** (Ctrl+C) or **SIGTERM**: Graceful stop. What happens to the resting offers is `engine.shutdown_offers` in the config: `cancel` (the default) cancels them all on-chain, then exits; `keep` cancels nothing and leaves them on the book for the next start to re-adopt.
+- **From the GUI**: Stop Trading and closing the window ask — *Keep offers on the book*, *Cancel all offers* or *Don't stop* — and preselect that config default. A Windows log-off or shutdown never asks; it uses the default.
+- **Keep only together with an on-chain expiry** (`strategy.offer_expiry_secs`): a kept offer is takeable with no engine behind it — no repricing, no TTL, no dead man's switch — until the next start. See the `engine:` section of `config.example.yaml`.
 - **Second signal**: Force-stops immediately (offers may remain on-chain until coins are spent).
 
 ---

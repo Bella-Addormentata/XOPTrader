@@ -562,6 +562,156 @@ Three rules made 97% of them. Each now has a replacement behind its own
 
 Out of scope and unchanged: startup sweeps, Cancel All, reload-disabled pairs,
 shutdown, every safety cancel, UTXO liberation, and the stopped-engine TTL sweep.
+## [Unreleased]
+
+### A stop can keep the offers on the book (S74)
+
+- **Stopping the engine no longer has to cancel everything.** A graceful stop
+  cancelled the whole book: a wallet-wide cancel, the retry ladder, a cancel
+  intent in `data/uncancelled.txt` and `cancel_pending` rows for the next start
+  to finish. With blocks about 97% full that leaves unconfirmed cancel spends
+  and locked coins behind every restart, and the only way to keep offers across
+  one was to hard-kill the GUI and the engine. A stop now carries a policy,
+  `cancel` or `keep`. With `keep` the engine sends no cancel of any kind (not
+  the sweep, not the ladder, not the dead man's switch), writes no cancel
+  intent, leaves every `offer_log` row as it is, disarms the dead man's switch
+  before anything else, and logs one line: how many offers were left resting,
+  on which pairs, and the soonest and latest on-chain expiry it knows of — or,
+  plainly, that they carry none. The next start re-adopts them through the
+  startup reconcile, exactly as it did after a hard kill.
+- **The GUI asks.** Stop Trading and closing the window show a prompt with three
+  choices — **Keep offers on the book**, **Cancel all offers**, **Don't stop** —
+  the number of resting offers per pair and, when the on-chain expiry is on, the
+  latest time a kept offer can stay takeable. It preselects the config default
+  and remembers nothing. An OS session end (log-off, shutdown, restart) and a
+  signal never show it: a modal box with nobody to answer would block the
+  shutdown for ever.
+- **`engine.shutdown_offers: cancel | keep`** (new optional section, default
+  `cancel`, so an upgrade changes nothing) decides every stop nobody answers:
+  a session end, SIGINT/SIGTERM, Ctrl+C in a console, a service stop, an older
+  GUI, a hand-written `shutdown.flag`. It is printed at startup, and the engine
+  warns there when `keep` is set while an enabled pair posts offers with no
+  on-chain expiry. Strict: an unknown key or value in `engine:` is a startup
+  error, because every lenient reading of a typo is a silent `cancel`. Settings
+  → Risk Management → *Stopping the Engine* edits it; the save writes that one
+  key only when the dropdown was changed, and re-reads the file first, so it
+  neither adds the key to an untouched config nor reverts a value edited on
+  disk.
+- **Protocol.** The addressed v1 stop request gains one optional line,
+  `offers=cancel|keep`. PID addressing, freshness and the truthful stop outcome
+  (#153) are unchanged, and a request without the line is byte-identical to
+  before. A line the engine cannot read does not refuse the stop: the config
+  default applies and the log says so. An engine that predates the line would
+  ignore it and cancel, so the GUI offers Keep only to an engine whose `--help`
+  advertises `shutdown.flag offers=cancel|keep`, and refuses to stop rather than
+  let a requested keep turn into a cancel.
+- **A keep stop delivered by a signal waits for the one offer it may have been
+  creating, and starts no more.** A GUI stop is read between heartbeat cycles
+  and never finds a create in flight; Ctrl+C, SIGTERM, a service stop or a
+  session end can arrive while one is outstanding, and stopping the event loop
+  there would let the wallet finish an offer nothing recorded — an orphan the
+  next start may cancel. The stop now waits for that create to land, on a timer
+  and never on the wallet, for at most one create plus one publish at their own
+  worst case (**247 s** with the shipped RPC timeouts). While it waits the
+  engine begins **no new create at all**, and cancels nothing that already
+  exists, so the wait really is one create's and not a whole ladder's.
+  **Do not hard-kill a stop that seems slow** — that wait is what keeps a
+  just-created offer from arriving at the next start as an orphan. A second
+  Ctrl+C still exits at once. If a create instead fails with *no answer* — a
+  timeout, an empty reply, a 5xx — that is not proof the wallet refused it, and
+  the keep stop now says so at error rather than reporting a clean book.
+- **What the stop report may and may not claim.** Three operator-facing
+  sentences asserted safety the code does not provide, and are now built from
+  the facts the report has already computed:
+  - the mid-cycle line ended with a flat *"No offer post was left
+    unrecorded"*, logged **unconditionally** and forty lines below the two
+    facts (`post_abandoned`, `create_outcome_unknown_`) that exist to say the
+    opposite. The contradiction was guaranteed, not incidental: a
+    `post_abandoned` stop is always a mid-cycle one, because the only path
+    that marks a post in flight runs inside the marked cycle. The reassurance
+    is now conditional on both, and the same sentence no longer implies a
+    **take** cut by the stop is recovered — a cancel is adopted from the
+    wallet's `PENDING_CANCEL` record, but a take completed after the cut is
+    booked nowhere in this engine (TODO S76 (c));
+  - *"nothing was left on the book"* was printed whenever nothing was
+    **resting**, although every `cancel_pending` offer is deliberately excluded
+    from that count — and in this repo a submitted cancel is not proof: such an
+    offer generally stays **takeable** until a maker coin is spent (24 of them
+    for 2.5 h in August, three for 13 days). The stop then disarms the dead
+    man's switch and exits, so nothing chases them until the next start. The
+    line now says so, both when the book is otherwise empty and when it is not;
+  - *"the dead man's switch is disarmed for this stop"* was flat, where
+    `engine.hpp` is careful: a cancel the switch had **already begun** holds
+    the mutex and is not recalled. The line now reads `watchdog_fired_` and
+    says which of the two happened;
+  - and *"nothing was left on the book"* survived the move. Relocating the
+    sentence to `kept_book.hpp` took it away from `post_abandoned` and
+    `create_outcome_unknown_`, which were never passed in — so a stop with a
+    completely empty `State` printed the flat all-clear **first** and only
+    then the error lines for those facts, each of which qualifies the *count*
+    (*"NOT in the count above"*) and therefore retracts nothing about the word
+    *nothing*. Weaker than the mid-cycle defect above — it needs an empty book
+    rather than following by construction — but the same shape, so it has the
+    same fix: the two facts are arguments to `describe_kept_book`, every
+    branch of it says when a create this process began is unaccounted for, and
+    a gtest reads each result.
+  Each of these sentences now lives in `kept_book.hpp`, where a gtest reads
+  exactly what the operator reads — the `engine.cpp` wiring scan strips string
+  literals and structurally cannot. That is also the limit the last item ran
+  into: the scan's `CLAIM_WORDING` backstop lists *"nothing was left on the
+  book"*, but it reads literals in `engine.cpp`, so moving the sentence out
+  moved it out of range. The replacement guard pins the **arguments** at the
+  call site, and the sentences they produce are gtests.
+- **The GUI stop prompt no longer says a cancel already in flight is untouched
+  by the choice.** It read *"neither choice changes those"*. **Keep** does send
+  nothing for them — but **Cancel all** seeds its list from every offer in
+  `State` with no `cancel_pending` filter, writes every one of those ids into
+  the cancel intent file before the first attempt, and its first attempt is the
+  wallet-wide secure sweep, which in chia 2.7.4 performs no trade-status check
+  at all: it takes the offer's cancellation coins and builds a fresh spend, so a
+  merely `PENDING_CANCEL` trade is swept and re-spent. That escalation is what
+  finally cleared the three XCH/BYC bids stuck for 13 days. (Only the per-offer
+  **retries** skip such an offer, to avoid paying a second fee for the same
+  spend; the wallet-wide leg does not.) The prompt now states the real
+  difference. In the same place, a book whose every offer is `cancel_pending`
+  was announced as *"No offers are resting on the book."* — the prompt reads
+  those rows and then diverts them out of `resting` — with every informative
+  line gated on `resting`, so the operator learned nothing else about them
+  either. Such a book is no longer called empty, and gets a line of its own.
+- **A blank `engine.shutdown_offers` is a startup error**, like every other
+  value the section cannot read. `shutdown_offers:` with nothing after it used
+  to fall through to `cancel` — the silent default this section exists to
+  prevent. An omitted or empty `engine:` section is still "not set" and still
+  means `cancel`.
+- **The documented stop latency is the real one.** `config.example.yaml` said a
+  GUI stop is *immediate* because the request is read between heartbeat cycles.
+  The clause is the reason it is **not**: the flag is read once per 5 s poll and
+  the same poll iteration then awaits the whole cycle inline. Measured over 976
+  live cycles: median 10.4 s, p90 14.2 s, 1.5% over 30 s, longest 108.7 s. The
+  paragraph now states that, and states that the GUI's own 30 s window ends in
+  `TerminateProcess` — the hard kill the same paragraph tells operators not to
+  perform — which skips the `offer_log` flush and can send an offer to the next
+  start as an orphan. The 30 s value is **unchanged in this PR** and flagged for
+  an operator decision (see the PR body).
+- **Operator notes.** Keep is for restarts. A kept offer is takeable with no
+  engine behind it — no repricing, no TTL, no dead man's switch — so use it
+  only with `strategy.offer_expiry_secs` set. **While the engine is down the
+  on-chain expiry is the only bound**: it is stamped when each offer is posted,
+  so at the live `offer_expiry_secs: 86400` an offer can stay takeable for up to
+  24 h from the moment it was posted, however long the stop lasts. What happens
+  when the engine comes back depends on `strategy.ttl_cancel_mode`:
+  with `cancel` (the default, and the only behaviour of any build before that
+  key existed — there is no value spelled `age`) the first
+  cycle cancels anything past the hard TTL — 2 × `offer_ttl_blocks`, 800 blocks
+  ≈ 4 h 10 min at the peak-height cadence of 18.75 s/block — including offers
+  whose expiry has already passed, because the reference wallet goes on
+  reporting such an offer `PENDING_ACCEPT` and keeps its coins locked until it
+  is cancelled (chia-blockchain 2.7.4, `chia/wallet/trade_manager.py`); with
+  `expire`, an offer carrying a verified expiry is **not** cancelled at the hard
+  TTL at all — it rests until its own `max_time` passes and is then retired with
+  a free local cancel about ten minutes later, so the bound is the expiry (~24 h
+  takeable, ~24 h 10 min of locked coins), not the hard TTL. Operator **Cancel
+  All** is unchanged.
 
 ## [0.10.24] — 2026-09-14 — record what happened, not what was asked for
 

@@ -799,6 +799,36 @@ public:
     /// wire it.
     void set_abort_predicate(std::function<bool()> predicate);
 
+    /// [S74 / review #165, round 4] "Stop CREATING. Cancel nothing."
+    ///
+    /// Consulted immediately before every create, beside the abort predicate
+    /// above and never instead of it. The two differ in what they do about an
+    /// offer that already exists:
+    ///
+    ///   abort_predicate_          the dead man's switch fired: refuse to
+    ///                             create, and CANCEL a create that landed
+    ///                             after the bulk sweep enumerated the book;
+    ///   stop_creating_predicate_  the operator asked the engine to stop:
+    ///                             refuse to START a create, and touch nothing
+    ///                             that exists. A keep stop must not cancel,
+    ///                             and a cancelling stop's own sweep owns the
+    ///                             book from here on.
+    ///
+    /// WHY IT EXISTS (TODO S76 (a)). A keep stop waits for the ONE create it
+    /// can find in flight, on a budget sized to exactly that window
+    /// (util::keep_stop_drain_budget_ms, 247 s as shipped). The wait suspends
+    /// on a poll timer, which hands control back to the very coroutine it is
+    /// waiting for -- and without this predicate post_quotes went on to the
+    /// next tier, re-armed the mark, and made the drain wait out an
+    /// unbounded ladder under a budget that covers one create. Worse than the
+    /// latency: it created NEW offers after the operator asked to stop, and a
+    /// budget that then expires abandons a create mid-flight, which is the
+    /// orphan the drain exists to prevent.
+    ///
+    /// Unset means "never stop", so nothing changes for callers that do not
+    /// wire it.
+    void set_stop_creating_predicate(std::function<bool()> predicate);
+
     /// [S31] Called when an offer created after the abort could not be
     /// cancelled again, with an operator-facing description.
     ///
@@ -809,6 +839,44 @@ public:
     /// log file turns that alert into a false all-clear about the one thing
     /// it is for.
     void set_escalation(std::function<void(const std::string&)> escalate);
+
+    /// [S74 / review #165] The flag a KEEP stop's drain watches.
+    ///
+    /// Set while a create_offer is outstanding AND the offer it returns is not
+    /// yet in State -- the one window in which stopping the io_context can
+    /// leave a live offer this process never recorded, and the next boot meets
+    /// as an ORPHAN it may cancel. Cleared by RAII, so a throw, an early
+    /// `continue` and an abandoned coroutine frame all clear it.
+    ///
+    /// NOT held for a whole ladder: every offer created earlier in the same
+    /// post_quotes call is already in State, and the keep stop's flush gives
+    /// each of those an offer_log row. Holding it across the ladder would make
+    /// the stop wait for up to 2 x num_tiers creates for no extra safety
+    /// (xop/util/stop_offers_policy.hpp has the budget arithmetic).
+    ///
+    /// Unset means the marks do nothing, so nothing changes for a caller that
+    /// does not wire it. Read and written on the io_context thread only.
+    void set_posting_in_flight_flag(bool* flag) noexcept;
+
+    /// [S74 / review #165, round 4] The flag that says "a create ended with
+    /// NO ANSWER, so the wallet may hold an offer this process never
+    /// recorded".
+    ///
+    /// The drain flag above answers "is a create outstanding RIGHT NOW"; this
+    /// one answers "did one already end in a way that proves nothing". A
+    /// create that throws a transport error clears its PostingMark -- there is
+    /// nothing left for the io_context to wait for -- but a timeout, an empty
+    /// reply or a 5xx does not prove the wallet refused it
+    /// (rpc::request_possibly_submitted). Set once and never cleared: only a
+    /// reconcile against the wallet could retire the doubt, and nothing here
+    /// does that. A keep stop READS it and says so, rather than reporting that
+    /// everything it created is recorded.
+    ///
+    /// Engine-owned (Engine::create_outcome_unknown_), exactly like the drain
+    /// flag, because the keep branch and the keep report are scan-forbidden
+    /// from calling back into OfferManager. Unset means the notes do nothing.
+    /// Read and written on the io_context thread only.
+    void set_create_outcome_unknown_flag(bool* flag) noexcept;
 
     /// Return the fee currently in effect (dynamic or static fallback).
     [[nodiscard]] std::uint64_t current_fee() const noexcept;
@@ -1479,7 +1547,30 @@ private:
 
     std::function<void(const std::string&, std::uint64_t)> cancel_observer_;
     std::function<bool()> abort_predicate_;
+
+    /// [S74 / review #165, round 4] set_stop_creating_predicate(). Checked
+    /// before every create and nowhere else: unlike abort_predicate_ it never
+    /// cancels anything, so a keep stop can use it.
+    std::function<bool()> stop_creating_predicate_;
     std::function<void(const std::string&)> escalate_;
+
+    /// [S74 / review #165] set_posting_in_flight_flag(). Owned by the engine
+    /// (Engine::posting_in_flight_); nullptr until it is wired.
+    bool* posting_in_flight_flag_{nullptr};
+
+    /// [S74 / review #165, round 4] set_create_outcome_unknown_flag(). Owned
+    /// by the engine (Engine::create_outcome_unknown_); nullptr until wired.
+    bool* create_outcome_unknown_flag_{nullptr};
+
+    /// Record that a create FAILED without proving the wallet made no offer.
+    ///
+    /// Called from every create's transport-error handler. Sets the engine's
+    /// flag (above) only when rpc::request_possibly_submitted says the request
+    /// may have reached the handler; a connect or TLS failure never wrote the
+    /// request, so it leaves the flag alone. Sends nothing, waits for nothing.
+    void note_create_outcome_unknown(const rpc::ChiaRPCTransportError& e,
+                                     const std::string& pair_name,
+                                     const char*        context);
 
     /// O(1) lookup: pair_name -> PairConfig.  Populated once in the
     /// constructor from AppConfig::pairs so that evaluate_rebalance()

@@ -1793,6 +1793,77 @@ TEST(ConfigParserTest, OfferExpiryOverride_NegativeAndAboveUint32Rejected) {
 }
 
 // ============================================================================
+// [S74 2026-09-20] engine.shutdown_offers, through the PARSER.
+//
+// The key decides what a stop does with a live book when nobody is there to
+// answer (Ctrl+C, SIGTERM, a session end, a pre-policy GUI).  Two things must
+// hold: a config written before the key existed keeps today's behaviour, and
+// no typo reads as a policy the operator did not choose -- the lenient reading
+// of every bad spelling below is a silent "cancel".
+// ============================================================================
+
+TEST(ConfigParserTest, ShutdownOffers_AbsentMeansCancel) {
+    TempYaml tmp(kMinimalValidYaml);
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_EQ(cfg.engine.shutdown_offers, xop::util::StopOffersPolicy::Cancel);
+}
+
+TEST(ConfigParserTest, ShutdownOffers_BothPoliciesRoundTrip) {
+    {
+        TempYaml tmp(std::string(kMinimalValidYaml) + "\nengine:\n  shutdown_offers: keep\n");
+        EXPECT_EQ(xop::load_config(tmp.path()).engine.shutdown_offers,
+                  xop::util::StopOffersPolicy::Keep);
+    }
+    {
+        TempYaml tmp(std::string(kMinimalValidYaml) + "\nengine:\n  shutdown_offers: cancel\n");
+        EXPECT_EQ(xop::load_config(tmp.path()).engine.shutdown_offers,
+                  xop::util::StopOffersPolicy::Cancel);
+    }
+    {
+        // Quoted, capitalised: one parser serves the config and the flag.
+        TempYaml tmp(std::string(kMinimalValidYaml) + "\nengine:\n  shutdown_offers: \"Keep\"\n");
+        EXPECT_EQ(xop::load_config(tmp.path()).engine.shutdown_offers,
+                  xop::util::StopOffersPolicy::Keep);
+    }
+    {
+        // An EMPTY SECTION is "not set": the key was never written.
+        TempYaml empty(std::string(kMinimalValidYaml) + "\nengine:\n");
+        EXPECT_EQ(xop::load_config(empty.path()).engine.shutdown_offers,
+                  xop::util::StopOffersPolicy::Cancel);
+        TempYaml braces(std::string(kMinimalValidYaml) + "\nengine: {}\n");
+        EXPECT_EQ(xop::load_config(braces.path()).engine.shutdown_offers,
+                  xop::util::StopOffersPolicy::Cancel);
+    }
+    // A key written and left BLANK is NOT "not set" -- see the rejected list.
+}
+
+TEST(ConfigParserTest, ShutdownOffers_AnythingElseIsRejectedNotDefaulted) {
+    // [review] A BLANK VALUE IS ONE OF THESE, not a default. `shutdown_offers:`
+    // with nothing after it is a half-finished edit, and reading it as "cancel"
+    // is exactly the silent default this section refuses -- arriving through
+    // the one section documented as STRICT. (`engine:` with no key at all is
+    // still "not set": covered above.)
+    for (const char* section : {
+             "engine:\n  shutdown_offers:\n",              // written and left BLANK
+             "engine:\n  shutdown_offers: ~\n",            // an explicit YAML null
+             "engine:\n  shutdown_offers: null\n",
+             "engine:\n  shutdown_offers: \"\"\n",         // an empty string
+             "engine:\n  shutdown_offers: kep\n",          // a typo in the value
+             "engine:\n  shutdown_offers: true\n",         // a YAML boolean
+             "engine:\n  shutdown_offers: 1\n",
+             "engine:\n  shutdown_offers: keep-bids\n",
+             "engine:\n  shutdown_offers: [keep]\n",       // not a scalar
+             "engine:\n  shutdown_offers:\n    mode: keep\n",
+             "engine:\n  shutdown_offer: keep\n",          // a typo in the KEY
+             "engine:\n  shutdown_offers: keep\n  other: 1\n",
+             "engine: keep\n",                             // not a mapping
+         }) {
+        TempYaml tmp(std::string(kMinimalValidYaml) + "\n" + section);
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError) << section;
+    }
+}
+
+// ============================================================================
 // [S33 2026-09-12] Non-finite values in the numeric knobs.
 //
 // yaml-cpp accepts `.nan` and `.inf`, and NaN makes EVERY comparison false --

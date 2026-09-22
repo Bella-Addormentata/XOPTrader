@@ -24,6 +24,7 @@
 #include <vector>
 #include <stdexcept>
 #include <xop/peg_registry.hpp>
+#include <xop/util/stop_offers_policy.hpp>
 
 namespace xop {
 
@@ -2713,6 +2714,32 @@ struct BuyerConfig {
 };
 
 // ---------------------------------------------------------------------------
+// EngineConfig -- the optional `engine:` section: process-level behaviour that
+// belongs to no trading subsystem.
+// ---------------------------------------------------------------------------
+struct EngineConfig {
+    /// [S74 2026-09-20] What a stop does with the resting book when the stop
+    /// request itself does not say: "cancel" (the default, and the only
+    /// behaviour before this key existed) or "keep".
+    ///
+    /// The GUI asks the operator on Stop and on window close and writes the
+    /// answer into data/shutdown.flag; THIS key answers every stop where
+    /// nobody was there to ask -- a console Ctrl+C, SIGTERM, a service stop,
+    /// an OS session end, a pre-policy GUI, a hand-written flag.  The rule and
+    /// the full table are in xop/util/stop_offers_policy.hpp.
+    ///
+    /// "keep" leaves offers TAKEABLE with no engine behind them: no TTL, no
+    /// repricing and no dead man's switch until the next start re-adopts
+    /// them.  The only bound on that is the on-chain expiry
+    /// (strategy.offer_expiry_secs), so the engine warns at startup when
+    /// "keep" is configured while an enabled pair posts offers with none.
+    ///
+    /// Read at startup only; a Settings save takes effect at the next engine
+    /// start, like every key the reload does not apply live.
+    util::StopOffersPolicy shutdown_offers{util::StopOffersPolicy::Cancel};
+};
+
+// ---------------------------------------------------------------------------
 // Top-level application configuration aggregating every section.
 // ---------------------------------------------------------------------------
 struct AppConfig {
@@ -2743,6 +2770,7 @@ struct AppConfig {
     MarketAllocatorConfig market_allocator;
     RecoveryConfig   recovery;
     BuyerConfig      buyer;
+    EngineConfig     engine;
 };
 
 // ---------------------------------------------------------------------------

@@ -96,6 +96,7 @@ from gui.ratio_targets import (
     ratio_targets_from,
     valid_ratio,
 )
+from gui import stop_offers
 from gui.theme import COLORS, HitTargetCheckBox, fit_row_height
 from gui.widgets.sub_tabs import SubTabPages
 
@@ -436,6 +437,10 @@ class SettingsWidget(QWidget):
         # rebased to by a save.  A name in here that the table no longer
         # holds was removed or renamed away, so a save drops its ratio target.
         self._populated_ratio_pair_names: frozenset[str] = frozenset()
+        # [S74] The engine.shutdown_offers policy the Risk tab's dropdown was
+        # last populated with, or rebased to by a save; None when the key was
+        # absent.  A save writes the key only when the dropdown differs.
+        self._populated_shutdown_offers: Optional[str] = None
         # (pair name, repr(value)) of the retired ratio_target_override keys
         # load_config has already warned about: the warning is one-time.
         self._warned_legacy_ratio_mirrors: frozenset[tuple[str, str]] = (
@@ -1088,7 +1093,40 @@ class SettingsWidget(QWidget):
         cb_form.addRow("Max Window Loss:", self._max_window_loss_bps)
 
         layout.addWidget(cb_group)
+
+        # -- [S74] Stopping the engine --
+        stop_group = QGroupBox("Stopping the Engine")
+        stop_layout = QVBoxLayout(stop_group)
+        stop_form = QFormLayout()
+        stop_form.setSpacing(8)
+        self._shutdown_offers = QComboBox()
+        # Index order IS stop_offers.POLICIES: cancel first, the default.
+        self._shutdown_offers.addItems([
+            "Cancel all offers (default)", "Keep offers on the book"])
+        self._shutdown_offers.setToolTip(
+            "engine.shutdown_offers: what a stop does with the resting offers "
+            "when nobody is asked -- log-off or shutdown, a signal, Ctrl+C in "
+            "a console, a service stop. Stop Trading and closing this window "
+            "ASK every time and only preselect this. Read by the engine at "
+            "startup: a change applies from the next engine start."
+        )
+        stop_form.addRow("Offers when nobody is asked:", self._shutdown_offers)
+        stop_layout.addLayout(stop_form)
+        stop_note = QLabel(
+            "Kept offers stay TAKEABLE with no engine behind them -- no "
+            "repricing, no TTL, no dead man's switch -- until the next start "
+            "re-adopts them. The only limit on that is the on-chain expiry "
+            "(strategy.offer_expiry_secs): choose Keep only together with an "
+            "expiry. The engine warns at startup when Keep is set and an "
+            "enabled pair posts offers with none."
+        )
+        stop_note.setWordWrap(True)
+        stop_note.setStyleSheet(f"color: {_C.TEXT_SECONDARY};")
+        stop_layout.addWidget(stop_note)
+        layout.addWidget(stop_group)
         layout.addStretch(1)
+        self._shutdown_offers.currentIndexChanged.connect(
+            lambda _i, ti=3: self._mark_dirty(ti))
 
         # Wire dirty tracking (tab index 3).
         for widget in (
@@ -3128,6 +3166,26 @@ class SettingsWidget(QWidget):
                 int(risk.get("max_window_loss_bps", 500))
             )
 
+            # -- engine -- [S74] The stop default. What the dropdown was
+            # LOADED with is remembered (None: the key was absent or
+            # unreadable), because save_config writes the key only when the
+            # operator changed it (stop_offers.merge_shutdown_offers).
+            # On a Load from Editor the BASELINE is the config the page last
+            # knew to be on disk, not the editor's text -- otherwise a policy
+            # changed in the editor would count as untouched and never be saved.
+            def _engine_policy(source: Any) -> Optional[str]:
+                section = (source or {}).get(stop_offers.CONFIG_SECTION)
+                if not isinstance(section, dict):
+                    return None
+                return stop_offers.parse_policy(
+                    section.get(stop_offers.CONFIG_KEY))
+
+            self._populated_shutdown_offers = _engine_policy(
+                cfg if ratio_baseline_cfg is None else ratio_baseline_cfg)
+            self._shutdown_offers.setCurrentIndex(
+                stop_offers.POLICIES.index(
+                    _engine_policy(cfg) or stop_offers.POLICY_CANCEL))
+
             # -- volatility --
             vol = cfg.get("volatility", {})
             self._lookback_blocks.setValue(
@@ -3305,7 +3363,7 @@ class SettingsWidget(QWidget):
             self._soft_limit, self._hard_limit, self._single_cat_cap,
             self._kelly_fraction, self._max_capital_per_pair,
             self._max_drawdown_pct, self._loss_window_blocks,
-            self._max_window_loss_bps,
+            self._max_window_loss_bps, self._shutdown_offers,
             self._prom_port, self._tg_token, self._tg_chat_id,
             self._lookback_blocks, self._yz_alpha, self._candle_agg_blocks,
             self._db_path, self._yaml_editor,
@@ -4097,6 +4155,45 @@ class SettingsWidget(QWidget):
         strategy = root.get("strategy")
         return strategy if isinstance(strategy, dict) else {}
 
+    def _read_disk_section(self, name: str) -> Optional[dict[str, Any]]:
+        """[S74] One top-level section of the loaded config.yaml as it is NOW.
+
+        ``None`` when no path is loaded or the file cannot be read or parsed
+        (the save then patches its loaded snapshot instead); ``{}`` when the
+        file is readable and simply has no such section -- which is an answer,
+        not a failure.  config.yaml only, never secrets.yaml.
+        """
+        if not self._config_path:
+            return None
+        try:
+            with open(self._config_path, encoding="utf-8") as fh:
+                root = yaml.safe_load(fh)
+        except (OSError, ValueError, yaml.YAMLError) as exc:
+            log.warning(
+                "Settings save: could not re-read %s (%s); the %s section "
+                "is patched onto the loaded snapshot",
+                self._config_path, exc, name,
+            )
+            return None
+        if not isinstance(root, dict):
+            return None
+        section = root.get(name)
+        return dict(section) if isinstance(section, dict) else {}
+
+    def _rebase_shutdown_offers(self, engine_section: Optional[dict[str, Any]]) -> None:
+        """[S74] Show what the save left on disk and make it the baseline, so
+        a later save cannot re-apply this one's edit over a newer on-disk
+        value -- and an untouched page stops showing a value the file no
+        longer has."""
+        value = (engine_section or {}).get(stop_offers.CONFIG_KEY)
+        self._populated_shutdown_offers = stop_offers.parse_policy(value)
+        was_blocked = self._shutdown_offers.blockSignals(True)
+        try:
+            self._shutdown_offers.setCurrentIndex(stop_offers.POLICIES.index(
+                self._populated_shutdown_offers or stop_offers.POLICY_CANCEL))
+        finally:
+            self._shutdown_offers.blockSignals(was_blocked)
+
     def save_config(self, path: Optional[str] = None) -> bool:
         """Validate and write the current settings to a YAML file.
 
@@ -4188,6 +4285,29 @@ class SettingsWidget(QWidget):
                 else:
                     strategy_out.pop(key, None)
 
+        # [S74] engine.shutdown_offers is PATCHED the same way.  The section
+        # is taken from a fresh read of the file being saved over (the loaded
+        # snapshot when saving anywhere else, or when the file cannot be
+        # read), and the one key is written only if the operator changed the
+        # dropdown -- so an untouched page never adds the key, never reverts a
+        # value edited on disk since it loaded, and never drops another key
+        # from the section.
+        snapshot_engine = (self._clean_snapshot or {}).get(
+            stop_offers.CONFIG_SECTION)
+        disk_engine = self._read_disk_section(
+            stop_offers.CONFIG_SECTION) if same_file else None
+        selected_policy = stop_offers.POLICIES[
+            max(0, self._shutdown_offers.currentIndex())]
+        engine_out = stop_offers.merge_shutdown_offers(
+            disk_engine if disk_engine is not None else snapshot_engine,
+            selected=selected_policy,
+            populated=self._populated_shutdown_offers,
+        )
+        if engine_out is not None:
+            cfg[stop_offers.CONFIG_SECTION] = engine_out
+        else:
+            cfg.pop(stop_offers.CONFIG_SECTION, None)
+
         # The deep-merge preserves unmanaged keys from the on-disk snapshot,
         # which is exactly wrong for keys the ENGINE refuses to start on: a
         # legacy risk.max_drawdown_pct loaded from a pre-rename (or
@@ -4229,6 +4349,7 @@ class SettingsWidget(QWidget):
         # [RATIO-SOT] Show what hit disk, and make it the baseline, so a later
         # save cannot re-apply this save's edits over a newer on-disk value.
         self._rebase_ratio_cells(merged_targets)
+        self._rebase_shutdown_offers(engine_out)
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._last_saved_time = now
         # [RELOAD] The truthful "does this reach the running engine?"

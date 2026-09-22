@@ -25,6 +25,17 @@ FORMAT v1 (ASCII, LF line endings, replaced atomically)::
 
 Only a line that starts at column 0 with ``pid=`` addresses the request.
 
+[S74 2026-09-20] One optional line more, still v1::
+
+    offers=<cancel|keep>
+
+says what the stop does with the resting offers (``gui/stop_offers.py``; the
+engine's table is ``cpp/include/xop/util/stop_offers_policy.hpp``). It is
+written only when the operator answered the stop prompt. Without it the engine
+applies its own ``engine.shutdown_offers`` -- which is what every stop with
+nobody to ask must get, and what every request written before the line existed
+already means. It never changes whose request this is.
+
 Standard library only; PyYAML is imported lazily inside
 :func:`resolve_shutdown_flag_path`. Anything under ``gui.services`` imports
 ``EngineBridge`` and therefore PySide6, and this module must stay importable
@@ -41,6 +52,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
+from gui.stop_offers import POLICY_CANCEL, POLICY_KEEP, parse_policy
+
 FLAG_NAME = "shutdown.flag"
 FORMAT_LINE = "xop-shutdown-request v1"
 MAX_PID = 0xFFFF_FFFF
@@ -50,6 +63,7 @@ _REPLACE_RETRY_S = 0.02
 
 _PID_KEY = "pid="
 _REQUESTER_KEY = "requested_by_pid="
+_OFFERS_KEY = "offers="
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +78,16 @@ class RequestKind(Enum):
     MALFORMED = "malformed"      # a pid line that names no process, or two
 
 
+class OffersRequest(Enum):
+    """[S74] What a request says about the resting offers -- the engine's
+    ``StopOffersRequest``, value for value."""
+
+    UNSPECIFIED = "unspecified"    # no offers line: the engine's config default
+    CANCEL = POLICY_CANCEL
+    KEEP = POLICY_KEEP
+    UNRECOGNISED = "unrecognised"  # a line nobody can read, or two of them
+
+
 @dataclass(frozen=True)
 class ParsedRequest:
     """A parsed flag. ``requester_pid`` is GUI-side information only: the
@@ -73,20 +97,42 @@ class ParsedRequest:
     kind: RequestKind
     pid: Optional[int] = None
     requester_pid: Optional[int] = None
+    offers: OffersRequest = OffersRequest.UNSPECIFIED
 
 
-def render_shutdown_request(target_pid: int, *, requester_pid: int, written_at: str) -> str:
-    """Return the v1 request text for *target_pid*."""
+def render_shutdown_request(
+    target_pid: int,
+    *,
+    requester_pid: int,
+    written_at: str,
+    offers_policy: Optional[str] = None,
+) -> str:
+    """Return the v1 request text for *target_pid*.
+
+    [S74] *offers_policy* ``"cancel"`` or ``"keep"`` appends the ``offers=``
+    line; None writes none, so the engine's ``engine.shutdown_offers`` decides
+    and the bytes are exactly what they were before the line existed. Anything
+    else raises: a request must never carry a policy the engine cannot read,
+    because the engine would then fall back to its default while the GUI
+    believed it had said something.
+    """
     if isinstance(target_pid, bool) or not isinstance(target_pid, int) \
             or not 1 <= target_pid <= MAX_PID:
         raise ValueError(
             f"target_pid must be an integer in 1..{MAX_PID}, got {target_pid!r}")
-    return (
+    text = (
         f"{FORMAT_LINE}\n"
         f"pid={target_pid}\n"
         f"requested_by_pid={requester_pid}\n"
         f"written_at={written_at}\n"
     )
+    if offers_policy is not None:
+        if offers_policy not in (POLICY_CANCEL, POLICY_KEEP):
+            raise ValueError(
+                f"offers_policy must be {POLICY_CANCEL!r}, {POLICY_KEEP!r} or "
+                f"None, got {offers_policy!r}")
+        text += f"{_OFFERS_KEY}{offers_policy}\n"
+    return text
 
 
 def _decimal_pid(value: str) -> Optional[int]:
@@ -114,10 +160,22 @@ def parse_shutdown_request(text: str) -> ParsedRequest:
     seen_pid = False
     target: Optional[int] = None
     requesters: list[Optional[int]] = []
+    offers = OffersRequest.UNSPECIFIED
     for raw in lines:
         line = raw[:-1] if raw.endswith("\r") else raw
         if line.startswith(_REQUESTER_KEY):
             requesters.append(_decimal_pid(line[len(_REQUESTER_KEY):]))
+
+        # [S74] Column 0 only, like "pid=". The first offers line is read; a
+        # second one makes the policy UNRECOGNISED whatever either says.
+        if line.startswith(_OFFERS_KEY):
+            if offers is OffersRequest.UNSPECIFIED:
+                policy = parse_policy(line[len(_OFFERS_KEY):])
+                offers = (OffersRequest(policy) if policy is not None
+                          else OffersRequest.UNRECOGNISED)
+            else:
+                offers = OffersRequest.UNRECOGNISED
+            continue
 
         # Column 0 only: "requested_by_pid=" must never address a request.
         if not line.startswith(_PID_KEY):
@@ -134,8 +192,8 @@ def parse_shutdown_request(text: str) -> ParsedRequest:
 
     requester = requesters[0] if len(requesters) == 1 else None
     if seen_pid:
-        return ParsedRequest(RequestKind.ADDRESSED, target, requester)
-    return ParsedRequest(RequestKind.UNADDRESSED)
+        return ParsedRequest(RequestKind.ADDRESSED, target, requester, offers)
+    return ParsedRequest(RequestKind.UNADDRESSED, offers=offers)
 
 
 def read_shutdown_request(flag_path: Path) -> Optional[ParsedRequest]:
@@ -161,8 +219,13 @@ def write_shutdown_request(
     *,
     requester_pid: Optional[int] = None,
     now: Optional[datetime] = None,
+    offers_policy: Optional[str] = None,
 ) -> None:
     """Write a v1 request for *target_pid* to *flag_path*, atomically.
+
+    [S74] *offers_policy* is the operator's answer to the stop prompt
+    (``"cancel"``/``"keep"``); None writes no ``offers=`` line and leaves the
+    decision to the engine's ``engine.shutdown_offers``.
 
     The bytes go to a temporary file beside the target and are moved over it
     with ``os.replace``, so the engine never reads a half-written request.
@@ -177,6 +240,7 @@ def write_shutdown_request(
         target_pid,
         requester_pid=requester_pid or os.getpid(),
         written_at=(now or datetime.now()).isoformat(timespec="seconds"),
+        offers_policy=offers_policy,
     )
     flag_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = flag_path.with_name(f"{flag_path.name}.{os.getpid()}.tmp")

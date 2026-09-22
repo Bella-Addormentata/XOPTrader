@@ -28,7 +28,7 @@ from typing import Any, Final, Optional
 
 from PySide6.QtCore import QObject, Qt, QTimer, Signal, Slot
 
-from gui import shutdown_flag
+from gui import shutdown_flag, stop_offers
 from gui.services.config_service import ConfigService
 from gui.services.config_split import split_and_save
 from gui.services.database_service import DatabaseService
@@ -213,6 +213,20 @@ class EngineBridge(QObject):
         self._engine_log_fh: Any = None
         self._engine_log_path: Path | None = None
         self._engine_launch_dir: Path | None = None
+        # [S74] Whether the engine binary THIS bridge launched advertises the
+        # stop policy in --help (stop_offers.ENGINE_HELP_TOKEN). False until a
+        # launch proves otherwise: an engine that predates the policy cancels
+        # the book on a request that says keep.
+        self._engine_keep_supported: bool = False
+        # The binary that probe was run against, and whether a "no" has
+        # already been asked a second time (engine_supports_keep_offers).
+        self._engine_binary_path: Path | None = None
+        self._engine_keep_reprobed: bool = False
+        # [S74] The operator's answer to the close prompt, held from
+        # MainWindow.closeEvent until aboutToQuit runs shutdown(). None means
+        # "nobody answered": the request carries no offers line and the
+        # engine's own engine.shutdown_offers decides.
+        self._close_offers_policy: Optional[str] = None
         self._tick_count: int = 0
 
         # Cache for the most recent price_mojos per pair, looked up from
@@ -356,7 +370,11 @@ class EngineBridge(QObject):
         self._database_svc.stop()
         self._wallet_svc.stop()
         self._warp_svc.stop()
-        self._stop_engine_process()
+        # [S74] The close prompt's answer, if the operator gave one. A session
+        # end or a signal reaches here with None, and the engine's own
+        # engine.shutdown_offers decides.
+        self._stop_engine_process(
+            offers_policy=getattr(self, "_close_offers_policy", None))
         _log.info("EngineBridge shutdown complete.")
 
     # ===================================================================
@@ -572,9 +590,28 @@ class EngineBridge(QObject):
                 + " is in the same folder as the GUI."
             )
 
-    def stop_engine(self) -> None:
-        """Gracefully stop the managed C++ engine subprocess."""
-        outcome = self._stop_engine_process()
+    def stop_engine(self, offers_policy: Optional[str] = None) -> None:
+        """Gracefully stop the managed C++ engine subprocess.
+
+        [S74] *offers_policy* is the operator's answer to the stop prompt:
+        ``"keep"`` leaves the resting offers on the book, ``"cancel"`` cancels
+        them, and None writes no policy into the request, so the engine's own
+        ``engine.shutdown_offers`` decides. A ``"keep"`` this engine build
+        cannot honour stops NOTHING: that engine would cancel the book, which
+        is the one outcome the operator just declined.
+        """
+        if (stop_offers.parse_policy(offers_policy) == stop_offers.POLICY_KEEP
+                and not self.engine_supports_keep_offers):
+            _log.error(
+                "Stop with offers kept was requested, but this engine build "
+                "does not advertise the stop policy; NOT stopping -- it would "
+                "cancel the book.")
+            self.error.emit(
+                "This engine build cannot keep offers across a stop (it "
+                "predates the stop policy and would cancel them). The engine "
+                "was NOT stopped.")
+            return
+        outcome = self._stop_engine_process(offers_policy=offers_policy)
         if outcome is shutdown_flag.StopOutcome.STILL_RUNNING:
             # [shutdown-flag-race] The Stop Trading button shows "Stopped"
             # whatever happens here; say so when that is not true.
@@ -610,6 +647,74 @@ class EngineBridge(QObject):
         """True while a GUI-launched engine subprocess is alive."""
         proc = getattr(self, "_engine_process", None)
         return proc is not None and proc.poll() is None
+
+    # -- [S74] the stop prompt's inputs -------------------------------------
+
+    @property
+    def engine_supports_keep_offers(self) -> bool:
+        """True when the launched engine binary advertises the stop policy.
+
+        The launch-time probe runs ``--help`` under a 2 s timeout, and a false
+        "no" sends the operator straight back to hard-killing the engine to
+        keep offers -- on exactly the overloaded machine (full blocks, a busy
+        wallet) where a keep stop matters most. So a "no" is asked ONCE more,
+        the first time anyone needs the answer. A second "no" stands.
+        """
+        if getattr(self, "_engine_keep_supported", False):
+            return True
+        path = getattr(self, "_engine_binary_path", None)
+        if path is not None and not getattr(self, "_engine_keep_reprobed", False):
+            self._engine_keep_reprobed = True
+            self._engine_keep_supported = self._engine_supports_flag(
+                path, stop_offers.ENGINE_HELP_TOKEN)
+            if self._engine_keep_supported:
+                _log.info(
+                    "Engine %s advertises the stop policy after all (the "
+                    "launch-time --help probe had timed out or failed).", path)
+        return bool(getattr(self, "_engine_keep_supported", False))
+
+    @property
+    def stop_offers_default(self) -> str:
+        """``engine.shutdown_offers`` as this GUI's config model has it -- what
+        the prompt preselects. The ENGINE's loaded value is what actually
+        applies to a stop with no policy; the two differ only when config.yaml
+        changed after the engine started."""
+        try:
+            config = self._config_svc.get_full_config()
+        except Exception:  # noqa: BLE001 -- a prompt default must never raise
+            config = None
+        return stop_offers.configured_default(config)
+
+    def resting_offers_summary(self) -> Optional[stop_offers.RestingSummary]:
+        """What offer_log says is resting right now, read-only and
+        synchronously (one SELECT) for the stop prompt. None when the database
+        cannot be read -- the prompt then says so."""
+        rows = stop_offers.read_resting_rows(getattr(self, "_db_path", None))
+        if rows is None:
+            return None
+        try:
+            config = self._config_svc.get_full_config()
+        except Exception:  # noqa: BLE001
+            config = None
+        return stop_offers.summarise_resting_offers(rows, config)
+
+    def _policy_for_request(self, requested: Optional[str]) -> Optional[str]:
+        """The policy that may be written for *requested*.
+
+        [review #165] The capability is consulted ONLY for an actual keep:
+        :attr:`engine_supports_keep_offers` may run a ``--help`` subprocess
+        under a 2 s timeout, and a session-end close (no policy) or a cancel
+        must not spend the OS's few shutdown seconds on a probe whose answer
+        cannot matter."""
+        if stop_offers.parse_policy(requested) != stop_offers.POLICY_KEEP:
+            return stop_offers.policy_to_send(requested, keep_supported=False)
+        return stop_offers.policy_to_send(
+            requested, keep_supported=self.engine_supports_keep_offers)
+
+    def set_close_offers_policy(self, policy: Optional[str]) -> None:
+        """Hold the close prompt's answer for :meth:`shutdown`. ``"keep"`` is
+        held only for an engine that can honour it."""
+        self._close_offers_policy = self._policy_for_request(policy)
 
     def request_config_reload(self) -> None:
         """[RELOAD] Ask the running engine to re-read config.yaml.
@@ -1127,6 +1232,12 @@ class EngineBridge(QObject):
             if secrets_path.is_file() and self._engine_supports_flag(engine_path, "--secrets"):
                 candidate_args.extend(["--secrets", str(secrets_path)])
 
+            # [S74] Same probe, for the stop policy: only an engine whose
+            # --help carries the token reads "offers=keep". Asked BEFORE the
+            # launch -- --help returns before main() touches anything.
+            keep_supported = self._engine_supports_flag(
+                engine_path, stop_offers.ENGINE_HELP_TOKEN)
+
             cmd: list[str] = [str(engine_path), *candidate_args]
             try:
                 launch_dir = self._determine_engine_launch_dir(engine_path)
@@ -1169,6 +1280,15 @@ class EngineBridge(QObject):
                 self._launched_config_path = (
                     self._config_path if self._config_path.is_file() else None
                 )
+                self._engine_keep_supported = keep_supported
+                self._engine_binary_path = engine_path
+                self._engine_keep_reprobed = False
+                if not keep_supported:
+                    _log.warning(
+                        "Engine %s did not advertise the stop policy in "
+                        "--help: unless a second probe says otherwise, a stop "
+                        "can only CANCEL its offers and the stop prompt will "
+                        "not offer Keep.", engine_path)
                 QTimer.singleShot(3_000, self._check_engine_startup_result)
                 return True
             except Exception:
@@ -1182,6 +1302,8 @@ class EngineBridge(QObject):
                 self._engine_log_path = None
                 self._engine_launch_dir = None
                 self._engine_process = None
+                self._engine_keep_supported = False
+                self._engine_binary_path = None
 
         return False
 
@@ -1203,8 +1325,17 @@ class EngineBridge(QObject):
         except Exception:
             return False
 
-    def _stop_engine_process(self) -> Optional[shutdown_flag.StopOutcome]:
+    def _stop_engine_process(
+        self,
+        offers_policy: Optional[str] = None,
+    ) -> Optional[shutdown_flag.StopOutcome]:
         """Stop the managed engine subprocess and report truthfully how it ended.
+
+        [S74] *offers_policy* (``"cancel"``/``"keep"``/None) is written into
+        the stop request as its ``offers=`` line; None writes none and the
+        engine applies its own ``engine.shutdown_offers``. A ``"keep"`` for an
+        engine that does not advertise the stop policy is withheld
+        (``stop_offers.policy_to_send``) and said so.
 
         [review #7] Windows terminate() is a hard kill the engine never sees
         -- closing the GUI mid-drain left the book resting unmanaged -- so a
@@ -1248,8 +1379,16 @@ class EngineBridge(QObject):
                     "Could not write %s (%s); a GUI launched after the engine "
                     "consumes shutdown.flag will not wait for this stop.",
                     shutdown_flag.STOP_MARKER_NAME, exc)
+            policy = self._policy_for_request(offers_policy)
+            if (stop_offers.parse_policy(offers_policy) == stop_offers.POLICY_KEEP
+                    and policy is None):
+                _log.error(
+                    "Keep was requested for engine PID %d, but this engine "
+                    "build does not advertise the stop policy: the request "
+                    "carries NO offers line and that engine will CANCEL its "
+                    "book.", pid)
             try:
-                outcome = self._stop_running_engine(proc, pid, flag)
+                outcome = self._stop_running_engine(proc, pid, flag, policy)
             finally:
                 if marker is not None:
                     shutdown_flag.remove_if_addressed_to(marker, pid)
@@ -1264,6 +1403,8 @@ class EngineBridge(QObject):
             self._engine_log_fh = None
         self._engine_log_path = None
         self._engine_launch_dir = None
+        self._engine_keep_supported = False
+        self._engine_binary_path = None
         return outcome
 
     def _stop_running_engine(
@@ -1271,6 +1412,7 @@ class EngineBridge(QObject):
         proc: subprocess.Popen,
         pid: int,
         flag: Path,
+        offers_policy: Optional[str] = None,
     ) -> shutdown_flag.StopOutcome:
         """Request a graceful stop of *proc*, escalate if needed, and classify it.
 
@@ -1281,13 +1423,21 @@ class EngineBridge(QObject):
         """
         forced = False
         request_written = False
+        if offers_policy == stop_offers.POLICY_KEEP:
+            intent = "leave its offers RESTING (offers=keep) and exit"
+        elif offers_policy == stop_offers.POLICY_CANCEL:
+            intent = "cancel its book (offers=cancel) and exit"
+        else:
+            intent = ("apply its own engine.shutdown_offers to its book (no "
+                      "offers line) and exit")
         try:
-            shutdown_flag.write_shutdown_request(flag, pid)
+            shutdown_flag.write_shutdown_request(
+                flag, pid, offers_policy=offers_policy)
             request_written = True
             _log.info(
                 "Wrote shutdown.flag addressed to engine PID %d; waiting up "
-                "to %d s for it to cancel its book and exit.",
-                pid, _GRACEFUL_STOP_WAIT_S)
+                "to %d s for it to %s.",
+                pid, _GRACEFUL_STOP_WAIT_S, intent)
             proc.wait(timeout=_GRACEFUL_STOP_WAIT_S)
         except subprocess.TimeoutExpired:
             forced = True

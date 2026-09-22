@@ -4239,6 +4239,82 @@ BuyerConfig parse_buyer(const YAML::Node& root)
     return cfg;
 }
 
+// ---------------------------------------------------------------------------
+// parse_engine -- optional `engine:` section.  [S74 2026-09-20]
+//
+// One key today: shutdown_offers, the stop policy used when a stop request
+// names none (xop/util/stop_offers_policy.hpp).  Absent means "cancel", so a
+// config written before the key existed behaves exactly as it did.
+//
+// STRICT, unlike the older sections: a section that is not a mapping, a key
+// this build does not know and a value it cannot read are all errors.  This
+// key decides what happens to a live book when nobody is there to answer, and
+// every lenient reading of a typo ("shutdown_offer: keep", "engine: keep",
+// "shutdown_offers: kep") is a silent "cancel" the operator did not choose.
+// [review] "A value it cannot read" INCLUDES A BLANK ONE.  `shutdown_offers:`
+// with nothing after it used to fall through to the default -- a silent
+// "cancel" arriving through the one section whose whole point is that it never
+// does that.  An empty SECTION is still "not set": there the key is absent.
+// ---------------------------------------------------------------------------
+EngineConfig parse_engine(const YAML::Node& root)
+{
+    const std::string sec = "engine";
+    EngineConfig cfg;
+
+    if (!root[sec] || !root[sec].IsDefined() || root[sec].IsNull()) {
+        return cfg;
+    }
+    const YAML::Node& node = root[sec];
+    if (!node.IsMap()) {
+        throw ConfigError(sec + " must be a mapping with the key "
+                          "shutdown_offers (cancel or keep)");
+    }
+    bool key_present = false;
+    for (auto it = node.begin(); it != node.end(); ++it) {
+        const std::string key =
+            it->first.IsScalar() ? it->first.as<std::string>() : std::string("<non-scalar key>");
+        if (key != "shutdown_offers") {
+            throw ConfigError(sec + "." + key + " is not a known key (the only "
+                              "key in this section is shutdown_offers)");
+        }
+        key_present = true;
+    }
+    // [review] An EMPTY section (`engine:`, `engine: {}`) really is "not set":
+    // the key was never written, and absent means cancel exactly as it did
+    // before the key existed.  A key that IS written and left BLANK
+    // (`shutdown_offers:`) is a different thing -- a half-finished edit -- and
+    // letting it read as "cancel" is precisely the silent default this section
+    // says it refuses.  Rejected below with the rest of the unreadable values.
+    if (!key_present) {
+        return cfg;
+    }
+
+    const YAML::Node& value = node["shutdown_offers"];
+    const bool has_value = static_cast<bool>(value) && value.IsDefined()
+                           && !value.IsNull();
+    const std::optional<util::StopOffersPolicy> policy =
+        (has_value && value.IsScalar())
+            ? util::parse_stop_offers_policy(value.as<std::string>())
+            : std::nullopt;
+    if (!policy.has_value()) {
+        std::string got;
+        if (!has_value) {
+            got = "an empty value";
+        } else if (value.IsScalar()) {
+            got = "\"" + value.as<std::string>() + "\"";
+        } else {
+            got = "a non-scalar value";
+        }
+        throw ConfigError(
+            sec + ".shutdown_offers must be \"cancel\" or \"keep\" (got "
+            + got
+            + "): it decides what a stop does with the resting offers "
+              "when the stop request does not say");
+    }
+    cfg.shutdown_offers = *policy;
+    return cfg;
+}
+
 // [PACE D1 2026-09-13] Per-pair concentration overrides.  The EFFECTIVE soft
 // limit (override or risk.soft_limit_pct) must be below the effective hard
 // limit for every configured pair, enabled or not, with or without the pace
@@ -4660,6 +4736,7 @@ AppConfig load_config(const std::string& path,
     cfg.market_allocator = parse_market_allocator(root);
     cfg.recovery   = parse_recovery(root);
     cfg.buyer      = parse_buyer(root);
+    cfg.engine     = parse_engine(root);
 
     // [S70 2026-09-20] Cross-section: ttl_cancel_mode: expire spares only an
     // offer that carries an on-chain expiry.  With no expiry configured on
