@@ -1720,6 +1720,14 @@ private:
     /// (PNL-BASIS-PERSIST).  Called after every mutation; never throws.
     void persist_inventory_state() noexcept;
 
+    /// [SEED-FAIL-CLOSED 2026-09-22] Make State's position in `asset` the
+    /// wallet's confirmed balance, whatever State held
+    /// (risk/state_position_truth.hpp).  Called by Step 8 at each balance read
+    /// below its wallet sync gate.  A read that verifies an asset the startup
+    /// seed could not read clears it from state_unverified_assets_.
+    void reconcile_state_position(const std::string& asset, Mojo confirmed,
+                                  bool fields_validated, BlockHeight block_height);
+
     // -- Double-entry accounting (LEDGER 2026-07-30) ------------------------
 
     /// Establish opening balances once, from the wallet's confirmed balances.
@@ -2728,6 +2736,12 @@ private:
         bool fields_validated{false};
     };
     std::unordered_map<std::string, WalletBalanceEntry> cached_wallet_balances_;
+
+    // [SEED-FAIL-CLOSED 2026-09-22] Assets whose State position the startup
+    // seed could not read from the wallet, and so took from the last
+    // persisted quantity.  Step 8 clears an asset the first time it reads a
+    // validated balance for it (reconcile_state_position).
+    std::unordered_set<std::string> state_unverified_assets_;
 
     // -- [PACE 2026-09-13] Pace controller state -----------------------------
     // The only pace state kept between heartbeats is each asset's activation

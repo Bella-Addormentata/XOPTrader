@@ -130,6 +130,7 @@ add_executable(xop_tests
     test_rpc_retry_policy.cpp
     test_price_cancel_replay.cpp
     test_stop_offers_policy.cpp
+    test_state_position_truth.cpp
 )
 
 target_link_libraries(xop_tests

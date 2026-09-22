@@ -5,6 +5,44 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### The risk limits read the wallet's positions, not a guess that fills made
+
+On 2026-09-22 every startup balance read timed out (four 30-second attempts
+each, 16:58:39 to 17:04:49) and the seed skipped each asset with a DEBUG line,
+so State (the positions the risk limits read) started empty and the log said
+nothing. Fills then gave State 1.103 XCH and 102.976 DBX, and no BYC. In that
+heartbeat the single-CAT cap read DBX as 52.8% of the portfolio (full block at
+50%) and sized the XCH/DBX ask to zero; after the next fill State held 0.103 XCH
+and 203.188 DBX, and DBX read as about 96%. The wallet held about 34.7 XCH, 99
+BYC and 2,167 DBX. Step 8 had a recovery for an unseeded State, but it fired
+only while a position was exactly zero, and the fills had made them non-zero
+before Step 8 first read a balance. (That evening Step 8 posted nothing anyway:
+it stopped at its wallet sync gate on every heartbeat. But the moment the
+wallet synced, the wrong State would have sized every ask, and nothing could
+have corrected it.)
+
+- **Every validated balance Step 8 reads now sets State's position**, whatever
+  State held before: the main loop's balance gate and the empty-ladder
+  liveness refresh, which is the only read a suspended pair's CAT gets (BYC's,
+  that evening). Fees, taker fills and deposits, which never pass through
+  `record_buy`/`record_sell`, stop accumulating in State as drift too. A reply
+  missing `confirmed_wallet_balance` or `pending_change` changes nothing, and
+  the bridge asset keeps its single writer while its scan is operational.
+- **An unread startup balance is never zero.** A failed read falls back to the
+  quantity last persisted for the asset (`inventory_state`), logs an ERROR
+  naming it, and stays unverified until Step 8 reads the wallet, which logs a
+  WARN with the correction. A built wallet map with no wallet for an asset is a
+  verified zero; an unbuilt one proves nothing. The empty State this replaces
+  was the least cautious default available: with no positions, concentration
+  reads "balanced" and every CAT 0%, so no limit can trip.
+- The per-asset startup read failure is logged as a WARN instead of DEBUG.
+
+Not in this change: the InventoryTracker (the strategy's `q`) and its one-shot
+Step 11 reconcile, and the XCH/DBX bid, which was zero for a different reason
+that evening (`q` above `q_max`).
+
 ## [0.10.25] — 2026-09-21 — less dust, fewer cancels, a fee controller shipped off, and stops that keep the book
 
 ### Less reward dust in new offers, except on the no-floor retry

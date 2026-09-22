@@ -26,6 +26,7 @@
 
 #include <atomic>
 #include <functional>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
@@ -116,6 +117,19 @@ public:
     /// Returns false (and does nothing) if the position has insufficient
     /// balance.  Logs via spdlog.
     [[nodiscard]] bool record_sell(const AssetId& asset_id, Mojo qty);
+
+    /// [SEED-FAIL-CLOSED 2026-09-22] Set the position in `asset_id` to
+    /// `observed` mojos, a balance the wallet reported.  record_buy and
+    /// record_sell move a position by a delta, so a position is only ever as
+    /// right as the balance it started from; this replaces the balance
+    /// outright.  Only the quantity changes: the weighted-average cost basis
+    /// is kept, and a position with none (absent or empty) takes the unit
+    /// basis the startup seed has always used.  An absent asset observed at
+    /// zero gets no entry.  Logs a change via spdlog.
+    /// Returns the balance held before the call, or std::nullopt (and changes
+    /// nothing) for a negative `observed`, which no wallet reports.
+    [[nodiscard]] std::optional<Mojo> reconcile_balance(const AssetId& asset_id,
+                                                        Mojo           observed);
 
     /// Inventory skew metric for a base/quote pair.
     /// Returns a value in [-1.0, +1.0]:

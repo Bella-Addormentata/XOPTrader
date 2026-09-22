@@ -39,6 +39,7 @@
 #include "xop/execution/mid_gate.hpp"
 #include "xop/risk/valuation_authority.hpp"
 #include "xop/risk/usd_route.hpp"
+#include "xop/risk/state_position_truth.hpp"
 
 #include "xop/accounting/bridge_ingest.hpp"
 #include "xop/accounting/reward_ingest.hpp"
@@ -3081,18 +3082,24 @@ asio::awaitable<void> Engine::poll_loop_coro()
     }
 
     if (inventory_ && offer_mgr_ && wallet_) {
+        // Collect unique asset IDs across all enabled pairs.
+        std::unordered_set<std::string> seed_asset_ids;
+        for (const auto& pair : config_.pairs) {
+            if (!pair.enabled) continue;
+            seed_asset_ids.insert(pair.base_asset_id);
+            seed_asset_ids.insert(pair.quote_asset_id);
+        }
+        // [SEED-FAIL-CLOSED 2026-09-22] What the wallet actually said, per
+        // asset, for the State seed below the try: a confirmed balance from a
+        // reply that carried one, or "the built wallet map has no wallet for
+        // it".  An asset in neither was not read.
+        std::unordered_map<std::string, Mojo> state_seed_confirmed;
+        std::unordered_set<std::string>       state_seed_not_held;
+
         try {
             // Ensure the wallet-ID cache is populated so that
             // resolve_wallet_id() returns real IDs for CAT assets.
             co_await offer_mgr_->ensure_wallet_ids();
-
-            // Collect unique asset IDs across all enabled pairs.
-            std::unordered_set<std::string> seed_asset_ids;
-            for (const auto& pair : config_.pairs) {
-                if (!pair.enabled) continue;
-                seed_asset_ids.insert(pair.base_asset_id);
-                seed_asset_ids.insert(pair.quote_asset_id);
-            }
 
             Mojo total_seeded = 0;
             // [LEDGER] Collect confirmed balances so opening entries can be
@@ -3109,7 +3116,12 @@ asio::awaitable<void> Engine::poll_loop_coro()
             std::unordered_map<AssetId, std::string> genesis_observed_at;
             for (const auto& aid : seed_asset_ids) {
                 auto wid = offer_mgr_->resolve_wallet_id(aid);
-                if (wid <= 0) continue;
+                if (wid <= 0) {
+                    if (offer_mgr_->wallet_ids_resolved()) {
+                        state_seed_not_held.insert(aid);
+                    }
+                    continue;
+                }
 
                 try {
                     auto bal_json = co_await wallet_->get_wallet_balance(wid);
@@ -3117,6 +3129,9 @@ asio::awaitable<void> Engine::poll_loop_coro()
                                                     static_cast<Mojo>(0));
                     Mojo confirmed = bal_json.value("confirmed_wallet_balance",
                                                     static_cast<Mojo>(0));
+                    if (bal_json.contains("confirmed_wallet_balance")) {
+                        state_seed_confirmed[aid] = confirmed;
+                    }
                     // [S19 review round 6] The bridge asset records
                     // its opening even at ZERO balance: the zero-opening
                     // exception in post_ledger_genesis is unreachable
@@ -3160,18 +3175,17 @@ asio::awaitable<void> Engine::poll_loop_coro()
                     // real mojos held.
                     inventory_->seed_position(AssetId{aid}, seed_qty,
                                               Mojo{1});
-                    // Also seed State positions so that evaluate_limits()
-                    // has accurate balances from the start (not just
-                    // from detected fills).
-                    state_->record_buy(AssetId{aid}, seed_qty, Mojo{1});
                     total_seeded += seed_qty;
 
                     spdlog::info("[Engine] Seeded inventory for asset {} "
                                  "(wallet {}): {} mojos",
                                  aid.substr(0, 12), wid, seed_qty);
                 } catch (const std::exception& e) {
-                    spdlog::debug("[Engine] Could not query balance for "
-                                  "wallet {}: {}", wid, e.what());
+                    // [SEED-FAIL-CLOSED] Was DEBUG: on 2026-09-22 all three
+                    // reads failed and the log said nothing.
+                    spdlog::warn("[Engine] Could not query the startup balance "
+                                 "of {} (wallet {}): {}",
+                                 aid.substr(0, 12), wid, e.what());
                 }
             }
 
@@ -3192,7 +3206,39 @@ asio::awaitable<void> Engine::poll_loop_coro()
                                 genesis_observed_at);
         } catch (const std::exception& ex) {
             spdlog::warn("[Engine] Startup inventory seeding failed: {}; "
-                         "continuing with zero inventory", ex.what());
+                         "continuing without a wallet seed", ex.what());
+        }
+
+        // [SEED-FAIL-CLOSED 2026-09-22] Seed State -- the positions the risk
+        // limits read -- for EVERY tracked asset, whether or not the loop
+        // above reached it (risk/state_position_truth.hpp).  Here, below the
+        // try, so a failure that ends the loop early still seeds the rest.
+        // It used to be seeded inside the loop, and a failed read left the
+        // asset out of State: an empty State trips no concentration or
+        // single-CAT limit at all.
+        if (state_) {
+            for (const auto& aid : seed_asset_ids) {
+                const auto wallet_read = state_seed_confirmed.find(aid);
+                const std::optional<Mojo> wallet_confirmed =
+                    (wallet_read != state_seed_confirmed.end())
+                        ? std::optional<Mojo>{wallet_read->second}
+                        : std::nullopt;
+                const risk::SeedDecision seed = risk::decide_state_seed(
+                    wallet_confirmed, state_seed_not_held.count(aid) > 0,
+                    inventory_->net_inventory(AssetId{aid}));
+                // Never refused: decide_state_seed() returns no negative
+                // quantity, the one input reconcile_balance() rejects.
+                (void)state_->reconcile_balance(AssetId{aid}, seed.quantity);
+                if (seed.source == risk::SeedSource::LastKnown) {
+                    state_unverified_assets_.insert(aid);
+                    spdlog::error("[Engine] Startup: the wallet balance of {} "
+                                  "was not read -- its State position, which "
+                                  "the risk limits read, is the last persisted "
+                                  "quantity ({} mojos) and stays UNVERIFIED "
+                                  "until Step 8 reads the wallet",
+                                  aid.substr(0, 12), seed.quantity);
+                }
+            }
         }
     }
 
@@ -11951,10 +11997,20 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     if (bal_json.contains("pending_change"))
                         pending =
                             bal_json["pending_change"].get<Mojo>();
+                    const bool fields_validated =
+                        bal_json.contains("confirmed_wallet_balance")
+                        && bal_json.contains("pending_change");
                     cached_wallet_balances_[asset] =
                         {spendable, confirmed, pending, block_height,
-                         bal_json.contains("confirmed_wallet_balance")
-                             && bal_json.contains("pending_change")};
+                         fields_validated};
+                    // [SEED-FAIL-CLOSED 2026-09-22] The main loop never reads
+                    // the assets of a pair with an empty ladder -- a suspended
+                    // pair's, for one -- yet they count in every other pair's
+                    // portfolio fractions.  On 2026-09-22 XCH/BYC was
+                    // suspended, and after its failed startup read BYC never
+                    // entered State.
+                    reconcile_state_position(asset, confirmed, fields_validated,
+                                             block_height);
                     // Log only transitions worth an operator's eye: a
                     // balance appearing where the cache had none/zero.
                     if (confirmed > 0
@@ -12497,10 +12553,22 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                         // consumers can reject stale snapshots (Step 8 is
                         // skipped in several engine modes while Step 2 keeps
                         // mutating inventory).
+                        const bool fields_validated =
+                            bal_json.contains("confirmed_wallet_balance")
+                            && bal_json.contains("pending_change");
                         cached_wallet_balances_[sb.label] =
                             {spendable, confirmed, pending, block_height,
-                             bal_json.contains("confirmed_wallet_balance")
-                                 && bal_json.contains("pending_change")};
+                             fields_validated};
+                        // [SEED-FAIL-CLOSED 2026-09-22] State follows the
+                        // wallet on every validated read.  The recovery this
+                        // replaces fired only while State's position was
+                        // EXACTLY zero: on 2026-09-22 the startup reads all
+                        // failed, fills landed before Step 8 first read a
+                        // balance, and the small non-zero positions they
+                        // left (0.103 of ~34.7 XCH) disarmed it until a
+                        // position returned to exactly zero.
+                        reconcile_state_position(sb.label, confirmed,
+                                                 fields_validated, block_height);
                         const AssetId tracked_asset{sb.label};
                         // [S19 review round 6] The bridge asset's
                         // inventory and State position are maintained by
@@ -12509,7 +12577,9 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                         // mint the scan is about to book.  Same exclusion
                         // as Step 11's one-shot reconcile.  Only while
                         // the scan is OPERATIONAL (round 11) -- when it
-                        // stands down, this recovery seed resumes.
+                        // stands down, this recovery seed resumes.  The
+                        // State side of the exclusion is applied inside
+                        // reconcile_state_position().
                         const bool bridge_owned =
                             sb.label == config_.accounting.bridge_asset_id
                             && bridge_accounting_operational();
@@ -12526,15 +12596,6 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                             // sentinel to a market mark next heartbeat;
                             // persist so a crash in between round-trips.
                             persist_inventory_state();
-                        }
-                        if (!bridge_owned && confirmed > 0 && state_
-                            && state_->get_position(tracked_asset).balance == 0)
-                        {
-                            state_->record_buy(tracked_asset, confirmed, Mojo{1});
-                            spdlog::warn("[Engine] Step 8: recovered state "
-                                         "position for asset {} from wallet "
-                                         "confirmed balance {} mojos",
-                                         sb.label, confirmed);
                         }
                         metrics_->update_spendable_reserve(
                             sb.label,
@@ -18484,6 +18545,29 @@ void Engine::persist_inventory_state() noexcept
         }
     } catch (...) {
         spdlog::warn("[Engine] persist_inventory_state: unexpected failure");
+    }
+}
+
+void Engine::reconcile_state_position(const std::string& asset, Mojo confirmed,
+                                      bool fields_validated,
+                                      BlockHeight block_height)
+{
+    if (!state_) return;
+    // [S19 review round 6] While the bridge scan is operational it is the
+    // single writer of the bridge asset's State position.
+    const bool bridge_owned = asset == config_.accounting.bridge_asset_id
+                              && bridge_accounting_operational();
+    const risk::TruthResult r = risk::apply_wallet_truth(
+        *state_, AssetId{asset}, confirmed, fields_validated, bridge_owned);
+    if (r.outcome == risk::TruthOutcome::Skipped) return;
+    // A correction to an asset the startup seed did read is routine -- fees,
+    // taker fills and deposits never pass through record_buy/record_sell --
+    // and State logs it.  Verifying a fallback position is the event.
+    if (state_unverified_assets_.erase(asset) > 0) {
+        spdlog::warn("[Engine] Step 8: State position of {} verified against "
+                     "the wallet at block {}: {} -> {} mojos (startup could "
+                     "not read it and used the last persisted quantity)",
+                     asset.substr(0, 12), block_height, r.previous, confirmed);
     }
 }
 

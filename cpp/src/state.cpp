@@ -198,6 +198,56 @@ bool State::record_sell(const AssetId& asset_id, Mojo qty)
     return ok;
 }
 
+std::optional<Mojo> State::reconcile_balance(const AssetId& asset_id,
+                                             Mojo           observed)
+{
+    if (observed < 0) {
+        spdlog::error("reconcile_balance: negative observed balance {} for "
+                      "asset={} -- rejected", observed, asset_id);
+        return std::nullopt;
+    }
+
+    std::unique_lock lock(mtx_positions_);
+
+    auto it = positions_.find(asset_id);
+    if (it == positions_.end()) {
+        if (observed == 0) {
+            return Mojo{0};   // nothing held and nothing tracked: no entry
+        }
+        it = positions_.try_emplace(asset_id, asset_id).first;
+    }
+
+    Position&  pos      = it->second;
+    const Mojo previous = pos.balance;
+    if (previous == observed) {
+        return previous;
+    }
+
+    if (observed == 0) {
+        pos.balance    = 0;
+        pos.total_cost = 0.0;   // full exit, as Position::remove does
+    } else if (previous > 0) {
+        // Scale the cost with the quantity: the weighted average survives
+        // exactly, whichever way the balance moved.
+        pos.total_cost *= static_cast<double>(observed)
+                        / static_cast<double>(previous);
+        pos.balance     = observed;
+    } else {
+        // No holdings to take a basis from: the unit-mojo basis of the
+        // startup seed (record_buy(qty, Mojo{1})).
+        pos.balance    = observed;
+        pos.total_cost = static_cast<double>(observed);
+    }
+    pos.cost_basis = (pos.balance > 0)
+        ? static_cast<Mojo>(std::llround(pos.total_cost
+                                         / static_cast<double>(pos.balance)))
+        : 0;
+
+    spdlog::info("reconcile   asset={} balance {} -> {} basis={}",
+                  asset_id, previous, observed, pos.cost_basis);
+    return previous;
+}
+
 double State::inventory_skew(const AssetId& base_id, const AssetId& quote_id) const
 {
     // Skew = (base_value - quote_value) / (base_value + quote_value)
