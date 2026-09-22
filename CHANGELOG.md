@@ -5,7 +5,9 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — less reward dust in new offers, except on the no-floor retry
+## [0.10.25] — 2026-09-21 — less dust, fewer cancels, a fee controller shipped off, and stops that keep the book
+
+### Less reward dust in new offers, except on the no-floor retry
 
 Dexie pays liquidity rewards as one tiny coin per rewarded offer. On 2026-09-19
 the DBX wallet held 4,575 unspent coins, 4,389 of them under 0.1 DBX and worth
@@ -191,7 +193,7 @@ attempt (30 s) instead of four (about 124 s). `take_offer` is unchanged. For the
 same reason a merged create that ends with no answer is no longer followed by
 one create per tier; a refusal, or a failure before the request was written,
 still is.
-## [Unreleased] — a closed-loop fee controller, shipped off
+### A closed-loop fee controller, shipped off
 
 With Chia blocks about 97% full the node admits a spend only at 5 mojos or more
 per unit of CLVM cost. The engine paid the node's estimate for a plain XCH send
@@ -476,8 +478,6 @@ default to off, and with both off every fee is what v0.10.24 paid.
   top is about one window's spend.
 - Found while measuring, not fixed here: Step 8's force-delete fires after a
   median of 176 seconds, not the ~10 minutes its constant documents (S68).
-## [Unreleased]
-
 ### Cancel far fewer offers (S70-S72) -- three switches, all default OFF
 
 In the 14 days to block 9,319,413 the bot posted 1,283 offers, filled 15 and
@@ -517,7 +517,7 @@ Three rules made 97% of them. Each now has a replacement behind its own
   maker's own wallet derived (`trade_manager.py:500,518`: each requested payment
   is a notarized payment to `action_scope.get_puzzle_hash`), so it moves the
   coin records and the balances this bot reads elsewhere. A sound local detector
-  is therefore constructible; it is filed with its design as S77 and is **not**
+  is therefore constructible; it is filed with its design as S78 and is **not**
   implemented here. Until it is, the shipped check is external: an offer this
   bot retired should end at Dexie `status: 6` with `spent_block_index: null`,
   and a `status: 4` with a block index means someone took it after the retire.
@@ -562,8 +562,6 @@ Three rules made 97% of them. Each now has a replacement behind its own
 
 Out of scope and unchanged: startup sweeps, Cancel All, reload-disabled pairs,
 shutdown, every safety cancel, UTXO liberation, and the stopped-engine TTL sweep.
-## [Unreleased]
-
 ### A stop can keep the offers on the book (S74)
 
 - **Stopping the engine no longer has to cancel everything.** A graceful stop
