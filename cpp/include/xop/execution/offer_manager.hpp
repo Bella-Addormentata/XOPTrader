@@ -52,6 +52,7 @@
 
 #include "xop/execution/coin_lock_ledger.hpp"
 #include "xop/execution/offer_expiry.hpp"
+#include "xop/execution/offer_min_input_coin.hpp"
 #include "xop/execution/take_retry.hpp"
 #include "xop/execution/terminal_recheck.hpp"
 #include <spdlog/spdlog.h>
@@ -974,6 +975,35 @@ public:
         std::uint64_t       expected_max_time,
         const char*         context);
 
+    // -- [MIN-INPUT-COIN] wiring (decisions in offer_min_input_coin.hpp) ----
+
+    /// The ONLY place this class calls wallet_->create_offer, so no posting
+    /// path can fund an offer from reward dust by forgetting the floor
+    /// (tests/test_offer_min_input_coin_wiring.py pins that).  Computes
+    /// min_coin_amount from the offer_dict and
+    /// strategy.offer_min_input_coin_frac, and retries ONCE without it when
+    /// the wallet ANSWERS that the floor leaves too little to spend.  Every
+    /// other failure propagates exactly as wallet_->create_offer raised it,
+    /// so the call sites keep their own handling.
+    ///
+    /// @param tier_index  The tier, or the first tier of a merged batch.
+    /// @param context     "tier", "merged batch" or "batch fallback".
+    asio::awaitable<json> create_offer_min_coin(
+        const json&                  offer_dict,
+        std::optional<std::uint64_t> expiry_max_time,
+        const PairConfig&            pair,
+        Side                         side,
+        int                          tier_index,
+        const char*                  context);
+
+    /// Dexie refused an offer for having too many input coins: say so in one
+    /// greppable line ("[dexie-too-many-inputs]") that names the remedy.
+    void note_dexie_too_many_inputs(const std::string& posting,
+                                    std::size_t        offer_chars);
+
+    /// How often that has happened since this process started.
+    std::uint64_t dexie_too_many_inputs_count_{0};
+
     /**
      * @brief Emergency cancel with reduced or zero fee.
      *
@@ -1219,6 +1249,9 @@ private:
      * (the offer is already valid on-chain).
      *
      * @param offer_text  Bech32m-encoded offer string.
+     * @param posting     Which offer this is ("XCH/DBX Bid tier 4"), for the
+     *                    [dexie-too-many-inputs] warning.  By value: this is
+     *                    a coroutine.
      * @return Dexie's offer id on success, empty string on any error.
      *         The id MUST be retained on the PendingOffer: the dexie
      *         orderbook reports our resting offers under it, and own-offer
@@ -1226,7 +1259,8 @@ private:
      *         (as this did until 2026-07-30) leaves the taker able to trade
      *         against the bot's own offers.
      */
-    asio::awaitable<std::string> submit_to_dexie(const std::string& offer_text);
+    asio::awaitable<std::string> submit_to_dexie(const std::string& offer_text,
+                                                 std::string        posting);
 
     /**
      * @brief One-time initialisation of the asset-to-wallet-ID cache.

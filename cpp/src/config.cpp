@@ -18,6 +18,10 @@
 #include "xop/rpc/coingecko_parse.hpp"
 #include "xop/feed_listings.hpp"
 #include "xop/strategy/pid_reachability.hpp"
+// [review #162, round 7] For the Dexie input-limit constants and the
+// ceil(1 / frac) bound, so the load-time warning and the runtime one cannot
+// disagree about the threshold.
+#include "xop/execution/offer_min_input_coin.hpp"
 
 #include <spdlog/spdlog.h>
 #include <yaml-cpp/yaml.h>
@@ -1155,6 +1159,47 @@ StrategyConfig parse_strategy(const YAML::Node& root)
     if (node["offer_expiry_secs"] && node["offer_expiry_secs"].IsDefined()
         && !node["offer_expiry_secs"].IsNull()) {
         cfg.offer_expiry_secs = read_uint32(node, "offer_expiry_secs", sec);
+    }
+
+    // [MIN-INPUT-COIN] Optional; absent or null keeps the 0.01 default.
+    // [0, 1): 0 is a real setting ("send no floor"), and 1 would demand a
+    // single coin at least as large as the whole offer.  Non-finite values
+    // throw inside the helper before the range test, which NaN would pass.
+    cfg.offer_min_input_coin_frac = read_optional_finite_in_range(
+        node, "offer_min_input_coin_frac", sec,
+        cfg.offer_min_input_coin_frac, 0.0, 1.0,
+        /*lo_open=*/false, /*hi_open=*/true);
+    // [review #162, round 7] THE RANGE IS WIDER THAN THE KEY IS USEFUL OVER.
+    // [0, 1) is the right ACCEPTANCE test -- 0 really means "send no floor"
+    // and the arithmetic is sound at every value in it -- but the whole point
+    // of the floor is to bound the input count under what Dexie accepts, and
+    // below 1/124 the bound it guarantees is itself above that limit.  Such a
+    // value loads silently, and a create the wallet SATISFIES can then still
+    // be refused for input count, which is the one case the runtime warning
+    // cannot diagnose from its own arguments.  Not an error: the key is not
+    // load-bearing for safety and an operator may be mid-experiment.
+    if (execution::min_input_coin_frac_ppb(cfg.offer_min_input_coin_frac) != 0
+        && !execution::min_input_coin_bound_fits_dexie(
+               cfg.offer_min_input_coin_frac)) {
+        spdlog::warn(
+            "[Config] {}.offer_min_input_coin_frac ({}) leaves the CAT-leg "
+            "bound ABOVE Dexie's limit: ceil(1 / frac) = {} inputs, plus the "
+            "XCH fee coin, against the {} inputs Dexie was measured to "
+            "accept.  The floor still loads and still keeps dust out, but it "
+            "no longer guarantees what it exists for -- an offer the wallet "
+            "builds WITHIN this floor can be refused with \"Too many input "
+            "coins\", and the [dexie-too-many-inputs] warning cannot then "
+            "tell that case from the no-floor retry.  Use at least {:.5f} "
+            "(= 1 / {}); the default 0.01 bounds it at {}.  0 disables the "
+            "floor and is not warned about.",
+            sec, cfg.offer_min_input_coin_frac,
+            execution::min_input_coin_cat_leg_bound(
+                cfg.offer_min_input_coin_frac),
+            execution::kDexieMeasuredInputLimit,
+            execution::min_input_coin_safe_frac(),
+            execution::kDexieMeasuredInputLimit
+                - execution::kDexieFeeLegInputsToday,
+            execution::min_input_coin_cat_leg_bound(0.01));
     }
     cfg.num_tiers            = read_uint32_positive(node, "num_tiers", sec);
 

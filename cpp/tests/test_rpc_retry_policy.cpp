@@ -131,3 +131,55 @@ TEST(RpcRetryPolicy, APostSendCancelFailureIsPossiblySubmitted) {
         EXPECT_FALSE(cancel_possibly_submitted(CURLE_OK, code)) << "HTTP " << code;
     }
 }
+
+// ---------------------------------------------------------------------------
+// [MIN-INPUT-COIN review #162, round 2] create_offer_for_ids.
+//
+// The min-input-coin fallback answers one specific wallet refusal with one
+// more create, on the premise that a refusal proves no offer was built.
+// rpc_post returns only its last attempt, so while this endpoint was re-sent
+// after a timeout the refusal could answer a COPY whose original had already
+// built the offer -- and the fallback then created a second one.
+// ---------------------------------------------------------------------------
+
+using xop::rpc::create_possibly_submitted;
+
+TEST(RpcRetryPolicy, ACreateIsNeverResentOnceItMayHaveReachedTheWallet) {
+    // Spelled exactly as ChiaWalletRPC::create_offer passes it.
+    const RpcRetryPolicy create =
+        retry_policy_for_endpoint("create_offer_for_ids");
+    ASSERT_EQ(create, RpcRetryPolicy::NeverResend);
+
+    // The shape that made two offers: no reply within the timeout, the
+    // request possibly still running inside the wallet.
+    EXPECT_FALSE(may_resend(create, CURLE_OPERATION_TIMEDOUT, /*transient=*/true));
+    EXPECT_FALSE(may_resend(create, CURLE_RECV_ERROR, true));
+    EXPECT_FALSE(may_resend(create, CURLE_GOT_NOTHING, true));
+    EXPECT_FALSE(may_resend(create, CURLE_OK, true));  // an HTTP 5xx
+
+    // A wallet that is down was never asked: still worth another attempt.
+    EXPECT_TRUE(may_resend(create, CURLE_COULDNT_CONNECT, true));
+    EXPECT_TRUE(may_resend(create, CURLE_SSL_CONNECT_ERROR, true));
+
+    // Deliberately narrow: the other non-idempotent endpoint is unchanged.
+    EXPECT_EQ(retry_policy_for_endpoint("take_offer"),
+              RpcRetryPolicy::RetryTransient);
+}
+
+TEST(RpcRetryPolicy, AnUnansweredCreateMayHaveBuiltTheOffer) {
+    // What post_merged_side asks before it answers a failed merged create
+    // with one create per tier.
+    EXPECT_TRUE(create_possibly_submitted(CURLE_OPERATION_TIMEDOUT, 0));
+    EXPECT_TRUE(create_possibly_submitted(CURLE_RECV_ERROR, 0));
+    EXPECT_TRUE(create_possibly_submitted(CURLE_GOT_NOTHING, 0));
+    EXPECT_TRUE(create_possibly_submitted(CURLE_OK, 500));
+    EXPECT_TRUE(create_possibly_submitted(CURLE_OK, 200));  // unparseable 2xx
+
+    // Provably never written, or answered with a refusal: the wallet built
+    // nothing, and the individual fallback is safe.
+    EXPECT_FALSE(create_possibly_submitted(CURLE_COULDNT_CONNECT, 0));
+    EXPECT_FALSE(create_possibly_submitted(CURLE_SSL_CONNECT_ERROR, 0));
+    EXPECT_FALSE(create_possibly_submitted(CURLE_COULDNT_RESOLVE_HOST, 0));
+    EXPECT_FALSE(create_possibly_submitted(CURLE_OK, 400));
+    EXPECT_FALSE(create_possibly_submitted(CURLE_OK, 429));
+}

@@ -5,6 +5,193 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — less reward dust in new offers, except on the no-floor retry
+
+Dexie pays liquidity rewards as one tiny coin per rewarded offer. On 2026-09-19
+the DBX wallet held 4,575 unspent coins, 4,389 of them under 0.1 DBX and worth
+84.6 DBX together. The wallet's coin selection minimises overshoot, which
+favours dust, so an XCH/DBX bid paying 80.334 DBX became a 62,228-character
+offer that Dexie refused with HTTP 400 "Too many input coins". The offer still
+existed in the wallet and locked its coins, listed nowhere. `engine.log` holds
+13 such refusals between 2026-09-10 and 2026-09-19.
+
+What the floor below does, stated plainly: the **first** create for each offer
+asks the wallet for coins of at least 1% of the amount, which bounds its CAT
+leg at 100 inputs — about 46,000 characters at the 459 per input measured
+here, against refusals that began at 60,612. (That bounds the CAT leg only:
+the XCH fee coin is a separate selection this CAT-scaled value does not
+constrain — one coin while every XCH coin covers the fee, as today's do by
+133x the **cap** on that fee, which is a measurement and not a guarantee.)
+Those 13 HTTP 400s
+become a create the wallet either satisfies or refuses up front, before any
+offer exists. What the floor does **not** do is guarantee the outcome: a
+refused create is re-sent once without the floor, and the offer that retry
+builds is as exposed to dust as it was before this change.
+
+- **A floor on the coins an offer is funded from.** The **first**
+  `create_offer_for_ids` attempt for a CAT-funded offer now carries
+  `min_coin_amount` =
+  ceil(mojos the offer spends x `strategy.offer_min_input_coin_frac`) — **the
+  first attempt only: the no-floor fallback below sends a second, distinct
+  create with the key omitted**, and an offer built by that retry is as
+  exposed to reward dust as it was before this change. The new
+  key defaults to 0.01, accepts [0, 1), is read at startup, and 0 disables it,
+  restoring the previous request byte for byte — **the request only**, see the
+  operator note below. With every CAT input at least 1% of
+  the amount, 100 of them always suffice — the **CAT leg** only; the XCH fee
+  coin is selected separately and this CAT-scaled floor does not bound that
+  count. Dexie does not
+  publish its limit; from this bot's own submissions it accepted 125 inputs
+  (57,382 characters) and refused everything from 60,612 characters up.
+- **XCH-funded offers are unchanged.** Their coins are shaped by the coin pool
+  and budgeted by the XCH lock ledger under the wallet's default selection.
+- **One value covers the fee coin too, and the XCH lock ledger models it.** In
+  chia 2.7.4 the coin-selection keys are read from the top level of the request
+  and one config governs every selection it makes, including the XCH fee coin
+  of a CAT-funded offer. The floor is CAT-scaled (804 mojos for the offer
+  above), and it changes which XCH coin pays the fee **exactly when the XCH
+  wallet holds a coin below the floor** — chia filters the candidate set
+  before it chooses a selection branch, so excluding one coin can flip the
+  branch whatever that coin's size relative to the fee. The fee decides only
+  whether the exclusion changes the answer. (An earlier revision of this entry
+  said the effect "needs floor > fee" and derived thresholds of 500 and
+  1,500,000 CAT units from `fees.min_fee_mojos`. That was wrong in both
+  directions and is withdrawn: a floor under the fee can still change the
+  selection, and a floor no coin falls under changes nothing however large.)
+  When the wallet does skip a small XCH coin it locks a larger one, so
+  `CoinLockLedger::try_lock`
+  and `try_lock_floor_only` take the same floor, in the preflight probe and in
+  all three posting paths. Without it the ledger charged the coin the wallet
+  skipped and later creates could pass the cycle cap or the reserve floor on
+  XCH that was already locked.
+- **On the live deployment this is inert today — because of the coin set, not
+  the fee.** Measured read-only on 2026-09-21 (`chia rpc wallet
+  get_spendable_coins`, `get_coin_records`, `get_wallet_balance`), twice in the
+  day. The XCH wallet held 54 unspent coins both times, the smallest
+  **13,494,209,440 mojos** on the first read and **13,314,209,440** on the
+  second; spendable went 30 → 42 and its smallest 20,757,615,448 →
+  13,314,209,440. The figures below use the smallest of those readings. The
+  largest floor the bot can emit is bounded by the CAT mojos **one offer** can
+  spend, so it scales with the fraction, and **both** CAT-funded pairs enabled
+  in the live config are in scope — XCH/DBX (wallet 8, 1,844,501 mojos) and
+  XCH/BYC (wallet 4, 88,845 mojos). DBX binds at every fraction: 18,446 mojos
+  at the shipped 0.01, 1,844,501 at a fraction just under 1.
+  **The margin is therefore not one number.** Against 13,314,209,440 it is
+  721,794× (5.86 orders of magnitude) at 0.01 and 7,218× (3.86 orders) at the
+  top of the range — "more than five orders" holds only up to a fraction of
+  about 0.072, and it was previously stated as an absolute over every floor the
+  bot can emit, which it is not. **The conclusion survives the correction:**
+  even the largest floor the range `[0, 1)` permits, from either CAT wallet, is
+  over three orders of magnitude under the smallest XCH coin, so nothing is
+  filtered out and no selection changes. This is a property of **today's coin
+  set, which moves** — it moved twice within 2026-09-21, and the same coin was
+  recorded at 20,787,615,448 mojos in the 2026-09-20 snapshot and at
+  20,757,615,448 on 2026-09-21, exactly 30,000,000 lower, which is what two
+  15,000,000-mojo fee spends would do (that attribution is an inference; the
+  measurements are not). `fees.min_fee_mojos` does not govern reachability
+  in either direction.
+- **The fraction is applied in parts per billion, rounded up.** Rounded to
+  nearest, the applied fraction could fall below the configured one and the
+  input bound failed for ordinary values: at 1/3, three floor-sized coins of a
+  1,000,000,000-mojo offer totalled 999,999,999. The default 0.01 is exact and
+  unchanged.
+- **Fallback.** If the wallet answers that the coins at or above the floor
+  cannot cover the amount ("... or our minimum coin amount is too high"), the
+  create is sent once more without the floor and a `[min-input-coin]` warning
+  names the pair, side, tier and floor. Only that answer triggers it: a timeout
+  or any other transport failure is never followed by a second create from this
+  path. The offer built by the retry can again be one Dexie refuses.
+- **Detection.** A Dexie refusal for too many input coins now logs one
+  `[dexie-too-many-inputs]` warning that names the offer, its length, the
+  remedy and a count since start. The remedy is to **combine the coins** —
+  the CAT's, since the dust is CAT reward payouts and the CAT leg is what the
+  floor bounds; if the XCH fee leg ever contributes, the coins to combine
+  there are XCH.
+  **The rest of the advice is computed, not fixed.** The warning is handed the
+  posting and the offer's length and nothing about how the offer was built, so
+  it derives `ceil(1 / frac)` — the CAT-leg bound on a *floored* create — and
+  branches on whether that plus the one-coin fee leg fits inside the 125
+  inputs Dexie was measured to accept:
+  - **At or above 1/124** (the shipped 0.01 bounds it at 100): a floored
+    create *cannot* reach the limit, so a refusal is proof no floor was sent.
+    Do **not** raise the fraction — that makes the wallet refuse the floored
+    create more often and fires the no-floor retry that builds these offers.
+    Only a small **reduction** can help, never below 1/124.
+  - **Below 1/124** (0.002 bounds it at 500): the bound is over the limit on
+    its own, so a create the wallet **satisfied** can be refused exactly like
+    a dust-funded one and the refusal proves nothing. The advice inverts —
+    **raise** the fraction — and the warning names the preceding
+    `[min-input-coin]` line as the way to tell the two apart for that offer.
+  - **At 0**: the floor is off and nothing carries a bound.
+
+  The earlier text gave the first branch's advice unconditionally, which was
+  correct at 0.01 and backwards below 1/124; and it printed `0.008` as the
+  safe floor, which is on the wrong side of 1/124 — `ceil(1 / 0.008)` is
+  exactly 125, one over once the fee coin is counted. Both numbers are now
+  derived from `kDexieMeasuredInputLimit` and `kDexieFeeLegInputsToday`, so
+  they cannot drift apart again. The fallback fact is deliberately **not**
+  threaded into the warning: in the shipped branch it is deducible, and the
+  datum would have to be the optional floor rather than a "did the fallback
+  run" bool, since XCH-funded offers and skipped dict shapes also send no
+  floor. No metric was added: `OfferManager` has no posting-failure
+  metric to extend. Nothing is cancelled automatically.
+- **Startup warns when the fraction cannot bound what it is for.** The range
+  `[0, 1)` is closed at the bottom, so a value like 0.002 loaded silently
+  although `ceil(1 / frac)` is then 500 — above Dexie's limit before the fee
+  coin. Config load now emits one `[Config]` warning for any fraction that is
+  on but below 1/124, naming the bound it gives and the value to use. `0` is a
+  real setting and is not warned about. Not an error: the key is not
+  load-bearing for safety.
+
+**What changes on upgrade, with no config edit at all.** Three things, and only
+the first has a lever:
+
+1. **The floor is ON.** `strategy.offer_min_input_coin_frac` is absent from the
+   live `config.yaml`, so it takes its 0.01 default and every CAT-funded
+   `create_offer_for_ids` starts carrying `min_coin_amount` **on its first
+   attempt** from the first restart. It is not carried by the no-floor
+   fallback, which re-sends the create with the key omitted after a min-coin
+   refusal (Fallback bullet above): that request is byte-identical to the
+   pre-upgrade one, so the offer it builds has the pre-upgrade exposure to
+   reward dust — including the exposure that produced the 62,228-character
+   offer Dexie refused on 2026-09-19. Setting the key to `0` turns the floor
+   off altogether.
+2. **A create that fails is no longer re-sent** (the section below). This is
+   unconditional: `retry_policy_for_endpoint` keys off the endpoint name, not
+   off the fraction, so `offer_min_input_coin_frac: 0` does **not** restore the
+   old four-attempt behaviour. A create that times out now fails after one
+   attempt (30 s) instead of four (~124 s).
+3. **An unanswered MERGED create posts nothing else for that side this cycle**,
+   also unconditional and also unaffected by the fraction. If the other side of
+   the pair did post, the asymmetric-ladder guard in `post_quotes` can then
+   cancel it, so a merged-create timeout can cost one cycle of both sides
+   rather than one side.
+
+2 and 3 are strictly safer than what they replace — the risk they remove is a
+duplicate offer, which costs real money — but they are behaviour changes that
+ship whatever the new key is set to, and no config value reverts them.
+
+**Operator note.** The dust already in the wallet is not touched: it stays
+spendable, the engine simply stops selecting it for offers, and it can be
+combined at any time (`chia wallet coins combine`). An offer Dexie refused is
+tracked like any other and retired by the usual cancels: the one posted at
+14:42 on 2026-09-19 was cancelled at 18:23. Until then it locks its coins while
+listed nowhere (`TODO.md` S66).
+
+**A create is no longer re-sent once it may have reached the wallet.** `rpc_post`
+re-sent `create_offer_for_ids` after a timeout or an HTTP 5xx, up to three more
+times, and returns only its last attempt (#158 had left the endpoint out of
+scope). A second copy of a create is a second offer, and the fallback above
+made that worse than it was: the wallet's refusal could answer a copy whose
+original had already built the offer and lost its reply, and the fallback then
+created another. `create_offer_for_ids` is now never re-sent unless the request
+cannot have reached the wallet (no connection, no TLS handshake), as the two
+cancel endpoints already were, so a create that times out fails after one
+attempt (30 s) instead of four (about 124 s). `take_offer` is unchanged. For the
+same reason a merged create that ends with no answer is no longer followed by
+one create per tier; a refusal, or a failure before the request was written,
+still is.
+
 ## [0.10.24] — 2026-09-14 — record what happened, not what was asked for
 
 Nine merged branches, and most of them fix a record or a signal that reported a

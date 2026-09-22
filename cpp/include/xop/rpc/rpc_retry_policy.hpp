@@ -104,13 +104,29 @@ enum class RpcRetryPolicy {
 
 /// The policy for an rpc_post endpoint name (e.g. "cancel_offers").
 ///
-/// Only the two cancel endpoints are NeverResend.  create_offer_for_ids and
-/// take_offer are not idempotent either; they are out of scope for this
-/// change and keep the transient retry (see the PR that introduced this).
+/// The two cancel endpoints and create_offer_for_ids are NeverResend.
+/// take_offer is not idempotent either; it is still out of scope and keeps
+/// the transient retry.
+///
+/// [MIN-INPUT-COIN review #162, round 2] WHY create_offer_for_ids JOINED THEM.
+/// A second copy of a create is a second offer.  That was already true, but
+/// the min-input-coin fallback (execution/offer_min_input_coin.hpp) made it
+/// load-bearing: it answers the wallet's "minimum coin amount is too high"
+/// refusal with one more create, on the premise that a refusal proves the
+/// wallet built nothing.  With the transient retry that premise was false.
+/// rpc_post returns only its LAST attempt, so the refusal could answer a
+/// RE-SEND whose first copy had already built the offer and lost its reply --
+/// and that first offer, having locked the coins above the floor, is exactly
+/// what makes the copy get refused.  Now a copy is sent only when the
+/// request cannot have reached the handler, so any answer rpc_post returns
+/// for this endpoint is the answer to the only request the wallet ever saw.
+/// The cost: a create that times out fails after one attempt (30 s) where it
+/// used to be re-sent three more times (~124 s).
 [[nodiscard]] constexpr RpcRetryPolicy retry_policy_for_endpoint(
     std::string_view endpoint) noexcept
 {
-    if (endpoint == "cancel_offers" || endpoint == "cancel_offer") {
+    if (endpoint == "cancel_offers" || endpoint == "cancel_offer"
+        || endpoint == "create_offer_for_ids") {
         return RpcRetryPolicy::NeverResend;
     }
     return RpcRetryPolicy::RetryTransient;
@@ -215,6 +231,22 @@ enum class RpcRetryPolicy {
         default:
             return true;
     }
+}
+
+/// Did a create_offer_for_ids that FAILED possibly reach the wallet's
+/// handler -- so that the offer may exist although no reply said so?
+///
+/// [MIN-INPUT-COIN review #162, round 2] The classification above is a
+/// property of the transport failure, not of the endpoint, so this forwards
+/// to it; it has its own name because its caller asks a different question.
+/// OfferManager::post_merged_side used to answer ANY failed merged create by
+/// creating every tier individually.  After a timeout the merged offer may
+/// already rest in the wallet, and the individual creates would then
+/// duplicate it tier by tier.  When this is true the fallback is skipped.
+[[nodiscard]] constexpr bool create_possibly_submitted(
+    CURLcode rc, long http_code) noexcept
+{
+    return cancel_possibly_submitted(rc, http_code);
 }
 
 }  // namespace xop::rpc

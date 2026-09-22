@@ -366,6 +366,82 @@ strategy:
   # our own TTL would let the chain retire offers the engine still tracks as
   # live, with no cancel ever recorded.
   # offer_expiry_secs: 172800  # [OPTIONAL, default: 0 = disabled] 48h
+  #
+  # --- Minimum input coin for the offers we create ---------------------------
+  # Dexie pays liquidity rewards as one tiny coin per rewarded offer, so a CAT
+  # wallet that earns them fills with dust.  The wallet's coin selection
+  # prefers that dust, and Dexie refuses an offer built from too many coins
+  # (HTTP 400 "Too many input coins"; measured limit between 125 and about
+  # 132 inputs).  The refused offer still exists in the wallet and locks its
+  # coins, but is listed nowhere.
+  #
+  # With this key the engine sends create_offer_for_ids a `min_coin_amount` of
+  # ceil(amount the offer spends x this fraction) on the FIRST create for each
+  # offer, so the wallet leaves smaller coins alone and an offer built by that
+  # attempt needs at most ceil(1 / fraction) CAT inputs: 100 at the default.
+  # 0 disables the floor.  The bound is on
+  # that first attempt only -- the no-floor retry described below sends no
+  # floor at all, and the offer it builds can be dust-funded again.
+  #
+  # IT BOUNDS THE CAT LEG, NOT THE WHOLE OFFER.  The XCH fee coin is chosen
+  # in a separate selection that this CAT-scaled value does not constrain, so
+  # the offer carries those CAT inputs PLUS however many XCH coins the fee
+  # takes.  That is one coin only while every XCH coin covers the fee -- a
+  # measurement, not a guarantee.  The create pays the dynamic fee, which is
+  # clamped to [fees.min_fee_mojos, fees.max_fee_mojos], so the comparison
+  # that bounds the leg is against the CAP: the smallest XCH coin on
+  # 2026-09-21, 13,314,209,440 mojos, is 133x a max_fee_mojos of 100,000,000.
+  # (An earlier revision said 887x, which is against min_fee_mojos -- the
+  # cheapest create, not every create.)
+  #
+  # THE INPUT COUNT IS NOT MONOTONE IN THIS FRACTION.  Raising it tightens
+  # ceil(1 / fraction) only while the coins at or above the floor can still
+  # cover the amount; past that the wallet refuses, the no-floor retry builds
+  # the offer from dust again, and the bound is gone.  So raising it AFTER a
+  # "Too many input coins" refusal makes that outcome more common, not less --
+  # at 0.01 that refusal is itself evidence the offer was built without a
+  # floor, since the CAT leg cannot exceed 100 inputs and the fee leg is one
+  # coin here.  Lowering it loosens the bound, and below 1/124 the CAT-leg
+  # bound plus the fee coin exceeds the 125 inputs Dexie was measured to
+  # accept.  The remedy for a refusal is to combine the coins; the only
+  # fraction change that can help is a small REDUCTION, and only when it is
+  # the FLOORED create the wallet is refusing.
+  #
+  # THAT EVIDENCE HOLDS ONLY ABOVE 1/124, AND THE RANGE GOES LOWER.  [0, 1)
+  # is closed at the bottom, so 0.002 loads and bounds the CAT leg at 500 --
+  # over Dexie's limit by itself.  Set below 1/124 the floor no longer
+  # guarantees what it is for: an offer the wallet builds WITHIN the floor can
+  # be refused for input count, and raising the fraction back is then the
+  # change that helps.  Startup warns when this key is in that band, and the
+  # [dexie-too-many-inputs] warning computes ceil(1 / fraction) and gives the
+  # advice that matches it.  (1/124 is about 0.00807; 0.008 is on the wrong
+  # side of it -- ceil(1 / 0.008) is exactly 125, one over once the fee coin
+  # is counted.)
+  #
+  # Applies to CAT-funded offers only (a bid on XCH/<CAT>, an ask on
+  # <CAT>/...).  XCH-funded offers are untouched: their coins are managed by
+  # the coin pool.  The wallet applies the one value to the XCH fee coin of
+  # the same request as well.  It is CAT-scaled, so it is small (1% of an
+  # 80 DBX offer is 804 mojos, under a billionth of an XCH).  Small is not
+  # the same as inert: it changes which XCH coin pays the fee whenever the
+  # XCH wallet holds a coin BELOW the floor, because chia filters the
+  # candidate set before it picks a selection branch.  It does NOT depend on
+  # the floor exceeding the fee -- a floor under the fee can still flip the
+  # branch, and a floor no coin falls under changes nothing however large it
+  # is.  fees.min_fee_mojos is therefore not the lever here; the sizes of the
+  # coins in the XCH wallet are.  The XCH lock ledger models the same floor,
+  # so the reserve and the cycle cap still see what is really locked.
+  # The fraction is applied in parts per billion, rounded up.
+  #
+  # If the coins at or above the floor cannot cover the amount, the wallet
+  # refuses, and the engine retries ONCE without the floor and logs a
+  # "[min-input-coin]" warning naming the pair, side and tier.  That retry's
+  # request is the pre-floor one byte for byte, so the offer it builds has the
+  # pre-floor exposure to dust -- this is the one case the bound above does
+  # not cover.  A Dexie refusal logs "[dexie-too-many-inputs]".  Either one
+  # means the dust should be combined (chia wallet coins combine).  Read at
+  # startup.
+  # offer_min_input_coin_frac: 0.01  # [OPTIONAL, default: 0.01] range [0, 1); 0 = disabled
   num_tiers: 4               # [REQUIRED] Multi-tier offer ladder depth (4 recommended: fewer, larger tiers)
   tier_spacing_bps: [35, 100, 200, 300]  # [REQUIRED] Spread per tier (bps)
   tier_size_pct: [0.15, 0.20, 0.30, 0.35] # [REQUIRED] Capital fraction per tier (sum ≈ 1.0)

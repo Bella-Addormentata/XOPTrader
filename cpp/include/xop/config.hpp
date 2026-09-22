@@ -403,6 +403,63 @@ struct StrategyConfig {
     /// return collateral -- land a cancel.
     uint32_t offer_expiry_secs{0};
 
+    /// [MIN-INPUT-COIN 2026-09-19] Smallest coin the wallet may use to fund
+    /// an offer, as a fraction of the amount the offer spends.  Sent to
+    /// create_offer_for_ids as `min_coin_amount` =
+    /// ceil(offered mojos x this), for CAT-funded offers only.
+    ///
+    /// Dexie pays rewards as one tiny coin per rewarded offer; the wallet's
+    /// coin selection prefers that dust, and an offer built from about 130
+    /// or more inputs is refused by Dexie ("Too many input coins") while it
+    /// still locks its coins in the wallet.  With every CAT input at least
+    /// this fraction of the amount, ceil(1 / fraction) of them always
+    /// suffice: 100 at the default, against a measured Dexie limit between
+    /// 125 and about 132.
+    ///
+    /// THAT BOUNDS THE CAT LEG, NOT THE OFFER [review #162, round 5].  The
+    /// XCH fee coin is chosen in a separate selection that this CAT-scaled
+    /// value does not constrain, so the fee leg's coin count is not bounded
+    /// here -- it is one coin only while every XCH coin covers the fee,
+    /// which is a measurement, not a guarantee.  The create pays
+    /// current_fee_mojos_, clamped by FeeTracker to
+    /// [fees.min_fee_mojos, fees.max_fee_mojos]; today's smallest XCH coin
+    /// is 133x that CAP, so every coin covers any fee the engine can send
+    /// [review #162, round 7 -- the 887x quoted here before was against
+    /// min_fee_mojos, the smallest fee, which is the weaker claim].
+    ///
+    /// THE INPUT COUNT IS NOT MONOTONE IN THIS FRACTION [review #162,
+    /// round 5 -- CORRECTING THIS COMMENT].  An earlier revision said
+    /// "RAISING it tightens the bound", which is true only while the coins
+    /// at or above the floor can still cover the amount.  Past that point
+    /// the wallet refuses and the fallback below re-sends the create with
+    /// NO floor, so that offer is dust-funded again and the bound is gone:
+    /// raising the fraction further makes that outcome MORE common, not
+    /// less, and it is the outcome a Dexie "Too many input coins" refusal
+    /// reports AT THIS FRACTION.  Lowering the fraction loosens the bound
+    /// instead, and below 1 / 124 the CAT-leg bound plus the fee coin
+    /// exceeds the 125 inputs Dexie was measured to accept.  So the useful
+    /// range is narrow, the remedy for a refusal is to combine the coins
+    /// (chia wallet coins combine), and the only fraction change that can
+    /// help is a small REDUCTION -- and only when it is the floored create
+    /// the wallet is refusing.
+    ///
+    /// AND THE RANGE IS WIDER THAN THAT [review #162, round 7].  [0, 1) is
+    /// closed at the bottom, so 0.002 loads without complaint and bounds the
+    /// CAT leg at 500 -- above Dexie's limit on its own.  Under 1 / 124 the
+    /// floor stops guaranteeing what it exists for: a create the wallet
+    /// SATISFIES can be refused for input count, and "a refusal means no
+    /// floor was sent" is then false.  config.cpp warns at load, and the
+    /// [dexie-too-many-inputs] warning computes ceil(1 / frac) and inverts
+    /// its advice rather than assuming the 0.01 case.
+    ///
+    /// 0 disables the floor and restores the previous request byte for
+    /// byte.  Range [0, 1).  XCH-funded offers never carry it: their coins
+    /// are shaped by the coin pool and budgeted by the XCH lock ledger.  If
+    /// the wallet answers that the floor leaves too little to spend, the
+    /// create is retried once without it and a warning names the offer.
+    /// Read at startup.  See execution/offer_min_input_coin.hpp.
+    double offer_min_input_coin_frac{0.01};
+
     // [ALWAYSOFFER 2026-08-30] Side-aware BBO sanity (see bbo_sanity.hpp).
     // Aggressive deviation (would EXECUTE dislocated) keeps the tight
     // 10%; passive deviation (merely RESTS far from a thin book, e.g. a
