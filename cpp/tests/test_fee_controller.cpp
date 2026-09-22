@@ -1935,7 +1935,7 @@ TEST(SimulatedFloor, FollowsTheFloorDownByProbing)
 {
     // Full mempool for a while, then it drains: the floor falls 10x.
     const std::uint32_t drop_at = 10'000 + 3'000;
-    FloorSim sim = make_sim([drop_at](std::uint32_t h) { return h < drop_at ? 5.0 : 0.5; });
+    FloorSim sim = make_sim([](std::uint32_t h) { return h < drop_at ? 5.0 : 0.5; });
     sim.run(3'000);
     const double before = sim.submitted.back().rate;
     ASSERT_GE(before, 5.0);
@@ -1958,7 +1958,7 @@ TEST(SimulatedFloor, FollowsTheFloorDownByProbing)
 TEST(SimulatedFloor, RecoversFromATenfoldJumpWithinTenActions)
 {
     const std::uint32_t jump_at = 10'000 + 4'000;
-    FloorSim sim = make_sim([jump_at](std::uint32_t h) { return h < jump_at ? 0.5 : 5.0; });
+    FloorSim sim = make_sim([](std::uint32_t h) { return h < jump_at ? 0.5 : 5.0; });
     sim.run(4'000);
     const std::size_t at_jump = sim.submitted.size();
     ASSERT_LT(sim.submitted.back().rate, 0.5 * 1.45);  // settled on the low floor
@@ -1979,7 +1979,7 @@ TEST(SimulatedFloor, TheNodeFloorMakesTheJumpCostNothing)
 {
     // Same jump, but the node says its mempool is full the moment it is.
     const std::uint32_t jump_at = 10'000 + 4'000;
-    FloorSim sim = make_sim([jump_at](std::uint32_t h) { return h < jump_at ? 0.5 : 5.0; });
+    FloorSim sim = make_sim([](std::uint32_t h) { return h < jump_at ? 0.5 : 5.0; });
     sim.run(3'999);
     const std::size_t at_jump = sim.submitted.size();
     for (int i = 0; i < 600; ++i) {
@@ -2047,7 +2047,7 @@ TEST(SimulatedFloor, ReportsItsNumbers)
                 wiped.submitted[conv_fd].block - wiped.submitted[0].block);
 
     const std::uint32_t drop_at = 13'000;
-    FloorSim down = make_sim([drop_at](std::uint32_t h) { return h < drop_at ? 5.0 : 0.5; });
+    FloorSim down = make_sim([](std::uint32_t h) { return h < drop_at ? 5.0 : 0.5; });
     down.run(3'000);
     const std::size_t at_drop = down.submitted.size();
     down.run(3'000);
@@ -2059,7 +2059,7 @@ TEST(SimulatedFloor, ReportsItsNumbers)
                 reached - at_drop, down.submitted.back().rate / 0.5);
 
     const std::uint32_t jump_at = 14'000;
-    FloorSim up = make_sim([jump_at](std::uint32_t h) { return h < jump_at ? 0.5 : 5.0; });
+    FloorSim up = make_sim([](std::uint32_t h) { return h < jump_at ? 0.5 : 5.0; });
     up.run(4'000);
     const std::size_t at_jump = up.submitted.size();
     up.run(600);
