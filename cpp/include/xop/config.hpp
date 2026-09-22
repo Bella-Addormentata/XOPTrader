@@ -63,6 +63,52 @@ inline const char* to_string(ChiaMode m) noexcept {
 }
 
 // ---------------------------------------------------------------------------
+// [S70-S72 2026-09-20] The three cancel-reduction switches.  Each is a named
+// mode rather than a bool so the log and the config say WHICH rule ran, and
+// each defaults to the rule that was in force before the switch existed.
+// ---------------------------------------------------------------------------
+
+/// strategy.ttl_cancel_mode -- what ends an offer that is merely OLD.
+///   Cancel: the unconditional hard-TTL cancel (offer_ttl_blocks x
+///           OfferManager::kHardTtlMultiplier), a fee-bearing spend.
+///   Expire: an offer that VERIFIABLY carries an on-chain expiry
+///           (offer_expiry_secs) is left to the chain, then retired with a
+///           free local cancel once a chain clock supplied by a full node on
+///           THIS host is safely past its max_time
+///           (execution/offer_expiry.hpp).  An offer with no verified expiry
+///           keeps the hard TTL, and so does every offer while the wallet has
+///           any full-node peer this host does not run.
+enum class TtlCancelMode : std::uint8_t { Cancel = 0, Expire = 1 };
+
+/// strategy.exposure_rule -- how Step 8 projects reserve exposure.
+///   Legacy:  spendable - pending, at two sites that disagree the moment an
+///            offer locks a coin (execution/exposure_gate.hpp).
+///   Unified: one verdict from lock-invariant inputs, shared by both sites --
+///            and, while any LIVE resting offer's pair cannot be resolved
+///            against this config, a refusal to ADD exposure rather than a
+///            reading of that offer's spend as zero.
+enum class ExposureRule : std::uint8_t { Legacy = 0, Unified = 1 };
+
+/// strategy.price_cancel_mode -- when a resting offer is cancelled for PRICE.
+///   Deviation: drift from the tier's new optimal price past a threshold.
+///   Margin:    only when a fill at the resting price would earn less than
+///              price_cancel_edge_retain x the edge Step 7 demands -- judged
+///              against BOTH of Step 7's centres, the KINDER of the two edges
+///              deciding, so the rule never cancels what the pricer would
+///              itself post (execution/cross_guard.hpp).
+enum class PriceCancelMode : std::uint8_t { Deviation = 0, Margin = 1 };
+
+inline const char* to_string(TtlCancelMode m) noexcept {
+    return m == TtlCancelMode::Expire ? "expire" : "cancel";
+}
+inline const char* to_string(ExposureRule m) noexcept {
+    return m == ExposureRule::Unified ? "unified" : "legacy";
+}
+inline const char* to_string(PriceCancelMode m) noexcept {
+    return m == PriceCancelMode::Margin ? "margin" : "deviation";
+}
+
+// ---------------------------------------------------------------------------
 // Chia blockchain RPC connectivity and authentication.
 // Covers both the full-node and wallet daemon endpoints.
 // ---------------------------------------------------------------------------
@@ -469,6 +515,94 @@ struct StrategyConfig {
     double bbo_sanity_max_aggressive_dev{0.10};
     double bbo_sanity_max_passive_dev{0.30};
     double bbo_sanity_max_mid_dev{0.50};
+
+    /// [S70 2026-09-20] What ends an offer that is merely OLD.  `cancel`
+    /// (default) is the unconditional hard-TTL cancel.  `expire` leaves an
+    /// offer that verifiably carries offer_expiry_secs' max_time to the
+    /// chain and retires it with a FREE local cancel once a chain clock,
+    /// read kExpiredRetireDepthBlocks below the wallet's synced height, is
+    /// past that max_time; the soft-TTL
+    /// adverse rule, every price rule and every safety cancel still apply,
+    /// and an offer with no verified expiry keeps the hard TTL.  The
+    /// reasoning and the wallet facts are in execution/offer_expiry.hpp --
+    /// including the one offer_expiry_secs above declined to claim: an
+    /// expired PENDING_ACCEPT trade stays in get_locked_coins() until it is
+    /// cancelled, so this mode is what lands that cancel.
+    /// `expire` with no expiry configured anywhere is rejected at load: it
+    /// would read as "TTL cancels are off" while changing nothing.
+    ///
+    /// [review #164 2026-09-21] THAT CLOCK IS NOT THE WALLET'S OWN, and this
+    /// comment was the LAST place in the tree still saying it was -- the
+    /// defect this review round is about, reproduced inside its own fix, in
+    /// the file an operator reads before setting the key.  Only the HEIGHT is
+    /// anchored to the wallet's processed chain (get_height_info).  The
+    /// TIMESTAMP at that height is whatever the first answering full-node
+    /// peer says, with no signature, proof of space, VDF or consensus check
+    /// (rpc/wallet_requests.hpp has the 2.7.4 line numbers), and the depth
+    /// bounds reorgs only, never a liar.
+    ///
+    /// So `expire` carries a PRECONDITION, and it is not optional: the wallet
+    /// must reach the chain only through a full node on THIS host.  The pass
+    /// censuses the wallet's full-node peers either side of the clock read
+    /// and retires nothing unless every one of them is local; while that does
+    /// not hold -- most obviously when the local node is down -- retires
+    /// pause and those offers keep their coins locked, logged as "no trusted
+    /// chain clock".  Check the wallet's own get_connections before enabling.
+    TtlCancelMode ttl_cancel_mode{TtlCancelMode::Cancel};
+
+    /// [S71 2026-09-20] Step 8's reserve-exposure rule.  `legacy` (default)
+    /// is the pair of spendable-based checks that cancelled 528 offers in 14
+    /// days at an average age of 27 blocks; `unified` is one verdict from
+    /// lock-invariant inputs (execution/exposure_gate.hpp).
+    /// [review #164] `unified` also fails CLOSED in one direction, which is
+    /// not a reserve breach and does not say so in the log: while a LIVE
+    /// resting offer's pair cannot be resolved against this config (an
+    /// adopted UNKNOWN wallet record, or a pair since REMOVED from the file
+    /// -- a merely DISABLED pair is still mapped), the resting sum is a lower
+    /// bound while `owned` still counts the coins that offer locks, so new
+    /// posts are suppressed on both sides.  It never cancels a resting offer
+    /// on that account.  Watch for "exposure (unified) ... cannot be
+    /// projected -- a LIVE resting offer's pair is not in this config".
+    ExposureRule  exposure_rule{ExposureRule::Legacy};
+    /// [S71] Unified rule only.  New posts are suppressed when the projected
+    /// balance is below the reserve; RESTING offers are cancelled only below
+    /// reserve x (1 - this).  [0, 1]; 1 never cancels (suppress only).
+    double        exposure_cancel_hysteresis_pct{0.25};
+    /// [S71] Unified rule only.  A resting offer younger than this is never
+    /// an exposure-cancel candidate.  Peak-height blocks (18.75 s): 32 is
+    /// ten minutes.  [0, 4608].
+    std::uint32_t exposure_cancel_min_age_blocks{32};
+
+    /// [S72 2026-09-20] When a resting offer is cancelled for PRICE.
+    /// `deviation` (default) is the selective refresh: drift from the tier's
+    /// new optimal price past kSelectiveRefreshThreshold x tier scale, the
+    /// soft-TTL adverse threshold, and the anchor override.  `margin`
+    /// replaces all three with one test -- would a fill at the resting price
+    /// still earn the edge Step 7 demands of a NEW offer
+    /// (max(min_profit_margin, quote_width_sigma_mult x combined_sigma,
+    /// tibetswap fee))?  A crossed offer is still cancelled
+    /// first, kMinRefreshAgeBlocks still protects a young one, and
+    /// favourable drift never cancels (it only adds edge).
+    ///
+    /// [review #164] WHICH centre that edge is measured against is not a
+    /// detail, and an earlier revision of this comment named only one.  BOTH
+    /// of Step 7's centres are judged and the KINDER edge decides: the
+    /// shifted ladder centre alone is the wrong frame for "what would this
+    /// fill earn", and the fair centre alone cancels what the pricer just
+    /// posted on the side being shed (execution/cross_guard.hpp).
+    /// Nor is the switch a free reduction in wasted cancels: replayed over
+    /// the recorded fortnight the rule fires at some block of the recorded
+    /// life of up to 7 of the 15 offers that actually FILLED, and `margin`
+    /// drops the anchor override, so nothing pulls a favourably-drifted quote
+    /// back toward the touch (cpp/tests/test_price_cancel_replay.cpp).
+    PriceCancelMode price_cancel_mode{PriceCancelMode::Deviation};
+    /// [S72] Margin rule only.  The fraction of Step 7's posting floor a
+    /// RESTING offer must keep.  (0, 1].  1.0 cancels the moment the edge
+    /// dips under the posting floor -- and Step 7 routinely posts tiers
+    /// exactly AT that floor, so at 1.0 any adverse tick refreshes them.
+    /// The post and cancel thresholds must not coincide; 0.5 keeps an offer
+    /// until it has lost half the edge a new one would need.
+    double        price_cancel_edge_retain{0.5};
 
     // [FLOOR 2026-08-30] The Step 7 ask floor mode: "strict" (never quote
     // below basis+margin -- the old unconditional behaviour), "aging"

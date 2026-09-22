@@ -476,6 +476,92 @@ default to off, and with both off every fee is what v0.10.24 paid.
   top is about one window's spend.
 - Found while measuring, not fixed here: Step 8's force-delete fires after a
   median of 176 seconds, not the ~10 minutes its constant documents (S68).
+## [Unreleased]
+
+### Cancel far fewer offers (S70-S72) -- three switches, all default OFF
+
+In the 14 days to block 9,319,413 the bot posted 1,283 offers, filled 15 and
+cancelled 1,254 -- about 84 fee-bearing spends per fill, into ~97% full blocks.
+Three rules made 97% of them. Each now has a replacement behind its own
+`strategy` key; every key defaults to the old rule and needs a restart.
+
+- **`ttl_cancel_mode: expire` (was 402 `ttl_expired` cancels).** An offer that
+  verifiably carries the on-chain expiry from #150 is no longer cancelled at the
+  hard TTL. The chain ages it out, and the bot then frees its coins with a free
+  local cancel -- read from the chia 2.7.4 source: an expired trade stays
+  PENDING_ACCEPT and stays in `get_locked_coins()` until cancelled, and
+  `cancel_offer secure=false` releases it with no spend. The cancel is sent only
+  when a chain clock (`get_timestamp_for_height` at the wallet's finished-sync
+  height less 32 blocks -- a depth, because a seconds margin can be met by the
+  tip block alone) is past `max_time`, the wallet still reports PENDING_ACCEPT, and
+  its record repeats the tracked `max_time`; this host's clock only decides
+  whether to look.
+  **That clock is one connected peer's unvalidated assertion, not a local fact**
+  -- chia's wallet forwards `get_timestamp_for_height` to whichever full-node
+  peer answers first, unanchored (no `expected_header_hash`), so nothing checks
+  a signature, a proof of space or a VDF, and the 32-block depth bounds reorgs
+  only, never a liar. The retire therefore censuses the wallet's full-node peers
+  (`get_connections`) before the clock and again after it, and retires nothing
+  unless every peer is on this host, where chia's own `is_trusted_peer` trusts
+  it unconditionally. **Enabling `expire` has a precondition: the wallet must
+  reach the chain only through a local full node.** While it does not -- most
+  obviously when that node is down -- retires pause, offers keep their coins
+  locked, and the log says `no trusted chain clock`.
+  `expire` with no expiry configured is refused at startup.
+  **The wallet's TRADE RECORD is blind to a take of a retired offer. The
+  wallet is not, and an earlier draft of this bullet said it was.**
+  `get_trades_by_coin` skips CANCELLED (`trade_manager.py:131-139`), so
+  `coins_of_interest_farmed` never fires, the trade never reaches CONFIRMED and
+  no fill is booked -- that is the whole of what the evidence supports. A take
+  still spends our maker coin AND pays the requested asset to a puzzle hash the
+  maker's own wallet derived (`trade_manager.py:500,518`: each requested payment
+  is a notarized payment to `action_scope.get_puzzle_hash`), so it moves the
+  coin records and the balances this bot reads elsewhere. A sound local detector
+  is therefore constructible; it is filed with its design as S77 and is **not**
+  implemented here. Until it is, the shipped check is external: an offer this
+  bot retired should end at Dexie `status: 6` with `spent_block_index: null`,
+  and a `status: 4` with a block index means someone took it after the retire.
+  The GUI pairs table sizes its resting-offer window from the expiry in this
+  mode, so a quote that legitimately rests 24 h is not shown as absent after 6.
+- **`exposure_rule: unified` (was 528 `exposure_floor_rebalance` cancels).** The
+  pre-post projection and the resting-offer check now share one verdict. They
+  disagreed because `spendable_balance` already excludes coins locked by resting
+  offers, so posting an offer moved the second check by the size of whatever
+  coin the wallet locked: on 2026-09-13 the bot cancelled 267 XCH/DBX asks
+  this way, at one point re-posting the same tier every ~2.7 minutes. Unified
+  projects from
+  `unconfirmed_wallet_balance` against every resting offer that spends the asset,
+  cancels only below `reserve x (1 - exposure_cancel_hysteresis_pct)`, never an
+  offer younger than `exposure_cancel_min_age_blocks`, and suppresses the next
+  post instead. A tracked offer whose pair this config cannot resolve -- an
+  adopted `UNKNOWN` wallet record, or a pair since REMOVED from the file; a
+  merely DISABLED pair is still mapped and still projected -- is recorded as
+  UNQUANTIFIABLE rather than dropped, because `owned` still counts the coins it
+  holds locked. While one is live, unified refuses to add exposure on either
+  side and says so in the log; it never cancels a resting offer on its account,
+  and the reload drain clears it on the next heartbeat.
+- **`price_cancel_mode: margin` (was 282 `price_adverse` cancels).** Cancel for
+  price only when a fill at the resting price would earn less than
+  `price_cancel_edge_retain` x the edge Step 7 demands of a new offer, against
+  BOTH of Step 7's centres (the shifted ladder centre and fair value), so it
+  never cancels what the pricer would itself post nor churns an offer that still
+  earns its edge. Crossed offers are still cancelled first; favourable
+  drift never cancels. Replayed over the recorded fortnight it would have made
+  82 of the 248 witnessed price cancels at the default 0.5 -- and the literal
+  rule (1.0) fires on MORE offers than the rule it replaces, which is why 0.5
+  is the default. New cancel reasons: `expired_onchain`, `margin_breach(..)`.
+  **Read this before enabling it: the same replay fires on up to 7 of the
+  fortnight's 15 FILLED offers**, at every retain from 0.5 up
+  (`PriceCancelReplay.WhatItWouldHaveDoneToEveryOtherOffer`). The replay judges
+  one centre where the live rule needs both to fail, so 7 is an upper bound;
+  bounding the unrecorded fair centre by the 100 bps A-S rail brackets the real
+  figure at 0 to 7 at retain 0.5, and at 3 to 7 at retain 1.0. This is the
+  switch's real cost: `margin` also drops the anchor override, so a quote the
+  market drifts AWAY from is never pulled back to the touch. It is not a pure
+  reduction in wasted cancels.
+
+Out of scope and unchanged: startup sweeps, Cancel All, reload-disabled pairs,
+shutdown, every safety cancel, UTXO liberation, and the stopped-engine TTL sweep.
 
 ## [0.10.24] — 2026-09-14 — record what happened, not what was asked for
 

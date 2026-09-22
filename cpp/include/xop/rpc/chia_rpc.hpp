@@ -50,6 +50,7 @@
 
 #include "xop/rpc/node_requests.hpp"
 #include "xop/rpc/transport_evidence.hpp"
+#include "xop/rpc/wallet_requests.hpp"
 
 namespace xop::rpc {
 
@@ -769,6 +770,41 @@ public:
      * @throws ChiaRPCError on transport or application-level failure.
      */
     asio::awaitable<std::int64_t> get_height_info();
+
+    /**
+     * @brief What a connected full-node peer says the chain clock at
+     *        @p height is.
+     *
+     * [S70 2026-09-20] Calls the wallet RPC "get_timestamp_for_height": the
+     * timestamp of the latest TRANSACTION block at or before @p height --
+     * the value consensus compares an offer's max_time with.  Read-only.
+     * Payload and parsing are pinned in rpc/wallet_requests.hpp.
+     *
+     * [review #164 2026-09-21] NOT a local computation and NOT validated.
+     * The wallet forwards this to whichever full-node peer answers first, in
+     * chia's UNANCHORED mode (no expected_header_hash), so the number is that
+     * peer's assertion about a header block.  Any caller acting irreversibly
+     * on it must first establish get_full_node_peer_census().
+     *
+     * @return The timestamp, or 0 when the response carries none.
+     * @throws ChiaRPCError on transport or application-level failure.
+     */
+    asio::awaitable<std::uint64_t> get_timestamp_for_height(std::int64_t height);
+
+    /**
+     * @brief Which full nodes this wallet is connected to.
+     *
+     * [review #164 2026-09-21] Calls the shared RPC "get_connections" with
+     * node_type = FULL_NODE and censuses the answer, so a caller can tell
+     * whether a get_timestamp_for_height answer could only have come from a
+     * full node on this host.  Read-only; nothing here opens or closes a
+     * connection.  Parsing is pinned in rpc/wallet_requests.hpp.
+     *
+     * @return The census; `readable` is false when the response could not be
+     *         fully accounted for, which callers must treat as "do not act".
+     * @throws ChiaRPCError on transport or application-level failure.
+     */
+    asio::awaitable<FullNodePeerCensus> get_full_node_peer_census();
 
     /**
      * @brief Retrieve the wallet's sync status.

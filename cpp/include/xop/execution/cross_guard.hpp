@@ -40,6 +40,7 @@
 // ---------------------------------------------------------------------------
 
 #include <cmath>
+#include <string>
 
 namespace xop::execution {
 
@@ -230,6 +231,188 @@ enum class TierRefresh {
         ? tier_threshold
         : tier_threshold * kFavorableDriftMultiplier;
     return price_deviation > limit ? TierRefresh::Stale : TierRefresh::Fresh;
+}
+
+// ---------------------------------------------------------------------------
+// [S72 2026-09-20] strategy.price_cancel_mode: margin -- cancel for price
+// only when the FILL would be a bad one.
+//
+// classify_tier_refresh above asks how far the tier's NEW optimal price has
+// moved from the resting one.  That is a question about the ladder, not about
+// the offer: 282 of the cancels in the 14 days to 2026-09-20 were this rule,
+// at a median deviation of 1.30%, on books where our quotes rest 140-240 bps
+// from the touch and nothing trades for days.  At the block they were
+// cancelled, 126 of the 248 with a recorded ladder rested no closer to the
+// centre than the ladder's own innermost tier (test_price_cancel_replay.cpp).
+// The XCH/DBX tier-0 ask of 2026-09-10 went 78.69 -> 79.52 -> 78.70 -> 79.94
+// in three hours, each leg a ~1% "adverse" drift of the tier's optimal price:
+// that is chasing the engine's own fair-value noise, one fee per flip.
+//
+// The margin rule asks the offer's own question: if this were taken right now
+// at its resting price, would it still earn the edge Step 7 demands of a NEW
+// offer -- max(min_profit_margin, quote_width_sigma_mult x combined_sigma,
+// tibetswap fee) -- against the CURRENT centre?  Every number is one Step 7
+// threaded to Step 8 (PairCycleState), so the canceller cannot disagree with
+// the pricer about where the floor is; two rules for one decision drifting
+// apart is the bug class this file documents.
+//
+// WHICH CENTRE -- BOTH, AND THE KINDER ONE DECIDES.  [review #164]  Step 7
+// keeps two.  quote_fair_centre_mojos is what the asset is WORTH.
+// quote_mid_mojos is that centre after the Avellaneda-Stoikov reservation
+// shift (up to as_reservation_max_offset_bps, 100 bps), which moves quotes to
+// shed inventory and is what the width-floor pass measures the floor from.
+// engine.hpp is explicit that the shifted centre is the wrong frame for "how
+// much edge does this carry", and the first revision of this rule used it
+// alone.  But the fair centre alone is wrong the other way: on the side being
+// SHED, Step 7 deliberately posts at shifted x (1 +/- floor), i.e. with only
+// floor - shift of edge against fair value, so a canceller that demanded
+// retain x floor against fair value would cancel what the pricer had just
+// posted whenever shift > (1 - retain) x floor -- 61.5 bps at the live 123 bps
+// floor, inside the 100 bps rail -- and the pricer would post it again: the
+// post/cancel loop of S71, rebuilt one rule over.
+//
+// So an offer is cancelled for price only when it fails against BOTH centres:
+//   * on the shed side that reduces to the shifted-centre test: nothing the
+//     pricer would itself post now is ever cancelled;
+//   * on the other side it reduces to the fair-value test: an offer still
+//     earning its edge against what the asset is worth is not churned merely
+//     because the inventory skew moved the ladder away from it.  Inventory
+//     that must not grow is the business of the side gates (can_bid/can_ask,
+//     which classify_tier_staleness honours first), not of a price rule.
+// With no fair centre (0 until Step 7 reaches its capture point) the shifted
+// centre decides alone.
+//
+// WHY THE RESTING FLOOR IS A FRACTION OF THE POSTING FLOOR.  Step 7's
+// width-floor pass pushes tiers out to EXACTLY centre x (1 +/- floor), so an
+// offer is routinely born with edge == floor.  Were the cancel threshold the
+// same number, the first adverse tick after kMinRefreshAgeBlocks would refresh
+// it, and the rule would cancel MORE than the one it replaces.  A post
+// threshold and a cancel threshold that coincide are a flapping switch;
+// edge_retain is the gap between them.
+// ---------------------------------------------------------------------------
+
+/// The edge, in bps of the centre, a fill at @p price would earn: positive
+/// when an ask rests ABOVE the centre or a bid BELOW it.  0 for an unusable
+/// input; callers gate on margin_reference_usable first.
+[[nodiscard]] inline double resting_edge_bps(bool   is_ask,
+                                             double price,
+                                             double centre) noexcept
+{
+    if (!(price > 0.0) || !std::isfinite(price)
+        || !(centre > 0.0) || !std::isfinite(centre)) {
+        return 0.0;
+    }
+    const double signed_gap = is_ask ? (price - centre) : (centre - price);
+    return signed_gap / centre * 10'000.0;
+}
+
+/// The edge the margin rule judges: the KINDER of the edges against Step 7's
+/// shifted ladder centre and its fair-value centre (see the banner above for
+/// why both, and why the kinder).  An unusable @p fair_centre leaves the
+/// shifted centre to decide alone.
+[[nodiscard]] inline double margin_edge_bps(bool   is_ask,
+                                            double price,
+                                            double centre,
+                                            double fair_centre) noexcept
+{
+    const double vs_ladder = resting_edge_bps(is_ask, price, centre);
+    if (!(fair_centre > 0.0) || !std::isfinite(fair_centre)) {
+        return vs_ladder;
+    }
+    const double vs_fair = resting_edge_bps(is_ask, price, fair_centre);
+    return vs_fair > vs_ladder ? vs_fair : vs_ladder;
+}
+
+/// Whether Step 7 handed over a centre, a floor and a retain fraction the
+/// margin rule can reason from.  quote_mid_mojos and the floor stay 0 until
+/// Step 7 reaches ladder generation for the pair this cycle.
+[[nodiscard]] inline bool margin_reference_usable(double centre,
+                                                  double min_edge_bps,
+                                                  double edge_retain) noexcept
+{
+    return centre > 0.0 && std::isfinite(centre)
+        && min_edge_bps > 0.0 && std::isfinite(min_edge_bps)
+        && edge_retain > 0.0 && edge_retain <= 1.0;
+}
+
+enum class MarginRefresh {
+    Fresh,        ///< keep the offer live
+    Stale,        ///< crossed, or a fill would earn less than the resting floor
+    NoReference,  ///< no usable centre/floor -- the caller falls back to
+                  ///< classify_tier_refresh, i.e. to today's rule, rather than
+                  ///< resting an offer nothing is pricing
+};
+
+/// The margin-mode zone selection, in its own order.  As above, the order is
+/// the contract: a cross outranks everything, the minimum-age guard outranks
+/// the edge test, and direction is not an input at all -- a favourable drift
+/// can only ADD edge, so it can never cancel.
+///
+/// @param crossed       from classify_cross_bbo, above.
+/// @param below_min_age age < kMinRefreshAgeBlocks.
+/// @param is_ask        side of the resting offer.
+/// @param price         its resting price.
+/// @param centre        Step 7's SHIFTED ladder centre for the pair, THIS
+///                      cycle (quote_mid_mojos) -- the one the floor is
+///                      measured from, and the one that must be usable.
+/// @param fair_centre   Step 7's fair-value centre before the inventory shift
+///                      (quote_fair_centre_mojos); 0 = not captured.
+/// @param min_edge_bps  Step 7's minimum half-spread for the pair, THIS cycle.
+/// @param edge_retain   fraction of min_edge_bps a resting offer must keep.
+[[nodiscard]] inline MarginRefresh classify_tier_refresh_margin(
+    bool   crossed,
+    bool   below_min_age,
+    bool   is_ask,
+    double price,
+    double centre,
+    double fair_centre,
+    double min_edge_bps,
+    double edge_retain) noexcept
+{
+    // (1) Crossed: urgent, ahead of every guard -- and decidable with no
+    //     centre at all, so it is tested before the reference is.
+    if (crossed) {
+        return MarginRefresh::Stale;
+    }
+    if (!margin_reference_usable(centre, min_edge_bps, edge_retain)
+        || !(price > 0.0) || !std::isfinite(price)) {
+        return MarginRefresh::NoReference;
+    }
+    // (2) Too young: same guard, same reason, as the deviation rule.
+    if (below_min_age) {
+        return MarginRefresh::Fresh;
+    }
+    // (3) The edge test.  Strictly below: an offer resting exactly on the
+    //     resting floor is still acceptable, as one exactly on the posting
+    //     floor is to Step 7.
+    return margin_edge_bps(is_ask, price, centre, fair_centre)
+               < min_edge_bps * edge_retain
+        ? MarginRefresh::Stale
+        : MarginRefresh::Fresh;
+}
+
+/// The offer_log cancel_reason of a margin cancel: the edge the fill would
+/// have earned over the edge a resting offer must keep, e.g.
+/// "margin_breach(41.7/61.5bps)".  A negative edge is an offer resting on the
+/// wrong side of the centre.  The "margin_breach(" prefix is what reports
+/// group on, as they do on "price_adverse(".
+[[nodiscard]] inline std::string margin_breach_reason(double edge_bps,
+                                                      double required_edge_bps)
+{
+    // One decimal, by integer arithmetic: no locale, no "-0.0", and no
+    // printf for -Wformat-truncation to reason about.  A non-finite input
+    // prints as 0.0 rather than putting "nan" in a column people filter.
+    const auto tenths = [](double v) {
+        if (!std::isfinite(v)) v = 0.0;
+        if (v >  1.0e12) v =  1.0e12;
+        if (v < -1.0e12) v = -1.0e12;
+        const long long t = std::llround(v * 10.0);
+        const long long a = (t < 0) ? -t : t;
+        return std::string(t < 0 ? "-" : "") + std::to_string(a / 10) + "."
+             + std::to_string(a % 10);
+    };
+    return "margin_breach(" + tenths(edge_bps) + "/"
+         + tenths(required_edge_bps) + "bps)";
 }
 
 }  // namespace xop::execution

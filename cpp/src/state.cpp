@@ -295,6 +295,17 @@ bool State::mark_cancel_pending(const std::string& offer_id)
     return true;
 }
 
+bool State::set_offer_expiry(const std::string& offer_id,
+                             std::uint64_t      expiry_max_time)
+{
+    std::unique_lock lock(mtx_offers_);
+
+    auto it = pending_offers_.find(offer_id);
+    if (it == pending_offers_.end()) return false;
+    it->second.expiry_max_time = expiry_max_time;
+    return true;
+}
+
 PendingOffer State::get_offer(const std::string& offer_id) const
 {
     std::shared_lock lock(mtx_offers_);

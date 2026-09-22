@@ -922,6 +922,27 @@ asio::awaitable<std::int64_t> ChiaWalletRPC::get_height_info()
     co_return resp["height"].get<std::int64_t>();
 }
 
+asio::awaitable<std::uint64_t>
+ChiaWalletRPC::get_timestamp_for_height(std::int64_t height)
+{
+    // [S70] Shape pinned in wallet_requests.hpp / test_wallet_requests.cpp.
+    const json resp = co_await rpc_post(
+        "get_timestamp_for_height",
+        make_get_timestamp_for_height_request(height));
+    co_return parse_timestamp_for_height_response(resp);
+}
+
+asio::awaitable<FullNodePeerCensus>
+ChiaWalletRPC::get_full_node_peer_census()
+{
+    // [review #164] Shape pinned in wallet_requests.hpp /
+    // test_wallet_requests.cpp, and verified read-only against the live 2.7.4
+    // wallet on 2026-09-21.
+    const json resp = co_await rpc_post("get_connections",
+                                        make_get_connections_request());
+    co_return census_full_node_peers(resp);
+}
+
 asio::awaitable<json> ChiaWalletRPC::get_sync_status()
 {
     co_return co_await rpc_post("get_sync_status");

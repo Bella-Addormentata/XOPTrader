@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <string>
 
 #include "xop/execution/offer_expiry.hpp"
 #include "xop/rpc/chia_rpc.hpp"
@@ -35,7 +36,21 @@ using xop::execution::effective_offer_expiry_secs;
 using xop::execution::expiry_echo_ok;
 using xop::execution::expiry_max_time_from;
 using xop::execution::expiry_outlasts_hard_ttl;
+using xop::execution::age_limit_cancel_applies;
+using xop::execution::chain_clock_trust;
+using xop::execution::chain_clock_trust_reason;
+using xop::execution::ChainClockTrust;
+using xop::execution::decide_expired_retire;
+using xop::execution::expired_at_depth;
+using xop::execution::expired_retire_clock_height;
+using xop::execution::ExpiredRetire;
+using xop::execution::expiry_warn_due;
+using xop::execution::expiry_worth_checking;
 using xop::execution::hard_ttl_seconds;
+using xop::execution::kExpiredRetireDepthBlocks;
+using xop::execution::kExpiryWarnIntervalBlocks;
+using xop::execution::kMinPlausibleUnixTime;
+using xop::execution::trade_record_max_time;
 using xop::rpc::ChiaWalletRPC;
 
 namespace {
@@ -302,4 +317,365 @@ TEST(OfferExpiry, TheFloorTracksTheConfiguredTtlRatherThanAFixedNumber) {
                                           kSecsBlock));
     EXPECT_TRUE(expiry_outlasts_hard_ttl(200000u, 600u, kHardMult,
                                          kSecsBlock));
+}
+
+// ===========================================================================
+// [S70 2026-09-20] ttl_cancel_mode: expire
+//
+// Five ways this mode could turn from "fewer cancels" into a loss:
+//
+//   5. It must spare ONLY an offer with a verified expiry.  Sparing one with
+//      none leaves an offer nothing bounds.
+//   6. The expiry read back from a wallet record must fail closed exactly as
+//      the creation echo does.
+//   7. "Expired" is a statement about the CHAIN clock, read at a confirmation
+//      DEPTH (a seconds margin is not one -- [review #164]); the host clock
+//      may only ever decide to look.
+//   8. A trade the wallet no longer reports PENDING_ACCEPT is never retired
+//      locally -- CONFIRMED is a fill, and `filled` always wins.
+//   9. A record that does not repeat the tracked expiry is never retired
+//      locally: that would be the insecure cancel on an unverified timelock.
+//  10. [review #164] The clock must come from a peer this host runs.  It is
+//      not a local fact and nothing about its VALUE can be checked, so the
+//      only defence is a check on WHOSE it is.
+// ===========================================================================
+
+namespace {
+
+// A get_offer trade_record as the live chia 2.7.4 wallet returned it on
+// 2026-09-20 for an offer posted with offer_expiry_secs: 86400 (key set and
+// valid_times block verbatim; ids shortened).
+json live_trade_record(const json& max_time_value,
+                       const char* status = "PENDING_ACCEPT") {
+    return json{
+        {"accepted_at_time", nullptr},
+        {"confirmed_at_index", 0},
+        {"created_at_time", 1789916833},
+        {"is_my_offer", true},
+        {"sent", 0},
+        {"sent_to", json::array()},
+        {"status", status},
+        {"taken_offer", nullptr},
+        {"trade_id", "0x77e25517"},
+        {"valid_times", {
+            {"max_blocks_after_created", nullptr},
+            {"max_height",               nullptr},
+            {"max_secs_after_created",   nullptr},
+            {"max_time",                 max_time_value},
+            {"min_blocks_since_created", nullptr},
+            {"min_height",               nullptr},
+            {"min_secs_since_created",   nullptr},
+            {"min_time",                 nullptr},
+        }},
+    };
+}
+
+constexpr std::uint64_t kMaxTime = 1'790'003'230ull;  // the live record's
+
+}  // namespace
+
+// -- 5. which offers the hard TTL still owns --------------------------------
+
+TEST(OfferExpireMode, DefaultModeKeepsTheHardTtlForEveryOffer) {
+    EXPECT_TRUE(age_limit_cancel_applies(/*expire_mode=*/false, 0u));
+    EXPECT_TRUE(age_limit_cancel_applies(/*expire_mode=*/false, kMaxTime));
+}
+
+TEST(OfferExpireMode, ExpireModeSparesOnlyAVerifiedExpiry) {
+    EXPECT_FALSE(age_limit_cancel_applies(/*expire_mode=*/true, kMaxTime));
+    // No verified expiry: nothing else bounds this offer's life, so the
+    // hard TTL keeps it -- an offer from before the feature, a failed echo,
+    // or one restored from offer_log and not yet read back from the wallet.
+    EXPECT_TRUE(age_limit_cancel_applies(/*expire_mode=*/true, 0u));
+}
+
+// -- 6. the expiry a wallet RECORD carries ----------------------------------
+
+TEST(OfferExpireMode, RecordMaxTimeIsReadFromTheLiveShape) {
+    EXPECT_EQ(trade_record_max_time(live_trade_record(kMaxTime)), kMaxTime);
+    // And through TEXT, as rpc_post parses the wire -- which is what makes
+    // a non-negative integer number_unsigned in the first place.
+    const json wire = json::parse(live_trade_record(kMaxTime).dump());
+    ASSERT_TRUE(wire["valid_times"]["max_time"].is_number_unsigned());
+    EXPECT_EQ(trade_record_max_time(wire), kMaxTime);
+}
+
+TEST(OfferExpireMode, RecordMaxTimeFailsClosedOnEveryNotHonouredShape) {
+    EXPECT_EQ(trade_record_max_time(live_trade_record(nullptr)), 0u);
+    EXPECT_EQ(trade_record_max_time(live_trade_record("1790003230")), 0u);
+    EXPECT_EQ(trade_record_max_time(live_trade_record(1790003230.0)), 0u);
+    EXPECT_EQ(trade_record_max_time(live_trade_record(1790003230.5)), 0u);
+    EXPECT_EQ(trade_record_max_time(live_trade_record(-1)), 0u);
+    EXPECT_EQ(trade_record_max_time(json::object()), 0u);
+    EXPECT_EQ(trade_record_max_time(json{{"valid_times", nullptr}}), 0u);
+    EXPECT_EQ(trade_record_max_time(json{{"valid_times", "nope"}}), 0u);
+    EXPECT_EQ(trade_record_max_time(json{{"valid_times", json::object()}}), 0u);
+    EXPECT_EQ(trade_record_max_time(json::array()), 0u);
+    EXPECT_EQ(trade_record_max_time(json(nullptr)), 0u);
+}
+
+TEST(OfferExpireMode, RecordMaxTimeBeforeGenesisIsNotOurs) {
+    // Same plausibility floor as expiry_max_time_from: a timelock before
+    // mainnet genesis is not one this bot minted, and with chain time far
+    // past it every such offer would read as "expired long ago".
+    const auto genesis = static_cast<std::uint64_t>(kMinPlausibleUnixTime);
+    EXPECT_EQ(trade_record_max_time(live_trade_record(genesis - 1)), 0u);
+    EXPECT_EQ(trade_record_max_time(live_trade_record(std::uint64_t{86401})),
+              0u);
+    EXPECT_EQ(trade_record_max_time(live_trade_record(genesis)), genesis);
+}
+
+TEST(OfferExpireMode, TheGetOfferWrapperIsNotWhatIsParsed) {
+    // ChiaWalletRPC::get_offer returns the trade_record OBJECT.  Handing the
+    // parser the whole response instead must read as "no expiry", not throw.
+    const json whole{{"success", true},
+                     {"trade_record", live_trade_record(kMaxTime)}};
+    EXPECT_EQ(trade_record_max_time(whole), 0u);
+    EXPECT_EQ(trade_record_max_time(whole["trade_record"]), kMaxTime);
+}
+
+// -- 7. "expired" is the chain's word ----------------------------------------
+
+TEST(OfferExpireMode, TheReorgAllowanceIsADepthInBlocks) {
+    // 32 peak-height blocks (~10 min at 18.75 s), over five times the 6 this
+    // engine asks of a fill.  Pinned because the header, the PR and the
+    // operator procedure all quote it.
+    EXPECT_EQ(kExpiredRetireDepthBlocks, 32);
+    // The clock is read that far BELOW the wallet's synced height...
+    EXPECT_EQ(expired_retire_clock_height(9'319'422), 9'319'390);
+    EXPECT_EQ(expired_retire_clock_height(33), 1);
+    // ...and a wallet not yet that deep into the chain has no clock at all,
+    // rather than a clamped height that would quietly read the tip.
+    EXPECT_EQ(expired_retire_clock_height(32), 0);
+    EXPECT_EQ(expired_retire_clock_height(1), 0);
+    EXPECT_EQ(expired_retire_clock_height(0), 0);
+    EXPECT_EQ(expired_retire_clock_height(-7), 0);
+}
+
+TEST(OfferExpireMode, ExpiredOnceTheChainAtDepthIsAtOrPastMaxTime) {
+    EXPECT_FALSE(expired_at_depth(kMaxTime, kMaxTime - 1));
+    // AT max_time counts, as it does in consensus: a spend asserting BEFORE
+    // max_time fails once the previous transaction block is stamped >= it.
+    EXPECT_TRUE(expired_at_depth(kMaxTime, kMaxTime));
+    EXPECT_TRUE(expired_at_depth(kMaxTime, kMaxTime + 86400));
+}
+
+TEST(OfferExpireMode, UnknownClockOrUnknownExpiryIsNeverExpired) {
+    EXPECT_FALSE(expired_at_depth(0u, kMaxTime + 86400));
+    EXPECT_FALSE(expired_at_depth(kMaxTime, 0u));
+    EXPECT_FALSE(expired_at_depth(0u, 0u));
+}
+
+TEST(OfferExpireMode, ASecondsMarginIsNotAConfirmationDepth) {
+    // [review #164] The scenario the first revision got wrong.  The last
+    // transaction block before the expiry was stamped max_time - 5; then the
+    // chain went quiet, and the NEXT transaction block -- the wallet's tip --
+    // is stamped max_time + 700.  A "600 s past max_time" margin read at the
+    // tip is satisfied at a confirmation depth of ONE; reorg that block and
+    // the offer is takeable again while its trade says CANCELLED.
+    //
+    // Read 32 blocks back instead, the chain clock is still max_time - 5, and
+    // the offer waits.  (That the pass ASKS for the clock at that height, not
+    // at the tip, is pinned in tests/test_cancel_reduction_wiring.py.)
+    const std::uint64_t clock_at_depth = kMaxTime - 5;
+    EXPECT_FALSE(expired_at_depth(kMaxTime, clock_at_depth));
+    EXPECT_EQ(decide_expired_retire(true, kMaxTime, kMaxTime, clock_at_depth),
+              ExpiredRetire::NotExpired);
+    // Thirty-two blocks later that same +700 block is what the at-depth read
+    // returns, and the offer retires.
+    EXPECT_EQ(decide_expired_retire(true, kMaxTime, kMaxTime, kMaxTime + 700),
+              ExpiredRetire::RetireLocal);
+}
+
+TEST(OfferExpireMode, AHugeMaxTimeHasNoArithmeticToWrap) {
+    // The decision compares; it never adds to or subtracts from max_time, so a
+    // hostile value cannot wrap into "long expired".
+    const auto huge = std::numeric_limits<std::uint64_t>::max() - 10;
+    EXPECT_FALSE(expired_at_depth(huge, kMaxTime));
+    EXPECT_TRUE(expired_at_depth(huge, huge));
+}
+
+TEST(OfferExpireMode, TheHostClockOnlyDecidesWhetherToLook) {
+    EXPECT_FALSE(expiry_worth_checking(kMaxTime,
+                                       static_cast<std::int64_t>(kMaxTime) - 1));
+    EXPECT_TRUE(expiry_worth_checking(kMaxTime,
+                                      static_cast<std::int64_t>(kMaxTime)));
+    // No expiry, or a dead host clock: nothing to look at.
+    EXPECT_FALSE(expiry_worth_checking(0u, static_cast<std::int64_t>(kMaxTime)));
+    EXPECT_FALSE(expiry_worth_checking(kMaxTime, 0));
+    EXPECT_FALSE(expiry_worth_checking(kMaxTime, -5));
+}
+
+TEST(OfferExpireMode, AFastHostClockCannotRetireAnything) {
+    // The host says the offer expired a day ago; the chain, at depth, says it
+    // has two minutes left.  The pre-filter looks -- and the decision says no.
+    const std::uint64_t chain_now = kMaxTime - 120;
+    EXPECT_TRUE(expiry_worth_checking(
+        kMaxTime, static_cast<std::int64_t>(kMaxTime) + 86400));
+    EXPECT_EQ(decide_expired_retire(true, kMaxTime, kMaxTime, chain_now),
+              ExpiredRetire::NotExpired);
+}
+
+// -- 8 and 9. the retire decision ---------------------------------------------
+
+TEST(OfferExpireMode, RetiresOnlyAnExpiredVerifiedPendingAcceptOffer) {
+    EXPECT_EQ(decide_expired_retire(true, kMaxTime, kMaxTime, kMaxTime),
+              ExpiredRetire::RetireLocal);
+    EXPECT_EQ(decide_expired_retire(true, kMaxTime, kMaxTime, kMaxTime + 600),
+              ExpiredRetire::RetireLocal);
+}
+
+TEST(OfferExpireMode, AnyOtherWalletStatusIsLeftToTheWallet) {
+    // CONFIRMED is a fill; PENDING_CANCEL / CANCELLED belong to the path that
+    // sent the cancel.  None is retired locally, however long ago it expired
+    // -- and the status outranks every other input.
+    EXPECT_EQ(decide_expired_retire(false, kMaxTime, kMaxTime,
+                                    kMaxTime + 86400),
+              ExpiredRetire::LeaveToWallet);
+    EXPECT_EQ(decide_expired_retire(false, 0u, 0u, 0u),
+              ExpiredRetire::LeaveToWallet);
+    EXPECT_EQ(decide_expired_retire(false, kMaxTime, kMaxTime - 1,
+                                    kMaxTime + 86400),
+              ExpiredRetire::LeaveToWallet);
+}
+
+TEST(OfferExpireMode, ARecordThatDoesNotRepeatTheTrackedExpiryIsUnverified) {
+    // Dropped (0), earlier, later: each means the timelock we are about to
+    // rely on is not the one the wallet signed.
+    for (const std::uint64_t rec : {std::uint64_t{0}, kMaxTime - 1,
+                                    kMaxTime + 1}) {
+        EXPECT_EQ(decide_expired_retire(true, kMaxTime, rec, kMaxTime + 86400),
+                  ExpiredRetire::Unverified) << rec;
+    }
+    // And an offer we never tracked an expiry for is not retired because the
+    // record happens to carry one.
+    EXPECT_EQ(decide_expired_retire(true, 0u, kMaxTime, kMaxTime + 86400),
+              ExpiredRetire::Unverified);
+    EXPECT_EQ(decide_expired_retire(true, 0u, 0u, kMaxTime + 86400),
+              ExpiredRetire::Unverified);
+}
+
+TEST(OfferExpireMode, VerifiedButNotYetExpiredAtDepthWaits) {
+    EXPECT_EQ(decide_expired_retire(true, kMaxTime, kMaxTime, kMaxTime - 1),
+              ExpiredRetire::NotExpired);
+    EXPECT_EQ(decide_expired_retire(true, kMaxTime, kMaxTime, 0u),
+              ExpiredRetire::NotExpired);
+}
+
+TEST(OfferExpireMode, ARepeatedRetireWarningIsLoggedOncePerHalfHour) {
+    // The retire pass runs every heartbeat while any offer waits past its
+    // expiry, and a wallet that cannot supply the chain clock fails the same
+    // way each time.  96 peak-height blocks is ~30 min at 18.75 s.
+    EXPECT_EQ(kExpiryWarnIntervalBlocks, 96u);
+    EXPECT_TRUE(expiry_warn_due(0u, 9'319'000u)) << "never warned";
+    EXPECT_FALSE(expiry_warn_due(9'319'000u, 9'319'000u));
+    EXPECT_FALSE(expiry_warn_due(9'319'000u, 9'319'095u));
+    EXPECT_TRUE(expiry_warn_due(9'319'000u, 9'319'096u));
+    // A height that went backwards (a reorg, a height-source switch) must
+    // warn rather than wrap into a huge "age" -- or stay silent for good.
+    EXPECT_TRUE(expiry_warn_due(9'319'000u, 9'318'990u));
+}
+
+// ===========================================================================
+// 10. [review #164 2026-09-21] WHOSE clock it is.
+//
+// Copilot's finding, verified against the chia 2.7.4 source: the timestamp is
+// not anchored to the wallet's processed chain.  WalletNode.get_timestamp_for_
+// height walks its full-node peers and returns the first non-None answer, with
+// expected_header_hash left at None, so on a cache miss the only validation is
+// "one block came back" and "its height matches" -- no signature, PoSpace, VDF
+// or consensus.  Acting falsely on it frees a still-takeable offer's coins
+// with no spend and no undo, and the take is then invisible forever.
+//
+// The tests below pin the two halves of the honest answer: the arithmetic has
+// NO defence of its own (so nobody deletes the gate believing one is in here),
+// and the gate is a statement about the peer SET.
+// ===========================================================================
+
+TEST(OfferExpireMode, TheClockArithmeticHasNoDefenceAgainstAForgedTimestamp) {
+    // A peer answering the largest uint64 expires every offer that will ever
+    // exist.  Nothing in this header objects -- expired_at_depth tests only
+    // `>=`, and there is deliberately no plausibility ceiling.
+    const auto forged_far = std::numeric_limits<std::uint64_t>::max();
+    EXPECT_TRUE(expired_at_depth(kMaxTime, forged_far));
+    EXPECT_EQ(decide_expired_retire(true, kMaxTime, kMaxTime, forged_far),
+              ExpiredRetire::RetireLocal);
+
+    // And the crude lie is not the one to design against.  A patient peer
+    // answers max_time EXACTLY -- a second's worth of lie, which no ceiling
+    // and no "is this plausible" test could ever separate from the truth --
+    // and gets the same irreversible cancel.
+    EXPECT_EQ(decide_expired_retire(true, kMaxTime, kMaxTime, kMaxTime),
+              ExpiredRetire::RetireLocal);
+
+    // Nor would a monotonicity rule help: read an honest clock first, then a
+    // forged one, and the sequence is still strictly increasing, so a "the
+    // chain clock must never go backwards" gate passes both readings.
+    const std::uint64_t honest_earlier = kMaxTime - 600;
+    EXPECT_FALSE(expired_at_depth(kMaxTime, honest_earlier));
+    EXPECT_GT(forged_far, honest_earlier);
+    EXPECT_GT(kMaxTime, honest_earlier);
+
+    // Which is the whole argument for gating on WHO answered.
+}
+
+TEST(OfferExpireMode, TheClockIsTrustedOnlyWhenEveryFullNodePeerIsOnThisHost) {
+    EXPECT_EQ(chain_clock_trust(true, 1, 0), ChainClockTrust::Trusted);
+    EXPECT_EQ(chain_clock_trust(true, 4, 0), ChainClockTrust::Trusted);
+    // ONE stranger among four is enough.  The RPC never reports which peer
+    // answered and get_full_node_peers_in_order() shuffles within its
+    // buckets, so the candidate set is the only thing that can be gated.
+    EXPECT_EQ(chain_clock_trust(true, 4, 1), ChainClockTrust::UntrustedPeer);
+    EXPECT_EQ(chain_clock_trust(true, 3, 3), ChainClockTrust::UntrustedPeer);
+    // "Nothing could have answered" and "we could not read the answer" are
+    // different operator problems from "a stranger could have"; all three
+    // refuse, and each says which it was.
+    EXPECT_EQ(chain_clock_trust(true, 0, 0), ChainClockTrust::NoFullNodePeer);
+    EXPECT_EQ(chain_clock_trust(false, 1, 0), ChainClockTrust::Unreadable);
+    EXPECT_EQ(chain_clock_trust(false, 0, 0), ChainClockTrust::Unreadable);
+    // An unreadable census outranks whatever it might have contained: those
+    // counts were never established.
+    EXPECT_EQ(chain_clock_trust(false, 9, 0), ChainClockTrust::Unreadable);
+    EXPECT_EQ(chain_clock_trust(false, 9, 9), ChainClockTrust::Unreadable);
+}
+
+TEST(OfferExpireMode, TheTwoStatesThisOperatorHasBeenInBothRefuseTheClock) {
+    // (a) THE LOCAL NODE IS DOWN.  wallet_node.py:838-841 on_disconnect clears
+    //     local_node_synced and re-runs initialize_wallet_peers; discovery
+    //     connects to strangers and the wallet untrusted-syncs to them
+    //     (:1481-1499).  The node RPC was unreachable for hours on
+    //     2026-09-14 -- this is not a hypothetical.
+    EXPECT_EQ(chain_clock_trust(true, 3, 3), ChainClockTrust::UntrustedPeer);
+    // (b) THE TRANSIENT AFTER IT RETURNS.  The localhost peer is connected
+    //     again but sits in the `trusted` bucket (3rd) until its long_sync
+    //     finishes, while already-synced strangers sit in `synced` (2nd) --
+    //     so a stranger is asked FIRST for the whole window (:1203-1228).
+    EXPECT_EQ(chain_clock_trust(true, 4, 3), ChainClockTrust::UntrustedPeer);
+    // Neither is closed by the engine's wallet sync gate (get_sync_status):
+    // a wallet synced to strangers reports synced = true.  Only the steady
+    // state retires anything.
+    EXPECT_EQ(chain_clock_trust(true, 1, 0), ChainClockTrust::Trusted);
+}
+
+TEST(OfferExpireMode, EachRefusalNamesItselfToTheOperator) {
+    const std::string unreadable =
+        chain_clock_trust_reason(ChainClockTrust::Unreadable);
+    const std::string no_peer =
+        chain_clock_trust_reason(ChainClockTrust::NoFullNodePeer);
+    const std::string stranger =
+        chain_clock_trust_reason(ChainClockTrust::UntrustedPeer);
+    const std::string trusted =
+        chain_clock_trust_reason(ChainClockTrust::Trusted);
+    for (const std::string* s : {&unreadable, &no_peer, &stranger, &trusted}) {
+        EXPECT_FALSE(s->empty());
+    }
+    // A dead node, a wallet that would not say, and a wallet talking to
+    // strangers are three different things to go and fix.
+    EXPECT_NE(unreadable, no_peer);
+    EXPECT_NE(no_peer, stranger);
+    EXPECT_NE(unreadable, stranger);
+    // The one that matters most must say why the answer is worthless, not
+    // merely that a peer is foreign.
+    EXPECT_NE(stranger.find("this host does not run"), std::string::npos);
+    EXPECT_NE(stranger.find("whatever a peer says"), std::string::npos);
 }

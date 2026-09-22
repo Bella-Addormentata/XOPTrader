@@ -276,6 +276,54 @@ def test_the_book_window_follows_the_configured_ttl():
     assert our_book_window_hours(1000) > our_book_window_hours(400)
 
 
+def test_the_book_window_follows_the_onchain_expiry_in_expire_mode():
+    """[S70] Under ttl_cancel_mode: expire a quote outlives the hard TTL.
+
+    It rests until its on-chain expiry plus the engine's 32-block (~600 s) retire depth --
+    24 h 10 min at the live offer_expiry_secs: 86400, against a hard TTL of
+    ~4.2 h.  A window sized from offer_ttl_blocks alone would show that side
+    as absent for most of the offer's life.
+    """
+    from pathlib import Path
+
+    from gui.services.database_service import (
+        book_window_ttl_blocks,
+        our_book_window_hours,
+    )
+
+    base = {"strategy": {"offer_ttl_blocks": 400, "offer_expiry_secs": 86400}}
+    # Default mode (key absent, or 'cancel'): exactly the configured TTL.
+    assert book_window_ttl_blocks(base) == 400
+    assert book_window_ttl_blocks(
+        {"strategy": {**base["strategy"], "ttl_cancel_mode": "cancel"}}) == 400
+
+    expire = {"strategy": {**base["strategy"], "ttl_cancel_mode": "expire"}}
+    rest_hours = (86400 + 600) / 3600.0
+    assert our_book_window_hours(book_window_ttl_blocks(expire)) > rest_hours
+    assert our_book_window_hours(400) < rest_hours, "the regression this guards"
+
+    # The longest pair override counts; a TTL longer than the expiry still wins.
+    pair_only = {"strategy": {"offer_ttl_blocks": 400, "ttl_cancel_mode": "expire"},
+                 "pairs": [{"name": "A"}, {"offer_expiry_secs_override": 172800}, "junk"]}
+    assert our_book_window_hours(book_window_ttl_blocks(pair_only)) > (172800 + 600) / 3600.0
+    long_ttl = {"strategy": {"offer_ttl_blocks": 9000, "offer_expiry_secs": 86400,
+                             "ttl_cancel_mode": "expire"}}
+    assert book_window_ttl_blocks(long_ttl) == 9000
+
+    # Expire mode with nothing to expire, and junk, fall back to the TTL / 0.
+    assert book_window_ttl_blocks(
+        {"strategy": {"offer_ttl_blocks": 400, "ttl_cancel_mode": "expire"}}) == 400
+    for junk in (None, {}, {"strategy": None}, {"strategy": {"offer_ttl_blocks": "x"}},
+                 {"strategy": {"ttl_cancel_mode": "expire", "offer_expiry_secs": "x"}}):
+        assert book_window_ttl_blocks(junk) == 0
+
+    source = Path(__file__).resolve().parent.parent.joinpath(
+        "gui", "widgets", "main_window.py").read_text(encoding="utf-8")
+    assert "ttl_blocks = book_window_ttl_blocks(cfg)" in source, (
+        "the pairs table must size its window through book_window_ttl_blocks"
+    )
+
+
 def test_the_usd_rate_is_not_taken_from_a_stale_fallback():
     """The table refuses a last_trade mid; the P&L conversion must too.
 

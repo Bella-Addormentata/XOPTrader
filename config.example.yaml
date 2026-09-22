@@ -446,6 +446,59 @@ strategy:
   tier_spacing_bps: [35, 100, 200, 300]  # [REQUIRED] Spread per tier (bps)
   tier_size_pct: [0.15, 0.20, 0.30, 0.35] # [REQUIRED] Capital fraction per tier (sum ≈ 1.0)
   max_half_spread_bps: 250  # [OPTIONAL, default: 250] Global cap on half-spread
+  # [S70-S72] Three switches that cut CANCELS (each is a fee-bearing spend).
+  # Every one defaults to the rule in force before it existed; all need a
+  # restart.  Enable one at a time and watch the log line named beside it.
+  #
+  # ttl_cancel_mode: expire -- an offer that verifiably carries the expiry
+  #   above is no longer cancelled at the hard TTL; the chain ages it out and
+  #   the bot then frees its coins with a FREE local cancel, once a chain
+  #   clock read 32 blocks back is past max_time (never this host's clock, and
+  #   never the tip's: that proves no reorg depth).  Requires
+  #   offer_expiry_secs (or a pair override) > 0 -- rejected at startup
+  #   otherwise.  Log: "[offer-expiry] retired".  Offers with no verified
+  #   expiry, and everything a stopped engine ages out, keep today's cancel.
+  #   PRECONDITION -- the wallet must reach the chain ONLY through a full node
+  #   on this host.  The wallet RPC that supplies the clock answers from
+  #   whichever connected full node replies first, with no consensus check, so
+  #   the retire refuses to run while the wallet has ANY full-node peer this
+  #   host does not run -- which is what happens when the local node is down.
+  #   Then offers keep their coins locked until it returns; that is the safe
+  #   direction, and the log line naming it is "no trusted chain clock".
+  # ttl_cancel_mode: cancel                # [OPTIONAL, default: cancel] cancel | expire
+  #
+  # exposure_rule: unified -- one reserve-exposure verdict for the pre-post
+  #   projection AND the resting-offer check, from inputs that do not move
+  #   when an offer locks a coin.  Log: "exposure (unified)".
+  #   FAILS CLOSED, and not as a reserve breach: while a LIVE resting offer's
+  #   pair cannot be resolved against this config (an adopted UNKNOWN wallet
+  #   record, or a pair since REMOVED from the file -- a merely DISABLED pair
+  #   is still mapped), the resting sum is a lower bound while the wallet
+  #   balance still counts the coins that offer locks, so new posts are
+  #   suppressed on both sides until it drains.  No resting offer is ever
+  #   cancelled on its account.  Watch for the line that says so in its own
+  #   words: "exposure (unified) ... cannot be projected -- a LIVE resting
+  #   offer's pair is not in this config".
+  # exposure_rule: legacy                  # [OPTIONAL, default: legacy] legacy | unified
+  # exposure_cancel_hysteresis_pct: 0.25   # [OPTIONAL, default: 0.25] [0, 1] unified only: resting offers are cancelled only below reserve x (1 - this); 1 = never cancel, suppress only
+  # exposure_cancel_min_age_blocks: 32     # [OPTIONAL, default: 32] [0, 4608] unified only: younger offers are never exposure-cancelled (32 blocks = 10 min)
+  #
+  # price_cancel_mode: margin -- cancel for PRICE only when a fill at the
+  #   resting price would earn less than price_cancel_edge_retain x the edge
+  #   Step 7 demands of a new offer (max(min_profit_margin, sigma width,
+  #   tibetswap fee)) -- judged against BOTH of Step 7's centres, the shifted
+  #   ladder centre and fair value, with the KINDER of the two edges deciding,
+  #   so it never cancels what the pricer would itself post.  Crossed offers
+  #   are still cancelled first; favourable drift never cancels.  Reason in
+  #   offer_log: "margin_breach(<edge>/<floor>bps)".
+  #   COST, MEASURED: replayed over the 14 days to 2026-09-20 this rule fires,
+  #   at some block, on up to 7 of the 15 offers that actually FILLED (0-7 once
+  #   the unrecorded fair centre is bounded by the 100 bps A-S rail; 3-7 at
+  #   retain 1.0).  It can cancel offers that would have been taken, and
+  #   nothing in this mode pulls a favourably-drifted quote back toward the
+  #   touch.  See cpp/tests/test_price_cancel_replay.cpp.
+  # price_cancel_mode: deviation           # [OPTIONAL, default: deviation] deviation | margin
+  # price_cancel_edge_retain: 0.5          # [OPTIONAL, default: 0.5] (0, 1] margin only: 1.0 cancels the instant the edge dips under the POSTING floor, where Step 7 routinely rests tiers
   offer_fee_mojos: 10000000  # [OPTIONAL, default: 10000000] On-chain fee per offer/cancel
   # --- Triangulated fair-value guard ----------------------------------------
   # The ladder is centred on a dexie book mid.  These knobs validate that mid

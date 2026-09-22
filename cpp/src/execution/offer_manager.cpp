@@ -390,6 +390,222 @@ OfferManager::retire_offer_failed_expiry(const PendingOffer& adopt,
 }
 
 // ---------------------------------------------------------------------------
+// [S70 2026-09-20] retire_expired_offers -- ttl_cancel_mode: expire
+//
+// The decisions are in offer_expiry.hpp; this supplies the wallet's answers.
+// Every read is of THIS heartbeat, and the order is fixed: WHO the wallet's
+// full-node peers are, then the chain clock (once), then who they are again,
+// then per offer the trade record, then the verdict, then -- only on
+// RetireLocal -- the one insecure cancel this function exists to send.
+//
+// [review #164 2026-09-21] The peer census is not decoration.  The clock is
+// one connected peer's unvalidated assertion, and acting on a false one frees
+// the maker coins of a STILL-TAKEABLE offer with no spend and no undo, with
+// the take then invisible to this wallet forever.
+// ---------------------------------------------------------------------------
+
+asio::awaitable<std::vector<std::string>>
+OfferManager::retire_expired_offers(BlockHeight current_block)
+{
+    std::vector<std::string> retired;
+    if (strategy_cfg_.ttl_cancel_mode != TtlCancelMode::Expire) {
+        co_return retired;
+    }
+
+    // Host clock: a PRE-FILTER only, so a heartbeat with nothing near its
+    // expiry costs no RPC.  It never decides a retire.
+    const auto host_now_s = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+
+    std::vector<PendingOffer> due;
+    for (const auto& po : state_->get_all_offers()) {
+        if (po.cancel_pending) continue;   // a cancel is already in hand
+        if (expiry_worth_checking(po.expiry_max_time,
+                                  static_cast<std::int64_t>(host_now_s))) {
+            due.push_back(po);
+        }
+    }
+    if (due.empty()) {
+        co_return retired;
+    }
+
+    // The chain clock, read kExpiredRetireDepthBlocks BELOW the height the
+    // wallet has FINISHED syncing to.  If the latest transaction block at
+    // that depth was already stamped >= an offer's max_time, then no later
+    // block can carry a take of it and the block that expired it is buried
+    // that deep -- a seconds margin proves neither (see offer_expiry.hpp).
+    //
+    // [review #164 2026-09-21] AND IT IS ONLY WORTH ANYTHING IF THE PEER THAT
+    // ANSWERED IT IS OURS.  get_timestamp_for_height takes the first answer
+    // from any connected full node, unanchored and unvalidated, so the wallet
+    // is asked WHO those peers are -- before the clock and again after it,
+    // because the set can change under the read -- and nothing is retired
+    // unless every one of them is on this host both times.  The depth does not
+    // help here: forging a timestamp 32 blocks back is exactly as cheap.
+    const rpc::TransportCounters pass_start = wallet_->transport_counters();
+    // This pass repeats every heartbeat while anything waits past its expiry,
+    // and a wallet that cannot answer fails the same way each time: WARN once
+    // per kExpiryWarnIntervalBlocks, debug in between.
+    const bool warn_now = expiry_warn_due(expiry_warned_block_, current_block);
+    const auto problem_level =
+        warn_now ? spdlog::level::warn : spdlog::level::debug;
+    bool problem_logged = false;
+
+    const auto trust_of = [](const rpc::FullNodePeerCensus& c) {
+        return chain_clock_trust(c.readable, c.full_node_peers,
+                                 c.non_local_peers);
+    };
+    const auto trust_error = [](ChainClockTrust t,
+                                const rpc::FullNodePeerCensus& c) {
+        std::string why = chain_clock_trust_reason(t);
+        if (!c.first_non_local_host.empty()) {
+            why += " (" + c.first_non_local_host + ")";
+        }
+        return why;
+    };
+
+    std::uint64_t chain_time_s = 0;
+    std::string clock_error;
+    try {
+        const rpc::FullNodePeerCensus before =
+            co_await wallet_->get_full_node_peer_census();
+        const ChainClockTrust trust_before = trust_of(before);
+        if (trust_before != ChainClockTrust::Trusted) {
+            clock_error = trust_error(trust_before, before);
+        } else {
+            const std::int64_t synced_height =
+                co_await wallet_->get_height_info();
+            const std::int64_t clock_height =
+                expired_retire_clock_height(synced_height);
+            if (clock_height <= 0) {
+                clock_error = "the wallet is fewer than "
+                    + std::to_string(kExpiredRetireDepthBlocks)
+                    + " blocks into the chain";
+            } else {
+                const std::uint64_t answered =
+                    co_await wallet_->get_timestamp_for_height(clock_height);
+                // The peer set can change WHILE the clock is being read, and
+                // the RPC never says which peer answered.  Re-ask.
+                const rpc::FullNodePeerCensus after =
+                    co_await wallet_->get_full_node_peer_census();
+                const ChainClockTrust trust_after = trust_of(after);
+                if (trust_after != ChainClockTrust::Trusted) {
+                    clock_error = "the peer set changed while the clock was "
+                                  "being read: " + trust_error(trust_after,
+                                                               after);
+                } else {
+                    chain_time_s = answered;
+                }
+            }
+        }
+    } catch (const std::exception& e) {
+        clock_error = e.what();
+    }
+    if (chain_time_s == 0) {
+        logger_->log(problem_level,
+                     "[offer-expiry] no trusted chain clock this heartbeat "
+                     "({}) -- {} offer(s) past their expiry stay tracked and "
+                     "keep their coins locked; retiring on an untrusted or "
+                     "missing clock is the one mistake this pass cannot undo",
+                     clock_error.empty() ? "the wallet returned no timestamp"
+                                         : clock_error.c_str(),
+                     due.size());
+        if (warn_now) expiry_warned_block_ = current_block;
+        co_return retired;
+    }
+
+    for (const auto& po : due) {
+        if (!expired_at_depth(po.expiry_max_time, chain_time_s)) {
+            continue;   // expired by the host clock only; ask again later
+        }
+        if (abort_predicate_ && abort_predicate_()) {
+            break;      // a stop is cancelling the book its own way
+        }
+        if (unanswered_transport_failure_since(
+                pass_start, wallet_->transport_counters())) {
+            break;      // [WALLET-CIRCUIT] no more calls into a dead wallet
+        }
+
+        ExpiredRetire verdict = ExpiredRetire::NotExpired;
+        try {
+            const json rec = co_await wallet_->get_offer(
+                po.offer_id, /*file_contents=*/false);
+            const bool pending_accept = rec.contains("status")
+                && trade_status::parse(rec["status"])
+                       == trade_status::kPendingAccept;
+            verdict = decide_expired_retire(pending_accept,
+                                            po.expiry_max_time,
+                                            trade_record_max_time(rec),
+                                            chain_time_s);
+        } catch (const std::exception& e) {
+            logger_->log(problem_level,
+                         "[offer-expiry] get_offer failed for expired {}: {} "
+                         "-- left tracked", po.offer_id.substr(0, 12),
+                         e.what());
+            problem_logged = true;
+            continue;
+        }
+
+        if (verdict == ExpiredRetire::LeaveToWallet) {
+            // CONFIRMED is a fill and `filled` always wins; a cancel status
+            // belongs to the path that sent it.  detect_fills owns both.
+            logger_->debug("[offer-expiry] {} is past its expiry but the "
+                           "wallet no longer reports PENDING_ACCEPT -- left "
+                           "to fill detection", po.offer_id.substr(0, 12));
+            continue;
+        }
+        if (verdict == ExpiredRetire::Unverified) {
+            // The wallet's record does not repeat the expiry we tracked.
+            // Forget it: the offer goes back under the hard TTL, which
+            // cancels it securely.
+            state_->set_offer_expiry(po.offer_id, 0);
+            logger_->warn("[offer-expiry] {} is tracked with max_time={} but "
+                          "the wallet record does not carry it -- expiry "
+                          "dropped, the hard TTL applies again",
+                          po.offer_id.substr(0, 12), po.expiry_max_time);
+            continue;
+        }
+        if (verdict != ExpiredRetire::RetireLocal) {
+            continue;
+        }
+        // A cancel may have been sent for it while this pass was suspended.
+        if (state_->get_offer(po.offer_id).cancel_pending) {
+            continue;
+        }
+
+        try {
+            // secure=false, fee 0: the trade goes CANCELLED in the wallet and
+            // its coins leave get_locked_coins(); nothing is spent.  Safe
+            // ONLY because of the verdict above -- see offer_expiry.hpp.
+            co_await cancel_offer_charged(po.offer_id, 0, /*secure=*/false);
+        } catch (const std::exception& e) {
+            logger_->log(problem_level,
+                         "[offer-expiry] local cancel of expired {} failed: "
+                         "{} -- retried next heartbeat",
+                         po.offer_id.substr(0, 12), e.what());
+            problem_logged = true;
+            continue;
+        }
+        // cancel_pending, not removed: only the wallet's CANCELLED verdict,
+        // seen by detect_fills, completes the offer_log row (#157).
+        state_->mark_cancel_pending(po.offer_id);
+        retired.push_back(po.offer_id);
+        logger_->info("[offer-expiry] retired {} ({} {} tier {}) at block {}: "
+                      "max_time={} chain_time_at_depth={} (+{}s) -- "
+                      "local cancel, no fee, coins released",
+                      po.offer_id.substr(0, 12), po.pair_name,
+                      to_string(po.side), po.tier, current_block,
+                      po.expiry_max_time, chain_time_s,
+                      chain_time_s - po.expiry_max_time);
+    }
+
+    if (problem_logged && warn_now) {
+        expiry_warned_block_ = current_block;
+    }
+    co_return retired;
+}
+
+// ---------------------------------------------------------------------------
 // post_quotes -- create multi-tier bid + ask offers on-chain
 // ---------------------------------------------------------------------------
 
@@ -939,6 +1155,9 @@ asio::awaitable<int> OfferManager::post_quotes(
         // Retain dexie's id -- own-offer exclusion in the arbitrage taker
         // matches the orderbook feed on THIS id, not the wallet trade id.
         pending.dexie_id         = dexie_id;
+        // [S70] Reached only past expiry_echo_ok above, so a non-zero value
+        // here IS the wallet's echo, not merely what we asked for.
+        pending.expiry_max_time  = expiry_max_time.value_or(0);
 
         state_->upsert_offer(pending);
         ++created_count;
@@ -1155,6 +1374,35 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
                 ++fill_poll_pending_counts_[id];
             } else {
                 fill_poll_pending_counts_.erase(id);
+            }
+        }
+    }
+
+    // [S70] Expiry backfill.  The boot restore rebuilds State from offer_log
+    // (pending_offer_from_db), which has no expiry column, so every restored
+    // offer comes back with expiry_max_time == 0 and would fall to the hard
+    // TTL under ttl_cancel_mode: expire.  The record this poll just fetched
+    // carries the wallet's own valid_times, so read it back from there -- no
+    // extra RPC, and Step 2 runs before Step 8 in the same heartbeat.  Expire
+    // mode only: in the default mode nothing reads the field.
+    if (strategy_cfg_.ttl_cancel_mode == TtlCancelMode::Expire) {
+        for (const auto& rec : trade_records) {
+            if (!rec.contains("trade_id") || !rec["trade_id"].is_string()
+                || !rec.contains("status")
+                || trade_status::parse(rec["status"])
+                       != trade_status::kPendingAccept) {
+                continue;
+            }
+            const auto id = rec["trade_id"].get<std::string>();
+            const auto it = pending_map.find(id);
+            if (it == pending_map.end() || it->second.expiry_max_time != 0) {
+                continue;
+            }
+            const std::uint64_t max_time = trade_record_max_time(rec);
+            if (max_time > 0 && state_->set_offer_expiry(id, max_time)) {
+                logger_->info("[offer-expiry] {} carries max_time={} per the "
+                              "wallet record -- tracked for expiry",
+                              id.substr(0, 12), max_time);
             }
         }
     }
@@ -1507,14 +1755,26 @@ OfferManager::recheck_terminal(const std::string& trade_id,
 asio::awaitable<std::vector<std::string>> OfferManager::cancel_stale(
     const std::string& pair_name,
     BlockHeight        current_block,
-    BlockHeight        ttl_blocks)
+    BlockHeight        ttl_blocks,
+    bool               spare_expiring)
 {
     auto all_offers = state_->get_all_offers();
     std::vector<std::string> cancelled_ids;
 
+    const bool expire_mode =
+        strategy_cfg_.ttl_cancel_mode == TtlCancelMode::Expire;
+
     for (const auto& po : all_offers) {
         // Filter by pair name.
         if (po.pair_name != pair_name) {
+            continue;
+        }
+
+        // [S70] The stuck pass retries a hard-TTL cancel that failed.  An
+        // offer left to its on-chain expiry never had one, so it is not
+        // "stuck" for being old; retire_expired_offers owns it.
+        if (spare_expiring
+            && !age_limit_cancel_applies(expire_mode, po.expiry_max_time)) {
             continue;
         }
 
@@ -2281,9 +2541,26 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
     Mojo                           mid_price,
     bool                           anchor_active,
     bool                           can_bid,
-    bool                           can_ask) const
+    bool                           can_ask,
+    double                         margin_centre,
+    double                         margin_min_edge_bps,
+    double                         margin_fair_centre) const
 {
     std::vector<TierClassification> results;
+
+    // [S70] Whether the unconditional hard-TTL cancel below is in force for
+    // an offer is age_limit_cancel_applies(expire_mode, its verified expiry).
+    const bool expire_mode =
+        strategy_cfg_.ttl_cancel_mode == TtlCancelMode::Expire;
+
+    // [S72] Margin mode replaces the deviation zones with ONE edge test
+    // against Step 7's own centre and floor (cross_guard.hpp).  With no
+    // usable reference -- the pace pass sends none, and Step 7 leaves both at
+    // 0 until it reaches ladder generation -- every offer falls back to the
+    // deviation zones, i.e. to today's rule, never to "keep regardless".
+    const bool margin_mode =
+        strategy_cfg_.price_cancel_mode == PriceCancelMode::Margin;
+    const double edge_retain = strategy_cfg_.price_cancel_edge_retain;
 
     auto pending = state_->get_all_offers();
     if (pending.empty()) return results;
@@ -2337,12 +2614,37 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
 
         // Hard TTL: absolute expiration regardless of price.
         // Safety backstop -- offers should never live indefinitely.
-        if (past_hard_ttl) {
+        //
+        // [S70] Under ttl_cancel_mode: expire an offer that VERIFIABLY
+        // carries an on-chain expiry already has that backstop, enforced by
+        // the chain for free, so it is not cancelled merely for its age; it
+        // falls through to every price rule below, and
+        // retire_expired_offers frees its coins once a TRUSTED peer's chain
+        // clock is past its max_time.  An offer with no verified expiry (0)
+        // keeps the hard TTL.
+        if (past_hard_ttl
+            && age_limit_cancel_applies(expire_mode, po.expiry_max_time)) {
             tc.staleness       = TierStaleness::Expired;
             tc.price_deviation = 1.0;  // maximal
             results.push_back(std::move(tc));
             continue;
         }
+
+        // [S72] The margin verdict for THIS offer, shared by both branches
+        // below.  `crossed` is filled in by each branch first.
+        const auto margin_verdict = [&](bool crossed) {
+            return classify_tier_refresh_margin(
+                crossed, age < kMinRefreshAgeBlocks, po.side == Side::Ask,
+                static_cast<double>(po.price), margin_centre,
+                margin_fair_centre, margin_min_edge_bps, edge_retain);
+        };
+        const auto note_margin_breach = [&](TierClassification& out) {
+            out.margin_breach     = true;
+            out.edge_bps          = margin_edge_bps(
+                po.side == Side::Ask, static_cast<double>(po.price),
+                margin_centre, margin_fair_centre);
+            out.required_edge_bps = margin_min_edge_bps * edge_retain;
+        };
 
         // Look up the optimal price for this tier.
         std::string key = std::to_string(static_cast<int>(po.side))
@@ -2394,6 +2696,17 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
             } else {
                 tc.staleness       = TierStaleness::Fresh;
                 tc.adverse         = false;
+            }
+
+            // [S72] The edge test needs no replacement tier: it asks about
+            // THIS offer's fill, and a tier the budget dropped is still
+            // takeable at its resting price.  Deviation mode keeps such an
+            // offer unless crossed, as it always did.
+            if (margin_mode && !tc.crossed
+                && margin_verdict(false) == MarginRefresh::Stale) {
+                tc.staleness = TierStaleness::Stale;
+                tc.adverse   = true;
+                note_margin_breach(tc);
             }
 
             results.push_back(std::move(tc));
@@ -2489,7 +2802,28 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
         // behavior-preserving, but this block is NOT identical to main: the
         // normal zone's 3x favorable multiplier was added by 922b183 earlier
         // in this same PR.
-        {
+        //
+        // [S72] In margin mode the zones are replaced by the edge test, and
+        // only a missing reference (NoReference) reaches them.
+        bool margin_decided = false;
+        if (margin_mode) {
+            switch (margin_verdict(tc.crossed)) {
+                case MarginRefresh::Fresh:
+                    tc.staleness   = TierStaleness::Fresh;
+                    margin_decided = true;
+                    break;
+                case MarginRefresh::Stale:
+                    tc.staleness   = TierStaleness::Stale;
+                    margin_decided = true;
+                    if (!tc.crossed) {
+                        note_margin_breach(tc);
+                    }
+                    break;
+                case MarginRefresh::NoReference:
+                    break;
+            }
+        }
+        if (!margin_decided) {
             const double tier_threshold = kSelectiveRefreshThreshold
                 * (1.0 + static_cast<double>(po.tier) * kTierThresholdScale);
             switch (classify_tier_refresh(tc.crossed,
@@ -2542,7 +2876,13 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
         // means we're deep in the book instead of near the top.  Override
         // Fresh->Stale when the ABSOLUTE deviation exceeds the tier-scaled
         // threshold, regardless of direction.
+        //
+        // [S72] Not in margin mode: this override exists to cancel a
+        // FAVOURABLE drift, which is the one thing the margin rule promises
+        // never to do.  It still runs when the margin rule had no reference
+        // and the deviation zones decided instead.
         if (anchor_active
+            && !margin_decided
             && tc.staleness == TierStaleness::Fresh
             && age >= kMinRefreshAgeBlocks) {
             const double tier_threshold = kSelectiveRefreshThreshold
@@ -4331,6 +4671,8 @@ asio::awaitable<int> OfferManager::post_merged_side(
                 po.created_at_ts    = std::chrono::system_clock::now();
                 // [WALLET-LOAD] For the fill-poll striking-distance reset.
                 po.post_spread_bps  = tier.spread_bps;
+                // [S70] Past expiry_echo_ok above: the wallet's echo.
+                po.expiry_max_time  = expiry_max_time.value_or(0);
                 state_->upsert_offer(po);
                 ++fallback_count;
 
@@ -4509,6 +4851,8 @@ asio::awaitable<int> OfferManager::post_merged_side(
         // [WALLET-LOAD] For the fill-poll striking-distance reset.
         pending.post_spread_bps  = tier.spread_bps;
         pending.dexie_id         = batch_dexie_id;
+        // [S70] Past expiry_echo_ok above: the wallet's echo.
+        pending.expiry_max_time  = expiry_max_time.value_or(0);
         state_->upsert_offer(pending);
     }
 
@@ -4770,6 +5114,11 @@ std::optional<PendingOffer> OfferManager::try_parse_wallet_offer(
     if (summary.contains("fees") && summary["fees"].is_number()) {
         po.fee_mojos = summary["fees"].get<std::uint64_t>();
     }
+
+    // [S70] The wallet's own record of the timelock it put on this offer
+    // (valid_times is parse_timelock_info of the conditions it signed), so an
+    // adopted offer keeps its expiry across a restart.  0 when absent.
+    po.expiry_max_time = trade_record_max_time(trade_record);
 
     // Approximate created_at_block from wall-clock time.
     po.created_at_block = 0;
