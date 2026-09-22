@@ -48,6 +48,7 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include "xop/rpc/node_requests.hpp"
 #include "xop/rpc/transport_evidence.hpp"
 
 namespace xop::rpc {
@@ -456,6 +457,22 @@ public:
         std::uint64_t target_time_seconds = 60);
 
     /**
+     * @brief [S67] The node's fee RATE for a target inclusion time.
+     *
+     * Sends get_fee_estimate with an explicit `cost`
+     * (rpc::kFeeEstimateReferenceCost) instead of `spend_type:
+     * send_xch_transaction`, whose 9.4M-cost answer was 4.5x-22x too small
+     * for the cancels and takes it paid for.  The rate does not depend on the
+     * cost asked about, so one call serves every action class.  See
+     * rpc/node_requests.hpp.
+     *
+     * @return The parsed reading; `ok` is false when the call failed or the
+     *         reply could not be read.  Never throws ChiaRPCError.
+     */
+    asio::awaitable<FeeEstimateReading> get_fee_rate_estimate(
+        std::uint64_t target_time_seconds);
+
+    /**
      * @brief Look up coin records by their coin names (IDs).
      *
      * Batch-validates whether specific coins are spent or unspent on-chain.
@@ -518,8 +535,18 @@ public:
         return last_sync_state_;
     }
 
+    /// [S67] The mempool fields of the most recent blockchain-state response
+    /// get_block_height() fetched -- the node's own admission floor, read at
+    /// no extra RPC, exactly as last_sync_state() is.  `known` stays false
+    /// until the node has answered with all of them.
+    [[nodiscard]] MempoolState last_mempool_state() const noexcept
+    {
+        return last_mempool_state_;
+    }
+
 private:
     SyncState last_sync_state_{};
+    MempoolState last_mempool_state_{};
 };
 
 /**

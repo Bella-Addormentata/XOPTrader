@@ -334,8 +334,16 @@ public:
     /// @param trade_id       Wallet trade id to re-query.
     /// @param current_block  Height used when re-adopting a CONFIRMED
     ///                       offer into State.
+    /// @param wallet_cancelled_out  [review #163] When not null, set to true
+    ///                       iff the verdict is StillTerminal AND the wallet's
+    ///                       status is CANCELLED.  StillTerminal also covers
+    ///                       FAILED, which is no evidence that a cancel spend
+    ///                       confirmed; the fee controller needs to tell them
+    ///                       apart and nothing else does.  Must outlive the
+    ///                       await (a local of the awaiting coroutine does).
     asio::awaitable<TerminalRecheck>
-    recheck_terminal(const std::string& trade_id, BlockHeight current_block);
+    recheck_terminal(const std::string& trade_id, BlockHeight current_block,
+                     bool* wallet_cancelled_out = nullptr);
 
     // -- Cancellation -------------------------------------------------------
 
@@ -749,6 +757,78 @@ public:
 
     /// Return the fee currently in effect (dynamic or static fallback).
     [[nodiscard]] std::uint64_t current_fee() const noexcept;
+
+    // -- [S67] Class-aware cancel fees ---------------------------------------
+
+    /// The fee controller's cancel fees.  A secure cancel spends the coins
+    /// the offer OFFERED: an XCH coin costs ~8.4M CLVM, a CAT coin plus its
+    /// XCH fee coin ~42M, so one fee for both under- or over-pays by 5x.
+    /// Until this is called every cancel pays current_fee(), exactly as
+    /// before.
+    ///
+    /// [review #163 r9] The engine calls it whenever
+    /// FeeTracker::class_fees_active() is true, which is the CONTROLLER OR
+    /// fees.cost_aware_estimate ALONE -- not "only while
+    /// fees.controller_enabled", as this used to say.  And it is called from
+    /// Step 8, which first runs AFTER startup_reconcile: for the whole boot
+    /// window every cancel that reconciliation issues -- including the
+    /// OrphanDisposition::Unknown path, which fires for any resting offer on
+    /// a pair the operator has disabled -- pays the raw constructor fee.
+    void set_cancel_fees(std::uint64_t xch_offered_mojos,
+                         std::uint64_t cat_offered_mojos) noexcept;
+
+    /// Back to one fee for everything (neither the controller nor
+    /// fees.cost_aware_estimate is on).
+    void clear_cancel_fees() noexcept;
+
+    /// [review #163] Called after every per-offer SECURE cancel the wallet
+    /// ACCEPTED, with the trade id and the fee that cancel really paid --
+    /// whatever path chose it (Step 8, an emergency tier, a zero-fee retry,
+    /// an escalation).  The fee controller opens its ticket from this, at
+    /// the moment of submission: a ticket opened a heartbeat later from the
+    /// CURRENT policy missed every cancel that confirmed inside that
+    /// heartbeat and misattributed any whose fee was not the policy's.
+    /// Not called for a local-only (insecure) cancel, which spends nothing,
+    /// nor for the bulk cancel_offers sweep.  Unset: nothing happens.
+    void set_cancel_observer(
+        std::function<void(const std::string& trade_id, std::uint64_t fee_mojos)> observer);
+
+    /// The fee a cancel of `offer_id` pays now: current_fee() unless
+    /// set_cancel_fees() is in force, then the fee for the asset the offer
+    /// offered (strategy::fee::cancel_fee_for).  An offer State does not
+    /// know pays the CAT fee, the larger.
+    [[nodiscard]] std::uint64_t cancel_fee_for(const std::string& offer_id) const;
+
+    /// Unconfirmed wallet rows whose sent_to array reports a fee refusal
+    /// (INVALID_FEE_TOO_CLOSE_TO_ZERO / INVALID_FEE_LOW_FEE) from some peer
+    /// and an acceptance from none, first seen by prune_stuck_transactions()
+    /// since this was last called.
+    ///
+    /// [review #163 r9] Two corrections to what this used to promise. The
+    /// array is scanned in full rather than by its LATEST entry, because it is
+    /// per PEER and not a timeline (execution::sent_to_reports_fee_rejection).
+    /// And a row is counted once per transaction name only until the name set
+    /// is cleared: prune_stuck_transactions tests the capacity before it
+    /// inserts and clears the whole set, so the sweep that trips
+    /// kMaxReportedFeeRejections re-counts every refused row still visible in
+    /// it. Normal case, not an invariant.
+    [[nodiscard]] std::uint32_t take_fee_rejections_seen() noexcept;
+
+    /// [review #163 r9] Mojos the wallet ACCEPTED for secure per-offer cancels
+    /// since this was last called, then reset to 0.
+    ///
+    /// This is what a cancel really committed, not what policy would quote for
+    /// it now: `selective_cancel` pushes an offer id into its cancelled list
+    /// whether the cancel went out at `cancel_fee_for()` or fell through to
+    /// `emergency_cancel`, which can succeed at a halved or quartered tier
+    /// down to 1 mojo, at a secure fee of 0, or as a LOCAL-ONLY cancel that
+    /// spends nothing on chain at all. Re-deriving the fee afterwards booked
+    /// every one of those at the full policy fee.
+    ///
+    /// A local-only (insecure) cancel contributes 0, because it commits
+    /// nothing. The bulk `cancel_offers` sweep does not pass through here and
+    /// is not counted -- it is not counted today either.
+    [[nodiscard]] std::uint64_t take_cancel_fees_accepted() noexcept;
 
     // -- Offer reconciliation -----------------------------------------------
 
@@ -1320,6 +1400,22 @@ private:
     /// Dynamic fee override.  Initialised from strategy_cfg_.offer_fee_mojos;
     /// updated at runtime by set_dynamic_fee() from the engine's FeeTracker.
     std::uint64_t current_fee_mojos_;
+
+    /// [S67] Class-aware cancel fees; inert until set_cancel_fees().
+    bool          cancel_fees_active_{false};
+    std::uint64_t cancel_fee_xch_mojos_{0};
+    std::uint64_t cancel_fee_cat_mojos_{0};
+
+    /// [S67] sent_to fee refusals seen by prune_stuck_transactions and not
+    /// yet taken, and the transaction names already counted (bounded).
+    std::uint32_t fee_rejections_seen_{0};
+    std::unordered_set<std::string> fee_rejections_reported_;
+
+    /// [review #163 r9] Mojos the wallet ACCEPTED for secure per-offer cancels
+    /// since take_cancel_fees_accepted() was last called; saturating.
+    std::uint64_t cancel_fees_accepted_{0};
+
+    std::function<void(const std::string&, std::uint64_t)> cancel_observer_;
     std::function<bool()> abort_predicate_;
     std::function<void(const std::string&)> escalate_;
 

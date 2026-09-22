@@ -667,7 +667,11 @@ void Database::insert_offer(const DbOfferRecord& r)
     bind_int64 (stmt_insert_offer_, 10, static_cast<std::int64_t>(r.execution_quality_score));
     bind_text  (stmt_insert_offer_, 11, r.status);
     bind_int64 (stmt_insert_offer_, 12, static_cast<std::int64_t>(r.created_block));
-    bind_int64 (stmt_insert_offer_, 13, static_cast<std::int64_t>(r.fee_mojos));
+    // [review #163 r6] fee_mojos is a std::uint64_t assigned straight from
+    // FeeTracker::get_recommended_fee (engine.cpp step 8).  SQLite stores a
+    // SIGNED 64-bit integer, so saturate rather than wrap -- the same rule
+    // mark_offer_cancel_submitted() already applies to the same column family.
+    bind_int64 (stmt_insert_offer_, 13, to_mojo_saturating(r.fee_mojos));
     bind_int64 (stmt_insert_offer_, 14, static_cast<std::int64_t>(r.book_best_bid));
     bind_int64 (stmt_insert_offer_, 15, static_cast<std::int64_t>(r.book_best_ask));
 

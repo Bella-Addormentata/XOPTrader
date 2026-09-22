@@ -424,6 +424,49 @@ namespace detail {
     return WalletCancelState::Unknown;
 }
 
+/// [review #163 r5] The chain height a trade record CONFIRMED at, or
+/// `fallback` when the record does not state one.
+///
+/// The wallet writes `confirmed_at_index` on every trade record and leaves it
+/// 0 while the trade is still pending; offer_manager.cpp's fill path has read
+/// it since 2026-07-30.  It matters here because a poller learns of a
+/// confirmation at its own convenience: the fee sweep reads ONE take per
+/// heartbeat, oldest first, so a second ticketed take pushes this one back a
+/// heartbeat at a time.  Measuring the confirmation delay from the heartbeat
+/// that noticed, rather than from the height it landed at, reports a spend
+/// that confirmed on time as late -- which raises the fee, or fails a probe
+/// that was right.
+///
+/// "Not stated" is its own answer and it authorises nothing: missing, not a
+/// number, 0 (the wallet's own "still pending"), negative, or past what a
+/// BlockHeight holds all return `fallback`.  The caller passes the current
+/// height there, which is the old, conservative behaviour.
+[[nodiscard]] inline std::uint32_t confirmed_height_from_record(
+    const nlohmann::json& record, std::uint32_t fallback)
+{
+    if (!record.is_object()) {
+        return fallback;
+    }
+    const auto it = record.find("confirmed_at_index");
+    if (it == record.end()) {
+        return fallback;
+    }
+    constexpr std::uint64_t kMaxHeight = std::numeric_limits<std::uint32_t>::max();
+    if (it->is_number_unsigned()) {
+        const auto value = it->get<std::uint64_t>();
+        return (value > 0U && value <= kMaxHeight)
+            ? static_cast<std::uint32_t>(value)
+            : fallback;
+    }
+    if (it->is_number_integer()) {
+        const auto value = it->get<std::int64_t>();
+        return (value > 0 && static_cast<std::uint64_t>(value) <= kMaxHeight)
+            ? static_cast<std::uint32_t>(value)
+            : fallback;
+    }
+    return fallback;
+}
+
 /// One coin object ({parent_coin_info, puzzle_hash, amount}), or nullopt if
 /// any field is missing or malformed.  Type-checks before every get<>: a get
 /// on a string or a negative value throws, and the fail-closed path must not

@@ -2185,6 +2185,79 @@ struct FeeConfig {
     /// Market-making offers are long-lived (offer_ttl_blocks ~60), so
     /// urgency is low.  Default 300 s (5 min).
     uint32_t fee_estimate_target_seconds{300};
+
+    // -- [S67 2026-09-20] Cost-aware estimate and the fee controller --------
+    //
+    // Both ship OFF.  With both off every fee is byte-identical to v0.10.24.
+    // Design, evidence and every rule: strategy/fee_controller.hpp.  EVERY
+    // block count below is a PEAK height (4,608 per day, 18.75 s each).
+
+    /// Ask get_fee_estimate for a RATE (explicit `cost`) and scale it by the
+    /// action's own CLVM cost, instead of asking about a plain XCH send
+    /// (9.4M cost) and paying that for a 42M-cost CAT cancel.  Gated on its
+    /// own because it changes fees paid with the controller off (about 4.5x
+    /// for a CAT cancel).  Implied by controller_enabled.
+    bool     cost_aware_estimate{false};
+
+    /// Master switch for the closed-loop controller.
+    bool     controller_enabled{false};
+
+    /// Setpoint: our spends should confirm within this many peak heights.
+    uint32_t controller_target_delay_blocks{8};
+
+    /// Gains in log2 fee units per target delay of lateness.
+    double   controller_kp{1.0};
+    double   controller_ki{0.5};
+    double   controller_kd{0.5};
+
+    /// Cap on one observation's lateness, and what a hard signal reports.
+    double   controller_max_error{2.0};
+
+    /// Cap on one observation's raise, log2 units (1.0 = x2).
+    double   controller_max_step_up{1.0};
+
+    /// A too-low spend stops counting once the level is this far (log2) above
+    /// the level it was submitted at.
+    double   controller_min_raise{1.0};
+
+    /// Observations consumed before the level may move.
+    uint32_t controller_warmup_observations{3};
+
+    /// Probe-down: step size, run of on-target confirmations before a probe,
+    /// confirmations that make a probe good, bump above last-good when one
+    /// fails, and the cap on the doubled interval.
+    double   controller_probe_fraction{0.15};
+    uint32_t controller_probe_after_confirmations{8};
+    uint32_t controller_probe_confirmations{3};
+    double   controller_probe_fail_bump{0.10};
+    uint32_t controller_probe_backoff_cap{256};
+
+    /// Multiplier on the node's estimate and admission floor.
+    double   controller_ff_margin{1.10};
+
+    /// A node reading older than this many peak heights is dropped.
+    uint32_t controller_ff_max_age_blocks{32};
+
+    /// Budget held back from offer-attached fees: this many CAT cancels at the
+    /// current fee, capped at half of daily_budget_mojos.
+    ///
+    /// [review #163 r8] It makes the squeeze on attached fees START while that
+    /// much of the window is still unspent; it is NOT a guarantee that the
+    /// resting book can still be cancelled, and this comment used to say it
+    /// was.  fees.min_fee_mojos overrides the reserve unconditionally, nothing
+    /// refuses to post on budget grounds with the controller on, and Step 8
+    /// books a fee for every offer POSTED, so attached fees can still drive the
+    /// window past the budget.  Cancels are funded because apply_budget's
+    /// PRIORITY branch never looks at the reserve at all -- they are paid in
+    /// full and the overrun reported.  See strategy::fee::apply_budget.
+    uint32_t controller_budget_reserve_cancels{25};
+
+    /// CLVM cost per action class, measured on this wallet 2026-09-20; see
+    /// strategy::fee::ClassCosts for the numbers and how they were taken.
+    std::uint64_t controller_cost_offer_attached{21'000'000ULL};
+    std::uint64_t controller_cost_cancel_xch{8'400'000ULL};
+    std::uint64_t controller_cost_cancel_cat{42'300'000ULL};
+    std::uint64_t controller_cost_take{125'000'000ULL};
 };
 
 // ---------------------------------------------------------------------------

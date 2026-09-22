@@ -307,6 +307,23 @@ std::uint32_t read_optional_uint32_in_range(const YAML::Node& node, const std::s
     return static_cast<std::uint32_t>(value);
 }
 
+// [S67 2026-09-20] An optional unsigned 64-bit integer within [lo, hi].
+// yaml-cpp refuses a negative scalar for an unsigned type, so no int64 detour
+// is needed (and one would halve the range).
+std::uint64_t read_optional_uint64_in_range(const YAML::Node& node, const std::string& key,
+                                            const std::string& sec, std::uint64_t dflt,
+                                            std::uint64_t lo, std::uint64_t hi)
+{
+    if (!node[key] || !node[key].IsDefined() || node[key].IsNull()) {
+        return dflt;
+    }
+    const std::uint64_t value = node[key].as<std::uint64_t>();
+    if (value < lo || value > hi) {
+        throw ConfigError(sec + "." + key + " must be in [" + std::to_string(lo) + ", "
+                          + std::to_string(hi) + "]; got " + std::to_string(value));
+    }
+    return value;
+}
 // Read a required double clamped to (0, 1].
 double read_fraction(const YAML::Node& parent,
                      const std::string& key,
@@ -3031,6 +3048,74 @@ FeeConfig parse_fees(const YAML::Node& root)
     read_u32 ("fee_window_blocks",    cfg.fee_window_blocks);
     read_u32 ("fee_estimate_target_seconds", cfg.fee_estimate_target_seconds);
 
+    // [S67 2026-09-20] Cost-aware estimate and the fee controller.  Every
+    // double goes through read_optional_finite_in_range and every count
+    // through a range reader: one copy of each rule, and NaN is refused
+    // before any comparison can wave it through.  The ranges are the ones
+    // strategy::fee::Controller falls back to a default outside of, so a
+    // value that parses is a value the controller uses as written.
+    read_bool("cost_aware_estimate", cfg.cost_aware_estimate);
+    read_bool("controller_enabled",  cfg.controller_enabled);
+    cfg.controller_target_delay_blocks = read_optional_uint32_in_range(
+        node, "controller_target_delay_blocks", sec, cfg.controller_target_delay_blocks, 1u, 4'608u);
+    cfg.controller_kp = read_optional_finite_in_range(
+        node, "controller_kp", sec, cfg.controller_kp, 0.0, 16.0, false, false);
+    cfg.controller_ki = read_optional_finite_in_range(
+        node, "controller_ki", sec, cfg.controller_ki, 0.0, 16.0, false, false);
+    cfg.controller_kd = read_optional_finite_in_range(
+        node, "controller_kd", sec, cfg.controller_kd, 0.0, 16.0, false, false);
+    cfg.controller_max_error = read_optional_finite_in_range(
+        node, "controller_max_error", sec, cfg.controller_max_error, 0.0, 16.0, true, false);
+    cfg.controller_max_step_up = read_optional_finite_in_range(
+        node, "controller_max_step_up", sec, cfg.controller_max_step_up, 0.0, 8.0, true, false);
+    cfg.controller_min_raise = read_optional_finite_in_range(
+        node, "controller_min_raise", sec, cfg.controller_min_raise, 0.0, 8.0, true, false);
+    cfg.controller_warmup_observations = read_optional_uint32_in_range(
+        node, "controller_warmup_observations", sec, cfg.controller_warmup_observations, 0u, 1'000u);
+    cfg.controller_probe_fraction = read_optional_finite_in_range(
+        node, "controller_probe_fraction", sec, cfg.controller_probe_fraction, 0.0, 0.9, true, false);
+    cfg.controller_probe_after_confirmations = read_optional_uint32_in_range(
+        node, "controller_probe_after_confirmations", sec,
+        cfg.controller_probe_after_confirmations, 1u, 100'000u);
+    cfg.controller_probe_confirmations = read_optional_uint32_in_range(
+        node, "controller_probe_confirmations", sec, cfg.controller_probe_confirmations, 1u, 1'000u);
+    cfg.controller_probe_fail_bump = read_optional_finite_in_range(
+        node, "controller_probe_fail_bump", sec, cfg.controller_probe_fail_bump, 0.0, 1.0, false, false);
+    cfg.controller_probe_backoff_cap = read_optional_uint32_in_range(
+        node, "controller_probe_backoff_cap", sec, cfg.controller_probe_backoff_cap, 1u, 1'000'000u);
+    cfg.controller_ff_margin = read_optional_finite_in_range(
+        node, "controller_ff_margin", sec, cfg.controller_ff_margin, 1.0, 4.0, false, false);
+    cfg.controller_ff_max_age_blocks = read_optional_uint32_in_range(
+        node, "controller_ff_max_age_blocks", sec, cfg.controller_ff_max_age_blocks, 1u, 4'608u);
+    cfg.controller_budget_reserve_cancels = read_optional_uint32_in_range(
+        node, "controller_budget_reserve_cancels", sec, cfg.controller_budget_reserve_cancels, 0u, 1'000u);
+    // A cost below 100,000 is below any real spend; above 5.5e9 the mempool
+    // refuses the bundle outright (MAX_BLOCK_COST_CLVM / 2).
+    cfg.controller_cost_offer_attached = read_optional_uint64_in_range(
+        node, "controller_cost_offer_attached", sec, cfg.controller_cost_offer_attached,
+        100'000ULL, 5'500'000'000ULL);
+    cfg.controller_cost_cancel_xch = read_optional_uint64_in_range(
+        node, "controller_cost_cancel_xch", sec, cfg.controller_cost_cancel_xch,
+        100'000ULL, 5'500'000'000ULL);
+    cfg.controller_cost_cancel_cat = read_optional_uint64_in_range(
+        node, "controller_cost_cancel_cat", sec, cfg.controller_cost_cancel_cat,
+        100'000ULL, 5'500'000'000ULL);
+    cfg.controller_cost_take = read_optional_uint64_in_range(
+        node, "controller_cost_take", sec, cfg.controller_cost_take,
+        100'000ULL, 5'500'000'000ULL);
+    if (cfg.controller_probe_backoff_cap < cfg.controller_probe_after_confirmations) {
+        throw ConfigError(sec + ".controller_probe_backoff_cap ("
+                          + std::to_string(cfg.controller_probe_backoff_cap) + ") must be >= "
+                          + sec + ".controller_probe_after_confirmations ("
+                          + std::to_string(cfg.controller_probe_after_confirmations) + ")");
+    }
+    if (cfg.controller_enabled && !cfg.enabled) {
+        // Not an error: fees.enabled: false is the documented passthrough, and
+        // it wins.  Say so once, because the key reads as if it were live.
+        spdlog::warn("[Config] fees.controller_enabled is true but fees.enabled is false -- "
+                     "the fee controller is inert; every fee is the static offer_fee_mojos");
+    }
+
     // Validate constraints.
     if (cfg.min_fee_mojos > cfg.max_fee_mojos) {
         throw ConfigError(sec + ".min_fee_mojos ("
@@ -3051,6 +3136,13 @@ FeeConfig parse_fees(const YAML::Node& root)
     }
     if (cfg.daily_budget_mojos == 0) {
         throw ConfigError(sec + ".daily_budget_mojos must be > 0");
+    }
+    // [S67] min_fee_mojos is the controller's anchor (level 0 = a CAT cancel
+    // pays exactly min_fee) and the floor an exhausted budget degrades to.
+    // At 0 that floor is "pay nothing", which Step 8 reads as "skip".
+    if (cfg.controller_enabled && cfg.min_fee_mojos == 0) {
+        throw ConfigError(sec + ".controller_enabled requires " + sec
+                          + ".min_fee_mojos > 0");
     }
 
     return cfg;
@@ -3467,7 +3559,29 @@ void log_config_summary(const AppConfig& cfg)
         << "  max_fee    = " << cfg.fees.max_fee_mojos << " mojos\n"
         << "  adaptive   = " << (cfg.fees.adaptive_enabled ? "true" : "false") << "\n"
         << "  window     = " << cfg.fees.fee_window_blocks << " blocks\n"
-        << "  estimate_target = " << cfg.fees.fee_estimate_target_seconds << "s\n";
+        << "  estimate_target = " << cfg.fees.fee_estimate_target_seconds << "s\n"
+        << "  cost_aware_estimate = " << (cfg.fees.cost_aware_estimate ? "true" : "false") << "\n"
+        << "  controller = " << (cfg.fees.controller_enabled ? "ON" : "off")
+        << " target=" << cfg.fees.controller_target_delay_blocks << " peak heights"
+        << " kp=" << cfg.fees.controller_kp
+        << " ki=" << cfg.fees.controller_ki
+        << " kd=" << cfg.fees.controller_kd
+        << " max_error=" << cfg.fees.controller_max_error
+        << " max_step_up=" << cfg.fees.controller_max_step_up
+        << " min_raise=" << cfg.fees.controller_min_raise
+        << " warmup=" << cfg.fees.controller_warmup_observations << "\n"
+        << "  controller_probe = -" << (cfg.fees.controller_probe_fraction * 100.0) << "% after "
+        << cfg.fees.controller_probe_after_confirmations << " on-target, good after "
+        << cfg.fees.controller_probe_confirmations << ", fail_bump=+"
+        << (cfg.fees.controller_probe_fail_bump * 100.0) << "%, backoff_cap="
+        << cfg.fees.controller_probe_backoff_cap << "\n"
+        << "  controller_ff = x" << cfg.fees.controller_ff_margin << " max_age="
+        << cfg.fees.controller_ff_max_age_blocks << " reserve_cancels="
+        << cfg.fees.controller_budget_reserve_cancels << "\n"
+        << "  controller_costs = attached " << cfg.fees.controller_cost_offer_attached
+        << " cancel_xch " << cfg.fees.controller_cost_cancel_xch
+        << " cancel_cat " << cfg.fees.controller_cost_cancel_cat
+        << " take " << cfg.fees.controller_cost_take << "\n";
 
     // Strategy: new fields.
     out << "  confirm    = " << cfg.strategy.confirmation_depth_blocks << " blocks\n"

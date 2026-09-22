@@ -413,6 +413,10 @@ public:
     /// Update the rolling 24-hour blockchain fees gauge (mojos).
     void update_fees_paid_24h(std::uint64_t total_mojos);
 
+    /// [S67] The fee controller's state: the effective rate in mojos per
+    /// CLVM cost (feed-forward floor included) and the learned log2 level.
+    void update_fee_controller(double rate_mojos_per_cost, double level_log2);
+
     /// Increment a trade decision-tree counter.
     void increment_trade_decision(std::string_view strategy,
                                   std::string_view scenario_id,
@@ -559,6 +563,8 @@ private:
     prometheus::Family<prometheus::Gauge>* peg_status_family_{nullptr};
     prometheus::Family<prometheus::Gauge>* peg_deviation_family_{nullptr};
     prometheus::Gauge* fees_paid_24h_gauge_{nullptr};
+    prometheus::Gauge* fees_controller_rate_gauge_{nullptr};
+    prometheus::Gauge* fees_controller_level_gauge_{nullptr};
 
     // -- Trade decision-tree counters ---------------------------------------
 

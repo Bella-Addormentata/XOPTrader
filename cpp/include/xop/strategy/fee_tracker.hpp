@@ -24,17 +24,57 @@
 #define XOP_STRATEGY_FEE_TRACKER_HPP
 
 #include "xop/config.hpp"
+#include "xop/strategy/fee_controller.hpp"
 #include "xop/types.hpp"
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <limits>
 #include <utility>
 
 namespace xop {
 
 // ---------------------------------------------------------------------------
+// [review #163 r6] THE TYPE-BOUNDARY PIN, stated in terms of Mojo itself.
+//
+// This is the first header that sees both strategy::fee (which emits fees as
+// std::uint64_t) and xop::Mojo (std::int64_t), so it is the only place the
+// round trip can be asserted over the REAL type rather than over a spelled-out
+// std::int64_t.  fee_controller.hpp pins the same property on its own, because
+// it is a pure header and must not depend on types.hpp; this one is the
+// assertion a reader of `Mojo` will actually find.
+//
+// The finding this replaces: kFeeCeiling was exactly 2^63, the single uint64
+// value that is not a Mojo, and it was emitted as a public result --
+// fee_for() clamps to [min_fee_, max_fee_] and both are capped AT the ceiling,
+// so an operator writing a 19- or 20-digit fees.max_fee_mojos (config.cpp
+// accepts any uint64; it validates only min <= max) got 2^63 out of
+// get_recommended_fee() and INT64_MIN into every Mojo consumer.
+// ---------------------------------------------------------------------------
+static_assert(to_mojo_saturating(strategy::fee::kFeeCeiling)
+                  == static_cast<Mojo>(strategy::fee::kFeeCeiling),
+              "the emitted fee ceiling must convert to a Mojo WITHOUT saturating: "
+              "if this fails the ceiling is out of Mojo range again");
+static_assert(static_cast<Mojo>(strategy::fee::kFeeCeiling) > 0,
+              "a fee that converts to a negative Mojo is silently dropped by "
+              "clamp_need(), ask_take_cost() and add_same_wallet_fee()");
+// VALUE preservation, not a bit-pattern round trip: the latter is the identity
+// for every uint64 (modular conversion is a bijection), holds for 2^63, and was
+// measured in the round-6 campaign to be the one assertion that did NOT fire.
+static_assert(strategy::fee::kFeeCeiling
+                  <= static_cast<std::uint64_t>(std::numeric_limits<Mojo>::max()),
+              "the emitted fee ceiling must be in range for a Mojo");
+
+// ---------------------------------------------------------------------------
 // FeeTracker
 // ---------------------------------------------------------------------------
+
+/// [S67] The controller's tuning, copied out of the `fees:` section.  The
+/// controller is enabled only when fees.enabled is too: fees.enabled: false
+/// is the documented passthrough and it wins.
+[[nodiscard]] strategy::fee::ControllerConfig fee_controller_config_from(const FeeConfig& cfg);
 
 class FeeTracker {
 public:
@@ -52,6 +92,13 @@ public:
 
     /// Sum of all fees paid within the rolling window ending at
     /// @p current_block.  Expired entries are pruned.
+    ///
+    /// [review #163 r7] THE POST-CONDITION, which holds after ANY sequence of
+    /// record_fee() and prune(): the value returned is the TRUE sum of the
+    /// fees still inside the window, or UINT64_MAX if and only if that true
+    /// sum genuinely exceeds UINT64_MAX.  Anything weaker is a fail-open --
+    /// this number is the budget, and an under-estimate reopens it.
+    ///
     /// @return Cumulative fee mojos in the window.
     std::uint64_t get_rolling_total(BlockHeight current_block);
 
@@ -88,9 +135,17 @@ public:
     ///
     /// @param static_fee_mojos  The statically configured offer_fee_mojos.
     /// @param current_block     Current block height (for budget check).
-    /// @return Recommended fee in mojos.
+    /// @param action            [S67] What the fee pays for.  There is NO
+    ///                          default on purpose: a call site that names no
+    ///                          class does not compile.  With
+    ///                          fees.cost_aware_estimate and the controller
+    ///                          both off the class is not read at all.
+    /// @return Recommended fee in mojos.  0 means "skip posting" on the
+    ///         legacy path only; with the controller on it is never 0 (see
+    ///         strategy::fee::apply_budget).
     std::uint64_t get_recommended_fee(std::uint64_t static_fee_mojos,
-                                      BlockHeight   current_block);
+                                      BlockHeight   current_block,
+                                      strategy::fee::ActionClass action);
 
     // -- Mempool estimate ingestion -----------------------------------------
 
@@ -100,6 +155,142 @@ public:
     ///
     /// @param estimated_fee_mojos  Fee estimate for ~60 s target time.
     void update_mempool_estimate(std::uint64_t estimated_fee_mojos);
+
+    // -- [S67] Cost-aware estimate and the fee controller -------------------
+
+    /// True when fees.cost_aware_estimate or the controller wants a RATE
+    /// from the node (get_fee_rate_estimate) rather than the legacy estimate.
+    [[nodiscard]] bool wants_rate_estimate() const noexcept
+    {
+        return cfg_.enabled && cfg_.adaptive_enabled
+            && (cfg_.cost_aware_estimate || controller_.enabled());
+    }
+
+    /// True when the closed-loop controller sets the fees.
+    [[nodiscard]] bool controller_active() const noexcept { return controller_.enabled(); }
+
+    /// [review #163] True when a fee depends on its ACTION CLASS: the
+    /// controller is on, or fees.cost_aware_estimate is (with fees.enabled and
+    /// adaptive_enabled, the conditions under which the rate is read at all).
+    /// This -- not controller_active() -- is what gates the class-aware cancel
+    /// fees Step 8 hands OfferManager: with only the cost-aware estimate on, a
+    /// CAT cancel paid the OFFER-ATTACHED class's 21M-cost estimate instead of
+    /// its own 42.3M, half of what the key promised.  False with both off.
+    [[nodiscard]] bool class_fees_active() const noexcept
+    {
+        return controller_.enabled()
+            || (cfg_.enabled && cfg_.adaptive_enabled && cfg_.cost_aware_estimate);
+    }
+
+    /// [review #163] How many offers the NEXT offer-attached fee will be
+    /// attached to before the budget is consulted again.  Step 8 asks for one
+    /// fee per heartbeat and attaches it to every tier it posts; the room
+    /// above the cancel reserve is shared between that many offers instead
+    /// of being granted to each (strategy::fee::apply_budget).  Controller
+    /// path only; 0 counts as 1.
+    void set_attached_batch(std::uint32_t offers) noexcept { attached_batch_ = offers; }
+    [[nodiscard]] std::uint32_t attached_batch() const noexcept { return attached_batch_; }
+
+    /// One node reading: the estimate as mojos per cost, and the node's own
+    /// admission floor (0 when its mempool has room or it did not say).
+    /// Feeds the cost-aware legacy path and the controller's floor.
+    strategy::fee::Change update_feed_forward(double      estimate_rate,
+                                              double      admission_floor_rate,
+                                              BlockHeight current_block);
+
+    /// Feed one observation to the controller.  A no-op returning
+    /// ChangeReason::Disabled when the controller is off.
+    strategy::fee::Change observe(const strategy::fee::Observation& observation);
+
+    /// The ticket for a spend just submitted at `fee_paid_mojos`.
+    [[nodiscard]] strategy::fee::Ticket make_ticket(strategy::fee::ActionClass action,
+                                                    std::uint64_t fee_paid_mojos,
+                                                    BlockHeight   current_block) const noexcept;
+
+    /// True ONCE per episode in which the budget could not fund an
+    /// OFFER-ATTACHED fee (the only kind it shapes at all): the engine turns
+    /// it into one operator alert.
+    ///
+    /// [review #163 r8] "COULD NOT FUND", NOT "LOWERED".  The episode used to
+    /// open and close on `BudgetedFee::bound`, and `bound` is false whenever
+    /// the controller's own answer for an attached fee is already at
+    /// fees.min_fee_mojos -- every level at or below
+    /// log2(42.3/21) = 1.010, which on the live bounds is the bottom 39% of
+    /// the band and includes the level the engine BOOTS at.  There the floor
+    /// hands the whole fee back, so an exhausted budget never opened the
+    /// episode, and an already-open one was CLOSED by a quote from an empty
+    /// window: `[FeeController] the fee budget no longer binds (headroom 0
+    /// mojos)`, an all-clear contradicted by its own number.  The rule is now
+    /// `BudgetedFee::allowance < desired` on both edges, so the episode ends
+    /// only when the budget really has room for the fee.
+    [[nodiscard]] bool take_budget_bound_alert() noexcept;
+
+    /// The attached fee the budget last could not fund, and what the BUDGET
+    /// ITSELF allowed for it (`BudgetedFee::allowance`).  The fee actually
+    /// attached may be HIGHER than `last_bound_allowed()`, because
+    /// fees.min_fee_mojos is the operator's floor and overrides the budget;
+    /// when it is, `allowed` is 0 or near it and that is the real number.
+    [[nodiscard]] std::uint64_t last_bound_desired() const noexcept { return last_bound_desired_; }
+    [[nodiscard]] std::uint64_t last_bound_allowed() const noexcept { return last_bound_allowed_; }
+
+    /// [review #163 r5] A PRIORITY spend the wallet ACCEPTED, at the fee
+    /// really paid.  This -- not a quote -- is what turns an over-budget
+    /// recommendation into an over-budget EPISODE.
+    ///
+    /// Why it has to be separate from `get_recommended_fee`.  Step 8 asks for
+    /// both cancel classes every heartbeat before any cancellation, and a take
+    /// fee is computed while a candidate is still being evaluated.  Latching
+    /// the overrun there recorded "a priority spend was PAID over budget",
+    /// queued FeeBudgetUnfunded and logged "PAYING IT ANYWAY" on heartbeats
+    /// where no wallet RPC was sent at all -- a quote is not a spend.
+    ///
+    /// The engine calls this from the two places a priority spend becomes
+    /// real: OfferManager's cancel observer (the wallet accepted the cancel)
+    /// and the take-success hook.  It is also where the episode CLEARS -- and
+    /// [review #163 r8] it clears only when `fee_paid_mojos` FITS THE HEADROOM
+    /// its class's last quote measured.  The clear branch used to be the bare
+    /// negation of the latch condition, so an accepted spend at any fee
+    /// strictly below that quote ended the episode however far above the
+    /// headroom it really was: a 239,000,000-mojo escalation against a
+    /// headroom of 0 read as "the budget funds priority spends again".
+    ///
+    /// A spend IN BETWEEN -- above the headroom, below the quote -- now does
+    /// neither.  It overran the window, so it is no all-clear; it is not the
+    /// quoted spend, so it is not this quote's overrun either.  (A spend of 0
+    /// mojos fits every headroom and therefore does clear: the budget really
+    /// did fund it.)
+    ///
+    /// @param action          The class of the spend (OfferAttached is
+    ///                        ignored: an attached fee is paid by a fill, and
+    ///                        the budget never reports it over).
+    /// @param fee_paid_mojos  What was actually paid.
+    void note_priority_spend(strategy::fee::ActionClass action,
+                             std::uint64_t              fee_paid_mojos);
+
+    /// [review #163 r3] True ONCE per episode in which the budget could NOT
+    /// fund a priority spend (a cancel or a take).  That spend was paid in
+    /// full anyway -- a cancel priced below the node's admission floor never
+    /// confirms, keeps its coins locked and ends in a wallet-wide
+    /// force-delete -- so this is an alert about the BUDGET, not a degraded
+    /// fee.  [review #163 r5] The episode opens at note_priority_spend, never
+    /// at a quote, and [review #163 r8] ends when an accepted priority spend
+    /// fits the headroom -- which is now what the code compares, see
+    /// note_priority_spend.
+    [[nodiscard]] bool take_budget_unfunded_alert() noexcept;
+
+    /// The priority fee last paid over budget, the headroom it exceeded, and
+    /// what it was for.
+    [[nodiscard]] std::uint64_t last_unfunded_fee() const noexcept { return last_unfunded_fee_; }
+    [[nodiscard]] std::uint64_t last_unfunded_headroom() const noexcept
+    {
+        return last_unfunded_headroom_;
+    }
+    [[nodiscard]] strategy::fee::ActionClass last_unfunded_action() const noexcept
+    {
+        return last_unfunded_action_;
+    }
+
+    [[nodiscard]] const strategy::fee::Controller& controller() const noexcept { return controller_; }
 
     // -- Accessors ----------------------------------------------------------
 
@@ -119,14 +310,95 @@ private:
     /// Oldest entries are at the front; pruned when expired.
     std::deque<std::pair<BlockHeight, std::uint64_t>> fee_history_;
 
-    /// Cached rolling total (updated on prune).
-    std::uint64_t cached_total_{0};
+    /// [review #163 r7] The window total, kept EXACTLY, as a 128-bit unsigned
+    /// value in two halves: `cached_total_hi_ * 2^64 + cached_total_lo_`.
+    ///
+    /// Round 6 made record_fee()'s addition SATURATE (a wrapped total reads as
+    /// a huge headroom, which is a fail-open) and made prune()'s subtraction
+    /// clamp to match.  Saturating addition is LOSSY, so it has no inverse and
+    /// a clamped subtraction is not one: with a history of
+    /// `[UINT64_MAX @ h=100, 100 @ h=101]` the total saturates to UINT64_MAX,
+    /// and pruning the first entry compared `total > oldest` -- UINT64_MAX
+    /// against UINT64_MAX, FALSE -- and set the total to ZERO while 100 mojos
+    /// were still inside the window.  budget_remaining() then reopened the
+    /// whole budget: the same fail-open, one round later.
+    ///
+    /// Exact accumulation has no such branch.  A carry on the way in and a
+    /// borrow on the way out are exact inverses, `fee_history_` cannot hold
+    /// 2^64 entries so `hi` cannot overflow, and the SATURATION HAPPENS ONCE,
+    /// AT THE READ (saturated_total), where the clamped value is returned to a
+    /// caller and never fed back into this arithmetic.
+    std::uint64_t cached_total_lo_{0};
+    std::uint64_t cached_total_hi_{0};
+
+    /// The window total as one uint64: the true sum when it fits, UINT64_MAX
+    /// when -- and only when -- the true sum does not.  The ONLY saturation.
+    ///
+    /// Said exactly, because the point of this round is that a comment must
+    /// not claim more than its code gives.  Clamping is an UNDER-estimate of a
+    /// true sum above UINT64_MAX, which is normally the dangerous direction --
+    /// it is safe here only because UINT64_MAX is at or above every
+    /// representable daily_budget_mojos, so a clamped read reports the budget
+    /// EXHAUSTED: budget_remaining() returns 0 and is_within_budget() refuses
+    /// every non-zero spend.  (The one answer it still gets wrong is
+    /// `is_within_budget(b, 0)` with daily_budget_mojos == UINT64_MAX, which
+    /// says yes; no caller asks whether spending nothing fits.)  Both
+    /// consumers are monotone non-decreasing in this value and NEITHER
+    /// subtracts from it -- subtracting from a clamped total was r6's mistake.
+    [[nodiscard]] std::uint64_t saturated_total() const noexcept
+    {
+        return (cached_total_hi_ != 0U) ? std::numeric_limits<std::uint64_t>::max()
+                                        : cached_total_lo_;
+    }
 
     /// Block height at which the cache was last pruned.
     BlockHeight cached_prune_block_{0};
 
     /// Latest mempool fee estimate (0 = not available).
     std::uint64_t mempool_estimate_{0};
+
+    /// [S67] Latest node estimate as a RATE, mojos per cost (0 = not
+    /// available), for fees.cost_aware_estimate.
+    double mempool_rate_{0.0};
+
+    /// [S67] The closed loop.  Inert unless fees.controller_enabled.
+    strategy::fee::Controller controller_;
+
+    std::uint32_t attached_batch_{1};
+    bool          budget_bound_{false};
+    bool          budget_alert_pending_{false};
+    std::uint64_t last_bound_desired_{0};
+    std::uint64_t last_bound_allowed_{0};
+
+    /// [review #163 r3] The over-budget PRIORITY episode, kept apart from the
+    /// bound episode above: they mean different things to the operator and
+    /// neither must swallow the other.
+    bool          budget_unfunded_{false};
+    bool          unfunded_alert_pending_{false};
+    std::uint64_t last_unfunded_fee_{0};
+    std::uint64_t last_unfunded_headroom_{0};
+    strategy::fee::ActionClass last_unfunded_action_{strategy::fee::ActionClass::CancelCat};
+
+    /// [review #163 r5] The would-be overrun of the LAST quote for each action
+    /// class: INERT DATA, not an episode.  controller_fee writes it and
+    /// changes nothing else; note_priority_spend promotes it when the spend
+    /// is real.
+    ///
+    /// One slot PER CLASS, not one slot overall, because Step 8 quotes
+    /// CancelXch and then CancelCat in the same heartbeat: with a single slot
+    /// the XCH cancel that is accepted afterwards would read the CAT quote,
+    /// which is a different fee against the same headroom -- and would take
+    /// the "the budget funds priority spends again" branch on a class
+    /// mismatch, clearing an episode nothing had resolved.
+    struct PendingUnfunded {
+        bool          over{false};
+        std::uint64_t fee{0};
+        std::uint64_t headroom{0};
+    };
+    std::array<PendingUnfunded, strategy::fee::kActionClassCount> pending_unfunded_{};
+
+    /// The controller path of get_recommended_fee.
+    std::uint64_t controller_fee(strategy::fee::ActionClass action, BlockHeight current_block);
 };
 
 }  // namespace xop

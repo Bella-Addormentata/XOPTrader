@@ -191,6 +191,291 @@ attempt (30 s) instead of four (about 124 s). `take_offer` is unchanged. For the
 same reason a merged create that ends with no answer is no longer followed by
 one create per tier; a refusal, or a failure before the request was written,
 still is.
+## [Unreleased] — a closed-loop fee controller, shipped off
+
+With Chia blocks about 97% full the node admits a spend only at 5 mojos or more
+per unit of CLVM cost. The engine paid the node's estimate for a plain XCH send
+and never checked whether its own cancels and takes confirmed, so they sat,
+`pending_change` persisted, and Step 8 force-deleted every unconfirmed wallet
+transaction 10-12 times a day. This adds the feedback. Both new switches
+default to off, and with both off every fee is what v0.10.24 paid.
+
+### Fee controller (S67)
+
+- **One controlled quantity: a fee rate, in mojos per CLVM cost.** Four action
+  classes turn it into a fee — cancel of an XCH-offered offer (8.4M cost), cancel
+  of a CAT-offered offer (42.3M), take (125M), fee attached to a posted offer
+  (21M). The costs were measured on this wallet's own spend bundles and are
+  configurable. Every `get_recommended_fee` call site now names its class; the
+  parameter has no default, so a site that forgets does not compile.
+- **Fast up on evidence that a fee is too low.** A cancel or take of ours still
+  pending after `controller_target_delay_blocks` (8 peak heights, 150 s) is a
+  censored observation and raises the rate at once — a too-low fee may never
+  confirm, so waiting for a confirmation would deadlock the loop. Also heard:
+  a late confirmation, the wallet's `sent_to` fee refusals (read from rows the
+  stuck-transaction pruner already holds), Step 8's `pending_change` counter at
+  half way, and the force-delete itself. The law is a velocity-form PID in log
+  fee space that only ever raises.
+- **Slow down by probing.** After 8 on-target confirmations the fee steps down
+  15%. A confirmation counts only if that spend paid no more than the loop pays
+  for its class now — compared as fees, after the `[min_fee, max_fee]` clamp, so
+  a cancel the `min_fee_mojos` floor lifted still counts for the levels at which
+  the loop would pay that same floor. A probe that fails returns to the last
+  known-good fee plus 10%, the level
+  it failed at is remembered, and re-testing that level waits twice as long each
+  time (cap 256 confirmations). A re-test that succeeds means the floor has
+  fallen: the memory is dropped and probing resumes at the base interval.
+- **Anti-windup.** A stuck spend stops counting once the fee is `min_raise` above
+  what that spend paid, which also bounds what a fee clamped by `max_fee_mojos`
+  or the budget can do. Wallet-level signals are ignored for two target delays
+  after a raise, and at most three in a row may raise the fee without an
+  observation of one of our own spends in between.
+- **The node's numbers are a floor under the learned rate, never a multiplier.**
+  `get_fee_estimate` is now asked with an explicit `cost` instead of
+  `spend_type: send_xch_transaction`; the rate it returns is scaled by each
+  class's cost. The node's own admission floor is read from the
+  `get_blockchain_state` reply the height poll already fetches
+  (`mempool_cost`, `mempool_max_total_cost`, `mempool_min_fees`). No node call
+  is added, the wallet-only gate is unchanged, and a reading older than 32 peak
+  heights is dropped: with the node unreachable the learned rate stands alone.
+- **The budget no longer stops the bot, and it never prices a cancel below what
+  the node will admit.** With the controller on, offer-attached fees may spend
+  only what is above a reserve (`controller_budget_reserve_cancels`, 25 CAT
+  cancels, capped at half the budget so it can never exceed the budget itself);
+  an exhausted budget pins the attached fee at `min_fee_mojos` and sends one
+  `FeeBudgetBound` alert — which fires when the budget **could not fund** that
+  fee, not only when it *lowered* one: at the pin the emitted fee is exactly
+  what was asked for. It never returns 0, which made Step 8 skip cancelling
+  stale quotes as well as posting. Step 8 asks for one attached fee and attaches
+  it to every tier it posts, so the room above the reserve is shared across the
+  tiers it may post that heartbeat rather than granted to each. **The reserve
+  moves *when* that squeeze starts; it does not bound what attached fees
+  spend** — `min_fee_mojos` overrides it unconditionally, `should_post_offer`
+  no longer refuses a tier on budget grounds with the controller on, and a fee
+  is booked for every offer *posted* (S69), so a ladder can still push the
+  window past the budget at `min_fee_mojos` per tier. Only a correctly sized
+  `daily_budget_mojos` prevents that, which is what the startup advisory is
+  for. **A cancel or a
+  take is never degraded** — with one exception found at review round 8 and
+  recorded below, the bulk stop/shutdown sweep: `min_fee_mojos` on a 42.3M-cost CAT cancel is 0.35
+  mojos per cost against the 5 a full mempool admits, so a degraded cancel is a
+  spend that cannot be mined, keeps its coins locked and ends in a wallet-wide
+  force-delete. It is paid in full — `max_fee_mojos` is the ceiling that bounds
+  it — and the overrun is reported with one `FeeBudgetUnfunded` alert. That
+  report is raised when the wallet ACCEPTS the spend, never when a fee is
+  merely quoted: Step 8 prices both cancel classes every heartbeat before it
+  cancels anything, so reporting at the quote would say "paid over budget" on
+  heartbeats that sent no wallet RPC at all.
+- **The budget is sized by derivation, not by a quoted number.** At full-mempool
+  prices and this wallet's measured action rates one `fee_window_blocks` window
+  costs 15,163,585,937 mojos, so `daily_budget_mojos` wants at least
+  30,327,171,874. The engine computes that from the operator's own costs and
+  window, logs it at startup and warns when the budget is below it;
+  `config.example.yaml` quotes the same figure and shows the arithmetic.
+- **Tickets carry what was really paid.** A cancel's ticket opens when the
+  wallet accepts the cancel RPC, with that call's fee (an emergency tier, a
+  zero-fee retry and an escalation included) and its height; a re-cancel
+  replaces it. Only a wallet-verified CANCELLED closes it as a confirmation:
+  `recheck_terminal` answers "still terminal" for FAILED too, and a FAILED
+  offer says nothing about our fee. A cancel adopted at boot has no ticket.
+  A ticket's height is the height of the cycle that issued the spend (the
+  startup height for a cancel the startup reconcile issues), never the
+  last-processed-block marker, which trails by a cycle and is 0 at boot; with
+  no known height no ticket is opened, and a ticket at height 0 is never
+  evidence. Both fee bounds are capped at the same ceiling, so a floor above it
+  cannot put the minimum over the maximum. A take's ticket closes on the wallet's own
+  `confirmed_at_index`, not on the heartbeat that read it: the sweep polls one
+  take per heartbeat, so a second ticketed take would otherwise turn an on-time
+  confirmation into a late one and raise the fee.
+- **Every fee the controller emits is a valid `Mojo`, and the conversion to one
+  is now a named function.** The saturation ceiling was exactly 2^63 — the one
+  `std::uint64_t` value that is *not* an `xop::Mojo` (`std::int64_t`, maximum
+  2^63 − 1). It really was emitted: `fee_for()` clamps to
+  `[min_fee_mojos, max_fee_mojos]` and both bounds are capped at that ceiling,
+  so an operator writing a 19- or 20-digit `fees.max_fee_mojos` — the parser
+  accepts any `uint64` and validates only `min <= max` — got 2^63 back from
+  `get_recommended_fee`. C++20 makes the out-of-range conversion modular wrap
+  rather than undefined, so it became `INT64_MIN` silently, on every compiler.
+  The ceiling is now 2^63 − 1; the *comparison* bound stays at exactly 2^63
+  (a constant just below `UINT64_MAX` rounds up to 2^64 as a double) and is
+  renamed so the two can no longer be misread as the same number. A negative
+  fee is worse than a huge one because every guard downstream ignores it rather
+  than refusing — `CoinLockLedger::clamp_need()` zeroes it on the cancel path,
+  and `ask_take_cost()` / `add_same_wallet_fee()` drop it on their own
+  `<= 0` clause on the take path — so all **fifteen** `uint64` → `Mojo` fee
+  conversions now go through `xop::to_mojo_saturating()`. Eleven replaced an
+  explicit `static_cast`; the other **four** were implicit narrowings with no
+  cast to grep for, and those four are exactly the `CoinLockLedger` fee
+  arguments in `offer_manager.cpp`. (Counted, after an earlier draft of this
+  entry said "fourteen … six of them implicit" — both numbers were wrong.) The
+  two `posted × fee` products saturate too.
+  `static_assert`s in `fee_controller.hpp` and `fee_tracker.hpp` make a wrong
+  ceiling a compile error on every toolchain, and
+  `tests/test_fee_controller_wiring.py` now pins every one of the fifteen call
+  sites — see the entry below.
+  **Not reachable on the shipped configuration** (`max_fee_mojos` 100,000,000),
+  and not reachable merely by enabling the controller.
+- **The rolling fee window is accounted EXACTLY, and saturates only when it is
+  read.** An earlier draft of the paragraph above said the running total and
+  its pruning subtraction saturated as well, and that was the bug. Saturating
+  addition is lossy, so it is not invertible and no subtraction undoes it: with
+  a history of `[UINT64_MAX, 100]` the total saturated to `UINT64_MAX`, and
+  pruning the first entry compared `total > oldest` — `UINT64_MAX` against
+  `UINT64_MAX`, false — and set the window total to **zero** while 100 mojos
+  were still inside it. `budget_remaining()` is `daily_budget − total`, so the
+  budget reopened in full: a fail-open on the one number the budget is, in the
+  code added to close a fail-open. `FeeTracker` now keeps the window total as a
+  128-bit unsigned value in two 64-bit halves — a carry on the way in, the
+  matching borrow on the way out, both exact and O(1) — and clamps to
+  `UINT64_MAX` once, in `get_rolling_total()`, where the clamped number is
+  handed to a caller and never fed back into the arithmetic. The post-condition
+  is that `get_rolling_total()` is the true sum of the fees still inside the
+  window, or `UINT64_MAX` if and only if that true sum genuinely exceeds
+  `UINT64_MAX`; every consumer of it is monotone in it, so the clamp can only
+  refuse a spend, never allow one. **Also not reachable on the shipped
+  configuration**: at `max_fee_mojos` 100,000,000 and the ~1,400 fee-bearing
+  events this wallet's busiest day recorded, one window totals about 1.4e11
+  mojos against the 1.8e19 needed to saturate. It takes a `max_fee_mojos` near
+  2^63, which `config.cpp` accepts because it validates only `min <= max`.
+- **Both budget alerts told the operator the wrong thing, and both are the
+  signals the staged enable says to act on.** (1) The `FeeBudgetBound` episode
+  latched and cleared on "the budget *lowered* the fee", which is false
+  whenever the controller's own answer for an attached fee is already at
+  `min_fee_mojos` — every level at or below `log2(42.3/21) = 1.010`, the bottom
+  39% of the live band and the level the engine **boots at**. So an exhausted
+  budget raised no alert there at all, and an open episode was *closed* by a
+  quote taken from an empty window, logging `the fee budget no longer binds
+  (headroom 0 mojos)`: an all-clear contradicted by its own number. The rule is
+  now what the budget actually granted (`BudgetedFee::allowance`, the room
+  above the reserve divided by the batch) against what was asked for, on both
+  edges. (2) The `FeeBudgetUnfunded` episode's clear branch was the bare
+  negation of its latch and never compared the fee *paid* with the headroom, so
+  an accepted priority spend at any fee below its class's last quote ended the
+  episode however far above the headroom it was — a 239,000,000-mojo escalation
+  against a headroom of 0 read as "the budget funds priority spends again". It
+  now ends only when the accepted spend fits the headroom, which is what the
+  header always documented. Both are behind `controller_enabled` and both are
+  load-bearing at the live `daily_budget_mojos: 10000000000`, which this PR's
+  own startup advisory says is about 3x too small.
+- **One cancel path is still degraded, and "a cancel is never degraded" is
+  qualified rather than repeated.** `OfferManager::cancel_all`'s **bulk** sweep
+  hands `current_fee_mojos_` to the wallet as `batch_fee`, and that is the
+  budget-shaped *offer-attached* fee `Engine::set_dynamic_fee` last wrote — so
+  with the controller on and the budget exhausted, a stop/shutdown Cancel All
+  can go out at `min_fee_mojos` while the controller's own cancel fee is far
+  above it. Every *per-offer* cancel is unaffected (`cancel_fee_for` reads the
+  class-aware priority fees). Found by review at `cbf0301` and **not fixed
+  here** — it changes the stop/shutdown sweep and wants its own review; the
+  fix is to pass `max(cancel_fee_xch_mojos_, cancel_fee_cat_mojos_)` while the
+  class-aware fees are in force. It must land before `controller_enabled:
+  true`.
+- **The saturating conversion had no guard of its own, and a merge gate proved
+  it by measurement.** This release introduced `xop::to_mojo_saturating()` and
+  routed fifteen fee conversions through it — and pinned none of them. On the
+  four-way merged tree the gate dropped the wrapper from each of the four
+  `CoinLockLedger` fee arguments in turn and **nothing caught it**: MSVC
+  `/W4 /WX` builds clean because `uint64` → `int64` is a same-size conversion
+  and `-Wconversion` is in neither toolchain's flags, the C++ suite passes
+  because nothing in `cpp/tests` constructs an `OfferManager`, and no source
+  scan mentioned `to_mojo_saturating` at all. The only thing ever holding those
+  four lines was a neighbouring PR's literal text pin, which was loosened —
+  correctly — so it could pass both alone and merged. Six assertions in
+  `tests/test_fee_controller_wiring.py` now pin the invariant where it belongs:
+  the `CoinLockLedger` fee argument is checked **positionally** (so a third
+  `min_coin` argument cannot break it), the ternary, assignment, bind and
+  ledger-leg shapes are checked individually, a bare narrowing cast on a fee is
+  refused, and an exact per-file census makes dropping any one of the fifteen
+  visible. **Scope, plainly: the code was correct at every site and the
+  reachable impact is negligible** — the narrowing needs a fee above 2^63 mojos
+  (~9.2 million XCH) and `current_fee_mojos_` is clamped by
+  `fees.max_fee_mojos`. This is guard erosion, not a live defect.
+- **Review round 9: four corrections, one of them a real signal defect.**
+  (1) **`sent_to` is per peer, not a timeline**, so reading only its last tuple
+  was wrong in both directions. Measured against this wallet's own `debug.log`
+  (8 files, 38,250 non-empty lists): **8,289 carry more than one peer**, so an
+  accepting peer followed by a fee-refusing one would have raised the fee on a
+  spend already in a mempool; and **341 lists carry a fee refusal that is not
+  last** and were dropped silently. The parser now scans the whole array — any
+  peer reporting SUCCESS or PENDING suppresses the row, an unreadable tuple
+  stops the row rather than being skipped over (it could be the acceptance),
+  and otherwise any fee refusal counts. The residual is stated rather than
+  glossed: `filter_ok_mempool_status` strips the SUCCESS/PENDING tuples on the
+  resend tick, so a spend resting in an accepting peer's mempool later looks
+  identical to a refused one — across all 38,250 live lists, **zero** ever
+  carried a SUCCESS, which is what that filter looks like from outside. No
+  reading of `sent_to` alone can separate those; what bounds it is the
+  controller's dead time and its three-raise uncorroborated streak limit.
+  (2) **The rolling fee window booked intent.** `cancel_fees_paid` re-derived
+  each cancel's fee from a fresh `cancel_fee_for()` policy lookup, so a cancel
+  that fell through to `emergency_cancel` and went out at a halved tier, at a
+  secure fee of 0, or as a local-only cancel that spends nothing was booked at
+  the full policy fee. `OfferManager` now carries the accepted fee out
+  (`take_cancel_fees_accepted()`), which also books accepted cancels from
+  routines that reached no booking site at all. Gated with the rest — the
+  legacy branch is byte-identical to `main`.
+  (3) **"Reported once" was not an invariant**: the refused-name set tests its
+  capacity *before* inserting and then clears wholesale, so the sweep that
+  trips 256 re-counts every refused row still visible in it, and names of
+  deleted transactions are never shed.
+  (4) **Class-aware cancel fees start at Step 8, which is after startup
+  reconciliation** — so the bulk sweep is not the only cancel that misses them;
+  every cancel the boot reconciliation issues pays the raw constructor fee,
+  including the `OrphanDisposition::Unknown` path that fires for any resting
+  offer on a disabled pair.
+- **Observability.** One `[FeeController] rate a -> b mojos/cost (reason; n
+  move(s)) -- fees now: ...` line per burst of changes, and two gauges,
+  `xop_fees_controller_rate_mojos_per_cost` and `xop_fees_controller_level_log2`.
+  At startup the controller reports which classes `max_fee_mojos` cannot get
+  into a full mempool.
+- **Keys**, all under `fees:` and read at startup: `cost_aware_estimate`,
+  `controller_enabled`, `controller_target_delay_blocks`, `controller_kp` / `_ki`
+  / `_kd`, `controller_max_error`, `controller_max_step_up`,
+  `controller_min_raise`, `controller_warmup_observations`,
+  `controller_probe_fraction`, `controller_probe_after_confirmations`,
+  `controller_probe_confirmations`, `controller_probe_fail_bump`,
+  `controller_probe_backoff_cap`, `controller_ff_margin`,
+  `controller_ff_max_age_blocks`, `controller_budget_reserve_cancels` and four
+  `controller_cost_*`. Ranges are validated; `controller_enabled` requires
+  `min_fee_mojos > 0`.
+
+### Operator notes
+
+- **Nothing changes until a switch is turned on.** `cost_aware_estimate: true`
+  alone changes fees (about 4.5x for a CAT cancel at the same node rate), and
+  it makes cancels pay by the asset the offer offered, as the controller does.
+- **Level 0 is `min_fee_mojos` exactly**, whatever its value. A very low floor
+  (the example file's 5000) makes a very wide band: the startup log says how
+  many raises, and roughly how many minutes, crossing it takes without the
+  node's floor.
+- **The live `max_fee_mojos: 100000000` cannot get an offer-attached fee, a CAT
+  cancel or a take into a full mempool** — three of the four classes, not the
+  two earlier drafts of this entry named. The node admits at 5 mojos per cost
+  and the controller asks for `controller_ff_margin` × that (5.5 at the
+  default), so the classes need 115,500,000, 232,650,000 and 687,500,000
+  respectively; only the XCH cancel's 46,200,000 fits under 100,000,000. The
+  startup log names each one. Before enabling the controller raise it to at
+  least 250,000,000, or 700,000,000 to cover takes **as the shipped cost model
+  prices them** — that figure is `5.5 × controller_cost_take` at the modelled
+  125,000,000, and the measured take cost reaches **212,112,758**, which needs
+  **1,166,620,169**. Raising the cap alone will not make the loop ask for that:
+  the fee is `rate × controller_cost_take`, so pricing the largest measured
+  take needs `controller_cost_take: 212112758` **and** `max_fee_mojos >=
+  1166620169`. Keeping the shipped 125,000,000 is defensible — it was chosen to
+  cover 7 of the 11 measured bundles rather than make the common take pay for
+  the rare one — but then the 4 large takes are under-priced in a full mempool
+  and the controller compensates by raising the *rate*, which raises every
+  other class too. Also raise
+  `strategy.cancel_escalation_max_fee_mojos` with it.
+- **`daily_budget_mojos` is per `fee_window_blocks`, and 1662 peak heights is
+  8.7 hours, not 24** (S69). At full-mempool prices one such window costs
+  15,163,585,937 mojos on this wallet's measured action rates, so set the budget
+  to at least 30,327,171,874 (35000000000 is a round number); the engine logs
+  the figure for your configuration and warns below it. The 5000000000 to
+  15000000000 suggested in earlier drafts was wrong at both ends: the bottom is
+  less than the cancel reserve itself (25 x 232,650,000 = 5,816,250,000) and the
+  top is about one window's spend.
+- Found while measuring, not fixed here: Step 8's force-delete fires after a
+  median of 176 seconds, not the ~10 minutes its constant documents (S68).
 
 ## [0.10.24] — 2026-09-14 — record what happened, not what was asked for
 

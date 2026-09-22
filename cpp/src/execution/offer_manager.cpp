@@ -25,6 +25,7 @@
 #include <xop/execution/cancel_escalation.hpp>
 #include <xop/execution/cancel_retry.hpp>
 #include <xop/execution/cross_guard.hpp>
+#include <xop/execution/fee_feedback.hpp>
 #include <xop/execution/stuck_tx_verdict.hpp>
 #include <xop/execution/wallet_circuit.hpp>
 #include <xop/execution/wallet_poll_throttle.hpp>
@@ -34,6 +35,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <unordered_set>
 
@@ -562,7 +564,7 @@ asio::awaitable<int> OfferManager::post_quotes(
                     bool needs_emergency = false;
                     try {
                         co_await cancel_offer_charged(
-                            po.offer_id, current_fee_mojos_, /*secure=*/true);
+                            po.offer_id, cancel_fee_for(po.offer_id), /*secure=*/true);
                         cancel_ok = true;
                     } catch (const rpc::ChiaRPCError& e) {
                         const std::string_view msg{e.what()};
@@ -597,7 +599,7 @@ asio::awaitable<int> OfferManager::post_quotes(
                     bool needs_emergency = false;
                     try {
                         co_await cancel_offer_charged(
-                            po.offer_id, current_fee_mojos_, /*secure=*/true);
+                            po.offer_id, cancel_fee_for(po.offer_id), /*secure=*/true);
                         cancel_ok = true;
                     } catch (const rpc::ChiaRPCError& e) {
                         const std::string_view msg{e.what()};
@@ -1222,7 +1224,7 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
                 // already called remove_offer(), which always returned a
                 // default (fee 0) -- trade_log.fee_mojos was silently 0 for
                 // every fill since June 2026.
-                fill.fee_mojos    = static_cast<Mojo>(po.fee_mojos);
+                fill.fee_mojos    = to_mojo_saturating(po.fee_mojos);
 
                 // Extract confirmed block height if available.
                 if (rec.contains("confirmed_at_index")) {
@@ -1358,8 +1360,12 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
 // ---------------------------------------------------------------------------
 asio::awaitable<TerminalRecheck>
 OfferManager::recheck_terminal(const std::string& trade_id,
-                               BlockHeight        current_block)
+                               BlockHeight        current_block,
+                               bool*              wallet_cancelled_out)
 {
+    if (wallet_cancelled_out != nullptr) {
+        *wallet_cancelled_out = false;
+    }
     json rec;
     try {
         rec = co_await wallet_->get_offer(trade_id, /*file_contents=*/false);
@@ -1382,6 +1388,11 @@ OfferManager::recheck_terminal(const std::string& trade_id,
     const int status = trade_status::parse(rec["status"]);
 
     if (status == trade_status::kCancelled || status == trade_status::kFailed) {
+        // [review #163] Both are terminal, but only CANCELLED says a cancel
+        // spend confirmed.
+        if (wallet_cancelled_out != nullptr) {
+            *wallet_cancelled_out = (status == trade_status::kCancelled);
+        }
         co_return TerminalRecheck::StillTerminal;
     }
 
@@ -1521,7 +1532,7 @@ asio::awaitable<std::vector<std::string>> OfferManager::cancel_stale(
         bool needs_emergency = false;
         try {
             co_await cancel_offer_charged(
-                po.offer_id, current_fee_mojos_, /*secure=*/true);
+                po.offer_id, cancel_fee_for(po.offer_id), /*secure=*/true);
             cancel_ok = true;
         } catch (const rpc::ChiaRPCError& e) {
             const std::string_view msg{e.what()};
@@ -1883,7 +1894,7 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_ids(
         // out.last_error is therefore assigned ONLY on the failed branch.
         std::string err;
         try {
-            co_await cancel_offer_charged(oid, current_fee_mojos_,
+            co_await cancel_offer_charged(oid, cancel_fee_for(oid),
                                           /*secure=*/true);
             logger_->debug("Cancelled offer {}", oid.substr(0, 12));
             cancel_ok = true;
@@ -2152,6 +2163,67 @@ void OfferManager::set_escalation(
 std::uint64_t OfferManager::current_fee() const noexcept
 {
     return current_fee_mojos_;
+}
+
+// ---------------------------------------------------------------------------
+// [S67] Class-aware cancel fees
+// ---------------------------------------------------------------------------
+
+void OfferManager::set_cancel_fees(std::uint64_t xch_offered_mojos,
+                                   std::uint64_t cat_offered_mojos) noexcept
+{
+    cancel_fees_active_   = true;
+    cancel_fee_xch_mojos_ = xch_offered_mojos;
+    cancel_fee_cat_mojos_ = cat_offered_mojos;
+}
+
+void OfferManager::clear_cancel_fees() noexcept
+{
+    cancel_fees_active_ = false;
+}
+
+void OfferManager::set_cancel_observer(
+    std::function<void(const std::string&, std::uint64_t)> observer)
+{
+    cancel_observer_ = std::move(observer);
+}
+
+std::uint64_t OfferManager::cancel_fee_for(const std::string& offer_id) const
+{
+    if (!cancel_fees_active_) {
+        return current_fee_mojos_;   // the pre-S67 behaviour, untouched
+    }
+    // A bid offers the QUOTE asset, an ask the BASE: those are the coins a
+    // secure cancel spends.
+    bool known          = false;
+    bool offered_is_xch = false;
+    const PendingOffer po = state_->get_offer(offer_id);
+    if (!po.offer_id.empty()) {
+        const auto it = pair_config_map_.find(po.pair_name);
+        if (it != pair_config_map_.end()) {
+            const std::string& offered = (po.side == Side::Bid)
+                ? it->second.quote_asset_id : it->second.base_asset_id;
+            known          = true;
+            offered_is_xch = (offered == "xch");
+        }
+    }
+    return strategy::fee::cancel_fee_for(cancel_fees_active_, current_fee_mojos_,
+                                         cancel_fee_xch_mojos_, cancel_fee_cat_mojos_,
+                                         known, offered_is_xch);
+}
+
+std::uint32_t OfferManager::take_fee_rejections_seen() noexcept
+{
+    const std::uint32_t seen = fee_rejections_seen_;
+    fee_rejections_seen_ = 0;
+    return seen;
+}
+
+std::uint64_t OfferManager::take_cancel_fees_accepted() noexcept
+{
+    const std::uint64_t paid = cancel_fees_accepted_;
+    cancel_fees_accepted_ = 0;
+    return paid;
 }
 
 // ---------------------------------------------------------------------------
@@ -2526,7 +2598,7 @@ asio::awaitable<std::vector<std::string>> OfferManager::selective_cancel(
         bool needs_emergency = false;
         try {
             co_await cancel_offer_charged(
-                offer_id, current_fee_mojos_, /*secure=*/true);
+                offer_id, cancel_fee_for(offer_id), /*secure=*/true);
             cancel_ok = true;
         } catch (const rpc::ChiaRPCError& e) {
             const std::string_view msg{e.what()};
@@ -3063,7 +3135,7 @@ OrphanEvaluation OfferManager::evaluate_orphan(
     //   - Adverse but within threshold: adopt (cost to cancel > likely loss).
     //   - Adverse beyond threshold: cancel (likely loss > cancel cost).
     //   - Mild adverse (between half-threshold and threshold): adopt-stale.
-    eval.cancel_cost = static_cast<Mojo>(current_fee_mojos_);
+    eval.cancel_cost = to_mojo_saturating(current_fee_mojos_);
 
     if (!eval.adverse) {
         // Favorable deviation -- our offer is more conservative than
@@ -3485,7 +3557,7 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
                 bool needs_emergency = false;
                 try {
                     co_await cancel_offer_charged(wo->trade_id,
-                                                   current_fee_mojos_,
+                                                   cancel_fee_for(wo->trade_id),
                                                    /*secure=*/true);
                     cancel_ok = true;
                 } catch (const rpc::ChiaRPCError& e) {
@@ -3592,6 +3664,25 @@ asio::awaitable<int> OfferManager::prune_stuck_transactions(
 
                 if (row_class == StuckRowClass::Confirmed) {
                     continue;
+                }
+                // [S67] The wallet's own word that a fee is too low: some peer
+                // refused this row on the fee and none accepted it.  Already
+                // in hand -- no RPC is added -- and counted once per
+                // transaction name until the set is cleared (see
+                // kMaxReportedFeeRejections; "once" is a normal case, not an
+                // invariant).  It changes nothing this function decides.
+                // [review #163 r9] The whole sent_to array is read, not its
+                // last entry: the array is per PEER, not a timeline.
+                if (execution::sent_to_reports_fee_rejection(tx)) {
+                    const std::string tx_key = (tx.contains("name") && tx["name"].is_string())
+                        ? tx["name"].get<std::string>() : std::string{};
+                    if (fee_rejections_reported_.size() >= execution::kMaxReportedFeeRejections) {
+                        fee_rejections_reported_.clear();
+                    }
+                    if (!tx_key.empty() && fee_rejections_reported_.insert(tx_key).second
+                        && fee_rejections_seen_ != std::numeric_limits<std::uint32_t>::max()) {
+                        ++fee_rejections_seen_;
+                    }
                 }
                 if (row_class == StuckRowClass::FreshOrUnknown) {
                     ++fresh_count;
@@ -3795,8 +3886,33 @@ std::string OfferManager::late_trade_id(const json& result,
 asio::awaitable<json> OfferManager::cancel_offer_charged(
     const std::string& trade_id, std::uint64_t fee, bool secure)
 {
-    xch_cycle_ledger_.note_lock(0, static_cast<Mojo>(fee));
-    co_return co_await wallet_->cancel_offer(trade_id, fee, secure);
+    // [review #163 r6] to_mojo_saturating, not a bare cast: `fee` is a
+    // std::uint64_t and a wrapped negative is silently zeroed by
+    // CoinLockLedger::clamp_need(), which would leave the pool believing this
+    // cancel locks nothing.  See xop::to_mojo_saturating (types.hpp).
+    xch_cycle_ledger_.note_lock(0, to_mojo_saturating(fee));
+    json reply = co_await wallet_->cancel_offer(trade_id, fee, secure);
+    // [review #163] The wallet ACCEPTED it (a refusal throws past this line).
+    // Tell the fee controller what was really paid, now -- see
+    // set_cancel_observer.  A local-only cancel spends nothing on chain.
+    if (secure) {
+        // [review #163 r9] THE SAME LINE IS ALSO THE ONLY HONEST INPUT TO THE
+        // ROLLING FEE WINDOW.  Engine::cancel_fees_paid used to re-derive each
+        // cancel's fee from cancel_fee_for(), a FRESH POLICY LOOKUP -- so a
+        // cancel that fell through to emergency_cancel and went out at a
+        // halved tier, at a secure fee of 0, or as a local-only cancel that
+        // spends nothing was still booked at the full policy fee.  This
+        // accumulates what the wallet ACCEPTED instead; an insecure cancel
+        // contributes nothing because it commits nothing on chain.
+        cancel_fees_accepted_ = (fee > std::numeric_limits<std::uint64_t>::max()
+                                           - cancel_fees_accepted_)
+                                    ? std::numeric_limits<std::uint64_t>::max()
+                                    : cancel_fees_accepted_ + fee;
+        if (cancel_observer_) {
+            cancel_observer_(trade_id, fee);
+        }
+    }
+    co_return reply;
 }
 
 // ---------------------------------------------------------------------------
@@ -3854,7 +3970,7 @@ asio::awaitable<json> OfferManager::cancel_offers_charged(
     // [S33 2026-09-11] The arithmetic, the >= 1 clamp and the rationale live
     // in execution/coin_lock_ledger.hpp so that ctest drives the same code
     // this does -- inline here, the reservation had no coverage at all.
-    reserve_bulk_cancel(xch_cycle_ledger_, static_cast<Mojo>(fee), n_offers);
+    reserve_bulk_cancel(xch_cycle_ledger_, to_mojo_saturating(fee), n_offers);
     co_return co_await wallet_->cancel_offers(fee, secure);
 }
 
@@ -3915,13 +4031,17 @@ bool OfferManager::xch_ledger_probe_admits(CoinLockLedger&   probe,
         || (side == Side::Ask && pair.quote_asset_id == "xch");
     // [MIN-INPUT-COIN review #162] Same floor as the real admission, or the
     // preflight would keep a side the cycle ledger then refuses.
+    // [review #163 r6] The fee was an IMPLICIT uint64 -> Mojo narrowing: the
+    // sinks take a Mojo and no diagnostic fires.  See xch_ledger_admits below
+    // and xop::to_mojo_saturating (types.hpp).
     const Mojo min_coin = ledger_min_coin_mojos(
         offer_dict, strategy_cfg_.offer_min_input_coin_frac);
     if (buys_xch) {
-        return probe.try_lock_floor_only(0, current_fee_mojos_, min_coin);
+        return probe.try_lock_floor_only(
+            0, to_mojo_saturating(current_fee_mojos_), min_coin);
     }
     return probe.try_lock(xch_principal_from_offer_dict(offer_dict),
-                          current_fee_mojos_, min_coin);
+                          to_mojo_saturating(current_fee_mojos_), min_coin);
 }
 
 bool OfferManager::xch_ledger_admits(const json&       offer_dict,
@@ -3952,8 +4072,8 @@ bool OfferManager::xch_ledger_admits(const json&       offer_dict,
     const Mojo min_coin = ledger_min_coin_mojos(
         offer_dict, strategy_cfg_.offer_min_input_coin_frac);
     if (buys_xch) {
-        if (xch_cycle_ledger_.try_lock_floor_only(0, current_fee_mojos_,
-                                                  min_coin)) {
+        if (xch_cycle_ledger_.try_lock_floor_only(
+                0, to_mojo_saturating(current_fee_mojos_), min_coin)) {
             return true;
         }
         xch_ledger_suppressed_ = true;
@@ -3967,7 +4087,8 @@ bool OfferManager::xch_ledger_admits(const json&       offer_dict,
         return false;
     }
     const Mojo principal = xch_principal_from_offer_dict(offer_dict);
-    if (xch_cycle_ledger_.try_lock(principal, current_fee_mojos_, min_coin)) {
+    if (xch_cycle_ledger_.try_lock(
+            principal, to_mojo_saturating(current_fee_mojos_), min_coin)) {
         return true;
     }
     xch_ledger_suppressed_ = true;
@@ -4832,7 +4953,15 @@ asio::awaitable<bool> OfferManager::emergency_cancel(
             // insufficient funds at a given tier, halve and retry.
             // This lets us cancel even when spendable is far below the
             // configured minimum fee.
-            const auto fee_cap = static_cast<Mojo>(current_fee_mojos_ * 2);
+            // [review #163 r6] The DOUBLING happens in the uint64 domain, so
+            // it has to saturate BEFORE the conversion does: a bare
+            // `static_cast<Mojo>(current_fee_mojos_ * 2)` wraps the product
+            // first and then narrows the wrapped value, which no amount of
+            // care at the cast alone would catch.
+            const Mojo fee_cap = to_mojo_saturating(
+                current_fee_mojos_ > std::numeric_limits<std::uint64_t>::max() / 2U
+                    ? std::numeric_limits<std::uint64_t>::max()
+                    : current_fee_mojos_ * 2U);
             Mojo attempt_fee = std::min(
                 fee_cap,
                 std::max(Mojo{1}, xch_spendable - Mojo{1000}));
