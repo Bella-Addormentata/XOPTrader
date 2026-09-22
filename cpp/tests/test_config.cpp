@@ -16,6 +16,7 @@
 #include <xop/config.hpp>
 #include <xop/execution/book_side_quality.hpp>
 #include <xop/execution/cancel_escalation_config.hpp>
+#include <xop/strategy/fee_controller.hpp>
 
 #include <spdlog/sinks/ringbuffer_sink.h>
 #include <spdlog/spdlog.h>
@@ -1792,6 +1793,77 @@ TEST(ConfigParserTest, OfferExpiryOverride_NegativeAndAboveUint32Rejected) {
 }
 
 // ============================================================================
+// [S74 2026-09-20] engine.shutdown_offers, through the PARSER.
+//
+// The key decides what a stop does with a live book when nobody is there to
+// answer (Ctrl+C, SIGTERM, a session end, a pre-policy GUI).  Two things must
+// hold: a config written before the key existed keeps today's behaviour, and
+// no typo reads as a policy the operator did not choose -- the lenient reading
+// of every bad spelling below is a silent "cancel".
+// ============================================================================
+
+TEST(ConfigParserTest, ShutdownOffers_AbsentMeansCancel) {
+    TempYaml tmp(kMinimalValidYaml);
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_EQ(cfg.engine.shutdown_offers, xop::util::StopOffersPolicy::Cancel);
+}
+
+TEST(ConfigParserTest, ShutdownOffers_BothPoliciesRoundTrip) {
+    {
+        TempYaml tmp(std::string(kMinimalValidYaml) + "\nengine:\n  shutdown_offers: keep\n");
+        EXPECT_EQ(xop::load_config(tmp.path()).engine.shutdown_offers,
+                  xop::util::StopOffersPolicy::Keep);
+    }
+    {
+        TempYaml tmp(std::string(kMinimalValidYaml) + "\nengine:\n  shutdown_offers: cancel\n");
+        EXPECT_EQ(xop::load_config(tmp.path()).engine.shutdown_offers,
+                  xop::util::StopOffersPolicy::Cancel);
+    }
+    {
+        // Quoted, capitalised: one parser serves the config and the flag.
+        TempYaml tmp(std::string(kMinimalValidYaml) + "\nengine:\n  shutdown_offers: \"Keep\"\n");
+        EXPECT_EQ(xop::load_config(tmp.path()).engine.shutdown_offers,
+                  xop::util::StopOffersPolicy::Keep);
+    }
+    {
+        // An EMPTY SECTION is "not set": the key was never written.
+        TempYaml empty(std::string(kMinimalValidYaml) + "\nengine:\n");
+        EXPECT_EQ(xop::load_config(empty.path()).engine.shutdown_offers,
+                  xop::util::StopOffersPolicy::Cancel);
+        TempYaml braces(std::string(kMinimalValidYaml) + "\nengine: {}\n");
+        EXPECT_EQ(xop::load_config(braces.path()).engine.shutdown_offers,
+                  xop::util::StopOffersPolicy::Cancel);
+    }
+    // A key written and left BLANK is NOT "not set" -- see the rejected list.
+}
+
+TEST(ConfigParserTest, ShutdownOffers_AnythingElseIsRejectedNotDefaulted) {
+    // [review] A BLANK VALUE IS ONE OF THESE, not a default. `shutdown_offers:`
+    // with nothing after it is a half-finished edit, and reading it as "cancel"
+    // is exactly the silent default this section refuses -- arriving through
+    // the one section documented as STRICT. (`engine:` with no key at all is
+    // still "not set": covered above.)
+    for (const char* section : {
+             "engine:\n  shutdown_offers:\n",              // written and left BLANK
+             "engine:\n  shutdown_offers: ~\n",            // an explicit YAML null
+             "engine:\n  shutdown_offers: null\n",
+             "engine:\n  shutdown_offers: \"\"\n",         // an empty string
+             "engine:\n  shutdown_offers: kep\n",          // a typo in the value
+             "engine:\n  shutdown_offers: true\n",         // a YAML boolean
+             "engine:\n  shutdown_offers: 1\n",
+             "engine:\n  shutdown_offers: keep-bids\n",
+             "engine:\n  shutdown_offers: [keep]\n",       // not a scalar
+             "engine:\n  shutdown_offers:\n    mode: keep\n",
+             "engine:\n  shutdown_offer: keep\n",          // a typo in the KEY
+             "engine:\n  shutdown_offers: keep\n  other: 1\n",
+             "engine: keep\n",                             // not a mapping
+         }) {
+        TempYaml tmp(std::string(kMinimalValidYaml) + "\n" + section);
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError) << section;
+    }
+}
+
+// ============================================================================
 // [S33 2026-09-12] Non-finite values in the numeric knobs.
 //
 // yaml-cpp accepts `.nan` and `.inf`, and NaN makes EVERY comparison false --
@@ -3112,6 +3184,195 @@ const std::string kTestId = "0123456789abcdef0123456789abcdef0123456789abcdef012
 
 }  // namespace
 
+// ===========================================================================
+// [S67 2026-09-20] fees.cost_aware_estimate and the fee controller
+// ===========================================================================
+
+namespace {
+
+/// kMinimalValidYaml carries no `fees:` section, so one can be appended whole.
+std::string with_fees(const std::string& keys)
+{
+    return std::string(kMinimalValidYaml) + "\nfees:\n  enabled: true\n" + keys;
+}
+
+}  // namespace
+
+TEST(FeeControllerConfig, DefaultsKeepBothFlagsOff) {
+    TempYaml tmp(kMinimalValidYaml);
+    const auto cfg = xop::load_config(tmp.path());
+    EXPECT_FALSE(cfg.fees.cost_aware_estimate);
+    EXPECT_FALSE(cfg.fees.controller_enabled);
+    EXPECT_EQ(cfg.fees.controller_target_delay_blocks, 8u);
+    EXPECT_DOUBLE_EQ(cfg.fees.controller_kp, 1.0);
+    EXPECT_DOUBLE_EQ(cfg.fees.controller_ki, 0.5);
+    EXPECT_DOUBLE_EQ(cfg.fees.controller_kd, 0.5);
+    EXPECT_DOUBLE_EQ(cfg.fees.controller_max_error, 2.0);
+    EXPECT_DOUBLE_EQ(cfg.fees.controller_max_step_up, 1.0);
+    EXPECT_DOUBLE_EQ(cfg.fees.controller_min_raise, 1.0);
+    EXPECT_EQ(cfg.fees.controller_warmup_observations, 3u);
+    EXPECT_DOUBLE_EQ(cfg.fees.controller_probe_fraction, 0.15);
+    EXPECT_EQ(cfg.fees.controller_probe_after_confirmations, 8u);
+    EXPECT_EQ(cfg.fees.controller_probe_confirmations, 3u);
+    EXPECT_DOUBLE_EQ(cfg.fees.controller_probe_fail_bump, 0.10);
+    EXPECT_EQ(cfg.fees.controller_probe_backoff_cap, 256u);
+    EXPECT_DOUBLE_EQ(cfg.fees.controller_ff_margin, 1.10);
+    EXPECT_EQ(cfg.fees.controller_ff_max_age_blocks, 32u);
+    EXPECT_EQ(cfg.fees.controller_budget_reserve_cancels, 25u);
+    EXPECT_EQ(cfg.fees.controller_cost_offer_attached, 21'000'000ULL);
+    EXPECT_EQ(cfg.fees.controller_cost_cancel_xch, 8'400'000ULL);
+    EXPECT_EQ(cfg.fees.controller_cost_cancel_cat, 42'300'000ULL);
+    EXPECT_EQ(cfg.fees.controller_cost_take, 125'000'000ULL);
+    // The header's own defaults and the config's must not drift apart.
+    const xop::strategy::fee::ControllerConfig d{};
+    EXPECT_EQ(cfg.fees.controller_target_delay_blocks, d.target_delay_blocks);
+    EXPECT_DOUBLE_EQ(cfg.fees.controller_min_raise, d.min_raise);
+    EXPECT_EQ(cfg.fees.controller_probe_backoff_cap, d.probe_backoff_cap);
+    EXPECT_EQ(cfg.fees.controller_cost_take, d.costs.take);
+    EXPECT_EQ(cfg.fees.controller_cost_cancel_cat, d.costs.cancel_cat);
+    EXPECT_EQ(cfg.fees.controller_cost_cancel_xch, d.costs.cancel_xch);
+    EXPECT_EQ(cfg.fees.controller_cost_offer_attached, d.costs.offer_attached);
+}
+
+TEST(FeeControllerConfig, ParsesEveryKey) {
+    TempYaml tmp(with_fees(
+        "  min_fee_mojos: 15000000\n"
+        "  max_fee_mojos: 700000000\n"
+        "  cost_aware_estimate: true\n"
+        "  controller_enabled: true\n"
+        "  controller_target_delay_blocks: 12\n"
+        "  controller_kp: 1.5\n"
+        "  controller_ki: 0.75\n"
+        "  controller_kd: 0.25\n"
+        "  controller_max_error: 3.0\n"
+        "  controller_max_step_up: 1.5\n"
+        "  controller_min_raise: 0.75\n"
+        "  controller_warmup_observations: 0\n"
+        "  controller_probe_fraction: 0.2\n"
+        "  controller_probe_after_confirmations: 10\n"
+        "  controller_probe_confirmations: 4\n"
+        "  controller_probe_fail_bump: 0.05\n"
+        "  controller_probe_backoff_cap: 80\n"
+        "  controller_ff_margin: 1.25\n"
+        "  controller_ff_max_age_blocks: 48\n"
+        "  controller_budget_reserve_cancels: 30\n"
+        "  controller_cost_offer_attached: 20000000\n"
+        "  controller_cost_cancel_xch: 9000000\n"
+        "  controller_cost_cancel_cat: 43000000\n"
+        "  controller_cost_take: 150000000\n"));
+    const auto cfg = xop::load_config(tmp.path());
+    EXPECT_TRUE(cfg.fees.cost_aware_estimate);
+    EXPECT_TRUE(cfg.fees.controller_enabled);
+    EXPECT_EQ(cfg.fees.controller_target_delay_blocks, 12u);
+    EXPECT_DOUBLE_EQ(cfg.fees.controller_kp, 1.5);
+    EXPECT_DOUBLE_EQ(cfg.fees.controller_ki, 0.75);
+    EXPECT_DOUBLE_EQ(cfg.fees.controller_kd, 0.25);
+    EXPECT_DOUBLE_EQ(cfg.fees.controller_max_error, 3.0);
+    EXPECT_DOUBLE_EQ(cfg.fees.controller_max_step_up, 1.5);
+    EXPECT_DOUBLE_EQ(cfg.fees.controller_min_raise, 0.75);
+    EXPECT_EQ(cfg.fees.controller_warmup_observations, 0u);
+    EXPECT_DOUBLE_EQ(cfg.fees.controller_probe_fraction, 0.2);
+    EXPECT_EQ(cfg.fees.controller_probe_after_confirmations, 10u);
+    EXPECT_EQ(cfg.fees.controller_probe_confirmations, 4u);
+    EXPECT_DOUBLE_EQ(cfg.fees.controller_probe_fail_bump, 0.05);
+    EXPECT_EQ(cfg.fees.controller_probe_backoff_cap, 80u);
+    EXPECT_DOUBLE_EQ(cfg.fees.controller_ff_margin, 1.25);
+    EXPECT_EQ(cfg.fees.controller_ff_max_age_blocks, 48u);
+    EXPECT_EQ(cfg.fees.controller_budget_reserve_cancels, 30u);
+    EXPECT_EQ(cfg.fees.controller_cost_offer_attached, 20'000'000ULL);
+    EXPECT_EQ(cfg.fees.controller_cost_cancel_xch, 9'000'000ULL);
+    EXPECT_EQ(cfg.fees.controller_cost_cancel_cat, 43'000'000ULL);
+    EXPECT_EQ(cfg.fees.controller_cost_take, 150'000'000ULL);
+}
+
+TEST(FeeControllerConfig, NonFiniteDoubleKeysThrow) {
+    // Each double key is its own parser call site, so each is driven: a guard
+    // checked on one key says nothing about the next (memory: mutate every
+    // copy).  .nan and .inf are YAML 1.2 floats yaml-cpp converts happily.
+    for (const char* key : {"controller_kp", "controller_ki", "controller_kd",
+                            "controller_max_error", "controller_max_step_up",
+                            "controller_min_raise", "controller_probe_fraction",
+                            "controller_probe_fail_bump", "controller_ff_margin"}) {
+        expect_config_error_containing(with_fees(std::string("  ") + key + ": .nan\n"), key);
+        expect_config_error_containing(with_fees(std::string("  ") + key + ": .inf\n"), key);
+    }
+}
+
+TEST(FeeControllerConfig, OutOfRangeThrowsAndTheBoundariesLoad) {
+    struct Case { const char* key; const char* bad_lo; const char* bad_hi; const char* ok_lo; const char* ok_hi; };
+    const Case cases[] = {
+        {"controller_target_delay_blocks", "0", "4609", "1", "4608"},
+        {"controller_kp", "-0.1", "16.1", "0", "16"},
+        {"controller_ki", "-0.1", "16.1", "0", "16"},
+        {"controller_kd", "-0.1", "16.1", "0", "16"},
+        {"controller_max_error", "0", "16.1", "0.01", "16"},
+        {"controller_max_step_up", "0", "8.1", "0.01", "8"},
+        {"controller_min_raise", "0", "8.1", "0.01", "8"},
+        {"controller_warmup_observations", "-1", "1001", "0", "1000"},
+        {"controller_probe_fraction", "0", "0.91", "0.01", "0.9"},
+        {"controller_probe_after_confirmations", "0", "100001", "1", "200"},
+        {"controller_probe_confirmations", "0", "1001", "1", "1000"},
+        {"controller_probe_fail_bump", "-0.01", "1.01", "0", "1"},
+        {"controller_ff_margin", "0.99", "4.01", "1", "4"},
+        {"controller_ff_max_age_blocks", "0", "4609", "1", "4608"},
+        {"controller_budget_reserve_cancels", "-1", "1001", "0", "1000"},
+        {"controller_cost_offer_attached", "99999", "5500000001", "100000", "5500000000"},
+        {"controller_cost_cancel_xch", "99999", "5500000001", "100000", "5500000000"},
+        {"controller_cost_cancel_cat", "99999", "5500000001", "100000", "5500000000"},
+        {"controller_cost_take", "99999", "5500000001", "100000", "5500000000"},
+    };
+    for (const Case& c : cases) {
+        SCOPED_TRACE(c.key);
+        const std::string k = std::string("  ") + c.key + ": ";
+        expect_config_error_containing(with_fees(k + c.bad_lo + "\n"), c.key);
+        expect_config_error_containing(with_fees(k + c.bad_hi + "\n"), c.key);
+        expect_loads(with_fees(k + c.ok_lo + "\n"));
+        expect_loads(with_fees(k + c.ok_hi + "\n"));
+    }
+}
+
+TEST(FeeControllerConfig, BackoffCapBelowTheBaseIntervalThrows) {
+    expect_config_error_containing(
+        with_fees("  controller_probe_after_confirmations: 50\n  controller_probe_backoff_cap: 49\n"),
+        "controller_probe_backoff_cap");
+    expect_loads(
+        with_fees("  controller_probe_after_confirmations: 50\n  controller_probe_backoff_cap: 50\n"));
+    // A negative cost is refused by the unsigned conversion, not wrapped.
+    TempYaml tmp(with_fees("  controller_cost_take: -5\n"));
+    EXPECT_ANY_THROW(xop::load_config(tmp.path()));
+}
+
+TEST(FeeControllerConfig, EnabledNeedsAPositiveMinFee) {
+    expect_config_error_containing(
+        with_fees("  controller_enabled: true\n  min_fee_mojos: 0\n"), "min_fee_mojos > 0");
+    // Off, a zero floor is still allowed, as it always was.
+    expect_loads(with_fees("  controller_enabled: false\n  min_fee_mojos: 0\n"));
+    expect_loads(with_fees("  controller_enabled: true\n  min_fee_mojos: 1\n"));
+}
+
+TEST(FeeControllerConfig, EnabledWithFeesDisabledWarnsThatItIsInert) {
+    CapturedLog log;
+    expect_loads(std::string(kMinimalValidYaml)
+                 + "\nfees:\n  enabled: false\n  controller_enabled: true\n");
+    EXPECT_TRUE(log.warned_containing("fee controller is inert")) << log.text();
+}
+
+TEST(FeeControllerConfig, StartupDumpPrintsEverySetting) {
+    // load_config logs the redacted summary as ONE info record.
+    CapturedLog log;
+    expect_loads(with_fees("  controller_enabled: true\n  cost_aware_estimate: true\n"));
+    const std::string text = log.text();
+    for (const char* needle : {"cost_aware_estimate = true", "controller = ON", "target=8 peak heights",
+                               "kp=1", "ki=0.5", "kd=0.5", "max_error=2", "max_step_up=1",
+                               "min_raise=1", "warmup=3", "controller_probe = -15% after 8",
+                               "good after 3", "fail_bump=+10%", "backoff_cap=256",
+                               "controller_ff = x1.1 max_age=32 reserve_cancels=25",
+                               "attached 21000000", "cancel_xch 8400000",
+                               "cancel_cat 42300000", "take 125000000"}) {
+        EXPECT_NE(text.find(needle), std::string::npos) << "missing: " << needle << "\n" << text;
+    }
+}
+
 TEST(PaceConfig, DefaultsKeepFeatureOff) {
     TempYaml tmp(kMinimalValidYaml);
     const auto cfg = xop::load_config(tmp.path());
@@ -3176,6 +3437,221 @@ TEST(PaceConfig, ParsesAllKeysAndUppercasesAssets) {
     EXPECT_EQ(strategy.pace_max_balance_age_blocks, 30u);
     EXPECT_DOUBLE_EQ(strategy.pace_reprice_min_bps, 40.0);
     EXPECT_EQ(strategy.pace_reprice_min_age_blocks, 120u);
+}
+
+// ===========================================================================
+// [S70-S72 2026-09-20] The three cancel-reduction switches, through the PARSER.
+//
+// Each switch changes what the bot CANCELS, so the properties that matter
+// are: the default is the rule that existed before the key did; a mode is a
+// closed vocabulary (a typo must not silently keep the old rule while the
+// operator believes the new one is on); and `expire` cannot be selected with
+// nothing to expire.
+//
+// (Placed mid-file on purpose: two open branches add their config tests at the
+// top of the PaceConfig suite and at the end of this file, and these tests need
+// the helpers defined above both.)
+// ===========================================================================
+
+TEST(CancelReductionConfig, DefaultsAreTheRulesThatExistedBeforeTheKeys) {
+    TempYaml tmp(kMinimalValidYaml);
+    const auto cfg = xop::load_config(tmp.path());
+    const xop::StrategyConfig& s = cfg.strategy;
+    EXPECT_EQ(s.ttl_cancel_mode, xop::TtlCancelMode::Cancel);
+    EXPECT_EQ(s.exposure_rule, xop::ExposureRule::Legacy);
+    EXPECT_EQ(s.price_cancel_mode, xop::PriceCancelMode::Deviation);
+    EXPECT_DOUBLE_EQ(s.exposure_cancel_hysteresis_pct, 0.25);
+    EXPECT_EQ(s.exposure_cancel_min_age_blocks, 32u);
+    EXPECT_DOUBLE_EQ(s.price_cancel_edge_retain, 0.5);
+    // A default-constructed StrategyConfig (what the tests that never load a
+    // file get) agrees with the parser.
+    const xop::StrategyConfig fresh{};
+    EXPECT_EQ(fresh.ttl_cancel_mode, xop::TtlCancelMode::Cancel);
+    EXPECT_EQ(fresh.exposure_rule, xop::ExposureRule::Legacy);
+    EXPECT_EQ(fresh.price_cancel_mode, xop::PriceCancelMode::Deviation);
+}
+
+TEST(CancelReductionConfig, ParsesEveryKey) {
+    TempYaml tmp(pace_with_strategy(
+        "  offer_expiry_secs: 86400\n"
+        "  ttl_cancel_mode: expire\n"
+        "  exposure_rule: unified\n"
+        "  exposure_cancel_hysteresis_pct: 0.4\n"
+        "  exposure_cancel_min_age_blocks: 96\n"
+        "  price_cancel_mode: margin\n"
+        "  price_cancel_edge_retain: 0.75\n"));
+    const auto cfg = xop::load_config(tmp.path());
+    const xop::StrategyConfig& s = cfg.strategy;
+    EXPECT_EQ(s.ttl_cancel_mode, xop::TtlCancelMode::Expire);
+    EXPECT_EQ(s.exposure_rule, xop::ExposureRule::Unified);
+    EXPECT_EQ(s.price_cancel_mode, xop::PriceCancelMode::Margin);
+    EXPECT_DOUBLE_EQ(s.exposure_cancel_hysteresis_pct, 0.4);
+    EXPECT_EQ(s.exposure_cancel_min_age_blocks, 96u);
+    EXPECT_DOUBLE_EQ(s.price_cancel_edge_retain, 0.75);
+}
+
+TEST(CancelReductionConfig, TheRollbackValuesParseExplicitly) {
+    // The rollback for each switch is to WRITE the old mode, not only to
+    // delete the key -- so the old names must be accepted, not just implied.
+    TempYaml tmp(pace_with_strategy(
+        "  ttl_cancel_mode: cancel\n"
+        "  exposure_rule: legacy\n"
+        "  price_cancel_mode: deviation\n"));
+    const auto cfg = xop::load_config(tmp.path());
+    EXPECT_EQ(cfg.strategy.ttl_cancel_mode, xop::TtlCancelMode::Cancel);
+    EXPECT_EQ(cfg.strategy.exposure_rule, xop::ExposureRule::Legacy);
+    EXPECT_EQ(cfg.strategy.price_cancel_mode, xop::PriceCancelMode::Deviation);
+}
+
+TEST(CancelReductionConfig, NullKeepsTheDefault) {
+    expect_loads(pace_with_strategy(
+        "  ttl_cancel_mode: ~\n"
+        "  exposure_rule: ~\n"
+        "  price_cancel_mode: ~\n"
+        "  exposure_cancel_hysteresis_pct: ~\n"
+        "  exposure_cancel_min_age_blocks: ~\n"
+        "  price_cancel_edge_retain: ~\n"));
+}
+
+TEST(CancelReductionConfig, AnUnknownModeThrowsRatherThanFallingBack) {
+    struct Row {
+        const char* key{nullptr};
+        const char* value{nullptr};
+    };
+    const Row rows[] = {
+        {"ttl_cancel_mode", "expired"},     {"ttl_cancel_mode", "Expire"},
+        {"ttl_cancel_mode", "true"},        {"ttl_cancel_mode", "1"},
+        {"ttl_cancel_mode", "[expire]"},
+        {"exposure_rule", "unifed"},        {"exposure_rule", "UNIFIED"},
+        {"exposure_rule", "{a: b}"},
+        {"price_cancel_mode", "margins"},   {"price_cancel_mode", "edge"},
+        {"price_cancel_mode", "[margin]"},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(std::string(row.key) + ": " + row.value);
+        expect_config_error_containing(
+            pace_with_strategy("  offer_expiry_secs: 86400\n"
+                               + std::string("  ") + row.key + ": " + row.value + "\n"),
+            row.key);
+    }
+}
+
+TEST(CancelReductionConfig, OutOfRangeAndNonFiniteThrow) {
+    struct Row {
+        const char* key{nullptr};
+        const char* value{nullptr};
+    };
+    const Row rows[] = {
+        {"exposure_cancel_hysteresis_pct", "-0.0001"},
+        {"exposure_cancel_hysteresis_pct", "1.0001"},
+        {"exposure_cancel_hysteresis_pct", ".nan"},
+        {"exposure_cancel_hysteresis_pct", ".inf"},
+        {"exposure_cancel_min_age_blocks", "-1"},
+        {"exposure_cancel_min_age_blocks", "4609"},
+        // (0, 1]: 0 would mean "never cancel for price".
+        {"price_cancel_edge_retain", "0"},
+        {"price_cancel_edge_retain", "-0.5"},
+        {"price_cancel_edge_retain", "1.0001"},
+        {"price_cancel_edge_retain", ".nan"},
+        {"price_cancel_edge_retain", ".inf"},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(std::string(row.key) + ": " + row.value);
+        expect_config_error_containing(
+            pace_with_strategy(std::string("  ") + row.key + ": " + row.value + "\n"),
+            row.key);
+    }
+}
+
+TEST(CancelReductionConfig, TheRangeEndsAreLegal) {
+    // hysteresis 0 (cancel at the reserve) and 1 (suppress only) are both
+    // documented operator levers; min age 0 spares nothing; retain 1.0 is the
+    // literal rule.
+    expect_loads(pace_with_strategy(
+        "  exposure_cancel_hysteresis_pct: 0\n"
+        "  exposure_cancel_min_age_blocks: 0\n"
+        "  price_cancel_edge_retain: 1.0\n"));
+    expect_loads(pace_with_strategy(
+        "  exposure_cancel_hysteresis_pct: 1\n"
+        "  exposure_cancel_min_age_blocks: 4608\n"));
+}
+
+TEST(CancelReductionConfig, ExpireWithNothingToExpireIsRefused) {
+    // With no expiry on the strategy or any pair, `expire` spares no offer --
+    // yet the config would read as "age cancels are off".
+    expect_config_error_containing(
+        pace_with_strategy("  ttl_cancel_mode: expire\n"), "ttl_cancel_mode");
+    expect_config_error_containing(
+        pace_with_strategy("  ttl_cancel_mode: expire\n  offer_expiry_secs: 0\n"),
+        "offer_expiry_secs");
+    // A pair that explicitly opts OUT does not count as an expiry either.
+    expect_config_error_containing(
+        pace_after_first_pair(pace_with_strategy("  ttl_cancel_mode: expire\n"),
+                              "    offer_expiry_secs_override: 0\n"),
+        "ttl_cancel_mode");
+}
+
+TEST(CancelReductionConfig, ExpireCountsEachPairsEffectiveExpiry) {
+    // [review #164] A present 0 override BINDS (effective_offer_expiry_secs),
+    // so a global expiry that the only pair opts out of attaches no timelock
+    // to anything.  The first revision counted the global regardless.
+    expect_config_error_containing(
+        pace_after_first_pair(
+            pace_with_strategy("  ttl_cancel_mode: expire\n  offer_expiry_secs: 86400\n"),
+            "    offer_expiry_secs_override: 0\n"),
+        "ttl_cancel_mode");
+    // Two enabled pairs, one opted out, one inheriting the global: satisfied.
+    expect_loads(pace_after_first_pair(
+        pace_with_strategy("  ttl_cancel_mode: expire\n  offer_expiry_secs: 86400\n"),
+        "    offer_expiry_secs_override: 0\n"
+        "  - base_asset_id: \"xch\"\n"
+        "    quote_asset_id: \"" + std::string(kTest2) + "\"\n"
+        "    name: \"XCH/OTHER\"\n"
+        "    enabled: true\n"));
+}
+
+TEST(CancelReductionConfig, ExpireIgnoresPairsThatPostNothing) {
+    // The enabled pair opts out; the only pair with an effective expiry is
+    // DISABLED, so no offer this engine posts carries one.
+    expect_config_error_containing(
+        pace_after_first_pair(
+            pace_with_strategy("  ttl_cancel_mode: expire\n  offer_expiry_secs: 86400\n"),
+            "    offer_expiry_secs_override: 0\n"
+            "  - base_asset_id: \"xch\"\n"
+            "    quote_asset_id: \"" + std::string(kTest2) + "\"\n"
+            "    name: \"XCH/OTHER\"\n"
+            "    enabled: false\n"),
+        "ENABLED pair");
+    // No enabled pair at all: nothing is posted, so there is nothing for the
+    // mode to mislead about -- an operator who has parked every pair must
+    // still be able to start the engine.
+    std::string parked = pace_with_strategy("  ttl_cancel_mode: expire\n");
+    const std::string on = "    enabled: true\n";
+    const auto at = parked.find(on);
+    ASSERT_NE(at, std::string::npos);
+    parked.replace(at, on.size(), "    enabled: false\n");
+    expect_loads(parked);
+}
+
+TEST(CancelReductionConfig, ExpireIsSatisfiedByTheGlobalOrByOnePair) {
+    expect_loads(pace_with_strategy(
+        "  ttl_cancel_mode: expire\n  offer_expiry_secs: 86400\n"));
+    expect_loads(pace_after_first_pair(
+        pace_with_strategy("  ttl_cancel_mode: expire\n"),
+        "    offer_expiry_secs_override: 86400\n"));
+    // The default mode asks for nothing.
+    expect_loads(pace_with_strategy("  ttl_cancel_mode: cancel\n"));
+}
+
+TEST(CancelReductionConfig, ModeNamesRoundTripThroughToString) {
+    // The startup summary and the log print these; the names are the ones
+    // the parser accepts, so what is printed can be pasted back.
+    EXPECT_STREQ(xop::to_string(xop::TtlCancelMode::Cancel), "cancel");
+    EXPECT_STREQ(xop::to_string(xop::TtlCancelMode::Expire), "expire");
+    EXPECT_STREQ(xop::to_string(xop::ExposureRule::Legacy), "legacy");
+    EXPECT_STREQ(xop::to_string(xop::ExposureRule::Unified), "unified");
+    EXPECT_STREQ(xop::to_string(xop::PriceCancelMode::Deviation), "deviation");
+    EXPECT_STREQ(xop::to_string(xop::PriceCancelMode::Margin), "margin");
 }
 
 TEST(PaceConfig, NonFiniteDoubleKeysThrow) {
@@ -3312,4 +3788,60 @@ TEST(PaceConfig, EnabledWithEmptyAssetsWarns) {
     CapturedLog log;
     expect_loads(pace_with_strategy("  pace_enabled: true\n"));
     EXPECT_TRUE(log.warned_containing("pace_assets is empty")) << log.text();
+}
+
+// ============================================================================
+// [MIN-INPUT-COIN] strategy.offer_min_input_coin_frac
+//
+// The arithmetic is pinned in test_offer_min_input_coin.cpp; this is only the
+// parse: the default protects an unconfigured deployment, 0 is a real setting,
+// and everything outside [0, 1) is refused at load rather than reaching the
+// wallet as a floor nobody chose.
+// ============================================================================
+
+TEST(ConfigParserTest, OfferMinInputCoinFracDefaultsToOnePercent) {
+    TempYaml tmp(kMinimalValidYaml);
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_DOUBLE_EQ(cfg.strategy.offer_min_input_coin_frac, 0.01);
+}
+
+TEST(ConfigParserTest, OfferMinInputCoinFracIsOverridable) {
+    TempYaml tmp(with_strategy_keys("\n  offer_min_input_coin_frac: 0.025"));
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_DOUBLE_EQ(cfg.strategy.offer_min_input_coin_frac, 0.025);
+}
+
+TEST(ConfigParserTest, OfferMinInputCoinFracZeroDisablesAndIsAccepted) {
+    // 0 must bind as "send no floor", not be rejected as non-positive and
+    // not fall back to the default.
+    TempYaml tmp(with_strategy_keys("\n  offer_min_input_coin_frac: 0"));
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_DOUBLE_EQ(cfg.strategy.offer_min_input_coin_frac, 0.0);
+}
+
+TEST(ConfigParserTest, OfferMinInputCoinFracNullKeepsTheDefault) {
+    TempYaml tmp(with_strategy_keys("\n  offer_min_input_coin_frac: ~"));
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_DOUBLE_EQ(cfg.strategy.offer_min_input_coin_frac, 0.01);
+}
+
+TEST(ConfigParserTest, OfferMinInputCoinFracAcceptsJustBelowOne) {
+    TempYaml tmp(with_strategy_keys("\n  offer_min_input_coin_frac: 0.999"));
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_DOUBLE_EQ(cfg.strategy.offer_min_input_coin_frac, 0.999);
+}
+
+TEST(ConfigParserTest, OfferMinInputCoinFracOutsideTheRangeIsRejected) {
+    // 1 would demand a single coin at least as large as the whole offer; a
+    // negative or non-finite value has no meaning at all.  .nan is the row
+    // only the finiteness test can reject: every range comparison is false
+    // for it.
+    for (const char* v : {"1", "1.0", "1.5", "-0.01", "-1", ".nan", ".inf",
+                          "-.inf"}) {
+        SCOPED_TRACE(v);
+        expect_config_error_containing(
+            with_strategy_keys(std::string("\n  offer_min_input_coin_frac: ")
+                               + v),
+            "offer_min_input_coin_frac");
+    }
 }

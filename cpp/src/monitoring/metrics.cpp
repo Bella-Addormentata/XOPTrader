@@ -403,6 +403,21 @@ void MetricsExporter::register_metrics()
         .Register(*registry_)
         .Add({});
 
+    // [S67] Same family prefix as the gauge above.  Both read 0 until the
+    // controller is enabled and first reports.
+    fees_controller_rate_gauge_ = &prometheus::BuildGauge()
+        .Name("xop_fees_controller_rate_mojos_per_cost")
+        .Help("Fee controller: effective fee rate in mojos per unit of CLVM "
+              "cost, node feed-forward floor included")
+        .Register(*registry_)
+        .Add({});
+    fees_controller_level_gauge_ = &prometheus::BuildGauge()
+        .Name("xop_fees_controller_level_log2")
+        .Help("Fee controller: learned level, log2 over the min_fee anchor "
+              "(0 = a CAT cancel pays fees.min_fee_mojos)")
+        .Register(*registry_)
+        .Add({});
+
     trade_decision_counter_family_ = &prometheus::BuildCounter()
         .Name("xop_trade_decision_total")
         .Help("Cumulative trade decision-tree branch events")
@@ -990,6 +1005,15 @@ void MetricsExporter::update_fees_paid_24h(std::uint64_t total_mojos)
     if (!running_) return;
 
     fees_paid_24h_gauge_->Set(static_cast<double>(total_mojos));
+}
+
+void MetricsExporter::update_fee_controller(double rate_mojos_per_cost, double level_log2)
+{
+    std::unique_lock lock(mtx_);
+    if (!running_ || !fees_controller_rate_gauge_ || !fees_controller_level_gauge_) return;
+
+    fees_controller_rate_gauge_->Set(rate_mojos_per_cost);
+    fees_controller_level_gauge_->Set(level_log2);
 }
 
 void MetricsExporter::increment_trade_decision(

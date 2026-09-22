@@ -73,6 +73,8 @@
 // NOT part of the greppable-extraction list.
 #include "xop/util/denom_format.hpp"
 #include "xop/util/shutdown_flag.hpp"
+#include "xop/execution/kept_book.hpp"
+#include "xop/execution/offer_expiry.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -112,7 +114,8 @@ namespace {
 // Two saturated summands overflow a signed int64, which is UNDEFINED
 // BEHAVIOUR, not a wrap: the compiler is entitled to assume it cannot happen
 // and optimise on that basis, and the number it corrupts feeds
-// exposure_breaches_reserve() and therefore can_bid/can_ask -- a quoting kill
+// decide_exposure() [S71; then exposure_breaches_reserve()] and therefore
+// can_bid/can_ask -- a quoting kill
 // switch.
 //
 // Unreachable today: these loops iterate only over OUR OWN offers and
@@ -535,6 +538,40 @@ Engine::Engine(const AppConfig& config, bool dry_run,
                  config_.strategy.detect_fills_backoff_interval,
                  execution::kReconcileStopAfterOldPages,
                  execution::kReconcileScanSlackSecs / 3600);
+    // [S74 2026-09-20] Operator eyeball line for the stop policy, and the one
+    // combination worth a warning: "keep" leaves offers takeable with no engine
+    // behind them, and the on-chain expiry is the only thing that bounds that.
+    spdlog::info("[Engine] Stop policy: engine.shutdown_offers={} -- a stop "
+                 "whose request names no policy (Ctrl+C, SIGTERM, a service "
+                 "stop, an OS session end, a pre-policy GUI, a hand-written "
+                 "shutdown.flag) will {}; a request carrying \"offers=cancel\" "
+                 "or \"offers=keep\" overrides this default",
+                 util::stop_offers_policy_name(config_.engine.shutdown_offers),
+                 util::stop_book_action_name(
+                     util::plan_stop_offers(util::StopOffersRequest::Unspecified,
+                                            config_.engine.shutdown_offers,
+                                            /*dry_run=*/false).action));
+    if (config_.engine.shutdown_offers == util::StopOffersPolicy::Keep) {
+        std::string no_expiry_pairs;
+        for (const auto& pair : config_.pairs) {
+            if (!pair.enabled) continue;
+            if (execution::effective_offer_expiry_secs(
+                    pair.offer_expiry_secs_override,
+                    config_.strategy.offer_expiry_secs) == 0) {
+                no_expiry_pairs += (no_expiry_pairs.empty() ? "" : ", ") + pair.name;
+            }
+        }
+        if (!no_expiry_pairs.empty()) {
+            spdlog::warn("[Engine] [S74] engine.shutdown_offers is \"keep\" but "
+                         "these enabled pairs post offers with NO on-chain "
+                         "expiry (offer_expiry_secs is 0): {}. An offer kept "
+                         "across a stop on them stays takeable, unmanaged, until "
+                         "an engine or the operator cancels it -- however long "
+                         "the engine is down. Set strategy.offer_expiry_secs (or "
+                         "the pair's offer_expiry_secs_override), or use "
+                         "\"cancel\".", no_expiry_pairs);
+        }
+    }
 
     // -- Database (must be first: other subsystems may query on construction) --
     db_ = std::make_unique<Database>(config_.database.path);
@@ -597,6 +634,64 @@ Engine::Engine(const AppConfig& config, bool dry_run,
     offer_mgr_->set_abort_predicate([this] {
         return watchdog_fired_.load(std::memory_order_acquire);
     });
+    // [S67, review #163] Every secure cancel the wallet accepts opens its fee
+    // ticket HERE, with the fee it really paid and the height it was
+    // submitted at.  Inert unless fees.controller_enabled.  Runs on the
+    // engine's strand: the dead man's switch cancels through its own wallet
+    // client, never through OfferManager.
+    offer_mgr_->set_cancel_observer([this](const std::string& id, std::uint64_t fee) {
+        fee_feedback_track_cancel(id, fee);
+    });
+    // [S74 / review #165, round 4] ...and the one that only STOPS CREATING.
+    // Once a stop is latched, no further create begins -- and nothing that
+    // already exists is cancelled, which is what makes this usable by a keep
+    // stop where set_abort_predicate is not. It is what makes the drain's
+    // budget a real bound: the keep stop then waits for the ONE create already
+    // in flight, never for the rest of a ladder that goes on starting new ones
+    // in the gaps of its own poll timer (TODO S76 (a)).
+    //
+    // stop_requested_, not the keep latch: a CANCELLING stop must not post a
+    // fresh book on top of the sweep it is running over the same coins either.
+    offer_mgr_->set_stop_creating_predicate([this] {
+        return stop_requested_.load(std::memory_order_acquire);
+    });
+    // [S74 / review #165] The flag a KEEP stop's drain waits on. OfferManager
+    // sets it while a create_offer is outstanding and the offer it makes is
+    // not yet in State -- the only window in which stopping the io_context can
+    // leave a live offer this process never recorded. Without this wiring the
+    // drain would always see "nothing in flight" and stop straight through it.
+    offer_mgr_->set_posting_in_flight_flag(&posting_in_flight_);
+    // [S74 / review #165, round 4] ...and the flag that says a create ended
+    // with no answer at all. The drain flag cannot carry that: it is cleared
+    // by RAII when the create throws, because nothing is then left for the
+    // io_context to wait for -- so the fact has to be recorded, not waited on.
+    offer_mgr_->set_create_outcome_unknown_flag(&create_outcome_unknown_);
+    // [S74 / review round 3] ...and HOW LONG that drain may wait, sized to the
+    // window it waits on rather than to a round number: one create's whole
+    // retry ladder, plus the publish that stands between the wallet's answer
+    // and the offer entering State. Two rpc_post calls, each up to
+    // request_timeout x attempts plus backoff. The wallet's timeout is read
+    // from the client, exactly as the S46 cancel ladder reads it; the retry
+    // knobs are the clients' own defaults, which this engine never overrides
+    // (above: host, port and TLS only). Computed HERE and not in shutdown(),
+    // which a POSIX signal can run on any thread -- see engine.hpp.
+    {
+        const auto rpc_worst_case = [](std::int64_t  timeout_ms,
+                                       std::uint64_t retries,
+                                       std::int64_t  backoff_ms) {
+            return util::rpc_call_worst_case_ms(
+                timeout_ms > 0 ? static_cast<std::uint64_t>(timeout_ms) : 0ull,
+                retries + 1ull,
+                backoff_ms > 0 ? static_cast<std::uint64_t>(backoff_ms) : 0ull);
+        };
+        const rpc::DexieConfig dexie_defaults{};
+        keep_stop_drain_budget_ms_ = util::keep_stop_drain_budget_ms(
+            rpc_worst_case(wal_cfg.request_timeout.count(), wal_cfg.max_retries,
+                           wal_cfg.retry_base_delay.count()),
+            rpc_worst_case(dexie_defaults.request_timeout.count(),
+                           static_cast<std::uint64_t>(dexie_defaults.max_retries),
+                           dexie_defaults.retry_base_delay.count()));
+    }
     // A late offer that could not be cancelled has to reach the operator.
     // The watchdog's own alert says a cancel of every resting offer was
     // SUBMITTED -- and this trade was created after that request enumerated
@@ -1103,6 +1198,19 @@ void Engine::watchdog_cancel_book(const std::string&              why,
     // declaration for why concurrent entry is worse than a slow one.
     const std::lock_guard<std::mutex> cancel_lock(watchdog_cancel_mtx_);
 
+    // [S74 2026-09-20] A KEEP stop sends no cancel -- this one included.
+    // shutdown() sets the latch before it does anything else, and it is read
+    // HERE, under the mutex every route into this function takes, rather than
+    // in watchdog_loop(): a tick that passed the watchdog_stop_ check a moment
+    // before the operator's stop would otherwise still fire over a book the
+    // operator had just asked to keep.
+    if (offers_kept_on_stop_.load(std::memory_order_acquire)) {
+        spdlog::warn("[Engine] [S74] the dead man's switch path was reached "
+                     "during a stop that KEEPS the resting offers ({}) -- NOT "
+                     "cancelling: the operator's keep stands", why);
+        return;
+    }
+
     // [S46] The ids, rendered once, for every outcome branch below. The
     // 2026-09-02 alert told the operator to "cancel them by hand NOW" and
     // then did not say which -- so the only way to find out was to query
@@ -1471,7 +1579,39 @@ void Engine::shutdown()
         return;  // Already shutting down or stopped.
     }
 
+    // [S74 2026-09-20] WHAT THIS STOP DOES WITH THE BOOK.
+    //
+    // The request's policy (a shutdown.flag "offers=" line, latched by
+    // evaluate_shutdown_flag) or else engine.shutdown_offers; a signal carries
+    // none. The table is util::plan_stop_offers, and dry run is decided inside
+    // it, first. config_.engine is never written after construction, so this
+    // read is safe on whichever thread a signal delivers us on.
+    const util::StopOffersPlan stop_plan = util::plan_stop_offers(
+        stop_offers_request_.load(std::memory_order_acquire),
+        config_.engine.shutdown_offers, dry_run_);
+    const bool cancels_book = stop_plan.action == util::StopBookAction::CancelBook;
+    const bool keeps_book   = stop_plan.action == util::StopBookAction::KeepBook;
+    if (keeps_book) {
+        // FIRST, before a log line or a status change can take any time: the
+        // latch that turns watchdog_cancel_book() into a no-op, then the flag
+        // that ends the watchdog loop within its one-second tick. The thread
+        // is JOINED where it always was, in run() after ioc_.run() returns --
+        // not here, because a POSIX signal can deliver shutdown() ON the
+        // watchdog thread, and a thread cannot join itself.
+        //
+        // Disarming at the top of shutdown() is exactly what the cancel path
+        // must never do (engine.hpp, graceful_cancel_active_): there a wedged
+        // stop would leave a book the operator asked to be rid of. Here the
+        // operator asked for the book to STAY, so a wedged stop that ends in a
+        // hard kill leaves precisely what was asked for.
+        offers_kept_on_stop_.store(true, std::memory_order_release);
+        watchdog_stop_.store(true, std::memory_order_relaxed);
+    }
+
     spdlog::info("[Engine] Shutdown requested");
+    spdlog::warn("[Engine] [S74] this stop will {} ({})",
+                 util::stop_book_action_name(stop_plan.action),
+                 util::stop_policy_source_name(stop_plan.source));
     state_->set_status(BotStatus::ShuttingDown);
 
     // [review] A shutdown just requested is not a stall. The heartbeat is
@@ -1494,7 +1634,12 @@ void Engine::shutdown()
     // appeared -- the exact duplicate-spend race the claim exists to
     // prevent, reopened by its own delivery latency. The coroutine's
     // ClaimGuard still clears it when the cancel completes.
-    if (!dry_run_) {
+    //
+    // [S74] Only a stop that CANCELS claims anything. `cancels_book` is
+    // `!dry_run_` narrowed by the stop policy; a keep stop has no cancel for
+    // the claim to describe, and operator Cancel All reads this flag to decide
+    // whether a shutdown's sweep is about to take over from it.
+    if (cancels_book) {
         graceful_cancel_started_ms_.store(
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count(),
@@ -1524,9 +1669,13 @@ void Engine::shutdown()
     //
     // ISO/IEC 5055: no blocking .get()/.wait() calls; fully async teardown.
     // ISO/IEC 27001:2022: all cancellation outcomes are audit-logged.
-    asio::co_spawn(ioc_, [this]() -> asio::awaitable<void> {
+    asio::co_spawn(ioc_, [this, cancels_book, keeps_book]() -> asio::awaitable<void> {
         // --- Cancel outstanding offers (skip in dry-run mode) ---
-        if (!dry_run_) {
+        // [S74] ...and skip when the stop KEEPS the book. EVERY cancel this
+        // function can send, the intent file and the cancel_pending rows live
+        // inside this one block, and tests/test_stop_keep_wiring.py pins that:
+        // a cancel site added outside it would run on a keep stop too.
+        if (cancels_book) {
             // The claim was published synchronously in shutdown() -- see
             // the note there. This guard is what CLEARS it once the cancel
             // completes (or fails), so the watchdog resumes its own
@@ -2109,6 +2258,58 @@ void Engine::shutdown()
             } catch (const std::exception& ex) {
                 spdlog::error("[Engine] cancel_all exception: {}", ex.what());
             }
+        } else if (keeps_book) {
+            // [review #165] LET AN IN-FLIGHT CREATE LAND FIRST. A shutdown.flag
+            // stop is read between cycles and never finds one; a SIGNAL can
+            // arrive while post_quotes is suspended in create_offer or in the
+            // Dexie submission that follows it. Stopping the io_context then
+            // would let the wallet finish a create with nobody left to record
+            // it, and the next boot may CANCEL that orphan
+            // (util::keep_stop_drain_step has the whole argument). The only
+            // thing awaited here is a timer -- never an RPC -- and the wait is
+            // bounded, so a wallet that never answers cannot turn a stop into
+            // a hang. The budget was sized in the CONSTRUCTOR from the
+            // clients' own timeouts (engine.hpp keep_stop_drain_budget_ms_),
+            // so the keep branch itself touches no client and a signal-thread
+            // shutdown() reads a number rather than building a config.
+            const auto drain_t0 = std::chrono::steady_clock::now();
+            std::uint64_t waited_for_post_ms = 0;
+            bool post_abandoned = false;
+            bool drain_announced = false;
+            for (;;) {
+                waited_for_post_ms = static_cast<std::uint64_t>(
+                    std::max<std::int64_t>(
+                        0, std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now() - drain_t0)
+                               .count()));
+                const util::KeepStopDrainStep drain = util::keep_stop_drain_step(
+                    posting_in_flight_, waited_for_post_ms,
+                    keep_stop_drain_budget_ms_);
+                if (drain == util::KeepStopDrainStep::Proceed) break;
+                if (drain == util::KeepStopDrainStep::GiveUp) {
+                    post_abandoned = true;
+                    break;
+                }
+                if (!drain_announced) {
+                    drain_announced = true;
+                    spdlog::warn("[Engine] [S74] KEEP stop: an offer create is "
+                                 "in flight (this stop arrived by signal, inside "
+                                 "a heartbeat cycle) -- waiting up to {} ms, one "
+                                 "create's worst case, for it to land so the "
+                                 "offer is recorded, not orphaned",
+                                 keep_stop_drain_budget_ms_);
+                }
+                asio::steady_timer drain_timer(ioc_);
+                drain_timer.expires_after(
+                    std::chrono::milliseconds(util::kKeepStopDrainPollMs));
+                co_await drain_timer.async_wait(asio::use_awaitable);
+            }
+
+            // [S74] No cancel, no intent file, no row changed, no RPC at all:
+            // a plain function, so nothing in it can await one. From here to
+            // ioc_.stop() below nothing suspends either, so no other coroutine
+            // (a heartbeat cycle, an operator Cancel All) runs again.
+            report_offers_kept_on_stop(waited_for_post_ms, post_abandoned);
         }
 
         // --- Post-cancel cleanup (runs on io_context, no deadlock) ---
@@ -2132,6 +2333,180 @@ void Engine::shutdown()
 
         co_return;
     }, asio::detached);
+}
+
+// [S74 2026-09-20] The whole of what a KEEP stop does about the book.
+//
+// TWO things, neither of which can reach the wallet:
+//
+//   1. FLUSH. Every offer in State gets an offer_log row if it has none. The
+//      next boot's startup_reconcile splits the wallet's open offers into
+//      "known" (restored as they are) and "orphan" (re-priced, and cancelled if
+//      the price no longer suits) BY offer_log -- so an offer this stop promised
+//      to keep must not arrive there unknown. Rows are normally written right
+//      after post_quotes and by the periodic reconcile mirror; a stop that
+//      lands between an offer entering State and either of those is the gap.
+//      An EXISTING row is never touched: pending stays pending, cancel_pending
+//      stays cancel_pending.
+//   2. SAY SO. One line, at warn so the file sink flushes it even if the GUI's
+//      stop window then hard-kills the process (main.cpp flush_on(warn)).
+//
+// What it deliberately does NOT do, each pinned by tests/
+// test_stop_keep_wiring.py over this function's text: await anything, call the
+// wallet, the full node, Dexie or OfferManager, write or clear the cancel
+// intent file, or write an offer status. The intent file a previous process
+// left is left exactly as it is -- those cancels were ordered, and the next
+// engine's sweep still owns them.
+void Engine::report_offers_kept_on_stop(std::uint64_t waited_for_post_ms,
+                                        bool          post_abandoned)
+{
+    if (!book_restored_from_offer_log_) {
+        // The stop landed in boot, before offer_log's pending rows were
+        // restored into State. State is empty because nothing was LOADED, not
+        // because nothing rests -- so an "N offers left resting" line here
+        // would report this process's ignorance as a fact about the book.
+        spdlog::warn("[Engine] [S74] KEEP stop during startup, before this "
+                     "process had restored the book from offer_log: whatever "
+                     "was resting in the wallet is STILL RESTING and was not "
+                     "counted. No cancel was sent, no cancel intent was "
+                     "written, and {}. The next engine start re-adopts the "
+                     "offers.",
+                     execution::describe_watchdog_disarm(
+                         watchdog_fired_.load(std::memory_order_acquire)));
+        return;
+    }
+
+    const auto all_offers = state_->get_all_offers();
+
+    std::size_t rows_added = 0;
+    std::size_t rows_failed = 0;
+    for (const auto& po : all_offers) {
+        try {
+            if (db_->query_offer_status(po.offer_id).has_value()) {
+                continue;  // it has a row: leave it exactly as it is
+            }
+            db_->insert_offer(offer_log_row_for(po));
+            ++rows_added;
+        } catch (const std::exception& e) {
+            ++rows_failed;
+            spdlog::warn("[Engine] [S74] could not give kept offer {} an "
+                         "offer_log row: {} -- the next start will meet it as "
+                         "an ORPHAN and may re-price or cancel it",
+                         po.offer_id, e.what());
+        }
+    }
+
+    std::vector<execution::KeptOfferFacts> facts;
+    facts.reserve(all_offers.size());
+    for (const auto& po : all_offers) {
+        execution::KeptOfferFacts fact;
+        fact.pair_name      = po.pair_name;
+        fact.cancel_pending = po.cancel_pending;
+        // Stamped only by the posting paths; an offer restored at boot or
+        // adopted from the wallet keeps the epoch default.
+        const auto posted = std::chrono::duration_cast<std::chrono::seconds>(
+            po.created_at_ts.time_since_epoch()).count();
+        fact.posted_unix_s = posted > 0 ? static_cast<std::int64_t>(posted) : 0;
+        const PairConfig* pair = find_pair_config(po.pair_name);
+        fact.expiry_secs = execution::effective_offer_expiry_secs(
+            pair != nullptr ? pair->offer_expiry_secs_override : std::nullopt,
+            config_.strategy.offer_expiry_secs);
+        facts.push_back(std::move(fact));
+    }
+    const auto now_unix_s = static_cast<std::int64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    const execution::KeptBookSummary summary =
+        execution::summarise_kept_book(facts, now_unix_s);
+
+    // [review] The switch clause is CONDITIONAL on watchdog_fired_, which is
+    // latched before any switch-initiated cancel and never cleared. engine.hpp
+    // refuses to state the disarm flatly -- a cancel the switch had already
+    // begun holds the mutex and is not recalled -- and neither does this line.
+    //
+    // [review -- round 6] The book clause is CONDITIONAL on the two
+    // untracked-create facts for the same reason. It is printed BEFORE the
+    // error lines below, and for a completely empty State it used to read
+    // "nothing was left on the book" -- a flat all-clear that those error
+    // lines never retract, because each of them qualifies only the COUNT.
+    // The facts are passed in, so the sentence is built from them under gtest
+    // (KeptBook in test_stop_offers_policy.cpp) rather than contradicted by
+    // them a few lines later.
+    spdlog::warn("[Engine] [S74] KEEP stop: {} No cancel was sent, no cancel "
+                 "intent was written, and {}.",
+                 execution::describe_kept_book(summary, post_abandoned,
+                                               create_outcome_unknown_),
+                 execution::describe_watchdog_disarm(
+                     watchdog_fired_.load(std::memory_order_acquire)));
+    if (rows_added > 0 || rows_failed > 0) {
+        spdlog::warn("[Engine] [S74] offer_log: {} kept offer(s) had no row and "
+                     "were given one so the next start restores them as known; "
+                     "{} could not be written", rows_added, rows_failed);
+    }
+    if (post_abandoned) {
+        // [review #165] The bounded wait ran out with post_quotes still
+        // awaiting the wallet. Say exactly what that can leave behind.
+        spdlog::error("[Engine] [S74] an offer post was STILL in flight after "
+                      "{} ms and this stop did not wait longer. If the wallet "
+                      "completes that create, it holds one offer this engine "
+                      "never recorded: the next start meets it as an ORPHAN and "
+                      "adopts it only if it is recent and not adversely priced "
+                      "-- otherwise it CANCELS it.", waited_for_post_ms);
+    } else if (waited_for_post_ms > 0) {
+        spdlog::warn("[Engine] [S74] waited {} ms for an in-flight offer post to "
+                     "land; what it created is recorded and counted above.",
+                     waited_for_post_ms);
+    }
+    if (create_outcome_unknown_) {
+        // [review #165, round 4] THE DRAIN CANNOT COVER THIS ONE, and saying
+        // nothing would make the two lines above a false all-clear. A create
+        // that failed with no answer from the wallet -- a timeout, an empty
+        // reply, a 5xx -- released its mark at once, because nothing was left
+        // for the io_context to wait for. It is not proof the wallet refused
+        // it: this engine may be stopping with an offer it never recorded.
+        // Waiting longer could not have helped, and re-asking the wallet is
+        // the one thing a keep stop must not do.
+        spdlog::error("[Engine] [S74] at least one offer create in this "
+                      "process ended with NO ANSWER from the wallet, which is "
+                      "not a refusal. If the wallet built that offer it is "
+                      "NOT in the count above: the next start meets it as an "
+                      "ORPHAN and adopts it only if it is recent and not "
+                      "adversely priced -- otherwise it CANCELS it. Check the "
+                      "wallet's open offers against this book before "
+                      "assuming the stop was clean. (A periodic reconcile may "
+                      "already have adopted it; this latch is never cleared.)");
+    }
+    if (heartbeat_in_flight_) {
+        // [review #165] Only a SIGNAL gets here mid-cycle: shutdown.flag is
+        // read between cycles. Anything the cycle was awaiting is cut: from
+        // here to ioc_.stop() nothing suspends, so it never resumes.
+        //
+        // [review -- MERGE BLOCKER] The wording is built by
+        // execution::describe_cut_cycle FROM THE TWO FACTS COMPUTED ABOVE, not
+        // written here. It used to end "No offer post was left unrecorded."
+        // unconditionally, which post_abandoned CONTRADICTS BY CONSTRUCTION --
+        // post_abandoned implies heartbeat_in_flight_, because the only path
+        // that sets posting_in_flight_ runs inside the marked cycle. The
+        // wiring scan over this file strips string literals and cannot see a
+        // sentence at all, so the claim lives where a gtest reads it.
+        spdlog::warn("[Engine] [S74] {}",
+                     execution::describe_cut_cycle(post_abandoned,
+                                                   create_outcome_unknown_));
+    }
+    if (cancel_all_inflight_) {
+        spdlog::warn("[Engine] [S74] an operator Cancel All was still in flight "
+                     "when this stop began. This stop sends nothing more and "
+                     "does not wait for it: whatever the wallet accepted shows "
+                     "there as PENDING_CANCEL, and the next start adopts those "
+                     "as cancel_pending.");
+    }
+    if (!cancel_intent_.empty()) {
+        spdlog::warn("[Engine] [S74] {} cancel intent(s) recovered from an "
+                     "earlier process are still unresolved; the intent file is "
+                     "left as it is and the next start keeps sweeping them. "
+                     "None of the offers kept by this stop was added to it.",
+                     cancel_intent_.size());
+    }
 }
 
 bool Engine::is_running() const noexcept
@@ -2214,6 +2589,11 @@ asio::awaitable<void> Engine::poll_loop_coro()
             // [LEDGER] Anchor for genesis: fills that settled at or below
             // this height are already inside the opening wallet balance.
             startup_block_ = startup_block;
+            // [S67, review #163 r2] startup_reconcile() below issues SECURE
+            // cancels before the first cycle; they are ticketed at THIS height.
+            // If it could not be read it stays 0 and those cancels get no
+            // ticket at all (fee_feedback_track_cancel).
+            fee_now_block_ = startup_block;
 
             // Load what the DB remembers as pending.
             auto db_pending = db_->query_pending_offers();
@@ -2397,6 +2777,10 @@ asio::awaitable<void> Engine::poll_loop_coro()
                 spdlog::info("[Engine] Restored {} pending offers from DB into State",
                              db_pending.size());
             }
+            // [S74] From here State describes the book. A KEEP stop that lands
+            // earlier in boot must not report "no offers were resting" about a
+            // book this process simply never loaded.
+            book_restored_from_offer_log_ = true;
 
             // -- [S14 2026-09-13] Wallet PENDING_CANCEL records -----------------
             // startup_reconcile keeps every PENDING_CANCEL trade its wallet scan
@@ -3190,6 +3574,17 @@ asio::awaitable<void> Engine::poll_loop_coro()
 
             // If we observed a new block, run the full heartbeat cycle.
             if (current_block > last_block_.load(std::memory_order_relaxed)) {
+                // [S74, review #165] Marked so a KEEP stop can say when it
+                // landed INSIDE a cycle. A shutdown.flag stop cannot: the
+                // flag is read above, between cycles. A SIGNAL can, and the
+                // keep continuation then runs the moment this cycle suspends
+                // in an RPC and stops the io_context -- see
+                // report_offers_kept_on_stop for what that can leave behind.
+                struct CycleMark {
+                    bool* flag;
+                    ~CycleMark() { *flag = false; }
+                } cycle_mark{&heartbeat_in_flight_};
+                heartbeat_in_flight_ = true;
                 co_await on_new_block_coro(current_block);
             }
         } catch (const std::exception& ex) {
@@ -3814,6 +4209,11 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
 {
     spdlog::info("[Engine] Processing block {}", block_height);
 
+    // [S67, review #163 r2] The height THIS cycle works at, for the fee
+    // controller's tickets.  last_block_ is stored only when a cycle ENDS, so
+    // during cycle N it still reads N-1 (or 0 before the first one finishes).
+    fee_now_block_ = block_height;
+
     auto cycle_start = std::chrono::steady_clock::now();
 
     // Clear per-cycle working state from the previous block.
@@ -4258,6 +4658,17 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
                       "retried next heartbeat", e.what());
     }
 
+    // [S67] The fee controller's feedback sweep: censored observations for
+    // spends of ours still pending past the target delay.  Beside the two
+    // sweeps above for the same reason -- "not trading" is no reason to stop
+    // learning that a cancel is stuck.  Pays nothing, posts nothing; inert
+    // unless fees.controller_enabled.
+    try { co_await fee_feedback_sweep(block_height); }
+    catch (const std::exception& e) {
+        spdlog::error("[Engine] [S67] fee feedback sweep failed: {} -- "
+                      "retried next heartbeat", e.what());
+    }
+
     // Gate Steps 7-8 when in XCH recovery mode (no market-making until
     // XCH balance is restored).
     if (xch_recovery_mode_) {
@@ -4304,8 +4715,14 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
     // trades, and a pause that stops passive posting while active taking
     // continues is not a pause -- the audit found the latch gated Step 8
     // alone while every taker path kept trading.
+    // [S74, review #165] ...and not after a stop was requested. 9f INITIATES
+    // taker trades. It sits BEFORE Step 8, so a keep stop's drain cannot hand
+    // control back here (the drain only waits on a create, which is inside
+    // Step 8) -- but a CANCELLING stop awaits its whole sweep, and this cycle
+    // resumes in every gap of it. The same gate covers Steps 9-13 below.
     if (!breaker_pause_active_
             && !watchdog_fired_.load(std::memory_order_acquire)
+            && !stop_requested_.load(std::memory_order_acquire)
             && wallet_step_may_run("Step 9f (drift corrector)")) {
         try { co_await step_run_drift_corrector(block_height); }
         catch (const std::exception& e) {
@@ -4449,6 +4866,30 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
     }
 
     } // end of !xch_recovery_mode_ block
+
+    // [S74, review #165] A STOP LATCHED WHILE THIS CYCLE WAS RUNNING ENDS IT
+    // HERE. The gate at the top of this function only sees a stop that arrived
+    // BETWEEN cycles; shutdown() is co_spawned onto the same io_context, so a
+    // stop delivered by a signal -- the only kind that can land mid-cycle --
+    // runs whenever this cycle suspends in an RPC, and a keep stop then waits
+    // (bounded) for an in-flight create, suspending itself and handing control
+    // back here. Without this gate the rest of the cycle carries on under a
+    // stop the operator has already asked for: Step 9c can SEND a crossed-book
+    // take_offer, and the ingest steps below open new wallet and node calls,
+    // all of them cut mid-flight by the ioc_.stop() that follows.
+    //
+    // Step 8 has its own checks (it re-reads the latch before posting and
+    // stops after the pair it was posting); everything after it is covered
+    // here. This is deliberately gated on stop_requested_, not on the keep
+    // latch alone: a CANCELLING stop must not start new takes either, and its
+    // sweep is running concurrently over the same coins.
+    if (stop_requested_.load(std::memory_order_acquire)) {
+        spdlog::warn("[Engine] block {} cut short: a stop was requested while "
+                     "this cycle was running -- Steps 9-13 (arbitrage takes, "
+                     "hedging, PnL, ingest, metrics, alerts) are NOT started",
+                     block_height);
+        co_return;
+    }
 
     if (!breaker_pause_active_
             && !watchdog_fired_.load(std::memory_order_acquire)) {
@@ -5014,9 +5455,33 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
     if (fee_tracker_->enabled() && config_.fees.adaptive_enabled
         && !wallet_only_mode_) {
         try {
-            auto est = co_await full_node_->get_fee_estimate(config_.fees.fee_estimate_target_seconds);
-            if (est > 0) {
-                fee_tracker_->update_mempool_estimate(est);
+            if (fee_tracker_->wants_rate_estimate()) {
+                // [S67] Same endpoint, same one call per cycle, same
+                // wallet-only gate above -- but asked for a RATE (explicit
+                // cost), which every action class then scales by its own
+                // CLVM cost.  The node's admission floor comes from the
+                // blockchain state get_block_height() already fetched, so
+                // no node call is added to the heartbeat.
+                const rpc::FeeEstimateReading reading = co_await
+                    full_node_->get_fee_rate_estimate(config_.fees.fee_estimate_target_seconds);
+                if (reading.ok) {
+                    rpc::MempoolState mempool = full_node_->last_mempool_state();
+                    if (!mempool.known && reading.mempool_known) {
+                        mempool.known          = reading.mempool_max_cost > 0;
+                        mempool.cost           = reading.mempool_cost;
+                        mempool.max_total_cost = reading.mempool_max_cost;
+                    }
+                    const double floor_rate = rpc::admission_floor_rate(
+                        mempool, strategy::fee::max_cost(fee_tracker_->controller().config().costs));
+                    fee_feedback_note(fee_tracker_->update_feed_forward(
+                                          reading.rate, floor_rate, block_height),
+                                      block_height);
+                }
+            } else {
+                auto est = co_await full_node_->get_fee_estimate(config_.fees.fee_estimate_target_seconds);
+                if (est > 0) {
+                    fee_tracker_->update_mempool_estimate(est);
+                }
             }
         } catch (const std::exception& e) {
             spdlog::debug("[Engine] Step 1: get_fee_estimate failed: {} "
@@ -5275,9 +5740,13 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
             }
 
             // Re-verify against the wallet before the one-way write.
+            // [S67, review #163] StillTerminal covers CANCELLED and FAILED;
+            // the fee controller may only hear the first.
+            bool wallet_says_cancelled = false;
             const execution::TerminalRecheck verdict =
                 co_await offer_mgr_->recheck_terminal(t.offer_id,
-                                                      block_height);
+                                                      block_height,
+                                                      &wallet_says_cancelled);
 
             if (verdict == execution::TerminalRecheck::NoVerdict) {
                 // The wallet was unreachable.  Retry, but not forever: on
@@ -5332,6 +5801,13 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
                     t.offer_id, "cancelled",
                     static_cast<BlockHeight>(t.observed_block),
                     "wallet reported terminal");
+                // [S67] The wallet's verdict on a cancel we submitted: the
+                // fee controller's confirmation, at the height the status
+                // CHANGED (not this maturity height).  A no-op for an offer
+                // it holds no ticket for, and with the controller off.
+                fee_feedback_on_cancel_verdict(
+                    t.offer_id, static_cast<BlockHeight>(t.observed_block),
+                    wallet_says_cancelled);
             } catch (const OfferNotFound& nf) {
                 // Genuinely unknown offer: nothing to update, ever.  This
                 // is a TYPED exception rather than a message match --
@@ -11037,7 +11513,7 @@ asio::awaitable<void> Engine::step_enforce_pace_caps(BlockHeight block_height,
             }
         }
         if (fee_tracker_->enabled() && !pace_freed.empty()) {
-            fee_tracker_->record_fee(static_cast<std::uint64_t>(pace_freed.size()) * recommended_fee,
+            fee_tracker_->record_fee(cancel_fees_paid(pace_freed, recommended_fee),
                                      block_height);
         }
         spdlog::warn("[Engine] Pace: {} cancelled {}/{} resting offers (binding={}, tiers={}, "
@@ -11135,6 +11611,29 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         co_return;
     }
 
+    // [S70 2026-09-20] ttl_cancel_mode: expire -- free the coins of offers
+    // the chain has already aged out.  Here, below the sync gate, because the
+    // verdict rests on the wallet having PROCESSED the chain up to the clock
+    // it reports; and above the lock-ledger snapshot, so the coins a retire
+    // releases are in this cycle's budget.  A no-op in the default mode, and
+    // free of RPCs until the host clock says some offer's max_time has passed.
+    // An accepted local cancel is still only a SUBMISSION to offer_log: the
+    // wallet's CANCELLED verdict, seen by detect_fills, completes the row.
+    if (config_.strategy.ttl_cancel_mode == TtlCancelMode::Expire
+        && wallet_step_may_run("Step 8 expired-offer retire")) {
+        const std::vector<std::string> expired_retired =
+            co_await offer_mgr_->retire_expired_offers(block_height);
+        for (const auto& oid : expired_retired) {
+            try {
+                db_->mark_offer_cancel_submitted(oid, block_height,
+                                                 "expired_onchain");
+            } catch (const std::exception& e) {
+                spdlog::debug("[Engine] mark_offer_cancel_submitted failed "
+                              "for {}: {}", oid.substr(0, 12), e.what());
+            }
+        }
+    }
+
     // [XCH-LOCK-LEDGER 2026-08-23] Seed the per-cycle XCH coin-lock budget
     // from the wallet's real free-coin list before any pair posts.  This is
     // the cross-pair commitment cap the 2026-08-23 zero-spendable incident
@@ -11150,8 +11649,24 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
     // OfferManager so that every subsequent create/cancel uses the
     // optimal fee.  When fee tracking is disabled, the static
     // offer_fee_mojos from StrategyConfig is used unchanged.
+    // [S67, review #163] ONE attached fee is asked for here and then attached
+    // to every tier this step posts, so the budget has to be told how many
+    // that can be: every tier of every quotable ladder, an upper bound (most
+    // already rest).  Read by the controller path only.
+    {
+        std::size_t may_post = 0;
+        for (const auto& [batch_pair, batch_pcs] : cycle_) {
+            static_cast<void>(batch_pair);
+            if (batch_pcs.quote_valid) {
+                may_post += batch_pcs.ladder.size();
+            }
+        }
+        fee_tracker_->set_attached_batch(static_cast<std::uint32_t>(
+            std::min<std::size_t>(may_post, 1'000'000U)));
+    }
     const std::uint64_t recommended_fee = fee_tracker_->get_recommended_fee(
-        config_.strategy.offer_fee_mojos, block_height);
+        config_.strategy.offer_fee_mojos, block_height,
+        strategy::fee::ActionClass::OfferAttached);
 
     if (recommended_fee == 0 && fee_tracker_->enabled()) {
         spdlog::warn("[Engine] Step 8: fee budget exhausted -- "
@@ -11160,6 +11675,21 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
     }
 
     offer_mgr_->set_dynamic_fee(recommended_fee);
+
+    // [S67] When fees depend on the action class -- the controller is on, or
+    // fees.cost_aware_estimate is [review #163] -- a cancel pays for what it
+    // SPENDS: an XCH-offered cancel costs ~8.4M CLVM, a CAT-offered one ~42M.
+    // With both off the override is cleared and every cancel pays
+    // recommended_fee as before.
+    if (fee_tracker_->class_fees_active()) {
+        offer_mgr_->set_cancel_fees(
+            fee_tracker_->get_recommended_fee(config_.strategy.offer_fee_mojos, block_height,
+                                              strategy::fee::ActionClass::CancelXch),
+            fee_tracker_->get_recommended_fee(config_.strategy.offer_fee_mojos, block_height,
+                                              strategy::fee::ActionClass::CancelCat));
+    } else {
+        offer_mgr_->clear_cancel_fees();
+    }
 
     // [WALLET-CIRCUIT] C1.  The sync check and the XCH lock-ledger snapshot
     // above are this step's first wallet calls.  The sync check's own catch
@@ -11540,7 +12070,20 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 * static_cast<double>(kMojosPerXch))),
             anchor_active,
             can_bid_rebalance,
-            can_ask_rebalance);
+            can_ask_rebalance,
+            // [S72] price_cancel_mode: margin judges a resting offer against
+            // the SAME centres and floor Step 7 priced this cycle's ladder
+            // with -- threaded, not recomputed, so the canceller and the
+            // pricer cannot disagree about where the floor is.  The shifted
+            // centre and the floor are 0 until Step 7 reaches ladder
+            // generation, which the classifier reads as "no reference" and
+            // answers with the deviation rule.  [review #164] The fair-value
+            // centre rides along because the shifted one alone is the wrong
+            // frame for edge; an offer must fail against BOTH to be cancelled
+            // (cross_guard.hpp says why not the fair one alone).
+            static_cast<double>(pcs.quote_mid_mojos),
+            pcs.quote_min_half_spread_bps,
+            static_cast<double>(pcs.quote_fair_centre_mojos));
 
         // [PACE 2026-09-13] Pace reprice.  To the canceller a tighter desired
         // bid is FAVOURABLE drift, refreshed only past 3x the tier threshold
@@ -11645,6 +12188,12 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     cancel_reasons[tc.offer_id] =
                         "crossed_mid(" + std::to_string(tc.price_deviation * 100.0)
                         .substr(0, 5) + "%)";
+                } else if (tc.margin_breach) {
+                    // [S72] edge the fill would earn / edge a resting offer
+                    // must keep, both in bps of Step 7's centre.
+                    cancel_reasons[tc.offer_id] =
+                        execution::margin_breach_reason(tc.edge_bps,
+                                                        tc.required_edge_bps);
                 } else {
                     cancel_reasons[tc.offer_id] =
                         "price_adverse(" + std::to_string(tc.price_deviation * 100.0)
@@ -11674,7 +12223,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             // T4-03: Record cancel fees in the tracker.
             if (fee_tracker_->enabled()) {
                 fee_tracker_->record_fee(
-                    static_cast<std::uint64_t>(cancelled_ids.size()) * recommended_fee,
+                    cancel_fees_paid(cancelled_ids, recommended_fee),
                     block_height);
             }
         }
@@ -11699,8 +12248,19 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             // every block and cancelled nothing (215 lines in four hours for
             // five XCH/DBX offers). Those offers belong to the escalation.
             std::size_t stuck_count = 0;
+            // [S70] An offer left to its on-chain expiry never had a hard-TTL
+            // cancel to get stuck: it is old by design, and
+            // retire_expired_offers owns it.  The counter and cancel_stale
+            // (spare_expiring) apply the SAME exemption, for the reason the
+            // [S14] note below gives.
+            const bool stuck_expire_mode =
+                config_.strategy.ttl_cancel_mode == TtlCancelMode::Expire;
             for (const auto& po : all_offers) {
                 if (po.pair_name != pair_name) continue;
+                if (!execution::age_limit_cancel_applies(stuck_expire_mode,
+                                                         po.expiry_max_time)) {
+                    continue;
+                }
                 if (execution::is_forced_cancel_candidate(
                         po.cancel_pending, po.created_at_block, block_height,
                         stuck_threshold)) {
@@ -11734,7 +12294,8 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     co_return;
                 }
                 auto stuck_cancelled = co_await offer_mgr_->cancel_stale(
-                    pair_name, block_height, stuck_threshold);
+                    pair_name, block_height, stuck_threshold,
+                    /*spare_expiring=*/true);
                 for (const auto& oid : stuck_cancelled) {
                     try {
                         db_->mark_offer_cancel_submitted(oid, block_height,
@@ -11766,6 +12327,53 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         Mojo pair_quote_pending_spend = 0;
         Mojo pair_base_reserve_mojos = 0;
         Mojo pair_quote_reserve_mojos = 0;
+        // [S71] exposure_rule: unified -- see the balance gate below.
+        Mojo pair_base_owned = 0;
+        Mojo pair_quote_owned = 0;
+        bool pair_base_owned_known = false;
+        bool pair_quote_owned_known = false;
+        const bool exposure_unified =
+            config_.strategy.exposure_rule == ExposureRule::Unified;
+        // Every resting offer's claim on the asset it spends, across ALL
+        // pairs, for the unified projection.  Rebuilt from State at each of
+        // the two sites, so a cancel the first site sends (cancel_pending) is
+        // already out of the second site's sum.
+        const auto exposure_resting_claims = [this]() {
+            std::vector<execution::RestingSpend> claims;
+            for (const auto& po : state_->get_all_offers()) {
+                const PairConfig* claim_pc = find_pair_config(po.pair_name);
+                if (!claim_pc) {
+                    // [review #164] An adopted "UNKNOWN" offer has no legs to
+                    // read, and neither has one on a pair since REMOVED from
+                    // the file (a pair merely DISABLED is still in
+                    // pair_config_map_, which is built from config_.pairs
+                    // with no enabled filter, so it still projects normally).
+                    // Dropping the claim told the wallet-wide projection its
+                    // spend was ZERO while `owned` still counted the coins it
+                    // locks: a fail-open.  Record it as unquantifiable and
+                    // let decide_exposure refuse to add exposure instead.
+                    execution::RestingSpend unknown;
+                    unknown.pair_unmapped  = true;
+                    unknown.cancel_pending = po.cancel_pending;
+                    claims.push_back(std::move(unknown));
+                    continue;
+                }
+                execution::RestingSpend claim;
+                claim.cancel_pending = po.cancel_pending;
+                if (po.side == Side::Ask) {
+                    claim.asset_id    = claim_pc->base_asset_id;
+                    claim.spend_mojos = po.size;
+                } else {
+                    claim.asset_id    = claim_pc->quote_asset_id;
+                    claim.spend_mojos = execution::quote_cost_for_ask(
+                        BaseMojos{po.size}, po.price,
+                        BaseMpu{claim_pc->base_mojos_per_unit},
+                        QuoteMpu{claim_pc->quote_mojos_per_unit}).v;
+                }
+                claims.push_back(std::move(claim));
+            }
+            return claims;
+        };
 
         // XCH-buy-only mode: when UTXO liberation couldn't restore the
         // fee reserve, only allow pairs that can acquire XCH, and only
@@ -11856,6 +12464,35 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                             pair_quote_balance_known = true;
                         }
 
+                        // [S71] exposure_rule: unified projects from what the
+                        // wallet OWNS net of its in-flight transactions --
+                        // unconfirmed_wallet_balance, which neither an
+                        // offer's coin lock nor a cancel's pending change
+                        // moves (exposure_gate.hpp).  Typed strictly; with
+                        // neither field present the side has no unified
+                        // verdict and nothing is cancelled on its account.
+                        {
+                            Mojo owned = 0;
+                            bool owned_known = false;
+                            if (bal_json.contains("unconfirmed_wallet_balance")
+                                && bal_json["unconfirmed_wallet_balance"]
+                                       .is_number_integer()) {
+                                owned = bal_json["unconfirmed_wallet_balance"]
+                                            .get<Mojo>();
+                                owned_known = true;
+                            } else if (bal_json.contains("confirmed_wallet_balance")) {
+                                owned = confirmed;
+                                owned_known = true;
+                            }
+                            if (sb.is_base) {
+                                pair_base_owned = owned;
+                                pair_base_owned_known = owned_known;
+                            } else {
+                                pair_quote_owned = owned;
+                                pair_quote_owned_known = owned_known;
+                            }
+                        }
+
                         // Update the cache for metrics.  Stamp the block so
                         // consumers can reject stale snapshots (Step 8 is
                         // skipped in several engine modes while Step 2 keeps
@@ -11911,7 +12548,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                         // alone.  spendable_balance already excludes in-flight
                         // coins, so the spendable-based gates below (2 and 3)
                         // and the exposure projections later in Step 8
-                        // (execution::exposure_breaches_reserve) decide
+                        // (execution::decide_exposure) decide
                         // whether the side can genuinely fund its ladder plus
                         // reserve.  The old unconditional suppression was
                         // backwards for bid fills: buying base put pending
@@ -11934,6 +12571,13 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                             if (!saw_pending_change) {
                                 ++consecutive_pending_blocks_;
                                 saw_pending_change = true;
+                                // [S67] Half way to the force-delete: our own
+                                // spends are not confirming.  An edge, so one
+                                // run of pending_change speaks once.
+                                if (consecutive_pending_blocks_ == kForceDeletePendingBlocks / 2) {
+                                    fee_feedback_signal(
+                                        strategy::fee::Signal::PendingChangeStuck, block_height);
+                                }
                             }
 
                             // Periodic stuck-tx pruning.
@@ -11944,6 +12588,12 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                     auto pruned = co_await
                                         offer_mgr_->prune_stuck_transactions(
                                             {sb.wid}, /*max_age_seconds=*/600);
+                                    // [S67] The rows the pruner just read carry
+                                    // the node's own refusals (sent_to).
+                                    if (offer_mgr_->take_fee_rejections_seen() > 0) {
+                                        fee_feedback_signal(
+                                            strategy::fee::Signal::MempoolRejected, block_height);
+                                    }
                                     if (pruned > 0) {
                                         spdlog::info("[Engine] Step 8: pruned "
                                                      "stuck transactions from "
@@ -11998,6 +12648,10 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                                      pw, e.what());
                                     }
                                 }
+                                // [S67] The hardest "too low" there is: spends
+                                // sat unconfirmed until the wallet was wiped.
+                                fee_feedback_signal(strategy::fee::Signal::ForceDelete,
+                                                    block_height);
                                 consecutive_pending_blocks_ = 0;
                             }
                             // Fall through to Gates 2 and 3: they evaluate
@@ -12087,6 +12741,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                         std::uint8_t tier{0};
                         int staleness_rank{2};
                         Mojo price{0};
+                        BlockHeight created_block{0};  // [S71] min-age gate
                     };
                     // [2026-09-01] This was a verbatim third copy of
                     // take_sizing.hpp's old long double arithmetic -- a local
@@ -12150,7 +12805,8 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                 pair_base_pending_spend = saturating_add_mojo(
                                     pair_base_pending_spend, spend);
                                 ask_candidates.push_back(
-                                    {po.offer_id, spend, po.tier, staleness_rank, class_price});
+                                    {po.offer_id, spend, po.tier, staleness_rank, class_price,
+                                     po.created_at_block});
                             }
                         } else {
                             const Mojo spend = quote_cost_for_base_size(BaseMojos{po.size}, po.price);
@@ -12158,7 +12814,8 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                 pair_quote_pending_spend = saturating_add_mojo(
                                     pair_quote_pending_spend, spend);
                                 bid_candidates.push_back(
-                                    {po.offer_id, spend, po.tier, staleness_rank, class_price});
+                                    {po.offer_id, spend, po.tier, staleness_rank, class_price,
+                                     po.created_at_block});
                             }
                         }
                     }
@@ -12190,41 +12847,141 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                         });
                     };
 
-                    if (pair_base_balance_known && pair_base_reserve_mojos > 0
-                        && pair_base_spendable > 0 && pair_base_pending_spend > 0) {
-                        const Mojo projected_after_fill =
-                            execution::projected_balance_after_fills(
-                                pair_base_spendable, pair_base_pending_spend,
-                                /*planned_spend_mojos=*/0);
-                        if (execution::exposure_breaches_reserve(
-                                pair_base_spendable, pair_base_pending_spend,
-                                /*planned_spend_mojos=*/0,
-                                pair_base_reserve_mojos)) {
-                            Mojo need_to_free = pair_base_reserve_mojos - projected_after_fill;
-                            sort_candidates(ask_candidates, Side::Ask);
-                            std::vector<std::string> cancel_ids;
-                            Mojo freed = 0;
-                            for (const auto& cand : ask_candidates) {
-                                cancel_ids.push_back(cand.offer_id);
-                                freed += cand.spend_cost;
-                                if (freed >= need_to_free) {
-                                    break;
-                                }
+                    // [S71 2026-09-20] ONE verdict for this site and the
+                    // pre-post projection below: execution::decide_exposure.
+                    // exposure_rule: legacy reproduces the old arithmetic
+                    // exactly (spendable - this pair's pending < reserve, every
+                    // resting offer a candidate); unified projects from what
+                    // the wallet OWNS against every resting offer that spends
+                    // the asset, cancels only below the hysteresis floor, and
+                    // never buys back an offer younger than the minimum age --
+                    // it suppresses the NEXT post instead.  The plan is built
+                    // by a plain lambda so the cancel itself stays a direct
+                    // co_await below, one per side, as before.
+                    struct ExposurePlan {
+                        execution::ExposureDecision decision;
+                        std::vector<std::string>    cancel_ids;
+                        Mojo                        freed{0};
+                        Mojo                        resting{0};
+                        bool                        evaluated{false};
+                    };
+                    auto plan_exposure = [&](Side side) -> ExposurePlan {
+                        const bool is_ask = (side == Side::Ask);
+                        const bool balance_known = is_ask ? pair_base_balance_known
+                                                          : pair_quote_balance_known;
+                        const bool owned_known = is_ask ? pair_base_owned_known
+                                                        : pair_quote_owned_known;
+                        const Mojo reserve   = is_ask ? pair_base_reserve_mojos
+                                                      : pair_quote_reserve_mojos;
+                        const Mojo spendable = is_ask ? pair_base_spendable
+                                                      : pair_quote_spendable;
+                        const Mojo pending   = is_ask ? pair_base_pending_spend
+                                                      : pair_quote_pending_spend;
+                        auto& cands = is_ask ? ask_candidates : bid_candidates;
+
+                        ExposurePlan plan;
+                        // Legacy guards verbatim; unified needs `owned`, not a
+                        // positive spendable (all-coins-locked is its case).
+                        const bool inputs_ok = balance_known && reserve > 0 && pending > 0
+                            && (exposure_unified ? owned_known : spendable > 0);
+                        if (!inputs_ok) {
+                            return plan;
+                        }
+                        plan.evaluated = true;
+                        // Legacy leaves this empty, so the claim-derived flag
+                        // below is false for it, as it must be.
+                        const std::vector<execution::RestingSpend> claims =
+                            exposure_unified ? exposure_resting_claims()
+                                             : std::vector<execution::RestingSpend>{};
+                        plan.resting = exposure_unified
+                            ? execution::resting_spend_on_asset(
+                                  claims,
+                                  is_ask ? gate_pc->base_asset_id
+                                         : gate_pc->quote_asset_id)
+                            : pending;
+
+                        execution::ExposureInputs in;
+                        in.owned_mojos         = is_ask ? pair_base_owned : pair_quote_owned;
+                        in.spendable_mojos     = spendable;
+                        in.resting_spend_mojos = plan.resting;
+                        in.planned_spend_mojos = 0;
+                        in.reserve_mojos       = reserve;
+                        in.resting_incomplete =
+                            execution::has_unmapped_live_claim(claims);
+                        plan.decision = execution::decide_exposure(
+                            exposure_unified, in,
+                            config_.strategy.exposure_cancel_hysteresis_pct);
+                        if (plan.decision.verdict
+                            != execution::ExposureVerdict::CancelResting) {
+                            return plan;
+                        }
+
+                        sort_candidates(cands, side);
+                        for (const auto& cand : cands) {
+                            if (!execution::exposure_cancel_candidate(
+                                    exposure_unified, cand.created_block, block_height,
+                                    config_.strategy.exposure_cancel_min_age_blocks)) {
+                                continue;
                             }
-                            if (!cancel_ids.empty()) {
-                                // [WALLET-CIRCUIT] Nothing between the sides
-                                // loop above and this cancel checks the gate,
-                                // and a failed balance query breaks out of
-                                // that loop.
-                                if (!wallet_step_may_run("Step 8 exposure-floor cancel (asks)")) {
-                                    co_return;
-                                }
-                                auto cancelled = co_await offer_mgr_->selective_cancel(cancel_ids);
-                                if (!cancelled.empty()) {
-                                    pair_base_pending_spend = (pair_base_pending_spend > freed)
-                                        ? (pair_base_pending_spend - freed)
-                                        : Mojo{0};
-                                    can_ask = false;
+                            plan.cancel_ids.push_back(cand.offer_id);
+                            plan.freed = saturating_add_mojo(plan.freed, cand.spend_cost);
+                            if (plan.freed >= plan.decision.need_to_free) {
+                                break;
+                            }
+                        }
+                        return plan;
+                    };
+                    // Unified only: a breach that is not (or not yet) worth a
+                    // cancel still stops this side ADDING exposure this cycle.
+                    const auto suppress_instead = [&](const ExposurePlan& plan,
+                                                      const char* side_name,
+                                                      const std::string& asset,
+                                                      Mojo reserve_mojos) {
+                        spdlog::info("[Engine] Step 8: {} exposure (unified) on {}: "
+                                     "owned - resting = {} vs reserve {} (resting={}) "
+                                     "-- suppressing new {} posts, no resting offer "
+                                     "cancelled (inside the hysteresis band, or every "
+                                     "candidate younger than {} blocks)",
+                                     pair_name, asset,
+                                     plan.decision.projected_mojos,
+                                     reserve_mojos,
+                                     plan.resting, side_name,
+                                     config_.strategy.exposure_cancel_min_age_blocks);
+                    };
+
+                    {
+                        ExposurePlan plan = plan_exposure(Side::Ask);
+                        if (exposure_unified && plan.evaluated
+                            && plan.decision.verdict != execution::ExposureVerdict::Ok
+                            && plan.cancel_ids.empty()) {
+                            can_ask = false;
+                            suppress_instead(plan, "ask", gate_pc->base_asset_id,
+                                             pair_base_reserve_mojos);
+                        }
+                        if (!plan.cancel_ids.empty()) {
+                            // [WALLET-CIRCUIT] Nothing between the sides
+                            // loop above and this cancel checks the gate,
+                            // and a failed balance query breaks out of
+                            // that loop.
+                            if (!wallet_step_may_run("Step 8 exposure-floor cancel (asks)")) {
+                                co_return;
+                            }
+                            auto cancelled = co_await offer_mgr_->selective_cancel(plan.cancel_ids);
+                            if (!cancelled.empty()) {
+                                pair_base_pending_spend = (pair_base_pending_spend > plan.freed)
+                                    ? (pair_base_pending_spend - plan.freed)
+                                    : Mojo{0};
+                                can_ask = false;
+                                if (exposure_unified) {
+                                    spdlog::warn("[Engine] Step 8: {} exposure (unified) on {} "
+                                                 "breached reserve (owned={} resting={} "
+                                                 "projected={} reserve={}) -- cancelled {} ask "
+                                                 "offers to rebalance exposure",
+                                                 pair_name, gate_pc->base_asset_id,
+                                                 pair_base_owned, plan.resting,
+                                                 plan.decision.projected_mojos,
+                                                 pair_base_reserve_mojos, cancelled.size());
+                                } else {
                                     spdlog::warn("[Engine] Step 8: {} pending exposure on {} "
                                                  "breached reserve (spendable={} pending={} "
                                                  "reserve={}) -- cancelled {} ask offers "
@@ -12235,51 +12992,49 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                                  pair_base_pending_spend,
                                                  pair_base_reserve_mojos,
                                                  cancelled.size());
-                                    for (const auto& oid : cancelled) {
-                                        try {
-                                            db_->mark_offer_cancel_submitted(
-                                                oid, block_height,
-                                                "exposure_floor_rebalance");
-                                        } catch (...) {}
-                                    }
+                                }
+                                for (const auto& oid : cancelled) {
+                                    try {
+                                        db_->mark_offer_cancel_submitted(
+                                            oid, block_height,
+                                            "exposure_floor_rebalance");
+                                    } catch (...) {}
                                 }
                             }
                         }
                     }
 
-                    if (pair_quote_balance_known && pair_quote_reserve_mojos > 0
-                        && pair_quote_spendable > 0 && pair_quote_pending_spend > 0) {
-                        const Mojo projected_after_fill =
-                            execution::projected_balance_after_fills(
-                                pair_quote_spendable, pair_quote_pending_spend,
-                                /*planned_spend_mojos=*/0);
-                        if (execution::exposure_breaches_reserve(
-                                pair_quote_spendable, pair_quote_pending_spend,
-                                /*planned_spend_mojos=*/0,
-                                pair_quote_reserve_mojos)) {
-                            Mojo need_to_free = pair_quote_reserve_mojos - projected_after_fill;
-                            sort_candidates(bid_candidates, Side::Bid);
-                            std::vector<std::string> cancel_ids;
-                            Mojo freed = 0;
-                            for (const auto& cand : bid_candidates) {
-                                cancel_ids.push_back(cand.offer_id);
-                                freed += cand.spend_cost;
-                                if (freed >= need_to_free) {
-                                    break;
-                                }
+                    {
+                        ExposurePlan plan = plan_exposure(Side::Bid);
+                        if (exposure_unified && plan.evaluated
+                            && plan.decision.verdict != execution::ExposureVerdict::Ok
+                            && plan.cancel_ids.empty()) {
+                            can_bid = false;
+                            suppress_instead(plan, "bid", gate_pc->quote_asset_id,
+                                             pair_quote_reserve_mojos);
+                        }
+                        if (!plan.cancel_ids.empty()) {
+                            // [WALLET-CIRCUIT] As for the asks; the ask
+                            // cancel above may also just have failed.
+                            if (!wallet_step_may_run("Step 8 exposure-floor cancel (bids)")) {
+                                co_return;
                             }
-                            if (!cancel_ids.empty()) {
-                                // [WALLET-CIRCUIT] As for the asks; the ask
-                                // cancel above may also just have failed.
-                                if (!wallet_step_may_run("Step 8 exposure-floor cancel (bids)")) {
-                                    co_return;
-                                }
-                                auto cancelled = co_await offer_mgr_->selective_cancel(cancel_ids);
-                                if (!cancelled.empty()) {
-                                    pair_quote_pending_spend = (pair_quote_pending_spend > freed)
-                                        ? (pair_quote_pending_spend - freed)
-                                        : Mojo{0};
-                                    can_bid = false;
+                            auto cancelled = co_await offer_mgr_->selective_cancel(plan.cancel_ids);
+                            if (!cancelled.empty()) {
+                                pair_quote_pending_spend = (pair_quote_pending_spend > plan.freed)
+                                    ? (pair_quote_pending_spend - plan.freed)
+                                    : Mojo{0};
+                                can_bid = false;
+                                if (exposure_unified) {
+                                    spdlog::warn("[Engine] Step 8: {} exposure (unified) on {} "
+                                                 "breached reserve (owned={} resting={} "
+                                                 "projected={} reserve={}) -- cancelled {} bid "
+                                                 "offers to rebalance exposure",
+                                                 pair_name, gate_pc->quote_asset_id,
+                                                 pair_quote_owned, plan.resting,
+                                                 plan.decision.projected_mojos,
+                                                 pair_quote_reserve_mojos, cancelled.size());
+                                } else {
                                     spdlog::warn("[Engine] Step 8: {} pending exposure on {} "
                                                  "breached reserve (spendable={} pending={} "
                                                  "reserve={}) -- cancelled {} bid offers "
@@ -12290,13 +13045,13 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                                  pair_quote_pending_spend,
                                                  pair_quote_reserve_mojos,
                                                  cancelled.size());
-                                    for (const auto& oid : cancelled) {
-                                        try {
-                                            db_->mark_offer_cancel_submitted(
-                                                oid, block_height,
-                                                "exposure_floor_rebalance");
-                                        } catch (...) {}
-                                    }
+                                }
+                                for (const auto& oid : cancelled) {
+                                    try {
+                                        db_->mark_offer_cancel_submitted(
+                                            oid, block_height,
+                                            "exposure_floor_rebalance");
+                                    } catch (...) {}
                                 }
                             }
                         }
@@ -13548,7 +14303,8 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         {
             // [2026-09-01] The fourth copy of the same long double formula,
             // and the most dangerous of them: this one feeds
-            // exposure_breaches_reserve() and therefore can_bid/can_ask --
+            // decide_exposure() [S71; then exposure_breaches_reserve()] and
+            // therefore can_bid/can_ask --
             // a quoting kill switch driven by platform-dependent arithmetic,
             // on every enabled pair. No test reaches it. Replaced with the
             // shared exact-integer implementation; see the banner in
@@ -13597,42 +14353,138 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 }
             }
 
-            bool suppress_ask_projection = false;
-            bool suppress_bid_projection = false;
-            if (can_ask && pair_base_balance_known && pair_base_reserve_mojos > 0) {
-                if (execution::exposure_breaches_reserve(
-                        pair_base_spendable,
-                        /*pending_spend_mojos=*/pending_plus_new_ask,
-                        /*planned_spend_mojos=*/0,
-                        pair_base_reserve_mojos)) {
-                    suppress_ask_projection = true;
-                    can_ask = false;
-                    spdlog::info("[Engine] Step 8: {} projected ask exposure "
-                                 "would breach reserve on {} (spendable={} "
-                                 "pending+new={} reserve={}) -- suppressing ask",
-                                 pair_name,
-                                 pair_cfg->base_asset_id,
-                                 pair_base_spendable,
-                                 pending_plus_new_ask,
-                                 pair_base_reserve_mojos);
+            // [S71 2026-09-20] The SAME verdict the resting-offer check above
+            // asked for, with the new tiers as `planned`: decide_exposure.
+            // Legacy inputs are the old ones (spendable, this pair's pending)
+            // and any non-Ok verdict suppresses, which is exactly the old
+            // exposure_breaches_reserve(spendable, pending+new, 0, reserve).
+            // Unified projects from `owned` against every resting offer that
+            // spends the asset -- re-read from State here, so an offer the
+            // first site just cancelled (cancel_pending) is already out of
+            // the sum -- and also refuses tiers the FREE coins cannot fund.
+            Mojo planned_ask = 0;
+            Mojo planned_bid = 0;
+            for (const auto& tq : fee_filtered_tiers) {
+                if (tq.side == Side::Ask) {
+                    planned_ask = saturating_add_mojo(planned_ask, tq.size);
+                } else {
+                    planned_bid = saturating_add_mojo(
+                        planned_bid,
+                        quote_cost_for_base_size(BaseMojos{tq.size}, tq.price));
                 }
             }
-            if (can_bid && pair_quote_balance_known && pair_quote_reserve_mojos > 0) {
-                if (execution::exposure_breaches_reserve(
-                        pair_quote_spendable,
-                        /*pending_spend_mojos=*/pending_plus_new_bid,
-                        /*planned_spend_mojos=*/0,
-                        pair_quote_reserve_mojos)) {
+            const std::vector<execution::RestingSpend> prepost_claims =
+                exposure_unified ? exposure_resting_claims()
+                                 : std::vector<execution::RestingSpend>{};
+            const auto projection_for = [&](bool is_ask) {
+                execution::ExposureInputs in;
+                in.owned_mojos     = is_ask ? pair_base_owned : pair_quote_owned;
+                in.spendable_mojos = is_ask ? pair_base_spendable
+                                            : pair_quote_spendable;
+                in.resting_spend_mojos = exposure_unified
+                    ? execution::resting_spend_on_asset(
+                          prepost_claims,
+                          is_ask ? pair_cfg->base_asset_id
+                                 : pair_cfg->quote_asset_id)
+                    : (is_ask ? pair_base_pending_spend : pair_quote_pending_spend);
+                in.planned_spend_mojos = is_ask ? planned_ask : planned_bid;
+                in.reserve_mojos = is_ask ? pair_base_reserve_mojos
+                                          : pair_quote_reserve_mojos;
+                // [review #164] Legacy's prepost_claims is empty, so this is
+                // false for it; unified refuses to ADD exposure while any
+                // live resting offer's spend cannot be read.
+                in.resting_incomplete =
+                    execution::has_unmapped_live_claim(prepost_claims);
+                return std::make_pair(
+                    in, execution::decide_exposure(
+                            exposure_unified, in,
+                            config_.strategy.exposure_cancel_hysteresis_pct));
+            };
+
+            bool suppress_ask_projection = false;
+            bool suppress_bid_projection = false;
+            if (can_ask && pair_base_balance_known && pair_base_reserve_mojos > 0
+                && (!exposure_unified || pair_base_owned_known)) {
+                const auto [ask_in, ask_dec] = projection_for(/*is_ask=*/true);
+                if (ask_dec.verdict != execution::ExposureVerdict::Ok) {
+                    suppress_ask_projection = true;
+                    can_ask = false;
+                    if (exposure_unified && ask_in.resting_incomplete) {
+                        spdlog::warn("[Engine] Step 8: {} ask exposure (unified) "
+                                     "on {} cannot be projected -- a LIVE resting "
+                                     "offer's pair is not in this config (an "
+                                     "adopted UNKNOWN record, or a pair since "
+                                     "removed), so resting={} is a lower bound "
+                                     "and owned={} already counts the coins it "
+                                     "locks -- suppressing ask (new={} reserve={}); "
+                                     "no resting offer is cancelled on its account",
+                                     pair_name, pair_cfg->base_asset_id,
+                                     ask_in.resting_spend_mojos,
+                                     ask_in.owned_mojos,
+                                     ask_in.planned_spend_mojos,
+                                     ask_in.reserve_mojos);
+                    } else if (exposure_unified) {
+                        spdlog::info("[Engine] Step 8: {} projected ask exposure "
+                                     "(unified) would breach reserve on {} (owned={} "
+                                     "spendable={} resting={} new={} reserve={}) -- "
+                                     "suppressing ask",
+                                     pair_name, pair_cfg->base_asset_id,
+                                     ask_in.owned_mojos, ask_in.spendable_mojos,
+                                     ask_in.resting_spend_mojos,
+                                     ask_in.planned_spend_mojos,
+                                     ask_in.reserve_mojos);
+                    } else {
+                        spdlog::info("[Engine] Step 8: {} projected ask exposure "
+                                     "would breach reserve on {} (spendable={} "
+                                     "pending+new={} reserve={}) -- suppressing ask",
+                                     pair_name,
+                                     pair_cfg->base_asset_id,
+                                     pair_base_spendable,
+                                     pending_plus_new_ask,
+                                     pair_base_reserve_mojos);
+                    }
+                }
+            }
+            if (can_bid && pair_quote_balance_known && pair_quote_reserve_mojos > 0
+                && (!exposure_unified || pair_quote_owned_known)) {
+                const auto [bid_in, bid_dec] = projection_for(/*is_ask=*/false);
+                if (bid_dec.verdict != execution::ExposureVerdict::Ok) {
                     suppress_bid_projection = true;
                     can_bid = false;
-                    spdlog::info("[Engine] Step 8: {} projected bid exposure "
-                                 "would breach reserve on {} (spendable={} "
-                                 "pending+new={} reserve={}) -- suppressing bid",
-                                 pair_name,
-                                 pair_cfg->quote_asset_id,
-                                 pair_quote_spendable,
-                                 pending_plus_new_bid,
-                                 pair_quote_reserve_mojos);
+                    if (exposure_unified && bid_in.resting_incomplete) {
+                        spdlog::warn("[Engine] Step 8: {} bid exposure (unified) "
+                                     "on {} cannot be projected -- a LIVE resting "
+                                     "offer's pair is not in this config (an "
+                                     "adopted UNKNOWN record, or a pair since "
+                                     "removed), so resting={} is a lower bound "
+                                     "and owned={} already counts the coins it "
+                                     "locks -- suppressing bid (new={} reserve={}); "
+                                     "no resting offer is cancelled on its account",
+                                     pair_name, pair_cfg->quote_asset_id,
+                                     bid_in.resting_spend_mojos,
+                                     bid_in.owned_mojos,
+                                     bid_in.planned_spend_mojos,
+                                     bid_in.reserve_mojos);
+                    } else if (exposure_unified) {
+                        spdlog::info("[Engine] Step 8: {} projected bid exposure "
+                                     "(unified) would breach reserve on {} (owned={} "
+                                     "spendable={} resting={} new={} reserve={}) -- "
+                                     "suppressing bid",
+                                     pair_name, pair_cfg->quote_asset_id,
+                                     bid_in.owned_mojos, bid_in.spendable_mojos,
+                                     bid_in.resting_spend_mojos,
+                                     bid_in.planned_spend_mojos,
+                                     bid_in.reserve_mojos);
+                    } else {
+                        spdlog::info("[Engine] Step 8: {} projected bid exposure "
+                                     "would breach reserve on {} (spendable={} "
+                                     "pending+new={} reserve={}) -- suppressing bid",
+                                     pair_name,
+                                     pair_cfg->quote_asset_id,
+                                     pair_quote_spendable,
+                                     pending_plus_new_bid,
+                                     pair_quote_reserve_mojos);
+                    }
                 }
             }
 
@@ -13684,13 +14536,25 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         if (!wallet_step_may_run("Step 8 post_quotes")) {
             co_return;
         }
+        // [review #165] post_quotes is the ONLY call through which this engine
+        // creates a maker offer. OfferManager marks posting_in_flight_ around
+        // each create_offer inside it -- from the request until that offer is
+        // in State -- so a keep stop delivered by a signal waits for the ONE
+        // call actually outstanding instead of orphaning it (shutdown(), and
+        // the PostingMark in offer_manager.cpp).
         int posted = co_await offer_mgr_->post_quotes(
             *pair_cfg, fee_filtered_tiers, block_height, fee_override);
 
         // T4-03: Record posting fees in the tracker.
         if (fee_tracker_->enabled() && posted > 0) {
+            // [review #163 r6] Saturating: posted x fee is the one place the
+            // attached-fee booking multiplies, and a wrapped product would
+            // under-book the window.
+            const std::uint64_t n_posted = static_cast<std::uint64_t>(posted);
             fee_tracker_->record_fee(
-                static_cast<std::uint64_t>(posted) * recommended_fee,
+                recommended_fee > std::numeric_limits<std::uint64_t>::max() / n_posted
+                    ? std::numeric_limits<std::uint64_t>::max()
+                    : n_posted * recommended_fee,
                 block_height);
         }
         // [T2-09] Persist actual wallet-assigned offer IDs to the database.
@@ -13821,6 +14685,17 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         spdlog::info("[Engine] Step 8: posted {} offers for {} (cancelled {}, "
                      "fee {} mojos/offer)",
                      posted, pair_name, cancelled_ids.size(), recommended_fee);
+
+        // [review #165] A keep stop landed while this pair was posting and is
+        // waiting for exactly this point: what was created is in State and in
+        // offer_log. Manage NOTHING further -- the next pair's iteration would
+        // open with cancels, under a stop that promised to send none.
+        if (offers_kept_on_stop_.load(std::memory_order_acquire)) {
+            spdlog::warn("[Engine] [S74] Step 8 stops after {}: a stop that "
+                         "keeps the resting offers is waiting on this post",
+                         pair_name);
+            co_return;
+        }
     }
 
     // Reset consecutive pending counter only when NO pair hit Gate 1
@@ -14269,7 +15144,8 @@ asio::awaitable<void> Engine::step_check_arbitrage(
         // ------------------------------------------------------------------
         const std::uint64_t fee = fee_tracker_
             ? fee_tracker_->get_recommended_fee(
-                  config_.fees.min_fee_mojos, block_height)
+                  config_.fees.min_fee_mojos, block_height,
+                  strategy::fee::ActionClass::Take)
             : config_.fees.min_fee_mojos;
 
         // 9c lifts an ASK and only an ASK -- evaluate_crossed_book() has no
@@ -14288,7 +15164,7 @@ asio::awaitable<void> Engine::step_check_arbitrage(
         const QuoteMojos spend_cost = execution::ask_take_cost(
             decision.best_ask_size, best_ask_price,
             BaseMpu{pair.base_mojos_per_unit}, QuoteMpu{pair.quote_mojos_per_unit},
-            spend_is_xch ? static_cast<Mojo>(fee) : Mojo{0});
+            spend_is_xch ? to_mojo_saturating(fee) : Mojo{0});
 
         // read_ok{false} is UNKNOWN and it is the DEFAULT. A number is never
         // substituted for a failed read (coin_pool_verdict.hpp), which is why
@@ -14546,6 +15422,7 @@ asio::awaitable<void> Engine::step_check_arbitrage(
                 if (fee_tracker_) {
                     fee_tracker_->record_fee(fee, block_height);
                 }
+                fee_feedback_track_take(trade_id, fee, block_height);   // [S67]
 
                 // Alert for visibility.
                 if (alerts_) {
@@ -14778,7 +15655,8 @@ asio::awaitable<void> Engine::step_check_arbitrage(
                     // against min_edge and so never accounted for any of it.
                     const std::uint64_t est_fee = fee_tracker_
                         ? fee_tracker_->get_recommended_fee(
-                              config_.fees.min_fee_mojos, block_height)
+                              config_.fees.min_fee_mojos, block_height,
+                              strategy::fee::ActionClass::Take)
                         : static_cast<std::uint64_t>(config_.fees.min_fee_mojos);
                     const double fee_bps_per_leg =
                         (best_ask_a_size > 0)
@@ -14888,7 +15766,8 @@ asio::awaitable<void> Engine::step_check_arbitrage(
                         const std::uint64_t fee = fee_tracker_
                             ? fee_tracker_->get_recommended_fee(
                                   config_.fees.min_fee_mojos,
-                                  block_height)
+                                  block_height,
+                                  strategy::fee::ActionClass::Take)
                             : config_.fees.min_fee_mojos;
 
                         spdlog::info("[Engine] Step 9d: TAKING "
@@ -14947,6 +15826,7 @@ asio::awaitable<void> Engine::step_check_arbitrage(
                                 fee_tracker_->record_fee(
                                     fee, block_height);
                             }
+                            fee_feedback_track_take(trade_id, fee, block_height);   // [S67]
 
                             if (alerts_) {
                                 alerts_->send_alert(
@@ -15197,7 +16077,8 @@ asio::awaitable<void> Engine::step_check_arbitrage(
 
                 const std::uint64_t fee = fee_tracker_
                     ? fee_tracker_->get_recommended_fee(
-                          config_.fees.min_fee_mojos, block_height)
+                          config_.fees.min_fee_mojos, block_height,
+                          strategy::fee::ActionClass::Take)
                     : config_.fees.min_fee_mojos;
 
                 // Pre-balance check: verify we have enough spendable
@@ -15278,10 +16159,16 @@ asio::awaitable<void> Engine::step_check_arbitrage(
                             // otherwise. Inert on XCH/DBX and XCH/BYC ask
                             // takes; live on a bid take of an xch base and on
                             // the wmilliETH.b/XCH family.
+                            // [review #163 r6] to_mojo_saturating: a wrapped
+                            // negative fee is DROPPED by
+                            // add_same_wallet_fee's `same_wallet_fee <= 0`
+                            // clause -- the take path's own guard, not
+                            // clamp_need -- so the funding check would price
+                            // a spend without the fee the wallet pays.
                             const Mojo cost = execution::add_same_wallet_fee(
                                 spend_cost,
                                 spend_asset == "xch"
-                                    ? static_cast<Mojo>(fee) : Mojo{0});
+                                    ? to_mojo_saturating(fee) : Mojo{0});
 
                             const auto fv =
                                 execution::decide_funding(reading, cost);
@@ -15381,6 +16268,7 @@ asio::awaitable<void> Engine::step_check_arbitrage(
 
                     if (fee_tracker_)
                         fee_tracker_->record_fee(fee, block_height);
+                    fee_feedback_track_take(tid, fee, block_height);   // [S67]
                     if (alerts_) {
                         alerts_->send_alert(
                             AlertRule::ArbitrageDetected,
@@ -15930,7 +16818,8 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
         // SAME wallet as the spend, so it is computed before the check.
         const std::uint64_t fee = fee_tracker_
             ? fee_tracker_->get_recommended_fee(
-                  config_.fees.min_fee_mojos, block_height)
+                  config_.fees.min_fee_mojos, block_height,
+                  strategy::fee::ActionClass::Take)
             : config_.fees.min_fee_mojos;
 
         // Pre-balance check (mirrors Step 9e).
@@ -15968,7 +16857,7 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
                     }
                     const Mojo cost = execution::add_same_wallet_fee(
                         chosen->spend_cost,
-                        spend_asset == "xch" ? static_cast<Mojo>(fee)
+                        spend_asset == "xch" ? to_mojo_saturating(fee)
                                              : Mojo{0});
                     const auto fv =
                         execution::decide_funding(reading, cost);
@@ -16055,6 +16944,7 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
 
             if (fee_tracker_)
                 fee_tracker_->record_fee(fee, block_height);
+            fee_feedback_track_take(tid, fee, block_height);   // [S67]
             if (alerts_) {
                 alerts_->send_alert(
                     AlertRule::ArbitrageDetected,
@@ -17858,7 +18748,7 @@ void Engine::record_taker_fill(const std::string& strategy,
         f.quote_asset           = pc.quote_asset_id;
         f.quote_delta_mojos     = quote_delta;
         f.price_mojos           = price_mojos;
-        f.fee_mojos             = static_cast<Mojo>(fee_mojos);
+        f.fee_mojos             = to_mojo_saturating(fee_mojos);
         db_->insert_taker_fill(f);
 
         // Ledger legs, keyed on the trade id so a retry cannot double-post.
@@ -17901,7 +18791,7 @@ void Engine::record_taker_fill(const std::string& strategy,
         add("base",  pc.base_asset_id,  base_delta);
         add("quote", pc.quote_asset_id, quote_delta);
         if (fee_mojos > 0) {
-            add("fee", AssetId{"xch"}, -static_cast<Mojo>(fee_mojos));
+            add("fee", AssetId{"xch"}, -to_mojo_saturating(fee_mojos));
         }
 
         // A real write failure IS a ledger-incompleteness event: legs that
@@ -21163,6 +22053,337 @@ bool Engine::wallet_step_may_run(std::string_view step)
 }
 
 // ---------------------------------------------------------------------------
+// [S67 2026-09-20] Fee controller feedback -- the engine glue.
+//
+// Every DECISION lives in strategy/fee_controller.hpp and is driven by ctest;
+// these functions only gather inputs and apply outputs, and every one of them
+// is inert unless fees.controller_enabled (FeeTracker::controller_active).
+// Every block count is a PEAK height.
+// ---------------------------------------------------------------------------
+
+std::uint64_t Engine::cancel_fees_paid(const std::vector<std::string>& ids,
+                                       std::uint64_t                   legacy_fee) const
+{
+    // [review #163 r9] DRAIN FIRST, ON BOTH PATHS.  The accumulator is fed by
+    // every accepted secure cancel whatever the flags say, so the legacy
+    // branch has to empty it too or it would only ever grow (saturating) while
+    // the controller is off -- and then hand a stale total to the first
+    // heartbeat after someone enables it.
+    const std::uint64_t accepted =
+        offer_mgr_ ? offer_mgr_->take_cancel_fees_accepted() : std::uint64_t{0};
+
+    if (!fee_tracker_ || !fee_tracker_->class_fees_active() || !offer_mgr_) {
+        // The pre-S67 accounting: one fee for every cancel.  [review #163 r6]
+        // The PRODUCT now saturates the same way the class-aware sum below
+        // already did -- an unguarded count x fee wraps for a large enough fee
+        // and hands FeeTracker::record_fee a small number.
+        const std::uint64_t n = static_cast<std::uint64_t>(ids.size());
+        if (n != 0U && legacy_fee > std::numeric_limits<std::uint64_t>::max() / n) {
+            return std::numeric_limits<std::uint64_t>::max();
+        }
+        return n * legacy_fee;
+    }
+    // [review #163 r9] WHAT WAS ACCEPTED, NOT WHAT POLICY WOULD QUOTE NOW.
+    // This used to sum offer_mgr_->cancel_fee_for(id) over the ids, which is a
+    // FRESH POLICY LOOKUP and books INTENT: selective_cancel pushes an id into
+    // its cancelled list whether the cancel went out at cancel_fee_for() or
+    // fell through to emergency_cancel, and that path can succeed at a halved
+    // or quartered tier down to 1 mojo, at a secure fee of 0, or as a
+    // local-only cancel that spends nothing on chain -- every one of them
+    // booked at the full policy fee.  OfferManager now carries the accepted
+    // fee out of the cancel routine instead (memory:
+    // taker-fills-booked-at-submit -- the third instance of that family found
+    // on this PR).  `ids` is deliberately unused here: the accumulator counts
+    // what the wallet took, which is the thing the rolling window is for.
+    //
+    // It also picks up accepted cancels from routines that reached no booking
+    // site at all before (cancel_stale, the #157 escalation).  That makes the
+    // window MORE complete, not less, and it is gated with the rest: the
+    // legacy branch above is byte-identical to main, so nothing changes with
+    // both flags off.  `ids` is still read by that branch.
+    return accepted;
+}
+
+void Engine::fee_feedback_note(const strategy::fee::Change& change, BlockHeight block)
+{
+    if (!fee_tracker_ || !fee_tracker_->controller_active()) {
+        return;
+    }
+    if (metrics_) {
+        metrics_->update_fee_controller(fee_tracker_->controller().effective_rate(block),
+                                        fee_tracker_->controller().level());
+    }
+    // ONE line per burst of moves, old -> new with the latest reason; see
+    // strategy::fee::ChangeLogGate.  Nothing is logged for a change that
+    // moved nothing.
+    if (!fee_change_log_.note(change, block)) {
+        return;
+    }
+    const strategy::fee::Controller& c = fee_tracker_->controller();
+    spdlog::info("[FeeController] rate {:.4f} -> {:.4f} mojos/cost ({}; {} move(s); level "
+                 "{:+.2f} log2{}) -- fees now: cancel_xch {} cancel_cat {} take {} attached {}",
+                 fee_change_log_.first_old_rate, fee_change_log_.latest_new_rate,
+                 strategy::fee::to_string(fee_change_log_.latest_reason),
+                 fee_change_log_.folded, c.level(), c.probing() ? ", probing" : "",
+                 c.fee_for(strategy::fee::ActionClass::CancelXch, block),
+                 c.fee_for(strategy::fee::ActionClass::CancelCat, block),
+                 c.fee_for(strategy::fee::ActionClass::Take, block),
+                 c.fee_for(strategy::fee::ActionClass::OfferAttached, block));
+    fee_change_log_.emitted(block);
+}
+
+void Engine::fee_feedback_signal(strategy::fee::Signal signal, BlockHeight block)
+{
+    if (!fee_tracker_ || !fee_tracker_->controller_active()) {
+        return;
+    }
+    strategy::fee::Observation o;
+    o.signal = signal;
+    o.now    = block;
+    fee_feedback_note(fee_tracker_->observe(o), block);
+}
+
+void Engine::fee_feedback_track_take(const std::string& trade_id, std::uint64_t fee,
+                                     BlockHeight block)
+{
+    if (!fee_tracker_ || !fee_tracker_->controller_active()) {
+        return;
+    }
+    // [review #163 r5] The take SUCCEEDED -- this hook is called only after
+    // the wallet accepted it -- so an over-budget Take quote is now a real
+    // overrun and may open the episode.  Before the ticket guards below: the
+    // spend happened whether or not we can track it.
+    fee_tracker_->note_priority_spend(strategy::fee::ActionClass::Take, fee);
+    if (trade_id.empty() || trade_id == "unknown"
+        || fee_tickets_.size() >= strategy::fee::kMaxTickets) {
+        return;
+    }
+    fee_tickets_.emplace(trade_id, fee_tracker_->make_ticket(
+                                       strategy::fee::ActionClass::Take, fee, block));
+}
+
+void Engine::fee_feedback_track_cancel(const std::string& offer_id, std::uint64_t fee)
+{
+    if (!fee_tracker_ || !fee_tracker_->controller_active() || !state_ || offer_id.empty()) {
+        return;
+    }
+    const PendingOffer cancelled = state_->get_offer(offer_id);
+    const PairConfig*  cancelled_pc =
+        cancelled.offer_id.empty() ? nullptr : find_pair_config(cancelled.pair_name);
+    const bool cancelled_offered_xch = cancelled_pc != nullptr
+        && ((cancelled.side == Side::Bid ? cancelled_pc->quote_asset_id
+                                         : cancelled_pc->base_asset_id) == "xch");
+    const strategy::fee::ActionClass cls = cancelled_pc != nullptr
+        ? strategy::fee::cancel_class(cancelled_offered_xch)
+        : strategy::fee::ActionClass::CancelCat;
+    // [review #163 r5] The wallet ACCEPTED this cancel (OfferManager's
+    // observer runs past the RPC, never before it), so an over-budget quote
+    // for its class is now a real overrun.  Ahead of every ticket guard
+    // below: the mojos are committed whether or not a ticket can be opened.
+    fee_tracker_->note_priority_spend(cls, fee);
+    // A re-cancel (an escalation, an emergency tier) REPLACES the ticket: it
+    // is a new spend at a new fee, and evidence about it starts now.
+    if (fee_tickets_.size() >= strategy::fee::kMaxTickets
+        && fee_tickets_.count(offer_id) == 0) {
+        return;
+    }
+    // [review #163 r2] The submission height is the cycle's own
+    // (fee_now_block_), NOT last_block_: that one lags a whole cycle, and is 0
+    // until the first cycle ends -- so a startup-reconcile cancel was ticketed
+    // at height 0 and its first sweep read an age of nine million heights, a
+    // maximum-error raise at every boot.  No known height, no ticket: a stale
+    // ticket for the same offer goes too, since this cancel replaced its spend.
+    if (fee_now_block_ == 0) {
+        fee_tickets_.erase(offer_id);
+        return;
+    }
+    fee_tickets_.insert_or_assign(offer_id,
+                                  fee_tracker_->make_ticket(cls, fee, fee_now_block_));
+}
+
+void Engine::fee_feedback_on_cancel_verdict(const std::string& offer_id,
+                                            BlockHeight        observed_block,
+                                            bool               wallet_says_cancelled)
+{
+    if (!fee_tracker_ || !fee_tracker_->controller_active()) {
+        return;
+    }
+    const auto it = fee_tickets_.find(offer_id);
+    if (it == fee_tickets_.end() || it->second.cls == strategy::fee::ActionClass::Take) {
+        return;
+    }
+    // Only a wallet-verified CANCELLED confirms the cancel spend; a FAILED
+    // offer closes the ticket unheard (strategy::fee::
+    // observation_for_cancel_verdict).
+    const BlockHeight now = fee_now_block_;   // the cycle's height, not last_block_
+    const strategy::fee::VerdictObservation v = strategy::fee::observation_for_cancel_verdict(
+        it->second, wallet_says_cancelled, observed_block, now);
+    fee_tickets_.erase(it);
+    if (v.has) {
+        fee_feedback_note(fee_tracker_->observe(v.observation), now);
+    }
+}
+
+asio::awaitable<void> Engine::fee_feedback_sweep(BlockHeight block)
+{
+    if (!fee_tracker_ || !fee_tracker_->controller_active() || dry_run_
+        || !state_ || !offer_mgr_ || block == 0) {
+        co_return;
+    }
+
+    // The budget bound: ONE alert per episode (FeeTracker owns the edge).
+    if (fee_tracker_->take_budget_bound_alert() && alerts_) {
+        alerts_->send_alert(
+            AlertRule::FeeBudgetBound,
+            "Fee budget binds: an offer-attached fee wanted "
+                + std::to_string(fee_tracker_->last_bound_desired())
+                + " mojos, budget allows " + std::to_string(fee_tracker_->last_bound_allowed())
+                + ". Attached fees degrade toward fees.min_fee_mojos; PER-OFFER cancels and "
+                  "takes are NOT degraded and quoting continues. Raise fees.daily_budget_mojos. "
+                  "(The BULK stop/shutdown sweep still pays the attached fee -- TODO S67.)");
+    }
+    // [review #163] And the other edge: a cancel or a take the budget could not
+    // fund, paid in full so it can still be mined.
+    if (fee_tracker_->take_budget_unfunded_alert() && alerts_) {
+        alerts_->send_alert(
+            AlertRule::FeeBudgetUnfunded,
+            std::string("Fee budget exceeded on purpose: a ")
+                + strategy::fee::to_string(fee_tracker_->last_unfunded_action()) + " needs "
+                + std::to_string(fee_tracker_->last_unfunded_fee()) + " mojos to clear the node's "
+                  "admission floor and the window has only "
+                + std::to_string(fee_tracker_->last_unfunded_headroom())
+                + " left. It was PAID: a cancel priced below what the node admits never "
+                  "confirms, keeps its coins locked and ends in a wallet-wide force-delete. "
+                  "Raise fees.daily_budget_mojos.");
+    }
+
+    const std::uint32_t target = fee_tracker_->controller().config().target_delay_blocks;
+
+    // 1. Which cancels are still in flight.  [review #163] Tickets are NOT
+    //    opened here: fee_feedback_track_cancel opens them at the accepted
+    //    cancel RPC, with the fee really paid.  So a cancel adopted at boot
+    //    from the wallet's PENDING_CANCEL records -- fee unknown -- never has
+    //    one, and a cancel that confirms before this sweep first runs does.
+    std::unordered_set<std::string> cancels_in_flight;
+    for (const auto& po : state_->get_all_offers()) {
+        if (po.cancel_pending) {
+            cancels_in_flight.insert(po.offer_id);
+        }
+    }
+
+    // 2. Walk the tickets.  A take is polled below; a cancel that left
+    //    cancel_pending waits for Step 2's wallet verdict (it may have been a
+    //    FILL, which says nothing about our fee) and is dropped unheard when
+    //    none comes.
+    std::string take_to_poll;
+    BlockHeight take_to_poll_block = 0;
+    for (auto it = fee_tickets_.begin(); it != fee_tickets_.end();) {
+        strategy::fee::Ticket& t = it->second;
+        // [review #163 r4] The unconditional age cap, for EVERY class and
+        // before anything else.  A take always had one; a cancel had only
+        // verdict_expired, which needs awaiting_verdict, which is set only
+        // when the offer leaves cancel_pending -- and a cancel STRANDED by an
+        // exhausted #157 escalation never does.  Its ticket then spoke once
+        // per height for ever and failed every probe below the fee it paid.
+        // strategy::fee::ticket_abandoned has the whole argument.
+        if (strategy::fee::ticket_abandoned(t, block)) {
+            it = fee_tickets_.erase(it);      // dropped UNHEARD
+            continue;
+        }
+        const bool is_take = t.cls == strategy::fee::ActionClass::Take;
+        if (!is_take) {
+            const bool in_flight = cancels_in_flight.count(it->first) != 0;
+            if (!in_flight && !t.awaiting_verdict) {
+                t.awaiting_verdict = true;
+                t.left_block       = block;
+            } else if (in_flight && t.awaiting_verdict) {
+                t.awaiting_verdict = false;   // revived into State: pending again
+            }
+        }
+        if (strategy::fee::verdict_expired(t, block)) {
+            it = fee_tickets_.erase(it);
+            continue;
+        }
+        if (is_take) {
+            if (take_to_poll.empty() || t.submit_block < take_to_poll_block) {
+                take_to_poll       = it->first;
+                take_to_poll_block = t.submit_block;
+            }
+        } else if (strategy::fee::pending_observation_due(t, block, target)) {
+            t.last_pending_block = block;
+            // [review #163] Built by the pure rule so the ticket's CLASS cannot
+            // be dropped here (strategy::fee::observation_for_pending).
+            fee_feedback_note(
+                fee_tracker_->observe(strategy::fee::observation_for_pending(t, block)), block);
+        }
+        ++it;
+    }
+
+    // 3. ONE take per heartbeat, oldest first: a single wallet get_offer by
+    //    trade id, and none at all while the wallet is failing or the dead
+    //    man's switch has fired.  Take BOOKING is untouched -- this only
+    //    listens.
+    if (take_to_poll.empty() || !wallet_ || wallet_circuit_open_
+        || watchdog_fired_.load(std::memory_order_acquire)
+        || execution::wallet_gate(wallet_transport_at_cycle_start_,
+                                  wallet_->transport_counters())
+               != execution::WalletGate::Run) {
+        co_return;
+    }
+    nlohmann::json record;
+    try {
+        record = co_await wallet_->get_offer(take_to_poll, /*file_contents=*/false);
+    } catch (const std::exception& e) {
+        spdlog::debug("[Engine] [S67] take status read failed for {}: {} -- retried next "
+                      "heartbeat", take_to_poll.substr(0, 12), e.what());
+        co_return;
+    }
+    const auto found = fee_tickets_.find(take_to_poll);
+    if (found == fee_tickets_.end()) {
+        co_return;
+    }
+    const execution::WalletCancelState status = execution::wallet_cancel_state_from_record(record);
+    strategy::fee::Observation o;
+    o.attributed   = true;
+    o.submit_level = found->second.submit_level;
+    o.cls          = found->second.cls;   // [review #163] see Observation::cls
+    o.now          = block;
+    // [review #163 r5] o.blocks is set PER BRANCH.  Set once here it was the
+    // age at THIS heartbeat, and only one take is polled per heartbeat
+    // (oldest first, the `is_take` selection above), so a second ticketed
+    // take delays this read a heartbeat at a time -- turning an on-time
+    // confirmation into a late observation that raises the fee or fails a
+    // probe that was right.  Only another TAKE can do that: cancels are
+    // serviced in the same pass and never contend for the poll slot.
+    if (status == execution::WalletCancelState::Confirmed) {
+        o.signal = strategy::fee::Signal::Confirmed;
+        // Measured from the height the spend LANDED at, which the record
+        // already carries -- the same contract the cancel verdict has kept
+        // since r1 (strategy::fee::observation_for_cancel_verdict).  The
+        // helper clamps a height regression to 0, and a record that states no
+        // usable height falls back to `block`, the old behaviour.
+        o.blocks = static_cast<double>(strategy::fee::confirmation_delay(
+            found->second, execution::confirmed_height_from_record(record, block)));
+        fee_tickets_.erase(found);
+        fee_feedback_note(fee_tracker_->observe(o), block);
+    } else if (status == execution::WalletCancelState::Failed
+               || status == execution::WalletCancelState::Cancelled) {
+        // Someone else took it first, or the wallet gave up: not a verdict on
+        // the fee.
+        fee_tickets_.erase(found);
+    } else if (status == execution::WalletCancelState::PendingConfirm
+               && strategy::fee::pending_observation_due(found->second, block, target)) {
+        found->second.last_pending_block = block;
+        o.signal = strategy::fee::Signal::Pending;
+        // Still pending: there is no confirmation height, and the age at this
+        // heartbeat is exactly what a censored observation means.
+        o.blocks = static_cast<double>(strategy::fee::ticket_age(found->second, block));
+        fee_feedback_note(fee_tracker_->observe(o), block);
+    }
+    co_return;
+}
+
+// ---------------------------------------------------------------------------
 // [S14 2026-09-13] escalate_stuck_cancels -- proof-gated re-cancel of offers
 // whose cancel the wallet accepted but the chain never saw.
 //
@@ -21377,14 +22598,24 @@ asio::awaitable<void> Engine::escalate_stuck_cancels(BlockHeight block)
     }
 
     if (!due.empty()) {
+        // [S67] One class for the whole sweep: CancelCat, the dearer cancel.
+        // An escalation exists to get a stuck cancel IN, so an XCH-offered
+        // offer overpaying here is the cheap side of that error.
         const std::uint64_t base_fee = fee_tracker_
-            ? fee_tracker_->get_recommended_fee(config_.strategy.offer_fee_mojos, block)
+            ? fee_tracker_->get_recommended_fee(config_.strategy.offer_fee_mojos, block,
+                                                strategy::fee::ActionClass::CancelCat)
             : config_.strategy.offer_fee_mojos;
         // A ceiling on the cancel being replaced: emergency_cancel's top tier
         // pays up to twice the dynamic fee.  It is the dynamic fee NOW, not the
         // one that cancel saw -- initial cancel fees are not persisted (see
         // execution::escalation_fee_mojos).
-        const std::uint64_t dynamic_fee = offer_mgr_->current_fee();
+        // [S67] With the controller on the cancel being replaced paid a CLASS
+        // fee, which can exceed current_fee() (the offer-attached fee), so the
+        // ceiling rests on the larger of the two.  Off, this is current_fee().
+        const std::uint64_t dynamic_fee =
+            (fee_tracker_ && fee_tracker_->class_fees_active())
+                ? std::max(offer_mgr_->current_fee(), base_fee)
+                : offer_mgr_->current_fee();
         const std::uint64_t prior_ceiling =
             dynamic_fee > std::numeric_limits<std::uint64_t>::max() / 2U
                 ? std::numeric_limits<std::uint64_t>::max()
@@ -21647,6 +22878,10 @@ asio::awaitable<void> Engine::escalate_stuck_cancels(BlockHeight block)
 // then stop -- the same thing SIGINT triggers on platforms where the GUI
 // could deliver it.
 //
+// [S74 2026-09-20] ...unless the request says "offers=keep", or says nothing
+// and engine.shutdown_offers is "keep": then shutdown() stops WITHOUT
+// cancelling (xop/util/stop_offers_policy.hpp).
+//
 // [shutdown-flag-race 2026-09-12] Only a request naming this PID, or no PID,
 // and written at or after this process started stops it (decide_shutdown_flag).
 // Called from the fast poll, the analysis poll and the boot checkpoints.
@@ -21764,9 +22999,16 @@ util::ShutdownFlagDecision Engine::evaluate_shutdown_flag(util::ShutdownFlagSite
                       ec.message(), reason_name, process_identity_.pid, age_ms);
     } else {
         spdlog::warn("[Engine] shutdown.flag consumed ({}; this PID {}, written {} ms "
-                     "after start) -- graceful shutdown (the book is cancelled on "
-                     "the way down)", reason_name, process_identity_.pid, age_ms);
+                     "after start; offers policy in the request: {}) -- graceful "
+                     "shutdown", reason_name, process_identity_.pid, age_ms,
+                     util::stop_offers_request_name(facts.parsed.offers));
     }
+    // [S74 2026-09-20] Hand shutdown() what THIS request said about the book.
+    // Stored here and nowhere else, and only on the honour path: a discarded
+    // flag is somebody else's request, and its policy must never colour a
+    // later stop of this process (a Ctrl+C, say). shutdown() resolves it
+    // against engine.shutdown_offers and says which one decided.
+    stop_offers_request_.store(facts.parsed.offers, std::memory_order_release);
     shutdown();
     return decision;
 }

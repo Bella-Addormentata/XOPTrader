@@ -15,9 +15,14 @@
 // ISO/IEC 25000 -- clear error messages citing the offending field.
 
 #include "xop/config.hpp"
+#include "xop/execution/offer_expiry.hpp"
 #include "xop/rpc/coingecko_parse.hpp"
 #include "xop/feed_listings.hpp"
 #include "xop/strategy/pid_reachability.hpp"
+// [review #162, round 7] For the Dexie input-limit constants and the
+// ceil(1 / frac) bound, so the load-time warning and the runtime one cannot
+// disagree about the threshold.
+#include "xop/execution/offer_min_input_coin.hpp"
 
 #include <spdlog/spdlog.h>
 #include <yaml-cpp/yaml.h>
@@ -303,6 +308,23 @@ std::uint32_t read_optional_uint32_in_range(const YAML::Node& node, const std::s
     return static_cast<std::uint32_t>(value);
 }
 
+// [S67 2026-09-20] An optional unsigned 64-bit integer within [lo, hi].
+// yaml-cpp refuses a negative scalar for an unsigned type, so no int64 detour
+// is needed (and one would halve the range).
+std::uint64_t read_optional_uint64_in_range(const YAML::Node& node, const std::string& key,
+                                            const std::string& sec, std::uint64_t dflt,
+                                            std::uint64_t lo, std::uint64_t hi)
+{
+    if (!node[key] || !node[key].IsDefined() || node[key].IsNull()) {
+        return dflt;
+    }
+    const std::uint64_t value = node[key].as<std::uint64_t>();
+    if (value < lo || value > hi) {
+        throw ConfigError(sec + "." + key + " must be in [" + std::to_string(lo) + ", "
+                          + std::to_string(hi) + "]; got " + std::to_string(value));
+    }
+    return value;
+}
 // Read a required double clamped to (0, 1].
 double read_fraction(const YAML::Node& parent,
                      const std::string& key,
@@ -1156,6 +1178,47 @@ StrategyConfig parse_strategy(const YAML::Node& root)
         && !node["offer_expiry_secs"].IsNull()) {
         cfg.offer_expiry_secs = read_uint32(node, "offer_expiry_secs", sec);
     }
+
+    // [MIN-INPUT-COIN] Optional; absent or null keeps the 0.01 default.
+    // [0, 1): 0 is a real setting ("send no floor"), and 1 would demand a
+    // single coin at least as large as the whole offer.  Non-finite values
+    // throw inside the helper before the range test, which NaN would pass.
+    cfg.offer_min_input_coin_frac = read_optional_finite_in_range(
+        node, "offer_min_input_coin_frac", sec,
+        cfg.offer_min_input_coin_frac, 0.0, 1.0,
+        /*lo_open=*/false, /*hi_open=*/true);
+    // [review #162, round 7] THE RANGE IS WIDER THAN THE KEY IS USEFUL OVER.
+    // [0, 1) is the right ACCEPTANCE test -- 0 really means "send no floor"
+    // and the arithmetic is sound at every value in it -- but the whole point
+    // of the floor is to bound the input count under what Dexie accepts, and
+    // below 1/124 the bound it guarantees is itself above that limit.  Such a
+    // value loads silently, and a create the wallet SATISFIES can then still
+    // be refused for input count, which is the one case the runtime warning
+    // cannot diagnose from its own arguments.  Not an error: the key is not
+    // load-bearing for safety and an operator may be mid-experiment.
+    if (execution::min_input_coin_frac_ppb(cfg.offer_min_input_coin_frac) != 0
+        && !execution::min_input_coin_bound_fits_dexie(
+               cfg.offer_min_input_coin_frac)) {
+        spdlog::warn(
+            "[Config] {}.offer_min_input_coin_frac ({}) leaves the CAT-leg "
+            "bound ABOVE Dexie's limit: ceil(1 / frac) = {} inputs, plus the "
+            "XCH fee coin, against the {} inputs Dexie was measured to "
+            "accept.  The floor still loads and still keeps dust out, but it "
+            "no longer guarantees what it exists for -- an offer the wallet "
+            "builds WITHIN this floor can be refused with \"Too many input "
+            "coins\", and the [dexie-too-many-inputs] warning cannot then "
+            "tell that case from the no-floor retry.  Use at least {:.5f} "
+            "(= 1 / {}); the default 0.01 bounds it at {}.  0 disables the "
+            "floor and is not warned about.",
+            sec, cfg.offer_min_input_coin_frac,
+            execution::min_input_coin_cat_leg_bound(
+                cfg.offer_min_input_coin_frac),
+            execution::kDexieMeasuredInputLimit,
+            execution::min_input_coin_safe_frac(),
+            execution::kDexieMeasuredInputLimit
+                - execution::kDexieFeeLegInputsToday,
+            execution::min_input_coin_cat_leg_bound(0.01));
+    }
     cfg.num_tiers            = read_uint32_positive(node, "num_tiers", sec);
 
     cfg.tier_spacing_bps = read_positive_double_seq(node, "tier_spacing_bps", sec);
@@ -1712,6 +1775,63 @@ StrategyConfig parse_strategy(const YAML::Node& root)
         node, "pace_reprice_min_bps", sec, cfg.pace_reprice_min_bps, 0.0, 1000.0, true, false);
     cfg.pace_reprice_min_age_blocks = read_optional_uint32_in_range(
         node, "pace_reprice_min_age_blocks", sec, cfg.pace_reprice_min_age_blocks, 12u, 4'608u);
+
+    // [S70-S72 2026-09-20] The three cancel-reduction switches.  All
+    // optional; absent or null keeps the rule that was in force before the
+    // key existed.  A mode is a closed vocabulary, so anything else -- a
+    // typo, a bool, a number -- throws rather than falling back: "expire"
+    // misspelt must not silently keep paying for TTL cancels.
+    const auto read_mode = [&](const char* key) -> std::optional<std::string> {
+        if (!node[key] || !node[key].IsDefined() || node[key].IsNull()) {
+            return std::nullopt;
+        }
+        if (!node[key].IsScalar()) {
+            throw ConfigError(sec + "." + key + " must be a scalar mode name");
+        }
+        return node[key].as<std::string>();
+    };
+    if (const auto m = read_mode("ttl_cancel_mode")) {
+        if (*m == "cancel") {
+            cfg.ttl_cancel_mode = TtlCancelMode::Cancel;
+        } else if (*m == "expire") {
+            cfg.ttl_cancel_mode = TtlCancelMode::Expire;
+        } else {
+            throw ConfigError(sec + ".ttl_cancel_mode must be 'cancel' or "
+                              "'expire'; got '" + *m + "'");
+        }
+    }
+    if (const auto m = read_mode("exposure_rule")) {
+        if (*m == "legacy") {
+            cfg.exposure_rule = ExposureRule::Legacy;
+        } else if (*m == "unified") {
+            cfg.exposure_rule = ExposureRule::Unified;
+        } else {
+            throw ConfigError(sec + ".exposure_rule must be 'legacy' or "
+                              "'unified'; got '" + *m + "'");
+        }
+    }
+    if (const auto m = read_mode("price_cancel_mode")) {
+        if (*m == "deviation") {
+            cfg.price_cancel_mode = PriceCancelMode::Deviation;
+        } else if (*m == "margin") {
+            cfg.price_cancel_mode = PriceCancelMode::Margin;
+        } else {
+            throw ConfigError(sec + ".price_cancel_mode must be 'deviation' "
+                              "or 'margin'; got '" + *m + "'");
+        }
+    }
+    cfg.exposure_cancel_hysteresis_pct = read_optional_finite_in_range(
+        node, "exposure_cancel_hysteresis_pct", sec,
+        cfg.exposure_cancel_hysteresis_pct, 0.0, 1.0, false, false);
+    cfg.exposure_cancel_min_age_blocks = read_optional_uint32_in_range(
+        node, "exposure_cancel_min_age_blocks", sec,
+        cfg.exposure_cancel_min_age_blocks, 0u, 4'608u);
+    // (0, 1]: 0 would mean "never cancel for price", which is what the
+    // crossed rule and the hard TTL are NOT a substitute for.
+    cfg.price_cancel_edge_retain = read_optional_finite_in_range(
+        node, "price_cancel_edge_retain", sec,
+        cfg.price_cancel_edge_retain, 0.0, 1.0, true, false);
+
     if (node["ratio_band_exit"] && node["ratio_band_exit"].IsDefined()
         && !node["ratio_band_exit"].IsNull()) {
         cfg.ratio_band_exit = node["ratio_band_exit"].as<double>();
@@ -2986,6 +3106,74 @@ FeeConfig parse_fees(const YAML::Node& root)
     read_u32 ("fee_window_blocks",    cfg.fee_window_blocks);
     read_u32 ("fee_estimate_target_seconds", cfg.fee_estimate_target_seconds);
 
+    // [S67 2026-09-20] Cost-aware estimate and the fee controller.  Every
+    // double goes through read_optional_finite_in_range and every count
+    // through a range reader: one copy of each rule, and NaN is refused
+    // before any comparison can wave it through.  The ranges are the ones
+    // strategy::fee::Controller falls back to a default outside of, so a
+    // value that parses is a value the controller uses as written.
+    read_bool("cost_aware_estimate", cfg.cost_aware_estimate);
+    read_bool("controller_enabled",  cfg.controller_enabled);
+    cfg.controller_target_delay_blocks = read_optional_uint32_in_range(
+        node, "controller_target_delay_blocks", sec, cfg.controller_target_delay_blocks, 1u, 4'608u);
+    cfg.controller_kp = read_optional_finite_in_range(
+        node, "controller_kp", sec, cfg.controller_kp, 0.0, 16.0, false, false);
+    cfg.controller_ki = read_optional_finite_in_range(
+        node, "controller_ki", sec, cfg.controller_ki, 0.0, 16.0, false, false);
+    cfg.controller_kd = read_optional_finite_in_range(
+        node, "controller_kd", sec, cfg.controller_kd, 0.0, 16.0, false, false);
+    cfg.controller_max_error = read_optional_finite_in_range(
+        node, "controller_max_error", sec, cfg.controller_max_error, 0.0, 16.0, true, false);
+    cfg.controller_max_step_up = read_optional_finite_in_range(
+        node, "controller_max_step_up", sec, cfg.controller_max_step_up, 0.0, 8.0, true, false);
+    cfg.controller_min_raise = read_optional_finite_in_range(
+        node, "controller_min_raise", sec, cfg.controller_min_raise, 0.0, 8.0, true, false);
+    cfg.controller_warmup_observations = read_optional_uint32_in_range(
+        node, "controller_warmup_observations", sec, cfg.controller_warmup_observations, 0u, 1'000u);
+    cfg.controller_probe_fraction = read_optional_finite_in_range(
+        node, "controller_probe_fraction", sec, cfg.controller_probe_fraction, 0.0, 0.9, true, false);
+    cfg.controller_probe_after_confirmations = read_optional_uint32_in_range(
+        node, "controller_probe_after_confirmations", sec,
+        cfg.controller_probe_after_confirmations, 1u, 100'000u);
+    cfg.controller_probe_confirmations = read_optional_uint32_in_range(
+        node, "controller_probe_confirmations", sec, cfg.controller_probe_confirmations, 1u, 1'000u);
+    cfg.controller_probe_fail_bump = read_optional_finite_in_range(
+        node, "controller_probe_fail_bump", sec, cfg.controller_probe_fail_bump, 0.0, 1.0, false, false);
+    cfg.controller_probe_backoff_cap = read_optional_uint32_in_range(
+        node, "controller_probe_backoff_cap", sec, cfg.controller_probe_backoff_cap, 1u, 1'000'000u);
+    cfg.controller_ff_margin = read_optional_finite_in_range(
+        node, "controller_ff_margin", sec, cfg.controller_ff_margin, 1.0, 4.0, false, false);
+    cfg.controller_ff_max_age_blocks = read_optional_uint32_in_range(
+        node, "controller_ff_max_age_blocks", sec, cfg.controller_ff_max_age_blocks, 1u, 4'608u);
+    cfg.controller_budget_reserve_cancels = read_optional_uint32_in_range(
+        node, "controller_budget_reserve_cancels", sec, cfg.controller_budget_reserve_cancels, 0u, 1'000u);
+    // A cost below 100,000 is below any real spend; above 5.5e9 the mempool
+    // refuses the bundle outright (MAX_BLOCK_COST_CLVM / 2).
+    cfg.controller_cost_offer_attached = read_optional_uint64_in_range(
+        node, "controller_cost_offer_attached", sec, cfg.controller_cost_offer_attached,
+        100'000ULL, 5'500'000'000ULL);
+    cfg.controller_cost_cancel_xch = read_optional_uint64_in_range(
+        node, "controller_cost_cancel_xch", sec, cfg.controller_cost_cancel_xch,
+        100'000ULL, 5'500'000'000ULL);
+    cfg.controller_cost_cancel_cat = read_optional_uint64_in_range(
+        node, "controller_cost_cancel_cat", sec, cfg.controller_cost_cancel_cat,
+        100'000ULL, 5'500'000'000ULL);
+    cfg.controller_cost_take = read_optional_uint64_in_range(
+        node, "controller_cost_take", sec, cfg.controller_cost_take,
+        100'000ULL, 5'500'000'000ULL);
+    if (cfg.controller_probe_backoff_cap < cfg.controller_probe_after_confirmations) {
+        throw ConfigError(sec + ".controller_probe_backoff_cap ("
+                          + std::to_string(cfg.controller_probe_backoff_cap) + ") must be >= "
+                          + sec + ".controller_probe_after_confirmations ("
+                          + std::to_string(cfg.controller_probe_after_confirmations) + ")");
+    }
+    if (cfg.controller_enabled && !cfg.enabled) {
+        // Not an error: fees.enabled: false is the documented passthrough, and
+        // it wins.  Say so once, because the key reads as if it were live.
+        spdlog::warn("[Config] fees.controller_enabled is true but fees.enabled is false -- "
+                     "the fee controller is inert; every fee is the static offer_fee_mojos");
+    }
+
     // Validate constraints.
     if (cfg.min_fee_mojos > cfg.max_fee_mojos) {
         throw ConfigError(sec + ".min_fee_mojos ("
@@ -3006,6 +3194,13 @@ FeeConfig parse_fees(const YAML::Node& root)
     }
     if (cfg.daily_budget_mojos == 0) {
         throw ConfigError(sec + ".daily_budget_mojos must be > 0");
+    }
+    // [S67] min_fee_mojos is the controller's anchor (level 0 = a CAT cancel
+    // pays exactly min_fee) and the floor an exhausted budget degrades to.
+    // At 0 that floor is "pay nothing", which Step 8 reads as "skip".
+    if (cfg.controller_enabled && cfg.min_fee_mojos == 0) {
+        throw ConfigError(sec + ".controller_enabled requires " + sec
+                          + ".min_fee_mojos > 0");
     }
 
     return cfg;
@@ -3262,6 +3457,13 @@ void log_config_summary(const AppConfig& cfg)
         << "  q_max      = " << cfg.strategy.q_max << "\n"
         << "  min_margin = " << cfg.strategy.min_profit_margin_bps << " bps\n"
         << "  offer_ttl  = " << cfg.strategy.offer_ttl_blocks << " blocks\n"
+        << "  ttl_cancel = " << to_string(cfg.strategy.ttl_cancel_mode)
+        << " (offer_expiry_secs=" << cfg.strategy.offer_expiry_secs << ")\n"
+        << "  exposure   = " << to_string(cfg.strategy.exposure_rule)
+        << " (hysteresis=" << cfg.strategy.exposure_cancel_hysteresis_pct
+        << " min_age=" << cfg.strategy.exposure_cancel_min_age_blocks << ")\n"
+        << "  price_cancel = " << to_string(cfg.strategy.price_cancel_mode)
+        << " (edge_retain=" << cfg.strategy.price_cancel_edge_retain << ")\n"
         << "  tiers      = " << cfg.strategy.num_tiers << "\n"
         << "  spacing    = [";
     for (std::size_t i = 0; i < cfg.strategy.tier_spacing_bps.size(); ++i) {
@@ -3422,7 +3624,29 @@ void log_config_summary(const AppConfig& cfg)
         << "  max_fee    = " << cfg.fees.max_fee_mojos << " mojos\n"
         << "  adaptive   = " << (cfg.fees.adaptive_enabled ? "true" : "false") << "\n"
         << "  window     = " << cfg.fees.fee_window_blocks << " blocks\n"
-        << "  estimate_target = " << cfg.fees.fee_estimate_target_seconds << "s\n";
+        << "  estimate_target = " << cfg.fees.fee_estimate_target_seconds << "s\n"
+        << "  cost_aware_estimate = " << (cfg.fees.cost_aware_estimate ? "true" : "false") << "\n"
+        << "  controller = " << (cfg.fees.controller_enabled ? "ON" : "off")
+        << " target=" << cfg.fees.controller_target_delay_blocks << " peak heights"
+        << " kp=" << cfg.fees.controller_kp
+        << " ki=" << cfg.fees.controller_ki
+        << " kd=" << cfg.fees.controller_kd
+        << " max_error=" << cfg.fees.controller_max_error
+        << " max_step_up=" << cfg.fees.controller_max_step_up
+        << " min_raise=" << cfg.fees.controller_min_raise
+        << " warmup=" << cfg.fees.controller_warmup_observations << "\n"
+        << "  controller_probe = -" << (cfg.fees.controller_probe_fraction * 100.0) << "% after "
+        << cfg.fees.controller_probe_after_confirmations << " on-target, good after "
+        << cfg.fees.controller_probe_confirmations << ", fail_bump=+"
+        << (cfg.fees.controller_probe_fail_bump * 100.0) << "%, backoff_cap="
+        << cfg.fees.controller_probe_backoff_cap << "\n"
+        << "  controller_ff = x" << cfg.fees.controller_ff_margin << " max_age="
+        << cfg.fees.controller_ff_max_age_blocks << " reserve_cancels="
+        << cfg.fees.controller_budget_reserve_cancels << "\n"
+        << "  controller_costs = attached " << cfg.fees.controller_cost_offer_attached
+        << " cancel_xch " << cfg.fees.controller_cost_cancel_xch
+        << " cancel_cat " << cfg.fees.controller_cost_cancel_cat
+        << " take " << cfg.fees.controller_cost_take << "\n";
 
     // Strategy: new fields.
     out << "  confirm    = " << cfg.strategy.confirmation_depth_blocks << " blocks\n"
@@ -4015,6 +4239,82 @@ BuyerConfig parse_buyer(const YAML::Node& root)
     return cfg;
 }
 
+// ---------------------------------------------------------------------------
+// parse_engine -- optional `engine:` section.  [S74 2026-09-20]
+//
+// One key today: shutdown_offers, the stop policy used when a stop request
+// names none (xop/util/stop_offers_policy.hpp).  Absent means "cancel", so a
+// config written before the key existed behaves exactly as it did.
+//
+// STRICT, unlike the older sections: a section that is not a mapping, a key
+// this build does not know and a value it cannot read are all errors.  This
+// key decides what happens to a live book when nobody is there to answer, and
+// every lenient reading of a typo ("shutdown_offer: keep", "engine: keep",
+// "shutdown_offers: kep") is a silent "cancel" the operator did not choose.
+// [review] "A value it cannot read" INCLUDES A BLANK ONE.  `shutdown_offers:`
+// with nothing after it used to fall through to the default -- a silent
+// "cancel" arriving through the one section whose whole point is that it never
+// does that.  An empty SECTION is still "not set": there the key is absent.
+// ---------------------------------------------------------------------------
+EngineConfig parse_engine(const YAML::Node& root)
+{
+    const std::string sec = "engine";
+    EngineConfig cfg;
+
+    if (!root[sec] || !root[sec].IsDefined() || root[sec].IsNull()) {
+        return cfg;
+    }
+    const YAML::Node& node = root[sec];
+    if (!node.IsMap()) {
+        throw ConfigError(sec + " must be a mapping with the key "
+                          "shutdown_offers (cancel or keep)");
+    }
+    bool key_present = false;
+    for (auto it = node.begin(); it != node.end(); ++it) {
+        const std::string key =
+            it->first.IsScalar() ? it->first.as<std::string>() : std::string("<non-scalar key>");
+        if (key != "shutdown_offers") {
+            throw ConfigError(sec + "." + key + " is not a known key (the only "
+                              "key in this section is shutdown_offers)");
+        }
+        key_present = true;
+    }
+    // [review] An EMPTY section (`engine:`, `engine: {}`) really is "not set":
+    // the key was never written, and absent means cancel exactly as it did
+    // before the key existed.  A key that IS written and left BLANK
+    // (`shutdown_offers:`) is a different thing -- a half-finished edit -- and
+    // letting it read as "cancel" is precisely the silent default this section
+    // says it refuses.  Rejected below with the rest of the unreadable values.
+    if (!key_present) {
+        return cfg;
+    }
+
+    const YAML::Node& value = node["shutdown_offers"];
+    const bool has_value = static_cast<bool>(value) && value.IsDefined()
+                           && !value.IsNull();
+    const std::optional<util::StopOffersPolicy> policy =
+        (has_value && value.IsScalar())
+            ? util::parse_stop_offers_policy(value.as<std::string>())
+            : std::nullopt;
+    if (!policy.has_value()) {
+        std::string got;
+        if (!has_value) {
+            got = "an empty value";
+        } else if (value.IsScalar()) {
+            got = "\"" + value.as<std::string>() + "\"";
+        } else {
+            got = "a non-scalar value";
+        }
+        throw ConfigError(
+            sec + ".shutdown_offers must be \"cancel\" or \"keep\" (got "
+            + got
+            + "): it decides what a stop does with the resting offers "
+              "when the stop request does not say");
+    }
+    cfg.shutdown_offers = *policy;
+    return cfg;
+}
+
 // [PACE D1 2026-09-13] Per-pair concentration overrides.  The EFFECTIVE soft
 // limit (override or risk.soft_limit_pct) must be below the effective hard
 // limit for every configured pair, enabled or not, with or without the pace
@@ -4436,6 +4736,47 @@ AppConfig load_config(const std::string& path,
     cfg.market_allocator = parse_market_allocator(root);
     cfg.recovery   = parse_recovery(root);
     cfg.buyer      = parse_buyer(root);
+    cfg.engine     = parse_engine(root);
+
+    // [S70 2026-09-20] Cross-section: ttl_cancel_mode: expire spares only an
+    // offer that carries an on-chain expiry.  With no expiry configured on
+    // the strategy or on any pair it spares nothing, yet the config would
+    // read as "age cancels are off" -- so refuse the combination at load,
+    // naming the way out, rather than let the operator watch ttl_expired
+    // cancels continue under a mode that claims to have stopped them.
+    //
+    // [review #164] Judged on each pair's EFFECTIVE expiry, through the one
+    // function the posting path uses (execution::effective_offer_expiry_secs):
+    // a present 0 override BINDS, so a global expiry that every pair opts out
+    // of attaches no timelock anywhere.  The first revision counted the global
+    // regardless and accepted exactly that config.  Only ENABLED pairs count:
+    // a disabled pair posts nothing, and enabling one needs a restart, which
+    // re-runs this check.  With no enabled pair at all there is nothing for
+    // the mode to mislead about, and the config loads.
+    if (cfg.strategy.ttl_cancel_mode == TtlCancelMode::Expire) {
+        bool any_enabled = false;
+        bool any_expiry  = false;
+        for (const auto& p : cfg.pairs) {
+            if (!p.enabled) {
+                continue;
+            }
+            any_enabled = true;
+            if (execution::effective_offer_expiry_secs(
+                    p.offer_expiry_secs_override,
+                    cfg.strategy.offer_expiry_secs) > 0u) {
+                any_expiry = true;
+            }
+        }
+        if (any_enabled && !any_expiry) {
+            throw ConfigError(
+                "strategy.ttl_cancel_mode: expire requires an on-chain expiry "
+                "on at least one ENABLED pair -- set strategy.offer_expiry_secs "
+                "above 0 (a pair's offer_expiry_secs_override: 0 opts that pair "
+                "out), or give a pair its own offer_expiry_secs_override, or "
+                "set ttl_cancel_mode back to 'cancel'. With no expiry attached, "
+                "every offer keeps the hard TTL and the mode changes nothing.");
+        }
+    }
 
     // Cross-section: revive_market quotes from the fair-value solve with
     // no order-book reference, so its whole safety envelope is carried by

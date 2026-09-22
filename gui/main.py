@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 from typing import Callable, Final, Iterable, Optional
 
-from gui import shutdown_flag
+from gui import shutdown_flag, stop_offers
 from gui.app import XOPTraderApp
 from gui.services.engine_bridge import EngineBridge
 from gui.utils import (
@@ -773,11 +773,28 @@ def _install_signal_handlers(app: XOPTraderApp) -> None:
         sys.stderr.write(
             f"[XOPTrader] Received {sig_name} -- shutting down.\n"
         )
+        # [S74] Qt 6's quit() closes every window first, and the main window's
+        # closeEvent asks what the engine stop does with the resting offers.
+        # Nobody sent this signal from that window: mark the quit BEFORE it
+        # starts so no modal prompt can block it, and the engine's own
+        # engine.shutdown_offers decides.
+        stop_offers.mark_noninteractive_quit(sig_name)
         app.quit()
 
     # SIGINT / SIGTERM are available on all POSIX platforms.
     signal.signal(signal.SIGINT, _shutdown_handler)
     signal.signal(signal.SIGTERM, _shutdown_handler)
+
+    # [S74] An OS session end (log-off, shutdown, restart): same rule. Qt
+    # emits commitDataRequest while the session manager waits on this process,
+    # then aboutToQuit; a prompt there would hold up the whole log-off until
+    # Windows kills the GUI and the engine with it.
+    app.commitDataRequest.connect(_on_session_ending)
+
+
+def _on_session_ending(*_args: object) -> None:
+    """[S74] The OS session is ending: nobody will answer a stop prompt."""
+    stop_offers.mark_noninteractive_quit("OS session end")
 
 
 # ---------------------------------------------------------------------------

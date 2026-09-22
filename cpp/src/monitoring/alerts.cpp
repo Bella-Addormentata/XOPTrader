@@ -83,6 +83,8 @@ const char* to_string(AlertRule rule) noexcept
         case AlertRule::DeadMansSwitchLive:   return "DeadMansSwitchLive";
         case AlertRule::ConfigReload:         return "ConfigReload";
         case AlertRule::CancelUnresolved:     return "CancelUnresolved";
+        case AlertRule::FeeBudgetBound:       return "FeeBudgetBound";
+        case AlertRule::FeeBudgetUnfunded:    return "FeeBudgetUnfunded";
     }
     return "UNKNOWN";
 }
@@ -111,6 +113,15 @@ AlertTier tier_for_rule(AlertRule rule) noexcept
         // [RELOAD] A reload outcome is operator feedback on an action they
         // just took -- important, never capital-critical by itself.
         case AlertRule::ConfigReload:
+        // [S67] The budget cannot fund offer-attached fees, so min_fee_mojos
+        // pays them: [review #163 r9] the fee is pinned at the floor rather
+        // than necessarily "degraded", and nothing stops.  Attention, not a
+        // page.
+        case AlertRule::FeeBudgetBound:
+        // [review #163] The budget was exceeded on purpose so a cancel could
+        // still clear the node's floor.  Nothing is stuck and nothing stops;
+        // the budget is mis-sized and wants raising.
+        case AlertRule::FeeBudgetUnfunded:
             return AlertTier::WARNING;
 
         // A quote stablecoin leaving its peg mis-values the entire book and

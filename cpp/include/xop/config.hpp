@@ -24,6 +24,7 @@
 #include <vector>
 #include <stdexcept>
 #include <xop/peg_registry.hpp>
+#include <xop/util/stop_offers_policy.hpp>
 
 namespace xop {
 
@@ -60,6 +61,52 @@ inline const char* to_string(ChiaMode m) noexcept {
         case ChiaMode::WalletOnly: return "wallet_only";
     }
     return "unknown";
+}
+
+// ---------------------------------------------------------------------------
+// [S70-S72 2026-09-20] The three cancel-reduction switches.  Each is a named
+// mode rather than a bool so the log and the config say WHICH rule ran, and
+// each defaults to the rule that was in force before the switch existed.
+// ---------------------------------------------------------------------------
+
+/// strategy.ttl_cancel_mode -- what ends an offer that is merely OLD.
+///   Cancel: the unconditional hard-TTL cancel (offer_ttl_blocks x
+///           OfferManager::kHardTtlMultiplier), a fee-bearing spend.
+///   Expire: an offer that VERIFIABLY carries an on-chain expiry
+///           (offer_expiry_secs) is left to the chain, then retired with a
+///           free local cancel once a chain clock supplied by a full node on
+///           THIS host is safely past its max_time
+///           (execution/offer_expiry.hpp).  An offer with no verified expiry
+///           keeps the hard TTL, and so does every offer while the wallet has
+///           any full-node peer this host does not run.
+enum class TtlCancelMode : std::uint8_t { Cancel = 0, Expire = 1 };
+
+/// strategy.exposure_rule -- how Step 8 projects reserve exposure.
+///   Legacy:  spendable - pending, at two sites that disagree the moment an
+///            offer locks a coin (execution/exposure_gate.hpp).
+///   Unified: one verdict from lock-invariant inputs, shared by both sites --
+///            and, while any LIVE resting offer's pair cannot be resolved
+///            against this config, a refusal to ADD exposure rather than a
+///            reading of that offer's spend as zero.
+enum class ExposureRule : std::uint8_t { Legacy = 0, Unified = 1 };
+
+/// strategy.price_cancel_mode -- when a resting offer is cancelled for PRICE.
+///   Deviation: drift from the tier's new optimal price past a threshold.
+///   Margin:    only when a fill at the resting price would earn less than
+///              price_cancel_edge_retain x the edge Step 7 demands -- judged
+///              against BOTH of Step 7's centres, the KINDER of the two edges
+///              deciding, so the rule never cancels what the pricer would
+///              itself post (execution/cross_guard.hpp).
+enum class PriceCancelMode : std::uint8_t { Deviation = 0, Margin = 1 };
+
+inline const char* to_string(TtlCancelMode m) noexcept {
+    return m == TtlCancelMode::Expire ? "expire" : "cancel";
+}
+inline const char* to_string(ExposureRule m) noexcept {
+    return m == ExposureRule::Unified ? "unified" : "legacy";
+}
+inline const char* to_string(PriceCancelMode m) noexcept {
+    return m == PriceCancelMode::Margin ? "margin" : "deviation";
 }
 
 // ---------------------------------------------------------------------------
@@ -403,6 +450,63 @@ struct StrategyConfig {
     /// return collateral -- land a cancel.
     uint32_t offer_expiry_secs{0};
 
+    /// [MIN-INPUT-COIN 2026-09-19] Smallest coin the wallet may use to fund
+    /// an offer, as a fraction of the amount the offer spends.  Sent to
+    /// create_offer_for_ids as `min_coin_amount` =
+    /// ceil(offered mojos x this), for CAT-funded offers only.
+    ///
+    /// Dexie pays rewards as one tiny coin per rewarded offer; the wallet's
+    /// coin selection prefers that dust, and an offer built from about 130
+    /// or more inputs is refused by Dexie ("Too many input coins") while it
+    /// still locks its coins in the wallet.  With every CAT input at least
+    /// this fraction of the amount, ceil(1 / fraction) of them always
+    /// suffice: 100 at the default, against a measured Dexie limit between
+    /// 125 and about 132.
+    ///
+    /// THAT BOUNDS THE CAT LEG, NOT THE OFFER [review #162, round 5].  The
+    /// XCH fee coin is chosen in a separate selection that this CAT-scaled
+    /// value does not constrain, so the fee leg's coin count is not bounded
+    /// here -- it is one coin only while every XCH coin covers the fee,
+    /// which is a measurement, not a guarantee.  The create pays
+    /// current_fee_mojos_, clamped by FeeTracker to
+    /// [fees.min_fee_mojos, fees.max_fee_mojos]; today's smallest XCH coin
+    /// is 133x that CAP, so every coin covers any fee the engine can send
+    /// [review #162, round 7 -- the 887x quoted here before was against
+    /// min_fee_mojos, the smallest fee, which is the weaker claim].
+    ///
+    /// THE INPUT COUNT IS NOT MONOTONE IN THIS FRACTION [review #162,
+    /// round 5 -- CORRECTING THIS COMMENT].  An earlier revision said
+    /// "RAISING it tightens the bound", which is true only while the coins
+    /// at or above the floor can still cover the amount.  Past that point
+    /// the wallet refuses and the fallback below re-sends the create with
+    /// NO floor, so that offer is dust-funded again and the bound is gone:
+    /// raising the fraction further makes that outcome MORE common, not
+    /// less, and it is the outcome a Dexie "Too many input coins" refusal
+    /// reports AT THIS FRACTION.  Lowering the fraction loosens the bound
+    /// instead, and below 1 / 124 the CAT-leg bound plus the fee coin
+    /// exceeds the 125 inputs Dexie was measured to accept.  So the useful
+    /// range is narrow, the remedy for a refusal is to combine the coins
+    /// (chia wallet coins combine), and the only fraction change that can
+    /// help is a small REDUCTION -- and only when it is the floored create
+    /// the wallet is refusing.
+    ///
+    /// AND THE RANGE IS WIDER THAN THAT [review #162, round 7].  [0, 1) is
+    /// closed at the bottom, so 0.002 loads without complaint and bounds the
+    /// CAT leg at 500 -- above Dexie's limit on its own.  Under 1 / 124 the
+    /// floor stops guaranteeing what it exists for: a create the wallet
+    /// SATISFIES can be refused for input count, and "a refusal means no
+    /// floor was sent" is then false.  config.cpp warns at load, and the
+    /// [dexie-too-many-inputs] warning computes ceil(1 / frac) and inverts
+    /// its advice rather than assuming the 0.01 case.
+    ///
+    /// 0 disables the floor and restores the previous request byte for
+    /// byte.  Range [0, 1).  XCH-funded offers never carry it: their coins
+    /// are shaped by the coin pool and budgeted by the XCH lock ledger.  If
+    /// the wallet answers that the floor leaves too little to spend, the
+    /// create is retried once without it and a warning names the offer.
+    /// Read at startup.  See execution/offer_min_input_coin.hpp.
+    double offer_min_input_coin_frac{0.01};
+
     // [ALWAYSOFFER 2026-08-30] Side-aware BBO sanity (see bbo_sanity.hpp).
     // Aggressive deviation (would EXECUTE dislocated) keeps the tight
     // 10%; passive deviation (merely RESTS far from a thin book, e.g. a
@@ -412,6 +516,94 @@ struct StrategyConfig {
     double bbo_sanity_max_aggressive_dev{0.10};
     double bbo_sanity_max_passive_dev{0.30};
     double bbo_sanity_max_mid_dev{0.50};
+
+    /// [S70 2026-09-20] What ends an offer that is merely OLD.  `cancel`
+    /// (default) is the unconditional hard-TTL cancel.  `expire` leaves an
+    /// offer that verifiably carries offer_expiry_secs' max_time to the
+    /// chain and retires it with a FREE local cancel once a chain clock,
+    /// read kExpiredRetireDepthBlocks below the wallet's synced height, is
+    /// past that max_time; the soft-TTL
+    /// adverse rule, every price rule and every safety cancel still apply,
+    /// and an offer with no verified expiry keeps the hard TTL.  The
+    /// reasoning and the wallet facts are in execution/offer_expiry.hpp --
+    /// including the one offer_expiry_secs above declined to claim: an
+    /// expired PENDING_ACCEPT trade stays in get_locked_coins() until it is
+    /// cancelled, so this mode is what lands that cancel.
+    /// `expire` with no expiry configured anywhere is rejected at load: it
+    /// would read as "TTL cancels are off" while changing nothing.
+    ///
+    /// [review #164 2026-09-21] THAT CLOCK IS NOT THE WALLET'S OWN, and this
+    /// comment was the LAST place in the tree still saying it was -- the
+    /// defect this review round is about, reproduced inside its own fix, in
+    /// the file an operator reads before setting the key.  Only the HEIGHT is
+    /// anchored to the wallet's processed chain (get_height_info).  The
+    /// TIMESTAMP at that height is whatever the first answering full-node
+    /// peer says, with no signature, proof of space, VDF or consensus check
+    /// (rpc/wallet_requests.hpp has the 2.7.4 line numbers), and the depth
+    /// bounds reorgs only, never a liar.
+    ///
+    /// So `expire` carries a PRECONDITION, and it is not optional: the wallet
+    /// must reach the chain only through a full node on THIS host.  The pass
+    /// censuses the wallet's full-node peers either side of the clock read
+    /// and retires nothing unless every one of them is local; while that does
+    /// not hold -- most obviously when the local node is down -- retires
+    /// pause and those offers keep their coins locked, logged as "no trusted
+    /// chain clock".  Check the wallet's own get_connections before enabling.
+    TtlCancelMode ttl_cancel_mode{TtlCancelMode::Cancel};
+
+    /// [S71 2026-09-20] Step 8's reserve-exposure rule.  `legacy` (default)
+    /// is the pair of spendable-based checks that cancelled 528 offers in 14
+    /// days at an average age of 27 blocks; `unified` is one verdict from
+    /// lock-invariant inputs (execution/exposure_gate.hpp).
+    /// [review #164] `unified` also fails CLOSED in one direction, which is
+    /// not a reserve breach and does not say so in the log: while a LIVE
+    /// resting offer's pair cannot be resolved against this config (an
+    /// adopted UNKNOWN wallet record, or a pair since REMOVED from the file
+    /// -- a merely DISABLED pair is still mapped), the resting sum is a lower
+    /// bound while `owned` still counts the coins that offer locks, so new
+    /// posts are suppressed on both sides.  It never cancels a resting offer
+    /// on that account.  Watch for "exposure (unified) ... cannot be
+    /// projected -- a LIVE resting offer's pair is not in this config".
+    ExposureRule  exposure_rule{ExposureRule::Legacy};
+    /// [S71] Unified rule only.  New posts are suppressed when the projected
+    /// balance is below the reserve; RESTING offers are cancelled only below
+    /// reserve x (1 - this).  [0, 1]; 1 never cancels (suppress only).
+    double        exposure_cancel_hysteresis_pct{0.25};
+    /// [S71] Unified rule only.  A resting offer younger than this is never
+    /// an exposure-cancel candidate.  Peak-height blocks (18.75 s): 32 is
+    /// ten minutes.  [0, 4608].
+    std::uint32_t exposure_cancel_min_age_blocks{32};
+
+    /// [S72 2026-09-20] When a resting offer is cancelled for PRICE.
+    /// `deviation` (default) is the selective refresh: drift from the tier's
+    /// new optimal price past kSelectiveRefreshThreshold x tier scale, the
+    /// soft-TTL adverse threshold, and the anchor override.  `margin`
+    /// replaces all three with one test -- would a fill at the resting price
+    /// still earn the edge Step 7 demands of a NEW offer
+    /// (max(min_profit_margin, quote_width_sigma_mult x combined_sigma,
+    /// tibetswap fee))?  A crossed offer is still cancelled
+    /// first, kMinRefreshAgeBlocks still protects a young one, and
+    /// favourable drift never cancels (it only adds edge).
+    ///
+    /// [review #164] WHICH centre that edge is measured against is not a
+    /// detail, and an earlier revision of this comment named only one.  BOTH
+    /// of Step 7's centres are judged and the KINDER edge decides: the
+    /// shifted ladder centre alone is the wrong frame for "what would this
+    /// fill earn", and the fair centre alone cancels what the pricer just
+    /// posted on the side being shed (execution/cross_guard.hpp).
+    /// Nor is the switch a free reduction in wasted cancels: replayed over
+    /// the recorded fortnight the rule fires at some block of the recorded
+    /// life of up to 7 of the 15 offers that actually FILLED, and `margin`
+    /// drops the anchor override, so nothing pulls a favourably-drifted quote
+    /// back toward the touch (cpp/tests/test_price_cancel_replay.cpp).
+    PriceCancelMode price_cancel_mode{PriceCancelMode::Deviation};
+    /// [S72] Margin rule only.  The fraction of Step 7's posting floor a
+    /// RESTING offer must keep.  (0, 1].  1.0 cancels the moment the edge
+    /// dips under the posting floor -- and Step 7 routinely posts tiers
+    /// exactly AT that floor, so at 1.0 any adverse tick refreshes them.
+    /// The post and cancel thresholds must not coincide; 0.5 keeps an offer
+    /// until it has lost half the edge a new one would need.
+    double        price_cancel_edge_retain{0.5};
 
     // [FLOOR 2026-08-30] The Step 7 ask floor mode: "strict" (never quote
     // below basis+margin -- the old unconditional behaviour), "aging"
@@ -2128,6 +2320,79 @@ struct FeeConfig {
     /// Market-making offers are long-lived (offer_ttl_blocks ~60), so
     /// urgency is low.  Default 300 s (5 min).
     uint32_t fee_estimate_target_seconds{300};
+
+    // -- [S67 2026-09-20] Cost-aware estimate and the fee controller --------
+    //
+    // Both ship OFF.  With both off every fee is byte-identical to v0.10.24.
+    // Design, evidence and every rule: strategy/fee_controller.hpp.  EVERY
+    // block count below is a PEAK height (4,608 per day, 18.75 s each).
+
+    /// Ask get_fee_estimate for a RATE (explicit `cost`) and scale it by the
+    /// action's own CLVM cost, instead of asking about a plain XCH send
+    /// (9.4M cost) and paying that for a 42M-cost CAT cancel.  Gated on its
+    /// own because it changes fees paid with the controller off (about 4.5x
+    /// for a CAT cancel).  Implied by controller_enabled.
+    bool     cost_aware_estimate{false};
+
+    /// Master switch for the closed-loop controller.
+    bool     controller_enabled{false};
+
+    /// Setpoint: our spends should confirm within this many peak heights.
+    uint32_t controller_target_delay_blocks{8};
+
+    /// Gains in log2 fee units per target delay of lateness.
+    double   controller_kp{1.0};
+    double   controller_ki{0.5};
+    double   controller_kd{0.5};
+
+    /// Cap on one observation's lateness, and what a hard signal reports.
+    double   controller_max_error{2.0};
+
+    /// Cap on one observation's raise, log2 units (1.0 = x2).
+    double   controller_max_step_up{1.0};
+
+    /// A too-low spend stops counting once the level is this far (log2) above
+    /// the level it was submitted at.
+    double   controller_min_raise{1.0};
+
+    /// Observations consumed before the level may move.
+    uint32_t controller_warmup_observations{3};
+
+    /// Probe-down: step size, run of on-target confirmations before a probe,
+    /// confirmations that make a probe good, bump above last-good when one
+    /// fails, and the cap on the doubled interval.
+    double   controller_probe_fraction{0.15};
+    uint32_t controller_probe_after_confirmations{8};
+    uint32_t controller_probe_confirmations{3};
+    double   controller_probe_fail_bump{0.10};
+    uint32_t controller_probe_backoff_cap{256};
+
+    /// Multiplier on the node's estimate and admission floor.
+    double   controller_ff_margin{1.10};
+
+    /// A node reading older than this many peak heights is dropped.
+    uint32_t controller_ff_max_age_blocks{32};
+
+    /// Budget held back from offer-attached fees: this many CAT cancels at the
+    /// current fee, capped at half of daily_budget_mojos.
+    ///
+    /// [review #163 r8] It makes the squeeze on attached fees START while that
+    /// much of the window is still unspent; it is NOT a guarantee that the
+    /// resting book can still be cancelled, and this comment used to say it
+    /// was.  fees.min_fee_mojos overrides the reserve unconditionally, nothing
+    /// refuses to post on budget grounds with the controller on, and Step 8
+    /// books a fee for every offer POSTED, so attached fees can still drive the
+    /// window past the budget.  Cancels are funded because apply_budget's
+    /// PRIORITY branch never looks at the reserve at all -- they are paid in
+    /// full and the overrun reported.  See strategy::fee::apply_budget.
+    uint32_t controller_budget_reserve_cancels{25};
+
+    /// CLVM cost per action class, measured on this wallet 2026-09-20; see
+    /// strategy::fee::ClassCosts for the numbers and how they were taken.
+    std::uint64_t controller_cost_offer_attached{21'000'000ULL};
+    std::uint64_t controller_cost_cancel_xch{8'400'000ULL};
+    std::uint64_t controller_cost_cancel_cat{42'300'000ULL};
+    std::uint64_t controller_cost_take{125'000'000ULL};
 };
 
 // ---------------------------------------------------------------------------
@@ -2449,6 +2714,32 @@ struct BuyerConfig {
 };
 
 // ---------------------------------------------------------------------------
+// EngineConfig -- the optional `engine:` section: process-level behaviour that
+// belongs to no trading subsystem.
+// ---------------------------------------------------------------------------
+struct EngineConfig {
+    /// [S74 2026-09-20] What a stop does with the resting book when the stop
+    /// request itself does not say: "cancel" (the default, and the only
+    /// behaviour before this key existed) or "keep".
+    ///
+    /// The GUI asks the operator on Stop and on window close and writes the
+    /// answer into data/shutdown.flag; THIS key answers every stop where
+    /// nobody was there to ask -- a console Ctrl+C, SIGTERM, a service stop,
+    /// an OS session end, a pre-policy GUI, a hand-written flag.  The rule and
+    /// the full table are in xop/util/stop_offers_policy.hpp.
+    ///
+    /// "keep" leaves offers TAKEABLE with no engine behind them: no TTL, no
+    /// repricing and no dead man's switch until the next start re-adopts
+    /// them.  The only bound on that is the on-chain expiry
+    /// (strategy.offer_expiry_secs), so the engine warns at startup when
+    /// "keep" is configured while an enabled pair posts offers with none.
+    ///
+    /// Read at startup only; a Settings save takes effect at the next engine
+    /// start, like every key the reload does not apply live.
+    util::StopOffersPolicy shutdown_offers{util::StopOffersPolicy::Cancel};
+};
+
+// ---------------------------------------------------------------------------
 // Top-level application configuration aggregating every section.
 // ---------------------------------------------------------------------------
 struct AppConfig {
@@ -2479,6 +2770,7 @@ struct AppConfig {
     MarketAllocatorConfig market_allocator;
     RecoveryConfig   recovery;
     BuyerConfig      buyer;
+    EngineConfig     engine;
 };
 
 // ---------------------------------------------------------------------------

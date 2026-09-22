@@ -39,6 +39,7 @@
 #include "xop/config.hpp"
 #include "xop/version.hpp"
 #include "xop/util/process_identity.hpp"
+#include "xop/util/stop_offers_policy.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -293,7 +294,13 @@ static std::optional<CliArgs> parse_cli(int argc, char* argv[]) {
     }
 
     if (vm.count("help")) {
-        std::cout << desc << "\n";
+        // [S74] The second line is a CAPABILITY MARKER, not decoration: the
+        // GUI reads --help and offers "Keep offers on the book" only when the
+        // token is present, because an engine without it would cancel the
+        // book on a request that says keep (stop_offers_policy.hpp).
+        std::cout << desc << "\n"
+                  << "Stop requests: " << xop::util::kStopPolicyHelpToken
+                  << " (no offers line: engine.shutdown_offers decides)\n";
         return std::nullopt;
     }
 
@@ -709,7 +716,9 @@ int main(int argc, char* argv[]) {
     //    work to the internal io_context via an atomic flag).
     //
     //    Two-phase protocol:
-    //      First signal  -> engine->shutdown() (graceful, cancels offers)
+    //      First signal  -> engine->shutdown() (graceful; [S74] a signal
+    //                       names no stop policy, so engine.shutdown_offers
+    //                       decides whether the offers are cancelled or kept)
     //      Second signal -> std::_Exit()       (force-kill escape hatch)
     //
     //    On Windows, SIGINT maps to Ctrl+C and SIGTERM is best-effort

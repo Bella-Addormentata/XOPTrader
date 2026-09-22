@@ -57,8 +57,15 @@ SUBMIT_REASONS = (
     # (pace_idle_ttl, pace_idle_crossed, pace_increasing, pace_tier,
     # pace_above_fv, pace_budget) from pace_why.
     "pace_why[oid]",
+    # [S70 2026-09-20] ttl_cancel_mode: expire retires an offer the CHAIN has
+    # already made untakeable with a free local cancel.  It is a submit-time
+    # write like every other: the wallet's CANCELLED verdict, seen by
+    # detect_fills, is still what completes the row, and a CONFIRMED trade is
+    # never retired at all (execution::decide_expired_retire), so `filled`
+    # keeps winning.
+    '"expired_onchain"',
 )
-SUBMIT_SITE_COUNT = 19
+SUBMIT_SITE_COUNT = 20
 
 
 def _read(path: Path) -> str:

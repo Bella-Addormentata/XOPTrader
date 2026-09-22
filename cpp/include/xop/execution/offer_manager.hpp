@@ -52,6 +52,7 @@
 
 #include "xop/execution/coin_lock_ledger.hpp"
 #include "xop/execution/offer_expiry.hpp"
+#include "xop/execution/offer_min_input_coin.hpp"
 #include "xop/execution/take_retry.hpp"
 #include "xop/execution/terminal_recheck.hpp"
 #include <spdlog/spdlog.h>
@@ -111,6 +112,12 @@ struct TierClassification {
     bool            crossed{false};  ///< True when the offer crossed the mid-price.
     std::uint8_t    tier_index;      ///< Tier index of this offer.
     Side            side;            ///< Bid or Ask.
+    /// [S72] Stale because a fill at the resting price would earn less than
+    /// the resting floor (price_cancel_mode: margin), with the two numbers
+    /// the cancel reason records.  False for every other cause.
+    bool            margin_breach{false};
+    double          edge_bps{0.0};          ///< edge vs Step 7's centre, bps.
+    double          required_edge_bps{0.0}; ///< Step 7 floor x edge_retain.
 };
 
 // ---------------------------------------------------------------------------
@@ -333,8 +340,16 @@ public:
     /// @param trade_id       Wallet trade id to re-query.
     /// @param current_block  Height used when re-adopting a CONFIRMED
     ///                       offer into State.
+    /// @param wallet_cancelled_out  [review #163] When not null, set to true
+    ///                       iff the verdict is StillTerminal AND the wallet's
+    ///                       status is CANCELLED.  StillTerminal also covers
+    ///                       FAILED, which is no evidence that a cancel spend
+    ///                       confirmed; the fee controller needs to tell them
+    ///                       apart and nothing else does.  Must outlive the
+    ///                       await (a local of the awaiting coroutine does).
     asio::awaitable<TerminalRecheck>
-    recheck_terminal(const std::string& trade_id, BlockHeight current_block);
+    recheck_terminal(const std::string& trade_id, BlockHeight current_block,
+                     bool* wallet_cancelled_out = nullptr);
 
     // -- Cancellation -------------------------------------------------------
 
@@ -348,12 +363,47 @@ public:
      * @param pair_name      Trading pair name (e.g. "XCH/wUSDC").
      * @param current_block  Latest known block height.
      * @param ttl_blocks     Maximum offer age in blocks before cancellation.
+     * @param spare_expiring [S70] When true, an offer that is left to its
+     *                       on-chain expiry under ttl_cancel_mode: expire
+     *                       (execution::age_limit_cancel_applies) is skipped.
+     *                       Only Step 8's stuck pass sets it -- that pass
+     *                       exists to retry the hard-TTL cancel, which such
+     *                       an offer never had.  The stopped-engine sweep
+     *                       leaves it false: a stopped book is aged out at
+     *                       the soft TTL whatever the mode.
      * @return Offer IDs that were successfully cancelled.
      */
     asio::awaitable<std::vector<std::string>> cancel_stale(
         const std::string& pair_name,
         BlockHeight        current_block,
-        BlockHeight        ttl_blocks);
+        BlockHeight        ttl_blocks,
+        bool               spare_expiring = false);
+
+    /**
+     * @brief [S70 2026-09-20] Retire resting offers whose on-chain expiry
+     *        has passed, with a FREE local cancel.
+     *
+     * No-op unless strategy.ttl_cancel_mode is `expire`.  For each tracked,
+     * not-cancel-pending offer whose verified max_time the host clock says
+     * has passed (a pre-filter only), it censuses the wallet's full-node
+     * peers, reads the chain clock ONCE (get_height_info ->
+     * get_timestamp_for_height) only if every one of them is on this host,
+     * censuses them again, and discards the clock unless that still holds
+     * (execution::chain_clock_trust -- the clock is a peer's unvalidated
+     * assertion, not a local fact).  Then, for each such offer, it re-reads
+     * the trade record and applies execution::decide_expired_retire.
+     * Only RetireLocal sends cancel_offer(fee 0, secure=false) -- the single
+     * place outside emergency_cancel's last resort that may, and the reason
+     * it may is in execution/offer_expiry.hpp.  The offer is then marked
+     * cancel_pending and stays in State: only the wallet's CANCELLED verdict,
+     * seen by detect_fills, completes its offer_log row.
+     *
+     * @param current_block  Height, for logging.
+     * @return Offer IDs whose local cancel the wallet accepted; the caller
+     *         records each through mark_offer_cancel_submitted.
+     */
+    asio::awaitable<std::vector<std::string>> retire_expired_offers(
+        BlockHeight current_block);
 
     /**
      * @brief [S46 2026-09-02] The outcome of a cancel sweep, in enough
@@ -594,6 +644,17 @@ public:
      *                      not just adverse deviations.
      * @param can_bid       Whether bid (buy base) offers are currently allowed on this pair.
      * @param can_ask       Whether ask (sell base) offers are currently allowed on this pair.
+     * @param margin_centre        [S72] Step 7's SHIFTED ladder centre for the
+     *                      pair this cycle, in mojos (PairCycleState::quote_mid_mojos).
+     * @param margin_fair_centre   [S72] Step 7's fair-value centre before the
+     *                      inventory shift (quote_fair_centre_mojos); an offer
+     *                      is cancelled for price only if it fails against
+     *                      BOTH (cross_guard.hpp).  0 = not captured.
+     * @param margin_min_edge_bps  [S72] Step 7's minimum half-spread for the
+     *                      pair this cycle (quote_min_half_spread_bps).  Both
+     *                      are read only under price_cancel_mode: margin, and
+     *                      0 (the default, and what the pace pass sends)
+     *                      means "no reference": the deviation zones decide.
      * @return Per-offer classification results.
      */
     std::vector<TierClassification> classify_tier_staleness(
@@ -604,7 +665,10 @@ public:
         Mojo                           mid_price = 0,
         bool                           anchor_active = false,
         bool                           can_bid = true,
-        bool                           can_ask = true) const;
+        bool                           can_ask = true,
+        double                         margin_centre = 0.0,
+        double                         margin_min_edge_bps = 0.0,
+        double                         margin_fair_centre = 0.0) const;
 
     /**
      * @brief [T5-01] Cancel only the offers classified as Stale or Expired.
@@ -735,6 +799,36 @@ public:
     /// wire it.
     void set_abort_predicate(std::function<bool()> predicate);
 
+    /// [S74 / review #165, round 4] "Stop CREATING. Cancel nothing."
+    ///
+    /// Consulted immediately before every create, beside the abort predicate
+    /// above and never instead of it. The two differ in what they do about an
+    /// offer that already exists:
+    ///
+    ///   abort_predicate_          the dead man's switch fired: refuse to
+    ///                             create, and CANCEL a create that landed
+    ///                             after the bulk sweep enumerated the book;
+    ///   stop_creating_predicate_  the operator asked the engine to stop:
+    ///                             refuse to START a create, and touch nothing
+    ///                             that exists. A keep stop must not cancel,
+    ///                             and a cancelling stop's own sweep owns the
+    ///                             book from here on.
+    ///
+    /// WHY IT EXISTS (TODO S76 (a)). A keep stop waits for the ONE create it
+    /// can find in flight, on a budget sized to exactly that window
+    /// (util::keep_stop_drain_budget_ms, 247 s as shipped). The wait suspends
+    /// on a poll timer, which hands control back to the very coroutine it is
+    /// waiting for -- and without this predicate post_quotes went on to the
+    /// next tier, re-armed the mark, and made the drain wait out an
+    /// unbounded ladder under a budget that covers one create. Worse than the
+    /// latency: it created NEW offers after the operator asked to stop, and a
+    /// budget that then expires abandons a create mid-flight, which is the
+    /// orphan the drain exists to prevent.
+    ///
+    /// Unset means "never stop", so nothing changes for callers that do not
+    /// wire it.
+    void set_stop_creating_predicate(std::function<bool()> predicate);
+
     /// [S31] Called when an offer created after the abort could not be
     /// cancelled again, with an operator-facing description.
     ///
@@ -746,8 +840,118 @@ public:
     /// it is for.
     void set_escalation(std::function<void(const std::string&)> escalate);
 
+    /// [S74 / review #165] The flag a KEEP stop's drain watches.
+    ///
+    /// Set while a create_offer is outstanding AND the offer it returns is not
+    /// yet in State -- the one window in which stopping the io_context can
+    /// leave a live offer this process never recorded, and the next boot meets
+    /// as an ORPHAN it may cancel. Cleared by RAII, so a throw, an early
+    /// `continue` and an abandoned coroutine frame all clear it.
+    ///
+    /// NOT held for a whole ladder: every offer created earlier in the same
+    /// post_quotes call is already in State, and the keep stop's flush gives
+    /// each of those an offer_log row. Holding it across the ladder would make
+    /// the stop wait for up to 2 x num_tiers creates for no extra safety
+    /// (xop/util/stop_offers_policy.hpp has the budget arithmetic).
+    ///
+    /// Unset means the marks do nothing, so nothing changes for a caller that
+    /// does not wire it. Read and written on the io_context thread only.
+    void set_posting_in_flight_flag(bool* flag) noexcept;
+
+    /// [S74 / review #165, round 4] The flag that says "a create ended with
+    /// NO ANSWER, so the wallet may hold an offer this process never
+    /// recorded".
+    ///
+    /// The drain flag above answers "is a create outstanding RIGHT NOW"; this
+    /// one answers "did one already end in a way that proves nothing". A
+    /// create that throws a transport error clears its PostingMark -- there is
+    /// nothing left for the io_context to wait for -- but a timeout, an empty
+    /// reply or a 5xx does not prove the wallet refused it
+    /// (rpc::request_possibly_submitted). Set once and never cleared: only a
+    /// reconcile against the wallet could retire the doubt, and nothing here
+    /// does that. A keep stop READS it and says so, rather than reporting that
+    /// everything it created is recorded.
+    ///
+    /// Engine-owned (Engine::create_outcome_unknown_), exactly like the drain
+    /// flag, because the keep branch and the keep report are scan-forbidden
+    /// from calling back into OfferManager. Unset means the notes do nothing.
+    /// Read and written on the io_context thread only.
+    void set_create_outcome_unknown_flag(bool* flag) noexcept;
+
     /// Return the fee currently in effect (dynamic or static fallback).
     [[nodiscard]] std::uint64_t current_fee() const noexcept;
+
+    // -- [S67] Class-aware cancel fees ---------------------------------------
+
+    /// The fee controller's cancel fees.  A secure cancel spends the coins
+    /// the offer OFFERED: an XCH coin costs ~8.4M CLVM, a CAT coin plus its
+    /// XCH fee coin ~42M, so one fee for both under- or over-pays by 5x.
+    /// Until this is called every cancel pays current_fee(), exactly as
+    /// before.
+    ///
+    /// [review #163 r9] The engine calls it whenever
+    /// FeeTracker::class_fees_active() is true, which is the CONTROLLER OR
+    /// fees.cost_aware_estimate ALONE -- not "only while
+    /// fees.controller_enabled", as this used to say.  And it is called from
+    /// Step 8, which first runs AFTER startup_reconcile: for the whole boot
+    /// window every cancel that reconciliation issues -- including the
+    /// OrphanDisposition::Unknown path, which fires for any resting offer on
+    /// a pair the operator has disabled -- pays the raw constructor fee.
+    void set_cancel_fees(std::uint64_t xch_offered_mojos,
+                         std::uint64_t cat_offered_mojos) noexcept;
+
+    /// Back to one fee for everything (neither the controller nor
+    /// fees.cost_aware_estimate is on).
+    void clear_cancel_fees() noexcept;
+
+    /// [review #163] Called after every per-offer SECURE cancel the wallet
+    /// ACCEPTED, with the trade id and the fee that cancel really paid --
+    /// whatever path chose it (Step 8, an emergency tier, a zero-fee retry,
+    /// an escalation).  The fee controller opens its ticket from this, at
+    /// the moment of submission: a ticket opened a heartbeat later from the
+    /// CURRENT policy missed every cancel that confirmed inside that
+    /// heartbeat and misattributed any whose fee was not the policy's.
+    /// Not called for a local-only (insecure) cancel, which spends nothing,
+    /// nor for the bulk cancel_offers sweep.  Unset: nothing happens.
+    void set_cancel_observer(
+        std::function<void(const std::string& trade_id, std::uint64_t fee_mojos)> observer);
+
+    /// The fee a cancel of `offer_id` pays now: current_fee() unless
+    /// set_cancel_fees() is in force, then the fee for the asset the offer
+    /// offered (strategy::fee::cancel_fee_for).  An offer State does not
+    /// know pays the CAT fee, the larger.
+    [[nodiscard]] std::uint64_t cancel_fee_for(const std::string& offer_id) const;
+
+    /// Unconfirmed wallet rows whose sent_to array reports a fee refusal
+    /// (INVALID_FEE_TOO_CLOSE_TO_ZERO / INVALID_FEE_LOW_FEE) from some peer
+    /// and an acceptance from none, first seen by prune_stuck_transactions()
+    /// since this was last called.
+    ///
+    /// [review #163 r9] Two corrections to what this used to promise. The
+    /// array is scanned in full rather than by its LATEST entry, because it is
+    /// per PEER and not a timeline (execution::sent_to_reports_fee_rejection).
+    /// And a row is counted once per transaction name only until the name set
+    /// is cleared: prune_stuck_transactions tests the capacity before it
+    /// inserts and clears the whole set, so the sweep that trips
+    /// kMaxReportedFeeRejections re-counts every refused row still visible in
+    /// it. Normal case, not an invariant.
+    [[nodiscard]] std::uint32_t take_fee_rejections_seen() noexcept;
+
+    /// [review #163 r9] Mojos the wallet ACCEPTED for secure per-offer cancels
+    /// since this was last called, then reset to 0.
+    ///
+    /// This is what a cancel really committed, not what policy would quote for
+    /// it now: `selective_cancel` pushes an offer id into its cancelled list
+    /// whether the cancel went out at `cancel_fee_for()` or fell through to
+    /// `emergency_cancel`, which can succeed at a halved or quartered tier
+    /// down to 1 mojo, at a secure fee of 0, or as a LOCAL-ONLY cancel that
+    /// spends nothing on chain at all. Re-deriving the fee afterwards booked
+    /// every one of those at the full policy fee.
+    ///
+    /// A local-only (insecure) cancel contributes 0, because it commits
+    /// nothing. The bulk `cancel_offers` sweep does not pass through here and
+    /// is not counted -- it is not counted today either.
+    [[nodiscard]] std::uint64_t take_cancel_fees_accepted() noexcept;
 
     // -- Offer reconciliation -----------------------------------------------
 
@@ -973,6 +1177,35 @@ public:
         const PendingOffer& adopt,
         std::uint64_t       expected_max_time,
         const char*         context);
+
+    // -- [MIN-INPUT-COIN] wiring (decisions in offer_min_input_coin.hpp) ----
+
+    /// The ONLY place this class calls wallet_->create_offer, so no posting
+    /// path can fund an offer from reward dust by forgetting the floor
+    /// (tests/test_offer_min_input_coin_wiring.py pins that).  Computes
+    /// min_coin_amount from the offer_dict and
+    /// strategy.offer_min_input_coin_frac, and retries ONCE without it when
+    /// the wallet ANSWERS that the floor leaves too little to spend.  Every
+    /// other failure propagates exactly as wallet_->create_offer raised it,
+    /// so the call sites keep their own handling.
+    ///
+    /// @param tier_index  The tier, or the first tier of a merged batch.
+    /// @param context     "tier", "merged batch" or "batch fallback".
+    asio::awaitable<json> create_offer_min_coin(
+        const json&                  offer_dict,
+        std::optional<std::uint64_t> expiry_max_time,
+        const PairConfig&            pair,
+        Side                         side,
+        int                          tier_index,
+        const char*                  context);
+
+    /// Dexie refused an offer for having too many input coins: say so in one
+    /// greppable line ("[dexie-too-many-inputs]") that names the remedy.
+    void note_dexie_too_many_inputs(const std::string& posting,
+                                    std::size_t        offer_chars);
+
+    /// How often that has happened since this process started.
+    std::uint64_t dexie_too_many_inputs_count_{0};
 
     /**
      * @brief Emergency cancel with reduced or zero fee.
@@ -1219,6 +1452,9 @@ private:
      * (the offer is already valid on-chain).
      *
      * @param offer_text  Bech32m-encoded offer string.
+     * @param posting     Which offer this is ("XCH/DBX Bid tier 4"), for the
+     *                    [dexie-too-many-inputs] warning.  By value: this is
+     *                    a coroutine.
      * @return Dexie's offer id on success, empty string on any error.
      *         The id MUST be retained on the PendingOffer: the dexie
      *         orderbook reports our resting offers under it, and own-offer
@@ -1226,7 +1462,8 @@ private:
      *         (as this did until 2026-07-30) leaves the taker able to trade
      *         against the bot's own offers.
      */
-    asio::awaitable<std::string> submit_to_dexie(const std::string& offer_text);
+    asio::awaitable<std::string> submit_to_dexie(const std::string& offer_text,
+                                                 std::string        posting);
 
     /**
      * @brief One-time initialisation of the asset-to-wallet-ID cache.
@@ -1280,14 +1517,60 @@ private:
     /// of the poll backoff schedule).
     std::uint64_t fill_poll_heartbeat_{0};
 
+    /// [S70] Block of retire_expired_offers' last WARN.  A wallet that cannot
+    /// supply a TRUSTED chain clock -- no answer, or a full-node peer this
+    /// host does not run -- fails the same way every heartbeat while any
+    /// offer waits past its expiry; the repeats go to debug
+    /// (execution::expiry_warn_due), so the log says it once per ~30 min.
+    BlockHeight expiry_warned_block_{0};
+
     /// Per-pair rebalance baselines for trigger evaluation.
     std::unordered_map<std::string, RebalanceSnapshot> rebalance_baselines_;
 
     /// Dynamic fee override.  Initialised from strategy_cfg_.offer_fee_mojos;
     /// updated at runtime by set_dynamic_fee() from the engine's FeeTracker.
     std::uint64_t current_fee_mojos_;
+
+    /// [S67] Class-aware cancel fees; inert until set_cancel_fees().
+    bool          cancel_fees_active_{false};
+    std::uint64_t cancel_fee_xch_mojos_{0};
+    std::uint64_t cancel_fee_cat_mojos_{0};
+
+    /// [S67] sent_to fee refusals seen by prune_stuck_transactions and not
+    /// yet taken, and the transaction names already counted (bounded).
+    std::uint32_t fee_rejections_seen_{0};
+    std::unordered_set<std::string> fee_rejections_reported_;
+
+    /// [review #163 r9] Mojos the wallet ACCEPTED for secure per-offer cancels
+    /// since take_cancel_fees_accepted() was last called; saturating.
+    std::uint64_t cancel_fees_accepted_{0};
+
+    std::function<void(const std::string&, std::uint64_t)> cancel_observer_;
     std::function<bool()> abort_predicate_;
+
+    /// [S74 / review #165, round 4] set_stop_creating_predicate(). Checked
+    /// before every create and nowhere else: unlike abort_predicate_ it never
+    /// cancels anything, so a keep stop can use it.
+    std::function<bool()> stop_creating_predicate_;
     std::function<void(const std::string&)> escalate_;
+
+    /// [S74 / review #165] set_posting_in_flight_flag(). Owned by the engine
+    /// (Engine::posting_in_flight_); nullptr until it is wired.
+    bool* posting_in_flight_flag_{nullptr};
+
+    /// [S74 / review #165, round 4] set_create_outcome_unknown_flag(). Owned
+    /// by the engine (Engine::create_outcome_unknown_); nullptr until wired.
+    bool* create_outcome_unknown_flag_{nullptr};
+
+    /// Record that a create FAILED without proving the wallet made no offer.
+    ///
+    /// Called from every create's transport-error handler. Sets the engine's
+    /// flag (above) only when rpc::request_possibly_submitted says the request
+    /// may have reached the handler; a connect or TLS failure never wrote the
+    /// request, so it leaves the flag alone. Sends nothing, waits for nothing.
+    void note_create_outcome_unknown(const rpc::ChiaRPCTransportError& e,
+                                     const std::string& pair_name,
+                                     const char*        context);
 
     /// O(1) lookup: pair_name -> PairConfig.  Populated once in the
     /// constructor from AppConfig::pairs so that evaluate_rebalance()

@@ -25,6 +25,7 @@
 #include <xop/execution/cancel_escalation.hpp>
 #include <xop/execution/cancel_retry.hpp>
 #include <xop/execution/cross_guard.hpp>
+#include <xop/execution/fee_feedback.hpp>
 #include <xop/execution/stuck_tx_verdict.hpp>
 #include <xop/execution/wallet_circuit.hpp>
 #include <xop/execution/wallet_poll_throttle.hpp>
@@ -34,6 +35,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <unordered_set>
 
@@ -72,6 +74,80 @@ namespace trade_status {
         return -1;  // Unknown status.
     }
 }  // namespace trade_status
+
+// ---------------------------------------------------------------------------
+// [S74 / review #165] PostingMark -- "a create_offer is out, and the offer it
+// makes is not in State yet"
+// ---------------------------------------------------------------------------
+//
+// Engine::shutdown()'s KEEP branch waits while the engine's posting_in_flight_
+// flag is set (util::keep_stop_drain_step), because stopping the io_context
+// inside this window lets the wallet finish a create with nobody left to record
+// it: the next boot meets that offer as an ORPHAN and may CANCEL it, which is
+// the one outcome a keep stop exists to prevent.
+//
+// The window is exactly [create_offer issued .. the offer is in State]. That
+// includes the Dexie submission, which sits between the wallet's answer and
+// state_->upsert_offer -- an offer created and published but not yet in State
+// is the WORST case, since it is unknown to the engine entirely.
+//
+// One mark per create, never one per ladder: everything created earlier in the
+// same post_quotes call is already in State, and a keep stop's flush gives each
+// of those an offer_log row. Holding the mark across the ladder would make a
+// stop wait for up to 2 x num_tiers creates (12 at the live config) for no
+// extra safety -- and would need a budget to match.
+//
+// RAII, so a throw, an early `continue`, a `break`, a `co_return` and a
+// coroutine frame destroyed by ioc_.stop() all clear it. Single-threaded: the
+// flag is written here and read by the shutdown continuation, both on the
+// io_context thread.
+// ---------------------------------------------------------------------------
+namespace {
+
+class PostingMark {
+public:
+    explicit PostingMark(bool* flag) noexcept : flag_(flag)
+    {
+        if (flag_ != nullptr) {
+            *flag_ = true;
+        }
+    }
+    ~PostingMark() { release(); }
+
+    PostingMark(const PostingMark&)            = delete;
+    PostingMark& operator=(const PostingMark&) = delete;
+    PostingMark(PostingMark&&)                 = delete;
+    PostingMark& operator=(PostingMark&&)      = delete;
+
+    /// This create's window is over: a keep stop may proceed.
+    ///
+    /// [review #165, round 4] IT DOES NOT SAY THE OFFER IS RECORDED. It used
+    /// to read "the offer is in State (or there is no offer)", which is a
+    /// FALSE assurance in one case the destructor also covers: a create that
+    /// threw a TRANSPORT error. A timeout, an empty reply or a 5xx does not
+    /// prove the wallet refused the request -- the handler may have built the
+    /// offer and only the answer was lost (rpc::request_possibly_submitted,
+    /// and PR #162 encodes the same principle for this RPC family: "no answer
+    /// is not a refusal"). The mark is released anyway, deliberately: it
+    /// exists only to keep the io_context alive until THIS coroutine reaches
+    /// state_->upsert_offer, and once the create has thrown there is nothing
+    /// left for it to wait for -- holding it would burn the drain budget and
+    /// still end with an untracked offer. What the caller does instead is
+    /// RECORD the uncertainty (create_outcome_unknown_flag_) so the keep stop
+    /// reports a possibly-untracked offer rather than clean success.
+    void release() noexcept
+    {
+        if (flag_ != nullptr) {
+            *flag_ = false;
+            flag_  = nullptr;
+        }
+    }
+
+private:
+    bool* flag_;
+};
+
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // Constructor
@@ -193,6 +269,144 @@ OfferManager::expiry_max_time_for(const PairConfig& pair) const
     return max_time;
 }
 
+// ---------------------------------------------------------------------------
+// [MIN-INPUT-COIN] wiring -- the decisions live in offer_min_input_coin.hpp
+// ---------------------------------------------------------------------------
+
+asio::awaitable<json> OfferManager::create_offer_min_coin(
+    const json&                  offer_dict,
+    std::optional<std::uint64_t> expiry_max_time,
+    const PairConfig&            pair,
+    Side                         side,
+    int                          tier_index,
+    const char*                  context)
+{
+    const double frac = strategy_cfg_.offer_min_input_coin_frac;
+    // nullopt for an XCH-funded offer, a disabled fraction, or any dict shape
+    // the rule was not designed for: the request is then the old one.
+    const std::optional<std::uint64_t> min_coin =
+        offer_min_input_coin(offer_dict, frac);
+
+    co_return co_await create_offer_with_min_coin_fallback(
+        // Deliberately NOT a coroutine lambda: it hands back the wallet's
+        // own awaitable, so nothing reads these captures after it returns.
+        [this, &offer_dict, expiry_max_time](
+            std::optional<std::uint64_t> coin_floor) {
+            return wallet_->create_offer(
+                offer_dict, current_fee_mojos_, /*validate_only=*/false,
+                expiry_max_time, coin_floor);
+        },
+        min_coin,
+        [this, &pair, side, tier_index, context, min_coin, frac](
+            const std::string& refusal) {
+            logger_->warn(
+                "[min-input-coin] wallet refused {} {} tier {} ({}) under "
+                "min_coin_amount={} mojos (strategy."
+                "offer_min_input_coin_frac={}): {} -- retrying ONCE without "
+                "the floor; the offer may then be built from dust, which "
+                "Dexie refuses above about 125 inputs",
+                pair.name, to_string(side), tier_index, context,
+                min_coin.value_or(0), frac, refusal);
+        });
+}
+
+void OfferManager::note_dexie_too_many_inputs(const std::string& posting,
+                                              std::size_t        offer_chars)
+{
+    ++dexie_too_many_inputs_count_;
+
+    // [review #162, round 7] THE ADVICE IS COMPUTED, NOT FIXED.  This
+    // function is handed the posting and the offer's size and NOTHING about
+    // how the offer was built, so it cannot observe whether the no-floor
+    // retry ran -- and the shipped text drew a conclusion that needs exactly
+    // that fact ("was built with NO floor").
+    //
+    // What it CAN do is decide whether the fact is needed at all.  The
+    // floored create's own CAT leg is bounded at ceil(1 / frac), and while
+    // that plus today's one-coin XCH fee leg fits inside Dexie's measured
+    // accept, a refusal for input count is arithmetically impossible for a
+    // floored create -- so the conclusion is DERIVED, not assumed.  Below
+    // that fraction the bound exceeds the limit on its own, a create the
+    // wallet SATISFIES can be refused exactly like this one, and the advice
+    // inverts.  The range is open at the bottom (config.cpp takes [0, 1)
+    // with the low end closed), so that branch is reachable by configuration
+    // alone; config.cpp now warns at load as well.
+    //
+    // NOT THREADED ON PURPOSE.  Handing this function the floor the create
+    // sent would sharpen only the second branch, and it would have to be the
+    // optional floor, not a "did the fallback run" bool -- an XCH-funded
+    // offer and a dict shape the rule skips also send no floor, so a bool
+    // would answer "false" for them and seed a fresh wrong inference.  In
+    // the shipped branch the fact is deducible without it, and the second
+    // branch names the log line that already records it at the moment it
+    // happens.
+    const double        frac       = strategy_cfg_.offer_min_input_coin_frac;
+    const std::uint64_t cat_bound  = min_input_coin_cat_leg_bound(frac);
+    const bool          bound_fits = min_input_coin_bound_fits_dexie(frac);
+    const double        safe_frac  = min_input_coin_safe_frac();
+
+    std::string advice;
+    if (cat_bound == 0) {
+        advice = fmt::format(
+            "The floor is OFF (strategy.offer_min_input_coin_frac = {}), so "
+            "no create carries a bound and this offer was built from "
+            "whatever the wallet selected.  Setting it to the default 0.01 "
+            "bounds the CAT leg of each FLOORED create at {} inputs, inside "
+            "that limit.",
+            frac, min_input_coin_cat_leg_bound(0.01));
+    } else if (bound_fits) {
+        advice = fmt::format(
+            "Do NOT RAISE strategy.offer_min_input_coin_frac (now {}): it "
+            "bounds the CAT LEG of a FLOORED create at ceil(1 / frac) = {} "
+            "inputs, {} with today's one-coin XCH FEE LEG, inside that "
+            "limit -- so THIS offer was built with NO floor (the no-floor "
+            "retry, or a posting path that carries none: XCH-funded, or a "
+            "dict shape the rule skips).  Raising the floor only makes the "
+            "wallet refuse more floored creates and fire that retry more "
+            "often.  The only fraction change that can help is "
+            "a SMALL REDUCTION, never below {:.5f} (= 1 / {}), "
+            "where the CAT-leg bound plus the fee coin reaches the limit "
+            "exactly.",
+            frac, cat_bound, cat_bound + xop::execution::kDexieFeeLegInputsToday,
+            safe_frac,
+            xop::execution::kDexieMeasuredInputLimit
+                - xop::execution::kDexieFeeLegInputsToday);
+    } else {
+        advice = fmt::format(
+            "strategy.offer_min_input_coin_frac is {}, whose CAT-LEG bound "
+            "is ceil(1 / frac) = {} inputs -- ABOVE that limit on its own, "
+            "before the XCH FEE LEG.  At this fraction the floor is not a "
+            "bound Dexie will honour, so this refusal does NOT show that "
+            "the no-floor retry ran: a create the wallet SATISFIED can "
+            "carry {} inputs and be refused exactly like this one.  "
+            "RAISE the fraction to at least {:.5f} (= 1 / {}); "
+            "the default 0.01 "
+            "bounds it at {}.  To tell the two apart for THIS offer, look "
+            "for a preceding '[min-input-coin] wallet refused' line naming "
+            "the same pair and tier -- present means the retry ran and no "
+            "floor was sent.",
+            frac, cat_bound, cat_bound, safe_frac,
+            xop::execution::kDexieMeasuredInputLimit
+                - xop::execution::kDexieFeeLegInputsToday,
+            min_input_coin_cat_leg_bound(0.01));
+    }
+
+    logger_->warn(
+        "[dexie-too-many-inputs] Dexie refused {} ({} characters): too many "
+        "input coins.  The offer EXISTS in the wallet, is listed nowhere and "
+        "locks its coins until it is cancelled.  Dexie was measured to "
+        "accept {} input coins.  Remedy: combine the small coins of the CAT "
+        "this offer spends (chia wallet coins combine) -- the only remedy "
+        "that removes the cause; the dust is CAT reward payouts and the CAT "
+        "LEG is what the floor bounds.  It does not bound the XCH FEE LEG, "
+        "which is a separate selection and is one coin only while every XCH "
+        "coin covers the fee; if that leg ever contributes, the coins to "
+        "combine there are XCH, not the CAT.  {}  Seen {} time(s) since "
+        "start.",
+        posting, offer_chars, xop::execution::kDexieMeasuredInputLimit, advice,
+        dexie_too_many_inputs_count_);
+}
+
 asio::awaitable<void>
 OfferManager::retire_offer_failed_expiry(const PendingOffer& adopt,
                                          std::uint64_t expected_max_time,
@@ -247,6 +461,222 @@ OfferManager::retire_offer_failed_expiry(const PendingOffer& adopt,
         }
     }
     co_return;
+}
+
+// ---------------------------------------------------------------------------
+// [S70 2026-09-20] retire_expired_offers -- ttl_cancel_mode: expire
+//
+// The decisions are in offer_expiry.hpp; this supplies the wallet's answers.
+// Every read is of THIS heartbeat, and the order is fixed: WHO the wallet's
+// full-node peers are, then the chain clock (once), then who they are again,
+// then per offer the trade record, then the verdict, then -- only on
+// RetireLocal -- the one insecure cancel this function exists to send.
+//
+// [review #164 2026-09-21] The peer census is not decoration.  The clock is
+// one connected peer's unvalidated assertion, and acting on a false one frees
+// the maker coins of a STILL-TAKEABLE offer with no spend and no undo, with
+// the take then invisible to this wallet forever.
+// ---------------------------------------------------------------------------
+
+asio::awaitable<std::vector<std::string>>
+OfferManager::retire_expired_offers(BlockHeight current_block)
+{
+    std::vector<std::string> retired;
+    if (strategy_cfg_.ttl_cancel_mode != TtlCancelMode::Expire) {
+        co_return retired;
+    }
+
+    // Host clock: a PRE-FILTER only, so a heartbeat with nothing near its
+    // expiry costs no RPC.  It never decides a retire.
+    const auto host_now_s = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+
+    std::vector<PendingOffer> due;
+    for (const auto& po : state_->get_all_offers()) {
+        if (po.cancel_pending) continue;   // a cancel is already in hand
+        if (expiry_worth_checking(po.expiry_max_time,
+                                  static_cast<std::int64_t>(host_now_s))) {
+            due.push_back(po);
+        }
+    }
+    if (due.empty()) {
+        co_return retired;
+    }
+
+    // The chain clock, read kExpiredRetireDepthBlocks BELOW the height the
+    // wallet has FINISHED syncing to.  If the latest transaction block at
+    // that depth was already stamped >= an offer's max_time, then no later
+    // block can carry a take of it and the block that expired it is buried
+    // that deep -- a seconds margin proves neither (see offer_expiry.hpp).
+    //
+    // [review #164 2026-09-21] AND IT IS ONLY WORTH ANYTHING IF THE PEER THAT
+    // ANSWERED IT IS OURS.  get_timestamp_for_height takes the first answer
+    // from any connected full node, unanchored and unvalidated, so the wallet
+    // is asked WHO those peers are -- before the clock and again after it,
+    // because the set can change under the read -- and nothing is retired
+    // unless every one of them is on this host both times.  The depth does not
+    // help here: forging a timestamp 32 blocks back is exactly as cheap.
+    const rpc::TransportCounters pass_start = wallet_->transport_counters();
+    // This pass repeats every heartbeat while anything waits past its expiry,
+    // and a wallet that cannot answer fails the same way each time: WARN once
+    // per kExpiryWarnIntervalBlocks, debug in between.
+    const bool warn_now = expiry_warn_due(expiry_warned_block_, current_block);
+    const auto problem_level =
+        warn_now ? spdlog::level::warn : spdlog::level::debug;
+    bool problem_logged = false;
+
+    const auto trust_of = [](const rpc::FullNodePeerCensus& c) {
+        return chain_clock_trust(c.readable, c.full_node_peers,
+                                 c.non_local_peers);
+    };
+    const auto trust_error = [](ChainClockTrust t,
+                                const rpc::FullNodePeerCensus& c) {
+        std::string why = chain_clock_trust_reason(t);
+        if (!c.first_non_local_host.empty()) {
+            why += " (" + c.first_non_local_host + ")";
+        }
+        return why;
+    };
+
+    std::uint64_t chain_time_s = 0;
+    std::string clock_error;
+    try {
+        const rpc::FullNodePeerCensus before =
+            co_await wallet_->get_full_node_peer_census();
+        const ChainClockTrust trust_before = trust_of(before);
+        if (trust_before != ChainClockTrust::Trusted) {
+            clock_error = trust_error(trust_before, before);
+        } else {
+            const std::int64_t synced_height =
+                co_await wallet_->get_height_info();
+            const std::int64_t clock_height =
+                expired_retire_clock_height(synced_height);
+            if (clock_height <= 0) {
+                clock_error = "the wallet is fewer than "
+                    + std::to_string(kExpiredRetireDepthBlocks)
+                    + " blocks into the chain";
+            } else {
+                const std::uint64_t answered =
+                    co_await wallet_->get_timestamp_for_height(clock_height);
+                // The peer set can change WHILE the clock is being read, and
+                // the RPC never says which peer answered.  Re-ask.
+                const rpc::FullNodePeerCensus after =
+                    co_await wallet_->get_full_node_peer_census();
+                const ChainClockTrust trust_after = trust_of(after);
+                if (trust_after != ChainClockTrust::Trusted) {
+                    clock_error = "the peer set changed while the clock was "
+                                  "being read: " + trust_error(trust_after,
+                                                               after);
+                } else {
+                    chain_time_s = answered;
+                }
+            }
+        }
+    } catch (const std::exception& e) {
+        clock_error = e.what();
+    }
+    if (chain_time_s == 0) {
+        logger_->log(problem_level,
+                     "[offer-expiry] no trusted chain clock this heartbeat "
+                     "({}) -- {} offer(s) past their expiry stay tracked and "
+                     "keep their coins locked; retiring on an untrusted or "
+                     "missing clock is the one mistake this pass cannot undo",
+                     clock_error.empty() ? "the wallet returned no timestamp"
+                                         : clock_error.c_str(),
+                     due.size());
+        if (warn_now) expiry_warned_block_ = current_block;
+        co_return retired;
+    }
+
+    for (const auto& po : due) {
+        if (!expired_at_depth(po.expiry_max_time, chain_time_s)) {
+            continue;   // expired by the host clock only; ask again later
+        }
+        if (abort_predicate_ && abort_predicate_()) {
+            break;      // a stop is cancelling the book its own way
+        }
+        if (unanswered_transport_failure_since(
+                pass_start, wallet_->transport_counters())) {
+            break;      // [WALLET-CIRCUIT] no more calls into a dead wallet
+        }
+
+        ExpiredRetire verdict = ExpiredRetire::NotExpired;
+        try {
+            const json rec = co_await wallet_->get_offer(
+                po.offer_id, /*file_contents=*/false);
+            const bool pending_accept = rec.contains("status")
+                && trade_status::parse(rec["status"])
+                       == trade_status::kPendingAccept;
+            verdict = decide_expired_retire(pending_accept,
+                                            po.expiry_max_time,
+                                            trade_record_max_time(rec),
+                                            chain_time_s);
+        } catch (const std::exception& e) {
+            logger_->log(problem_level,
+                         "[offer-expiry] get_offer failed for expired {}: {} "
+                         "-- left tracked", po.offer_id.substr(0, 12),
+                         e.what());
+            problem_logged = true;
+            continue;
+        }
+
+        if (verdict == ExpiredRetire::LeaveToWallet) {
+            // CONFIRMED is a fill and `filled` always wins; a cancel status
+            // belongs to the path that sent it.  detect_fills owns both.
+            logger_->debug("[offer-expiry] {} is past its expiry but the "
+                           "wallet no longer reports PENDING_ACCEPT -- left "
+                           "to fill detection", po.offer_id.substr(0, 12));
+            continue;
+        }
+        if (verdict == ExpiredRetire::Unverified) {
+            // The wallet's record does not repeat the expiry we tracked.
+            // Forget it: the offer goes back under the hard TTL, which
+            // cancels it securely.
+            state_->set_offer_expiry(po.offer_id, 0);
+            logger_->warn("[offer-expiry] {} is tracked with max_time={} but "
+                          "the wallet record does not carry it -- expiry "
+                          "dropped, the hard TTL applies again",
+                          po.offer_id.substr(0, 12), po.expiry_max_time);
+            continue;
+        }
+        if (verdict != ExpiredRetire::RetireLocal) {
+            continue;
+        }
+        // A cancel may have been sent for it while this pass was suspended.
+        if (state_->get_offer(po.offer_id).cancel_pending) {
+            continue;
+        }
+
+        try {
+            // secure=false, fee 0: the trade goes CANCELLED in the wallet and
+            // its coins leave get_locked_coins(); nothing is spent.  Safe
+            // ONLY because of the verdict above -- see offer_expiry.hpp.
+            co_await cancel_offer_charged(po.offer_id, 0, /*secure=*/false);
+        } catch (const std::exception& e) {
+            logger_->log(problem_level,
+                         "[offer-expiry] local cancel of expired {} failed: "
+                         "{} -- retried next heartbeat",
+                         po.offer_id.substr(0, 12), e.what());
+            problem_logged = true;
+            continue;
+        }
+        // cancel_pending, not removed: only the wallet's CANCELLED verdict,
+        // seen by detect_fills, completes the offer_log row (#157).
+        state_->mark_cancel_pending(po.offer_id);
+        retired.push_back(po.offer_id);
+        logger_->info("[offer-expiry] retired {} ({} {} tier {}) at block {}: "
+                      "max_time={} chain_time_at_depth={} (+{}s) -- "
+                      "local cancel, no fee, coins released",
+                      po.offer_id.substr(0, 12), po.pair_name,
+                      to_string(po.side), po.tier, current_block,
+                      po.expiry_max_time, chain_time_s,
+                      chain_time_s - po.expiry_max_time);
+    }
+
+    if (problem_logged && warn_now) {
+        expiry_warned_block_ = current_block;
+    }
+    co_return retired;
 }
 
 // ---------------------------------------------------------------------------
@@ -424,7 +854,7 @@ asio::awaitable<int> OfferManager::post_quotes(
                     bool needs_emergency = false;
                     try {
                         co_await cancel_offer_charged(
-                            po.offer_id, current_fee_mojos_, /*secure=*/true);
+                            po.offer_id, cancel_fee_for(po.offer_id), /*secure=*/true);
                         cancel_ok = true;
                     } catch (const rpc::ChiaRPCError& e) {
                         const std::string_view msg{e.what()};
@@ -459,7 +889,7 @@ asio::awaitable<int> OfferManager::post_quotes(
                     bool needs_emergency = false;
                     try {
                         co_await cancel_offer_charged(
-                            po.offer_id, current_fee_mojos_, /*secure=*/true);
+                            po.offer_id, cancel_fee_for(po.offer_id), /*secure=*/true);
                         cancel_ok = true;
                     } catch (const rpc::ChiaRPCError& e) {
                         const std::string_view msg{e.what()};
@@ -641,16 +1071,48 @@ asio::awaitable<int> OfferManager::post_quotes(
             break;
         }
 
+        // [S74 / review #165, round 4] STOP CREATING, CANCEL NOTHING. A stop
+        // has been latched: start no further create. Not the same check as the
+        // abort above -- that one cancels a create that landed late, which a
+        // KEEP stop must never do. Without this, the keep stop's drain (which
+        // suspends on a poll timer, handing control straight back to this
+        // coroutine) waited out the rest of the ladder under a budget sized
+        // for ONE create, and this loop went on posting new offers after the
+        // operator asked the engine to stop.
+        if (stop_creating_predicate_ && stop_creating_predicate_()) {
+            logger_->warn("not creating any further {} tier: a stop is "
+                          "latched. Nothing already created is cancelled.",
+                          pair.name);
+            break;
+        }
+
         // Step 2: Call wallet.create_offer() to produce the spend bundle.
         // [OFFER-EXPIRY] nullopt unless this pair opted in, in which case
         // the payload is unchanged from before the feature existed.
         const std::optional<std::uint64_t> expiry_max_time =
             expiry_max_time_for(pair);
+        // [MIN-INPUT-COIN] Through the floor, like every create here.
         json result;
+        // [S74 / review #165] From here until this tier's offer is in State, a
+        // keep stop waits rather than stopping the io_context under it.
+        PostingMark posting_mark{posting_in_flight_flag_};
         try {
-            result = co_await wallet_->create_offer(
-                offer_dict, current_fee_mojos_, /*validate_only=*/false,
-                expiry_max_time);
+            result = co_await create_offer_min_coin(
+                offer_dict, expiry_max_time, pair, tier.side,
+                static_cast<int>(tier.tier_index), "tier");
+        } catch (const rpc::ChiaRPCTransportError& e) {
+            // [review #165, round 4] BEFORE the base handler, which would take
+            // this too. A transport failure is not a refusal: the wallet may
+            // have built the offer and only the answer was lost. Recorded so
+            // the keep stop stops calling this case "no offer" (the
+            // PostingMark comment has the whole argument). Nothing is sent
+            // and nothing is waited for -- there is no tier id to cancel,
+            // and a second create would be a second offer.
+            logger_->error("create_offer failed for {} {} tier {}: {}",
+                           pair.name, to_string(tier.side),
+                           tier.tier_index, e.what());
+            note_create_outcome_unknown(e, pair.name, "tier");
+            continue;
         } catch (const rpc::ChiaRPCError& e) {
             logger_->error("create_offer failed for {} {} tier {}: {}",
                            pair.name, to_string(tier.side),
@@ -769,7 +1231,10 @@ asio::awaitable<int> OfferManager::post_quotes(
         }
 
         // Step 4: Submit to dexie for cross-platform aggregation (best-effort).
-        const std::string dexie_id = co_await submit_to_dexie(offer_text);
+        const std::string dexie_id = co_await submit_to_dexie(
+            offer_text,
+            fmt::format("{} {} tier {}", pair.name, to_string(tier.side),
+                        tier.tier_index));
         if (dexie_id.empty()) {
             logger_->warn("Dexie submission failed for {} tier {} -- "
                           "offer is still valid on-chain, but with no dexie "
@@ -795,8 +1260,14 @@ asio::awaitable<int> OfferManager::post_quotes(
         // Retain dexie's id -- own-offer exclusion in the arbitrage taker
         // matches the orderbook feed on THIS id, not the wallet trade id.
         pending.dexie_id         = dexie_id;
+        // [S70] Reached only past expiry_echo_ok above, so a non-zero value
+        // here IS the wallet's echo, not merely what we asked for.
+        pending.expiry_max_time  = expiry_max_time.value_or(0);
 
         state_->upsert_offer(pending);
+        // [S74] Recorded: a keep stop that stops the io_context now finds this
+        // offer in State, and its flush gives it an offer_log row.
+        posting_mark.release();
         ++created_count;
 
         logger_->info("Posted {} {} tier {} @ {} mojos, size {} mojos [{}]",
@@ -1015,6 +1486,35 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
         }
     }
 
+    // [S70] Expiry backfill.  The boot restore rebuilds State from offer_log
+    // (pending_offer_from_db), which has no expiry column, so every restored
+    // offer comes back with expiry_max_time == 0 and would fall to the hard
+    // TTL under ttl_cancel_mode: expire.  The record this poll just fetched
+    // carries the wallet's own valid_times, so read it back from there -- no
+    // extra RPC, and Step 2 runs before Step 8 in the same heartbeat.  Expire
+    // mode only: in the default mode nothing reads the field.
+    if (strategy_cfg_.ttl_cancel_mode == TtlCancelMode::Expire) {
+        for (const auto& rec : trade_records) {
+            if (!rec.contains("trade_id") || !rec["trade_id"].is_string()
+                || !rec.contains("status")
+                || trade_status::parse(rec["status"])
+                       != trade_status::kPendingAccept) {
+                continue;
+            }
+            const auto id = rec["trade_id"].get<std::string>();
+            const auto it = pending_map.find(id);
+            if (it == pending_map.end() || it->second.expiry_max_time != 0) {
+                continue;
+            }
+            const std::uint64_t max_time = trade_record_max_time(rec);
+            if (max_time > 0 && state_->set_offer_expiry(id, max_time)) {
+                logger_->info("[offer-expiry] {} carries max_time={} per the "
+                              "wallet record -- tracked for expiry",
+                              id.substr(0, 12), max_time);
+            }
+        }
+    }
+
     for (const auto& rec : trade_records) {
         // Extract trade_id and status from the record.
         if (!rec.contains("trade_id") || !rec.contains("status")) {
@@ -1080,7 +1580,7 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
                 // already called remove_offer(), which always returned a
                 // default (fee 0) -- trade_log.fee_mojos was silently 0 for
                 // every fill since June 2026.
-                fill.fee_mojos    = static_cast<Mojo>(po.fee_mojos);
+                fill.fee_mojos    = to_mojo_saturating(po.fee_mojos);
 
                 // Extract confirmed block height if available.
                 if (rec.contains("confirmed_at_index")) {
@@ -1216,8 +1716,12 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
 // ---------------------------------------------------------------------------
 asio::awaitable<TerminalRecheck>
 OfferManager::recheck_terminal(const std::string& trade_id,
-                               BlockHeight        current_block)
+                               BlockHeight        current_block,
+                               bool*              wallet_cancelled_out)
 {
+    if (wallet_cancelled_out != nullptr) {
+        *wallet_cancelled_out = false;
+    }
     json rec;
     try {
         rec = co_await wallet_->get_offer(trade_id, /*file_contents=*/false);
@@ -1240,6 +1744,11 @@ OfferManager::recheck_terminal(const std::string& trade_id,
     const int status = trade_status::parse(rec["status"]);
 
     if (status == trade_status::kCancelled || status == trade_status::kFailed) {
+        // [review #163] Both are terminal, but only CANCELLED says a cancel
+        // spend confirmed.
+        if (wallet_cancelled_out != nullptr) {
+            *wallet_cancelled_out = (status == trade_status::kCancelled);
+        }
         co_return TerminalRecheck::StillTerminal;
     }
 
@@ -1354,14 +1863,26 @@ OfferManager::recheck_terminal(const std::string& trade_id,
 asio::awaitable<std::vector<std::string>> OfferManager::cancel_stale(
     const std::string& pair_name,
     BlockHeight        current_block,
-    BlockHeight        ttl_blocks)
+    BlockHeight        ttl_blocks,
+    bool               spare_expiring)
 {
     auto all_offers = state_->get_all_offers();
     std::vector<std::string> cancelled_ids;
 
+    const bool expire_mode =
+        strategy_cfg_.ttl_cancel_mode == TtlCancelMode::Expire;
+
     for (const auto& po : all_offers) {
         // Filter by pair name.
         if (po.pair_name != pair_name) {
+            continue;
+        }
+
+        // [S70] The stuck pass retries a hard-TTL cancel that failed.  An
+        // offer left to its on-chain expiry never had one, so it is not
+        // "stuck" for being old; retire_expired_offers owns it.
+        if (spare_expiring
+            && !age_limit_cancel_applies(expire_mode, po.expiry_max_time)) {
             continue;
         }
 
@@ -1379,7 +1900,7 @@ asio::awaitable<std::vector<std::string>> OfferManager::cancel_stale(
         bool needs_emergency = false;
         try {
             co_await cancel_offer_charged(
-                po.offer_id, current_fee_mojos_, /*secure=*/true);
+                po.offer_id, cancel_fee_for(po.offer_id), /*secure=*/true);
             cancel_ok = true;
         } catch (const rpc::ChiaRPCError& e) {
             const std::string_view msg{e.what()};
@@ -1741,7 +2262,7 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_ids(
         // out.last_error is therefore assigned ONLY on the failed branch.
         std::string err;
         try {
-            co_await cancel_offer_charged(oid, current_fee_mojos_,
+            co_await cancel_offer_charged(oid, cancel_fee_for(oid),
                                           /*secure=*/true);
             logger_->debug("Cancelled offer {}", oid.substr(0, 12));
             cancel_ok = true;
@@ -2001,15 +2522,113 @@ void OfferManager::set_abort_predicate(std::function<bool()> predicate)
     abort_predicate_ = std::move(predicate);
 }
 
+void OfferManager::set_stop_creating_predicate(std::function<bool()> predicate)
+{
+    stop_creating_predicate_ = std::move(predicate);
+}
+
 void OfferManager::set_escalation(
     std::function<void(const std::string&)> escalate)
 {
     escalate_ = std::move(escalate);
 }
 
+void OfferManager::set_posting_in_flight_flag(bool* flag) noexcept
+{
+    posting_in_flight_flag_ = flag;
+}
+
+void OfferManager::set_create_outcome_unknown_flag(bool* flag) noexcept
+{
+    create_outcome_unknown_flag_ = flag;
+}
+
+void OfferManager::note_create_outcome_unknown(
+    const rpc::ChiaRPCTransportError& e,
+    const std::string&                pair_name,
+    const char*                       context)
+{
+    // A connect or TLS failure happens before the request is written, so the
+    // wallet cannot have made an offer. Everything else may follow a request
+    // the handler received -- a timeout, an empty or garbled reply, a 5xx, or
+    // a 2xx whose body could not be parsed.
+    if (!rpc::request_possibly_submitted(e.curl_code(), e.http_code())) {
+        return;
+    }
+    logger_->error("{} create for {} failed with NO ANSWER ({}): this does "
+                   "not prove the wallet refused it. If the handler built the "
+                   "offer, this process holds no record of it and the next "
+                   "start meets it as an ORPHAN.",
+                   context, pair_name, e.what());
+    if (create_outcome_unknown_flag_ != nullptr) {
+        *create_outcome_unknown_flag_ = true;
+    }
+}
+
 std::uint64_t OfferManager::current_fee() const noexcept
 {
     return current_fee_mojos_;
+}
+
+// ---------------------------------------------------------------------------
+// [S67] Class-aware cancel fees
+// ---------------------------------------------------------------------------
+
+void OfferManager::set_cancel_fees(std::uint64_t xch_offered_mojos,
+                                   std::uint64_t cat_offered_mojos) noexcept
+{
+    cancel_fees_active_   = true;
+    cancel_fee_xch_mojos_ = xch_offered_mojos;
+    cancel_fee_cat_mojos_ = cat_offered_mojos;
+}
+
+void OfferManager::clear_cancel_fees() noexcept
+{
+    cancel_fees_active_ = false;
+}
+
+void OfferManager::set_cancel_observer(
+    std::function<void(const std::string&, std::uint64_t)> observer)
+{
+    cancel_observer_ = std::move(observer);
+}
+
+std::uint64_t OfferManager::cancel_fee_for(const std::string& offer_id) const
+{
+    if (!cancel_fees_active_) {
+        return current_fee_mojos_;   // the pre-S67 behaviour, untouched
+    }
+    // A bid offers the QUOTE asset, an ask the BASE: those are the coins a
+    // secure cancel spends.
+    bool known          = false;
+    bool offered_is_xch = false;
+    const PendingOffer po = state_->get_offer(offer_id);
+    if (!po.offer_id.empty()) {
+        const auto it = pair_config_map_.find(po.pair_name);
+        if (it != pair_config_map_.end()) {
+            const std::string& offered = (po.side == Side::Bid)
+                ? it->second.quote_asset_id : it->second.base_asset_id;
+            known          = true;
+            offered_is_xch = (offered == "xch");
+        }
+    }
+    return strategy::fee::cancel_fee_for(cancel_fees_active_, current_fee_mojos_,
+                                         cancel_fee_xch_mojos_, cancel_fee_cat_mojos_,
+                                         known, offered_is_xch);
+}
+
+std::uint32_t OfferManager::take_fee_rejections_seen() noexcept
+{
+    const std::uint32_t seen = fee_rejections_seen_;
+    fee_rejections_seen_ = 0;
+    return seen;
+}
+
+std::uint64_t OfferManager::take_cancel_fees_accepted() noexcept
+{
+    const std::uint64_t paid = cancel_fees_accepted_;
+    cancel_fees_accepted_ = 0;
+    return paid;
 }
 
 // ---------------------------------------------------------------------------
@@ -2067,9 +2686,26 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
     Mojo                           mid_price,
     bool                           anchor_active,
     bool                           can_bid,
-    bool                           can_ask) const
+    bool                           can_ask,
+    double                         margin_centre,
+    double                         margin_min_edge_bps,
+    double                         margin_fair_centre) const
 {
     std::vector<TierClassification> results;
+
+    // [S70] Whether the unconditional hard-TTL cancel below is in force for
+    // an offer is age_limit_cancel_applies(expire_mode, its verified expiry).
+    const bool expire_mode =
+        strategy_cfg_.ttl_cancel_mode == TtlCancelMode::Expire;
+
+    // [S72] Margin mode replaces the deviation zones with ONE edge test
+    // against Step 7's own centre and floor (cross_guard.hpp).  With no
+    // usable reference -- the pace pass sends none, and Step 7 leaves both at
+    // 0 until it reaches ladder generation -- every offer falls back to the
+    // deviation zones, i.e. to today's rule, never to "keep regardless".
+    const bool margin_mode =
+        strategy_cfg_.price_cancel_mode == PriceCancelMode::Margin;
+    const double edge_retain = strategy_cfg_.price_cancel_edge_retain;
 
     auto pending = state_->get_all_offers();
     if (pending.empty()) return results;
@@ -2123,12 +2759,37 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
 
         // Hard TTL: absolute expiration regardless of price.
         // Safety backstop -- offers should never live indefinitely.
-        if (past_hard_ttl) {
+        //
+        // [S70] Under ttl_cancel_mode: expire an offer that VERIFIABLY
+        // carries an on-chain expiry already has that backstop, enforced by
+        // the chain for free, so it is not cancelled merely for its age; it
+        // falls through to every price rule below, and
+        // retire_expired_offers frees its coins once a TRUSTED peer's chain
+        // clock is past its max_time.  An offer with no verified expiry (0)
+        // keeps the hard TTL.
+        if (past_hard_ttl
+            && age_limit_cancel_applies(expire_mode, po.expiry_max_time)) {
             tc.staleness       = TierStaleness::Expired;
             tc.price_deviation = 1.0;  // maximal
             results.push_back(std::move(tc));
             continue;
         }
+
+        // [S72] The margin verdict for THIS offer, shared by both branches
+        // below.  `crossed` is filled in by each branch first.
+        const auto margin_verdict = [&](bool crossed) {
+            return classify_tier_refresh_margin(
+                crossed, age < kMinRefreshAgeBlocks, po.side == Side::Ask,
+                static_cast<double>(po.price), margin_centre,
+                margin_fair_centre, margin_min_edge_bps, edge_retain);
+        };
+        const auto note_margin_breach = [&](TierClassification& out) {
+            out.margin_breach     = true;
+            out.edge_bps          = margin_edge_bps(
+                po.side == Side::Ask, static_cast<double>(po.price),
+                margin_centre, margin_fair_centre);
+            out.required_edge_bps = margin_min_edge_bps * edge_retain;
+        };
 
         // Look up the optimal price for this tier.
         std::string key = std::to_string(static_cast<int>(po.side))
@@ -2180,6 +2841,17 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
             } else {
                 tc.staleness       = TierStaleness::Fresh;
                 tc.adverse         = false;
+            }
+
+            // [S72] The edge test needs no replacement tier: it asks about
+            // THIS offer's fill, and a tier the budget dropped is still
+            // takeable at its resting price.  Deviation mode keeps such an
+            // offer unless crossed, as it always did.
+            if (margin_mode && !tc.crossed
+                && margin_verdict(false) == MarginRefresh::Stale) {
+                tc.staleness = TierStaleness::Stale;
+                tc.adverse   = true;
+                note_margin_breach(tc);
             }
 
             results.push_back(std::move(tc));
@@ -2275,7 +2947,28 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
         // behavior-preserving, but this block is NOT identical to main: the
         // normal zone's 3x favorable multiplier was added by 922b183 earlier
         // in this same PR.
-        {
+        //
+        // [S72] In margin mode the zones are replaced by the edge test, and
+        // only a missing reference (NoReference) reaches them.
+        bool margin_decided = false;
+        if (margin_mode) {
+            switch (margin_verdict(tc.crossed)) {
+                case MarginRefresh::Fresh:
+                    tc.staleness   = TierStaleness::Fresh;
+                    margin_decided = true;
+                    break;
+                case MarginRefresh::Stale:
+                    tc.staleness   = TierStaleness::Stale;
+                    margin_decided = true;
+                    if (!tc.crossed) {
+                        note_margin_breach(tc);
+                    }
+                    break;
+                case MarginRefresh::NoReference:
+                    break;
+            }
+        }
+        if (!margin_decided) {
             const double tier_threshold = kSelectiveRefreshThreshold
                 * (1.0 + static_cast<double>(po.tier) * kTierThresholdScale);
             switch (classify_tier_refresh(tc.crossed,
@@ -2328,7 +3021,13 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
         // means we're deep in the book instead of near the top.  Override
         // Fresh->Stale when the ABSOLUTE deviation exceeds the tier-scaled
         // threshold, regardless of direction.
+        //
+        // [S72] Not in margin mode: this override exists to cancel a
+        // FAVOURABLE drift, which is the one thing the margin rule promises
+        // never to do.  It still runs when the margin rule had no reference
+        // and the deviation zones decided instead.
         if (anchor_active
+            && !margin_decided
             && tc.staleness == TierStaleness::Fresh
             && age >= kMinRefreshAgeBlocks) {
             const double tier_threshold = kSelectiveRefreshThreshold
@@ -2384,7 +3083,7 @@ asio::awaitable<std::vector<std::string>> OfferManager::selective_cancel(
         bool needs_emergency = false;
         try {
             co_await cancel_offer_charged(
-                offer_id, current_fee_mojos_, /*secure=*/true);
+                offer_id, cancel_fee_for(offer_id), /*secure=*/true);
             cancel_ok = true;
         } catch (const rpc::ChiaRPCError& e) {
             const std::string_view msg{e.what()};
@@ -2921,7 +3620,7 @@ OrphanEvaluation OfferManager::evaluate_orphan(
     //   - Adverse but within threshold: adopt (cost to cancel > likely loss).
     //   - Adverse beyond threshold: cancel (likely loss > cancel cost).
     //   - Mild adverse (between half-threshold and threshold): adopt-stale.
-    eval.cancel_cost = static_cast<Mojo>(current_fee_mojos_);
+    eval.cancel_cost = to_mojo_saturating(current_fee_mojos_);
 
     if (!eval.adverse) {
         // Favorable deviation -- our offer is more conservative than
@@ -3343,7 +4042,7 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
                 bool needs_emergency = false;
                 try {
                     co_await cancel_offer_charged(wo->trade_id,
-                                                   current_fee_mojos_,
+                                                   cancel_fee_for(wo->trade_id),
                                                    /*secure=*/true);
                     cancel_ok = true;
                 } catch (const rpc::ChiaRPCError& e) {
@@ -3450,6 +4149,25 @@ asio::awaitable<int> OfferManager::prune_stuck_transactions(
 
                 if (row_class == StuckRowClass::Confirmed) {
                     continue;
+                }
+                // [S67] The wallet's own word that a fee is too low: some peer
+                // refused this row on the fee and none accepted it.  Already
+                // in hand -- no RPC is added -- and counted once per
+                // transaction name until the set is cleared (see
+                // kMaxReportedFeeRejections; "once" is a normal case, not an
+                // invariant).  It changes nothing this function decides.
+                // [review #163 r9] The whole sent_to array is read, not its
+                // last entry: the array is per PEER, not a timeline.
+                if (execution::sent_to_reports_fee_rejection(tx)) {
+                    const std::string tx_key = (tx.contains("name") && tx["name"].is_string())
+                        ? tx["name"].get<std::string>() : std::string{};
+                    if (fee_rejections_reported_.size() >= execution::kMaxReportedFeeRejections) {
+                        fee_rejections_reported_.clear();
+                    }
+                    if (!tx_key.empty() && fee_rejections_reported_.insert(tx_key).second
+                        && fee_rejections_seen_ != std::numeric_limits<std::uint32_t>::max()) {
+                        ++fee_rejections_seen_;
+                    }
                 }
                 if (row_class == StuckRowClass::FreshOrUnknown) {
                     ++fresh_count;
@@ -3653,8 +4371,33 @@ std::string OfferManager::late_trade_id(const json& result,
 asio::awaitable<json> OfferManager::cancel_offer_charged(
     const std::string& trade_id, std::uint64_t fee, bool secure)
 {
-    xch_cycle_ledger_.note_lock(0, static_cast<Mojo>(fee));
-    co_return co_await wallet_->cancel_offer(trade_id, fee, secure);
+    // [review #163 r6] to_mojo_saturating, not a bare cast: `fee` is a
+    // std::uint64_t and a wrapped negative is silently zeroed by
+    // CoinLockLedger::clamp_need(), which would leave the pool believing this
+    // cancel locks nothing.  See xop::to_mojo_saturating (types.hpp).
+    xch_cycle_ledger_.note_lock(0, to_mojo_saturating(fee));
+    json reply = co_await wallet_->cancel_offer(trade_id, fee, secure);
+    // [review #163] The wallet ACCEPTED it (a refusal throws past this line).
+    // Tell the fee controller what was really paid, now -- see
+    // set_cancel_observer.  A local-only cancel spends nothing on chain.
+    if (secure) {
+        // [review #163 r9] THE SAME LINE IS ALSO THE ONLY HONEST INPUT TO THE
+        // ROLLING FEE WINDOW.  Engine::cancel_fees_paid used to re-derive each
+        // cancel's fee from cancel_fee_for(), a FRESH POLICY LOOKUP -- so a
+        // cancel that fell through to emergency_cancel and went out at a
+        // halved tier, at a secure fee of 0, or as a local-only cancel that
+        // spends nothing was still booked at the full policy fee.  This
+        // accumulates what the wallet ACCEPTED instead; an insecure cancel
+        // contributes nothing because it commits nothing on chain.
+        cancel_fees_accepted_ = (fee > std::numeric_limits<std::uint64_t>::max()
+                                           - cancel_fees_accepted_)
+                                    ? std::numeric_limits<std::uint64_t>::max()
+                                    : cancel_fees_accepted_ + fee;
+        if (cancel_observer_) {
+            cancel_observer_(trade_id, fee);
+        }
+    }
+    co_return reply;
 }
 
 // ---------------------------------------------------------------------------
@@ -3712,7 +4455,7 @@ asio::awaitable<json> OfferManager::cancel_offers_charged(
     // [S33 2026-09-11] The arithmetic, the >= 1 clamp and the rationale live
     // in execution/coin_lock_ledger.hpp so that ctest drives the same code
     // this does -- inline here, the reservation had no coverage at all.
-    reserve_bulk_cancel(xch_cycle_ledger_, static_cast<Mojo>(fee), n_offers);
+    reserve_bulk_cancel(xch_cycle_ledger_, to_mojo_saturating(fee), n_offers);
     co_return co_await wallet_->cancel_offers(fee, secure);
 }
 
@@ -3771,11 +4514,19 @@ bool OfferManager::xch_ledger_probe_admits(CoinLockLedger&   probe,
     const bool buys_xch =
         (side == Side::Bid && pair.base_asset_id == "xch")
         || (side == Side::Ask && pair.quote_asset_id == "xch");
+    // [MIN-INPUT-COIN review #162] Same floor as the real admission, or the
+    // preflight would keep a side the cycle ledger then refuses.
+    // [review #163 r6] These two were IMPLICIT uint64 -> Mojo narrowings: the
+    // sinks take a Mojo and no diagnostic fires.  See xch_ledger_admits below
+    // and xop::to_mojo_saturating (types.hpp).
+    const Mojo min_coin = ledger_min_coin_mojos(
+        offer_dict, strategy_cfg_.offer_min_input_coin_frac);
     if (buys_xch) {
-        return probe.try_lock_floor_only(0, current_fee_mojos_);
+        return probe.try_lock_floor_only(
+            0, to_mojo_saturating(current_fee_mojos_), min_coin);
     }
     return probe.try_lock(xch_principal_from_offer_dict(offer_dict),
-                          current_fee_mojos_);
+                          to_mojo_saturating(current_fee_mojos_), min_coin);
 }
 
 bool OfferManager::xch_ledger_admits(const json&       offer_dict,
@@ -3799,8 +4550,15 @@ bool OfferManager::xch_ledger_admits(const json&       offer_dict,
     const bool buys_xch =
         (side == Side::Bid && pair.base_asset_id == "xch")
         || (side == Side::Ask && pair.quote_asset_id == "xch");
+    // [MIN-INPUT-COIN review #162] The floor create_offer_min_coin will send
+    // for THIS offer_dict -- per-tier, merged batch and batch fallback alike
+    // -- which the wallet also applies to the XCH fee coin.  0 for an
+    // XCH-funded offer, so those admissions are unchanged.
+    const Mojo min_coin = ledger_min_coin_mojos(
+        offer_dict, strategy_cfg_.offer_min_input_coin_frac);
     if (buys_xch) {
-        if (xch_cycle_ledger_.try_lock_floor_only(0, current_fee_mojos_)) {
+        if (xch_cycle_ledger_.try_lock_floor_only(
+                0, to_mojo_saturating(current_fee_mojos_), min_coin)) {
             return true;
         }
         xch_ledger_suppressed_ = true;
@@ -3814,7 +4572,8 @@ bool OfferManager::xch_ledger_admits(const json&       offer_dict,
         return false;
     }
     const Mojo principal = xch_principal_from_offer_dict(offer_dict);
-    if (xch_cycle_ledger_.try_lock(principal, current_fee_mojos_)) {
+    if (xch_cycle_ledger_.try_lock(
+            principal, to_mojo_saturating(current_fee_mojos_), min_coin)) {
         return true;
     }
     xch_ledger_suppressed_ = true;
@@ -3870,6 +4629,14 @@ asio::awaitable<int> OfferManager::post_merged_side(
         co_return 0;
     }
 
+    // [S74 / review #165, round 4] ...and the same on the batch path: a stop
+    // is latched, so start no create. Cancels nothing (see post_quotes).
+    if (stop_creating_predicate_ && stop_creating_predicate_()) {
+        logger_->warn("not creating the merged {} batch: a stop is latched. "
+                      "Nothing already created is cancelled.", pair.name);
+        co_return 0;
+    }
+
     // [XCH-LOCK-LEDGER] One merged offer, one lock: the merged dict's XCH
     // leg is the sum of every tier's, so the ledger charge is exact.
     if (!xch_ledger_admits(merged_dict, pair, tiers.front().side,
@@ -3887,17 +4654,55 @@ asio::awaitable<int> OfferManager::post_merged_side(
         expiry_max_time_for(pair);
     json result;
     bool batch_failed = false;
+    bool batch_uncertain = false;
     std::string batch_err;
+    // [MIN-INPUT-COIN] The merged dict still has one spend leg, so the floor
+    // scales with the merged amount.
+    // [S74 / review #165] Held until the merged offer is in State (or until
+    // this call gives up on it): a keep stop waits for exactly this window.
+    PostingMark batch_mark{posting_in_flight_flag_};
     try {
-        result = co_await wallet_->create_offer(
-            merged_dict, current_fee_mojos_, /*validate_only=*/false,
-            expiry_max_time);
+        result = co_await create_offer_min_coin(
+            merged_dict, expiry_max_time, pair, tiers.front().side,
+            static_cast<int>(tiers.front().tier_index), "merged batch");
+    } catch (const rpc::ChiaRPCTransportError& e) {
+        // [MERGE #162 x #165] ONE handler, not two. ChiaRPCTransportError
+        // derives from ChiaRPCError, so keeping both PRs' handlers on the same
+        // try is an unreachable duplicate (MSVC C2312, GCC -Wexceptions) --
+        // and both effects are wanted. Still BEFORE the base handler, which
+        // would otherwise take this too.
+        //   * #162: suppress the per-tier fallback, which would otherwise
+        //     rebuild the batch on top of a merged offer the wallet holds;
+        //   * #165: record the uncertainty, so a keep stop stops reporting a
+        //     clean book (the PostingMark comment has the whole argument).
+        batch_failed = true;
+        batch_err = e.what();
+        batch_uncertain =
+            rpc::create_possibly_submitted(e.curl_code(), e.http_code());
+        note_create_outcome_unknown(e, pair.name, "merged batch");
     } catch (const rpc::ChiaRPCError& e) {
         batch_failed = true;
         batch_err = e.what();
     }
 
+    // [MIN-INPUT-COIN review #162, round 2] No answer is not a refusal.  The
+    // merged offer may already rest in the wallet, and creating the tiers
+    // individually would duplicate it tier by tier.  Post nothing more for
+    // this side this cycle; a refusal, or a failure before the request was
+    // written, still falls back below.
+    if (batch_failed && batch_uncertain) {
+        logger_->error("Batch create_offer for {} {} got NO ANSWER ({}) -- "
+                       "the merged offer may exist in the wallet, so the "
+                       "tiers are NOT created individually this cycle",
+                       pair.name, to_string(tiers.front().side), batch_err);
+        co_return 0;
+    }
+
     if (batch_failed) {
+        // [S74] This create answered (with a failure): released here so the
+        // fallback tiers below are marked one at a time by their own marks,
+        // never nested inside this one.
+        batch_mark.release();
         // Fallback: if batch fails, fall through to individual creation.
         logger_->warn("Batch create_offer failed for {} {} -- "
                       "falling back to individual: {}",
@@ -3929,13 +4734,32 @@ asio::awaitable<int> OfferManager::post_merged_side(
                                pair.name, tier.tier_index);
                 break;
             }
+            // [S74 / review #165, round 4] ...and the fallback loop is a
+            // create-per-tier loop like post_quotes', so it needs the same
+            // non-cancelling gate. Its own copy: a gate on one loop says
+            // nothing about another (see the "mutate every copy" rule).
+            if (stop_creating_predicate_ && stop_creating_predicate_()) {
+                logger_->warn("not creating any further {} fallback tier: a "
+                              "stop is latched. Nothing already created is "
+                              "cancelled.", pair.name);
+                break;
+            }
             bool tier_failed = false;
             std::string tier_err;
             json sr;
+            // [S74 / review #165] One mark per fallback create, cleared when
+            // that tier's offer is in State below.
+            PostingMark fallback_mark{posting_in_flight_flag_};
             try {
-                sr = co_await wallet_->create_offer(
-                    single_dict, current_fee_mojos_, /*validate_only=*/false,
-                    expiry_max_time);
+                sr = co_await create_offer_min_coin(
+                    single_dict, expiry_max_time, pair, tier.side,
+                    static_cast<int>(tier.tier_index), "batch fallback");
+            } catch (const rpc::ChiaRPCTransportError& e2) {
+                // [review #165, round 4] Its own copy, for the same reason as
+                // the two above: no answer is not a refusal.
+                tier_failed = true;
+                tier_err = e2.what();
+                note_create_outcome_unknown(e2, pair.name, "batch fallback");
             } catch (const rpc::ChiaRPCError& e2) {
                 tier_failed = true;
                 tier_err = e2.what();
@@ -4022,7 +4846,10 @@ asio::awaitable<int> OfferManager::post_merged_side(
                 // Retain dexie's id so this offer is excluded from our own
                 // arbitrage scan; dropping it here would leave the fallback
                 // path takeable by our own taker.
-                po.dexie_id         = co_await submit_to_dexie(offer_text);
+                po.dexie_id         = co_await submit_to_dexie(
+                    offer_text,
+                    fmt::format("{} {} tier {} (batch fallback)", pair.name,
+                                to_string(tier.side), tier.tier_index));
                 po.offer_id         = sr["trade_record"]["trade_id"].get<std::string>();
                 po.pair_name        = pair.name;
                 po.side             = tier.side;
@@ -4033,7 +4860,10 @@ asio::awaitable<int> OfferManager::post_merged_side(
                 po.created_at_ts    = std::chrono::system_clock::now();
                 // [WALLET-LOAD] For the fill-poll striking-distance reset.
                 po.post_spread_bps  = tier.spread_bps;
+                // [S70] Past expiry_echo_ok above: the wallet's echo.
+                po.expiry_max_time  = expiry_max_time.value_or(0);
                 state_->upsert_offer(po);
+                fallback_mark.release();  // [S74] recorded
                 ++fallback_count;
 
                 // -- Fee reserve guard (batch fallback, UTXO-aware) ---------
@@ -4191,7 +5021,10 @@ asio::awaitable<int> OfferManager::post_merged_side(
     // Submit to dexie (best-effort).  Retain the id: every tier merged into
     // this batch rests on the book under it, and own-offer exclusion in the
     // arbitrage taker matches on it.
-    const std::string batch_dexie_id = co_await submit_to_dexie(offer_text);
+    const std::string batch_dexie_id = co_await submit_to_dexie(
+        offer_text,
+        fmt::format("{} {} merged batch of {} tiers", pair.name,
+                    to_string(tiers.front().side), tiers.size()));
 
     // Track all constituent tiers with the same offer_id.
     for (const auto& tier : tiers) {
@@ -4208,8 +5041,11 @@ asio::awaitable<int> OfferManager::post_merged_side(
         // [WALLET-LOAD] For the fill-poll striking-distance reset.
         pending.post_spread_bps  = tier.spread_bps;
         pending.dexie_id         = batch_dexie_id;
+        // [S70] Past expiry_echo_ok above: the wallet's echo.
+        pending.expiry_max_time  = expiry_max_time.value_or(0);
         state_->upsert_offer(pending);
     }
+    batch_mark.release();  // [S74] every constituent tier is in State
 
     logger_->info("Batch: posted {} {} ({} tiers merged) [{}]",
                   pair.name, to_string(tiers.front().side),
@@ -4223,7 +5059,8 @@ asio::awaitable<int> OfferManager::post_merged_side(
 // ---------------------------------------------------------------------------
 
 asio::awaitable<std::string> OfferManager::submit_to_dexie(
-    const std::string& offer_text)
+    const std::string& offer_text,
+    std::string        posting)
 {
     // Best-effort submission to the Dexie aggregator for cross-platform
     // visibility.  The offer is already valid on-chain regardless of
@@ -4262,6 +5099,9 @@ asio::awaitable<std::string> OfferManager::submit_to_dexie(
         // Log the reason but do not treat as a hard failure.
         logger_->warn("submit_to_dexie: rejected by Dexie -- {}",
                       result.error_message);
+        if (dexie_rejected_too_many_inputs(result.error_message)) {
+            note_dexie_too_many_inputs(posting, offer_text.size());
+        }
         co_return std::string{};
 
     } catch (const rpc::DexieRateLimitError& e) {
@@ -4272,6 +5112,12 @@ asio::awaitable<std::string> OfferManager::submit_to_dexie(
     } catch (const rpc::DexieClientError& e) {
         // Non-retryable 4xx error (bad request, invalid offer format, etc.).
         logger_->warn("submit_to_dexie: client error -- {}", e.what());
+        // [MIN-INPUT-COIN] The shape seen live: HTTP 400 whose body carries
+        // "Too many input coins".  Not an auto-cancel -- only the one line
+        // an operator can grep for and act on.
+        if (dexie_rejected_too_many_inputs(e.response_body)) {
+            note_dexie_too_many_inputs(posting, offer_text.size());
+        }
         co_return std::string{};
     } catch (const rpc::DexieServerError& e) {
         // Server-side 5xx that persisted after retries.
@@ -4460,6 +5306,11 @@ std::optional<PendingOffer> OfferManager::try_parse_wallet_offer(
         po.fee_mojos = summary["fees"].get<std::uint64_t>();
     }
 
+    // [S70] The wallet's own record of the timelock it put on this offer
+    // (valid_times is parse_timelock_info of the conditions it signed), so an
+    // adopted offer keeps its expiry across a restart.  0 when absent.
+    po.expiry_max_time = trade_record_max_time(trade_record);
+
     // Approximate created_at_block from wall-clock time.
     po.created_at_block = 0;
     if (current_block > 0 && trade_record.contains("created_at_time") &&
@@ -4642,7 +5493,15 @@ asio::awaitable<bool> OfferManager::emergency_cancel(
             // insufficient funds at a given tier, halve and retry.
             // This lets us cancel even when spendable is far below the
             // configured minimum fee.
-            const auto fee_cap = static_cast<Mojo>(current_fee_mojos_ * 2);
+            // [review #163 r6] The DOUBLING happens in the uint64 domain, so
+            // it has to saturate BEFORE the conversion does: a bare
+            // `static_cast<Mojo>(current_fee_mojos_ * 2)` wraps the product
+            // first and then narrows the wrapped value, which no amount of
+            // care at the cast alone would catch.
+            const Mojo fee_cap = to_mojo_saturating(
+                current_fee_mojos_ > std::numeric_limits<std::uint64_t>::max() / 2U
+                    ? std::numeric_limits<std::uint64_t>::max()
+                    : current_fee_mojos_ * 2U);
             Mojo attempt_fee = std::min(
                 fee_cap,
                 std::max(Mojo{1}, xch_spendable - Mojo{1000}));

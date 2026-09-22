@@ -22,6 +22,7 @@
 
 using xop::rpc::cancel_possibly_submitted;
 using xop::rpc::may_resend;
+using xop::rpc::request_possibly_submitted;
 using xop::rpc::retry_policy_for_endpoint;
 using xop::rpc::RpcRetryPolicy;
 
@@ -129,5 +130,112 @@ TEST(RpcRetryPolicy, APostSendCancelFailureIsPossiblySubmitted) {
     // A 4xx is an answer that the request was refused before any cancel ran.
     for (long code : {400L, 404L, 429L}) {
         EXPECT_FALSE(cancel_possibly_submitted(CURLE_OK, code)) << "HTTP " << code;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// [MIN-INPUT-COIN review #162, round 2] create_offer_for_ids.
+//
+// The min-input-coin fallback answers one specific wallet refusal with one
+// more create, on the premise that a refusal proves no offer was built.
+// rpc_post returns only its last attempt, so while this endpoint was re-sent
+// after a timeout the refusal could answer a COPY whose original had already
+// built the offer -- and the fallback then created a second one.
+// ---------------------------------------------------------------------------
+
+using xop::rpc::create_possibly_submitted;
+
+TEST(RpcRetryPolicy, ACreateIsNeverResentOnceItMayHaveReachedTheWallet) {
+    // Spelled exactly as ChiaWalletRPC::create_offer passes it.
+    const RpcRetryPolicy create =
+        retry_policy_for_endpoint("create_offer_for_ids");
+    ASSERT_EQ(create, RpcRetryPolicy::NeverResend);
+
+    // The shape that made two offers: no reply within the timeout, the
+    // request possibly still running inside the wallet.
+    EXPECT_FALSE(may_resend(create, CURLE_OPERATION_TIMEDOUT, /*transient=*/true));
+    EXPECT_FALSE(may_resend(create, CURLE_RECV_ERROR, true));
+    EXPECT_FALSE(may_resend(create, CURLE_GOT_NOTHING, true));
+    EXPECT_FALSE(may_resend(create, CURLE_OK, true));  // an HTTP 5xx
+
+    // A wallet that is down was never asked: still worth another attempt.
+    EXPECT_TRUE(may_resend(create, CURLE_COULDNT_CONNECT, true));
+    EXPECT_TRUE(may_resend(create, CURLE_SSL_CONNECT_ERROR, true));
+
+    // Deliberately narrow: the other non-idempotent endpoint is unchanged.
+    EXPECT_EQ(retry_policy_for_endpoint("take_offer"),
+              RpcRetryPolicy::RetryTransient);
+}
+
+TEST(RpcRetryPolicy, AnUnansweredCreateMayHaveBuiltTheOffer) {
+    // What post_merged_side asks before it answers a failed merged create
+    // with one create per tier.
+    EXPECT_TRUE(create_possibly_submitted(CURLE_OPERATION_TIMEDOUT, 0));
+    EXPECT_TRUE(create_possibly_submitted(CURLE_RECV_ERROR, 0));
+    EXPECT_TRUE(create_possibly_submitted(CURLE_GOT_NOTHING, 0));
+    EXPECT_TRUE(create_possibly_submitted(CURLE_OK, 500));
+    EXPECT_TRUE(create_possibly_submitted(CURLE_OK, 200));  // unparseable 2xx
+
+    // Provably never written, or answered with a refusal: the wallet built
+    // nothing, and the individual fallback is safe.
+    EXPECT_FALSE(create_possibly_submitted(CURLE_COULDNT_CONNECT, 0));
+    EXPECT_FALSE(create_possibly_submitted(CURLE_SSL_CONNECT_ERROR, 0));
+    EXPECT_FALSE(create_possibly_submitted(CURLE_COULDNT_RESOLVE_HOST, 0));
+    EXPECT_FALSE(create_possibly_submitted(CURLE_OK, 400));
+    EXPECT_FALSE(create_possibly_submitted(CURLE_OK, 429));
+}
+
+// [review #165, round 4] THE SAME QUESTION, ASKED BY A FAILED CREATE.
+//
+// A create that throws clears its PostingMark, so the keep-stop drain sees
+// "nothing in flight" and reported clean success -- but a timeout is not a
+// refusal, and the wallet may hold an offer this process never recorded. The
+// classification never depended on the endpoint, so cancel_possibly_submitted
+// became a thin alias of request_possibly_submitted and OfferManager's create
+// handlers ask the generic name (offer_manager.cpp
+// note_create_outcome_unknown; pinned there by tests/test_stop_keep_wiring.py,
+// which is where the wiring lives -- nothing in cpp/tests can construct an
+// OfferManager).
+//
+// MUTATION: make request_possibly_submitted return false for a timeout
+// -> FAILS here and in APostSendCancelFailureIsPossiblySubmitted (the alias),
+//    and nowhere else.
+// MUTATION: give cancel_possibly_submitted a body of its own that differs on
+//    any code -> FAILS the agreement block below, and nowhere else.
+TEST(RpcRetryPolicy, ACreateThatGotNoAnswerIsPossiblySubmittedToo) {
+    // The shapes an offer create actually meets on localhost: the 30 s
+    // request timeout, a wallet that died mid-reply, a reply that would not
+    // parse. Each of these may follow an offer the wallet really built.
+    EXPECT_TRUE(request_possibly_submitted(CURLE_OPERATION_TIMEDOUT, 0));
+    EXPECT_TRUE(request_possibly_submitted(CURLE_GOT_NOTHING, 0));
+    EXPECT_TRUE(request_possibly_submitted(CURLE_RECV_ERROR, 0));
+    EXPECT_TRUE(request_possibly_submitted(CURLE_OK, 200));  // unparseable body
+    EXPECT_TRUE(request_possibly_submitted(CURLE_OK, 502));
+
+    // ...and the ones that prove no offer was built, so a keep stop can still
+    // report a clean book: the request was never written.
+    EXPECT_FALSE(request_possibly_submitted(CURLE_COULDNT_CONNECT, 0));
+    EXPECT_FALSE(request_possibly_submitted(CURLE_COULDNT_RESOLVE_HOST, 0));
+    EXPECT_FALSE(request_possibly_submitted(CURLE_SSL_CONNECT_ERROR, 0));
+    EXPECT_FALSE(request_possibly_submitted(CURLE_FAILED_INIT, 0));
+    // A 4xx is the daemon answering that it refused the request.
+    EXPECT_FALSE(request_possibly_submitted(CURLE_OK, 404));
+
+    // The alias agrees everywhere the callers can reach, including the codes
+    // neither list names. One rule, two names -- not two rules that can drift.
+    for (CURLcode rc : {CURLE_OK, CURLE_OPERATION_TIMEDOUT, CURLE_GOT_NOTHING,
+                        CURLE_SEND_ERROR, CURLE_RECV_ERROR, CURLE_PARTIAL_FILE,
+                        CURLE_WEIRD_SERVER_REPLY, CURLE_OUT_OF_MEMORY,
+                        CURLE_FAILED_INIT, CURLE_URL_MALFORMAT,
+                        CURLE_UNSUPPORTED_PROTOCOL, CURLE_COULDNT_RESOLVE_PROXY,
+                        CURLE_COULDNT_RESOLVE_HOST, CURLE_COULDNT_CONNECT,
+                        CURLE_SSL_CONNECT_ERROR, CURLE_PEER_FAILED_VERIFICATION,
+                        CURLE_SSL_CERTPROBLEM, CURLE_SSL_CIPHER,
+                        CURLE_SSL_CACERT_BADFILE}) {
+        for (long http : {0L, 200L, 302L, 400L, 404L, 429L, 500L, 503L}) {
+            EXPECT_EQ(cancel_possibly_submitted(rc, http),
+                      request_possibly_submitted(rc, http))
+                << "curl " << static_cast<int>(rc) << " HTTP " << http;
+        }
     }
 }

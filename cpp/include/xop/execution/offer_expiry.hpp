@@ -193,6 +193,350 @@ inline constexpr double kExpiryFloorMargin = 2.0;
            * kExpiryFloorMargin;
 }
 
+// ---------------------------------------------------------------------------
+// [S70 2026-09-20] strategy.ttl_cancel_mode: expire -- let the chain age an
+// offer out instead of paying for a cancel.
+//
+// THE PROBLEM.  The hard TTL cancels a correctly priced offer purely for its
+// age and reposts it at nearly the same price: 402 of 1,254 cancels in the 14
+// days to 2026-09-20, every one a fee-bearing spend into ~97% full blocks.
+// An offer that carries a VERIFIED max_time already has an age limit the
+// chain enforces for free, so in `expire` mode the hard TTL skips it.
+//
+// WHAT CHIA 2.7.4 DOES WITH AN EXPIRED OFFER -- read from the source at tag
+// 2.7.4 (commit 98aba3d1), not assumed.  This is the half that [review #150]
+// above declined to claim:
+//
+//   * The wallet never retires it.  Nothing in chia/wallet/trade_manager.py
+//     or wallet_node.py reads valid_times after the trade is stored; a trade
+//     leaves PENDING_ACCEPT only through coins_of_interest_farmed (a coin it
+//     watches was spent) or cancel_pending_offers.  An expired offer stays
+//     PENDING_ACCEPT indefinitely.
+//   * Its coins stay LOCKED.  TradeManager.get_locked_coins (trade_manager.py
+//     L210-230) returns the coins of every PENDING_ACCEPT / PENDING_CONFIRM /
+//     PENDING_CANCEL trade with no time test, and get_spendable_coins_for_
+//     wallet (wallet_state_manager.py L2002-2035) subtracts them.  So an
+//     expiry alone returns NO collateral.
+//   * cancel_offer with secure=false releases them with no spend.
+//     cancel_pending_offers (trade_manager.py L289-292) sets the trade
+//     CANCELLED and `continue`s before it builds any transaction, and a
+//     CANCELLED trade is outside get_locked_coins.  No fee, no mempool.
+//   * Nobody can take it afterwards.  max_time becomes
+//     ASSERT_BEFORE_SECONDS_ABSOLUTE on the maker's own signed spend, and
+//     chia_rs check_time_locks fails a bundle once
+//     `timestamp >= before_seconds_absolute`, where `timestamp` is the
+//     PREVIOUS TRANSACTION BLOCK's (mempool_manager.py L829-841 passes
+//     self.peak.timestamp).  Transaction-block timestamps only increase, so
+//     once one at or past max_time exists no later block can carry the spend.
+//
+// WHY A LOCAL CANCEL IS NORMALLY UNSAFE AND IS SAFE HERE.  secure=false leaves
+// the offer file valid: anyone holding it can still take it, and a take after
+// the local cancel is invisible, because get_trades_by_coin skips CANCELLED
+// trades, so the wallet never reports CONFIRMED and the fill is never booked.
+// That is a race the bot loses silently.  For an EXPIRED offer there is no
+// race left to lose -- provided the clock that says "expired" is the chain's.
+//
+// THE CLOCK IS NOT THIS HOST'S -- AND IT IS NOT THE WALLET'S OWN EITHER.
+// max_time was minted from the host clock but is ENFORCED against block
+// timestamps, which trail wall time by one transaction-block interval (~52 s
+// typical, minutes on a slow patch) and are themselves only loosely bound to
+// it.  So "now >= max_time" on this host proves nothing: the offer can still
+// be taken until a transaction block stamped >= max_time exists.  The retire
+// decision therefore reads get_timestamp_for_height rather than the host
+// clock.
+//
+// [review #164, 2026-09-21] AN EARLIER REVISION OF THIS COMMENT CALLED THAT
+// "the wallet's own chain clock" AND SAID IT ANSWERED TWO QUESTIONS AT ONCE.
+// That was false, and false in the direction that matters.  Only the HEIGHT
+// the clock is asked at is anchored to the wallet's processed chain
+// (get_height_info = get_finished_sync_up_to).  The TIMESTAMP returned at that
+// height is ONE CONNECTED PEER'S UNVALIDATED ASSERTION about a header block:
+// WalletNode.get_timestamp_for_height asks peers in order and takes the first
+// non-None answer, with expected_header_hash left at None, so on a cache miss
+// the only checks are "one block came back" and "its height matches".  No
+// signature, no proof of space, no VDF, no consensus.  rpc/wallet_requests.hpp
+// has the line numbers in chia 2.7.4 and the rest of the evidence.
+//
+// So the sentence this header used to end on -- "If it still says
+// PENDING_ACCEPT, the offer was never taken and never can be" -- holds only if
+// the timestamp is true.  A peer that lies makes it false, and the consequence
+// is the worst one this feature has: cancel_offer secure=false frees the maker
+// coins with no spend and cannot be undone, while the offer file stays valid
+// and published, so a taker can still spend it -- and the take is invisible,
+// because get_trades_by_coin skips CANCELLED trades and the wallet therefore
+// never reports CONFIRMED.  The coins AND the accounting are lost.
+//
+// THE REORG ALLOWANCE IS A DEPTH, NOT A NUMBER OF SECONDS -- AND IT IS NOT AN
+// ANSWER TO A LYING PEER.  [review #164] The first revision required the chain
+// clock to be 600 s PAST max_time and called that "~32 blocks".  It is not:
+// transaction-block timestamps must increase, but by no particular step, so
+// after a slow patch the FIRST block stamped past max_time can be stamped
+// 600 s past it -- satisfying a seconds margin at a confirmation depth of one.
+// Reorg that one block (ordinary at the tip) and the previous transaction
+// block is again before max_time: the offer is takeable, its trade is
+// CANCELLED in the wallet, and the take is never booked.  So the clock is read
+// kExpiredRetireDepthBlocks BELOW the wallet's synced height: if the chain was
+// already past max_time that many blocks ago, the block that expired the offer
+// is buried at least that deep.  That bounds REORGS and nothing else -- a
+// forged timestamp at height H-32 costs a liar exactly what one at H costs.
+//
+// WHAT BOUNDS THE LIAR IS chain_clock_trust BELOW: the pass asks the wallet
+// which full nodes it is connected to and refuses to retire anything unless
+// every one of them is on this host, where chia's own is_trusted_peer trusts
+// them unconditionally.  The residual is stated at that function.
+//
+// Pure, like the rest of this header.  OfferManager::retire_expired_offers
+// supplies the wallet answers; cpp/tests/test_offer_expiry.cpp drives these.
+// ---------------------------------------------------------------------------
+
+/// Whether the bot's OWN age limit (the unconditional hard-TTL cancel, and the
+/// stuck-offer pass behind it) applies to an offer.
+///
+/// False only when the operator chose `expire` AND the offer verifiably
+/// carries an on-chain expiry.  0 means "no verified expiry" -- an offer
+/// created before the feature, one whose echo failed, or one restored from
+/// offer_log before the wallet record has been read back -- and such an offer
+/// keeps today's hard TTL, because nothing else bounds its life.
+[[nodiscard]] constexpr bool age_limit_cancel_applies(
+    bool          expire_mode,
+    std::uint64_t verified_max_time) noexcept
+{
+    return !(expire_mode && verified_max_time > 0);
+}
+
+/// The max_time a wallet trade record carries, or 0 when it carries none.
+///
+/// Takes the trade_record OBJECT itself (get_offer's "trade_record", or one
+/// element of get_all_offers' "trade_records").  Same fail-closed typing as
+/// expiry_echo_ok: a null, a float, a string or a negative number all read as
+/// "no verified expiry", so the offer keeps the bot's own hard TTL.
+[[nodiscard]] inline std::uint64_t trade_record_max_time(
+    const nlohmann::json& trade_record)
+{
+    if (!trade_record.is_object()
+        || !trade_record.contains("valid_times")
+        || !trade_record["valid_times"].is_object()) {
+        return 0;
+    }
+    const auto& vt = trade_record["valid_times"];
+    if (!vt.contains("max_time") || !vt["max_time"].is_number_unsigned()) {
+        return 0;
+    }
+    const auto max_time = vt["max_time"].get<std::uint64_t>();
+    // A timelock before mainnet genesis is not one this bot minted (see
+    // kMinPlausibleUnixTime); refuse to reason from it.
+    return max_time >= static_cast<std::uint64_t>(kMinPlausibleUnixTime)
+        ? max_time : 0;
+}
+
+/// Whether the chain clock this heartbeat would come from a peer this host
+/// runs itself.
+///
+/// [review #164 2026-09-21] THIS IS THE DEFENCE, and the read depth is not.
+/// get_timestamp_for_height returns whatever the first answering full-node
+/// peer says, unvalidated (rpc/wallet_requests.hpp).  Nothing downstream can
+/// tell a true timestamp from a forged one -- there is no upper bound to
+/// violate, and a liar picks a value just past max_time, so no plausibility
+/// test and no monotonicity test separates the two.  The only property that
+/// does is WHOSE answer it is.
+enum class ChainClockTrust : std::uint8_t {
+    Unreadable,      ///< the wallet did not say who it is connected to
+    NoFullNodePeer,  ///< nothing could have answered; there is no clock
+    UntrustedPeer,   ///< a full node this host does not run could have answered
+    Trusted,         ///< every full-node peer is on this host
+};
+
+/// The verdict on a get_connections census (rpc::census_full_node_peers).
+///
+/// Split from the parser so it is pure, constexpr and directly testable: the
+/// parser turns JSON into three numbers, and this turns three numbers into the
+/// decision.
+///
+/// WHY "EVERY PEER" RATHER THAN "THE PEER THAT ANSWERED": the RPC never says
+/// which peer answered, and get_full_node_peers_in_order() shuffles within its
+/// buckets, so the candidate set is the only thing that can be gated.
+///
+/// THE TWO DEPLOYMENT STATES THIS CLOSES, both of which this operator has been
+/// in.  The local full node being the wallet's only peer is a deployment
+/// accident, not an invariant -- chia/util/network.py:144-149 trusts localhost
+/// unconditionally, and the live wallet had exactly one peer, 127.0.0.1:8444,
+/// when this was measured on 2026-09-21.  It lapses:
+///   (a) LOCAL NODE DOWN.  on_disconnect clears local_node_synced and re-runs
+///       initialize_wallet_peers (wallet_node.py:838-841); discovery then
+///       connects to strangers and the wallet untrusted-syncs to them
+///       (:1481-1499).  The node RPC was unreachable for hours on 2026-09-14.
+///   (b) THE TRANSIENT AFTER IT RETURNS.  The localhost peer sits in the
+///       `trusted` bucket (3rd) until its long_sync finishes, while
+///       already-synced strangers sit in `synced` (2nd) -- so a stranger is
+///       asked FIRST during that window (:1203-1228).
+/// Neither is closed by the engine's wallet sync gate, which reads
+/// get_sync_status: a wallet synced to strangers reports synced=true.
+///
+/// THE RESIDUAL, stated rather than papered over.  This is a check on a peer
+/// SET that can change between the census and the clock read, so the pass
+/// takes it twice, immediately before and immediately after, and requires
+/// Trusted both times.  A peer that connects, answers and disconnects entirely
+/// inside that window would still be missed.  And a compromised or buggy
+/// LOCAL node is inside the trust boundary by construction -- it already
+/// supplies this bot's coin records, fee estimates and mempool admission, so
+/// nothing here would be worth anything if it were hostile.
+[[nodiscard]] constexpr ChainClockTrust chain_clock_trust(
+    bool readable,
+    int  full_node_peers,
+    int  non_local_peers) noexcept
+{
+    if (!readable)            return ChainClockTrust::Unreadable;
+    if (full_node_peers <= 0) return ChainClockTrust::NoFullNodePeer;
+    if (non_local_peers > 0)  return ChainClockTrust::UntrustedPeer;
+    return ChainClockTrust::Trusted;
+}
+
+/// The operator-facing half of a non-Trusted verdict, so the log says WHICH
+/// of the three it was rather than "no chain clock".
+[[nodiscard]] constexpr const char* chain_clock_trust_reason(
+    ChainClockTrust trust) noexcept
+{
+    switch (trust) {
+        case ChainClockTrust::Unreadable:
+            return "the wallet did not say which full nodes it is connected to";
+        case ChainClockTrust::NoFullNodePeer:
+            return "the wallet has no full-node peer to ask";
+        case ChainClockTrust::UntrustedPeer:
+            return "the wallet is connected to a full node this host does not "
+                   "run, and the chain clock is whatever a peer says it is";
+        case ChainClockTrust::Trusted:
+            return "every full-node peer is on this host";
+    }
+    return "unknown";
+}
+
+/// How deep the block that expired an offer must be buried before the offer is
+/// retired locally, in peak-height blocks.  32 is ~10 min at the 18.75 s
+/// cadence (4,608/day) and over five times strategy.confirmation_depth_blocks'
+/// default of 6, which is what this engine asks of a FILL: an insecure cancel
+/// cannot be taken back, so it waits longer.  The cost is ten more minutes of
+/// locked coins on an offer that already cannot be taken.
+///
+/// [review #164] THIS IS A REORG ALLOWANCE AND NOTHING MORE.  It buys ZERO
+/// protection against a peer that forges the timestamp, because forging one
+/// for height H-32 is exactly as cheap as forging one for H.  chain_clock_trust
+/// is what addresses that; do not read this depth as if it did.
+inline constexpr std::int64_t kExpiredRetireDepthBlocks = 32;
+
+/// The height the retire decision asks its timestamp at: @p synced_height (the
+/// wallet's get_height_info, i.e. get_finished_sync_up_to) less the depth.
+/// 0 when the wallet is not that deep into the chain -- no clock, and nothing
+/// is retired.
+///
+/// The HEIGHT is the part that is anchored to the wallet's own processed
+/// chain.  The timestamp returned at it is not (see the header comment).
+[[nodiscard]] constexpr std::int64_t expired_retire_clock_height(
+    std::int64_t synced_height) noexcept
+{
+    return synced_height > kExpiredRetireDepthBlocks
+        ? synced_height - kExpiredRetireDepthBlocks
+        : 0;
+}
+
+/// True once the answered transaction-block timestamp at
+/// expired_retire_clock_height(...) was already at or past max_time.
+/// @p chain_time_at_depth_s is what get_timestamp_for_height returned -- a
+/// TRANSACTION-BLOCK timestamp as asserted by one connected peer, never this
+/// host's clock, and never independently validated (rpc/wallet_requests.hpp).
+/// `>=`, as consensus has it: a spend asserting BEFORE max_time fails once the
+/// previous transaction block's timestamp is >= max_time.  0 on either side
+/// reads as "unknown" and is never expired: an unknown max_time by the first
+/// clause, an unknown clock because 0 is >= no real max_time.
+///
+/// There is deliberately NO upper bound here.  A plausibility ceiling would
+/// stop only a careless liar -- a careful one answers max_time + 1 -- while
+/// making a second untrusted clock (this host's) load-bearing.  The caller
+/// must have established chain_clock_trust before it reaches this function.
+[[nodiscard]] constexpr bool expired_at_depth(
+    std::uint64_t max_time,
+    std::uint64_t chain_time_at_depth_s) noexcept
+{
+    return max_time != 0 && chain_time_at_depth_s >= max_time;
+}
+
+/// A cheap PRE-FILTER on the host clock, so a heartbeat with nothing near its
+/// expiry asks the wallet nothing.  It only ever decides to LOOK: a fast host
+/// clock costs four read-only RPCs (the peer census, the height, the clock,
+/// the census again), a slow one delays a retire that is already harmless.
+/// The retire itself is decided by expired_at_depth behind chain_clock_trust.
+[[nodiscard]] constexpr bool expiry_worth_checking(
+    std::uint64_t max_time,
+    std::int64_t  host_now_s) noexcept
+{
+    return max_time > 0
+        && host_now_s > 0
+        && static_cast<std::uint64_t>(host_now_s) >= max_time;
+}
+
+/// How often retire_expired_offers may repeat a WARN, in peak-height blocks:
+/// 96 is ~30 min at 18.75 s.  The pass runs every heartbeat while any offer
+/// waits past its expiry, and a wallet that cannot supply the chain clock
+/// fails identically each time.
+inline constexpr std::uint64_t kExpiryWarnIntervalBlocks = 96;
+
+/// Whether a retire-pass warning may be logged at WARN this block (it goes
+/// to debug otherwise).  0 = never warned.  A height that went BACKWARDS (a
+/// reorg, a height-source switch) warns rather than staying silent -- stated
+/// as its own clause although the unsigned subtraction below would wrap to
+/// the same answer, because a rule that is right only by wrap-around reads as
+/// a bug to the next person who touches it.
+[[nodiscard]] constexpr bool expiry_warn_due(
+    std::uint64_t last_warned_block,
+    std::uint64_t current_block) noexcept
+{
+    return last_warned_block == 0
+        || current_block < last_warned_block
+        || current_block - last_warned_block >= kExpiryWarnIntervalBlocks;
+}
+
+/// What to do with a resting offer whose on-chain expiry may have passed.
+enum class ExpiredRetire {
+    NotExpired,     ///< the chain was not yet past max_time at depth: leave it
+    LeaveToWallet,  ///< the wallet says it is no longer PENDING_ACCEPT: a fill
+                    ///< or a cancel is in hand, and those paths own it
+    Unverified,     ///< the wallet's record does not carry OUR max_time: keep
+                    ///< the offer, and let the hard TTL have it back
+    RetireLocal,    ///< expired, never taken, never takeable: free the coins
+};
+
+/// The retire decision.  Every input is a wallet answer read THIS heartbeat.
+///
+/// @param wallet_status_pending_accept  get_offer reported PENDING_ACCEPT.
+/// @param tracked_max_time   the expiry State holds for the offer.
+/// @param record_max_time    trade_record_max_time(get_offer's record).
+/// @param chain_time_at_depth_s  the timestamp a TRUSTED full-node peer
+///                           answered for expired_retire_clock_height(synced
+///                           height).  The caller passes 0 unless
+///                           chain_clock_trust said Trusted both before and
+///                           after the read.
+///
+/// Order is the contract.  The status is read first because a CONFIRMED
+/// trade is a FILL whatever the clock says, and `filled` always wins.  The
+/// record must then repeat the expiry we tracked, exactly: a local cancel on
+/// an offer whose timelock we cannot re-verify is the insecure cancel this
+/// repo otherwise refuses.
+[[nodiscard]] constexpr ExpiredRetire decide_expired_retire(
+    bool          wallet_status_pending_accept,
+    std::uint64_t tracked_max_time,
+    std::uint64_t record_max_time,
+    std::uint64_t chain_time_at_depth_s) noexcept
+{
+    if (!wallet_status_pending_accept) {
+        return ExpiredRetire::LeaveToWallet;
+    }
+    if (tracked_max_time == 0 || record_max_time != tracked_max_time) {
+        return ExpiredRetire::Unverified;
+    }
+    return expired_at_depth(tracked_max_time, chain_time_at_depth_s)
+        ? ExpiredRetire::RetireLocal
+        : ExpiredRetire::NotExpired;
+}
+
 }  // namespace xop::execution
 
 #endif  // XOP_EXECUTION_OFFER_EXPIRY_HPP

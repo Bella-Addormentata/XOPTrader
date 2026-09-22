@@ -48,7 +48,9 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include "xop/rpc/node_requests.hpp"
 #include "xop/rpc/transport_evidence.hpp"
+#include "xop/rpc/wallet_requests.hpp"
 
 namespace xop::rpc {
 
@@ -456,6 +458,22 @@ public:
         std::uint64_t target_time_seconds = 60);
 
     /**
+     * @brief [S67] The node's fee RATE for a target inclusion time.
+     *
+     * Sends get_fee_estimate with an explicit `cost`
+     * (rpc::kFeeEstimateReferenceCost) instead of `spend_type:
+     * send_xch_transaction`, whose 9.4M-cost answer was 4.5x-22x too small
+     * for the cancels and takes it paid for.  The rate does not depend on the
+     * cost asked about, so one call serves every action class.  See
+     * rpc/node_requests.hpp.
+     *
+     * @return The parsed reading; `ok` is false when the call failed or the
+     *         reply could not be read.  Never throws ChiaRPCError.
+     */
+    asio::awaitable<FeeEstimateReading> get_fee_rate_estimate(
+        std::uint64_t target_time_seconds);
+
+    /**
      * @brief Look up coin records by their coin names (IDs).
      *
      * Batch-validates whether specific coins are spent or unspent on-chain.
@@ -518,8 +536,18 @@ public:
         return last_sync_state_;
     }
 
+    /// [S67] The mempool fields of the most recent blockchain-state response
+    /// get_block_height() fetched -- the node's own admission floor, read at
+    /// no extra RPC, exactly as last_sync_state() is.  `known` stays false
+    /// until the node has answered with all of them.
+    [[nodiscard]] MempoolState last_mempool_state() const noexcept
+    {
+        return last_mempool_state_;
+    }
+
 private:
     SyncState last_sync_state_{};
+    MempoolState last_mempool_state_{};
 };
 
 /**
@@ -584,6 +612,13 @@ public:
      *                       the ONLY timelock flag we send -- see
      *                       StrategyConfig::offer_expiry_secs for why
      *                       max_height/min_height/min_time are not.
+     * @param min_coin_amount  [MIN-INPUT-COIN] Optional floor, in mojos, on
+     *                       the coins the wallet may select.  ONE value
+     *                       governs every selection the request makes: the
+     *                       offered asset AND, for a CAT-funded offer, the
+     *                       XCH fee coin (chia 2.7.4 tx_endpoint /
+     *                       TXConfigLoader).  Omitted entirely when unset.
+     *                       See execution/offer_min_input_coin.hpp.
      * @return JSON containing "offer" (bech32 text) and "trade_record".
      *         When max_time was sent, trade_record.valid_times.max_time
      *         echoes it back; callers must VERIFY that echo rather than
@@ -593,7 +628,8 @@ public:
         const json&    offer_dict,
         std::uint64_t  fee           = 0,
         bool           validate_only = false,
-        std::optional<std::uint64_t> max_time = std::nullopt);
+        std::optional<std::uint64_t> max_time = std::nullopt,
+        std::optional<std::uint64_t> min_coin_amount = std::nullopt);
 
     /**
      * @brief Build the create_offer_for_ids request body.
@@ -609,12 +645,18 @@ public:
      *
      * @param max_time  Absent leaves the payload byte-identical to the one
      *                  sent before offer expiry existed.
+     * @param min_coin_amount  [MIN-INPUT-COIN] Absent leaves the payload
+     *                  byte-identical to the one sent before the floor
+     *                  existed.  Present, it is written at the TOP LEVEL --
+     *                  where chia 2.7.4 reads its coin-selection config --
+     *                  and never inside "offer".
      */
     [[nodiscard]] static json build_create_offer_payload(
         const json&    offer_dict,
         std::uint64_t  fee,
         bool           validate_only,
-        const std::optional<std::uint64_t>& max_time);
+        const std::optional<std::uint64_t>& max_time,
+        const std::optional<std::uint64_t>& min_coin_amount = std::nullopt);
 
     /**
      * @brief Accept (take) an existing offer.
@@ -728,6 +770,41 @@ public:
      * @throws ChiaRPCError on transport or application-level failure.
      */
     asio::awaitable<std::int64_t> get_height_info();
+
+    /**
+     * @brief What a connected full-node peer says the chain clock at
+     *        @p height is.
+     *
+     * [S70 2026-09-20] Calls the wallet RPC "get_timestamp_for_height": the
+     * timestamp of the latest TRANSACTION block at or before @p height --
+     * the value consensus compares an offer's max_time with.  Read-only.
+     * Payload and parsing are pinned in rpc/wallet_requests.hpp.
+     *
+     * [review #164 2026-09-21] NOT a local computation and NOT validated.
+     * The wallet forwards this to whichever full-node peer answers first, in
+     * chia's UNANCHORED mode (no expected_header_hash), so the number is that
+     * peer's assertion about a header block.  Any caller acting irreversibly
+     * on it must first establish get_full_node_peer_census().
+     *
+     * @return The timestamp, or 0 when the response carries none.
+     * @throws ChiaRPCError on transport or application-level failure.
+     */
+    asio::awaitable<std::uint64_t> get_timestamp_for_height(std::int64_t height);
+
+    /**
+     * @brief Which full nodes this wallet is connected to.
+     *
+     * [review #164 2026-09-21] Calls the shared RPC "get_connections" with
+     * node_type = FULL_NODE and censuses the answer, so a caller can tell
+     * whether a get_timestamp_for_height answer could only have come from a
+     * full node on this host.  Read-only; nothing here opens or closes a
+     * connection.  Parsing is pinned in rpc/wallet_requests.hpp.
+     *
+     * @return The census; `readable` is false when the response could not be
+     *         fully accounted for, which callers must treat as "do not act".
+     * @throws ChiaRPCError on transport or application-level failure.
+     */
+    asio::awaitable<FullNodePeerCensus> get_full_node_peer_census();
 
     /**
      * @brief Retrieve the wallet's sync status.

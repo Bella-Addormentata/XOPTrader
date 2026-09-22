@@ -746,6 +746,10 @@ asio::awaitable<std::int64_t> ChiaFullNodeRPC::get_block_height()
     // rebuilding database before its first peak -- which genuinely cannot
     // serve a height, and whose gauges stay dark until one arrives.
     last_sync_state_ = node_sync_from_blockchain_state(resp, last_sync_state_);
+    // [S67] Same response, same reason: the node's admission floor rides in it
+    // and costs no second RPC.  A reply without the mempool fields reads as
+    // UNKNOWN (known = false), never as an empty mempool.
+    last_mempool_state_ = node_mempool_from_blockchain_state(resp);
 
     if (!resp.contains("blockchain_state") ||
         !resp["blockchain_state"].contains("peak") ||
@@ -810,10 +814,10 @@ ChiaFullNodeRPC::get_fee_estimate(std::uint64_t target_time_seconds)
     // If the endpoint is unavailable (older node) or fails, return 0 so the
     // caller falls back to the static fee.
     try {
-        json payload = {
-            {"target_times", {target_time_seconds}},
-            {"spend_type", "send_xch_transaction"}
-        };
+        // [S67] The payload now lives in rpc/node_requests.hpp so ctest pins it.
+        // This is the LEGACY request, unchanged: fees.cost_aware_estimate and
+        // the fee controller use get_fee_rate_estimate() below instead.
+        const json payload = make_fee_estimate_request_legacy(target_time_seconds);
 
         const json resp = co_await rpc_post("get_fee_estimate", payload);
 
@@ -830,6 +834,23 @@ ChiaFullNodeRPC::get_fee_estimate(std::uint64_t target_time_seconds)
     }
 }
 
+asio::awaitable<FeeEstimateReading>
+ChiaFullNodeRPC::get_fee_rate_estimate(std::uint64_t target_time_seconds)
+{
+    // [S67] One request with an explicit reference cost; the handler returns
+    // rate x cost, so the rate falls out and every action class scales it by
+    // its own cost.  Failure is a reading with ok = false, never a throw: the
+    // caller is the heartbeat, and a fee estimate is not worth a cycle.
+    try {
+        // A named payload, not a temporary inside the co_await expression.
+        const json payload =
+            make_fee_estimate_request(target_time_seconds, kFeeEstimateReferenceCost);
+        const json resp = co_await rpc_post("get_fee_estimate", payload);
+        co_return parse_fee_estimate(resp, kFeeEstimateReferenceCost);
+    } catch (const ChiaRPCError&) {
+        co_return FeeEstimateReading{};
+    }
+}
 asio::awaitable<std::vector<json>>
 ChiaFullNodeRPC::get_coin_records_by_names(
     const std::vector<std::string>& names,
@@ -901,6 +922,27 @@ asio::awaitable<std::int64_t> ChiaWalletRPC::get_height_info()
     co_return resp["height"].get<std::int64_t>();
 }
 
+asio::awaitable<std::uint64_t>
+ChiaWalletRPC::get_timestamp_for_height(std::int64_t height)
+{
+    // [S70] Shape pinned in wallet_requests.hpp / test_wallet_requests.cpp.
+    const json resp = co_await rpc_post(
+        "get_timestamp_for_height",
+        make_get_timestamp_for_height_request(height));
+    co_return parse_timestamp_for_height_response(resp);
+}
+
+asio::awaitable<FullNodePeerCensus>
+ChiaWalletRPC::get_full_node_peer_census()
+{
+    // [review #164] Shape pinned in wallet_requests.hpp /
+    // test_wallet_requests.cpp, and verified read-only against the live 2.7.4
+    // wallet on 2026-09-21.
+    const json resp = co_await rpc_post("get_connections",
+                                        make_get_connections_request());
+    co_return census_full_node_peers(resp);
+}
+
 asio::awaitable<json> ChiaWalletRPC::get_sync_status()
 {
     co_return co_await rpc_post("get_sync_status");
@@ -939,11 +981,12 @@ asio::awaitable<json>
 ChiaWalletRPC::create_offer(const json&   offer_dict,
                              std::uint64_t fee,
                              bool          validate_only,
-                             std::optional<std::uint64_t> max_time)
+                             std::optional<std::uint64_t> max_time,
+                             std::optional<std::uint64_t> min_coin_amount)
 {
     // The Chia wallet RPC endpoint is "create_offer_for_ids".
     const json payload = build_create_offer_payload(
-        offer_dict, fee, validate_only, max_time);
+        offer_dict, fee, validate_only, max_time, min_coin_amount);
 
     const json resp = co_await rpc_post("create_offer_for_ids", payload);
 
@@ -956,7 +999,8 @@ json ChiaWalletRPC::build_create_offer_payload(
     const json&    offer_dict,
     std::uint64_t  fee,
     bool           validate_only,
-    const std::optional<std::uint64_t>& max_time)
+    const std::optional<std::uint64_t>& max_time,
+    const std::optional<std::uint64_t>& min_coin_amount)
 {
     // offer_dict maps wallet_id (as string key) -> signed mojo amount.
     json payload = {
@@ -979,6 +1023,15 @@ json ChiaWalletRPC::build_create_offer_payload(
     // supported by this API.  test_offer_expiry pins all of this.
     if (max_time.has_value()) {
         payload["max_time"] = *max_time;
+    }
+
+    // [MIN-INPUT-COIN] Attached only when the caller asks.  The key sits at
+    // the top level because that is where the wallet reads its coin-selection
+    // config (tx_endpoint -> TXConfigLoader.from_json_dict(request)); the same
+    // floor then governs the offered asset and the XCH fee coin alike.  A
+    // floor of 0 is the wallet's own default, so it is not worth a key.
+    if (min_coin_amount.has_value() && *min_coin_amount > 0) {
+        payload["min_coin_amount"] = *min_coin_amount;
     }
     return payload;
 }

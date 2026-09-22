@@ -22,6 +22,12 @@
 using xop::execution::classify_cross_bbo;
 using xop::execution::classify_cross_published_mid;
 using xop::execution::classify_tier_refresh;
+using xop::execution::classify_tier_refresh_margin;
+using xop::execution::margin_breach_reason;
+using xop::execution::margin_edge_bps;
+using xop::execution::margin_reference_usable;
+using xop::execution::MarginRefresh;
+using xop::execution::resting_edge_bps;
 using xop::execution::CrossVerdict;
 using xop::execution::TierRefresh;
 
@@ -520,4 +526,299 @@ TEST(TierRefresh, PastTheSoftTtlOnlyAdverseDriftExpiresAndFavorableRestsToHardTt
     EXPECT_EQ(classify_tier_refresh(false, true, /*below_min_age=*/true,
                                     true, 0.05, kTierThreshold, kSoftTtl),
               TierRefresh::Expired);
+}
+
+// -- [S72 2026-09-20] The margin rule ----------------------------------------
+//
+// price_cancel_mode: margin replaces every deviation zone above with one
+// question about the OFFER rather than the ladder: would a fill at its
+// resting price still earn edge_retain x the edge Step 7 demands of a new
+// offer, against Step 7's own centre?  Pinned here: the arithmetic and its
+// sign convention, the zone order, the boundary, that a favourable drift can
+// never cancel, that a missing reference falls back instead of keeping, and
+// the two things that make the rule cheaper than the one it replaces.
+
+namespace {
+// XCH/DBX on 2026-09-14 14:21: centre 85.97 DBX, floor 123 bps (the sigma
+// term bound), so Step 7's posting edges were 84.9160 / 87.0310.
+constexpr double kCentre   = 85.9735;
+constexpr double kFloorBps = 123.0;
+constexpr double kRetain   = 0.5;
+
+[[nodiscard]] double px_at_edge(bool is_ask, double edge_bps)
+{
+    return is_ask ? kCentre * (1.0 + edge_bps / 10'000.0)
+                  : kCentre * (1.0 - edge_bps / 10'000.0);
+}
+
+[[nodiscard]] MarginRefresh margin_of(bool is_ask, double price,
+                                      double centre = kCentre,
+                                      double retain = kRetain)
+{
+    // One centre: no fair-value centre captured (0), so the ladder centre
+    // decides alone.  The two-centre cases build their own calls below.
+    return classify_tier_refresh_margin(/*crossed=*/false,
+                                        /*below_min_age=*/false, is_ask, price,
+                                        centre, /*fair_centre=*/0.0, kFloorBps,
+                                        retain);
+}
+}  // namespace
+
+TEST(MarginRefresh, EdgeIsPositiveOnTheProfitableSideOfTheCentre)
+{
+    // An ask earns by resting ABOVE the centre, a bid by resting BELOW it.
+    EXPECT_NEAR(resting_edge_bps(kAsk, 101.0, 100.0), 100.0, 1e-9);
+    EXPECT_NEAR(resting_edge_bps(kBid, 99.0, 100.0), 100.0, 1e-9);
+    // The wrong side of the centre is a NEGATIVE edge, not a large one.
+    EXPECT_NEAR(resting_edge_bps(kAsk, 99.0, 100.0), -100.0, 1e-9);
+    EXPECT_NEAR(resting_edge_bps(kBid, 101.0, 100.0), -100.0, 1e-9);
+    // Measured in bps of the CENTRE, which is what Step 7's floor is in.
+    EXPECT_NEAR(resting_edge_bps(kAsk, 210.0, 200.0), 500.0, 1e-9);
+}
+
+TEST(MarginRefresh, UnusableInputsEarnNothing)
+{
+    for (const double bad : {0.0, -1.0, kInf, kNaN}) {
+        EXPECT_EQ(resting_edge_bps(kAsk, bad, 100.0), 0.0) << bad;
+        EXPECT_EQ(resting_edge_bps(kAsk, 100.0, bad), 0.0) << bad;
+    }
+}
+
+TEST(MarginRefresh, AnOfferAtThePostingFloorIsKept)
+{
+    // THE case the retain fraction exists for.  Step 7's width-floor pass
+    // pushes tiers out to EXACTLY centre x (1 +/- floor), so this is where
+    // offers are born.
+    EXPECT_EQ(margin_of(kAsk, px_at_edge(kAsk, kFloorBps)), MarginRefresh::Fresh);
+    EXPECT_EQ(margin_of(kBid, px_at_edge(kBid, kFloorBps)), MarginRefresh::Fresh);
+}
+
+TEST(MarginRefresh, TheCentreMovingHalfTheFloorAgainstItIsWhatCancels)
+{
+    // Born at the floor (123 bps), retain 0.5: the resting floor is 61.5 bps.
+    const double ask_px = px_at_edge(kAsk, kFloorBps);
+    const double bid_px = px_at_edge(kBid, kFloorBps);
+    // Centre up 50 bps: the ask keeps ~73 bps, the bid GAINS edge.
+    const double up50 = kCentre * 1.0050;
+    EXPECT_EQ(margin_of(kAsk, ask_px, up50), MarginRefresh::Fresh);
+    EXPECT_EQ(margin_of(kBid, bid_px, up50), MarginRefresh::Fresh);
+    // Centre up 80 bps: the ask keeps ~43 bps -- under 61.5.  Stale.
+    const double up80 = kCentre * 1.0080;
+    EXPECT_EQ(margin_of(kAsk, ask_px, up80), MarginRefresh::Stale);
+    EXPECT_EQ(margin_of(kBid, bid_px, up80), MarginRefresh::Fresh);
+    // And symmetrically for a falling centre.
+    const double down80 = kCentre * 0.9920;
+    EXPECT_EQ(margin_of(kBid, bid_px, down80), MarginRefresh::Stale);
+    EXPECT_EQ(margin_of(kAsk, ask_px, down80), MarginRefresh::Fresh);
+}
+
+TEST(MarginRefresh, RetainOneIsTheLiteralRuleAndFlapsAtTheFloor)
+{
+    // At retain 1.0 the cancel threshold IS the posting floor, so a ONE bp
+    // adverse tick refreshes an offer born there.  This is why the default
+    // is not 1.0; pinned so the comment in cross_guard.hpp cannot rot.
+    const double ask_px = px_at_edge(kAsk, kFloorBps);
+    EXPECT_EQ(margin_of(kAsk, ask_px, kCentre * 1.0001, /*retain=*/1.0),
+              MarginRefresh::Stale);
+    EXPECT_EQ(margin_of(kAsk, ask_px, kCentre * 1.0001, /*retain=*/0.5),
+              MarginRefresh::Fresh);
+}
+
+TEST(MarginRefresh, TheBoundaryIsStrict)
+{
+    // Exactly on the resting floor is still acceptable, as exactly on the
+    // posting floor is to Step 7.  Every number here is exact in binary:
+    // centre 128, price 129 or 127 -> edge 1/128 = 78.125 bps, and the
+    // resting floor is 156.25 x 0.5 = 78.125 bps.
+    EXPECT_EQ(resting_edge_bps(kAsk, 129.0, 128.0), 78.125);
+    EXPECT_EQ(resting_edge_bps(kBid, 127.0, 128.0), 78.125);
+    EXPECT_EQ(classify_tier_refresh_margin(false, false, kAsk, 129.0, 128.0,
+                                           0.0, 156.25, 0.5),
+              MarginRefresh::Fresh);
+    EXPECT_EQ(classify_tier_refresh_margin(
+                  false, false, kAsk, std::nextafter(129.0, 0.0), 128.0,
+                  0.0, 156.25, 0.5),
+              MarginRefresh::Stale);
+    EXPECT_EQ(classify_tier_refresh_margin(false, false, kBid, 127.0, 128.0,
+                                           0.0, 156.25, 0.5),
+              MarginRefresh::Fresh);
+    EXPECT_EQ(classify_tier_refresh_margin(
+                  false, false, kBid, std::nextafter(127.0, 200.0), 128.0,
+                  0.0, 156.25, 0.5),
+              MarginRefresh::Stale);
+}
+
+TEST(MarginRefresh, FavourableDriftNeverCancelsHoweverLarge)
+{
+    // The deviation rule refreshes a favourable drift past 3x the tier
+    // threshold, and the anchor override past 1x.  Direction is not even an
+    // input here: moving away from the centre only ADDS edge.
+    for (const double far_bps : {500.0, 2'000.0, 9'000.0}) {
+        EXPECT_EQ(margin_of(kAsk, px_at_edge(kAsk, far_bps)),
+                  MarginRefresh::Fresh) << far_bps;
+        EXPECT_EQ(margin_of(kBid, px_at_edge(kBid, far_bps)),
+                  MarginRefresh::Fresh) << far_bps;
+    }
+}
+
+TEST(MarginRefresh, CrossedOutranksEverything)
+{
+    // Ahead of the minimum-age guard, ahead of a healthy edge, and ahead of
+    // a missing reference -- a cross needs no centre to be a cross.
+    EXPECT_EQ(classify_tier_refresh_margin(/*crossed=*/true,
+                                           /*below_min_age=*/true, kAsk,
+                                           px_at_edge(kAsk, 900.0), kCentre,
+                                           kCentre, kFloorBps, kRetain),
+              MarginRefresh::Stale);
+    EXPECT_EQ(classify_tier_refresh_margin(true, false, kAsk, 87.0, 0.0, 0.0, 0.0,
+                                           kRetain),
+              MarginRefresh::Stale);
+}
+
+TEST(MarginRefresh, TheMinimumAgeGuardOutranksTheEdgeTest)
+{
+    // An offer with NEGATIVE edge, too young to refresh: kept, exactly as
+    // the deviation rule keeps a young offer however far it has drifted.
+    const double underwater = px_at_edge(kAsk, -50.0);
+    EXPECT_EQ(classify_tier_refresh_margin(false, /*below_min_age=*/true, kAsk,
+                                           underwater, kCentre, kCentre,
+                                           kFloorBps, kRetain),
+              MarginRefresh::Fresh);
+    EXPECT_EQ(classify_tier_refresh_margin(false, /*below_min_age=*/false, kAsk,
+                                           underwater, kCentre, kCentre,
+                                           kFloorBps, kRetain),
+              MarginRefresh::Stale);
+}
+
+TEST(MarginRefresh, NoReferenceFallsBackRatherThanKeeping)
+{
+    // Step 7 leaves centre and floor at 0 until it reaches ladder generation,
+    // and the pace pass sends none.  "No reference" must NOT read as Fresh:
+    // the caller answers it with the deviation zones, i.e. today's rule.
+    // The ladder centre and the floor travel together from Step 7, so it is
+    // the LADDER centre that must be usable: a fair centre alone (passed as
+    // kCentre throughout) does not rescue a missing one.
+    const double px = px_at_edge(kAsk, 10.0);   // would be Stale with one
+    for (const double bad : {0.0, -1.0, kInf, kNaN}) {
+        EXPECT_EQ(classify_tier_refresh_margin(false, false, kAsk, px, bad,
+                                               kCentre, kFloorBps, kRetain),
+                  MarginRefresh::NoReference) << "centre " << bad;
+        EXPECT_EQ(classify_tier_refresh_margin(false, false, kAsk, px, kCentre,
+                                               kCentre, bad, kRetain),
+                  MarginRefresh::NoReference) << "floor " << bad;
+        EXPECT_EQ(classify_tier_refresh_margin(false, false, kAsk, bad, kCentre,
+                                               kCentre, kFloorBps, kRetain),
+                  MarginRefresh::NoReference) << "price " << bad;
+    }
+    // retain outside (0, 1] is a config the parser refuses; were one to get
+    // here it must not quietly become "never cancel" or "always cancel".
+    for (const double bad : {0.0, -0.5, 1.0001, kInf, kNaN}) {
+        EXPECT_EQ(classify_tier_refresh_margin(false, false, kAsk, px, kCentre,
+                                               kCentre, kFloorBps, bad),
+                  MarginRefresh::NoReference) << "retain " << bad;
+        EXPECT_FALSE(margin_reference_usable(kCentre, kFloorBps, bad)) << bad;
+    }
+    EXPECT_TRUE(margin_reference_usable(kCentre, kFloorBps, 1.0));
+    // And the young-offer guard does not mask a missing reference: the
+    // deviation zones have their own copy of it.
+    EXPECT_EQ(classify_tier_refresh_margin(false, /*below_min_age=*/true, kAsk,
+                                           px, 0.0, kCentre, kFloorBps,
+                                           kRetain),
+              MarginRefresh::NoReference);
+}
+
+TEST(MarginRefresh, KeepsWhatTheDeviationRuleCancelledForLadderDrift)
+{
+    // The recorded shape: an XCH/DBX ask resting well outside the floor while
+    // its TIER's new optimal price moves 1.5% further out.  The deviation
+    // rule calls that adverse drift past the 1% tier-0 threshold and cancels;
+    // the fill it is protecting against would still earn 3x the floor.
+    const double resting = px_at_edge(kAsk, 370.0);
+    const double new_optimal = resting * 1.015;
+    EXPECT_EQ(refresh_of(kAsk, resting, new_optimal, false), TierRefresh::Stale);
+    EXPECT_EQ(margin_of(kAsk, resting), MarginRefresh::Fresh);
+}
+
+// -- [review #164] two centres, and the kinder one decides ---------------------
+//
+// fair = 100.  The engine is LONG the base, so the A-S reservation shift moves
+// the ladder centre DOWN 80 bps to 99.2 (the rail is 100 bps): asks are the
+// side being shed, bids the side being discouraged.  Floor 123 bps, retain
+// 0.5 -> a resting offer must keep 61.5 bps.
+
+namespace {
+constexpr double kFair    = 100.0;
+constexpr double kShifted = 99.2;
+
+[[nodiscard]] MarginRefresh two_centre(bool is_ask, double price,
+                                       double centre, double fair)
+{
+    return classify_tier_refresh_margin(false, false, is_ask, price, centre,
+                                        fair, kFloorBps, kRetain);
+}
+}  // namespace
+
+TEST(MarginRefresh, TheEdgeIsTheKinderOfTheTwoCentres)
+{
+    // An ask at 100.5: 50 bps over fair, ~131 bps over the shifted centre.
+    EXPECT_NEAR(margin_edge_bps(kAsk, 100.5, kShifted, kFair),
+                resting_edge_bps(kAsk, 100.5, kShifted), 1e-12);
+    // A bid at 99.0: 100 bps under fair, only ~20 bps under the shifted one.
+    EXPECT_NEAR(margin_edge_bps(kBid, 99.0, kShifted, kFair), 100.0, 1e-9);
+    // No fair centre captured: the ladder centre decides alone.
+    for (const double none : {0.0, -1.0, kInf, kNaN}) {
+        EXPECT_EQ(margin_edge_bps(kBid, 99.0, kShifted, none),
+                  resting_edge_bps(kBid, 99.0, kShifted)) << none;
+    }
+}
+
+TEST(MarginRefresh, TheShedSideIsNeverCancelledForWhatThePricerJustPosted)
+{
+    // Step 7 posts the innermost ask at shifted x (1 + floor) = 100.42016:
+    // only ~42 bps over FAIR value, by design -- that is what shedding
+    // inventory costs.  A rule that demanded 61.5 bps against fair value
+    // ALONE cancels it after twelve blocks, and Step 7 posts it again: the
+    // S71 loop, one rule over.  (Fair-alone is spelled here by passing fair as
+    // both centres.)
+    const double posted = kShifted * (1.0 + kFloorBps / 10'000.0);
+    EXPECT_LT(resting_edge_bps(kAsk, posted, kFair), kFloorBps * kRetain);
+    EXPECT_EQ(two_centre(kAsk, posted, kFair, kFair), MarginRefresh::Stale)
+        << "what the reviewer's literal suggestion would do";
+    EXPECT_EQ(two_centre(kAsk, posted, kShifted, kFair), MarginRefresh::Fresh);
+}
+
+TEST(MarginRefresh, TheOtherSideIsJudgedAgainstWhatTheAssetIsWorth)
+{
+    // A bid posted before the skew, at fair x (1 - floor) = 98.77.  The
+    // ladder has since moved down around it -- it is only ~43 bps under the
+    // shifted centre -- but a fill there still earns 123 bps against fair
+    // value.  The shifted centre ALONE (the first revision) churned it for an
+    // inventory reason the side gates exist to handle.
+    const double resting = kFair * (1.0 - kFloorBps / 10'000.0);
+    EXPECT_LT(resting_edge_bps(kBid, resting, kShifted), kFloorBps * kRetain);
+    EXPECT_EQ(two_centre(kBid, resting, kShifted, 0.0), MarginRefresh::Stale)
+        << "the first revision: shifted centre alone";
+    EXPECT_EQ(two_centre(kBid, resting, kShifted, kFair), MarginRefresh::Fresh);
+}
+
+TEST(MarginRefresh, AnOfferThroughFairValueThatThePricerWouldNotPostIsCancelled)
+{
+    // The reviewer's case.  An ask at 99.5 is 50 bps THROUGH fair value and
+    // only ~30 bps over the shifted centre: it fails against both.
+    EXPECT_EQ(two_centre(kAsk, 99.5, kShifted, kFair), MarginRefresh::Stale);
+    // A bid at 99.9 likewise: 10 bps under fair, and ABOVE the shifted centre.
+    EXPECT_EQ(two_centre(kBid, 99.9, kShifted, kFair), MarginRefresh::Stale);
+    // With no skew the two centres coincide and the rule is the one-centre
+    // rule exactly.
+    EXPECT_EQ(two_centre(kAsk, 100.5, kFair, kFair), MarginRefresh::Stale);
+    EXPECT_EQ(two_centre(kAsk, 100.7, kFair, kFair), MarginRefresh::Fresh);
+}
+
+TEST(MarginRefresh, TheReasonStringCarriesBothNumbers)
+{
+    EXPECT_EQ(margin_breach_reason(41.72, 61.5), "margin_breach(41.7/61.5bps)");
+    EXPECT_EQ(margin_breach_reason(-12.0, 61.5), "margin_breach(-12.0/61.5bps)");
+    // The prefix is what reports group on; a non-finite input must not
+    // produce "nan" or "inf" in a column people filter.
+    EXPECT_EQ(margin_breach_reason(kNaN, kInf), "margin_breach(0.0/0.0bps)");
 }

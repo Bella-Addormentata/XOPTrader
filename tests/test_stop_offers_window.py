@@ -1,0 +1,365 @@
+"""[S74 2026-09-20] The main window asks before it stops the engine -- or does not.
+
+Drives the real ``MainWindow`` with a bridge double and a patched prompt; no
+engine is spawned and no modal dialog is ever exec()'d. What is pinned:
+
+* Stop Trading and a window close both ask, with the bridge's live inputs;
+* "Don't stop" calls the stop off -- and on a close, keeps the window open;
+* a close nobody at the machine started (OS session end, a signal) shows NO
+  prompt and sends no policy;
+* with no engine of ours running there is nothing to ask.
+
+The decision table itself is tests/test_stop_offers.py; this file is the
+wiring between it and the window.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+_REPO = Path(__file__).resolve().parents[1]
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
+
+import pytest  # noqa: E402
+
+pytest.importorskip("PySide6")
+
+from PySide6.QtCore import QCoreApplication, QEvent  # noqa: E402
+from PySide6.QtGui import QCloseEvent  # noqa: E402
+from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
+
+from gui import stop_offers  # noqa: E402
+from gui.stop_offers import RestingSummary, StopChoice  # noqa: E402
+
+SENTINEL = object()
+
+
+class BridgeDouble:
+    """Only what the stop paths touch."""
+
+    def __init__(self, *, running=True, keep_supported=True, default="cancel"):
+        self.engine_running_locally = running
+        self.engine_supports_keep_offers = keep_supported
+        self.stop_offers_default = default
+        self.summary = RestingSummary(resting=3, per_pair=(("XCH/DBX", 3),))
+        self.stops = []
+        self.starts = 0
+        self.close_policy = SENTINEL
+
+    def resting_offers_summary(self):
+        return self.summary
+
+    def stop_engine(self, offers_policy=SENTINEL):
+        self.stops.append(offers_policy)
+
+    def start_engine(self):
+        self.starts += 1
+
+    def set_close_offers_policy(self, policy):
+        self.close_policy = policy
+
+
+@pytest.fixture(scope="module")
+def app():
+    instance = QApplication.instance() or QApplication(sys.argv)
+    yield instance
+
+
+def _destroy(widget, app) -> None:
+    """Really delete *widget*, now.
+
+    ``deleteLater()`` alone never runs in a test: no event loop is running, and
+    ``processEvents()`` does not deliver DeferredDelete. A leaked top-level
+    widget is not harmless -- every later ``app.setStyleSheet()``
+    (tests/test_ui_sizing.py applies about twenty) re-polishes every widget of
+    every window still alive. Measured: that file takes 0.2 s alone, 190 s
+    after the six windows the smoke tests leave behind, and did not finish in
+    ten minutes after eleven more.
+    """
+    widget.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    app.processEvents()
+
+
+@pytest.fixture(scope="module")
+def shared_window(app):
+    """ONE MainWindow for the whole module, really destroyed at the end."""
+    from gui.widgets.main_window import MainWindow
+
+    w = MainWindow()
+    yield w
+    w._bridge = None          # a teardown close must never prompt
+    w.close()
+    _destroy(w, app)
+
+
+@pytest.fixture
+def window(shared_window, monkeypatch):
+    stop_offers.reset_noninteractive_quit()
+    # Any OTHER modal box would hang an offscreen run instead of failing it.
+    monkeypatch.setattr(QMessageBox, "question", staticmethod(
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("the old yes/no stop confirmation was shown"))))
+    shared_window._bridge = None
+    shared_window._bot_running = False
+    yield shared_window
+    stop_offers.reset_noninteractive_quit()
+    shared_window._bridge = None
+
+
+def _prompt_returns(monkeypatch, choice):
+    """Patch the modal prompt; return the list its calls are recorded in."""
+    calls = []
+
+    def fake(parent, summary, *, default_policy, keep_supported, closing):
+        calls.append(dict(summary=summary, default_policy=default_policy,
+                          keep_supported=keep_supported, closing=closing))
+        return choice
+
+    import gui.widgets.stop_engine_dialog as dlg
+    monkeypatch.setattr(dlg, "ask_stop_offers", fake)
+    return calls
+
+
+def _no_prompt(monkeypatch):
+    """A prompt that must not be shown. It RECORDS the call and answers Cancel
+    rather than raising: decide_stop swallows a raising prompt by design (a
+    broken dialog must not trap a close) and proceeds with no policy -- the very
+    outcome these tests expect -- so a raising double stayed green with the
+    "not interactive" guard deleted (mutation check, 2026-09-20). Assert the
+    returned list is empty."""
+    calls = _prompt_returns(monkeypatch, StopChoice.CANCEL)
+    return calls
+
+
+# --------------------------------------------------------------------------- #
+# Stop Trading
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize(("choice", "policy"), [
+    (StopChoice.KEEP, "keep"), (StopChoice.CANCEL, "cancel")])
+def test_stop_trading_asks_and_sends_the_answer(window, monkeypatch, choice, policy):
+    bridge = BridgeDouble(default="keep", keep_supported=True)
+    window._bridge = bridge
+    window._bot_running = True
+    calls = _prompt_returns(monkeypatch, choice)
+
+    window._on_start_stop()
+
+    assert bridge.stops == [policy]
+    assert window._bot_running is False
+    assert calls == [dict(summary=bridge.summary, default_policy="keep",
+                          keep_supported=True, closing=False)], (
+        "the prompt must get the bridge's live count, default and capability")
+
+
+def test_dont_stop_leaves_the_engine_and_the_button_alone(window, monkeypatch):
+    bridge = BridgeDouble()
+    window._bridge = bridge
+    window._bot_running = True
+    _prompt_returns(monkeypatch, StopChoice.DONT_STOP)
+
+    window._on_start_stop()
+
+    assert bridge.stops == []
+    assert window._bot_running is True
+
+
+def test_stop_trading_prompts_even_while_a_noninteractive_mark_stands(window, monkeypatch):
+    """[review #165] A Windows log-off can be cancelled after it was announced.
+    The mark it left stands for up to 120 s and governs CLOSES; a click on Stop
+    Trading is proof somebody is there, so it must still prompt -- otherwise
+    that stop would quietly use the config default."""
+    bridge = BridgeDouble(default="cancel")
+    window._bridge = bridge
+    window._bot_running = True
+    calls = _prompt_returns(monkeypatch, StopChoice.KEEP)
+    stop_offers.mark_noninteractive_quit("OS session end")
+
+    window._on_start_stop()
+
+    assert len(calls) == 1, "a manual stop was silenced by a stale non-interactive mark"
+    assert bridge.stops == ["keep"]
+
+
+def test_the_prompt_remembers_nothing_between_stops(window, monkeypatch):
+    """Two stops, two prompts, both preselecting the CONFIG default -- not the
+    previous answer."""
+    bridge = BridgeDouble(default="cancel")
+    window._bridge = bridge
+    calls = _prompt_returns(monkeypatch, StopChoice.KEEP)
+    for _ in range(2):
+        window._bot_running = True
+        window._on_start_stop()
+    assert bridge.stops == ["keep", "keep"]
+    assert [c["default_policy"] for c in calls] == ["cancel", "cancel"]
+
+
+# --------------------------------------------------------------------------- #
+# Closing the window
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize(("choice", "policy"), [
+    (StopChoice.KEEP, "keep"), (StopChoice.CANCEL, "cancel")])
+def test_a_close_asks_and_hands_the_answer_to_the_bridge(window, monkeypatch, choice, policy):
+    bridge = BridgeDouble()
+    window._bridge = bridge
+    calls = _prompt_returns(monkeypatch, choice)
+
+    event = QCloseEvent()
+    window.closeEvent(event)
+
+    assert event.isAccepted()
+    assert bridge.close_policy == policy
+    assert [c["closing"] for c in calls] == [True]
+    assert bridge.stops == [], "the stop itself belongs to aboutToQuit, not to closeEvent"
+
+
+def test_dont_stop_keeps_the_window_open(window, monkeypatch):
+    bridge = BridgeDouble()
+    window._bridge = bridge
+    _prompt_returns(monkeypatch, StopChoice.DONT_STOP)
+
+    event = QCloseEvent()
+    window.closeEvent(event)
+
+    assert not event.isAccepted()
+    assert bridge.close_policy is SENTINEL, "a refused close must not leave a policy behind"
+
+
+@pytest.mark.parametrize("reason", ["OS session end", "SIGTERM"])
+def test_a_close_nobody_started_shows_no_prompt_and_sends_no_policy(
+        window, monkeypatch, reason):
+    bridge = BridgeDouble(default="keep")
+    window._bridge = bridge
+    calls = _no_prompt(monkeypatch)
+    stop_offers.mark_noninteractive_quit(reason)
+
+    event = QCloseEvent()
+    window.closeEvent(event)
+
+    assert calls == [], "a stop prompt was shown where nobody could answer it"
+    assert event.isAccepted()
+    assert bridge.close_policy is None, (
+        "no policy: the ENGINE's engine.shutdown_offers decides, not the GUI's copy of it")
+
+
+@pytest.fixture
+def dirty_settings(window):
+    """The window's real Settings page, flagged as having unsaved edits."""
+    page = window._settings_widget
+    assert hasattr(page, "_dirty"), "the Settings page is not the real widget"
+    saved = page._dirty
+    page._dirty = True
+    yield page
+    page._dirty = saved
+
+
+def test_a_close_nobody_started_skips_the_unsaved_settings_modal_too(
+        window, monkeypatch, dirty_settings, caplog):
+    """[review #165] The unsaved-settings box sits ABOVE the stop prompt in
+    closeEvent. With a dirty Settings page a log-off or a signal would block on
+    it for ever. The edits are discarded, never saved: a config nobody
+    confirmed must not reach the engine's next start."""
+    import logging
+
+    caplog.set_level(logging.WARNING)
+    saves = []
+    monkeypatch.setattr(dirty_settings, "save_config", lambda *a, **k: saves.append(1),
+                        raising=False)
+    bridge = BridgeDouble(default="keep")
+    window._bridge = bridge
+    calls = _no_prompt(monkeypatch)
+    stop_offers.mark_noninteractive_quit("OS session end")
+
+    event = QCloseEvent()
+    window.closeEvent(event)   # the fixture's QMessageBox.question raises if shown
+
+    assert event.isAccepted()
+    assert calls == [] and saves == []
+    assert bridge.close_policy is None
+    assert any("discarded, not saved" in r.getMessage() for r in caplog.records)
+
+
+def test_an_interactive_close_still_asks_about_unsaved_settings(
+        window, monkeypatch, dirty_settings):
+    """The other side of that gate: somebody IS there, so the box is shown, and
+    its Cancel keeps the window open before the stop prompt is ever reached."""
+    asked = []
+
+    def question(*_a, **_k):
+        asked.append(1)
+        return QMessageBox.StandardButton.Cancel
+
+    monkeypatch.setattr(QMessageBox, "question", staticmethod(question))
+    bridge = BridgeDouble()
+    window._bridge = bridge
+    calls = _no_prompt(monkeypatch)
+
+    event = QCloseEvent()
+    window.closeEvent(event)
+
+    assert asked == [1]
+    assert not event.isAccepted()
+    assert calls == [], "the stop prompt was shown after the close was cancelled"
+
+
+def test_a_close_with_no_engine_of_ours_asks_nothing(window, monkeypatch):
+    bridge = BridgeDouble(running=False)
+    window._bridge = bridge
+    calls = _no_prompt(monkeypatch)
+
+    event = QCloseEvent()
+    window.closeEvent(event)
+
+    assert calls == [], "a prompt was shown with no engine of ours to stop"
+    assert event.isAccepted()
+    assert bridge.close_policy is None
+
+
+def test_a_close_with_no_bridge_at_all_still_closes(window, monkeypatch):
+    window._bridge = None
+    calls = _no_prompt(monkeypatch)
+    event = QCloseEvent()
+    window.closeEvent(event)
+    assert calls == []
+    assert event.isAccepted()
+
+
+def test_the_session_end_signal_is_real_on_this_qt_and_our_slot_marks_the_quit(app):
+    """[review #165, round 3] The OS-session-end row was pinned by a SOURCE SCAN
+    only (tests/test_stop_offers.py reads gui/main.py as text).
+
+    Nothing here can make Qt emit ``commitDataRequest``: that needs a real
+    log-off, and its argument is a ``QSessionManager`` a test cannot construct.
+    So this pins the two halves that CAN be checked at run time --
+
+    * the signal this PySide6/Qt build offers is the one ``gui/main.py``
+      connects to, and it accepts our slot. A rename or a signature change
+      would fail HERE rather than at the operator's log-off, where the symptom
+      is a modal prompt holding up a shutdown nobody can answer;
+    * the slot itself marks the quit non-interactive when it is called.
+
+    That Qt actually calls it at a session end is Qt's contract, not this
+    repo's, and remains unverified by any test -- the PR body says so.
+    """
+    from gui import main as gui_main
+
+    assert hasattr(app, "commitDataRequest"), (
+        "this Qt build has no QGuiApplication.commitDataRequest: gui/main.py "
+        "would raise at startup, or silently never be told the session is ending")
+    app.commitDataRequest.connect(gui_main._on_session_ending)
+    try:
+        stop_offers.reset_noninteractive_quit()
+        gui_main._on_session_ending(None)
+        assert stop_offers.noninteractive_quit_reason() == "OS session end", (
+            "the session-end slot no longer marks the quit non-interactive: a "
+            "log-off would reach the stop prompt with nobody to answer it")
+    finally:
+        app.commitDataRequest.disconnect(gui_main._on_session_ending)
+        stop_offers.reset_noninteractive_quit()

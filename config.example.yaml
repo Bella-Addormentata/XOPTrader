@@ -366,10 +366,139 @@ strategy:
   # our own TTL would let the chain retire offers the engine still tracks as
   # live, with no cancel ever recorded.
   # offer_expiry_secs: 172800  # [OPTIONAL, default: 0 = disabled] 48h
+  #
+  # --- Minimum input coin for the offers we create ---------------------------
+  # Dexie pays liquidity rewards as one tiny coin per rewarded offer, so a CAT
+  # wallet that earns them fills with dust.  The wallet's coin selection
+  # prefers that dust, and Dexie refuses an offer built from too many coins
+  # (HTTP 400 "Too many input coins"; measured limit between 125 and about
+  # 132 inputs).  The refused offer still exists in the wallet and locks its
+  # coins, but is listed nowhere.
+  #
+  # With this key the engine sends create_offer_for_ids a `min_coin_amount` of
+  # ceil(amount the offer spends x this fraction) on the FIRST create for each
+  # offer, so the wallet leaves smaller coins alone and an offer built by that
+  # attempt needs at most ceil(1 / fraction) CAT inputs: 100 at the default.
+  # 0 disables the floor.  The bound is on
+  # that first attempt only -- the no-floor retry described below sends no
+  # floor at all, and the offer it builds can be dust-funded again.
+  #
+  # IT BOUNDS THE CAT LEG, NOT THE WHOLE OFFER.  The XCH fee coin is chosen
+  # in a separate selection that this CAT-scaled value does not constrain, so
+  # the offer carries those CAT inputs PLUS however many XCH coins the fee
+  # takes.  That is one coin only while every XCH coin covers the fee -- a
+  # measurement, not a guarantee.  The create pays the dynamic fee, which is
+  # clamped to [fees.min_fee_mojos, fees.max_fee_mojos], so the comparison
+  # that bounds the leg is against the CAP: the smallest XCH coin on
+  # 2026-09-21, 13,314,209,440 mojos, is 133x a max_fee_mojos of 100,000,000.
+  # (An earlier revision said 887x, which is against min_fee_mojos -- the
+  # cheapest create, not every create.)
+  #
+  # THE INPUT COUNT IS NOT MONOTONE IN THIS FRACTION.  Raising it tightens
+  # ceil(1 / fraction) only while the coins at or above the floor can still
+  # cover the amount; past that the wallet refuses, the no-floor retry builds
+  # the offer from dust again, and the bound is gone.  So raising it AFTER a
+  # "Too many input coins" refusal makes that outcome more common, not less --
+  # at 0.01 that refusal is itself evidence the offer was built without a
+  # floor, since the CAT leg cannot exceed 100 inputs and the fee leg is one
+  # coin here.  Lowering it loosens the bound, and below 1/124 the CAT-leg
+  # bound plus the fee coin exceeds the 125 inputs Dexie was measured to
+  # accept.  The remedy for a refusal is to combine the coins; the only
+  # fraction change that can help is a small REDUCTION, and only when it is
+  # the FLOORED create the wallet is refusing.
+  #
+  # THAT EVIDENCE HOLDS ONLY ABOVE 1/124, AND THE RANGE GOES LOWER.  [0, 1)
+  # is closed at the bottom, so 0.002 loads and bounds the CAT leg at 500 --
+  # over Dexie's limit by itself.  Set below 1/124 the floor no longer
+  # guarantees what it is for: an offer the wallet builds WITHIN the floor can
+  # be refused for input count, and raising the fraction back is then the
+  # change that helps.  Startup warns when this key is in that band, and the
+  # [dexie-too-many-inputs] warning computes ceil(1 / fraction) and gives the
+  # advice that matches it.  (1/124 is about 0.00807; 0.008 is on the wrong
+  # side of it -- ceil(1 / 0.008) is exactly 125, one over once the fee coin
+  # is counted.)
+  #
+  # Applies to CAT-funded offers only (a bid on XCH/<CAT>, an ask on
+  # <CAT>/...).  XCH-funded offers are untouched: their coins are managed by
+  # the coin pool.  The wallet applies the one value to the XCH fee coin of
+  # the same request as well.  It is CAT-scaled, so it is small (1% of an
+  # 80 DBX offer is 804 mojos, under a billionth of an XCH).  Small is not
+  # the same as inert: it changes which XCH coin pays the fee whenever the
+  # XCH wallet holds a coin BELOW the floor, because chia filters the
+  # candidate set before it picks a selection branch.  It does NOT depend on
+  # the floor exceeding the fee -- a floor under the fee can still flip the
+  # branch, and a floor no coin falls under changes nothing however large it
+  # is.  fees.min_fee_mojos is therefore not the lever here; the sizes of the
+  # coins in the XCH wallet are.  The XCH lock ledger models the same floor,
+  # so the reserve and the cycle cap still see what is really locked.
+  # The fraction is applied in parts per billion, rounded up.
+  #
+  # If the coins at or above the floor cannot cover the amount, the wallet
+  # refuses, and the engine retries ONCE without the floor and logs a
+  # "[min-input-coin]" warning naming the pair, side and tier.  That retry's
+  # request is the pre-floor one byte for byte, so the offer it builds has the
+  # pre-floor exposure to dust -- this is the one case the bound above does
+  # not cover.  A Dexie refusal logs "[dexie-too-many-inputs]".  Either one
+  # means the dust should be combined (chia wallet coins combine).  Read at
+  # startup.
+  # offer_min_input_coin_frac: 0.01  # [OPTIONAL, default: 0.01] range [0, 1); 0 = disabled
   num_tiers: 4               # [REQUIRED] Multi-tier offer ladder depth (4 recommended: fewer, larger tiers)
   tier_spacing_bps: [35, 100, 200, 300]  # [REQUIRED] Spread per tier (bps)
   tier_size_pct: [0.15, 0.20, 0.30, 0.35] # [REQUIRED] Capital fraction per tier (sum ≈ 1.0)
   max_half_spread_bps: 250  # [OPTIONAL, default: 250] Global cap on half-spread
+  # [S70-S72] Three switches that cut CANCELS (each is a fee-bearing spend).
+  # Every one defaults to the rule in force before it existed; all need a
+  # restart.  Enable one at a time and watch the log line named beside it.
+  #
+  # ttl_cancel_mode: expire -- an offer that verifiably carries the expiry
+  #   above is no longer cancelled at the hard TTL; the chain ages it out and
+  #   the bot then frees its coins with a FREE local cancel, once a chain
+  #   clock read 32 blocks back is past max_time (never this host's clock, and
+  #   never the tip's: that proves no reorg depth).  Requires
+  #   offer_expiry_secs (or a pair override) > 0 -- rejected at startup
+  #   otherwise.  Log: "[offer-expiry] retired".  Offers with no verified
+  #   expiry, and everything a stopped engine ages out, keep today's cancel.
+  #   PRECONDITION -- the wallet must reach the chain ONLY through a full node
+  #   on this host.  The wallet RPC that supplies the clock answers from
+  #   whichever connected full node replies first, with no consensus check, so
+  #   the retire refuses to run while the wallet has ANY full-node peer this
+  #   host does not run -- which is what happens when the local node is down.
+  #   Then offers keep their coins locked until it returns; that is the safe
+  #   direction, and the log line naming it is "no trusted chain clock".
+  # ttl_cancel_mode: cancel                # [OPTIONAL, default: cancel] cancel | expire
+  #
+  # exposure_rule: unified -- one reserve-exposure verdict for the pre-post
+  #   projection AND the resting-offer check, from inputs that do not move
+  #   when an offer locks a coin.  Log: "exposure (unified)".
+  #   FAILS CLOSED, and not as a reserve breach: while a LIVE resting offer's
+  #   pair cannot be resolved against this config (an adopted UNKNOWN wallet
+  #   record, or a pair since REMOVED from the file -- a merely DISABLED pair
+  #   is still mapped), the resting sum is a lower bound while the wallet
+  #   balance still counts the coins that offer locks, so new posts are
+  #   suppressed on both sides until it drains.  No resting offer is ever
+  #   cancelled on its account.  Watch for the line that says so in its own
+  #   words: "exposure (unified) ... cannot be projected -- a LIVE resting
+  #   offer's pair is not in this config".
+  # exposure_rule: legacy                  # [OPTIONAL, default: legacy] legacy | unified
+  # exposure_cancel_hysteresis_pct: 0.25   # [OPTIONAL, default: 0.25] [0, 1] unified only: resting offers are cancelled only below reserve x (1 - this); 1 = never cancel, suppress only
+  # exposure_cancel_min_age_blocks: 32     # [OPTIONAL, default: 32] [0, 4608] unified only: younger offers are never exposure-cancelled (32 blocks = 10 min)
+  #
+  # price_cancel_mode: margin -- cancel for PRICE only when a fill at the
+  #   resting price would earn less than price_cancel_edge_retain x the edge
+  #   Step 7 demands of a new offer (max(min_profit_margin, sigma width,
+  #   tibetswap fee)) -- judged against BOTH of Step 7's centres, the shifted
+  #   ladder centre and fair value, with the KINDER of the two edges deciding,
+  #   so it never cancels what the pricer would itself post.  Crossed offers
+  #   are still cancelled first; favourable drift never cancels.  Reason in
+  #   offer_log: "margin_breach(<edge>/<floor>bps)".
+  #   COST, MEASURED: replayed over the 14 days to 2026-09-20 this rule fires,
+  #   at some block, on up to 7 of the 15 offers that actually FILLED (0-7 once
+  #   the unrecorded fair centre is bounded by the 100 bps A-S rail; 3-7 at
+  #   retain 1.0).  It can cancel offers that would have been taken, and
+  #   nothing in this mode pulls a favourably-drifted quote back toward the
+  #   touch.  See cpp/tests/test_price_cancel_replay.cpp.
+  # price_cancel_mode: deviation           # [OPTIONAL, default: deviation] deviation | margin
+  # price_cancel_edge_retain: 0.5          # [OPTIONAL, default: 0.5] (0, 1] margin only: 1.0 cancels the instant the edge dips under the POSTING floor, where Step 7 routinely rests tiers
   offer_fee_mojos: 10000000  # [OPTIONAL, default: 10000000] On-chain fee per offer/cancel
   # --- Triangulated fair-value guard ----------------------------------------
   # The ladder is centred on a dexie book mid.  These knobs validate that mid
@@ -703,6 +832,102 @@ monitoring:
   # Prometheus
   prometheus_port: 9090             # [REQUIRED]
 
+# --- engine: OPTIONAL (omit the section and nothing changes) ------------------
+# [S74] What a STOP does with the offers resting on the book.
+#
+#   cancel  (default) The engine cancels the whole book on the way down: a
+#           wallet-wide cancel, a retry ladder, and a note in
+#           data/uncancelled.txt so the next start finishes what did not
+#           confirm. This is the only behaviour older versions had.
+#   keep    The engine cancels NOTHING. The offers stay on the book and the
+#           next start re-adopts them. No cancel spends to confirm, no
+#           uncancelled.txt intent and no cancel_pending rows to clean up --
+#           which matters when blocks are full. (The kept offers keep their own
+#           coins locked, of course; what there is nothing to clean up AFTER is
+#           the cancelling stop's residue.)
+#
+#           HOW LONG THE STOP ITSELF TAKES. A stop you ask for in the GUI is
+#           NOT instant. The engine reads data/shutdown.flag once per 5 s poll
+#           and only BETWEEN heartbeat cycles -- the same poll iteration then
+#           runs the whole cycle inline -- so a request that arrives just after
+#           a cycle starts is not even SEEN until that cycle ends. Being read
+#           between cycles is what keeps a GUI stop from ever finding an offer
+#           being created; it is not what makes it fast. Measured over 976 live
+#           cycles on the reference machine (2026-09-21, two enabled pairs at
+#           num_tiers: 6): median 10.4 s, 90th percentile 14.2 s, 1.5% longer
+#           than 30 s, longest 108.7 s. risk.watchdog_stall_seconds (600)
+#           is what the engine itself treats as too long.
+#
+#           AND THE GUI ITSELF HARD-KILLS A STOP THAT OVERRUNS 30 SECONDS
+#           (_GRACEFUL_STOP_WAIT_S in gui/services/engine_bridge.py, then
+#           TerminateProcess). About one cycle in 65 is longer than that on its
+#           own, so this does happen. A killed stop never reaches the keep
+#           report, so the offer_log flush it performs does not run: any offer
+#           that had entered State but had no offer_log row yet arrives at the
+#           next start as an ORPHAN, which the reconcile re-prices or CANCELS.
+#           The offers themselves stay resting either way -- a hard kill runs
+#           no cancel. If engine.log shows a stop being terminated, treat the
+#           next start's orphan lines as the thing to check.
+#
+#           A stop delivered by a SIGNAL (Ctrl+C, SIGTERM, a service stop, an
+#           OS session end) can land while the engine is in the middle of
+#           creating an offer, and it then WAITS for that one create to land so
+#           the offer is recorded instead of orphaned -- up to 247 seconds with
+#           the shipped RPC timeouts, which is one create plus one publish at
+#           their own worst case. It waits on a timer, never on the wallet, and
+#           starts no new offers while it waits; it says so when it begins
+#           ("KEEP stop: an offer create is in flight"). DO NOT HARD-KILL A
+#           STOP THAT SEEMS SLOW (Task Manager, taskkill /F, End Task, running
+#           the installer over a live bot): that is exactly the wait that keeps
+#           a just-created offer from becoming an orphan the NEXT start may
+#           cancel. A second Ctrl+C is the escape hatch if you truly need one.
+#
+# The GUI ASKS on Stop Trading and when its window is closed, and only
+# preselects this value. THIS key decides every stop where nobody is asked:
+# Windows log-off / shutdown / restart, a signal (SIGINT, SIGTERM), Ctrl+C in a
+# console, a service stop, an older GUI, a hand-written data/shutdown.flag with
+# no "offers=" line. (A hard kill -- Task Manager, taskkill /F, the installer --
+# runs no stop at all, so the offers stay, whatever this says.)
+#
+# READ THIS BEFORE CHOOSING keep. A kept offer is TAKEABLE with no engine behind
+# it: no repricing, no TTL, and no dead man's switch (risk.watchdog_stall_seconds
+# only watches a RUNNING engine, and a keep stop disarms it). If the market moves
+# while the engine is down, stale offers get filled at the old price. The ONLY
+# thing that bounds how long a kept offer can live is the on-chain expiry:
+#
+#   * use keep only together with strategy.offer_expiry_secs > 0 (and no pair
+#     with offer_expiry_secs_override: 0). The engine logs a WARNING at startup
+#     when keep is set and an enabled pair posts offers with no expiry;
+#   * the expiry is stamped when an offer is POSTED, so offers posted before the
+#     expiry was turned on carry none until they rotate out by TTL;
+#   * an offer whose expiry passes while the engine is down can no longer be
+#     taken, but the wallet still holds its coins until it is cancelled.
+#
+# HOW LONG A KEPT OFFER CAN LIVE, exactly:
+#   * while nothing is running, only the on-chain expiry bounds it -- at
+#     offer_expiry_secs: 86400 that is up to 24 h from when each offer was
+#     POSTED, whatever the stop's length;
+#   * when the engine comes back with strategy.ttl_cancel_mode: cancel (the
+#     default, and the only behaviour of any build before PR #164 added the
+#     key -- there is no value spelled "age"), its first cycle cancels anything
+#     past the hard TTL -- offer_ttl_blocks x 2, i.e. 800 blocks or about
+#     4 h 10 min at the peak-height cadence of 18.75 s per block -- expired
+#     offers included;
+#   * with ttl_cancel_mode: expire, an offer that carries a verified expiry is
+#     NOT cancelled at the hard TTL: it rests until its own max_time passes and
+#     is then retired with a free local cancel about ten minutes later. The
+#     bound there is the expiry itself, not the hard TTL -- and the startup
+#     floor keeps the expiry well above it (see offer_expiry_secs).
+#
+# Strict: only this key, only these two values -- anything else is a startup
+# error, because every lenient reading of a typo would be a silent "cancel".
+# "Anything else" includes a BLANK value: `shutdown_offers:` with nothing after
+# it is a half-finished edit, not a policy, and it is rejected. Omitting the
+# section, or leaving it empty, is still "not set" and still means cancel.
+# Read at startup; a change applies from the next engine start.
+engine:
+  shutdown_offers: cancel           # [OPTIONAL, default: cancel] cancel | keep
+
 # --- depeg: OPTIONAL (omit section to disable depeg monitoring) --------------
 # Stablecoin depeg detection — global settings.
 # Per-pair thresholds are set in each pair's is_stablecoin / depeg_* fields.
@@ -843,6 +1068,134 @@ fees:
   adaptive_enabled: true             # Query full node get_fee_estimate for mempool-aware fees
   fee_window_blocks: 1662            # Rolling window for budget (~24h at 52s/block)
   fee_estimate_target_seconds: 300   # Target inclusion time for fee estimate (300=5min, low urgency)
+
+  # -- [S67] Cost-aware estimate and the closed-loop fee controller ----------
+  # Both ship OFF; with both off every fee is what it was before they existed.
+  # Why: with Chia blocks ~97% full the node admits a spend only at >= 5 mojos
+  # per unit of CLVM cost and refuses the rest (INVALID_FEE_TOO_CLOSE_TO_ZERO).
+  # The old fee was the node's estimate for a PLAIN XCH SEND (9.4M cost) paid
+  # for CAT cancels (42M) and takes (93M-212M), and nothing checked whether our
+  # own spends confirmed.  Design and evidence: cpp/include/xop/strategy/
+  # fee_controller.hpp.  EVERY block count below is a PEAK height: 4,608 per
+  # day, 18.75 s each -- not the ~52 s transaction-block figure used above.
+  #
+  # NOTE fee_window_blocks above is compared against peak heights too, so 1662
+  # is ~8.7 hours, not 24: daily_budget_mojos is really a per-8.7-hour budget.
+  #
+  # cost_aware_estimate: false       # Ask the node for a fee RATE (explicit cost) and
+  #                                  # scale it by the action's own CLVM cost.  Changes
+  #                                  # fees paid even with the controller off (about
+  #                                  # 4.5x for a CAT cancel).  Implied by the controller.
+  # controller_enabled: false        # Master switch.  Needs enabled: true and min_fee_mojos > 0.
+  #                                  # Raises the fee rate fast when our spends are not
+  #                                  # confirming; lowers it by scheduled probes.
+  # controller_target_delay_blocks: 8   # A spend of ours should confirm within this many
+  #                                  # peak heights (8 = 150 s).  [1, 4608]
+  # controller_kp: 1.0               # Gains, log2 fee units per target-delay of lateness.
+  # controller_ki: 0.5               # Each in [0, 16].  ki: 0 means a sustained error
+  # controller_kd: 0.5               # raises once and then no more (warned at startup).
+  # controller_max_error: 2.0        # Cap on one observation's lateness; what a hard signal
+  #                                  # (force-delete, sent_to fee error) reports.  (0, 16]
+  # controller_max_step_up: 1.0      # Cap on one observation's raise, log2 (1.0 = x2).  (0, 8]
+  # controller_min_raise: 1.0        # A stuck spend keeps raising the fee until it is this
+  #                                  # far (log2) above what that spend paid.  (0, 8]
+  # controller_warmup_observations: 3   # Observations consumed before the fee may move.  [0, 1000]
+  # controller_probe_fraction: 0.15  # Probe-down step: lower the fee by this fraction ...
+  # controller_probe_after_confirmations: 8   # ... after this many on-target confirmations ...
+  # controller_probe_confirmations: 3         # ... good after this many more at the lower fee.
+  # controller_probe_fail_bump: 0.10 # A failed probe returns to last-good times (1 + this).  [0, 1]
+  # controller_probe_backoff_cap: 256   # Re-testing a fee that already failed waits 2x longer
+  #                                  # each time, up to this many confirmations.
+  # controller_ff_margin: 1.10       # Multiplier on the node's estimate and its admission
+  #                                  # floor, which act as a FLOOR under the learned fee.  [1, 4]
+  # controller_ff_max_age_blocks: 32 # A node reading older than this is dropped (node
+  #                                  # unreachable): the learned fee then stands alone.
+  # controller_budget_reserve_cancels: 25   # Budget held back from offer-attached fees: this
+  #                                  # many CAT cancels at today's price, CAPPED at half of
+  #                                  # daily_budget_mojos so it can never exceed the budget
+  #                                  # itself.  [0, 1000]
+  #                                  # WHAT IT DOES: attached fees start being squeezed while
+  #                                  # this much of the window is still unspent, instead of
+  #                                  # when the window empties.  WHAT IT DOES NOT DO: bound
+  #                                  # what attached fees spend.  min_fee_mojos overrides it
+  #                                  # unconditionally, nothing refuses to post on budget
+  #                                  # grounds with the controller on, and a fee is booked for
+  #                                  # every offer POSTED -- so a ladder can still drive the
+  #                                  # window past the budget at min_fee_mojos per tier.  Only
+  #                                  # daily_budget_mojos prevents that.  Cancels are funded
+  #                                  # because they are never shaped by the budget at all.
+  #                                  # With the controller ON an exhausted budget degrades the
+  #                                  # OFFER-ATTACHED fee to min_fee_mojos (one FeeBudgetBound
+  #                                  # alert); it never returns 0 = "skip Step 8", which also
+  #                                  # stopped cancels.  A PER-OFFER CANCEL or a TAKE is never
+  #                                  # degraded (the bulk sweep is the exception, see below):
+  #                                  # min_fee_mojos on a 42.3M-cost CAT cancel is 0.35
+  #                                  # mojos/cost against the ~5 a full mempool admits, so a
+  #                                  # degraded cancel would never confirm, would keep its
+  #                                  # coins locked and would end in a wallet-wide
+  #                                  # force-delete.  It is paid in full and reported with one
+  #                                  # FeeBudgetUnfunded alert instead.
+  #                                  # ONE EXCEPTION, found 2026-09-21 and NOT yet fixed: the
+  #                                  # BULK stop/shutdown sweep (wallet cancel_offers) still
+  #                                  # pays the single dynamic fee, which with the controller
+  #                                  # on IS the offer-attached fee -- so a Cancel All can go
+  #                                  # out at min_fee_mojos.  Per-offer cancels are unaffected.
+  # CLVM cost per action class, measured on the live wallet 2026-09-20 (321 spend
+  # bundles costed with chia_rs).  fee = rate x cost, clamped to [min_fee, max_fee].
+  # controller_cost_cancel_xch: 8400000      # cancel of an offer that offered XCH (8.33-8.38M)
+  # controller_cost_cancel_cat: 42300000     # cancel of an offer that offered a CAT (42.05-42.26M)
+  # controller_cost_take: 125000000          # take_offer (92.6M with one maker coin, +30.5M each)
+  # controller_cost_offer_attached: 21000000 # maker's share of a fill; paid only if filled
+  #
+  # OPERATOR GUIDANCE at full-mempool fee levels (5 mojos/cost x 1.10 margin):
+  #   CAT cancel 232650000, XCH cancel 46200000, take 687500000, offer-attached
+  #   115500000 mojos.  So:
+  #   * max_fee_mojos 100000000 CANNOT get an OFFER-ATTACHED fee, a CAT cancel
+  #     or a take into a full mempool -- THREE of the four classes, since all
+  #     three figures above (115500000, 232650000, 687500000) are over it.
+  #     Only the XCH cancel's 46200000 clears.  The startup log names each one.
+  #     Use >= 250000000 to cover the attached fee and cancels, >= 700000000 to
+  #     cover takes as well.  (The test is max_fee_mojos < 5 x
+  #     controller_ff_margin x cost, i.e. 5.5 mojos/cost at the default margin,
+  #     not a bare 5 -- the same margin the feed-forward floor carries.)
+  #     CAREFUL WITH THE 700000000 (corrected 2026-09-21).  It covers the
+  #     MODELLED take, 5.5 x controller_cost_take 125000000 = 687500000, and
+  #     nothing more.  The measured take cost RANGE is 92618934-212112758
+  #     (above), and 125000000 was chosen to cover 7 of those 11 bundles, so a
+  #     large multi-coin take is under-modelled and the loop will not even ASK
+  #     for enough -- raising the cap alone cannot fix that, because the fee is
+  #     rate x controller_cost_take.  To price the largest measured take you
+  #     need BOTH: controller_cost_take: 212112758 AND max_fee_mojos >=
+  #     1166620169 (= 5.5 x 212112758) to let the answer through.  Keeping the
+  #     shipped 125000000 model is a defensible choice -- it stops the 7 common
+  #     takes overpaying for the 4 rare ones -- but then the 4 rare ones are
+  #     under-priced in a full mempool, and the controller answers that by
+  #     raising the RATE, which raises every other class with it.
+  #   * daily_budget_mojos is spent over fee_window_blocks, NOT over a day, and
+  #     FeeTracker::record_fee books an attached fee for every offer POSTED.  At
+  #     the measured rate of this wallet (2026-09-20: 152 offers, 134 cancels
+  #     split 58 XCH / 76 CAT, up to 6 takes per DAY = 4608 peak heights) a full
+  #     mempool costs, per day,
+  #         152 x 115500000 = 17556000000   offer-attached
+  #          58 x  46200000 =  2679600000   XCH cancels
+  #          76 x 232650000 = 17681400000   CAT cancels
+  #           6 x 687500000 =  4125000000   takes
+  #                          -------------
+  #                           42042000000   per day
+  #     and at fee_window_blocks 1662 (~8.7 h) one WINDOW is
+  #         42042000000 x 1662 / 4608 = 15163585937 mojos.
+  #     The budget must not bind in ordinary operation, so carry twice that:
+  #         >= 30327171874.  Use 35000000000; 70000000000 is comfortable.
+  #     xop::strategy::fee::recommended_window_budget computes this from YOUR
+  #     costs, ff_margin and fee_window_blocks and the engine logs it (and warns
+  #     when daily_budget_mojos is below it) at startup, so the number here can
+  #     never be the stale one.
+  #     NB the range 5000000000-15000000000 recommended before 2026-09-20 was
+  #     wrong twice over: 5000000000 is LESS than the cancel reserve itself
+  #     (25 x 232650000 = 5816250000), and 15000000000 is about one window's
+  #     spend, so the budget bound continuously at either end.
+  #   * strategy.cancel_escalation_max_fee_mojos caps the #157 re-cancel
+  #     separately; raise it alongside max_fee_mojos.
 
 # Inventory aging (T4-09): gradually relax the no-loss floor for positions
 # held underwater for an extended period.  Capital locked in permanently-

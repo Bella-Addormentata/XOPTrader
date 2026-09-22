@@ -66,12 +66,20 @@ using xop::util::ShutdownFlagFacts;
 using xop::util::ShutdownFlagReason;
 using xop::util::ShutdownFlagSite;
 using xop::util::ShutdownFlagVerdict;
+using xop::util::StopOffersRequest;
 
 namespace {
 
 // GOLDEN: byte-identical to GOLDEN in tests/test_shutdown_flag.py.
 constexpr std::string_view kGolden =
     "xop-shutdown-request v1\npid=15916\nrequested_by_pid=19084\nwritten_at=2026-09-12T22:41:07\n";
+
+// [S74] GOLDEN_KEEP / GOLDEN_CANCEL in tests/test_shutdown_flag.py, same rule:
+// the request the GUI writes after the operator answered its stop prompt.
+constexpr std::string_view kGoldenKeep =
+    "xop-shutdown-request v1\npid=15916\nrequested_by_pid=19084\nwritten_at=2026-09-12T22:41:07\noffers=keep\n";
+constexpr std::string_view kGoldenCancel =
+    "xop-shutdown-request v1\npid=15916\nrequested_by_pid=19084\nwritten_at=2026-09-12T22:41:07\noffers=cancel\n";
 
 constexpr std::uint64_t kKilledEnginePid = 15916;  // the request was written for it
 constexpr std::uint64_t kSuccessorPid    = 11616;  // the engine that inherited it
@@ -94,17 +102,17 @@ ProcessIdentity identity(std::uint64_t pid)
 
 ParsedShutdownFlag unaddressed()
 {
-    return ParsedShutdownFlag{ShutdownFlagAddress::Unaddressed, 0};
+    return ParsedShutdownFlag{ShutdownFlagAddress::Unaddressed, 0, StopOffersRequest::Unspecified};
 }
 
 ParsedShutdownFlag addressed(std::uint64_t pid)
 {
-    return ParsedShutdownFlag{ShutdownFlagAddress::Addressed, pid};
+    return ParsedShutdownFlag{ShutdownFlagAddress::Addressed, pid, StopOffersRequest::Unspecified};
 }
 
 ParsedShutdownFlag malformed()
 {
-    return ParsedShutdownFlag{ShutdownFlagAddress::Malformed, 0};
+    return ParsedShutdownFlag{ShutdownFlagAddress::Malformed, 0, StopOffersRequest::Unspecified};
 }
 
 // Every field set explicitly, every time.
@@ -249,6 +257,117 @@ TEST(ShutdownFlagParse, TwoPidLinesAreMalformed)
         const ParsedShutdownFlag parsed = parse_shutdown_flag(content);
         EXPECT_EQ(parsed.address, ShutdownFlagAddress::Malformed);
         EXPECT_EQ(parsed.pid, std::uint64_t{0});
+    }
+}
+
+// ===========================================================================
+// ShutdownFlagOffersPolicy -- [S74 2026-09-20] the optional "offers=" line
+// ===========================================================================
+
+// Every request written before the line existed -- kGolden is one -- says
+// nothing about the book, and must go on meaning "use the config default".
+TEST(ShutdownFlagOffersPolicy, ARequestWithoutTheLineIsUnspecified)
+{
+    const std::array<std::string_view, 4> contents{{kGolden, "shutdown", "", "pid=42\n"}};
+    for (const std::string_view content : contents) {
+        SCOPED_TRACE(std::string(content));
+        EXPECT_EQ(parse_shutdown_flag(content).offers, StopOffersRequest::Unspecified);
+    }
+}
+
+TEST(ShutdownFlagOffersPolicy, TheGuiRequestsWithAPolicyParseToItAndToTheSameTarget)
+{
+    const ParsedShutdownFlag keep = parse_shutdown_flag(kGoldenKeep);
+    EXPECT_EQ(keep.address, ShutdownFlagAddress::Addressed);
+    EXPECT_EQ(keep.pid, kKilledEnginePid);
+    EXPECT_EQ(keep.offers, StopOffersRequest::Keep);
+
+    const ParsedShutdownFlag cancel = parse_shutdown_flag(kGoldenCancel);
+    EXPECT_EQ(cancel.address, ShutdownFlagAddress::Addressed);
+    EXPECT_EQ(cancel.pid, kKilledEnginePid);
+    EXPECT_EQ(cancel.offers, StopOffersRequest::Cancel);
+}
+
+TEST(ShutdownFlagOffersPolicy, LineOrderPaddingCaseAndLineEndingsDoNotMatter)
+{
+    const std::array<std::string_view, 6> contents{{
+        "offers=keep\npid=42\n", "pid=42\noffers=keep", "pid=42\r\noffers=keep\r\n",
+        "pid=42\noffers= Keep \n", "\xEF\xBB\xBFoffers=KEEP\r\npid=42\r\n",
+        "pid=42\noffers=\tkeep\t\n"}};
+    for (const std::string_view content : contents) {
+        SCOPED_TRACE(std::string(content));
+        const ParsedShutdownFlag parsed = parse_shutdown_flag(content);
+        EXPECT_EQ(parsed.address, ShutdownFlagAddress::Addressed);
+        EXPECT_EQ(parsed.pid, std::uint64_t{42});
+        EXPECT_EQ(parsed.offers, StopOffersRequest::Keep);
+    }
+}
+
+// An operator's hand-written flag has no pid line; it may still name a policy.
+TEST(ShutdownFlagOffersPolicy, AHandWrittenFlagMayNameAPolicy)
+{
+    const ParsedShutdownFlag parsed = parse_shutdown_flag("offers=keep\n");
+    EXPECT_EQ(parsed.address, ShutdownFlagAddress::Unaddressed);
+    EXPECT_EQ(parsed.offers, StopOffersRequest::Keep);
+}
+
+// Unrecognised, NOT Keep and NOT Cancel: the engine falls back to the config
+// default and says the line could not be read. And never a reason to refuse
+// the stop -- the address is untouched by whatever the offers line says.
+TEST(ShutdownFlagOffersPolicy, AnUnreadableLineIsUnrecognisedAndTheRequestIsStillAddressed)
+{
+    const std::array<std::string_view, 8> contents{{
+        "pid=42\noffers=\n", "pid=42\noffers=kee\n", "pid=42\noffers=keep-bids\n",
+        "pid=42\noffers=yes\n", "pid=42\noffers=keep cancel\n", "pid=42\noffers=1\n",
+        "pid=42\noffers=keep\noffers=cancel\n", "pid=42\noffers=keep\noffers=keep\n"}};
+    for (const std::string_view content : contents) {
+        SCOPED_TRACE(std::string(content));
+        const ParsedShutdownFlag parsed = parse_shutdown_flag(content);
+        EXPECT_EQ(parsed.address, ShutdownFlagAddress::Addressed);
+        EXPECT_EQ(parsed.pid, std::uint64_t{42});
+        EXPECT_EQ(parsed.offers, StopOffersRequest::Unrecognised);
+    }
+}
+
+// Column 0 only, as for "pid=": a key that merely CONTAINS "offers=" is not it.
+TEST(ShutdownFlagOffersPolicy, OnlyALineStartingWithTheKeyCounts)
+{
+    const std::array<std::string_view, 3> contents{{
+        "pid=42\n offers=keep\n", "pid=42\nkeep_offers=keep\n", "pid=42\n#offers=keep\n"}};
+    for (const std::string_view content : contents) {
+        SCOPED_TRACE(std::string(content));
+        EXPECT_EQ(parse_shutdown_flag(content).offers, StopOffersRequest::Unspecified);
+    }
+}
+
+// A request that names no process is nobody's, and carries nobody's policy.
+TEST(ShutdownFlagOffersPolicy, AMalformedAddressReportsNoPolicy)
+{
+    const std::array<std::string_view, 2> contents{{
+        "offers=keep\npid=abc\n", "pid=1\noffers=keep\npid=2\n"}};
+    for (const std::string_view content : contents) {
+        SCOPED_TRACE(std::string(content));
+        const ParsedShutdownFlag parsed = parse_shutdown_flag(content);
+        EXPECT_EQ(parsed.address, ShutdownFlagAddress::Malformed);
+        EXPECT_EQ(parsed.offers, StopOffersRequest::Unspecified);
+    }
+}
+
+// The policy never decides WHOSE request it is: a keep request for another
+// process is discarded exactly like a cancel one.
+TEST(ShutdownFlagOffersPolicy, ThePolicyNeverChangesTheVerdict)
+{
+    for (const std::string_view content : {kGolden, kGoldenKeep, kGoldenCancel}) {
+        SCOPED_TRACE(std::string(content));
+        const ParsedShutdownFlag parsed = parse_shutdown_flag(content);
+        const ShutdownFlagDecision other = decide_shutdown_flag(facts(
+            true, parsed, true, kStart + std::chrono::seconds{5}, identity(kSuccessorPid)));
+        EXPECT_EQ(other.verdict, ShutdownFlagVerdict::Discard);
+        EXPECT_EQ(other.reason, ShutdownFlagReason::AddressedToAnotherProcess);
+
+        const ShutdownFlagDecision ours = decide_shutdown_flag(facts(
+            true, parsed, true, kStart + std::chrono::seconds{5}, identity(kKilledEnginePid)));
+        EXPECT_EQ(ours.verdict, ShutdownFlagVerdict::Honour);
     }
 }
 

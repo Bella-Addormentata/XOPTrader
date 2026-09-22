@@ -5,6 +5,712 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.25] — 2026-09-21 — less dust, fewer cancels, a fee controller shipped off, and stops that keep the book
+
+### Less reward dust in new offers, except on the no-floor retry
+
+Dexie pays liquidity rewards as one tiny coin per rewarded offer. On 2026-09-19
+the DBX wallet held 4,575 unspent coins, 4,389 of them under 0.1 DBX and worth
+84.6 DBX together. The wallet's coin selection minimises overshoot, which
+favours dust, so an XCH/DBX bid paying 80.334 DBX became a 62,228-character
+offer that Dexie refused with HTTP 400 "Too many input coins". The offer still
+existed in the wallet and locked its coins, listed nowhere. `engine.log` holds
+13 such refusals between 2026-09-10 and 2026-09-19.
+
+What the floor below does, stated plainly: the **first** create for each offer
+asks the wallet for coins of at least 1% of the amount, which bounds its CAT
+leg at 100 inputs — about 46,000 characters at the 459 per input measured
+here, against refusals that began at 60,612. (That bounds the CAT leg only:
+the XCH fee coin is a separate selection this CAT-scaled value does not
+constrain — one coin while every XCH coin covers the fee, as today's do by
+133x the **cap** on that fee, which is a measurement and not a guarantee.)
+Those 13 HTTP 400s
+become a create the wallet either satisfies or refuses up front, before any
+offer exists. What the floor does **not** do is guarantee the outcome: a
+refused create is re-sent once without the floor, and the offer that retry
+builds is as exposed to dust as it was before this change.
+
+- **A floor on the coins an offer is funded from.** The **first**
+  `create_offer_for_ids` attempt for a CAT-funded offer now carries
+  `min_coin_amount` =
+  ceil(mojos the offer spends x `strategy.offer_min_input_coin_frac`) — **the
+  first attempt only: the no-floor fallback below sends a second, distinct
+  create with the key omitted**, and an offer built by that retry is as
+  exposed to reward dust as it was before this change. The new
+  key defaults to 0.01, accepts [0, 1), is read at startup, and 0 disables it,
+  restoring the previous request byte for byte — **the request only**, see the
+  operator note below. With every CAT input at least 1% of
+  the amount, 100 of them always suffice — the **CAT leg** only; the XCH fee
+  coin is selected separately and this CAT-scaled floor does not bound that
+  count. Dexie does not
+  publish its limit; from this bot's own submissions it accepted 125 inputs
+  (57,382 characters) and refused everything from 60,612 characters up.
+- **XCH-funded offers are unchanged.** Their coins are shaped by the coin pool
+  and budgeted by the XCH lock ledger under the wallet's default selection.
+- **One value covers the fee coin too, and the XCH lock ledger models it.** In
+  chia 2.7.4 the coin-selection keys are read from the top level of the request
+  and one config governs every selection it makes, including the XCH fee coin
+  of a CAT-funded offer. The floor is CAT-scaled (804 mojos for the offer
+  above), and it changes which XCH coin pays the fee **exactly when the XCH
+  wallet holds a coin below the floor** — chia filters the candidate set
+  before it chooses a selection branch, so excluding one coin can flip the
+  branch whatever that coin's size relative to the fee. The fee decides only
+  whether the exclusion changes the answer. (An earlier revision of this entry
+  said the effect "needs floor > fee" and derived thresholds of 500 and
+  1,500,000 CAT units from `fees.min_fee_mojos`. That was wrong in both
+  directions and is withdrawn: a floor under the fee can still change the
+  selection, and a floor no coin falls under changes nothing however large.)
+  When the wallet does skip a small XCH coin it locks a larger one, so
+  `CoinLockLedger::try_lock`
+  and `try_lock_floor_only` take the same floor, in the preflight probe and in
+  all three posting paths. Without it the ledger charged the coin the wallet
+  skipped and later creates could pass the cycle cap or the reserve floor on
+  XCH that was already locked.
+- **On the live deployment this is inert today — because of the coin set, not
+  the fee.** Measured read-only on 2026-09-21 (`chia rpc wallet
+  get_spendable_coins`, `get_coin_records`, `get_wallet_balance`), twice in the
+  day. The XCH wallet held 54 unspent coins both times, the smallest
+  **13,494,209,440 mojos** on the first read and **13,314,209,440** on the
+  second; spendable went 30 → 42 and its smallest 20,757,615,448 →
+  13,314,209,440. The figures below use the smallest of those readings. The
+  largest floor the bot can emit is bounded by the CAT mojos **one offer** can
+  spend, so it scales with the fraction, and **both** CAT-funded pairs enabled
+  in the live config are in scope — XCH/DBX (wallet 8, 1,844,501 mojos) and
+  XCH/BYC (wallet 4, 88,845 mojos). DBX binds at every fraction: 18,446 mojos
+  at the shipped 0.01, 1,844,501 at a fraction just under 1.
+  **The margin is therefore not one number.** Against 13,314,209,440 it is
+  721,794× (5.86 orders of magnitude) at 0.01 and 7,218× (3.86 orders) at the
+  top of the range — "more than five orders" holds only up to a fraction of
+  about 0.072, and it was previously stated as an absolute over every floor the
+  bot can emit, which it is not. **The conclusion survives the correction:**
+  even the largest floor the range `[0, 1)` permits, from either CAT wallet, is
+  over three orders of magnitude under the smallest XCH coin, so nothing is
+  filtered out and no selection changes. This is a property of **today's coin
+  set, which moves** — it moved twice within 2026-09-21, and the same coin was
+  recorded at 20,787,615,448 mojos in the 2026-09-20 snapshot and at
+  20,757,615,448 on 2026-09-21, exactly 30,000,000 lower, which is what two
+  15,000,000-mojo fee spends would do (that attribution is an inference; the
+  measurements are not). `fees.min_fee_mojos` does not govern reachability
+  in either direction.
+- **The fraction is applied in parts per billion, rounded up.** Rounded to
+  nearest, the applied fraction could fall below the configured one and the
+  input bound failed for ordinary values: at 1/3, three floor-sized coins of a
+  1,000,000,000-mojo offer totalled 999,999,999. The default 0.01 is exact and
+  unchanged.
+- **Fallback.** If the wallet answers that the coins at or above the floor
+  cannot cover the amount ("... or our minimum coin amount is too high"), the
+  create is sent once more without the floor and a `[min-input-coin]` warning
+  names the pair, side, tier and floor. Only that answer triggers it: a timeout
+  or any other transport failure is never followed by a second create from this
+  path. The offer built by the retry can again be one Dexie refuses.
+- **Detection.** A Dexie refusal for too many input coins now logs one
+  `[dexie-too-many-inputs]` warning that names the offer, its length, the
+  remedy and a count since start. The remedy is to **combine the coins** —
+  the CAT's, since the dust is CAT reward payouts and the CAT leg is what the
+  floor bounds; if the XCH fee leg ever contributes, the coins to combine
+  there are XCH.
+  **The rest of the advice is computed, not fixed.** The warning is handed the
+  posting and the offer's length and nothing about how the offer was built, so
+  it derives `ceil(1 / frac)` — the CAT-leg bound on a *floored* create — and
+  branches on whether that plus the one-coin fee leg fits inside the 125
+  inputs Dexie was measured to accept:
+  - **At or above 1/124** (the shipped 0.01 bounds it at 100): a floored
+    create *cannot* reach the limit, so a refusal is proof no floor was sent.
+    Do **not** raise the fraction — that makes the wallet refuse the floored
+    create more often and fires the no-floor retry that builds these offers.
+    Only a small **reduction** can help, never below 1/124.
+  - **Below 1/124** (0.002 bounds it at 500): the bound is over the limit on
+    its own, so a create the wallet **satisfied** can be refused exactly like
+    a dust-funded one and the refusal proves nothing. The advice inverts —
+    **raise** the fraction — and the warning names the preceding
+    `[min-input-coin]` line as the way to tell the two apart for that offer.
+  - **At 0**: the floor is off and nothing carries a bound.
+
+  The earlier text gave the first branch's advice unconditionally, which was
+  correct at 0.01 and backwards below 1/124; and it printed `0.008` as the
+  safe floor, which is on the wrong side of 1/124 — `ceil(1 / 0.008)` is
+  exactly 125, one over once the fee coin is counted. Both numbers are now
+  derived from `kDexieMeasuredInputLimit` and `kDexieFeeLegInputsToday`, so
+  they cannot drift apart again. The fallback fact is deliberately **not**
+  threaded into the warning: in the shipped branch it is deducible, and the
+  datum would have to be the optional floor rather than a "did the fallback
+  run" bool, since XCH-funded offers and skipped dict shapes also send no
+  floor. No metric was added: `OfferManager` has no posting-failure
+  metric to extend. Nothing is cancelled automatically.
+- **Startup warns when the fraction cannot bound what it is for.** The range
+  `[0, 1)` is closed at the bottom, so a value like 0.002 loaded silently
+  although `ceil(1 / frac)` is then 500 — above Dexie's limit before the fee
+  coin. Config load now emits one `[Config]` warning for any fraction that is
+  on but below 1/124, naming the bound it gives and the value to use. `0` is a
+  real setting and is not warned about. Not an error: the key is not
+  load-bearing for safety.
+
+**What changes on upgrade, with no config edit at all.** Three things, and only
+the first has a lever:
+
+1. **The floor is ON.** `strategy.offer_min_input_coin_frac` is absent from the
+   live `config.yaml`, so it takes its 0.01 default and every CAT-funded
+   `create_offer_for_ids` starts carrying `min_coin_amount` **on its first
+   attempt** from the first restart. It is not carried by the no-floor
+   fallback, which re-sends the create with the key omitted after a min-coin
+   refusal (Fallback bullet above): that request is byte-identical to the
+   pre-upgrade one, so the offer it builds has the pre-upgrade exposure to
+   reward dust — including the exposure that produced the 62,228-character
+   offer Dexie refused on 2026-09-19. Setting the key to `0` turns the floor
+   off altogether.
+2. **A create that fails is no longer re-sent** (the section below). This is
+   unconditional: `retry_policy_for_endpoint` keys off the endpoint name, not
+   off the fraction, so `offer_min_input_coin_frac: 0` does **not** restore the
+   old four-attempt behaviour. A create that times out now fails after one
+   attempt (30 s) instead of four (~124 s).
+3. **An unanswered MERGED create posts nothing else for that side this cycle**,
+   also unconditional and also unaffected by the fraction. If the other side of
+   the pair did post, the asymmetric-ladder guard in `post_quotes` can then
+   cancel it, so a merged-create timeout can cost one cycle of both sides
+   rather than one side.
+
+2 and 3 are strictly safer than what they replace — the risk they remove is a
+duplicate offer, which costs real money — but they are behaviour changes that
+ship whatever the new key is set to, and no config value reverts them.
+
+**Operator note.** The dust already in the wallet is not touched: it stays
+spendable, the engine simply stops selecting it for offers, and it can be
+combined at any time (`chia wallet coins combine`). An offer Dexie refused is
+tracked like any other and retired by the usual cancels: the one posted at
+14:42 on 2026-09-19 was cancelled at 18:23. Until then it locks its coins while
+listed nowhere (`TODO.md` S66).
+
+**A create is no longer re-sent once it may have reached the wallet.** `rpc_post`
+re-sent `create_offer_for_ids` after a timeout or an HTTP 5xx, up to three more
+times, and returns only its last attempt (#158 had left the endpoint out of
+scope). A second copy of a create is a second offer, and the fallback above
+made that worse than it was: the wallet's refusal could answer a copy whose
+original had already built the offer and lost its reply, and the fallback then
+created another. `create_offer_for_ids` is now never re-sent unless the request
+cannot have reached the wallet (no connection, no TLS handshake), as the two
+cancel endpoints already were, so a create that times out fails after one
+attempt (30 s) instead of four (about 124 s). `take_offer` is unchanged. For the
+same reason a merged create that ends with no answer is no longer followed by
+one create per tier; a refusal, or a failure before the request was written,
+still is.
+### A closed-loop fee controller, shipped off
+
+With Chia blocks about 97% full the node admits a spend only at 5 mojos or more
+per unit of CLVM cost. The engine paid the node's estimate for a plain XCH send
+and never checked whether its own cancels and takes confirmed, so they sat,
+`pending_change` persisted, and Step 8 force-deleted every unconfirmed wallet
+transaction 10-12 times a day. This adds the feedback. Both new switches
+default to off, and with both off every fee is what v0.10.24 paid.
+
+### Fee controller (S67)
+
+- **One controlled quantity: a fee rate, in mojos per CLVM cost.** Four action
+  classes turn it into a fee — cancel of an XCH-offered offer (8.4M cost), cancel
+  of a CAT-offered offer (42.3M), take (125M), fee attached to a posted offer
+  (21M). The costs were measured on this wallet's own spend bundles and are
+  configurable. Every `get_recommended_fee` call site now names its class; the
+  parameter has no default, so a site that forgets does not compile.
+- **Fast up on evidence that a fee is too low.** A cancel or take of ours still
+  pending after `controller_target_delay_blocks` (8 peak heights, 150 s) is a
+  censored observation and raises the rate at once — a too-low fee may never
+  confirm, so waiting for a confirmation would deadlock the loop. Also heard:
+  a late confirmation, the wallet's `sent_to` fee refusals (read from rows the
+  stuck-transaction pruner already holds), Step 8's `pending_change` counter at
+  half way, and the force-delete itself. The law is a velocity-form PID in log
+  fee space that only ever raises.
+- **Slow down by probing.** After 8 on-target confirmations the fee steps down
+  15%. A confirmation counts only if that spend paid no more than the loop pays
+  for its class now — compared as fees, after the `[min_fee, max_fee]` clamp, so
+  a cancel the `min_fee_mojos` floor lifted still counts for the levels at which
+  the loop would pay that same floor. A probe that fails returns to the last
+  known-good fee plus 10%, the level
+  it failed at is remembered, and re-testing that level waits twice as long each
+  time (cap 256 confirmations). A re-test that succeeds means the floor has
+  fallen: the memory is dropped and probing resumes at the base interval.
+- **Anti-windup.** A stuck spend stops counting once the fee is `min_raise` above
+  what that spend paid, which also bounds what a fee clamped by `max_fee_mojos`
+  or the budget can do. Wallet-level signals are ignored for two target delays
+  after a raise, and at most three in a row may raise the fee without an
+  observation of one of our own spends in between.
+- **The node's numbers are a floor under the learned rate, never a multiplier.**
+  `get_fee_estimate` is now asked with an explicit `cost` instead of
+  `spend_type: send_xch_transaction`; the rate it returns is scaled by each
+  class's cost. The node's own admission floor is read from the
+  `get_blockchain_state` reply the height poll already fetches
+  (`mempool_cost`, `mempool_max_total_cost`, `mempool_min_fees`). No node call
+  is added, the wallet-only gate is unchanged, and a reading older than 32 peak
+  heights is dropped: with the node unreachable the learned rate stands alone.
+- **The budget no longer stops the bot, and it never prices a cancel below what
+  the node will admit.** With the controller on, offer-attached fees may spend
+  only what is above a reserve (`controller_budget_reserve_cancels`, 25 CAT
+  cancels, capped at half the budget so it can never exceed the budget itself);
+  an exhausted budget pins the attached fee at `min_fee_mojos` and sends one
+  `FeeBudgetBound` alert — which fires when the budget **could not fund** that
+  fee, not only when it *lowered* one: at the pin the emitted fee is exactly
+  what was asked for. It never returns 0, which made Step 8 skip cancelling
+  stale quotes as well as posting. Step 8 asks for one attached fee and attaches
+  it to every tier it posts, so the room above the reserve is shared across the
+  tiers it may post that heartbeat rather than granted to each. **The reserve
+  moves *when* that squeeze starts; it does not bound what attached fees
+  spend** — `min_fee_mojos` overrides it unconditionally, `should_post_offer`
+  no longer refuses a tier on budget grounds with the controller on, and a fee
+  is booked for every offer *posted* (S69), so a ladder can still push the
+  window past the budget at `min_fee_mojos` per tier. Only a correctly sized
+  `daily_budget_mojos` prevents that, which is what the startup advisory is
+  for. **A cancel or a
+  take is never degraded** — with one exception found at review round 8 and
+  recorded below, the bulk stop/shutdown sweep: `min_fee_mojos` on a 42.3M-cost CAT cancel is 0.35
+  mojos per cost against the 5 a full mempool admits, so a degraded cancel is a
+  spend that cannot be mined, keeps its coins locked and ends in a wallet-wide
+  force-delete. It is paid in full — `max_fee_mojos` is the ceiling that bounds
+  it — and the overrun is reported with one `FeeBudgetUnfunded` alert. That
+  report is raised when the wallet ACCEPTS the spend, never when a fee is
+  merely quoted: Step 8 prices both cancel classes every heartbeat before it
+  cancels anything, so reporting at the quote would say "paid over budget" on
+  heartbeats that sent no wallet RPC at all.
+- **The budget is sized by derivation, not by a quoted number.** At full-mempool
+  prices and this wallet's measured action rates one `fee_window_blocks` window
+  costs 15,163,585,937 mojos, so `daily_budget_mojos` wants at least
+  30,327,171,874. The engine computes that from the operator's own costs and
+  window, logs it at startup and warns when the budget is below it;
+  `config.example.yaml` quotes the same figure and shows the arithmetic.
+- **Tickets carry what was really paid.** A cancel's ticket opens when the
+  wallet accepts the cancel RPC, with that call's fee (an emergency tier, a
+  zero-fee retry and an escalation included) and its height; a re-cancel
+  replaces it. Only a wallet-verified CANCELLED closes it as a confirmation:
+  `recheck_terminal` answers "still terminal" for FAILED too, and a FAILED
+  offer says nothing about our fee. A cancel adopted at boot has no ticket.
+  A ticket's height is the height of the cycle that issued the spend (the
+  startup height for a cancel the startup reconcile issues), never the
+  last-processed-block marker, which trails by a cycle and is 0 at boot; with
+  no known height no ticket is opened, and a ticket at height 0 is never
+  evidence. Both fee bounds are capped at the same ceiling, so a floor above it
+  cannot put the minimum over the maximum. A take's ticket closes on the wallet's own
+  `confirmed_at_index`, not on the heartbeat that read it: the sweep polls one
+  take per heartbeat, so a second ticketed take would otherwise turn an on-time
+  confirmation into a late one and raise the fee.
+- **Every fee the controller emits is a valid `Mojo`, and the conversion to one
+  is now a named function.** The saturation ceiling was exactly 2^63 — the one
+  `std::uint64_t` value that is *not* an `xop::Mojo` (`std::int64_t`, maximum
+  2^63 − 1). It really was emitted: `fee_for()` clamps to
+  `[min_fee_mojos, max_fee_mojos]` and both bounds are capped at that ceiling,
+  so an operator writing a 19- or 20-digit `fees.max_fee_mojos` — the parser
+  accepts any `uint64` and validates only `min <= max` — got 2^63 back from
+  `get_recommended_fee`. C++20 makes the out-of-range conversion modular wrap
+  rather than undefined, so it became `INT64_MIN` silently, on every compiler.
+  The ceiling is now 2^63 − 1; the *comparison* bound stays at exactly 2^63
+  (a constant just below `UINT64_MAX` rounds up to 2^64 as a double) and is
+  renamed so the two can no longer be misread as the same number. A negative
+  fee is worse than a huge one because every guard downstream ignores it rather
+  than refusing — `CoinLockLedger::clamp_need()` zeroes it on the cancel path,
+  and `ask_take_cost()` / `add_same_wallet_fee()` drop it on their own
+  `<= 0` clause on the take path — so all **fifteen** `uint64` → `Mojo` fee
+  conversions now go through `xop::to_mojo_saturating()`. Eleven replaced an
+  explicit `static_cast`; the other **four** were implicit narrowings with no
+  cast to grep for, and those four are exactly the `CoinLockLedger` fee
+  arguments in `offer_manager.cpp`. (Counted, after an earlier draft of this
+  entry said "fourteen … six of them implicit" — both numbers were wrong.) The
+  two `posted × fee` products saturate too.
+  `static_assert`s in `fee_controller.hpp` and `fee_tracker.hpp` make a wrong
+  ceiling a compile error on every toolchain, and
+  `tests/test_fee_controller_wiring.py` now pins every one of the fifteen call
+  sites — see the entry below.
+  **Not reachable on the shipped configuration** (`max_fee_mojos` 100,000,000),
+  and not reachable merely by enabling the controller.
+- **The rolling fee window is accounted EXACTLY, and saturates only when it is
+  read.** An earlier draft of the paragraph above said the running total and
+  its pruning subtraction saturated as well, and that was the bug. Saturating
+  addition is lossy, so it is not invertible and no subtraction undoes it: with
+  a history of `[UINT64_MAX, 100]` the total saturated to `UINT64_MAX`, and
+  pruning the first entry compared `total > oldest` — `UINT64_MAX` against
+  `UINT64_MAX`, false — and set the window total to **zero** while 100 mojos
+  were still inside it. `budget_remaining()` is `daily_budget − total`, so the
+  budget reopened in full: a fail-open on the one number the budget is, in the
+  code added to close a fail-open. `FeeTracker` now keeps the window total as a
+  128-bit unsigned value in two 64-bit halves — a carry on the way in, the
+  matching borrow on the way out, both exact and O(1) — and clamps to
+  `UINT64_MAX` once, in `get_rolling_total()`, where the clamped number is
+  handed to a caller and never fed back into the arithmetic. The post-condition
+  is that `get_rolling_total()` is the true sum of the fees still inside the
+  window, or `UINT64_MAX` if and only if that true sum genuinely exceeds
+  `UINT64_MAX`; every consumer of it is monotone in it, so the clamp can only
+  refuse a spend, never allow one. **Also not reachable on the shipped
+  configuration**: at `max_fee_mojos` 100,000,000 and the ~1,400 fee-bearing
+  events this wallet's busiest day recorded, one window totals about 1.4e11
+  mojos against the 1.8e19 needed to saturate. It takes a `max_fee_mojos` near
+  2^63, which `config.cpp` accepts because it validates only `min <= max`.
+- **Both budget alerts told the operator the wrong thing, and both are the
+  signals the staged enable says to act on.** (1) The `FeeBudgetBound` episode
+  latched and cleared on "the budget *lowered* the fee", which is false
+  whenever the controller's own answer for an attached fee is already at
+  `min_fee_mojos` — every level at or below `log2(42.3/21) = 1.010`, the bottom
+  39% of the live band and the level the engine **boots at**. So an exhausted
+  budget raised no alert there at all, and an open episode was *closed* by a
+  quote taken from an empty window, logging `the fee budget no longer binds
+  (headroom 0 mojos)`: an all-clear contradicted by its own number. The rule is
+  now what the budget actually granted (`BudgetedFee::allowance`, the room
+  above the reserve divided by the batch) against what was asked for, on both
+  edges. (2) The `FeeBudgetUnfunded` episode's clear branch was the bare
+  negation of its latch and never compared the fee *paid* with the headroom, so
+  an accepted priority spend at any fee below its class's last quote ended the
+  episode however far above the headroom it was — a 239,000,000-mojo escalation
+  against a headroom of 0 read as "the budget funds priority spends again". It
+  now ends only when the accepted spend fits the headroom, which is what the
+  header always documented. Both are behind `controller_enabled` and both are
+  load-bearing at the live `daily_budget_mojos: 10000000000`, which this PR's
+  own startup advisory says is about 3x too small.
+- **One cancel path is still degraded, and "a cancel is never degraded" is
+  qualified rather than repeated.** `OfferManager::cancel_all`'s **bulk** sweep
+  hands `current_fee_mojos_` to the wallet as `batch_fee`, and that is the
+  budget-shaped *offer-attached* fee `Engine::set_dynamic_fee` last wrote — so
+  with the controller on and the budget exhausted, a stop/shutdown Cancel All
+  can go out at `min_fee_mojos` while the controller's own cancel fee is far
+  above it. Every *per-offer* cancel is unaffected (`cancel_fee_for` reads the
+  class-aware priority fees). Found by review at `cbf0301` and **not fixed
+  here** — it changes the stop/shutdown sweep and wants its own review; the
+  fix is to pass `max(cancel_fee_xch_mojos_, cancel_fee_cat_mojos_)` while the
+  class-aware fees are in force. It must land before `controller_enabled:
+  true`.
+- **The saturating conversion had no guard of its own, and a merge gate proved
+  it by measurement.** This release introduced `xop::to_mojo_saturating()` and
+  routed fifteen fee conversions through it — and pinned none of them. On the
+  four-way merged tree the gate dropped the wrapper from each of the four
+  `CoinLockLedger` fee arguments in turn and **nothing caught it**: MSVC
+  `/W4 /WX` builds clean because `uint64` → `int64` is a same-size conversion
+  and `-Wconversion` is in neither toolchain's flags, the C++ suite passes
+  because nothing in `cpp/tests` constructs an `OfferManager`, and no source
+  scan mentioned `to_mojo_saturating` at all. The only thing ever holding those
+  four lines was a neighbouring PR's literal text pin, which was loosened —
+  correctly — so it could pass both alone and merged. Six assertions in
+  `tests/test_fee_controller_wiring.py` now pin the invariant where it belongs:
+  the `CoinLockLedger` fee argument is checked **positionally** (so a third
+  `min_coin` argument cannot break it), the ternary, assignment, bind and
+  ledger-leg shapes are checked individually, a bare narrowing cast on a fee is
+  refused, and an exact per-file census makes dropping any one of the fifteen
+  visible. **Scope, plainly: the code was correct at every site and the
+  reachable impact is negligible** — the narrowing needs a fee above 2^63 mojos
+  (~9.2 million XCH) and `current_fee_mojos_` is clamped by
+  `fees.max_fee_mojos`. This is guard erosion, not a live defect.
+- **Review round 9: four corrections, one of them a real signal defect.**
+  (1) **`sent_to` is per peer, not a timeline**, so reading only its last tuple
+  was wrong in both directions. Measured against this wallet's own `debug.log`
+  (8 files, 38,250 non-empty lists): **8,289 carry more than one peer**, so an
+  accepting peer followed by a fee-refusing one would have raised the fee on a
+  spend already in a mempool; and **341 lists carry a fee refusal that is not
+  last** and were dropped silently. The parser now scans the whole array — any
+  peer reporting SUCCESS or PENDING suppresses the row, an unreadable tuple
+  stops the row rather than being skipped over (it could be the acceptance),
+  and otherwise any fee refusal counts. The residual is stated rather than
+  glossed: `filter_ok_mempool_status` strips the SUCCESS/PENDING tuples on the
+  resend tick, so a spend resting in an accepting peer's mempool later looks
+  identical to a refused one — across all 38,250 live lists, **zero** ever
+  carried a SUCCESS, which is what that filter looks like from outside. No
+  reading of `sent_to` alone can separate those; what bounds it is the
+  controller's dead time and its three-raise uncorroborated streak limit.
+  (2) **The rolling fee window booked intent.** `cancel_fees_paid` re-derived
+  each cancel's fee from a fresh `cancel_fee_for()` policy lookup, so a cancel
+  that fell through to `emergency_cancel` and went out at a halved tier, at a
+  secure fee of 0, or as a local-only cancel that spends nothing was booked at
+  the full policy fee. `OfferManager` now carries the accepted fee out
+  (`take_cancel_fees_accepted()`), which also books accepted cancels from
+  routines that reached no booking site at all. Gated with the rest — the
+  legacy branch is byte-identical to `main`.
+  (3) **"Reported once" was not an invariant**: the refused-name set tests its
+  capacity *before* inserting and then clears wholesale, so the sweep that
+  trips 256 re-counts every refused row still visible in it, and names of
+  deleted transactions are never shed.
+  (4) **Class-aware cancel fees start at Step 8, which is after startup
+  reconciliation** — so the bulk sweep is not the only cancel that misses them;
+  every cancel the boot reconciliation issues pays the raw constructor fee,
+  including the `OrphanDisposition::Unknown` path that fires for any resting
+  offer on a disabled pair.
+- **Observability.** One `[FeeController] rate a -> b mojos/cost (reason; n
+  move(s)) -- fees now: ...` line per burst of changes, and two gauges,
+  `xop_fees_controller_rate_mojos_per_cost` and `xop_fees_controller_level_log2`.
+  At startup the controller reports which classes `max_fee_mojos` cannot get
+  into a full mempool.
+- **Keys**, all under `fees:` and read at startup: `cost_aware_estimate`,
+  `controller_enabled`, `controller_target_delay_blocks`, `controller_kp` / `_ki`
+  / `_kd`, `controller_max_error`, `controller_max_step_up`,
+  `controller_min_raise`, `controller_warmup_observations`,
+  `controller_probe_fraction`, `controller_probe_after_confirmations`,
+  `controller_probe_confirmations`, `controller_probe_fail_bump`,
+  `controller_probe_backoff_cap`, `controller_ff_margin`,
+  `controller_ff_max_age_blocks`, `controller_budget_reserve_cancels` and four
+  `controller_cost_*`. Ranges are validated; `controller_enabled` requires
+  `min_fee_mojos > 0`.
+
+### Operator notes
+
+- **Nothing changes until a switch is turned on.** `cost_aware_estimate: true`
+  alone changes fees (about 4.5x for a CAT cancel at the same node rate), and
+  it makes cancels pay by the asset the offer offered, as the controller does.
+- **Level 0 is `min_fee_mojos` exactly**, whatever its value. A very low floor
+  (the example file's 5000) makes a very wide band: the startup log says how
+  many raises, and roughly how many minutes, crossing it takes without the
+  node's floor.
+- **The live `max_fee_mojos: 100000000` cannot get an offer-attached fee, a CAT
+  cancel or a take into a full mempool** — three of the four classes, not the
+  two earlier drafts of this entry named. The node admits at 5 mojos per cost
+  and the controller asks for `controller_ff_margin` × that (5.5 at the
+  default), so the classes need 115,500,000, 232,650,000 and 687,500,000
+  respectively; only the XCH cancel's 46,200,000 fits under 100,000,000. The
+  startup log names each one. Before enabling the controller raise it to at
+  least 250,000,000, or 700,000,000 to cover takes **as the shipped cost model
+  prices them** — that figure is `5.5 × controller_cost_take` at the modelled
+  125,000,000, and the measured take cost reaches **212,112,758**, which needs
+  **1,166,620,169**. Raising the cap alone will not make the loop ask for that:
+  the fee is `rate × controller_cost_take`, so pricing the largest measured
+  take needs `controller_cost_take: 212112758` **and** `max_fee_mojos >=
+  1166620169`. Keeping the shipped 125,000,000 is defensible — it was chosen to
+  cover 7 of the 11 measured bundles rather than make the common take pay for
+  the rare one — but then the 4 large takes are under-priced in a full mempool
+  and the controller compensates by raising the *rate*, which raises every
+  other class too. Also raise
+  `strategy.cancel_escalation_max_fee_mojos` with it.
+- **`daily_budget_mojos` is per `fee_window_blocks`, and 1662 peak heights is
+  8.7 hours, not 24** (S69). At full-mempool prices one such window costs
+  15,163,585,937 mojos on this wallet's measured action rates, so set the budget
+  to at least 30,327,171,874 (35000000000 is a round number); the engine logs
+  the figure for your configuration and warns below it. The 5000000000 to
+  15000000000 suggested in earlier drafts was wrong at both ends: the bottom is
+  less than the cancel reserve itself (25 x 232,650,000 = 5,816,250,000) and the
+  top is about one window's spend.
+- Found while measuring, not fixed here: Step 8's force-delete fires after a
+  median of 176 seconds, not the ~10 minutes its constant documents (S68).
+### Cancel far fewer offers (S70-S72) -- three switches, all default OFF
+
+In the 14 days to block 9,319,413 the bot posted 1,283 offers, filled 15 and
+cancelled 1,254 -- about 84 fee-bearing spends per fill, into ~97% full blocks.
+Three rules made 97% of them. Each now has a replacement behind its own
+`strategy` key; every key defaults to the old rule and needs a restart.
+
+- **`ttl_cancel_mode: expire` (was 402 `ttl_expired` cancels).** An offer that
+  verifiably carries the on-chain expiry from #150 is no longer cancelled at the
+  hard TTL. The chain ages it out, and the bot then frees its coins with a free
+  local cancel -- read from the chia 2.7.4 source: an expired trade stays
+  PENDING_ACCEPT and stays in `get_locked_coins()` until cancelled, and
+  `cancel_offer secure=false` releases it with no spend. The cancel is sent only
+  when a chain clock (`get_timestamp_for_height` at the wallet's finished-sync
+  height less 32 blocks -- a depth, because a seconds margin can be met by the
+  tip block alone) is past `max_time`, the wallet still reports PENDING_ACCEPT, and
+  its record repeats the tracked `max_time`; this host's clock only decides
+  whether to look.
+  **That clock is one connected peer's unvalidated assertion, not a local fact**
+  -- chia's wallet forwards `get_timestamp_for_height` to whichever full-node
+  peer answers first, unanchored (no `expected_header_hash`), so nothing checks
+  a signature, a proof of space or a VDF, and the 32-block depth bounds reorgs
+  only, never a liar. The retire therefore censuses the wallet's full-node peers
+  (`get_connections`) before the clock and again after it, and retires nothing
+  unless every peer is on this host, where chia's own `is_trusted_peer` trusts
+  it unconditionally. **Enabling `expire` has a precondition: the wallet must
+  reach the chain only through a local full node.** While it does not -- most
+  obviously when that node is down -- retires pause, offers keep their coins
+  locked, and the log says `no trusted chain clock`.
+  `expire` with no expiry configured is refused at startup.
+  **The wallet's TRADE RECORD is blind to a take of a retired offer. The
+  wallet is not, and an earlier draft of this bullet said it was.**
+  `get_trades_by_coin` skips CANCELLED (`trade_manager.py:131-139`), so
+  `coins_of_interest_farmed` never fires, the trade never reaches CONFIRMED and
+  no fill is booked -- that is the whole of what the evidence supports. A take
+  still spends our maker coin AND pays the requested asset to a puzzle hash the
+  maker's own wallet derived (`trade_manager.py:500,518`: each requested payment
+  is a notarized payment to `action_scope.get_puzzle_hash`), so it moves the
+  coin records and the balances this bot reads elsewhere. A sound local detector
+  is therefore constructible; it is filed with its design as S78 and is **not**
+  implemented here. Until it is, the shipped check is external: an offer this
+  bot retired should end at Dexie `status: 6` with `spent_block_index: null`,
+  and a `status: 4` with a block index means someone took it after the retire.
+  The GUI pairs table sizes its resting-offer window from the expiry in this
+  mode, so a quote that legitimately rests 24 h is not shown as absent after 6.
+- **`exposure_rule: unified` (was 528 `exposure_floor_rebalance` cancels).** The
+  pre-post projection and the resting-offer check now share one verdict. They
+  disagreed because `spendable_balance` already excludes coins locked by resting
+  offers, so posting an offer moved the second check by the size of whatever
+  coin the wallet locked: on 2026-09-13 the bot cancelled 267 XCH/DBX asks
+  this way, at one point re-posting the same tier every ~2.7 minutes. Unified
+  projects from
+  `unconfirmed_wallet_balance` against every resting offer that spends the asset,
+  cancels only below `reserve x (1 - exposure_cancel_hysteresis_pct)`, never an
+  offer younger than `exposure_cancel_min_age_blocks`, and suppresses the next
+  post instead. A tracked offer whose pair this config cannot resolve -- an
+  adopted `UNKNOWN` wallet record, or a pair since REMOVED from the file; a
+  merely DISABLED pair is still mapped and still projected -- is recorded as
+  UNQUANTIFIABLE rather than dropped, because `owned` still counts the coins it
+  holds locked. While one is live, unified refuses to add exposure on either
+  side and says so in the log; it never cancels a resting offer on its account,
+  and the reload drain clears it on the next heartbeat.
+- **`price_cancel_mode: margin` (was 282 `price_adverse` cancels).** Cancel for
+  price only when a fill at the resting price would earn less than
+  `price_cancel_edge_retain` x the edge Step 7 demands of a new offer, against
+  BOTH of Step 7's centres (the shifted ladder centre and fair value), so it
+  never cancels what the pricer would itself post nor churns an offer that still
+  earns its edge. Crossed offers are still cancelled first; favourable
+  drift never cancels. Replayed over the recorded fortnight it would have made
+  82 of the 248 witnessed price cancels at the default 0.5 -- and the literal
+  rule (1.0) fires on MORE offers than the rule it replaces, which is why 0.5
+  is the default. New cancel reasons: `expired_onchain`, `margin_breach(..)`.
+  **Read this before enabling it: the same replay fires on up to 7 of the
+  fortnight's 15 FILLED offers**, at every retain from 0.5 up
+  (`PriceCancelReplay.WhatItWouldHaveDoneToEveryOtherOffer`). The replay judges
+  one centre where the live rule needs both to fail, so 7 is an upper bound;
+  bounding the unrecorded fair centre by the 100 bps A-S rail brackets the real
+  figure at 0 to 7 at retain 0.5, and at 3 to 7 at retain 1.0. This is the
+  switch's real cost: `margin` also drops the anchor override, so a quote the
+  market drifts AWAY from is never pulled back to the touch. It is not a pure
+  reduction in wasted cancels.
+
+Out of scope and unchanged: startup sweeps, Cancel All, reload-disabled pairs,
+shutdown, every safety cancel, UTXO liberation, and the stopped-engine TTL sweep.
+### A stop can keep the offers on the book (S74)
+
+- **Stopping the engine no longer has to cancel everything.** A graceful stop
+  cancelled the whole book: a wallet-wide cancel, the retry ladder, a cancel
+  intent in `data/uncancelled.txt` and `cancel_pending` rows for the next start
+  to finish. With blocks about 97% full that leaves unconfirmed cancel spends
+  and locked coins behind every restart, and the only way to keep offers across
+  one was to hard-kill the GUI and the engine. A stop now carries a policy,
+  `cancel` or `keep`. With `keep` the engine sends no cancel of any kind (not
+  the sweep, not the ladder, not the dead man's switch), writes no cancel
+  intent, leaves every `offer_log` row as it is, disarms the dead man's switch
+  before anything else, and logs one line: how many offers were left resting,
+  on which pairs, and the soonest and latest on-chain expiry it knows of — or,
+  plainly, that they carry none. The next start re-adopts them through the
+  startup reconcile, exactly as it did after a hard kill.
+- **The GUI asks.** Stop Trading and closing the window show a prompt with three
+  choices — **Keep offers on the book**, **Cancel all offers**, **Don't stop** —
+  the number of resting offers per pair and, when the on-chain expiry is on, the
+  latest time a kept offer can stay takeable. It preselects the config default
+  and remembers nothing. An OS session end (log-off, shutdown, restart) and a
+  signal never show it: a modal box with nobody to answer would block the
+  shutdown for ever.
+- **`engine.shutdown_offers: cancel | keep`** (new optional section, default
+  `cancel`, so an upgrade changes nothing) decides every stop nobody answers:
+  a session end, SIGINT/SIGTERM, Ctrl+C in a console, a service stop, an older
+  GUI, a hand-written `shutdown.flag`. It is printed at startup, and the engine
+  warns there when `keep` is set while an enabled pair posts offers with no
+  on-chain expiry. Strict: an unknown key or value in `engine:` is a startup
+  error, because every lenient reading of a typo is a silent `cancel`. Settings
+  → Risk Management → *Stopping the Engine* edits it; the save writes that one
+  key only when the dropdown was changed, and re-reads the file first, so it
+  neither adds the key to an untouched config nor reverts a value edited on
+  disk.
+- **Protocol.** The addressed v1 stop request gains one optional line,
+  `offers=cancel|keep`. PID addressing, freshness and the truthful stop outcome
+  (#153) are unchanged, and a request without the line is byte-identical to
+  before. A line the engine cannot read does not refuse the stop: the config
+  default applies and the log says so. An engine that predates the line would
+  ignore it and cancel, so the GUI offers Keep only to an engine whose `--help`
+  advertises `shutdown.flag offers=cancel|keep`, and refuses to stop rather than
+  let a requested keep turn into a cancel.
+- **A keep stop delivered by a signal waits for the one offer it may have been
+  creating, and starts no more.** A GUI stop is read between heartbeat cycles
+  and never finds a create in flight; Ctrl+C, SIGTERM, a service stop or a
+  session end can arrive while one is outstanding, and stopping the event loop
+  there would let the wallet finish an offer nothing recorded — an orphan the
+  next start may cancel. The stop now waits for that create to land, on a timer
+  and never on the wallet, for at most one create plus one publish at their own
+  worst case (**247 s** with the shipped RPC timeouts). While it waits the
+  engine begins **no new create at all**, and cancels nothing that already
+  exists, so the wait really is one create's and not a whole ladder's.
+  **Do not hard-kill a stop that seems slow** — that wait is what keeps a
+  just-created offer from arriving at the next start as an orphan. A second
+  Ctrl+C still exits at once. If a create instead fails with *no answer* — a
+  timeout, an empty reply, a 5xx — that is not proof the wallet refused it, and
+  the keep stop now says so at error rather than reporting a clean book.
+- **What the stop report may and may not claim.** Three operator-facing
+  sentences asserted safety the code does not provide, and are now built from
+  the facts the report has already computed:
+  - the mid-cycle line ended with a flat *"No offer post was left
+    unrecorded"*, logged **unconditionally** and forty lines below the two
+    facts (`post_abandoned`, `create_outcome_unknown_`) that exist to say the
+    opposite. The contradiction was guaranteed, not incidental: a
+    `post_abandoned` stop is always a mid-cycle one, because the only path
+    that marks a post in flight runs inside the marked cycle. The reassurance
+    is now conditional on both, and the same sentence no longer implies a
+    **take** cut by the stop is recovered — a cancel is adopted from the
+    wallet's `PENDING_CANCEL` record, but a take completed after the cut is
+    booked nowhere in this engine (TODO S76 (c));
+  - *"nothing was left on the book"* was printed whenever nothing was
+    **resting**, although every `cancel_pending` offer is deliberately excluded
+    from that count — and in this repo a submitted cancel is not proof: such an
+    offer generally stays **takeable** until a maker coin is spent (24 of them
+    for 2.5 h in August, three for 13 days). The stop then disarms the dead
+    man's switch and exits, so nothing chases them until the next start. The
+    line now says so, both when the book is otherwise empty and when it is not;
+  - *"the dead man's switch is disarmed for this stop"* was flat, where
+    `engine.hpp` is careful: a cancel the switch had **already begun** holds
+    the mutex and is not recalled. The line now reads `watchdog_fired_` and
+    says which of the two happened;
+  - and *"nothing was left on the book"* survived the move. Relocating the
+    sentence to `kept_book.hpp` took it away from `post_abandoned` and
+    `create_outcome_unknown_`, which were never passed in — so a stop with a
+    completely empty `State` printed the flat all-clear **first** and only
+    then the error lines for those facts, each of which qualifies the *count*
+    (*"NOT in the count above"*) and therefore retracts nothing about the word
+    *nothing*. Weaker than the mid-cycle defect above — it needs an empty book
+    rather than following by construction — but the same shape, so it has the
+    same fix: the two facts are arguments to `describe_kept_book`, every
+    branch of it says when a create this process began is unaccounted for, and
+    a gtest reads each result.
+  Each of these sentences now lives in `kept_book.hpp`, where a gtest reads
+  exactly what the operator reads — the `engine.cpp` wiring scan strips string
+  literals and structurally cannot. That is also the limit the last item ran
+  into: the scan's `CLAIM_WORDING` backstop lists *"nothing was left on the
+  book"*, but it reads literals in `engine.cpp`, so moving the sentence out
+  moved it out of range. The replacement guard pins the **arguments** at the
+  call site, and the sentences they produce are gtests.
+- **The GUI stop prompt no longer says a cancel already in flight is untouched
+  by the choice.** It read *"neither choice changes those"*. **Keep** does send
+  nothing for them — but **Cancel all** seeds its list from every offer in
+  `State` with no `cancel_pending` filter, writes every one of those ids into
+  the cancel intent file before the first attempt, and its first attempt is the
+  wallet-wide secure sweep, which in chia 2.7.4 performs no trade-status check
+  at all: it takes the offer's cancellation coins and builds a fresh spend, so a
+  merely `PENDING_CANCEL` trade is swept and re-spent. That escalation is what
+  finally cleared the three XCH/BYC bids stuck for 13 days. (Only the per-offer
+  **retries** skip such an offer, to avoid paying a second fee for the same
+  spend; the wallet-wide leg does not.) The prompt now states the real
+  difference. In the same place, a book whose every offer is `cancel_pending`
+  was announced as *"No offers are resting on the book."* — the prompt reads
+  those rows and then diverts them out of `resting` — with every informative
+  line gated on `resting`, so the operator learned nothing else about them
+  either. Such a book is no longer called empty, and gets a line of its own.
+- **A blank `engine.shutdown_offers` is a startup error**, like every other
+  value the section cannot read. `shutdown_offers:` with nothing after it used
+  to fall through to `cancel` — the silent default this section exists to
+  prevent. An omitted or empty `engine:` section is still "not set" and still
+  means `cancel`.
+- **The documented stop latency is the real one.** `config.example.yaml` said a
+  GUI stop is *immediate* because the request is read between heartbeat cycles.
+  The clause is the reason it is **not**: the flag is read once per 5 s poll and
+  the same poll iteration then awaits the whole cycle inline. Measured over 976
+  live cycles: median 10.4 s, p90 14.2 s, 1.5% over 30 s, longest 108.7 s. The
+  paragraph now states that, and states that the GUI's own 30 s window ends in
+  `TerminateProcess` — the hard kill the same paragraph tells operators not to
+  perform — which skips the `offer_log` flush and can send an offer to the next
+  start as an orphan. The 30 s value is **unchanged in this PR** and flagged for
+  an operator decision (see the PR body).
+- **Operator notes.** Keep is for restarts. A kept offer is takeable with no
+  engine behind it — no repricing, no TTL, no dead man's switch — so use it
+  only with `strategy.offer_expiry_secs` set. **While the engine is down the
+  on-chain expiry is the only bound**: it is stamped when each offer is posted,
+  so at the live `offer_expiry_secs: 86400` an offer can stay takeable for up to
+  24 h from the moment it was posted, however long the stop lasts. What happens
+  when the engine comes back depends on `strategy.ttl_cancel_mode`:
+  with `cancel` (the default, and the only behaviour of any build before that
+  key existed — there is no value spelled `age`) the first
+  cycle cancels anything past the hard TTL — 2 × `offer_ttl_blocks`, 800 blocks
+  ≈ 4 h 10 min at the peak-height cadence of 18.75 s/block — including offers
+  whose expiry has already passed, because the reference wallet goes on
+  reporting such an offer `PENDING_ACCEPT` and keeps its coins locked until it
+  is cancelled (chia-blockchain 2.7.4, `chia/wallet/trade_manager.py`); with
+  `expire`, an offer carrying a verified expiry is **not** cancelled at the hard
+  TTL at all — it rests until its own `max_time` passes and is then retired with
+  a free local cancel about ten minutes later, so the bound is the expiry (~24 h
+  takeable, ~24 h 10 min of locked coins), not the hard TTL. Operator **Cancel
+  All** is unchanged.
+
 ## [0.10.24] — 2026-09-14 — record what happened, not what was asked for
 
 Nine merged branches, and most of them fix a record or a signal that reported a

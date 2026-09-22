@@ -79,6 +79,7 @@ add_executable(xop_tests
     test_liquidity.cpp
     test_market_allocator.cpp
     test_fee_tracker.cpp
+    test_fee_controller.cpp
     test_pnl_units.cpp
     test_pnl_tracker.cpp
     test_competitiveness_pid.cpp
@@ -104,6 +105,7 @@ add_executable(xop_tests
     test_watchdog.cpp
     test_height_source.cpp
     test_node_sync_state.cpp
+    test_node_requests.cpp
     test_dexie_probe_liveness.cpp
     test_dexie_market_ticker.cpp
     test_raw_ticker_provenance.cpp
@@ -117,6 +119,7 @@ add_executable(xop_tests
     test_pid_reachability.cpp
     test_pid_rail_latch.cpp
     test_offer_expiry.cpp
+    test_offer_min_input_coin.cpp
     test_wallet_requests.cpp
     test_stuck_tx_verdict.cpp
     test_wallet_circuit.cpp
@@ -125,6 +128,8 @@ add_executable(xop_tests
     test_shutdown_flag.cpp
     test_cancel_escalation.cpp
     test_rpc_retry_policy.cpp
+    test_price_cancel_replay.cpp
+    test_stop_offers_policy.cpp
 )
 
 target_link_libraries(xop_tests

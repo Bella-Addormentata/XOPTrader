@@ -73,6 +73,7 @@
 #include "xop/risk/peg_suspension.hpp"
 #include "xop/config_reload.hpp"
 #include "xop/util/process_identity.hpp"
+#include "xop/util/stop_offers_policy.hpp"
 #include "xop/strategy/bbo_sanity.hpp"
 #include "xop/strategy/pace_controller.hpp"
 #include "xop/strategy/no_loss_floor.hpp"
@@ -669,7 +670,13 @@ public:
     ///
     /// 1. Sets the bot status to ShuttingDown.
     /// 2. Cancels the polling timer.
-    /// 3. Cancels all outstanding offers (on-chain, secure).
+    /// 3. Cancels all outstanding offers (on-chain, secure) -- OR, [S74] when
+    ///    the stop policy is "keep", cancels nothing, writes no cancel intent,
+    ///    disarms the dead man's switch and reports what was left resting.
+    ///    The policy is the stop request's (a shutdown.flag "offers=" line,
+    ///    latched by evaluate_shutdown_flag before it calls this) or else
+    ///    engine.shutdown_offers; a signal carries none, so Ctrl+C and SIGTERM
+    ///    follow the config default (xop/util/stop_offers_policy.hpp).
     /// 4. Closes all RPC connections.
     /// 5. Shuts down the Prometheus exporter.
     /// 6. Sets the bot status to Stopped.
@@ -1174,6 +1181,99 @@ private:
     /// shutdown() has already spawned the continuation that owns teardown.
     [[nodiscard]] bool boot_stop_checkpoint(const char* where);
 
+    // -- [S74 2026-09-20] A stop that KEEPS the resting offers ----------------
+    //
+    // What a stop does with the book is a policy: the stop request's, or else
+    // engine.shutdown_offers (xop/util/stop_offers_policy.hpp). shutdown()
+    // keeps its signature -- a signal handler calls it with no arguments, and
+    // the wiring scans find it by that signature -- so the request's policy
+    // travels in this atomic: evaluate_shutdown_flag() stores what the honoured
+    // flag said immediately before it calls shutdown(), and a signal leaves it
+    // Unspecified. An atomic because shutdown() runs on whichever thread the
+    // signal arrives on.
+    std::atomic<util::StopOffersRequest> stop_offers_request_{
+        util::StopOffersRequest::Unspecified};
+
+    /// Set by shutdown(), before anything else, when the stop keeps the book;
+    /// never cleared. watchdog_cancel_book() reads it under its mutex and sends
+    /// nothing once it is set, which is what makes "the dead man's switch does
+    /// not fire during a keep stop" true for a tick that had already passed
+    /// the watchdog_stop_ check -- and for every other route into that
+    /// function. A cancel the switch had ALREADY started before the operator
+    /// asked is not recalled: it holds the mutex, and it was a real firing.
+    std::atomic<bool> offers_kept_on_stop_{false};
+
+    /// Set by poll_loop_coro once boot has restored offer_log's pending rows
+    /// into State. Until then State says nothing about the book, and a keep
+    /// stop reports exactly that instead of an empty book. ioc_ thread only.
+    bool book_restored_from_offer_log_{false};
+
+    /// True while poll_loop_coro is inside a heartbeat cycle. Read only by the
+    /// keep report, to say when a SIGNAL-delivered keep stop cut a cycle short
+    /// (a shutdown.flag stop is read between cycles and never does). ioc_
+    /// thread only.
+    bool heartbeat_in_flight_{false};
+
+    /// [review #165] True while ONE create_offer is outstanding and the offer it
+    /// makes is not yet in State. Set by OfferManager (offer_manager.cpp
+    /// PostingMark, wired in the constructor with set_posting_in_flight_flag),
+    /// because the engine cannot see inside post_quotes -- the only call through
+    /// which it creates a maker offer. A keep stop waits (bounded,
+    /// util::keep_stop_drain_step) while this is set, so a create the wallet is
+    /// still answering lands in State instead of becoming an orphan the next
+    /// boot may cancel.
+    ///
+    /// [review round 3] Deliberately NOT one mark per post_quotes call: a
+    /// pair's ladder is up to 2 x num_tiers creates (12 live), so a stop would
+    /// have to outwait all of them, and the 60 s budget it had did not. Every
+    /// offer created earlier in the same ladder is already in State, and the
+    /// keep stop's flush gives each of those an offer_log row. ioc_ thread only.
+    bool posting_in_flight_{false};
+
+    /// [review #165, round 4] True once a create has ended with NO ANSWER in a
+    /// way that does not prove the wallet refused it (a timeout, an empty or
+    /// garbled reply, a 5xx, a 2xx whose body would not parse --
+    /// rpc::request_possibly_submitted). Set by OfferManager, wired in the
+    /// constructor with set_create_outcome_unknown_flag.
+    ///
+    /// It is NOT the drain flag. That one says a create is outstanding now, and
+    /// is cleared by RAII whichever way the create ends -- including a throw,
+    /// where holding it would only burn the budget, because nothing is left for
+    /// the io_context to wait for. This one records that the window closed
+    /// WITHOUT proving where the offer went, so the keep stop reports a
+    /// possibly-untracked offer instead of clean success.
+    ///
+    /// Never cleared: only a reconcile against the wallet could retire the
+    /// doubt, and the keep path deliberately sends nothing. ioc_ thread only.
+    bool create_outcome_unknown_{false};
+
+    /// [review round 3] How long that wait may last: one create's worst case
+    /// plus the publish that follows it before the offer is in State -- two
+    /// rpc_post calls, each up to request_timeout x attempts plus backoff.
+    ///
+    /// Computed ONCE, in the constructor, from the clients' own numbers. Not in
+    /// shutdown(): a POSIX signal can run shutdown() on any thread, and reading
+    /// the config there would mean constructing std::string/fs::path members in
+    /// a signal handler. The default below is the value for the shipped
+    /// timeouts, so even a build that never reaches that assignment waits the
+    /// right amount rather than a zero budget that abandons every create.
+    std::uint64_t keep_stop_drain_budget_ms_{util::keep_stop_drain_budget_ms(
+        util::kShippedRpcWorstCaseMs, util::kShippedRpcWorstCaseMs)};
+
+    /// The keep path: mirror State into offer_log for any offer that has no row
+    /// yet, then log the one line that says what was left resting
+    /// (execution/kept_book.hpp). Deliberately NOT a coroutine -- it cannot
+    /// await an RPC, so it cannot send one: no cancel, no wallet read, nothing
+    /// that a wedged wallet could hold up. It never writes the cancel intent
+    /// file and never changes an existing offer_log row.
+    ///
+    /// [review #165] `waited_for_post_ms` is how long the stop waited for an
+    /// in-flight post to land (0: none was in flight); `post_abandoned` is true
+    /// when one was STILL in flight at the budget, and the line then says an
+    /// offer may have been left unrecorded.
+    void report_offers_kept_on_stop(std::uint64_t waited_for_post_ms,
+                                    bool          post_abandoned);
+
     [[nodiscard]] bool asset_peg_suspended(const std::string& asset_id) const;
     [[nodiscard]] bool pair_peg_suspended(const PairConfig& pc) const;
     asio::awaitable<void> step_observe_asset_pegs(BlockHeight block_height);
@@ -1306,6 +1406,52 @@ private:
     // the wallet reports the trade live AND the full node shows every maker
     // coin unspent.  The decisions live in execution/cancel_escalation.hpp.
     asio::awaitable<void> escalate_stuck_cancels(BlockHeight block);
+
+    // -- [S67 2026-09-20] Fee controller feedback ------------------------------
+    //
+    // The closed loop's engine glue (strategy/fee_controller.hpp holds every
+    // decision).  All of it is inert unless fees.controller_enabled.
+    //
+    /// Per-heartbeat: emit censored observations for ticketed spends pending
+    /// past the target delay, retire tickets whose cancel left State, poll ONE
+    /// pending take's status, send the budget-bound alert.  Runs beside
+    /// escalate_stuck_cancels, above the Step 7/8 gate chain.
+    asio::awaitable<void> fee_feedback_sweep(BlockHeight block);
+    /// Log (rate-limited) and publish one controller change.
+    void fee_feedback_note(const strategy::fee::Change& change, BlockHeight block);
+    /// A wallet-level signal: pending_change persisting, a sent_to fee
+    /// refusal, a force-delete.
+    void fee_feedback_signal(strategy::fee::Signal signal, BlockHeight block);
+    /// A take was submitted at `fee`: open its ticket.
+    void fee_feedback_track_take(const std::string& trade_id, std::uint64_t fee,
+                                 BlockHeight block);
+    /// OfferManager's cancel observer: the wallet accepted a secure cancel of
+    /// `offer_id` at `fee`.  Opens (or replaces) its ticket with the fee
+    /// really paid, at the current height.
+    void fee_feedback_track_cancel(const std::string& offer_id, std::uint64_t fee);
+    /// Step 2 wrote the wallet's terminal verdict for `offer_id`.  Only a
+    /// wallet-verified CANCELLED is a confirmation; FAILED drops the ticket.
+    void fee_feedback_on_cancel_verdict(const std::string& offer_id,
+                                        BlockHeight        observed_block,
+                                        bool               wallet_says_cancelled);
+    /// What cancelling `ids` cost, for the fee budget: ids.size() x legacy_fee
+    /// with the controller off (unchanged), the per-offer class fees with it on.
+    [[nodiscard]] std::uint64_t cancel_fees_paid(const std::vector<std::string>& ids,
+                                                 std::uint64_t legacy_fee) const;
+    /// Spends of ours awaiting a verdict, by offer id (cancels) or trade id
+    /// (takes), opened at the accepted RPC with the fee really paid.  In
+    /// memory: a restart forgets them, and a cancel adopted at boot (fee
+    /// unknown) never gets one.
+    std::unordered_map<std::string, strategy::fee::Ticket> fee_tickets_;
+    /// [review #163 r2] The height the engine is working at NOW: the startup
+    /// height while the startup reconcile runs, then each cycle's own height,
+    /// stamped at the TOP of on_new_block_coro.  last_block_ cannot serve: it
+    /// is stored when a cycle ends, so it lags one cycle and is 0 at boot.
+    /// 0 means unknown, and a cancel observed then gets no ticket.  Engine
+    /// strand only, like fee_tickets_.
+    BlockHeight fee_now_block_{0};
+    strategy::fee::ChangeLogGate fee_change_log_{};
+
     /// Send the queued CancelUnresolved alert when its window is open, and
     /// mark exactly the offers it names as alerted.
     void flush_cancel_unresolved_alerts();

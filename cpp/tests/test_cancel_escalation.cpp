@@ -10,6 +10,7 @@
 
 #include <xop/execution/cancel_escalation.hpp>
 #include <xop/execution/coin_manager.hpp>
+#include <xop/strategy/fee_controller.hpp>
 #include <xop/types.hpp>
 
 #include <nlohmann/json.hpp>
@@ -498,6 +499,75 @@ TEST(WalletCancelState, FromIntOrName)
               Wallet::Unknown);
     EXPECT_EQ(ex::wallet_cancel_state_from_record(nlohmann::json::object()),
               Wallet::Unknown);
+}
+
+TEST(WalletCancelState, ConfirmedHeightFromRecord)
+{
+    // [review #163 r5] The height a trade record CONFIRMED at.  The fee
+    // controller's take poll reads one take per heartbeat, so the heartbeat
+    // that notices is not the height the spend landed at.
+    constexpr std::uint32_t kFallback = 9'319'300U;
+    EXPECT_EQ(ex::confirmed_height_from_record(
+                  nlohmann::json{{"confirmed_at_index", 9'319'293}}, kFallback),
+              9'319'293U)
+        << "a stated height must be used, NOT the polling heartbeat";
+    EXPECT_EQ(ex::confirmed_height_from_record(
+                  nlohmann::json::parse(R"({"confirmed_at_index": 9319293})"), kFallback),
+              9'319'293U);
+    // "Not stated" in each of its forms falls back to the caller's height.
+    EXPECT_EQ(ex::confirmed_height_from_record(nlohmann::json::object(), kFallback), kFallback);
+    EXPECT_EQ(ex::confirmed_height_from_record(
+                  nlohmann::json{{"confirmed_at_index", 0}}, kFallback), kFallback)
+        << "0 is the wallet's own 'still pending'";
+    EXPECT_EQ(ex::confirmed_height_from_record(
+                  nlohmann::json{{"confirmed_at_index", -5}}, kFallback), kFallback);
+    EXPECT_EQ(ex::confirmed_height_from_record(
+                  nlohmann::json{{"confirmed_at_index", 9'319'293.0}}, kFallback), kFallback);
+    EXPECT_EQ(ex::confirmed_height_from_record(
+                  nlohmann::json{{"confirmed_at_index", "9319293"}}, kFallback), kFallback);
+    EXPECT_EQ(ex::confirmed_height_from_record(
+                  nlohmann::json{{"confirmed_at_index", 4'294'967'296LL}}, kFallback), kFallback)
+        << "past what a BlockHeight holds";
+    EXPECT_EQ(ex::confirmed_height_from_record(
+                  nlohmann::json{{"confirmed_at_index", 18'446'744'073'709'551'615ULL}},
+                  kFallback),
+              kFallback);
+    EXPECT_EQ(ex::confirmed_height_from_record(nlohmann::json(42), kFallback), kFallback);
+    // The boundary is usable.
+    EXPECT_EQ(ex::confirmed_height_from_record(
+                  nlohmann::json{{"confirmed_at_index", 4'294'967'295LL}}, kFallback),
+              4'294'967'295U);
+}
+
+TEST(WalletCancelState, AConfirmedTakeIsAgedFromItsConfirmationHeightNotThePoll)
+{
+    // [review #163 r5] The composition the engine performs, at numbers where
+    // the two answers DIFFER -- a test that only exercised
+    // confirmed_at_index == block would prove nothing.
+    //
+    // A take submitted at 9'319'290 confirmed at 9'319'293 (3 heights, on
+    // target).  A second ticketed take held the single poll slot, so the
+    // record was not read until 9'319'300.
+    namespace fee = xop::strategy::fee;
+    const fee::Ticket t{fee::ActionClass::Take, 9'319'290U, 1.5, 0U, false, 0U};
+    const nlohmann::json record{{"status", "CONFIRMED"},
+                                {"confirmed_at_index", 9'319'293}};
+    constexpr std::uint32_t kPolledAt = 9'319'300U;
+
+    EXPECT_EQ(fee::confirmation_delay(t, ex::confirmed_height_from_record(record, kPolledAt)),
+              3U);
+    EXPECT_EQ(fee::ticket_age(t, kPolledAt), 10U)
+        << "the old shape: the poll's own lateness, charged to the fee";
+
+    // No stated height: the caller's heartbeat, which is the old behaviour.
+    const nlohmann::json pending{{"status", "PENDING_CONFIRM"}};
+    EXPECT_EQ(fee::confirmation_delay(t, ex::confirmed_height_from_record(pending, kPolledAt)),
+              10U);
+
+    // A height regression -- a reorg that rewound the peak below the
+    // submission -- clamps to 0 rather than wrapping to four billion.
+    const nlohmann::json early{{"confirmed_at_index", 9'319'280}};
+    EXPECT_EQ(fee::confirmation_delay(t, ex::confirmed_height_from_record(early, kPolledAt)), 0U);
 }
 
 // ===========================================================================

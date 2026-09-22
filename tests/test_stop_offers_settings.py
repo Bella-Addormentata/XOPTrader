@@ -1,0 +1,475 @@
+"""[S74 2026-09-20] Settings Save and engine.shutdown_offers: patch one key, touch nothing else.
+
+The Settings writer serialises the config it loaded at startup, which is how a
+save on 2026-08-30 deleted a key added on disk after launch and reverted two
+others. The Risk tab's new "Offers when nobody is asked" dropdown must not be
+one more way to do that, and an UPGRADE must change nothing: a config with no
+``engine`` section has none after an untouched save.
+
+These tests drive the real SettingsWidget -- load_config, a dropdown change,
+save_config -- and then read what hit disk, both as parsed YAML (values) and as
+TEXT (key order and comments). Always on tmp copies of config.example.yaml,
+never the repo config.yaml: load_config merges a sibling secrets.yaml.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import sys
+from pathlib import Path
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+_REPO = Path(__file__).resolve().parents[1]
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
+
+import pytest  # noqa: E402
+import yaml  # noqa: E402
+
+pytest.importorskip("PySide6")
+
+from PySide6.QtCore import QCoreApplication, QEvent  # noqa: E402
+from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
+
+from gui import stop_offers  # noqa: E402
+from gui.services.config_split import RUAMEL_AVAILABLE  # noqa: E402
+from gui.widgets.settings import SettingsWidget  # noqa: E402
+
+#: Key order and comments survive a save only through the ruamel round-trip
+#: writer; without it the writer falls back to PyYAML and says so. The VALUE
+#: tests below hold either way.
+requires_ruamel = pytest.mark.skipif(
+    not RUAMEL_AVAILABLE, reason="ruamel.yaml not installed")
+
+KEEP_INDEX = stop_offers.POLICIES.index("keep")
+CANCEL_INDEX = stop_offers.POLICIES.index("cancel")
+
+
+@pytest.fixture(scope="session")
+def qapp():
+    app = QApplication.instance() or QApplication([])
+    yield app
+
+
+def _no_modal_dialog(*_args, **_kwargs):
+    raise AssertionError("an unexpected modal dialog would block this test")
+
+
+@pytest.fixture
+def panel(qapp, monkeypatch):
+    """A SettingsWidget that touches nothing outside the test's tmp dir."""
+    monkeypatch.setattr(SettingsWidget, "_refresh_suggested_targets", lambda self: None)
+    monkeypatch.setattr(SettingsWidget, "_save_appearance_settings", lambda self: None)
+    monkeypatch.setattr(QMessageBox, "warning", staticmethod(_no_modal_dialog))
+    monkeypatch.setattr(QMessageBox, "critical", staticmethod(_no_modal_dialog))
+    w = SettingsWidget()
+    yield w
+    # Really deleted, not deleteLater() alone: see tests/
+    # test_stop_offers_window.py _destroy for what a leaked widget costs the
+    # tests that run after this file.
+    w.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    qapp.processEvents()
+
+
+def _strip_engine_section(text: str) -> str:
+    """config.example.yaml without its ``engine:`` section and its comment
+    block -- the shape of every config written before the key existed."""
+    lines = text.splitlines(keepends=True)
+    start = next(i for i, line in enumerate(lines) if line.startswith("# --- engine:"))
+    end = next(i for i, line in enumerate(lines) if line.startswith("# --- depeg:"))
+    assert start < end
+    return "".join(lines[:start] + lines[end:])
+
+
+@pytest.fixture
+def old_cfg(tmp_path):
+    """A config from before the key existed: no ``engine`` section at all."""
+    dest = tmp_path / "config.yaml"
+    text = (_REPO / "config.example.yaml").read_text(encoding="utf-8")
+    dest.write_text(_strip_engine_section(text), encoding="utf-8")
+    assert "engine" not in yaml.safe_load(dest.read_text(encoding="utf-8"))
+    return dest
+
+
+@pytest.fixture
+def new_cfg(tmp_path):
+    dest = tmp_path / "config.yaml"
+    shutil.copyfile(_REPO / "config.example.yaml", dest)
+    return dest
+
+
+def _disk(path: Path) -> dict:
+    return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
+def _top_level_keys(path: Path) -> list[str]:
+    """Top-level keys in FILE order -- yaml.safe_load would hide a reorder."""
+    keys = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if (line and not line[0].isspace() and line[0] not in "#-"
+                and ":" in line):
+            keys.append(line.split(":", 1)[0])
+    return keys
+
+
+def _control_save(panel, path: Path) -> Path:
+    """The same config, loaded and saved with the dropdown UNTOUCHED, beside
+    *path*. A Settings save normalises a few things that have nothing to do
+    with this key (an unticked revive_market drops its ``false``); comparing
+    against this control, not against the pristine file, isolates what the
+    dropdown did."""
+    control_dir = path.parent / "control"
+    control_dir.mkdir()
+    control = control_dir / path.name
+    shutil.copyfile(path, control)
+    _load(panel, control)
+    assert panel.save_config() is True
+    return control
+
+
+def _load(panel, path: Path) -> None:
+    panel.load_config(str(path))
+    assert Path(panel._config_path) == path.resolve(), "the config did not load"
+
+
+def _touch_something_else(panel) -> None:
+    """Make the page dirty through a field that has nothing to do with stops."""
+    panel._q_max.setValue(panel._q_max.value() + 1)
+
+
+# --------------------------------------------------------------------------- #
+# The shipped example documents the key, at its default
+# --------------------------------------------------------------------------- #
+
+def _engine_block() -> str:
+    text = (_REPO / "config.example.yaml").read_text(encoding="utf-8")
+    return text[text.index("# --- engine:"):text.index("# --- depeg:")]
+
+
+def test_the_example_config_documents_the_key_at_its_default():
+    raw = _disk(_REPO / "config.example.yaml")
+    assert raw["engine"] == {"shutdown_offers": "cancel"}
+    block = _engine_block()
+    for must_say in ("offer_expiry_secs", "dead man", "log-off", "keep", "cancel"):
+        assert must_say in block, f"the engine: comment block no longer mentions {must_say!r}"
+
+
+def test_the_keep_bullet_states_the_real_stop_latency_from_the_code_itself():
+    """[review #165, round 4 -- Copilot 4058780344] The bullet said a keep stop
+    "takes about a second". True of a GUI stop, which is read between cycles;
+    a SIGNAL-delivered one waits for an in-flight create, and the bound is the
+    code's own (``util::keep_stop_drain_budget_ms``, 247 s as shipped).
+
+    Pinned AGAINST THE HEADER, not against a copied constant: a number in
+    documentation is a claim, and this one drifts silently if the client
+    timeouts change. The header's own ``static_assert`` is the source."""
+    header = (_REPO / "cpp" / "include" / "xop" / "util"
+              / "stop_offers_policy.hpp").read_text(encoding="utf-8")
+    pin = re.search(
+        r"static_assert\(\s*keep_stop_drain_budget_ms\("
+        r"kShippedRpcWorstCaseMs,\s*kShippedRpcWorstCaseMs\)\s*==\s*([\d']+)\)",
+        header)
+    assert pin, "the shipped drain budget is no longer pinned in the header"
+    seconds = int(pin.group(1).replace("'", "")) // 1000
+    block = _engine_block()
+    assert f"{seconds} seconds" in block, (
+        f"the engine: comment block does not state the {seconds} s a "
+        "signal-delivered keep stop may wait")
+    assert "about a second" not in block, (
+        "the keep bullet still claims a keep stop takes about a second, which "
+        "is false for the one stop that can find a create in flight")
+    # The cancel-path residue is the comparison that made the bullet true, and
+    # it must survive the rewrite: a kept offer's OWN coins stay locked.
+    for must_say in ("uncancelled.txt", "cancel_pending", "coins locked"):
+        assert must_say in block, (
+            f"the keep bullet no longer says {must_say!r}: what a keep stop "
+            "avoids is the cancelling stop's residue, not locked coins")
+    # ...and the instruction the old text invited an operator to break. This
+    # repo has already had an installer hard-kill a running bot and leave the
+    # offers resting.
+    assert "DO NOT HARD-KILL" in block and "taskkill /F" in block, (
+        "the keep bullet no longer tells the operator not to kill a slow "
+        "stop -- which is exactly the wait that keeps a just-created offer "
+        "from becoming an orphan the next start may cancel")
+
+
+def test_no_document_names_a_ttl_cancel_mode_value_that_exists_in_no_build():
+    """[review] ``ttl_cancel_mode: age`` was named in a paragraph headed
+    "exactly", in three documents. That value exists in NO build: the key is
+    added by open PR #164 and spelled ``cancel | expire``, with ``cancel`` the
+    default. The mistake is the kind an operator acts on -- they would edit the
+    live config to a value the strict parser rejects, or read the default as
+    something other than what it is.
+
+    Checked across every document that carries the claim, because this round's
+    repeated failure has been a correction that missed a copy."""
+    offenders = []
+    for name in ("config.example.yaml", "CHANGELOG.md", "TODO.md", "README.md"):
+        path = _REPO / name
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8")
+        for pattern in (r"ttl_cancel_mode:\s*age\b", r"ttl_cancel_mode`?:?\s*`?age`"):
+            if re.search(pattern, text):
+                offenders.append(name)
+    assert not offenders, (
+        "these documents name strategy.ttl_cancel_mode: age, a value no build "
+        "accepts (#164 spells the key cancel | expire, default cancel): %r"
+        % (sorted(set(offenders)),))
+
+
+def test_the_keep_bullet_does_not_call_a_gui_stop_immediate():
+    """[review] THE PARAGRAPH WAS WRONG ABOUT THE PATH OPERATORS ACTUALLY USE.
+
+    It said a GUI stop "is immediate: it is read between heartbeat cycles, so
+    it never finds an offer being created". The clause offered as the
+    justification is the reason it is NOT immediate: ``check_shutdown_flag()``
+    runs once per 5 s poll iteration and the SAME iteration then ``co_await``s
+    the whole heartbeat cycle inline (``cpp/src/engine.cpp``), so a request
+    arriving just after a cycle starts is not read until that cycle ends.
+    Measured over 976 live cycles on 2026-09-21: median 10.4 s, p90 14.2 s,
+    1.5% over 30 s, longest 108.7 s."""
+    block = _engine_block()
+    assert "is\n#           immediate" not in block and " is immediate" not in block, (
+        "the keep bullet calls a GUI stop immediate again -- the flag is read "
+        "once per poll and only between cycles, which bounds the latency by a "
+        "whole heartbeat cycle")
+    for must_say in ("NOT instant", "once per 5 s poll", "108.7 s"):
+        assert must_say in block, (
+            f"the keep bullet no longer states {must_say!r}: an operator told "
+            "the stop is immediate will read a 30 s wait as a hang")
+
+
+def test_the_keep_bullet_discloses_the_guis_own_hard_kill():
+    """...and the GUI performs the very hard kill the paragraph forbids.
+
+    ``_GRACEFUL_STOP_WAIT_S`` seconds after writing ``shutdown.flag`` the GUI
+    calls ``proc.terminate()`` -- ``TerminateProcess`` on Windows. A killed
+    stop never reaches ``report_offers_kept_on_stop``, so the ``offer_log``
+    flush does not run and an offer with no row yet arrives at the next start
+    as an orphan. Pinned against the GUI's own constant, not a copied number:
+    if the window is retuned, this documentation must move with it."""
+    from gui.services import engine_bridge
+
+    wait_s = engine_bridge._GRACEFUL_STOP_WAIT_S
+    block = _engine_block()
+    assert f"{wait_s} SECONDS" in block or f"{wait_s} seconds" in block, (
+        f"the keep bullet does not state the GUI's own {wait_s} s stop window, "
+        "after which it hard-kills the engine it just asked to stop")
+    for must_say in ("_GRACEFUL_STOP_WAIT_S", "TerminateProcess", "offer_log flush",
+                     "ORPHAN"):
+        assert must_say in block, (
+            f"the keep bullet no longer says {must_say!r}: the operator is "
+            "told not to hard-kill a slow stop while the GUI does exactly "
+            "that, and the kill skips the flush that makes re-adoption clean")
+
+
+# --------------------------------------------------------------------------- #
+# An upgrade changes nothing
+# --------------------------------------------------------------------------- #
+
+def test_the_dropdown_shows_cancel_for_a_config_without_the_key(panel, old_cfg):
+    _load(panel, old_cfg)
+    assert panel._shutdown_offers.currentIndex() == CANCEL_INDEX
+    assert panel._populated_shutdown_offers is None
+
+
+def test_an_untouched_save_does_not_add_the_section(panel, old_cfg):
+    _load(panel, old_cfg)
+    _touch_something_else(panel)
+    assert panel.save_config() is True
+
+    assert "engine" not in _disk(old_cfg), (
+        "a Settings save added engine.shutdown_offers to a config whose operator "
+        "never touched the dropdown")
+
+
+@requires_ruamel
+def test_an_untouched_save_keeps_every_section_where_it_was(panel, old_cfg):
+    keys_before = _top_level_keys(old_cfg)
+    _load(panel, old_cfg)
+    _touch_something_else(panel)
+    assert panel.save_config() is True
+    assert _top_level_keys(old_cfg) == keys_before
+
+
+def test_loading_is_not_an_edit(panel, new_cfg):
+    """Populating the dropdown must not look like the operator changing it.
+
+    [mutation check 2026-09-20] The first version asserted ``_dirty is False``
+    after loading the shipped example -- whose policy is ``cancel``, the
+    dropdown's initial index, so nothing fired at all; and load_config clears
+    the dirty flags afterwards anyway. With the dropdown taken out of the
+    signal-blocking list it stayed green. What an unblocked dropdown really does
+    is emit config_changed MID-POPULATION, with half the page still holding the
+    previous config -- so load a ``keep`` config (the index moves) and count."""
+    new_cfg.write_text(
+        new_cfg.read_text(encoding="utf-8").replace(
+            "shutdown_offers: cancel", "shutdown_offers: keep"),
+        encoding="utf-8")
+    emitted = []
+    panel.config_changed.connect(lambda _cfg: emitted.append(1))
+    _load(panel, new_cfg)
+
+    assert panel._shutdown_offers.currentIndex() == KEEP_INDEX
+    assert emitted == [], "populating the dropdown emitted config_changed"
+    assert panel._dirty is False, "populating the dropdown counted as an edit"
+
+
+# --------------------------------------------------------------------------- #
+# A change writes one key and nothing else
+# --------------------------------------------------------------------------- #
+
+def test_choosing_keep_writes_exactly_that_key(panel, old_cfg):
+    control = _control_save(panel, old_cfg)
+
+    _load(panel, old_cfg)
+    assert panel._dirty is False
+    panel._shutdown_offers.setCurrentIndex(KEEP_INDEX)
+    assert panel._dirty is True, "changing the dropdown must enable Save"
+    assert panel.save_config() is True
+
+    after = _disk(old_cfg)
+    engine_section = after.pop("engine", None)
+    assert engine_section == {"shutdown_offers": "keep"}
+    assert after == _disk(control), (
+        "the save changed something other than engine.shutdown_offers")
+
+
+@requires_ruamel
+def test_choosing_keep_appends_the_section_and_moves_nothing(panel, old_cfg):
+    control = _control_save(panel, old_cfg)
+    _load(panel, old_cfg)
+    panel._shutdown_offers.setCurrentIndex(KEEP_INDEX)
+    assert panel.save_config() is True
+
+    # A NEW top-level section is appended; every existing line keeps its place.
+    assert _top_level_keys(old_cfg) == _top_level_keys(control) + ["engine"]
+    control_lines = control.read_text(encoding="utf-8").splitlines()
+    saved_lines = old_cfg.read_text(encoding="utf-8").splitlines()
+    assert saved_lines[:len(control_lines)] == control_lines
+    assert [line for line in saved_lines[len(control_lines):] if line.strip()] == [
+        "engine:", "  shutdown_offers: keep"]
+
+
+def test_changing_an_existing_key_changes_only_that_value(panel, new_cfg):
+    control = _control_save(panel, new_cfg)
+    _load(panel, new_cfg)
+    panel._shutdown_offers.setCurrentIndex(KEEP_INDEX)
+    assert panel.save_config() is True
+
+    after = _disk(new_cfg)
+    assert after["engine"] == {"shutdown_offers": "keep"}
+    after["engine"] = {"shutdown_offers": "cancel"}
+    assert after == _disk(control)
+
+
+@requires_ruamel
+def test_changing_an_existing_key_keeps_its_place_and_its_comments(panel, new_cfg):
+    control = _control_save(panel, new_cfg)
+    _load(panel, new_cfg)
+    panel._shutdown_offers.setCurrentIndex(KEEP_INDEX)
+    assert panel.save_config() is True
+
+    control_lines = control.read_text(encoding="utf-8").splitlines()
+    saved_lines = new_cfg.read_text(encoding="utf-8").splitlines()
+    assert len(saved_lines) == len(control_lines)
+    changed = [(old, new) for old, new in zip(control_lines, saved_lines) if old != new]
+    assert len(changed) == 1, f"more than the one line changed: {changed}"
+    old, new = changed[0]
+    assert old.split("#")[0].rstrip() == "  shutdown_offers: cancel"
+    assert new.split("#")[0].rstrip() == "  shutdown_offers: keep"
+    assert "#" in old and new.split("#", 1)[1] == old.split("#", 1)[1], (
+        "the key's trailing comment was lost")
+    # ...and the comment block that documents the section is still above it.
+    text = new_cfg.read_text(encoding="utf-8")
+    assert text.index("# --- engine:") < text.index("\nengine:\n")
+
+
+def test_a_second_save_does_not_reapply_the_first(panel, new_cfg):
+    """After a save the page's baseline is what hit disk. If the operator then
+    edits the file by hand and saves the page again untouched, the hand edit
+    survives."""
+    _load(panel, new_cfg)
+    panel._shutdown_offers.setCurrentIndex(KEEP_INDEX)
+    assert panel.save_config() is True
+    assert _disk(new_cfg)["engine"]["shutdown_offers"] == "keep"
+
+    text = new_cfg.read_text(encoding="utf-8")
+    new_cfg.write_text(text.replace("shutdown_offers: keep", "shutdown_offers: cancel"),
+                       encoding="utf-8")
+    _touch_something_else(panel)
+    assert panel.save_config() is True
+    assert _disk(new_cfg)["engine"]["shutdown_offers"] == "cancel"
+    assert panel._shutdown_offers.currentIndex() == CANCEL_INDEX, (
+        "the page still shows a value the file no longer has")
+
+
+# --------------------------------------------------------------------------- #
+# The lost-update shape: the file changed on disk after the page loaded
+# --------------------------------------------------------------------------- #
+
+def test_a_value_added_on_disk_after_load_survives_an_untouched_save(panel, old_cfg):
+    _load(panel, old_cfg)
+    with open(old_cfg, "a", encoding="utf-8") as fh:
+        fh.write("\nengine:\n  shutdown_offers: keep\n")
+    _touch_something_else(panel)
+    assert panel.save_config() is True
+
+    assert _disk(old_cfg)["engine"] == {"shutdown_offers": "keep"}, (
+        "the save reverted an engine.shutdown_offers edited on disk after the "
+        "page loaded -- the 2026-08-30 lost update, again")
+    assert panel._shutdown_offers.currentIndex() == KEEP_INDEX
+
+
+def test_another_key_in_the_section_survives_a_changed_dropdown(panel, new_cfg):
+    """The engine section has one key today. The save must not be what makes a
+    second one impossible."""
+    _load(panel, new_cfg)
+    text = new_cfg.read_text(encoding="utf-8")
+    new_cfg.write_text(
+        text.replace("  shutdown_offers: cancel",
+                     "  future_key: 7\n  shutdown_offers: cancel"),
+        encoding="utf-8")
+    panel._shutdown_offers.setCurrentIndex(KEEP_INDEX)
+    assert panel.save_config() is True
+
+    engine = _disk(new_cfg)["engine"]
+    assert engine == {"future_key": 7, "shutdown_offers": "keep"}
+    assert list(engine) == ["future_key", "shutdown_offers"]
+
+
+def test_an_operator_edit_beats_a_disk_edit_and_only_for_that_key(panel, new_cfg):
+    _load(panel, new_cfg)                                   # disk: cancel
+    panel._shutdown_offers.setCurrentIndex(KEEP_INDEX)      # operator: keep
+    assert panel.save_config() is True
+    assert _disk(new_cfg)["engine"]["shutdown_offers"] == "keep"
+
+    panel._shutdown_offers.setCurrentIndex(CANCEL_INDEX)    # operator: back to cancel
+    assert panel.save_config() is True
+    assert _disk(new_cfg)["engine"]["shutdown_offers"] == "cancel"
+
+
+# --------------------------------------------------------------------------- #
+# The YAML editor path
+# --------------------------------------------------------------------------- #
+
+def test_a_policy_changed_in_the_yaml_editor_is_saved(panel, old_cfg, monkeypatch):
+    """Load from Editor populates the page from the EDITOR's text. The baseline
+    must stay the config on disk, or the editor's change reads as untouched and
+    a Save silently drops it."""
+    _load(panel, old_cfg)
+    edited = _disk(old_cfg)
+    edited["engine"] = {"shutdown_offers": "keep"}
+    panel._yaml_editor.setPlainText(yaml.safe_dump(edited, sort_keys=False))
+    monkeypatch.setattr(QMessageBox, "question", staticmethod(
+        lambda *a, **k: QMessageBox.StandardButton.Yes))
+    panel._on_load_from_editor()
+
+    assert panel._shutdown_offers.currentIndex() == KEEP_INDEX
+    assert panel.save_config() is True
+    assert _disk(old_cfg)["engine"] == {"shutdown_offers": "keep"}
