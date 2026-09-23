@@ -11602,8 +11602,14 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 if (rc == 0) {
                     spdlog::info("[Engine] Wallet service restart initiated");
                 } else {
+                    // A command that failed restarted nothing: the next
+                    // attempt keeps this one's budget instead of doubling it.
+                    execution::record_failed_wallet_restart(wallet_sync_watch_);
                     spdlog::error("[Engine] Wallet service restart failed "
-                                  "(rc={})", rc);
+                                  "(rc={}); {} failed attempt(s) since the "
+                                  "wallet was last synced -- the next attempt "
+                                  "keeps the same budget", rc,
+                                  wallet_sync_watch_.failed_restarts);
                 }
             }
             co_return;

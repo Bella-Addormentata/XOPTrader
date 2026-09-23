@@ -177,6 +177,23 @@ def test_every_sync_reading_reaches_the_watch() -> None:
     assert read_at < observed_at < first_return
 
 
+def test_a_failed_restart_command_takes_back_its_backoff() -> None:
+    """Review, PR #170: the failure branch of the restart command -- and only
+    it -- reports the failure to the watch, so a restart that did not happen
+    does not double the next budget."""
+    body = _function_body(_engine(), STEP8)
+    rc_if = re.search(r"\bif\s*\(\s*rc\s*==\s*0\s*\)\s*\{", body)
+    assert rc_if, "the restart command's return code is not checked"
+    ok_open = rc_if.end() - 1
+    ok_close = _matching(body, ok_open)
+    assert body[ok_close + 1:].lstrip().startswith("else"), "no failure branch"
+    fail_open = body.index("{", ok_close + 1)
+    fail_block = body[fail_open:_matching(body, fail_open)]
+    assert "execution::record_failed_wallet_restart(wallet_sync_watch_)" in fail_block
+    assert "record_failed_wallet_restart" not in body[ok_open:ok_close]
+    assert body.count("record_failed_wallet_restart(") == 1
+
+
 def test_the_watch_runs_on_a_monotonic_clock() -> None:
     """A wall-clock step (NTP, DST) must not fire or suppress a restart."""
     body = _function_body(_engine(), STEP8)

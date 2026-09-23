@@ -19,6 +19,7 @@
 namespace {
 
 using xop::execution::observe_wallet_sync;
+using xop::execution::record_failed_wallet_restart;
 using xop::execution::wallet_restart_budget;
 using xop::execution::WalletRestartPolicy;
 using xop::execution::WalletSyncAction;
@@ -213,6 +214,65 @@ TEST(WalletSyncWatch, ASilenceKeepsTheBackoff)
     const WalletSyncVerdict v = see(watch, kUnsynced, kIdle, 900 + 5000);
     EXPECT_EQ(v.restarts, 1U);
     EXPECT_EQ(v.idle_budget_s, 1800);
+}
+
+TEST(WalletSyncWatch, AFailedRestartDoesNotAdvanceTheBackoff)
+{
+    // Review, PR #170: a restart command that failed restarted nothing, so
+    // the next attempt must not wait double.
+    WalletSyncWatch watch;
+    ASSERT_EQ(see(watch, kUnsynced, kIdle, 0).action, WalletSyncAction::Wait);
+    ASSERT_EQ(see(watch, kUnsynced, kIdle, 450).action, WalletSyncAction::Wait);
+    ASSERT_EQ(see(watch, kUnsynced, kIdle, 900).action, WalletSyncAction::Restart);
+    record_failed_wallet_restart(watch);
+    EXPECT_EQ(watch.restarts, 0U);
+    EXPECT_EQ(watch.failed_restarts, 1U);
+
+    const WalletSyncVerdict v = see(watch, kUnsynced, kIdle, 930);
+    EXPECT_EQ(v.restarts, 0U);
+    EXPECT_EQ(v.idle_budget_s, 900);       // not 1800
+    EXPECT_EQ(v.syncing_budget_s, 7200);   // not 14400
+    for (std::int64_t t = 960; t < 930 + 900; t += 30) {
+        ASSERT_EQ(see(watch, kUnsynced, kIdle, t).action, WalletSyncAction::Wait)
+            << "t=" << t;
+    }
+    EXPECT_EQ(see(watch, kUnsynced, kIdle, 930 + 900).action, WalletSyncAction::Restart);
+}
+
+TEST(WalletSyncWatch, AFailedRestartStillWaitsAFullBudgetBeforeRetrying)
+{
+    // The alternative -- restoring the streak -- would decide Restart again at
+    // the very next heartbeat: a blocking command per heartbeat while it fails.
+    WalletSyncWatch watch;
+    ASSERT_EQ(see(watch, kUnsynced, kIdle, 0).action, WalletSyncAction::Wait);
+    ASSERT_EQ(see(watch, kUnsynced, kIdle, 450).action, WalletSyncAction::Wait);
+    ASSERT_EQ(see(watch, kUnsynced, kIdle, 900).action, WalletSyncAction::Restart);
+    record_failed_wallet_restart(watch);
+    const WalletSyncVerdict v = see(watch, kUnsynced, kIdle, 930);
+    EXPECT_EQ(v.action, WalletSyncAction::Wait);
+    EXPECT_EQ(v.unsynced_for_s, 0);
+    EXPECT_EQ(v.idle_for_s, 0);
+}
+
+TEST(WalletSyncWatch, AFailedRestartCannotUnderflowTheBackoff)
+{
+    WalletSyncWatch watch;
+    record_failed_wallet_restart(watch);
+    EXPECT_EQ(watch.restarts, 0U);
+    EXPECT_EQ(watch.failed_restarts, 1U);
+    EXPECT_EQ(see(watch, kUnsynced, kIdle, 0).idle_budget_s, 900);
+}
+
+TEST(WalletSyncWatch, SyncedClearsTheFailedAttempts)
+{
+    WalletSyncWatch watch;
+    ASSERT_EQ(see(watch, kUnsynced, kIdle, 0).action, WalletSyncAction::Wait);
+    ASSERT_EQ(see(watch, kUnsynced, kIdle, 450).action, WalletSyncAction::Wait);
+    ASSERT_EQ(see(watch, kUnsynced, kIdle, 900).action, WalletSyncAction::Restart);
+    record_failed_wallet_restart(watch);
+    ASSERT_EQ(watch.failed_restarts, 1U);
+    EXPECT_EQ(see(watch, kSynced, kIdle, 960).action, WalletSyncAction::Synced);
+    EXPECT_EQ(watch.failed_restarts, 0U);
 }
 
 TEST(WalletSyncWatch, TheEveningOf20260922IsNoLongerALivelock)

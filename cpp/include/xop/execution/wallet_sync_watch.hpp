@@ -37,8 +37,10 @@
 //     that idle run.
 //   * EACH RESTART DOUBLES BOTH BUDGETS for the next attempt, up to the cap,
 //     and starts a fresh streak.  A wallet that needs longer than the budget
-//     gets it on a later attempt instead of being killed forever.  Reporting
-//     synced clears everything, the backoff included.
+//     gets it on a later attempt instead of being killed forever.  A restart
+//     command that FAILED takes its doubling back (record_failed_wallet_restart)
+//     but keeps the fresh streak, so failures retry once per budget, never once
+//     per heartbeat.  Reporting synced clears everything, the backoff included.
 //   * TIME IS MEASURED, NOT COUNTED, on a monotonic clock.  A silence longer
 //     than max_observation_gap_s (Step 8 not reached: paused, breaker open)
 //     says nothing about the wallet, so it starts a new streak instead of
@@ -70,6 +72,7 @@ struct WalletSyncWatch {
     std::optional<std::int64_t> idle_since{};      ///< start of the current not-syncing run in it
     std::optional<std::int64_t> last_observed{};
     std::uint32_t               restarts{0};       ///< restarts since the wallet last reported synced
+    std::uint32_t               failed_restarts{0};///< restart COMMANDS that failed, same period
 };
 
 enum class WalletSyncAction : std::uint8_t {
@@ -153,6 +156,20 @@ struct WalletSyncVerdict {
         verdict.action = WalletSyncAction::Restart;
     }
     return verdict;
+}
+
+/// The restart COMMAND failed (review, PR #170): a restart that did not
+/// happen must not double the next budget, so this takes back the backoff
+/// step observe_wallet_sync() took for it.  The streak stays reset, so the
+/// next attempt still waits a full budget -- the budget this attempt had.
+/// Restoring the old streak instead would retry on every heartbeat, a
+/// blocking command each time, for as long as the command keeps failing.
+inline void record_failed_wallet_restart(WalletSyncWatch& watch) noexcept
+{
+    if (watch.restarts > 0) {
+        --watch.restarts;
+    }
+    ++watch.failed_restarts;
 }
 
 }  // namespace xop::execution
