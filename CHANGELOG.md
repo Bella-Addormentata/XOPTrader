@@ -5,6 +5,38 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### The engine stops restarting a wallet that is still syncing
+
+On 2026-09-22 the wallet reported `synced=false, syncing=true` on every Step 8
+heartbeat from 17:08 on, so Step 8 managed no offers all evening. Every 20
+unsynced heartbeats (6-10 minutes in practice; the code said "~3 min") the
+engine ran `chia stop wallet & chia start wallet`, 9 times between 17:18 and
+18:24, and that restart is what kept the wallet from syncing. In Chia 2.7.4 a
+long sync records its progress only when it completes; with
+`use_delta_sync: false` it re-reads every puzzle hash and coin from height 0;
+and a freshly started wallet begins its first long sync by rolling back 256
+blocks. So every restart threw away the sync in progress and moved the wallet
+backwards. At 18:29 its finished-sync height was 9,297,547 against a node peak
+of 9,329,985.
+
+- The restart now follows `execution/wallet_sync_watch.hpp`. A wallet that
+  reports a sync in progress is not restarted for 2 hours. One that is neither
+  synced nor syncing is restarted after 15 minutes. Each restart doubles both
+  budgets for the next attempt (capped at 24 hours), and reporting synced
+  resets them.
+- Time is measured on a monotonic clock instead of counted in heartbeats. A gap
+  of more than 10 minutes between readings (Step 8 not reached) starts a new
+  streak rather than counting as unsynced time.
+- A reply without `syncing` is treated as syncing, never as idle.
+- The Step 8 line says how long the wallet has been unsynced and what a restart
+  waits for; the restart line says which restart it is.
+
+Not in this change: the wallet's own configuration (`use_delta_sync`,
+`connect_to_unknown_peers`), and the restart itself, which is still a blocking
+`std::system` call.
+
 ## [0.10.25] — 2026-09-21 — less dust, fewer cancels, a fee controller shipped off, and stops that keep the book
 
 ### Less reward dust in new offers, except on the no-floor retry

@@ -11549,10 +11549,12 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
     // and cancel_offer will fail outright.  Block ALL offer management
     // until the wallet reports synced=true.
     //
-    // Auto-recovery: if the wallet stays unsynced for kWalletRestartThreshold
-    // consecutive blocks (~3 min), restart the wallet service.  This breaks
-    // the deadlock where pending_change prevents sync and the sync gate
-    // prevents the force-delete escalation from ever firing.
+    // Auto-recovery [WALLET-RESTART-LIVELOCK 2026-09-22]: restart the wallet
+    // service only when execution/wallet_sync_watch.hpp says so.  This used
+    // to restart after 20 unsynced heartbeats whatever the wallet was doing.
+    // A Chia long sync records its progress only when it completes, and every
+    // restart rolls the wallet back 256 blocks, so on 2026-09-22 the restarts
+    // (9 between 17:18 and 18:24) kept a syncing wallet from ever finishing.
     try {
         auto sync_status = co_await wallet_->get_sync_status();
         bool synced = false;
@@ -11565,22 +11567,33 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         wallet_synced_ = synced && !syncing;
         wallet_syncing_ = syncing;
 
-        if (!synced || syncing) {
-            ++consecutive_unsynced_blocks_;
-            spdlog::warn("[Engine] Step 8: wallet not fully synced "
-                         "(synced={}, syncing={}, unsynced_blocks={}/{}) "
-                         "-- skipping all offer management",
-                         synced, syncing,
-                         consecutive_unsynced_blocks_,
-                         kWalletRestartThreshold);
+        // A reply without `syncing` is an unread state, not an idle wallet:
+        // it never earns the short idle budget.
+        const bool may_be_syncing = syncing || !sync_status.contains("syncing");
+        const std::int64_t now_s =
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+        const execution::WalletSyncVerdict sync_watch =
+            execution::observe_wallet_sync(wallet_sync_watch_,
+                                           synced && !syncing,
+                                           may_be_syncing, now_s);
 
-            // Escalation: restart wallet service after prolonged unsync.
-            if (consecutive_unsynced_blocks_ >= kWalletRestartThreshold) {
-                spdlog::warn("[Engine] Wallet unsynced for {} consecutive "
-                             "blocks (~{} sec) -- restarting wallet service "
-                             "to force clean resync",
-                             consecutive_unsynced_blocks_,
-                             consecutive_unsynced_blocks_ * 9);
+        if (sync_watch.action != execution::WalletSyncAction::Synced) {
+            spdlog::warn("[Engine] Step 8: wallet not fully synced "
+                         "(synced={}, syncing={}) for {}s -- skipping all "
+                         "offer management; a restart waits for {}s "
+                         "unsynced or {}s not syncing (not syncing for {}s)",
+                         synced, syncing, sync_watch.unsynced_for_s,
+                         sync_watch.syncing_budget_s, sync_watch.idle_budget_s,
+                         sync_watch.idle_for_s);
+
+            if (sync_watch.action == execution::WalletSyncAction::Restart) {
+                spdlog::warn("[Engine] Wallet unsynced for {}s, {}s of it not "
+                             "syncing -- restarting the wallet service "
+                             "(restart {} since it was last synced; the next "
+                             "attempt's budgets double)",
+                             sync_watch.unsynced_for_s, sync_watch.idle_for_s,
+                             sync_watch.restarts + 1);
 #ifdef _WIN32
                 int rc = std::system("chia stop wallet & chia start wallet");
 #else
@@ -11592,16 +11605,14 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     spdlog::error("[Engine] Wallet service restart failed "
                                   "(rc={})", rc);
                 }
-                consecutive_unsynced_blocks_ = 0;
             }
             co_return;
         }
 
-        // Wallet is synced -- reset the unsync counter.
-        if (consecutive_unsynced_blocks_ > 0) {
-            spdlog::info("[Engine] Wallet re-synced after {} blocks",
-                         consecutive_unsynced_blocks_);
-            consecutive_unsynced_blocks_ = 0;
+        if (sync_watch.unsynced_for_s > 0 || sync_watch.restarts > 0) {
+            spdlog::info("[Engine] Wallet re-synced after {}s unsynced "
+                         "({} restart(s) along the way)",
+                         sync_watch.unsynced_for_s, sync_watch.restarts);
         }
     } catch (const std::exception& e) {
         wallet_synced_ = false;
