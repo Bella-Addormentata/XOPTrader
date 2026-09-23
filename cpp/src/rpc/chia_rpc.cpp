@@ -1091,6 +1091,30 @@ ChiaWalletRPC::get_offer(const std::string& trade_id, bool file_contents)
 }
 
 asio::awaitable<std::vector<json>>
+ChiaWalletRPC::get_coin_records_by_names(const std::vector<std::string>& names)
+{
+    json name_arr = json::array();
+    for (const auto& n : names) {
+        name_arr.push_back(n.size() >= 2 && n.substr(0, 2) == "0x" ? n : "0x" + n);
+    }
+    // No allow_unsynced: an unsynced wallet must refuse, not answer.
+    const json payload = {
+        {"names",               name_arr},
+        {"include_spent_coins", true}
+    };
+    const json resp = co_await rpc_post("get_coin_records_by_names", payload);
+
+    std::vector<json> records;
+    if (resp.contains("coin_records") && resp["coin_records"].is_array()) {
+        records.reserve(resp["coin_records"].size());
+        for (auto& rec : resp["coin_records"]) {
+            records.push_back(std::move(rec));
+        }
+    }
+    co_return records;
+}
+
+asio::awaitable<std::vector<json>>
 ChiaWalletRPC::get_all_offers(std::int64_t start,
                                std::int64_t end,
                                bool         file_contents,

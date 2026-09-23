@@ -730,6 +730,22 @@ public:
                                     bool               file_contents = false);
 
     /**
+     * @brief [FILL-PROOF 2026-09-23] Coin records for `names` from the
+     * wallet's own coin store, spent coins included.
+     *
+     * The fallback source of execution::prove_fill() when the engine does not
+     * trust its full node.  The wallet refuses (an RPC error) unless it is
+     * synced -- allow_unsynced is never sent -- which is the point: its
+     * store is incomplete mid-resync, exactly when it mislabelled dead
+     * offers CONFIRMED on 2026-09-22.  Coins it does not hold are omitted.
+     *
+     * @param names  Coin names, hex, with or without 0x.
+     * @return The records array, same shape as the full node's.
+     */
+    asio::awaitable<std::vector<json>> get_coin_records_by_names(
+        const std::vector<std::string>& names);
+
+    /**
      * @brief Retrieve offers with pagination.
      *
      * [WALLET-LOAD 2026-08-04] Verified against docs.chia.net offer-rpc

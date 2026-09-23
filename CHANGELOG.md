@@ -5,6 +5,70 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### A fill is booked only when the chain shows the offer was taken
+
+On 2026-09-22 the engine booked three fills for offers that were never taken:
+the XCH/DBX asks `0xd6a8325c15` and `0x83eef9df80` and the XCH/BYC bid
+`0xdb63709cb9` (trade_log rows 1900-1902). Each had lost exactly one XCH input
+to another of the bot's own transactions, which spent it paying a
+15,000,000-mojo fee (blocks 9,324,680, 9,325,004 and 9,325,694). Every other
+maker coin of all three is still unspent, and Dexie shows all three cancelled.
+The wallet nevertheless reported them CONFIRMED at exactly those heights, and
+detect_fills booked every CONFIRMED offer: they entered trade_log, the ledger,
+the inventory tracker and State (about -0.9 XCH, -1.864 BYC and +203.188 DBX,
+and 44,876 DBX mojos of realized P&L that never happened).
+
+The wallet's CONFIRMED is its own bookkeeping, not evidence. The likely
+mechanism, read from Chia 2.7.4's code: it marks a trade CONFIRMED when every
+coin its inputs would create exists on-chain, but it only checks the inputs it
+finds in its coin store at that moment. After the 2026-09-22 resyncs the
+untouched inputs could be missing from the store, and a check over what is left
+can pass for an offer nobody took.
+
+- Before booking a CONFIRMED offer, detect_fills looks up the offer's maker
+  coins (the trade record's `coins_of_interest`) on-chain
+  (`execution/fill_proof.hpp`). It asks the full node while the engine trusts
+  it (a node, and not `wallet_only_mode_`, the rule the S14 cancel escalation
+  uses), and otherwise the wallet, which does not answer until it is synced.
+- A take spends every maker coin in one block. Only that books a fill, and it
+  books the same way as before. The fill's height is now the height of those
+  spends, which the confirmation-depth buffer counts from, not the wallet's
+  `confirmed_at_index`. For a take the wallet saw itself they are the same
+  number.
+- A maker coin still unspent while another is spent, or maker coins spent at
+  different heights, means the offer died without being taken. Nothing is
+  booked. Once the first spend is `strategy.confirmation_depth_blocks` deep
+  (default 6), the offer stops being tracked, its offer_log row is closed
+  `cancelled` with reason `dead_on_chain` at the height of that spend, and the
+  engine logs an ERROR. A fee ticket for a cancel on it closes without an
+  observation, the same way a FAILED offer's does.
+- Every maker coin unspent means the offer can still be taken. Nothing is
+  booked and it stays tracked. If it is taken later, it is booked then.
+- A lookup that fails, or an answer that does not cover every maker coin or
+  cannot be read, books nothing. The offer stays tracked and is asked about
+  again next heartbeat. The first deferral and every 20th are logged. After one
+  lookup fails, nothing more is asked that heartbeat, as the S14 escalation
+  does: each failure spends its transport retries.
+- `recheck_terminal` no longer re-adopts an offer proven dead. The wallet goes
+  on reporting it CONFIRMED, and re-adopting it would send it through
+  detect_fills again.
+
+The gtest replays the wallet and node records of `0xdb63709cb9` (one of three
+maker coins spent, at 9,325,694: dead) and of a real take on 2026-09-16,
+`0x202ff7d2d8` (both maker coins spent at 9,297,025: settled).
+
+A genuine fill can now wait a heartbeat or more if the node has not yet seen
+the take. Each CONFIRMED offer costs one extra coin-records call per heartbeat
+until it is resolved.
+
+Not in this change: repairing what the three rows already booked (trade_log
+1900-1902, their ledger legs, their offer_log rows and the tracker). That needs
+the engine stopped and a separate decision. Also not in this change: the
+trigger, which is a new offer built on an XCH coin that a pending transaction
+spends as its fee.
+
 ## [0.10.25] — 2026-09-21 — less dust, fewer cancels, a fee controller shipped off, and stops that keep the book
 
 ### Less reward dust in new offers, except on the no-floor retry

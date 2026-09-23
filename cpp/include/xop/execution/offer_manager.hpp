@@ -72,6 +72,11 @@ namespace xop::execution {
 namespace asio = boost::asio;
 using json = nlohmann::json;
 
+// [FILL-PROOF] Defined in execution/fill_proof.hpp, which only
+// offer_manager.cpp needs: every file that includes this header, engine.cpp
+// among them, would otherwise recompile whenever the proof's rules change.
+struct FillProofResult;
+
 // TierQuote and RebalanceReason are defined in <xop/types.hpp> (unified).
 // The execution layer uses xop::TierQuote and xop::RebalanceReason directly.
 using xop::TierQuote;
@@ -314,6 +319,33 @@ public:
     [[nodiscard]] const std::vector<std::string>& last_terminal_offers() const noexcept {
         return last_terminal_offers_;
     }
+
+    /// [FILL-PROOF 2026-09-23] An offer the wallet reported CONFIRMED that
+    /// the chain proved was never taken (execution/fill_proof.hpp): a maker
+    /// coin unspent while another was spent elsewhere, the earliest spend at
+    /// confirmation depth.
+    struct DeadOffer {
+        std::string   offer_id{};
+        std::string   pair_name{};
+        std::uint64_t spent_height{0};   ///< the earliest spend of a maker coin
+        std::size_t   coins{0};          ///< maker coins examined
+        std::size_t   unspent{0};        ///< of them, still unspent
+    };
+
+    /// [FILL-PROOF] Offers the most recent detect_fills() proved dead.  It
+    /// booked nothing for them and stopped tracking them; the engine records
+    /// each outcome.  Same contract as last_terminal_offers(): cleared at the
+    /// start of every detect_fills(), so it describes that call only.
+    [[nodiscard]] const std::vector<DeadOffer>& last_dead_offers() const noexcept {
+        return last_dead_offers_;
+    }
+
+    /// [FILL-PROOF] The full node the fill proof asks, and whether the engine
+    /// trusts it right now -- the S14 escalation's rule: a node, and not
+    /// wallet_only_mode_.  When it does not, the proof asks the wallet, which
+    /// refuses until it is synced.  Unset: the wallet is always asked.
+    void set_fill_proof_node(std::shared_ptr<rpc::ChiaFullNodeRPC> node,
+                             std::function<bool()>                node_trusted);
 
     /// [S25 2026-08-24] Re-query the wallet about an offer previously
     /// observed terminal, so a deferred "cancelled" write can be checked
@@ -1339,6 +1371,35 @@ private:
     /// [S25 2026-08-24] Trade ids observed terminal by the most recent
     /// detect_fills().  See last_terminal_offers().
     std::vector<std::string> last_terminal_offers_;
+
+    // -- [FILL-PROOF 2026-09-23] -------------------------------------------
+    /// Offers the most recent detect_fills() proved dead.  See last_dead_offers().
+    std::vector<DeadOffer> last_dead_offers_;
+    /// Every offer this process proved dead.  The wallet keeps reporting them
+    /// CONFIRMED, so recheck_terminal() must not re-adopt one as a fill.
+    std::unordered_set<std::string> proven_dead_;
+    /// See set_fill_proof_node().
+    std::shared_ptr<rpc::ChiaFullNodeRPC> fill_proof_node_;
+    std::function<bool()>                 fill_proof_node_trusted_;
+    /// Consecutive heartbeats a CONFIRMED offer went unbooked for want of a
+    /// Settled proof, for the log's cadence.
+    std::unordered_map<std::string, std::uint32_t> fill_proof_deferrals_;
+
+    /// Ask the chain what a CONFIRMED trade record's maker coins prove
+    /// (execution::prove_fill).  Never throws and never logs: a failure is
+    /// FillProof::Unknown, with the reason in `failure` for the caller's
+    /// rate-limited line.  `lookup_failed` is set when the node or wallet
+    /// could not be asked at all, so detect_fills asks nothing more that call.
+    asio::awaitable<FillProofResult> prove_fill_on_chain(const json& trade_record,
+                                                         std::string& failure,
+                                                         bool& lookup_failed);
+
+    /// A CONFIRMED offer whose proof is not Settled: log it and, when the
+    /// proof is a Dead verdict at confirmation depth, stop tracking it and
+    /// report it in last_dead_offers_.  Books nothing, ever.
+    void handle_unproven_fill(const std::string& trade_id, const PendingOffer& po,
+                              const FillProofResult& proof, const std::string& failure,
+                              BlockHeight current_block);
 
     /// [S46 2026-09-02] Result of the DB -> wallet leg of the most recent
     /// startup_reconcile().  See last_db_leg().

@@ -634,6 +634,14 @@ Engine::Engine(const AppConfig& config, bool dry_run,
     offer_mgr_->set_abort_predicate([this] {
         return watchdog_fired_.load(std::memory_order_acquire);
     });
+    // [FILL-PROOF 2026-09-23] The chain decides what is a fill
+    // (execution/fill_proof.hpp).  The node is asked only while the engine
+    // trusts it -- the S14 escalation's rule -- and the wallet, which answers
+    // only when synced, otherwise.  Read at call time: wallet_only_mode_
+    // changes while the engine runs.
+    offer_mgr_->set_fill_proof_node(full_node_, [this] {
+        return full_node_ != nullptr && !wallet_only_mode_;
+    });
     // [S67, review #163] Every secure cancel the wallet accepts opens its fee
     // ticket HERE, with the fee it really paid and the height it was
     // submitted at.  Inert unless fees.controller_enabled.  Runs on the
@@ -5587,6 +5595,42 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
     // fill does.
     for (const auto& tid : offer_mgr_->last_terminal_offers()) {
         buffer_terminal_offer(tid, block_height);
+    }
+
+    // [FILL-PROOF 2026-09-23] Offers the wallet reported CONFIRMED that the
+    // chain proved were never taken.  detect_fills booked nothing for them and
+    // stopped tracking them; record how they ended.  'cancelled' is the status
+    // of an offer that ended without a fill, and the reason says this one died
+    // on-chain.  Not buffered like a wallet-reported terminal: the proof
+    // already waited out the confirmation depth, and recheck_terminal would
+    // only hear the wallet say CONFIRMED again.  A failed write leaves the row
+    // as it is; the next process proves the offer dead again and retries.
+    for (const auto& dead : offer_mgr_->last_dead_offers()) {
+        try {
+            db_->update_offer_status(dead.offer_id, "cancelled",
+                                     static_cast<BlockHeight>(dead.spent_height),
+                                     "dead_on_chain");
+            // [S67] A cancel we submitted on it did not confirm -- a cancel
+            // spends every maker coin, and some are unspent -- so its fee
+            // ticket closes unheard, as a FAILED offer's does.
+            fee_feedback_on_cancel_verdict(dead.offer_id,
+                                           static_cast<BlockHeight>(dead.spent_height),
+                                           /*wallet_says_cancelled=*/false);
+            spdlog::error("[Engine] Step 2: {} ({}) recorded cancelled "
+                          "(dead_on_chain): the wallet reported it CONFIRMED, "
+                          "but its {} maker coins were not spent together "
+                          "({} still unspent) -- no fill was booked",
+                          dead.offer_id.substr(0, 12), dead.pair_name,
+                          dead.coins, dead.unspent);
+        } catch (const OfferNotFound& nf) {
+            spdlog::debug("[Engine] Step 2: dead offer {} has no offer_log row "
+                          "-- not ours to record ({})",
+                          dead.offer_id.substr(0, 12), nf.what());
+        } catch (const std::exception& ex) {
+            spdlog::error("[Engine] Step 2: could not record dead offer {} -- "
+                          "its offer_log row stays as it is: {}",
+                          dead.offer_id.substr(0, 12), ex.what());
+        }
     }
 
     // [T4-02] Reorg protection: confirmation depth gating.

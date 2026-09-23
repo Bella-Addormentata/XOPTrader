@@ -171,6 +171,16 @@ Leading hypotheses, in rough order of likelihood:
    offers whose final status is `cancelled`. `detect_fills` treats wallet
    trade status `CONFIRMED` as a completed fill without verifying settled
    amounts (`offer_manager.cpp` ~606).
+
+   *[2026-09-23] One mechanism of this shape is now confirmed.* On 2026-09-22
+   the wallet reported three never-taken offers CONFIRMED (trade_log
+   1900-1902; each had lost one input to another transaction, every other
+   maker coin is still unspent, and Dexie shows them cancelled). They were
+   booked as fills. `detect_fills` now books a CONFIRMED offer only when the
+   chain shows every maker coin spent in one block (`execution/fill_proof.hpp`;
+   CHANGELOG, "A fill is booked only when the chain shows the offer was
+   taken"). Whether the same mechanism accounts for the rows above is **not**
+   established; it would take checking their maker coins on-chain.
 2. **Posted size assumed to be settled size.** A `Fill` copies the offer's
    originally posted price and size; nothing reads what actually settled, so
    a partially-taken or re-priced offer records at full size.

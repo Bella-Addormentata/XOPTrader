@@ -24,8 +24,10 @@
 
 #include <xop/execution/cancel_escalation.hpp>
 #include <xop/execution/cancel_retry.hpp>
+#include <xop/execution/coin_manager.hpp>
 #include <xop/execution/cross_guard.hpp>
 #include <xop/execution/fee_feedback.hpp>
+#include <xop/execution/fill_proof.hpp>
 #include <xop/execution/stuck_tx_verdict.hpp>
 #include <xop/execution/wallet_circuit.hpp>
 #include <xop/execution/wallet_poll_throttle.hpp>
@@ -1343,6 +1345,7 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
 
     // [S25] Describes THIS call only; the engine drains it after we return.
     last_terminal_offers_.clear();
+    last_dead_offers_.clear();
 
     // [WALLET-LOAD 2026-08-04] Advance the poll heartbeat counter once per
     // invocation -- the backoff schedule below is phased on it.
@@ -1352,6 +1355,7 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
     auto pending_offers = state_->get_all_offers();
     if (pending_offers.empty()) {
         fill_poll_pending_counts_.clear();
+        fill_proof_deferrals_.clear();
         co_return fills;
     }
 
@@ -1368,6 +1372,9 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
         it = pending_map.count(it->first)
                  ? std::next(it)
                  : fill_poll_pending_counts_.erase(it);
+    }
+    for (auto it = fill_proof_deferrals_.begin(); it != fill_proof_deferrals_.end();) {
+        it = pending_map.count(it->first) ? std::next(it) : fill_proof_deferrals_.erase(it);
     }
 
     // Query only offers we currently track AND due for a poll this
@@ -1515,6 +1522,8 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
         }
     }
 
+    // [FILL-PROOF] Set by the first coin lookup that fails; see below.
+    bool proof_lookup_failed = false;
     for (const auto& rec : trade_records) {
         // Extract trade_id and status from the record.
         if (!rec.contains("trade_id") || !rec.contains("status")) {
@@ -1532,6 +1541,30 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
         const PendingOffer& po = it->second;
 
         if (status == trade_status::kConfirmed) {
+                // [FILL-PROOF 2026-09-23] The wallet's CONFIRMED is its own
+                // bookkeeping, not evidence: on 2026-09-22 it reported three
+                // offers CONFIRMED that were never taken, and they were booked
+                // as fills (execution/fill_proof.hpp).  Nothing below -- the
+                // Fill, State, the removal from tracking -- happens until the
+                // chain shows every maker coin spent in one block.
+                //
+                // After one lookup fails, the rest of this call asks nothing:
+                // each failed attempt spends its transport retries, and the
+                // S14 escalation stops its sweep on the same failure.
+                std::string proof_failure;
+                FillProofResult proof;
+                if (proof_lookup_failed) {
+                    proof_failure = "an earlier coin lookup this heartbeat failed -- "
+                                    "not asked again until the next one";
+                } else {
+                    proof = co_await prove_fill_on_chain(rec, proof_failure, proof_lookup_failed);
+                }
+                if (proof.verdict != FillProof::Settled) {
+                    handle_unproven_fill(trade_id, po, proof, proof_failure, current_block);
+                    continue;
+                }
+                fill_proof_deferrals_.erase(trade_id);
+
                 // Offer was taken and settled -- this is a fill.
                 Fill fill;
                 fill.offer_id     = trade_id;
@@ -1582,12 +1615,21 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
                 // every fill since June 2026.
                 fill.fee_mojos    = to_mojo_saturating(po.fee_mojos);
 
-                // Extract confirmed block height if available.
-                if (rec.contains("confirmed_at_index")) {
-                    fill.block_height = static_cast<BlockHeight>(
-                        rec["confirmed_at_index"].get<std::int64_t>());
-                } else {
-                    fill.block_height = 0;
+                // [FILL-PROOF] The height the chain proved the take at, which
+                // the confirmation-depth buffer counts from.  For a take the
+                // wallet saw itself its confirmed_at_index is the same
+                // number; for an offer it had already mislabelled CONFIRMED
+                // and that was then really taken, the wallet's number is the
+                // stale one, and would let the buffer book a fresh take at
+                // once.
+                fill.block_height = static_cast<BlockHeight>(proof.height);
+                if (const auto idx = rec.find("confirmed_at_index");
+                    idx != rec.end() && idx->is_number_unsigned()
+                    && idx->get<std::uint64_t>() != proof.height) {
+                    logger_->warn("detect_fills: {} the wallet says confirmed at "
+                                  "{}, the chain says taken at {} -- using the chain's",
+                                  trade_id.substr(0, 12), idx->get<std::uint64_t>(),
+                                  proof.height);
                 }
 
                 // T1-08: Update position accounting using canonical asset IDs
@@ -1707,8 +1749,116 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
         logger_->info("detect_fills: {} offer(s) observed terminal",
                       last_terminal_offers_.size());
     }
+    if (!last_dead_offers_.empty()) {
+        logger_->error("detect_fills: {} offer(s) the wallet reports CONFIRMED "
+                       "were proven never taken -- none booked as a fill",
+                       last_dead_offers_.size());
+    }
 
     co_return fills;
+}
+
+// ---------------------------------------------------------------------------
+// [FILL-PROOF 2026-09-23] The chain's word on a CONFIRMED trade
+// ---------------------------------------------------------------------------
+void OfferManager::set_fill_proof_node(std::shared_ptr<rpc::ChiaFullNodeRPC> node,
+                                       std::function<bool()>                node_trusted)
+{
+    fill_proof_node_         = std::move(node);
+    fill_proof_node_trusted_ = std::move(node_trusted);
+}
+
+asio::awaitable<FillProofResult>
+OfferManager::prove_fill_on_chain(const json& trade_record, std::string& failure,
+                                  bool& lookup_failed)
+{
+    // The escalation's adapter shape: any throw is "cannot hash", which voids
+    // the whole name list, which proves nothing.
+    const auto name_of = [](const CoinRef& ref) -> std::string {
+        try {
+            return CoinManager::compute_coin_name(ref.parent_hex, ref.puzzle_hash_hex,
+                                                  static_cast<Mojo>(ref.amount));
+        } catch (const std::exception&) {
+            return {};
+        }
+    };
+    const std::vector<std::string> names =
+        coin_names_for(parse_coins_of_interest(trade_record), name_of);
+    if (names.empty()) {
+        failure = "the wallet record carries no readable coins_of_interest";
+        co_return FillProofResult{};
+    }
+
+    const bool ask_node = fill_proof_node_ && fill_proof_node_trusted_
+                          && fill_proof_node_trusted_();
+    std::vector<json> records;
+    try {
+        if (ask_node) {
+            records = co_await fill_proof_node_->get_coin_records_by_names(
+                names, /*include_spent=*/true);
+        } else {
+            // Refuses until synced -- the window the wallet mislabels in.
+            records = co_await wallet_->get_coin_records_by_names(names);
+        }
+    } catch (const std::exception& e) {
+        lookup_failed = true;
+        failure = std::string{"the "} + (ask_node ? "full node" : "wallet")
+                  + " could not list its maker coins: " + e.what();
+        co_return FillProofResult{};
+    }
+    const FillProofResult proof = prove_fill(names, records, name_of);
+    if (proof.verdict == FillProof::Unknown) {
+        failure = std::string{"the "} + (ask_node ? "full node" : "wallet")
+                  + "'s answer did not cover every maker coin, or a record was "
+                    "unreadable or contradictory";
+    }
+    co_return proof;
+}
+
+void OfferManager::handle_unproven_fill(const std::string& trade_id,
+                                        const PendingOffer& po,
+                                        const FillProofResult& proof,
+                                        const std::string& failure,
+                                        BlockHeight current_block)
+{
+    if (dead_offer_closable(proof, current_block,
+                            strategy_cfg_.confirmation_depth_blocks)) {
+        // Never taken, and the spend that killed it is as deep as a fill must
+        // be: stop tracking it, and report it -- never as a fill.  The engine
+        // records the outcome; proven_dead_ keeps recheck_terminal() from
+        // re-adopting what the wallet will go on calling CONFIRMED.
+        state_->remove_offer(trade_id);
+        proven_dead_.insert(trade_id);
+        fill_proof_deferrals_.erase(trade_id);
+        last_dead_offers_.push_back(DeadOffer{trade_id, po.pair_name, proof.height,
+                                              proof.coins, proof.unspent});
+        logger_->error("[FILL-PROOF] {} ({} {}): the wallet reports CONFIRMED, but "
+                       "its {} maker coins were not spent together ({} still "
+                       "unspent, the first spent at block {}) -- the offer died "
+                       "without being taken; NOT booked as a fill",
+                       trade_id.substr(0, 12), po.pair_name, to_string(po.side),
+                       proof.coins, proof.unspent, proof.height);
+        return;
+    }
+
+    // Not booked, still tracked: the next heartbeat asks again.  Logged on
+    // the first deferral and every 20th after it -- a CONFIRMED offer is
+    // polled every heartbeat, so an unthrottled line would repeat each one.
+    const std::uint32_t deferrals = ++fill_proof_deferrals_[trade_id];
+    if (deferrals != 1U && deferrals % 20U != 0U) {
+        return;
+    }
+    std::string why = failure.empty() ? std::string{"no usable answer"} : failure;
+    if (proof.verdict == FillProof::Live) {
+        why = "every maker coin is still unspent -- the offer is still takeable";
+    } else if (proof.verdict == FillProof::Dead) {
+        why = "its maker coins were not spent together (the offer died), but "
+              "the first spend is not yet at confirmation depth";
+    }
+    logger_->warn("[FILL-PROOF] {} ({}): the wallet reports CONFIRMED, the "
+                  "chain says {}: {} -- not booked; asked again next heartbeat "
+                  "(deferral {})", trade_id.substr(0, 12), po.pair_name,
+                  fill_proof_name(proof.verdict), why, deferrals);
 }
 
 // ---------------------------------------------------------------------------
@@ -1811,6 +1961,12 @@ OfferManager::recheck_terminal(const std::string& trade_id,
     };
 
     if (status == trade_status::kConfirmed) {
+        // [FILL-PROOF 2026-09-23] Not for an offer the chain proved dead: the
+        // wallet goes on reporting it CONFIRMED, and re-adopting it would send
+        // it round detect_fills again on every recheck.
+        if (proven_dead_.count(trade_id) > 0) {
+            co_return TerminalRecheck::StillTerminal;
+        }
         // The terminal observation was reorged into a FILL.  Re-adoption
         // is what makes the fill recordable: detect_fills() only inspects
         // offers still in State, so without this the fill would be
