@@ -10,6 +10,7 @@
 //   ISO/IEC 25000       -- single-responsibility methods, RAII locks
 
 #include "xop/state.hpp"
+#include "xop/peg_registry.hpp"   // to_mojo_checked
 
 #include <spdlog/spdlog.h>
 
@@ -238,10 +239,24 @@ std::optional<Mojo> State::reconcile_balance(const AssetId& asset_id,
         pos.balance    = observed;
         pos.total_cost = static_cast<double>(observed);
     }
-    pos.cost_basis = (pos.balance > 0)
-        ? static_cast<Mojo>(std::llround(pos.total_cost
-                                         / static_cast<double>(pos.balance)))
-        : 0;
+    // The basis only feeds the dashboard; the balance above is what the risk
+    // limits read and stands regardless.  A ratio that cannot be a Mojo --
+    // non-finite, negative, or out of range, where llround's result is
+    // unspecified -- is not converted: the position takes the unit basis.
+    pos.cost_basis = 0;
+    if (pos.balance > 0) {
+        if (const std::optional<Mojo> basis = to_mojo_checked(
+                pos.total_cost / static_cast<double>(pos.balance))) {
+            pos.cost_basis = *basis;
+        } else {
+            spdlog::warn("reconcile_balance: cost basis of asset={} is not a "
+                         "representable Mojo (total_cost={} over {}) -- reset "
+                         "to the unit basis", asset_id, pos.total_cost,
+                         pos.balance);
+            pos.total_cost = static_cast<double>(pos.balance);
+            pos.cost_basis = 1;
+        }
+    }
 
     spdlog::info("reconcile   asset={} balance {} -> {} basis={}",
                   asset_id, previous, observed, pos.cost_basis);

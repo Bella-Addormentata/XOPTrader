@@ -23,6 +23,7 @@
 
 #include <cstddef>
 #include <initializer_list>
+#include <limits>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -153,6 +154,24 @@ TEST(StateReconcileBalance, AnEqualBalanceReturnsItAndChangesNothing)
     EXPECT_EQ(*previous, Mojo{100});
     EXPECT_EQ(state.get_position(kDbx).cost_basis, Mojo{5});
     EXPECT_DOUBLE_EQ(state.get_position(kDbx).total_cost, 500.0);
+}
+
+TEST(StateReconcileBalance, AnUnrepresentableBasisFallsBackToTheUnitBasis)
+{
+    // Review round 1: the scaled basis goes through to_mojo_checked().  An
+    // average at INT64_MAX is not a representable Mojo -- llround's result
+    // there is unspecified -- so it is not converted: the balance, which is
+    // what the risk limits read, stands, and the basis becomes the unit one.
+    State state;
+    state.record_buy(kDbx, 1, std::numeric_limits<Mojo>::max());
+
+    const std::optional<Mojo> previous = state.reconcile_balance(kDbx, 2);
+    ASSERT_TRUE(previous.has_value());
+    EXPECT_EQ(*previous, Mojo{1});
+    const Position pos = state.get_position(kDbx);
+    EXPECT_EQ(pos.balance, Mojo{2});
+    EXPECT_EQ(pos.cost_basis, Mojo{1});
+    EXPECT_DOUBLE_EQ(pos.total_cost, 2.0);
 }
 
 TEST(StateReconcileBalance, AReconciledPositionTakesFillsNormally)

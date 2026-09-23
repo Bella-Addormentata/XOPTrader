@@ -1723,10 +1723,15 @@ private:
     /// [SEED-FAIL-CLOSED 2026-09-22] Make State's position in `asset` the
     /// wallet's confirmed balance, whatever State held
     /// (risk/state_position_truth.hpp).  Called by Step 8 at each balance read
-    /// below its wallet sync gate.  A read that verifies an asset the startup
-    /// seed could not read clears it from state_unverified_assets_.
-    void reconcile_state_position(const std::string& asset, Mojo confirmed,
-                                  bool fields_validated, BlockHeight block_height);
+    /// below its wallet sync gate.  Returns the balance State held before, or
+    /// std::nullopt when the read may not overwrite it (fields missing, bridge
+    /// asset under its scan, negative).  It does not verify an unverified
+    /// asset: only Step 8's verification pass does, because that pass is
+    /// followed by a heartbeat without posting (review round 1).
+    std::optional<Mojo> reconcile_state_position(const std::string& asset,
+                                                 Mojo confirmed,
+                                                 bool fields_validated,
+                                                 BlockHeight block_height);
 
     // -- Double-entry accounting (LEDGER 2026-07-30) ------------------------
 
@@ -2739,8 +2744,11 @@ private:
 
     // [SEED-FAIL-CLOSED 2026-09-22] Assets whose State position the startup
     // seed could not read from the wallet, and so took from the last
-    // persisted quantity.  Step 8 clears an asset the first time it reads a
-    // validated balance for it (reconcile_state_position).
+    // persisted quantity (or from nothing).  Step 8 does not quote a pair that
+    // trades one.  Step 8's verification pass reads them every synced
+    // heartbeat and clears each one it verifies -- and a heartbeat that
+    // verifies anything posts nothing, because Step 6 sized it from the guess.
+    // The bridge scan clears its own asset (review round 1).
     std::unordered_set<std::string> state_unverified_assets_;
 
     // -- [PACE 2026-09-13] Pace controller state -----------------------------

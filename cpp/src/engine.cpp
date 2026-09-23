@@ -11657,6 +11657,89 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         co_return;
     }
 
+    // [SEED-FAIL-CLOSED review round 1] Verify every position the startup seed
+    // could not read, here, below the sync gate and before anything is posted.
+    // Step 6 has already sized this heartbeat's ladders from those guesses (or
+    // from nothing, on a first boot with no persisted row), so a heartbeat that
+    // verifies anything posts nothing: the next one sizes from the wallet.  A
+    // position this pass cannot read stays unverified, and the pair loop below
+    // does not quote a pair that trades it.  The pass retries every synced
+    // heartbeat.  Cost: one balance RPC per unverified asset, usually none.
+    if (!state_unverified_assets_.empty()) {
+        if (!wallet_step_may_run("Step 8 State verification")) {
+            co_return;
+        }
+        try {
+            co_await offer_mgr_->ensure_wallet_ids();
+        } catch (const std::exception& e) {
+            spdlog::warn("[Engine] Step 8: wallet map unavailable for State "
+                         "verification: {}", e.what());
+        }
+        std::size_t verified = 0;
+        const std::vector<std::string> unverified(state_unverified_assets_.begin(),
+                                                  state_unverified_assets_.end());
+        for (const auto& asset : unverified) {
+            // The bridge scan verifies its own asset while it is operational.
+            if (asset == config_.accounting.bridge_asset_id
+                && bridge_accounting_operational()) {
+                continue;
+            }
+            const auto wid = offer_mgr_->resolve_wallet_id(asset);
+            std::optional<Mojo> previous;
+            Mojo observed = 0;
+            if (wid <= 0) {
+                // A BUILT map with no wallet for the asset: the wallet holds
+                // none of it (stuck_prune_scope.hpp).  An unbuilt map proves
+                // nothing, and the asset stays unverified.
+                if (!offer_mgr_->wallet_ids_resolved()) continue;
+                previous = reconcile_state_position(asset, 0, true, block_height);
+            } else {
+                if (!wallet_step_may_run("Step 8 State verification")) {
+                    co_return;
+                }
+                try {
+                    auto bal_json = co_await wallet_->get_wallet_balance(wid);
+                    Mojo spendable = 0, pending = 0;
+                    if (bal_json.contains("spendable_balance"))
+                        spendable = bal_json["spendable_balance"].get<Mojo>();
+                    if (bal_json.contains("confirmed_wallet_balance"))
+                        observed = bal_json["confirmed_wallet_balance"].get<Mojo>();
+                    if (bal_json.contains("pending_change"))
+                        pending = bal_json["pending_change"].get<Mojo>();
+                    const bool fields_validated =
+                        bal_json.contains("confirmed_wallet_balance")
+                        && bal_json.contains("pending_change");
+                    cached_wallet_balances_[asset] =
+                        {spendable, observed, pending, block_height,
+                         fields_validated};
+                    previous = reconcile_state_position(asset, observed,
+                                                        fields_validated,
+                                                        block_height);
+                } catch (const std::exception& e) {
+                    spdlog::warn("[Engine] Step 8: State verification of {} "
+                                 "could not read the wallet: {}",
+                                 asset.substr(0, 12), e.what());
+                }
+            }
+            if (previous.has_value()) {
+                state_unverified_assets_.erase(asset);
+                ++verified;
+                spdlog::warn("[Engine] Step 8: State position of {} verified "
+                             "against the wallet at block {}: {} -> {} mojos "
+                             "(startup could not read it)",
+                             asset.substr(0, 12), block_height, *previous,
+                             observed);
+            }
+        }
+        if (verified > 0) {
+            spdlog::warn("[Engine] Step 8: {} State position(s) verified this "
+                         "heartbeat -- no offer management until the next one, "
+                         "which Step 6 sizes from the wallet's balances",
+                         verified);
+            co_return;
+        }
+    }
+
     // [S70 2026-09-20] ttl_cancel_mode: expire -- free the coins of offers
     // the chain has already aged out.  Here, below the sync gate, because the
     // verdict rests on the wallet having PROCESSED the chain up to the clock
@@ -11966,7 +12049,27 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             // [PACE 2026-09-13] A pace-managed pair's empty ladder is pace's own
             // decision, not the deadlock this refresh breaks, and
             // refresh_pace_balances keeps its assets fresh.
-            if (config_.strategy.pace_enabled && pcs.pace.managed) continue;
+            if (config_.strategy.pace_enabled && pcs.pace.managed) {
+                // [SEED-FAIL-CLOSED review round 1] ...but no other read
+                // reaches their State positions while the ladder stays empty.
+                // Take them from a pace read made THIS heartbeat: it came from
+                // refresh_pace_balances above the sync gate, but this gate has
+                // passed since, within the same heartbeat.
+                if (const PairConfig* pace_pc = find_pair_config(pair_name)) {
+                    for (const std::string& pace_asset :
+                         {pace_pc->base_asset_id, pace_pc->quote_asset_id}) {
+                        if (pace_asset == "xch") continue;
+                        const auto pace_read = cached_wallet_balances_.find(pace_asset);
+                        if (pace_read != cached_wallet_balances_.end()
+                            && pace_read->second.as_of_block == block_height) {
+                            (void)reconcile_state_position(
+                                pace_asset, pace_read->second.confirmed,
+                                pace_read->second.fields_validated, block_height);
+                        }
+                    }
+                }
+                continue;
+            }
             const PairConfig* live_pc = find_pair_config(pair_name);
             if (!live_pc) continue;
             const std::string assets[2] = {live_pc->base_asset_id,
@@ -12060,6 +12163,21 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         if (!pcs.market_data_valid) {
             spdlog::warn("[Engine] Step 8: {} market data invalid -- "
                          "skipping offer posting", pair_name);
+            continue;
+        }
+
+        // [SEED-FAIL-CLOSED review round 1] Nor for a pair that trades a
+        // position the verification pass above could not read: its
+        // concentration and CAT share were computed from a guess, or from
+        // nothing.  The pass retries every heartbeat, so this lasts only as
+        // long as the wallet read keeps failing.
+        if (const PairConfig* verify_pc = find_pair_config(pair_name);
+            verify_pc
+            && (state_unverified_assets_.count(verify_pc->base_asset_id) > 0
+                || state_unverified_assets_.count(verify_pc->quote_asset_id) > 0)) {
+            spdlog::warn("[Engine] Step 8: {} not quoted -- a position it "
+                         "trades is still UNVERIFIED (its wallet balance "
+                         "could not be read)", pair_name);
             continue;
         }
 
@@ -18548,27 +18666,26 @@ void Engine::persist_inventory_state() noexcept
     }
 }
 
-void Engine::reconcile_state_position(const std::string& asset, Mojo confirmed,
-                                      bool fields_validated,
-                                      BlockHeight block_height)
+std::optional<Mojo> Engine::reconcile_state_position(const std::string& asset,
+                                                     Mojo confirmed,
+                                                     bool fields_validated,
+                                                     BlockHeight block_height)
 {
-    if (!state_) return;
+    if (!state_) return std::nullopt;
     // [S19 review round 6] While the bridge scan is operational it is the
     // single writer of the bridge asset's State position.
     const bool bridge_owned = asset == config_.accounting.bridge_asset_id
                               && bridge_accounting_operational();
     const risk::TruthResult r = risk::apply_wallet_truth(
         *state_, AssetId{asset}, confirmed, fields_validated, bridge_owned);
-    if (r.outcome == risk::TruthOutcome::Skipped) return;
-    // A correction to an asset the startup seed did read is routine -- fees,
-    // taker fills and deposits never pass through record_buy/record_sell --
-    // and State logs it.  Verifying a fallback position is the event.
-    if (state_unverified_assets_.erase(asset) > 0) {
-        spdlog::warn("[Engine] Step 8: State position of {} verified against "
-                     "the wallet at block {}: {} -> {} mojos (startup could "
-                     "not read it and used the last persisted quantity)",
-                     asset.substr(0, 12), block_height, r.previous, confirmed);
-    }
+    if (r.outcome == risk::TruthOutcome::Skipped) return std::nullopt;
+    // A correction is routine -- fees, taker fills and deposits never pass
+    // through record_buy/record_sell -- and State logs it.  It takes effect at
+    // the next Step 6, as a fill does.
+    spdlog::debug("[Engine] Step 8: State position of {} reconciled at block "
+                  "{}: {} -> {} mojos", asset.substr(0, 12), block_height,
+                  r.previous, confirmed);
+    return r.previous;
 }
 
 // ---------------------------------------------------------------------------
@@ -19755,6 +19872,19 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
                                      "reduced {} -> {}",
                                      asset.substr(0, 12), pos,
                                      bal.confirmed);
+                    }
+                    // [SEED-FAIL-CLOSED review round 1] The scan is this
+                    // asset's only State writer, so it is also what verifies
+                    // a startup fallback for it -- once State holds the
+                    // wallet's balance.  Step 8 does not quote its pairs
+                    // until then.
+                    if (state_->get_position(asset).balance == bal.confirmed
+                        && state_unverified_assets_.erase(asset) > 0) {
+                        spdlog::warn("[Engine] Bridge ingest: State position "
+                                     "of {} verified against the wallet at "
+                                     "block {}: {} -> {} mojos (startup could "
+                                     "not read it)", asset.substr(0, 12),
+                                     block_height, pos, bal.confirmed);
                     }
                 }
             }

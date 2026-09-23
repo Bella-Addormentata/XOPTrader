@@ -26,7 +26,7 @@ ENGINE = REPO / "cpp" / "src" / "engine.cpp"
 
 STEP8 = "asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)"
 POLL_LOOP = "asio::awaitable<void> Engine::poll_loop_coro()"
-HELPER = "void Engine::reconcile_state_position("
+HELPER = "Engine::reconcile_state_position("
 BRIDGE_SCAN = "asio::awaitable<void> Engine::step_ingest_bridge_flows("
 
 # The defect's shape: something gated on a State position being zero.  The
@@ -152,12 +152,13 @@ def test_step8_never_reads_state_positions() -> None:
 
 def test_every_step8_balance_read_reconciles_state() -> None:
     """Each validated balance Step 8 caches also becomes State's position, for
-    the same asset and under the same validation bit.  Two writers today: the
-    empty-ladder liveness refresh (the only read a suspended pair's CAT gets)
-    and the main loop's balance gate."""
+    the same asset, from the same confirmed value and under the same validation
+    bit.  Three writers today: the verification pass, the empty-ladder
+    liveness refresh (the only read a suspended pair's CAT gets) and the main
+    loop's balance gate."""
     body = _function_body(_engine(), STEP8)
     writes = list(CACHE_WRITE.finditer(body))
-    assert len(writes) >= 2, "expected the liveness refresh and the balance gate"
+    assert len(writes) >= 3, "expected the verification pass, the liveness refresh and the balance gate"
 
     flags = re.findall(r"const\s+bool\s+fields_validated\s*=\s*([^;]+);", body)
     assert len(flags) == len(writes)
@@ -172,15 +173,17 @@ def test_every_step8_balance_read_reconciles_state() -> None:
         entry_end = body.index(";", write.end())
         entry = body[write.end():entry_end].strip()
         assert entry.startswith("{") and entry.endswith("}"), entry
-        stored_flag = entry[1:-1].split(",")[-1].strip()
+        fields = [f.strip() for f in entry[1:-1].split(",")]
+        stored_confirmed, stored_flag = fields[1], fields[-1]
 
         window_end = writes[i + 1].start() if i + 1 < len(writes) else len(body)
         calls = _calls(body[write.end():window_end], "reconcile_state_position")
         assert calls, f"the cache write for {key} is not followed by a State reconcile"
         args = calls[0]
-        assert args == [key, "confirmed", stored_flag, "block_height"], (
+        assert args == [key, stored_confirmed, stored_flag, "block_height"], (
             f"cache write for {key} reconciles with {args}; expected the same "
-            f"asset, its confirmed balance and the flag stored with it ({stored_flag})"
+            f"asset, the confirmed balance it stored ({stored_confirmed}) and "
+            f"the flag stored with it ({stored_flag})"
         )
         assert stored_flag == "fields_validated"
 
@@ -248,7 +251,95 @@ def test_startup_seeds_state_for_every_asset_after_the_read_loop() -> None:
 
     lastknown_at = tail.index("risk::SeedSource::LastKnown")
     assert tail.index("state_unverified_assets_.insert(") > lastknown_at
-
     assert text.count("state_unverified_assets_.insert(") == 1
-    assert text.count("state_unverified_assets_.erase(") == 1
-    assert "state_unverified_assets_.erase(" in _function_body(text, HELPER)
+
+
+def _verification_block(body: str) -> tuple[int, str]:
+    """Step 8's verification pass: the block guarded by the unverified set."""
+    guard = re.search(r"if\s*\(\s*!\s*state_unverified_assets_\.empty\(\)\s*\)\s*\{", body)
+    assert guard, "Step 8 has no verification pass"
+    block_open = guard.end() - 1
+    return guard.start(), body[block_open:_matching(body, block_open)]
+
+
+def test_unverified_positions_are_verified_before_anything_is_posted() -> None:
+    """Review round 1: Step 6 sized this heartbeat from the guess, so the pass
+    runs below the sync gate but ahead of every offer action, clears a mark
+    only when the wallet's balance actually replaced the guess, and a
+    heartbeat that verified anything then stops -- the next one is sized from
+    the wallet."""
+    body = _function_body(_engine(), STEP8)
+    start, block = _verification_block(body)
+    assert body.index("wallet_->get_sync_status()") < start
+    for first_action in ("retire_expired_offers(", "step_enforce_pace_caps(",
+                         "post_quotes("):
+        if first_action in body:
+            assert start < body.index(first_action), first_action
+
+    assert "reconcile_state_position(" in block
+
+    def guarded(condition: str) -> str:
+        """The body of the `if (<condition>) {` block inside the pass."""
+        match = re.search(r"if\s*\(\s*" + condition + r"\s*\)\s*\{", block)
+        assert match, f"no `if ({condition})` in the verification pass"
+        open_at = match.end() - 1
+        return block[open_at:_matching(block, open_at)]
+
+    cleared = guarded(r"previous\.has_value\(\)")
+    assert "state_unverified_assets_.erase(asset)" in cleared, (
+        "a mark must be cleared only when a reconcile applied")
+    assert "++verified" in cleared
+    assert block.count("state_unverified_assets_.erase(") == 1
+    assert re.search(r"co_return\s*;", guarded(r"verified\s*>\s*0")), (
+        "a heartbeat that verified a position must not go on to post")
+    # A built wallet map with no wallet for the asset is a verified zero.
+    assert "wallet_ids_resolved()" in block
+
+
+def test_a_pair_with_an_unverified_position_is_not_quoted() -> None:
+    """Review round 1: a position the pass could not read stays unverified,
+    and the pair loop does not quote a pair that trades it -- ahead of its
+    balance gate and of posting."""
+    body = _function_body(_engine(), STEP8)
+    loop_at = body.index('wallet_step_may_run("Step 8 pair loop")')
+    gate = re.search(
+        r"state_unverified_assets_\.count\(\s*\w+->base_asset_id\s*\)\s*>\s*0"
+        r"\s*\|\|\s*state_unverified_assets_\.count\(\s*\w+->quote_asset_id\s*\)\s*>\s*0",
+        body[loop_at:])
+    assert gate, "the pair loop does not check its pair's positions are verified"
+    gate_at = loop_at + gate.end()
+    after = body[gate_at:]
+    block_open = after.index("{")
+    assert after[block_open:_matching(after, block_open)].rstrip().endswith("continue;")
+    assert gate_at < body.index("get_wallet_balance(sb.wid)")
+    assert gate_at < body.index("post_quotes(", loop_at)
+
+
+def test_pace_managed_pairs_reconcile_from_a_fresh_pace_read() -> None:
+    """Review round 1: the liveness refresh skips a pace-managed empty ladder,
+    and nothing else reads its assets while it stays empty, so their State
+    comes from the pace read made this heartbeat -- and only that heartbeat."""
+    body = _function_body(_engine(), STEP8)
+    managed = re.search(
+        r"if\s*\(\s*config_\.strategy\.pace_enabled\s*&&\s*pcs\.pace\.managed\s*\)\s*\{", body)
+    assert managed, "the liveness refresh no longer handles pace-managed pairs"
+    block_open = managed.end() - 1
+    block = body[block_open:_matching(body, block_open)]
+    assert "reconcile_state_position(" in block
+    assert re.search(r"as_of_block\s*==\s*block_height", block)
+    assert block.rstrip().endswith("continue;")
+
+
+def test_the_bridge_scan_verifies_its_own_asset() -> None:
+    """Review round 1: while its scan is operational the bridge asset has one
+    State writer, so Step 8's pass leaves it alone and the scan clears its
+    mark -- only once State holds the wallet's balance."""
+    text = _engine()
+    _, block = _verification_block(_function_body(text, STEP8))
+    assert "bridge_accounting_operational()" in block
+    bridge = _function_body(text, BRIDGE_SCAN)
+    assert re.search(r"get_position\(\s*asset\s*\)\.balance\s*==\s*bal\.confirmed\s*"
+                     r"&&\s*state_unverified_assets_\.erase\(\s*asset\s*\)", bridge)
+    # Cleared in exactly those two places; the routine reconcile never does.
+    assert text.count("state_unverified_assets_.erase(") == 2
+    assert "state_unverified_assets_" not in _function_body(text, HELPER)

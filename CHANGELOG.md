@@ -38,6 +38,19 @@ have corrected it.)
   was the least cautious default available: with no positions, concentration
   reads "balanced" and every CAT 0%, so no limit can trip.
 - The per-asset startup read failure is logged as a WARN instead of DEBUG.
+- **Nothing is quoted from a guessed position** (review round 1). Step 6 sizes
+  a heartbeat's ladders before Step 8 reads the wallet, so Step 8 now verifies
+  every unverified position right below its sync gate. A heartbeat that
+  verifies anything posts nothing, and the next one is sized from the wallet.
+  A pair that trades a position the pass could not read is not quoted until
+  it can be: that covers a first boot with no persisted row, where the guess
+  is nothing at all. A built wallet map with no wallet for the asset still
+  counts as a verified zero.
+- A pace-managed pair with an empty ladder takes its assets' State from that
+  heartbeat's pace read, since no other read reaches them. The bridge scan
+  clears the unverified mark on its own asset. The reconciled cost basis goes
+  through `to_mojo_checked()`, and a ratio that is not a representable Mojo
+  falls back to the unit basis instead of being converted.
 
 Not in this change: the InventoryTracker (the strategy's `q`) and its one-shot
 Step 11 reconcile, and the XCH/DBX bid, which was zero for a different reason
