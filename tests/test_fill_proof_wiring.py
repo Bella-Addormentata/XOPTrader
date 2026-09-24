@@ -264,11 +264,21 @@ def test_spent_together_books_only_with_the_takes_own_mark():
         "only a SpentTogether verdict goes on to the second stage"
     )
     rest = prove[passthrough.end():]
-    assert 'summary_amounts(trade_record, ask_node ? "offered" : "requested")' in rest, (
-        "the node looks for an offered amount, the wallet for a requested one"
+    # [round 5] The node looks for each offered asset's settlement coin -- its
+    # puzzle as well as its amount -- and the wallet for a requested amount.
+    assert re.search(r"ask_node \? offered_settlements\(trade_record, puzzle_of\)", rest), (
+        "the node looks for each offered asset's settlement coin"
+    )
+    assert re.search(r'ask_node \? std::vector<std::uint64_t>\{\} : '
+                     r'summary_amounts\(trade_record, "requested"\)', rest), (
+        "the wallet looks for a requested amount"
+    )
+    puzzle_of = _block_after(rest, "const auto puzzle_of = [](const std::string& asset) -> std::string {")
+    assert "CoinManager::settlement_puzzle_hash(asset).value_or(std::string{})" in puzzle_of, (
+        "each asset's settlement puzzle is named by CoinManager, as the chain's own coins show"
     )
     node = re.search(r"fill_proof_node_->get_coin_records_by_parent_ids\(\s*names", rest).start()
-    assert node < rest.index("prove_take_from_children(coins, names, children, amounts)")
+    assert node < rest.index("prove_take_from_children(coins, names, children, settlements)")
     wallet = rest.index("wallet_->get_coin_records_at_height(coins.height, amounts)")
     assert wallet < rest.index("prove_take_from_payments(coins, names, payments, amounts)")
     assert rest.index("if (ask_node) {") < node < rest.index("} else {") < wallet
@@ -294,6 +304,18 @@ def test_the_second_stage_asks_the_right_questions():
                      payments), "exactly the spend block, both ends inclusive"
     assert re.search(r'\{"amount_filter",\s*\{\{"values",\s*amounts\},\s*\{"mode",\s*1\}\}\}',
                      payments), "the requested amounts, included"
+    # [round 5] No limit: an answer cut at N rows, asked the same way every
+    # heartbeat, never shows a payment past the cut.  In chia 2.7.4 an omitted
+    # limit is uint32 max, which get_coin_records serves with no LIMIT clause.
+    assert '"limit"' not in payments, "the wallet's answer must not be cut short"
+    # [round 5] A reply without its coin_records list is a failed lookup, not
+    # an empty answer: an empty list of children now proves the offer Dead.
+    for body in (children, payments):
+        refused = re.search(r"if \(listed == resp\.end\(\) \|\| !listed->is_array\(\)\) \{\s*"
+                            r"throw ChiaRPCError\(", body)
+        assert refused and refused.start() < body.index("records.push_back("), (
+            "a malformed reply must throw before anything is read from it"
+        )
     prove = _function_body(_source(OFFER_MANAGER), PROVE_ON_CHAIN)
     assert re.search(r"get_coin_records_by_parent_ids\(\s*names,\s*/\*include_spent=\*/true\)",
                      prove), "a settlement coin is spent in the take block: include spent children"

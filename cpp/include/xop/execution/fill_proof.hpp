@@ -32,15 +32,15 @@
 //     or a stray spend of a one-coin offer, does it too.  So all spent at one
 //     height is only SpentTogether (prove_fill), and books nothing until the
 //     spend block also shows the TAKE'S OWN MARK:
-//       - from the node: a settlement coin, created from a maker coin for
-//         exactly an amount the offer offered, and spent in that same block
-//         (prove_take_from_children);
+//       - from the node: a settlement coin, created from a maker coin at the
+//         offered asset's settlement puzzle, for exactly the amount offered,
+//         and spent in that same block (prove_take_from_children);
 //       - from the wallet, which cannot see settlement coins: a payment to us
 //         of exactly a requested amount in that block, from a coin that is
 //         not ours (prove_take_from_payments).
-//     With the mark it is Settled.  If the node shows the block without one,
-//     it is Dead.  The wallet's silence proves nothing, so there it stays
-//     Unknown.
+//     With the mark it is Settled.  If the node shows the block without one
+//     -- or shows the maker coins created no children at all -- it is Dead.
+//     The wallet's silence proves nothing, so there it stays Unknown.
 //   * ANY MAKER COIN UNSPENT WHILE ANOTHER IS SPENT, or maker coins spent at
 //     different heights, is Dead: something else consumed an input and the
 //     offer can never be taken.  (A later reuse of the surviving coins spends
@@ -60,9 +60,9 @@
 //
 // NOT DETECTED:
 //   - From the node: another of our offers, built on the same coins, taken for
-//     exactly the same offered amount while this one is reported CONFIRMED.
-//     Its settlement coin is indistinguishable here.  Only its requested
-//     payment differs, and the node cannot search for that.
+//     exactly the same offered asset and amount while this one is reported
+//     CONFIRMED.  Its settlement coin is indistinguishable here.  Only its
+//     requested payment differs, and the node cannot search for that.
 //   - From the wallet: an unrelated coin of ours confirmed in the same block
 //     for exactly a requested amount -- another fill's payment of the same
 //     size, say.  The wallet cannot see a payment's parent, so it cannot tell.
@@ -84,6 +84,7 @@
 #include <system_error>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace xop::execution {
@@ -195,11 +196,13 @@ inline constexpr std::uint64_t kMaxRecordHeight = std::numeric_limits<std::uint3
     return std::nullopt;
 }
 
-/// The amounts, in mojos, that a trade record's summary lists on one side:
-/// `side` is "offered" or "requested".  The wallet writes them as decimal
-/// strings; numbers are read too.  Empty when the summary or the side is
-/// missing, or when ANY amount is unreadable or zero -- no amounts, no evidence.
-[[nodiscard]] inline std::vector<std::uint64_t> summary_amounts(
+/// The assets and amounts, in mojos, that a trade record's summary lists on
+/// one side: `side` is "offered" or "requested".  Each asset is the summary's
+/// own key: "xch", or a CAT's asset id (its TAIL hash, hex).  The wallet writes
+/// amounts as decimal strings; numbers are read too.  Empty when the summary
+/// or the side is missing, or when ANY amount is unreadable or zero -- no
+/// amounts, no evidence.
+[[nodiscard]] inline std::vector<std::pair<std::string, std::uint64_t>> summary_assets(
     const nlohmann::json& trade_record, const char* side)
 {
     if (!trade_record.is_object()) {
@@ -213,8 +216,8 @@ inline constexpr std::uint64_t kMaxRecordHeight = std::numeric_limits<std::uint3
     if (listed == summary->end() || !listed->is_object() || listed->empty()) {
         return {};
     }
-    std::vector<std::uint64_t> amounts;
-    for (const auto& value : *listed) {
+    std::vector<std::pair<std::string, std::uint64_t>> assets;
+    for (const auto& [asset, value] : listed->items()) {
         std::uint64_t amount = 0;
         if (value.is_number_unsigned()) {
             amount = value.get<std::uint64_t>();
@@ -237,9 +240,50 @@ inline constexpr std::uint64_t kMaxRecordHeight = std::numeric_limits<std::uint3
         if (amount == 0U) {
             return {};
         }
-        amounts.push_back(amount);
+        assets.emplace_back(asset, amount);
+    }
+    return assets;
+}
+
+/// summary_assets() without the assets: what the wallet's payment check asks
+/// for, since the wallet cannot see a payment's asset from its amount filter.
+[[nodiscard]] inline std::vector<std::uint64_t> summary_amounts(
+    const nlohmann::json& trade_record, const char* side)
+{
+    std::vector<std::uint64_t> amounts;
+    for (const auto& asset : summary_assets(trade_record, side)) {
+        amounts.push_back(asset.second);
     }
     return amounts;
+}
+
+/// [review #171, round 5] A settlement coin a take creates for one offered
+/// asset: the asset's settlement puzzle hash (lowercase hex, no 0x) and the
+/// offered amount.  Both must match -- an amount alone could be any child.
+struct SettlementCoin {
+    std::string   puzzle_hash_hex{};
+    std::uint64_t amount{0};
+};
+
+/// The settlement coins a trade record's offered side predicts.  Each asset's
+/// settlement puzzle hash comes from `puzzle_of`
+/// (CoinManager::settlement_puzzle_hash behind a catch in the caller; an empty
+/// string means "cannot name it").  Empty when the summary cannot be read, or
+/// when ANY offered asset's settlement puzzle cannot be named -- an offer we
+/// cannot fully describe proves nothing.
+template <class PuzzleOf>
+[[nodiscard]] std::vector<SettlementCoin> offered_settlements(
+    const nlohmann::json& trade_record, PuzzleOf puzzle_of)
+{
+    std::vector<SettlementCoin> settlements;
+    for (const auto& [asset, amount] : summary_assets(trade_record, "offered")) {
+        std::string puzzle_hash{puzzle_of(asset)};
+        if (puzzle_hash.empty()) {
+            return {};
+        }
+        settlements.push_back(SettlementCoin{std::move(puzzle_hash), amount});
+    }
+    return settlements;
 }
 
 /// Stage 1: what a coin-records answer proves about the offer whose maker
@@ -313,38 +357,41 @@ template <class NameOf>
 }
 
 /// Stage 2, from the full node: does the spend block show the take's own mark?
-/// A take creates a settlement coin from one of the maker coins, for exactly
-/// an amount the offer offered, and the taker's half of the bundle spends it
-/// in the same block.  A cancel, or a stray spend of a one-coin offer, sends
-/// its children to our own addresses, where they outlive the block.  Observed
+/// A take creates a settlement coin from one of the maker coins: at the
+/// offered asset's settlement puzzle, for exactly the amount offered.  The
+/// taker's half of the bundle spends it in the same block.  A cancel, or a
+/// stray spend of a one-coin offer, sends its children to our own addresses,
+/// where they outlive the block -- or creates none at all.  Observed
 /// 2026-09-23: four real takes (one ask, three bids) each show exactly one
-/// such child.  The coin consumed from the phantom 0xdb63709cb9 and four
-/// confirmed cancels show none.
+/// such child: 1 XCH at OFFER_MOD's puzzle, or DBX at its CAT wrapping.  The
+/// coin consumed from the phantom 0xdb63709cb9 and four confirmed cancels
+/// show none.
 ///
 /// `children` is the node's get_coin_records_by_parent_ids over the maker
-/// coins, spent coins included.  Only a SpentTogether result is examined;
-/// every other verdict is returned as it came:
-///   - a child created AND spent at the spend height, for an offered amount
-///                                                              -> Settled
-///   - no children, no offered amounts, a record that cannot be read, a child
-///     of a coin that was not asked about, or one created at another height
-///                                                              -> Unknown
-///   - otherwise: spent together, but not by a take             -> Dead
+/// coins, spent coins included -- the node's complete answer, since that
+/// wrapper refuses one without a coin_records list.  `settlements` is
+/// offered_settlements().  Only a SpentTogether result is examined; every
+/// other verdict is returned as it came:
+///   - a child created AND spent at the spend height, at a settlement coin's
+///     puzzle hash and for its amount                           -> Settled
+///   - no settlements, a record that cannot be read, a child of a coin that
+///     was not asked about, or one created at another height    -> Unknown
+///   - otherwise, NO CHILDREN AT ALL included [review #171, round 5]: spent
+///     together, but not by a take                               -> Dead
 [[nodiscard]] inline FillProofResult prove_take_from_children(
     const FillProofResult&             spent,
     const std::vector<std::string>&    maker_names,
     const std::vector<nlohmann::json>& children,
-    const std::vector<std::uint64_t>&  offered)
+    const std::vector<SettlementCoin>& settlements)
 {
     if (spent.verdict != FillProof::SpentTogether) {
         return spent;
     }
     const FillProofResult unknown{};
-    if (offered.empty() || children.empty() || spent.height == 0U) {
+    if (settlements.empty() || spent.height == 0U) {
         return unknown;
     }
     const std::unordered_set<std::string> makers(maker_names.begin(), maker_names.end());
-    const std::unordered_set<std::uint64_t> amounts(offered.begin(), offered.end());
     bool marked = false;
     for (const auto& record : children) {
         const auto coin_it = record.find("coin");
@@ -358,8 +405,14 @@ template <class NameOf>
             || *created != spent.height) {
             return unknown;   // not an answer about these coins' spend
         }
-        if (*spent_at == spent.height && amounts.count(ref->amount) > 0U) {
-            marked = true;
+        if (*spent_at != spent.height) {
+            continue;         // outlived the block: ours, not a settlement
+        }
+        for (const auto& settlement : settlements) {
+            if (ref->puzzle_hash_hex == settlement.puzzle_hash_hex
+                && ref->amount == settlement.amount) {
+                marked = true;
+            }
         }
     }
     FillProofResult result = spent;

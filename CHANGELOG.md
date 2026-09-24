@@ -35,20 +35,29 @@ can pass for an offer nobody took.
 - A take spends every maker coin in one block, but so does a cancel, or a
   stray spend of an offer funded by one coin, so that alone books nothing. A
   fill is booked only when that block also shows the take's own mark:
-  - From the node: a settlement coin, created from a maker coin for exactly an
-    amount the offer offered, and spent in the same block.
+  - From the node: a settlement coin, created from a maker coin at the offered
+    asset's settlement puzzle, for exactly the amount offered, and spent in
+    the same block. The puzzle is OFFER_MOD for XCH, and for a CAT it is CAT
+    v2 curried with the CAT's TAIL around OFFER_MOD
+    (`CoinManager::settlement_puzzle_hash`). An amount alone could belong to
+    any child.
   - From the wallet, which cannot see settlement coins: a payment to us of
     exactly a requested amount in that block, from a coin that is not ours.
+    The wallet is asked for every such coin, with no row limit. A limit of
+    50 would have hidden a payment past the 50th row on every retry.
 
   Four real takes (one ask, three bids) each show exactly one such
-  settlement coin. The phantom's consumed coin and four confirmed cancels show
-  none. Once the mark is found the fill books as before. The fill's height is
+  settlement coin, at exactly the puzzle computed for its asset. The
+  phantom's consumed coin and four confirmed cancels show none. Once the
+  mark is found the fill books as before. The fill's height is
   now the height of those spends, which the confirmation-depth buffer counts
   from, not the wallet's `confirmed_at_index`. For a take the wallet saw
   itself they are the same number.
 - A maker coin still unspent while another is spent, maker coins spent at
   different heights, or every coin spent in one block that the node shows
-  without a settlement coin, means the offer died without being taken.
+  without a settlement coin, means the offer died without being taken. That
+  includes a block where the maker coins created no children at all. A node
+  reply without its list of children is a failed lookup, not an empty list.
   Nothing is booked. Once the first spend is
   `strategy.confirmation_depth_blocks` deep (default 6), the offer stops being
   tracked, its offer_log row is closed `cancelled` with reason `dead_on_chain`

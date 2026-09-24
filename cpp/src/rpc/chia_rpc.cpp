@@ -898,12 +898,18 @@ ChiaFullNodeRPC::get_coin_records_by_parent_ids(
     };
     const json resp = co_await rpc_post("get_coin_records_by_parent_ids", payload);
 
+    // [FILL-PROOF, review #171 round 5] An answer, or a throw -- never an
+    // empty list for a malformed reply.  The node lists every child with no
+    // limit, so an empty list is proof that the maker coins created none, and
+    // the fill proof reads it as such.
+    const auto listed = resp.find("coin_records");
+    if (listed == resp.end() || !listed->is_array()) {
+        throw ChiaRPCError("get_coin_records_by_parent_ids: response has no coin_records list");
+    }
     std::vector<json> records;
-    if (resp.contains("coin_records") && resp["coin_records"].is_array()) {
-        records.reserve(resp["coin_records"].size());
-        for (auto& rec : resp["coin_records"]) {
-            records.push_back(std::move(rec));
-        }
+    records.reserve(listed->size());
+    for (const auto& rec : *listed) {
+        records.push_back(rec);
     }
     co_return records;
 }
@@ -1147,19 +1153,28 @@ ChiaWalletRPC::get_coin_records_at_height(std::uint64_t                     heig
     // inclusive at both ends.  Checked against a live 2.7.4 wallet
     // (2026-09-23): the real take 0x202ff7d2d8 answers with its one DBX
     // payment, and the phantom 0xdb63709cb9 with nothing.
+    //
+    // [review #171, round 5] NO LIMIT.  A limit of 50 cut the answer at 50
+    // rows, and this exact query repeats in the same order every heartbeat, so
+    // a payment past the cut was never seen.  In chia 2.7.4 an omitted limit
+    // is uint32 max, which get_coin_records accepts and queries with no LIMIT
+    // clause (wallet_rpc_api.py, wallet_coin_store.py).  Any explicit limit
+    // above 1000 is refused.  One block's coins of a few exact amounts is a
+    // small answer.
     const json payload = {
         {"confirmed_range", {{"start", height}, {"stop", height}}},
-        {"amount_filter",   {{"values", amounts}, {"mode", 1}}},
-        {"limit",           50}
+        {"amount_filter",   {{"values", amounts}, {"mode", 1}}}
     };
     const json resp = co_await rpc_post("get_coin_records", payload);
 
+    const auto listed = resp.find("coin_records");
+    if (listed == resp.end() || !listed->is_array()) {
+        throw ChiaRPCError("get_coin_records: response has no coin_records list");
+    }
     std::vector<json> records;
-    if (resp.contains("coin_records") && resp["coin_records"].is_array()) {
-        records.reserve(resp["coin_records"].size());
-        for (auto& rec : resp["coin_records"]) {
-            records.push_back(std::move(rec));
-        }
+    records.reserve(listed->size());
+    for (const auto& rec : *listed) {
+        records.push_back(rec);
     }
     co_return records;
 }

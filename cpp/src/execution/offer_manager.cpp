@@ -1853,12 +1853,25 @@ OfferManager::prove_fill_on_chain(const json& trade_record, std::string& failure
     // that, and so does a cancel or a stray spend of a one-coin offer, so
     // only the take's own mark in that block books a fill: the settlement
     // coin, from the node; the payment of what we asked for, from the wallet.
+    //
+    // [review #171, round 5] The settlement coin is known by its puzzle as
+    // well as its amount: each offered asset's settlement puzzle, named here.
+    const auto puzzle_of = [](const std::string& asset) -> std::string {
+        try {
+            return CoinManager::settlement_puzzle_hash(asset).value_or(std::string{});
+        } catch (const std::exception&) {
+            return {};
+        }
+    };
+    const std::vector<SettlementCoin> settlements =
+        ask_node ? offered_settlements(trade_record, puzzle_of) : std::vector<SettlementCoin>{};
     const std::vector<std::uint64_t> amounts =
-        summary_amounts(trade_record, ask_node ? "offered" : "requested");
-    if (amounts.empty()) {
+        ask_node ? std::vector<std::uint64_t>{} : summary_amounts(trade_record, "requested");
+    if (ask_node ? settlements.empty() : amounts.empty()) {
         failure = std::string{"every maker coin was spent at block "}
                   + std::to_string(coins.height) + ", but the trade record lists no "
-                  + (ask_node ? "offered" : "requested") + " amounts to look for";
+                  + (ask_node ? "offered asset whose settlement coin can be named"
+                              : "requested amounts to look for");
         co_return FillProofResult{};
     }
     FillProofResult proof;
@@ -1867,7 +1880,7 @@ OfferManager::prove_fill_on_chain(const json& trade_record, std::string& failure
             const std::vector<json> children =
                 co_await fill_proof_node_->get_coin_records_by_parent_ids(
                     names, /*include_spent=*/true);
-            proof = prove_take_from_children(coins, names, children, amounts);
+            proof = prove_take_from_children(coins, names, children, settlements);
         } else {
             const std::vector<json> payments =
                 co_await wallet_->get_coin_records_at_height(coins.height, amounts);

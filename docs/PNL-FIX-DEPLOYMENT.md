@@ -182,15 +182,19 @@ Leading hypotheses, in rough order of likelihood:
    chain shows the offer was taken"):
    - every maker coin was spent, all in one block;
    - that block carries the take's own mark. From the full node, that is a
-     settlement coin: a child of a maker coin, for exactly an amount the offer
-     offered, created and spent in that block. From the wallet, when the node
-     is not trusted, it is a coin of ours confirmed in that block for exactly
-     a requested amount, whose parent is not a maker coin.
+     settlement coin: a child of a maker coin at the offered asset's
+     settlement puzzle, for exactly the amount offered, created and spent in
+     that block. From the wallet, when the node is not trusted, it is a coin
+     of ours confirmed in that block for exactly a requested amount, whose
+     parent is not a maker coin.
 
    The first alone is not enough. For a one-coin offer, a cancel or any other
-   spend of that coin also spends every maker coin in one block. Whether the
-   same mechanism accounts for the rows above is **not** established; it would
-   take checking their maker coins on-chain.
+   spend of that coin also spends every maker coin in one block.
+
+   That settles trade_log 1900-1902 only. Whether the same mechanism also
+   accounts for the 123 older `trade_log` rows mapped to `cancelled` offers
+   (this hypothesis's evidence for the ~665 XCH gap) is **not** established.
+   It would take checking those rows' maker coins on-chain the same way.
 2. **Posted size assumed to be settled size.** A `Fill` copies the offer's
    originally posted price and size; nothing reads what actually settled, so
    a partially-taken or re-priced offer records at full size.

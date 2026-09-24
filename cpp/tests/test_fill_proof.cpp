@@ -29,9 +29,12 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <exception>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -102,12 +105,24 @@ FillProofResult prove(const json& wallet_record, const std::vector<json>& record
     return ex::prove_fill(names_of(wallet_record), records, chain_name);
 }
 
+// The engine's adapter shape: an asset whose settlement puzzle cannot be named,
+// or any throw, is "".
+std::string settlement_puzzle(const std::string& asset)
+{
+    try {
+        return ex::CoinManager::settlement_puzzle_hash(asset).value_or(std::string{});
+    } catch (const std::exception&) {
+        return {};
+    }
+}
+
 // Both stages, the node's way and the wallet's way.
 FillProofResult by_node(const json& wallet_record, const std::vector<json>& records,
                         const std::vector<json>& children)
 {
     return ex::prove_take_from_children(prove(wallet_record, records), names_of(wallet_record),
-                                        children, ex::summary_amounts(wallet_record, "offered"));
+                                        children,
+                                        ex::offered_settlements(wallet_record, settlement_puzzle));
 }
 
 FillProofResult by_wallet(const json& wallet_record, const std::vector<json>& records,
@@ -344,6 +359,25 @@ TEST(TakeFromChildren, ACoinThatOutlivedTheBlockIsNoMark)
     EXPECT_EQ(by_node(ask_wallet(), ask_records(), children).verdict, FillProof::Dead);
 }
 
+TEST(TakeFromChildren, AChildAtAnotherPuzzleIsNoMark)
+{
+    // [review #171, round 5] The settlement coin's amount, created and spent
+    // in the block -- but at the change's own address, not the settlement
+    // puzzle.  An amount alone could be any child.
+    std::vector<json> children = ask_children();
+    children[1]["coin"]["puzzle_hash"] = children[0]["coin"]["puzzle_hash"];
+    const FillProofResult proof = by_node(ask_wallet(), ask_records(), children);
+    EXPECT_EQ(proof.verdict, FillProof::Dead);
+    EXPECT_EQ(proof.height, 9297025U);
+
+    // The bid's DBX amount at XCH's settlement puzzle: the right puzzle for
+    // another asset is no mark either.
+    std::vector<json> bid_children = records_of(kBidChildren);
+    bid_children[2]["coin"]["puzzle_hash"] = ask_children()[1]["coin"]["puzzle_hash"];
+    EXPECT_EQ(by_node(json::parse(kBidWallet), records_of(kBidNode), bid_children).verdict,
+              FillProof::Dead);
+}
+
 TEST(TakeFromChildren, AChildOfSomeOtherCoinIsNoAnswer)
 {
     std::vector<json> children = ask_children();
@@ -376,13 +410,32 @@ TEST(TakeFromChildren, AnUnreadableChildIsNoAnswer)
     EXPECT_EQ(by_node(ask_wallet(), ask_records(), no_coin).verdict, FillProof::Unknown);
 }
 
-TEST(TakeFromChildren, NoChildrenOrNoAmountsIsNoAnswer)
+TEST(TakeFromChildren, NoChildrenAtAllIsDead)
 {
-    EXPECT_EQ(by_node(ask_wallet(), ask_records(), {}).verdict, FillProof::Unknown);
+    // [review #171, round 5] The node lists every child of the maker coins,
+    // and the wrapper refuses a reply without that list -- so an empty list
+    // says the spend created none, and a take always creates its settlement
+    // coin.  (A coin paid away whole as a fee, say.)
+    const FillProofResult proof = by_node(ask_wallet(), ask_records(), {});
+    EXPECT_EQ(proof.verdict, FillProof::Dead);
+    EXPECT_EQ(proof.height, 9297025U);
+    EXPECT_TRUE(proof.spent_together);
+    EXPECT_TRUE(ex::dead_offer_closable(proof, 9330000U, 6U));
+}
 
+TEST(TakeFromChildren, NoSettlementIsNoAnswer)
+{
     json no_summary = ask_wallet();
     no_summary.erase("summary");
     EXPECT_EQ(by_node(no_summary, ask_records(), ask_children()).verdict, FillProof::Unknown);
+    EXPECT_EQ(by_node(no_summary, ask_records(), {}).verdict, FillProof::Unknown);
+
+    // An offered asset whose settlement puzzle cannot be named: the offer
+    // cannot be fully described, so nothing about it is proven -- even Dead.
+    json unnamed = ask_wallet();
+    unnamed["summary"]["offered"]["dbx"] = "100";
+    EXPECT_EQ(by_node(unnamed, ask_records(), ask_children()).verdict, FillProof::Unknown);
+    EXPECT_EQ(by_node(unnamed, ask_records(), {}).verdict, FillProof::Unknown);
 }
 
 TEST(TakeFromChildren, OnlySpentTogetherIsExamined)
@@ -393,7 +446,8 @@ TEST(TakeFromChildren, OnlySpentTogetherIsExamined)
         in.verdict = other;
         in.height = 9297025;
         const FillProofResult out = ex::prove_take_from_children(
-            in, names_of(ask_wallet()), ask_children(), {1000000000000ULL});
+            in, names_of(ask_wallet()), ask_children(),
+            {ex::SettlementCoin{settlement_puzzle("xch"), 1000000000000ULL}});
         EXPECT_EQ(out.verdict, other) << ex::fill_proof_name(other);
         EXPECT_EQ(out.height, 9297025U) << ex::fill_proof_name(other);
     }
@@ -497,6 +551,71 @@ TEST(SummaryAmounts, RefusesAnythingItCannotRead)
     EXPECT_TRUE(ex::summary_amounts(json{{"summary", json::object()}}, "offered").empty());
     EXPECT_TRUE(ex::summary_amounts(
         json{{"summary", {{"offered", json::object()}}}}, "offered").empty());
+}
+
+TEST(SummaryAssets, KeepsEachAmountsAsset)
+{
+    using Assets = std::vector<std::pair<std::string, std::uint64_t>>;
+    EXPECT_EQ(ex::summary_assets(ask_wallet(), "offered"),
+              (Assets{{"xch", 1000000000000ULL}}));
+    EXPECT_EQ(ex::summary_assets(ask_wallet(), "requested"),
+              (Assets{{"db1a9020d48d9d4ad22631b66ab4b9ebd3637ef7758ad38881348c5d24c38f20",
+                       85094ULL}}));
+}
+
+// [review #171, round 5] Each offered asset's settlement coin is known by its
+// puzzle.  The golden values are the chain's own: the real takes' settlement
+// coins, in the fixtures above.
+TEST(SettlementPuzzleHash, MatchesTheChainsOwnSettlementCoins)
+{
+    const std::string dbx = "db1a9020d48d9d4ad22631b66ab4b9ebd3637ef7758ad38881348c5d24c38f20";
+    const std::string offer_mod = "cfbfdeed5c4ca2de3d0bf520b9cb4bb7743a359bd2e6a188d19ce7dffc21d3e7";
+    const std::string dbx_settlement = "2a8269fa3ec2a6968ee95219edc900ada54232beb24ad0f7581f3b3eab613e81";
+
+    EXPECT_EQ(ex::CoinManager::settlement_puzzle_hash("xch").value_or(""), offer_mod);
+    EXPECT_EQ(ex::CoinManager::settlement_puzzle_hash("XCH").value_or(""), offer_mod);
+    EXPECT_EQ(ask_children()[1]["coin"]["puzzle_hash"], "0x" + offer_mod);
+
+    // CAT v2 around OFFER_MOD, for DBX's TAIL: the real bid 0x18672b6b0f's
+    // settlement coin.
+    EXPECT_EQ(ex::CoinManager::settlement_puzzle_hash(dbx).value_or(""), dbx_settlement);
+    EXPECT_EQ(ex::CoinManager::settlement_puzzle_hash("0x" + dbx).value_or(""), dbx_settlement);
+    std::string upper = dbx;
+    std::transform(upper.begin(), upper.end(), upper.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+    EXPECT_EQ(ex::CoinManager::settlement_puzzle_hash(upper).value_or(""), dbx_settlement);
+    EXPECT_EQ(records_of(kBidChildren)[2]["coin"]["puzzle_hash"], "0x" + dbx_settlement);
+
+    // Anything else cannot be named.
+    for (const std::string& asset : {std::string{}, std::string{"dbx"}, std::string{"xch "},
+                                     dbx.substr(1), dbx + "0", "zz" + dbx.substr(2)}) {
+        EXPECT_FALSE(ex::CoinManager::settlement_puzzle_hash(asset).has_value()) << asset;
+    }
+}
+
+TEST(OfferedSettlements, EveryOfferedAssetOrNothing)
+{
+    const auto settlements = [](const json& record) {
+        return ex::offered_settlements(record, settlement_puzzle);
+    };
+    const std::vector<ex::SettlementCoin> ask = settlements(ask_wallet());
+    ASSERT_EQ(ask.size(), 1U);
+    EXPECT_EQ(ask[0].puzzle_hash_hex, settlement_puzzle("xch"));
+    EXPECT_EQ(ask[0].amount, 1000000000000ULL);
+
+    const std::vector<ex::SettlementCoin> bid = settlements(json::parse(kBidWallet));
+    ASSERT_EQ(bid.size(), 1U);
+    EXPECT_EQ(bid[0].puzzle_hash_hex,
+              "2a8269fa3ec2a6968ee95219edc900ada54232beb24ad0f7581f3b3eab613e81");
+    EXPECT_EQ(bid[0].amount, 84696ULL);
+
+    // One asset that cannot be named voids the list, as one bad amount does.
+    json partly = ask_wallet();
+    partly["summary"]["offered"]["dbx"] = "100";
+    EXPECT_TRUE(settlements(partly).empty());
+    json no_summary = ask_wallet();
+    no_summary.erase("summary");
+    EXPECT_TRUE(settlements(no_summary).empty());
 }
 
 TEST(CoinRecordSpentHeight, ReadsEitherFieldAndRefusesADisagreement)
