@@ -11638,10 +11638,12 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
     // and cancel_offer will fail outright.  Block ALL offer management
     // until the wallet reports synced=true.
     //
-    // Auto-recovery: if the wallet stays unsynced for kWalletRestartThreshold
-    // consecutive blocks (~3 min), restart the wallet service.  This breaks
-    // the deadlock where pending_change prevents sync and the sync gate
-    // prevents the force-delete escalation from ever firing.
+    // Auto-recovery [WALLET-RESTART-LIVELOCK 2026-09-22]: restart the wallet
+    // service only when execution/wallet_sync_watch.hpp says so.  This used
+    // to restart after 20 unsynced heartbeats whatever the wallet was doing.
+    // A Chia long sync records its progress only when it completes, and every
+    // restart rolls the wallet back 256 blocks, so on 2026-09-22 the restarts
+    // (9 between 17:18 and 18:24) kept a syncing wallet from ever finishing.
     try {
         auto sync_status = co_await wallet_->get_sync_status();
         bool synced = false;
@@ -11651,25 +11653,47 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         if (sync_status.contains("syncing"))
             syncing = sync_status["syncing"].get<bool>();
 
-        wallet_synced_ = synced && !syncing;
+        // A reply without `syncing` is an unread state, not an idle wallet:
+        // it never earns the short idle budget.  [review round 2] Nor is it
+        // synced: the startup gate already reads a missing `syncing` as true,
+        // and Step 8 must not manage offers on a reading the startup gate
+        // would not proceed on.
+        const bool may_be_syncing = syncing || !sync_status.contains("syncing");
+        const bool fully_synced = synced && !may_be_syncing;
+        wallet_synced_ = fully_synced;
         wallet_syncing_ = syncing;
 
-        if (!synced || syncing) {
-            ++consecutive_unsynced_blocks_;
-            spdlog::warn("[Engine] Step 8: wallet not fully synced "
-                         "(synced={}, syncing={}, unsynced_blocks={}/{}) "
-                         "-- skipping all offer management",
-                         synced, syncing,
-                         consecutive_unsynced_blocks_,
-                         kWalletRestartThreshold);
+        const std::int64_t now_s =
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+        const execution::WalletSyncVerdict sync_watch =
+            execution::observe_wallet_sync(wallet_sync_watch_, fully_synced,
+                                           may_be_syncing, now_s);
 
-            // Escalation: restart wallet service after prolonged unsync.
-            if (consecutive_unsynced_blocks_ >= kWalletRestartThreshold) {
-                spdlog::warn("[Engine] Wallet unsynced for {} consecutive "
-                             "blocks (~{} sec) -- restarting wallet service "
-                             "to force clean resync",
-                             consecutive_unsynced_blocks_,
-                             consecutive_unsynced_blocks_ * 9);
+        if (sync_watch.action != execution::WalletSyncAction::Synced) {
+            // [review round 3] The state the verdict used, not the raw flag: a
+            // reply without `syncing` reads as syncing, and the line says so
+            // rather than print syncing=false beside a rejected reading.
+            const char* const syncing_text =
+                !sync_status.contains("syncing") ? "missing, read as true"
+                                                 : (syncing ? "true" : "false");
+            spdlog::warn("[Engine] Step 8: wallet not fully synced "
+                         "(synced={}, syncing={}) for {}s -- skipping all "
+                         "offer management; a restart waits for {}s "
+                         "unsynced or {}s not syncing (not syncing for {}s)",
+                         synced, syncing_text, sync_watch.unsynced_for_s,
+                         sync_watch.syncing_budget_s, sync_watch.idle_budget_s,
+                         sync_watch.idle_for_s);
+
+            if (sync_watch.action == execution::WalletSyncAction::Restart) {
+                // [review round 4] "If it succeeds": a failed command takes
+                // the doubling back (record_failed_wallet_restart, below).
+                spdlog::warn("[Engine] Wallet unsynced for {}s, {}s of it not "
+                             "syncing -- restarting the wallet service "
+                             "(restart {} since it was last synced; if it "
+                             "succeeds, the next attempt's budgets double)",
+                             sync_watch.unsynced_for_s, sync_watch.idle_for_s,
+                             sync_watch.restarts + 1);
 #ifdef _WIN32
                 int rc = std::system("chia stop wallet & chia start wallet");
 #else
@@ -11678,19 +11702,34 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 if (rc == 0) {
                     spdlog::info("[Engine] Wallet service restart initiated");
                 } else {
+                    // A command that failed restarted nothing: the next
+                    // attempt keeps this one's budget instead of doubling it.
+                    execution::record_failed_wallet_restart(wallet_sync_watch_);
                     spdlog::error("[Engine] Wallet service restart failed "
-                                  "(rc={})", rc);
+                                  "(rc={}); {} failed attempt(s) since the "
+                                  "wallet was last synced -- the next attempt "
+                                  "keeps the same budget", rc,
+                                  wallet_sync_watch_.failed_restarts);
                 }
-                consecutive_unsynced_blocks_ = 0;
             }
             co_return;
         }
 
-        // Wallet is synced -- reset the unsync counter.
-        if (consecutive_unsynced_blocks_ > 0) {
-            spdlog::info("[Engine] Wallet re-synced after {} blocks",
-                         consecutive_unsynced_blocks_);
-            consecutive_unsynced_blocks_ = 0;
+        // [review round 5] The whole outage, not the streak: a restart starts a
+        // fresh streak, so the streak said "0s" whenever the first reading
+        // after a restart or a pause was synced.  A pause inside the outage
+        // leaves its length unknown, and the line says so.
+        if (sync_watch.outage) {
+            if (sync_watch.outage_s.has_value()) {
+                spdlog::info("[Engine] Wallet re-synced after {}s unsynced "
+                             "({} restart(s) along the way)",
+                             *sync_watch.outage_s, sync_watch.restarts);
+            } else {
+                spdlog::info("[Engine] Wallet re-synced after an unsynced "
+                             "period of unknown length: the sync check did "
+                             "not run for part of it ({} restart(s) along "
+                             "the way)", sync_watch.restarts);
+            }
         }
     } catch (const std::exception& e) {
         wallet_synced_ = false;

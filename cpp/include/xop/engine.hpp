@@ -53,6 +53,7 @@
 #include "xop/execution/market_data.hpp"
 #include "xop/execution/offer_manager.hpp"
 #include "xop/execution/take_retry.hpp"
+#include "xop/execution/wallet_sync_watch.hpp"
 
 // Data / analytics
 #include "xop/data/volatility.hpp"
@@ -2699,14 +2700,15 @@ private:
     uint32_t consecutive_pending_blocks_{0};
     static constexpr uint32_t kForceDeletePendingBlocks{12};  // ~10 min
 
-    // -- Wallet unsync auto-recovery -------------------------------------
-    // When the Chia wallet stays unsynced for kWalletRestartThreshold
-    // consecutive blocks, the engine restarts the wallet service to
-    // force a clean resync from the trusted full node.  This breaks the
-    // deadlock where pending_change prevents sync and the sync gate
-    // prevents the force-delete from ever firing.
-    uint32_t consecutive_unsynced_blocks_{0};
-    static constexpr uint32_t kWalletRestartThreshold{20};  // ~3 min
+    // -- Wallet unsync auto-recovery [WALLET-RESTART-LIVELOCK 2026-09-22] --
+    // Step 8 restarts the wallet service only when
+    // execution::observe_wallet_sync() says so: never inside the syncing
+    // budget while the wallet reports a sync, and each restart doubles the
+    // next attempt's budget.  It replaces a 20-heartbeat counter that
+    // restarted a SYNCING wallet every 6-10 minutes -- a livelock, because a
+    // Chia long sync records its progress only when it completes and a
+    // restart rolls the wallet back 256 blocks.
+    execution::WalletSyncWatch wallet_sync_watch_{};
 
     bool wallet_synced_{false};
     bool wallet_syncing_{false};

@@ -94,6 +94,49 @@ Not in this change: the InventoryTracker (the strategy's `q`) and its one-shot
 Step 11 reconcile, and the XCH/DBX bid, which was zero for a different reason
 that evening (`q` above `q_max`).
 
+### The engine stops restarting a wallet that is still syncing
+
+On 2026-09-22 the wallet reported `synced=false, syncing=true` on every Step 8
+heartbeat from 17:08 on, so Step 8 managed no offers all evening. Every 20
+unsynced heartbeats (6-10 minutes in practice; the code said "~3 min") the
+engine ran `chia stop wallet & chia start wallet`, 9 times between 17:18 and
+18:24, and that restart is what kept the wallet from syncing. In Chia 2.7.4 a
+long sync records its progress only when it completes; with
+`use_delta_sync: false` it re-reads every puzzle hash and coin from height 0;
+and a freshly started wallet begins its first long sync by rolling back 256
+blocks. So every restart threw away the sync in progress and moved the wallet
+backwards. At 18:29 its finished-sync height was 9,297,547 against a node peak
+of 9,329,985.
+
+- The restart now follows `execution/wallet_sync_watch.hpp`. A wallet that
+  reports a sync in progress is not restarted until it has been unsynced for
+  2 hours in total. Idle time before the sync counts too, at most 15 minutes,
+  so that a wallet flipping between syncing and idle still reaches a restart
+  (review round 4). One that is neither synced nor syncing is restarted after
+  15 minutes. Each successful restart doubles both budgets for the next
+  attempt (capped at 24 hours), and reporting synced resets them.
+- Time is measured on a monotonic clock instead of counted in heartbeats. A gap
+  of more than 10 minutes between readings (Step 8 not reached) starts a new
+  streak rather than counting as unsynced time.
+- A reply without `syncing` is treated as syncing: never as idle, and never as
+  synced either (review round 2). Step 8 used to read `{"synced": true}` alone
+  as synced and manage offers, while the startup gate kept waiting on the same
+  reply.
+- The Step 8 line says how long the wallet has been unsynced and what a restart
+  waits for; the restart line says which restart it is. It prints the syncing
+  state the verdict used, so a reply without `syncing` reads
+  `syncing=missing, read as true`, not `syncing=false` (review round 3).
+- The re-synced line reports the whole outage, restarts included (review
+  round 5). It printed the unsynced streak, which each restart starts afresh.
+  So after a restart it gave only the time since that restart, and "0s"
+  when the first reading after a restart or a pause was already synced. When
+  Step 8 was not reached for part of the outage, its length is unknown, and
+  the line says so instead of giving a number.
+
+Not in this change: the wallet's own configuration (`use_delta_sync`,
+`connect_to_unknown_peers`), and the restart itself, which is still a blocking
+`std::system` call.
+
 ## [0.10.25] — 2026-09-21 — less dust, fewer cancels, a fee controller shipped off, and stops that keep the book
 
 ### Less reward dust in new offers, except on the no-floor retry
