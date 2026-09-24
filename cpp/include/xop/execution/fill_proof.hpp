@@ -436,23 +436,28 @@ template <class NameOf>
 ///   - the verdict is Live (every maker coin unspent);
 ///   - it came from the full node, not the wallet, whose store is what
 ///     mislabelled these offers;
-///   - it was made at `current_block`, this heartbeat;
-///   - that block is at least `confirmation_depth` past `claimed_height`, the
-///     wallet's confirmed_at_index.  When the node is trusted, the engine's
-///     height is the node's own, so the node has processed the claimed block
-///     and `confirmation_depth` more without seeing a spend.
+///   - it was made by `current_call`, the latest detect_fills call.  [round 4]
+///     A call, not a block: detect_fills can run more than once at one
+///     height, and a proof an earlier call made is not this call's evidence.
+///     Call 0 is no call -- an offer held before its first proof;
+///   - `proved_block`, the height it was made at, is at least
+///     `confirmation_depth` past `claimed_height`, the wallet's
+///     confirmed_at_index.  When the node is trusted, the engine's height is
+///     the node's own, so the node has processed the claimed block and
+///     `confirmation_depth` more without seeing a spend.
 /// Anything else stays withheld until the proof settles or closes the offer.
 [[nodiscard]] constexpr bool live_offer_cancellable(FillProof     verdict,
                                                     bool          from_node,
                                                     std::uint64_t claimed_height,
-                                                    std::uint64_t proved_at,
-                                                    std::uint64_t current_block,
+                                                    std::uint64_t proved_block,
+                                                    std::uint64_t proof_call,
+                                                    std::uint64_t current_call,
                                                     std::uint64_t confirmation_depth) noexcept
 {
     return verdict == FillProof::Live && from_node && claimed_height > 0U
-        && proved_at == current_block
-        && current_block >= claimed_height
-        && current_block - claimed_height >= confirmation_depth;
+        && proof_call != 0U && proof_call == current_call
+        && proved_block >= claimed_height
+        && proved_block - claimed_height >= confirmation_depth;
 }
 
 [[nodiscard]] constexpr const char* fill_proof_name(FillProof proof) noexcept

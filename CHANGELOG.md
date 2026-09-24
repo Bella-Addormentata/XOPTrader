@@ -70,16 +70,20 @@ can pass for an offer nobody took.
   over any status, and an insecure one sets CANCELLED. So a cancel sent during
   a one-heartbeat lookup failure would erase the CONFIRMED the proof is waiting
   on, and a real take with it. The one exception: an offer the full node shows
-  live again can be cancelled. That means every maker coin unspent this
-  heartbeat, with the node at least `confirmation_depth_blocks` past the
-  height the wallet claims. A take undone by a reorganisation therefore does
-  not leave a quote nobody can withdraw. An offer stops being held as soon as
-  the wallet stops reporting it CONFIRMED. Cancel All's wallet-wide sweep skips
-  every trade the wallet calls completed, so it never reports a held offer as
-  cancelled. Such an offer goes through the guarded per-offer path instead:
-  it is cancelled there if the node has proven it live again, and otherwise
-  it stays outstanding. It is never marked cancel_pending over a quote that
-  may still be takeable.
+  live again can be cancelled. That means every maker coin unspent in the
+  latest fill check, with the node at least `confirmation_depth_blocks` past
+  the height the wallet claims. A take undone by a reorganisation therefore
+  does not leave a quote nobody can withdraw. The latest check is counted by
+  call, not by block: two checks can run at one height, and a live proof from
+  the earlier one no longer counts. An offer is held from the poll that reads
+  CONFIRMED, before the engine waits on anything else. So a Cancel All or a
+  shutdown that runs while the proof is being asked cannot slip in before the
+  hold. An offer stops being held as soon as the wallet stops reporting it
+  CONFIRMED. Cancel All's wallet-wide sweep skips every trade the wallet calls
+  completed, so it never reports a held offer as cancelled. Such an offer goes
+  through the guarded per-offer path instead: it is cancelled there if the
+  node has proven it live again, and otherwise it stays outstanding. It is
+  never marked cancel_pending over a quote that may still be takeable.
 - A coin record whose height does not fit a BlockHeight is unreadable, so it
   proves nothing. The engine narrows every proven height to 32 bits, and such
   a height would have wrapped to an old block.

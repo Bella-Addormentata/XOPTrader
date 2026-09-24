@@ -24,6 +24,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 ENGINE = REPO / "cpp" / "src" / "engine.cpp"
 OFFER_MANAGER = REPO / "cpp" / "src" / "execution" / "offer_manager.cpp"
+OFFER_MANAGER_HPP = REPO / "cpp" / "include" / "xop" / "execution" / "offer_manager.hpp"
 CHIA_RPC = REPO / "cpp" / "src" / "rpc" / "chia_rpc.cpp"
 
 DETECT_FILLS = "asio::awaitable<std::vector<Fill>> OfferManager::detect_fills("
@@ -326,13 +327,14 @@ def test_a_confirmed_offer_under_proof_is_never_cancelled():
     assert "co_return false;" in _block_after(emergency, early.group(0))
 
     # Review round 2: withheld unless the LATEST proof makes it cancellable --
-    # a Live verdict from the node, this heartbeat, at depth past the claim.
+    # a Live verdict from the node, made by the latest detect_fills call (round
+    # 4: the call, not the block), at depth past the claim.
     helper = _function_body(manager, "bool OfferManager::cancel_withheld_for_proof(")
     missing = re.search(r"if \(held == fill_proof_deferrals_\.end\(\)\) \{\s*return false;", helper)
     assert missing, "an offer not under proof is never withheld"
     decision = _call_args(helper, "live_offer_cancellable")
     assert decision == [["latest.verdict", "latest.from_node", "latest.claimed_height",
-                         "latest.proved_at", "last_detect_block_",
+                         "latest.proved_block", "latest.proof_call", "fill_poll_heartbeat_",
                          "strategy_cfg_.confirmation_depth_blocks"]], decision
     assert re.search(r"return\s*!\s*live_offer_cancellable\(", helper)
 
@@ -370,9 +372,16 @@ def test_the_latest_proof_is_what_a_cancel_is_judged_by():
     as the wallet stops calling it CONFIRMED."""
     manager = _source(OFFER_MANAGER)
     detect = _function_body(manager, DETECT_FILLS)
-    assert detect.index("last_detect_block_ = current_block;") < detect.index("co_return"), (
-        "the heartbeat a proof belongs to must be known before detect_fills returns"
+    # [round 4] A proof belongs to a detect_fills CALL, numbered by the poll
+    # heartbeat counter.  It is advanced once per call, before the call's
+    # first await, and written nowhere else, so while a call waits, no proof
+    # an earlier call made can pass for this one's.
+    assert detect.index("++fill_poll_heartbeat_;") < detect.index("co_await"), (
+        "the call is numbered before its first await"
     )
+    writes = re.findall(r"\+\+\s*fill_poll_heartbeat_|--\s*fill_poll_heartbeat_"
+                        r"|fill_poll_heartbeat_\s*(?:\+\+|--|[-+*/]?=(?!=))", manager)
+    assert writes == ["++fill_poll_heartbeat_"], writes
     cleared = re.search(r"if \(status != trade_status::kConfirmed\) \{\s*"
                         r"fill_proof_deferrals_\.erase\(trade_id\);\s*\}", detect)
     assert cleared and cleared.start() < detect.index("if (status == trade_status::kConfirmed) {"), (
@@ -389,8 +398,32 @@ def test_the_latest_proof_is_what_a_cancel_is_judged_by():
     assert re.search(r"asked_node = ask_node;", prove), "the proof's source must be reported"
     handler = _function_body(manager, HANDLE_UNPROVEN)
     for field, value in (("verdict", "proof.verdict"), ("from_node", "from_node"),
-                         ("claimed_height", "claimed_height"), ("proved_at", "current_block")):
+                         ("claimed_height", "claimed_height"), ("proved_block", "current_block"),
+                         ("proof_call", "fill_poll_heartbeat_")):
         assert re.search(r"deferral\.%s\s*=\s*%s;" % (field, re.escape(value)), handler), field
+
+
+def test_an_offer_is_held_from_the_moment_the_wallet_says_confirmed():
+    """[review #171, round 4] The guard was entered only after the offer's own
+    proof lookup.  Every await before that -- this call's later polls included
+    -- let a detached Cancel All or the shutdown ladder run on the engine's one
+    io_context, find no guard, and report the offer cancelled or overwrite the
+    CONFIRMED the proof waits on.  The poll that reads CONFIRMED now holds the
+    offer, with no await in between, and a new entry is never cancellable."""
+    detect = _function_body(_source(OFFER_MANAGER), DETECT_FILLS)
+    poll = detect.index("co_await wallet_->get_offer(trade_id,")
+    hold = re.search(r"if \(const auto st = rec\.find\(\"status\"\);\s*"
+                     r"st != rec\.end\(\) && trade_status::parse\(\*st\) == trade_status::kConfirmed\) \{\s*"
+                     r"fill_proof_deferrals_\.try_emplace\(trade_id\);\s*\}", detect)
+    assert hold and hold.start() > poll, "the offer is held by the poll that reads CONFIRMED"
+    assert "co_await" not in detect[poll + len("co_await"):hold.start()], (
+        "an await between reading CONFIRMED and holding the offer reopens the window"
+    )
+    assert hold.end() < detect.index("trade_records.push_back(std::move(rec));")
+    assert hold.end() < detect.index("co_await prove_fill_on_chain(")
+    deferral = _block_after(_source(OFFER_MANAGER_HPP), "struct FillProofDeferral {")
+    assert re.search(r"FillProof\s+verdict\{\};", deferral), "a new entry is Unknown"
+    assert re.search(r"std::uint64_t\s+proof_call\{0\};", deferral), "a new entry is from no call"
 
 
 def test_the_wallet_fallback_refuses_while_unsynced():

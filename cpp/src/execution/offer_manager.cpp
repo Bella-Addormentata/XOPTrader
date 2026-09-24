@@ -1346,10 +1346,15 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
     // [S25] Describes THIS call only; the engine drains it after we return.
     last_terminal_offers_.clear();
     last_dead_offers_.clear();
-    last_detect_block_ = current_block;
 
     // [WALLET-LOAD 2026-08-04] Advance the poll heartbeat counter once per
     // invocation -- the backoff schedule below is phased on it.
+    //
+    // [FILL-PROOF, review #171 round 4] It also numbers the call a fill proof
+    // belongs to.  Advanced here, before the first await, it makes every proof
+    // an earlier call made stale for the whole of this one, so a cancel that
+    // runs while this call waits is withheld.  The block could not do this:
+    // two calls at one height would share it.
     ++fill_poll_heartbeat_;
 
     // Get all known pending offers from state for comparison.
@@ -1450,9 +1455,20 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
         }
 
         try {
-            trade_records.push_back(
-                co_await wallet_->get_offer(trade_id,
-                                            /*file_contents=*/false));
+            json rec = co_await wallet_->get_offer(trade_id, /*file_contents=*/false);
+            // [FILL-PROOF, review #171 round 4] HELD FROM THE POLL THAT READS
+            // CONFIRMED.  The guard used to be entered only after this offer's
+            // own proof lookup, and every await before that -- this loop's
+            // later polls included -- let a detached Cancel All or the shutdown
+            // ladder run, find no guard, and report the offer cancelled or
+            // overwrite the CONFIRMED the proof waits on.  No await comes
+            // between the read and the hold.  A new entry is never cancellable,
+            // and an existing one keeps its count for the log.
+            if (const auto st = rec.find("status");
+                st != rec.end() && trade_status::parse(*st) == trade_status::kConfirmed) {
+                fill_proof_deferrals_.try_emplace(trade_id);
+            }
+            trade_records.push_back(std::move(rec));
             polled_ids.push_back(trade_id);
         } catch (const rpc::ChiaRPCError& e) {
             logger_->error("get_offer failed during fill detection for {}: {}",
@@ -1923,15 +1939,14 @@ void OfferManager::handle_unproven_fill(const std::string& trade_id,
     deferral.verdict        = proof.verdict;
     deferral.from_node      = from_node;
     deferral.claimed_height = claimed_height;
-    deferral.proved_at      = current_block;
+    deferral.proved_block   = current_block;
+    deferral.proof_call     = fill_poll_heartbeat_;
     if (deferrals != 1U && deferrals % 20U != 0U) {
         return;
     }
     std::string why = failure.empty() ? std::string{"no usable answer"} : failure;
     if (proof.verdict == FillProof::Live) {
-        why = live_offer_cancellable(proof.verdict, from_node, claimed_height,
-                                     current_block, current_block,
-                                     strategy_cfg_.confirmation_depth_blocks)
+        why = !cancel_withheld_for_proof(trade_id)
                   ? "every maker coin is still unspent, "
                     + std::to_string(strategy_cfg_.confirmation_depth_blocks)
                     + "+ blocks past the height the wallet claims -- the offer is "
@@ -1962,7 +1977,7 @@ bool OfferManager::cancel_withheld_for_proof(const std::string& trade_id) const
     }
     const FillProofDeferral& latest = held->second;
     return !live_offer_cancellable(latest.verdict, latest.from_node, latest.claimed_height,
-                                   latest.proved_at, last_detect_block_,
+                                   latest.proved_block, latest.proof_call, fill_poll_heartbeat_,
                                    strategy_cfg_.confirmation_depth_blocks);
 }
 

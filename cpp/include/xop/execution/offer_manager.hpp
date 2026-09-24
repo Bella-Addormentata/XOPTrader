@@ -1391,19 +1391,20 @@ private:
     /// An offer the wallet reports CONFIRMED that the proof has not settled:
     /// how long it has waited, and the latest proof.  The latest proof decides
     /// whether cancel_offer_charged() withholds its cancels
-    /// (execution::live_offer_cancellable).  The entry goes once the wallet
+    /// (execution::live_offer_cancellable).  [review #171, round 4] The entry
+    /// is made by the poll that reads CONFIRMED, before the next await, so an
+    /// offer is held while its proof is asked -- a new entry is Unknown and
+    /// from no call, which is never cancellable.  It goes once the wallet
     /// stops reporting CONFIRMED, or the offer leaves State.
     struct FillProofDeferral {
         std::uint32_t count{0};                    ///< consecutive deferrals, for the log
         FillProof     verdict{};                   ///< the latest proof (Unknown until one)
         bool          from_node{false};            ///< it came from the full node
         std::uint64_t claimed_height{0};           ///< the wallet's confirmed_at_index
-        BlockHeight   proved_at{0};                ///< the heartbeat it was made at
+        BlockHeight   proved_block{0};             ///< the height it was made at
+        std::uint64_t proof_call{0};               ///< the detect_fills call that made it (0: none)
     };
     std::unordered_map<std::string, FillProofDeferral> fill_proof_deferrals_;
-    /// The block the most recent detect_fills() ran at: a proof made then is
-    /// this heartbeat's.
-    BlockHeight last_detect_block_{0};
 
     /// Whether cancel_offer_charged() must refuse `trade_id`: an offer under
     /// proof, unless its latest proof makes it cancellable.
@@ -1602,7 +1603,9 @@ private:
     std::unordered_map<std::string, std::uint32_t> fill_poll_pending_counts_;
 
     /// Monotonic detect_fills invocation counter (the "heartbeat index"
-    /// of the poll backoff schedule).
+    /// of the poll backoff schedule).  [FILL-PROOF, review #171 round 4] Also
+    /// the call a fill proof belongs to: a proof is fresh only while no later
+    /// call has started (execution::live_offer_cancellable).
     std::uint64_t fill_poll_heartbeat_{0};
 
     /// [S70] Block of retire_expired_offers' last WARN.  A wallet that cannot
