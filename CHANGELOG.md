@@ -110,6 +110,17 @@ can pass for an offer nobody took.
   through the guarded per-offer path instead: it is cancelled there if the
   node has proven it live again, and otherwise it stays outstanding. It is
   never marked cancel_pending over a quote that may still be takeable.
+  A hold, though, is the status of the last poll, and the sweep acts on the
+  status each trade has when it runs. In chia 2.7.4 it marks PENDING_CANCEL
+  every trade it cancels, and every trade not yet CANCELLED that shares a
+  cancellation coin with one, a held CONFIRMED trade included. So after an
+  accepted sweep, each held offer's status is read again (review round 10).
+  Only one the wallet still reports CONFIRMED goes to the guarded path. One
+  now PENDING_CANCEL, CANCELLED or FAILED is reported with the sweep's
+  offers, and is not cancelled a second time. One PENDING_ACCEPT or
+  PENDING_CONFIRM is live and was not swept, so it is cancelled. One whose
+  status cannot be read is sent nothing and reported outstanding. Every
+  status the wallet really reports other than CONFIRMED releases the hold.
 - A coin record whose height does not fit a BlockHeight is unreadable, so it
   proves nothing. The engine narrows every proven height to 32 bits, and such
   a height would have wrapped to an old block.

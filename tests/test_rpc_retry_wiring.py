@@ -193,7 +193,13 @@ def test_cancel_all_sends_nothing_more_after_a_possibly_submitted_sweep():
     assert code.count("cancel_ids(") == 2
     assert code.find("cancel_ids(", branches[1]) > branches[2]
     bulk = _block(code, "if(bulk_ok){")
-    assert bulk.count("cancel_ids(") == 1 and "cancel_ids(held,deadline)" in bulk
+    # [review #171 round 10] ...and of those, only the ones a re-read after the
+    # sweep finds still CONFIRMED, or live and not swept: an offer the sweep
+    # already covered is not cancelled a second time.
+    assert bulk.count("cancel_ids(") == 1 and "cancel_ids(to_cancel,deadline)" in bulk
+    reread = _block(bulk, "for(std::size_ti=0;i<held.size();++i){")
+    assert "constauto&oid=held[i];" in reread
+    assert bulk.count("to_cancel.push_back(") == 2 == reread.count("to_cancel.push_back(oid);")
     assert bulk.count("held.push_back(") == 1
     assert "held.push_back(po.offer_id);" in _block(
         bulk, "if(fill_proof_deferrals_.count(po.offer_id)>0U){"), (

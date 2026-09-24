@@ -2400,7 +2400,67 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(
             }
         }
         if (!held.empty()) {
-            CancelOutcome per_offer = co_await cancel_ids(held, deadline);
+            // [review #171 round 10] RE-READ, AFTER THE SWEEP, WHAT IT DID TO
+            // EACH HELD OFFER.  A hold records the status of the LAST POLL; the
+            // sweep acted on the status each trade had when it ran.  In chia
+            // 2.7.4 it cancels every PENDING_ACCEPT, PENDING_CONFIRM and
+            // PENDING_CANCEL trade and marks each PENDING_CANCEL before it
+            // returns -- and also every trade not yet CANCELLED that shares a
+            // cancellation coin with one, a held CONFIRMED trade included
+            // (trade_manager.cancel_pending_offers, get_trades_by_coin).  So the
+            // sweep may already cover a held offer, and sending it down the
+            // per-offer path as well would cancel it a second time or report it
+            // outstanding.  Only an offer the wallet still reports CONFIRMED,
+            // which the sweep skipped, is left to the guard:
+            //   - CONFIRMED: the guarded per-offer path decides, as before;
+            //   - PENDING_CANCEL: a cancel is in flight, this sweep's or an
+            //     earlier one's -- nothing more is sent;
+            //   - CANCELLED or FAILED: nothing is left to cancel;
+            //   - PENDING_ACCEPT or PENDING_CONFIRM: live, and not in the sweep,
+            //     which would have left it PENDING_CANCEL -- cancelled here;
+            //   - no answer, or no status the wallet really reports: the sweep
+            //     may or may not have cancelled it, so nothing is sent and it
+            //     is reported outstanding.
+            // Any status the wallet really reports other than CONFIRMED releases
+            // the hold, as the poll's does (round 6).
+            std::vector<std::string> to_cancel;
+            std::vector<std::string> unread;
+            std::size_t covered = 0;
+            std::string read_error;
+            for (std::size_t i = 0; i < held.size(); ++i) {
+                const auto& oid = held[i];
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    for (std::size_t j = i; j < held.size(); ++j) {
+                        unread.push_back(held[j]);
+                    }
+                    out.deadline_hit = true;
+                    break;
+                }
+                int status = -1;
+                try {
+                    const json rec = co_await wallet_->get_offer(oid, /*file_contents=*/false);
+                    if (const auto st = rec.find("status"); st != rec.end()) {
+                        status = trade_status::parse(*st);
+                    }
+                } catch (const std::exception& e) {
+                    read_error = e.what();
+                }
+                if (status == trade_status::kConfirmed) {
+                    to_cancel.push_back(oid);
+                } else if (status == trade_status::kPendingCancel
+                           || status == trade_status::kCancelled
+                           || status == trade_status::kFailed) {
+                    fill_proof_deferrals_.erase(oid);
+                    out.cancelled.push_back(oid);
+                    ++covered;
+                } else if (trade_status::is_known(status)) {
+                    fill_proof_deferrals_.erase(oid);
+                    to_cancel.push_back(oid);
+                } else {
+                    unread.push_back(oid);
+                }
+            }
+            CancelOutcome per_offer = co_await cancel_ids(to_cancel, deadline);
             out.cancelled.insert(out.cancelled.end(), per_offer.cancelled.begin(),
                                  per_offer.cancelled.end());
             out.failed.insert(out.failed.end(), per_offer.failed.begin(),
@@ -2412,12 +2472,29 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(
                 out.last_error  = per_offer.last_error;
                 out.worst_class = per_offer.worst_class;
             }
+            if (!unread.empty()) {
+                out.failed.insert(out.failed.end(), unread.begin(), unread.end());
+                std::string why = read_error.empty()
+                    ? std::string{"the status of an offer the fill proof holds "
+                                  "could not be read after the sweep"}
+                    : read_error;
+                const auto cls = execution::classify_take_failure(why);
+                out.worst_class = per_offer.failed.empty()
+                    ? cls
+                    : execution::more_retryable(out.worst_class, cls);
+                if (per_offer.failed.empty()) {
+                    out.last_error = std::move(why);
+                }
+            }
             out.deadline_hit = out.deadline_hit || per_offer.deadline_hit;
-            logger_->warn("cancel_all: {} offer(s) the wallet reports CONFIRMED "
-                          "were not in the sweep (the fill proof holds them) -- "
-                          "{} cancelled one by one, {} still outstanding",
-                          held.size(), per_offer.cancelled.size(),
-                          per_offer.failed.size());
+            logger_->warn("cancel_all: {} offer(s) the fill proof held, re-read "
+                          "after the sweep: {} already covered by a cancel or "
+                          "closed; {} still CONFIRMED or live and not swept -- "
+                          "{} cancelled one by one, {} still outstanding; {} "
+                          "unreadable, reported outstanding with nothing sent",
+                          held.size(), covered, to_cancel.size(),
+                          per_offer.cancelled.size(), per_offer.failed.size(),
+                          unread.size());
         }
     } else if (bulk_possibly_submitted) {
         // [review 2026-09-13, round 2] NO ANSWER IS NOT A REFUSAL.  The sweep

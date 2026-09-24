@@ -375,16 +375,86 @@ def test_the_bulk_sweep_never_reports_a_proof_held_offer_cancelled():
                       r"held\.push_back\(po\.offer_id\);\s*\} else \{\s*"
                       r"out\.cancelled\.push_back\(po\.offer_id\);\s*\}", bulk_ok)
     assert split, "a proof-held offer must not be reported cancelled by the sweep"
-    assert bulk_ok.count("out.cancelled.push_back(") == 1, (
+    # [round 10] ...unless the re-read after the sweep finds it covered by a
+    # cancel or closed (test_the_sweep_is_judged_by_what_the_wallet_reports_after_it).
+    assert bulk_ok.count("out.cancelled.push_back(") == 2, (
         "no other path in the bulk branch may report an id cancelled"
     )
-    per_offer = bulk_ok.index("co_await cancel_ids(held, deadline)")
+    per_offer = bulk_ok.index("co_await cancel_ids(to_cancel, deadline)")
     assert per_offer > split.end(), "held offers go through the guarded per-offer path"
     after = bulk_ok[per_offer:]
     for field in ("cancelled", "failed", "already_pending"):
         assert re.search(r"out\.%s\.insert\(\s*out\.%s\.end\(\),\s*per_offer\.%s\.begin\(\),"
                          r"\s*per_offer\.%s\.end\(\)\);" % ((field,) * 4), after), (
             "the per-offer outcome must be kept: " + field)
+
+
+def test_the_sweep_is_judged_by_what_the_wallet_reports_after_it():
+    """[review #171, round 10] A hold records the LAST POLL's status, but the
+    sweep acts on the status each trade has when it runs.  In chia 2.7.4 it
+    cancels every PENDING_ACCEPT, PENDING_CONFIRM and PENDING_CANCEL trade,
+    leaves each PENDING_CANCEL, and marks PENDING_CANCEL every trade not yet
+    CANCELLED that shares a cancellation coin with one -- a held CONFIRMED
+    trade included.  Sending every held offer down the per-offer path could
+    therefore cancel one a second time, or report outstanding an offer the
+    sweep covered.  So each held offer's status is read again after the sweep,
+    and only one the wallet still reports CONFIRMED goes to the guard.  One the
+    sweep covered, or that is closed, is reported with the sweep's; one that is
+    live and was not swept is released and cancelled; one whose status cannot
+    be read is sent nothing and reported outstanding."""
+    manager = _source(OFFER_MANAGER)
+    cancel_all = _function_body(
+        manager, "asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(")
+    bulk_ok = _block_after(cancel_all, "if (bulk_ok) {")
+    held_branch = _block_after(bulk_ok, "if (!held.empty()) {")
+    loop_head = "for (std::size_t i = 0; i < held.size(); ++i) {"
+    assert held_branch.index(loop_head) < held_branch.index("co_await cancel_ids("), (
+        "every held offer is re-read before any is cancelled"
+    )
+    reread = _block_after(held_branch, loop_head)
+    assert reread[1:].lstrip().startswith("const auto& oid = held[i];")
+
+    # The deadline comes first, and whatever it cuts short is reported, not dropped.
+    deadline = re.search(r"if \(std::chrono::steady_clock::now\(\) >= deadline\) \{\s*"
+                         r"for \(std::size_t j = i; j < held\.size\(\); \+\+j\) \{\s*"
+                         r"unread\.push_back\(held\[j\]\);\s*\}\s*"
+                         r"out\.deadline_hit = true;\s*break;\s*\}", reread)
+    assert deadline and deadline.start() < reread.index("co_await wallet_->get_offer("), (
+        "the re-read stops at the deadline and reports the rest outstanding"
+    )
+    # One read per offer, and a read that fails leaves no status at all.
+    read = re.search(r"int status = -1;\s*try \{\s*"
+                     r"const json rec = co_await wallet_->get_offer\(oid, /\*file_contents=\*/false\);\s*"
+                     r"if \(const auto st = rec\.find\(\"status\"\); st != rec\.end\(\)\) \{\s*"
+                     r"status = trade_status::parse\(\*st\);\s*\}\s*"
+                     r"\} catch \(const std::exception& e\) \{\s*read_error = e\.what\(\);\s*\}",
+                     reread)
+    assert read, "the status is read after the sweep, and a failed read is no status"
+    # The decision, in full.
+    decision = re.search(
+        r"if \(status == trade_status::kConfirmed\) \{\s*to_cancel\.push_back\(oid\);\s*"
+        r"\} else if \(status == trade_status::kPendingCancel\s*"
+        r"\|\| status == trade_status::kCancelled\s*"
+        r"\|\| status == trade_status::kFailed\) \{\s*"
+        r"fill_proof_deferrals_\.erase\(oid\);\s*out\.cancelled\.push_back\(oid\);\s*\+\+covered;\s*"
+        r"\} else if \(trade_status::is_known\(status\)\) \{\s*"
+        r"fill_proof_deferrals_\.erase\(oid\);\s*to_cancel\.push_back\(oid\);\s*"
+        r"\} else \{\s*unread\.push_back\(oid\);\s*\}", reread)
+    assert decision and decision.start() > read.end(), (
+        "CONFIRMED goes to the guard; a cancel in flight or a closed offer is the sweep's; "
+        "any other real status is released and cancelled; anything else is unread"
+    )
+    # Only the re-read's picks are cancelled one by one.  An unread offer is
+    # reported outstanding: never cancelled, never reported cancelled.
+    assert held_branch.count("to_cancel.push_back(") == 2
+    assert held_branch.count("unread.push_back(") == 2
+    assert "co_await cancel_ids(to_cancel, deadline)" in held_branch
+    kept = re.search(r"if \(!unread\.empty\(\)\) \{\s*"
+                     r"out\.failed\.insert\(out\.failed\.end\(\), unread\.begin\(\), unread\.end\(\)\);",
+                     held_branch)
+    assert kept and kept.start() > held_branch.index("co_await cancel_ids("), (
+        "an offer whose status is unknown is reported outstanding"
+    )
 
 
 def test_the_latest_proof_is_what_a_cancel_is_judged_by():
