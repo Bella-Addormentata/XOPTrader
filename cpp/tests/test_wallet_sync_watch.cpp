@@ -184,6 +184,89 @@ TEST(WalletSyncWatch, ASyncedWalletReportsNoStreak)
     EXPECT_EQ(v.restarts, 0U);
 }
 
+// ---------------------------------------------------------------------------
+// [review round 5] The outage: what the "re-synced after" line reports
+// ---------------------------------------------------------------------------
+
+TEST(WalletSyncWatch, TheReSyncReportsTheWholeOutageRestartsIncluded)
+{
+    WalletSyncWatch watch;
+    ASSERT_EQ(see(watch, kUnsynced, kIdle, 0).action, WalletSyncAction::Wait);
+    ASSERT_EQ(see(watch, kUnsynced, kIdle, 450).action, WalletSyncAction::Wait);
+    ASSERT_EQ(see(watch, kUnsynced, kIdle, 900).action, WalletSyncAction::Restart);
+    ASSERT_EQ(see(watch, kUnsynced, kSyncing, 960).action, WalletSyncAction::Wait);
+
+    const WalletSyncVerdict v = see(watch, kSynced, kIdle, 1500);
+    ASSERT_EQ(v.action, WalletSyncAction::Synced);
+    EXPECT_TRUE(v.outage);
+    ASSERT_TRUE(v.outage_s.has_value());
+    EXPECT_EQ(*v.outage_s, 1500);          // from 0, not from the restart
+    EXPECT_EQ(v.unsynced_for_s, 540);      // the streak alone: 960 to 1500
+    EXPECT_EQ(v.restarts, 1U);
+}
+
+TEST(WalletSyncWatch, ASyncedReadingRightAfterARestartIsNoZeroOutage)
+{
+    // The line used to say "re-synced after 0s unsynced (1 restart(s))".
+    WalletSyncWatch watch;
+    ASSERT_EQ(see(watch, kUnsynced, kIdle, 0).action, WalletSyncAction::Wait);
+    ASSERT_EQ(see(watch, kUnsynced, kIdle, 450).action, WalletSyncAction::Wait);
+    ASSERT_EQ(see(watch, kUnsynced, kIdle, 900).action, WalletSyncAction::Restart);
+
+    const WalletSyncVerdict v = see(watch, kSynced, kIdle, 930);
+    EXPECT_EQ(v.unsynced_for_s, 0);        // the restart emptied the streak
+    ASSERT_TRUE(v.outage_s.has_value());
+    EXPECT_EQ(*v.outage_s, 930);
+    EXPECT_EQ(v.restarts, 1U);
+}
+
+TEST(WalletSyncWatch, ASilenceInsideTheOutageLeavesItsLengthUnknown)
+{
+    // The review's case: a restart, then Step 8 not reached for 5000 s, then
+    // a synced reading.  The restart count survives the silence; the length
+    // of the outage does not.
+    WalletSyncWatch watch;
+    ASSERT_EQ(see(watch, kUnsynced, kIdle, 0).action, WalletSyncAction::Wait);
+    ASSERT_EQ(see(watch, kUnsynced, kIdle, 450).action, WalletSyncAction::Wait);
+    ASSERT_EQ(see(watch, kUnsynced, kIdle, 900).action, WalletSyncAction::Restart);
+
+    const WalletSyncVerdict v = see(watch, kSynced, kIdle, 900 + 5000);
+    ASSERT_EQ(v.action, WalletSyncAction::Synced);
+    EXPECT_TRUE(v.outage);
+    EXPECT_FALSE(v.outage_s.has_value());
+    EXPECT_EQ(v.restarts, 1U);
+}
+
+TEST(WalletSyncWatch, ASilenceBeforeTheOutageLeavesItKnown)
+{
+    WalletSyncWatch watch;
+    ASSERT_EQ(see(watch, kSynced, kIdle, 0).action, WalletSyncAction::Synced);
+    ASSERT_EQ(see(watch, kUnsynced, kIdle, 5000).action, WalletSyncAction::Wait);
+    ASSERT_EQ(see(watch, kUnsynced, kIdle, 5030).action, WalletSyncAction::Wait);
+
+    const WalletSyncVerdict v = see(watch, kSynced, kIdle, 5100);
+    ASSERT_TRUE(v.outage_s.has_value());
+    EXPECT_EQ(*v.outage_s, 100);
+}
+
+TEST(WalletSyncWatch, SyncedEndsTheOutage)
+{
+    WalletSyncWatch watch;
+    ASSERT_EQ(see(watch, kUnsynced, kIdle, 0).action, WalletSyncAction::Wait);
+    const WalletSyncVerdict first = see(watch, kSynced, kIdle, 100);
+    ASSERT_TRUE(first.outage_s.has_value());
+    EXPECT_EQ(*first.outage_s, 100);
+
+    const WalletSyncVerdict quiet = see(watch, kSynced, kIdle, 130);
+    EXPECT_FALSE(quiet.outage);            // synced to synced: nothing to report
+    EXPECT_FALSE(quiet.outage_s.has_value());
+
+    ASSERT_EQ(see(watch, kUnsynced, kIdle, 200).action, WalletSyncAction::Wait);
+    const WalletSyncVerdict next = see(watch, kSynced, kIdle, 300);
+    ASSERT_TRUE(next.outage_s.has_value());
+    EXPECT_EQ(*next.outage_s, 100);        // from 200, not from 0
+}
+
 TEST(WalletSyncWatch, ALongSilenceStartsANewStreak)
 {
     // Step 8 not reached for 5000 s (paused, breaker open): the wallet may

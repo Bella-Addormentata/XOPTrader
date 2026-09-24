@@ -243,3 +243,26 @@ def test_the_watch_runs_on_a_monotonic_clock() -> None:
     assert "steady_clock" in now.group(1)
     assert "system_clock" not in now.group(1)
     assert _call_args(body, "execution::observe_wallet_sync")[0][3] == "now_s"
+
+def test_the_resync_line_reports_the_whole_outage_or_says_it_is_unknown() -> None:
+    """Review round 5: a restart starts a fresh streak, so the re-synced line,
+    which printed the streak, said "0s unsynced" whenever the first reading
+    after a restart or a pause was synced -- after a restart it reported only
+    the time since that restart.  It now prints the whole outage the watch
+    keeps (execution::WalletSyncVerdict::outage_s), and says the length is
+    unknown when a pause fell inside it, instead of printing a number."""
+    body = _function_body(_engine(), STEP8)
+    line_at = body.index('"[Engine] Wallet re-synced after {}s unsynced "')
+    gate = re.search(r"if \(sync_watch\.outage\) \{\s*"
+                     r"if \(sync_watch\.outage_s\.has_value\(\)\) \{", body)
+    assert gate and gate.end() < line_at, "the line is not gated on a known outage"
+    known = _call_args(body[body.rindex("spdlog::info(", 0, line_at):], "spdlog::info")[0]
+    assert known[1:] == ["*sync_watch.outage_s", "sync_watch.restarts"], known
+    unknown_at = body.index('"[Engine] Wallet re-synced after an unsynced "')
+    assert unknown_at > line_at
+    unknown = _call_args(body[body.rindex("spdlog::info(", 0, unknown_at):], "spdlog::info")[0]
+    assert unknown[1:] == ["sync_watch.restarts"], unknown
+    assert "sync_watch.unsynced_for_s" not in body[gate.start():unknown_at], (
+        "the streak must not be reported as the outage"
+    )
+

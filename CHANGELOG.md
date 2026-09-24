@@ -39,6 +39,12 @@ of 9,329,985.
   waits for; the restart line says which restart it is. It prints the syncing
   state the verdict used, so a reply without `syncing` reads
   `syncing=missing, read as true`, not `syncing=false` (review round 3).
+- The re-synced line reports the whole outage, restarts included (review
+  round 5). It printed the unsynced streak, which each restart starts afresh.
+  So after a restart it gave only the time since that restart, and "0s"
+  when the first reading after a restart or a pause was already synced. When
+  Step 8 was not reached for part of the outage, its length is unknown, and
+  the line says so instead of giving a number.
 
 Not in this change: the wallet's own configuration (`use_delta_sync`,
 `connect_to_unknown_peers`), and the restart itself, which is still a blocking

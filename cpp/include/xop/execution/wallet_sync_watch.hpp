@@ -51,6 +51,12 @@
 //     than max_observation_gap_s (Step 8 not reached: paused, breaker open)
 //     says nothing about the wallet, so it starts a new streak instead of
 //     arriving as one enormous unsynced interval.
+//   * THE OUTAGE IS NOT THE STREAK.  [review round 5] A restart starts a fresh
+//     streak, so the streak cannot say how long the wallet was out: right
+//     after a restart it is empty.  The watch also keeps the whole outage,
+//     from the first unsynced reading since the wallet last reported synced,
+//     through every restart.  A silence inside it makes its length unknown,
+//     and the verdict says so instead of reporting a number.
 //
 // NOT DECIDED HERE: how the engine restarts the wallet, and what an unknown
 // sync state means.  The engine treats a reply without `syncing` as syncing:
@@ -79,6 +85,8 @@ struct WalletSyncWatch {
     std::optional<std::int64_t> last_observed{};
     std::uint32_t               restarts{0};       ///< restarts since the wallet last reported synced
     std::uint32_t               failed_restarts{0};///< restart COMMANDS that failed, same period
+    std::optional<std::int64_t> outage_since{};    ///< [round 5] first unsynced reading since then; restarts keep it
+    bool                        outage_blurred{false}; ///< [round 5] a silence fell inside that outage
 };
 
 enum class WalletSyncAction : std::uint8_t {
@@ -96,6 +104,11 @@ struct WalletSyncVerdict {
     std::int64_t     idle_budget_s{0};     ///< budgets in force for this streak, after backoff
     std::int64_t     syncing_budget_s{0};
     std::uint32_t    restarts{0};          ///< restarts before this observation's decision
+    /// [review round 5] On Synced: an unsynced outage just ended, and its whole
+    /// length, restarts included.  Empty when a silence longer than
+    /// max_observation_gap_s fell inside it, since its length is then unknown.
+    bool                        outage{false};
+    std::optional<std::int64_t> outage_s{};
 };
 
 /// `base` doubled once per restart, capped at `cap`; overflow-safe.
@@ -121,15 +134,24 @@ struct WalletSyncVerdict {
         && now_s - *watch.last_observed > policy.max_observation_gap_s) {
         watch.unsynced_since.reset();
         watch.idle_since.reset();
+        // [review round 5] The outage goes on; only its length is lost.
+        if (watch.outage_since.has_value()) {
+            watch.outage_blurred = true;
+        }
     }
     watch.last_observed = now_s;
 
     WalletSyncVerdict verdict{};
     verdict.restarts = watch.restarts;
     if (synced) {
-        // The streak that just ended, for the "re-synced after" log.
+        // The streak that just ended: what the budgets measured.
         verdict.unsynced_for_s = watch.unsynced_since.has_value()
                                      ? now_s - *watch.unsynced_since : 0;
+        // [review round 5] And the whole outage, for the "re-synced after" log.
+        verdict.outage = watch.outage_since.has_value();
+        if (verdict.outage && !watch.outage_blurred) {
+            verdict.outage_s = now_s - *watch.outage_since;
+        }
         watch = WalletSyncWatch{};
         watch.last_observed = now_s;
         verdict.action = WalletSyncAction::Synced;
@@ -138,6 +160,9 @@ struct WalletSyncVerdict {
 
     if (!watch.unsynced_since.has_value()) {
         watch.unsynced_since = now_s;
+    }
+    if (!watch.outage_since.has_value()) {
+        watch.outage_since = now_s;
     }
     if (syncing) {
         watch.idle_since.reset();

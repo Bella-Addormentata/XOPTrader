@@ -11626,10 +11626,21 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             co_return;
         }
 
-        if (sync_watch.unsynced_for_s > 0 || sync_watch.restarts > 0) {
-            spdlog::info("[Engine] Wallet re-synced after {}s unsynced "
-                         "({} restart(s) along the way)",
-                         sync_watch.unsynced_for_s, sync_watch.restarts);
+        // [review round 5] The whole outage, not the streak: a restart starts a
+        // fresh streak, so the streak said "0s" whenever the first reading
+        // after a restart or a pause was synced.  A pause inside the outage
+        // leaves its length unknown, and the line says so.
+        if (sync_watch.outage) {
+            if (sync_watch.outage_s.has_value()) {
+                spdlog::info("[Engine] Wallet re-synced after {}s unsynced "
+                             "({} restart(s) along the way)",
+                             *sync_watch.outage_s, sync_watch.restarts);
+            } else {
+                spdlog::info("[Engine] Wallet re-synced after an unsynced "
+                             "period of unknown length: the sync check did "
+                             "not run for part of it ({} restart(s) along "
+                             "the way)", sync_watch.restarts);
+            }
         }
     } catch (const std::exception& e) {
         wallet_synced_ = false;
