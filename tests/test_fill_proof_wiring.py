@@ -375,9 +375,10 @@ def test_the_bulk_sweep_never_reports_a_proof_held_offer_cancelled():
                       r"held\.push_back\(po\.offer_id\);\s*\} else \{\s*"
                       r"out\.cancelled\.push_back\(po\.offer_id\);\s*\}", bulk_ok)
     assert split, "a proof-held offer must not be reported cancelled by the sweep"
-    # [round 10] ...unless the re-read after the sweep finds it covered by a
-    # cancel or closed (test_the_sweep_is_judged_by_what_the_wallet_reports_after_it).
-    assert bulk_ok.count("out.cancelled.push_back(") == 2, (
+    # [round 11] Nor does the re-read after the sweep: an offer it finds with a
+    # cancel in flight, or closed, is reported as that, never as a cancel this
+    # call submitted (test_the_sweep_is_judged_by_what_the_wallet_reports_after_it).
+    assert bulk_ok.count("out.cancelled.push_back(") == 1, (
         "no other path in the bulk branch may report an id cancelled"
     )
     per_offer = bulk_ok.index("co_await cancel_ids(to_cancel, deadline)")
@@ -398,10 +399,15 @@ def test_the_sweep_is_judged_by_what_the_wallet_reports_after_it():
     trade included.  Sending every held offer down the per-offer path could
     therefore cancel one a second time, or report outstanding an offer the
     sweep covered.  So each held offer's status is read again after the sweep,
-    and only one the wallet still reports CONFIRMED goes to the guard.  One the
-    sweep covered, or that is closed, is reported with the sweep's; one that is
-    live and was not swept is released and cancelled; one whose status cannot
-    be read is sent nothing and reported outstanding."""
+    and only one the wallet still reports CONFIRMED goes to the guard.  One that
+    is live and was not swept is released and cancelled; one whose status cannot
+    be read is sent nothing and reported outstanding.
+
+    [round 11] Only a cancel this call's RPCs accepted is reported `cancelled`,
+    which the callers persist as submitted with their own cause.  One with a
+    cancel in flight is `already_pending`; one CANCELLED or FAILED is `closed`.
+    PENDING_CANCEL and CANCELLED are what a cancel writes over a real take, so
+    they keep the hold for detect_fills to prove on-chain; FAILED releases it."""
     manager = _source(OFFER_MANAGER)
     cancel_all = _function_body(
         manager, "asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(")
@@ -433,16 +439,25 @@ def test_the_sweep_is_judged_by_what_the_wallet_reports_after_it():
     # The decision, in full.
     decision = re.search(
         r"if \(status == trade_status::kConfirmed\) \{\s*to_cancel\.push_back\(oid\);\s*"
-        r"\} else if \(status == trade_status::kPendingCancel\s*"
-        r"\|\| status == trade_status::kCancelled\s*"
-        r"\|\| status == trade_status::kFailed\) \{\s*"
-        r"fill_proof_deferrals_\.erase\(oid\);\s*out\.cancelled\.push_back\(oid\);\s*\+\+covered;\s*"
+        r"\} else if \(status == trade_status::kPendingCancel\) \{\s*"
+        r"out\.already_pending\.push_back\(oid\);\s*\+\+in_flight;\s*"
+        r"\} else if \(status == trade_status::kCancelled\) \{\s*"
+        r"out\.closed\.push_back\(oid\);\s*\+\+closed;\s*"
+        r"\} else if \(status == trade_status::kFailed\) \{\s*"
+        r"fill_proof_deferrals_\.erase\(oid\);\s*out\.closed\.push_back\(oid\);\s*\+\+closed;\s*"
         r"\} else if \(trade_status::is_known\(status\)\) \{\s*"
         r"fill_proof_deferrals_\.erase\(oid\);\s*to_cancel\.push_back\(oid\);\s*"
         r"\} else \{\s*unread\.push_back\(oid\);\s*\}", reread)
     assert decision and decision.start() > read.end(), (
-        "CONFIRMED goes to the guard; a cancel in flight or a closed offer is the sweep's; "
-        "any other real status is released and cancelled; anything else is unread"
+        "CONFIRMED goes to the guard; a cancel in flight is already pending and a closed "
+        "offer is closed, both still held unless FAILED; any other real status is released "
+        "and cancelled; anything else is unread"
+    )
+    assert "out.cancelled.push_back(" not in held_branch, (
+        "the re-read reports nothing as a cancel this call submitted"
+    )
+    assert held_branch.count("fill_proof_deferrals_.erase(") == 2, (
+        "only FAILED and a live offer the sweep missed are released"
     )
     # Only the re-read's picks are cancelled one by one.  An unread offer is
     # reported outstanding: never cancelled, never reported cancelled.
@@ -474,7 +489,9 @@ def test_the_latest_proof_is_what_a_cancel_is_judged_by():
     writes = re.findall(r"\+\+\s*fill_poll_heartbeat_|--\s*fill_poll_heartbeat_"
                         r"|fill_poll_heartbeat_\s*(?:\+\+|--|[-+*/]?=(?!=))", manager)
     assert writes == ["++fill_poll_heartbeat_"], writes
-    cleared = re.search(r"if \(status != trade_status::kConfirmed && trade_status::is_known\(status\)\) \{\s*"
+    # [round 11] ...other than one a cancel writes, which may hide a take.
+    cleared = re.search(r"if \(status != trade_status::kConfirmed && trade_status::is_known\(status\)\s*"
+                        r"&& !trade_status::written_by_a_cancel\(status\)\) \{\s*"
                         r"fill_proof_deferrals_\.erase\(trade_id\);\s*\}", detect)
     assert cleared and cleared.start() < detect.index("if (status == trade_status::kConfirmed) {"), (
         "an offer the wallet no longer calls CONFIRMED is not under proof"
@@ -512,11 +529,13 @@ def test_an_offer_is_held_from_the_moment_the_wallet_says_confirmed():
     poll = detect.index("co_await wallet_->get_offer(trade_id,")
     # [round 8] Released only by a status the wallet really reported: an
     # unrecognised one is no evidence the offer left CONFIRMED.
+    # [round 11] ...and not by a status a cancel writes, which may hide a take.
     hold = re.search(r"if \(const auto st = rec\.find\(\"status\"\); st != rec\.end\(\)\) \{\s*"
                      r"const int polled = trade_status::parse\(\*st\);\s*"
                      r"if \(polled == trade_status::kConfirmed\) \{\s*"
                      r"fill_proof_deferrals_\.try_emplace\(trade_id\);\s*"
-                     r"\} else if \(trade_status::is_known\(polled\)\) \{\s*"
+                     r"\} else if \(trade_status::is_known\(polled\)\s*"
+                     r"&& !trade_status::written_by_a_cancel\(polled\)\) \{\s*"
                      r"fill_proof_deferrals_\.erase\(trade_id\);\s*"
                      r"\}\s*\}", detect)
     known = re.search(r"constexpr bool is_known\(int status\) noexcept \{\s*"
@@ -535,6 +554,62 @@ def test_an_offer_is_held_from_the_moment_the_wallet_says_confirmed():
     deferral = _block_after(_source(OFFER_MANAGER_HPP), "struct FillProofDeferral {")
     assert re.search(r"FillProof\s+verdict\{\};", deferral), "a new entry is Unknown"
     assert re.search(r"std::uint64_t\s+proof_call\{0\};", deferral), "a new entry is from no call"
+
+
+def test_a_cancels_status_on_a_held_offer_is_proven_before_it_is_let_go():
+    """[review #171, round 11] A cancel's status can hide a real take.  chia
+    2.7.4's cancel_pending_offers writes PENDING_CANCEL (CANCELLED if insecure)
+    on the trade it cancels AND on every trade not yet CANCELLED that shares a
+    cancellation coin with it, a CONFIRMED one included.  And a real take does
+    not fail a pending offer that shared one of its coins, so cancelling that
+    offer later -- by any path: this engine's sweeps and per-offer cancels, the
+    watchdog's sweep -- overwrote the take's CONFIRMED.  The next poll released
+    the hold, and the take was never proved or booked.  A held offer now keeps
+    its hold under PENDING_CANCEL or CANCELLED, and detect_fills proves it
+    on-chain once more.  Settled books it as the CONFIRMED offer it was, from
+    that proof; Live or Dead releases it to be handled as its status, as before;
+    Unknown keeps it held and asks again next heartbeat."""
+    manager = _source(OFFER_MANAGER)
+    written = re.search(r"constexpr bool written_by_a_cancel\(int status\) noexcept \{\s*"
+                        r"return status == kPendingCancel \|\| status == kCancelled;\s*\}", manager)
+    assert written, "exactly the two statuses a cancel writes"
+    detect = _function_body(manager, DETECT_FILLS)
+    head = "for (const auto& rec : trade_records) {"
+    loop = _block_after(detect[detect.rindex(head):], head)
+    opener = re.search(r"if \(trade_status::written_by_a_cancel\(status\)\s*"
+                       r"&& fill_proof_deferrals_\.count\(trade_id\) > 0U\) \{", loop)
+    assert opener, "a held offer under a cancel's status is proven again"
+    fallback = loop.index("fill_proof_deferrals_.erase(trade_id);")
+    branch = loop.index("if (status == trade_status::kConfirmed) {")
+    assert fallback < opener.start() < branch, (
+        "proven after the fallback release, and before the CONFIRMED branch books"
+    )
+    declared = loop.index("std::optional<FillProofResult> reproved;")
+    assert declared < opener.start(), "one re-proof per record, never carried to the next"
+    reproof = _block_after(loop, opener.group(0))
+    asked = re.search(r"if \(proof_lookup_failed\) \{[^}]*\} else \{\s*"
+                      r"reproof = co_await prove_fill_on_chain\(rec, reproof_failure,\s*"
+                      r"proof_lookup_failed,\s*reproved_asked_node\);\s*\}", reproof)
+    assert asked, "asked once, and not at all once a lookup has failed this call"
+    settled = _block_after(reproof, "if (reproof.verdict == FillProof::Settled) {")
+    assert re.search(r"reproved = reproof;\s*status = trade_status::kConfirmed;\s*\}$", settled), (
+        "a take after all: booked by the CONFIRMED branch, from this proof"
+    )
+    no_take = re.search(r"\} else if \(reproof\.verdict == FillProof::Live\s*"
+                        r"\|\| reproof\.verdict == FillProof::Dead\) \{\s*"
+                        r"fill_proof_deferrals_\.erase\(trade_id\);\s*"
+                        r"\} else \{", reproof)
+    assert no_take, "only a verdict of no take releases it, to be handled as its status"
+    unknown = _block_after(reproof, no_take.group(0))
+    assert _call_args(unknown, "handle_unproven_fill") == [[
+        "trade_id", "po", "reproof", "reproof_failure", "reproved_asked_node",
+        "claimed_height", "current_block"]], "Unknown is deferred as a CONFIRMED offer's is"
+    assert re.search(r"continue;\s*\}$", unknown), "...still held, and asked again next heartbeat"
+    assert "fill_proof_deferrals_.erase(" not in unknown, "Unknown must not let the offer go"
+    reuse = re.search(r"if \(reproved\) \{\s*proof\s*=\s*\*reproved;\s*"
+                      r"asked_node\s*=\s*reproved_asked_node;\s*"
+                      r"\} else if \(proof_lookup_failed\) \{", _confirmed_branch())
+    assert reuse, "the CONFIRMED branch books a re-proved take from that proof, asking nothing twice"
 
 
 def test_a_malformed_stage_one_reply_is_a_failed_lookup():

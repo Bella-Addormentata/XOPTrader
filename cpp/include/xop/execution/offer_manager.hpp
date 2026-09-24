@@ -460,8 +460,8 @@ public:
     struct CancelOutcome {
         /// Offers the wallet accepted a cancel for. On the bulk path this is
         /// every id -- see `bulk_submitted`, which qualifies what that means
-        /// -- except one the fill proof holds, which the sweep skips as a
-        /// completed trade and which goes through the per-offer path.
+        /// -- except one the fill proof holds, which is read again after the
+        /// sweep: it is here only if the per-offer path then cancels it.
         std::vector<std::string> cancelled;
         /// Offers we still believe are LIVE. These are what a retry re-attempts.
         std::vector<std::string> failed;
@@ -473,6 +473,16 @@ public:
         /// than `continue`d into silence -- an id that vanishes from every
         /// list is exactly the fail-open shape this file keeps producing.
         std::vector<std::string> already_pending;
+        /// [FILL-PROOF, review #171 round 11] Offers the fill proof held that
+        /// the wallet reported CANCELLED or FAILED when read again after an
+        /// accepted sweep. Nothing was sent for them and nothing is left to
+        /// send: not a cancel this call submitted, so not `cancelled`, whose
+        /// ids the callers persist as submitted with their own cause; and not
+        /// live, so not `failed`. detect_fills reads the terminal status (and
+        /// first proves a held CANCELLED one on-chain, since a cancel of
+        /// another offer can overwrite a real take). Reported here rather than
+        /// dropped from every list.
+        std::vector<std::string> closed;
         /// Verbatim text of the last failure. Empty when nothing failed.
         std::string              last_error;
         /// The MOST RETRYABLE class across every failure in this call, folded

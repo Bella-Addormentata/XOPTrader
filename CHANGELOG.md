@@ -105,6 +105,17 @@ can pass for an offer nobody took.
   The status must be one of Chia's six trade statuses (review round 8). An
   unrecognised one is no evidence the offer left CONFIRMED, so the hold
   stays until a poll reads one that is.
+  Nor does PENDING_CANCEL or CANCELLED release it (review round 11): they are
+  what a cancel writes, and a cancel can write them over a real take. In
+  chia 2.7.4 cancelling an offer marks every trade not yet CANCELLED that
+  shares one of its coins, a CONFIRMED one included. And a take leaves a
+  pending offer that shared one of its coins PENDING_ACCEPT, so cancelling
+  that offer later -- any sweep or per-offer cancel, the watchdog's included --
+  reaches the taken trade. Its take was then never proved or booked. Now the
+  next heartbeat proves such an offer on-chain once more. If the chain shows
+  the take, it is booked, from that proof. If it shows the offer live or dead,
+  the hold is released and the offer is handled as its status says, as
+  before. If the chain cannot say, it stays held and is asked again.
   Cancel All's wallet-wide sweep skips every trade the wallet calls
   completed, so it never reports a held offer as cancelled. Such an offer goes
   through the guarded per-offer path instead: it is cancelled there if the
@@ -115,12 +126,15 @@ can pass for an offer nobody took.
   every trade it cancels, and every trade not yet CANCELLED that shares a
   cancellation coin with one, a held CONFIRMED trade included. So after an
   accepted sweep, each held offer's status is read again (review round 10).
-  Only one the wallet still reports CONFIRMED goes to the guarded path. One
-  now PENDING_CANCEL, CANCELLED or FAILED is reported with the sweep's
-  offers, and is not cancelled a second time. One PENDING_ACCEPT or
-  PENDING_CONFIRM is live and was not swept, so it is cancelled. One whose
-  status cannot be read is sent nothing and reported outstanding. Every
-  status the wallet really reports other than CONFIRMED releases the hold.
+  Only one the wallet still reports CONFIRMED goes to the guarded path, and
+  nothing is sent a second time. One PENDING_ACCEPT or PENDING_CONFIRM is
+  live and was not swept, so it is cancelled. One whose status cannot be
+  read is sent nothing and reported outstanding. The rest are not reported
+  as cancels this call submitted, which the callers would persist with their
+  own cause (review round 11). One PENDING_CANCEL is reported as a cancel
+  already in flight. One CANCELLED or FAILED is reported closed, for
+  detect_fills to read. PENDING_CANCEL and CANCELLED keep the hold, for the
+  proof above; FAILED, PENDING_ACCEPT and PENDING_CONFIRM release it.
 - A coin record whose height does not fit a BlockHeight is unreadable, so it
   proves nothing. The engine narrows every proven height to 32 bits, and such
   a height would have wrapped to an old block.
