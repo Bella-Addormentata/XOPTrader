@@ -373,6 +373,30 @@ def test_startup_reads_count_only_from_a_wallet_seen_synced() -> None:
     assert poll.count("state_seed_not_held.insert(") == 1
 
 
+def test_a_map_built_from_an_unsynced_wallet_is_dropped() -> None:
+    """Review round 5: the startup seed builds the wallet-ID map, and
+    ensure_wallet_ids() builds it only once.  Built from a wallet the sync
+    wait never saw synced, it can lack a CAT wallet not yet created, and Step
+    8's pass would read that CAT's -1 as a verified zero.  So the map is
+    dropped after the seed when the wait did not see the wallet synced; Step
+    8's pass then builds it below its sync gate."""
+    text = _engine()
+    poll = _function_body(text, POLL_LOOP)
+    dropped = re.search(r"if\s*\(\s*!\s*startup_wallet_synced\s*&&\s*offer_mgr_\s*&&\s*"
+                        r"offer_mgr_->wallet_ids_resolved\(\)\s*\)\s*\{\s*"
+                        r"offer_mgr_->invalidate_wallet_ids\(\)\s*;\s*\}", poll)
+    assert dropped, "a map built from an unsynced wallet must be dropped"
+    assert poll.rindex("offer_mgr_->ensure_wallet_ids()", 0, dropped.start()) > poll.index(
+        "bool startup_wallet_synced"), "the drop follows the seed's own map build"
+    assert poll.index("risk::decide_state_seed(") < dropped.start(), (
+        "the drop comes after every use the seed makes of the map"
+    )
+    _, block = _verification_block(_function_body(text, STEP8))
+    assert "offer_mgr_->ensure_wallet_ids()" in block, (
+        "Step 8's pass rebuilds the map, below its sync gate"
+    )
+
+
 def test_an_unverified_pair_takes_down_what_it_quotes() -> None:
     """Review round 2: offers restored at boot must not rest unmanaged for as
     long as a position read fails, so they are cancelled -- those not already

@@ -40,7 +40,10 @@ have corrected it.)
   a map with no wallet for the asset, counts as the wallet's word only if the
   startup sync wait saw the wallet fully synced (review round 4). When the
   wait runs out first, every asset takes the unverified path, the log says so,
-  and Step 8 verifies each one once the wallet is synced.
+  and Step 8 verifies each one once the wallet is synced. The wallet-ID map
+  boot built is dropped too (review round 5). It is built only once, and one
+  built mid-sync can lack a CAT wallet not yet created, which Step 8 would
+  then verify as a zero. Step 8 rebuilds it below its sync gate.
 - The per-asset startup read failure is logged as a WARN instead of DEBUG.
 - **Nothing is quoted from a guessed position** (review round 1). Step 6 sizes
   a heartbeat's ladders before Step 8 reads the wallet, so Step 8 now verifies

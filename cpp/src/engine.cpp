@@ -3269,6 +3269,17 @@ asio::awaitable<void> Engine::poll_loop_coro()
                 }
             }
         }
+
+        // [SEED-FAIL-CLOSED review round 5] ...and the wallet-ID map this
+        // section built goes with the reads it could not trust.  Built from a
+        // wallet the wait never saw synced, it can lack a CAT wallet the
+        // wallet has yet to create, and ensure_wallet_ids() builds it only
+        // once: Step 8's pass would then read that CAT's -1 as a verified
+        // zero.  Dropped here, it is next built by Step 8's pass or by
+        // post_quotes, both below Step 8's sync gate.
+        if (!startup_wallet_synced && offer_mgr_ && offer_mgr_->wallet_ids_resolved()) {
+            offer_mgr_->invalidate_wallet_ids();
+        }
     }
 
     // [shutdown-flag-race] BC4. The last boot checkpoint; the analysis loop
