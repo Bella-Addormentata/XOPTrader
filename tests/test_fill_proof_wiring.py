@@ -248,6 +248,82 @@ def test_one_failed_lookup_ends_the_lookups_for_the_call():
     assert "lookup_failed = true;" in handler, "a failed lookup must set the latch"
 
 
+def test_spent_together_books_only_with_the_takes_own_mark():
+    """[review #171] Every maker coin spent in one block is what a take does,
+    and also what a cancel or a stray spend of a one-coin offer does.  The
+    second stage decides, from the node's settlement coin or the wallet's
+    payment -- and a failure there is a failed lookup like any other."""
+    prove = _function_body(_source(OFFER_MANAGER), PROVE_ON_CHAIN)
+    stage1 = prove.index("prove_fill(names, records, name_of)")
+    passthrough = re.search(r"if \(coins\.verdict != FillProof::SpentTogether\) \{\s*"
+                            r"co_return coins;\s*\}", prove)
+    assert passthrough and stage1 < passthrough.start(), (
+        "only a SpentTogether verdict goes on to the second stage"
+    )
+    rest = prove[passthrough.end():]
+    assert 'summary_amounts(trade_record, ask_node ? "offered" : "requested")' in rest, (
+        "the node looks for an offered amount, the wallet for a requested one"
+    )
+    node = re.search(r"fill_proof_node_->get_coin_records_by_parent_ids\(\s*names", rest).start()
+    assert node < rest.index("prove_take_from_children(coins, names, children, amounts)")
+    wallet = rest.index("wallet_->get_coin_records_at_height(coins.height, amounts)")
+    assert wallet < rest.index("prove_take_from_payments(coins, names, payments, amounts)")
+    assert rest.index("if (ask_node) {") < node < rest.index("} else {") < wallet
+    failed = _block_after(rest, "catch (const std::exception& e) {")
+    assert "lookup_failed = true;" in failed and "co_return FillProofResult{};" in failed, (
+        "a second-stage lookup that fails is Unknown and trips the latch"
+    )
+    assert "co_return coins;" not in rest, "a SpentTogether verdict never leaves unsettled"
+
+
+def test_the_second_stage_asks_the_right_questions():
+    """The node lists the children of the maker coins, spent ones included;
+    the wallet lists our coins confirmed in exactly the spend block for the
+    requested amounts (FilterMode.include is 1)."""
+    rpc = _source(CHIA_RPC)
+    children = _function_body(rpc, "ChiaFullNodeRPC::get_coin_records_by_parent_ids(")
+    assert '"get_coin_records_by_parent_ids"' in children
+    assert re.search(r'\{"parent_ids",\s*id_arr\}', children)
+    assert re.search(r'\{"include_spent_coins",\s*include_spent\}', children)
+    payments = _function_body(rpc, "ChiaWalletRPC::get_coin_records_at_height(")
+    assert '"get_coin_records"' in payments
+    assert re.search(r'\{"confirmed_range",\s*\{\{"start",\s*height\},\s*\{"stop",\s*height\}\}\}',
+                     payments), "exactly the spend block, both ends inclusive"
+    assert re.search(r'\{"amount_filter",\s*\{\{"values",\s*amounts\},\s*\{"mode",\s*1\}\}\}',
+                     payments), "the requested amounts, included"
+    prove = _function_body(_source(OFFER_MANAGER), PROVE_ON_CHAIN)
+    assert re.search(r"get_coin_records_by_parent_ids\(\s*names,\s*/\*include_spent=\*/true\)",
+                     prove), "a settlement coin is spent in the take block: include spent children"
+
+
+def test_a_confirmed_offer_under_proof_is_never_cancelled():
+    """[review #171] Chia 2.7.4's secure cancel sets PENDING_CANCEL over any
+    status, and an insecure one sets CANCELLED.  So cancelling an offer the
+    wallet reports CONFIRMED erases the CONFIRMED the proof waits on, and a
+    real take with it.  Every per-offer cancel reaches the wallet through
+    cancel_offer_charged.  The bulk cancel_offers endpoint skips completed
+    trades itself."""
+    manager = _source(OFFER_MANAGER)
+    assert manager.count("wallet_->cancel_offer(") == 1, (
+        "cancel_offer_charged must stay the only per-offer way to the wallet's cancel"
+    )
+    charged = _function_body(manager, "OfferManager::cancel_offer_charged(")
+    guard = re.search(r"if \(fill_proof_deferrals_\.count\(trade_id\) > 0U\) \{", charged)
+    assert guard and guard.start() < charged.index("wallet_->cancel_offer("), (
+        "an offer under fill proof is refused before anything reaches the wallet"
+    )
+    assert "throw rpc::ChiaRPCError(" in _block_after(charged, guard.group(0)), (
+        "refused like a wallet refusal, which every caller already handles"
+    )
+    emergency = _function_body(manager, "asio::awaitable<bool> OfferManager::emergency_cancel(")
+    early = re.search(r"if \(fill_proof_deferrals_\.count\(offer_id\) > 0U\) \{", emergency)
+    assert early and early.start() < emergency.index("get_wallet_balance("), (
+        "emergency_cancel gives up at once, not after a balance read and a fee ladder "
+        "of refusals"
+    )
+    assert "co_return false;" in _block_after(emergency, early.group(0))
+
+
 def test_the_wallet_fallback_refuses_while_unsynced():
     body = _function_body(_source(CHIA_RPC), WALLET_COIN_RECORDS)
     assert '"include_spent_coins", true' in body, (
@@ -260,12 +336,19 @@ def test_the_wallet_fallback_refuses_while_unsynced():
     assert '"get_coin_records_by_names"' in body
 
 
+WRITE_LOOP = "for (auto& w : pending_dead_writes_) {"
+
+
 def test_the_engine_records_every_dead_offer_as_cancelled_dead_on_chain():
     step = _function_body(_source(ENGINE), STEP_PROCESS_FILLS)
     detect_at = step.index("co_await offer_mgr_->detect_fills(")
     head = "for (const auto& dead : offer_mgr_->last_dead_offers()) {"
     assert step.index(head) > detect_at, "the dead list describes the detect_fills call above it"
-    loop = _block_after(step, head)
+    assert "pending_dead_writes_.push_back(" in _block_after(step, head), (
+        "every dead offer detect_fills reports is queued for its write"
+    )
+    assert step.index(WRITE_LOOP) > step.index(head)
+    loop = _block_after(step, WRITE_LOOP)
     writes = _call_args(loop, "db_->update_offer_status")
     assert writes == [["dead.offer_id", '"cancelled"',
                        "static_cast<BlockHeight>(dead.spent_height)", '"dead_on_chain"']], (
@@ -276,9 +359,30 @@ def test_the_engine_records_every_dead_offer_as_cancelled_dead_on_chain():
     )
     verdicts = _call_args(loop, "fee_feedback_on_cancel_verdict")
     assert len(verdicts) == 1 and verdicts[0][2].endswith("false"), (
-        "a cancel we paid for on a dead offer did not confirm: its fee ticket "
-        "closes unheard"
+        "the chain cannot say whose spend killed a dead offer, so a fee ticket "
+        "for a cancel on it closes unheard"
     )
+
+
+def test_a_failed_dead_offer_write_is_retried_and_bounded():
+    """[review #171] detect_fills reports a dead offer once, having already
+    stopped tracking it, so a write that fails must be retried -- and not for
+    ever, the S25 buffer's rule."""
+    step = _function_body(_source(ENGINE), STEP_PROCESS_FILLS)
+    loop = _block_after(step, WRITE_LOOP)
+    failed = _block_after(loop, "catch (const std::exception& ex) {")
+    bound = re.search(r"if \(\+\+w\.failures >= kMaxTerminalPersistFailures\) \{", failed)
+    assert bound, "the bound is exactly S25's: kMaxTerminalPersistFailures consecutive failures"
+    gave_up = _block_after(failed, bound.group(0))
+    assert "continue;" in gave_up and "dead_still_pending" not in gave_up, (
+        "at the bound the entry is dropped"
+    )
+    assert "dead_still_pending.push_back(std::move(w));" in failed[bound.start() + len(gave_up):], (
+        "below the bound a write that fails is re-queued"
+    )
+    not_ours = _block_after(loop, "catch (const OfferNotFound& nf) {")
+    assert "dead_still_pending" not in not_ours, "an offer with no row is never retried"
+    assert step.index("pending_dead_writes_ = std::move(dead_still_pending);") > step.index(WRITE_LOOP)
 
 
 def test_detect_fills_describes_only_its_own_call():

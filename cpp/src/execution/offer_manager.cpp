@@ -1806,11 +1806,55 @@ OfferManager::prove_fill_on_chain(const json& trade_record, std::string& failure
                   + " could not list its maker coins: " + e.what();
         co_return FillProofResult{};
     }
-    const FillProofResult proof = prove_fill(names, records, name_of);
-    if (proof.verdict == FillProof::Unknown) {
+    const FillProofResult coins = prove_fill(names, records, name_of);
+    if (coins.verdict == FillProof::Unknown) {
         failure = std::string{"the "} + (ask_node ? "full node" : "wallet")
                   + "'s answer did not cover every maker coin, or a record was "
                     "unreadable or contradictory";
+    }
+    if (coins.verdict != FillProof::SpentTogether) {
+        co_return coins;
+    }
+
+    // [review #171] Every maker coin was spent in one block.  A take does
+    // that, and so does a cancel or a stray spend of a one-coin offer, so
+    // only the take's own mark in that block books a fill: the settlement
+    // coin, from the node; the payment of what we asked for, from the wallet.
+    const std::vector<std::uint64_t> amounts =
+        summary_amounts(trade_record, ask_node ? "offered" : "requested");
+    if (amounts.empty()) {
+        failure = std::string{"every maker coin was spent at block "}
+                  + std::to_string(coins.height) + ", but the trade record lists no "
+                  + (ask_node ? "offered" : "requested") + " amounts to look for";
+        co_return FillProofResult{};
+    }
+    FillProofResult proof;
+    try {
+        if (ask_node) {
+            const std::vector<json> children =
+                co_await fill_proof_node_->get_coin_records_by_parent_ids(
+                    names, /*include_spent=*/true);
+            proof = prove_take_from_children(coins, names, children, amounts);
+        } else {
+            const std::vector<json> payments =
+                co_await wallet_->get_coin_records_at_height(coins.height, amounts);
+            proof = prove_take_from_payments(coins, names, payments, amounts);
+        }
+    } catch (const std::exception& e) {
+        lookup_failed = true;
+        failure = std::string{"every maker coin was spent at block "}
+                  + std::to_string(coins.height) + ", but the "
+                  + (ask_node ? "full node could not list their children"
+                              : "wallet could not list the payments at that height")
+                  + ": " + e.what();
+        co_return FillProofResult{};
+    }
+    if (proof.verdict == FillProof::Unknown) {
+        failure = std::string{"every maker coin was spent at block "}
+                  + std::to_string(coins.height)
+                  + (ask_node ? ", and the node's list of their children could not be read"
+                              : ", and the wallet shows no payment of a requested "
+                                "amount in that block -- which proves nothing either way");
     }
     co_return proof;
 }
@@ -1831,13 +1875,23 @@ void OfferManager::handle_unproven_fill(const std::string& trade_id,
         proven_dead_.insert(trade_id);
         fill_proof_deferrals_.erase(trade_id);
         last_dead_offers_.push_back(DeadOffer{trade_id, po.pair_name, proof.height,
-                                              proof.coins, proof.unspent});
-        logger_->error("[FILL-PROOF] {} ({} {}): the wallet reports CONFIRMED, but "
-                       "its {} maker coins were not spent together ({} still "
-                       "unspent, the first spent at block {}) -- the offer died "
-                       "without being taken; NOT booked as a fill",
-                       trade_id.substr(0, 12), po.pair_name, to_string(po.side),
-                       proof.coins, proof.unspent, proof.height);
+                                              proof.coins, proof.unspent,
+                                              proof.spent_together});
+        if (proof.spent_together) {
+            logger_->error("[FILL-PROOF] {} ({} {}): the wallet reports CONFIRMED, "
+                           "but block {} -- where all {} maker coins were spent -- "
+                           "holds no settlement coin for it: a cancel or another "
+                           "spend consumed them, not a take; NOT booked as a fill",
+                           trade_id.substr(0, 12), po.pair_name, to_string(po.side),
+                           proof.height, proof.coins);
+        } else {
+            logger_->error("[FILL-PROOF] {} ({} {}): the wallet reports CONFIRMED, "
+                           "but its {} maker coins were not spent together ({} still "
+                           "unspent, the first spent at block {}) -- the offer died "
+                           "without being taken; NOT booked as a fill",
+                           trade_id.substr(0, 12), po.pair_name, to_string(po.side),
+                           proof.coins, proof.unspent, proof.height);
+        }
         return;
     }
 
@@ -1852,8 +1906,12 @@ void OfferManager::handle_unproven_fill(const std::string& trade_id,
     if (proof.verdict == FillProof::Live) {
         why = "every maker coin is still unspent -- the offer is still takeable";
     } else if (proof.verdict == FillProof::Dead) {
-        why = "its maker coins were not spent together (the offer died), but "
-              "the first spend is not yet at confirmation depth";
+        why = proof.spent_together
+                  ? "its maker coins were spent in one block that holds no "
+                    "settlement coin for it (the offer died), but that block is "
+                    "not yet at confirmation depth"
+                  : "its maker coins were not spent together (the offer died), but "
+                    "the first spend is not yet at confirmation depth";
     }
     logger_->warn("[FILL-PROOF] {} ({}): the wallet reports CONFIRMED, the "
                   "chain says {}: {} -- not booked; asked again next heartbeat "
@@ -4527,6 +4585,17 @@ std::string OfferManager::late_trade_id(const json& result,
 asio::awaitable<json> OfferManager::cancel_offer_charged(
     const std::string& trade_id, std::uint64_t fee, bool secure)
 {
+    // [FILL-PROOF, review #171] Never an offer the wallet reports CONFIRMED
+    // that the fill proof has not settled.  Chia 2.7.4's secure cancel sets
+    // PENDING_CANCEL over whatever status the trade has, and an insecure one
+    // sets CANCELLED, so a cancel sent while a lookup failed or the node lagged
+    // would erase the CONFIRMED the proof waits on -- and a real take with it.
+    // Refused like a wallet refusal, which every caller already handles.
+    if (fill_proof_deferrals_.count(trade_id) > 0U) {
+        throw rpc::ChiaRPCError("cancel withheld: the wallet reports "
+                                + trade_id.substr(0, 12)
+                                + " CONFIRMED and the fill proof has not settled it");
+    }
     // [review #163 r6] to_mojo_saturating, not a bare cast: `fee` is a
     // std::uint64_t and a wrapped negative is silently zeroed by
     // CoinLockLedger::clamp_need(), which would leave the pool believing this
@@ -5615,6 +5684,15 @@ asio::awaitable<bool> OfferManager::emergency_cancel(
     const std::string& context,
     bool prefer_zero_fee)
 {
+    // [FILL-PROOF, review #171] cancel_offer_charged refuses an offer under
+    // fill proof.  Stop here rather than read the balance and walk the whole
+    // fee ladder into that refusal.
+    if (fill_proof_deferrals_.count(offer_id) > 0U) {
+        logger_->warn("{}: cancel of {} withheld -- the wallet reports it "
+                      "CONFIRMED and the fill proof has not settled it",
+                      context, offer_id.substr(0, 12));
+        co_return false;
+    }
     try {
         // When prefer_zero_fee is set (UTXO liberation), try the fee=0
         // secure cancel FIRST so we don't burn spendable XCH on fees.

@@ -321,15 +321,17 @@ public:
     }
 
     /// [FILL-PROOF 2026-09-23] An offer the wallet reported CONFIRMED that
-    /// the chain proved was never taken (execution/fill_proof.hpp): a maker
-    /// coin unspent while another was spent elsewhere, the earliest spend at
-    /// confirmation depth.
+    /// the chain proved was never taken (execution/fill_proof.hpp), its
+    /// earliest spend at confirmation depth.  Either a maker coin is unspent
+    /// while another was spent elsewhere, or every maker coin was spent in one
+    /// block that holds no settlement coin for it (a cancel or a stray spend).
     struct DeadOffer {
         std::string   offer_id{};
         std::string   pair_name{};
         std::uint64_t spent_height{0};   ///< the earliest spend of a maker coin
         std::size_t   coins{0};          ///< maker coins examined
         std::size_t   unspent{0};        ///< of them, still unspent
+        bool          spent_together{false};  ///< all spent in one block, not by a take
     };
 
     /// [FILL-PROOF] Offers the most recent detect_fills() proved dead.  It
@@ -1382,7 +1384,8 @@ private:
     std::shared_ptr<rpc::ChiaFullNodeRPC> fill_proof_node_;
     std::function<bool()>                 fill_proof_node_trusted_;
     /// Consecutive heartbeats a CONFIRMED offer went unbooked for want of a
-    /// Settled proof, for the log's cadence.
+    /// Settled proof: the log's cadence, and the offers whose cancels
+    /// cancel_offer_charged() withholds.
     std::unordered_map<std::string, std::uint32_t> fill_proof_deferrals_;
 
     /// Ask the chain what a CONFIRMED trade record's maker coins prove

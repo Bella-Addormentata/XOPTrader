@@ -28,7 +28,19 @@
 // The rules -- the chain decides, from the trade record's coins_of_interest:
 //
 //   * A TAKE SPENDS EVERY MAKER COIN, IN ONE BLOCK.  An offer settles as one
-//     atomic spend bundle.  All spent at one height is Settled.
+//     atomic spend bundle.  But that is not enough to prove a take: a cancel,
+//     or a stray spend of a one-coin offer, does it too.  So all spent at one
+//     height is only SpentTogether (prove_fill), and books nothing until the
+//     spend block also shows the TAKE'S OWN MARK:
+//       - from the node: a settlement coin, created from a maker coin for
+//         exactly an amount the offer offered, and spent in that same block
+//         (prove_take_from_children);
+//       - from the wallet, which cannot see settlement coins: a payment to us
+//         of exactly a requested amount in that block, from a coin that is
+//         not ours (prove_take_from_payments).
+//     With the mark it is Settled.  If the node shows the block without one,
+//     it is Dead.  The wallet's silence proves nothing, so there it stays
+//     Unknown.
 //   * ANY MAKER COIN UNSPENT WHILE ANOTHER IS SPENT, or maker coins spent at
 //     different heights, is Dead: something else consumed an input and the
 //     offer can never be taken.  (A later reuse of the surviving coins spends
@@ -46,6 +58,11 @@
 // trusts it, else the wallet, which refuses to answer until synced), and what
 // happens to a Dead offer (OfferManager::detect_fills).
 //
+// NOT DETECTED: another of our offers, built on the same coins, taken for
+// exactly the same offered amount while this one is reported CONFIRMED.  Its
+// settlement coin is indistinguishable here.  Only its requested payment
+// differs, and the node cannot search for that.
+//
 // Pure header: no I/O, no RPC, no logging.
 // ---------------------------------------------------------------------------
 
@@ -53,11 +70,13 @@
 
 #include <nlohmann/json.hpp>
 
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <optional>
 #include <string>
+#include <system_error>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -66,18 +85,23 @@ namespace xop::execution {
 
 /// What the chain says about a trade the wallet reports CONFIRMED.
 enum class FillProof : std::uint8_t {
-    Unknown = 0,  ///< no usable answer: book nothing, keep tracking, retry
-    Settled,      ///< every maker coin spent, all at one height: a take
-    Dead,         ///< an input consumed elsewhere: never taken, never takeable
-    Live,         ///< every maker coin unspent: still takeable
+    Unknown = 0,    ///< no usable answer: book nothing, keep tracking, retry
+    Settled,        ///< a take: every maker coin spent in one block, and the
+                    ///< block shows the take's own mark (prove_take_from_*)
+    Dead,           ///< consumed, but not by a take: never taken, never takeable
+    Live,           ///< every maker coin unspent: still takeable
+    SpentTogether,  ///< prove_fill() only: every maker coin spent in one block.
+                    ///< A take does that, and so does a cancel or a stray spend
+                    ///< of a one-coin offer.  Never booked as it stands.
 };
 
-/// Outcome of prove_fill().
+/// Outcome of prove_fill() and prove_take_from_*().
 struct FillProofResult {
     FillProof     verdict{FillProof::Unknown};
-    std::uint64_t height{0};   ///< Settled: the height; Dead: the EARLIEST spend
+    std::uint64_t height{0};   ///< Settled/SpentTogether: the spend height; Dead: the EARLIEST spend
     std::size_t   coins{0};    ///< maker coins the answer covered
     std::size_t   unspent{0};  ///< of them, still unspent
+    bool          spent_together{false};  ///< every maker coin spent at one height
 };
 
 /// The height a node or wallet coin record was spent at: 0 when unspent,
@@ -122,11 +146,90 @@ struct FillProofResult {
     return height;
 }
 
-/// What a coin-records answer proves about the offer whose maker coins are
-/// `requested_names`.  Each record is matched back to a requested name by
-/// hashing its own coin with `name_of` (CoinManager::compute_coin_name behind
-/// a catch in the caller; an empty string means "cannot hash"), exactly as
-/// classify_coin_records() does -- the answer omits coins it does not find.
+/// The height a coin record was created at: the node's
+/// `confirmed_block_index` or the wallet's `confirmed_height`.  std::nullopt
+/// when neither is a readable non-negative number.
+[[nodiscard]] inline std::optional<std::uint64_t> coin_record_confirmed_height(
+    const nlohmann::json& record)
+{
+    if (!record.is_object()) {
+        return std::nullopt;
+    }
+    for (const char* key : {"confirmed_block_index", "confirmed_height"}) {
+        const auto it = record.find(key);
+        if (it == record.end()) {
+            continue;
+        }
+        if (it->is_number_unsigned()) {
+            return it->get<std::uint64_t>();
+        }
+        if (it->is_number_integer()) {
+            const auto value = it->get<std::int64_t>();
+            if (value < 0) {
+                return std::nullopt;
+            }
+            return static_cast<std::uint64_t>(value);
+        }
+        return std::nullopt;
+    }
+    return std::nullopt;
+}
+
+/// The amounts, in mojos, that a trade record's summary lists on one side:
+/// `side` is "offered" or "requested".  The wallet writes them as decimal
+/// strings; numbers are read too.  Empty when the summary or the side is
+/// missing, or when ANY amount is unreadable or zero -- no amounts, no evidence.
+[[nodiscard]] inline std::vector<std::uint64_t> summary_amounts(
+    const nlohmann::json& trade_record, const char* side)
+{
+    if (!trade_record.is_object()) {
+        return {};
+    }
+    const auto summary = trade_record.find("summary");
+    if (summary == trade_record.end() || !summary->is_object()) {
+        return {};
+    }
+    const auto listed = summary->find(side);
+    if (listed == summary->end() || !listed->is_object() || listed->empty()) {
+        return {};
+    }
+    std::vector<std::uint64_t> amounts;
+    for (const auto& value : *listed) {
+        std::uint64_t amount = 0;
+        if (value.is_number_unsigned()) {
+            amount = value.get<std::uint64_t>();
+        } else if (value.is_number_integer()) {
+            const auto signed_amount = value.get<std::int64_t>();
+            if (signed_amount <= 0) {
+                return {};
+            }
+            amount = static_cast<std::uint64_t>(signed_amount);
+        } else if (value.is_string()) {
+            const std::string& text = value.get_ref<const std::string&>();
+            const char* const end = text.data() + text.size();
+            const auto [ptr, ec] = std::from_chars(text.data(), end, amount);
+            if (text.empty() || ec != std::errc{} || ptr != end) {
+                return {};
+            }
+        } else {
+            return {};
+        }
+        if (amount == 0U) {
+            return {};
+        }
+        amounts.push_back(amount);
+    }
+    return amounts;
+}
+
+/// Stage 1: what a coin-records answer proves about the offer whose maker
+/// coins are `requested_names`.  NEVER Settled: every maker coin spent at one
+/// height is SpentTogether, for prove_take_from_children() or
+/// prove_take_from_payments() to decide.  Each record is matched back to a
+/// requested name by hashing its own coin with `name_of`
+/// (CoinManager::compute_coin_name behind a catch in the caller; an empty
+/// string means "cannot hash"), exactly as classify_coin_records() does --
+/// the answer omits coins it does not find.
 template <class NameOf>
 [[nodiscard]] FillProofResult prove_fill(
     const std::vector<std::string>&    requested_names,
@@ -179,13 +282,115 @@ template <class NameOf>
     if (unspent == spent_at.size()) {
         result.verdict = FillProof::Live;
     } else if (unspent == 0U && earliest == latest) {
-        result.verdict = FillProof::Settled;
+        result.verdict = FillProof::SpentTogether;
         result.height = earliest;
+        result.spent_together = true;
     } else {
         result.verdict = FillProof::Dead;
         result.height = earliest;
     }
     return result;
+}
+
+/// Stage 2, from the full node: does the spend block show the take's own mark?
+/// A take creates a settlement coin from one of the maker coins, for exactly
+/// an amount the offer offered, and the taker's half of the bundle spends it
+/// in the same block.  A cancel, or a stray spend of a one-coin offer, sends
+/// its children to our own addresses, where they outlive the block.  Observed
+/// 2026-09-23: four real takes (one ask, three bids) each show exactly one
+/// such child.  The coin consumed from the phantom 0xdb63709cb9 and four
+/// confirmed cancels show none.
+///
+/// `children` is the node's get_coin_records_by_parent_ids over the maker
+/// coins, spent coins included.  Only a SpentTogether result is examined;
+/// every other verdict is returned as it came:
+///   - a child created AND spent at the spend height, for an offered amount
+///                                                              -> Settled
+///   - no children, no offered amounts, a record that cannot be read, a child
+///     of a coin that was not asked about, or one created at another height
+///                                                              -> Unknown
+///   - otherwise: spent together, but not by a take             -> Dead
+[[nodiscard]] inline FillProofResult prove_take_from_children(
+    const FillProofResult&             spent,
+    const std::vector<std::string>&    maker_names,
+    const std::vector<nlohmann::json>& children,
+    const std::vector<std::uint64_t>&  offered)
+{
+    if (spent.verdict != FillProof::SpentTogether) {
+        return spent;
+    }
+    const FillProofResult unknown{};
+    if (offered.empty() || children.empty() || spent.height == 0U) {
+        return unknown;
+    }
+    const std::unordered_set<std::string> makers(maker_names.begin(), maker_names.end());
+    const std::unordered_set<std::uint64_t> amounts(offered.begin(), offered.end());
+    bool marked = false;
+    for (const auto& record : children) {
+        const auto coin_it = record.find("coin");
+        if (coin_it == record.end()) {
+            return unknown;
+        }
+        const auto ref = parse_coin_ref(*coin_it);
+        const auto created = coin_record_confirmed_height(record);
+        const auto spent_at = coin_record_spent_height(record);
+        if (!ref || !created || !spent_at || makers.count(ref->parent_hex) == 0U
+            || *created != spent.height) {
+            return unknown;   // not an answer about these coins' spend
+        }
+        if (*spent_at == spent.height && amounts.count(ref->amount) > 0U) {
+            marked = true;
+        }
+    }
+    FillProofResult result = spent;
+    result.verdict = marked ? FillProof::Settled : FillProof::Dead;
+    return result;
+}
+
+/// Stage 2, from the wallet, which cannot see a settlement coin (it is not
+/// ours): did we receive what the offer requested?  A take pays each requested
+/// amount to us in the take block, from the taker's settlement coin, never
+/// from one of our own maker coins.  Observed 2026-09-23: the real ask
+/// 0x202ff7d2d8 shows its 85,094-mojo DBX payment at 9,297,025; the phantom
+/// 0xdb63709cb9 shows no payment at 9,325,694.
+///
+/// `payments` is the wallet's get_coin_records for our coins confirmed at the
+/// spend height with a requested amount.  Only a SpentTogether result is
+/// examined; every other verdict is returned as it came:
+///   - a coin confirmed at the spend height, for a requested amount, whose
+///     parent is not a maker coin                              -> Settled
+///   - anything else                                            -> Unknown,
+///     NEVER Dead: the wallet's store is what was incomplete on 2026-09-22,
+///     so its silence proves nothing, and closing an offer is one-way.
+[[nodiscard]] inline FillProofResult prove_take_from_payments(
+    const FillProofResult&             spent,
+    const std::vector<std::string>&    maker_names,
+    const std::vector<nlohmann::json>& payments,
+    const std::vector<std::uint64_t>&  requested)
+{
+    if (spent.verdict != FillProof::SpentTogether) {
+        return spent;
+    }
+    const FillProofResult unknown{};
+    if (requested.empty() || spent.height == 0U) {
+        return unknown;
+    }
+    const std::unordered_set<std::string> makers(maker_names.begin(), maker_names.end());
+    const std::unordered_set<std::uint64_t> amounts(requested.begin(), requested.end());
+    for (const auto& record : payments) {
+        const auto ref = parse_coin_ref(record);   // wallet records are flat
+        const auto created = coin_record_confirmed_height(record);
+        if (!ref || !created) {
+            return unknown;
+        }
+        if (*created == spent.height && amounts.count(ref->amount) > 0U
+            && makers.count(ref->parent_hex) == 0U) {
+            FillProofResult result = spent;
+            result.verdict = FillProof::Settled;
+            return result;
+        }
+    }
+    return unknown;
 }
 
 /// A Dead verdict is final once its earliest spend is `confirmation_depth`
@@ -203,10 +408,11 @@ template <class NameOf>
 [[nodiscard]] constexpr const char* fill_proof_name(FillProof proof) noexcept
 {
     switch (proof) {
-        case FillProof::Unknown: return "unknown";
-        case FillProof::Settled: return "settled";
-        case FillProof::Dead:    return "dead";
-        case FillProof::Live:    return "live";
+        case FillProof::Unknown:       return "unknown";
+        case FillProof::Settled:       return "settled";
+        case FillProof::Dead:          return "dead";
+        case FillProof::Live:          return "live";
+        case FillProof::SpentTogether: return "spent together";
     }
     return "unknown";
 }

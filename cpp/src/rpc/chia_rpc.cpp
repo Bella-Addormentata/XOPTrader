@@ -883,6 +883,31 @@ ChiaFullNodeRPC::get_coin_records_by_names(
     co_return records;
 }
 
+asio::awaitable<std::vector<json>>
+ChiaFullNodeRPC::get_coin_records_by_parent_ids(
+    const std::vector<std::string>& parent_ids,
+    bool                            include_spent)
+{
+    json id_arr = json::array();
+    for (const auto& id : parent_ids) {
+        id_arr.push_back(id.size() >= 2 && id.substr(0, 2) == "0x" ? id : "0x" + id);
+    }
+    const json payload = {
+        {"parent_ids",          id_arr},
+        {"include_spent_coins", include_spent}
+    };
+    const json resp = co_await rpc_post("get_coin_records_by_parent_ids", payload);
+
+    std::vector<json> records;
+    if (resp.contains("coin_records") && resp["coin_records"].is_array()) {
+        records.reserve(resp["coin_records"].size());
+        for (auto& rec : resp["coin_records"]) {
+            records.push_back(std::move(rec));
+        }
+    }
+    co_return records;
+}
+
 asio::awaitable<json>
 ChiaFullNodeRPC::get_block_record_by_height(std::int64_t height)
 {
@@ -1103,6 +1128,31 @@ ChiaWalletRPC::get_coin_records_by_names(const std::vector<std::string>& names)
         {"include_spent_coins", true}
     };
     const json resp = co_await rpc_post("get_coin_records_by_names", payload);
+
+    std::vector<json> records;
+    if (resp.contains("coin_records") && resp["coin_records"].is_array()) {
+        records.reserve(resp["coin_records"].size());
+        for (auto& rec : resp["coin_records"]) {
+            records.push_back(std::move(rec));
+        }
+    }
+    co_return records;
+}
+
+asio::awaitable<std::vector<json>>
+ChiaWalletRPC::get_coin_records_at_height(std::uint64_t                     height,
+                                          const std::vector<std::uint64_t>& amounts)
+{
+    // amount_filter mode 1 is FilterMode.include; confirmed_range is
+    // inclusive at both ends.  Checked against a live 2.7.4 wallet
+    // (2026-09-23): the real take 0x202ff7d2d8 answers with its one DBX
+    // payment, and the phantom 0xdb63709cb9 with nothing.
+    const json payload = {
+        {"confirmed_range", {{"start", height}, {"stop", height}}},
+        {"amount_filter",   {{"values", amounts}, {"mode", 1}}},
+        {"limit",           50}
+    };
+    const json resp = co_await rpc_post("get_coin_records", payload);
 
     std::vector<json> records;
     if (resp.contains("coin_records") && resp["coin_records"].is_array()) {

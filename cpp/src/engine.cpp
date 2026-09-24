@@ -5603,35 +5603,58 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
     // of an offer that ended without a fill, and the reason says this one died
     // on-chain.  Not buffered like a wallet-reported terminal: the proof
     // already waited out the confirmation depth, and recheck_terminal would
-    // only hear the wallet say CONFIRMED again.  A failed write leaves the row
-    // as it is; the next process proves the offer dead again and retries.
+    // only hear the wallet say CONFIRMED again.
+    //
+    // [review #171] detect_fills reports each dead offer once, so a write that
+    // fails is queued and retried every heartbeat, bounded as S25's are.
     for (const auto& dead : offer_mgr_->last_dead_offers()) {
+        pending_dead_writes_.push_back(PendingDeadWrite{dead, 0});
+    }
+    std::vector<PendingDeadWrite> dead_still_pending;
+    for (auto& w : pending_dead_writes_) {
+        const auto& dead = w.dead;
         try {
             db_->update_offer_status(dead.offer_id, "cancelled",
                                      static_cast<BlockHeight>(dead.spent_height),
                                      "dead_on_chain");
-            // [S67] A cancel we submitted on it did not confirm -- a cancel
-            // spends every maker coin, and some are unspent -- so its fee
-            // ticket closes unheard, as a FAILED offer's does.
+            // [S67] Whose spend killed it the chain does not say: a secure
+            // cancel that confirmed spends only its cancellation coins, which
+            // reads just like this.  So its fee ticket closes unheard, as a
+            // FAILED offer's does.
             fee_feedback_on_cancel_verdict(dead.offer_id,
                                            static_cast<BlockHeight>(dead.spent_height),
                                            /*wallet_says_cancelled=*/false);
             spdlog::error("[Engine] Step 2: {} ({}) recorded cancelled "
-                          "(dead_on_chain): the wallet reported it CONFIRMED, "
-                          "but its {} maker coins were not spent together "
-                          "({} still unspent) -- no fill was booked",
+                          "(dead_on_chain): the wallet reported it CONFIRMED, but "
+                          "{} -- no fill was booked",
                           dead.offer_id.substr(0, 12), dead.pair_name,
-                          dead.coins, dead.unspent);
+                          dead.spent_together
+                              ? "all " + std::to_string(dead.coins)
+                                    + " maker coins were spent in one block with no "
+                                      "settlement coin: not a take"
+                              : "its " + std::to_string(dead.coins)
+                                    + " maker coins were not spent together ("
+                                    + std::to_string(dead.unspent) + " still unspent)");
         } catch (const OfferNotFound& nf) {
             spdlog::debug("[Engine] Step 2: dead offer {} has no offer_log row "
                           "-- not ours to record ({})",
                           dead.offer_id.substr(0, 12), nf.what());
         } catch (const std::exception& ex) {
-            spdlog::error("[Engine] Step 2: could not record dead offer {} -- "
-                          "its offer_log row stays as it is: {}",
-                          dead.offer_id.substr(0, 12), ex.what());
+            if (++w.failures >= kMaxTerminalPersistFailures) {
+                spdlog::error("[Engine] Step 2: giving up on recording dead offer "
+                              "{} after {} write failures ({}) -- its offer_log row "
+                              "stays as it is until a later process proves it dead "
+                              "again", dead.offer_id.substr(0, 12),
+                              kMaxTerminalPersistFailures, ex.what());
+                continue;
+            }
+            spdlog::warn("[Engine] Step 2: could not record dead offer {} ({}) -- "
+                         "retrying next heartbeat", dead.offer_id.substr(0, 12),
+                         ex.what());
+            dead_still_pending.push_back(std::move(w));
         }
     }
+    pending_dead_writes_ = std::move(dead_still_pending);
 
     // [T4-02] Reorg protection: confirmation depth gating.
     // Newly detected fills are buffered in pending_unconfirmed_fills_ and

@@ -2628,6 +2628,17 @@ private:
     /// exists to avoid.
     static constexpr std::uint32_t kMaxTerminalPersistFailures = 10;
 
+    /// [FILL-PROOF, review #171] Dead offers whose offer_log write failed.
+    /// detect_fills() reports a dead offer ONCE, having already stopped
+    /// tracking it, so a failed write would otherwise wait for the next
+    /// process start.  Retried each heartbeat, up to
+    /// kMaxTerminalPersistFailures consecutive failures, as S25 retries its own.
+    struct PendingDeadWrite {
+        execution::OfferManager::DeadOffer dead{};
+        std::uint32_t                      failures{0};
+    };
+    std::vector<PendingDeadWrite> pending_dead_writes_;
+
     /// Buffer an offer the wallet reported terminal so Step 2 can persist
     /// it once the observation has matured and been re-verified.  Ignores
     /// an id already buffered, since detect_fills() and reconcile_offers()

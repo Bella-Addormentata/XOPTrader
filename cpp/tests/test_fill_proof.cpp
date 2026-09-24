@@ -1,18 +1,24 @@
 // test_fill_proof.cpp -- [FILL-PROOF 2026-09-23]
 //
 // Is a trade the wallet reports CONFIRMED really a fill
-// (execution/fill_proof.hpp)?  The first three tests replay REAL data: the
-// wallet's trade record and the full node's coin records as read on
-// 2026-09-23, trimmed to the fields the proof reads.
+// (execution/fill_proof.hpp)?  The tests marked REAL replay records read from
+// the live wallet and full node on 2026-09-23, trimmed to the fields the proof
+// reads:
 //
-//   * 0xdb63709cb9 -- an XCH/BYC bid booked as a fill on 2026-09-22.  The
-//     wallet says CONFIRMED at 9,325,694; the node says one of its three
-//     maker coins was spent there and the other two never were.  Dead.
-//   * 0x202ff7d2d8 -- an XCH/DBX ask that really was taken on 2026-09-16
-//     (Dexie: completed).  Both maker coins spent at 9,297,025.  Settled.
+//   * 0xdb63709cb9 -- an XCH/BYC bid booked as a fill on 2026-09-22.  One of
+//     its three maker coins was spent at 9,325,694 by a fee spend, whose only
+//     child outlived the block; the other two were never spent.  Dead.
+//   * 0x202ff7d2d8 -- an XCH/DBX ask really taken on 2026-09-16 (trade_log
+//     1899).  Both maker coins spent at 9,297,025.  One of them created the
+//     1-XCH settlement coin, spent in the same block, and the wallet received
+//     the 85,094-mojo DBX payment there.  Settled.
+//   * 0x18672b6b0f -- an XCH/DBX bid really taken (trade_log 1883).  Both
+//     maker coins spent at 9,249,503.  The DBX coin created the 84,696-mojo
+//     settlement coin, spent in the same block, and the wallet received the
+//     1-XCH payment there.  Settled.
 //
-// The rest derive from the genuine fill's records, so every coin name is a
-// real one, computed by CoinManager::compute_coin_name as the engine does.
+// The synthetic tests vary these records, so every coin name is a real one,
+// computed by CoinManager::compute_coin_name as the engine does.
 
 #include <gtest/gtest.h>
 
@@ -22,6 +28,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <exception>
 #include <string>
@@ -45,24 +52,49 @@ std::string chain_name(const ex::CoinRef& ref)
     }
 }
 
-// get_offer(file_contents=false), trimmed to the fields the proof reads.
-constexpr const char* kPhantomWalletRecord = R"({"trade_id":"0xdb63709cb9b2c3794cbf1a57bb15f2d5c1830dca620b16ac36926d0d60c6c556","status":"CONFIRMED","confirmed_at_index":9325694,"coins_of_interest":[{"amount":21284030165,"parent_coin_info":"0x82ee60315b50419a1cbaf52b44bbc98c787129307fc2578e87995cfba73571b7","puzzle_hash":"0xf4d66eb50f4a2d721cc58a4940f3d678989da55af0387d5f7087403521913dcb"},{"amount":1657,"parent_coin_info":"0xf88d5c260891d06b0daf16f22e974c67b1341f2d1bc8a404e374fdcc475abfbc","puzzle_hash":"0x47d29d6d58ccdb7f597c82b3e3c6f9524b2b8aee03414e5971e67ff0241f5955"},{"amount":1600,"parent_coin_info":"0xdf311e9bd2b13703ae87b9e814a8df3d939d03f508f6abc41b96f265479eb469","puzzle_hash":"0xa240a96af2d708713ff6ef3281dd4d47a737961e8899fa8f49a3f9ed62296a78"}]})";
+// wallet get_offer(file_contents=false), trimmed.
+constexpr const char* kPhantomWallet = R"({"trade_id":"0xdb63709cb9b2c3794cbf1a57bb15f2d5c1830dca620b16ac36926d0d60c6c556","status":"CONFIRMED","confirmed_at_index":9325694,"coins_of_interest":[{"amount":21284030165,"parent_coin_info":"0x82ee60315b50419a1cbaf52b44bbc98c787129307fc2578e87995cfba73571b7","puzzle_hash":"0xf4d66eb50f4a2d721cc58a4940f3d678989da55af0387d5f7087403521913dcb"},{"amount":1657,"parent_coin_info":"0xf88d5c260891d06b0daf16f22e974c67b1341f2d1bc8a404e374fdcc475abfbc","puzzle_hash":"0x47d29d6d58ccdb7f597c82b3e3c6f9524b2b8aee03414e5971e67ff0241f5955"},{"amount":1600,"parent_coin_info":"0xdf311e9bd2b13703ae87b9e814a8df3d939d03f508f6abc41b96f265479eb469","puzzle_hash":"0xa240a96af2d708713ff6ef3281dd4d47a737961e8899fa8f49a3f9ed62296a78"}],"summary":{"fees":15000000,"offered":{"ae1536f56760e471ad85ead45f00d680ff9cca73b8cc3407be778f1c0c606eac":"1864"},"requested":{"xch":"1103203898833"}}})";
 
 // full_node get_coin_records_by_names, include_spent_coins, trimmed.
-constexpr const char* kPhantomNodeRecords = R"([{"coin":{"amount":21284030165,"parent_coin_info":"0x82ee60315b50419a1cbaf52b44bbc98c787129307fc2578e87995cfba73571b7","puzzle_hash":"0xf4d66eb50f4a2d721cc58a4940f3d678989da55af0387d5f7087403521913dcb"},"confirmed_block_index":9325687,"spent_block_index":9325694,"spent":true},{"coin":{"amount":1600,"parent_coin_info":"0xdf311e9bd2b13703ae87b9e814a8df3d939d03f508f6abc41b96f265479eb469","puzzle_hash":"0xa240a96af2d708713ff6ef3281dd4d47a737961e8899fa8f49a3f9ed62296a78"},"confirmed_block_index":9245763,"spent_block_index":0,"spent":false},{"coin":{"amount":1657,"parent_coin_info":"0xf88d5c260891d06b0daf16f22e974c67b1341f2d1bc8a404e374fdcc475abfbc","puzzle_hash":"0x47d29d6d58ccdb7f597c82b3e3c6f9524b2b8aee03414e5971e67ff0241f5955"},"confirmed_block_index":9325248,"spent_block_index":0,"spent":false}])";
+constexpr const char* kPhantomNode = R"([{"coin":{"amount":21284030165,"parent_coin_info":"0x82ee60315b50419a1cbaf52b44bbc98c787129307fc2578e87995cfba73571b7","puzzle_hash":"0xf4d66eb50f4a2d721cc58a4940f3d678989da55af0387d5f7087403521913dcb"},"confirmed_block_index":9325687,"spent_block_index":9325694,"spent":true},{"coin":{"amount":1600,"parent_coin_info":"0xdf311e9bd2b13703ae87b9e814a8df3d939d03f508f6abc41b96f265479eb469","puzzle_hash":"0xa240a96af2d708713ff6ef3281dd4d47a737961e8899fa8f49a3f9ed62296a78"},"confirmed_block_index":9245763,"spent_block_index":0,"spent":false},{"coin":{"amount":1657,"parent_coin_info":"0xf88d5c260891d06b0daf16f22e974c67b1341f2d1bc8a404e374fdcc475abfbc","puzzle_hash":"0x47d29d6d58ccdb7f597c82b3e3c6f9524b2b8aee03414e5971e67ff0241f5955"},"confirmed_block_index":9325248,"spent_block_index":0,"spent":false}])";
 
-constexpr const char* kGenuineWalletRecord = R"({"trade_id":"0x202ff7d2d8554a76bf97df827ce65965d5a6a5619496780f698c8222b9a3fcec","status":"CONFIRMED","confirmed_at_index":9297025,"coins_of_interest":[{"amount":999935419490,"parent_coin_info":"0x2c4d49c77fd91113a3717d230cb7c1d44bec20ccfcf146064d9549a86629061e","puzzle_hash":"0x85b236977ac595209c59276f8074b5c4ce9320ee9d7e7987cd201a1b2dcb6360"},{"amount":999955647482,"parent_coin_info":"0xffb0885ba8babec7a41b05aee34195aaf5843a694804f39d5e35fdb784ce2db3","puzzle_hash":"0xe2d5898d50eb165f06653c1e7fcc0e1d626d9181a04ee8fd94ba98ad28bbfa1f"}]})";
+// full_node get_coin_records_by_parent_ids over the maker coins, trimmed: the
+// fee spend's change, spent at 9,331,128.
+constexpr const char* kPhantomChildren = R"([{"coin":{"amount":21269030165,"parent_coin_info":"0x4ea3d75d6698817cfa79a8e5b609ced34fc10bb4d889db437525b85d42bc8413","puzzle_hash":"0x7eaad1dfc5fb8d060234e0fb3a9b2272c89080312c269623106725e7c0845168"},"confirmed_block_index":9325694,"spent_block_index":9331128,"spent":true}])";
 
-constexpr const char* kGenuineNodeRecords = R"([{"coin":{"amount":999955647482,"parent_coin_info":"0xffb0885ba8babec7a41b05aee34195aaf5843a694804f39d5e35fdb784ce2db3","puzzle_hash":"0xe2d5898d50eb165f06653c1e7fcc0e1d626d9181a04ee8fd94ba98ad28bbfa1f"},"confirmed_block_index":9291973,"spent_block_index":9297025,"spent":true},{"coin":{"amount":999935419490,"parent_coin_info":"0x2c4d49c77fd91113a3717d230cb7c1d44bec20ccfcf146064d9549a86629061e","puzzle_hash":"0x85b236977ac595209c59276f8074b5c4ce9320ee9d7e7987cd201a1b2dcb6360"},"confirmed_block_index":9292565,"spent_block_index":9297025,"spent":true}])";
+constexpr const char* kAskWallet = R"({"trade_id":"0x202ff7d2d8554a76bf97df827ce65965d5a6a5619496780f698c8222b9a3fcec","status":"CONFIRMED","confirmed_at_index":9297025,"coins_of_interest":[{"amount":999935419490,"parent_coin_info":"0x2c4d49c77fd91113a3717d230cb7c1d44bec20ccfcf146064d9549a86629061e","puzzle_hash":"0x85b236977ac595209c59276f8074b5c4ce9320ee9d7e7987cd201a1b2dcb6360"},{"amount":999955647482,"parent_coin_info":"0xffb0885ba8babec7a41b05aee34195aaf5843a694804f39d5e35fdb784ce2db3","puzzle_hash":"0xe2d5898d50eb165f06653c1e7fcc0e1d626d9181a04ee8fd94ba98ad28bbfa1f"}],"summary":{"fees":10000000,"offered":{"xch":"1000000000000"},"requested":{"db1a9020d48d9d4ad22631b66ab4b9ebd3637ef7758ad38881348c5d24c38f20":"85094"}}})";
+
+constexpr const char* kAskNode = R"([{"coin":{"amount":999955647482,"parent_coin_info":"0xffb0885ba8babec7a41b05aee34195aaf5843a694804f39d5e35fdb784ce2db3","puzzle_hash":"0xe2d5898d50eb165f06653c1e7fcc0e1d626d9181a04ee8fd94ba98ad28bbfa1f"},"confirmed_block_index":9291973,"spent_block_index":9297025,"spent":true},{"coin":{"amount":999935419490,"parent_coin_info":"0x2c4d49c77fd91113a3717d230cb7c1d44bec20ccfcf146064d9549a86629061e","puzzle_hash":"0x85b236977ac595209c59276f8074b5c4ce9320ee9d7e7987cd201a1b2dcb6360"},"confirmed_block_index":9292565,"spent_block_index":9297025,"spent":true}])";
+
+// [0] the change, [1] the settlement coin (1 XCH at the settlement puzzle,
+// created and spent at 9,297,025).
+constexpr const char* kAskChildren = R"([{"coin":{"amount":999881066972,"parent_coin_info":"0x10e8fca4a290ed992202011788a5a0385057ac5a089082d143004a1b3b903289","puzzle_hash":"0x5ade11161c958f48d66fb618569c13d5e993d164fbdaa152ae8411808fb8c45f"},"confirmed_block_index":9297025,"spent_block_index":9302353,"spent":true},{"coin":{"amount":1000000000000,"parent_coin_info":"0x10e8fca4a290ed992202011788a5a0385057ac5a089082d143004a1b3b903289","puzzle_hash":"0xcfbfdeed5c4ca2de3d0bf520b9cb4bb7743a359bd2e6a188d19ce7dffc21d3e7"},"confirmed_block_index":9297025,"spent_block_index":9297025,"spent":true}])";
+
+// wallet get_coin_records(confirmed_range [9297025, 9297025], amounts
+// [85094]), trimmed: the DBX payment, from the taker's settlement coin.
+constexpr const char* kAskPayments = R"([{"parent_coin_info":"0xafe2244082dbd143a68741eac6207204245a98d55e10fc8a68f791ad0a458384","puzzle_hash":"0xece6bdca8e31ca56d1c402256c052fa2209969681237461d8c297ed64c641f3e","amount":85094,"confirmed_height":9297025,"spent_height":0}])";
+
+constexpr const char* kBidWallet = R"({"trade_id":"0x18672b6b0f03801f9c9a83381b10259bdf44ab97ade00ddfb9ee4f454ccaade5","status":"CONFIRMED","confirmed_at_index":9249503,"coins_of_interest":[{"amount":22068721835,"parent_coin_info":"0xc1988b3597a829a09a206b9cbc987481c5baa51d1a7d666d40713ce6510cde22","puzzle_hash":"0x56abd87f93ae2749858de9eaeca4af5872776d420f29aa6775b7da6e53922145"},{"amount":86034,"parent_coin_info":"0x2ca5da1e910894207e6415101b52c862486238d9837121e6137e0e14a66b3448","puzzle_hash":"0xc60002fd91353a41c931103c4343a017fa31186f3ba5b409dd14cd30f646496c"}],"summary":{"fees":877612,"offered":{"db1a9020d48d9d4ad22631b66ab4b9ebd3637ef7758ad38881348c5d24c38f20":"84696"},"requested":{"xch":"1000000000000"}}})";
+
+constexpr const char* kBidNode = R"([{"coin":{"amount":86034,"parent_coin_info":"0x2ca5da1e910894207e6415101b52c862486238d9837121e6137e0e14a66b3448","puzzle_hash":"0xc60002fd91353a41c931103c4343a017fa31186f3ba5b409dd14cd30f646496c"},"confirmed_block_index":9249420,"spent_block_index":9249503,"spent":true},{"coin":{"amount":22068721835,"parent_coin_info":"0xc1988b3597a829a09a206b9cbc987481c5baa51d1a7d666d40713ce6510cde22","puzzle_hash":"0x56abd87f93ae2749858de9eaeca4af5872776d420f29aa6775b7da6e53922145"},"confirmed_block_index":9247411,"spent_block_index":9249503,"spent":true}])";
+
+// DBX change, XCH change, and the DBX settlement coin (84,696 at the DBX
+// settlement puzzle, created and spent at 9,249,503).
+constexpr const char* kBidChildren = R"([{"coin":{"amount":1338,"parent_coin_info":"0xca9e21410f8e7e3ce3b6e168a2f36e6d5a5bcd276914e262f59e75620f43571f","puzzle_hash":"0x0a495aa099992803f345bacbbbdbb7a8859ceaadfc2b9ce88a1b345d536dd2b4"},"confirmed_block_index":9249503,"spent_block_index":9275986,"spent":true},{"coin":{"amount":22067844223,"parent_coin_info":"0x26f5ee7bb75a3d5ebf5b8a12eb5950873d4d723633caedbcc895e5449bb11222","puzzle_hash":"0x87fabdee1f2921063bc8d3b4d0907a343d4dddf77dcc96bf352be5edaafda781"},"confirmed_block_index":9249503,"spent_block_index":9253024,"spent":true},{"coin":{"amount":84696,"parent_coin_info":"0xca9e21410f8e7e3ce3b6e168a2f36e6d5a5bcd276914e262f59e75620f43571f","puzzle_hash":"0x2a8269fa3ec2a6968ee95219edc900ada54232beb24ad0f7581f3b3eab613e81"},"confirmed_block_index":9249503,"spent_block_index":9249503,"spent":true}])";
+
+// The 1-XCH payment -- to the same address as the XCH change, but from the
+// taker's settlement coin, not from a maker coin.
+constexpr const char* kBidPayments = R"([{"parent_coin_info":"0x2dce69d6b2deb73a3c1f004959a1670bcf3907a659f6a932d821e25cc28c48d5","puzzle_hash":"0x87fabdee1f2921063bc8d3b4d0907a343d4dddf77dcc96bf352be5edaafda781","amount":1000000000000,"confirmed_height":9249503,"spent_height":9273574}])";
 
 std::vector<std::string> names_of(const json& wallet_record)
 {
     return ex::coin_names_for(ex::parse_coins_of_interest(wallet_record), chain_name);
 }
 
-std::vector<json> records_of(const json& node_records)
+std::vector<json> records_of(const char* text)
 {
-    return std::vector<json>(node_records.begin(), node_records.end());
+    const json parsed = json::parse(text);
+    return std::vector<json>(parsed.begin(), parsed.end());
 }
 
 FillProofResult prove(const json& wallet_record, const std::vector<json>& records)
@@ -70,17 +102,47 @@ FillProofResult prove(const json& wallet_record, const std::vector<json>& record
     return ex::prove_fill(names_of(wallet_record), records, chain_name);
 }
 
-json genuine_wallet() { return json::parse(kGenuineWalletRecord); }
-std::vector<json> genuine_records() { return records_of(json::parse(kGenuineNodeRecords)); }
+// Both stages, the node's way and the wallet's way.
+FillProofResult by_node(const json& wallet_record, const std::vector<json>& records,
+                        const std::vector<json>& children)
+{
+    return ex::prove_take_from_children(prove(wallet_record, records), names_of(wallet_record),
+                                        children, ex::summary_amounts(wallet_record, "offered"));
+}
+
+FillProofResult by_wallet(const json& wallet_record, const std::vector<json>& records,
+                          const std::vector<json>& payments)
+{
+    return ex::prove_take_from_payments(prove(wallet_record, records), names_of(wallet_record),
+                                        payments, ex::summary_amounts(wallet_record, "requested"));
+}
+
+json ask_wallet() { return json::parse(kAskWallet); }
+std::vector<json> ask_records() { return records_of(kAskNode); }
+std::vector<json> ask_children() { return records_of(kAskChildren); }
+std::vector<json> ask_payments() { return records_of(kAskPayments); }
+
+// A ONE-coin offer built from the phantom's consumed XCH coin -- real on-chain
+// records, grouped as the review's case: every maker coin spent in one block,
+// by a spend that is not a take.
+json one_coin_offer()
+{
+    json record = json::object();
+    record["coins_of_interest"] =
+        json::array({json::parse(kPhantomWallet)["coins_of_interest"][0]});
+    record["summary"] = {{"offered", {{"xch", "1000000000000"}}},
+                         {"requested", {{"dbx", "100000"}}}};
+    return record;
+}
 
 // ---------------------------------------------------------------------------
-// The real cases
+// REAL: the phantom, and two real takes
 // ---------------------------------------------------------------------------
 
 TEST(FillProof, TheCoinNamesAreTheChainsOwn)
 {
     // The names the proof asks for are the ids Dexie and the node use.
-    const std::vector<std::string> names = names_of(json::parse(kPhantomWalletRecord));
+    const std::vector<std::string> names = names_of(json::parse(kPhantomWallet));
     ASSERT_EQ(names.size(), 3U);
     EXPECT_EQ(names[0], "4ea3d75d6698817cfa79a8e5b609ced34fc10bb4d889db437525b85d42bc8413");
     EXPECT_EQ(names[1], "fe636075405d34d1f22d803c282b6c207fb1e4fa46e4a8b6eb872b4556566f67");
@@ -88,50 +150,101 @@ TEST(FillProof, TheCoinNamesAreTheChainsOwn)
 
 TEST(FillProof, ThePhantomFillOf20260922IsDead)
 {
-    const FillProofResult proof = prove(json::parse(kPhantomWalletRecord),
-                                        records_of(json::parse(kPhantomNodeRecords)));
+    const json wallet = json::parse(kPhantomWallet);
+    const FillProofResult proof = prove(wallet, records_of(kPhantomNode));
     EXPECT_EQ(proof.verdict, FillProof::Dead);
-    EXPECT_EQ(proof.height, 9325694U);   // the fee coin's spend: the wallet's "confirmed" height
+    EXPECT_EQ(proof.height, 9325694U);   // the fee spend: the wallet's "confirmed" height
     EXPECT_EQ(proof.coins, 3U);
     EXPECT_EQ(proof.unspent, 2U);
+    EXPECT_FALSE(proof.spent_together);
     // Nearly 4,700 blocks deep by 2026-09-23: closable at the default depth.
     EXPECT_TRUE(ex::dead_offer_closable(proof, 9330000U, 6U));
+    // The second stage never revisits it.
+    EXPECT_EQ(by_node(wallet, records_of(kPhantomNode), records_of(kPhantomChildren)).verdict,
+              FillProof::Dead);
+    EXPECT_EQ(by_wallet(wallet, records_of(kPhantomNode), {}).verdict, FillProof::Dead);
 }
 
-TEST(FillProof, AGenuineFillIsSettled)
+TEST(FillProof, ATakeSpendsEveryCoinTogetherButThatAloneIsNoFill)
 {
-    const FillProofResult proof = prove(genuine_wallet(), genuine_records());
-    EXPECT_EQ(proof.verdict, FillProof::Settled);
+    const FillProofResult proof = prove(ask_wallet(), ask_records());
+    EXPECT_EQ(proof.verdict, FillProof::SpentTogether);
     EXPECT_EQ(proof.height, 9297025U);   // the wallet's confirmed_at_index too
     EXPECT_EQ(proof.coins, 2U);
     EXPECT_EQ(proof.unspent, 0U);
+    EXPECT_TRUE(proof.spent_together);
     EXPECT_FALSE(ex::dead_offer_closable(proof, 9330000U, 6U));
 }
 
+TEST(FillProof, TheRealAskShowsItsSettlementCoin)
+{
+    const FillProofResult proof = by_node(ask_wallet(), ask_records(), ask_children());
+    EXPECT_EQ(proof.verdict, FillProof::Settled);
+    EXPECT_EQ(proof.height, 9297025U);
+    EXPECT_TRUE(proof.spent_together);
+}
+
+TEST(FillProof, TheRealBidShowsItsSettlementCoin)
+{
+    const json wallet = json::parse(kBidWallet);
+    EXPECT_EQ(prove(wallet, records_of(kBidNode)).verdict, FillProof::SpentTogether);
+    const FillProofResult proof = by_node(wallet, records_of(kBidNode), records_of(kBidChildren));
+    EXPECT_EQ(proof.verdict, FillProof::Settled);
+    EXPECT_EQ(proof.height, 9249503U);
+}
+
+TEST(FillProof, TheWalletSeesTheRealTakesPayments)
+{
+    EXPECT_EQ(by_wallet(ask_wallet(), ask_records(), ask_payments()).verdict, FillProof::Settled);
+    const json bid = json::parse(kBidWallet);
+    EXPECT_EQ(by_wallet(bid, records_of(kBidNode), records_of(kBidPayments)).verdict,
+              FillProof::Settled);
+}
+
+TEST(FillProof, AOneCoinOfferConsumedWithoutATakeIsDead)
+{
+    // [review #171] The coin was spent in one block, as a take would spend
+    // it -- by a fee spend whose only child outlived the block.
+    const json offer = one_coin_offer();
+    const std::vector<json> coin{records_of(kPhantomNode)[0]};
+    const FillProofResult coins = prove(offer, coin);
+    ASSERT_EQ(coins.verdict, FillProof::SpentTogether);
+
+    const FillProofResult proof = by_node(offer, coin, records_of(kPhantomChildren));
+    EXPECT_EQ(proof.verdict, FillProof::Dead);
+    EXPECT_EQ(proof.height, 9325694U);
+    EXPECT_TRUE(proof.spent_together);
+    EXPECT_TRUE(ex::dead_offer_closable(proof, 9330000U, 6U));
+
+    // The wallet saw no payment either -- which proves nothing: never Dead.
+    EXPECT_EQ(by_wallet(offer, coin, {}).verdict, FillProof::Unknown);
+}
+
 // ---------------------------------------------------------------------------
-// Variations on the genuine fill
+// Stage 1: the maker coins' own records
 // ---------------------------------------------------------------------------
 
 TEST(FillProof, CoinsSpentAtDifferentHeightsAreDead)
 {
     // What the phantom's surviving coins would show once a later offer reused
     // them: every coin spent, but not together.  "All spent" is not a take.
-    std::vector<json> records = genuine_records();
+    std::vector<json> records = ask_records();
     records[1]["spent_block_index"] = 9297030;
-    const FillProofResult proof = prove(genuine_wallet(), records);
+    const FillProofResult proof = prove(ask_wallet(), records);
     EXPECT_EQ(proof.verdict, FillProof::Dead);
     EXPECT_EQ(proof.height, 9297025U);   // the earliest spend
     EXPECT_EQ(proof.unspent, 0U);
+    EXPECT_FALSE(proof.spent_together);
 }
 
 TEST(FillProof, EveryCoinUnspentIsLive)
 {
-    std::vector<json> records = genuine_records();
+    std::vector<json> records = ask_records();
     for (auto& record : records) {
         record["spent_block_index"] = 0;
         record["spent"] = false;
     }
-    const FillProofResult proof = prove(genuine_wallet(), records);
+    const FillProofResult proof = prove(ask_wallet(), records);
     EXPECT_EQ(proof.verdict, FillProof::Live);
     EXPECT_EQ(proof.unspent, 2U);
     EXPECT_FALSE(ex::dead_offer_closable(proof, 9330000U, 6U));
@@ -139,10 +252,10 @@ TEST(FillProof, EveryCoinUnspentIsLive)
 
 TEST(FillProof, OneCoinSpentAndOneNotIsDead)
 {
-    std::vector<json> records = genuine_records();
+    std::vector<json> records = ask_records();
     records[0]["spent_block_index"] = 0;
     records[0]["spent"] = false;
-    const FillProofResult proof = prove(genuine_wallet(), records);
+    const FillProofResult proof = prove(ask_wallet(), records);
     EXPECT_EQ(proof.verdict, FillProof::Dead);
     EXPECT_EQ(proof.height, 9297025U);
     EXPECT_EQ(proof.unspent, 1U);
@@ -151,69 +264,240 @@ TEST(FillProof, OneCoinSpentAndOneNotIsDead)
 TEST(FillProof, AMakerCoinTheAnswerOmitsIsNoProof)
 {
     // The node omits coins it does not find; the one it returned is spent.
-    std::vector<json> records = genuine_records();
+    std::vector<json> records = ask_records();
     records.pop_back();
-    EXPECT_EQ(prove(genuine_wallet(), records).verdict, FillProof::Unknown);
-    EXPECT_EQ(prove(genuine_wallet(), {}).verdict, FillProof::Unknown);
+    EXPECT_EQ(prove(ask_wallet(), records).verdict, FillProof::Unknown);
+    EXPECT_EQ(prove(ask_wallet(), {}).verdict, FillProof::Unknown);
 }
 
 TEST(FillProof, ARecordForACoinNotAskedAboutIsNoProof)
 {
-    std::vector<json> records = genuine_records();
-    records.push_back(records_of(json::parse(kPhantomNodeRecords))[0]);
-    EXPECT_EQ(prove(genuine_wallet(), records).verdict, FillProof::Unknown);
+    std::vector<json> records = ask_records();
+    records.push_back(records_of(kPhantomNode)[0]);
+    EXPECT_EQ(prove(ask_wallet(), records).verdict, FillProof::Unknown);
 }
 
 TEST(FillProof, AContradictoryRecordIsNoProof)
 {
-    std::vector<json> spent_without_height = genuine_records();
+    std::vector<json> spent_without_height = ask_records();
     spent_without_height[0]["spent_block_index"] = 0;   // "spent": true stays
-    EXPECT_EQ(prove(genuine_wallet(), spent_without_height).verdict, FillProof::Unknown);
+    EXPECT_EQ(prove(ask_wallet(), spent_without_height).verdict, FillProof::Unknown);
 
-    std::vector<json> height_but_unspent = genuine_records();
+    std::vector<json> height_but_unspent = ask_records();
     height_but_unspent[0]["spent"] = false;              // the height stays
-    EXPECT_EQ(prove(genuine_wallet(), height_but_unspent).verdict, FillProof::Unknown);
+    EXPECT_EQ(prove(ask_wallet(), height_but_unspent).verdict, FillProof::Unknown);
 }
 
 TEST(FillProof, AnUnreadableRecordIsNoProof)
 {
-    std::vector<json> string_height = genuine_records();
+    std::vector<json> string_height = ask_records();
     string_height[0]["spent_block_index"] = "9297025";
-    EXPECT_EQ(prove(genuine_wallet(), string_height).verdict, FillProof::Unknown);
+    EXPECT_EQ(prove(ask_wallet(), string_height).verdict, FillProof::Unknown);
 
-    std::vector<json> no_coin = genuine_records();
+    std::vector<json> no_coin = ask_records();
     no_coin[0].erase("coin");
-    EXPECT_EQ(prove(genuine_wallet(), no_coin).verdict, FillProof::Unknown);
+    EXPECT_EQ(prove(ask_wallet(), no_coin).verdict, FillProof::Unknown);
 
     // Every maker coin answered, plus a record with no coin in it: the answer
     // is not the one that was asked for, whatever else it holds.
-    std::vector<json> junk_added = genuine_records();
+    std::vector<json> junk_added = ask_records();
     junk_added.push_back(json{{"spent_block_index", 0}, {"spent", false}});
-    EXPECT_EQ(prove(genuine_wallet(), junk_added).verdict, FillProof::Unknown);
+    EXPECT_EQ(prove(ask_wallet(), junk_added).verdict, FillProof::Unknown);
 }
 
 TEST(FillProof, DuplicateRecordsMustAgree)
 {
-    std::vector<json> agreeing = genuine_records();
+    std::vector<json> agreeing = ask_records();
     agreeing.push_back(agreeing[0]);
-    EXPECT_EQ(prove(genuine_wallet(), agreeing).verdict, FillProof::Settled);
+    EXPECT_EQ(prove(ask_wallet(), agreeing).verdict, FillProof::SpentTogether);
 
-    std::vector<json> disagreeing = genuine_records();
+    std::vector<json> disagreeing = ask_records();
     json copy = disagreeing[0];
     copy["spent_block_index"] = 9297026;
     disagreeing.push_back(copy);
-    EXPECT_EQ(prove(genuine_wallet(), disagreeing).verdict, FillProof::Unknown);
+    EXPECT_EQ(prove(ask_wallet(), disagreeing).verdict, FillProof::Unknown);
 }
 
 TEST(FillProof, NoCoinsToAskAboutIsNoProof)
 {
-    EXPECT_EQ(ex::prove_fill(std::vector<std::string>{}, genuine_records(), chain_name).verdict,
+    EXPECT_EQ(ex::prove_fill(std::vector<std::string>{}, ask_records(), chain_name).verdict,
               FillProof::Unknown);
 }
 
 // ---------------------------------------------------------------------------
-// coin_record_spent_height
+// Stage 2 from the node: the settlement coin
 // ---------------------------------------------------------------------------
+
+TEST(TakeFromChildren, ASettlementCoinForAnotherAmountIsNoMark)
+{
+    std::vector<json> children = ask_children();
+    children[1]["coin"]["amount"] = 999999999999ULL;
+    const FillProofResult proof = by_node(ask_wallet(), ask_records(), children);
+    EXPECT_EQ(proof.verdict, FillProof::Dead);
+    EXPECT_EQ(proof.height, 9297025U);
+}
+
+TEST(TakeFromChildren, ACoinThatOutlivedTheBlockIsNoMark)
+{
+    std::vector<json> children = ask_children();
+    children[1]["spent_block_index"] = 9297026;
+    EXPECT_EQ(by_node(ask_wallet(), ask_records(), children).verdict, FillProof::Dead);
+}
+
+TEST(TakeFromChildren, AChildOfSomeOtherCoinIsNoAnswer)
+{
+    std::vector<json> children = ask_children();
+    children[0]["coin"]["parent_coin_info"] =
+        "0x4ea3d75d6698817cfa79a8e5b609ced34fc10bb4d889db437525b85d42bc8413";
+    EXPECT_EQ(by_node(ask_wallet(), ask_records(), children).verdict, FillProof::Unknown);
+}
+
+TEST(TakeFromChildren, AChildCreatedAtAnotherHeightIsNoAnswer)
+{
+    // The maker coins were spent at 9,297,025, so that is where their
+    // children were created.  Anything else is not an answer about this spend.
+    std::vector<json> children = ask_children();
+    children[0]["confirmed_block_index"] = 9297024;
+    EXPECT_EQ(by_node(ask_wallet(), ask_records(), children).verdict, FillProof::Unknown);
+}
+
+TEST(TakeFromChildren, AnUnreadableChildIsNoAnswer)
+{
+    std::vector<json> no_height = ask_children();
+    no_height[0].erase("confirmed_block_index");
+    EXPECT_EQ(by_node(ask_wallet(), ask_records(), no_height).verdict, FillProof::Unknown);
+
+    std::vector<json> contradictory = ask_children();
+    contradictory[1]["spent"] = false;   // spent_block_index says spent
+    EXPECT_EQ(by_node(ask_wallet(), ask_records(), contradictory).verdict, FillProof::Unknown);
+
+    std::vector<json> no_coin = ask_children();
+    no_coin[0].erase("coin");
+    EXPECT_EQ(by_node(ask_wallet(), ask_records(), no_coin).verdict, FillProof::Unknown);
+}
+
+TEST(TakeFromChildren, NoChildrenOrNoAmountsIsNoAnswer)
+{
+    EXPECT_EQ(by_node(ask_wallet(), ask_records(), {}).verdict, FillProof::Unknown);
+
+    json no_summary = ask_wallet();
+    no_summary.erase("summary");
+    EXPECT_EQ(by_node(no_summary, ask_records(), ask_children()).verdict, FillProof::Unknown);
+}
+
+TEST(TakeFromChildren, OnlySpentTogetherIsExamined)
+{
+    for (const FillProof other : {FillProof::Unknown, FillProof::Settled, FillProof::Dead,
+                                  FillProof::Live}) {
+        FillProofResult in;
+        in.verdict = other;
+        in.height = 9297025;
+        const FillProofResult out = ex::prove_take_from_children(
+            in, names_of(ask_wallet()), ask_children(), {1000000000000ULL});
+        EXPECT_EQ(out.verdict, other) << ex::fill_proof_name(other);
+        EXPECT_EQ(out.height, 9297025U) << ex::fill_proof_name(other);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2 from the wallet: the payment we asked for
+// ---------------------------------------------------------------------------
+
+TEST(TakeFromPayments, APaymentFromOurOwnMakerCoinIsNoMark)
+{
+    // Change from a maker coin can match a requested amount; a take's
+    // payment never comes from one.
+    std::vector<json> payments = ask_payments();
+    payments[0]["parent_coin_info"] =
+        "0x10e8fca4a290ed992202011788a5a0385057ac5a089082d143004a1b3b903289";
+    EXPECT_EQ(by_wallet(ask_wallet(), ask_records(), payments).verdict, FillProof::Unknown);
+}
+
+TEST(TakeFromPayments, APaymentAtAnotherHeightIsNoMark)
+{
+    std::vector<json> payments = ask_payments();
+    payments[0]["confirmed_height"] = 9297026;
+    EXPECT_EQ(by_wallet(ask_wallet(), ask_records(), payments).verdict, FillProof::Unknown);
+}
+
+TEST(TakeFromPayments, APaymentForAnotherAmountIsNoMark)
+{
+    std::vector<json> payments = ask_payments();
+    payments[0]["amount"] = 85095;
+    EXPECT_EQ(by_wallet(ask_wallet(), ask_records(), payments).verdict, FillProof::Unknown);
+}
+
+TEST(TakeFromPayments, AnUnreadablePaymentIsNoAnswer)
+{
+    std::vector<json> text_amount = ask_payments();
+    text_amount[0]["amount"] = "85094";
+    EXPECT_EQ(by_wallet(ask_wallet(), ask_records(), text_amount).verdict, FillProof::Unknown);
+
+    std::vector<json> no_height = ask_payments();
+    no_height[0].erase("confirmed_height");
+    EXPECT_EQ(by_wallet(ask_wallet(), ask_records(), no_height).verdict, FillProof::Unknown);
+}
+
+TEST(TakeFromPayments, TheWalletsSilenceIsNeverDead)
+{
+    EXPECT_EQ(by_wallet(ask_wallet(), ask_records(), {}).verdict, FillProof::Unknown);
+
+    json no_summary = ask_wallet();
+    no_summary.erase("summary");
+    EXPECT_EQ(by_wallet(no_summary, ask_records(), ask_payments()).verdict, FillProof::Unknown);
+}
+
+TEST(TakeFromPayments, OnlySpentTogetherIsExamined)
+{
+    for (const FillProof other : {FillProof::Unknown, FillProof::Settled, FillProof::Dead,
+                                  FillProof::Live}) {
+        FillProofResult in;
+        in.verdict = other;
+        in.height = 9297025;
+        const FillProofResult out = ex::prove_take_from_payments(
+            in, names_of(ask_wallet()), ask_payments(), {85094ULL});
+        EXPECT_EQ(out.verdict, other) << ex::fill_proof_name(other);
+        EXPECT_EQ(out.height, 9297025U) << ex::fill_proof_name(other);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The record readers
+// ---------------------------------------------------------------------------
+
+TEST(SummaryAmounts, ReadsTheWalletsStringsAndNumbers)
+{
+    EXPECT_EQ(ex::summary_amounts(ask_wallet(), "offered"),
+              std::vector<std::uint64_t>{1000000000000ULL});
+    EXPECT_EQ(ex::summary_amounts(ask_wallet(), "requested"),
+              std::vector<std::uint64_t>{85094ULL});
+    const json numbers = {{"summary", {{"offered", {{"xch", 5}, {"dbx", 7U}}}}}};
+    std::vector<std::uint64_t> read = ex::summary_amounts(numbers, "offered");
+    std::sort(read.begin(), read.end());
+    EXPECT_EQ(read, (std::vector<std::uint64_t>{5ULL, 7ULL}));
+}
+
+TEST(SummaryAmounts, RefusesAnythingItCannotRead)
+{
+    const auto side = [](const json& value) {
+        return ex::summary_amounts(json{{"summary", {{"offered", {{"xch", value}}}}}}, "offered");
+    };
+    for (const char* text : {"", "-5", "+5", " 5", "5x", "0", "18446744073709551616"}) {
+        EXPECT_TRUE(side(text).empty()) << '"' << text << '"';
+    }
+    EXPECT_TRUE(side(0).empty());
+    EXPECT_TRUE(side(-5).empty());
+    EXPECT_TRUE(side(true).empty());
+    EXPECT_TRUE(side(1.5).empty());
+
+    // One bad amount voids the side: a partial list is a different offer.
+    EXPECT_TRUE(ex::summary_amounts(
+        json{{"summary", {{"offered", {{"xch", "5"}, {"dbx", "x"}}}}}}, "offered").empty());
+    EXPECT_TRUE(ex::summary_amounts(json::object(), "offered").empty());
+    EXPECT_TRUE(ex::summary_amounts(json{{"summary", json::object()}}, "offered").empty());
+    EXPECT_TRUE(ex::summary_amounts(
+        json{{"summary", {{"offered", json::object()}}}}, "offered").empty());
+}
 
 TEST(CoinRecordSpentHeight, ReadsEitherFieldAndRefusesADisagreement)
 {
@@ -228,6 +512,16 @@ TEST(CoinRecordSpentHeight, ReadsEitherFieldAndRefusesADisagreement)
     EXPECT_FALSE(ex::coin_record_spent_height(json{{"spent_block_index", 0}, {"spent", true}}).has_value());
     EXPECT_FALSE(ex::coin_record_spent_height(json::object()).has_value());
     EXPECT_FALSE(ex::coin_record_spent_height(json::array()).has_value());
+}
+
+TEST(CoinRecordConfirmedHeight, ReadsTheNodesAndTheWalletsField)
+{
+    EXPECT_EQ(ex::coin_record_confirmed_height(json{{"confirmed_block_index", 7}}), 7U);
+    EXPECT_EQ(ex::coin_record_confirmed_height(json{{"confirmed_height", 7}}), 7U);
+    EXPECT_FALSE(ex::coin_record_confirmed_height(json{{"confirmed_block_index", -1}}).has_value());
+    EXPECT_FALSE(ex::coin_record_confirmed_height(json{{"confirmed_height", "7"}}).has_value());
+    EXPECT_FALSE(ex::coin_record_confirmed_height(json::object()).has_value());
+    EXPECT_FALSE(ex::coin_record_confirmed_height(json::array()).has_value());
 }
 
 // ---------------------------------------------------------------------------
@@ -248,7 +542,8 @@ TEST(DeadOfferClosable, OnlyADeadVerdictAtConfirmationDepth)
     no_height.height = 0;
     EXPECT_FALSE(ex::dead_offer_closable(no_height, 1000U, 6U));
 
-    for (const FillProof other : {FillProof::Unknown, FillProof::Settled, FillProof::Live}) {
+    for (const FillProof other : {FillProof::Unknown, FillProof::Settled, FillProof::Live,
+                                  FillProof::SpentTogether}) {
         FillProofResult not_dead = dead;
         not_dead.verdict = other;
         EXPECT_FALSE(ex::dead_offer_closable(not_dead, 1000U, 6U))

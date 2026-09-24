@@ -32,36 +32,66 @@ can pass for an offer nobody took.
   (`execution/fill_proof.hpp`). It asks the full node while the engine trusts
   it (a node, and not `wallet_only_mode_`, the rule the S14 cancel escalation
   uses), and otherwise the wallet, which does not answer until it is synced.
-- A take spends every maker coin in one block. Only that books a fill, and it
-  books the same way as before. The fill's height is now the height of those
-  spends, which the confirmation-depth buffer counts from, not the wallet's
-  `confirmed_at_index`. For a take the wallet saw itself they are the same
-  number.
-- A maker coin still unspent while another is spent, or maker coins spent at
-  different heights, means the offer died without being taken. Nothing is
-  booked. Once the first spend is `strategy.confirmation_depth_blocks` deep
-  (default 6), the offer stops being tracked, its offer_log row is closed
-  `cancelled` with reason `dead_on_chain` at the height of that spend, and the
-  engine logs an ERROR. A fee ticket for a cancel on it closes without an
-  observation, the same way a FAILED offer's does.
+- A take spends every maker coin in one block, but so does a cancel, or a
+  stray spend of an offer funded by one coin, so that alone books nothing. A
+  fill is booked only when that block also shows the take's own mark:
+  - From the node: a settlement coin, created from a maker coin for exactly an
+    amount the offer offered, and spent in the same block.
+  - From the wallet, which cannot see settlement coins: a payment to us of
+    exactly a requested amount in that block, from a coin that is not ours.
+
+  Four real takes (one ask, three bids) each show exactly one such
+  settlement coin. The phantom's consumed coin and four confirmed cancels show
+  none. Once the mark is found the fill books as before. The fill's height is
+  now the height of those spends, which the confirmation-depth buffer counts
+  from, not the wallet's `confirmed_at_index`. For a take the wallet saw
+  itself they are the same number.
+- A maker coin still unspent while another is spent, maker coins spent at
+  different heights, or every coin spent in one block that the node shows
+  without a settlement coin, means the offer died without being taken.
+  Nothing is booked. Once the first spend is
+  `strategy.confirmation_depth_blocks` deep (default 6), the offer stops being
+  tracked, its offer_log row is closed `cancelled` with reason `dead_on_chain`
+  at the height of that spend, and the engine logs an ERROR. A write that
+  fails is retried every heartbeat, up to the 10 failures S25 allows. A fee
+  ticket for a cancel on it closes without an observation, the same way a
+  FAILED offer's does: the chain cannot say whose spend killed it.
 - Every maker coin unspent means the offer can still be taken. Nothing is
   booked and it stays tracked. If it is taken later, it is booked then.
 - A lookup that fails, or an answer that does not cover every maker coin or
-  cannot be read, books nothing. The offer stays tracked and is asked about
-  again next heartbeat. The first deferral and every 20th are logged. After one
-  lookup fails, nothing more is asked that heartbeat, as the S14 escalation
-  does: each failure spends its transport retries.
+  cannot be read, books nothing. So does a wallet that shows no payment: its
+  store is what was incomplete on 2026-09-22, so its silence proves nothing
+  either way. The offer stays tracked and is asked about again next heartbeat.
+  The first deferral and every 20th are logged. After one lookup fails,
+  nothing more is asked that heartbeat, as the S14 escalation does: each
+  failure spends its transport retries.
+- While the wallet reports an offer CONFIRMED and the proof has not settled
+  it, the engine will not cancel it. Chia's secure cancel sets PENDING_CANCEL
+  over any status, and an insecure one sets CANCELLED. So a cancel sent during
+  a one-heartbeat lookup failure would erase the CONFIRMED the proof is waiting
+  on, and a real take with it.
 - `recheck_terminal` no longer re-adopts an offer proven dead. The wallet goes
   on reporting it CONFIRMED, and re-adopting it would send it through
   detect_fills again.
 
 The gtest replays the wallet and node records of `0xdb63709cb9` (one of three
-maker coins spent, at 9,325,694: dead) and of a real take on 2026-09-16,
-`0x202ff7d2d8` (both maker coins spent at 9,297,025: settled).
+maker coins spent, at 9,325,694: dead), and of two real takes: an ask on
+2026-09-16, `0x202ff7d2d8`, and a bid, `0x18672b6b0f`. Each has its settlement
+coin and its payment.
 
 A genuine fill can now wait a heartbeat or more if the node has not yet seen
-the take. Each CONFIRMED offer costs one extra coin-records call per heartbeat
-until it is resolved.
+the take. Each CONFIRMED offer costs one or two extra coin-record calls per
+heartbeat until it is resolved.
+
+Not detected: another of our offers, built on the same coins and offering
+exactly the same amount, taken while this one is reported CONFIRMED. Its
+settlement coin looks the same, and only its requested payment differs. The
+node cannot search for a payment.
+
+Not changed: a fill still books once, when the take is found, and then waits
+out the confirmation depth without being checked again. A take reorganised out
+of the chain inside that window is still booked. That gap predates this change
+and is listed in `docs/PNL-FIX-DEPLOYMENT.md`.
 
 Not in this change: repairing what the three rows already booked (trade_log
 1900-1902, their ledger legs, their offer_log rows and the tracker). That needs
