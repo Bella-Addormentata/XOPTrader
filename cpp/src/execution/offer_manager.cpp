@@ -1384,6 +1384,7 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
     if (pending_offers.empty()) {
         fill_poll_pending_counts_.clear();
         fill_proof_deferrals_.clear();
+        cancel_status_proven_.clear();
         co_return fills;
     }
 
@@ -1400,6 +1401,9 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
         it = pending_map.count(it->first)
                  ? std::next(it)
                  : fill_poll_pending_counts_.erase(it);
+    }
+    for (auto it = cancel_status_proven_.begin(); it != cancel_status_proven_.end();) {
+        it = pending_map.count(it->first) ? std::next(it) : cancel_status_proven_.erase(it);
     }
     for (auto it = fill_proof_deferrals_.begin(); it != fill_proof_deferrals_.end();) {
         it = pending_map.count(it->first) ? std::next(it) : fill_proof_deferrals_.erase(it);
@@ -1610,22 +1614,37 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
         }
 
         // [FILL-PROOF, review #171 round 11] A CANCEL'S STATUS HIDES NOTHING
-        // FROM THE PROOF.  An offer still held here read CONFIRMED at an
-        // earlier poll and now reads PENDING_CANCEL or CANCELLED.  A cancel may
-        // have overwritten a real take -- one sharing a coin with an offer
-        // that was cancelled, by anything that cancels -- and Chia keeps the
-        // record's coins and confirmed_at_index, so the proof can still be
-        // asked.  The chain decides:
+        // FROM THE PROOF.  A cancel may have overwritten a real take -- one
+        // sharing a coin with an offer that was cancelled, by anything that
+        // cancels -- and Chia keeps the record's coins and confirmed_at_index,
+        // so the proof can still be asked.
+        //
+        // [round 12] Not only for an offer held here, which read CONFIRMED at
+        // an earlier poll of this process.  The overwrite can come before that
+        // poll, and a restart forgets every hold.  So an offer is proven the
+        // first time it shows each cancel status, and while it is held, every
+        // heartbeat.  About one lookup per cancel status, since
+        // cancel_status_proven_ remembers the answer.  The chain decides:
         //   - Settled: a take after all.  Booked below as the CONFIRMED offer
         //     it was, from this proof, with nothing asked twice;
-        //   - Live or Dead: no take, so the cancel's status stands.  The hold
-        //     is released and the offer is handled as that status, as before;
-        //   - Unknown: nothing is settled either way.  Still held, and asked
-        //     again next heartbeat, as a CONFIRMED offer would be.
+        //   - Live or Dead: no take, so the cancel's status stands.  A hold is
+        //     released, and the offer is handled as that status, as before;
+        //   - Unknown, held: still held, and asked again next heartbeat, as a
+        //     CONFIRMED offer would be;
+        //   - Unknown, not held, after a lookup failed: asked again next
+        //     heartbeat, and its status waits;
+        //   - Unknown otherwise: the chain can say no more, so the status
+        //     stands.  An offer never seen CONFIRMED is not held on a question
+        //     that no retry will answer.
         std::optional<FillProofResult> reproved;
         bool reproved_asked_node = false;
-        if (trade_status::written_by_a_cancel(status)
-            && fill_proof_deferrals_.count(trade_id) > 0U) {
+        const bool held = fill_proof_deferrals_.count(trade_id) > 0U;
+        bool reprove = false;
+        if (trade_status::written_by_a_cancel(status)) {
+            const auto seen = cancel_status_proven_.find(trade_id);
+            reprove = held || seen == cancel_status_proven_.end() || seen->second != status;
+        }
+        if (reprove) {
             std::string reproof_failure;
             FillProofResult reproof;
             if (proof_lookup_failed) {
@@ -1637,10 +1656,10 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
                                                        reproved_asked_node);
             }
             if (reproof.verdict == FillProof::Settled) {
-                logger_->warn("[FILL-PROOF] {} ({}): the wallet reports it {} after "
-                              "reporting it CONFIRMED, but the chain shows the take "
-                              "-- a cancel of an offer sharing its coins overwrote "
-                              "the status; booked as the fill it is",
+                logger_->warn("[FILL-PROOF] {} ({}): the wallet reports it {}, but "
+                              "the chain shows the take -- a cancel of an offer "
+                              "sharing its coins overwrote the status; booked as "
+                              "the fill it is",
                               trade_id.substr(0, 12), po.pair_name,
                               status == trade_status::kPendingCancel ? "PENDING_CANCEL"
                                                                      : "CANCELLED");
@@ -1649,7 +1668,8 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
             } else if (reproof.verdict == FillProof::Live
                        || reproof.verdict == FillProof::Dead) {
                 fill_proof_deferrals_.erase(trade_id);
-            } else {
+                cancel_status_proven_[trade_id] = status;
+            } else if (held) {
                 std::uint64_t claimed_height = 0;
                 if (const auto idx = rec.find("confirmed_at_index");
                     idx != rec.end() && idx->is_number_unsigned()) {
@@ -1658,6 +1678,13 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
                 handle_unproven_fill(trade_id, po, reproof, reproof_failure,
                                      reproved_asked_node, claimed_height, current_block);
                 continue;
+            } else if (proof_lookup_failed) {
+                logger_->debug("[FILL-PROOF] {} ({}): a coin lookup failed this "
+                               "heartbeat -- its cancel status is proven next "
+                               "heartbeat", trade_id.substr(0, 12), po.pair_name);
+                continue;
+            } else {
+                cancel_status_proven_[trade_id] = status;
             }
         }
 

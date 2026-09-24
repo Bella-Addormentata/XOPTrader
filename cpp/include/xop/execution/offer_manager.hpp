@@ -1417,6 +1417,16 @@ private:
     };
     std::unordered_map<std::string, FillProofDeferral> fill_proof_deferrals_;
 
+    /// [review #171 round 12] The cancel status (a trade_status code) under
+    /// which each tracked offer was last proven untaken by this process.  A
+    /// cancel's status can hide a real take whether or not this process ever
+    /// saw the offer CONFIRMED: a cancel of a sibling sharing its coins can
+    /// overwrite it first, and a restart forgets every hold.  So detect_fills
+    /// proves an offer the first time it shows each cancel status, and this
+    /// keeps it from asking again every heartbeat.  Pruned with the deferrals
+    /// when the offer leaves State.
+    std::unordered_map<std::string, int> cancel_status_proven_;
+
     /// Whether cancel_offer_charged() must refuse `trade_id`: an offer under
     /// proof, unless its latest proof makes it cancellable.
     [[nodiscard]] bool cancel_withheld_for_proof(const std::string& trade_id) const;

@@ -556,19 +556,24 @@ def test_an_offer_is_held_from_the_moment_the_wallet_says_confirmed():
     assert re.search(r"std::uint64_t\s+proof_call\{0\};", deferral), "a new entry is from no call"
 
 
-def test_a_cancels_status_on_a_held_offer_is_proven_before_it_is_let_go():
+def test_a_cancels_status_is_proven_on_chain_before_it_is_acted_on():
     """[review #171, round 11] A cancel's status can hide a real take.  chia
     2.7.4's cancel_pending_offers writes PENDING_CANCEL (CANCELLED if insecure)
     on the trade it cancels AND on every trade not yet CANCELLED that shares a
     cancellation coin with it, a CONFIRMED one included.  And a real take does
     not fail a pending offer that shared one of its coins, so cancelling that
     offer later -- by any path: this engine's sweeps and per-offer cancels, the
-    watchdog's sweep -- overwrote the take's CONFIRMED.  The next poll released
-    the hold, and the take was never proved or booked.  A held offer now keeps
-    its hold under PENDING_CANCEL or CANCELLED, and detect_fills proves it
-    on-chain once more.  Settled books it as the CONFIRMED offer it was, from
-    that proof; Live or Dead releases it to be handled as its status, as before;
-    Unknown keeps it held and asks again next heartbeat."""
+    watchdog's sweep -- overwrote the take's CONFIRMED, and the take was never
+    proved or booked.
+
+    [round 12] Nor only for an offer held here, which this process saw
+    CONFIRMED: the overwrite can come before that poll, and a restart forgets
+    every hold.  An offer is proven the first time it shows each cancel status
+    (cancel_status_proven_ remembers the answer), and while held, every
+    heartbeat.  Settled books it as the CONFIRMED offer it was, from that proof.
+    Live or Dead lets the status stand and releases any hold.  Unknown keeps a
+    held offer held; one not held is asked again only after a failed lookup,
+    and otherwise its status stands."""
     manager = _source(OFFER_MANAGER)
     written = re.search(r"constexpr bool written_by_a_cancel\(int status\) noexcept \{\s*"
                         r"return status == kPendingCancel \|\| status == kCancelled;\s*\}", manager)
@@ -576,17 +581,22 @@ def test_a_cancels_status_on_a_held_offer_is_proven_before_it_is_let_go():
     detect = _function_body(manager, DETECT_FILLS)
     head = "for (const auto& rec : trade_records) {"
     loop = _block_after(detect[detect.rindex(head):], head)
-    opener = re.search(r"if \(trade_status::written_by_a_cancel\(status\)\s*"
-                       r"&& fill_proof_deferrals_\.count\(trade_id\) > 0U\) \{", loop)
-    assert opener, "a held offer under a cancel's status is proven again"
+    gate = re.search(r"const bool held = fill_proof_deferrals_\.count\(trade_id\) > 0U;\s*"
+                     r"bool reprove = false;\s*"
+                     r"if \(trade_status::written_by_a_cancel\(status\)\) \{\s*"
+                     r"const auto seen = cancel_status_proven_\.find\(trade_id\);\s*"
+                     r"reprove = held \|\| seen == cancel_status_proven_\.end\(\) "
+                     r"\|\| seen->second != status;\s*\}", loop)
+    assert gate, "proven while held, and the first time each cancel status shows"
     fallback = loop.index("fill_proof_deferrals_.erase(trade_id);")
+    opener = loop.index("if (reprove) {")
     branch = loop.index("if (status == trade_status::kConfirmed) {")
-    assert fallback < opener.start() < branch, (
+    assert fallback < gate.start() < opener < branch, (
         "proven after the fallback release, and before the CONFIRMED branch books"
     )
     declared = loop.index("std::optional<FillProofResult> reproved;")
-    assert declared < opener.start(), "one re-proof per record, never carried to the next"
-    reproof = _block_after(loop, opener.group(0))
+    assert declared < opener, "one re-proof per record, never carried to the next"
+    reproof = _block_after(loop, "if (reprove) {")
     asked = re.search(r"if \(proof_lookup_failed\) \{[^}]*\} else \{\s*"
                       r"reproof = co_await prove_fill_on_chain\(rec, reproof_failure,\s*"
                       r"proof_lookup_failed,\s*reproved_asked_node\);\s*\}", reproof)
@@ -598,18 +608,37 @@ def test_a_cancels_status_on_a_held_offer_is_proven_before_it_is_let_go():
     no_take = re.search(r"\} else if \(reproof\.verdict == FillProof::Live\s*"
                         r"\|\| reproof\.verdict == FillProof::Dead\) \{\s*"
                         r"fill_proof_deferrals_\.erase\(trade_id\);\s*"
-                        r"\} else \{", reproof)
-    assert no_take, "only a verdict of no take releases it, to be handled as its status"
-    unknown = _block_after(reproof, no_take.group(0))
-    assert _call_args(unknown, "handle_unproven_fill") == [[
+                        r"cancel_status_proven_\[trade_id\] = status;\s*"
+                        r"\} else if \(held\) \{", reproof)
+    assert no_take, "no take: the status stands, any hold goes, and it is not asked again"
+    held_unknown = _block_after(reproof, "} else if (held) {")
+    assert _call_args(held_unknown, "handle_unproven_fill") == [[
         "trade_id", "po", "reproof", "reproof_failure", "reproved_asked_node",
-        "claimed_height", "current_block"]], "Unknown is deferred as a CONFIRMED offer's is"
-    assert re.search(r"continue;\s*\}$", unknown), "...still held, and asked again next heartbeat"
-    assert "fill_proof_deferrals_.erase(" not in unknown, "Unknown must not let the offer go"
+        "claimed_height", "current_block"]], "a held Unknown is deferred as a CONFIRMED offer's is"
+    assert re.search(r"continue;\s*\}$", held_unknown), "...still held, and asked again next heartbeat"
+    assert "fill_proof_deferrals_.erase(" not in held_unknown, "a held Unknown must not let the offer go"
+    transient = _block_after(reproof, "} else if (proof_lookup_failed) {")
+    assert re.search(r"continue;\s*\}$", transient), "after a failed lookup: asked again next heartbeat"
+    assert "cancel_status_proven_" not in transient and "handle_unproven_fill" not in transient, (
+        "a failed lookup is remembered as no answer, and holds nothing"
+    )
+    assert re.search(r"\} else \{\s*cancel_status_proven_\[trade_id\] = status;\s*\}\s*\}$", reproof), (
+        "otherwise the chain can say no more, and the status stands"
+    )
+    assert reproof.count("cancel_status_proven_[trade_id] = status;") == 2
     reuse = re.search(r"if \(reproved\) \{\s*proof\s*=\s*\*reproved;\s*"
                       r"asked_node\s*=\s*reproved_asked_node;\s*"
                       r"\} else if \(proof_lookup_failed\) \{", _confirmed_branch())
     assert reuse, "the CONFIRMED branch books a re-proved take from that proof, asking nothing twice"
+    # What is remembered goes with the offer.
+    pruned = re.search(r"for \(auto it = cancel_status_proven_\.begin\(\); "
+                       r"it != cancel_status_proven_\.end\(\);\) \{\s*"
+                       r"it = pending_map\.count\(it->first\) \? std::next\(it\) "
+                       r": cancel_status_proven_\.erase\(it\);\s*\}", detect)
+    assert pruned and pruned.start() < detect.rindex(head), "pruned before the loop, as the deferrals are"
+    assert "cancel_status_proven_.clear();" in _block_after(detect, "if (pending_offers.empty()) {")
+    assert re.search(r"std::unordered_map<std::string, int>\s+cancel_status_proven_;",
+                     _source(OFFER_MANAGER_HPP))
 
 
 def test_a_malformed_stage_one_reply_is_a_failed_lookup():
