@@ -458,6 +458,26 @@ def test_an_offer_is_held_from_the_moment_the_wallet_says_confirmed():
     assert re.search(r"std::uint64_t\s+proof_call\{0\};", deferral), "a new entry is from no call"
 
 
+def test_a_malformed_stage_one_reply_is_a_failed_lookup():
+    """[review #171, round 7] Both first-stage wrappers -- the node's and the
+    wallet's get_coin_records_by_names -- throw on a reply without its
+    coin_records list, as the two second-stage wrappers do.  An empty list
+    read from a malformed reply was Unknown without tripping the latch, so
+    every later CONFIRMED offer in the call asked again."""
+    rpc = _source(CHIA_RPC)
+    for signature in ("ChiaFullNodeRPC::get_coin_records_by_names(", WALLET_COIN_RECORDS):
+        body = _function_body(rpc, signature)
+        refused = re.search(r"if \(listed == resp\.end\(\) \|\| !listed->is_array\(\)\) \{\s*"
+                            r"throw ChiaRPCError\(", body)
+        assert refused and refused.start() < body.index("records.push_back("), (
+            f"{signature} must throw on a malformed reply before reading anything from it"
+        )
+    prove = _function_body(_source(OFFER_MANAGER), PROVE_ON_CHAIN)
+    stage1 = prove.index("fill_proof_node_->get_coin_records_by_names(")
+    caught = _block_after(prove[stage1:], "catch (const std::exception& e) {")
+    assert "lookup_failed = true;" in caught, "a first-stage throw trips the latch"
+
+
 def test_the_wallet_fallback_refuses_while_unsynced():
     body = _function_body(_source(CHIA_RPC), WALLET_COIN_RECORDS)
     assert '"include_spent_coins", true' in body, (

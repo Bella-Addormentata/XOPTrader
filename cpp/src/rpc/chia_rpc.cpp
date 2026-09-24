@@ -873,12 +873,19 @@ ChiaFullNodeRPC::get_coin_records_by_names(
 
     const json resp = co_await rpc_post("get_coin_records_by_names", payload);
 
+    // [FILL-PROOF, review #171 round 7] An answer, or a throw -- never an
+    // empty list for a malformed reply.  Both callers, the fill proof's first
+    // stage and the S14 cancel escalation, count a throw as a failed lookup
+    // and ask nothing more that heartbeat.  An empty list read them as
+    // "Unknown, ask the next offer".
+    const auto listed = resp.find("coin_records");
+    if (listed == resp.end() || !listed->is_array()) {
+        throw ChiaRPCError("get_coin_records_by_names: response has no coin_records list");
+    }
     std::vector<json> records;
-    if (resp.contains("coin_records") && resp["coin_records"].is_array()) {
-        records.reserve(resp["coin_records"].size());
-        for (auto& rec : resp["coin_records"]) {
-            records.push_back(std::move(rec));
-        }
+    records.reserve(listed->size());
+    for (const auto& rec : *listed) {
+        records.push_back(rec);
     }
     co_return records;
 }
@@ -1135,12 +1142,16 @@ ChiaWalletRPC::get_coin_records_by_names(const std::vector<std::string>& names)
     };
     const json resp = co_await rpc_post("get_coin_records_by_names", payload);
 
+    // [review #171 round 7] An answer, or a throw, as the node's does: the
+    // fill proof counts a throw as a failed lookup and trips its latch.
+    const auto listed = resp.find("coin_records");
+    if (listed == resp.end() || !listed->is_array()) {
+        throw ChiaRPCError("get_coin_records_by_names: response has no coin_records list");
+    }
     std::vector<json> records;
-    if (resp.contains("coin_records") && resp["coin_records"].is_array()) {
-        records.reserve(resp["coin_records"].size());
-        for (auto& rec : resp["coin_records"]) {
-            records.push_back(std::move(rec));
-        }
+    records.reserve(listed->size());
+    for (const auto& rec : *listed) {
+        records.push_back(rec);
     }
     co_return records;
 }

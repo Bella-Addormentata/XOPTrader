@@ -56,8 +56,12 @@ can pass for an offer nobody took.
 - A maker coin still unspent while another is spent, maker coins spent at
   different heights, or every coin spent in one block that the node shows
   without a settlement coin, means the offer died without being taken. That
-  includes a block where the maker coins created no children at all. A node
-  reply without its list of children is a failed lookup, not an empty list.
+  includes a block where the maker coins created no children at all. A reply
+  without its list of coin records, at either stage and from the node or the
+  wallet, is a failed lookup, not an empty list. So the first malformed reply
+  ends the lookups for that heartbeat, as a timeout does, instead of every
+  other CONFIRMED offer asking again (review round 7). The S14 cancel
+  escalation, which shares the node's lookup, now stops its sweep on one too.
   Nothing is booked. Once the first spend is
   `strategy.confirmation_depth_blocks` deep (default 6), the offer stops being
   tracked, its offer_log row is closed `cancelled` with reason `dead_on_chain`
