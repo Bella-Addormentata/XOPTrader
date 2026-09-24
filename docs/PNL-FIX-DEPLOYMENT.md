@@ -171,6 +171,30 @@ Leading hypotheses, in rough order of likelihood:
    offers whose final status is `cancelled`. `detect_fills` treats wallet
    trade status `CONFIRMED` as a completed fill without verifying settled
    amounts (`offer_manager.cpp` ~606).
+
+   *[2026-09-23] One mechanism of this shape is now confirmed.* On 2026-09-22
+   the wallet reported three never-taken offers CONFIRMED (trade_log
+   1900-1902; each had lost one input to another transaction, every other
+   maker coin is still unspent, and Dexie shows them cancelled). They were
+   booked as fills. `detect_fills` now books a CONFIRMED offer only when the
+   chain shows it was taken, which takes two things
+   (`execution/fill_proof.hpp`; CHANGELOG, "A fill is booked only when the
+   chain shows the offer was taken"):
+   - every maker coin was spent, all in one block;
+   - that block carries the take's own mark. From the full node, that is a
+     settlement coin: a child of a maker coin at the offered asset's
+     settlement puzzle, for exactly the amount offered, created and spent in
+     that block. From the wallet, when the node is not trusted, it is a coin
+     of ours confirmed in that block for exactly a requested amount, whose
+     parent is not a maker coin.
+
+   The first alone is not enough. For a one-coin offer, a cancel or any other
+   spend of that coin also spends every maker coin in one block.
+
+   That settles trade_log 1900-1902 only. Whether the same mechanism also
+   accounts for the 123 older `trade_log` rows mapped to `cancelled` offers
+   (this hypothesis's evidence for the ~665 XCH gap) is **not** established.
+   It would take checking those rows' maker coins on-chain the same way.
 2. **Posted size assumed to be settled size.** A `Fill` copies the offer's
    originally posted price and size; nothing reads what actually settled, so
    a partially-taken or re-priced offer records at full size.

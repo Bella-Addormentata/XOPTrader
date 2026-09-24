@@ -24,8 +24,10 @@
 
 #include <xop/execution/cancel_escalation.hpp>
 #include <xop/execution/cancel_retry.hpp>
+#include <xop/execution/coin_manager.hpp>
 #include <xop/execution/cross_guard.hpp>
 #include <xop/execution/fee_feedback.hpp>
+#include <xop/execution/fill_proof.hpp>
 #include <xop/execution/stuck_tx_verdict.hpp>
 #include <xop/execution/wallet_circuit.hpp>
 #include <xop/execution/wallet_poll_throttle.hpp>
@@ -72,6 +74,28 @@ namespace trade_status {
             if (s == "FAILED")          return kFailed;
         }
         return -1;  // Unknown status.
+    }
+
+    /// [FILL-PROOF, review #171 round 8] A status the wallet really reported:
+    /// one of Chia's six TradeStatus codes.  parse() answers -1 for an unknown
+    /// string and passes any integer through, so anything outside this range
+    /// is no evidence of a state at all -- and in particular none that an
+    /// offer the proof holds has left CONFIRMED.
+    constexpr bool is_known(int status) noexcept {
+        return status >= kPendingAccept && status <= kFailed;
+    }
+
+    /// [FILL-PROOF, review #171 round 11] The statuses a cancel writes over
+    /// any other, CONFIRMED included.  chia 2.7.4's cancel_pending_offers sets
+    /// PENDING_CANCEL (secure) or CANCELLED (insecure) on the trade it cancels
+    /// AND on every trade not yet CANCELLED that shares a cancellation coin
+    /// with it (get_trades_by_coin) -- whoever sent the cancel, this engine's
+    /// sweeps, its per-offer cancels, or the watchdog's.  And a real take does
+    /// not fail a pending offer that shared one of its coins: that one stays
+    /// PENDING_ACCEPT, so cancelling it later reaches the taken trade.  On an
+    /// offer the fill proof holds, one of these may therefore hide a take.
+    constexpr bool written_by_a_cancel(int status) noexcept {
+        return status == kPendingCancel || status == kCancelled;
     }
 }  // namespace trade_status
 
@@ -1343,15 +1367,24 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
 
     // [S25] Describes THIS call only; the engine drains it after we return.
     last_terminal_offers_.clear();
+    last_dead_offers_.clear();
 
     // [WALLET-LOAD 2026-08-04] Advance the poll heartbeat counter once per
     // invocation -- the backoff schedule below is phased on it.
+    //
+    // [FILL-PROOF, review #171 round 4] It also numbers the call a fill proof
+    // belongs to.  Advanced here, before the first await, it makes every proof
+    // an earlier call made stale for the whole of this one, so a cancel that
+    // runs while this call waits is withheld.  The block could not do this:
+    // two calls at one height would share it.
     ++fill_poll_heartbeat_;
 
     // Get all known pending offers from state for comparison.
     auto pending_offers = state_->get_all_offers();
     if (pending_offers.empty()) {
         fill_poll_pending_counts_.clear();
+        fill_proof_deferrals_.clear();
+        cancel_status_proven_.clear();
         co_return fills;
     }
 
@@ -1368,6 +1401,12 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
         it = pending_map.count(it->first)
                  ? std::next(it)
                  : fill_poll_pending_counts_.erase(it);
+    }
+    for (auto it = cancel_status_proven_.begin(); it != cancel_status_proven_.end();) {
+        it = pending_map.count(it->first) ? std::next(it) : cancel_status_proven_.erase(it);
+    }
+    for (auto it = fill_proof_deferrals_.begin(); it != fill_proof_deferrals_.end();) {
+        it = pending_map.count(it->first) ? std::next(it) : fill_proof_deferrals_.erase(it);
     }
 
     // Query only offers we currently track AND due for a poll this
@@ -1442,9 +1481,40 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
         }
 
         try {
-            trade_records.push_back(
-                co_await wallet_->get_offer(trade_id,
-                                            /*file_contents=*/false));
+            json rec = co_await wallet_->get_offer(trade_id, /*file_contents=*/false);
+            // [FILL-PROOF, review #171 round 4] HELD FROM THE POLL THAT READS
+            // CONFIRMED.  The guard used to be entered only after this offer's
+            // own proof lookup, and every await before that -- this loop's
+            // later polls included -- let a detached Cancel All or the shutdown
+            // ladder run, find no guard, and report the offer cancelled or
+            // overwrite the CONFIRMED the proof waits on.  No await comes
+            // between the read and the hold.  A new entry is never cancellable,
+            // and an existing one keeps its count for the log.
+            //
+            // [review #171 round 6] AND RELEASED BY THE POLL THAT READS ANYTHING
+            // ELSE.  A hold left for the erase after this loop would refuse, at
+            // every later await here, the cancel of an offer the wallet has
+            // already taken out of CONFIRMED.  That erase stays as a fallback.
+            //
+            // [review #171 round 8] Released only by a status the wallet really
+            // reported.  An unrecognised one is no evidence the offer left
+            // CONFIRMED, so the hold stays until a poll reads one that is.
+            //
+            // [review #171 round 11] And not by a status a cancel writes: a
+            // cancel of another offer sharing one of its coins overwrites the
+            // CONFIRMED of a real take (trade_status::written_by_a_cancel).
+            // The loop below proves such an offer on-chain once more, and
+            // releases it only when the chain shows no take.
+            if (const auto st = rec.find("status"); st != rec.end()) {
+                const int polled = trade_status::parse(*st);
+                if (polled == trade_status::kConfirmed) {
+                    fill_proof_deferrals_.try_emplace(trade_id);
+                } else if (trade_status::is_known(polled)
+                           && !trade_status::written_by_a_cancel(polled)) {
+                    fill_proof_deferrals_.erase(trade_id);
+                }
+            }
+            trade_records.push_back(std::move(rec));
             polled_ids.push_back(trade_id);
         } catch (const rpc::ChiaRPCError& e) {
             logger_->error("get_offer failed during fill detection for {}: {}",
@@ -1515,6 +1585,8 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
         }
     }
 
+    // [FILL-PROOF] Set by the first coin lookup that fails; see below.
+    bool proof_lookup_failed = false;
     for (const auto& rec : trade_records) {
         // Extract trade_id and status from the record.
         if (!rec.contains("trade_id") || !rec.contains("status")) {
@@ -1531,7 +1603,128 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
 
         const PendingOffer& po = it->second;
 
+        // [FILL-PROOF, review #171 round 2] Under proof only while the wallet
+        // says CONFIRMED.  An entry left behind would go on withholding the
+        // cancels of an offer the wallet has since called live or cancelling.
+        // [round 8] A status the wallet really reported, as at the poll.
+        // [round 11] Other than one a cancel writes, as at the poll.
+        if (status != trade_status::kConfirmed && trade_status::is_known(status)
+            && !trade_status::written_by_a_cancel(status)) {
+            fill_proof_deferrals_.erase(trade_id);
+        }
+
+        // [FILL-PROOF, review #171 round 11] A CANCEL'S STATUS HIDES NOTHING
+        // FROM THE PROOF.  A cancel may have overwritten a real take -- one
+        // sharing a coin with an offer that was cancelled, by anything that
+        // cancels -- and Chia keeps the record's coins and confirmed_at_index,
+        // so the proof can still be asked.
+        //
+        // [round 12] Not only for an offer held here, which read CONFIRMED at
+        // an earlier poll of this process.  The overwrite can come before that
+        // poll, and a restart forgets every hold.  So an offer is proven the
+        // first time it shows each cancel status, and while it is held, every
+        // heartbeat.  About one lookup per cancel status, since
+        // cancel_status_proven_ remembers the answer.  The chain decides:
+        //   - Settled: a take after all.  Booked below as the CONFIRMED offer
+        //     it was, from this proof, with nothing asked twice;
+        //   - Live or Dead: no take, so the cancel's status stands.  A hold is
+        //     released, and the offer is handled as that status, as before;
+        //   - Unknown, held: still held, and asked again next heartbeat, as a
+        //     CONFIRMED offer would be;
+        //   - Unknown, not held, after a lookup failed: asked again next
+        //     heartbeat, and its status waits;
+        //   - Unknown otherwise: the chain can say no more, so the status
+        //     stands.  An offer never seen CONFIRMED is not held on a question
+        //     that no retry will answer.
+        std::optional<FillProofResult> reproved;
+        bool reproved_asked_node = false;
+        const bool held = fill_proof_deferrals_.count(trade_id) > 0U;
+        bool reprove = false;
+        if (trade_status::written_by_a_cancel(status)) {
+            const auto seen = cancel_status_proven_.find(trade_id);
+            reprove = held || seen == cancel_status_proven_.end() || seen->second != status;
+        }
+        if (reprove) {
+            std::string reproof_failure;
+            FillProofResult reproof;
+            if (proof_lookup_failed) {
+                reproof_failure = "an earlier coin lookup this heartbeat failed -- "
+                                  "not asked again until the next one";
+            } else {
+                reproof = co_await prove_fill_on_chain(rec, reproof_failure,
+                                                       proof_lookup_failed,
+                                                       reproved_asked_node);
+            }
+            if (reproof.verdict == FillProof::Settled) {
+                logger_->warn("[FILL-PROOF] {} ({}): the wallet reports it {}, but "
+                              "the chain shows the take -- a cancel of an offer "
+                              "sharing its coins overwrote the status; booked as "
+                              "the fill it is",
+                              trade_id.substr(0, 12), po.pair_name,
+                              status == trade_status::kPendingCancel ? "PENDING_CANCEL"
+                                                                     : "CANCELLED");
+                reproved = reproof;
+                status = trade_status::kConfirmed;
+            } else if (reproof.verdict == FillProof::Live
+                       || reproof.verdict == FillProof::Dead) {
+                fill_proof_deferrals_.erase(trade_id);
+                cancel_status_proven_[trade_id] = status;
+            } else if (held) {
+                std::uint64_t claimed_height = 0;
+                if (const auto idx = rec.find("confirmed_at_index");
+                    idx != rec.end() && idx->is_number_unsigned()) {
+                    claimed_height = idx->get<std::uint64_t>();
+                }
+                handle_unproven_fill(trade_id, po, reproof, reproof_failure,
+                                     reproved_asked_node, claimed_height, current_block);
+                continue;
+            } else if (proof_lookup_failed) {
+                logger_->debug("[FILL-PROOF] {} ({}): a coin lookup failed this "
+                               "heartbeat -- its cancel status is proven next "
+                               "heartbeat", trade_id.substr(0, 12), po.pair_name);
+                continue;
+            } else {
+                cancel_status_proven_[trade_id] = status;
+            }
+        }
+
         if (status == trade_status::kConfirmed) {
+                // [FILL-PROOF 2026-09-23] The wallet's CONFIRMED is its own
+                // bookkeeping, not evidence: on 2026-09-22 it reported three
+                // offers CONFIRMED that were never taken, and they were booked
+                // as fills (execution/fill_proof.hpp).  Nothing below -- the
+                // Fill, State, the removal from tracking -- happens until the
+                // chain shows every maker coin spent in one block.
+                //
+                // After one lookup fails, the rest of this call asks nothing:
+                // each failed attempt spends its transport retries, and the
+                // S14 escalation stops its sweep on the same failure.
+                std::string proof_failure;
+                FillProofResult proof;
+                bool asked_node = false;
+                if (reproved) {
+                    // [round 11] Proven just above, under a cancel's status.
+                    proof      = *reproved;
+                    asked_node = reproved_asked_node;
+                } else if (proof_lookup_failed) {
+                    proof_failure = "an earlier coin lookup this heartbeat failed -- "
+                                    "not asked again until the next one";
+                } else {
+                    proof = co_await prove_fill_on_chain(rec, proof_failure,
+                                                         proof_lookup_failed, asked_node);
+                }
+                if (proof.verdict != FillProof::Settled) {
+                    std::uint64_t claimed_height = 0;
+                    if (const auto idx = rec.find("confirmed_at_index");
+                        idx != rec.end() && idx->is_number_unsigned()) {
+                        claimed_height = idx->get<std::uint64_t>();
+                    }
+                    handle_unproven_fill(trade_id, po, proof, proof_failure, asked_node,
+                                         claimed_height, current_block);
+                    continue;
+                }
+                fill_proof_deferrals_.erase(trade_id);
+
                 // Offer was taken and settled -- this is a fill.
                 Fill fill;
                 fill.offer_id     = trade_id;
@@ -1582,12 +1775,21 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
                 // every fill since June 2026.
                 fill.fee_mojos    = to_mojo_saturating(po.fee_mojos);
 
-                // Extract confirmed block height if available.
-                if (rec.contains("confirmed_at_index")) {
-                    fill.block_height = static_cast<BlockHeight>(
-                        rec["confirmed_at_index"].get<std::int64_t>());
-                } else {
-                    fill.block_height = 0;
+                // [FILL-PROOF] The height the chain proved the take at, which
+                // the confirmation-depth buffer counts from.  For a take the
+                // wallet saw itself its confirmed_at_index is the same
+                // number; for an offer it had already mislabelled CONFIRMED
+                // and that was then really taken, the wallet's number is the
+                // stale one, and would let the buffer book a fresh take at
+                // once.
+                fill.block_height = static_cast<BlockHeight>(proof.height);
+                if (const auto idx = rec.find("confirmed_at_index");
+                    idx != rec.end() && idx->is_number_unsigned()
+                    && idx->get<std::uint64_t>() != proof.height) {
+                    logger_->warn("detect_fills: {} the wallet says confirmed at "
+                                  "{}, the chain says taken at {} -- using the chain's",
+                                  trade_id.substr(0, 12), idx->get<std::uint64_t>(),
+                                  proof.height);
                 }
 
                 // T1-08: Update position accounting using canonical asset IDs
@@ -1707,8 +1909,219 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
         logger_->info("detect_fills: {} offer(s) observed terminal",
                       last_terminal_offers_.size());
     }
+    if (!last_dead_offers_.empty()) {
+        logger_->error("detect_fills: {} offer(s) the wallet reports CONFIRMED "
+                       "were proven never taken -- none booked as a fill",
+                       last_dead_offers_.size());
+    }
 
     co_return fills;
+}
+
+// ---------------------------------------------------------------------------
+// [FILL-PROOF 2026-09-23] The chain's word on a CONFIRMED trade
+// ---------------------------------------------------------------------------
+void OfferManager::set_fill_proof_node(std::shared_ptr<rpc::ChiaFullNodeRPC> node,
+                                       std::function<bool()>                node_trusted)
+{
+    fill_proof_node_         = std::move(node);
+    fill_proof_node_trusted_ = std::move(node_trusted);
+}
+
+asio::awaitable<FillProofResult>
+OfferManager::prove_fill_on_chain(const json& trade_record, std::string& failure,
+                                  bool& lookup_failed, bool& asked_node)
+{
+    // The escalation's adapter shape: any throw is "cannot hash", which voids
+    // the whole name list, which proves nothing.
+    const auto name_of = [](const CoinRef& ref) -> std::string {
+        try {
+            return CoinManager::compute_coin_name(ref.parent_hex, ref.puzzle_hash_hex,
+                                                  static_cast<Mojo>(ref.amount));
+        } catch (const std::exception&) {
+            return {};
+        }
+    };
+    const std::vector<std::string> names =
+        coin_names_for(parse_coins_of_interest(trade_record), name_of);
+    if (names.empty()) {
+        failure = "the wallet record carries no readable coins_of_interest";
+        co_return FillProofResult{};
+    }
+
+    const bool ask_node = fill_proof_node_ && fill_proof_node_trusted_
+                          && fill_proof_node_trusted_();
+    asked_node = ask_node;
+    std::vector<json> records;
+    try {
+        if (ask_node) {
+            records = co_await fill_proof_node_->get_coin_records_by_names(
+                names, /*include_spent=*/true);
+        } else {
+            // Refuses until synced -- the window the wallet mislabels in.
+            records = co_await wallet_->get_coin_records_by_names(names);
+        }
+    } catch (const std::exception& e) {
+        lookup_failed = true;
+        failure = std::string{"the "} + (ask_node ? "full node" : "wallet")
+                  + " could not list its maker coins: " + e.what();
+        co_return FillProofResult{};
+    }
+    const FillProofResult coins = prove_fill(names, records, name_of);
+    if (coins.verdict == FillProof::Unknown) {
+        failure = std::string{"the "} + (ask_node ? "full node" : "wallet")
+                  + "'s answer did not cover every maker coin, or a record was "
+                    "unreadable or contradictory";
+    }
+    if (coins.verdict != FillProof::SpentTogether) {
+        co_return coins;
+    }
+
+    // [review #171] Every maker coin was spent in one block.  A take does
+    // that, and so does a cancel or a stray spend of a one-coin offer, so
+    // only the take's own mark in that block books a fill: the settlement
+    // coin, from the node; the payment of what we asked for, from the wallet.
+    //
+    // [review #171, round 5] The settlement coin is known by its puzzle as
+    // well as its amount: each offered asset's settlement puzzle, named here.
+    const auto puzzle_of = [](const std::string& asset) -> std::string {
+        try {
+            return CoinManager::settlement_puzzle_hash(asset).value_or(std::string{});
+        } catch (const std::exception&) {
+            return {};
+        }
+    };
+    const std::vector<SettlementCoin> settlements =
+        ask_node ? offered_settlements(trade_record, puzzle_of) : std::vector<SettlementCoin>{};
+    const std::vector<std::uint64_t> amounts =
+        ask_node ? std::vector<std::uint64_t>{} : summary_amounts(trade_record, "requested");
+    if (ask_node ? settlements.empty() : amounts.empty()) {
+        failure = std::string{"every maker coin was spent at block "}
+                  + std::to_string(coins.height) + ", but the trade record lists no "
+                  + (ask_node ? "offered asset whose settlement coin can be named"
+                              : "requested amounts to look for");
+        co_return FillProofResult{};
+    }
+    FillProofResult proof;
+    try {
+        if (ask_node) {
+            const std::vector<json> children =
+                co_await fill_proof_node_->get_coin_records_by_parent_ids(
+                    names, /*include_spent=*/true);
+            proof = prove_take_from_children(coins, names, children, settlements);
+        } else {
+            const std::vector<json> payments =
+                co_await wallet_->get_coin_records_at_height(coins.height, amounts);
+            proof = prove_take_from_payments(coins, names, payments, amounts);
+        }
+    } catch (const std::exception& e) {
+        lookup_failed = true;
+        failure = std::string{"every maker coin was spent at block "}
+                  + std::to_string(coins.height) + ", but the "
+                  + (ask_node ? "full node could not list their children"
+                              : "wallet could not list the payments at that height")
+                  + ": " + e.what();
+        co_return FillProofResult{};
+    }
+    if (proof.verdict == FillProof::Unknown) {
+        failure = std::string{"every maker coin was spent at block "}
+                  + std::to_string(coins.height)
+                  + (ask_node ? ", and the node's list of their children could not be read"
+                              : ", and the wallet shows no payment of a requested "
+                                "amount in that block -- which proves nothing either way");
+    }
+    co_return proof;
+}
+
+void OfferManager::handle_unproven_fill(const std::string& trade_id,
+                                        const PendingOffer& po,
+                                        const FillProofResult& proof,
+                                        const std::string& failure,
+                                        bool from_node,
+                                        std::uint64_t claimed_height,
+                                        BlockHeight current_block)
+{
+    if (dead_offer_closable(proof, current_block,
+                            strategy_cfg_.confirmation_depth_blocks)) {
+        // Never taken, and the spend that killed it is as deep as a fill must
+        // be: stop tracking it, and report it -- never as a fill.  The engine
+        // records the outcome; proven_dead_ keeps recheck_terminal() from
+        // re-adopting what the wallet will go on calling CONFIRMED.
+        state_->remove_offer(trade_id);
+        proven_dead_.insert(trade_id);
+        fill_proof_deferrals_.erase(trade_id);
+        last_dead_offers_.push_back(DeadOffer{trade_id, po.pair_name, proof.height,
+                                              proof.coins, proof.unspent,
+                                              proof.spent_together});
+        if (proof.spent_together) {
+            logger_->error("[FILL-PROOF] {} ({} {}): the wallet reports CONFIRMED, "
+                           "but block {} -- where all {} maker coins were spent -- "
+                           "holds no settlement coin for it: a cancel or another "
+                           "spend consumed them, not a take; NOT booked as a fill",
+                           trade_id.substr(0, 12), po.pair_name, to_string(po.side),
+                           proof.height, proof.coins);
+        } else {
+            logger_->error("[FILL-PROOF] {} ({} {}): the wallet reports CONFIRMED, "
+                           "but its {} maker coins were not spent together ({} still "
+                           "unspent, the first spent at block {}) -- the offer died "
+                           "without being taken; NOT booked as a fill",
+                           trade_id.substr(0, 12), po.pair_name, to_string(po.side),
+                           proof.coins, proof.unspent, proof.height);
+        }
+        return;
+    }
+
+    // Not booked, still tracked: the next heartbeat asks again.  The latest
+    // proof is kept for cancel_offer_charged() (review round 2).  Logged on
+    // the first deferral and every 20th after it -- a CONFIRMED offer is
+    // polled every heartbeat, so an unthrottled line would repeat each one.
+    FillProofDeferral& deferral = fill_proof_deferrals_[trade_id];
+    const std::uint32_t deferrals = ++deferral.count;
+    deferral.verdict        = proof.verdict;
+    deferral.from_node      = from_node;
+    deferral.claimed_height = claimed_height;
+    deferral.proved_block   = current_block;
+    deferral.proof_call     = fill_poll_heartbeat_;
+    if (deferrals != 1U && deferrals % 20U != 0U) {
+        return;
+    }
+    std::string why = failure.empty() ? std::string{"no usable answer"} : failure;
+    if (proof.verdict == FillProof::Live) {
+        why = !cancel_withheld_for_proof(trade_id)
+                  ? "every maker coin is still unspent, "
+                    + std::to_string(strategy_cfg_.confirmation_depth_blocks)
+                    + "+ blocks past the height the wallet claims -- the offer is "
+                      "live again and may be cancelled"
+                  : std::string{"every maker coin is still unspent -- a node that "
+                                "has not yet seen the take, or an offer live "
+                                "again; its cancels are withheld until the node "
+                                "is at confirmation depth past the wallet's claim"};
+    } else if (proof.verdict == FillProof::Dead) {
+        why = proof.spent_together
+                  ? "its maker coins were spent in one block that holds no "
+                    "settlement coin for it (the offer died), but that block is "
+                    "not yet at confirmation depth"
+                  : "its maker coins were not spent together (the offer died), but "
+                    "the first spend is not yet at confirmation depth";
+    }
+    // [round 11] "reported": an offer re-proved under a cancel's status is
+    // deferred here too, and the wallet no longer reports it CONFIRMED.
+    logger_->warn("[FILL-PROOF] {} ({}): the wallet reported CONFIRMED, the "
+                  "chain says {}: {} -- not booked; asked again next heartbeat "
+                  "(deferral {})", trade_id.substr(0, 12), po.pair_name,
+                  fill_proof_name(proof.verdict), why, deferrals);
+}
+
+bool OfferManager::cancel_withheld_for_proof(const std::string& trade_id) const
+{
+    const auto held = fill_proof_deferrals_.find(trade_id);
+    if (held == fill_proof_deferrals_.end()) {
+        return false;   // not under proof
+    }
+    const FillProofDeferral& latest = held->second;
+    return !live_offer_cancellable(latest.verdict, latest.from_node, latest.claimed_height,
+                                   latest.proved_block, latest.proof_call, fill_poll_heartbeat_,
+                                   strategy_cfg_.confirmation_depth_blocks);
 }
 
 // ---------------------------------------------------------------------------
@@ -1811,6 +2224,12 @@ OfferManager::recheck_terminal(const std::string& trade_id,
     };
 
     if (status == trade_status::kConfirmed) {
+        // [FILL-PROOF 2026-09-23] Not for an offer the chain proved dead: the
+        // wallet goes on reporting it CONFIRMED, and re-adopting it would send
+        // it round detect_fills again on every recheck.
+        if (proven_dead_.count(trade_id) > 0) {
+            co_return TerminalRecheck::StillTerminal;
+        }
         // The terminal observation was reorged into a FILL.  Re-adoption
         // is what makes the fill recordable: detect_fills() only inspects
         // offers still in State, so without this the fill would be
@@ -2071,8 +2490,129 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(
         logger_->info("cancel_all: bulk cancel_offers succeeded");
         out.bulk_submitted = true;
         out.cancelled.reserve(all_offers.size());
+        // [FILL-PROOF, review #171 round 3] ...except for an offer the fill
+        // proof holds.  The sweep skips every trade the wallet calls completed
+        // -- CONFIRMED included -- so it did not cancel that one, and
+        // reporting it cancelled would mark it cancel_pending: shutdown would
+        // claim success over a quote that may still be takeable, and every
+        // later per-offer path would skip it.  It goes through the guarded
+        // per-offer path instead: cancelled there if the node has proven it
+        // live again, reported outstanding while its cancel stays withheld.
+        std::vector<std::string> held;
         for (const auto& po : all_offers) {
-            out.cancelled.push_back(po.offer_id);
+            if (fill_proof_deferrals_.count(po.offer_id) > 0U) {
+                held.push_back(po.offer_id);
+            } else {
+                out.cancelled.push_back(po.offer_id);
+            }
+        }
+        if (!held.empty()) {
+            // [review #171 round 10] RE-READ, AFTER THE SWEEP, WHAT IT DID TO
+            // EACH HELD OFFER.  A hold records the status of the LAST POLL; the
+            // sweep acted on the status each trade had when it ran.  In chia
+            // 2.7.4 it cancels every PENDING_ACCEPT, PENDING_CONFIRM and
+            // PENDING_CANCEL trade and marks each PENDING_CANCEL before it
+            // returns -- and also every trade not yet CANCELLED that shares a
+            // cancellation coin with one, a held CONFIRMED trade included
+            // (trade_manager.cancel_pending_offers, get_trades_by_coin).  So the
+            // sweep may already cover a held offer, and sending it down the
+            // per-offer path as well would cancel it a second time or report it
+            // outstanding.  Only an offer the wallet still reports CONFIRMED,
+            // which the sweep skipped, is left to the guard:
+            //   - CONFIRMED: the guarded per-offer path decides, as before;
+            //   - PENDING_CANCEL: a cancel is in flight, this sweep's or an
+            //     earlier one's -- nothing more is sent;
+            //   - CANCELLED or FAILED: nothing is left to cancel;
+            //   - PENDING_ACCEPT or PENDING_CONFIRM: live, and not in the sweep,
+            //     which would have left it PENDING_CANCEL -- cancelled here;
+            //   - no answer, or no status the wallet really reports: the sweep
+            //     may or may not have cancelled it, so nothing is sent and it
+            //     is reported outstanding.
+            // [round 11] Only a cancel this call's RPCs had accepted is reported
+            // `cancelled`: its callers persist those as submitted with their
+            // own cause.  A cancel in flight is `already_pending`, and a closed
+            // offer is `closed`, which no caller persists or retries.  And a
+            // status a cancel writes keeps the hold: it may hide a take, and
+            // detect_fills proves that on-chain before letting it go.  Any
+            // other status the wallet really reports releases it.
+            std::vector<std::string> to_cancel;
+            std::vector<std::string> unread;
+            std::size_t in_flight = 0;
+            std::size_t closed = 0;
+            std::string read_error;
+            for (std::size_t i = 0; i < held.size(); ++i) {
+                const auto& oid = held[i];
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    for (std::size_t j = i; j < held.size(); ++j) {
+                        unread.push_back(held[j]);
+                    }
+                    out.deadline_hit = true;
+                    break;
+                }
+                int status = -1;
+                try {
+                    const json rec = co_await wallet_->get_offer(oid, /*file_contents=*/false);
+                    if (const auto st = rec.find("status"); st != rec.end()) {
+                        status = trade_status::parse(*st);
+                    }
+                } catch (const std::exception& e) {
+                    read_error = e.what();
+                }
+                if (status == trade_status::kConfirmed) {
+                    to_cancel.push_back(oid);
+                } else if (status == trade_status::kPendingCancel) {
+                    out.already_pending.push_back(oid);
+                    ++in_flight;
+                } else if (status == trade_status::kCancelled) {
+                    out.closed.push_back(oid);
+                    ++closed;
+                } else if (status == trade_status::kFailed) {
+                    fill_proof_deferrals_.erase(oid);
+                    out.closed.push_back(oid);
+                    ++closed;
+                } else if (trade_status::is_known(status)) {
+                    fill_proof_deferrals_.erase(oid);
+                    to_cancel.push_back(oid);
+                } else {
+                    unread.push_back(oid);
+                }
+            }
+            CancelOutcome per_offer = co_await cancel_ids(to_cancel, deadline);
+            out.cancelled.insert(out.cancelled.end(), per_offer.cancelled.begin(),
+                                 per_offer.cancelled.end());
+            out.failed.insert(out.failed.end(), per_offer.failed.begin(),
+                              per_offer.failed.end());
+            out.already_pending.insert(out.already_pending.end(),
+                                       per_offer.already_pending.begin(),
+                                       per_offer.already_pending.end());
+            if (!per_offer.failed.empty()) {
+                out.last_error  = per_offer.last_error;
+                out.worst_class = per_offer.worst_class;
+            }
+            if (!unread.empty()) {
+                out.failed.insert(out.failed.end(), unread.begin(), unread.end());
+                std::string why = read_error.empty()
+                    ? std::string{"the status of an offer the fill proof holds "
+                                  "could not be read after the sweep"}
+                    : read_error;
+                const auto cls = execution::classify_take_failure(why);
+                out.worst_class = per_offer.failed.empty()
+                    ? cls
+                    : execution::more_retryable(out.worst_class, cls);
+                if (per_offer.failed.empty()) {
+                    out.last_error = std::move(why);
+                }
+            }
+            out.deadline_hit = out.deadline_hit || per_offer.deadline_hit;
+            logger_->warn("cancel_all: {} offer(s) the fill proof held, re-read "
+                          "after the sweep: {} with a cancel already in flight "
+                          "and {} closed, nothing sent for either; {} still "
+                          "CONFIRMED or live and not swept -- {} cancelled one "
+                          "by one, {} still outstanding; {} unreadable, "
+                          "reported outstanding with nothing sent",
+                          held.size(), in_flight, closed, to_cancel.size(),
+                          per_offer.cancelled.size(), per_offer.failed.size(),
+                          unread.size());
         }
     } else if (bulk_possibly_submitted) {
         // [review 2026-09-13, round 2] NO ANSWER IS NOT A REFUSAL.  The sweep
@@ -4371,6 +4911,19 @@ std::string OfferManager::late_trade_id(const json& result,
 asio::awaitable<json> OfferManager::cancel_offer_charged(
     const std::string& trade_id, std::uint64_t fee, bool secure)
 {
+    // [FILL-PROOF, review #171] Not an offer the wallet reports CONFIRMED
+    // that the fill proof has not settled.  Chia 2.7.4's secure cancel sets
+    // PENDING_CANCEL over whatever status the trade has, and an insecure one
+    // sets CANCELLED, so a cancel sent while a lookup failed or the node lagged
+    // would erase the CONFIRMED the proof waits on -- and a real take with it.
+    // [round 2] Unless the node has proven it live again, at depth
+    // (execution::live_offer_cancellable).  Refused like a wallet refusal,
+    // which every caller already handles.
+    if (cancel_withheld_for_proof(trade_id)) {
+        throw rpc::ChiaRPCError("cancel withheld: the wallet reports "
+                                + trade_id.substr(0, 12)
+                                + " CONFIRMED and the fill proof has not settled it");
+    }
     // [review #163 r6] to_mojo_saturating, not a bare cast: `fee` is a
     // std::uint64_t and a wrapped negative is silently zeroed by
     // CoinLockLedger::clamp_need(), which would leave the pool believing this
@@ -5459,6 +6012,15 @@ asio::awaitable<bool> OfferManager::emergency_cancel(
     const std::string& context,
     bool prefer_zero_fee)
 {
+    // [FILL-PROOF, review #171] cancel_offer_charged refuses an offer under
+    // fill proof.  Stop here rather than read the balance and walk the whole
+    // fee ladder into that refusal.
+    if (cancel_withheld_for_proof(offer_id)) {
+        logger_->warn("{}: cancel of {} withheld -- the wallet reports it "
+                      "CONFIRMED and the fill proof has not settled it",
+                      context, offer_id.substr(0, 12));
+        co_return false;
+    }
     try {
         // When prefer_zero_fee is set (UTXO liberation), try the fee=0
         // secure cancel FIRST so we don't burn spendable XCH on fees.

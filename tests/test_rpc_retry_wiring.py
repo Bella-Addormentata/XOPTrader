@@ -172,7 +172,7 @@ def test_cancel_all_sends_nothing_more_after_a_possibly_submitted_sweep():
     ])
 
     # A possibly-submitted outcome is decided BEFORE the per-id fallback, in
-    # a branch that sends nothing -- and the fallback is the only cancel_ids.
+    # a branch that sends nothing.
     branches = _in_order(code, [
         "if(bulk_ok){",
         "}elseif(bulk_possibly_submitted){",
@@ -184,8 +184,28 @@ def test_cancel_all_sends_nothing_more_after_a_possibly_submitted_sweep():
         "-- a second, conflicting spend of every offer the sweep cancelled"
     )
     assert "out.bulk_possibly_submitted=true;" in possibly
-    assert code.count("cancel_ids(") == 1
-    assert code.find("cancel_ids(") > branches[2]
+
+    # [FILL-PROOF, review #171 round 3] Two cancel_ids, and only two: the
+    # refused sweep's per-id fallback, after every other branch, and -- after a
+    # sweep that ANSWERED -- the offers the fill proof holds.  The sweep skips
+    # a trade the wallet calls CONFIRMED, so those are the only ids it did not
+    # spend; re-cancelling any other would be the second, conflicting spend.
+    assert code.count("cancel_ids(") == 2
+    assert code.find("cancel_ids(", branches[1]) > branches[2]
+    bulk = _block(code, "if(bulk_ok){")
+    # [review #171 round 10] ...and of those, only the ones a re-read after the
+    # sweep finds still CONFIRMED, or live and not swept: an offer the sweep
+    # already covered is not cancelled a second time.
+    assert bulk.count("cancel_ids(") == 1 and "cancel_ids(to_cancel,deadline)" in bulk
+    reread = _block(bulk, "for(std::size_ti=0;i<held.size();++i){")
+    assert "constauto&oid=held[i];" in reread
+    assert bulk.count("to_cancel.push_back(") == 2 == reread.count("to_cancel.push_back(oid);")
+    assert bulk.count("held.push_back(") == 1
+    assert "held.push_back(po.offer_id);" in _block(
+        bulk, "if(fill_proof_deferrals_.count(po.offer_id)>0U){"), (
+        "the answered sweep's per-id cancels are no longer only the offers the "
+        "fill proof holds -- they now re-cancel offers the sweep already spent"
+    )
 
     # [review 2026-09-13, round 3] No RPC of ANY kind leaves that branch --
     # not cancel_ids, not cancel_offer_charged, not emergency_cancel -- and

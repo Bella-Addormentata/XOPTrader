@@ -128,6 +128,7 @@ add_executable(xop_tests
     test_stuck_prune_scope.cpp
     test_shutdown_flag.cpp
     test_cancel_escalation.cpp
+    test_fill_proof.cpp
     test_rpc_retry_policy.cpp
     test_price_cancel_replay.cpp
     test_stop_offers_policy.cpp

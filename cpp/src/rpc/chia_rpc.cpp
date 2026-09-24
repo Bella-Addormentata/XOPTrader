@@ -873,12 +873,50 @@ ChiaFullNodeRPC::get_coin_records_by_names(
 
     const json resp = co_await rpc_post("get_coin_records_by_names", payload);
 
+    // [FILL-PROOF, review #171 round 7] An answer, or a throw -- never an
+    // empty list for a malformed reply.  Both callers, the fill proof's first
+    // stage and the S14 cancel escalation, count a throw as a failed lookup
+    // and ask nothing more that heartbeat.  An empty list read them as
+    // "Unknown, ask the next offer".
+    const auto listed = resp.find("coin_records");
+    if (listed == resp.end() || !listed->is_array()) {
+        throw ChiaRPCError("get_coin_records_by_names: response has no coin_records list");
+    }
     std::vector<json> records;
-    if (resp.contains("coin_records") && resp["coin_records"].is_array()) {
-        records.reserve(resp["coin_records"].size());
-        for (auto& rec : resp["coin_records"]) {
-            records.push_back(std::move(rec));
-        }
+    records.reserve(listed->size());
+    for (const auto& rec : *listed) {
+        records.push_back(rec);
+    }
+    co_return records;
+}
+
+asio::awaitable<std::vector<json>>
+ChiaFullNodeRPC::get_coin_records_by_parent_ids(
+    const std::vector<std::string>& parent_ids,
+    bool                            include_spent)
+{
+    json id_arr = json::array();
+    for (const auto& id : parent_ids) {
+        id_arr.push_back(id.size() >= 2 && id.substr(0, 2) == "0x" ? id : "0x" + id);
+    }
+    const json payload = {
+        {"parent_ids",          id_arr},
+        {"include_spent_coins", include_spent}
+    };
+    const json resp = co_await rpc_post("get_coin_records_by_parent_ids", payload);
+
+    // [FILL-PROOF, review #171 round 5] An answer, or a throw -- never an
+    // empty list for a malformed reply.  The node lists every child with no
+    // limit, so an empty list is proof that the maker coins created none, and
+    // the fill proof reads it as such.
+    const auto listed = resp.find("coin_records");
+    if (listed == resp.end() || !listed->is_array()) {
+        throw ChiaRPCError("get_coin_records_by_parent_ids: response has no coin_records list");
+    }
+    std::vector<json> records;
+    records.reserve(listed->size());
+    for (const auto& rec : *listed) {
+        records.push_back(rec);
     }
     co_return records;
 }
@@ -1088,6 +1126,68 @@ ChiaWalletRPC::get_offer(const std::string& trade_id, bool file_contents)
     }
 
     co_return resp["trade_record"];
+}
+
+asio::awaitable<std::vector<json>>
+ChiaWalletRPC::get_coin_records_by_names(const std::vector<std::string>& names)
+{
+    json name_arr = json::array();
+    for (const auto& n : names) {
+        name_arr.push_back(n.size() >= 2 && n.substr(0, 2) == "0x" ? n : "0x" + n);
+    }
+    // No allow_unsynced: an unsynced wallet must refuse, not answer.
+    const json payload = {
+        {"names",               name_arr},
+        {"include_spent_coins", true}
+    };
+    const json resp = co_await rpc_post("get_coin_records_by_names", payload);
+
+    // [review #171 round 7] An answer, or a throw, as the node's does: the
+    // fill proof counts a throw as a failed lookup and trips its latch.
+    const auto listed = resp.find("coin_records");
+    if (listed == resp.end() || !listed->is_array()) {
+        throw ChiaRPCError("get_coin_records_by_names: response has no coin_records list");
+    }
+    std::vector<json> records;
+    records.reserve(listed->size());
+    for (const auto& rec : *listed) {
+        records.push_back(rec);
+    }
+    co_return records;
+}
+
+asio::awaitable<std::vector<json>>
+ChiaWalletRPC::get_coin_records_at_height(std::uint64_t                     height,
+                                          const std::vector<std::uint64_t>& amounts)
+{
+    // amount_filter mode 1 is FilterMode.include; confirmed_range is
+    // inclusive at both ends.  Checked against a live 2.7.4 wallet
+    // (2026-09-23): the real take 0x202ff7d2d8 answers with its one DBX
+    // payment, and the phantom 0xdb63709cb9 with nothing.
+    //
+    // [review #171, round 5] NO LIMIT.  A limit of 50 cut the answer at 50
+    // rows, and this exact query repeats in the same order every heartbeat, so
+    // a payment past the cut was never seen.  In chia 2.7.4 an omitted limit
+    // is uint32 max, which get_coin_records accepts and queries with no LIMIT
+    // clause (wallet_rpc_api.py, wallet_coin_store.py).  Any explicit limit
+    // above 1000 is refused.  One block's coins of a few exact amounts is a
+    // small answer.
+    const json payload = {
+        {"confirmed_range", {{"start", height}, {"stop", height}}},
+        {"amount_filter",   {{"values", amounts}, {"mode", 1}}}
+    };
+    const json resp = co_await rpc_post("get_coin_records", payload);
+
+    const auto listed = resp.find("coin_records");
+    if (listed == resp.end() || !listed->is_array()) {
+        throw ChiaRPCError("get_coin_records: response has no coin_records list");
+    }
+    std::vector<json> records;
+    records.reserve(listed->size());
+    for (const auto& rec : *listed) {
+        records.push_back(rec);
+    }
+    co_return records;
 }
 
 asio::awaitable<std::vector<json>>

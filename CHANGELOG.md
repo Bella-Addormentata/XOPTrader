@@ -137,6 +137,178 @@ Not in this change: the wallet's own configuration (`use_delta_sync`,
 `connect_to_unknown_peers`), and the restart itself, which is still a blocking
 `std::system` call.
 
+### A fill is booked only when the chain shows the offer was taken
+
+On 2026-09-22 the engine booked three fills for offers that were never taken:
+the XCH/DBX asks `0xd6a8325c15` and `0x83eef9df80` and the XCH/BYC bid
+`0xdb63709cb9` (trade_log rows 1900-1902). Each had lost exactly one XCH input
+to another of the bot's own transactions, which spent it paying a
+15,000,000-mojo fee (blocks 9,324,680, 9,325,004 and 9,325,694). Every other
+maker coin of all three is still unspent, and Dexie shows all three cancelled.
+The wallet nevertheless reported them CONFIRMED at exactly those heights, and
+detect_fills booked every CONFIRMED offer: they entered trade_log, the ledger,
+the inventory tracker and State (about -0.9 XCH, -1.864 BYC and +203.188 DBX,
+and 44,876 DBX mojos of realized P&L that never happened).
+
+The wallet's CONFIRMED is its own bookkeeping, not evidence. The likely
+mechanism, read from Chia 2.7.4's code: it marks a trade CONFIRMED when every
+coin its inputs would create exists on-chain, but it only checks the inputs it
+finds in its coin store at that moment. After the 2026-09-22 resyncs the
+untouched inputs could be missing from the store, and a check over what is left
+can pass for an offer nobody took.
+
+- Before booking a CONFIRMED offer, detect_fills looks up the offer's maker
+  coins (the trade record's `coins_of_interest`) on-chain
+  (`execution/fill_proof.hpp`). It asks the full node while the engine trusts
+  it (a node, and not `wallet_only_mode_`, the rule the S14 cancel escalation
+  uses), and otherwise the wallet, which does not answer until it is synced.
+- A take spends every maker coin in one block, but so does a cancel, or a
+  stray spend of an offer funded by one coin, so that alone books nothing. A
+  fill is booked only when that block also shows the take's own mark:
+  - From the node: a settlement coin, created from a maker coin at the offered
+    asset's settlement puzzle, for exactly the amount offered, and spent in
+    the same block. The puzzle is OFFER_MOD for XCH, and for a CAT it is CAT
+    v2 curried with the CAT's TAIL around OFFER_MOD
+    (`CoinManager::settlement_puzzle_hash`). An amount alone could belong to
+    any child.
+  - From the wallet, which cannot see settlement coins: a coin of ours
+    confirmed in that block for exactly a requested amount, whose parent is
+    not one of this offer's maker coins. That is all the check can prove: it
+    cannot tell a payment from an unrelated coin of ours (see "Not detected"
+    below).
+    The wallet is asked for every such coin, with no row limit. A limit of
+    50 would have hidden a payment past the 50th row on every retry.
+
+  Four real takes (one ask, three bids) each show exactly one such
+  settlement coin, at exactly the puzzle computed for its asset. The
+  phantom's consumed coin and four confirmed cancels show none. Once the
+  mark is found the fill books as before. The fill's height is
+  now the height of those spends, which the confirmation-depth buffer counts
+  from, not the wallet's `confirmed_at_index`. For a take the wallet saw
+  itself they are the same number.
+- A maker coin still unspent while another is spent, maker coins spent at
+  different heights, or every coin spent in one block that the node shows
+  without a settlement coin, means the offer died without being taken. That
+  includes a block where the maker coins created no children at all. A reply
+  without its list of coin records, at either stage and from the node or the
+  wallet, is a failed lookup, not an empty list. So the first malformed reply
+  ends the lookups for that heartbeat, as a timeout does, instead of every
+  other CONFIRMED offer asking again (review round 7). The S14 cancel
+  escalation, which shares the node's lookup, now stops its sweep on one too.
+  Nothing is booked. Once the first spend is
+  `strategy.confirmation_depth_blocks` deep (default 6), the offer stops being
+  tracked, the engine logs an ERROR, and it records the offer `cancelled` at
+  the height of that spend with the reason `dead_on_chain`. The closure event
+  keeps that reason. The offer_log row follows the rule every closure does
+  (S14): a row still open closes `cancelled` at that height with that reason,
+  a row whose cancel was already submitted closes the same way but keeps that
+  cancel's cause, and a row already closed keeps its status. So an audit of
+  dead offers reads the closure events (review round 9). A write that
+  fails is retried every heartbeat, up to the 10 failures S25 allows. A fee
+  ticket for a cancel on it closes without an observation, the same way a
+  FAILED offer's does: the chain cannot say whose spend killed it.
+- Every maker coin unspent means the offer can still be taken. Nothing is
+  booked and it stays tracked. If it is taken later, it is booked then.
+- A lookup that fails, or an answer that does not cover every maker coin or
+  cannot be read, books nothing. So does a wallet that shows no payment: its
+  store is what was incomplete on 2026-09-22, so its silence proves nothing
+  either way. The offer stays tracked and is asked about again next heartbeat.
+  The first deferral and every 20th are logged. After one lookup fails,
+  nothing more is asked that heartbeat, as the S14 escalation does: each
+  failure spends its transport retries.
+- While the wallet reports an offer CONFIRMED and the proof has not settled
+  it, the engine will not cancel it. Chia's secure cancel sets PENDING_CANCEL
+  over any status, and an insecure one sets CANCELLED. So a cancel sent during
+  a one-heartbeat lookup failure would erase the CONFIRMED the proof is waiting
+  on, and a real take with it. The one exception: an offer the full node shows
+  live again can be cancelled. That means every maker coin unspent in the
+  latest fill check, with the node at least `confirmation_depth_blocks` past
+  the height the wallet claims. A take undone by a reorganisation therefore
+  does not leave a quote nobody can withdraw. The latest check is counted by
+  call, not by block: two checks can run at one height, and a live proof from
+  the earlier one no longer counts. An offer is held from the poll that reads
+  CONFIRMED, before the engine waits on anything else. So a Cancel All or a
+  shutdown that runs while the proof is being asked cannot slip in before the
+  hold. An offer stops being held by the first poll that reads any other
+  status, again before the engine waits on anything else. Once the engine
+  has read that status, no cancel of the offer is refused on its account.
+  The status must be one of Chia's six trade statuses (review round 8). An
+  unrecognised one is no evidence the offer left CONFIRMED, so the hold
+  stays until a poll reads one that is.
+  Nor does PENDING_CANCEL or CANCELLED release it (review round 11): they are
+  what a cancel writes, and a cancel can write them over a real take. In
+  chia 2.7.4 cancelling an offer marks every trade not yet CANCELLED that
+  shares one of its coins, a CONFIRMED one included. And a take leaves a
+  pending offer that shared one of its coins PENDING_ACCEPT, so cancelling
+  that offer later -- any sweep or per-offer cancel, the watchdog's included --
+  reaches the taken trade. Its take was then never proved or booked. Now the
+  next heartbeat proves such an offer on-chain once more. If the chain shows
+  the take, it is booked, from that proof. If it shows the offer live or dead,
+  the hold is released and the offer is handled as its status says, as
+  before. If the chain cannot say, it stays held and is asked again.
+  Nor only an offer this process held (review round 12). The overwrite can
+  come before the first poll that reads CONFIRMED, and a restart forgets
+  every hold. So every tracked offer is proven the first time it shows each
+  cancel status, and a held one every heartbeat. The answer is remembered,
+  so a cancel costs about one lookup per status. For an offer never held, an
+  answer the chain cannot settle is asked again only after a failed lookup.
+  Otherwise its status stands, so no offer waits on a question no retry
+  will answer.
+  Cancel All's wallet-wide sweep skips every trade the wallet calls
+  completed, so it never reports a held offer as cancelled. Such an offer goes
+  through the guarded per-offer path instead: it is cancelled there if the
+  node has proven it live again, and otherwise it stays outstanding. It is
+  never marked cancel_pending over a quote that may still be takeable.
+  A hold, though, is the status of the last poll, and the sweep acts on the
+  status each trade has when it runs. In chia 2.7.4 it marks PENDING_CANCEL
+  every trade it cancels, and every trade not yet CANCELLED that shares a
+  cancellation coin with one, a held CONFIRMED trade included. So after an
+  accepted sweep, each held offer's status is read again (review round 10).
+  Only one the wallet still reports CONFIRMED goes to the guarded path, and
+  nothing is sent a second time. One PENDING_ACCEPT or PENDING_CONFIRM is
+  live and was not swept, so it is cancelled. One whose status cannot be
+  read is sent nothing and reported outstanding. The rest are not reported
+  as cancels this call submitted, which the callers would persist with their
+  own cause (review round 11). One PENDING_CANCEL is reported as a cancel
+  already in flight. One CANCELLED or FAILED is reported closed, for
+  detect_fills to read. PENDING_CANCEL and CANCELLED keep the hold, for the
+  proof above; FAILED, PENDING_ACCEPT and PENDING_CONFIRM release it.
+- A coin record whose height does not fit a BlockHeight is unreadable, so it
+  proves nothing. The engine narrows every proven height to 32 bits, and such
+  a height would have wrapped to an old block.
+- `recheck_terminal` no longer re-adopts an offer proven dead. The wallet goes
+  on reporting it CONFIRMED, and re-adopting it would send it through
+  detect_fills again.
+
+The gtest replays the wallet and node records of `0xdb63709cb9` (one of three
+maker coins spent, at 9,325,694: dead), and of two real takes: an ask on
+2026-09-16, `0x202ff7d2d8`, and a bid, `0x18672b6b0f`. Each has its settlement
+coin and its payment.
+
+A genuine fill can now wait a heartbeat or more if the node has not yet seen
+the take. Each CONFIRMED offer costs one or two extra coin-record calls per
+heartbeat until it is resolved.
+
+Not detected: another of our offers, built on the same coins and offering
+exactly the same amount, taken while this one is reported CONFIRMED. Its
+settlement coin looks the same, and only its requested payment differs. The
+node cannot search for a payment. From the wallet, which is asked only while
+the node is not trusted: an unrelated coin of ours, confirmed in the same
+block for exactly a requested amount. The wallet shows a payment's parent
+only as a coin id, and it holds no record of a coin that is not ours, so it
+cannot tell a settlement coin from any other sender.
+
+Not changed: a fill still books once, when the take is found, and then waits
+out the confirmation depth without being checked again. A take reorganised out
+of the chain inside that window is still booked. That gap predates this change
+and is listed in `docs/PNL-FIX-DEPLOYMENT.md`.
+
+Not in this change: repairing what the three rows already booked (trade_log
+1900-1902, their ledger legs, their offer_log rows and the tracker). That needs
+the engine stopped and a separate decision. Also not in this change: the
+trigger, which is a new offer built on an XCH coin that a pending transaction
+spends as its fee.
+
 ## [0.10.25] — 2026-09-21 — less dust, fewer cancels, a fee controller shipped off, and stops that keep the book
 
 ### Less reward dust in new offers, except on the no-floor retry
