@@ -1394,8 +1394,9 @@ private:
     /// (execution::live_offer_cancellable).  [review #171, round 4] The entry
     /// is made by the poll that reads CONFIRMED, before the next await, so an
     /// offer is held while its proof is asked -- a new entry is Unknown and
-    /// from no call, which is never cancellable.  It goes once the wallet
-    /// stops reporting CONFIRMED, or the offer leaves State.
+    /// from no call, which is never cancellable.  It goes with the poll that
+    /// reads any other status, also before the next await [round 6], or when
+    /// the offer leaves State.
     struct FillProofDeferral {
         std::uint32_t count{0};                    ///< consecutive deferrals, for the log
         FillProof     verdict{};                   ///< the latest proof (Unknown until one)

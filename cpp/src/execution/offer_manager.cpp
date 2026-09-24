@@ -1464,9 +1464,17 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
             // overwrite the CONFIRMED the proof waits on.  No await comes
             // between the read and the hold.  A new entry is never cancellable,
             // and an existing one keeps its count for the log.
-            if (const auto st = rec.find("status");
-                st != rec.end() && trade_status::parse(*st) == trade_status::kConfirmed) {
-                fill_proof_deferrals_.try_emplace(trade_id);
+            //
+            // [review #171 round 6] AND RELEASED BY THE POLL THAT READS ANYTHING
+            // ELSE.  A hold left for the erase after this loop would refuse, at
+            // every later await here, the cancel of an offer the wallet has
+            // already taken out of CONFIRMED.  That erase stays as a fallback.
+            if (const auto st = rec.find("status"); st != rec.end()) {
+                if (trade_status::parse(*st) == trade_status::kConfirmed) {
+                    fill_proof_deferrals_.try_emplace(trade_id);
+                } else {
+                    fill_proof_deferrals_.erase(trade_id);
+                }
             }
             trade_records.push_back(std::move(rec));
             polled_ids.push_back(trade_id);

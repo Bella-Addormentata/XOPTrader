@@ -431,15 +431,25 @@ def test_an_offer_is_held_from_the_moment_the_wallet_says_confirmed():
     -- let a detached Cancel All or the shutdown ladder run on the engine's one
     io_context, find no guard, and report the offer cancelled or overwrite the
     CONFIRMED the proof waits on.  The poll that reads CONFIRMED now holds the
-    offer, with no await in between, and a new entry is never cancellable."""
+    offer, with no await in between, and a new entry is never cancellable.
+
+    [review #171, round 6] The same poll releases the hold when it reads any
+    other status.  Left for the erase after the loop, the stale hold refused,
+    at every later await, the cancel of an offer the wallet had already taken
+    out of CONFIRMED."""
     detect = _function_body(_source(OFFER_MANAGER), DETECT_FILLS)
     poll = detect.index("co_await wallet_->get_offer(trade_id,")
-    hold = re.search(r"if \(const auto st = rec\.find\(\"status\"\);\s*"
-                     r"st != rec\.end\(\) && trade_status::parse\(\*st\) == trade_status::kConfirmed\) \{\s*"
-                     r"fill_proof_deferrals_\.try_emplace\(trade_id\);\s*\}", detect)
-    assert hold and hold.start() > poll, "the offer is held by the poll that reads CONFIRMED"
+    hold = re.search(r"if \(const auto st = rec\.find\(\"status\"\); st != rec\.end\(\)\) \{\s*"
+                     r"if \(trade_status::parse\(\*st\) == trade_status::kConfirmed\) \{\s*"
+                     r"fill_proof_deferrals_\.try_emplace\(trade_id\);\s*"
+                     r"\} else \{\s*"
+                     r"fill_proof_deferrals_\.erase\(trade_id\);\s*"
+                     r"\}\s*\}", detect)
+    assert hold and hold.start() > poll, (
+        "the poll holds an offer it reads CONFIRMED and releases one it reads otherwise"
+    )
     assert "co_await" not in detect[poll + len("co_await"):hold.start()], (
-        "an await between reading CONFIRMED and holding the offer reopens the window"
+        "an await between reading the status and holding or releasing the offer reopens the window"
     )
     assert hold.end() < detect.index("trade_records.push_back(std::move(rec));")
     assert hold.end() < detect.index("co_await prove_fill_on_chain(")

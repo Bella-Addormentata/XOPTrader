@@ -87,8 +87,10 @@ can pass for an offer nobody took.
   the earlier one no longer counts. An offer is held from the poll that reads
   CONFIRMED, before the engine waits on anything else. So a Cancel All or a
   shutdown that runs while the proof is being asked cannot slip in before the
-  hold. An offer stops being held as soon as the wallet stops reporting it
-  CONFIRMED. Cancel All's wallet-wide sweep skips every trade the wallet calls
+  hold. An offer stops being held by the first poll that reads any other
+  status, again before the engine waits on anything else. Once the engine
+  has read that status, no cancel of the offer is refused on its account.
+  Cancel All's wallet-wide sweep skips every trade the wallet calls
   completed, so it never reports a held offer as cancelled. Such an offer goes
   through the guarded per-offer path instead: it is cancelled there if the
   node has proven it live again, and otherwise it stays outstanding. It is
