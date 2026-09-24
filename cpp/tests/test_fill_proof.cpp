@@ -514,6 +514,25 @@ TEST(CoinRecordSpentHeight, ReadsEitherFieldAndRefusesADisagreement)
     EXPECT_FALSE(ex::coin_record_spent_height(json::array()).has_value());
 }
 
+TEST(CoinRecordHeights, AHeightABlockHeightCannotHoldIsNoHeight)
+{
+    // [review round 3] The engine narrows every proven height to BlockHeight
+    // (32 bits).  One past that range would wrap to an old block.
+    constexpr std::uint64_t kTop = 4294967295ULL;
+    EXPECT_EQ(ex::coin_record_spent_height(json{{"spent_block_index", kTop}}), kTop);
+    EXPECT_FALSE(ex::coin_record_spent_height(json{{"spent_block_index", kTop + 1U}}).has_value());
+    EXPECT_EQ(ex::coin_record_confirmed_height(json{{"confirmed_block_index", kTop}}), kTop);
+    EXPECT_FALSE(ex::coin_record_confirmed_height(json{{"confirmed_block_index", kTop + 1U}}).has_value());
+    EXPECT_FALSE(ex::coin_record_confirmed_height(json{{"confirmed_height", kTop + 1U}}).has_value());
+
+    // 2^32 + 9,297,025 narrows to exactly the real take's height: as a spend
+    // height it would have settled at 9,297,025.  It proves nothing instead.
+    std::vector<json> wrapped = ask_records();
+    wrapped[0]["spent_block_index"] = (kTop + 1U) + 9297025ULL;
+    wrapped[0]["spent"] = true;
+    EXPECT_EQ(prove(ask_wallet(), wrapped).verdict, FillProof::Unknown);
+}
+
 TEST(CoinRecordConfirmedHeight, ReadsTheNodesAndTheWalletsField)
 {
     EXPECT_EQ(ex::coin_record_confirmed_height(json{{"confirmed_block_index", 7}}), 7U);

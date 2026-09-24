@@ -109,10 +109,17 @@ struct FillProofResult {
     bool          spent_together{false};  ///< every maker coin spent at one height
 };
 
+/// [review #171, round 3] The highest height a record may carry: the engine
+/// narrows every proven height to BlockHeight (std::uint32_t), and a larger
+/// value would wrap to an old block -- a fill booked at a height long past
+/// its confirmation depth.  cancel_escalation's confirmed_height_from_record()
+/// bounds its heights the same way.
+inline constexpr std::uint64_t kMaxRecordHeight = std::numeric_limits<std::uint32_t>::max();
+
 /// The height a node or wallet coin record was spent at: 0 when unspent,
-/// std::nullopt when neither `spent_block_index` nor `spent` is readable or
-/// the two disagree (a spent flag with no height, or a height with a flag
-/// that says unspent).
+/// std::nullopt when neither `spent_block_index` nor `spent` is readable, when
+/// the height is past kMaxRecordHeight, or when the two disagree (a spent flag
+/// with no height, or a height with a flag that says unspent).
 [[nodiscard]] inline std::optional<std::uint64_t> coin_record_spent_height(
     const nlohmann::json& record)
 {
@@ -131,6 +138,9 @@ struct FillProofResult {
             }
             height = static_cast<std::uint64_t>(value);
         } else {
+            return std::nullopt;
+        }
+        if (height && *height > kMaxRecordHeight) {
             return std::nullopt;
         }
     }
@@ -153,7 +163,7 @@ struct FillProofResult {
 
 /// The height a coin record was created at: the node's
 /// `confirmed_block_index` or the wallet's `confirmed_height`.  std::nullopt
-/// when neither is a readable non-negative number.
+/// when neither is a readable number from 0 to kMaxRecordHeight.
 [[nodiscard]] inline std::optional<std::uint64_t> coin_record_confirmed_height(
     const nlohmann::json& record)
 {
@@ -165,17 +175,22 @@ struct FillProofResult {
         if (it == record.end()) {
             continue;
         }
+        std::uint64_t value = 0;
         if (it->is_number_unsigned()) {
-            return it->get<std::uint64_t>();
-        }
-        if (it->is_number_integer()) {
-            const auto value = it->get<std::int64_t>();
-            if (value < 0) {
+            value = it->get<std::uint64_t>();
+        } else if (it->is_number_integer()) {
+            const auto signed_value = it->get<std::int64_t>();
+            if (signed_value < 0) {
                 return std::nullopt;
             }
-            return static_cast<std::uint64_t>(value);
+            value = static_cast<std::uint64_t>(signed_value);
+        } else {
+            return std::nullopt;
         }
-        return std::nullopt;
+        if (value > kMaxRecordHeight) {
+            return std::nullopt;
+        }
+        return value;
     }
     return std::nullopt;
 }

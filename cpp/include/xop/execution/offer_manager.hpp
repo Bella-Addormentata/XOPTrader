@@ -459,7 +459,9 @@ public:
      */
     struct CancelOutcome {
         /// Offers the wallet accepted a cancel for. On the bulk path this is
-        /// every id -- see `bulk_submitted`, which qualifies what that means.
+        /// every id -- see `bulk_submitted`, which qualifies what that means
+        /// -- except one the fill proof holds, which the sweep skips as a
+        /// completed trade and which goes through the per-offer path.
         std::vector<std::string> cancelled;
         /// Offers we still believe are LIVE. These are what a retry re-attempts.
         std::vector<std::string> failed;

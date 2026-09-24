@@ -2332,8 +2332,41 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(
         logger_->info("cancel_all: bulk cancel_offers succeeded");
         out.bulk_submitted = true;
         out.cancelled.reserve(all_offers.size());
+        // [FILL-PROOF, review #171 round 3] ...except for an offer the fill
+        // proof holds.  The sweep skips every trade the wallet calls completed
+        // -- CONFIRMED included -- so it did not cancel that one, and
+        // reporting it cancelled would mark it cancel_pending: shutdown would
+        // claim success over a quote that may still be takeable, and every
+        // later per-offer path would skip it.  It goes through the guarded
+        // per-offer path instead: cancelled there if the node has proven it
+        // live again, reported outstanding while its cancel stays withheld.
+        std::vector<std::string> held;
         for (const auto& po : all_offers) {
-            out.cancelled.push_back(po.offer_id);
+            if (fill_proof_deferrals_.count(po.offer_id) > 0U) {
+                held.push_back(po.offer_id);
+            } else {
+                out.cancelled.push_back(po.offer_id);
+            }
+        }
+        if (!held.empty()) {
+            CancelOutcome per_offer = co_await cancel_ids(held, deadline);
+            out.cancelled.insert(out.cancelled.end(), per_offer.cancelled.begin(),
+                                 per_offer.cancelled.end());
+            out.failed.insert(out.failed.end(), per_offer.failed.begin(),
+                              per_offer.failed.end());
+            out.already_pending.insert(out.already_pending.end(),
+                                       per_offer.already_pending.begin(),
+                                       per_offer.already_pending.end());
+            if (!per_offer.failed.empty()) {
+                out.last_error  = per_offer.last_error;
+                out.worst_class = per_offer.worst_class;
+            }
+            out.deadline_hit = out.deadline_hit || per_offer.deadline_hit;
+            logger_->warn("cancel_all: {} offer(s) the wallet reports CONFIRMED "
+                          "were not in the sweep (the fill proof holds them) -- "
+                          "{} cancelled one by one, {} still outstanding",
+                          held.size(), per_offer.cancelled.size(),
+                          per_offer.failed.size());
         }
     } else if (bulk_possibly_submitted) {
         // [review 2026-09-13, round 2] NO ANSWER IS NOT A REFUSAL.  The sweep

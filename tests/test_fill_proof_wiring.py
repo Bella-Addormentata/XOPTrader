@@ -337,6 +337,32 @@ def test_a_confirmed_offer_under_proof_is_never_cancelled():
     assert re.search(r"return\s*!\s*live_offer_cancellable\(", helper)
 
 
+def test_the_bulk_sweep_never_reports_a_proof_held_offer_cancelled():
+    """[review #171, round 3] The wallet's cancel_offers sweep skips completed
+    trades, CONFIRMED included, so an offer the fill proof holds is NOT
+    cancelled by it.  cancel_all used to report every tracked id cancelled on
+    a successful sweep and mark it cancel_pending.  A held offer now goes
+    through the guarded per-offer path, and its outcome is reported as it is."""
+    manager = _source(OFFER_MANAGER)
+    cancel_all = _function_body(
+        manager, "asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(")
+    bulk_ok = _block_after(cancel_all, "if (bulk_ok) {")
+    split = re.search(r"if \(fill_proof_deferrals_\.count\(po\.offer_id\) > 0U\) \{\s*"
+                      r"held\.push_back\(po\.offer_id\);\s*\} else \{\s*"
+                      r"out\.cancelled\.push_back\(po\.offer_id\);\s*\}", bulk_ok)
+    assert split, "a proof-held offer must not be reported cancelled by the sweep"
+    assert bulk_ok.count("out.cancelled.push_back(") == 1, (
+        "no other path in the bulk branch may report an id cancelled"
+    )
+    per_offer = bulk_ok.index("co_await cancel_ids(held, deadline)")
+    assert per_offer > split.end(), "held offers go through the guarded per-offer path"
+    after = bulk_ok[per_offer:]
+    for field in ("cancelled", "failed", "already_pending"):
+        assert re.search(r"out\.%s\.insert\(\s*out\.%s\.end\(\),\s*per_offer\.%s\.begin\(\),"
+                         r"\s*per_offer\.%s\.end\(\)\);" % ((field,) * 4), after), (
+            "the per-offer outcome must be kept: " + field)
+
+
 def test_the_latest_proof_is_what_a_cancel_is_judged_by():
     """[review #171, round 2] The guard reads what the last proof found, from
     where, against which claim, and when -- so a CONFIRMED offer the node has

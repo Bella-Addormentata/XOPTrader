@@ -74,7 +74,15 @@ can pass for an offer nobody took.
   heartbeat, with the node at least `confirmation_depth_blocks` past the
   height the wallet claims. A take undone by a reorganisation therefore does
   not leave a quote nobody can withdraw. An offer stops being held as soon as
-  the wallet stops reporting it CONFIRMED.
+  the wallet stops reporting it CONFIRMED. Cancel All's wallet-wide sweep skips
+  every trade the wallet calls completed, so it never reports a held offer as
+  cancelled. Such an offer goes through the guarded per-offer path instead:
+  it is cancelled there if the node has proven it live again, and otherwise
+  it stays outstanding. It is never marked cancel_pending over a quote that
+  may still be takeable.
+- A coin record whose height does not fit a BlockHeight is unreadable, so it
+  proves nothing. The engine narrows every proven height to 32 bits, and such
+  a height would have wrapped to an old block.
 - `recheck_terminal` no longer re-adopts an offer proven dead. The wallet goes
   on reporting it CONFIRMED, and re-adopting it would send it through
   detect_fills again.
