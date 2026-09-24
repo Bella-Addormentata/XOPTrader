@@ -75,6 +75,15 @@ namespace trade_status {
         }
         return -1;  // Unknown status.
     }
+
+    /// [FILL-PROOF, review #171 round 8] A status the wallet really reported:
+    /// one of Chia's six TradeStatus codes.  parse() answers -1 for an unknown
+    /// string and passes any integer through, so anything outside this range
+    /// is no evidence of a state at all -- and in particular none that an
+    /// offer the proof holds has left CONFIRMED.
+    constexpr bool is_known(int status) noexcept {
+        return status >= kPendingAccept && status <= kFailed;
+    }
 }  // namespace trade_status
 
 // ---------------------------------------------------------------------------
@@ -1469,10 +1478,15 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
             // ELSE.  A hold left for the erase after this loop would refuse, at
             // every later await here, the cancel of an offer the wallet has
             // already taken out of CONFIRMED.  That erase stays as a fallback.
+            //
+            // [review #171 round 8] Released only by a status the wallet really
+            // reported.  An unrecognised one is no evidence the offer left
+            // CONFIRMED, so the hold stays until a poll reads one that is.
             if (const auto st = rec.find("status"); st != rec.end()) {
-                if (trade_status::parse(*st) == trade_status::kConfirmed) {
+                const int polled = trade_status::parse(*st);
+                if (polled == trade_status::kConfirmed) {
                     fill_proof_deferrals_.try_emplace(trade_id);
-                } else {
+                } else if (trade_status::is_known(polled)) {
                     fill_proof_deferrals_.erase(trade_id);
                 }
             }
@@ -1568,7 +1582,8 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
         // [FILL-PROOF, review #171 round 2] Under proof only while the wallet
         // says CONFIRMED.  An entry left behind would go on withholding the
         // cancels of an offer the wallet has since called live or cancelling.
-        if (status != trade_status::kConfirmed) {
+        // [round 8] A status the wallet really reported, as at the poll.
+        if (status != trade_status::kConfirmed && trade_status::is_known(status)) {
             fill_proof_deferrals_.erase(trade_id);
         }
 

@@ -404,7 +404,7 @@ def test_the_latest_proof_is_what_a_cancel_is_judged_by():
     writes = re.findall(r"\+\+\s*fill_poll_heartbeat_|--\s*fill_poll_heartbeat_"
                         r"|fill_poll_heartbeat_\s*(?:\+\+|--|[-+*/]?=(?!=))", manager)
     assert writes == ["++fill_poll_heartbeat_"], writes
-    cleared = re.search(r"if \(status != trade_status::kConfirmed\) \{\s*"
+    cleared = re.search(r"if \(status != trade_status::kConfirmed && trade_status::is_known\(status\)\) \{\s*"
                         r"fill_proof_deferrals_\.erase\(trade_id\);\s*\}", detect)
     assert cleared and cleared.start() < detect.index("if (status == trade_status::kConfirmed) {"), (
         "an offer the wallet no longer calls CONFIRMED is not under proof"
@@ -437,14 +437,23 @@ def test_an_offer_is_held_from_the_moment_the_wallet_says_confirmed():
     other status.  Left for the erase after the loop, the stale hold refused,
     at every later await, the cancel of an offer the wallet had already taken
     out of CONFIRMED."""
-    detect = _function_body(_source(OFFER_MANAGER), DETECT_FILLS)
+    manager = _source(OFFER_MANAGER)
+    detect = _function_body(manager, DETECT_FILLS)
     poll = detect.index("co_await wallet_->get_offer(trade_id,")
+    # [round 8] Released only by a status the wallet really reported: an
+    # unrecognised one is no evidence the offer left CONFIRMED.
     hold = re.search(r"if \(const auto st = rec\.find\(\"status\"\); st != rec\.end\(\)\) \{\s*"
-                     r"if \(trade_status::parse\(\*st\) == trade_status::kConfirmed\) \{\s*"
+                     r"const int polled = trade_status::parse\(\*st\);\s*"
+                     r"if \(polled == trade_status::kConfirmed\) \{\s*"
                      r"fill_proof_deferrals_\.try_emplace\(trade_id\);\s*"
-                     r"\} else \{\s*"
+                     r"\} else if \(trade_status::is_known\(polled\)\) \{\s*"
                      r"fill_proof_deferrals_\.erase\(trade_id\);\s*"
                      r"\}\s*\}", detect)
+    known = re.search(r"constexpr bool is_known\(int status\) noexcept \{\s*"
+                      r"return status >= kPendingAccept && status <= kFailed;\s*\}", manager)
+    assert known, "is_known must admit exactly Chia's six TradeStatus codes"
+    assert re.search(r"constexpr int kPendingAccept\s*= 0;", manager)
+    assert re.search(r"constexpr int kFailed\s*= 5;", manager)
     assert hold and hold.start() > poll, (
         "the poll holds an offer it reads CONFIRMED and releases one it reads otherwise"
     )
