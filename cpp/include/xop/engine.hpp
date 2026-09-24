@@ -1720,6 +1720,19 @@ private:
     /// (PNL-BASIS-PERSIST).  Called after every mutation; never throws.
     void persist_inventory_state() noexcept;
 
+    /// [SEED-FAIL-CLOSED 2026-09-22] Make State's position in `asset` the
+    /// wallet's confirmed balance, whatever State held
+    /// (risk/state_position_truth.hpp).  Called by Step 8 at each balance read
+    /// below its wallet sync gate.  Returns the balance State held before, or
+    /// std::nullopt when the read may not overwrite it (fields missing, bridge
+    /// asset under its scan, negative).  It does not verify an unverified
+    /// asset: only Step 8's verification pass does, because that pass is
+    /// followed by a heartbeat without posting (review round 1).
+    std::optional<Mojo> reconcile_state_position(const std::string& asset,
+                                                 Mojo confirmed,
+                                                 bool fields_validated,
+                                                 BlockHeight block_height);
+
     // -- Double-entry accounting (LEDGER 2026-07-30) ------------------------
 
     /// Establish opening balances once, from the wallet's confirmed balances.
@@ -2728,6 +2741,25 @@ private:
         bool fields_validated{false};
     };
     std::unordered_map<std::string, WalletBalanceEntry> cached_wallet_balances_;
+
+    // [SEED-FAIL-CLOSED 2026-09-22] Assets whose State position the startup
+    // seed could not read from the wallet, and so took from the last
+    // persisted quantity (or from nothing).  Step 8 does not quote a pair that
+    // trades one.  Step 8's verification pass reads them every synced
+    // heartbeat and clears each one it verifies -- and a heartbeat that
+    // verifies anything posts nothing, because Step 6 sized it from the guess.
+    // The bridge scan clears its own asset (review round 1).
+    std::unordered_set<std::string> state_unverified_assets_;
+    // [SEED-FAIL-CLOSED review round 2] Step 9f's "unverified" line has been
+    // logged at WARN for the current episode; later heartbeats log at debug.
+    bool drift_unverified_warned_{false};
+    // [SEED-FAIL-CLOSED review round 6] Step 8 passed its wallet-sync gate in
+    // THIS heartbeat.  Cleared at the top of every heartbeat and set only just
+    // below that gate, so it is never an earlier heartbeat's verdict: Step 8
+    // does not run while paused, and wallet_synced_ keeps its last value.
+    // The bridge scan, which runs every heartbeat after Step 8, clears its
+    // asset's unverified mark only while this holds.
+    bool step8_sync_gate_passed_{false};
 
     // -- [PACE 2026-09-13] Pace controller state -----------------------------
     // The only pace state kept between heartbeats is each asset's activation

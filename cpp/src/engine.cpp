@@ -39,6 +39,7 @@
 #include "xop/execution/mid_gate.hpp"
 #include "xop/risk/valuation_authority.hpp"
 #include "xop/risk/usd_route.hpp"
+#include "xop/risk/state_position_truth.hpp"
 
 #include "xop/accounting/bridge_ingest.hpp"
 #include "xop/accounting/reward_ingest.hpp"
@@ -2995,6 +2996,12 @@ asio::awaitable<void> Engine::poll_loop_coro()
     // Wallet balance queries return unreliable data when the wallet is
     // still syncing.  Poll sync status until fully synced, with a
     // timeout to avoid blocking forever on a stuck wallet.
+    // [SEED-FAIL-CLOSED review round 4] Whether the wait ever SAW the wallet
+    // fully synced.  Boot carries on when the probes run out, and a balance
+    // read after that -- or a "no wallet for this asset" answer from a wallet
+    // still finding its CAT wallets -- is no verified position: the State seed
+    // below counts neither unless this is true.
+    bool startup_wallet_synced = false;
     if (wallet_) {
         // 30 PROBES, not blocks -- one get_sync_status RPC plus a 10 s sleep
         // each, a 5 min floor; a timing-out wallet adds its retry budget per
@@ -3008,6 +3015,7 @@ asio::awaitable<void> Engine::poll_loop_coro()
                 bool synced  = ss.value("synced", false);
                 bool syncing = ss.value("syncing", true);
                 if (synced && !syncing) {
+                    startup_wallet_synced = true;
                     spdlog::info("[Engine] Wallet fully synced -- "
                                  "proceeding with inventory seed");
                     break;
@@ -3030,6 +3038,12 @@ asio::awaitable<void> Engine::poll_loop_coro()
             if (boot_stop_checkpoint("waiting for wallet sync")) {
                 co_return;
             }
+        }
+        if (!startup_wallet_synced) {
+            spdlog::warn("[Engine] Startup: the wallet was not seen fully synced "
+                         "in {} probes -- its balances still seed inventory, but "
+                         "every State position stays UNVERIFIED until Step 8 "
+                         "reads a synced wallet", kMaxSyncWaitProbes);
         }
     }
 
@@ -3081,18 +3095,34 @@ asio::awaitable<void> Engine::poll_loop_coro()
     }
 
     if (inventory_ && offer_mgr_ && wallet_) {
+        // Collect unique asset IDs across all enabled pairs.
+        std::unordered_set<std::string> seed_asset_ids;
+        for (const auto& pair : config_.pairs) {
+            if (!pair.enabled) continue;
+            seed_asset_ids.insert(pair.base_asset_id);
+            seed_asset_ids.insert(pair.quote_asset_id);
+        }
+        // [SEED-FAIL-CLOSED 2026-09-22] What the wallet actually said, per
+        // asset, for the State seed below the try: a confirmed balance from a
+        // reply that carried one, or "the built wallet map has no wallet for
+        // it".  An asset in neither was not read.
+        std::unordered_map<std::string, Mojo> state_seed_confirmed;
+        std::unordered_set<std::string>       state_seed_not_held;
+        // [SEED-FAIL-CLOSED review round 2] The quantity inventory_state
+        // restored, taken BEFORE the loop below.  That is the "last persisted
+        // quantity" the State seed falls back on.  seed_position() leaves a
+        // restored position alone, but it fills an empty one from this boot's
+        // reply, and a reply without confirmed_wallet_balance seeds it from
+        // spendable -- a guess the fallback would then log as persisted.
+        std::unordered_map<std::string, Mojo> persisted_quantity;
+        for (const auto& aid : seed_asset_ids) {
+            persisted_quantity[aid] = inventory_->net_inventory(AssetId{aid});
+        }
+
         try {
             // Ensure the wallet-ID cache is populated so that
             // resolve_wallet_id() returns real IDs for CAT assets.
             co_await offer_mgr_->ensure_wallet_ids();
-
-            // Collect unique asset IDs across all enabled pairs.
-            std::unordered_set<std::string> seed_asset_ids;
-            for (const auto& pair : config_.pairs) {
-                if (!pair.enabled) continue;
-                seed_asset_ids.insert(pair.base_asset_id);
-                seed_asset_ids.insert(pair.quote_asset_id);
-            }
 
             Mojo total_seeded = 0;
             // [LEDGER] Collect confirmed balances so opening entries can be
@@ -3109,7 +3139,15 @@ asio::awaitable<void> Engine::poll_loop_coro()
             std::unordered_map<AssetId, std::string> genesis_observed_at;
             for (const auto& aid : seed_asset_ids) {
                 auto wid = offer_mgr_->resolve_wallet_id(aid);
-                if (wid <= 0) continue;
+                if (wid <= 0) {
+                    // [review round 4] A built map proves the wallet holds none
+                    // of it only once the wallet is synced: mid-sync it may not
+                    // have created the CAT wallet yet.
+                    if (startup_wallet_synced && offer_mgr_->wallet_ids_resolved()) {
+                        state_seed_not_held.insert(aid);
+                    }
+                    continue;
+                }
 
                 try {
                     auto bal_json = co_await wallet_->get_wallet_balance(wid);
@@ -3117,6 +3155,12 @@ asio::awaitable<void> Engine::poll_loop_coro()
                                                     static_cast<Mojo>(0));
                     Mojo confirmed = bal_json.value("confirmed_wallet_balance",
                                                     static_cast<Mojo>(0));
+                    // [review round 4] State takes it as the wallet's word only
+                    // from a wallet the wait saw synced.  Otherwise the asset
+                    // falls to the unverified path below.
+                    if (startup_wallet_synced && bal_json.contains("confirmed_wallet_balance")) {
+                        state_seed_confirmed[aid] = confirmed;
+                    }
                     // [S19 review round 6] The bridge asset records
                     // its opening even at ZERO balance: the zero-opening
                     // exception in post_ledger_genesis is unreachable
@@ -3160,18 +3204,17 @@ asio::awaitable<void> Engine::poll_loop_coro()
                     // real mojos held.
                     inventory_->seed_position(AssetId{aid}, seed_qty,
                                               Mojo{1});
-                    // Also seed State positions so that evaluate_limits()
-                    // has accurate balances from the start (not just
-                    // from detected fills).
-                    state_->record_buy(AssetId{aid}, seed_qty, Mojo{1});
                     total_seeded += seed_qty;
 
                     spdlog::info("[Engine] Seeded inventory for asset {} "
                                  "(wallet {}): {} mojos",
                                  aid.substr(0, 12), wid, seed_qty);
                 } catch (const std::exception& e) {
-                    spdlog::debug("[Engine] Could not query balance for "
-                                  "wallet {}: {}", wid, e.what());
+                    // [SEED-FAIL-CLOSED] Was DEBUG: on 2026-09-22 all three
+                    // reads failed and the log said nothing.
+                    spdlog::warn("[Engine] Could not query the startup balance "
+                                 "of {} (wallet {}): {}",
+                                 aid.substr(0, 12), wid, e.what());
                 }
             }
 
@@ -3192,7 +3235,50 @@ asio::awaitable<void> Engine::poll_loop_coro()
                                 genesis_observed_at);
         } catch (const std::exception& ex) {
             spdlog::warn("[Engine] Startup inventory seeding failed: {}; "
-                         "continuing with zero inventory", ex.what());
+                         "continuing without a wallet seed", ex.what());
+        }
+
+        // [SEED-FAIL-CLOSED 2026-09-22] Seed State -- the positions the risk
+        // limits read -- for EVERY tracked asset, whether or not the loop
+        // above reached it (risk/state_position_truth.hpp).  Here, below the
+        // try, so a failure that ends the loop early still seeds the rest.
+        // It used to be seeded inside the loop, and a failed read left the
+        // asset out of State: an empty State trips no concentration or
+        // single-CAT limit at all.
+        if (state_) {
+            for (const auto& aid : seed_asset_ids) {
+                const auto wallet_read = state_seed_confirmed.find(aid);
+                const std::optional<Mojo> wallet_confirmed =
+                    (wallet_read != state_seed_confirmed.end())
+                        ? std::optional<Mojo>{wallet_read->second}
+                        : std::nullopt;
+                const risk::SeedDecision seed = risk::decide_state_seed(
+                    wallet_confirmed, state_seed_not_held.count(aid) > 0,
+                    persisted_quantity.at(aid));
+                // Never refused: decide_state_seed() returns no negative
+                // quantity, the one input reconcile_balance() rejects.
+                (void)state_->reconcile_balance(AssetId{aid}, seed.quantity);
+                if (seed.source == risk::SeedSource::LastKnown) {
+                    state_unverified_assets_.insert(aid);
+                    spdlog::error("[Engine] Startup: the wallet balance of {} "
+                                  "was not read -- its State position, which "
+                                  "the risk limits read, is the last persisted "
+                                  "quantity ({} mojos) and stays UNVERIFIED "
+                                  "until Step 8 reads the wallet",
+                                  aid.substr(0, 12), seed.quantity);
+                }
+            }
+        }
+
+        // [SEED-FAIL-CLOSED review round 5] ...and the wallet-ID map this
+        // section built goes with the reads it could not trust.  Built from a
+        // wallet the wait never saw synced, it can lack a CAT wallet the
+        // wallet has yet to create, and ensure_wallet_ids() builds it only
+        // once: Step 8's pass would then read that CAT's -1 as a verified
+        // zero.  Dropped here, it is next built by Step 8's pass or by
+        // post_quotes, both below Step 8's sync gate.
+        if (!startup_wallet_synced && offer_mgr_ && offer_mgr_->wallet_ids_resolved()) {
+            offer_mgr_->invalidate_wallet_ids();
         }
     }
 
@@ -4226,6 +4312,9 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
         wallet_transport_at_cycle_start_ = wallet_->transport_counters();
     }
     wallet_skip_warned_this_cycle_ = false;
+    // [SEED-FAIL-CLOSED review round 6] Not synced until this heartbeat's Step 8
+    // says so (engine.hpp).
+    step8_sync_gate_passed_ = false;
 
     // [T3-08] Reset NHE accumulators for this cycle.
     nhe_net_inventory_change_ = 0.0;
@@ -11610,6 +11699,92 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                      "-- skipping offer management cautiously", e.what());
         co_return;
     }
+    // [SEED-FAIL-CLOSED review round 6] Below the gate: the wallet was synced
+    // in this heartbeat (engine.hpp).
+    step8_sync_gate_passed_ = true;
+
+    // [SEED-FAIL-CLOSED review round 1] Verify every position the startup seed
+    // could not read, here, below the sync gate and before anything is posted.
+    // Step 6 has already sized this heartbeat's ladders from those guesses (or
+    // from nothing, on a first boot with no persisted row), so a heartbeat that
+    // verifies anything posts nothing: the next one sizes from the wallet.  A
+    // position this pass cannot read stays unverified, and the pair loop below
+    // does not quote a pair that trades it.  The pass retries every synced
+    // heartbeat.  Cost: one balance RPC per unverified asset, usually none.
+    if (!state_unverified_assets_.empty()) {
+        if (!wallet_step_may_run("Step 8 State verification")) {
+            co_return;
+        }
+        try {
+            co_await offer_mgr_->ensure_wallet_ids();
+        } catch (const std::exception& e) {
+            spdlog::warn("[Engine] Step 8: wallet map unavailable for State "
+                         "verification: {}", e.what());
+        }
+        std::size_t verified = 0;
+        const std::vector<std::string> unverified(state_unverified_assets_.begin(),
+                                                  state_unverified_assets_.end());
+        for (const auto& asset : unverified) {
+            // The bridge scan verifies its own asset while it is operational.
+            if (asset == config_.accounting.bridge_asset_id
+                && bridge_accounting_operational()) {
+                continue;
+            }
+            const auto wid = offer_mgr_->resolve_wallet_id(asset);
+            std::optional<Mojo> previous;
+            Mojo observed = 0;
+            if (wid <= 0) {
+                // A BUILT map with no wallet for the asset: the wallet holds
+                // none of it (stuck_prune_scope.hpp).  An unbuilt map proves
+                // nothing, and the asset stays unverified.
+                if (!offer_mgr_->wallet_ids_resolved()) continue;
+                previous = reconcile_state_position(asset, 0, true, block_height);
+            } else {
+                if (!wallet_step_may_run("Step 8 State verification")) {
+                    co_return;
+                }
+                try {
+                    auto bal_json = co_await wallet_->get_wallet_balance(wid);
+                    Mojo spendable = 0, pending = 0;
+                    if (bal_json.contains("spendable_balance"))
+                        spendable = bal_json["spendable_balance"].get<Mojo>();
+                    if (bal_json.contains("confirmed_wallet_balance"))
+                        observed = bal_json["confirmed_wallet_balance"].get<Mojo>();
+                    if (bal_json.contains("pending_change"))
+                        pending = bal_json["pending_change"].get<Mojo>();
+                    const bool fields_validated =
+                        bal_json.contains("confirmed_wallet_balance")
+                        && bal_json.contains("pending_change");
+                    cached_wallet_balances_[asset] =
+                        {spendable, observed, pending, block_height,
+                         fields_validated};
+                    previous = reconcile_state_position(asset, observed,
+                                                        fields_validated,
+                                                        block_height);
+                } catch (const std::exception& e) {
+                    spdlog::warn("[Engine] Step 8: State verification of {} "
+                                 "could not read the wallet: {}",
+                                 asset.substr(0, 12), e.what());
+                }
+            }
+            if (previous.has_value()) {
+                state_unverified_assets_.erase(asset);
+                ++verified;
+                spdlog::warn("[Engine] Step 8: State position of {} verified "
+                             "against the wallet at block {}: {} -> {} mojos "
+                             "(startup could not read it)",
+                             asset.substr(0, 12), block_height, *previous,
+                             observed);
+            }
+        }
+        if (verified > 0) {
+            spdlog::warn("[Engine] Step 8: {} State position(s) verified this "
+                         "heartbeat -- no offer management until the next one, "
+                         "which Step 6 sizes from the wallet's balances",
+                         verified);
+            co_return;
+        }
+    }
 
     // [S70 2026-09-20] ttl_cancel_mode: expire -- free the coins of offers
     // the chain has already aged out.  Here, below the sync gate, because the
@@ -11696,6 +11871,57 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
     // already co_returns; the snapshot swallows its failure, so look here.
     if (!wallet_step_may_run("Step 8 (offers)")) {
         co_return;
+    }
+
+    // [SEED-FAIL-CLOSED review round 3] THE DRAIN, BEFORE THE PAIR LOOP.
+    // Round 2 cancelled an unverified pair's resting offers inside the pair
+    // loop below, but that loop skips a pair with an empty ladder or an
+    // invalid quote before it gets that far -- and a pair whose position is
+    // unverified is likely to have an empty ladder.  Here the whole book is
+    // scanned, as the peg-suspension drain does: after this heartbeat's fees
+    // are set, which every cancel in this step pays, and ahead of every exit
+    // that follows.  Only the verification pass's own co_return, which lasts
+    // one heartbeat, and a fee budget or wallet circuit that stops every
+    // cancel come before it.  Convergent: each heartbeat cancels whatever
+    // still rests on a pair that trades an unverified position and is not
+    // already cancelling, and it is a no-op once those pairs are flat.  An
+    // in-flight operator Cancel All supersedes it, as it does that drain.
+    if (!state_unverified_assets_.empty() && offer_mgr_ && !dry_run_
+        && !cancel_all_inflight_) {
+        std::vector<std::string> to_cancel;
+        for (const auto& po : state_->get_all_offers()) {
+            const PairConfig* drain_pc = find_pair_config(po.pair_name);
+            if (drain_pc && !po.cancel_pending
+                && (state_unverified_assets_.count(drain_pc->base_asset_id) > 0
+                    || state_unverified_assets_.count(drain_pc->quote_asset_id) > 0)) {
+                to_cancel.push_back(po.offer_id);
+            }
+        }
+        if (!to_cancel.empty()) {
+            if (!wallet_step_may_run("Step 8 unverified drain")) {
+                co_return;
+            }
+            try {
+                const auto done = co_await offer_mgr_->selective_cancel(to_cancel);
+                for (const auto& id : done) {
+                    try {
+                        db_->mark_offer_cancel_submitted(id, block_height,
+                                                         "unverified_position");
+                    } catch (const std::exception& mark_error) {
+                        spdlog::debug("[Engine] Step 8: could not mark {} "
+                                      "cancel_pending: {}", id.substr(0, 12),
+                                      mark_error.what());
+                    }
+                }
+                spdlog::warn("[Engine] Step 8: cancelled {}/{} resting offers "
+                             "on pairs whose position is unverified",
+                             done.size(), to_cancel.size());
+            } catch (const std::exception& e) {
+                spdlog::error("[Engine] Step 8: could not cancel the resting "
+                              "offers on pairs whose position is unverified: "
+                              "{} -- retrying next heartbeat", e.what());
+            }
+        }
     }
 
     // -- UTXO Liberation ------------------------------------------------
@@ -11910,23 +12136,31 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
     // cached balance.  Any conditional skip here reopens the deadlock for
     // whichever case it skips (round 9: two positive sub-minimum sides
     // starved each other out), so an empty ladder refreshes ALL of its
-    // CAT funding assets, unconditionally.  Deduped across pairs; XCH is
-    // exempt (its refresh runs in the poll loop and is not ladder-gated).
-    // Cost: at most two RPCs per empty-ladder pair per heartbeat.
+    // funding assets, unconditionally.  Deduped across pairs.
+    // [SEED-FAIL-CLOSED review round 3] XCH is no longer exempt.  Its cap
+    // refresh runs elsewhere, but that read (Step 7's) never updates State,
+    // so for a pair with an empty ladder this is the only read that reaches
+    // XCH's State position.  It runs below the sync gate, so no half-synced
+    // wallet's reading gets there.  Cost: at most two RPCs per empty-ladder
+    // pair per heartbeat, XCH once.
     {
         std::set<std::string> refreshed;
         for (auto& [pair_name, pcs] : cycle_) {
             if (!pcs.ladder.empty()) continue;
-            // [PACE 2026-09-13] A pace-managed pair's empty ladder is pace's own
-            // decision, not the deadlock this refresh breaks, and
-            // refresh_pace_balances keeps its assets fresh.
-            if (config_.strategy.pace_enabled && pcs.pace.managed) continue;
+            // [SEED-FAIL-CLOSED review round 4] Pace-managed pairs too.  Their
+            // empty ladder is pace's own decision, not the deadlock this
+            // refresh breaks, but nothing else below the sync gate reaches
+            // their State positions.  Rounds 1-2 reconciled them from pace's
+            // own read, which runs before this step's sync check and covers
+            // only the assets pace lists.  A read taken while the wallet was
+            // still syncing then reached State, and so did nothing at all for
+            // XCH in a CAT-only pace config.  Read here, both assets, like any
+            // other pair's.  Pace is off in the live config.
             const PairConfig* live_pc = find_pair_config(pair_name);
             if (!live_pc) continue;
             const std::string assets[2] = {live_pc->base_asset_id,
                                            live_pc->quote_asset_id};
             for (const auto& asset : assets) {
-                if (asset == "xch") continue;
                 if (!refreshed.insert(asset).second) continue;
                 const auto wid = offer_mgr_->resolve_wallet_id(asset);
                 if (wid <= 0) continue;
@@ -11951,13 +12185,25 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     if (bal_json.contains("pending_change"))
                         pending =
                             bal_json["pending_change"].get<Mojo>();
+                    const bool fields_validated =
+                        bal_json.contains("confirmed_wallet_balance")
+                        && bal_json.contains("pending_change");
                     cached_wallet_balances_[asset] =
                         {spendable, confirmed, pending, block_height,
-                         bal_json.contains("confirmed_wallet_balance")
-                             && bal_json.contains("pending_change")};
+                         fields_validated};
+                    // [SEED-FAIL-CLOSED 2026-09-22] The main loop never reads
+                    // the assets of a pair with an empty ladder -- a suspended
+                    // pair's, for one -- yet they count in every other pair's
+                    // portfolio fractions.  On 2026-09-22 XCH/BYC was
+                    // suspended, and after its failed startup read BYC never
+                    // entered State.
+                    reconcile_state_position(asset, confirmed, fields_validated,
+                                             block_height);
                     // Log only transitions worth an operator's eye: a
                     // balance appearing where the cache had none/zero.
-                    if (confirmed > 0
+                    // XCH's first read here is no deposit -- its cap read
+                    // may never have cached it under this key.
+                    if (asset != "xch" && confirmed > 0
                         && (!prior.has_value() || *prior <= 0)) {
                         spdlog::info(
                             "[Engine] Step 8: liveness refresh observed a "
@@ -12004,6 +12250,24 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         if (!pcs.market_data_valid) {
             spdlog::warn("[Engine] Step 8: {} market data invalid -- "
                          "skipping offer posting", pair_name);
+            continue;
+        }
+
+        // [SEED-FAIL-CLOSED review round 1] Nor for a pair that trades a
+        // position the verification pass above could not read: its
+        // concentration and CAT share were computed from a guess, or from
+        // nothing.  The pass retries every heartbeat, so this lasts only as
+        // long as the wallet read keeps failing.
+        if (const PairConfig* verify_pc = find_pair_config(pair_name);
+            verify_pc
+            && (state_unverified_assets_.count(verify_pc->base_asset_id) > 0
+                || state_unverified_assets_.count(verify_pc->quote_asset_id) > 0)) {
+            spdlog::warn("[Engine] Step 8: {} not quoted -- a position it "
+                         "trades is still UNVERIFIED (its wallet balance "
+                         "could not be read)", pair_name);
+            // [review round 3] What it already quotes was taken down by the
+            // drain in the verification pass above, which this loop's early
+            // `continue`s cannot skip.
             continue;
         }
 
@@ -12497,10 +12761,22 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                         // consumers can reject stale snapshots (Step 8 is
                         // skipped in several engine modes while Step 2 keeps
                         // mutating inventory).
+                        const bool fields_validated =
+                            bal_json.contains("confirmed_wallet_balance")
+                            && bal_json.contains("pending_change");
                         cached_wallet_balances_[sb.label] =
                             {spendable, confirmed, pending, block_height,
-                             bal_json.contains("confirmed_wallet_balance")
-                                 && bal_json.contains("pending_change")};
+                             fields_validated};
+                        // [SEED-FAIL-CLOSED 2026-09-22] State follows the
+                        // wallet on every validated read.  The recovery this
+                        // replaces fired only while State's position was
+                        // EXACTLY zero: on 2026-09-22 the startup reads all
+                        // failed, fills landed before Step 8 first read a
+                        // balance, and the small non-zero positions they
+                        // left (0.103 of ~34.7 XCH) disarmed it until a
+                        // position returned to exactly zero.
+                        reconcile_state_position(sb.label, confirmed,
+                                                 fields_validated, block_height);
                         const AssetId tracked_asset{sb.label};
                         // [S19 review round 6] The bridge asset's
                         // inventory and State position are maintained by
@@ -12509,7 +12785,9 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                         // mint the scan is about to book.  Same exclusion
                         // as Step 11's one-shot reconcile.  Only while
                         // the scan is OPERATIONAL (round 11) -- when it
-                        // stands down, this recovery seed resumes.
+                        // stands down, this recovery seed resumes.  The
+                        // State side of the exclusion is applied inside
+                        // reconcile_state_position().
                         const bool bridge_owned =
                             sb.label == config_.accounting.bridge_asset_id
                             && bridge_accounting_operational();
@@ -12526,15 +12804,6 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                             // sentinel to a market mark next heartbeat;
                             // persist so a crash in between round-trips.
                             persist_inventory_state();
-                        }
-                        if (!bridge_owned && confirmed > 0 && state_
-                            && state_->get_position(tracked_asset).balance == 0)
-                        {
-                            state_->record_buy(tracked_asset, confirmed, Mojo{1});
-                            spdlog::warn("[Engine] Step 8: recovered state "
-                                         "position for asset {} from wallet "
-                                         "confirmed balance {} mojos",
-                                         sb.label, confirmed);
                         }
                         metrics_->update_spendable_reserve(
                             sb.label,
@@ -16345,6 +16614,24 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
     if (!dexie_ || !wallet_ || !market_data_) co_return;
     if (wallet_circuit_open_) co_return;
 
+    // [SEED-FAIL-CLOSED review round 3] NOTHING WHILE ANY POSITION IS
+    // UNVERIFIED.  Round 2 stood 9f down only when no balance had been read
+    // at all.  With some read and some not, the unread asset is simply
+    // missing from the shares below, every other asset looks overweight, and
+    // 9f -- which trades both ways toward its targets -- would sell them.  A
+    // partial view is worse than none, so it waits: Step 8's pass verifies
+    // every position within a heartbeat of the wallet answering.
+    if (!state_unverified_assets_.empty()) {
+        spdlog::log(drift_unverified_warned_ ? spdlog::level::debug
+                                             : spdlog::level::warn,
+                    "[Engine] Step 9f: no drift correction -- {} State "
+                    "position(s) are UNVERIFIED",
+                    state_unverified_assets_.size());
+        drift_unverified_warned_ = true;
+        co_return;
+    }
+    drift_unverified_warned_ = false;   // re-armed once everything is verified
+
     // -- Cooldown ----------------------------------------------------------
     if (last_drift_correction_block_ != 0 &&
         block_height < last_drift_correction_block_ +
@@ -16425,6 +16712,9 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
             }
         }
         if (total_xch <= 0.0) {
+            // [SEED-FAIL-CLOSED review round 2] State only once every position
+            // in it is the wallet's: the gate at the top of this step returns
+            // while any is unverified (review round 3).
             const auto positions = state_->get_all_positions();
             for (const auto& p : positions) {
                 const double v = static_cast<double>(PreTradeCheck::mark_to_xch(p, *state_));
@@ -18487,6 +18777,28 @@ void Engine::persist_inventory_state() noexcept
     }
 }
 
+std::optional<Mojo> Engine::reconcile_state_position(const std::string& asset,
+                                                     Mojo confirmed,
+                                                     bool fields_validated,
+                                                     BlockHeight block_height)
+{
+    if (!state_) return std::nullopt;
+    // [S19 review round 6] While the bridge scan is operational it is the
+    // single writer of the bridge asset's State position.
+    const bool bridge_owned = asset == config_.accounting.bridge_asset_id
+                              && bridge_accounting_operational();
+    const risk::TruthResult r = risk::apply_wallet_truth(
+        *state_, AssetId{asset}, confirmed, fields_validated, bridge_owned);
+    if (r.outcome == risk::TruthOutcome::Skipped) return std::nullopt;
+    // A correction is routine -- fees, taker fills and deposits never pass
+    // through record_buy/record_sell -- and State logs it.  It takes effect at
+    // the next Step 6, as a fill does.
+    spdlog::debug("[Engine] Step 8: State position of {} reconciled at block "
+                  "{}: {} -> {} mojos", asset.substr(0, 12), block_height,
+                  r.previous, confirmed);
+    return r.previous;
+}
+
 // ---------------------------------------------------------------------------
 // Double-entry accounting (LEDGER 2026-07-30)
 //
@@ -19671,6 +19983,25 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
                                      "reduced {} -> {}",
                                      asset.substr(0, 12), pos,
                                      bal.confirmed);
+                    }
+                    // [SEED-FAIL-CLOSED review round 1] The scan is this
+                    // asset's only State writer, so it is also what verifies
+                    // a startup fallback for it -- once State holds the
+                    // wallet's balance.  Step 8 does not quote its pairs
+                    // until then.
+                    // [review round 6] ...and only from a wallet Step 8 saw
+                    // synced in THIS heartbeat.  The scan runs every heartbeat,
+                    // Step 8 stopped at its sync gate or not, and its own fetch
+                    // checks only that the wallet answers: a mid-sync balance
+                    // must not verify the asset.
+                    if (step8_sync_gate_passed_
+                        && state_->get_position(asset).balance == bal.confirmed
+                        && state_unverified_assets_.erase(asset) > 0) {
+                        spdlog::warn("[Engine] Bridge ingest: State position "
+                                     "of {} verified against the wallet at "
+                                     "block {}: {} -> {} mojos (startup could "
+                                     "not read it)", asset.substr(0, 12),
+                                     block_height, pos, bal.confirmed);
                     }
                 }
             }

@@ -5,6 +5,95 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### The risk limits read the wallet's positions, not a guess that fills made
+
+On 2026-09-22 every startup balance read timed out (four 30-second attempts
+each, 16:58:39 to 17:04:49) and the seed skipped each asset with a DEBUG line,
+so State (the positions the risk limits read) started empty and the log said
+nothing. Fills then gave State 1.103 XCH and 102.976 DBX, and no BYC. In that
+heartbeat the single-CAT cap read DBX as 52.8% of the portfolio (full block at
+50%) and sized the XCH/DBX ask to zero; after the next fill State held 0.103 XCH
+and 203.188 DBX, and DBX read as about 96%. The wallet held about 34.7 XCH, 99
+BYC and 2,167 DBX. Step 8 had a recovery for an unseeded State, but it fired
+only while a position was exactly zero, and the fills had made them non-zero
+before Step 8 first read a balance. (That evening Step 8 posted nothing anyway:
+it stopped at its wallet sync gate on every heartbeat. But the moment the
+wallet synced, the wrong State would have sized every ask, and nothing could
+have corrected it.)
+
+- **Every validated balance Step 8 reads now sets State's position**, whatever
+  State held before: the main loop's balance gate and the empty-ladder
+  liveness refresh, which is the only read a suspended pair's CAT gets (BYC's,
+  that evening). Fees, taker fills and deposits, which never pass through
+  `record_buy`/`record_sell`, stop accumulating in State as drift too. A reply
+  missing `confirmed_wallet_balance` or `pending_change` changes nothing, and
+  the bridge asset keeps its single writer while its scan is operational.
+- **An unread startup balance is never zero.** A failed read falls back to the
+  quantity last persisted for the asset (`inventory_state`), logs an ERROR
+  naming it, and stays unverified until Step 8 reads the wallet, which logs a
+  WARN with the correction. A built wallet map with no wallet for an asset is a
+  verified zero; an unbuilt one proves nothing. The empty State this replaces
+  was the least cautious default available: with no positions, concentration
+  reads "balanced" and every CAT 0%, so no limit can trip. A startup read, or
+  a map with no wallet for the asset, counts as the wallet's word only if the
+  startup sync wait saw the wallet fully synced (review round 4). When the
+  wait runs out first, every asset takes the unverified path, the log says so,
+  and Step 8 verifies each one once the wallet is synced. The wallet-ID map
+  boot built is dropped too (review round 5). It is built only once, and one
+  built mid-sync can lack a CAT wallet not yet created, which Step 8 would
+  then verify as a zero. Step 8 rebuilds it below its sync gate.
+- The per-asset startup read failure is logged as a WARN instead of DEBUG.
+- **Nothing is quoted from a guessed position** (review round 1). Step 6 sizes
+  a heartbeat's ladders before Step 8 reads the wallet, so Step 8 now verifies
+  every unverified position right below its sync gate. A heartbeat that
+  verifies anything posts nothing, and the next one is sized from the wallet.
+  A pair that trades a position the pass could not read is not quoted until
+  it can be: that covers a first boot with no persisted row, where the guess
+  is nothing at all. A built wallet map with no wallet for the asset still
+  counts as a verified zero.
+- A pace-managed pair with an empty ladder has both its assets read by the
+  empty-ladder refresh, below Step 8's sync gate, like any other pair (review
+  round 4). Rounds 1 and 2 took them from pace's own read instead. That read
+  runs before the sync check, so it could be taken mid-sync, and it covers
+  only the assets pace lists, so it skips XCH in a CAT-only pace config. The
+  bridge scan clears the unverified mark on its own asset, but only in a
+  heartbeat whose Step 8 passed its wallet-sync gate (review round 6). The
+  scan runs every heartbeat, and its own balance fetch checks only that the
+  wallet answers. The reconciled cost basis goes through `to_mojo_checked()`,
+  and a ratio that is not a representable Mojo falls back to the unit basis
+  instead of being converted.
+- **An unverified pair's resting offers come down** (review round 2). Its gate
+  used to skip every cancel path in the pair loop, so offers restored at boot
+  rested unmanaged for as long as the read kept failing. Step 8 now cancels
+  them (reason `unverified_position`), each heartbeat, until the pair is flat.
+  Round 3 moved that drain ahead of the pair loop and made it scan the whole
+  book, like the peg-suspension drain. It runs right after the heartbeat's
+  fees are set, which every cancel in Step 8 pays, and ahead of every exit
+  that follows. Inside the pair loop it sat behind the skip for an empty
+  ladder or an invalid quote, which an unverified pair is likely to have.
+- **The drift corrector does nothing while any position is unverified** (review
+  rounds 2 and 3). Round 2 stood Step 9f down only when no balance had been
+  read at all. With some read and some not, the unread asset was simply
+  missing from its shares, every other asset looked overweight, and 9f, which
+  trades both ways toward its targets, would have sold them.
+- **The empty-ladder liveness refresh reads XCH too** (review round 3). Step 7's
+  XCH read updates the cap and never State, so for a pair that is not
+  pace-managed, nothing corrected XCH's State position while every XCH ladder
+  stayed empty. The refresh runs below Step 8's sync gate, so no half-synced
+  wallet's reading reaches State. It costs at most one extra XCH balance call
+  per heartbeat, and only while some pair's ladder is empty.
+- The startup fallback is the quantity `inventory_state` restored, captured
+  before the read loop. `seed_position()` fills an empty record from this
+  boot's reply, and a reply without `confirmed_wallet_balance` would otherwise
+  have passed its spendable balance off as the persisted quantity (review
+  round 2).
+
+Not in this change: the InventoryTracker (the strategy's `q`) and its one-shot
+Step 11 reconcile, and the XCH/DBX bid, which was zero for a different reason
+that evening (`q` above `q_max`).
+
 ## [0.10.25] — 2026-09-21 — less dust, fewer cancels, a fee controller shipped off, and stops that keep the book
 
 ### Less reward dust in new offers, except on the no-floor retry
