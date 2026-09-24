@@ -64,8 +64,11 @@ SUBMIT_REASONS = (
     # never retired at all (execution::decide_expired_retire), so `filled`
     # keeps winning.
     '"expired_onchain"',
+    # [SEED-FAIL-CLOSED review round 2] Step 8 takes down a pair's resting
+    # offers while a position it trades is unverified.
+    '"unverified_position"',
 )
-SUBMIT_SITE_COUNT = 20
+SUBMIT_SITE_COUNT = 21
 
 
 def _read(path: Path) -> str:

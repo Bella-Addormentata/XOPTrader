@@ -245,8 +245,16 @@ def test_startup_seeds_state_for_every_asset_after_the_read_loop() -> None:
     decisions = _calls(tail, "risk::decide_state_seed")
     assert len(decisions) == 1
     assert tail.index("risk::decide_state_seed(") > seed_loop.start()
-    # The fallback quantity is the tracker's DB-restored one.
-    assert "inventory_->net_inventory(" in decisions[0][2]
+    # The fallback quantity is the tracker's DB-restored one, taken BEFORE the
+    # reads (review round 2): the read loop's seed_position() fills an empty
+    # record from this boot's reply, which would then pass for persisted.
+    assert decisions[0][2] == "persisted_quantity.at(%s)" % seed_loop.group(1), decisions[0][2]
+    capture = re.search(r"persisted_quantity\s*\[\s*(\w+)\s*\]\s*=\s*"
+                        r"inventory_->net_inventory\(\s*AssetId\{\s*\1\s*\}\s*\)\s*;", poll)
+    assert capture, "the persisted quantities are not captured from the tracker"
+    assert decl.end() < capture.start() < try_open, (
+        "the persisted quantities must be captured before the reads' try"
+    )
     assert "state_->reconcile_balance(" in tail
 
     lastknown_at = tail.index("risk::SeedSource::LastKnown")
@@ -328,6 +336,56 @@ def test_pace_managed_pairs_reconcile_from_a_fresh_pace_read() -> None:
     assert "reconcile_state_position(" in block
     assert re.search(r"as_of_block\s*==\s*block_height", block)
     assert block.rstrip().endswith("continue;")
+    # Review round 2: XCH too -- refresh_pace_balances caches it as "xch", and
+    # when every XCH pair is pace-managed with an empty ladder no other read
+    # reaches its State position.
+    assert '"xch"' not in block, "the pace reconciliation must not skip XCH"
+
+
+def test_an_unverified_pair_takes_down_what_it_quotes() -> None:
+    """Review round 2: the unverified gate's `continue` skips every cancel path
+    in the pair loop, so offers restored at boot would rest unmanaged for as
+    long as the read fails.  The gate cancels the pair's resting offers --
+    those not already cancelling -- and records each as a submission."""
+    body = _function_body(_engine(), STEP8)
+    loop_at = body.index('wallet_step_may_run("Step 8 pair loop")')
+    gate = re.search(
+        r"state_unverified_assets_\.count\(\s*\w+->base_asset_id\s*\)\s*>\s*0"
+        r"\s*\|\|\s*state_unverified_assets_\.count\(\s*\w+->quote_asset_id\s*\)\s*>\s*0",
+        body[loop_at:])
+    assert gate
+    after = body[loop_at + gate.end():]
+    block_open = after.index("{")
+    block = after[block_open:_matching(after, block_open)]
+    pick = re.search(r"if\s*\(\s*po\.pair_name\s*==\s*pair_name\s*&&\s*!\s*po\.cancel_pending\s*\)",
+                     block)
+    assert pick, "the drain must take exactly this pair's offers that are not already cancelling"
+    picked_open = block.index("{", pick.end())
+    assert "to_cancel.push_back(po.offer_id);" in block[picked_open:_matching(block, picked_open)]
+    cancel_at = block.index("offer_mgr_->selective_cancel(to_cancel)")
+    marks = _calls(block, "db_->mark_offer_cancel_submitted")
+    assert marks == [["id", "block_height", '"unverified_position"']], marks
+    assert pick.start() < cancel_at < block.index("mark_offer_cancel_submitted(")
+    assert block.index("mark_offer_cancel_submitted(") < block.rindex("continue;")
+    assert block.rstrip().endswith("continue;")
+
+
+def test_the_drift_corrector_never_sizes_from_an_unverified_state() -> None:
+    """Review round 2: Step 9f runs before Step 8's verification pass and sizes
+    TAKER trades.  With no balance read yet it falls back on State, and it
+    must not while any State position is unverified."""
+    body = _function_body(_engine(), "asio::awaitable<void> Engine::step_run_drift_corrector(")
+    fallback = re.search(r"if\s*\(\s*total_xch\s*<=\s*0\.0\s*\)\s*\{", body)
+    assert fallback, "the drift corrector's State fallback moved"
+    block_open = fallback.end() - 1
+    block = body[block_open:_matching(body, block_open)]
+    guard = re.search(r"if\s*\(\s*!\s*state_unverified_assets_\.empty\(\)\s*\)\s*\{", block)
+    assert guard, "the State fallback is not gated on verification"
+    guarded = block[guard.end() - 1:_matching(block, guard.end() - 1)]
+    assert re.search(r"co_return\s*;", guarded), "an unverified State must stop 9f"
+    assert guard.start() < block.index("state_->get_all_positions()"), (
+        "the gate must come before State is read"
+    )
 
 
 def test_the_bridge_scan_verifies_its_own_asset() -> None:

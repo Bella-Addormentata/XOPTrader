@@ -2750,6 +2750,9 @@ private:
     // verifies anything posts nothing, because Step 6 sized it from the guess.
     // The bridge scan clears its own asset (review round 1).
     std::unordered_set<std::string> state_unverified_assets_;
+    // [SEED-FAIL-CLOSED review round 2] Step 9f's "unverified" line has been
+    // logged at WARN for the current episode; later heartbeats log at debug.
+    bool drift_unverified_warned_{false};
 
     // -- [PACE 2026-09-13] Pace controller state -----------------------------
     // The only pace state kept between heartbeats is each asset's activation

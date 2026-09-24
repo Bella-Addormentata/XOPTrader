@@ -51,6 +51,20 @@ have corrected it.)
   clears the unverified mark on its own asset. The reconciled cost basis goes
   through `to_mojo_checked()`, and a ratio that is not a representable Mojo
   falls back to the unit basis instead of being converted.
+- **An unverified pair's resting offers come down** (review round 2). Its gate
+  used to skip every cancel path in the pair loop, so offers restored at boot
+  rested unmanaged for as long as the read kept failing. Step 8 now cancels
+  them (reason `unverified_position`), each heartbeat, until the pair is flat.
+- **The drift corrector does not size a taker trade from an unverified State**
+  (review round 2). Step 9f runs before Step 8's verification pass and, with no
+  balance read yet, falls back on State positions. It now stands down while any
+  position is unverified.
+- The startup fallback is the quantity `inventory_state` restored, captured
+  before the read loop. `seed_position()` fills an empty record from this
+  boot's reply, and a reply without `confirmed_wallet_balance` would otherwise
+  have passed its spendable balance off as the persisted quantity. A
+  pace-managed pair with an empty ladder now reconciles XCH as well as its CAT
+  from that heartbeat's pace read (both review round 2).
 
 Not in this change: the InventoryTracker (the strategy's `q`) and its one-shot
 Step 11 reconcile, and the XCH/DBX bid, which was zero for a different reason

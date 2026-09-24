@@ -3095,6 +3095,16 @@ asio::awaitable<void> Engine::poll_loop_coro()
         // it".  An asset in neither was not read.
         std::unordered_map<std::string, Mojo> state_seed_confirmed;
         std::unordered_set<std::string>       state_seed_not_held;
+        // [SEED-FAIL-CLOSED review round 2] The quantity inventory_state
+        // restored, taken BEFORE the loop below.  That is the "last persisted
+        // quantity" the State seed falls back on.  seed_position() leaves a
+        // restored position alone, but it fills an empty one from this boot's
+        // reply, and a reply without confirmed_wallet_balance seeds it from
+        // spendable -- a guess the fallback would then log as persisted.
+        std::unordered_map<std::string, Mojo> persisted_quantity;
+        for (const auto& aid : seed_asset_ids) {
+            persisted_quantity[aid] = inventory_->net_inventory(AssetId{aid});
+        }
 
         try {
             // Ensure the wallet-ID cache is populated so that
@@ -3225,7 +3235,7 @@ asio::awaitable<void> Engine::poll_loop_coro()
                         : std::nullopt;
                 const risk::SeedDecision seed = risk::decide_state_seed(
                     wallet_confirmed, state_seed_not_held.count(aid) > 0,
-                    inventory_->net_inventory(AssetId{aid}));
+                    persisted_quantity.at(aid));
                 // Never refused: decide_state_seed() returns no negative
                 // quantity, the one input reconcile_balance() rejects.
                 (void)state_->reconcile_balance(AssetId{aid}, seed.quantity);
@@ -12055,10 +12065,13 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 // Take them from a pace read made THIS heartbeat: it came from
                 // refresh_pace_balances above the sync gate, but this gate has
                 // passed since, within the same heartbeat.
+                // [review round 2] XCH too.  refresh_pace_balances caches it
+                // under "xch", and the Step 7 XCH read updates only the cap,
+                // never State: when every XCH pair is pace-managed with an
+                // empty ladder, this is the only read that reaches it.
                 if (const PairConfig* pace_pc = find_pair_config(pair_name)) {
                     for (const std::string& pace_asset :
                          {pace_pc->base_asset_id, pace_pc->quote_asset_id}) {
-                        if (pace_asset == "xch") continue;
                         const auto pace_read = cached_wallet_balances_.find(pace_asset);
                         if (pace_read != cached_wallet_balances_.end()
                             && pace_read->second.as_of_block == block_height) {
@@ -12178,6 +12191,44 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             spdlog::warn("[Engine] Step 8: {} not quoted -- a position it "
                          "trades is still UNVERIFIED (its wallet balance "
                          "could not be read)", pair_name);
+            // [review round 2] ...and what it already quotes comes down.  The
+            // `continue` below skips every cancel path in this loop, so offers
+            // restored at boot would otherwise rest, unmanaged, for as long as
+            // the read keeps failing.  Convergent, like the peg-suspension
+            // drain: each heartbeat cancels whatever is not already
+            // cancelling, and is a no-op once the pair is flat.
+            if (offer_mgr_ && !dry_run_ && !cancel_all_inflight_) {
+                std::vector<std::string> to_cancel;
+                for (const auto& po : state_->get_all_offers()) {
+                    if (po.pair_name == pair_name && !po.cancel_pending) {
+                        to_cancel.push_back(po.offer_id);
+                    }
+                }
+                if (!to_cancel.empty()) {
+                    try {
+                        const auto done = co_await offer_mgr_->selective_cancel(to_cancel);
+                        for (const auto& id : done) {
+                            try {
+                                db_->mark_offer_cancel_submitted(id, block_height,
+                                                                 "unverified_position");
+                            } catch (const std::exception& mark_error) {
+                                spdlog::debug("[Engine] Step 8: could not mark {} "
+                                              "cancel_pending: {}", id.substr(0, 12),
+                                              mark_error.what());
+                            }
+                        }
+                        spdlog::warn("[Engine] Step 8: {} -- cancelled {}/{} "
+                                     "resting offers while its position is "
+                                     "unverified", pair_name, done.size(),
+                                     to_cancel.size());
+                    } catch (const std::exception& e) {
+                        spdlog::error("[Engine] Step 8: {} -- could not cancel its "
+                                      "resting offers while its position is "
+                                      "unverified: {} -- retrying next heartbeat",
+                                      pair_name, e.what());
+                    }
+                }
+            }
             continue;
         }
 
@@ -16523,6 +16574,8 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
     if (scfg.asset_target_allocations.empty()) co_return;
     if (!dexie_ || !wallet_ || !market_data_) co_return;
     if (wallet_circuit_open_) co_return;
+    // Re-arm the "unverified" warning below once everything is verified.
+    if (state_unverified_assets_.empty()) drift_unverified_warned_ = false;
 
     // -- Cooldown ----------------------------------------------------------
     if (last_drift_correction_block_ != 0 &&
@@ -16604,6 +16657,21 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
             }
         }
         if (total_xch <= 0.0) {
+            // [SEED-FAIL-CLOSED review round 2] Not from a State that holds a
+            // guess.  9f runs before Step 8's verification pass and sizes
+            // TAKER trades from these shares, and an unverified position is
+            // only its last persisted quantity.  The balance cache above is
+            // the wallet's own word and is used whatever State holds.
+            if (!state_unverified_assets_.empty()) {
+                spdlog::log(drift_unverified_warned_ ? spdlog::level::debug
+                                                     : spdlog::level::warn,
+                            "[Engine] Step 9f: no drift correction -- no "
+                            "balance has been read yet and {} State "
+                            "position(s) are UNVERIFIED",
+                            state_unverified_assets_.size());
+                drift_unverified_warned_ = true;
+                co_return;
+            }
             const auto positions = state_->get_all_positions();
             for (const auto& p : positions) {
                 const double v = static_cast<double>(PreTradeCheck::mark_to_xch(p, *state_));
