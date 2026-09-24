@@ -11582,11 +11582,17 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                            may_be_syncing, now_s);
 
         if (sync_watch.action != execution::WalletSyncAction::Synced) {
+            // [review round 3] The state the verdict used, not the raw flag: a
+            // reply without `syncing` reads as syncing, and the line says so
+            // rather than print syncing=false beside a rejected reading.
+            const char* const syncing_text =
+                !sync_status.contains("syncing") ? "missing, read as true"
+                                                 : (syncing ? "true" : "false");
             spdlog::warn("[Engine] Step 8: wallet not fully synced "
                          "(synced={}, syncing={}) for {}s -- skipping all "
                          "offer management; a restart waits for {}s "
                          "unsynced or {}s not syncing (not syncing for {}s)",
-                         synced, syncing, sync_watch.unsynced_for_s,
+                         synced, syncing_text, sync_watch.unsynced_for_s,
                          sync_watch.syncing_budget_s, sync_watch.idle_budget_s,
                          sync_watch.idle_for_s);
 

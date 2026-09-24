@@ -185,6 +185,24 @@ def test_every_sync_reading_reaches_the_watch() -> None:
     assert read_at < observed_at < first_return
 
 
+def test_the_unsynced_warning_logs_the_state_the_verdict_used() -> None:
+    """Review round 3: a reply without `syncing` is read as syncing
+    (may_be_syncing), so the unsynced warning must not print the raw flag's
+    false beside the reading it rejected.  It prints the effective state, and
+    says when the field was missing."""
+    body = _function_body(_engine(), STEP8)
+    warn_at = body.index('"[Engine] Step 8: wallet not fully synced "')
+    call_at = body.rindex("spdlog::warn(", 0, warn_at)
+    args = _call_args(body[call_at:], "spdlog::warn")[0]
+    assert args[1:3] == ["synced", "syncing_text"], args
+    text = re.search(r"const\s+char\*\s+const\s+syncing_text\s*=\s*([^;]+);", body)
+    assert text and text.start() < call_at, "syncing_text is not defined before the warning"
+    assert " ".join(text.group(1).split()) == (
+        '!sync_status.contains("syncing") ? "missing, read as true" '
+        ': (syncing ? "true" : "false")'
+    ), text.group(1)
+
+
 def test_a_failed_restart_command_takes_back_its_backoff() -> None:
     """Review, PR #170: the failure branch of the restart command -- and only
     it -- reports the failure to the watch, so a restart that did not happen

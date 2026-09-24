@@ -34,7 +34,9 @@ of 9,329,985.
   as synced and manage offers, while the startup gate kept waiting on the same
   reply.
 - The Step 8 line says how long the wallet has been unsynced and what a restart
-  waits for; the restart line says which restart it is.
+  waits for; the restart line says which restart it is. It prints the syncing
+  state the verdict used, so a reply without `syncing` reads
+  `syncing=missing, read as true`, not `syncing=false` (review round 3).
 
 Not in this change: the wallet's own configuration (`use_delta_sync`,
 `connect_to_unknown_peers`), and the restart itself, which is still a blocking
