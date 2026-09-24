@@ -28,6 +28,7 @@ STEP8 = "asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_heig
 POLL_LOOP = "asio::awaitable<void> Engine::poll_loop_coro()"
 HELPER = "Engine::reconcile_state_position("
 BRIDGE_SCAN = "asio::awaitable<void> Engine::step_ingest_bridge_flows("
+HEARTBEAT = "asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)"
 
 # The defect's shape: something gated on a State position being zero.  The
 # argument may be brace-initialised (`AssetId{x}`), so only `;` bounds it: a
@@ -492,6 +493,34 @@ def test_the_drift_corrector_never_sizes_from_an_unverified_state() -> None:
     assert body.count("state_unverified_assets_.empty()") == 1, "one gate, at the top"
 
 
+def test_the_bridge_scan_verifies_only_from_a_wallet_step8_saw_synced() -> None:
+    """Review round 6: the bridge scan runs every heartbeat, whether or not
+    Step 8 got past its sync gate, and its own balance fetch checks only that
+    the wallet answers.  So it clears its asset's unverified mark only when
+    this heartbeat's Step 8 passed that gate: a flag cleared at the top of
+    every heartbeat and set nowhere but just below the gate.  wallet_synced_
+    would not do -- Step 8 does not run while paused, and it keeps its last
+    value."""
+    text = _engine()
+    writes = re.findall(r"step8_sync_gate_passed_\s*=\s*(\w+)\s*;", text)
+    assert writes == ["false", "true"], writes
+    heartbeat = _function_body(text, HEARTBEAT)
+    cleared = heartbeat.index("step8_sync_gate_passed_ = false;")
+    assert cleared < heartbeat.index("co_await step_manage_offers(block_height)"), (
+        "cleared before this heartbeat's Step 8 runs"
+    )
+    assert cleared < heartbeat.index("co_await step_ingest_bridge_flows(block_height)")
+    body = _function_body(text, STEP8)
+    set_at = body.index("step8_sync_gate_passed_ = true;")
+    sync_at = body.index("wallet_->get_sync_status()")
+    catch_at = body.index("catch (const std::exception& e) {", sync_at)
+    catch_open = body.index("{", catch_at)
+    assert _matching(body, catch_open) < set_at, "set only below the sync gate, after its catch"
+    assert "co_return" not in body[_matching(body, catch_open) + 1:set_at]
+    start, _ = _verification_block(body)
+    assert set_at < start, "set before anything below the gate relies on it"
+
+
 def test_the_bridge_scan_verifies_its_own_asset() -> None:
     """Review round 1: while its scan is operational the bridge asset has one
     State writer, so Step 8's pass leaves it alone and the scan clears its
@@ -500,7 +529,9 @@ def test_the_bridge_scan_verifies_its_own_asset() -> None:
     _, block = _verification_block(_function_body(text, STEP8))
     assert "bridge_accounting_operational()" in block
     bridge = _function_body(text, BRIDGE_SCAN)
-    assert re.search(r"get_position\(\s*asset\s*\)\.balance\s*==\s*bal\.confirmed\s*"
+    # Review round 6: and only from a wallet this heartbeat's Step 8 saw synced.
+    assert re.search(r"step8_sync_gate_passed_\s*&&\s*"
+                     r"state_->get_position\(\s*asset\s*\)\.balance\s*==\s*bal\.confirmed\s*"
                      r"&&\s*state_unverified_assets_\.erase\(\s*asset\s*\)", bridge)
     # Cleared in exactly those two places; the routine reconcile never does.
     assert text.count("state_unverified_assets_.erase(") == 2

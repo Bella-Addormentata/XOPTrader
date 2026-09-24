@@ -2753,6 +2753,13 @@ private:
     // [SEED-FAIL-CLOSED review round 2] Step 9f's "unverified" line has been
     // logged at WARN for the current episode; later heartbeats log at debug.
     bool drift_unverified_warned_{false};
+    // [SEED-FAIL-CLOSED review round 6] Step 8 passed its wallet-sync gate in
+    // THIS heartbeat.  Cleared at the top of every heartbeat and set only just
+    // below that gate, so it is never an earlier heartbeat's verdict: Step 8
+    // does not run while paused, and wallet_synced_ keeps its last value.
+    // The bridge scan, which runs every heartbeat after Step 8, clears its
+    // asset's unverified mark only while this holds.
+    bool step8_sync_gate_passed_{false};
 
     // -- [PACE 2026-09-13] Pace controller state -----------------------------
     // The only pace state kept between heartbeats is each asset's activation

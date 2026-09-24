@@ -58,9 +58,12 @@ have corrected it.)
   round 4). Rounds 1 and 2 took them from pace's own read instead. That read
   runs before the sync check, so it could be taken mid-sync, and it covers
   only the assets pace lists, so it skips XCH in a CAT-only pace config. The
-  bridge scan clears the unverified mark on its own asset. The reconciled cost
-  basis goes through `to_mojo_checked()`, and a ratio that is not a
-  representable Mojo falls back to the unit basis instead of being converted.
+  bridge scan clears the unverified mark on its own asset, but only in a
+  heartbeat whose Step 8 passed its wallet-sync gate (review round 6). The
+  scan runs every heartbeat, and its own balance fetch checks only that the
+  wallet answers. The reconciled cost basis goes through `to_mojo_checked()`,
+  and a ratio that is not a representable Mojo falls back to the unit basis
+  instead of being converted.
 - **An unverified pair's resting offers come down** (review round 2). Its gate
   used to skip every cancel path in the pair loop, so offers restored at boot
   rested unmanaged for as long as the read kept failing. Step 8 now cancels

@@ -4312,6 +4312,9 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
         wallet_transport_at_cycle_start_ = wallet_->transport_counters();
     }
     wallet_skip_warned_this_cycle_ = false;
+    // [SEED-FAIL-CLOSED review round 6] Not synced until this heartbeat's Step 8
+    // says so (engine.hpp).
+    step8_sync_gate_passed_ = false;
 
     // [T3-08] Reset NHE accumulators for this cycle.
     nhe_net_inventory_change_ = 0.0;
@@ -11696,6 +11699,9 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                      "-- skipping offer management cautiously", e.what());
         co_return;
     }
+    // [SEED-FAIL-CLOSED review round 6] Below the gate: the wallet was synced
+    // in this heartbeat (engine.hpp).
+    step8_sync_gate_passed_ = true;
 
     // [SEED-FAIL-CLOSED review round 1] Verify every position the startup seed
     // could not read, here, below the sync gate and before anything is posted.
@@ -19983,7 +19989,13 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
                     // a startup fallback for it -- once State holds the
                     // wallet's balance.  Step 8 does not quote its pairs
                     // until then.
-                    if (state_->get_position(asset).balance == bal.confirmed
+                    // [review round 6] ...and only from a wallet Step 8 saw
+                    // synced in THIS heartbeat.  The scan runs every heartbeat,
+                    // Step 8 stopped at its sync gate or not, and its own fetch
+                    // checks only that the wallet answers: a mid-sync balance
+                    // must not verify the asset.
+                    if (step8_sync_gate_passed_
+                        && state_->get_position(asset).balance == bal.confirmed
                         && state_unverified_assets_.erase(asset) > 0) {
                         spdlog::warn("[Engine] Bridge ingest: State position "
                                      "of {} verified against the wallet at "
