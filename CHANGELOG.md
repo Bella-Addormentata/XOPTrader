@@ -41,8 +41,11 @@ can pass for an offer nobody took.
     v2 curried with the CAT's TAIL around OFFER_MOD
     (`CoinManager::settlement_puzzle_hash`). An amount alone could belong to
     any child.
-  - From the wallet, which cannot see settlement coins: a payment to us of
-    exactly a requested amount in that block, from a coin that is not ours.
+  - From the wallet, which cannot see settlement coins: a coin of ours
+    confirmed in that block for exactly a requested amount, whose parent is
+    not one of this offer's maker coins. That is all the check can prove: it
+    cannot tell a payment from an unrelated coin of ours (see "Not detected"
+    below).
     The wallet is asked for every such coin, with no row limit. A limit of
     50 would have hidden a payment past the 50th row on every retry.
 
@@ -64,8 +67,13 @@ can pass for an offer nobody took.
   escalation, which shares the node's lookup, now stops its sweep on one too.
   Nothing is booked. Once the first spend is
   `strategy.confirmation_depth_blocks` deep (default 6), the offer stops being
-  tracked, its offer_log row is closed `cancelled` with reason `dead_on_chain`
-  at the height of that spend, and the engine logs an ERROR. A write that
+  tracked, the engine logs an ERROR, and it records the offer `cancelled` at
+  the height of that spend with the reason `dead_on_chain`. The closure event
+  keeps that reason. The offer_log row follows the rule every closure does
+  (S14): a row still open closes `cancelled` at that height with that reason,
+  a row whose cancel was already submitted closes the same way but keeps that
+  cancel's cause, and a row already closed keeps its status. So an audit of
+  dead offers reads the closure events (review round 9). A write that
   fails is retried every heartbeat, up to the 10 failures S25 allows. A fee
   ticket for a cancel on it closes without an observation, the same way a
   FAILED offer's does: the chain cannot say whose spend killed it.
@@ -123,8 +131,9 @@ exactly the same amount, taken while this one is reported CONFIRMED. Its
 settlement coin looks the same, and only its requested payment differs. The
 node cannot search for a payment. From the wallet, which is asked only while
 the node is not trusted: an unrelated coin of ours, confirmed in the same
-block for exactly a requested amount. The wallet cannot see a payment's
-parent, so it cannot tell the two apart.
+block for exactly a requested amount. The wallet shows a payment's parent
+only as a coin id, and it holds no record of a coin that is not ours, so it
+cannot tell a settlement coin from any other sender.
 
 Not changed: a fill still books once, when the take is found, and then waits
 out the confirmation depth without being checked again. A take reorganised out

@@ -5600,10 +5600,15 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
     // [FILL-PROOF 2026-09-23] Offers the wallet reported CONFIRMED that the
     // chain proved were never taken.  detect_fills booked nothing for them and
     // stopped tracking them; record how they ended.  'cancelled' is the status
-    // of an offer that ended without a fill, and the reason says this one died
-    // on-chain.  Not buffered like a wallet-reported terminal: the proof
-    // already waited out the confirmation depth, and recheck_terminal would
-    // only hear the wallet say CONFIRMED again.
+    // of an offer that ended without a fill, and the closure event's reason
+    // says this one died on-chain.  [review #171 round 9] The row takes that
+    // reason only while still open: a row whose cancel was already submitted
+    // keeps that cancel's cause, as every completed cancel does, and a row
+    // already closed keeps its status (S14, Database::update_offer_status).
+    // So an audit of dead offers reads the closure events.  Not buffered like
+    // a wallet-reported terminal: the proof already waited out the
+    // confirmation depth, and recheck_terminal would only hear the wallet say
+    // CONFIRMED again.
     //
     // [review #171] detect_fills reports each dead offer once, so a write that
     // fails is queued and retried every heartbeat, bounded as S25's are.

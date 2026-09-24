@@ -35,9 +35,11 @@
 //       - from the node: a settlement coin, created from a maker coin at the
 //         offered asset's settlement puzzle, for exactly the amount offered,
 //         and spent in that same block (prove_take_from_children);
-//       - from the wallet, which cannot see settlement coins: a payment to us
-//         of exactly a requested amount in that block, from a coin that is
-//         not ours (prove_take_from_payments).
+//       - from the wallet, which cannot see settlement coins: a coin of ours
+//         confirmed in that block for exactly a requested amount, whose parent
+//         is not one of this offer's maker coins (prove_take_from_payments).
+//         [review #171 round 9] That is the whole check: it cannot tell a
+//         payment from an unrelated coin of ours (NOT DETECTED, below).
 //     With the mark it is Settled.  If the node shows the block without one
 //     -- or shows the maker coins created no children at all -- it is Dead.
 //     The wallet's silence proves nothing, so there it stays Unknown.
@@ -65,7 +67,9 @@
 //     requested payment differs, and the node cannot search for that.
 //   - From the wallet: an unrelated coin of ours confirmed in the same block
 //     for exactly a requested amount -- another fill's payment of the same
-//     size, say.  The wallet cannot see a payment's parent, so it cannot tell.
+//     size, say.  The wallet shows a payment's parent only as a coin id: it
+//     holds no record of a coin that is not ours, so it cannot tell a
+//     settlement coin from any other sender.
 //     This path runs only while the node is not trusted.
 //
 // Pure header: no I/O, no RPC, no logging.
