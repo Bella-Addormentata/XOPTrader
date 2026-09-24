@@ -69,7 +69,12 @@ can pass for an offer nobody took.
   it, the engine will not cancel it. Chia's secure cancel sets PENDING_CANCEL
   over any status, and an insecure one sets CANCELLED. So a cancel sent during
   a one-heartbeat lookup failure would erase the CONFIRMED the proof is waiting
-  on, and a real take with it.
+  on, and a real take with it. The one exception: an offer the full node shows
+  live again can be cancelled. That means every maker coin unspent this
+  heartbeat, with the node at least `confirmation_depth_blocks` past the
+  height the wallet claims. A take undone by a reorganisation therefore does
+  not leave a quote nobody can withdraw. An offer stops being held as soon as
+  the wallet stops reporting it CONFIRMED.
 - `recheck_terminal` no longer re-adopts an offer proven dead. The wallet goes
   on reporting it CONFIRMED, and re-adopting it would send it through
   detect_fills again.
@@ -86,7 +91,10 @@ heartbeat until it is resolved.
 Not detected: another of our offers, built on the same coins and offering
 exactly the same amount, taken while this one is reported CONFIRMED. Its
 settlement coin looks the same, and only its requested payment differs. The
-node cannot search for a payment.
+node cannot search for a payment. From the wallet, which is asked only while
+the node is not trusted: an unrelated coin of ours, confirmed in the same
+block for exactly a requested amount. The wallet cannot see a payment's
+parent, so it cannot tell the two apart.
 
 Not changed: a fill still books once, when the take is found, and then waits
 out the confirmation depth without being checked again. A take reorganised out

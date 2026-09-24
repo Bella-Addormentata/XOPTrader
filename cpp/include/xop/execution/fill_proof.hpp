@@ -58,10 +58,15 @@
 // trusts it, else the wallet, which refuses to answer until synced), and what
 // happens to a Dead offer (OfferManager::detect_fills).
 //
-// NOT DETECTED: another of our offers, built on the same coins, taken for
-// exactly the same offered amount while this one is reported CONFIRMED.  Its
-// settlement coin is indistinguishable here.  Only its requested payment
-// differs, and the node cannot search for that.
+// NOT DETECTED:
+//   - From the node: another of our offers, built on the same coins, taken for
+//     exactly the same offered amount while this one is reported CONFIRMED.
+//     Its settlement coin is indistinguishable here.  Only its requested
+//     payment differs, and the node cannot search for that.
+//   - From the wallet: an unrelated coin of ours confirmed in the same block
+//     for exactly a requested amount -- another fill's payment of the same
+//     size, say.  The wallet cannot see a payment's parent, so it cannot tell.
+//     This path runs only while the node is not trusted.
 //
 // Pure header: no I/O, no RPC, no logging.
 // ---------------------------------------------------------------------------
@@ -403,6 +408,36 @@ template <class NameOf>
     return proof.verdict == FillProof::Dead && proof.height > 0U
         && current_block >= proof.height
         && current_block - proof.height >= confirmation_depth;
+}
+
+/// [review #171, round 2] May an offer the wallet reports CONFIRMED be
+/// cancelled?  Chia 2.7.4's cancel sets PENDING_CANCEL (secure) or CANCELLED
+/// (insecure) over any status, so a cancel erases the CONFIRMED a real take
+/// would be booked from.  And Chia sets CONFIRMED only when a spend of one of
+/// the offer's coins triggers it: a Live verdict against it means the node
+/// lags the wallet -- or a reorganisation undid that spend, and the offer can
+/// be taken again.  Only the second may be cancelled, and they are told apart
+/// by depth.  So a cancel is allowed only when:
+///   - the verdict is Live (every maker coin unspent);
+///   - it came from the full node, not the wallet, whose store is what
+///     mislabelled these offers;
+///   - it was made at `current_block`, this heartbeat;
+///   - that block is at least `confirmation_depth` past `claimed_height`, the
+///     wallet's confirmed_at_index.  When the node is trusted, the engine's
+///     height is the node's own, so the node has processed the claimed block
+///     and `confirmation_depth` more without seeing a spend.
+/// Anything else stays withheld until the proof settles or closes the offer.
+[[nodiscard]] constexpr bool live_offer_cancellable(FillProof     verdict,
+                                                    bool          from_node,
+                                                    std::uint64_t claimed_height,
+                                                    std::uint64_t proved_at,
+                                                    std::uint64_t current_block,
+                                                    std::uint64_t confirmation_depth) noexcept
+{
+    return verdict == FillProof::Live && from_node && claimed_height > 0U
+        && proved_at == current_block
+        && current_block >= claimed_height
+        && current_block - claimed_height >= confirmation_depth;
 }
 
 [[nodiscard]] constexpr const char* fill_proof_name(FillProof proof) noexcept

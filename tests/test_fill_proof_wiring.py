@@ -144,15 +144,17 @@ def _confirmed_branch() -> str:
 def test_no_fill_is_booked_before_the_chain_proves_it():
     confirmed = _confirmed_branch()
     proof_at = confirmed.index("co_await prove_fill_on_chain(rec, ")
-    gate = re.search(r"if \(proof\.verdict != FillProof::Settled\) \{\s*"
-                     r"handle_unproven_fill\([^;]*\);\s*continue;\s*\}", confirmed)
-    assert gate and gate.start() > proof_at, (
-        "a proof that is not Settled must hand the offer to handle_unproven_fill "
-        "and skip everything else"
+    head = "if (proof.verdict != FillProof::Settled) {"
+    gate_at = confirmed.index(head)
+    held = _block_after(confirmed, head)
+    assert gate_at > proof_at and "handle_unproven_fill(" in held, (
+        "a proof that is not Settled must hand the offer to handle_unproven_fill"
     )
+    assert re.search(r"continue;\s*\}$", held), "...and skip everything else"
+    gate_end = confirmed.index("{", gate_at + len(head) - 1) + len(held)
     for booking in ("Fill fill;", "state_->record_buy(", "state_->record_sell(",
                     "state_->remove_offer(", "fills.push_back("):
-        assert confirmed.index(booking) > gate.end(), (
+        assert confirmed.index(booking) > gate_end, (
             "%s must come after the Settled gate" % booking
         )
     detect = _function_body(_source(OFFER_MANAGER), DETECT_FILLS)
@@ -240,8 +242,8 @@ def test_one_failed_lookup_ends_the_lookups_for_the_call():
         "the latch belongs to the call, declared before the loop that books"
     )
     asked = re.search(r"if \(proof_lookup_failed\) \{[^}]*\} else \{\s*"
-                      r"proof = co_await prove_fill_on_chain\(rec, proof_failure, "
-                      r"proof_lookup_failed\);\s*\}", _confirmed_branch())
+                      r"proof = co_await prove_fill_on_chain\(rec, proof_failure,\s*"
+                      r"proof_lookup_failed, asked_node\);\s*\}", _confirmed_branch())
     assert asked, "no lookup may be sent once one has failed in this call"
     prove = _function_body(_source(OFFER_MANAGER), PROVE_ON_CHAIN)
     handler = _block_after(prove, "catch (const std::exception& e) {")
@@ -308,7 +310,7 @@ def test_a_confirmed_offer_under_proof_is_never_cancelled():
         "cancel_offer_charged must stay the only per-offer way to the wallet's cancel"
     )
     charged = _function_body(manager, "OfferManager::cancel_offer_charged(")
-    guard = re.search(r"if \(fill_proof_deferrals_\.count\(trade_id\) > 0U\) \{", charged)
+    guard = re.search(r"if \(cancel_withheld_for_proof\(trade_id\)\) \{", charged)
     assert guard and guard.start() < charged.index("wallet_->cancel_offer("), (
         "an offer under fill proof is refused before anything reaches the wallet"
     )
@@ -316,12 +318,53 @@ def test_a_confirmed_offer_under_proof_is_never_cancelled():
         "refused like a wallet refusal, which every caller already handles"
     )
     emergency = _function_body(manager, "asio::awaitable<bool> OfferManager::emergency_cancel(")
-    early = re.search(r"if \(fill_proof_deferrals_\.count\(offer_id\) > 0U\) \{", emergency)
+    early = re.search(r"if \(cancel_withheld_for_proof\(offer_id\)\) \{", emergency)
     assert early and early.start() < emergency.index("get_wallet_balance("), (
         "emergency_cancel gives up at once, not after a balance read and a fee ladder "
         "of refusals"
     )
     assert "co_return false;" in _block_after(emergency, early.group(0))
+
+    # Review round 2: withheld unless the LATEST proof makes it cancellable --
+    # a Live verdict from the node, this heartbeat, at depth past the claim.
+    helper = _function_body(manager, "bool OfferManager::cancel_withheld_for_proof(")
+    missing = re.search(r"if \(held == fill_proof_deferrals_\.end\(\)\) \{\s*return false;", helper)
+    assert missing, "an offer not under proof is never withheld"
+    decision = _call_args(helper, "live_offer_cancellable")
+    assert decision == [["latest.verdict", "latest.from_node", "latest.claimed_height",
+                         "latest.proved_at", "last_detect_block_",
+                         "strategy_cfg_.confirmation_depth_blocks"]], decision
+    assert re.search(r"return\s*!\s*live_offer_cancellable\(", helper)
+
+
+def test_the_latest_proof_is_what_a_cancel_is_judged_by():
+    """[review #171, round 2] The guard reads what the last proof found, from
+    where, against which claim, and when -- so a CONFIRMED offer the node has
+    proven live again can be cancelled -- and an offer leaves the guard as soon
+    as the wallet stops calling it CONFIRMED."""
+    manager = _source(OFFER_MANAGER)
+    detect = _function_body(manager, DETECT_FILLS)
+    assert detect.index("last_detect_block_ = current_block;") < detect.index("co_return"), (
+        "the heartbeat a proof belongs to must be known before detect_fills returns"
+    )
+    cleared = re.search(r"if \(status != trade_status::kConfirmed\) \{\s*"
+                        r"fill_proof_deferrals_\.erase\(trade_id\);\s*\}", detect)
+    assert cleared and cleared.start() < detect.index("if (status == trade_status::kConfirmed) {"), (
+        "an offer the wallet no longer calls CONFIRMED is not under proof"
+    )
+    confirmed = _confirmed_branch()
+    assert re.search(r"claimed_height = idx->get<std::uint64_t>\(\);", confirmed), (
+        "the wallet's claimed height comes from the record's confirmed_at_index"
+    )
+    unproven = _call_args(confirmed, "handle_unproven_fill")
+    assert unproven == [["trade_id", "po", "proof", "proof_failure", "asked_node",
+                         "claimed_height", "current_block"]], unproven
+    prove = _function_body(manager, PROVE_ON_CHAIN)
+    assert re.search(r"asked_node = ask_node;", prove), "the proof's source must be reported"
+    handler = _function_body(manager, HANDLE_UNPROVEN)
+    for field, value in (("verdict", "proof.verdict"), ("from_node", "from_node"),
+                         ("claimed_height", "claimed_height"), ("proved_at", "current_block")):
+        assert re.search(r"deferral\.%s\s*=\s*%s;" % (field, re.escape(value)), handler), field
 
 
 def test_the_wallet_fallback_refuses_while_unsynced():

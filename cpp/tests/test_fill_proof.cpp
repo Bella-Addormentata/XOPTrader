@@ -525,6 +525,35 @@ TEST(CoinRecordConfirmedHeight, ReadsTheNodesAndTheWalletsField)
 }
 
 // ---------------------------------------------------------------------------
+// live_offer_cancellable (review round 2)
+// ---------------------------------------------------------------------------
+
+TEST(LiveOfferCancellable, OnlyAFreshNodeLiveAtDepthPastTheWalletsClaim)
+{
+    // The wallet claims a take at 100.  The node, this heartbeat, six blocks
+    // past that and every maker coin unspent: the take is not on its chain.
+    EXPECT_TRUE(ex::live_offer_cancellable(FillProof::Live, true, 100U, 106U, 106U, 6U));
+    EXPECT_TRUE(ex::live_offer_cancellable(FillProof::Live, true, 100U, 500U, 500U, 6U));
+
+    // Five past: the node may simply not have the take yet.
+    EXPECT_FALSE(ex::live_offer_cancellable(FillProof::Live, true, 100U, 105U, 105U, 6U));
+    // The wallet's Live: its store is what mislabelled these offers.
+    EXPECT_FALSE(ex::live_offer_cancellable(FillProof::Live, false, 100U, 106U, 106U, 6U));
+    // A proof from an earlier heartbeat: the offer may have been taken since.
+    EXPECT_FALSE(ex::live_offer_cancellable(FillProof::Live, true, 100U, 105U, 106U, 6U));
+    // No claimed height: nothing to measure the node against.
+    EXPECT_FALSE(ex::live_offer_cancellable(FillProof::Live, true, 0U, 106U, 106U, 6U));
+    // A claim above the node's own height: the node is behind the wallet.
+    EXPECT_FALSE(ex::live_offer_cancellable(FillProof::Live, true, 200U, 106U, 106U, 6U));
+
+    for (const FillProof other : {FillProof::Unknown, FillProof::Settled, FillProof::Dead,
+                                  FillProof::SpentTogether}) {
+        EXPECT_FALSE(ex::live_offer_cancellable(other, true, 100U, 106U, 106U, 6U))
+            << ex::fill_proof_name(other);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // dead_offer_closable
 // ---------------------------------------------------------------------------
 

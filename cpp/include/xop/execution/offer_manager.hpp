@@ -75,7 +75,10 @@ using json = nlohmann::json;
 // [FILL-PROOF] Defined in execution/fill_proof.hpp, which only
 // offer_manager.cpp needs: every file that includes this header, engine.cpp
 // among them, would otherwise recompile whenever the proof's rules change.
+// The enum's opaque declaration names its underlying type, so it is complete
+// here; value-initialized it is FillProof::Unknown (0).
 struct FillProofResult;
+enum class FillProof : std::uint8_t;
 
 // TierQuote and RebalanceReason are defined in <xop/types.hpp> (unified).
 // The execution layer uses xop::TierQuote and xop::RebalanceReason directly.
@@ -1383,10 +1386,26 @@ private:
     /// See set_fill_proof_node().
     std::shared_ptr<rpc::ChiaFullNodeRPC> fill_proof_node_;
     std::function<bool()>                 fill_proof_node_trusted_;
-    /// Consecutive heartbeats a CONFIRMED offer went unbooked for want of a
-    /// Settled proof: the log's cadence, and the offers whose cancels
-    /// cancel_offer_charged() withholds.
-    std::unordered_map<std::string, std::uint32_t> fill_proof_deferrals_;
+    /// An offer the wallet reports CONFIRMED that the proof has not settled:
+    /// how long it has waited, and the latest proof.  The latest proof decides
+    /// whether cancel_offer_charged() withholds its cancels
+    /// (execution::live_offer_cancellable).  The entry goes once the wallet
+    /// stops reporting CONFIRMED, or the offer leaves State.
+    struct FillProofDeferral {
+        std::uint32_t count{0};                    ///< consecutive deferrals, for the log
+        FillProof     verdict{};                   ///< the latest proof (Unknown until one)
+        bool          from_node{false};            ///< it came from the full node
+        std::uint64_t claimed_height{0};           ///< the wallet's confirmed_at_index
+        BlockHeight   proved_at{0};                ///< the heartbeat it was made at
+    };
+    std::unordered_map<std::string, FillProofDeferral> fill_proof_deferrals_;
+    /// The block the most recent detect_fills() ran at: a proof made then is
+    /// this heartbeat's.
+    BlockHeight last_detect_block_{0};
+
+    /// Whether cancel_offer_charged() must refuse `trade_id`: an offer under
+    /// proof, unless its latest proof makes it cancellable.
+    [[nodiscard]] bool cancel_withheld_for_proof(const std::string& trade_id) const;
 
     /// Ask the chain what a CONFIRMED trade record's maker coins prove
     /// (execution::prove_fill).  Never throws and never logs: a failure is
@@ -1395,13 +1414,16 @@ private:
     /// could not be asked at all, so detect_fills asks nothing more that call.
     asio::awaitable<FillProofResult> prove_fill_on_chain(const json& trade_record,
                                                          std::string& failure,
-                                                         bool& lookup_failed);
+                                                         bool& lookup_failed,
+                                                         bool& asked_node);
 
     /// A CONFIRMED offer whose proof is not Settled: log it and, when the
     /// proof is a Dead verdict at confirmation depth, stop tracking it and
-    /// report it in last_dead_offers_.  Books nothing, ever.
+    /// report it in last_dead_offers_.  Otherwise record the proof in
+    /// fill_proof_deferrals_.  Books nothing, ever.
     void handle_unproven_fill(const std::string& trade_id, const PendingOffer& po,
                               const FillProofResult& proof, const std::string& failure,
+                              bool from_node, std::uint64_t claimed_height,
                               BlockHeight current_block);
 
     /// [S46 2026-09-02] Result of the DB -> wallet leg of the most recent
