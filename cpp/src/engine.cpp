@@ -11837,6 +11837,57 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         co_return;
     }
 
+    // [SEED-FAIL-CLOSED review round 3] THE DRAIN, BEFORE THE PAIR LOOP.
+    // Round 2 cancelled an unverified pair's resting offers inside the pair
+    // loop below, but that loop skips a pair with an empty ladder or an
+    // invalid quote before it gets that far -- and a pair whose position is
+    // unverified is likely to have an empty ladder.  Here the whole book is
+    // scanned, as the peg-suspension drain does: after this heartbeat's fees
+    // are set, which every cancel in this step pays, and ahead of every exit
+    // that follows.  Only the verification pass's own co_return, which lasts
+    // one heartbeat, and a fee budget or wallet circuit that stops every
+    // cancel come before it.  Convergent: each heartbeat cancels whatever
+    // still rests on a pair that trades an unverified position and is not
+    // already cancelling, and it is a no-op once those pairs are flat.  An
+    // in-flight operator Cancel All supersedes it, as it does that drain.
+    if (!state_unverified_assets_.empty() && offer_mgr_ && !dry_run_
+        && !cancel_all_inflight_) {
+        std::vector<std::string> to_cancel;
+        for (const auto& po : state_->get_all_offers()) {
+            const PairConfig* drain_pc = find_pair_config(po.pair_name);
+            if (drain_pc && !po.cancel_pending
+                && (state_unverified_assets_.count(drain_pc->base_asset_id) > 0
+                    || state_unverified_assets_.count(drain_pc->quote_asset_id) > 0)) {
+                to_cancel.push_back(po.offer_id);
+            }
+        }
+        if (!to_cancel.empty()) {
+            if (!wallet_step_may_run("Step 8 unverified drain")) {
+                co_return;
+            }
+            try {
+                const auto done = co_await offer_mgr_->selective_cancel(to_cancel);
+                for (const auto& id : done) {
+                    try {
+                        db_->mark_offer_cancel_submitted(id, block_height,
+                                                         "unverified_position");
+                    } catch (const std::exception& mark_error) {
+                        spdlog::debug("[Engine] Step 8: could not mark {} "
+                                      "cancel_pending: {}", id.substr(0, 12),
+                                      mark_error.what());
+                    }
+                }
+                spdlog::warn("[Engine] Step 8: cancelled {}/{} resting offers "
+                             "on pairs whose position is unverified",
+                             done.size(), to_cancel.size());
+            } catch (const std::exception& e) {
+                spdlog::error("[Engine] Step 8: could not cancel the resting "
+                              "offers on pairs whose position is unverified: "
+                              "{} -- retrying next heartbeat", e.what());
+            }
+        }
+    }
+
     // -- UTXO Liberation ------------------------------------------------
     // The Chia wallet locks *entire* UTXOs when creating offers.  A small
     // fee (0.005 XCH) can lock a 16 XCH UTXO, draining spendable to
@@ -12049,9 +12100,13 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
     // cached balance.  Any conditional skip here reopens the deadlock for
     // whichever case it skips (round 9: two positive sub-minimum sides
     // starved each other out), so an empty ladder refreshes ALL of its
-    // CAT funding assets, unconditionally.  Deduped across pairs; XCH is
-    // exempt (its refresh runs in the poll loop and is not ladder-gated).
-    // Cost: at most two RPCs per empty-ladder pair per heartbeat.
+    // funding assets, unconditionally.  Deduped across pairs.
+    // [SEED-FAIL-CLOSED review round 3] XCH is no longer exempt.  Its cap
+    // refresh runs elsewhere, but that read (Step 7's) never updates State,
+    // so for a pair with an empty ladder this is the only read that reaches
+    // XCH's State position.  It runs below the sync gate, so no half-synced
+    // wallet's reading gets there.  Cost: at most two RPCs per empty-ladder
+    // pair per heartbeat, XCH once.
     {
         std::set<std::string> refreshed;
         for (auto& [pair_name, pcs] : cycle_) {
@@ -12088,7 +12143,6 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             const std::string assets[2] = {live_pc->base_asset_id,
                                            live_pc->quote_asset_id};
             for (const auto& asset : assets) {
-                if (asset == "xch") continue;
                 if (!refreshed.insert(asset).second) continue;
                 const auto wid = offer_mgr_->resolve_wallet_id(asset);
                 if (wid <= 0) continue;
@@ -12129,7 +12183,9 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                              block_height);
                     // Log only transitions worth an operator's eye: a
                     // balance appearing where the cache had none/zero.
-                    if (confirmed > 0
+                    // XCH's first read here is no deposit -- its cap read
+                    // may never have cached it under this key.
+                    if (asset != "xch" && confirmed > 0
                         && (!prior.has_value() || *prior <= 0)) {
                         spdlog::info(
                             "[Engine] Step 8: liveness refresh observed a "
@@ -12191,44 +12247,9 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             spdlog::warn("[Engine] Step 8: {} not quoted -- a position it "
                          "trades is still UNVERIFIED (its wallet balance "
                          "could not be read)", pair_name);
-            // [review round 2] ...and what it already quotes comes down.  The
-            // `continue` below skips every cancel path in this loop, so offers
-            // restored at boot would otherwise rest, unmanaged, for as long as
-            // the read keeps failing.  Convergent, like the peg-suspension
-            // drain: each heartbeat cancels whatever is not already
-            // cancelling, and is a no-op once the pair is flat.
-            if (offer_mgr_ && !dry_run_ && !cancel_all_inflight_) {
-                std::vector<std::string> to_cancel;
-                for (const auto& po : state_->get_all_offers()) {
-                    if (po.pair_name == pair_name && !po.cancel_pending) {
-                        to_cancel.push_back(po.offer_id);
-                    }
-                }
-                if (!to_cancel.empty()) {
-                    try {
-                        const auto done = co_await offer_mgr_->selective_cancel(to_cancel);
-                        for (const auto& id : done) {
-                            try {
-                                db_->mark_offer_cancel_submitted(id, block_height,
-                                                                 "unverified_position");
-                            } catch (const std::exception& mark_error) {
-                                spdlog::debug("[Engine] Step 8: could not mark {} "
-                                              "cancel_pending: {}", id.substr(0, 12),
-                                              mark_error.what());
-                            }
-                        }
-                        spdlog::warn("[Engine] Step 8: {} -- cancelled {}/{} "
-                                     "resting offers while its position is "
-                                     "unverified", pair_name, done.size(),
-                                     to_cancel.size());
-                    } catch (const std::exception& e) {
-                        spdlog::error("[Engine] Step 8: {} -- could not cancel its "
-                                      "resting offers while its position is "
-                                      "unverified: {} -- retrying next heartbeat",
-                                      pair_name, e.what());
-                    }
-                }
-            }
+            // [review round 3] What it already quotes was taken down by the
+            // drain in the verification pass above, which this loop's early
+            // `continue`s cannot skip.
             continue;
         }
 
@@ -16574,8 +16595,24 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
     if (scfg.asset_target_allocations.empty()) co_return;
     if (!dexie_ || !wallet_ || !market_data_) co_return;
     if (wallet_circuit_open_) co_return;
-    // Re-arm the "unverified" warning below once everything is verified.
-    if (state_unverified_assets_.empty()) drift_unverified_warned_ = false;
+
+    // [SEED-FAIL-CLOSED review round 3] NOTHING WHILE ANY POSITION IS
+    // UNVERIFIED.  Round 2 stood 9f down only when no balance had been read
+    // at all.  With some read and some not, the unread asset is simply
+    // missing from the shares below, every other asset looks overweight, and
+    // 9f -- which trades both ways toward its targets -- would sell them.  A
+    // partial view is worse than none, so it waits: Step 8's pass verifies
+    // every position within a heartbeat of the wallet answering.
+    if (!state_unverified_assets_.empty()) {
+        spdlog::log(drift_unverified_warned_ ? spdlog::level::debug
+                                             : spdlog::level::warn,
+                    "[Engine] Step 9f: no drift correction -- {} State "
+                    "position(s) are UNVERIFIED",
+                    state_unverified_assets_.size());
+        drift_unverified_warned_ = true;
+        co_return;
+    }
+    drift_unverified_warned_ = false;   // re-armed once everything is verified
 
     // -- Cooldown ----------------------------------------------------------
     if (last_drift_correction_block_ != 0 &&
@@ -16657,21 +16694,9 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
             }
         }
         if (total_xch <= 0.0) {
-            // [SEED-FAIL-CLOSED review round 2] Not from a State that holds a
-            // guess.  9f runs before Step 8's verification pass and sizes
-            // TAKER trades from these shares, and an unverified position is
-            // only its last persisted quantity.  The balance cache above is
-            // the wallet's own word and is used whatever State holds.
-            if (!state_unverified_assets_.empty()) {
-                spdlog::log(drift_unverified_warned_ ? spdlog::level::debug
-                                                     : spdlog::level::warn,
-                            "[Engine] Step 9f: no drift correction -- no "
-                            "balance has been read yet and {} State "
-                            "position(s) are UNVERIFIED",
-                            state_unverified_assets_.size());
-                drift_unverified_warned_ = true;
-                co_return;
-            }
+            // [SEED-FAIL-CLOSED review round 2] State only once every position
+            // in it is the wallet's: the gate at the top of this step returns
+            // while any is unverified (review round 3).
             const auto positions = state_->get_all_positions();
             for (const auto& p : positions) {
                 const double v = static_cast<double>(PreTradeCheck::mark_to_xch(p, *state_));

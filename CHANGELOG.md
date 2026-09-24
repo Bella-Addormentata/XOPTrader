@@ -55,10 +55,22 @@ have corrected it.)
   used to skip every cancel path in the pair loop, so offers restored at boot
   rested unmanaged for as long as the read kept failing. Step 8 now cancels
   them (reason `unverified_position`), each heartbeat, until the pair is flat.
-- **The drift corrector does not size a taker trade from an unverified State**
-  (review round 2). Step 9f runs before Step 8's verification pass and, with no
-  balance read yet, falls back on State positions. It now stands down while any
-  position is unverified.
+  Round 3 moved that drain ahead of the pair loop and made it scan the whole
+  book, like the peg-suspension drain. It runs right after the heartbeat's
+  fees are set, which every cancel in Step 8 pays, and ahead of every exit
+  that follows. Inside the pair loop it sat behind the skip for an empty
+  ladder or an invalid quote, which an unverified pair is likely to have.
+- **The drift corrector does nothing while any position is unverified** (review
+  rounds 2 and 3). Round 2 stood Step 9f down only when no balance had been
+  read at all. With some read and some not, the unread asset was simply
+  missing from its shares, every other asset looked overweight, and 9f, which
+  trades both ways toward its targets, would have sold them.
+- **The empty-ladder liveness refresh reads XCH too** (review round 3). Step 7's
+  XCH read updates the cap and never State, so for a pair that is not
+  pace-managed, nothing corrected XCH's State position while every XCH ladder
+  stayed empty. The refresh runs below Step 8's sync gate, so no half-synced
+  wallet's reading reaches State. It costs at most one extra XCH balance call
+  per heartbeat, and only while some pair's ladder is empty.
 - The startup fallback is the quantity `inventory_state` restored, captured
   before the read loop. `seed_position()` fills an empty record from this
   boot's reply, and a reply without `confirmed_wallet_balance` would otherwise

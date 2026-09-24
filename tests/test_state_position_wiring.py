@@ -343,49 +343,98 @@ def test_pace_managed_pairs_reconcile_from_a_fresh_pace_read() -> None:
 
 
 def test_an_unverified_pair_takes_down_what_it_quotes() -> None:
-    """Review round 2: the unverified gate's `continue` skips every cancel path
-    in the pair loop, so offers restored at boot would rest unmanaged for as
-    long as the read fails.  The gate cancels the pair's resting offers --
-    those not already cancelling -- and records each as a submission."""
-    body = _function_body(_engine(), STEP8)
-    loop_at = body.index('wallet_step_may_run("Step 8 pair loop")')
-    gate = re.search(
-        r"state_unverified_assets_\.count\(\s*\w+->base_asset_id\s*\)\s*>\s*0"
-        r"\s*\|\|\s*state_unverified_assets_\.count\(\s*\w+->quote_asset_id\s*\)\s*>\s*0",
-        body[loop_at:])
-    assert gate
-    after = body[loop_at + gate.end():]
-    block_open = after.index("{")
-    block = after[block_open:_matching(after, block_open)]
-    pick = re.search(r"if\s*\(\s*po\.pair_name\s*==\s*pair_name\s*&&\s*!\s*po\.cancel_pending\s*\)",
-                     block)
-    assert pick, "the drain must take exactly this pair's offers that are not already cancelling"
-    picked_open = block.index("{", pick.end())
-    assert "to_cancel.push_back(po.offer_id);" in block[picked_open:_matching(block, picked_open)]
-    cancel_at = block.index("offer_mgr_->selective_cancel(to_cancel)")
-    marks = _calls(block, "db_->mark_offer_cancel_submitted")
+    """Review round 2: offers restored at boot must not rest unmanaged for as
+    long as a position read fails, so they are cancelled -- those not already
+    cancelling -- and each is recorded as a submission.
+
+    Review round 3: that drain sat in the pair loop, whose first line skips a
+    pair with an empty ladder or an invalid quote -- which an unverified pair
+    is likely to have.  It now scans the whole book before the pair loop:
+    after this heartbeat's fees are set (every cancel in Step 8 pays them, and
+    tests/test_fee_controller_wiring.py pins the fee setup ahead of the first
+    selective_cancel), and ahead of every exit that follows."""
+    text = _engine()
+    body = _function_body(text, STEP8)
+    drain = re.search(r"if\s*\(\s*!\s*state_unverified_assets_\.empty\(\)\s*&&\s*offer_mgr_\s*&&\s*"
+                      r"!\s*dry_run_\s*&&\s*!\s*cancel_all_inflight_\s*\)\s*\{", body)
+    assert drain, "Step 8 has no drain"
+    c1 = re.search(r'if\s*\(\s*!\s*wallet_step_may_run\("Step 8 \(offers\)"\)\s*\)\s*\{\s*co_return\s*;\s*\}',
+                   body)
+    assert c1, "Step 8's C1 circuit check moved"
+    assert body.index("offer_mgr_->set_dynamic_fee(recommended_fee)") < c1.start() < drain.start()
+    assert body.index("if (fee_tracker_->class_fees_active()) {") < drain.start()
+    assert "co_return" not in body[c1.end():drain.start()], (
+        "no exit may come between the fee setup's circuit check and the drain"
+    )
+    assert drain.start() < body.index("std::set<std::string> refreshed;")
+    assert drain.start() < body.index('wallet_step_may_run("Step 8 pair loop")')
+    drain_open = drain.end() - 1
+    drained = body[drain_open:_matching(body, drain_open)]
+    assert "state_->get_all_offers()" in drained, "the drain scans the whole book"
+    pick = re.search(
+        r"if\s*\(\s*drain_pc\s*&&\s*!\s*po\.cancel_pending\s*&&\s*\(\s*"
+        r"state_unverified_assets_\.count\(\s*drain_pc->base_asset_id\s*\)\s*>\s*0\s*\|\|\s*"
+        r"state_unverified_assets_\.count\(\s*drain_pc->quote_asset_id\s*\)\s*>\s*0\s*\)\s*\)",
+        drained)
+    assert pick, ("the drain must take every offer on a pair that trades an unverified "
+                  "position, and only those not already cancelling")
+    picked_open = drained.index("{", pick.end())
+    assert "to_cancel.push_back(po.offer_id);" in drained[picked_open:_matching(drained, picked_open)]
+    gate_at = drained.index('wallet_step_may_run("Step 8 unverified drain")')
+    cancel_at = drained.index("offer_mgr_->selective_cancel(to_cancel)")
+    assert pick.start() < gate_at < cancel_at
+    marks = _calls(drained, "db_->mark_offer_cancel_submitted")
     assert marks == [["id", "block_height", '"unverified_position"']], marks
-    assert pick.start() < cancel_at < block.index("mark_offer_cancel_submitted(")
-    assert block.index("mark_offer_cancel_submitted(") < block.rindex("continue;")
-    assert block.rstrip().endswith("continue;")
+    assert text.count('"unverified_position"') == 1, (
+        "one drain: the pair loop only skips an unverified pair"
+    )
+
+
+def test_the_liveness_refresh_reads_xch_too() -> None:
+    """Review round 3: Step 7's XCH read updates the cap and never State, so for
+    a pair that is not pace-managed, an empty ladder's refresh is the only read
+    that brings XCH's State position to the wallet's.  XCH is refreshed like
+    every other funding asset -- deduped, below the sync gate, reconciled."""
+    body = _function_body(_engine(), STEP8)
+    refresh = re.search(r"std::set<std::string>\s+refreshed\s*;", body)
+    assert refresh, "the liveness refresh moved"
+    assert body.index("wallet_->get_sync_status()") < refresh.start(), (
+        "the refresh must stay below the sync gate"
+    )
+    loop = re.search(r"for\s*\(\s*const\s+auto&\s*asset\s*:\s*assets\s*\)\s*\{", body[refresh.end():])
+    assert loop, "the liveness refresh no longer loops over a pair's two assets"
+    loop_open = refresh.end() + loop.end() - 1
+    loop_body = body[loop_open:_matching(body, loop_open)]
+    assert not re.search(r'if\s*\(\s*asset\s*==\s*"xch"\s*\)\s*continue\s*;', loop_body), (
+        "the liveness refresh must not skip XCH"
+    )
+    assert re.search(r"if\s*\(\s*!\s*refreshed\.insert\(\s*asset\s*\)\.second\s*\)\s*continue\s*;",
+                     loop_body), "each asset is read once per heartbeat"
+    assert _calls(loop_body, "reconcile_state_position") == [
+        ["asset", "confirmed", "fields_validated", "block_height"]]
 
 
 def test_the_drift_corrector_never_sizes_from_an_unverified_state() -> None:
-    """Review round 2: Step 9f runs before Step 8's verification pass and sizes
-    TAKER trades.  With no balance read yet it falls back on State, and it
-    must not while any State position is unverified."""
+    """Review round 2: Step 9f sizes TAKER trades and must not use a State
+    position that is only a guess.  Review round 3: nor shares with an unread
+    asset missing -- every other asset then looks overweight, and 9f, which
+    trades both ways toward its targets, would sell them.  So it does nothing
+    at all while any position is unverified: the gate comes first, before the
+    cooldown and before any share is computed."""
     body = _function_body(_engine(), "asio::awaitable<void> Engine::step_run_drift_corrector(")
-    fallback = re.search(r"if\s*\(\s*total_xch\s*<=\s*0\.0\s*\)\s*\{", body)
-    assert fallback, "the drift corrector's State fallback moved"
-    block_open = fallback.end() - 1
-    block = body[block_open:_matching(body, block_open)]
-    guard = re.search(r"if\s*\(\s*!\s*state_unverified_assets_\.empty\(\)\s*\)\s*\{", block)
-    assert guard, "the State fallback is not gated on verification"
-    guarded = block[guard.end() - 1:_matching(block, guard.end() - 1)]
-    assert re.search(r"co_return\s*;", guarded), "an unverified State must stop 9f"
-    assert guard.start() < block.index("state_->get_all_positions()"), (
-        "the gate must come before State is read"
+    guard = re.search(r"if\s*\(\s*!\s*state_unverified_assets_\.empty\(\)\s*\)\s*\{", body)
+    assert guard, "9f is not gated on verification"
+    guard_open = guard.end() - 1
+    guard_close = _matching(body, guard_open)
+    assert re.search(r"co_return\s*;", body[guard_open:guard_close]), "an unverified position must stop 9f"
+    for later in ("last_drift_correction_block_", "cached_wallet_balances_",
+                  "portfolio_pct_by_asset", "state_->get_all_positions()"):
+        assert guard.start() < body.index(later), f"the gate must come before {later}"
+    rearm = re.search(r"drift_unverified_warned_\s*=\s*false\s*;", body)
+    assert rearm and rearm.start() > guard_close, (
+        "the warning re-arms only once every position is verified"
     )
+    assert body.count("state_unverified_assets_.empty()") == 1, "one gate, at the top"
 
 
 def test_the_bridge_scan_verifies_its_own_asset() -> None:
