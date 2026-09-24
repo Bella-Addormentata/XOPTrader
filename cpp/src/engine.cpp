@@ -11597,10 +11597,12 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                          sync_watch.idle_for_s);
 
             if (sync_watch.action == execution::WalletSyncAction::Restart) {
+                // [review round 4] "If it succeeds": a failed command takes
+                // the doubling back (record_failed_wallet_restart, below).
                 spdlog::warn("[Engine] Wallet unsynced for {}s, {}s of it not "
                              "syncing -- restarting the wallet service "
-                             "(restart {} since it was last synced; the next "
-                             "attempt's budgets double)",
+                             "(restart {} since it was last synced; if it "
+                             "succeeds, the next attempt's budgets double)",
                              sync_watch.unsynced_for_s, sync_watch.idle_for_s,
                              sync_watch.restarts + 1);
 #ifdef _WIN32

@@ -185,6 +185,21 @@ def test_every_sync_reading_reaches_the_watch() -> None:
     assert read_at < observed_at < first_return
 
 
+def test_the_restart_line_promises_no_doubling_a_failure_takes_back() -> None:
+    """Review round 4: the restart warning said the next attempt's budgets
+    double, unconditionally, while a failed command takes the doubling back
+    and the failure line says the next attempt keeps the same budget.  The
+    warning now says the budgets double if the restart succeeds."""
+    body = _function_body(_engine(), STEP8)
+    start = body.index('"[Engine] Wallet unsynced for {}s, {}s of it not "')
+    end = body.index(");", start)
+    text = re.sub(r'"\s*"', "", body[start:end])
+    assert "if it succeeds, the next attempt's budgets double" in text, text
+    assert "execution::record_failed_wallet_restart(wallet_sync_watch_)" in body[end:], (
+        "the failure branch that keeps the budget must follow the warning"
+    )
+
+
 def test_the_unsynced_warning_logs_the_state_the_verdict_used() -> None:
     """Review round 3: a reply without `syncing` is read as syncing
     (may_be_syncing), so the unsynced warning must not print the raw flag's

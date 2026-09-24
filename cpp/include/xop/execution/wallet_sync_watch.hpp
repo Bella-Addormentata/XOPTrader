@@ -29,9 +29,15 @@
 //
 // The rules:
 //
-//   * A WALLET THAT SAYS IT IS SYNCING IS NOT RESTARTED within the syncing
-//     budget.  Its only visible progress is completion, so the budget is
-//     long: a sync that runs past it is presumed hung.
+//   * A WALLET THAT SAYS IT IS SYNCING IS NOT RESTARTED until the whole
+//     unsynced streak reaches the syncing budget.  Its only visible progress
+//     is completion, so the budget is long: a sync that runs past it is
+//     presumed hung.  [review round 4] The streak counts from the first
+//     unsynced reading, not from the start of syncing, so any idle time
+//     before the sync counts too -- at most the idle budget, since an idle
+//     run that long is restarted first.  That is deliberate: a wallet that
+//     keeps flipping between syncing and idle would otherwise never reach
+//     a restart.
 //   * A WALLET NEITHER SYNCED NOR SYNCING (not even trying -- e.g. no peer)
 //     is restarted after the much shorter idle budget.  A sync attempt resets
 //     that idle run.

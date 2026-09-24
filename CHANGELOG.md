@@ -22,10 +22,12 @@ backwards. At 18:29 its finished-sync height was 9,297,547 against a node peak
 of 9,329,985.
 
 - The restart now follows `execution/wallet_sync_watch.hpp`. A wallet that
-  reports a sync in progress is not restarted for 2 hours. One that is neither
-  synced nor syncing is restarted after 15 minutes. Each restart doubles both
-  budgets for the next attempt (capped at 24 hours), and reporting synced
-  resets them.
+  reports a sync in progress is not restarted until it has been unsynced for
+  2 hours in total. Idle time before the sync counts too, at most 15 minutes,
+  so that a wallet flipping between syncing and idle still reaches a restart
+  (review round 4). One that is neither synced nor syncing is restarted after
+  15 minutes. Each successful restart doubles both budgets for the next
+  attempt (capped at 24 hours), and reporting synced resets them.
 - Time is measured on a monotonic clock instead of counted in heartbeats. A gap
   of more than 10 minutes between readings (Step 8 not reached) starts a new
   streak rather than counting as unsynced time.
