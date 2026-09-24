@@ -323,23 +323,54 @@ def test_a_pair_with_an_unverified_position_is_not_quoted() -> None:
     assert gate_at < body.index("post_quotes(", loop_at)
 
 
-def test_pace_managed_pairs_reconcile_from_a_fresh_pace_read() -> None:
-    """Review round 1: the liveness refresh skips a pace-managed empty ladder,
-    and nothing else reads its assets while it stays empty, so their State
-    comes from the pace read made this heartbeat -- and only that heartbeat."""
+def test_pace_managed_pairs_are_read_below_the_sync_gate_like_any_other() -> None:
+    """Review round 4 (replacing rounds 1-2's pace branch): a pace-managed pair
+    with an empty ladder took its State from pace's own read.  That read runs
+    before Step 8's sync check, so a read taken while the wallet was still
+    syncing reached State.  It covers only the assets pace lists, so XCH in a
+    CAT-only pace config got no read at all.  The liveness refresh now reads
+    a pace-managed pair's two assets itself, below the sync gate, like any
+    other pair's."""
     body = _function_body(_engine(), STEP8)
-    managed = re.search(
-        r"if\s*\(\s*config_\.strategy\.pace_enabled\s*&&\s*pcs\.pace\.managed\s*\)\s*\{", body)
-    assert managed, "the liveness refresh no longer handles pace-managed pairs"
-    block_open = managed.end() - 1
+    refresh = re.search(r"std::set<std::string>\s+refreshed\s*;", body)
+    assert refresh, "the liveness refresh moved"
+    block_open = body.rindex("{", 0, refresh.start())
     block = body[block_open:_matching(body, block_open)]
-    assert "reconcile_state_position(" in block
-    assert re.search(r"as_of_block\s*==\s*block_height", block)
-    assert block.rstrip().endswith("continue;")
-    # Review round 2: XCH too -- refresh_pace_balances caches it as "xch", and
-    # when every XCH pair is pace-managed with an empty ladder no other read
-    # reaches its State position.
-    assert '"xch"' not in block, "the pace reconciliation must not skip XCH"
+    assert "pace.managed" not in block, "the refresh must not set pace-managed pairs aside"
+    assert "as_of_block" not in block, (
+        "no State write from a cached read: every read here is made below the sync gate"
+    )
+    assert body.index("wallet_->get_sync_status()") < refresh.start()
+
+
+def test_startup_reads_count_only_from_a_wallet_seen_synced() -> None:
+    """Review round 4: the startup sync wait gives up when its probes run out,
+    and boot carries on.  A balance read then -- or a "no wallet for this
+    asset" answer from a wallet still finding its CAT wallets -- is no
+    verified position.  The seed counts either only when the wait saw the
+    wallet fully synced; otherwise every asset takes the unverified path, and
+    Step 8 verifies it once the wallet is synced."""
+    poll = _function_body(_engine(), POLL_LOOP)
+    decl = re.search(r"bool\s+startup_wallet_synced\s*=\s*false\s*;", poll)
+    assert decl, "the flag must start false"
+    writes = re.findall(r"startup_wallet_synced\s*=\s*(\w+)\s*;", poll)
+    assert writes == ["false", "true"], writes
+    synced_branch = re.search(r"if\s*\(\s*synced\s*&&\s*!\s*syncing\s*\)\s*\{", poll)
+    assert synced_branch and decl.start() < synced_branch.start()
+    branch_open = synced_branch.end() - 1
+    assert re.search(r"startup_wallet_synced\s*=\s*true\s*;",
+                     poll[branch_open:_matching(poll, branch_open)]), (
+        "only the probe that saw the wallet fully synced may set the flag"
+    )
+    read = re.search(r"if\s*\(\s*startup_wallet_synced\s*&&\s*"
+                     r"bal_json\.contains\(\"confirmed_wallet_balance\"\)\s*\)\s*\{\s*"
+                     r"state_seed_confirmed\[\s*aid\s*\]\s*=\s*confirmed\s*;", poll)
+    assert read, "a startup balance counts as the wallet's word only from a synced wallet"
+    miss = re.search(r"if\s*\(\s*startup_wallet_synced\s*&&\s*offer_mgr_->wallet_ids_resolved\(\)\s*\)"
+                     r"\s*\{\s*state_seed_not_held\.insert\(\s*aid\s*\)\s*;", poll)
+    assert miss, "a map miss counts as holding none only from a synced wallet"
+    assert poll.count("state_seed_confirmed[") == 1
+    assert poll.count("state_seed_not_held.insert(") == 1
 
 
 def test_an_unverified_pair_takes_down_what_it_quotes() -> None:

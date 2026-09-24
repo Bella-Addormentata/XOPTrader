@@ -2996,6 +2996,12 @@ asio::awaitable<void> Engine::poll_loop_coro()
     // Wallet balance queries return unreliable data when the wallet is
     // still syncing.  Poll sync status until fully synced, with a
     // timeout to avoid blocking forever on a stuck wallet.
+    // [SEED-FAIL-CLOSED review round 4] Whether the wait ever SAW the wallet
+    // fully synced.  Boot carries on when the probes run out, and a balance
+    // read after that -- or a "no wallet for this asset" answer from a wallet
+    // still finding its CAT wallets -- is no verified position: the State seed
+    // below counts neither unless this is true.
+    bool startup_wallet_synced = false;
     if (wallet_) {
         // 30 PROBES, not blocks -- one get_sync_status RPC plus a 10 s sleep
         // each, a 5 min floor; a timing-out wallet adds its retry budget per
@@ -3009,6 +3015,7 @@ asio::awaitable<void> Engine::poll_loop_coro()
                 bool synced  = ss.value("synced", false);
                 bool syncing = ss.value("syncing", true);
                 if (synced && !syncing) {
+                    startup_wallet_synced = true;
                     spdlog::info("[Engine] Wallet fully synced -- "
                                  "proceeding with inventory seed");
                     break;
@@ -3031,6 +3038,12 @@ asio::awaitable<void> Engine::poll_loop_coro()
             if (boot_stop_checkpoint("waiting for wallet sync")) {
                 co_return;
             }
+        }
+        if (!startup_wallet_synced) {
+            spdlog::warn("[Engine] Startup: the wallet was not seen fully synced "
+                         "in {} probes -- its balances still seed inventory, but "
+                         "every State position stays UNVERIFIED until Step 8 "
+                         "reads a synced wallet", kMaxSyncWaitProbes);
         }
     }
 
@@ -3127,7 +3140,10 @@ asio::awaitable<void> Engine::poll_loop_coro()
             for (const auto& aid : seed_asset_ids) {
                 auto wid = offer_mgr_->resolve_wallet_id(aid);
                 if (wid <= 0) {
-                    if (offer_mgr_->wallet_ids_resolved()) {
+                    // [review round 4] A built map proves the wallet holds none
+                    // of it only once the wallet is synced: mid-sync it may not
+                    // have created the CAT wallet yet.
+                    if (startup_wallet_synced && offer_mgr_->wallet_ids_resolved()) {
                         state_seed_not_held.insert(aid);
                     }
                     continue;
@@ -3139,7 +3155,10 @@ asio::awaitable<void> Engine::poll_loop_coro()
                                                     static_cast<Mojo>(0));
                     Mojo confirmed = bal_json.value("confirmed_wallet_balance",
                                                     static_cast<Mojo>(0));
-                    if (bal_json.contains("confirmed_wallet_balance")) {
+                    // [review round 4] State takes it as the wallet's word only
+                    // from a wallet the wait saw synced.  Otherwise the asset
+                    // falls to the unverified path below.
+                    if (startup_wallet_synced && bal_json.contains("confirmed_wallet_balance")) {
                         state_seed_confirmed[aid] = confirmed;
                     }
                     // [S19 review round 6] The bridge asset records
@@ -12111,33 +12130,15 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         std::set<std::string> refreshed;
         for (auto& [pair_name, pcs] : cycle_) {
             if (!pcs.ladder.empty()) continue;
-            // [PACE 2026-09-13] A pace-managed pair's empty ladder is pace's own
-            // decision, not the deadlock this refresh breaks, and
-            // refresh_pace_balances keeps its assets fresh.
-            if (config_.strategy.pace_enabled && pcs.pace.managed) {
-                // [SEED-FAIL-CLOSED review round 1] ...but no other read
-                // reaches their State positions while the ladder stays empty.
-                // Take them from a pace read made THIS heartbeat: it came from
-                // refresh_pace_balances above the sync gate, but this gate has
-                // passed since, within the same heartbeat.
-                // [review round 2] XCH too.  refresh_pace_balances caches it
-                // under "xch", and the Step 7 XCH read updates only the cap,
-                // never State: when every XCH pair is pace-managed with an
-                // empty ladder, this is the only read that reaches it.
-                if (const PairConfig* pace_pc = find_pair_config(pair_name)) {
-                    for (const std::string& pace_asset :
-                         {pace_pc->base_asset_id, pace_pc->quote_asset_id}) {
-                        const auto pace_read = cached_wallet_balances_.find(pace_asset);
-                        if (pace_read != cached_wallet_balances_.end()
-                            && pace_read->second.as_of_block == block_height) {
-                            (void)reconcile_state_position(
-                                pace_asset, pace_read->second.confirmed,
-                                pace_read->second.fields_validated, block_height);
-                        }
-                    }
-                }
-                continue;
-            }
+            // [SEED-FAIL-CLOSED review round 4] Pace-managed pairs too.  Their
+            // empty ladder is pace's own decision, not the deadlock this
+            // refresh breaks, but nothing else below the sync gate reaches
+            // their State positions.  Rounds 1-2 reconciled them from pace's
+            // own read, which runs before this step's sync check and covers
+            // only the assets pace lists.  A read taken while the wallet was
+            // still syncing then reached State, and so did nothing at all for
+            // XCH in a CAT-only pace config.  Read here, both assets, like any
+            // other pair's.  Pace is off in the live config.
             const PairConfig* live_pc = find_pair_config(pair_name);
             if (!live_pc) continue;
             const std::string assets[2] = {live_pc->base_asset_id,

@@ -36,7 +36,11 @@ have corrected it.)
   WARN with the correction. A built wallet map with no wallet for an asset is a
   verified zero; an unbuilt one proves nothing. The empty State this replaces
   was the least cautious default available: with no positions, concentration
-  reads "balanced" and every CAT 0%, so no limit can trip.
+  reads "balanced" and every CAT 0%, so no limit can trip. A startup read, or
+  a map with no wallet for the asset, counts as the wallet's word only if the
+  startup sync wait saw the wallet fully synced (review round 4). When the
+  wait runs out first, every asset takes the unverified path, the log says so,
+  and Step 8 verifies each one once the wallet is synced.
 - The per-asset startup read failure is logged as a WARN instead of DEBUG.
 - **Nothing is quoted from a guessed position** (review round 1). Step 6 sizes
   a heartbeat's ladders before Step 8 reads the wallet, so Step 8 now verifies
@@ -46,11 +50,14 @@ have corrected it.)
   it can be: that covers a first boot with no persisted row, where the guess
   is nothing at all. A built wallet map with no wallet for the asset still
   counts as a verified zero.
-- A pace-managed pair with an empty ladder takes its assets' State from that
-  heartbeat's pace read, since no other read reaches them. The bridge scan
-  clears the unverified mark on its own asset. The reconciled cost basis goes
-  through `to_mojo_checked()`, and a ratio that is not a representable Mojo
-  falls back to the unit basis instead of being converted.
+- A pace-managed pair with an empty ladder has both its assets read by the
+  empty-ladder refresh, below Step 8's sync gate, like any other pair (review
+  round 4). Rounds 1 and 2 took them from pace's own read instead. That read
+  runs before the sync check, so it could be taken mid-sync, and it covers
+  only the assets pace lists, so it skips XCH in a CAT-only pace config. The
+  bridge scan clears the unverified mark on its own asset. The reconciled cost
+  basis goes through `to_mojo_checked()`, and a ratio that is not a
+  representable Mojo falls back to the unit basis instead of being converted.
 - **An unverified pair's resting offers come down** (review round 2). Its gate
   used to skip every cancel path in the pair loop, so offers restored at boot
   rested unmanaged for as long as the read kept failing. Step 8 now cancels
@@ -74,9 +81,8 @@ have corrected it.)
 - The startup fallback is the quantity `inventory_state` restored, captured
   before the read loop. `seed_position()` fills an empty record from this
   boot's reply, and a reply without `confirmed_wallet_balance` would otherwise
-  have passed its spendable balance off as the persisted quantity. A
-  pace-managed pair with an empty ladder now reconciles XCH as well as its CAT
-  from that heartbeat's pace read (both review round 2).
+  have passed its spendable balance off as the persisted quantity (review
+  round 2).
 
 Not in this change: the InventoryTracker (the strategy's `q`) and its one-shot
 Step 11 reconcile, and the XCH/DBX bid, which was zero for a different reason
