@@ -11564,18 +11564,21 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         if (sync_status.contains("syncing"))
             syncing = sync_status["syncing"].get<bool>();
 
-        wallet_synced_ = synced && !syncing;
+        // A reply without `syncing` is an unread state, not an idle wallet:
+        // it never earns the short idle budget.  [review round 2] Nor is it
+        // synced: the startup gate already reads a missing `syncing` as true,
+        // and Step 8 must not manage offers on a reading the startup gate
+        // would not proceed on.
+        const bool may_be_syncing = syncing || !sync_status.contains("syncing");
+        const bool fully_synced = synced && !may_be_syncing;
+        wallet_synced_ = fully_synced;
         wallet_syncing_ = syncing;
 
-        // A reply without `syncing` is an unread state, not an idle wallet:
-        // it never earns the short idle budget.
-        const bool may_be_syncing = syncing || !sync_status.contains("syncing");
         const std::int64_t now_s =
             std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count();
         const execution::WalletSyncVerdict sync_watch =
-            execution::observe_wallet_sync(wallet_sync_watch_,
-                                           synced && !syncing,
+            execution::observe_wallet_sync(wallet_sync_watch_, fully_synced,
                                            may_be_syncing, now_s);
 
         if (sync_watch.action != execution::WalletSyncAction::Synced) {

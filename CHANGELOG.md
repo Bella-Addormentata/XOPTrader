@@ -29,7 +29,10 @@ of 9,329,985.
 - Time is measured on a monotonic clock instead of counted in heartbeats. A gap
   of more than 10 minutes between readings (Step 8 not reached) starts a new
   streak rather than counting as unsynced time.
-- A reply without `syncing` is treated as syncing, never as idle.
+- A reply without `syncing` is treated as syncing: never as idle, and never as
+  synced either (review round 2). Step 8 used to read `{"synced": true}` alone
+  as synced and manage offers, while the startup gate kept waiting on the same
+  reply.
 - The Step 8 line says how long the wallet has been unsynced and what a restart
   waits for; the restart line says which restart it is.
 

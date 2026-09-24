@@ -154,13 +154,13 @@ def test_the_wallet_restart_is_gated_by_the_sync_watch() -> None:
 def test_every_sync_reading_reaches_the_watch() -> None:
     """The watch sees EVERY reading -- synced ones too, which is what clears the
     backoff -- as the gate itself defines synced, and an unread `syncing` is
-    treated as syncing."""
+    treated as syncing: never idle, and (review round 2) never synced."""
     body = _function_body(_engine(), STEP8)
     calls = _call_args(body, "execution::observe_wallet_sync")
     assert len(calls) == 1
     args = calls[0]
     assert args[0] == "wallet_sync_watch_"
-    assert args[1] == "synced && !syncing"
+    assert args[1] == "fully_synced"
     assert args[2] == "may_be_syncing"
 
     definition = re.search(r"const\s+bool\s+may_be_syncing\s*=\s*([^;]+);", body)
@@ -168,6 +168,14 @@ def test_every_sync_reading_reaches_the_watch() -> None:
     assert " ".join(definition.group(1).split()) == (
         'syncing || !sync_status.contains("syncing")'
     )
+    synced = re.search(r"const\s+bool\s+fully_synced\s*=\s*([^;]+);", body)
+    assert synced and " ".join(synced.group(1).split()) == "synced && !may_be_syncing", (
+        "a reply without `syncing` must not read as synced"
+    )
+    assert re.search(r"\bwallet_synced_\s*=\s*fully_synced\s*;", body), (
+        "the flag the rest of the engine reads must agree with the watch"
+    )
+    assert body.index("const bool fully_synced") < body.index("execution::observe_wallet_sync(")
 
     # Between the reading and the gate's first return, so a synced reading
     # reaches it as surely as an unsynced one.
