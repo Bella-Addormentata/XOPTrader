@@ -11912,7 +11912,8 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
     // it, as it does that drain.
     //
     // [review round 7] And on the pairs of an asset verified since boot, the
-    // offers created before it was verified -- those restored at boot, which
+    // offers created at or before the block it was verified at -- those
+    // restored at boot, which
     // a verifying heartbeat used to leave behind -- until one pass has taken
     // them all down.  An offer the pair loop posts afterwards is never taken.
     // [review round 8] At or before that block: after a restart within one
