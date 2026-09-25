@@ -1624,11 +1624,13 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
         // poll, and a restart forgets every hold.  So an offer is proven the
         // first time it shows each cancel status, and while it is held, every
         // heartbeat.  About one lookup per cancel status, since
-        // cancel_status_proven_ remembers the answer.  The chain decides:
+        // cancel_status_proven_ remembers a final answer.  The chain decides:
         //   - Settled: a take after all.  Booked below as the CONFIRMED offer
         //     it was, from this proof, with nothing asked twice;
         //   - Live or Dead: no take, so the cancel's status stands.  A hold is
-        //     released, and the offer is handled as that status, as before;
+        //     released, and the offer is handled as that status, as before.
+        //     [round 14] Only Dead is remembered: a Live offer can still be
+        //     taken, so it is asked again next heartbeat;
         //   - Unknown, held: still held, and asked again next heartbeat, as a
         //     CONFIRMED offer would be;
         //   - Unknown, not held, after a lookup failed: asked again next
@@ -1636,6 +1638,18 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
         //   - Unknown otherwise: the chain can say no more, so the status
         //     stands.  An offer never seen CONFIRMED is not held on a question
         //     that no retry will answer.
+        //
+        // [review #171 round 14] A cancel is in flight for an offer the wallet
+        // reports PENDING_CANCEL, whoever sent it -- this engine's sweeps, the
+        // watchdog's, or a sibling's cancel through a shared coin -- so State
+        // says so too, as recheck_terminal's revival does.  Otherwise, once a
+        // proof below releases the hold, the TTL and reprice paths would read
+        // the offer as cancellable and send a second secure cancel for the same
+        // coins.  Before the proof, so no path through it can skip the mark.
+        if (status == trade_status::kPendingCancel) {
+            state_->mark_cancel_pending(trade_id);
+        }
+
         std::optional<FillProofResult> reproved;
         bool reproved_asked_node = false;
         const bool held = fill_proof_deferrals_.count(trade_id) > 0U;
@@ -1668,7 +1682,14 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
             } else if (reproof.verdict == FillProof::Live
                        || reproof.verdict == FillProof::Dead) {
                 fill_proof_deferrals_.erase(trade_id);
-                cancel_status_proven_[trade_id] = status;
+                // [round 14] Only Dead is final.  Live -- every maker coin
+                // unspent -- can still be taken, and a take that a later cancel
+                // overwrites again would show this same status, so a Live offer
+                // is asked again next heartbeat: one lookup, until its cancel
+                // lands or its status changes.
+                if (reproof.verdict == FillProof::Dead) {
+                    cancel_status_proven_[trade_id] = status;
+                }
             } else if (held) {
                 std::uint64_t claimed_height = 0;
                 if (const auto idx = rec.find("confirmed_at_index");

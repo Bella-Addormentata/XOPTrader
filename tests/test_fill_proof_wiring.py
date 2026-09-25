@@ -575,7 +575,12 @@ def test_a_cancels_status_is_proven_on_chain_before_it_is_acted_on():
     heartbeat.  Settled books it as the CONFIRMED offer it was, from that proof.
     Live or Dead lets the status stand and releases any hold.  Unknown keeps a
     held offer held; one not held is asked again only after a failed lookup,
-    and otherwise its status stands."""
+    and otherwise its status stands.
+
+    [round 14] A PENDING_CANCEL also marks State cancel_pending first, as
+    recheck_terminal's revival does, so once a proof releases the hold no TTL
+    or reprice path sends a second cancel.  And only Dead is remembered: a Live
+    offer can still be taken, so it is asked again next heartbeat."""
     manager = _source(OFFER_MANAGER)
     written = re.search(r"constexpr bool written_by_a_cancel\(int status\) noexcept \{\s*"
                         r"return status == kPendingCancel \|\| status == kCancelled;\s*\}", manager)
@@ -598,6 +603,13 @@ def test_a_cancels_status_is_proven_on_chain_before_it_is_acted_on():
     )
     declared = loop.index("std::optional<FillProofResult> reproved;")
     assert declared < opener, "one re-proof per record, never carried to the next"
+    # [round 14] A PENDING_CANCEL marks State cancel_pending, before any proof
+    # can release the hold, so no TTL or reprice path sends a second cancel.
+    mark = re.search(r"if \(status == trade_status::kPendingCancel\) \{\s*"
+                     r"state_->mark_cancel_pending\(trade_id\);\s*\}", loop)
+    assert mark and fallback < mark.start() < gate.start(), (
+        "a cancel in flight must be marked before the proof, on every path"
+    )
     reproof = _block_after(loop, "if (reprove) {")
     asked = re.search(r"if \(proof_lookup_failed\) \{[^}]*\} else \{\s*"
                       r"reproof = co_await prove_fill_on_chain\(rec, reproof_failure,\s*"
@@ -607,12 +619,14 @@ def test_a_cancels_status_is_proven_on_chain_before_it_is_acted_on():
     assert re.search(r"reproved = reproof;\s*status = trade_status::kConfirmed;\s*\}$", settled), (
         "a take after all: booked by the CONFIRMED branch, from this proof"
     )
+    # [round 14] Only Dead is remembered: Live can still be taken.
     no_take = re.search(r"\} else if \(reproof\.verdict == FillProof::Live\s*"
                         r"\|\| reproof\.verdict == FillProof::Dead\) \{\s*"
                         r"fill_proof_deferrals_\.erase\(trade_id\);\s*"
-                        r"cancel_status_proven_\[trade_id\] = status;\s*"
+                        r"if \(reproof\.verdict == FillProof::Dead\) \{\s*"
+                        r"cancel_status_proven_\[trade_id\] = status;\s*\}\s*"
                         r"\} else if \(held\) \{", reproof)
-    assert no_take, "no take: the status stands, any hold goes, and it is not asked again"
+    assert no_take, "no take: the status stands and any hold goes; only Dead is not asked again"
     held_unknown = _block_after(reproof, "} else if (held) {")
     assert _call_args(held_unknown, "handle_unproven_fill") == [[
         "trade_id", "po", "reproof", "reproof_failure", "reproved_asked_node",
