@@ -84,6 +84,14 @@ have corrected it.)
   before anything is posted. The drain takes every offer created at or
   before that block (review round 8): after a restart within one peak, a
   restored offer can carry the very height the first heartbeat verifies at.
+- A pair whose position a fill moved posts nothing new until the next
+  heartbeat (review round 9, from #172's review). Step 8 sets each State
+  position to the wallet's balance, and Step 2 books each fill into State
+  too. So a take the wallet already showed at the last Step 8 counts twice
+  until this Step 8 reads the balance again. That happens when the wallet
+  sees the block between Step 2 and Step 8, or when the fill proof waits for
+  the node, and Step 6 sized that heartbeat's ladders from the doubled
+  position. Its cancels still run; only posting waits a heartbeat.
 - **The drift corrector does nothing while any position is unverified** (review
   rounds 2 and 3). Round 2 stood Step 9f down only when no balance had been
   read at all. With some read and some not, the unread asset was simply
