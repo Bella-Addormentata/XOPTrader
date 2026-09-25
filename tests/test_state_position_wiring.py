@@ -299,8 +299,13 @@ def test_unverified_positions_are_verified_before_anything_is_posted() -> None:
         "a mark must be cleared only when a reconcile applied")
     assert "++verified" in cleared
     assert block.count("state_unverified_assets_.erase(") == 1
-    assert re.search(r"co_return\s*;", guarded(r"verified\s*>\s*0")), (
-        "a heartbeat that verified a position must not go on to post")
+    # [review round 7] ...and records it for the drain, which it then reaches:
+    # the heartbeat ends after the drain (test_a_verifying_heartbeat_drains_
+    # before_it_ends), not here.
+    assert "state_verified_undrained_.emplace(asset, block_height);" in cleared
+    stops = guarded(r"verified\s*>\s*0")
+    assert "verified_this_heartbeat = true;" in stops
+    assert "co_return" not in stops, "the verifying heartbeat must still reach the drain"
     # A built wallet map with no wallet for the asset is a verified zero.
     assert "wallet_ids_resolved()" in block
 
@@ -411,7 +416,8 @@ def test_an_unverified_pair_takes_down_what_it_quotes() -> None:
     selective_cancel), and ahead of every exit that follows."""
     text = _engine()
     body = _function_body(text, STEP8)
-    drain = re.search(r"if\s*\(\s*!\s*state_unverified_assets_\.empty\(\)\s*&&\s*offer_mgr_\s*&&\s*"
+    drain = re.search(r"if\s*\(\s*\(\s*!\s*state_unverified_assets_\.empty\(\)\s*\|\|\s*"
+                      r"!\s*state_verified_undrained_\.empty\(\)\s*\)\s*&&\s*offer_mgr_\s*&&\s*"
                       r"!\s*dry_run_\s*&&\s*!\s*cancel_all_inflight_\s*\)\s*\{", body)
     assert drain, "Step 8 has no drain"
     c1 = re.search(r'if\s*\(\s*!\s*wallet_step_may_run\("Step 8 \(offers\)"\)\s*\)\s*\{\s*co_return\s*;\s*\}',
@@ -429,8 +435,8 @@ def test_an_unverified_pair_takes_down_what_it_quotes() -> None:
     assert "state_->get_all_offers()" in drained, "the drain scans the whole book"
     pick = re.search(
         r"if\s*\(\s*drain_pc\s*&&\s*!\s*po\.cancel_pending\s*&&\s*\(\s*"
-        r"state_unverified_assets_\.count\(\s*drain_pc->base_asset_id\s*\)\s*>\s*0\s*\|\|\s*"
-        r"state_unverified_assets_\.count\(\s*drain_pc->quote_asset_id\s*\)\s*>\s*0\s*\)\s*\)",
+        r"drains\(\s*drain_pc->base_asset_id\s*,\s*po\s*\)\s*\|\|\s*"
+        r"drains\(\s*drain_pc->quote_asset_id\s*,\s*po\s*\)\s*\)\s*\)",
         drained)
     assert pick, ("the drain must take every offer on a pair that trades an unverified "
                   "position, and only those not already cancelling")
@@ -536,3 +542,48 @@ def test_the_bridge_scan_verifies_its_own_asset() -> None:
     # Cleared in exactly those two places; the routine reconcile never does.
     assert text.count("state_unverified_assets_.erase(") == 2
     assert "state_unverified_assets_" not in _function_body(text, HELPER)
+
+
+def test_a_verifying_heartbeat_drains_before_it_ends() -> None:
+    """Review round 7: a heartbeat that verified a position returned before
+    the drain, and on the next one the asset was no longer unverified, so the
+    offers restored at boot on its pairs were never taken down.  Now both
+    places that verify -- Step 8's pass and the bridge scan -- record the
+    asset with the block it was verified at.  The drain takes, on its pairs,
+    every offer created before that block (never one the pair loop posts
+    afterwards), and forgets the assets once one pass has taken them all.  The
+    verifying heartbeat ends right after the drain, before any posting, as it
+    used to end at the pass."""
+    text = _engine()
+    body = _function_body(text, STEP8)
+    drains = re.search(
+        r"const auto drains = \[this\]\(const std::string& asset, const PendingOffer& po\) \{\s*"
+        r"if \(state_unverified_assets_\.count\(asset\) > 0\) \{\s*return true;\s*\}\s*"
+        r"const auto verified = state_verified_undrained_\.find\(asset\);\s*"
+        r"return verified != state_verified_undrained_\.end\(\)\s*"
+        r"&& po\.created_at_block < verified->second;\s*\};", body)
+    assert drains, "an unverified asset takes every offer; a verified one, only what came before"
+    drain_at = body.index("(!state_unverified_assets_.empty() || !state_verified_undrained_.empty())")
+    assert drains.start() < drain_at
+    drain_open = body.index("{", drain_at)
+    drain = body[drain_open:_matching(body, drain_open)]
+    assert re.search(r"if \(to_cancel\.empty\(\)\) \{\s*state_verified_undrained_\.clear\(\);\s*\}", drain), (
+        "nothing older rests on their pairs: forget them")
+    assert re.search(r"if \(done\.size\(\) == to_cancel\.size\(\)\) \{\s*"
+                     r"state_verified_undrained_\.clear\(\);\s*\}", drain), (
+        "every one went: forget them, and not before")
+    assert text.count("state_verified_undrained_.clear()") == 2
+    # The heartbeat that verified ends after the drain, before any posting.
+    declared = body.index("bool verified_this_heartbeat = false;")
+    ends = re.search(r"if \(verified_this_heartbeat\) \{\s*co_return;\s*\}", body)
+    assert ends and declared < drain_at < ends.start(), "it must end after the drain"
+    assert ends.start() > drain_open + len(drain)
+    for posting in ("std::set<std::string> refreshed;", 'wallet_step_may_run("Step 8 pair loop")'):
+        assert ends.start() < body.index(posting), posting
+    assert body.count("verified_this_heartbeat") == 3, "declared, set by the pass, read once"
+    # Both verifiers record the block.
+    assert text.count("state_verified_undrained_.emplace(asset, block_height);") == 2
+    bridge = _function_body(text, BRIDGE_SCAN)
+    assert re.search(r"state_unverified_assets_\.erase\(asset\) > 0\) \{\s*"
+                     r"state_verified_undrained_\.emplace\(asset, block_height\);", bridge), (
+        "the bridge scan's verification must be drained too")

@@ -11822,6 +11822,12 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
     // position this pass cannot read stays unverified, and the pair loop below
     // does not quote a pair that trades it.  The pass retries every synced
     // heartbeat.  Cost: one balance RPC per unverified asset, usually none.
+    //
+    // [review round 7] A heartbeat that verifies anything still posts nothing,
+    // but it no longer returns here.  It goes on to the drain below, and ends
+    // there: the offers restored at boot on a just-verified asset's pairs are
+    // taken down like those on a pair still unverified (state_verified_undrained_).
+    bool verified_this_heartbeat = false;
     if (!state_unverified_assets_.empty()) {
         if (!wallet_step_may_run("Step 8 State verification")) {
             co_return;
@@ -11880,6 +11886,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             }
             if (previous.has_value()) {
                 state_unverified_assets_.erase(asset);
+                state_verified_undrained_.emplace(asset, block_height);
                 ++verified;
                 spdlog::warn("[Engine] Step 8: State position of {} verified "
                              "against the wallet at block {}: {} -> {} mojos "
@@ -11890,10 +11897,10 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         }
         if (verified > 0) {
             spdlog::warn("[Engine] Step 8: {} State position(s) verified this "
-                         "heartbeat -- no offer management until the next one, "
-                         "which Step 6 sizes from the wallet's balances",
-                         verified);
-            co_return;
+                         "heartbeat -- no offer posting until the next one, "
+                         "which Step 6 sizes from the wallet's balances; their "
+                         "pairs' older offers are drained first", verified);
+            verified_this_heartbeat = true;
         }
     }
 
@@ -11991,24 +11998,41 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
     // unverified is likely to have an empty ladder.  Here the whole book is
     // scanned, as the peg-suspension drain does: after this heartbeat's fees
     // are set, which every cancel in this step pays, and ahead of every exit
-    // that follows.  Only the verification pass's own co_return, which lasts
-    // one heartbeat, and a fee budget or wallet circuit that stops every
-    // cancel come before it.  Convergent: each heartbeat cancels whatever
-    // still rests on a pair that trades an unverified position and is not
-    // already cancelling, and it is a no-op once those pairs are flat.  An
-    // in-flight operator Cancel All supersedes it, as it does that drain.
-    if (!state_unverified_assets_.empty() && offer_mgr_ && !dry_run_
-        && !cancel_all_inflight_) {
+    // that follows.  Only a fee budget or wallet circuit that stops every
+    // cancel comes before it -- [review round 7] no longer the verification
+    // pass, which now ends its heartbeat just below.  Convergent: each
+    // heartbeat cancels whatever still rests on a pair that trades an
+    // unverified position and is not already cancelling, and it is a no-op
+    // once those pairs are flat.  An in-flight operator Cancel All supersedes
+    // it, as it does that drain.
+    //
+    // [review round 7] And on the pairs of an asset verified since boot, the
+    // offers created before it was verified -- those restored at boot, which
+    // a verifying heartbeat used to leave behind -- until one pass has taken
+    // them all down.  An offer the pair loop posts afterwards is never taken.
+    const auto drains = [this](const std::string& asset, const PendingOffer& po) {
+        if (state_unverified_assets_.count(asset) > 0) {
+            return true;
+        }
+        const auto verified = state_verified_undrained_.find(asset);
+        return verified != state_verified_undrained_.end()
+            && po.created_at_block < verified->second;
+    };
+    if ((!state_unverified_assets_.empty() || !state_verified_undrained_.empty())
+        && offer_mgr_ && !dry_run_ && !cancel_all_inflight_) {
         std::vector<std::string> to_cancel;
         for (const auto& po : state_->get_all_offers()) {
             const PairConfig* drain_pc = find_pair_config(po.pair_name);
             if (drain_pc && !po.cancel_pending
-                && (state_unverified_assets_.count(drain_pc->base_asset_id) > 0
-                    || state_unverified_assets_.count(drain_pc->quote_asset_id) > 0)) {
+                && (drains(drain_pc->base_asset_id, po)
+                    || drains(drain_pc->quote_asset_id, po))) {
                 to_cancel.push_back(po.offer_id);
             }
         }
-        if (!to_cancel.empty()) {
+        if (to_cancel.empty()) {
+            // Nothing from before their verification rests on their pairs.
+            state_verified_undrained_.clear();
+        } else {
             if (!wallet_step_may_run("Step 8 unverified drain")) {
                 co_return;
             }
@@ -12024,8 +12048,13 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                       mark_error.what());
                     }
                 }
+                // Every one went: nothing from before a verification is left.
+                if (done.size() == to_cancel.size()) {
+                    state_verified_undrained_.clear();
+                }
                 spdlog::warn("[Engine] Step 8: cancelled {}/{} resting offers "
-                             "on pairs whose position is unverified",
+                             "on pairs whose position is unverified, or was "
+                             "until a verification since boot",
                              done.size(), to_cancel.size());
             } catch (const std::exception& e) {
                 spdlog::error("[Engine] Step 8: could not cancel the resting "
@@ -12033,6 +12062,13 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                               "{} -- retrying next heartbeat", e.what());
             }
         }
+    }
+
+    // [review round 7] The verifying heartbeat ends here, drained, as it used
+    // to end at the verification pass: Step 6 sized its ladders from the
+    // guess, so nothing is posted until the next one.
+    if (verified_this_heartbeat) {
+        co_return;
     }
 
     // -- UTXO Liberation ------------------------------------------------
@@ -20105,9 +20141,13 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
                     // Step 8 stopped at its sync gate or not, and its own fetch
                     // checks only that the wallet answers: a mid-sync balance
                     // must not verify the asset.
+                    // [review round 7] Its pairs' offers from before this
+                    // verification are then drained by Step 8, as the
+                    // verification pass's are.
                     if (step8_sync_gate_passed_
                         && state_->get_position(asset).balance == bal.confirmed
                         && state_unverified_assets_.erase(asset) > 0) {
+                        state_verified_undrained_.emplace(asset, block_height);
                         spdlog::warn("[Engine] Bridge ingest: State position "
                                      "of {} verified against the wallet at "
                                      "block {}: {} -> {} mojos (startup could "
