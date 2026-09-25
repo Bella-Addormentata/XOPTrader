@@ -141,6 +141,15 @@ of 9,329,985.
   when the first reading after a restart or a pause was already synced. When
   Step 8 was not reached for part of the outage, its length is unknown, and
   the line says so instead of giving a number.
+- A restart whose start failed no longer leaves the wallet down (review
+  round 6). The restart ran as one command, `chia stop wallet & chia start
+  wallet` on Windows, which returned only the start's code. A start that
+  failed after a stop that worked left no wallet to answer Step 8's sync
+  check. The watch then never decided again, and the wallet circuit breaker
+  skipped Step 8 altogether, so the retry never came. Stop and start are now
+  two commands. A start that fails is owed, and the heartbeat retries it
+  before any wallet call or gate: after 60 seconds, then at doubling
+  intervals up to 15 minutes, until a start succeeds or the wallet answers.
 
 Not in this change: the wallet's own configuration (`use_delta_sync`,
 `connect_to_unknown_peers`), and the restart itself, which is still a blocking
