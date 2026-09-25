@@ -2758,6 +2758,14 @@ private:
     // The drain takes down what was created before that block -- never an
     // offer the pair loop posts afterwards -- and drops the entry once it has.
     std::unordered_map<std::string, BlockHeight> state_verified_undrained_;
+    // [SEED-FAIL-CLOSED review round 9, #172's review] Assets a fill booked
+    // in THIS heartbeat's Step 2 moved.  Step 2 books a fill into State with
+    // record_buy/record_sell, and Step 8 sets State to the wallet's balance;
+    // a take the wallet already showed at the last Step 8 is counted twice
+    // until this one, and Step 6 sized this heartbeat's ladders from that.
+    // Step 8 posts nothing on a pair trading one of these.  Cleared at the
+    // top of every heartbeat.
+    std::unordered_set<std::string> fill_moved_assets_;
     // [SEED-FAIL-CLOSED review round 2] Step 9f's "unverified" line has been
     // logged at WARN for the current episode; later heartbeats log at debug.
     bool drift_unverified_warned_{false};

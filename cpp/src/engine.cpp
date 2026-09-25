@@ -4319,6 +4319,9 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
     // [T3-08] Reset NHE accumulators for this cycle.
     nhe_net_inventory_change_ = 0.0;
     nhe_total_volume_         = 0.0;
+    // [SEED-FAIL-CLOSED review round 9] This heartbeat's fills only: set by
+    // Step 2, read by Step 8's pair loop, even when Step 2 does not run.
+    fill_moved_assets_.clear();
 
     // Initialize per-pair cycle state for all enabled pairs.
     // [T3-24] market_data_valid defaults to false; Step 1 sets it true
@@ -5653,6 +5656,19 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
     // [WALLET-LOAD 2026-08-04] Passes the block height for the fill-poll
     // age gate (a just-posted offer cannot have settled).
     auto new_fills = co_await offer_mgr_->detect_fills(block_height);
+
+    // [SEED-FAIL-CLOSED review round 9, #172's review] What each fill moved.
+    // detect_fills has booked it into State, which Step 8 also sets to the
+    // wallet's balance: if the wallet showed the take at the last Step 8 --
+    // it saw the block between Step 2 and Step 8, or the fill proof waited
+    // for the node -- the take now counts twice until this Step 8 reads the
+    // balance again.  Step 8 posts nothing on these assets' pairs meanwhile.
+    for (const auto& fill : new_fills) {
+        if (const PairConfig* fill_pc = find_pair_config(fill.pair_name)) {
+            fill_moved_assets_.insert(fill_pc->base_asset_id);
+            fill_moved_assets_.insert(fill_pc->quote_asset_id);
+        }
+    }
 
     // [S25 2026-08-24] Persist offers the wallet reports TERMINAL.
     //
@@ -14813,6 +14829,22 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         if (fee_filtered_tiers.empty()) {
             spdlog::info("[Engine] Step 8: {} all tiers filtered by pending "
                          "exposure projection", pair_name);
+            continue;
+        }
+
+        // [SEED-FAIL-CLOSED review round 9, #172's review] NOTHING NEW ON A
+        // PAIR WHOSE POSITION A FILL MOVED THIS HEARTBEAT.  Step 6 sized this
+        // ladder from State after Step 2 booked the fill, and State may count
+        // that take twice until this Step 8 reconciles it to the wallet
+        // (fill_moved_assets_).  The next heartbeat sizes from the reconciled
+        // position.  Only posting waits: the cancels above have run, and
+        // pulling a quote sizes nothing.
+        if (fill_moved_assets_.count(pair_cfg->base_asset_id) > 0
+            || fill_moved_assets_.count(pair_cfg->quote_asset_id) > 0) {
+            spdlog::info("[Engine] Step 8: {} posts nothing this heartbeat -- "
+                         "a fill booked in Step 2 moved a position it trades, "
+                         "and its ladder was sized before Step 8 reconciled "
+                         "that position to the wallet", pair_name);
             continue;
         }
 
