@@ -81,7 +81,9 @@ have corrected it.)
   takes down, on the asset's pairs, every offer created before that block,
   never one the pair loop posts afterwards. It forgets the asset once a pass
   has taken them all. The verifying heartbeat ends right after the drain,
-  before anything is posted.
+  before anything is posted. The drain takes every offer created at or
+  before that block (review round 8): after a restart within one peak, a
+  restored offer can carry the very height the first heartbeat verifies at.
 - **The drift corrector does nothing while any position is unverified** (review
   rounds 2 and 3). Round 2 stood Step 9f down only when no balance had been
   read at all. With some read and some not, the unread asset was simply
