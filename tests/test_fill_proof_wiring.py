@@ -35,6 +35,8 @@ STEP_PROCESS_FILLS = "asio::awaitable<void> Engine::step_process_fills(BlockHeig
 WALLET_COIN_RECORDS = "ChiaWalletRPC::get_coin_records_by_names(const std::vector<std::string>& names)"
 POLL_LOOP = "asio::awaitable<void> Engine::poll_loop_coro()"
 STARTUP_RECONCILE = "asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile("
+RETIRE_EXPIRED = "OfferManager::retire_expired_offers(BlockHeight current_block)"
+RECONCILE_OFFERS = "asio::awaitable<std::vector<std::string>> OfferManager::reconcile_offers("
 
 
 def _read(path: Path) -> str:
@@ -236,21 +238,49 @@ def test_the_proof_asks_the_node_only_while_the_engine_trusts_it():
 
 
 def test_one_failed_lookup_ends_the_lookups_for_the_call():
-    """A dead node or an unsynced wallet costs one failed lookup per heartbeat,
-    not one per CONFIRMED offer -- each failure spends its transport retries,
-    and the S14 escalation stops its sweep on the same failure."""
+    """A node or wallet that cannot answer -- a transport failure, or a reply
+    that cannot be read -- costs one failed lookup per heartbeat, not one per
+    CONFIRMED offer: each failure spends its transport retries, and the S14
+    escalation stops its sweep on the same failure.
+
+    [review #171, round 15] Not a lookup it refuses.  The wallet refuses a
+    request naming a coin it does not hold, and that answer costs one round
+    trip and is that offer's alone.  Latching on it let one offer, polled
+    first in unordered_map order every heartbeat, keep every later fill
+    unproven."""
     detect = _function_body(_source(OFFER_MANAGER), DETECT_FILLS)
     latch = detect.index("bool proof_lookup_failed = false;")
     assert latch < detect.rindex("for (const auto& rec : trade_records) {"), (
         "the latch belongs to the call, declared before the loop that books"
     )
-    asked = re.search(r"if \(proof_lookup_failed\) \{[^}]*\} else \{\s*"
-                      r"proof = co_await prove_fill_on_chain\(rec, proof_failure,\s*"
-                      r"proof_lookup_failed, asked_node\);\s*\}", _confirmed_branch())
-    assert asked, "no lookup may be sent once one has failed in this call"
+    asked = re.search(r"\} else if \(proof_lookup_failed\) \{[^}]*\} else \{\s*"
+                      r"ProofLookup lookup = ProofLookup::Answered;\s*"
+                      r"proof = co_await prove_fill_on_chain\(rec, proof_failure, lookup,\s*"
+                      r"asked_node\);\s*"
+                      r"if \(lookup == ProofLookup::Failed\) \{\s*"
+                      r"proof_lookup_failed = true;\s*\}\s*\}", _confirmed_branch())
+    assert asked, "no lookup once one has failed this call, and only a failed one latches"
+    assert detect.count("proof_lookup_failed = true;") == 2, (
+        "set by the two lookups, the CONFIRMED branch's and the re-proof's, and nowhere else"
+    )
     prove = _function_body(_source(OFFER_MANAGER), PROVE_ON_CHAIN)
-    handler = _block_after(prove, "catch (const std::exception& e) {")
-    assert "lookup_failed = true;" in handler, "a failed lookup must set the latch"
+    for stage, anchor in (("first", "fill_proof_node_->get_coin_records_by_names("),
+                          ("second", "fill_proof_node_->get_coin_records_by_parent_ids(")):
+        rest = prove[prove.index(anchor):]
+        refused_head = "catch (const rpc::ChiaRPCApplicationError& e) {"
+        failed_head = "catch (const std::exception& e) {"
+        assert rest.index(refused_head) < rest.index(failed_head), (
+            f"{stage} stage: a refusal is caught before the catch-all can take it"
+        )
+        refused = _block_after(rest, refused_head)
+        assert "lookup = ProofLookup::Refused;" in refused and "ProofLookup::Failed" not in refused, (
+            f"{stage} stage: a refused lookup is that offer's alone"
+        )
+        assert "co_return FillProofResult{};" in refused, f"{stage} stage: ...and proves nothing"
+        failed = _block_after(rest, failed_head)
+        assert "lookup = ProofLookup::Failed;" in failed, (
+            f"{stage} stage: a lookup that fails any other way sets the latch"
+        )
 
 
 def test_spent_together_books_only_with_the_takes_own_mark():
@@ -285,7 +315,7 @@ def test_spent_together_books_only_with_the_takes_own_mark():
     assert wallet < rest.index("prove_take_from_payments(coins, names, payments, amounts)")
     assert rest.index("if (ask_node) {") < node < rest.index("} else {") < wallet
     failed = _block_after(rest, "catch (const std::exception& e) {")
-    assert "lookup_failed = true;" in failed and "co_return FillProofResult{};" in failed, (
+    assert "lookup = ProofLookup::Failed;" in failed and "co_return FillProofResult{};" in failed, (
         "a second-stage lookup that fails is Unknown and trips the latch"
     )
     assert "co_return coins;" not in rest, "a SpentTogether verdict never leaves unsettled"
@@ -611,10 +641,14 @@ def test_a_cancels_status_is_proven_on_chain_before_it_is_acted_on():
         "a cancel in flight must be marked before the proof, on every path"
     )
     reproof = _block_after(loop, "if (reprove) {")
-    asked = re.search(r"if \(proof_lookup_failed\) \{[^}]*\} else \{\s*"
+    asked = re.search(r"ProofLookup reproof_lookup = ProofLookup::Answered;\s*"
+                      r"if \(proof_lookup_failed\) \{\s*reproof_lookup = ProofLookup::Failed;[^}]*"
+                      r"\} else \{\s*"
                       r"reproof = co_await prove_fill_on_chain\(rec, reproof_failure,\s*"
-                      r"proof_lookup_failed,\s*reproved_asked_node\);\s*\}", reproof)
-    assert asked, "asked once, and not at all once a lookup has failed this call"
+                      r"reproof_lookup,\s*reproved_asked_node\);\s*"
+                      r"if \(reproof_lookup == ProofLookup::Failed\) \{\s*"
+                      r"proof_lookup_failed = true;\s*\}\s*\}", reproof)
+    assert asked, "asked once, not at all once a lookup has failed this call, and only a failed one latches"
     settled = _block_after(reproof, "if (reproof.verdict == FillProof::Settled) {")
     assert re.search(r"reproved = reproof;\s*status = trade_status::kConfirmed;\s*\}$", settled), (
         "a take after all: booked by the CONFIRMED branch, from this proof"
@@ -624,8 +658,9 @@ def test_a_cancels_status_is_proven_on_chain_before_it_is_acted_on():
                         r"\|\| reproof\.verdict == FillProof::Dead\) \{\s*"
                         r"fill_proof_deferrals_\.erase\(trade_id\);\s*"
                         r"if \(reproof\.verdict == FillProof::Dead\) \{\s*"
-                        r"cancel_status_proven_\[trade_id\] = status;\s*\}\s*"
-                        r"\} else if \(held\) \{", reproof)
+                        r"cancel_status_proven_\[trade_id\] = status;\s*"
+                        r"\} else if \(status == trade_status::kCancelled\s*"
+                        r"&& expiry_retired_\.count\(trade_id\) == 0U\) \{", reproof)
     assert no_take, "no take: the status stands and any hold goes; only Dead is not asked again"
     held_unknown = _block_after(reproof, "} else if (held) {")
     assert _call_args(held_unknown, "handle_unproven_fill") == [[
@@ -633,7 +668,8 @@ def test_a_cancels_status_is_proven_on_chain_before_it_is_acted_on():
         "claimed_height", "current_block"]], "a held Unknown is deferred as a CONFIRMED offer's is"
     assert re.search(r"continue;\s*\}$", held_unknown), "...still held, and asked again next heartbeat"
     assert "fill_proof_deferrals_.erase(" not in held_unknown, "a held Unknown must not let the offer go"
-    transient = _block_after(reproof, "} else if (proof_lookup_failed) {")
+    # [round 15] Its own lookup, refused or failed, or an earlier one's latch.
+    transient = _block_after(reproof, "} else if (reproof_lookup != ProofLookup::Answered) {")
     assert re.search(r"continue;\s*\}$", transient), "after a failed lookup: asked again next heartbeat"
     assert "cancel_status_proven_" not in transient and "handle_unproven_fill" not in transient, (
         "a failed lookup is remembered as no answer, and holds nothing"
@@ -657,12 +693,91 @@ def test_a_cancels_status_is_proven_on_chain_before_it_is_acted_on():
                      _source(OFFER_MANAGER_HPP))
 
 
+def test_a_local_cancel_stays_tracked_while_it_can_be_taken():
+    """[review #171, round 15] A wallet CANCELLED with every maker coin unspent
+    is a local cancel -- emergency_cancel's last resort, or one made in the
+    wallet's own UI -- and the offer can still be taken.  In chia 2.7.4 the
+    wallet watches no CANCELLED trade's coins (get_trades_by_coin skips them),
+    so it would never report the take: only the fill proof can see it.
+    detect_fills proved such an offer Live once and then closed it, and
+    reconcile_offers closed it unproven.  Now it stays tracked, flagged
+    cancel_pending, and is proven every heartbeat until the chain shows it
+    taken or dead.  The one exception is an offer retire_expired_offers
+    cancelled locally after proving it expired at depth: nothing can take
+    it, so it closes on that verdict, which #157 needs."""
+    manager = _source(OFFER_MANAGER)
+    detect = _function_body(manager, DETECT_FILLS)
+    head = "for (const auto& rec : trade_records) {"
+    loop = _block_after(detect[detect.rindex(head):], head)
+    reproof = _block_after(loop, "if (reprove) {")
+    kept = re.search(r"\} else if \(status == trade_status::kCancelled\s*"
+                     r"&& expiry_retired_\.count\(trade_id\) == 0U\) \{", reproof)
+    assert kept, "a Live CANCELLED stays tracked, unless the expiry retire proved it expired"
+    live = reproof.index("reproof.verdict == FillProof::Live")
+    assert live < kept.start() < reproof.index("} else if (held) {"), (
+        "on a Live answer only: a Dead one is remembered, and closes it"
+    )
+    open_index = kept.end() - 1
+    block = reproof[open_index:_matching(reproof, open_index) + 1]
+    assert re.match(r"\{\s*state_->mark_cancel_pending\(trade_id\);", block), (
+        "flagged cancel_pending first, so nothing cancels it again"
+    )
+    assert re.search(r"continue;\s*\}$", block), (
+        "and kept: it never reaches the terminal branch, which removes it"
+    )
+    assert "cancel_status_proven_" not in block and "remove_offer" not in block, (
+        "nothing remembered, so it is proven again next heartbeat, and nothing removed"
+    )
+    # The expiry retire records what it proved, and nothing else does.
+    retire = _function_body(manager, RETIRE_EXPIRED)
+    local = retire.index("co_await cancel_offer_charged(po.offer_id, 0, /*secure=*/false);")
+    recorded = re.search(r"state_->mark_cancel_pending\(po\.offer_id\);\s*"
+                         r"expiry_retired_\.insert\(po\.offer_id\);\s*"
+                         r"retired\.push_back\(po\.offer_id\);", retire)
+    assert recorded and local < recorded.start(), (
+        "recorded once its local cancel was accepted, with the retire itself"
+    )
+    assert manager.count("expiry_retired_.insert(") == 1, (
+        "only the expiry retire, which proved the offer expired, records one"
+    )
+    pruned = re.search(r"for \(auto it = expiry_retired_\.begin\(\); it != expiry_retired_\.end\(\);\) \{\s*"
+                       r"it = pending_map\.count\(\*it\) \? std::next\(it\) "
+                       r": expiry_retired_\.erase\(it\);\s*\}", detect)
+    assert pruned and pruned.start() < detect.rindex(head), "pruned before the loop, as the deferrals are"
+    assert "expiry_retired_.clear();" in _block_after(detect, "if (pending_offers.empty()) {")
+    assert re.search(r"std::unordered_set<std::string>\s+expiry_retired_;", _source(OFFER_MANAGER_HPP))
+    # Reconciliation leaves a CANCELLED to detect_fills, in the scan and off it.
+    reconcile = _function_body(manager, RECONCILE_OFFERS)
+    scan = re.search(r"if \(status == trade_status::kCancelled\) \{\s*"
+                     r"state_->mark_cancel_pending\(trade_id\);\s*"
+                     r"\} else if \(status == trade_status::kFailed\) \{\s*"
+                     r"state_->remove_offer\(trade_id\);", reconcile)
+    assert scan, "in the scan: a CANCELLED is flagged and left to detect_fills, a FAILED removed"
+    off_scan = re.search(r"if \(status == trade_status::kCancelled\) \{\s*"
+                         r"state_->mark_cancel_pending\(offer_id\);", reconcile)
+    assert off_scan, "off the scan: a CANCELLED is flagged and left to detect_fills"
+    open_index = reconcile.index("{", off_scan.start())
+    close_index = _matching(reconcile, open_index)
+    left = reconcile[open_index:close_index + 1]
+    assert re.search(r"continue;\s*\}$", left) and "remove_offer" not in left, (
+        "...and never reaches the removal"
+    )
+    assert re.match(r"\s*if \(status != trade_status::kFailed\) \{", reconcile[close_index + 1:]), (
+        "then only a FAILED goes on to be removed"
+    )
+    assert reconcile.count("state_->remove_offer(") == 2, "the two FAILED removals, and no other"
+
+
 def test_a_malformed_stage_one_reply_is_a_failed_lookup():
     """[review #171, round 7] Both first-stage wrappers -- the node's and the
     wallet's get_coin_records_by_names -- throw on a reply without its
     coin_records list, as the two second-stage wrappers do.  An empty list
     read from a malformed reply was Unknown without tripping the latch, so
-    every later CONFIRMED offer in the call asked again."""
+    every later CONFIRMED offer in the call asked again.
+
+    [round 15] Still a failure, not a refusal: the wrappers throw a plain
+    ChiaRPCError, which the ChiaRPCApplicationError catch of a refusal does
+    not take."""
     rpc = _source(CHIA_RPC)
     for signature in ("ChiaFullNodeRPC::get_coin_records_by_names(", WALLET_COIN_RECORDS):
         body = _function_body(rpc, signature)
@@ -674,7 +789,7 @@ def test_a_malformed_stage_one_reply_is_a_failed_lookup():
     prove = _function_body(_source(OFFER_MANAGER), PROVE_ON_CHAIN)
     stage1 = prove.index("fill_proof_node_->get_coin_records_by_names(")
     caught = _block_after(prove[stage1:], "catch (const std::exception& e) {")
-    assert "lookup_failed = true;" in caught, "a first-stage throw trips the latch"
+    assert "lookup = ProofLookup::Failed;" in caught, "a first-stage throw trips the latch"
 
 
 def test_the_wallet_fallback_refuses_while_unsynced():

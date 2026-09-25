@@ -233,7 +233,12 @@ can pass for an offer nobody took.
   either way. The offer stays tracked and is asked about again next heartbeat.
   The first deferral and every 20th are logged. After one lookup fails,
   nothing more is asked that heartbeat, as the S14 escalation does: each
-  failure spends its transport retries.
+  failure spends its transport retries. A lookup the node or wallet refuses
+  is different (review round 15). The wallet refuses a request that names a
+  coin it does not hold. The refusal costs one round trip and is that
+  offer's alone, so the offers after it are still asked. The fill poll visits
+  offers in hash-map order, so the same offer could otherwise have come
+  first every heartbeat and kept every later fill unproven.
 - While the wallet reports an offer CONFIRMED and the proof has not settled
   it, the engine will not cancel it. Chia's secure cancel sets PENDING_CANCEL
   over any status, and an insecure one sets CANCELLED. So a cancel sent during
@@ -285,6 +290,20 @@ can pass for an offer nobody took.
   otherwise have sent a second secure cancel for the same coins. And only a
   Dead answer is remembered: a Live offer can still be taken, so it is asked
   again next heartbeat, one lookup, until its cancel lands.
+  And an offer the wallet reports CANCELLED while every maker coin is unspent
+  stays tracked (review round 15). That is a local cancel: the last resort of
+  the emergency cancel ladder, or one made in the wallet's own UI. The offer
+  can still be taken, and the wallet watches no CANCELLED trade's coins
+  (chia 2.7.4), so it would never report the take. detect_fills used to
+  close such an offer after one Live proof. It now stays tracked, flagged
+  cancel_pending, and is proven every heartbeat until the chain shows it
+  taken (booked then) or dead (closed then). The one exception is an offer
+  the expiry retire (`ttl_cancel_mode: expire`) cancelled locally after
+  proving it expired: nothing can take it, so it still closes on that
+  verdict. The engine remembers those only until it restarts, so after a
+  restart such an offer stays tracked until one of its coins is spent.
+  Periodic reconciliation now leaves a CANCELLED offer to detect_fills the
+  same way, instead of removing it unproven.
   Cancel All's wallet-wide sweep skips every trade the wallet calls
   completed, so it never reports a held offer as cancelled. Such an offer goes
   through the guarded per-offer path instead: it is cancelled there if the

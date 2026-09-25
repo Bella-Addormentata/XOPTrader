@@ -1432,21 +1432,43 @@ private:
     /// overwrite it first, and a restart forgets every hold.  So detect_fills
     /// proves an offer the first time it shows each cancel status, and this
     /// keeps it from asking again every heartbeat.  Pruned with the deferrals
-    /// when the offer leaves State.
+    /// when the offer leaves State.  [round 14] Only a final answer is kept:
+    /// a Live offer can still be taken, so it is asked every heartbeat.
     std::unordered_map<std::string, int> cancel_status_proven_;
+
+    /// [review #171 round 15] Offers retire_expired_offers() cancelled
+    /// locally after proving them expired at depth.  detect_fills keeps an
+    /// offer the wallet reports CANCELLED tracked while the chain shows every
+    /// maker coin unspent -- a local cancel leaves it takeable, and the wallet
+    /// watches no CANCELLED trade's coins -- but not one of these: nothing
+    /// can take it.  In memory only, so after a restart such an offer stays
+    /// tracked until one of its coins is spent, which is the safe direction.
+    /// Pruned with the deferrals when the offer leaves State.
+    std::unordered_set<std::string> expiry_retired_;
 
     /// Whether cancel_offer_charged() must refuse `trade_id`: an offer under
     /// proof, unless its latest proof makes it cancellable.
     [[nodiscard]] bool cancel_withheld_for_proof(const std::string& trade_id) const;
 
+    /// [review #171 round 15] How prove_fill_on_chain()'s lookups went.
+    enum class ProofLookup : std::uint8_t {
+        Answered,  ///< none failed: the verdict is the answer's
+        Refused,   ///< the node or wallet refused this request
+                   ///< (ChiaRPCApplicationError) -- the wallet refuses one
+                   ///< naming a coin it does not hold.  This offer's alone.
+        Failed,    ///< it could not answer: a transport failure, or a reply
+                   ///< that could not be read.  The next lookup would fail the
+                   ///< same way, so detect_fills asks nothing more that call.
+    };
+
     /// Ask the chain what a CONFIRMED trade record's maker coins prove
     /// (execution::prove_fill).  Never throws and never logs: a failure is
     /// FillProof::Unknown, with the reason in `failure` for the caller's
-    /// rate-limited line.  `lookup_failed` is set when the node or wallet
-    /// could not be asked at all, so detect_fills asks nothing more that call.
+    /// rate-limited line, and `lookup` set to how the lookup failed.  It is
+    /// left alone when none did.
     asio::awaitable<FillProofResult> prove_fill_on_chain(const json& trade_record,
                                                          std::string& failure,
-                                                         bool& lookup_failed,
+                                                         ProofLookup& lookup,
                                                          bool& asked_node);
 
     /// A CONFIRMED offer whose proof is not Settled: log it and, when the
