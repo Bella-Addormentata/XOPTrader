@@ -25,6 +25,7 @@ REPO = Path(__file__).resolve().parents[1]
 ENGINE = REPO / "cpp" / "src" / "engine.cpp"
 OFFER_MANAGER = REPO / "cpp" / "src" / "execution" / "offer_manager.cpp"
 OFFER_MANAGER_HPP = REPO / "cpp" / "include" / "xop" / "execution" / "offer_manager.hpp"
+FILL_PROOF_HPP = REPO / "cpp" / "include" / "xop" / "execution" / "fill_proof.hpp"
 CHIA_RPC = REPO / "cpp" / "src" / "rpc" / "chia_rpc.cpp"
 
 DETECT_FILLS = "asio::awaitable<std::vector<Fill>> OfferManager::detect_fills("
@@ -548,11 +549,15 @@ def test_a_cancelled_offer_is_closed_by_the_sweep_only_once_the_chain_says_so():
                        r"out\.closed\.push_back\(oid\);\s*\+\+closed;\s*\} else \{", cancelled)
     assert closed and asked.end() < closed.start(), "only a taken offer, or one dead at depth, is closed"
     other = cancelled[closed.end() - 1:_matching(cancelled, closed.end() - 1) + 1]
-    assert re.search(r"if \(proof\.verdict == FillProof::Live\) \{\s*"
-                     r"local_cancel_live_\.insert\(oid\);", other), "a Live one is remembered as still takeable"
-    assert re.search(r"\} else if \(proof\.verdict == FillProof::Dead\) \{\s*"
-                     r"local_cancel_live_\.insert\(oid\);", other), (
-        "a shallow Dead one is remembered too, so every retry keeps it outstanding")
+    # [round 20] Whatever the answer, one it does not close is flagged and
+    # remembered first, so every retry keeps it outstanding and nothing
+    # cancels it again: Live, a shallow Dead, or not proven.
+    assert re.match(r"\{\s*state_->mark_cancel_pending\(oid\);\s*local_cancel_live_\.insert\(oid\);\s*"
+                    r"if \(proof\.verdict == FillProof::Live\) \{", other), (
+        "flagged and remembered before its answer is read")
+    assert other.count("local_cancel_live_.insert(oid);") == 1
+    assert re.search(r'\} else if \(proof\.verdict == FillProof::Dead\) \{\s*takeable_why = "dead at block "',
+                     other), "a shallow Dead one is told apart in the report"
     assert re.search(r"\+\+fill_poll_heartbeat_;\s*latest_fill_poll_block_ = current_block;",
                      _function_body(manager, DETECT_FILLS)), "the block the depth is judged at"
     assert manager.count("latest_fill_poll_block_ =") == 1
@@ -572,6 +577,10 @@ def test_a_cancelled_offer_is_closed_by_the_sweep_only_once_the_chain_says_so():
     block = ids[live.end() - 1:_matching(ids, live.end() - 1) + 1]
     assert re.search(r"out\.failed\.push_back\(oid\);\s*continue;\s*\}$", block), "outstanding, nothing sent"
     assert "already_pending" not in block and "cancel_offer_charged" not in block
+    # [round 20] Verdict-neutral: a shallow Dead one is not "still takeable".
+    assert re.search(r'const std::string why = "the wallet reports " \+ oid\.substr\(0, 12\)\s*'
+                     r'\+ " CANCELLED, but the chain has not yet shown it taken, or dead "\s*'
+                     r'"at confirmation depth";', block), "the report names what is not yet proven"
     # detect_fills remembers what it proves, and forgets it on a Dead or taken proof.
     detect = _function_body(manager, DETECT_FILLS)
     assert re.search(r"state_->mark_cancel_pending\(trade_id\);\s*local_cancel_live_\.insert\(trade_id\);", detect), (
@@ -977,6 +986,98 @@ def test_a_local_cancel_stays_tracked_while_it_can_be_taken():
         "then only a FAILED goes on to be removed"
     )
     assert reconcile.count("state_->remove_offer(") == 2, "the two FAILED removals, and no other"
+
+
+def test_a_wallet_cancelled_offer_is_unresolved_from_the_first_sight():
+    """[review #171, round 20] A CANCELLED offer was flagged cancel_pending, and
+    remembered as no cancel in flight (local_cancel_live_), only on a Live
+    answer.  A lookup that failed, an answer that settled nothing, or a
+    shallow Dead left it unflagged or unremembered, so a TTL or reprice path
+    could cancel it again, or cancel_ids report it as a cancel in flight and
+    let a shutdown retry drop it unproven.  Now every CANCELLED offer is
+    flagged and remembered from the first sight of that status, before any
+    proof, until the chain shows it taken or dead at depth -- except one the
+    expiry retire cancelled, which closes on a Live answer."""
+    manager = _source(OFFER_MANAGER)
+    detect = _function_body(manager, DETECT_FILLS)
+    head = "for (const auto& rec : trade_records) {"
+    loop = _block_after(detect[detect.rindex(head):], head)
+    pending = re.search(r"if \(status == trade_status::kPendingCancel\) \{\s*"
+                        r"state_->mark_cancel_pending\(trade_id\);\s*\}", loop)
+    mark = re.search(r"if \(status == trade_status::kCancelled "
+                     r"&& expiry_retired_\.count\(trade_id\) == 0U\) \{\s*"
+                     r"state_->mark_cancel_pending\(trade_id\);\s*"
+                     r"local_cancel_live_\.insert\(trade_id\);\s*\}", loop)
+    assert pending and mark, "a CANCELLED is flagged and remembered, as a PENDING_CANCEL is flagged"
+    assert pending.end() <= mark.start() < loop.index("if (reprove) {"), (
+        "before any proof, so no answer -- or the lack of one -- can leave it unmarked"
+    )
+    # Left only by a take or a Dead proof at depth (round 19), or with the
+    # offer, when it leaves State.
+    reproof = _block_after(loop, "if (reprove) {")
+    assert reproof.count("local_cancel_live_.erase(") == 1
+    assert re.search(r"if \(dead_at_depth \|\| reproof\.verdict == FillProof::Settled\) \{\s*"
+                     r"local_cancel_live_\.erase\(trade_id\);\s*\}", reproof)
+    assert detect.count("local_cancel_live_.erase(") == 2, "that erase, and the prune"
+
+
+def test_a_dead_offer_left_pending_cancel_is_closed_at_depth():
+    """[review #172] A PENDING_CANCEL offer proven Dead at depth was only
+    remembered: its status stood, and the terminal branch removes only
+    CANCELLED and FAILED, so the offer stayed tracked for as long as the
+    wallet said PENDING_CANCEL -- for good when the cancel spends a coin that
+    another spend already took (2026-09-21).  Now it is closed and reported
+    dead_on_chain through handle_unproven_fill, as a CONFIRMED offer dead at
+    depth is, and the record and both logs name the status the wallet
+    reported."""
+    manager = _source(OFFER_MANAGER)
+    detect = _function_body(manager, DETECT_FILLS)
+    head = "for (const auto& rec : trade_records) {"
+    loop = _block_after(detect[detect.rindex(head):], head)
+    reproof = _block_after(loop, "if (reprove) {")
+    branch = re.search(r"\} else if \(dead_at_depth && status == trade_status::kPendingCancel\) \{", reproof)
+    assert branch, "a PENDING_CANCEL dead at depth has a branch of its own"
+    assert (reproof.index("if (reproof.verdict == FillProof::Settled) {") < branch.start()
+            < reproof.index("} else if (reproof.verdict == FillProof::Live || dead_at_depth) {")), (
+        "after a take is booked, and before the branch that would only remember it"
+    )
+    block = reproof[branch.end() - 1:_matching(reproof, branch.end() - 1) + 1]
+    assert _call_args(block, "handle_unproven_fill") == [[
+        "trade_id", "po", "reproof", "reproof_failure", "reproved_asked_node", "0U",
+        "current_block", '"PENDING_CANCEL"']], "closed as a CONFIRMED offer dead at depth is"
+    assert re.search(r"continue;\s*\}$", block), "and never reaches the terminal branch"
+    assert "cancel_status_proven_" not in block
+    handler = _function_body(manager, HANDLE_UNPROVEN)
+    assert "std::string_view wallet_status)" in handler, "the wallet's status is an argument"
+    assert _call_args(handler, "last_dead_offers_.push_back") == [[
+        "DeadOffer{trade_id, po.pair_name, proof.height, proof.coins, proof.unspent, "
+        "proof.spent_together, std::string(wallet_status)}"]], "and goes with the dead offer"
+    assert handler.count("the wallet reports {}, ") == 2 and "reports CONFIRMED" not in handler
+    hpp = _source(OFFER_MANAGER_HPP)
+    assert re.search(r'BlockHeight current_block,\s*std::string_view wallet_status = "CONFIRMED"\);', hpp), (
+        "CONFIRMED unless a caller says otherwise"
+    )
+    assert re.search(r'std::string\s+wallet_status\{"CONFIRMED"\};', hpp)
+    step = _function_body(_source(ENGINE), STEP_PROCESS_FILLS)
+    writes = _block_after(step, WRITE_LOOP)
+    assert "the wallet reported it {}, but " in writes and "dead.wallet_status," in writes, (
+        "the engine's record names what the wallet reported"
+    )
+
+
+def test_only_the_wallets_missing_coin_refusal_is_one_offers():
+    """[review #171, round 20] The refusal that is one offer's own was matched
+    by "not found" anywhere in the text, which a refusal that is every
+    offer's -- an unknown method's or endpoint's -- can say as well: it would
+    skip the call-wide latch and repeat a doomed lookup for every offer.  Now
+    only the wallet's own shape counts, the list of coin ids and then its
+    end (gtest CoinLookupRefusal pins the behaviour)."""
+    body = _block_after(_source(FILL_PROOF_HPP),
+                        "constexpr bool coin_lookup_refusal_is_offer_local(std::string_view error) noexcept")
+    assert 'constexpr std::string_view head = "Coin ID\'s: [";' in body
+    assert 'constexpr std::string_view tail = "] not found.";' in body
+    assert re.search(r"error\.find\(tail, at \+ head\.size\(\)\)", body), "the list, then its end"
+    assert 'find("not found")' not in body
 
 
 def test_a_malformed_stage_one_reply_is_a_failed_lookup():

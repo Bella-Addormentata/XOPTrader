@@ -743,6 +743,15 @@ TEST(CoinLookupRefusal, OnlyAMissingCoinIsOneOffersRefusal)
     // rpc_post's text for a refusal that names no error, and nothing at all.
     EXPECT_FALSE(ex::coin_lookup_refusal_is_offer_local("RPC returned success=false"));
     EXPECT_FALSE(ex::coin_lookup_refusal_is_offer_local(""));
+    // [review #171 round 20] Matched by its shape, not by "not found" alone:
+    // a refusal that is every offer's can say that too.
+    EXPECT_FALSE(ex::coin_lookup_refusal_is_offer_local("Endpoint not found"));
+    EXPECT_FALSE(ex::coin_lookup_refusal_is_offer_local(
+        "method get_coin_records_by_names not found"));
+    EXPECT_FALSE(ex::coin_lookup_refusal_is_offer_local("Coin ID's: not found."));
+    EXPECT_FALSE(ex::coin_lookup_refusal_is_offer_local("] not found. Coin ID's: ['0x01'"));
+    EXPECT_TRUE(ex::coin_lookup_refusal_is_offer_local(
+        "Coin ID's: ['0x01', '0x02'] not found."));
 }
 
 }  // namespace

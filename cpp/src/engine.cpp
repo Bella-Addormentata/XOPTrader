@@ -5626,7 +5626,8 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
     }
 
     // [FILL-PROOF 2026-09-23] Offers the wallet reported CONFIRMED that the
-    // chain proved were never taken.  detect_fills booked nothing for them and
+    // chain proved were never taken -- [review #172] or PENDING_CANCEL, under a
+    // cancel that may never land.  detect_fills booked nothing for them and
     // stopped tracking them; record how they ended.  'cancelled' is the status
     // of an offer that ended without a fill, and the closure event's reason
     // says this one died on-chain.  [review #171 round 9] The row takes that
@@ -5658,9 +5659,10 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
                                            static_cast<BlockHeight>(dead.spent_height),
                                            /*wallet_says_cancelled=*/false);
             spdlog::error("[Engine] Step 2: {} ({}) recorded cancelled "
-                          "(dead_on_chain): the wallet reported it CONFIRMED, but "
+                          "(dead_on_chain): the wallet reported it {}, but "
                           "{} -- no fill was booked",
                           dead.offer_id.substr(0, 12), dead.pair_name,
+                          dead.wallet_status,
                           dead.spent_together
                               ? "all " + std::to_string(dead.coins)
                                     + " maker coins were spent in one block with no "

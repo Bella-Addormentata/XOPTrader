@@ -63,6 +63,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -335,6 +336,9 @@ public:
         std::size_t   coins{0};          ///< maker coins examined
         std::size_t   unspent{0};        ///< of them, still unspent
         bool          spent_together{false};  ///< all spent in one block, not by a take
+        /// [review #172] What the wallet reported: CONFIRMED, or
+        /// PENDING_CANCEL under a cancel that may never land.
+        std::string   wallet_status{"CONFIRMED"};
     };
 
     /// [FILL-PROOF] Offers the most recent detect_fills() proved dead.  It
@@ -1467,6 +1471,10 @@ private:
     /// chain last showed Live: cancelled only locally, and still takeable.
     /// [round 19] Or one Cancel All's re-read found dead by a spend not yet
     /// confirmation_depth_blocks deep, which a reorganisation could undo.
+    /// [round 20] In all, every offer the wallet reports CANCELLED that the
+    /// chain has not yet shown closed, from the first sight of that status
+    /// (except one the expiry retire cancelled): detect_fills and the re-read
+    /// both add it, whatever a proof in between says.
     /// State flags them cancel_pending so nothing re-cancels them in the
     /// normal run, but no cancel is in flight for them, so cancel_ids
     /// reports one outstanding rather than already pending -- a Cancel All
@@ -1510,11 +1518,15 @@ private:
     /// A CONFIRMED offer whose proof is not Settled: log it and, when the
     /// proof is a Dead verdict at confirmation depth, stop tracking it and
     /// report it in last_dead_offers_.  Otherwise record the proof in
-    /// fill_proof_deferrals_.  Books nothing, ever.
+    /// fill_proof_deferrals_.  Books nothing, ever.  [review #172]
+    /// `wallet_status` is what the wallet reports, for the log and the
+    /// dead-offer record: PENDING_CANCEL for an offer dead at depth under a
+    /// cancel that may never land.
     void handle_unproven_fill(const std::string& trade_id, const PendingOffer& po,
                               const FillProofResult& proof, const std::string& failure,
                               bool from_node, std::uint64_t claimed_height,
-                              BlockHeight current_block);
+                              BlockHeight current_block,
+                              std::string_view wallet_status = "CONFIRMED");
 
     /// [S46 2026-09-02] Result of the DB -> wallet leg of the most recent
     /// startup_reconcile().  See last_db_leg().

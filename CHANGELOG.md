@@ -193,6 +193,14 @@ can pass for an offer nobody took.
   reported outstanding, and stays so on every retry. And `detect_fills` no
   longer forgets that a locally cancelled offer was takeable until its spend
   is that deep.
+  From review round 20, an offer the wallet reports CANCELLED is flagged and
+  remembered from the first sight of that status until the chain shows it
+  taken or dead at that depth, whatever a proof in between says, so no retry
+  reports it as a cancel in flight. One the chain proves dead at that depth
+  while the wallet still reports PENDING_CANCEL is closed as `dead_on_chain`,
+  since the cancel it waits on may never land. And a coin lookup's refusal
+  counts as one offer's only in the wallet's words for a missing coin,
+  `Coin ID's: [...] not found.`.
   Cancel All's wallet-wide sweep skips every trade the wallet calls
   completed, so it never reports a held offer as cancelled. Such an offer goes
   through the guarded per-offer path instead: it is cancelled there if the

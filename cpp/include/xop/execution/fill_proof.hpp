@@ -491,10 +491,17 @@ template <class NameOf>
 /// to a full node." -- and when a coin it was asked about is not in its
 /// store: "Coin ID's: [...] not found.".  Only that last one is one offer's.
 /// Any other refusal, known or not, would refuse the next offer's lookup the
-/// same way.
+/// same way.  [review #171 round 20] So it is matched by its shape -- the
+/// list of coin ids, then "not found." -- and not by "not found" alone,
+/// which a refusal that is every offer's, an unknown method's or
+/// endpoint's, can say as well.
 [[nodiscard]] constexpr bool coin_lookup_refusal_is_offer_local(std::string_view error) noexcept
 {
-    return error.find("not found") != std::string_view::npos;
+    constexpr std::string_view head = "Coin ID's: [";
+    constexpr std::string_view tail = "] not found.";
+    const auto at = error.find(head);
+    return at != std::string_view::npos
+        && error.find(tail, at + head.size()) != std::string_view::npos;
 }
 
 /// [review #171, round 2] May an offer the wallet reports CONFIRMED be
