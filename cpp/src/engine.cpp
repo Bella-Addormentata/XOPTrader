@@ -2685,6 +2685,8 @@ asio::awaitable<void> Engine::poll_loop_coro()
                 // any DB-pending row, flagged cancel_pending, and
                 // detect_fills proves each the first time it polls it --
                 // booking a take, and otherwise closing it as the wallet says.
+                // [round 15] Except while every maker coin is unspent: a
+                // local cancel, still takeable, which stays tracked.
                 if (!leg.cancelled_unproven.empty()) {
                     cancelled_unproven = leg.cancelled_unproven;
                     spdlog::warn("[Engine] [S46] {} DB-pending offer(s) the "

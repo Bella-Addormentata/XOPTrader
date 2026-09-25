@@ -686,7 +686,11 @@ OfferManager::retire_expired_offers(BlockHeight current_block)
         }
         // cancel_pending, not removed: only the wallet's CANCELLED verdict,
         // seen by detect_fills, completes the offer_log row (#157).
+        // [review #171 round 15] detect_fills keeps any other local cancel
+        // tracked while its coins are unspent.  This one is proven expired
+        // at depth, so nothing can take it, and it closes on that verdict.
         state_->mark_cancel_pending(po.offer_id);
+        expiry_retired_.insert(po.offer_id);
         retired.push_back(po.offer_id);
         logger_->info("[offer-expiry] retired {} ({} {} tier {}) at block {}: "
                       "max_time={} chain_time_at_depth={} (+{}s) -- "
@@ -1385,6 +1389,7 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
         fill_poll_pending_counts_.clear();
         fill_proof_deferrals_.clear();
         cancel_status_proven_.clear();
+        expiry_retired_.clear();
         co_return fills;
     }
 
@@ -1404,6 +1409,9 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
     }
     for (auto it = cancel_status_proven_.begin(); it != cancel_status_proven_.end();) {
         it = pending_map.count(it->first) ? std::next(it) : cancel_status_proven_.erase(it);
+    }
+    for (auto it = expiry_retired_.begin(); it != expiry_retired_.end();) {
+        it = pending_map.count(*it) ? std::next(it) : expiry_retired_.erase(it);
     }
     for (auto it = fill_proof_deferrals_.begin(); it != fill_proof_deferrals_.end();) {
         it = pending_map.count(it->first) ? std::next(it) : fill_proof_deferrals_.erase(it);
@@ -1586,6 +1594,8 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
     }
 
     // [FILL-PROOF] Set by the first coin lookup that fails; see below.
+    // [review #171 round 15] Not by one the node or wallet refuses, which is
+    // that offer's alone.
     bool proof_lookup_failed = false;
     for (const auto& rec : trade_records) {
         // Extract trade_id and status from the record.
@@ -1631,9 +1641,18 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
         //     released, and the offer is handled as that status, as before.
         //     [round 14] Only Dead is remembered: a Live offer can still be
         //     taken, so it is asked again next heartbeat;
+        //     [round 15] and a Live offer the wallet calls CANCELLED is not
+        //     closed.  Every maker coin is unspent, so it was cancelled
+        //     locally -- emergency_cancel's last resort, or the wallet's own
+        //     UI -- and can still be taken, while the wallet watches no
+        //     CANCELLED trade's coins (chia 2.7.4 get_trades_by_coin) and
+        //     would never report the take.  It stays tracked, cancel_pending,
+        //     unless retire_expired_offers proved it expired before it
+        //     cancelled it: nothing can take that one;
         //   - Unknown, held: still held, and asked again next heartbeat, as a
         //     CONFIRMED offer would be;
-        //   - Unknown, not held, after a lookup failed: asked again next
+        //   - Unknown, not held, after a lookup failed -- its own, refused or
+        //     failed, or an earlier one this heartbeat: asked again next
         //     heartbeat, and its status waits;
         //   - Unknown otherwise: the chain can say no more, so the status
         //     stands.  An offer never seen CONFIRMED is not held on a question
@@ -1661,13 +1680,18 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
         if (reprove) {
             std::string reproof_failure;
             FillProofResult reproof;
+            ProofLookup reproof_lookup = ProofLookup::Answered;
             if (proof_lookup_failed) {
+                reproof_lookup = ProofLookup::Failed;
                 reproof_failure = "an earlier coin lookup this heartbeat failed -- "
                                   "not asked again until the next one";
             } else {
                 reproof = co_await prove_fill_on_chain(rec, reproof_failure,
-                                                       proof_lookup_failed,
+                                                       reproof_lookup,
                                                        reproved_asked_node);
+                if (reproof_lookup == ProofLookup::Failed) {
+                    proof_lookup_failed = true;
+                }
             }
             if (reproof.verdict == FillProof::Settled) {
                 logger_->warn("[FILL-PROOF] {} ({}): the wallet reports it {}, but "
@@ -1689,6 +1713,18 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
                 // lands or its status changes.
                 if (reproof.verdict == FillProof::Dead) {
                     cancel_status_proven_[trade_id] = status;
+                } else if (status == trade_status::kCancelled
+                           && expiry_retired_.count(trade_id) == 0U) {
+                    // [review #171 round 15] Cancelled locally and still
+                    // takeable: tracked until the chain shows it taken
+                    // (booked) or dead (closed), and cancel_pending, so
+                    // nothing cancels it again meanwhile.
+                    state_->mark_cancel_pending(trade_id);
+                    logger_->debug("[FILL-PROOF] {} ({}): the wallet reports it "
+                                   "CANCELLED, but every maker coin is unspent -- a "
+                                   "local cancel, still takeable; kept tracked",
+                                   trade_id.substr(0, 12), po.pair_name);
+                    continue;
                 }
             } else if (held) {
                 std::uint64_t claimed_height = 0;
@@ -1699,7 +1735,7 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
                 handle_unproven_fill(trade_id, po, reproof, reproof_failure,
                                      reproved_asked_node, claimed_height, current_block);
                 continue;
-            } else if (proof_lookup_failed) {
+            } else if (reproof_lookup != ProofLookup::Answered) {
                 logger_->debug("[FILL-PROOF] {} ({}): a coin lookup failed this "
                                "heartbeat -- its cancel status is proven next "
                                "heartbeat", trade_id.substr(0, 12), po.pair_name);
@@ -1720,6 +1756,12 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
                 // After one lookup fails, the rest of this call asks nothing:
                 // each failed attempt spends its transport retries, and the
                 // S14 escalation stops its sweep on the same failure.
+                // [review #171 round 15] Not after one the node or wallet
+                // refuses -- the wallet refuses a request naming a coin it
+                // does not hold.  That costs one round trip and is this
+                // offer's alone, and offers are polled in unordered_map
+                // order: the same one could come first every heartbeat and
+                // keep every fill after it unproven.
                 std::string proof_failure;
                 FillProofResult proof;
                 bool asked_node = false;
@@ -1731,8 +1773,12 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
                     proof_failure = "an earlier coin lookup this heartbeat failed -- "
                                     "not asked again until the next one";
                 } else {
-                    proof = co_await prove_fill_on_chain(rec, proof_failure,
-                                                         proof_lookup_failed, asked_node);
+                    ProofLookup lookup = ProofLookup::Answered;
+                    proof = co_await prove_fill_on_chain(rec, proof_failure, lookup,
+                                                         asked_node);
+                    if (lookup == ProofLookup::Failed) {
+                        proof_lookup_failed = true;
+                    }
                 }
                 if (proof.verdict != FillProof::Settled) {
                     std::uint64_t claimed_height = 0;
@@ -1951,7 +1997,7 @@ void OfferManager::set_fill_proof_node(std::shared_ptr<rpc::ChiaFullNodeRPC> nod
 
 asio::awaitable<FillProofResult>
 OfferManager::prove_fill_on_chain(const json& trade_record, std::string& failure,
-                                  bool& lookup_failed, bool& asked_node)
+                                  ProofLookup& lookup, bool& asked_node)
 {
     // The escalation's adapter shape: any throw is "cannot hash", which voids
     // the whole name list, which proves nothing.
@@ -1982,8 +2028,16 @@ OfferManager::prove_fill_on_chain(const json& trade_record, std::string& failure
             // Refuses until synced -- the window the wallet mislabels in.
             records = co_await wallet_->get_coin_records_by_names(names);
         }
+    } catch (const rpc::ChiaRPCApplicationError& e) {
+        // [review #171 round 15] An answer: this request refused, as the
+        // wallet refuses one naming a coin it does not hold.  This offer's
+        // alone -- the call's other offers are still asked.
+        lookup = ProofLookup::Refused;
+        failure = std::string{"the "} + (ask_node ? "full node" : "wallet")
+                  + " refused to list its maker coins: " + e.what();
+        co_return FillProofResult{};
     } catch (const std::exception& e) {
-        lookup_failed = true;
+        lookup = ProofLookup::Failed;
         failure = std::string{"the "} + (ask_node ? "full node" : "wallet")
                   + " could not list its maker coins: " + e.what();
         co_return FillProofResult{};
@@ -2035,8 +2089,17 @@ OfferManager::prove_fill_on_chain(const json& trade_record, std::string& failure
                 co_await wallet_->get_coin_records_at_height(coins.height, amounts);
             proof = prove_take_from_payments(coins, names, payments, amounts);
         }
+    } catch (const rpc::ChiaRPCApplicationError& e) {
+        // [review #171 round 15] Refused, as at the first stage.
+        lookup = ProofLookup::Refused;
+        failure = std::string{"every maker coin was spent at block "}
+                  + std::to_string(coins.height) + ", but the "
+                  + (ask_node ? "full node refused to list their children"
+                              : "wallet refused to list the payments at that height")
+                  + ": " + e.what();
+        co_return FillProofResult{};
     } catch (const std::exception& e) {
-        lookup_failed = true;
+        lookup = ProofLookup::Failed;
         failure = std::string{"every maker coin was spent at block "}
                   + std::to_string(coins.height) + ", but the "
                   + (ask_node ? "full node could not list their children"
@@ -3807,8 +3870,15 @@ asio::awaitable<std::vector<std::string>> OfferManager::reconcile_offers(
             }
 
             // Detected terminal state that we missed during normal polling.
-            if (status == trade_status::kCancelled ||
-                status == trade_status::kFailed) {
+            // [review #171 round 15] FAILED only.  A CANCELLED is left to
+            // detect_fills, which proves it on-chain before it closes it: a
+            // cancel's status can overwrite a real take (round 11), and a
+            // local cancel leaves the offer takeable, with nothing in the
+            // wallet watching its coins.  Marked cancel_pending, so it is
+            // polled every heartbeat and nothing cancels it again.
+            if (status == trade_status::kCancelled) {
+                state_->mark_cancel_pending(trade_id);
+            } else if (status == trade_status::kFailed) {
                 state_->remove_offer(trade_id);
                 removed_ids.push_back(trade_id);
                 logger_->warn("[reconcile] Removed orphaned offer {} "
@@ -3883,8 +3953,17 @@ asio::awaitable<std::vector<std::string>> OfferManager::reconcile_offers(
             continue;
         }
 
-        if (status != trade_status::kCancelled &&
-            status != trade_status::kFailed) {
+        if (status == trade_status::kCancelled) {
+            // [review #171 round 15] Left to detect_fills, as in the scan.
+            state_->mark_cancel_pending(offer_id);
+            logger_->debug("[reconcile] Offer {} ({}) missing from scan, "
+                           "wallet status CANCELLED -- left tracked for "
+                           "detect_fills to prove", offer_id.substr(0, 12),
+                           po.pair_name);
+            continue;
+        }
+
+        if (status != trade_status::kFailed) {
             // Still live, pending, or unrecognised -- not ours to remove.
             logger_->debug("[reconcile] Offer {} ({}) missing from scan, "
                            "wallet status={} -- keeping tracked",
