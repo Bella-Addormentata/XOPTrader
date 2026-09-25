@@ -73,6 +73,15 @@ have corrected it.)
   fees are set, which every cancel in Step 8 pays, and ahead of every exit
   that follows. Inside the pair loop it sat behind the skip for an empty
   ladder or an invalid quote, which an unverified pair is likely to have.
+  The heartbeat that verifies a position no longer skips it (review round 7).
+  That heartbeat used to return before the drain, and on the next one the
+  asset no longer counted as unverified, so the offers restored at boot on
+  its pairs were never taken down. Now both places that verify, Step 8's
+  pass and the bridge scan, record the block they verified at. The drain
+  takes down, on the asset's pairs, every offer created before that block,
+  never one the pair loop posts afterwards. It forgets the asset once a pass
+  has taken them all. The verifying heartbeat ends right after the drain,
+  before anything is posted.
 - **The drift corrector does nothing while any position is unverified** (review
   rounds 2 and 3). Round 2 stood Step 9f down only when no balance had been
   read at all. With some read and some not, the unread asset was simply

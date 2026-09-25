@@ -2750,6 +2750,14 @@ private:
     // verifies anything posts nothing, because Step 6 sized it from the guess.
     // The bridge scan clears its own asset (review round 1).
     std::unordered_set<std::string> state_unverified_assets_;
+    // [SEED-FAIL-CLOSED review round 7] Assets verified since boot whose pairs'
+    // older offers the unverified-offer drain has not yet taken down, each with
+    // the block it was verified at.  A heartbeat that verifies an asset used to
+    // return before the drain, and the next one no longer counted the asset as
+    // unverified, so offers restored at boot on its pairs were never drained.
+    // The drain takes down what was created before that block -- never an
+    // offer the pair loop posts afterwards -- and drops the entry once it has.
+    std::unordered_map<std::string, BlockHeight> state_verified_undrained_;
     // [SEED-FAIL-CLOSED review round 2] Step 9f's "unverified" line has been
     // logged at WARN for the current episode; later heartbeats log at debug.
     bool drift_unverified_warned_{false};
