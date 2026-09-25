@@ -85,6 +85,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <unordered_map>
 #include <unordered_set>
@@ -480,6 +481,20 @@ template <class NameOf>
     return proof.verdict == FillProof::Dead && proof.height > 0U
         && current_block >= proof.height
         && current_block - proof.height >= confirmation_depth;
+}
+
+/// [review #171, round 16] Whether a coin lookup's refusal is the request's
+/// own.  Chia 2.7.4's wallet get_coin_records_by_names refuses, with an
+/// application error, both when it cannot answer anyone -- "Wallet is not
+/// connected to any synced peers.", "Wallet needs to be fully synced before
+/// finding coin information", "No full node peers connected. Please connect
+/// to a full node." -- and when a coin it was asked about is not in its
+/// store: "Coin ID's: [...] not found.".  Only that last one is one offer's.
+/// Any other refusal, known or not, would refuse the next offer's lookup the
+/// same way.
+[[nodiscard]] constexpr bool coin_lookup_refusal_is_offer_local(std::string_view error) noexcept
+{
+    return error.find("not found") != std::string_view::npos;
 }
 
 /// [review #171, round 2] May an offer the wallet reports CONFIRMED be

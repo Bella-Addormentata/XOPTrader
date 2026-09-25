@@ -190,6 +190,9 @@ def test_cancel_all_sends_nothing_more_after_a_possibly_submitted_sweep():
     # sweep that ANSWERED -- the offers the fill proof holds.  The sweep skips
     # a trade the wallet calls CONFIRMED, so those are the only ids it did not
     # spend; re-cancelling any other would be the second, conflicting spend.
+    # [review #171 round 16] With them, the offers State already marks
+    # cancel_pending: the wallet may call one CANCELLED, which the sweep skips
+    # too.  They are read again, and go to cancel_ids only as the held do.
     assert code.count("cancel_ids(") == 2
     assert code.find("cancel_ids(", branches[1]) > branches[2]
     bulk = _block(code, "if(bulk_ok){")
@@ -197,14 +200,15 @@ def test_cancel_all_sends_nothing_more_after_a_possibly_submitted_sweep():
     # sweep finds still CONFIRMED, or live and not swept: an offer the sweep
     # already covered is not cancelled a second time.
     assert bulk.count("cancel_ids(") == 1 and "cancel_ids(to_cancel,deadline)" in bulk
-    reread = _block(bulk, "for(std::size_ti=0;i<held.size();++i){")
-    assert "constauto&oid=held[i];" in reread
+    reread = _block(bulk, "for(std::size_ti=0;i<reread.size();++i){")
+    assert "constauto&oid=reread[i];" in reread
     assert bulk.count("to_cancel.push_back(") == 2 == reread.count("to_cancel.push_back(oid);")
-    assert bulk.count("held.push_back(") == 1
-    assert "held.push_back(po.offer_id);" in _block(
-        bulk, "if(fill_proof_deferrals_.count(po.offer_id)>0U){"), (
+    assert bulk.count("reread.push_back(") == 1
+    assert "reread.push_back(po.offer_id);" in _block(
+        bulk, "if(fill_proof_deferrals_.count(po.offer_id)>0U||po.cancel_pending){"), (
         "the answered sweep's per-id cancels are no longer only the offers the "
-        "fill proof holds -- they now re-cancel offers the sweep already spent"
+        "fill proof holds or State marks cancel_pending -- they now re-cancel "
+        "offers the sweep already spent"
     )
 
     # [review 2026-09-13, round 3] No RPC of ANY kind leaves that branch --
