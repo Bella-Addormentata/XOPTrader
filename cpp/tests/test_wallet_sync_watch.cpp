@@ -398,7 +398,7 @@ TEST(WalletStartDebt, AFailedStartIsRetriedAfterTheBaseDelay)
     owe_wallet_start(debt, 1000, /*stop_worked=*/true);
     EXPECT_FALSE(wallet_start_due(debt, 1059));
     EXPECT_TRUE(wallet_start_due(debt, 1060));    // 60 s later
-    EXPECT_TRUE(wallet_start_due(debt, 5000));    // and on every heartbeat after
+    EXPECT_TRUE(wallet_start_due(debt, 5000));    // and on every poll after
 }
 
 TEST(WalletStartDebt, EachFailedRetryDoublesTheDelayUpToTheCap)

@@ -11649,7 +11649,8 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 // half failed.  A start that failed after a stop that worked
                 // leaves no wallet to answer the sync check, and the watch
                 // could then never decide again.  That start is owed, and the
-                // heartbeat retries it without asking the wallet anything.
+                // poll loop retries it without asking the wallet anything
+                // [review round 7].
                 const int stop_rc  = std::system("chia stop wallet");
                 const int start_rc = std::system("chia start wallet");
                 if (stop_rc == 0 && start_rc == 0) {

@@ -2698,9 +2698,11 @@ private:
     execution::WalletSyncWatch wallet_sync_watch_{};
 
     // [review round 6] A wallet start owed after a restart whose start command
-    // failed.  Retried from the top of on_new_block_coro, before any wallet
-    // call or gate, since a stopped wallet answers no sync check; cleared when
-    // the wallet answers Step 8's.
+    // failed.  [review round 7] Retried from poll_loop_coro on every poll,
+    // before any wallet or height call: a stopped wallet answers no sync
+    // check, and in wallet-only mode no height either, so a heartbeat would
+    // never come.  Settled when a start works or the wallet answers Step 8's
+    // sync check, which counts the restart a stop that worked began.
     execution::WalletStartDebt wallet_start_debt_{};
 
     bool wallet_synced_{false};
