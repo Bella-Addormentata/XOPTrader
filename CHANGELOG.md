@@ -278,6 +278,13 @@ can pass for an offer nobody took.
   restart never reached the proof. Such a row is no longer stamped: it
   restores into State flagged cancel_pending, and detect_fills proves it the
   first time it polls it. FAILED, which no cancel writes, is still stamped.
+  Two refinements (review round 14). An offer the wallet reports
+  PENDING_CANCEL is marked cancel_pending in State before any proof, as
+  recheck_terminal's revival does. The cancel in flight may be anyone's,
+  and once a proof released the hold, the TTL and reprice paths would
+  otherwise have sent a second secure cancel for the same coins. And only a
+  Dead answer is remembered: a Live offer can still be taken, so it is asked
+  again next heartbeat, one lookup, until its cancel lands.
   Cancel All's wallet-wide sweep skips every trade the wallet calls
   completed, so it never reports a held offer as cancelled. Such an offer goes
   through the guarded per-offer path instead: it is cancelled there if the
