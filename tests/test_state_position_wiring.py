@@ -553,7 +553,12 @@ def test_a_verifying_heartbeat_drains_before_it_ends() -> None:
     every offer created before that block (never one the pair loop posts
     afterwards), and forgets the assets once one pass has taken them all.  The
     verifying heartbeat ends right after the drain, before any posting, as it
-    used to end at the pass."""
+    used to end at the pass.
+
+    Review round 8: at or before that block.  After a restart within one peak
+    a restored offer can carry the very height the first heartbeat verifies
+    at, and a strict comparison left it resting while the drain forgot the
+    asset."""
     text = _engine()
     body = _function_body(text, STEP8)
     drains = re.search(
@@ -561,8 +566,8 @@ def test_a_verifying_heartbeat_drains_before_it_ends() -> None:
         r"if \(state_unverified_assets_\.count\(asset\) > 0\) \{\s*return true;\s*\}\s*"
         r"const auto verified = state_verified_undrained_\.find\(asset\);\s*"
         r"return verified != state_verified_undrained_\.end\(\)\s*"
-        r"&& po\.created_at_block < verified->second;\s*\};", body)
-    assert drains, "an unverified asset takes every offer; a verified one, only what came before"
+        r"&& po\.created_at_block <= verified->second;\s*\};", body)
+    assert drains, "an unverified asset takes every offer; a verified one, what came at or before"
     drain_at = body.index("(!state_unverified_assets_.empty() || !state_verified_undrained_.empty())")
     assert drains.start() < drain_at
     drain_open = body.index("{", drain_at)

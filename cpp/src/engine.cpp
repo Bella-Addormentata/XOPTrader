@@ -12078,13 +12078,17 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
     // offers created before it was verified -- those restored at boot, which
     // a verifying heartbeat used to leave behind -- until one pass has taken
     // them all down.  An offer the pair loop posts afterwards is never taken.
+    // [review round 8] At or before that block: after a restart within one
+    // peak, a restored offer can carry the very height the first heartbeat
+    // verifies at, and it predates the verification all the same.  Nothing
+    // this process posts can: the verifying heartbeat ends before posting.
     const auto drains = [this](const std::string& asset, const PendingOffer& po) {
         if (state_unverified_assets_.count(asset) > 0) {
             return true;
         }
         const auto verified = state_verified_undrained_.find(asset);
         return verified != state_verified_undrained_.end()
-            && po.created_at_block < verified->second;
+            && po.created_at_block <= verified->second;
     };
     if ((!state_unverified_assets_.empty() || !state_verified_undrained_.empty())
         && offer_mgr_ && !dry_run_ && !cancel_all_inflight_) {
