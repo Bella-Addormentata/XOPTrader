@@ -2774,8 +2774,10 @@ private:
     // the block it was verified at.  A heartbeat that verifies an asset used to
     // return before the drain, and the next one no longer counted the asset as
     // unverified, so offers restored at boot on its pairs were never drained.
-    // The drain takes down what was created before that block -- never an
-    // offer the pair loop posts afterwards -- and drops the entry once it has.
+    // The drain takes down what was created AT OR before that block [review
+    // round 8: a restored offer can carry that very height after a restart
+    // within one peak] -- never an offer the pair loop posts afterwards -- and
+    // drops the entry once it has.
     std::unordered_map<std::string, BlockHeight> state_verified_undrained_;
     // [SEED-FAIL-CLOSED review round 9, #172's review] Assets a fill booked
     // in THIS heartbeat's Step 2 moved.  Step 2 books a fill into State with
