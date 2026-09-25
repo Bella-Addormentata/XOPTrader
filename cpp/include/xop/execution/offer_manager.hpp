@@ -1446,6 +1446,19 @@ private:
     /// Pruned with the deferrals when the offer leaves State.
     std::unordered_set<std::string> expiry_retired_;
 
+    /// [review #172] An answer under a cancel's status that settled nothing
+    /// -- not every maker coin covered, a record that cannot be read, the
+    /// wallet's silence -- may yet be completed by a node catching up.  The
+    /// status, and the block the first such answer came at: the offer is
+    /// asked again every heartbeat for confirmation_depth_blocks from then,
+    /// and only then does its status stand.  Ended by a conclusive answer;
+    /// pruned with the deferrals when the offer leaves State.
+    struct InconclusiveSince {
+        int         status{0};
+        BlockHeight block{0};
+    };
+    std::unordered_map<std::string, InconclusiveSince> cancel_status_inconclusive_;
+
     /// Whether cancel_offer_charged() must refuse `trade_id`: an offer under
     /// proof, unless its latest proof makes it cancellable.
     [[nodiscard]] bool cancel_withheld_for_proof(const std::string& trade_id) const;
@@ -1462,6 +1475,10 @@ private:
                    ///< request, such as a wallet not synced.  The next lookup
                    ///< would fail the same way, so detect_fills asks nothing
                    ///< more that call.
+        NothingToAsk, ///< [review #172] the trade record gives the proof nothing
+                      ///< to ask: no readable maker coin, or every maker coin
+                      ///< spent together with no settlement coin or requested
+                      ///< amount to look for.  No retry can change that.
     };
 
     /// Ask the chain what a CONFIRMED trade record's maker coins prove

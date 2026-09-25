@@ -1390,6 +1390,7 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
         fill_proof_deferrals_.clear();
         cancel_status_proven_.clear();
         expiry_retired_.clear();
+        cancel_status_inconclusive_.clear();
         co_return fills;
     }
 
@@ -1412,6 +1413,9 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
     }
     for (auto it = expiry_retired_.begin(); it != expiry_retired_.end();) {
         it = pending_map.count(*it) ? std::next(it) : expiry_retired_.erase(it);
+    }
+    for (auto it = cancel_status_inconclusive_.begin(); it != cancel_status_inconclusive_.end();) {
+        it = pending_map.count(it->first) ? std::next(it) : cancel_status_inconclusive_.erase(it);
     }
     for (auto it = fill_proof_deferrals_.begin(); it != fill_proof_deferrals_.end();) {
         it = pending_map.count(it->first) ? std::next(it) : fill_proof_deferrals_.erase(it);
@@ -1662,9 +1666,16 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
         //   - Unknown, not held, after a lookup failed -- its own, refused or
         //     failed, or an earlier one this heartbeat: asked again next
         //     heartbeat, and its status waits;
-        //   - Unknown otherwise: the chain can say no more, so the status
-        //     stands.  An offer never seen CONFIRMED is not held on a question
-        //     that no retry will answer.
+        //   - [review #172] Unknown from an answer that settled nothing -- not
+        //     every maker coin covered, a record that cannot be read, the
+        //     wallet's silence: a node catching up can still complete it, so
+        //     it is asked again every heartbeat, cancel_pending, for
+        //     confirmation_depth_blocks from the first such answer under this
+        //     status, and only then does the status stand;
+        //   - Unknown with nothing to ask -- no readable maker coin, or no
+        //     settlement coin or requested amount to look for: no retry can
+        //     answer it, so the status stands.  An offer never seen CONFIRMED
+        //     is not held on a question that no retry will answer.
         //
         // [review #171 round 14] A cancel is in flight for an offer the wallet
         // reports PENDING_CANCEL, whoever sent it -- this engine's sweeps, the
@@ -1704,6 +1715,10 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
             // [review #171 round 16] Dead is final only at confirmation depth.
             const bool dead_at_depth = dead_offer_closable(
                 reproof, current_block, strategy_cfg_.confirmation_depth_blocks);
+            // [review #172] A conclusive answer ends a run of inconclusive ones.
+            if (reproof.verdict != FillProof::Unknown) {
+                cancel_status_inconclusive_.erase(trade_id);
+            }
             if (reproof.verdict == FillProof::Settled) {
                 logger_->warn("[FILL-PROOF] {} ({}): the wallet reports it {}, but "
                               "the chain shows the take -- a cancel of an offer "
@@ -1759,12 +1774,38 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
                                trade_id.substr(0, 12), po.pair_name, reproof.height,
                                strategy_cfg_.confirmation_depth_blocks);
                 continue;
-            } else if (reproof_lookup != ProofLookup::Answered) {
+            } else if (reproof_lookup == ProofLookup::Refused
+                       || reproof_lookup == ProofLookup::Failed) {
                 logger_->debug("[FILL-PROOF] {} ({}): a coin lookup failed this "
                                "heartbeat -- its cancel status is proven next "
                                "heartbeat", trade_id.substr(0, 12), po.pair_name);
                 continue;
+            } else if (reproof_lookup == ProofLookup::Answered) {
+                // [review #172] An answer that settled nothing may yet be
+                // completed, so it is asked again every heartbeat,
+                // cancel_pending, for confirmation_depth_blocks from the first
+                // such answer under this status.  Only then does it stand.
+                auto window = cancel_status_inconclusive_.try_emplace(
+                    trade_id, InconclusiveSince{status, current_block}).first;
+                if (window->second.status != status) {
+                    window->second = InconclusiveSince{status, current_block};
+                }
+                if (current_block < window->second.block
+                    || current_block - window->second.block
+                           < strategy_cfg_.confirmation_depth_blocks) {
+                    state_->mark_cancel_pending(trade_id);
+                    logger_->debug("[FILL-PROOF] {} ({}): the chain's answer proves "
+                                   "nothing yet -- asked again every heartbeat until "
+                                   "block {}", trade_id.substr(0, 12), po.pair_name,
+                                   window->second.block
+                                       + strategy_cfg_.confirmation_depth_blocks);
+                    continue;
+                }
+                cancel_status_inconclusive_.erase(window);
+                cancel_status_proven_[trade_id] = status;
             } else {
+                // NothingToAsk: the record gives the proof nothing to ask, and
+                // no retry can change that, so the status stands.
                 cancel_status_proven_[trade_id] = status;
             }
         }
@@ -2036,6 +2077,7 @@ OfferManager::prove_fill_on_chain(const json& trade_record, std::string& failure
     const std::vector<std::string> names =
         coin_names_for(parse_coins_of_interest(trade_record), name_of);
     if (names.empty()) {
+        lookup  = ProofLookup::NothingToAsk;   // [review #172]
         failure = "the wallet record carries no readable coins_of_interest";
         co_return FillProofResult{};
     }
@@ -2098,6 +2140,7 @@ OfferManager::prove_fill_on_chain(const json& trade_record, std::string& failure
     const std::vector<std::uint64_t> amounts =
         ask_node ? std::vector<std::uint64_t>{} : summary_amounts(trade_record, "requested");
     if (ask_node ? settlements.empty() : amounts.empty()) {
+        lookup  = ProofLookup::NothingToAsk;   // [review #172]
         failure = std::string{"every maker coin was spent at block "}
                   + std::to_string(coins.height) + ", but the trade record lists no "
                   + (ask_node ? "offered asset whose settlement coin can be named"

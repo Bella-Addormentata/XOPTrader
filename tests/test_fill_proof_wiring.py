@@ -681,15 +681,20 @@ def test_a_cancels_status_is_proven_on_chain_before_it_is_acted_on():
     assert re.search(r"continue;\s*\}$", held_unknown), "...still held, and asked again next heartbeat"
     assert "fill_proof_deferrals_.erase(" not in held_unknown, "a held Unknown must not let the offer go"
     # [round 15] Its own lookup, refused or failed, or an earlier one's latch.
-    transient = _block_after(reproof, "} else if (reproof_lookup != ProofLookup::Answered) {")
+    waits = re.search(r"\} else if \(reproof_lookup == ProofLookup::Refused\s*"
+                      r"\|\| reproof_lookup == ProofLookup::Failed\) \{", reproof)
+    assert waits, "a refused or failed lookup, or an earlier one's latch, waits"
+    transient = reproof[waits.end() - 1:_matching(reproof, waits.end() - 1) + 1]
     assert re.search(r"continue;\s*\}$", transient), "after a failed lookup: asked again next heartbeat"
     assert "cancel_status_proven_" not in transient and "handle_unproven_fill" not in transient, (
         "a failed lookup is remembered as no answer, and holds nothing"
     )
     assert re.search(r"\} else \{\s*cancel_status_proven_\[trade_id\] = status;\s*\}\s*\}$", reproof), (
-        "otherwise the chain can say no more, and the status stands"
+        "with nothing to ask, the chain can say no more, and the status stands"
     )
-    assert reproof.count("cancel_status_proven_[trade_id] = status;") == 2
+    # [#172's review] Dead at depth, an answer that settled nothing once its
+    # window has passed, and nothing to ask.
+    assert reproof.count("cancel_status_proven_[trade_id] = status;") == 3
     reuse = re.search(r"if \(reproved\) \{\s*proof\s*=\s*\*reproved;\s*"
                       r"asked_node\s*=\s*reproved_asked_node;\s*"
                       r"\} else if \(proof_lookup_failed\) \{", _confirmed_branch())
@@ -738,7 +743,7 @@ def test_a_dead_answer_is_final_only_at_confirmation_depth():
     held_at = reproof.index("} else if (held) {")
     shallow = re.search(r"\} else if \(reproof\.verdict == FillProof::Dead\) \{", reproof)
     assert shallow and final.start() < held_at < shallow.start() < reproof.index(
-        "} else if (reproof_lookup != ProofLookup::Answered) {"), (
+        "} else if (reproof_lookup == ProofLookup::Refused"), (
         "a held offer's shallow Dead is deferred as a CONFIRMED offer's is; any other's is "
         "handled next, before a failed lookup's wait"
     )
@@ -750,6 +755,77 @@ def test_a_dead_answer_is_final_only_at_confirmation_depth():
     assert re.search(r"continue;\s*\}$", block), "and kept tracked: it never reaches the terminal branch"
     for forbidden in ("cancel_status_proven_", "remove_offer", "fill_proof_deferrals_"):
         assert forbidden not in block, f"a shallow Dead neither remembers nor releases anything: {forbidden}"
+
+
+def test_an_answer_that_settles_nothing_is_asked_again_for_confirmation_depth():
+    """[#172's review] An Unknown under a cancel's status let the status stand
+    at once for an offer not held -- also when it came from an answer that
+    settled nothing: one that did not cover every maker coin, a record that
+    could not be read, the wallet's silence.  A node catching up can still
+    complete such an answer, and a take hidden under the status was then never
+    asked about again.  Now such an offer stays tracked, cancel_pending, and is
+    proven every heartbeat for confirmation_depth_blocks from the first such
+    answer under that status; only then does the status stand.  A conclusive
+    answer ends the run.  An Unknown with nothing to ask -- no readable maker
+    coin, or no settlement coin or requested amount to look for
+    (ProofLookup::NothingToAsk) -- still lets the status stand at once."""
+    manager = _source(OFFER_MANAGER)
+    prove = _function_body(manager, PROVE_ON_CHAIN)
+    nothing = re.search(r"if \(names\.empty\(\)\) \{\s*lookup\s*= ProofLookup::NothingToAsk;", prove)
+    assert nothing, "a record with no readable maker coin gives the proof nothing to ask"
+    second = re.search(r"if \(ask_node \? settlements\.empty\(\) : amounts\.empty\(\)\) \{\s*"
+                       r"lookup\s*= ProofLookup::NothingToAsk;", prove)
+    assert second, "nor one that names no settlement coin or requested amount to look for"
+    assert prove.count("ProofLookup::NothingToAsk") == 2
+    detect = _function_body(manager, DETECT_FILLS)
+    head = "for (const auto& rec : trade_records) {"
+    loop = _block_after(detect[detect.rindex(head):], head)
+    reproof = _block_after(loop, "if (reprove) {")
+    ended = re.search(r"if \(reproof\.verdict != FillProof::Unknown\) \{\s*"
+                      r"cancel_status_inconclusive_\.erase\(trade_id\);\s*\}", reproof)
+    assert ended and ended.start() < reproof.index("if (reproof.verdict == FillProof::Settled) {"), (
+        "a conclusive answer ends a run of inconclusive ones, before any verdict acts"
+    )
+    waits = re.search(r"\} else if \(reproof_lookup == ProofLookup::Refused\s*"
+                      r"\|\| reproof_lookup == ProofLookup::Failed\) \{", reproof)
+    answered = re.search(r"\} else if \(reproof_lookup == ProofLookup::Answered\) \{", reproof)
+    assert waits and answered and waits.start() < answered.start(), (
+        "a failed lookup waits first; only an answer opens the window"
+    )
+    open_index = answered.end() - 1
+    window = reproof[open_index:_matching(reproof, open_index) + 1]
+    opened = re.search(r"auto window = cancel_status_inconclusive_\.try_emplace\(\s*"
+                       r"trade_id, InconclusiveSince\{status, current_block\}\)\.first;\s*"
+                       r"if \(window->second\.status != status\) \{\s*"
+                       r"window->second = InconclusiveSince\{status, current_block\};\s*\}", window)
+    assert opened, "the window opens at the first such answer, and again when the status changes"
+    within = re.search(r"if \(current_block < window->second\.block\s*"
+                       r"\|\| current_block - window->second\.block\s*"
+                       r"< strategy_cfg_\.confirmation_depth_blocks\) \{", window)
+    assert within and opened.end() <= within.start(), "it lasts confirmation_depth_blocks"
+    inside = window[within.end() - 1:_matching(window, within.end() - 1) + 1]
+    assert re.match(r"\{\s*state_->mark_cancel_pending\(trade_id\);", inside), (
+        "while it lasts, the offer is flagged cancel_pending"
+    )
+    assert re.search(r"continue;\s*\}$", inside), "...and asked again next heartbeat"
+    assert "cancel_status_proven_" not in inside, "...remembering nothing"
+    after = window[within.end() - 1 + len(inside):]
+    assert re.match(r"\s*cancel_status_inconclusive_\.erase\(window\);\s*"
+                    r"cancel_status_proven_\[trade_id\] = status;\s*\}$", after), (
+        "only once it has passed does the status stand"
+    )
+    nothing_else = re.search(r"\} else \{\s*cancel_status_proven_\[trade_id\] = status;\s*\}\s*\}$", reproof)
+    assert nothing_else and nothing_else.start() > answered.start(), (
+        "nothing to ask: the status stands at once"
+    )
+    pruned = re.search(r"for \(auto it = cancel_status_inconclusive_\.begin\(\); "
+                       r"it != cancel_status_inconclusive_\.end\(\);\) \{\s*"
+                       r"it = pending_map\.count\(it->first\) \? std::next\(it\) "
+                       r": cancel_status_inconclusive_\.erase\(it\);\s*\}", detect)
+    assert pruned and pruned.start() < detect.rindex(head), "pruned before the loop, as the deferrals are"
+    assert "cancel_status_inconclusive_.clear();" in _block_after(detect, "if (pending_offers.empty()) {")
+    assert re.search(r"std::unordered_map<std::string, InconclusiveSince>\s+cancel_status_inconclusive_;",
+                     _source(OFFER_MANAGER_HPP))
 
 
 def test_a_local_cancel_stays_tracked_while_it_can_be_taken():

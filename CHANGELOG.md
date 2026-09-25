@@ -170,6 +170,15 @@ can pass for an offer nobody took.
   cancel_pending is read again, as a held one is (review round 16). The
   sweep skips a trade the wallet calls CANCELLED, and such an offer was
   reported as one this call had cancelled.
+  An answer under a cancel's status that settles nothing is asked again
+  (#172's review). One that does not cover every maker coin, a record that
+  cannot be read, or the wallet's silence can still be completed by a node
+  catching up, and the status used to stand at once, so a take hidden under
+  it was never asked about again. Such an offer now stays tracked, flagged
+  cancel_pending, and is proven every heartbeat for
+  `strategy.confirmation_depth_blocks` from the first such answer. Only
+  then does its status stand. A record that gives the proof nothing to ask,
+  such as no readable maker coin, still lets it stand at once.
   Cancel All's wallet-wide sweep skips every trade the wallet calls
   completed, so it never reports a held offer as cancelled. Such an offer goes
   through the guarded per-offer path instead: it is cancelled there if the
