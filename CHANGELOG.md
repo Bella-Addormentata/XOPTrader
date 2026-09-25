@@ -187,6 +187,12 @@ can pass for an offer nobody took.
   cannot prove, is reported outstanding, and stays so on every retry: the
   per-offer path no longer reports such an offer as a cancel already in
   flight. Nothing is sent for it; it takes a secure cancel.
+  A Dead proof counts as closed there only at
+  `strategy.confirmation_depth_blocks`, as it does everywhere else (review
+  round 19). A shallower spend could be reorganised out, so such an offer is
+  reported outstanding, and stays so on every retry. And `detect_fills` no
+  longer forgets that a locally cancelled offer was takeable until its spend
+  is that deep.
   Cancel All's wallet-wide sweep skips every trade the wallet calls
   completed, so it never reports a held offer as cancelled. Such an offer goes
   through the guarded per-offer path instead: it is cancelled there if the
