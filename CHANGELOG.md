@@ -272,6 +272,12 @@ can pass for an offer nobody took.
   answer the chain cannot settle is asked again only after a failed lookup.
   Otherwise its status stands, so no offer waits on a question no retry
   will answer.
+  Nor at boot (review round 13). Startup reconciliation counted a DB row the
+  wallet reported CANCELLED as terminal, and the engine stamped it cancelled
+  before restoring the book. So a take that a cancel overwrote before a
+  restart never reached the proof. Such a row is no longer stamped: it
+  restores into State flagged cancel_pending, and detect_fills proves it the
+  first time it polls it. FAILED, which no cancel writes, is still stamped.
   Cancel All's wallet-wide sweep skips every trade the wallet calls
   completed, so it never reports a held offer as cancelled. Such an offer goes
   through the guarded per-offer path instead: it is cancelled there if the

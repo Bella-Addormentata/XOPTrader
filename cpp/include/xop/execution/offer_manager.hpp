@@ -1067,8 +1067,16 @@ public:
      * it describes that call only -- same contract as last_terminal_offers().
      */
     struct StartupDbLeg {
-        /// Wallet says CANCELLED / FAILED. Safe to stamp the row resolved.
+        /// Wallet says FAILED. Safe to stamp the row resolved.
         std::vector<std::string> terminal;
+        /// [FILL-PROOF, review #171 round 13] Wallet says CANCELLED.  No
+        /// longer stamped at boot: CANCELLED is a status a cancel writes, over
+        /// a real take too (trade_status::written_by_a_cancel), and stamping
+        /// it here closed the row before any chain proof could run.  The row
+        /// restores into State flagged cancel_pending, and detect_fills proves
+        /// it on-chain the first time it polls it: a take is booked, and any
+        /// other answer closes it as the wallet says.
+        std::vector<std::string> cancelled_unproven;
         /// Wallet says PENDING_ACCEPT. Genuinely still resting.
         std::vector<std::string> still_live;
         /// Wallet says CONFIRMED. Keep tracked so detect_fills books the
@@ -1083,7 +1091,7 @@ public:
 
         [[nodiscard]] std::size_t total() const noexcept
         {
-            return terminal.size() + still_live.size()
+            return terminal.size() + cancelled_unproven.size() + still_live.size()
                  + confirmed.size() + unverifiable.size();
         }
     };

@@ -2628,6 +2628,10 @@ asio::awaitable<void> Engine::poll_loop_coro()
             // run neither posts nor cancels, so there is nothing for the
             // adopted state to be used by.
             std::vector<std::string> orphans;
+            // [FILL-PROOF, review #171 round 13] DB-pending rows the wallet
+            // reports CANCELLED: restored below, flagged cancel_pending, and
+            // left for detect_fills to prove before the row is closed.
+            std::vector<std::string> cancelled_unproven;
             if (dry_run_) {
                 spdlog::warn("[Engine] [S31] dry run -- SKIPPING startup "
                              "reconciliation. It cancels offers it judges "
@@ -2674,6 +2678,22 @@ asio::awaitable<void> Engine::poll_loop_coro()
                 // stamped cancelled -- that is the 2026-07-31 defect that put
                 // six XCH/BYC fills off the books. recheck/detect_fills owns
                 // them; leave the row alone and let them restore into State.
+                // [FILL-PROOF, review #171 round 13] `cancelled_unproven` rows
+                // are not stamped either.  CANCELLED is a status a cancel
+                // writes, over a real take too, and stamping it here closed
+                // the row with no chain proof: a take overwritten before a
+                // restart was lost for good.  They restore into State like
+                // any DB-pending row, flagged cancel_pending, and
+                // detect_fills proves each the first time it polls it --
+                // booking a take, and otherwise closing it as the wallet says.
+                if (!leg.cancelled_unproven.empty()) {
+                    cancelled_unproven = leg.cancelled_unproven;
+                    spdlog::warn("[Engine] [S46] {} DB-pending offer(s) the "
+                                 "wallet reports CANCELLED -- restored for "
+                                 "detect_fills to prove on-chain before they "
+                                 "are closed", cancelled_unproven.size());
+                }
+
                 if (!leg.confirmed.empty()) {
                     spdlog::warn("[Engine] [S46] {} DB-pending offer(s) the "
                                  "wallet reports CONFIRMED -- left for the "
@@ -2782,6 +2802,12 @@ asio::awaitable<void> Engine::poll_loop_coro()
                 }
             }
 
+            // [review #171 round 13] The wallet already calls these cancelled:
+            // nothing may cancel them again or quote around them before
+            // detect_fills has proven them.
+            for (const auto& oid : cancelled_unproven) {
+                state_->mark_cancel_pending(oid);
+            }
             if (!db_pending.empty()) {
                 spdlog::info("[Engine] Restored {} pending offers from DB into State",
                              db_pending.size());

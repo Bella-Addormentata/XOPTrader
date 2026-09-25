@@ -4401,9 +4401,13 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
                 continue;
             }
 
-            if (status == trade_status::kCancelled
-                || status == trade_status::kFailed) {
+            // [FILL-PROOF, review #171 round 13] CANCELLED is not terminal
+            // here: a cancel writes it, over a real take too, so detect_fills
+            // proves the offer on-chain before the row is closed.
+            if (status == trade_status::kFailed) {
                 db_leg_.terminal.push_back(id);
+            } else if (status == trade_status::kCancelled) {
+                db_leg_.cancelled_unproven.push_back(id);
             } else if (status == trade_status::kConfirmed) {
                 db_leg_.confirmed.push_back(id);
             } else if (status == trade_status::kPendingAccept) {
@@ -4420,9 +4424,11 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
         if (db_leg_.total() > 0) {
             logger_->warn("[startup_reconcile] DB->wallet leg: {} DB-pending "
                           "row(s) absent from the wallet scan -- {} terminal, "
+                          "{} cancelled (proven before they are closed), "
                           "{} still live, {} confirmed/filling, {} "
                           "UNVERIFIABLE (kept pending for the heartbeat)",
                           db_leg_.total(), db_leg_.terminal.size(),
+                          db_leg_.cancelled_unproven.size(),
                           db_leg_.still_live.size(),
                           db_leg_.confirmed.size(),
                           db_leg_.unverifiable.size());
