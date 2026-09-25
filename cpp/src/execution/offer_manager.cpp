@@ -1382,6 +1382,8 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
     // runs while this call waits is withheld.  The block could not do this:
     // two calls at one height would share it.
     ++fill_poll_heartbeat_;
+    // [review #171 round 19] For cancel_all's depth check of a Dead proof.
+    latest_fill_poll_block_ = current_block;
 
     // Get all known pending offers from state for comparison.
     auto pending_offers = state_->get_all_offers();
@@ -1723,8 +1725,10 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
             if (reproof.verdict != FillProof::Unknown) {
                 cancel_status_inconclusive_.erase(trade_id);
             }
-            // [review #171 round 18] Dead or taken: no longer takeable.
-            if (reproof.verdict == FillProof::Dead || reproof.verdict == FillProof::Settled) {
+            // [review #171 round 18] Taken, or [round 19] dead at confirmation
+            // depth: no longer takeable.  A shallower spend could still be
+            // reorganised out, so a live local cancel stays remembered.
+            if (dead_at_depth || reproof.verdict == FillProof::Settled) {
                 local_cancel_live_.erase(trade_id);
             }
             if (reproof.verdict == FillProof::Settled) {
@@ -2760,8 +2764,11 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(
                             proof_lookup_failed = true;
                         }
                     }
-                    if (proof.verdict == FillProof::Dead
-                        || proof.verdict == FillProof::Settled) {
+                    // [review #171 round 19] Dead only at confirmation depth, as
+                    // everywhere else: a shallower spend could be reorganised out.
+                    if (proof.verdict == FillProof::Settled
+                        || dead_offer_closable(proof, latest_fill_poll_block_,
+                                               strategy_cfg_.confirmation_depth_blocks)) {
                         local_cancel_live_.erase(oid);
                         out.closed.push_back(oid);
                         ++closed;
@@ -2770,6 +2777,14 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(
                             local_cancel_live_.insert(oid);
                             takeable_why = "the wallet cancelled it only locally: every "
                                            "maker coin is unspent, so it can still be taken";
+                        } else if (proof.verdict == FillProof::Dead) {
+                            // [round 19] Remembered, so every retry keeps it
+                            // outstanding until the spend is deep enough.
+                            local_cancel_live_.insert(oid);
+                            takeable_why = "dead at block " + std::to_string(proof.height)
+                                + ", not yet "
+                                + std::to_string(strategy_cfg_.confirmation_depth_blocks)
+                                + " blocks deep: a reorganisation could still undo the spend";
                         } else {
                             takeable_why = "the wallet reports it CANCELLED, but the chain "
                                            "did not show it dead or taken: " + proof_failure;

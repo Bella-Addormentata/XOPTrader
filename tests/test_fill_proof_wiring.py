@@ -540,14 +540,22 @@ def test_a_cancelled_offer_is_closed_by_the_sweep_only_once_the_chain_says_so():
                       r"if \(lookup == ProofLookup::Failed\) \{\s*proof_lookup_failed = true;\s*\}\s*\}",
                       cancelled)
     assert asked, "proven on-chain, and not asked again in this sweep once a lookup has failed"
-    closed = re.search(r"if \(proof\.verdict == FillProof::Dead\s*"
-                       r"\|\| proof\.verdict == FillProof::Settled\) \{\s*"
+    # [round 19] Dead only at confirmation depth, judged at the latest fill poll.
+    closed = re.search(r"if \(proof\.verdict == FillProof::Settled\s*"
+                       r"\|\| dead_offer_closable\(proof, latest_fill_poll_block_,\s*"
+                       r"strategy_cfg_\.confirmation_depth_blocks\)\) \{\s*"
                        r"local_cancel_live_\.erase\(oid\);\s*"
                        r"out\.closed\.push_back\(oid\);\s*\+\+closed;\s*\} else \{", cancelled)
-    assert closed and asked.end() < closed.start(), "only a Dead or taken offer is closed"
+    assert closed and asked.end() < closed.start(), "only a taken offer, or one dead at depth, is closed"
     other = cancelled[closed.end() - 1:_matching(cancelled, closed.end() - 1) + 1]
     assert re.search(r"if \(proof\.verdict == FillProof::Live\) \{\s*"
                      r"local_cancel_live_\.insert\(oid\);", other), "a Live one is remembered as still takeable"
+    assert re.search(r"\} else if \(proof\.verdict == FillProof::Dead\) \{\s*"
+                     r"local_cancel_live_\.insert\(oid\);", other), (
+        "a shallow Dead one is remembered too, so every retry keeps it outstanding")
+    assert re.search(r"\+\+fill_poll_heartbeat_;\s*latest_fill_poll_block_ = current_block;",
+                     _function_body(manager, DETECT_FILLS)), "the block the depth is judged at"
+    assert manager.count("latest_fill_poll_block_ =") == 1
     assert re.search(r"takeable\.push_back\(oid\);\s*\}$", other), "Live or not proven: outstanding"
     assert "out.closed" not in other and "out.cancelled" not in other
     kept = re.search(r"if \(!takeable\.empty\(\)\) \{[^}]*"
@@ -569,8 +577,9 @@ def test_a_cancelled_offer_is_closed_by_the_sweep_only_once_the_chain_says_so():
     assert re.search(r"state_->mark_cancel_pending\(trade_id\);\s*local_cancel_live_\.insert\(trade_id\);", detect), (
         "the round-15 keep branch remembers a Live CANCELLED offer"
     )
-    assert re.search(r"if \(reproof\.verdict == FillProof::Dead \|\| reproof\.verdict == FillProof::Settled\) \{\s*"
-                     r"local_cancel_live_\.erase\(trade_id\);\s*\}", detect)
+    assert re.search(r"if \(dead_at_depth \|\| reproof\.verdict == FillProof::Settled\) \{\s*"
+                     r"local_cancel_live_\.erase\(trade_id\);\s*\}", detect), (
+        "[round 19] forgotten only on a take or a Dead proof at depth")
     assert re.search(r"for \(auto it = local_cancel_live_\.begin\(\); it != local_cancel_live_\.end\(\);\) \{\s*"
                      r"it = pending_map\.count\(\*it\) \? std::next\(it\) : local_cancel_live_\.erase\(it\);\s*\}",
                      detect), "pruned with the deferrals"
@@ -800,13 +809,12 @@ def test_a_dead_answer_is_final_only_at_confirmation_depth():
     assert re.search(r"if \(dead_at_depth\) \{\s*cancel_status_proven_\[trade_id\] = status;", reproof), (
         "and only a Dead one at depth is remembered"
     )
-    # [round 18] Read directly twice: where it is not yet deep enough, and to
-    # forget that a local cancel was still takeable -- never for finality.
-    assert reproof.count("FillProof::Dead") == 2, (
-        "a Dead verdict is read directly only where it is not yet deep enough, and "
-        "for local_cancel_live_"
+    # [round 19] Read directly once again: a live local cancel is forgotten
+    # only at depth too (dead_at_depth), never on a shallow Dead.
+    assert reproof.count("FillProof::Dead") == 1, (
+        "a Dead verdict is read directly only where it is not yet deep enough"
     )
-    assert re.search(r"if \(reproof\.verdict == FillProof::Dead \|\| reproof\.verdict == FillProof::Settled\) \{\s*"
+    assert re.search(r"if \(dead_at_depth \|\| reproof\.verdict == FillProof::Settled\) \{\s*"
                      r"local_cancel_live_\.erase\(trade_id\);\s*\}", reproof)
     held_at = reproof.index("} else if (held) {")
     shallow = re.search(r"\} else if \(reproof\.verdict == FillProof::Dead\) \{", reproof)

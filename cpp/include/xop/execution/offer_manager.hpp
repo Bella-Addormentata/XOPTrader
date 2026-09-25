@@ -460,8 +460,10 @@ public:
     struct CancelOutcome {
         /// Offers the wallet accepted a cancel for. On the bulk path this is
         /// every id -- see `bulk_submitted`, which qualifies what that means
-        /// -- except one the fill proof holds, which is read again after the
-        /// sweep: it is here only if the per-offer path then cancels it.
+        /// -- except one the fill proof holds and [review #171 round 16] one
+        /// State already marks cancel_pending.  Each of those is read again
+        /// after the sweep, and is here only if the per-offer path then
+        /// cancels it.
         std::vector<std::string> cancelled;
         /// Offers we still believe are LIVE. These are what a retry re-attempts.
         std::vector<std::string> failed;
@@ -1463,11 +1465,14 @@ private:
 
     /// [review #171 round 18] Offers the wallet reports CANCELLED that the
     /// chain last showed Live: cancelled only locally, and still takeable.
+    /// [round 19] Or one Cancel All's re-read found dead by a spend not yet
+    /// confirmation_depth_blocks deep, which a reorganisation could undo.
     /// State flags them cancel_pending so nothing re-cancels them in the
     /// normal run, but no cancel is in flight for them, so cancel_ids
     /// reports one outstanding rather than already pending -- a Cancel All
-    /// or shutdown retry must not close the book over it.  Left by a Dead or
-    /// Settled proof; pruned with the deferrals when the offer leaves State.
+    /// or shutdown retry must not close the book over it.  Left by a Settled
+    /// proof, or [round 19] a Dead one at depth; pruned with the deferrals
+    /// when the offer leaves State.
     std::unordered_set<std::string> local_cancel_live_;
 
     /// Whether cancel_offer_charged() must refuse `trade_id`: an offer under
@@ -1689,6 +1694,10 @@ private:
     /// the call a fill proof belongs to: a proof is fresh only while no later
     /// call has started (execution::live_offer_cancellable).
     std::uint64_t fill_poll_heartbeat_{0};
+    /// [review #171 round 19] The block the latest detect_fills call ran at.
+    /// cancel_all judges a Dead proof's depth against it; an older block only
+    /// makes that stricter, and none (0) makes no Dead proof final.
+    BlockHeight latest_fill_poll_block_{0};
 
     /// [S70] Block of retire_expired_offers' last WARN.  A wallet that cannot
     /// supply a TRUSTED chain clock -- no answer, or a full-node peer this
