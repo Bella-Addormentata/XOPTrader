@@ -157,15 +157,14 @@ of 9,329,985.
   failed after a stop that worked left no wallet to answer Step 8's sync
   check. The watch then never decided again, and the wallet circuit breaker
   skipped Step 8 altogether, so the retry never came. Stop and start are now
-  two commands. A start that fails is owed, and the heartbeat retries it
-  before any wallet call or gate: after 60 seconds, then at doubling
-  intervals up to 15 minutes, until a start succeeds or the wallet answers.
-  The retry runs from the poll loop, before any wallet or height call
-  (review round 7). In wallet-only mode the heartbeat that ran it needed a
-  height from the wallet the failed start had left down, so it never came.
-  And once the owed start works, or the wallet answers, a restart whose
-  stop worked counts again, so the next budgets double as a successful
-  restart's do.
+  two commands. A start that fails is owed, and the poll loop retries it on
+  every poll, before any wallet or height call (review round 7): after 60
+  seconds, then at doubling intervals up to 15 minutes, until a start
+  succeeds or the wallet answers. It runs there rather than in the
+  heartbeat because in wallet-only mode a heartbeat needs a height from the
+  very wallet the failed start left down. Once the owed start works, or the
+  wallet answers, a restart whose stop worked counts again, so the next
+  budgets double as a successful restart's do.
 
 Not in this change: the wallet's own configuration (`use_delta_sync`,
 `connect_to_unknown_peers`), and the restart itself, which is still a blocking
