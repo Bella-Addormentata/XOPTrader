@@ -472,21 +472,25 @@ def test_the_sweep_is_judged_by_what_the_wallet_reports_after_it():
         "the re-read stops at the deadline and reports the rest outstanding"
     )
     # One read per offer, and a read that fails leaves no status at all.
-    read = re.search(r"int status = -1;\s*try \{\s*"
-                     r"const json rec = co_await wallet_->get_offer\(oid, /\*file_contents=\*/false\);\s*"
+    read = re.search(r"int status = -1;\s*json rec;\s*try \{\s*"
+                     r"rec = co_await wallet_->get_offer\(oid, /\*file_contents=\*/false\);\s*"
                      r"if \(const auto st = rec\.find\(\"status\"\); st != rec\.end\(\)\) \{\s*"
                      r"status = trade_status::parse\(\*st\);\s*\}\s*"
                      r"\} catch \(const std::exception& e\) \{\s*read_error = e\.what\(\);\s*\}",
                      reread)
     assert read, "the status is read after the sweep, and a failed read is no status"
     # The decision, in full.
+    # [round 18] CANCELLED has a block of its own, proven first
+    # (test_a_cancelled_offer_is_closed_by_the_sweep_only_once_the_chain_says_so).
+    cancelled_head = "} else if (status == trade_status::kCancelled) {"
+    cancelled_block = _block_after(reread, cancelled_head)
+    reread = reread.replace(cancelled_head[:-1] + cancelled_block, cancelled_head + " CANCELLED }", 1)
     decision = re.search(
         r"if \(status == trade_status::kConfirmed\) \{\s*to_cancel\.push_back\(oid\);\s*"
         r"\} else if \(status == trade_status::kPendingCancel\) \{\s*"
         r"out\.already_pending\.push_back\(oid\);\s*\+\+in_flight;\s*"
-        r"\} else if \(status == trade_status::kCancelled\) \{\s*"
-        r"out\.closed\.push_back\(oid\);\s*\+\+closed;\s*"
-        r"\} else if \(status == trade_status::kFailed\) \{\s*"
+        r"\} else if \(status == trade_status::kCancelled\) \{ CANCELLED \}\s*"
+        r"else if \(status == trade_status::kFailed\) \{\s*"
         r"fill_proof_deferrals_\.erase\(oid\);\s*out\.closed\.push_back\(oid\);\s*\+\+closed;\s*"
         r"\} else if \(trade_status::is_known\(status\)\) \{\s*"
         r"fill_proof_deferrals_\.erase\(oid\);\s*to_cancel\.push_back\(oid\);\s*"
@@ -513,6 +517,65 @@ def test_the_sweep_is_judged_by_what_the_wallet_reports_after_it():
     assert kept and kept.start() > held_branch.index("co_await cancel_ids("), (
         "an offer whose status is unknown is reported outstanding"
     )
+
+
+def test_a_cancelled_offer_is_closed_by_the_sweep_only_once_the_chain_says_so():
+    """[review #171, round 18] After an accepted sweep, the re-read reported an
+    offer the wallet calls CANCELLED as closed.  But a local cancel leaves every
+    maker coin unspent and the offer takeable, the sweep skips it as it skips
+    every completed trade, and every caller ignores `closed`: a shutdown could
+    end "all cancelled" with it still on offer.  Now such an offer is proven
+    on-chain first.  Dead or taken is closed.  Live, or not proven, is
+    outstanding, in `failed`, with nothing sent.  And it stays outstanding on a
+    retry: an offer proven CANCELLED and Live is remembered (local_cancel_live_),
+    and cancel_ids reports it in `failed`, never as a cancel already in flight."""
+    manager = _source(OFFER_MANAGER)
+    cancel_all = _function_body(
+        manager, "asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(")
+    bulk_ok = _block_after(cancel_all, "if (bulk_ok) {")
+    reread_branch = _block_after(bulk_ok, "if (!reread.empty()) {")
+    cancelled = _block_after(reread_branch, "} else if (status == trade_status::kCancelled) {")
+    asked = re.search(r"if \(proof_lookup_failed\) \{[^}]*\} else \{\s*"
+                      r"proof = co_await prove_fill_on_chain\(rec, proof_failure, lookup,\s*asked_node\);\s*"
+                      r"if \(lookup == ProofLookup::Failed\) \{\s*proof_lookup_failed = true;\s*\}\s*\}",
+                      cancelled)
+    assert asked, "proven on-chain, and not asked again in this sweep once a lookup has failed"
+    closed = re.search(r"if \(proof\.verdict == FillProof::Dead\s*"
+                       r"\|\| proof\.verdict == FillProof::Settled\) \{\s*"
+                       r"local_cancel_live_\.erase\(oid\);\s*"
+                       r"out\.closed\.push_back\(oid\);\s*\+\+closed;\s*\} else \{", cancelled)
+    assert closed and asked.end() < closed.start(), "only a Dead or taken offer is closed"
+    other = cancelled[closed.end() - 1:_matching(cancelled, closed.end() - 1) + 1]
+    assert re.search(r"if \(proof\.verdict == FillProof::Live\) \{\s*"
+                     r"local_cancel_live_\.insert\(oid\);", other), "a Live one is remembered as still takeable"
+    assert re.search(r"takeable\.push_back\(oid\);\s*\}$", other), "Live or not proven: outstanding"
+    assert "out.closed" not in other and "out.cancelled" not in other
+    kept = re.search(r"if \(!takeable\.empty\(\)\) \{[^}]*"
+                     r"out\.failed\.insert\(out\.failed\.end\(\), takeable\.begin\(\), takeable\.end\(\)\);",
+                     reread_branch)
+    assert kept and kept.start() > reread_branch.index("co_await cancel_ids("), (
+        "reported outstanding, with nothing sent for it"
+    )
+    # And on every retry: cancel_ids reports it outstanding, never already pending.
+    ids = _function_body(manager, "asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_ids(")
+    live = re.search(r"if \(po\.cancel_pending && local_cancel_live_\.count\(oid\) > 0U\) \{", ids)
+    pending = ids.index("if (po.cancel_pending) {")
+    assert live and live.start() < pending, "checked before the cancel-in-flight skip"
+    block = ids[live.end() - 1:_matching(ids, live.end() - 1) + 1]
+    assert re.search(r"out\.failed\.push_back\(oid\);\s*continue;\s*\}$", block), "outstanding, nothing sent"
+    assert "already_pending" not in block and "cancel_offer_charged" not in block
+    # detect_fills remembers what it proves, and forgets it on a Dead or taken proof.
+    detect = _function_body(manager, DETECT_FILLS)
+    assert re.search(r"state_->mark_cancel_pending\(trade_id\);\s*local_cancel_live_\.insert\(trade_id\);", detect), (
+        "the round-15 keep branch remembers a Live CANCELLED offer"
+    )
+    assert re.search(r"if \(reproof\.verdict == FillProof::Dead \|\| reproof\.verdict == FillProof::Settled\) \{\s*"
+                     r"local_cancel_live_\.erase\(trade_id\);\s*\}", detect)
+    assert re.search(r"for \(auto it = local_cancel_live_\.begin\(\); it != local_cancel_live_\.end\(\);\) \{\s*"
+                     r"it = pending_map\.count\(\*it\) \? std::next\(it\) : local_cancel_live_\.erase\(it\);\s*\}",
+                     detect), "pruned with the deferrals"
+    assert "local_cancel_live_.clear();" in _block_after(detect, "if (pending_offers.empty()) {")
+    assert re.search(r"std::unordered_set<std::string>\s+local_cancel_live_;", _source(OFFER_MANAGER_HPP))
 
 
 def test_the_latest_proof_is_what_a_cancel_is_judged_by():
@@ -737,9 +800,14 @@ def test_a_dead_answer_is_final_only_at_confirmation_depth():
     assert re.search(r"if \(dead_at_depth\) \{\s*cancel_status_proven_\[trade_id\] = status;", reproof), (
         "and only a Dead one at depth is remembered"
     )
-    assert reproof.count("FillProof::Dead") == 1, (
-        "a Dead verdict is read directly only where it is not yet deep enough"
+    # [round 18] Read directly twice: where it is not yet deep enough, and to
+    # forget that a local cancel was still takeable -- never for finality.
+    assert reproof.count("FillProof::Dead") == 2, (
+        "a Dead verdict is read directly only where it is not yet deep enough, and "
+        "for local_cancel_live_"
     )
+    assert re.search(r"if \(reproof\.verdict == FillProof::Dead \|\| reproof\.verdict == FillProof::Settled\) \{\s*"
+                     r"local_cancel_live_\.erase\(trade_id\);\s*\}", reproof)
     held_at = reproof.index("} else if (held) {")
     shallow = re.search(r"\} else if \(reproof\.verdict == FillProof::Dead\) \{", reproof)
     assert shallow and final.start() < held_at < shallow.start() < reproof.index(

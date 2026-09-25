@@ -1391,6 +1391,7 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
         cancel_status_proven_.clear();
         expiry_retired_.clear();
         cancel_status_inconclusive_.clear();
+        local_cancel_live_.clear();
         co_return fills;
     }
 
@@ -1416,6 +1417,9 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
     }
     for (auto it = cancel_status_inconclusive_.begin(); it != cancel_status_inconclusive_.end();) {
         it = pending_map.count(it->first) ? std::next(it) : cancel_status_inconclusive_.erase(it);
+    }
+    for (auto it = local_cancel_live_.begin(); it != local_cancel_live_.end();) {
+        it = pending_map.count(*it) ? std::next(it) : local_cancel_live_.erase(it);
     }
     for (auto it = fill_proof_deferrals_.begin(); it != fill_proof_deferrals_.end();) {
         it = pending_map.count(it->first) ? std::next(it) : fill_proof_deferrals_.erase(it);
@@ -1719,6 +1723,10 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
             if (reproof.verdict != FillProof::Unknown) {
                 cancel_status_inconclusive_.erase(trade_id);
             }
+            // [review #171 round 18] Dead or taken: no longer takeable.
+            if (reproof.verdict == FillProof::Dead || reproof.verdict == FillProof::Settled) {
+                local_cancel_live_.erase(trade_id);
+            }
             if (reproof.verdict == FillProof::Settled) {
                 logger_->warn("[FILL-PROOF] {} ({}): the wallet reports it {}, but "
                               "the chain shows the take -- a cancel of an offer "
@@ -1744,8 +1752,10 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
                     // [review #171 round 15] Cancelled locally and still
                     // takeable: tracked until the chain shows it taken
                     // (booked) or dead (closed), and cancel_pending, so
-                    // nothing cancels it again meanwhile.
+                    // nothing cancels it again meanwhile.  [round 18] Nor is it
+                    // reported as a cancel in flight (cancel_ids).
                     state_->mark_cancel_pending(trade_id);
+                    local_cancel_live_.insert(trade_id);
                     logger_->debug("[FILL-PROOF] {} ({}): the wallet reports it "
                                    "CANCELLED, but every maker coin is unspent -- a "
                                    "local cancel, still takeable; kept tracked",
@@ -2685,7 +2695,12 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(
             //   - CONFIRMED: the guarded per-offer path decides, as before;
             //   - PENDING_CANCEL: a cancel is in flight, this sweep's or an
             //     earlier one's -- nothing more is sent;
-            //   - CANCELLED or FAILED: nothing is left to cancel;
+            //   - FAILED: nothing is left to cancel;
+            //   - [round 18] CANCELLED: closed only once the chain shows it dead
+            //     or taken.  A local cancel leaves every maker coin unspent and
+            //     the offer takeable, and the sweep skips it as it skips every
+            //     completed trade, so one the chain shows Live, or cannot
+            //     prove, is reported outstanding, with nothing sent;
             //   - PENDING_ACCEPT or PENDING_CONFIRM: live, and not in the sweep,
             //     which would have left it PENDING_CANCEL -- cancelled here;
             //   - no answer, or no status the wallet really reports: the sweep
@@ -2700,6 +2715,9 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(
             // other status the wallet really reports releases it.
             std::vector<std::string> to_cancel;
             std::vector<std::string> unread;
+            std::vector<std::string> takeable;   // [round 18] CANCELLED, not proven closed
+            std::string takeable_why;
+            bool proof_lookup_failed = false;
             std::size_t in_flight = 0;
             std::size_t closed = 0;
             std::string read_error;
@@ -2713,8 +2731,9 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(
                     break;
                 }
                 int status = -1;
+                json rec;
                 try {
-                    const json rec = co_await wallet_->get_offer(oid, /*file_contents=*/false);
+                    rec = co_await wallet_->get_offer(oid, /*file_contents=*/false);
                     if (const auto st = rec.find("status"); st != rec.end()) {
                         status = trade_status::parse(*st);
                     }
@@ -2727,8 +2746,36 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(
                     out.already_pending.push_back(oid);
                     ++in_flight;
                 } else if (status == trade_status::kCancelled) {
-                    out.closed.push_back(oid);
-                    ++closed;
+                    // [review #171 round 18] Proven before it is called closed.
+                    std::string proof_failure;
+                    ProofLookup lookup = ProofLookup::Answered;
+                    bool asked_node = false;
+                    FillProofResult proof;
+                    if (proof_lookup_failed) {
+                        proof_failure = "an earlier coin lookup in this sweep failed";
+                    } else {
+                        proof = co_await prove_fill_on_chain(rec, proof_failure, lookup,
+                                                             asked_node);
+                        if (lookup == ProofLookup::Failed) {
+                            proof_lookup_failed = true;
+                        }
+                    }
+                    if (proof.verdict == FillProof::Dead
+                        || proof.verdict == FillProof::Settled) {
+                        local_cancel_live_.erase(oid);
+                        out.closed.push_back(oid);
+                        ++closed;
+                    } else {
+                        if (proof.verdict == FillProof::Live) {
+                            local_cancel_live_.insert(oid);
+                            takeable_why = "the wallet cancelled it only locally: every "
+                                           "maker coin is unspent, so it can still be taken";
+                        } else {
+                            takeable_why = "the wallet reports it CANCELLED, but the chain "
+                                           "did not show it dead or taken: " + proof_failure;
+                        }
+                        takeable.push_back(oid);
+                    }
                 } else if (status == trade_status::kFailed) {
                     fill_proof_deferrals_.erase(oid);
                     out.closed.push_back(oid);
@@ -2754,9 +2801,11 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(
             }
             if (!unread.empty()) {
                 out.failed.insert(out.failed.end(), unread.begin(), unread.end());
+                // [review #171 round 18] Either kind of re-read offer.
                 std::string why = read_error.empty()
-                    ? std::string{"the status of an offer the fill proof holds "
-                                  "could not be read after the sweep"}
+                    ? std::string{"the status of an offer the fill proof holds, or "
+                                  "one State had flagged cancel_pending, could not "
+                                  "be read after the sweep"}
                     : read_error;
                 const auto cls = execution::classify_take_failure(why);
                 out.worst_class = per_offer.failed.empty()
@@ -2766,15 +2815,29 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(
                     out.last_error = std::move(why);
                 }
             }
+            if (!takeable.empty()) {
+                // [review #171 round 18] Outstanding: CANCELLED in the wallet,
+                // and not proven closed on-chain.
+                const bool first_failure = per_offer.failed.empty() && unread.empty();
+                out.failed.insert(out.failed.end(), takeable.begin(), takeable.end());
+                const auto cls = execution::classify_take_failure(takeable_why);
+                out.worst_class = first_failure
+                    ? cls
+                    : execution::more_retryable(out.worst_class, cls);
+                if (first_failure) {
+                    out.last_error = takeable_why;
+                }
+            }
             out.deadline_hit = out.deadline_hit || per_offer.deadline_hit;
             logger_->warn("cancel_all: {} offer(s) the fill proof held or State "
                           "had cancel_pending, re-read "
                           "after the sweep: {} with a cancel already in flight "
-                          "and {} closed, nothing sent for either; {} still "
+                          "and {} closed, nothing sent for either; {} CANCELLED "
+                          "but not proven closed on-chain, reported outstanding; {} still "
                           "CONFIRMED or live and not swept -- {} cancelled one "
                           "by one, {} still outstanding; {} unreadable, "
                           "reported outstanding with nothing sent",
-                          reread.size(), in_flight, closed, to_cancel.size(),
+                          reread.size(), in_flight, closed, takeable.size(), to_cancel.size(),
                           per_offer.cancelled.size(), per_offer.failed.size(),
                           unread.size());
         }
@@ -2947,6 +3010,23 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_ids(
         // flight. recheck_terminal returns Revived for PENDING_CANCEL and
         // calls mark_cancel_pending() precisely to stop this -- but only
         // callers that READ the flag are stopped by it.
+        if (po.cancel_pending && local_cancel_live_.count(oid) > 0U) {
+            // [review #171 round 18] Not a cancel in flight: the wallet
+            // cancelled it only locally, and the chain last showed every
+            // maker coin unspent.  It can still be taken, so it is reported
+            // outstanding, never already pending -- or a retry would close
+            // the book over it.  Nothing is sent.
+            const std::string why = "the wallet cancelled " + oid.substr(0, 12)
+                + " only locally, and the chain last showed it still takeable";
+            logger_->warn("cancel_ids: {} -- reported outstanding, nothing sent", why);
+            const auto cls = execution::classify_take_failure(why);
+            out.worst_class = have_class ? execution::more_retryable(out.worst_class, cls)
+                                         : cls;
+            have_class = true;
+            out.last_error = why;
+            out.failed.push_back(oid);
+            continue;
+        }
         if (po.cancel_pending) {
             logger_->info("cancel_ids: {} already has a cancel in flight -- "
                           "skipping (a second secure cancel would pay a "

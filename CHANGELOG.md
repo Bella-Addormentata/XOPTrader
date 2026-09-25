@@ -179,6 +179,14 @@ can pass for an offer nobody took.
   `strategy.confirmation_depth_blocks` from the first such answer. Only
   then does its status stand. A record that gives the proof nothing to ask,
   such as no readable maker coin, still lets it stand at once.
+  After an accepted Cancel All sweep, an offer the wallet reports CANCELLED
+  is proven on-chain before it counts as closed (review round 18). A local
+  cancel leaves every maker coin unspent and the offer takeable, and the
+  sweep skips it, so a shutdown could end "all cancelled" with it still on
+  offer. One the chain shows dead or taken is closed. One it shows live, or
+  cannot prove, is reported outstanding, and stays so on every retry: the
+  per-offer path no longer reports such an offer as a cancel already in
+  flight. Nothing is sent for it; it takes a secure cancel.
   Cancel All's wallet-wide sweep skips every trade the wallet calls
   completed, so it never reports a held offer as cancelled. Such an offer goes
   through the guarded per-offer path instead: it is cancelled there if the

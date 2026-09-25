@@ -475,7 +475,9 @@ public:
         std::vector<std::string> already_pending;
         /// [FILL-PROOF, review #171 round 11] Offers the fill proof held that
         /// the wallet reported CANCELLED or FAILED when read again after an
-        /// accepted sweep -- [round 16] or that State had cancel_pending. Nothing was sent for them and nothing is left to
+        /// accepted sweep -- [round 16] or that State had cancel_pending.
+        /// [round 18] A CANCELLED one only once the chain shows it dead or
+        /// taken: one it shows Live, or cannot prove, is in `failed`. Nothing was sent for them and nothing is left to
         /// send: not a cancel this call submitted, so not `cancelled`, whose
         /// ids the callers persist as submitted with their own cause; and not
         /// live, so not `failed`. detect_fills reads the terminal status (and
@@ -1458,6 +1460,15 @@ private:
         BlockHeight block{0};
     };
     std::unordered_map<std::string, InconclusiveSince> cancel_status_inconclusive_;
+
+    /// [review #171 round 18] Offers the wallet reports CANCELLED that the
+    /// chain last showed Live: cancelled only locally, and still takeable.
+    /// State flags them cancel_pending so nothing re-cancels them in the
+    /// normal run, but no cancel is in flight for them, so cancel_ids
+    /// reports one outstanding rather than already pending -- a Cancel All
+    /// or shutdown retry must not close the book over it.  Left by a Dead or
+    /// Settled proof; pruned with the deferrals when the offer leaves State.
+    std::unordered_set<std::string> local_cancel_live_;
 
     /// Whether cancel_offer_charged() must refuse `trade_id`: an offer under
     /// proof, unless its latest proof makes it cancellable.
