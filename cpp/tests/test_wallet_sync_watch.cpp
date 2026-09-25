@@ -395,7 +395,7 @@ TEST(WalletStartDebt, NothingIsOwedUntilAStartFails)
 TEST(WalletStartDebt, AFailedStartIsRetriedAfterTheBaseDelay)
 {
     WalletStartDebt debt;
-    owe_wallet_start(debt, 1000);
+    owe_wallet_start(debt, 1000, /*stop_worked=*/true);
     EXPECT_FALSE(wallet_start_due(debt, 1059));
     EXPECT_TRUE(wallet_start_due(debt, 1060));    // 60 s later
     EXPECT_TRUE(wallet_start_due(debt, 5000));    // and on every heartbeat after
@@ -403,19 +403,20 @@ TEST(WalletStartDebt, AFailedStartIsRetriedAfterTheBaseDelay)
 
 TEST(WalletStartDebt, EachFailedRetryDoublesTheDelayUpToTheCap)
 {
+    WalletSyncWatch watch;
     WalletStartDebt debt;
-    owe_wallet_start(debt, 0);
-    record_wallet_start(debt, /*started=*/false, 60);
+    owe_wallet_start(debt, 0, /*stop_worked=*/true);
+    record_wallet_start(debt, watch, /*started=*/false, 60);
     ASSERT_TRUE(debt.retry_at.has_value());
     EXPECT_EQ(*debt.retry_at, 60 + 120);
-    record_wallet_start(debt, false, 180);
+    record_wallet_start(debt, watch, false, 180);
     EXPECT_EQ(*debt.retry_at, 180 + 240);
-    record_wallet_start(debt, false, 420);
+    record_wallet_start(debt, watch, false, 420);
     EXPECT_EQ(*debt.retry_at, 420 + 480);
-    record_wallet_start(debt, false, 900);
+    record_wallet_start(debt, watch, false, 900);
     EXPECT_EQ(*debt.retry_at, 900 + 900);         // 960, capped at 15 min
     for (int i = 0; i < 40; ++i) {
-        record_wallet_start(debt, false, 10'000);
+        record_wallet_start(debt, watch, false, 10'000);
     }
     EXPECT_EQ(*debt.retry_at, 10'000 + 900);      // no overflow, still capped
     EXPECT_EQ(debt.attempts, 44U);
@@ -423,10 +424,11 @@ TEST(WalletStartDebt, EachFailedRetryDoublesTheDelayUpToTheCap)
 
 TEST(WalletStartDebt, AStartThatWorksSettlesTheDebt)
 {
+    WalletSyncWatch watch;
     WalletStartDebt debt;
-    owe_wallet_start(debt, 0);
-    record_wallet_start(debt, false, 60);
-    record_wallet_start(debt, /*started=*/true, 180);
+    owe_wallet_start(debt, 0, /*stop_worked=*/true);
+    record_wallet_start(debt, watch, false, 60);
+    record_wallet_start(debt, watch, /*started=*/true, 180);
     EXPECT_FALSE(debt.retry_at.has_value());
     EXPECT_EQ(debt.attempts, 0U);
     EXPECT_FALSE(wallet_start_due(debt, 1'000'000));
@@ -434,9 +436,10 @@ TEST(WalletStartDebt, AStartThatWorksSettlesTheDebt)
 
 TEST(WalletStartDebt, AWalletThatAnswersOwesNothing)
 {
+    WalletSyncWatch watch;
     WalletStartDebt debt;
-    owe_wallet_start(debt, 0);
-    clear_wallet_start(debt);
+    owe_wallet_start(debt, 0, /*stop_worked=*/true);
+    clear_wallet_start(debt, watch);
     EXPECT_FALSE(wallet_start_due(debt, 1'000'000));
 }
 
@@ -444,13 +447,15 @@ TEST(WalletStartDebt, ASecondFailedRestartKeepsTheScheduleItFound)
 {
     // A restart that fails while a start is already owed must not push the
     // retry back to the base delay, or keep resetting it.
+    WalletSyncWatch watch;
     WalletStartDebt debt;
-    owe_wallet_start(debt, 0);
-    record_wallet_start(debt, false, 60);          // next at 180
-    owe_wallet_start(debt, 100);
+    owe_wallet_start(debt, 0, /*stop_worked=*/true);
+    record_wallet_start(debt, watch, false, 60);   // next at 180
+    owe_wallet_start(debt, 100, /*stop_worked=*/false);
     ASSERT_TRUE(debt.retry_at.has_value());
     EXPECT_EQ(*debt.retry_at, 180);
     EXPECT_EQ(debt.attempts, 1U);
+    EXPECT_TRUE(debt.restart_credit);              // [round 7] nor loses a stop that worked
 }
 
 TEST(WalletStartDebt, APolicyOverridesTheRetryDelays)
@@ -458,13 +463,82 @@ TEST(WalletStartDebt, APolicyOverridesTheRetryDelays)
     WalletRestartPolicy policy;
     policy.start_retry_base_s = 10;
     policy.start_retry_cap_s  = 25;
+    WalletSyncWatch watch;
     WalletStartDebt debt;
-    owe_wallet_start(debt, 0, policy);
+    owe_wallet_start(debt, 0, /*stop_worked=*/true, policy);
     EXPECT_TRUE(wallet_start_due(debt, 10));
-    record_wallet_start(debt, false, 10, policy);
+    record_wallet_start(debt, watch, false, 10, policy);
     EXPECT_EQ(*debt.retry_at, 10 + 20);
-    record_wallet_start(debt, false, 30, policy);
+    record_wallet_start(debt, watch, false, 30, policy);
     EXPECT_EQ(*debt.retry_at, 30 + 25);            // 40, capped
+}
+
+// ---------------------------------------------------------------------------
+// [review round 7] The restart a settled debt finishes counts again
+// ---------------------------------------------------------------------------
+
+TEST(WalletStartDebt, AnOwedStartThatWorksCountsTheRestartItFinished)
+{
+    // The stop worked and the start failed, so the watch took the restart's
+    // doubling back.  Once a retried start works, that restart has happened
+    // after all, and the next budgets double as a successful restart's do.
+    WalletSyncWatch watch;
+    ASSERT_EQ(see(watch, kUnsynced, kIdle, 0).action, WalletSyncAction::Wait);
+    ASSERT_EQ(see(watch, kUnsynced, kIdle, 450).action, WalletSyncAction::Wait);
+    ASSERT_EQ(see(watch, kUnsynced, kIdle, 900).action, WalletSyncAction::Restart);
+    record_failed_wallet_restart(watch);           // the start command failed
+    ASSERT_EQ(watch.restarts, 0U);
+
+    WalletStartDebt debt;
+    owe_wallet_start(debt, 900, /*stop_worked=*/true);
+    record_wallet_start(debt, watch, /*started=*/false, 960);
+    EXPECT_EQ(watch.restarts, 0U);                 // still down: nothing to count yet
+    record_wallet_start(debt, watch, /*started=*/true, 1080);
+    EXPECT_EQ(watch.restarts, 1U);
+    EXPECT_FALSE(wallet_start_due(debt, 1'000'000));
+
+    const WalletSyncVerdict v = see(watch, kUnsynced, kIdle, 1100);
+    EXPECT_EQ(v.restarts, 1U);
+    EXPECT_EQ(v.idle_budget_s, 1800);              // doubled
+    EXPECT_EQ(v.syncing_budget_s, 14400);
+}
+
+TEST(WalletStartDebt, AWalletThatAnswersCountsTheRestartToo)
+{
+    // However the wallet came back -- this engine's retry, the operator or
+    // Chia's own daemon -- a restart whose stop worked has finished.
+    WalletSyncWatch watch;
+    WalletStartDebt debt;
+    owe_wallet_start(debt, 0, /*stop_worked=*/true);
+    clear_wallet_start(debt, watch);
+    EXPECT_EQ(watch.restarts, 1U);
+    EXPECT_FALSE(wallet_start_due(debt, 1'000'000));
+    clear_wallet_start(debt, watch);                // every later answer: nothing more
+    EXPECT_EQ(watch.restarts, 1U);
+}
+
+TEST(WalletStartDebt, NoRestartIsCountedWhenTheStopFailed)
+{
+    // A stop that failed restarted nothing, so settling the start it owed
+    // gives nothing back.
+    WalletSyncWatch watch;
+    WalletStartDebt debt;
+    owe_wallet_start(debt, 0, /*stop_worked=*/false);
+    record_wallet_start(debt, watch, /*started=*/true, 60);
+    EXPECT_EQ(watch.restarts, 0U);
+    owe_wallet_start(debt, 100, /*stop_worked=*/false);
+    clear_wallet_start(debt, watch);
+    EXPECT_EQ(watch.restarts, 0U);
+}
+
+TEST(WalletStartDebt, TheRestartIsCountedOnceWhateverSettlesIt)
+{
+    WalletSyncWatch watch;
+    WalletStartDebt debt;
+    owe_wallet_start(debt, 0, /*stop_worked=*/true);
+    record_wallet_start(debt, watch, /*started=*/true, 60);
+    clear_wallet_start(debt, watch);                // the wallet then answers
+    EXPECT_EQ(watch.restarts, 1U);
 }
 
 TEST(WalletSyncWatch, APolicyOverridesEveryBudget)

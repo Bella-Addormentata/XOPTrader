@@ -49,9 +49,12 @@
 //     per heartbeat.  Reporting synced clears everything, the backoff included.
 //   * A RESTART WHOSE START FAILED OWES A START.  [review round 6] The stop may
 //     have worked, leaving no wallet to answer the sync check, so the watch
-//     could never decide again.  The engine retries the start from the
-//     heartbeat itself (WalletStartDebt): after 60 s, then at doubling
-//     intervals up to 15 minutes, until a start succeeds or the wallet answers.
+//     could never decide again.  The engine retries the start from its poll
+//     loop, before any wallet or height call [round 7] (WalletStartDebt):
+//     after 60 s, then at doubling intervals up to 15 minutes, until a start
+//     succeeds or the wallet answers.  [round 7] A restart whose stop worked
+//     then counts again: settling the debt gives back the doubling
+//     record_failed_wallet_restart() took.
 //   * TIME IS MEASURED, NOT COUNTED, on a monotonic clock.  A silence longer
 //     than max_observation_gap_s (Step 8 not reached: paused, breaker open)
 //     says nothing about the wallet, so it starts a new streak instead of
@@ -214,22 +217,30 @@ inline void record_failed_wallet_restart(WalletSyncWatch& watch) noexcept
 /// command failed.  The stop may well have worked, and then there is no wallet
 /// to answer Step 8's sync check: the watch never observes again, and the
 /// wallet circuit breaker skips Step 8 altogether.  So the retry cannot wait on
-/// the watch.  The engine asks at the top of every heartbeat, before any
-/// wallet call or gate, and clears the debt when the wallet answers.
+/// the watch.  [review round 7] The engine asks on every poll, before any
+/// wallet or height call -- a heartbeat needs a height, which in wallet-only
+/// mode comes from the wallet that is down -- and settles the debt when the
+/// wallet answers.
 struct WalletStartDebt {
     std::optional<std::int64_t> retry_at{};   ///< when the next start is due; empty: none owed
     std::uint32_t               attempts{0};  ///< start commands that failed since it was owed
+    /// [review round 7] The restart's stop worked, so a restart did begin.
+    /// record_failed_wallet_restart() took its doubling back when the start
+    /// failed; settling the debt gives it back, once.
+    bool                        restart_credit{false};
 };
 
 /// The restart's start command failed: a start is owed, first due after the
-/// base delay.  A debt already owed keeps its own schedule.
-inline void owe_wallet_start(WalletStartDebt& debt, std::int64_t now_s,
+/// base delay.  A debt already owed keeps its own schedule.  [review round 7]
+/// `stop_worked`: the restart's stop command succeeded, so the restart began.
+inline void owe_wallet_start(WalletStartDebt& debt, std::int64_t now_s, bool stop_worked,
                              const WalletRestartPolicy& policy = WalletRestartPolicy{}) noexcept
 {
     if (!debt.retry_at.has_value()) {
         debt.retry_at = now_s + policy.start_retry_base_s;
         debt.attempts = 0;
     }
+    debt.restart_credit = debt.restart_credit || stop_worked;
 }
 
 /// Is a start owed, and due?
@@ -239,13 +250,27 @@ inline void owe_wallet_start(WalletStartDebt& debt, std::int64_t now_s,
     return debt.retry_at.has_value() && now_s >= *debt.retry_at;
 }
 
+/// [review round 7] The debt is settled: a start worked, or the wallet
+/// answered.  If the restart's stop had worked, that restart has now
+/// finished, so it counts: the doubling record_failed_wallet_restart() took
+/// back is given back, once, and the next budgets double as a successful
+/// restart's do.
+inline void settle_wallet_start(WalletStartDebt& debt, WalletSyncWatch& watch) noexcept
+{
+    if (debt.restart_credit) {
+        ++watch.restarts;
+    }
+    debt = WalletStartDebt{};
+}
+
 /// A start command sent because one was due: success settles the debt, and a
 /// failure doubles the delay to the next one, up to the cap.
-inline void record_wallet_start(WalletStartDebt& debt, bool started, std::int64_t now_s,
+inline void record_wallet_start(WalletStartDebt& debt, WalletSyncWatch& watch, bool started,
+                                std::int64_t now_s,
                                 const WalletRestartPolicy& policy = WalletRestartPolicy{}) noexcept
 {
     if (started) {
-        debt = WalletStartDebt{};
+        settle_wallet_start(debt, watch);
         return;
     }
     ++debt.attempts;
@@ -254,9 +279,9 @@ inline void record_wallet_start(WalletStartDebt& debt, bool started, std::int64_
 }
 
 /// The wallet answered: whatever was owed, it is running.
-inline void clear_wallet_start(WalletStartDebt& debt) noexcept
+inline void clear_wallet_start(WalletStartDebt& debt, WalletSyncWatch& watch) noexcept
 {
-    debt = WalletStartDebt{};
+    settle_wallet_start(debt, watch);
 }
 
 }  // namespace xop::execution

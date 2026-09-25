@@ -3362,6 +3362,36 @@ asio::awaitable<void> Engine::poll_loop_coro()
         }
 
         try {
+            // [WALLET-RESTART-LIVELOCK review round 6] A wallet start still owed
+            // after a restart whose start command failed (Step 8).  [review round 7]
+            // Here, on every poll, before any wallet or height call.  The heartbeat
+            // that used to retry it runs only once a height has been read, and in
+            // wallet-only mode -- configured, or S28's fallback -- that height comes
+            // from the wallet the failed start left down, so no heartbeat came and
+            // the wallet stayed down.  Blocking, like the restart itself.  Due after
+            // 60 s, then at doubling intervals up to 15 minutes, until a start
+            // succeeds or the wallet answers.  Either way a restart whose stop
+            // worked then counts again, and the next budgets double.
+            {
+                const std::int64_t now_s =
+                    std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count();
+                if (execution::wallet_start_due(wallet_start_debt_, now_s)) {
+                    const int rc = std::system("chia start wallet");
+                    execution::record_wallet_start(wallet_start_debt_, wallet_sync_watch_,
+                                                   rc == 0, now_s);
+                    if (rc == 0) {
+                        spdlog::warn("[Engine] Owed wallet start sent after a failed "
+                                     "restart -- Step 8 resumes once the wallet answers");
+                    } else {
+                        spdlog::error("[Engine] Owed wallet start failed again (rc={}, "
+                                      "{} attempt(s)) -- next try in {}s", rc,
+                                      wallet_start_debt_.attempts,
+                                      wallet_start_debt_.retry_at.value_or(now_s) - now_s);
+                    }
+                }
+            }
+
             // -- Wallet circuit breaker: probe for recovery ----------------
             if (wallet_circuit_open_) {
                 auto now = std::chrono::steady_clock::now();
@@ -4352,31 +4382,9 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
     // says so (engine.hpp).
     step8_sync_gate_passed_ = false;
 
-    // [WALLET-RESTART-LIVELOCK review round 6] A wallet start still owed after a
-    // restart whose start command failed (Step 8).  Here, above every wallet
-    // call and gate: with the stop done and the start failed, there is no
-    // wallet to answer Step 8's sync check, and the wallet circuit breaker
-    // skips Step 8 altogether, so a retry left to the watch would never come.
-    // Blocking, like the restart itself.  Due after 60 s, then at doubling
-    // intervals up to 15 minutes, until a start succeeds or the wallet answers.
-    {
-        const std::int64_t now_s =
-            std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count();
-        if (execution::wallet_start_due(wallet_start_debt_, now_s)) {
-            const int rc = std::system("chia start wallet");
-            execution::record_wallet_start(wallet_start_debt_, rc == 0, now_s);
-            if (rc == 0) {
-                spdlog::warn("[Engine] Owed wallet start sent after a failed "
-                             "restart -- Step 8 resumes once the wallet answers");
-            } else {
-                spdlog::error("[Engine] Owed wallet start failed again (rc={}, "
-                              "{} attempt(s)) -- next try in {}s", rc,
-                              wallet_start_debt_.attempts,
-                              wallet_start_debt_.retry_at.value_or(now_s) - now_s);
-            }
-        }
-    }
+    // [WALLET-RESTART-LIVELOCK review round 7] A wallet start still owed after a
+    // failed restart is retried from poll_loop_coro, not here: this heartbeat
+    // runs only once a height has been read.
 
     // [T3-08] Reset NHE accumulators for this cycle.
     nhe_net_inventory_change_ = 0.0;
@@ -11773,7 +11781,9 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
     try {
         auto sync_status = co_await wallet_->get_sync_status();
         // [review round 6] It answered, so it is running: no start is owed.
-        execution::clear_wallet_start(wallet_start_debt_);
+        // [review round 7] And a restart whose stop worked has finished: it
+        // counts again, so the next budgets double.
+        execution::clear_wallet_start(wallet_start_debt_, wallet_sync_watch_);
         bool synced = false;
         if (sync_status.contains("synced"))
             synced = sync_status["synced"].get<bool>();
@@ -11838,7 +11848,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     // attempt keeps this one's budget instead of doubling it.
                     execution::record_failed_wallet_restart(wallet_sync_watch_);
                     if (start_rc != 0) {
-                        execution::owe_wallet_start(wallet_start_debt_, now_s);
+                        execution::owe_wallet_start(wallet_start_debt_, now_s, stop_rc == 0);
                     }
                     spdlog::error("[Engine] Wallet service restart failed "
                                   "(stop rc={}, start rc={}); {} failed "
@@ -11848,7 +11858,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                   wallet_sync_watch_.failed_restarts,
                                   start_rc != 0
                                       ? "; the start is retried from the "
-                                        "heartbeat, which needs no wallet answer"
+                                        "poll loop, which needs no wallet answer"
                                       : "");
                 }
             }

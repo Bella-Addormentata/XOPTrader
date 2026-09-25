@@ -26,6 +26,7 @@ ENGINE_HPP = REPO / "cpp" / "include" / "xop" / "engine.hpp"
 
 STEP8 = "asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)"
 HEARTBEAT = "asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)"
+POLL_LOOP = "asio::awaitable<void> Engine::poll_loop_coro()"
 RESTART_COMMAND = 'std::system("chia stop wallet'
 
 
@@ -269,15 +270,23 @@ def test_the_resync_line_reports_the_whole_outage_or_says_it_is_unknown() -> Non
     )
 
 
-def test_a_start_that_failed_is_owed_and_retried_from_the_heartbeat() -> None:
+def test_a_start_that_failed_is_owed_and_retried_from_the_poll_loop() -> None:
     """Review round 6: `chia stop wallet & chia start wallet` returned only the
     start's code on Windows, and a start that failed after a stop that worked
     left the wallet down.  Then nothing answers Step 8's sync check, the watch
     never decides again, and the wallet circuit breaker skips Step 8 entirely,
-    so the budgeted retry never came.  Stop and start are now two commands.  A
-    failed start is owed, and the heartbeat retries it, above every wallet call
-    and gate, on the watch's own backoff (WalletStartDebt), until a start
-    works or the wallet answers."""
+    so the budgeted retry never came.  Stop and start are now two commands, and
+    a failed start is owed (WalletStartDebt), retried on the watch's own backoff
+    until a start works or the wallet answers.
+
+    Review round 7: retried from the poll loop, not the heartbeat.  A heartbeat
+    runs only once a height has been read, and in wallet-only mode --
+    configured, or S28's fallback -- that height comes from the wallet the
+    failed start left down, so the retry never ran.  It now runs on every poll,
+    right after the poll's wait and before the circuit-breaker probe and the
+    height call.  And the debt remembers whether the stop worked: settling it,
+    by a start that works or by the wallet answering, counts that restart again
+    (settle_wallet_start, pinned by gtest)."""
     text = _engine()
     body = _function_body(text, STEP8)
     assert 'std::system("chia stop wallet &' not in text, "one combined command again"
@@ -287,29 +296,37 @@ def test_a_start_that_failed_is_owed_and_retried_from_the_heartbeat() -> None:
     fail_open = body.index("{", body.index("else", body.index("if (stop_rc == 0 && start_rc == 0)")))
     failure = body[fail_open:_matching(body, fail_open)]
     owed = re.search(r"if \(start_rc != 0\) \{\s*"
-                     r"execution::owe_wallet_start\(wallet_start_debt_, now_s\);\s*\}", failure)
-    assert owed, "a failed start must be owed"
+                     r"execution::owe_wallet_start\(wallet_start_debt_, now_s, stop_rc == 0\);\s*\}", failure)
+    assert owed, "a failed start must be owed, remembering whether the stop worked"
     assert text.count("execution::owe_wallet_start(") == 1
 
-    # The wallet answered: nothing is owed.
+    # The wallet answered: nothing is owed, and a restart whose stop worked counts.
     cleared = re.search(r"auto sync_status = co_await wallet_->get_sync_status\(\);\s*"
-                        r"execution::clear_wallet_start\(wallet_start_debt_\);", body)
+                        r"execution::clear_wallet_start\(wallet_start_debt_, wallet_sync_watch_\);", body)
     assert cleared, "an answer to the sync check settles the debt"
 
-    # The retry: at the top of the heartbeat, before any wallet call or gate.
-    heartbeat = _function_body(text, HEARTBEAT)
+    # The retry: in the poll loop, on every poll, before any wallet or height call.
+    poll = _function_body(text, POLL_LOOP)
+    loop = poll[poll.index("while (!stop_requested_.load(std::memory_order_relaxed)) {"):]
     retry = re.search(r"if \(execution::wallet_start_due\(wallet_start_debt_, now_s\)\) \{\s*"
                       r'const int rc = std::system\("chia start wallet"\);\s*'
-                      r"execution::record_wallet_start\(wallet_start_debt_, rc == 0, now_s\);", heartbeat)
-    assert retry, "an owed start must be retried from the heartbeat, and its outcome recorded"
-    # After the circuit's transport mark, a local counter read and not a call.
-    mark_end = heartbeat.index(";", heartbeat.index("wallet_transport_at_cycle_start_ ="))
-    assert mark_end < retry.start()
-    for later in ("co_await", "wallet_step_may_run(", "wallet_->"):
-        at = heartbeat.find(later, mark_end)
-        assert at == -1 or retry.start() < at, f"the retry must come before the first {later}"
-    now = re.search(r"const\s+std::int64_t\s+now_s\s*=([^;]+);", heartbeat[:retry.start()])
-    assert now and "steady_clock" in now.group(1), "the retry runs on the monotonic clock"
+                      r"execution::record_wallet_start\(wallet_start_debt_, wallet_sync_watch_,\s*"
+                      r"rc == 0, now_s\);", loop)
+    assert retry, "an owed start must be retried from the poll loop, and its outcome recorded"
+    wait = "co_await timer.async_wait("
+    assert loop.index(wait) < retry.start(), "after the poll's wait"
+    assert "co_await" not in loop[loop.index(wait) + len(wait):retry.start()], (
+        "nothing is awaited between the poll's wait and the retry"
+    )
+    for later in ("if (wallet_circuit_open_) {", "wallet_->get_height_info()",
+                  "co_await on_new_block_coro("):
+        assert retry.start() < loop.index(later), f"the retry must come before {later}"
+    nows = list(re.finditer(r"const\s+std::int64_t\s+now_s\s*=([^;]+);", loop[:retry.start()]))
+    assert nows and "steady_clock" in nows[-1].group(1), "the retry runs on the monotonic clock"
+    assert "wallet_start_due(" not in _function_body(text, HEARTBEAT), (
+        "one retry, from the poll loop: the heartbeat no longer asks"
+    )
+    assert text.count("execution::wallet_start_due(") == 1
     assert text.count('std::system("chia start wallet")') == 2, (
         "a wallet start runs only in the restart and in the owed retry"
     )
