@@ -33,6 +33,8 @@ PROVE_ON_CHAIN = "OfferManager::prove_fill_on_chain(const json& trade_record"
 RECHECK_TERMINAL = "OfferManager::recheck_terminal(const std::string& trade_id,"
 STEP_PROCESS_FILLS = "asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)"
 WALLET_COIN_RECORDS = "ChiaWalletRPC::get_coin_records_by_names(const std::vector<std::string>& names)"
+POLL_LOOP = "asio::awaitable<void> Engine::poll_loop_coro()"
+STARTUP_RECONCILE = "asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile("
 
 
 def _read(path: Path) -> str:
@@ -728,3 +730,35 @@ def test_detect_fills_describes_only_its_own_call():
         "the dead list must be cleared before detect_fills can return, or the "
         "engine records the same offers again"
     )
+
+
+def test_a_wallet_cancelled_row_is_proven_before_boot_closes_it():
+    """[review #171, round 13] At boot, startup_reconcile's DB leg counted a
+    wallet CANCELLED as terminal, and the engine stamped the row cancelled
+    and dropped it before restoring the book.  So a take that a cancel had
+    overwritten before a restart never reached the round-12 proof, and was
+    lost for good.  CANCELLED is now a bucket of its own.  The row is not
+    stamped: it restores into State flagged cancel_pending, and detect_fills
+    proves it on-chain the first time it polls it.  FAILED, which no cancel
+    writes, is still stamped."""
+    reconcile = _function_body(_source(OFFER_MANAGER), STARTUP_RECONCILE)
+    buckets = re.search(r"if \(status == trade_status::kFailed\) \{\s*db_leg_\.terminal\.push_back\(id\);\s*"
+                        r"\} else if \(status == trade_status::kCancelled\) \{\s*"
+                        r"db_leg_\.cancelled_unproven\.push_back\(id\);\s*\}", reconcile)
+    assert buckets, "a wallet CANCELLED must not be terminal at boot"
+    assert reconcile.count("db_leg_.terminal.push_back(") == 1
+    leg = _block_after(_source(OFFER_MANAGER_HPP), "struct StartupDbLeg {")
+    assert "std::vector<std::string> cancelled_unproven;" in leg
+    assert "cancelled_unproven.size()" in _block_after(leg, "std::size_t total() const noexcept")
+
+    engine = _function_body(_source(ENGINE), POLL_LOOP)
+    stamp = _block_after(engine, "for (const auto& oid : leg.terminal) {")
+    assert "cancelled_unproven" not in stamp, "a CANCELLED row must not be stamped"
+    carried = re.search(r"if \(!leg\.cancelled_unproven\.empty\(\)\) \{\s*"
+                        r"cancelled_unproven = leg\.cancelled_unproven;", engine)
+    assert carried, "the ids are carried out to the restore"
+    assert engine.count("known_ids.erase(") == 1, "only a stamped row stays out of the restore"
+    restore = engine.index("const PendingOffer po = pending_offer_from_db(rec);")
+    flagged = re.search(r"for \(const auto& oid : cancelled_unproven\) \{\s*"
+                        r"state_->mark_cancel_pending\(oid\);\s*\}", engine)
+    assert flagged and flagged.start() > restore, "flagged cancel_pending once restored"
