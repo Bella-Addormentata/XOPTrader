@@ -4227,6 +4227,32 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
     }
     wallet_skip_warned_this_cycle_ = false;
 
+    // [WALLET-RESTART-LIVELOCK review round 6] A wallet start still owed after a
+    // restart whose start command failed (Step 8).  Here, above every wallet
+    // call and gate: with the stop done and the start failed, there is no
+    // wallet to answer Step 8's sync check, and the wallet circuit breaker
+    // skips Step 8 altogether, so a retry left to the watch would never come.
+    // Blocking, like the restart itself.  Due after 60 s, then at doubling
+    // intervals up to 15 minutes, until a start succeeds or the wallet answers.
+    {
+        const std::int64_t now_s =
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (execution::wallet_start_due(wallet_start_debt_, now_s)) {
+            const int rc = std::system("chia start wallet");
+            execution::record_wallet_start(wallet_start_debt_, rc == 0, now_s);
+            if (rc == 0) {
+                spdlog::warn("[Engine] Owed wallet start sent after a failed "
+                             "restart -- Step 8 resumes once the wallet answers");
+            } else {
+                spdlog::error("[Engine] Owed wallet start failed again (rc={}, "
+                              "{} attempt(s)) -- next try in {}s", rc,
+                              wallet_start_debt_.attempts,
+                              wallet_start_debt_.retry_at.value_or(now_s) - now_s);
+            }
+        }
+    }
+
     // [T3-08] Reset NHE accumulators for this cycle.
     nhe_net_inventory_change_ = 0.0;
     nhe_total_volume_         = 0.0;
@@ -11557,6 +11583,8 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
     // (9 between 17:18 and 18:24) kept a syncing wallet from ever finishing.
     try {
         auto sync_status = co_await wallet_->get_sync_status();
+        // [review round 6] It answered, so it is running: no start is owed.
+        execution::clear_wallet_start(wallet_start_debt_);
         bool synced = false;
         if (sync_status.contains("synced"))
             synced = sync_status["synced"].get<bool>();
@@ -11605,22 +11633,34 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                              "succeeds, the next attempt's budgets double)",
                              sync_watch.unsynced_for_s, sync_watch.idle_for_s,
                              sync_watch.restarts + 1);
-#ifdef _WIN32
-                int rc = std::system("chia stop wallet & chia start wallet");
-#else
-                int rc = std::system("chia stop wallet && chia start wallet");
-#endif
-                if (rc == 0) {
+                // [review round 6] Two commands, not one.  `stop & start` (Windows)
+                // returned only the start's code, and `stop && start` (POSIX)
+                // skipped the start after a failed stop, so neither said which
+                // half failed.  A start that failed after a stop that worked
+                // leaves no wallet to answer the sync check, and the watch
+                // could then never decide again.  That start is owed, and the
+                // heartbeat retries it without asking the wallet anything.
+                const int stop_rc  = std::system("chia stop wallet");
+                const int start_rc = std::system("chia start wallet");
+                if (stop_rc == 0 && start_rc == 0) {
                     spdlog::info("[Engine] Wallet service restart initiated");
                 } else {
                     // A command that failed restarted nothing: the next
                     // attempt keeps this one's budget instead of doubling it.
                     execution::record_failed_wallet_restart(wallet_sync_watch_);
+                    if (start_rc != 0) {
+                        execution::owe_wallet_start(wallet_start_debt_, now_s);
+                    }
                     spdlog::error("[Engine] Wallet service restart failed "
-                                  "(rc={}); {} failed attempt(s) since the "
-                                  "wallet was last synced -- the next attempt "
-                                  "keeps the same budget", rc,
-                                  wallet_sync_watch_.failed_restarts);
+                                  "(stop rc={}, start rc={}); {} failed "
+                                  "attempt(s) since the wallet was last "
+                                  "synced -- the next attempt keeps the same "
+                                  "budget{}", stop_rc, start_rc,
+                                  wallet_sync_watch_.failed_restarts,
+                                  start_rc != 0
+                                      ? "; the start is retried from the "
+                                        "heartbeat, which needs no wallet answer"
+                                      : "");
                 }
             }
             co_return;

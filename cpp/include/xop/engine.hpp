@@ -2697,6 +2697,12 @@ private:
     // restart rolls the wallet back 256 blocks.
     execution::WalletSyncWatch wallet_sync_watch_{};
 
+    // [review round 6] A wallet start owed after a restart whose start command
+    // failed.  Retried from the top of on_new_block_coro, before any wallet
+    // call or gate, since a stopped wallet answers no sync check; cleared when
+    // the wallet answers Step 8's.
+    execution::WalletStartDebt wallet_start_debt_{};
+
     bool wallet_synced_{false};
     bool wallet_syncing_{false};
     // [S33 2026-09-05] The node_connected_/node_synced_/node_syncing_ triplet

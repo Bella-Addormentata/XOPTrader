@@ -18,10 +18,15 @@
 
 namespace {
 
+using xop::execution::clear_wallet_start;
 using xop::execution::observe_wallet_sync;
+using xop::execution::owe_wallet_start;
 using xop::execution::record_failed_wallet_restart;
+using xop::execution::record_wallet_start;
 using xop::execution::wallet_restart_budget;
+using xop::execution::wallet_start_due;
 using xop::execution::WalletRestartPolicy;
+using xop::execution::WalletStartDebt;
 using xop::execution::WalletSyncAction;
 using xop::execution::WalletSyncVerdict;
 using xop::execution::WalletSyncWatch;
@@ -374,6 +379,92 @@ TEST(WalletSyncWatch, TheEveningOf20260922IsNoLongerALivelock)
     }
     EXPECT_EQ(restarts, 0);
     EXPECT_LT(t, WalletRestartPolicy{}.syncing_budget_s);
+}
+
+// ---------------------------------------------------------------------------
+// [review round 6] A start owed after a restart whose start command failed
+// ---------------------------------------------------------------------------
+
+TEST(WalletStartDebt, NothingIsOwedUntilAStartFails)
+{
+    const WalletStartDebt debt;
+    EXPECT_FALSE(wallet_start_due(debt, 0));
+    EXPECT_FALSE(wallet_start_due(debt, 1'000'000));
+}
+
+TEST(WalletStartDebt, AFailedStartIsRetriedAfterTheBaseDelay)
+{
+    WalletStartDebt debt;
+    owe_wallet_start(debt, 1000);
+    EXPECT_FALSE(wallet_start_due(debt, 1059));
+    EXPECT_TRUE(wallet_start_due(debt, 1060));    // 60 s later
+    EXPECT_TRUE(wallet_start_due(debt, 5000));    // and on every heartbeat after
+}
+
+TEST(WalletStartDebt, EachFailedRetryDoublesTheDelayUpToTheCap)
+{
+    WalletStartDebt debt;
+    owe_wallet_start(debt, 0);
+    record_wallet_start(debt, /*started=*/false, 60);
+    ASSERT_TRUE(debt.retry_at.has_value());
+    EXPECT_EQ(*debt.retry_at, 60 + 120);
+    record_wallet_start(debt, false, 180);
+    EXPECT_EQ(*debt.retry_at, 180 + 240);
+    record_wallet_start(debt, false, 420);
+    EXPECT_EQ(*debt.retry_at, 420 + 480);
+    record_wallet_start(debt, false, 900);
+    EXPECT_EQ(*debt.retry_at, 900 + 900);         // 960, capped at 15 min
+    for (int i = 0; i < 40; ++i) {
+        record_wallet_start(debt, false, 10'000);
+    }
+    EXPECT_EQ(*debt.retry_at, 10'000 + 900);      // no overflow, still capped
+    EXPECT_EQ(debt.attempts, 44U);
+}
+
+TEST(WalletStartDebt, AStartThatWorksSettlesTheDebt)
+{
+    WalletStartDebt debt;
+    owe_wallet_start(debt, 0);
+    record_wallet_start(debt, false, 60);
+    record_wallet_start(debt, /*started=*/true, 180);
+    EXPECT_FALSE(debt.retry_at.has_value());
+    EXPECT_EQ(debt.attempts, 0U);
+    EXPECT_FALSE(wallet_start_due(debt, 1'000'000));
+}
+
+TEST(WalletStartDebt, AWalletThatAnswersOwesNothing)
+{
+    WalletStartDebt debt;
+    owe_wallet_start(debt, 0);
+    clear_wallet_start(debt);
+    EXPECT_FALSE(wallet_start_due(debt, 1'000'000));
+}
+
+TEST(WalletStartDebt, ASecondFailedRestartKeepsTheScheduleItFound)
+{
+    // A restart that fails while a start is already owed must not push the
+    // retry back to the base delay, or keep resetting it.
+    WalletStartDebt debt;
+    owe_wallet_start(debt, 0);
+    record_wallet_start(debt, false, 60);          // next at 180
+    owe_wallet_start(debt, 100);
+    ASSERT_TRUE(debt.retry_at.has_value());
+    EXPECT_EQ(*debt.retry_at, 180);
+    EXPECT_EQ(debt.attempts, 1U);
+}
+
+TEST(WalletStartDebt, APolicyOverridesTheRetryDelays)
+{
+    WalletRestartPolicy policy;
+    policy.start_retry_base_s = 10;
+    policy.start_retry_cap_s  = 25;
+    WalletStartDebt debt;
+    owe_wallet_start(debt, 0, policy);
+    EXPECT_TRUE(wallet_start_due(debt, 10));
+    record_wallet_start(debt, false, 10, policy);
+    EXPECT_EQ(*debt.retry_at, 10 + 20);
+    record_wallet_start(debt, false, 30, policy);
+    EXPECT_EQ(*debt.retry_at, 30 + 25);            // 40, capped
 }
 
 TEST(WalletSyncWatch, APolicyOverridesEveryBudget)
