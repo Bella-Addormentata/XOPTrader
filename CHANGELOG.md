@@ -238,7 +238,10 @@ can pass for an offer nobody took.
   coin it does not hold. The refusal costs one round trip and is that
   offer's alone, so the offers after it are still asked. The fill poll visits
   offers in hash-map order, so the same offer could otherwise have come
-  first every heartbeat and kept every later fill unproven.
+  first every heartbeat and kept every later fill unproven. Only that
+  refusal is one offer's (review round 16). A wallet that is not synced, or
+  not connected to a synced peer or any full node, refuses every lookup the
+  same way, so that refusal still ends the heartbeat's lookups.
 - While the wallet reports an offer CONFIRMED and the proof has not settled
   it, the engine will not cancel it. Chia's secure cancel sets PENDING_CANCEL
   over any status, and an insecure one sets CANCELLED. So a cancel sent during
@@ -304,6 +307,17 @@ can pass for an offer nobody took.
   restart such an offer stays tracked until one of its coins is spent.
   Periodic reconciliation now leaves a CANCELLED offer to detect_fills the
   same way, instead of removing it unproven.
+  A Dead answer under a cancel's status is final only once the spend that
+  killed the offer is `strategy.confirmation_depth_blocks` deep, as it is
+  for a CONFIRMED offer (review round 16). A shallower spend can be
+  reorganised out, and in chia 2.7.4 a reorganisation leaves the wallet's
+  trade records alone, so the cancel's status would stay over an offer that
+  can be taken again. Until the spend is deep enough, the offer stays
+  tracked and is proven every heartbeat.
+  After an accepted Cancel All sweep, an offer already flagged
+  cancel_pending is read again, as a held one is (review round 16). The
+  sweep skips a trade the wallet calls CANCELLED, and such an offer was
+  reported as one this call had cancelled.
   Cancel All's wallet-wide sweep skips every trade the wallet calls
   completed, so it never reports a held offer as cancelled. Such an offer goes
   through the guarded per-offer path instead: it is cancelled there if the

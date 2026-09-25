@@ -1649,6 +1649,14 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
         //     would never report the take.  It stays tracked, cancel_pending,
         //     unless retire_expired_offers proved it expired before it
         //     cancelled it: nothing can take that one;
+        //     [round 16] And Dead only once the spend that killed the offer
+        //     is confirmation_depth_blocks deep, as for a CONFIRMED offer
+        //     (dead_offer_closable).  A shallower spend can be reorganised
+        //     out, and the wallet would go on reporting its cancel's status
+        //     over an offer that can be taken again: chia 2.7.4's
+        //     reorg_rollback leaves its trade records alone.  Until then a
+        //     held offer stays held, and any other is kept tracked,
+        //     cancel_pending, and asked again next heartbeat;
         //   - Unknown, held: still held, and asked again next heartbeat, as a
         //     CONFIRMED offer would be;
         //   - Unknown, not held, after a lookup failed -- its own, refused or
@@ -1693,6 +1701,9 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
                     proof_lookup_failed = true;
                 }
             }
+            // [review #171 round 16] Dead is final only at confirmation depth.
+            const bool dead_at_depth = dead_offer_closable(
+                reproof, current_block, strategy_cfg_.confirmation_depth_blocks);
             if (reproof.verdict == FillProof::Settled) {
                 logger_->warn("[FILL-PROOF] {} ({}): the wallet reports it {}, but "
                               "the chain shows the take -- a cancel of an offer "
@@ -1703,15 +1714,15 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
                                                                      : "CANCELLED");
                 reproved = reproof;
                 status = trade_status::kConfirmed;
-            } else if (reproof.verdict == FillProof::Live
-                       || reproof.verdict == FillProof::Dead) {
+            } else if (reproof.verdict == FillProof::Live || dead_at_depth) {
                 fill_proof_deferrals_.erase(trade_id);
                 // [round 14] Only Dead is final.  Live -- every maker coin
                 // unspent -- can still be taken, and a take that a later cancel
                 // overwrites again would show this same status, so a Live offer
                 // is asked again next heartbeat: one lookup, until its cancel
-                // lands or its status changes.
-                if (reproof.verdict == FillProof::Dead) {
+                // lands or its status changes.  [round 16] And Dead only at
+                // confirmation depth.
+                if (dead_at_depth) {
                     cancel_status_proven_[trade_id] = status;
                 } else if (status == trade_status::kCancelled
                            && expiry_retired_.count(trade_id) == 0U) {
@@ -1727,6 +1738,8 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
                     continue;
                 }
             } else if (held) {
+                // Unknown, or [round 16] Dead not yet at depth: still held, as
+                // a CONFIRMED offer would be.
                 std::uint64_t claimed_height = 0;
                 if (const auto idx = rec.find("confirmed_at_index");
                     idx != rec.end() && idx->is_number_unsigned()) {
@@ -1734,6 +1747,17 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
                 }
                 handle_unproven_fill(trade_id, po, reproof, reproof_failure,
                                      reproved_asked_node, claimed_height, current_block);
+                continue;
+            } else if (reproof.verdict == FillProof::Dead) {
+                // [review #171 round 16] Dead, but the spend is not yet deep
+                // enough to close on: kept tracked, cancel_pending, and
+                // proven again next heartbeat, until it is -- or until a
+                // reorganisation undoes it and the chain shows the offer live.
+                state_->mark_cancel_pending(trade_id);
+                logger_->debug("[FILL-PROOF] {} ({}): dead at block {}, not yet "
+                               "{} blocks deep -- kept tracked until it is",
+                               trade_id.substr(0, 12), po.pair_name, reproof.height,
+                               strategy_cfg_.confirmation_depth_blocks);
                 continue;
             } else if (reproof_lookup != ProofLookup::Answered) {
                 logger_->debug("[FILL-PROOF] {} ({}): a coin lookup failed this "
@@ -2031,8 +2055,11 @@ OfferManager::prove_fill_on_chain(const json& trade_record, std::string& failure
     } catch (const rpc::ChiaRPCApplicationError& e) {
         // [review #171 round 15] An answer: this request refused, as the
         // wallet refuses one naming a coin it does not hold.  This offer's
-        // alone -- the call's other offers are still asked.
-        lookup = ProofLookup::Refused;
+        // alone -- the call's other offers are still asked.  [round 16] Only
+        // that refusal: a wallet not synced or not connected refuses every
+        // lookup the same way, so that one ends the call's lookups.
+        lookup = coin_lookup_refusal_is_offer_local(e.what()) ? ProofLookup::Refused
+                                                              : ProofLookup::Failed;
         failure = std::string{"the "} + (ask_node ? "full node" : "wallet")
                   + " refused to list its maker coins: " + e.what();
         co_return FillProofResult{};
@@ -2091,7 +2118,8 @@ OfferManager::prove_fill_on_chain(const json& trade_record, std::string& failure
         }
     } catch (const rpc::ChiaRPCApplicationError& e) {
         // [review #171 round 15] Refused, as at the first stage.
-        lookup = ProofLookup::Refused;
+        lookup = coin_lookup_refusal_is_offer_local(e.what()) ? ProofLookup::Refused
+                                                              : ProofLookup::Failed;
         failure = std::string{"every maker coin was spent at block "}
                   + std::to_string(coins.height) + ", but the "
                   + (ask_node ? "full node refused to list their children"
@@ -2582,15 +2610,23 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(
         // later per-offer path would skip it.  It goes through the guarded
         // per-offer path instead: cancelled there if the node has proven it
         // live again, reported outstanding while its cancel stays withheld.
-        std::vector<std::string> held;
+        //
+        // [review #171 round 16] ...and except for an offer State already
+        // marks cancel_pending.  The wallet may call it CANCELLED -- a row
+        // boot restored, an offer reconcile_offers or detect_fills keeps
+        // tracked -- which the sweep skips as it skips CONFIRMED, or its own
+        // cancel may be in flight.  Either way this call did not cancel it,
+        // so it is read again after the sweep with the held ones, and
+        // reported as the wallet then says.
+        std::vector<std::string> reread;
         for (const auto& po : all_offers) {
-            if (fill_proof_deferrals_.count(po.offer_id) > 0U) {
-                held.push_back(po.offer_id);
+            if (fill_proof_deferrals_.count(po.offer_id) > 0U || po.cancel_pending) {
+                reread.push_back(po.offer_id);
             } else {
                 out.cancelled.push_back(po.offer_id);
             }
         }
-        if (!held.empty()) {
+        if (!reread.empty()) {
             // [review #171 round 10] RE-READ, AFTER THE SWEEP, WHAT IT DID TO
             // EACH HELD OFFER.  A hold records the status of the LAST POLL; the
             // sweep acted on the status each trade had when it ran.  In chia
@@ -2624,11 +2660,11 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(
             std::size_t in_flight = 0;
             std::size_t closed = 0;
             std::string read_error;
-            for (std::size_t i = 0; i < held.size(); ++i) {
-                const auto& oid = held[i];
+            for (std::size_t i = 0; i < reread.size(); ++i) {
+                const auto& oid = reread[i];
                 if (std::chrono::steady_clock::now() >= deadline) {
-                    for (std::size_t j = i; j < held.size(); ++j) {
-                        unread.push_back(held[j]);
+                    for (std::size_t j = i; j < reread.size(); ++j) {
+                        unread.push_back(reread[j]);
                     }
                     out.deadline_hit = true;
                     break;
@@ -2688,13 +2724,14 @@ asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(
                 }
             }
             out.deadline_hit = out.deadline_hit || per_offer.deadline_hit;
-            logger_->warn("cancel_all: {} offer(s) the fill proof held, re-read "
+            logger_->warn("cancel_all: {} offer(s) the fill proof held or State "
+                          "had cancel_pending, re-read "
                           "after the sweep: {} with a cancel already in flight "
                           "and {} closed, nothing sent for either; {} still "
                           "CONFIRMED or live and not swept -- {} cancelled one "
                           "by one, {} still outstanding; {} unreadable, "
                           "reported outstanding with nothing sent",
-                          held.size(), in_flight, closed, to_cancel.size(),
+                          reread.size(), in_flight, closed, to_cancel.size(),
                           per_offer.cancelled.size(), per_offer.failed.size(),
                           unread.size());
         }

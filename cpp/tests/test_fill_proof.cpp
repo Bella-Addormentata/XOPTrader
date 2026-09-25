@@ -722,4 +722,27 @@ TEST(DeadOfferClosable, OnlyADeadVerdictAtConfirmationDepth)
     }
 }
 
+// ---------------------------------------------------------------------------
+// [review #171, round 16] Which refusal of a coin lookup is one offer's
+// ---------------------------------------------------------------------------
+
+TEST(CoinLookupRefusal, OnlyAMissingCoinIsOneOffersRefusal)
+{
+    // chia 2.7.4 wallet_rpc_api.get_coin_records_by_names, verbatim: the one
+    // refusal that names this request's coins...
+    EXPECT_TRUE(ex::coin_lookup_refusal_is_offer_local(
+        "Coin ID's: ['0x6d4f1b0a2c9e8f7d6b5a4c3e2f1d0b9a8c7e6f5d4b3a2c1e0f9d8b7a6c5e4f3d']"
+        " not found."));
+    // ...and the three it gives before looking at any coin.
+    EXPECT_FALSE(ex::coin_lookup_refusal_is_offer_local(
+        "Wallet is not connected to any synced peers."));
+    EXPECT_FALSE(ex::coin_lookup_refusal_is_offer_local(
+        "Wallet needs to be fully synced before finding coin information"));
+    EXPECT_FALSE(ex::coin_lookup_refusal_is_offer_local(
+        "No full node peers connected. Please connect to a full node."));
+    // rpc_post's text for a refusal that names no error, and nothing at all.
+    EXPECT_FALSE(ex::coin_lookup_refusal_is_offer_local("RPC returned success=false"));
+    EXPECT_FALSE(ex::coin_lookup_refusal_is_offer_local(""));
+}
+
 }  // namespace

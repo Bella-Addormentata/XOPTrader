@@ -247,7 +247,12 @@ def test_one_failed_lookup_ends_the_lookups_for_the_call():
     request naming a coin it does not hold, and that answer costs one round
     trip and is that offer's alone.  Latching on it let one offer, polled
     first in unordered_map order every heartbeat, keep every later fill
-    unproven."""
+    unproven.
+
+    [round 16] Only a refusal that names a missing coin.  A wallet that is not
+    synced or not connected refuses every lookup the same way, so that one
+    still ends the call's lookups (coin_lookup_refusal_is_offer_local, pinned
+    by gtest on chia 2.7.4's own messages)."""
     detect = _function_body(_source(OFFER_MANAGER), DETECT_FILLS)
     latch = detect.index("bool proof_lookup_failed = false;")
     assert latch < detect.rindex("for (const auto& rec : trade_records) {"), (
@@ -273,8 +278,9 @@ def test_one_failed_lookup_ends_the_lookups_for_the_call():
             f"{stage} stage: a refusal is caught before the catch-all can take it"
         )
         refused = _block_after(rest, refused_head)
-        assert "lookup = ProofLookup::Refused;" in refused and "ProofLookup::Failed" not in refused, (
-            f"{stage} stage: a refused lookup is that offer's alone"
+        assert re.search(r"lookup = coin_lookup_refusal_is_offer_local\(e\.what\(\)\)\s*"
+                         r"\? ProofLookup::Refused\s*: ProofLookup::Failed;", refused), (
+            f"{stage} stage: a refused lookup is that offer's alone only when it names a missing coin"
         )
         assert "co_return FillProofResult{};" in refused, f"{stage} stage: ...and proves nothing"
         failed = _block_after(rest, failed_head)
@@ -398,15 +404,20 @@ def test_the_bulk_sweep_never_reports_a_proof_held_offer_cancelled():
     trades, CONFIRMED included, so an offer the fill proof holds is NOT
     cancelled by it.  cancel_all used to report every tracked id cancelled on
     a successful sweep and mark it cancel_pending.  A held offer now goes
-    through the guarded per-offer path, and its outcome is reported as it is."""
+    through the guarded per-offer path, and its outcome is reported as it is.
+
+    [round 16] So does an offer State already marks cancel_pending.  The
+    wallet may call it CANCELLED -- a row boot restored, an offer
+    reconcile_offers or detect_fills keeps tracked -- which the sweep skips as
+    it skips CONFIRMED, and it was reported as a cancel this call submitted."""
     manager = _source(OFFER_MANAGER)
     cancel_all = _function_body(
         manager, "asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(")
     bulk_ok = _block_after(cancel_all, "if (bulk_ok) {")
-    split = re.search(r"if \(fill_proof_deferrals_\.count\(po\.offer_id\) > 0U\) \{\s*"
-                      r"held\.push_back\(po\.offer_id\);\s*\} else \{\s*"
+    split = re.search(r"if \(fill_proof_deferrals_\.count\(po\.offer_id\) > 0U \|\| po\.cancel_pending\) \{\s*"
+                      r"reread\.push_back\(po\.offer_id\);\s*\} else \{\s*"
                       r"out\.cancelled\.push_back\(po\.offer_id\);\s*\}", bulk_ok)
-    assert split, "a proof-held offer must not be reported cancelled by the sweep"
+    assert split, "a proof-held offer, or one already cancel_pending, must not be reported cancelled"
     # [round 11] Nor does the re-read after the sweep: an offer it finds with a
     # cancel in flight, or closed, is reported as that, never as a cancel this
     # call submitted (test_the_sweep_is_judged_by_what_the_wallet_reports_after_it).
@@ -444,18 +455,18 @@ def test_the_sweep_is_judged_by_what_the_wallet_reports_after_it():
     cancel_all = _function_body(
         manager, "asio::awaitable<OfferManager::CancelOutcome> OfferManager::cancel_all(")
     bulk_ok = _block_after(cancel_all, "if (bulk_ok) {")
-    held_branch = _block_after(bulk_ok, "if (!held.empty()) {")
-    loop_head = "for (std::size_t i = 0; i < held.size(); ++i) {"
+    held_branch = _block_after(bulk_ok, "if (!reread.empty()) {")
+    loop_head = "for (std::size_t i = 0; i < reread.size(); ++i) {"
     assert held_branch.index(loop_head) < held_branch.index("co_await cancel_ids("), (
         "every held offer is re-read before any is cancelled"
     )
     reread = _block_after(held_branch, loop_head)
-    assert reread[1:].lstrip().startswith("const auto& oid = held[i];")
+    assert reread[1:].lstrip().startswith("const auto& oid = reread[i];")
 
     # The deadline comes first, and whatever it cuts short is reported, not dropped.
     deadline = re.search(r"if \(std::chrono::steady_clock::now\(\) >= deadline\) \{\s*"
-                         r"for \(std::size_t j = i; j < held\.size\(\); \+\+j\) \{\s*"
-                         r"unread\.push_back\(held\[j\]\);\s*\}\s*"
+                         r"for \(std::size_t j = i; j < reread\.size\(\); \+\+j\) \{\s*"
+                         r"unread\.push_back\(reread\[j\]\);\s*\}\s*"
                          r"out\.deadline_hit = true;\s*break;\s*\}", reread)
     assert deadline and deadline.start() < reread.index("co_await wallet_->get_offer("), (
         "the re-read stops at the deadline and reports the rest outstanding"
@@ -654,10 +665,11 @@ def test_a_cancels_status_is_proven_on_chain_before_it_is_acted_on():
         "a take after all: booked by the CONFIRMED branch, from this proof"
     )
     # [round 14] Only Dead is remembered: Live can still be taken.
-    no_take = re.search(r"\} else if \(reproof\.verdict == FillProof::Live\s*"
-                        r"\|\| reproof\.verdict == FillProof::Dead\) \{\s*"
+    # [round 16] Dead only at confirmation depth
+    # (test_a_dead_answer_is_final_only_at_confirmation_depth).
+    no_take = re.search(r"\} else if \(reproof\.verdict == FillProof::Live \|\| dead_at_depth\) \{\s*"
                         r"fill_proof_deferrals_\.erase\(trade_id\);\s*"
-                        r"if \(reproof\.verdict == FillProof::Dead\) \{\s*"
+                        r"if \(dead_at_depth\) \{\s*"
                         r"cancel_status_proven_\[trade_id\] = status;\s*"
                         r"\} else if \(status == trade_status::kCancelled\s*"
                         r"&& expiry_retired_\.count\(trade_id\) == 0U\) \{", reproof)
@@ -691,6 +703,53 @@ def test_a_cancels_status_is_proven_on_chain_before_it_is_acted_on():
     assert "cancel_status_proven_.clear();" in _block_after(detect, "if (pending_offers.empty()) {")
     assert re.search(r"std::unordered_map<std::string, int>\s+cancel_status_proven_;",
                      _source(OFFER_MANAGER_HPP))
+
+
+def test_a_dead_answer_is_final_only_at_confirmation_depth():
+    """[review #171, round 16] A Dead re-proof under a cancel's status was
+    remembered at once, and a CANCELLED offer closed on it, whatever the depth
+    of the spend that killed it.  The CONFIRMED path waits until that spend is
+    confirmation_depth_blocks deep (dead_offer_closable), because a shallower
+    one can be reorganised out -- and in chia 2.7.4 a reorganisation leaves
+    the wallet's trade records alone, so the cancel's status would stay over
+    an offer that can be taken again.  The re-proof now uses the same rule.
+    Dead at depth is final.  A shallower Dead keeps a held offer held, through
+    handle_unproven_fill as a CONFIRMED offer's would be, and keeps any other
+    tracked and cancel_pending, remembering nothing, so it is proven again
+    next heartbeat."""
+    manager = _source(OFFER_MANAGER)
+    detect = _function_body(manager, DETECT_FILLS)
+    head = "for (const auto& rec : trade_records) {"
+    loop = _block_after(detect[detect.rindex(head):], head)
+    reproof = _block_after(loop, "if (reprove) {")
+    depth = re.search(r"const bool dead_at_depth = dead_offer_closable\(\s*"
+                      r"reproof, current_block, strategy_cfg_\.confirmation_depth_blocks\);", reproof)
+    assert depth, "judged by the CONFIRMED path's own rule"
+    assert reproof.index("co_await prove_fill_on_chain(") < depth.start() < reproof.index(
+        "if (reproof.verdict == FillProof::Settled) {"), "once the re-proof is in, before any verdict acts"
+    final = re.search(r"\} else if \(reproof\.verdict == FillProof::Live \|\| dead_at_depth\) \{", reproof)
+    assert final, "only a Live answer, or a Dead one at depth, lets the status stand"
+    assert re.search(r"if \(dead_at_depth\) \{\s*cancel_status_proven_\[trade_id\] = status;", reproof), (
+        "and only a Dead one at depth is remembered"
+    )
+    assert reproof.count("FillProof::Dead") == 1, (
+        "a Dead verdict is read directly only where it is not yet deep enough"
+    )
+    held_at = reproof.index("} else if (held) {")
+    shallow = re.search(r"\} else if \(reproof\.verdict == FillProof::Dead\) \{", reproof)
+    assert shallow and final.start() < held_at < shallow.start() < reproof.index(
+        "} else if (reproof_lookup != ProofLookup::Answered) {"), (
+        "a held offer's shallow Dead is deferred as a CONFIRMED offer's is; any other's is "
+        "handled next, before a failed lookup's wait"
+    )
+    open_index = shallow.end() - 1
+    block = reproof[open_index:_matching(reproof, open_index) + 1]
+    assert re.match(r"\{\s*state_->mark_cancel_pending\(trade_id\);", block), (
+        "flagged cancel_pending, so nothing cancels it again meanwhile"
+    )
+    assert re.search(r"continue;\s*\}$", block), "and kept tracked: it never reaches the terminal branch"
+    for forbidden in ("cancel_status_proven_", "remove_offer", "fill_proof_deferrals_"):
+        assert forbidden not in block, f"a shallow Dead neither remembers nor releases anything: {forbidden}"
 
 
 def test_a_local_cancel_stays_tracked_while_it_can_be_taken():

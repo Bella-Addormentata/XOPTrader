@@ -475,7 +475,7 @@ public:
         std::vector<std::string> already_pending;
         /// [FILL-PROOF, review #171 round 11] Offers the fill proof held that
         /// the wallet reported CANCELLED or FAILED when read again after an
-        /// accepted sweep. Nothing was sent for them and nothing is left to
+        /// accepted sweep -- [round 16] or that State had cancel_pending. Nothing was sent for them and nothing is left to
         /// send: not a cancel this call submitted, so not `cancelled`, whose
         /// ids the callers persist as submitted with their own cause; and not
         /// live, so not `failed`. detect_fills reads the terminal status (and
@@ -1453,12 +1453,15 @@ private:
     /// [review #171 round 15] How prove_fill_on_chain()'s lookups went.
     enum class ProofLookup : std::uint8_t {
         Answered,  ///< none failed: the verdict is the answer's
-        Refused,   ///< the node or wallet refused this request
-                   ///< (ChiaRPCApplicationError) -- the wallet refuses one
-                   ///< naming a coin it does not hold.  This offer's alone.
-        Failed,    ///< it could not answer: a transport failure, or a reply
-                   ///< that could not be read.  The next lookup would fail the
-                   ///< same way, so detect_fills asks nothing more that call.
+        Refused,   ///< the node or wallet refused this request because a coin
+                   ///< it names is not in its store
+                   ///< (coin_lookup_refusal_is_offer_local).  This offer's
+                   ///< alone.
+        Failed,    ///< it could not answer: a transport failure, a reply that
+                   ///< could not be read, or [round 16] a refusal of every
+                   ///< request, such as a wallet not synced.  The next lookup
+                   ///< would fail the same way, so detect_fills asks nothing
+                   ///< more that call.
     };
 
     /// Ask the chain what a CONFIRMED trade record's maker coins prove
