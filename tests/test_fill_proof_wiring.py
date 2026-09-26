@@ -758,7 +758,9 @@ def test_a_cancels_status_is_proven_on_chain_before_it_is_acted_on():
     held_unknown = _block_after(reproof, "} else if (held) {")
     assert _call_args(held_unknown, "handle_unproven_fill") == [[
         "trade_id", "po", "reproof", "reproof_failure", "reproved_asked_node",
-        "claimed_height", "current_block"]], "a held Unknown is deferred as a CONFIRMED offer's is"
+        "claimed_height", "current_block",
+        'status == trade_status::kPendingCancel ? "PENDING_CANCEL" : "CANCELLED"']], (
+        "a held Unknown is deferred as a CONFIRMED offer's is, [#172's review] under the status it shows")
     assert re.search(r"continue;\s*\}$", held_unknown), "...still held, and asked again next heartbeat"
     assert "fill_proof_deferrals_.erase(" not in held_unknown, "a held Unknown must not let the offer go"
     # [round 15] Its own lookup, refused or failed, or an earlier one's latch.
@@ -1047,12 +1049,19 @@ def test_a_dead_offer_left_pending_cancel_is_closed_at_depth():
         "current_block", '"PENDING_CANCEL"']], "closed as a CONFIRMED offer dead at depth is"
     assert re.search(r"continue;\s*\}$", block), "and never reaches the terminal branch"
     assert "cancel_status_proven_" not in block
+    # [round 21] ...and the call's summary line covers both statuses.
+    assert re.search(r'"detect_fills: \{\} offer\(s\) the wallet reports CONFIRMED or "\s*'
+                     r'"PENDING_CANCEL were proven never taken -- none booked as a fill"', detect), (
+        "the summary of the call's dead offers names the PENDING_CANCEL ones too"
+    )
     handler = _function_body(manager, HANDLE_UNPROVEN)
     assert "std::string_view wallet_status)" in handler, "the wallet's status is an argument"
     assert _call_args(handler, "last_dead_offers_.push_back") == [[
         "DeadOffer{trade_id, po.pair_name, proof.height, proof.coins, proof.unspent, "
         "proof.spent_together, std::string(wallet_status)}"]], "and goes with the dead offer"
-    assert handler.count("the wallet reports {}, ") == 2 and "reports CONFIRMED" not in handler
+    # [round 22] ...and so does the deferral warning: three lines in all.
+    assert handler.count("the wallet reports {}, ") == 3
+    assert "reports CONFIRMED" not in handler and "reported CONFIRMED" not in handler
     hpp = _source(OFFER_MANAGER_HPP)
     assert re.search(r'BlockHeight current_block,\s*std::string_view wallet_status = "CONFIRMED"\);', hpp), (
         "CONFIRMED unless a caller says otherwise"

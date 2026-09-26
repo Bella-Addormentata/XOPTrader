@@ -1082,8 +1082,14 @@ public:
         /// a real take too (trade_status::written_by_a_cancel), and stamping
         /// it here closed the row before any chain proof could run.  The row
         /// restores into State flagged cancel_pending, and detect_fills proves
-        /// it on-chain the first time it polls it: a take is booked, and any
-        /// other answer closes it as the wallet says.
+        /// it on-chain as it does any offer the wallet reports CANCELLED
+        /// [review #171 round 21].  A take is booked.  A Dead proof at
+        /// confirmation depth, or a record that gives the proof nothing to
+        /// ask, closes it as the wallet says.  A Live proof (a local cancel:
+        /// every maker coin unspent, still takeable), a shallower Dead and a
+        /// failed lookup keep it tracked and ask again, and an answer that
+        /// settles nothing is asked again for confirmation_depth_blocks
+        /// before the status stands.
         std::vector<std::string> cancelled_unproven;
         /// Wallet says PENDING_ACCEPT. Genuinely still resting.
         std::vector<std::string> still_live;
@@ -1519,9 +1525,10 @@ private:
     /// proof is a Dead verdict at confirmation depth, stop tracking it and
     /// report it in last_dead_offers_.  Otherwise record the proof in
     /// fill_proof_deferrals_.  Books nothing, ever.  [review #172]
-    /// `wallet_status` is what the wallet reports, for the log and the
-    /// dead-offer record: PENDING_CANCEL for an offer dead at depth under a
-    /// cancel that may never land.
+    /// `wallet_status` is what the wallet reports now, for the logs and the
+    /// dead-offer record: CONFIRMED, PENDING_CANCEL for an offer dead at
+    /// depth under a cancel that may never land, or the cancel status a held
+    /// offer shows while its re-proof is deferred.
     void handle_unproven_fill(const std::string& trade_id, const PendingOffer& po,
                               const FillProofResult& proof, const std::string& failure,
                               bool from_node, std::uint64_t claimed_height,
