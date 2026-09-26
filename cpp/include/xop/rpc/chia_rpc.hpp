@@ -489,6 +489,23 @@ public:
         bool                            include_spent = true);
 
     /**
+     * @brief [FILL-PROOF review] Coin records of the children of
+     * `parent_ids`: every coin they created.
+     *
+     * The node side of execution::prove_take_from_children(): a take's
+     * settlement coin is a child of a maker coin, created and spent in the
+     * take block.
+     *
+     * @param parent_ids     Coin names, hex, with or without 0x.
+     * @param include_spent  If true, include already-spent children.
+     * @return Vector of coin-record JSON objects, same shape as
+     *         get_coin_records_by_names.
+     */
+    asio::awaitable<std::vector<json>> get_coin_records_by_parent_ids(
+        const std::vector<std::string>& parent_ids,
+        bool                            include_spent = true);
+
+    /**
      * @brief Retrieve a block record by height.
      *
      * Returns the block record (including header_hash) for the given height.
@@ -728,6 +745,42 @@ public:
      */
     asio::awaitable<json> get_offer(const std::string& trade_id,
                                     bool               file_contents = false);
+
+    /**
+     * @brief [FILL-PROOF 2026-09-23] Coin records for `names` from the
+     * wallet's own coin store, spent coins included.
+     *
+     * The fallback source of execution::prove_fill() when the engine does not
+     * trust its full node.  The wallet refuses (an RPC error) unless it is
+     * synced -- allow_unsynced is never sent -- which is the point: its
+     * store is incomplete mid-resync, exactly when it mislabelled dead
+     * offers CONFIRMED on 2026-09-22.  It also refuses when any of `names`
+     * is not in its store (Chia 2.7.4 wallet_rpc_api: "Coin ID's: [...] not
+     * found.").
+     *
+     * @param names  Coin names, hex, with or without 0x.
+     * @return The records array, same shape as the full node's.
+     */
+    asio::awaitable<std::vector<json>> get_coin_records_by_names(
+        const std::vector<std::string>& names);
+
+    /**
+     * @brief [FILL-PROOF review] Our coins confirmed at exactly `height`
+     * whose amount is one of `amounts`, from the wallet's own store
+     * (get_coin_records, confirmed_range [height, height], amount_filter
+     * include).
+     *
+     * The wallet side of execution::prove_take_from_payments(): a take pays
+     * each requested amount to us in the take block.  Unlike
+     * get_coin_records_by_names the endpoint has no sync check, so only call
+     * it right after a synced answer.
+     *
+     * @return The records array: flat wallet records (parent_coin_info,
+     *         puzzle_hash, amount, confirmed_height, spent_height, ...).
+     */
+    asio::awaitable<std::vector<json>> get_coin_records_at_height(
+        std::uint64_t                     height,
+        const std::vector<std::uint64_t>& amounts);
 
     /**
      * @brief Retrieve offers with pagination.

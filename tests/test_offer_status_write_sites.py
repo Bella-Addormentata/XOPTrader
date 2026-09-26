@@ -34,6 +34,12 @@ WALLET_VERIFIED_CANCELLED = (
 # S25 depth buffer.  Named here so the scan stays exact -- it is an open,
 # out-of-scope item of the cancel-truth PR, not something this list endorses.
 KNOWN_UNVERIFIED_CANCELLED = ("on_chain_reconcile",)
+# [FILL-PROOF 2026-09-23] Verified by the CHAIN, against the wallet: the wallet
+# reports these offers CONFIRMED, and the node shows a maker coin unspent while
+# another was spent elsewhere, the first spend at confirmation depth
+# (execution/fill_proof.hpp).  Not buffered through S25 -- the proof already
+# waited out the depth -- and the row it closes is one no fill can ever reach.
+CHAIN_VERIFIED_CANCELLED = ("dead_on_chain",)
 
 # Every submit-time writer, by the cause it records.
 SUBMIT_REASONS = (
@@ -64,8 +70,11 @@ SUBMIT_REASONS = (
     # never retired at all (execution::decide_expired_retire), so `filled`
     # keeps winning.
     '"expired_onchain"',
+    # [SEED-FAIL-CLOSED review round 2] Step 8 takes down a pair's resting
+    # offers while a position it trades is unverified.
+    '"unverified_position"',
 )
-SUBMIT_SITE_COUNT = 20
+SUBMIT_SITE_COUNT = 21
 
 
 def _read(path: Path) -> str:
@@ -135,14 +144,15 @@ def _first_call(text: str, callee: str, start: int = 0) -> int:
 def test_every_cancelled_write_is_wallet_verified():
     calls = [args for args in _call_arguments(_read(ENGINE), "update_offer_status")
              if '"cancelled"' in args]
-    allowed = WALLET_VERIFIED_CANCELLED + KNOWN_UNVERIFIED_CANCELLED
+    allowed = (WALLET_VERIFIED_CANCELLED + KNOWN_UNVERIFIED_CANCELLED
+               + CHAIN_VERIFIED_CANCELLED)
     unverified = [args for args in calls if not any(tok in args for tok in allowed)]
     assert not unverified, (
-        "a 'cancelled' write without a wallet verdict -- an accepted cancel is a "
-        "submission; use mark_offer_cancel_submitted: %r" % unverified
+        "a 'cancelled' write without a wallet or chain verdict -- an accepted "
+        "cancel is a submission; use mark_offer_cancel_submitted: %r" % unverified
     )
-    assert len(calls) == 4, (
-        "expected exactly 4 terminal 'cancelled' writers, found %d -- the scan "
+    assert len(calls) == 5, (
+        "expected exactly 5 terminal 'cancelled' writers, found %d -- the scan "
         "must not pass vacuously, and a new terminal writer needs review" % len(calls)
     )
 

@@ -497,6 +497,21 @@ public:
                                          const std::string& puzzle_hash,
                                          Mojo               amount);
 
+    /**
+     * @brief The puzzle hash of the coin a take settles an offered asset
+     *        through [FILL-PROOF, review #171 round 5].
+     *
+     * "xch" (any case): OFFER_MOD's own hash, settlement_payments v1.  A CAT's
+     * 32-byte asset id (its TAIL hash, hex, 0x optional): CAT v2 curried with
+     * that TAIL around OFFER_MOD.  Checked against the chain: the real take
+     * of 0x18672b6b0f settled its DBX through 0x2a8269fa...3e81.
+     *
+     * @return 64-character lowercase hex, or std::nullopt for an asset whose
+     *         settlement puzzle this cannot name.
+     * @throws std::exception on an OpenSSL digest failure.
+     */
+    static std::optional<std::string> settlement_puzzle_hash(const std::string& asset);
+
 private:
     // -- Internal helpers ---------------------------------------------------
 

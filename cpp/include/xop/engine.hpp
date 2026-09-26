@@ -53,6 +53,7 @@
 #include "xop/execution/market_data.hpp"
 #include "xop/execution/offer_manager.hpp"
 #include "xop/execution/take_retry.hpp"
+#include "xop/execution/wallet_sync_watch.hpp"
 
 // Data / analytics
 #include "xop/data/volatility.hpp"
@@ -1720,6 +1721,19 @@ private:
     /// (PNL-BASIS-PERSIST).  Called after every mutation; never throws.
     void persist_inventory_state() noexcept;
 
+    /// [SEED-FAIL-CLOSED 2026-09-22] Make State's position in `asset` the
+    /// wallet's confirmed balance, whatever State held
+    /// (risk/state_position_truth.hpp).  Called by Step 8 at each balance read
+    /// below its wallet sync gate.  Returns the balance State held before, or
+    /// std::nullopt when the read may not overwrite it (fields missing, bridge
+    /// asset under its scan, negative).  It does not verify an unverified
+    /// asset: only Step 8's verification pass does, because that pass is
+    /// followed by a heartbeat without posting (review round 1).
+    std::optional<Mojo> reconcile_state_position(const std::string& asset,
+                                                 Mojo confirmed,
+                                                 bool fields_validated,
+                                                 BlockHeight block_height);
+
     // -- Double-entry accounting (LEDGER 2026-07-30) ------------------------
 
     /// Establish opening balances once, from the wallet's confirmed balances.
@@ -2628,6 +2642,17 @@ private:
     /// exists to avoid.
     static constexpr std::uint32_t kMaxTerminalPersistFailures = 10;
 
+    /// [FILL-PROOF, review #171] Dead offers whose offer_log write failed.
+    /// detect_fills() reports a dead offer ONCE, having already stopped
+    /// tracking it, so a failed write would otherwise wait for the next
+    /// process start.  Retried each heartbeat, up to
+    /// kMaxTerminalPersistFailures consecutive failures, as S25 retries its own.
+    struct PendingDeadWrite {
+        execution::OfferManager::DeadOffer dead{};
+        std::uint32_t                      failures{0};
+    };
+    std::vector<PendingDeadWrite> pending_dead_writes_;
+
     /// Buffer an offer the wallet reported terminal so Step 2 can persist
     /// it once the observation has matured and been re-verified.  Ignores
     /// an id already buffered, since detect_fills() and reconcile_offers()
@@ -2686,14 +2711,28 @@ private:
     uint32_t consecutive_pending_blocks_{0};
     static constexpr uint32_t kForceDeletePendingBlocks{12};  // ~10 min
 
-    // -- Wallet unsync auto-recovery -------------------------------------
-    // When the Chia wallet stays unsynced for kWalletRestartThreshold
-    // consecutive blocks, the engine restarts the wallet service to
-    // force a clean resync from the trusted full node.  This breaks the
-    // deadlock where pending_change prevents sync and the sync gate
-    // prevents the force-delete from ever firing.
-    uint32_t consecutive_unsynced_blocks_{0};
-    static constexpr uint32_t kWalletRestartThreshold{20};  // ~3 min
+    // -- Wallet unsync auto-recovery [WALLET-RESTART-LIVELOCK 2026-09-22] --
+    // Step 8 restarts the wallet service only when
+    // execution::observe_wallet_sync() says so: never inside the syncing
+    // budget while the wallet reports a sync, and each restart doubles the
+    // next attempt's budget.  It replaces a 20-heartbeat counter that
+    // restarted a SYNCING wallet every 6-10 minutes -- a livelock, because a
+    // Chia long sync records its progress only when it completes and a
+    // restart rolls the wallet back 256 blocks.
+    execution::WalletSyncWatch wallet_sync_watch_{};
+
+    // [review round 6] A wallet start owed after a restart whose start command
+    // failed.  [review round 7] Retried from poll_loop_coro on every poll,
+    // before any wallet or height call: a stopped wallet answers no sync
+    // check, and in wallet-only mode no height either, so a heartbeat would
+    // never come.  Settled when a start works or the wallet answers -- Step 8's
+    // sync check, the circuit probe, or [review round 10] any call since the
+    // start was owed -- which counts the restart a stop that worked began.
+    execution::WalletStartDebt wallet_start_debt_{};
+    // [review round 10] The wallet client's answered-call count when the start
+    // was owed.  Any answer since proves the wallet running, and the poll loop
+    // settles the debt before sending another start.
+    std::uint64_t wallet_start_owed_answered_{0};
 
     bool wallet_synced_{false};
     bool wallet_syncing_{false};
@@ -2728,6 +2767,53 @@ private:
         bool fields_validated{false};
     };
     std::unordered_map<std::string, WalletBalanceEntry> cached_wallet_balances_;
+
+    // [SEED-FAIL-CLOSED 2026-09-22] Assets whose State position the startup
+    // seed could not read from the wallet, and so took from the last
+    // persisted quantity (or from nothing).  Step 8 does not quote a pair that
+    // trades one.  Step 8's verification pass reads them every synced
+    // heartbeat and clears each one it verifies -- and a heartbeat that
+    // verifies anything posts nothing, because Step 6 sized it from the guess.
+    // The bridge scan clears its own asset (review round 1).
+    std::unordered_set<std::string> state_unverified_assets_;
+    // [SEED-FAIL-CLOSED review round 7] Assets verified since boot whose pairs'
+    // older offers the unverified-offer drain has not yet taken down, each with
+    // the block it was verified at.  A heartbeat that verifies an asset used to
+    // return before the drain, and the next one no longer counted the asset as
+    // unverified, so offers restored at boot on its pairs were never drained.
+    // The drain takes down what was created AT OR before that block [review
+    // round 8: a restored offer can carry that very height after a restart
+    // within one peak] -- never an offer the pair loop posts afterwards -- and
+    // drops the entry once it has.  [review round 13] Until then the pair loop
+    // posts nothing on the asset's pairs: an offer the drain could not cancel
+    // may still rest.
+    std::unordered_map<std::string, BlockHeight> state_verified_undrained_;
+    // [SEED-FAIL-CLOSED review round 9, #172's review] Assets a booked fill
+    // moved.  Step 2 books a fill into State with record_buy/record_sell, and
+    // Step 8 sets State to the wallet's balance; a take the wallet already
+    // showed at the last Step 8 is counted twice until the next one, and Step
+    // 6 sizes ladders from that.  [review round 12] Kept until a validated
+    // Step 8 read has reconciled the asset (reconcile_state_position), or
+    // [review round 13], for the bridge asset, the bridge scan has set it.
+    // Not cleared each heartbeat: one whose Step 8 is skipped, or whose read
+    // fails, leaves State double-counted.  Step 9f waits while it holds
+    // anything.
+    std::unordered_set<std::string> fill_moved_assets_;
+    // [review round 12] This heartbeat's posting pause: what fill_moved_assets_
+    // held when it began, plus this Step 2's fills.  Step 8 posts nothing on a
+    // pair trading one of these -- in the heartbeat that reconciles an asset
+    // too, since Step 6 sized its ladders before the read.
+    std::unordered_set<std::string> fill_gate_assets_;
+    // [SEED-FAIL-CLOSED review round 2] Step 9f's "unverified" line has been
+    // logged at WARN for the current episode; later heartbeats log at debug.
+    bool drift_unverified_warned_{false};
+    // [SEED-FAIL-CLOSED review round 6] Step 8 passed its wallet-sync gate in
+    // THIS heartbeat.  Cleared at the top of every heartbeat and set only just
+    // below that gate, so it is never an earlier heartbeat's verdict: Step 8
+    // does not run while paused, and wallet_synced_ keeps its last value.
+    // The bridge scan, which runs every heartbeat after Step 8, clears its
+    // asset's unverified mark only while this holds.
+    bool step8_sync_gate_passed_{false};
 
     // -- [PACE 2026-09-13] Pace controller state -----------------------------
     // The only pace state kept between heartbeats is each asset's activation

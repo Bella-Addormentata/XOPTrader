@@ -10,6 +10,7 @@
 //   ISO/IEC 25000       -- single-responsibility methods, RAII locks
 
 #include "xop/state.hpp"
+#include "xop/peg_registry.hpp"   // to_mojo_checked
 
 #include <spdlog/spdlog.h>
 
@@ -196,6 +197,70 @@ bool State::record_sell(const AssetId& asset_id, Mojo qty)
                       asset_id, qty, it->second.balance, it->second.cost_basis);
     }
     return ok;
+}
+
+std::optional<Mojo> State::reconcile_balance(const AssetId& asset_id,
+                                             Mojo           observed)
+{
+    if (observed < 0) {
+        spdlog::error("reconcile_balance: negative observed balance {} for "
+                      "asset={} -- rejected", observed, asset_id);
+        return std::nullopt;
+    }
+
+    std::unique_lock lock(mtx_positions_);
+
+    auto it = positions_.find(asset_id);
+    if (it == positions_.end()) {
+        if (observed == 0) {
+            return Mojo{0};   // nothing held and nothing tracked: no entry
+        }
+        it = positions_.try_emplace(asset_id, asset_id).first;
+    }
+
+    Position&  pos      = it->second;
+    const Mojo previous = pos.balance;
+    if (previous == observed) {
+        return previous;
+    }
+
+    if (observed == 0) {
+        pos.balance    = 0;
+        pos.total_cost = 0.0;   // full exit, as Position::remove does
+    } else if (previous > 0) {
+        // Scale the cost with the quantity: the weighted average survives
+        // exactly, whichever way the balance moved.
+        pos.total_cost *= static_cast<double>(observed)
+                        / static_cast<double>(previous);
+        pos.balance     = observed;
+    } else {
+        // No holdings to take a basis from: the unit-mojo basis of the
+        // startup seed (record_buy(qty, Mojo{1})).
+        pos.balance    = observed;
+        pos.total_cost = static_cast<double>(observed);
+    }
+    // The basis only feeds the dashboard; the balance above is what the risk
+    // limits read and stands regardless.  A ratio that cannot be a Mojo --
+    // non-finite, negative, or out of range, where llround's result is
+    // unspecified -- is not converted: the position takes the unit basis.
+    pos.cost_basis = 0;
+    if (pos.balance > 0) {
+        if (const std::optional<Mojo> basis = to_mojo_checked(
+                pos.total_cost / static_cast<double>(pos.balance))) {
+            pos.cost_basis = *basis;
+        } else {
+            spdlog::warn("reconcile_balance: cost basis of asset={} is not a "
+                         "representable Mojo (total_cost={} over {}) -- reset "
+                         "to the unit basis", asset_id, pos.total_cost,
+                         pos.balance);
+            pos.total_cost = static_cast<double>(pos.balance);
+            pos.cost_basis = 1;
+        }
+    }
+
+    spdlog::info("reconcile   asset={} balance {} -> {} basis={}",
+                  asset_id, previous, observed, pos.cost_basis);
+    return previous;
 }
 
 double State::inventory_skew(const AssetId& base_id, const AssetId& quote_id) const

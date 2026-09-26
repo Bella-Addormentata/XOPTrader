@@ -30,9 +30,14 @@
 #include <algorithm>
 #include <mutex>
 #include <array>
+#include <cctype>
+#include <charconv>
 #include <cmath>
 #include <cstring>
 #include <functional>
+#include <initializer_list>
+#include <string_view>
+#include <system_error>
 #include <limits>         // std::numeric_limits -- overflow guards (HIGH-1, HIGH-3)
 #include <sstream>
 #include <stdexcept>
@@ -775,6 +780,137 @@ std::string CoinManager::compute_coin_name(const std::string& parent_id,
     }
 
     return oss.str();
+}
+
+// ---------------------------------------------------------------------------
+// [FILL-PROOF, review #171 round 5] settlement_puzzle_hash
+// ---------------------------------------------------------------------------
+// A take settles each offered asset through a coin at that asset's settlement
+// puzzle: OFFER_MOD (settlement_payments.clsp) itself for XCH, and for a CAT,
+// CAT v2 curried with the CAT's TAIL around OFFER_MOD.  A curried puzzle's
+// tree hash follows from the hashes of its parts, as chia's
+// curry_and_treehash computes it, so no CLVM is run:
+//
+//   atom(b)    = sha256(0x01 || b)
+//   pair(l, r) = sha256(0x02 || l || r)
+//   MOD curried with A1 A2 A3 = (a (q . MOD) (c (q . A1) (c (q . A2) (c (q . A3) 1))))
+// ---------------------------------------------------------------------------
+
+namespace {
+
+using TreeHash = std::array<std::uint8_t, 32>;
+
+TreeHash sha256_of(std::initializer_list<std::pair<const std::uint8_t*, std::size_t>> parts)
+{
+    std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx(
+        EVP_MD_CTX_new(), EVP_MD_CTX_free);
+    if (!ctx || EVP_DigestInit_ex(ctx.get(), EVP_sha256(), nullptr) != 1) {
+        throw std::runtime_error("settlement_puzzle_hash: SHA-256 init failed");
+    }
+    for (const auto& [data, size] : parts) {
+        if (size > 0U && EVP_DigestUpdate(ctx.get(), data, size) != 1) {
+            throw std::runtime_error("settlement_puzzle_hash: SHA-256 update failed");
+        }
+    }
+    TreeHash out{};
+    unsigned int out_len = 0;
+    if (EVP_DigestFinal_ex(ctx.get(), out.data(), &out_len) != 1 || out_len != out.size()) {
+        throw std::runtime_error("settlement_puzzle_hash: SHA-256 final failed");
+    }
+    return out;
+}
+
+TreeHash tree_atom(const std::uint8_t* data, std::size_t size)
+{
+    static constexpr std::uint8_t kAtomTag = 0x01;
+    return sha256_of({{&kAtomTag, 1U}, {data, size}});
+}
+
+TreeHash tree_atom(const TreeHash& bytes)
+{
+    return tree_atom(bytes.data(), bytes.size());
+}
+
+TreeHash tree_pair(const TreeHash& left, const TreeHash& right)
+{
+    static constexpr std::uint8_t kPairTag = 0x02;
+    return sha256_of({{&kPairTag, 1U}, {left.data(), left.size()}, {right.data(), right.size()}});
+}
+
+/// 32 bytes from 64 hex digits, a 0x prefix allowed; std::nullopt otherwise.
+std::optional<TreeHash> hash32_from_hex(std::string_view hex)
+{
+    if (hex.size() >= 2U && hex[0] == '0' && (hex[1] == 'x' || hex[1] == 'X')) {
+        hex.remove_prefix(2);
+    }
+    if (hex.size() != 64U) {
+        return std::nullopt;
+    }
+    TreeHash out{};
+    for (std::size_t i = 0; i < out.size(); ++i) {
+        const char* const first = hex.data() + 2U * i;
+        unsigned int byte = 0;
+        const auto [ptr, ec] = std::from_chars(first, first + 2, byte, 16);
+        if (ec != std::errc{} || ptr != first + 2) {
+            return std::nullopt;
+        }
+        out[i] = static_cast<std::uint8_t>(byte);
+    }
+    return out;
+}
+
+std::string lower_hex(const TreeHash& bytes)
+{
+    static constexpr char kDigits[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(2U * bytes.size());
+    for (const std::uint8_t byte : bytes) {
+        out.push_back(kDigits[byte >> 4U]);
+        out.push_back(kDigits[byte & 0x0FU]);
+    }
+    return out;
+}
+
+}  // namespace
+
+std::optional<std::string> CoinManager::settlement_puzzle_hash(const std::string& asset)
+{
+    // settlement_payments.clsp v1 (OFFER_MOD_HASH) and cat_v2.clsp (CAT_MOD_HASH).
+    static constexpr std::string_view kOfferModHash =
+        "cfbfdeed5c4ca2de3d0bf520b9cb4bb7743a359bd2e6a188d19ce7dffc21d3e7";
+    static constexpr std::string_view kCatModHash =
+        "37bef360ee858133b69d595a906dc45d01af50379dad515eb9518abb7c1d2a7a";
+
+    std::string lowered = asset;
+    for (char& ch : lowered) {
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+    if (lowered == "xch") {
+        return std::string{kOfferModHash};
+    }
+    const std::optional<TreeHash> tail = hash32_from_hex(lowered);
+    if (!tail) {
+        return std::nullopt;
+    }
+    const TreeHash offer_mod = hash32_from_hex(kOfferModHash).value();
+    const TreeHash cat_mod   = hash32_from_hex(kCatModHash).value();
+
+    static constexpr std::uint8_t kQuote = 0x01;
+    static constexpr std::uint8_t kApply = 0x02;
+    static constexpr std::uint8_t kCons  = 0x04;
+    const TreeHash quote = tree_atom(&kQuote, 1U);
+    const TreeHash apply = tree_atom(&kApply, 1U);
+    const TreeHash cons  = tree_atom(&kCons, 1U);
+    const TreeHash nil   = tree_atom(nullptr, 0U);
+
+    // The arguments, built from the innermost out: OFFER_MOD (a puzzle: its
+    // tree hash), the TAIL and CAT_MOD_HASH (atoms).  The innermost tail of
+    // the list is the environment, 1 -- the same atom as the quote keyword.
+    TreeHash args = quote;
+    for (const TreeHash& arg : {offer_mod, tree_atom(*tail), tree_atom(cat_mod)}) {
+        args = tree_pair(cons, tree_pair(tree_pair(quote, arg), tree_pair(args, nil)));
+    }
+    return lower_hex(tree_pair(apply, tree_pair(tree_pair(quote, cat_mod), tree_pair(args, nil))));
 }
 
 }  // namespace xop::execution

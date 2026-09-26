@@ -5,6 +5,439 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.26] — 2026-09-26 — positions that follow the wallet, a wallet left to sync, and fills the chain has proven
+
+### The risk limits read the wallet's positions, not a guess that fills made
+
+On 2026-09-22 every startup balance read timed out (four 30-second attempts
+each, 16:58:39 to 17:04:49) and the seed skipped each asset with a DEBUG line,
+so State (the positions the risk limits read) started empty and the log said
+nothing. Fills then gave State 1.103 XCH and 102.976 DBX, and no BYC. In that
+heartbeat the single-CAT cap read DBX as 52.8% of the portfolio (full block at
+50%) and sized the XCH/DBX ask to zero; after the next fill State held 0.103 XCH
+and 203.188 DBX, and DBX read as about 96%. The wallet held about 34.7 XCH, 99
+BYC and 2,167 DBX. Step 8 had a recovery for an unseeded State, but it fired
+only while a position was exactly zero, and the fills had made them non-zero
+before Step 8 first read a balance. (That evening Step 8 posted nothing anyway:
+it stopped at its wallet sync gate on every heartbeat. But the moment the
+wallet synced, the wrong State would have sized every ask, and nothing could
+have corrected it.)
+
+- **Every validated balance Step 8 reads now sets State's position**, whatever
+  State held before: the main loop's balance gate and the empty-ladder
+  liveness refresh, which is the only read a suspended pair's CAT gets (BYC's,
+  that evening). Fees, taker fills and deposits, which never pass through
+  `record_buy`/`record_sell`, stop accumulating in State as drift too. A reply
+  missing `confirmed_wallet_balance` or `pending_change` changes nothing, and
+  the bridge asset keeps its single writer while its scan is operational.
+- **An unread startup balance is never zero.** A failed read falls back to the
+  quantity last persisted for the asset (`inventory_state`), logs an ERROR
+  naming it, and stays unverified until Step 8 reads the wallet, which logs a
+  WARN with the correction. A built wallet map with no wallet for an asset is a
+  verified zero; an unbuilt one proves nothing. The empty State this replaces
+  was the least cautious default available: with no positions, concentration
+  reads "balanced" and every CAT 0%, so no limit can trip. A startup read, or
+  a map with no wallet for the asset, counts as the wallet's word only if the
+  startup sync wait saw the wallet fully synced (review round 4). When the
+  wait runs out first, every asset takes the unverified path, the log says so,
+  and Step 8 verifies each one once the wallet is synced. The wallet-ID map
+  boot built is dropped too (review round 5). It is built only once, and one
+  built mid-sync can lack a CAT wallet not yet created, which Step 8 would
+  then verify as a zero. Step 8 rebuilds it below its sync gate.
+- The per-asset startup read failure is logged as a WARN instead of DEBUG.
+- **Nothing is quoted from a guessed position** (review round 1). Step 6 sizes
+  a heartbeat's ladders before Step 8 reads the wallet, so Step 8 now verifies
+  every unverified position right below its sync gate. A heartbeat that
+  verifies anything posts nothing, and the next one is sized from the wallet.
+  A pair that trades a position the pass could not read is not quoted until
+  it can be: that covers a first boot with no persisted row, where the guess
+  is nothing at all. A built wallet map with no wallet for the asset still
+  counts as a verified zero. Nor does an unverified position loosen another
+  pair's caps (review round 11). Its fallback quantity stays out of the
+  portfolio total the single-CAT and pair-capital caps divide by, as the
+  asset did before this change, when a failed read left it out of State. An
+  overstated fallback would have understated every other asset's share.
+- A pace-managed pair with an empty ladder has both its assets read by the
+  empty-ladder refresh, below Step 8's sync gate, like any other pair (review
+  round 4). Rounds 1 and 2 took them from pace's own read instead. That read
+  runs before the sync check, so it could be taken mid-sync, and it covers
+  only the assets pace lists, so it skips XCH in a CAT-only pace config. The
+  bridge scan clears the unverified mark on its own asset, but only in a
+  heartbeat whose Step 8 passed its wallet-sync gate (review round 6). The
+  scan runs every heartbeat, and its own balance fetch checks only that the
+  wallet answers. The reconciled cost basis goes through `to_mojo_checked()`,
+  and a ratio that is not a representable Mojo falls back to the unit basis
+  instead of being converted.
+- **An unverified pair's resting offers come down** (review round 2). Its gate
+  used to skip every cancel path in the pair loop, so offers restored at boot
+  rested unmanaged for as long as the read kept failing. Step 8 now cancels
+  them (reason `unverified_position`), each heartbeat, until the pair is flat.
+  Round 3 moved that drain ahead of the pair loop and made it scan the whole
+  book, like the peg-suspension drain. It runs right after the heartbeat's
+  fees are set, which every cancel in Step 8 pays, and ahead of every exit
+  that follows. Inside the pair loop it sat behind the skip for an empty
+  ladder or an invalid quote, which an unverified pair is likely to have.
+  The heartbeat that verifies a position no longer skips it (review round 7).
+  That heartbeat used to return before the drain, and on the next one the
+  asset no longer counted as unverified, so the offers restored at boot on
+  its pairs were never taken down. Now both places that verify, Step 8's
+  pass and the bridge scan, record the block they verified at. The drain
+  takes down, on the asset's pairs, every offer created before that block,
+  never one the pair loop posts afterwards. It forgets the asset once a pass
+  has taken them all. The verifying heartbeat ends right after the drain,
+  before anything is posted. The drain takes every offer created at or
+  before that block (review round 8): after a restart within one peak, a
+  restored offer can carry the very height the first heartbeat verifies at.
+- A pair whose position a fill moved posts nothing new until Step 8 has
+  reconciled that position to the wallet, nor in the heartbeat that does
+  (review round 9, from #172's review). Step 8 sets each State
+  position to the wallet's balance, and Step 2 books each fill into State
+  too. So a take the wallet already showed at the last Step 8 counts twice
+  until this Step 8 reads the balance again. That happens when the wallet
+  sees the block between Step 2 and Step 8, or when the fill proof waits for
+  the node, and Step 6 sized that heartbeat's ladders from the doubled
+  position. Its cancels still run; only posting waits. A heartbeat whose
+  Step 8 is skipped, or whose read fails, keeps the pause (review round
+  12): round 9 lifted it at the next heartbeat whatever had happened. Step
+  7's asset-drift guard, when it totals State, leaves the unverified out
+  too, as Step 6 does (review round 12). For the bridge asset the pause ends
+  once the bridge scan, its only State writer, has set State to the wallet's
+  balance (review round 13). Step 9f's drift corrector, which places taker
+  trades before Step 8 runs, does nothing while any fill's position is
+  unreconciled. And a pair whose stale offers a verification's drain could
+  not all cancel posts nothing until they are (review round 13).
+- **The drift corrector does nothing while any position is unverified** (review
+  rounds 2 and 3). Round 2 stood Step 9f down only when no balance had been
+  read at all. With some read and some not, the unread asset was simply
+  missing from its shares, every other asset looked overweight, and 9f, which
+  trades both ways toward its targets, would have sold them.
+- **The empty-ladder liveness refresh reads XCH too** (review round 3). Step 7's
+  XCH read updates the cap and never State, so for a pair that is not
+  pace-managed, nothing corrected XCH's State position while every XCH ladder
+  stayed empty. The refresh runs below Step 8's sync gate, so no half-synced
+  wallet's reading reaches State. It costs at most one extra XCH balance call
+  per heartbeat, and only while some pair's ladder is empty.
+- The startup fallback is the quantity `inventory_state` restored, captured
+  before the read loop. `seed_position()` fills an empty record from this
+  boot's reply, and a reply without `confirmed_wallet_balance` would otherwise
+  have passed its spendable balance off as the persisted quantity (review
+  round 2).
+
+Not in this change: the InventoryTracker (the strategy's `q`) and its one-shot
+Step 11 reconcile, and the XCH/DBX bid, which was zero for a different reason
+that evening (`q` above `q_max`).
+
+### The engine stops restarting a wallet that is still syncing
+
+On 2026-09-22 the wallet reported `synced=false, syncing=true` on every Step 8
+heartbeat from 17:08 on, so Step 8 managed no offers all evening. Every 20
+unsynced heartbeats (6-10 minutes in practice; the code said "~3 min") the
+engine ran `chia stop wallet & chia start wallet`, 9 times between 17:18 and
+18:24, and that restart is what kept the wallet from syncing. In Chia 2.7.4 a
+long sync records its progress only when it completes; with
+`use_delta_sync: false` it re-reads every puzzle hash and coin from height 0;
+and a freshly started wallet begins its first long sync by rolling back 256
+blocks. So every restart threw away the sync in progress and moved the wallet
+backwards. At 18:29 its finished-sync height was 9,297,547 against a node peak
+of 9,329,985.
+
+- The restart now follows `execution/wallet_sync_watch.hpp`. A wallet that
+  reports a sync in progress is not restarted until it has been unsynced for
+  2 hours in total. Idle time before the sync counts too, at most 15 minutes,
+  so that a wallet flipping between syncing and idle still reaches a restart
+  (review round 4). One that is neither synced nor syncing is restarted after
+  15 minutes. Each successful restart doubles both budgets for the next
+  attempt (capped at 24 hours), and reporting synced resets them.
+- Time is measured on a monotonic clock instead of counted in heartbeats. A gap
+  of more than 10 minutes between readings (Step 8 not reached) starts a new
+  streak rather than counting as unsynced time.
+- A reply without `syncing` is treated as syncing: never as idle, and never as
+  synced either (review round 2). Step 8 used to read `{"synced": true}` alone
+  as synced and manage offers, while the startup gate kept waiting on the same
+  reply.
+- The Step 8 line says how long the wallet has been unsynced and what a restart
+  waits for; the restart line says which restart it is. It prints the syncing
+  state the verdict used, so a reply without `syncing` reads
+  `syncing=missing, read as true`, not `syncing=false` (review round 3).
+- The re-synced line reports the whole outage, restarts included (review
+  round 5). It printed the unsynced streak, which each restart starts afresh.
+  So after a restart it gave only the time since that restart, and "0s"
+  when the first reading after a restart or a pause was already synced. When
+  Step 8 was not reached for part of the outage, its length is unknown, and
+  the line says so instead of giving a number.
+- A restart whose start failed no longer leaves the wallet down (review
+  round 6). The restart ran as one command, `chia stop wallet & chia start
+  wallet` on Windows, which returned only the start's code. A start that
+  failed after a stop that worked left no wallet to answer Step 8's sync
+  check. The watch then never decided again, and the wallet circuit breaker
+  skipped Step 8 altogether, so the retry never came. Stop and start are now
+  two commands. A start that fails is owed, and the poll loop retries it on
+  every poll, before any wallet or height call (review round 7): after 60
+  seconds, then at doubling intervals up to 15 minutes, until a start
+  succeeds or the wallet answers. It runs there rather than in the
+  heartbeat because in wallet-only mode a heartbeat needs a height from the
+  very wallet the failed start left down. Once the owed start works, or the
+  wallet answers, a restart whose stop worked counts again, so the next
+  budgets double as a successful restart's do. The wallet answering the
+  circuit breaker's probe settles it too (review round 9), and so, from
+  review round 10, does any wallet call answered since the start was owed,
+  such as a wallet-only height. So a heartbeat that never reaches Step 8 no
+  longer leaves the poll loop sending starts to a running wallet. And each retry's delay counts from when the blocking
+  command returned, not from when it was due.
+
+Not in this change: the wallet's own configuration (`use_delta_sync`,
+`connect_to_unknown_peers`), and the restart itself, which is still a blocking
+`std::system` call.
+
+### A fill is booked only when the chain shows the offer was taken
+
+On 2026-09-22 the engine booked three fills for offers that were never taken:
+the XCH/DBX asks `0xd6a8325c15` and `0x83eef9df80` and the XCH/BYC bid
+`0xdb63709cb9` (trade_log rows 1900-1902). Each had lost exactly one XCH input
+to another of the bot's own transactions, which spent it paying a
+15,000,000-mojo fee (blocks 9,324,680, 9,325,004 and 9,325,694). Every other
+maker coin of all three is still unspent, and Dexie shows all three cancelled.
+The wallet nevertheless reported them CONFIRMED at exactly those heights, and
+detect_fills booked every CONFIRMED offer: they entered trade_log, the ledger,
+the inventory tracker and State (about -0.9 XCH, -1.864 BYC and +203.188 DBX,
+and 44,876 DBX mojos of realized P&L that never happened).
+
+The wallet's CONFIRMED is its own bookkeeping, not evidence. The likely
+mechanism, read from Chia 2.7.4's code: it marks a trade CONFIRMED when every
+coin its inputs would create exists on-chain, but it only checks the inputs it
+finds in its coin store at that moment. After the 2026-09-22 resyncs the
+untouched inputs could be missing from the store, and a check over what is left
+can pass for an offer nobody took.
+
+- Before booking a CONFIRMED offer, detect_fills looks up the offer's maker
+  coins (the trade record's `coins_of_interest`) on-chain
+  (`execution/fill_proof.hpp`). It asks the full node while the engine trusts
+  it (a node, and not `wallet_only_mode_`, the rule the S14 cancel escalation
+  uses), and otherwise the wallet, which does not answer until it is synced.
+- A take spends every maker coin in one block, but so does a cancel, or a
+  stray spend of an offer funded by one coin, so that alone books nothing. A
+  fill is booked only when that block also shows the take's own mark:
+  - From the node: a settlement coin, created from a maker coin at the offered
+    asset's settlement puzzle, for exactly the amount offered, and spent in
+    the same block. The puzzle is OFFER_MOD for XCH, and for a CAT it is CAT
+    v2 curried with the CAT's TAIL around OFFER_MOD
+    (`CoinManager::settlement_puzzle_hash`). An amount alone could belong to
+    any child.
+  - From the wallet, which cannot see settlement coins: a coin of ours
+    confirmed in that block for exactly a requested amount, whose parent is
+    not one of this offer's maker coins. That is all the check can prove: it
+    cannot tell a payment from an unrelated coin of ours (see "Not detected"
+    below).
+    The wallet is asked for every such coin, with no row limit. A limit of
+    50 would have hidden a payment past the 50th row on every retry.
+
+  Four real takes (one ask, three bids) each show exactly one such
+  settlement coin, at exactly the puzzle computed for its asset. The
+  phantom's consumed coin and four confirmed cancels show none. Once the
+  mark is found the fill books as before. The fill's height is
+  now the height of those spends, which the confirmation-depth buffer counts
+  from, not the wallet's `confirmed_at_index`. For a take the wallet saw
+  itself they are the same number.
+- A maker coin still unspent while another is spent, maker coins spent at
+  different heights, or every coin spent in one block that the node shows
+  without a settlement coin, means the offer died without being taken. That
+  includes a block where the maker coins created no children at all. A reply
+  without its list of coin records, at either stage and from the node or the
+  wallet, is a failed lookup, not an empty list. So the first malformed reply
+  ends the lookups for that heartbeat, as a timeout does, instead of every
+  other CONFIRMED offer asking again (review round 7). The S14 cancel
+  escalation, which shares the node's lookup, now stops its sweep on one too.
+  Nothing is booked. Once the first spend is
+  `strategy.confirmation_depth_blocks` deep (default 6), the offer stops being
+  tracked, the engine logs an ERROR, and it records the offer `cancelled` at
+  the height of that spend with the reason `dead_on_chain`. The closure event
+  keeps that reason. The offer_log row follows the rule every closure does
+  (S14): a row still open closes `cancelled` at that height with that reason,
+  a row whose cancel was already submitted closes the same way but keeps that
+  cancel's cause, and a row already closed keeps its status. So an audit of
+  dead offers reads the closure events (review round 9). A write that
+  fails is retried every heartbeat, up to the 10 failures S25 allows. A fee
+  ticket for a cancel on it closes without an observation, the same way a
+  FAILED offer's does: the chain cannot say whose spend killed it.
+- Every maker coin unspent means the offer can still be taken. Nothing is
+  booked and it stays tracked. If it is taken later, it is booked then.
+- A lookup that fails, or an answer that does not cover every maker coin or
+  cannot be read, books nothing. So does a wallet that shows no payment: its
+  store is what was incomplete on 2026-09-22, so its silence proves nothing
+  either way. The offer stays tracked and is asked about again next heartbeat.
+  The first deferral and every 20th are logged. After one lookup fails,
+  nothing more is asked that heartbeat, as the S14 escalation does: each
+  failure spends its transport retries. A lookup the node or wallet refuses
+  is different (review round 15). The wallet refuses a request that names a
+  coin it does not hold. The refusal costs one round trip and is that
+  offer's alone, so the offers after it are still asked. The fill poll visits
+  offers in hash-map order, so the same offer could otherwise have come
+  first every heartbeat and kept every later fill unproven. Only that
+  refusal is one offer's (review round 16). A wallet that is not synced, or
+  not connected to a synced peer or any full node, refuses every lookup the
+  same way, so that refusal still ends the heartbeat's lookups.
+- While the wallet reports an offer CONFIRMED and the proof has not settled
+  it, the engine will not cancel it. Chia's secure cancel sets PENDING_CANCEL
+  over any status, and an insecure one sets CANCELLED. So a cancel sent during
+  a one-heartbeat lookup failure would erase the CONFIRMED the proof is waiting
+  on, and a real take with it. The one exception: an offer the full node shows
+  live again can be cancelled. That means every maker coin unspent in the
+  latest fill check, with the node at least `confirmation_depth_blocks` past
+  the height the wallet claims. A take undone by a reorganisation therefore
+  does not leave a quote nobody can withdraw. The latest check is counted by
+  call, not by block: two checks can run at one height, and a live proof from
+  the earlier one no longer counts. An offer is held from the poll that reads
+  CONFIRMED, before the engine waits on anything else. So a Cancel All or a
+  shutdown that runs while the proof is being asked cannot slip in before the
+  hold. An offer stops being held by the first poll that reads any other
+  status, again before the engine waits on anything else. Once the engine
+  has read that status, no cancel of the offer is refused on its account.
+  The status must be one of Chia's six trade statuses (review round 8). An
+  unrecognised one is no evidence the offer left CONFIRMED, so the hold
+  stays until a poll reads one that is.
+  Nor does PENDING_CANCEL or CANCELLED release it (review round 11): they are
+  what a cancel writes, and a cancel can write them over a real take. In
+  chia 2.7.4 cancelling an offer marks every trade not yet CANCELLED that
+  shares one of its coins, a CONFIRMED one included. And a take leaves a
+  pending offer that shared one of its coins PENDING_ACCEPT, so cancelling
+  that offer later -- any sweep or per-offer cancel, the watchdog's included --
+  reaches the taken trade. Its take was then never proved or booked. Now the
+  next heartbeat proves such an offer on-chain once more. If the chain shows
+  the take, it is booked, from that proof. If it shows the offer live or dead,
+  the hold is released and the offer is handled as its status says, as
+  before. If the chain cannot say, it stays held and is asked again.
+  Nor only an offer this process held (review round 12). The overwrite can
+  come before the first poll that reads CONFIRMED, and a restart forgets
+  every hold. So every tracked offer is proven the first time it shows each
+  cancel status, and a held one every heartbeat. The answer is remembered,
+  so a cancel costs about one lookup per status. For an offer never held, an
+  answer the chain cannot settle is asked again only after a failed lookup.
+  Otherwise its status stands, so no offer waits on a question no retry
+  will answer.
+  Nor at boot (review round 13). Startup reconciliation counted a DB row the
+  wallet reported CANCELLED as terminal, and the engine stamped it cancelled
+  before restoring the book. So a take that a cancel overwrote before a
+  restart never reached the proof. Such a row is no longer stamped: it
+  restores into State flagged cancel_pending, and detect_fills proves it the
+  first time it polls it. FAILED, which no cancel writes, is still stamped.
+  Two refinements (review round 14). An offer the wallet reports
+  PENDING_CANCEL is marked cancel_pending in State before any proof, as
+  recheck_terminal's revival does. The cancel in flight may be anyone's,
+  and once a proof released the hold, the TTL and reprice paths would
+  otherwise have sent a second secure cancel for the same coins. And only a
+  Dead answer is remembered: a Live offer can still be taken, so it is asked
+  again next heartbeat, one lookup, until its cancel lands.
+  And an offer the wallet reports CANCELLED while every maker coin is unspent
+  stays tracked (review round 15). That is a local cancel: the last resort of
+  the emergency cancel ladder, or one made in the wallet's own UI. The offer
+  can still be taken, and the wallet watches no CANCELLED trade's coins
+  (chia 2.7.4), so it would never report the take. detect_fills used to
+  close such an offer after one Live proof. It now stays tracked, flagged
+  cancel_pending, and is proven every heartbeat until the chain shows it
+  taken (booked then) or dead (closed then). The one exception is an offer
+  the expiry retire (`ttl_cancel_mode: expire`) cancelled locally after
+  proving it expired: nothing can take it, so it still closes on that
+  verdict. The engine remembers those only until it restarts, so after a
+  restart such an offer stays tracked until one of its coins is spent.
+  Periodic reconciliation now leaves a CANCELLED offer to detect_fills the
+  same way, instead of removing it unproven.
+  A Dead answer under a cancel's status is final only once the spend that
+  killed the offer is `strategy.confirmation_depth_blocks` deep, as it is
+  for a CONFIRMED offer (review round 16). A shallower spend can be
+  reorganised out, and in chia 2.7.4 a reorganisation leaves the wallet's
+  trade records alone, so the cancel's status would stay over an offer that
+  can be taken again. Until the spend is deep enough, the offer stays
+  tracked and is proven every heartbeat.
+  After an accepted Cancel All sweep, an offer already flagged
+  cancel_pending is read again, as a held one is (review round 16). The
+  sweep skips a trade the wallet calls CANCELLED, and such an offer was
+  reported as one this call had cancelled.
+  An answer under a cancel's status that settles nothing is asked again
+  (#172's review). One that does not cover every maker coin, a record that
+  cannot be read, or the wallet's silence can still be completed by a node
+  catching up, and the status used to stand at once, so a take hidden under
+  it was never asked about again. Such an offer now stays tracked, flagged
+  cancel_pending, and is proven every heartbeat for
+  `strategy.confirmation_depth_blocks` from the first such answer. Only
+  then does its status stand. A record that gives the proof nothing to ask,
+  such as no readable maker coin, still lets it stand at once.
+  After an accepted Cancel All sweep, an offer the wallet reports CANCELLED
+  is proven on-chain before it counts as closed (review round 18). A local
+  cancel leaves every maker coin unspent and the offer takeable, and the
+  sweep skips it, so a shutdown could end "all cancelled" with it still on
+  offer. One the chain shows dead or taken is closed. One it shows live, or
+  cannot prove, is reported outstanding, and stays so on every retry: the
+  per-offer path no longer reports such an offer as a cancel already in
+  flight. Nothing is sent for it; it takes a secure cancel.
+  A Dead proof counts as closed there only at
+  `strategy.confirmation_depth_blocks`, as it does everywhere else (review
+  round 19). A shallower spend could be reorganised out, so such an offer is
+  reported outstanding, and stays so on every retry. And `detect_fills` no
+  longer forgets that a locally cancelled offer was takeable until its spend
+  is that deep.
+  From review round 20, an offer the wallet reports CANCELLED is flagged and
+  remembered from the first sight of that status until the chain shows it
+  taken or dead at that depth, whatever a proof in between says, so no retry
+  reports it as a cancel in flight. One the chain proves dead at that depth
+  while the wallet still reports PENDING_CANCEL is closed as `dead_on_chain`,
+  since the cancel it waits on may never land. And a coin lookup's refusal
+  counts as one offer's only in the wallet's words for a missing coin,
+  `Coin ID's: [...] not found.`.
+  Cancel All's wallet-wide sweep skips every trade the wallet calls
+  completed, so it never reports a held offer as cancelled. Such an offer goes
+  through the guarded per-offer path instead: it is cancelled there if the
+  node has proven it live again, and otherwise it stays outstanding. It is
+  never marked cancel_pending over a quote that may still be takeable.
+  A hold, though, is the status of the last poll, and the sweep acts on the
+  status each trade has when it runs. In chia 2.7.4 it marks PENDING_CANCEL
+  every trade it cancels, and every trade not yet CANCELLED that shares a
+  cancellation coin with one, a held CONFIRMED trade included. So after an
+  accepted sweep, each held offer's status is read again (review round 10).
+  Only one the wallet still reports CONFIRMED goes to the guarded path, and
+  nothing is sent a second time. One PENDING_ACCEPT or PENDING_CONFIRM is
+  live and was not swept, so it is cancelled. One whose status cannot be
+  read is sent nothing and reported outstanding. The rest are not reported
+  as cancels this call submitted, which the callers would persist with their
+  own cause (review round 11). One PENDING_CANCEL is reported as a cancel
+  already in flight. One CANCELLED or FAILED is reported closed, for
+  detect_fills to read. PENDING_CANCEL and CANCELLED keep the hold, for the
+  proof above; FAILED, PENDING_ACCEPT and PENDING_CONFIRM release it.
+- A coin record whose height does not fit a BlockHeight is unreadable, so it
+  proves nothing. The engine narrows every proven height to 32 bits, and such
+  a height would have wrapped to an old block.
+- `recheck_terminal` no longer re-adopts an offer proven dead. The wallet goes
+  on reporting it CONFIRMED, and re-adopting it would send it through
+  detect_fills again.
+
+The gtest replays the wallet and node records of `0xdb63709cb9` (one of three
+maker coins spent, at 9,325,694: dead), and of two real takes: an ask on
+2026-09-16, `0x202ff7d2d8`, and a bid, `0x18672b6b0f`. Each has its settlement
+coin and its payment.
+
+A genuine fill can now wait a heartbeat or more if the node has not yet seen
+the take. Each CONFIRMED offer costs one or two extra coin-record calls per
+heartbeat until it is resolved.
+
+Not detected: another of our offers, built on the same coins and offering
+exactly the same amount, taken while this one is reported CONFIRMED. Its
+settlement coin looks the same, and only its requested payment differs. The
+node cannot search for a payment. From the wallet, which is asked only while
+the node is not trusted: an unrelated coin of ours, confirmed in the same
+block for exactly a requested amount. The wallet shows a payment's parent
+only as a coin id, and it holds no record of a coin that is not ours, so it
+cannot tell a settlement coin from any other sender.
+
+Not changed: a fill still books once, when the take is found, and then waits
+out the confirmation depth without being checked again. A take reorganised out
+of the chain inside that window is still booked. That gap predates this change
+and is listed in `docs/PNL-FIX-DEPLOYMENT.md`.
+
+Not in this change: repairing what the three rows already booked (trade_log
+1900-1902, their ledger legs, their offer_log rows and the tracker). That needs
+the engine stopped and a separate decision. Also not in this change: the
+trigger, which is a new offer built on an XCH coin that a pending transaction
+spends as its fee.
+
 ## [0.10.25] — 2026-09-21 — less dust, fewer cancels, a fee controller shipped off, and stops that keep the book
 
 ### Less reward dust in new offers, except on the no-floor retry

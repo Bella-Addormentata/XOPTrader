@@ -123,13 +123,16 @@ add_executable(xop_tests
     test_wallet_requests.cpp
     test_stuck_tx_verdict.cpp
     test_wallet_circuit.cpp
+    test_wallet_sync_watch.cpp
     test_rpc_transport_evidence.cpp
     test_stuck_prune_scope.cpp
     test_shutdown_flag.cpp
     test_cancel_escalation.cpp
+    test_fill_proof.cpp
     test_rpc_retry_policy.cpp
     test_price_cancel_replay.cpp
     test_stop_offers_policy.cpp
+    test_state_position_truth.cpp
 )
 
 target_link_libraries(xop_tests

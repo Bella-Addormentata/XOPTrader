@@ -422,7 +422,8 @@ LimitsDecision PreTradeCheck::evaluate_limits(
     const AssetId&             base_id,
     const AssetId&             quote_id,
     const State&               state,
-    const ConcentrationLimits& limits) const
+    const ConcentrationLimits& limits,
+    const std::unordered_set<AssetId>& unverified) const
 {
     LimitsDecision decision{};
     LimitsTrace& limits_trace = decision.trace;
@@ -431,7 +432,8 @@ LimitsDecision PreTradeCheck::evaluate_limits(
 
     const Position base_pos  = state.get_position(base_id);
     const Position quote_pos = state.get_position(quote_id);
-    const auto all_positions = state.get_all_positions();
+    // [SEED-FAIL-CLOSED review round 11] Less every unverified position.
+    const auto all_positions = positions_in_totals(state, unverified);
 
     // ---- 1. Inventory concentration (soft / hard limits) ------------------
     //
@@ -800,11 +802,13 @@ LimitStatus PreTradeCheck::get_limit_status(
     const AssetId&             base_id,
     const AssetId&             quote_id,
     const State&               state,
-    const ConcentrationLimits& limits) const
+    const ConcentrationLimits& limits,
+    const std::unordered_set<AssetId>& unverified) const
 {
     const Position base_pos  = state.get_position(base_id);
     const Position quote_pos = state.get_position(quote_id);
-    const auto all_positions = state.get_all_positions();
+    // [SEED-FAIL-CLOSED review round 11] Less every unverified position.
+    const auto all_positions = positions_in_totals(state, unverified);
 
     LimitStatus ls{};
     ls.base_id  = base_id;
@@ -981,6 +985,29 @@ double PreTradeCheck::compute_pair_capital_fraction(
     const double pair_capital = static_cast<double>(mark_to_xch(base_pos, state))
                               + static_cast<double>(mark_to_xch(quote_pos, state));
     return pair_capital / total;
+}
+
+// ---------------------------------------------------------------------------
+// [SEED-FAIL-CLOSED review round 11] positions_in_totals -- the positions a
+// portfolio total sums: every one State holds, less the unverified.  An
+// unverified position is a startup fallback no wallet read has confirmed.
+// Counted, an overstated one would understate every other asset's share of
+// the total, and loosen the single-CAT and pair-capital caps of pairs whose
+// own positions are verified.  Before the seed kept such a fallback in State,
+// a failed read left the asset out of it, and so out of the total.
+// ---------------------------------------------------------------------------
+
+std::vector<Position> PreTradeCheck::positions_in_totals(
+    const State&                       state,
+    const std::unordered_set<AssetId>& unverified)
+{
+    std::vector<Position> all = state.get_all_positions();
+    all.erase(std::remove_if(all.begin(), all.end(),
+                             [&unverified](const Position& p) {
+                                 return unverified.count(p.asset_id) > 0U;
+                             }),
+              all.end());
+    return all;
 }
 
 }  // namespace xop
