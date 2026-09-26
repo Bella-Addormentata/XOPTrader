@@ -5,7 +5,7 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.10.26] — 2026-09-24 — positions that follow the wallet, a wallet left to sync, and fills the chain has proven
+## [0.10.26] — 2026-09-26 — positions that follow the wallet, a wallet left to sync, and fills the chain has proven
 
 ### The risk limits read the wallet's positions, not a guess that fills made
 
