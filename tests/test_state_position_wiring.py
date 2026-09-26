@@ -30,6 +30,7 @@ HELPER = "Engine::reconcile_state_position("
 BRIDGE_SCAN = "asio::awaitable<void> Engine::step_ingest_bridge_flows("
 HEARTBEAT = "asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)"
 PROCESS_FILLS = "asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)"
+STEP7 = "void Engine::step_generate_ladder(BlockHeight block_height)"
 
 # The defect's shape: something gated on a State position being zero.  The
 # argument may be brace-initialised (`AssetId{x}`), so only `;` bounds it: a
@@ -608,37 +609,58 @@ def test_a_verifying_heartbeat_drains_before_it_ends() -> None:
         "the bridge scan's verification must be drained too")
 
 
-def test_a_pair_a_fill_moved_posts_nothing_until_the_next_heartbeat() -> None:
+def test_a_pair_a_fill_moved_posts_nothing_until_its_position_is_reconciled() -> None:
     """Review round 9 (#172's review): Step 8 sets each State position to the
     wallet's balance, and Step 2 books each fill into State as well.  A take
     the wallet already showed at the last Step 8 -- it saw the block between
     Step 2 and Step 8, or the fill proof waited for the node -- then counts
     twice until this Step 8 reads the balance again, and Step 6 sized this
     heartbeat's ladders from it.  So Step 2 records the assets each booked fill
-    moved, and Step 8 posts nothing on a pair trading one of them until the
-    next heartbeat.  Its cancels still run: only the post waits.  The record is
-    cleared at the top of every heartbeat, so one whose Step 2 did not run
-    inherits nothing."""
+    moved, and Step 8 posts nothing on a pair trading one of them.  Its cancels
+    still run: only the post waits.
+
+    Review round 12 (the review of b56f0f5): the record was cleared at the top
+    of every heartbeat.  A heartbeat whose Step 8 was skipped -- the GUI pause,
+    a gate -- or whose balance read failed left State double-counted, and the
+    next one sized from it with nothing recorded.  Now an asset stays recorded
+    (fill_moved_assets_) until a validated Step 8 read has reconciled it, or
+    the bridge scan owns it and Step 8 never sets it.  Each heartbeat's pause
+    (fill_gate_assets_) starts from what is still recorded, so the heartbeat
+    that reconciles an asset posts nothing on it either."""
     text = _engine()
     fills = _function_body(text, PROCESS_FILLS)
     detect = fills.index("co_await offer_mgr_->detect_fills(block_height);")
     record = re.search(r"for \(const auto& fill : new_fills\) \{\s*"
                        r"if \(const PairConfig\* fill_pc = find_pair_config\(fill\.pair_name\)\) \{\s*"
                        r"fill_moved_assets_\.insert\(fill_pc->base_asset_id\);\s*"
-                       r"fill_moved_assets_\.insert\(fill_pc->quote_asset_id\);\s*\}\s*\}", fills)
-    assert record and detect < record.start(), "every booked fill's two assets are recorded"
+                       r"fill_moved_assets_\.insert\(fill_pc->quote_asset_id\);\s*"
+                       r"fill_gate_assets_\.insert\(fill_pc->base_asset_id\);\s*"
+                       r"fill_gate_assets_\.insert\(fill_pc->quote_asset_id\);\s*\}\s*\}", fills)
+    assert record and detect < record.start(), "every booked fill's two assets are recorded, and paused"
     assert text.count("fill_moved_assets_.insert(") == 2, "and nothing else records one"
+    assert text.count("fill_gate_assets_.insert(") == 2
+    # [round 12] Kept until reconciled: never cleared wholesale, and each
+    # heartbeat's pause starts from what is left, before Step 2 adds to it.
+    assert "fill_moved_assets_.clear()" not in text
     heartbeat = _function_body(text, HEARTBEAT)
-    cleared = heartbeat.index("fill_moved_assets_.clear();")
-    assert cleared < heartbeat.index("co_await step_process_fills(block_height);"), (
-        "cleared before Step 2, so a heartbeat whose Step 2 does not run inherits nothing")
-    assert text.count("fill_moved_assets_.clear()") == 1
+    seeded = heartbeat.index("fill_gate_assets_ = fill_moved_assets_;")
+    assert seeded < heartbeat.index("co_await step_process_fills(block_height);")
+    assert text.count("fill_gate_assets_ =") == 1
+    # [round 12] Released by a read that set the position, or by the bridge
+    # scan's ownership -- never by a skipped read.
+    helper = _function_body(text, HELPER)
+    released = re.search(r"if \(bridge_owned \|\| r\.outcome != risk::TruthOutcome::Skipped\) \{\s*"
+                         r"fill_moved_assets_\.erase\(asset\);\s*\}", helper)
+    assert released and released.start() < helper.index(
+        "if (r.outcome == risk::TruthOutcome::Skipped) return std::nullopt;")
+    assert text.count("fill_moved_assets_.erase(") == 1
     body = _function_body(text, STEP8)
-    gate = re.search(r"if \(fill_moved_assets_\.count\(pair_cfg->base_asset_id\) > 0\s*"
-                     r"\|\| fill_moved_assets_\.count\(pair_cfg->quote_asset_id\) > 0\) \{", body)
-    assert gate, "a pair trading either asset a fill moved posts nothing"
+    gate = re.search(r"if \(fill_gate_assets_\.count\(pair_cfg->base_asset_id\) > 0\s*"
+                     r"\|\| fill_gate_assets_\.count\(pair_cfg->quote_asset_id\) > 0\) \{", body)
+    assert gate, "a pair trading either paused asset posts nothing"
+    assert "fill_moved_assets_" not in body, "the gate reads this heartbeat's pause, not the record"
     block = body[gate.end() - 1:_matching(body, gate.end() - 1) + 1]
-    assert re.search(r"continue;\s*\}$", block), "...until the next heartbeat"
+    assert re.search(r"continue;\s*\}$", block), "...this heartbeat"
     for forbidden in ("selective_cancel", "cancel_stale", "post_quotes", "state_->"):
         assert forbidden not in block, f"the gate only skips the post: {forbidden}"
     post = body.index("co_await offer_mgr_->post_quotes(")
@@ -648,3 +670,19 @@ def test_a_pair_a_fill_moved_posts_nothing_until_the_next_heartbeat() -> None:
     assert 0 <= last_cancel < gate.start(), "and after the pair loop's cancels, which still run"
     header = (REPO / "cpp" / "include" / "xop" / "engine.hpp").read_text(encoding="utf-8")
     assert re.search(r"std::unordered_set<std::string>\s+fill_moved_assets_;", header)
+    assert re.search(r"std::unordered_set<std::string>\s+fill_gate_assets_;", header)
+
+
+def test_step7_keeps_unverified_positions_out_of_its_drift_totals() -> None:
+    """Review round 12 (the review of b56f0f5, medium): with the wallet
+    balance cache empty -- the first heartbeat -- Step 7's asset-drift guard
+    totals State, and that total counted every unverified fallback.  An
+    overstated one diluted a verified pair's shares and could keep its
+    acquisition side from being tapered.  The fallback now totals
+    positions_in_totals, less the unverified set, as Step 6 does (round 11)."""
+    body = _function_body(_engine(), STEP7)
+    fallback = re.search(r"if \(total_xch <= 0\.0\) \{\s*"
+                         r"const auto positions =\s*"
+                         r"PreTradeCheck::positions_in_totals\(\*state_, state_unverified_assets_\);", body)
+    assert fallback, "Step 7's State fallback leaves the unverified out of its total"
+    assert "state_->get_all_positions()" not in body

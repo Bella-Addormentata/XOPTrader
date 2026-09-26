@@ -2760,14 +2760,20 @@ private:
     // within one peak] -- never an offer the pair loop posts afterwards -- and
     // drops the entry once it has.
     std::unordered_map<std::string, BlockHeight> state_verified_undrained_;
-    // [SEED-FAIL-CLOSED review round 9, #172's review] Assets a fill booked
-    // in THIS heartbeat's Step 2 moved.  Step 2 books a fill into State with
-    // record_buy/record_sell, and Step 8 sets State to the wallet's balance;
-    // a take the wallet already showed at the last Step 8 is counted twice
-    // until this one, and Step 6 sized this heartbeat's ladders from that.
-    // Step 8 posts nothing on a pair trading one of these.  Cleared at the
-    // top of every heartbeat.
+    // [SEED-FAIL-CLOSED review round 9, #172's review] Assets a booked fill
+    // moved.  Step 2 books a fill into State with record_buy/record_sell, and
+    // Step 8 sets State to the wallet's balance; a take the wallet already
+    // showed at the last Step 8 is counted twice until the next one, and Step
+    // 6 sizes ladders from that.  [review round 12] Kept until a validated
+    // Step 8 read has reconciled the asset, or the bridge scan owns it
+    // (reconcile_state_position).  Not cleared each heartbeat: one whose Step
+    // 8 is skipped, or whose read fails, leaves State double-counted.
     std::unordered_set<std::string> fill_moved_assets_;
+    // [review round 12] This heartbeat's posting pause: what fill_moved_assets_
+    // held when it began, plus this Step 2's fills.  Step 8 posts nothing on a
+    // pair trading one of these -- in the heartbeat that reconciles an asset
+    // too, since Step 6 sized its ladders before the read.
+    std::unordered_set<std::string> fill_gate_assets_;
     // [SEED-FAIL-CLOSED review round 2] Step 9f's "unverified" line has been
     // logged at WARN for the current episode; later heartbeats log at debug.
     bool drift_unverified_warned_{false};

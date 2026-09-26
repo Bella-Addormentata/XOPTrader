@@ -4319,9 +4319,11 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
     // [T3-08] Reset NHE accumulators for this cycle.
     nhe_net_inventory_change_ = 0.0;
     nhe_total_volume_         = 0.0;
-    // [SEED-FAIL-CLOSED review round 9] This heartbeat's fills only: set by
-    // Step 2, read by Step 8's pair loop, even when Step 2 does not run.
-    fill_moved_assets_.clear();
+    // [SEED-FAIL-CLOSED review round 9] This heartbeat's posting pause.
+    // [review round 12] It starts from every asset a fill moved that no
+    // validated Step 8 read has reconciled since -- whatever a skipped Step 8
+    // or a failed read left -- and Step 2 adds this heartbeat's fills.
+    fill_gate_assets_ = fill_moved_assets_;
 
     // Initialize per-pair cycle state for all enabled pairs.
     // [T3-24] market_data_valid defaults to false; Step 1 sets it true
@@ -5662,11 +5664,14 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
     // wallet's balance: if the wallet showed the take at the last Step 8 --
     // it saw the block between Step 2 and Step 8, or the fill proof waited
     // for the node -- the take now counts twice until this Step 8 reads the
-    // balance again.  Step 8 posts nothing on these assets' pairs meanwhile.
+    // balance again.  Step 8 posts nothing on these assets' pairs meanwhile:
+    // [review round 12] until a validated read has reconciled each asset.
     for (const auto& fill : new_fills) {
         if (const PairConfig* fill_pc = find_pair_config(fill.pair_name)) {
             fill_moved_assets_.insert(fill_pc->base_asset_id);
             fill_moved_assets_.insert(fill_pc->quote_asset_id);
+            fill_gate_assets_.insert(fill_pc->base_asset_id);
+            fill_gate_assets_.insert(fill_pc->quote_asset_id);
         }
     }
 
@@ -8575,7 +8580,13 @@ void Engine::step_generate_ladder(BlockHeight block_height)
             }
         }
         if (total_xch <= 0.0) {
-            const auto positions = state_->get_all_positions();
+            // [SEED-FAIL-CLOSED review round 12] Less every unverified
+            // position, as Step 6's total is (review round 11): an overstated
+            // fallback would dilute every other asset's share and keep a
+            // verified pair's acquisition side from being tapered.  A pair
+            // that trades an unverified asset posts nothing (Step 8).
+            const auto positions =
+                PreTradeCheck::positions_in_totals(*state_, state_unverified_assets_);
             for (const auto& p : positions) {
                 const double v = static_cast<double>(PreTradeCheck::mark_to_xch(p, *state_));
                 if (v <= 0.0) continue;
@@ -14839,18 +14850,19 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         }
 
         // [SEED-FAIL-CLOSED review round 9, #172's review] NOTHING NEW ON A
-        // PAIR WHOSE POSITION A FILL MOVED THIS HEARTBEAT.  Step 6 sized this
-        // ladder from State after Step 2 booked the fill, and State may count
-        // that take twice until this Step 8 reconciles it to the wallet
-        // (fill_moved_assets_).  The next heartbeat sizes from the reconciled
-        // position.  Only posting waits: the cancels above have run, and
-        // pulling a quote sizes nothing.
-        if (fill_moved_assets_.count(pair_cfg->base_asset_id) > 0
-            || fill_moved_assets_.count(pair_cfg->quote_asset_id) > 0) {
+        // PAIR WHOSE POSITION A FILL MOVED.  Step 6 sized this ladder from
+        // State after Step 2 booked the fill, and State may count that take
+        // twice until Step 8 reconciles it to the wallet.  [review round 12]
+        // The pause (fill_gate_assets_) holds until a heartbeat that begins
+        // with the asset reconciled, whether or not Step 8 ran, or its read
+        // succeeded, in between.  Only posting waits: the cancels above have
+        // run, and pulling a quote sizes nothing.
+        if (fill_gate_assets_.count(pair_cfg->base_asset_id) > 0
+            || fill_gate_assets_.count(pair_cfg->quote_asset_id) > 0) {
             spdlog::info("[Engine] Step 8: {} posts nothing this heartbeat -- "
-                         "a fill booked in Step 2 moved a position it trades, "
-                         "and its ladder was sized before Step 8 reconciled "
-                         "that position to the wallet", pair_name);
+                         "a fill moved a position it trades, and its ladder "
+                         "was sized before Step 8 reconciled that position to "
+                         "the wallet", pair_name);
             continue;
         }
 
@@ -18867,6 +18879,15 @@ std::optional<Mojo> Engine::reconcile_state_position(const std::string& asset,
                               && bridge_accounting_operational();
     const risk::TruthResult r = risk::apply_wallet_truth(
         *state_, AssetId{asset}, confirmed, fields_validated, bridge_owned);
+    // [SEED-FAIL-CLOSED review round 12] A fill counts twice only in a
+    // position Step 8 sets to the wallet's balance.  Once this read has set
+    // it -- or when the bridge scan owns the position, which Step 8 never
+    // sets -- a fill no longer holds its pairs' posting back.  This
+    // heartbeat's pause stands (fill_gate_assets_): Step 6 sized its ladders
+    // before this read.
+    if (bridge_owned || r.outcome != risk::TruthOutcome::Skipped) {
+        fill_moved_assets_.erase(asset);
+    }
     if (r.outcome == risk::TruthOutcome::Skipped) return std::nullopt;
     // A correction is routine -- fees, taker fills and deposits never pass
     // through record_buy/record_sell -- and State logs it.  It takes effect at
