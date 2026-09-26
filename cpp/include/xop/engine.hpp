@@ -2701,9 +2701,14 @@ private:
     // failed.  [review round 7] Retried from poll_loop_coro on every poll,
     // before any wallet or height call: a stopped wallet answers no sync
     // check, and in wallet-only mode no height either, so a heartbeat would
-    // never come.  Settled when a start works or the wallet answers Step 8's
-    // sync check, which counts the restart a stop that worked began.
+    // never come.  Settled when a start works or the wallet answers -- Step 8's
+    // sync check, the circuit probe, or [review round 10] any call since the
+    // start was owed -- which counts the restart a stop that worked began.
     execution::WalletStartDebt wallet_start_debt_{};
+    // [review round 10] The wallet client's answered-call count when the start
+    // was owed.  Any answer since proves the wallet running, and the poll loop
+    // settles the debt before sending another start.
+    std::uint64_t wallet_start_owed_answered_{0};
 
     bool wallet_synced_{false};
     bool wallet_syncing_{false};
