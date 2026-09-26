@@ -1525,9 +1525,10 @@ private:
     /// proof is a Dead verdict at confirmation depth, stop tracking it and
     /// report it in last_dead_offers_.  Otherwise record the proof in
     /// fill_proof_deferrals_.  Books nothing, ever.  [review #172]
-    /// `wallet_status` is what the wallet reports, for the log and the
-    /// dead-offer record: PENDING_CANCEL for an offer dead at depth under a
-    /// cancel that may never land.
+    /// `wallet_status` is what the wallet reports now, for the logs and the
+    /// dead-offer record: CONFIRMED, PENDING_CANCEL for an offer dead at
+    /// depth under a cancel that may never land, or the cancel status a held
+    /// offer shows while its re-proof is deferred.
     void handle_unproven_fill(const std::string& trade_id, const PendingOffer& po,
                               const FillProofResult& proof, const std::string& failure,
                               bool from_node, std::uint64_t claimed_height,

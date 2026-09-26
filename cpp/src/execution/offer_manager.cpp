@@ -1801,8 +1801,12 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
                     idx != rec.end() && idx->is_number_unsigned()) {
                     claimed_height = idx->get<std::uint64_t>();
                 }
+                // [review #172] Under the cancel status the wallet reports
+                // now, which its deferral warning names.
                 handle_unproven_fill(trade_id, po, reproof, reproof_failure,
-                                     reproved_asked_node, claimed_height, current_block);
+                                     reproved_asked_node, claimed_height, current_block,
+                                     status == trade_status::kPendingCancel ? "PENDING_CANCEL"
+                                                                            : "CANCELLED");
                 continue;
             } else if (reproof.verdict == FillProof::Dead) {
                 // [review #171 round 16] Dead, but the spend is not yet deep
@@ -2304,11 +2308,11 @@ void OfferManager::handle_unproven_fill(const std::string& trade_id,
                   : "its maker coins were not spent together (the offer died), but "
                     "the first spend is not yet at confirmation depth";
     }
-    // [round 11] "reported": an offer re-proved under a cancel's status is
-    // deferred here too, and the wallet no longer reports it CONFIRMED.
-    logger_->warn("[FILL-PROOF] {} ({}): the wallet reported CONFIRMED, the "
-                  "chain says {}: {} -- not booked; asked again next heartbeat "
-                  "(deferral {})", trade_id.substr(0, 12), po.pair_name,
+    // [round 11] An offer re-proved under a cancel's status is deferred here
+    // too: [review #172] the line names the status the wallet reports now.
+    logger_->warn("[FILL-PROOF] {} ({}): the wallet reports {}, the chain says "
+                  "{}: {} -- not booked; asked again next heartbeat (deferral {})",
+                  trade_id.substr(0, 12), po.pair_name, wallet_status,
                   fill_proof_name(proof.verdict), why, deferrals);
 }
 
