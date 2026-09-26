@@ -8103,12 +8103,17 @@ void Engine::step_apply_risk_limits(BlockHeight block_height)
         // every rule below tapers it (operator decision D1).  A hold plan
         // offers 0; an unmanaged plan returns the quote unchanged.
         quote = strategy::pace::inject_reducing_side(quote, pcs.pace);
+        // [SEED-FAIL-CLOSED review round 11] Every unverified position stays
+        // out of the portfolio total the single-CAT and pair-capital caps
+        // divide by: an overstated fallback would loosen this pair's caps,
+        // though its own positions are verified.
         const LimitsDecision limits_decision = pre_trade_->evaluate_limits(
             quote,
             AssetId{pair_cfg->base_asset_id},
             AssetId{pair_cfg->quote_asset_id},
             *state_,
-            conc_limits);
+            conc_limits,
+            state_unverified_assets_);
 
         if (limits_decision.has_quote) {
             pcs.risk_quote  = limits_decision.quote;

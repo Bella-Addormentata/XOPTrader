@@ -20,11 +20,13 @@
 #include <xop/config.hpp>
 #include <xop/types.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <initializer_list>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1193,6 +1195,84 @@ TEST(Step6NoQuoteText, PrintsTheEffectiveLimits) {
         xop::ConcentrationLimits{0.90, 0.97}, xop::kLimitBlockWarnReminderBlocks);
     EXPECT_NE(overridden.find("cfg_soft=0.900 cfg_hard=0.970 cfg_cat=0.250 cfg_pair=0.850"),
               std::string::npos) << overridden;
+}
+
+// ============================================================================
+// [SEED-FAIL-CLOSED review round 11] Unverified positions stay out of the
+// portfolio total (PR #169's review of c143c6b)
+// ============================================================================
+
+std::vector<std::string> asset_names(const std::vector<xop::Position>& positions)
+{
+    std::vector<std::string> names;
+    for (const auto& p : positions) {
+        names.push_back(p.asset_id);
+    }
+    std::sort(names.begin(), names.end());
+    return names;
+}
+
+TEST(PositionsInTotals, LeavesOutEveryUnverifiedPosition) {
+    xop::State state;
+    seed_unit_rate_portfolio(state, {{"xch", 100}, {"byc", 15}, {"dbx", 100}});
+
+    EXPECT_EQ(asset_names(xop::PreTradeCheck::positions_in_totals(state, {})),
+              (std::vector<std::string>{"byc", "dbx", "xch"}));
+    EXPECT_EQ(asset_names(xop::PreTradeCheck::positions_in_totals(state, {"dbx"})),
+              (std::vector<std::string>{"byc", "xch"}));
+    EXPECT_TRUE(xop::PreTradeCheck::positions_in_totals(state, {"dbx", "xch", "byc"}).empty());
+    // An unverified asset State does not hold leaves the total as it is.
+    EXPECT_EQ(asset_names(xop::PreTradeCheck::positions_in_totals(state, {"wusdc"})),
+              (std::vector<std::string>{"byc", "dbx", "xch"}));
+}
+
+TEST_F(LimitsTestFixture, EvaluateLimits_UnverifiedFallbackStaysOutOfThePortfolioTotal) {
+    // The review's case.  XCH/BYC's own positions are verified, but DBX's is
+    // an unverified startup fallback, overstated at 100.  Counted, it dilutes
+    // BYC to 15/215 of the portfolio and the single-CAT cap never fires.
+    // Left out, BYC is 15/115 of what is known, over the 0.12 cap, and the
+    // ask -- which buys BYC -- is cut.
+    risk_cfg.max_capital_per_pair_pct = 1.01;   // keep the pair cap out of it
+    xop::PreTradeCheck ptc(risk_cfg, strat_cfg);
+    xop::State state;
+    seed_unit_rate_portfolio(state, {{"xch", 100}, {"byc", 15}, {"dbx", 100}});
+    const xop::ConcentrationLimits conc{risk_cfg.soft_limit_pct, risk_cfg.hard_limit_pct};
+
+    xop::Quote q{};
+    q.bid_size = 0;
+    q.ask_size = 1000;
+
+    const xop::LimitsDecision counted = ptc.evaluate_limits(q, "xch", "byc", state, conc);
+    EXPECT_NEAR(counted.trace.quote_cat_fraction, 15.0 / 215.0, 1e-9);
+    EXPECT_NEAR(counted.trace.pair_capital_fraction, 115.0 / 215.0, 1e-9);
+    EXPECT_FALSE(xop::has_limit_rule(counted.trace.ask.reduced_by, xop::LimitRule::SingleCatCap));
+    ASSERT_TRUE(counted.has_quote);
+    EXPECT_EQ(counted.quote.ask_size, 1000);
+
+    const xop::LimitsDecision verified_only =
+        ptc.evaluate_limits(q, "xch", "byc", state, conc, {"dbx"});
+    EXPECT_NEAR(verified_only.trace.quote_cat_fraction, 15.0 / 115.0, 1e-9);
+    EXPECT_NEAR(verified_only.trace.pair_capital_fraction, 1.0, 1e-9);
+    EXPECT_TRUE(xop::has_limit_rule(verified_only.trace.ask.reduced_by,
+                                    xop::LimitRule::SingleCatCap));
+    EXPECT_LT(verified_only.quote.ask_size, 1000);
+}
+
+TEST_F(LimitsTestFixture, GetLimitStatus_LeavesTheUnverifiedOutOfTheTotalToo) {
+    xop::PreTradeCheck ptc(risk_cfg, strat_cfg);
+    xop::State state;
+    seed_unit_rate_portfolio(state, {{"xch", 100}, {"byc", 15}, {"dbx", 100}});
+    const xop::ConcentrationLimits conc{risk_cfg.soft_limit_pct, risk_cfg.hard_limit_pct};
+
+    const xop::LimitStatus counted = ptc.get_limit_status("xch", "byc", state, conc);
+    EXPECT_NEAR(counted.cat_portfolio_pct, 15.0 / 215.0, 1e-9);
+    EXPECT_FALSE(counted.cat_cap_breached);
+
+    const xop::LimitStatus verified_only =
+        ptc.get_limit_status("xch", "byc", state, conc, {"dbx"});
+    EXPECT_NEAR(verified_only.cat_portfolio_pct, 15.0 / 115.0, 1e-9);
+    EXPECT_TRUE(verified_only.cat_cap_breached);
+    EXPECT_NEAR(verified_only.pair_capital_pct, 1.0, 1e-9);
 }
 
 }  // namespace

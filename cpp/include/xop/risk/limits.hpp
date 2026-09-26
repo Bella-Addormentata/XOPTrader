@@ -37,6 +37,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 namespace xop {
@@ -361,12 +362,21 @@ public:
     /// bid and the quote-overweight ask.  The single-CAT and pair-capital caps
     /// stay global.  The overload above forwards
     /// ConcentrationLimits{soft_limit_pct, hard_limit_pct} of the RiskConfig.
+    ///
+    /// [SEED-FAIL-CLOSED review round 11] `unverified`: assets whose State
+    /// position is a startup fallback no wallet read has confirmed (the
+    /// engine's state_unverified_assets_).  They stay out of the portfolio
+    /// total the single-CAT and pair-capital caps divide by
+    /// (positions_in_totals): an overstated fallback would understate every
+    /// other asset's share and loosen its caps.  A pair that trades one of
+    /// them posts nothing anyway (engine Step 8).
     [[nodiscard]]
     LimitsDecision evaluate_limits(Quote                      quote,
                                    const AssetId&             base_id,
                                    const AssetId&             quote_id,
                                    const State&               state,
-                                   const ConcentrationLimits& limits) const;
+                                   const ConcentrationLimits& limits,
+                                   const std::unordered_set<AssetId>& unverified = {}) const;
 
     /// Apply soft-limit, hard-limit, single-CAT cap, and max-capital-per-pair
     /// checks.  Returns a (possibly modified) quote, or std::nullopt when BOTH
@@ -488,12 +498,14 @@ public:
 
     /// [PACE D1 2026-09-13] get_limit_status() with this pair's effective
     /// concentration limits in the soft/hard breach flags.  The overload
-    /// above forwards the RiskConfig's own soft/hard.
+    /// above forwards the RiskConfig's own soft/hard.  [SEED-FAIL-CLOSED
+    /// review round 11] `unverified` as for evaluate_limits().
     [[nodiscard]]
     LimitStatus get_limit_status(const AssetId&             base_id,
                                  const AssetId&             quote_id,
                                  const State&               state,
-                                 const ConcentrationLimits& limits) const;
+                                 const ConcentrationLimits& limits,
+                                 const std::unordered_set<AssetId>& unverified = {}) const;
 
 private:
     const RiskConfig&     risk_cfg_;
@@ -543,6 +555,12 @@ public:
     static double compute_concentration(const Position& base_pos,
                                         const Position& quote_pos,
                                         const State&    state) noexcept;
+
+    /// [SEED-FAIL-CLOSED review round 11] The positions a portfolio total
+    /// sums: every one State holds, less those in `unverified`.
+    [[nodiscard]]
+    static std::vector<Position> positions_in_totals(
+        const State& state, const std::unordered_set<AssetId>& unverified);
 private:
 
     /// Compute what fraction of total portfolio value (mark-to-market in XCH)

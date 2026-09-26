@@ -52,7 +52,11 @@ have corrected it.)
   A pair that trades a position the pass could not read is not quoted until
   it can be: that covers a first boot with no persisted row, where the guess
   is nothing at all. A built wallet map with no wallet for the asset still
-  counts as a verified zero.
+  counts as a verified zero. Nor does an unverified position loosen another
+  pair's caps (review round 11). Its fallback quantity stays out of the
+  portfolio total the single-CAT and pair-capital caps divide by, as the
+  asset did before this change, when a failed read left it out of State. An
+  overstated fallback would have understated every other asset's share.
 - A pace-managed pair with an empty ladder has both its assets read by the
   empty-ladder refresh, below Step 8's sync gate, like any other pair (review
   round 4). Rounds 1 and 2 took them from pace's own read instead. That read
