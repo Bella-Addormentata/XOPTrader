@@ -100,7 +100,12 @@ have corrected it.)
   Step 8 is skipped, or whose read fails, keeps the pause (review round
   12): round 9 lifted it at the next heartbeat whatever had happened. Step
   7's asset-drift guard, when it totals State, leaves the unverified out
-  too, as Step 6 does (review round 12).
+  too, as Step 6 does (review round 12). For the bridge asset the pause ends
+  once the bridge scan, its only State writer, has set State to the wallet's
+  balance (review round 13). Step 9f's drift corrector, which places taker
+  trades before Step 8 runs, does nothing while any fill's position is
+  unreconciled. And a pair whose stale offers a verification's drain could
+  not all cancel posts nothing until they are (review round 13).
 - **The drift corrector does nothing while any position is unverified** (review
   rounds 2 and 3). Round 2 stood Step 9f down only when no balance had been
   read at all. With some read and some not, the unread asset was simply
