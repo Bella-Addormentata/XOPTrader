@@ -2784,16 +2784,20 @@ private:
     // The drain takes down what was created AT OR before that block [review
     // round 8: a restored offer can carry that very height after a restart
     // within one peak] -- never an offer the pair loop posts afterwards -- and
-    // drops the entry once it has.
+    // drops the entry once it has.  [review round 13] Until then the pair loop
+    // posts nothing on the asset's pairs: an offer the drain could not cancel
+    // may still rest.
     std::unordered_map<std::string, BlockHeight> state_verified_undrained_;
     // [SEED-FAIL-CLOSED review round 9, #172's review] Assets a booked fill
     // moved.  Step 2 books a fill into State with record_buy/record_sell, and
     // Step 8 sets State to the wallet's balance; a take the wallet already
     // showed at the last Step 8 is counted twice until the next one, and Step
     // 6 sizes ladders from that.  [review round 12] Kept until a validated
-    // Step 8 read has reconciled the asset, or the bridge scan owns it
-    // (reconcile_state_position).  Not cleared each heartbeat: one whose Step
-    // 8 is skipped, or whose read fails, leaves State double-counted.
+    // Step 8 read has reconciled the asset (reconcile_state_position), or
+    // [review round 13], for the bridge asset, the bridge scan has set it.
+    // Not cleared each heartbeat: one whose Step 8 is skipped, or whose read
+    // fails, leaves State double-counted.  Step 9f waits while it holds
+    // anything.
     std::unordered_set<std::string> fill_moved_assets_;
     // [review round 12] This heartbeat's posting pause: what fill_moved_assets_
     // held when it began, plus this Step 2's fills.  Step 8 posts nothing on a

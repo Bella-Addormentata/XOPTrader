@@ -623,8 +623,9 @@ def test_a_pair_a_fill_moved_posts_nothing_until_its_position_is_reconciled() ->
     of every heartbeat.  A heartbeat whose Step 8 was skipped -- the GUI pause,
     a gate -- or whose balance read failed left State double-counted, and the
     next one sized from it with nothing recorded.  Now an asset stays recorded
-    (fill_moved_assets_) until a validated Step 8 read has reconciled it, or
-    the bridge scan owns it and Step 8 never sets it.  Each heartbeat's pause
+    (fill_moved_assets_) until a validated Step 8 read has reconciled it --
+    or, for the bridge asset, the bridge scan has (round 13: round 12 let
+    Step 8's bridge-owned skip release it).  Each heartbeat's pause
     (fill_gate_assets_) starts from what is still recorded, so the heartbeat
     that reconciles an asset posts nothing on it either."""
     text = _engine()
@@ -646,14 +647,19 @@ def test_a_pair_a_fill_moved_posts_nothing_until_its_position_is_reconciled() ->
     seeded = heartbeat.index("fill_gate_assets_ = fill_moved_assets_;")
     assert seeded < heartbeat.index("co_await step_process_fills(block_height);")
     assert text.count("fill_gate_assets_ =") == 1
-    # [round 12] Released by a read that set the position, or by the bridge
-    # scan's ownership -- never by a skipped read.
+    # [round 12] Released by a read that set the position -- never by a
+    # skipped one, [round 13] the bridge-owned skip included: the bridge scan
+    # sets that position, and releases it only once State holds the balance.
     helper = _function_body(text, HELPER)
-    released = re.search(r"if \(bridge_owned \|\| r\.outcome != risk::TruthOutcome::Skipped\) \{\s*"
+    released = re.search(r"if \(r\.outcome != risk::TruthOutcome::Skipped\) \{\s*"
                          r"fill_moved_assets_\.erase\(asset\);\s*\}", helper)
     assert released and released.start() < helper.index(
         "if (r.outcome == risk::TruthOutcome::Skipped) return std::nullopt;")
-    assert text.count("fill_moved_assets_.erase(") == 1
+    bridge = _function_body(text, BRIDGE_SCAN)
+    assert re.search(r"if \(state_->get_position\(asset\)\.balance == bal\.confirmed\) \{\s*"
+                     r"fill_moved_assets_\.erase\(asset\);\s*\}", bridge), (
+        "the bridge scan ends its asset's pause once State holds the wallet's balance")
+    assert text.count("fill_moved_assets_.erase(") == 2
     body = _function_body(text, STEP8)
     gate = re.search(r"if \(fill_gate_assets_\.count\(pair_cfg->base_asset_id\) > 0\s*"
                      r"\|\| fill_gate_assets_\.count\(pair_cfg->quote_asset_id\) > 0\) \{", body)
@@ -671,6 +677,45 @@ def test_a_pair_a_fill_moved_posts_nothing_until_its_position_is_reconciled() ->
     header = (REPO / "cpp" / "include" / "xop" / "engine.hpp").read_text(encoding="utf-8")
     assert re.search(r"std::unordered_set<std::string>\s+fill_moved_assets_;", header)
     assert re.search(r"std::unordered_set<std::string>\s+fill_gate_assets_;", header)
+
+
+def test_the_drift_corrector_waits_while_a_fill_may_count_twice() -> None:
+    """Review round 13 (the review of 79ab4bc, medium): Step 9f places taker
+    trades and runs before Step 8.  On the first heartbeat after a restart the
+    wallet-balance cache is empty and it sizes from State, where a take that
+    landed while the engine was down counts twice once Step 2 books it -- the
+    startup seed already read the balance that held it.  So 9f does nothing
+    while any fill's position is unreconciled, right after its unverified gate
+    and before its cooldown or any share."""
+    body = _function_body(_engine(), "asio::awaitable<void> Engine::step_run_drift_corrector(")
+    gate = re.search(r"if \(!fill_moved_assets_\.empty\(\)\) \{", body)
+    assert gate, "9f is not gated on the fill record"
+    block = body[gate.end() - 1:_matching(body, gate.end() - 1) + 1]
+    assert re.search(r"co_return;\s*\}$", block), "an unreconciled fill must stop 9f"
+    assert body.index("drift_unverified_warned_ = false;") < gate.start()
+    for later in ("last_drift_correction_block_", "cached_wallet_balances_", "portfolio_pct_by_asset"):
+        assert gate.start() < body.index(later), f"the gate must come before {later}"
+
+
+def test_a_pair_posts_nothing_while_its_verification_drain_is_incomplete() -> None:
+    """Review round 13 (the review of 79ab4bc, a medium finding in code it had
+    not re-read): a drain whose selective_cancel took only some of the offers
+    from before a verification keeps state_verified_undrained_, but a later
+    heartbeat went on to post on those pairs beside the offers still resting,
+    sized from the guess.  Now a pair trading an asset the map still holds
+    posts nothing -- its cancels still run -- until the drain has taken them
+    all down."""
+    body = _function_body(_engine(), STEP8)
+    gate = re.search(r"if \(state_verified_undrained_\.count\(pair_cfg->base_asset_id\) > 0\s*"
+                     r"\|\| state_verified_undrained_\.count\(pair_cfg->quote_asset_id\) > 0\) \{", body)
+    assert gate, "a pair trading an undrained asset posts nothing"
+    block = body[gate.end() - 1:_matching(body, gate.end() - 1) + 1]
+    assert re.search(r"continue;\s*\}$", block)
+    for forbidden in ("selective_cancel", "cancel_stale", "post_quotes", "state_->"):
+        assert forbidden not in block, f"the gate only skips the post: {forbidden}"
+    post = body.index("co_await offer_mgr_->post_quotes(")
+    drain = body.index("state_verified_undrained_.clear();")
+    assert drain < gate.start() < post, "after the drain has had its turn, and before the post"
 
 
 def test_step7_keeps_unverified_positions_out_of_its_drift_totals() -> None:

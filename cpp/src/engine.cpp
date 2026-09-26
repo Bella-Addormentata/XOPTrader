@@ -15086,6 +15086,20 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             continue;
         }
 
+        // [SEED-FAIL-CLOSED review round 13] NOR WHILE A VERIFICATION'S DRAIN
+        // IS INCOMPLETE.  The drain above keeps an asset in
+        // state_verified_undrained_ until every offer from before its
+        // verification has a cancel submitted; one it could not cancel may
+        // still rest, sized from the guess.  Its pairs post nothing new until
+        // the drain has taken them all down.
+        if (state_verified_undrained_.count(pair_cfg->base_asset_id) > 0
+            || state_verified_undrained_.count(pair_cfg->quote_asset_id) > 0) {
+            spdlog::info("[Engine] Step 8: {} posts nothing this heartbeat -- "
+                         "offers from before a position it trades was verified "
+                         "are not all cancelled yet", pair_name);
+            continue;
+        }
+
         // [T1-03] co_await post_quotes directly instead of use_future.
         // In xch_buy_only_mode, pass the full fee_reserve_xch so
         // offer_manager enforces the same UTXO-lock safety margin.
@@ -16941,6 +16955,20 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
         co_return;
     }
     drift_unverified_warned_ = false;   // re-armed once everything is verified
+
+    // [SEED-FAIL-CLOSED review round 13] NOR WHILE A FILL MAY COUNT TWICE.
+    // Step 2 books each fill into State, which the startup seed and Step 8 set
+    // to the wallet's balance: a take the balance already held -- one that
+    // landed while the engine was down, say -- counts twice until a read
+    // reconciles it (fill_moved_assets_).  9f runs before Step 8 and, on the
+    // first heartbeat, sizes from State; a trade from a doubled position would
+    // chase an allocation the wallet does not hold.
+    if (!fill_moved_assets_.empty()) {
+        spdlog::debug("[Engine] Step 9f: no drift correction -- {} position(s) "
+                      "a fill moved are not yet reconciled to the wallet",
+                      fill_moved_assets_.size());
+        co_return;
+    }
 
     // -- Cooldown ----------------------------------------------------------
     if (last_drift_correction_block_ != 0 &&
@@ -19099,13 +19127,13 @@ std::optional<Mojo> Engine::reconcile_state_position(const std::string& asset,
                               && bridge_accounting_operational();
     const risk::TruthResult r = risk::apply_wallet_truth(
         *state_, AssetId{asset}, confirmed, fields_validated, bridge_owned);
-    // [SEED-FAIL-CLOSED review round 12] A fill counts twice only in a
-    // position Step 8 sets to the wallet's balance.  Once this read has set
-    // it -- or when the bridge scan owns the position, which Step 8 never
-    // sets -- a fill no longer holds its pairs' posting back.  This
-    // heartbeat's pause stands (fill_gate_assets_): Step 6 sized its ladders
-    // before this read.
-    if (bridge_owned || r.outcome != risk::TruthOutcome::Skipped) {
+    // [SEED-FAIL-CLOSED review round 12] Once this read has set the position
+    // to the wallet's balance, a fill no longer holds its pairs' posting back.
+    // This heartbeat's pause stands (fill_gate_assets_): Step 6 sized its
+    // ladders before this read.  [review round 13] Never on a skip, the
+    // bridge-owned one included: the bridge scan sets that position, and
+    // ends its pause itself once it has.
+    if (r.outcome != risk::TruthOutcome::Skipped) {
         fill_moved_assets_.erase(asset);
     }
     if (r.outcome == risk::TruthOutcome::Skipped) return std::nullopt;
@@ -20302,6 +20330,14 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
                                      "reduced {} -> {}",
                                      asset.substr(0, 12), pos,
                                      bal.confirmed);
+                    }
+                    // [SEED-FAIL-CLOSED review round 13] While it is
+                    // operational the scan is this asset's only State writer
+                    // (Step 8 skips it), so it also ends a fill's pause on it:
+                    // once State holds the wallet's balance, never on a
+                    // snapshot it could not use.
+                    if (state_->get_position(asset).balance == bal.confirmed) {
+                        fill_moved_assets_.erase(asset);
                     }
                     // [SEED-FAIL-CLOSED review round 1] The scan is this
                     // asset's only State writer, so it is also what verifies
