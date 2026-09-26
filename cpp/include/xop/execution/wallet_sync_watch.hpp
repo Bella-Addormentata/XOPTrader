@@ -133,8 +133,13 @@ struct WalletSyncVerdict {
 }
 
 /// Record one Step 8 sync-gate reading and decide.
-/// @param synced   the wallet is synced (the engine's reading: synced && !syncing).
-/// @param syncing  the wallet reports a sync in progress, or its state is unknown.
+/// @param synced   the wallet is fully synced: the engine's reading,
+///                 `synced && !may_be_syncing`.  [review round 11] Not
+///                 `synced && !syncing`: a reply without `syncing` passes that,
+///                 and the engine reads such a reply as possibly syncing
+///                 (review round 2).
+/// @param syncing  `may_be_syncing`: the wallet reports a sync in progress, or
+///                 its reply does not say.
 /// @param now_s    a monotonic clock, in seconds.
 [[nodiscard]] inline WalletSyncVerdict observe_wallet_sync(
     WalletSyncWatch& watch, bool synced, bool syncing, std::int64_t now_s,
