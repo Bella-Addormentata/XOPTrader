@@ -330,6 +330,19 @@ def test_a_pair_with_an_unverified_position_is_not_quoted() -> None:
     assert gate_at < body.index("post_quotes(", loop_at)
 
 
+def test_step6_keeps_unverified_positions_out_of_the_portfolio_totals() -> None:
+    """Review round 11 (the review of c143c6b, high): a pair whose own
+    positions are verified still sized its single-CAT and pair-capital caps
+    against a portfolio total that counted every unverified fallback.  An
+    overstated one understated the pair's shares and loosened its caps.  Step
+    6 now hands the unverified set to evaluate_limits, which leaves those
+    positions out of the total (gtests PositionsInTotals.*,
+    EvaluateLimits_UnverifiedFallbackStaysOutOfThePortfolioTotal)."""
+    calls = _calls(_engine(), "pre_trade_->evaluate_limits")
+    assert len(calls) == 1, calls
+    assert calls[0][-1] == "state_unverified_assets_", calls[0]
+
+
 def test_pace_managed_pairs_are_read_below_the_sync_gate_like_any_other() -> None:
     """Review round 4 (replacing rounds 1-2's pace branch): a pace-managed pair
     with an empty ladder took its State from pace's own read.  That read runs
