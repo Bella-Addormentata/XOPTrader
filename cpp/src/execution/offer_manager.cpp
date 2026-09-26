@@ -2083,8 +2083,10 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
                       last_terminal_offers_.size());
     }
     if (!last_dead_offers_.empty()) {
-        logger_->error("detect_fills: {} offer(s) the wallet reports CONFIRMED "
-                       "were proven never taken -- none booked as a fill",
+        // [review #171 round 21] CONFIRMED, or [review #172] PENDING_CANCEL
+        // under a cancel that may never land; each record names its own.
+        logger_->error("detect_fills: {} offer(s) the wallet reports CONFIRMED or "
+                       "PENDING_CANCEL were proven never taken -- none booked as a fill",
                        last_dead_offers_.size());
     }
 

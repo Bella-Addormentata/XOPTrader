@@ -1047,6 +1047,11 @@ def test_a_dead_offer_left_pending_cancel_is_closed_at_depth():
         "current_block", '"PENDING_CANCEL"']], "closed as a CONFIRMED offer dead at depth is"
     assert re.search(r"continue;\s*\}$", block), "and never reaches the terminal branch"
     assert "cancel_status_proven_" not in block
+    # [round 21] ...and the call's summary line covers both statuses.
+    assert re.search(r'"detect_fills: \{\} offer\(s\) the wallet reports CONFIRMED or "\s*'
+                     r'"PENDING_CANCEL were proven never taken -- none booked as a fill"', detect), (
+        "the summary of the call's dead offers names the PENDING_CANCEL ones too"
+    )
     handler = _function_body(manager, HANDLE_UNPROVEN)
     assert "std::string_view wallet_status)" in handler, "the wallet's status is an argument"
     assert _call_args(handler, "last_dead_offers_.push_back") == [[

@@ -1082,8 +1082,14 @@ public:
         /// a real take too (trade_status::written_by_a_cancel), and stamping
         /// it here closed the row before any chain proof could run.  The row
         /// restores into State flagged cancel_pending, and detect_fills proves
-        /// it on-chain the first time it polls it: a take is booked, and any
-        /// other answer closes it as the wallet says.
+        /// it on-chain as it does any offer the wallet reports CANCELLED
+        /// [review #171 round 21].  A take is booked.  A Dead proof at
+        /// confirmation depth, or a record that gives the proof nothing to
+        /// ask, closes it as the wallet says.  A Live proof (a local cancel:
+        /// every maker coin unspent, still takeable), a shallower Dead and a
+        /// failed lookup keep it tracked and ask again, and an answer that
+        /// settles nothing is asked again for confirmation_depth_blocks
+        /// before the status stands.
         std::vector<std::string> cancelled_unproven;
         /// Wallet says PENDING_ACCEPT. Genuinely still resting.
         std::vector<std::string> still_live;
