@@ -144,7 +144,35 @@ def test_a_wallet_that_answers_the_circuit_probe_settles_an_owed_start() -> None
                         r"wallet_circuit_open_ = false;\s*"
                         r"execution::clear_wallet_start\(wallet_start_debt_, wallet_sync_watch_\);", probe)
     assert settled, "the probe's answer settles the owed start, as the circuit closes"
-    assert text.count("execution::clear_wallet_start(") == 2, "Step 8's sync read, and the probe"
+    assert text.count("execution::clear_wallet_start(") == 3, (
+        "Step 8's sync read, the probe, and [round 10] any answer since the owe")
+
+
+def test_any_wallet_answer_settles_an_owed_start() -> None:
+    """Review round 10 (the review of 0714c6a): the owed start was settled only
+    by Step 8's sync read, a start that worked, or the circuit probe.  In
+    wallet-only mode the wallet can answer the poll loop's height call on
+    every poll while no Step 8 runs -- the same height, or a gate that skips
+    it -- and the retry went on starting a running wallet.  The owe now
+    records the wallet client's answered-call count, and the poll loop
+    settles the debt, before any retry, once the client has answered
+    anything since."""
+    text = _engine()
+    body = _function_body(text, STEP8)
+    owe = re.search(r"execution::owe_wallet_start\(wallet_start_debt_, done_s, stop_rc == 0\);\s*"
+                    r"wallet_start_owed_answered_ = wallet_->transport_counters\(\)\.answered;", body)
+    assert owe, "the owe records how many calls the wallet had answered"
+    assert text.count("wallet_start_owed_answered_ =") == 1
+    poll = _function_body(text, POLL_LOOP)
+    loop = poll[poll.index("while (!stop_requested_.load(std::memory_order_relaxed)) {"):]
+    settle = re.search(r"if \(wallet_start_debt_\.retry_at\.has_value\(\) && wallet_\s*"
+                       r"&& wallet_->transport_counters\(\)\.answered > wallet_start_owed_answered_\) \{\s*"
+                       r"execution::clear_wallet_start\(wallet_start_debt_, wallet_sync_watch_\);\s*\}", loop)
+    assert settle, "an answer since the owe settles the debt"
+    assert settle.end() <= loop.index("if (execution::wallet_start_due(wallet_start_debt_, now_s)) {"), (
+        "before any retry is sent")
+    header = _read(ENGINE_HPP)
+    assert re.search(r"std::uint64_t\s+wallet_start_owed_answered_\{0\};", header)
 
 
 def test_the_wallet_restart_is_gated_by_the_sync_watch() -> None:
@@ -313,8 +341,10 @@ def test_a_start_that_failed_is_owed_and_retried_from_the_poll_loop() -> None:
     fail_open = body.index("{", body.index("else", body.index("if (stop_rc == 0 && start_rc == 0)")))
     failure = body[fail_open:_matching(body, fail_open)]
     owed = re.search(r"if \(start_rc != 0\) \{\s*"
-                     r"execution::owe_wallet_start\(wallet_start_debt_, done_s, stop_rc == 0\);\s*\}", failure)
-    assert owed, "a failed start must be owed, remembering whether the stop worked"
+                     r"execution::owe_wallet_start\(wallet_start_debt_, done_s, stop_rc == 0\);\s*"
+                     r"wallet_start_owed_answered_ = wallet_->transport_counters\(\)\.answered;\s*\}", failure)
+    assert owed, ("a failed start must be owed, remembering whether the stop worked, "
+                  "[round 10] and how many calls the wallet had answered")
     # [round 9] ...its first retry counted from when the blocking commands returned.
     assert re.search(r'const int start_rc\s*=\s*std::system\("chia start wallet"\);\s*'
                      r"const std::int64_t done_s =\s*std::chrono::duration_cast<std::chrono::seconds>\(\s*"

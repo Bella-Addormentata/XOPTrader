@@ -174,9 +174,10 @@ of 9,329,985.
   very wallet the failed start left down. Once the owed start works, or the
   wallet answers, a restart whose stop worked counts again, so the next
   budgets double as a successful restart's do. The wallet answering the
-  circuit breaker's probe settles it too (review round 9), so a heartbeat
-  that never reaches Step 8 no longer leaves the poll loop sending starts to
-  a running wallet. And each retry's delay counts from when the blocking
+  circuit breaker's probe settles it too (review round 9), and so, from
+  review round 10, does any wallet call answered since the start was owed,
+  such as a wallet-only height. So a heartbeat that never reaches Step 8 no
+  longer leaves the poll loop sending starts to a running wallet. And each retry's delay counts from when the blocking
   command returned, not from when it was due.
 
 Not in this change: the wallet's own configuration (`use_delta_sync`,

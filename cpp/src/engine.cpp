@@ -3376,6 +3376,14 @@ asio::awaitable<void> Engine::poll_loop_coro()
                 const std::int64_t now_s =
                     std::chrono::duration_cast<std::chrono::seconds>(
                         std::chrono::steady_clock::now().time_since_epoch()).count();
+                // [review round 10] Any wallet call answered since the start was
+                // owed -- a wallet-only height, a balance read, the circuit
+                // probe -- proves the wallet is running: the debt is settled,
+                // as Step 8's sync read settles it, before another start is sent.
+                if (wallet_start_debt_.retry_at.has_value() && wallet_
+                    && wallet_->transport_counters().answered > wallet_start_owed_answered_) {
+                    execution::clear_wallet_start(wallet_start_debt_, wallet_sync_watch_);
+                }
                 if (execution::wallet_start_due(wallet_start_debt_, now_s)) {
                     const int rc = std::system("chia start wallet");
                     // [review round 9] The command blocks, so the next delay
@@ -11901,6 +11909,9 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     execution::record_failed_wallet_restart(wallet_sync_watch_);
                     if (start_rc != 0) {
                         execution::owe_wallet_start(wallet_start_debt_, done_s, stop_rc == 0);
+                        // [review round 10] An answer counted after this one
+                        // proves the wallet running (poll_loop_coro).
+                        wallet_start_owed_answered_ = wallet_->transport_counters().answered;
                     }
                     spdlog::error("[Engine] Wallet service restart failed "
                                   "(stop rc={}, start rc={}); {} failed "
