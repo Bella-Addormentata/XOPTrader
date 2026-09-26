@@ -3256,8 +3256,13 @@ asio::awaitable<void> Engine::poll_loop_coro()
                         std::chrono::steady_clock::now().time_since_epoch()).count();
                 if (execution::wallet_start_due(wallet_start_debt_, now_s)) {
                     const int rc = std::system("chia start wallet");
+                    // [review round 9] The command blocks, so the next delay
+                    // counts from when it returned, not from when it was due.
+                    const std::int64_t done_s =
+                        std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::steady_clock::now().time_since_epoch()).count();
                     execution::record_wallet_start(wallet_start_debt_, wallet_sync_watch_,
-                                                   rc == 0, now_s);
+                                                   rc == 0, done_s);
                     if (rc == 0) {
                         spdlog::warn("[Engine] Owed wallet start sent after a failed "
                                      "restart -- Step 8 resumes once the wallet answers");
@@ -3265,7 +3270,7 @@ asio::awaitable<void> Engine::poll_loop_coro()
                         spdlog::error("[Engine] Owed wallet start failed again (rc={}, "
                                       "{} attempt(s)) -- next try in {}s", rc,
                                       wallet_start_debt_.attempts,
-                                      wallet_start_debt_.retry_at.value_or(now_s) - now_s);
+                                      wallet_start_debt_.retry_at.value_or(done_s) - done_s);
                     }
                 }
             }
@@ -3281,6 +3286,13 @@ asio::awaitable<void> Engine::poll_loop_coro()
                         // this probe's answer has already reset the wallet
                         // client's transport streak (rpc_post records it).
                         wallet_circuit_open_ = false;
+                        // [WALLET-RESTART-LIVELOCK review round 9] It answered,
+                        // so it is running: a start still owed after a failed
+                        // restart is settled, and that restart counts, as
+                        // Step 8's sync read settles it.  Otherwise, while no
+                        // heartbeat reached Step 8, the poll loop went on
+                        // sending `chia start wallet` to a running wallet.
+                        execution::clear_wallet_start(wallet_start_debt_, wallet_sync_watch_);
                         spdlog::info("[Engine] Wallet circuit breaker CLOSED "
                                      "-- wallet is reachable again");
                         // [T5-10] Invalidate the wallet-ID cache so that
@@ -11653,6 +11665,11 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 // [review round 7].
                 const int stop_rc  = std::system("chia stop wallet");
                 const int start_rc = std::system("chia start wallet");
+                // [review round 9] Both commands block: an owed start's first
+                // retry counts from when they returned.
+                const std::int64_t done_s =
+                    std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count();
                 if (stop_rc == 0 && start_rc == 0) {
                     spdlog::info("[Engine] Wallet service restart initiated");
                 } else {
@@ -11660,7 +11677,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     // attempt keeps this one's budget instead of doubling it.
                     execution::record_failed_wallet_restart(wallet_sync_watch_);
                     if (start_rc != 0) {
-                        execution::owe_wallet_start(wallet_start_debt_, now_s, stop_rc == 0);
+                        execution::owe_wallet_start(wallet_start_debt_, done_s, stop_rc == 0);
                     }
                     spdlog::error("[Engine] Wallet service restart failed "
                                   "(stop rc={}, start rc={}); {} failed "

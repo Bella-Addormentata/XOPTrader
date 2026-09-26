@@ -130,6 +130,23 @@ def test_no_heartbeat_counter_restarts_the_wallet() -> None:
         assert "consecutive_unsynced_blocks_" not in text, path.name
 
 
+def test_a_wallet_that_answers_the_circuit_probe_settles_an_owed_start() -> None:
+    """Review round 9 (the review of 4da6c31, in code it had not re-read): an
+    owed start was settled only by Step 8's sync read, or by a start that
+    worked.  The wallet-circuit probe could hear the wallet answer and close
+    the circuit, and while no heartbeat then reached Step 8 the poll loop went
+    on sending `chia start wallet` to a running wallet.  The probe's answer
+    now settles it, as Step 8's does (clear_wallet_start, pinned by gtest)."""
+    text = _engine()
+    poll = _function_body(text, POLL_LOOP)
+    probe = poll[poll.index("if (wallet_circuit_open_) {"):]
+    settled = re.search(r"co_await wallet_->get_sync_status\(\);\s*"
+                        r"wallet_circuit_open_ = false;\s*"
+                        r"execution::clear_wallet_start\(wallet_start_debt_, wallet_sync_watch_\);", probe)
+    assert settled, "the probe's answer settles the owed start, as the circuit closes"
+    assert text.count("execution::clear_wallet_start(") == 2, "Step 8's sync read, and the probe"
+
+
 def test_the_wallet_restart_is_gated_by_the_sync_watch() -> None:
     """Every wallet-restart command sits inside the block that runs only on a
     Restart verdict -- whatever the platform branch."""
@@ -296,8 +313,14 @@ def test_a_start_that_failed_is_owed_and_retried_from_the_poll_loop() -> None:
     fail_open = body.index("{", body.index("else", body.index("if (stop_rc == 0 && start_rc == 0)")))
     failure = body[fail_open:_matching(body, fail_open)]
     owed = re.search(r"if \(start_rc != 0\) \{\s*"
-                     r"execution::owe_wallet_start\(wallet_start_debt_, now_s, stop_rc == 0\);\s*\}", failure)
+                     r"execution::owe_wallet_start\(wallet_start_debt_, done_s, stop_rc == 0\);\s*\}", failure)
     assert owed, "a failed start must be owed, remembering whether the stop worked"
+    # [round 9] ...its first retry counted from when the blocking commands returned.
+    assert re.search(r'const int start_rc\s*=\s*std::system\("chia start wallet"\);\s*'
+                     r"const std::int64_t done_s =\s*std::chrono::duration_cast<std::chrono::seconds>\(\s*"
+                     r"std::chrono::steady_clock::now\(\)\.time_since_epoch\(\)\)\.count\(\);", body), (
+        "the owed start's clock starts once the restart's commands have returned"
+    )
     assert text.count("execution::owe_wallet_start(") == 1
 
     # The wallet answered: nothing is owed, and a restart whose stop worked counts.
@@ -310,9 +333,12 @@ def test_a_start_that_failed_is_owed_and_retried_from_the_poll_loop() -> None:
     loop = poll[poll.index("while (!stop_requested_.load(std::memory_order_relaxed)) {"):]
     retry = re.search(r"if \(execution::wallet_start_due\(wallet_start_debt_, now_s\)\) \{\s*"
                       r'const int rc = std::system\("chia start wallet"\);\s*'
+                      r"const std::int64_t done_s =\s*std::chrono::duration_cast<std::chrono::seconds>\(\s*"
+                      r"std::chrono::steady_clock::now\(\)\.time_since_epoch\(\)\)\.count\(\);\s*"
                       r"execution::record_wallet_start\(wallet_start_debt_, wallet_sync_watch_,\s*"
-                      r"rc == 0, now_s\);", loop)
-    assert retry, "an owed start must be retried from the poll loop, and its outcome recorded"
+                      r"rc == 0, done_s\);", loop)
+    assert retry, ("an owed start must be retried from the poll loop, and its outcome recorded "
+                   "[round 9] from when the blocking command returned")
     wait = "co_await timer.async_wait("
     assert loop.index(wait) < retry.start(), "after the poll's wait"
     assert "co_await" not in loop[loop.index(wait) + len(wait):retry.start()], (

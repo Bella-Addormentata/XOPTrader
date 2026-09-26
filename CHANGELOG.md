@@ -58,7 +58,11 @@ of 9,329,985.
   heartbeat because in wallet-only mode a heartbeat needs a height from the
   very wallet the failed start left down. Once the owed start works, or the
   wallet answers, a restart whose stop worked counts again, so the next
-  budgets double as a successful restart's do.
+  budgets double as a successful restart's do. The wallet answering the
+  circuit breaker's probe settles it too (review round 9), so a heartbeat
+  that never reaches Step 8 no longer leaves the poll loop sending starts to
+  a running wallet. And each retry's delay counts from when the blocking
+  command returned, not from when it was due.
 
 Not in this change: the wallet's own configuration (`use_delta_sync`,
 `connect_to_unknown_peers`), and the restart itself, which is still a blocking
