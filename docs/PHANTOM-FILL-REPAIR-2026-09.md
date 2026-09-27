@@ -1,13 +1,24 @@
 # Phantom-fill repair, 2026-09: trade_log 1900-1902
 
-Status as of **2026-09-26**: the repair is designed and reviewed, and its
-scripts were hardened and re-verified in three passes on copies of the 14:52
-snapshot of the live database. It has **NOT** been applied. The operator
-applies it in the v0.10.26 install window, with the engine and the GUI
-stopped, **before v0.10.26 starts for the first time**. v0.10.26's first boot
-may post XCH or BYC auto-adjusts. Those would change the pre-state the repair
-asserts, and the repair would then refuse to run. The execution record at the
-end stays blank until the repair is applied.
+Status as of **2026-09-27**: **APPLIED** to the live database at
+2026-09-27T09:12:15Z (04:12 CDT), in the v0.10.26 install window. The engine
+and the GUI were stopped, and v0.10.26 had not yet started.
+- Results:
+  - checker 115 PASS, 0 FAIL;
+  - v0.10.26 started at 04:14:28 CDT;
+  - after-boot check 68 PASS, 0 FAIL;
+  - completeness sweep PASS with WARN (the two expected exclusions).
+- The execution record at the end has the details and what is still open: the
+  first XCH and BYC auto-adjusts, and the Follow-ups.
+- The rollback window closed at the first start. From here on only R2 (a
+  forward un-repair) applies, and only if the repair itself is shown wrong.
+
+Before the window, the repair was designed and reviewed, and its scripts were
+hardened and re-verified in three passes on copies of the 14:52 snapshot. A
+read-only pre-flight on a fresh snapshot on 2026-09-27 verified them again. It
+had to run before v0.10.26's first start: that boot may post XCH or BYC
+auto-adjusts, which would change the pre-state the repair asserts, and the
+repair would then refuse to run.
 
 **v0.10.25 must never run on the repaired database** (step g says why and what
 to do instead).
@@ -1332,40 +1343,86 @@ listed under Pinned artefacts:
   been cancel_pending since 09-23, is Dead on-chain, and holds phantom 1900's
   unspent maker coin. Also include taker fills 631 and 636 (Residuals).
 
-## Execution record (template: fill in at the window)
+## Execution record
 
-Operator: `________`  Date: `________`  Times in local time (CDT) unless
-marked UTC.
+The repair was applied on **2026-09-27**. The operator was at the PC throughout. Claude ran the commands through
+its PowerShell tool, and the operator did the GUI close (Keep), the Windows
+Update pause and the installer (UAC). Times are local (CDT) unless marked UTC.
 
 | Step | Time | Result |
 |---|---|---|
-| Scripts checkout path, and HEAD from the script's `git :` line (informational; recorded here after the run) | | |
-| `$Out` folder | | |
-| Setup: `--print-hashes` exit code; do the three `lf=` values equal the Pinned artefacts table? | | |
-| Setup: `python --version`; installer file and sha256 (= `ee5e15e4...5abf`?) | | |
-| a. GUI closed; offers answer (Keep expected; if Cancel, why) | | |
-| b. `--list-blockers` RESULT and exit code; what had to be closed; any `taskkill`? | | |
-| c. `uncancelled.txt` / `.json` / `.txt.tmp`: absent / present; lines or file removed | | |
-| d. Wallet status 1900 / 1901 / 1902, and each VERDICT | | `____` / `____` / `____` |
-| d. Wallet confirmed (Total) XCH / DBX / BYC, in mojos; does Pending equal Total? | | |
-| d. No fourth phantom: trade_log rows after 1903 (each re-proved?), offer_log 21449 status | | |
-| e. Dry run: last line, exit code | | |
-| e. Real run: `APPLIED at` (UTC), row changes, exit code | | |
-| e. Ledger lines: xch / db1a9020 / ae1536f5, before -> after | | |
-| e. Wallet confirmed XCH (d) minus post-repair XCH ledger (e): the XCH adjust to expect; same for BYC | | |
-| e. `$Backup` path and sha256; live database sha256 after COMMIT (both from the apply output) | | |
-| f. Checker: PASS count / FAIL count, exit code | | |
-| f. INFO F12 lines: XCH and BYC ledger minus tracker | | |
-| Rollback decision at f (none / R1 / manual); R1 exit code and `$Backup.restore.log` | | |
-| g. Installer run: UAC answered, result, Launch checked? Any retry? | | |
-| h. First engine start: version and time (the rollback window closes) | | |
-| h. P&L after the start: XCH/DBX realized and fills, XCH/BYC fills | | |
-| h. Ledger invariant lines for xch / BYC / DBX (divergence, tol, exposure) | | |
-| h. Adjusting entries posted: asset, amount, ledger id, time; compared with the expectation from e | | |
-| h. Any log line or closure event for the three ids | | |
-| h. Checker `--after-boot`: PASS count / FAIL count, exit code | | |
-| Completeness sweep after the start: result line, exit code, excluded ids; re-prove verdicts | | |
-| Startup shortcut moved into `$Out` (setup) and put back (g.5); Windows Update paused and resumed | | |
-| Branches taken, if any: exit 4 / exit 5 and f fails / ALREADY APPLIED / R1 exit 6 / after-boot FAIL; what was captured and decided | | |
-| `trades_full.csv` regenerated at a later stop: date, old copy kept, the three ids absent | | |
-| Any deviation from this runbook | | |
+| Scripts checkout path, and HEAD from the script's `git :` line (informational; recorded here after the run) | 04:11 | `C:\GitHub\XOPTrader-phantomfix`, HEAD `7d2e2047db7c`, directory clean |
+| `$Out` folder | 03:46 | `C:\GitHub\XOPTrader-backups\phantom-repair-20260927_084653` |
+| Setup: `--print-hashes` exit code; do the three `lf=` values equal the Pinned artefacts table? | 03:46 | exit 0; three `[matches SHA256SUMS]`; `lf=` 33194400… / b097a98c… / faf23085… equal the table |
+| Setup: `python --version`; installer file and sha256 (= `ee5e15e4...5abf`?) | 03:46 | Python 3.13.12. `xop_trader-installer-windows-x64-v0.10.26.exe`, 109,612,886 bytes, downloaded from the v0.10.26 release with `gh release download` at the operator's approval. sha256 `ee5e15e4…5abf`: comparison `True`. Unsigned (Authenticode `NotSigned`), like earlier releases. |
+| a. GUI closed; offers answer (Keep expected; if Cancel, why) | 04:10 | Closed by the operator: **Keep**. Pre-close log tail had no flash-crash gate active. |
+| b. `--list-blockers` RESULT and exit code; what had to be closed; any `taskkill`? | 04:11:16 | `RESULT : nothing would stop the live run (exit 0)`; nothing had to be closed; no `taskkill` |
+| c. `uncancelled.txt` / `.json` / `.txt.tmp`: absent / present; lines or file removed | 04:11 | all three absent |
+| d. Wallet status 1900 / 1901 / 1902, and each VERDICT | 04:11 | `CONFIRMED` / `CONFIRMED` / `CANCELLED`, each `VERDICT: Dead` (1900: spent [9324680], 1 unspent; 1901: [9325694], 2 unspent; 1902: [9325004, 9339728]) |
+| d. Wallet confirmed (Total) XCH / DBX / BYC, in mojos; does Pending equal Total? | 04:11 | 40,945,287,566,022 / 1,938,432 / 78,139 at height 9,350,614, wallet synced. Unconfirmed = confirmed and `pending_change` 0 for all three (read with the read-only `get_wallet_balance` RPC; see Deviations). |
+| d. No fourth phantom: trade_log rows after 1903 (each re-proved?), offer_log 21449 status | 04:11 | `trade_log after 1903: []`; 21449 `('cancel_pending', 'price_adverse(1.218%)')` |
+| e. Dry run: last line, exit code | 09:12:05Z | `DRY RUN OK: 22 row changes verified, then rolled back.` / `exit : 0 OK` |
+| e. Real run: `APPLIED at` (UTC), row changes, exit code | 09:12:15.303Z | `APPLIED at 2026-09-27T09:12:15.303Z: 22 row changes.`; re-check after COMMIT: no XOPTrader process and no open handle; exit 0 |
+| e. Ledger lines: xch / db1a9020 / ae1536f5, before -> after | 09:12Z | xch 42,611,742,193,532 -> 43,508,583,294,699 (+896,841,101,167); db1a9020 1,938,432 -> 1,938,432 (+0); ae1536f5 73,854 -> 75,718 (+1,864) |
+| e. Wallet confirmed XCH (d) minus post-repair XCH ledger (e): the XCH adjust to expect; same for BYC | 04:12 | XCH: 40,945,287,566,022 - 43,508,583,294,699 = **-2,563,295,728,677** (about -2.563 XCH, inside First start item 2's range). BYC: 78,139 - 75,718 = **+2,421**, which is exactly the quote legs of taker fills 631 and 636 (Residuals). DBX: 0. |
+| e. `$Backup` path and sha256; live database sha256 after COMMIT (both from the apply output) | 09:12Z | `$Out\xop_trader_pre_phantom_repair_20260927_084653.db`, sha256 `8ef83c48488b4e26960700441c3a129c415bc18247ac2be01bd68e05d4590a19` (327,155,712 bytes); live database after COMMIT `aa08e9d0cbfffbf0de8dea44e1d4b1793920bbf0a6408d77d3f9b342760c3fad` |
+| f. Checker: PASS count / FAIL count, exit code | 04:12 | **115 PASS, 0 FAIL**, exit 0; no scripts-mismatch WARNING |
+| f. INFO F12 lines: XCH and BYC ledger minus tracker | 04:12 | XCH +3,657,229,627,510 -> +4,554,070,728,677; BYC -7,552 -> -5,688 |
+| Rollback decision at f (none / R1 / manual); R1 exit code and `$Backup.restore.log` | 04:12 | none |
+| g. Installer run: UAC answered, result, Launch checked? Any retry? | 04:13-04:14 | Run by the operator; UAC answered; installed (uninstall entry `XOPTrader version 0.10.26`, 0.10.26, 20260927); Launch left checked; no retry |
+| h. First engine start: version and time (the rollback window closes) | 04:14:28 | `XOPTrader v0.10.26 starting (PID 30488)` (GUI 04:14:22). Boot: `[S14] 1 wallet trade(s) are PENDING_CANCEL` (21449, already cancel_pending); 18 wallet offers known/restored, 0 orphans. |
+| h. P&L after the start: XCH/DBX realized and fills, XCH/BYC fills | 04:12 (f, E4) | XCH/DBX fills 197 -> 195, realized 84,125 -> 39,249 DBX mojos (-44,876), fees 104,791,842 -> 74,791,842; XCH/BYC fills 670 -> 669, realized 18,988 unchanged, fees 102,507,669 -> 87,507,669 |
+| h. Ledger invariant lines for xch / BYC / DBX (divergence, tol, exposure) | to 04:25:43 | none yet (7 heartbeats) |
+| h. Adjusting entries posted: asset, amount, ledger id, time; compared with the expectation from e | to 04:25:43 | **none yet**. Expected: XCH about -2.563 XCH and BYC about +2,421, once the book is thin enough (First start items 2-3). **Open: record them when they post.** |
+| h. Any log line or closure event for the three ids | 04:15, 04:25 | none (`h_ids.txt` empty; H2 counts 0 engine events) |
+| h. Checker `--after-boot`: PASS count / FAIL count, exit code | 04:15:18 | **68 PASS, 0 FAIL**, exit 0; schema identical to baseline |
+| Completeness sweep after the start: result line, exit code, excluded ids; re-prove verdicts | 04:15-04:26 | `PASS with WARN: every CONFIRMED wallet trade in scope is recorded, except 2 excluded as proven dead on-chain`, exit 0; `--since-height 9321000`, 22,946 wallet records, 0 missing maker, 0 missing taker, 4 dead_on_chain offers; excluded 0xd6a8325c15 (1900) and 0xdb63709cb9 (1901); re-proved 04:26:44: both `CONFIRMED`, `VERDICT: Dead` |
+| Startup shortcut moved into `$Out` (setup) and put back (g.5); Windows Update paused and resumed | 03:46 / 04:14:48 | Moved (`False`/`True`), put back (`True`). Windows Update paused by the operator at a; **resume: operator** |
+| Branches taken, if any: exit 4 / exit 5 and f fails / ALREADY APPLIED / R1 exit 6 / after-boot FAIL; what was captured and decided | | none |
+| `trades_full.csv` regenerated at a later stop: date, old copy kept, the three ids absent | | open (Follow-ups) |
+| Any deviation from this runbook | | See below. |
+
+**Deviations.**
+
+1. **Commands ran through Claude's PowerShell tool, one process per call.**
+   - Variables persisted in `$Out\vars.ps1`, which each call dot-sourced.
+   - Each call appended to `transcript.txt` (`Start-Transcript -Append`) and stopped it at the end.
+   - `Remove-Item Env:XOP_REPAIR_FAKE_LIVE_DIR` was blocked by the tool's path guard before anything ran, so it became `$env:XOP_REPAIR_FAKE_LIVE_DIR = $null`. The variable was confirmed unset.
+2. **The wallet balances at d came from the read-only wallet RPC** (`get_sync_status`, `get_height_info`, `get_wallets`, `get_wallet_balance`), not `chia wallet show`, which can prompt for a key in a non-interactive shell. The output is in `d_wallet_balances.txt`.
+3. **d's fourth-phantom query** was captured with `Tee-Object -Variable` then `Out-File -Encoding utf8`. It wrote no Tee file.
+4. **Evidence files were not committed**, because this repository is public. The transcript names the user and host, and `d_wallet_balances.txt` lists every wallet. The files stay in `$Out`, and their sha256 are below. The transcript's hash is its state after the last step recorded here (04:26:44).
+
+**After the start.** v0.10.26 closed offer_log 21449 at 04:16:07 as
+`cancelled` / `dead_on_chain`: "its 2 maker coins were not spent together
+(1 still unspent) -- no fill was booked". That settles the fourth-phantom
+exposure that step d guarded against. The brief `Wallet needs to be fully
+synced` errors after the start are the same short sync drops the pre-flight
+saw before the window.
+
+**Evidence (kept in `$Out`, sha256).**
+
+```
+9906aa350a186266c754d985c7feaea51381333ef90c1cc414682e5dd525d55d          581  0_hashes.txt
+ecb0e35126af263901ee814aafa17f5f8be5b1e875349ca980bef6a3c7ebff81         1407  b_list_blockers.txt
+7cade96101cf6173e089f5616ce06aeed263e249224acec8ca9563386289e7f2           98  d_fourth_phantom.txt
+e031a3d8ddda2d3bbf345ef6db73b32b02cb1c0c943cf44e05d2b56c5a059150         1532  d_offers.txt
+943ebe1db203b3688852d2a8f23c09608087374d811e193a66bd9a18bd5c86ce         1109  d_wallet_balances.txt
+f62985fc812bd8fa513929c72d45b23e528b6c0a2828f477c6a83ef0b2bd7eb3         4310  e_apply.txt
+b166eb773e91d4669f58edd434ee7844c3641314449c967985f32351aa6be0dd         1809  e_dryrun.txt
+62d89f30d08041cd6e11b6cd7c808af31c926c5fbea615073713094f01f6c70f        13422  f_check.txt
+663ef2d45c7c87b89d1c6482beaf589d50dc5f3bc273eef0ac682aa76a3b57ab         9604  h_check_after_boot.txt
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855            0  h_ids.txt
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855            0  h_ledger.txt
+12540e5850ee7cef7ef9cb3fbe852064b982ec35cf231d6083406d55b555c7ad         1658  sweep.txt
+d3d50fce4eddbb761a595d87b41f96678d3c12367f89e67f483403ad77b28f87         1033  sweep_reprove.txt
+847e82c79b03be5daa777dad0009fc9656aed9c6da6c700202aa005a004a9b4a        35275  transcript.txt
+0b3386b26353629678e72dff9f65c19e4167cd979f50bc6e7aec53e8819bbd1c          602  vars.ps1
+8ef83c48488b4e26960700441c3a129c415bc18247ac2be01bd68e05d4590a19    327155712  xop_trader_pre_phantom_repair_20260927_084653.db
+a9d5d22a1e3c6cdb84a4a4f0144fb6eb3b7aca01e0b103018c04fc3a2e441079         1874  xop_trader_pre_phantom_repair_20260927_084653.db.dryrun.log
+bec1214a05f644bb2768b46e395cd722ec8f4f4915653da7b852c3757de503d6         4356  xop_trader_pre_phantom_repair_20260927_084653.db.log
+```
+
+**Still open.**
+- Record the first XCH and BYC auto-adjusts, compared with the expectation above.
+- Resume Windows Update.
+- The Follow-ups: `trades_full.csv`, the engine follow-ups, the historical audit, and the 631/636 reversal.
