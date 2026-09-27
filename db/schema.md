@@ -44,6 +44,14 @@ Writers:
 - `PnLTracker::record_fill` — single canonical writer
   (`cpp/src/monitoring/pnl.cpp`).
 
+Deletions: `docs/ACCOUNTING-POLICY.md` §2 allows one kind, a fill the chain
+proved was never taken, and only after the full row is archived as JSON in an
+`offer_closure_events` row of type `phantom_fill_correction`. The id is
+AUTOINCREMENT, so no id is ever reused. The 2026-09 phantom-fill repair
+(`docs/PHANTOM-FILL-REPAIR-2026-09.md`) is planned to delete rows 1900-1902
+this way, offline, in the v0.10.26 install window; its execution record says
+whether and when it ran.
+
 ---
 
 ## `inventory_state` — persisted cost-basis records (2026-07-30)
@@ -87,9 +95,9 @@ balance each heartbeat.
 |----------------|---------|----------------------------------------------------|
 | `id`           | INTEGER | PK autoinc                                         |
 | `entry_time`   | TEXT    | ISO-8601 UTC of the event                          |
-| `event_type`   | TEXT    | `opening`, `fill`, `fee`, `take`, `adjust`         |
-| `event_id`     | TEXT    | trade_id, or `genesis:<asset>`                     |
-| `leg`          | TEXT    | `base`, `quote`, `fee`, `opening`, `adjust`        |
+| `event_type`   | TEXT    | `opening`, `fill`, `take`, `reward`, `bridge_deposit`, `bridge_withdrawal`, `adjust`, `reversal` (fee is a leg, not an event type) |
+| `event_id`     | TEXT    | trade_id (fills), or `genesis:<asset>`, `take:<trade_id>`, `reward:<tx>`, `bridge:job:<id>:<created_at>`, `adjust:<asset>:<height>`, `reversal:<event_id>`, `correction:<adjust event_id>` |
+| `leg`          | TEXT    | `base`, `quote`, `fee`, `opening`, `reward`, `bridge`, `adjust` |
 | `asset_id`     | TEXT    | Canonical (`xch` or 64-hex) — never a display symbol |
 | `delta_mojos`  | INTEGER | Signed: **+ inflow, − outflow**                    |
 | `pair_name`    | TEXT    | Context                                            |
@@ -107,13 +115,24 @@ Legs per event:
 | `opening` | one per asset = wallet confirmed balance at genesis |
 | `fill` (bid) | base `+size`, quote `−quote_mojos`, `xch −fee` |
 | `fill` (ask) | base `−size`, quote `+quote_mojos`, `xch −fee` |
+| `adjust` | one `adjust` leg: the invariant control's re-tie to the wallet (`adjust:<asset>:<height>`), or the correction of one (`correction:<that event_id>`) |
+| `reversal` | one leg per reversed leg: same `leg`, asset, pair and block, delta negated (`reversal:<event_id>`) |
 
-**Append-only.** Never `UPDATE` or `DELETE`; corrections are new `adjust`
-legs. Genesis deliberately does **not** replay `trade_log` — that table
-disagrees with the wallet by ~665 XCH, and replaying it would import the
-corruption the ledger exists to detect.
+**Append-only.** Never `UPDATE` or `DELETE`; corrections are new legs. A
+booking proven wrong gets `reversal` legs, which are never counted as
+unexplained: they stay out of `SUM(delta_mojos) WHERE event_type = 'adjust'`,
+the "unaccounted for" measure. If an auto-adjust had already absorbed part of
+that booking, that part is backed out by an `adjust` leg with event_id
+`correction:<adjust event_id>`; the adjust row itself is never edited.
+`docs/ACCOUNTING-POLICY.md` §2 has the rules; the first planned use (2026-09)
+is `docs/PHANTOM-FILL-REPAIR-2026-09.md`. Genesis deliberately does **not**
+replay `trade_log` — that table disagrees with the wallet by ~665 XCH, and
+replaying it would import the corruption the ledger exists to detect.
 
-Writer: `Database::append_ledger_entries` (engine, on genesis and every fill).
+Writer: `Database::append_ledger_entries` (engine: genesis, fills, takes,
+rewards, bridge flows, auto-adjusts). The engine never writes `reversal` legs
+or `correction:` legs; only an offline repair run with the engine and the GUI
+stopped does, and the 2026-09 phantom-fill repair is the only one defined.
 Reader: `Database::ledger_balances` (the invariant control).
 
 ---
@@ -157,7 +176,7 @@ reorg-defence tooling.
 | `id`             | INTEGER | PK autoinc                                     |
 | `offer_id`       | TEXT    |                                                |
 | `pair_name`      | TEXT    |                                                |
-| `event_type`     | TEXT    | e.g. `closed`, `stuck`, `reconcile`            |
+| `event_type`     | TEXT    | Engine: `status_update` (the row changed), `status_observation` / `reconcile_observation` (it did not), `reopen_observation`. Corrections appended offline: `era_backfill_correction` (2026-08-02 era remediation), `phantom_fill_correction` (defined by the 2026-09 phantom-fill repair) |
 | `previous_status`| TEXT    |                                                |
 | `observed_status`| TEXT    |                                                |
 | `closure_reason` | TEXT    | Mirrors `offer_log.cancel_reason` when set     |
@@ -167,6 +186,21 @@ reorg-defence tooling.
 
 Stuck cancels (offers cancelled because they got wedged in the wallet) are
 already emitted here via `update_offer_status(..., "stuck")`.
+
+An offer the chain proved was never taken (v0.10.26) is found by its
+`status_update` event with `closure_reason` exactly `dead_on_chain`. On a row
+that was already closed, the same verdict is a `status_observation`. A
+`phantom_fill_correction` reason also starts with `dead_on_chain`, so an audit
+of dead offers counts DISTINCT `offer_id` and filters on `event_type`, as
+`scripts/verify_fill_completeness.py` does.
+
+The phantom-fill repair's verdict events use the same `event_type` and
+`closure_reason`, but with `previous_status` 'filled'. The engine never writes
+that shape: on a 'filled' row `update_offer_status` only appends an
+observation. So `event_type = 'status_update' AND previous_status = 'filled'`
+finds those events, which carry no repair tag. The repair's
+`phantom_fill_correction` events end with the tag `phantom-fill repair of
+trade_log 1900-1902 (follow-up to PR #171, v0.10.26)`.
 
 ---
 
@@ -289,6 +323,16 @@ realized_pnl_quote_mojos, realized_pnl_usd, block_height
 > lost on every restart and overflowed for XCH pairs).  For truthful
 > historical P&L use `scripts/compute_actual_pnl.py` (cash-flow method),
 > which needs only prices and sizes.
+
+**Known bad lines in `trades_live.csv`.** It holds three lines, appended on
+2026-09-22, for fills that never happened: trade_ids
+`0xd6a8325c15af4fdb2674061afdd613ffb6c240be5fb0ef23aab6ddf31262d0d6`,
+`0xdb63709cb9b2c3794cbf1a57bb15f2d5c1830dca620b16ac36926d0d60c6c556` and
+`0x83eef9df80a4d5557422c4e6b1789c8d7504e7e83759a47a818c103b8099511c`
+(trade_log 1900-1902; `docs/PHANTOM-FILL-REPAIR-2026-09.md`). The file is
+append-only and is not edited, so they stay. Leave those trade_ids out when
+comparing it with `trade_log` or the wallet. `trades_full.csv` loses them the
+next time it is regenerated after the repair.
 
 ---
 
