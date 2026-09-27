@@ -61,7 +61,7 @@ None of the three offers meets this test.
 |---|---|---|---|
 | 1900 `0xd6a8325c15` | block 9,324,680 (created at 9,324,678), a fee transaction of the bot's own | unspent | CONFIRMED |
 | 1901 `0xdb63709cb9` | block 9,325,694 (created at 9,325,693), a fee transaction of the bot's own | unspent | CONFIRMED |
-| 1902 `0x83eef9df80` | block 9,325,004 (created at 9,325,003), a fee transaction of the bot's own | the second maker coin was spent later, at 9,339,728, and reused into the coins behind trade 1903's offer | CANCELLED |
+| 1902 `0x83eef9df80` | block 9,325,004 (created at 9,325,003), a fee transaction of the bot's own | the second maker coin was spent later, at 9,339,728, into a single change coin (less a 15,000,000 fee). The coins behind trade 1903's offer were spent in the same block but come from two other coins: the spends share a block, not a lineage (re-traced on-chain 2026-09-27) | CANCELLED |
 
 Maker coins spent at different heights, or some left unspent, mean the offer
 died without being taken. v0.10.26 records exactly this case as `cancelled`
@@ -227,6 +227,7 @@ into State, are unchanged.
 | Snapshot P&L history | `snapshots.pnl_total_usd` rows from 09-22 22:09 to the repair carry about +$0.87 of phantom P&L. The GUI's realized series is rebuilt from trade_log and loses it retroactively. So between those times total minus realized is inflated by about $0.87, and the total curve steps down at the restart. | Not rewritten. Snapshots are history that the engine never reads back. |
 | `data/trade_history/trades_live.csv` | Keeps the three phantom lines. The file is append-only and nothing reads it back. | Not edited: the lines are recorded in `db/schema.md` instead. `trades_full.csv` is regenerated at a later stop (Follow-ups). |
 | `offer_log.resolved_at` for the three rows | Holds the phantom booking time (09-22 22:09:29 / 22:13:39), not the time the offer died, which was 1-2 blocks after creation on 09-21 / 09-22. | Kept. This is the documented exception in policy §2: the repair changes only status and cancel_reason. Offer-lifetime analytics on these rows are wrong by about a day. |
+| Taker fills 631 and 636 (not phantoms of this kind; found in the 2026-09-27 pre-flight) | Each took a Dexie offer that the next fill (632, 637) took again. The wallet reports 631 FAILED and 636 CANCELLED, but their ledger `take` legs stand: XCH +1,057,670,000,000 net (base +476,400,000,000 and +581,300,000,000, fees 2 x -15,000,000) and BYC -2,421. After the repair, BYC ledger minus wallet is exactly -2,421, and about 1.058 XCH of the XCH gap is these two takes. | Not repaired here. The first v0.10.26 boot's XCH and BYC auto-adjusts will absorb them. Record the breakdown at h. A later reversal of 631 and 636 must then back out that part of those adjusts with `correction:` legs, as 2641 is here, or it double-counts. |
 | The trade_id journal-first guard for these ids | Gone with the trade_log rows. | Harmless under v0.10.26, which books only on proof; these offers can only prove Dead. **Not harmless under v0.10.25**: a phantom it re-adopted could be journaled again, while its ledger legs are dropped by `INSERT OR IGNORE` (the original legs hold the key), leaving a trade_log row with no ledger legs. One reason v0.10.25 must never run on the repaired database. |
 
 ## First start after the repair (v0.10.26)
@@ -378,9 +379,16 @@ Known edges of the pinned scripts.
     updates) and resume it after step h. If a restart is already pending
     there, it can still be forced: choose another time for the window, or
     restart first (close the GUI and answer Keep before you restart).
-- Download the installer. Its hash is checked in the session setup below.
+- Download the installer: `xop_trader-installer-windows-x64-v0.10.26.exe`,
+  109,612,886 bytes, from the v0.10.26 GitHub release (GitHub's published
+  asset digest equals the pin). Its hash is checked in the session setup
+  below.
 - Close every agent session and every Python tool that works on XOPTrader.
-  The script's process check refuses on:
+  An agent session kept open to help with the window must launch no Python of
+  its own (workflows, monitors, log pollers) from step b through step f. Its
+  scratch paths contain `C--GitHub-XOPTrader`, so one such process gives
+  exit 3 at b or e, or exit 4 after COMMIT. The script's process check
+  refuses on:
   - `xop_trader.exe` and the GUI executables (`xop_trader_gui.exe`, and the
     older names `xoptrader-gui.exe` and `xoptrader_gui.exe`);
   - anything running from `C:\Program Files\XOPTrader`;
@@ -600,6 +608,38 @@ Get-Content "$Out\d_offers.txt"
   XCH, DBX and BYC in mojos. Check that **Pending Total Balance** equals it,
   meaning no coins are in flight. If it does not, read it again later.
 
+**No fourth phantom.** The apply checks only the three offers, and the checker
+compares against `$Backup`, so a fill that v0.10.25 booked wrongly after
+2026-09-26 would pass both unseen. Offer_log 21449 (`0x0fab2a2ca4...`, an
+XCH/DBX ask) has the phantoms' exact shape: it has been `cancel_pending` since
+09-23, one maker coin was spent before its cancel was sent, and its other
+maker coin is phantom 1900's unspent coin. It proves Dead on-chain. List what
+has been booked since 1903, read-only, with the engine stopped (paste the block
+as it stands; the closing `"@` must be at column 0):
+
+```powershell
+@"
+import sqlite3, pathlib
+con = sqlite3.connect(pathlib.Path(r'$LiveDb').as_uri() + '?mode=ro', uri=True)
+print('trade_log after 1903:', con.execute("SELECT id, trade_id, pair_name, side, block_height FROM trade_log WHERE id > 1903 ORDER BY id").fetchall())
+print('offer_log 21449     :', con.execute("SELECT status, cancel_reason FROM offer_log WHERE id = 21449").fetchall())
+con.close()
+"@ | python -
+```
+
+- Expected (as on 2026-09-27 05:16 UTC): `trade_log after 1903: []` and
+  `offer_log 21449 : [('cancel_pending', 'price_adverse(1.218%)')]`.
+- Prove every row listed after 1903:
+  `cmd /c "python -u $Dir\prove_fill_on_chain.py <trade_id> >> $Out\d_new_rows.txt 2>&1"`.
+  A `VERDICT: Settled` row is a real fill: the repair does not touch it, so
+  record it and go on.
+- **Stop before e** if 21449 reads `filled`, or if any row after 1903 is not
+  `VERDICT: Settled`. That is a fourth phantom, which this repair does not
+  cover. Stop as in Session setup ("Stopping before g"): the database is
+  still unrepaired, so v0.10.25 may run. Then re-plan.
+- The query leaves an empty `-wal` and a `-shm` beside the database. That is
+  normal SQLite behaviour; its handle closes when the query exits.
+
 **e. Dry run, then the real run.**
 
 ```powershell
@@ -770,6 +810,14 @@ database; that is normal SQLite behaviour.
      With trade_log 1900-1902 deleted, the UNIQUE trade_id no longer stops
      that journal write, while the ledger legs are dropped by
      `INSERT OR IGNORE`.
+   - **This overrides any general upgrade procedure**, including an agent's
+     remembered rule to relaunch the old GUI when UAC times out (Inno exit 2
+     with no log). In this window a timeout comes after COMMIT, while v0.10.25
+     is still installed. The operator runs the wizard interactively (the UAC
+     prompt is on the secure desktop, so no remote session or agent can answer
+     it). Nobody runs it with `/SILENT` or relaunches a GUI. Nobody clicks the
+     Start-menu or desktop XOPTrader shortcuts between e and g: they start
+     whatever version is installed.
    - **Preferred: retry the installer.** The repair stays applied and valid,
      and the window stays open until something starts.
    - **If v0.10.26 cannot be installed in this window and the bot must
@@ -1281,7 +1329,8 @@ listed under Pinned artefacts:
     spends as its fee (CHANGELOG v0.10.26, "Not in this change").
 - **Historical audit** of other dead offers. Find them through the closure
   events, not through offer_log's reason. Include offer_log 21449, which has
-  been cancel_pending since 09-23.
+  been cancel_pending since 09-23, is Dead on-chain, and holds phantom 1900's
+  unspent maker coin. Also include taker fills 631 and 636 (Residuals).
 
 ## Execution record (template: fill in at the window)
 
@@ -1299,6 +1348,7 @@ marked UTC.
 | c. `uncancelled.txt` / `.json` / `.txt.tmp`: absent / present; lines or file removed | | |
 | d. Wallet status 1900 / 1901 / 1902, and each VERDICT | | `____` / `____` / `____` |
 | d. Wallet confirmed (Total) XCH / DBX / BYC, in mojos; does Pending equal Total? | | |
+| d. No fourth phantom: trade_log rows after 1903 (each re-proved?), offer_log 21449 status | | |
 | e. Dry run: last line, exit code | | |
 | e. Real run: `APPLIED at` (UTC), row changes, exit code | | |
 | e. Ledger lines: xch / db1a9020 / ae1536f5, before -> after | | |
