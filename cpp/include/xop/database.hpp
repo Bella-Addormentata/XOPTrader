@@ -272,13 +272,25 @@ struct DbInventoryState {
 //
 // Idempotency: (event_id, leg, asset_id) is UNIQUE.  A fill re-detected after
 // a crash re-posts identical legs, which are ignored rather than doubled.
+//
+// Append-only: corrections are new legs, never an UPDATE or DELETE.  A
+// booking proven wrong gets one 'reversal' leg per original leg (event_id
+// "reversal:<event_id>", delta negated), which is never counted as
+// unexplained: it stays out of SUM(event_type='adjust').  The part of an
+// auto-adjust that such a booking explains is backed out by an 'adjust' leg
+// with event_id "correction:<adjust event_id>".  The engine writes neither;
+// only an offline repair with the engine stopped does (the one defined is the
+// 2026-09 phantom-fill repair, docs/PHANTOM-FILL-REPAIR-2026-09.md).
+// docs/ACCOUNTING-POLICY.md s.2.
 // ---------------------------------------------------------------------------
 
 struct DbLedgerEntry {
     std::string entry_time;         ///< ISO-8601 UTC of the event.
-    std::string event_type;         ///< opening | fill | fee | take | adjust.
+    std::string event_type;         ///< opening | fill | take | reward | bridge_deposit |
+                                    ///< bridge_withdrawal | adjust | reversal.
     std::string event_id;           ///< trade_id, or a synthetic unique id.
-    std::string leg;                ///< base | quote | fee | opening | adjust.
+    std::string leg;                ///< base | quote | fee | opening | reward | bridge |
+                                    ///< adjust.  A 'reversal' keeps its original's leg.
     AssetId     asset_id;           ///< Canonical id ("xch" or 64-hex).
     Mojo        delta_mojos{0};     ///< Signed: + inflow, - outflow.
     std::string pair_name;          ///< Context (may be empty).

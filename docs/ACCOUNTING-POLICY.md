@@ -5,7 +5,14 @@ in the same commit as any code that changes the treatment — silent divergence
 between policy and implementation is how the July 2026 P&L failures went
 unnoticed for three months.
 
-Status: adopted 2026-07-30 (v0.8.0).
+Status: adopted 2026-07-30 (v0.8.0). Amended 2026-09-26 (§2): the `reversal`
+event type, the correction of an auto-adjust, and the treatment of a fill that
+never happened in the other stores, including the one sanctioned deletion from
+`trade_log` (the row is archived first). Before this, the only correction in
+the ledger was an `adjust` leg. The first planned use is the phantom-fill
+repair of trade_log 1900-1902, `docs/PHANTOM-FILL-REPAIR-2026-09.md`, to be
+applied offline in the v0.10.26 install window; its execution record says
+whether and when it ran.
 
 ---
 
@@ -28,7 +35,8 @@ of legs**. Summing `delta_mojos` per asset gives the ledger's implied balance.
 | `opening` | one leg per asset = wallet confirmed balance at genesis |
 | `fill` (bid) | base `+size`, quote `−quote_mojos`, `xch −fee` |
 | `fill` (ask) | base `−size`, quote `+quote_mojos`, `xch −fee` |
-| `adjust` | single leg, explicitly labelled, for movements with no internal event |
+| `adjust` | single leg, explicitly labelled, for movements with no internal event; also the correction of an earlier auto-adjust (below) |
+| `reversal` | one leg per leg of the booking it reverses: same `leg`, `asset_id`, `pair_name` and `block_height`, `delta_mojos` negated |
 
 **Sign convention**: positive is an inflow to the bot, negative an outflow.
 
@@ -36,9 +44,114 @@ of legs**. Summing `delta_mojos` per asset gives the ledger's implied balance.
 after a crash re-posts identical legs, which are ignored rather than doubled.
 
 **Append-only.** Never `UPDATE` or `DELETE` a ledger row. Corrections are new
-`adjust` legs that reference the original event. Both historical backfill
-scripts violated this on `trade_log` and left a column that is a palimpsest of
-three incompatible formula generations; they are now retired and refuse to run.
+legs that reference the original event: a `reversal` for a booking proven
+wrong, an `adjust` for a movement with no internal event. Both historical
+backfill scripts violated this on `trade_log` and left a column that is a
+palimpsest of three incompatible formula generations; they are now retired and
+refuse to run.
+
+### Reversal: a booking proven wrong (2026-09-26)
+
+A `reversal` is the compensating entry for a booking that evidence proves never
+happened, for example a fill the chain shows was never taken.
+
+- **One leg per leg** of the wrong event. Each reversal leg keeps the original
+  `leg`, `asset_id`, `pair_name` and `block_height`, and negates `delta_mojos`.
+  `entry_time` is the time the reversal is posted.
+- **`event_id` is `reversal:<event_id of the reversed event>`**. For a fill,
+  that is `reversal:<offer_id>`. A reversal cannot reuse the original
+  `event_id`: under the UNIQUE key and `INSERT OR IGNORE` the leg would be
+  dropped without an error.
+- **The `note` cites every reversed row** (`reverses ledger_entries id=<n>`)
+  and the proof.
+- **The original legs stay.** They keep the idempotency key that stops the
+  event from ever being posted again.
+- **The fee leg is reversed too** when the event never settled. §8: an offer's
+  creation fee is paid only at settlement.
+- **A reversal is never counted as unexplained.** It is not an `adjust`, so it
+  stays out of `SUM(delta_mojos) WHERE event_type = 'adjust'`, which the
+  engine defines as "how much is unaccounted for" (`step_check_ledger_invariant`).
+  TODO S44(b) asked for this separation: a booking known to be wrong is not
+  unexplained. A reversal does count in the ledger balance, like every leg.
+- **Offline only.** Post reversals with the engine and the GUI stopped, in one
+  transaction together with the other stores' corrections, after a backup made
+  with the SQLite backup API. Keep an execution record in `docs/`.
+
+### Correcting an auto-adjust
+
+Before posting any reversal, list every auto-adjust posted for the same assets
+after the wrong booking. These are the rows with `event_id`
+`adjust:<asset>:<height>` and the note `unexplained divergence reconciled to
+wallet`. An auto-adjust that absorbed part of the wrong booking has already
+re-tied that asset to the wallet. A reversal on its own would count the
+correction twice and push the ledger away from the wallet (S40, `ef05578`).
+
+For each auto-adjust that absorbed part of the booking, post one correction leg:
+
+- `event_type` `adjust`, `leg` `adjust`, `event_id`
+  `correction:<event_id of the adjust>`;
+- `delta_mojos` = the amount it absorbed, with the sign opposite to the
+  adjust's;
+- `block_height` = the adjust's;
+- a note citing the adjust's id, the amount it absorbed, the reversal events,
+  and the part of the adjust that is still unexplained.
+
+The reversal and the correction together leave that asset's ledger balance
+unchanged. `SUM(adjust)` then shows only the part that really is unexplained.
+The adjust row itself is never edited. The correction stays an `adjust`, not a
+`reversal`, because what it changes is the attribution of an `adjust`, and
+`SUM(adjust)` has to net to the part still unexplained.
+
+The rule applies to itself. A reversal that is later withdrawn is reversed as
+`reversal:reversal:<id>`. A correction that is later withdrawn is corrected as
+`correction:correction:<adjust event_id>`.
+
+### The other stores, for a fill that never happened
+
+A voided fill touches more than the ledger. The treatment for everything
+except the ledger is set out below. The first planned use and its numbers are
+in `docs/PHANTOM-FILL-REPAIR-2026-09.md`.
+
+- **`trade_log`: the row is deleted, after it is archived.** The table has no
+  status column, and `PnLTracker::rehydrate_from_db` rebuilds P&L from `COUNT`
+  and `SUM` over every row at each engine start. So a row that stays is a fill
+  that stays, and setting its realized P&L to NULL still counts the fill and
+  its fee. First the full row is archived as JSON in an append-only
+  `offer_closure_events` row (`phantom_fill_correction`). Then the row is
+  deleted. `trade_log` ids are AUTOINCREMENT and are never reused. This is the
+  only sanctioned deletion from `trade_log`; an in-place `UPDATE` is still
+  prohibited.
+- **`offer_log`** gets the status and block the engine records for an offer
+  proven dead (v0.10.26): `cancelled`, keeping the cancel cause (restored if
+  the wrong booking cleared it), with `resolved_block` = the height of the
+  spend that killed it. Only `status` and `cancel_reason` are rewritten:
+  `resolved_block` must already hold that height, and the repair refuses if
+  it does not. (For the 2026-09 rows it does: the wrong fill verdict recorded
+  the wallet's `confirmed_at_index`, which was the killing spend's height.)
+  - **`resolved_at` is the exception.** The engine stamps it with the time it
+    writes its verdict. A repair keeps the row's existing `resolved_at`, which
+    is the time of the wrong verdict it corrects, not the time the offer left
+    the book. For the phantom-fill repair that is 2026-09-22 22:09:29 or
+    22:13:39, 21 to 27 hours after the dead spend; v0.10.26 would have stamped
+    the repair time. Offer-lifetime figures read from `resolved_at` are wrong
+    for such rows either way; the execution record lists them as a residual.
+- **`offer_closure_events`** gets two appended events per offer:
+  - **The verdict**: the event type and reason the engine uses for a dead
+    offer (`status_update`, `closure_reason` exactly `dead_on_chain`), at the
+    height of the killing spend, fee NULL. Its `previous_status` is the row's
+    status before the repair (`filled` for a voided fill), a shape the engine
+    never writes: on a `filled` row `update_offer_status` only appends a
+    `status_observation` or `reconcile_observation`. So
+    `event_type = 'status_update' AND previous_status = 'filled'` finds the
+    repair's verdict rows. They carry no repair tag.
+  - **The correction record** (`phantom_fill_correction`): why, the restored
+    cancel cause, the reversal event id, and the archived `trade_log` row as
+    JSON. Its reason starts with `dead_on_chain` and ends with the repair's
+    tag, as does the `note` of every ledger leg the repair appends.
+- **`inventory_state`** is not rewritten. Step 11 re-ties quantities to the
+  wallet at boot. The phantom lots' contribution to cost cannot be
+  reconstructed (§6: unknown cost is never fabricated), so it stays as a
+  documented residual.
 
 **Genesis does not replay `trade_log`.** That table was shown on 2026-07-30 to
 disagree with the wallet by ~665 XCH; replaying it would import precisely the

@@ -1,0 +1,6 @@
+# sha256 of each file with CRLF normalised to LF (stable across a git
+# autocrlf checkout).  Regenerate after a REVIEWED change with:
+#   python apply_phantom_repair.py --write-hashes
+33194400b9b4feaabd32c50b4b01d07619be481ffdd4d8c2c32f5a84841418ac  apply_phantom_repair.py
+b097a98cc95311163bf7e09bb9240d3c90c9346008f8b50d86116baa1443385c  check_phantom_repair.py
+faf230850c59b433309436382798626964cfd0097850cd0554988f966277353a  prove_fill_on_chain.py

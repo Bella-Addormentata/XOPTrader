@@ -79,6 +79,17 @@ The single invariant that catches both mechanisms forever:
 > Every wallet trade record that reaches CONFIRMED (both `is_my_offer`
 > values) must exist in `trade_log` or `taker_fills`.
 
+Amended 2026-09-26: an offer the engine proved was never taken is listed as
+excluded, not missing. The proof is a closure event of type `status_update`
+with reason exactly `dead_on_chain` (v0.10.26). Offers are counted once each.
+The wallet reported three such offers CONFIRMED on 2026-09-22; see
+`docs/PHANTOM-FILL-REPAIR-2026-09.md`. The exclusion takes the engine's verdict
+on trust, so each excluded offer is printed in a `WARN: Excluded, not checked`
+section with a `re-prove:` command: the read-only
+`scripts/oneoff/phantom_fill_repair_2026_09/prove_fill_on_chain.py <trade_id>`,
+which needs the local wallet and full node and should print `VERDICT: Dead`.
+Any other verdict means the offer may be a real, unrecorded fill.
+
 The script is strictly read-only (wallet RPC + read-only DB URI), prints
 PASS/FAIL with every missing trade_id listed, and exits nonzero on FAIL:
 
@@ -86,11 +97,34 @@ PASS/FAIL with every missing trade_id listed, and exits nonzero on FAIL:
 .venv/Scripts/python.exe scripts/verify_fill_completeness.py                    # full history
 .venv/Scripts/python.exe scripts/verify_fill_completeness.py --since-days 7     # weekly check
 .venv/Scripts/python.exe scripts/verify_fill_completeness.py --since-height N   # from a block height
+.venv/Scripts/python.exe scripts/verify_fill_completeness.py --strict           # an exclusion exits 3
 ```
 
 Requires the Chia wallet running and synced (localhost:9256).  A 10-minute
 grace window (`--grace-minutes`) excludes just-confirmed trades the engine
-has not persisted yet.  Exit codes: 0 PASS, 1 FAIL, 2 operational error.
+has not persisted yet.  The grace is judged by the accepted, else created,
+time, so a maker offer posted earlier and taken moments ago is not in it.  A
+FAIL naming a very recent take can therefore be transient: run the sweep
+again a few minutes later before investigating.  Exit codes: 0 PASS (also "PASS with
+WARN" when offers are excluded), 1 FAIL, 2 operational error, 3 only with
+`--strict`: nothing is missing, but at least one offer is excluded as dead
+on-chain.  A missing trade exits 1 with or without `--strict`.  Exit 2 covers
+a missing database, an unreachable wallet RPC, a failed `get_height_info` or
+a height of 0 under `--since-days`, and bad arguments (including
+`--since-days` of 0 or less).  An uncaught error (for example a missing
+`requests` package) also exits 1, like a FAIL; its traceback tells them
+apart.
+
+`--since-days N` (amended 2026-09-26) counts a trade in scope when its
+accepted, else created, time is inside the window, OR its
+`confirmed_at_index` is at or above the wallet's current height minus N days
+of blocks (4,608 a day, widened by 10%).  A maker fill usually carries only
+its creation time, so without the height an offer posted before the window
+and taken inside it was silently dropped.  The current height comes from the
+wallet's read-only `get_height_info` RPC.  A record with no
+`confirmed_at_index` (0) falls back to its time alone.  `--since-height H`
+checks only trades whose `confirmed_at_index` is at least H (a record without
+one is not checked).
 
 ### Sweep result 2026-08-02 (full history) -- FAIL
 
@@ -173,10 +207,13 @@ for ~2.5 BYC — are now recorded in `taker_fills` with
 
 **Deliberately NO ledger entries.** Unlike the pre-genesis backfill (whose flows
 sit inside the opening balances), these settled *after* genesis, so the ledger
-genuinely missed them at the time. However the 2026-08-02 adjusting entries
-(XCH −17.000001, BYC +10.192, wUSDC.b +13.745) have since re-tied the ledger to
-the wallet, absorbing all then-unexplained flow **including these two**. Posting
-individual legs now would double-count and break the live invariant.
+genuinely missed them at the time. However the engine's auto-adjusts of
+2026-07-30/31 (ledger ids 14, 42 and 88: wUSDC.b +13.745 at 07-30 22:31Z,
+XCH −17.000001 at 07-31 13:34Z, BYC +10.192 at 07-31 17:16Z, each noted
+"unexplained divergence reconciled to wallet") have since re-tied the ledger
+to the wallet, absorbing all then-unexplained flow **including these two**.
+They were posted by the invariant control, not by hand. Posting individual
+legs now would double-count and break the live invariant.
 
 Treatment: the trade record is preserved for audit in `taker_fills`; the value
 movement is already reflected in the ledger via the adjustment. This follows the
