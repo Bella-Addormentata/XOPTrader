@@ -376,3 +376,17 @@ def test_sweep_rejects_fee_exceeding_amount():
     coin = _security_coin(amount=100)
     with pytest.raises(d.WarpDriverError, match="sweep fee"):
         d.build_sweep_bundle(NET, coin, bytes.fromhex("77" * 32), _ephemeral_sk_bytes(), sweep_fee=100)
+
+
+def test_evm_address_follows_the_validators_rule():
+    """warpdotgreen/cli#26: keep the last 20 bytes, never strip the address's
+    own leading zero byte (the old rule stripped every leading 0x00)."""
+    addr = bytes.fromhex("00" + "ab" * 19)
+    assert d._evm_address(addr) == addr
+    assert d._evm_address(b"\x00" * 12 + addr) == addr
+    bridge = bytes.fromhex(NET.erc20_bridge_address[2:])
+    assert d._evm_address(bridge) == bridge
+    with pytest.raises(d.WarpDriverError, match="non-zero pad"):
+        d._evm_address(b"\x01" + b"\x00" * 11 + addr)
+    with pytest.raises(d.WarpDriverError, match="20 bytes"):
+        d._evm_address(addr[1:])

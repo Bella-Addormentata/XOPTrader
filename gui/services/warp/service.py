@@ -796,8 +796,18 @@ class WarpEngine:
             if job.status in sweepable_pends
             else "Retry re-attempts it"
         )
+        # Since warpdotgreen/cli#26 a signature quorum that never forms is not
+        # only slowness: validators stop signing on a Nostr control "stop"
+        # (and by default until a "start"), and permanently refuse a message
+        # their spend policy rejects. Neither is visible from here -- the stop
+        # authors are each operator's own config -- so name both causes.
+        cause = (
+            " -- the validators may be paused, or may have rejected this message"
+            if job.status in (JobStatus.COLLECTING_SIGS, JobStatus.COLLECTING_EVM_SIGS)
+            else ""
+        )
         return (
-            f"no progress in {job.status} after {polls} polls (~{hours:.1f}h); "
+            f"no progress in {job.status} after {polls} polls (~{hours:.1f}h){cause}; "
             f"handing over to the operator -- {remedy}"
         )
 

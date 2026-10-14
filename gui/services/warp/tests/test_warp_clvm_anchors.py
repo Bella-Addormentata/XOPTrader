@@ -383,11 +383,10 @@ def test_burn_puzzle_hash_derives_from_this_repos_drivers():
     the outbound analogue of the wrapped-asset anchor: a drivers or vendored
     puzzle defect fails here before any job exists.
 
-    Known divergence, deliberately preserved: our get_cat_burner_puzzle
-    applies _strip_source(destination) and upstream does not. A no-op for the
-    deployed bridge address (no leading zero byte); a bridge redeploy to a
-    leading-zero address would surface here as a hash mismatch, which is the
-    correct failure.
+    Our get_cat_burner_puzzle normalizes the destination with _evm_address
+    (20-byte form, the validators' rule since warpdotgreen/cli#26) and
+    upstream takes it as given. Both agree on any 20-byte bridge address,
+    including one with a leading zero byte.
     """
     from gui.services.warp import constants as C
     from gui.services.warp import drivers

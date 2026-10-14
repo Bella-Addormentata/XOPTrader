@@ -172,18 +172,26 @@ class ClaimBundle:
 # Small helpers.
 # --------------------------------------------------------------------------- #
 
-def _strip_source(source: bytes) -> bytes:
-    """Strip leading 0x00 bytes -- the 32-byte-padded EVM address -> 20 bytes.
+def _evm_address(source: bytes) -> bytes:
+    """Normalize an EVM address to its 20-byte form, keeping its own zero bytes.
 
-    Matches ``xch_follower.signMessage`` and warp-ui's inner-solution builder;
-    for the mainnet Base bridge (``0x8412..``) there are no leading zeros so this
-    is a no-op, but it keeps the digest, message-coin, cat_minter, and portal
-    inner solution all committed to an identical source.
+    Mirrors the validators' rule since warpdotgreen/cli#26
+    (``spend_policy.normalize_signed_evm_source`` / ``evm_address_from_bytes32``):
+    a 20-byte address passes through, a left-padded word keeps its last 20
+    bytes, and a non-zero pad is refused -- the validators refuse to sign it.
+    The old rule stripped *every* leading 0x00, which agrees for the mainnet
+    Base bridge (``0x8412..``) but would have dropped an address's own leading
+    zero byte. It keeps the digest, message-coin, cat_minter, and portal inner
+    solution all committed to an identical source.
     """
-    i = 0
-    while i < len(source) and source[i] == 0:
-        i += 1
-    return source[i:]
+    source = bytes(source)
+    if len(source) > 20:
+        pad, source = source[:-20], source[-20:]
+        if any(pad):
+            raise WarpDriverError("EVM address has a non-zero pad; validators will not sign it")
+    if len(source) != 20:
+        raise WarpDriverError(f"EVM address must be 20 bytes, got {len(source)}")
+    return source
 
 
 def _as_keys(pubkeys: Sequence) -> list:
@@ -276,7 +284,7 @@ def get_message_coin_puzzle(
     return cu.curry(
         get_message_coin_puzzle_1st_curry(launcher_id),
         (source_chain, nonce),
-        _strip_source(source),
+        _evm_address(source),
         destination,
         message_hash,
     )
@@ -353,7 +361,7 @@ def get_portal_receiver_inner_solution(
     return SExp.to([
         0,  # no update puzzle
         [(source_chain, nonce)],
-        [[sigs_switch, _strip_source(source), destination, list(contents)]],
+        [[sigs_switch, _evm_address(source), destination, list(contents)]],
     ])
 
 
@@ -379,7 +387,7 @@ def get_validator_message_digest(
     tree = cu.sha256tree(SExp.to([
         source_chain,
         nonce,
-        _strip_source(source),
+        _evm_address(source),
         destination,
         list(contents),
     ]))
@@ -397,12 +405,12 @@ def get_cat_burner_puzzle(destination_chain: bytes, destination: bytes) -> SExp:
         BURN_INNER_PUZZLE_MOD_HASH,
         BRIDGING_PUZZLE_HASH,
         destination_chain,
-        _strip_source(destination),
+        _evm_address(destination),
     )
 
 
 def get_cat_minter_puzzle(launcher_id: bytes, source_chain: bytes, source: bytes) -> SExp:
-    source = _strip_source(source)
+    source = _evm_address(source)
     return cu.curry(
         CAT_MINTER_MOD,
         cu.sha256tree(get_message_coin_puzzle_1st_curry(launcher_id)),
@@ -434,7 +442,7 @@ def get_wrapped_tail(
     source: bytes,
     source_chain_token_contract_address: bytes,
 ) -> SExp:
-    source = _strip_source(source)
+    source = _evm_address(source)
     token = source_chain_token_contract_address
     if len(token) < 32:
         token = b"\x00" * (32 - len(token)) + token
