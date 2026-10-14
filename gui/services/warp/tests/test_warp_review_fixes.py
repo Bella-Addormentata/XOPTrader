@@ -707,6 +707,25 @@ def test_a_state_that_never_progresses_eventually_reaches_the_operator(monkeypat
     assert "no progress in FUNDING_CLAIM" in (out["last_error"] or "")
 
 
+@pytest.mark.parametrize(
+    "status", [JobStatus.COLLECTING_SIGS, JobStatus.COLLECTING_EVM_SIGS]
+)
+def test_a_quorum_that_never_forms_names_a_validator_pause_or_reject(status):
+    """Since warpdotgreen/cli#26 validators can be paused over Nostr or refuse
+    a message outright; a sig-wait expiry must not read as mere slowness."""
+    engine, _ctx = build(new_store())
+    limit = S._PENDING_MAX_POLLS[status]
+    reason = engine._pending_expired(
+        SimpleNamespace(status=status, state={"pending_polls": limit})
+    )
+    assert reason and "validators may be paused" in reason
+    other = engine._pending_expired(SimpleNamespace(
+        status=JobStatus.FUNDING_CLAIM,
+        state={"pending_polls": S._PENDING_MAX_POLLS[JobStatus.FUNDING_CLAIM]},
+    ))
+    assert other and "validators" not in other
+
+
 def test_the_pending_counter_resets_when_the_job_advances(monkeypatch):
     """The clock measures time in one state, not the age of the job."""
     monkeypatch.setattr(claim_mod, "find_security_coin",
