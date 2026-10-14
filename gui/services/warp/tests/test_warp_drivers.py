@@ -388,5 +388,10 @@ def test_evm_address_follows_the_validators_rule():
     assert d._evm_address(bridge) == bridge
     with pytest.raises(d.WarpDriverError, match="non-zero pad"):
         d._evm_address(b"\x01" + b"\x00" * 11 + addr)
-    with pytest.raises(d.WarpDriverError, match="20 bytes"):
-        d._evm_address(addr[1:])
+    assert d._evm_address(b"\x00" * 40 + addr) == addr
+    with pytest.raises(d.WarpDriverError, match="non-zero pad"):
+        d._evm_address(b"\x01" + b"\x00" * 31 + addr)
+    # Only 20 bytes or a padded 32-byte word, exactly as the validators accept.
+    for bad in (addr[1:], b"\x00" + addr, b"\x00" * 11 + addr):
+        with pytest.raises(d.WarpDriverError, match="20 bytes"):
+            d._evm_address(bad)

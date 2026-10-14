@@ -177,20 +177,27 @@ def _evm_address(source: bytes) -> bytes:
 
     Mirrors the validators' rule since warpdotgreen/cli#26
     (``spend_policy.normalize_signed_evm_source`` / ``evm_address_from_bytes32``):
-    a 20-byte address passes through, a left-padded word keeps its last 20
-    bytes, and a non-zero pad is refused -- the validators refuse to sign it.
-    The old rule stripped *every* leading 0x00, which agrees for the mainnet
-    Base bridge (``0x8412..``) but would have dropped an address's own leading
-    zero byte. It keeps the digest, message-coin, cat_minter, and portal inner
-    solution all committed to an identical source.
+    a 20-byte address passes through, a left-padded 32-byte word keeps its last
+    20 bytes, anything longer must be a zero pad onto such a word, and every
+    other length or a non-zero pad is refused -- the validators refuse to sign
+    it. The old rule stripped *every* leading 0x00, which agrees for the
+    mainnet Base bridge (``0x8412..``) but would have dropped an address's own
+    leading zero byte. It keeps the digest, message-coin, cat_minter, and
+    portal inner solution all committed to an identical source.
     """
     source = bytes(source)
-    if len(source) > 20:
-        pad, source = source[:-20], source[-20:]
-        if any(pad):
+    if len(source) > 32:
+        if any(source[:-32]):
             raise WarpDriverError("EVM address has a non-zero pad; validators will not sign it")
+        source = source[-32:]
+    if len(source) == 32:
+        if any(source[:12]):
+            raise WarpDriverError("EVM address has a non-zero pad; validators will not sign it")
+        source = source[-20:]
     if len(source) != 20:
-        raise WarpDriverError(f"EVM address must be 20 bytes, got {len(source)}")
+        raise WarpDriverError(
+            f"EVM address must be 20 bytes or a padded 32-byte word, got {len(source)}"
+        )
     return source
 
 
