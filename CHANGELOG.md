@@ -5,6 +5,45 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.27] — 2026-10-14 — the bridge follows warp.green's new validator rules, and Target % edits that stay put
+
+### The warp.green bridge matches the validators' rules (#174)
+
+warp.green's validator software changed in warpdotgreen/cli#26 (merged
+2026-10-11). Contracts, puzzles, the Nostr signature format and the signed
+message layout did not change, so the existing flows (`bridgeToChia` for USDC
+and milliETH, the four-spend burn, `receiveMessage` relays) already pass. This
+release is hardening, not a fix for anything broken today.
+
+- A message's EVM source address is normalized the way the validators now do
+  it: 20 bytes, or a 32-byte word with a 12-byte zero pad. Anything else is
+  refused instead of truncated. The mainnet Base bridge address is unchanged.
+- A job that expires while collecting signatures now says the validators may
+  be paused (a Nostr control "stop") or may have rejected the message, rather
+  than a generic "no progress".
+- `gui/services/warp/tests/test_warp_validator_policy.py` runs our burn
+  bundle through a port of the validators' `validate_chia_erc20_unwrap`, so a
+  builder change that the validators would refuse fails a test before it
+  melts any wUSDC.b.
+
+### Target % edits stay put, and Suggested % can fill every target (#175)
+
+In the Target Portfolio Allocation table, a Target % being typed (or nudged
+with +/-) often snapped back to the old value before Enter: every balance tick
+rebuilt the table, and Qt pushes a changed cell straight into its open editor.
+The table now waits while a cell is being edited and refreshes once editing
+ends. A new **Apply Suggested Values** button copies Suggested % into Target %
+for every row that has a suggestion; nothing reaches the strategy until
+**Apply Targets To Strategy** is pressed.
+
+### Offline repair for the 2026-09-22 phantom fills (#173)
+
+`scripts/oneoff/phantom_fill_repair_2026_09/` reverses the three dead offers
+that a wallet resync booked as fills (trade_log 1900-1902). It was applied on
+2026-09-27 09:12:15Z with the engine stopped; the execution record is in
+`docs/PHANTOM-FILL-REPAIR-2026-09.md`. Nothing runs at startup, and an
+installed database that was already repaired needs no action.
+
 ## [0.10.26] — 2026-09-26 — positions that follow the wallet, a wallet left to sync, and fills the chain has proven
 
 ### The risk limits read the wallet's positions, not a guess that fills made
