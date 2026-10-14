@@ -16,9 +16,12 @@ import json
 import logging
 from typing import Any, Final, Optional
 
-from PySide6.QtCore import QObject, QSettings, Qt, QThread, Signal, Slot
+from PySide6.QtCore import (
+    QObject, QSettings, Qt, QThread, QTimer, Signal, Slot,
+)
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -229,6 +232,9 @@ class WalletBalancesWidget(QWidget):
         self._target_allocations: dict[str, float] = {}
         self._target_tolerances: dict[str, float] = {}
         self._alloc_updating = False
+        # Set when a refresh arrives while a Target % / +/- cell is being
+        # edited; the refresh runs once the editor closes instead.
+        self._alloc_refresh_deferred = False
         # Advisory suggested allocation (flow-keyed calculator output).
         # None until the first async compute lands; _suggested_status is
         # "pending", "ready" or "failed: <msg>".
@@ -429,6 +435,9 @@ class WalletBalancesWidget(QWidget):
             """
         )
         self._alloc_table.cellChanged.connect(self._on_alloc_cell_changed)
+        self._alloc_table.itemDelegate().closeEditor.connect(
+            self._on_alloc_editor_closed
+        )
         alloc_layout.addWidget(self._alloc_table)
 
         # Advisory footnote for the Suggested % column.  States the
@@ -467,6 +476,15 @@ class WalletBalancesWidget(QWidget):
             """
         )
         normalize_btn.clicked.connect(self._normalize_targets)
+        self._apply_suggested_btn = QPushButton("Apply Suggested Values")
+        self._apply_suggested_btn.setStyleSheet(normalize_btn.styleSheet())
+        self._apply_suggested_btn.setToolTip(
+            "Copy the Suggested % column into Target %.  Rows without a "
+            "suggestion keep their current target.  Nothing reaches the "
+            "strategy until you press Apply Targets To Strategy."
+        )
+        self._apply_suggested_btn.setEnabled(False)
+        self._apply_suggested_btn.clicked.connect(self._apply_suggested_targets)
         self._apply_alloc_btn = QPushButton("Apply Targets To Strategy")
         self._apply_alloc_btn.setStyleSheet(
             f"""
@@ -488,6 +506,7 @@ class WalletBalancesWidget(QWidget):
         self._apply_alloc_btn.clicked.connect(self._apply_targets)
         alloc_controls.addWidget(self._alloc_sum_label)
         alloc_controls.addWidget(self._alloc_hint_label, stretch=1)
+        alloc_controls.addWidget(self._apply_suggested_btn)
         alloc_controls.addWidget(normalize_btn)
         alloc_controls.addWidget(self._apply_alloc_btn)
         alloc_layout.addLayout(alloc_controls)
@@ -963,7 +982,39 @@ class WalletBalancesWidget(QWidget):
             if p.get("enabled", True) and p.get("name")
         }
 
+    def _alloc_editing(self) -> bool:
+        return (
+            self._alloc_table.state()
+            == QAbstractItemView.State.EditingState
+        )
+
+    @Slot()
+    def _on_alloc_editor_closed(self, *_args: Any) -> None:
+        # The view leaves EditingState in its own (queued) closeEditor
+        # handler, after this one; hop to the event loop before refreshing.
+        if self._alloc_refresh_deferred:
+            QTimer.singleShot(0, self._run_deferred_alloc_refresh)
+
+    @Slot()
+    def _run_deferred_alloc_refresh(self) -> None:
+        if not self._alloc_refresh_deferred:
+            return
+        if self._alloc_editing():
+            # Still closing, or the user moved straight to another cell.
+            QTimer.singleShot(100, self._run_deferred_alloc_refresh)
+            return
+        self._alloc_refresh_deferred = False
+        self._refresh_allocation_table()
+
     def _refresh_allocation_table(self) -> None:
+        # Rewriting a cell whose editor is open makes Qt push the model value
+        # back into the editor (QAbstractItemView.dataChanged ->
+        # setEditorData), so a balance tick mid-typing reverted the user's
+        # new Target % before they could press Enter.  Hold the refresh until
+        # the editor closes.
+        if self._alloc_editing():
+            self._alloc_refresh_deferred = True
+            return
         asset_prices = self._asset_prices_usdc()
         current_values: dict[str, float] = {}
         # One-shot diagnostic so we can see in the GUI log why the
@@ -1060,6 +1111,7 @@ class WalletBalancesWidget(QWidget):
         if not all_assets:
             self._alloc_table.setRowCount(0)
             _fit_table_to_contents(self._alloc_table)
+            self._apply_suggested_btn.setEnabled(False)
             self._alloc_sum_label.setText("Target sum: —")
             self._alloc_hint_label.setText("No wallets detected yet")
             return
@@ -1137,6 +1189,7 @@ class WalletBalancesWidget(QWidget):
 
         self._alloc_updating = False
         _fit_table_to_contents(self._alloc_table)
+        self._apply_suggested_btn.setEnabled(bool(self._suggested_targets()))
         self._update_allocation_sum_status()
         unpriced = sorted(all_assets - set(current_values))
         if total_value <= 0.0:
@@ -1195,6 +1248,7 @@ class WalletBalancesWidget(QWidget):
         if self._suggest_thread is not None:
             return
         self._suggested_status = "pending"
+        self._apply_suggested_btn.setEnabled(False)
         thread = QThread(self)
         worker = _SuggestedAllocationWorker(
             self._sizing_config_path, self._sizing_db_path
@@ -1394,6 +1448,38 @@ class WalletBalancesWidget(QWidget):
             self._alloc_hint_label.setStyleSheet(
                 f"color: {WARNING}; font-size: 11px;"
             )
+
+    def _suggested_targets(self) -> dict[str, float]:
+        """Suggested % per asset currently shown in the allocation table."""
+        if self._suggested_status != "ready" or self._suggested_alloc is None:
+            return {}
+        suggested = self._suggested_alloc.get("assets") or {}
+        out: dict[str, float] = {}
+        for row in range(self._alloc_table.rowCount()):
+            item = self._alloc_table.item(row, 0)
+            if item is None:
+                continue
+            asset = item.text().strip().upper()
+            info = suggested.get(asset)
+            if info is None:
+                continue
+            try:
+                out[asset] = max(
+                    0.0, min(100.0, float(info.get("suggested_pct", 0.0)))
+                )
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    @Slot()
+    def _apply_suggested_targets(self) -> None:
+        """Copy the Suggested % column into Target % (not to the strategy)."""
+        suggested = self._suggested_targets()
+        if not suggested:
+            return
+        self._target_allocations.update(suggested)
+        self._save_target_allocations()
+        self._refresh_allocation_table()
 
     @Slot()
     def _normalize_targets(self) -> None:
