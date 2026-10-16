@@ -28,6 +28,8 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace {
 
@@ -2557,6 +2559,56 @@ pegged_assets:
     EXPECT_EQ(a->sustained_observations, 7u);
     EXPECT_FALSE(a->prefer_market_cross);
     EXPECT_TRUE(a->enforce);
+}
+
+// [PEGEDGE 2026-10-16] observe_from: book_edge unless declared otherwise, so
+// an existing config with no such key gets the fix on upgrade.
+TEST(ConfigParserTest, PeggedAssets_ObserveFromDefaultsToBookEdge) {
+    TempYaml tmp(with_pegs(R"(
+pegged_assets:
+- asset_id: aabb000000000000000000000000000000000000000000000000000000000000
+  symbol: wTEST
+  peg_currency: USD
+  peg_target: 1.0
+)"));
+    auto cfg = xop::load_config(tmp.path());
+    const auto* a = cfg.pegged_assets.find(
+        "aabb000000000000000000000000000000000000000000000000000000000000");
+    ASSERT_NE(a, nullptr);
+    EXPECT_EQ(a->observe_from, xop::PegObserveFrom::BookEdge);
+}
+
+TEST(ConfigParserTest, PeggedAssets_ObserveFromParsesBothValues) {
+    for (const auto& [text, want] :
+         std::vector<std::pair<std::string, xop::PegObserveFrom>>{
+             {"book_edge", xop::PegObserveFrom::BookEdge},
+             {"mid", xop::PegObserveFrom::Mid}}) {
+        TempYaml tmp(with_pegs(
+            "pegged_assets:\n"
+            "- asset_id: aabb000000000000000000000000000000000000000000000000000000000000\n"
+            "  symbol: wTEST\n"
+            "  peg_currency: USD\n"
+            "  peg_target: 1.0\n"
+            "  observe_from: " + text + "\n"));
+        auto cfg = xop::load_config(tmp.path());
+        const auto* a = cfg.pegged_assets.find(
+            "aabb000000000000000000000000000000000000000000000000000000000000");
+        ASSERT_NE(a, nullptr) << text;
+        EXPECT_EQ(a->observe_from, want) << text;
+    }
+}
+
+TEST(ConfigParserTest, PeggedAssets_UnknownObserveFromIsRejected) {
+    TempYaml tmp(with_pegs(R"(
+pegged_assets:
+- asset_id: aabb000000000000000000000000000000000000000000000000000000000000
+  symbol: wTEST
+  peg_currency: USD
+  peg_target: 1.0
+  observe_from: edge
+)"));
+    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError)
+        << "a typo must not silently pick the watcher's behaviour";
 }
 
 TEST(ConfigParserTest, PeggedAssets_ThresholdsAreNotAdvertisedAsUnwired) {

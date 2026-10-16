@@ -20764,11 +20764,32 @@ void Engine::step_check_stablecoin_peg([[maybe_unused]] BlockHeight block_height
         const double dex_mid = market_data_->get_mid_price("XCH/wUSDC.b");
         if (dex_mid > 0.0) {
             const double cex_mid = xch_it->second / usdc_it->second;
-            const double implied = usdc_it->second * (cex_mid / dex_mid);
+            // [PEGEDGE 2026-10-16] Judge the third-party book price nearest
+            // the CEX price, not the mid, for the reason given on
+            // risk::peg_usd_book_observation: on 2026-10-15 a lone 2.000
+            // ask beside a 1.584 bid read here as "implied wUSDC.b = $0.913"
+            // and raised a CRITICAL depeg alert while wUSDC.b was at par.
+            // Falls back to the mid when the book is one-sided, crossed, or
+            // may include our own offers.
+            double dex_px = dex_mid;
+            const char* dex_src = "mid";
+            const auto snap = state_->get_market("XCH/wUSDC.b");
+            if (snap.touches_third_party) {
+                const double scale = static_cast<double>(kMojosPerXch);
+                if (const auto edge = risk::book_price_nearest(
+                        cex_mid,
+                        static_cast<double>(snap.best_bid) / scale,
+                        static_cast<double>(snap.best_ask) / scale)) {
+                    dex_px  = *edge;
+                    dex_src = "book edge";
+                }
+            }
+            const double implied = usdc_it->second * (cex_mid / dex_px);
             const double dev     = std::abs(implied - 1.0) * 100.0;
             score("wUSDC.b/implied", dev, acc.peg_implied_warn_pct,
                   "implied wUSDC.b = $" + std::to_string(implied)
-                  + " (dex " + std::to_string(dex_mid)
+                  + " (dex " + std::to_string(dex_px) + " " + dex_src
+                  + ", mid " + std::to_string(dex_mid)
                   + " vs cex " + std::to_string(cex_mid) + ")");
         }
     }
@@ -24483,15 +24504,26 @@ asio::awaitable<void> Engine::step_observe_asset_pegs(BlockHeight block_height)
                 // That is why refusing is the SAFE direction here and
                 // returning a number is the risky one -- the inverse of the
                 // usual rule, and stated at length in that header.
-                const auto obs = risk::peg_usd_observation(
+                //
+                // [PEGEDGE 2026-10-16] Judged at the book edge nearest par
+                // (a->observe_from, default book_edge) -- see
+                // risk::peg_usd_book_observation. Touches that may include
+                // our own offers are passed as 0, which makes it fall back
+                // to the mid observation.
+                const bool third_party = snap.touches_third_party;
+                const auto obs = risk::peg_usd_book_observation(
+                    a->observe_from,
                     static_cast<double>(snap.mid_price),
+                    third_party ? static_cast<double>(snap.best_bid) : 0.0,
+                    third_party ? static_cast<double>(snap.best_ask) : 0.0,
                     static_cast<double>(kMojosPerXch),
                     xch_base,
                     snap.mid_valuation_grade,
                     snap.bid_side_anchor_ok,
                     snap.ask_side_anchor_ok,
                     usd_anchor,
-                    a->asset_id);
+                    a->asset_id,
+                    a->peg_target);
                 if (!obs) {
                     // [review round 8] THE CIRCULAR REASON BELONGS IN THIS
                     // LINE. peg_usd_observation checks circularity FIRST, so

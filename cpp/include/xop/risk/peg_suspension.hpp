@@ -31,6 +31,7 @@
 #ifndef XOP_RISK_PEG_SUSPENSION_HPP
 #define XOP_RISK_PEG_SUSPENSION_HPP
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <functional>
@@ -38,6 +39,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include "xop/peg_registry.hpp"
 
 namespace xop::risk {
 
@@ -612,6 +615,109 @@ using XchAnchorPrice =
     if (!std::isfinite(usd) || !(usd > 0.0)) {
         return std::nullopt;
     }
+    return usd;
+}
+
+// ---------------------------------------------------------------------------
+// book_price_nearest -- the price inside a two-sided book nearest `target`.
+//
+// [PEGEDGE 2026-10-16] A two-sided book says the price lies somewhere in
+// [best_bid, best_ask] and nothing more precise. So the price in that range
+// nearest a target is `target` itself when the book straddles it, and the
+// nearer edge when it does not.
+//
+// nullopt unless the book is two-sided and uncrossed (0 < bid < ask, both
+// finite) and `target` is positive and finite. Units are whatever the caller
+// passes, as long as all three agree.
+// ---------------------------------------------------------------------------
+[[nodiscard]] inline std::optional<double> book_price_nearest(
+    double target, double best_bid, double best_ask) noexcept
+{
+    if (!(target > 0.0) || !std::isfinite(target)) return std::nullopt;
+    if (!(best_bid > 0.0) || !std::isfinite(best_bid)) return std::nullopt;
+    if (!(best_ask > best_bid) || !std::isfinite(best_ask)) {
+        return std::nullopt;
+    }
+    return std::clamp(target, best_bid, best_ask);
+}
+
+// ---------------------------------------------------------------------------
+// peg_usd_book_observation -- peg_usd_observation, judged at the book edge
+// nearest par instead of at the published mid.
+//
+// [PEGEDGE 2026-10-16] WHY. The published mid is the mean of the two touches
+// (blended with the CEX leg on XCH/wUSDC.b), so ONE far-off offer moves it
+// however healthy the rest of the book is. On 2026-10-15 XCH/wUSDC.b held:
+//
+//   CEX XCH = $1.54   best bid 1.584   best ask 2.000 (a single offer)
+//   published mid 1.718  ->  wUSDC.b = 1.54 / 1.718 = $0.896, 10.4% off
+//
+// That was past bail_pct for 30 observations, so wUSDC.b's par was
+// suspended and XCH/wUSDC.b and BYC/wUSDC.b stopped quoting. But someone was
+// bidding 1.584 wUSDC.b per XCH, which prices wUSDC.b at $0.972, inside
+// bail. A book can only CONFIRM a depeg when no price on it is consistent
+// with par, so this judges the price in [bid, ask] nearest par.
+//
+// The side-quality screen did not catch it, and is the wrong place to: the
+// ask was 1.30x the anchor, inside book_side_anchor_band_ratio (3.0), and
+// the 2,324 bps spread was inside book_side_agree_max_spread_bps (5,000).
+// Those knobs also steer quoting on every pair, so tightening them to fix a
+// peg watcher would retune trading.
+//
+// WHAT IT DOES NOT WEAKEN.
+//   * Every refusal in peg_usd_observation still runs first, unchanged:
+//     circular anchor, degenerate inputs, ungraded mid, a disqualified side.
+//     A refusal still holds the streak.
+//   * A real depeg moves the whole book: holders exit by lifting XCH asks
+//     and bidding XCH up, so the near edge follows the price. Only the
+//     distance between the near edge and the mid is lost, at most half the
+//     book's spread, which is small on any book tight enough to trust.
+//   * On a tight book this reads a real depeg MORE fully than the mid did:
+//     the edge carries no CEX blend, so the attenuation documented on
+//     peg_usd_observation (a true $0.90 reading as $0.9278) does not apply.
+//   * A one-sided or crossed book has no range to judge, so it falls back
+//     to the mid observation exactly as before.
+//
+// @param from          PeggedAsset::observe_from. Mid returns exactly
+//                      peg_usd_observation's value.
+// @param scaled_best_bid / scaled_best_ask  MarketSnapshot::best_bid /
+//                      best_ask (the DEX touches), mojo-scaled like the mid.
+// @param peg_target    PeggedAsset::peg_target -- the same value the caller
+//                      passes observe_peg, so "nearest par" means nearest
+//                      the value the observation is judged against.
+// Other parameters as peg_usd_observation.
+// ---------------------------------------------------------------------------
+[[nodiscard]] inline std::optional<double> peg_usd_book_observation(
+    PegObserveFrom         from,
+    double                 scaled_mid,
+    double                 scaled_best_bid,
+    double                 scaled_best_ask,
+    double                 scale,
+    bool                   xch_base,
+    bool                   mid_valuation_grade,
+    bool                   bid_side_ok,
+    bool                   ask_side_ok,
+    const XchUsdAnchor&    anchor,
+    std::string_view       judged_asset_id,
+    double                 peg_target) noexcept
+{
+    const auto mid_obs = peg_usd_observation(
+        scaled_mid, scale, xch_base, mid_valuation_grade,
+        bid_side_ok, ask_side_ok, anchor, judged_asset_id);
+    if (!mid_obs || from == PegObserveFrom::Mid) return mid_obs;
+    if (!(peg_target > 0.0) || !std::isfinite(peg_target)) return mid_obs;
+
+    // peg_usd_observation has already checked anchor.usd and scale.
+    const double usd_per_xch = anchor.usd;
+    // The pair price at which the asset would be worth exactly peg_target.
+    const double par_px = xch_base ? usd_per_xch / peg_target
+                                   : peg_target / usd_per_xch;
+    const auto px = book_price_nearest(par_px,
+                                       scaled_best_bid / scale,
+                                       scaled_best_ask / scale);
+    if (!px) return mid_obs;
+    const double usd = xch_base ? usd_per_xch / *px : usd_per_xch * *px;
+    if (!std::isfinite(usd) || !(usd > 0.0)) return mid_obs;
     return usd;
 }
 
