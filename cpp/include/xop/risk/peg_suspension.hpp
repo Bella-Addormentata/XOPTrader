@@ -642,6 +642,44 @@ using XchAnchorPrice =
 }
 
 // ---------------------------------------------------------------------------
+// implied_wrapper_usd -- the alert-only "wUSDC.b/implied" peg signal.
+//
+// implied = usd(XCH) / dex(XCH per wrapper). The engine used to write it as
+// usdc * (cex_mid / dex) with cex_mid = usd(XCH) / usdc, which is the same
+// number: the native-USDC price cancels.
+//
+// [PEGEDGE 2026-10-16] dex is the third-party book price nearest DOLLAR par
+// -- the pair price at which the wrapper is worth exactly $1, which is
+// usd(XCH) -- rather than the published mid. Not nearest cex_mid: that is
+// par against NATIVE USDC, and when USDC itself is off $1 (XCH $1.54, USDC
+// $0.95, book 1.46 / 1.65) it picks 1.621 and reports $0.95 for a book that
+// straddles $1.
+//
+// Falls back to dex_mid when the book is not two-sided (pass 0 touches for
+// a book that may include our own offers). nullopt on unusable inputs.
+// ---------------------------------------------------------------------------
+struct ImpliedWrapperUsd {
+    double usd{0.0};            ///< implied USD value of one wrapper unit
+    double dex_px{0.0};         ///< the dex price it was computed from
+    bool   at_book_edge{false}; ///< false: dex_px is the published mid
+};
+
+[[nodiscard]] inline std::optional<ImpliedWrapperUsd> implied_wrapper_usd(
+    double xch_usd, double dex_mid, double best_bid, double best_ask) noexcept
+{
+    if (!(xch_usd > 0.0) || !std::isfinite(xch_usd)) return std::nullopt;
+    if (!(dex_mid > 0.0) || !std::isfinite(dex_mid)) return std::nullopt;
+    ImpliedWrapperUsd out{0.0, dex_mid, false};
+    if (const auto edge = book_price_nearest(xch_usd, best_bid, best_ask)) {
+        out.dex_px       = *edge;
+        out.at_book_edge = true;
+    }
+    out.usd = xch_usd / out.dex_px;
+    if (!std::isfinite(out.usd) || !(out.usd > 0.0)) return std::nullopt;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
 // peg_usd_book_observation -- peg_usd_observation, judged at the book edge
 // nearest par instead of at the published mid.
 //

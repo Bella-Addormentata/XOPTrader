@@ -20765,32 +20765,28 @@ void Engine::step_check_stablecoin_peg([[maybe_unused]] BlockHeight block_height
         if (dex_mid > 0.0) {
             const double cex_mid = xch_it->second / usdc_it->second;
             // [PEGEDGE 2026-10-16] Judge the third-party book price nearest
-            // the CEX price, not the mid, for the reason given on
+            // dollar par, not the mid, for the reason given on
             // risk::peg_usd_book_observation: on 2026-10-15 a lone 2.000
             // ask beside a 1.584 bid read here as "implied wUSDC.b = $0.913"
             // and raised a CRITICAL depeg alert while wUSDC.b was at par.
-            // Falls back to the mid when the book is one-sided, crossed, or
-            // may include our own offers.
-            double dex_px = dex_mid;
-            const char* dex_src = "mid";
+            // Touches that may include our own offers are passed as 0, which
+            // falls back to the mid. See risk::implied_wrapper_usd.
             const auto snap = state_->get_market("XCH/wUSDC.b");
-            if (snap.touches_third_party) {
-                const double scale = static_cast<double>(kMojosPerXch);
-                if (const auto edge = risk::book_price_nearest(
-                        cex_mid,
-                        static_cast<double>(snap.best_bid) / scale,
-                        static_cast<double>(snap.best_ask) / scale)) {
-                    dex_px  = *edge;
-                    dex_src = "book edge";
-                }
+            const double scale = static_cast<double>(kMojosPerXch);
+            const bool third_party = snap.touches_third_party;
+            const auto obs = risk::implied_wrapper_usd(
+                xch_it->second, dex_mid,
+                third_party ? static_cast<double>(snap.best_bid) / scale : 0.0,
+                third_party ? static_cast<double>(snap.best_ask) / scale : 0.0);
+            if (obs) {
+                const double dev = std::abs(obs->usd - 1.0) * 100.0;
+                score("wUSDC.b/implied", dev, acc.peg_implied_warn_pct,
+                      "implied wUSDC.b = $" + std::to_string(obs->usd)
+                      + " (dex " + std::to_string(obs->dex_px)
+                      + (obs->at_book_edge ? " book edge" : " mid")
+                      + ", mid " + std::to_string(dex_mid)
+                      + " vs cex " + std::to_string(cex_mid) + ")");
             }
-            const double implied = usdc_it->second * (cex_mid / dex_px);
-            const double dev     = std::abs(implied - 1.0) * 100.0;
-            score("wUSDC.b/implied", dev, acc.peg_implied_warn_pct,
-                  "implied wUSDC.b = $" + std::to_string(implied)
-                  + " (dex " + std::to_string(dex_px) + " " + dex_src
-                  + ", mid " + std::to_string(dex_mid)
-                  + " vs cex " + std::to_string(cex_mid) + ")");
         }
     }
 }

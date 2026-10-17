@@ -1064,3 +1064,61 @@ TEST(BookPriceNearest, RefusesAnythingButATwoSidedBook)
     EXPECT_FALSE(book_price_nearest(0.0, 1.5, 2.0).has_value());
     EXPECT_FALSE(book_price_nearest(nan, 1.5, 2.0).has_value());
 }
+
+// The alert-only "wUSDC.b/implied" signal.
+
+TEST(ImpliedWrapperUsd, TheOct15BookReadsAtTheBidNotTheMid)
+{
+    const auto obs = xop::risk::implied_wrapper_usd(
+        kOct15UsdXch, /*dex_mid=*/1.741, kOct15Bid, kOct15Ask);
+    ASSERT_TRUE(obs.has_value());
+    EXPECT_TRUE(obs->at_book_edge);
+    EXPECT_DOUBLE_EQ(obs->dex_px, kOct15Bid);
+    EXPECT_NEAR(obs->usd, kOct15UsdXch / kOct15Bid, 1e-12);
+}
+
+TEST(ImpliedWrapperUsd, ABookStraddlingDollarParReadsParWhateverUsdcIsWorth)
+{
+    // [review, PR #177] XCH $1.54 with native USDC at $0.95, so XCH is
+    // 1.621 USDC on the CEX. The 1.46 / 1.65 book contains 1.54, the price
+    // at which wUSDC.b is worth exactly $1. Clamping toward the USDC price
+    // (1.621) instead read $0.95 -- a false wrapper depeg caused by USDC.
+    const auto obs = xop::risk::implied_wrapper_usd(
+        /*xch_usd=*/1.54, /*dex_mid=*/1.555, 1.46, 1.65);
+    ASSERT_TRUE(obs.has_value());
+    EXPECT_TRUE(obs->at_book_edge);
+    EXPECT_DOUBLE_EQ(obs->dex_px, 1.54);
+    EXPECT_DOUBLE_EQ(obs->usd, 1.0);
+}
+
+TEST(ImpliedWrapperUsd, MatchesTheOldFormulaOnTheMid)
+{
+    // usdc * (cex_mid / dex) with cex_mid = xch / usdc is xch / dex.
+    constexpr double xch = 1.54;
+    constexpr double usdc = 0.95;
+    constexpr double dex = 1.70;
+    const auto obs = xop::risk::implied_wrapper_usd(xch, dex, 0.0, 0.0);
+    ASSERT_TRUE(obs.has_value());
+    EXPECT_FALSE(obs->at_book_edge);
+    EXPECT_NEAR(obs->usd, usdc * ((xch / usdc) / dex), 1e-12);
+}
+
+TEST(ImpliedWrapperUsd, FallsBackToTheMidWithoutATwoSidedBook)
+{
+    for (const auto& [bid, ask] : std::vector<std::pair<double, double>>{
+             {0.0, 2.0}, {1.584, 0.0}, {2.0, 1.584}, {0.0, 0.0}}) {
+        const auto obs = xop::risk::implied_wrapper_usd(1.54, 1.741, bid, ask);
+        ASSERT_TRUE(obs.has_value()) << bid << " / " << ask;
+        EXPECT_FALSE(obs->at_book_edge) << bid << " / " << ask;
+        EXPECT_DOUBLE_EQ(obs->dex_px, 1.741);
+    }
+}
+
+TEST(ImpliedWrapperUsd, UnusableInputsYieldNothing)
+{
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    EXPECT_FALSE(xop::risk::implied_wrapper_usd(0.0, 1.7, 1.5, 2.0));
+    EXPECT_FALSE(xop::risk::implied_wrapper_usd(nan, 1.7, 1.5, 2.0));
+    EXPECT_FALSE(xop::risk::implied_wrapper_usd(1.54, 0.0, 1.5, 2.0));
+    EXPECT_FALSE(xop::risk::implied_wrapper_usd(1.54, nan, 1.5, 2.0));
+}
