@@ -601,6 +601,22 @@ PegRegistry parse_pegged_assets(const YAML::Node& root)
         if (item["prefer_market_cross"]) {
             a.prefer_market_cross = item["prefer_market_cross"].as<bool>();
         }
+        // [PEGEDGE 2026-10-16] Absent -> book_edge (PeggedAsset's default).
+        // An unrecognised value is an error rather than a silent fallback:
+        // a typo here would otherwise pick the watcher's behaviour for the
+        // operator.
+        if (item["observe_from"]) {
+            const std::string from = item["observe_from"].as<std::string>();
+            if (from == "book_edge") {
+                a.observe_from = PegObserveFrom::BookEdge;
+            } else if (from == "mid") {
+                a.observe_from = PegObserveFrom::Mid;
+            } else {
+                throw ConfigError(
+                    "pegged_assets: observe_from '" + from
+                    + "' must be 'book_edge' or 'mid'");
+            }
+        }
         // [review 2026-08-28, CORRECTED 2026-09-12] This block used to warn
         // at startup that these three were "NOT YET WIRED to a detector".
         // That was written one day before the wiring landed (comment cc5a62f

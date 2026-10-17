@@ -16,6 +16,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 using xop::risk::PegObservation;
@@ -839,4 +840,285 @@ TEST(SelectXchUsdAnchor, NoCandidatesAndNoFeedIsUnknownRatherThanAGuess)
     const auto no_pricer = xop::risk::select_xch_usd_anchor(
         false, 0.0, shipped_candidates(), nullptr);
     EXPECT_EQ(no_pricer.kind, XchAnchorKind::None);
+}
+
+// ===========================================================================
+// [PEGEDGE 2026-10-16] peg_usd_book_observation -- the peg is judged at the
+// book price nearest par, not at the published mid.
+//
+// The live case: at 00:32 CDT on 2026-10-15 XCH/wUSDC.b held a 1.584 bid and
+// a single 2.000 ask against a $1.54 CEX price. The published mid priced
+// wUSDC.b at $0.8964 (10.4% off) for 30 observations and suspended it, and
+// both of its pairs stayed off for a day and a half while the bid priced it
+// at $0.972.
+// ===========================================================================
+
+namespace {
+
+using xop::PegObserveFrom;
+
+constexpr double kOct15UsdXch = 1.54;
+constexpr double kOct15Bid    = 1.584;
+constexpr double kOct15Ask    = 2.000;
+// The published mid behind the PEGSUSPEND line: 1.54 / 0.8964.
+constexpr double kOct15Mid    = 1.718;
+constexpr XchUsdAnchor kOct15Anchor{kOct15UsdXch,
+                                    XchAnchorKind::ExternalFeed, {}};
+
+// XCH/wUSDC.b (xch_base), graded, both sides in band, par $1.00.
+std::optional<double> wusdcb_obs(PegObserveFrom from, double mid, double bid,
+                                 double ask,
+                                 const XchUsdAnchor& anchor = kOct15Anchor)
+{
+    return xop::risk::peg_usd_book_observation(
+        from, mid * kScale, bid * kScale, ask * kScale, kScale,
+        /*xch_base=*/true, /*mid_valuation_grade=*/true,
+        /*bid_side_ok=*/true, /*ask_side_ok=*/true, anchor, kWusdcB,
+        /*peg_target=*/1.0);
+}
+
+// Feeds `obs` to observe_peg `n` times with wUSDC.b's shipped thresholds;
+// true if it suspended.
+bool suspends(double obs, int n)
+{
+    xop::risk::PegRuntime rt{};
+    for (int i = 0; i < n; ++i) {
+        if (xop::risk::observe_peg(rt, obs, 1.0, /*bail_pct=*/10.0,
+                                   /*warn_pct=*/2.0,
+                                   /*sustained_observations=*/30,
+                                   1000u + static_cast<std::uint32_t>(i))
+            == xop::risk::PegObservation::JustSuspended) {
+            return true;
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
+TEST(PegBookObservation, TheOct15BookReadsInsideBailAtTheBookEdge)
+{
+    const auto mid = wusdcb_obs(PegObserveFrom::Mid,
+                                kOct15Mid, kOct15Bid, kOct15Ask);
+    ASSERT_TRUE(mid.has_value());
+    EXPECT_NEAR(*mid, 0.8964, 1e-4)
+        << "precondition: Mid reproduces the observation that suspended";
+
+    const auto edge = wusdcb_obs(PegObserveFrom::BookEdge,
+                                 kOct15Mid, kOct15Bid, kOct15Ask);
+    ASSERT_TRUE(edge.has_value());
+    EXPECT_NEAR(*edge, kOct15UsdXch / kOct15Bid, 1e-12)
+        << "par (1.54) sits below the book, so the bid is the nearest price";
+    EXPECT_NEAR(*edge, 0.9722, 1e-4);
+}
+
+TEST(PegBookObservation, TheOct15BookSuspendsOnlyFromTheMid)
+{
+    const auto mid = wusdcb_obs(PegObserveFrom::Mid,
+                                kOct15Mid, kOct15Bid, kOct15Ask);
+    const auto edge = wusdcb_obs(PegObserveFrom::BookEdge,
+                                 kOct15Mid, kOct15Bid, kOct15Ask);
+    ASSERT_TRUE(mid.has_value());
+    ASSERT_TRUE(edge.has_value());
+    EXPECT_TRUE(suspends(*mid, 40))
+        << "the counterfactual: the mid observation latches a depeg";
+    EXPECT_FALSE(suspends(*edge, 120))
+        << "the same book read at its edge must never suspend";
+}
+
+TEST(PegBookObservation, ABookThatStraddlesParReadsExactlyPar)
+{
+    // 2026-10-16: CEX $1.59 now sits INSIDE the same 1.584 / 2.000 book.
+    const XchUsdAnchor anchor{1.59, XchAnchorKind::ExternalFeed, {}};
+    const auto edge = wusdcb_obs(PegObserveFrom::BookEdge,
+                                 1.741, kOct15Bid, kOct15Ask, anchor);
+    ASSERT_TRUE(edge.has_value());
+    EXPECT_DOUBLE_EQ(*edge, 1.0)
+        << "a book with par inside it cannot evidence any deviation";
+}
+
+TEST(PegBookObservation, ARealDepegOnATightBookIsStillDetected)
+{
+    // wUSDC.b genuinely at $0.85: XCH costs 1.54 / 0.85 = 1.812 wUSDC.b and
+    // the whole book has moved there.
+    constexpr double bid = 1.800;
+    constexpr double ask = 1.830;
+    // The published mid blends the CEX leg in at 0.30.
+    constexpr double published_mid = 0.7 * ((bid + ask) / 2.0) + 0.3 * 1.54;
+
+    const auto edge = wusdcb_obs(PegObserveFrom::BookEdge,
+                                 published_mid, bid, ask);
+    const auto mid = wusdcb_obs(PegObserveFrom::Mid, published_mid, bid, ask);
+    ASSERT_TRUE(edge.has_value());
+    ASSERT_TRUE(mid.has_value());
+    EXPECT_NEAR(*edge, kOct15UsdXch / bid, 1e-12);
+    EXPECT_LT(*edge, 0.90) << "more than 10% off: a real depeg";
+    EXPECT_TRUE(suspends(*edge, 40));
+    EXPECT_LT(*edge, *mid)
+        << "the edge carries no CEX blend, so it reads a real depeg MORE "
+           "fully than the attenuated mid does";
+}
+
+TEST(PegBookObservation, APremiumIsJudgedAtTheAsk)
+{
+    // The wrapper above par: XCH cheaper in it than on the CEX, so the
+    // whole book sits below par price and the ask is the nearer edge.
+    const auto edge = wusdcb_obs(PegObserveFrom::BookEdge, 1.33, 1.30, 1.35);
+    ASSERT_TRUE(edge.has_value());
+    EXPECT_NEAR(*edge, kOct15UsdXch / 1.35, 1e-12);
+    EXPECT_GT(*edge, 1.0);
+}
+
+TEST(PegBookObservation, XchQuoteOrientationJudgesTheSameWay)
+{
+    // <asset>/XCH: price is XCH per asset, so par price is 1 / usd_per_xch
+    // = 0.6993 and the USD value is the product.
+    auto obs = [](double mid, double bid, double ask) {
+        return xop::risk::peg_usd_book_observation(
+            PegObserveFrom::BookEdge, mid * kScale, bid * kScale,
+            ask * kScale, kScale, /*xch_base=*/false, true, true, true,
+            kExternalAnchor, kByc, 1.0);
+    };
+    const auto straddle = obs(0.70, 0.60, 0.80);
+    ASSERT_TRUE(straddle.has_value());
+    EXPECT_NEAR(*straddle, 1.0, 1e-12);
+
+    const auto above = obs(0.80, 0.75, 0.85);
+    ASSERT_TRUE(above.has_value());
+    EXPECT_NEAR(*above, kUsdXch * 0.75, 1e-12)
+        << "the book sits above par price, so the bid is nearest";
+}
+
+TEST(PegBookObservation, WithoutATwoSidedBookItFallsBackToTheMid)
+{
+    const auto mid = wusdcb_obs(PegObserveFrom::Mid,
+                                kOct15Mid, kOct15Bid, kOct15Ask);
+    ASSERT_TRUE(mid.has_value());
+    // One-sided either way, crossed, locked, and the zeros the engine
+    // passes for touches that may include our own offers.
+    const std::vector<std::pair<double, double>> books{
+        {0.0, kOct15Ask}, {kOct15Bid, 0.0}, {2.0, 1.584},
+        {1.584, 1.584}, {0.0, 0.0}};
+    for (const auto& [bid, ask] : books) {
+        const auto edge = wusdcb_obs(PegObserveFrom::BookEdge,
+                                     kOct15Mid, bid, ask);
+        ASSERT_TRUE(edge.has_value()) << bid << " / " << ask;
+        EXPECT_DOUBLE_EQ(*edge, *mid) << bid << " / " << ask;
+    }
+}
+
+TEST(PegBookObservation, MidModeIsExactlyTheOldObservation)
+{
+    const auto old_obs = xop::risk::peg_usd_observation(
+        kOct15Mid * kScale, kScale, true, true, true, true,
+        kOct15Anchor, kWusdcB);
+    const auto mid = wusdcb_obs(PegObserveFrom::Mid,
+                                kOct15Mid, kOct15Bid, kOct15Ask);
+    ASSERT_TRUE(old_obs.has_value());
+    ASSERT_TRUE(mid.has_value());
+    EXPECT_DOUBLE_EQ(*mid, *old_obs);
+}
+
+TEST(PegBookObservation, EveryRefusalStillRefuses)
+{
+    auto obs = [](bool grade, bool bid_ok, bool ask_ok,
+                  const XchUsdAnchor& anchor) {
+        return xop::risk::peg_usd_book_observation(
+            PegObserveFrom::BookEdge, kOct15Mid * kScale, kOct15Bid * kScale,
+            kOct15Ask * kScale, kScale, true, grade, bid_ok, ask_ok, anchor,
+            kWusdcB, 1.0);
+    };
+    EXPECT_FALSE(obs(false, true, true, kOct15Anchor).has_value())
+        << "an ungraded mid refuses even with a good book behind it";
+    EXPECT_FALSE(obs(true, false, true, kOct15Anchor).has_value());
+    EXPECT_FALSE(obs(true, true, false, kOct15Anchor).has_value());
+    EXPECT_FALSE(obs(true, true, true,
+                     XchUsdAnchor{1.54, XchAnchorKind::DeclaredParCross,
+                                  kWusdcB}).has_value())
+        << "a circular anchor refuses before any book price is read";
+    EXPECT_FALSE(obs(true, true, true,
+                     XchUsdAnchor{0.0, XchAnchorKind::None, {}})
+                     .has_value());
+}
+
+TEST(BookPriceNearest, ClampsIntoTheBook)
+{
+    using xop::risk::book_price_nearest;
+    EXPECT_DOUBLE_EQ(book_price_nearest(1.7, 1.5, 2.0).value(), 1.7);
+    EXPECT_DOUBLE_EQ(book_price_nearest(1.2, 1.5, 2.0).value(), 1.5);
+    EXPECT_DOUBLE_EQ(book_price_nearest(2.5, 1.5, 2.0).value(), 2.0);
+    EXPECT_DOUBLE_EQ(book_price_nearest(1.5, 1.5, 2.0).value(), 1.5);
+}
+
+TEST(BookPriceNearest, RefusesAnythingButATwoSidedBook)
+{
+    using xop::risk::book_price_nearest;
+    const double inf = std::numeric_limits<double>::infinity();
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    EXPECT_FALSE(book_price_nearest(1.7, 0.0, 2.0).has_value());
+    EXPECT_FALSE(book_price_nearest(1.7, 1.5, 0.0).has_value());
+    EXPECT_FALSE(book_price_nearest(1.7, 2.0, 1.5).has_value());
+    EXPECT_FALSE(book_price_nearest(1.7, 1.5, 1.5).has_value());
+    EXPECT_FALSE(book_price_nearest(1.7, 1.5, inf).has_value());
+    EXPECT_FALSE(book_price_nearest(1.7, nan, 2.0).has_value());
+    EXPECT_FALSE(book_price_nearest(0.0, 1.5, 2.0).has_value());
+    EXPECT_FALSE(book_price_nearest(nan, 1.5, 2.0).has_value());
+}
+
+// The alert-only "wUSDC.b/implied" signal.
+
+TEST(ImpliedWrapperUsd, TheOct15BookReadsAtTheBidNotTheMid)
+{
+    const auto obs = xop::risk::implied_wrapper_usd(
+        kOct15UsdXch, /*dex_mid=*/1.741, kOct15Bid, kOct15Ask);
+    ASSERT_TRUE(obs.has_value());
+    EXPECT_TRUE(obs->at_book_edge);
+    EXPECT_DOUBLE_EQ(obs->dex_px, kOct15Bid);
+    EXPECT_NEAR(obs->usd, kOct15UsdXch / kOct15Bid, 1e-12);
+}
+
+TEST(ImpliedWrapperUsd, ABookStraddlingDollarParReadsParWhateverUsdcIsWorth)
+{
+    // [review, PR #177] XCH $1.54 with native USDC at $0.95, so XCH is
+    // 1.621 USDC on the CEX. The 1.46 / 1.65 book contains 1.54, the price
+    // at which wUSDC.b is worth exactly $1. Clamping toward the USDC price
+    // (1.621) instead read $0.95 -- a false wrapper depeg caused by USDC.
+    const auto obs = xop::risk::implied_wrapper_usd(
+        /*xch_usd=*/1.54, /*dex_mid=*/1.555, 1.46, 1.65);
+    ASSERT_TRUE(obs.has_value());
+    EXPECT_TRUE(obs->at_book_edge);
+    EXPECT_DOUBLE_EQ(obs->dex_px, 1.54);
+    EXPECT_DOUBLE_EQ(obs->usd, 1.0);
+}
+
+TEST(ImpliedWrapperUsd, MatchesTheOldFormulaOnTheMid)
+{
+    // usdc * (cex_mid / dex) with cex_mid = xch / usdc is xch / dex.
+    constexpr double xch = 1.54;
+    constexpr double usdc = 0.95;
+    constexpr double dex = 1.70;
+    const auto obs = xop::risk::implied_wrapper_usd(xch, dex, 0.0, 0.0);
+    ASSERT_TRUE(obs.has_value());
+    EXPECT_FALSE(obs->at_book_edge);
+    EXPECT_NEAR(obs->usd, usdc * ((xch / usdc) / dex), 1e-12);
+}
+
+TEST(ImpliedWrapperUsd, FallsBackToTheMidWithoutATwoSidedBook)
+{
+    for (const auto& [bid, ask] : std::vector<std::pair<double, double>>{
+             {0.0, 2.0}, {1.584, 0.0}, {2.0, 1.584}, {0.0, 0.0}}) {
+        const auto obs = xop::risk::implied_wrapper_usd(1.54, 1.741, bid, ask);
+        ASSERT_TRUE(obs.has_value()) << bid << " / " << ask;
+        EXPECT_FALSE(obs->at_book_edge) << bid << " / " << ask;
+        EXPECT_DOUBLE_EQ(obs->dex_px, 1.741);
+    }
+}
+
+TEST(ImpliedWrapperUsd, UnusableInputsYieldNothing)
+{
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    EXPECT_FALSE(xop::risk::implied_wrapper_usd(0.0, 1.7, 1.5, 2.0));
+    EXPECT_FALSE(xop::risk::implied_wrapper_usd(nan, 1.7, 1.5, 2.0));
+    EXPECT_FALSE(xop::risk::implied_wrapper_usd(1.54, 0.0, 1.5, 2.0));
+    EXPECT_FALSE(xop::risk::implied_wrapper_usd(1.54, nan, 1.5, 2.0));
 }

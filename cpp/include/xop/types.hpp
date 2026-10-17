@@ -411,6 +411,18 @@ struct MarketSnapshot {
     // it from the same struct guarantees they use the SAME number the
     // disqualification was computed from.
     Mojo         book_side_ref{0};
+
+    // [PEGEDGE 2026-10-16] best_bid/best_ask were written by the dust-
+    // filtered, third-party-only offers ingest (PairState::
+    // bbo_from_filtered_book) and that ingest ran within stale_threshold.
+    // The raw ticker that can overwrite them includes OUR OWN resting
+    // offers. The asset-level peg watcher judges the book edge only when
+    // this holds, so it never reads our own bid back as proof of par.
+    //
+    // Default FALSE, unlike the trust flags above: a hand-built snapshot
+    // falls back to the mid observation, which is the pre-PEGEDGE
+    // behaviour. MarketDataFeed::publish_snapshot always sets it.
+    bool         touches_third_party{false};
 };
 
 // ---------------------------------------------------------------------------

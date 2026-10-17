@@ -641,6 +641,11 @@ struct PairState {
     // get_fair_value_inputs() and refresh()'s published spread_bps.
     bool        bbo_from_filtered_book{false};
 
+    // [PEGEDGE 2026-10-16] bbo_from_filtered_book AND the filtered ingest
+    // ran within stale_threshold, evaluated in refresh() just before the
+    // publish. Published as MarketSnapshot::touches_third_party.
+    bool        touches_third_party{false};
+
     // [S20 2026-08-24] ...and whether that filtering ran against an
     // independent ANCHOR.  Provenance alone is not enough: on a process's
     // first cycle a pair anchored by CEX or AMM has no anchor yet at

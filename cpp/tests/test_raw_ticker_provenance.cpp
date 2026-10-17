@@ -42,6 +42,7 @@
 // every one of them reads through.
 // ---------------------------------------------------------------------------
 
+#include <chrono>
 #include <cmath>
 #include <string>
 #include <vector>
@@ -275,4 +276,83 @@ TEST(RawTickerProvenance, WithCompetitorTrackingOffNoSpreadIsPublished)
 
     ASSERT_GT(state.get_market(kPair).best_bid, 0);
     EXPECT_DOUBLE_EQ(feed.get_spread_bps(kPair), 0.0);
+}
+
+// ===========================================================================
+// Gate 3 -- [PEGEDGE 2026-10-16] MarketSnapshot::touches_third_party: the
+// asset-level peg watcher judges the book edge only when best_bid/best_ask
+// came from the filtered third-party book. A raw ticker includes our own
+// resting offers, and our own bid near par must never read as proof of par.
+// ===========================================================================
+
+TEST(RawTickerProvenance, AFilteredBookPublishesThirdPartyTouches)
+{
+    State state;
+    MarketDataFeed feed(provenance_cfg(), state);
+    feed.ingest_block_height(100);
+    ingest_filtered(feed);
+    feed.refresh({kPair});
+
+    const auto snap = state.get_market(kPair);
+    ASSERT_GT(snap.best_bid, 0);
+    EXPECT_TRUE(snap.touches_third_party);
+}
+
+TEST(RawTickerProvenance, ARawTickerBookPublishesNoThirdPartyTouches)
+{
+    State state;
+    MarketDataFeed feed(provenance_cfg(), state);
+    feed.ingest_block_height(100);
+    ingest_raw(feed);
+    feed.refresh({kPair});
+
+    const auto snap = state.get_market(kPair);
+    ASSERT_GT(snap.best_bid, 0)
+        << "precondition: the raw touches really are published";
+    EXPECT_FALSE(snap.touches_third_party)
+        << "the raw ticker includes our own offers";
+}
+
+TEST(RawTickerProvenance, ARawTickerIngestWithdrawsThirdPartyTouches)
+{
+    State state;
+    MarketDataFeed feed(provenance_cfg(), state);
+    feed.ingest_block_height(100);
+    ingest_filtered(feed);
+    feed.refresh({kPair});
+    ASSERT_TRUE(state.get_market(kPair).touches_third_party);
+
+    // The next heartbeat's offers fetch fails: only the ticker arrives.
+    ingest_raw(feed);
+    feed.refresh({kPair});
+    EXPECT_FALSE(state.get_market(kPair).touches_third_party);
+}
+
+TEST(RawTickerProvenance, AStaleFilteredBookPublishesNoThirdPartyTouches)
+{
+    MarketDataConfig cfg = provenance_cfg();
+    // Any filtered ingest is older than a negative threshold.
+    cfg.stale_threshold = std::chrono::minutes(-1);
+    State state;
+    MarketDataFeed feed(cfg, state);
+    feed.ingest_block_height(100);
+    ingest_filtered(feed);
+    feed.refresh({kPair});
+
+    EXPECT_FALSE(state.get_market(kPair).touches_third_party)
+        << "offers last seen longer ago than stale_threshold may be gone";
+}
+
+TEST(RawTickerProvenance, WithCompetitorTrackingOffNoTouchesAreThirdParty)
+{
+    MarketDataConfig cfg = provenance_cfg();
+    cfg.enable_competitor_tracking = false;
+    State state;
+    MarketDataFeed feed(cfg, state);
+    feed.ingest_block_height(100);
+    ingest_raw(feed);
+    ingest_filtered(feed);   // a no-op with tracking off
+    feed.refresh({kPair});
+
+    EXPECT_FALSE(state.get_market(kPair).touches_third_party);
 }
