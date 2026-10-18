@@ -5,6 +5,42 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.28] — 2026-10-18 — a peg judged at the book edge nearest par
+
+### One far-off offer can no longer suspend a pegged asset (#177)
+
+At 00:32 CDT on 2026-10-15 XCH/wUSDC.b held a 1.584 bid and a single 2.000
+ask while XCH was $1.54 on the CEX. The asset-level peg watcher priced
+wUSDC.b off the published mid (1.718), read it at $0.896 (10.4% off) for 30
+observations, suspended its par and switched off XCH/wUSDC.b and
+BYC/wUSDC.b for a day and a half. The bid alone priced wUSDC.b at $0.972,
+inside the 10% bail.
+
+The watcher now judges the third-party book price NEAREST par: a depeg
+suspends only when every executable price on the book is past bail_pct. A
+real depeg moves the whole book and is still caught, and on a tight book it
+reads more fully than before, because the book edge carries no CEX blend.
+
+- `risk::peg_usd_book_observation` runs every existing refusal first
+  (circular anchor, ungraded mid, disqualified side), then clamps the par
+  price into `[best_bid, best_ask]`. A one-sided or crossed book falls back
+  to the mid.
+- The feed publishes `MarketSnapshot::touches_third_party` (filtered
+  third-party book, ingested within `stale_threshold`). Touches that may
+  include our own offers fall back to the mid, so our own bid is never read
+  as proof of par.
+- The alert-only `wUSDC.b/implied` watch, which raised a false CRITICAL
+  depeg alert on the same book, now judges the book edge nearest dollar par
+  (`risk::implied_wrapper_usd`), not USDC par.
+
+### Operator notes
+
+- New per-asset key `pegged_assets[].observe_from`: `book_edge` (default)
+  or `mid`. The default applies to existing configs with no key; `mid`
+  restores the previous behaviour. An unknown value is a config error.
+- A peg suspension is held in memory, so starting this version clears one
+  latched by the old watcher. Re-enabling from the Depeg tab also works.
+
 ## [0.10.27] — 2026-10-14 — the bridge follows warp.green's new validator rules, and Target % edits that stay put
 
 ### The warp.green bridge matches the validators' rules (#174)
