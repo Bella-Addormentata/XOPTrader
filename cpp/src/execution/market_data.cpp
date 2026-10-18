@@ -475,6 +475,15 @@ void MarketDataFeed::refresh(const std::vector<std::string>& enabled_pairs) {
         }
 
         // Step 9: Publish snapshot to shared State.
+        //
+        // [PEGEDGE 2026-10-16] Provenance and recency of the touches, for
+        // the peg watcher. Deliberately NOT book_evidence_fresh(): that also
+        // requires the book to be MOVING, and a quiet book's resting offers
+        // are still executable. 2026-10-15's false depeg came from a book
+        // that sat at 1.584 / 2.000 for hours.
+        ps.touches_third_party = ps.bbo_from_filtered_book
+            && ps.ob_updated_at != Timestamp{}
+            && now - ps.ob_updated_at <= sweep_cfg.stale_threshold;
         publish_snapshot(ps);
 
         spdlog::debug("MarketDataFeed: pair={} mid={:.6f} spread={:.1f}bps "
@@ -2076,6 +2085,7 @@ void MarketDataFeed::publish_snapshot(const PairState& ps) {
     snap.bid_side_anchor_ok = ps.bid_side_anchor_ok;
     snap.ask_side_anchor_ok = ps.ask_side_anchor_ok;
     snap.book_side_ref      = to_mojos(ps.book_side_ref);
+    snap.touches_third_party = ps.touches_third_party;
 
     // Write to shared State (thread-safe; State::update_market acquires
     // its own internal mutex).

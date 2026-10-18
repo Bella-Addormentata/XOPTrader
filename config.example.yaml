@@ -141,6 +141,14 @@ pegged_assets:
   sustained_observations: 30
   prefer_market_cross: false
   enforce: true
+  # [2026-10-16] Which book price the peg watcher judges. book_edge (the
+  # default for every entry, so it applies even where this key is absent)
+  # judges the third-party book price NEAREST par: a depeg suspends only when
+  # every executable price is past bail_pct. `mid` judges the published
+  # midpoint, which one far-off offer can drag past bail on its own -- on
+  # 2026-10-15 a lone 2.000 ask beside a 1.584 bid read wUSDC.b as $0.896
+  # and suspended it while the bid priced it at $0.972.
+  observe_from: book_edge
 # The other two legacy wrappers.  No live pair quotes them today.  Declaring
 # them here is what gives them a PAR of exactly $1; the old hardcoded list
 # gave them that implicitly, and par is now declared, never assumed.

@@ -55,6 +55,16 @@
 
 namespace xop {
 
+/// Which price in a pair's DEX book the asset-level peg watcher judges.
+/// See PeggedAsset::observe_from.
+enum class PegObserveFrom : std::uint8_t {
+    /// The price inside [best bid, best ask] nearest the asset's par
+    /// price. The default.
+    BookEdge = 0,
+    /// The pair's published mid, as before 2026-10-16.
+    Mid,
+};
+
 /// An asset the operator has declared to be pegged, and to what.
 struct PeggedAsset {
     /// Canonical asset id (CAT tail hex, or "xch").  The identity that
@@ -129,6 +139,23 @@ struct PeggedAsset {
     ///
     /// Set false for wrappers, true for market-determined pegs.
     bool prefer_market_cross{false};
+
+    /// [PEGEDGE 2026-10-16] Which book price the peg watcher observes.
+    ///
+    /// BookEdge (config `book_edge`, the default): a two-sided book only
+    /// says the price lies somewhere in [best bid, best ask], so the
+    /// watcher judges the price in that range NEAREST par. A depeg is
+    /// confirmed only when every executable price on the book is past
+    /// bail_pct, not when one far-off offer drags the midpoint there.
+    ///
+    /// On 2026-10-15 XCH/wUSDC.b held a 1.584 bid and a lone 2.000 ask
+    /// against a 1.54 CEX price. The bid priced wUSDC.b at $0.972; the
+    /// published mid priced it at $0.896, 10.4% off, which suspended
+    /// wUSDC.b and switched off both of its pairs for a day and a half.
+    ///
+    /// Mid (config `mid`) restores the pre-2026-10-16 behaviour. A
+    /// one-sided or crossed book uses the published mid in either mode.
+    PegObserveFrom observe_from{PegObserveFrom::BookEdge};
 
     [[nodiscard]] bool is_coherent() const noexcept {
         // Finiteness is checked explicitly: +inf satisfies `> 0.0` and an
