@@ -78,6 +78,7 @@
 #include "xop/strategy/bbo_sanity.hpp"
 #include "xop/strategy/pace_controller.hpp"
 #include "xop/strategy/revive.hpp"
+#include "xop/strategy/synthetic_price.hpp"
 #include "xop/strategy/no_loss_floor.hpp"
 #include "xop/risk/usd_route.hpp"
 #include "xop/risk/inventory.hpp"
@@ -1280,6 +1281,19 @@ private:
     [[nodiscard]] bool pair_peg_suspended(const PairConfig& pc) const;
     asio::awaitable<void> step_observe_asset_pegs(BlockHeight block_height);
     asio::awaitable<void> step_revive_maintenance(BlockHeight block_height);
+
+    // [SYNTH 2026-10-22] Synthetic quoting price for revive pairs with an
+    // unlisted leg (xop/strategy/synthetic_price.hpp). refresh_synth_tape
+    // re-fetches one asset's Dexie <asset>_xch trade history when it is
+    // older than kSynthTapeRefresh; a failed fetch keeps the old trades.
+    // synth_asset_in_xch prices one leg in XCH from its CoinGecko listing
+    // and its tape; synth_pair_price crosses the legs and blends in the
+    // fair-value estimate and the pair's last synthetic price, aged.
+    asio::awaitable<void> refresh_synth_tape(const std::string& asset_id);
+    [[nodiscard]] std::optional<synth::PriceSource> synth_asset_in_xch(
+        const std::string& asset_id, const std::string& leg_symbol) const;
+    [[nodiscard]] std::optional<synth::PriceSource> synth_pair_price(
+        const PairConfig& pc);
     void check_peg_reenable_flag();
     void publish_peg_status();
 
@@ -2263,6 +2277,9 @@ private:
         // third-party book cannot price the pair by itself, so the revive
         // spread floor and size cap apply.
         bool          revive_thin{false};
+        // [SYNTH 2026-10-22] The error bar (bps) of the synthetic quoting
+        // price published for this pair in Step 1; 0 when none was.
+        double        revive_synth_sigma_bps{0.0};
 
         // [2026-09-02, review] The spread SpreadOptimizer::compute_spread()
         // produced, captured before Step 5's first adjustment site.
@@ -2454,6 +2471,18 @@ private:
     // maintenance pass (expired-offer retire, UTXO liberation, pace caps,
     // reconciliation), which the guard keeps off for everything else.
     std::optional<std::unordered_set<std::string>> step8_pair_filter_;
+
+    // [SYNTH 2026-10-22] Per-asset Dexie trade history (keyed by asset id)
+    // and each revive pair's last synthetic price with when it was made.
+    // In memory: they rebuild from Dexie and the solve after a restart.
+    struct SynthTape {
+        std::vector<synth::TapeTrade>         trades;
+        std::chrono::steady_clock::time_point fetched_at{};
+    };
+    std::unordered_map<std::string, SynthTape> synth_tapes_;
+    std::unordered_map<std::string,
+        std::pair<synth::PriceSource, std::chrono::system_clock::time_point>>
+        synth_last_good_;
 
     // XCH Recovery Mode -- entered when XCH spendable drops below threshold.
     // While active: offers cancelled, Steps 7-8 skipped, engine scans for

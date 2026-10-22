@@ -318,7 +318,7 @@ def test_the_indicator_stays_proportionate_to_the_text(app):
     assert bare.sizeHint().height() <= _text_height() + 2
 
 
-def test_both_pairs_table_toggles_use_the_subclass():
+def test_every_pairs_table_toggle_uses_the_subclass():
     """A future unlabeled checkbox must not silently miss this."""
     from pathlib import Path
     source = Path(__file__).resolve().parent.parent.joinpath(
@@ -326,7 +326,8 @@ def test_both_pairs_table_toggles_use_the_subclass():
     assert "QCheckBox()" not in source, (
         "a bare unlabeled QCheckBox in settings.py has no enlarged hit target"
     )
-    assert source.count("HitTargetCheckBox()") == 2
+    # Enabled, Revive and (2026-10-22) Peg guard.
+    assert source.count("HitTargetCheckBox()") == 3
 
 
 def test_the_row_probe_measures_the_style_production_uses(app):

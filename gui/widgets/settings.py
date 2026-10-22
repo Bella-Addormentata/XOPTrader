@@ -762,12 +762,12 @@ class SettingsWidget(QWidget):
         layout.addLayout(toolbar)
 
         # -- Pairs table --
-        self._pairs_table = QTableWidget(0, 8)
+        self._pairs_table = QTableWidget(0, 9)
         self._pairs_table.setHorizontalHeaderLabels(
             [
                 "Enabled", "Name", "Base Asset", "Quote Asset",
                 "Ratio Target (%)", "Suggested (%)", "Revive",
-                "Actions",
+                "Peg guard", "Actions",
             ]
         )
         header = self._pairs_table.horizontalHeader()
@@ -779,6 +779,7 @@ class SettingsWidget(QWidget):
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(8, QHeaderView.ResizeMode.ResizeToContents)
         self._pairs_table.setAlternatingRowColors(True)
         self._pairs_table.setSelectionBehavior(
             QTableWidget.SelectionBehavior.SelectRows
@@ -2840,6 +2841,18 @@ class SettingsWidget(QWidget):
             else:
                 merged.pop("revive_market", None)
 
+            # [PEGGUARD 2026-10-22] On by default, so only an unticked box is
+            # written (peg_guard: false); a ticked one drops the key.
+            guard_container = self._pairs_table.cellWidget(row, 7)
+            guard_cb = (
+                guard_container.findChild(QCheckBox)
+                if guard_container else None
+            )
+            if guard_cb is not None and not guard_cb.isChecked():
+                merged["peg_guard"] = False
+            else:
+                merged.pop("peg_guard", None)
+
             # [RATIO-SOT] The Ratio Target column is saved to
             # strategy.ratio_target_by_pair (below, and in save_config), never
             # into the pair.  A retired pairs[].ratio_target_override key
@@ -3512,14 +3525,16 @@ class SettingsWidget(QWidget):
         revive_cb = HitTargetCheckBox()   # unlabeled, same reason
         revive_cb.setChecked(bool(pair.get("revive_market", False)))
         revive_cb.setToolTip(
-            "Revive a dead market: quote from the external fair-value "
-            "estimate even when every third-party offer is stale or "
-            "absent.  Without this, a pair whose book fails the 20% "
-            "sanity filter posts nothing.  Requires a live CoinGecko "
-            "price feed: the engine refuses to quote when no recent "
-            "successful CoinGecko fetch exists, and an AMM pool alone "
-            "does not satisfy that gate.  Requires an engine restart "
-            "to take effect."
+            "Revive a thin or dead market: keep quoting when the book is "
+            "empty or one-sided, inside the revive limits (minimum "
+            "spread, small offer size, daily loss budget), and keep "
+            "posting while another pair's flash crash pauses the rest.  "
+            "A coin with a CoinGecko listing is priced from it, and that "
+            "needs a recent successful CoinGecko fetch -- an AMM pool "
+            "alone does not satisfy that gate.  A coin without one (BYC) "
+            "gets a synthetic price from its Dexie trades, the engine's "
+            "estimate and its last known price, quoted wider the less "
+            "certain it is.  Requires an engine restart to take effect."
         )
         revive_cb.stateChanged.connect(lambda _s, ti=1: self._mark_dirty(ti))
         revive_container = QWidget()
@@ -3528,6 +3543,29 @@ class SettingsWidget(QWidget):
         revive_layout.setContentsMargins(0, 0, 0, 0)
         revive_layout.addWidget(revive_cb)
         self._pairs_table.setCellWidget(row, 6, revive_container)
+
+        # [PEGGUARD 2026-10-22] Per-pair peg guard, ticked by default.
+        # Unticking it lets a REVIVE pair keep quoting through a peg
+        # suspension or depeg bail-out; it has no effect unless Revive is
+        # also ticked, so the revive limits always cover such a pair.
+        guard_cb = HitTargetCheckBox()
+        guard_cb.setChecked(bool(pair.get("peg_guard", True)))
+        guard_cb.setToolTip(
+            "Peg guard: stop quoting this pair when a pegged coin in it "
+            "loses its peg.  Untick for a riskier revival attempt: the "
+            "pair then keeps quoting through a depeg, inside the revive "
+            "limits (spread floor, offer size, daily loss budget).  Only "
+            "takes effect when Revive is also ticked.  Depeg alerts "
+            "still fire and every other pair stays guarded.  Requires an "
+            "engine restart to take effect."
+        )
+        guard_cb.stateChanged.connect(lambda _s, ti=1: self._mark_dirty(ti))
+        guard_container = QWidget()
+        guard_layout = QHBoxLayout(guard_container)
+        guard_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        guard_layout.setContentsMargins(0, 0, 0, 0)
+        guard_layout.addWidget(guard_cb)
+        self._pairs_table.setCellWidget(row, 7, guard_container)
 
         # Action buttons.
         actions = QWidget()
@@ -3555,7 +3593,7 @@ class SettingsWidget(QWidget):
             )
         )
         actions_layout.addWidget(remove_btn)
-        self._pairs_table.setCellWidget(row, 7, actions)
+        self._pairs_table.setCellWidget(row, 8, actions)
 
     def _on_add_pair(self) -> None:
         """Open the Add Pair dialog and append the result to the table."""

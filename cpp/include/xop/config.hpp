@@ -293,6 +293,15 @@ struct PairConfig {
     // external estimate the pair still refuses to quote, flag or not.
     bool   revive_market{false};
 
+    // [PEGGUARD 2026-10-22] Per-pair "Peg guard" (GUI: Settings -> Trading
+    // Pairs). On by default. Off lets this pair keep quoting through an
+    // asset-level peg suspension and its own depeg bail-out -- but ONLY when
+    // revive_market is also on, so the revive spread floor, size cap and
+    // daily loss budget always cover it; with revive off it is ignored.
+    // Alerts still fire, every other pair touching the asset stays guarded,
+    // and accounting is unchanged.
+    bool   peg_guard{true};
+
     // -- Stablecoin peg configuration ---------------------------------------
     // When is_stablecoin is true, the depeg detector monitors this pair
     // and can flag it as suspected-failed, pulling all quotes.
@@ -310,6 +319,13 @@ struct PairConfig {
     bool   stablecoin_flat_sizing{false};    // Skip adverse-selection sizing.
     bool   stablecoin_skip_gap_aware{false}; // Skip gap-aware spacing.
 };
+
+/// [PEGGUARD 2026-10-22] True when the pair quotes through peg suspension
+/// and the depeg bail-out: its peg_guard is off AND revive_market is on, so
+/// the revive limits always cover it. With revive off the box is ignored.
+inline bool peg_guard_is_waived(const PairConfig& pc) {
+    return pc.revive_market && !pc.peg_guard;
+}
 
 /// Step 7's empty-book decision, factored out so it is unit-testable.
 ///

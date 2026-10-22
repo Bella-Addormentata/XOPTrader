@@ -593,6 +593,7 @@ struct PairState {
 
     // --- CEX reference ---
     double      cex_mid{0.0};       // CEX mid-price (0 if unavailable)
+    bool        cex_synthetic{false}; // [SYNTH] cex_mid is a revive synthetic price
     Timestamp   cex_updated_at{};   // When CEX data was last refreshed
 
     // --- Independent fair value (never derived from this pair's book) ---
@@ -847,10 +848,19 @@ public:
     /// @param observed_at  When the price was actually fetched.  Defaults to
     ///                     now() for callers that fetch synchronously at the
     ///                     call site; the engine passes its real fetch time.
+    ///
+    /// [SYNTH 2026-10-22] @param synthetic  True for a revive pair's
+    ///                     synthetic quoting price (Engine, Step 1). It is
+    ///                     blended into the published mid like any CEX leg,
+    ///                     so the pair can quote, but it is withheld from
+    ///                     everything that treats the CEX leg as independent
+    ///                     evidence: valuation grade, the mid gate's anchors,
+    ///                     the CEX-DEX arbitrage signal and get_cex_reference.
     void ingest_cex_reference(const std::string& pair_name,
                               double             cex_mid,
                               Timestamp          observed_at
-                                  = Timestamp::clock::now());
+                                  = Timestamp::clock::now(),
+                              bool               synthetic = false);
 
     /// Ingest the TibetSwap AMM implied mid-price for a pair.
     /// The implied price is computed from pool reserves: output_reserve / input_reserve.

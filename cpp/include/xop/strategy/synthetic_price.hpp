@@ -1,0 +1,198 @@
+#ifndef XOP_STRATEGY_SYNTHETIC_PRICE_HPP
+#define XOP_STRATEGY_SYNTHETIC_PRICE_HPP
+// ---------------------------------------------------------------------------
+// synthetic_price.hpp -- [SYNTH 2026-10-22] a quoting price for a
+// revive_market pair that has no external feed, built from whatever evidence
+// exists, with an honest error bar.
+//
+// WHY. revive_market used to need a CoinGecko listing for both legs. BYC has
+// none, so neither BYC pair could be revived, and a pair with no listing and
+// a thin book had no price at all. This builds one from:
+//
+//   * per-asset XCH prices -- each CAT's price in XCH from its CoinGecko
+//     listing (when it has one) and/or from Dexie's per-trade history of its
+//     <asset>_xch market (tape_source), carried forward with a growing error
+//     bar when the evidence goes quiet (aged_source); a pair's price is the
+//     cross of its two legs (cross_source);
+//   * the engine's fair-value estimate for the pair, which already includes
+//     cross-pair books and declared pars;
+//
+// blended in log space by inverse variance (blend_sources). When the sources
+// DISAGREE the blended error bar widens to their spread, so conflicting
+// evidence (par says $1, the tape says $0.78) quotes wide instead of
+// confidently in the middle.
+//
+// WHAT IT IS NOT. docs/price-discovery-from-trade-history.md (2026-09-01)
+// refused the trade tape as a fair-value input, for reasons that still hold
+// for VALUATION: a polled ticker cannot bound a print's age, and a tape-fed
+// graph edge would displace the governed par fallback with a smaller error
+// bar. So this price never enters the fair-value solve, valuation or the
+// mid gate's anchors (MarketDataFeed marks it synthetic and withholds
+// valuation grade). It only lets a revive pair QUOTE, and it answers the
+// note's two objections for that use: Dexie's v2 trade history carries a
+// per-trade timestamp, so age is measured, not inferred; and its error bar
+// is never smaller than the disagreement between sources.
+//
+// Pure header: no engine, feed or RPC types.
+// ---------------------------------------------------------------------------
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <optional>
+#include <vector>
+
+namespace xop::synth {
+
+/// A price and its one-sigma uncertainty, in basis points.
+struct PriceSource {
+    double price{0.0};
+    double sigma_bps{0.0};
+};
+
+/// True when `s` is usable: positive finite price, finite sigma >= 0.
+[[nodiscard]] inline bool usable(const PriceSource& s) noexcept
+{
+    return s.price > 0.0 && std::isfinite(s.price)
+        && s.sigma_bps >= 0.0 && std::isfinite(s.sigma_bps);
+}
+
+/// The largest error bar any synthetic price may report. A source that
+/// would exceed it is clipped to it rather than dropped, so a stale price
+/// still quotes -- wide.
+inline constexpr double kMaxSigmaBps = 5000.0;
+
+/// Inverse-variance blend in log space. The reported sigma is the larger of
+/// the formal combined error, sqrt(1 / sum w), and the weighted spread of the
+/// sources around the result, so two confident sources that disagree do not
+/// produce a confident answer. A source with sigma 0 is treated as
+/// `min_sigma_bps`. nullopt when no source is usable.
+[[nodiscard]] inline std::optional<PriceSource> blend_sources(
+    const std::vector<PriceSource>& sources, double min_sigma_bps = 50.0)
+{
+    double sum_w = 0.0, sum_wx = 0.0;
+    for (const auto& s : sources) {
+        if (!usable(s)) continue;
+        const double sig = std::max(s.sigma_bps, min_sigma_bps) / 1e4;
+        const double w = 1.0 / (sig * sig);
+        sum_w  += w;
+        sum_wx += w * std::log(s.price);
+    }
+    if (!(sum_w > 0.0)) return std::nullopt;
+    const double centre = sum_wx / sum_w;
+    double sum_wd = 0.0;
+    for (const auto& s : sources) {
+        if (!usable(s)) continue;
+        const double sig = std::max(s.sigma_bps, min_sigma_bps) / 1e4;
+        const double d = std::log(s.price) - centre;
+        sum_wd += (1.0 / (sig * sig)) * d * d;
+    }
+    const double formal = std::sqrt(1.0 / sum_w) * 1e4;
+    const double spread = std::sqrt(sum_wd / sum_w) * 1e4;
+    PriceSource out;
+    out.price     = std::exp(centre);
+    out.sigma_bps = std::min(kMaxSigmaBps, std::max(formal, spread));
+    return out;
+}
+
+/// The price of `base` in `quote` from each one's price in a common unit
+/// (XCH): base / quote, errors added in quadrature. nullopt if either leg is
+/// unusable.
+[[nodiscard]] inline std::optional<PriceSource> cross_source(
+    const PriceSource& base_in_xch, const PriceSource& quote_in_xch)
+{
+    if (!usable(base_in_xch) || !usable(quote_in_xch)) return std::nullopt;
+    PriceSource out;
+    out.price     = base_in_xch.price / quote_in_xch.price;
+    out.sigma_bps = std::min(kMaxSigmaBps,
+                             std::hypot(base_in_xch.sigma_bps,
+                                        quote_in_xch.sigma_bps));
+    if (!usable(out)) return std::nullopt;
+    return out;
+}
+
+/// A remembered price `age_hours` old: its sigma grows linearly with age.
+[[nodiscard]] inline PriceSource aged_source(const PriceSource& last,
+                                             double age_hours,
+                                             double bps_per_hour)
+{
+    PriceSource out = last;
+    const double age = (age_hours > 0.0 && std::isfinite(age_hours)) ? age_hours : 0.0;
+    out.sigma_bps = std::min(kMaxSigmaBps, last.sigma_bps + age * bps_per_hour);
+    return out;
+}
+
+/// One settled trade on a <asset>_xch market: XCH per asset, the asset
+/// amount, and when it settled.
+struct TapeTrade {
+    double price{0.0};
+    double volume{0.0};
+    std::chrono::system_clock::time_point at{};
+};
+
+/// Parameters of tape_source. Defaults are the shipped values.
+struct TapeParams {
+    std::chrono::hours window{72};   ///< trades older than this are ignored
+    double base_sigma_bps{200.0};    ///< floor: a thin tape is never precise
+    double bps_per_hour{25.0};       ///< added per hour since the newest trade
+};
+
+/// The asset's price in XCH from its recent trades: the volume-weighted mean
+/// of log prices, with a sigma of base + the trades' own weighted dispersion
+/// (in quadrature) + bps_per_hour times the newest trade's age. Trades with a
+/// non-positive price or volume, or outside the window, are ignored. nullopt
+/// when none remain.
+[[nodiscard]] inline std::optional<PriceSource> tape_source(
+    const std::vector<TapeTrade>& trades,
+    std::chrono::system_clock::time_point now,
+    const TapeParams& p = TapeParams{})
+{
+    double sum_w = 0.0, sum_wx = 0.0;
+    std::chrono::system_clock::time_point newest{};
+    for (const auto& t : trades) {
+        if (!(t.price > 0.0) || !std::isfinite(t.price)) continue;
+        if (!(t.volume > 0.0) || !std::isfinite(t.volume)) continue;
+        if (t.at > now || now - t.at > p.window) continue;
+        sum_w  += t.volume;
+        sum_wx += t.volume * std::log(t.price);
+        newest = std::max(newest, t.at);
+    }
+    if (!(sum_w > 0.0)) return std::nullopt;
+    const double centre = sum_wx / sum_w;
+    double sum_wd = 0.0;
+    for (const auto& t : trades) {
+        if (!(t.price > 0.0) || !std::isfinite(t.price)) continue;
+        if (!(t.volume > 0.0) || !std::isfinite(t.volume)) continue;
+        if (t.at > now || now - t.at > p.window) continue;
+        const double d = std::log(t.price) - centre;
+        sum_wd += t.volume * d * d;
+    }
+    const double dispersion = std::sqrt(sum_wd / sum_w) * 1e4;
+    const double age_h =
+        std::chrono::duration<double, std::ratio<3600>>(now - newest).count();
+    PriceSource out;
+    out.price     = std::exp(centre);
+    out.sigma_bps = std::min(kMaxSigmaBps,
+                             std::hypot(p.base_sigma_bps, dispersion)
+                                 + std::max(0.0, age_h) * p.bps_per_hour);
+    return out;
+}
+
+/// A quoting half-spread that covers `sigma_mult` error bars, never below
+/// `floor_bps` and never above `cap_bps` (a ladder past ~50% stops meaning
+/// anything and a bid would approach zero).
+[[nodiscard]] inline double half_spread_for_sigma(double floor_bps,
+                                                  double sigma_bps,
+                                                  double sigma_mult = 2.0,
+                                                  double cap_bps = 5000.0) noexcept
+{
+    double want = floor_bps;
+    if (sigma_bps > 0.0 && std::isfinite(sigma_bps)) {
+        want = std::max(want, sigma_mult * sigma_bps);
+    }
+    return std::min(want, std::max(floor_bps, cap_bps));
+}
+
+}  // namespace xop::synth
+
+#endif  // XOP_STRATEGY_SYNTHETIC_PRICE_HPP

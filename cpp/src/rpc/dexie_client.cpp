@@ -937,6 +937,66 @@ asio::awaitable<OffersPage> DexieClient::get_trades(
 }
 
 // -----------------------------------------------------------------------
+// [SYNTH 2026-10-22] GET /v2/prices/historical_trades
+// -----------------------------------------------------------------------
+std::string dexie_v2_base_url(std::string_view base_url) {
+    std::string base(base_url);
+    while (!base.empty() && base.back() == '/') base.pop_back();
+    constexpr std::string_view kV1 = "/v1";
+    if (base.size() >= kV1.size()
+        && base.compare(base.size() - kV1.size(), kV1.size(), kV1) == 0) {
+        base.erase(base.size() - kV1.size());
+    }
+    return base + "/v2";
+}
+
+std::vector<HistoricalTrade> parse_historical_trades(
+    const nlohmann::json& response) {
+    std::vector<HistoricalTrade> out;
+    if (!response.is_object() || !response.value("success", false)) {
+        return out;
+    }
+    const auto it = response.find("trades");
+    if (it == response.end() || !it->is_array()) return out;
+    // Dexie sends the numbers as decimal strings; accept JSON numbers too.
+    auto number = [](const nlohmann::json& j, const char* key) -> double {
+        const auto f = j.find(key);
+        if (f == j.end() || f->is_null()) return 0.0;
+        try {
+            if (f->is_number()) return f->get<double>();
+            if (f->is_string()) return std::stod(f->get<std::string>());
+        } catch (...) {}
+        return 0.0;
+    };
+    for (const auto& t : *it) {
+        if (!t.is_object()) continue;
+        HistoricalTrade h;
+        h.price         = number(t, "price");
+        h.base_volume   = number(t, "base_volume");
+        h.target_volume = number(t, "target_volume");
+        const double ts = number(t, "trade_timestamp");
+        h.timestamp_ms  = (ts > 0.0 && std::isfinite(ts))
+                        ? static_cast<std::int64_t>(ts) : 0;
+        if (!(h.price > 0.0) || !std::isfinite(h.price)
+            || !(h.base_volume > 0.0) || !std::isfinite(h.base_volume)
+            || h.timestamp_ms <= 0) {
+            continue;
+        }
+        out.push_back(h);
+    }
+    return out;
+}
+
+asio::awaitable<std::vector<HistoricalTrade>> DexieClient::get_xch_trade_history(
+    std::string_view asset_id, uint32_t limit) {
+    const std::string url = dexie_v2_base_url(cfg_.base_url)
+        + "/prices/historical_trades?ticker_id=" + std::string(asset_id)
+        + "_xch&limit=" + std::to_string(limit);
+    const auto json = co_await execute_request_("GET", url, /*body=*/"");
+    co_return parse_historical_trades(json);
+}
+
+// -----------------------------------------------------------------------
 // POST /v1/offers  (submit a new offer)
 // -----------------------------------------------------------------------
 asio::awaitable<SubmitResult> DexieClient::submit_offer(

@@ -1430,9 +1430,12 @@ TEST(ConfigParserTest, ReviveMarketCoinIdsMustCoverTheLegs) {
     }
 }
 
-TEST(ConfigParserTest, ReviveMarketUnmappableLeg_Throws) {
-    // "TEST" has no CoinGecko feed mapping at all: no id list can anchor
-    // it, so revival is refused with a message naming the leg.
+TEST(ConfigParserTest, ReviveMarketUnmappableLeg_LoadsForSyntheticPricing) {
+    // [SYNTH 2026-10-22] "TEST" has no CoinGecko feed mapping. Revival used
+    // to be refused; an unlisted leg is now priced by the engine's synthetic
+    // quoting price (Dexie trade history, the fair-value estimate, the last
+    // known price), so the pair loads. The listed leg's id is still checked
+    // by ReviveMarketCoinIdsMustCoverTheLegs.
     std::string yaml(kMinimalValidYaml);
     const std::string anchor =
         "    name: \"XCH/TEST\"\n"
@@ -1443,7 +1446,9 @@ TEST(ConfigParserTest, ReviveMarketUnmappableLeg_Throws) {
     yaml += "\ncoingecko:\n  enabled: true\n"
             "  coin_ids: [\"chia\", \"usd-coin\", \"ethereum\"]\n";
     TempYaml tmp(yaml);
-    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+    const auto cfg = xop::load_config(tmp.path());
+    ASSERT_FALSE(cfg.pairs.empty());
+    EXPECT_TRUE(cfg.pairs[0].revive_market);
 }
 
 }  // namespace
@@ -4039,4 +4044,35 @@ TEST(ConfigParserTest, ReviveSizeCapAndBatchingAreRefusedTogether) {
         TempYaml tmp(revive_yaml(""));
         EXPECT_NO_THROW(static_cast<void>(xop::load_config(tmp.path())));
     }
+}
+
+// [PEGGUARD 2026-10-22] pairs[].peg_guard: on by default; only a revive pair
+// can waive it.
+TEST(ConfigParserTest, PegGuard_DefaultsOnAndParsesFalse) {
+    {
+        TempYaml tmp(kMinimalValidYaml);
+        const auto cfg = xop::load_config(tmp.path());
+        ASSERT_FALSE(cfg.pairs.empty());
+        EXPECT_TRUE(cfg.pairs[0].peg_guard);
+    }
+    std::string yaml(kMinimalValidYaml);
+    const std::string anchor = "    enabled: true\n";
+    const auto pos = yaml.find(anchor);
+    ASSERT_NE(pos, std::string::npos);
+    yaml.insert(pos + anchor.size(), "    peg_guard: false\n");
+    TempYaml tmp(yaml);
+    const auto cfg = xop::load_config(tmp.path());
+    EXPECT_FALSE(cfg.pairs[0].peg_guard);
+}
+
+TEST(ConfigParserTest, PegGuard_IsWaivedOnlyTogetherWithRevive) {
+    xop::PairConfig pc;
+    EXPECT_FALSE(xop::peg_guard_is_waived(pc)) << "defaults";
+    pc.peg_guard = false;
+    EXPECT_FALSE(xop::peg_guard_is_waived(pc))
+        << "without revive the box is ignored";
+    pc.revive_market = true;
+    EXPECT_TRUE(xop::peg_guard_is_waived(pc));
+    pc.peg_guard = true;
+    EXPECT_FALSE(xop::peg_guard_is_waived(pc));
 }

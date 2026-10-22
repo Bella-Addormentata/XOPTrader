@@ -332,10 +332,19 @@ pairs:
     # leg, so an empty OR one-sided book still has a mid; runs its own
     # flash-crash guard, so another pair's crash does not pause it; and,
     # while its book is thin, quotes inside the strategy.revive_* limits
-    # (spread floor, size cap) and stops at its daily loss budget. Both of
-    # its legs must have a CoinGecko listing (BYC has none).
+    # (spread floor, size cap) and stops at its daily loss budget. A coin
+    # with a CoinGecko listing is priced from it; a coin without one (BYC)
+    # gets a synthetic price from its Dexie trade history, the engine's
+    # fair-value estimate and its last known price, quoted wider the less
+    # certain it is. The synthetic price is for quoting only: it never marks
+    # equity or feeds the fair-value solve.
     # Editable per pair in Settings -> Trading Pairs.
     revive_market: false
+    # [OPTIONAL, default: true] Peg guard. Off lets this pair keep quoting
+    # through a peg suspension or depeg bail-out -- only when revive_market
+    # is also on, so the revive limits always cover it. Alerts still fire
+    # and every other pair stays guarded. Settings -> Trading Pairs.
+    peg_guard: true
   - base_asset_id: "4cb15a8ecc85068fb1f98c09a5e489d1ad61b2af79690ce00f9fc4803c8b597f"  # wmilliETH
     quote_asset_id: "xch"
     name: "wmilliETH/XCH"

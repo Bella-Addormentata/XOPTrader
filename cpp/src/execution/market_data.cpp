@@ -147,7 +147,8 @@ midgate::AnchorCandidates anchor_candidates(const PairState&        ps,
                                             const MarketDataConfig& cfg,
                                             Timestamp               now) {
     midgate::AnchorCandidates c;
-    if (ps.cex_mid > 0.0 && std::isfinite(ps.cex_mid)
+    // [SYNTH] A synthetic quoting price is not independent evidence.
+    if (ps.cex_mid > 0.0 && std::isfinite(ps.cex_mid) && !ps.cex_synthetic
         && (cfg.cex_freshness_threshold_sec <= 0.0
             || age_seconds(ps.cex_updated_at, now)
                    < cfg.cex_freshness_threshold_sec)) {
@@ -454,7 +455,8 @@ void MarketDataFeed::refresh(const std::vector<std::string>& enabled_pairs) {
         }
 
         // Step 7: Check for arbitrage divergence (only if both sources live).
-        if (!dex_stale && ps.cex_mid > 0.0 && !cex_stale) {
+        if (!dex_stale && ps.cex_mid > 0.0 && !cex_stale
+            && !ps.cex_synthetic) {
             // Release pairs lock before acquiring arb lock to maintain the
             // single-mutex rule.  We copy the needed values first.
             //
@@ -538,7 +540,8 @@ void MarketDataFeed::ingest_dexie(const std::string& pair_name,
                     .value;
             }
             // Gate OFF: legacy behaviour, unfiltered CEX only.
-            return it->second.cex_mid > 0.0 ? it->second.cex_mid : 0.0;
+            return (it->second.cex_mid > 0.0 && !it->second.cex_synthetic)
+                ? it->second.cex_mid : 0.0;
         }();
         if (ref > 0.0) {
             constexpr double kMaxRatio = 10.0;
@@ -659,7 +662,8 @@ void MarketDataFeed::ingest_block_height(BlockHeight block_height) {
 
 void MarketDataFeed::ingest_cex_reference(const std::string& pair_name,
                                            double             cex_mid,
-                                           Timestamp          observed_at) {
+                                           Timestamp          observed_at,
+                                           bool               synthetic) {
     // [S20 2026-08-24] Reject non-finite as well as non-positive.  NaN
     // fails `<= 0.0` and +inf passes it, so both used to be stored -- and
     // a stored infinity then satisfied every bare `cex_mid > 0.0` test
@@ -674,6 +678,7 @@ void MarketDataFeed::ingest_cex_reference(const std::string& pair_name,
     PairState& ps = get_or_create_pair(pair_name);
 
     ps.cex_mid        = cex_mid;
+    ps.cex_synthetic  = synthetic;
     // Stored VERBATIM, for the same reason spelled out in ingest_amm_mid:
     // the engine re-derives cex_mid from its CoinGecko CACHE every heartbeat,
     // and a failed fetch leaves that cache in place.  Stamping now() here
@@ -816,7 +821,7 @@ std::optional<double> MarketDataFeed::get_cex_reference(
     const PairState& ps = it->second;
 
     // Return nullopt if no CEX data has ever been ingested, or if it is stale.
-    if (ps.cex_mid <= 0.0) {
+    if (ps.cex_mid <= 0.0 || ps.cex_synthetic) {
         return std::nullopt;
     }
     if (detect_stale(ps.cex_updated_at)) {
@@ -1667,8 +1672,10 @@ void MarketDataFeed::apply_mid_gate(PairState& ps, const MarketDataConfig& cfg)
     // must never bless an otherwise-ungraded DEX candidate into equity
     // and P&L.  select_anchor already skips non-finite values, and this
     // keeps the grade path consistent with it.
+    // [SYNTH] A synthetic quoting price never grants valuation grade.
     const bool cex_fresh = ps.cex_mid > 0.0
         && std::isfinite(ps.cex_mid)
+        && !ps.cex_synthetic
         && (cfg.cex_freshness_threshold_sec <= 0.0
             || age_seconds(ps.cex_updated_at, now)
                    < cfg.cex_freshness_threshold_sec);

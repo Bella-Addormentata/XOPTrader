@@ -851,6 +851,10 @@ std::vector<PairConfig> parse_pairs(const YAML::Node& root)
             && !item["revive_market"].IsNull()) {
             p.revive_market = item["revive_market"].as<bool>();
         }
+        if (item["peg_guard"] && item["peg_guard"].IsDefined()
+            && !item["peg_guard"].IsNull()) {
+            p.peg_guard = item["peg_guard"].as<bool>();
+        }
 
         // -- Stablecoin peg configuration (optional) ------------------------
         if (item["is_stablecoin"] && item["is_stablecoin"].IsDefined()
@@ -4991,14 +4995,11 @@ AppConfig load_config(const std::string& path,
                 for (const auto& leg : leg_names) {
                     const auto it = listings.find(leg);
                     if (it == listings.end()) {
-                        throw ConfigError(
-                            "pairs[" + std::to_string(i) + "] ("
-                            + cfg.pairs[i].name + "): revive_market "
-                            "cannot anchor leg \"" + leg + "\" -- it has "
-                            "no CoinGecko feed mapping. Revival quotes "
-                            "from direct anchors on BOTH legs; known "
-                            "mappable symbols: xch, usdc/wusdc(.b), dbx, "
-                            "eth/weth, millieth/wmillieth(.b).");
+                        // [SYNTH 2026-10-22] An unlisted leg (BYC) is
+                        // priced by the engine's synthetic quoting price
+                        // (Dexie trade history, the fair-value estimate,
+                        // the last known price) instead of CoinGecko.
+                        continue;
                     }
                     const std::string feed_id = it->second.id;
                     const auto& ids = cfg.coingecko.coin_ids;

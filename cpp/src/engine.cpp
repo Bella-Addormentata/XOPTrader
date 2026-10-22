@@ -5611,7 +5611,8 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
                     derived = true;
                 }
             }
-            // Pairs with no CoinGecko mapping (BYC) are silently skipped.
+            // Pairs with no CoinGecko mapping (BYC) are skipped here; a
+            // revive pair among them gets a synthetic price below.
 
             if (derived && cex_mid > 0.0) {
                 // Pass the fetch time, not the re-ingest time: this runs
@@ -5628,6 +5629,38 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
                 }
                 spdlog::debug("[Engine] Step 1: {} CoinGecko cex_mid={:.6f}",
                               pair.name, cex_mid);
+            }
+        }
+
+        // -- [SYNTH 2026-10-22] Synthetic quoting price -----------------------
+        // A revive pair with an unlisted leg (BYC) has no CoinGecko cross.
+        // It quotes from a synthetic price instead: its legs priced in XCH
+        // from their listings and Dexie trade history, blended with the
+        // fair-value estimate, or its last synthetic price aged when nothing
+        // else is left (xop/strategy/synthetic_price.hpp). Published as a
+        // SYNTHETIC reference: it moves the published mid so the pair can
+        // quote, and is withheld from valuation, the mid gate and the
+        // arbitrage signal.
+        if (pair.revive_market
+            && !listed_cross_price(pair.name, coingecko_prices_)) {
+            co_await refresh_synth_tape(pair.base_asset_id);
+            co_await refresh_synth_tape(pair.quote_asset_id);
+            if (const auto sp = synth_pair_price(pair)) {
+                market_data_->ingest_cex_reference(
+                    pair.name, sp->price, std::chrono::system_clock::now(),
+                    /*synthetic=*/true);
+                revive_ref_ok = true;
+                if (auto cit = cycle_.find(pair.name); cit != cycle_.end()) {
+                    cit->second.revive_synth_sigma_bps =
+                        std::max(sp->sigma_bps, 1.0);
+                }
+                spdlog::debug("[Engine] Step 1: {} synthetic price "
+                              "{:.6f} +/- {:.0f} bps", pair.name, sp->price,
+                              sp->sigma_bps);
+            } else {
+                spdlog::debug("[Engine] Step 1: {} has no synthetic price "
+                              "yet -- no listing, no trades, no estimate",
+                              pair.name);
             }
         }
 
@@ -6927,9 +6960,15 @@ void Engine::step_compute_quotes(BlockHeight block_height)
         // [PEGSUSPEND] The asset-level latch gates every pair TOUCHING a
         // suspended asset -- including XCH/<asset>, which the pair-level
         // detector cannot see because its mid moves with XCH.
+        // [PEGGUARD 2026-10-22] A revive pair with peg_guard off quotes
+        // through both peg gates (its limits and loss budget still apply).
+        const PairConfig* pc_guard = find_pair_config(pair_name);
+        const bool peg_guard_waived = pc_guard != nullptr
+            && peg_guard_is_waived(*pc_guard);
         {
-            const PairConfig* pc4 = find_pair_config(pair_name);
-            if (pc4 != nullptr && pair_peg_suspended(*pc4)) {
+            const PairConfig* pc4 = pc_guard;
+            if (pc4 != nullptr && pair_peg_suspended(*pc4)
+                && !peg_guard_waived) {
                 // [SIDEQUALITY 2026-09-01] warn, not debug.  This gate
                 // silently suppressed every XCH/BYC quote for a full day
                 // after a FALSE suspension, and nothing said so at info
@@ -6945,7 +6984,15 @@ void Engine::step_compute_quotes(BlockHeight block_height)
                 continue;
             }
         }
-        if (depeg_detector_ && depeg_detector_->should_bail(pair_name)) {
+        if (peg_guard_waived
+            && ((pc_guard != nullptr && pair_peg_suspended(*pc_guard))
+                || (depeg_detector_ && depeg_detector_->should_bail(pair_name)))) {
+            spdlog::debug("[Engine] Step 4: {} peg guard off -- quoting "
+                          "through the peg suspension / depeg bail-out",
+                          pair_name);
+        }
+        if (!peg_guard_waived && depeg_detector_
+            && depeg_detector_->should_bail(pair_name)) {
             // [S17] The Step 3 transition log is the alert; this per-cycle
             // suppression note stays at debug.
             spdlog::debug("[Engine] Step 4: {} depeg bail-out active -- "
@@ -9992,12 +10039,18 @@ void Engine::step_generate_ladder(BlockHeight block_height)
             config_.arbitrage.tibetswap_fee_bps);
         // [REVIVE2 2026-10-22] A revive pair on a thin book quotes no
         // tighter than strategy.revive_min_half_spread_bps.
-        const double quote_min_half_spread_bps = revive::half_spread_floor_bps(
+        double quote_min_half_spread_bps = revive::half_spread_floor_bps(
             std::max(quote_base_floor_bps,
                      std::max(0.0, config_.strategy.quote_width_sigma_mult)
                          * quote_combined_sigma_bps),
             pcs.revive_thin,
             config_.strategy.revive_min_half_spread_bps);
+        // [SYNTH 2026-10-22] Quoting from a synthetic price on a thin book:
+        // cover two of its error bars (capped at 50%).
+        if (pcs.revive_thin && pcs.revive_synth_sigma_bps > 0.0) {
+            quote_min_half_spread_bps = synth::half_spread_for_sigma(
+                quote_min_half_spread_bps, pcs.revive_synth_sigma_bps);
+        }
         if (pcs.revive_thin && config_.strategy.revive_min_half_spread_bps > 0.0) {
             spdlog::debug("[Engine] Step 7: {} revive thin book -- min "
                           "half-spread {:.0f} bps", pair_name,
@@ -10664,9 +10717,13 @@ void Engine::step_generate_ladder(BlockHeight block_height)
         // feed, would be exactly the unguarded quoting this clear exists
         // to stop -- both cases still clear regardless of the flag.
         if (snap.best_bid <= 0 && snap.best_ask <= 0) {
+            // [SYNTH 2026-10-22] A synthetic quoting price published this
+            // heartbeat is the live anchor for a revive pair with an
+            // unlisted leg: it has no CoinGecko feed to be fresh.
+            const bool synth_anchor = pcs.revive_synth_sigma_bps > 0.0;
             if (ladder_survives_empty_book(pair_cfg,
-                                           quote_has_external_est,
-                                           quote_anchor_feed_fresh)) {
+                                           quote_has_external_est || synth_anchor,
+                                           quote_anchor_feed_fresh || synth_anchor)) {
                 spdlog::info("[Engine] Step 7: {} revive market: empty "
                              "filtered book but external anchor is live "
                              "(combined_sigma={:.0f}bps) -- quoting from "
@@ -21501,6 +21558,13 @@ void Engine::step_update_pnl(BlockHeight block_height)
                         q != coingecko_prices_.end() && q->second > 0.0) {
                         listed_quote_usd = q->second / l->second.units_per_coin;
                     }
+                } else if (xch_usd > 0.0) {
+                    // [SYNTH 2026-10-22] An unlisted quote (BYC): its
+                    // synthetic XCH price -- Dexie trades, aged -- in USD.
+                    if (const auto sq = synth_asset_in_xch(pair.quote_asset_id,
+                                                           legs->second)) {
+                        listed_quote_usd = sq->price * xch_usd;
+                    }
                 }
             }
             const auto carried = last_trusted_quote_usd_factor_.find(pair.name);
@@ -25047,8 +25111,9 @@ asio::awaitable<void> Engine::step_observe_asset_pegs(BlockHeight block_height)
         std::vector<std::string> to_cancel;
         for (const auto& po : state_->get_all_offers()) {
             const auto* pc = find_pair_config(po.pair_name);
+            // [PEGGUARD 2026-10-22] Not on a pair whose peg guard is off.
             if (pc != nullptr && !po.cancel_pending
-                && pair_peg_suspended(*pc)) {
+                && pair_peg_suspended(*pc) && !peg_guard_is_waived(*pc)) {
                 to_cancel.push_back(po.offer_id);
             }
         }
@@ -25600,6 +25665,127 @@ asio::awaitable<void> Engine::step_revive_maintenance(BlockHeight block_height)
     spdlog::warn("[Engine] revive maintenance: cancelled {}/{} resting "
                  "offer(s) (over the loss budget, or above the size cap on "
                  "a thin book)", done.size(), ids.size());
+}
+
+// ---------------------------------------------------------------------------
+// [SYNTH 2026-10-22] Synthetic quoting price for revive pairs (see
+// xop/strategy/synthetic_price.hpp and Step 1's SYNTH block).
+// ---------------------------------------------------------------------------
+namespace {
+/// How often one asset's Dexie trade history is re-fetched.
+constexpr auto kSynthTapeRefresh = std::chrono::minutes(10);
+/// How fast a remembered synthetic price's error bar grows once no fresh
+/// evidence supports it.
+constexpr double kSynthAgedBpsPerHour = 25.0;
+
+bool is_xch_asset(const std::string& asset_id)
+{
+    return asset_id == "xch" || asset_id == "XCH";
+}
+}  // namespace
+
+asio::awaitable<void> Engine::refresh_synth_tape(const std::string& asset_id)
+{
+    if (asset_id.empty() || is_xch_asset(asset_id) || !dexie_) co_return;
+    auto& tape = synth_tapes_[asset_id];
+    const auto now = std::chrono::steady_clock::now();
+    if (tape.fetched_at != std::chrono::steady_clock::time_point{}
+        && now - tape.fetched_at < kSynthTapeRefresh) {
+        co_return;
+    }
+    // Stamped before the request, so a failing endpoint is retried at the
+    // refresh interval rather than every heartbeat.
+    tape.fetched_at = now;
+    try {
+        const auto trades = co_await dexie_->get_xch_trade_history(asset_id, 50);
+        if (!trades.empty()) {
+            std::vector<synth::TapeTrade> out;
+            out.reserve(trades.size());
+            for (const auto& t : trades) {
+                out.push_back(synth::TapeTrade{
+                    t.price, t.base_volume,
+                    std::chrono::system_clock::time_point(
+                        std::chrono::milliseconds(t.timestamp_ms))});
+            }
+            synth_tapes_[asset_id].trades = std::move(out);
+        }
+    } catch (const std::exception& e) {
+        spdlog::warn("[Engine] synthetic price: Dexie trade history for {} "
+                     "failed: {} -- keeping the previous trades",
+                     asset_id.substr(0, 12), e.what());
+    }
+}
+
+std::optional<synth::PriceSource> Engine::synth_asset_in_xch(
+    const std::string& asset_id, const std::string& leg_symbol) const
+{
+    if (is_xch_asset(asset_id)) return synth::PriceSource{1.0, 0.0};
+    std::vector<synth::PriceSource> sources;
+
+    // Its CoinGecko listing, while the feed is fresh.
+    const auto& table = feed_listings();
+    if (const auto l = table.find(leg_symbol);
+        l != table.end() && l->second.units_per_coin > 0.0
+        && coingecko_feed_fresh_for_revival(
+               !coingecko_prices_.empty(), coingecko_last_fetch_,
+               std::chrono::steady_clock::now(),
+               config_.market_data.cex_freshness_threshold_sec)) {
+        const auto a = coingecko_prices_.find(l->second.id);
+        const auto x = coingecko_prices_.find("chia");
+        if (a != coingecko_prices_.end() && x != coingecko_prices_.end()
+            && a->second > 0.0 && x->second > 0.0) {
+            sources.push_back(synth::PriceSource{
+                (a->second / l->second.units_per_coin) / x->second,
+                config_.strategy.fair_value_feed_sigma_bps});
+        }
+    }
+
+    // Its own <asset>_xch trades.
+    if (const auto t = synth_tapes_.find(asset_id); t != synth_tapes_.end()) {
+        if (const auto tape = synth::tape_source(
+                t->second.trades, std::chrono::system_clock::now())) {
+            sources.push_back(*tape);
+        }
+    }
+    return synth::blend_sources(sources);
+}
+
+std::optional<synth::PriceSource> Engine::synth_pair_price(const PairConfig& pc)
+{
+    std::vector<synth::PriceSource> sources;
+    if (const auto legs = split_pair_legs(pc.name)) {
+        const auto b = synth_asset_in_xch(pc.base_asset_id, legs->first);
+        const auto q = synth_asset_in_xch(pc.quote_asset_id, legs->second);
+        if (b && q) {
+            if (const auto c = synth::cross_source(*b, *q)) sources.push_back(*c);
+        }
+    }
+    // The engine's own estimate (cross-pair books, declared pars). Clipped,
+    // not dropped, when its error bar is huge: it then carries little weight
+    // but still widens the blend if it disagrees.
+    if (const auto est = market_data_->get_fair_value_estimate(pc.name);
+        est && est->price > 0.0 && std::isfinite(est->price)) {
+        const double sig = std::isfinite(est->sigma_bps)
+            ? std::clamp(est->sigma_bps, 0.0, synth::kMaxSigmaBps)
+            : synth::kMaxSigmaBps;
+        sources.push_back(synth::PriceSource{est->price, sig});
+    }
+
+    const auto now = std::chrono::system_clock::now();
+    if (!sources.empty()) {
+        const auto out = synth::blend_sources(sources);
+        if (out) synth_last_good_[pc.name] = {*out, now};
+        return out;
+    }
+    // Nothing fresh: the last synthetic price, its error bar grown by its
+    // age. Only when nothing fresh exists, so it never re-counts itself.
+    if (const auto lg = synth_last_good_.find(pc.name);
+        lg != synth_last_good_.end()) {
+        const double age_h = std::chrono::duration<double, std::ratio<3600>>(
+            now - lg->second.second).count();
+        return synth::aged_source(lg->second.first, age_h, kSynthAgedBpsPerHour);
+    }
+    return std::nullopt;
 }
 
 }  // namespace xop
