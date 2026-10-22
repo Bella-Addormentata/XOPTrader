@@ -1766,6 +1766,12 @@ struct RiskConfig {
     uint32_t recovery_stable_blocks_phase1{50};     ///< Blocks stable for Crash→Recovery.
     uint32_t recovery_stable_blocks_phase2{100};    ///< Blocks stable for Recovery→Normal.
     double   recovery_stability_band_pct{0.05};     ///< Max price deviation in recovery.
+    /// [STALEHIST 2026-10-22] A pair whose newest price is more than this
+    /// many blocks old has stopped publishing a mid; the crash and recovery
+    /// checks leave it out, so its frozen history cannot hold every other
+    /// pair paused (PreTradeCheck::price_history_is_stale). 0 keeps every
+    /// pair in, the pre-2026-10-22 behaviour.
+    uint32_t flash_crash_stale_history_blocks{10};
 
     // -- Circuit-breaker rebalance (T7-09) -----------------------------------
     // Automatically enables StrategicLossManager for a pair when all of:

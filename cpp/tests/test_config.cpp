@@ -902,6 +902,40 @@ TEST(ConfigParserTest, XchCycleCommitFrac_ParsesDefaultsAndRejects) {
     }
 }
 
+TEST(ConfigParserTest, FlashCrashStaleHistory_ParsesDefaultsAndRejects) {
+    // [STALEHIST 2026-10-22] Injected into the existing risk: section, as
+    // FlashCrashWindow below explains.
+    const auto with_stale = [](const std::string& value) {
+        std::string yaml(kMinimalValidYaml);
+        const std::string anchor = "risk:\n";
+        const auto at = yaml.find(anchor);
+        EXPECT_NE(at, std::string::npos);
+        yaml.insert(at + anchor.size(),
+                    "  flash_crash_stale_history_blocks: " + value + "\n");
+        return yaml;
+    };
+    {
+        TempYaml tmp(kMinimalValidYaml);
+        auto cfg = xop::load_config(tmp.path());
+        EXPECT_EQ(cfg.risk.flash_crash_stale_history_blocks, 10u)
+            << "on by default, so existing configs get it on upgrade";
+    }
+    {
+        TempYaml tmp(with_stale("25"));
+        auto cfg = xop::load_config(tmp.path());
+        EXPECT_EQ(cfg.risk.flash_crash_stale_history_blocks, 25u);
+    }
+    {
+        TempYaml tmp(with_stale("0"));
+        auto cfg = xop::load_config(tmp.path());
+        EXPECT_EQ(cfg.risk.flash_crash_stale_history_blocks, 0u);
+    }
+    {
+        TempYaml tmp(with_stale("-1"));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+    }
+}
+
 TEST(ConfigParserTest, FlashCrashWindow_ParsesDefaultsAndRejects) {
     // kMinimalValidYaml already carries a risk: section, so the knob is
     // INJECTED into it rather than appended as a duplicate root key --

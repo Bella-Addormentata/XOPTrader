@@ -479,6 +479,26 @@ public:
                                       std::size_t required_stable_blocks = 100,
                                       double stability_band = 0.05) noexcept;
 
+    /// [STALEHIST 2026-10-22] True when a pair's newest price-history entry
+    /// is more than `max_age_blocks` blocks behind `current_block`, i.e. the
+    /// pair has stopped publishing a mid. 0 disables the test (never stale).
+    ///
+    /// The flash-crash check leaves such a pair out. Its history is frozen,
+    /// so whatever it held when the mid stopped decides the check forever:
+    /// on 2026-10-21 BYC/wUSDC.b lost its third-party bid with 0.898 and
+    /// 1.114 both inside its last 100 entries, and Recovery could never
+    /// complete for any pair. A pair with no mid is not quoted, so leaving
+    /// it out cannot resume posting into it.
+    [[nodiscard]]
+    static constexpr bool price_history_is_stale(
+        BlockHeight newest_block, BlockHeight current_block,
+        std::uint32_t max_age_blocks) noexcept
+    {
+        return max_age_blocks > 0
+            && current_block > newest_block
+            && current_block - newest_block > max_age_blocks;
+    }
+
     /// Compute the recommended rebalancing buffer multiplier during network
     /// congestion.  Normal operation returns 1.0; when `congested` is true
     /// the multiplier increases to the configured congestion factor (1.25-1.50).

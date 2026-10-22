@@ -4537,6 +4537,23 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
             auto history = market_data_->get_price_history(pair.name);
             if (history.empty()) continue;
 
+            // [STALEHIST 2026-10-22] A pair that stopped publishing a mid
+            // keeps a frozen history that can never pass (or leave) these
+            // checks, and on 2026-10-21 it held every pair in Recovery for
+            // over a day. It is not quoted without a mid, so leave it out.
+            if (PreTradeCheck::price_history_is_stale(
+                    history.back().block_height, block_height,
+                    config_.risk.flash_crash_stale_history_blocks)) {
+                if (flash_crash_state_ != FlashCrashState::Normal) {
+                    spdlog::debug("[Engine] Flash crash check: {} left out "
+                                  "-- newest price is from block {}, {} "
+                                  "blocks ago", pair.name,
+                                  history.back().block_height,
+                                  block_height - history.back().block_height);
+                }
+                continue;
+            }
+
             // Convert PriceHistoryEntry to Mojo vector for check_flash_crash.
             std::vector<Mojo> price_vec;
             price_vec.reserve(history.size());

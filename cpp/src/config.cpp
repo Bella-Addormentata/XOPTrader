@@ -2600,6 +2600,19 @@ RiskConfig parse_risk(const YAML::Node& root)
         cfg.flash_crash_window_blocks = static_cast<uint32_t>(v);
     }
 
+    // [STALEHIST 2026-10-22] 0 = never treat a pair's history as stale.
+    if (node["flash_crash_stale_history_blocks"]
+            && node["flash_crash_stale_history_blocks"].IsDefined()
+            && !node["flash_crash_stale_history_blocks"].IsNull()) {
+        int64_t v = node["flash_crash_stale_history_blocks"].as<int64_t>();
+        if (v < 0 || v > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
+            throw ConfigError(sec + ".flash_crash_stale_history_blocks must be in [0, "
+                              + std::to_string(std::numeric_limits<uint32_t>::max())
+                              + "]; got " + std::to_string(v));
+        }
+        cfg.flash_crash_stale_history_blocks = static_cast<uint32_t>(v);
+    }
+
     // recovery_stable_blocks_phase1: blocks that must be stable for Crash->Recovery.
     if (node["recovery_stable_blocks_phase1"] && node["recovery_stable_blocks_phase1"].IsDefined()
             && !node["recovery_stable_blocks_phase1"].IsNull()) {
