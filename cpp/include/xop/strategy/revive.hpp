@@ -153,6 +153,21 @@ struct PairFlows {
     }
 };
 
+/// The quote leg's USD price for PairFlows::value_usd: XCH's price for an
+/// XCH quote, else the leg's listed (feed) price, else the pair's carried
+/// accounting factor; 0 when none is known. The accounting factor alone is
+/// 0 for a non-par, non-XCH quote (wmilliETH.b/DBX), which would leave the
+/// loss budget blind, so the listed price comes first.
+[[nodiscard]] inline double quote_usd_price(bool quote_is_xch, double xch_usd,
+                                            double listed_usd,
+                                            double carried_factor) noexcept
+{
+    auto ok = [](double v) { return v > 0.0 && std::isfinite(v); };
+    if (quote_is_xch) return ok(xch_usd) ? xch_usd : 0.0;
+    if (ok(listed_usd)) return listed_usd;
+    return ok(carried_factor) ? carried_factor : 0.0;
+}
+
 /// Per-pair daily loss budget over a rolling window of P&L samples.
 ///
 /// The drawdown is the window's PEAK P&L minus the LATEST sample, so a gain

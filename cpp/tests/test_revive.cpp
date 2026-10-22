@@ -371,3 +371,28 @@ TEST(ListedCrossPrice, AMissingOrNonPositiveQuoteHasNoPrice)
     EXPECT_FALSE(xop::listed_cross_price(
         "not-a-pair", std::map<std::string, double>{{"chia", 1.60}}));
 }
+
+// ---------------------------------------------------------------------------
+// quote_usd_price -- the quote leg's USD price for the loss budget
+// ---------------------------------------------------------------------------
+
+TEST(ReviveQuoteUsd, AnXchQuoteUsesXchsPrice)
+{
+    EXPECT_DOUBLE_EQ(xop::revive::quote_usd_price(true, 1.43, 99.0, 99.0), 1.43);
+    EXPECT_DOUBLE_EQ(xop::revive::quote_usd_price(true, 0.0, 99.0, 99.0), 0.0);
+}
+
+TEST(ReviveQuoteUsd, AListedNonParQuoteIsPricedFromItsListing)
+{
+    // [review, PR #179] wmilliETH.b/DBX: the accounting factor is 0 for a
+    // non-par, non-XCH quote, so the listed price must come first or the
+    // budget never sees a loss.
+    EXPECT_DOUBLE_EQ(xop::revive::quote_usd_price(false, 1.43, 0.0172, 0.0),
+                     0.0172);
+}
+
+TEST(ReviveQuoteUsd, TheCarriedFactorIsTheLastResort)
+{
+    EXPECT_DOUBLE_EQ(xop::revive::quote_usd_price(false, 1.43, 0.0, 1.0), 1.0);
+    EXPECT_DOUBLE_EQ(xop::revive::quote_usd_price(false, 1.43, kNaN, 0.0), 0.0);
+}

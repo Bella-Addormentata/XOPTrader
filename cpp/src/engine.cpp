@@ -13353,7 +13353,11 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
 
                             // Track consecutive blocks with pending_change.
                             pending_wallets_this_block.insert(sb.wid);
-                            if (!saw_pending_change) {
+                            // [REVIVE2 2026-10-22] Not in a revive-only run:
+                            // it skips the clean-heartbeat reset below the
+                            // loop, so counting here would turn alternating
+                            // pending/clear heartbeats into a false streak.
+                            if (!saw_pending_change && !step8_pair_filter_) {
                                 ++consecutive_pending_blocks_;
                                 saw_pending_change = true;
                                 // [S67] Half way to the force-delete: our own
@@ -13398,8 +13402,9 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                             // global counter can fire while examining any
                             // wallet; clearing only that wallet leaves the
                             // others stuck indefinitely.
-                            if (consecutive_pending_blocks_ >=
-                                kForceDeletePendingBlocks) {
+                            if (!step8_pair_filter_
+                                && consecutive_pending_blocks_ >=
+                                       kForceDeletePendingBlocks) {
                                 spdlog::warn("[Engine] Step 8: pending_change "
                                              "persisted for {} consecutive "
                                              "blocks -- force-deleting ALL "
@@ -21416,10 +21421,28 @@ void Engine::step_update_pnl(BlockHeight block_height)
                     mid = est->price;
                 }
             }
+            // The quote leg's USD price: XCH directly, else its feed listing
+            // (every revive leg is listed -- load_config requires it), else
+            // the pair's carried accounting factor. The accounting factor
+            // alone is 0 for a non-par, non-XCH quote (wmilliETH.b/DBX),
+            // which would leave the budget unable to see any loss.
+            double listed_quote_usd = 0.0;
+            if (const auto legs = split_pair_legs(pair.name)) {
+                const auto& table = feed_listings();
+                if (const auto l = table.find(legs->second);
+                    l != table.end() && l->second.units_per_coin > 0.0) {
+                    if (const auto q = coingecko_prices_.find(l->second.id);
+                        q != coingecko_prices_.end() && q->second > 0.0) {
+                        listed_quote_usd = q->second / l->second.units_per_coin;
+                    }
+                }
+            }
             const auto carried = last_trusted_quote_usd_factor_.find(pair.name);
-            const double quote_usd =
+            const double quote_usd = revive::quote_usd_price(
+                pair.quote_asset_id == "xch" || pair.quote_asset_id == "XCH",
+                xch_usd, listed_quote_usd,
                 carried != last_trusted_quote_usd_factor_.end()
-                    ? carried->second : 0.0;
+                    ? carried->second : 0.0);
             if (const auto v = flows.value_usd(mid, quote_usd, xch_usd)) {
                 revive_loss_budget_.record(pair.name, now, *v);
             }
