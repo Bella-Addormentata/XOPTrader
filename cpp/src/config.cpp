@@ -4889,6 +4889,20 @@ AppConfig load_config(const std::string& path,
         for (std::size_t i = 0; i < cfg.pairs.size(); ++i) {
             if (!cfg.pairs[i].revive_market) continue;
 
+            // [REVIVE2 2026-10-22] Batching merges a side's tiers into one
+            // wallet offer (post_merged_side), so the per-tier revive size
+            // cap would not bound what is actually posted.
+            if (cfg.strategy.batch_offers_enabled
+                && cfg.strategy.revive_max_offer_size_units > 0.0) {
+                throw ConfigError(
+                    "pairs[" + std::to_string(i) + "] ("
+                    + cfg.pairs[i].name + "): revive_market with "
+                    "strategy.revive_max_offer_size_units > 0 cannot be "
+                    "combined with strategy.batch_offers_enabled: batching "
+                    "merges a side's capped tiers into one larger offer. "
+                    "Disable batching, or set the cap to 0.");
+            }
+
             // [REVIVE2 2026-10-22] Pace resizes and replans its pairs'
             // ladders after the revive size cap is applied (Step 7's pace
             // post-pass, Step 8's replan after a take), so the cap would not

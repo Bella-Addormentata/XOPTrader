@@ -440,15 +440,23 @@ public:
      * seen by detect_fills, completes its offer_log row.
      *
      * @param current_block  Height, for logging.
-     * @param only_pairs     [REVIVE2 2026-10-22] When set, only offers on
-     *                       these pairs are retired (Step 8's revive-only
-     *                       run under the flash-crash guard); null = all.
      * @return Offer IDs whose local cancel the wallet accepted; the caller
      *         records each through mark_offer_cancel_submitted.
+     *
+     * [REVIVE2 2026-10-22] Honours set_retire_pair_filter().
      */
     asio::awaitable<std::vector<std::string>> retire_expired_offers(
-        BlockHeight current_block,
-        const std::unordered_set<std::string>* only_pairs = nullptr);
+        BlockHeight current_block);
+
+    /// [REVIVE2 2026-10-22] Restrict retire_expired_offers() to offers on
+    /// `only_pairs` (Step 8's revive-only run under the flash-crash guard);
+    /// nullptr = every pair. The set must outlive the retire call; the
+    /// engine sets it immediately before and clears it immediately after.
+    void set_retire_pair_filter(
+        const std::unordered_set<std::string>* only_pairs) noexcept
+    {
+        retire_only_pairs_ = only_pairs;
+    }
 
     /**
      * @brief [S46 2026-09-02] The outcome of a cancel sweep, in enough
@@ -1721,6 +1729,9 @@ private:
     /// cancel_all judges a Dead proof's depth against it; an older block only
     /// makes that stricter, and none (0) makes no Dead proof final.
     BlockHeight latest_fill_poll_block_{0};
+
+    /// [REVIVE2 2026-10-22] See set_retire_pair_filter().
+    const std::unordered_set<std::string>* retire_only_pairs_{nullptr};
 
     /// [S70] Block of retire_expired_offers' last WARN.  A wallet that cannot
     /// supply a TRUSTED chain clock -- no answer, or a full-node peer this

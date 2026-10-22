@@ -3996,3 +3996,47 @@ TEST(ConfigParserTest, ReviveAndPaceOnOnePairAreRefused) {
             << e.what();
     }
 }
+
+// [REVIVE2 2026-10-22] Batching merges a side's capped tiers into one
+// larger offer, so the revive size cap cannot hold with it.
+TEST(ConfigParserTest, ReviveSizeCapAndBatchingAreRefusedTogether) {
+    auto revive_yaml = [](const std::string& strategy_extra) {
+        std::string yaml(kMinimalValidYaml);
+        const std::string anchor =
+            "    name: \"XCH/TEST\"\n"
+            "    enabled: true\n";
+        auto pos = yaml.find(anchor);
+        EXPECT_NE(pos, std::string::npos);
+        yaml.insert(pos + anchor.size(), "    revive_market: true\n");
+        auto npos_ = yaml.find("name: \"XCH/TEST\"");
+        yaml.replace(npos_, std::string("name: \"XCH/TEST\"").size(),
+                     "name: \"XCH/wUSDC.b\"");
+        const std::string s_anchor = "strategy:\n";
+        const auto at = yaml.find(s_anchor);
+        EXPECT_NE(at, std::string::npos);
+        yaml.insert(at + s_anchor.size(), strategy_extra);
+        yaml += "\ncoingecko:\n  enabled: true\n"
+                "  coin_ids: [\"chia\", \"usd-coin\"]\n";
+        return yaml;
+    };
+    {
+        TempYaml tmp(revive_yaml("  batch_offers_enabled: true\n"));
+        try {
+            static_cast<void>(xop::load_config(tmp.path()));
+            FAIL() << "a capped revive pair with batching must be refused";
+        } catch (const xop::ConfigError& e) {
+            EXPECT_NE(std::string(e.what()).find("batch_offers_enabled"),
+                      std::string::npos) << e.what();
+        }
+    }
+    {
+        // With the cap off, batching cannot break it.
+        TempYaml tmp(revive_yaml("  batch_offers_enabled: true\n"
+                                 "  revive_max_offer_size_units: 0\n"));
+        EXPECT_NO_THROW(static_cast<void>(xop::load_config(tmp.path())));
+    }
+    {
+        TempYaml tmp(revive_yaml(""));
+        EXPECT_NO_THROW(static_cast<void>(xop::load_config(tmp.path())));
+    }
+}

@@ -73,8 +73,11 @@ SUBMIT_REASONS = (
     # [SEED-FAIL-CLOSED review round 2] Step 8 takes down a pair's resting
     # offers while a position it trades is unverified.
     '"unverified_position"',
+    # [REVIVE2 2026-10-22] A revive pair over its daily loss budget has its
+    # resting offers cancelled (Engine::step_cancel_revive_over_budget).
+    '"revive_loss_budget"',
 )
-SUBMIT_SITE_COUNT = 21
+SUBMIT_SITE_COUNT = 22
 
 
 def _read(path: Path) -> str:

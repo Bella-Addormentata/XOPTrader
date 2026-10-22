@@ -4461,6 +4461,16 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
     try { co_await step_observe_asset_pegs(block_height); }
     catch (const std::exception& e) {
         spdlog::error("[Engine] peg observation failed: {}", e.what());
+    }
+
+    // [REVIVE2 2026-10-22] A revive pair over its daily loss budget posts
+    // nothing new (Step 4), and its resting offers are cancelled here,
+    // every heartbeat until flat, so they cannot keep filling after the
+    // limit tripped -- including under the flash-crash guard.
+    try { co_await step_cancel_revive_over_budget(block_height); }
+    catch (const std::exception& e) {
+        spdlog::error("[Engine] revive loss-budget cancel failed: {}",
+                      e.what());
     } }
     catch (const std::exception& e) {
         spdlog::error("[Engine] Step 1 (market state) failed: {}", e.what());
@@ -12274,12 +12284,12 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
     // [REVIVE2 2026-10-22] A revive-only run (step8_pair_filter_) retires
     // expired offers on its own pairs only, and skips every cross-pair
     // pass below; see engine.hpp.
+    offer_mgr_->set_retire_pair_filter(
+        step8_pair_filter_ ? &*step8_pair_filter_ : nullptr);
     if (config_.strategy.ttl_cancel_mode == TtlCancelMode::Expire
         && wallet_step_may_run("Step 8 expired-offer retire")) {
         const std::vector<std::string> expired_retired =
-            co_await offer_mgr_->retire_expired_offers(
-                block_height,
-                step8_pair_filter_ ? &*step8_pair_filter_ : nullptr);
+            co_await offer_mgr_->retire_expired_offers(block_height);
         for (const auto& oid : expired_retired) {
             try {
                 db_->mark_offer_cancel_submitted(oid, block_height,
@@ -12290,6 +12300,8 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             }
         }
     }
+
+    offer_mgr_->set_retire_pair_filter(nullptr);
 
     // [XCH-LOCK-LEDGER 2026-08-23] Seed the per-cycle XCH coin-lock budget
     // from the wallet's real free-coin list before any pair posts.  This is
@@ -12313,7 +12325,11 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
     {
         std::size_t may_post = 0;
         for (const auto& [batch_pair, batch_pcs] : cycle_) {
-            static_cast<void>(batch_pair);
+            // [REVIVE2 2026-10-22] A revive-only run posts only its pairs.
+            if (step8_pair_filter_
+                && step8_pair_filter_->count(batch_pair) == 0) {
+                continue;
+            }
             if (batch_pcs.quote_valid) {
                 may_post += batch_pcs.ladder.size();
             }
@@ -12390,9 +12406,9 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
     // [REVIVE2 2026-10-22] Not in a revive-only run: this drain cancels
     // across every pair, including those the flash-crash guard is holding,
     // and clears the drain markers. It runs on the next normal heartbeat.
-    if (!step8_pair_filter_
-        && (!state_unverified_assets_.empty() || !state_verified_undrained_.empty())
-        && offer_mgr_ && !dry_run_ && !cancel_all_inflight_) {
+    if ((!state_unverified_assets_.empty() || !state_verified_undrained_.empty())
+        && offer_mgr_ && !dry_run_ && !cancel_all_inflight_
+        && !step8_pair_filter_) {
         std::vector<std::string> to_cancel;
         for (const auto& po : state_->get_all_offers()) {
             const PairConfig* drain_pc = find_pair_config(po.pair_name);
@@ -19669,6 +19685,25 @@ void Engine::record_taker_fill(const std::string& strategy,
         f.fee_mojos             = to_mojo_saturating(fee_mojos);
         db_->insert_taker_fill(f);
 
+        // [REVIVE2 2026-10-22] A take on a revive pair moves that pair's
+        // flows too, or a taker hedge of a maker position would leave the
+        // loss budget seeing an exposure that has been closed.
+        if (pc.revive_market && pc.base_mojos_per_unit > 0) {
+            if (!revive_loss_budget_.has_samples(pc.name)
+                && revive_flows_[pc.name].is_empty()) {
+                revive_loss_budget_.record(
+                    pc.name, std::chrono::system_clock::now(), 0.0);
+            }
+            revive_flows_[pc.name].apply_fill(
+                we_bought_base,
+                static_cast<double>(base_mojos)
+                    / static_cast<double>(pc.base_mojos_per_unit),
+                static_cast<double>(price_mojos)
+                    / static_cast<double>(kMojosPerXch),
+                static_cast<double>(fee_mojos)
+                    / static_cast<double>(kMojosPerXch));
+        }
+
         // Ledger legs, keyed on the trade id so a retry cannot double-post.
         //
         // [S44 2026-09-02] The skip below used to be COMPLETELY SILENT --
@@ -25483,5 +25518,39 @@ asio::awaitable<void> Engine::step_maintain_coin_pool(BlockHeight block_height)
     coin_pool_last_block_ = block_height;
     co_return;
 }
+// ---------------------------------------------------------------------------
+// [REVIVE2 2026-10-22] Cancel the resting offers of revive pairs that are
+// over their daily loss budget (revive_over_budget_, set in Step 4).
+// Convergent like the PEGSUSPEND cancel: retried every heartbeat until no
+// offer rests on such a pair.
+// ---------------------------------------------------------------------------
+asio::awaitable<void> Engine::step_cancel_revive_over_budget(BlockHeight block_height)
+{
+    if (revive_over_budget_.empty() || !offer_mgr_ || dry_run_
+        || cancel_all_inflight_) {
+        co_return;
+    }
+    if (!wallet_step_may_run("revive loss-budget cancel")) co_return;
+    std::vector<std::string> to_cancel;
+    for (const auto& po : state_->get_all_offers()) {
+        if (!po.cancel_pending && revive_over_budget_.count(po.pair_name) > 0) {
+            to_cancel.push_back(po.offer_id);
+        }
+    }
+    if (to_cancel.empty()) co_return;
+    const auto done = co_await offer_mgr_->selective_cancel(to_cancel);
+    for (const auto& id : done) {
+        try {
+            db_->mark_offer_cancel_submitted(id, block_height,
+                                             "revive_loss_budget");
+        } catch (const std::exception& e) {
+            spdlog::debug("[Engine] could not mark {} cancel_pending: {}",
+                          id.substr(0, 12), e.what());
+        }
+    }
+    spdlog::warn("[Engine] revive loss budget: cancelled {}/{} resting "
+                 "offer(s) on pairs over budget", done.size(), to_cancel.size());
+}
+
 }  // namespace xop
 
