@@ -13370,8 +13370,14 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                             }
 
                             // Periodic stuck-tx pruning.
-                            if (block_height >= last_stuck_tx_prune_block_
-                                                + kStuckTxPruneInterval) {
+                            // [REVIVE2 2026-10-22] Not in a revive-only run:
+                            // the pruner can delete EVERY unconfirmed
+                            // transaction in the wallet, including the
+                            // pending creates/cancels of pairs the flash-
+                            // crash guard is holding.
+                            if (!step8_pair_filter_
+                                && block_height >= last_stuck_tx_prune_block_
+                                                   + kStuckTxPruneInterval) {
                                 last_stuck_tx_prune_block_ = block_height;
                                 try {
                                     auto pruned = co_await
