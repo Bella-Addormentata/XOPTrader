@@ -5117,8 +5117,9 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
         if (config_.strategy.revive_isolate_flash_crash) {
             for (const auto& [name, pcs] : cycle_) {
                 const PairConfig* pc = find_pair_config(name);
-                if (pc != nullptr && pc->revive_market && pcs.quote_valid
-                    && !pcs.ladder.empty()) {
+                // An empty ladder still qualifies: Step 8's liveness refresh
+                // is what recovers a ladder emptied by a stale balance cache.
+                if (pc != nullptr && pc->revive_market && pcs.quote_valid) {
                     revive_ok.insert(name);
                 }
             }
@@ -6389,6 +6390,15 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
         // one is not counted twice.
         if (fill_newly_recorded && fill_pair_cfg->revive_market
             && fill_pair_cfg->base_mojos_per_unit > 0) {
+            // A zero baseline before the pair's first fill: the flows start
+            // at zero, and without it a loss on the first heartbeat would be
+            // the window's first sample and read as no drawdown at all.
+            if (!revive_loss_budget_.has_samples(fill.pair_name)
+                && revive_flows_[fill.pair_name].is_empty()) {
+                revive_loss_budget_.record(fill.pair_name,
+                                           std::chrono::system_clock::now(),
+                                           0.0);
+            }
             revive_flows_[fill.pair_name].apply_fill(
                 fill.side == Side::Bid,
                 static_cast<double>(fill.size)
@@ -12261,13 +12271,15 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
     // free of RPCs until the host clock says some offer's max_time has passed.
     // An accepted local cancel is still only a SUBMISSION to offer_log: the
     // wallet's CANCELLED verdict, seen by detect_fills, completes the row.
-    // [REVIVE2 2026-10-22] A revive-only run (step8_pair_filter_) skips
-    // this and every other cross-pair pass below; see engine.hpp.
-    if (!step8_pair_filter_
-        && config_.strategy.ttl_cancel_mode == TtlCancelMode::Expire
+    // [REVIVE2 2026-10-22] A revive-only run (step8_pair_filter_) retires
+    // expired offers on its own pairs only, and skips every cross-pair
+    // pass below; see engine.hpp.
+    if (config_.strategy.ttl_cancel_mode == TtlCancelMode::Expire
         && wallet_step_may_run("Step 8 expired-offer retire")) {
         const std::vector<std::string> expired_retired =
-            co_await offer_mgr_->retire_expired_offers(block_height);
+            co_await offer_mgr_->retire_expired_offers(
+                block_height,
+                step8_pair_filter_ ? &*step8_pair_filter_ : nullptr);
         for (const auto& oid : expired_retired) {
             try {
                 db_->mark_offer_cancel_submitted(oid, block_height,
@@ -12375,7 +12387,11 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         return verified != state_verified_undrained_.end()
             && po.created_at_block <= verified->second;
     };
-    if ((!state_unverified_assets_.empty() || !state_verified_undrained_.empty())
+    // [REVIVE2 2026-10-22] Not in a revive-only run: this drain cancels
+    // across every pair, including those the flash-crash guard is holding,
+    // and clears the drain markers. It runs on the next normal heartbeat.
+    if (!step8_pair_filter_
+        && (!state_unverified_assets_.empty() || !state_verified_undrained_.empty())
         && offer_mgr_ && !dry_run_ && !cancel_all_inflight_) {
         std::vector<std::string> to_cancel;
         for (const auto& po : state_->get_all_offers()) {
@@ -12658,6 +12674,10 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         std::set<std::string> refreshed;
         for (auto& [pair_name, pcs] : cycle_) {
             if (!pcs.ladder.empty()) continue;
+            // [REVIVE2 2026-10-22] A revive-only run refreshes its own pairs.
+            if (step8_pair_filter_ && step8_pair_filter_->count(pair_name) == 0) {
+                continue;
+            }
             // [SEED-FAIL-CLOSED review round 4] Pace-managed pairs too.  Their
             // empty ladder is pace's own decision, not the deadlock this
             // refresh breaks, but nothing else below the sync gate reaches

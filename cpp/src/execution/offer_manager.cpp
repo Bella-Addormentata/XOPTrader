@@ -503,7 +503,9 @@ OfferManager::retire_offer_failed_expiry(const PendingOffer& adopt,
 // ---------------------------------------------------------------------------
 
 asio::awaitable<std::vector<std::string>>
-OfferManager::retire_expired_offers(BlockHeight current_block)
+OfferManager::retire_expired_offers(
+    BlockHeight current_block,
+    const std::unordered_set<std::string>* only_pairs)
 {
     std::vector<std::string> retired;
     if (strategy_cfg_.ttl_cancel_mode != TtlCancelMode::Expire) {
@@ -518,6 +520,9 @@ OfferManager::retire_expired_offers(BlockHeight current_block)
     std::vector<PendingOffer> due;
     for (const auto& po : state_->get_all_offers()) {
         if (po.cancel_pending) continue;   // a cancel is already in hand
+        if (only_pairs != nullptr && only_pairs->count(po.pair_name) == 0) {
+            continue;
+        }
         if (expiry_worth_checking(po.expiry_max_time,
                                   static_cast<std::int64_t>(host_now_s))) {
             due.push_back(po);

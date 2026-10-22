@@ -440,11 +440,15 @@ public:
      * seen by detect_fills, completes its offer_log row.
      *
      * @param current_block  Height, for logging.
+     * @param only_pairs     [REVIVE2 2026-10-22] When set, only offers on
+     *                       these pairs are retired (Step 8's revive-only
+     *                       run under the flash-crash guard); null = all.
      * @return Offer IDs whose local cancel the wallet accepted; the caller
      *         records each through mark_offer_cancel_submitted.
      */
     asio::awaitable<std::vector<std::string>> retire_expired_offers(
-        BlockHeight current_block);
+        BlockHeight current_block,
+        const std::unordered_set<std::string>* only_pairs = nullptr);
 
     /**
      * @brief [S46 2026-09-02] The outcome of a cancel sweep, in enough

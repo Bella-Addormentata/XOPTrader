@@ -396,3 +396,30 @@ TEST(ReviveQuoteUsd, TheCarriedFactorIsTheLastResort)
     EXPECT_DOUBLE_EQ(xop::revive::quote_usd_price(false, 1.43, 0.0, 1.0), 1.0);
     EXPECT_DOUBLE_EQ(xop::revive::quote_usd_price(false, 1.43, kNaN, 0.0), 0.0);
 }
+
+TEST(ReviveLossBudget, AZeroBaselineCatchesAFirstHeartbeatLoss)
+{
+    // [review, PR #179] Step 2 books a fill before Step 11's first sample.
+    // Without a baseline the first sample is already -20 and the window
+    // reads no drawdown; the engine records 0 before the first fill.
+    LossBudget b;
+    EXPECT_FALSE(b.has_samples("p"));
+    b.record("p", kT0, 0.0);                 // the baseline
+    EXPECT_TRUE(b.has_samples("p"));
+    b.record("p", kT0 + 2min, -20.0);
+    EXPECT_TRUE(b.exceeded("p", 10.0));
+
+    LossBudget no_baseline;
+    no_baseline.record("p", kT0 + 2min, -20.0);
+    no_baseline.record("p", kT0 + 4min, -20.0);
+    EXPECT_FALSE(no_baseline.exceeded("p", 10.0))
+        << "the counterfactual the baseline exists for";
+}
+
+TEST(RevivePairFlows, IsEmptyUntilTheFirstFill)
+{
+    xop::revive::PairFlows f;
+    EXPECT_TRUE(f.is_empty());
+    f.apply_fill(true, 1.0, 1.5, 0.0);
+    EXPECT_FALSE(f.is_empty());
+}

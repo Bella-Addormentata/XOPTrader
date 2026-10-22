@@ -117,6 +117,12 @@ struct PairFlows {
     double quote_units{0.0};   ///< net quote received (+) / paid (-)
     double fee_xch{0.0};       ///< offer-creation fees paid, in XCH
 
+    /// True until the first fill is booked.
+    [[nodiscard]] bool is_empty() const noexcept
+    {
+        return base_units == 0.0 && quote_units == 0.0 && fee_xch == 0.0;
+    }
+
     /// Book one fill. `bid` true = we bought base. `price` is quote per
     /// base. Non-finite or non-positive inputs are ignored.
     void apply_fill(bool bid, double base_units_filled, double price,
@@ -199,6 +205,13 @@ public:
             d.push_back(Bucket{now, pnl_usd, pnl_usd});
         }
         while (!d.empty() && now - d.front().start > window_) d.pop_front();
+    }
+
+    /// True once anything has been recorded for `pair` (and not all aged out).
+    [[nodiscard]] bool has_samples(const std::string& pair) const
+    {
+        const auto it = samples_.find(pair);
+        return it != samples_.end() && !it->second.empty();
     }
 
     /// Peak-to-latest drawdown in USD for `pair` (0 with no samples).
