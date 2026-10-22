@@ -5396,6 +5396,10 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
 
         // [T3-24] Assume invalid until successful data ingestion.
         bool pair_data_ok = false;
+        // [REVIVE2 2026-10-22] A revive pair whose external reference was
+        // published this heartbeat from a fresh feed is priceable even when
+        // its Dexie ticker has no last trade (a never-traded pair).
+        bool revive_ref_ok = false;
 
         // Per-pair isolation: a failure in one pair must not abort the
         // market-data update for the remaining pairs.
@@ -5604,6 +5608,13 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
                 // leaves that cache untouched.
                 market_data_->ingest_cex_reference(
                     pair.name, cex_mid, coingecko_last_success_at_);
+                if (pair.revive_market
+                    && coingecko_feed_fresh_for_revival(
+                           true, coingecko_last_fetch_,
+                           std::chrono::steady_clock::now(),
+                           config_.market_data.cex_freshness_threshold_sec)) {
+                    revive_ref_ok = true;
+                }
                 spdlog::debug("[Engine] Step 1: {} CoinGecko cex_mid={:.6f}",
                               pair.name, cex_mid);
             }
@@ -5690,8 +5701,8 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
         // ISO/IEC 5055: explicit validity tracking per pair.
         auto cycle_it = cycle_.find(pair.name);
         if (cycle_it != cycle_.end()) {
-            cycle_it->second.market_data_valid = pair_data_ok;
-            if (!pair_data_ok) {
+            cycle_it->second.market_data_valid = pair_data_ok || revive_ref_ok;
+            if (!cycle_it->second.market_data_valid) {
                 spdlog::warn("[Engine] Step 1: {} market data invalid -- "
                              "steps 4-8 gated for this pair", pair.name);
             }
@@ -6372,6 +6383,21 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
 
         // Record the offer as filled in the offer log.
         db_->update_offer_status(fill.offer_id, "filled", fill.block_height, "");
+
+        // [REVIVE2 2026-10-22] A revive pair's own trading flows, for its
+        // daily loss budget. Only a newly journaled fill, so a re-detected
+        // one is not counted twice.
+        if (fill_newly_recorded && fill_pair_cfg->revive_market
+            && fill_pair_cfg->base_mojos_per_unit > 0) {
+            revive_flows_[fill.pair_name].apply_fill(
+                fill.side == Side::Bid,
+                static_cast<double>(fill.size)
+                    / static_cast<double>(fill_pair_cfg->base_mojos_per_unit),
+                static_cast<double>(fill.price)
+                    / static_cast<double>(kMojosPerXch),
+                static_cast<double>(tr.fee_mojos)
+                    / static_cast<double>(kMojosPerXch));
+        }
 
         // Update the inventory tracker with EVERY leg of the fill: base,
         // quote and the XCH creation fee ([FILL-LEGS 2026-09-13]).  Until then
@@ -11603,9 +11629,10 @@ void Engine::step_generate_ladder(BlockHeight block_height)
             // the minimum just enforced).
             if (pair_cfg->revive_market && pcs.revive_thin
                 && config_.strategy.revive_max_offer_size_units > 0.0) {
-                const Mojo revive_cap = static_cast<Mojo>(std::llround(
-                    config_.strategy.revive_max_offer_size_units
-                    * static_cast<double>(pair_cfg->base_mojos_per_unit)));
+                const Mojo revive_cap = static_cast<Mojo>(
+                    revive::cap_units_to_mojos(
+                        config_.strategy.revive_max_offer_size_units,
+                        static_cast<double>(pair_cfg->base_mojos_per_unit)));
                 int revive_capped = 0;
                 for (auto& tq : pcs.ladder) {
                     const Mojo capped = static_cast<Mojo>(
@@ -21371,16 +21398,31 @@ void Engine::step_update_pnl(BlockHeight block_height)
         db_->insert_strategy_quotes_batch(quote_batch);
     }
 
-    // [REVIVE2 2026-10-22] Sample each revive pair's total P&L for its daily
-    // loss budget (read in Step 4 of the next heartbeat). Not while XCH/USD
-    // is unknown: the USD figures then read low for a reason that is not a
-    // loss, and would spend the budget.
-    if (config_.strategy.revive_daily_loss_budget_usd > 0.0 && xch_usd > 0.0) {
+    // [REVIVE2 2026-10-22] Sample each revive pair's own trading P&L for its
+    // daily loss budget (read in Step 4 of the next heartbeat): its fills'
+    // flows on both legs, marked at its mid. A sample whose prices are
+    // unknown is skipped rather than read as a loss.
+    if (config_.strategy.revive_daily_loss_budget_usd > 0.0) {
         const auto now = std::chrono::system_clock::now();
         for (const auto& pair : config_.pairs) {
             if (!pair.enabled || !pair.revive_market) continue;
-            revive_loss_budget_.record(
-                pair.name, now, pnl_->get_pair_pnl(pair.name).total_pnl_usd);
+            const auto fl = revive_flows_.find(pair.name);
+            const revive::PairFlows flows =
+                fl != revive_flows_.end() ? fl->second : revive::PairFlows{};
+            double mid = market_data_->get_mid_price(pair.name);
+            if (!(mid > 0.0)) {
+                if (const auto est =
+                        market_data_->get_fair_value_estimate(pair.name)) {
+                    mid = est->price;
+                }
+            }
+            const auto carried = last_trusted_quote_usd_factor_.find(pair.name);
+            const double quote_usd =
+                carried != last_trusted_quote_usd_factor_.end()
+                    ? carried->second : 0.0;
+            if (const auto v = flows.value_usd(mid, quote_usd, xch_usd)) {
+                revive_loss_budget_.record(pair.name, now, *v);
+            }
         }
     }
 

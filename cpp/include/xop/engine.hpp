@@ -2437,10 +2437,13 @@ private:
     // of flash_crash_state_. Absent = Normal.
     std::unordered_map<std::string, FlashCrashState> revive_crash_state_;
 
-    // [REVIVE2 2026-10-22] Rolling 24h P&L per revive pair, sampled in
-    // step_update_pnl, read in Step 4 against
-    // strategy.revive_daily_loss_budget_usd. Pairs currently over budget
-    // are kept in revive_over_budget_ so the transition logs once.
+    // [REVIVE2 2026-10-22] Each revive pair's own trading flows (booked
+    // in Step 2 from its fills, in memory, so they restart at zero), valued
+    // and sampled into a rolling 24h window in step_update_pnl, read in
+    // Step 4 against strategy.revive_daily_loss_budget_usd. Pairs currently
+    // over budget are kept in revive_over_budget_ so the transition logs
+    // once.
+    std::unordered_map<std::string, revive::PairFlows> revive_flows_;
     revive::LossBudget revive_loss_budget_;
     std::unordered_set<std::string> revive_over_budget_;
 

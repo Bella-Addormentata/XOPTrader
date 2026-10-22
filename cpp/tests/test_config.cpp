@@ -3982,3 +3982,17 @@ TEST(ConfigParserTest, OfferMinInputCoinFracOutsideTheRangeIsRejected) {
             "offer_min_input_coin_frac");
     }
 }
+
+// [REVIVE2 2026-10-22] Pace resizes its pairs' ladders after the revive
+// size cap, so one pair cannot have both.
+TEST(ConfigParserTest, ReviveAndPaceOnOnePairAreRefused) {
+    TempYaml tmp(pace_after_first_pair(pace_with_strategy(kPaceOn + kPaceTargets),
+                                       "    revive_market: true\n"));
+    try {
+        static_cast<void>(xop::load_config(tmp.path()));
+        FAIL() << "a pace-managed revive pair must be refused";
+    } catch (const xop::ConfigError& e) {
+        EXPECT_NE(std::string(e.what()).find("pace manages"), std::string::npos)
+            << e.what();
+    }
+}

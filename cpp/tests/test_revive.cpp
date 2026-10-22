@@ -195,13 +195,112 @@ TEST(ReviveLossBudget, ALossOlderThanTheWindowStopsCounting)
     EXPECT_DOUBLE_EQ(b.drawdown_usd("p"), 0.0);
 }
 
-TEST(ReviveLossBudget, CloseSamplesReplaceRatherThanAccumulate)
+TEST(ReviveLossBudget, CloseSamplesShareABucketButKeepItsPeak)
 {
     LossBudget b(24h, 60s);
     b.record("p", kT0, 10.0);
-    b.record("p", kT0 + 10s, -5.0);   // replaces the 10.0 sample
-    EXPECT_DOUBLE_EQ(b.drawdown_usd("p"), 0.0)
-        << "within min_spacing the latest sample is overwritten";
+    b.record("p", kT0 + 10s, -5.0);   // same bucket: latest -5, peak stays 10
+    EXPECT_DOUBLE_EQ(b.drawdown_usd("p"), 15.0)
+        << "coalescing must not erase the peak it replaced";
+}
+
+TEST(ReviveLossBudget, ALossInsideTheFirstIntervalIsCaught)
+{
+    // [review, PR #179] With the latest-only coalescing, 0 then -20 inside
+    // one interval left a single -20 sample, and another -20 a minute later
+    // still read zero drawdown, so the $10 budget missed a $20 loss.
+    LossBudget b(24h, 60s);
+    b.record("p", kT0, 0.0);
+    b.record("p", kT0 + 20s, -20.0);
+    b.record("p", kT0 + 60s, -20.0);
+    EXPECT_DOUBLE_EQ(b.drawdown_usd("p"), 20.0);
+    EXPECT_TRUE(b.exceeded("p", 10.0));
+}
+
+// ---------------------------------------------------------------------------
+// PairFlows -- the pair's own trading P&L
+// ---------------------------------------------------------------------------
+
+TEST(RevivePairFlows, NoFillsIsZeroWithoutNeedingAnyPrice)
+{
+    const xop::revive::PairFlows f;
+    const auto v = f.value_usd(0.0, 1.43, 0.0);
+    ASSERT_TRUE(v.has_value());
+    EXPECT_DOUBLE_EQ(*v, 0.0);
+}
+
+TEST(RevivePairFlows, ABidIsMarkedOnBothLegs)
+{
+    // wmilliETH.b/XCH: buy 2 milliETH at 1.50 XCH, XCH at $1.40.
+    xop::revive::PairFlows f;
+    f.apply_fill(/*bid=*/true, 2.0, 1.50, 0.0);
+    EXPECT_DOUBLE_EQ(f.base_units, 2.0);
+    EXPECT_DOUBLE_EQ(f.quote_units, -3.0);
+    // Mid falls to 1.40 XCH: 2 x 1.40 - 3.0 = -0.2 XCH = -$0.28.
+    EXPECT_NEAR(*f.value_usd(1.40, 1.40, 1.40), -0.28, 1e-12);
+    // Mid rises to 1.60: +0.2 XCH = +$0.28.
+    EXPECT_NEAR(*f.value_usd(1.60, 1.40, 1.40), 0.28, 1e-12);
+}
+
+TEST(RevivePairFlows, ARoundTripRealizesTheSpreadAndPaysFees)
+{
+    xop::revive::PairFlows f;
+    f.apply_fill(true, 1.0, 1.50, 0.005);    // buy at 1.50
+    f.apply_fill(false, 1.0, 1.56, 0.005);   // sell at 1.56
+    EXPECT_DOUBLE_EQ(f.base_units, 0.0);
+    // +0.06 XCH spread - 0.01 XCH fees = 0.05 XCH at $1.40, at any mid.
+    EXPECT_NEAR(*f.value_usd(0.0, 1.40, 1.40), 0.07, 1e-12);
+}
+
+TEST(RevivePairFlows, AnUnknownPriceIsNotALoss)
+{
+    xop::revive::PairFlows f;
+    f.apply_fill(true, 2.0, 1.50, 0.005);
+    EXPECT_FALSE(f.value_usd(0.0, 1.40, 1.40).has_value()) << "no mid";
+    EXPECT_FALSE(f.value_usd(1.50, 0.0, 1.40).has_value()) << "no quote USD";
+    EXPECT_FALSE(f.value_usd(1.50, 1.40, kNaN).has_value()) << "no XCH USD";
+}
+
+TEST(RevivePairFlows, BadFillsAreIgnored)
+{
+    xop::revive::PairFlows f;
+    f.apply_fill(true, 0.0, 1.5, 0.0);
+    f.apply_fill(true, 1.0, -1.5, 0.0);
+    f.apply_fill(true, kNaN, 1.5, 0.0);
+    EXPECT_DOUBLE_EQ(f.base_units, 0.0);
+    EXPECT_DOUBLE_EQ(f.quote_units, 0.0);
+}
+
+// ---------------------------------------------------------------------------
+// cap_units_to_mojos
+// ---------------------------------------------------------------------------
+
+TEST(ReviveSizeCap, ConvertsUnitsToMojos)
+{
+    EXPECT_EQ(xop::revive::cap_units_to_mojos(1.0, 1e12), 1'000'000'000'000LL);
+    EXPECT_EQ(xop::revive::cap_units_to_mojos(2.5, 1000.0), 2'500);
+}
+
+TEST(ReviveSizeCap, ATinyPositiveCapNeverBecomesTheNoCapSentinel)
+{
+    // [review, PR #179] 0.0001 units of a 1000-mojo CAT is 0.1 mojo, which
+    // rounded to 0 -- the "no cap" value -- and left a 5-unit tier uncapped.
+    EXPECT_EQ(xop::revive::cap_units_to_mojos(0.0001, 1000.0), 1);
+    EXPECT_EQ(xop::revive::capped_tier_size(5'000, 1, 1'000), 1'000)
+        << "a one-mojo cap still caps to the minimum size";
+}
+
+TEST(ReviveSizeCap, SaturatesInsteadOfOverflowing)
+{
+    EXPECT_EQ(xop::revive::cap_units_to_mojos(1e6, 1e15), 9'000'000'000'000'000'000LL);
+}
+
+TEST(ReviveSizeCap, NonPositiveOrNonFiniteIsNoCap)
+{
+    EXPECT_EQ(xop::revive::cap_units_to_mojos(0.0, 1e12), 0);
+    EXPECT_EQ(xop::revive::cap_units_to_mojos(-1.0, 1e12), 0);
+    EXPECT_EQ(xop::revive::cap_units_to_mojos(kNaN, 1e12), 0);
+    EXPECT_EQ(xop::revive::cap_units_to_mojos(1.0, 0.0), 0);
 }
 
 TEST(ReviveLossBudget, PairsAreIndependent)

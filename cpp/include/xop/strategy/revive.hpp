@@ -25,8 +25,9 @@
 //
 // and at all times:
 //
-//   * stops quoting once its P&L has fallen more than a daily loss budget
-//     below its peak in the last 24 hours (LossBudget).
+//   * stops quoting once its own trading P&L (PairFlows) has fallen more
+//     than a daily loss budget below its peak in the last 24 hours
+//     (LossBudget).
 //
 // Everything that protects against REAL loss still applies unchanged: the
 // external estimate must come from a fresh feed (load_config already
@@ -105,13 +106,62 @@ template <typename State>
     return s;
 }
 
+/// A revive pair's own trading P&L: the base and quote it has bought and
+/// sold through its fills, plus the XCH fees those offers cost, valued at
+/// the current mid. Starts at zero, so a pair that has not traded has lost
+/// nothing; inventory held before revive, or shared with another pair, is
+/// not attributed to it. Both legs count: a bid that bought base with quote
+/// is worth (base x mid - quote paid) whatever asset carries the loss.
+struct PairFlows {
+    double base_units{0.0};    ///< net base bought (+) / sold (-)
+    double quote_units{0.0};   ///< net quote received (+) / paid (-)
+    double fee_xch{0.0};       ///< offer-creation fees paid, in XCH
+
+    /// Book one fill. `bid` true = we bought base. `price` is quote per
+    /// base. Non-finite or non-positive inputs are ignored.
+    void apply_fill(bool bid, double base_units_filled, double price,
+                    double fee_xch_paid) noexcept
+    {
+        if (!(base_units_filled > 0.0) || !std::isfinite(base_units_filled)
+            || !(price > 0.0) || !std::isfinite(price)) {
+            return;
+        }
+        const double quote = base_units_filled * price;
+        base_units  += bid ? base_units_filled : -base_units_filled;
+        quote_units += bid ? -quote : quote;
+        if (fee_xch_paid > 0.0 && std::isfinite(fee_xch_paid)) {
+            fee_xch += fee_xch_paid;
+        }
+    }
+
+    /// The flows marked at `mid` (quote per base) in USD, given the quote
+    /// asset's and XCH's USD prices. nullopt when any input it needs is
+    /// unknown, so a missing price is never read as a loss.
+    [[nodiscard]] std::optional<double> value_usd(double mid, double quote_usd,
+                                                  double xch_usd) const noexcept
+    {
+        if (!(quote_usd > 0.0) || !std::isfinite(quote_usd)) return std::nullopt;
+        if (base_units != 0.0 && (!(mid > 0.0) || !std::isfinite(mid))) {
+            return std::nullopt;
+        }
+        if (fee_xch > 0.0 && (!(xch_usd > 0.0) || !std::isfinite(xch_usd))) {
+            return std::nullopt;
+        }
+        const double base_value = base_units != 0.0 ? base_units * mid : 0.0;
+        const double fees = fee_xch > 0.0 ? fee_xch * xch_usd : 0.0;
+        return (quote_units + base_value) * quote_usd - fees;
+    }
+};
+
 /// Per-pair daily loss budget over a rolling window of P&L samples.
 ///
-/// The drawdown is the window's PEAK total P&L minus the LATEST sample, so a
-/// gain earlier in the day is not spent before the budget counts, and a
-/// loss that has been earned back stops counting once it leaves the window.
-/// Total P&L includes the mark-to-market of inventory: a revive pair holding
-/// an asset whose price falls is losing money whether or not it traded.
+/// The drawdown is the window's PEAK P&L minus the LATEST sample, so a gain
+/// earlier in the day is not spent before the budget counts, and a loss that
+/// has been earned back stops counting once it leaves the window.
+///
+/// Samples closer together than `min_spacing` share one bucket. A bucket
+/// keeps its own highest value as well as its latest, so coalescing never
+/// erases a peak: a P&L of 0 then -20 inside one bucket is a 20 drawdown.
 class LossBudget {
 public:
     using Clock     = std::chrono::system_clock;
@@ -121,20 +171,19 @@ public:
                         std::chrono::seconds min_spacing = std::chrono::seconds(60))
         : window_(window), min_spacing_(min_spacing) {}
 
-    /// Record `total_pnl_usd` for `pair` at `now`. Samples closer together
-    /// than `min_spacing` replace the latest one rather than adding a new
-    /// entry, so the window holds at most ~1,440 samples per pair. Non-finite
-    /// values are ignored.
-    void record(const std::string& pair, TimePoint now, double total_pnl_usd)
+    /// Record `pnl_usd` for `pair` at `now`. The window holds at most about
+    /// window / min_spacing buckets per pair. Non-finite values are ignored.
+    void record(const std::string& pair, TimePoint now, double pnl_usd)
     {
-        if (!std::isfinite(total_pnl_usd)) return;
+        if (!std::isfinite(pnl_usd)) return;
         auto& d = samples_[pair];
-        if (!d.empty() && now - d.back().first < min_spacing_) {
-            d.back().second = total_pnl_usd;
+        if (!d.empty() && now - d.back().start < min_spacing_) {
+            d.back().latest = pnl_usd;
+            d.back().peak   = std::max(d.back().peak, pnl_usd);
         } else {
-            d.emplace_back(now, total_pnl_usd);
+            d.push_back(Bucket{now, pnl_usd, pnl_usd});
         }
-        while (!d.empty() && now - d.front().first > window_) d.pop_front();
+        while (!d.empty() && now - d.front().start > window_) d.pop_front();
     }
 
     /// Peak-to-latest drawdown in USD for `pair` (0 with no samples).
@@ -142,9 +191,9 @@ public:
     {
         const auto it = samples_.find(pair);
         if (it == samples_.end() || it->second.empty()) return 0.0;
-        double peak = it->second.front().second;
-        for (const auto& s : it->second) peak = std::max(peak, s.second);
-        return std::max(0.0, peak - it->second.back().second);
+        double peak = it->second.front().peak;
+        for (const auto& b : it->second) peak = std::max(peak, b.peak);
+        return std::max(0.0, peak - it->second.back().latest);
     }
 
     /// True when the drawdown exceeds `budget_usd`. A budget <= 0 (or not
@@ -156,11 +205,30 @@ public:
     }
 
 private:
+    struct Bucket {
+        TimePoint start;
+        double    latest;
+        double    peak;
+    };
     std::chrono::seconds window_;
     std::chrono::seconds min_spacing_;
-    std::unordered_map<std::string,
-                       std::deque<std::pair<TimePoint, double>>> samples_;
+    std::unordered_map<std::string, std::deque<Bucket>> samples_;
 };
+
+/// The revive size cap in base mojos, or 0 (no cap) when `cap_units` is not
+/// a positive finite number. Saturates instead of overflowing, and a positive
+/// cap is never rounded down to 0 -- that is the "no cap" sentinel, so a tiny
+/// cap would silently disable itself.
+[[nodiscard]] inline std::int64_t cap_units_to_mojos(double cap_units,
+                                                     double mojos_per_unit) noexcept
+{
+    if (!(cap_units > 0.0) || !std::isfinite(cap_units)) return 0;
+    if (!(mojos_per_unit > 0.0) || !std::isfinite(mojos_per_unit)) return 0;
+    const double v = cap_units * mojos_per_unit;
+    constexpr double kMax = 9.0e18;   // below INT64_MAX (~9.22e18)
+    if (!(v < kMax)) return static_cast<std::int64_t>(kMax);
+    return std::max<std::int64_t>(1, std::llround(v));
+}
 
 }  // namespace xop::revive
 
