@@ -1619,6 +1619,26 @@ StrategyConfig parse_strategy(const YAML::Node& root)
             throw ConfigError(sec + ".max_offer_size_units must be >= 0");
         }
     }
+    // [REVIVE2 2026-10-22] Each 0 = off; negative or non-finite is an error.
+    for (const auto& [key, field] : {
+             std::pair<const char*, double*>{"revive_min_half_spread_bps",
+                                             &cfg.revive_min_half_spread_bps},
+             {"revive_max_offer_size_units", &cfg.revive_max_offer_size_units},
+             {"revive_daily_loss_budget_usd", &cfg.revive_daily_loss_budget_usd}}) {
+        if (node[key] && node[key].IsDefined() && !node[key].IsNull()) {
+            const double v = node[key].as<double>();
+            if (!std::isfinite(v) || v < 0.0) {
+                throw ConfigError(sec + "." + key + " must be a finite value >= 0");
+            }
+            *field = v;
+        }
+    }
+    if (node["revive_isolate_flash_crash"]
+        && node["revive_isolate_flash_crash"].IsDefined()
+        && !node["revive_isolate_flash_crash"].IsNull()) {
+        cfg.revive_isolate_flash_crash =
+            node["revive_isolate_flash_crash"].as<bool>();
+    }
     if (node["wallet_balance_caps_enabled"] && node["wallet_balance_caps_enabled"].IsDefined()
         && !node["wallet_balance_caps_enabled"].IsNull()) {
         cfg.wallet_balance_caps_enabled = node["wallet_balance_caps_enabled"].as<bool>();

@@ -1,0 +1,274 @@
+// test_revive.cpp -- [REVIVE2 2026-10-22] revive_market decisions for thin
+// markets (xop/strategy/revive.hpp) and the feed-listing CEX leg that lets a
+// revive pair price an empty or one-sided book (xop/feed_listings.hpp).
+
+#include <gtest/gtest.h>
+
+#include "xop/feed_listings.hpp"
+#include "xop/strategy/revive.hpp"
+
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <limits>
+#include <map>
+#include <string>
+
+namespace {
+
+using namespace std::chrono_literals;
+using xop::revive::LossBudget;
+
+const double kNaN = std::numeric_limits<double>::quiet_NaN();
+const double kInf = std::numeric_limits<double>::infinity();
+
+// The same three states as xop::FlashCrashState, without pulling in the
+// engine header.
+enum class S { Normal, Crash, Recovery };
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// book_is_thin
+// ---------------------------------------------------------------------------
+
+TEST(ReviveBook, ATwoSidedThirdPartyBookIsNotThin)
+{
+    EXPECT_FALSE(xop::revive::book_is_thin(1.584, 2.000, true));
+}
+
+TEST(ReviveBook, AMissingSideIsThin)
+{
+    // wmilliETH.b/XCH on 2026-10-22: asks only.
+    EXPECT_TRUE(xop::revive::book_is_thin(0.0, 1.8277, true));
+    EXPECT_TRUE(xop::revive::book_is_thin(1.4850, 0.0, true));
+    EXPECT_TRUE(xop::revive::book_is_thin(0.0, 0.0, true));
+}
+
+TEST(ReviveBook, ACrossedOrLockedBookIsThin)
+{
+    EXPECT_TRUE(xop::revive::book_is_thin(2.0, 1.5, true));
+    EXPECT_TRUE(xop::revive::book_is_thin(1.5, 1.5, true));
+}
+
+TEST(ReviveBook, TouchesThatMayBeOursAreThin)
+{
+    EXPECT_TRUE(xop::revive::book_is_thin(1.584, 2.000, false))
+        << "a raw ticker can be our own offers: it is no third-party book";
+}
+
+TEST(ReviveBook, NonFinitePricesAreThin)
+{
+    EXPECT_TRUE(xop::revive::book_is_thin(kNaN, 2.0, true));
+    EXPECT_TRUE(xop::revive::book_is_thin(1.5, kInf, true));
+}
+
+// ---------------------------------------------------------------------------
+// half_spread_floor_bps
+// ---------------------------------------------------------------------------
+
+TEST(ReviveSpread, AThinBookRaisesTheFloor)
+{
+    EXPECT_DOUBLE_EQ(xop::revive::half_spread_floor_bps(141.0, true, 300.0),
+                     300.0);
+}
+
+TEST(ReviveSpread, AWiderNormalFloorIsKept)
+{
+    EXPECT_DOUBLE_EQ(xop::revive::half_spread_floor_bps(350.0, true, 300.0),
+                     350.0);
+}
+
+TEST(ReviveSpread, ATwoSidedBookOrAZeroFloorChangesNothing)
+{
+    EXPECT_DOUBLE_EQ(xop::revive::half_spread_floor_bps(141.0, false, 300.0),
+                     141.0);
+    EXPECT_DOUBLE_EQ(xop::revive::half_spread_floor_bps(141.0, true, 0.0),
+                     141.0);
+    EXPECT_DOUBLE_EQ(xop::revive::half_spread_floor_bps(141.0, true, kNaN),
+                     141.0);
+}
+
+// ---------------------------------------------------------------------------
+// capped_tier_size
+// ---------------------------------------------------------------------------
+
+TEST(ReviveSize, ALargerTierIsCapped)
+{
+    EXPECT_EQ(xop::revive::capped_tier_size(5'000, 1'000, 1'000), 1'000);
+}
+
+TEST(ReviveSize, TheCapNeverGoesBelowTheMinimumSize)
+{
+    EXPECT_EQ(xop::revive::capped_tier_size(5'000, 500, 1'000), 1'000)
+        << "a sub-minimum cap would turn every tier back into dust";
+}
+
+TEST(ReviveSize, ASmallerTierOrNoCapIsUnchanged)
+{
+    EXPECT_EQ(xop::revive::capped_tier_size(800, 1'000, 500), 800);
+    EXPECT_EQ(xop::revive::capped_tier_size(5'000, 0, 1'000), 5'000);
+}
+
+// ---------------------------------------------------------------------------
+// next_crash_state -- the global machine's transitions, for one pair
+// ---------------------------------------------------------------------------
+
+TEST(ReviveCrashState, NormalEntersCrashOnlyOnACrash)
+{
+    using xop::revive::next_crash_state;
+    EXPECT_EQ(next_crash_state(S::Normal, true, false, false), S::Crash);
+    EXPECT_EQ(next_crash_state(S::Normal, false, false, false), S::Normal);
+}
+
+TEST(ReviveCrashState, CrashNeedsPhaseOneStabilityToRecover)
+{
+    using xop::revive::next_crash_state;
+    EXPECT_EQ(next_crash_state(S::Crash, true, true, true), S::Crash);
+    EXPECT_EQ(next_crash_state(S::Crash, false, false, false), S::Crash);
+    EXPECT_EQ(next_crash_state(S::Crash, false, true, false), S::Recovery);
+}
+
+TEST(ReviveCrashState, RecoveryNeedsPhaseTwoAndFallsBackOnARecrash)
+{
+    using xop::revive::next_crash_state;
+    EXPECT_EQ(next_crash_state(S::Recovery, false, true, false), S::Recovery);
+    EXPECT_EQ(next_crash_state(S::Recovery, false, true, true), S::Normal);
+    EXPECT_EQ(next_crash_state(S::Recovery, true, true, true), S::Crash);
+}
+
+static_assert(xop::revive::next_crash_state(S::Normal, true, true, true)
+              == S::Crash);
+
+// ---------------------------------------------------------------------------
+// LossBudget
+// ---------------------------------------------------------------------------
+
+namespace {
+const LossBudget::TimePoint kT0 = LossBudget::TimePoint{} + 1000h;
+}  // namespace
+
+TEST(ReviveLossBudget, NoSamplesIsNoDrawdown)
+{
+    LossBudget b;
+    EXPECT_DOUBLE_EQ(b.drawdown_usd("wmilliETH.b/XCH"), 0.0);
+    EXPECT_FALSE(b.exceeded("wmilliETH.b/XCH", 10.0));
+}
+
+TEST(ReviveLossBudget, DrawdownIsPeakToLatest)
+{
+    LossBudget b;
+    b.record("p", kT0, 2.0);
+    b.record("p", kT0 + 2min, 6.0);      // peak
+    b.record("p", kT0 + 4min, -5.0);     // now 11 below the peak
+    EXPECT_DOUBLE_EQ(b.drawdown_usd("p"), 11.0);
+    EXPECT_TRUE(b.exceeded("p", 10.0));
+    EXPECT_FALSE(b.exceeded("p", 12.0));
+}
+
+TEST(ReviveLossBudget, ExactlyTheBudgetIsNotOver)
+{
+    LossBudget b;
+    b.record("p", kT0, 10.0);
+    b.record("p", kT0 + 2min, 0.0);
+    EXPECT_FALSE(b.exceeded("p", 10.0));
+}
+
+TEST(ReviveLossBudget, ARecoveryBackTowardThePeakShrinksTheDrawdown)
+{
+    LossBudget b;
+    b.record("p", kT0, 0.0);
+    b.record("p", kT0 + 2min, -12.0);
+    ASSERT_TRUE(b.exceeded("p", 10.0));
+    b.record("p", kT0 + 4min, -4.0);
+    EXPECT_FALSE(b.exceeded("p", 10.0));
+}
+
+TEST(ReviveLossBudget, ALossOlderThanTheWindowStopsCounting)
+{
+    LossBudget b(24h, 60s);
+    b.record("p", kT0, 20.0);                  // the old peak
+    b.record("p", kT0 + 1h, 0.0);
+    ASSERT_TRUE(b.exceeded("p", 10.0));
+    b.record("p", kT0 + 25h, 0.0);             // the peak has aged out
+    EXPECT_FALSE(b.exceeded("p", 10.0));
+    EXPECT_DOUBLE_EQ(b.drawdown_usd("p"), 0.0);
+}
+
+TEST(ReviveLossBudget, CloseSamplesReplaceRatherThanAccumulate)
+{
+    LossBudget b(24h, 60s);
+    b.record("p", kT0, 10.0);
+    b.record("p", kT0 + 10s, -5.0);   // replaces the 10.0 sample
+    EXPECT_DOUBLE_EQ(b.drawdown_usd("p"), 0.0)
+        << "within min_spacing the latest sample is overwritten";
+}
+
+TEST(ReviveLossBudget, PairsAreIndependent)
+{
+    LossBudget b;
+    b.record("a", kT0, 0.0);
+    b.record("a", kT0 + 2min, -20.0);
+    b.record("b", kT0, 0.0);
+    EXPECT_TRUE(b.exceeded("a", 10.0));
+    EXPECT_FALSE(b.exceeded("b", 10.0));
+}
+
+TEST(ReviveLossBudget, ZeroOrNonFiniteBudgetDisablesAndNaNSamplesAreIgnored)
+{
+    LossBudget b;
+    b.record("p", kT0, 0.0);
+    b.record("p", kT0 + 2min, -50.0);
+    EXPECT_FALSE(b.exceeded("p", 0.0));
+    EXPECT_FALSE(b.exceeded("p", kNaN));
+
+    LossBudget c;
+    c.record("p", kT0, 0.0);
+    c.record("p", kT0 + 2min, kNaN);
+    EXPECT_DOUBLE_EQ(c.drawdown_usd("p"), 0.0);
+}
+
+// ---------------------------------------------------------------------------
+// listed_cross_price -- the CEX leg a revive pair gets from feed listings
+// ---------------------------------------------------------------------------
+
+TEST(ListedCrossPrice, MatchesTheHardcodedMilliEthLeg)
+{
+    const std::map<std::string, double> prices{
+        {"ethereum", 2'480.0}, {"chia", 1.60}};
+    const auto px = xop::listed_cross_price("wmilliETH.b/XCH", prices);
+    ASSERT_TRUE(px.has_value());
+    // Step 1's hardcoded formula: (ethereum / 1000) / chia.
+    EXPECT_NEAR(*px, (2'480.0 / 1000.0) / 1.60, 1e-12);
+}
+
+TEST(ListedCrossPrice, PricesAnyPairWithBothLegsListed)
+{
+    const std::map<std::string, double> prices{
+        {"chia", 1.60}, {"dexie-bucks", 0.0172}};
+    const auto px = xop::listed_cross_price("XCH/DBX", prices);
+    ASSERT_TRUE(px.has_value());
+    EXPECT_NEAR(*px, 1.60 / 0.0172, 1e-9);
+}
+
+TEST(ListedCrossPrice, AnUnlistedLegHasNoPrice)
+{
+    const std::map<std::string, double> prices{{"chia", 1.60}};
+    EXPECT_FALSE(xop::listed_cross_price("XCH/BYC", prices).has_value())
+        << "BYC has no feed listing";
+    EXPECT_FALSE(xop::listed_cross_price("BYC/wUSDC.b", prices).has_value());
+}
+
+TEST(ListedCrossPrice, AMissingOrNonPositiveQuoteHasNoPrice)
+{
+    EXPECT_FALSE(xop::listed_cross_price(
+        "XCH/DBX", std::map<std::string, double>{{"chia", 1.60}}));
+    EXPECT_FALSE(xop::listed_cross_price(
+        "XCH/DBX",
+        std::map<std::string, double>{{"chia", 1.60}, {"dexie-bucks", 0.0}}));
+    EXPECT_FALSE(xop::listed_cross_price(
+        "XCH/DBX",
+        std::map<std::string, double>{{"chia", kInf}, {"dexie-bucks", 0.02}}));
+    EXPECT_FALSE(xop::listed_cross_price(
+        "not-a-pair", std::map<std::string, double>{{"chia", 1.60}}));
+}

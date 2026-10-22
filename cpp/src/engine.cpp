@@ -4551,6 +4551,10 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
                                   history.back().block_height,
                                   block_height - history.back().block_height);
                 }
+                // [REVIVE2 2026-10-22] Nor may a frozen history hold a revive
+                // pair's own state: it restarts at Normal, and is judged
+                // again on its full window as soon as its mid returns.
+                revive_crash_state_.erase(pair.name);
                 continue;
             }
 
@@ -4574,26 +4578,54 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
             // still requires exactly what phase 2 always demanded, the
             // last 100 blocks inside the stability band; the phases only
             // run sequentially when a pair re-crashes DURING recovery.
-            if (PreTradeCheck::check_flash_crash(price_vec,
-                    config_.risk.flash_crash_threshold_pct,
-                    config_.risk.flash_crash_window_blocks)) {
+            const bool pair_crashing = PreTradeCheck::check_flash_crash(
+                price_vec,
+                config_.risk.flash_crash_threshold_pct,
+                config_.risk.flash_crash_window_blocks);
+            const bool pair_stable_phase1 = PreTradeCheck::is_stable_after_crash(
+                price_vec,
+                static_cast<int>(config_.risk.recovery_stable_blocks_phase1),
+                config_.risk.recovery_stability_band_pct);
+            const bool pair_stable_phase2 = PreTradeCheck::is_stable_after_crash(
+                price_vec,
+                static_cast<int>(config_.risk.recovery_stable_blocks_phase2),
+                config_.risk.recovery_stability_band_pct);
+
+            // [REVIVE2 2026-10-22] A revive pair runs its own state machine
+            // and is left out of the global one: its crash pauses only it
+            // (Step 4), and it neither trips nor holds the other pairs.
+            if (pair.revive_market
+                && config_.strategy.revive_isolate_flash_crash) {
+                auto& st = revive_crash_state_[pair.name];
+                const FlashCrashState next = revive::next_crash_state(
+                    st, pair_crashing, pair_stable_phase1, pair_stable_phase2);
+                if (next != st) {
+                    if (next == FlashCrashState::Crash) {
+                        spdlog::warn("[Engine] Flash crash DETECTED for "
+                                     "revive pair {} -- its own quotes "
+                                     "suspended", pair.name);
+                        alerts_->send_alert(AlertRule::FlashCrash,
+                            "Flash crash detected for revive pair "
+                            + pair.name + " -- its own offer posting "
+                              "suspended");
+                    } else {
+                        spdlog::info("[Engine] Revive pair {} flash-crash "
+                                     "state {} -> {}", pair.name,
+                                     to_string(st), to_string(next));
+                    }
+                    st = next;
+                }
+                continue;
+            }
+
+            if (pair_crashing) {
                 any_pair_crashing = true;
                 if (crash_pair_name.empty()) crash_pair_name = pair.name;
             }
 
             // Check stability signals for this pair.
-            if (!PreTradeCheck::is_stable_after_crash(
-                    price_vec,
-                    static_cast<int>(config_.risk.recovery_stable_blocks_phase1),
-                    config_.risk.recovery_stability_band_pct)) {
-                all_pairs_stable_50 = false;
-            }
-            if (!PreTradeCheck::is_stable_after_crash(
-                    price_vec,
-                    static_cast<int>(config_.risk.recovery_stable_blocks_phase2),
-                    config_.risk.recovery_stability_band_pct)) {
-                all_pairs_stable_100 = false;
-            }
+            if (!pair_stable_phase1) all_pairs_stable_50 = false;
+            if (!pair_stable_phase2) all_pairs_stable_100 = false;
             // [MEDIUM-5] No break -- continue checking all enabled pairs.
         }
 
@@ -4635,6 +4667,17 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
                         "-- offer posting resumed");
                 }
                 break;
+        }
+
+        // [REVIVE2 2026-10-22] Step 4 read the revive states from the last
+        // heartbeat; apply this heartbeat's before Step 6 runs, so a revive
+        // pair that crashes now is dropped now, as the global guard is.
+        for (auto& [name, pcs] : cycle_) {
+            const auto st = revive_crash_state_.find(name);
+            if (st != revive_crash_state_.end()
+                && st->second != FlashCrashState::Normal && pcs.quote_valid) {
+                pcs.quote_valid = false;
+            }
         }
     } catch (const std::exception& e) {
         spdlog::error("[Engine] Flash crash check failed: {}", e.what());
@@ -5064,6 +5107,39 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
         spdlog::warn("[Engine] Step 8 GATED: flash_crash_state={} "
                      "-- no new offers posted",
                      to_string(flash_crash_state_));
+
+        // [REVIVE2 2026-10-22] ...except for revive pairs, which answer to
+        // their own state (Step 4 already dropped any of them that are in
+        // their own Crash or Recovery). step_manage_offers runs for them
+        // alone and skips every cross-pair pass, so nothing above changes
+        // for the pairs the guard is holding.
+        std::unordered_set<std::string> revive_ok;
+        if (config_.strategy.revive_isolate_flash_crash) {
+            for (const auto& [name, pcs] : cycle_) {
+                const PairConfig* pc = find_pair_config(name);
+                if (pc != nullptr && pc->revive_market && pcs.quote_valid
+                    && !pcs.ladder.empty()) {
+                    revive_ok.insert(name);
+                }
+            }
+        }
+        if (!revive_ok.empty()) {
+            spdlog::info("[Engine] Step 8: {} revive pair(s) still managed "
+                         "under the flash-crash guard", revive_ok.size());
+            step8_pair_filter_ = std::move(revive_ok);
+            try {
+                co_await step_manage_offers(block_height);
+            }
+            catch (const std::exception& e) {
+                spdlog::error("[Engine] Step 8 (revive offers) failed: {}",
+                              e.what());
+            }
+            catch (...) {
+                step8_pair_filter_.reset();   // never outlive this run
+                throw;
+            }
+            step8_pair_filter_.reset();
+        }
     }
 
     } // end of !xch_recovery_mode_ block
@@ -5506,6 +5582,17 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
                     xch_it->second > 0.0) {
                     // wmilliETH = 1/1000 of ETH
                     cex_mid = (eth_it->second / 1000.0) / xch_it->second;
+                    derived = true;
+                }
+            } else if (pair.revive_market) {
+                // [REVIVE2 2026-10-22] Any other revive pair gets its leg
+                // from the feed listings (load_config already requires both
+                // of its legs to be listed), so an empty or one-sided book
+                // falls back to the external price instead of publishing 0
+                // and dropping the quote in Step 4.
+                if (const auto px = listed_cross_price(pair.name,
+                                                       coingecko_prices_)) {
+                    cex_mid = *px;
                     derived = true;
                 }
             }
@@ -6819,6 +6906,48 @@ void Engine::step_compute_quotes(BlockHeight block_height)
                           "suppressing all quotes", pair_name);
             pcs.quote_valid = false;
             continue;
+        }
+
+        // [REVIVE2 2026-10-22] revive_market pairs: their own flash-crash
+        // state, the daily loss budget, and whether the book is thin.
+        if (const PairConfig* pcr = find_pair_config(pair_name);
+            pcr != nullptr && pcr->revive_market) {
+            if (config_.strategy.revive_isolate_flash_crash) {
+                const auto st = revive_crash_state_.find(pair_name);
+                if (st != revive_crash_state_.end()
+                    && st->second != FlashCrashState::Normal) {
+                    spdlog::warn("[Engine] Step 4: {} revive pair in its own "
+                                 "flash-crash {} state -- suppressing quotes",
+                                 pair_name, to_string(st->second));
+                    pcs.quote_valid = false;
+                    continue;
+                }
+            }
+            const double budget = config_.strategy.revive_daily_loss_budget_usd;
+            if (revive_loss_budget_.exceeded(pair_name, budget)) {
+                if (revive_over_budget_.insert(pair_name).second) {
+                    const std::string msg = fmt::format(
+                        "{} revive pair is ${:.2f} below its 24h P&L peak, "
+                        "over its ${:.2f} daily loss budget -- quoting "
+                        "suspended until the drawdown leaves the window",
+                        pair_name, revive_loss_budget_.drawdown_usd(pair_name),
+                        budget);
+                    spdlog::error("[Engine] Step 4: {}", msg);
+                    alerts_->send_alert(AlertRule::CircuitBreaker, msg);
+                }
+                pcs.quote_valid = false;
+                continue;
+            }
+            if (revive_over_budget_.erase(pair_name) > 0) {
+                spdlog::warn("[Engine] Step 4: {} revive pair back within its "
+                             "daily loss budget -- quoting resumes", pair_name);
+            }
+            const MarketSnapshot rs = state_->get_market(pair_name);
+            const double scale = static_cast<double>(kMojosPerXch);
+            pcs.revive_thin = revive::book_is_thin(
+                static_cast<double>(rs.best_bid) / scale,
+                static_cast<double>(rs.best_ask) / scale,
+                rs.touches_third_party);
         }
 
         // -- Staleness gate: suppress quoting when market data is stale ------
@@ -9813,10 +9942,19 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                            config_.strategy.min_profit_margin_bps)
                      : config_.strategy.min_profit_margin_bps,
             config_.arbitrage.tibetswap_fee_bps);
-        const double quote_min_half_spread_bps = std::max(
-            quote_base_floor_bps,
-            std::max(0.0, config_.strategy.quote_width_sigma_mult)
-                * quote_combined_sigma_bps);
+        // [REVIVE2 2026-10-22] A revive pair on a thin book quotes no
+        // tighter than strategy.revive_min_half_spread_bps.
+        const double quote_min_half_spread_bps = revive::half_spread_floor_bps(
+            std::max(quote_base_floor_bps,
+                     std::max(0.0, config_.strategy.quote_width_sigma_mult)
+                         * quote_combined_sigma_bps),
+            pcs.revive_thin,
+            config_.strategy.revive_min_half_spread_bps);
+        if (pcs.revive_thin && config_.strategy.revive_min_half_spread_bps > 0.0) {
+            spdlog::debug("[Engine] Step 7: {} revive thin book -- min "
+                          "half-spread {:.0f} bps", pair_name,
+                          quote_min_half_spread_bps);
+        }
 
         // [2026-08-01 adversarial review, finding 1] Thread the floor to
         // Step 8: quote-recovery repricing runs AFTER every Step 7 guard
@@ -11460,6 +11598,32 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                              pair_name, bumped_tiers, eff_min_units);
             }
 
+            // [REVIVE2 2026-10-22] A revive pair on a thin book posts no tier
+            // larger than strategy.revive_max_offer_size_units (never below
+            // the minimum just enforced).
+            if (pair_cfg->revive_market && pcs.revive_thin
+                && config_.strategy.revive_max_offer_size_units > 0.0) {
+                const Mojo revive_cap = static_cast<Mojo>(std::llround(
+                    config_.strategy.revive_max_offer_size_units
+                    * static_cast<double>(pair_cfg->base_mojos_per_unit)));
+                int revive_capped = 0;
+                for (auto& tq : pcs.ladder) {
+                    const Mojo capped = static_cast<Mojo>(
+                        revive::capped_tier_size(tq.size, revive_cap,
+                                                 min_base_mojos));
+                    if (capped < tq.size) {
+                        tq.size = capped;
+                        ++revive_capped;
+                    }
+                }
+                if (revive_capped > 0) {
+                    spdlog::info("[Engine] Step 7: {} revive thin book -- "
+                                 "capped {} tiers to {:.2f} units", pair_name,
+                                 revive_capped,
+                                 config_.strategy.revive_max_offer_size_units);
+                }
+            }
+
             // -- [PACE 2026-09-13] Pace size post-pass -------------------------
             // A pace-managed pair keeps only the bid tiers whose INDEX is below
             // the composed tier count and posts no ask.  Every kept tier gets
@@ -12070,7 +12234,10 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
     // free of RPCs until the host clock says some offer's max_time has passed.
     // An accepted local cancel is still only a SUBMISSION to offer_log: the
     // wallet's CANCELLED verdict, seen by detect_fills, completes the row.
-    if (config_.strategy.ttl_cancel_mode == TtlCancelMode::Expire
+    // [REVIVE2 2026-10-22] A revive-only run (step8_pair_filter_) skips
+    // this and every other cross-pair pass below; see engine.hpp.
+    if (!step8_pair_filter_
+        && config_.strategy.ttl_cancel_mode == TtlCancelMode::Expire
         && wallet_step_may_run("Step 8 expired-offer retire")) {
         const std::vector<std::string> expired_retired =
             co_await offer_mgr_->retire_expired_offers(block_height);
@@ -12267,7 +12434,14 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                           e.what());
         }
 
-        if (liberation_needed) {
+        if (liberation_needed && step8_pair_filter_) {
+            // [REVIVE2 2026-10-22] A revive-only run under the flash-crash
+            // guard cancels nothing on other pairs to free coins; it posts
+            // in XCH-buy-only mode instead.
+            spdlog::info("[Engine] UTXO liberation skipped in a revive-only "
+                         "run -- XCH-buy-only mode");
+            xch_buy_only_mode = true;
+        } else if (liberation_needed) {
             auto all_offers = state_->get_all_offers();
             if (all_offers.empty()) {
                 // Spendable below reserve but no tracked offers to cancel.
@@ -12534,11 +12708,16 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
     // the main loop: cancels land as cancel_pending, which the main loop's
     // classifier skips, so a tier is re-posted at its shaped size in this
     // same Step 8.
-    co_await step_enforce_pace_caps(block_height, recommended_fee);
+    if (!step8_pair_filter_) {
+        co_await step_enforce_pace_caps(block_height, recommended_fee);
+    }
 
     std::set<std::int64_t> pending_wallets_this_block;
     for (auto& [pair_name, pcs] : cycle_) {
         if (!pcs.quote_valid || pcs.ladder.empty()) continue;
+        if (step8_pair_filter_ && step8_pair_filter_->count(pair_name) == 0) {
+            continue;
+        }
 
         // [WALLET-CIRCUIT] C2, at every pair boundary.  co_return, NOT break:
         // a break falls through to the consecutive_pending_blocks_ reset below
@@ -15307,6 +15486,11 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             co_return;
         }
     }
+
+    // [REVIVE2 2026-10-22] A revive-only run ends with its pairs: the
+    // escalation counter and reconciliation below cover the whole book,
+    // which the flash-crash guard is holding.
+    if (step8_pair_filter_) co_return;
 
     // Reset consecutive pending counter only when NO pair hit Gate 1
     // (pending_change > 0) on this entire block.  Resetting per-pair
@@ -21185,6 +21369,19 @@ void Engine::step_update_pnl(BlockHeight block_height)
 
     if (!quote_batch.empty()) {
         db_->insert_strategy_quotes_batch(quote_batch);
+    }
+
+    // [REVIVE2 2026-10-22] Sample each revive pair's total P&L for its daily
+    // loss budget (read in Step 4 of the next heartbeat). Not while XCH/USD
+    // is unknown: the USD figures then read low for a reason that is not a
+    // loss, and would spend the budget.
+    if (config_.strategy.revive_daily_loss_budget_usd > 0.0 && xch_usd > 0.0) {
+        const auto now = std::chrono::system_clock::now();
+        for (const auto& pair : config_.pairs) {
+            if (!pair.enabled || !pair.revive_market) continue;
+            revive_loss_budget_.record(
+                pair.name, now, pnl_->get_pair_pnl(pair.name).total_pnl_usd);
+        }
     }
 
     spdlog::debug("[Engine] Step 11: PnL updated and {} snapshots, {} quotes persisted",

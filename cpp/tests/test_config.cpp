@@ -936,6 +936,57 @@ TEST(ConfigParserTest, FlashCrashStaleHistory_ParsesDefaultsAndRejects) {
     }
 }
 
+TEST(ConfigParserTest, ReviveThinMarketKeys_ParseDefaultsAndReject) {
+    // [REVIVE2 2026-10-22] Injected into the existing strategy: section, as
+    // FlashCrashWindow below explains for risk:.
+    const auto with_strategy = [](const std::string& line) {
+        std::string yaml(kMinimalValidYaml);
+        const std::string anchor = "strategy:\n";
+        const auto at = yaml.find(anchor);
+        EXPECT_NE(at, std::string::npos);
+        yaml.insert(at + anchor.size(), "  " + line + "\n");
+        return yaml;
+    };
+    {
+        TempYaml tmp(kMinimalValidYaml);
+        auto cfg = xop::load_config(tmp.path());
+        EXPECT_DOUBLE_EQ(cfg.strategy.revive_min_half_spread_bps, 300.0);
+        EXPECT_DOUBLE_EQ(cfg.strategy.revive_max_offer_size_units, 1.0);
+        EXPECT_DOUBLE_EQ(cfg.strategy.revive_daily_loss_budget_usd, 10.0);
+        EXPECT_TRUE(cfg.strategy.revive_isolate_flash_crash);
+    }
+    {
+        TempYaml tmp(with_strategy("revive_min_half_spread_bps: 450"));
+        EXPECT_DOUBLE_EQ(
+            xop::load_config(tmp.path()).strategy.revive_min_half_spread_bps,
+            450.0);
+    }
+    {
+        TempYaml tmp(with_strategy("revive_max_offer_size_units: 0"));
+        EXPECT_DOUBLE_EQ(
+            xop::load_config(tmp.path()).strategy.revive_max_offer_size_units,
+            0.0);
+    }
+    {
+        TempYaml tmp(with_strategy("revive_daily_loss_budget_usd: 25.5"));
+        EXPECT_DOUBLE_EQ(
+            xop::load_config(tmp.path()).strategy.revive_daily_loss_budget_usd,
+            25.5);
+    }
+    {
+        TempYaml tmp(with_strategy("revive_isolate_flash_crash: false"));
+        EXPECT_FALSE(
+            xop::load_config(tmp.path()).strategy.revive_isolate_flash_crash);
+    }
+    for (const char* bad : {"revive_min_half_spread_bps: -1",
+                            "revive_max_offer_size_units: -0.5",
+                            "revive_daily_loss_budget_usd: .nan",
+                            "revive_daily_loss_budget_usd: .inf"}) {
+        TempYaml tmp(with_strategy(bad));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError) << bad;
+    }
+}
+
 TEST(ConfigParserTest, FlashCrashWindow_ParsesDefaultsAndRejects) {
     // kMinimalValidYaml already carries a risk: section, so the knob is
     // INJECTED into it rather than appended as a duplicate root key --
