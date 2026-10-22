@@ -76,8 +76,11 @@ SUBMIT_REASONS = (
     # [REVIVE2 2026-10-22] A revive pair over its daily loss budget has its
     # resting offers cancelled (Engine::step_cancel_revive_over_budget).
     '"revive_loss_budget"',
+    # [REVIVE2 2026-10-22] On a thin book Step 8 cancels a revive pair's
+    # resting offers above the revive size cap.
+    '"revive_size_cap"',
 )
-SUBMIT_SITE_COUNT = 22
+SUBMIT_SITE_COUNT = 23
 
 
 def _read(path: Path) -> str:

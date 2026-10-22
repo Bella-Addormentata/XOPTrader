@@ -12823,6 +12823,53 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             continue;
         }
 
+        // [REVIVE2 2026-10-22] On a thin book the revive size cap binds what
+        // RESTS too, not only the new ladder: a resting offer above the cap
+        // is cancelled now (the staleness check would keep a 1.5-unit offer
+        // Fresh against a 1-unit cap), and Step 8 reposts it capped.
+        if (const PairConfig* cap_pc = find_pair_config(pair_name);
+            cap_pc != nullptr && cap_pc->revive_market && pcs.revive_thin
+            && config_.strategy.revive_max_offer_size_units > 0.0
+            && !dry_run_ && !cancel_all_inflight_) {
+            const bool xch_base_cap = cap_pc->base_asset_id == "xch"
+                                   || cap_pc->base_asset_id == "XCH";
+            const double min_units = cap_pc->min_offer_size_units_override.value_or(
+                xch_base_cap ? 1.0 : config_.strategy.min_offer_size_units);
+            const Mojo limit = std::max<Mojo>(
+                static_cast<Mojo>(revive::cap_units_to_mojos(
+                    config_.strategy.revive_max_offer_size_units,
+                    static_cast<double>(cap_pc->base_mojos_per_unit))),
+                static_cast<Mojo>(revive::cap_units_to_mojos(
+                    min_units, static_cast<double>(cap_pc->base_mojos_per_unit))));
+            std::vector<std::string> oversized;
+            for (const auto& po : state_->get_all_offers()) {
+                if (po.pair_name == pair_name && !po.cancel_pending
+                    && po.size > limit) {
+                    oversized.push_back(po.offer_id);
+                }
+            }
+            if (!oversized.empty()) {
+                const auto done = co_await offer_mgr_->selective_cancel(oversized);
+                for (const auto& id : done) {
+                    try {
+                        db_->mark_offer_cancel_submitted(id, block_height,
+                                                         "revive_size_cap");
+                    } catch (const std::exception& e) {
+                        spdlog::debug("[Engine] could not mark {} "
+                                      "cancel_pending: {}", id.substr(0, 12),
+                                      e.what());
+                    }
+                }
+                if (fee_tracker_->enabled()) {
+                    fee_tracker_->record_fee(
+                        cancel_fees_paid(done, recommended_fee), block_height);
+                }
+                spdlog::info("[Engine] Step 8: {} revive thin book -- "
+                             "cancelled {}/{} resting offer(s) above the size "
+                             "cap", pair_name, done.size(), oversized.size());
+            }
+        }
+
         // [T5-01] Selective refresh: classify existing tiers before deciding
         // whether to do a full cancel+repost or a surgical selective refresh.
         //
@@ -21475,11 +21522,14 @@ void Engine::step_update_pnl(BlockHeight block_height)
             const auto fl = revive_flows_.find(pair.name);
             const revive::PairFlows flows =
                 fl != revive_flows_.end() ? fl->second : revive::PairFlows{};
-            double mid = market_data_->get_mid_price(pair.name);
+            // Only marks valuation would use: a graded mid, else the trusted
+            // fair value. A dislocated book price could otherwise plant a
+            // fictitious peak, and its correction read as a loss.
+            double mid = market_data_->mid_valuation_grade(pair.name)
+                ? market_data_->get_mid_price(pair.name) : 0.0;
             if (!(mid > 0.0)) {
-                if (const auto est =
-                        market_data_->get_fair_value_estimate(pair.name)) {
-                    mid = est->price;
+                if (const auto fv = market_data_->get_fair_value(pair.name)) {
+                    mid = fv->price;
                 }
             }
             // The quote leg's USD price: XCH directly, else its feed listing
@@ -25539,6 +25589,14 @@ asio::awaitable<void> Engine::step_cancel_revive_over_budget(BlockHeight block_h
     }
     if (to_cancel.empty()) co_return;
     const auto done = co_await offer_mgr_->selective_cancel(to_cancel);
+    // Booked here, not left to Step 8: under the flash-crash guard Step 8
+    // may not run, and its later cancel_fees_paid() would drain this
+    // sweep's accepted fees into a count that omits these ids.
+    if (fee_tracker_ && fee_tracker_->enabled()) {
+        fee_tracker_->record_fee(
+            cancel_fees_paid(done, offer_mgr_->current_fee()),
+            block_height);
+    }
     for (const auto& id : done) {
         try {
             db_->mark_offer_cancel_submitted(id, block_height,
