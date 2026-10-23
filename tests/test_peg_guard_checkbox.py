@@ -155,3 +155,74 @@ def test_tooltip_says_it_needs_revive(panel, cfg_path):
     panel.load_config(str(cfg_path))
     tip = _guard_cb(panel, _pair_row(panel, "BYC/wUSDC.b")).toolTip()
     assert "Revive" in tip
+
+
+def _set_pair_key(cfg_path, name: str, line: str) -> None:
+    """Set one key of one pair as a raw YAML line, bypassing safe_dump so
+    null and quoted spellings reach the loader exactly as a hand-edited
+    file has them. Replaces the key if the pair already has it."""
+    lines = cfg_path.read_text(encoding="utf-8").splitlines()
+    at = next((i for i, ln in enumerate(lines)
+               if ln.strip().lstrip("- ").strip() in (f'name: "{name}"', f"name: {name}")),
+              None)
+    assert at is not None, f"pair {name!r} not found in the example config"
+    indent = " " * (len(lines[at]) - len(lines[at].lstrip(" -")))
+    key = line.split(":", 1)[0]
+    end = at + 1
+    while end < len(lines) and (lines[end].startswith(indent) or not lines[end].strip()):
+        end += 1
+    for i in range(at - 1, -1, -1):          # the entry may start above `name`
+        if lines[i].lstrip().startswith("- "):
+            start = i
+            break
+    else:
+        start = at
+    for i in range(start, end):
+        if lines[i].strip().lstrip("- ").startswith(f"{key}:"):
+            lines[i] = lines[i][: len(lines[i]) - len(lines[i].lstrip(" -"))] + line
+            break
+    else:
+        lines.insert(at + 1, indent + line)
+    cfg_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize("spelling", ["peg_guard:", "peg_guard: null", "peg_guard: ~"])
+def test_a_null_value_keeps_the_guard_on_through_a_save(panel, cfg_path, spelling):
+    """The engine skips a null peg_guard and keeps it on; the GUI must too,
+    or saving would write peg_guard: false and silently disable it."""
+    _set_pair_key(cfg_path, "BYC/wUSDC.b", spelling)
+    raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    assert {p["name"]: p for p in raw["pairs"]}["BYC/wUSDC.b"]["peg_guard"] is None
+
+    panel.load_config(str(cfg_path))
+    assert _guard_cb(panel, _pair_row(panel, "BYC/wUSDC.b")).isChecked() is True
+    assert panel.save_config(str(cfg_path)) is True
+    on_disk = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    assert {p["name"]: p for p in on_disk["pairs"]}["BYC/wUSDC.b"].get("peg_guard") \
+        is not False
+
+
+@pytest.mark.parametrize("spelling,expected", [
+    ('peg_guard: "false"', False), ("peg_guard: 'no'", False),
+    ('peg_guard: "true"', True), ('peg_guard: "garbage"', True),
+])
+def test_quoted_spellings_read_as_the_engine_reads_them(panel, cfg_path,
+                                                       spelling, expected):
+    _set_pair_key(cfg_path, "BYC/wUSDC.b", spelling)
+    panel.load_config(str(cfg_path))
+    assert _guard_cb(panel, _pair_row(panel, "BYC/wUSDC.b")).isChecked() is expected
+
+
+def test_the_same_reading_covers_enabled_and_revive(panel, cfg_path):
+    """Same defect class: ``enabled: null`` is enabled to the engine and a
+    quoted ``revive_market: "false"`` is off."""
+    _set_pair_key(cfg_path, "BYC/wUSDC.b", "enabled: null")
+    _set_pair_key(cfg_path, "BYC/wUSDC.b", 'revive_market: "false"')
+    panel.load_config(str(cfg_path))
+    row = _pair_row(panel, "BYC/wUSDC.b")
+
+    def _cb(col):
+        return panel._pairs_table.cellWidget(row, col).findChild(QCheckBox)
+
+    assert _cb(0).isChecked() is True, "enabled: null is enabled"
+    assert _cb(6).isChecked() is False, 'revive_market: "false" is off'

@@ -183,6 +183,34 @@ def load_curfew_enabled() -> bool:
     return str(raw).strip().lower() not in ("false", "0", "off", "no")
 
 
+# yaml-cpp's bool spellings (YAML::convert<bool>): what the engine accepts.
+_YAML_TRUE: Final[frozenset[str]] = frozenset({"true", "yes", "on", "y"})
+_YAML_FALSE: Final[frozenset[str]] = frozenset({"false", "no", "off", "n"})
+
+
+def _pair_flag(pair: dict, key: str, default: bool) -> bool:
+    """A pair's boolean setting as the ENGINE reads it.
+
+    The C++ loader skips an absent or null key (``peg_guard:`` or
+    ``peg_guard: null``) and keeps the default, and reads a quoted
+    ``"false"`` as false.  ``bool()`` gets both wrong -- ``bool(None)`` is
+    False and ``bool("false")`` is True -- so a checkbox seeded with it
+    could show the opposite of the running setting, and saving would then
+    write that opposite back: unticking a default-on peg guard, or
+    ticking Revive.  Anything else unreadable keeps the default.
+    """
+    value = pair.get(key)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        spelled = value.strip().lower()
+        if spelled in _YAML_TRUE:
+            return True
+        if spelled in _YAML_FALSE:
+            return False
+    return default
+
+
 # ---------------------------------------------------------------------------
 # Theme colour shorthand
 # ---------------------------------------------------------------------------
@@ -3448,7 +3476,7 @@ class SettingsWidget(QWidget):
         # Unlabeled: a plain QCheckBox would shrink its clickable area
         # with the indicator, so only the small box would toggle the row.
         cb = HitTargetCheckBox()
-        cb.setChecked(bool(pair.get("enabled", True)))
+        cb.setChecked(_pair_flag(pair, "enabled", True))
         cb.stateChanged.connect(lambda _s, ti=1: self._mark_dirty(ti))
         cb_container = QWidget()
         cb_layout = QHBoxLayout(cb_container)
@@ -3523,7 +3551,7 @@ class SettingsWidget(QWidget):
         # operator with an AMM-backed pair ticks the box and watches
         # nothing happen.
         revive_cb = HitTargetCheckBox()   # unlabeled, same reason
-        revive_cb.setChecked(bool(pair.get("revive_market", False)))
+        revive_cb.setChecked(_pair_flag(pair, "revive_market", False))
         revive_cb.setToolTip(
             "Revive a thin or dead market: keep quoting when the book is "
             "empty or one-sided, inside the revive limits (minimum "
@@ -3549,7 +3577,7 @@ class SettingsWidget(QWidget):
         # suspension or depeg bail-out; it has no effect unless Revive is
         # also ticked, so the revive limits always cover such a pair.
         guard_cb = HitTargetCheckBox()
-        guard_cb.setChecked(bool(pair.get("peg_guard", True)))
+        guard_cb.setChecked(_pair_flag(pair, "peg_guard", True))
         guard_cb.setToolTip(
             "Peg guard: stop quoting this pair when a pegged coin in it "
             "loses its peg.  Untick for a riskier revival attempt: the "
