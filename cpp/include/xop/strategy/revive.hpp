@@ -295,6 +295,10 @@ private:
 struct RestingRule {
     bool         over_budget{false};
     std::int64_t size_limit{0};
+    /// [SYNTH 2026-10-22] The pair has lost its only eligible price (no
+    /// synthetic price on a thin book): every resting offer goes, whatever
+    /// its size and whatever the flows.
+    bool         no_price{false};
 };
 
 /// A resting offer, as revive maintenance sees it.
@@ -309,6 +313,7 @@ struct RestingOffer {
 struct RestingCancel {
     std::string offer_id;
     bool        over_budget{false};   ///< false = above the size limit
+    bool        no_price{false};      ///< the pair lost its eligible price
 };
 
 /// The resting offers revive maintenance cancels: on a pair with a rule,
@@ -323,8 +328,9 @@ struct RestingCancel {
         if (o.cancel_pending) continue;
         const auto r = rules.find(o.pair_name);
         if (r == rules.end()) continue;
-        if (r->second.over_budget) {
-            out.push_back(RestingCancel{o.offer_id, true});
+        if (r->second.over_budget || r->second.no_price) {
+            out.push_back(RestingCancel{o.offer_id, r->second.over_budget,
+                                        r->second.no_price});
         } else if (r->second.size_limit > 0 && o.size > r->second.size_limit) {
             out.push_back(RestingCancel{o.offer_id, false});
         }

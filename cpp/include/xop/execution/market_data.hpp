@@ -869,6 +869,11 @@ public:
     /// for the rest of its freshness window.
     void clear_synthetic_reference(const std::string& pair_name);
 
+    /// [SYNTH 2026-10-22] Withdraw the pair's CEX reference, real or
+    /// synthetic -- e.g. a listing-derived one once a leg's peg is
+    /// suspended, since the listing is then the UNDERLYING coin's price.
+    void clear_cex_reference(const std::string& pair_name);
+
     /// Ingest the TibetSwap AMM implied mid-price for a pair.
     /// The implied price is computed from pool reserves: output_reserve / input_reserve.
     ///

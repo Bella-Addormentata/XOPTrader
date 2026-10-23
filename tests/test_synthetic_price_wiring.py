@@ -86,7 +86,7 @@ def test_only_a_missing_listing_selects_the_synthetic_price():
     # then `if (synth_pricing)` immediately guarding the call.
     decl = re.search(
         r"const\s+bool\s+synth_pricing\s*=\s*pair\.revive_market\s*&&\s*"
-        r"pair_has_unlisted_leg\s*\(", body)
+        r"\(?\s*pair_has_unlisted_leg\s*\(", body)
     assert decl and decl.start() < synth_call, (
         "the synthetic fallback must be selected by a missing feed LISTING; "
         "gating it on missing cached prices lets a listed pair skip the live "
@@ -431,3 +431,50 @@ def test_the_pair_crosses_fresh_or_aged_leg_marks():
         "freeze the pair while the other leg moves"
     )
     assert "synth_asset_in_xch(" not in before
+
+
+# ---------------------------------------------------------------------------
+# Tenth review of PR #180.
+# ---------------------------------------------------------------------------
+
+HEARTBEAT = "asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)"
+REVALIDATE = "void Engine::revalidate_after_peg_observation()"
+
+
+def test_a_suspended_leg_gets_no_listing_reference():
+    body = _body(STEP1)
+    ingest = body.find("market_data_->ingest_cex_reference(\n                    pair.name, cex_mid")
+    if ingest < 0:
+        ingest = body.find("pair.name, cex_mid, coingecko_last_success_at_")
+    assert ingest >= 0
+    gate = body.rfind("if (", 0, ingest)
+    assert "!leg_suspended" in body[gate:ingest], (
+        "a listing-derived reference is the UNDERLYING coin's price once the "
+        "wrapper is suspended"
+    )
+    assert re.search(r"if\s*\(\s*leg_suspended\s*\)\s*market_data_->clear_cex_reference\(", body)
+    assert re.search(r"pair_has_unlisted_leg\(pair\.name\)\s*\|\|\s*leg_suspended", body), (
+        "a revive pair with a suspended leg prices from listing-free legs"
+    )
+
+
+def test_references_are_revalidated_after_peg_observation():
+    hb = _body(HEARTBEAT)
+    observe = hb.find("step_observe_asset_pegs(")
+    revalidate = hb.find("revalidate_after_peg_observation()")
+    maintain = hb.find("step_revive_maintenance(")
+    assert 0 <= observe < revalidate < maintain, (
+        "a suspension latched this heartbeat must withdraw the references "
+        "Step 1 built before anything quotes or maintenance runs"
+    )
+    body = _body(REVALIDATE)
+    for needed in ("synth::remembered_price_usable(", "clear_cex_reference(",
+                   "market_data_valid      = false",
+                   "revive_price_ineligible_.insert("):
+        assert needed in body, needed
+
+
+def test_maintenance_cancels_offers_of_a_pair_with_no_price():
+    body = _body(REVIVE_MAINT)
+    assert re.search(r"r\.no_price\s*=\s*thin\s*&&\s*revive_price_ineligible_\.count\(", body)
+    assert "r.no_price" in body[body.find("rules[pc.name] = r") - 80: body.find("rules[pc.name] = r")]

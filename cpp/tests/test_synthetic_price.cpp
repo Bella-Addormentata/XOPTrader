@@ -916,6 +916,41 @@ TEST(SyntheticReference, WithdrawingLeavesARealReferenceAlone)
     EXPECT_GT(state.get_market("XCH/wUSDC.b").mid_price, 0);
 }
 
+TEST(SyntheticReference, ASuspendedPairsListedReferenceCanBeWithdrawn)
+{
+    // Tenth review: XCH/wUSDC.b's listed reference is chia/usd-coin -- the
+    // UNDERLYING coin. Once wUSDC.b is suspended it is withdrawn, and the
+    // pair publishes no mid off it (nor grade through the CEX branch).
+    xop::State state;
+    xop::MarketDataFeed feed(synth_cfg(), state);
+    feed.ingest_block_height(100);
+    feed.ingest_cex_reference("XCH/wUSDC.b", 1.43, Clock::now());
+    feed.refresh({"XCH/wUSDC.b"});
+    ASSERT_TRUE(state.get_market("XCH/wUSDC.b").mid_valuation_grade);
+
+    feed.clear_cex_reference("XCH/wUSDC.b");
+    feed.refresh({"XCH/wUSDC.b"});
+    const auto snap = state.get_market("XCH/wUSDC.b");
+    EXPECT_EQ(snap.mid_price, 0);
+    EXPECT_FALSE(snap.mid_valuation_grade);
+    EXPECT_FALSE(feed.get_cex_reference("XCH/wUSDC.b").has_value());
+    feed.clear_cex_reference("NOT/TRACKED");   // harmless
+}
+
+TEST(SynthProvenance, ASuspensionLatchedThisHeartbeatInvalidatesItsReferences)
+{
+    // Tenth review: Step 1 builds references before peg observation. The
+    // same per-leg rule decides, after observation, whether a leg was
+    // suspended since: then this heartbeat's references are withdrawn.
+    using xop::synth::remembered_price_usable;
+    const bool ref_base = false, ref_quote = false;   // as Step 1 saw them
+    EXPECT_FALSE(remembered_price_usable(false, /*quote now=*/true,
+                                         ref_base, ref_quote))
+        << "wUSDC.b latched during this heartbeat: withdraw";
+    EXPECT_TRUE(remembered_price_usable(false, false, ref_base, ref_quote))
+        << "nothing changed: keep";
+}
+
 TEST(SyntheticReference, ARealReferenceClearsTheSyntheticMark)
 {
     xop::State state;

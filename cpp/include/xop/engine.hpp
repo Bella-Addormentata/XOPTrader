@@ -1281,6 +1281,9 @@ private:
     [[nodiscard]] bool pair_peg_suspended(const PairConfig& pc) const;
     asio::awaitable<void> step_observe_asset_pegs(BlockHeight block_height);
     asio::awaitable<void> step_revive_maintenance(BlockHeight block_height);
+    // [SYNTH 2026-10-22] Right after peg observation: withdraw references a
+    // leg's NEW suspension made ineligible, before anything quotes on them.
+    void revalidate_after_peg_observation();
 
     // [SYNTH 2026-10-22] Synthetic quoting price for revive pairs with an
     // unlisted leg (xop/strategy/synthetic_price.hpp). refresh_synth_tape
@@ -2289,6 +2292,11 @@ private:
         // price published for this pair in Step 1; 0 when none was.
         double        revive_synth_sigma_bps{0.0};
         double        revive_synth_price{0.0};
+        // [SYNTH 2026-10-22] Each leg's peg suspension when Step 1 built
+        // this heartbeat's references; a leg suspended later in the same
+        // heartbeat makes them ineligible (revalidate_after_peg_observation).
+        bool          ref_base_suspended{false};
+        bool          ref_quote_suspended{false};
 
         // [2026-09-02, review] The spread SpreadOptimizer::compute_spread()
         // produced, captured before Step 5's first adjustment site.
@@ -2476,6 +2484,10 @@ private:
     // [SYNTH 2026-10-22] Revive pairs whose budget cannot value their
     // exposure (Step 11); treated as over budget until a mark returns.
     std::unordered_set<std::string> revive_budget_blind_;
+    // [SYNTH 2026-10-22] Revive pairs priced synthetically that have no
+    // eligible price this heartbeat; revive maintenance cancels their
+    // resting offers while the book is thin.
+    std::unordered_set<std::string> revive_price_ineligible_;
 
     // [REVIVE2 2026-10-22] Set only for the duration of a Step 8 run made
     // while the global flash-crash guard is engaged: step_manage_offers

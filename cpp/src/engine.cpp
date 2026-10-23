@@ -4463,6 +4463,13 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
         spdlog::error("[Engine] peg observation failed: {}", e.what());
     }
 
+    // [SYNTH 2026-10-22] A suspension latched just now invalidates the
+    // references Step 1 built from that wrapper's listing this heartbeat.
+    try { revalidate_after_peg_observation(); }
+    catch (const std::exception& e) {
+        spdlog::error("[Engine] peg revalidation failed: {}", e.what());
+    }
+
     // [REVIVE2 2026-10-22] Revive maintenance: resting offers of a pair
     // over its loss budget, or above the size cap on a thin book, are
     // cancelled every heartbeat until none qualify -- whatever the pair's
@@ -5566,6 +5573,20 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
                          "for {}: {}", pair.name, ex.what());
         }
 
+        // [SYNTH 2026-10-22] A pair with a peg-suspended leg takes no
+        // listing-derived reference: the listing is the wrapper's UNDERLYING
+        // coin (wUSDC.b -> usd-coin), which the suspension says it no longer
+        // tracks. Any reference it had is withdrawn here; a revive pair then
+        // prices from the wrapper's own trades (synthetic, below) or not at
+        // all. Recorded per leg so a suspension latched later this heartbeat
+        // is caught too (revalidate_after_peg_observation).
+        const bool leg_suspended = pair_peg_suspended(pair);
+        if (auto cit = cycle_.find(pair.name); cit != cycle_.end()) {
+            cit->second.ref_base_suspended  = asset_peg_suspended(pair.base_asset_id);
+            cit->second.ref_quote_suspended = asset_peg_suspended(pair.quote_asset_id);
+        }
+        if (leg_suspended) market_data_->clear_cex_reference(pair.name);
+
         // -- CoinGecko-derived CEX reference price ----------------------------
         // Derive a pair-level mid-price from the cached CoinGecko USD prices.
         //
@@ -5614,7 +5635,7 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
             // Pairs with no CoinGecko mapping (BYC) are skipped here; a
             // revive pair among them gets a synthetic price below.
 
-            if (derived && cex_mid > 0.0) {
+            if (derived && cex_mid > 0.0 && !leg_suspended) {
                 // Pass the fetch time, not the re-ingest time: this runs
                 // every heartbeat off the cached prices, and a failed fetch
                 // leaves that cache untouched.
@@ -5641,12 +5662,15 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
         // SYNTHETIC reference: it moves the published mid so the pair can
         // quote, and is withheld from valuation, the mid gate and the
         // arbitrage signal.
+        // A revive pair with a peg-suspended (depegged) wrapper leg is priced
+        // the same way, from listing-free legs: its listing (the underlying
+        // coin) no longer prices the wrapper. An ordinary feed OUTAGE does
+        // not make a listed pair synthetic -- it waits for the live feed.
         const bool synth_pricing =
-            pair.revive_market && pair_has_unlisted_leg(pair.name);
-        // A revive pair with a peg-suspended (depegged) wrapper leg needs
-        // that wrapper's own trades for its loss budget: its listing (the
-        // underlying coin) no longer prices it.
-        if (synth_pricing || (pair.revive_market && pair_peg_suspended(pair))) {
+            pair.revive_market
+            && (pair_has_unlisted_leg(pair.name) || leg_suspended);
+        if (!synth_pricing) revive_price_ineligible_.erase(pair.name);
+        if (synth_pricing) {
             co_await refresh_synth_tape(pair.base_asset_id);
             co_await refresh_synth_tape(pair.quote_asset_id);
         }
@@ -5667,6 +5691,7 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
                 sp.reset();
             }
             if (sp) {
+                revive_price_ineligible_.erase(pair.name);
                 market_data_->ingest_cex_reference(
                     pair.name, sp->price, std::chrono::system_clock::now(),
                     /*synthetic=*/true);
@@ -5684,9 +5709,12 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
                 // rest of its freshness window: whatever made it is no
                 // longer eligible (a suspension, an out-of-range price).
                 market_data_->clear_synthetic_reference(pair.name);
-                spdlog::debug("[Engine] Step 1: {} has no synthetic price "
-                              "-- no listing, no trades, no estimate",
-                              pair.name);
+                if (revive_price_ineligible_.insert(pair.name).second) {
+                    spdlog::warn("[Engine] Step 1: {} has no eligible price "
+                                 "-- no listing, no trades, no estimate; its "
+                                 "resting offers are cancelled while the "
+                                 "book is thin", pair.name);
+                }
             }
         }
 
@@ -25806,12 +25834,19 @@ asio::awaitable<void> Engine::step_revive_maintenance(BlockHeight block_height)
         r.over_budget = revive_loss_budget_.exceeded(
                             pc.name, config_.strategy.revive_daily_loss_budget_usd)
                      || revive_budget_blind_.count(pc.name) > 0;
+        const MarketSnapshot snap = state_->get_market(pc.name);
+        const double scale = static_cast<double>(kMojosPerXch);
+        const bool thin = revive::book_is_thin(
+            static_cast<double>(snap.best_bid) / scale,
+            static_cast<double>(snap.best_ask) / scale,
+            snap.touches_third_party);
+        // [SYNTH 2026-10-22] A synthetically priced pair with no eligible
+        // price on a thin book has nothing to price its resting offers:
+        // all of them go, whatever the flows or their size. Re-selected
+        // every heartbeat, so a failed cancel is retried.
+        r.no_price = thin && revive_price_ineligible_.count(pc.name) > 0;
         if (config_.strategy.revive_max_offer_size_units > 0.0) {
-            const MarketSnapshot snap = state_->get_market(pc.name);
-            const double scale = static_cast<double>(kMojosPerXch);
-            if (revive::book_is_thin(static_cast<double>(snap.best_bid) / scale,
-                                     static_cast<double>(snap.best_ask) / scale,
-                                     snap.touches_third_party)) {
+            if (thin) {
                 const bool xch_base = pc.base_asset_id == "xch"
                                    || pc.base_asset_id == "XCH";
                 const double min_units = pc.min_offer_size_units_override.value_or(
@@ -25824,7 +25859,7 @@ asio::awaitable<void> Engine::step_revive_maintenance(BlockHeight block_height)
                         min_units, static_cast<double>(pc.base_mojos_per_unit)));
             }
         }
-        if (r.over_budget || r.size_limit > 0) rules[pc.name] = r;
+        if (r.over_budget || r.no_price || r.size_limit > 0) rules[pc.name] = r;
     }
     if (rules.empty()) co_return;
 
@@ -25842,6 +25877,7 @@ asio::awaitable<void> Engine::step_revive_maintenance(BlockHeight block_height)
     for (const auto& pk : picks) {
         ids.push_back(pk.offer_id);
         reason[pk.offer_id] = pk.over_budget ? "revive_loss_budget"
+                            : pk.no_price    ? "revive_no_price"
                                              : "revive_size_cap";
     }
     const auto done = co_await offer_mgr_->selective_cancel(ids);
@@ -25861,8 +25897,38 @@ asio::awaitable<void> Engine::step_revive_maintenance(BlockHeight block_height)
         }
     }
     spdlog::warn("[Engine] revive maintenance: cancelled {}/{} resting "
-                 "offer(s) (over the loss budget, or above the size cap on "
-                 "a thin book)", done.size(), ids.size());
+                 "offer(s) (over the loss budget, no eligible price, or "
+                 "above the size cap on a thin book)", done.size(), ids.size());
+}
+
+void Engine::revalidate_after_peg_observation()
+{
+    for (const auto& pc : config_.pairs) {
+        if (!pc.enabled) continue;
+        const auto cit = cycle_.find(pc.name);
+        if (cit == cycle_.end()) continue;
+        PairCycleState& pcs = cit->second;
+        // Still valid when no leg is suspended that was not already when
+        // Step 1 built the references (the same rule as a remembered
+        // synthetic price).
+        if (synth::remembered_price_usable(
+                asset_peg_suspended(pc.base_asset_id),
+                asset_peg_suspended(pc.quote_asset_id),
+                pcs.ref_base_suspended, pcs.ref_quote_suspended)) {
+            continue;
+        }
+        // A leg was suspended THIS heartbeat: the reference -- listed or
+        // synthetic -- may rest on that wrapper's listing or an estimate
+        // anchored there. Withdraw it and this heartbeat's quoting on it;
+        // Step 1 rebuilds from eligible inputs next heartbeat.
+        market_data_->clear_cex_reference(pc.name);
+        pcs.revive_synth_price     = 0.0;
+        pcs.revive_synth_sigma_bps = 0.0;
+        pcs.market_data_valid      = false;
+        if (pc.revive_market) revive_price_ineligible_.insert(pc.name);
+        spdlog::warn("[Engine] {} reference withdrawn: a leg's peg was "
+                     "suspended this heartbeat", pc.name);
+    }
 }
 
 // ---------------------------------------------------------------------------
