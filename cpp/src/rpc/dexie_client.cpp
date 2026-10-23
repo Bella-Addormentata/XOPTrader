@@ -975,7 +975,10 @@ std::vector<HistoricalTrade> parse_historical_trades(
         h.base_volume   = number(t, "base_volume");
         h.target_volume = number(t, "target_volume");
         const double ts = number(t, "trade_timestamp");
-        h.timestamp_ms  = (ts > 0.0 && std::isfinite(ts))
+        // 2^63 exclusive: INT64_MAX itself rounds up to 2^63 as a double,
+        // and casting a value outside int64's range is undefined.
+        constexpr double kInt64Limit = 9223372036854775808.0;
+        h.timestamp_ms  = (ts > 0.0 && ts < kInt64Limit)
                         ? static_cast<std::int64_t>(ts) : 0;
         if (!(h.price > 0.0) || !std::isfinite(h.price)
             || !(h.base_volume > 0.0) || !std::isfinite(h.base_volume)

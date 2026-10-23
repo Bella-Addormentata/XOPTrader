@@ -62,6 +62,10 @@ struct PriceSource {
 /// still quotes -- wide.
 inline constexpr double kMaxSigmaBps = 5000.0;
 
+/// How fast a remembered synthetic price's error bar grows, per hour, once
+/// no fresh evidence supports it (aged_source's usual rate).
+inline constexpr double kAgedSigmaBpsPerHour = 25.0;
+
 /// Inverse-variance blend in log space. The reported sigma is the larger of
 /// the formal combined error, sqrt(1 / sum w), and the weighted spread of the
 /// sources around the result, so two confident sources that disagree do not
@@ -176,6 +180,20 @@ struct TapeParams {
                              std::hypot(p.base_sigma_bps, dispersion)
                                  + std::max(0.0, age_h) * p.bps_per_hour);
     return out;
+}
+
+/// A mark for a loss budget from a synthetic price: one error bar against
+/// the position (the lower edge when long base, the upper when short; the
+/// price itself when flat), so the budget can only over-count a loss. 0 when
+/// the source is unusable.
+[[nodiscard]] inline double conservative_mark(const PriceSource& p,
+                                              double net_base) noexcept
+{
+    if (!usable(p)) return 0.0;
+    const double frac = std::min(p.sigma_bps, kMaxSigmaBps) / 1e4;
+    if (net_base > 0.0) return p.price * (1.0 - frac);
+    if (net_base < 0.0) return p.price * (1.0 + frac);
+    return p.price;
 }
 
 /// A quoting half-spread that covers `sigma_mult` error bars, never below

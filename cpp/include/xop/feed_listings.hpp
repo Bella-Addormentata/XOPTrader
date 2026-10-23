@@ -72,6 +72,18 @@ split_pair_legs(const std::string& pair_name) {
     return std::make_pair(std::move(base), std::move(quote));
 }
 
+// [SYNTH 2026-10-22] True when a leg of `pair_name` has no feed listing at
+// all (BYC) -- the case the synthetic price exists for. A listed pair whose
+// prices are merely missing from the cache (an outage, a partial response)
+// is NOT unlisted: it must wait for the live feed, not fall back.
+inline bool pair_has_unlisted_leg(const std::string& pair_name) {
+    const auto legs = split_pair_legs(pair_name);
+    if (!legs) return false;
+    const auto& table = feed_listings();
+    return table.find(legs->first) == table.end()
+        || table.find(legs->second) == table.end();
+}
+
 // [REVIVE2 2026-10-22] A pair's price (quote per base) from the external
 // feed alone: usd(base) / usd(quote), each leg through its listing.
 // nullopt unless BOTH legs are listed and both quoted prices are positive

@@ -1456,7 +1456,10 @@ double MarketDataFeed::compute_mid(const PairState& ps) const {
     const bool has_amm = (amm_mid > 0.0);
 
     if (!has_dex) w_dex = 0.0;
-    if (!has_cex) w_cex = 0.0;
+    // [SYNTH 2026-10-22] A synthetic reference stands in only when the DEX
+    // has no mid of its own. Blended into a DEX mid it would reach a mid the
+    // two-sided-book grade path can still mark equity with.
+    if (!has_cex || (ps.cex_synthetic && has_dex)) w_cex = 0.0;
     if (!has_amm) w_amm = 0.0;
 
     const double w_total = w_dex + w_cex + w_amm;

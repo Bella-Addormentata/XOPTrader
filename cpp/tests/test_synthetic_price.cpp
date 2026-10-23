@@ -5,7 +5,9 @@
 
 #include <gtest/gtest.h>
 
+#include "xop/execution/fair_value_solver.hpp"
 #include "xop/execution/market_data.hpp"
+#include "xop/feed_listings.hpp"
 #include "xop/rpc/dexie_client.hpp"
 #include "xop/state.hpp"
 #include "xop/strategy/synthetic_price.hpp"
@@ -14,6 +16,7 @@
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -179,6 +182,74 @@ TEST(SynthTape, ScatteredTradesWidenTheErrorBar)
 // half_spread_for_sigma
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// conservative_mark -- the revive loss budget's mark for a synthetic price
+// ---------------------------------------------------------------------------
+
+TEST(SynthMark, MarksOneErrorBarAgainstThePosition)
+{
+    const PriceSource p{2.0, 500.0};  // +-5%
+    EXPECT_DOUBLE_EQ(xop::synth::conservative_mark(p, 3.0), 1.9)
+        << "long base: the lower edge";
+    EXPECT_DOUBLE_EQ(xop::synth::conservative_mark(p, -3.0), 2.1)
+        << "short base: the upper edge";
+    EXPECT_DOUBLE_EQ(xop::synth::conservative_mark(p, 0.0), 2.0);
+}
+
+TEST(SynthMark, TheErrorBarIsCappedAndUnusableIsNothing)
+{
+    EXPECT_DOUBLE_EQ(xop::synth::conservative_mark({2.0, 9000.0}, 1.0), 1.0)
+        << "clipped to kMaxSigmaBps (50%), never a zero or negative mark";
+    EXPECT_DOUBLE_EQ(xop::synth::conservative_mark({0.0, 100.0}, 1.0), 0.0);
+    EXPECT_DOUBLE_EQ(xop::synth::conservative_mark({kNaN, 100.0}, 1.0), 0.0);
+    EXPECT_DOUBLE_EQ(xop::synth::conservative_mark({2.0, kNaN}, 1.0), 0.0);
+}
+
+// ---------------------------------------------------------------------------
+// Which revive pairs take the synthetic price
+// ---------------------------------------------------------------------------
+
+TEST(SynthEligibility, OnlyAMissingListingSelectsTheSyntheticPrice)
+{
+    EXPECT_TRUE(xop::pair_has_unlisted_leg("XCH/BYC"));
+    EXPECT_TRUE(xop::pair_has_unlisted_leg("BYC/wUSDC.b"));
+    EXPECT_FALSE(xop::pair_has_unlisted_leg("XCH/wUSDC.b"));
+    EXPECT_FALSE(xop::pair_has_unlisted_leg("wmilliETH.b/DBX"));
+    EXPECT_FALSE(xop::pair_has_unlisted_leg("not-a-pair"));
+}
+
+TEST(SynthEligibility, AnEmptyFeedCacheDoesNotMakeAListedPairUnlisted)
+{
+    // The startup-outage case: both legs listed, no prices fetched yet.
+    // listed_cross_price has nothing, but the pair must keep waiting for the
+    // live feed rather than fall back to the tape.
+    const std::map<std::string, double> no_prices;
+    ASSERT_FALSE(xop::listed_cross_price("XCH/wUSDC.b", no_prices).has_value());
+    EXPECT_FALSE(xop::pair_has_unlisted_leg("XCH/wUSDC.b"));
+}
+
+// ---------------------------------------------------------------------------
+// The ladder centres on the synthetic price, not the raw estimate
+// ---------------------------------------------------------------------------
+
+TEST(SynthCentre, AnEmptyBookCentresOnTheSyntheticPriceNotTheEstimate)
+{
+    // Step 1: the tape (1.835 +-250 bps) and the estimate (1.426 +-160 bps)
+    // blend to the synthetic price. Step 7 hands that price -- in place of
+    // the estimate -- to the centre blend, with no book opinion.
+    const auto synth = xop::synth::blend_sources(
+        {PriceSource{1.835, 250.0}, PriceSource{1.426, 160.0}});
+    ASSERT_TRUE(synth.has_value());
+    EXPECT_NEAR(synth->price, 1.5344, 5e-4);
+
+    const auto c = xop::fv::blend_quote_center(0.0, 0.0, synth->price,
+                                               synth->sigma_bps);
+    ASSERT_TRUE(c.ok);
+    EXPECT_NEAR(c.center, synth->price, 1e-9)
+        << "the tape must move the centre, not only the spread";
+    EXPECT_DOUBLE_EQ(c.sigma_bps, synth->sigma_bps);
+}
+
 TEST(SynthSpread, CoversTwoErrorBarsBetweenTheFloorAndTheCap)
 {
     EXPECT_DOUBLE_EQ(xop::synth::half_spread_for_sigma(300.0, 100.0), 300.0);
@@ -225,6 +296,20 @@ TEST(DexieHistoricalTrades, ANonSuccessOrBadEntriesYieldNothing)
         ]})"));
     ASSERT_EQ(t.size(), 1u);
     EXPECT_EQ(t[0].timestamp_ms, 5);
+}
+
+TEST(DexieHistoricalTrades, AnOversizedTimestampIsRejectedNotCast)
+{
+    // 1e30 and 2^63 are finite and positive but outside int64: they must be
+    // dropped before the cast, never converted.
+    const auto t = xop::rpc::parse_historical_trades(nlohmann::json::parse(R"({
+        "success": true, "trades": [
+            {"price": 0.5, "base_volume": 2, "trade_timestamp": 1e30},
+            {"price": 0.5, "base_volume": 2, "trade_timestamp": 9223372036854775808.0},
+            {"price": 0.5, "base_volume": 2, "trade_timestamp": 1792635467000}
+        ]})"));
+    ASSERT_EQ(t.size(), 1u);
+    EXPECT_EQ(t[0].timestamp_ms, 1792635467000LL);
 }
 
 TEST(DexieHistoricalTrades, TheV2RootFollowsTheConfiguredV1Base)
@@ -279,6 +364,55 @@ TEST(SyntheticReference, ARealReferenceStillGrantsGrade)
 
     EXPECT_TRUE(state.get_market("XCH/BYC").mid_valuation_grade);
     EXPECT_TRUE(feed.get_cex_reference("XCH/BYC").has_value());
+}
+
+TEST(SyntheticReference, ATwoSidedBookKeepsItsOwnGradedMid)
+{
+    // A healthy two-sided book with a synthetic leg inside its spread. The
+    // synthetic leg must not enter the published mid (it would otherwise
+    // be graded through the book branch and reach equity and P&L): the mid
+    // and grade must equal those of the same book with no synthetic leg.
+    // Inside the spread on purpose: a leg outside it would be blended and
+    // then clamped back to the book edge by the published-mid band, which
+    // can hide a blend.
+    auto offer = [](const std::string& id, xop::Side side, double price) {
+        xop::CompetingOffer o;
+        o.offer_id = id;
+        o.side     = side;
+        o.price    = static_cast<xop::Mojo>(
+            std::llround(price * static_cast<double>(xop::kMojosPerXch)));
+        o.size     = 5'000'000'000'000LL;
+        return o;
+    };
+    const std::string pair = "XCH/BYC";
+    auto run = [&](bool with_synthetic) {
+        xop::MarketDataConfig cfg = synth_cfg();
+        cfg.amm_blend_weight = 0.0;
+        xop::State state;
+        xop::MarketDataFeed feed(cfg, state);
+        feed.ingest_block_height(100);
+        feed.ingest_reference_anchor(pair, /*implied_cross=*/1.41,
+                                     /*peg_target=*/0.0);
+        feed.ingest_competing_offers(
+            pair,
+            {offer("b1", xop::Side::Bid, 1.38), offer("a1", xop::Side::Ask, 1.44)},
+            {}, xop::kMojosPerXch, 1'000);
+        if (with_synthetic) {
+            feed.ingest_cex_reference(pair, 1.39, Clock::now(), /*synthetic=*/true);
+        }
+        feed.refresh({pair});
+        return state.get_market(pair);
+    };
+    const auto control = run(false);
+    ASSERT_GT(control.mid_price, 0);
+    ASSERT_TRUE(control.mid_valuation_grade)
+        << "precondition: the book alone must earn grade, or the assertion "
+           "below proves nothing";
+
+    const auto snap = run(true);
+    EXPECT_EQ(snap.mid_price, control.mid_price)
+        << "the synthetic leg moved a two-sided book's mid (blended 70/30)";
+    EXPECT_TRUE(snap.mid_valuation_grade);
 }
 
 TEST(SyntheticReference, ARealReferenceClearsTheSyntheticMark)

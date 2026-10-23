@@ -5641,8 +5641,7 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
         // SYNTHETIC reference: it moves the published mid so the pair can
         // quote, and is withheld from valuation, the mid gate and the
         // arbitrage signal.
-        if (pair.revive_market
-            && !listed_cross_price(pair.name, coingecko_prices_)) {
+        if (pair.revive_market && pair_has_unlisted_leg(pair.name)) {
             co_await refresh_synth_tape(pair.base_asset_id);
             co_await refresh_synth_tape(pair.quote_asset_id);
             if (const auto sp = synth_pair_price(pair)) {
@@ -5651,6 +5650,7 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
                     /*synthetic=*/true);
                 revive_ref_ok = true;
                 if (auto cit = cycle_.find(pair.name); cit != cycle_.end()) {
+                    cit->second.revive_synth_price = sp->price;
                     cit->second.revive_synth_sigma_bps =
                         std::max(sp->sigma_bps, 1.0);
                 }
@@ -7006,14 +7006,22 @@ void Engine::step_compute_quotes(BlockHeight block_height)
         if (const PairConfig* pcr = find_pair_config(pair_name);
             pcr != nullptr && pcr->revive_market) {
             const double budget = config_.strategy.revive_daily_loss_budget_usd;
-            if (revive_loss_budget_.exceeded(pair_name, budget)) {
+            if (revive_loss_budget_.exceeded(pair_name, budget)
+                || revive_budget_blind_.count(pair_name) > 0) {
                 if (revive_over_budget_.insert(pair_name).second) {
-                    const std::string msg = fmt::format(
-                        "{} revive pair is ${:.2f} below its 24h P&L peak, "
-                        "over its ${:.2f} daily loss budget -- quoting "
-                        "suspended until the drawdown leaves the window",
-                        pair_name, revive_loss_budget_.drawdown_usd(pair_name),
-                        budget);
+                    const std::string msg =
+                        revive_budget_blind_.count(pair_name) > 0
+                        ? fmt::format(
+                            "{} revive pair holds a position its ${:.2f} daily "
+                            "loss budget cannot value (no mark or no quote USD "
+                            "price) -- quoting suspended until it can",
+                            pair_name, budget)
+                        : fmt::format(
+                            "{} revive pair is ${:.2f} below its 24h P&L peak, "
+                            "over its ${:.2f} daily loss budget -- quoting "
+                            "suspended until the drawdown leaves the window",
+                            pair_name,
+                            revive_loss_budget_.drawdown_usd(pair_name), budget);
                     spdlog::error("[Engine] Step 4: {}", msg);
                     alerts_->send_alert(AlertRule::CircuitBreaker, msg);
                 }
@@ -9094,13 +9102,28 @@ void Engine::step_generate_ladder(BlockHeight block_height)
             quote_has_external_est =
                 est.has_value()
                 && config_.strategy.quote_center_blend_enabled;
+            double ext_price = (config_.strategy.quote_center_blend_enabled && est)
+                ? est->price : 0.0;
+            double ext_sigma = est ? est->sigma_bps : 0.0;
+            // [SYNTH 2026-10-22] A revive pair quoting from a synthetic price
+            // centres on it: it already folds in the estimate (and the tape,
+            // which the estimate lacks), so it replaces the estimate here
+            // rather than being counted next to it. Blending off: the empty-
+            // book mid is already the synthetic price (compute_mid), and a
+            // two-sided book keeps its own centre, as the setting asks.
+            if (config_.strategy.quote_center_blend_enabled
+                && pcs.revive_synth_sigma_bps > 0.0
+                && pcs.revive_synth_price > 0.0) {
+                ext_price = pcs.revive_synth_price;
+                ext_sigma = pcs.revive_synth_sigma_bps;
+                quote_has_external_est = true;
+            }
 
             const auto blend = fv::blend_quote_center(
                 (obs.has_book && market_mid > 0.0) ? market_mid : 0.0,
                 book_sigma_bps,
-                (config_.strategy.quote_center_blend_enabled && est)
-                    ? est->price : 0.0,
-                est ? est->sigma_bps : 0.0);
+                ext_price,
+                ext_sigma);
 
             if (blend.ok) {
                 quote_combined_sigma_bps = blend.sigma_bps;
@@ -9115,7 +9138,7 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                         "combined={:.0f}bps)",
                         pair_name, market_mid, blend.center, shift_bps,
                         blend.w_external, book_sigma_bps,
-                        est ? est->sigma_bps : 0.0, blend.sigma_bps);
+                        ext_sigma, blend.sigma_bps);
                 } else {
                     spdlog::debug(
                         "[Engine] Step 7: {} uncertainty centre: "
@@ -21544,8 +21567,25 @@ void Engine::step_update_pnl(BlockHeight block_height)
                     mid = fv->price;
                 }
             }
+            // [SYNTH 2026-10-22] A pair priced only synthetically (a tape-
+            // only coin, or a peg suspension that removed the par fallback)
+            // has neither. Its budget then marks at the synthetic price's
+            // UNFAVOURABLE edge -- one error bar against the position -- so
+            // the budget can only over-count a loss. Budget-only: this never
+            // grants the synthetic price accounting grade.
+            if (!(mid > 0.0)) {
+                if (const auto lg = synth_last_good_.find(pair.name);
+                    lg != synth_last_good_.end()) {
+                    const double age_h = std::chrono::duration<
+                        double, std::ratio<3600>>(now - lg->second.second).count();
+                    mid = synth::conservative_mark(
+                        synth::aged_source(lg->second.first, age_h,
+                                           synth::kAgedSigmaBpsPerHour),
+                        flows.base_units);
+                }
+            }
             // The quote leg's USD price: XCH directly, else its feed listing
-            // (every revive leg is listed -- load_config requires it), else
+            // (or, for an unlisted quote, its synthetic XCH price), else
             // the pair's carried accounting factor. The accounting factor
             // alone is 0 for a non-par, non-XCH quote (wmilliETH.b/DBX),
             // which would leave the budget unable to see any loss.
@@ -21575,8 +21615,26 @@ void Engine::step_update_pnl(BlockHeight block_height)
                     ? carried->second : 0.0);
             if (const auto v = flows.value_usd(mid, quote_usd, xch_usd)) {
                 revive_loss_budget_.record(pair.name, now, *v);
+                if (revive_budget_blind_.erase(pair.name) > 0) {
+                    spdlog::warn("[Engine] Step 11: {} revive loss budget can "
+                                 "be valued again", pair.name);
+                }
+            } else if (!flows.is_empty()) {
+                // [SYNTH 2026-10-22] FAIL CLOSED: a pair holding exposure its
+                // budget cannot value is treated as over budget (Step 4 stops
+                // its quoting, revive maintenance cancels what rests) until a
+                // mark returns.
+                if (revive_budget_blind_.insert(pair.name).second) {
+                    spdlog::error("[Engine] Step 11: {} revive loss budget "
+                                  "cannot value the pair's exposure (no mark "
+                                  "or no quote USD price) -- treating it as "
+                                  "over budget", pair.name);
+                }
             }
         }
+    } else {
+        // No budget, nothing to be blind to.
+        revive_budget_blind_.clear();
     }
 
     spdlog::debug("[Engine] Step 11: PnL updated and {} snapshots, {} quotes persisted",
@@ -25607,7 +25665,8 @@ asio::awaitable<void> Engine::step_revive_maintenance(BlockHeight block_height)
         if (!pc.enabled || !pc.revive_market) continue;
         revive::RestingRule r;
         r.over_budget = revive_loss_budget_.exceeded(
-            pc.name, config_.strategy.revive_daily_loss_budget_usd);
+                            pc.name, config_.strategy.revive_daily_loss_budget_usd)
+                     || revive_budget_blind_.count(pc.name) > 0;
         if (config_.strategy.revive_max_offer_size_units > 0.0) {
             const MarketSnapshot snap = state_->get_market(pc.name);
             const double scale = static_cast<double>(kMojosPerXch);
@@ -25674,9 +25733,6 @@ asio::awaitable<void> Engine::step_revive_maintenance(BlockHeight block_height)
 namespace {
 /// How often one asset's Dexie trade history is re-fetched.
 constexpr auto kSynthTapeRefresh = std::chrono::minutes(10);
-/// How fast a remembered synthetic price's error bar grows once no fresh
-/// evidence supports it.
-constexpr double kSynthAgedBpsPerHour = 25.0;
 
 bool is_xch_asset(const std::string& asset_id)
 {
@@ -25763,8 +25819,16 @@ std::optional<synth::PriceSource> Engine::synth_pair_price(const PairConfig& pc)
     // The engine's own estimate (cross-pair books, declared pars). Clipped,
     // not dropped, when its error bar is huge: it then carries little weight
     // but still widens the blend if it disagrees.
+    // Only while the feed behind the solve's anchors is genuinely fresh: the
+    // solve re-stamps its result from a retained cache during an outage,
+    // and a stale estimate here would keep resetting the last-good price
+    // instead of letting it age.
+    const bool feed_fresh = coingecko_feed_fresh_for_revival(
+        !coingecko_prices_.empty(), coingecko_last_fetch_,
+        std::chrono::steady_clock::now(),
+        config_.market_data.cex_freshness_threshold_sec);
     if (const auto est = market_data_->get_fair_value_estimate(pc.name);
-        est && est->price > 0.0 && std::isfinite(est->price)) {
+        feed_fresh && est && est->price > 0.0 && std::isfinite(est->price)) {
         const double sig = std::isfinite(est->sigma_bps)
             ? std::clamp(est->sigma_bps, 0.0, synth::kMaxSigmaBps)
             : synth::kMaxSigmaBps;
@@ -25783,7 +25847,8 @@ std::optional<synth::PriceSource> Engine::synth_pair_price(const PairConfig& pc)
         lg != synth_last_good_.end()) {
         const double age_h = std::chrono::duration<double, std::ratio<3600>>(
             now - lg->second.second).count();
-        return synth::aged_source(lg->second.first, age_h, kSynthAgedBpsPerHour);
+        return synth::aged_source(lg->second.first, age_h,
+                                  synth::kAgedSigmaBpsPerHour);
     }
     return std::nullopt;
 }

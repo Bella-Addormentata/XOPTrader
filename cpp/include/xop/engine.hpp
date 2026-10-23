@@ -2280,6 +2280,7 @@ private:
         // [SYNTH 2026-10-22] The error bar (bps) of the synthetic quoting
         // price published for this pair in Step 1; 0 when none was.
         double        revive_synth_sigma_bps{0.0};
+        double        revive_synth_price{0.0};
 
         // [2026-09-02, review] The spread SpreadOptimizer::compute_spread()
         // produced, captured before Step 5's first adjustment site.
@@ -2464,6 +2465,9 @@ private:
     std::unordered_map<std::string, revive::PairFlows> revive_flows_;
     revive::LossBudget revive_loss_budget_;
     std::unordered_set<std::string> revive_over_budget_;
+    // [SYNTH 2026-10-22] Revive pairs whose budget cannot value their
+    // exposure (Step 11); treated as over budget until a mark returns.
+    std::unordered_set<std::string> revive_budget_blind_;
 
     // [REVIVE2 2026-10-22] Set only for the duration of a Step 8 run made
     // while the global flash-crash guard is engaged: step_manage_offers
