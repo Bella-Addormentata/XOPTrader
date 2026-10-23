@@ -47,6 +47,7 @@
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace xop::revive {
 
@@ -256,6 +257,49 @@ private:
     constexpr double kMax = 9.0e18;   // below INT64_MAX (~9.22e18)
     if (!(v < kMax)) return static_cast<std::int64_t>(kMax);
     return std::max<std::int64_t>(1, std::llround(v));
+}
+
+/// [REVIVE2 2026-10-22] What revive maintenance may cancel on one pair:
+/// everything when it is over its loss budget, else offers above
+/// `size_limit` (base mojos; 0 = no limit) while its book is thin.
+struct RestingRule {
+    bool         over_budget{false};
+    std::int64_t size_limit{0};
+};
+
+/// A resting offer, as revive maintenance sees it.
+struct RestingOffer {
+    std::string  offer_id;
+    std::string  pair_name;
+    std::int64_t size{0};
+    bool         cancel_pending{false};
+};
+
+/// One offer to cancel, and why.
+struct RestingCancel {
+    std::string offer_id;
+    bool        over_budget{false};   ///< false = above the size limit
+};
+
+/// The resting offers revive maintenance cancels: on a pair with a rule,
+/// every offer not already cancelling when the pair is over budget, else
+/// those above its size limit. Pairs without a rule are never touched.
+[[nodiscard]] inline std::vector<RestingCancel> select_resting_cancels(
+    const std::vector<RestingOffer>& offers,
+    const std::unordered_map<std::string, RestingRule>& rules)
+{
+    std::vector<RestingCancel> out;
+    for (const auto& o : offers) {
+        if (o.cancel_pending) continue;
+        const auto r = rules.find(o.pair_name);
+        if (r == rules.end()) continue;
+        if (r->second.over_budget) {
+            out.push_back(RestingCancel{o.offer_id, true});
+        } else if (r->second.size_limit > 0 && o.size > r->second.size_limit) {
+            out.push_back(RestingCancel{o.offer_id, false});
+        }
+    }
+    return out;
 }
 
 }  // namespace xop::revive

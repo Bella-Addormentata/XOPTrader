@@ -73,14 +73,13 @@ SUBMIT_REASONS = (
     # [SEED-FAIL-CLOSED review round 2] Step 8 takes down a pair's resting
     # offers while a position it trades is unverified.
     '"unverified_position"',
-    # [REVIVE2 2026-10-22] A revive pair over its daily loss budget has its
-    # resting offers cancelled (Engine::step_cancel_revive_over_budget).
-    '"revive_loss_budget"',
-    # [REVIVE2 2026-10-22] On a thin book Step 8 cancels a revive pair's
-    # resting offers above the revive size cap.
-    '"revive_size_cap"',
+    # [REVIVE2 2026-10-22] Engine::step_revive_maintenance cancels a revive
+    # pair's resting offers when it is over its daily loss budget
+    # ("revive_loss_budget") or above the size cap on a thin book
+    # ("revive_size_cap"), recording each offer's cause from reason[id].
+    "block_height, reason[id]",
 )
-SUBMIT_SITE_COUNT = 23
+SUBMIT_SITE_COUNT = 22
 
 
 def _read(path: Path) -> str:

@@ -1279,7 +1279,7 @@ private:
     [[nodiscard]] bool asset_peg_suspended(const std::string& asset_id) const;
     [[nodiscard]] bool pair_peg_suspended(const PairConfig& pc) const;
     asio::awaitable<void> step_observe_asset_pegs(BlockHeight block_height);
-    asio::awaitable<void> step_cancel_revive_over_budget(BlockHeight block_height);
+    asio::awaitable<void> step_revive_maintenance(BlockHeight block_height);
     void check_peg_reenable_flag();
     void publish_peg_status();
 

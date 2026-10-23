@@ -13,6 +13,8 @@
 #include <limits>
 #include <map>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 namespace {
 
@@ -422,4 +424,56 @@ TEST(RevivePairFlows, IsEmptyUntilTheFirstFill)
     EXPECT_TRUE(f.is_empty());
     f.apply_fill(true, 1.0, 1.5, 0.0);
     EXPECT_FALSE(f.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// select_resting_cancels -- revive maintenance, independent of quoting
+// ---------------------------------------------------------------------------
+
+namespace {
+std::vector<xop::revive::RestingOffer> sample_book()
+{
+    return {
+        {"a1", "wmilliETH.b/XCH", 1'000, false},
+        {"a2", "wmilliETH.b/XCH", 1'500, false},   // above a 1-unit cap
+        {"a3", "wmilliETH.b/XCH", 2'000, true},    // already cancelling
+        {"x1", "XCH/DBX", 9'000'000'000'000, false},
+    };
+}
+}  // namespace
+
+TEST(ReviveMaintenance, AThinBookCancelsOnlyOffersAboveTheLimit)
+{
+    // [review, PR #179] The cap must bind resting offers even when the pair
+    // cannot quote (empty ladder, invalid quote): the selection reads only
+    // the book's thinness and the limit, never quote eligibility.
+    const std::unordered_map<std::string, xop::revive::RestingRule> rules{
+        {"wmilliETH.b/XCH", {false, 1'000}}};
+    const auto picks = xop::revive::select_resting_cancels(sample_book(), rules);
+    ASSERT_EQ(picks.size(), 1u);
+    EXPECT_EQ(picks[0].offer_id, "a2");
+    EXPECT_FALSE(picks[0].over_budget);
+}
+
+TEST(ReviveMaintenance, OverBudgetCancelsEverythingRestingOnThePair)
+{
+    // [review, PR #179] Read from the budget directly, so a breach during
+    // the pair's own crash still takes its offers down.
+    const std::unordered_map<std::string, xop::revive::RestingRule> rules{
+        {"wmilliETH.b/XCH", {true, 0}}};
+    const auto picks = xop::revive::select_resting_cancels(sample_book(), rules);
+    ASSERT_EQ(picks.size(), 2u);
+    for (const auto& p : picks) {
+        EXPECT_TRUE(p.over_budget);
+        EXPECT_NE(p.offer_id, "a3") << "an offer already cancelling is left alone";
+    }
+}
+
+TEST(ReviveMaintenance, PairsWithoutARuleAreNeverTouched)
+{
+    EXPECT_TRUE(xop::revive::select_resting_cancels(sample_book(), {}).empty());
+    const std::unordered_map<std::string, xop::revive::RestingRule> rules{
+        {"wmilliETH.b/XCH", {false, 0}}};
+    EXPECT_TRUE(xop::revive::select_resting_cancels(sample_book(), rules).empty())
+        << "no budget breach and no size limit: nothing to do";
 }

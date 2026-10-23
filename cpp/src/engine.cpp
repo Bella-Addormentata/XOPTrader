@@ -4463,13 +4463,13 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
         spdlog::error("[Engine] peg observation failed: {}", e.what());
     }
 
-    // [REVIVE2 2026-10-22] A revive pair over its daily loss budget posts
-    // nothing new (Step 4), and its resting offers are cancelled here,
-    // every heartbeat until flat, so they cannot keep filling after the
-    // limit tripped -- including under the flash-crash guard.
-    try { co_await step_cancel_revive_over_budget(block_height); }
+    // [REVIVE2 2026-10-22] Revive maintenance: resting offers of a pair
+    // over its loss budget, or above the size cap on a thin book, are
+    // cancelled every heartbeat until none qualify -- whatever the pair's
+    // quote eligibility or the flash-crash state.
+    try { co_await step_revive_maintenance(block_height); }
     catch (const std::exception& e) {
-        spdlog::error("[Engine] revive loss-budget cancel failed: {}",
+        spdlog::error("[Engine] revive maintenance failed: {}",
                       e.what());
     } }
     catch (const std::exception& e) {
@@ -6958,17 +6958,6 @@ void Engine::step_compute_quotes(BlockHeight block_height)
         // state, the daily loss budget, and whether the book is thin.
         if (const PairConfig* pcr = find_pair_config(pair_name);
             pcr != nullptr && pcr->revive_market) {
-            if (config_.strategy.revive_isolate_flash_crash) {
-                const auto st = revive_crash_state_.find(pair_name);
-                if (st != revive_crash_state_.end()
-                    && st->second != FlashCrashState::Normal) {
-                    spdlog::warn("[Engine] Step 4: {} revive pair in its own "
-                                 "flash-crash {} state -- suppressing quotes",
-                                 pair_name, to_string(st->second));
-                    pcs.quote_valid = false;
-                    continue;
-                }
-            }
             const double budget = config_.strategy.revive_daily_loss_budget_usd;
             if (revive_loss_budget_.exceeded(pair_name, budget)) {
                 if (revive_over_budget_.insert(pair_name).second) {
@@ -6987,6 +6976,19 @@ void Engine::step_compute_quotes(BlockHeight block_height)
             if (revive_over_budget_.erase(pair_name) > 0) {
                 spdlog::warn("[Engine] Step 4: {} revive pair back within its "
                              "daily loss budget -- quoting resumes", pair_name);
+            }
+            // Its own crash state, after the budget so a breach during a
+            // crash is still announced (revive maintenance cancels either way).
+            if (config_.strategy.revive_isolate_flash_crash) {
+                const auto st = revive_crash_state_.find(pair_name);
+                if (st != revive_crash_state_.end()
+                    && st->second != FlashCrashState::Normal) {
+                    spdlog::warn("[Engine] Step 4: {} revive pair in its own "
+                                 "flash-crash {} state -- suppressing quotes",
+                                 pair_name, to_string(st->second));
+                    pcs.quote_valid = false;
+                    continue;
+                }
             }
             const MarketSnapshot rs = state_->get_market(pair_name);
             const double scale = static_cast<double>(kMojosPerXch);
@@ -12821,53 +12823,6 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             // drain in the verification pass above, which this loop's early
             // `continue`s cannot skip.
             continue;
-        }
-
-        // [REVIVE2 2026-10-22] On a thin book the revive size cap binds what
-        // RESTS too, not only the new ladder: a resting offer above the cap
-        // is cancelled now (the staleness check would keep a 1.5-unit offer
-        // Fresh against a 1-unit cap), and Step 8 reposts it capped.
-        if (const PairConfig* cap_pc = find_pair_config(pair_name);
-            cap_pc != nullptr && cap_pc->revive_market && pcs.revive_thin
-            && config_.strategy.revive_max_offer_size_units > 0.0
-            && !dry_run_ && !cancel_all_inflight_) {
-            const bool xch_base_cap = cap_pc->base_asset_id == "xch"
-                                   || cap_pc->base_asset_id == "XCH";
-            const double min_units = cap_pc->min_offer_size_units_override.value_or(
-                xch_base_cap ? 1.0 : config_.strategy.min_offer_size_units);
-            const Mojo limit = std::max<Mojo>(
-                static_cast<Mojo>(revive::cap_units_to_mojos(
-                    config_.strategy.revive_max_offer_size_units,
-                    static_cast<double>(cap_pc->base_mojos_per_unit))),
-                static_cast<Mojo>(revive::cap_units_to_mojos(
-                    min_units, static_cast<double>(cap_pc->base_mojos_per_unit))));
-            std::vector<std::string> oversized;
-            for (const auto& po : state_->get_all_offers()) {
-                if (po.pair_name == pair_name && !po.cancel_pending
-                    && po.size > limit) {
-                    oversized.push_back(po.offer_id);
-                }
-            }
-            if (!oversized.empty()) {
-                const auto done = co_await offer_mgr_->selective_cancel(oversized);
-                for (const auto& id : done) {
-                    try {
-                        db_->mark_offer_cancel_submitted(id, block_height,
-                                                         "revive_size_cap");
-                    } catch (const std::exception& e) {
-                        spdlog::debug("[Engine] could not mark {} "
-                                      "cancel_pending: {}", id.substr(0, 12),
-                                      e.what());
-                    }
-                }
-                if (fee_tracker_->enabled()) {
-                    fee_tracker_->record_fee(
-                        cancel_fees_paid(done, recommended_fee), block_height);
-                }
-                spdlog::info("[Engine] Step 8: {} revive thin book -- "
-                             "cancelled {}/{} resting offer(s) above the size "
-                             "cap", pair_name, done.size(), oversized.size());
-            }
         }
 
         // [T5-01] Selective refresh: classify existing tiers before deciding
@@ -25569,45 +25524,82 @@ asio::awaitable<void> Engine::step_maintain_coin_pool(BlockHeight block_height)
     co_return;
 }
 // ---------------------------------------------------------------------------
-// [REVIVE2 2026-10-22] Cancel the resting offers of revive pairs that are
-// over their daily loss budget (revive_over_budget_, set in Step 4).
-// Convergent like the PEGSUSPEND cancel: retried every heartbeat until no
-// offer rests on such a pair.
+// [REVIVE2 2026-10-22] Revive maintenance, every heartbeat, independent of
+// whether a pair may quote (a pair in its own crash, with an empty ladder or
+// an invalid quote still gets it), under any flash-crash state:
+//   * a pair over its daily loss budget has ALL its resting offers cancelled
+//     -- the budget is read here directly, not through Step 4;
+//   * a pair whose current third-party book is thin has its resting offers
+//     above max(size cap, minimum size) cancelled; Step 8 reposts capped.
+// Convergent like the PEGSUSPEND cancel: retried until nothing qualifies.
 // ---------------------------------------------------------------------------
-asio::awaitable<void> Engine::step_cancel_revive_over_budget(BlockHeight block_height)
+asio::awaitable<void> Engine::step_revive_maintenance(BlockHeight block_height)
 {
-    if (revive_over_budget_.empty() || !offer_mgr_ || dry_run_
-        || cancel_all_inflight_) {
-        co_return;
-    }
-    if (!wallet_step_may_run("revive loss-budget cancel")) co_return;
-    std::vector<std::string> to_cancel;
-    for (const auto& po : state_->get_all_offers()) {
-        if (!po.cancel_pending && revive_over_budget_.count(po.pair_name) > 0) {
-            to_cancel.push_back(po.offer_id);
+    if (!offer_mgr_ || dry_run_ || cancel_all_inflight_) co_return;
+
+    std::unordered_map<std::string, revive::RestingRule> rules;
+    for (const auto& pc : config_.pairs) {
+        if (!pc.enabled || !pc.revive_market) continue;
+        revive::RestingRule r;
+        r.over_budget = revive_loss_budget_.exceeded(
+            pc.name, config_.strategy.revive_daily_loss_budget_usd);
+        if (config_.strategy.revive_max_offer_size_units > 0.0) {
+            const MarketSnapshot snap = state_->get_market(pc.name);
+            const double scale = static_cast<double>(kMojosPerXch);
+            if (revive::book_is_thin(static_cast<double>(snap.best_bid) / scale,
+                                     static_cast<double>(snap.best_ask) / scale,
+                                     snap.touches_third_party)) {
+                const bool xch_base = pc.base_asset_id == "xch"
+                                   || pc.base_asset_id == "XCH";
+                const double min_units = pc.min_offer_size_units_override.value_or(
+                    xch_base ? 1.0 : config_.strategy.min_offer_size_units);
+                r.size_limit = std::max(
+                    revive::cap_units_to_mojos(
+                        config_.strategy.revive_max_offer_size_units,
+                        static_cast<double>(pc.base_mojos_per_unit)),
+                    revive::cap_units_to_mojos(
+                        min_units, static_cast<double>(pc.base_mojos_per_unit)));
+            }
         }
+        if (r.over_budget || r.size_limit > 0) rules[pc.name] = r;
     }
-    if (to_cancel.empty()) co_return;
-    const auto done = co_await offer_mgr_->selective_cancel(to_cancel);
+    if (rules.empty()) co_return;
+
+    std::vector<revive::RestingOffer> resting;
+    for (const auto& po : state_->get_all_offers()) {
+        resting.push_back(revive::RestingOffer{po.offer_id, po.pair_name,
+                                               po.size, po.cancel_pending});
+    }
+    const auto picks = revive::select_resting_cancels(resting, rules);
+    if (picks.empty()) co_return;
+    if (!wallet_step_may_run("revive maintenance cancel")) co_return;
+
+    std::vector<std::string> ids;
+    std::unordered_map<std::string, const char*> reason;
+    for (const auto& pk : picks) {
+        ids.push_back(pk.offer_id);
+        reason[pk.offer_id] = pk.over_budget ? "revive_loss_budget"
+                                             : "revive_size_cap";
+    }
+    const auto done = co_await offer_mgr_->selective_cancel(ids);
     // Booked here, not left to Step 8: under the flash-crash guard Step 8
-    // may not run, and its later cancel_fees_paid() would drain this
-    // sweep's accepted fees into a count that omits these ids.
+    // may not run, and its later cancel_fees_paid() would drain this sweep's
+    // accepted fees into a count that omits these ids.
     if (fee_tracker_ && fee_tracker_->enabled()) {
         fee_tracker_->record_fee(
-            cancel_fees_paid(done, offer_mgr_->current_fee()),
-            block_height);
+            cancel_fees_paid(done, offer_mgr_->current_fee()), block_height);
     }
     for (const auto& id : done) {
         try {
-            db_->mark_offer_cancel_submitted(id, block_height,
-                                             "revive_loss_budget");
+            db_->mark_offer_cancel_submitted(id, block_height, reason[id]);
         } catch (const std::exception& e) {
             spdlog::debug("[Engine] could not mark {} cancel_pending: {}",
                           id.substr(0, 12), e.what());
         }
     }
-    spdlog::warn("[Engine] revive loss budget: cancelled {}/{} resting "
-                 "offer(s) on pairs over budget", done.size(), to_cancel.size());
+    spdlog::warn("[Engine] revive maintenance: cancelled {}/{} resting "
+                 "offer(s) (over the loss budget, or above the size cap on "
+                 "a thin book)", done.size(), ids.size());
 }
 
 }  // namespace xop
