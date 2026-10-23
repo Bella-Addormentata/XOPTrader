@@ -78,6 +78,7 @@
 #include "xop/strategy/bbo_sanity.hpp"
 #include "xop/strategy/pace_controller.hpp"
 #include "xop/strategy/revive.hpp"
+#include "xop/strategy/synthetic_price.hpp"
 #include "xop/strategy/no_loss_floor.hpp"
 #include "xop/risk/usd_route.hpp"
 #include "xop/risk/inventory.hpp"
@@ -1280,6 +1281,30 @@ private:
     [[nodiscard]] bool pair_peg_suspended(const PairConfig& pc) const;
     asio::awaitable<void> step_observe_asset_pegs(BlockHeight block_height);
     asio::awaitable<void> step_revive_maintenance(BlockHeight block_height);
+    // [SYNTH 2026-10-22] Right after peg observation: withdraw references a
+    // leg's NEW suspension made ineligible, before anything quotes on them.
+    void revalidate_after_peg_observation();
+
+    // [SYNTH 2026-10-22] Synthetic quoting price for revive pairs with an
+    // unlisted leg (xop/strategy/synthetic_price.hpp). refresh_synth_tape
+    // re-fetches one asset's Dexie <asset>_xch trade history when it is
+    // older than kSynthTapeRefresh; a failed fetch keeps the old trades.
+    // synth_asset_in_xch prices one leg in XCH from its CoinGecko listing
+    // and its tape; synth_pair_price crosses the legs and blends in the
+    // fair-value estimate and the pair's last synthetic price, aged.
+    asio::awaitable<void> refresh_synth_tape(const std::string& asset_id);
+    // `used_listing`, when given, reports whether the listing contributed;
+    // a peg-suspended asset's listing (its underlying coin) never does.
+    [[nodiscard]] std::optional<synth::PriceSource> synth_asset_in_xch(
+        const std::string& asset_id, const std::string& leg_symbol,
+        bool* used_listing = nullptr) const;
+    // synth_asset_mark: synth_asset_in_xch, else the asset's last such
+    // price aged (for the revive loss budget, which must not go blind
+    // when a coin's trades leave the tape window).
+    [[nodiscard]] std::optional<synth::PriceSource> synth_asset_mark(
+        const std::string& asset_id, const std::string& leg_symbol);
+    [[nodiscard]] std::optional<synth::PriceSource> synth_pair_price(
+        const PairConfig& pc);
     void check_peg_reenable_flag();
     void publish_peg_status();
 
@@ -2263,6 +2288,15 @@ private:
         // third-party book cannot price the pair by itself, so the revive
         // spread floor and size cap apply.
         bool          revive_thin{false};
+        // [SYNTH 2026-10-22] The error bar (bps) of the synthetic quoting
+        // price published for this pair in Step 1; 0 when none was.
+        double        revive_synth_sigma_bps{0.0};
+        double        revive_synth_price{0.0};
+        // [SYNTH 2026-10-22] Each leg's peg suspension when Step 1 built
+        // this heartbeat's references; a leg suspended later in the same
+        // heartbeat makes them ineligible (revalidate_after_peg_observation).
+        bool          ref_base_suspended{false};
+        bool          ref_quote_suspended{false};
 
         // [2026-09-02, review] The spread SpreadOptimizer::compute_spread()
         // produced, captured before Step 5's first adjustment site.
@@ -2447,6 +2481,13 @@ private:
     std::unordered_map<std::string, revive::PairFlows> revive_flows_;
     revive::LossBudget revive_loss_budget_;
     std::unordered_set<std::string> revive_over_budget_;
+    // [SYNTH 2026-10-22] Revive pairs whose budget cannot value their
+    // exposure (Step 11); treated as over budget until a mark returns.
+    std::unordered_set<std::string> revive_budget_blind_;
+    // [SYNTH 2026-10-22] Revive pairs priced synthetically that have no
+    // eligible price this heartbeat; revive maintenance cancels their
+    // resting offers while the book is thin.
+    std::unordered_set<std::string> revive_price_ineligible_;
 
     // [REVIVE2 2026-10-22] Set only for the duration of a Step 8 run made
     // while the global flash-crash guard is engaged: step_manage_offers
@@ -2454,6 +2495,30 @@ private:
     // maintenance pass (expired-offer retire, UTXO liberation, pace caps,
     // reconciliation), which the guard keeps off for everything else.
     std::optional<std::unordered_set<std::string>> step8_pair_filter_;
+
+    // [SYNTH 2026-10-22] Per-asset Dexie trade history (keyed by asset id)
+    // and each revive pair's last synthetic price with when it was made.
+    // In memory: they rebuild from Dexie and the solve after a restart.
+    struct SynthTape {
+        std::vector<synth::TapeTrade>         trades;
+        std::chrono::steady_clock::time_point fetched_at{};
+    };
+    std::unordered_map<std::string, SynthTape> synth_tapes_;
+    struct SynthPairMark {
+        synth::PriceSource                    src;
+        std::chrono::system_clock::time_point at{};
+        // Each leg's peg suspension when the price was made: a suspended
+        // leg's listing, and any estimate, were left out of it.
+        bool base_suspended{false};
+        bool quote_suspended{false};
+    };
+    std::unordered_map<std::string, SynthPairMark> synth_last_good_;
+    struct SynthAssetMark {
+        synth::PriceSource                    src;
+        std::chrono::system_clock::time_point at{};
+        bool listing_free{false};  // computed without the feed listing
+    };
+    std::unordered_map<std::string, SynthAssetMark> synth_asset_last_good_;
 
     // XCH Recovery Mode -- entered when XCH spendable drops below threshold.
     // While active: offers cancelled, Steps 7-8 skipped, engine scans for

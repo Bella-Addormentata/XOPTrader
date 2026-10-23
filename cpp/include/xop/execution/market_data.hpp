@@ -593,6 +593,7 @@ struct PairState {
 
     // --- CEX reference ---
     double      cex_mid{0.0};       // CEX mid-price (0 if unavailable)
+    bool        cex_synthetic{false}; // [SYNTH] cex_mid is a revive synthetic price
     Timestamp   cex_updated_at{};   // When CEX data was last refreshed
 
     // --- Independent fair value (never derived from this pair's book) ---
@@ -712,6 +713,7 @@ struct PairState {
     // --- [S20] Gate outcome for the CURRENT published values ---
     double      last_accepted_mid{0.0};    // last mid that passed the gate
     bool        mid_valuation_grade{false};// see MarketSnapshot for semantics
+    bool        mid_synthetic{false};      // [SYNTH] see MarketSnapshot::mid_synthetic
     bool        gate_reject_logged{false}; // warn-once per rejection episode
 
     explicit PairState(const std::string& name = "") : pair_name(name) {}
@@ -847,10 +849,37 @@ public:
     /// @param observed_at  When the price was actually fetched.  Defaults to
     ///                     now() for callers that fetch synchronously at the
     ///                     call site; the engine passes its real fetch time.
+    ///
+    /// [SYNTH 2026-10-22] @param synthetic  True for a revive pair's
+    ///                     synthetic quoting price (Engine, Step 1). It is
+    ///                     blended into the published mid like any CEX leg,
+    ///                     so the pair can quote, but it is withheld from
+    ///                     everything that treats the CEX leg as independent
+    ///                     evidence: valuation grade, the mid gate's anchors,
+    ///                     the CEX-DEX arbitrage signal and get_cex_reference.
     void ingest_cex_reference(const std::string& pair_name,
                               double             cex_mid,
                               Timestamp          observed_at
-                                  = Timestamp::clock::now());
+                                  = Timestamp::clock::now(),
+                              bool               synthetic = false);
+
+    /// [SYNTH 2026-10-22] Withdraw a SYNTHETIC reference (a real CEX
+    /// reference is left alone). Called when a revive pair has no eligible
+    /// synthetic price this heartbeat, so the last one is not published
+    /// for the rest of its freshness window.
+    void clear_synthetic_reference(const std::string& pair_name);
+
+    /// [SYNTH 2026-10-22] Withdraw the pair's CEX reference, real or
+    /// synthetic -- e.g. a listing-derived one once a leg's peg is
+    /// suspended, since the listing is then the UNDERLYING coin's price.
+    void clear_cex_reference(const std::string& pair_name);
+
+    /// [SYNTH 2026-10-22] clear_cex_reference, and also withdraw the mid
+    /// already published from it this heartbeat: the pair's mid, valuation
+    /// grade and synthetic flag are zeroed and the snapshot republished at
+    /// once, so accounting later in the same heartbeat cannot read it. The
+    /// next refresh() recomputes from what remains.
+    void withdraw_reference_and_mid(const std::string& pair_name);
 
     /// Ingest the TibetSwap AMM implied mid-price for a pair.
     /// The implied price is computed from pool reserves: output_reserve / input_reserve.
@@ -1278,7 +1307,10 @@ private:
     ///   3. If CEX reference is available: mid = kDexWeight*dex + kCexWeight*cex
     ///   4. Otherwise: mid = dex_mid
     /// Returns 0.0 if no price data is available at all.
-    double compute_mid(const PairState& ps) const;
+    /// [SYNTH] `synthetic_used`, when given, is set to whether a synthetic
+    /// reference contributed to the returned mid.
+    double compute_mid(const PairState& ps,
+                       bool* synthetic_used = nullptr) const;
 
     /// Compute the spread in basis points from best_bid and best_ask.
     /// Returns 0.0 if either side is zero (no two-sided market).

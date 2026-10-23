@@ -103,8 +103,11 @@ jobs:
           -DVCPKG_TARGET_TRIPLET=x64-linux
 
       # ---- Build (compile-error check) -------------------------------------
+      # Bounded: a bare --parallel is an unbounded `make -j`, which starts every
+      # translation unit at once (engine.cpp alone is ~26k lines) and gets the
+      # runner killed for memory. 4 matches the runner's vCPUs.
       - name: Build
-        run: cmake --build build --config Debug --parallel
+        run: cmake --build build --config Debug --parallel 4
 
       # ---- Run the C++ suite -----------------------------------------------
       # The build above already produces xop_tests, so running it here costs

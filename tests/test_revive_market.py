@@ -227,7 +227,7 @@ def test_remove_button_removes_the_clicked_row_not_row_zero(
     assert len(before) >= 3, "example config must have several pairs"
     target = before[2]
 
-    container = panel._pairs_table.cellWidget(2, 7)
+    container = panel._pairs_table.cellWidget(2, 8)
     assert container is not None, "actions cell missing"
     btn = container.findChild(QPushButton)
     assert btn is not None
@@ -240,7 +240,7 @@ def test_remove_button_removes_the_clicked_row_not_row_zero(
 
     # And again after the table has shifted: rows re-resolve at click time.
     target2 = after[1]
-    container2 = panel._pairs_table.cellWidget(1, 7)
+    container2 = panel._pairs_table.cellWidget(1, 8)
     btn2 = container2.findChild(QPushButton)
     btn2.click()
     qapp.processEvents()

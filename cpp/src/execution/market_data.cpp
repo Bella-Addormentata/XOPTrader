@@ -38,6 +38,7 @@
 #include "xop/execution/book_side_quality.hpp"
 #include "xop/execution/mid_gate.hpp"
 #include "xop/execution/orderbook_mid.hpp"
+#include "xop/peg_registry.hpp"   // to_mojo_checked
 
 #include <spdlog/spdlog.h>
 
@@ -147,7 +148,8 @@ midgate::AnchorCandidates anchor_candidates(const PairState&        ps,
                                             const MarketDataConfig& cfg,
                                             Timestamp               now) {
     midgate::AnchorCandidates c;
-    if (ps.cex_mid > 0.0 && std::isfinite(ps.cex_mid)
+    // [SYNTH] A synthetic quoting price is not independent evidence.
+    if (ps.cex_mid > 0.0 && std::isfinite(ps.cex_mid) && !ps.cex_synthetic
         && (cfg.cex_freshness_threshold_sec <= 0.0
             || age_seconds(ps.cex_updated_at, now)
                    < cfg.cex_freshness_threshold_sec)) {
@@ -410,7 +412,9 @@ void MarketDataFeed::refresh(const std::vector<std::string>& enabled_pairs) {
         ps.last_block = current_block;
 
         // Step 4: Compute aggregated mid-price.
-        ps.mid_price = compute_mid(ps);
+        bool synthetic_used = false;
+        ps.mid_price     = compute_mid(ps, &synthetic_used);
+        ps.mid_synthetic = synthetic_used;
 
         // Step 4b: [S20 2026-08-24] Plausibility gate.  Runs BEFORE the
         // arbitrage check, price history append, and snapshot publish so a
@@ -454,7 +458,8 @@ void MarketDataFeed::refresh(const std::vector<std::string>& enabled_pairs) {
         }
 
         // Step 7: Check for arbitrage divergence (only if both sources live).
-        if (!dex_stale && ps.cex_mid > 0.0 && !cex_stale) {
+        if (!dex_stale && ps.cex_mid > 0.0 && !cex_stale
+            && !ps.cex_synthetic) {
             // Release pairs lock before acquiring arb lock to maintain the
             // single-mutex rule.  We copy the needed values first.
             //
@@ -538,7 +543,8 @@ void MarketDataFeed::ingest_dexie(const std::string& pair_name,
                     .value;
             }
             // Gate OFF: legacy behaviour, unfiltered CEX only.
-            return it->second.cex_mid > 0.0 ? it->second.cex_mid : 0.0;
+            return (it->second.cex_mid > 0.0 && !it->second.cex_synthetic)
+                ? it->second.cex_mid : 0.0;
         }();
         if (ref > 0.0) {
             constexpr double kMaxRatio = 10.0;
@@ -657,9 +663,45 @@ void MarketDataFeed::ingest_block_height(BlockHeight block_height) {
     spdlog::debug("ingest_block_height: height={}", block_height);
 }
 
+void MarketDataFeed::clear_synthetic_reference(const std::string& pair_name)
+{
+    std::unique_lock lock(mtx_pairs_);
+    const auto it = pairs_.find(pair_name);
+    if (it == pairs_.end() || !it->second.cex_synthetic) return;
+    it->second.cex_mid        = 0.0;
+    it->second.cex_synthetic  = false;
+    it->second.cex_updated_at = Timestamp{};
+}
+
+void MarketDataFeed::clear_cex_reference(const std::string& pair_name)
+{
+    std::unique_lock lock(mtx_pairs_);
+    const auto it = pairs_.find(pair_name);
+    if (it == pairs_.end()) return;
+    it->second.cex_mid        = 0.0;
+    it->second.cex_synthetic  = false;
+    it->second.cex_updated_at = Timestamp{};
+}
+
+void MarketDataFeed::withdraw_reference_and_mid(const std::string& pair_name)
+{
+    std::unique_lock lock(mtx_pairs_);
+    const auto it = pairs_.find(pair_name);
+    if (it == pairs_.end()) return;
+    PairState& ps = it->second;
+    ps.cex_mid             = 0.0;
+    ps.cex_synthetic       = false;
+    ps.cex_updated_at      = Timestamp{};
+    ps.mid_price           = 0.0;
+    ps.mid_valuation_grade = false;
+    ps.mid_synthetic       = false;
+    publish_snapshot(ps);
+}
+
 void MarketDataFeed::ingest_cex_reference(const std::string& pair_name,
                                            double             cex_mid,
-                                           Timestamp          observed_at) {
+                                           Timestamp          observed_at,
+                                           bool               synthetic) {
     // [S20 2026-08-24] Reject non-finite as well as non-positive.  NaN
     // fails `<= 0.0` and +inf passes it, so both used to be stored -- and
     // a stored infinity then satisfied every bare `cex_mid > 0.0` test
@@ -669,11 +711,22 @@ void MarketDataFeed::ingest_cex_reference(const std::string& pair_name,
                      pair_name, cex_mid);
         return;
     }
+    // [SYNTH 2026-10-22] ...and one the snapshot cannot represent: it is
+    // published in mojos, and a cross of a near-worthless coin (1e8 per
+    // XCH) scales past int64. Converting that is undefined, not an error.
+    if (const auto m = to_mojo_checked(
+            cex_mid * static_cast<double>(kMojosPerXch));
+        !m || *m <= 0) {
+        spdlog::warn("ingest_cex_reference: pair={} cex_mid={} is outside "
+                     "the fixed-point range -- ignored", pair_name, cex_mid);
+        return;
+    }
 
     std::unique_lock lock(mtx_pairs_);
     PairState& ps = get_or_create_pair(pair_name);
 
     ps.cex_mid        = cex_mid;
+    ps.cex_synthetic  = synthetic;
     // Stored VERBATIM, for the same reason spelled out in ingest_amm_mid:
     // the engine re-derives cex_mid from its CoinGecko CACHE every heartbeat,
     // and a failed fetch leaves that cache in place.  Stamping now() here
@@ -816,7 +869,7 @@ std::optional<double> MarketDataFeed::get_cex_reference(
     const PairState& ps = it->second;
 
     // Return nullopt if no CEX data has ever been ingested, or if it is stale.
-    if (ps.cex_mid <= 0.0) {
+    if (ps.cex_mid <= 0.0 || ps.cex_synthetic) {
         return std::nullopt;
     }
     if (detect_stale(ps.cex_updated_at)) {
@@ -1300,7 +1353,9 @@ void MarketDataFeed::set_whale_max_spread_multiplier(double multiplier) {
 //   govern it, not be pinned to it.
 // -------------------------------------------------------------------------
 
-double MarketDataFeed::compute_mid(const PairState& ps) const {
+double MarketDataFeed::compute_mid(const PairState& ps,
+                                   bool* synthetic_used) const {
+    if (synthetic_used != nullptr) *synthetic_used = false;
     // [MEDIUM-1] Snapshot config under shared_lock (ISO/IEC 5055 -- CWE-362).
     const auto cfg = [&] { std::shared_lock lk(mtx_config_); return config_; }();
 
@@ -1451,7 +1506,10 @@ double MarketDataFeed::compute_mid(const PairState& ps) const {
     const bool has_amm = (amm_mid > 0.0);
 
     if (!has_dex) w_dex = 0.0;
-    if (!has_cex) w_cex = 0.0;
+    // [SYNTH 2026-10-22] A synthetic reference stands in only when the DEX
+    // has no mid of its own. Blended into a DEX mid it would reach a mid the
+    // two-sided-book grade path can still mark equity with.
+    if (!has_cex || (ps.cex_synthetic && has_dex)) w_cex = 0.0;
     if (!has_amm) w_amm = 0.0;
 
     const double w_total = w_dex + w_cex + w_amm;
@@ -1462,6 +1520,9 @@ double MarketDataFeed::compute_mid(const PairState& ps) const {
 
     double mid = (w_dex * dex_mid + w_cex * cex_mid + w_amm * amm_mid)
                  / w_total;
+    if (synthetic_used != nullptr) {
+        *synthetic_used = ps.cex_synthetic && w_cex > 0.0;
+    }
 
     // Published-mid invariant -- see the block comment above compute_mid().
     // Applies only when a two-sided THIRD-PARTY book exists and the dex data
@@ -1667,8 +1728,10 @@ void MarketDataFeed::apply_mid_gate(PairState& ps, const MarketDataConfig& cfg)
     // must never bless an otherwise-ungraded DEX candidate into equity
     // and P&L.  select_anchor already skips non-finite values, and this
     // keeps the grade path consistent with it.
+    // [SYNTH] A synthetic quoting price never grants valuation grade.
     const bool cex_fresh = ps.cex_mid > 0.0
         && std::isfinite(ps.cex_mid)
+        && !ps.cex_synthetic
         && (cfg.cex_freshness_threshold_sec <= 0.0
             || age_seconds(ps.cex_updated_at, now)
                    < cfg.cex_freshness_threshold_sec);
@@ -1878,7 +1941,10 @@ void MarketDataFeed::apply_mid_gate(PairState& ps, const MarketDataConfig& cfg)
     const bool book_side_safe =
         !book_two_sided
         || (sides_examined && book_sides_ok && book_agrees_with_itself);
+    // [SYNTH] A mid a synthetic reference contributed to is never graded,
+    // whatever else holds (compute_mid already keeps it off a DEX mid).
     ps.mid_valuation_grade = ps.mid_price > 0.0
+        && !ps.mid_synthetic
         && book_side_safe
         && ((book_two_sided && dex_fresh_grade) || cex_fresh);
 }
@@ -2053,10 +2119,13 @@ void MarketDataFeed::publish_snapshot(const PairState& ps) {
         if (price <= 0.0) {
             return 0;
         }
-        // Round to nearest mojo.  The result fits int64 because prices in
-        // the Chia ecosystem are on the order of $2-3 (XCH) or fractions
-        // thereof, so price * 10^12 stays well within int64 range.
-        return static_cast<Mojo>(std::llround(price * static_cast<double>(kMojosPerXch)));
+        // Round to nearest mojo -- CHECKED. Chia prices of a few dollars fit
+        // easily, but nothing upstream bounds every input (a synthetic cross
+        // of a near-worthless coin is 1e8 per XCH, 1e20 scaled), and
+        // llround on an out-of-range double is undefined. 0 publishes "no
+        // price", which every consumer already handles.
+        return to_mojo_checked(price * static_cast<double>(kMojosPerXch))
+            .value_or(0);
     };
 
     MarketSnapshot snap;
@@ -2074,6 +2143,7 @@ void MarketDataFeed::publish_snapshot(const PairState& ps) {
     // struct default is true only so hand-built snapshots keep their
     // pre-S20 behaviour.
     snap.mid_valuation_grade = ps.mid_valuation_grade;
+    snap.mid_synthetic       = ps.mid_synthetic && ps.mid_price > 0.0;
     snap.dex_print_age       = ps.dex_print_age;
     snap.is_stale            = ps.is_stale;
 

@@ -364,6 +364,14 @@ struct MarketSnapshot {
     // pre-S20 behaviour; MarketDataFeed::publish_snapshot always sets it.
     bool         mid_valuation_grade{true};
 
+    // [SYNTH 2026-10-22] The published mid rests on a revive pair's
+    // SYNTHETIC quoting price (Dexie trades, crossed listings, an aged last
+    // price) rather than on an observation. It is never valuation grade, and
+    // the ungraded readers above -- the USD anchor fallback, the arbitrage
+    // scans, the drift corrector -- must refuse it too: it exists so the pair
+    // can quote, not to price anything else.
+    bool         mid_synthetic{false};
+
     // [S20] Heartbeats since the dust-filtered book mid last moved by more
     // than 1 bp (PairState::dex_print_age).  0 also when never observed.
     std::int32_t dex_print_age{0};

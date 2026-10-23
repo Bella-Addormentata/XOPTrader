@@ -158,6 +158,24 @@ struct PairFlows {
         const double fees = fee_xch > 0.0 ? fee_xch * xch_usd : 0.0;
         return (quote_units + base_value) * quote_usd - fees;
     }
+
+    /// [SYNTH 2026-10-22] The flows marked LEG BY LEG: base at `base_usd`,
+    /// quote at `quote_usd` (USD per unit of each). A leg's mark is needed
+    /// only while that leg is held, so quote-only exposure needs no base
+    /// mark and base-only exposure no quote mark. nullopt when a mark the
+    /// flows need is unknown, so a missing price is never read as a loss.
+    [[nodiscard]] std::optional<double> value_usd_by_leg(
+        double base_usd, double quote_usd, double xch_usd) const noexcept
+    {
+        auto ok = [](double v) { return v > 0.0 && std::isfinite(v); };
+        if (base_units != 0.0 && !ok(base_usd)) return std::nullopt;
+        if (quote_units != 0.0 && !ok(quote_usd)) return std::nullopt;
+        if (fee_xch > 0.0 && !ok(xch_usd)) return std::nullopt;
+        const double b = base_units != 0.0 ? base_units * base_usd : 0.0;
+        const double q = quote_units != 0.0 ? quote_units * quote_usd : 0.0;
+        const double f = fee_xch > 0.0 ? fee_xch * xch_usd : 0.0;
+        return b + q - f;
+    }
 };
 
 /// The quote leg's USD price for PairFlows::value_usd: XCH's price for an
@@ -197,13 +215,25 @@ public:
     /// window / min_spacing buckets per pair. Non-finite values are ignored.
     void record(const std::string& pair, TimePoint now, double pnl_usd)
     {
-        if (!std::isfinite(pnl_usd)) return;
+        record(pair, now, pnl_usd, pnl_usd);
+    }
+
+    /// [SYNTH 2026-10-22] Record an uncertain P&L: `central_usd` at the
+    /// central marks feeds the PEAK, `adverse_usd` (one error bar against
+    /// the position, never above central) is the LATEST value. Discounting
+    /// both would let a narrowing error bar raise the latest value and hide
+    /// a real fall; this way the drawdown is at least the central loss.
+    void record(const std::string& pair, TimePoint now, double central_usd,
+                double adverse_usd)
+    {
+        if (!std::isfinite(central_usd) || !std::isfinite(adverse_usd)) return;
+        const double latest = std::min(adverse_usd, central_usd);
         auto& d = samples_[pair];
         if (!d.empty() && now - d.back().start < min_spacing_) {
-            d.back().latest = pnl_usd;
-            d.back().peak   = std::max(d.back().peak, pnl_usd);
+            d.back().latest = latest;
+            d.back().peak   = std::max(d.back().peak, central_usd);
         } else {
-            d.push_back(Bucket{now, pnl_usd, pnl_usd});
+            d.push_back(Bucket{now, latest, central_usd});
         }
         while (!d.empty() && now - d.front().start > window_) d.pop_front();
     }
@@ -265,7 +295,25 @@ private:
 struct RestingRule {
     bool         over_budget{false};
     std::int64_t size_limit{0};
+    /// [SYNTH 2026-10-22] The pair has lost its only eligible price (no
+    /// synthetic price on a thin book): every resting offer goes, whatever
+    /// its size and whatever the flows.
+    bool         no_price{false};
 };
+
+/// [SYNTH 2026-10-22] Whether a revive pair has nothing eligible to price
+/// its offers by: only on a thin book (a two-sided third-party book prices
+/// it), and either no eligible synthetic price this heartbeat or -- for a
+/// synthetically priced pair -- no published mid at all (the mid gate
+/// rejected the synthetic step). Resting offers are cancelled and no new
+/// quote is posted while it holds.
+[[nodiscard]] inline bool no_eligible_price(bool thin, bool synthetic_pricing,
+                                            bool price_ineligible,
+                                            bool has_published_mid) noexcept
+{
+    return thin
+        && (price_ineligible || (synthetic_pricing && !has_published_mid));
+}
 
 /// A resting offer, as revive maintenance sees it.
 struct RestingOffer {
@@ -279,6 +327,7 @@ struct RestingOffer {
 struct RestingCancel {
     std::string offer_id;
     bool        over_budget{false};   ///< false = above the size limit
+    bool        no_price{false};      ///< the pair lost its eligible price
 };
 
 /// The resting offers revive maintenance cancels: on a pair with a rule,
@@ -293,8 +342,9 @@ struct RestingCancel {
         if (o.cancel_pending) continue;
         const auto r = rules.find(o.pair_name);
         if (r == rules.end()) continue;
-        if (r->second.over_budget) {
-            out.push_back(RestingCancel{o.offer_id, true});
+        if (r->second.over_budget || r->second.no_price) {
+            out.push_back(RestingCancel{o.offer_id, r->second.over_budget,
+                                        r->second.no_price});
         } else if (r->second.size_limit > 0 && o.size > r->second.size_limit) {
             out.push_back(RestingCancel{o.offer_id, false});
         }

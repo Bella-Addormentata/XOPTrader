@@ -455,6 +455,40 @@ TEST(ReviveMaintenance, AThinBookCancelsOnlyOffersAboveTheLimit)
     EXPECT_FALSE(picks[0].over_budget);
 }
 
+TEST(ReviveMaintenance, NoEligiblePriceCancelsEverythingRestingOnThePair)
+{
+    // [SYNTH, review PR #180] A synthetically priced pair that has lost its
+    // only eligible price (a wrapper suspended with no trades of its own)
+    // cancels every resting offer -- with no fills and every offer inside
+    // the size cap, so neither the budget nor the cap would.
+    xop::revive::RestingRule no_price;
+    no_price.no_price = true;
+    const std::unordered_map<std::string, xop::revive::RestingRule> rules{
+        {"wmilliETH.b/XCH", no_price}};
+    const auto picks = xop::revive::select_resting_cancels(sample_book(), rules);
+    ASSERT_EQ(picks.size(), 2u);
+    for (const auto& p : picks) {
+        EXPECT_TRUE(p.no_price);
+        EXPECT_FALSE(p.over_budget);
+        EXPECT_NE(p.offer_id, "a3") << "an offer already cancelling is left alone";
+    }
+}
+
+TEST(ReviveMaintenance, NoEligiblePriceIsDecidedOnlyOnAThinBook)
+{
+    using xop::revive::no_eligible_price;
+    // Eleventh review: an accepted synthetic price, then a step the mid gate
+    // rejects -- the pair is still "eligible" but publishes no mid.
+    EXPECT_TRUE(no_eligible_price(/*thin=*/true, /*synthetic=*/true,
+                                  /*ineligible=*/false, /*mid=*/false));
+    EXPECT_TRUE(no_eligible_price(true, true, /*ineligible=*/true, true));
+    EXPECT_FALSE(no_eligible_price(true, true, false, true));
+    // A two-sided third-party book prices the pair by itself.
+    EXPECT_FALSE(no_eligible_price(/*thin=*/false, true, true, false));
+    // A listed (non-synthetic) pair's missing mid is not this rule's call.
+    EXPECT_FALSE(no_eligible_price(true, /*synthetic=*/false, false, false));
+}
+
 TEST(ReviveMaintenance, OverBudgetCancelsEverythingRestingOnThePair)
 {
     // [review, PR #179] Read from the budget directly, so a breach during

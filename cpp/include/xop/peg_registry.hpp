@@ -528,6 +528,21 @@ to_mojo_checked(double value) noexcept
     return static_cast<std::int64_t>(std::llround(value));
 }
 
+/// to_mojo_checked with a ROUNDING DIRECTION: down (a bid pays no more) or
+/// up (an ask receives no less). Same bound, checked after rounding.
+[[nodiscard]] inline std::optional<std::int64_t>
+floor_mojo_checked(double value) noexcept
+{
+    return std::isfinite(value) ? to_mojo_checked(std::floor(value))
+                                : std::nullopt;
+}
+[[nodiscard]] inline std::optional<std::int64_t>
+ceil_mojo_checked(double value) noexcept
+{
+    return std::isfinite(value) ? to_mojo_checked(std::ceil(value))
+                                : std::nullopt;
+}
+
 }  // namespace xop
 
 #endif  // XOP_PEG_REGISTRY_HPP

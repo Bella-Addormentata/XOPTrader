@@ -226,6 +226,25 @@ struct MarketTickerMatch {
     std::string_view      base_asset_id,
     std::string_view      quote_asset_id);
 
+/// [SYNTH 2026-10-22] One settled trade from Dexie's
+/// GET /v2/prices/historical_trades, for a "<asset_id>_xch" ticker.
+struct HistoricalTrade {
+    double       price{0.0};          ///< XCH per asset (target per base).
+    double       base_volume{0.0};    ///< Asset amount traded.
+    double       target_volume{0.0};  ///< XCH amount traded.
+    std::int64_t timestamp_ms{0};     ///< Settlement time, Unix ms.
+};
+
+/// Parse a historical_trades response. Pure -- no I/O. Entries with a
+/// missing or non-positive price, volume or timestamp are skipped; a
+/// response without "success": true yields nothing.
+[[nodiscard]] std::vector<HistoricalTrade> parse_historical_trades(
+    const nlohmann::json& response);
+
+/// The v2 API root for a configured v1 base URL: a trailing "/v1" becomes
+/// "/v2"; any other base gets "/v2" appended after trimming a trailing "/".
+[[nodiscard]] std::string dexie_v2_base_url(std::string_view base_url);
+
 /// Result of POST /v1/offers (offer submission).
 struct SubmitResult {
     bool        success = false;
@@ -515,6 +534,16 @@ public:
         std::string_view pair_id   = {},
         uint32_t         page      = 1,
         uint32_t         page_size = 20);
+
+    /// [SYNTH 2026-10-22] GET /v2/prices/historical_trades for the
+    /// "<asset_id>_xch" market: the newest `limit` settled trades, each
+    /// with its own settlement timestamp. Prices are XCH per asset. Dexie
+    /// lists this history only for CAT/XCH markets. An empty vector when
+    /// the market is unknown or the response is not a success. Feeds the
+    /// synthetic quoting price of revive pairs only -- never valuation
+    /// (see xop/strategy/synthetic_price.hpp).
+    [[nodiscard]] boost::asio::awaitable<std::vector<HistoricalTrade>>
+    get_xch_trade_history(std::string_view asset_id, uint32_t limit = 50);
 
     // -- Order management ------------------------------------------------
 
