@@ -713,6 +713,7 @@ struct PairState {
     // --- [S20] Gate outcome for the CURRENT published values ---
     double      last_accepted_mid{0.0};    // last mid that passed the gate
     bool        mid_valuation_grade{false};// see MarketSnapshot for semantics
+    bool        mid_synthetic{false};      // [SYNTH] see MarketSnapshot::mid_synthetic
     bool        gate_reject_logged{false}; // warn-once per rejection episode
 
     explicit PairState(const std::string& name = "") : pair_name(name) {}
@@ -1288,7 +1289,10 @@ private:
     ///   3. If CEX reference is available: mid = kDexWeight*dex + kCexWeight*cex
     ///   4. Otherwise: mid = dex_mid
     /// Returns 0.0 if no price data is available at all.
-    double compute_mid(const PairState& ps) const;
+    /// [SYNTH] `synthetic_used`, when given, is set to whether a synthetic
+    /// reference contributed to the returned mid.
+    double compute_mid(const PairState& ps,
+                       bool* synthetic_used = nullptr) const;
 
     /// Compute the spread in basis points from best_bid and best_ask.
     /// Returns 0.0 if either side is zero (no two-sided market).

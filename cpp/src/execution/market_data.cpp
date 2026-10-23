@@ -411,7 +411,9 @@ void MarketDataFeed::refresh(const std::vector<std::string>& enabled_pairs) {
         ps.last_block = current_block;
 
         // Step 4: Compute aggregated mid-price.
-        ps.mid_price = compute_mid(ps);
+        bool synthetic_used = false;
+        ps.mid_price     = compute_mid(ps, &synthetic_used);
+        ps.mid_synthetic = synthetic_used;
 
         // Step 4b: [S20 2026-08-24] Plausibility gate.  Runs BEFORE the
         // arbitrage check, price history append, and snapshot publish so a
@@ -1305,7 +1307,9 @@ void MarketDataFeed::set_whale_max_spread_multiplier(double multiplier) {
 //   govern it, not be pinned to it.
 // -------------------------------------------------------------------------
 
-double MarketDataFeed::compute_mid(const PairState& ps) const {
+double MarketDataFeed::compute_mid(const PairState& ps,
+                                   bool* synthetic_used) const {
+    if (synthetic_used != nullptr) *synthetic_used = false;
     // [MEDIUM-1] Snapshot config under shared_lock (ISO/IEC 5055 -- CWE-362).
     const auto cfg = [&] { std::shared_lock lk(mtx_config_); return config_; }();
 
@@ -1470,6 +1474,9 @@ double MarketDataFeed::compute_mid(const PairState& ps) const {
 
     double mid = (w_dex * dex_mid + w_cex * cex_mid + w_amm * amm_mid)
                  / w_total;
+    if (synthetic_used != nullptr) {
+        *synthetic_used = ps.cex_synthetic && w_cex > 0.0;
+    }
 
     // Published-mid invariant -- see the block comment above compute_mid().
     // Applies only when a two-sided THIRD-PARTY book exists and the dex data
@@ -1888,7 +1895,10 @@ void MarketDataFeed::apply_mid_gate(PairState& ps, const MarketDataConfig& cfg)
     const bool book_side_safe =
         !book_two_sided
         || (sides_examined && book_sides_ok && book_agrees_with_itself);
+    // [SYNTH] A mid a synthetic reference contributed to is never graded,
+    // whatever else holds (compute_mid already keeps it off a DEX mid).
     ps.mid_valuation_grade = ps.mid_price > 0.0
+        && !ps.mid_synthetic
         && book_side_safe
         && ((book_two_sided && dex_fresh_grade) || cex_fresh);
 }
@@ -2084,6 +2094,7 @@ void MarketDataFeed::publish_snapshot(const PairState& ps) {
     // struct default is true only so hand-built snapshots keep their
     // pre-S20 behaviour.
     snap.mid_valuation_grade = ps.mid_valuation_grade;
+    snap.mid_synthetic       = ps.mid_synthetic && ps.mid_price > 0.0;
     snap.dex_print_age       = ps.dex_print_age;
     snap.is_stale            = ps.is_stale;
 

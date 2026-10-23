@@ -15848,6 +15848,9 @@ asio::awaitable<void> Engine::step_check_arbitrage(
             if (!pair.enabled || pair_peg_suspended(pair)) continue;
             auto it = cycle_.find(pair.name);
             if (it == cycle_.end() || !it->second.market_data_valid) continue;
+            // [SYNTH 2026-10-22] A synthetic quoting price is not a market
+            // to arbitrage against.
+            if (state_->get_market(pair.name).mid_synthetic) continue;
             const double mid = market_data_->get_mid_price(pair.name);
             if (mid > 0.0) {
                 pair_prices[pair.name] = mid;
@@ -16503,9 +16506,18 @@ asio::awaitable<void> Engine::step_check_arbitrage(
             double stable_spread_bps = 0.0;
             for (const auto& pc : config_.pairs) {
                 if (pc.is_stablecoin && pc.enabled) {
+                    auto ssnap = state_->get_market(pc.name);
+                    // [SYNTH 2026-10-22] A synthetic cross rate would price
+                    // real takes off a quoting estimate: no arb this cycle.
+                    if (ssnap.mid_synthetic) {
+                        spdlog::debug("[Engine] Step 9: cross-stable arb "
+                                      "skipped -- {} has only a synthetic "
+                                      "price", pc.name);
+                        xch_stable_pairs.clear();
+                        break;
+                    }
                     const double mid = market_data_->get_mid_price(pc.name);
                     if (mid > 0.0) stable_cross_rate = mid;
-                    auto ssnap = state_->get_market(pc.name);
                     if (ssnap.spread_bps > 0.0) stable_spread_bps = ssnap.spread_bps;
                     stable_pair_base_id = pc.base_asset_id;
                     break;
@@ -17551,7 +17563,9 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
         if (snap.best_bid > 0 && snap.best_ask > 0) {
             mid = (snap.best_bid + snap.best_ask) / 2;
         }
-        if (mid == 0) {
+        // [SYNTH 2026-10-22] Taking offers is judged against a market, not
+        // a synthetic quoting price: no fallback to one.
+        if (mid == 0 && !snap.mid_synthetic) {
             mid = static_cast<Mojo>(std::llround(
                 market_data_->get_mid_price(pair.name)
                 * static_cast<double>(kMojosPerXch)));
@@ -18703,6 +18717,11 @@ risk::XchUsdAnchor Engine::usd_per_xch_anchor() const
             // against an independent anchor before it reaches State, which
             // is where junk is meant to be stopped.
             const auto snap = state_->get_market(std::string{c.pair_name});
+            // [SYNTH 2026-10-22] Ungraded is accepted here, synthetic is
+            // not: a revive pair's synthetic quoting price is not an
+            // observation of XCH's dollar value, and every XCH-quoted
+            // pair's USD factor is trusted on the strength of this anchor.
+            if (snap.mid_synthetic) return std::nullopt;
             // [PEG 2026-08-27] Multiply by the quote's DECLARED par rather
             // than assuming one unit is one dollar.  The mid here is
             // denominated in the quote asset, so for a EUR-pegged wrapper
@@ -21592,18 +21611,55 @@ void Engine::step_update_pnl(BlockHeight block_height)
             double listed_quote_usd = 0.0;
             if (const auto legs = split_pair_legs(pair.name)) {
                 const auto& table = feed_listings();
-                if (const auto l = table.find(legs->second);
-                    l != table.end() && l->second.units_per_coin > 0.0) {
-                    if (const auto q = coingecko_prices_.find(l->second.id);
-                        q != coingecko_prices_.end() && q->second > 0.0) {
-                        listed_quote_usd = q->second / l->second.units_per_coin;
+                // A leg's USD price from its feed listing; 0 if unlisted or
+                // not quoted.
+                auto listed_usd = [&](const std::string& leg) -> double {
+                    const auto l = table.find(leg);
+                    if (l == table.end() || !(l->second.units_per_coin > 0.0)) {
+                        return 0.0;
                     }
+                    const auto q = coingecko_prices_.find(l->second.id);
+                    return (q != coingecko_prices_.end() && q->second > 0.0)
+                        ? q->second / l->second.units_per_coin : 0.0;
+                };
+                if (table.count(legs->second) > 0) {
+                    listed_quote_usd = listed_usd(legs->second);
                 } else if (xch_usd > 0.0) {
                     // [SYNTH 2026-10-22] An unlisted quote (BYC): its
-                    // synthetic XCH price -- Dexie trades, aged -- in USD.
+                    // synthetic XCH price -- Dexie trades, aged -- in USD,
+                    // and the mid derived from the SAME marks, so the base
+                    // leg is not re-priced through a mid from another
+                    // source (a par-backed fair value times a tape-priced
+                    // quote). The base leg: XCH, else its listing, else its
+                    // own synthetic price; each synthetic mark one error
+                    // bar against the position.
                     if (const auto sq = synth_asset_in_xch(pair.quote_asset_id,
                                                            legs->second)) {
-                        listed_quote_usd = sq->price * xch_usd;
+                        double base_usd = 0.0;
+                        if (pair.base_asset_id == "xch"
+                            || pair.base_asset_id == "XCH") {
+                            base_usd = xch_usd;
+                        } else if (table.count(legs->first) > 0) {
+                            base_usd = listed_usd(legs->first);
+                        } else if (const auto sb = synth_asset_in_xch(
+                                       pair.base_asset_id, legs->first)) {
+                            base_usd = synth::conservative_mark(
+                                synth::PriceSource{sb->price * xch_usd,
+                                                   sb->sigma_bps},
+                                flows.base_units);
+                        }
+                        if (const auto m = synth::synthetic_quote_marks(
+                                base_usd,
+                                synth::PriceSource{sq->price * xch_usd,
+                                                   sq->sigma_bps},
+                                flows.quote_units)) {
+                            mid = m->mid;
+                            listed_quote_usd = m->quote_usd;
+                        } else {
+                            // No consistent marks: no mark at all, so a
+                            // held position fails closed below.
+                            mid = 0.0;
+                        }
                     }
                 }
             }
@@ -25758,10 +25814,11 @@ asio::awaitable<void> Engine::refresh_synth_tape(const std::string& asset_id)
             std::vector<synth::TapeTrade> out;
             out.reserve(trades.size());
             for (const auto& t : trades) {
-                out.push_back(synth::TapeTrade{
-                    t.price, t.base_volume,
-                    std::chrono::system_clock::time_point(
-                        std::chrono::milliseconds(t.timestamp_ms))});
+                // Checked before conversion: an int64 of milliseconds can
+                // overflow the clock's own duration.
+                const auto at = synth::time_from_epoch_ms(t.timestamp_ms);
+                if (!at) continue;
+                out.push_back(synth::TapeTrade{t.price, t.base_volume, *at});
             }
             synth_tapes_[asset_id].trades = std::move(out);
         }

@@ -10,11 +10,13 @@
 #include "xop/feed_listings.hpp"
 #include "xop/rpc/dexie_client.hpp"
 #include "xop/state.hpp"
+#include "xop/strategy/revive.hpp"
 #include "xop/strategy/synthetic_price.hpp"
 #include "xop/types.hpp"
 
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <map>
 #include <string>
@@ -203,6 +205,96 @@ TEST(SynthMark, TheErrorBarIsCappedAndUnusableIsNothing)
     EXPECT_DOUBLE_EQ(xop::synth::conservative_mark({0.0, 100.0}, 1.0), 0.0);
     EXPECT_DOUBLE_EQ(xop::synth::conservative_mark({kNaN, 100.0}, 1.0), 0.0);
     EXPECT_DOUBLE_EQ(xop::synth::conservative_mark({2.0, kNaN}, 1.0), 0.0);
+}
+
+// ---------------------------------------------------------------------------
+// synthetic_quote_marks -- a tape-priced QUOTE leg in the loss budget
+// ---------------------------------------------------------------------------
+
+TEST(SynthQuoteMarks, BothLegsAreMarkedFromTheSameUsdPrices)
+{
+    // Review case: XCH/BYC, net -40 XCH / +80 BYC, XCH steady at $1.43,
+    // BYC (tape-priced) falls from $0.78 to $0.50. The real loss is
+    // 80 x 0.28 = $22.40, over the default $10 budget.
+    xop::revive::PairFlows flows;
+    flows.base_units  = -40.0;
+    flows.quote_units = 80.0;
+    const double xch_usd = 1.43;
+
+    auto value = [&](double byc_usd) {
+        const auto m = xop::synth::synthetic_quote_marks(
+            xch_usd, PriceSource{byc_usd, 0.0}, flows.quote_units);
+        EXPECT_TRUE(m.has_value());
+        if (!m) return kNaN;
+        EXPECT_NEAR(m->mid, xch_usd / byc_usd, 1e-12)
+            << "the mid comes from the same marks, not from elsewhere";
+        return *flows.value_usd(m->mid, m->quote_usd, xch_usd);
+    };
+    xop::revive::LossBudget budget;
+    const auto t0 = Clock::time_point{} + 1000h;
+    budget.record("XCH/BYC", t0, value(0.78));
+    budget.record("XCH/BYC", t0 + 2min, value(0.50));
+    EXPECT_NEAR(budget.drawdown_usd("XCH/BYC"), 22.40, 1e-9);
+    EXPECT_TRUE(budget.exceeded("XCH/BYC", 10.0));
+
+    // The defect this replaces: a par-backed mid (1.43 BYC per XCH) times
+    // the tape-priced BYC marks XCH at $0.715 and sees only $6.384.
+    const double par_mid = 1.43;
+    const double stale_loss = *flows.value_usd(par_mid, 0.78, xch_usd)
+                            - *flows.value_usd(par_mid, 0.50, xch_usd);
+    EXPECT_NEAR(stale_loss, 6.384, 1e-9);
+    EXPECT_FALSE(stale_loss > 10.0) << "which is why it missed the budget";
+}
+
+TEST(SynthQuoteMarks, TheQuoteIsMarkedAgainstThePosition)
+{
+    const PriceSource byc{0.80, 500.0};  // +-5%
+    const auto long_quote = xop::synth::synthetic_quote_marks(1.43, byc, 80.0);
+    ASSERT_TRUE(long_quote.has_value());
+    EXPECT_DOUBLE_EQ(long_quote->quote_usd, 0.76) << "holding BYC: its lower edge";
+    EXPECT_DOUBLE_EQ(long_quote->mid, 1.43 / 0.76);
+    const auto short_quote = xop::synth::synthetic_quote_marks(1.43, byc, -80.0);
+    ASSERT_TRUE(short_quote.has_value());
+    EXPECT_DOUBLE_EQ(short_quote->quote_usd, 0.84) << "owing BYC: its upper edge";
+}
+
+TEST(SynthQuoteMarks, AnUnusableLegIsNoMark)
+{
+    EXPECT_FALSE(xop::synth::synthetic_quote_marks(0.0, {0.8, 100.0}, 1.0));
+    EXPECT_FALSE(xop::synth::synthetic_quote_marks(kNaN, {0.8, 100.0}, 1.0));
+    EXPECT_FALSE(xop::synth::synthetic_quote_marks(1.43, {0.0, 100.0}, 1.0));
+    EXPECT_FALSE(xop::synth::synthetic_quote_marks(1.43, {0.8, kNaN}, 1.0));
+}
+
+// ---------------------------------------------------------------------------
+// Trade timestamps -> time points
+// ---------------------------------------------------------------------------
+
+TEST(SynthTime, AnInRangeTimestampConvertsExactly)
+{
+    const auto at = xop::synth::time_from_epoch_ms(1792635467000LL);
+    ASSERT_TRUE(at.has_value());
+    EXPECT_EQ(std::chrono::duration_cast<std::chrono::milliseconds>(
+                  at->time_since_epoch()).count(),
+              1792635467000LL);
+}
+
+TEST(SynthTime, TimestampsBeyondTheClockAreRefusedBeforeConversion)
+{
+    // 1e15 ms fits int64 but overflows a nanosecond (Linux) or 100 ns
+    // (MSVC) system_clock duration.
+    EXPECT_FALSE(xop::synth::time_from_epoch_ms(1'000'000'000'000'000LL));
+    EXPECT_FALSE(xop::synth::time_from_epoch_ms(
+        std::numeric_limits<std::int64_t>::max()));
+    EXPECT_FALSE(xop::synth::time_from_epoch_ms(0));
+    EXPECT_FALSE(xop::synth::time_from_epoch_ms(-5));
+    // The boundary itself: the clock's largest whole millisecond converts,
+    // one past it does not.
+    const std::int64_t max_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            Clock::duration::max()).count();
+    EXPECT_TRUE(xop::synth::time_from_epoch_ms(max_ms).has_value());
+    EXPECT_FALSE(xop::synth::time_from_epoch_ms(max_ms + 1));
 }
 
 // ---------------------------------------------------------------------------
@@ -413,6 +505,30 @@ TEST(SyntheticReference, ATwoSidedBookKeepsItsOwnGradedMid)
     EXPECT_EQ(snap.mid_price, control.mid_price)
         << "the synthetic leg moved a two-sided book's mid (blended 70/30)";
     EXPECT_TRUE(snap.mid_valuation_grade);
+    EXPECT_FALSE(snap.mid_synthetic)
+        << "a synthetic leg that contributed nothing is not provenance";
+}
+
+TEST(SyntheticReference, AnEmptyBookPublishesItsSyntheticProvenance)
+{
+    // The ungraded readers (USD anchor fallback, arbitrage scans, drift
+    // corrector) need to know the mid is synthetic, not just ungraded.
+    xop::State state;
+    xop::MarketDataFeed feed(synth_cfg(), state);
+    feed.ingest_block_height(100);
+    feed.ingest_cex_reference("XCH/BYC", 1.835, Clock::now(), /*synthetic=*/true);
+    feed.refresh({"XCH/BYC"});
+    const auto snap = state.get_market("XCH/BYC");
+    ASSERT_GT(snap.mid_price, 0);
+    EXPECT_TRUE(snap.mid_synthetic);
+
+    // The same price as a real reference is not synthetic.
+    xop::State state2;
+    xop::MarketDataFeed feed2(synth_cfg(), state2);
+    feed2.ingest_block_height(100);
+    feed2.ingest_cex_reference("XCH/BYC", 1.835, Clock::now());
+    feed2.refresh({"XCH/BYC"});
+    EXPECT_FALSE(state2.get_market("XCH/BYC").mid_synthetic);
 }
 
 TEST(SyntheticReference, ARealReferenceClearsTheSyntheticMark)

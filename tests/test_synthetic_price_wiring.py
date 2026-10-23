@@ -155,3 +155,75 @@ def test_the_estimate_joins_the_blend_only_while_the_feed_is_fresh():
     )
     cond = body[est : body.index("{", est)]
     assert re.search(r"\bfeed_fresh\b", cond)
+
+
+# ---------------------------------------------------------------------------
+# Second review of PR #180: synthetic provenance must reach the ungraded
+# readers, the budget must mark a synthetic quote leg consistently, and a
+# trade timestamp must fit the clock before it becomes a time point.
+# ---------------------------------------------------------------------------
+
+USD_ANCHOR = "risk::XchUsdAnchor Engine::usd_per_xch_anchor() const"
+ARB = "asio::awaitable<void> Engine::step_check_arbitrage("
+DRIFT = "asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)"
+TAPE = "asio::awaitable<void> Engine::refresh_synth_tape(const std::string& asset_id)"
+
+
+def test_the_usd_anchor_fallback_refuses_a_synthetic_mid():
+    body = _body(USD_ANCHOR)
+    read = body.find("state_->get_market(")
+    assert read >= 0
+    use = body.find("usd_per_base_from_mid(", read)
+    assert use > read
+    assert re.search(r"if\s*\(\s*snap\.mid_synthetic\s*\)\s*return\s+std::nullopt\s*;",
+                     body[read:use]), (
+        "every XCH-quoted pair's USD factor is trusted on this anchor; a "
+        "synthetic quoting price must not supply it"
+    )
+
+
+def test_neither_arbitrage_scan_prices_off_a_synthetic_mid():
+    body = _body(ARB)
+    tri = body.find("pair_prices[pair.name] = mid;")
+    assert tri >= 0
+    assert "mid_synthetic" in body[body.rfind("for (const auto& pair", 0, tri):tri], (
+        "the triangular scan must skip synthetic mids"
+    )
+    rate = body.find("stable_cross_rate = mid;")
+    assert rate >= 0
+    loop = body.rfind("for (const auto& pc : config_.pairs)", 0, rate)
+    window = body[loop:rate]
+    assert "ssnap.mid_synthetic" in window and "xch_stable_pairs.clear()" in window, (
+        "the cross-stable scan must not normalise real takes through a "
+        "synthetic rate"
+    )
+
+
+def test_the_drift_corrector_does_not_fall_back_to_a_synthetic_mid():
+    body = _body(DRIFT)
+    fallback = body.find("market_data_->get_mid_price(pair.name)")
+    assert fallback >= 0
+    gate = body.rfind("if (", 0, fallback)
+    assert re.search(r"mid\s*==\s*0\s*&&\s*!\s*snap\.mid_synthetic", body[gate:fallback])
+
+
+def test_a_synthetic_quote_leg_is_marked_consistently():
+    body = _body(STEP11)
+    record = body.find("revive_loss_budget_.record(")
+    marks = body.find("synth::synthetic_quote_marks(")
+    assert 0 <= marks < record, (
+        "a tape-priced quote leg must be valued with the mid derived from "
+        "the same USD marks, not a par-backed or book mid"
+    )
+    after = body[marks:record]
+    assert re.search(r"\bmid\s*=\s*m->mid\s*;", after)
+    assert re.search(r"listed_quote_usd\s*=\s*m->quote_usd\s*;", after)
+
+
+def test_trade_timestamps_are_bounded_before_conversion():
+    body = _body(TAPE)
+    assert "synth::time_from_epoch_ms(" in body
+    assert not re.search(r"time_point\s*\(\s*std::chrono::milliseconds\s*\(", body), (
+        "constructing the time point straight from milliseconds can "
+        "overflow the clock's duration"
+    )

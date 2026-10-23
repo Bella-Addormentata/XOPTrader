@@ -39,6 +39,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <optional>
 #include <vector>
 
@@ -134,6 +135,21 @@ struct TapeTrade {
     std::chrono::system_clock::time_point at{};
 };
 
+/// A trade's epoch-milliseconds timestamp as a time point, or nullopt when
+/// it is not positive or lies beyond what system_clock can represent (its
+/// duration is nanoseconds on Linux, so ~year 2262 -- an int64 of
+/// milliseconds reaches much further, and converting it would overflow).
+[[nodiscard]] inline std::optional<std::chrono::system_clock::time_point>
+time_from_epoch_ms(std::int64_t ms) noexcept
+{
+    using namespace std::chrono;
+    constexpr std::int64_t kMaxMs =
+        duration_cast<milliseconds>(system_clock::duration::max()).count();
+    if (ms <= 0 || ms > kMaxMs) return std::nullopt;
+    return system_clock::time_point(
+        duration_cast<system_clock::duration>(milliseconds(ms)));
+}
+
 /// Parameters of tape_source. Defaults are the shipped values.
 struct TapeParams {
     std::chrono::hours window{72};   ///< trades older than this are ignored
@@ -194,6 +210,30 @@ struct TapeParams {
     if (net_base > 0.0) return p.price * (1.0 - frac);
     if (net_base < 0.0) return p.price * (1.0 + frac);
     return p.price;
+}
+
+/// The loss budget's marks for a pair whose QUOTE leg is priced only
+/// synthetically (an unlisted quote coin). The quote's USD price is taken
+/// at its unfavourable edge for the position (conservative_mark on the net
+/// quote held), and the pair mid is derived from the SAME USD marks --
+/// base_usd / quote_usd -- so neither leg is re-priced through a mid from
+/// another source. (A par-backed fair value with a tape-priced quote would
+/// otherwise mark XCH at par times the tape: $0.715 for a $1.43 coin.)
+/// nullopt unless both marks are usable.
+struct BudgetMarks {
+    double mid{0.0};        ///< quote per base
+    double quote_usd{0.0};  ///< USD per quote unit
+};
+[[nodiscard]] inline std::optional<BudgetMarks>
+synthetic_quote_marks(double base_usd, const PriceSource& quote_usd,
+                      double net_quote) noexcept
+{
+    if (!(base_usd > 0.0) || !std::isfinite(base_usd)) return std::nullopt;
+    const double q = conservative_mark(quote_usd, net_quote);
+    if (!(q > 0.0) || !std::isfinite(q)) return std::nullopt;
+    const double mid = base_usd / q;
+    if (!(mid > 0.0) || !std::isfinite(mid)) return std::nullopt;
+    return BudgetMarks{mid, q};
 }
 
 /// A quoting half-spread that covers `sigma_mult` error bars, never below
