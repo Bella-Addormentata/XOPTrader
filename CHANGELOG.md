@@ -5,6 +5,97 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.29] — 2026-10-23 — revive pairs quote through thin markets, with a synthetic price for coins no feed lists
+
+### A pair with no prices no longer holds the flash-crash guard (#179)
+
+At 05:35 CDT on 2026-10-21 the guard tripped on XCH/BYC. Around 21:30
+BYC/wUSDC.b lost its only third-party bid, so it stopped adding prices, and
+its frozen history could never pass the recovery check. The engine posted no
+new offers for over a day.
+
+A pair whose newest price is more than `risk.flash_crash_stale_history_blocks`
+(default 10) behind the current block is now left out of both the crash
+check and the recovery check. A pair with no mid isn't quoted, so leaving it
+out can't resume posting into it. `0` restores the old behaviour.
+
+### revive_market pairs quote through thin markets, inside hard limits (#179)
+
+A revive pair now:
+
+- gets a CEX reference from its coins' feed listings, so an empty or
+  one-sided book still has a mid;
+- runs its own flash-crash guard: its crash pauses only that pair, and
+  another pair's crash no longer stops it posting;
+- while its third-party book is thin (one-sided, empty, or possibly our own
+  offers), quotes no tighter than `strategy.revive_min_half_spread_bps`
+  (300) and posts no tier above `strategy.revive_max_offer_size_units`
+  (1.0, never below the minimum size). Resting offers above the cap are
+  cancelled every heartbeat;
+- stops quoting, and cancels its resting offers, once its P&L is more than
+  `strategy.revive_daily_loss_budget_usd` ($10) below its 24-hour peak.
+
+### Coins with no price feed get a synthetic quoting price (#180)
+
+Revive used to need a CoinGecko listing for both coins, so neither BYC pair
+could use it. A revive pair with an unlisted coin now quotes from a
+synthetic price built from what exists: each coin's Dexie trade history in
+XCH (timestamped, so its age is measured), its listing where it has one, the
+engine's fair-value estimate, and, when nothing fresh is left, its last price
+with the error bar growing 25 bps an hour. The error bar is never smaller
+than the sources' disagreement. BYC trades on Dexie at about 0.545 XCH
+(roughly $0.78) against a declared $1 par, so XCH/BYC quotes wide rather
+than confidently in the middle. On a thin book the pair quotes at least two
+error bars wide, with the uncertainty part capped at 50%.
+
+The synthetic price is for quoting only. It never earns valuation grade and
+never feeds the mid gate, the arbitrage scans, the drift corrector, the
+fair-value solve, the shared risk rates or the USD cost of fills. A pair
+with no eligible price on a thin book posts nothing and has its resting
+offers cancelled.
+
+The revive loss budget values a pair with an unlisted coin leg by leg, each
+synthetic leg one error bar against the position. The peak is taken at the
+central price and the latest value at that adverse edge, so price
+uncertainty on a held position counts against the budget. A position the
+budget cannot value at all counts as over budget.
+
+### Peg guard checkbox (#180)
+
+Settings → Trading Pairs has a new **Peg guard** column, ticked by default.
+Unticking it lets a revive pair keep quoting through a peg suspension or
+depeg bail-out, inside the revive limits. It does nothing unless Revive is
+also ticked, and depeg alerts still fire. While a wrapper (wUSDC.b) is
+suspended, nothing prices it from its underlying coin's listing (usd-coin):
+not the pair's reference, the fair-value solve, the synthetic price or the
+loss budget. It is priced from its own Dexie trades or not at all, and a
+suspension latched mid-heartbeat takes effect in that heartbeat.
+
+### Fixes
+
+- The Trading Pairs table read a blank or `null` `peg_guard` (and
+  `enabled`) as off, and a quoted `"false"` `revive_market` as on. Saving
+  could then write the opposite of the running setting. Each now reads the
+  way the engine does: blank or null keeps the default.
+- Prices outside the engine's fixed-point range are dropped rather than
+  converted, in the published snapshot and the raw ladder.
+- CI's C++ compile check is bounded to 4 parallel jobs; unbounded it was
+  killed for memory.
+
+### Operator notes
+
+- New keys, all optional: `risk.flash_crash_stale_history_blocks` (10),
+  `strategy.revive_min_half_spread_bps` (300),
+  `strategy.revive_max_offer_size_units` (1.0),
+  `strategy.revive_daily_loss_budget_usd` (10.0),
+  `strategy.revive_isolate_flash_crash` (true), and `pairs[].peg_guard`
+  (true). Each limit is off at `0`.
+- Revive can now be ticked on a BYC pair. The listed coin's id is still
+  checked at load.
+- A revive pair can't also be paced, and the revive size cap can't be
+  combined with `batch_offers_enabled`. Both combinations are refused at
+  load.
+
 ## [0.10.28] — 2026-10-18 — a peg judged at the book edge nearest par
 
 ### One far-off offer can no longer suspend a pegged asset (#177)
