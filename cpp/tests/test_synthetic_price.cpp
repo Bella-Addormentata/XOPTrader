@@ -531,18 +531,20 @@ TEST(SynthTime, AnInRangeTimestampConvertsExactly)
 
 TEST(SynthTime, TimestampsBeyondTheClockAreRefusedBeforeConversion)
 {
-    // 1e15 ms fits int64 but overflows a nanosecond (Linux) or 100 ns
-    // (MSVC) system_clock duration.
-    EXPECT_FALSE(xop::synth::time_from_epoch_ms(1'000'000'000'000'000LL));
+    // The clock's own range decides: its duration is nanoseconds on
+    // libstdc++ (Linux), 100 ns on MSVC and MICROseconds on libc++ (macOS),
+    // so 1e15 ms is out of range on the first two and in range on the last.
+    const std::int64_t max_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            Clock::duration::max()).count();
+    constexpr std::int64_t k1e15 = 1'000'000'000'000'000LL;
+    EXPECT_EQ(xop::synth::time_from_epoch_ms(k1e15).has_value(), k1e15 <= max_ms);
     EXPECT_FALSE(xop::synth::time_from_epoch_ms(
         std::numeric_limits<std::int64_t>::max()));
     EXPECT_FALSE(xop::synth::time_from_epoch_ms(0));
     EXPECT_FALSE(xop::synth::time_from_epoch_ms(-5));
-    // The boundary itself: the clock's largest whole millisecond converts,
-    // one past it does not.
-    const std::int64_t max_ms =
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            Clock::duration::max()).count();
+    // The boundary itself, on every platform: the clock's largest whole
+    // millisecond converts, one past it does not.
     EXPECT_TRUE(xop::synth::time_from_epoch_ms(max_ms).has_value());
     EXPECT_FALSE(xop::synth::time_from_epoch_ms(max_ms + 1));
 }
