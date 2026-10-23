@@ -18940,9 +18940,13 @@ double Engine::quote_usd_factor(const PairConfig& pc) const
     // State has already passed the plausibility gate, and requiring grade
     // would zero every DBX-denominated figure whenever that pair's
     // filtered book happens to be one-sided.
+    // [SYNTH 2026-10-22] Ungraded, but not synthetic: a revive pair's
+    // synthetic quoting price would otherwise set the USD cost of every
+    // fill on it (Step 2's to_usd_pseudo) and persist it. 0 sends the fill
+    // down the existing unpriced path instead.
     if (pc.base_asset_id == "xch") {
         auto snap = state_->get_market(pc.name);
-        if (snap.mid_price > 0) {
+        if (snap.mid_price > 0 && !snap.mid_synthetic) {
             const double quote_per_xch =
                 static_cast<double>(snap.mid_price)
                 / static_cast<double>(kMojosPerXch);
@@ -21587,6 +21591,9 @@ void Engine::step_update_pnl(BlockHeight block_height)
             const auto fl = revive_flows_.find(pair.name);
             const revive::PairFlows flows =
                 fl != revive_flows_.end() ? fl->second : revive::PairFlows{};
+            // `central` marks at each price itself; `value` is the adverse
+            // valuation (they coincide unless a leg is priced synthetically).
+            std::optional<double> central;
             std::optional<double> value;
             const auto legs = split_pair_legs(pair.name);
             const auto& table = feed_listings();
@@ -21612,23 +21619,36 @@ void Engine::step_update_pnl(BlockHeight block_height)
                 // factor: either would hold the unlisted coin at par while
                 // its trades fall. A held leg with no mark fails closed
                 // below. Budget-only: nothing here grants accounting grade.
+                //
+                // The budget's PEAK is taken at the central marks and its
+                // LATEST value at the adverse ones (LossBudget's two-value
+                // record): discounting both would let a narrowing error bar
+                // raise the latest value and hide a real fall.
+                struct LegMark { double central{0.0}; double adverse{0.0}; };
                 auto leg_usd = [&](const std::string& asset_id,
                                    const std::string& leg,
-                                   double units) -> double {
-                    if (asset_id == "xch" || asset_id == "XCH") return xch_usd;
-                    if (table.count(leg) > 0) return listed_usd(leg);
-                    if (!(xch_usd > 0.0)) return 0.0;
+                                   double units) -> LegMark {
+                    if (asset_id == "xch" || asset_id == "XCH") {
+                        return {xch_usd, xch_usd};
+                    }
+                    if (table.count(leg) > 0) {
+                        const double v = listed_usd(leg);
+                        return {v, v};
+                    }
+                    if (!(xch_usd > 0.0)) return {};
                     const auto m = synth_asset_mark(asset_id, leg);
-                    return m ? synth::conservative_mark(
-                                   synth::PriceSource{m->price * xch_usd,
-                                                      m->sigma_bps},
-                                   units)
-                             : 0.0;
+                    if (!m) return {};
+                    const synth::PriceSource usd{m->price * xch_usd,
+                                                 m->sigma_bps};
+                    if (!synth::usable(usd)) return {};
+                    return {usd.price, synth::conservative_mark(usd, units)};
                 };
-                value = flows.value_usd_by_leg(
-                    leg_usd(pair.base_asset_id, legs->first, flows.base_units),
-                    leg_usd(pair.quote_asset_id, legs->second, flows.quote_units),
-                    xch_usd);
+                const LegMark b =
+                    leg_usd(pair.base_asset_id, legs->first, flows.base_units);
+                const LegMark q =
+                    leg_usd(pair.quote_asset_id, legs->second, flows.quote_units);
+                central = flows.value_usd_by_leg(b.central, q.central, xch_usd);
+                value   = flows.value_usd_by_leg(b.adverse, q.adverse, xch_usd);
             } else {
                 // Only marks valuation would use: a graded mid, else the
                 // trusted fair value. A dislocated book price could otherwise
@@ -21654,9 +21674,10 @@ void Engine::step_update_pnl(BlockHeight block_height)
                     carried != last_trusted_quote_usd_factor_.end()
                         ? carried->second : 0.0);
                 value = flows.value_usd(mid, quote_usd, xch_usd);
+                central = value;
             }
-            if (value) {
-                revive_loss_budget_.record(pair.name, now, *value);
+            if (value && central) {
+                revive_loss_budget_.record(pair.name, now, *central, *value);
                 if (revive_budget_blind_.erase(pair.name) > 0) {
                     spdlog::warn("[Engine] Step 11: {} revive loss budget can "
                                  "be valued again", pair.name);

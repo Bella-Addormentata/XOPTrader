@@ -300,6 +300,87 @@ TEST(SynthBudget, OnlyAHeldLegNeedsAMark)
     EXPECT_NEAR(*fees.value_usd_by_leg(0.0, 0.0, 2.0), -0.002, 1e-15);
 }
 
+// Fourth review: the peak is taken at the central marks and the latest
+// value at the adverse ones. Discounting both lets the discount hide a fall.
+namespace {
+// +units of an unlisted coin against a listed $1 quote: central and adverse
+// valuations at `price` with `sigma_bps`, as Step 11 computes them.
+struct Valuation { double central; double adverse; };
+Valuation coin_position(double units, double quote_units, double price,
+                        double sigma_bps)
+{
+    xop::revive::PairFlows f;
+    f.base_units  = units;
+    f.quote_units = quote_units;
+    return {*f.value_usd_by_leg(price, 1.0, 1.43),
+            *f.value_usd_by_leg(unlisted_mark(price, sigma_bps, units), 1.0, 1.43)};
+}
+}  // namespace
+
+TEST(SynthBudget, ANarrowingErrorBarCannotHideAFall)
+{
+    // +100 coins / -$50. The coin falls from $1 (1,000 bps) to a fresh
+    // $0.85 trade (200 bps): a central loss of $15.
+    const auto before = coin_position(100.0, -50.0, 1.00, 1000.0);
+    const auto after  = coin_position(100.0, -50.0, 0.85, 200.0);
+    EXPECT_NEAR(before.central, 50.0, 1e-9);
+    EXPECT_NEAR(after.adverse, 33.3, 1e-9);
+
+    xop::revive::LossBudget budget;
+    budget.record("p", kBudgetT0, before.central, before.adverse);
+    budget.record("p", kBudgetT0 + 2min, after.central, after.adverse);
+    EXPECT_NEAR(budget.drawdown_usd("p"), 16.7, 1e-9)
+        << "at least the $15 central loss";
+    EXPECT_TRUE(budget.exceeded("p", 10.0));
+
+    // The defect: both discounted, the budget saw $6.70.
+    xop::revive::LossBudget both_discounted;
+    both_discounted.record("p", kBudgetT0, before.adverse);
+    both_discounted.record("p", kBudgetT0 + 2min, after.adverse);
+    EXPECT_NEAR(both_discounted.drawdown_usd("p"), 6.7, 1e-9);
+    EXPECT_FALSE(both_discounted.exceeded("p", 10.0));
+}
+
+TEST(SynthBudget, AConstantErrorBarCannotHideAFallEither)
+{
+    // +80 coins / -$40, $0.78 -> $0.65 at a constant 500 bps: a central
+    // loss of $10.40, over the $10 budget.
+    const auto before = coin_position(80.0, -40.0, 0.78, 500.0);
+    const auto after  = coin_position(80.0, -40.0, 0.65, 500.0);
+    xop::revive::LossBudget budget;
+    budget.record("p", kBudgetT0, before.central, before.adverse);
+    budget.record("p", kBudgetT0 + 2min, after.central, after.adverse);
+    EXPECT_NEAR(budget.drawdown_usd("p"), 13.0, 1e-9);
+    EXPECT_TRUE(budget.exceeded("p", 10.0));
+
+    xop::revive::LossBudget both_discounted;
+    both_discounted.record("p", kBudgetT0, before.adverse);
+    both_discounted.record("p", kBudgetT0 + 2min, after.adverse);
+    EXPECT_NEAR(both_discounted.drawdown_usd("p"), 9.88, 1e-9)
+        << "the defect: $9.88, under the budget";
+}
+
+TEST(SynthBudget, UncertaintyItselfCountsAgainstTheBudget)
+{
+    // Disclosed behaviour, not an accident: with the price unchanged the
+    // drawdown is the error bar on the position, so a large position in a
+    // coin the bot cannot price closely stops quoting before it can lose
+    // more than the budget unseen.
+    const auto v = coin_position(80.0, -40.0, 0.78, 500.0);
+    xop::revive::LossBudget budget;
+    budget.record("p", kBudgetT0, v.central, v.adverse);
+    EXPECT_NEAR(budget.drawdown_usd("p"), 80.0 * 0.78 * 0.05, 1e-9);
+}
+
+TEST(SynthBudget, TheTwoValueRecordNeverLetsAdverseExceedCentral)
+{
+    xop::revive::LossBudget budget;
+    budget.record("p", kBudgetT0, 10.0, 12.0);   // adverse above central
+    EXPECT_DOUBLE_EQ(budget.drawdown_usd("p"), 0.0);
+    budget.record("p", kBudgetT0 + 2min, 10.0, kNaN);  // ignored
+    EXPECT_DOUBLE_EQ(budget.drawdown_usd("p"), 0.0);
+}
+
 TEST(SynthBudget, ExpiredTradesAgeTheMarkInsteadOfDroppingIt)
 {
     // Third review: once a coin's trades leave the 72 h window the tape has

@@ -619,6 +619,7 @@ strategy:
   revive_min_half_spread_bps: 300      # [OPTIONAL, default: 300]  Min half-spread while thin; 0 = none
   revive_max_offer_size_units: 1.0     # [OPTIONAL, default: 1.0]  Max tier size (base units) while thin, never below the min size; 0 = no cap
   revive_daily_loss_budget_usd: 10.0   # [OPTIONAL, default: 10.0] Stop quoting a revive pair once its P&L is this far below its 24h peak; 0 = no budget
+  #   A coin with no price feed (synthetic price) is marked one error bar against the position, so its price uncertainty counts against the budget too.
   revive_isolate_flash_crash: true     # [OPTIONAL, default: true] Revive pairs run their own flash-crash guard and keep posting while another pair's crash holds the global one
   min_trading_units: 10.0              # [OPTIONAL, default: 10.0] Desired minimum for active trading
   auto_rebalance_enabled: true         # [OPTIONAL, default: true] Post buy-side-only to acquire depleted assets

@@ -258,3 +258,34 @@ def test_trade_timestamps_are_bounded_before_conversion():
         "constructing the time point straight from milliseconds can "
         "overflow the clock's duration"
     )
+
+
+# ---------------------------------------------------------------------------
+# Fourth review of PR #180.
+# ---------------------------------------------------------------------------
+
+QUOTE_USD_FACTOR = "double Engine::quote_usd_factor(const PairConfig& pc) const"
+
+
+def test_fill_accounting_refuses_a_synthetic_cross():
+    body = _body(QUOTE_USD_FACTOR)
+    branch = body.find('if (pc.base_asset_id == "xch")')
+    assert branch >= 0
+    window = body[branch:body.find("usd_per_xch() / quote_per_xch", branch)]
+    assert re.search(r"snap\.mid_price\s*>\s*0\s*&&\s*!\s*snap\.mid_synthetic", window), (
+        "a revive pair's synthetic quoting price must not set the USD cost "
+        "of its fills"
+    )
+
+
+def test_the_budget_peak_is_central_and_its_latest_adverse():
+    body = _body(STEP11)
+    assert re.search(
+        r"revive_loss_budget_\.record\(\s*pair\.name\s*,\s*now\s*,\s*\*central\s*,\s*\*value\s*\)",
+        body), (
+        "record the central valuation for the peak and the adverse one as "
+        "the latest value"
+    )
+    branch = _unlisted_budget_branch()
+    assert re.search(r"central\s*=\s*flows\.value_usd_by_leg\(\s*b\.central", branch)
+    assert re.search(r"value\s*=\s*flows\.value_usd_by_leg\(\s*b\.adverse", branch)

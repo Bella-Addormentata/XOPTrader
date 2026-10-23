@@ -215,13 +215,25 @@ public:
     /// window / min_spacing buckets per pair. Non-finite values are ignored.
     void record(const std::string& pair, TimePoint now, double pnl_usd)
     {
-        if (!std::isfinite(pnl_usd)) return;
+        record(pair, now, pnl_usd, pnl_usd);
+    }
+
+    /// [SYNTH 2026-10-22] Record an uncertain P&L: `central_usd` at the
+    /// central marks feeds the PEAK, `adverse_usd` (one error bar against
+    /// the position, never above central) is the LATEST value. Discounting
+    /// both would let a narrowing error bar raise the latest value and hide
+    /// a real fall; this way the drawdown is at least the central loss.
+    void record(const std::string& pair, TimePoint now, double central_usd,
+                double adverse_usd)
+    {
+        if (!std::isfinite(central_usd) || !std::isfinite(adverse_usd)) return;
+        const double latest = std::min(adverse_usd, central_usd);
         auto& d = samples_[pair];
         if (!d.empty() && now - d.back().start < min_spacing_) {
-            d.back().latest = pnl_usd;
-            d.back().peak   = std::max(d.back().peak, pnl_usd);
+            d.back().latest = latest;
+            d.back().peak   = std::max(d.back().peak, central_usd);
         } else {
-            d.push_back(Bucket{now, pnl_usd, pnl_usd});
+            d.push_back(Bucket{now, latest, central_usd});
         }
         while (!d.empty() && now - d.front().start > window_) d.pop_front();
     }
