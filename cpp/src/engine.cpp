@@ -5644,7 +5644,21 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
         if (pair.revive_market && pair_has_unlisted_leg(pair.name)) {
             co_await refresh_synth_tape(pair.base_asset_id);
             co_await refresh_synth_tape(pair.quote_asset_id);
-            if (const auto sp = synth_pair_price(pair)) {
+            auto sp = synth_pair_price(pair);
+            // A price the snapshot cannot carry in mojos (a near-worthless
+            // coin's cross: 1e8 per XCH is 1e20 scaled) is no price at all,
+            // for the reference, revive_ref_ok and Step 7 alike.
+            if (sp) {
+                const auto m = to_mojo_checked(
+                    sp->price * static_cast<double>(kMojosPerXch));
+                if (!m || *m <= 0) {
+                    spdlog::warn("[Engine] Step 1: {} synthetic price {} is "
+                                 "outside the fixed-point range -- not used",
+                                 pair.name, sp->price);
+                    sp.reset();
+                }
+            }
+            if (sp) {
                 market_data_->ingest_cex_reference(
                     pair.name, sp->price, std::chrono::system_clock::now(),
                     /*synthetic=*/true);
@@ -21586,6 +21600,10 @@ void Engine::step_update_pnl(BlockHeight block_height)
     // unknown is skipped rather than read as a loss.
     if (config_.strategy.revive_daily_loss_budget_usd > 0.0) {
         const auto now = std::chrono::system_clock::now();
+        const bool listed_feed_fresh = coingecko_feed_fresh_for_revival(
+            !coingecko_prices_.empty(), coingecko_last_fetch_,
+            std::chrono::steady_clock::now(),
+            config_.market_data.cex_freshness_threshold_sec);
         for (const auto& pair : config_.pairs) {
             if (!pair.enabled || !pair.revive_market) continue;
             const auto fl = revive_flows_.find(pair.name);
@@ -21624,6 +21642,12 @@ void Engine::step_update_pnl(BlockHeight block_height)
                 // LATEST value at the adverse ones (LossBudget's two-value
                 // record): discounting both would let a narrowing error bar
                 // raise the latest value and hide a real fall.
+                //
+                // A LISTED leg takes its feed price only while the feed is
+                // fresh. During an outage the retained cache would hold it
+                // still while the pair keeps quoting from Dexie trades, so it
+                // is then marked like an unlisted leg: its own synthetic
+                // price (its Dexie trades, else its last such price aged).
                 struct LegMark { double central{0.0}; double adverse{0.0}; };
                 auto leg_usd = [&](const std::string& asset_id,
                                    const std::string& leg,
@@ -21631,12 +21655,15 @@ void Engine::step_update_pnl(BlockHeight block_height)
                     if (asset_id == "xch" || asset_id == "XCH") {
                         return {xch_usd, xch_usd};
                     }
-                    if (table.count(leg) > 0) {
+                    // Called for a listed leg too, so its aged fallback is
+                    // warm (seeded from the listing) when an outage starts.
+                    const auto m = (xch_usd > 0.0)
+                        ? synth_asset_mark(asset_id, leg)
+                        : std::nullopt;
+                    if (table.count(leg) > 0 && listed_feed_fresh) {
                         const double v = listed_usd(leg);
-                        return {v, v};
+                        if (v > 0.0) return {v, v};
                     }
-                    if (!(xch_usd > 0.0)) return {};
-                    const auto m = synth_asset_mark(asset_id, leg);
                     if (!m) return {};
                     const synth::PriceSource usd{m->price * xch_usd,
                                                  m->sigma_bps};

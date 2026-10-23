@@ -38,6 +38,7 @@
 #include "xop/execution/book_side_quality.hpp"
 #include "xop/execution/mid_gate.hpp"
 #include "xop/execution/orderbook_mid.hpp"
+#include "xop/peg_registry.hpp"   // to_mojo_checked
 
 #include <spdlog/spdlog.h>
 
@@ -673,6 +674,16 @@ void MarketDataFeed::ingest_cex_reference(const std::string& pair_name,
     if (!(cex_mid > 0.0) || !std::isfinite(cex_mid)) {
         spdlog::warn("ingest_cex_reference: pair={} invalid cex_mid={}",
                      pair_name, cex_mid);
+        return;
+    }
+    // [SYNTH 2026-10-22] ...and one the snapshot cannot represent: it is
+    // published in mojos, and a cross of a near-worthless coin (1e8 per
+    // XCH) scales past int64. Converting that is undefined, not an error.
+    if (const auto m = to_mojo_checked(
+            cex_mid * static_cast<double>(kMojosPerXch));
+        !m || *m <= 0) {
+        spdlog::warn("ingest_cex_reference: pair={} cex_mid={} is outside "
+                     "the fixed-point range -- ignored", pair_name, cex_mid);
         return;
     }
 
@@ -2073,10 +2084,13 @@ void MarketDataFeed::publish_snapshot(const PairState& ps) {
         if (price <= 0.0) {
             return 0;
         }
-        // Round to nearest mojo.  The result fits int64 because prices in
-        // the Chia ecosystem are on the order of $2-3 (XCH) or fractions
-        // thereof, so price * 10^12 stays well within int64 range.
-        return static_cast<Mojo>(std::llround(price * static_cast<double>(kMojosPerXch)));
+        // Round to nearest mojo -- CHECKED. Chia prices of a few dollars fit
+        // easily, but nothing upstream bounds every input (a synthetic cross
+        // of a near-worthless coin is 1e8 per XCH, 1e20 scaled), and
+        // llround on an out-of-range double is undefined. 0 publishes "no
+        // price", which every consumer already handles.
+        return to_mojo_checked(price * static_cast<double>(kMojosPerXch))
+            .value_or(0);
     };
 
     MarketSnapshot snap;

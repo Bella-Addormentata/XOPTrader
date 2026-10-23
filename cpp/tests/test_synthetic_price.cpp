@@ -381,6 +381,40 @@ TEST(SynthBudget, TheTwoValueRecordNeverLetsAdverseExceedCentral)
     EXPECT_DOUBLE_EQ(budget.drawdown_usd("p"), 0.0);
 }
 
+TEST(SynthBudget, AListedLegIsNotHeldStillByAStaleFeed)
+{
+    // Sixth review: +100 BYC (unlisted, $1 +-200 bps) / -100 DBX (listed).
+    // CoinGecko is down; DBX's Dexie trades rise from $1 to $1.20 while its
+    // cached feed price stays at $1. The real loss is at least $20.
+    xop::revive::PairFlows flows;
+    flows.base_units  = 100.0;
+    flows.quote_units = -100.0;
+    const double xch_usd = 1.43;
+    auto record = [&](xop::revive::LossBudget& b, Clock::time_point t,
+                      double dbx_usd, double dbx_sigma) {
+        const double byc_c = 1.0;
+        const double byc_a = unlisted_mark(1.0, 200.0, flows.base_units);
+        const double dbx_a = unlisted_mark(dbx_usd, dbx_sigma, flows.quote_units);
+        b.record("BYC/DBX", t, *flows.value_usd_by_leg(byc_c, dbx_usd, xch_usd),
+                 *flows.value_usd_by_leg(byc_a, dbx_a, xch_usd));
+    };
+
+    // Stale: the cached $1 both times (a listed price carries no error bar).
+    xop::revive::LossBudget stale;
+    record(stale, kBudgetT0, 1.00, 0.0);
+    record(stale, kBudgetT0 + 2min, 1.00, 0.0);
+    EXPECT_NEAR(stale.drawdown_usd("BYC/DBX"), 2.0, 1e-9)
+        << "the defect: only BYC's error bar shows";
+    EXPECT_FALSE(stale.exceeded("BYC/DBX", 10.0));
+
+    // Fixed: during the outage DBX is marked from its own trades.
+    xop::revive::LossBudget fresh;
+    record(fresh, kBudgetT0, 1.00, 200.0);
+    record(fresh, kBudgetT0 + 2min, 1.20, 200.0);
+    EXPECT_GE(fresh.drawdown_usd("BYC/DBX"), 22.0);
+    EXPECT_TRUE(fresh.exceeded("BYC/DBX", 10.0));
+}
+
 TEST(SynthBudget, ExpiredTradesAgeTheMarkInsteadOfDroppingIt)
 {
     // Third review: once a coin's trades leave the 72 h window the tape has
@@ -672,6 +706,31 @@ TEST(SyntheticReference, AnEmptyBookPublishesItsSyntheticProvenance)
     feed2.ingest_cex_reference("XCH/BYC", 1.835, Clock::now());
     feed2.refresh({"XCH/BYC"});
     EXPECT_FALSE(state2.get_market("XCH/BYC").mid_synthetic);
+}
+
+TEST(SyntheticReference, AnUnrepresentablePriceIsRefused)
+{
+    // Sixth review: a tape-only price of 1e-8 XCH per coin crosses to 1e8
+    // coins per XCH -- 1e20 in mojos, outside int64. It must not be stored
+    // (the snapshot would convert it with undefined behaviour).
+    xop::State state;
+    xop::MarketDataFeed feed(synth_cfg(), state);
+    feed.ingest_block_height(100);
+    feed.ingest_cex_reference("XCH/CHEAP", 1e8, Clock::now(), /*synthetic=*/true);
+    feed.refresh({"XCH/CHEAP"});
+    const auto snap = state.get_market("XCH/CHEAP");
+    EXPECT_EQ(snap.mid_price, 0);
+    EXPECT_EQ(snap.cex_mid, 0);
+    EXPECT_FALSE(snap.mid_synthetic);
+
+    // Just inside the range still publishes.
+    xop::State state2;
+    xop::MarketDataFeed feed2(synth_cfg(), state2);
+    feed2.ingest_block_height(100);
+    feed2.ingest_cex_reference("XCH/CHEAP", 9e6, Clock::now(), true);
+    feed2.refresh({"XCH/CHEAP"});
+    EXPECT_EQ(state2.get_market("XCH/CHEAP").mid_price,
+              static_cast<xop::Mojo>(9e6 * 1e12));
 }
 
 TEST(SyntheticReference, ARealReferenceClearsTheSyntheticMark)

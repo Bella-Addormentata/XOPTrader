@@ -289,3 +289,32 @@ def test_the_budget_peak_is_central_and_its_latest_adverse():
     branch = _unlisted_budget_branch()
     assert re.search(r"central\s*=\s*flows\.value_usd_by_leg\(\s*b\.central", branch)
     assert re.search(r"value\s*=\s*flows\.value_usd_by_leg\(\s*b\.adverse", branch)
+
+
+# ---------------------------------------------------------------------------
+# Sixth review of PR #180.
+# ---------------------------------------------------------------------------
+
+
+def test_an_unrepresentable_synthetic_price_is_not_used():
+    body = _body(STEP1)
+    synth = body.find("synth_pair_price(")
+    ingest = body.find("ingest_cex_reference(", synth)
+    assert 0 <= synth < ingest
+    window = body[synth:ingest]
+    assert "to_mojo_checked(" in window and "sp.reset()" in window, (
+        "a synthetic price outside the fixed-point range must be dropped "
+        "before it reaches the reference, revive_ref_ok or Step 7"
+    )
+
+
+def test_a_listed_leg_is_marked_from_its_feed_only_while_fresh():
+    branch = _unlisted_budget_branch()
+    use = branch.find("listed_usd(leg)")
+    assert use >= 0
+    gate = branch.rfind("if (", 0, use)
+    assert "listed_feed_fresh" in branch[gate:use], (
+        "during a feed outage the cached listing would hold the leg still "
+        "while the pair keeps quoting"
+    )
+    assert "coingecko_feed_fresh_for_revival(" in _body(STEP11)
