@@ -301,6 +301,20 @@ struct RestingRule {
     bool         no_price{false};
 };
 
+/// [SYNTH 2026-10-22] Whether a revive pair has nothing eligible to price
+/// its offers by: only on a thin book (a two-sided third-party book prices
+/// it), and either no eligible synthetic price this heartbeat or -- for a
+/// synthetically priced pair -- no published mid at all (the mid gate
+/// rejected the synthetic step). Resting offers are cancelled and no new
+/// quote is posted while it holds.
+[[nodiscard]] inline bool no_eligible_price(bool thin, bool synthetic_pricing,
+                                            bool price_ineligible,
+                                            bool has_published_mid) noexcept
+{
+    return thin
+        && (price_ineligible || (synthetic_pricing && !has_published_mid));
+}
+
 /// A resting offer, as revive maintenance sees it.
 struct RestingOffer {
     std::string  offer_id;

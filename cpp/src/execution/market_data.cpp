@@ -683,6 +683,21 @@ void MarketDataFeed::clear_cex_reference(const std::string& pair_name)
     it->second.cex_updated_at = Timestamp{};
 }
 
+void MarketDataFeed::withdraw_reference_and_mid(const std::string& pair_name)
+{
+    std::unique_lock lock(mtx_pairs_);
+    const auto it = pairs_.find(pair_name);
+    if (it == pairs_.end()) return;
+    PairState& ps = it->second;
+    ps.cex_mid             = 0.0;
+    ps.cex_synthetic       = false;
+    ps.cex_updated_at      = Timestamp{};
+    ps.mid_price           = 0.0;
+    ps.mid_valuation_grade = false;
+    ps.mid_synthetic       = false;
+    publish_snapshot(ps);
+}
+
 void MarketDataFeed::ingest_cex_reference(const std::string& pair_name,
                                            double             cex_mid,
                                            Timestamp          observed_at,

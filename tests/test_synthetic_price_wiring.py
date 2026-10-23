@@ -468,7 +468,7 @@ def test_references_are_revalidated_after_peg_observation():
         "Step 1 built before anything quotes or maintenance runs"
     )
     body = _body(REVALIDATE)
-    for needed in ("synth::remembered_price_usable(", "clear_cex_reference(",
+    for needed in ("synth::remembered_price_usable(", "withdraw_reference_and_mid(",
                    "market_data_valid      = false",
                    "revive_price_ineligible_.insert("):
         assert needed in body, needed
@@ -476,5 +476,24 @@ def test_references_are_revalidated_after_peg_observation():
 
 def test_maintenance_cancels_offers_of_a_pair_with_no_price():
     body = _body(REVIVE_MAINT)
-    assert re.search(r"r\.no_price\s*=\s*thin\s*&&\s*revive_price_ineligible_\.count\(", body)
+    assert re.search(r"r\.no_price\s*=\s*revive::no_eligible_price\(", body)
+    call = body[body.find("revive::no_eligible_price("):]
+    call = call[: call.find(";")]
+    assert "revive_price_ineligible_.count(" in call and "snap.mid_price > 0" in call
     assert "r.no_price" in body[body.find("rules[pc.name] = r") - 80: body.find("rules[pc.name] = r")]
+
+
+# ---------------------------------------------------------------------------
+# Eleventh review of PR #180.
+# ---------------------------------------------------------------------------
+
+
+def test_no_new_quotes_without_an_eligible_price():
+    body = _body(STEP4)
+    thin = body.find("pcs.revive_thin = revive::book_is_thin(")
+    assert thin >= 0
+    after = body[thin: thin + 1500]
+    assert "revive::no_eligible_price(" in after and "pcs.quote_valid = false;" in after, (
+        "maintenance cancels resting offers on this rule; Step 4 must not "
+        "post fresh ones on the same heartbeat"
+    )

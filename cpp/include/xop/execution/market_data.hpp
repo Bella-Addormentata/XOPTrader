@@ -874,6 +874,13 @@ public:
     /// suspended, since the listing is then the UNDERLYING coin's price.
     void clear_cex_reference(const std::string& pair_name);
 
+    /// [SYNTH 2026-10-22] clear_cex_reference, and also withdraw the mid
+    /// already published from it this heartbeat: the pair's mid, valuation
+    /// grade and synthetic flag are zeroed and the snapshot republished at
+    /// once, so accounting later in the same heartbeat cannot read it. The
+    /// next refresh() recomputes from what remains.
+    void withdraw_reference_and_mid(const std::string& pair_name);
+
     /// Ingest the TibetSwap AMM implied mid-price for a pair.
     /// The implied price is computed from pool reserves: output_reserve / input_reserve.
     ///

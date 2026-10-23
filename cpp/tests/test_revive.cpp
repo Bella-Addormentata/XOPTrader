@@ -474,6 +474,21 @@ TEST(ReviveMaintenance, NoEligiblePriceCancelsEverythingRestingOnThePair)
     }
 }
 
+TEST(ReviveMaintenance, NoEligiblePriceIsDecidedOnlyOnAThinBook)
+{
+    using xop::revive::no_eligible_price;
+    // Eleventh review: an accepted synthetic price, then a step the mid gate
+    // rejects -- the pair is still "eligible" but publishes no mid.
+    EXPECT_TRUE(no_eligible_price(/*thin=*/true, /*synthetic=*/true,
+                                  /*ineligible=*/false, /*mid=*/false));
+    EXPECT_TRUE(no_eligible_price(true, true, /*ineligible=*/true, true));
+    EXPECT_FALSE(no_eligible_price(true, true, false, true));
+    // A two-sided third-party book prices the pair by itself.
+    EXPECT_FALSE(no_eligible_price(/*thin=*/false, true, true, false));
+    // A listed (non-synthetic) pair's missing mid is not this rule's call.
+    EXPECT_FALSE(no_eligible_price(true, /*synthetic=*/false, false, false));
+}
+
 TEST(ReviveMaintenance, OverBudgetCancelsEverythingRestingOnThePair)
 {
     // [review, PR #179] Read from the budget directly, so a breach during

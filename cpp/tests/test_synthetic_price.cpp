@@ -951,6 +951,29 @@ TEST(SynthProvenance, ASuspensionLatchedThisHeartbeatInvalidatesItsReferences)
         << "nothing changed: keep";
 }
 
+TEST(SyntheticReference, AWithdrawnMidIsGoneFromStateAtOnce)
+{
+    // Eleventh review: after a same-heartbeat suspension the published mid
+    // and grade must go immediately -- refresh() already ran, and
+    // accounting reads State later in the same heartbeat.
+    xop::State state;
+    xop::MarketDataFeed feed(synth_cfg(), state);
+    feed.ingest_block_height(100);
+    feed.ingest_cex_reference("XCH/wUSDC.b", 1.43, Clock::now());
+    feed.refresh({"XCH/wUSDC.b"});
+    ASSERT_GT(state.get_market("XCH/wUSDC.b").mid_price, 0);
+    ASSERT_TRUE(state.get_market("XCH/wUSDC.b").mid_valuation_grade);
+
+    feed.withdraw_reference_and_mid("XCH/wUSDC.b");   // no refresh after
+    const auto snap = state.get_market("XCH/wUSDC.b");
+    EXPECT_EQ(snap.mid_price, 0);
+    EXPECT_FALSE(snap.mid_valuation_grade);
+    EXPECT_FALSE(snap.mid_synthetic);
+    EXPECT_DOUBLE_EQ(feed.get_mid_price("XCH/wUSDC.b"), 0.0);
+    EXPECT_FALSE(feed.get_cex_reference("XCH/wUSDC.b").has_value());
+    EXPECT_FALSE(feed.mid_valuation_grade("XCH/wUSDC.b"));
+}
+
 TEST(SyntheticReference, ARealReferenceClearsTheSyntheticMark)
 {
     xop::State state;

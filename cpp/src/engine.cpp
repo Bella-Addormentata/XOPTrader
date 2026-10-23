@@ -7116,6 +7116,20 @@ void Engine::step_compute_quotes(BlockHeight block_height)
                 static_cast<double>(rs.best_bid) / scale,
                 static_cast<double>(rs.best_ask) / scale,
                 rs.touches_third_party);
+            // [SYNTH 2026-10-22] No eligible price on a thin book: nothing
+            // new is posted either (revive maintenance has cancelled what
+            // rested, on the same rule). A last-trade print or a one-sided
+            // book is what the synthetic price exists to replace.
+            if (revive::no_eligible_price(
+                    pcs.revive_thin,
+                    pair_has_unlisted_leg(pair_name) || pair_peg_suspended(*pcr),
+                    revive_price_ineligible_.count(pair_name) > 0,
+                    rs.mid_price > 0)) {
+                spdlog::debug("[Engine] Step 4: {} has no eligible price on "
+                              "a thin book -- suppressing quotes", pair_name);
+                pcs.quote_valid = false;
+                continue;
+            }
         }
 
         // -- Staleness gate: suppress quoting when market data is stale ------
@@ -25844,7 +25858,9 @@ asio::awaitable<void> Engine::step_revive_maintenance(BlockHeight block_height)
         // price on a thin book has nothing to price its resting offers:
         // all of them go, whatever the flows or their size. Re-selected
         // every heartbeat, so a failed cancel is retried.
-        r.no_price = thin && revive_price_ineligible_.count(pc.name) > 0;
+        r.no_price = revive::no_eligible_price(
+            thin, pair_has_unlisted_leg(pc.name) || pair_peg_suspended(pc),
+            revive_price_ineligible_.count(pc.name) > 0, snap.mid_price > 0);
         if (config_.strategy.revive_max_offer_size_units > 0.0) {
             if (thin) {
                 const bool xch_base = pc.base_asset_id == "xch"
@@ -25921,7 +25937,7 @@ void Engine::revalidate_after_peg_observation()
         // synthetic -- may rest on that wrapper's listing or an estimate
         // anchored there. Withdraw it and this heartbeat's quoting on it;
         // Step 1 rebuilds from eligible inputs next heartbeat.
-        market_data_->clear_cex_reference(pc.name);
+        market_data_->withdraw_reference_and_mid(pc.name);
         pcs.revive_synth_price     = 0.0;
         pcs.revive_synth_sigma_bps = 0.0;
         pcs.market_data_valid      = false;
