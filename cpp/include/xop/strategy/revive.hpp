@@ -158,6 +158,24 @@ struct PairFlows {
         const double fees = fee_xch > 0.0 ? fee_xch * xch_usd : 0.0;
         return (quote_units + base_value) * quote_usd - fees;
     }
+
+    /// [SYNTH 2026-10-22] The flows marked LEG BY LEG: base at `base_usd`,
+    /// quote at `quote_usd` (USD per unit of each). A leg's mark is needed
+    /// only while that leg is held, so quote-only exposure needs no base
+    /// mark and base-only exposure no quote mark. nullopt when a mark the
+    /// flows need is unknown, so a missing price is never read as a loss.
+    [[nodiscard]] std::optional<double> value_usd_by_leg(
+        double base_usd, double quote_usd, double xch_usd) const noexcept
+    {
+        auto ok = [](double v) { return v > 0.0 && std::isfinite(v); };
+        if (base_units != 0.0 && !ok(base_usd)) return std::nullopt;
+        if (quote_units != 0.0 && !ok(quote_usd)) return std::nullopt;
+        if (fee_xch > 0.0 && !ok(xch_usd)) return std::nullopt;
+        const double b = base_units != 0.0 ? base_units * base_usd : 0.0;
+        const double q = quote_units != 0.0 ? quote_units * quote_usd : 0.0;
+        const double f = fee_xch > 0.0 ? fee_xch * xch_usd : 0.0;
+        return b + q - f;
+    }
 };
 
 /// The quote leg's USD price for PairFlows::value_usd: XCH's price for an

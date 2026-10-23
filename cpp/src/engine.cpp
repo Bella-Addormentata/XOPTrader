@@ -5839,6 +5839,17 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
     // checks reflect real economic values instead of raw mojo counts.
     for (const auto& pair : config_.pairs) {
         if (!pair.enabled) continue;
+        // [SYNTH 2026-10-22] Risk marks are observations. A revive pair's
+        // synthetic quoting price writes none: these rates are shared --
+        // every pair's single-CAT and pair-capital fractions divide by the
+        // portfolio they mark -- so an overstated synthetic coin would
+        // loosen unrelated pairs' limits. The asset keeps what it had
+        // before revive pricing existed: its last observed rate, or none.
+        if (state_->get_market(pair.name).mid_synthetic) {
+            spdlog::debug("[Engine] XCH rate: {} mid is synthetic -- risk "
+                          "rate left at its last observation", pair.name);
+            continue;
+        }
         double mid = market_data_->get_mid_price(pair.name);
         if (mid <= 0.0) continue;
 
@@ -21576,101 +21587,76 @@ void Engine::step_update_pnl(BlockHeight block_height)
             const auto fl = revive_flows_.find(pair.name);
             const revive::PairFlows flows =
                 fl != revive_flows_.end() ? fl->second : revive::PairFlows{};
-            // Only marks valuation would use: a graded mid, else the trusted
-            // fair value. A dislocated book price could otherwise plant a
-            // fictitious peak, and its correction read as a loss.
-            double mid = market_data_->mid_valuation_grade(pair.name)
-                ? market_data_->get_mid_price(pair.name) : 0.0;
-            if (!(mid > 0.0)) {
-                if (const auto fv = market_data_->get_fair_value(pair.name)) {
-                    mid = fv->price;
+            std::optional<double> value;
+            const auto legs = split_pair_legs(pair.name);
+            const auto& table = feed_listings();
+            // A listed leg's USD price from its feed; 0 if not quoted.
+            auto listed_usd = [&](const std::string& leg) -> double {
+                const auto l = table.find(leg);
+                if (l == table.end() || !(l->second.units_per_coin > 0.0)) {
+                    return 0.0;
                 }
-            }
-            // [SYNTH 2026-10-22] A pair priced only synthetically (a tape-
-            // only coin, or a peg suspension that removed the par fallback)
-            // has neither. Its budget then marks at the synthetic price's
-            // UNFAVOURABLE edge -- one error bar against the position -- so
-            // the budget can only over-count a loss. Budget-only: this never
-            // grants the synthetic price accounting grade.
-            if (!(mid > 0.0)) {
-                if (const auto lg = synth_last_good_.find(pair.name);
-                    lg != synth_last_good_.end()) {
-                    const double age_h = std::chrono::duration<
-                        double, std::ratio<3600>>(now - lg->second.second).count();
-                    mid = synth::conservative_mark(
-                        synth::aged_source(lg->second.first, age_h,
-                                           synth::kAgedSigmaBpsPerHour),
-                        flows.base_units);
-                }
-            }
-            // The quote leg's USD price: XCH directly, else its feed listing
-            // (or, for an unlisted quote, its synthetic XCH price), else
-            // the pair's carried accounting factor. The accounting factor
-            // alone is 0 for a non-par, non-XCH quote (wmilliETH.b/DBX),
-            // which would leave the budget unable to see any loss.
-            double listed_quote_usd = 0.0;
-            if (const auto legs = split_pair_legs(pair.name)) {
-                const auto& table = feed_listings();
-                // A leg's USD price from its feed listing; 0 if unlisted or
-                // not quoted.
-                auto listed_usd = [&](const std::string& leg) -> double {
-                    const auto l = table.find(leg);
-                    if (l == table.end() || !(l->second.units_per_coin > 0.0)) {
-                        return 0.0;
-                    }
-                    const auto q = coingecko_prices_.find(l->second.id);
-                    return (q != coingecko_prices_.end() && q->second > 0.0)
-                        ? q->second / l->second.units_per_coin : 0.0;
+                const auto q = coingecko_prices_.find(l->second.id);
+                return (q != coingecko_prices_.end() && q->second > 0.0)
+                    ? q->second / l->second.units_per_coin : 0.0;
+            };
+            if (legs && pair_has_unlisted_leg(pair.name)) {
+                // [SYNTH 2026-10-22] A pair with an unlisted leg (BYC) is
+                // valued LEG BY LEG from one consistent set of USD marks:
+                // XCH at its price, a listed leg at its feed price, an
+                // unlisted leg at its synthetic price (Dexie trades; once
+                // they age out of the window, the last such price with its
+                // error bar grown) taken one error bar against the
+                // position, so the budget can only over-count a loss.
+                // Never a par-backed fair value or a carried accounting
+                // factor: either would hold the unlisted coin at par while
+                // its trades fall. A held leg with no mark fails closed
+                // below. Budget-only: nothing here grants accounting grade.
+                auto leg_usd = [&](const std::string& asset_id,
+                                   const std::string& leg,
+                                   double units) -> double {
+                    if (asset_id == "xch" || asset_id == "XCH") return xch_usd;
+                    if (table.count(leg) > 0) return listed_usd(leg);
+                    if (!(xch_usd > 0.0)) return 0.0;
+                    const auto m = synth_asset_mark(asset_id, leg);
+                    return m ? synth::conservative_mark(
+                                   synth::PriceSource{m->price * xch_usd,
+                                                      m->sigma_bps},
+                                   units)
+                             : 0.0;
                 };
-                if (table.count(legs->second) > 0) {
-                    listed_quote_usd = listed_usd(legs->second);
-                } else if (xch_usd > 0.0) {
-                    // [SYNTH 2026-10-22] An unlisted quote (BYC): its
-                    // synthetic XCH price -- Dexie trades, aged -- in USD,
-                    // and the mid derived from the SAME marks, so the base
-                    // leg is not re-priced through a mid from another
-                    // source (a par-backed fair value times a tape-priced
-                    // quote). The base leg: XCH, else its listing, else its
-                    // own synthetic price; each synthetic mark one error
-                    // bar against the position.
-                    if (const auto sq = synth_asset_in_xch(pair.quote_asset_id,
-                                                           legs->second)) {
-                        double base_usd = 0.0;
-                        if (pair.base_asset_id == "xch"
-                            || pair.base_asset_id == "XCH") {
-                            base_usd = xch_usd;
-                        } else if (table.count(legs->first) > 0) {
-                            base_usd = listed_usd(legs->first);
-                        } else if (const auto sb = synth_asset_in_xch(
-                                       pair.base_asset_id, legs->first)) {
-                            base_usd = synth::conservative_mark(
-                                synth::PriceSource{sb->price * xch_usd,
-                                                   sb->sigma_bps},
-                                flows.base_units);
-                        }
-                        if (const auto m = synth::synthetic_quote_marks(
-                                base_usd,
-                                synth::PriceSource{sq->price * xch_usd,
-                                                   sq->sigma_bps},
-                                flows.quote_units)) {
-                            mid = m->mid;
-                            listed_quote_usd = m->quote_usd;
-                        } else {
-                            // No consistent marks: no mark at all, so a
-                            // held position fails closed below.
-                            mid = 0.0;
-                        }
+                value = flows.value_usd_by_leg(
+                    leg_usd(pair.base_asset_id, legs->first, flows.base_units),
+                    leg_usd(pair.quote_asset_id, legs->second, flows.quote_units),
+                    xch_usd);
+            } else {
+                // Only marks valuation would use: a graded mid, else the
+                // trusted fair value. A dislocated book price could otherwise
+                // plant a fictitious peak, and its correction read as a loss.
+                double mid = market_data_->mid_valuation_grade(pair.name)
+                    ? market_data_->get_mid_price(pair.name) : 0.0;
+                if (!(mid > 0.0)) {
+                    if (const auto fv = market_data_->get_fair_value(pair.name)) {
+                        mid = fv->price;
                     }
                 }
+                // The quote leg's USD price: XCH directly, else its feed
+                // listing, else the pair's carried accounting factor. The
+                // accounting factor alone is 0 for a non-par, non-XCH quote
+                // (wmilliETH.b/DBX), which would leave the budget unable to
+                // see any loss.
+                const double listed_quote_usd =
+                    legs ? listed_usd(legs->second) : 0.0;
+                const auto carried = last_trusted_quote_usd_factor_.find(pair.name);
+                const double quote_usd = revive::quote_usd_price(
+                    pair.quote_asset_id == "xch" || pair.quote_asset_id == "XCH",
+                    xch_usd, listed_quote_usd,
+                    carried != last_trusted_quote_usd_factor_.end()
+                        ? carried->second : 0.0);
+                value = flows.value_usd(mid, quote_usd, xch_usd);
             }
-            const auto carried = last_trusted_quote_usd_factor_.find(pair.name);
-            const double quote_usd = revive::quote_usd_price(
-                pair.quote_asset_id == "xch" || pair.quote_asset_id == "XCH",
-                xch_usd, listed_quote_usd,
-                carried != last_trusted_quote_usd_factor_.end()
-                    ? carried->second : 0.0);
-            if (const auto v = flows.value_usd(mid, quote_usd, xch_usd)) {
-                revive_loss_budget_.record(pair.name, now, *v);
+            if (value) {
+                revive_loss_budget_.record(pair.name, now, *value);
                 if (revive_budget_blind_.erase(pair.name) > 0) {
                     spdlog::warn("[Engine] Step 11: {} revive loss budget can "
                                  "be valued again", pair.name);
@@ -21682,8 +21668,8 @@ void Engine::step_update_pnl(BlockHeight block_height)
                 // mark returns.
                 if (revive_budget_blind_.insert(pair.name).second) {
                     spdlog::error("[Engine] Step 11: {} revive loss budget "
-                                  "cannot value the pair's exposure (no mark "
-                                  "or no quote USD price) -- treating it as "
+                                  "cannot value the pair's exposure (a held "
+                                  "leg has no USD mark) -- treating it as "
                                   "over budget", pair.name);
                 }
             }
@@ -25861,6 +25847,27 @@ std::optional<synth::PriceSource> Engine::synth_asset_in_xch(
         }
     }
     return synth::blend_sources(sources);
+}
+
+std::optional<synth::PriceSource> Engine::synth_asset_mark(
+    const std::string& asset_id, const std::string& leg_symbol)
+{
+    const auto now = std::chrono::system_clock::now();
+    if (const auto fresh = synth_asset_in_xch(asset_id, leg_symbol)) {
+        synth_asset_last_good_[asset_id] = {*fresh, now};
+        return fresh;
+    }
+    // Its trades have left the window: the last price, its error bar grown
+    // by its age, rather than no mark at all. Nothing remembered (a restart
+    // with no trades since) is no mark.
+    if (const auto lg = synth_asset_last_good_.find(asset_id);
+        lg != synth_asset_last_good_.end()) {
+        const double age_h = std::chrono::duration<double, std::ratio<3600>>(
+            now - lg->second.second).count();
+        return synth::aged_source(lg->second.first, age_h,
+                                  synth::kAgedSigmaBpsPerHour);
+    }
+    return std::nullopt;
 }
 
 std::optional<synth::PriceSource> Engine::synth_pair_price(const PairConfig& pc)

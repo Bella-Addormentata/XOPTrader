@@ -208,32 +208,37 @@ TEST(SynthMark, TheErrorBarIsCappedAndUnusableIsNothing)
 }
 
 // ---------------------------------------------------------------------------
-// synthetic_quote_marks -- a tape-priced QUOTE leg in the loss budget
+// The revive loss budget for a pair with an unlisted leg: leg-by-leg marks
+// (PairFlows::value_usd_by_leg), the unlisted leg at its synthetic price's
+// unfavourable edge (conservative_mark) -- as Engine::step_update_pnl does.
 // ---------------------------------------------------------------------------
 
-TEST(SynthQuoteMarks, BothLegsAreMarkedFromTheSameUsdPrices)
+namespace {
+// The engine's mark for an unlisted leg: its synthetic USD price, one error
+// bar against the position.
+double unlisted_mark(double usd, double sigma_bps, double units)
 {
-    // Review case: XCH/BYC, net -40 XCH / +80 BYC, XCH steady at $1.43,
+    return xop::synth::conservative_mark(PriceSource{usd, sigma_bps}, units);
+}
+const auto kBudgetT0 = Clock::time_point{} + 1000h;
+}  // namespace
+
+TEST(SynthBudget, AnUnlistedQuoteLegIsMarkedFromItsOwnUsdPrice)
+{
+    // Second review: XCH/BYC, net -40 XCH / +80 BYC, XCH steady at $1.43,
     // BYC (tape-priced) falls from $0.78 to $0.50. The real loss is
     // 80 x 0.28 = $22.40, over the default $10 budget.
     xop::revive::PairFlows flows;
     flows.base_units  = -40.0;
     flows.quote_units = 80.0;
     const double xch_usd = 1.43;
-
     auto value = [&](double byc_usd) {
-        const auto m = xop::synth::synthetic_quote_marks(
-            xch_usd, PriceSource{byc_usd, 0.0}, flows.quote_units);
-        EXPECT_TRUE(m.has_value());
-        if (!m) return kNaN;
-        EXPECT_NEAR(m->mid, xch_usd / byc_usd, 1e-12)
-            << "the mid comes from the same marks, not from elsewhere";
-        return *flows.value_usd(m->mid, m->quote_usd, xch_usd);
+        return flows.value_usd_by_leg(
+            xch_usd, unlisted_mark(byc_usd, 0.0, flows.quote_units), xch_usd);
     };
     xop::revive::LossBudget budget;
-    const auto t0 = Clock::time_point{} + 1000h;
-    budget.record("XCH/BYC", t0, value(0.78));
-    budget.record("XCH/BYC", t0 + 2min, value(0.50));
+    budget.record("XCH/BYC", kBudgetT0, *value(0.78));
+    budget.record("XCH/BYC", kBudgetT0 + 2min, *value(0.50));
     EXPECT_NEAR(budget.drawdown_usd("XCH/BYC"), 22.40, 1e-9);
     EXPECT_TRUE(budget.exceeded("XCH/BYC", 10.0));
 
@@ -246,24 +251,81 @@ TEST(SynthQuoteMarks, BothLegsAreMarkedFromTheSameUsdPrices)
     EXPECT_FALSE(stale_loss > 10.0) << "which is why it missed the budget";
 }
 
-TEST(SynthQuoteMarks, TheQuoteIsMarkedAgainstThePosition)
+TEST(SynthBudget, AnUnlistedBaseLegIsMarkedFromItsOwnUsdPrice)
 {
-    const PriceSource byc{0.80, 500.0};  // +-5%
-    const auto long_quote = xop::synth::synthetic_quote_marks(1.43, byc, 80.0);
-    ASSERT_TRUE(long_quote.has_value());
-    EXPECT_DOUBLE_EQ(long_quote->quote_usd, 0.76) << "holding BYC: its lower edge";
-    EXPECT_DOUBLE_EQ(long_quote->mid, 1.43 / 0.76);
-    const auto short_quote = xop::synth::synthetic_quote_marks(1.43, byc, -80.0);
-    ASSERT_TRUE(short_quote.has_value());
-    EXPECT_DOUBLE_EQ(short_quote->quote_usd, 0.84) << "owing BYC: its upper edge";
+    // Third review: BYC/wUSDC.b, net +80 BYC / -62.40 wUSDC.b (listed, $1).
+    // BYC's tape falls from $0.78 to $0.50: a $22.40 loss.
+    xop::revive::PairFlows flows;
+    flows.base_units  = 80.0;
+    flows.quote_units = -62.40;
+    auto value = [&](double byc_usd) {
+        return flows.value_usd_by_leg(
+            unlisted_mark(byc_usd, 0.0, flows.base_units), 1.0, 1.43);
+    };
+    xop::revive::LossBudget budget;
+    budget.record("BYC/wUSDC.b", kBudgetT0, *value(0.78));
+    budget.record("BYC/wUSDC.b", kBudgetT0 + 2min, *value(0.50));
+    EXPECT_NEAR(budget.drawdown_usd("BYC/wUSDC.b"), 22.40, 1e-9);
+    EXPECT_TRUE(budget.exceeded("BYC/wUSDC.b", 10.0));
+
+    // The defect this replaces: a par-backed fair value (1.0 wUSDC.b per
+    // BYC) records $17.60 before and after -- no loss at all.
+    EXPECT_NEAR(*flows.value_usd(1.0, 1.0, 1.43), 17.60, 1e-9);
 }
 
-TEST(SynthQuoteMarks, AnUnusableLegIsNoMark)
+TEST(SynthBudget, EachLegIsMarkedAgainstThePosition)
 {
-    EXPECT_FALSE(xop::synth::synthetic_quote_marks(0.0, {0.8, 100.0}, 1.0));
-    EXPECT_FALSE(xop::synth::synthetic_quote_marks(kNaN, {0.8, 100.0}, 1.0));
-    EXPECT_FALSE(xop::synth::synthetic_quote_marks(1.43, {0.0, 100.0}, 1.0));
-    EXPECT_FALSE(xop::synth::synthetic_quote_marks(1.43, {0.8, kNaN}, 1.0));
+    // Holding BYC marks it at its lower edge, owing it at its upper edge.
+    EXPECT_DOUBLE_EQ(unlisted_mark(0.80, 500.0, 80.0), 0.76);
+    EXPECT_DOUBLE_EQ(unlisted_mark(0.80, 500.0, -80.0), 0.84);
+}
+
+TEST(SynthBudget, OnlyAHeldLegNeedsAMark)
+{
+    xop::revive::PairFlows quote_only;
+    quote_only.quote_units = 50.0;
+    EXPECT_NEAR(*quote_only.value_usd_by_leg(0.0, 0.8, 1.43), 40.0, 1e-12)
+        << "quote-only exposure needs no base mark (and no mid)";
+    EXPECT_FALSE(quote_only.value_usd_by_leg(1.43, 0.0, 1.43).has_value())
+        << "but cannot be valued without its own";
+
+    xop::revive::PairFlows base_only;
+    base_only.base_units = 2.0;
+    EXPECT_NEAR(*base_only.value_usd_by_leg(1.43, 0.0, 1.43), 2.86, 1e-12);
+    EXPECT_FALSE(base_only.value_usd_by_leg(kNaN, 0.8, 1.43).has_value());
+
+    xop::revive::PairFlows fees;
+    fees.fee_xch = 0.001;
+    EXPECT_FALSE(fees.value_usd_by_leg(1.0, 1.0, 0.0).has_value());
+    EXPECT_NEAR(*fees.value_usd_by_leg(0.0, 0.0, 2.0), -0.002, 1e-15);
+}
+
+TEST(SynthBudget, ExpiredTradesAgeTheMarkInsteadOfDroppingIt)
+{
+    // Third review: once a coin's trades leave the 72 h window the tape has
+    // nothing, and the budget must neither go blind (stopping revival for a
+    // quiet coin) nor fall back to a carried par factor. The engine keeps
+    // the asset's last synthetic price and grows its error bar.
+    const std::vector<TapeTrade> old = {
+        {0.545, 1.0, kNow - 80h}, {0.540, 2.0, kNow - 79h}};
+    EXPECT_FALSE(xop::synth::tape_source(old, kNow).has_value())
+        << "precondition: every trade is outside the window";
+
+    const PriceSource last{0.545, 600.0};     // as last computed
+    const auto aged = xop::synth::aged_source(
+        last, /*age_h=*/10.0, xop::synth::kAgedSigmaBpsPerHour);
+    EXPECT_DOUBLE_EQ(aged.price, 0.545);
+    EXPECT_DOUBLE_EQ(aged.sigma_bps, 850.0);
+
+    // Held BYC is then marked lower the longer it goes unobserved: the
+    // budget sees a growing loss, never a missing one.
+    const double xch_usd = 1.43;
+    const double fresh_mark = unlisted_mark(last.price * xch_usd, last.sigma_bps, 80.0);
+    const double aged_mark = unlisted_mark(aged.price * xch_usd, aged.sigma_bps, 80.0);
+    EXPECT_LT(aged_mark, fresh_mark);
+    xop::revive::PairFlows flows;
+    flows.quote_units = 80.0;
+    EXPECT_TRUE(flows.value_usd_by_leg(0.0, aged_mark, xch_usd).has_value());
 }
 
 // ---------------------------------------------------------------------------

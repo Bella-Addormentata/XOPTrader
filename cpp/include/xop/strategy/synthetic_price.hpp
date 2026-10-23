@@ -212,30 +212,6 @@ struct TapeParams {
     return p.price;
 }
 
-/// The loss budget's marks for a pair whose QUOTE leg is priced only
-/// synthetically (an unlisted quote coin). The quote's USD price is taken
-/// at its unfavourable edge for the position (conservative_mark on the net
-/// quote held), and the pair mid is derived from the SAME USD marks --
-/// base_usd / quote_usd -- so neither leg is re-priced through a mid from
-/// another source. (A par-backed fair value with a tape-priced quote would
-/// otherwise mark XCH at par times the tape: $0.715 for a $1.43 coin.)
-/// nullopt unless both marks are usable.
-struct BudgetMarks {
-    double mid{0.0};        ///< quote per base
-    double quote_usd{0.0};  ///< USD per quote unit
-};
-[[nodiscard]] inline std::optional<BudgetMarks>
-synthetic_quote_marks(double base_usd, const PriceSource& quote_usd,
-                      double net_quote) noexcept
-{
-    if (!(base_usd > 0.0) || !std::isfinite(base_usd)) return std::nullopt;
-    const double q = conservative_mark(quote_usd, net_quote);
-    if (!(q > 0.0) || !std::isfinite(q)) return std::nullopt;
-    const double mid = base_usd / q;
-    if (!(mid > 0.0) || !std::isfinite(mid)) return std::nullopt;
-    return BudgetMarks{mid, q};
-}
-
 /// A quoting half-spread that covers `sigma_mult` error bars, never below
 /// `floor_bps` and never above `cap_bps` (a ladder past ~50% stops meaning
 /// anything and a bid would approach zero).

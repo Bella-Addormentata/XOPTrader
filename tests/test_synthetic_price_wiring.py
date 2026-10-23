@@ -115,16 +115,60 @@ def test_step1_carries_the_synthetic_price_to_step7():
     )
 
 
-def test_the_budget_marks_a_synthetic_position_conservatively():
+def _unlisted_budget_branch() -> str:
+    """The Step 11 budget branch for a revive pair with an unlisted leg."""
     body = _body(STEP11)
-    record = body.find("revive_loss_budget_.record(")
-    assert record >= 0
-    before = body[:record]
-    assert "synth::conservative_mark(" in before, (
-        "a tape-only pair has no graded mid and no trusted fair value; its "
-        "budget must mark at the synthetic price's unfavourable edge"
+    start = body.find("if (legs && pair_has_unlisted_leg(pair.name))")
+    assert start >= 0, (
+        "Step 11 must value a pair with an unlisted leg on its own branch"
     )
-    assert "synth_last_good_" in before
+    end = body.find("} else {", start)
+    assert end > start
+    return body[start:end]
+
+
+def test_the_budget_marks_an_unlisted_leg_conservatively():
+    branch = _unlisted_budget_branch()
+    assert "flows.value_usd_by_leg(" in branch, (
+        "an unlisted-leg pair is valued leg by leg from consistent USD marks"
+    )
+    assert "synth_asset_mark(" in branch and "synth::conservative_mark(" in branch, (
+        "the unlisted leg is marked at its synthetic price's unfavourable edge"
+    )
+
+
+def test_the_unlisted_budget_never_holds_a_coin_at_par():
+    branch = _unlisted_budget_branch()
+    for forbidden in ("get_fair_value", "last_trusted_quote_usd_factor_",
+                      "quote_usd_price(", "value_usd(mid"):
+        assert forbidden not in branch, (
+            f"{forbidden!r} in the unlisted-leg budget branch: a par-backed "
+            "fair value or carried factor holds the coin at par while its "
+            "trades fall"
+        )
+
+
+def test_an_expired_tape_ages_the_asset_mark():
+    body = _body("std::optional<synth::PriceSource> Engine::synth_asset_mark(")
+    fresh = body.find("synth_asset_in_xch(")
+    aged = body.find("synth::aged_source(")
+    assert 0 <= fresh < aged, (
+        "the budget's asset mark falls back to the last price, aged, when "
+        "the trades leave the window"
+    )
+    assert "synth_asset_last_good_" in body
+
+
+def test_a_synthetic_mid_writes_no_shared_risk_rate():
+    body = _body(STEP1)
+    write = body.find("state_->set_asset_xch_rate(")
+    assert write >= 0
+    loop = body.rfind("for (const auto& pair : config_.pairs)", 0, write)
+    window = body[loop:write]
+    assert re.search(r"if\s*\(\s*state_->get_market\(pair\.name\)\.mid_synthetic\s*\)", window), (
+        "risk rates are shared by every pair's limits; a synthetic quoting "
+        "price must not write one"
+    )
 
 
 def test_an_unvaluable_position_fails_closed():
@@ -205,19 +249,6 @@ def test_the_drift_corrector_does_not_fall_back_to_a_synthetic_mid():
     assert fallback >= 0
     gate = body.rfind("if (", 0, fallback)
     assert re.search(r"mid\s*==\s*0\s*&&\s*!\s*snap\.mid_synthetic", body[gate:fallback])
-
-
-def test_a_synthetic_quote_leg_is_marked_consistently():
-    body = _body(STEP11)
-    record = body.find("revive_loss_budget_.record(")
-    marks = body.find("synth::synthetic_quote_marks(")
-    assert 0 <= marks < record, (
-        "a tape-priced quote leg must be valued with the mid derived from "
-        "the same USD marks, not a par-backed or book mid"
-    )
-    after = body[marks:record]
-    assert re.search(r"\bmid\s*=\s*m->mid\s*;", after)
-    assert re.search(r"listed_quote_usd\s*=\s*m->quote_usd\s*;", after)
 
 
 def test_trade_timestamps_are_bounded_before_conversion():

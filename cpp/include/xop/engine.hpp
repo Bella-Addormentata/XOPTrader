@@ -1292,6 +1292,11 @@ private:
     asio::awaitable<void> refresh_synth_tape(const std::string& asset_id);
     [[nodiscard]] std::optional<synth::PriceSource> synth_asset_in_xch(
         const std::string& asset_id, const std::string& leg_symbol) const;
+    // synth_asset_mark: synth_asset_in_xch, else the asset's last such
+    // price aged (for the revive loss budget, which must not go blind
+    // when a coin's trades leave the tape window).
+    [[nodiscard]] std::optional<synth::PriceSource> synth_asset_mark(
+        const std::string& asset_id, const std::string& leg_symbol);
     [[nodiscard]] std::optional<synth::PriceSource> synth_pair_price(
         const PairConfig& pc);
     void check_peg_reenable_flag();
@@ -2487,6 +2492,9 @@ private:
     std::unordered_map<std::string,
         std::pair<synth::PriceSource, std::chrono::system_clock::time_point>>
         synth_last_good_;
+    std::unordered_map<std::string,
+        std::pair<synth::PriceSource, std::chrono::system_clock::time_point>>
+        synth_asset_last_good_;
 
     // XCH Recovery Mode -- entered when XCH spendable drops below threshold.
     // While active: offers cancelled, Steps 7-8 skipped, engine scans for
