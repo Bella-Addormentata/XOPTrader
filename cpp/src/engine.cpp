@@ -8699,9 +8699,21 @@ void Engine::update_fair_values()
     // two, and letting it count twice would silently halve its error bar.
     std::vector<fv::Anchor> anchors;
     std::unordered_set<std::string> anchored;
+    // [SYNTH 2026-10-22] A peg-suspended wrapper is not its listing: the
+    // listing is the UNDERLYING coin (wUSDC.b -> usd-coin), which is exactly
+    // what the suspension says the wrapper no longer tracks. Its node gets
+    // no feed anchor while ANY asset on it is suspended (".b" siblings are
+    // one node), so the solve prices it off the market -- as declared_usd_par
+    // already does for its par.
+    std::unordered_set<std::string> suspended_legs;
+    for (const GraphPair& gp : graph) {
+        if (asset_peg_suspended(gp.base_id))  suspended_legs.insert(gp.base);
+        if (asset_peg_suspended(gp.quote_id)) suspended_legs.insert(gp.quote);
+    }
     for (const GraphPair& gp : graph) {
         for (const std::string& leg : {gp.base, gp.quote}) {
             if (anchored.count(leg)) continue;
+            if (suspended_legs.count(leg)) continue;
             auto listing = kFeedListings.find(leg);
             if (listing == kFeedListings.end()) continue;
             if (listing->second.units_per_coin <= 0.0) continue;
@@ -25983,8 +25995,13 @@ std::optional<synth::PriceSource> Engine::synth_pair_price(const PairConfig& pc)
         !coingecko_prices_.empty(), coingecko_last_fetch_,
         std::chrono::steady_clock::now(),
         config_.market_data.cex_freshness_threshold_sec);
+    // Nor while a leg's peg is suspended: the cached solve may predate the
+    // suspension and still be anchored on the wrapper's $1 listing. The
+    // pair then prices from the legs' own trades alone.
+    const bool suspended = pair_peg_suspended(pc);
     if (const auto est = market_data_->get_fair_value_estimate(pc.name);
-        feed_fresh && est && est->price > 0.0 && std::isfinite(est->price)) {
+        feed_fresh && !suspended && est && est->price > 0.0
+        && std::isfinite(est->price)) {
         const double sig = std::isfinite(est->sigma_bps)
             ? std::clamp(est->sigma_bps, 0.0, synth::kMaxSigmaBps)
             : synth::kMaxSigmaBps;
@@ -25994,16 +26011,22 @@ std::optional<synth::PriceSource> Engine::synth_pair_price(const PairConfig& pc)
     const auto now = std::chrono::system_clock::now();
     if (!sources.empty()) {
         const auto out = synth::blend_sources(sources);
-        if (out) synth_last_good_[pc.name] = {*out, now};
+        if (out) synth_last_good_[pc.name] = {*out, now, suspended};
         return out;
     }
     // Nothing fresh: the last synthetic price, its error bar grown by its
     // age. Only when nothing fresh exists, so it never re-counts itself.
+    // Under a suspension only a price made under it may stand in: one made
+    // before may rest on the wrapper's listing or an estimate anchored on it.
     if (const auto lg = synth_last_good_.find(pc.name);
         lg != synth_last_good_.end()) {
+        if (suspended && !lg->second.made_under_suspension) {
+            synth_last_good_.erase(lg);
+            return std::nullopt;
+        }
         const double age_h = std::chrono::duration<double, std::ratio<3600>>(
-            now - lg->second.second).count();
-        return synth::aged_source(lg->second.first, age_h,
+            now - lg->second.at).count();
+        return synth::aged_source(lg->second.src, age_h,
                                   synth::kAgedSigmaBpsPerHour);
     }
     return std::nullopt;

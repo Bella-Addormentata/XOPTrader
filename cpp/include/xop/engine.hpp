@@ -2492,9 +2492,14 @@ private:
         std::chrono::steady_clock::time_point fetched_at{};
     };
     std::unordered_map<std::string, SynthTape> synth_tapes_;
-    std::unordered_map<std::string,
-        std::pair<synth::PriceSource, std::chrono::system_clock::time_point>>
-        synth_last_good_;
+    struct SynthPairMark {
+        synth::PriceSource                    src;
+        std::chrono::system_clock::time_point at{};
+        // Made while the pair had a peg-suspended leg, so without that
+        // wrapper's listing or an estimate anchored on it.
+        bool made_under_suspension{false};
+    };
+    std::unordered_map<std::string, SynthPairMark> synth_last_good_;
     struct SynthAssetMark {
         synth::PriceSource                    src;
         std::chrono::system_clock::time_point at{};

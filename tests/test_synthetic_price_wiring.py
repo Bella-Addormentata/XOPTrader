@@ -363,3 +363,40 @@ def test_width_floor_ask_edges_are_checked():
     body = _body(STEP7)
     assert re.search(r"floor_ask_edge\s*=\s*to_mojo_checked\(", body)
     assert re.search(r"next_min\s*=\s*to_mojo_checked\(", body)
+
+
+# ---------------------------------------------------------------------------
+# Eighth review of PR #180: a suspended wrapper's listing must not reach the
+# synthetic price through the fair-value solve or a remembered pair price.
+# ---------------------------------------------------------------------------
+
+UPDATE_FV = "void Engine::update_fair_values()"
+SYNTH_PAIR_FN = "std::optional<synth::PriceSource> Engine::synth_pair_price(const PairConfig& pc)"
+
+
+def test_the_solve_gives_a_suspended_wrapper_no_feed_anchor():
+    body = _body(UPDATE_FV)
+    push = body.find("anchors.push_back(fv::Anchor{")
+    assert push >= 0
+    loop = body.rfind("for (const GraphPair& gp : graph)", 0, push)
+    window = body[loop:push]
+    assert re.search(r"if\s*\(\s*suspended_legs\.count\(leg\)\s*\)\s*continue\s*;", window), (
+        "a suspended wrapper's listing is its underlying coin; the solve "
+        "must not anchor the wrapper's node to it"
+    )
+    assert "asset_peg_suspended(gp.quote_id)" in body[:loop]
+    assert "asset_peg_suspended(gp.base_id)" in body[:loop]
+
+
+def test_the_synthetic_price_drops_suspension_dependent_inputs():
+    body = _body(SYNTH_PAIR_FN)
+    est = body.find("get_fair_value_estimate(")
+    cond_end = body.index("{", est)
+    assert re.search(r"!\s*suspended", body[est:cond_end]), (
+        "the cached estimate may predate the suspension and still be "
+        "anchored on the wrapper's listing"
+    )
+    assert re.search(r"suspended\s*&&\s*!\s*lg->second\.made_under_suspension", body), (
+        "a remembered pair price made before the suspension must not stand in"
+    )
+    assert re.search(r"synth_last_good_\[pc\.name\]\s*=\s*\{\s*\*out\s*,\s*now\s*,\s*suspended\s*\}", body)
