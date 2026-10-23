@@ -663,6 +663,16 @@ void MarketDataFeed::ingest_block_height(BlockHeight block_height) {
     spdlog::debug("ingest_block_height: height={}", block_height);
 }
 
+void MarketDataFeed::clear_synthetic_reference(const std::string& pair_name)
+{
+    std::unique_lock lock(mtx_pairs_);
+    const auto it = pairs_.find(pair_name);
+    if (it == pairs_.end() || !it->second.cex_synthetic) return;
+    it->second.cex_mid        = 0.0;
+    it->second.cex_synthetic  = false;
+    it->second.cex_updated_at = Timestamp{};
+}
+
 void MarketDataFeed::ingest_cex_reference(const std::string& pair_name,
                                            double             cex_mid,
                                            Timestamp          observed_at,

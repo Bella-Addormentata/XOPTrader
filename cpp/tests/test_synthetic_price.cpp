@@ -450,6 +450,44 @@ TEST(SynthBudget, ASuspendedWrapperIsMarkedFromItsOwnTrades)
     EXPECT_TRUE(own.exceeded("BYC/wUSDC.b", 10.0));
 }
 
+TEST(SynthProvenance, SuccessiveSuspensionsInvalidateARememberedPrice)
+{
+    using xop::synth::remembered_price_usable;
+    // Made with no leg suspended: either leg's suspension invalidates it.
+    EXPECT_TRUE(remembered_price_usable(false, false, false, false));
+    EXPECT_FALSE(remembered_price_usable(true, false, false, false));
+    EXPECT_FALSE(remembered_price_usable(false, true, false, false));
+    // Ninth review: made while only BYC (base) was suspended -- so it may
+    // include wUSDC.b's listing. wUSDC.b suspended later: refused.
+    EXPECT_TRUE(remembered_price_usable(true, false, true, false));
+    EXPECT_FALSE(remembered_price_usable(true, true, true, false));
+    // Made with both suspended: neither listing is in it.
+    EXPECT_TRUE(remembered_price_usable(true, true, true, true));
+    // A suspension that has since lifted is no reason to refuse.
+    EXPECT_TRUE(remembered_price_usable(false, false, true, true));
+}
+
+TEST(SynthCross, AnExpiredLegCrossesAtItsAgedPriceWithTheFreshLeg)
+{
+    // Ninth review (earlier miss): a tape-only CAT last priced at 0.5 XCH,
+    // its tape now expired, while the listed quote rises 0.5 -> 1 XCH. The
+    // pair is 0.5 quote per CAT, not the 1.0 remembered from before.
+    const std::vector<TapeTrade> expired = {{0.5, 1.0, kNow - 80h}};
+    ASSERT_FALSE(xop::synth::tape_source(expired, kNow).has_value());
+    const auto cat = xop::synth::aged_source(
+        PriceSource{0.5, 300.0}, /*age_h=*/8.0, xop::synth::kAgedSigmaBpsPerHour);
+    const PriceSource quote_now{1.0, 150.0};
+    const auto pair = xop::synth::cross_source(cat, quote_now);
+    ASSERT_TRUE(pair.has_value());
+    EXPECT_NEAR(pair->price, 0.5, 1e-12);
+    EXPECT_GT(pair->sigma_bps, cat.sigma_bps) << "both legs' errors carried";
+
+    const auto before = xop::synth::cross_source(PriceSource{0.5, 300.0},
+                                                 PriceSource{0.5, 150.0});
+    ASSERT_TRUE(before.has_value());
+    EXPECT_NEAR(before->price, 1.0, 1e-12) << "the remembered price it replaces";
+}
+
 TEST(SynthBudget, ExpiredTradesAgeTheMarkInsteadOfDroppingIt)
 {
     // Third review: once a coin's trades leave the 72 h window the tape has
@@ -843,6 +881,39 @@ TEST(SyntheticReference, AnUnrepresentablePriceIsRefused)
     feed2.refresh({"XCH/CHEAP"});
     EXPECT_EQ(state2.get_market("XCH/CHEAP").mid_price,
               static_cast<xop::Mojo>(9e6 * 1e12));
+}
+
+TEST(SyntheticReference, AWithdrawnSyntheticReferenceStopsPublishing)
+{
+    // Ninth review: published -> no eligible replacement (a suspension
+    // discarded it). The stored synthetic leg must go at once, not linger
+    // for the CEX freshness window.
+    xop::State state;
+    xop::MarketDataFeed feed(synth_cfg(), state);
+    feed.ingest_block_height(100);
+    feed.ingest_cex_reference("BYC/wUSDC.b", 0.78, Clock::now(), /*synthetic=*/true);
+    feed.refresh({"BYC/wUSDC.b"});
+    ASSERT_GT(state.get_market("BYC/wUSDC.b").mid_price, 0);
+
+    feed.clear_synthetic_reference("BYC/wUSDC.b");
+    feed.refresh({"BYC/wUSDC.b"});
+    const auto snap = state.get_market("BYC/wUSDC.b");
+    EXPECT_EQ(snap.mid_price, 0);
+    EXPECT_EQ(snap.cex_mid, 0);
+    EXPECT_FALSE(snap.mid_synthetic);
+}
+
+TEST(SyntheticReference, WithdrawingLeavesARealReferenceAlone)
+{
+    xop::State state;
+    xop::MarketDataFeed feed(synth_cfg(), state);
+    feed.ingest_block_height(100);
+    feed.ingest_cex_reference("XCH/wUSDC.b", 1.43, Clock::now());
+    feed.clear_synthetic_reference("XCH/wUSDC.b");
+    feed.clear_synthetic_reference("NOT/TRACKED");
+    feed.refresh({"XCH/wUSDC.b"});
+    EXPECT_TRUE(feed.get_cex_reference("XCH/wUSDC.b").has_value());
+    EXPECT_GT(state.get_market("XCH/wUSDC.b").mid_price, 0);
 }
 
 TEST(SyntheticReference, ARealReferenceClearsTheSyntheticMark)

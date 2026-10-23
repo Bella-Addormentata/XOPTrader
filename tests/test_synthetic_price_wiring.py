@@ -396,7 +396,38 @@ def test_the_synthetic_price_drops_suspension_dependent_inputs():
         "the cached estimate may predate the suspension and still be "
         "anchored on the wrapper's listing"
     )
-    assert re.search(r"suspended\s*&&\s*!\s*lg->second\.made_under_suspension", body), (
-        "a remembered pair price made before the suspension must not stand in"
+    assert "synth::remembered_price_usable(" in body, (
+        "a remembered pair price made before a leg's suspension must not "
+        "stand in"
     )
-    assert re.search(r"synth_last_good_\[pc\.name\]\s*=\s*\{\s*\*out\s*,\s*now\s*,\s*suspended\s*\}", body)
+    assert re.search(r"\{\s*\*out\s*,\s*now\s*,\s*base_suspended\s*,\s*quote_suspended\s*\}", body), (
+        "each leg's suspension is recorded with the price it shaped"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Ninth review of PR #180.
+# ---------------------------------------------------------------------------
+
+
+def test_no_eligible_synthetic_price_withdraws_the_published_one():
+    body = _body(STEP1)
+    synth = body.find("auto sp = synth_pair_price(pair);")
+    assert synth >= 0
+    tail = body[synth: body.find("TibetSwap AMM implied mid-price", synth)]
+    assert "market_data_->clear_synthetic_reference(pair.name);" in tail, (
+        "a synthetic reference with no eligible replacement must not keep "
+        "publishing for its freshness window"
+    )
+
+
+def test_the_pair_crosses_fresh_or_aged_leg_marks():
+    body = _body(SYNTH_PAIR_FN)
+    cross = body.find("synth::cross_source(")
+    assert cross >= 0
+    before = body[:cross]
+    assert before.count("synth_asset_mark(") == 2, (
+        "each leg fresh, else its own aged price: one expired tape must not "
+        "freeze the pair while the other leg moves"
+    )
+    assert "synth_asset_in_xch(" not in before

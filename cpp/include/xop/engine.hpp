@@ -2495,9 +2495,10 @@ private:
     struct SynthPairMark {
         synth::PriceSource                    src;
         std::chrono::system_clock::time_point at{};
-        // Made while the pair had a peg-suspended leg, so without that
-        // wrapper's listing or an estimate anchored on it.
-        bool made_under_suspension{false};
+        // Each leg's peg suspension when the price was made: a suspended
+        // leg's listing, and any estimate, were left out of it.
+        bool base_suspended{false};
+        bool quote_suspended{false};
     };
     std::unordered_map<std::string, SynthPairMark> synth_last_good_;
     struct SynthAssetMark {

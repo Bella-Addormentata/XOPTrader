@@ -233,6 +233,20 @@ struct TapeParams {
     return std::min(want, cap_bps);
 }
 
+/// Whether a remembered synthetic PAIR price may still stand in, given each
+/// leg's peg suspension now and when the price was made. A leg suspended
+/// since then invalidates it: the price may rest on that wrapper's listing
+/// (its underlying coin) or on an estimate anchored there. A leg suspended
+/// then had both excluded, so its suspension now is no reason to refuse.
+[[nodiscard]] inline bool remembered_price_usable(bool base_suspended_now,
+                                                  bool quote_suspended_now,
+                                                  bool base_suspended_then,
+                                                  bool quote_suspended_then) noexcept
+{
+    return (!base_suspended_now || base_suspended_then)
+        && (!quote_suspended_now || quote_suspended_then);
+}
+
 /// How far from its centre a ladder may price before the engine's mojo
 /// arithmetic (1e12-scaled, int64) can overflow: a synthetic price is used
 /// only if `kLadderHeadroom` times it still fits, which covers the widest

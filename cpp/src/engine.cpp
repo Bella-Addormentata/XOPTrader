@@ -5680,8 +5680,12 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
                               "{:.6f} +/- {:.0f} bps", pair.name, sp->price,
                               sp->sigma_bps);
             } else {
+                // Withdraw the last one rather than let it publish for the
+                // rest of its freshness window: whatever made it is no
+                // longer eligible (a suspension, an out-of-range price).
+                market_data_->clear_synthetic_reference(pair.name);
                 spdlog::debug("[Engine] Step 1: {} has no synthetic price "
-                              "yet -- no listing, no trades, no estimate",
+                              "-- no listing, no trades, no estimate",
                               pair.name);
             }
         }
@@ -25978,8 +25982,11 @@ std::optional<synth::PriceSource> Engine::synth_pair_price(const PairConfig& pc)
 {
     std::vector<synth::PriceSource> sources;
     if (const auto legs = split_pair_legs(pc.name)) {
-        const auto b = synth_asset_in_xch(pc.base_asset_id, legs->first);
-        const auto q = synth_asset_in_xch(pc.quote_asset_id, legs->second);
+        // Each leg fresh, else its own last price aged (synth_asset_mark):
+        // one leg's tape expiring must not freeze the pair at its remembered
+        // price while the other leg moves.
+        const auto b = synth_asset_mark(pc.base_asset_id, legs->first);
+        const auto q = synth_asset_mark(pc.quote_asset_id, legs->second);
         if (b && q) {
             if (const auto c = synth::cross_source(*b, *q)) sources.push_back(*c);
         }
@@ -25998,7 +26005,9 @@ std::optional<synth::PriceSource> Engine::synth_pair_price(const PairConfig& pc)
     // Nor while a leg's peg is suspended: the cached solve may predate the
     // suspension and still be anchored on the wrapper's $1 listing. The
     // pair then prices from the legs' own trades alone.
-    const bool suspended = pair_peg_suspended(pc);
+    const bool base_suspended  = asset_peg_suspended(pc.base_asset_id);
+    const bool quote_suspended = asset_peg_suspended(pc.quote_asset_id);
+    const bool suspended = base_suspended || quote_suspended;
     if (const auto est = market_data_->get_fair_value_estimate(pc.name);
         feed_fresh && !suspended && est && est->price > 0.0
         && std::isfinite(est->price)) {
@@ -26011,16 +26020,21 @@ std::optional<synth::PriceSource> Engine::synth_pair_price(const PairConfig& pc)
     const auto now = std::chrono::system_clock::now();
     if (!sources.empty()) {
         const auto out = synth::blend_sources(sources);
-        if (out) synth_last_good_[pc.name] = {*out, now, suspended};
+        if (out) {
+            synth_last_good_[pc.name] =
+                {*out, now, base_suspended, quote_suspended};
+        }
         return out;
     }
     // Nothing fresh: the last synthetic price, its error bar grown by its
     // age. Only when nothing fresh exists, so it never re-counts itself.
-    // Under a suspension only a price made under it may stand in: one made
-    // before may rest on the wrapper's listing or an estimate anchored on it.
+    // Not once a leg has been suspended SINCE it was made: it may rest on
+    // that wrapper's listing or an estimate anchored on it.
     if (const auto lg = synth_last_good_.find(pc.name);
         lg != synth_last_good_.end()) {
-        if (suspended && !lg->second.made_under_suspension) {
+        if (!synth::remembered_price_usable(base_suspended, quote_suspended,
+                                            lg->second.base_suspended,
+                                            lg->second.quote_suspended)) {
             synth_last_good_.erase(lg);
             return std::nullopt;
         }

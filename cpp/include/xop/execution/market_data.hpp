@@ -863,6 +863,12 @@ public:
                                   = Timestamp::clock::now(),
                               bool               synthetic = false);
 
+    /// [SYNTH 2026-10-22] Withdraw a SYNTHETIC reference (a real CEX
+    /// reference is left alone). Called when a revive pair has no eligible
+    /// synthetic price this heartbeat, so the last one is not published
+    /// for the rest of its freshness window.
+    void clear_synthetic_reference(const std::string& pair_name);
+
     /// Ingest the TibetSwap AMM implied mid-price for a pair.
     /// The implied price is computed from pool reserves: output_reserve / input_reserve.
     ///
