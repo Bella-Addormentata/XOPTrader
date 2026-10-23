@@ -212,19 +212,42 @@ struct TapeParams {
     return p.price;
 }
 
-/// A quoting half-spread that covers `sigma_mult` error bars, never below
-/// `floor_bps` and never above `cap_bps` (a ladder past ~50% stops meaning
-/// anything and a bid would approach zero).
-[[nodiscard]] inline double half_spread_for_sigma(double floor_bps,
-                                                  double sigma_bps,
+/// The UNCERTAINTY-derived part of a synthetic-priced pair's quoting
+/// half-spread: the centre's own width (k_sigma times the combined centre
+/// sigma) and, on a thin book, `sigma_mult` of the synthetic price's error
+/// bars -- capped at `cap_bps`, since past ~50% a ladder stops meaning
+/// anything and the bids approach zero. Explicit minimums (profit margin,
+/// fee, the revive floor) are applied by the caller on top, uncapped: they
+/// are configuration, not uncertainty.
+[[nodiscard]] inline double uncertainty_width_bps(double centre_width_bps,
+                                                  double synth_sigma_bps,
+                                                  bool   thin,
                                                   double sigma_mult = 2.0,
-                                                  double cap_bps = 5000.0) noexcept
+                                                  double cap_bps = kMaxSigmaBps) noexcept
 {
-    double want = floor_bps;
-    if (sigma_bps > 0.0 && std::isfinite(sigma_bps)) {
-        want = std::max(want, sigma_mult * sigma_bps);
+    double want = (centre_width_bps > 0.0 && std::isfinite(centre_width_bps))
+        ? centre_width_bps : 0.0;
+    if (thin && synth_sigma_bps > 0.0 && std::isfinite(synth_sigma_bps)) {
+        want = std::max(want, sigma_mult * synth_sigma_bps);
     }
-    return std::min(want, std::max(floor_bps, cap_bps));
+    return std::min(want, cap_bps);
+}
+
+/// How far from its centre a ladder may price before the engine's mojo
+/// arithmetic (1e12-scaled, int64) can overflow: a synthetic price is used
+/// only if `kLadderHeadroom` times it still fits, which covers the widest
+/// ladder (a 50% half-spread plus any tier schedule) many times over.
+inline constexpr double kLadderHeadroom = 16.0;
+
+/// True when `price` (quote per base) leaves the ladder that headroom in
+/// `scale`-scaled int64 units.
+[[nodiscard]] inline bool fits_with_ladder_headroom(double price,
+                                                    double scale) noexcept
+{
+    if (!(price > 0.0) || !std::isfinite(price)) return false;
+    constexpr double kMax = 9.2233720368547748e18;
+    const double scaled = price * scale;
+    return scaled >= 1.0 && scaled * kLadderHeadroom < kMax;
 }
 
 }  // namespace xop::synth

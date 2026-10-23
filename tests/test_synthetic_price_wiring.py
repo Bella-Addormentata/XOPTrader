@@ -81,17 +81,20 @@ def test_only_a_missing_listing_selects_the_synthetic_price():
     body = _body(STEP1)
     synth_call = body.find("synth_pair_price(")
     assert synth_call >= 0, "Step 1 no longer computes a synthetic price"
-    # The gate in front of that call is the listing test, not a cache lookup.
-    # It is the nearest `if (pair.revive_market ...` before the call.
-    gate = body.rfind("if (pair.revive_market", 0, synth_call)
-    assert gate >= 0, "the synthetic price is no longer gated on revive_market"
-    window = body[gate:synth_call]
-    assert re.search(r"revive_market\s*&&\s*pair_has_unlisted_leg\s*\(", window), (
+    # The gate in front of that call is the listing test, not a cache lookup:
+    # `synth_pricing = pair.revive_market && pair_has_unlisted_leg(...)`,
+    # then `if (synth_pricing)` immediately guarding the call.
+    decl = re.search(
+        r"const\s+bool\s+synth_pricing\s*=\s*pair\.revive_market\s*&&\s*"
+        r"pair_has_unlisted_leg\s*\(", body)
+    assert decl and decl.start() < synth_call, (
         "the synthetic fallback must be selected by a missing feed LISTING; "
         "gating it on missing cached prices lets a listed pair skip the live "
         "feed during an outage"
     )
-    assert "listed_cross_price" not in window
+    gate = body.rfind("if (", 0, synth_call)
+    assert body[gate:synth_call].startswith("if (synth_pricing)")
+    assert "listed_cross_price" not in body[decl.start():synth_call]
 
 
 def test_the_ladder_centres_on_the_synthetic_price():
@@ -118,7 +121,7 @@ def test_step1_carries_the_synthetic_price_to_step7():
 def _unlisted_budget_branch() -> str:
     """The Step 11 budget branch for a revive pair with an unlisted leg."""
     body = _body(STEP11)
-    start = body.find("if (legs && pair_has_unlisted_leg(pair.name))")
+    start = body.find("if (legs && (pair_has_unlisted_leg(pair.name)")
     assert start >= 0, (
         "Step 11 must value a pair with an unlisted leg on its own branch"
     )
@@ -302,7 +305,7 @@ def test_an_unrepresentable_synthetic_price_is_not_used():
     ingest = body.find("ingest_cex_reference(", synth)
     assert 0 <= synth < ingest
     window = body[synth:ingest]
-    assert "to_mojo_checked(" in window and "sp.reset()" in window, (
+    assert "synth::fits_with_ladder_headroom(" in window and "sp.reset()" in window, (
         "a synthetic price outside the fixed-point range must be dropped "
         "before it reaches the reference, revive_ref_ok or Step 7"
     )
@@ -318,3 +321,45 @@ def test_a_listed_leg_is_marked_from_its_feed_only_while_fresh():
         "while the pair keeps quoting"
     )
     assert "coingecko_feed_fresh_for_revival(" in _body(STEP11)
+
+
+# ---------------------------------------------------------------------------
+# Seventh review of PR #180.
+# ---------------------------------------------------------------------------
+
+SYNTH_ASSET = ("std::optional<synth::PriceSource> Engine::synth_asset_in_xch(")
+SYNTH_MARK = "std::optional<synth::PriceSource> Engine::synth_asset_mark("
+
+
+def test_a_suspended_wrapper_never_takes_its_underlying_listing():
+    body = _body(SYNTH_ASSET)
+    listing = body.find("coingecko_prices_.find(l->second.id)")
+    assert listing >= 0
+    assert "!asset_peg_suspended(asset_id)" in body[:listing], (
+        "a suspended wrapper's listing is its underlying coin"
+    )
+    mark = _body(SYNTH_MARK)
+    assert re.search(r"listing_free\s*\|\|\s*!asset_peg_suspended\(asset_id\)", mark), (
+        "the aged fallback must not let a listing-seeded price back in "
+        "for a suspended wrapper"
+    )
+    branch = _unlisted_budget_branch()
+    assert "!asset_peg_suspended(asset_id)" in branch
+    assert "pair_peg_suspended(pair)" in _body(STEP11)[: _body(STEP11).find("if (legs && (")+200]
+
+
+def test_the_quote_width_caps_uncertainty_not_minimums():
+    body = _body(STEP7)
+    width = body.find("synth::uncertainty_width_bps(")
+    floor = body.find("revive::half_spread_floor_bps(", width)
+    assert 0 <= width < floor, (
+        "the synthetic uncertainty width is capped BEFORE the explicit "
+        "minimums are applied"
+    )
+    assert "half_spread_for_sigma" not in body
+
+
+def test_width_floor_ask_edges_are_checked():
+    body = _body(STEP7)
+    assert re.search(r"floor_ask_edge\s*=\s*to_mojo_checked\(", body)
+    assert re.search(r"next_min\s*=\s*to_mojo_checked\(", body)

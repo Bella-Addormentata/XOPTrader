@@ -20,6 +20,7 @@
 //   ISO/IEC JTC 1/SC 22 (standard-conforming C++17)
 
 #include "xop/strategy/liquidity.hpp"
+#include "xop/peg_registry.hpp"   // floor_/ceil_mojo_checked
 
 #include <spdlog/spdlog.h>
 
@@ -199,8 +200,9 @@ std::vector<TierQuote> LiquidityEngine::build_raw_ladder(
         // Rounding DOWN for bids is conservative (we pay less).
         const double bid_price_f =
             static_cast<double>(mid) * (1.0 - bid_spread_bps / 10000.0);
-        const auto   bid_price   =
-            static_cast<std::int64_t>(std::floor(bid_price_f));
+        // Checked: a price outside int64 is not converted (undefined) but
+        // dropped, as a non-positive one already is.
+        const auto   bid_price   = floor_mojo_checked(bid_price_f).value_or(0);
 
         const auto bid_size = tier_size_for_pool(bid_pool);
 
@@ -219,8 +221,8 @@ std::vector<TierQuote> LiquidityEngine::build_raw_ladder(
         // Rounding UP for asks is conservative (we receive more).
         const double ask_price_f =
             static_cast<double>(mid) * (1.0 + ask_spread_bps / 10000.0);
-        const auto   ask_price   =
-            static_cast<std::int64_t>(std::ceil(ask_price_f));
+        // Checked, as the bid: an ask past the fixed-point range is dropped.
+        const auto   ask_price   = ceil_mojo_checked(ask_price_f).value_or(0);
 
         const auto ask_size = tier_size_for_pool(ask_pool);
 

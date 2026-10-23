@@ -7,6 +7,8 @@
 
 #include "xop/execution/fair_value_solver.hpp"
 #include "xop/execution/market_data.hpp"
+#include "xop/peg_registry.hpp"
+#include "xop/strategy/liquidity.hpp"
 #include "xop/feed_listings.hpp"
 #include "xop/rpc/dexie_client.hpp"
 #include "xop/state.hpp"
@@ -181,7 +183,7 @@ TEST(SynthTape, ScatteredTradesWidenTheErrorBar)
 }
 
 // ---------------------------------------------------------------------------
-// half_spread_for_sigma
+// uncertainty_width_bps
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
@@ -415,6 +417,39 @@ TEST(SynthBudget, AListedLegIsNotHeldStillByAStaleFeed)
     EXPECT_TRUE(fresh.exceeded("BYC/DBX", 10.0));
 }
 
+TEST(SynthBudget, ASuspendedWrapperIsMarkedFromItsOwnTrades)
+{
+    // Seventh review: peg_guard off, wUSDC.b suspended and falling to $0.50
+    // on its own trades while its listing (usd-coin) stays at $1. Net
+    // -100 BYC ($1 +-200 bps) / +100 wUSDC.b: a $50 loss.
+    xop::revive::PairFlows flows;
+    flows.base_units  = -100.0;
+    flows.quote_units = 100.0;
+    auto record = [&](xop::revive::LossBudget& b, Clock::time_point t,
+                      double wrapper_usd, double wrapper_sigma) {
+        const double byc_a = unlisted_mark(1.0, 200.0, flows.base_units);
+        const double w_a = unlisted_mark(wrapper_usd, wrapper_sigma,
+                                         flows.quote_units);
+        b.record("BYC/wUSDC.b", t,
+                 *flows.value_usd_by_leg(1.0, wrapper_usd, 1.43),
+                 *flows.value_usd_by_leg(byc_a, w_a, 1.43));
+    };
+
+    // The defect: the underlying's $1 listing, both times.
+    xop::revive::LossBudget listed;
+    record(listed, kBudgetT0, 1.00, 0.0);
+    record(listed, kBudgetT0 + 2min, 1.00, 0.0);
+    EXPECT_NEAR(listed.drawdown_usd("BYC/wUSDC.b"), 2.0, 1e-9);
+    EXPECT_FALSE(listed.exceeded("BYC/wUSDC.b", 10.0));
+
+    // Marked from the wrapper's own trades: at least the $50 loss.
+    xop::revive::LossBudget own;
+    record(own, kBudgetT0, 1.00, 200.0);
+    record(own, kBudgetT0 + 2min, 0.50, 200.0);
+    EXPECT_GE(own.drawdown_usd("BYC/wUSDC.b"), 50.0);
+    EXPECT_TRUE(own.exceeded("BYC/wUSDC.b", 10.0));
+}
+
 TEST(SynthBudget, ExpiredTradesAgeTheMarkInsteadOfDroppingIt)
 {
     // Third review: once a coin's trades leave the 72 h window the tape has
@@ -519,12 +554,89 @@ TEST(SynthCentre, AnEmptyBookCentresOnTheSyntheticPriceNotTheEstimate)
     EXPECT_DOUBLE_EQ(c.sigma_bps, synth->sigma_bps);
 }
 
-TEST(SynthSpread, CoversTwoErrorBarsBetweenTheFloorAndTheCap)
+TEST(SynthSpread, OnAThinBookTheWidthCoversTwoErrorBars)
 {
-    EXPECT_DOUBLE_EQ(xop::synth::half_spread_for_sigma(300.0, 100.0), 300.0);
-    EXPECT_DOUBLE_EQ(xop::synth::half_spread_for_sigma(300.0, 600.0), 1200.0);
-    EXPECT_DOUBLE_EQ(xop::synth::half_spread_for_sigma(300.0, 4000.0), 5000.0);
-    EXPECT_DOUBLE_EQ(xop::synth::half_spread_for_sigma(300.0, kNaN), 300.0);
+    using xop::synth::uncertainty_width_bps;
+    EXPECT_DOUBLE_EQ(uncertainty_width_bps(0.0, 600.0, /*thin=*/true), 1200.0);
+    EXPECT_DOUBLE_EQ(uncertainty_width_bps(0.0, 600.0, /*thin=*/false), 0.0);
+    EXPECT_DOUBLE_EQ(uncertainty_width_bps(1500.0, 600.0, true), 1500.0)
+        << "the centre's own width when it is the wider";
+    EXPECT_DOUBLE_EQ(uncertainty_width_bps(400.0, kNaN, true), 400.0);
+    EXPECT_DOUBLE_EQ(uncertainty_width_bps(kNaN, 600.0, true), 1200.0);
+}
+
+TEST(SynthSpread, TheUncertaintyWidthIsCappedBeforeTheMinimumsApply)
+{
+    // Seventh review: k_sigma 2 x a 5000 bps centre sigma is 10,000 bps.
+    // Carried in as a floor it priced every bid at zero; capped as the
+    // uncertainty it is, the ladder keeps a bid at half the centre.
+    using xop::synth::uncertainty_width_bps;
+    const double width = uncertainty_width_bps(2.0 * 5000.0, 5000.0, true);
+    EXPECT_DOUBLE_EQ(width, 5000.0);
+    const double half = xop::revive::half_spread_floor_bps(
+        std::max(50.0, width), /*thin=*/true, /*revive_floor_bps=*/300.0);
+    EXPECT_DOUBLE_EQ(half, 5000.0);
+    const xop::Mojo mid = 1'835'000'000'000LL;
+    EXPECT_GT(static_cast<double>(mid) * (1.0 - half / 1e4), 0.0);
+
+    // An explicit minimum is configuration, not uncertainty: never capped.
+    EXPECT_DOUBLE_EQ(xop::revive::half_spread_floor_bps(
+                         std::max(6000.0, width), true, 300.0),
+                     6000.0);
+}
+
+// ---------------------------------------------------------------------------
+// Fixed-point headroom for a synthetic price and the ladder built on it
+// ---------------------------------------------------------------------------
+
+TEST(SynthHeadroom, APriceNearTheFixedPointLimitIsRefused)
+{
+    using xop::synth::fits_with_ladder_headroom;
+    const double scale = 1e12;
+    EXPECT_FALSE(fits_with_ladder_headroom(9e6, scale))
+        << "9e18 mojos fits, but a 400 bps ask above it does not";
+    EXPECT_FALSE(fits_with_ladder_headroom(1e8, scale));
+    EXPECT_TRUE(fits_with_ladder_headroom(5e5, scale));
+    EXPECT_TRUE(fits_with_ladder_headroom(1.835, scale));
+    EXPECT_FALSE(fits_with_ladder_headroom(1e-13, scale)) << "below one mojo";
+    EXPECT_FALSE(fits_with_ladder_headroom(kNaN, scale));
+    EXPECT_FALSE(fits_with_ladder_headroom(0.0, scale));
+}
+
+TEST(SynthHeadroom, ARawLadderDropsTiersPastTheFixedPointRangeOnEachSide)
+{
+    // The near-boundary centre from the review, through ladder generation:
+    // 9e18 mojos with a 400 bps tier puts the ask at 9.36e18, above int64.
+    xop::LiquidityConfig cfg;
+    cfg.num_tiers        = 2;
+    cfg.tier_spacing_bps = {400.0, 800.0};
+    cfg.tier_size_pct    = {0.5, 0.5};
+    cfg.adverse_selection_sizing = false;
+    cfg.gap_aware_spacing        = false;
+    xop::LiquidityEngine engine("XCH/CHEAP", cfg);
+    const xop::Mojo mid = 9'000'000'000'000'000'000LL;
+    const auto ladder = engine.compute_ladder(
+        mid, 0.03, 0.5, 10'000'000'000'000LL, 10'000'000'000'000LL, cfg);
+    int bids = 0;
+    for (const auto& tq : ladder) {
+        EXPECT_GT(tq.price, 0);
+        EXPECT_NE(tq.side, xop::Side::Ask)
+            << "an ask above int64 must be dropped, not converted";
+        if (tq.side == xop::Side::Bid) {
+            ++bids;
+            EXPECT_LT(tq.price, mid) << "bids round down below the centre";
+        }
+    }
+    EXPECT_EQ(bids, 2) << "the representable side still quotes";
+}
+
+TEST(SynthHeadroom, CheckedFloorAndCeilKeepTheirDirection)
+{
+    EXPECT_EQ(xop::floor_mojo_checked(10.9), 10);
+    EXPECT_EQ(xop::ceil_mojo_checked(10.1), 11);
+    EXPECT_FALSE(xop::ceil_mojo_checked(9.36e18).has_value());
+    EXPECT_FALSE(xop::floor_mojo_checked(kNaN).has_value());
+    EXPECT_FALSE(xop::floor_mojo_checked(-1.5).has_value());
 }
 
 // ---------------------------------------------------------------------------

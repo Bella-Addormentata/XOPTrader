@@ -5641,22 +5641,30 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
         // SYNTHETIC reference: it moves the published mid so the pair can
         // quote, and is withheld from valuation, the mid gate and the
         // arbitrage signal.
-        if (pair.revive_market && pair_has_unlisted_leg(pair.name)) {
+        const bool synth_pricing =
+            pair.revive_market && pair_has_unlisted_leg(pair.name);
+        // A revive pair with a peg-suspended (depegged) wrapper leg needs
+        // that wrapper's own trades for its loss budget: its listing (the
+        // underlying coin) no longer prices it.
+        if (synth_pricing || (pair.revive_market && pair_peg_suspended(pair))) {
             co_await refresh_synth_tape(pair.base_asset_id);
             co_await refresh_synth_tape(pair.quote_asset_id);
+        }
+        if (synth_pricing) {
             auto sp = synth_pair_price(pair);
-            // A price the snapshot cannot carry in mojos (a near-worthless
-            // coin's cross: 1e8 per XCH is 1e20 scaled) is no price at all,
-            // for the reference, revive_ref_ok and Step 7 alike.
-            if (sp) {
-                const auto m = to_mojo_checked(
-                    sp->price * static_cast<double>(kMojosPerXch));
-                if (!m || *m <= 0) {
-                    spdlog::warn("[Engine] Step 1: {} synthetic price {} is "
-                                 "outside the fixed-point range -- not used",
-                                 pair.name, sp->price);
-                    sp.reset();
-                }
+            // A price the engine's mojo arithmetic cannot carry -- with room
+            // for the widest ladder around it (a near-worthless coin's
+            // cross: 1e8 per XCH is 1e20 scaled) -- is no price at all, for
+            // the reference, revive_ref_ok and Step 7 alike. Such a coin
+            // can be quoted the other way round (<coin>/XCH).
+            if (sp && !synth::fits_with_ladder_headroom(
+                          sp->price, static_cast<double>(kMojosPerXch))) {
+                spdlog::warn("[Engine] Step 1: {} synthetic price {} is "
+                             "outside the fixed-point range (with ladder "
+                             "headroom) -- not used; configure the pair "
+                             "the other way round to quote it",
+                             pair.name, sp->price);
+                sp.reset();
             }
             if (sp) {
                 market_data_->ingest_cex_reference(
@@ -10087,18 +10095,23 @@ void Engine::step_generate_ladder(BlockHeight block_height)
             config_.arbitrage.tibetswap_fee_bps);
         // [REVIVE2 2026-10-22] A revive pair on a thin book quotes no
         // tighter than strategy.revive_min_half_spread_bps.
+        double quote_sigma_width_bps =
+            std::max(0.0, config_.strategy.quote_width_sigma_mult)
+            * quote_combined_sigma_bps;
+        // [SYNTH 2026-10-22] Quoting from a synthetic price: the width also
+        // covers two of its error bars on a thin book, and the whole
+        // uncertainty-derived width is capped at 50% (a 5000 bps sigma
+        // times 2 would otherwise price every bid at zero). The explicit
+        // minimums below stay as configured.
+        if (pcs.revive_synth_sigma_bps > 0.0) {
+            quote_sigma_width_bps = synth::uncertainty_width_bps(
+                quote_sigma_width_bps, pcs.revive_synth_sigma_bps,
+                pcs.revive_thin);
+        }
         double quote_min_half_spread_bps = revive::half_spread_floor_bps(
-            std::max(quote_base_floor_bps,
-                     std::max(0.0, config_.strategy.quote_width_sigma_mult)
-                         * quote_combined_sigma_bps),
+            std::max(quote_base_floor_bps, quote_sigma_width_bps),
             pcs.revive_thin,
             config_.strategy.revive_min_half_spread_bps);
-        // [SYNTH 2026-10-22] Quoting from a synthetic price on a thin book:
-        // cover two of its error bars (capped at 50%).
-        if (pcs.revive_thin && pcs.revive_synth_sigma_bps > 0.0) {
-            quote_min_half_spread_bps = synth::half_spread_for_sigma(
-                quote_min_half_spread_bps, pcs.revive_synth_sigma_bps);
-        }
         if (pcs.revive_thin && config_.strategy.revive_min_half_spread_bps > 0.0) {
             spdlog::debug("[Engine] Step 7: {} revive thin book -- min "
                           "half-spread {:.0f} bps", pair_name,
@@ -10665,9 +10678,11 @@ void Engine::step_generate_ladder(BlockHeight block_height)
             const auto floor_bid_edge = static_cast<Mojo>(std::llround(
                 static_cast<double>(mid_mojos)
                 * (1.0 - quote_min_half_spread_bps / 10'000.0)));
-            const auto floor_ask_edge = static_cast<Mojo>(std::llround(
+            // Checked: an ask edge past the fixed-point range drops the
+            // asks that would need it rather than converting it (undefined).
+            const auto floor_ask_edge = to_mojo_checked(
                 static_cast<double>(mid_mojos)
-                * (1.0 + quote_min_half_spread_bps / 10'000.0)));
+                * (1.0 + quote_min_half_spread_bps / 10'000.0));
 
             auto tiers_in_order = [&](Side side) {
                 std::vector<TierQuote*> out;
@@ -10710,19 +10725,33 @@ void Engine::step_generate_ladder(BlockHeight block_height)
             }
 
             // ASK side: running floor stepping UP.
-            Mojo next_min = floor_ask_edge;
+            std::optional<Mojo> next_min = floor_ask_edge;
+            int dropped_asks = 0;
             for (TierQuote* tqp : tiers_in_order(Side::Ask)) {
                 TierQuote& tq = *tqp;
-                if (tq.price >= next_min) {
-                    next_min = std::max(next_min, tq.price);
+                if (!next_min) {        // past the fixed-point range
+                    tq.price = 0;       // marked; erased below
+                    ++dropped_asks;
                     continue;
                 }
-                tq.price = next_min;
+                if (tq.price >= *next_min) {
+                    next_min = std::max(*next_min, tq.price);
+                    continue;
+                }
+                tq.price = *next_min;
                 resync_spread(tq);
                 ++floored_asks;
-                next_min = static_cast<Mojo>(std::llround(
-                    static_cast<double>(next_min)
-                    * (1.0 + step_bps / 10'000.0)));
+                next_min = to_mojo_checked(
+                    static_cast<double>(*next_min)
+                    * (1.0 + step_bps / 10'000.0));
+            }
+            if (dropped_asks > 0) {
+                std::erase_if(pcs.ladder, [](const TierQuote& t) {
+                    return t.side == Side::Ask && t.price <= 0;
+                });
+                spdlog::warn("[Engine] Step 7: {} dropped {} ask tier(s) "
+                             "whose width-floor price is outside the "
+                             "fixed-point range", pair_name, dropped_asks);
             }
 
             if (floored_bids > 0 || floored_asks > 0) {
@@ -21625,7 +21654,8 @@ void Engine::step_update_pnl(BlockHeight block_height)
                 return (q != coingecko_prices_.end() && q->second > 0.0)
                     ? q->second / l->second.units_per_coin : 0.0;
             };
-            if (legs && pair_has_unlisted_leg(pair.name)) {
+            if (legs && (pair_has_unlisted_leg(pair.name)
+                         || pair_peg_suspended(pair))) {
                 // [SYNTH 2026-10-22] A pair with an unlisted leg (BYC) is
                 // valued LEG BY LEG from one consistent set of USD marks:
                 // XCH at its price, a listed leg at its feed price, an
@@ -21660,7 +21690,10 @@ void Engine::step_update_pnl(BlockHeight block_height)
                     const auto m = (xch_usd > 0.0)
                         ? synth_asset_mark(asset_id, leg)
                         : std::nullopt;
-                    if (table.count(leg) > 0 && listed_feed_fresh) {
+                    // A peg-suspended wrapper's listing is its underlying
+                    // coin's price, not its own: never used for it.
+                    if (table.count(leg) > 0 && listed_feed_fresh
+                        && !asset_peg_suspended(asset_id)) {
                         const double v = listed_usd(leg);
                         if (v > 0.0) return {v, v};
                     }
@@ -25864,15 +25897,20 @@ asio::awaitable<void> Engine::refresh_synth_tape(const std::string& asset_id)
 }
 
 std::optional<synth::PriceSource> Engine::synth_asset_in_xch(
-    const std::string& asset_id, const std::string& leg_symbol) const
+    const std::string& asset_id, const std::string& leg_symbol,
+    bool* used_listing) const
 {
+    if (used_listing != nullptr) *used_listing = false;
     if (is_xch_asset(asset_id)) return synth::PriceSource{1.0, 0.0};
     std::vector<synth::PriceSource> sources;
 
-    // Its CoinGecko listing, while the feed is fresh.
+    // Its CoinGecko listing, while the feed is fresh -- and while the asset
+    // holds its peg: a suspended wrapper's listing is its UNDERLYING coin
+    // (wUSDC.b -> usd-coin), which no longer prices it.
     const auto& table = feed_listings();
     if (const auto l = table.find(leg_symbol);
         l != table.end() && l->second.units_per_coin > 0.0
+        && !asset_peg_suspended(asset_id)
         && coingecko_feed_fresh_for_revival(
                !coingecko_prices_.empty(), coingecko_last_fetch_,
                std::chrono::steady_clock::now(),
@@ -25884,6 +25922,7 @@ std::optional<synth::PriceSource> Engine::synth_asset_in_xch(
             sources.push_back(synth::PriceSource{
                 (a->second / l->second.units_per_coin) / x->second,
                 config_.strategy.fair_value_feed_sigma_bps});
+            if (used_listing != nullptr) *used_listing = true;
         }
     }
 
@@ -25901,18 +25940,23 @@ std::optional<synth::PriceSource> Engine::synth_asset_mark(
     const std::string& asset_id, const std::string& leg_symbol)
 {
     const auto now = std::chrono::system_clock::now();
-    if (const auto fresh = synth_asset_in_xch(asset_id, leg_symbol)) {
-        synth_asset_last_good_[asset_id] = {*fresh, now};
+    bool used_listing = false;
+    if (const auto fresh = synth_asset_in_xch(asset_id, leg_symbol,
+                                              &used_listing)) {
+        synth_asset_last_good_[asset_id] = {*fresh, now, !used_listing};
         return fresh;
     }
     // Its trades have left the window: the last price, its error bar grown
     // by its age, rather than no mark at all. Nothing remembered (a restart
-    // with no trades since) is no mark.
+    // with no trades since) is no mark. A peg-suspended asset may only
+    // fall back to a price made WITHOUT its listing -- one seeded from the
+    // underlying coin would mark the depegged wrapper at par.
     if (const auto lg = synth_asset_last_good_.find(asset_id);
-        lg != synth_asset_last_good_.end()) {
+        lg != synth_asset_last_good_.end()
+        && (lg->second.listing_free || !asset_peg_suspended(asset_id))) {
         const double age_h = std::chrono::duration<double, std::ratio<3600>>(
-            now - lg->second.second).count();
-        return synth::aged_source(lg->second.first, age_h,
+            now - lg->second.at).count();
+        return synth::aged_source(lg->second.src, age_h,
                                   synth::kAgedSigmaBpsPerHour);
     }
     return std::nullopt;
