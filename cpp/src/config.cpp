@@ -1619,6 +1619,27 @@ StrategyConfig parse_strategy(const YAML::Node& root)
             throw ConfigError(sec + ".max_offer_size_units must be >= 0");
         }
     }
+    // [REVIVE2 2026-10-22] Each 0 = off; negative or non-finite is an error.
+    for (const auto& [key, field] : {
+             std::pair<const char*, double*>{"revive_min_half_spread_bps",
+                                             &cfg.revive_min_half_spread_bps},
+             {"revive_max_offer_size_units", &cfg.revive_max_offer_size_units},
+             {"revive_daily_loss_budget_usd", &cfg.revive_daily_loss_budget_usd}}) {
+        if (node[key] && node[key].IsDefined() && !node[key].IsNull()) {
+            const double v = node[key].as<double>();
+            if (!std::isfinite(v) || v < 0.0 || v > 1e6) {
+                throw ConfigError(sec + "." + key
+                                  + " must be a finite value in [0, 1e6]");
+            }
+            *field = v;
+        }
+    }
+    if (node["revive_isolate_flash_crash"]
+        && node["revive_isolate_flash_crash"].IsDefined()
+        && !node["revive_isolate_flash_crash"].IsNull()) {
+        cfg.revive_isolate_flash_crash =
+            node["revive_isolate_flash_crash"].as<bool>();
+    }
     if (node["wallet_balance_caps_enabled"] && node["wallet_balance_caps_enabled"].IsDefined()
         && !node["wallet_balance_caps_enabled"].IsNull()) {
         cfg.wallet_balance_caps_enabled = node["wallet_balance_caps_enabled"].as<bool>();
@@ -2598,6 +2619,19 @@ RiskConfig parse_risk(const YAML::Node& root)
                               "can never detect a drop");
         }
         cfg.flash_crash_window_blocks = static_cast<uint32_t>(v);
+    }
+
+    // [STALEHIST 2026-10-22] 0 = never treat a pair's history as stale.
+    if (node["flash_crash_stale_history_blocks"]
+            && node["flash_crash_stale_history_blocks"].IsDefined()
+            && !node["flash_crash_stale_history_blocks"].IsNull()) {
+        int64_t v = node["flash_crash_stale_history_blocks"].as<int64_t>();
+        if (v < 0 || v > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
+            throw ConfigError(sec + ".flash_crash_stale_history_blocks must be in [0, "
+                              + std::to_string(std::numeric_limits<uint32_t>::max())
+                              + "]; got " + std::to_string(v));
+        }
+        cfg.flash_crash_stale_history_blocks = static_cast<uint32_t>(v);
     }
 
     // recovery_stable_blocks_phase1: blocks that must be stable for Crash->Recovery.
@@ -4854,6 +4888,49 @@ AppConfig load_config(const std::string& path,
         };
         for (std::size_t i = 0; i < cfg.pairs.size(); ++i) {
             if (!cfg.pairs[i].revive_market) continue;
+
+            // [REVIVE2 2026-10-22] Batching merges a side's tiers into one
+            // wallet offer (post_merged_side), so the per-tier revive size
+            // cap would not bound what is actually posted.
+            if (cfg.strategy.batch_offers_enabled
+                && cfg.strategy.revive_max_offer_size_units > 0.0) {
+                throw ConfigError(
+                    "pairs[" + std::to_string(i) + "] ("
+                    + cfg.pairs[i].name + "): revive_market with "
+                    "strategy.revive_max_offer_size_units > 0 cannot be "
+                    "combined with strategy.batch_offers_enabled: batching "
+                    "merges a side's capped tiers into one larger offer. "
+                    "Disable batching, or set the cap to 0.");
+            }
+
+            // [REVIVE2 2026-10-22] Pace resizes and replans its pairs'
+            // ladders after the revive size cap is applied (Step 7's pace
+            // post-pass, Step 8's replan after a take), so the cap would not
+            // hold on a pair both manage. Refuse the combination.
+            if (cfg.strategy.pace_enabled) {
+                if (const auto legs = split_pair_legs(cfg.pairs[i].name)) {
+                    for (const std::string& leg : {legs->first, legs->second}) {
+                        std::string upper = leg;
+                        for (auto& c : upper) {
+                            c = static_cast<char>(
+                                std::toupper(static_cast<unsigned char>(c)));
+                        }
+                        for (const std::string& pa : cfg.strategy.pace_assets) {
+                            if (canonical_feed_symbol(pa) == leg
+                                || pa == upper) {
+                                throw ConfigError(
+                                    "pairs[" + std::to_string(i) + "] ("
+                                    + cfg.pairs[i].name + "): revive_market "
+                                    "cannot be set on a pair that pace "
+                                    "manages (strategy.pace_assets contains "
+                                    + pa + "): pace resizes the ladder after "
+                                    "the revive size cap. Remove one of them.");
+                            }
+                        }
+                    }
+                }
+            }
+
             for (const auto& k : knobs) {
                 if (usable(k.value)) continue;
                 throw ConfigError(

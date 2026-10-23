@@ -279,6 +279,40 @@ TEST(StabilityTest, ZeroLatestPrice_NotStable) {
     EXPECT_FALSE(xop::PreTradeCheck::is_stable_after_crash(prices, 4, 0.05));
 }
 
+// [STALEHIST 2026-10-22] price_history_is_stale
+
+TEST(StaleHistoryTest, AFrozenVolatileHistoryCanNeverPassTheRecoveryCheck) {
+    // Why the test exists: BYC/wUSDC.b on 2026-10-21. Its mid stopped with
+    // 0.898 and 1.114 inside the last 100 entries, and nothing appends to a
+    // history without a mid, so this verdict could never change.
+    std::vector<xop::Mojo> frozen(100, 1'113'600'000'000LL);
+    frozen[40] = 898'000'000'000LL;
+    EXPECT_FALSE(xop::PreTradeCheck::is_stable_after_crash(frozen, 100, 0.05));
+}
+
+TEST(StaleHistoryTest, AHistoryFromThisBlockOrWithinTheLimitIsNotStale) {
+    using xop::PreTradeCheck;
+    EXPECT_FALSE(PreTradeCheck::price_history_is_stale(9467000, 9467000, 10));
+    EXPECT_FALSE(PreTradeCheck::price_history_is_stale(9466990, 9467000, 10))
+        << "exactly the limit is still fresh";
+    EXPECT_FALSE(PreTradeCheck::price_history_is_stale(9467001, 9467000, 10))
+        << "a newest entry ahead of the current block is not stale";
+}
+
+TEST(StaleHistoryTest, AHistoryOlderThanTheLimitIsStale) {
+    using xop::PreTradeCheck;
+    EXPECT_TRUE(PreTradeCheck::price_history_is_stale(9466989, 9467000, 10));
+    // 2026-10-21 21:32 to 2026-10-22 08:15 CDT is about 740 blocks.
+    EXPECT_TRUE(PreTradeCheck::price_history_is_stale(9466260, 9467000, 10));
+}
+
+TEST(StaleHistoryTest, ZeroDisablesTheTest) {
+    EXPECT_FALSE(xop::PreTradeCheck::price_history_is_stale(1, 9467000, 0));
+}
+
+static_assert(xop::PreTradeCheck::price_history_is_stale(0, 11, 10));
+static_assert(!xop::PreTradeCheck::price_history_is_stale(0, 10, 10));
+
 // ============================================================================
 // congestion_buffer_multiplier
 // ============================================================================

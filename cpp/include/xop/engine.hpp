@@ -77,6 +77,7 @@
 #include "xop/util/stop_offers_policy.hpp"
 #include "xop/strategy/bbo_sanity.hpp"
 #include "xop/strategy/pace_controller.hpp"
+#include "xop/strategy/revive.hpp"
 #include "xop/strategy/no_loss_floor.hpp"
 #include "xop/risk/usd_route.hpp"
 #include "xop/risk/inventory.hpp"
@@ -1278,6 +1279,7 @@ private:
     [[nodiscard]] bool asset_peg_suspended(const std::string& asset_id) const;
     [[nodiscard]] bool pair_peg_suspended(const PairConfig& pc) const;
     asio::awaitable<void> step_observe_asset_pegs(BlockHeight block_height);
+    asio::awaitable<void> step_revive_maintenance(BlockHeight block_height);
     void check_peg_reenable_flag();
     void publish_peg_status();
 
@@ -2257,6 +2259,11 @@ private:
         Mojo          quote_fair_centre_mojos{0};
         double        quote_min_half_spread_bps{0.0};
 
+        // [REVIVE2 2026-10-22] Set in Step 4 for revive_market pairs: the
+        // third-party book cannot price the pair by itself, so the revive
+        // spread floor and size cap apply.
+        bool          revive_thin{false};
+
         // [2026-09-02, review] The spread SpreadOptimizer::compute_spread()
         // produced, captured before Step 5's first adjustment site.
         //
@@ -2425,6 +2432,28 @@ private:
     // During Crash and Recovery states, Step 8 (offer posting) is gated.
     // ISO/IEC 5055: deterministic initial state; exhaustive enum.
     FlashCrashState flash_crash_state_{FlashCrashState::Normal};
+
+    // [REVIVE2 2026-10-22] With strategy.revive_isolate_flash_crash, each
+    // revive_market pair runs its own state machine here and is left out
+    // of flash_crash_state_. Absent = Normal.
+    std::unordered_map<std::string, FlashCrashState> revive_crash_state_;
+
+    // [REVIVE2 2026-10-22] Each revive pair's own trading flows (booked
+    // in Step 2 from its fills, in memory, so they restart at zero), valued
+    // and sampled into a rolling 24h window in step_update_pnl, read in
+    // Step 4 against strategy.revive_daily_loss_budget_usd. Pairs currently
+    // over budget are kept in revive_over_budget_ so the transition logs
+    // once.
+    std::unordered_map<std::string, revive::PairFlows> revive_flows_;
+    revive::LossBudget revive_loss_budget_;
+    std::unordered_set<std::string> revive_over_budget_;
+
+    // [REVIVE2 2026-10-22] Set only for the duration of a Step 8 run made
+    // while the global flash-crash guard is engaged: step_manage_offers
+    // then manages ONLY these revive pairs and skips every cross-pair
+    // maintenance pass (expired-offer retire, UTXO liberation, pace caps,
+    // reconciliation), which the guard keeps off for everything else.
+    std::optional<std::unordered_set<std::string>> step8_pair_filter_;
 
     // XCH Recovery Mode -- entered when XCH spendable drops below threshold.
     // While active: offers cancelled, Steps 7-8 skipped, engine scans for

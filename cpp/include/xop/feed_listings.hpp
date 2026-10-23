@@ -11,6 +11,7 @@
 #pragma once
 
 #include <cctype>
+#include <limits>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -69,6 +70,41 @@ split_pair_legs(const std::string& pair_name) {
         return std::nullopt;
     }
     return std::make_pair(std::move(base), std::move(quote));
+}
+
+// [REVIVE2 2026-10-22] A pair's price (quote per base) from the external
+// feed alone: usd(base) / usd(quote), each leg through its listing.
+// nullopt unless BOTH legs are listed and both quoted prices are positive
+// and finite. `prices` maps CoinGecko id -> USD (Engine::coingecko_prices_,
+// a std::map; any map with find/end works).
+//
+// This is what gives a revive_market pair a CEX reference leg in Step 1
+// when it has no hardcoded one, so its published mid falls back to the
+// external price on an empty or one-sided book instead of going to 0.
+template <typename PriceMap>
+std::optional<double> listed_cross_price(const std::string& pair_name,
+                                         const PriceMap& prices) {
+    const auto legs = split_pair_legs(pair_name);
+    if (!legs) return std::nullopt;
+    const auto& table = feed_listings();
+    auto usd = [&](const std::string& leg) -> double {
+        const auto listing = table.find(leg);
+        if (listing == table.end() || !(listing->second.units_per_coin > 0.0)) {
+            return 0.0;
+        }
+        const auto quoted = prices.find(listing->second.id);
+        if (quoted == prices.end()) return 0.0;
+        const double v = quoted->second / listing->second.units_per_coin;
+        return (v > 0.0 && v < std::numeric_limits<double>::infinity()) ? v : 0.0;
+    };
+    const double base_usd  = usd(legs->first);
+    const double quote_usd = usd(legs->second);
+    if (!(base_usd > 0.0) || !(quote_usd > 0.0)) return std::nullopt;
+    const double px = base_usd / quote_usd;
+    if (!(px > 0.0) || !(px < std::numeric_limits<double>::infinity())) {
+        return std::nullopt;
+    }
+    return px;
 }
 
 }  // namespace xop

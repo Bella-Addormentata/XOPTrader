@@ -902,6 +902,91 @@ TEST(ConfigParserTest, XchCycleCommitFrac_ParsesDefaultsAndRejects) {
     }
 }
 
+TEST(ConfigParserTest, FlashCrashStaleHistory_ParsesDefaultsAndRejects) {
+    // [STALEHIST 2026-10-22] Injected into the existing risk: section, as
+    // FlashCrashWindow below explains.
+    const auto with_stale = [](const std::string& value) {
+        std::string yaml(kMinimalValidYaml);
+        const std::string anchor = "risk:\n";
+        const auto at = yaml.find(anchor);
+        EXPECT_NE(at, std::string::npos);
+        yaml.insert(at + anchor.size(),
+                    "  flash_crash_stale_history_blocks: " + value + "\n");
+        return yaml;
+    };
+    {
+        TempYaml tmp(kMinimalValidYaml);
+        auto cfg = xop::load_config(tmp.path());
+        EXPECT_EQ(cfg.risk.flash_crash_stale_history_blocks, 10u)
+            << "on by default, so existing configs get it on upgrade";
+    }
+    {
+        TempYaml tmp(with_stale("25"));
+        auto cfg = xop::load_config(tmp.path());
+        EXPECT_EQ(cfg.risk.flash_crash_stale_history_blocks, 25u);
+    }
+    {
+        TempYaml tmp(with_stale("0"));
+        auto cfg = xop::load_config(tmp.path());
+        EXPECT_EQ(cfg.risk.flash_crash_stale_history_blocks, 0u);
+    }
+    {
+        TempYaml tmp(with_stale("-1"));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+    }
+}
+
+TEST(ConfigParserTest, ReviveThinMarketKeys_ParseDefaultsAndReject) {
+    // [REVIVE2 2026-10-22] Injected into the existing strategy: section, as
+    // FlashCrashWindow below explains for risk:.
+    const auto with_strategy = [](const std::string& line) {
+        std::string yaml(kMinimalValidYaml);
+        const std::string anchor = "strategy:\n";
+        const auto at = yaml.find(anchor);
+        EXPECT_NE(at, std::string::npos);
+        yaml.insert(at + anchor.size(), "  " + line + "\n");
+        return yaml;
+    };
+    {
+        TempYaml tmp(kMinimalValidYaml);
+        auto cfg = xop::load_config(tmp.path());
+        EXPECT_DOUBLE_EQ(cfg.strategy.revive_min_half_spread_bps, 300.0);
+        EXPECT_DOUBLE_EQ(cfg.strategy.revive_max_offer_size_units, 1.0);
+        EXPECT_DOUBLE_EQ(cfg.strategy.revive_daily_loss_budget_usd, 10.0);
+        EXPECT_TRUE(cfg.strategy.revive_isolate_flash_crash);
+    }
+    {
+        TempYaml tmp(with_strategy("revive_min_half_spread_bps: 450"));
+        EXPECT_DOUBLE_EQ(
+            xop::load_config(tmp.path()).strategy.revive_min_half_spread_bps,
+            450.0);
+    }
+    {
+        TempYaml tmp(with_strategy("revive_max_offer_size_units: 0"));
+        EXPECT_DOUBLE_EQ(
+            xop::load_config(tmp.path()).strategy.revive_max_offer_size_units,
+            0.0);
+    }
+    {
+        TempYaml tmp(with_strategy("revive_daily_loss_budget_usd: 25.5"));
+        EXPECT_DOUBLE_EQ(
+            xop::load_config(tmp.path()).strategy.revive_daily_loss_budget_usd,
+            25.5);
+    }
+    {
+        TempYaml tmp(with_strategy("revive_isolate_flash_crash: false"));
+        EXPECT_FALSE(
+            xop::load_config(tmp.path()).strategy.revive_isolate_flash_crash);
+    }
+    for (const char* bad : {"revive_min_half_spread_bps: -1",
+                            "revive_max_offer_size_units: -0.5",
+                            "revive_daily_loss_budget_usd: .nan",
+                            "revive_daily_loss_budget_usd: .inf"}) {
+        TempYaml tmp(with_strategy(bad));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError) << bad;
+    }
+}
+
 TEST(ConfigParserTest, FlashCrashWindow_ParsesDefaultsAndRejects) {
     // kMinimalValidYaml already carries a risk: section, so the knob is
     // INJECTED into it rather than appended as a duplicate root key --
@@ -3895,5 +3980,63 @@ TEST(ConfigParserTest, OfferMinInputCoinFracOutsideTheRangeIsRejected) {
             with_strategy_keys(std::string("\n  offer_min_input_coin_frac: ")
                                + v),
             "offer_min_input_coin_frac");
+    }
+}
+
+// [REVIVE2 2026-10-22] Pace resizes its pairs' ladders after the revive
+// size cap, so one pair cannot have both.
+TEST(ConfigParserTest, ReviveAndPaceOnOnePairAreRefused) {
+    TempYaml tmp(pace_after_first_pair(pace_with_strategy(kPaceOn + kPaceTargets),
+                                       "    revive_market: true\n"));
+    try {
+        static_cast<void>(xop::load_config(tmp.path()));
+        FAIL() << "a pace-managed revive pair must be refused";
+    } catch (const xop::ConfigError& e) {
+        EXPECT_NE(std::string(e.what()).find("pace manages"), std::string::npos)
+            << e.what();
+    }
+}
+
+// [REVIVE2 2026-10-22] Batching merges a side's capped tiers into one
+// larger offer, so the revive size cap cannot hold with it.
+TEST(ConfigParserTest, ReviveSizeCapAndBatchingAreRefusedTogether) {
+    auto revive_yaml = [](const std::string& strategy_extra) {
+        std::string yaml(kMinimalValidYaml);
+        const std::string anchor =
+            "    name: \"XCH/TEST\"\n"
+            "    enabled: true\n";
+        auto pos = yaml.find(anchor);
+        EXPECT_NE(pos, std::string::npos);
+        yaml.insert(pos + anchor.size(), "    revive_market: true\n");
+        auto npos_ = yaml.find("name: \"XCH/TEST\"");
+        yaml.replace(npos_, std::string("name: \"XCH/TEST\"").size(),
+                     "name: \"XCH/wUSDC.b\"");
+        const std::string s_anchor = "strategy:\n";
+        const auto at = yaml.find(s_anchor);
+        EXPECT_NE(at, std::string::npos);
+        yaml.insert(at + s_anchor.size(), strategy_extra);
+        yaml += "\ncoingecko:\n  enabled: true\n"
+                "  coin_ids: [\"chia\", \"usd-coin\"]\n";
+        return yaml;
+    };
+    {
+        TempYaml tmp(revive_yaml("  batch_offers_enabled: true\n"));
+        try {
+            static_cast<void>(xop::load_config(tmp.path()));
+            FAIL() << "a capped revive pair with batching must be refused";
+        } catch (const xop::ConfigError& e) {
+            EXPECT_NE(std::string(e.what()).find("batch_offers_enabled"),
+                      std::string::npos) << e.what();
+        }
+    }
+    {
+        // With the cap off, batching cannot break it.
+        TempYaml tmp(revive_yaml("  batch_offers_enabled: true\n"
+                                 "  revive_max_offer_size_units: 0\n"));
+        EXPECT_NO_THROW(static_cast<void>(xop::load_config(tmp.path())));
+    }
+    {
+        TempYaml tmp(revive_yaml(""));
+        EXPECT_NO_THROW(static_cast<void>(xop::load_config(tmp.path())));
     }
 }

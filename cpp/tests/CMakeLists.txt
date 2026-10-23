@@ -92,6 +92,7 @@ add_executable(xop_tests
     test_mid_gate.cpp
     test_peg_registry.cpp
     test_peg_suspension.cpp
+    test_revive.cpp
     test_depeg_detector.cpp
     test_valuation_authority.cpp
     test_usd_route.cpp

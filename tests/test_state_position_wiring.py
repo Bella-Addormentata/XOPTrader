@@ -433,7 +433,9 @@ def test_an_unverified_pair_takes_down_what_it_quotes() -> None:
     body = _function_body(text, STEP8)
     drain = re.search(r"if\s*\(\s*\(\s*!\s*state_unverified_assets_\.empty\(\)\s*\|\|\s*"
                       r"!\s*state_verified_undrained_\.empty\(\)\s*\)\s*&&\s*offer_mgr_\s*&&\s*"
-                      r"!\s*dry_run_\s*&&\s*!\s*cancel_all_inflight_\s*\)\s*\{", body)
+                      r"!\s*dry_run_\s*&&\s*!\s*cancel_all_inflight_\s*"
+                      # [REVIVE2 2026-10-22] not in a revive-only Step 8 run
+                      r"&&\s*!\s*step8_pair_filter_\s*\)\s*\{", body)
     assert drain, "Step 8 has no drain"
     c1 = re.search(r'if\s*\(\s*!\s*wallet_step_may_run\("Step 8 \(offers\)"\)\s*\)\s*\{\s*co_return\s*;\s*\}',
                    body)

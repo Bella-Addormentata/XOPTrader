@@ -1159,6 +1159,30 @@ struct StrategyConfig {
     /// Tiers larger than this are capped down.  0 = no cap.  Default 5.0.
     double   max_offer_size_units{5.0};
 
+    // -- [REVIVE2 2026-10-22] revive_market pairs in thin markets ----------
+    // See xop/strategy/revive.hpp. All four apply only to pairs with
+    // PairConfig::revive_market set.
+
+    /// Minimum ladder half-spread, in bps around the centre, while a revive
+    /// pair's third-party book is thin (one-sided, empty, or possibly ours).
+    /// 0 = no extra floor. Default 300 (3%).
+    double   revive_min_half_spread_bps{300.0};
+
+    /// Largest tier, in base-asset units, while a revive pair's book is thin.
+    /// Never below the pair's minimum offer size. 0 = no cap. Default 1.0.
+    double   revive_max_offer_size_units{1.0};
+
+    /// A revive pair stops quoting once its total P&L (realized plus the
+    /// mark of its inventory) is more than this many USD below its peak in
+    /// the last 24 hours. 0 = no budget. Default 10.0.
+    double   revive_daily_loss_budget_usd{10.0};
+
+    /// When true a revive pair runs its own flash-crash state machine: its
+    /// own crash pauses only it, it does not trip or hold the global guard,
+    /// and it keeps posting while another pair holds the global guard.
+    /// false = the pre-2026-10-22 global behaviour. Default true.
+    bool     revive_isolate_flash_crash{true};
+
     /// When true, Step 7 caps the bid pool (avail_capital) at the quote-
     /// asset wallet's confirmed balance, and the ask pool (avail_inventory)
     /// at the base-asset wallet's confirmed balance, for CAT assets.  XCH
@@ -1766,6 +1790,12 @@ struct RiskConfig {
     uint32_t recovery_stable_blocks_phase1{50};     ///< Blocks stable for Crash→Recovery.
     uint32_t recovery_stable_blocks_phase2{100};    ///< Blocks stable for Recovery→Normal.
     double   recovery_stability_band_pct{0.05};     ///< Max price deviation in recovery.
+    /// [STALEHIST 2026-10-22] A pair whose newest price is more than this
+    /// many blocks old has stopped publishing a mid; the crash and recovery
+    /// checks leave it out, so its frozen history cannot hold every other
+    /// pair paused (PreTradeCheck::price_history_is_stale). 0 keeps every
+    /// pair in, the pre-2026-10-22 behaviour.
+    uint32_t flash_crash_stale_history_blocks{10};
 
     // -- Circuit-breaker rebalance (T7-09) -----------------------------------
     // Automatically enables StrategicLossManager for a pair when all of:

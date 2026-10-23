@@ -518,6 +518,10 @@ OfferManager::retire_expired_offers(BlockHeight current_block)
     std::vector<PendingOffer> due;
     for (const auto& po : state_->get_all_offers()) {
         if (po.cancel_pending) continue;   // a cancel is already in hand
+        if (retire_only_pairs_ != nullptr
+            && retire_only_pairs_->count(po.pair_name) == 0) {
+            continue;
+        }
         if (expiry_worth_checking(po.expiry_max_time,
                                   static_cast<std::int64_t>(host_now_s))) {
             due.push_back(po);
