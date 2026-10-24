@@ -16,8 +16,13 @@ with a JSON body.  Two wallets are supported here:
   in Sage's settings; then it listens on 127.0.0.1:9257 (``[rpc]`` in
   Sage's config.toml).  It accepts exactly one client certificate: the
   self-signed ``ssl/wallet.crt`` + ``wallet.key`` in Sage's data folder,
-  which is also its server certificate.  Errors come back as plain-text
-  bodies with HTTP 400/401/404/500.
+  which is also its server certificate.  So the probe pins the server to
+  that same certificate: while Sage's RPC is off, any local program could
+  bind 9257, and it must not pass for Sage.  Errors come back as
+  plain-text bodies with HTTP 400/401/404/500.
+
+Everything a server sends back is untrusted text.  Callers show the
+summaries in PlainText widgets only (see the Wallet Link page).
 
 This module only *detects* and *probes* (read-only calls).  Nothing here
 makes, takes or cancels offers.  Every function is blocking and returns
@@ -26,9 +31,11 @@ plain data, so callers run it off the GUI thread.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
+import ssl
 import sys
 import tomllib
 from dataclasses import dataclass, field
@@ -191,11 +198,11 @@ def detect_sage(data_dirs: Optional[list[Path]] = None) -> dict[str, Any]:
     return {"found": False}
 
 
-def expand_path(raw: str, env: Optional[dict[str, str]] = None) -> str:
-    """Resolve ``${VAR}``, ``${VAR:-default}`` and ``~`` in a config path.
+def expand_env(raw: str, env: Optional[dict[str, str]] = None) -> str:
+    """Resolve ``${VAR}`` and ``${VAR:-default}`` in a config string.
 
-    An unset ``${VAR}`` with no default is left as written, so the
-    "file not found" message shows the operator what did not resolve.
+    An unset ``${VAR}`` with no default is left as written, so an error
+    message shows the operator what did not resolve.
     """
     env = os.environ if env is None else env
 
@@ -206,7 +213,12 @@ def expand_path(raw: str, env: Optional[dict[str, str]] = None) -> str:
         default = match.group(2)
         return default if default is not None else match.group(0)
 
-    return str(Path(_ENV_REF_RE.sub(_sub, str(raw or ""))).expanduser())
+    return _ENV_REF_RE.sub(_sub, str(raw or "")).strip()
+
+
+def expand_path(raw: str, env: Optional[dict[str, str]] = None) -> str:
+    """:func:`expand_env`, then ``~``, for a config path."""
+    return str(Path(expand_env(raw, env)).expanduser())
 
 
 # ===================================================================
@@ -230,6 +242,43 @@ def _default_post() -> PostFn:
     return requests.post
 
 
+def cert_sha256(cert_path: str) -> str:
+    """SHA-256 (hex) of the DER form of the first certificate in a PEM file."""
+    text = Path(cert_path).read_text(encoding="ascii", errors="replace")
+    begin = text.find("-----BEGIN CERTIFICATE-----")
+    end_marker = "-----END CERTIFICATE-----"
+    end = text.find(end_marker, begin)
+    if begin < 0 or end < 0:
+        raise ValueError("no PEM certificate found")
+    der = ssl.PEM_cert_to_DER_cert(text[begin:end + len(end_marker)])
+    return hashlib.sha256(der).hexdigest()
+
+
+def _pinned_post(fingerprint: str) -> PostFn:
+    """A ``post`` that only talks to a server presenting *fingerprint*.
+
+    urllib3 checks ``assert_fingerprint`` against the peer certificate
+    even with ``verify=False``, which is what a self-signed server needs.
+    ``trust_env`` is off so an HTTPS_PROXY cannot route the call through a
+    proxy pool that would skip the check (Sage only binds 127.0.0.1).
+    """
+    import requests  # noqa: WPS433 -- GUI-only dependency
+    import urllib3  # noqa: WPS433
+    from requests.adapters import HTTPAdapter  # noqa: WPS433
+
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    class _PinnedAdapter(HTTPAdapter):
+        def init_poolmanager(self, *args: Any, **kwargs: Any) -> None:
+            kwargs["assert_fingerprint"] = fingerprint
+            super().init_poolmanager(*args, **kwargs)
+
+    session = requests.Session()
+    session.trust_env = False
+    session.mount("https://", _PinnedAdapter())
+    return session.post
+
+
 def _check_files(cert_path: str, key_path: str) -> Optional[str]:
     for label, raw in (("certificate", cert_path), ("key", key_path)):
         if not str(raw or "").strip():
@@ -251,12 +300,18 @@ def _call(
     verify: bool | str = False,
 ) -> dict[str, Any]:
     """POST one RPC call and return its JSON object, or raise _RpcError."""
+    host = expand_env(host)
     url = f"https://{host}:{port}/{endpoint}"
     try:
         resp = post(url, json=body, cert=cert, verify=verify,
                     timeout=timeout, allow_redirects=False)
     except Exception as exc:  # noqa: BLE001 -- classified below
         name = type(exc).__name__
+        if "Fingerprints did not match" in str(exc):
+            raise _RpcError(
+                f"The server on {host}:{port} is not the {wallet} wallet that "
+                "owns this certificate. Refusing to talk to it."
+            ) from exc
         if "SSL" in name:
             raise _RpcError(
                 f"{wallet} rejected the TLS handshake. The certificate and "
@@ -362,7 +417,12 @@ def probe_sage(
     problem = _check_files(cert_path, key_path)
     if problem:
         return ProbeResult(False, problem)
-    post = post or _default_post()
+    if post is None:
+        try:
+            post = _pinned_post(cert_sha256(expand_path(cert_path)))
+        except (OSError, ValueError) as exc:
+            return ProbeResult(
+                False, f"The certificate file is not a PEM certificate: {exc}")
     cert = (expand_path(cert_path), expand_path(key_path))
     try:
         version = _call(post, "Sage", host, port, cert,

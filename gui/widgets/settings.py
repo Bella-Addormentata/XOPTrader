@@ -1932,6 +1932,8 @@ class SettingsWidget(QWidget):
         )
         self._wl_test_result = QLabel("")
         self._wl_test_result.setWordWrap(True)
+        # Shows text the wallet's server sent back: never rich text.
+        self._wl_test_result.setTextFormat(Qt.TextFormat.PlainText)
         wl_test_row = QHBoxLayout()
         wl_test_row.addWidget(self._wl_detect_btn)
         wl_test_row.addWidget(self._wl_test_btn)
@@ -2002,6 +2004,8 @@ class SettingsWidget(QWidget):
         )
         self._sage_test_result = QLabel("")
         self._sage_test_result.setWordWrap(True)
+        # Shows text the wallet's server sent back: never rich text.
+        self._sage_test_result.setTextFormat(Qt.TextFormat.PlainText)
         sg_test_row = QHBoxLayout()
         sg_test_row.addWidget(self._sage_detect_btn)
         sg_test_row.addWidget(self._sage_test_btn)
@@ -5493,12 +5497,10 @@ class SettingsWidget(QWidget):
             msg = f"Found Chia in {found['root']}."
         self._set_link_status(w["label"], msg + " Save to keep it.", "ok")
 
-    def _start_wallet_probe(self, target: str) -> None:
-        """Run a read-only connection test for *target* on a worker thread."""
-        if target in self._probe_threads:
-            return
+    def _wallet_probe_params(self, target: str) -> dict[str, Any]:
+        """Keyword arguments for *target*'s probe, from the page as it stands."""
         w = self._wallet_link_widgets(target)
-        params = {
+        params: dict[str, Any] = {
             "host": w["host"].text().strip() or w["default_host"],
             "port": w["port"].value(),
             "cert_path": w["cert"].text().strip(),
@@ -5509,8 +5511,19 @@ class SettingsWidget(QWidget):
             # snapshot, and the probe must check the server the same way the
             # engine will.
             chia = (self._clean_snapshot or {}).get("chia") or {}
-            params["verify_ssl"] = bool(chia.get("verify_ssl", False))
+            # The engine verifies unless verify_ssl is explicitly false
+            # (config.hpp: verify_ssl{true}; omitted or null keeps it).
+            verify_ssl = chia.get("verify_ssl")
+            params["verify_ssl"] = True if verify_ssl is None else bool(verify_ssl)
             params["ca_cert_path"] = str(chia.get("ca_cert_path") or "")
+        return params
+
+    def _start_wallet_probe(self, target: str) -> None:
+        """Run a read-only connection test for *target* on a worker thread."""
+        if target in self._probe_threads:
+            return
+        w = self._wallet_link_widgets(target)
+        params = self._wallet_probe_params(target)
         self._set_link_status(
             w["label"], f"Connecting to {params['host']}:{params['port']}...",
             "busy",

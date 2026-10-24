@@ -456,3 +456,115 @@ def test_fingerprint_above_int32_round_trips(panel, cfg_path, monkeypatch):
     cfg_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
     panel.load_config(str(cfg_path))
     assert panel._collect_config_dict()["chia"]["wallet_fingerprint"] == 4_294_967_295
+
+
+@pytest.mark.parametrize(
+    "on_disk, expected",
+    [("absent", True), (None, True), (True, True), (False, False)],
+)
+def test_chia_probe_params_follow_engine_verify_default(
+        panel, cfg_path, on_disk, expected):
+    """The engine verifies unless verify_ssl is explicitly false."""
+    raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    if on_disk == "absent":
+        raw["chia"].pop("verify_ssl", None)
+    else:
+        raw["chia"]["verify_ssl"] = on_disk
+    cfg_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    panel.load_config(str(cfg_path))
+    params = panel._wallet_probe_params("chia")
+    assert params["verify_ssl"] is expected
+    assert "verify_ssl" not in panel._wallet_probe_params("sage")
+
+
+def test_probe_expands_env_ref_host(certs, monkeypatch):
+    monkeypatch.delenv("XOP_WALLET_HOST", raising=False)
+    calls: list = []
+    post = _fake_post({
+        "get_sync_status": _Resp({"synced": True}),
+        "get_logged_in_fingerprint": _Resp({"fingerprint": 1}),
+        "get_wallet_balance": _Resp({"wallet_balance": {}}),
+    }, calls)
+    wallet_link.probe_chia_wallet(
+        "${XOP_WALLET_HOST:-localhost}", 9256, *certs, post=post)
+    assert calls[0][0] == "https://localhost:9256/get_sync_status"
+
+
+# ===================================================================
+# Security review follow-ups (PR #188)
+# ===================================================================
+
+# Throwaway self-signed public certificate (no key), only to pin a hash.
+_TEST_CERT_PEM = """\
+-----BEGIN CERTIFICATE-----
+MIIBfTCCASOgAwIBAgIUDXjdYush+7r19Tbuwq5QfyEJUSEwCgYIKoZIzj0EAwIw
+EzERMA8GA1UEAwwIeG9wLXRlc3QwIBcNMjYxMDI0MjIwOTM2WhgPMjEyNjA5MzAy
+MjA5MzZaMBMxETAPBgNVBAMMCHhvcC10ZXN0MFkwEwYHKoZIzj0CAQYIKoZIzj0D
+AQcDQgAE1RTijQ6JzVDBpIXSoiXcaK5ZxprGnRCLxRfocjKBxSBPjvrMypoJexGc
+XuA21hwpCY8XhIka7OW7PIVcTVHSOaNTMFEwHQYDVR0OBBYEFAetd1QPd7J3ANGk
+45pjdclYyMHQMB8GA1UdIwQYMBaAFAetd1QPd7J3ANGk45pjdclYyMHQMA8GA1Ud
+EwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDSAAwRQIgL7pAsYpnKidcbwHHP/lieXu/
+rgbcW7/5VsM7U24H8zICIQCAb6TMO65lH+Lo3JlyX0nzfuMhcbUILXm7RqbABRMU
+hA==
+-----END CERTIFICATE-----
+"""
+# openssl x509 -in t.crt -outform DER | sha256sum
+_TEST_CERT_SHA256 = (
+    "67d59cdd05ace8ac2e07f1f1cf3615e281b214b5fbf562ffd8c6d44bc5de300d"
+)
+
+
+def test_cert_sha256_matches_openssl(tmp_path):
+    crt = tmp_path / "wallet.crt"
+    crt.write_text(_TEST_CERT_PEM)
+    assert wallet_link.cert_sha256(str(crt)) == _TEST_CERT_SHA256
+
+
+def test_sage_probe_without_pem_cert_never_connects(tmp_path, monkeypatch):
+    """Sage's server is pinned to wallet.crt; no pin, no request."""
+    crt = tmp_path / "wallet.crt"
+    key = tmp_path / "wallet.key"
+    crt.write_text("not a certificate")
+    key.write_text("k")
+    monkeypatch.setattr(wallet_link, "_pinned_post", lambda fp: (_ for _ in ()).throw(
+        AssertionError("must not build a session without a pin")))
+    result = wallet_link.probe_sage("127.0.0.1", 9257, str(crt), str(key))
+    assert result.ok is False and "not a PEM certificate" in result.summary
+
+
+def test_sage_probe_pins_wallet_crt(tmp_path, monkeypatch):
+    crt = tmp_path / "wallet.crt"
+    key = tmp_path / "wallet.key"
+    crt.write_text(_TEST_CERT_PEM)
+    key.write_text("k")
+    pins: list = []
+
+    def fake_pinned(fp):
+        pins.append(fp)
+        return _fake_post({"get_version": ConnectionError("refused")})
+
+    monkeypatch.setattr(wallet_link, "_pinned_post", fake_pinned)
+    wallet_link.probe_sage("127.0.0.1", 9257, str(crt), str(key))
+    assert pins == [_TEST_CERT_SHA256]
+
+
+def test_fingerprint_mismatch_is_reported(certs):
+    class SSLError(Exception):
+        pass
+
+    post = _fake_post({"get_version": SSLError(
+        "Fingerprints did not match. Expected \"ab\", got \"cd\"")})
+    result = wallet_link.probe_sage("127.0.0.1", 9257, *certs, post=post)
+    assert result.ok is False
+    assert "is not the Sage wallet that owns this certificate" in result.summary
+
+
+def test_status_labels_never_render_server_markup(panel):
+    """Server replies reach these labels: they must stay PlainText."""
+    from PySide6.QtCore import Qt
+
+    evil = 'Sage returned HTTP 500 on get_version: <img src="//host/s/x.png">'
+    for label in (panel._wl_test_result, panel._sage_test_result):
+        assert label.textFormat() == Qt.TextFormat.PlainText
+    panel._on_wallet_probe_done("sage", False, evil)
+    assert panel._sage_test_result.text() == evil
