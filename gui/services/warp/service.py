@@ -58,7 +58,7 @@ import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from PySide6.QtCore import (
     QMutex,
@@ -273,6 +273,30 @@ def _c_wei_per_milli_unit(net) -> int:
     is 1e12 wei -- the MilliETH wrapper's own granularity.
     """
     return 10 ** (18 - 3 - int(getattr(net, "milli_eth_decimals", 3)))
+
+
+def _millieth_topup_minimums(max_fee_per_gas: int,
+                             wei_per_unit: int) -> Tuple[int, int]:
+    """[review] The smallest automatic ETH top-up worth making at
+    *max_fee_per_gas*: ``(Base milliETH units to withdraw, wmilliETH.b mojos
+    to burn)``.
+
+    Each must deliver MORE wei than the gas it costs to turn into ETH, at
+    worst-case limits: held milliETH needs one ``withdraw()``; a burn's
+    POST-TIP proceeds also pay for the relay, counted as if self-relayed
+    (the job may switch to self-relay when gas arrives).
+    """
+    from gui.services.basewallet import _MILLIETH_GAS_DEFAULT
+
+    from .evm import _RELAY_GAS_DEFAULT
+
+    fee = max(0, int(max_fee_per_gas))
+    per = max(1, int(wei_per_unit))
+    units = (int(_MILLIETH_GAS_DEFAULT) * fee) // per + 1
+    post_tip = ((int(_MILLIETH_GAS_DEFAULT) + int(_RELAY_GAS_DEFAULT))
+                * fee) // per + 1
+    mojos = -(-post_tip * 10_000 // (10_000 - rb._UNWRAP_TIP_BPS))
+    return int(units), int(mojos)
 
 
 def _parse_millieth_unwrap_cap(warp: dict) -> int:
@@ -2367,10 +2391,27 @@ class WarpEngine:
             ), amount
         units = -(-short // _c_wei_per_milli_unit(net))
         grossed = -(-units * 10_000 // (10_000 - rb._UNWRAP_TIP_BPS))
-        if grossed < amount:
+        # [review] Never trimmed (or left) below the smallest burn worth
+        # making at the gas price NOW: a burn whose proceeds cannot pay for
+        # their own withdraw and relay would shrink the reserve. Nothing is
+        # committed yet, so cancelling frees the slot; the next consult
+        # re-plans from live balances.
+        _, floor_mojos = _millieth_topup_minimums(
+            int(self._evm.get_fee_data().max_fee_per_gas),
+            _c_wei_per_milli_unit(net))
+        size = min(max(grossed, floor_mojos), amount)
+        if size < floor_mojos:
+            return _advance(
+                JobStatus.CANCELLED,
+                message=(f"top-up unwrap not worth making now: {size} mojos "
+                         "would deliver less ETH than the withdraw and relay "
+                         f"gas cost at current Base fees (at least "
+                         f"{floor_mojos} needed)"),
+            ), amount
+        if size < amount:
             _log.info("top-up unwrap trimmed %d -> %d mojos (gas landed while "
-                      "the job waited)", amount, grossed)
-            return None, int(grossed)
+                      "the job waited)", amount, size)
+            return None, int(size)
         return None, amount
 
     def _h_unwrap_checks(self, job: WarpJob) -> _Step:
@@ -2837,7 +2878,7 @@ class WarpEngine:
             # operator and one less message in the network's stuck tail.
             if (
                 job.state.get("external_relay")
-                and self._evm.get_eth_balance(self._hot_address) < _MIN_GAS_WEI
+                and not self._can_self_relay(job)
             ):
                 return _advance(
                     JobStatus.AWAITING_EXTERNAL_RELAY,
@@ -3008,7 +3049,7 @@ class WarpEngine:
                 )
             raise  # transport or an unexpected revert: retryable per taxonomy
 
-        if self._evm.get_eth_balance(self._hot_address) >= _MIN_GAS_WEI:
+        if self._can_self_relay(job):
             return _advance(
                 JobStatus.RELAYING,
                 message="hot wallet now holds relay gas; switching to self-relay",
@@ -3018,6 +3059,31 @@ class WarpEngine:
             "relayer (or fund the hot wallet with ~0.0003 ETH on Base to "
             f"self-relay). Also claimable any time at {net.status_url}"
         )
+
+    def _can_self_relay(self, job: WarpJob) -> bool:
+        """[review] Whether an external-relay job should relay itself: the
+        hot wallet holds the relay-gas floor AND the relay's worst-case gas
+        at current fees -- plus, for an automatic ETH top-up, the milliETH
+        ``withdraw()`` that turns its proceeds into gas. Short of that a
+        self-relay would stall unfunded (or leave the proceeds stranded),
+        so the job keeps waiting for an altruistic relayer. Unknown fees
+        read as no."""
+        from gui.services.basewallet import _MILLIETH_GAS_DEFAULT
+
+        from .evm import _RELAY_GAS_DEFAULT
+
+        eth = int(self._evm.get_eth_balance(self._hot_address))
+        if eth < _MIN_GAS_WEI:
+            return False
+        try:
+            fee = int(self._evm.get_fee_data().max_fee_per_gas)
+        except Exception as exc:  # noqa: BLE001 -- fail closed: stay external
+            _log.debug("self-relay check: Base fees unknown (%s)", exc)
+            return False
+        gas = int(_RELAY_GAS_DEFAULT)
+        if job.state.get("rebalance_eth_target_wei"):
+            gas += int(_MILLIETH_GAS_DEFAULT)
+        return eth >= gas * fee
 
     def _external_delivery_hash(self, job: WarpJob) -> Optional[str]:
         """The watcher's destination tx hash -- display only, never the proof."""
@@ -4413,11 +4479,16 @@ class _WarpWorker(QObject):
             # Only once Base has no milliETH left to withdraw: that is the
             # planner's first, free source, and a Chia RPC failure must not
             # cost it its turn.
+            eth_low = p.eth is not None and eth_now < p.eth.low
+            # [review] The smallest withdraw and burn worth making at live
+            # gas; read only when the band is breached.
+            min_units, min_mojos = (
+                self._millieth_topup_floor(engine) if eth_low else (1, 1))
             chia_millieth, chia_millieth_held = (
                 self._chia_millieth_balances(engine)
-                if src is not None and src.enabled and p.eth is not None
-                and eth_now < p.eth.low
-                and int(hot.get("millieth_units") or 0) <= 0 else (0, 0)
+                if src is not None and src.enabled and eth_low
+                and int(hot.get("millieth_units") or 0) < min_units
+                else (0, 0)
             )
             action = rb.plan(
                 params=p,
@@ -4438,8 +4509,19 @@ class _WarpWorker(QObject):
                 chia_millieth_mojos=chia_millieth,
                 max_unwrap_millieth_mojos=int(
                     getattr(ep, "max_unwrap_millieth_mojos", -1)),
+                min_millieth_units=min_units,
+                min_wmillieth_mojos=min_mojos,
             )
             if action is None:
+                cap = int(getattr(ep, "max_unwrap_millieth_mojos", -1))
+                if (eth_low and src is not None and src.enabled
+                        and 0 < cap < min_mojos):
+                    self._rebalance_last = (
+                        f"rebalance waiting: warp.max_unwrap_millieth ({cap} "
+                        f"mojos) is below the {min_mojos} mojos a top-up must "
+                        "burn to deliver more ETH than its gas costs at "
+                        "current Base fees"
+                    )
                 return
             # Both USDC actions create a JOB whose gas gates would pend a
             # gasless wallet indefinitely -- squatting the single active
@@ -4547,7 +4629,8 @@ class _WarpWorker(QObject):
                     rebalance_eth_target_wei=p.eth.target if p.eth else 0,
                 )
             elif action.kind == "buy_wmillieth":
-                reason = self._dexie_buy(engine, action.amount, p.wmillieth)
+                reason = self._dexie_buy(engine, action.amount, p.wmillieth,
+                                         min_mojos=min_mojos)
             self._rebalance_last = reason
         except Exception as exc:  # noqa: BLE001 -- banner + cooldown, never a crash
             # Cooldown on ANY failure, including before the plan (e.g.
@@ -4590,6 +4673,17 @@ class _WarpWorker(QObject):
                 "wmilliETH.b balance reply is missing spendable or confirmed; "
                 "retrying")
         return max(0, int(spendable)), max(0, int(confirmed))
+
+    def _millieth_topup_floor(self, engine: "WarpEngine") -> Tuple[int, int]:
+        """:func:`_millieth_topup_minimums` at live Base fees. Unknown fees
+        give (1, 1): a Base withdraw then fails on its own gas check, and
+        :meth:`_can_withdraw_millieth` already blocks every Chia source."""
+        try:
+            fee = int(engine._evm.get_fee_data().max_fee_per_gas)
+        except Exception as exc:  # noqa: BLE001 -- the gates fail closed
+            _log.debug("rebalance: Base fees unknown (%s)", exc)
+            return 1, 1
+        return _millieth_topup_minimums(fee, _c_wei_per_milli_unit(engine._net))
 
     def _can_withdraw_millieth(self, engine: "WarpEngine", eth_wei: int) -> bool:
         """Whether *eth_wei* covers a milliETH ``withdraw()``'s worst-case gas
@@ -4688,7 +4782,7 @@ class _WarpWorker(QObject):
         return in_flight
 
     def _dexie_buy(self, engine: "WarpEngine", want_mojos: int,
-                   src: "rb.WmilliethSource") -> str:
+                   src: "rb.WmilliethSource", *, min_mojos: int = 1) -> str:
         """Take at most ONE Dexie ask for wmilliETH.b; the banner text.
 
         Every refusal raises (banner + cooldown); finding no eligible ask is
@@ -4720,7 +4814,9 @@ class _WarpWorker(QObject):
             max_premium_pct=src.max_premium_pct,
             max_spend_xch_mojos=max(
                 0, src.max_spend_xch_mojos - src.take_fee_mojos),
-            own_trade_ids=own)
+            own_trade_ids=own,
+            # [review] Never an ask too small to be worth unwrapping.
+            min_mojos=min_mojos)
         if ask is None:
             return (
                 f"rebalance: no Dexie wmilliETH.b ask within "

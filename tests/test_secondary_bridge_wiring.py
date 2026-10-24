@@ -108,6 +108,23 @@ def test_a_takes_legs_follow_each_assets_own_opening():
     assert takes.count("db_->insert_taker_fill(fill_row);") == 2
 
 
+def test_a_take_books_only_on_a_snapshot_this_read_validated():
+    """[review] A failed refresh leaves the earlier same-block cache entry
+    in place; that entry must not count as the post-take snapshot."""
+    takes = _body(_engine(), "asio::awaitable<void> Engine::step_ingest_topup_takes(")
+    assert "co_await fetch_bridge_balance(a, block_height, &validated);" in takes
+    assert "co_return validated;" in takes
+    assert "cached_wallet_balances_" not in takes
+
+
+def test_takes_are_gated_on_the_ledger_not_the_bridge_switch():
+    """[review] config.cpp may turn bridge ingest off while the GUI still
+    buys gas; the XCH leg must still book against the XCH opening."""
+    takes = _body(_engine(), "asio::awaitable<void> Engine::step_ingest_topup_takes(")
+    assert "bridge_ingest_enabled" not in takes
+    assert "if (!acc.ledger_enabled) co_return;" in takes
+
+
 def test_a_take_re_arms_without_resetting_the_risk_baselines():
     """A top-up take is a trade: the reconcile it re-arms corrects inventory
     but must not discard the drawdown peak or the loss window."""

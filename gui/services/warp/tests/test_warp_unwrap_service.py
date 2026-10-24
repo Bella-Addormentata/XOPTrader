@@ -42,6 +42,12 @@ class UnwrapFakeEvm(FakeEvm):
         self.domain_ok = True
         self.bridge_liquidity = 10 ** 12
         self.relay_receipts: dict = {}
+        # 1 gwei: a 250k-gas relay (2.5e14 wei) fits the 3e14 relay floor.
+        self.max_fee = 1_000_000_000
+
+    def get_fee_data(self):
+        return SimpleNamespace(max_fee_per_gas=self.max_fee,
+                               max_priority_fee_per_gas=1_000_000)
 
     def get_burn_puzzle_hash(self):
         return self.burn_ph

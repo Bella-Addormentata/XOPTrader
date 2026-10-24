@@ -165,14 +165,18 @@ def reference_xch_per_millieth(get_json: GetJson,
 def pick_ask(asks: Iterable[DexieAsk], *, want_mojos: int,
              reference_xch_per_unit: Decimal, max_premium_pct: float,
              max_spend_xch_mojos: int,
-             own_trade_ids: Iterable[str] = ()) -> Optional[DexieAsk]:
+             own_trade_ids: Iterable[str] = (),
+             min_mojos: int = 1) -> Optional[DexieAsk]:
     """The ask to take, or None.
 
-    Eligible: not ours, at most ``max_spend_xch_mojos``, and priced at most
-    ``max_premium_pct`` above the reference. Among those, the cheapest one
-    that covers *want_mojos*; failing that, the cheapest one at all -- a
-    partial top-up still buys gas, and the next consult can buy again.
+    Eligible: not ours, at most ``max_spend_xch_mojos``, priced at most
+    ``max_premium_pct`` above the reference, and offering at least
+    ``min_mojos`` (the smallest burn worth making at current gas). Among
+    those, the cheapest one that covers *want_mojos*; failing that, the
+    cheapest one at all -- a partial top-up still buys gas, and the next
+    consult can buy again.
     """
+    floor = max(1, int(min_mojos))
     if not (reference_xch_per_unit > 0) or want_mojos < 1:
         return None
     ceiling = reference_xch_per_unit * (
@@ -181,6 +185,7 @@ def pick_ask(asks: Iterable[DexieAsk], *, want_mojos: int,
     eligible = sorted(
         (a for a in asks
          if a.trade_id not in own
+         and a.cat_mojos >= floor
          and a.xch_mojos <= int(max_spend_xch_mojos)
          and a.xch_per_unit <= ceiling),
         key=lambda a: (a.xch_per_unit, a.xch_mojos))

@@ -167,6 +167,14 @@ def test_a_partial_top_up_beats_none():
     assert _pick(asks, want_mojos=900).trade_id == TID_A
 
 
+def test_an_ask_below_the_minimum_burn_is_never_taken():
+    """[review] An ask too small to be worth unwrapping is skipped, even as
+    the only one: its proceeds would not pay for their own gas."""
+    asks = D.parse_asks(BOOK, WM)
+    assert _pick(asks, min_mojos=547).trade_id == TID_A
+    assert _pick(asks, min_mojos=548) is None
+
+
 def test_nothing_without_a_reference_or_a_need():
     asks = D.parse_asks(BOOK, WM)
     assert _pick(asks, reference_xch_per_unit=Decimal(0)) is None

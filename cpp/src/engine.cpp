@@ -20720,8 +20720,10 @@ std::vector<accounting::BridgeJobRow> read_bridge_job_rows(
 // Moved out of step_ingest_bridge_flows unchanged when the secondary scan
 // needed the same read ([WARP-MILLIETH 2026-10-24]).
 asio::awaitable<bool> Engine::fetch_bridge_balance(const AssetId& asset,
-                                                   BlockHeight block_height)
+                                                   BlockHeight block_height,
+                                                   bool* validated)
 {
+    if (validated != nullptr) *validated = false;
     // The circuit is consulted last, so only when a fetch is actually
     // possible (see the round-34 note at the primary scan's call site).
     if (!offer_mgr_ || !wallet_ || !wallet_->is_open()
@@ -20754,6 +20756,7 @@ asio::awaitable<bool> Engine::fetch_bridge_balance(const AssetId& asset,
         e.as_of_block = block_height;
         e.fields_validated = true;  // presence checked above
         cached_wallet_balances_[asset] = e;
+        if (validated != nullptr) *validated = true;
         co_return e.pending_change == 0;
     } catch (const std::exception& ex) {
         spdlog::debug("[Engine] Bridge ingest: on-demand balance "
@@ -21570,8 +21573,13 @@ std::vector<accounting::TopupTakeRow> read_topup_take_rows(
 // time the books are tied to the wallet.
 asio::awaitable<void> Engine::step_ingest_topup_takes(BlockHeight block_height)
 {
+    // [review] Gated on the LEDGER, not the bridge switch: config.cpp turns
+    // bridge_ingest_enabled off when no enabled pair trades a bridge asset,
+    // yet the GUI still buys gas then, and the XCH it pays is real flow the
+    // XCH opening must see.  The per-asset opening checks below decide
+    // which legs can book.
     const auto& acc = config_.accounting;
-    if (!acc.ledger_enabled || !acc.bridge_ingest_enabled) co_return;
+    if (!acc.ledger_enabled) co_return;
     if (!db_ || acc.bridge_jobs_db_path.empty()) co_return;
     if (!ledger_genesis_done_ || ledger_incomplete_) co_return;
 
@@ -21588,13 +21596,14 @@ asio::awaitable<void> Engine::step_ingest_topup_takes(BlockHeight block_height)
     const auto fresh = [&](const AssetId& a) -> asio::awaitable<bool> {
         if (refreshed.count(a)) co_return true;
         if (!co_await secondary_wallet_synced(block_height)) co_return false;
-        (void)co_await fetch_bridge_balance(a, block_height);
-        const auto it = cached_wallet_balances_.find(a);
-        const bool ok = it != cached_wallet_balances_.end()
-            && it->second.as_of_block == block_height
-            && it->second.fields_validated;
-        if (ok) refreshed.insert(a);
-        co_return ok;
+        // [review] Whether THIS read produced a validated snapshot: a failed
+        // or incomplete read leaves an earlier same-block entry in place --
+        // possibly read before the take landed -- which must not pass as
+        // fresh.  Pending change is deliberately not part of the test.
+        bool validated = false;
+        (void)co_await fetch_bridge_balance(a, block_height, &validated);
+        if (validated) refreshed.insert(a);
+        co_return validated;
     };
 
     for (const auto& row : read_topup_take_rows(acc.bridge_jobs_db_path)) {

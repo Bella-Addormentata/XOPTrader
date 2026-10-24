@@ -379,7 +379,8 @@ def test_an_accepted_take_is_rekeyed_to_the_wallet_trade_id(monkeypatch):
 
 def test_the_chia_balance_is_not_read_while_base_has_millieth(monkeypatch):
     w, eng = _worker(_params()), FakeEngine()
-    eng._hot_cache["millieth_units"] = 5
+    # 50 units = 5e13 wei, above the 9e12-wei withdraw at 0.1 gwei.
+    eng._hot_cache["millieth_units"] = 50
     eng._cat_wallet_ids = None                    # would raise if consulted
     calls = []
 
@@ -389,7 +390,7 @@ def test_the_chia_balance_is_not_read_while_base_has_millieth(monkeypatch):
 
     w._base_wallet = _BaseWallet
     w._maybe_rebalance(eng)
-    assert calls == [5]
+    assert calls == [50]
 
 
 def test_the_live_test_proof_is_found_beyond_the_newest_jobs():
@@ -535,3 +536,46 @@ def test_an_unreadable_trade_record_raises():
         client = WalletClient({}, poster=lambda url, body, r=reply: r)
         with pytest.raises(WalletError):
             client.get_offer("aa" * 32)
+
+
+def test_the_minimums_cover_the_gas_of_turning_a_top_up_into_eth():
+    """[review] 0.1 gwei: a withdraw costs 9e12 wei (9 units), so 10 units;
+    a burn pays withdraw + relay (3.4e13 wei) from post-tip proceeds."""
+    assert S._millieth_topup_minimums(10 ** 8, 10 ** 12) == (10, 36)
+    units, mojos = S._millieth_topup_minimums(3 * 10 ** 9, 10 ** 12)
+    assert units * 10 ** 12 > 90_000 * 3 * 10 ** 9
+    assert (mojos * 9_970 // 10_000) * 10 ** 12 > 340_000 * 3 * 10 ** 9
+
+
+def test_held_millieth_below_the_minimum_is_not_withdrawn():
+    w, eng = _worker(_params()), FakeEngine(wm_spendable=5_000)
+    eng._hot_cache["millieth_units"] = 5          # 5e12 wei < 9e12 of gas
+    calls = []
+
+    class _BaseWallet:
+        def unwrap_millieth(self, units):
+            calls.append(units)
+
+    w._base_wallet = _BaseWallet
+    w._maybe_rebalance(eng)
+    assert calls == []
+    assert eng.calls and eng.calls[0][0] == "unwrap"   # Chia instead
+
+
+def test_a_cap_below_the_minimum_burns_nothing_and_says_why():
+    w, eng = _worker(_params()), FakeEngine(wm_spendable=5_000)
+    eng._params.max_unwrap_millieth_mojos = 1
+    w._maybe_rebalance(eng)
+    assert eng.calls == []
+    assert "max_unwrap_millieth (1 mojos)" in w._rebalance_last
+
+
+def test_a_dexie_buy_skips_asks_too_small_to_unwrap(monkeypatch):
+    _http(monkeypatch, asks=[{
+        "id": "dx1", "trade_id": MAKER_TID, "offer": "offer1qqexample",
+        "status": 0, "offered": [{"id": WM, "amount": 0.002}],
+        "requested": [{"id": "xch", "amount": 0.0067}]}])
+    w, eng = _worker(_params(buy=True)), FakeEngine()
+    w._maybe_rebalance(eng)
+    assert eng._wallet.taken == []
+    assert "nothing bought" in w._rebalance_last

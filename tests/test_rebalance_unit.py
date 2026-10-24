@@ -414,3 +414,27 @@ def test_a_huge_integer_limit_is_a_config_error_not_an_overflow():
             enabled=True, eth={"target": 0.01, "tolerance_pct": 20},
             wmillieth={"enabled": True, "max_spend_xch": 10 ** 400}),
             min_gas_wei=MIN_GAS)
+
+
+def test_no_withdraw_or_burn_smaller_than_its_gas():
+    """[review] A top-up below the economic minimum would cost more ETH
+    than it delivers: it waits (the balance accumulates) instead."""
+    short = dict(params=_wm_params(buy_on_dexie=True), eth_wei=10 ** 15,
+                 max_unwrap_millieth_mojos=0, min_millieth_units=10,
+                 min_wmillieth_mojos=36)
+    # 5 units held on Base, 10 needed: skipped for the Chia source.
+    a = _plan(**short, millieth_units=5, chia_millieth_mojos=50_000)
+    assert a.kind == "unwrap_wmillieth"
+    # 20 mojos on Chia, 36 needed: bought up to the deficit instead.
+    a = _plan(**short, chia_millieth_mojos=20)
+    assert (a.kind, a.amount) == ("buy_wmillieth", 9_028)
+    # A cap below the minimum: nothing burnt or bought at all.
+    assert _plan(**{**short, "max_unwrap_millieth_mojos": 1},
+                 chia_millieth_mojos=50_000) is None
+
+
+def test_a_tiny_deficit_still_moves_at_least_the_minimum():
+    a = _plan(params=_wm_params(), eth_wei=7_999_999_999_999_999,
+              max_unwrap_millieth_mojos=0, chia_millieth_mojos=50_000,
+              min_wmillieth_mojos=4_000)
+    assert (a.kind, a.amount) == ("unwrap_wmillieth", 4_000)

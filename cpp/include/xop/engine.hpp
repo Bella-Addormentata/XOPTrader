@@ -1857,8 +1857,12 @@ private:
     /// settled snapshot that postdates every job the caller has read.
     /// False (and no cache write) when the wallet is closed, its circuit
     /// refuses, the asset has no wallet, or the reply is incomplete.
+    /// @p validated, when given, says whether THIS call cached a validated
+    /// snapshot -- independent of pending change, and never true from an
+    /// earlier same-block entry a failed call left in place.
     asio::awaitable<bool> fetch_bridge_balance(const AssetId& asset,
-                                               BlockHeight block_height);
+                                               BlockHeight block_height,
+                                               bool* validated = nullptr);
 
     /// [WARP-MILLIETH review] Whether the wallet is known synced for the
     /// secondary scan's balance reads: Step 8 passed its sync gate in this

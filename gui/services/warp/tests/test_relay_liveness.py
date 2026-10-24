@@ -717,3 +717,70 @@ def test_build_engine_wires_the_relayer_and_key_fallback(tmp_path, monkeypatch):
     assert engine3 is not None
     assert engine3._relayer is None and engine3._relay_key is None
     engine3.close()
+
+
+# --------------------------------------------------------------------------- #
+# [review] Self-relay only when the wallet can pay for it.
+# --------------------------------------------------------------------------- #
+
+def test_an_external_job_stays_external_when_the_relay_costs_more():
+    """0.0004 ETH clears the 0.0003 floor, but a 250k-gas relay at 3 gwei
+    needs 0.00075: self-relaying would stall unfunded."""
+    store = new_store()
+    engine, ctx = _build_unwrap(store, collector=CompleteEcdsaCollector())
+    _seed_collecting(store, external=True)
+    ctx.evm.eth, ctx.evm.max_fee = 4 * 10 ** 14, 3 * 10 ** 9
+    assert engine.step()["status"] == JobStatus.AWAITING_EXTERNAL_RELAY
+
+    store2 = new_store()
+    engine2, ctx2 = _build_unwrap(store2)
+    _seed_awaiting(store2)
+    ctx2.evm.eth, ctx2.evm.max_fee = 4 * 10 ** 14, 3 * 10 ** 9
+    assert engine2.step()["status"] == JobStatus.AWAITING_EXTERNAL_RELAY
+
+
+def test_an_automatic_top_up_also_keeps_gas_for_its_withdraw():
+    """At 1 gwei the relay alone (2.5e14) fits 3e14 wei; relay + withdraw
+    (3.4e14) does not, so the top-up stays external."""
+    for target, want in ((10 ** 16, JobStatus.AWAITING_EXTERNAL_RELAY),
+                         (None, JobStatus.RELAYING)):
+        store = new_store()
+        engine, ctx = _build_unwrap(store)
+        seed(store, JobStatus.AWAITING_EXTERNAL_RELAY,
+             columns={"amount_mojos": AMOUNT, "bridge_nonce": "cd" * 32},
+             state={"receiver_evm": "ab" * 20, "relay_sigs": "00" * 390,
+                    "relay_threshold": 6, "external_relay": True,
+                    **({"rebalance_eth_target_wei": target} if target else {})})
+        ctx.evm.eth = S._MIN_GAS_WEI
+        assert engine.step()["status"] == want
+
+
+def test_unknown_fees_keep_an_external_job_external():
+    store = new_store()
+    engine, ctx = _build_unwrap(store)
+    _seed_awaiting(store)
+
+    def down():
+        raise RuntimeError("rpc down")
+
+    ctx.evm.get_fee_data = down
+    assert engine.step()["status"] == JobStatus.AWAITING_EXTERNAL_RELAY
+
+
+def test_the_top_up_trim_never_leaves_an_uneconomic_burn():
+    """[review] The gate re-derives the size; it never trims below the
+    smallest worthwhile burn, and cancels one that was planned below it."""
+    store = new_store()
+    engine, ctx = _build_unwrap(store)
+    ctx.evm.get_erc20_balance = lambda token, owner: 0     # no milliETH held
+    ctx.evm.max_fee = 3 * 10 ** 9
+    _, floor = S._millieth_topup_minimums(3 * 10 ** 9, 10 ** 12)
+    job = _seed_awaiting(store)
+    target = 10 ** 16
+    # Nearly at target: the live need is ~101 mojos, kept at the floor.
+    ctx.evm.eth = target - 100 * 10 ** 12
+    step, size = engine._rebalance_millieth_trim(job, 5_000, target)
+    assert step is None and size == floor
+    # Planned below the floor (cheaper gas then): cancelled, nothing burnt.
+    step, _ = engine._rebalance_millieth_trim(job, floor - 1, target)
+    assert step is not None and step.next_status == JobStatus.CANCELLED
