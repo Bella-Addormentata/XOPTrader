@@ -100,6 +100,8 @@ def test_a_takes_legs_follow_each_assets_own_opening():
     assert 'if (book_cat) add("base"' in takes
     xch = takes.index("if (book_xch) {")
     assert 'add("quote"' in takes[xch:xch + 200] and 'add("fee"' in takes[xch:xch + 200]
+    # No enabled market is needed: the legs book whatever the engine quotes.
+    assert "pc.enabled" not in takes
     # A buy the openings already hold still gets its history row.
     none = takes.index("if (!book_cat && !book_xch) {")
     assert "db_->insert_taker_fill(fill_row);" in takes[none:none + 200]

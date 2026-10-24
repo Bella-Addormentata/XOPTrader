@@ -288,7 +288,16 @@ def _parse_millieth_unwrap_cap(warp: dict) -> int:
     if str(raw).strip().lower() == "unlimited":
         return 0
     value = _parse_usdc_config_value("max_unwrap_millieth", raw)
-    mojos = int(round(value * 1000))
+    # FLOORED to whole mojos, from the exact text: a cap must never round UP
+    # into a burn larger than the operator stated (2.0005 -> 2,000 mojos, and
+    # 0.0006 is below one mojo, so it is refused, not read as 0.001).
+    from decimal import ROUND_FLOOR, Decimal, InvalidOperation
+
+    try:
+        mojos = int((Decimal(str(raw).strip()) * 1000).to_integral_value(
+            rounding=ROUND_FLOOR))
+    except (InvalidOperation, ValueError):
+        mojos = int(value * 1000)
     if value <= 0 or mojos <= 0:
         raise WarpError(
             f"warp.max_unwrap_millieth must be positive (got {raw!r}); use "

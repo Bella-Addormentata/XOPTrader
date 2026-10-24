@@ -21521,7 +21521,8 @@ std::vector<accounting::TopupTakeRow> read_topup_take_rows(
     sqlite3_busy_timeout(raw_db, 250);
     static constexpr const char* kSql = R"SQL(
         SELECT id, trade_id, asset_id, cat_mojos, xch_mojos, fee_mojos,
-               COALESCE(created_at, ''), COALESCE(confirmed_height, 0)
+               COALESCE(created_at, ''), COALESCE(confirmed_height, 0),
+               COALESCE(confirmed_at, '')
         FROM dexie_takes
         WHERE status = 'confirmed'
         ORDER BY id;
@@ -21550,6 +21551,7 @@ std::vector<accounting::TopupTakeRow> read_topup_take_rows(
         r.created_at = text(6);
         const std::int64_t h = sqlite3_column_int64(stmt, 7);
         r.confirmed_height = h > 0 ? static_cast<std::uint64_t>(h) : 0;
+        r.confirmed_at = text(8);
         rows.push_back(std::move(r));
     }
     if (rc != SQLITE_DONE) {
@@ -21609,20 +21611,16 @@ asio::awaitable<void> Engine::step_ingest_topup_takes(BlockHeight block_height)
         }
         if (topup_booked_ids_.count(legs.event_id)) continue;
 
-        // The pair it traded, for the taker_fills row: a wmilliETH.b/XCH
-        // style pair, enabled.  None means no opening either.
-        const PairConfig* pair = nullptr;
+        // [review] The market's identity for the history row: the
+        // configured CAT/XCH pair's name, enabled or not, else a stable
+        // "<asset-id prefix>/xch".  The legs do not depend on it -- the GUI
+        // buys gas whether or not the engine is quoting that market.
+        std::string market = row.asset_id.substr(0, 12) + "/xch";
         for (const auto& pc : config_.pairs) {
-            if (pc.enabled && pc.base_asset_id == row.asset_id
-                && pc.quote_asset_id == "xch") {
-                pair = &pc;
+            if (pc.base_asset_id == row.asset_id && pc.quote_asset_id == "xch") {
+                market = pc.name;
                 break;
             }
-        }
-        if (pair == nullptr) {
-            skip_once("bought " + row.asset_id.substr(0, 12)
-                      + ", which no enabled CAT/XCH pair trades");
-            continue;
         }
 
         // Per asset (openings are established independently): a leg books
@@ -21636,12 +21634,7 @@ asio::awaitable<void> Engine::step_ingest_topup_takes(BlockHeight block_height)
             if (!ledger_opened_assets_.count(a)) return false;
             const std::string opened = db_->ledger_opening_time(a);
             if (opened.empty()) return false;
-            // [review] By confirmation block when the GUI recorded one: an
-            // opening observed after the submit but before the trade landed
-            // still holds the pre-take balance.
-            return accounting::take_leg_after_opening(
-                row.confirmed_height, row.created_at,
-                db_->ledger_opening_block(a), opened);
+            return accounting::take_leg_after_opening(row.created_at, opened);
         };
         const bool book_cat = books(AssetId{row.asset_id});
         const bool book_xch = books(AssetId{"xch"});
@@ -21654,12 +21647,20 @@ asio::awaitable<void> Engine::step_ingest_topup_takes(BlockHeight block_height)
         // checked non-negative): no uint64 narrowing here.
         const std::string ts =
             PnLTracker::timestamp_to_iso(std::chrono::system_clock::now());
+        // [review] When it happened, not when it was ingested: pace
+        // accounting filters taker_fills by block, and an import after
+        // downtime must not land old buys inside the current horizon.
         DbTakerFill fill_row;
-        fill_row.taken_at              = ts;
-        fill_row.block_height          = block_height;
+        fill_row.taken_at              = !row.confirmed_at.empty()
+                                             ? row.confirmed_at
+                                             : row.created_at;
+        fill_row.block_height          = row.confirmed_height > 0
+                                             ? static_cast<BlockHeight>(
+                                                   row.confirmed_height)
+                                             : block_height;
         fill_row.strategy              = "warp_topup";
         fill_row.trade_id              = row.trade_id;
-        fill_row.pair_name             = pair->name;
+        fill_row.pair_name             = market;
         fill_row.we_bought_base        = true;
         fill_row.base_asset            = AssetId{row.asset_id};
         fill_row.base_delta_mojos      = legs.base_delta;
@@ -21693,7 +21694,7 @@ asio::awaitable<void> Engine::step_ingest_topup_takes(BlockHeight block_height)
             e.leg          = leg;
             e.asset_id     = asset;
             e.delta_mojos  = delta;
-            e.pair_name    = pair->name;
+            e.pair_name    = market;
             e.block_height = block_height;
             e.note         = "warp_topup";
             entries.push_back(std::move(e));
@@ -21731,7 +21732,7 @@ asio::awaitable<void> Engine::step_ingest_topup_takes(BlockHeight block_height)
         spdlog::info("[Engine] Top-up take {}: bought {} mojos of {} for {} "
                      "XCH mojos (+{} fee) on {}, booked at block {}",
                      row.id, legs.base_delta, row.asset_id.substr(0, 12),
-                     -legs.quote_delta, row.fee_mojos, pair->name,
+                     -legs.quote_delta, row.fee_mojos, market,
                      block_height);
     }
 }

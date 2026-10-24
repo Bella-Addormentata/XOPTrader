@@ -78,26 +78,16 @@ TEST(TopupTakeTest, ThePriceRoundsWithoutOverflowNearTheLimit) {
               scaled / 2'000 + ((scaled % 2'000) * 2 >= 2'000 ? 1 : 0));
 }
 
-TEST(TopupTakeTest, ALegIsJudgedByTheConfirmationBlockWhenKnown) {
-    // Submitted 12:00, opening observed 12:01 at block 500, trade landed in
-    // block 502: the opening holds the PRE-take balance, so the leg books.
-    EXPECT_TRUE(take_leg_after_opening(502, "2026-10-24T12:00:00+00:00",
-                                       500, "2026-10-24T12:01:00Z"));
-    // Landed in 499 (before the opening read): already inside it.
-    EXPECT_FALSE(take_leg_after_opening(499, "2026-10-24T12:00:00+00:00",
-                                        500, "2026-10-24T12:01:00Z"));
-    // A tie is treated as inside, the safe direction.
-    EXPECT_FALSE(take_leg_after_opening(500, "2026-10-24T12:00:00+00:00",
-                                        500, "2026-10-24T11:00:00Z"));
-}
-
-TEST(TopupTakeTest, WithoutABlockTheSubmitTimeDecides) {
-    EXPECT_TRUE(take_leg_after_opening(0, "2026-10-24T12:00:00+00:00",
-                                       500, "2026-10-24T11:00:00Z"));
-    EXPECT_FALSE(take_leg_after_opening(0, "2026-10-24T12:00:00+00:00",
-                                        500, "2026-10-24T12:00:00Z"));
-    EXPECT_FALSE(take_leg_after_opening(502, "2026-10-24T12:00:00+00:00",
-                                        0, "2026-10-24T12:01:00Z"));
+TEST(TopupTakeTest, ALegBooksOnlyAfterAnOpeningObservedBeforeTheSubmit) {
+    EXPECT_TRUE(take_leg_after_opening("2026-10-24T12:00:00+00:00",
+                                       "2026-10-24T11:00:00Z"));
+    // A tie, or an opening observed after the submit (the take may already
+    // be inside it): skipped -- under-booking is the safe direction.
+    EXPECT_FALSE(take_leg_after_opening("2026-10-24T12:00:00+00:00",
+                                        "2026-10-24T12:00:00Z"));
+    EXPECT_FALSE(take_leg_after_opening("2026-10-24T12:00:00+00:00",
+                                        "2026-10-24T12:01:00Z"));
+    EXPECT_FALSE(take_leg_after_opening("", "2026-10-24T11:00:00Z"));
 }
 
 TEST(TopupTakeTest, OverflowingAmountsBookNothing) {

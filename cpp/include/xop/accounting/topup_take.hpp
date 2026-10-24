@@ -43,23 +43,23 @@ struct TopupTakeRow {
     Mojo         fee_mojos{0}; ///< Our network fee.
     std::string  created_at;   ///< ISO-8601 UTC: when the take was submitted.
     /// Chain block the trade confirmed in (the wallet's confirmed_at_index),
-    /// 0 when the GUI did not record one.
+    /// 0 when the GUI did not record one.  History only (taker_fills).
     std::uint64_t confirmed_height{0};
+    std::string   confirmed_at; ///< When the GUI saw it confirm; "" if not.
 };
 
 /// Whether a take's leg belongs AFTER an asset's ledger opening -- i.e. the
-/// opening did not already read the post-take balance.  By block when both
-/// are known: the wallet changes at the confirmation block, so an opening
-/// read at a strictly earlier block holds the pre-take balance (a tie is
-/// treated as already inside, the safe direction).  Otherwise by time,
-/// against the SUBMIT time, the bridge flows' lower-bound rule (ties skip).
+/// opening did not already read the post-take balance.  By TIME, against
+/// the SUBMIT time, the bridge flows' lower-bound rule: the opening's stamp
+/// is its balance OBSERVATION time, while no height is tied to that
+/// observation (the opening row's block is the startup block, taken before
+/// the reads), so a block comparison could double-count a take that landed
+/// in between.  An opening observed after the submit -- the trade may or
+/// may not be inside it -- skips that leg: under-booking degrades to the
+/// divergence control's adjustment, double-booking would never heal.
 [[nodiscard]] inline bool take_leg_after_opening(
-    std::uint64_t confirmed_height, const std::string& created_at,
-    std::uint64_t opening_block, const std::string& opening_time) noexcept
+    const std::string& created_at, const std::string& opening_time) noexcept
 {
-    if (confirmed_height > 0 && opening_block > 0) {
-        return opening_block < confirmed_height;
-    }
     return iso_strictly_after(created_at, opening_time);
 }
 

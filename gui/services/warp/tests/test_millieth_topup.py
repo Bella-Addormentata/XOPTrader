@@ -488,3 +488,16 @@ def test_the_take_fee_counts_against_max_xch_per_buy(monkeypatch):
     w._maybe_rebalance(eng)
     assert eng._wallet.taken == []
     assert "nothing bought" in w._rebalance_last
+
+
+@pytest.mark.parametrize("raw,mojos", [
+    ("2.0005", 2_000), (2.0005, 2_000), ("2", 2_000), (0.0019, 1),
+])
+def test_the_unwrap_cap_floors_to_whole_mojos(raw, mojos):
+    """[review] A cap never rounds UP into a larger burn than stated."""
+    assert S._parse_millieth_unwrap_cap({"max_unwrap_millieth": raw}) == mojos
+
+
+def test_a_cap_below_one_mojo_is_refused():
+    with pytest.raises(S.WarpError):
+        S._parse_millieth_unwrap_cap({"max_unwrap_millieth": 0.0006})
