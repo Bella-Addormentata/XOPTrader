@@ -21638,7 +21638,31 @@ asio::awaitable<void> Engine::step_ingest_topup_takes(BlockHeight block_height)
         };
         const bool book_cat = books(AssetId{row.asset_id});
         const bool book_xch = books(AssetId{"xch"});
+
+        // The history row stands whatever the legs do -- the trade happened
+        // even when the openings already hold both sides -- and is replayed
+        // EVERY time (INSERT OR IGNORE on the trade id): a crash between the
+        // ledger commit and this insert would otherwise lose it for good.
+        // The fee is already a Mojo (a signed SQLite column the classifier
+        // checked non-negative): no uint64 narrowing here.
+        const std::string ts =
+            PnLTracker::timestamp_to_iso(std::chrono::system_clock::now());
+        DbTakerFill fill_row;
+        fill_row.taken_at              = ts;
+        fill_row.block_height          = block_height;
+        fill_row.strategy              = "warp_topup";
+        fill_row.trade_id              = row.trade_id;
+        fill_row.pair_name             = pair->name;
+        fill_row.we_bought_base        = true;
+        fill_row.base_asset            = AssetId{row.asset_id};
+        fill_row.base_delta_mojos      = legs.base_delta;
+        fill_row.quote_asset           = AssetId{"xch"};
+        fill_row.quote_delta_mojos     = legs.quote_delta;
+        fill_row.price_mojos           = legs.price_mojos;
+        fill_row.fee_mojos             = row.fee_mojos;
+
         if (!book_cat && !book_xch) {
+            db_->insert_taker_fill(fill_row);
             topup_booked_ids_.insert(legs.event_id);   // nothing to post
             continue;
         }
@@ -21651,8 +21675,6 @@ asio::awaitable<void> Engine::step_ingest_topup_takes(BlockHeight block_height)
             break;
         }
 
-        const std::string ts =
-            PnLTracker::timestamp_to_iso(std::chrono::system_clock::now());
         std::vector<DbLedgerEntry> entries;
         const auto add = [&](const char* leg, const AssetId& asset,
                              Mojo delta) {
@@ -21681,24 +21703,6 @@ asio::awaitable<void> Engine::step_ingest_topup_takes(BlockHeight block_height)
             break;
         }
 
-        // The history row, replayed EVERY time (INSERT OR IGNORE on the
-        // trade id): a crash between the ledger commit and this insert would
-        // otherwise lose it for good, since the ledger dedupe skips the take
-        // from then on.  The fee is already a Mojo (a signed SQLite column
-        // the classifier checked non-negative): no uint64 narrowing here.
-        DbTakerFill fill_row;
-        fill_row.taken_at              = ts;
-        fill_row.block_height          = block_height;
-        fill_row.strategy              = "warp_topup";
-        fill_row.trade_id              = row.trade_id;
-        fill_row.pair_name             = pair->name;
-        fill_row.we_bought_base        = true;
-        fill_row.base_asset            = AssetId{row.asset_id};
-        fill_row.base_delta_mojos      = legs.base_delta;
-        fill_row.quote_asset           = AssetId{"xch"};
-        fill_row.quote_delta_mojos     = legs.quote_delta;
-        fill_row.price_mojos           = legs.price_mojos;
-        fill_row.fee_mojos             = row.fee_mojos;
         db_->insert_taker_fill(fill_row);
         topup_booked_ids_.insert(legs.event_id);
         if (*inserted == 0) continue;   // booked before this process
