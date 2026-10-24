@@ -784,3 +784,31 @@ def test_the_top_up_trim_never_leaves_an_uneconomic_burn():
     # Planned below the floor (cheaper gas then): cancelled, nothing burnt.
     step, _ = engine._rebalance_millieth_trim(job, floor - 1, target)
     assert step is not None and step.next_status == JobStatus.CANCELLED
+
+
+
+def test_the_trim_credits_only_milliETH_the_planner_would_withdraw():
+    """[review] 30 gwei: a withdraw needs 2,701 units, so 2,500 held units
+    do not count -- crediting them would cancel this burn while ETH sits
+    below its band."""
+    store = new_store()
+    engine, ctx = _build_unwrap(store)
+    ctx.evm.max_fee = 30 * 10 ** 9
+    ctx.evm.eth = 79 * 10 ** 14                                # 0.0079 ETH
+    ctx.evm.get_erc20_balance = lambda token, owner: 2_500
+    job = _seed_awaiting(store)
+    step, size = engine._rebalance_millieth_trim(job, 20_000, 10 ** 16)
+    assert step is None and size > 0
+
+
+def test_the_gate_cancels_a_top_up_whose_withdraw_is_no_longer_affordable():
+    """[review] Queued at 0.1 gwei with 1e14 wei; at 3 gwei a withdraw
+    needs 2.7e14, so the burn must not happen."""
+    store = new_store()
+    engine, ctx = _build_unwrap(store)
+    ctx.evm.max_fee = 3 * 10 ** 9
+    ctx.evm.eth = 10 ** 14
+    ctx.evm.get_erc20_balance = lambda token, owner: 0
+    job = _seed_awaiting(store)
+    step, _ = engine._rebalance_millieth_trim(job, 5_000, 10 ** 16)
+    assert step is not None and step.next_status == JobStatus.CANCELLED

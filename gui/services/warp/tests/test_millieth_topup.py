@@ -610,3 +610,28 @@ def test_unknown_fees_stop_the_top_up_rather_than_guess_its_size():
     assert calls == [] and eng.calls == []
     assert "Base fees unknown" in w._rebalance_last
     assert w._rebalance_next_ok > 0                  # retried after cooldown
+
+
+def test_settlement_logs_in_first_and_a_failed_login_defers_it():
+    """[review] A logged-out daemon or another active key must not age a
+    real trade toward the failed timeout."""
+    w, eng = _worker(_params()), FakeEngine()
+    eng._store.record_take(trade_id=OUR_TID, offer_id=MAKER_TID, asset_id=WM,
+                           cat_mojos=547, xch_mojos=10, fee_mojos=0,
+                           status=J.TAKE_SUBMITTED)
+    order = []
+    eng._wallet.log_in = lambda: order.append("log_in") or {}
+    real = eng._wallet.get_offer
+    eng._wallet.get_offer = lambda tid: order.append("get_offer") or real(tid)
+    w._settle_dexie_takes(eng)
+    assert order == ["log_in", "get_offer"]
+
+    def refused():
+        raise RuntimeError("daemon logged out")
+
+    eng._wallet.log_in = refused
+    order.clear()
+    with pytest.raises(RuntimeError):
+        w._settle_dexie_takes(eng)
+    assert order == []
+    assert eng._store.get_take(OUR_TID).status == J.TAKE_SUBMITTED

@@ -299,6 +299,14 @@ def _millieth_topup_minimums(max_fee_per_gas: int,
     return int(units), int(mojos)
 
 
+def _top_up_withdraw_short(eth_wei: int, max_fee_per_gas: int) -> bool:
+    """Whether *eth_wei* falls short of a milliETH ``withdraw()``'s
+    worst-case gas at *max_fee_per_gas* (BaseWallet.unwrap_millieth's bound)."""
+    from gui.services.basewallet import _MILLIETH_GAS_DEFAULT
+
+    return int(eth_wei) < int(_MILLIETH_GAS_DEFAULT) * max(0, int(max_fee_per_gas))
+
+
 def _parse_millieth_unwrap_cap(warp: dict) -> int:
     """warp.max_unwrap_millieth (wmilliETH.b units) -> mojos; -1 if never set.
 
@@ -2382,10 +2390,29 @@ class WarpEngine:
         is grossed up the same way the planner does it.
         """
         net = self._net
+        wpu = _c_wei_per_milli_unit(net)
+        # [review] ONE live fee read for every check below.
+        fee = int(self._evm.get_fee_data().max_fee_per_gas)
+        min_units, floor_mojos = _millieth_topup_minimums(fee, wpu)
         eth = int(self._evm.get_eth_balance(self._hot_address))
+        # [review] The proceeds land as milliETH, and turning them into gas
+        # is a withdraw() this wallet pays for (external relay covers only
+        # the delivery). Fees rise between queueing and the gate: below that
+        # cost now, cancel before anything is committed.
+        if _top_up_withdraw_short(eth, fee):
+            return _advance(
+                JobStatus.CANCELLED,
+                message=("top-up unwrap cancelled before the burn: the hot "
+                         "wallet's ETH no longer covers the milliETH "
+                         "withdraw() at current Base fees"),
+            ), amount
         milli = int(self._evm.get_erc20_balance(
             net.milli_eth_address, self._hot_address))
-        held = eth + milli * _c_wei_per_milli_unit(net)
+        # [review] Held milliETH counts toward the need only when the planner
+        # would withdraw it (at least its economic minimum): a smaller balance
+        # waits, and crediting it would cancel this burn while ETH stays low.
+        credited = milli if milli >= min_units else 0
+        held = eth + credited * wpu
         short = eth_target_wei - held
         if short <= 0:
             return _advance(
@@ -2393,16 +2420,13 @@ class WarpEngine:
                 message=("top-up unwrap no longer needed: the ETH fee reserve "
                          "was met while the job waited"),
             ), amount
-        units = -(-short // _c_wei_per_milli_unit(net))
+        units = -(-short // wpu)
         grossed = -(-units * 10_000 // (10_000 - rb._UNWRAP_TIP_BPS))
         # [review] Never trimmed (or left) below the smallest burn worth
         # making at the gas price NOW: a burn whose proceeds cannot pay for
         # their own withdraw and relay would shrink the reserve. Nothing is
         # committed yet, so cancelling frees the slot; the next consult
         # re-plans from live balances.
-        _, floor_mojos = _millieth_topup_minimums(
-            int(self._evm.get_fee_data().max_fee_per_gas),
-            _c_wei_per_milli_unit(net))
         size = min(max(grossed, floor_mojos), amount)
         if size < floor_mojos:
             return _advance(
@@ -2656,6 +2680,20 @@ class WarpEngine:
             return _stay(
                 state=patch,
                 message="cat_spend already in the wallet history (dedupe hit)",
+            )
+
+        # [review] An automatic ETH top-up rechecks, immediately before the
+        # irreversible send, that its proceeds can still be withdrawn: fees
+        # may have risen since the gate, and external relay skipped G9. a-c
+        # proved nothing was sent, so cancelling here commits nothing.
+        if job.state.get("rebalance_eth_target_wei") and _top_up_withdraw_short(
+                int(self._evm.get_eth_balance(self._hot_address)),
+                int(self._evm.get_fee_data().max_fee_per_gas)):
+            return _advance(
+                JobStatus.CANCELLED,
+                message=("top-up unwrap cancelled before the cat_spend: the "
+                         "hot wallet's ETH no longer covers the milliETH "
+                         "withdraw() at current Base fees"),
             )
 
         # d) Send. Default coin selection ONLY -- it is what honours the trade
@@ -4754,7 +4792,14 @@ class _WarpWorker(QObject):
                              take.offer_id, _TAKE_UNKNOWN_FAIL_S)
             else:
                 in_flight = True
-        for take in engine._store.list_takes(status=jobs.TAKE_SUBMITTED):
+        submitted = engine._store.list_takes(status=jobs.TAKE_SUBMITTED)
+        if submitted:
+            # [review] The configured key first, OUTSIDE the per-take handler:
+            # after a restart the daemon may be logged out or on another key,
+            # and that must defer settlement (this raises), never count
+            # toward the timeout that settles a real trade as failed.
+            engine._wallet.log_in()
+        for take in submitted:
             try:
                 record = engine._wallet.get_offer(take.trade_id)
             except Exception as exc:  # noqa: BLE001 -- unknown stays in flight

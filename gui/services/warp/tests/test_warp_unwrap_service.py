@@ -664,3 +664,28 @@ def test_cap_parsers_reject_junk_with_a_clear_error():
 
     with pytest.raises(S.WarpError, match="min_auto_bridge_usdc"):
         S.warp_params_from_config({"warp": {"min_auto_bridge_usdc": "abc"}})
+
+
+
+def test_a_top_up_rechecks_its_withdraw_gas_right_before_the_cat_spend():
+    """[review] Fees can rise after the gate; an automatic ETH top-up that
+    could no longer withdraw its proceeds is cancelled, unsent."""
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    _to_burn_sent(store, engine, ctx)
+    job = store.get_active_job()
+    store.update_job(job.id, state_patch={"rebalance_eth_target_wei": 10 ** 16})
+    ctx.evm.max_fee = 3 * 10 ** 9
+    ctx.evm.eth = 10 ** 14                          # < 90k gas x 3 gwei
+    out = engine.step()
+    assert out["status"] == JobStatus.CANCELLED
+    assert ctx.wallet.cat_spends == []
+
+    store2 = new_store()
+    engine2, ctx2 = build_unwrap(store2, params=params_with_cap())
+    _to_burn_sent(store2, engine2, ctx2)
+    job2 = store2.get_active_job()
+    store2.update_job(job2.id,
+                      state_patch={"rebalance_eth_target_wei": 10 ** 16})
+    engine2.step()                                  # funded: it sends
+    assert len(ctx2.wallet.cat_spends) == 1
