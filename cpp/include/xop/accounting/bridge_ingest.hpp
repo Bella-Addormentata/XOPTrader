@@ -523,6 +523,34 @@ struct SecondaryInventoryPlan {
     return p;
 }
 
+/// Step 13's rolling-loss window rebase after a booked secondary flow
+/// (engine.cpp): the window restarts every cycle while this says Wait.
+enum class WindowRebaseVerdict { Wait, CaughtUp, Expired };
+
+/// Whether a booked flow's rebase can retire.  CaughtUp needs State to hold
+/// the wallet's balance from a validated snapshot taken at or after the
+/// booking, AND a heartbeat strictly after the booking one: Step 11 marks
+/// P&L before the scan books, so a flow booked this heartbeat (a deposit's
+/// new cost basis, a relative inventory move) reaches the marks only next
+/// heartbeat, whatever State shows now.  Expired after one loss window, so
+/// an asset whose State never catches up cannot blind the breaker.
+[[nodiscard]] inline WindowRebaseVerdict window_rebase_verdict(
+    std::uint64_t booked_block, std::uint64_t now_block,
+    bool snapshot_validated, std::uint64_t snapshot_block,
+    Mojo state_balance, Mojo wallet_confirmed,
+    std::uint64_t window_blocks) noexcept
+{
+    if (now_block > booked_block && snapshot_validated
+        && snapshot_block >= booked_block
+        && state_balance == wallet_confirmed) {
+        return WindowRebaseVerdict::CaughtUp;
+    }
+    if (now_block >= booked_block && now_block - booked_block >= window_blocks) {
+        return WindowRebaseVerdict::Expired;
+    }
+    return WindowRebaseVerdict::Wait;
+}
+
 }  // namespace xop::accounting
 
 #endif  // XOP_ACCOUNTING_BRIDGE_INGEST_HPP

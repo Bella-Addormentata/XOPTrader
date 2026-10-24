@@ -479,6 +479,40 @@ TEST(SecondaryInventoryPlanTest, ImpossibleArithmeticReadsTheWallet) {
               SecondaryInventoryAction::WalletTruth);
 }
 
+// -- Step 13's rolling-window rebase ([review]) ------------------------------
+
+TEST(WindowRebaseTest, ADepositBookedThisHeartbeatWaitsForTheNextMark) {
+    // State already equals the wallet in the booking heartbeat (Step 8 read
+    // the post-flow balance), but Step 11 marked BEFORE the scan booked the
+    // deposit's cost basis: retiring now would let next heartbeat's mark
+    // drop against a baseline taken at the old basis.
+    EXPECT_EQ(window_rebase_verdict(100, 100, true, 100, 5'000, 5'000, 1152),
+              WindowRebaseVerdict::Wait);
+    EXPECT_EQ(window_rebase_verdict(100, 101, true, 101, 5'000, 5'000, 1152),
+              WindowRebaseVerdict::CaughtUp);
+}
+
+TEST(WindowRebaseTest, StateBehindTheWalletKeepsWaiting) {
+    // A pause: Step 8 has not reconciled State to the post-flow wallet.
+    EXPECT_EQ(window_rebase_verdict(100, 140, true, 140, 5'547, 5'000, 1152),
+              WindowRebaseVerdict::Wait);
+    // A snapshot older than the booking proves nothing.
+    EXPECT_EQ(window_rebase_verdict(100, 140, true, 99, 5'000, 5'000, 1152),
+              WindowRebaseVerdict::Wait);
+    EXPECT_EQ(window_rebase_verdict(100, 140, false, 140, 5'000, 5'000, 1152),
+              WindowRebaseVerdict::Wait);
+}
+
+TEST(WindowRebaseTest, ItExpiresAfterOneLossWindow) {
+    EXPECT_EQ(window_rebase_verdict(100, 1251, true, 1251, 1, 2, 1152),
+              WindowRebaseVerdict::Wait);
+    EXPECT_EQ(window_rebase_verdict(100, 1252, true, 1252, 1, 2, 1152),
+              WindowRebaseVerdict::Expired);
+    // A regressed height is no elapsed time, not an expiry.
+    EXPECT_EQ(window_rebase_verdict(100, 90, true, 90, 1, 2, 1152),
+              WindowRebaseVerdict::Wait);
+}
+
 TEST(SecondaryInventoryPlanTest, AMalformedFloorWithAWriteOnRecordReadsTheWallet) {
     EXPECT_EQ(plan_secondary_inventory(5'000, -547, "2026-10-24T09:00:00Z",
                                        "garbage").action,

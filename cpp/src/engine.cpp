@@ -22932,26 +22932,28 @@ void Engine::step_check_alerts(BlockHeight block_height)
         // [WARP-MILLIETH review] A booked secondary bridge flow restarts the
         // window (restart semantics, like the drawdown peak; see
         // step_ingest_secondary_bridge_flows) on every cycle until State
-        // holds the wallet's post-booking balance for that asset -- the
-        // marks feeding total_pnl_usd then include the flow, and Step 11
-        // marks after Step 8 in the same heartbeat, so the restart on the
-        // catch-up cycle is the last one.  Bounded by one window length: an
-        // asset whose State never catches up must not blind the breaker.
+        // holds the wallet's post-booking balance for that asset, in a
+        // heartbeat AFTER the booking one -- Step 11 marks before the scan
+        // books, so only then do the marks feeding total_pnl_usd include
+        // the flow (State, and a deposit's new cost basis).  The restart on
+        // the catch-up cycle is the last one.  Bounded by one window
+        // length (accounting::window_rebase_verdict).
         if (!pnl_window_rebase_assets_.empty()) {
             for (auto it = pnl_window_rebase_assets_.begin();
                  it != pnl_window_rebase_assets_.end();) {
                 const auto cit = cached_wallet_balances_.find(it->first);
-                const bool caught_up =
-                    state_ && cit != cached_wallet_balances_.end()
-                    && cit->second.fields_validated
-                    && cit->second.as_of_block >= it->second
-                    && state_->get_position(AssetId{it->first}).balance
-                           == cit->second.confirmed;
-                const bool expired = block_height >= it->second
-                    && block_height - it->second
-                           >= config_.risk.loss_window_blocks;
-                if (caught_up || expired) {
-                    if (!caught_up) {
+                const bool have = state_
+                    && cit != cached_wallet_balances_.end();
+                const auto verdict = accounting::window_rebase_verdict(
+                    it->second, block_height,
+                    have && cit->second.fields_validated,
+                    have ? cit->second.as_of_block : 0,
+                    have ? state_->get_position(AssetId{it->first}).balance
+                         : Mojo{-1},
+                    have ? cit->second.confirmed : Mojo{-2},
+                    config_.risk.loss_window_blocks);
+                if (verdict != accounting::WindowRebaseVerdict::Wait) {
+                    if (verdict == accounting::WindowRebaseVerdict::Expired) {
                         spdlog::warn("[Engine] Step 13: State for {} never "
                                      "caught up with a booked bridge flow "
                                      "within one loss window -- the rolling "
