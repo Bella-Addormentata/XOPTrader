@@ -630,6 +630,9 @@ class BurnRequest:
     security_coin: Coin               # ephemeral toll coin (amount == chia_toll_mojos)
     security_sk: bytes                # its raw BLS secret key
     receiver: bytes                   # 20-byte Base address the USDC pays
+    # [MULTI-ASSET-OUT] The asset being unwrapped (a WarpAsset). None keeps
+    # the legacy USDC terms (net.usdc_address / net.expected_asset_id).
+    asset: object = None
 
 
 @dataclass(frozen=True)
@@ -640,38 +643,61 @@ class BurnBundle:
     bridging_coin: Coin
 
 
-def expected_burn_inner_puzzle_hash(net, receiver: bytes) -> bytes:
-    """Where ``cat_spend`` must deliver the wUSDC.b -- THE commit point.
+def _outbound_terms(net, asset=None) -> tuple:
+    """``(token20, tail32)`` for an unwrap of *asset* (None: legacy USDC).
+
+    [MULTI-ASSET-OUT] The burn inner puzzle curries the SOURCE token and the
+    burned CAT is identified by its wrapped TAIL; both must describe the same
+    asset, so they come from one descriptor together -- never a token from
+    one asset and a TAIL from another. The descriptor's TAIL is the anchored
+    one (verified offline against the token at engine construction).
+    """
+    if asset is None:
+        token, tail = net.usdc_address, net.expected_asset_id
+    else:
+        token = getattr(asset, "erc20_address", "") or ""
+        tail = getattr(asset, "expected_asset_id", "") or ""
+    token = token[2:] if token[:2] in ("0x", "0X") else token
+    if len(token) != 40 or not tail:
+        raise WarpDriverError(
+            f"unwrap asset terms incomplete (token {token!r}, tail {tail!r})"
+        )
+    return bytes.fromhex(token), bytes.fromhex(tail)
+
+
+def expected_burn_inner_puzzle_hash(net, receiver: bytes, asset=None) -> bytes:
+    """Where ``cat_spend`` must deliver the wrapped CAT -- THE commit point.
 
     Once a coin sits at this inner puzzle hash its only possible future is
     destruction into a message paying ``receiver``. Every gate runs before
-    the spend that targets this.
+    the spend that targets this. *asset* selects the token (None: USDC).
     """
+    token20, _tail = _outbound_terms(net, asset)
     inner = get_cat_burn_inner_puzzle(
         b"bse",
         bytes.fromhex(net.erc20_bridge_address[2:]),
-        bytes.fromhex(net.usdc_address[2:]),
+        token20,
         receiver,
         net.chia_toll_mojos,
     )
     return cu.sha256tree(inner)
 
 
-def expected_burn_cat_puzzle_hash(net, receiver: bytes) -> bytes:
+def expected_burn_cat_puzzle_hash(net, receiver: bytes, asset=None) -> bytes:
     """The full cat_v2 outer hash the burn CAT sits at -- what coin scans match."""
+    token20, tail = _outbound_terms(net, asset)
     inner = get_cat_burn_inner_puzzle(
         b"bse",
         bytes.fromhex(net.erc20_bridge_address[2:]),
-        bytes.fromhex(net.usdc_address[2:]),
+        token20,
         receiver,
         net.chia_toll_mojos,
     )
-    return cu.sha256tree(
-        construct_cat_puzzle(bytes.fromhex(net.expected_asset_id), inner)
-    )
+    return cu.sha256tree(construct_cat_puzzle(tail, inner))
 
 
-def outbound_message_contents(net, receiver: bytes, amount_mojos: int) -> list:
+def outbound_message_contents(net, receiver: bytes, amount_mojos: int,
+                              asset=None) -> list:
     """The three 32-byte atoms the validators sign for an unwrap.
 
     Reproduces the validator's memo padding exactly: each Chia memo atom is
@@ -686,8 +712,9 @@ def outbound_message_contents(net, receiver: bytes, amount_mojos: int) -> list:
         return b"\x00" * (32 - len(b)) + b
 
     amount_atom = SExp.to(int(amount_mojos)).atom or b""
+    token20, _tail = _outbound_terms(net, asset)
     return [
-        pad32(bytes.fromhex(net.usdc_address[2:])),
+        pad32(token20),
         pad32(receiver),
         pad32(amount_atom),
     ]
@@ -712,8 +739,7 @@ def build_burn_bundle(req: BurnRequest) -> BurnBundle:
         raise WarpDriverError(f"receiver must be 20 bytes, got {len(req.receiver)}")
 
     bridge20 = bytes.fromhex(net.erc20_bridge_address[2:])
-    token20 = bytes.fromhex(net.usdc_address[2:])
-    tail_hash = bytes.fromhex(net.expected_asset_id)
+    token20, tail_hash = _outbound_terms(net, req.asset)
 
     # The burn CAT: outer = cat_v2(tail, burn inner). Verify the coin we were
     # handed actually sits at the puzzle this bundle is about to reveal --

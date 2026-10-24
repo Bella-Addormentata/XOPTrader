@@ -281,3 +281,65 @@ def test_swapped_parent_ids_are_caught_by_width_or_diverge():
         drivers.get_burn_inner_puzzle_solution(b"\x01" * 20, b"\x02" * 32, 0)
     with pytest.raises(drivers.WarpDriverError):
         drivers.get_burn_inner_puzzle_solution(b"\x01" * 32, b"\x02" * 20, 0)
+
+
+# --------------------------------------------------------------------------- #
+# [MULTI-ASSET-OUT 2026-10-24] The asset parameter: USDC byte-identical to the
+# legacy path, milliETH on its own token and TAIL.
+# --------------------------------------------------------------------------- #
+
+USDC = NET.asset("USDC")
+MILLI = NET.asset("milliETH")
+RECEIVER = bytes.fromhex("ab" * 20)
+
+
+def test_the_usdc_asset_reproduces_the_legacy_burn_terms_exactly():
+    """The fixture-pinned legacy path (asset=None) and an explicit USDC asset
+    must produce the same bytes everywhere -- the live wUSDC.b unwrap must
+    not move by a single bit."""
+    assert (drivers.expected_burn_inner_puzzle_hash(NET, RECEIVER)
+            == drivers.expected_burn_inner_puzzle_hash(NET, RECEIVER, asset=USDC))
+    assert (drivers.expected_burn_cat_puzzle_hash(NET, RECEIVER)
+            == drivers.expected_burn_cat_puzzle_hash(NET, RECEIVER, asset=USDC))
+    assert (drivers.outbound_message_contents(NET, RECEIVER, 5000)
+            == drivers.outbound_message_contents(NET, RECEIVER, 5000,
+                                                 asset=USDC))
+
+
+def test_a_millieth_unwrap_signs_for_the_millieth_token_and_tail():
+    contents = drivers.outbound_message_contents(NET, RECEIVER, 547,
+                                                 asset=MILLI)
+    assert contents[0] == b"\x00" * 12 + bytes.fromhex(
+        MILLI.erc20_address[2:])
+    assert contents[1:] == drivers.outbound_message_contents(
+        NET, RECEIVER, 547)[1:], "receiver and amount atoms are asset-free"
+    inner = drivers.expected_burn_inner_puzzle_hash(NET, RECEIVER, asset=MILLI)
+    assert inner != drivers.expected_burn_inner_puzzle_hash(NET, RECEIVER)
+    outer = drivers.expected_burn_cat_puzzle_hash(NET, RECEIVER, asset=MILLI)
+    rebuilt = cu.sha256tree(drivers.construct_cat_puzzle(
+        bytes.fromhex(MILLI.expected_asset_id),
+        drivers.get_cat_burn_inner_puzzle(
+            b"bse", _hx(NET.erc20_bridge_address), _hx(MILLI.erc20_address),
+            RECEIVER, NET.chia_toll_mojos)))
+    assert outer == rebuilt
+
+
+def test_a_millieth_burn_bundle_refuses_a_usdc_burn_coin():
+    """The bundle verifies the burn CAT against the ASSET's puzzle: a coin at
+    the wUSDC.b burn puzzle cannot be spent as a wmilliETH.b burn."""
+    req, _burn_cat = _synthetic_request()        # a wUSDC.b burn coin
+    from dataclasses import replace
+
+    with pytest.raises(drivers.WarpDriverError):
+        build_burn_bundle(replace(req, asset=MILLI))
+    assert build_burn_bundle(replace(req, asset=USDC)).nonce == (
+        build_burn_bundle(req).nonce)
+
+
+def test_incomplete_asset_terms_are_refused():
+    from types import SimpleNamespace
+
+    with pytest.raises(drivers.WarpDriverError):
+        drivers.outbound_message_contents(
+            NET, RECEIVER, 1, asset=SimpleNamespace(erc20_address="0x12",
+                                                    expected_asset_id="ab"))

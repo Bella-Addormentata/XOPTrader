@@ -225,6 +225,13 @@ _VALID_BORDER: Final[str] = f"border: 1px solid {_C.BORDER};"
 # Default config.yaml file name when none is provided.
 _DEFAULT_CONFIG_FILENAME: Final[str] = "config.yaml"
 
+#: [MILLIETH-TOPUP 2026-10-24] wmilliETH.b's CAT id -- the gas float the ETH
+#: top-up unwraps, and the strategy.asset_reserve_units key this page edits.
+#: Pinned in gui/services/warp/constants.py; a test keeps the two equal.
+_WMILLIETH_ASSET_ID: Final[str] = (
+    "f322a205c034fe28681829fa5a2e483ac421f0952eb1292945c8db06e0a471a6"
+)
+
 # [RATIO-SOT] Item-data roles on the Ratio Target cell (pairs column 4).  The
 # NAME cell's UserRole holds the stashed pair dict; these ride on a different
 # item and are offset from UserRole anyway, so the two can never be confused.
@@ -2093,6 +2100,92 @@ class SettingsWidget(QWidget):
 
         layout.addWidget(base_group)
 
+        # [MILLIETH-TOPUP 2026-10-24] wmilliETH.b on Chia as the ETH
+        # reserve's source: kept unsold by the engine, unwrapped to Base by
+        # the rebalancer, and optionally bought on Dexie when none is held.
+        wm_group = QGroupBox("ETH Top-up from wmilliETH.b")
+        wm_form = QFormLayout(wm_group)
+        wm_form.setSpacing(8)
+
+        self._wm_gas_reserve = QDoubleSpinBox()
+        self._wm_gas_reserve.setRange(0.0, 1_000_000.0)
+        self._wm_gas_reserve.setSingleStep(1.0)
+        self._wm_gas_reserve.setDecimals(3)
+        self._wm_gas_reserve.setValue(1.0)
+        self._wm_gas_reserve.setSuffix(" wmilliETH.b")
+        self._wm_gas_reserve.setToolTip(
+            "The engine's sell offers always leave at least this much "
+            "wmilliETH.b in the wallet, so there is some to unwrap for gas. "
+            "1 wmilliETH.b = 0.001 ETH. Replaces Min Reserve Balance for this "
+            "coin (strategy.asset_reserve_units). Takes effect when the "
+            "engine restarts."
+        )
+        wm_form.addRow("Keep Unsold:", self._wm_gas_reserve)
+
+        self._wm_source = QCheckBox("Top up ETH from wmilliETH.b on Chia")
+        self._wm_source.setToolTip(
+            "When ETH falls below the band and no milliETH is left on Base, "
+            "unwrap wmilliETH.b from the Chia wallet to Base, where the next "
+            "top-up turns it into ETH. Needs Auto top-up above, and starts "
+            "only after one manual wmilliETH.b unwrap has completed "
+            "(warp.rebalance.wmillieth.enabled)."
+        )
+        wm_form.addRow("", self._wm_source)
+
+        self._wm_unwrap_cap = QDoubleSpinBox()
+        self._wm_unwrap_cap.setRange(0.001, 1_000_000.0)
+        self._wm_unwrap_cap.setSingleStep(1.0)
+        self._wm_unwrap_cap.setDecimals(3)
+        self._wm_unwrap_cap.setValue(10.0)
+        self._wm_unwrap_cap.setSuffix(" wmilliETH.b")
+        self._wm_unwrap_cap.setToolTip(
+            "The most any one wmilliETH.b unwrap may move, automatic or "
+            "manual (warp.max_unwrap_millieth)."
+        )
+        self._wm_unwrap_unlimited = QCheckBox("Unlimited")
+        wm_cap_row = QHBoxLayout()
+        wm_cap_row.addWidget(self._wm_unwrap_cap)
+        wm_cap_row.addWidget(self._wm_unwrap_unlimited)
+        wm_cap_row.addStretch(1)
+        wm_form.addRow("Max per Unwrap:", wm_cap_row)
+
+        self._wm_buy = QCheckBox("Buy wmilliETH.b on Dexie when none is held")
+        self._wm_buy.setToolTip(
+            "With no wmilliETH.b to unwrap, take one Dexie ask for it, paid in "
+            "XCH. The offer must read exactly as listed in your own wallet, "
+            "may not be one of your own asks, must be priced within the "
+            "premium below of CoinGecko's ETH/XCH, and may not spend the "
+            "engine's XCH fee reserve. One buy per rebalance cooldown "
+            "(warp.rebalance.wmillieth.buy_on_dexie)."
+        )
+        wm_form.addRow("", self._wm_buy)
+
+        self._wm_premium = QDoubleSpinBox()
+        self._wm_premium.setRange(0.1, 50.0)
+        self._wm_premium.setSingleStep(0.5)
+        self._wm_premium.setDecimals(1)
+        self._wm_premium.setValue(3.0)
+        self._wm_premium.setSuffix(" %")
+        self._wm_premium.setToolTip(
+            "The most a Dexie buy may pay above CoinGecko's price "
+            "(warp.rebalance.wmillieth.max_premium_pct)."
+        )
+        wm_form.addRow("Max Premium:", self._wm_premium)
+
+        self._wm_max_spend = QDoubleSpinBox()
+        self._wm_max_spend.setRange(0.001, 1_000.0)
+        self._wm_max_spend.setSingleStep(1.0)
+        self._wm_max_spend.setDecimals(3)
+        self._wm_max_spend.setValue(25.0)
+        self._wm_max_spend.setSuffix(" XCH")
+        self._wm_max_spend.setToolTip(
+            "The most XCH any one Dexie buy may spend "
+            "(warp.rebalance.wmillieth.max_spend_xch)."
+        )
+        wm_form.addRow("Max XCH per Buy:", self._wm_max_spend)
+
+        layout.addWidget(wm_group)
+
         # [WARP-GUI 2026-10-24] warp.green bridge (USDC on Base -> Chia).
         warp_group = QGroupBox("warp.green Bridge (USDC)")
         warp_form = QFormLayout(warp_group)
@@ -2188,15 +2281,36 @@ class SettingsWidget(QWidget):
                         ("max_auto_bridge_usdc", self._warp_max),
                         ("keep_usdc_on_base", self._warp_keep),
                         ("eth.target", self._eth_reserve_target),
-                        ("eth.tolerance_pct", self._eth_reserve_tol)):
+                        ("eth.tolerance_pct", self._eth_reserve_tol),
+                        ("max_unwrap_millieth", self._wm_unwrap_cap),
+                        ("wm.max_premium_pct", self._wm_premium),
+                        ("wm.max_spend_xch", self._wm_max_spend)):
             sb.valueChanged.connect(
                 lambda _v, k=key: self._warp_edited.add(k))
+        # The gas reserve is an ENGINE setting (strategy.*): written when it
+        # was on disk or the operator touched it, never invented.
+        self._wm_reserve_loaded: Optional[float] = None
+        self._wm_reserve_edited = False
+        self._wm_gas_reserve.valueChanged.connect(
+            lambda _v: setattr(self, "_wm_reserve_edited", True))
+        self._wm_gas_reserve.valueChanged.connect(
+            lambda _v, ti=5: self._mark_dirty(ti))
+        self._wm_unwrap_cap_unlimited_loaded = False
+        # [review] Toggling Unlimited is an edit of the cap: unticking it
+        # after a save that wrote "unlimited" must write the finite value,
+        # or the deep merge keeps unlimited unwraps on disk. Reset after
+        # every load (which sets the box itself).
+        self._wm_unwrap_unlimited_toggled = False
+        self._wm_unwrap_unlimited.stateChanged.connect(
+            lambda _s: setattr(self, "_wm_unwrap_unlimited_toggled", True))
         for cb in (self._warp_auto_bridge, self._warp_max_unlimited,
-                   self._eth_auto_topup):
+                   self._eth_auto_topup, self._wm_source,
+                   self._wm_unwrap_unlimited, self._wm_buy):
             cb.stateChanged.connect(lambda _s, ti=5: self._mark_dirty(ti))
             cb.stateChanged.connect(lambda _s: self._refresh_warp_controls())
         for sb in (self._warp_min_auto, self._warp_max, self._warp_keep,
-                   self._eth_reserve_target, self._eth_reserve_tol):
+                   self._eth_reserve_target, self._eth_reserve_tol,
+                   self._wm_unwrap_cap, self._wm_premium, self._wm_max_spend):
             sb.valueChanged.connect(lambda _v, ti=5: self._mark_dirty(ti))
             sb.valueChanged.connect(lambda _v: self._refresh_warp_controls())
         self._refresh_warp_controls()
@@ -3093,6 +3207,21 @@ class SettingsWidget(QWidget):
             cfg["strategy"][RATIO_TARGETS_KEY] = ratio_targets
         for _key, _value in snapshot_strategy.items():
             cfg["strategy"].setdefault(_key, _value)
+        # [MILLIETH-TOPUP] The wmilliETH.b gas reserve, patched into the
+        # loaded per-coin map so other coins' entries stay as they are.
+        if self._wm_reserve_edited or self._wm_reserve_loaded is not None:
+            reserves = snapshot_strategy.get("asset_reserve_units")
+            reserves = dict(reserves) if isinstance(reserves, dict) else {}
+            # Under the key as spelled on disk: the save deep-merges onto
+            # the file, so a second spelling would survive beside it and
+            # the engine refuses a coin listed twice.
+            key = next((k for k in reserves
+                        if str(k).strip().lower() == _WMILLIETH_ASSET_ID),
+                       _WMILLIETH_ASSET_ID)
+            reserves[key] = (
+                round(self._wm_gas_reserve.value(), 3)
+                if self._wm_reserve_edited else self._wm_reserve_loaded)
+            cfg["strategy"]["asset_reserve_units"] = reserves
 
         # -- risk --
         cfg["risk"] = {
@@ -3330,6 +3459,7 @@ class SettingsWidget(QWidget):
             self._min_reserve_units.setValue(
                 float(strat.get("min_reserve_units", 1.0))
             )
+            self._populate_wm_reserve(strat)
             self._min_trading_units.setValue(
                 float(strat.get("min_trading_units", 10.0))
             )
@@ -3586,6 +3716,16 @@ class SettingsWidget(QWidget):
         topup = present and self._eth_auto_topup.isChecked()
         self._eth_reserve_target.setEnabled(topup)
         self._eth_reserve_tol.setEnabled(topup)
+        # The wmilliETH.b source tops up the ETH band, so it needs one.
+        self._wm_source.setEnabled(topup)
+        source = topup and self._wm_source.isChecked()
+        self._wm_unwrap_unlimited.setEnabled(present)
+        self._wm_unwrap_cap.setEnabled(
+            present and not self._wm_unwrap_unlimited.isChecked())
+        self._wm_buy.setEnabled(source)
+        buy = source and self._wm_buy.isChecked()
+        self._wm_premium.setEnabled(buy)
+        self._wm_max_spend.setEnabled(buy)
 
         warn = ""
         if (present and self._warp_auto_bridge.isChecked() and not unlimited
@@ -3619,6 +3759,32 @@ class SettingsWidget(QWidget):
             for key in ("target", "tolerance_pct"):
                 if eth_raw.get(key) is not None:
                     self._warp_loaded_raw[f"eth.{key}"] = eth_raw.get(key)
+        # Numbers as the runtime reads them -- quoted ones too ("0.0001") --
+        # so an untouched field is written back exactly; "unlimited" stays
+        # the checkbox's.
+        def _numeric(v: Any) -> bool:
+            if isinstance(v, bool):
+                return False
+            if isinstance(v, (int, float)):
+                return True
+            if isinstance(v, str) and v.strip().lower() != "unlimited":
+                try:
+                    float(v)
+                except ValueError:
+                    return False
+                return True
+            return False
+
+        wm_raw = (reb_raw.get("wmillieth")
+                  if isinstance(reb_raw, dict) else None)
+        if isinstance(wm_raw, dict):
+            for key in ("max_premium_pct", "max_spend_xch"):
+                v = wm_raw.get(key)
+                if _numeric(v):
+                    self._warp_loaded_raw[f"wm.{key}"] = v
+        cap_raw = warp.get("max_unwrap_millieth")
+        if _numeric(cap_raw):
+            self._warp_loaded_raw["max_unwrap_millieth"] = cap_raw
 
         _flag = self._warp_flag
 
@@ -3646,7 +3812,57 @@ class SettingsWidget(QWidget):
         if isinstance(eth, dict):
             self._eth_reserve_target.setValue(_num(eth.get("target"), 0.01))
             self._eth_reserve_tol.setValue(_num(eth.get("tolerance_pct"), 20.0))
+
+        wm = (reb or {}).get("wmillieth") if isinstance(reb, dict) else None
+        wm = wm if isinstance(wm, dict) else {}
+        self._wm_source.setChecked(_flag(wm.get("enabled"), False))
+        self._wm_source_loaded = (self._wm_source.isChecked()
+                                  and self._eth_auto_topup.isChecked())
+        self._wm_buy.setChecked(_flag(wm.get("buy_on_dexie"), False))
+        self._wm_premium.setValue(_num(wm.get("max_premium_pct"), 3.0))
+        self._wm_max_spend.setValue(_num(wm.get("max_spend_xch"), 25.0))
+        cap = warp.get("max_unwrap_millieth")
+        cap_unlimited = isinstance(cap, str) and cap.strip().lower() == "unlimited"
+        self._wm_unwrap_cap_unlimited_loaded = cap_unlimited
+        self._wm_unwrap_unlimited.setChecked(cap_unlimited)
+        self._wm_unwrap_unlimited_toggled = False
+        if not cap_unlimited:
+            self._wm_unwrap_cap.setValue(_num(cap, 10.0))
         self._refresh_warp_controls()
+
+    def _populate_wm_reserve(self, strat: Any) -> None:
+        """Load the wmilliETH.b gas reserve from strategy.asset_reserve_units.
+
+        No entry shows the global Min Reserve Balance, which is what the
+        engine applies to the coin until one is written.
+        """
+        self._wm_reserve_edited = False
+        self._wm_reserve_loaded = None
+        strat = strat if isinstance(strat, dict) else {}
+        reserves = strat.get("asset_reserve_units")
+        value = None
+        if isinstance(reserves, dict):
+            for k, v in reserves.items():
+                if str(k).strip().lower() == _WMILLIETH_ASSET_ID:
+                    value = v
+        shown: Optional[float] = None
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            shown = float(value)
+        elif isinstance(value, str):
+            # The engine reads a quoted number too; show it, keep it raw.
+            try:
+                shown = float(value)
+            except ValueError:
+                shown = None
+        if shown is not None and math.isfinite(shown):
+            self._wm_reserve_loaded = value
+            self._wm_gas_reserve.setValue(shown)
+        else:
+            try:
+                fallback = float(strat.get("min_reserve_units", 1.0))
+            except (TypeError, ValueError):
+                fallback = 1.0
+            self._wm_gas_reserve.setValue(fallback)
 
     def _warp_value(self, key: str, shown: Any) -> Any:
         """*shown* if the operator edited *key*, else the loaded value."""
@@ -3674,6 +3890,9 @@ class SettingsWidget(QWidget):
             existing.get("usdc"), dict)
         # Read "enabled" the way the runtime does (true/1/"true"), so a USDC
         # band switched on as `enabled: "true"` is not saved back as off.
+        had_wm = isinstance(existing, dict) and isinstance(
+            existing.get("wmillieth"), dict)
+        source = self._eth_auto_topup.isChecked() and self._wm_source.isChecked()
         if self._eth_auto_topup.isChecked():
             out["rebalance"] = {
                 "enabled": True,
@@ -3692,6 +3911,36 @@ class SettingsWidget(QWidget):
             enabled = self._warp_flag(existing.get("enabled"), False)
             out["rebalance"] = {"enabled": bool(enabled and has_usdc),
                                 "eth": None}
+        # [MILLIETH-TOPUP] The wmilliETH.b source rides the ETH band: with
+        # the band gone it is switched off too, or a preserved USDC band
+        # would leave an enabled source the parser refuses.
+        if source:
+            out["rebalance"]["wmillieth"] = {
+                "enabled": True,
+                "buy_on_dexie": self._wm_buy.isChecked(),
+                "max_premium_pct": self._warp_value(
+                    "wm.max_premium_pct", round(self._wm_premium.value(), 1)),
+                "max_spend_xch": self._warp_value(
+                    "wm.max_spend_xch", round(self._wm_max_spend.value(), 3)),
+            }
+        elif had_wm and "rebalance" in out:
+            out["rebalance"]["wmillieth"] = {"enabled": False}
+        # The unwrap cap gates manual unwraps too, so it is written only when
+        # it was on disk, was touched, or the source was switched on in THIS
+        # session (the operator saw the cap beside it) -- never invented for
+        # a source already on at load, since stating a cap is what first
+        # allows an unwrap.
+        newly_on = source and not getattr(self, "_wm_source_loaded", False)
+        if (newly_on or "max_unwrap_millieth" in self._warp_loaded_raw
+                or "max_unwrap_millieth" in self._warp_edited
+                or self._wm_unwrap_cap_unlimited_loaded
+                or getattr(self, "_wm_unwrap_unlimited_toggled", False)
+                or self._wm_unwrap_unlimited.isChecked()):
+            out["max_unwrap_millieth"] = (
+                "unlimited" if self._wm_unwrap_unlimited.isChecked()
+                else self._warp_value(
+                    "max_unwrap_millieth",
+                    round(self._wm_unwrap_cap.value(), 3)))
         return out
 
     @staticmethod
@@ -3798,6 +4047,10 @@ class SettingsWidget(QWidget):
             self._warp_max_unlimited, self._warp_keep,
             self._eth_auto_topup, self._eth_reserve_target,
             self._eth_reserve_tol,
+            # ETH top-up from wmilliETH.b
+            self._wm_gas_reserve, self._wm_source, self._wm_unwrap_cap,
+            self._wm_unwrap_unlimited, self._wm_buy, self._wm_premium,
+            self._wm_max_spend,
         ]
         for w in widgets_to_block:
             w.blockSignals(block)
