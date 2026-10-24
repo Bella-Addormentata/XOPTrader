@@ -2268,6 +2268,11 @@ private:
     /// earlier wallet-set write, and the booking block: the reconcile then
     /// accepts only a snapshot taken at or after it.
     std::unordered_map<std::string, BlockHeight> inventory_reconcile_not_before_;
+    /// [MILLIETH-TOPUP review] Why each re-armed reconcile was armed: true
+    /// for a bridge flow (a capital event -- the correction re-anchors the
+    /// risk baselines), false for a top-up take only (a trade -- it must
+    /// not).  Absent means the startup one-shot, which re-anchors.
+    std::unordered_map<std::string, bool> inventory_reconcile_capital_;
 
     /// [MILLIETH-TOPUP] Top-up takes already decided this process (booked,
     /// found booked, or inside an opening), and those already warned about.

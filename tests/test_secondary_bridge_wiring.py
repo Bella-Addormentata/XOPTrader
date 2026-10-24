@@ -91,6 +91,20 @@ def test_unknown_reserve_coins_suppress_the_spending_sides():
     assert "can_bid = false;" in step8[gate_q:gate_q + 600]
 
 
+def test_a_take_re_arms_without_resetting_the_risk_baselines():
+    """A top-up take is a trade: the reconcile it re-arms corrects inventory
+    but must not discard the drawdown peak or the loss window."""
+    text = _engine()
+    takes = _body(text, "asio::awaitable<void> Engine::step_ingest_topup_takes(")
+    assert "inventory_reconcile_capital_.try_emplace(a, false);" in takes
+    scan = _body(text, SECONDARY)
+    assert "inventory_reconcile_capital_[sid] = true;" in scan
+    step11 = _body(text, STEP11)
+    reset = step11.index("peak_equity_hwm_usd_ = 0.0;")
+    gate = step11.rindex("capital_event", 0, reset)
+    assert "inventory_reconcile_capital_.find(aid)" in step11[gate - 600:gate]
+
+
 def test_step11s_restart_reconcile_re_anchors_a_secondary_asset():
     """The one-shot reconcile is where a restart's stale restored quantity is
     corrected; for a secondary bridge asset that is a capital event."""

@@ -379,8 +379,12 @@ def test_the_chia_balance_is_not_read_while_base_has_millieth(monkeypatch):
     eng._hot_cache["millieth_units"] = 5
     eng._cat_wallet_ids = None                    # would raise if consulted
     calls = []
-    w._base_wallet = lambda: type("W", (), {
-        "unwrap_millieth": lambda self, units: calls.append(units)})()
+
+    class _BaseWallet:
+        def unwrap_millieth(self, units):
+            calls.append(units)
+
+    w._base_wallet = _BaseWallet
     w._maybe_rebalance(eng)
     assert calls == [5]
 
@@ -421,3 +425,20 @@ def test_our_open_offers_are_listed_across_every_page():
 
     with pytest.raises(WalletError):
         WalletClient({}, poster=failing).get_my_open_trade_ids(page=2)
+
+
+def test_an_offer_already_attempted_is_never_taken_again(monkeypatch):
+    _http(monkeypatch)
+    w, eng = _worker(_params(buy=True)), FakeEngine()
+
+    def refused(offer, *, fee_mojos=0):
+        raise RuntimeError("wallet refused the take")
+
+    eng._wallet.take_offer = refused
+    w._maybe_rebalance(eng)
+    monkeypatch.setattr(S, "_age_s", lambda iso: S._TAKE_UNKNOWN_FAIL_S + 1)
+    w._settle_dexie_takes(eng)                     # the attempt -> failed
+    eng._wallet.take_offer = FakeWallet().take_offer
+    w._rebalance_next_ok = 0.0
+    w._maybe_rebalance(eng)
+    assert "nothing bought" in w._rebalance_last, "the only ask was tried"

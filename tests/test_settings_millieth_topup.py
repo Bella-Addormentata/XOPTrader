@@ -176,6 +176,17 @@ def test_the_gas_reserve_is_editable_without_a_warp_section(panel, tmp_path):
     assert _out(panel)["strategy"]["asset_reserve_units"] == {WM: 2.0}
 
 
+def test_a_source_on_at_load_without_a_cap_is_not_given_one(panel, tmp_path):
+    """[review] Unwraps are refused until a cap is stated; an unrelated
+    save must not state one for the operator."""
+    panel.load_config(str(_cfg(tmp_path, {**LIVE, "rebalance": {
+        **BAND, "wmillieth": {"enabled": True}}})))
+    assert panel._wm_source.isChecked()
+    assert "max_unwrap_millieth" not in _out(panel)["warp"]
+    panel._wm_unwrap_cap.setValue(4.0)                 # an explicit edit does
+    assert _out(panel)["warp"]["max_unwrap_millieth"] == 4.0
+
+
 def test_quoted_numbers_are_written_back_verbatim(panel, tmp_path):
     """[review] The runtime reads quoted numbers; an untouched one must not
     be rounded or clamped by an unrelated save."""

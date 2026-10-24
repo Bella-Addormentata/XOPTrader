@@ -21444,6 +21444,7 @@ asio::awaitable<void> Engine::step_ingest_secondary_bridge_flows(
                 // asset's quantity.
                 inventory_reconciled_assets_.erase(sid);
                 inventory_reconcile_not_before_[sid] = block_height;
+                inventory_reconcile_capital_[sid] = true;
             }
             // [review] Re-anchored NOW in both cases: on the wallet-truth
             // path an absolute write may already have taken the flow out of
@@ -21712,9 +21713,13 @@ asio::awaitable<void> Engine::step_ingest_topup_takes(BlockHeight block_height)
         // from this booking on -- the same one wallet-truth writer, with its
         // grace and pending-fill rules, that the secondary bridge scan uses.
         // Only for a NEW booking: a replayed one was re-armed when it booked.
+        // A take is a TRADE: the correction it is owed must not reset the
+        // drawdown peak or the rolling window (a bridge flow re-arming the
+        // same asset keeps its capital-event reason).
         for (const AssetId& a : {AssetId{row.asset_id}, AssetId{"xch"}}) {
             inventory_reconciled_assets_.erase(a);
             inventory_reconcile_not_before_[a] = block_height;
+            inventory_reconcile_capital_.try_emplace(a, false);
         }
         spdlog::info("[Engine] Top-up take {}: bought {} mojos of {} for {} "
                      "XCH mojos (+{} fee) on {}, booked at block {}",
@@ -22299,7 +22304,15 @@ void Engine::step_update_pnl(BlockHeight block_height)
                     // grace.  Re-anchor as the secondary scan does -- restart
                     // semantics for the capital event, never a Net Deposits
                     // entry (the ledger row already carries that).
-                    if (config_.accounting.bridge_ingest_enabled
+                    // [review] ...but not when the only reason it was re-armed
+                    // is a top-up TAKE: that is a trade, and a trade's effect
+                    // on equity is performance, not capital.
+                    const auto reason = inventory_reconcile_capital_.find(aid);
+                    const bool capital_event =
+                        reason == inventory_reconcile_capital_.end()
+                        || reason->second;
+                    if (capital_event
+                        && config_.accounting.bridge_ingest_enabled
                         && accounting::is_secondary_bridge_asset(
                                config_.accounting.bridge_secondary_asset_ids,
                                aid)) {
@@ -22320,6 +22333,7 @@ void Engine::step_update_pnl(BlockHeight block_height)
                 }
                 inventory_reconciled_assets_.insert(aid);
                 inventory_reconcile_not_before_.erase(aid);
+                inventory_reconcile_capital_.erase(aid);
             }
         }
 

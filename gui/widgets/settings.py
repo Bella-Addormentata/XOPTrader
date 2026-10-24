@@ -3809,6 +3809,8 @@ class SettingsWidget(QWidget):
         wm = (reb or {}).get("wmillieth") if isinstance(reb, dict) else None
         wm = wm if isinstance(wm, dict) else {}
         self._wm_source.setChecked(_flag(wm.get("enabled"), False))
+        self._wm_source_loaded = (self._wm_source.isChecked()
+                                  and self._eth_auto_topup.isChecked())
         self._wm_buy.setChecked(_flag(wm.get("buy_on_dexie"), False))
         self._wm_premium.setValue(_num(wm.get("max_premium_pct"), 3.0))
         self._wm_max_spend.setValue(_num(wm.get("max_spend_xch"), 25.0))
@@ -3907,9 +3909,12 @@ class SettingsWidget(QWidget):
         elif had_wm and "rebalance" in out:
             out["rebalance"]["wmillieth"] = {"enabled": False}
         # The unwrap cap gates manual unwraps too, so it is written only when
-        # it was on disk, was touched, or the source needs one -- never
-        # invented, since stating a cap is what first allows an unwrap.
-        if (source or "max_unwrap_millieth" in self._warp_loaded_raw
+        # it was on disk, was touched, or the source was switched on in THIS
+        # session (the operator saw the cap beside it) -- never invented for
+        # a source already on at load, since stating a cap is what first
+        # allows an unwrap.
+        newly_on = source and not getattr(self, "_wm_source_loaded", False)
+        if (newly_on or "max_unwrap_millieth" in self._warp_loaded_raw
                 or "max_unwrap_millieth" in self._warp_edited
                 or self._wm_unwrap_cap_unlimited_loaded
                 or self._wm_unwrap_unlimited.isChecked()):

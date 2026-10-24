@@ -4644,7 +4644,11 @@ class _WarpWorker(QObject):
                         else None) or "https://api.dexie.space/v1")
         asks = dx.fetch_asks(_http_get_json, api_base, asset_id)
         engine._wallet.log_in()
-        own = engine._wallet.get_my_open_trade_ids()
+        # [review] Never an offer already attempted (any outcome): its id is
+        # the provisional key of that attempt's row, and a failed take of a
+        # still-listed ask must not be retried blind.
+        own = engine._wallet.get_my_open_trade_ids() | (
+            engine._store.take_offer_ids())
         ask = dx.pick_ask(
             asks, want_mojos=int(want_mojos), reference_xch_per_unit=ref,
             max_premium_pct=src.max_premium_pct,

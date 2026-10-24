@@ -655,6 +655,13 @@ class WarpJobStore:
                 raise StaleJobError(f"no submitting Dexie take {old}")
         return self.get_take(new)
 
+    def take_offer_ids(self) -> set[str]:
+        """Every maker offer id a take was ever attempted on."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT offer_id FROM dexie_takes").fetchall()
+        return {str(r["offer_id"]) for r in rows}
+
     def completed_job_states(self) -> list[dict]:
         """The state payload of EVERY completed job (no row limit)."""
         with self._lock:
