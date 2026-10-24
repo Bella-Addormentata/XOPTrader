@@ -119,12 +119,27 @@ def parse_asks(payload: Any, asset_id: str) -> list[DexieAsk]:
 
 
 def fetch_asks(get_json: GetJson, api_base: str, asset_id: str,
-               *, page_size: int = 20) -> list[DexieAsk]:
-    """Open Dexie asks for *asset_id* priced in XCH, cheapest first."""
+               *, page_size: int = 20, max_pages: int = 5) -> list[DexieAsk]:
+    """Open Dexie asks for *asset_id* priced in XCH, cheapest first.
+
+    Reads page after page (Dexie's ``page`` is 1-based) until a short page
+    ends the book or *max_pages* is reached: the cheapest asks may all be
+    ones the caller excludes (our own, ones already attempted), and an
+    eligible ask further down must still be seen.
+    """
     url = api_base.rstrip("/") + "/offers"
-    params = {"offered": _norm_id(asset_id), "requested": "xch",
-              "status": 0, "page_size": int(page_size), "sort": "price"}
-    return parse_asks(get_json(url, params, {}), asset_id)
+    asks: list[DexieAsk] = []
+    for page in range(1, int(max_pages) + 1):
+        params = {"offered": _norm_id(asset_id), "requested": "xch",
+                  "status": 0, "page_size": int(page_size), "page": page,
+                  "sort": "price"}
+        payload = get_json(url, params, {})
+        asks.extend(parse_asks(payload, asset_id))
+        offers = payload.get("offers") if isinstance(payload, dict) else None
+        if not isinstance(offers, list) or len(offers) < int(page_size):
+            break
+    asks.sort(key=lambda a: (a.xch_per_unit, a.xch_mojos))
+    return asks
 
 
 def reference_xch_per_millieth(get_json: GetJson,

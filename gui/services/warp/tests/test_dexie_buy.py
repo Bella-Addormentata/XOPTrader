@@ -77,7 +77,35 @@ def test_fetch_asks_queries_the_pair_cheapest_first():
     assert seen["params"]["offered"] == WM
     assert seen["params"]["requested"] == "xch"
     assert seen["params"]["status"] == 0
+    assert seen["params"]["page"] == 1, "a short first page ends the book"
     assert asks[0].trade_id == TID_A
+
+
+def test_fetch_asks_reads_past_a_full_first_page():
+    """[review] The first page may be all excluded asks; later pages count."""
+    pages = []
+
+    def get_json(url, params, headers):
+        pages.append(params["page"])
+        if params["page"] == 1:
+            return {"offers": [_offer(TID_B, 1.0, 10.0), _offer(TID_C, 2.0, 20.0)]}
+        return {"offers": [_offer(TID_A, 0.547, 1.8277)]}
+
+    asks = D.fetch_asks(get_json, "https://api.dexie.space/v1", WM, page_size=2)
+    assert pages == [1, 2]
+    assert [a.trade_id for a in asks] == [TID_A, TID_B, TID_C]
+
+
+def test_fetch_asks_stops_at_its_page_budget():
+    pages = []
+
+    def get_json(url, params, headers):
+        pages.append(params["page"])
+        return {"offers": [_offer(TID_B, 1.0, 10.0), _offer(TID_C, 2.0, 20.0)]}
+
+    D.fetch_asks(get_json, "https://api.dexie.space/v1", WM, page_size=2,
+                 max_pages=3)
+    assert pages == [1, 2, 3]
 
 
 # -- reference price ---------------------------------------------------------
