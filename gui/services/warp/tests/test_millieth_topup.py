@@ -709,3 +709,22 @@ def test_a_listing_the_wallet_refuses_is_not_picked_again(monkeypatch):
     w._rebalance_next_ok = 0.0
     w._maybe_rebalance(eng)
     assert eng._wallet.taken == [] and "nothing bought" in w._rebalance_last
+
+
+def test_a_buy_leaves_the_xch_its_own_unwrap_needs(monkeypatch):
+    """[review] With no engine fee reserve, a buy spending every mojo
+    would leave the bought CAT stuck at the unwrap's XCH gate (the toll,
+    plus the unwrap fee twice)."""
+    _http(monkeypatch)
+    w = _worker(_params(buy=True), {"strategy": {"fee_reserve_xch": 0}})
+    eng = FakeEngine()
+    eng._params.unwrap_chia_fee_mojos = 0
+    eng._wallet.xch_spendable = 1_827_800_000_000      # ask + fee, exactly
+    w._maybe_rebalance(eng)
+    assert eng._wallet.taken == []
+    assert "nothing bought" in w._rebalance_last
+    # With the toll's 0.001 XCH to spare, it buys.
+    w._rebalance_next_ok = 0.0
+    eng._wallet.xch_spendable = 1_828_800_000_000
+    w._maybe_rebalance(eng)
+    assert len(eng._wallet.taken) == 1

@@ -299,6 +299,13 @@ def _millieth_topup_minimums(max_fee_per_gas: int,
     return int(units), int(mojos)
 
 
+def _unwrap_xch_need(net: Any, params: Any) -> int:
+    """The spendable XCH an unwrap needs at G10: the toll plus the extra
+    Chia fee TWICE (once on the cat_spend, once on the toll funding send)."""
+    return int(net.chia_toll_mojos) + 2 * int(
+        getattr(params, "unwrap_chia_fee_mojos", 0) or 0)
+
+
 def _top_up_withdraw_short(eth_wei: int, max_fee_per_gas: int) -> bool:
     """Whether *eth_wei* falls short of a milliETH ``withdraw()``'s
     worst-case gas at *max_fee_per_gas* (BaseWallet.unwrap_millieth's bound)."""
@@ -2536,7 +2543,7 @@ class WarpEngine:
         # a nonzero fee pass here and stall mid-burn with the CAT already
         # committed to the burn address.  Harmless at the default fee of 0,
         # which is exactly why it survived until the 2026-08 fee study.
-        toll_need = net.chia_toll_mojos + 2 * p.unwrap_chia_fee_mojos
+        toll_need = _unwrap_xch_need(net, p)
         if int(xch.get("spendable_balance") or 0) < toll_need:
             raise WarpPending(
                 f"spendable XCH below the unwrap budget of {toll_need} mojos "
@@ -4942,7 +4949,11 @@ class _WarpWorker(QObject):
         # reserve: a covering ask it cannot afford must not be picked over an
         # affordable partial one, only to be refused on every cooldown. The
         # final balance recheck below still runs.
-        keep = _engine_xch_fee_reserve_mojos(self._config)
+        # [review] The floor is the larger of the engine's fee reserve and
+        # what the unwrap of this very purchase will need (G10): a buy that
+        # spent that too would leave the CAT stuck at the unwrap gate.
+        keep = max(_engine_xch_fee_reserve_mojos(self._config),
+                   _unwrap_xch_need(engine._net, engine._params))
         spendable = int(
             engine._wallet.get_wallet_balance(1).get("spendable_balance") or 0)
         budget = max(0, min(src.max_spend_xch_mojos, spendable - keep)
@@ -4959,8 +4970,9 @@ class _WarpWorker(QObject):
                 f"rebalance: no Dexie wmilliETH.b ask within "
                 f"{src.max_premium_pct:g}% of CoinGecko ({ref:.4f} XCH each) "
                 f"for at most {budget / 10 ** 12:g} XCH (Max XCH per Buy and "
-                f"the spendable XCH above the engine's {keep / 10 ** 12:g} XCH "
-                "fee reserve, less the take fee); nothing bought")
+                f"the spendable XCH above {keep / 10 ** 12:g} XCH -- the "
+                "engine's fee reserve or the unwrap's XCH, whichever is "
+                "larger -- less the take fee); nothing bought")
         try:
             dx.verify_offer(engine._wallet, ask, asset_id)
         except dx.DexieBuyError:
@@ -4969,12 +4981,12 @@ class _WarpWorker(QObject):
         cost = dx.buy_cost_mojos(ask, src.take_fee_mojos)
         spendable = int(
             engine._wallet.get_wallet_balance(1).get("spendable_balance") or 0)
-        keep = _engine_xch_fee_reserve_mojos(self._config)
         if spendable - cost < keep:
             raise WarpError(
                 f"a Dexie buy costing {cost / 10 ** 12:.6f} XCH would leave "
                 f"{(spendable - cost) / 10 ** 12:.6f} XCH spendable, under the "
-                f"engine's {keep / 10 ** 12:g} XCH fee reserve")
+                f"{keep / 10 ** 12:g} XCH kept back (the engine's fee reserve "
+                "or the unwrap's XCH, whichever is larger)")
         # [review] The intent is recorded BEFORE the irreversible RPC, under
         # the maker's offer id: a lost response, a crash or a failed write
         # after the take must still leave a row that blocks a second buy
