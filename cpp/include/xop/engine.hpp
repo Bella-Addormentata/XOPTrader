@@ -1860,6 +1860,13 @@ private:
     asio::awaitable<bool> fetch_bridge_balance(const AssetId& asset,
                                                BlockHeight block_height);
 
+    /// [WARP-MILLIETH review] Whether the wallet is known synced for the
+    /// secondary scan's balance reads: Step 8 passed its sync gate in this
+    /// heartbeat, else one on-demand get_sync_status per heartbeat.
+    asio::awaitable<bool> secondary_wallet_synced(BlockHeight block_height);
+    BlockHeight secondary_sync_checked_block_{0};
+    bool        secondary_sync_ok_{false};
+
     /// [WARP-MILLIETH] Record that @p asset_id's tracked inventory was
     /// just SET from the wallet (startup seed, Step 8 recovery seed,
     /// Step 11 one-shot reconcile, a secondary wallet-truth pass), so a
@@ -2674,10 +2681,12 @@ private:
     // ISO/IEC 27001:2022: continuous monitoring within a bounded time window.
     // ISO/IEC 5055: deque prevents unbounded memory growth.
     std::deque<std::pair<BlockHeight, double>> pnl_window_usd_;
-    /// [WARP-MILLIETH review] Step 13 cycles left that restart the rolling
-    /// window instead of extending it -- set by a booked secondary bridge
-    /// flow, whose State-based unrealized move is capital, not a loss.
-    int pnl_window_restart_cycles_{0};
+    /// [WARP-MILLIETH review] Assets with a booked secondary bridge flow
+    /// that State has not yet absorbed, and the block it was booked at:
+    /// Step 13 restarts the rolling window instead of extending it while
+    /// any remain, since the State-based unrealized move is capital, not a
+    /// loss.  Bounded by one loss window per entry.
+    std::unordered_map<std::string, BlockHeight> pnl_window_rebase_assets_;
 
     // [T3-08] NHE (Natural Hedge Efficiency) accumulators for step 10.
     // These running totals track net inventory change and total traded

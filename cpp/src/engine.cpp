@@ -20632,6 +20632,38 @@ asio::awaitable<bool> Engine::fetch_bridge_balance(const AssetId& asset,
     co_return false;
 }
 
+// [WARP-MILLIETH review] Whether the wallet is known synced for the
+// secondary scan's reads: Step 8 saw it synced in this heartbeat, or -- when
+// Step 8 did not get that far (a pause) -- an on-demand get_sync_status gives
+// the reading Step 8 requires (synced=true, syncing=false; a reply without
+// `syncing` reads as syncing).  Asked at most once per heartbeat.
+asio::awaitable<bool> Engine::secondary_wallet_synced(BlockHeight block_height)
+{
+    if (step8_sync_gate_passed_) co_return true;
+    if (secondary_sync_checked_block_ == block_height) {
+        co_return secondary_sync_ok_;
+    }
+    secondary_sync_checked_block_ = block_height;
+    secondary_sync_ok_ = false;
+    if (!wallet_ || !wallet_->is_open()
+        || !wallet_step_may_run("bridge ingest")) {
+        co_return false;
+    }
+    try {
+        const auto st = co_await wallet_->get_sync_status();
+        const bool synced = st.contains("synced") && st["synced"].is_boolean()
+                            && st["synced"].get<bool>();
+        const bool syncing = !st.contains("syncing")
+                             || !st["syncing"].is_boolean()
+                             || st["syncing"].get<bool>();
+        secondary_sync_ok_ = synced && !syncing;
+    } catch (const std::exception& ex) {
+        spdlog::debug("[Engine] Bridge ingest: sync check failed ({}) -- "
+                      "secondary booking deferred this heartbeat", ex.what());
+    }
+    co_return secondary_sync_ok_;
+}
+
 void Engine::note_inventory_absolute_write(const std::string& asset_id)
 {
     inventory_absolute_write_iso_[asset_id] = PnLTracker::timestamp_to_iso(
@@ -21101,6 +21133,9 @@ asio::awaitable<void> Engine::step_ingest_secondary_bridge_flows(
 
     bool reset_peak  = false;
     bool inv_changed = false;
+    // Assets whose booking moves total_pnl_usd as capital (see the window
+    // rebase at the end).
+    std::set<std::string> rebase_assets;
 
     // -- 1. Wallet-truth passes owed by earlier bookings ---------------------
     // Keys copied first: the loop suspends on the wallet read.
@@ -21117,15 +21152,14 @@ asio::awaitable<void> Engine::step_ingest_secondary_bridge_flows(
         // confirmation whose wallet effect the tracker has yet to see
         // (Step 11's one-shot rule) -- else setting to the wallet could
         // count that fill twice once it confirms.  [review] And only from
-        // a wallet Step 8 saw SYNCED in this heartbeat: the fetch below
-        // checks fields and pending change, not sync, and a mid-sync
-        // balance would set inventory to a partial figure and consume the
-        // pass.  While Step 8 does not run (a pause) the pass waits.
+        // a wallet known SYNCED: the fetch below checks fields and pending
+        // change, not sync, and a mid-sync balance would set inventory to a
+        // partial figure and consume the pass.
         if (block_height <= due.after_block
-            || !pending_unconfirmed_fills_.empty()
-            || !step8_sync_gate_passed_) {
+            || !pending_unconfirmed_fills_.empty()) {
             continue;
         }
+        if (!co_await secondary_wallet_synced(block_height)) continue;
         const AssetId a{aid};
         if (!co_await fetch_bridge_balance(a, block_height)) continue;
         const Mojo wallet = cached_wallet_balances_[a].confirmed;
@@ -21149,13 +21183,17 @@ asio::awaitable<void> Engine::step_ingest_secondary_bridge_flows(
             // restart restores it before any pass can run) may hold it too:
             // re-anchor whenever the pass moves it, whatever the flow's age.
             reset_peak = true;
+            rebase_assets.insert(aid);
             spdlog::info("[Engine] Bridge ingest: {} inventory {} -> {} mojos "
                          "from wallet truth (a booked flow overlapped an "
                          "earlier wallet-set quantity)",
                          aid.substr(0, 12), tracked, wallet);
         }
         note_inventory_absolute_write(aid);
-        reset_peak = reset_peak || due.reset_peak;
+        if (due.reset_peak) {
+            reset_peak = true;
+            rebase_assets.insert(aid);
+        }
         secondary_truth_due_.erase(aid);
     }
 
@@ -21233,7 +21271,10 @@ asio::awaitable<void> Engine::step_ingest_secondary_bridge_flows(
         // A settled snapshot that postdates this scan (bridge-asset scan,
         // rounds 17 and 31): booking against an older one would let the
         // invariant, next in this heartbeat, adjust the flow straight back.
-        if (!co_await fetch_bridge_balance(asset, block_height)) {
+        // [review] From a wallet known synced, or the cached snapshot the
+        // invariant then reads could be a mid-sync partial balance.
+        if (!co_await secondary_wallet_synced(block_height)
+            || !co_await fetch_bridge_balance(asset, block_height)) {
             spdlog::debug("[Engine] Bridge ingest: no settled {} wallet "
                           "snapshot -- booking deferred this heartbeat",
                           sid.substr(0, 12));
@@ -21312,7 +21353,10 @@ asio::awaitable<void> Engine::step_ingest_secondary_bridge_flows(
             // path an absolute write may already have taken the flow out of
             // equity, and Step 13, later this heartbeat, must not measure
             // that drop against the pre-flow peak.
-            reset_peak = reset_peak || in_process;
+            if (in_process) {
+                reset_peak = true;
+                rebase_assets.insert(sid);
+            }
 
             ++booked;
             booked_usd += val.flow_usd;
@@ -21347,12 +21391,11 @@ asio::awaitable<void> Engine::step_ingest_secondary_bridge_flows(
     // P&L marks the STATE balance, so moving a coin that has gained since
     // its cost moves total_pnl_usd by that gain: a withdrawal would read
     // as a trading loss.  Unlike the wUSDC.b numeraire, a secondary asset
-    // carries such gains.  The window restarts for this cycle and the next
-    // one, because the marks lag a heartbeat behind a State change that
-    // lands after Step 11 (Step 8 next heartbeat, or the State write when
-    // the pass corrects it).
-    if (reset_peak) {
-        pnl_window_restart_cycles_ = 2;
+    // carries such gains, and State takes the flow only when Step 8 next
+    // reconciles it to the wallet -- possibly heartbeats later (a pause).
+    // Step 13 restarts the window until it has.
+    for (const auto& a : rebase_assets) {
+        pnl_window_rebase_assets_[a] = block_height;
     }
 
     if (inv_changed) {
@@ -22887,10 +22930,38 @@ void Engine::step_check_alerts(BlockHeight block_height)
     if (config_.risk.max_window_loss_bps > 0.0) {
 
         // [WARP-MILLIETH review] A booked secondary bridge flow restarts the
-        // window (restart semantics, like the drawdown peak): see
-        // step_ingest_secondary_bridge_flows.
-        if (pnl_window_restart_cycles_ > 0) {
-            --pnl_window_restart_cycles_;
+        // window (restart semantics, like the drawdown peak; see
+        // step_ingest_secondary_bridge_flows) on every cycle until State
+        // holds the wallet's post-booking balance for that asset -- the
+        // marks feeding total_pnl_usd then include the flow, and Step 11
+        // marks after Step 8 in the same heartbeat, so the restart on the
+        // catch-up cycle is the last one.  Bounded by one window length: an
+        // asset whose State never catches up must not blind the breaker.
+        if (!pnl_window_rebase_assets_.empty()) {
+            for (auto it = pnl_window_rebase_assets_.begin();
+                 it != pnl_window_rebase_assets_.end();) {
+                const auto cit = cached_wallet_balances_.find(it->first);
+                const bool caught_up =
+                    state_ && cit != cached_wallet_balances_.end()
+                    && cit->second.fields_validated
+                    && cit->second.as_of_block >= it->second
+                    && state_->get_position(AssetId{it->first}).balance
+                           == cit->second.confirmed;
+                const bool expired = block_height >= it->second
+                    && block_height - it->second
+                           >= config_.risk.loss_window_blocks;
+                if (caught_up || expired) {
+                    if (!caught_up) {
+                        spdlog::warn("[Engine] Step 13: State for {} never "
+                                     "caught up with a booked bridge flow "
+                                     "within one loss window -- the rolling "
+                                     "window resumes", it->first.substr(0, 12));
+                    }
+                    it = pnl_window_rebase_assets_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
             pnl_window_usd_.clear();
         }
 
