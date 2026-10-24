@@ -250,9 +250,18 @@ class WalletClient:
         This is the wallet's reading of the spend bundle, not a third
         party's listing -- the Dexie buy checks it against Dexie's.
         """
+        return self.decode_offer(offer)[1]
+
+    def decode_offer(self, offer: str) -> tuple:
+        """``(offer id, summary)`` from the daemon's ``get_offer_summary``.
+
+        The id is the wallet's own name for the spend bundle -- the trade id
+        a take of it gets -- or "" when the daemon did not report one.
+        """
         data = self._post("get_offer_summary", {"offer": str(offer)})
         summary = data.get("summary")
-        return summary if isinstance(summary, dict) else {}
+        return (str(data.get("id") or ""),
+                summary if isinstance(summary, dict) else {})
 
     def check_offer_validity(self, offer: str) -> bool:
         """Whether every coin the offer spends is still unspent."""

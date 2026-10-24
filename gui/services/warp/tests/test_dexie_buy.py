@@ -184,11 +184,11 @@ def test_nothing_without_a_reference_or_a_need():
 # -- verifying ---------------------------------------------------------------
 
 class FakeWallet:
-    def __init__(self, summary, valid=True):
-        self.summary, self.valid = summary, valid
+    def __init__(self, summary, valid=True, offer_id="0x" + TID_A):
+        self.summary, self.valid, self.offer_id = summary, valid, offer_id
 
-    def get_offer_summary(self, offer):
-        return self.summary
+    def decode_offer(self, offer):
+        return self.offer_id, self.summary
 
     def check_offer_validity(self, offer):
         return self.valid
@@ -223,3 +223,26 @@ def test_any_disagreement_with_the_listing_refuses(summary, valid):
 def test_the_cost_is_price_plus_our_fee():
     assert D.buy_cost_mojos(_ask(), 100_000_000) == 1_827_800_000_000
     assert D.buy_cost_mojos(_ask(), -5) == 1_827_700_000_000
+
+
+
+@pytest.mark.parametrize("offer_id", ["0x" + TID_B, "", None])
+def test_the_offer_file_must_be_the_listed_trade_id(offer_id):
+    """[review] One of our offers listed under another id would slip past
+    the own-offer exclusion; the wallet's own id for the file decides."""
+    with pytest.raises(D.DexieBuyError, match="trade id"):
+        D.verify_offer(FakeWallet({"offered": {WM: 547},
+                                   "requested": {"xch": 1_827_700_000_000}},
+                                  offer_id=offer_id), _ask(), WM)
+
+
+def test_decimal_string_amounts_are_read_strictly():
+    """[review] Some wallets encode summary mojos as decimal strings."""
+    D.verify_offer(FakeWallet({"offered": {WM: "547"},
+                               "requested": {"xch": "1827700000000"}}),
+                   _ask(), WM)
+    for bad in ("547.0", "-547", " ", True, 547.0):
+        with pytest.raises(D.DexieBuyError):
+            D.verify_offer(FakeWallet({"offered": {WM: bad},
+                                       "requested": {"xch": 1_827_700_000_000}}),
+                           _ask(), WM)

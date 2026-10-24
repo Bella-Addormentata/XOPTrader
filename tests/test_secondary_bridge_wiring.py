@@ -142,6 +142,11 @@ def test_a_take_re_arms_without_resetting_the_risk_baselines():
     text = _engine()
     takes = _body(text, "asio::awaitable<void> Engine::step_ingest_topup_takes(")
     assert "inventory_reconcile_capital_.try_emplace(a, false);" in takes
+    # ...and only for an asset that had reconciled: a pending startup
+    # reconcile keeps its re-anchoring reason.
+    mark = takes.index("inventory_reconcile_capital_.try_emplace(a, false);")
+    assert "if (was_reconciled) {" in takes[mark - 200:mark]
+    assert "inventory_reconciled_assets_.erase(a) > 0;" in takes
     scan = _body(text, SECONDARY)
     assert "inventory_reconcile_capital_[sid] = true;" in scan
     step11 = _body(text, STEP11)

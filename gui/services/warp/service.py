@@ -4797,8 +4797,7 @@ class _WarpWorker(QObject):
             path = Path(_job_db_path(self._config, anchor=self._config_home()))
             if not path.is_file():
                 return
-            store = WarpJobStore(str(path))
-            try:
+            with WarpJobStore(str(path)) as store:
                 if not (store.list_takes(status=jobs.TAKE_SUBMITTED, limit=1)
                         or store.list_takes(status=jobs.TAKE_SUBMITTING,
                                             limit=1)):
@@ -4807,8 +4806,6 @@ class _WarpWorker(QObject):
 
                 self._settle_dexie_takes(SimpleNamespace(
                     _store=store, _wallet=self._chia_wallet_client()))
-            finally:
-                store.close()
         except Exception as exc:  # noqa: BLE001 -- a tick must not crash
             _log.debug("Dexie take settlement (no engine) failed: %s", exc)
 
@@ -4932,8 +4929,14 @@ class _WarpWorker(QObject):
         # [review] Never an offer already attempted (any outcome): its id is
         # the provisional key of that attempt's row, and a failed take of a
         # still-listed ask must not be retried blind.
+        # ...nor one our wallet already refused to verify (a listing whose
+        # id or amounts the offer file contradicts): it would be picked, and
+        # refused, again on every cooldown.
+        refused = getattr(self, "_dexie_refused", None)
+        if refused is None:
+            refused = self._dexie_refused = set()
         own = engine._wallet.get_my_open_trade_ids() | (
-            engine._store.take_offer_ids())
+            engine._store.take_offer_ids()) | refused
         # Max XCH per Buy bounds the whole debit: the ask AND our fee.
         # [review] So does what the wallet can spend above the engine's fee
         # reserve: a covering ask it cannot afford must not be picked over an
@@ -4958,7 +4961,11 @@ class _WarpWorker(QObject):
                 f"for at most {budget / 10 ** 12:g} XCH (Max XCH per Buy and "
                 f"the spendable XCH above the engine's {keep / 10 ** 12:g} XCH "
                 "fee reserve, less the take fee); nothing bought")
-        dx.verify_offer(engine._wallet, ask, asset_id)
+        try:
+            dx.verify_offer(engine._wallet, ask, asset_id)
+        except dx.DexieBuyError:
+            refused.add(ask.trade_id)
+            raise
         cost = dx.buy_cost_mojos(ask, src.take_fee_mojos)
         spendable = int(
             engine._wallet.get_wallet_balance(1).get("spendable_balance") or 0)

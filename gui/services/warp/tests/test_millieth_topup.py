@@ -57,8 +57,8 @@ class FakeWallet:
         return {"spendable_balance": self.wm_spendable,
                 "confirmed_wallet_balance": self.wm_confirmed}
 
-    def get_offer_summary(self, offer):
-        return self.summary
+    def decode_offer(self, offer):
+        return "0x" + MAKER_TID, self.summary
 
     def check_offer_validity(self, offer):
         return self.valid
@@ -673,22 +673,18 @@ def test_takes_settle_with_warp_disabled(tmp_path):
     """[review] Turning warp.enabled off must not strand a submitted take:
     settlement runs on the store and the wallet alone."""
     db = tmp_path / "warp_jobs.db"
-    store = J.WarpJobStore(str(db))
-    store.record_take(trade_id=OUR_TID, offer_id=MAKER_TID, asset_id=WM,
-                      cat_mojos=547, xch_mojos=10, fee_mojos=0,
-                      status=J.TAKE_SUBMITTED)
-    store.close()
+    with J.WarpJobStore(str(db)) as store:
+        store.record_take(trade_id=OUR_TID, offer_id=MAKER_TID, asset_id=WM,
+                          cat_mojos=547, xch_mojos=10, fee_mojos=0,
+                          status=J.TAKE_SUBMITTED)
     w = _worker(_params(), {"warp": {"enabled": False, "jobs_db": str(db)}})
     w._secrets_path = None
     wallet = FakeWallet()
     wallet.trade_status = "CONFIRMED"
     w._chia_wallet_client = lambda: wallet
     w._settle_takes_without_engine()
-    store = J.WarpJobStore(str(db))
-    try:
+    with J.WarpJobStore(str(db)) as store:
         assert store.get_take(OUR_TID).status == J.TAKE_CONFIRMED
-    finally:
-        store.close()
 
 
 def test_no_store_file_means_no_settlement_and_no_new_database(tmp_path):
@@ -698,3 +694,18 @@ def test_no_store_file_means_no_settlement_and_no_new_database(tmp_path):
     w._chia_wallet_client = lambda: (_ for _ in ()).throw(AssertionError())
     w._settle_takes_without_engine()
     assert not db.exists()
+
+
+
+def test_a_listing_the_wallet_refuses_is_not_picked_again(monkeypatch):
+    """[review] A listing whose offer file contradicts it is skipped on
+    later consults instead of being refused every cooldown."""
+    _http(monkeypatch)
+    w, eng = _worker(_params(buy=True)), FakeEngine()
+    eng._wallet.decode_offer = lambda offer: ("0x" + "ee" * 32,
+                                              eng._wallet.summary)
+    w._maybe_rebalance(eng)
+    assert eng._wallet.taken == [] and "trade id" in w._rebalance_last
+    w._rebalance_next_ok = 0.0
+    w._maybe_rebalance(eng)
+    assert eng._wallet.taken == [] and "nothing bought" in w._rebalance_last

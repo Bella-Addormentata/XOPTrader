@@ -12,8 +12,9 @@ parties that do not share a failure:
   amounts, price and identity all come from a third-party API.
 * **Our own wallet** decodes the offer file (``get_offer_summary``) and must
   report EXACTLY the amounts Dexie listed -- the maker offering only
-  wmilliETH.b, asking only XCH -- and ``check_offer_validity`` must say its
-  coins are still unspent. Only then is it taken.
+  wmilliETH.b, asking only XCH -- under the very trade id Dexie listed, and
+  ``check_offer_validity`` must say its coins are still unspent. Only then
+  is it taken.
 
 The price ceiling comes from a third source, CoinGecko: an ask is eligible
 only when its XCH per wmilliETH.b is within ``max_premium_pct`` of
@@ -195,20 +196,40 @@ def pick_ask(asks: Iterable[DexieAsk], *, want_mojos: int,
     return eligible[0] if eligible else None
 
 
+def _strict_mojos(value: Any) -> Optional[int]:
+    """A summary amount as an int: an int, or a decimal-digit string (some
+    wallets encode mojos that way); anything else (a bool, a float, a
+    signed or fractional string) is None, which never matches a listing."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
 def verify_offer(wallet: Any, ask: DexieAsk, asset_id: str) -> None:
     """Raise :class:`DexieBuyError` unless our wallet reads *ask* as listed.
 
-    The maker must offer exactly ``cat_mojos`` of *asset_id* and nothing
-    else, and request exactly ``xch_mojos`` of XCH and nothing else; and the
+    The wallet's own id for the offer file must be the trade id Dexie
+    listed -- the id the own-offer exclusion and the take's records key on,
+    so a listing cannot pass one of our offers off under another id. The
+    maker must offer exactly ``cat_mojos`` of *asset_id* and nothing else,
+    and request exactly ``xch_mojos`` of XCH and nothing else; and the
     wallet must report the offer still valid (its coins unspent).
     """
-    summary = wallet.get_offer_summary(ask.offer)
+    offer_id, summary = wallet.decode_offer(ask.offer)
+    if _norm_id(offer_id) != ask.trade_id:
+        raise DexieBuyError(
+            f"the wallet names the offer file {offer_id or 'nothing'!s:.20}, "
+            f"not the trade id {ask.trade_id[:16]}... Dexie listed")
     offered = summary.get("offered") if isinstance(summary, dict) else None
     requested = summary.get("requested") if isinstance(summary, dict) else None
     if not isinstance(offered, dict) or not isinstance(requested, dict):
         raise DexieBuyError("the wallet could not summarise the offer")
-    offered_n = {_norm_id(k): v for k, v in offered.items()}
-    requested_n = {_norm_id(k): v for k, v in requested.items()}
+    offered_n = {_norm_id(k): _strict_mojos(v) for k, v in offered.items()}
+    requested_n = {_norm_id(k): _strict_mojos(v) for k, v in requested.items()}
     if offered_n != {_norm_id(asset_id): ask.cat_mojos}:
         raise DexieBuyError(
             f"the offer gives {offered_n}, not the {ask.cat_mojos} "

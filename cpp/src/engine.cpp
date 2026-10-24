@@ -21754,9 +21754,16 @@ asio::awaitable<void> Engine::step_ingest_topup_takes(BlockHeight block_height)
         // same asset keeps its capital-event reason).
         for (const AssetId& a : {AssetId{row.asset_id}, AssetId{"xch"}}) {
             if (!(a == "xch" ? book_xch : book_cat)) continue;
-            inventory_reconciled_assets_.erase(a);
+            // [review] Marked a trade-only re-arm ONLY when the asset had
+            // already reconciled: one still owed its startup reconcile
+            // keeps that reason (absent = re-anchors), since the correction
+            // it gets may include a capital change made while we were down.
+            const bool was_reconciled =
+                inventory_reconciled_assets_.erase(a) > 0;
             inventory_reconcile_not_before_[a] = block_height;
-            inventory_reconcile_capital_.try_emplace(a, false);
+            if (was_reconciled) {
+                inventory_reconcile_capital_.try_emplace(a, false);
+            }
         }
         spdlog::info("[Engine] Top-up take {}: bought {} mojos of {} for {} "
                      "XCH mojos (+{} fee) on {}, booked at block {}",
