@@ -330,6 +330,9 @@ SECRET_KEYS: dict[str, set[str]] = {
         "wallet_key_path",
         "ca_cert_path",
     },
+    # Sage wallet link (Settings > Wallet Link): machine-specific paths,
+    # kept with the chia cert paths for the same reason.
+    "wallet_link": {"sage_cert_path", "sage_key_path"},
     "monitoring": {"telegram_bot_token", "telegram_chat_id"},
     "coingecko": {"api_key"},
     "database": {"path"},

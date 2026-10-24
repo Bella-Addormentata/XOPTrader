@@ -290,6 +290,40 @@ class _SuggestedTargetsWorker(QObject):
 
 
 # ===================================================================
+# Background worker: Wallet Link connection tests
+# ===================================================================
+
+class _WalletProbeWorker(QObject):
+    """Runs one read-only wallet RPC probe off the UI thread.
+
+    Same pattern as ``_SuggestedTargetsWorker``: moved to a QThread, the
+    result comes back through a queued signal.  A probe is up to three
+    RPC calls with a 5 s timeout each, far too long for the event loop.
+    """
+
+    done = Signal(str, bool, str)   # target ("chia" | "sage"), ok, summary
+
+    def __init__(self, target: str, params: dict[str, Any]) -> None:
+        super().__init__()
+        self._target = target
+        self._params = params
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            from gui.services import wallet_link  # noqa: WPS433
+
+            probe = (
+                wallet_link.probe_sage if self._target == "sage"
+                else wallet_link.probe_chia_wallet
+            )
+            result = probe(**self._params)
+            self.done.emit(self._target, result.ok, result.summary)
+        except Exception as exc:  # noqa: BLE001 -- report, never crash
+            self.done.emit(self._target, False, f"Test failed: {exc}")
+
+
+# ===================================================================
 # YAML syntax highlighter for the Advanced tab raw editor
 # ===================================================================
 
@@ -496,6 +530,9 @@ class SettingsWidget(QWidget):
         # {pair_name: {"ratio": float|None, "artifact": bool, "reason": str}}
         self._suggested_targets: Optional[dict[str, dict]] = None
         self._suggest_thread: Optional[QThread] = None
+        # Wallet Link connection tests in flight, keyed "chia" / "sage".
+        self._probe_threads: dict[str, QThread] = {}
+        self._probe_workers: dict[str, QObject] = {}
         # Keep a Python reference to the worker while it runs: PySide6
         # would otherwise garbage-collect the unparented QObject before
         # the thread invokes it.
@@ -574,6 +611,7 @@ class SettingsWidget(QWidget):
             ("Appearance", self._build_appearance_tab),       # 9
             ("Startup", self._build_startup_tab),             # 10
             ("Advanced", self._build_advanced_tab),           # 11
+            ("Wallet Link", self._build_wallet_link_tab),     # 12
         ]
         for idx, (title_text, builder) in enumerate(tab_builders):
             widget = builder()
@@ -682,51 +720,16 @@ class SettingsWidget(QWidget):
         layout.addWidget(fn_group)
 
         # -- Wallet --
-        wl_group = QGroupBox("Wallet")
-        wl_form = QFormLayout(wl_group)
-        wl_form.setSpacing(8)
-
-        self._wl_host = QLineEdit()
-        self._wl_host.setPlaceholderText("localhost")
-        self._wl_host.setToolTip("Hostname or IP of the Chia wallet RPC")
-        wl_form.addRow("Host:", self._wl_host)
-
-        self._wl_port = QSpinBox()
-        self._wl_port.setRange(1, 65535)
-        self._wl_port.setValue(9256)
-        self._wl_port.setToolTip("TCP port of the Chia wallet RPC (default 9256)")
-        wl_form.addRow("Port:", self._wl_port)
-
-        self._wl_cert = self._make_path_row(
-            wl_form, "SSL Cert:", "wallet_cert_path",
-            "Path to wallet SSL certificate (.crt)",
-            "Certificate Files (*.crt *.pem);;All Files (*)",
+        # The wallet RPC fields live on the Wallet Link page, next to the
+        # Sage link, so every wallet the bot can talk to is set up in one
+        # place.
+        wl_note = QLabel(
+            "Wallet connection settings (Chia wallet and Sage) are on the "
+            "Wallet Link page."
         )
-        self._wl_key = self._make_path_row(
-            wl_form, "SSL Key:", "wallet_key_path",
-            "Path to wallet SSL private key (.key)",
-            "Key Files (*.key *.pem);;All Files (*)",
-        )
-
-        self._wl_fingerprint = QSpinBox()
-        self._wl_fingerprint.setRange(0, 2_147_483_647)
-        self._wl_fingerprint.setValue(0)
-        self._wl_fingerprint.setToolTip("Wallet fingerprint (integer)")
-        wl_form.addRow("Fingerprint:", self._wl_fingerprint)
-
-        self._wl_test_btn = QPushButton("Test Connection")
-        self._wl_test_btn.setToolTip("Attempt to reach the wallet RPC")
-        self._wl_test_btn.clicked.connect(
-            lambda: self._test_connection("wallet")
-        )
-        self._wl_test_result = QLabel("")
-        wl_test_row = QHBoxLayout()
-        wl_test_row.addWidget(self._wl_test_btn)
-        wl_test_row.addWidget(self._wl_test_result)
-        wl_test_row.addStretch(1)
-        wl_form.addRow("", wl_test_row)
-
-        layout.addWidget(wl_group)
+        wl_note.setWordWrap(True)
+        wl_note.setStyleSheet(f"color: {_C.TEXT_SECONDARY};")
+        layout.addWidget(wl_note)
 
         # -- Dexie --
         dx_group = QGroupBox("Dexie API")
@@ -759,13 +762,12 @@ class SettingsWidget(QWidget):
         # Wire change signals for dirty tracking (tab index 0).
         for widget in (
             self._fn_host, self._fn_cert, self._fn_key,
-            self._wl_host, self._wl_cert, self._wl_key,
             self._dx_api_base,
         ):
             widget.textChanged.connect(lambda _t, ti=0: self._mark_dirty(ti))
 
         for widget in (
-            self._fn_port, self._wl_port, self._wl_fingerprint,
+            self._fn_port,
             self._dx_rate_limit,
         ):
             widget.valueChanged.connect(lambda _v, ti=0: self._mark_dirty(ti))
@@ -1837,6 +1839,184 @@ class SettingsWidget(QWidget):
             _widget_signal.connect(
                 lambda *_a, ti=11: self._mark_dirty(ti)
             )
+
+        return page
+
+    # -------------------------------------------------------------------
+    # Wallet Link tab
+    # -------------------------------------------------------------------
+
+    def _build_wallet_link_tab(self) -> QWidget:
+        """Build the Wallet Link tab: the Chia wallet and an optional Sage link.
+
+        The Chia wallet group is the one that used to sit on the Connection
+        tab; its widgets and config keys are unchanged.  The Sage link is
+        new, off by default, and read-only for now (see
+        gui/services/wallet_link.py).
+        """
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
+
+        intro = QLabel(
+            "Link XOPTrader to the wallet software on this computer. Both "
+            "wallets run a local RPC server that only answers programs "
+            "holding the wallet's own certificate, so nothing here leaves "
+            "this machine. Use Detect to find the files, then Test Connection."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        # -- Chia wallet (official) --
+        wl_group = QGroupBox("Chia wallet (official)")
+        wl_form = QFormLayout(wl_group)
+        wl_form.setSpacing(8)
+
+        wl_help = QLabel(
+            "XOPTrader trades through this wallet: it makes, takes and "
+            "cancels offers over the Chia wallet RPC (port 9256 by default). "
+            "The link is authenticated with the wallet's own private_wallet "
+            "certificate from the Chia install."
+        )
+        wl_help.setWordWrap(True)
+        wl_help.setStyleSheet(f"color: {_C.TEXT_SECONDARY};")
+        wl_form.addRow(wl_help)
+
+        self._wl_host = QLineEdit()
+        self._wl_host.setPlaceholderText("localhost")
+        self._wl_host.setToolTip("Hostname or IP of the Chia wallet RPC")
+        wl_form.addRow("Host:", self._wl_host)
+
+        self._wl_port = QSpinBox()
+        self._wl_port.setRange(1, 65535)
+        self._wl_port.setValue(9256)
+        self._wl_port.setToolTip("TCP port of the Chia wallet RPC (default 9256)")
+        wl_form.addRow("Port:", self._wl_port)
+
+        self._wl_cert = self._make_path_row(
+            wl_form, "SSL Cert:", "wallet_cert_path",
+            "Path to wallet SSL certificate (.crt)",
+            "Certificate Files (*.crt *.pem);;All Files (*)",
+        )
+        self._wl_key = self._make_path_row(
+            wl_form, "SSL Key:", "wallet_key_path",
+            "Path to wallet SSL private key (.key)",
+            "Key Files (*.key *.pem);;All Files (*)",
+        )
+
+        self._wl_fingerprint = QSpinBox()
+        self._wl_fingerprint.setRange(0, 2_147_483_647)
+        self._wl_fingerprint.setValue(0)
+        self._wl_fingerprint.setToolTip("Wallet fingerprint (integer)")
+        wl_form.addRow("Fingerprint:", self._wl_fingerprint)
+
+        self._wl_detect_btn = QPushButton("Detect")
+        self._wl_detect_btn.setToolTip(
+            "Fill these fields from the local Chia install\n"
+            "(CHIA_ROOT, or ~/.chia/mainnet)"
+        )
+        self._wl_detect_btn.clicked.connect(
+            lambda: self._on_wallet_link_detect("chia")
+        )
+        self._wl_test_btn = QPushButton("Test Connection")
+        self._wl_test_btn.setToolTip(
+            "Read sync state, fingerprint and XCH balance from the wallet RPC"
+        )
+        self._wl_test_btn.clicked.connect(
+            lambda: self._start_wallet_probe("chia")
+        )
+        self._wl_test_result = QLabel("")
+        self._wl_test_result.setWordWrap(True)
+        wl_test_row = QHBoxLayout()
+        wl_test_row.addWidget(self._wl_detect_btn)
+        wl_test_row.addWidget(self._wl_test_btn)
+        wl_test_row.addWidget(self._wl_test_result, stretch=1)
+        wl_form.addRow("", wl_test_row)
+
+        layout.addWidget(wl_group)
+
+        # -- Sage wallet --
+        sg_group = QGroupBox("Sage wallet")
+        sg_form = QFormLayout(sg_group)
+        sg_form.setSpacing(8)
+
+        sg_help = QLabel(
+            "Sage keeps its RPC server off until you turn it on in Sage's "
+            "settings (RPC server, port 9257). Linking Sage is read-only for "
+            "now: XOPTrader can check Sage's sync state and balance, but it "
+            "still trades through the Chia wallet above."
+        )
+        sg_help.setWordWrap(True)
+        sg_help.setStyleSheet(f"color: {_C.TEXT_SECONDARY};")
+        sg_form.addRow(sg_help)
+
+        self._sage_enabled = QCheckBox("Link Sage wallet")
+        self._sage_enabled.setChecked(False)
+        self._sage_enabled.setToolTip(
+            "Off by default. Saved as wallet_link.sage_enabled."
+        )
+        sg_form.addRow("", self._sage_enabled)
+
+        self._sage_host = QLineEdit()
+        self._sage_host.setPlaceholderText("127.0.0.1")
+        self._sage_host.setToolTip(
+            "Sage's RPC server only listens on this computer (127.0.0.1)"
+        )
+        sg_form.addRow("Host:", self._sage_host)
+
+        self._sage_port = QSpinBox()
+        self._sage_port.setRange(1, 65535)
+        self._sage_port.setValue(9257)
+        self._sage_port.setToolTip("TCP port of the Sage RPC (default 9257)")
+        sg_form.addRow("Port:", self._sage_port)
+
+        self._sage_cert = self._make_path_row(
+            sg_form, "SSL Cert:", "sage_cert_path",
+            "Sage's wallet.crt, in the ssl folder of Sage's data folder",
+            "Certificate Files (*.crt *.pem);;All Files (*)",
+        )
+        self._sage_key = self._make_path_row(
+            sg_form, "SSL Key:", "sage_key_path",
+            "Sage's wallet.key, next to wallet.crt",
+            "Key Files (*.key *.pem);;All Files (*)",
+        )
+
+        self._sage_detect_btn = QPushButton("Detect")
+        self._sage_detect_btn.setToolTip(
+            "Find Sage's data folder, certificate and RPC port"
+        )
+        self._sage_detect_btn.clicked.connect(
+            lambda: self._on_wallet_link_detect("sage")
+        )
+        self._sage_test_btn = QPushButton("Test Connection")
+        self._sage_test_btn.setToolTip(
+            "Read Sage's version, logged-in wallet, sync progress and balance"
+        )
+        self._sage_test_btn.clicked.connect(
+            lambda: self._start_wallet_probe("sage")
+        )
+        self._sage_test_result = QLabel("")
+        self._sage_test_result.setWordWrap(True)
+        sg_test_row = QHBoxLayout()
+        sg_test_row.addWidget(self._sage_detect_btn)
+        sg_test_row.addWidget(self._sage_test_btn)
+        sg_test_row.addWidget(self._sage_test_result, stretch=1)
+        sg_form.addRow("", sg_test_row)
+
+        layout.addWidget(sg_group)
+        layout.addStretch(1)
+
+        for widget in (
+            self._wl_host, self._wl_cert, self._wl_key,
+            self._sage_host, self._sage_cert, self._sage_key,
+        ):
+            widget.textChanged.connect(lambda _t, ti=12: self._mark_dirty(ti))
+        for widget in (self._wl_port, self._wl_fingerprint, self._sage_port):
+            widget.valueChanged.connect(lambda _v, ti=12: self._mark_dirty(ti))
+        self._sage_enabled.stateChanged.connect(
+            lambda _s, ti=12: self._mark_dirty(ti)
+        )
 
         return page
 
@@ -3085,6 +3265,17 @@ class SettingsWidget(QWidget):
             "wallet_fingerprint": self._wl_fingerprint.value(),
         }
 
+        # -- wallet_link --
+        # Optional second wallet.  The cert/key paths are machine-specific
+        # and go to secrets.yaml like the chia ones (config_split.SECRET_KEYS).
+        cfg["wallet_link"] = {
+            "sage_enabled": self._sage_enabled.isChecked(),
+            "sage_host": self._sage_host.text().strip() or "127.0.0.1",
+            "sage_port": self._sage_port.value(),
+            "sage_cert_path": self._sage_cert.text().strip(),
+            "sage_key_path": self._sage_key.text().strip(),
+        }
+
         # -- dexie --
         cfg["dexie"] = {
             "api_base": self._dx_api_base.text(),
@@ -3384,6 +3575,20 @@ class SettingsWidget(QWidget):
             self._wl_fingerprint.setValue(
                 int(chia.get("wallet_fingerprint", 0))
             )
+
+            # Absent on every install made before the Wallet Link page:
+            # fall back to the shipped defaults (Sage link off).
+            link = cfg.get("wallet_link") or {}
+            if not isinstance(link, dict):
+                link = {}
+            self._sage_enabled.setChecked(bool(link.get("sage_enabled", False)))
+            self._sage_host.setText(str(link.get("sage_host") or "127.0.0.1"))
+            try:
+                self._sage_port.setValue(int(link.get("sage_port") or 9257))
+            except (TypeError, ValueError):
+                self._sage_port.setValue(9257)
+            self._sage_cert.setText(str(link.get("sage_cert_path") or ""))
+            self._sage_key.setText(str(link.get("sage_key_path") or ""))
 
             dexie = cfg.get("dexie", {})
             self._dx_api_base.setText(
@@ -3999,6 +4204,8 @@ class SettingsWidget(QWidget):
             self._fn_host, self._fn_port, self._fn_cert, self._fn_key,
             self._wl_host, self._wl_port, self._wl_cert, self._wl_key,
             self._wl_fingerprint,
+            self._sage_enabled, self._sage_host, self._sage_port,
+            self._sage_cert, self._sage_key,
             self._dx_api_base, self._dx_rate_limit,
             self._pairs_table,
             self._gamma, self._kappa, self._phi, self._q_max,
@@ -4758,6 +4965,14 @@ class SettingsWidget(QWidget):
         Child widgets do not receive closeEvent when the top-level window
         closes, which is why this is public and called by MainWindow.
         """
+        # Wallet Link probes: read-only RPC reads, same shutdown rule.
+        for target, probe_thread in list(self._probe_threads.items()):
+            probe_thread.quit()
+            if not probe_thread.wait(timeout_ms):
+                probe_thread.terminate()
+                probe_thread.wait(1000)
+            self._probe_threads.pop(target, None)
+
         thread = self._suggest_thread
         if thread is None:
             return
@@ -5190,6 +5405,131 @@ class SettingsWidget(QWidget):
         label.setText(f"Connecting to {host}:{port}...")
         label.setStyleSheet(f"color: {_C.WARNING_YELLOW};")
         log.info("Connection test requested: %s -> %s:%d", target, host, port)
+
+    # ===================================================================
+    # Wallet Link: detect + connection test
+    # ===================================================================
+
+    def _wallet_link_widgets(self, target: str) -> dict[str, Any]:
+        """The host/port/cert/key widgets and result label for *target*."""
+        if target == "sage":
+            return {
+                "host": self._sage_host, "port": self._sage_port,
+                "cert": self._sage_cert, "key": self._sage_key,
+                "button": self._sage_test_btn,
+                "label": self._sage_test_result,
+                "default_host": "127.0.0.1",
+            }
+        return {
+            "host": self._wl_host, "port": self._wl_port,
+            "cert": self._wl_cert, "key": self._wl_key,
+            "button": self._wl_test_btn,
+            "label": self._wl_test_result,
+            "default_host": "localhost",
+        }
+
+    def _set_link_status(self, label: QLabel, text: str, tone: str) -> None:
+        colour = {
+            "ok": _C.PROFIT_GREEN, "busy": _C.WARNING_YELLOW,
+        }.get(tone, _C.LOSS_RED)
+        label.setText(text)
+        label.setStyleSheet(f"color: {colour};")
+
+    def _on_wallet_link_detect(self, target: str) -> None:
+        """Fill *target*'s fields from what is installed on this computer.
+
+        Only runs when the operator clicks Detect, and only overwrites the
+        fields it actually found, so a hand-set path is never blanked.
+        The page is marked dirty through the normal widget signals; nothing
+        is written until Save.
+        """
+        from gui.services import wallet_link  # noqa: WPS433
+
+        w = self._wallet_link_widgets(target)
+        if target == "sage":
+            found = wallet_link.detect_sage()
+            if not found.get("found"):
+                where = ", ".join(
+                    p.as_posix() for p in wallet_link.sage_data_dirs()
+                )
+                self._set_link_status(
+                    w["label"], f"Sage not found (looked in {where}).", "err"
+                )
+                return
+        else:
+            found = wallet_link.detect_chia_wallet()
+            if not found.get("found"):
+                self._set_link_status(
+                    w["label"],
+                    "Chia wallet certificates not found (looked in "
+                    "CHIA_ROOT and ~/.chia/mainnet).",
+                    "err",
+                )
+                return
+
+        if not w["host"].text().strip():
+            w["host"].setText(w["default_host"])
+        w["port"].setValue(int(found["port"]))
+        if found.get("cert_path"):
+            w["cert"].setText(found["cert_path"])
+        if found.get("key_path"):
+            w["key"].setText(found["key_path"])
+
+        if target == "sage":
+            msg = f"Found Sage in {found['data_dir']}."
+            if found.get("rpc_enabled") is False:
+                msg += (" Its RPC server is turned off: turn it on in "
+                        "Sage's settings, then Test Connection.")
+                self._set_link_status(w["label"], msg, "busy")
+                return
+        else:
+            fp = found.get("fingerprint")
+            if fp and self._wl_fingerprint.value() == 0:
+                self._wl_fingerprint.setValue(int(fp))
+            msg = f"Found Chia in {found['root']}."
+        self._set_link_status(w["label"], msg + " Save to keep it.", "ok")
+
+    def _start_wallet_probe(self, target: str) -> None:
+        """Run a read-only connection test for *target* on a worker thread."""
+        if target in self._probe_threads:
+            return
+        w = self._wallet_link_widgets(target)
+        params = {
+            "host": w["host"].text().strip() or w["default_host"],
+            "port": w["port"].value(),
+            "cert_path": w["cert"].text().strip(),
+            "key_path": w["key"].text().strip(),
+        }
+        self._set_link_status(
+            w["label"], f"Connecting to {params['host']}:{params['port']}...",
+            "busy",
+        )
+        w["button"].setEnabled(False)
+        log.info("Wallet link test requested: %s -> %s:%d",
+                 target, params["host"], params["port"])
+
+        thread = QThread(self)
+        worker = _WalletProbeWorker(target, params)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.done.connect(self._on_wallet_probe_done)
+        worker.done.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(
+            lambda t=target: self._probe_threads.pop(t, None)
+        )
+        # Hold a Python reference until the result arrives.
+        self._probe_workers[target] = worker
+        self._probe_threads[target] = thread
+        thread.start()
+
+    @Slot(str, bool, str)
+    def _on_wallet_probe_done(self, target: str, ok: bool, summary: str) -> None:
+        w = self._wallet_link_widgets(target)
+        w["button"].setEnabled(True)
+        self._set_link_status(w["label"], summary, "ok" if ok else "err")
+        self._probe_workers.pop(target, None)
 
     # ===================================================================
     # Telegram test stub
