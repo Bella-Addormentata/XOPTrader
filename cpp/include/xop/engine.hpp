@@ -1881,6 +1881,13 @@ private:
     /// top of a quantity that may already contain it.
     void note_inventory_absolute_write(const std::string& asset_id);
 
+    /// [MILLIETH-TOPUP 2026-10-24] Book the warp rebalancer's confirmed
+    /// Dexie buys (warp_jobs.db dexie_takes) as takes: base, quote and fee
+    /// legs under "take:<trade_id>" and a taker_fills row.  Read-only,
+    /// idempotent per trade (ledger event_id uniqueness).  Runs before the
+    /// invariant.  See accounting/topup_take.hpp.
+    void step_ingest_topup_takes(BlockHeight block_height);
+
     /// Tie the ledger's implied balances to the wallet's confirmed balances
     /// and escalate on sustained, unexplained divergence.  Alert-only unless
     /// accounting.pause_enabled is set.
@@ -2259,6 +2266,11 @@ private:
     /// earlier wallet-set write, and the booking block: the reconcile then
     /// accepts only a snapshot taken at or after it.
     std::unordered_map<std::string, BlockHeight> inventory_reconcile_not_before_;
+
+    /// [MILLIETH-TOPUP] Top-up takes already decided this process (booked,
+    /// found booked, or inside an opening), and those already warned about.
+    std::set<std::string> topup_booked_ids_;
+    std::set<std::int64_t> topup_warned_ids_;
 
     /// [S18 2026-08-23] Consecutive lifted evaluations of the max-drawdown
     /// condition; the re-alert gate only re-arms once this reaches the

@@ -293,10 +293,21 @@ def test_jobs_table_populates_with_status_and_error(qapp):
     assert table.rowCount() == 2
     # Human-readable status label, amounts, and the error tooltip.
     assert table.item(0, 0).text() == "Completed"
-    assert table.item(0, 1).text() == "2.00"          # 2_000_000 micros
-    assert table.item(0, 2).text() == "1.994"         # post-tip mojos / 1000
+    assert table.item(0, 1).text() == "2.00 USDC"     # 2_000_000 micros
+    assert table.item(0, 2).text() == "1.994 wUSDC.b"  # post-tip mojos / 1000
     assert table.item(1, 0).text() == "Failed"
     assert table.item(1, 0).toolTip() == "node rejected bundle"
+
+
+def test_a_millieth_job_shows_its_own_units(qapp):
+    """[MILLIETH-TOPUP] amount_usdc_micros holds milliETH BASE units (3
+    decimals) for a milliETH job; read as micro-USDC it showed 0.00."""
+    job = _job(id=3, status="COMPLETED")
+    job.update(asset="milliETH", amount_usdc_micros=547, amount_mojos=547,
+               post_tip_mojos=None)
+    w = _make(qapp, _full(jobs=[job]))
+    assert w._jobs_table.item(0, 1).text() == "0.547 milliETH"
+    assert w._jobs_table.item(0, 2).text() == "0.547 wmilliETH.b"
 
 
 def test_explorer_urls_mainnet(qapp):
@@ -452,7 +463,8 @@ def test_unwrap_click_emits_mojos_destination_and_relay_mode(qapp):
     w = _make(qapp, {"enabled": True})
     got = []
     w.unwrap_requested.connect(
-        lambda mojos, dest, external: got.append((mojos, dest, external))
+        lambda mojos, dest, external, asset: got.append(
+            (mojos, dest, external, asset))
     )
 
     w._unwrap_amount.setText("5.000")
@@ -461,9 +473,14 @@ def test_unwrap_click_emits_mojos_destination_and_relay_mode(qapp):
     # The Chia-only checkbox rides as the third argument.
     w._unwrap_external.setChecked(True)
     w._unwrap_btn.click()
+    # [MILLIETH-TOPUP] ...and the asset as the fourth.
+    w._unwrap_asset.setCurrentIndex(w._unwrap_asset.findData("milliETH"))
+    w._unwrap_btn.click()
 
-    assert got == [(5000, "0x" + "ab" * 20, False),
-                   (5000, "0x" + "ab" * 20, True)]
+    assert got == [(5000, "0x" + "ab" * 20, False, "USDC"),
+                   (5000, "0x" + "ab" * 20, True, "USDC"),
+                   (5000, "0x" + "ab" * 20, True, "milliETH")]
+    assert "wmilliETH.b" in w._unwrap_amount.placeholderText()
 
 
 def test_unwrap_click_refuses_a_non_numeric_amount(qapp):
@@ -512,8 +529,8 @@ def test_unwrap_amount_parser_never_rounds_or_crashes(qapp):
     w._unwrap_btn.click()
     w._unwrap_amount.setText("5.001")
     w._unwrap_btn.click()
-    assert got == [(1, "0x" + "ab" * 20, False),
-                   (5001, "0x" + "ab" * 20, False)]
+    assert got == [(1, "0x" + "ab" * 20, False, "USDC"),
+                   (5001, "0x" + "ab" * 20, False, "USDC")]
 
 
 # ---------------------------------------------------------------------------

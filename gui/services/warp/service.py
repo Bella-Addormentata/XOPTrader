@@ -259,6 +259,42 @@ class WarpParams:
     # amount is the operator's explicit choice and is not reduced by it.
     # 0 (the default) keeps the old behaviour: bridge the whole balance.
     keep_usdc_micros: int = 0
+    # [MULTI-ASSET-OUT] Cap per wmilliETH.b unwrap, in wmilliETH.b MOJOS
+    # (1000 per wmilliETH.b = 1 milliETH = 0.001 ETH). Same contract as
+    # max_unwrap_micros: -1 == never configured (a wmilliETH.b unwrap is
+    # refused until it is stated), 0 == explicit unlimited.
+    max_unwrap_millieth_mojos: int = -1
+
+
+def _c_wei_per_milli_unit(net) -> int:
+    """Wei per milliETH BASE unit (= per wmilliETH.b mojo): 1e18 / 10**(3+3).
+
+    One milliETH is 1e15 wei and the token has 3 decimals, so one base unit
+    is 1e12 wei -- the MilliETH wrapper's own granularity.
+    """
+    return 10 ** (18 - 3 - int(getattr(net, "milli_eth_decimals", 3)))
+
+
+def _parse_millieth_unwrap_cap(warp: dict) -> int:
+    """warp.max_unwrap_millieth (wmilliETH.b units) -> mojos; -1 if never set.
+
+    The same fail-closed shape as :func:`_parse_unwrap_cap`, in the asset's
+    own units: a USDC-denominated cap applied to milliETH base units would
+    read 1000x too permissive, which is why the two are separate keys.
+    """
+    raw = warp.get("max_unwrap_millieth", None)
+    if raw is None or str(raw).strip() == "":
+        return -1
+    if str(raw).strip().lower() == "unlimited":
+        return 0
+    value = _parse_usdc_config_value("max_unwrap_millieth", raw)
+    mojos = int(round(value * 1000))
+    if value <= 0 or mojos <= 0:
+        raise WarpError(
+            f"warp.max_unwrap_millieth must be positive (got {raw!r}); use "
+            "'unlimited' if no cap is genuinely intended"
+        )
+    return mojos
 
 
 #: The smallest inbound bridge, in wrapped-CAT mojos. ERC20Bridge's tip is at
@@ -455,6 +491,7 @@ def warp_params_from_config(config: Optional[dict]) -> WarpParams:
         keep_usdc_micros=int(round(_parse_non_negative_float(
             "keep_usdc_on_base", warp.get("keep_usdc_on_base"), 0.0
         ) * scale)),
+        max_unwrap_millieth_mojos=_parse_millieth_unwrap_cap(warp),
     )
 
 
@@ -580,6 +617,10 @@ def _job_dict(job: Optional[WarpJob]) -> Optional[dict]:
         "created_at": job.created_at,
         "updated_at": job.updated_at,
         "amount_usdc_micros": job.amount_usdc_micros,
+        # [MILLIETH-TOPUP] The asset's NAME, for display only (identity is
+        # the fingerprint): a milliETH job's amount_usdc_micros column
+        # holds milliETH base units, not micro-USDC.
+        "asset": str(job.state.get("asset") or "USDC"),
         "amount_mojos": job.amount_mojos,
         "post_tip_mojos": job.post_tip_mojos,
         "receiver_address": job.receiver_address,
@@ -2208,11 +2249,15 @@ class WarpEngine:
     # burn pays us (docs/warp-unwrap-design.md par.3).
     # ================================================================== #
 
-    def _resolve_cat_wallet_id(self) -> int:
-        """The daemon wallet holding the wrapped asset, by TAIL hash."""
+    def _cat_wallet_ids(self, asset_id: Optional[str] = None) -> list:
+        """Every daemon wallet holding the wrapped asset, by TAIL hash.
+
+        Raises :class:`WarpError` (retryable) when any candidate failed to
+        answer: absence is only proven when every candidate answered.
+        """
         from .wallet import WalletError
 
-        want = self._net.expected_asset_id.lower()
+        want = (asset_id or self._net.expected_asset_id).lower()
         self._wallet.log_in()
         matches, errors = [], []
         for w in self._wallet.get_wallets(wallet_type=6):
@@ -2224,17 +2269,26 @@ class WarpEngine:
                 continue
             if asset == want:
                 matches.append(wid)
-        if len(matches) == 1:
-            return matches[0]
-        if errors:
+        if len(matches) != 1 and errors:
             # One flaky RPC must not FAIL the job: absence is only proven
             # when every candidate answered.
             raise WarpError(
                 f"CAT wallet resolution degraded ({errors[0]}); retrying"
             )
+        return matches
+
+    def _resolve_cat_wallet_id(self, asset_id: Optional[str] = None) -> int:
+        """The daemon wallet holding the wrapped asset, by TAIL hash.
+
+        *asset_id* selects which wrapped CAT (default: wUSDC.b).
+        """
+        matches = self._cat_wallet_ids(asset_id)
+        if len(matches) == 1:
+            return matches[0]
+        want = (asset_id or self._net.expected_asset_id).lower()
         raise WarpTerminal(
             f"expected exactly one CAT wallet for asset "
-            f"{self._net.expected_asset_id}, found {matches or 'none'}"
+            f"{want}, found {matches or 'none'}"
         )
 
     def _rebalance_unwrap_trim(self, job: WarpJob, amount: int):
@@ -2249,6 +2303,9 @@ class WarpEngine:
         slot cleanly); otherwise the possibly-reduced amount to burn.
         Manual unwraps carry no target and are never touched.
         """
+        eth_target = job.state.get("rebalance_eth_target_wei")
+        if eth_target:
+            return self._rebalance_millieth_trim(job, amount, int(eth_target))
         target = job.state.get("rebalance_target_micros")
         if not target:
             return None, amount
@@ -2276,6 +2333,37 @@ class WarpEngine:
             return None, int(needed_mojos)
         return None, amount
 
+    def _rebalance_millieth_trim(self, job: WarpJob, amount: int,
+                                 eth_target_wei: int):
+        """[MULTI-ASSET-OUT] The wmilliETH.b top-up's version of the trim.
+
+        The need is "ETH on Base back to the reserve target", and milliETH
+        already on Base counts toward it (the next consult unwraps it to ETH
+        for free). If gas landed while the job waited, burning the stale
+        amount would overshoot -- so cancel or trim before the commit point.
+        1 wmilliETH.b mojo = 1 milliETH base unit = 1e12 wei; the 30 bps tip
+        is grossed up the same way the planner does it.
+        """
+        net = self._net
+        eth = int(self._evm.get_eth_balance(self._hot_address))
+        milli = int(self._evm.get_erc20_balance(
+            net.milli_eth_address, self._hot_address))
+        held = eth + milli * _c_wei_per_milli_unit(net)
+        short = eth_target_wei - held
+        if short <= 0:
+            return _advance(
+                JobStatus.CANCELLED,
+                message=("top-up unwrap no longer needed: the ETH fee reserve "
+                         "was met while the job waited"),
+            ), amount
+        units = -(-short // _c_wei_per_milli_unit(net))
+        grossed = -(-units * 10_000 // (10_000 - rb._UNWRAP_TIP_BPS))
+        if grossed < amount:
+            _log.info("top-up unwrap trimmed %d -> %d mojos (gas landed while "
+                      "the job waited)", amount, grossed)
+            return None, int(grossed)
+        return None, amount
+
     def _h_unwrap_checks(self, job: WarpJob) -> _Step:
         """Every gate, ordered cheap-to-expensive, all before the cat_spend."""
         from . import clvm_utils as cu, drivers, evm
@@ -2283,6 +2371,9 @@ class WarpEngine:
         net, p = self._net, self._params
         receiver = bytes.fromhex(job.state["receiver_evm"])
         amount = int(job.amount_mojos)
+        # [MULTI-ASSET-OUT] Every asset-dependent term below comes from the
+        # job's frozen asset: token, TAIL, CAT wallet, precision.
+        spec = self._job_asset(job)
 
         # G0 (rebalance jobs only): re-derive the size at the gate.
         step, amount = self._rebalance_unwrap_trim(job, amount)
@@ -2315,7 +2406,8 @@ class WarpEngine:
             raise
 
         # G4: the CAT wallet.
-        wallet_id = int(job.state.get("cat_wallet_id") or self._resolve_cat_wallet_id())
+        wallet_id = int(job.state.get("cat_wallet_id")
+                        or self._resolve_cat_wallet_id(spec.expected_asset_id))
 
         # G5: spendable vs confirmed. Over-confirmed is terminal (the amount
         # cannot exist); over-spendable only pends -- the difference is offer
@@ -2339,12 +2431,12 @@ class WarpEngine:
             raise WarpTerminal(f"live signatureThreshold {threshold} out of range")
         tip_bps = self._evm.get_tip_bps()
         post_tip = evm.unwrap_post_tip_base_units(
-            amount, tip_bps, net.usdc_decimals, net.cat_decimals
+            amount, tip_bps, int(spec.erc20_decimals), net.cat_decimals
         )
 
         # G8/G9/G10: liquidity, relay gas, toll funds -- all pends.
         liquidity = self._evm.get_erc20_balance(
-            net.usdc_address, net.erc20_bridge_address
+            spec.erc20_address, net.erc20_bridge_address
         )
         if liquidity < post_tip:
             raise WarpPending(
@@ -2371,12 +2463,14 @@ class WarpEngine:
                 "the cat_spend and the toll funding send)"
             )
 
-        burn_inner_ph = drivers.expected_burn_inner_puzzle_hash(net, receiver)
+        burn_inner_ph = drivers.expected_burn_inner_puzzle_hash(
+            net, receiver, asset=spec)
         state = {
             "cat_wallet_id": wallet_id,
             "post_tip_base_units": post_tip,
             "burn_inner_ph": burn_inner_ph.hex(),
-            "burn_cat_ph": drivers.expected_burn_cat_puzzle_hash(net, receiver).hex(),
+            "burn_cat_ph": drivers.expected_burn_cat_puzzle_hash(
+                net, receiver, asset=spec).hex(),
             "burn_address": cu.encode_puzzle_hash(burn_inner_ph, net.chia_prefix),
         }
         if self._job_dry_run(job):
@@ -2664,6 +2758,7 @@ class WarpEngine:
         out = drivers.build_burn_bundle(drivers.BurnRequest(
             net=net, burn_cat_coin=burn_cat, cat_lineage_proof=lineage,
             security_coin=sec, security_sk=sk, receiver=receiver,
+            asset=self._job_asset(job),
         ))
         # Persist the nonce AND the coin it derives from BEFORE pushing --
         # together, always: a nonce without its coin is the incoherence the
@@ -2692,7 +2787,7 @@ class WarpEngine:
 
         separator = self._evm.verify_eip712_domain()
         contents = drivers.outbound_message_contents(
-            net, receiver, int(job.amount_mojos)
+            net, receiver, int(job.amount_mojos), asset=self._job_asset(job)
         )
         digest = evm.validator_message_digest(
             separator, nonce, b"xch",
@@ -2755,7 +2850,7 @@ class WarpEngine:
             net.erc20_bridge_address,
             drivers.outbound_message_contents(
                 net, bytes.fromhex(job.state["receiver_evm"]),
-                int(job.amount_mojos),
+                int(job.amount_mojos), asset=self._job_asset(job),
             ),
             bytes.fromhex(job.state["relay_sigs"]),
         )
@@ -2923,7 +3018,8 @@ class WarpEngine:
             columns={"bridge_tx_hash": tx_hash} if tx_hash else None,
             state={"delivered_by": by},
             message=(
-                f"unwrap complete ({by}): {post_tip} USDC base units paid to "
+                f"unwrap complete ({by}): {post_tip} "
+                f"{self._job_asset(job).symbol} base units paid to "
                 f"0x{job.state.get('receiver_evm')}"
             ),
         )
@@ -3405,9 +3501,17 @@ class WarpEngine:
 
     def request_unwrap(
         self, amount_mojos: int, receiver: str, external_relay: bool = False,
-        *, automatic: bool = False, rebalance_target_micros: int = 0
+        *, automatic: bool = False, rebalance_target_micros: int = 0,
+        asset: str = "USDC", rebalance_eth_target_wei: int = 0,
     ) -> dict:
-        """Operator-triggered unwrap: wUSDC.b -> native USDC at *receiver*.
+        """Operator-triggered unwrap: a wrapped CAT -> its ERC-20 at *receiver*.
+
+        *asset* names the bridgeable asset: ``"USDC"`` (wUSDC.b -> USDC, the
+        default and the legacy behaviour) or ``"milliETH"`` (wmilliETH.b ->
+        milliETH, which the hot wallet can then unwrap to ETH for gas). Each
+        asset has its own cap in its own units -- ``max_unwrap_usdc`` and
+        ``max_unwrap_millieth`` -- and an unwrap is refused until that cap is
+        stated.
 
         Refusals here are synchronous and create no job. Unlike Bridge now,
         the operator states an exact amount and destination -- there is no
@@ -3448,28 +3552,49 @@ class WarpEngine:
                     "a typo would send the USDC to a stranger"
                 )
         amount = int(amount_mojos)
+        try:
+            spec = self._net.asset(asset)
+        except KeyError:
+            raise WarpError(f"unknown unwrap asset {asset!r}") from None
+        is_usdc = (spec.expected_asset_id.lower()
+                   == (self._net.expected_asset_id or "").lower())
         if amount < 1:
-            raise WarpError("unwrap amount must be at least 1 mojo (0.001 USDC)")
-        if p.max_unwrap_micros < 0:
             raise WarpError(
-                "warp.max_unwrap_usdc is not set; the unwrap cap must be stated "
-                "before any unwrap (use 'unlimited' to opt out explicitly)"
-            )
-        micros = amount * 10 ** (
-            self._net.usdc_decimals - self._net.cat_decimals
+                f"unwrap amount must be at least 1 mojo (0.001 {spec.symbol})")
+        if is_usdc:
+            if p.max_unwrap_micros < 0:
+                raise WarpError(
+                    "warp.max_unwrap_usdc is not set; the unwrap cap must be "
+                    "stated before any unwrap (use 'unlimited' to opt out "
+                    "explicitly)"
+                )
+            cap_key, cap = "max_unwrap_usdc", p.max_unwrap_micros
+        else:
+            cap = int(getattr(p, "max_unwrap_millieth_mojos", -1))
+            if cap < 0:
+                raise WarpError(
+                    "warp.max_unwrap_millieth is not set; the wmilliETH.b "
+                    "unwrap cap must be stated before any wmilliETH.b unwrap "
+                    "(use 'unlimited' to opt out explicitly)"
+                )
+            cap_key = "max_unwrap_millieth"
+        base_units = amount * 10 ** (
+            int(spec.erc20_decimals) - self._net.cat_decimals
         )
-        if p.max_unwrap_micros and micros > p.max_unwrap_micros:
+        # USDC's cap is in micro-USDC (base units); milliETH's in mojos.
+        capped_value = base_units if is_usdc else amount
+        if cap and capped_value > cap:
             raise WarpError(
-                f"unwrap of {micros} micro-USDC exceeds warp.max_unwrap_usdc "
-                f"({p.max_unwrap_micros}); refusing rather than clamping"
+                f"unwrap of {capped_value} {'micro-USDC' if is_usdc else 'mojos'} "
+                f"exceeds warp.{cap_key} ({cap}); refusing rather than clamping"
             )
         job = self._store.create_job(
             self._net.name,
             status=JobStatus.UNWRAP_CHECKS,
-            columns={"amount_mojos": amount, "amount_usdc_micros": micros},
+            columns={"amount_mojos": amount, "amount_usdc_micros": base_units},
             state={
                 "direction": "out",
-                **_asset_stamp(self._net.asset("USDC"), self._net.cat_decimals),
+                **_asset_stamp(spec, self._net.cat_decimals),
                 "manual": not automatic,
                 **({"rebalance": True} if automatic else {}),
                 # Lets _h_unwrap_checks re-derive the still-needed amount
@@ -3477,13 +3602,15 @@ class WarpEngine:
                 # possibly-stale snapshot.
                 **({"rebalance_target_micros": int(rebalance_target_micros)}
                    if automatic and rebalance_target_micros else {}),
+                **({"rebalance_eth_target_wei": int(rebalance_eth_target_wei)}
+                   if automatic and rebalance_eth_target_wei else {}),
                 "receiver_evm": rec_bytes.hex(),
                 "external_relay": bool(external_relay),
                 **self._binding(),
             },
             event_message=(
                 ("rebalance: automatic " if automatic else "")
-                + f"unwrap requested: {amount} mojos -> {receiver}"
+                + f"unwrap requested: {amount} mojos of w{spec.symbol}.b -> {receiver}"
                 + (" (external relay: no Base gas needed)" if external_relay else "")
             ),
         )
@@ -3875,6 +4002,47 @@ class WarpEngine:
 # Lazy engine construction helpers (run on the worker thread).
 # --------------------------------------------------------------------------- #
 
+def _http_get_json(url: str, params: dict, headers: dict) -> Any:
+    """GET *url* and parse JSON; raises on any transport or HTTP error."""
+    import requests  # lazy: only when a real network call is made
+
+    resp = requests.get(url, params=params, headers=headers, timeout=10)
+    resp.raise_for_status()
+    return resp.json()
+
+
+#: A submitted Dexie take the wallet still cannot read after this long is
+#: settled as failed (its record is lost), so it cannot block every later buy.
+_TAKE_UNKNOWN_FAIL_S: int = 3600
+
+
+def _age_s(iso: str) -> float:
+    """Seconds since ISO-8601 *iso*; 0 when it cannot be parsed."""
+    from datetime import datetime, timezone
+
+    try:
+        then = datetime.fromisoformat(str(iso))
+    except ValueError:
+        return 0.0
+    if then.tzinfo is None:
+        then = then.replace(tzinfo=timezone.utc)
+    return max(0.0, (datetime.now(timezone.utc) - then).total_seconds())
+
+
+def _engine_xch_fee_reserve_mojos(config: Optional[dict]) -> int:
+    """strategy.fee_reserve_xch (default 1.0) in mojos: the XCH the engine
+    keeps for its own fees, which a Dexie top-up buy must never spend."""
+    strategy = (config or {}).get("strategy") or {}
+    raw = strategy.get("fee_reserve_xch", 1.0) if isinstance(strategy, dict) else 1.0
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = 1.0
+    if not 0.0 <= value < float("inf"):   # also catches NaN
+        value = 1.0
+    return int(round(value * 10 ** 12))
+
+
 def _job_db_path(
     config: Optional[dict], *, anchor: Optional[Path] = None
 ) -> str:
@@ -3987,6 +4155,10 @@ class _WarpWorker(QObject):
         self._rebalance_error: str = ""
         self._rebalance_next_ok: float = 0.0
         self._rebalance_last: str = ""
+        # [MILLIETH-TOPUP] Latched once a MANUAL wmilliETH.b unwrap has
+        # completed: the automatic top-up never runs an asset path the
+        # operator has not watched succeed end to end.
+        self._millieth_unwrap_proven: bool = False
         # Monotonic count of PROCESSED wallet actions. Rides every snapshot so
         # the GUI can tell a wallet-action-completion snapshot apart from the
         # timer-driven ticks that carry the same cached value -- without it,
@@ -4143,6 +4315,10 @@ class _WarpWorker(QObject):
         consumes, so the two nonce reads are the only added RPC, and only
         while the rebalancer is live.
         """
+        # [MILLIETH-TOPUP] Dexie takes settle whatever the rebalancer's
+        # state: switching the source off must not strand a submitted take
+        # that the engine would then never book.
+        self._settle_takes_quietly(engine)
         p = self._rebalance_params
         if not p.enabled or self._rebalance_error:
             engine.refresh_hot_wallet()          # snapshot only
@@ -4188,6 +4364,21 @@ class _WarpWorker(QObject):
             hot = getattr(engine, "_hot_cache", None) or {}
             if hot.get("error") or hot.get("eth_wei") is None:
                 return
+            eth_now = int(hot.get("eth_wei") or 0)
+            # [MILLIETH-TOPUP] Chia-side sources for the ETH band. A Dexie
+            # buy still confirming blocks another one; spendable wmilliETH.b
+            # is read only when the band is actually breached.
+            src = p.wmillieth
+            buy_in_flight = (
+                bool(engine._store.list_takes(status=jobs.TAKE_SUBMITTED,
+                                              limit=1))
+                if src is not None and src.enabled else False
+            )
+            chia_millieth, chia_millieth_held = (
+                self._chia_millieth_balances(engine)
+                if src is not None and src.enabled and p.eth is not None
+                and eth_now < p.eth.low else (0, 0)
+            )
             action = rb.plan(
                 params=p,
                 eth_wei=int(hot.get("eth_wei") or 0),
@@ -4204,6 +4395,9 @@ class _WarpWorker(QObject):
                 ),
                 # And a USDC band never plans to bridge into the keep floor.
                 keep_usdc_micros=int(getattr(ep, "keep_usdc_micros", 0) or 0),
+                chia_millieth_mojos=chia_millieth,
+                max_unwrap_millieth_mojos=int(
+                    getattr(ep, "max_unwrap_millieth_mojos", -1)),
             )
             if action is None:
                 return
@@ -4218,6 +4412,31 @@ class _WarpWorker(QObject):
                     f"rebalance skipped: {action.kind} needs Base gas but "
                     "ETH is below the relay-gas floor; fund the wallet or "
                     "let an ETH refuel land first"
+                )
+                return
+            if action.kind in ("unwrap_wmillieth", "buy_wmillieth") and (
+                    not self._millieth_unwrap_is_proven(engine)):
+                self._rebalance_last = (
+                    "rebalance skipped: the ETH top-up from wmilliETH.b starts "
+                    "after one manual wmilliETH.b unwrap has completed (Warp "
+                    "-> Unwrap, asset milliETH)"
+                )
+                return
+            if action.kind == "buy_wmillieth" and buy_in_flight:
+                self._rebalance_last = (
+                    "rebalance waiting: the last Dexie wmilliETH.b buy has "
+                    "not confirmed yet"
+                )
+                return
+            if (action.kind == "buy_wmillieth"
+                    and chia_millieth_held >= action.amount):
+                # Enough held, none of it spendable: locked in the engine's
+                # open offers (its gas reserve keeps reserve coins out of
+                # them, so this is a reserve set below the need). It frees up
+                # as the offers turn over -- buying more would only add to it.
+                self._rebalance_last = (
+                    "rebalance waiting: wmilliETH.b is held but locked in "
+                    "open offers; not buying more on Dexie"
                 )
                 return
             reason = action.reason
@@ -4266,6 +4485,16 @@ class _WarpWorker(QObject):
                 )
             elif action.kind == "unwrap_millieth":
                 self._base_wallet().unwrap_millieth(action.amount)
+            elif action.kind == "unwrap_wmillieth":
+                # External relay: the top-up must work with too little Base
+                # gas to relay (it self-relays whenever gas is there).
+                engine.request_unwrap(
+                    mojos, engine._hot_address, True, automatic=True,
+                    asset="milliETH",
+                    rebalance_eth_target_wei=p.eth.target if p.eth else 0,
+                )
+            elif action.kind == "buy_wmillieth":
+                reason = self._dexie_buy(engine, action.amount, p.wmillieth)
             self._rebalance_last = reason
         except Exception as exc:  # noqa: BLE001 -- banner + cooldown, never a crash
             # Cooldown on ANY failure, including before the plan (e.g.
@@ -4275,20 +4504,174 @@ class _WarpWorker(QObject):
             self._rebalance_last = f"rebalance failed: {exc}"
             _log.warning("rebalance action failed: %s", exc)
 
+    # -- [MILLIETH-TOPUP] Chia-side ETH sources ----------------------------- #
+
+    def _chia_millieth_spendable(self, engine: "WarpEngine") -> int:
+        """Spendable wmilliETH.b mojos (see :meth:`_chia_millieth_balances`)."""
+        return self._chia_millieth_balances(engine)[0]
+
+    def _chia_millieth_balances(self, engine: "WarpEngine") -> tuple:
+        """(spendable, confirmed) wmilliETH.b mojos; (0, 0) only when no
+        such CAT wallet exists.
+
+        Spendable, not confirmed: coins the engine has locked into offers are
+        not ours to burn (the unwrap's own G5 gate would pend on them). Every
+        other failure raises -- two matching wallets, or an RPC that did not
+        answer -- because an unknown balance must not read as zero and send
+        the planner to Dexie for coins already held.
+        """
+        spec = engine._net.asset("milliETH")
+        matches = engine._cat_wallet_ids(spec.expected_asset_id)
+        if not matches:
+            return 0, 0           # never held any: the wallet has none
+        if len(matches) > 1:
+            raise WarpTerminal(
+                f"expected one wmilliETH.b CAT wallet, found {matches}")
+        bal = engine._wallet.get_wallet_balance(matches[0])
+        return (max(0, int(bal.get("spendable_balance") or 0)),
+                max(0, int(bal.get("confirmed_wallet_balance") or 0)))
+
+    def _millieth_unwrap_is_proven(self, engine: "WarpEngine") -> bool:
+        """Whether a MANUAL wmilliETH.b unwrap has ever completed here."""
+        if self._millieth_unwrap_proven:
+            return True
+        tail = ":" + engine._net.asset("milliETH").expected_asset_id.lower()
+        for job in engine._store.list_jobs(limit=500):
+            if (job.status == JobStatus.COMPLETED
+                    and job.state.get("direction") == "out"
+                    and job.state.get("manual")
+                    and str(job.state.get("asset_fingerprint") or "")
+                    .lower().endswith(tail)):
+                self._millieth_unwrap_proven = True
+                break
+        return self._millieth_unwrap_proven
+
+    def _settle_takes_quietly(self, engine: "WarpEngine") -> None:
+        """:meth:`_settle_dexie_takes`, contracted never to raise."""
+        if getattr(engine._store, "list_takes", None) is None:
+            return
+        try:
+            self._settle_dexie_takes(engine)
+        except Exception as exc:  # noqa: BLE001 -- a tick must not crash
+            _log.debug("Dexie take settlement failed: %s", exc)
+
+    def _settle_dexie_takes(self, engine: "WarpEngine") -> bool:
+        """Settle submitted Dexie takes from the wallet's trade records.
+
+        True while one is still unconfirmed (or unreadable): no second buy
+        starts until the first is known to have landed or failed. A take the
+        wallet still cannot read after ``_TAKE_UNKNOWN_FAIL_S`` settles as
+        failed, so a lost trade record cannot stop every later buy.
+        """
+        in_flight = False
+        for take in engine._store.list_takes(status=jobs.TAKE_SUBMITTED):
+            try:
+                record = engine._wallet.get_offer(take.trade_id)
+            except Exception as exc:  # noqa: BLE001 -- unknown stays in flight
+                if _age_s(take.created_at) > _TAKE_UNKNOWN_FAIL_S:
+                    engine._store.settle_take(
+                        take.trade_id, jobs.TAKE_FAILED,
+                        error=f"the wallet has no readable trade record ({exc})")
+                    _log.warning("Dexie take %s: no trade record after %ds; "
+                                 "settled as failed", take.trade_id,
+                                 _TAKE_UNKNOWN_FAIL_S)
+                    continue
+                _log.debug("Dexie take %s: status unknown (%s)",
+                           take.trade_id, exc)
+                in_flight = True
+                continue
+            status = str(record.get("status") or "").upper()
+            if status == "CONFIRMED":
+                engine._store.settle_take(take.trade_id, jobs.TAKE_CONFIRMED)
+                _log.info("Dexie take %s confirmed: %d wmilliETH.b mojos for "
+                          "%d XCH mojos", take.trade_id, take.cat_mojos,
+                          take.xch_mojos)
+            elif status in ("FAILED", "CANCELLED"):
+                engine._store.settle_take(
+                    take.trade_id, jobs.TAKE_FAILED,
+                    error=f"wallet reports {status}")
+                _log.warning("Dexie take %s %s", take.trade_id, status.lower())
+            else:
+                in_flight = True
+        return in_flight
+
+    def _dexie_buy(self, engine: "WarpEngine", want_mojos: int,
+                   src: "rb.WmilliethSource") -> str:
+        """Take at most ONE Dexie ask for wmilliETH.b; the banner text.
+
+        Every refusal raises (banner + cooldown); finding no eligible ask is
+        not an error and buys nothing. See dexie_buy.py for the checks.
+        """
+        from . import dexie_buy as dx
+
+        asset_id = engine._net.asset("milliETH").expected_asset_id.lower()
+        cg = self._config.get("coingecko") or {}
+        api_key = str(cg.get("api_key") or "") if isinstance(cg, dict) else ""
+        ref = dx.reference_xch_per_millieth(_http_get_json, api_key)
+        if ref is None:
+            raise WarpError(
+                "no CoinGecko ETH and XCH prices to bound the Dexie price; "
+                "not buying blind")
+        dexie = self._config.get("dexie") or {}
+        api_base = str((dexie.get("api_base") if isinstance(dexie, dict)
+                        else None) or "https://api.dexie.space/v1")
+        asks = dx.fetch_asks(_http_get_json, api_base, asset_id)
+        engine._wallet.log_in()
+        own = engine._wallet.get_my_open_trade_ids()
+        ask = dx.pick_ask(
+            asks, want_mojos=int(want_mojos), reference_xch_per_unit=ref,
+            max_premium_pct=src.max_premium_pct,
+            max_spend_xch_mojos=src.max_spend_xch_mojos, own_trade_ids=own)
+        if ask is None:
+            return (
+                f"rebalance: no Dexie wmilliETH.b ask within "
+                f"{src.max_premium_pct:g}% of CoinGecko ({ref:.4f} XCH each) "
+                f"for at most {src.max_spend_xch_mojos / 10 ** 12:g} XCH; "
+                "nothing bought")
+        dx.verify_offer(engine._wallet, ask, asset_id)
+        cost = dx.buy_cost_mojos(ask, src.take_fee_mojos)
+        spendable = int(
+            engine._wallet.get_wallet_balance(1).get("spendable_balance") or 0)
+        keep = _engine_xch_fee_reserve_mojos(self._config)
+        if spendable - cost < keep:
+            raise WarpError(
+                f"a Dexie buy costing {cost / 10 ** 12:.6f} XCH would leave "
+                f"{(spendable - cost) / 10 ** 12:.6f} XCH spendable, under the "
+                f"engine's {keep / 10 ** 12:g} XCH fee reserve")
+        record = engine._wallet.take_offer(ask.offer,
+                                           fee_mojos=src.take_fee_mojos)
+        trade_id = str(record.get("trade_id") or "") or ask.trade_id
+        try:
+            engine._store.record_take(
+                trade_id=trade_id, asset_id=asset_id,
+                cat_mojos=ask.cat_mojos, xch_mojos=ask.xch_mojos,
+                fee_mojos=src.take_fee_mojos)
+        except Exception as exc:  # noqa: BLE001 -- the take already happened
+            _log.error("Dexie take %s succeeded but could not be recorded "
+                       "(%s); the engine will see it as wallet divergence",
+                       trade_id, exc)
+        return (
+            f"rebalance: took Dexie offer {ask.dexie_id or ask.trade_id[:12]}: "
+            f"{ask.cat_mojos / 1000:g} wmilliETH.b for "
+            f"{ask.xch_mojos / 10 ** 12:.6f} XCH ({ask.xch_per_unit:.4f} XCH "
+            f"each; CoinGecko {ref:.4f})")
+
     @Slot(object)
     def request_bridge(self, target_micros: object) -> None:
         self.snapshot_ready.emit(
             self._guarded(lambda engine: engine.request_bridge(target_micros))
         )
 
-    @Slot(int, str, bool)
+    @Slot(int, str, bool, str)
     def request_unwrap(
-        self, amount_mojos: int, receiver: str, external_relay: bool = False
+        self, amount_mojos: int, receiver: str, external_relay: bool = False,
+        asset: str = "USDC",
     ) -> None:
         self.snapshot_ready.emit(
             self._guarded(
                 lambda engine: engine.request_unwrap(
-                    int(amount_mojos), receiver, bool(external_relay)
+                    int(amount_mojos), receiver, bool(external_relay),
+                    asset=str(asset or "USDC"),
                 )
             )
         )
@@ -4780,7 +5163,7 @@ class WarpService(QObject):
     _trigger_tick = Signal()
     _trigger_params = Signal(dict)
     _trigger_bridge = Signal(object)
-    _trigger_unwrap = Signal(int, str, bool)
+    _trigger_unwrap = Signal(int, str, bool, str)
     _trigger_action = Signal(int, str)
     _trigger_wallet = Signal(str, dict)
 
@@ -4856,12 +5239,14 @@ class WarpService(QObject):
         self._trigger_bridge.emit(target_micros)
 
     def request_unwrap(
-        self, amount_mojos: int, receiver: str, external_relay: bool = False
+        self, amount_mojos: int, receiver: str, external_relay: bool = False,
+        asset: str = "USDC",
     ) -> None:
         if not self._thread.isRunning():
             self.start()
         self._trigger_unwrap.emit(
-            int(amount_mojos), str(receiver), bool(external_relay)
+            int(amount_mojos), str(receiver), bool(external_relay),
+            str(asset or "USDC"),
         )
 
     def job_action(self, job_id: int, action: str) -> None:

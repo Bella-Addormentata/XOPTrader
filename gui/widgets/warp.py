@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
     QCheckBox,
+    QComboBox,
     QFrame,
     QGroupBox,
     QHBoxLayout,
@@ -288,8 +289,10 @@ class WarpWidget(QWidget):
     # Carries the typed amount in micro-USDC, or None for "the balance"
     # (everything above warp.keep_usdc_on_base, up to the per-warp cap).
     bridge_now_requested = Signal(object)
-    # (amount_mojos, receiver_0x, external_relay) -> WarpService.request_unwrap().
-    unwrap_requested = Signal(int, str, bool)
+    # (amount_mojos, receiver_0x, external_relay, asset) ->
+    # WarpService.request_unwrap(). asset is "USDC" (wUSDC.b) or "milliETH"
+    # (wmilliETH.b).
+    unwrap_requested = Signal(int, str, bool, str)
     # Emitted for a per-job action -> WarpService.job_action(job_id, action).
     # ``action`` is one of "retry", "cancel", "sweep".
     job_action_requested = Signal(int, str)
@@ -477,21 +480,38 @@ class WarpWidget(QWidget):
 
         layout.addWidget(wrap_group)
 
-        # -- Unwrap: wUSDC.b (Chia) -> USDC (Base) ---------------------
-        unwrap_group = QGroupBox("Unwrap — wUSDC.b (Chia) → USDC (Base)")
+        # -- Unwrap: a wrapped CAT (Chia) -> its token (Base) ----------
+        unwrap_group = QGroupBox("Unwrap — Chia → Base")
         unwrap_layout = QVBoxLayout(unwrap_group)
         unwrap_layout.setSpacing(10)
 
         unwrap_intro = _body_label(
             "The reverse direction: takes capital <b>out</b> of the bot by "
-            "burning wUSDC.b on Chia and releasing native USDC on Base. "
-            "Irreversible once the burn is sent; the warp tip and the Chia "
-            "toll apply (current figures on the Unwrap button)."
+            "burning wUSDC.b on Chia and releasing native USDC on Base -- or "
+            "wmilliETH.b, released as milliETH, which the Base wallet turns "
+            "into ETH for gas. Irreversible once the burn is sent; the warp "
+            "tip and the Chia toll apply (current figures on the Unwrap "
+            "button)."
         )
         unwrap_intro.setTextFormat(Qt.TextFormat.RichText)
         unwrap_layout.addWidget(unwrap_intro)
 
         unwrap_row = QHBoxLayout()
+        # [MILLIETH-TOPUP] Which wrapped CAT to burn. Each has its own cap
+        # (warp.max_unwrap_usdc / warp.max_unwrap_millieth).
+        self._unwrap_asset = QComboBox()
+        self._unwrap_asset.addItem("wUSDC.b → USDC", "USDC")
+        self._unwrap_asset.addItem("wmilliETH.b → milliETH", "milliETH")
+        self._unwrap_asset.setToolTip(
+            "wUSDC.b releases USDC on Base (cap: warp.max_unwrap_usdc).\n"
+            "wmilliETH.b releases milliETH on Base, 0.001 ETH each, which the "
+            "Base wallet can withdraw to ETH for gas (cap: "
+            "warp.max_unwrap_millieth). One completed manual wmilliETH.b "
+            "unwrap also lets the automatic ETH top-up use it."
+        )
+        self._unwrap_asset.currentIndexChanged.connect(
+            self._on_unwrap_asset_changed)
+        unwrap_row.addWidget(self._unwrap_asset)
         self._unwrap_amount = QLineEdit()
         self._unwrap_amount.setPlaceholderText("USDC amount (min 0.001)")
         self._unwrap_amount.setMaximumWidth(160)
@@ -504,9 +524,10 @@ class WarpWidget(QWidget):
         unwrap_row.addWidget(self._unwrap_dest, 1)
         self._unwrap_btn = self._primary_button("🔥  Unwrap")
         self._unwrap_btn.setToolTip(
-            "Burn wUSDC.b on Chia and release native USDC to the destination.\n"
-            "Irreversible once the burn is sent. Costs the 0.3% warp tip plus\n"
-            "the 0.001 XCH toll. Requires warp.max_unwrap_usdc to be set."
+            "Burn the wrapped CAT on Chia and release its token to the "
+            "destination.\nIrreversible once the burn is sent. Costs the 0.3% "
+            "warp tip plus\nthe 0.001 XCH toll. Requires that asset's unwrap "
+            "cap to be set."
         )
         self._unwrap_btn.clicked.connect(self._on_unwrap_clicked)
         unwrap_row.addWidget(self._unwrap_btn)
@@ -603,7 +624,7 @@ class WarpWidget(QWidget):
         """Create the read-only jobs table with a per-row action menu."""
         table = QTableWidget(0, 5)
         table.setHorizontalHeaderLabels(
-            ["Status", "USDC in", "wUSDC.b out", "Updated", "Base tx"]
+            ["Status", "Base amount", "Chia amount", "Updated", "Base tx"]
         )
         table.verticalHeader().setVisible(False)
         table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -912,9 +933,16 @@ class WarpWidget(QWidget):
                 status_item.setToolTip(str(last_error))
             table.setItem(row, 0, status_item)
 
-            table.setItem(row, 1, QTableWidgetItem(_usdc(job.get("amount_usdc_micros"))))
             out_mojos = job.get("post_tip_mojos") or job.get("amount_mojos")
-            table.setItem(row, 2, QTableWidgetItem(_wusdc(out_mojos)))
+            if str(job.get("asset") or "USDC").lower() == "millieth":
+                # milliETH has 3 decimals on Base, like its CAT on Chia.
+                base_text = f"{_wusdc(job.get('amount_usdc_micros'))} milliETH"
+                chia_text = f"{_wusdc(out_mojos)} wmilliETH.b"
+            else:
+                base_text = f"{_usdc(job.get('amount_usdc_micros'))} USDC"
+                chia_text = f"{_wusdc(out_mojos)} wUSDC.b"
+            table.setItem(row, 1, QTableWidgetItem(base_text))
+            table.setItem(row, 2, QTableWidgetItem(chia_text))
             table.setItem(row, 3, QTableWidgetItem(str(job.get("updated_at") or "—")))
 
             tx = job.get("bridge_tx_hash")
@@ -935,6 +963,14 @@ class WarpWidget(QWidget):
     # ------------------------------------------------------------------
     # Actions
     # ------------------------------------------------------------------
+
+    def _unwrap_symbol(self) -> str:
+        """The asset the Unwrap controls are set to: "USDC" or "milliETH"."""
+        return str(self._unwrap_asset.currentData() or "USDC")
+
+    def _on_unwrap_asset_changed(self, _index: int) -> None:
+        unit = "wmilliETH.b" if self._unwrap_symbol() == "milliETH" else "USDC"
+        self._unwrap_amount.setPlaceholderText(f"{unit} amount (min 0.001)")
 
     def _on_unwrap_clicked(self) -> None:
         """Parse to mojos and emit; the engine re-validates everything."""
@@ -964,7 +1000,8 @@ class WarpWidget(QWidget):
             self._unwrap_amount.setFocus()
             return
         self.unwrap_requested.emit(
-            mojos, dest, bool(self._unwrap_external.isChecked())
+            mojos, dest, bool(self._unwrap_external.isChecked()),
+            self._unwrap_symbol(),
         )
 
     def _on_bridge_now(self) -> None:

@@ -273,6 +273,47 @@ CREATE TABLE IF NOT EXISTS warp_meta (
 )
 """
 
+# [MILLIETH-TOPUP 2026-10-24] Dexie offers the rebalancer TOOK to buy
+# wmilliETH.b for gas. Not warp jobs (no bridge, no active slot): a take is
+# one wallet RPC, then the trade confirms or fails. The engine reads the
+# CONFIRMED rows and books each as a take -- base, quote and fee legs --
+# so a top-up buy is an explained trade, not wallet divergence.
+_CREATE_DEXIE_TAKES = """
+CREATE TABLE IF NOT EXISTS dexie_takes (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_id     TEXT    NOT NULL UNIQUE,   -- lowercase hex, no 0x
+    created_at   TEXT    NOT NULL,
+    updated_at   TEXT    NOT NULL,
+    asset_id     TEXT    NOT NULL,          -- the CAT bought
+    cat_mojos    INTEGER NOT NULL,          -- received
+    xch_mojos    INTEGER NOT NULL,          -- paid to the maker
+    fee_mojos    INTEGER NOT NULL,          -- our network fee
+    status       TEXT    NOT NULL,          -- submitted | confirmed | failed
+    confirmed_at TEXT,
+    last_error   TEXT
+)
+"""
+
+TAKE_SUBMITTED = "submitted"
+TAKE_CONFIRMED = "confirmed"
+TAKE_FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class DexieTake:
+    id: int
+    trade_id: str
+    created_at: str
+    updated_at: str
+    asset_id: str
+    cat_mojos: int
+    xch_mojos: int
+    fee_mojos: int
+    status: str
+    confirmed_at: Optional[str]
+    last_error: Optional[str]
+
+
 _JOB_COLUMNS = (
     "id, status, network, created_at, updated_at, receiver_address, receiver_ph, "
     "amount_usdc_micros, amount_mojos, post_tip_mojos, bridge_tx_hash, "
@@ -338,6 +379,7 @@ class WarpJobStore:
             self._conn.execute(_CREATE_EVENTS)
             self._conn.execute(_CREATE_EVENTS_INDEX)
             self._conn.execute(_CREATE_META)
+            self._conn.execute(_CREATE_DEXIE_TAKES)
             row = self._conn.execute(
                 "SELECT value FROM warp_meta WHERE key = 'schema_version'"
             ).fetchone()
@@ -570,6 +612,70 @@ class WarpJobStore:
                 self._conn.execute("SELECT COUNT(*) FROM warp_jobs").fetchone()[0]
             )
 
+    # -- Dexie takes ([MILLIETH-TOPUP]) -------------------------------------- #
+
+    def record_take(self, *, trade_id: str, asset_id: str, cat_mojos: int,
+                    xch_mojos: int, fee_mojos: int) -> DexieTake:
+        """Record a take the wallet accepted, as ``submitted``."""
+        tid = str(trade_id).strip().lower()
+        tid = tid[2:] if tid.startswith("0x") else tid
+        now = self._now()
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO dexie_takes(trade_id, created_at, updated_at, "
+                "asset_id, cat_mojos, xch_mojos, fee_mojos, status) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+                (tid, now, now, str(asset_id).lower(), int(cat_mojos),
+                 int(xch_mojos), int(fee_mojos), TAKE_SUBMITTED),
+            )
+        return self.get_take(tid)
+
+    def get_take(self, trade_id: str) -> DexieTake:
+        tid = str(trade_id).strip().lower()
+        tid = tid[2:] if tid.startswith("0x") else tid
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT {_TAKE_COLUMNS} FROM dexie_takes WHERE trade_id = ?",
+                (tid,),
+            ).fetchone()
+        if row is None:
+            raise WarpJobStoreError(f"no Dexie take {tid}")
+        return _row_to_take(row)
+
+    def list_takes(self, status: Optional[str] = None,
+                   limit: int = 50) -> list[DexieTake]:
+        """Most recent first, optionally only those in *status*."""
+        with self._lock:
+            if status is None:
+                rows = self._conn.execute(
+                    f"SELECT {_TAKE_COLUMNS} FROM dexie_takes "
+                    "ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+            else:
+                rows = self._conn.execute(
+                    f"SELECT {_TAKE_COLUMNS} FROM dexie_takes WHERE status = ? "
+                    "ORDER BY id DESC LIMIT ?", (status, limit)).fetchall()
+        return [_row_to_take(r) for r in rows]
+
+    def settle_take(self, trade_id: str, status: str,
+                    error: Optional[str] = None) -> DexieTake:
+        """Move a ``submitted`` take to ``confirmed`` or ``failed``, once."""
+        if status not in (TAKE_CONFIRMED, TAKE_FAILED):
+            raise WarpJobStoreError(f"a take cannot settle as {status!r}")
+        take = self.get_take(trade_id)
+        if take.status != TAKE_SUBMITTED:
+            raise StaleJobError(
+                f"Dexie take {take.trade_id} is already {take.status}")
+        now = self._now()
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE dexie_takes SET status = ?, updated_at = ?, "
+                "confirmed_at = ?, last_error = ? "
+                "WHERE trade_id = ? AND status = ?",
+                (status, now, now if status == TAKE_CONFIRMED else None,
+                 error, take.trade_id, TAKE_SUBMITTED),
+            )
+        return self.get_take(take.trade_id)
+
     # -- meta (portal-coin hint, schema version, misc singletons) ------------ #
 
     def get_meta(self, key: str, default: Optional[str] = None) -> Optional[str]:
@@ -600,6 +706,23 @@ class WarpJobStore:
                 f"non-indexed fields through state_patch"
             )
         return dict(columns)
+
+
+_TAKE_COLUMNS = (
+    "id, trade_id, created_at, updated_at, asset_id, cat_mojos, xch_mojos, "
+    "fee_mojos, status, confirmed_at, last_error"
+)
+
+
+def _row_to_take(row: sqlite3.Row) -> DexieTake:
+    return DexieTake(
+        id=int(row["id"]), trade_id=row["trade_id"],
+        created_at=row["created_at"], updated_at=row["updated_at"],
+        asset_id=row["asset_id"], cat_mojos=int(row["cat_mojos"]),
+        xch_mojos=int(row["xch_mojos"]), fee_mojos=int(row["fee_mojos"]),
+        status=row["status"], confirmed_at=row["confirmed_at"],
+        last_error=row["last_error"],
+    )
 
 
 def _row_to_job(row: sqlite3.Row) -> WarpJob:

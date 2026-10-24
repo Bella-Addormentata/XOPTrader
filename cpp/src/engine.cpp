@@ -43,6 +43,7 @@
 #include "xop/risk/state_position_truth.hpp"
 
 #include "xop/accounting/bridge_ingest.hpp"
+#include "xop/accounting/topup_take.hpp"
 #include "xop/accounting/reward_ingest.hpp"
 #include "xop/accounting/maker_fill_legs.hpp"
 
@@ -5264,6 +5265,10 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
     catch (const std::exception& e) {
         spdlog::error("[Engine] Secondary bridge ingestion failed: {}",
                       e.what());
+    }
+    try { step_ingest_topup_takes(block_height); }
+    catch (const std::exception& e) {
+        spdlog::error("[Engine] Top-up take ingestion failed: {}", e.what());
     }
 
     // [LEDGER 2026-07-30] Tie the books to the wallet.  Runs after Step 2
@@ -21493,6 +21498,187 @@ asio::awaitable<void> Engine::step_ingest_secondary_bridge_flows(
         persist_inventory_state();
     }
     co_return;
+}
+
+namespace {
+
+// [MILLIETH-TOPUP 2026-10-24] The confirmed rows of warp_jobs.db's
+// dexie_takes table, read-only, oldest first.  A missing database or table
+// (no top-up buy has ever run on this host), a locked file, or a truncated
+// scan returns none: unbooked takes then stay wallet divergence for the
+// invariant, the behaviour before the table existed.
+std::vector<accounting::TopupTakeRow> read_topup_take_rows(
+    const std::string& db_path)
+{
+    std::vector<accounting::TopupTakeRow> rows;
+    sqlite3* raw_db = nullptr;
+    const int rc_open = sqlite3_open_v2(db_path.c_str(), &raw_db,
+                                        SQLITE_OPEN_READONLY, nullptr);
+    const std::unique_ptr<sqlite3, int (*)(sqlite3*)> db_guard(
+        raw_db, &sqlite3_close);
+    if (rc_open != SQLITE_OK) return rows;
+    sqlite3_busy_timeout(raw_db, 250);
+    static constexpr const char* kSql = R"SQL(
+        SELECT id, trade_id, asset_id, cat_mojos, xch_mojos, fee_mojos,
+               COALESCE(created_at, '')
+        FROM dexie_takes
+        WHERE status = 'confirmed'
+        ORDER BY id;
+    )SQL";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(raw_db, kSql, -1, &stmt, nullptr) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        return rows;   // no such table yet: nothing to book
+    }
+    const std::unique_ptr<sqlite3_stmt, int (*)(sqlite3_stmt*)> stmt_guard(
+        stmt, &sqlite3_finalize);
+    int rc = SQLITE_OK;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        accounting::TopupTakeRow r;
+        r.id = sqlite3_column_int64(stmt, 0);
+        const auto text = [&](int col) {
+            const char* t = reinterpret_cast<const char*>(
+                sqlite3_column_text(stmt, col));
+            return std::string(t ? t : "");
+        };
+        r.trade_id   = text(1);
+        r.asset_id   = text(2);
+        r.cat_mojos  = sqlite3_column_int64(stmt, 3);
+        r.xch_mojos  = sqlite3_column_int64(stmt, 4);
+        r.fee_mojos  = sqlite3_column_int64(stmt, 5);
+        r.created_at = text(6);
+        rows.push_back(std::move(r));
+    }
+    if (rc != SQLITE_DONE) {
+        spdlog::warn("[Engine] Top-up takes: scan of {} ended with rc={} -- "
+                     "booking skipped this heartbeat", db_path, rc);
+        rows.clear();
+    }
+    return rows;
+}
+
+}  // namespace
+
+// [MILLIETH-TOPUP 2026-10-24] Book the warp rebalancer's confirmed Dexie
+// buys as takes.  See accounting/topup_take.hpp.  Runs with the bridge
+// scans, before the invariant, so a confirmed buy is explained flow by the
+// time the books are tied to the wallet.
+void Engine::step_ingest_topup_takes(BlockHeight block_height)
+{
+    const auto& acc = config_.accounting;
+    if (!acc.ledger_enabled || !acc.bridge_ingest_enabled) return;
+    if (!db_ || acc.bridge_jobs_db_path.empty()) return;
+    if (!ledger_genesis_done_ || ledger_incomplete_) return;
+
+    for (const auto& row : read_topup_take_rows(acc.bridge_jobs_db_path)) {
+        const auto legs = accounting::classify_topup_take(row);
+        const auto skip_once = [&](const std::string& why) {
+            if (topup_warned_ids_.insert(row.id).second) {
+                spdlog::warn("[Engine] Top-up take {} {} -- not booked (left "
+                             "for the divergence control)", row.id, why);
+            }
+        };
+        if (!legs.valid) {
+            skip_once("is malformed");
+            continue;
+        }
+        if (topup_booked_ids_.count(legs.event_id)) continue;
+
+        // The pair it traded, for the taker_fills row: a wmilliETH.b/XCH
+        // style pair, enabled.  None means no opening either.
+        const PairConfig* pair = nullptr;
+        for (const auto& pc : config_.pairs) {
+            if (pc.enabled && pc.base_asset_id == row.asset_id
+                && pc.quote_asset_id == "xch") {
+                pair = &pc;
+                break;
+            }
+        }
+        if (pair == nullptr) {
+            skip_once("bought " + row.asset_id.substr(0, 12)
+                      + ", which no enabled CAT/XCH pair trades");
+            continue;
+        }
+
+        // Inside an opening already (the opening read the post-take wallet):
+        // booking it again would double-count.  The submit time is a lower
+        // bound on the wallet change; ties skip, as for bridge flows.
+        bool inside_opening = false;
+        bool opening_missing = false;
+        for (const AssetId a : {AssetId{row.asset_id}, AssetId{"xch"}}) {
+            if (!ledger_opened_assets_.count(a)) {
+                opening_missing = true;
+                continue;
+            }
+            const std::string opened = db_->ledger_opening_time(a);
+            if (opened.empty()) {
+                opening_missing = true;
+            } else if (!accounting::iso_strictly_after(row.created_at,
+                                                       opened)) {
+                inside_opening = true;
+            }
+        }
+        if (inside_opening) {
+            topup_booked_ids_.insert(legs.event_id);   // terminal
+            continue;
+        }
+        if (opening_missing) {
+            skip_once("has an asset with no ledger opening");
+            continue;
+        }
+
+        const std::string ts =
+            PnLTracker::timestamp_to_iso(std::chrono::system_clock::now());
+        std::vector<DbLedgerEntry> entries;
+        const auto add = [&](const char* leg, const AssetId& asset,
+                             Mojo delta) {
+            if (delta == 0) return;
+            DbLedgerEntry e;
+            e.entry_time   = ts;
+            e.event_type   = "take";
+            e.event_id     = legs.event_id;
+            e.leg          = leg;
+            e.asset_id     = asset;
+            e.delta_mojos  = delta;
+            e.pair_name    = pair->name;
+            e.block_height = block_height;
+            e.note         = "warp_topup";
+            entries.push_back(std::move(e));
+        };
+        add("base",  AssetId{row.asset_id}, legs.base_delta);
+        add("quote", AssetId{"xch"},        legs.quote_delta);
+        add("fee",   AssetId{"xch"},        legs.fee_delta);
+        const auto inserted = db_->append_ledger_entries(entries);
+        if (!inserted) {
+            spdlog::error("[Engine] Top-up take {}: ledger write FAILED -- "
+                          "retrying next heartbeat", row.id);
+            break;
+        }
+        topup_booked_ids_.insert(legs.event_id);
+        if (*inserted == 0) continue;   // booked before this process
+
+        // The fee is already a Mojo (a signed SQLite column the classifier
+        // checked non-negative): no uint64 narrowing to saturate here.
+        DbTakerFill fill_row;
+        fill_row.taken_at              = ts;
+        fill_row.block_height          = block_height;
+        fill_row.strategy              = "warp_topup";
+        fill_row.trade_id              = row.trade_id;
+        fill_row.pair_name             = pair->name;
+        fill_row.we_bought_base        = true;
+        fill_row.base_asset            = AssetId{row.asset_id};
+        fill_row.base_delta_mojos      = legs.base_delta;
+        fill_row.quote_asset           = AssetId{"xch"};
+        fill_row.quote_delta_mojos     = legs.quote_delta;
+        fill_row.price_mojos           = legs.price_mojos;
+        fill_row.fee_mojos             = row.fee_mojos;
+        db_->insert_taker_fill(fill_row);
+        spdlog::info("[Engine] Top-up take {}: bought {} mojos of {} for {} "
+                     "XCH mojos (+{} fee) on {}, booked at block {}",
+                     row.id, legs.base_delta, row.asset_id.substr(0, 12),
+                     -legs.quote_delta, row.fee_mojos, pair->name,
+                     block_height);
+    }
 }
 
 void Engine::step_check_ledger_invariant(BlockHeight block_height)

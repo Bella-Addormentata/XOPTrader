@@ -102,6 +102,7 @@ add_executable(xop_tests
     test_asset_reserve.cpp
     test_reservation_offset.cpp
     test_bridge_ingest.cpp
+    test_topup_take.cpp
     test_reward_ingest.cpp
     test_maker_fill_legs.cpp
     test_drawdown_breaker.cpp
