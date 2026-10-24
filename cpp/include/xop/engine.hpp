@@ -1869,6 +1869,10 @@ private:
     /// [WARP-MILLIETH review] When the secondary scan last rebuilt the
     /// wallet-id map for an asset with no wallet (0 = never).
     BlockHeight secondary_wallet_map_refresh_block_{0};
+    /// [GAS-RESERVE review] Reserved assets whose spendable coins Step 8
+    /// could not establish this heartbeat: the balance gate suppresses
+    /// every side that spends them.  Rebuilt at each Step 8.
+    std::unordered_set<std::string> reserve_coins_unknown_;
 
     /// [WARP-MILLIETH] Record that @p asset_id's tracked inventory was
     /// just SET from the wallet (startup seed, Step 8 recovery seed,

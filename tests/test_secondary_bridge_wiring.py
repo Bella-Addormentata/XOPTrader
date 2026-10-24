@@ -76,6 +76,21 @@ def test_a_cat_wallet_created_after_startup_is_found():
     assert "ensure_wallet_ids()" in scan[rebuild:fetch]
 
 
+def test_unknown_reserve_coins_suppress_the_spending_sides():
+    """Fail closed per asset: a reserve whose coins cannot be read this
+    heartbeat stops every new offer spending that asset, not all of Step 8."""
+    text = _engine()
+    step8 = _body(text, "asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)")
+    assert step8.count("reserve_coins_unknown_.insert(asset_id);") == 2
+    # An unbuilt map (ensure_wallet_ids() swallows RPC errors) fails closed.
+    ensure = step8.index("co_await offer_mgr_->ensure_wallet_ids();")
+    assert "!offer_mgr_->wallet_ids_resolved()" in step8[ensure:ensure + 900]
+    gate = step8.index("reserve_coins_unknown_.count(gate_pc->base_asset_id)")
+    assert "can_ask = false;" in step8[gate:gate + 600]
+    gate_q = step8.index("reserve_coins_unknown_.count(gate_pc->quote_asset_id)")
+    assert "can_bid = false;" in step8[gate_q:gate_q + 600]
+
+
 def test_step11s_restart_reconcile_re_anchors_a_secondary_asset():
     """The one-shot reconcile is where a restart's stale restored quantity is
     corrected; for a secondary bridge asset that is a capital event."""

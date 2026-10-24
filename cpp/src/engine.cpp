@@ -12517,18 +12517,37 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
     // reserve's coins cannot be read, this heartbeat posts nothing -- a
     // stale or empty exclusion list could let a small offer lock the coin
     // the reserve exists to keep.  A single malformed coin record is
-    // skipped, not fatal.
+    // skipped, not fatal.  [review] Fail closed PER ASSET: an asset whose
+    // coins cannot be established this heartbeat has every side that spends
+    // it suppressed (reserve_coins_unknown_, read in the balance gate below),
+    // while the rest of Step 8 -- cancels, reprices, other pairs -- runs on.
+    reserve_coins_unknown_.clear();
     if (offer_mgr_ && !config_.strategy.asset_reserve_units.empty()) {
         if (!wallet_step_may_run("Step 8 reserve coins")) co_return;
+        bool map_ok = true;
         try {
             co_await offer_mgr_->ensure_wallet_ids();
         } catch (const std::exception& e) {
             spdlog::warn("[Engine] Step 8: wallet map unavailable for the "
-                         "per-asset reserves ({}) -- posting nothing this "
-                         "heartbeat", e.what());
-            co_return;
+                         "per-asset reserves ({}) -- their spending sides are "
+                         "suppressed this heartbeat", e.what());
+            map_ok = false;
+        }
+        // [review] ensure_wallet_ids() swallows an RPC failure and returns
+        // with the map still unbuilt: a reserved CAT would then resolve to
+        // no wallet here and skip its refresh, while post_quotes rebuilds the
+        // map later this heartbeat and posts against a stale exclusion list.
+        if (map_ok && !offer_mgr_->wallet_ids_resolved()) {
+            spdlog::warn("[Engine] Step 8: wallet map not built -- the "
+                         "per-asset reserves' spending sides are suppressed "
+                         "this heartbeat");
+            map_ok = false;
         }
         for (const auto& [asset_id, units] : config_.strategy.asset_reserve_units) {
+            if (!map_ok) {
+                reserve_coins_unknown_.insert(asset_id);
+                continue;
+            }
             const std::int64_t wid = offer_mgr_->resolve_wallet_id(asset_id);
             if (wid <= 0) continue;   // no wallet: no coins for an offer to lock
             if (!wallet_step_may_run("Step 8 reserve coins")) co_return;
@@ -12540,9 +12559,11 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 records = co_await wallet_->get_spendable_coins(wid);
             } catch (const std::exception& e) {
                 spdlog::warn("[Engine] Step 8: reserve coins for {} could not "
-                             "be read ({}) -- posting nothing this heartbeat",
+                             "be read ({}) -- the sides that spend it are "
+                             "suppressed this heartbeat",
                              asset_id.substr(0, 12), e.what());
-                co_return;
+                reserve_coins_unknown_.insert(asset_id);
+                continue;
             }
             std::vector<execution::ReserveCoin> coins;
             for (const auto& rec : records) {
@@ -13953,6 +13974,26 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                         can_ask = false;
                         break;
                     }
+                }
+
+                // [GAS-RESERVE review] A reserved asset whose coins could not
+                // be established this heartbeat: no new offer may spend it,
+                // since its exclusion list may be stale or empty.
+                if (reserve_coins_unknown_.count(gate_pc->base_asset_id)
+                    && can_ask) {
+                    spdlog::info("[Engine] Step 8: {} ask suppressed -- the "
+                                 "reserve coins of {} are unknown this "
+                                 "heartbeat", pair_name,
+                                 gate_pc->base_asset_id.substr(0, 12));
+                    can_ask = false;
+                }
+                if (reserve_coins_unknown_.count(gate_pc->quote_asset_id)
+                    && can_bid) {
+                    spdlog::info("[Engine] Step 8: {} bid suppressed -- the "
+                                 "reserve coins of {} are unknown this "
+                                 "heartbeat", pair_name,
+                                 gate_pc->quote_asset_id.substr(0, 12));
+                    can_bid = false;
                 }
 
                 // Pending exposure guard (existing offers): if all currently
