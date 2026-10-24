@@ -1905,8 +1905,12 @@ class SettingsWidget(QWidget):
             "Key Files (*.key *.pem);;All Files (*)",
         )
 
-        self._wl_fingerprint = QSpinBox()
-        self._wl_fingerprint.setRange(0, 2_147_483_647)
+        # Fingerprints are uint32 (the engine reads read_uint32), so about
+        # half of them exceed QSpinBox's signed 32-bit range.  A 0-decimal
+        # QDoubleSpinBox holds every uint32 exactly.
+        self._wl_fingerprint = QDoubleSpinBox()
+        self._wl_fingerprint.setDecimals(0)
+        self._wl_fingerprint.setRange(0, 4_294_967_295)
         self._wl_fingerprint.setValue(0)
         self._wl_fingerprint.setToolTip("Wallet fingerprint (integer)")
         wl_form.addRow("Fingerprint:", self._wl_fingerprint)
@@ -3262,7 +3266,7 @@ class SettingsWidget(QWidget):
             "ssl_key_path": self._fn_key.text(),
             "wallet_cert_path": self._wl_cert.text(),
             "wallet_key_path": self._wl_key.text(),
-            "wallet_fingerprint": self._wl_fingerprint.value(),
+            "wallet_fingerprint": int(self._wl_fingerprint.value()),
         }
 
         # -- wallet_link --
@@ -5485,7 +5489,7 @@ class SettingsWidget(QWidget):
         else:
             fp = found.get("fingerprint")
             if fp and self._wl_fingerprint.value() == 0:
-                self._wl_fingerprint.setValue(int(fp))
+                self._wl_fingerprint.setValue(float(fp))
             msg = f"Found Chia in {found['root']}."
         self._set_link_status(w["label"], msg + " Save to keep it.", "ok")
 
@@ -5500,6 +5504,13 @@ class SettingsWidget(QWidget):
             "cert_path": w["cert"].text().strip(),
             "key_path": w["key"].text().strip(),
         }
+        if target == "chia":
+            # verify_ssl / ca_cert_path have no widget; they ride the loaded
+            # snapshot, and the probe must check the server the same way the
+            # engine will.
+            chia = (self._clean_snapshot or {}).get("chia") or {}
+            params["verify_ssl"] = bool(chia.get("verify_ssl", False))
+            params["ca_cert_path"] = str(chia.get("ca_cert_path") or "")
         self._set_link_status(
             w["label"], f"Connecting to {params['host']}:{params['port']}...",
             "busy",

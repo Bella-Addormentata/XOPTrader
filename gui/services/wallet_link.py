@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 import tomllib
 from dataclasses import dataclass, field
@@ -46,6 +47,12 @@ SAGE_APP_ID: Final[str] = "com.rigidnetwork.sage"
 
 _PROBE_TIMEOUT_S: Final[float] = 5.0
 _MOJOS_PER_XCH: Final[float] = 1_000_000_000_000.0
+
+# ${VAR} / ${VAR:-default}: the substitution config.yaml and secrets.yaml
+# support (the engine applies it; see the secrets.example.yaml header).
+_ENV_REF_RE: Final[re.Pattern[str]] = re.compile(
+    r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}"
+)
 
 
 @dataclass
@@ -115,7 +122,9 @@ def detect_chia_wallet(root: Optional[Path] = None) -> dict[str, Any]:
         if text.isdigit():
             fingerprint = int(text)
     except OSError:
-        pass
+        # No wallet has logged in yet (or the file is unreadable): leave
+        # the fingerprint unset and let the operator type it.
+        fingerprint = None
 
     return {
         "found": cert.is_file() and key.is_file(),
@@ -182,6 +191,24 @@ def detect_sage(data_dirs: Optional[list[Path]] = None) -> dict[str, Any]:
     return {"found": False}
 
 
+def expand_path(raw: str, env: Optional[dict[str, str]] = None) -> str:
+    """Resolve ``${VAR}``, ``${VAR:-default}`` and ``~`` in a config path.
+
+    An unset ``${VAR}`` with no default is left as written, so the
+    "file not found" message shows the operator what did not resolve.
+    """
+    env = os.environ if env is None else env
+
+    def _sub(match: re.Match[str]) -> str:
+        value = env.get(match.group(1))
+        if value:
+            return value
+        default = match.group(2)
+        return default if default is not None else match.group(0)
+
+    return str(Path(_ENV_REF_RE.sub(_sub, str(raw or ""))).expanduser())
+
+
 # ===================================================================
 # Probing (read-only RPC calls)
 # ===================================================================
@@ -207,7 +234,7 @@ def _check_files(cert_path: str, key_path: str) -> Optional[str]:
     for label, raw in (("certificate", cert_path), ("key", key_path)):
         if not str(raw or "").strip():
             return f"No {label} file set. Try Detect."
-        if not Path(str(raw)).expanduser().is_file():
+        if not Path(expand_path(raw)).is_file():
             return f"The {label} file was not found: {raw}"
     return None
 
@@ -221,11 +248,13 @@ def _call(
     endpoint: str,
     body: dict[str, Any],
     timeout: float,
+    verify: bool | str = False,
 ) -> dict[str, Any]:
     """POST one RPC call and return its JSON object, or raise _RpcError."""
     url = f"https://{host}:{port}/{endpoint}"
     try:
-        resp = post(url, json=body, cert=cert, verify=False, timeout=timeout)
+        resp = post(url, json=body, cert=cert, verify=verify,
+                    timeout=timeout, allow_redirects=False)
     except Exception as exc:  # noqa: BLE001 -- classified below
         name = type(exc).__name__
         if "SSL" in name:
@@ -272,22 +301,35 @@ def probe_chia_wallet(
     cert_path: str,
     key_path: str,
     *,
+    verify_ssl: bool = False,
+    ca_cert_path: str = "",
     timeout: float = _PROBE_TIMEOUT_S,
     post: Optional[PostFn] = None,
 ) -> ProbeResult:
-    """Read the Chia wallet's sync state, fingerprint and XCH balance."""
+    """Read the Chia wallet's sync state, fingerprint and XCH balance.
+
+    Server verification follows ``chia.verify_ssl`` exactly as the engine
+    does: off (the localhost default, private CA issued to "Chia"), or on
+    against ``ca_cert_path`` when set, else the system CA bundle.
+    """
     problem = _check_files(cert_path, key_path)
     if problem:
         return ProbeResult(False, problem)
+    verify: bool | str = False
+    if verify_ssl:
+        verify = expand_path(ca_cert_path) if str(ca_cert_path or "").strip() else True
+        if isinstance(verify, str) and not Path(verify).is_file():
+            return ProbeResult(
+                False, f"verify_ssl is on but the CA file was not found: {ca_cert_path}")
     post = post or _default_post()
-    cert = (str(Path(cert_path).expanduser()), str(Path(key_path).expanduser()))
+    cert = (expand_path(cert_path), expand_path(key_path))
     try:
         sync = _call(post, "Chia wallet", host, port, cert,
-                     "get_sync_status", {}, timeout)
+                     "get_sync_status", {}, timeout, verify)
         fp = _call(post, "Chia wallet", host, port, cert,
-                   "get_logged_in_fingerprint", {}, timeout).get("fingerprint")
+                   "get_logged_in_fingerprint", {}, timeout, verify).get("fingerprint")
         bal = _call(post, "Chia wallet", host, port, cert,
-                    "get_wallet_balance", {"wallet_id": 1}, timeout)
+                    "get_wallet_balance", {"wallet_id": 1}, timeout, verify)
     except _RpcError as exc:
         return ProbeResult(False, str(exc))
 
@@ -321,7 +363,7 @@ def probe_sage(
     if problem:
         return ProbeResult(False, problem)
     post = post or _default_post()
-    cert = (str(Path(cert_path).expanduser()), str(Path(key_path).expanduser()))
+    cert = (expand_path(cert_path), expand_path(key_path))
     try:
         version = _call(post, "Sage", host, port, cert,
                         "get_version", {}, timeout).get("version")
@@ -343,7 +385,10 @@ def probe_sage(
     name = key.get("name") or ""
     mojos = _amount_to_int(sync.get("selectable_balance"))
     unit = sync.get("unit") or {}
-    precision = int(unit.get("precision", 12) or 12)
+    # 0 is a real precision (Sage's "Mojos" unit); default only when absent.
+    precision = unit.get("precision")
+    if not isinstance(precision, int) or precision < 0:
+        precision = 12
     ticker = str(unit.get("ticker") or "XCH")
     synced_coins = int(sync.get("synced_coins") or 0)
     total_coins = int(sync.get("total_coins") or 0)

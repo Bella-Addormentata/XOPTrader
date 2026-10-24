@@ -50,7 +50,8 @@ class _Resp:
 
 
 def _fake_post(routes: dict, calls: list | None = None):
-    def post(url, json=None, cert=None, verify=None, timeout=None):
+    def post(url, json=None, cert=None, verify=None, timeout=None,
+             allow_redirects=True):
         endpoint = url.rsplit("/", 1)[-1]
         if calls is not None:
             calls.append((url, json, cert, verify))
@@ -362,3 +363,96 @@ def test_probe_done_updates_label_and_reenables(panel):
     panel._on_wallet_probe_done("sage", False, "Nothing answered")
     assert panel._sage_test_btn.isEnabled() is True
     assert panel._sage_test_result.text() == "Nothing answered"
+
+
+# ===================================================================
+# Review follow-ups (PR #188)
+# ===================================================================
+
+def test_expand_path_env_refs():
+    env = {"CHIA_ROOT": "/srv/chia"}
+    assert wallet_link.expand_path(
+        "${CHIA_ROOT}/config/ssl/wallet/private_wallet.crt", env
+    ) == "/srv/chia/config/ssl/wallet/private_wallet.crt"
+    assert wallet_link.expand_path("${NOPE:-/d}/x.crt", env) == "/d/x.crt"
+    # unset, no default: left as written so the error shows it
+    assert wallet_link.expand_path("${NOPE}/x.crt", env) == "${NOPE}/x.crt"
+
+
+def test_probe_resolves_env_ref_cert_paths(tmp_path, monkeypatch):
+    (tmp_path / "w.crt").write_text("c")
+    (tmp_path / "w.key").write_text("k")
+    monkeypatch.setenv("XOP_TEST_SSL", str(tmp_path))
+    calls: list = []
+    post = _fake_post({
+        "get_sync_status": _Resp({"synced": True}),
+        "get_logged_in_fingerprint": _Resp({"fingerprint": 1}),
+        "get_wallet_balance": _Resp({"wallet_balance": {}}),
+    }, calls)
+    result = wallet_link.probe_chia_wallet(
+        "localhost", 9256, "${XOP_TEST_SSL}/w.crt", "${XOP_TEST_SSL}/w.key",
+        post=post)
+    assert result.ok is True
+    assert calls[0][2] == (str(tmp_path / "w.crt"), str(tmp_path / "w.key"))
+
+
+def test_chia_probe_honours_verify_ssl(certs, tmp_path):
+    ca = tmp_path / "ca.crt"
+    ca.write_text("ca")
+    routes = {
+        "get_sync_status": _Resp({"synced": True}),
+        "get_logged_in_fingerprint": _Resp({"fingerprint": 1}),
+        "get_wallet_balance": _Resp({"wallet_balance": {}}),
+    }
+    calls: list = []
+    wallet_link.probe_chia_wallet("localhost", 9256, *certs,
+                                  post=_fake_post(routes, calls))
+    assert calls[0][3] is False                      # default: off
+
+    calls.clear()
+    wallet_link.probe_chia_wallet("node", 9256, *certs, verify_ssl=True,
+                                  ca_cert_path=str(ca),
+                                  post=_fake_post(routes, calls))
+    assert calls[0][3] == str(ca)                    # pinned to the CA
+
+    calls.clear()
+    wallet_link.probe_chia_wallet("node", 9256, *certs, verify_ssl=True,
+                                  post=_fake_post(routes, calls))
+    assert calls[0][3] is True                       # system bundle
+
+    missing = wallet_link.probe_chia_wallet(
+        "node", 9256, *certs, verify_ssl=True,
+        ca_cert_path=str(tmp_path / "nope.crt"), post=_fake_post(routes))
+    assert missing.ok is False and "CA file" in missing.summary
+
+
+def test_probe_sage_zero_precision_unit(certs):
+    post = _fake_post({
+        "get_version": _Resp({"version": "0.12.7"}),
+        "get_key": _Resp({"key": {"fingerprint": 42, "name": ""}}),
+        "get_sync_status": _Resp({
+            "selectable_balance": 1_000_000,
+            "unit": {"ticker": "Mojos", "precision": 0},
+            "synced_coins": 1, "total_coins": 1,
+        }),
+    })
+    result = wallet_link.probe_sage("127.0.0.1", 9257, *certs, post=post)
+    assert "1,000,000.0000 Mojos spendable" in result.summary
+
+
+def test_fingerprint_above_int32_round_trips(panel, cfg_path, monkeypatch):
+    big = 3_000_000_000
+    panel.load_config(str(cfg_path))
+    monkeypatch.setattr(wallet_link, "detect_chia_wallet", lambda: {
+        "found": True, "root": "/r", "port": 9256, "cert_path": "/r/c.crt",
+        "key_path": "/r/c.key", "fingerprint": big,
+    })
+    panel._wl_fingerprint.setValue(0)
+    panel._on_wallet_link_detect("chia")
+    assert panel._collect_config_dict()["chia"]["wallet_fingerprint"] == big
+
+    raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    raw["chia"]["wallet_fingerprint"] = 4_294_967_295
+    cfg_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    panel.load_config(str(cfg_path))
+    assert panel._collect_config_dict()["chia"]["wallet_fingerprint"] == 4_294_967_295
