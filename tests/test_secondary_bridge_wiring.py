@@ -50,6 +50,19 @@ def test_the_secondary_scan_runs_after_the_bridge_scan_and_before_the_invariant(
     assert primary < secondary < invariant
 
 
+def test_a_bridge_asset_with_no_cat_wallet_yet_opens_at_zero():
+    """The first wrap creates the CAT wallet; without a zero opening taken
+    while the wallet proved it held none, that deposit could never book."""
+    text = _engine()
+    branch = text.index("if (wid <= 0) {")
+    body = text[branch:branch + 2500]
+    proven = body.index("startup_wallet_synced && offer_mgr_->wallet_ids_resolved()")
+    end = body.index("continue;", proven)
+    assert "is_secondary_bridge_asset(" in body[proven:end]
+    assert "genesis_balances[AssetId{aid}] = 0;" in body[proven:end]
+    assert "genesis_observed_at[AssetId{aid}]" in body[proven:end]
+
+
 def test_step11s_restart_reconcile_re_anchors_a_secondary_asset():
     """The one-shot reconcile is where a restart's stale restored quantity is
     corrected; for a secondary bridge asset that is a capital event."""

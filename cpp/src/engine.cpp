@@ -3182,6 +3182,25 @@ asio::awaitable<void> Engine::poll_loop_coro()
                     // have created the CAT wallet yet.
                     if (startup_wallet_synced && offer_mgr_->wallet_ids_resolved()) {
                         state_seed_not_held.insert(aid);
+                        // [WARP-MILLIETH review] A bridge asset with no CAT
+                        // wallet yet holds a PROVEN zero: open it at zero now
+                        // (observation-stamped), or its first wrap -- which
+                        // creates the wallet -- could never book, and the
+                        // restart that then opens at the minted balance
+                        // would place that deposit inside the opening for
+                        // good.  The same zero-opening rule as a wallet that
+                        // exists but is empty, just below.
+                        if (config_.accounting.bridge_ingest_enabled
+                            && (aid == config_.accounting.bridge_asset_id
+                                || accounting::is_secondary_bridge_asset(
+                                       config_.accounting
+                                           .bridge_secondary_asset_ids,
+                                       aid))) {
+                            genesis_balances[AssetId{aid}] = 0;
+                            genesis_observed_at[AssetId{aid}] =
+                                PnLTracker::timestamp_to_iso(
+                                    std::chrono::system_clock::now());
+                        }
                     }
                     continue;
                 }
