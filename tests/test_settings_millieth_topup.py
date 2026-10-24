@@ -199,3 +199,11 @@ def test_quoted_numbers_are_written_back_verbatim(panel, tmp_path):
     assert warp["max_unwrap_millieth"] == "2.0005"
     assert warp["rebalance"]["wmillieth"]["max_spend_xch"] == "0.0001"
     assert warp["rebalance"]["wmillieth"]["max_premium_pct"] == "2.25"
+
+
+
+def test_a_quoted_reserve_is_shown_and_kept(panel, tmp_path):
+    panel.load_config(str(_cfg(tmp_path, LIVE, {"asset_reserve_units": {
+        WM: "5.0"}})))
+    assert panel._wm_gas_reserve.value() == pytest.approx(5.0)
+    assert _out(panel)["strategy"]["asset_reserve_units"] == {WM: "5.0"}

@@ -24,6 +24,7 @@
 #ifndef XOP_ACCOUNTING_TOPUP_TAKE_HPP
 #define XOP_ACCOUNTING_TOPUP_TAKE_HPP
 
+#include "xop/accounting/bridge_ingest.hpp"
 #include "xop/types.hpp"
 
 #include <cstdint>
@@ -41,7 +42,26 @@ struct TopupTakeRow {
     Mojo         xch_mojos{0}; ///< Paid to the maker.
     Mojo         fee_mojos{0}; ///< Our network fee.
     std::string  created_at;   ///< ISO-8601 UTC: when the take was submitted.
+    /// Chain block the trade confirmed in (the wallet's confirmed_at_index),
+    /// 0 when the GUI did not record one.
+    std::uint64_t confirmed_height{0};
 };
+
+/// Whether a take's leg belongs AFTER an asset's ledger opening -- i.e. the
+/// opening did not already read the post-take balance.  By block when both
+/// are known: the wallet changes at the confirmation block, so an opening
+/// read at a strictly earlier block holds the pre-take balance (a tie is
+/// treated as already inside, the safe direction).  Otherwise by time,
+/// against the SUBMIT time, the bridge flows' lower-bound rule (ties skip).
+[[nodiscard]] inline bool take_leg_after_opening(
+    std::uint64_t confirmed_height, const std::string& created_at,
+    std::uint64_t opening_block, const std::string& opening_time) noexcept
+{
+    if (confirmed_height > 0 && opening_block > 0) {
+        return opening_block < confirmed_height;
+    }
+    return iso_strictly_after(created_at, opening_time);
+}
 
 /// The ledger shape of a take, from our side.
 struct TopupTakeLegs {

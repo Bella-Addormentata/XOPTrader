@@ -4019,6 +4019,23 @@ def _http_get_json(url: str, params: dict, headers: dict) -> Any:
     return resp.json()
 
 
+#: Chia's TradeStatus values, for wallets that report the number.
+_TRADE_STATUS_NAMES: Dict[int, str] = {
+    0: "PENDING_ACCEPT", 1: "PENDING_CONFIRM", 2: "PENDING_CANCEL",
+    3: "CANCELLED", 4: "CONFIRMED", 5: "FAILED",
+}
+
+
+def _trade_status_name(status: Any) -> str:
+    """A trade record's status as its upper-case name, int or string."""
+    if isinstance(status, int) and not isinstance(status, bool):
+        return _TRADE_STATUS_NAMES.get(status, "")
+    text = str(status or "").strip().upper()
+    if text.isdigit():
+        return _TRADE_STATUS_NAMES.get(int(text), "")
+    return text
+
+
 #: A submitted Dexie take the wallet still cannot read after this long is
 #: settled as failed (its record is lost), so it cannot block every later buy.
 _TAKE_UNKNOWN_FAIL_S: int = 3600
@@ -4542,8 +4559,15 @@ class _WarpWorker(QObject):
             raise WarpTerminal(
                 f"expected one wmilliETH.b CAT wallet, found {matches}")
         bal = engine._wallet.get_wallet_balance(matches[0])
-        return (max(0, int(bal.get("spendable_balance") or 0)),
-                max(0, int(bal.get("confirmed_wallet_balance") or 0)))
+        spendable = bal.get("spendable_balance")
+        confirmed = bal.get("confirmed_wallet_balance")
+        # Both, or neither: a reply missing one must not read as zero and
+        # send the planner to Dexie (or past the held-but-locked guard).
+        if spendable is None or confirmed is None:
+            raise WarpError(
+                "wmilliETH.b balance reply is missing spendable or confirmed; "
+                "retrying")
+        return max(0, int(spendable)), max(0, int(confirmed))
 
     def _millieth_unwrap_is_proven(self, engine: "WarpEngine") -> bool:
         """Whether a MANUAL wmilliETH.b unwrap has ever completed here."""
@@ -4607,9 +4631,14 @@ class _WarpWorker(QObject):
                            take.trade_id, exc)
                 in_flight = True
                 continue
-            status = str(record.get("status") or "").upper()
+            status = _trade_status_name(record.get("status"))
             if status == "CONFIRMED":
-                engine._store.settle_take(take.trade_id, jobs.TAKE_CONFIRMED)
+                height = record.get("confirmed_at_index")
+                engine._store.settle_take(
+                    take.trade_id, jobs.TAKE_CONFIRMED,
+                    confirmed_height=(int(height) if isinstance(height, int)
+                                      and not isinstance(height, bool)
+                                      and height > 0 else None))
                 _log.info("Dexie take %s confirmed: %d wmilliETH.b mojos for "
                           "%d XCH mojos", take.trade_id, take.cat_mojos,
                           take.xch_mojos)
@@ -4649,10 +4678,13 @@ class _WarpWorker(QObject):
         # still-listed ask must not be retried blind.
         own = engine._wallet.get_my_open_trade_ids() | (
             engine._store.take_offer_ids())
+        # Max XCH per Buy bounds the whole debit: the ask AND our fee.
         ask = dx.pick_ask(
             asks, want_mojos=int(want_mojos), reference_xch_per_unit=ref,
             max_premium_pct=src.max_premium_pct,
-            max_spend_xch_mojos=src.max_spend_xch_mojos, own_trade_ids=own)
+            max_spend_xch_mojos=max(
+                0, src.max_spend_xch_mojos - src.take_fee_mojos),
+            own_trade_ids=own)
         if ask is None:
             return (
                 f"rebalance: no Dexie wmilliETH.b ask within "

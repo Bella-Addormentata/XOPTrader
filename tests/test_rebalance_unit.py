@@ -389,3 +389,19 @@ def test_the_unwrap_cap_bounds_the_top_up_and_unset_plans_nothing():
 def test_no_dexie_buy_unless_asked_for():
     assert _plan(params=_wm_params(), eth_wei=10 ** 15,
                  max_unwrap_millieth_mojos=0) is None
+
+
+
+@pytest.mark.parametrize("block,why", [
+    ({"enabled": True, "max_spend_xch": 1e308}, "max_spend_xch"),
+    ({"enabled": True, "take_fee_xch": 1e308}, "take_fee_xch"),
+    ({"enabled": True, "max_spend_xch": 0.001, "take_fee_xch": 0.001},
+     "below max_spend_xch"),
+])
+def test_wmillieth_limits_are_bounded_and_coherent(block, why):
+    """[review] 1e308 used to overflow the mojo scaling -- an OverflowError,
+    not a RebalanceConfigError, so the old parameters kept running."""
+    with pytest.raises(rb.RebalanceConfigError, match=why):
+        rb.parse_rebalance_config(_cfg(
+            enabled=True, eth={"target": 0.01, "tolerance_pct": 20},
+            wmillieth=block), min_gas_wei=MIN_GAS)

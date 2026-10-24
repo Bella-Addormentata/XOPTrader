@@ -21521,7 +21521,7 @@ std::vector<accounting::TopupTakeRow> read_topup_take_rows(
     sqlite3_busy_timeout(raw_db, 250);
     static constexpr const char* kSql = R"SQL(
         SELECT id, trade_id, asset_id, cat_mojos, xch_mojos, fee_mojos,
-               COALESCE(created_at, '')
+               COALESCE(created_at, ''), COALESCE(confirmed_height, 0)
         FROM dexie_takes
         WHERE status = 'confirmed'
         ORDER BY id;
@@ -21548,6 +21548,8 @@ std::vector<accounting::TopupTakeRow> read_topup_take_rows(
         r.xch_mojos  = sqlite3_column_int64(stmt, 4);
         r.fee_mojos  = sqlite3_column_int64(stmt, 5);
         r.created_at = text(6);
+        const std::int64_t h = sqlite3_column_int64(stmt, 7);
+        r.confirmed_height = h > 0 ? static_cast<std::uint64_t>(h) : 0;
         rows.push_back(std::move(r));
     }
     if (rc != SQLITE_DONE) {
@@ -21633,8 +21635,13 @@ asio::awaitable<void> Engine::step_ingest_topup_takes(BlockHeight block_height)
         const auto books = [&](const AssetId& a) {
             if (!ledger_opened_assets_.count(a)) return false;
             const std::string opened = db_->ledger_opening_time(a);
-            return !opened.empty()
-                && accounting::iso_strictly_after(row.created_at, opened);
+            if (opened.empty()) return false;
+            // [review] By confirmation block when the GUI recorded one: an
+            // opening observed after the submit but before the trade landed
+            // still holds the pre-take balance.
+            return accounting::take_leg_after_opening(
+                row.confirmed_height, row.created_at,
+                db_->ledger_opening_block(a), opened);
         };
         const bool book_cat = books(AssetId{row.asset_id});
         const bool book_xch = books(AssetId{"xch"});

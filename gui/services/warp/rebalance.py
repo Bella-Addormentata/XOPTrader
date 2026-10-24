@@ -323,14 +323,21 @@ def _parse_wmillieth_source(block: Any, eth: Optional[AssetBand]
     if not 0 < premium <= 50:
         raise RebalanceConfigError(
             "warp.rebalance.wmillieth.max_premium_pct must be in (0, 50]")
+    # Bounded, so the mojo scaling below can never overflow (an
+    # OverflowError would slip past set_config's RebalanceConfigError
+    # handler and leave the previous parameters running).
     spend = num("max_spend_xch", 25.0)
-    if spend <= 0:
+    if not 0 < spend <= 1_000_000:
         raise RebalanceConfigError(
-            "warp.rebalance.wmillieth.max_spend_xch must be positive")
+            "warp.rebalance.wmillieth.max_spend_xch must be in (0, 1000000]")
     fee = num("take_fee_xch", 0.0001)
-    if fee < 0:
+    if not 0 <= fee <= 1:
         raise RebalanceConfigError(
-            "warp.rebalance.wmillieth.take_fee_xch must be >= 0")
+            "warp.rebalance.wmillieth.take_fee_xch must be in [0, 1]")
+    if fee >= spend:
+        raise RebalanceConfigError(
+            "warp.rebalance.wmillieth.take_fee_xch must be below "
+            "max_spend_xch (the cap includes the fee)")
     return WmilliethSource(
         enabled=True, buy_on_dexie=buy, max_premium_pct=premium,
         max_spend_xch_mojos=int(round(spend * 10 ** 12)),

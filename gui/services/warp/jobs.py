@@ -295,6 +295,7 @@ CREATE TABLE IF NOT EXISTS dexie_takes (
     status       TEXT    NOT NULL,          -- submitting | submitted |
                                             -- confirmed | failed
     confirmed_at TEXT,
+    confirmed_height INTEGER,               -- chain block the trade landed in
     last_error   TEXT
 )
 """
@@ -319,6 +320,7 @@ class DexieTake:
     status: str
     confirmed_at: Optional[str]
     last_error: Optional[str]
+    confirmed_height: Optional[int] = None
 
 
 _JOB_COLUMNS = (
@@ -705,7 +707,8 @@ class WarpJobStore:
         return [_row_to_take(r) for r in rows]
 
     def settle_take(self, trade_id: str, status: str,
-                    error: Optional[str] = None) -> DexieTake:
+                    error: Optional[str] = None,
+                    confirmed_height: Optional[int] = None) -> DexieTake:
         """Move an open take to ``confirmed`` or ``failed``, once. Only a
         ``submitted`` take (one with a wallet trade record) can confirm."""
         if status not in (TAKE_CONFIRMED, TAKE_FAILED):
@@ -721,9 +724,10 @@ class WarpJobStore:
         with self._lock, self._conn:
             self._conn.execute(
                 "UPDATE dexie_takes SET status = ?, updated_at = ?, "
-                "confirmed_at = ?, last_error = ? "
+                "confirmed_at = ?, confirmed_height = ?, last_error = ? "
                 "WHERE trade_id = ? AND status = ?",
                 (status, now, now if status == TAKE_CONFIRMED else None,
+                 confirmed_height if status == TAKE_CONFIRMED else None,
                  error, take.trade_id, take.status),
             )
         return self.get_take(take.trade_id)
@@ -762,7 +766,7 @@ class WarpJobStore:
 
 _TAKE_COLUMNS = (
     "id, trade_id, offer_id, created_at, updated_at, asset_id, cat_mojos, "
-    "xch_mojos, fee_mojos, status, confirmed_at, last_error"
+    "xch_mojos, fee_mojos, status, confirmed_at, last_error, confirmed_height"
 )
 
 
@@ -779,6 +783,8 @@ def _row_to_take(row: sqlite3.Row) -> DexieTake:
         xch_mojos=int(row["xch_mojos"]), fee_mojos=int(row["fee_mojos"]),
         status=row["status"], confirmed_at=row["confirmed_at"],
         last_error=row["last_error"],
+        confirmed_height=(int(row["confirmed_height"])
+                          if row["confirmed_height"] is not None else None),
     )
 
 

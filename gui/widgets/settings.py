@@ -3837,9 +3837,18 @@ class SettingsWidget(QWidget):
             for k, v in reserves.items():
                 if str(k).strip().lower() == _WMILLIETH_ASSET_ID:
                     value = v
+        shown: Optional[float] = None
         if isinstance(value, (int, float)) and not isinstance(value, bool):
+            shown = float(value)
+        elif isinstance(value, str):
+            # The engine reads a quoted number too; show it, keep it raw.
+            try:
+                shown = float(value)
+            except ValueError:
+                shown = None
+        if shown is not None and math.isfinite(shown):
             self._wm_reserve_loaded = value
-            self._wm_gas_reserve.setValue(float(value))
+            self._wm_gas_reserve.setValue(shown)
         else:
             try:
                 fallback = float(strat.get("min_reserve_units", 1.0))

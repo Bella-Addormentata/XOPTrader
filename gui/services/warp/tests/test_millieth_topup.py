@@ -442,3 +442,49 @@ def test_an_offer_already_attempted_is_never_taken_again(monkeypatch):
     w._rebalance_next_ok = 0.0
     w._maybe_rebalance(eng)
     assert "nothing bought" in w._rebalance_last, "the only ask was tried"
+
+
+
+# -- review round 6 (PR #186): the summary's missed issues ---------------------
+
+def test_a_numeric_confirmed_status_settles_with_its_block(monkeypatch):
+    _http(monkeypatch)
+    w, eng = _worker(_params(buy=True)), FakeEngine()
+    w._maybe_rebalance(eng)
+    eng._wallet.get_offer = lambda tid: {"status": 4, "confirmed_at_index": 9_400_123}
+    assert w._settle_dexie_takes(eng) is False
+    take = eng._store.get_take(OUR_TID)
+    assert take.status == J.TAKE_CONFIRMED
+    assert take.confirmed_height == 9_400_123
+
+
+def test_numeric_failure_statuses_settle_failed(monkeypatch):
+    for status in (3, 5, "5"):
+        _http(monkeypatch)
+        w, eng = _worker(_params(buy=True)), FakeEngine()
+        w._maybe_rebalance(eng)
+        eng._wallet.get_offer = lambda tid, s=status: {"status": s}
+        assert w._settle_dexie_takes(eng) is False
+        assert eng._store.get_take(OUR_TID).status == J.TAKE_FAILED
+
+
+def test_a_balance_reply_missing_a_field_is_not_zero():
+    w, eng = _worker(_params()), FakeEngine()
+    eng._wallet.get_wallet_balance = lambda wid: {"spendable_balance": 0}
+    with pytest.raises(S.WarpError):
+        w._chia_millieth_balances(eng)
+
+
+def test_the_take_fee_counts_against_max_xch_per_buy(monkeypatch):
+    """An ask priced exactly at the cap would debit cap + fee: refused."""
+    _http(monkeypatch, xch_usd=1.2)
+    params = rb.RebalanceParams(
+        enabled=True, eth=ETH_BAND,
+        wmillieth=rb.WmilliethSource(
+            enabled=True, buy_on_dexie=True,
+            max_spend_xch_mojos=1_827_700_000_000,      # exactly the ask
+            take_fee_mojos=100_000_000))
+    w, eng = _worker(params), FakeEngine()
+    w._maybe_rebalance(eng)
+    assert eng._wallet.taken == []
+    assert "nothing bought" in w._rebalance_last
