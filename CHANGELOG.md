@@ -5,6 +5,77 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.30] — 2026-10-24 — the ETH fee reserve tops itself up from wmilliETH.b
+
+### Bridge an exact amount, keep some USDC on Base, set the ETH fee reserve in Settings (#184)
+
+The Warp tab's Bridge now has an amount box. Blank bridges the hot-wallet
+balance as before, less the new keep-on-Base floor
+(`warp.keep_usdc_on_base`). A typed amount is bridged exactly; it is
+refused up front if it is above `max_auto_bridge_usdc` or not a 0.001 USDC
+step, and the job waits until the balance covers it.
+
+Settings → Fees & Reserves now holds the bridge settings (auto-bridge on or
+off, its minimum, the max per warp with Unlimited, and Keep on Base) and the
+ETH fee reserve: **ETH Fee Reserve Target**, **Top-up Tolerance** and
+**Auto top-up**, written as the rebalancer's `warp.rebalance.eth` band. A
+band the rebalancer would refuse cannot be saved, and an auto-bridge minimum
+above the cap is flagged on both pages.
+
+With only an ETH band configured, `warp.auto_bridge` keeps working: the
+rebalancer runs it as its last leg, after any gas top-up. The status bar and
+the log flag it once each time the hot wallet's ETH falls below
+`min_base_eth`.
+
+### The engine books wmilliETH.b warp flows and keeps a per-coin gas reserve (#185)
+
+wmilliETH.b warp flows are now booked like wUSDC.b ones: a
+`bridge_deposit` or `bridge_withdrawal` ledger row, Net Deposits moved by
+the flow's USD value at the engine's own price for the coin, inventory moved
+by the flow, and the drawdown peak and rolling-loss window restarted at it.
+The coins covered are listed in `accounting.bridge_secondary_asset_ids`
+(default: wmilliETH.b). The dashboard's Net Deposits card now sums each
+flow's booked dollar value instead of counting every unit as $1.
+
+`strategy.asset_reserve_units` keeps a set amount of a coin out of the sell
+offers, the way `fee_reserve_xch` does for XCH. The reserve is also kept
+spendable: offers spending from that wallet exclude the coins that cover it,
+so a small ask cannot lock the one coin a gas top-up needs.
+
+### The ETH fee reserve tops itself up from wmilliETH.b, and can buy it on Dexie (#186)
+
+When ETH on Base drops below its band, the warp rebalancer now works through
+three sources in order:
+
+1. milliETH already on Base, withdrawn to ETH;
+2. wmilliETH.b in the Chia wallet, unwrapped to Base
+   (`warp.rebalance.wmillieth.enabled`);
+3. if you turn it on (`buy_on_dexie`, off by default), one Dexie ask for
+   wmilliETH.b per cooldown, paid in XCH.
+
+The automatic unwrap starts only after one manual wmilliETH.b unwrap has
+completed. It never moves an amount whose ETH would not pay for the gas of
+turning it into ETH, and it only proceeds while the hot wallet can pay for
+the final `withdraw()`. Right before the burn it rechecks that the top-up is
+still needed, still worth making and still affordable, and cancels if not.
+Spendable coins only: wmilliETH.b locked in open offers is never touched.
+
+A Dexie buy must pass every check: our own wallet decodes the offer file
+under the exact trade id Dexie listed, with exactly the listed amounts, and
+says its coins are unspent; it is not one of our own offers, open or
+cancelled; it costs at most `max_premium_pct` above CoinGecko's
+ETH/1000/XCH and at most `max_spend_xch`, take fee included; and it leaves
+the larger of `strategy.fee_reserve_xch` and the XCH its own unwrap will
+need. Each take is recorded in `warp_jobs.db`, settled from the wallet's
+trade record (even with Warp switched off), and booked by the engine as a
+take, with its fee counted against the daily fee budget.
+
+The Warp tab can unwrap wUSDC.b or wmilliETH.b by hand, each with its own
+cap (`warp.max_unwrap_usdc`, and the new `warp.max_unwrap_millieth`).
+Settings → Fees & Reserves has a new **ETH Top-up from wmilliETH.b** group:
+Keep Unsold, the source switch, Max per Unwrap (with Unlimited), Buy on
+Dexie, Max Premium and Max XCH per Buy.
+
 ## [0.10.29] — 2026-10-23 — revive pairs quote through thin markets, with a synthetic price for coins no feed lists
 
 ### A pair with no prices no longer holds the flash-crash guard (#179)
