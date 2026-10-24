@@ -440,12 +440,12 @@ struct BridgeValuation {
 //     heartbeat) would fight the fill path on a traded asset, so a secondary
 //     flow moves inventory RELATIVELY, by its own delta.  That is exact
 //     unless an ABSOLUTE writer -- the startup seed, Step 8's recovery seed,
-//     Step 11's one-shot reconcile, or an earlier wallet-truth pass of the
-//     secondary step -- set the quantity from the wallet at or after the
-//     flow's broadcast lower bound: that write may already contain the
-//     flow, and adding the delta again would count it twice.  Those flows
-//     (and a delta that would drive the tracker negative -- it was already
-//     short) take a wallet-truth pass instead.
+//     Step 11's one-shot reconcile -- set the quantity from the wallet at or
+//     after the flow's broadcast lower bound: that write may already contain
+//     the flow, and adding the delta again would count it twice.  Those
+//     flows (and a delta that would drive the tracker negative -- it was
+//     already short) re-arm Step 11's one-shot wallet reconcile instead, so
+//     wallet truth arrives under that reconcile's own rules.
 // ---------------------------------------------------------------------------
 
 /// Whether `asset_id` is one of the configured secondary bridge assets.

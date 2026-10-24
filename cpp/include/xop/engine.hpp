@@ -1843,9 +1843,9 @@ private:
     /// [WARP-MILLIETH 2026-10-24] The same booking for
     /// accounting.bridge_secondary_asset_ids (wmilliETH.b by default):
     /// ledger leg, Net Deposits at the engine's own USD mark, inventory
-    /// moved by the flow itself (or by a wallet-truth pass when an
-    /// absolute inventory write may already contain it), and the flow
-    /// re-anchor of the drawdown peak.  Runs right after
+    /// moved by the flow itself (or by Step 11's wallet reconcile,
+    /// re-armed, when an absolute inventory write may already contain
+    /// it), and the flow re-anchor of the drawdown peak.  Runs right after
     /// step_ingest_bridge_flows, before the invariant.  See
     /// accounting/bridge_ingest.hpp for the rules.
     asio::awaitable<void> step_ingest_secondary_bridge_flows(
@@ -1869,7 +1869,7 @@ private:
 
     /// [WARP-MILLIETH] Record that @p asset_id's tracked inventory was
     /// just SET from the wallet (startup seed, Step 8 recovery seed,
-    /// Step 11 one-shot reconcile, a secondary wallet-truth pass), so a
+    /// Step 11 one-shot reconcile), so a
     /// later secondary flow whose broadcast precedes it is not added on
     /// top of a quantity that may already contain it.
     void note_inventory_absolute_write(const std::string& asset_id);
@@ -2247,16 +2247,11 @@ private:
     /// note_inventory_absolute_write).  In-memory: a restart's startup
     /// seed and one-shot reconcile re-stamp what they write.
     std::unordered_map<std::string, std::string> inventory_absolute_write_iso_;
-    /// A wallet-truth pass a booked secondary flow is owed: run on the
-    /// first settled snapshot taken AFTER after_block with no fills
-    /// awaiting confirmation; reset_peak repeats the flow re-anchor at
-    /// that moment (it also ran at booking), so the peak re-seeds from
-    /// equity that contains the flow.
-    struct SecondaryTruthDue {
-        BlockHeight after_block{0};
-        bool        reset_peak{false};
-    };
-    std::unordered_map<std::string, SecondaryTruthDue> secondary_truth_due_;
+    /// [WARP-MILLIETH review] Step 11 one-shot reconciles RE-ARMED by a
+    /// booked secondary flow whose quantity may already be inside an
+    /// earlier wallet-set write, and the booking block: the reconcile then
+    /// accepts only a snapshot taken at or after it.
+    std::unordered_map<std::string, BlockHeight> inventory_reconcile_not_before_;
 
     /// [S18 2026-08-23] Consecutive lifted evaluations of the max-drawdown
     /// condition; the re-alert gate only re-arms once this reaches the

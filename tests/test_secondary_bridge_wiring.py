@@ -65,9 +65,21 @@ def test_the_secondary_scan_re_anchors_and_rebases_together():
     scan = _body(_engine(), SECONDARY)
     assert "peak_equity_hwm_usd_ = 0.0;" in scan
     assert "pnl_window_rebase_assets_[a] = block_height;" in scan
-    # The wallet-truth pass re-anchors whenever it moves the quantity.
-    moved = scan.index("if (wallet != tracked) {")
-    assert "reset_peak = true;" in scan[moved:moved + 900]
+
+
+def test_wallet_truth_re_arms_step11_on_a_post_booking_snapshot():
+    """One wallet-truth writer, with one set of rules: a flow whose quantity
+    an earlier absolute write may contain re-arms Step 11's one-shot
+    reconcile, which then waits for a snapshot from the booking on."""
+    text = _engine()
+    scan = _body(text, SECONDARY)
+    assert "inventory_reconciled_assets_.erase(sid);" in scan
+    assert "inventory_reconcile_not_before_[sid] = block_height;" in scan
+    step11 = _body(text, STEP11)
+    gate = step11.index("inventory_reconcile_not_before_.find(aid)")
+    write = step11.index("inventory_->adjust_quantity(AssetId{aid}")
+    assert gate < write
+    assert "bal.as_of_block < nb->second" in step11[gate:write]
 
 
 def test_step13_restarts_the_window_by_the_tested_verdict():

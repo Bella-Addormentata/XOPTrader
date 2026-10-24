@@ -21137,67 +21137,7 @@ asio::awaitable<void> Engine::step_ingest_secondary_bridge_flows(
     // rebase at the end).
     std::set<std::string> rebase_assets;
 
-    // -- 1. Wallet-truth passes owed by earlier bookings ---------------------
-    // Keys copied first: the loop suspends on the wallet read.
-    std::vector<std::string> due_assets;
-    due_assets.reserve(secondary_truth_due_.size());
-    for (const auto& [aid, due] : secondary_truth_due_) {
-        due_assets.push_back(aid);
-    }
-    for (const auto& aid : due_assets) {
-        const auto dit = secondary_truth_due_.find(aid);
-        if (dit == secondary_truth_due_.end()) continue;
-        const SecondaryTruthDue due = dit->second;
-        // A snapshot taken AFTER the booking, and no fill awaiting
-        // confirmation whose wallet effect the tracker has yet to see
-        // (Step 11's one-shot rule) -- else setting to the wallet could
-        // count that fill twice once it confirms.  [review] And only from
-        // a wallet known SYNCED: the fetch below checks fields and pending
-        // change, not sync, and a mid-sync balance would set inventory to a
-        // partial figure and consume the pass.
-        if (block_height <= due.after_block
-            || !pending_unconfirmed_fills_.empty()) {
-            continue;
-        }
-        if (!co_await secondary_wallet_synced(block_height)) continue;
-        const AssetId a{aid};
-        if (!co_await fetch_bridge_balance(a, block_height)) continue;
-        const Mojo wallet = cached_wallet_balances_[a].confirmed;
-        if (wallet < 0) continue;
-        const Mojo tracked = inventory_->net_inventory(a);
-        Mojo add_price = 0;
-        if (wallet > tracked) {
-            // An increase needs a price to cost the new lot (else
-            // adjust_quantity no-ops); wait for one.
-            const auto px = usd_per_unit_for(a);
-            if (px) {
-                add_price = accounting::value_bridge_flow(
-                    wallet - tracked, kCatMojosPerUnit, *px).fmv_pseudo_price;
-            }
-            if (add_price <= 0) continue;
-        }
-        if (wallet != tracked) {
-            inventory_->adjust_quantity(a, wallet, add_price);
-            inv_changed = true;
-            // [review] The quantity was stale, so a peak seeded since (a
-            // restart restores it before any pass can run) may hold it too:
-            // re-anchor whenever the pass moves it, whatever the flow's age.
-            reset_peak = true;
-            rebase_assets.insert(aid);
-            spdlog::info("[Engine] Bridge ingest: {} inventory {} -> {} mojos "
-                         "from wallet truth (a booked flow overlapped an "
-                         "earlier wallet-set quantity)",
-                         aid.substr(0, 12), tracked, wallet);
-        }
-        note_inventory_absolute_write(aid);
-        if (due.reset_peak) {
-            reset_peak = true;
-            rebase_assets.insert(aid);
-        }
-        secondary_truth_due_.erase(aid);
-    }
-
-    // -- 2. Book this scan's flows -------------------------------------------
+    // -- Book this scan's flows ----------------------------------------------
     const std::vector<accounting::BridgeJobRow> jobs =
         read_bridge_job_rows(acc.bridge_jobs_db_path);
     const auto  now        = std::chrono::system_clock::now();
@@ -21342,12 +21282,14 @@ asio::awaitable<void> Engine::step_ingest_secondary_bridge_flows(
                                             val.fmv_pseudo_price);
                 inv_changed = true;
             } else {
-                // The wallet-truth pass re-anchors again once it has run, so
-                // the peak re-seeds from equity that holds the flow either
-                // way.
-                auto& due = secondary_truth_due_[sid];
-                due.after_block = block_height;
-                due.reset_peak  = due.reset_peak || in_process;
+                // [review] Wallet truth through Step 11's one-shot reconcile,
+                // RE-ARMED for this asset rather than a second writer with
+                // rules of its own: the same startup grace, pending-fill rule
+                // and snapshot freshness, on a snapshot taken at or after
+                // this booking.  It re-anchors when it moves a secondary
+                // asset's quantity.
+                inventory_reconciled_assets_.erase(sid);
+                inventory_reconcile_not_before_[sid] = block_height;
             }
             // [review] Re-anchored NOW in both cases: on the wallet-truth
             // path an absolute write may already have taken the flow out of
@@ -21942,6 +21884,13 @@ void Engine::step_update_pnl(BlockHeight block_height)
                     continue;
                 }
                 if (bal.pending_change != 0) continue;  // coins in flight
+                // [WARP-MILLIETH review] Re-armed by a booked secondary flow:
+                // only a snapshot taken at or after that booking may close it.
+                if (const auto nb = inventory_reconcile_not_before_.find(aid);
+                    nb != inventory_reconcile_not_before_.end()
+                    && bal.as_of_block < nb->second) {
+                    continue;
+                }
                 // Stale snapshot: skip WITHOUT consuming the one-shot so it
                 // is retried once Step 8 refreshes the balance.
                 if (bal.as_of_block == 0
@@ -21992,6 +21941,7 @@ void Engine::step_update_pnl(BlockHeight block_height)
                                  aid.substr(0, 12), tracked, bal.confirmed);
                 }
                 inventory_reconciled_assets_.insert(aid);
+                inventory_reconcile_not_before_.erase(aid);
             }
         }
 
