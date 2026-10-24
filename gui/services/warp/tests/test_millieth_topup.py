@@ -339,3 +339,85 @@ def test_a_take_settles_exactly_once():
         store.settle_take(OUR_TID, J.TAKE_SUBMITTED)
     assert [t.trade_id for t in store.list_takes(status=J.TAKE_CONFIRMED)] == [
         OUR_TID]
+
+
+# -- review round 1 (PR #186) ---------------------------------------------------
+
+def test_the_intent_is_recorded_before_the_take(monkeypatch):
+    """A lost take response must still leave a row that blocks a second buy."""
+    _http(monkeypatch)
+    w, eng = _worker(_params(buy=True)), FakeEngine()
+    seen = {}
+
+    def lost_response(offer, *, fee_mojos=0):
+        seen["rows"] = [(t.status, t.offer_id)
+                        for t in eng._store.list_takes()]
+        raise RuntimeError("connection reset after send")
+
+    eng._wallet.take_offer = lost_response
+    w._maybe_rebalance(eng)
+    assert seen["rows"] == [(J.TAKE_SUBMITTING, MAKER_TID)]
+    w._rebalance_next_ok = 0.0
+    w._maybe_rebalance(eng)                       # no second buy
+    assert "not confirmed yet" in w._rebalance_last
+    # An hour later, unresolved, it settles as failed.
+    monkeypatch.setattr(S, "_age_s", lambda iso: S._TAKE_UNKNOWN_FAIL_S + 1)
+    assert w._settle_dexie_takes(eng) is False
+    assert eng._store.list_takes()[0].status == J.TAKE_FAILED
+
+
+def test_an_accepted_take_is_rekeyed_to_the_wallet_trade_id(monkeypatch):
+    _http(monkeypatch)
+    w, eng = _worker(_params(buy=True)), FakeEngine()
+    w._maybe_rebalance(eng)
+    take = eng._store.get_take(OUR_TID)
+    assert (take.status, take.offer_id) == (J.TAKE_SUBMITTED, MAKER_TID)
+
+
+def test_the_chia_balance_is_not_read_while_base_has_millieth(monkeypatch):
+    w, eng = _worker(_params()), FakeEngine()
+    eng._hot_cache["millieth_units"] = 5
+    eng._cat_wallet_ids = None                    # would raise if consulted
+    calls = []
+    w._base_wallet = lambda: type("W", (), {
+        "unwrap_millieth": lambda self, units: calls.append(units)})()
+    w._maybe_rebalance(eng)
+    assert calls == [5]
+
+
+def test_the_live_test_proof_is_found_beyond_the_newest_jobs():
+    w, eng = _worker(_params()), FakeEngine(proven=True)
+    for _ in range(3):
+        eng._store.create_job("mainnet", status=JobStatus.UNWRAP_CHECKS,
+                              state={"direction": "out"})
+        job = eng._store.get_active_job()
+        eng._store.update_job(job.id, status=JobStatus.CANCELLED,
+                              expected_status=JobStatus.UNWRAP_CHECKS)
+    assert w._millieth_unwrap_is_proven(eng)
+
+
+def test_our_open_offers_are_listed_across_every_page():
+    from gui.services.warp.wallet import WalletClient, WalletError
+
+    pages = []
+
+    def poster(url, body):
+        pages.append((body["start"], body["end"]))
+        n = 2 if body["start"] == 0 else 1
+        return {"success": True, "trade_records": [
+            {"trade_id": f"0x{body['start'] + i:064x}", "is_my_offer": True}
+            for i in range(n)]}
+
+    client = WalletClient({}, poster=poster)
+    ids = client.get_my_open_trade_ids(page=2)
+    assert pages == [(0, 2), (2, 4)]
+    assert len(ids) == 3
+
+    def failing(url, body):
+        if body["start"] > 0:
+            return {"success": False, "error": "busy"}
+        return {"success": True, "trade_records": [
+            {"trade_id": "0x" + "1" * 64, "is_my_offer": True}] * 2}
+
+    with pytest.raises(WalletError):
+        WalletClient({}, poster=failing).get_my_open_trade_ids(page=2)

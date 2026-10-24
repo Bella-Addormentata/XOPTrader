@@ -281,19 +281,25 @@ CREATE TABLE IF NOT EXISTS warp_meta (
 _CREATE_DEXIE_TAKES = """
 CREATE TABLE IF NOT EXISTS dexie_takes (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    trade_id     TEXT    NOT NULL UNIQUE,   -- lowercase hex, no 0x
+    trade_id     TEXT    NOT NULL UNIQUE,   -- lowercase hex, no 0x: the
+                                            -- wallet's trade record once
+                                            -- submitted, the maker's offer
+                                            -- id while submitting
+    offer_id     TEXT    NOT NULL,          -- the maker's offer (Dexie)
     created_at   TEXT    NOT NULL,
     updated_at   TEXT    NOT NULL,
     asset_id     TEXT    NOT NULL,          -- the CAT bought
     cat_mojos    INTEGER NOT NULL,          -- received
     xch_mojos    INTEGER NOT NULL,          -- paid to the maker
     fee_mojos    INTEGER NOT NULL,          -- our network fee
-    status       TEXT    NOT NULL,          -- submitted | confirmed | failed
+    status       TEXT    NOT NULL,          -- submitting | submitted |
+                                            -- confirmed | failed
     confirmed_at TEXT,
     last_error   TEXT
 )
 """
 
+TAKE_SUBMITTING = "submitting"   # recorded before the take RPC
 TAKE_SUBMITTED = "submitted"
 TAKE_CONFIRMED = "confirmed"
 TAKE_FAILED = "failed"
@@ -303,6 +309,7 @@ TAKE_FAILED = "failed"
 class DexieTake:
     id: int
     trade_id: str
+    offer_id: str
     created_at: str
     updated_at: str
     asset_id: str
@@ -615,24 +622,58 @@ class WarpJobStore:
     # -- Dexie takes ([MILLIETH-TOPUP]) -------------------------------------- #
 
     def record_take(self, *, trade_id: str, asset_id: str, cat_mojos: int,
-                    xch_mojos: int, fee_mojos: int) -> DexieTake:
-        """Record a take the wallet accepted, as ``submitted``."""
-        tid = str(trade_id).strip().lower()
-        tid = tid[2:] if tid.startswith("0x") else tid
+                    xch_mojos: int, fee_mojos: int,
+                    offer_id: Optional[str] = None,
+                    status: str = TAKE_SUBMITTED) -> DexieTake:
+        """Record a take: ``submitting`` before the RPC, or ``submitted``."""
+        if status not in (TAKE_SUBMITTING, TAKE_SUBMITTED):
+            raise WarpJobStoreError(f"a take cannot be recorded as {status!r}")
+        tid = _norm_hex(trade_id)
+        oid = _norm_hex(offer_id if offer_id is not None else trade_id)
         now = self._now()
         with self._lock, self._conn:
             self._conn.execute(
-                "INSERT INTO dexie_takes(trade_id, created_at, updated_at, "
-                "asset_id, cat_mojos, xch_mojos, fee_mojos, status) "
-                "VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
-                (tid, now, now, str(asset_id).lower(), int(cat_mojos),
-                 int(xch_mojos), int(fee_mojos), TAKE_SUBMITTED),
+                "INSERT INTO dexie_takes(trade_id, offer_id, created_at, "
+                "updated_at, asset_id, cat_mojos, xch_mojos, fee_mojos, "
+                "status) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (tid, oid, now, now, str(asset_id).lower(), int(cat_mojos),
+                 int(xch_mojos), int(fee_mojos), status),
             )
         return self.get_take(tid)
 
+    def take_submitted(self, provisional_id: str, trade_id: str) -> DexieTake:
+        """A ``submitting`` take the wallet accepted: key it by the wallet's
+        own trade id, which is what its trade record answers to."""
+        old, new = _norm_hex(provisional_id), _norm_hex(trade_id)
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE dexie_takes SET trade_id = ?, status = ?, "
+                "updated_at = ? WHERE trade_id = ? AND status = ?",
+                (new, TAKE_SUBMITTED, self._now(), old, TAKE_SUBMITTING),
+            )
+            if cur.rowcount != 1:
+                raise StaleJobError(f"no submitting Dexie take {old}")
+        return self.get_take(new)
+
+    def completed_job_states(self) -> list[dict]:
+        """The state payload of EVERY completed job (no row limit)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT state FROM warp_jobs WHERE status = ?",
+                (JobStatus.COMPLETED,),
+            ).fetchall()
+        out = []
+        for r in rows:
+            try:
+                state = json.loads(r["state"] or "{}")
+            except ValueError:
+                continue
+            if isinstance(state, dict):
+                out.append(state)
+        return out
+
     def get_take(self, trade_id: str) -> DexieTake:
-        tid = str(trade_id).strip().lower()
-        tid = tid[2:] if tid.startswith("0x") else tid
+        tid = _norm_hex(trade_id)
         with self._lock:
             row = self._conn.execute(
                 f"SELECT {_TAKE_COLUMNS} FROM dexie_takes WHERE trade_id = ?",
@@ -658,13 +699,17 @@ class WarpJobStore:
 
     def settle_take(self, trade_id: str, status: str,
                     error: Optional[str] = None) -> DexieTake:
-        """Move a ``submitted`` take to ``confirmed`` or ``failed``, once."""
+        """Move an open take to ``confirmed`` or ``failed``, once. Only a
+        ``submitted`` take (one with a wallet trade record) can confirm."""
         if status not in (TAKE_CONFIRMED, TAKE_FAILED):
             raise WarpJobStoreError(f"a take cannot settle as {status!r}")
         take = self.get_take(trade_id)
-        if take.status != TAKE_SUBMITTED:
+        allowed = ((TAKE_SUBMITTED,) if status == TAKE_CONFIRMED
+                   else (TAKE_SUBMITTED, TAKE_SUBMITTING))
+        if take.status not in allowed:
             raise StaleJobError(
-                f"Dexie take {take.trade_id} is already {take.status}")
+                f"Dexie take {take.trade_id} is {take.status}; cannot settle "
+                f"as {status}")
         now = self._now()
         with self._lock, self._conn:
             self._conn.execute(
@@ -672,7 +717,7 @@ class WarpJobStore:
                 "confirmed_at = ?, last_error = ? "
                 "WHERE trade_id = ? AND status = ?",
                 (status, now, now if status == TAKE_CONFIRMED else None,
-                 error, take.trade_id, TAKE_SUBMITTED),
+                 error, take.trade_id, take.status),
             )
         return self.get_take(take.trade_id)
 
@@ -709,14 +754,19 @@ class WarpJobStore:
 
 
 _TAKE_COLUMNS = (
-    "id, trade_id, created_at, updated_at, asset_id, cat_mojos, xch_mojos, "
-    "fee_mojos, status, confirmed_at, last_error"
+    "id, trade_id, offer_id, created_at, updated_at, asset_id, cat_mojos, "
+    "xch_mojos, fee_mojos, status, confirmed_at, last_error"
 )
+
+
+def _norm_hex(value: object) -> str:
+    text = str(value or "").strip().lower()
+    return text[2:] if text.startswith("0x") else text
 
 
 def _row_to_take(row: sqlite3.Row) -> DexieTake:
     return DexieTake(
-        id=int(row["id"]), trade_id=row["trade_id"],
+        id=int(row["id"]), trade_id=row["trade_id"], offer_id=row["offer_id"],
         created_at=row["created_at"], updated_at=row["updated_at"],
         asset_id=row["asset_id"], cat_mojos=int(row["cat_mojos"]),
         xch_mojos=int(row["xch_mojos"]), fee_mojos=int(row["fee_mojos"]),

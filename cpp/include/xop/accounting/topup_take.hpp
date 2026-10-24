@@ -13,9 +13,8 @@
 // legs under "take:<trade_id>" -- plus a taker_fills row for the history.
 //
 // A take is a TRADE, not external capital: nothing here touches Net
-// Deposits.  Like the engine's own takes (S48), it does not move the
-// inventory tracker; the secondary bridge scan's wallet-truth fallback and
-// the Step 11 reconcile cover the difference.
+// Deposits.  The tracker saw neither leg, so the engine re-arms Step 11's
+// one-shot wallet reconcile for both assets when it books one.
 //
 // Compliant with:
 //   ISO/IEC 5055  -- pure functions, overflow-checked, no UB
@@ -76,10 +75,13 @@ struct TopupTakeLegs {
     if (r.cat_mojos <= 0 || r.xch_mojos <= 0 || r.fee_mojos < 0) return out;
     constexpr Mojo kMax = std::numeric_limits<Mojo>::max();
     if (r.xch_mojos > kMax - r.fee_mojos) return out;
-    // price = xch * 1000 / cat, without overflowing the product.
+    // price = xch * 1000 / cat, rounded half up, without overflowing the
+    // product or the rounding step: from the quotient and remainder.
     if (r.xch_mojos > kMax / 1000) return out;
     const Mojo scaled = r.xch_mojos * 1000;
-    out.price_mojos = (scaled + r.cat_mojos / 2) / r.cat_mojos;
+    const Mojo quotient  = scaled / r.cat_mojos;
+    const Mojo remainder = scaled % r.cat_mojos;
+    out.price_mojos = quotient + (remainder >= r.cat_mojos - remainder ? 1 : 0);
     out.event_id    = "take:" + r.trade_id;
     out.base_delta  = r.cat_mojos;
     out.quote_delta = -r.xch_mojos;

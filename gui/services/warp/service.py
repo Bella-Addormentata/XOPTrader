@@ -2484,8 +2484,16 @@ class WarpEngine:
                     "Set warp.dry_run: false to go live"
                 ),
             )
+        # [review] The size the gates checked IS the size to burn: a
+        # rebalance trim above changed it, and _h_burn_sent (and the
+        # engine's ledger booking) read the job's columns, not this local.
         return _advance(
             JobStatus.BURN_SENT,
+            columns={
+                "amount_mojos": amount,
+                "amount_usdc_micros": amount * 10 ** (
+                    int(spec.erc20_decimals) - net.cat_decimals),
+            },
             state=state,
             message=f"all gates passed; sending {amount} mojos to the burn puzzle",
         )
@@ -4371,13 +4379,19 @@ class _WarpWorker(QObject):
             src = p.wmillieth
             buy_in_flight = (
                 bool(engine._store.list_takes(status=jobs.TAKE_SUBMITTED,
-                                              limit=1))
+                                              limit=1)
+                     or engine._store.list_takes(status=jobs.TAKE_SUBMITTING,
+                                                 limit=1))
                 if src is not None and src.enabled else False
             )
+            # Only once Base has no milliETH left to withdraw: that is the
+            # planner's first, free source, and a Chia RPC failure must not
+            # cost it its turn.
             chia_millieth, chia_millieth_held = (
                 self._chia_millieth_balances(engine)
                 if src is not None and src.enabled and p.eth is not None
-                and eth_now < p.eth.low else (0, 0)
+                and eth_now < p.eth.low
+                and int(hot.get("millieth_units") or 0) <= 0 else (0, 0)
             )
             action = rb.plan(
                 params=p,
@@ -4536,11 +4550,9 @@ class _WarpWorker(QObject):
         if self._millieth_unwrap_proven:
             return True
         tail = ":" + engine._net.asset("milliETH").expected_asset_id.lower()
-        for job in engine._store.list_jobs(limit=500):
-            if (job.status == JobStatus.COMPLETED
-                    and job.state.get("direction") == "out"
-                    and job.state.get("manual")
-                    and str(job.state.get("asset_fingerprint") or "")
+        for state in engine._store.completed_job_states():
+            if (state.get("direction") == "out" and state.get("manual")
+                    and str(state.get("asset_fingerprint") or "")
                     .lower().endswith(tail)):
                 self._millieth_unwrap_proven = True
                 break
@@ -4564,6 +4576,21 @@ class _WarpWorker(QObject):
         failed, so a lost trade record cannot stop every later buy.
         """
         in_flight = False
+        for take in engine._store.list_takes(status=jobs.TAKE_SUBMITTING):
+            # The take RPC's outcome never reached the store (a lost
+            # response, a crash): no wallet trade id to look up. It blocks
+            # buys until _TAKE_UNKNOWN_FAIL_S, then settles as failed -- by
+            # then a buy that did land shows up as wmilliETH.b held, so the
+            # planner no longer asks for one.
+            if _age_s(take.created_at) > _TAKE_UNKNOWN_FAIL_S:
+                engine._store.settle_take(
+                    take.trade_id, jobs.TAKE_FAILED,
+                    error="the take's outcome was never recorded")
+                _log.warning("Dexie take of %s: outcome unknown after %ds; "
+                             "settled as failed (check the wallet)",
+                             take.offer_id, _TAKE_UNKNOWN_FAIL_S)
+            else:
+                in_flight = True
         for take in engine._store.list_takes(status=jobs.TAKE_SUBMITTED):
             try:
                 record = engine._wallet.get_offer(take.trade_id)
@@ -4638,18 +4665,27 @@ class _WarpWorker(QObject):
                 f"a Dexie buy costing {cost / 10 ** 12:.6f} XCH would leave "
                 f"{(spendable - cost) / 10 ** 12:.6f} XCH spendable, under the "
                 f"engine's {keep / 10 ** 12:g} XCH fee reserve")
+        # [review] The intent is recorded BEFORE the irreversible RPC, under
+        # the maker's offer id: a lost response, a crash or a failed write
+        # after the take must still leave a row that blocks a second buy
+        # and that settlement resolves. If this write fails, nothing is taken.
+        engine._store.record_take(
+            trade_id=ask.trade_id, offer_id=ask.trade_id, asset_id=asset_id,
+            cat_mojos=ask.cat_mojos, xch_mojos=ask.xch_mojos,
+            fee_mojos=src.take_fee_mojos, status=jobs.TAKE_SUBMITTING)
         record = engine._wallet.take_offer(ask.offer,
                                            fee_mojos=src.take_fee_mojos)
-        trade_id = str(record.get("trade_id") or "") or ask.trade_id
-        try:
-            engine._store.record_take(
-                trade_id=trade_id, asset_id=asset_id,
-                cat_mojos=ask.cat_mojos, xch_mojos=ask.xch_mojos,
-                fee_mojos=src.take_fee_mojos)
-        except Exception as exc:  # noqa: BLE001 -- the take already happened
-            _log.error("Dexie take %s succeeded but could not be recorded "
-                       "(%s); the engine will see it as wallet divergence",
-                       trade_id, exc)
+        trade_id = str(record.get("trade_id") or "")
+        if trade_id:
+            try:
+                engine._store.take_submitted(ask.trade_id, trade_id)
+            except Exception as exc:  # noqa: BLE001 -- the take happened
+                _log.error("Dexie take of %s accepted as %s but not marked "
+                           "submitted (%s); it settles as unknown",
+                           ask.trade_id, trade_id, exc)
+        else:
+            _log.warning("Dexie take of %s accepted without a trade id; it "
+                         "settles as unknown", ask.trade_id)
         return (
             f"rebalance: took Dexie offer {ask.dexie_id or ask.trade_id[:12]}: "
             f"{ask.cat_mojos / 1000:g} wmilliETH.b for "

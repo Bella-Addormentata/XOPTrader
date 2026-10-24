@@ -174,3 +174,17 @@ def test_the_gas_reserve_is_editable_without_a_warp_section(panel, tmp_path):
     assert panel._wm_gas_reserve.isEnabled()
     panel._wm_gas_reserve.setValue(2.0)
     assert _out(panel)["strategy"]["asset_reserve_units"] == {WM: 2.0}
+
+
+def test_quoted_numbers_are_written_back_verbatim(panel, tmp_path):
+    """[review] The runtime reads quoted numbers; an untouched one must not
+    be rounded or clamped by an unrelated save."""
+    panel.load_config(str(_cfg(tmp_path, {
+        **LIVE, "max_unwrap_millieth": "2.0005",
+        "rebalance": {**BAND, "wmillieth": {
+            "enabled": True, "max_spend_xch": "0.0001",
+            "max_premium_pct": "2.25"}}})))
+    warp = _out(panel)["warp"]
+    assert warp["max_unwrap_millieth"] == "2.0005"
+    assert warp["rebalance"]["wmillieth"]["max_spend_xch"] == "0.0001"
+    assert warp["rebalance"]["wmillieth"]["max_premium_pct"] == "2.25"

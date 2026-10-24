@@ -64,6 +64,20 @@ TEST(TopupTakeTest, MalformedRowsBookNothing) {
     EXPECT_FALSE(bad([](TopupTakeRow& r) { r.fee_mojos = -1; }));
 }
 
+TEST(TopupTakeTest, ThePriceRoundsWithoutOverflowNearTheLimit) {
+    // [review] xch * 1000 fits but adding half the divisor would not.
+    constexpr Mojo kMax = std::numeric_limits<Mojo>::max();
+    auto r = live_take();
+    r.fee_mojos = 0;
+    r.xch_mojos = kMax / 1000;
+    r.cat_mojos = 2'000;
+    const auto legs = classify_topup_take(r);
+    ASSERT_TRUE(legs.valid);
+    const Mojo scaled = (kMax / 1000) * 1000;
+    EXPECT_EQ(legs.price_mojos,
+              scaled / 2'000 + ((scaled % 2'000) * 2 >= 2'000 ? 1 : 0));
+}
+
 TEST(TopupTakeTest, OverflowingAmountsBookNothing) {
     constexpr Mojo kMax = std::numeric_limits<Mojo>::max();
     auto r = live_take();

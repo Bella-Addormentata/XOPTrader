@@ -1885,8 +1885,10 @@ private:
     /// Dexie buys (warp_jobs.db dexie_takes) as takes: base, quote and fee
     /// legs under "take:<trade_id>" and a taker_fills row.  Read-only,
     /// idempotent per trade (ledger event_id uniqueness).  Runs before the
-    /// invariant.  See accounting/topup_take.hpp.
-    void step_ingest_topup_takes(BlockHeight block_height);
+    /// invariant, from fresh synced wallet snapshots of both assets, and
+    /// re-arms Step 11's wallet reconcile for each.  See
+    /// accounting/topup_take.hpp.
+    asio::awaitable<void> step_ingest_topup_takes(BlockHeight block_height);
 
     /// Tie the ledger's implied balances to the wallet's confirmed balances
     /// and escalate on sustained, unexplained divergence.  Alert-only unless

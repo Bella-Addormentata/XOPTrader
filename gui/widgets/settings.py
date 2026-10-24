@@ -3752,15 +3752,31 @@ class SettingsWidget(QWidget):
             for key in ("target", "tolerance_pct"):
                 if eth_raw.get(key) is not None:
                     self._warp_loaded_raw[f"eth.{key}"] = eth_raw.get(key)
+        # Numbers as the runtime reads them -- quoted ones too ("0.0001") --
+        # so an untouched field is written back exactly; "unlimited" stays
+        # the checkbox's.
+        def _numeric(v: Any) -> bool:
+            if isinstance(v, bool):
+                return False
+            if isinstance(v, (int, float)):
+                return True
+            if isinstance(v, str) and v.strip().lower() != "unlimited":
+                try:
+                    float(v)
+                except ValueError:
+                    return False
+                return True
+            return False
+
         wm_raw = (reb_raw.get("wmillieth")
                   if isinstance(reb_raw, dict) else None)
         if isinstance(wm_raw, dict):
             for key in ("max_premium_pct", "max_spend_xch"):
                 v = wm_raw.get(key)
-                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                if _numeric(v):
                     self._warp_loaded_raw[f"wm.{key}"] = v
         cap_raw = warp.get("max_unwrap_millieth")
-        if isinstance(cap_raw, (int, float)) and not isinstance(cap_raw, bool):
+        if _numeric(cap_raw):
             self._warp_loaded_raw["max_unwrap_millieth"] = cap_raw
 
         _flag = self._warp_flag

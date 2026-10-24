@@ -5266,7 +5266,7 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
         spdlog::error("[Engine] Secondary bridge ingestion failed: {}",
                       e.what());
     }
-    try { step_ingest_topup_takes(block_height); }
+    try { co_await step_ingest_topup_takes(block_height); }
     catch (const std::exception& e) {
         spdlog::error("[Engine] Top-up take ingestion failed: {}", e.what());
     }
@@ -21563,12 +21563,34 @@ std::vector<accounting::TopupTakeRow> read_topup_take_rows(
 // buys as takes.  See accounting/topup_take.hpp.  Runs with the bridge
 // scans, before the invariant, so a confirmed buy is explained flow by the
 // time the books are tied to the wallet.
-void Engine::step_ingest_topup_takes(BlockHeight block_height)
+asio::awaitable<void> Engine::step_ingest_topup_takes(BlockHeight block_height)
 {
     const auto& acc = config_.accounting;
-    if (!acc.ledger_enabled || !acc.bridge_ingest_enabled) return;
-    if (!db_ || acc.bridge_jobs_db_path.empty()) return;
-    if (!ledger_genesis_done_ || ledger_incomplete_) return;
+    if (!acc.ledger_enabled || !acc.bridge_ingest_enabled) co_return;
+    if (!db_ || acc.bridge_jobs_db_path.empty()) co_return;
+    if (!ledger_genesis_done_ || ledger_incomplete_) co_return;
+
+    // Fresh wallet snapshots, read once per heartbeat and only when a take
+    // is actually about to book: the invariant runs next and must tie the
+    // books carrying the take to a wallet that carries it too (the bridge
+    // scans' rule).  From a wallet known synced; pending change is NOT
+    // required here -- a market maker's XCH is rarely settled, and the
+    // invariant already widens its tolerance by the in-flight amount.
+    // A coroutine lambda is safe HERE: the closure is a named local that
+    // outlives every co_await of it, and each argument is a temporary that
+    // lives to the end of the full co_await expression.
+    std::set<std::string> refreshed;
+    const auto fresh = [&](const AssetId& a) -> asio::awaitable<bool> {
+        if (refreshed.count(a)) co_return true;
+        if (!co_await secondary_wallet_synced(block_height)) co_return false;
+        (void)co_await fetch_bridge_balance(a, block_height);
+        const auto it = cached_wallet_balances_.find(a);
+        const bool ok = it != cached_wallet_balances_.end()
+            && it->second.as_of_block == block_height
+            && it->second.fields_validated;
+        if (ok) refreshed.insert(a);
+        co_return ok;
+    };
 
     for (const auto& row : read_topup_take_rows(acc.bridge_jobs_db_path)) {
         const auto legs = accounting::classify_topup_take(row);
@@ -21605,7 +21627,7 @@ void Engine::step_ingest_topup_takes(BlockHeight block_height)
         // bound on the wallet change; ties skip, as for bridge flows.
         bool inside_opening = false;
         bool opening_missing = false;
-        for (const AssetId a : {AssetId{row.asset_id}, AssetId{"xch"}}) {
+        for (const AssetId& a : {AssetId{row.asset_id}, AssetId{"xch"}}) {
             if (!ledger_opened_assets_.count(a)) {
                 opening_missing = true;
                 continue;
@@ -21625,6 +21647,14 @@ void Engine::step_ingest_topup_takes(BlockHeight block_height)
         if (opening_missing) {
             skip_once("has an asset with no ledger opening");
             continue;
+        }
+
+        if (!co_await fresh(AssetId{row.asset_id})
+            || !co_await fresh(AssetId{"xch"})) {
+            spdlog::debug("[Engine] Top-up take {}: no fresh synced wallet "
+                          "snapshot -- booking deferred this heartbeat",
+                          row.id);
+            break;
         }
 
         const std::string ts =
@@ -21654,11 +21684,12 @@ void Engine::step_ingest_topup_takes(BlockHeight block_height)
                           "retrying next heartbeat", row.id);
             break;
         }
-        topup_booked_ids_.insert(legs.event_id);
-        if (*inserted == 0) continue;   // booked before this process
 
-        // The fee is already a Mojo (a signed SQLite column the classifier
-        // checked non-negative): no uint64 narrowing to saturate here.
+        // The history row, replayed EVERY time (INSERT OR IGNORE on the
+        // trade id): a crash between the ledger commit and this insert would
+        // otherwise lose it for good, since the ledger dedupe skips the take
+        // from then on.  The fee is already a Mojo (a signed SQLite column
+        // the classifier checked non-negative): no uint64 narrowing here.
         DbTakerFill fill_row;
         fill_row.taken_at              = ts;
         fill_row.block_height          = block_height;
@@ -21673,6 +21704,18 @@ void Engine::step_ingest_topup_takes(BlockHeight block_height)
         fill_row.price_mojos           = legs.price_mojos;
         fill_row.fee_mojos             = row.fee_mojos;
         db_->insert_taker_fill(fill_row);
+        topup_booked_ids_.insert(legs.event_id);
+        if (*inserted == 0) continue;   // booked before this process
+
+        // Inventory: both assets moved and the tracker saw neither, so
+        // re-arm Step 11's one-shot wallet reconcile for each, on a snapshot
+        // from this booking on -- the same one wallet-truth writer, with its
+        // grace and pending-fill rules, that the secondary bridge scan uses.
+        // Only for a NEW booking: a replayed one was re-armed when it booked.
+        for (const AssetId& a : {AssetId{row.asset_id}, AssetId{"xch"}}) {
+            inventory_reconciled_assets_.erase(a);
+            inventory_reconcile_not_before_[a] = block_height;
+        }
         spdlog::info("[Engine] Top-up take {}: bought {} mojos of {} for {} "
                      "XCH mojos (+{} fee) on {}, booked at block {}",
                      row.id, legs.base_delta, row.asset_id.substr(0, 12),

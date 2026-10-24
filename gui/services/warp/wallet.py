@@ -279,20 +279,32 @@ class WalletClient:
         record = data.get("trade_record")
         return record if isinstance(record, dict) else {}
 
-    def get_my_open_trade_ids(self, *, page: int = 500) -> set[str]:
+    def get_my_open_trade_ids(self, *, page: int = 500,
+                              max_pages: int = 200) -> set[str]:
         """Trade ids (lowercase hex, no 0x) of OUR offers still open.
 
-        Used to keep the Dexie buy from taking one of the engine's own asks.
+        Used to keep the Dexie buy from taking one of the engine's own asks,
+        so it is complete or it raises: every page is read until a short
+        one, and a failed page propagates (WalletError) rather than hand
+        back a partial set that could authorize buying our own offer.
         """
-        data = self._post("get_all_offers", {
-            "start": 0, "end": int(page), "exclude_my_offers": False,
-            "exclude_taken_offers": True, "include_completed": False,
-            "file_contents": False,
-        })
         out: set[str] = set()
-        for rec in data.get("trade_records") or []:
-            if not isinstance(rec, dict) or not rec.get("is_my_offer"):
-                continue
-            tid = str(rec.get("trade_id") or "").lower()
-            out.add(tid[2:] if tid.startswith("0x") else tid)
-        return out
+        start = 0
+        for _ in range(int(max_pages)):
+            data = self._post("get_all_offers", {
+                "start": start, "end": start + int(page),
+                "exclude_my_offers": False, "exclude_taken_offers": True,
+                "include_completed": False, "file_contents": False,
+            })
+            records = data.get("trade_records") or []
+            for rec in records:
+                if not isinstance(rec, dict) or not rec.get("is_my_offer"):
+                    continue
+                tid = str(rec.get("trade_id") or "").lower()
+                out.add(tid[2:] if tid.startswith("0x") else tid)
+            if len(records) < int(page):
+                return out
+            start += int(page)
+        raise WalletError(
+            f"get_all_offers still returning full pages after {max_pages}; "
+            "our open offers cannot be listed completely")

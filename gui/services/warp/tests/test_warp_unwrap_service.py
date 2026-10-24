@@ -235,6 +235,24 @@ def test_offer_locked_balance_pends_rather_than_burning_collateral():
     assert engine.step()["status"] == JobStatus.BURN_SENT
 
 
+def test_a_trimmed_rebalance_unwrap_burns_the_trimmed_size():
+    """[review] The gate's rebalance trim must reach the job's columns:
+    _h_burn_sent (and the engine's ledger booking) read amount_mojos, so a
+    trim held only in the gate's local would burn the stale size."""
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    engine.request_unwrap(AMOUNT, engine._hot_address, automatic=True,
+                          rebalance_target_micros=10_000_000)      # 10 USDC
+    ctx.evm.erc20 = 8_000_000            # 8 USDC landed while it waited
+    out = engine.step()
+    assert out["status"] == JobStatus.BURN_SENT
+    job = store.get_active_job()
+    # 2 USDC still short, grossed for the 30 bps tip (the trim's own
+    # rounding, pinned in test_rebalance.py): 2,006 mojos, not 5,000.
+    assert job.amount_mojos == 2_006
+    assert job.amount_usdc_micros == 2_006 * 1000
+
+
 def test_gates_pass_and_advance_to_burn_sent():
     store = new_store()
     engine, ctx = build_unwrap(store, params=params_with_cap())
