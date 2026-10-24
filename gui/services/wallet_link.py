@@ -313,9 +313,17 @@ def _call(
                 "owns this certificate. Refusing to talk to it."
             ) from exc
         if "SSL" in name:
+            reason = _tls_reason(exc)
+            if "CERTIFICATE_VERIFY_FAILED" in reason:
+                # Only reachable with verify_ssl on: the SERVER failed our
+                # check; the client cert/key may be fine.
+                raise _RpcError(
+                    f"Could not verify the server certificate of {host}:{port} "
+                    f"({reason}). Check chia.ca_cert_path and verify_ssl."
+                ) from exc
             raise _RpcError(
-                f"{wallet} rejected the TLS handshake. The certificate and "
-                "key do not belong to this wallet."
+                f"TLS handshake with {wallet} failed ({reason}). Check that "
+                "the certificate and key belong to this wallet."
             ) from exc
         if "Timeout" in name:
             raise _RpcError(f"{wallet} did not answer within {timeout:g}s.") from exc
@@ -340,6 +348,19 @@ def _call(
     if data.get("success") is False:
         raise _RpcError(f"{wallet} {endpoint} failed: {data.get('error', 'unknown error')}")
     return data
+
+
+# The OpenSSL reason inside a requests/urllib3 SSLError, which wraps it in
+# "HTTPSConnectionPool(...): Max retries exceeded ... (Caused by SSLError(...))".
+_TLS_REASON_RE: Final[re.Pattern[str]] = re.compile(
+    r"\[SSL[^\]]*\].*?(?=\s*\(_ssl\.c:\d+\)|'\)|\"\)|$)"
+)
+
+
+def _tls_reason(exc: BaseException) -> str:
+    text = str(exc)
+    match = _TLS_REASON_RE.search(text)
+    return (match.group(0) if match else text).strip()[:200]
 
 
 def _amount_to_int(value: Any) -> Optional[int]:

@@ -568,3 +568,35 @@ def test_status_labels_never_render_server_markup(panel):
         assert label.textFormat() == Qt.TextFormat.PlainText
     panel._on_wallet_probe_done("sage", False, evil)
     assert panel._sage_test_result.text() == evil
+
+
+class SSLError(Exception):
+    """Stands in for requests.exceptions.SSLError (matched by class name)."""
+
+
+_WRAP = ("HTTPSConnectionPool(host='node', port=9256): Max retries exceeded "
+         "with url: /get_sync_status (Caused by SSLError({})))")
+
+
+@pytest.mark.parametrize(
+    "inner, expect",
+    [
+        ("SSLCertVerificationError(1, '[SSL: CERTIFICATE_VERIFY_FAILED] "
+         "certificate verify failed: self-signed certificate (_ssl.c:1032)')",
+         "Could not verify the server certificate of node:9256 ([SSL: "
+         "CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed "
+         "certificate). Check chia.ca_cert_path and verify_ssl."),
+        ("SSLError(1, '[SSL: TLSV1_ALERT_UNKNOWN_CA] tlsv1 alert unknown ca "
+         "(_ssl.c:2660)')",
+         "TLS handshake with Chia wallet failed ([SSL: TLSV1_ALERT_UNKNOWN_CA] "
+         "tlsv1 alert unknown ca). Check that the certificate and key belong "
+         "to this wallet."),
+    ],
+)
+def test_tls_failures_name_the_real_cause(certs, inner, expect):
+    """A server-trust failure must not blame the client cert/key."""
+    post = _fake_post({"get_sync_status": SSLError(_WRAP.format(inner))})
+    result = wallet_link.probe_chia_wallet(
+        "node", 9256, *certs, verify_ssl=True, post=post)
+    assert result.ok is False
+    assert result.summary == expect
