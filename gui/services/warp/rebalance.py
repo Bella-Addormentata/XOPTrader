@@ -257,6 +257,7 @@ def plan(
     max_bridge_micros: int,
     max_unwrap_micros: int,
     min_bridge_micros: int,
+    auto_bridge_floor_micros: Optional[int] = None,
 ) -> Optional[RebalanceAction]:
     """At most one action moving one balance back to its target.
 
@@ -264,6 +265,12 @@ def plan(
     existing pipeline caps, and enforces every execution-time rail (job slot,
     unmined guard, cooldown). Priority is gas safety first (ETH deficit),
     then restoring the USDC reserve, then shedding excess.
+
+    ``auto_bridge_floor_micros`` is warp.auto_bridge when no USDC band is
+    configured (None = auto-bridge off): everything above that floor
+    (warp.keep_usdc_on_base) is bridged, as the LAST leg -- so enabling an
+    ETH band for gas top-ups no longer switches automatic bridging off, and
+    a gas refuel still always goes first.
     """
     if not params.enabled:
         return None
@@ -333,6 +340,21 @@ def plan(
                 "bridge_usdc", int(excess),
                 f"USDC {usdc_micros} above band {params.usdc.high}; bridging "
                 f"{excess} micros toward target {params.usdc.target}",
+            )
+
+    # 5. Auto-bridge without a USDC band: bridge what sits above the
+    #    keep-on-Base floor, under the same auto floor and cap as the
+    #    legacy auto job it replaces while the rebalancer is enabled.
+    if params.usdc is None and auto_bridge_floor_micros is not None:
+        floor = max(0, int(auto_bridge_floor_micros))
+        excess = usdc_micros - floor
+        if max_bridge_micros > 0:
+            excess = min(excess, max_bridge_micros)
+        if excess >= max(min_bridge_micros, _USDC_MICROS_PER_MOJO):
+            return RebalanceAction(
+                "bridge_usdc", int(excess),
+                f"auto-bridge: USDC {usdc_micros} above the {floor} kept on "
+                f"Base; bridging {excess} micros",
             )
 
     return None

@@ -407,6 +407,9 @@ class MainWindow(QMainWindow):
         self._tab_order_panel: Optional[QWidget] = None
         self._warp_widget: Optional[QWidget] = None
         self._base_wallet_widget: Optional[QWidget] = None
+        # [WARP-GUI] Whether the Base hot wallet was below its gas reserve at
+        # the last snapshot: the low-gas alert fires on the crossing, once.
+        self._warp_low_gas: bool = False
         # Declared like every other page. Both were previously assigned only
         # inside their builders, which is why closeEvent and
         # _make_permuto_live read them directly while other call sites went
@@ -690,6 +693,34 @@ class MainWindow(QMainWindow):
         bot_log = self._unwrap(self._bot_log)
         if bot_log is not None and hasattr(bot_log, "error_detected"):
             bot_log.error_detected.connect(self._on_bot_error)
+
+    def _check_warp_low_gas(self, warp: Any) -> None:
+        """[WARP-GUI 2026-10-24] Alert once when Base gas drops below reserve.
+
+        The Warp and Base Wallet pages already show a banner, but only to
+        someone looking at them. A bridge or unwrap that runs out of Base gas
+        stalls mid-flight, so the crossing is also logged and shown in the
+        status bar -- once per crossing, re-armed when the balance recovers.
+        """
+        try:
+            from gui.widgets.warp import low_gas
+        except Exception:  # noqa: BLE001 -- a stubbed warp page: no alert
+            return
+        state = low_gas(warp)
+        if state is not None and not self._warp_low_gas:
+            wei, floor = state
+            msg = (
+                f"Low Base gas: the warp hot wallet has {wei / 1e18:.6f} ETH, "
+                f"below the {floor / 1e18:.4f} ETH reserve. Bridges and unwraps "
+                "need Base ETH -- top it up, or turn on Auto top-up in "
+                "Settings -> Fees & Reserves."
+            )
+            _log.warning("%s", msg)
+            try:
+                self.statusBar().showMessage(msg, 20_000)
+            except Exception:  # noqa: BLE001 -- headless/teardown
+                pass
+        self._warp_low_gas = state is not None
 
     def _on_bridge_data(self, data: dict) -> None:
         """Handle aggregated data snapshot from EngineBridge.
@@ -1137,6 +1168,7 @@ class MainWindow(QMainWindow):
         warp_widget = self._unwrap(self._warp_widget)
         if warp_widget is not None and hasattr(warp_widget, "update_data"):
             warp_widget.update_data(data)
+        self._check_warp_low_gas((data or {}).get("warp"))
 
         # Base Wallet tab -- same snapshot; consumes data["warp"]["base_wallet"]
         # plus the wallet_notice / wallet_action_error companions.

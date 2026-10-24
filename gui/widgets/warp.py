@@ -78,6 +78,31 @@ _WEI_PER_ETH: Final[float] = 1e18
 #: Fallback only; the live floor is warp.min_base_eth from the snapshot.
 _LOW_GAS_WEI_FALLBACK: Final[int] = 5_000_000_000_000_000  # 0.005 ETH
 
+
+def low_gas(snap: Any) -> Optional[tuple]:
+    """``(eth_wei, floor_wei)`` when the hot wallet is below its gas reserve.
+
+    None when it is not, or when that cannot be told (bridge off or not built,
+    balances unread, warning switched off with ``min_base_eth: 0``). Shared by
+    the Warp page's banner and the main window's one-shot alert so the two
+    can never disagree.
+    """
+    if not isinstance(snap, dict) or not snap.get("enabled"):
+        return None
+    hot = snap.get("hot_wallet")
+    if not isinstance(hot, dict) or hot.get("error"):
+        return None
+    wei = hot.get("eth_wei")
+    if not isinstance(wei, int) or isinstance(wei, bool):
+        return None
+    try:
+        floor = int(snap.get("min_base_eth_wei"))
+    except (TypeError, ValueError):
+        floor = _LOW_GAS_WEI_FALLBACK
+    if floor > 0 and wei < floor:
+        return (wei, floor)
+    return None
+
 # Job-status string constants (mirror gui.services.warp.jobs.JobStatus values,
 # kept as local literals so the widget imports no heavy warp module at GUI boot).
 _ST_COMPLETED: Final[str] = "COMPLETED"
@@ -237,7 +262,9 @@ class WarpWidget(QWidget):
     # copies to the clipboard itself).
     address_copy_requested = Signal(str)
     # Emitted when the user clicks "Bridge now" -> WarpService.request_bridge().
-    bridge_now_requested = Signal()
+    # Carries the typed amount in micro-USDC, or None for "the balance"
+    # (everything above warp.keep_usdc_on_base, up to the per-warp cap).
+    bridge_now_requested = Signal(object)
     # (amount_mojos, receiver_0x, external_relay) -> WarpService.request_unwrap().
     unwrap_requested = Signal(int, str, bool)
     # Emitted for a per-job action -> WarpService.job_action(job_id, action).
@@ -401,11 +428,29 @@ class WarpWidget(QWidget):
         wrap_layout.addWidget(self._asset_lbl)
 
         bridge_row = QHBoxLayout()
+        self._bridge_amount = QLineEdit()
+        self._bridge_amount.setPlaceholderText("USDC amount (blank = balance)")
+        self._bridge_amount.setMaximumWidth(200)
+        self._bridge_amount.setToolTip(
+            "Leave blank to bridge the current balance: everything above the\n"
+            "USDC you keep on Base, up to the max per warp.\n"
+            "Type an amount to bridge exactly that much (0.001 USDC steps).\n"
+            "The job waits until the balance covers it; it is not reduced by\n"
+            "the keep-on-Base amount, and above the max per warp it is refused."
+        )
+        self._bridge_amount.returnPressed.connect(self._on_bridge_now)
+        bridge_row.addWidget(self._bridge_amount)
         self._bridge_btn = self._primary_button("\U0001F309  Bridge now")
         self._bridge_btn.clicked.connect(self._on_bridge_now)
         bridge_row.addWidget(self._bridge_btn)
         bridge_row.addStretch(1)
         wrap_layout.addLayout(bridge_row)
+
+        self._bridge_err = QLabel()
+        self._bridge_err.setWordWrap(True)
+        self._bridge_err.setStyleSheet(f"color: {WARNING_YELLOW};")
+        self._bridge_err.setVisible(False)
+        wrap_layout.addWidget(self._bridge_err)
 
         layout.addWidget(wrap_group)
 
@@ -713,14 +758,33 @@ class WarpWidget(QWidget):
 
         if built:
             lo = _usdc(snap.get("min_micros"))
-            hi = _usdc(snap.get("max_micros"))
+            hi_raw = snap.get("max_micros")
+            hi = _usdc(hi_raw) if hi_raw else "unlimited"
             auto_on = bool(snap.get("auto_bridge"))
             state = "enabled" if auto_on else "disabled (deposits wait for Bridge now)"
+            keep = int(snap.get("keep_usdc_micros") or 0)
+            keep_txt = (
+                f" <b>{_usdc(keep)}</b> USDC is always left on Base when the "
+                "bridge sizes a job itself."
+                if keep > 0 else ""
+            )
             self._auto_lbl.setText(
                 f"Auto-bridge is <b>{state}</b>. Automatic bridging covers deposits "
                 f"between <b>{lo}</b> and <b>{hi}</b> USDC; <b>Bridge now</b> "
-                f"bridges any balance, up to <b>{hi}</b>."
+                f"bridges any balance, up to <b>{hi}</b>.{keep_txt}"
             )
+            try:
+                lo_m, hi_m = int(snap.get("min_micros") or 0), int(hi_raw or 0)
+            except (TypeError, ValueError):
+                lo_m = hi_m = 0
+            if auto_on and hi_m > 0 and lo_m > hi_m:
+                self._auto_lbl.setText(
+                    self._auto_lbl.text()
+                    + f"<br><span style='color:{WARNING_YELLOW};'>The auto-bridge "
+                    f"minimum ({lo}) is above the max per warp ({hi}), so "
+                    "automatic bridging can never start. Lower the minimum or "
+                    "raise the max in Settings → Fees &amp; Reserves.</span>"
+                )
             self._auto_lbl.setTextFormat(Qt.TextFormat.RichText)
             asset = snap.get("expected_asset_id") or ""
             self._asset_lbl.setText(f"wUSDC.b asset id: {_short(asset, 12, 8)}")
@@ -881,8 +945,52 @@ class WarpWidget(QWidget):
         )
 
     def _on_bridge_now(self) -> None:
-        """Request an immediate bridge of the current Base USDC balance."""
-        self.bridge_now_requested.emit()
+        """Request a bridge: the typed amount, or the balance when blank.
+
+        Parsed with Decimal, as the unwrap amount is, and checked against the
+        per-warp cap here so a mistyped amount is refused on the spot; the
+        engine re-validates everything.
+        """
+        from decimal import Decimal, InvalidOperation
+
+        if not self._bridge_btn.isEnabled():
+            return
+        text = (self._bridge_amount.text() or "").strip()
+        if not text:
+            self._set_bridge_error("")
+            self.bridge_now_requested.emit(None)
+            return
+        try:
+            amount = Decimal(text)
+        except InvalidOperation:
+            self._set_bridge_error(f"“{text}” is not a USDC amount.")
+            return
+        if not amount.is_finite() or amount <= 0:
+            self._set_bridge_error("Enter a positive USDC amount.")
+            return
+        if amount % Decimal("0.001") != 0:
+            self._set_bridge_error(
+                "Bridge amounts go in 0.001 USDC steps (one wUSDC.b mojo).")
+            return
+        micros = int(amount * 1_000_000)
+        try:
+            cap = int(self._snap.get("max_micros") or 0)
+        except (TypeError, ValueError):
+            cap = 0
+        if cap > 0 and micros > cap:
+            self._set_bridge_error(
+                f"{amount} USDC is above the max per warp ({_usdc(cap)} USDC). "
+                "Raise it in Settings → Fees & Reserves, or bridge less.")
+            return
+        self._set_bridge_error("")
+        self.bridge_now_requested.emit(micros)
+        self._bridge_amount.clear()
+
+    def _set_bridge_error(self, text: str) -> None:
+        self._bridge_err.setText(text)
+        self._bridge_err.setVisible(bool(text))
+        if text:
+            self._bridge_amount.setFocus()
 
     def _on_jobs_menu(self, pos: Any) -> None:
         """Show the Retry / Sweep / Cancel + explorer context menu for a job."""
