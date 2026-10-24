@@ -95,7 +95,10 @@ class FakeEngine:
         self._hot_cache = {"eth_wei": eth_wei, "usdc_micros": 0,
                            "millieth_units": 0, "error": None}
         self._hot_address = "0x" + "ab" * 20
-        self._evm = SimpleNamespace(get_nonce=lambda addr, pending=True: 7)
+        self._evm = SimpleNamespace(
+            get_nonce=lambda addr, pending=True: 7,
+            # 90k gas x 0.1 gwei: 9e12 wei, far below the test balances.
+            get_fee_data=lambda: SimpleNamespace(max_fee_per_gas=10 ** 8))
         self._wallet = FakeWallet(wm_spendable=wm_spendable)
         self.cat_wallets = [9]
         self.calls: list = []
@@ -501,3 +504,34 @@ def test_the_unwrap_cap_floors_to_whole_mojos(raw, mojos):
 def test_a_cap_below_one_mojo_is_refused():
     with pytest.raises(S.WarpError):
         S._parse_millieth_unwrap_cap({"max_unwrap_millieth": 0.0006})
+
+
+def test_no_top_up_burn_without_gas_for_the_final_withdraw():
+    """[review] External relay delivers milliETH; turning it into ETH is a
+    withdraw() the hot wallet pays for. Below that, nothing is burnt."""
+    w, eng = _worker(_params()), FakeEngine(eth_wei=10 ** 12, wm_spendable=5_000)
+    eng._evm.get_fee_data = lambda: SimpleNamespace(max_fee_per_gas=10 ** 8)
+    w._maybe_rebalance(eng)                   # 1e12 < 9e12 worst case
+    assert eng.calls == []
+    assert "withdraw()" in w._rebalance_last
+
+
+def test_unknown_base_fees_block_the_burn():
+    w, eng = _worker(_params()), FakeEngine(wm_spendable=5_000)
+
+    def down():
+        raise RuntimeError("rpc down")
+
+    eng._evm.get_fee_data = down
+    w._maybe_rebalance(eng)
+    assert eng.calls == []
+
+
+def test_an_unreadable_trade_record_raises():
+    from gui.services.warp.wallet import WalletClient, WalletError
+
+    for reply in ({"success": True}, {"success": True, "trade_record": {}},
+                  {"success": True, "trade_record": {"status": ""}}):
+        client = WalletClient({}, poster=lambda url, body, r=reply: r)
+        with pytest.raises(WalletError):
+            client.get_offer("aa" * 32)

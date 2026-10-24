@@ -405,3 +405,12 @@ def test_wmillieth_limits_are_bounded_and_coherent(block, why):
         rb.parse_rebalance_config(_cfg(
             enabled=True, eth={"target": 0.01, "tolerance_pct": 20},
             wmillieth=block), min_gas_wei=MIN_GAS)
+
+
+
+def test_a_huge_integer_limit_is_a_config_error_not_an_overflow():
+    with pytest.raises(rb.RebalanceConfigError):
+        rb.parse_rebalance_config(_cfg(
+            enabled=True, eth={"target": 0.01, "tolerance_pct": 20},
+            wmillieth={"enabled": True, "max_spend_xch": 10 ** 400}),
+            min_gas_wei=MIN_GAS)

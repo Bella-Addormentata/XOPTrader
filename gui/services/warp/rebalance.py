@@ -310,10 +310,13 @@ def _parse_wmillieth_source(block: Any, eth: Optional[AssetBand]
                 f"warp.rebalance.wmillieth.{key} must be a number")
         try:
             v = float(raw_v)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            # OverflowError too: a 400-digit YAML integer must disable the
+            # source with a banner, not slip past set_config's handler and
+            # leave the previous spending settings running.
             raise RebalanceConfigError(
-                f"warp.rebalance.wmillieth.{key} must be a number "
-                f"(got {raw_v!r})") from None
+                f"warp.rebalance.wmillieth.{key} must be a finite number "
+                f"(got {str(raw_v)[:40]!r})") from None
         if not math.isfinite(v):
             raise RebalanceConfigError(
                 f"warp.rebalance.wmillieth.{key} must be finite")

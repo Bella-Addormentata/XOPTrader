@@ -4462,6 +4462,19 @@ class _WarpWorker(QObject):
                     "-> Unwrap, asset milliETH)"
                 )
                 return
+            if action.kind in ("unwrap_wmillieth", "buy_wmillieth") and (
+                    not self._can_withdraw_millieth(engine, eth_now)):
+                # [review] The burn delivers milliETH, not ETH: turning it into
+                # gas takes one withdraw() the hot wallet itself must pay for.
+                # External relay covers the bridge's delivery, not that. Below
+                # its worst-case cost the top-up would burn wmilliETH.b and
+                # strand the proceeds, so it waits for the wallet to be funded.
+                self._rebalance_last = (
+                    "rebalance skipped: the hot wallet's ETH cannot pay the "
+                    "milliETH withdraw() the top-up would need; send it a "
+                    "little ETH first"
+                )
+                return
             if action.kind == "buy_wmillieth" and buy_in_flight:
                 self._rebalance_last = (
                     "rebalance waiting: the last Dexie wmilliETH.b buy has "
@@ -4577,6 +4590,20 @@ class _WarpWorker(QObject):
                 "wmilliETH.b balance reply is missing spendable or confirmed; "
                 "retrying")
         return max(0, int(spendable)), max(0, int(confirmed))
+
+    def _can_withdraw_millieth(self, engine: "WarpEngine", eth_wei: int) -> bool:
+        """Whether *eth_wei* covers a milliETH ``withdraw()``'s worst-case gas
+        at current fees (the same bound BaseWallet.unwrap_millieth enforces).
+        Unknown fees read as no: a burn it cannot finish must not start."""
+        from gui.services.basewallet import _MILLIETH_GAS_DEFAULT
+
+        try:
+            fees = engine._evm.get_fee_data()
+            worst = int(_MILLIETH_GAS_DEFAULT) * int(fees.max_fee_per_gas)
+        except Exception as exc:  # noqa: BLE001 -- fail closed
+            _log.debug("rebalance: Base fees unknown (%s)", exc)
+            return False
+        return int(eth_wei) >= worst
 
     def _millieth_unwrap_is_proven(self, engine: "WarpEngine") -> bool:
         """Whether a MANUAL wmilliETH.b unwrap has ever completed here."""

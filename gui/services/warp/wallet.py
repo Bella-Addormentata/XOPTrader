@@ -277,7 +277,11 @@ class WalletClient:
         tid = tid if tid.startswith("0x") else "0x" + tid
         data = self._post("get_offer", {"trade_id": tid, "file_contents": False})
         record = data.get("trade_record")
-        return record if isinstance(record, dict) else {}
+        # An unreadable record raises, so settlement treats it like an
+        # unanswered lookup (and times it out) instead of an open trade.
+        if not isinstance(record, dict) or record.get("status") in (None, ""):
+            raise WalletError(f"get_offer({tid}) returned no usable trade record")
+        return record
 
     def get_my_open_trade_ids(self, *, page: int = 500,
                               max_pages: int = 200) -> set[str]:
