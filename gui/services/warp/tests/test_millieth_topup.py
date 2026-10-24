@@ -656,3 +656,13 @@ def test_an_affordable_partial_ask_beats_an_unaffordable_covering_one(
     eng._wallet.xch_spendable = 3 * 10 ** 12      # only the big ask covers
     w._maybe_rebalance(eng)
     assert [offer for offer, _fee in eng._wallet.taken] == ["offer1qqexample"]
+
+
+
+def test_the_manual_unwrap_proof_does_not_survive_a_new_job_store():
+    """[review] A reload pointing warp.jobs_db elsewhere must re-read that
+    store's history, not inherit the old store's proof."""
+    w, eng = _worker(_params()), FakeEngine()
+    assert w._millieth_unwrap_is_proven(eng)
+    eng._store = J.WarpJobStore(":memory:")          # no manual unwrap here
+    assert not w._millieth_unwrap_is_proven(eng)

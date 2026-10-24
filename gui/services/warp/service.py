@@ -2683,18 +2683,31 @@ class WarpEngine:
             )
 
         # [review] An automatic ETH top-up rechecks, immediately before the
-        # irreversible send, that its proceeds can still be withdrawn: fees
-        # may have risen since the gate, and external relay skipped G9. a-c
-        # proved nothing was sent, so cancelling here commits nothing.
-        if job.state.get("rebalance_eth_target_wei") and _top_up_withdraw_short(
-                int(self._evm.get_eth_balance(self._hot_address)),
-                int(self._evm.get_fee_data().max_fee_per_gas)):
-            return _advance(
-                JobStatus.CANCELLED,
-                message=("top-up unwrap cancelled before the cat_spend: the "
-                         "hot wallet's ETH no longer covers the milliETH "
-                         "withdraw() at current Base fees"),
-            )
+        # irreversible send and on ONE fee read, both conditions the gate
+        # checked: the proceeds can still be withdrawn (external relay
+        # skipped G9), and the burn is still worth making (at least the
+        # economic minimum). Fees may have risen since the gate; a-c proved
+        # nothing was sent, so cancelling here commits nothing.
+        if job.state.get("rebalance_eth_target_wei"):
+            fee = int(self._evm.get_fee_data().max_fee_per_gas)
+            _, floor_mojos = _millieth_topup_minimums(
+                fee, _c_wei_per_milli_unit(net))
+            if _top_up_withdraw_short(
+                    int(self._evm.get_eth_balance(self._hot_address)), fee):
+                return _advance(
+                    JobStatus.CANCELLED,
+                    message=("top-up unwrap cancelled before the cat_spend: "
+                             "the hot wallet's ETH no longer covers the "
+                             "milliETH withdraw() at current Base fees"),
+                )
+            if amount < floor_mojos:
+                return _advance(
+                    JobStatus.CANCELLED,
+                    message=(f"top-up unwrap cancelled before the cat_spend: "
+                             f"{amount} mojos is below the {floor_mojos} a "
+                             "burn must be to pay for its own withdraw and "
+                             "relay at current Base fees"),
+                )
 
         # d) Send. Default coin selection ONLY -- it is what honours the trade
         # manager's offer locks (the client has no coins parameter, by design).
@@ -4300,7 +4313,8 @@ class _WarpWorker(QObject):
         # [MILLIETH-TOPUP] Latched once a MANUAL wmilliETH.b unwrap has
         # completed: the automatic top-up never runs an asset path the
         # operator has not watched succeed end to end.
-        self._millieth_unwrap_proven: bool = False
+        # (job store, asset) a manual wmilliETH.b unwrap was proven for.
+        self._millieth_unwrap_proven: Optional[tuple] = None
         # Monotonic count of PROCESSED wallet actions. Rides every snapshot so
         # the GUI can tell a wallet-action-completion snapshot apart from the
         # timer-driven ticks that carry the same cached value -- without it,
@@ -4747,17 +4761,25 @@ class _WarpWorker(QObject):
         return int(eth_wei) >= worst
 
     def _millieth_unwrap_is_proven(self, engine: "WarpEngine") -> bool:
-        """Whether a MANUAL wmilliETH.b unwrap has ever completed here."""
-        if self._millieth_unwrap_proven:
-            return True
+        """Whether a MANUAL wmilliETH.b unwrap has ever completed here.
+
+        [review] The cached proof is scoped to the job store and asset it
+        was read from: a config reload that points warp.jobs_db at another
+        database (or a different asset) re-reads that history instead of
+        inheriting a proof it does not contain.
+        """
         tail = ":" + engine._net.asset("milliETH").expected_asset_id.lower()
+        proof = self._millieth_unwrap_proven
+        if (isinstance(proof, tuple) and proof[0] is engine._store
+                and proof[1] == tail):
+            return True
         for state in engine._store.completed_job_states():
             if (state.get("direction") == "out" and state.get("manual")
                     and str(state.get("asset_fingerprint") or "")
                     .lower().endswith(tail)):
-                self._millieth_unwrap_proven = True
-                break
-        return self._millieth_unwrap_proven
+                self._millieth_unwrap_proven = (engine._store, tail)
+                return True
+        return False
 
     def _settle_takes_quietly(self, engine: "WarpEngine") -> None:
         """:meth:`_settle_dexie_takes`, contracted never to raise."""

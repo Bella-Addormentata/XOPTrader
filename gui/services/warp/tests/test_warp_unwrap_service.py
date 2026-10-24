@@ -689,3 +689,20 @@ def test_a_top_up_rechecks_its_withdraw_gas_right_before_the_cat_spend():
                       state_patch={"rebalance_eth_target_wei": 10 ** 16})
     engine2.step()                                  # funded: it sends
     assert len(ctx2.wallet.cat_spends) == 1
+
+
+
+def test_a_top_up_below_the_burn_minimum_at_send_time_is_cancelled():
+    """[review] Fees can rise between the gate and the send: a funded
+    wallet still must not burn below the economic minimum."""
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    _to_burn_sent(store, engine, ctx)
+    job = store.get_active_job()
+    store.update_job(job.id, state_patch={"rebalance_eth_target_wei": 10 ** 16})
+    ctx.evm.max_fee = 3 * 10 ** 9           # floor 1,025 mojos; ETH is ample
+    _, floor = S._millieth_topup_minimums(3 * 10 ** 9, 10 ** 12)
+    store.update_job(job.id, columns={"amount_mojos": floor - 1})
+    out = engine.step()
+    assert out["status"] == JobStatus.CANCELLED
+    assert ctx.wallet.cat_spends == []
