@@ -98,7 +98,39 @@ TEST(TopupTakeTest, OverflowingAmountsBookNothing) {
     r = live_take();
     r.fee_mojos = 0;
     r.xch_mojos = kMax / 1000 + 1;
+    r.cat_mojos = 1;
     EXPECT_FALSE(classify_topup_take(r).valid);    // the price overflows
+}
+
+TEST(TopupTakeTest, ALargeBuyWhosePriceFitsIsBooked) {
+    // [review] 10,000 XCH for 3,000,000 mojos: xch * 1000 overflows, the
+    // price (3,333,333,333,333.33 -> ...333) does not.
+    auto r = live_take();
+    r.fee_mojos = 0;
+    r.xch_mojos = 10'000LL * 1'000'000'000'000LL;
+    r.cat_mojos = 3'000'000;
+    const auto legs = classify_topup_take(r);
+    ASSERT_TRUE(legs.valid);
+    EXPECT_EQ(legs.price_mojos, 3'333'333'333'333);
+    r.cat_mojos = 6;                                  // ...666.67 rounds up
+    EXPECT_EQ(classify_topup_take(r).price_mojos,
+              1'666'666'666'666'666'667);
+}
+
+TEST(TopupTakeTest, LongDivisionMatchesTheDirectFormula) {
+    for (const Mojo xch : {Mojo{1}, Mojo{999}, Mojo{1'827'700'000'000},
+                           Mojo{7'777'777'777}}) {
+        for (const Mojo cat : {Mojo{1}, Mojo{2}, Mojo{3}, Mojo{547},
+                               Mojo{2'000}, Mojo{999'999}}) {
+            auto r = live_take();
+            r.xch_mojos = xch;
+            r.cat_mojos = cat;
+            const Mojo scaled = xch * 1000;
+            const Mojo q = scaled / cat, m = scaled % cat;
+            EXPECT_EQ(classify_topup_take(r).price_mojos,
+                      q + (m >= cat - m ? 1 : 0)) << xch << "/" << cat;
+        }
+    }
 }
 
 }  // namespace

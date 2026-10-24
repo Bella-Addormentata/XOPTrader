@@ -579,3 +579,12 @@ def test_a_dexie_buy_skips_asks_too_small_to_unwrap(monkeypatch):
     w._maybe_rebalance(eng)
     assert eng._wallet.taken == []
     assert "nothing bought" in w._rebalance_last
+
+
+@pytest.mark.parametrize("raw", [True, False])
+def test_a_boolean_unwrap_cap_is_refused(raw):
+    """[review] `max_unwrap_millieth: true` is not a stated limit."""
+    with pytest.raises(S.WarpError):
+        S._parse_millieth_unwrap_cap({"max_unwrap_millieth": raw})
+    with pytest.raises(S.WarpError):
+        S._parse_unwrap_cap({"max_unwrap_usdc": raw})

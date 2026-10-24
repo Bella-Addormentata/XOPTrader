@@ -368,6 +368,10 @@ def _parse_usdc_config_value(key: str, raw: object) -> float:
     """
     import math
 
+    # [review] A YAML boolean is not a number: float(True) is 1.0, which
+    # would read `max_unwrap_millieth: true` as a stated 1,000-mojo cap.
+    if isinstance(raw, bool):
+        raise WarpError(f"warp.{key} is not a number (got {raw!r})")
     try:
         value = float(raw)  # type: ignore[arg-type]
     except (TypeError, ValueError) as exc:

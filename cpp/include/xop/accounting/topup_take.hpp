@@ -95,13 +95,23 @@ struct TopupTakeLegs {
     if (r.cat_mojos <= 0 || r.xch_mojos <= 0 || r.fee_mojos < 0) return out;
     constexpr Mojo kMax = std::numeric_limits<Mojo>::max();
     if (r.xch_mojos > kMax - r.fee_mojos) return out;
-    // price = xch * 1000 / cat, rounded half up, without overflowing the
-    // product or the rounding step: from the quotient and remainder.
-    if (r.xch_mojos > kMax / 1000) return out;
-    const Mojo scaled = r.xch_mojos * 1000;
-    const Mojo quotient  = scaled / r.cat_mojos;
-    const Mojo remainder = scaled % r.cat_mojos;
-    out.price_mojos = quotient + (remainder >= r.cat_mojos - remainder ? 1 : 0);
+    // [review] price = xch * 1000 / cat, rounded half up, by LONG DIVISION:
+    // exact whenever the PRICE fits, never forming xch * 1000 (a buy the
+    // GUI allows -- 10,000 XCH for 3,000,000 mojos -- overflows that
+    // product though its price, ~3.3e12, does not).  The whole part, then
+    // three decimal digits from the remainder (rem < cat, so rem * 10 fits
+    // while cat <= kMax / 10 -- some 9e14 CAT units, beyond any real take).
+    if (r.cat_mojos > kMax / 10) return out;
+    const Mojo whole = r.xch_mojos / r.cat_mojos;
+    if (whole > (kMax - 1000) / 1000) return out;   // the price itself
+    Mojo price = whole * 1000;
+    Mojo rem   = r.xch_mojos % r.cat_mojos;
+    for (Mojo place = 100; place > 0; place /= 10) {
+        rem *= 10;
+        price += (rem / r.cat_mojos) * place;
+        rem %= r.cat_mojos;
+    }
+    out.price_mojos = price + (rem >= r.cat_mojos - rem ? 1 : 0);
     out.event_id    = "take:" + r.trade_id;
     out.base_delta  = r.cat_mojos;
     out.quote_delta = -r.xch_mojos;
