@@ -21623,35 +21623,28 @@ asio::awaitable<void> Engine::step_ingest_topup_takes(BlockHeight block_height)
             continue;
         }
 
-        // Inside an opening already (the opening read the post-take wallet):
-        // booking it again would double-count.  The submit time is a lower
-        // bound on the wallet change; ties skip, as for bridge flows.
-        bool inside_opening = false;
-        bool opening_missing = false;
-        for (const AssetId& a : {AssetId{row.asset_id}, AssetId{"xch"}}) {
-            if (!ledger_opened_assets_.count(a)) {
-                opening_missing = true;
-                continue;
-            }
+        // Per asset (openings are established independently): a leg books
+        // only where that asset's opening predates the take.  An opening
+        // that read the post-take wallet already holds that leg, and booking
+        // it again would double-count; an asset with no opening has no books
+        // to post into (the engine's own takes skip such a leg too).  The
+        // submit time is a lower bound on the wallet change; ties skip, as
+        // for bridge flows.
+        const auto books = [&](const AssetId& a) {
+            if (!ledger_opened_assets_.count(a)) return false;
             const std::string opened = db_->ledger_opening_time(a);
-            if (opened.empty()) {
-                opening_missing = true;
-            } else if (!accounting::iso_strictly_after(row.created_at,
-                                                       opened)) {
-                inside_opening = true;
-            }
-        }
-        if (inside_opening) {
-            topup_booked_ids_.insert(legs.event_id);   // terminal
-            continue;
-        }
-        if (opening_missing) {
-            skip_once("has an asset with no ledger opening");
+            return !opened.empty()
+                && accounting::iso_strictly_after(row.created_at, opened);
+        };
+        const bool book_cat = books(AssetId{row.asset_id});
+        const bool book_xch = books(AssetId{"xch"});
+        if (!book_cat && !book_xch) {
+            topup_booked_ids_.insert(legs.event_id);   // nothing to post
             continue;
         }
 
-        if (!co_await fresh(AssetId{row.asset_id})
-            || !co_await fresh(AssetId{"xch"})) {
+        if ((book_cat && !co_await fresh(AssetId{row.asset_id}))
+            || (book_xch && !co_await fresh(AssetId{"xch"}))) {
             spdlog::debug("[Engine] Top-up take {}: no fresh synced wallet "
                           "snapshot -- booking deferred this heartbeat",
                           row.id);
@@ -21676,9 +21669,11 @@ asio::awaitable<void> Engine::step_ingest_topup_takes(BlockHeight block_height)
             e.note         = "warp_topup";
             entries.push_back(std::move(e));
         };
-        add("base",  AssetId{row.asset_id}, legs.base_delta);
-        add("quote", AssetId{"xch"},        legs.quote_delta);
-        add("fee",   AssetId{"xch"},        legs.fee_delta);
+        if (book_cat) add("base", AssetId{row.asset_id}, legs.base_delta);
+        if (book_xch) {
+            add("quote", AssetId{"xch"}, legs.quote_delta);
+            add("fee",   AssetId{"xch"}, legs.fee_delta);
+        }
         const auto inserted = db_->append_ledger_entries(entries);
         if (!inserted) {
             spdlog::error("[Engine] Top-up take {}: ledger write FAILED -- "
@@ -21717,6 +21712,7 @@ asio::awaitable<void> Engine::step_ingest_topup_takes(BlockHeight block_height)
         // drawdown peak or the rolling window (a bridge flow re-arming the
         // same asset keeps its capital-event reason).
         for (const AssetId& a : {AssetId{row.asset_id}, AssetId{"xch"}}) {
+            if (!(a == "xch" ? book_xch : book_cat)) continue;
             inventory_reconciled_assets_.erase(a);
             inventory_reconcile_not_before_[a] = block_height;
             inventory_reconcile_capital_.try_emplace(a, false);

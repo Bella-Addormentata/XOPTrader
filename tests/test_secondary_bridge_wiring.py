@@ -91,6 +91,17 @@ def test_unknown_reserve_coins_suppress_the_spending_sides():
     assert "can_bid = false;" in step8[gate_q:gate_q + 600]
 
 
+def test_a_takes_legs_follow_each_assets_own_opening():
+    """[review] Openings are per asset: an opening taken after the buy holds
+    only that asset's leg, so each leg is filtered on its own opening."""
+    takes = _body(_engine(), "asio::awaitable<void> Engine::step_ingest_topup_takes(")
+    assert "const bool book_cat = books(AssetId{row.asset_id});" in takes
+    assert "const bool book_xch = books(AssetId{\"xch\"});" in takes
+    assert 'if (book_cat) add("base"' in takes
+    xch = takes.index("if (book_xch) {")
+    assert 'add("quote"' in takes[xch:xch + 200] and 'add("fee"' in takes[xch:xch + 200]
+
+
 def test_a_take_re_arms_without_resetting_the_risk_baselines():
     """A top-up take is a trade: the reconcile it re-arms corrects inventory
     but must not discard the drawdown peak or the loss window."""
