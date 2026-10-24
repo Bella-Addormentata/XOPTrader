@@ -2350,7 +2350,12 @@ class WarpEngine:
         """
         eth_target = job.state.get("rebalance_eth_target_wei")
         if eth_target:
-            return self._rebalance_millieth_trim(job, amount, int(eth_target))
+            step, size = self._rebalance_millieth_trim(
+                job, amount, int(eth_target))
+            if step is None and size < amount:
+                _log.info("top-up unwrap trimmed %d -> %d mojos (gas landed "
+                          "while the job waited)", amount, size)
+            return step, size
         target = job.state.get("rebalance_target_micros")
         if not target:
             return None, amount
@@ -2437,8 +2442,6 @@ class WarpEngine:
                          f"{floor_mojos} needed)"),
             ), amount
         if size < amount:
-            _log.info("top-up unwrap trimmed %d -> %d mojos (gas landed while "
-                      "the job waited)", amount, size)
             return None, int(size)
         return None, amount
 
@@ -2682,31 +2685,28 @@ class WarpEngine:
                 message="cat_spend already in the wallet history (dedupe hit)",
             )
 
-        # [review] An automatic ETH top-up rechecks, immediately before the
-        # irreversible send and on ONE fee read, both conditions the gate
-        # checked: the proceeds can still be withdrawn (external relay
-        # skipped G9), and the burn is still worth making (at least the
-        # economic minimum). Fees may have risen since the gate; a-c proved
-        # nothing was sent, so cancelling here commits nothing.
-        if job.state.get("rebalance_eth_target_wei"):
-            fee = int(self._evm.get_fee_data().max_fee_per_gas)
-            _, floor_mojos = _millieth_topup_minimums(
-                fee, _c_wei_per_milli_unit(net))
-            if _top_up_withdraw_short(
-                    int(self._evm.get_eth_balance(self._hot_address)), fee):
-                return _advance(
-                    JobStatus.CANCELLED,
-                    message=("top-up unwrap cancelled before the cat_spend: "
-                             "the hot wallet's ETH no longer covers the "
-                             "milliETH withdraw() at current Base fees"),
-                )
-            if amount < floor_mojos:
+        # [review] An automatic ETH top-up re-derives, immediately before the
+        # irreversible send, everything the gate checked (one fee read): the
+        # proceeds can still be withdrawn (external relay skipped G9), the
+        # burn is still worth making, and it is still NEEDED at this size --
+        # ETH may have arrived since the gate or while this step retried. It
+        # is never trimmed here (amount_mojos and post_tip_base_units were
+        # frozen at the gate): a satisfied, uneconomic or oversized job is
+        # cancelled, which a-c make safe (nothing was sent), and the next
+        # consult re-plans from live balances.
+        eth_target = job.state.get("rebalance_eth_target_wei")
+        if eth_target:
+            step, size = self._rebalance_millieth_trim(
+                job, amount, int(eth_target))
+            if step is not None:
+                return step
+            if size < amount:
                 return _advance(
                     JobStatus.CANCELLED,
                     message=(f"top-up unwrap cancelled before the cat_spend: "
-                             f"{amount} mojos is below the {floor_mojos} a "
-                             "burn must be to pay for its own withdraw and "
-                             "relay at current Base fees"),
+                             f"ETH arrived since the gate, so only {size} of "
+                             f"its {amount} mojos are still needed; the next "
+                             "consult re-plans"),
                 )
 
         # d) Send. Default coin selection ONLY -- it is what honours the trade
@@ -4417,7 +4417,14 @@ class _WarpWorker(QObject):
             engine.relay_sweep_if_due()
             engine.refresh_relay_activity_if_due()
 
-        self.snapshot_ready.emit(self._guarded(_run))
+        snap = self._guarded(_run)
+        if self._engine is None:
+            # [review] Submitted Dexie takes settle whatever the switch that
+            # authorises NEW warp work says: with warp disabled (or the
+            # engine blocked) a take that confirms must still reach the
+            # store, or the engine's ledger never books it.
+            self._settle_takes_without_engine()
+        self.snapshot_ready.emit(snap)
 
     def _legacy_auto_bridge_suppressed(self) -> bool:
         """Whether the engine's own auto-bridge must stand down this tick.
@@ -4781,6 +4788,49 @@ class _WarpWorker(QObject):
                 return True
         return False
 
+    def _settle_takes_without_engine(self) -> None:
+        """Settle open Dexie takes with no warp engine built: just the job
+        store and the Chia wallet, which is all settlement reads. Opens the
+        store only when its file exists, and the wallet only when a take is
+        still open. Contracted never to raise."""
+        try:
+            path = Path(_job_db_path(self._config, anchor=self._config_home()))
+            if not path.is_file():
+                return
+            store = WarpJobStore(str(path))
+            try:
+                if not (store.list_takes(status=jobs.TAKE_SUBMITTED, limit=1)
+                        or store.list_takes(status=jobs.TAKE_SUBMITTING,
+                                            limit=1)):
+                    return
+                from types import SimpleNamespace
+
+                self._settle_dexie_takes(SimpleNamespace(
+                    _store=store, _wallet=self._chia_wallet_client()))
+            finally:
+                store.close()
+        except Exception as exc:  # noqa: BLE001 -- a tick must not crash
+            _log.debug("Dexie take settlement (no engine) failed: %s", exc)
+
+    def _chia_wallet_client(self) -> Any:
+        """The Chia wallet RPC client the config names."""
+        from . import wallet as wallet_mod
+
+        chia = self._config.get("chia") or {}
+        return wallet_mod.WalletClient(
+            {
+                "host": chia.get("wallet_host") or "localhost",
+                "port": int(chia.get("wallet_port") or 9256),
+                "fingerprint": chia.get("wallet_fingerprint"),
+                "cert_path": str(chia.get("wallet_cert_path") or ""),
+                "key_path": str(chia.get("wallet_key_path") or ""),
+            },
+            # The default 5s is too tight for the 200-row history query that
+            # guards against double-funding; a timeout there now (correctly)
+            # blocks the send, so make it unlikely rather than merely safe.
+            timeout=30.0,
+        )
+
     def _settle_takes_quietly(self, engine: "WarpEngine") -> None:
         """:meth:`_settle_dexie_takes`, contracted never to raise."""
         if getattr(engine._store, "list_takes", None) is None:
@@ -5140,20 +5190,7 @@ class _WarpWorker(QObject):
         coinset_client = coinset_mod.CoinsetClient(_coinset_url(self._config, net))
         watcher_client = watcher_mod.WatcherClient(net.watcher_api_url)
 
-        chia = self._config.get("chia") or {}
-        wallet_client = wallet_mod.WalletClient(
-            {
-                "host": chia.get("wallet_host") or "localhost",
-                "port": int(chia.get("wallet_port") or 9256),
-                "fingerprint": chia.get("wallet_fingerprint"),
-                "cert_path": str(chia.get("wallet_cert_path") or ""),
-                "key_path": str(chia.get("wallet_key_path") or ""),
-            },
-            # The default 5s is too tight for the 200-row history query that
-            # guards against double-funding; a timeout there now (correctly)
-            # blocks the send, so make it unlikely rather than merely safe.
-            timeout=30.0,
-        )
+        wallet_client = self._chia_wallet_client()
 
         protector = keystore.default_protector()
         warp_cfg = self._config.get("warp") or {}

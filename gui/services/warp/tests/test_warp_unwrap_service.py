@@ -706,3 +706,28 @@ def test_a_top_up_below_the_burn_minimum_at_send_time_is_cancelled():
     out = engine.step()
     assert out["status"] == JobStatus.CANCELLED
     assert ctx.wallet.cat_spends == []
+
+
+
+def test_a_top_up_no_longer_needed_at_send_time_is_cancelled_not_trimmed():
+    """[review] ETH that arrives after the gate must stop the unsent burn;
+    the frozen amount and post-tip columns are never rewritten here."""
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    _to_burn_sent(store, engine, ctx)
+    job = store.get_active_job()
+    store.update_job(job.id, state_patch={"rebalance_eth_target_wei": 10 ** 16})
+    ctx.evm.eth = 10 ** 16 - 10 ** 15        # needs ~1,003 of 5,000 mojos
+    out = engine.step()
+    assert out["status"] == JobStatus.CANCELLED
+    assert ctx.wallet.cat_spends == []
+
+    store2 = new_store()
+    engine2, ctx2 = build_unwrap(store2, params=params_with_cap())
+    _to_burn_sent(store2, engine2, ctx2)
+    job2 = store2.get_active_job()
+    store2.update_job(job2.id,
+                      state_patch={"rebalance_eth_target_wei": 10 ** 16})
+    ctx2.evm.eth = 10 ** 16                  # target met
+    assert engine2.step()["status"] == JobStatus.CANCELLED
+    assert ctx2.wallet.cat_spends == []

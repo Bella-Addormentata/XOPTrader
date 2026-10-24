@@ -666,3 +666,35 @@ def test_the_manual_unwrap_proof_does_not_survive_a_new_job_store():
     assert w._millieth_unwrap_is_proven(eng)
     eng._store = J.WarpJobStore(":memory:")          # no manual unwrap here
     assert not w._millieth_unwrap_is_proven(eng)
+
+
+
+def test_takes_settle_with_warp_disabled(tmp_path):
+    """[review] Turning warp.enabled off must not strand a submitted take:
+    settlement runs on the store and the wallet alone."""
+    db = tmp_path / "warp_jobs.db"
+    store = J.WarpJobStore(str(db))
+    store.record_take(trade_id=OUR_TID, offer_id=MAKER_TID, asset_id=WM,
+                      cat_mojos=547, xch_mojos=10, fee_mojos=0,
+                      status=J.TAKE_SUBMITTED)
+    store.close()
+    w = _worker(_params(), {"warp": {"enabled": False, "jobs_db": str(db)}})
+    w._secrets_path = None
+    wallet = FakeWallet()
+    wallet.trade_status = "CONFIRMED"
+    w._chia_wallet_client = lambda: wallet
+    w._settle_takes_without_engine()
+    store = J.WarpJobStore(str(db))
+    try:
+        assert store.get_take(OUR_TID).status == J.TAKE_CONFIRMED
+    finally:
+        store.close()
+
+
+def test_no_store_file_means_no_settlement_and_no_new_database(tmp_path):
+    db = tmp_path / "warp_jobs.db"
+    w = _worker(_params(), {"warp": {"enabled": False, "jobs_db": str(db)}})
+    w._secrets_path = None
+    w._chia_wallet_client = lambda: (_ for _ in ()).throw(AssertionError())
+    w._settle_takes_without_engine()
+    assert not db.exists()
