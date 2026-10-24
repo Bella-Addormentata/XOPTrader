@@ -12502,6 +12502,49 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
     // in this heartbeat (engine.hpp).
     step8_sync_gate_passed_ = true;
 
+    // [GAS-RESERVE review] Keep each per-asset reserve SPENDABLE, not just
+    // unsold: pick spendable coins covering it and have every offer that
+    // spends the asset exclude them from its coin selection
+    // (execution/asset_reserve.hpp).  Below the sync gate, before any pair
+    // posts.  A failed read keeps the previous cycle's choice: excluding a
+    // coin since spent is harmless, dropping the exclusion is not.
+    if (offer_mgr_ && !config_.strategy.asset_reserve_units.empty()) {
+        for (const auto& [asset_id, units] : config_.strategy.asset_reserve_units) {
+            const std::int64_t wid = offer_mgr_->resolve_wallet_id(asset_id);
+            if (wid <= 0) continue;
+            if (!wallet_step_may_run("Step 8 reserve coins")) co_return;
+            try {
+                const auto hex = [](std::string s) {
+                    return s.rfind("0x", 0) == 0 ? s.substr(2) : s;
+                };
+                std::vector<execution::ReserveCoin> coins;
+                for (const auto& rec : co_await wallet_->get_spendable_coins(wid)) {
+                    const auto& coin = rec.contains("coin") ? rec["coin"] : rec;
+                    if (!coin.contains("parent_coin_info")
+                        || !coin.contains("puzzle_hash")
+                        || !coin.contains("amount")) {
+                        continue;
+                    }
+                    const Mojo amount = coin["amount"].get<Mojo>();
+                    coins.push_back({execution::CoinManager::compute_coin_name(
+                                         hex(coin["parent_coin_info"].get<std::string>()),
+                                         hex(coin["puzzle_hash"].get<std::string>()),
+                                         amount),
+                                     amount});
+                }
+                // CAT wallets only (XCH has fee_reserve_xch): 1e3 per unit.
+                offer_mgr_->set_reserved_coins(
+                    wid, execution::choose_reserve_coins(
+                             std::move(coins),
+                             execution::reserve_units_to_mojos(units, 1'000)));
+            } catch (const std::exception& e) {
+                spdlog::warn("[Engine] Step 8: reserve coins for {} not "
+                             "refreshed ({}) -- keeping the previous choice",
+                             asset_id.substr(0, 12), e.what());
+            }
+        }
+    }
+
     // [SEED-FAIL-CLOSED review round 1] Verify every position the startup seed
     // could not read, here, below the sync gate and before anything is posted.
     // Step 6 has already sized this heartbeat's ladders from those guesses (or
@@ -21226,6 +21269,29 @@ asio::awaitable<void> Engine::step_ingest_secondary_bridge_flows(
             continue;
         }
         secondary_unpriced_warned_.erase(sid);
+
+        // [review] A first wrap CREATES the CAT wallet, after the wallet-id
+        // map was built (ensure_wallet_ids() builds it once), so the asset
+        // would resolve to no wallet -- and its flow never book -- until a
+        // restart.  Rebuild the map, from a wallet known synced (a mid-sync
+        // map can lack a wallet still being created), at most every
+        // kWalletMapRefreshBlocks.
+        constexpr BlockHeight kWalletMapRefreshBlocks = 10;
+        if (offer_mgr_ && offer_mgr_->resolve_wallet_id(asset) <= 0
+            && (secondary_wallet_map_refresh_block_ == 0
+                || block_height >= secondary_wallet_map_refresh_block_
+                                       + kWalletMapRefreshBlocks)
+            && co_await secondary_wallet_synced(block_height)
+            && wallet_step_may_run("bridge ingest")) {
+            secondary_wallet_map_refresh_block_ = block_height;
+            offer_mgr_->invalidate_wallet_ids();
+            try {
+                co_await offer_mgr_->ensure_wallet_ids();
+            } catch (const std::exception& ex) {
+                spdlog::debug("[Engine] Bridge ingest: wallet map rebuild "
+                              "failed ({})", ex.what());
+            }
+        }
 
         // A settled snapshot that postdates this scan (bridge-asset scan,
         // rounds 17 and 31): booking against an older one would let the

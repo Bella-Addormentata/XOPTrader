@@ -24,6 +24,9 @@
 #include <limits>
 #include <string>
 #include <unordered_map>
+#include <vector>
+
+#include <nlohmann/json.hpp>
 
 namespace xop::execution {
 
@@ -63,6 +66,81 @@ namespace xop::execution {
                       : (balance <= reserve)  ? Mojo{0}
                                               : balance - reserve;
     return std::max(Mojo{0}, std::min(pool, budget));
+}
+
+// ---------------------------------------------------------------------------
+// [GAS-RESERVE review] The reserve kept SPENDABLE, not just unsold.
+//
+// Amount caps keep the ladder from selling the reserve, but the wallet funds
+// an offer with whole coins: with one 5-unit wmilliETH.b coin and a 3-unit
+// reserve, a 2-unit ask locks the whole coin and leaves nothing the warp
+// rebalancer can unwrap until that offer turns over.  So each cycle Step 8
+// picks spendable coins covering the reserve and every offer that spends the
+// asset sends them as excluded_coin_ids (chia 2.7.4 coin-selection config,
+// read from the top level of create_offer_for_ids): the wallet cannot lock
+// them.  An offer the remaining coins cannot fund is refused by the wallet,
+// which is the reserve doing its job.
+// ---------------------------------------------------------------------------
+
+struct ReserveCoin {
+    std::string id;       ///< Coin name, lowercase hex, no 0x.
+    Mojo        amount{0};
+};
+
+/// Spendable coins to hold back so `reserve` mojos stay spendable: the
+/// smallest single coin covering it when there is one (fewest coins kept
+/// out of trading), else largest-first until covered; every coin when even
+/// all of them fall short.  None for no reserve.  Coins with a
+/// non-positive amount or an empty id are ignored.
+[[nodiscard]] inline std::vector<std::string> choose_reserve_coins(
+    std::vector<ReserveCoin> coins, Mojo reserve)
+{
+    std::vector<std::string> out;
+    if (reserve <= 0) return out;
+    coins.erase(std::remove_if(coins.begin(), coins.end(),
+                               [](const ReserveCoin& c) {
+                                   return c.amount <= 0 || c.id.empty();
+                               }),
+                coins.end());
+    // Ascending, ties by id, so the choice is deterministic.
+    std::sort(coins.begin(), coins.end(),
+              [](const ReserveCoin& a, const ReserveCoin& b) {
+                  return a.amount != b.amount ? a.amount < b.amount
+                                              : a.id < b.id;
+              });
+    for (const auto& c : coins) {
+        if (c.amount >= reserve) {
+            out.push_back(c.id);
+            return out;
+        }
+    }
+    Mojo kept = 0;
+    for (auto it = coins.rbegin(); it != coins.rend() && kept < reserve; ++it) {
+        out.push_back(it->id);
+        kept = (it->amount > std::numeric_limits<Mojo>::max() - kept)
+                   ? std::numeric_limits<Mojo>::max()
+                   : kept + it->amount;
+    }
+    return out;
+}
+
+/// The reserve coins an offer must exclude: those held back for every wallet
+/// the offer SPENDS from (a negative amount in the create_offer_for_ids
+/// dict, keyed by wallet id).  Receive legs and unknown wallets add nothing.
+[[nodiscard]] inline std::vector<std::string> reserved_coins_for_offer(
+    const nlohmann::json& offer_dict,
+    const std::unordered_map<std::string, std::vector<std::string>>& by_wallet)
+{
+    std::vector<std::string> out;
+    if (by_wallet.empty() || !offer_dict.is_object()) return out;
+    for (const auto& [wallet_id, amount] : offer_dict.items()) {
+        if (!amount.is_number_integer() || amount.is_number_unsigned()) continue;
+        if (amount.get<std::int64_t>() >= 0) continue;
+        const auto it = by_wallet.find(wallet_id);
+        if (it == by_wallet.end()) continue;
+        out.insert(out.end(), it->second.begin(), it->second.end());
+    }
+    return out;
 }
 
 }  // namespace xop::execution

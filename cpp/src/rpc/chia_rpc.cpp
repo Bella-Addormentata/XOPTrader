@@ -1020,11 +1020,13 @@ ChiaWalletRPC::create_offer(const json&   offer_dict,
                              std::uint64_t fee,
                              bool          validate_only,
                              std::optional<std::uint64_t> max_time,
-                             std::optional<std::uint64_t> min_coin_amount)
+                             std::optional<std::uint64_t> min_coin_amount,
+                             const std::vector<std::string>& excluded_coin_ids)
 {
     // The Chia wallet RPC endpoint is "create_offer_for_ids".
     const json payload = build_create_offer_payload(
-        offer_dict, fee, validate_only, max_time, min_coin_amount);
+        offer_dict, fee, validate_only, max_time, min_coin_amount,
+        excluded_coin_ids);
 
     const json resp = co_await rpc_post("create_offer_for_ids", payload);
 
@@ -1038,7 +1040,8 @@ json ChiaWalletRPC::build_create_offer_payload(
     std::uint64_t  fee,
     bool           validate_only,
     const std::optional<std::uint64_t>& max_time,
-    const std::optional<std::uint64_t>& min_coin_amount)
+    const std::optional<std::uint64_t>& min_coin_amount,
+    const std::vector<std::string>& excluded_coin_ids)
 {
     // offer_dict maps wallet_id (as string key) -> signed mojo amount.
     json payload = {
@@ -1070,6 +1073,16 @@ json ChiaWalletRPC::build_create_offer_payload(
     // floor of 0 is the wallet's own default, so it is not worth a key.
     if (min_coin_amount.has_value() && *min_coin_amount > 0) {
         payload["min_coin_amount"] = *min_coin_amount;
+    }
+
+    // [GAS-RESERVE] Same top-level coin-selection config.  Attached only
+    // when there is something to exclude.
+    if (!excluded_coin_ids.empty()) {
+        json ids = json::array();
+        for (const auto& id : excluded_coin_ids) {
+            ids.push_back(id.rfind("0x", 0) == 0 ? id : "0x" + id);
+        }
+        payload["excluded_coin_ids"] = std::move(ids);
     }
     return payload;
 }

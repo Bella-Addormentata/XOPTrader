@@ -63,6 +63,19 @@ def test_a_bridge_asset_with_no_cat_wallet_yet_opens_at_zero():
     assert "genesis_observed_at[AssetId{aid}]" in body[proven:end]
 
 
+def test_a_cat_wallet_created_after_startup_is_found():
+    """The first wrap creates the wallet after the one-shot map build: the
+    secondary scan rebuilds the map (synced, throttled) before its read."""
+    scan = _body(_engine(), SECONDARY)
+    rebuild = scan.index("offer_mgr_->invalidate_wallet_ids();")
+    fetch = scan.index("fetch_bridge_balance(asset, block_height)")
+    assert rebuild < fetch
+    guard = scan[scan.rindex("if (offer_mgr_ && offer_mgr_->resolve_wallet_id(asset) <= 0",
+                             0, rebuild):rebuild]
+    assert "secondary_wallet_synced(block_height)" in guard
+    assert "ensure_wallet_ids()" in scan[rebuild:fetch]
+
+
 def test_step11s_restart_reconcile_re_anchors_a_secondary_asset():
     """The one-shot reconcile is where a restart's stale restored quantity is
     corrected; for a secondary bridge asset that is a capital event."""
