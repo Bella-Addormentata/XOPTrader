@@ -261,6 +261,12 @@ class WarpParams:
     keep_usdc_micros: int = 0
 
 
+#: The smallest inbound bridge, in wrapped-CAT mojos. ERC20Bridge's tip is at
+#: least one mojo and the contract requires amount > tip
+#: (evm.post_tip_amount), so one mojo can never bridge.
+_MIN_BRIDGE_MOJOS: int = 2
+
+
 def _parse_unwrap_cap(warp: dict) -> int:
     """warp.max_unwrap_usdc -> micros; -1 when the key was never set.
 
@@ -1094,7 +1100,8 @@ class WarpEngine:
         # closed, not left pending: a pending job holds the single active
         # slot and would block every gas top-up behind it.
         if job.state.get("rebalance") and want < max(
-                p.min_micros, 10 ** (net.usdc_decimals - net.cat_decimals)):
+                p.min_micros,
+                _MIN_BRIDGE_MOJOS * 10 ** (net.usdc_decimals - net.cat_decimals)):
             return _advance(
                 JobStatus.CANCELLED,
                 message=(
@@ -1102,6 +1109,13 @@ class WarpEngine:
                     f"bridgeable (balance {have}, {keep} kept on Base) is "
                     "below the minimum"
                 ),
+            )
+        mojo_micros = 10 ** (net.usdc_decimals - net.cat_decimals)
+        if 0 < want < _MIN_BRIDGE_MOJOS * mojo_micros:
+            raise WarpPending(
+                f"{want} micros bridgeable is below the {_MIN_BRIDGE_MOJOS}-mojo "
+                "minimum the bridge's tip leaves room for (have "
+                f"{have}, {keep} kept on Base)"
             )
         if want <= 0:
             if keep > 0 and have > 0:
@@ -3170,10 +3184,19 @@ class WarpEngine:
         if exact:
             micros = int(target_micros)
             mojo_micros = 10 ** (self._net.usdc_decimals - self._net.cat_decimals)
-            if micros < mojo_micros or micros % mojo_micros:
+            if micros % mojo_micros:
                 raise WarpError(
                     "bridge amount must be a whole number of wUSDC.b mojos "
                     f"(multiples of {mojo_micros} micro-USDC, i.e. 0.001 USDC)"
+                )
+            # The bridge's tip is at least one mojo and must leave one, so a
+            # single mojo can never bridge -- and a typed amount does not
+            # shrink, so such a job would hold the slot forever.
+            if micros < _MIN_BRIDGE_MOJOS * mojo_micros:
+                raise WarpError(
+                    f"bridge amount must be at least {_MIN_BRIDGE_MOJOS} "
+                    f"wUSDC.b mojos ({_MIN_BRIDGE_MOJOS * mojo_micros} "
+                    "micro-USDC): the bridge's tip takes at least one"
                 )
             cap = int(self._params.max_micros or 0)
             if cap > 0 and micros > cap:

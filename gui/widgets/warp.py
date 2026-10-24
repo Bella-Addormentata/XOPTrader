@@ -1002,6 +1002,11 @@ class WarpWidget(QWidget):
             self._set_bridge_error(
                 "Bridge amounts go in 0.001 USDC steps (one wUSDC.b mojo).")
             return
+        if micros < 2_000:
+            self._set_bridge_error(
+                "The smallest bridge is 0.002 USDC: the bridge's tip takes at "
+                "least 0.001.")
+            return
         try:
             cap = int(self._snap.get("max_micros") or 0)
         except (TypeError, ValueError):

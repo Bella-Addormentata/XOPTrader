@@ -331,7 +331,7 @@ def test_bridge_now_emits_a_typed_amount_in_micro_usdc(qapp):
     assert not w._bridge_err.isVisible()
 
 
-@pytest.mark.parametrize("text", ["abc", "-1", "0", "1.0005", "nan", "inf"])
+@pytest.mark.parametrize("text", ["abc", "-1", "0", "1.0005", "nan", "inf", "0.001"])
 def test_bridge_now_refuses_a_bad_amount_on_the_spot(qapp, text):
     w = _make(qapp, _full())
     fired: list[object] = []

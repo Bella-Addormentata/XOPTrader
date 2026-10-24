@@ -42,6 +42,9 @@ _WRAP_GRANULARITY_WEI = 10 ** 12
 _WEI_PER_MILLIETH_UNIT = 10 ** 12
 #: wUSDC.b mojos per USDC micro-unit factor (6 ERC-20 decimals -> 3 CAT).
 _USDC_MICROS_PER_MOJO = 1000
+#: The smallest bridge the pipeline can complete: ERC20Bridge's inbound tip
+#: is at least one mojo and must leave one (service._MIN_BRIDGE_MOJOS).
+_MIN_BRIDGE_MICROS = 2 * _USDC_MICROS_PER_MOJO
 #: ERC20Bridge.tip() in basis points -- immutable on the deployed contract
 #: (a redeploy is refused by the anchor gates), which is what lets the
 #: deficit leg gross requests up by a constant instead of a chain read.
@@ -339,7 +342,7 @@ def plan(
         # The protocol floor is one CAT mojo (1000 micros), not one micro:
         # a sub-mojo job would sit pending forever, squatting the single
         # active-job slot.
-        if excess >= max(min_bridge_micros, _USDC_MICROS_PER_MOJO):
+        if excess >= max(min_bridge_micros, _MIN_BRIDGE_MICROS):
             return RebalanceAction(
                 "bridge_usdc", int(excess),
                 f"USDC {usdc_micros} above band {params.usdc.high}; bridging "
@@ -354,7 +357,7 @@ def plan(
         excess = usdc_micros - floor
         if max_bridge_micros > 0:
             excess = min(excess, max_bridge_micros)
-        if excess >= max(min_bridge_micros, _USDC_MICROS_PER_MOJO):
+        if excess >= max(min_bridge_micros, _MIN_BRIDGE_MICROS):
             return RebalanceAction(
                 "bridge_usdc", int(excess),
                 f"auto-bridge: USDC {usdc_micros} above the {floor} kept on "

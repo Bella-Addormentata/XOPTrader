@@ -3587,13 +3587,7 @@ class SettingsWidget(QWidget):
         self._warp_section_present = isinstance(warp, dict)
         warp = warp if isinstance(warp, dict) else {}
 
-        def _flag(value: Any, default: bool) -> bool:
-            if isinstance(value, bool):
-                return value
-            if isinstance(value, str) and value.strip().lower() in (
-                    "true", "false"):
-                return value.strip().lower() == "true"
-            return default
+        _flag = self._warp_flag
 
         def _num(value: Any, default: float) -> float:
             try:
@@ -3635,6 +3629,8 @@ class SettingsWidget(QWidget):
         existing = self._loaded_rebalance
         has_usdc = isinstance(existing, dict) and isinstance(
             existing.get("usdc"), dict)
+        # Read "enabled" the way the runtime does (true/1/"true"), so a USDC
+        # band switched on as `enabled: "true"` is not saved back as off.
         if self._eth_auto_topup.isChecked():
             out["rebalance"] = {
                 "enabled": True,
@@ -3646,10 +3642,54 @@ class SettingsWidget(QWidget):
         elif isinstance(existing, dict):
             # Unticked: drop the ETH band this page owns. A hand-configured
             # USDC band stays exactly as it was (on, if it was on).
-            enabled = existing.get("enabled") is True
+            enabled = self._warp_flag(existing.get("enabled"), False)
             out["rebalance"] = {"enabled": bool(enabled and has_usdc),
                                 "eth": None}
         return out
+
+    @staticmethod
+    def _warp_flag(value: Any, default: bool) -> bool:
+        """A warp boolean as the runtime parsers read it: True/False, 0/1,
+        or the strings "true"/"false" (blank keeps *default*). Anything else
+        keeps *default* rather than guessing."""
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int) and value in (0, 1):
+            return bool(value)
+        if isinstance(value, str):
+            spelled = value.strip().lower()
+            if spelled in ("true", "false"):
+                return spelled == "true"
+        return default
+
+    def _merged_rebalance_error(self) -> str:
+        """Why the rebalance block as it would land ON DISK would be refused.
+
+        The page writes only the keys it owns and the deep merge keeps the
+        rest (a USDC band, cooldown_s, ...), so ticking Auto top-up can
+        enable a block whose PRESERVED parts are invalid -- and a refused
+        block stops every automatic bridge. Validate the merged result with
+        the runtime's own parser.
+        """
+        if not self._warp_section_present:
+            return ""
+        edit = self._collect_warp_bridge().get("rebalance")
+        if not isinstance(edit, dict) or not edit.get("enabled"):
+            return ""
+        from gui.services.config_split import deep_merge
+        from gui.services.warp import rebalance as rb
+
+        merged = copy.deepcopy(self._loaded_rebalance or {})
+        deep_merge(merged, copy.deepcopy(edit))
+        try:
+            rb.parse_rebalance_config(
+                {"rebalance": merged},
+                min_gas_wei=int(round(self._RELAY_GAS_FLOOR_ETH * 10 ** 18)),
+            )
+        except rb.RebalanceConfigError as exc:
+            return (f"warp.rebalance would be rejected after saving: {exc}. "
+                    "Fix it in config.yaml or untick Auto top-up.")
+        return ""
 
     def _block_all_signals(self, block: bool) -> None:
         """Block or unblock signals on all tracked input widgets.
@@ -4318,6 +4358,9 @@ class SettingsWidget(QWidget):
         # closed and stands every automatic bridge down with it.
         eth_band_err = self._eth_band_error()
         _set_valid(self._eth_reserve_target, not eth_band_err, eth_band_err)
+        if not eth_band_err:
+            merged_err = self._merged_rebalance_error()
+            _set_valid(self._eth_auto_topup, not merged_err, merged_err)
 
         # -- Risk: soft < hard --
         soft_ok = self._soft_limit.value() < self._hard_limit.value()

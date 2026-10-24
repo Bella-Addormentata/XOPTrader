@@ -242,3 +242,45 @@ def test_a_usdc_band_never_plans_into_the_keep_floor():
                  keep_usdc_micros=50_000_000) is None
     act = _plan(params=band, usdc_micros=60_000_000, keep_usdc_micros=50_000_000)
     assert act.kind == "bridge_usdc" and act.amount == 10_000_000
+
+
+# --------------------------------------------------------------------------- #
+# Review round 2 (PR #184): the bridge's tip needs two mojos.
+# --------------------------------------------------------------------------- #
+
+def test_a_one_mojo_typed_amount_is_refused():
+    store = new_store()
+    engine, _ = build(store)
+    with pytest.raises(S.WarpError, match="at least 2"):
+        engine.request_bridge(target_micros=1_000)
+    assert store.get_active_job() is None
+    engine.request_bridge(target_micros=2_000)
+    assert store.get_active_job() is not None
+
+
+def test_a_one_mojo_blank_bridge_pends_with_a_reason():
+    store = new_store()
+    engine, ctx = build(store, params=default_params(keep_usdc_micros=4_000_000))
+    ctx.evm.erc20 = 4_001_000                 # one mojo above the floor
+    engine.request_bridge()
+    out = engine.step()
+    assert out["status"] == JobStatus.AWAITING_DEPOSIT
+    msgs = " ".join(str(getattr(e, "message", "") or "")
+                    for e in store.get_events(store.get_active_job().id))
+    assert "2-mojo minimum" in msgs
+
+
+def test_a_one_mojo_rebalance_bridge_is_cancelled():
+    store = new_store()
+    engine, ctx = build(store, params=default_params(
+        keep_usdc_micros=4_000_000, min_micros=0))
+    ctx.evm.erc20 = 4_001_000
+    engine.request_bridge(target_micros=1_000_000, automatic=True)
+    out = engine.step()
+    assert out["status"] == JobStatus.CANCELLED
+
+
+def test_the_planner_never_plans_a_one_mojo_bridge():
+    assert _plan(auto_bridge_floor_micros=49_999_000, min_bridge_micros=0) is None
+    act = _plan(auto_bridge_floor_micros=49_998_000, min_bridge_micros=0)
+    assert act.kind == "bridge_usdc" and act.amount == 2_000

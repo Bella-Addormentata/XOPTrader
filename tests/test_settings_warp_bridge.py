@@ -193,3 +193,31 @@ def test_enable_save_disable_save_turns_the_band_off(panel, tmp_path):
     assert panel.save_config(str(path)) is True
     reb = yaml.safe_load(path.read_text(encoding="utf-8"))["warp"]["rebalance"]
     assert reb["enabled"] is False and reb.get("eth") is None
+
+
+# ---------------------------------------------------------------------------
+# Review round 2 (PR #184).
+# ---------------------------------------------------------------------------
+
+def test_a_preserved_invalid_usdc_band_blocks_the_save(panel, tmp_path):
+    """Ticking Auto top-up would enable a block whose PRESERVED usdc band is
+    invalid; the runtime would refuse it and stop every automatic bridge."""
+    panel.load_config(str(_cfg(tmp_path, {**LIVE, "rebalance": {
+        "enabled": False, "usdc": {"target": 0, "tolerance_pct": 20}}})))
+    panel._eth_auto_topup.setChecked(True)
+    assert any("would be rejected after saving" in e for e in panel._validate())
+
+
+def test_integer_booleans_load_as_the_runtime_reads_them(panel, tmp_path):
+    panel.load_config(str(_cfg(tmp_path, {**LIVE, "auto_bridge": 1, "rebalance": {
+        "enabled": 1, "eth": {"target": 0.01, "tolerance_pct": 20}}})))
+    assert panel._warp_auto_bridge.isChecked()
+    assert panel._eth_auto_topup.isChecked()
+    assert _warp(panel)["rebalance"]["enabled"] is True
+
+
+def test_a_string_true_usdc_band_stays_on_when_top_up_is_unticked(panel, tmp_path):
+    panel.load_config(str(_cfg(tmp_path, {**LIVE, "rebalance": {
+        "enabled": "true", "usdc": {"target": 100, "tolerance_pct": 20}}})))
+    assert not panel._eth_auto_topup.isChecked()
+    assert _warp(panel)["rebalance"] == {"enabled": True, "eth": None}
