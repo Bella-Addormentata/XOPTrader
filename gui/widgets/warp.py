@@ -79,6 +79,29 @@ _WEI_PER_ETH: Final[float] = 1e18
 _LOW_GAS_WEI_FALLBACK: Final[int] = 5_000_000_000_000_000  # 0.005 ETH
 
 
+def gas_state(snap: Any) -> tuple:
+    """``(state, detail)``: ``"low"`` with ``(eth_wei, floor_wei)``, ``"ok"``,
+    ``"off"`` (bridge disabled or the warning switched off), or
+    ``"unknown"`` (balances unread). The alert latch needs the difference
+    between "recovered" and "could not tell".
+    """
+    if not isinstance(snap, dict) or not snap.get("enabled"):
+        return ("off", None)
+    try:
+        floor = int(snap.get("min_base_eth_wei"))
+    except (TypeError, ValueError):
+        floor = _LOW_GAS_WEI_FALLBACK
+    if floor <= 0:
+        return ("off", None)
+    hot = snap.get("hot_wallet")
+    if not isinstance(hot, dict) or hot.get("error"):
+        return ("unknown", None)
+    wei = hot.get("eth_wei")
+    if not isinstance(wei, int) or isinstance(wei, bool):
+        return ("unknown", None)
+    return ("low", (wei, floor)) if wei < floor else ("ok", None)
+
+
 def low_gas(snap: Any) -> Optional[tuple]:
     """``(eth_wei, floor_wei)`` when the hot wallet is below its gas reserve.
 
@@ -968,11 +991,17 @@ class WarpWidget(QWidget):
         if not amount.is_finite() or amount <= 0:
             self._set_bridge_error("Enter a positive USDC amount.")
             return
-        if amount % Decimal("0.001") != 0:
+        try:
+            # Huge exponents (1e309) construct fine but raise here.
+            off_grid = amount % Decimal("0.001") != 0
+            micros = int(amount * 1_000_000)
+        except InvalidOperation:
+            self._set_bridge_error(f"“{text}” is too large a USDC amount.")
+            return
+        if off_grid:
             self._set_bridge_error(
                 "Bridge amounts go in 0.001 USDC steps (one wUSDC.b mojo).")
             return
-        micros = int(amount * 1_000_000)
         try:
             cap = int(self._snap.get("max_micros") or 0)
         except (TypeError, ValueError):

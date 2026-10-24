@@ -258,6 +258,7 @@ def plan(
     max_unwrap_micros: int,
     min_bridge_micros: int,
     auto_bridge_floor_micros: Optional[int] = None,
+    keep_usdc_micros: int = 0,
 ) -> Optional[RebalanceAction]:
     """At most one action moving one balance back to its target.
 
@@ -329,7 +330,10 @@ def plan(
     # 4. USDC excess: bridge it to Chia as trading float. Honors both the
     #    auto floor (no dust jobs) and the blast-radius cap.
     if params.usdc is not None and usdc_micros > params.usdc.high:
-        excess = usdc_micros - params.usdc.target
+        # Never into warp.keep_usdc_on_base: a floor above the target would
+        # otherwise plan a bridge the job then sizes to zero, and that
+        # pending job would hold the single slot against gas top-ups.
+        excess = usdc_micros - max(params.usdc.target, int(keep_usdc_micros))
         if max_bridge_micros > 0:
             excess = min(excess, max_bridge_micros)
         # The protocol floor is one CAT mojo (1000 micros), not one micro:

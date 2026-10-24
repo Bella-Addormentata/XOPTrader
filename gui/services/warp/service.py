@@ -1055,7 +1055,14 @@ class WarpEngine:
         exact = bool(job.state.get("exact")) and bool(target)
         if exact:
             # A typed amount is bridged as typed: wait for the balance to
-            # cover it rather than bridge whatever happens to be there.
+            # cover it rather than bridge whatever happens to be there --
+            # and never clamp it to a cap lowered while it waited.
+            if p.max_micros > 0 and int(target) > p.max_micros:
+                raise WarpPending(
+                    f"the requested {int(target)} micros is above the current "
+                    f"per-warp cap ({p.max_micros}); raise "
+                    "warp.max_auto_bridge_usdc or cancel this job"
+                )
             if have < int(target):
                 raise WarpPending(
                     f"awaiting a {spec.symbol} balance of {int(target)} micros "
@@ -1082,6 +1089,20 @@ class WarpEngine:
         # against the shipped default of 100 USDC. An unflagged legacy row is
         # treated as automatic, i.e. the conservative side.
         manual = bool(job.state.get("manual"))
+        # A REBALANCE job whose bridgeable amount fell below what it may move
+        # (the keep floor, or a balance that dropped while it waited) is
+        # closed, not left pending: a pending job holds the single active
+        # slot and would block every gas top-up behind it.
+        if job.state.get("rebalance") and want < max(
+                p.min_micros, 10 ** (net.usdc_decimals - net.cat_decimals)):
+            return _advance(
+                JobStatus.CANCELLED,
+                message=(
+                    f"rebalance bridge no longer needed: {want} micros "
+                    f"bridgeable (balance {have}, {keep} kept on Base) is "
+                    "below the minimum"
+                ),
+            )
         if want <= 0:
             if keep > 0 and have > 0:
                 raise WarpPending(
@@ -4156,6 +4177,8 @@ class _WarpWorker(QObject):
                     int(getattr(ep, "keep_usdc_micros", 0) or 0)
                     if getattr(ep, "auto_bridge", False) else None
                 ),
+                # And a USDC band never plans to bridge into the keep floor.
+                keep_usdc_micros=int(getattr(ep, "keep_usdc_micros", 0) or 0),
             )
             if action is None:
                 return

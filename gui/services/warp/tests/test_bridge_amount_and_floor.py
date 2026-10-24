@@ -26,7 +26,7 @@ from gui.services.warp import rebalance as rb  # noqa: E402
 from gui.services.warp import service as S  # noqa: E402
 from gui.services.warp.jobs import JobStatus  # noqa: E402
 
-from .test_warp_service import build, default_params, new_store, seed  # noqa: E402
+from .test_warp_service import build, default_params, new_store  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -167,7 +167,8 @@ ETH_ONLY = rb.RebalanceParams(
 def _plan(**over):
     args = dict(params=ETH_ONLY, eth_wei=10 ** 16, usdc_micros=50_000_000,
                 millieth_units=0, max_bridge_micros=0, max_unwrap_micros=0,
-                min_bridge_micros=1_000_000, auto_bridge_floor_micros=None)
+                min_bridge_micros=1_000_000, auto_bridge_floor_micros=None,
+                keep_usdc_micros=0)
     args.update(over)
     return rb.plan(**args)
 
@@ -203,3 +204,41 @@ def test_a_usdc_band_still_governs_bridging_over_the_auto_leg():
     act = _plan(params=both, auto_bridge_floor_micros=0)
     assert act.kind == "bridge_usdc" and act.amount == 10_000_000, (
         "the band's excess over its target, not the auto leg's whole balance")
+
+
+# --------------------------------------------------------------------------- #
+# Review round 1 (PR #184).
+# --------------------------------------------------------------------------- #
+
+def test_an_exact_job_pends_rather_than_clamp_to_a_lowered_cap():
+    store = new_store()
+    engine, ctx = build(store, params=default_params(max_micros=5_000_000))
+    engine.request_bridge(target_micros=3_000_000)
+    # The operator lowers the cap to 1 USDC while the job waits.
+    engine._params = default_params(max_micros=1_000_000)
+    ctx.evm.erc20 = 10_000_000
+    out = engine.step()
+    assert out["status"] == JobStatus.AWAITING_DEPOSIT, "pends, never bridges 1"
+    msgs = " ".join(str(getattr(e, "message", "") or "")
+                    for e in store.get_events(store.get_active_job().id))
+    assert "above the current per-warp cap" in msgs
+
+
+def test_a_rebalance_bridge_sized_to_nothing_closes_instead_of_squatting():
+    store = new_store()
+    engine, ctx = build(store, params=default_params(
+        keep_usdc_micros=50_000_000, min_micros=1_000_000))
+    ctx.evm.erc20 = 50_000_000              # all of it is kept on Base
+    engine.request_bridge(target_micros=10_000_000, automatic=True)
+    out = engine.step()
+    assert out["status"] == JobStatus.CANCELLED
+    assert store.get_active_job() is None, "the single slot is free again"
+
+
+def test_a_usdc_band_never_plans_into_the_keep_floor():
+    band = rb.RebalanceParams(
+        enabled=True, usdc=rb.AssetBand(target=40_000_000, tolerance_pct=10))
+    assert _plan(params=band, usdc_micros=50_000_000,
+                 keep_usdc_micros=50_000_000) is None
+    act = _plan(params=band, usdc_micros=60_000_000, keep_usdc_micros=50_000_000)
+    assert act.kind == "bridge_usdc" and act.amount == 10_000_000

@@ -703,12 +703,16 @@ class MainWindow(QMainWindow):
         status bar -- once per crossing, re-armed when the balance recovers.
         """
         try:
-            from gui.widgets.warp import low_gas
+            from gui.widgets.warp import gas_state
         except Exception:  # noqa: BLE001 -- a stubbed warp page: no alert
             return
-        state = low_gas(warp)
-        if state is not None and not self._warp_low_gas:
-            wei, floor = state
+        kind, detail = gas_state(warp)
+        if kind == "unknown":
+            # An unreadable balance is not a recovery: keep the latch as it
+            # is, or low -> RPC error -> low would alert twice.
+            return
+        if kind == "low" and not self._warp_low_gas:
+            wei, floor = detail
             msg = (
                 f"Low Base gas: the warp hot wallet has {wei / 1e18:.6f} ETH, "
                 f"below the {floor / 1e18:.4f} ETH reserve. Bridges and unwraps "
@@ -720,7 +724,7 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage(msg, 20_000)
             except Exception:  # noqa: BLE001 -- headless/teardown
                 pass
-        self._warp_low_gas = state is not None
+        self._warp_low_gas = kind == "low"
 
     def _on_bridge_data(self, data: dict) -> None:
         """Handle aggregated data snapshot from EngineBridge.

@@ -46,6 +46,7 @@ from __future__ import annotations
 import copy
 import datetime
 import logging
+import math
 import re
 from pathlib import Path
 from typing import Any, Final, Optional
@@ -3530,24 +3531,28 @@ class SettingsWidget(QWidget):
     _RELAY_GAS_FLOOR_ETH: Final[float] = 0.0003
 
     def _eth_band_error(self) -> str:
-        """Why the ETH fee-reserve band would be refused, or "" if fine."""
+        """Why the ETH fee-reserve band would be refused, or "" if fine.
+
+        Judged by the rebalancer's OWN parser on the values exactly as they
+        will be written (rounded the way _collect_warp_bridge rounds them),
+        so the GUI can never pass a band the runtime then rejects -- its
+        integer-wei truncation included.
+        """
         if not self._eth_auto_topup.isChecked():
             return ""
-        target = self._eth_reserve_target.value()
-        tol = self._eth_reserve_tol.value()
-        floor = self._RELAY_GAS_FLOOR_ETH
-        if target * (1.0 - tol / 100.0) <= floor:
-            return (
-                f"ETH fee reserve: the band bottom ({target * (1 - tol / 100):.4f} "
-                f"ETH) must stay above the {floor} ETH relay-gas floor -- raise "
-                "the target or lower the tolerance."
+        from gui.services.warp import rebalance as rb
+
+        band = {"target": round(self._eth_reserve_target.value(), 4),
+                "tolerance_pct": round(self._eth_reserve_tol.value(), 1)}
+        try:
+            rb.parse_rebalance_config(
+                {"rebalance": {"enabled": True, "eth": band}},
+                min_gas_wei=int(round(self._RELAY_GAS_FLOOR_ETH * 10 ** 18)),
             )
-        if target * tol / 100.0 < 2 * floor:
-            return (
-                f"ETH fee reserve: the band half-width ({target * tol / 100:.4f} "
-                f"ETH) must be at least {2 * floor:.4f} ETH -- raise the target "
-                "or the tolerance."
-            )
+        except rb.RebalanceConfigError as exc:
+            msg = str(exc).replace("warp.rebalance.eth", "ETH fee reserve")
+            return (f"ETH fee reserve rejected by the rebalancer: {msg}. Raise "
+                    "the target or adjust the tolerance.")
         return ""
 
     def _refresh_warp_controls(self) -> None:
@@ -3595,7 +3600,7 @@ class SettingsWidget(QWidget):
                 out = float(value)
             except (TypeError, ValueError):
                 return default
-            return out if out == out else default   # NaN -> default
+            return default if math.isnan(out) else out
 
         self._warp_auto_bridge.setChecked(_flag(warp.get("auto_bridge"), False))
         self._warp_min_auto.setValue(_num(warp.get("min_auto_bridge_usdc"), 0.0))
@@ -4687,6 +4692,15 @@ class SettingsWidget(QWidget):
         # so subsequent saves keep preserving unmanaged keys.
         self._config_path = str(resolved)
         self._clean_snapshot = copy.deepcopy(cfg)
+        # [WARP-GUI] The rebalance block just written is the new baseline:
+        # unticking Auto top-up on a later save must see THIS block, or it
+        # would write nothing and the deep merge would keep the band on.
+        saved_warp = cfg.get("warp") if isinstance(cfg, dict) else None
+        self._warp_section_present = isinstance(saved_warp, dict)
+        saved_reb = (saved_warp or {}).get("rebalance") if isinstance(
+            saved_warp, dict) else None
+        self._loaded_rebalance = (copy.deepcopy(saved_reb)
+                                  if isinstance(saved_reb, dict) else None)
         # [RATIO-SOT] Show what hit disk, and make it the baseline, so a later
         # save cannot re-apply this save's edits over a newer on-disk value.
         self._rebase_ratio_cells(merged_targets)

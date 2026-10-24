@@ -553,3 +553,37 @@ def test_main_window_alerts_once_per_crossing():
     MainWindow._check_warp_low_gas(fake, ok)
     MainWindow._check_warp_low_gas(fake, low)
     assert len(shown) == 2, "re-armed once the balance recovered"
+
+
+def test_main_window_alert_latch_survives_an_unreadable_balance():
+    """Review: low -> RPC error -> low is ONE episode, not two alerts."""
+    from types import SimpleNamespace
+
+    from gui.widgets.main_window import MainWindow
+
+    shown: list[str] = []
+    fake = SimpleNamespace(
+        _warp_low_gas=False,
+        statusBar=lambda: SimpleNamespace(
+            showMessage=lambda msg, _ms=0: shown.append(msg)),
+    )
+    low = _full(hot_wallet=_hot(eth_wei=10 ** 15), min_base_eth_wei=5 * 10 ** 15)
+    err = _full(hot_wallet=_hot(error="rpc down"), min_base_eth_wei=5 * 10 ** 15)
+    off = _full(hot_wallet=_hot(eth_wei=10 ** 15), min_base_eth_wei=0)
+    MainWindow._check_warp_low_gas(fake, low)
+    MainWindow._check_warp_low_gas(fake, err)
+    MainWindow._check_warp_low_gas(fake, low)
+    assert len(shown) == 1
+    MainWindow._check_warp_low_gas(fake, off)       # explicit disablement re-arms
+    MainWindow._check_warp_low_gas(fake, low)
+    assert len(shown) == 2
+
+
+def test_bridge_now_refuses_an_absurdly_large_amount_cleanly(qapp):
+    w = _make(qapp, _full())
+    fired: list[object] = []
+    w.bridge_now_requested.connect(lambda amount: fired.append(amount))
+    w._bridge_amount.setText("1e309")
+    w._bridge_btn.click()
+    assert fired == []
+    assert "too large" in w._bridge_err.text()

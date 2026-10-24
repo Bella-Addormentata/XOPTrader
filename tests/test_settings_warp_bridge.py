@@ -153,7 +153,7 @@ def test_unticking_an_eth_only_band_turns_the_rebalancer_off(panel, tmp_path):
 
 
 @pytest.mark.parametrize("target,tol,why", [
-    (0.0004, 50.0, "bottom"),      # bottom 0.0002 ETH <= the 0.0003 floor
+    (0.0009, 70.0, "bottom"),      # bottom 0.00027 ETH <= the 0.0003 floor
     (0.002, 20.0, "half-width"),   # half-width 0.0004 < 0.0006
 ])
 def test_a_band_the_rebalancer_would_refuse_cannot_be_saved(
@@ -170,3 +170,26 @@ def test_a_band_is_not_validated_while_top_up_is_off(panel, tmp_path):
     panel.load_config(str(_cfg(tmp_path, LIVE)))
     panel._eth_reserve_target.setValue(0.0004)
     assert not any("ETH fee reserve" in e for e in panel._validate())
+
+
+def test_validation_matches_the_parsers_integer_wei_truncation(panel, tmp_path):
+    """0.001 ETH at 70% passes float maths but the parser truncates the band
+    bottom to exactly the 0.0003 ETH floor and refuses it."""
+    panel.load_config(str(_cfg(tmp_path, LIVE)))
+    panel._eth_auto_topup.setChecked(True)
+    panel._eth_reserve_target.setValue(0.001)
+    panel._eth_reserve_tol.setValue(70)
+    assert any("ETH fee reserve" in e for e in panel._validate())
+
+
+def test_enable_save_disable_save_turns_the_band_off(panel, tmp_path):
+    """Review: with no rebalance block on first load, the baseline must be
+    refreshed by the first save, or unticking would write nothing."""
+    path = _cfg(tmp_path, LIVE)
+    panel.load_config(str(path))
+    panel._eth_auto_topup.setChecked(True)
+    assert panel.save_config(str(path)) is True
+    panel._eth_auto_topup.setChecked(False)
+    assert panel.save_config(str(path)) is True
+    reb = yaml.safe_load(path.read_text(encoding="utf-8"))["warp"]["rebalance"]
+    assert reb["enabled"] is False and reb.get("eth") is None
