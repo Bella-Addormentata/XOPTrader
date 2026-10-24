@@ -292,14 +292,18 @@ class WalletClient:
             raise WalletError(f"get_offer({tid}) returned no usable trade record")
         return record
 
-    def get_my_open_trade_ids(self, *, page: int = 500,
-                              max_pages: int = 200) -> set[str]:
-        """Trade ids (lowercase hex, no 0x) of OUR offers still open.
+    def get_my_offer_trade_ids(self, *, page: int = 500,
+                               max_pages: int = 2000) -> set[str]:
+        """Trade ids (lowercase hex, no 0x) of every offer WE made, open or
+        completed.
 
         Used to keep the Dexie buy from taking one of the engine's own asks,
         so it is complete or it raises: every page is read until a short
         one, and a failed page propagates (WalletError) rather than hand
         back a partial set that could authorize buying our own offer.
+        Completed records count too: a wallet-local (insecure) cancel -- the
+        engine's emergency fallback -- leaves the offer takeable on-chain
+        and possibly still listed on Dexie.
         """
         out: set[str] = set()
         start = 0
@@ -307,7 +311,7 @@ class WalletClient:
             data = self._post("get_all_offers", {
                 "start": start, "end": start + int(page),
                 "exclude_my_offers": False, "exclude_taken_offers": True,
-                "include_completed": False, "file_contents": False,
+                "include_completed": True, "file_contents": False,
             })
             records = data.get("trade_records") or []
             for rec in records:
@@ -320,4 +324,4 @@ class WalletClient:
             start += int(page)
         raise WalletError(
             f"get_all_offers still returning full pages after {max_pages}; "
-            "our open offers cannot be listed completely")
+            "our offers cannot be listed completely")

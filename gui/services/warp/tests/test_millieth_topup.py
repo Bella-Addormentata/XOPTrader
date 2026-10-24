@@ -70,7 +70,7 @@ class FakeWallet:
     def get_offer(self, trade_id):
         return {"trade_id": trade_id, "status": self.trade_status}
 
-    def get_my_open_trade_ids(self):
+    def get_my_offer_trade_ids(self):
         return set()
 
 
@@ -417,7 +417,7 @@ def test_our_open_offers_are_listed_across_every_page():
             for i in range(n)]}
 
     client = WalletClient({}, poster=poster)
-    ids = client.get_my_open_trade_ids(page=2)
+    ids = client.get_my_offer_trade_ids(page=2)
     assert pages == [(0, 2), (2, 4)]
     assert len(ids) == 3
 
@@ -428,7 +428,7 @@ def test_our_open_offers_are_listed_across_every_page():
             {"trade_id": "0x" + "1" * 64, "is_my_offer": True}] * 2}
 
     with pytest.raises(WalletError):
-        WalletClient({}, poster=failing).get_my_open_trade_ids(page=2)
+        WalletClient({}, poster=failing).get_my_offer_trade_ids(page=2)
 
 
 def test_an_offer_already_attempted_is_never_taken_again(monkeypatch):
@@ -728,3 +728,22 @@ def test_a_buy_leaves_the_xch_its_own_unwrap_needs(monkeypatch):
     eng._wallet.xch_spendable = 1_828_800_000_000
     w._maybe_rebalance(eng)
     assert len(eng._wallet.taken) == 1
+
+
+
+def test_completed_offers_of_ours_are_excluded_too():
+    """[review] An insecurely cancelled offer is still takeable on-chain;
+    the ownership scan asks for completed records as well."""
+    from gui.services.warp.wallet import WalletClient
+
+    bodies = []
+
+    def poster(url, body):
+        bodies.append(body)
+        return {"success": True, "trade_records": [
+            {"trade_id": "0x" + "c" * 64, "is_my_offer": True,
+             "status": "CANCELLED"}]}
+
+    ids = WalletClient({}, poster=poster).get_my_offer_trade_ids()
+    assert ids == {"c" * 64}
+    assert bodies[0]["include_completed"] is True

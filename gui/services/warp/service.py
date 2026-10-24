@@ -2504,6 +2504,17 @@ class WarpEngine:
         confirmed = int(bal.get("confirmed_wallet_balance") or 0)
         spendable = int(bal.get("spendable_balance") or 0)
         if amount > confirmed:
+            # [review] An AUTOMATIC unwrap was sized from a balance an engine
+            # fill may have spent since; nothing is committed yet, so cancel
+            # (freeing the slot for the next consult to re-plan) rather than
+            # leave a FAILED job holding it until an operator steps in.
+            if job.state.get("rebalance"):
+                return _advance(
+                    JobStatus.CANCELLED,
+                    message=(f"automatic unwrap of {amount} mojos cancelled "
+                             f"before the burn: the CAT balance is now "
+                             f"{confirmed}; the next consult re-plans"),
+                )
             raise WarpTerminal(
                 f"unwrap amount {amount} exceeds the confirmed balance {confirmed}"
             )
@@ -4942,7 +4953,7 @@ class _WarpWorker(QObject):
         refused = getattr(self, "_dexie_refused", None)
         if refused is None:
             refused = self._dexie_refused = set()
-        own = engine._wallet.get_my_open_trade_ids() | (
+        own = engine._wallet.get_my_offer_trade_ids() | (
             engine._store.take_offer_ids()) | refused
         # Max XCH per Buy bounds the whole debit: the ask AND our fee.
         # [review] So does what the wallet can spend above the engine's fee

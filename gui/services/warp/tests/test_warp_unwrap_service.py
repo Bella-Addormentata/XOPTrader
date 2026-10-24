@@ -731,3 +731,26 @@ def test_a_top_up_no_longer_needed_at_send_time_is_cancelled_not_trimmed():
     ctx2.evm.eth = 10 ** 16                  # target met
     assert engine2.step()["status"] == JobStatus.CANCELLED
     assert ctx2.wallet.cat_spends == []
+
+
+
+def test_an_automatic_unwrap_the_balance_no_longer_covers_is_cancelled():
+    """[review] An engine fill can spend the CAT between sizing and the
+    gate: an automatic job cancels (freeing the slot) instead of FAILING;
+    a manual one still stops for the operator."""
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    engine.request_unwrap(AMOUNT, engine._hot_address, automatic=True)
+    ctx.wallet.balances[3] = {"confirmed_wallet_balance": AMOUNT - 1,
+                              "spendable_balance": AMOUNT - 1}
+    out = engine.step()
+    assert out["status"] == JobStatus.CANCELLED
+    assert store.get_active_job() is None
+    assert ctx.wallet.cat_spends == []
+
+    store2 = new_store()
+    engine2, ctx2 = build_unwrap(store2, params=params_with_cap())
+    request(engine2)
+    ctx2.wallet.balances[3] = {"confirmed_wallet_balance": AMOUNT - 1,
+                               "spendable_balance": AMOUNT - 1}
+    assert engine2.step()["status"] == JobStatus.FAILED
