@@ -46,6 +46,7 @@ from __future__ import annotations
 import copy
 import datetime
 import logging
+import math
 import re
 from pathlib import Path
 from typing import Any, Final, Optional
@@ -2049,8 +2050,156 @@ class SettingsWidget(QWidget):
         )
         base_form.addRow("", base_hint)
 
+        # [WARP-GUI 2026-10-24] ETH fee reserve: the warp rebalancer's ETH
+        # band (warp.rebalance.eth), which tops ETH back up when it falls
+        # below the band and wraps any excess into milliETH on Base.
+        self._eth_auto_topup = QCheckBox("Auto top-up the ETH fee reserve")
+        self._eth_auto_topup.setToolTip(
+            "Keep the Base hot wallet's ETH near the target below. When ETH "
+            "falls below target − tolerance it is topped back up to the "
+            "target from milliETH already held on Base; above target + "
+            "tolerance the excess is wrapped into milliETH (still ETH, ready "
+            "to top up from later). Writes warp.rebalance.eth and enables "
+            "the rebalancer. Automatic USDC bridging keeps working while it "
+            "is on: the rebalancer runs it after any gas top-up."
+        )
+        base_form.addRow("", self._eth_auto_topup)
+
+        self._eth_reserve_target = QDoubleSpinBox()
+        self._eth_reserve_target.setRange(0.0004, 1000.0)
+        self._eth_reserve_target.setSingleStep(0.001)
+        self._eth_reserve_target.setDecimals(4)
+        self._eth_reserve_target.setValue(0.01)
+        self._eth_reserve_target.setSuffix(" ETH")
+        self._eth_reserve_target.setToolTip(
+            "The ETH balance the fee reserve is topped back up to."
+        )
+        base_form.addRow("ETH Fee Reserve Target:", self._eth_reserve_target)
+
+        self._eth_reserve_tol = QDoubleSpinBox()
+        self._eth_reserve_tol.setRange(0.1, 100.0)
+        self._eth_reserve_tol.setSingleStep(5.0)
+        self._eth_reserve_tol.setDecimals(1)
+        self._eth_reserve_tol.setValue(20.0)
+        self._eth_reserve_tol.setSuffix(" %")
+        self._eth_reserve_tol.setToolTip(
+            "How far ETH may drift from the target before a top-up (or a "
+            "wrap of the excess) fires. The band's bottom must stay above the "
+            "0.0003 ETH the bridge needs to sign at all, and its half-width "
+            "must be at least 0.0006 ETH so each action's own gas cannot "
+            "push it straight back out."
+        )
+        base_form.addRow("Top-up Tolerance:", self._eth_reserve_tol)
+
         layout.addWidget(base_group)
+
+        # [WARP-GUI 2026-10-24] warp.green bridge (USDC on Base -> Chia).
+        warp_group = QGroupBox("warp.green Bridge (USDC)")
+        warp_form = QFormLayout(warp_group)
+        warp_form.setSpacing(8)
+
+        self._warp_auto_bridge = QCheckBox("Auto-bridge USDC deposits to Chia")
+        self._warp_auto_bridge.setToolTip(
+            "Bridge USDC that arrives in the Base hot wallet without waiting "
+            "for Bridge now (warp.auto_bridge)."
+        )
+        warp_form.addRow("", self._warp_auto_bridge)
+
+        self._warp_min_auto = QDoubleSpinBox()
+        self._warp_min_auto.setRange(0.0, 1_000_000.0)
+        self._warp_min_auto.setSingleStep(10.0)
+        self._warp_min_auto.setDecimals(3)
+        self._warp_min_auto.setSuffix(" USDC")
+        self._warp_min_auto.setToolTip(
+            "Automatic bridging waits until at least this much is bridgeable, "
+            "so dust deposits don't each pay the bridge's costs. Bridge now "
+            "ignores it (warp.min_auto_bridge_usdc)."
+        )
+        warp_form.addRow("Auto-bridge Minimum:", self._warp_min_auto)
+
+        self._warp_max = QDoubleSpinBox()
+        # 0.002 USDC is the smallest bridge that can complete (the bridge's
+        # tip takes at least 0.001); a lower cap would block every bridge.
+        self._warp_max.setRange(0.002, 1_000_000.0)
+        self._warp_max.setSingleStep(10.0)
+        self._warp_max.setDecimals(3)
+        self._warp_max.setValue(5.0)
+        self._warp_max.setSuffix(" USDC")
+        self._warp_max.setToolTip(
+            "The most any one warp may move, automatic or Bridge now -- the "
+            "blast radius of a mis-click (warp.max_auto_bridge_usdc)."
+        )
+        self._warp_max_unlimited = QCheckBox("Unlimited")
+        self._warp_max_unlimited.setToolTip(
+            "No per-warp limit: any balance may be bridged in one job."
+        )
+        max_row = QHBoxLayout()
+        max_row.addWidget(self._warp_max)
+        max_row.addWidget(self._warp_max_unlimited)
+        max_row.addStretch(1)
+        warp_form.addRow("Max per Warp:", max_row)
+
+        self._warp_keep = QDoubleSpinBox()
+        self._warp_keep.setRange(0.0, 1_000_000.0)
+        self._warp_keep.setSingleStep(5.0)
+        self._warp_keep.setDecimals(3)
+        self._warp_keep.setSuffix(" USDC")
+        self._warp_keep.setToolTip(
+            "USDC always left in the Base hot wallet when the bridge sizes a "
+            "job itself: every automatic bridge, and Bridge now with no "
+            "amount typed. A typed amount is bridged as typed. "
+            "(warp.keep_usdc_on_base; 0 = bridge everything.)"
+        )
+        warp_form.addRow("Keep on Base:", self._warp_keep)
+
+        self._warp_caps_warn = QLabel()
+        self._warp_caps_warn.setWordWrap(True)
+        self._warp_caps_warn.setStyleSheet(f"color: {_C.WARNING_YELLOW};")
+        self._warp_caps_warn.setVisible(False)
+        warp_form.addRow("", self._warp_caps_warn)
+
+        self._warp_absent_hint = QLabel(
+            "These apply once a warp: section exists in config.yaml "
+            "(enable the bridge there first)."
+        )
+        self._warp_absent_hint.setWordWrap(True)
+        self._warp_absent_hint.setStyleSheet(
+            f"color: {_C.TEXT_SECONDARY}; font-size: 9pt;"
+        )
+        warp_form.addRow("", self._warp_absent_hint)
+
+        layout.addWidget(warp_group)
         layout.addStretch(1)
+
+        # Warp state loaded from disk: whether a warp: section exists (the
+        # bridge keys are only written then), and its rebalance block (kept
+        # whole except the ETH band this page owns).
+        self._warp_section_present = False
+        self._loaded_rebalance: Optional[dict] = None
+
+        # Loaded values as written on disk, and which numeric fields the
+        # operator has touched since: an untouched field is written back
+        # VERBATIM, so a value the spin box cannot represent exactly (more
+        # decimals, outside its range) is never silently changed by an
+        # unrelated save.
+        self._warp_loaded_raw: dict[str, Any] = {}
+        self._warp_edited: set[str] = set()
+        for key, sb in (("min_auto_bridge_usdc", self._warp_min_auto),
+                        ("max_auto_bridge_usdc", self._warp_max),
+                        ("keep_usdc_on_base", self._warp_keep),
+                        ("eth.target", self._eth_reserve_target),
+                        ("eth.tolerance_pct", self._eth_reserve_tol)):
+            sb.valueChanged.connect(
+                lambda _v, k=key: self._warp_edited.add(k))
+        for cb in (self._warp_auto_bridge, self._warp_max_unlimited,
+                   self._eth_auto_topup):
+            cb.stateChanged.connect(lambda _s, ti=5: self._mark_dirty(ti))
+            cb.stateChanged.connect(lambda _s: self._refresh_warp_controls())
+        for sb in (self._warp_min_auto, self._warp_max, self._warp_keep,
+                   self._eth_reserve_target, self._eth_reserve_tol):
+            sb.valueChanged.connect(lambda _v, ti=5: self._mark_dirty(ti))
+            sb.valueChanged.connect(lambda _v: self._refresh_warp_controls())
+        self._refresh_warp_controls()
 
         # Wire dirty tracking (tab index 5).
         self._fees_enabled.stateChanged.connect(
@@ -3031,6 +3180,11 @@ class SettingsWidget(QWidget):
         cfg["warp"] = {
             "min_base_eth": self._min_base_eth.value(),
         }
+        # [WARP-GUI 2026-10-24] The bridge keys only when a warp: section
+        # exists on disk -- writing caps into a config that never enabled the
+        # bridge would invent settings nobody chose.
+        if self._warp_section_present:
+            cfg["warp"].update(self._collect_warp_bridge())
 
         # -- inventory_aging --
         cfg["inventory_aging"] = {
@@ -3344,6 +3498,7 @@ class SettingsWidget(QWidget):
             self._min_base_eth.setValue(
                 float(warp.get("min_base_eth", 0.005))
             )
+            self._populate_warp_bridge(cfg.get("warp"))
 
             # -- inventory_aging --
             aging = cfg.get("inventory_aging", {})
@@ -3381,6 +3536,207 @@ class SettingsWidget(QWidget):
 
         finally:
             self._block_all_signals(False)
+
+    # ===================================================================
+    # warp.green bridge + ETH fee reserve (Fees & Reserves tab)
+    # ===================================================================
+
+    #: The bridge's relay-gas floor (service._MIN_GAS_WEI), in ETH. The
+    #: rebalancer refuses an ETH band whose bottom is at or below it, or whose
+    #: half-width is under twice it.
+    _RELAY_GAS_FLOOR_ETH: Final[float] = 0.0003
+
+    def _eth_band_error(self) -> str:
+        """Why the ETH fee-reserve band would be refused, or "" if fine.
+
+        Judged by the rebalancer's OWN parser on the values exactly as they
+        will be written (rounded the way _collect_warp_bridge rounds them),
+        so the GUI can never pass a band the runtime then rejects -- its
+        integer-wei truncation included.
+        """
+        if not self._eth_auto_topup.isChecked():
+            return ""
+        from gui.services.warp import rebalance as rb
+
+        band = {"target": self._warp_value(
+                    "eth.target", round(self._eth_reserve_target.value(), 4)),
+                "tolerance_pct": self._warp_value(
+                    "eth.tolerance_pct", round(self._eth_reserve_tol.value(), 1))}
+        try:
+            rb.parse_rebalance_config(
+                {"rebalance": {"enabled": True, "eth": band}},
+                min_gas_wei=int(round(self._RELAY_GAS_FLOOR_ETH * 10 ** 18)),
+            )
+        except rb.RebalanceConfigError as exc:
+            msg = str(exc).replace("warp.rebalance.eth", "ETH fee reserve")
+            return (f"ETH fee reserve rejected by the rebalancer: {msg}. Raise "
+                    "the target or adjust the tolerance.")
+        return ""
+
+    def _refresh_warp_controls(self) -> None:
+        """Enablement and the inline warnings for the warp fields."""
+        present = bool(getattr(self, "_warp_section_present", False))
+        for w in (self._warp_auto_bridge, self._warp_min_auto, self._warp_max,
+                  self._warp_max_unlimited, self._warp_keep,
+                  self._eth_auto_topup):
+            w.setEnabled(present)
+        self._warp_absent_hint.setVisible(not present)
+        unlimited = self._warp_max_unlimited.isChecked()
+        self._warp_max.setEnabled(present and not unlimited)
+        topup = present and self._eth_auto_topup.isChecked()
+        self._eth_reserve_target.setEnabled(topup)
+        self._eth_reserve_tol.setEnabled(topup)
+
+        warn = ""
+        if (present and self._warp_auto_bridge.isChecked() and not unlimited
+                and self._warp_min_auto.value() > self._warp_max.value()):
+            warn = (
+                f"The auto-bridge minimum ({self._warp_min_auto.value():g} USDC) "
+                f"is above the max per warp ({self._warp_max.value():g} USDC), "
+                "so automatic bridging can never start."
+            )
+        band = self._eth_band_error() if present else ""
+        text = "\n".join(t for t in (warn, band) if t)
+        self._warp_caps_warn.setText(text)
+        self._warp_caps_warn.setVisible(bool(text))
+
+    def _populate_warp_bridge(self, warp: Any) -> None:
+        """Load the bridge + fee-reserve fields from a config's warp block."""
+        self._warp_section_present = isinstance(warp, dict)
+        warp = warp if isinstance(warp, dict) else {}
+        self._warp_edited = set()
+        self._warp_loaded_raw = {}
+        for key in ("min_auto_bridge_usdc", "max_auto_bridge_usdc",
+                    "keep_usdc_on_base"):
+            raw_v = warp.get(key)
+            # Numbers only: "unlimited" is the checkbox's, and unticking it
+            # must write the spin box's value, not the string back.
+            if isinstance(raw_v, (int, float)) and not isinstance(raw_v, bool):
+                self._warp_loaded_raw[key] = raw_v
+        reb_raw = warp.get("rebalance")
+        eth_raw = reb_raw.get("eth") if isinstance(reb_raw, dict) else None
+        if isinstance(eth_raw, dict):
+            for key in ("target", "tolerance_pct"):
+                if eth_raw.get(key) is not None:
+                    self._warp_loaded_raw[f"eth.{key}"] = eth_raw.get(key)
+
+        _flag = self._warp_flag
+
+        def _num(value: Any, default: float) -> float:
+            try:
+                out = float(value)
+            except (TypeError, ValueError):
+                return default
+            return default if math.isnan(out) else out
+
+        self._warp_auto_bridge.setChecked(_flag(warp.get("auto_bridge"), False))
+        self._warp_min_auto.setValue(_num(warp.get("min_auto_bridge_usdc"), 0.0))
+        raw_cap = warp.get("max_auto_bridge_usdc")
+        unlimited = isinstance(raw_cap, str) and raw_cap.strip().lower() == "unlimited"
+        self._warp_max_unlimited.setChecked(unlimited)
+        if not unlimited:
+            self._warp_max.setValue(_num(raw_cap, 5.0))
+        self._warp_keep.setValue(_num(warp.get("keep_usdc_on_base"), 0.0))
+
+        reb = warp.get("rebalance")
+        self._loaded_rebalance = reb if isinstance(reb, dict) else None
+        eth = (reb or {}).get("eth") if isinstance(reb, dict) else None
+        reb_on = isinstance(reb, dict) and _flag(reb.get("enabled"), False)
+        self._eth_auto_topup.setChecked(bool(reb_on and isinstance(eth, dict)))
+        if isinstance(eth, dict):
+            self._eth_reserve_target.setValue(_num(eth.get("target"), 0.01))
+            self._eth_reserve_tol.setValue(_num(eth.get("tolerance_pct"), 20.0))
+        self._refresh_warp_controls()
+
+    def _warp_value(self, key: str, shown: Any) -> Any:
+        """*shown* if the operator edited *key*, else the loaded value."""
+        if key not in getattr(self, "_warp_edited", set()) and key in getattr(
+                self, "_warp_loaded_raw", {}):
+            return self._warp_loaded_raw[key]
+        return shown
+
+    def _collect_warp_bridge(self) -> dict:
+        """The warp keys this page owns, for deep-merge onto the on-disk block."""
+        out: dict[str, Any] = {
+            "auto_bridge": self._warp_auto_bridge.isChecked(),
+            "min_auto_bridge_usdc": self._warp_value(
+                "min_auto_bridge_usdc", round(self._warp_min_auto.value(), 3)),
+            "max_auto_bridge_usdc": (
+                "unlimited" if self._warp_max_unlimited.isChecked()
+                else self._warp_value(
+                    "max_auto_bridge_usdc", round(self._warp_max.value(), 3))
+            ),
+            "keep_usdc_on_base": self._warp_value(
+                "keep_usdc_on_base", round(self._warp_keep.value(), 3)),
+        }
+        existing = self._loaded_rebalance
+        has_usdc = isinstance(existing, dict) and isinstance(
+            existing.get("usdc"), dict)
+        # Read "enabled" the way the runtime does (true/1/"true"), so a USDC
+        # band switched on as `enabled: "true"` is not saved back as off.
+        if self._eth_auto_topup.isChecked():
+            out["rebalance"] = {
+                "enabled": True,
+                "eth": {
+                    "target": self._warp_value(
+                        "eth.target",
+                        round(self._eth_reserve_target.value(), 4)),
+                    "tolerance_pct": self._warp_value(
+                        "eth.tolerance_pct",
+                        round(self._eth_reserve_tol.value(), 1)),
+                },
+            }
+        elif isinstance(existing, dict):
+            # Unticked: drop the ETH band this page owns. A hand-configured
+            # USDC band stays exactly as it was (on, if it was on).
+            enabled = self._warp_flag(existing.get("enabled"), False)
+            out["rebalance"] = {"enabled": bool(enabled and has_usdc),
+                                "eth": None}
+        return out
+
+    @staticmethod
+    def _warp_flag(value: Any, default: bool) -> bool:
+        """A warp boolean as the runtime parsers read it: True/False, 0/1,
+        or the strings "true"/"false" (blank keeps *default*). Anything else
+        keeps *default* rather than guessing."""
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int) and value in (0, 1):
+            return bool(value)
+        if isinstance(value, str):
+            spelled = value.strip().lower()
+            if spelled in ("true", "false"):
+                return spelled == "true"
+        return default
+
+    def _merged_rebalance_error(self) -> str:
+        """Why the rebalance block as it would land ON DISK would be refused.
+
+        The page writes only the keys it owns and the deep merge keeps the
+        rest (a USDC band, cooldown_s, ...), so ticking Auto top-up can
+        enable a block whose PRESERVED parts are invalid -- and a refused
+        block stops every automatic bridge. Validate the merged result with
+        the runtime's own parser.
+        """
+        if not self._warp_section_present:
+            return ""
+        edit = self._collect_warp_bridge().get("rebalance")
+        if not isinstance(edit, dict) or not edit.get("enabled"):
+            return ""
+        from gui.services.config_split import deep_merge
+        from gui.services.warp import rebalance as rb
+
+        merged = copy.deepcopy(self._loaded_rebalance or {})
+        deep_merge(merged, copy.deepcopy(edit))
+        try:
+            rb.parse_rebalance_config(
+                {"rebalance": merged},
+                min_gas_wei=int(round(self._RELAY_GAS_FLOOR_ETH * 10 ** 18)),
+            )
+        except rb.RebalanceConfigError as exc:
+            return (f"warp.rebalance would be rejected after saving: {exc}. "
+                    "Fix it in config.yaml or untick Auto top-up.")
+        return ""
 
     def _block_all_signals(self, block: bool) -> None:
         """Block or unblock signals on all tracked input widgets.
@@ -3437,6 +3793,11 @@ class SettingsWidget(QWidget):
             # CoinGecko
             self._cg_enabled, self._cg_coin_ids, self._cg_polling_interval,
             self._cg_api_key,
+            # warp.green bridge + ETH fee reserve
+            self._warp_auto_bridge, self._warp_min_auto, self._warp_max,
+            self._warp_max_unlimited, self._warp_keep,
+            self._eth_auto_topup, self._eth_reserve_target,
+            self._eth_reserve_tol,
         ]
         for w in widgets_to_block:
             w.blockSignals(block)
@@ -4039,6 +4400,26 @@ class SettingsWidget(QWidget):
             "Dexie API base URL is required.",
         )
 
+        # -- warp: an ETH fee-reserve band the rebalancer would refuse --
+        # A refused band does not just skip the top-up: the rebalancer fails
+        # closed and stands every automatic bridge down with it.
+        eth_band_err = self._eth_band_error()
+        _set_valid(self._eth_reserve_target, not eth_band_err, eth_band_err)
+        # A zero auto-bridge minimum means NO automatic bridging (the auto
+        # job and the rebalancer's leg both treat it so); refuse it while
+        # Auto-bridge is ticked rather than save a setting that contradicts it.
+        if self._warp_section_present and self._warp_auto_bridge.isChecked():
+            min_ok = self._warp_min_auto.value() >= 0.002
+            _set_valid(
+                self._warp_min_auto, min_ok,
+                "" if min_ok else (
+                    "Auto-bridge Minimum must be at least 0.002 USDC while "
+                    "Auto-bridge is on (0 would mean no automatic bridging)."),
+            )
+        if not eth_band_err:
+            merged_err = self._merged_rebalance_error()
+            _set_valid(self._eth_auto_topup, not merged_err, merged_err)
+
         # -- Risk: soft < hard --
         soft_ok = self._soft_limit.value() < self._hard_limit.value()
         _set_valid(
@@ -4412,6 +4793,15 @@ class SettingsWidget(QWidget):
         # so subsequent saves keep preserving unmanaged keys.
         self._config_path = str(resolved)
         self._clean_snapshot = copy.deepcopy(cfg)
+        # [WARP-GUI] The rebalance block just written is the new baseline:
+        # unticking Auto top-up on a later save must see THIS block, or it
+        # would write nothing and the deep merge would keep the band on.
+        saved_warp = cfg.get("warp") if isinstance(cfg, dict) else None
+        self._warp_section_present = isinstance(saved_warp, dict)
+        saved_reb = (saved_warp or {}).get("rebalance") if isinstance(
+            saved_warp, dict) else None
+        self._loaded_rebalance = (copy.deepcopy(saved_reb)
+                                  if isinstance(saved_reb, dict) else None)
         # [RATIO-SOT] Show what hit disk, and make it the baseline, so a later
         # save cannot re-apply this save's edits over a newer on-disk value.
         self._rebase_ratio_cells(merged_targets)

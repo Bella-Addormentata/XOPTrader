@@ -254,6 +254,17 @@ class WarpParams:
     # operator is told to refuel BEFORE jobs start refusing. 0 disables the
     # warning.
     min_base_eth: float = 0.005
+    # USDC to leave on Base whenever the bridge sizes a job itself: every
+    # automatic bridge, and a Bridge now with no amount typed. A typed
+    # amount is the operator's explicit choice and is not reduced by it.
+    # 0 (the default) keeps the old behaviour: bridge the whole balance.
+    keep_usdc_micros: int = 0
+
+
+#: The smallest inbound bridge, in wrapped-CAT mojos. ERC20Bridge's tip is at
+#: least one mojo and the contract requires amount > tip
+#: (evm.post_tip_amount), so one mojo can never bridge.
+_MIN_BRIDGE_MOJOS: int = 2
 
 
 def _parse_unwrap_cap(warp: dict) -> int:
@@ -441,6 +452,9 @@ def warp_params_from_config(config: Optional[dict]) -> WarpParams:
         min_base_eth=_parse_non_negative_float(
             "min_base_eth", warp.get("min_base_eth"), 0.005
         ),
+        keep_usdc_micros=int(round(_parse_non_negative_float(
+            "keep_usdc_on_base", warp.get("keep_usdc_on_base"), 0.0
+        ) * scale)),
     )
 
 
@@ -1044,7 +1058,30 @@ class WarpEngine:
 
         have = self._evm.get_erc20_balance(spec.erc20_address, self._hot_address)
         target = job.state.get("target_micros")
-        want = min(int(target), have) if target else have
+        exact = bool(job.state.get("exact")) and bool(target)
+        if exact:
+            # A typed amount is bridged as typed: wait for the balance to
+            # cover it rather than bridge whatever happens to be there --
+            # and never clamp it to a cap lowered while it waited.
+            if p.max_micros > 0 and int(target) > p.max_micros:
+                raise WarpPending(
+                    f"the requested {int(target)} micros is above the current "
+                    f"per-warp cap ({p.max_micros}); raise "
+                    "warp.max_auto_bridge_usdc or cancel this job"
+                )
+            if have < int(target):
+                raise WarpPending(
+                    f"awaiting a {spec.symbol} balance of {int(target)} micros "
+                    f"for the requested amount (have {have})"
+                )
+            want = int(target)
+            keep = 0
+        else:
+            # Everything the bridge sizes itself leaves warp.keep_usdc_on_base
+            # behind (automatic jobs, rebalance jobs, a blank Bridge now).
+            keep = max(0, int(getattr(p, "keep_usdc_micros", 0) or 0))
+            avail = max(0, have - keep)
+            want = min(int(target), avail) if target else avail
 
         # max_micros is the blast radius and binds everything, manual included:
         # it is what makes a mis-click on a large balance survivable, and what
@@ -1058,7 +1095,33 @@ class WarpEngine:
         # against the shipped default of 100 USDC. An unflagged legacy row is
         # treated as automatic, i.e. the conservative side.
         manual = bool(job.state.get("manual"))
+        # A REBALANCE job whose bridgeable amount fell below what it may move
+        # (the keep floor, or a balance that dropped while it waited) is
+        # closed, not left pending: a pending job holds the single active
+        # slot and would block every gas top-up behind it.
+        if job.state.get("rebalance") and want < max(
+                p.min_micros,
+                _MIN_BRIDGE_MOJOS * 10 ** (net.usdc_decimals - net.cat_decimals)):
+            return _advance(
+                JobStatus.CANCELLED,
+                message=(
+                    f"rebalance bridge no longer needed: {want} micros "
+                    f"bridgeable (balance {have}, {keep} kept on Base) is "
+                    "below the minimum"
+                ),
+            )
+        mojo_micros = 10 ** (net.usdc_decimals - net.cat_decimals)
+        if 0 < want < _MIN_BRIDGE_MOJOS * mojo_micros:
+            raise WarpPending(
+                f"{want} micros bridgeable is below the {_MIN_BRIDGE_MOJOS}-mojo "
+                "minimum the bridge's tip leaves room for (have "
+                f"{have}, {keep} kept on Base)"
+            )
         if want <= 0:
+            if keep > 0 and have > 0:
+                raise WarpPending(
+                    f"awaiting a {spec.symbol} deposit above the {keep} micros "
+                    f"kept on Base (have {have})")
             raise WarpPending(
                 f"awaiting a {spec.symbol} deposit (have {have})")
         if not manual and p.min_micros > 0 and want < p.min_micros:
@@ -3089,7 +3152,9 @@ class WarpEngine:
             balance = self._evm.get_erc20_balance(net.usdc_address, self._hot_address)
         except Exception:  # noqa: BLE001 -- transient RPC; try again next tick
             return None
-        if balance < p.min_micros:
+        # Only what sits above the keep-on-Base floor is bridgeable.
+        keep = max(0, int(getattr(p, "keep_usdc_micros", 0) or 0))
+        if balance - keep < p.min_micros:
             return None
         job = self._store.create_job(
             net.name,
@@ -3109,7 +3174,39 @@ class WarpEngine:
         ``min_auto_bridge_usdc`` -- that floor exists to stop *automatic* dust
         bridging and has no meaning for an explicit click. ``max_auto_bridge_usdc``
         still applies; see :meth:`_h_awaiting_deposit`.
+
+        A manual ``target_micros`` is a typed amount: bridged EXACTLY (the job
+        waits until the balance covers it), not reduced by
+        ``keep_usdc_on_base``, and refused here -- not silently clamped --
+        when it exceeds the cap or is below one wUSDC.b mojo.
         """
+        # None is the blank Bridge now; any number -- zero included -- is a
+        # typed amount and must pass the checks below.
+        exact = target_micros is not None and not automatic
+        if exact:
+            micros = int(target_micros)
+            mojo_micros = 10 ** (self._net.usdc_decimals - self._net.cat_decimals)
+            if micros % mojo_micros:
+                raise WarpError(
+                    "bridge amount must be a whole number of wUSDC.b mojos "
+                    f"(multiples of {mojo_micros} micro-USDC, i.e. 0.001 USDC)"
+                )
+            # The bridge's tip is at least one mojo and must leave one, so a
+            # single mojo can never bridge -- and a typed amount does not
+            # shrink, so such a job would hold the slot forever.
+            if micros < _MIN_BRIDGE_MOJOS * mojo_micros:
+                raise WarpError(
+                    f"bridge amount must be at least {_MIN_BRIDGE_MOJOS} "
+                    f"wUSDC.b mojos ({_MIN_BRIDGE_MOJOS * mojo_micros} "
+                    "micro-USDC): the bridge's tip takes at least one"
+                )
+            cap = int(self._params.max_micros or 0)
+            if cap > 0 and micros > cap:
+                raise WarpError(
+                    f"bridge amount of {micros} micro-USDC exceeds "
+                    f"warp.max_auto_bridge_usdc ({cap}); refusing rather than "
+                    "clamping"
+                )
         active = self._store.get_active_job()
         if active is not None:
             raise WarpError(
@@ -3130,8 +3227,10 @@ class WarpEngine:
             state = {"manual": True, **_asset_stamp(self._net.asset("USDC"),
                             self._net.cat_decimals),
                      **self._binding()}
-        if target_micros:
+        if target_micros is not None:
             state["target_micros"] = int(target_micros)
+        if exact:
+            state["exact"] = True
         job = self._store.create_job(
             self._net.name,
             status=JobStatus.AWAITING_DEPOSIT,
@@ -3755,6 +3854,7 @@ class WarpEngine:
             # against the CONFIGURED floor instead of a hardcoded constant
             # that could not be raised for a busier wallet.
             "min_base_eth_wei": int(self._params.min_base_eth * 10 ** 18),
+            "keep_usdc_micros": int(getattr(self._params, "keep_usdc_micros", 0) or 0),
             "altruistic_relay": {
                 "enabled": self._relayer is not None,
                 "dry_run": self._params.dry_run,
@@ -4012,7 +4112,9 @@ class _WarpWorker(QObject):
         # job pends forever holding the single slot, and the milliETH
         # refuel that would have fixed the gas can never run -- a deadlock
         # whose only exit is an operator. An enabled rebalancer therefore
-        # owns automatic bridging outright.
+        # owns automatic bridging outright -- and with no USDC band it
+        # still honours warp.auto_bridge, as its lowest-priority leg
+        # (rb.plan's auto_bridge_floor_micros), AFTER any gas action.
         return bool(self._rebalance_params.enabled)
 
     def _wallet_settled(self, engine: "WarpEngine") -> bool:
@@ -4094,6 +4196,14 @@ class _WarpWorker(QObject):
                 max_bridge_micros=int(ep.max_micros or 0),
                 max_unwrap_micros=int(ep.max_unwrap_micros),
                 min_bridge_micros=int(ep.min_micros or 0),
+                # warp.auto_bridge without a USDC band: the legacy auto
+                # bridge, run here so a gas refuel always goes first.
+                auto_bridge_floor_micros=(
+                    int(getattr(ep, "keep_usdc_micros", 0) or 0)
+                    if getattr(ep, "auto_bridge", False) else None
+                ),
+                # And a USDC band never plans to bridge into the keep floor.
+                keep_usdc_micros=int(getattr(ep, "keep_usdc_micros", 0) or 0),
             )
             if action is None:
                 return

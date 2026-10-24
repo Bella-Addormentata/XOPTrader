@@ -311,12 +311,67 @@ def test_explorer_urls_mainnet(qapp):
 # ---------------------------------------------------------------------------
 
 def test_bridge_now_emits_signal(qapp):
+    """A blank amount asks for the balance: the signal carries None."""
     w = _make(qapp, _full())
-    fired: list[bool] = []
-    w.bridge_now_requested.connect(lambda: fired.append(True))
+    fired: list[object] = []
+    w.bridge_now_requested.connect(lambda amount: fired.append(amount))
     assert w._bridge_btn.isEnabled()
     w._bridge_btn.click()
-    assert fired == [True]
+    assert fired == [None]
+
+
+def test_bridge_now_emits_a_typed_amount_in_micro_usdc(qapp):
+    w = _make(qapp, _full())
+    fired: list[object] = []
+    w.bridge_now_requested.connect(lambda amount: fired.append(amount))
+    w._bridge_amount.setText("2.5")
+    w._bridge_btn.click()
+    assert fired == [2_500_000]
+    assert w._bridge_amount.text() == "", "cleared once sent"
+    assert not w._bridge_err.isVisible()
+
+
+@pytest.mark.parametrize("text", ["abc", "-1", "0", "1.0005", "nan", "inf", "0.001"])
+def test_bridge_now_refuses_a_bad_amount_on_the_spot(qapp, text):
+    w = _make(qapp, _full())
+    fired: list[object] = []
+    w.bridge_now_requested.connect(lambda amount: fired.append(amount))
+    w._bridge_amount.setText(text)
+    w._bridge_btn.click()
+    assert fired == []
+    assert w._bridge_err.isVisible() and w._bridge_err.text()
+
+
+def test_bridge_now_refuses_an_amount_above_the_per_warp_cap(qapp):
+    w = _make(qapp, _full(max_micros=5_000_000))   # 5 USDC cap
+    fired: list[object] = []
+    w.bridge_now_requested.connect(lambda amount: fired.append(amount))
+    w._bridge_amount.setText("5.001")
+    w._bridge_btn.click()
+    assert fired == []
+    assert "max per warp" in w._bridge_err.text()
+    w._bridge_amount.setText("5")
+    w._bridge_btn.click()
+    assert fired == [5_000_000]
+    assert not w._bridge_err.isVisible()
+
+
+def test_the_keep_on_base_floor_is_described(qapp):
+    w = _make(qapp, _full(keep_usdc_micros=20_000_000))
+    assert "20" in w._auto_lbl.text() and "left on Base" in w._auto_lbl.text()
+    w2 = _make(qapp, _full())
+    assert "left on Base" not in w2._auto_lbl.text()
+
+
+def test_an_auto_minimum_above_the_cap_is_flagged(qapp):
+    """min 100 > max 5 (today's live config): auto-bridge can never fire."""
+    w = _make(qapp, _full(min_micros=100_000_000, max_micros=5_000_000))
+    assert "can never start" in w._auto_lbl.text()
+    ok = _make(qapp, _full(min_micros=1_000_000, max_micros=5_000_000))
+    assert "can never start" not in ok._auto_lbl.text()
+    off = _make(qapp, _full(auto_bridge=False, min_micros=100_000_000,
+                            max_micros=5_000_000))
+    assert "can never start" not in off._auto_lbl.text()
 
 
 def test_job_action_signal_shape(qapp):
@@ -459,3 +514,76 @@ def test_unwrap_amount_parser_never_rounds_or_crashes(qapp):
     w._unwrap_btn.click()
     assert got == [(1, "0x" + "ab" * 20, False),
                    (5001, "0x" + "ab" * 20, False)]
+
+
+# ---------------------------------------------------------------------------
+# [WARP-GUI] The low-gas alert: shared predicate + once-per-crossing in the
+# main window.
+# ---------------------------------------------------------------------------
+
+def test_low_gas_predicate():
+    low = warp_mod.low_gas
+    assert low(_full(hot_wallet=_hot(eth_wei=10 ** 15),
+                     min_base_eth_wei=5 * 10 ** 15)) == (10 ** 15, 5 * 10 ** 15)
+    assert low(_full(hot_wallet=_hot(eth_wei=6 * 10 ** 15),
+                     min_base_eth_wei=5 * 10 ** 15)) is None
+    assert low(_full(hot_wallet=_hot(eth_wei=10 ** 15),
+                     min_base_eth_wei=0)) is None, "0 switches the warning off"
+    assert low(_full(enabled=False, hot_wallet=_hot(eth_wei=1))) is None
+    assert low(_full(hot_wallet=_hot(error="rpc down", eth_wei=1))) is None
+    assert low({}) is None and low(None) is None
+
+
+def test_main_window_alerts_once_per_crossing():
+    from types import SimpleNamespace
+
+    from gui.widgets.main_window import MainWindow
+
+    shown: list[str] = []
+    fake = SimpleNamespace(
+        _warp_low_gas=False,
+        statusBar=lambda: SimpleNamespace(
+            showMessage=lambda msg, _ms=0: shown.append(msg)),
+    )
+    low = _full(hot_wallet=_hot(eth_wei=10 ** 15), min_base_eth_wei=5 * 10 ** 15)
+    ok = _full(hot_wallet=_hot(eth_wei=10 ** 16), min_base_eth_wei=5 * 10 ** 15)
+    MainWindow._check_warp_low_gas(fake, low)
+    MainWindow._check_warp_low_gas(fake, low)
+    assert len(shown) == 1 and "Low Base gas" in shown[0]
+    MainWindow._check_warp_low_gas(fake, ok)
+    MainWindow._check_warp_low_gas(fake, low)
+    assert len(shown) == 2, "re-armed once the balance recovered"
+
+
+def test_main_window_alert_latch_survives_an_unreadable_balance():
+    """Review: low -> RPC error -> low is ONE episode, not two alerts."""
+    from types import SimpleNamespace
+
+    from gui.widgets.main_window import MainWindow
+
+    shown: list[str] = []
+    fake = SimpleNamespace(
+        _warp_low_gas=False,
+        statusBar=lambda: SimpleNamespace(
+            showMessage=lambda msg, _ms=0: shown.append(msg)),
+    )
+    low = _full(hot_wallet=_hot(eth_wei=10 ** 15), min_base_eth_wei=5 * 10 ** 15)
+    err = _full(hot_wallet=_hot(error="rpc down"), min_base_eth_wei=5 * 10 ** 15)
+    off = _full(hot_wallet=_hot(eth_wei=10 ** 15), min_base_eth_wei=0)
+    MainWindow._check_warp_low_gas(fake, low)
+    MainWindow._check_warp_low_gas(fake, err)
+    MainWindow._check_warp_low_gas(fake, low)
+    assert len(shown) == 1
+    MainWindow._check_warp_low_gas(fake, off)       # explicit disablement re-arms
+    MainWindow._check_warp_low_gas(fake, low)
+    assert len(shown) == 2
+
+
+def test_bridge_now_refuses_an_absurdly_large_amount_cleanly(qapp):
+    w = _make(qapp, _full())
+    fired: list[object] = []
+    w.bridge_now_requested.connect(lambda amount: fired.append(amount))
+    w._bridge_amount.setText("1e309")
+    w._bridge_btn.click()
+    assert fired == []
+    assert "too large" in w._bridge_err.text()

@@ -1444,6 +1444,8 @@ warp:
   auto_bridge: false                     # [OPTIONAL, default: false] bridge deposits automatically
   min_auto_bridge_usdc: 100              # [OPTIONAL] AUTO-bridge floor only; "Bridge now" ignores it
   max_auto_bridge_usdc: 10000            # [REQUIRED when enabled] blast-radius cap, manual included; 'unlimited' to opt out
+  keep_usdc_on_base: 0                   # [OPTIONAL, default: 0] USDC always left on Base when the bridge sizes a job itself
+                                         #   (automatic bridges, and Bridge now with no amount typed); a typed amount is bridged as typed
 
   # Target-band rebalancer (optional; ships inert). Keeps the Base hot
   # wallet at stated targets: excess USDC auto-bridges to Chia, a USDC
@@ -1455,9 +1457,11 @@ warp:
   # its half-width must be at least twice that floor (gas-churn guard).
   # USDC tolerance_pct must be at least 1 (the band must absorb the
   # 0.3% unwrap tip) and the half-width at least 0.001 USDC (one mojo).
-  # While enabled, the rebalancer OWNS automatic bridging: auto_bridge
-  # above stands down, and bridging happens per the usdc band (so with an
-  # eth-only band, USDC moves only on an operator's "Bridge now").
+  # While enabled, the rebalancer OWNS automatic bridging: the legacy
+  # auto job stands down and bridging happens per the usdc band. With an
+  # eth-only band, auto_bridge still works -- the rebalancer bridges what
+  # sits above keep_usdc_on_base as its last leg, after any gas action.
+  # Settings -> Fees & Reserves edits the eth band (ETH fee reserve).
   # ROLLOUT: leave the usdc block off until the first live 0.001-USDC
   # micro-unwrap protocol test has succeeded -- the deficit leg fires
   # real burns. The ETH block and the excess-bridge leg are safe first.

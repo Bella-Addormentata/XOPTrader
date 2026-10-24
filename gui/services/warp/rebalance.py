@@ -42,6 +42,9 @@ _WRAP_GRANULARITY_WEI = 10 ** 12
 _WEI_PER_MILLIETH_UNIT = 10 ** 12
 #: wUSDC.b mojos per USDC micro-unit factor (6 ERC-20 decimals -> 3 CAT).
 _USDC_MICROS_PER_MOJO = 1000
+#: The smallest bridge the pipeline can complete: ERC20Bridge's inbound tip
+#: is at least one mojo and must leave one (service._MIN_BRIDGE_MOJOS).
+_MIN_BRIDGE_MICROS = 2 * _USDC_MICROS_PER_MOJO
 #: ERC20Bridge.tip() in basis points -- immutable on the deployed contract
 #: (a redeploy is refused by the anchor gates), which is what lets the
 #: deficit leg gross requests up by a constant instead of a chain read.
@@ -257,6 +260,8 @@ def plan(
     max_bridge_micros: int,
     max_unwrap_micros: int,
     min_bridge_micros: int,
+    auto_bridge_floor_micros: Optional[int] = None,
+    keep_usdc_micros: int = 0,
 ) -> Optional[RebalanceAction]:
     """At most one action moving one balance back to its target.
 
@@ -264,6 +269,12 @@ def plan(
     existing pipeline caps, and enforces every execution-time rail (job slot,
     unmined guard, cooldown). Priority is gas safety first (ETH deficit),
     then restoring the USDC reserve, then shedding excess.
+
+    ``auto_bridge_floor_micros`` is warp.auto_bridge when no USDC band is
+    configured (None = auto-bridge off): everything above that floor
+    (warp.keep_usdc_on_base) is bridged, as the LAST leg -- so enabling an
+    ETH band for gas top-ups no longer switches automatic bridging off, and
+    a gas refuel still always goes first.
     """
     if not params.enabled:
         return None
@@ -322,17 +333,38 @@ def plan(
     # 4. USDC excess: bridge it to Chia as trading float. Honors both the
     #    auto floor (no dust jobs) and the blast-radius cap.
     if params.usdc is not None and usdc_micros > params.usdc.high:
-        excess = usdc_micros - params.usdc.target
+        # Never into warp.keep_usdc_on_base: a floor above the target would
+        # otherwise plan a bridge the job then sizes to zero, and that
+        # pending job would hold the single slot against gas top-ups.
+        excess = usdc_micros - max(params.usdc.target, int(keep_usdc_micros))
         if max_bridge_micros > 0:
             excess = min(excess, max_bridge_micros)
         # The protocol floor is one CAT mojo (1000 micros), not one micro:
         # a sub-mojo job would sit pending forever, squatting the single
         # active-job slot.
-        if excess >= max(min_bridge_micros, _USDC_MICROS_PER_MOJO):
+        if excess >= max(min_bridge_micros, _MIN_BRIDGE_MICROS):
             return RebalanceAction(
                 "bridge_usdc", int(excess),
                 f"USDC {usdc_micros} above band {params.usdc.high}; bridging "
                 f"{excess} micros toward target {params.usdc.target}",
+            )
+
+    # 5. Auto-bridge without a USDC band: bridge what sits above the
+    #    keep-on-Base floor, under the same auto floor and cap as the
+    #    legacy auto job it replaces while the rebalancer is enabled.
+    # A zero auto-bridge minimum means "no automatic bridging", exactly as
+    # in the legacy auto job (maybe_start_auto_job) this leg stands in for.
+    if (params.usdc is None and auto_bridge_floor_micros is not None
+            and min_bridge_micros > 0):
+        floor = max(0, int(auto_bridge_floor_micros))
+        excess = usdc_micros - floor
+        if max_bridge_micros > 0:
+            excess = min(excess, max_bridge_micros)
+        if excess >= max(min_bridge_micros, _MIN_BRIDGE_MICROS):
+            return RebalanceAction(
+                "bridge_usdc", int(excess),
+                f"auto-bridge: USDC {usdc_micros} above the {floor} kept on "
+                f"Base; bridging {excess} micros",
             )
 
     return None

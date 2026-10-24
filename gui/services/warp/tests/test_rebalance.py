@@ -366,7 +366,10 @@ def test_automatic_jobs_carry_rebalance_provenance_not_manual():
     # resolve descriptors like the real one.
     from gui.services.warp import constants as _C
     eng._net = SimpleNamespace(name="mainnet", asset=_C.MAINNET.asset,
-                               cat_decimals=_C.MAINNET.cat_decimals)
+                               cat_decimals=_C.MAINNET.cat_decimals,
+                               usdc_decimals=_C.MAINNET.usdc_decimals)
+    # A typed (manual) amount is validated against the per-warp cap.
+    eng._params = SimpleNamespace(max_micros=0)
     eng._store = SimpleNamespace(
         get_active_job=lambda: None,
         create_job=lambda name, **kw: created.update(kw) or PermissiveJob(
@@ -521,3 +524,24 @@ def test_a_manual_unwrap_is_never_trimmed():
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def test_an_eth_only_band_still_runs_auto_bridge_above_the_keep_floor():
+    """[WARP-GUI] Turning on the ETH fee reserve used to switch automatic
+    USDC bridging off (the legacy job stands down and an ETH-only band had
+    no USDC leg). The worker now hands warp.auto_bridge to the planner as
+    its last leg, with warp.keep_usdc_on_base left behind."""
+    w = _worker_with(rb.RebalanceParams(
+        enabled=True, eth=rb.AssetBand(target=10 ** 16, tolerance_pct=20)))
+    eng = FakeEngine()                      # 150 USDC, ETH in band
+    eng._params.auto_bridge = True
+    eng._params.keep_usdc_micros = 20_000_000
+    w._maybe_rebalance(eng)
+    assert eng.calls == [("bridge", 130_000_000, True)]
+
+    off = _worker_with(rb.RebalanceParams(
+        enabled=True, eth=rb.AssetBand(target=10 ** 16, tolerance_pct=20)))
+    eng2 = FakeEngine()
+    eng2._params.auto_bridge = False
+    off._maybe_rebalance(eng2)
+    assert eng2.calls == [], "auto_bridge off: USDC still only moves on Bridge now"
