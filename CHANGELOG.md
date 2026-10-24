@@ -5,6 +5,33 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.31] — 2026-10-24 — a Wallet Link page for the Chia wallet and Sage
+
+### Settings → Wallet Link (#188)
+
+A new Settings page holds every wallet the bot can talk to.
+
+**Chia wallet (official).** The Wallet group moves here from the Connection
+tab, with the same widgets and `chia.*` keys. **Detect** reads the local
+Chia install (`CHIA_ROOT`, or `~/.chia/mainnet`) and fills in the wallet RPC
+port, the `private_wallet.crt/.key` paths and, while the field is still 0,
+the last-used fingerprint. **Test Connection** is now a real read-only probe
+(sync status, logged-in fingerprint, XCH balance) that verifies the server
+the way the engine does under `chia.verify_ssl`. The fingerprint field now
+holds the full uint32 range.
+
+**Sage wallet (optional, off by default).** Host, port (127.0.0.1:9257) and
+the `wallet.crt`/`wallet.key` paths, under the new `wallet_link` section
+(`sage_enabled`, `sage_host`, `sage_port`; the cert paths go to
+`secrets.yaml`). **Detect** finds Sage's data folder and reads its
+`config.toml`, saying so when Sage's RPC server is turned off. **Test
+Connection** shows the version, wallet, sync progress and spendable XCH, and
+pins the server to the SHA-256 of Sage's own certificate. The Sage link is
+read-only: trading still goes through the Chia wallet RPC.
+
+A config without `wallet_link` loads with Sage off, and the engine ignores
+the section.
+
 ## [0.10.30] — 2026-10-24 — the ETH fee reserve tops itself up from wmilliETH.b
 
 ### Bridge an exact amount, keep some USDC on Base, set the ETH fee reserve in Settings (#184)
