@@ -635,3 +635,24 @@ def test_settlement_logs_in_first_and_a_failed_login_defers_it():
         w._settle_dexie_takes(eng)
     assert order == []
     assert eng._store.get_take(OUR_TID).status == J.TAKE_SUBMITTED
+
+
+
+def test_an_affordable_partial_ask_beats_an_unaffordable_covering_one(
+        monkeypatch):
+    """[review] 3 XCH spendable, 1 XCH reserved: a 16.5 XCH ask that covers
+    the need must not crowd out the 1.8277 XCH partial one."""
+    big_tid = "bb" * 32
+    _http(monkeypatch, asks=[
+        {"id": "dx1", "trade_id": MAKER_TID, "offer": "offer1qqexample",
+         "status": 0, "offered": [{"id": WM, "amount": 0.547}],
+         "requested": [{"id": "xch", "amount": 1.8277}]},
+        {"id": "dx2", "trade_id": big_tid, "offer": "offer1qqbig",
+         "status": 0, "offered": [{"id": WM, "amount": 5.0}],
+         "requested": [{"id": "xch", "amount": 16.5}]},
+    ])
+    w = _worker(_params(buy=True), {"strategy": {"fee_reserve_xch": 1.0}})
+    eng = FakeEngine(eth_wei=79 * 10 ** 14)      # ~2,107 mojos wanted:
+    eng._wallet.xch_spendable = 3 * 10 ** 12      # only the big ask covers
+    w._maybe_rebalance(eng)
+    assert [offer for offer, _fee in eng._wallet.taken] == ["offer1qqexample"]

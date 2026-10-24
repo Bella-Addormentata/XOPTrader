@@ -4863,11 +4863,19 @@ class _WarpWorker(QObject):
         own = engine._wallet.get_my_open_trade_ids() | (
             engine._store.take_offer_ids())
         # Max XCH per Buy bounds the whole debit: the ask AND our fee.
+        # [review] So does what the wallet can spend above the engine's fee
+        # reserve: a covering ask it cannot afford must not be picked over an
+        # affordable partial one, only to be refused on every cooldown. The
+        # final balance recheck below still runs.
+        keep = _engine_xch_fee_reserve_mojos(self._config)
+        spendable = int(
+            engine._wallet.get_wallet_balance(1).get("spendable_balance") or 0)
+        budget = max(0, min(src.max_spend_xch_mojos, spendable - keep)
+                     - src.take_fee_mojos)
         ask = dx.pick_ask(
             asks, want_mojos=int(want_mojos), reference_xch_per_unit=ref,
             max_premium_pct=src.max_premium_pct,
-            max_spend_xch_mojos=max(
-                0, src.max_spend_xch_mojos - src.take_fee_mojos),
+            max_spend_xch_mojos=budget,
             own_trade_ids=own,
             # [review] Never an ask too small to be worth unwrapping.
             min_mojos=min_mojos)
@@ -4875,8 +4883,9 @@ class _WarpWorker(QObject):
             return (
                 f"rebalance: no Dexie wmilliETH.b ask within "
                 f"{src.max_premium_pct:g}% of CoinGecko ({ref:.4f} XCH each) "
-                f"for at most {src.max_spend_xch_mojos / 10 ** 12:g} XCH; "
-                "nothing bought")
+                f"for at most {budget / 10 ** 12:g} XCH (Max XCH per Buy and "
+                f"the spendable XCH above the engine's {keep / 10 ** 12:g} XCH "
+                "fee reserve, less the take fee); nothing bought")
         dx.verify_offer(engine._wallet, ask, asset_id)
         cost = dx.buy_cost_mojos(ask, src.take_fee_mojos)
         spendable = int(

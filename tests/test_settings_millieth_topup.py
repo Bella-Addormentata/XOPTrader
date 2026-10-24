@@ -207,3 +207,15 @@ def test_a_quoted_reserve_is_shown_and_kept(panel, tmp_path):
         WM: "5.0"}})))
     assert panel._wm_gas_reserve.value() == pytest.approx(5.0)
     assert _out(panel)["strategy"]["asset_reserve_units"] == {WM: "5.0"}
+
+
+
+def test_unticking_unlimited_after_a_save_writes_the_finite_cap(panel, tmp_path):
+    """[review] Save with Unlimited, untick it, save again: the second save
+    must replace "unlimited" on disk, not omit the key."""
+    panel.load_config(str(_cfg(tmp_path, {**LIVE, "rebalance": BAND})))
+    assert "max_unwrap_millieth" not in _out(panel)["warp"]
+    panel._wm_unwrap_unlimited.setChecked(True)
+    assert _out(panel)["warp"]["max_unwrap_millieth"] == "unlimited"
+    panel._wm_unwrap_unlimited.setChecked(False)
+    assert _out(panel)["warp"]["max_unwrap_millieth"] == 10.0

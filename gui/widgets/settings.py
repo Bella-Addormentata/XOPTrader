@@ -2296,6 +2296,13 @@ class SettingsWidget(QWidget):
         self._wm_gas_reserve.valueChanged.connect(
             lambda _v, ti=5: self._mark_dirty(ti))
         self._wm_unwrap_cap_unlimited_loaded = False
+        # [review] Toggling Unlimited is an edit of the cap: unticking it
+        # after a save that wrote "unlimited" must write the finite value,
+        # or the deep merge keeps unlimited unwraps on disk. Reset after
+        # every load (which sets the box itself).
+        self._wm_unwrap_unlimited_toggled = False
+        self._wm_unwrap_unlimited.stateChanged.connect(
+            lambda _s: setattr(self, "_wm_unwrap_unlimited_toggled", True))
         for cb in (self._warp_auto_bridge, self._warp_max_unlimited,
                    self._eth_auto_topup, self._wm_source,
                    self._wm_unwrap_unlimited, self._wm_buy):
@@ -3818,6 +3825,7 @@ class SettingsWidget(QWidget):
         cap_unlimited = isinstance(cap, str) and cap.strip().lower() == "unlimited"
         self._wm_unwrap_cap_unlimited_loaded = cap_unlimited
         self._wm_unwrap_unlimited.setChecked(cap_unlimited)
+        self._wm_unwrap_unlimited_toggled = False
         if not cap_unlimited:
             self._wm_unwrap_cap.setValue(_num(cap, 10.0))
         self._refresh_warp_controls()
@@ -3926,6 +3934,7 @@ class SettingsWidget(QWidget):
         if (newly_on or "max_unwrap_millieth" in self._warp_loaded_raw
                 or "max_unwrap_millieth" in self._warp_edited
                 or self._wm_unwrap_cap_unlimited_loaded
+                or getattr(self, "_wm_unwrap_unlimited_toggled", False)
                 or self._wm_unwrap_unlimited.isChecked()):
             out["max_unwrap_millieth"] = (
                 "unlimited" if self._wm_unwrap_unlimited.isChecked()
