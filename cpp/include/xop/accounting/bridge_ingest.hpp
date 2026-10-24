@@ -494,8 +494,11 @@ struct SecondaryInventoryPlan {
 };
 
 /// How a booked secondary flow reaches the inventory tracker (see the
-/// banner above).  `last_absolute_write_iso` is empty when no absolute
-/// writer has touched the asset in this process.  Fails toward wallet
+/// banner above).  `last_absolute_write_iso` is the last absolute write's
+/// stamp; the engine passes its process start when none happened in this
+/// process, since the persisted quantity it restored may itself come from
+/// an earlier process's absolute write.  Empty means "none, ever" (pure
+/// callers and tests).  Fails toward wallet
 /// truth: a malformed flow floor with any absolute write on record, an
 /// overflowing sum, or a negative result all read the wallet instead.
 [[nodiscard]] inline SecondaryInventoryPlan plan_secondary_inventory(

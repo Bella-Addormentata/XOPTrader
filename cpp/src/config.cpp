@@ -5139,23 +5139,53 @@ AppConfig load_config(const std::string& path,
     // without exposing secrets in log files.
     log_config_summary(cfg);
 
+    const auto traded_by_enabled_pair = [&](const std::string& asset_id) {
+        return std::any_of(
+            cfg.pairs.begin(), cfg.pairs.end(), [&](const auto& pr) {
+                return pr.enabled && (pr.base_asset_id == asset_id
+                                      || pr.quote_asset_id == asset_id);
+            });
+    };
+
+    // [WARP-MILLIETH 2026-10-24] Each secondary bridge asset needs an
+    // enabled pair for the same reason the bridge asset does (below): one
+    // no enabled pair trades gets no ledger opening, so its flows could
+    // never book.  Dropped per asset rather than thrown; only an id the
+    // file listed is worth a warning, since the default (wmilliETH.b) is
+    // dropped on every config that simply does not trade it.  Checked
+    // FIRST, so the shared switch below can tell whether any bridge asset
+    // remains bookable.
+    {
+        auto& ids = cfg.accounting.bridge_secondary_asset_ids;
+        for (auto it = ids.begin(); it != ids.end();) {
+            if (traded_by_enabled_pair(*it)) {
+                ++it;
+                continue;
+            }
+            if (cfg.accounting.bridge_secondary_asset_ids_explicit) {
+                spdlog::warn(
+                    "accounting.bridge_secondary_asset_ids: {}... dropped -- "
+                    "no ENABLED pair trades it, so it would have no ledger "
+                    "opening and its bridge flows could never book",
+                    it->substr(0, 12));
+            }
+            it = ids.erase(it);
+        }
+    }
+
     // [S19 review round 14] Bridge ingestion depends on the bridge asset
     // being tracked: startup builds ledger openings and Step 8 refreshes
     // balances exclusively from ENABLED pairs, so a bridge asset no
     // enabled pair uses would silently never book anything while the
     // feature reports enabled.  Fail loudly instead.
+    // [WARP-MILLIETH review] ...unless a secondary bridge asset is still
+    // traded: the switch is shared, and turning it off would leave that
+    // asset with no booking and no zero opening.  The bridge-asset scan
+    // stands down on its own then (its asset never gets an opening).
     if (cfg.accounting.ledger_enabled
-        && cfg.accounting.bridge_ingest_enabled) {
-        bool tracked = false;
-        for (const auto& pr : cfg.pairs) {
-            if (!pr.enabled) continue;
-            if (pr.base_asset_id == cfg.accounting.bridge_asset_id
-                || pr.quote_asset_id == cfg.accounting.bridge_asset_id) {
-                tracked = true;
-                break;
-            }
-        }
-        if (!tracked) {
+        && cfg.accounting.bridge_ingest_enabled
+        && !traded_by_enabled_pair(cfg.accounting.bridge_asset_id)) {
+        if (cfg.accounting.bridge_secondary_asset_ids.empty()) {
             // Loud auto-disable, not a throw: bridge_ingest_enabled
             // defaults to TRUE, so a hard failure would brick every
             // config that simply does not trade the bridge asset.  The
@@ -5169,35 +5199,11 @@ AppConfig load_config(const std::string& path,
                 "Enable a pair that trades the asset to activate bridge "
                 "accounting.",
                 cfg.accounting.bridge_asset_id.substr(0, 12));
-        }
-    }
-
-    // [WARP-MILLIETH 2026-10-24] The same rule for each secondary bridge
-    // asset, per asset: one no enabled pair trades would get no ledger
-    // opening, so its flows could never book.  Dropped rather than thrown
-    // for the same reason; only an id the file listed is worth a warning,
-    // since the default (wmilliETH.b) is dropped on every config that
-    // simply does not trade it.
-    {
-        auto& ids = cfg.accounting.bridge_secondary_asset_ids;
-        for (auto it = ids.begin(); it != ids.end();) {
-            const bool traded = std::any_of(
-                cfg.pairs.begin(), cfg.pairs.end(), [&](const auto& pr) {
-                    return pr.enabled && (pr.base_asset_id == *it
-                                          || pr.quote_asset_id == *it);
-                });
-            if (traded) {
-                ++it;
-                continue;
-            }
-            if (cfg.accounting.bridge_secondary_asset_ids_explicit) {
-                spdlog::warn(
-                    "accounting.bridge_secondary_asset_ids: {}... dropped -- "
-                    "no ENABLED pair trades it, so it would have no ledger "
-                    "opening and its bridge flows could never book",
-                    it->substr(0, 12));
-            }
-            it = ids.erase(it);
+        } else {
+            spdlog::warn(
+                "accounting.bridge_asset_id ({}...): no ENABLED pair trades "
+                "it, so its bridge flows cannot book; the secondary bridge "
+                "assets still do", cfg.accounting.bridge_asset_id.substr(0, 12));
         }
     }
 

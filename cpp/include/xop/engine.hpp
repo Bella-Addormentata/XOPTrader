@@ -2242,8 +2242,9 @@ private:
     std::unordered_map<std::string, std::string> inventory_absolute_write_iso_;
     /// A wallet-truth pass a booked secondary flow is owed: run on the
     /// first settled snapshot taken AFTER after_block with no fills
-    /// awaiting confirmation; reset_peak carries the flow re-anchor to
-    /// that moment, so the peak re-seeds from equity that contains it.
+    /// awaiting confirmation; reset_peak repeats the flow re-anchor at
+    /// that moment (it also ran at booking), so the peak re-seeds from
+    /// equity that contains the flow.
     struct SecondaryTruthDue {
         BlockHeight after_block{0};
         bool        reset_peak{false};

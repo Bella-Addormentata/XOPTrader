@@ -318,6 +318,9 @@ TEST(ConfigParserTest, BridgeSecondaryDefault_KeptWhenTraded) {
     auto cfg = xop::load_config(tmp.path());
     ASSERT_EQ(cfg.accounting.bridge_secondary_asset_ids.size(), 1u);
     EXPECT_EQ(cfg.accounting.bridge_secondary_asset_ids[0], kWmilliEthId);
+    // [review] No enabled pair trades wUSDC.b here, but the shared switch
+    // must stay on, or wmilliETH.b would get no booking and no opening.
+    EXPECT_TRUE(cfg.accounting.bridge_ingest_enabled);
 }
 
 TEST(ConfigParserTest, BridgeSecondaryDefault_DroppedWhenNotTraded) {

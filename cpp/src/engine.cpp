@@ -12010,14 +12010,31 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                         return std::max(
                             Mojo{0}, xch_confirmed_balance_ - reserve_mojos);
                     }
-                    if (!config_.strategy.wallet_balance_caps_enabled) {
+                    // [GAS-RESERVE review] A per-asset reserve binds here
+                    // too, whatever the CAT-cap switch says, as the fee
+                    // reserve does for XCH just above: the up-scale and
+                    // pace passes can raise tiers past the reserve-capped
+                    // pool, and this filter is what drops them.
+                    const auto rit =
+                        config_.strategy.asset_reserve_units.find(asset_id);
+                    const bool reserved =
+                        rit != config_.strategy.asset_reserve_units.end();
+                    if (!config_.strategy.wallet_balance_caps_enabled
+                        && !reserved) {
                         return std::nullopt;  // CAT caps opted out
                     }
                     auto it = cached_wallet_balances_.find(asset_id);
                     if (it == cached_wallet_balances_.end()) {
                         return std::nullopt;  // never observed
                     }
-                    return it->second.confirmed;
+                    if (!reserved) return it->second.confirmed;
+                    const Mojo mpu = (asset_id == pair_cfg->base_asset_id)
+                        ? pair_cfg->base_mojos_per_unit
+                        : pair_cfg->quote_mojos_per_unit;
+                    const Mojo confirmed = it->second.confirmed;
+                    return execution::cap_pool_above_reserve(
+                        confirmed, confirmed,
+                        execution::reserve_units_to_mojos(rit->second, mpu));
                 };
 
                 for (const Side side : {Side::Ask, Side::Bid}) {
@@ -21257,11 +21274,16 @@ asio::awaitable<void> Engine::step_ingest_secondary_bridge_flows(
             const bool in_process = accounting::iso_strictly_after(
                 row.flow_at, bridge_process_start_iso_);
             const Mojo tracked = inventory_->net_inventory(asset);
+            // [review] With no absolute write recorded in this process, the
+            // quantity came from the PERSISTED inventory, which an absolute
+            // writer of an earlier process may have set from a wallet that
+            // already held this flow.  The process start stands in for that
+            // write: a flow broadcast before it reads the wallet instead.
             const auto it_abs = inventory_absolute_write_iso_.find(sid);
             const auto plan = accounting::plan_secondary_inventory(
                 tracked, flow.delta_mojos,
                 it_abs != inventory_absolute_write_iso_.end()
-                    ? it_abs->second : std::string{},
+                    ? it_abs->second : bridge_process_start_iso_,
                 c.floor);
             const bool relative =
                 plan.action == accounting::SecondaryInventoryAction::Relative;
@@ -21269,14 +21291,19 @@ asio::awaitable<void> Engine::step_ingest_secondary_bridge_flows(
                 inventory_->adjust_quantity(asset, plan.target,
                                             val.fmv_pseudo_price);
                 inv_changed = true;
-                reset_peak = reset_peak || in_process;
             } else {
-                // The re-anchor waits for the wallet-truth pass, so the
-                // peak re-seeds from equity that already holds the flow.
+                // The wallet-truth pass re-anchors again once it has run, so
+                // the peak re-seeds from equity that holds the flow either
+                // way.
                 auto& due = secondary_truth_due_[sid];
                 due.after_block = block_height;
                 due.reset_peak  = due.reset_peak || in_process;
             }
+            // [review] Re-anchored NOW in both cases: on the wallet-truth
+            // path an absolute write may already have taken the flow out of
+            // equity, and Step 13, later this heartbeat, must not measure
+            // that drop against the pre-flow peak.
+            reset_peak = reset_peak || in_process;
 
             ++booked;
             booked_usd += val.flow_usd;
