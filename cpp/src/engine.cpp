@@ -21116,9 +21116,14 @@ asio::awaitable<void> Engine::step_ingest_secondary_bridge_flows(
         // A snapshot taken AFTER the booking, and no fill awaiting
         // confirmation whose wallet effect the tracker has yet to see
         // (Step 11's one-shot rule) -- else setting to the wallet could
-        // count that fill twice once it confirms.
+        // count that fill twice once it confirms.  [review] And only from
+        // a wallet Step 8 saw SYNCED in this heartbeat: the fetch below
+        // checks fields and pending change, not sync, and a mid-sync
+        // balance would set inventory to a partial figure and consume the
+        // pass.  While Step 8 does not run (a pause) the pass waits.
         if (block_height <= due.after_block
-            || !pending_unconfirmed_fills_.empty()) {
+            || !pending_unconfirmed_fills_.empty()
+            || !step8_sync_gate_passed_) {
             continue;
         }
         const AssetId a{aid};
@@ -21140,6 +21145,10 @@ asio::awaitable<void> Engine::step_ingest_secondary_bridge_flows(
         if (wallet != tracked) {
             inventory_->adjust_quantity(a, wallet, add_price);
             inv_changed = true;
+            // [review] The quantity was stale, so a peak seeded since (a
+            // restart restores it before any pass can run) may hold it too:
+            // re-anchor whenever the pass moves it, whatever the flow's age.
+            reset_peak = true;
             spdlog::info("[Engine] Bridge ingest: {} inventory {} -> {} mojos "
                          "from wallet truth (a booked flow overlapped an "
                          "earlier wallet-set quantity)",
@@ -21333,6 +21342,17 @@ asio::awaitable<void> Engine::step_ingest_secondary_bridge_flows(
                      "valuation re-anchors it (restart semantics)",
                      peak_equity_hwm_usd_);
         peak_equity_hwm_usd_ = 0.0;
+    }
+    // [review] ...and so does Step 13's rolling-loss window.  Unrealized
+    // P&L marks the STATE balance, so moving a coin that has gained since
+    // its cost moves total_pnl_usd by that gain: a withdrawal would read
+    // as a trading loss.  Unlike the wUSDC.b numeraire, a secondary asset
+    // carries such gains.  The window restarts for this cycle and the next
+    // one, because the marks lag a heartbeat behind a State change that
+    // lands after Step 11 (Step 8 next heartbeat, or the State write when
+    // the pass corrects it).
+    if (reset_peak) {
+        pnl_window_restart_cycles_ = 2;
     }
 
     if (inv_changed) {
@@ -22865,6 +22885,14 @@ void Engine::step_check_alerts(BlockHeight block_height)
     // enabled, and the transition-guarded latch below keeps a persisting
     // breach from re-alerting every block.
     if (config_.risk.max_window_loss_bps > 0.0) {
+
+        // [WARP-MILLIETH review] A booked secondary bridge flow restarts the
+        // window (restart semantics, like the drawdown peak): see
+        // step_ingest_secondary_bridge_flows.
+        if (pnl_window_restart_cycles_ > 0) {
+            --pnl_window_restart_cycles_;
+            pnl_window_usd_.clear();
+        }
 
         if (drawdown_grace_remaining_ > 0) {
             pnl_window_usd_.clear();

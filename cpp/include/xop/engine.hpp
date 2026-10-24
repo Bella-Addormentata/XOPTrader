@@ -2674,6 +2674,10 @@ private:
     // ISO/IEC 27001:2022: continuous monitoring within a bounded time window.
     // ISO/IEC 5055: deque prevents unbounded memory growth.
     std::deque<std::pair<BlockHeight, double>> pnl_window_usd_;
+    /// [WARP-MILLIETH review] Step 13 cycles left that restart the rolling
+    /// window instead of extending it -- set by a booked secondary bridge
+    /// flow, whose State-based unrealized move is capital, not a loss.
+    int pnl_window_restart_cycles_{0};
 
     // [T3-08] NHE (Natural Hedge Efficiency) accumulators for step 10.
     // These running totals track net inventory change and total traded
