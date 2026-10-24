@@ -21964,6 +21964,28 @@ void Engine::step_update_pnl(BlockHeight block_height)
                                                 usd_price);
                     note_inventory_absolute_write(aid);
                     mutated = true;
+                    // [WARP-MILLIETH review] For a secondary bridge asset this
+                    // can be the correction of a flow the ledger already holds
+                    // from before a restart (journal written, inventory not
+                    // yet persisted): the restored quantity predates it, and
+                    // the peak may have seeded from it during the startup
+                    // grace.  Re-anchor as the secondary scan does -- restart
+                    // semantics for the capital event, never a Net Deposits
+                    // entry (the ledger row already carries that).
+                    if (config_.accounting.bridge_ingest_enabled
+                        && accounting::is_secondary_bridge_asset(
+                               config_.accounting.bridge_secondary_asset_ids,
+                               aid)) {
+                        if (peak_equity_hwm_usd_ > 0.0) {
+                            spdlog::info("[Engine] Step 11: {} inventory "
+                                         "corrected to the wallet -- drawdown "
+                                         "peak {:.2f} discarded (restart "
+                                         "semantics)", aid.substr(0, 12),
+                                         peak_equity_hwm_usd_);
+                            peak_equity_hwm_usd_ = 0.0;
+                        }
+                        pnl_window_rebase_assets_[aid] = block_height;
+                    }
                     spdlog::warn("[Engine] Step 11: reconciled {} inventory "
                                  "{} -> {} mojos against wallet "
                                  "(deposit/withdrawal while down?)",
