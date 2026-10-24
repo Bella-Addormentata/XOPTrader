@@ -646,7 +646,8 @@ public:
         std::uint64_t  fee           = 0,
         bool           validate_only = false,
         std::optional<std::uint64_t> max_time = std::nullopt,
-        std::optional<std::uint64_t> min_coin_amount = std::nullopt);
+        std::optional<std::uint64_t> min_coin_amount = std::nullopt,
+        const std::vector<std::string>& excluded_coin_ids = {});
 
     /**
      * @brief Build the create_offer_for_ids request body.
@@ -667,13 +668,18 @@ public:
      *                  existed.  Present, it is written at the TOP LEVEL --
      *                  where chia 2.7.4 reads its coin-selection config --
      *                  and never inside "offer".
+     * @param excluded_coin_ids  [GAS-RESERVE] Coins the wallet may not
+     *                  select (execution/asset_reserve.hpp).  Empty leaves
+     *                  the payload byte-identical; present, written at the
+     *                  top level beside min_coin_amount, 0x-prefixed.
      */
     [[nodiscard]] static json build_create_offer_payload(
         const json&    offer_dict,
         std::uint64_t  fee,
         bool           validate_only,
         const std::optional<std::uint64_t>& max_time,
-        const std::optional<std::uint64_t>& min_coin_amount = std::nullopt);
+        const std::optional<std::uint64_t>& min_coin_amount = std::nullopt,
+        const std::vector<std::string>& excluded_coin_ids = {});
 
     /**
      * @brief Accept (take) an existing offer.

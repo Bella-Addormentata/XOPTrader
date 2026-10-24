@@ -1226,6 +1226,16 @@ public:
      */
     std::int64_t resolve_wallet_id(const AssetId& asset_id) const;
 
+    /**
+     * @brief [GAS-RESERVE review] Coins of wallet @p wallet_id that no offer
+     *        may lock (execution/asset_reserve.hpp): sent as
+     *        excluded_coin_ids on every create that spends from that wallet.
+     *        An empty list clears the wallet's entry.  Set by Step 8 each
+     *        cycle for an asset with a strategy.asset_reserve_units entry.
+     */
+    void set_reserved_coins(std::int64_t wallet_id,
+                            std::vector<std::string> coin_ids);
+
     // -- Cancel-reduction constants (public for Engine access) ---------------
 
     /// Hard TTL multiplier.  The configured offer_ttl_blocks becomes a
@@ -1274,6 +1284,11 @@ public:
     ///
     /// @param tier_index  The tier, or the first tier of a merged batch.
     /// @param context     "tier", "merged batch" or "batch fallback".
+    /// [GAS-RESERVE review] set_reserved_coins(), keyed by the wallet id as
+    /// the create_offer_for_ids dict spells it.
+    std::unordered_map<std::string, std::vector<std::string>>
+        reserved_coins_by_wallet_;
+
     asio::awaitable<json> create_offer_min_coin(
         const json&                  offer_dict,
         std::optional<std::uint64_t> expiry_max_time,

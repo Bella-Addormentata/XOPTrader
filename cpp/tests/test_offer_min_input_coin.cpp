@@ -496,6 +496,31 @@ TEST(OfferMinInputCoin, NoFloorLeavesThePayloadByteIdentical) {
     EXPECT_EQ(after.size(), std::size_t{3});  // offer, fee, validate_only
 }
 
+TEST(OfferMinInputCoin, ReserveCoinsAreExcludedAtTheTopLevel) {
+    // [GAS-RESERVE review] Beside min_coin_amount, 0x-prefixed whatever the
+    // caller passed, and never inside "offer".
+    const json dict = cat_funded_bid(80'334);
+    const json p = ChiaWalletRPC::build_create_offer_payload(
+        dict, 5000, false, std::nullopt, Floor{804},
+        {std::string(64, 'a'), "0x" + std::string(64, 'b')});
+    ASSERT_TRUE(p.contains("excluded_coin_ids"));
+    EXPECT_EQ(p["excluded_coin_ids"],
+              json::array({"0x" + std::string(64, 'a'),
+                           "0x" + std::string(64, 'b')}));
+    EXPECT_EQ(p["min_coin_amount"].get<std::uint64_t>(), std::uint64_t{804});
+    EXPECT_EQ(p["offer"], dict);
+}
+
+TEST(OfferMinInputCoin, NoReserveCoinsLeaveThePayloadByteIdentical) {
+    const json dict = cat_funded_bid(80'334);
+    const json before = ChiaWalletRPC::build_create_offer_payload(
+        dict, 5000, false, std::nullopt, Floor{804});
+    const json after = ChiaWalletRPC::build_create_offer_payload(
+        dict, 5000, false, std::nullopt, Floor{804}, {});
+    EXPECT_FALSE(after.contains("excluded_coin_ids"));
+    EXPECT_EQ(after.dump(), before.dump());
+}
+
 TEST(OfferMinInputCoin, AZeroFloorIsNotSent) {
     // 0 is the wallet's own default; sending it would only make an
     // unconfigured request differ from the old one.

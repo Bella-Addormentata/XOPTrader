@@ -88,6 +88,34 @@ _MOJOS_PER_XCH: Final[float] = 1_000_000_000_000.0
 _MOJOS_PER_CAT: Final[float] = 1_000.0
 
 
+_FLOW_USD_KEY: Final[str] = "flow_usd="
+
+
+def _parse_bridge_flow_usd(note: Any) -> float:
+    """The signed USD a bridge ledger row was booked at, from its note.
+
+    [WARP-MILLIETH 2026-10-24] Mirrors the engine's
+    ``accounting::parse_bridge_flow_usd`` (bridge_ingest.hpp), which
+    rebuilds Net Deposits from the same field on restart: 0.0 for a note
+    without the field or with a non-finite or absurd (>= 1e12) value.
+    """
+    text = note if isinstance(note, str) else ""
+    pos = text.find(_FLOW_USD_KEY)
+    if pos < 0:
+        return 0.0
+    tail = text[pos + len(_FLOW_USD_KEY):]
+    end = 0
+    while end < len(tail) and (tail[end].isdigit() or tail[end] in "+-.eE"):
+        end += 1
+    try:
+        value = float(tail[:end])
+    except ValueError:
+        return 0.0
+    if not math.isfinite(value) or abs(value) >= 1e12:
+        return 0.0
+    return value
+
+
 def _mojos_per_unit(symbol: str) -> float:
     """Return the mojos-per-unit denominator for an asset display symbol."""
     return _MOJOS_PER_XCH if symbol.strip().upper() == "XCH" else _MOJOS_PER_CAT
@@ -615,17 +643,19 @@ class _DatabaseWorker(QObject):
 
         # [S19 2026-08-23] Net external capital via the warp bridge, so a
         # deposit is never mistaken for profit.  The engine books completed
-        # bridge jobs as bridge_deposit / bridge_withdrawal ledger rows;
-        # wUSDC.b is the $1.00 numeraire, so mojos / 1e3 IS the dollar
-        # figure.  NOT filtered by the display baseline: capital is a
-        # balance-sheet fact, not a performance figure a reset should hide.
+        # bridge jobs as bridge_deposit / bridge_withdrawal ledger rows with
+        # the signed USD in each note; summing that field gives exactly the
+        # engine's own figure.  [WARP-MILLIETH 2026-10-24] Not mojos / 1e3:
+        # that was the dollar figure only while every flow was wUSDC.b at
+        # $1.00, and a wmilliETH.b unwrap is worth ~$4 a unit.  NOT filtered
+        # by the display baseline: capital is a balance-sheet fact, not a
+        # performance figure a reset should hide.
         # The table may not exist on a fresh DB -- that is "no flows yet",
         # not a reason to drop the whole P&L payload, and (round 26) not a
         # reason to emit query_error on every refresh either: probe
         # sqlite_master first so the fallback stays silent.
         bridge_sql = """
-            SELECT COALESCE(SUM(delta_mojos), 0) AS net_mojos,
-                   COUNT(*)                      AS flow_count
+            SELECT COALESCE(note, '') AS note
             FROM ledger_entries
             WHERE event_type IN ('bridge_deposit', 'bridge_withdrawal')
         """
@@ -634,8 +664,9 @@ class _DatabaseWorker(QObject):
         rows = (self._execute_query(bridge_sql, [])
                 if self._table_exists("ledger_entries") else None)
         if rows:
-            net_deposits_usd = float(rows[0]["net_mojos"] or 0) / 1e3
-            bridge_flows = int(rows[0]["flow_count"] or 0)
+            net_deposits_usd = sum(
+                _parse_bridge_flow_usd(r["note"]) for r in rows)
+            bridge_flows = len(rows)
 
         self.pnl_display_ready.emit({
             "lifetime_usd": lifetime_usd,

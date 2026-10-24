@@ -89,12 +89,15 @@
 
 #include "xop/types.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <optional>
 #include <string>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -418,6 +421,134 @@ struct BridgeValuation {
         return false;
     }
     return a.compare(0, kPrefix, b, 0, kPrefix) > 0;
+}
+
+// ---------------------------------------------------------------------------
+// Secondary bridge assets ([WARP-MILLIETH 2026-10-24]).
+//
+// accounting.bridge_secondary_asset_ids (wmilliETH.b by default) are bridge
+// assets that are NOT the numeraire and that fills keep trading, so two
+// things differ from the bridge asset above:
+//
+//   * VALUE.  A flow is valued at the engine's own USD mark for the asset --
+//     the live pseudo-price when there is one, else the price equity is
+//     carrying it at -- so Net Deposits moves by what equity moves.  With
+//     neither, the flow WAITS (never terminal): unpriced now is not
+//     unpriceable forever.
+//
+//   * INVENTORY.  The bridge asset's tail reconcile (tracked := wallet every
+//     heartbeat) would fight the fill path on a traded asset, so a secondary
+//     flow moves inventory RELATIVELY, by its own delta.  That is exact
+//     unless an ABSOLUTE writer -- the startup seed, Step 8's recovery seed,
+//     Step 11's one-shot reconcile -- set the quantity from the wallet at or
+//     after the flow's broadcast lower bound: that write may already contain
+//     the flow, and adding the delta again would count it twice.  Those
+//     flows (and a delta that would drive the tracker negative -- it was
+//     already short) re-arm Step 11's one-shot wallet reconcile instead, so
+//     wallet truth arrives under that reconcile's own rules.
+// ---------------------------------------------------------------------------
+
+/// Whether `asset_id` is one of the configured secondary bridge assets.
+[[nodiscard]] inline bool is_secondary_bridge_asset(
+    const std::vector<std::string>& secondary_ids,
+    const std::string& asset_id)
+{
+    return std::find(secondary_ids.begin(), secondary_ids.end(), asset_id)
+        != secondary_ids.end();
+}
+
+/// Whether a job's fingerprint resolves to one of the secondary assets
+/// (the bridge-asset scan leaves such jobs to the secondary scan rather
+/// than warning that they are foreign).
+[[nodiscard]] inline bool is_secondary_bridge_asset_job(
+    const std::vector<std::string>& secondary_ids,
+    const std::string& fingerprint)
+{
+    return std::any_of(secondary_ids.begin(), secondary_ids.end(),
+                       [&](const std::string& id) {
+                           return fingerprint_matches_asset(fingerprint, id);
+                       });
+}
+
+/// USD per display unit to book a secondary-asset flow at: the live
+/// pseudo-price (USD x 1e12) when positive, else a finite positive carry,
+/// else nullopt (the flow waits for a price).
+[[nodiscard]] inline std::optional<double> secondary_flow_usd_per_unit(
+    Mojo live_pseudo_price, std::optional<double> carry_usd_per_unit) noexcept
+{
+    if (live_pseudo_price > 0) {
+        return static_cast<double>(live_pseudo_price) / 1e12;
+    }
+    if (carry_usd_per_unit && std::isfinite(*carry_usd_per_unit)
+        && *carry_usd_per_unit > 0.0) {
+        return *carry_usd_per_unit;
+    }
+    return std::nullopt;
+}
+
+enum class SecondaryInventoryAction { Relative, WalletTruth };
+
+struct SecondaryInventoryPlan {
+    SecondaryInventoryAction action{SecondaryInventoryAction::WalletTruth};
+    Mojo target{0};   ///< Relative only: the tracked quantity to set.
+};
+
+/// How a booked secondary flow reaches the inventory tracker (see the
+/// banner above).  `last_absolute_write_iso` is the last absolute write's
+/// stamp; the engine passes its process start when none happened in this
+/// process, since the persisted quantity it restored may itself come from
+/// an earlier process's absolute write.  Empty means "none, ever" (pure
+/// callers and tests).  Fails toward wallet
+/// truth: a malformed flow floor with any absolute write on record, an
+/// overflowing sum, or a negative result all read the wallet instead.
+[[nodiscard]] inline SecondaryInventoryPlan plan_secondary_inventory(
+    Mojo tracked, Mojo delta_mojos,
+    const std::string& last_absolute_write_iso,
+    const std::string& flow_floor_iso) noexcept
+{
+    SecondaryInventoryPlan p{};
+    if (tracked < 0) return p;
+    if (!last_absolute_write_iso.empty()
+        && !iso_strictly_after(flow_floor_iso, last_absolute_write_iso)) {
+        return p;
+    }
+    if (delta_mojos > 0
+        && tracked > std::numeric_limits<Mojo>::max() - delta_mojos) {
+        return p;
+    }
+    const Mojo target = tracked + delta_mojos;
+    if (target < 0) return p;
+    p.action = SecondaryInventoryAction::Relative;
+    p.target = target;
+    return p;
+}
+
+/// Step 13's rolling-loss window rebase after a booked secondary flow
+/// (engine.cpp): the window restarts every cycle while this says Wait.
+enum class WindowRebaseVerdict { Wait, CaughtUp, Expired };
+
+/// Whether a booked flow's rebase can retire.  CaughtUp needs State to hold
+/// the wallet's balance from a validated snapshot taken at or after the
+/// booking, AND a heartbeat strictly after the booking one: Step 11 marks
+/// P&L before the scan books, so a flow booked this heartbeat (a deposit's
+/// new cost basis, a relative inventory move) reaches the marks only next
+/// heartbeat, whatever State shows now.  Expired after one loss window, so
+/// an asset whose State never catches up cannot blind the breaker.
+[[nodiscard]] inline WindowRebaseVerdict window_rebase_verdict(
+    std::uint64_t booked_block, std::uint64_t now_block,
+    bool snapshot_validated, std::uint64_t snapshot_block,
+    Mojo state_balance, Mojo wallet_confirmed,
+    std::uint64_t window_blocks) noexcept
+{
+    if (now_block > booked_block && snapshot_validated
+        && snapshot_block >= booked_block
+        && state_balance == wallet_confirmed) {
+        return WindowRebaseVerdict::CaughtUp;
+    }
+    if (now_block >= booked_block && now_block - booked_block >= window_blocks) {
+        return WindowRebaseVerdict::Expired;
+    }
+    return WindowRebaseVerdict::Wait;
 }
 
 }  // namespace xop::accounting

@@ -612,6 +612,13 @@ strategy:
                                        # longer walk spendable XCH to zero.
   arb_reserve_coins: 2                 # [OPTIONAL, default: 2]   Coins kept unallocated for arb takes
   min_reserve_units: 1.0               # [OPTIONAL, default: 1.0]  Absolute floor per coin (units)
+  # [OPTIONAL, default: none] Per-coin reserve in units, by CAT asset id; an
+  # entry replaces min_reserve_units for that coin, and its offers are sized
+  # to leave the reserve unsold (confirmed minus reserve), the way
+  # fee_reserve_xch works for XCH.  Use it for wmilliETH.b when the warp
+  # rebalancer unwraps it into ETH for Base gas (warp.rebalance.eth).
+  # asset_reserve_units:
+  #   f322a205c034fe28681829fa5a2e483ac421f0952eb1292945c8db06e0a471a6: 3.0   # wmilliETH.b
   min_offer_size_units: 1.0            # [OPTIONAL, default: 1.0]  Min offer size in base-asset units; tiers below this are dropped
   max_offer_size_units: 5.0            # [OPTIONAL, default: 5.0]  Max offer size per tier for XCH-base pairs; 0 = no cap
   # revive_market pairs (see pairs[].revive_market). "Thin" = the third-party

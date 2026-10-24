@@ -22,6 +22,8 @@
 
 #include <xop/execution/offer_manager.hpp>
 
+#include <xop/execution/asset_reserve.hpp>
+
 #include <xop/execution/cancel_escalation.hpp>
 #include <xop/execution/cancel_retry.hpp>
 #include <xop/execution/coin_manager.hpp>
@@ -297,6 +299,17 @@ OfferManager::expiry_max_time_for(const PairConfig& pair) const
 // [MIN-INPUT-COIN] wiring -- the decisions live in offer_min_input_coin.hpp
 // ---------------------------------------------------------------------------
 
+void OfferManager::set_reserved_coins(std::int64_t wallet_id,
+                                      std::vector<std::string> coin_ids)
+{
+    const std::string key = std::to_string(wallet_id);
+    if (coin_ids.empty()) {
+        reserved_coins_by_wallet_.erase(key);
+    } else {
+        reserved_coins_by_wallet_[key] = std::move(coin_ids);
+    }
+}
+
 asio::awaitable<json> OfferManager::create_offer_min_coin(
     const json&                  offer_dict,
     std::optional<std::uint64_t> expiry_max_time,
@@ -310,15 +323,20 @@ asio::awaitable<json> OfferManager::create_offer_min_coin(
     // the rule was not designed for: the request is then the old one.
     const std::optional<std::uint64_t> min_coin =
         offer_min_input_coin(offer_dict, frac);
+    // [GAS-RESERVE] Reserve coins of every wallet this offer spends from
+    // stay out of its coin selection -- on the floored create AND the
+    // fallback, which drops only the floor.
+    const std::vector<std::string> excluded =
+        reserved_coins_for_offer(offer_dict, reserved_coins_by_wallet_);
 
     co_return co_await create_offer_with_min_coin_fallback(
         // Deliberately NOT a coroutine lambda: it hands back the wallet's
         // own awaitable, so nothing reads these captures after it returns.
-        [this, &offer_dict, expiry_max_time](
+        [this, &offer_dict, expiry_max_time, &excluded](
             std::optional<std::uint64_t> coin_floor) {
             return wallet_->create_offer(
                 offer_dict, current_fee_mojos_, /*validate_only=*/false,
-                expiry_max_time, coin_floor);
+                expiry_max_time, coin_floor, excluded);
         },
         min_coin,
         [this, &pair, side, tier_index, context, min_coin, frac](

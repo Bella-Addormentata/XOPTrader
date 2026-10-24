@@ -239,6 +239,152 @@ accounting:
     EXPECT_FALSE(cfg.accounting.bridge_ingest_enabled);
 }
 
+// ----------------------------------------------------------------------------
+// [GAS-RESERVE / WARP-MILLIETH 2026-10-24] Per-asset reserves and secondary
+// bridge assets.
+// ----------------------------------------------------------------------------
+
+const char* kWmilliEthId =
+    "f322a205c034fe28681829fa5a2e483ac421f0952eb1292945c8db06e0a471a6";
+
+// kMinimalValidYaml with `lines` added to its strategy: mapping and, when
+// `trade_wmillieth`, an enabled wmilliETH.b/XCH pair.
+std::string minimal_yaml_with(const std::string& strategy_lines,
+                              bool trade_wmillieth = false)
+{
+    std::string y = kMinimalValidYaml;
+    const std::string strat = "\nstrategy:\n";
+    const auto sp = y.find(strat);
+    if (sp == std::string::npos) return y;
+    y.insert(sp + strat.size(), strategy_lines);
+    if (trade_wmillieth) {
+        const std::string pairs = "\npairs:\n";
+        const auto pp = y.find(pairs);
+        if (pp == std::string::npos) return y;
+        y.insert(pp + pairs.size(),
+                 std::string("  - base_asset_id: \"") + kWmilliEthId + "\"\n"
+                 "    quote_asset_id: \"xch\"\n"
+                 "    name: \"wmilliETH.b/XCH\"\n"
+                 "    enabled: true\n");
+    }
+    return y;
+}
+
+TEST(ConfigParserTest, AssetReserveUnits_ParsesAndLowercases) {
+    std::string yaml = minimal_yaml_with(
+        "  asset_reserve_units:\n"
+        "    F322A205C034FE28681829FA5A2E483AC421F0952EB1292945C8DB06E0A471A6: 3.5\n");
+    TempYaml tmp(yaml.c_str());
+    auto cfg = xop::load_config(tmp.path());
+    ASSERT_EQ(cfg.strategy.asset_reserve_units.size(), 1u);
+    EXPECT_DOUBLE_EQ(cfg.strategy.asset_reserve_units.at(kWmilliEthId), 3.5);
+}
+
+TEST(ConfigParserTest, AssetReserveUnits_DefaultsEmpty) {
+    TempYaml tmp(kMinimalValidYaml);
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_TRUE(cfg.strategy.asset_reserve_units.empty());
+}
+
+TEST(ConfigParserTest, AssetReserveUnits_RejectsBadEntries) {
+    const std::string id = kWmilliEthId;
+    for (const std::string& entry : {
+             std::string("    xch: 2\n"),             // fee_reserve_xch's job
+             std::string("    XCH: 2\n"),
+             std::string("    abc: 2\n"),             // not a CAT id
+             "    " + id + ": -1\n",                  // negative
+             "    " + id + ": .nan\n",                // NaN
+             "    " + id + ": 2e9\n",                 // absurd
+         }) {
+        std::string yaml = minimal_yaml_with("  asset_reserve_units:\n" + entry);
+        TempYaml tmp(yaml.c_str());
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError) << entry;
+    }
+}
+
+TEST(ConfigParserTest, AssetReserveUnits_RejectsADuplicateAfterLowercasing) {
+    std::string upper = kWmilliEthId;
+    for (auto& c : upper) c = static_cast<char>(std::toupper(c));
+    std::string yaml = minimal_yaml_with(
+        "  asset_reserve_units:\n"
+        "    " + std::string(kWmilliEthId) + ": 2\n"
+        "    " + upper + ": 3\n");
+    TempYaml tmp(yaml.c_str());
+    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+}
+
+TEST(ConfigParserTest, BridgeSecondaryDefault_KeptWhenTraded) {
+    TempYaml tmp(minimal_yaml_with("", /*trade_wmillieth=*/true).c_str());
+    auto cfg = xop::load_config(tmp.path());
+    ASSERT_EQ(cfg.accounting.bridge_secondary_asset_ids.size(), 1u);
+    EXPECT_EQ(cfg.accounting.bridge_secondary_asset_ids[0], kWmilliEthId);
+    // [review] No enabled pair trades wUSDC.b here, but the shared switch
+    // must stay on, or wmilliETH.b would get no booking and no opening.
+    EXPECT_TRUE(cfg.accounting.bridge_ingest_enabled);
+}
+
+TEST(ConfigParserTest, BridgeSecondaryDefault_DroppedWhenNotTraded) {
+    // kMinimalValidYaml trades only XCH/TEST: wmilliETH.b would have no
+    // ledger opening, so its flows could never book.
+    TempYaml tmp(kMinimalValidYaml);
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_TRUE(cfg.accounting.bridge_secondary_asset_ids.empty());
+}
+
+TEST(ConfigParserTest, BridgeSecondaryExplicit_LowercasedAndDroppedPerAsset) {
+    std::string upper = kWmilliEthId;
+    for (auto& c : upper) c = static_cast<char>(std::toupper(c));
+    std::string yaml = minimal_yaml_with("", /*trade_wmillieth=*/true) + R"(
+accounting:
+  bridge_secondary_asset_ids:
+    - )" + upper + R"(
+    - 00000000000000000000000000000000000000000000000000000000000000ff
+)";
+    TempYaml tmp(yaml.c_str());
+    auto cfg = xop::load_config(tmp.path());
+    // The traded one stays (lowercased); the untraded one is dropped.
+    ASSERT_EQ(cfg.accounting.bridge_secondary_asset_ids.size(), 1u);
+    EXPECT_EQ(cfg.accounting.bridge_secondary_asset_ids[0], kWmilliEthId);
+}
+
+TEST(ConfigParserTest, BridgeSecondaryEmptyList_Disables) {
+    std::string yaml = minimal_yaml_with("", /*trade_wmillieth=*/true) + R"(
+accounting:
+  bridge_secondary_asset_ids: []
+)";
+    TempYaml tmp(yaml.c_str());
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_TRUE(cfg.accounting.bridge_secondary_asset_ids.empty());
+}
+
+TEST(ConfigParserTest, BridgeSecondary_RejectsBadLists) {
+    const std::string base = minimal_yaml_with("", /*trade_wmillieth=*/true);
+    for (const std::string& acc : {
+             // The numeraire cannot be booked a second time at a mark.
+             std::string("  bridge_secondary_asset_ids:\n"
+                         "    - fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d\n"),
+             "  bridge_secondary_asset_ids:\n    - " + std::string(kWmilliEthId)
+                 + "\n    - " + std::string(kWmilliEthId) + "\n",
+             std::string("  bridge_secondary_asset_ids:\n    - xch\n"),
+             std::string("  bridge_secondary_asset_ids: ")
+                 + kWmilliEthId + "\n",                     // not a list
+         }) {
+        TempYaml tmp((base + "\naccounting:\n" + acc).c_str());
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError) << acc;
+    }
+}
+
+TEST(ConfigParserTest, BridgeSecondary_RejectsTheBridgeAssetWhateverTheKeyOrder) {
+    // bridge_asset_id overridden AFTER the list in the file.
+    std::string yaml = minimal_yaml_with("", /*trade_wmillieth=*/true) + R"(
+accounting:
+  bridge_secondary_asset_ids:
+    - )" + std::string(kWmilliEthId) + R"(
+  bridge_asset_id: )" + std::string(kWmilliEthId) + "\n";
+    TempYaml tmp(yaml.c_str());
+    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+}
+
 TEST(ConfigParserTest, AccountingPauseBelowAlert_Throws) {
     // A pause threshold tighter than the alert threshold would pause before
     // ever alerting -- reject it rather than silently mis-escalate.

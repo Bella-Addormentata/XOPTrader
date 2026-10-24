@@ -1840,6 +1840,47 @@ private:
     asio::awaitable<void> step_ingest_bridge_flows(
         BlockHeight block_height);
 
+    /// [WARP-MILLIETH 2026-10-24] The same booking for
+    /// accounting.bridge_secondary_asset_ids (wmilliETH.b by default):
+    /// ledger leg, Net Deposits at the engine's own USD mark, inventory
+    /// moved by the flow itself (or by Step 11's wallet reconcile,
+    /// re-armed, when an absolute inventory write may already contain
+    /// it), and the flow re-anchor of the drawdown peak.  Runs right after
+    /// step_ingest_bridge_flows, before the invariant.  See
+    /// accounting/bridge_ingest.hpp for the rules.
+    asio::awaitable<void> step_ingest_secondary_bridge_flows(
+        BlockHeight block_height);
+
+    /// Fetch @p asset's wallet balance for the bridge scans and cache it
+    /// stamped with @p block_height.  True only when the reply carried
+    /// the confirmed and pending fields and pending_change is zero -- a
+    /// settled snapshot that postdates every job the caller has read.
+    /// False (and no cache write) when the wallet is closed, its circuit
+    /// refuses, the asset has no wallet, or the reply is incomplete.
+    asio::awaitable<bool> fetch_bridge_balance(const AssetId& asset,
+                                               BlockHeight block_height);
+
+    /// [WARP-MILLIETH review] Whether the wallet is known synced for the
+    /// secondary scan's balance reads: Step 8 passed its sync gate in this
+    /// heartbeat, else one on-demand get_sync_status per heartbeat.
+    asio::awaitable<bool> secondary_wallet_synced(BlockHeight block_height);
+    BlockHeight secondary_sync_checked_block_{0};
+    bool        secondary_sync_ok_{false};
+    /// [WARP-MILLIETH review] When the secondary scan last rebuilt the
+    /// wallet-id map for an asset with no wallet (0 = never).
+    BlockHeight secondary_wallet_map_refresh_block_{0};
+    /// [GAS-RESERVE review] Reserved assets whose spendable coins Step 8
+    /// could not establish this heartbeat: the balance gate suppresses
+    /// every side that spends them.  Rebuilt at each Step 8.
+    std::unordered_set<std::string> reserve_coins_unknown_;
+
+    /// [WARP-MILLIETH] Record that @p asset_id's tracked inventory was
+    /// just SET from the wallet (startup seed, Step 8 recovery seed,
+    /// Step 11 one-shot reconcile), so a
+    /// later secondary flow whose broadcast precedes it is not added on
+    /// top of a quantity that may already contain it.
+    void note_inventory_absolute_write(const std::string& asset_id);
+
     /// Tie the ledger's implied balances to the wallet's confirmed balances
     /// and escalate on sustained, unexplained divergence.  Alert-only unless
     /// accounting.pause_enabled is set.
@@ -2199,6 +2240,25 @@ private:
     /// forever, and one legitimate milliETH job must not warn on every
     /// heartbeat for the lifetime of the database.
     std::set<std::int64_t> bridge_warned_jobs_;
+
+    /// [WARP-MILLIETH 2026-10-24] The secondary scan's counterparts of
+    /// the three caches above (booked, terminal, warned), kept apart so
+    /// neither scan's verdict on a job is mistaken for the other's.
+    std::set<std::string> secondary_booked_event_ids_;
+    std::set<std::string> secondary_terminal_skip_ids_;
+    std::set<std::int64_t> secondary_warned_jobs_;
+    /// Secondary assets already warned about having no USD price while
+    /// a flow waits on one (cleared when a price returns).
+    std::set<std::string> secondary_unpriced_warned_;
+    /// ISO stamp of each asset's last ABSOLUTE inventory write (see
+    /// note_inventory_absolute_write).  In-memory: a restart's startup
+    /// seed and one-shot reconcile re-stamp what they write.
+    std::unordered_map<std::string, std::string> inventory_absolute_write_iso_;
+    /// [WARP-MILLIETH review] Step 11 one-shot reconciles RE-ARMED by a
+    /// booked secondary flow whose quantity may already be inside an
+    /// earlier wallet-set write, and the booking block: the reconcile then
+    /// accepts only a snapshot taken at or after it.
+    std::unordered_map<std::string, BlockHeight> inventory_reconcile_not_before_;
 
     /// [S18 2026-08-23] Consecutive lifted evaluations of the max-drawdown
     /// condition; the re-alert gate only re-arms once this reaches the
@@ -2623,6 +2683,12 @@ private:
     // ISO/IEC 27001:2022: continuous monitoring within a bounded time window.
     // ISO/IEC 5055: deque prevents unbounded memory growth.
     std::deque<std::pair<BlockHeight, double>> pnl_window_usd_;
+    /// [WARP-MILLIETH review] Assets with a booked secondary bridge flow
+    /// that State has not yet absorbed, and the block it was booked at:
+    /// Step 13 restarts the rolling window instead of extending it while
+    /// any remain, since the State-based unrealized move is capital, not a
+    /// loss.  Bounded by one loss window per entry.
+    std::unordered_map<std::string, BlockHeight> pnl_window_rebase_assets_;
 
     // [T3-08] NHE (Natural Hedge Efficiency) accumulators for step 10.
     // These running totals track net inventory change and total traded
