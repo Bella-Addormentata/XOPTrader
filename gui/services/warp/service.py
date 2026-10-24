@@ -4679,14 +4679,19 @@ class _WarpWorker(QObject):
         return max(0, int(spendable)), max(0, int(confirmed))
 
     def _millieth_topup_floor(self, engine: "WarpEngine") -> Tuple[int, int]:
-        """:func:`_millieth_topup_minimums` at live Base fees. Unknown fees
-        give (1, 1): a Base withdraw then fails on its own gas check, and
-        :meth:`_can_withdraw_millieth` already blocks every Chia source."""
+        """:func:`_millieth_topup_minimums` at live Base fees.
+
+        [review] Unknown fees RAISE (a banner and the cooldown, then a
+        retry): with no known minimum the planner could withdraw a single
+        base unit whose payout is less than the gas -- if the withdraw's own
+        fee read then succeeded, its affordability check would let it
+        through."""
         try:
             fee = int(engine._evm.get_fee_data().max_fee_per_gas)
-        except Exception as exc:  # noqa: BLE001 -- the gates fail closed
-            _log.debug("rebalance: Base fees unknown (%s)", exc)
-            return 1, 1
+        except Exception as exc:  # noqa: BLE001 -- surfaced, retried
+            raise WarpError(
+                f"Base fees unknown ({exc}); the ETH top-up waits until its "
+                "smallest worthwhile size is known") from exc
         return _millieth_topup_minimums(fee, _c_wei_per_milli_unit(engine._net))
 
     def _can_withdraw_millieth(self, engine: "WarpEngine", eth_wei: int) -> bool:

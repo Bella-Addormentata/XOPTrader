@@ -588,3 +588,25 @@ def test_a_boolean_unwrap_cap_is_refused(raw):
         S._parse_millieth_unwrap_cap({"max_unwrap_millieth": raw})
     with pytest.raises(S.WarpError):
         S._parse_unwrap_cap({"max_unwrap_usdc": raw})
+
+
+def test_unknown_fees_stop_the_top_up_rather_than_guess_its_size():
+    """[review] With no fee read there is no known minimum: a 1-unit
+    withdraw must not go out on a guess."""
+    w, eng = _worker(_params()), FakeEngine()
+    eng._hot_cache["millieth_units"] = 1
+    calls = []
+
+    class _BaseWallet:
+        def unwrap_millieth(self, units):
+            calls.append(units)
+
+    def down():
+        raise RuntimeError("rpc down")
+
+    w._base_wallet = _BaseWallet
+    eng._evm.get_fee_data = down
+    w._maybe_rebalance(eng)
+    assert calls == [] and eng.calls == []
+    assert "Base fees unknown" in w._rebalance_last
+    assert w._rebalance_next_ok > 0                  # retried after cooldown
