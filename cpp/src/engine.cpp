@@ -3230,13 +3230,18 @@ asio::awaitable<void> Engine::poll_loop_coro()
                     // every historical bridge flow.
                     // [WARP-MILLIETH] Secondary bridge assets too: a first
                     // wrap into an empty wallet needs the same anchor.
+                    // [review] A ZERO only from a wallet startup saw synced:
+                    // startup goes on after its sync probes run out, and a
+                    // mid-sync zero persisted as the once-ever opening would
+                    // misdate every later flow.
                     if (config_.accounting.bridge_ingest_enabled
                         && (aid == config_.accounting.bridge_asset_id
                             || accounting::is_secondary_bridge_asset(
                                    config_.accounting.bridge_secondary_asset_ids,
                                    aid))
                         && bal_json.contains("confirmed_wallet_balance")
-                        && confirmed >= 0) {
+                        && (confirmed > 0
+                            || (confirmed == 0 && startup_wallet_synced))) {
                         genesis_balances[AssetId{aid}] = confirmed;
                     }
                     // Record the successful balance observation BEFORE
@@ -12506,42 +12511,60 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
     // unsold: pick spendable coins covering it and have every offer that
     // spends the asset exclude them from its coin selection
     // (execution/asset_reserve.hpp).  Below the sync gate, before any pair
-    // posts.  A failed read keeps the previous cycle's choice: excluding a
-    // coin since spent is harmless, dropping the exclusion is not.
+    // posts.  [review] The wallet-id map is built first (a circuit recovery
+    // invalidates it, and an asset resolving to no wallet would skip its
+    // refresh while a later post rebuilds the map); and if the map or any
+    // reserve's coins cannot be read, this heartbeat posts nothing -- a
+    // stale or empty exclusion list could let a small offer lock the coin
+    // the reserve exists to keep.  A single malformed coin record is
+    // skipped, not fatal.
     if (offer_mgr_ && !config_.strategy.asset_reserve_units.empty()) {
+        if (!wallet_step_may_run("Step 8 reserve coins")) co_return;
+        try {
+            co_await offer_mgr_->ensure_wallet_ids();
+        } catch (const std::exception& e) {
+            spdlog::warn("[Engine] Step 8: wallet map unavailable for the "
+                         "per-asset reserves ({}) -- posting nothing this "
+                         "heartbeat", e.what());
+            co_return;
+        }
         for (const auto& [asset_id, units] : config_.strategy.asset_reserve_units) {
             const std::int64_t wid = offer_mgr_->resolve_wallet_id(asset_id);
-            if (wid <= 0) continue;
+            if (wid <= 0) continue;   // no wallet: no coins for an offer to lock
             if (!wallet_step_may_run("Step 8 reserve coins")) co_return;
+            const auto hex = [](std::string s) {
+                return s.rfind("0x", 0) == 0 ? s.substr(2) : s;
+            };
+            std::vector<json> records;
             try {
-                const auto hex = [](std::string s) {
-                    return s.rfind("0x", 0) == 0 ? s.substr(2) : s;
-                };
-                std::vector<execution::ReserveCoin> coins;
-                for (const auto& rec : co_await wallet_->get_spendable_coins(wid)) {
+                records = co_await wallet_->get_spendable_coins(wid);
+            } catch (const std::exception& e) {
+                spdlog::warn("[Engine] Step 8: reserve coins for {} could not "
+                             "be read ({}) -- posting nothing this heartbeat",
+                             asset_id.substr(0, 12), e.what());
+                co_return;
+            }
+            std::vector<execution::ReserveCoin> coins;
+            for (const auto& rec : records) {
+                try {
                     const auto& coin = rec.contains("coin") ? rec["coin"] : rec;
-                    if (!coin.contains("parent_coin_info")
-                        || !coin.contains("puzzle_hash")
-                        || !coin.contains("amount")) {
-                        continue;
-                    }
-                    const Mojo amount = coin["amount"].get<Mojo>();
+                    const Mojo amount = coin.at("amount").get<Mojo>();
                     coins.push_back({execution::CoinManager::compute_coin_name(
-                                         hex(coin["parent_coin_info"].get<std::string>()),
-                                         hex(coin["puzzle_hash"].get<std::string>()),
+                                         hex(coin.at("parent_coin_info").get<std::string>()),
+                                         hex(coin.at("puzzle_hash").get<std::string>()),
                                          amount),
                                      amount});
+                } catch (const std::exception& e) {
+                    spdlog::debug("[Engine] Step 8: malformed coin record for "
+                                  "{} skipped ({})", asset_id.substr(0, 12),
+                                  e.what());
                 }
-                // CAT wallets only (XCH has fee_reserve_xch): 1e3 per unit.
-                offer_mgr_->set_reserved_coins(
-                    wid, execution::choose_reserve_coins(
-                             std::move(coins),
-                             execution::reserve_units_to_mojos(units, 1'000)));
-            } catch (const std::exception& e) {
-                spdlog::warn("[Engine] Step 8: reserve coins for {} not "
-                             "refreshed ({}) -- keeping the previous choice",
-                             asset_id.substr(0, 12), e.what());
             }
+            // CAT wallets only (XCH has fee_reserve_xch): 1e3 per unit.
+            offer_mgr_->set_reserved_coins(
+                wid, execution::choose_reserve_coins(
+                         std::move(coins),
+                         execution::reserve_units_to_mojos(units, 1'000)));
         }
     }
 

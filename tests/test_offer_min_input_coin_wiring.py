@@ -252,11 +252,13 @@ def test_the_endpoint_is_posted_only_by_create_offer_with_the_floor_in_its_paylo
     )
     (payload_args,) = _call_arguments(body, "build_create_offer_payload")
     built = _split_arguments(payload_args)
-    assert len(built) == 5, (
-        "the payload builder takes %d arguments, expected 5: %r" % (len(built), built)
+    # [GAS-RESERVE] ...and the reserve coins as the sixth: dropped, every
+    # offer could lock the coins a per-asset reserve keeps spendable.
+    assert len(built) == 6, (
+        "the payload builder takes %d arguments, expected 6: %r" % (len(built), built)
     )
     for i, token in enumerate(("offer_dict", "fee", "validate_only", "max_time",
-                               "min_coin_amount")):
+                               "min_coin_amount", "excluded_coin_ids")):
         assert token in built[i], (
             "argument %d of build_create_offer_payload is %r, which does not "
             "mention %r -- %s" % (
@@ -289,9 +291,17 @@ def test_the_wrapper_applies_the_rule_and_the_fallback():
     # retry), not the literal spelling of any of them.
     (create_args,) = _call_arguments(wrapper, "wallet_->create_offer")
     passed = _split_arguments(create_args)
-    assert len(passed) == 5, (
-        "the wallet create takes %d arguments, expected 5: %r" % (len(passed), passed)
+    # [GAS-RESERVE] The sixth is the reserve coins this offer must not lock,
+    # derived from the same offer_dict; checked below the five.
+    assert len(passed) == 6, (
+        "the wallet create takes %d arguments, expected 6: %r" % (len(passed), passed)
     )
+    assert passed[5] == "excluded", (
+        "the sixth argument is %r, not the reserve coins derived for this "
+        "offer" % passed[5])
+    assert wrapper.count(
+        "excluded=reserved_coins_for_offer(offer_dict,reserved_coins_by_wallet_);"
+    ) == 1, "the reserve coins are not derived from the offer_dict being sent"
     for i, (token, why) in enumerate((
             ("offer_dict", "the dict the floor was derived from"),
             ("current_fee_mojos_", "the fee the engine is paying"),
@@ -302,7 +312,10 @@ def test_the_wrapper_applies_the_rule_and_the_fallback():
             "argument %d of the wallet create is %r, which does not mention %r "
             "(%s)" % (i + 1, passed[i], token, why)
         )
-    assert "[this,&offer_dict,expiry_max_time](std::optional<std::uint64_t>coin_floor)" in wrapper
+    # [GAS-RESERVE] The lambda also captures the reserve coins, by reference:
+    # it hands back the wallet's awaitable synchronously, as for offer_dict.
+    assert ("[this,&offer_dict,expiry_max_time,&excluded]"
+            "(std::optional<std::uint64_t>coin_floor)") in wrapper
     # The warning has to name the offer and the constraint.  Read through
     # _code() so a COMMENT cannot satisfy the assertion: the tag has to live in
     # a real string literal (keep_strings), the arguments in real code.
