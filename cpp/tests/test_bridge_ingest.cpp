@@ -17,7 +17,10 @@
 #include <xop/config.hpp>
 
 #include <cmath>
+#include <limits>
+#include <optional>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -366,6 +369,120 @@ TEST(BridgeConfigTest, DefaultsMatchTheLiveDeployment) {
     EXPECT_EQ(acc.bridge_asset_id,
               "fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901b"
               "aa6b7a99d");
+    // [WARP-MILLIETH] wmilliETH.b, the warp service's other asset.
+    ASSERT_EQ(acc.bridge_secondary_asset_ids.size(), 1u);
+    EXPECT_EQ(acc.bridge_secondary_asset_ids[0],
+              "f322a205c034fe28681829fa5a2e483ac421f0952eb1292945c8db06e"
+              "0a471a6");
+}
+
+// ============================================================================
+// Secondary bridge assets ([WARP-MILLIETH 2026-10-24])
+// ============================================================================
+
+const std::string kWmilliEth =
+    "f322a205c034fe28681829fa5a2e483ac421f0952eb1292945c8db06e0a471a6";
+// A milliETH job's fingerprint as service.py _asset_fingerprint writes it:
+// warp.green's MilliETH wrapper on Base (3 decimals) and 3 on Chia.
+const std::string kWmilliEthFingerprint =
+    "v1:0xf2d5d8ec69e2faed5eb4de90749c87ee314a4b12:3:3:" + kWmilliEth;
+
+TEST(SecondaryBridgeAssetTest, MembershipAndFingerprintRouting) {
+    const std::vector<std::string> ids{kWmilliEth};
+    EXPECT_TRUE(is_secondary_bridge_asset(ids, kWmilliEth));
+    EXPECT_FALSE(is_secondary_bridge_asset(ids, std::string(64, 'a')));
+    EXPECT_FALSE(is_secondary_bridge_asset({}, kWmilliEth));
+    EXPECT_TRUE(is_secondary_bridge_asset_job(ids, kWmilliEthFingerprint));
+    // A wUSDC.b job is not routed away from the bridge-asset scan.
+    EXPECT_FALSE(is_secondary_bridge_asset_job(
+        ids, "v1:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913:6:3:"
+             "fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d"));
+    EXPECT_FALSE(is_secondary_bridge_asset_job(ids, ""));
+}
+
+TEST(SecondaryBridgeAssetTest, ValuedAtTheLiveMarkFirst) {
+    // $3.95 per wmilliETH.b in the 1e12 pseudo-price convention.
+    const auto px = secondary_flow_usd_per_unit(3'950'000'000'000LL, 3.10);
+    ASSERT_TRUE(px.has_value());
+    EXPECT_DOUBLE_EQ(*px, 3.95);
+}
+
+TEST(SecondaryBridgeAssetTest, ThenAtTheCarriedPrice) {
+    const auto px = secondary_flow_usd_per_unit(0, 3.10);
+    ASSERT_TRUE(px.has_value());
+    EXPECT_DOUBLE_EQ(*px, 3.10);
+}
+
+TEST(SecondaryBridgeAssetTest, WithNeitherTheFlowWaits) {
+    EXPECT_FALSE(secondary_flow_usd_per_unit(0, std::nullopt).has_value());
+    EXPECT_FALSE(secondary_flow_usd_per_unit(-5, std::nullopt).has_value());
+    EXPECT_FALSE(secondary_flow_usd_per_unit(0, 0.0).has_value());
+    EXPECT_FALSE(secondary_flow_usd_per_unit(0, -1.0).has_value());
+    EXPECT_FALSE(secondary_flow_usd_per_unit(0, std::nan("")).has_value());
+    EXPECT_FALSE(secondary_flow_usd_per_unit(
+                     0, std::numeric_limits<double>::infinity())
+                     .has_value());
+}
+
+TEST(SecondaryBridgeAssetTest, AnUnwrapIsBookedAtItsUsdValue) {
+    // 0.547 wmilliETH.b burned at $3.95: -$2.16065 of external capital.
+    const auto val = value_bridge_flow(-547, 1e3, 3.95);
+    EXPECT_NEAR(val.flow_usd, -2.16065, 1e-9);
+    EXPECT_EQ(val.fmv_pseudo_price, 3'950'000'000'000LL);
+    EXPECT_NEAR(parse_bridge_flow_usd(bridge_note(val.flow_usd, 3.95, 7)),
+                -2.16065, 1e-9);
+}
+
+TEST(SecondaryInventoryPlanTest, NoAbsoluteWriteMovesInventoryByTheFlow) {
+    const auto burn = plan_secondary_inventory(5'000, -547, "",
+                                               "2026-10-24T12:00:00Z");
+    EXPECT_EQ(burn.action, SecondaryInventoryAction::Relative);
+    EXPECT_EQ(burn.target, 4'453);
+    const auto mint = plan_secondary_inventory(5'000, 1'200, "",
+                                               "2026-10-24T12:00:00Z");
+    EXPECT_EQ(mint.action, SecondaryInventoryAction::Relative);
+    EXPECT_EQ(mint.target, 6'200);
+}
+
+TEST(SecondaryInventoryPlanTest, AnAbsoluteWriteBeforeTheFlowStillAllowsRelative) {
+    // The startup seed ran at 09:00; the burn was broadcast at 12:00, so
+    // the seeded quantity cannot contain it.
+    const auto p = plan_secondary_inventory(
+        5'000, -547, "2026-10-24T09:00:00Z", "2026-10-24T12:00:00Z");
+    EXPECT_EQ(p.action, SecondaryInventoryAction::Relative);
+    EXPECT_EQ(p.target, 4'453);
+}
+
+TEST(SecondaryInventoryPlanTest, AnAbsoluteWriteAtOrAfterTheFlowReadsTheWallet) {
+    // Step 11's one-shot reconcile ran after the broadcast: it may already
+    // have set the post-burn balance, and -547 again would count it twice.
+    EXPECT_EQ(plan_secondary_inventory(4'453, -547, "2026-10-24T12:05:00Z",
+                                       "2026-10-24T12:00:00Z").action,
+              SecondaryInventoryAction::WalletTruth);
+    // A tie is treated as overlapping.
+    EXPECT_EQ(plan_secondary_inventory(4'453, -547, "2026-10-24T12:00:00Z",
+                                       "2026-10-24T12:00:00Z").action,
+              SecondaryInventoryAction::WalletTruth);
+}
+
+TEST(SecondaryInventoryPlanTest, ImpossibleArithmeticReadsTheWallet) {
+    // The tracker was already short of the burn.
+    EXPECT_EQ(plan_secondary_inventory(300, -547, "",
+                                       "2026-10-24T12:00:00Z").action,
+              SecondaryInventoryAction::WalletTruth);
+    EXPECT_EQ(plan_secondary_inventory(
+                  std::numeric_limits<xop::Mojo>::max() - 5, 10, "",
+                  "2026-10-24T12:00:00Z").action,
+              SecondaryInventoryAction::WalletTruth);
+    EXPECT_EQ(plan_secondary_inventory(-1, 10, "",
+                                       "2026-10-24T12:00:00Z").action,
+              SecondaryInventoryAction::WalletTruth);
+}
+
+TEST(SecondaryInventoryPlanTest, AMalformedFloorWithAWriteOnRecordReadsTheWallet) {
+    EXPECT_EQ(plan_secondary_inventory(5'000, -547, "2026-10-24T09:00:00Z",
+                                       "garbage").action,
+              SecondaryInventoryAction::WalletTruth);
 }
 
 }  // namespace

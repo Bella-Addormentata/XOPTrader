@@ -1166,6 +1166,18 @@ struct StrategyConfig {
     /// Uses the pair's mojos_per_unit for conversion.  Default 1.0.
     double   min_reserve_units{1.0};
 
+    /// [GAS-RESERVE 2026-10-24] Per-asset reserve, in display units, keyed
+    /// by lowercase CAT asset id.  An entry REPLACES min_reserve_units for
+    /// that asset in Step 8's reserve gates and Step 7's inventory
+    /// throttle, and also caps that asset's pools at the very end of
+    /// Step 7 to confirmed-minus-reserve -- the same last-word cap
+    /// fee_reserve_xch gets for XCH -- so the ladder is sized to leave the
+    /// reserve unsold instead of being suppressed outright.  Built for
+    /// wmilliETH.b: the warp rebalancer unwraps it into ETH to pay Base
+    /// gas, and the asks must never sell the last of it.  XCH has its own
+    /// reserve (fee_reserve_xch) and is refused as a key.  Default empty.
+    std::unordered_map<std::string, double> asset_reserve_units;
+
     /// Minimum offer size in base-asset units.  Tiers with a size below
     /// this value (converted to mojos) are dropped in Step 7.  Prevents
     /// dust-sized offers that waste fees and wallet UTXOs.  Default 0.1.
@@ -2271,6 +2283,23 @@ struct AccountingConfig {
     /// monitor above (the peg is MONITORED, not priced in).
     std::string bridge_asset_id{
         "fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d"};
+
+    /// [WARP-MILLIETH 2026-10-24] Further assets the warp bridge moves that
+    /// are NOT the $1 numeraire: wmilliETH.b by default (unwrapped into
+    /// ETH for Base gas, wrapped back from excess ETH).  Their completed
+    /// jobs book as bridge_deposit / bridge_withdrawal like the bridge
+    /// asset's, but valued at the engine's own USD mark (live, else the
+    /// price equity is carrying it at; a flow with neither waits), and
+    /// they reach inventory per flow rather than through the bridge
+    /// asset's single-writer reconcile, since fills keep trading them.
+    /// Lowercase 64-hex ids; an id no enabled pair trades is dropped at
+    /// load (it would have no ledger opening).  [] disables.
+    std::vector<std::string> bridge_secondary_asset_ids{
+        "f322a205c034fe28681829fa5a2e483ac421f0952eb1292945c8db06e0a471a6"};
+    /// Whether the list above came from the file.  Only an explicit entry
+    /// warns when it is dropped for want of an enabled pair; the default
+    /// drops silently on configs that never trade wmilliETH.b.
+    bool bridge_secondary_asset_ids_explicit{false};
 
     // -- Stablecoin peg monitor (2026-07-30) -------------------------------
     //

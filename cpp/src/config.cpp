@@ -291,6 +291,25 @@ double read_optional_finite_in_range(const YAML::Node& node, const std::string& 
     return v;
 }
 
+// [GAS-RESERVE 2026-10-24] A CAT asset id from a config key or list entry,
+// lowercased at the boundary like pair asset ids (downstream lookups
+// compare exactly against lowercased pair/cache/opening keys) and validated
+// as 64 hex characters: a typo would otherwise never match anything while
+// the setting reports itself configured.  "xch" is refused -- every caller
+// is a CAT-only setting.
+std::string normalize_cat_asset_id(std::string id, const std::string& field)
+{
+    std::transform(id.begin(), id.end(), id.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (id.size() != 64
+        || id.find_first_not_of("0123456789abcdef") != std::string::npos) {
+        throw ConfigError(field + ": '" + id + "' is not a 64-character hex "
+                          "CAT asset id");
+    }
+    return id;
+}
+
 // [PACE 2026-09-13] An optional unsigned 32-bit integer within [lo, hi].
 // Parsed through int64_t exactly like read_uint32 (CWE-681).
 std::uint32_t read_optional_uint32_in_range(const YAML::Node& node, const std::string& key,
@@ -1607,6 +1626,36 @@ StrategyConfig parse_strategy(const YAML::Node& root)
         cfg.min_reserve_units = node["min_reserve_units"].as<double>();
         if (cfg.min_reserve_units < 0.0) {
             throw ConfigError(sec + ".min_reserve_units must be >= 0");
+        }
+    }
+    if (node["asset_reserve_units"] && node["asset_reserve_units"].IsDefined()
+        && !node["asset_reserve_units"].IsNull()) {
+        const auto aru = node["asset_reserve_units"];
+        if (!aru.IsMap()) {
+            throw ConfigError(sec + ".asset_reserve_units must be a mapping "
+                              "of CAT asset id to units");
+        }
+        cfg.asset_reserve_units.clear();
+        for (const auto& kv : aru) {
+            const std::string raw = kv.first.as<std::string>();
+            const std::string field = sec + ".asset_reserve_units['" + raw + "']";
+            if (raw.size() == 3
+                && std::tolower(static_cast<unsigned char>(raw[0])) == 'x'
+                && std::tolower(static_cast<unsigned char>(raw[1])) == 'c'
+                && std::tolower(static_cast<unsigned char>(raw[2])) == 'h') {
+                throw ConfigError(field + ": XCH's reserve is "
+                                  + sec + ".fee_reserve_xch");
+            }
+            const std::string key = normalize_cat_asset_id(raw, field);
+            const double v = kv.second.as<double>();
+            // Finite first: every range comparison is false for NaN.
+            if (!std::isfinite(v) || v < 0.0 || v > 1e9) {
+                throw ConfigError(field + " must be a finite number of units "
+                                  "in [0, 1e9]");
+            }
+            if (!cfg.asset_reserve_units.emplace(key, v).second) {
+                throw ConfigError(field + " is listed twice");
+            }
         }
     }
     if (node["min_offer_size_units"] && node["min_offer_size_units"].IsDefined()
@@ -3390,6 +3439,44 @@ AccountingConfig parse_accounting(const YAML::Node& root)
             }
         }
     }
+    if (node["bridge_secondary_asset_ids"]
+        && node["bridge_secondary_asset_ids"].IsDefined()
+        && !node["bridge_secondary_asset_ids"].IsNull()) {
+        const auto list = node["bridge_secondary_asset_ids"];
+        if (!list.IsSequence()) {
+            throw ConfigError("accounting.bridge_secondary_asset_ids must be "
+                              "a list of CAT asset ids");
+        }
+        cfg.bridge_secondary_asset_ids.clear();
+        cfg.bridge_secondary_asset_ids_explicit = true;
+        for (const auto& entry : list) {
+            if (!entry.IsScalar()) {
+                throw ConfigError("accounting.bridge_secondary_asset_ids must "
+                                  "be a list of CAT asset ids");
+            }
+            const std::string id = normalize_cat_asset_id(
+                entry.as<std::string>(),
+                "accounting.bridge_secondary_asset_ids");
+            if (std::find(cfg.bridge_secondary_asset_ids.begin(),
+                          cfg.bridge_secondary_asset_ids.end(), id)
+                != cfg.bridge_secondary_asset_ids.end()) {
+                throw ConfigError("accounting.bridge_secondary_asset_ids "
+                                  "lists " + id + " twice");
+            }
+            cfg.bridge_secondary_asset_ids.push_back(id);
+        }
+    }
+    // Checked after both keys are read, whatever their order in the file:
+    // the bridge asset is the $1 numeraire with its own single-writer
+    // reconcile, and booking it a second time at a market mark would
+    // double-count every flow.
+    for (const auto& id : cfg.bridge_secondary_asset_ids) {
+        if (id == cfg.bridge_asset_id) {
+            throw ConfigError("accounting.bridge_secondary_asset_ids must not "
+                              "contain accounting.bridge_asset_id (" + id
+                              + ")");
+        }
+    }
     if (node["reward_asset_id"] && node["reward_asset_id"].IsDefined()
         && !node["reward_asset_id"].IsNull()) {
         cfg.reward_asset_id = node["reward_asset_id"].as<std::string>();
@@ -3722,6 +3809,8 @@ void log_config_summary(const AppConfig& cfg)
         << "  taker_min_spendable = " << cfg.strategy.taker_min_spendable_xch << "\n"
         << "  block_time_seconds = " << cfg.strategy.block_time_seconds << "\n"
         << "  min_reserve_units = " << cfg.strategy.min_reserve_units << "\n"
+        << "  asset_reserve_units = " << cfg.strategy.asset_reserve_units.size()
+        << " asset(s)\n"
         << "  min_offer_size_units = " << cfg.strategy.min_offer_size_units << "\n"
         << "  max_offer_size_units = " << cfg.strategy.max_offer_size_units << "\n"
         << "  min_trading_units = " << cfg.strategy.min_trading_units << "\n"
@@ -5080,6 +5169,35 @@ AppConfig load_config(const std::string& path,
                 "Enable a pair that trades the asset to activate bridge "
                 "accounting.",
                 cfg.accounting.bridge_asset_id.substr(0, 12));
+        }
+    }
+
+    // [WARP-MILLIETH 2026-10-24] The same rule for each secondary bridge
+    // asset, per asset: one no enabled pair trades would get no ledger
+    // opening, so its flows could never book.  Dropped rather than thrown
+    // for the same reason; only an id the file listed is worth a warning,
+    // since the default (wmilliETH.b) is dropped on every config that
+    // simply does not trade it.
+    {
+        auto& ids = cfg.accounting.bridge_secondary_asset_ids;
+        for (auto it = ids.begin(); it != ids.end();) {
+            const bool traded = std::any_of(
+                cfg.pairs.begin(), cfg.pairs.end(), [&](const auto& pr) {
+                    return pr.enabled && (pr.base_asset_id == *it
+                                          || pr.quote_asset_id == *it);
+                });
+            if (traded) {
+                ++it;
+                continue;
+            }
+            if (cfg.accounting.bridge_secondary_asset_ids_explicit) {
+                spdlog::warn(
+                    "accounting.bridge_secondary_asset_ids: {}... dropped -- "
+                    "no ENABLED pair trades it, so it would have no ledger "
+                    "opening and its bridge flows could never book",
+                    it->substr(0, 12));
+            }
+            it = ids.erase(it);
         }
     }
 

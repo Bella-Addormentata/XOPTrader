@@ -21,6 +21,7 @@
 
 #include "xop/engine.hpp"
 #include "xop/feed_listings.hpp"
+#include "xop/execution/asset_reserve.hpp"
 #include "xop/execution/exposure_gate.hpp"
 #include "xop/execution/fair_value_solver.hpp"
 #include "xop/execution/par_anchor.hpp"
@@ -3208,8 +3209,13 @@ asio::awaitable<void> Engine::poll_loop_coro()
                     // defaults to 0 above, and recording that as a
                     // genuine zero opening would permanently misdate
                     // every historical bridge flow.
+                    // [WARP-MILLIETH] Secondary bridge assets too: a first
+                    // wrap into an empty wallet needs the same anchor.
                     if (config_.accounting.bridge_ingest_enabled
-                        && aid == config_.accounting.bridge_asset_id
+                        && (aid == config_.accounting.bridge_asset_id
+                            || accounting::is_secondary_bridge_asset(
+                                   config_.accounting.bridge_secondary_asset_ids,
+                                   aid))
                         && bal_json.contains("confirmed_wallet_balance")
                         && confirmed >= 0) {
                         genesis_balances[AssetId{aid}] = confirmed;
@@ -3238,8 +3244,13 @@ asio::awaitable<void> Engine::poll_loop_coro()
                     // uses the live mid-price to convert base->quote.
                     // What matters is that total_quantity reflects the
                     // real mojos held.
+                    const Mojo before_seed =
+                        inventory_->net_inventory(AssetId{aid});
                     inventory_->seed_position(AssetId{aid}, seed_qty,
                                               Mojo{1});
+                    if (inventory_->net_inventory(AssetId{aid}) != before_seed) {
+                        note_inventory_absolute_write(aid);
+                    }
                     total_seeded += seed_qty;
 
                     spdlog::info("[Engine] Seeded inventory for asset {} "
@@ -5224,6 +5235,11 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
     try { co_await step_ingest_bridge_flows(block_height); }
     catch (const std::exception& e) {
         spdlog::error("[Engine] Bridge ingestion failed: {}", e.what());
+    }
+    try { co_await step_ingest_secondary_bridge_flows(block_height); }
+    catch (const std::exception& e) {
+        spdlog::error("[Engine] Secondary bridge ingestion failed: {}",
+                      e.what());
     }
 
     // [LEDGER 2026-07-30] Tie the books to the wallet.  Runs after Step 2
@@ -10132,6 +10148,75 @@ void Engine::step_generate_ladder(BlockHeight block_height)
             }
         }
 
+        // -- [GAS-RESERVE 2026-10-24] FINAL per-asset reserve caps ----------
+        // The CAT counterpart of the XCH caps just above, for assets with a
+        // strategy.asset_reserve_units entry (wmilliETH.b: the warp
+        // rebalancer unwraps it for Base gas).  Same placement and the same
+        // rule -- after every pool-raising transform, against
+        // confirmed-minus-reserve -- so the ladder is SIZED to leave the
+        // reserve unsold; Step 8's reserve gates would otherwise see the
+        // whole side breach and suppress it outright.  A balance never
+        // observed skips (Step 8's gates still hold), exactly as the CAT
+        // wallet caps above treat it.
+        if (pair_cfg && !config_.strategy.asset_reserve_units.empty()) {
+            const auto reserve_for = [&](const std::string& asset_id,
+                                         Mojo mojos_per_unit)
+                -> std::optional<std::pair<Mojo, Mojo>> {
+                if (asset_id == "xch") return std::nullopt;
+                const auto rit =
+                    config_.strategy.asset_reserve_units.find(asset_id);
+                if (rit == config_.strategy.asset_reserve_units.end()) {
+                    return std::nullopt;
+                }
+                const auto bit = cached_wallet_balances_.find(asset_id);
+                if (bit == cached_wallet_balances_.end()) return std::nullopt;
+                return std::make_pair(
+                    bit->second.confirmed,
+                    execution::reserve_units_to_mojos(rit->second,
+                                                      mojos_per_unit));
+            };
+
+            // Ask side: the pool is base mojos of the reserved asset.
+            if (const auto r = reserve_for(pair_cfg->base_asset_id,
+                                           pair_cfg->base_mojos_per_unit)) {
+                const Mojo capped = execution::cap_pool_above_reserve(
+                    avail_inventory, r->first, r->second);
+                if (capped < avail_inventory) {
+                    spdlog::info("[Engine] Step 7: {} ask pool {} -> {} base "
+                                 "mojos (confirmed {} minus {} reserve {})",
+                                 pair_name, avail_inventory, capped, r->first,
+                                 pair_cfg->base_asset_id.substr(0, 12),
+                                 r->second);
+                    avail_inventory = capped;
+                }
+            }
+
+            // Bid side: the pool is BASE mojos bought with the reserved
+            // quote asset -- cap at what confirmed-minus-reserve buys at
+            // the mid, with the XCH-quote cap's nullopt-skips rule.
+            if (pair_cfg->base_mojos_per_unit > 0) {
+                if (const auto r = reserve_for(pair_cfg->quote_asset_id,
+                                               pair_cfg->quote_mojos_per_unit)) {
+                    const Mojo budget = execution::cap_pool_above_reserve(
+                        r->first, r->first, r->second);
+                    const auto bid_cap = try_affordable_base_mojos(
+                        static_cast<double>(budget),
+                        static_cast<double>(pair_cfg->quote_mojos_per_unit),
+                        market_mid,
+                        static_cast<double>(pair_cfg->base_mojos_per_unit));
+                    if (bid_cap.has_value() && avail_capital > *bid_cap) {
+                        spdlog::info("[Engine] Step 7: {} bid pool {} -> {} "
+                                     "base mojos ({} confirmed {} minus "
+                                     "reserve {})",
+                                     pair_name, avail_capital, *bid_cap,
+                                     pair_cfg->quote_asset_id.substr(0, 12),
+                                     r->first, r->second);
+                        avail_capital = *bid_cap;
+                    }
+                }
+            }
+        }
+
         // -- Minimum ladder half-spread (uncertainty-scaled) ----------------
         // The ladder's minimum half-spread is
         //     max(configured tier spacing, k_sigma * combined_sigma,
@@ -11332,8 +11417,12 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                     critical_threshold = std::max(
                         config_.strategy.xch_ask_throttle_critical_xch, 0.0);
                 } else {
+                    // [GAS-RESERVE] The asset's own reserve when it has one.
                     critical_threshold = std::max(
-                        config_.strategy.min_reserve_units, 0.0);
+                        execution::effective_reserve_units(
+                            config_.strategy.asset_reserve_units,
+                            config_.strategy.min_reserve_units, spend_asset),
+                        0.0);
                     low_threshold = std::max(
                         config_.strategy.min_trading_units,
                         critical_threshold + 0.01);
@@ -13542,6 +13631,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                         {
                             inventory_->seed_position(tracked_asset, confirmed,
                                                       Mojo{1});
+                            note_inventory_absolute_write(sb.label);
                             spdlog::warn("[Engine] Step 8: recovered inventory "
                                          "seed for asset {} from wallet "
                                          "confirmed balance {} mojos",
@@ -13708,9 +13798,15 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                         }
 
                         // Gate 3: minimum balance management (unit-based).
-                        const auto reserve_mojos = static_cast<Mojo>(std::llround(
-                            config_.strategy.min_reserve_units
-                            * static_cast<double>(sb.mojos_per_unit)));
+                        // [GAS-RESERVE] A strategy.asset_reserve_units entry
+                        // replaces min_reserve_units for its asset.
+                        const double reserve_units =
+                            execution::effective_reserve_units(
+                                config_.strategy.asset_reserve_units,
+                                config_.strategy.min_reserve_units, sb.label);
+                        const Mojo reserve_mojos =
+                            execution::reserve_units_to_mojos(
+                                reserve_units, sb.mojos_per_unit);
                         const auto trading_mojos = static_cast<Mojo>(std::llround(
                             config_.strategy.min_trading_units
                             * static_cast<double>(sb.mojos_per_unit)));
@@ -13722,7 +13818,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                          "reserve {:.3f} -- suppressing {} side",
                                          sb.label,
                                          static_cast<double>(spendable) / sb.mojos_per_unit,
-                                         config_.strategy.min_reserve_units,
+                                         reserve_units,
                                          sb.is_base ? "ask" : "bid");
                             if (sb.is_base) can_ask = false;
                             else            can_bid = false;
@@ -19685,9 +19781,12 @@ void Engine::post_ledger_genesis(
         // rightly drops the historical job.  A 0-mojo opening anchors the
         // timeline BEFORE the flow, so the deposit books as external
         // capital.
+        // [WARP-MILLIETH] ...and so does each secondary bridge asset.
         const bool is_bridge_asset =
             config_.accounting.bridge_ingest_enabled
-            && asset == AssetId{config_.accounting.bridge_asset_id};
+            && (asset == AssetId{config_.accounting.bridge_asset_id}
+                || accounting::is_secondary_bridge_asset(
+                       config_.accounting.bridge_secondary_asset_ids, asset));
         if (balance < 0 || (balance == 0 && !is_bridge_asset)) continue;
         if (db_->has_ledger_opening(asset)) continue;   // once, ever
 
@@ -20336,56 +20435,21 @@ bool Engine::bridge_accounting_operational() const
         && ledger_opened_assets_.count(AssetId{acc.bridge_asset_id}) > 0;
 }
 
-// [S19 2026-08-23] Book completed warp bridge flows as first-class ledger
-// events.  See accounting/bridge_ingest.hpp for the design rationale and
-// engine.hpp for the contract.  Synchronous on purpose: one read-only
-// SQLite open of a small GUI-owned database per heartbeat, no RPC.
-asio::awaitable<void> Engine::step_ingest_bridge_flows(
-    BlockHeight block_height)
+namespace {
+
+// [WARP-MILLIETH 2026-10-24] The read-only warp_jobs.db scan, moved out of
+// step_ingest_bridge_flows unchanged so the secondary scan reads the same
+// rows the same way.  Returns every booking-eligible job; a missing,
+// locked or truncated read returns none (booking skipped this heartbeat).
+// As a plain function its SQLite guards destruct on return, before either
+// caller can suspend or write the ledger (the round-45 requirement the
+// nested scope used to meet).
+std::vector<accounting::BridgeJobRow> read_bridge_job_rows(
+    const std::string& db_path)
 {
-    const auto& acc = config_.accounting;
-    if (!acc.ledger_enabled || !acc.bridge_ingest_enabled) co_return;
-    if (!db_ || !inventory_ || !pnl_) co_return;
-    if (acc.bridge_asset_id.empty() || acc.bridge_jobs_db_path.empty()) co_return;
-
-    // Same stand-down conditions as the invariant control: without a
-    // genesis baseline (or with known-incomplete books) posting bridge
-    // legs would only deepen the inconsistency.
-    if (!ledger_genesis_done_ || ledger_incomplete_) co_return;
-
-    const AssetId asset{acc.bridge_asset_id};
-    if (!ledger_opened_assets_.count(asset)) co_return;
-
-    // Captured ONCE, before the first anchor can seed (round 35): the
-    // peak-credit gate below compares job completion stamps against
-    // this.
-    if (bridge_process_start_iso_.empty()) {
-        bridge_process_start_iso_ = PnLTracker::timestamp_to_iso(
-            std::chrono::system_clock::now());
-    }
-
-    // The GUI owns warp_jobs.db; the engine only ever reads it.
-    // SQLITE_OPEN_READONLY refuses to create the file and makes writes
-    // impossible at the API level.  A missing file (warp never used on
-    // this host) or a transiently locked one is a clean no-op: unbooked
-    // flows simply remain wallet-vs-books divergence for the invariant to
-    // absorb -- the pre-S19 behaviour, not a new failure mode.
-    // The scan portion below may fail (missing/locked DB, truncated
-    // read); those paths skip BOOKING only.  The wallet-truth reconcile
-    // at the tail still runs (review round 10) -- with Step 8 and
-    // Step 11 both excluding this asset, a permanently unreadable jobs
-    // DB must not leave its inventory without any maintainer.
     std::vector<accounting::BridgeJobRow> jobs;
-
-    {
-    // Nested scope (round 45): both SQLite guards must destruct at the
-    // closing brace below -- BEFORE the wallet co_await, the ledger
-    // writes, and inventory persistence -- so the read-only warp
-    // handle is never held across a suspension or a write.  The
-    // function-scoped form kept it open for the whole pass, which the
-    // old scope-exit comment mis-stated.
     sqlite3* raw_db = nullptr;
-    int rc = sqlite3_open_v2(acc.bridge_jobs_db_path.c_str(), &raw_db,
+    int rc = sqlite3_open_v2(db_path.c_str(), &raw_db,
                              SQLITE_OPEN_READONLY, nullptr);
     // RAII: sqlite3_open_v2 hands back a handle even on failure, and an
     // exception between prepare and finalize must not leak either handle
@@ -20396,7 +20460,7 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
     if (rc != SQLITE_OK) {
         spdlog::debug("[Engine] Bridge ingest: cannot open {} read-only "
                       "({}) -- booking skipped this heartbeat",
-                      acc.bridge_jobs_db_path,
+                      db_path,
                       wdb ? sqlite3_errmsg(wdb) : "out of memory");
     } else {
     // This runs on the engine's io_context thread: a locked database
@@ -20464,7 +20528,7 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
     if (rc != SQLITE_OK) {
         spdlog::warn("[Engine] Bridge ingest: prepare failed on {} ({}) -- "
                      "booking skipped this heartbeat",
-                     acc.bridge_jobs_db_path, sqlite3_errmsg(wdb));
+                     db_path, sqlite3_errmsg(wdb));
     } else {
 
     int step_rc = SQLITE_OK;
@@ -20494,13 +20558,110 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
     if (step_rc != SQLITE_DONE) {
         spdlog::warn("[Engine] Bridge ingest: scan of {} ended with rc={} "
                      "-- partial snapshot discarded, booking skipped "
-                     "this heartbeat", acc.bridge_jobs_db_path, step_rc);
+                     "this heartbeat", db_path, step_rc);
         jobs.clear();
     }
     }  // prepare ok
     }  // open ok
-    }  // scan scope: wdb_guard and stmt_guard destruct HERE (round 45),
-       // before the coroutine can suspend or the ledger is written.
+    return jobs;
+}
+
+}  // namespace
+
+// The bridge scans' on-demand wallet read (contract in engine.hpp).
+// Moved out of step_ingest_bridge_flows unchanged when the secondary scan
+// needed the same read ([WARP-MILLIETH 2026-10-24]).
+asio::awaitable<bool> Engine::fetch_bridge_balance(const AssetId& asset,
+                                                   BlockHeight block_height)
+{
+    // The circuit is consulted last, so only when a fetch is actually
+    // possible (see the round-34 note at the primary scan's call site).
+    if (!offer_mgr_ || !wallet_ || !wallet_->is_open()
+        || !wallet_step_may_run("bridge ingest")) {
+        co_return false;
+    }
+    const std::int64_t wid = offer_mgr_->resolve_wallet_id(asset);
+    if (wid <= 0) co_return false;
+    try {
+        auto bal_json = co_await wallet_->get_wallet_balance(wid);
+        // A missing balance field must not read as a settled
+        // ZERO (review round 22): zero is a valid target now,
+        // and defaulting a malformed response would reconcile
+        // inventory to nothing and let the invariant adjust the
+        // recorded balance away.
+        if (!bal_json.contains("confirmed_wallet_balance")
+            || !bal_json.contains("pending_change")) {
+            spdlog::warn("[Engine] Bridge ingest: balance "
+                         "response missing required fields -- "
+                         "deferring this heartbeat");
+            co_return false;
+        }
+        WalletBalanceEntry e{};
+        e.spendable = bal_json.value("spendable_balance",
+                                     static_cast<Mojo>(0));
+        e.confirmed = bal_json.value("confirmed_wallet_balance",
+                                     static_cast<Mojo>(0));
+        e.pending_change = bal_json.value("pending_change",
+                                          static_cast<Mojo>(0));
+        e.as_of_block = block_height;
+        e.fields_validated = true;  // presence checked above
+        cached_wallet_balances_[asset] = e;
+        co_return e.pending_change == 0;
+    } catch (const std::exception& ex) {
+        spdlog::debug("[Engine] Bridge ingest: on-demand balance "
+                      "fetch failed ({}) -- deferring this "
+                      "heartbeat", ex.what());
+    }
+    co_return false;
+}
+
+void Engine::note_inventory_absolute_write(const std::string& asset_id)
+{
+    inventory_absolute_write_iso_[asset_id] = PnLTracker::timestamp_to_iso(
+        std::chrono::system_clock::now());
+}
+
+// [S19 2026-08-23] Book completed warp bridge flows as first-class ledger
+// events.  See accounting/bridge_ingest.hpp for the design rationale and
+// engine.hpp for the contract.  Synchronous on purpose: one read-only
+// SQLite open of a small GUI-owned database per heartbeat, no RPC.
+asio::awaitable<void> Engine::step_ingest_bridge_flows(
+    BlockHeight block_height)
+{
+    const auto& acc = config_.accounting;
+    if (!acc.ledger_enabled || !acc.bridge_ingest_enabled) co_return;
+    if (!db_ || !inventory_ || !pnl_) co_return;
+    if (acc.bridge_asset_id.empty() || acc.bridge_jobs_db_path.empty()) co_return;
+
+    // Same stand-down conditions as the invariant control: without a
+    // genesis baseline (or with known-incomplete books) posting bridge
+    // legs would only deepen the inconsistency.
+    if (!ledger_genesis_done_ || ledger_incomplete_) co_return;
+
+    const AssetId asset{acc.bridge_asset_id};
+    if (!ledger_opened_assets_.count(asset)) co_return;
+
+    // Captured ONCE, before the first anchor can seed (round 35): the
+    // peak-credit gate below compares job completion stamps against
+    // this.
+    if (bridge_process_start_iso_.empty()) {
+        bridge_process_start_iso_ = PnLTracker::timestamp_to_iso(
+            std::chrono::system_clock::now());
+    }
+
+    // The GUI owns warp_jobs.db; the engine only ever reads it.
+    // SQLITE_OPEN_READONLY refuses to create the file and makes writes
+    // impossible at the API level.  A missing file (warp never used on
+    // this host) or a transiently locked one is a clean no-op: unbooked
+    // flows simply remain wallet-vs-books divergence for the invariant to
+    // absorb -- the pre-S19 behaviour, not a new failure mode.
+    // The scan portion below may fail (missing/locked DB, truncated
+    // read); those paths skip BOOKING only.  The wallet-truth reconcile
+    // at the tail still runs (review round 10) -- with Step 8 and
+    // Step 11 both excluding this asset, a permanently unreadable jobs
+    // DB must not leave its inventory without any maintainer.
+    std::vector<accounting::BridgeJobRow> jobs =
+        read_bridge_job_rows(acc.bridge_jobs_db_path);
 
     // wUSDC.b is the $1.00 numeraire (peg MONITORED, not priced in -- the
     // AccountingConfig peg-monitor doctrine), so no price feed is needed
@@ -20574,41 +20735,8 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
     // transport failure sooner: wallet_step_may_run also refuses after an
     // unanswered failure earlier in this heartbeat.  Evaluated last, so it is
     // consulted only when a fetch is actually needed.
-    if (!snapshot_current && offer_mgr_ && wallet_ && wallet_->is_open()
-        && wallet_step_may_run("bridge ingest")) {
-        const std::int64_t wid = offer_mgr_->resolve_wallet_id(asset);
-        if (wid > 0) {
-            try {
-                auto bal_json = co_await wallet_->get_wallet_balance(wid);
-                // A missing balance field must not read as a settled
-                // ZERO (review round 22): zero is a valid target now,
-                // and defaulting a malformed response would reconcile
-                // inventory to nothing and let the invariant adjust the
-                // recorded balance away.
-                if (!bal_json.contains("confirmed_wallet_balance")
-                    || !bal_json.contains("pending_change")) {
-                    spdlog::warn("[Engine] Bridge ingest: balance "
-                                 "response missing required fields -- "
-                                 "deferring this heartbeat");
-                } else {
-                    WalletBalanceEntry e{};
-                    e.spendable = bal_json.value("spendable_balance",
-                                                 static_cast<Mojo>(0));
-                    e.confirmed = bal_json.value("confirmed_wallet_balance",
-                                                 static_cast<Mojo>(0));
-                    e.pending_change = bal_json.value("pending_change",
-                                                      static_cast<Mojo>(0));
-                    e.as_of_block = block_height;
-                    e.fields_validated = true;  // presence checked above
-                    cached_wallet_balances_[asset] = e;
-                    snapshot_current = e.pending_change == 0;
-                }
-            } catch (const std::exception& ex) {
-                spdlog::debug("[Engine] Bridge ingest: on-demand balance "
-                              "fetch failed ({}) -- deferring this "
-                              "heartbeat", ex.what());
-            }
-        }
+    if (!snapshot_current) {
+        snapshot_current = co_await fetch_bridge_balance(asset, block_height);
     }
     if (!snapshot_current && !jobs.empty()) {
         spdlog::debug("[Engine] Bridge ingest: no usable wallet snapshot "
@@ -20659,6 +20787,12 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
         if (!accounting::fingerprint_matches_asset(flow.asset_fingerprint,
                                                    acc.bridge_asset_id)) {
             bridge_terminal_skip_ids_.insert(flow.event_id);  // terminal
+            // [WARP-MILLIETH] A secondary asset's job is not foreign: the
+            // secondary scan books it, so say nothing here.
+            if (accounting::is_secondary_bridge_asset_job(
+                    acc.bridge_secondary_asset_ids, flow.asset_fingerprint)) {
+                continue;
+            }
             skip_notice("has an asset fingerprint that does not resolve "
                         "to the configured bridge asset: ",
                         flow.asset_fingerprint);
@@ -20911,6 +21045,275 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
     co_return;
 }
 
+// [WARP-MILLIETH 2026-10-24] Book completed warp flows of the SECONDARY
+// bridge assets (accounting.bridge_secondary_asset_ids; wmilliETH.b by
+// default).  What differs from the bridge asset -- valuation at the
+// engine's own mark, inventory moved per flow with a wallet-truth
+// fallback -- and why is in accounting/bridge_ingest.hpp.  Everything else
+// follows step_ingest_bridge_flows above, whose review history its
+// comments carry: the same read-only scan and booking-point selection,
+// the opening chronology filter on the broadcast lower bound, a settled
+// same-block wallet snapshot before booking (so the invariant that runs
+// next ties post-flow books to a post-flow wallet), the journal first as
+// the idempotency gate, and the flow re-anchor for in-process flows.
+asio::awaitable<void> Engine::step_ingest_secondary_bridge_flows(
+    BlockHeight block_height)
+{
+    const auto& acc = config_.accounting;
+    if (!acc.ledger_enabled || !acc.bridge_ingest_enabled) co_return;
+    if (acc.bridge_secondary_asset_ids.empty()) co_return;
+    if (!db_ || !inventory_ || !pnl_) co_return;
+    if (acc.bridge_jobs_db_path.empty()) co_return;
+    if (!ledger_genesis_done_ || ledger_incomplete_) co_return;
+
+    if (bridge_process_start_iso_.empty()) {
+        bridge_process_start_iso_ = PnLTracker::timestamp_to_iso(
+            std::chrono::system_clock::now());
+    }
+
+    const auto usd_per_unit_for = [&](const AssetId& a) {
+        const auto cit = last_asset_usd_price_.find(a);
+        return accounting::secondary_flow_usd_per_unit(
+            asset_usd_pseudo_price(a),
+            cit != last_asset_usd_price_.end()
+                ? std::optional<double>{cit->second}
+                : std::nullopt);
+    };
+    // fingerprint_matches_asset admits 3-decimal CATs only.
+    constexpr double kCatMojosPerUnit = 1e3;
+
+    bool reset_peak  = false;
+    bool inv_changed = false;
+
+    // -- 1. Wallet-truth passes owed by earlier bookings ---------------------
+    // Keys copied first: the loop suspends on the wallet read.
+    std::vector<std::string> due_assets;
+    due_assets.reserve(secondary_truth_due_.size());
+    for (const auto& [aid, due] : secondary_truth_due_) {
+        due_assets.push_back(aid);
+    }
+    for (const auto& aid : due_assets) {
+        const auto dit = secondary_truth_due_.find(aid);
+        if (dit == secondary_truth_due_.end()) continue;
+        const SecondaryTruthDue due = dit->second;
+        // A snapshot taken AFTER the booking, and no fill awaiting
+        // confirmation whose wallet effect the tracker has yet to see
+        // (Step 11's one-shot rule) -- else setting to the wallet could
+        // count that fill twice once it confirms.
+        if (block_height <= due.after_block
+            || !pending_unconfirmed_fills_.empty()) {
+            continue;
+        }
+        const AssetId a{aid};
+        if (!co_await fetch_bridge_balance(a, block_height)) continue;
+        const Mojo wallet = cached_wallet_balances_[a].confirmed;
+        if (wallet < 0) continue;
+        const Mojo tracked = inventory_->net_inventory(a);
+        Mojo add_price = 0;
+        if (wallet > tracked) {
+            // An increase needs a price to cost the new lot (else
+            // adjust_quantity no-ops); wait for one.
+            const auto px = usd_per_unit_for(a);
+            if (px) {
+                add_price = accounting::value_bridge_flow(
+                    wallet - tracked, kCatMojosPerUnit, *px).fmv_pseudo_price;
+            }
+            if (add_price <= 0) continue;
+        }
+        if (wallet != tracked) {
+            inventory_->adjust_quantity(a, wallet, add_price);
+            inv_changed = true;
+            spdlog::info("[Engine] Bridge ingest: {} inventory {} -> {} mojos "
+                         "from wallet truth (a booked flow overlapped an "
+                         "earlier wallet-set quantity)",
+                         aid.substr(0, 12), tracked, wallet);
+        }
+        note_inventory_absolute_write(aid);
+        reset_peak = reset_peak || due.reset_peak;
+        secondary_truth_due_.erase(aid);
+    }
+
+    // -- 2. Book this scan's flows -------------------------------------------
+    const std::vector<accounting::BridgeJobRow> jobs =
+        read_bridge_job_rows(acc.bridge_jobs_db_path);
+    const auto  now        = std::chrono::system_clock::now();
+    std::size_t booked     = 0;
+    double      booked_usd = 0.0;
+
+    for (const auto& sid : acc.bridge_secondary_asset_ids) {
+        const AssetId asset{sid};
+        // No opening, no chronology: such flows stay with the divergence
+        // control, as every flow did before S19.
+        if (!ledger_opened_assets_.count(asset)) continue;
+        const std::string opening_time = db_->ledger_opening_time(asset);
+        if (opening_time.empty()) continue;
+
+        struct Candidate {
+            const accounting::BridgeJobRow* row;
+            accounting::BridgeFlow          flow;
+            std::string                     floor;
+        };
+        std::vector<Candidate> candidates;
+        for (const auto& row : jobs) {
+            auto flow = accounting::classify_bridge_job(row);
+            // Unclassifiable rows are the bridge-asset scan's to report.
+            if (!flow.valid) continue;
+            if (!accounting::fingerprint_matches_asset(flow.asset_fingerprint,
+                                                       sid)) {
+                continue;
+            }
+            if (secondary_booked_event_ids_.count(flow.event_id)
+                || secondary_terminal_skip_ids_.count(flow.event_id)) {
+                continue;
+            }
+            if (row.flow_at.empty()) {
+                // Not terminal: may heal (see the bridge-asset scan).
+                if (secondary_warned_jobs_.insert(row.id).second) {
+                    spdlog::warn("[Engine] Bridge ingest: job {} ({}) has no "
+                                 "recorded transition event -- skipped (left "
+                                 "for the divergence control)",
+                                 row.id, sid.substr(0, 12));
+                }
+                continue;
+            }
+            std::string floor =
+                row.flow_lb.empty() ? row.flow_at : row.flow_lb;
+            if (!accounting::iso_strictly_after(floor, opening_time)) {
+                // Terminal: inside the opening balance (bridge-asset scan,
+                // review rounds 1, 17 and 33).
+                secondary_terminal_skip_ids_.insert(flow.event_id);
+                spdlog::debug("[Engine] Bridge ingest: job {} may predate the "
+                              "{} ledger opening ({}) -- treated as inside "
+                              "the opening balance, not booked",
+                              row.id, sid.substr(0, 12), opening_time);
+                continue;
+            }
+            candidates.push_back({&row, std::move(flow), std::move(floor)});
+        }
+        if (candidates.empty()) continue;
+
+        // Priced first, so a flow waiting on a price costs no wallet read.
+        const auto usd_per_unit = usd_per_unit_for(asset);
+        if (!usd_per_unit) {
+            if (secondary_unpriced_warned_.insert(sid).second) {
+                spdlog::warn("[Engine] Bridge ingest: {} has no USD price "
+                             "(live or carried) -- {} flow(s) wait to book",
+                             sid.substr(0, 12), candidates.size());
+            }
+            continue;
+        }
+        secondary_unpriced_warned_.erase(sid);
+
+        // A settled snapshot that postdates this scan (bridge-asset scan,
+        // rounds 17 and 31): booking against an older one would let the
+        // invariant, next in this heartbeat, adjust the flow straight back.
+        if (!co_await fetch_bridge_balance(asset, block_height)) {
+            spdlog::debug("[Engine] Bridge ingest: no settled {} wallet "
+                          "snapshot -- booking deferred this heartbeat",
+                          sid.substr(0, 12));
+            continue;
+        }
+
+        for (const auto& c : candidates) {
+            const auto& row  = *c.row;
+            const auto& flow = c.flow;
+            const auto val = accounting::value_bridge_flow(
+                flow.delta_mojos, kCatMojosPerUnit, *usd_per_unit);
+            if (val.fmv_pseudo_price <= 0) {
+                // Not terminal here: the price, unlike the numeraire, moves.
+                if (secondary_warned_jobs_.insert(row.id).second) {
+                    spdlog::warn("[Engine] Bridge ingest: job {} ({}) has a "
+                                 "flow the valuation guard rejects at "
+                                 "${}/unit -- waiting",
+                                 row.id, sid.substr(0, 12), *usd_per_unit);
+                }
+                continue;
+            }
+
+            // Journal first (crash-consistent, and the idempotency gate).
+            DbLedgerEntry e;
+            e.entry_time   = PnLTracker::timestamp_to_iso(now);
+            e.event_type   = flow.event_type;
+            e.event_id     = flow.event_id;
+            e.leg          = "bridge";
+            e.asset_id     = asset;
+            e.delta_mojos  = flow.delta_mojos;
+            e.block_height = block_height;
+            e.note         = accounting::bridge_note(val.flow_usd,
+                                                     *usd_per_unit, row.id);
+            const auto inserted = db_->append_ledger_entries({e});
+            if (!inserted) {
+                spdlog::error("[Engine] Bridge ingest: ledger write FAILED for "
+                              "job {} ({}) -- retrying next heartbeat",
+                              row.id, sid.substr(0, 12));
+                break;
+            }
+            secondary_booked_event_ids_.insert(flow.event_id);
+            if (*inserted == 0) continue;   // booked before this process
+
+            // External capital, kept out of trading P&L (GIPS/TWR).
+            pnl_->add_net_deposit_usd(val.flow_usd);
+
+            const bool in_process = accounting::iso_strictly_after(
+                row.flow_at, bridge_process_start_iso_);
+            const Mojo tracked = inventory_->net_inventory(asset);
+            const auto it_abs = inventory_absolute_write_iso_.find(sid);
+            const auto plan = accounting::plan_secondary_inventory(
+                tracked, flow.delta_mojos,
+                it_abs != inventory_absolute_write_iso_.end()
+                    ? it_abs->second : std::string{},
+                c.floor);
+            const bool relative =
+                plan.action == accounting::SecondaryInventoryAction::Relative;
+            if (relative) {
+                inventory_->adjust_quantity(asset, plan.target,
+                                            val.fmv_pseudo_price);
+                inv_changed = true;
+                reset_peak = reset_peak || in_process;
+            } else {
+                // The re-anchor waits for the wallet-truth pass, so the
+                // peak re-seeds from equity that already holds the flow.
+                auto& due = secondary_truth_due_[sid];
+                due.after_block = block_height;
+                due.reset_peak  = due.reset_peak || in_process;
+            }
+
+            ++booked;
+            booked_usd += val.flow_usd;
+            spdlog::info("[Engine] Bridge flow: {} {:+} mojos of {} (job {}, "
+                         "${:+.6f} at ${:.6f}/unit) booked at block {}; "
+                         "inventory {}",
+                         flow.event_type, flow.delta_mojos, sid.substr(0, 12),
+                         row.id, val.flow_usd, *usd_per_unit, block_height,
+                         relative
+                             ? std::to_string(tracked) + " -> "
+                                   + std::to_string(plan.target) + " mojos"
+                             : std::string{"follows the wallet next "
+                                           "heartbeat"});
+        }
+    }
+
+    if (booked > 0) {
+        spdlog::info("[Engine] Bridge ingest: booked {} secondary-asset "
+                     "flow(s), net ${:+.6f} external capital at block {}",
+                     booked, booked_usd, block_height);
+    }
+
+    // The flow re-anchor (bridge-asset scan, round 42): restart semantics.
+    if (reset_peak && peak_equity_hwm_usd_ > 0.0) {
+        spdlog::info("[Engine] Bridge ingest: external flow booked -- "
+                     "drawdown peak {:.2f} discarded; the next equity "
+                     "valuation re-anchors it (restart semantics)",
+                     peak_equity_hwm_usd_);
+        peak_equity_hwm_usd_ = 0.0;
+    }
+
+    if (inv_changed) {
+        persist_inventory_state();
+    }
+    co_return;
+}
+
 void Engine::step_check_ledger_invariant(BlockHeight block_height)
 {
     const auto& acc = config_.accounting;
@@ -20958,7 +21361,11 @@ void Engine::step_check_ledger_invariant(BlockHeight block_height)
         if (cached.confirmed < 0) continue;
         if (cached.confirmed == 0
             && !(acc.bridge_ingest_enabled
-                 && asset == acc.bridge_asset_id
+                 && (asset == acc.bridge_asset_id
+                     // [WARP-MILLIETH] An unwrap can drain a secondary
+                     // bridge asset to zero just the same.
+                     || accounting::is_secondary_bridge_asset(
+                            acc.bridge_secondary_asset_ids, asset))
                  && cached.fields_validated)) {
             continue;
         }
@@ -21465,6 +21872,7 @@ void Engine::step_update_pnl(BlockHeight block_height)
                     }
                     inventory_->adjust_quantity(AssetId{aid}, bal.confirmed,
                                                 usd_price);
+                    note_inventory_absolute_write(aid);
                     mutated = true;
                     spdlog::warn("[Engine] Step 11: reconciled {} inventory "
                                  "{} -> {} mojos against wallet "

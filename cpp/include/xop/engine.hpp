@@ -1840,6 +1840,33 @@ private:
     asio::awaitable<void> step_ingest_bridge_flows(
         BlockHeight block_height);
 
+    /// [WARP-MILLIETH 2026-10-24] The same booking for
+    /// accounting.bridge_secondary_asset_ids (wmilliETH.b by default):
+    /// ledger leg, Net Deposits at the engine's own USD mark, inventory
+    /// moved by the flow itself (or by a wallet-truth pass when an
+    /// absolute inventory write may already contain it), and the flow
+    /// re-anchor of the drawdown peak.  Runs right after
+    /// step_ingest_bridge_flows, before the invariant.  See
+    /// accounting/bridge_ingest.hpp for the rules.
+    asio::awaitable<void> step_ingest_secondary_bridge_flows(
+        BlockHeight block_height);
+
+    /// Fetch @p asset's wallet balance for the bridge scans and cache it
+    /// stamped with @p block_height.  True only when the reply carried
+    /// the confirmed and pending fields and pending_change is zero -- a
+    /// settled snapshot that postdates every job the caller has read.
+    /// False (and no cache write) when the wallet is closed, its circuit
+    /// refuses, the asset has no wallet, or the reply is incomplete.
+    asio::awaitable<bool> fetch_bridge_balance(const AssetId& asset,
+                                               BlockHeight block_height);
+
+    /// [WARP-MILLIETH] Record that @p asset_id's tracked inventory was
+    /// just SET from the wallet (startup seed, Step 8 recovery seed,
+    /// Step 11 one-shot reconcile, a secondary wallet-truth pass), so a
+    /// later secondary flow whose broadcast precedes it is not added on
+    /// top of a quantity that may already contain it.
+    void note_inventory_absolute_write(const std::string& asset_id);
+
     /// Tie the ledger's implied balances to the wallet's confirmed balances
     /// and escalate on sustained, unexplained divergence.  Alert-only unless
     /// accounting.pause_enabled is set.
@@ -2199,6 +2226,29 @@ private:
     /// forever, and one legitimate milliETH job must not warn on every
     /// heartbeat for the lifetime of the database.
     std::set<std::int64_t> bridge_warned_jobs_;
+
+    /// [WARP-MILLIETH 2026-10-24] The secondary scan's counterparts of
+    /// the three caches above (booked, terminal, warned), kept apart so
+    /// neither scan's verdict on a job is mistaken for the other's.
+    std::set<std::string> secondary_booked_event_ids_;
+    std::set<std::string> secondary_terminal_skip_ids_;
+    std::set<std::int64_t> secondary_warned_jobs_;
+    /// Secondary assets already warned about having no USD price while
+    /// a flow waits on one (cleared when a price returns).
+    std::set<std::string> secondary_unpriced_warned_;
+    /// ISO stamp of each asset's last ABSOLUTE inventory write (see
+    /// note_inventory_absolute_write).  In-memory: a restart's startup
+    /// seed and one-shot reconcile re-stamp what they write.
+    std::unordered_map<std::string, std::string> inventory_absolute_write_iso_;
+    /// A wallet-truth pass a booked secondary flow is owed: run on the
+    /// first settled snapshot taken AFTER after_block with no fills
+    /// awaiting confirmation; reset_peak carries the flow re-anchor to
+    /// that moment, so the peak re-seeds from equity that contains it.
+    struct SecondaryTruthDue {
+        BlockHeight after_block{0};
+        bool        reset_peak{false};
+    };
+    std::unordered_map<std::string, SecondaryTruthDue> secondary_truth_due_;
 
     /// [S18 2026-08-23] Consecutive lifted evaluations of the max-drawdown
     /// condition; the re-alert gate only re-arms once this reaches the

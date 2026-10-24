@@ -99,6 +99,7 @@ add_executable(xop_tests
     test_usd_route.cpp
     test_coin_lock_ledger.cpp
     test_exposure_gate.cpp
+    test_asset_reserve.cpp
     test_reservation_offset.cpp
     test_bridge_ingest.cpp
     test_reward_ingest.cpp
