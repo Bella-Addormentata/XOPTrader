@@ -62,6 +62,19 @@ chia:
   # bundle that actually validates that host.
   verify_ssl: false
 
+# --- wallet_link: OPTIONAL ---------------------------------------------------
+# Settings > Wallet Link. Trading always goes through the Chia wallet above.
+# A Sage wallet (https://github.com/xch-dev/sage) can be linked as well; for
+# now that link is read-only (connection test: version, sync, balance).
+# Sage's RPC server is off until you turn it on in Sage's own settings.
+# Its cert/key paths (sage_cert_path, sage_key_path) are machine-specific
+# and live in secrets.yaml; the Detect button on the page fills them in.
+# A config without this section behaves exactly as sage_enabled: false.
+wallet_link:
+  sage_enabled: false
+  sage_host: "127.0.0.1"
+  sage_port: 9257
+
 # --- dexie: REQUIRED ---------------------------------------------------------
 # All fields are REQUIRED.
 dexie:
