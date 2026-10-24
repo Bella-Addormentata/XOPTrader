@@ -63,6 +63,19 @@ struct TopupTakeRow {
     return iso_strictly_after(created_at, opening_time);
 }
 
+/// [review] Whether a take's fee still falls inside the fee budget's rolling
+/// window at block @p now: confirmed at or after `now - window`, the cutoff
+/// FeeTracker::prune applies.  An unknown height (0) counts -- for a budget
+/// the conservative reading.
+[[nodiscard]] inline bool take_fee_in_window(std::uint64_t confirmed_height,
+                                             std::uint64_t now,
+                                             std::uint32_t window) noexcept
+{
+    if (confirmed_height == 0) return true;
+    const std::uint64_t cutoff = now > window ? now - window : 0;
+    return confirmed_height >= cutoff;
+}
+
 /// The ledger shape of a take, from our side.
 struct TopupTakeLegs {
     bool        valid{false};

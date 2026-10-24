@@ -102,6 +102,15 @@ TEST(TopupTakeTest, OverflowingAmountsBookNothing) {
     EXPECT_FALSE(classify_topup_take(r).valid);    // the price overflows
 }
 
+TEST(TopupTakeTest, AFeeCountsWhileItsBlockIsInsideTheBudgetWindow) {
+    // FeeTracker::prune drops entries below now - window.
+    EXPECT_TRUE(take_fee_in_window(9'000, 10'000, 1'662));
+    EXPECT_TRUE(take_fee_in_window(10'000 - 1'662, 10'000, 1'662));
+    EXPECT_FALSE(take_fee_in_window(10'000 - 1'663, 10'000, 1'662));
+    EXPECT_TRUE(take_fee_in_window(0, 10'000, 1'662));      // unknown: counts
+    EXPECT_TRUE(take_fee_in_window(5, 100, 1'662));         // young chain
+}
+
 TEST(TopupTakeTest, ALargeBuyWhosePriceFitsIsBooked) {
     // [review] 10,000 XCH for 3,000,000 mojos: xch * 1000 overflows, the
     // price (3,333,333,333,333.33 -> ...333) does not.

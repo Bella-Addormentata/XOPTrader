@@ -117,6 +117,17 @@ def test_a_take_books_only_on_a_snapshot_this_read_validated():
     assert "cached_wallet_balances_" not in takes
 
 
+def test_a_takes_fee_counts_against_the_fee_budget_once():
+    """[review] Engine takes record their fee in FeeTracker; a top-up take
+    must too, once (both booking branches), and only inside the window."""
+    takes = _body(_engine(), "asio::awaitable<void> Engine::step_ingest_topup_takes(")
+    assert "fee_tracker_->record_fee(" in takes
+    assert "accounting::take_fee_in_window(" in takes
+    assert takes.count("note_fee();") == 2
+    none = takes.index("if (!book_cat && !book_xch) {")
+    assert "note_fee();" in takes[none:none + 300]
+
+
 def test_takes_are_gated_on_the_ledger_not_the_bridge_switch():
     """[review] config.cpp may turn bridge ingest off while the GUI still
     buys gas; the XCH leg must still book against the XCH opening."""

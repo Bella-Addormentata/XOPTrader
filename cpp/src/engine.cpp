@@ -21678,9 +21678,28 @@ asio::awaitable<void> Engine::step_ingest_topup_takes(BlockHeight block_height)
         fill_row.price_mojos           = legs.price_mojos;
         fill_row.fee_mojos             = row.fee_mojos;
 
+        // [review] The take's fee is XCH this wallet spent, so it counts
+        // against the daily fee budget like an engine take's (Step 3's
+        // crossed-book record_fee).  Once per take per process -- the
+        // tracker is in-memory, like every other fee it holds -- and only
+        // while it is still inside the window.  Recorded at THIS block, not
+        // the confirmation block: FeeTracker's queue must stay chronological
+        // for prune(), and the lag only keeps the fee counted a little
+        // longer, the conservative direction for a budget.
+        const auto note_fee = [&] {
+            if (fee_tracker_ && row.fee_mojos > 0
+                && accounting::take_fee_in_window(
+                       row.confirmed_height, block_height,
+                       config_.fees.fee_window_blocks)) {
+                fee_tracker_->record_fee(
+                    static_cast<std::uint64_t>(row.fee_mojos), block_height);
+            }
+        };
+
         if (!book_cat && !book_xch) {
             db_->insert_taker_fill(fill_row);
             topup_booked_ids_.insert(legs.event_id);   // nothing to post
+            note_fee();
             continue;
         }
 
@@ -21722,6 +21741,7 @@ asio::awaitable<void> Engine::step_ingest_topup_takes(BlockHeight block_height)
 
         db_->insert_taker_fill(fill_row);
         topup_booked_ids_.insert(legs.event_id);
+        note_fee();
         if (*inserted == 0) continue;   // booked before this process
 
         // Inventory: both assets moved and the tracker saw neither, so
