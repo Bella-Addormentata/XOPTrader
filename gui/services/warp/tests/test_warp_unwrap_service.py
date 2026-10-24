@@ -42,6 +42,12 @@ class UnwrapFakeEvm(FakeEvm):
         self.domain_ok = True
         self.bridge_liquidity = 10 ** 12
         self.relay_receipts: dict = {}
+        # 1 gwei: a 250k-gas relay (2.5e14 wei) fits the 3e14 relay floor.
+        self.max_fee = 1_000_000_000
+
+    def get_fee_data(self):
+        return SimpleNamespace(max_fee_per_gas=self.max_fee,
+                               max_priority_fee_per_gas=1_000_000)
 
     def get_burn_puzzle_hash(self):
         return self.burn_ph
@@ -233,6 +239,24 @@ def test_offer_locked_balance_pends_rather_than_burning_collateral():
     # Collateral frees (offers closed) -> the same job proceeds.
     ctx.wallet.balances[3]["spendable_balance"] = 50_000
     assert engine.step()["status"] == JobStatus.BURN_SENT
+
+
+def test_a_trimmed_rebalance_unwrap_burns_the_trimmed_size():
+    """[review] The gate's rebalance trim must reach the job's columns:
+    _h_burn_sent (and the engine's ledger booking) read amount_mojos, so a
+    trim held only in the gate's local would burn the stale size."""
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    engine.request_unwrap(AMOUNT, engine._hot_address, automatic=True,
+                          rebalance_target_micros=10_000_000)      # 10 USDC
+    ctx.evm.erc20 = 8_000_000            # 8 USDC landed while it waited
+    out = engine.step()
+    assert out["status"] == JobStatus.BURN_SENT
+    job = store.get_active_job()
+    # 2 USDC still short, grossed for the 30 bps tip (the trim's own
+    # rounding, pinned in test_rebalance.py): 2,006 mojos, not 5,000.
+    assert job.amount_mojos == 2_006
+    assert job.amount_usdc_micros == 2_006 * 1000
 
 
 def test_gates_pass_and_advance_to_burn_sent():
@@ -640,3 +664,70 @@ def test_cap_parsers_reject_junk_with_a_clear_error():
 
     with pytest.raises(S.WarpError, match="min_auto_bridge_usdc"):
         S.warp_params_from_config({"warp": {"min_auto_bridge_usdc": "abc"}})
+
+
+
+def test_a_top_up_rechecks_its_withdraw_gas_right_before_the_cat_spend():
+    """[review] Fees can rise after the gate; an automatic ETH top-up that
+    could no longer withdraw its proceeds is cancelled, unsent."""
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    _to_burn_sent(store, engine, ctx)
+    job = store.get_active_job()
+    store.update_job(job.id, state_patch={"rebalance_eth_target_wei": 10 ** 16})
+    ctx.evm.max_fee = 3 * 10 ** 9
+    ctx.evm.eth = 10 ** 14                          # < 90k gas x 3 gwei
+    out = engine.step()
+    assert out["status"] == JobStatus.CANCELLED
+    assert ctx.wallet.cat_spends == []
+
+    store2 = new_store()
+    engine2, ctx2 = build_unwrap(store2, params=params_with_cap())
+    _to_burn_sent(store2, engine2, ctx2)
+    job2 = store2.get_active_job()
+    store2.update_job(job2.id,
+                      state_patch={"rebalance_eth_target_wei": 10 ** 16})
+    engine2.step()                                  # funded: it sends
+    assert len(ctx2.wallet.cat_spends) == 1
+
+
+
+def test_a_top_up_below_the_burn_minimum_at_send_time_is_cancelled():
+    """[review] Fees can rise between the gate and the send: a funded
+    wallet still must not burn below the economic minimum."""
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    _to_burn_sent(store, engine, ctx)
+    job = store.get_active_job()
+    store.update_job(job.id, state_patch={"rebalance_eth_target_wei": 10 ** 16})
+    ctx.evm.max_fee = 3 * 10 ** 9           # floor 1,025 mojos; ETH is ample
+    _, floor = S._millieth_topup_minimums(3 * 10 ** 9, 10 ** 12)
+    store.update_job(job.id, columns={"amount_mojos": floor - 1})
+    out = engine.step()
+    assert out["status"] == JobStatus.CANCELLED
+    assert ctx.wallet.cat_spends == []
+
+
+
+def test_a_top_up_no_longer_needed_at_send_time_is_cancelled_not_trimmed():
+    """[review] ETH that arrives after the gate must stop the unsent burn;
+    the frozen amount and post-tip columns are never rewritten here."""
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    _to_burn_sent(store, engine, ctx)
+    job = store.get_active_job()
+    store.update_job(job.id, state_patch={"rebalance_eth_target_wei": 10 ** 16})
+    ctx.evm.eth = 10 ** 16 - 10 ** 15        # needs ~1,003 of 5,000 mojos
+    out = engine.step()
+    assert out["status"] == JobStatus.CANCELLED
+    assert ctx.wallet.cat_spends == []
+
+    store2 = new_store()
+    engine2, ctx2 = build_unwrap(store2, params=params_with_cap())
+    _to_burn_sent(store2, engine2, ctx2)
+    job2 = store2.get_active_job()
+    store2.update_job(job2.id,
+                      state_patch={"rebalance_eth_target_wei": 10 ** 16})
+    ctx2.evm.eth = 10 ** 16                  # target met
+    assert engine2.step()["status"] == JobStatus.CANCELLED
+    assert ctx2.wallet.cat_spends == []

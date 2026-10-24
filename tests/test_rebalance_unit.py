@@ -308,3 +308,133 @@ def test_bands_whose_bounds_overflow_refuse_at_parse():
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# --------------------------------------------------------------------------- #
+# [MILLIETH-TOPUP 2026-10-24] wmilliETH.b on Chia as the ETH band's source.
+# --------------------------------------------------------------------------- #
+
+def _wm_params(**src):
+    return rb.RebalanceParams(
+        enabled=True, eth=rb.AssetBand(target=10 ** 16, tolerance_pct=20),
+        wmillieth=rb.WmilliethSource(enabled=True, **src))
+
+
+def test_the_wmillieth_block_parses_and_needs_an_eth_band():
+    p = rb.parse_rebalance_config(_cfg(
+        enabled=True, eth={"target": 0.01, "tolerance_pct": 20},
+        wmillieth={"enabled": True, "buy_on_dexie": "true",
+                   "max_premium_pct": 2, "max_spend_xch": 4,
+                   "take_fee_xch": 0}), min_gas_wei=MIN_GAS)
+    assert p.wmillieth == rb.WmilliethSource(
+        enabled=True, buy_on_dexie=True, max_premium_pct=2.0,
+        max_spend_xch_mojos=4 * 10 ** 12, take_fee_mojos=0)
+    with pytest.raises(rb.RebalanceConfigError, match="needs one"):
+        rb.parse_rebalance_config(_cfg(
+            enabled=True, usdc={"target": 100, "tolerance_pct": 20},
+            wmillieth={"enabled": True}), min_gas_wei=MIN_GAS)
+
+
+@pytest.mark.parametrize("block", [
+    {"enabled": "yes"},                                     # not a boolean
+    {"enabled": True, "buy_on_dexie": 1.5},
+    {"enabled": True, "max_premium_pct": 0},
+    {"enabled": True, "max_premium_pct": 51},
+    {"enabled": True, "max_spend_xch": 0},
+    {"enabled": True, "take_fee_xch": -1},
+    {"enabled": True, "max_premium_pct": "nan"},
+    {"enabled": True, "max_premium_pct": True},
+    "on",
+])
+def test_a_bad_wmillieth_block_fails_closed(block):
+    with pytest.raises(rb.RebalanceConfigError):
+        rb.parse_rebalance_config(_cfg(
+            enabled=True, eth={"target": 0.01, "tolerance_pct": 20},
+            wmillieth=block), min_gas_wei=MIN_GAS)
+
+
+def test_a_disabled_wmillieth_block_is_inert():
+    p = rb.parse_rebalance_config(_cfg(
+        enabled=True, eth={"target": 0.01, "tolerance_pct": 20},
+        wmillieth={"enabled": False, "max_premium_pct": 999}),
+        min_gas_wei=MIN_GAS)
+    assert p.wmillieth is None
+
+
+def test_base_millieth_goes_first_then_chia_then_dexie():
+    short = dict(params=_wm_params(buy_on_dexie=True), eth_wei=10 ** 15,
+                 max_unwrap_millieth_mojos=0)
+    # milliETH on Base: withdraw it, free.
+    assert _plan(**short, millieth_units=5).kind == "unwrap_millieth"
+    # None on Base, some on Chia: unwrap it (9,000 units grossed for the
+    # 30 bps tip, capped to what is spendable).
+    a = _plan(**short, chia_millieth_mojos=5_000)
+    assert (a.kind, a.amount) == ("unwrap_wmillieth", 5_000)
+    a = _plan(**short, chia_millieth_mojos=50_000)
+    assert (a.kind, a.amount) == ("unwrap_wmillieth", 9_028)
+    # None anywhere: buy the grossed amount on Dexie.
+    a = _plan(**short)
+    assert (a.kind, a.amount) == ("buy_wmillieth", 9_028)
+
+
+def test_the_unwrap_cap_bounds_the_top_up_and_unset_plans_nothing():
+    short = dict(params=_wm_params(buy_on_dexie=True), eth_wei=10 ** 15,
+                 chia_millieth_mojos=50_000)
+    a = _plan(**short, max_unwrap_millieth_mojos=2_000)
+    assert (a.kind, a.amount) == ("unwrap_wmillieth", 2_000)
+    # Never configured (-1): the unwrap would be refused, so no leg at all.
+    assert _plan(**short, max_unwrap_millieth_mojos=-1) is None
+
+
+def test_no_dexie_buy_unless_asked_for():
+    assert _plan(params=_wm_params(), eth_wei=10 ** 15,
+                 max_unwrap_millieth_mojos=0) is None
+
+
+
+@pytest.mark.parametrize("block,why", [
+    ({"enabled": True, "max_spend_xch": 1e308}, "max_spend_xch"),
+    ({"enabled": True, "take_fee_xch": 1e308}, "take_fee_xch"),
+    ({"enabled": True, "max_spend_xch": 0.001, "take_fee_xch": 0.001},
+     "below max_spend_xch"),
+])
+def test_wmillieth_limits_are_bounded_and_coherent(block, why):
+    """[review] 1e308 used to overflow the mojo scaling -- an OverflowError,
+    not a RebalanceConfigError, so the old parameters kept running."""
+    with pytest.raises(rb.RebalanceConfigError, match=why):
+        rb.parse_rebalance_config(_cfg(
+            enabled=True, eth={"target": 0.01, "tolerance_pct": 20},
+            wmillieth=block), min_gas_wei=MIN_GAS)
+
+
+
+def test_a_huge_integer_limit_is_a_config_error_not_an_overflow():
+    with pytest.raises(rb.RebalanceConfigError):
+        rb.parse_rebalance_config(_cfg(
+            enabled=True, eth={"target": 0.01, "tolerance_pct": 20},
+            wmillieth={"enabled": True, "max_spend_xch": 10 ** 400}),
+            min_gas_wei=MIN_GAS)
+
+
+def test_no_withdraw_or_burn_smaller_than_its_gas():
+    """[review] A top-up below the economic minimum would cost more ETH
+    than it delivers: it waits (the balance accumulates) instead."""
+    short = dict(params=_wm_params(buy_on_dexie=True), eth_wei=10 ** 15,
+                 max_unwrap_millieth_mojos=0, min_millieth_units=10,
+                 min_wmillieth_mojos=36)
+    # 5 units held on Base, 10 needed: skipped for the Chia source.
+    a = _plan(**short, millieth_units=5, chia_millieth_mojos=50_000)
+    assert a.kind == "unwrap_wmillieth"
+    # 20 mojos on Chia, 36 needed: bought up to the deficit instead.
+    a = _plan(**short, chia_millieth_mojos=20)
+    assert (a.kind, a.amount) == ("buy_wmillieth", 9_028)
+    # A cap below the minimum: nothing burnt or bought at all.
+    assert _plan(**{**short, "max_unwrap_millieth_mojos": 1},
+                 chia_millieth_mojos=50_000) is None
+
+
+def test_a_tiny_deficit_still_moves_at_least_the_minimum():
+    a = _plan(params=_wm_params(), eth_wei=7_999_999_999_999_999,
+              max_unwrap_millieth_mojos=0, chia_millieth_mojos=50_000,
+              min_wmillieth_mojos=4_000)
+    assert (a.kind, a.amount) == ("unwrap_wmillieth", 4_000)

@@ -70,17 +70,39 @@ class AssetBand:
 
 
 @dataclass(frozen=True)
+class WmilliethSource:
+    """[MILLIETH-TOPUP] Chia-side wmilliETH.b as a source for the ETH band.
+
+    When the ETH band is breached and milliETH already on Base cannot cover
+    it, the shortfall is unwrapped from wmilliETH.b held on Chia; with
+    ``buy_on_dexie`` and too little wmilliETH.b on Chia, it is first bought
+    on Dexie with XCH -- one taken ask per cooldown, never more than
+    ``max_premium_pct`` above the CoinGecko ETH/XCH price, never more than
+    ``max_spend_xch_mojos`` per take.
+    """
+
+    enabled: bool = False
+    buy_on_dexie: bool = False
+    max_premium_pct: float = 3.0
+    max_spend_xch_mojos: int = 25 * 10 ** 12
+    take_fee_mojos: int = 100_000_000
+
+
+@dataclass(frozen=True)
 class RebalanceParams:
     enabled: bool = False
     usdc: Optional[AssetBand] = None   # micros
     eth: Optional[AssetBand] = None    # wei
     cooldown_s: int = 600
+    wmillieth: Optional[WmilliethSource] = None
 
 
 @dataclass(frozen=True)
 class RebalanceAction:
     kind: str    # "unwrap_millieth" | "unwrap_usdc" | "wrap_eth" | "bridge_usdc"
-    amount: int  # unwrap_millieth: units; unwrap_usdc: CAT mojos; else base units
+                 # | "unwrap_wmillieth" | "buy_wmillieth"
+    amount: int  # unwrap_millieth: units; unwrap_usdc/unwrap_wmillieth/
+                 # buy_wmillieth: CAT mojos; else base units
     reason: str
 
 
@@ -247,7 +269,82 @@ def parse_rebalance_config(
             "warp.rebalance.cooldown_s must be at least 60 seconds"
         )
     return RebalanceParams(
-        enabled=True, usdc=usdc, eth=eth, cooldown_s=cooldown
+        enabled=True, usdc=usdc, eth=eth, cooldown_s=cooldown,
+        wmillieth=_parse_wmillieth_source(raw.get("wmillieth"), eth),
+    )
+
+
+def _strict_bool(key: str, value: Any, default: bool) -> bool:
+    """A YAML boolean, failing closed on anything else (quoted "false"
+    must not read as True, the way bool() would)."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+        return value.strip().lower() == "true"
+    raise RebalanceConfigError(
+        f"warp.rebalance.wmillieth.{key} must be a boolean (got {value!r})")
+
+
+def _parse_wmillieth_source(block: Any, eth: Optional[AssetBand]
+                            ) -> Optional[WmilliethSource]:
+    """``warp.rebalance.wmillieth`` -> :class:`WmilliethSource`, fail-closed."""
+    if block is None:
+        return None
+    if not isinstance(block, dict):
+        raise RebalanceConfigError("warp.rebalance.wmillieth must be a mapping")
+    enabled = _strict_bool("enabled", block.get("enabled"), False)
+    if not enabled:
+        return None
+    if eth is None:
+        raise RebalanceConfigError(
+            "warp.rebalance.wmillieth tops up the ETH band, so it needs one: "
+            "configure warp.rebalance.eth too")
+    buy = _strict_bool("buy_on_dexie", block.get("buy_on_dexie"), False)
+
+    def num(key: str, default: float) -> float:
+        raw_v = block.get(key, default)
+        if isinstance(raw_v, bool):
+            raise RebalanceConfigError(
+                f"warp.rebalance.wmillieth.{key} must be a number")
+        try:
+            v = float(raw_v)
+        except (TypeError, ValueError, OverflowError):
+            # OverflowError too: a 400-digit YAML integer must disable the
+            # source with a banner, not slip past set_config's handler and
+            # leave the previous spending settings running.
+            raise RebalanceConfigError(
+                f"warp.rebalance.wmillieth.{key} must be a finite number "
+                f"(got {str(raw_v)[:40]!r})") from None
+        if not math.isfinite(v):
+            raise RebalanceConfigError(
+                f"warp.rebalance.wmillieth.{key} must be finite")
+        return v
+
+    premium = num("max_premium_pct", 3.0)
+    if not 0 < premium <= 50:
+        raise RebalanceConfigError(
+            "warp.rebalance.wmillieth.max_premium_pct must be in (0, 50]")
+    # Bounded, so the mojo scaling below can never overflow (an
+    # OverflowError would slip past set_config's RebalanceConfigError
+    # handler and leave the previous parameters running).
+    spend = num("max_spend_xch", 25.0)
+    if not 0 < spend <= 1_000_000:
+        raise RebalanceConfigError(
+            "warp.rebalance.wmillieth.max_spend_xch must be in (0, 1000000]")
+    fee = num("take_fee_xch", 0.0001)
+    if not 0 <= fee <= 1:
+        raise RebalanceConfigError(
+            "warp.rebalance.wmillieth.take_fee_xch must be in [0, 1]")
+    if fee >= spend:
+        raise RebalanceConfigError(
+            "warp.rebalance.wmillieth.take_fee_xch must be below "
+            "max_spend_xch (the cap includes the fee)")
+    return WmilliethSource(
+        enabled=True, buy_on_dexie=buy, max_premium_pct=premium,
+        max_spend_xch_mojos=int(round(spend * 10 ** 12)),
+        take_fee_mojos=int(round(fee * 10 ** 12)),
     )
 
 
@@ -262,6 +359,10 @@ def plan(
     min_bridge_micros: int,
     auto_bridge_floor_micros: Optional[int] = None,
     keep_usdc_micros: int = 0,
+    chia_millieth_mojos: int = 0,
+    max_unwrap_millieth_mojos: int = -1,
+    min_millieth_units: int = 1,
+    min_wmillieth_mojos: int = 1,
 ) -> Optional[RebalanceAction]:
     """At most one action moving one balance back to its target.
 
@@ -275,22 +376,64 @@ def plan(
     (warp.keep_usdc_on_base) is bridged, as the LAST leg -- so enabling an
     ETH band for gas top-ups no longer switches automatic bridging off, and
     a gas refuel still always goes first.
+
+    ``min_millieth_units`` / ``min_wmillieth_mojos`` are the smallest Base
+    withdraw and wmilliETH.b burn worth making at current gas (the caller
+    derives them from live fees): a top-up delivering less ETH than turning
+    it into gas costs would shrink the reserve it exists to refill, so a
+    smaller one waits -- the balance accumulates -- instead.
     """
     if not params.enabled:
         return None
 
     # 1. ETH deficit: the wallet is running out of gas. Refuel from held
-    #    milliETH (the reason the wmilliETH.b market exists). Chia-side pull
-    #    arrives with the multi-asset burn pipeline.
+    #    milliETH on Base first (free: one withdraw() call), then from
+    #    wmilliETH.b on Chia (an unwrap, which lands as milliETH on Base for
+    #    the next consult to withdraw), then -- if allowed -- buy wmilliETH.b
+    #    on Dexie for the consult after that.
     if params.eth is not None and eth_wei < params.eth.low:
         deficit_units = -(-(params.eth.target - eth_wei) // _WEI_PER_MILLIETH_UNIT)
-        units = min(int(deficit_units), int(millieth_units))
-        if units >= 1:
+        min_units = max(1, int(min_millieth_units))
+        min_mojos = max(1, int(min_wmillieth_mojos))
+        # [review] At least the economic minimum, so a withdraw is never
+        # smaller than the gas it spends (the overshoot is at most that).
+        units = min(max(int(deficit_units), min_units), int(millieth_units))
+        if units >= min_units:
             return RebalanceAction(
                 "unwrap_millieth", units,
                 f"ETH {eth_wei} below band {params.eth.low}; unwrapping "
                 f"{units} milliETH units toward target {params.eth.target}",
             )
+        src = params.wmillieth
+        # The cap is the operator's stated line; never configured (< 0)
+        # means the unwrap would be refused anyway, so plan nothing.
+        if src is not None and src.enabled and max_unwrap_millieth_mojos >= 0:
+            # One wmilliETH.b mojo is one milliETH base unit; the receiver is
+            # credited post-tip, so gross up (ceiling) like the USDC leg.
+            grossed = -(-int(deficit_units) * 10_000 // (10_000 - _UNWRAP_TIP_BPS))
+            grossed = max(grossed, min_mojos)
+            if max_unwrap_millieth_mojos > 0:
+                grossed = min(grossed, int(max_unwrap_millieth_mojos))
+            # [review] Below the minimum (a cap set under it), nothing is
+            # burnt or bought: every such top-up would cost more ETH than
+            # it delivers.
+            if grossed < min_mojos:
+                grossed = 0
+            mojos = min(grossed, max(0, int(chia_millieth_mojos)))
+            if mojos >= min_mojos:
+                return RebalanceAction(
+                    "unwrap_wmillieth", mojos,
+                    f"ETH {eth_wei} below band {params.eth.low} and no milliETH "
+                    f"on Base; unwrapping {mojos} wmilliETH.b mojos from Chia "
+                    f"toward target {params.eth.target}",
+                )
+            if src.buy_on_dexie and grossed >= min_mojos:
+                return RebalanceAction(
+                    "buy_wmillieth", grossed,
+                    f"ETH {eth_wei} below band {params.eth.low} with no "
+                    "milliETH on Base or wmilliETH.b on Chia; buying up to "
+                    f"{grossed} wmilliETH.b mojos on Dexie",
+                )
 
     # 2. USDC deficit: pull the reserve back from Chia (wUSDC.b unwrap to
     #    the hot wallet). Clamped to the operator's unwrap cap; below one

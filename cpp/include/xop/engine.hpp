@@ -1857,8 +1857,12 @@ private:
     /// settled snapshot that postdates every job the caller has read.
     /// False (and no cache write) when the wallet is closed, its circuit
     /// refuses, the asset has no wallet, or the reply is incomplete.
+    /// @p validated, when given, says whether THIS call cached a validated
+    /// snapshot -- independent of pending change, and never true from an
+    /// earlier same-block entry a failed call left in place.
     asio::awaitable<bool> fetch_bridge_balance(const AssetId& asset,
-                                               BlockHeight block_height);
+                                               BlockHeight block_height,
+                                               bool* validated = nullptr);
 
     /// [WARP-MILLIETH review] Whether the wallet is known synced for the
     /// secondary scan's balance reads: Step 8 passed its sync gate in this
@@ -1880,6 +1884,15 @@ private:
     /// later secondary flow whose broadcast precedes it is not added on
     /// top of a quantity that may already contain it.
     void note_inventory_absolute_write(const std::string& asset_id);
+
+    /// [MILLIETH-TOPUP 2026-10-24] Book the warp rebalancer's confirmed
+    /// Dexie buys (warp_jobs.db dexie_takes) as takes: base, quote and fee
+    /// legs under "take:<trade_id>" and a taker_fills row.  Read-only,
+    /// idempotent per trade (ledger event_id uniqueness).  Runs before the
+    /// invariant, from fresh synced wallet snapshots of both assets, and
+    /// re-arms Step 11's wallet reconcile for each.  See
+    /// accounting/topup_take.hpp.
+    asio::awaitable<void> step_ingest_topup_takes(BlockHeight block_height);
 
     /// Tie the ledger's implied balances to the wallet's confirmed balances
     /// and escalate on sustained, unexplained divergence.  Alert-only unless
@@ -2259,6 +2272,16 @@ private:
     /// earlier wallet-set write, and the booking block: the reconcile then
     /// accepts only a snapshot taken at or after it.
     std::unordered_map<std::string, BlockHeight> inventory_reconcile_not_before_;
+    /// [MILLIETH-TOPUP review] Why each re-armed reconcile was armed: true
+    /// for a bridge flow (a capital event -- the correction re-anchors the
+    /// risk baselines), false for a top-up take only (a trade -- it must
+    /// not).  Absent means the startup one-shot, which re-anchors.
+    std::unordered_map<std::string, bool> inventory_reconcile_capital_;
+
+    /// [MILLIETH-TOPUP] Top-up takes already decided this process (booked,
+    /// found booked, or inside an opening), and those already warned about.
+    std::set<std::string> topup_booked_ids_;
+    std::set<std::int64_t> topup_warned_ids_;
 
     /// [S18 2026-08-23] Consecutive lifted evaluations of the max-drawdown
     /// condition; the re-alert gate only re-arms once this reaches the

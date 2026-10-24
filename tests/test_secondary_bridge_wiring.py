@@ -91,6 +91,70 @@ def test_unknown_reserve_coins_suppress_the_spending_sides():
     assert "can_bid = false;" in step8[gate_q:gate_q + 600]
 
 
+def test_a_takes_legs_follow_each_assets_own_opening():
+    """[review] Openings are per asset: an opening taken after the buy holds
+    only that asset's leg, so each leg is filtered on its own opening."""
+    takes = _body(_engine(), "asio::awaitable<void> Engine::step_ingest_topup_takes(")
+    assert "const bool book_cat = books(AssetId{row.asset_id});" in takes
+    assert "const bool book_xch = books(AssetId{\"xch\"});" in takes
+    assert 'if (book_cat) add("base"' in takes
+    xch = takes.index("if (book_xch) {")
+    assert 'add("quote"' in takes[xch:xch + 200] and 'add("fee"' in takes[xch:xch + 200]
+    # No enabled market is needed: the legs book whatever the engine quotes.
+    assert "pc.enabled" not in takes
+    # A buy the openings already hold still gets its history row.
+    none = takes.index("if (!book_cat && !book_xch) {")
+    assert "db_->insert_taker_fill(fill_row);" in takes[none:none + 200]
+    assert takes.count("db_->insert_taker_fill(fill_row);") == 2
+
+
+def test_a_take_books_only_on_a_snapshot_this_read_validated():
+    """[review] A failed refresh leaves the earlier same-block cache entry
+    in place; that entry must not count as the post-take snapshot."""
+    takes = _body(_engine(), "asio::awaitable<void> Engine::step_ingest_topup_takes(")
+    assert "co_await fetch_bridge_balance(a, block_height, &validated);" in takes
+    assert "co_return validated;" in takes
+    assert "cached_wallet_balances_" not in takes
+
+
+def test_a_takes_fee_counts_against_the_fee_budget_once():
+    """[review] Engine takes record their fee in FeeTracker; a top-up take
+    must too, once (both booking branches), and only inside the window."""
+    takes = _body(_engine(), "asio::awaitable<void> Engine::step_ingest_topup_takes(")
+    assert "fee_tracker_->record_fee(" in takes
+    assert "accounting::take_fee_in_window(" in takes
+    assert takes.count("note_fee();") == 2
+    none = takes.index("if (!book_cat && !book_xch) {")
+    assert "note_fee();" in takes[none:none + 300]
+
+
+def test_takes_are_gated_on_the_ledger_not_the_bridge_switch():
+    """[review] config.cpp may turn bridge ingest off while the GUI still
+    buys gas; the XCH leg must still book against the XCH opening."""
+    takes = _body(_engine(), "asio::awaitable<void> Engine::step_ingest_topup_takes(")
+    assert "bridge_ingest_enabled" not in takes
+    assert "if (!acc.ledger_enabled) co_return;" in takes
+
+
+def test_a_take_re_arms_without_resetting_the_risk_baselines():
+    """A top-up take is a trade: the reconcile it re-arms corrects inventory
+    but must not discard the drawdown peak or the loss window."""
+    text = _engine()
+    takes = _body(text, "asio::awaitable<void> Engine::step_ingest_topup_takes(")
+    assert "inventory_reconcile_capital_.try_emplace(a, false);" in takes
+    # ...and only for an asset that had reconciled: a pending startup
+    # reconcile keeps its re-anchoring reason.
+    mark = takes.index("inventory_reconcile_capital_.try_emplace(a, false);")
+    assert "if (was_reconciled) {" in takes[mark - 200:mark]
+    assert "inventory_reconciled_assets_.erase(a) > 0;" in takes
+    scan = _body(text, SECONDARY)
+    assert "inventory_reconcile_capital_[sid] = true;" in scan
+    step11 = _body(text, STEP11)
+    reset = step11.index("peak_equity_hwm_usd_ = 0.0;")
+    gate = step11.rindex("capital_event", 0, reset)
+    assert "inventory_reconcile_capital_.find(aid)" in step11[gate - 600:gate]
+
+
 def test_step11s_restart_reconcile_re_anchors_a_secondary_asset():
     """The one-shot reconcile is where a restart's stale restored quantity is
     corrected; for a secondary bridge asset that is a capital event."""

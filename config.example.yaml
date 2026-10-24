@@ -1472,11 +1472,31 @@ warp:
   # ROLLOUT: leave the usdc block off until the first live 0.001-USDC
   # micro-unwrap protocol test has succeeded -- the deficit leg fires
   # real burns. The ETH block and the excess-bridge leg are safe first.
+  # ETH from Chia (wmilliETH.b): with milliETH on Base used up, the ETH
+  # deficit is next unwrapped from wmilliETH.b in the Chia wallet (it lands
+  # as milliETH for the following top-up to withdraw). Needs an eth band
+  # and max_unwrap_millieth below, and starts only after one MANUAL
+  # wmilliETH.b unwrap has completed. Keep some unsold with
+  # strategy.asset_reserve_units. With buy_on_dexie and none held, one Dexie
+  # ask is taken per cooldown, paid in XCH: it must read exactly as listed
+  # in your own wallet, not be your own offer, cost at most max_premium_pct
+  # over CoinGecko's ETH/XCH and at most max_spend_xch, and never spend
+  # strategy.fee_reserve_xch. The engine books it as a take.
   # rebalance:
   #   enabled: true
   #   cooldown_s: 600
   #   usdc: {target: 100, tolerance_pct: 20}
   #   eth:  {target: 0.01, tolerance_pct: 20}
+  #   wmillieth:
+  #     enabled: true
+  #     buy_on_dexie: false
+  #     max_premium_pct: 3        # (0, 50]
+  #     max_spend_xch: 25
+  #     take_fee_xch: 0.0001
+  # [OPTIONAL, default: unset] Max wmilliETH.b per unwrap, automatic or
+  # manual, in wmilliETH.b (1 = 0.001 ETH); 'unlimited' to opt out. Unset
+  # refuses every wmilliETH.b unwrap.
+  # max_unwrap_millieth: 10
   claim_fee_mojos: 100000000             # [OPTIONAL] XCH fee reserved for the Chia claim spend (0.0001 XCH)
   chia_funding_fee_mojos: 0              # [OPTIONAL] extra fee on the wallet->claim funding send
   poll_interval_s: 15                    # [OPTIONAL, default: 15] background tick cadence

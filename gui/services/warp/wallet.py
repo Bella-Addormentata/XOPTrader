@@ -239,3 +239,85 @@ class WalletClient:
             body["confirmed"] = bool(confirmed)
         data = self._post("get_transactions", body)
         return list(data.get("transactions") or [])
+
+    # -- offers ([MILLIETH-TOPUP 2026-10-24]: the Dexie wmilliETH.b buy) ---- #
+
+    def get_offer_summary(self, offer: str) -> dict:
+        """The daemon's own decoding of an offer file.
+
+        ``offered`` is what the MAKER gives (what a taker receives) and
+        ``requested`` what the maker wants, each ``{asset_id | "xch": mojos}``.
+        This is the wallet's reading of the spend bundle, not a third
+        party's listing -- the Dexie buy checks it against Dexie's.
+        """
+        return self.decode_offer(offer)[1]
+
+    def decode_offer(self, offer: str) -> tuple:
+        """``(offer id, summary)`` from the daemon's ``get_offer_summary``.
+
+        The id is the wallet's own name for the spend bundle -- the trade id
+        a take of it gets -- or "" when the daemon did not report one.
+        """
+        data = self._post("get_offer_summary", {"offer": str(offer)})
+        summary = data.get("summary")
+        return (str(data.get("id") or ""),
+                summary if isinstance(summary, dict) else {})
+
+    def check_offer_validity(self, offer: str) -> bool:
+        """Whether every coin the offer spends is still unspent."""
+        data = self._post("check_offer_validity", {"offer": str(offer)})
+        return data.get("valid") is True
+
+    def take_offer(self, offer: str, *, fee_mojos: int = 0) -> dict:
+        """Take *offer*; returns the daemon's trade record.
+
+        Like the send methods, one RPC and never a retry: a take that may
+        have reached the mempool must be looked up by trade id, not resent.
+        """
+        data = self._post(
+            "take_offer", {"offer": str(offer), "fee": int(fee_mojos)}
+        )
+        record = data.get("trade_record")
+        return record if isinstance(record, dict) else {}
+
+    def get_offer(self, trade_id: str) -> dict:
+        """The trade record for *trade_id* (hex, with or without 0x)."""
+        tid = str(trade_id)
+        tid = tid if tid.startswith("0x") else "0x" + tid
+        data = self._post("get_offer", {"trade_id": tid, "file_contents": False})
+        record = data.get("trade_record")
+        # An unreadable record raises, so settlement treats it like an
+        # unanswered lookup (and times it out) instead of an open trade.
+        if not isinstance(record, dict) or record.get("status") in (None, ""):
+            raise WalletError(f"get_offer({tid}) returned no usable trade record")
+        return record
+
+    def get_my_open_trade_ids(self, *, page: int = 500,
+                              max_pages: int = 200) -> set[str]:
+        """Trade ids (lowercase hex, no 0x) of OUR offers still open.
+
+        Used to keep the Dexie buy from taking one of the engine's own asks,
+        so it is complete or it raises: every page is read until a short
+        one, and a failed page propagates (WalletError) rather than hand
+        back a partial set that could authorize buying our own offer.
+        """
+        out: set[str] = set()
+        start = 0
+        for _ in range(int(max_pages)):
+            data = self._post("get_all_offers", {
+                "start": start, "end": start + int(page),
+                "exclude_my_offers": False, "exclude_taken_offers": True,
+                "include_completed": False, "file_contents": False,
+            })
+            records = data.get("trade_records") or []
+            for rec in records:
+                if not isinstance(rec, dict) or not rec.get("is_my_offer"):
+                    continue
+                tid = str(rec.get("trade_id") or "").lower()
+                out.add(tid[2:] if tid.startswith("0x") else tid)
+            if len(records) < int(page):
+                return out
+            start += int(page)
+        raise WalletError(
+            f"get_all_offers still returning full pages after {max_pages}; "
+            "our open offers cannot be listed completely")

@@ -52,7 +52,10 @@ class FakeEngine:
         self.unmined = 0
         self._evm = SimpleNamespace(
             get_nonce=lambda addr, pending=True: 7 + (
-                self.unmined if pending else 0))
+                self.unmined if pending else 0),
+            # 0.1 gwei: a 90k-gas withdraw (9e12 wei) is worth >= 10 units.
+            get_fee_data=lambda: SimpleNamespace(max_fee_per_gas=10 ** 8))
+        self._net = SimpleNamespace()               # 3-decimal milliETH
         self.calls: list = []
 
     def refresh_hot_wallet(self):
