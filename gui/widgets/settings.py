@@ -2066,7 +2066,7 @@ class SettingsWidget(QWidget):
         base_form.addRow("", self._eth_auto_topup)
 
         self._eth_reserve_target = QDoubleSpinBox()
-        self._eth_reserve_target.setRange(0.0004, 1.0)
+        self._eth_reserve_target.setRange(0.0004, 1000.0)
         self._eth_reserve_target.setSingleStep(0.001)
         self._eth_reserve_target.setDecimals(4)
         self._eth_reserve_target.setValue(0.01)
@@ -2077,7 +2077,7 @@ class SettingsWidget(QWidget):
         base_form.addRow("ETH Fee Reserve Target:", self._eth_reserve_target)
 
         self._eth_reserve_tol = QDoubleSpinBox()
-        self._eth_reserve_tol.setRange(1.0, 100.0)
+        self._eth_reserve_tol.setRange(0.1, 100.0)
         self._eth_reserve_tol.setSingleStep(5.0)
         self._eth_reserve_tol.setDecimals(1)
         self._eth_reserve_tol.setValue(20.0)
@@ -2118,7 +2118,9 @@ class SettingsWidget(QWidget):
         warp_form.addRow("Auto-bridge Minimum:", self._warp_min_auto)
 
         self._warp_max = QDoubleSpinBox()
-        self._warp_max.setRange(0.001, 1_000_000.0)
+        # 0.002 USDC is the smallest bridge that can complete (the bridge's
+        # tip takes at least 0.001); a lower cap would block every bridge.
+        self._warp_max.setRange(0.002, 1_000_000.0)
         self._warp_max.setSingleStep(10.0)
         self._warp_max.setDecimals(3)
         self._warp_max.setValue(5.0)
@@ -2175,6 +2177,20 @@ class SettingsWidget(QWidget):
         self._warp_section_present = False
         self._loaded_rebalance: Optional[dict] = None
 
+        # Loaded values as written on disk, and which numeric fields the
+        # operator has touched since: an untouched field is written back
+        # VERBATIM, so a value the spin box cannot represent exactly (more
+        # decimals, outside its range) is never silently changed by an
+        # unrelated save.
+        self._warp_loaded_raw: dict[str, Any] = {}
+        self._warp_edited: set[str] = set()
+        for key, sb in (("min_auto_bridge_usdc", self._warp_min_auto),
+                        ("max_auto_bridge_usdc", self._warp_max),
+                        ("keep_usdc_on_base", self._warp_keep),
+                        ("eth.target", self._eth_reserve_target),
+                        ("eth.tolerance_pct", self._eth_reserve_tol)):
+            sb.valueChanged.connect(
+                lambda _v, k=key: self._warp_edited.add(k))
         for cb in (self._warp_auto_bridge, self._warp_max_unlimited,
                    self._eth_auto_topup):
             cb.stateChanged.connect(lambda _s, ti=5: self._mark_dirty(ti))
@@ -3542,8 +3558,10 @@ class SettingsWidget(QWidget):
             return ""
         from gui.services.warp import rebalance as rb
 
-        band = {"target": round(self._eth_reserve_target.value(), 4),
-                "tolerance_pct": round(self._eth_reserve_tol.value(), 1)}
+        band = {"target": self._warp_value(
+                    "eth.target", round(self._eth_reserve_target.value(), 4)),
+                "tolerance_pct": self._warp_value(
+                    "eth.tolerance_pct", round(self._eth_reserve_tol.value(), 1))}
         try:
             rb.parse_rebalance_config(
                 {"rebalance": {"enabled": True, "eth": band}},
@@ -3586,6 +3604,21 @@ class SettingsWidget(QWidget):
         """Load the bridge + fee-reserve fields from a config's warp block."""
         self._warp_section_present = isinstance(warp, dict)
         warp = warp if isinstance(warp, dict) else {}
+        self._warp_edited = set()
+        self._warp_loaded_raw = {}
+        for key in ("min_auto_bridge_usdc", "max_auto_bridge_usdc",
+                    "keep_usdc_on_base"):
+            raw_v = warp.get(key)
+            # Numbers only: "unlimited" is the checkbox's, and unticking it
+            # must write the spin box's value, not the string back.
+            if isinstance(raw_v, (int, float)) and not isinstance(raw_v, bool):
+                self._warp_loaded_raw[key] = raw_v
+        reb_raw = warp.get("rebalance")
+        eth_raw = reb_raw.get("eth") if isinstance(reb_raw, dict) else None
+        if isinstance(eth_raw, dict):
+            for key in ("target", "tolerance_pct"):
+                if eth_raw.get(key) is not None:
+                    self._warp_loaded_raw[f"eth.{key}"] = eth_raw.get(key)
 
         _flag = self._warp_flag
 
@@ -3615,16 +3648,26 @@ class SettingsWidget(QWidget):
             self._eth_reserve_tol.setValue(_num(eth.get("tolerance_pct"), 20.0))
         self._refresh_warp_controls()
 
+    def _warp_value(self, key: str, shown: Any) -> Any:
+        """*shown* if the operator edited *key*, else the loaded value."""
+        if key not in getattr(self, "_warp_edited", set()) and key in getattr(
+                self, "_warp_loaded_raw", {}):
+            return self._warp_loaded_raw[key]
+        return shown
+
     def _collect_warp_bridge(self) -> dict:
         """The warp keys this page owns, for deep-merge onto the on-disk block."""
         out: dict[str, Any] = {
             "auto_bridge": self._warp_auto_bridge.isChecked(),
-            "min_auto_bridge_usdc": round(self._warp_min_auto.value(), 3),
+            "min_auto_bridge_usdc": self._warp_value(
+                "min_auto_bridge_usdc", round(self._warp_min_auto.value(), 3)),
             "max_auto_bridge_usdc": (
                 "unlimited" if self._warp_max_unlimited.isChecked()
-                else round(self._warp_max.value(), 3)
+                else self._warp_value(
+                    "max_auto_bridge_usdc", round(self._warp_max.value(), 3))
             ),
-            "keep_usdc_on_base": round(self._warp_keep.value(), 3),
+            "keep_usdc_on_base": self._warp_value(
+                "keep_usdc_on_base", round(self._warp_keep.value(), 3)),
         }
         existing = self._loaded_rebalance
         has_usdc = isinstance(existing, dict) and isinstance(
@@ -3635,8 +3678,12 @@ class SettingsWidget(QWidget):
             out["rebalance"] = {
                 "enabled": True,
                 "eth": {
-                    "target": round(self._eth_reserve_target.value(), 4),
-                    "tolerance_pct": round(self._eth_reserve_tol.value(), 1),
+                    "target": self._warp_value(
+                        "eth.target",
+                        round(self._eth_reserve_target.value(), 4)),
+                    "tolerance_pct": self._warp_value(
+                        "eth.tolerance_pct",
+                        round(self._eth_reserve_tol.value(), 1)),
                 },
             }
         elif isinstance(existing, dict):
@@ -4358,6 +4405,17 @@ class SettingsWidget(QWidget):
         # closed and stands every automatic bridge down with it.
         eth_band_err = self._eth_band_error()
         _set_valid(self._eth_reserve_target, not eth_band_err, eth_band_err)
+        # A zero auto-bridge minimum means NO automatic bridging (the auto
+        # job and the rebalancer's leg both treat it so); refuse it while
+        # Auto-bridge is ticked rather than save a setting that contradicts it.
+        if self._warp_section_present and self._warp_auto_bridge.isChecked():
+            min_ok = self._warp_min_auto.value() >= 0.002
+            _set_valid(
+                self._warp_min_auto, min_ok,
+                "" if min_ok else (
+                    "Auto-bridge Minimum must be at least 0.002 USDC while "
+                    "Auto-bridge is on (0 would mean no automatic bridging)."),
+            )
         if not eth_band_err:
             merged_err = self._merged_rebalance_error()
             _set_valid(self._eth_auto_topup, not merged_err, merged_err)

@@ -352,7 +352,10 @@ def plan(
     # 5. Auto-bridge without a USDC band: bridge what sits above the
     #    keep-on-Base floor, under the same auto floor and cap as the
     #    legacy auto job it replaces while the rebalancer is enabled.
-    if params.usdc is None and auto_bridge_floor_micros is not None:
+    # A zero auto-bridge minimum means "no automatic bridging", exactly as
+    # in the legacy auto job (maybe_start_auto_job) this leg stands in for.
+    if (params.usdc is None and auto_bridge_floor_micros is not None
+            and min_bridge_micros > 0):
         floor = max(0, int(auto_bridge_floor_micros))
         excess = usdc_micros - floor
         if max_bridge_micros > 0:

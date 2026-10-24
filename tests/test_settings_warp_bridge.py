@@ -221,3 +221,42 @@ def test_a_string_true_usdc_band_stays_on_when_top_up_is_unticked(panel, tmp_pat
         "enabled": "true", "usdc": {"target": 100, "tolerance_pct": 20}}})))
     assert not panel._eth_auto_topup.isChecked()
     assert _warp(panel)["rebalance"] == {"enabled": True, "eth": None}
+
+
+# ---------------------------------------------------------------------------
+# Review round 3 (PR #184).
+# ---------------------------------------------------------------------------
+
+def test_an_unedited_out_of_range_target_is_written_back_verbatim(panel, tmp_path):
+    """A hand-configured 2 ETH target must survive an unrelated save."""
+    panel.load_config(str(_cfg(tmp_path, {**LIVE, "rebalance": {
+        "enabled": True, "eth": {"target": 2, "tolerance_pct": 20}}})))
+    out = _warp(panel)["rebalance"]["eth"]
+    assert out == {"target": 2, "tolerance_pct": 20}
+    panel._eth_reserve_target.setValue(0.02)        # an actual edit wins
+    assert _warp(panel)["rebalance"]["eth"]["target"] == 0.02
+
+
+def test_an_unedited_fine_grained_keep_value_is_preserved(panel, tmp_path):
+    panel.load_config(str(_cfg(tmp_path, {**LIVE, "keep_usdc_on_base": 12.3456})))
+    assert _warp(panel)["keep_usdc_on_base"] == 12.3456
+
+
+def test_unticking_unlimited_writes_the_spin_value(panel, tmp_path):
+    panel.load_config(str(_cfg(tmp_path, {**LIVE, "max_auto_bridge_usdc": "unlimited"})))
+    panel._warp_max_unlimited.setChecked(False)
+    assert isinstance(_warp(panel)["max_auto_bridge_usdc"], float)
+
+
+def test_the_cap_cannot_go_below_the_smallest_bridge(panel, tmp_path):
+    panel.load_config(str(_cfg(tmp_path, LIVE)))
+    panel._warp_max.setValue(0.001)
+    assert panel._warp_max.value() == pytest.approx(0.002)
+
+
+def test_a_zero_minimum_with_auto_bridge_on_cannot_be_saved(panel, tmp_path):
+    panel.load_config(str(_cfg(tmp_path, LIVE)))
+    panel._warp_min_auto.setValue(0)
+    assert any("Auto-bridge Minimum" in e for e in panel._validate())
+    panel._warp_auto_bridge.setChecked(False)
+    assert not any("Auto-bridge Minimum" in e for e in panel._validate())

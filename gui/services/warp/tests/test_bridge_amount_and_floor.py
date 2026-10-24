@@ -281,6 +281,25 @@ def test_a_one_mojo_rebalance_bridge_is_cancelled():
 
 
 def test_the_planner_never_plans_a_one_mojo_bridge():
-    assert _plan(auto_bridge_floor_micros=49_999_000, min_bridge_micros=0) is None
-    act = _plan(auto_bridge_floor_micros=49_998_000, min_bridge_micros=0)
+    assert _plan(auto_bridge_floor_micros=49_999_000, min_bridge_micros=1) is None
+    act = _plan(auto_bridge_floor_micros=49_998_000, min_bridge_micros=1)
     assert act.kind == "bridge_usdc" and act.amount == 2_000
+
+
+# --------------------------------------------------------------------------- #
+# Review round 3 (PR #184).
+# --------------------------------------------------------------------------- #
+
+def test_an_explicit_zero_amount_is_refused_not_read_as_blank():
+    store = new_store()
+    engine, _ = build(store)
+    with pytest.raises(S.WarpError):
+        engine.request_bridge(target_micros=0)
+    assert store.get_active_job() is None
+    engine.request_bridge()                       # None: the blank request
+    assert "exact" not in store.get_active_job().state
+
+
+def test_a_zero_auto_minimum_means_no_automatic_bridging_in_the_planner_too():
+    assert _plan(auto_bridge_floor_micros=0, min_bridge_micros=0) is None
+    assert _plan(auto_bridge_floor_micros=0, min_bridge_micros=2_000) is not None

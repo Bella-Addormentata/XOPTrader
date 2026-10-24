@@ -3180,7 +3180,9 @@ class WarpEngine:
         ``keep_usdc_on_base``, and refused here -- not silently clamped --
         when it exceeds the cap or is below one wUSDC.b mojo.
         """
-        exact = bool(target_micros) and not automatic
+        # None is the blank Bridge now; any number -- zero included -- is a
+        # typed amount and must pass the checks below.
+        exact = target_micros is not None and not automatic
         if exact:
             micros = int(target_micros)
             mojo_micros = 10 ** (self._net.usdc_decimals - self._net.cat_decimals)
@@ -3225,7 +3227,7 @@ class WarpEngine:
             state = {"manual": True, **_asset_stamp(self._net.asset("USDC"),
                             self._net.cat_decimals),
                      **self._binding()}
-        if target_micros:
+        if target_micros is not None:
             state["target_micros"] = int(target_micros)
         if exact:
             state["exact"] = True
